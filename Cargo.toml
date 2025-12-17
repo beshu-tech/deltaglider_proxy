@@ -1,0 +1,56 @@
+[package]
+name = "deltaglider_proxy"
+version = "0.1.0"
+description = "S3-compatible proxy with transparent delta compression"
+license = "GPL-2.0-only"
+readme = "README.md"
+edition = "2021"
+
+[dependencies]
+# Web framework
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# AWS S3 SDK (for backend storage)
+aws-sdk-s3 = "1"
+aws-config = "1"
+aws-credential-types = "1"
+
+# Async support
+async-trait = "0.1"
+
+# Delta compression
+xdelta3 = "0.1.5"
+
+# Hashing
+sha2 = "0.10"
+md-5 = "0.10"
+hex = "0.4"
+
+# XML for S3 responses
+quick-xml = { version = "0.36", features = ["serialize"] }
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+lru = "0.12"
+parking_lot = "0.12"
+bytes = "1"
+tower-http = { version = "0.6", features = ["trace"] }
+urlencoding = "2"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+rand = { version = "0.8", features = ["std_rng"] }
+tokio-test = "0.4"
+reqwest = { version = "0.12", features = ["json"] }

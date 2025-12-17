@@ -1,0 +1,80 @@
+# DeltaGlider Proxy S3 Proxy Configuration
+# Copy this file to deltaglider_proxy.toml and adjust settings as needed
+
+# Server listen address
+listen_addr = "127.0.0.1:9000"
+
+# Default bucket name (single-bucket mode)
+# Clients must use this bucket name in their S3 requests
+default_bucket = "default"
+
+# DeltaGlider Settings
+# -------------------
+
+# Maximum delta ratio - store as delta only if (delta_size / original_size) < this value
+# Lower values = more aggressive storage savings, but more compute
+# Higher values = store more files as deltas even with modest savings
+max_delta_ratio = 0.5
+
+# Maximum object size in bytes that can be delta-compressed
+# Objects larger than this are stored directly without compression
+# Default: 100MB (xdelta3 memory constraint)
+max_object_size = 104857600
+
+# Reference cache size in MB
+# Larger cache = faster delta reconstruction, more memory usage
+cache_size_mb = 100
+
+# Backend Configuration
+# ---------------------
+# Choose either filesystem or s3 backend
+
+# Option 1: Filesystem backend (for local development)
+[backend]
+type = "filesystem"
+path = "./data"
+
+# Option 2: S3 backend (for production)
+# Uncomment and configure the following:
+#
+# [backend]
+# type = "s3"
+#
+# # S3 endpoint (optional for AWS, required for MinIO/LocalStack)
+# endpoint = "http://localhost:9000"
+#
+# # S3 bucket for storing DeltaGlider objects
+# bucket = "deltaglider_proxy-data"
+#
+# # AWS region
+# region = "us-east-1"
+#
+# # Use path-style URLs (required for MinIO, LocalStack)
+# force_path_style = true
+#
+# # Credentials (optional if using env vars or instance credentials)
+# # access_key_id = "your-access-key"
+# # secret_access_key = "your-secret-key"
+
+# Environment Variables
+# ---------------------
+# The following environment variables can override config settings:
+#
+# DELTAGLIDER_PROXY_CONFIG           - Path to config file
+# DELTAGLIDER_PROXY_LISTEN_ADDR      - Listen address
+# DELTAGLIDER_PROXY_DATA_DIR         - Filesystem backend directory
+# DELTAGLIDER_PROXY_DEFAULT_BUCKET   - Default bucket name
+# DELTAGLIDER_PROXY_MAX_DELTA_RATIO  - Max delta ratio
+# DELTAGLIDER_PROXY_MAX_OBJECT_SIZE  - Max object size
+# DELTAGLIDER_PROXY_CACHE_SIZE_MB    - Cache size in MB
+#
+# For S3 backend:
+# DELTAGLIDER_PROXY_S3_BUCKET        - S3 bucket name (enables S3 backend)
+# DELTAGLIDER_PROXY_S3_ENDPOINT      - S3 endpoint URL
+# DELTAGLIDER_PROXY_S3_REGION        - AWS region
+# DELTAGLIDER_PROXY_S3_FORCE_PATH_STYLE - Use path-style URLs (true/false)
+#
+# AWS credentials:
+# AWS_ACCESS_KEY_ID        - AWS access key
+# AWS_SECRET_ACCESS_KEY    - AWS secret key
+# AWS_SESSION_TOKEN        - AWS session token (for temporary credentials)
