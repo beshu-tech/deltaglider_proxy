@@ -6,9 +6,9 @@ DeltaGlider Proxy sits between your S3 clients and backend storage, automaticall
 
 ```
 ┌─────────────────┐       ┌─────────────────┐       ┌─────────────────┐
-│   S3 Client     │──────▶│    DeltaGlider Proxy      │──────▶│   Backend S3    │
-│   (aws-cli,     │◀──────│   (xdelta3)     │◀──────│ (AWS/MinIO/R2)  │
-│   boto3, etc)   │       │                 │       │                 │
+│   S3 Client     │──────▶│  DeltaGlider    │──────▶│   Backend S3    │
+│   (aws-cli,     │◀──────│     Proxy       │◀──────│ (AWS/MinIO/R2)  │
+│   boto3, etc)   │       │   (xdelta3)     │       │                 │
 └─────────────────┘       └─────────────────┘       └─────────────────┘
 ```
 
@@ -196,7 +196,7 @@ src/
 | DeleteObjects | ✅ | Batch delete |
 | CopyObject | ✅ | Via x-amz-copy-source header |
 | CreateBucket | ✅ | Single-bucket mode |
-| HeadBucket | ✅ | |
+| HeadBucket | ✅ | Single-bucket mode |
 | DeleteBucket | ✅ | Must be empty |
 | ListBuckets | ✅ | Returns configured bucket |
 
