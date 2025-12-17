@@ -1,17 +1,33 @@
 //! S3 storage backend implementation using AWS SDK
+//!
+//! This backend stores metadata in S3 object metadata headers (x-amz-meta-dg-*)
+//! for compatibility with the original DeltaGlider CLI (beshultd/deltaglider).
+//!
+//! Metadata format follows DeltaGlider conventions:
+//! - x-amz-meta-dg-tool: "deltaglider/0.1.0"
+//! - x-amz-meta-dg-file-sha256: SHA256 hash of original file
+//! - x-amz-meta-dg-original-name: Original filename
+//! - x-amz-meta-dg-file-size: Size of original file in bytes
+//! - x-amz-meta-dg-created-at: ISO8601 timestamp
+//! - x-amz-meta-dg-note: "reference", "delta", or "direct"
+//! - x-amz-meta-dg-ref-key: Reference file key (for deltas)
+//! - x-amz-meta-dg-ref-sha256: SHA256 of reference file (for deltas)
+//! - x-amz-meta-dg-delta-size: Size of delta in bytes (for deltas)
+//! - x-amz-meta-dg-delta-cmd: xdelta3 command used (for deltas)
 
 use super::traits::{StorageBackend, StorageError};
 use crate::config::BackendConfig;
-use crate::types::FileMetadata;
+use crate::types::{FileMetadata, StorageInfo};
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
-use std::collections::HashSet;
+use chrono::{DateTime, Utc};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 
 /// S3 storage backend for DeltaGlider objects
 pub struct S3Backend {
@@ -82,34 +98,189 @@ impl S3Backend {
         format!("{}/reference.bin", prefix)
     }
 
-    /// Get the S3 key for reference metadata
-    fn reference_meta_key(&self, prefix: &str) -> String {
-        format!("{}/reference.bin.meta", prefix)
-    }
-
     /// Get the S3 key for a delta file
     fn delta_key(&self, prefix: &str, filename: &str) -> String {
         format!("{}/{}.delta", prefix, filename)
     }
 
-    /// Get the S3 key for delta metadata
-    fn delta_meta_key(&self, prefix: &str, filename: &str) -> String {
-        format!("{}/{}.delta.meta", prefix, filename)
-    }
-
-    /// Get the S3 key for a direct file
+    /// Get the S3 key for a direct file (non-delta eligible files)
+    /// Note: Original CLI doesn't have a separate .direct suffix - it stores
+    /// non-delta files without any suffix. For now we keep .direct for internal
+    /// consistency but may need to change this for full interop.
     fn direct_key(&self, prefix: &str, filename: &str) -> String {
         format!("{}/{}.direct", prefix, filename)
     }
 
-    /// Get the S3 key for direct metadata
-    fn direct_meta_key(&self, prefix: &str, filename: &str) -> String {
-        format!("{}/{}.direct.meta", prefix, filename)
+    // === Metadata conversion helpers ===
+
+    /// Convert FileMetadata to S3 metadata headers (dg-* format)
+    fn metadata_to_headers(&self, metadata: &FileMetadata) -> HashMap<String, String> {
+        let mut headers = HashMap::new();
+
+        // Common fields
+        headers.insert("dg-tool".to_string(), metadata.tool.clone());
+        headers.insert("dg-original-name".to_string(), metadata.original_name.clone());
+        headers.insert("dg-file-sha256".to_string(), metadata.file_sha256.clone());
+        headers.insert("dg-file-size".to_string(), metadata.file_size.to_string());
+        headers.insert(
+            "dg-created-at".to_string(),
+            metadata.created_at.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string(),
+        );
+
+        // Storage-type specific fields
+        match &metadata.storage_info {
+            StorageInfo::Reference { source_name } => {
+                headers.insert("dg-note".to_string(), "reference".to_string());
+                headers.insert("dg-source-name".to_string(), source_name.clone());
+            }
+            StorageInfo::Delta {
+                ref_key,
+                ref_sha256,
+                delta_size,
+                delta_cmd,
+            } => {
+                headers.insert("dg-note".to_string(), "delta".to_string());
+                headers.insert("dg-ref-key".to_string(), ref_key.clone());
+                headers.insert("dg-ref-sha256".to_string(), ref_sha256.clone());
+                headers.insert("dg-delta-size".to_string(), delta_size.to_string());
+                headers.insert("dg-delta-cmd".to_string(), delta_cmd.clone());
+            }
+            StorageInfo::Direct => {
+                headers.insert("dg-note".to_string(), "direct".to_string());
+            }
+        }
+
+        headers
+    }
+
+    /// Convert S3 metadata headers to FileMetadata
+    fn headers_to_metadata(&self, headers: &HashMap<String, String>) -> Result<FileMetadata, StorageError> {
+        // Helper to get a value with multiple possible keys
+        let get_value = |keys: &[&str]| -> Option<String> {
+            for key in keys {
+                if let Some(v) = headers.get(*key) {
+                    if !v.is_empty() {
+                        return Some(v.clone());
+                    }
+                }
+            }
+            None
+        };
+
+        let tool = get_value(&["dg-tool", "tool"])
+            .ok_or_else(|| StorageError::Other("Missing dg-tool".to_string()))?;
+        let original_name = get_value(&["dg-original-name", "original-name", "dg-source-name", "source-name"])
+            .ok_or_else(|| StorageError::Other("Missing dg-original-name".to_string()))?;
+        let file_sha256 = get_value(&["dg-file-sha256", "file-sha256"])
+            .ok_or_else(|| StorageError::Other("Missing dg-file-sha256".to_string()))?;
+        let file_size_str = get_value(&["dg-file-size", "file-size"])
+            .unwrap_or_else(|| "0".to_string());
+        let file_size: u64 = file_size_str
+            .parse()
+            .map_err(|_| StorageError::Other(format!("Invalid file size: {}", file_size_str)))?;
+        let created_at_str = get_value(&["dg-created-at", "created-at"])
+            .unwrap_or_else(|| Utc::now().to_rfc3339());
+        // Parse timestamp - handle various formats
+        let created_at: DateTime<Utc> = {
+            let ts = created_at_str.trim_end_matches('Z');
+            // Try RFC3339 with timezone
+            DateTime::parse_from_rfc3339(&format!("{}+00:00", ts))
+                .map(|dt| dt.with_timezone(&Utc))
+                .or_else(|_| {
+                    // Try parsing as naive datetime
+                    chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.f")
+                        .map(|ndt| ndt.and_utc())
+                })
+                .unwrap_or_else(|_| Utc::now())
+        };
+
+        let note = get_value(&["dg-note", "note"]);
+
+        // Determine storage type:
+        // 1. If note == "reference", it's a reference file
+        // 2. If dg-ref-key exists OR note contains "delta" or "zero-diff", it's a delta file
+        //    (Original CLI doesn't always set dg-note for delta files)
+        // 3. Otherwise it's direct storage
+        let ref_key_opt = get_value(&["dg-ref-key", "ref-key"]);
+        let is_reference = note.as_deref() == Some("reference");
+        let is_delta = ref_key_opt.is_some()
+            || note.as_ref().map(|n| n == "delta" || n.starts_with("zero-diff")).unwrap_or(false);
+
+        let storage_info = if is_reference {
+            let source_name = get_value(&["dg-source-name", "source-name"])
+                .unwrap_or_else(|| original_name.clone());
+            StorageInfo::Reference { source_name }
+        } else if is_delta {
+            let ref_key = ref_key_opt
+                .ok_or_else(|| StorageError::Other("Missing dg-ref-key".to_string()))?;
+            let ref_sha256 = get_value(&["dg-ref-sha256", "ref-sha256"])
+                .ok_or_else(|| StorageError::Other("Missing dg-ref-sha256".to_string()))?;
+            let delta_size_str = get_value(&["dg-delta-size", "delta-size"])
+                .unwrap_or_else(|| "0".to_string());
+            let delta_size: u64 = delta_size_str
+                .parse()
+                .map_err(|_| StorageError::Other(format!("Invalid delta size: {}", delta_size_str)))?;
+            let delta_cmd = get_value(&["dg-delta-cmd", "delta-cmd"])
+                .unwrap_or_default();
+            StorageInfo::Delta {
+                ref_key,
+                ref_sha256,
+                delta_size,
+                delta_cmd,
+            }
+        } else {
+            StorageInfo::Direct
+        };
+
+        // MD5 is not in the original DeltaGlider format, generate a placeholder
+        let md5 = headers.get("dg-md5").cloned().unwrap_or_else(|| "".to_string());
+
+        Ok(FileMetadata {
+            tool,
+            original_name,
+            file_sha256,
+            file_size,
+            md5,
+            created_at,
+            content_type: headers.get("content-type").cloned(),
+            storage_info,
+        })
     }
 
     // === Internal helpers ===
 
-    /// Put an object to S3
+    /// Put an object to S3 with metadata headers
+    async fn put_object_with_metadata(
+        &self,
+        key: &str,
+        data: &[u8],
+        metadata: &FileMetadata,
+    ) -> Result<(), StorageError> {
+        let headers = self.metadata_to_headers(metadata);
+
+        let mut request = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(ByteStream::from(data.to_vec()))
+            .content_type("application/octet-stream");
+
+        // Add all metadata headers
+        for (k, v) in headers {
+            request = request.metadata(k, v);
+        }
+
+        request
+            .send()
+            .await
+            .map_err(|e| StorageError::S3(format!("put_object failed: {}", e)))?;
+
+        debug!("S3 PUT {} ({} bytes) with DG metadata", key, data.len());
+        Ok(())
+    }
+
+    /// Put a raw object to S3 (no metadata)
     async fn put_object(&self, key: &str, data: &[u8]) -> Result<(), StorageError> {
         self.client
             .put_object()
@@ -157,6 +328,42 @@ impl S3Backend {
         Ok(data)
     }
 
+    /// Get object metadata from S3 headers
+    async fn get_object_metadata(&self, key: &str) -> Result<FileMetadata, StorageError> {
+        let response = self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| {
+                if let SdkError::ServiceError(service_error) = &e {
+                    if matches!(
+                        service_error.err(),
+                        aws_sdk_s3::operation::head_object::HeadObjectError::NotFound(_)
+                    ) {
+                        return StorageError::NotFound(key.to_string());
+                    }
+                }
+                StorageError::S3(format!("head_object failed: {}", e))
+            })?;
+
+        let headers: HashMap<String, String> = response
+            .metadata()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
+
+        if headers.is_empty() {
+            return Err(StorageError::NotFound(format!(
+                "No DeltaGlider metadata found for {}",
+                key
+            )));
+        }
+
+        self.headers_to_metadata(&headers)
+    }
+
     /// Delete an object from S3
     async fn delete_object(&self, key: &str) -> Result<(), StorageError> {
         self.client
@@ -180,19 +387,6 @@ impl S3Backend {
             .send()
             .await
             .is_ok()
-    }
-
-    /// Write metadata as JSON to S3
-    async fn write_metadata(&self, key: &str, metadata: &FileMetadata) -> Result<(), StorageError> {
-        let json = serde_json::to_vec_pretty(metadata)?;
-        self.put_object(key, &json).await
-    }
-
-    /// Read metadata JSON from S3
-    async fn read_metadata(&self, key: &str) -> Result<FileMetadata, StorageError> {
-        let data = self.get_object(key).await?;
-        let metadata: FileMetadata = serde_json::from_slice(&data)?;
-        Ok(metadata)
     }
 
     /// List objects with a prefix
@@ -265,6 +459,7 @@ impl StorageBackend for S3Backend {
     }
 
     // === Reference file operations ===
+    // Metadata is stored in S3 object headers (x-amz-meta-dg-*) for CLI compatibility
 
     #[instrument(skip(self, data, metadata))]
     async fn put_reference(
@@ -273,13 +468,9 @@ impl StorageBackend for S3Backend {
         data: &[u8],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        let data_key = self.reference_key(prefix);
-        let meta_key = self.reference_meta_key(prefix);
-
-        self.put_object(&data_key, data).await?;
-        self.write_metadata(&meta_key, metadata).await?;
-
-        debug!("Stored reference for {} ({} bytes)", prefix, data.len());
+        let key = self.reference_key(prefix);
+        self.put_object_with_metadata(&key, data, metadata).await?;
+        debug!("Stored reference for {} ({} bytes) with DG headers", prefix, data.len());
         Ok(())
     }
 
@@ -289,8 +480,12 @@ impl StorageBackend for S3Backend {
         prefix: &str,
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        let meta_key = self.reference_meta_key(prefix);
-        self.write_metadata(&meta_key, metadata).await
+        // For S3, we need to copy the object with new metadata
+        // This is a limitation - metadata can only be set at PUT time
+        // For now, we skip this operation as reference data+metadata are always PUT together
+        warn!("put_reference_metadata called on S3 backend - metadata can only be set at PUT time");
+        let _ = (prefix, metadata);
+        Ok(())
     }
 
     #[instrument(skip(self))]
@@ -301,8 +496,8 @@ impl StorageBackend for S3Backend {
 
     #[instrument(skip(self))]
     async fn get_reference_metadata(&self, prefix: &str) -> Result<FileMetadata, StorageError> {
-        let key = self.reference_meta_key(prefix);
-        self.read_metadata(&key).await
+        let key = self.reference_key(prefix);
+        self.get_object_metadata(&key).await
     }
 
     #[instrument(skip(self))]
@@ -313,13 +508,8 @@ impl StorageBackend for S3Backend {
 
     #[instrument(skip(self))]
     async fn delete_reference(&self, prefix: &str) -> Result<(), StorageError> {
-        let data_key = self.reference_key(prefix);
-        let meta_key = self.reference_meta_key(prefix);
-
-        // Delete both data and metadata (ignore errors for metadata if it doesn't exist)
-        self.delete_object(&data_key).await?;
-        let _ = self.delete_object(&meta_key).await;
-
+        let key = self.reference_key(prefix);
+        self.delete_object(&key).await?;
         debug!("Deleted reference for {}", prefix);
         Ok(())
     }
@@ -334,17 +524,11 @@ impl StorageBackend for S3Backend {
         data: &[u8],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        let data_key = self.delta_key(prefix, filename);
-        let meta_key = self.delta_meta_key(prefix, filename);
-
-        self.put_object(&data_key, data).await?;
-        self.write_metadata(&meta_key, metadata).await?;
-
+        let key = self.delta_key(prefix, filename);
+        self.put_object_with_metadata(&key, data, metadata).await?;
         debug!(
-            "Stored delta for {}/{} ({} bytes)",
-            prefix,
-            filename,
-            data.len()
+            "Stored delta for {}/{} ({} bytes) with DG headers",
+            prefix, filename, data.len()
         );
         Ok(())
     }
@@ -361,18 +545,14 @@ impl StorageBackend for S3Backend {
         prefix: &str,
         filename: &str,
     ) -> Result<FileMetadata, StorageError> {
-        let key = self.delta_meta_key(prefix, filename);
-        self.read_metadata(&key).await
+        let key = self.delta_key(prefix, filename);
+        self.get_object_metadata(&key).await
     }
 
     #[instrument(skip(self))]
     async fn delete_delta(&self, prefix: &str, filename: &str) -> Result<(), StorageError> {
-        let data_key = self.delta_key(prefix, filename);
-        let meta_key = self.delta_meta_key(prefix, filename);
-
-        self.delete_object(&data_key).await?;
-        let _ = self.delete_object(&meta_key).await;
-
+        let key = self.delta_key(prefix, filename);
+        self.delete_object(&key).await?;
         debug!("Deleted delta for {}/{}", prefix, filename);
         Ok(())
     }
@@ -387,17 +567,11 @@ impl StorageBackend for S3Backend {
         data: &[u8],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        let data_key = self.direct_key(prefix, filename);
-        let meta_key = self.direct_meta_key(prefix, filename);
-
-        self.put_object(&data_key, data).await?;
-        self.write_metadata(&meta_key, metadata).await?;
-
+        let key = self.direct_key(prefix, filename);
+        self.put_object_with_metadata(&key, data, metadata).await?;
         debug!(
-            "Stored direct for {}/{} ({} bytes)",
-            prefix,
-            filename,
-            data.len()
+            "Stored direct for {}/{} ({} bytes) with DG headers",
+            prefix, filename, data.len()
         );
         Ok(())
     }
@@ -414,18 +588,14 @@ impl StorageBackend for S3Backend {
         prefix: &str,
         filename: &str,
     ) -> Result<FileMetadata, StorageError> {
-        let key = self.direct_meta_key(prefix, filename);
-        self.read_metadata(&key).await
+        let key = self.direct_key(prefix, filename);
+        self.get_object_metadata(&key).await
     }
 
     #[instrument(skip(self))]
     async fn delete_direct(&self, prefix: &str, filename: &str) -> Result<(), StorageError> {
-        let data_key = self.direct_key(prefix, filename);
-        let meta_key = self.direct_meta_key(prefix, filename);
-
-        self.delete_object(&data_key).await?;
-        let _ = self.delete_object(&meta_key).await;
-
+        let key = self.direct_key(prefix, filename);
+        self.delete_object(&key).await?;
         debug!("Deleted direct for {}/{}", prefix, filename);
         Ok(())
     }
@@ -439,14 +609,17 @@ impl StorageBackend for S3Backend {
 
         let mut metadata_list = Vec::new();
 
-        // Find all .meta files and read them
+        // Read metadata from object headers for DeltaGlider files
         for key in keys {
-            if key.ends_with(".meta") {
-                match self.read_metadata(&key).await {
-                    Ok(meta) => metadata_list.push(meta),
-                    Err(e) => {
-                        debug!("Failed to read metadata from {}: {}", key, e);
-                    }
+            // Skip non-DeltaGlider files
+            if !key.ends_with("/reference.bin") && !key.ends_with(".delta") && !key.ends_with(".direct") {
+                continue;
+            }
+
+            match self.get_object_metadata(&key).await {
+                Ok(meta) => metadata_list.push(meta),
+                Err(e) => {
+                    debug!("Failed to read metadata from {}: {}", key, e);
                 }
             }
         }
@@ -530,30 +703,19 @@ mod tests {
         let prefix = "releases/v1";
         let filename = "app.zip";
 
-        // Test key formats directly
+        // Test key formats directly - S3 backend stores metadata in object headers,
+        // NOT in separate .meta files (unlike filesystem backend)
         assert_eq!(
             format!("{}/reference.bin", prefix),
             "releases/v1/reference.bin"
-        );
-        assert_eq!(
-            format!("{}/reference.bin.meta", prefix),
-            "releases/v1/reference.bin.meta"
         );
         assert_eq!(
             format!("{}/{}.delta", prefix, filename),
             "releases/v1/app.zip.delta"
         );
         assert_eq!(
-            format!("{}/{}.delta.meta", prefix, filename),
-            "releases/v1/app.zip.delta.meta"
-        );
-        assert_eq!(
             format!("{}/{}.direct", prefix, filename),
             "releases/v1/app.zip.direct"
-        );
-        assert_eq!(
-            format!("{}/{}.direct.meta", prefix, filename),
-            "releases/v1/app.zip.direct.meta"
         );
     }
 

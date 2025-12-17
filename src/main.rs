@@ -1,6 +1,6 @@
 //! DeltaGlider Proxy - S3-compatible object storage with DeltaGlider deduplication
 
-use axum::{routing::get, Router};
+use axum::{extract::DefaultBodyLimit, routing::get, Router};
 use clap::Parser;
 use std::sync::Arc;
 use deltaglider_proxy::api::handlers::{
@@ -151,6 +151,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .post(delete_objects),
         )
         .layer(TraceLayer::new_for_http())
+        // Increase body size limit to match max_object_size config (default 2MB is too small)
+        .layer(DefaultBodyLimit::max(config.max_object_size as usize))
         .with_state(state);
 
     // Start server with graceful shutdown

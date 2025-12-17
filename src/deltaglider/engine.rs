@@ -175,8 +175,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 .await;
         }
 
+        // Check if deltaspace already has a reference (existing deltaspace)
+        let has_existing_reference = self.deltaspace_mgr.has_reference(&deltaspace_id).await;
+
         // Ensure deltaspace has an internal reference baseline.
-        let ref_meta = if self.deltaspace_mgr.has_reference(&deltaspace_id).await {
+        let ref_meta = if has_existing_reference {
             self.deltaspace_mgr
                 .get_reference_metadata(&deltaspace_id)
                 .await?
@@ -205,12 +208,17 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             ratio * 100.0
         );
 
-        // Check if delta is worth storing
-        if ratio >= self.max_delta_ratio {
+        // Only apply the threshold when NO reference exists yet (first file in deltaspace).
+        // Once a reference exists, ALWAYS store as delta - the deltaspace is committed to
+        // delta storage and we want all related files to benefit from the shared reference.
+        if !has_existing_reference && ratio >= self.max_delta_ratio {
             debug!(
-                "Delta ratio {:.2} >= {:.2}, storing directly",
+                "First file in deltaspace with poor delta ratio {:.2} >= {:.2}, storing directly",
                 ratio, self.max_delta_ratio
             );
+            // Clean up the reference we just created since we're not using it
+            self.cache.invalidate(&deltaspace_id);
+            self.deltaspace_mgr.delete_reference(&deltaspace_id).await?;
             self.delete_delta_if_exists(&deltaspace_id, &obj_key.filename)
                 .await?;
             return self
@@ -819,5 +827,48 @@ mod tests {
         let result = engine.store("bucket", "large.zip", &large_data, None).await;
 
         assert!(matches!(result, Err(EngineError::TooLarge { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_always_delta_when_reference_exists() {
+        // Test that once a reference exists, subsequent files are ALWAYS stored as delta
+        // even if the delta ratio is poor (exceeds threshold)
+        let tmp = TempDir::new().unwrap();
+        let config = Config {
+            backend: BackendConfig::Filesystem {
+                path: tmp.path().to_path_buf(),
+            },
+            max_delta_ratio: 0.1, // Very low threshold - only 10% ratio acceptable
+            max_object_size: 10 * 1024 * 1024,
+            cache_size_mb: 10,
+            ..Default::default()
+        };
+        let engine = DeltaGliderEngine::new_filesystem(&config).await.unwrap();
+
+        // First file creates reference baseline and gets stored as delta
+        let base_data = vec![0u8; 10000];
+        let result1 = engine
+            .store("bucket", "releases/v1.zip", &base_data, None)
+            .await
+            .unwrap();
+        assert!(matches!(result1.metadata.storage_info, StorageInfo::Delta { .. }));
+
+        // Second file is completely different (random bytes) - poor delta ratio
+        // But since reference already exists, it should still be stored as delta
+        let random_data: Vec<u8> = (0..10000).map(|i| (i % 256) as u8).collect();
+        let result2 = engine
+            .store("bucket", "releases/v2.zip", &random_data, None)
+            .await
+            .unwrap();
+
+        // Key assertion: should be delta even with poor ratio because reference exists
+        assert!(
+            matches!(result2.metadata.storage_info, StorageInfo::Delta { .. }),
+            "Should store as delta when reference exists, even with poor ratio"
+        );
+
+        // Verify retrieval works
+        let (retrieved, _meta) = engine.retrieve("bucket", "releases/v2.zip").await.unwrap();
+        assert_eq!(retrieved, random_data);
     }
 }

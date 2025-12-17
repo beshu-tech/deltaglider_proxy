@@ -1,7 +1,14 @@
 //! xdelta3 codec wrapper for delta encoding/decoding
+//!
+//! Uses the xdelta3 CLI binary for decoding to ensure compatibility with
+//! deltas created by the original DeltaGlider Python CLI, and the Rust
+//! xdelta3 crate for encoding (which produces CLI-compatible deltas).
 
+use std::io::Write;
+use std::process::{Command, Stdio};
+use tempfile::NamedTempFile;
 use thiserror::Error;
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 
 /// Errors that can occur during delta encoding/decoding
 #[derive(Debug, Error)]
@@ -14,6 +21,9 @@ pub enum CodecError {
 
     #[error("Data too large: {size} bytes (max: {max} bytes)")]
     TooLarge { size: usize, max: usize },
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// Delta codec using xdelta3
@@ -65,6 +75,7 @@ impl DeltaCodec {
     }
 
     /// Decode a delta to reconstruct the target from source + delta
+    /// Uses the xdelta3 CLI binary for compatibility with original DeltaGlider CLI
     #[instrument(skip(self, source, delta))]
     pub fn decode(&self, source: &[u8], delta: &[u8]) -> Result<Vec<u8>, CodecError> {
         if source.len() > self.max_size {
@@ -80,13 +91,71 @@ impl DeltaCodec {
             delta.len()
         );
 
-        // xdelta3::decode(patch_data, old_data) - note the parameter order!
-        let target = xdelta3::decode(delta, source)
-            .ok_or_else(|| CodecError::DecodeFailed("xdelta3 decoding failed".to_string()))?;
+        // Try Rust crate first (faster, works for deltas we created)
+        if let Some(target) = xdelta3::decode(delta, source) {
+            debug!("Delta decoded via Rust crate: {} bytes", target.len());
+            return Ok(target);
+        }
 
-        debug!("Delta decoded: {} bytes", target.len());
+        // Fallback to CLI for compatibility with original DeltaGlider CLI deltas
+        debug!("Rust crate decode failed, falling back to xdelta3 CLI");
+        self.decode_via_cli(source, delta)
+    }
 
-        Ok(target)
+    /// Decode using the xdelta3 CLI binary
+    /// This handles deltas created by the original DeltaGlider Python CLI
+    fn decode_via_cli(&self, source: &[u8], delta: &[u8]) -> Result<Vec<u8>, CodecError> {
+        // Write source and delta to temporary files
+        let mut source_file = NamedTempFile::new()?;
+        source_file.write_all(source)?;
+        source_file.flush()?;
+
+        let mut delta_file = NamedTempFile::new()?;
+        delta_file.write_all(delta)?;
+        delta_file.flush()?;
+
+        let output_file = NamedTempFile::new()?;
+        let output_path = output_file.path().to_owned();
+
+        // Run xdelta3 -d -f -s source delta output
+        // -f is needed to overwrite the output file created by NamedTempFile
+        let result = Command::new("xdelta3")
+            .args([
+                "-d",
+                "-f",
+                "-s",
+                source_file.path().to_str().unwrap(),
+                delta_file.path().to_str().unwrap(),
+                output_path.to_str().unwrap(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output();
+
+        match result {
+            Ok(output) => {
+                if output.status.success() {
+                    let target = std::fs::read(&output_path)?;
+                    debug!("Delta decoded via CLI: {} bytes", target.len());
+                    Ok(target)
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    warn!("xdelta3 CLI decode failed: {}", stderr);
+                    Err(CodecError::DecodeFailed(format!(
+                        "xdelta3 CLI failed: {}",
+                        stderr
+                    )))
+                }
+            }
+            Err(e) => {
+                warn!("Failed to execute xdelta3 CLI: {}", e);
+                Err(CodecError::DecodeFailed(format!(
+                    "xdelta3 CLI not available: {}",
+                    e
+                )))
+            }
+        }
     }
 
     /// Calculate compression ratio (delta_size / original_size)
