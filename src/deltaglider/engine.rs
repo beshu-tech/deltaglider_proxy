@@ -9,6 +9,7 @@ use crate::storage::{FilesystemBackend, S3Backend, StorageBackend, StorageError}
 use crate::types::{FileMetadata, ObjectKey, StorageInfo, StoreResult};
 use md5::{Digest as Md5Digest, Md5};
 use sha2::Sha256;
+use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, info, instrument, warn};
@@ -71,6 +72,10 @@ pub struct DeltaGliderEngine<S: StorageBackend> {
     cache: ReferenceCache,
     max_delta_ratio: f32,
     max_object_size: u64,
+    /// Per-deltaspace locks to prevent concurrent reference overwrites.
+    /// Outer parking_lot::Mutex for fast synchronous map access;
+    /// inner tokio::sync::Mutex for async-compatible per-prefix locking.
+    prefix_locks: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl DeltaGliderEngine<FilesystemBackend> {
@@ -127,7 +132,23 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             cache: ReferenceCache::new(config.cache_size_mb),
             max_delta_ratio: config.max_delta_ratio,
             max_object_size: config.max_object_size,
+            prefix_locks: parking_lot::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Acquire a per-deltaspace async lock. Different prefixes do not contend.
+    async fn acquire_prefix_lock(
+        &self,
+        prefix: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let mutex = {
+            let mut locks = self.prefix_locks.lock();
+            locks
+                .entry(prefix.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        mutex.lock_owned().await
     }
 
     /// Store an object with automatic delta compression
@@ -168,12 +189,18 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // Check if file type is eligible for delta compression
         if !self.file_router.is_delta_eligible(&obj_key.filename) {
             debug!("File type not delta-eligible, storing directly");
+            let _lock = self.acquire_prefix_lock(&deltaspace_id).await;
             self.delete_delta_if_exists(&deltaspace_id, &obj_key.filename)
                 .await?;
             return self
                 .store_direct(&obj_key, &deltaspace_id, data, sha256, md5, content_type)
                 .await;
         }
+
+        // Acquire per-deltaspace lock to prevent concurrent reference overwrites.
+        // The critical section: has_reference check → set_reference → store_delta
+        // must be atomic per-prefix to avoid two writers both creating a reference.
+        let _lock = self.acquire_prefix_lock(&deltaspace_id).await;
 
         // Check if deltaspace already has a reference (existing deltaspace)
         let has_existing_reference = self.deltaspace_mgr.has_reference(&deltaspace_id).await;
@@ -515,11 +542,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         for deltaspace_id in deltaspace_ids {
             let metas = self.deltaspace_mgr.list_objects(&deltaspace_id).await?;
 
-            let key_prefix = if deltaspace_id == "_root_" {
-                ""
-            } else {
-                deltaspace_id.as_str()
-            };
+            // deltaspace_id is now the actual prefix (empty string for root-level files)
+            let key_prefix = deltaspace_id.as_str();
 
             for meta in metas {
                 if matches!(meta.storage_info, StorageInfo::Reference { .. }) {
@@ -587,6 +611,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let deltaspace_id = obj_key.deltaspace_id();
 
         info!("Deleting {}/{}", bucket, key);
+
+        // Acquire per-deltaspace lock to prevent races with concurrent store/delete
+        // operations that may create or clean up the reference.
+        let _lock = self.acquire_prefix_lock(&deltaspace_id).await;
 
         // Check if object exists
         let mut metadata = self

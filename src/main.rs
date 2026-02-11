@@ -5,10 +5,11 @@ use clap::Parser;
 use std::sync::Arc;
 use deltaglider_proxy::api::handlers::{
     create_bucket, delete_bucket, delete_object, delete_objects, get_object, head_bucket,
-    head_object, health_check, list_buckets, list_objects, put_object_or_copy, AppState,
+    head_object, health_check, list_buckets, list_objects, post_object, put_object_or_copy, AppState,
 };
 use deltaglider_proxy::config::{BackendConfig, Config};
 use deltaglider_proxy::deltaglider::DynEngine;
+use deltaglider_proxy::storage::FilesystemBackend;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tokio::signal;
@@ -100,6 +101,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     info!("  Cache size: {} MB", config.cache_size_mb);
 
+    // Check for orphaned data files from interrupted writes (filesystem only)
+    if let BackendConfig::Filesystem { ref path } = config.backend {
+        if let Ok(backend) = FilesystemBackend::new(path.clone()).await {
+            backend.warn_orphaned_files().await;
+        }
+    }
+
     // Create engine (async initialization with dynamic backend)
     let engine = DynEngine::new(&config).await?;
     let state = Arc::new(AppState {
@@ -130,7 +138,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(get_object)
                 .put(put_object_or_copy)
                 .delete(delete_object)
-                .head(head_object),
+                .head(head_object)
+                .post(post_object),
         )
         // Bucket operations (without trailing slash)
         .route(

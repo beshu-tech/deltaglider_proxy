@@ -1,10 +1,11 @@
 //! S3 API request handlers
 
+use super::aws_chunked::{decode_aws_chunked, get_decoded_content_length, is_aws_chunked};
 use super::errors::S3Error;
 use super::extractors::{ValidatedBucket, ValidatedPath};
 use super::xml::{
-    BucketInfo, CopyObjectResult, DeleteError, DeleteRequest, DeleteResult, DeletedObject,
-    ListBucketResult, ListBucketsResult, S3Object,
+    escape_xml, BucketInfo, CopyObjectResult, DeleteError, DeleteRequest, DeleteResult,
+    DeletedObject, ListBucketResult, ListBucketsResult, S3Object,
 };
 use crate::deltaglider::DynEngine;
 use crate::types::StorageInfo;
@@ -24,9 +25,9 @@ pub struct AppState {
     pub default_bucket: String,
 }
 
-/// Query parameters for LIST operation
+/// Query parameters for bucket-level GET operations
 #[derive(Debug, Deserialize, Default)]
-pub struct ListQuery {
+pub struct BucketGetQuery {
     pub prefix: Option<String>,
     #[serde(rename = "list-type")]
     pub list_type: Option<u8>,
@@ -34,6 +35,12 @@ pub struct ListQuery {
     pub max_keys: Option<u32>,
     #[serde(rename = "continuation-token")]
     pub continuation_token: Option<String>,
+    /// GetBucketLocation query parameter
+    pub location: Option<String>,
+    /// GetBucketVersioning query parameter
+    pub versioning: Option<String>,
+    /// ListMultipartUploads query parameter
+    pub uploads: Option<String>,
 }
 
 /// PUT object handler (internal)
@@ -166,14 +173,36 @@ pub async fn head_object(
         .into_response())
 }
 
-/// LIST objects handler (ListObjectsV2)
-/// GET /{bucket}?list-type=2&prefix=
+/// Bucket-level GET handler - dispatches to appropriate operation based on query params
+/// GET /{bucket}?list-type=2&prefix=  -> ListObjectsV2
+/// GET /{bucket}?location            -> GetBucketLocation
+/// GET /{bucket}?versioning          -> GetBucketVersioning
+/// GET /{bucket}?uploads             -> ListMultipartUploads
 #[instrument(skip(state))]
-pub async fn list_objects(
+pub async fn bucket_get_handler(
     State(state): State<Arc<AppState>>,
     ValidatedBucket(bucket): ValidatedBucket,
-    Query(query): Query<ListQuery>,
+    Query(query): Query<BucketGetQuery>,
 ) -> Result<Response, S3Error> {
+    // Check for GetBucketLocation
+    if query.location.is_some() {
+        info!("GET bucket location: {}", bucket);
+        return get_bucket_location(&bucket).await;
+    }
+
+    // Check for GetBucketVersioning
+    if query.versioning.is_some() {
+        info!("GET bucket versioning: {}", bucket);
+        return get_bucket_versioning(&bucket).await;
+    }
+
+    // Check for ListMultipartUploads
+    if query.uploads.is_some() {
+        info!("LIST multipart uploads: {}", bucket);
+        return list_multipart_uploads(&bucket).await;
+    }
+
+    // Default: ListObjects
     if let Some(list_type) = query.list_type {
         if list_type != 2 {
             return Err(S3Error::InvalidArgument(
@@ -214,6 +243,51 @@ pub async fn list_objects(
     Ok((StatusCode::OK, [("Content-Type", "application/xml")], xml).into_response())
 }
 
+/// GetBucketLocation handler
+/// GET /{bucket}?location
+async fn get_bucket_location(_bucket: &str) -> Result<Response, S3Error> {
+    // Return a fixed location - we use us-east-1 as default
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">us-east-1</LocationConstraint>"#;
+    Ok((StatusCode::OK, [("Content-Type", "application/xml")], xml).into_response())
+}
+
+/// GetBucketVersioning handler
+/// GET /{bucket}?versioning
+async fn get_bucket_versioning(_bucket: &str) -> Result<Response, S3Error> {
+    // Return empty VersioningConfiguration - versioning is not enabled
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>"#;
+    Ok((StatusCode::OK, [("Content-Type", "application/xml")], xml).into_response())
+}
+
+/// ListMultipartUploads handler (stub)
+/// GET /{bucket}?uploads
+async fn list_multipart_uploads(bucket: &str) -> Result<Response, S3Error> {
+    // Return empty list - no ongoing multipart uploads
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Bucket>{}</Bucket>
+  <KeyMarker/>
+  <UploadIdMarker/>
+  <MaxUploads>1000</MaxUploads>
+  <IsTruncated>false</IsTruncated>
+</ListMultipartUploadsResult>"#,
+        escape_xml(bucket)
+    );
+    Ok((StatusCode::OK, [("Content-Type", "application/xml")], xml).into_response())
+}
+
+/// Alias for backward compatibility
+pub async fn list_objects(
+    state: State<Arc<AppState>>,
+    bucket: ValidatedBucket,
+    query: Query<BucketGetQuery>,
+) -> Result<Response, S3Error> {
+    bucket_get_handler(state, bucket, query).await
+}
+
 /// DELETE object handler
 /// DELETE /{bucket}/{key}
 #[instrument(skip(state))]
@@ -240,6 +314,19 @@ pub async fn delete_object(
 #[derive(Debug, Deserialize, Default)]
 pub struct BucketPostQuery {
     pub delete: Option<String>,
+}
+
+/// Query parameters for object-level operations (multipart upload)
+#[derive(Debug, Deserialize, Default)]
+pub struct ObjectQuery {
+    /// CreateMultipartUpload (POST with ?uploads)
+    pub uploads: Option<String>,
+    /// UploadPart / CompleteMultipartUpload (with ?uploadId)
+    #[serde(rename = "uploadId")]
+    pub upload_id: Option<String>,
+    /// UploadPart (PUT with ?partNumber)
+    #[serde(rename = "partNumber")]
+    pub part_number: Option<u32>,
 }
 
 /// DELETE multiple objects handler
@@ -375,22 +462,103 @@ async fn copy_object_inner(
     Ok((StatusCode::OK, [("Content-Type", "application/xml")], xml).into_response())
 }
 
-/// PUT object handler with copy detection
+/// PUT object handler with copy detection and multipart upload support
 /// PUT /{bucket}/{key}
 /// Detects x-amz-copy-source header to dispatch to copy operation
+/// Detects ?partNumber&uploadId for multipart upload part
 #[instrument(skip(state, body))]
 pub async fn put_object_or_copy(
     State(state): State<Arc<AppState>>,
     ValidatedPath { bucket, key }: ValidatedPath,
+    Query(query): Query<ObjectQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, S3Error> {
+    // Check if this is a multipart upload part
+    if query.part_number.is_some() && query.upload_id.is_some() {
+        info!(
+            "UploadPart {}/{} part={} uploadId={}",
+            bucket,
+            key,
+            query.part_number.unwrap(),
+            query.upload_id.as_ref().unwrap()
+        );
+        return Err(S3Error::NotImplemented(
+            "Multipart upload is not supported. Use single PUT for uploads.".to_string(),
+        ));
+    }
+
     // Check if this is a copy operation
     if headers.contains_key("x-amz-copy-source") {
         copy_object_inner(&state, &bucket, &key, &headers).await
     } else {
-        put_object_inner(&state, &bucket, &key, &headers, &body).await
+        // Decode AWS chunked transfer encoding if present
+        let decoded_body = if is_aws_chunked(&headers) {
+            let expected_len = get_decoded_content_length(&headers);
+            debug!(
+                "Decoding AWS chunked payload: {} bytes, expected decoded: {:?}",
+                body.len(),
+                expected_len
+            );
+            match decode_aws_chunked(&body, expected_len) {
+                Some(decoded) => {
+                    debug!(
+                        "Successfully decoded AWS chunked: {} -> {} bytes",
+                        body.len(),
+                        decoded.len()
+                    );
+                    decoded
+                }
+                None => {
+                    warn!(
+                        "Failed to decode AWS chunked payload, using raw body ({} bytes)",
+                        body.len()
+                    );
+                    body
+                }
+            }
+        } else {
+            body
+        };
+
+        put_object_inner(&state, &bucket, &key, &headers, &decoded_body).await
     }
+}
+
+/// POST object handler for multipart upload operations
+/// POST /{bucket}/{key}?uploads - CreateMultipartUpload
+/// POST /{bucket}/{key}?uploadId=X - CompleteMultipartUpload
+#[instrument(skip(_state, _body))]
+pub async fn post_object(
+    State(_state): State<Arc<AppState>>,
+    ValidatedPath { bucket, key }: ValidatedPath,
+    Query(query): Query<ObjectQuery>,
+    _body: Bytes,
+) -> Result<Response, S3Error> {
+    // CreateMultipartUpload
+    if query.uploads.is_some() {
+        info!("CreateMultipartUpload {}/{}", bucket, key);
+        return Err(S3Error::NotImplemented(
+            "Multipart upload is not supported. Use single PUT for uploads.".to_string(),
+        ));
+    }
+
+    // CompleteMultipartUpload
+    if query.upload_id.is_some() {
+        info!(
+            "CompleteMultipartUpload {}/{} uploadId={}",
+            bucket,
+            key,
+            query.upload_id.as_ref().unwrap()
+        );
+        return Err(S3Error::NotImplemented(
+            "Multipart upload is not supported. Use single PUT for uploads.".to_string(),
+        ));
+    }
+
+    Err(S3Error::InvalidRequest(
+        "POST on object requires ?uploads or ?uploadId parameter".to_string(),
+    ))
 }
 
 // ============================================================================

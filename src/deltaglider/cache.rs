@@ -5,11 +5,16 @@ use parking_lot::Mutex;
 use std::num::NonZeroUsize;
 use tracing::debug;
 
+/// Internal cache state protected by a single mutex to prevent deadlocks
+struct CacheInner {
+    cache: LruCache<String, Vec<u8>>,
+    current_size: usize,
+}
+
 /// LRU cache for frequently accessed reference files
 pub struct ReferenceCache {
-    cache: Mutex<LruCache<String, Vec<u8>>>,
+    inner: Mutex<CacheInner>,
     max_size_bytes: usize,
-    current_size: Mutex<usize>,
 }
 
 impl ReferenceCache {
@@ -18,16 +23,18 @@ impl ReferenceCache {
         // Estimate max entries based on average reference size (assume ~1MB avg)
         let max_entries = max_size_mb.max(1);
         Self {
-            cache: Mutex::new(LruCache::new(NonZeroUsize::new(max_entries).unwrap())),
+            inner: Mutex::new(CacheInner {
+                cache: LruCache::new(NonZeroUsize::new(max_entries).unwrap()),
+                current_size: 0,
+            }),
             max_size_bytes: max_size_mb * 1024 * 1024,
-            current_size: Mutex::new(0),
         }
     }
 
     /// Get a reference from cache
     pub fn get(&self, prefix: &str) -> Option<Vec<u8>> {
-        let mut cache = self.cache.lock();
-        let result = cache.get(prefix).cloned();
+        let mut inner = self.inner.lock();
+        let result = inner.cache.get(prefix).cloned();
         if result.is_some() {
             debug!("Cache hit for prefix: {}", prefix);
         } else {
@@ -49,13 +56,12 @@ impl ReferenceCache {
             return;
         }
 
-        let mut cache = self.cache.lock();
-        let mut current_size = self.current_size.lock();
+        let mut inner = self.inner.lock();
 
         // Evict entries until we have space
-        while *current_size + data_size > self.max_size_bytes {
-            if let Some((evicted_key, evicted_data)) = cache.pop_lru() {
-                *current_size = current_size.saturating_sub(evicted_data.len());
+        while inner.current_size + data_size > self.max_size_bytes {
+            if let Some((evicted_key, evicted_data)) = inner.cache.pop_lru() {
+                inner.current_size = inner.current_size.saturating_sub(evicted_data.len());
                 debug!(
                     "Evicted {} from cache ({} bytes)",
                     evicted_key,
@@ -67,45 +73,43 @@ impl ReferenceCache {
         }
 
         // Add to cache
-        if let Some(old) = cache.put(prefix.to_string(), data) {
-            *current_size = current_size.saturating_sub(old.len());
+        if let Some(old) = inner.cache.put(prefix.to_string(), data) {
+            inner.current_size = inner.current_size.saturating_sub(old.len());
         }
-        *current_size += data_size;
+        inner.current_size += data_size;
 
         debug!(
             "Cached reference for {}: {} bytes (total cache: {} bytes)",
-            prefix, data_size, *current_size
+            prefix, data_size, inner.current_size
         );
     }
 
     /// Invalidate a cache entry
     pub fn invalidate(&self, prefix: &str) {
-        let mut cache = self.cache.lock();
-        let mut current_size = self.current_size.lock();
+        let mut inner = self.inner.lock();
 
-        if let Some(data) = cache.pop(prefix) {
-            *current_size = current_size.saturating_sub(data.len());
+        if let Some(data) = inner.cache.pop(prefix) {
+            inner.current_size = inner.current_size.saturating_sub(data.len());
             debug!("Invalidated cache entry for {}", prefix);
         }
     }
 
     /// Clear the entire cache
     pub fn clear(&self) {
-        let mut cache = self.cache.lock();
-        let mut current_size = self.current_size.lock();
-        cache.clear();
-        *current_size = 0;
+        let mut inner = self.inner.lock();
+        inner.cache.clear();
+        inner.current_size = 0;
         debug!("Cache cleared");
     }
 
     /// Get current cache size in bytes
     pub fn size(&self) -> usize {
-        *self.current_size.lock()
+        self.inner.lock().current_size
     }
 
     /// Get number of entries in cache
     pub fn len(&self) -> usize {
-        self.cache.lock().len()
+        self.inner.lock().cache.len()
     }
 
     /// Check if cache is empty
@@ -139,9 +143,11 @@ mod tests {
     fn test_cache_eviction() {
         // 1KB cache
         let cache = ReferenceCache {
-            cache: Mutex::new(LruCache::new(NonZeroUsize::new(2).unwrap())),
+            inner: Mutex::new(CacheInner {
+                cache: LruCache::new(NonZeroUsize::new(2).unwrap()),
+                current_size: 0,
+            }),
             max_size_bytes: 1024,
-            current_size: Mutex::new(0),
         };
 
         // Add entries that exceed cache size

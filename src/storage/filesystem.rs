@@ -3,9 +3,50 @@
 use super::traits::{StorageBackend, StorageError};
 use crate::types::FileMetadata;
 use async_trait::async_trait;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use tempfile::NamedTempFile;
 use tokio::fs;
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
+
+/// Async-safe path existence check (avoids blocking the Tokio runtime)
+async fn path_exists(path: &Path) -> bool {
+    fs::try_exists(path).await.unwrap_or(false)
+}
+
+/// Async-safe directory check
+async fn is_dir(path: &Path) -> bool {
+    fs::metadata(path)
+        .await
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+}
+
+/// Atomically write data to a file using write-to-temp + fsync + rename.
+///
+/// Creates a temp file in the same parent directory (guaranteeing same-filesystem
+/// for atomic rename on POSIX), writes all data, fsyncs, then atomically renames
+/// to the target path. A crash at any point leaves either the old file intact
+/// or no file at all -- never a truncated file.
+async fn atomic_write(path: &Path, data: &[u8]) -> Result<(), StorageError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| StorageError::Other("Cannot atomic-write to a path with no parent".into()))?
+        .to_path_buf();
+    let path = path.to_path_buf();
+    let data = data.to_vec();
+
+    tokio::task::spawn_blocking(move || {
+        let mut tmp = NamedTempFile::new_in(&parent)?;
+        tmp.write_all(&data)?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(&path)
+            .map_err(std::io::Error::other)?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| StorageError::Other(format!("spawn_blocking join failed: {}", e)))?
+}
 
 /// Filesystem storage backend
 ///
@@ -39,9 +80,13 @@ impl FilesystemBackend {
     }
 
     /// Get the full path for a deltaspace directory
+    /// For root-level files (empty prefix), files are stored directly in deltaspaces/
     fn deltaspace_dir(&self, prefix: &str) -> PathBuf {
-        let safe_prefix = if prefix.is_empty() { "_root_" } else { prefix };
-        self.root.join("deltaspaces").join(safe_prefix)
+        if prefix.is_empty() {
+            self.root.join("deltaspaces")
+        } else {
+            self.root.join("deltaspaces").join(prefix)
+        }
     }
 
     /// Get the path for the reference file
@@ -89,11 +134,12 @@ impl FilesystemBackend {
     /// Calculate total size of a directory recursively
     async fn dir_size(&self, path: &Path) -> Result<u64, StorageError> {
         let mut total = 0;
-        if path.is_dir() {
+        if is_dir(path).await {
             let mut entries = fs::read_dir(path).await?;
             while let Some(entry) = entries.next_entry().await? {
                 let path = entry.path();
-                if path.is_dir() {
+                let ft = entry.file_type().await?;
+                if ft.is_dir() {
                     total += Box::pin(self.dir_size(&path)).await?;
                 } else {
                     total += entry.metadata().await?.len();
@@ -101,6 +147,81 @@ impl FilesystemBackend {
             }
         }
         Ok(total)
+    }
+
+    /// Log warnings for orphaned data files (data without corresponding metadata).
+    /// These indicate incomplete writes from a previous crash. The data is harmless
+    /// but wastes disk space.
+    pub async fn warn_orphaned_files(&self) {
+        let deltaspaces_dir = self.root.join("deltaspaces");
+        if !path_exists(&deltaspaces_dir).await {
+            return;
+        }
+        let mut orphans = Vec::new();
+        if let Err(e) =
+            Self::find_orphans_recursive(&deltaspaces_dir, &mut orphans).await
+        {
+            warn!("Failed to scan for orphaned files: {}", e);
+            return;
+        }
+        for orphan in &orphans {
+            warn!(
+                "Orphaned data file (no metadata): {} — likely from an interrupted write",
+                orphan.display()
+            );
+        }
+        if !orphans.is_empty() {
+            warn!(
+                "Found {} orphaned data file(s). These consume disk but are not served. \
+                 They can be safely deleted.",
+                orphans.len()
+            );
+        }
+    }
+
+    /// Recursively find data files that have no corresponding .meta sidecar
+    fn find_orphans_recursive<'a>(
+        dir: &'a Path,
+        orphans: &'a mut Vec<PathBuf>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), StorageError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut entries = match fs::read_dir(dir).await {
+                Ok(e) => e,
+                Err(_) => return Ok(()),
+            };
+
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+                let ft = entry.file_type().await?;
+                if ft.is_dir() {
+                    Self::find_orphans_recursive(&path, orphans).await?;
+                } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    // Data files are: reference.bin, *.delta, *.direct
+                    // Their metadata sidecars are: reference.bin.meta, *.delta.meta, *.direct.meta
+                    let is_data_file = name == "reference.bin"
+                        || (name.ends_with(".delta") && !name.ends_with(".delta.meta"))
+                        || (name.ends_with(".direct") && !name.ends_with(".direct.meta"));
+
+                    if is_data_file {
+                        let meta_path = path.with_extension(
+                            path.extension().unwrap_or_default().to_string_lossy().to_string()
+                                + ".meta",
+                        );
+                        // For reference.bin -> reference.bin.meta
+                        let meta_path = if name == "reference.bin" {
+                            dir.join("reference.bin.meta")
+                        } else {
+                            meta_path
+                        };
+                        if !path_exists(&meta_path).await {
+                            orphans.push(path);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })
     }
 
     /// Recursively find all deltaspaces (directories containing deltaglider files)
@@ -116,7 +237,8 @@ impl FilesystemBackend {
 
             while let Some(entry) = entries.next_entry().await? {
                 let path = entry.path();
-                if path.is_dir() {
+                let ft = entry.file_type().await?;
+                if ft.is_dir() {
                     // Recursively check subdirectories
                     Self::find_deltaspaces_recursive(base_dir, &path, prefixes).await?;
                 } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
@@ -147,7 +269,7 @@ impl FilesystemBackend {
 
     /// Read metadata from a .meta file
     async fn read_metadata(&self, meta_path: &Path) -> Result<FileMetadata, StorageError> {
-        if !meta_path.exists() {
+        if !path_exists(meta_path).await {
             return Err(StorageError::NotFound(meta_path.display().to_string()));
         }
         let data = fs::read(meta_path).await?;
@@ -163,7 +285,7 @@ impl FilesystemBackend {
     ) -> Result<(), StorageError> {
         self.ensure_dir(meta_path).await?;
         let data = serde_json::to_vec_pretty(metadata)?;
-        fs::write(meta_path, data).await?;
+        atomic_write(meta_path, &data).await?;
         debug!("Wrote metadata to {:?}", meta_path);
         Ok(())
     }
@@ -175,7 +297,7 @@ impl StorageBackend for FilesystemBackend {
     async fn put_raw(&self, path: &Path, data: &[u8]) -> Result<(), StorageError> {
         let full_path = self.root.join(path);
         self.ensure_dir(&full_path).await?;
-        fs::write(&full_path, data).await?;
+        atomic_write(&full_path, data).await?;
         debug!("Wrote {} bytes to {:?}", data.len(), full_path);
         Ok(())
     }
@@ -183,7 +305,7 @@ impl StorageBackend for FilesystemBackend {
     #[instrument(skip(self))]
     async fn get_raw(&self, path: &Path) -> Result<Vec<u8>, StorageError> {
         let full_path = self.root.join(path);
-        if !full_path.exists() {
+        if !path_exists(&full_path).await {
             return Err(StorageError::NotFound(path.display().to_string()));
         }
         let data = fs::read(&full_path).await?;
@@ -192,13 +314,13 @@ impl StorageBackend for FilesystemBackend {
     }
 
     async fn exists(&self, path: &Path) -> bool {
-        self.root.join(path).exists()
+        path_exists(&self.root.join(path)).await
     }
 
     #[instrument(skip(self))]
     async fn delete(&self, path: &Path) -> Result<(), StorageError> {
         let full_path = self.root.join(path);
-        if !full_path.exists() {
+        if !path_exists(&full_path).await {
             return Err(StorageError::NotFound(path.display().to_string()));
         }
         fs::remove_file(&full_path).await?;
@@ -209,16 +331,16 @@ impl StorageBackend for FilesystemBackend {
     #[instrument(skip(self))]
     async fn list_prefix(&self, prefix: &Path) -> Result<Vec<String>, StorageError> {
         let dir = self.root.join(prefix);
-        if !dir.exists() {
+        if !path_exists(&dir).await {
             return Ok(Vec::new());
         }
 
         let mut files = Vec::new();
         let mut entries = fs::read_dir(&dir).await?;
         while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.is_file() {
-                if let Some(name) = path.file_name() {
+            let ft = entry.file_type().await?;
+            if ft.is_file() {
+                if let Some(name) = entry.path().file_name() {
                     files.push(name.to_string_lossy().to_string());
                 }
             }
@@ -231,7 +353,7 @@ impl StorageBackend for FilesystemBackend {
     #[instrument(skip(self))]
     async fn get_reference(&self, prefix: &str) -> Result<Vec<u8>, StorageError> {
         let path = self.reference_path(prefix);
-        if !path.exists() {
+        if !path_exists(&path).await {
             return Err(StorageError::NotFound(format!(
                 "Reference for prefix: {}",
                 prefix
@@ -257,7 +379,7 @@ impl StorageBackend for FilesystemBackend {
         let meta_path = self.reference_meta_path(prefix);
 
         self.ensure_dir(&data_path).await?;
-        fs::write(&data_path, data).await?;
+        atomic_write(&data_path, data).await?;
         self.write_metadata(&meta_path, metadata).await?;
 
         debug!(
@@ -285,7 +407,7 @@ impl StorageBackend for FilesystemBackend {
     }
 
     async fn has_reference(&self, prefix: &str) -> bool {
-        self.reference_path(prefix).exists()
+        path_exists(&self.reference_path(prefix)).await
     }
 
     #[instrument(skip(self))]
@@ -293,17 +415,20 @@ impl StorageBackend for FilesystemBackend {
         let data_path = self.reference_path(prefix);
         let meta_path = self.reference_meta_path(prefix);
 
-        if !data_path.exists() {
+        if !path_exists(&data_path).await {
             return Err(StorageError::NotFound(format!(
                 "Reference for prefix: {}",
                 prefix
             )));
         }
 
-        fs::remove_file(&data_path).await?;
-        if meta_path.exists() {
+        // Delete metadata first (reverse of write ordering).
+        // Removing the commit-marker first makes the object logically disappear
+        // before we remove the data, preventing dangling metadata pointers.
+        if path_exists(&meta_path).await {
             fs::remove_file(&meta_path).await?;
         }
+        fs::remove_file(&data_path).await?;
 
         debug!("Deleted reference for prefix {:?}", prefix);
         Ok(())
@@ -314,7 +439,7 @@ impl StorageBackend for FilesystemBackend {
     #[instrument(skip(self))]
     async fn get_delta(&self, prefix: &str, filename: &str) -> Result<Vec<u8>, StorageError> {
         let path = self.delta_path(prefix, filename);
-        if !path.exists() {
+        if !path_exists(&path).await {
             return Err(StorageError::NotFound(format!(
                 "Delta: {}/{}",
                 prefix, filename
@@ -342,7 +467,7 @@ impl StorageBackend for FilesystemBackend {
         let meta_path = self.delta_meta_path(prefix, filename);
 
         self.ensure_dir(&data_path).await?;
-        fs::write(&data_path, data).await?;
+        atomic_write(&data_path, data).await?;
         self.write_metadata(&meta_path, metadata).await?;
 
         debug!(
@@ -369,17 +494,18 @@ impl StorageBackend for FilesystemBackend {
         let data_path = self.delta_path(prefix, filename);
         let meta_path = self.delta_meta_path(prefix, filename);
 
-        if !data_path.exists() {
+        if !path_exists(&data_path).await {
             return Err(StorageError::NotFound(format!(
                 "Delta: {}/{}",
                 prefix, filename
             )));
         }
 
-        fs::remove_file(&data_path).await?;
-        if meta_path.exists() {
+        // Metadata first (reverse of write ordering)
+        if path_exists(&meta_path).await {
             fs::remove_file(&meta_path).await?;
         }
+        fs::remove_file(&data_path).await?;
 
         debug!("Deleted delta for {}/{}", prefix, filename);
         Ok(())
@@ -390,7 +516,7 @@ impl StorageBackend for FilesystemBackend {
     #[instrument(skip(self))]
     async fn get_direct(&self, prefix: &str, filename: &str) -> Result<Vec<u8>, StorageError> {
         let path = self.direct_path(prefix, filename);
-        if !path.exists() {
+        if !path_exists(&path).await {
             return Err(StorageError::NotFound(format!(
                 "Direct: {}/{}",
                 prefix, filename
@@ -418,7 +544,7 @@ impl StorageBackend for FilesystemBackend {
         let meta_path = self.direct_meta_path(prefix, filename);
 
         self.ensure_dir(&data_path).await?;
-        fs::write(&data_path, data).await?;
+        atomic_write(&data_path, data).await?;
         self.write_metadata(&meta_path, metadata).await?;
 
         debug!(
@@ -445,17 +571,18 @@ impl StorageBackend for FilesystemBackend {
         let data_path = self.direct_path(prefix, filename);
         let meta_path = self.direct_meta_path(prefix, filename);
 
-        if !data_path.exists() {
+        if !path_exists(&data_path).await {
             return Err(StorageError::NotFound(format!(
                 "Direct: {}/{}",
                 prefix, filename
             )));
         }
 
-        fs::remove_file(&data_path).await?;
-        if meta_path.exists() {
+        // Metadata first (reverse of write ordering)
+        if path_exists(&meta_path).await {
             fs::remove_file(&meta_path).await?;
         }
+        fs::remove_file(&data_path).await?;
 
         debug!("Deleted direct for {}/{}", prefix, filename);
         Ok(())
@@ -466,7 +593,7 @@ impl StorageBackend for FilesystemBackend {
     #[instrument(skip(self))]
     async fn scan_deltaspace(&self, prefix: &str) -> Result<Vec<FileMetadata>, StorageError> {
         let dir = self.deltaspace_dir(prefix);
-        if !dir.exists() {
+        if !path_exists(&dir).await {
             return Ok(Vec::new());
         }
 
@@ -500,7 +627,7 @@ impl StorageBackend for FilesystemBackend {
     #[instrument(skip(self))]
     async fn list_deltaspaces(&self) -> Result<Vec<String>, StorageError> {
         let deltaspaces_dir = self.root.join("deltaspaces");
-        if !deltaspaces_dir.exists() {
+        if !path_exists(&deltaspaces_dir).await {
             return Ok(Vec::new());
         }
 
