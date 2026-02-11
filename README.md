@@ -29,7 +29,8 @@ aws --endpoint-url "$DELTAGLIDER_PROXY_ENDPOINT" s3 cp s3://default/releases/v2.
 ## Quick Start
 
 ```bash
-# Build
+# Build (requires Node.js for the demo UI)
+cd demo/s3-browser/ui && npm install && npm run build && cd -
 cargo build --release
 
 # Run with filesystem backend (for testing)
@@ -44,6 +45,8 @@ AWS_ACCESS_KEY_ID=minioadmin \
 AWS_SECRET_ACCESS_KEY=minioadmin \
 ./target/release/deltaglider_proxy
 ```
+
+An embedded demo UI automatically starts on **S3 port + 1** (e.g. `http://localhost:9001` or `http://localhost:9003`).
 
 Point your S3 client at DeltaGlider Proxy (default `http://localhost:9000`, or `http://localhost:9002` in the MinIO example above) and use bucket name `default`:
 
@@ -139,11 +142,31 @@ OPTIONS:
     -V, --version           Print version
 ```
 
+## Demo UI
+
+An embedded React-based S3 browser ships inside the binary (via [rust-embed](https://crates.io/crates/rust-embed)). It starts automatically on **S3 port + 1** — no extra container needed.
+
+```bash
+# Local dev: build the UI first, then the Rust binary
+cd demo/s3-browser/ui && npm install && npm run build && cd -
+cargo run -- --listen 127.0.0.1:9002
+# S3 API  → http://localhost:9002
+# Demo UI → http://localhost:9003  (auto-connects to S3 API)
+
+# Docker: the Dockerfile handles the Node build automatically
+cd demo/s3-browser && docker compose up --build
+# S3 API  → http://localhost:9002
+# Demo UI → http://localhost:9003
+```
+
+The UI auto-detects the S3 endpoint (port - 1) from its own URL, so it works out of the box with zero configuration.
+
 ## Development
 
 ### Prerequisites
 
 - Rust 1.75+
+- Node.js 20+ (for demo UI build)
 - Docker (for MinIO testing)
 
 ### Build & Test
@@ -180,7 +203,9 @@ src/
 │   └── s3.rs          # S3 backend
 ├── config.rs          # Configuration loading
 ├── types.rs           # Core types (FileMetadata, etc)
+├── demo.rs            # Embedded React demo UI (rust-embed, served on S3 port + 1)
 └── main.rs            # Server entry point
+demo/s3-browser/ui/    # React demo UI source (Vite + TypeScript)
 ```
 
 ## S3 API Compatibility

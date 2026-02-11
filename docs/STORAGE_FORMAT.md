@@ -9,9 +9,9 @@ DeltaGlider Proxy groups objects into **deltaspaces** based on their key prefix 
 - Baseline data: `reference.bin` (full bytes)
 - Baseline metadata: `reference.bin.meta` (JSON)
 
-The baseline is **not** a user-visible S3 key. It’s internal, and it is seeded from the first delta-eligible upload in that deltaspace. Every delta patch is computed **against this baseline** (no delta chains).
+The baseline is **not** a user-visible S3 key. It's internal, and it is seeded from the first delta-eligible upload in that deltaspace. Every delta patch is computed **against this baseline** (no delta chains).
 
-Root keys (no `/` in the key) use the special deltaspace id `_root_`.
+Root-level keys (no `/` in the key) use an empty deltaspace id and their files are stored directly in the deltaspaces root (filesystem) or bucket root (S3).
 
 ## What gets stored for user objects
 
@@ -40,8 +40,10 @@ data/
       v1.zip.delta.meta
       readme.txt.direct
       readme.txt.direct.meta
-    _root_/
-      ...
+    reference.bin              # Root-level deltaspace
+    reference.bin.meta
+    file.zip.delta
+    file.zip.delta.meta
 ```
 
 If a deltaspace prefix contains `/`, it becomes nested directories under `deltaspaces/`.

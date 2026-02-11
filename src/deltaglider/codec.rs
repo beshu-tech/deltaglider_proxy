@@ -255,4 +255,33 @@ mod tests {
 
         assert!(matches!(result, Err(CodecError::TooLarge { .. })));
     }
+
+    #[test]
+    fn test_decode_corrupted_delta_fails() {
+        let codec = DeltaCodec::default();
+
+        let source = b"Hello, this is the original file content!";
+        let target = b"Hello, this is the modified file content!";
+
+        let mut delta = codec.encode(source, target).unwrap();
+        // Corrupt the delta by flipping bytes
+        for byte in delta.iter_mut() {
+            *byte = byte.wrapping_add(1);
+        }
+
+        let result = codec.decode(source, &delta);
+        assert!(result.is_err() || result.unwrap() != target);
+    }
+
+    #[test]
+    fn test_encode_empty_target() {
+        let codec = DeltaCodec::default();
+
+        let source = b"non-empty source content";
+        let target = b"";
+
+        let delta = codec.encode(source, target).unwrap();
+        let reconstructed = codec.decode(source, &delta).unwrap();
+        assert_eq!(reconstructed, target);
+    }
 }

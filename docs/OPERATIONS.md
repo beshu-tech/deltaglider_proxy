@@ -46,6 +46,21 @@ CLI flags override anything loaded from the file/env:
 ./target/release/deltaglider_proxy --config deltaglider_proxy.toml --listen 0.0.0.0:9000 --bucket default
 ```
 
+## Demo UI
+
+An embedded React-based S3 browser starts automatically on **S3 port + 1**. For example, if DeltaGlider Proxy listens on `:9002`, the demo UI is available at `http://localhost:9003`.
+
+The UI auto-detects the S3 endpoint from its own URL (port - 1), so no manual configuration is needed. It supports browsing objects, uploading files, viewing delta compression stats, and navigating folders.
+
+To build for local development:
+
+```bash
+cd demo/s3-browser/ui && npm install && npm run build && cd -
+cargo build
+```
+
+The Docker build handles the Node.js UI build automatically via a multi-stage Dockerfile.
+
 ## Health & Observability
 
 - `GET /health` returns JSON with `status` and `version`.

@@ -99,6 +99,7 @@ PUT object
 src/
 ├── main.rs                     # Axum server bootstrap, config
 ├── config.rs                   # Configuration (port, data_dir, max_ratio)
+├── demo.rs                     # Embedded React demo UI (rust-embed, served on S3 port + 1)
 │
 ├── api/
 │   ├── mod.rs
@@ -120,6 +121,7 @@ src/
 │   └── filesystem.rs           # Filesystem implementation (adapter)
 │
 └── types.rs                    # ObjectKey, ContentHash, ObjectMetadata
+demo/s3-browser/ui/             # React demo UI source (Vite + TypeScript)
 ```
 
 ---
@@ -370,7 +372,7 @@ async fn test_delta_deduplication_e2e() {
 **Decision**: Use immediate parent directory as deltaspace.
 - `releases/v1.0.0.zip` → deltaspace = `releases/`
 - `backups/db/monday.zip` → deltaspace = `backups/db/`
-- `file.zip` (root) → deltaspace = `_root_/`
+- `file.zip` (root) → deltaspace = `` (empty string, files stored at root)
 
 ### 3. xdelta3 Memory Usage
 

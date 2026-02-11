@@ -2,10 +2,11 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 
-/// Tool version identifier
-pub const DELTAGLIDER_TOOL: &str = "deltaglider/0.1.0";
+/// Tool version identifier — uses crate name and version from Cargo.toml
+pub const DELTAGLIDER_TOOL: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
 /// Errors that can occur when validating user-provided bucket/key inputs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +140,10 @@ pub struct FileMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
 
+    /// User-provided custom metadata (x-amz-meta-* headers, stored without the prefix)
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub user_metadata: HashMap<String, String>,
+
     /// Storage type specific fields
     #[serde(flatten)]
     pub storage_info: StorageInfo,
@@ -202,6 +207,7 @@ impl FileMetadata {
             md5,
             created_at: Utc::now(),
             content_type,
+            user_metadata: HashMap::new(),
             storage_info: StorageInfo::Reference { source_name },
         }
     }
@@ -230,6 +236,7 @@ impl FileMetadata {
             md5,
             created_at: Utc::now(),
             content_type,
+            user_metadata: HashMap::new(),
             storage_info: StorageInfo::Delta {
                 ref_key,
                 ref_sha256,
@@ -255,6 +262,7 @@ impl FileMetadata {
             md5,
             created_at: Utc::now(),
             content_type,
+            user_metadata: HashMap::new(),
             storage_info: StorageInfo::Direct,
         }
     }
@@ -374,12 +382,54 @@ mod tests {
             None,
         );
         let json = serde_json::to_string_pretty(&meta).unwrap();
-        assert!(json.contains("deltaglider/0.1.0"));
+        assert!(json.contains(DELTAGLIDER_TOOL));
         assert!(json.contains("ref_key"));
         assert!(json.contains("delta_cmd"));
 
         // Deserialize back
         let parsed: FileMetadata = serde_json::from_str(&json).unwrap();
         assert!(parsed.is_delta());
+    }
+
+    // === Key validation security tests ===
+
+    #[test]
+    fn test_validate_rejects_path_traversal() {
+        let key = ObjectKey::parse("bucket", "../../../etc/passwd");
+        assert!(key.validate_object().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_backslash() {
+        let key = ObjectKey::parse("bucket", "path\\file");
+        assert!(key.validate_object().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_nul_byte() {
+        let key = ObjectKey::parse("bucket", "path\0file");
+        assert!(key.validate_object().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_filename() {
+        let key = ObjectKey::parse("bucket", "prefix/");
+        assert!(key.validate_object().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_dot_dot_filename() {
+        let key = ObjectKey::parse("bucket", "..");
+        assert!(key.validate_object().is_err());
+    }
+
+    #[test]
+    fn test_validate_prefix_rejects_traversal() {
+        assert!(ObjectKey::validate_prefix("../bad").is_err());
+    }
+
+    #[test]
+    fn test_validate_prefix_allows_normal() {
+        assert!(ObjectKey::validate_prefix("releases/v1.0/").is_ok());
     }
 }

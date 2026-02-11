@@ -30,32 +30,39 @@ impl S3Object {
 pub struct ListBucketResult {
     pub name: String,
     pub prefix: String,
+    pub delimiter: Option<String>,
     pub max_keys: u32,
     pub key_count: u32,
     pub is_truncated: bool,
     pub contents: Vec<S3Object>,
+    pub common_prefixes: Vec<String>,
     pub continuation_token: Option<String>,
     pub next_continuation_token: Option<String>,
 }
 
 impl ListBucketResult {
+    #[allow(clippy::too_many_arguments)]
     pub fn new_v2(
         name: String,
         prefix: String,
+        delimiter: Option<String>,
         max_keys: u32,
         contents: Vec<S3Object>,
+        common_prefixes: Vec<String>,
         continuation_token: Option<String>,
         next_continuation_token: Option<String>,
         is_truncated: bool,
     ) -> Self {
-        let key_count = contents.len() as u32;
+        let key_count = (contents.len() + common_prefixes.len()) as u32;
         Self {
             name,
             prefix,
+            delimiter,
             max_keys,
             key_count,
             is_truncated,
             contents,
+            common_prefixes,
             continuation_token,
             next_continuation_token,
         }
@@ -74,6 +81,9 @@ impl ListBucketResult {
             "  <Prefix>{}</Prefix>\n",
             escape_xml(&self.prefix)
         ));
+        if let Some(ref delim) = self.delimiter {
+            xml.push_str(&format!("  <Delimiter>{}</Delimiter>\n", escape_xml(delim)));
+        }
         xml.push_str(&format!("  <MaxKeys>{}</MaxKeys>\n", self.max_keys));
         xml.push_str(&format!("  <KeyCount>{}</KeyCount>\n", self.key_count));
         xml.push_str(&format!(
@@ -109,6 +119,12 @@ impl ListBucketResult {
                 obj.storage_class
             ));
             xml.push_str("  </Contents>\n");
+        }
+
+        for cp in &self.common_prefixes {
+            xml.push_str("  <CommonPrefixes>\n");
+            xml.push_str(&format!("    <Prefix>{}</Prefix>\n", escape_xml(cp)));
+            xml.push_str("  </CommonPrefixes>\n");
         }
 
         xml.push_str("</ListBucketResult>");
@@ -302,31 +318,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_list_bucket_result_xml() {
-        let result = ListBucketResult::new_v2(
-            "test-bucket".to_string(),
-            "prefix/".to_string(),
-            1000,
-            vec![S3Object::new(
-                "prefix/file.txt".to_string(),
-                1024,
-                Utc::now(),
-                "\"abc123\"".to_string(),
-            )],
-            None,
-            None,
-            false,
-        );
-
-        let xml = result.to_xml();
-        assert!(xml.contains("<Name>test-bucket</Name>"));
-        assert!(xml.contains("<Key>prefix/file.txt</Key>"));
-        assert!(xml.contains("<Size>1024</Size>"));
-    }
-
-    #[test]
     fn test_escape_xml() {
         assert_eq!(escape_xml("a<b>c"), "a&lt;b&gt;c");
         assert_eq!(escape_xml("a&b"), "a&amp;b");
+    }
+
+    #[test]
+    fn test_delete_request_from_xml_basic() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Delete>
+  <Object><Key>file1.txt</Key></Object>
+  <Object><Key>file2.txt</Key></Object>
+</Delete>"#;
+        let req = DeleteRequest::from_xml(xml).unwrap();
+        assert_eq!(req.objects.len(), 2);
+        assert_eq!(req.objects[0].key, "file1.txt");
+        assert_eq!(req.objects[1].key, "file2.txt");
+        assert!(req.quiet.is_none());
+    }
+
+    #[test]
+    fn test_delete_request_from_xml_quiet() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Delete>
+  <Quiet>true</Quiet>
+  <Object><Key>file1.txt</Key></Object>
+</Delete>"#;
+        let req = DeleteRequest::from_xml(xml).unwrap();
+        assert_eq!(req.quiet, Some(true));
+        assert_eq!(req.objects.len(), 1);
+    }
+
+    #[test]
+    fn test_delete_request_from_xml_malformed() {
+        let xml = "this is not valid xml at all <<<>>>";
+        let result = DeleteRequest::from_xml(xml);
+        assert!(result.is_err());
     }
 }

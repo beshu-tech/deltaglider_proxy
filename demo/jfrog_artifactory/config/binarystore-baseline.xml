@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Artifactory Binary Store Configuration - BASELINE (Direct MinIO)
+
+  This configuration stores artifacts directly in MinIO without
+  the DeltaGlider proxy. Use this for baseline storage measurements.
+
+  Usage:
+    1. Copy to Artifactory: /var/opt/jfrog/artifactory/etc/binarystore.xml
+    2. Restart Artifactory
+-->
+<config version="2">
+    <chain template="s3-storage-v3-direct"/>
+    <provider id="s3-storage-v3" type="s3-storage-v3">
+        <endpoint>http://minio:9000</endpoint>
+        <bucketName>artifacts</bucketName>
+        <identity>minio</identity>
+        <credential>minio123</credential>
+        <region>us-east-1</region>
+        <path>artifactory-filestore</path>
+        <enablePathStyleAccess>true</enablePathStyleAccess>
+        <useInstanceCredentials>false</useInstanceCredentials>
+        <testConnection>false</testConnection>
+    </provider>
+</config>

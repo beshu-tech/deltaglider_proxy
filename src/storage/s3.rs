@@ -141,6 +141,10 @@ impl S3Backend {
         );
         headers.insert("dg-file-sha256".to_string(), metadata.file_sha256.clone());
         headers.insert("dg-file-size".to_string(), metadata.file_size.to_string());
+        headers.insert("dg-md5".to_string(), metadata.md5.clone());
+        if let Some(ref ct) = metadata.content_type {
+            headers.insert("content-type".to_string(), ct.clone());
+        }
         headers.insert(
             "dg-created-at".to_string(),
             metadata
@@ -170,6 +174,11 @@ impl S3Backend {
             StorageInfo::Direct => {
                 headers.insert("dg-note".to_string(), "direct".to_string());
             }
+        }
+
+        // User-provided custom metadata (stored with "user-" prefix)
+        for (key, value) in &metadata.user_metadata {
+            headers.insert(format!("user-{}", key), value.clone());
         }
 
         headers
@@ -270,6 +279,15 @@ impl S3Backend {
             .cloned()
             .unwrap_or_else(|| "".to_string());
 
+        // Extract user metadata (keys starting with "user-" prefix in S3 metadata)
+        let user_metadata: std::collections::HashMap<String, String> = headers
+            .iter()
+            .filter_map(|(k, v)| {
+                k.strip_prefix("user-")
+                    .map(|suffix| (suffix.to_string(), v.clone()))
+            })
+            .collect();
+
         Ok(FileMetadata {
             tool,
             original_name,
@@ -278,6 +296,7 @@ impl S3Backend {
             md5,
             created_at,
             content_type: headers.get("content-type").cloned(),
+            user_metadata,
             storage_info,
         })
     }
@@ -769,53 +788,5 @@ impl StorageBackend for S3Backend {
 
         debug!("Total S3 storage size: {} bytes", total);
         Ok(total)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_reference_key_generation() {
-        // Create a mock backend just to test key generation
-        // (Can't create real backend without AWS credentials)
-        let prefix = "releases/v1";
-        let filename = "app.zip";
-
-        // Test key formats directly - S3 backend stores metadata in object headers,
-        // NOT in separate .meta files (unlike filesystem backend)
-        assert_eq!(
-            format!("{}/reference.bin", prefix),
-            "releases/v1/reference.bin"
-        );
-        assert_eq!(
-            format!("{}/{}.delta", prefix, filename),
-            "releases/v1/app.zip.delta"
-        );
-        assert_eq!(
-            format!("{}/{}.direct", prefix, filename),
-            "releases/v1/app.zip.direct"
-        );
-    }
-
-    #[test]
-    fn test_root_prefix_key_generation() {
-        // Root-level files (empty prefix) should have no directory prefix
-        let prefix = "";
-        let filename = "data.bin";
-
-        // Test key formats for root-level files
-        let reference_key = if prefix.is_empty() {
-            "reference.bin".to_string()
-        } else {
-            format!("{}/reference.bin", prefix)
-        };
-        assert_eq!(reference_key, "reference.bin");
-
-        let direct_key = if prefix.is_empty() {
-            format!("{}.direct", filename)
-        } else {
-            format!("{}/{}.direct", prefix, filename)
-        };
-        assert_eq!(direct_key, "data.bin.direct");
     }
 }

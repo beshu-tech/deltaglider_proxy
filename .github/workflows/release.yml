@@ -52,6 +52,14 @@ jobs:
             exit 1
           fi
 
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: demo/s3-browser/ui/package-lock.json
+      - name: Build demo UI (required by rust-embed)
+        run: cd demo/s3-browser/ui && npm ci && npm run build
+
       - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
 
       - name: Dry-run build check
@@ -90,6 +98,14 @@ jobs:
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: demo/s3-browser/ui/package-lock.json
+      - name: Build demo UI (required by rust-embed)
+        run: cd demo/s3-browser/ui && npm ci && npm run build
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable

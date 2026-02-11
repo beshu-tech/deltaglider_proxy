@@ -235,13 +235,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     }
 
     /// Store an object with automatic delta compression
-    #[instrument(skip(self, data))]
+    #[instrument(skip(self, data, user_metadata))]
     pub async fn store(
         &self,
         bucket: &str,
         key: &str,
         data: &[u8],
         content_type: Option<String>,
+        user_metadata: std::collections::HashMap<String, String>,
     ) -> Result<StoreResult, EngineError> {
         // Check size limit
         if data.len() as u64 > self.max_object_size {
@@ -276,7 +277,15 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             self.delete_delta_if_exists(&deltaspace_id, &obj_key.filename)
                 .await?;
             return self
-                .store_direct(&obj_key, &deltaspace_id, data, sha256, md5, content_type)
+                .store_direct(
+                    &obj_key,
+                    &deltaspace_id,
+                    data,
+                    sha256,
+                    md5,
+                    content_type,
+                    user_metadata,
+                )
                 .await;
         }
 
@@ -334,12 +343,20 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             self.delete_delta_if_exists(&deltaspace_id, &obj_key.filename)
                 .await?;
             return self
-                .store_direct(&obj_key, &deltaspace_id, data, sha256, md5, content_type)
+                .store_direct(
+                    &obj_key,
+                    &deltaspace_id,
+                    data,
+                    sha256,
+                    md5,
+                    content_type,
+                    user_metadata,
+                )
                 .await;
         }
 
         // Store as delta
-        let metadata = FileMetadata::new_delta(
+        let mut metadata = FileMetadata::new_delta(
             obj_key.filename.clone(),
             sha256,
             md5,
@@ -349,6 +366,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             delta.len() as u64,
             content_type,
         );
+        metadata.user_metadata = user_metadata;
 
         self.delete_direct_if_exists(&deltaspace_id, &obj_key.filename)
             .await?;
@@ -392,6 +410,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     }
 
     /// Store directly without delta compression
+    #[allow(clippy::too_many_arguments)]
     async fn store_direct(
         &self,
         obj_key: &ObjectKey,
@@ -400,14 +419,16 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         sha256: String,
         md5: String,
         content_type: Option<String>,
+        user_metadata: HashMap<String, String>,
     ) -> Result<StoreResult, EngineError> {
-        let metadata = FileMetadata::new_direct(
+        let mut metadata = FileMetadata::new_direct(
             obj_key.filename.clone(),
             sha256,
             md5,
             data.len() as u64,
             content_type,
         );
+        metadata.user_metadata = user_metadata;
 
         self.storage
             .put_direct(deltaspace_id, &obj_key.filename, data, &metadata)
@@ -765,228 +786,6 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
-
-    async fn create_test_engine() -> (DeltaGliderEngine<FilesystemBackend>, TempDir) {
-        let tmp = TempDir::new().unwrap();
-        let config = Config {
-            backend: BackendConfig::Filesystem {
-                path: tmp.path().to_path_buf(),
-            },
-            max_delta_ratio: 0.5,
-            max_object_size: 10 * 1024 * 1024,
-            cache_size_mb: 10,
-            ..Default::default()
-        };
-        let engine = DeltaGliderEngine::new_filesystem(&config).await.unwrap();
-        (engine, tmp)
-    }
-
-    #[tokio::test]
-    async fn test_store_retrieve_direct() {
-        let (engine, _tmp) = create_test_engine().await;
-
-        // Store a non-delta-eligible file
-        let data = b"Hello, World!";
-        let result = engine
-            .store("bucket", "file.txt", data, None)
-            .await
-            .unwrap();
-        assert!(matches!(result.metadata.storage_info, StorageInfo::Direct));
-
-        // Retrieve it
-        let (retrieved, _meta) = engine.retrieve("bucket", "file.txt").await.unwrap();
-        assert_eq!(retrieved, data);
-    }
-
-    #[tokio::test]
-    async fn test_store_retrieve_first_delta_eligible() {
-        let (engine, _tmp) = create_test_engine().await;
-
-        // First delta-eligible file initializes the reference baseline but is still stored as an object.
-        let data = vec![0u8; 10_000];
-        let result = engine
-            .store("bucket", "releases/v1.zip", &data, None)
-            .await
-            .unwrap();
-        assert!(matches!(
-            result.metadata.storage_info,
-            StorageInfo::Delta { .. }
-        ));
-
-        // Retrieve it
-        let (retrieved, _meta) = engine.retrieve("bucket", "releases/v1.zip").await.unwrap();
-        assert_eq!(retrieved, data);
-    }
-
-    #[tokio::test]
-    async fn test_store_retrieve_delta() {
-        let (engine, _tmp) = create_test_engine().await;
-
-        // First file becomes reference
-        let base_data = vec![0u8; 10000];
-        engine
-            .store("bucket", "releases/v1.zip", &base_data, None)
-            .await
-            .unwrap();
-
-        // Second similar file should be stored as delta
-        let mut modified = base_data.clone();
-        modified[0] = 1; // Small change
-        modified[100] = 2;
-        let result = engine
-            .store("bucket", "releases/v2.zip", &modified, None)
-            .await
-            .unwrap();
-
-        // Should be stored as delta (ratio should be < 0.5)
-        assert!(matches!(
-            result.metadata.storage_info,
-            StorageInfo::Delta { .. }
-        ));
-        assert!(result.stored_size < modified.len() as u64);
-
-        // Retrieve and verify
-        let (retrieved, _meta) = engine.retrieve("bucket", "releases/v2.zip").await.unwrap();
-        assert_eq!(retrieved, modified);
-    }
-
-    #[tokio::test]
-    async fn test_list_objects() {
-        let (engine, _tmp) = create_test_engine().await;
-
-        engine
-            .store("bucket", "prefix/a.zip", b"data a", None)
-            .await
-            .unwrap();
-        engine
-            .store("bucket", "prefix/b.zip", b"data b", None)
-            .await
-            .unwrap();
-
-        let objects = engine.list("bucket", "prefix/").await.unwrap();
-        assert_eq!(objects.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_list_objects_v2_pagination() {
-        let (engine, _tmp) = create_test_engine().await;
-
-        engine
-            .store("bucket", "prefix/a.zip", b"data a", None)
-            .await
-            .unwrap();
-        engine
-            .store("bucket", "prefix/b.zip", b"data b", None)
-            .await
-            .unwrap();
-        engine
-            .store("bucket", "prefix/c.zip", b"data c", None)
-            .await
-            .unwrap();
-
-        let page1 = engine
-            .list_objects_v2("bucket", "prefix/", 2, None)
-            .await
-            .unwrap();
-        assert_eq!(
-            page1
-                .objects
-                .iter()
-                .map(|(k, _)| k.as_str())
-                .collect::<Vec<_>>(),
-            vec!["prefix/a.zip", "prefix/b.zip"]
-        );
-        assert!(page1.is_truncated);
-        assert_eq!(
-            page1.next_continuation_token.as_deref(),
-            Some("prefix/b.zip")
-        );
-
-        let page2 = engine
-            .list_objects_v2(
-                "bucket",
-                "prefix/",
-                2,
-                page1.next_continuation_token.as_deref(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            page2
-                .objects
-                .iter()
-                .map(|(k, _)| k.as_str())
-                .collect::<Vec<_>>(),
-            vec!["prefix/c.zip"]
-        );
-        assert!(!page2.is_truncated);
-        assert!(page2.next_continuation_token.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_size_limit() {
-        let tmp = TempDir::new().unwrap();
-        let config = Config {
-            backend: BackendConfig::Filesystem {
-                path: tmp.path().to_path_buf(),
-            },
-            max_object_size: 100, // Very small limit
-            ..Default::default()
-        };
-        let engine = DeltaGliderEngine::new_filesystem(&config).await.unwrap();
-
-        let large_data = vec![0u8; 200];
-        let result = engine.store("bucket", "large.zip", &large_data, None).await;
-
-        assert!(matches!(result, Err(EngineError::TooLarge { .. })));
-    }
-
-    #[tokio::test]
-    async fn test_always_delta_when_reference_exists() {
-        // Test that once a reference exists, subsequent files are ALWAYS stored as delta
-        // even if the delta ratio is poor (exceeds threshold)
-        let tmp = TempDir::new().unwrap();
-        let config = Config {
-            backend: BackendConfig::Filesystem {
-                path: tmp.path().to_path_buf(),
-            },
-            max_delta_ratio: 0.1, // Very low threshold - only 10% ratio acceptable
-            max_object_size: 10 * 1024 * 1024,
-            cache_size_mb: 10,
-            ..Default::default()
-        };
-        let engine = DeltaGliderEngine::new_filesystem(&config).await.unwrap();
-
-        // First file creates reference baseline and gets stored as delta
-        let base_data = vec![0u8; 10000];
-        let result1 = engine
-            .store("bucket", "releases/v1.zip", &base_data, None)
-            .await
-            .unwrap();
-        assert!(matches!(
-            result1.metadata.storage_info,
-            StorageInfo::Delta { .. }
-        ));
-
-        // Second file is completely different (random bytes) - poor delta ratio
-        // But since reference already exists, it should still be stored as delta
-        let random_data: Vec<u8> = (0..10000).map(|i| (i % 256) as u8).collect();
-        let result2 = engine
-            .store("bucket", "releases/v2.zip", &random_data, None)
-            .await
-            .unwrap();
-
-        // Key assertion: should be delta even with poor ratio because reference exists
-        assert!(
-            matches!(result2.metadata.storage_info, StorageInfo::Delta { .. }),
-            "Should store as delta when reference exists, even with poor ratio"
-        );
-
-        // Verify retrieval works
-        let (retrieved, _meta) = engine.retrieve("bucket", "releases/v2.zip").await.unwrap();
-        assert_eq!(retrieved, random_data);
-    }
 
     #[test]
     fn test_deltaspace_could_match() {

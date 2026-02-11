@@ -1,3 +1,11 @@
+node_modules/
 /target
 .vscode
 data/
+dist/
+
+# Playwright MCP
+.playwright-mcp/
+
+# Screenshots and demo images
+*.png

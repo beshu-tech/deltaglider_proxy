@@ -104,27 +104,3 @@ where
         Ok(ValidatedPath { bucket, key })
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_validated_bucket_deref() {
-        let bucket = ValidatedBucket("test-bucket".to_string());
-        assert_eq!(&*bucket, "test-bucket");
-        assert_eq!(bucket.len(), 11);
-    }
-
-    #[test]
-    fn test_validated_path_key_normalization() {
-        // This would normally be tested through integration tests
-        // since extractors require a full Axum request context
-        let path = ValidatedPath {
-            bucket: "bucket".to_string(),
-            key: "test/file.txt".to_string(),
-        };
-        assert_eq!(path.bucket, "bucket");
-        assert_eq!(path.key, "test/file.txt");
-    }
-}

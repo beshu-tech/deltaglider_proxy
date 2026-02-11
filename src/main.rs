@@ -1,5 +1,7 @@
 //! DeltaGlider Proxy - S3-compatible object storage with DeltaGlider deduplication
 
+mod demo;
+
 use axum::{extract::DefaultBodyLimit, routing::get, Router};
 use clap::Parser;
 use deltaglider_proxy::api::handlers::{
@@ -176,7 +178,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(DefaultBodyLimit::max(config.max_object_size as usize))
         .with_state(state);
 
-    // Start server with graceful shutdown
+    // Start embedded demo UI on a separate port (S3 port + 1)
+    let s3_port = config.listen_addr.port();
+    tokio::spawn(demo::serve(s3_port));
+
+    // Start S3 server with graceful shutdown
     let listener = TcpListener::bind(&config.listen_addr).await?;
     info!(
         "DeltaGlider Proxy listening on http://{}",

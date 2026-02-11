@@ -8,9 +8,10 @@ use super::xml::{
     DeletedObject, ListBucketResult, ListBucketsResult, S3Object,
 };
 use crate::deltaglider::DynEngine;
+use crate::types::{FileMetadata, StorageInfo};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::Utc;
@@ -28,6 +29,7 @@ pub struct AppState {
 #[derive(Debug, Deserialize, Default)]
 pub struct BucketGetQuery {
     pub prefix: Option<String>,
+    pub delimiter: Option<String>,
     #[serde(rename = "list-type")]
     pub list_type: Option<u8>,
     #[serde(rename = "max-keys")]
@@ -59,7 +61,27 @@ async fn put_object_inner(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    let result = state.engine.store(bucket, key, body, content_type).await?;
+    // Extract user-provided x-amz-meta-* headers (stored without the prefix)
+    let user_metadata: std::collections::HashMap<String, String> = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let name_str = name.as_str();
+            if let Some(suffix) = name_str.strip_prefix("x-amz-meta-") {
+                if !suffix.starts_with("dg-") {
+                    // Skip DeltaGlider internal metadata (x-amz-meta-dg-*)
+                    if let Ok(v) = value.to_str() {
+                        return Some((suffix.to_string(), v.to_string()));
+                    }
+                }
+            }
+            None
+        })
+        .collect();
+
+    let result = state
+        .engine
+        .store(bucket, key, body, content_type, user_metadata)
+        .await?;
 
     let storage_type = result.metadata.storage_info.label();
 
@@ -82,6 +104,76 @@ async fn put_object_inner(
         .into_response())
 }
 
+/// Build response headers for an object including DeltaGlider custom metadata.
+fn build_object_headers(metadata: &FileMetadata) -> HeaderMap {
+    let stored_size = metadata.delta_size().unwrap_or(metadata.file_size);
+    let content_type = metadata
+        .content_type
+        .clone()
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+
+    let mut headers = HeaderMap::new();
+    headers.insert("ETag", hval(&metadata.etag()));
+    headers.insert("Content-Length", hval(&metadata.file_size.to_string()));
+    headers.insert("Content-Type", hval(&content_type));
+    headers.insert(
+        "Last-Modified",
+        hval(
+            &metadata
+                .created_at
+                .format("%a, %d %b %Y %H:%M:%S GMT")
+                .to_string(),
+        ),
+    );
+    headers.insert("x-amz-storage-type", hval(metadata.storage_info.label()));
+    headers.insert("x-deltaglider-stored-size", hval(&stored_size.to_string()));
+
+    // DeltaGlider custom metadata (x-amz-meta-dg-*)
+    headers.insert("x-amz-meta-dg-tool", hval(&metadata.tool));
+    headers.insert("x-amz-meta-dg-original-name", hval(&metadata.original_name));
+    headers.insert("x-amz-meta-dg-file-sha256", hval(&metadata.file_sha256));
+    headers.insert(
+        "x-amz-meta-dg-file-size",
+        hval(&metadata.file_size.to_string()),
+    );
+
+    match &metadata.storage_info {
+        StorageInfo::Reference { source_name } => {
+            headers.insert("x-amz-meta-dg-note", hval("reference"));
+            headers.insert("x-amz-meta-dg-source-name", hval(source_name));
+        }
+        StorageInfo::Delta {
+            ref_key,
+            ref_sha256,
+            delta_size,
+            delta_cmd,
+        } => {
+            headers.insert("x-amz-meta-dg-note", hval("delta"));
+            headers.insert("x-amz-meta-dg-ref-key", hval(ref_key));
+            headers.insert("x-amz-meta-dg-ref-sha256", hval(ref_sha256));
+            headers.insert("x-amz-meta-dg-delta-size", hval(&delta_size.to_string()));
+            headers.insert("x-amz-meta-dg-delta-cmd", hval(delta_cmd));
+        }
+        StorageInfo::Direct => {
+            headers.insert("x-amz-meta-dg-note", hval("direct"));
+        }
+    }
+
+    // User-provided custom metadata (x-amz-meta-*)
+    for (key, value) in &metadata.user_metadata {
+        let header_name = format!("x-amz-meta-{}", key);
+        if let Ok(name) = axum::http::header::HeaderName::from_bytes(header_name.as_bytes()) {
+            headers.insert(name, hval(value));
+        }
+    }
+
+    headers
+}
+
+fn hval(s: &str) -> HeaderValue {
+    HeaderValue::from_bytes(s.as_bytes()).unwrap_or_else(|_| HeaderValue::from_static(""))
+}
+
 /// GET object handler
 /// GET /{bucket}/{key}
 #[instrument(skip(state))]
@@ -93,43 +185,16 @@ pub async fn get_object(
 
     let (data, metadata) = state.engine.retrieve(&bucket, &key).await?;
 
-    let storage_type = metadata.storage_info.label();
-
     debug!(
         "Retrieved {}/{} ({} bytes, stored as {})",
         bucket,
         key,
         data.len(),
-        storage_type
+        metadata.storage_info.label()
     );
 
-    let storage_type = metadata.storage_info.label();
-    let stored_size = metadata.delta_size().unwrap_or(metadata.file_size);
-
-    let content_type = metadata
-        .content_type
-        .clone()
-        .unwrap_or_else(|| "application/octet-stream".to_string());
-
-    Ok((
-        StatusCode::OK,
-        [
-            ("ETag", metadata.etag()),
-            ("Content-Length", metadata.file_size.to_string()),
-            ("Content-Type", content_type),
-            (
-                "Last-Modified",
-                metadata
-                    .created_at
-                    .format("%a, %d %b %Y %H:%M:%S GMT")
-                    .to_string(),
-            ),
-            ("x-amz-storage-type", storage_type.to_string()),
-            ("x-deltaglider-stored-size", stored_size.to_string()),
-        ],
-        data,
-    )
-        .into_response())
+    let headers = build_object_headers(&metadata);
+    Ok((StatusCode::OK, headers, data).into_response())
 }
 
 /// HEAD object handler
@@ -143,32 +208,8 @@ pub async fn head_object(
 
     let metadata = state.engine.head(&bucket, &key).await?;
 
-    let storage_type = metadata.storage_info.label();
-    let stored_size = metadata.delta_size().unwrap_or(metadata.file_size);
-
-    let content_type = metadata
-        .content_type
-        .clone()
-        .unwrap_or_else(|| "application/octet-stream".to_string());
-
-    Ok((
-        StatusCode::OK,
-        [
-            ("ETag", metadata.etag()),
-            ("Content-Length", metadata.file_size.to_string()),
-            ("Content-Type", content_type),
-            (
-                "Last-Modified",
-                metadata
-                    .created_at
-                    .format("%a, %d %b %Y %H:%M:%S GMT")
-                    .to_string(),
-            ),
-            ("x-amz-storage-type", storage_type.to_string()),
-            ("x-deltaglider-stored-size", stored_size.to_string()),
-        ],
-    )
-        .into_response())
+    let headers = build_object_headers(&metadata);
+    Ok((StatusCode::OK, headers).into_response())
 }
 
 /// Bucket-level GET handler - dispatches to appropriate operation based on query params
@@ -209,6 +250,7 @@ pub async fn bucket_get_handler(
         }
     }
     let prefix = query.prefix.unwrap_or_default();
+    let delimiter = query.delimiter.clone();
     info!("LIST {}/{}*", bucket, prefix);
 
     let page = state
@@ -221,17 +263,41 @@ pub async fn bucket_get_handler(
         )
         .await?;
 
-    let s3_objects: Vec<S3Object> = page
+    let all_objects: Vec<S3Object> = page
         .objects
         .into_iter()
         .map(|(key, meta)| S3Object::new(key, meta.file_size, meta.created_at, meta.etag()))
         .collect();
 
+    // If a delimiter is set, compute CommonPrefixes and filter objects
+    let (s3_objects, common_prefixes) = if let Some(ref delim) = delimiter {
+        let mut prefixes = std::collections::BTreeSet::new();
+        let mut direct_objects = Vec::new();
+
+        for obj in all_objects {
+            let after_prefix = &obj.key[prefix.len()..];
+            if let Some(pos) = after_prefix.find(delim.as_str()) {
+                // This key contains the delimiter after the prefix — it belongs to a common prefix
+                let common = format!("{}{}{}", prefix, &after_prefix[..pos], delim);
+                prefixes.insert(common);
+            } else {
+                // This key is directly at this level
+                direct_objects.push(obj);
+            }
+        }
+
+        (direct_objects, prefixes.into_iter().collect::<Vec<_>>())
+    } else {
+        (all_objects, Vec::new())
+    };
+
     let result = ListBucketResult::new_v2(
         bucket,
         prefix,
+        delimiter,
         query.max_keys.unwrap_or(1000),
         s3_objects,
+        common_prefixes,
         query.continuation_token,
         page.next_continuation_token,
         page.is_truncated,
@@ -444,10 +510,16 @@ async fn copy_object_inner(
     // Retrieve source object
     let (data, source_meta) = state.engine.retrieve(source_bucket, source_key).await?;
 
-    // Store as new object
+    // Store as new object, preserving user metadata from source
     let result = state
         .engine
-        .store(bucket, key, &data, source_meta.content_type.clone())
+        .store(
+            bucket,
+            key,
+            &data,
+            source_meta.content_type.clone(),
+            source_meta.user_metadata.clone(),
+        )
         .await?;
 
     debug!(

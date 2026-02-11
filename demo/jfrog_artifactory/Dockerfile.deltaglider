@@ -1,0 +1,48 @@
+# Dockerfile for DeltaGlider Proxy
+#
+# Multi-stage build: Node (demo UI) → Rust (binary) → minimal runtime
+
+# Stage 1: Build the demo UI
+FROM node:20-alpine AS ui-builder
+WORKDIR /ui
+COPY demo/s3-browser/ui/package.json demo/s3-browser/ui/package-lock.json ./
+RUN npm ci
+COPY demo/s3-browser/ui/ ./
+RUN npm run build
+
+# Stage 2: Build the Rust binary
+FROM rust:latest AS builder
+
+# Install build dependencies (clang for xdelta3 bindgen)
+RUN apt-get update && apt-get install -y \
+    libclang-dev \
+    clang \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy manifests
+COPY Cargo.toml Cargo.lock ./
+
+# Copy source
+COPY src ./src
+
+# Copy built UI dist so rust-embed can find it at compile time
+COPY --from=ui-builder /ui/dist ./demo/s3-browser/ui/dist
+
+# Build release binary
+RUN cargo build --release
+
+# Runtime image - use same base as builder to ensure GLIBC compatibility
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/deltaglider_proxy /usr/local/bin/
+
+EXPOSE 9002
+
+CMD ["deltaglider_proxy"]

@@ -137,4 +137,22 @@ mod tests {
         );
         assert!(is_aws_chunked(&headers));
     }
+
+    #[test]
+    fn test_decode_multi_chunk() {
+        // Two data chunks + terminal zero chunk
+        let body = Bytes::from(
+            "5;chunk-signature=aaa\r\nhello\r\n6;chunk-signature=bbb\r\n world\r\n0;chunk-signature=ccc\r\n"
+        );
+        let result = decode_aws_chunked(&body, Some(11)).unwrap();
+        assert_eq!(result.as_ref(), b"hello world");
+    }
+
+    #[test]
+    fn test_decode_empty_payload() {
+        // Just the terminal zero chunk
+        let body = Bytes::from("0;chunk-signature=abc\r\n");
+        let result = decode_aws_chunked(&body, Some(0)).unwrap();
+        assert!(result.is_empty());
+    }
 }

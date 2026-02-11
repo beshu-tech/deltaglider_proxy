@@ -1,0 +1,89 @@
+# DeltaGlider S3 Browser Demo
+#
+# docker compose up --build
+#
+# Demo UI: http://localhost:9003 (embedded, auto-starts on S3 port + 1)
+#
+# Ports:
+#   9002 - DeltaGlider Proxy (S3 API)
+#   9003 - Embedded Demo UI
+#   9000 - MinIO S3 API (internal)
+#   9001 - MinIO Console
+
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: s3browser-minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - demo
+
+  minio-setup:
+    image: minio/mc:latest
+    container_name: s3browser-minio-setup
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin;
+      mc mb --ignore-existing local/deltaglider-data;
+      echo 'Bucket created: deltaglider-data';
+      exit 0;
+      "
+    networks:
+      - demo
+
+  deltaglider:
+    image: deltaglider-proxy:latest
+    build:
+      context: ../..
+      dockerfile: demo/jfrog_artifactory/Dockerfile.deltaglider
+    container_name: s3browser-deltaglider
+    ports:
+      - "9002:9002"
+      - "9003:9003"
+    environment:
+      DELTAGLIDER_PROXY_LISTEN_ADDR: "0.0.0.0:9002"
+      DELTAGLIDER_PROXY_DEFAULT_BUCKET: "data"
+      DELTAGLIDER_PROXY_S3_BUCKET: "deltaglider-data"
+      DELTAGLIDER_PROXY_S3_ENDPOINT: "http://minio:9000"
+      DELTAGLIDER_PROXY_S3_REGION: "us-east-1"
+      DELTAGLIDER_PROXY_S3_FORCE_PATH_STYLE: "true"
+      DELTAGLIDER_PROXY_MAX_DELTA_RATIO: "0.9"
+      DELTAGLIDER_PROXY_MAX_OBJECT_SIZE: "104857600"
+      DELTAGLIDER_PROXY_CACHE_SIZE_MB: "100"
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      RUST_LOG: info
+    depends_on:
+      minio-setup:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9002/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - demo
+
+volumes:
+  minio-data:
+
+networks:
+  demo:
+    driver: bridge
