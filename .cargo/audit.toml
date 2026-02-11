@@ -1,0 +1,4 @@
+[advisories]
+# shlex 0.1.1: transitive build-dep from xdelta3 -> bindgen 0.52.
+# Cannot upgrade without forking xdelta3. Build-time only, not runtime.
+ignore = ["RUSTSEC-2024-0006"]

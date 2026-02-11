@@ -40,7 +40,7 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-lru = "0.12"
+lru = "0.16"
 parking_lot = "0.12"
 bytes = "1"
 tower-http = { version = "0.6", features = ["trace", "cors"] }

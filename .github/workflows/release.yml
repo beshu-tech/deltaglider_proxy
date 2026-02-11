@@ -94,7 +94,7 @@ jobs:
 
           # Windows x86_64
           - target: x86_64-pc-windows-msvc
-            os: blacksmith-4vcpu-windows-2025
+            os: windows-latest
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
