@@ -553,13 +553,10 @@ pub async fn put_object_or_copy(
     body: Bytes,
 ) -> Result<Response, S3Error> {
     // Check if this is a multipart upload part
-    if query.part_number.is_some() && query.upload_id.is_some() {
+    if let (Some(part_num), Some(upload_id)) = (&query.part_number, &query.upload_id) {
         info!(
             "UploadPart {}/{} part={} uploadId={}",
-            bucket,
-            key,
-            query.part_number.unwrap(),
-            query.upload_id.as_ref().unwrap()
+            bucket, key, part_num, upload_id
         );
         return Err(S3Error::NotImplemented(
             "Multipart upload is not supported. Use single PUT for uploads.".to_string(),
@@ -622,12 +619,10 @@ pub async fn post_object(
     }
 
     // CompleteMultipartUpload
-    if query.upload_id.is_some() {
+    if let Some(upload_id) = &query.upload_id {
         info!(
             "CompleteMultipartUpload {}/{} uploadId={}",
-            bucket,
-            key,
-            query.upload_id.as_ref().unwrap()
+            bucket, key, upload_id
         );
         return Err(S3Error::NotImplemented(
             "Multipart upload is not supported. Use single PUT for uploads.".to_string(),
