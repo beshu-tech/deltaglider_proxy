@@ -240,7 +240,7 @@ impl FilesystemBackend {
     fn find_deltaspaces_recursive<'a>(
         base_dir: &'a Path,
         current_dir: &'a Path,
-        prefixes: &'a mut Vec<String>,
+        prefixes: &'a mut std::collections::HashSet<String>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), StorageError>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -268,10 +268,7 @@ impl FilesystemBackend {
             // If this directory has deltaglider files, add it as a deltaspace
             if has_deltaglider_files {
                 if let Ok(relative) = current_dir.strip_prefix(base_dir) {
-                    let prefix = relative.to_string_lossy().to_string();
-                    if !prefixes.contains(&prefix) {
-                        prefixes.push(prefix);
-                    }
+                    prefixes.insert(relative.to_string_lossy().to_string());
                 }
             }
 
@@ -643,11 +640,11 @@ impl StorageBackend for FilesystemBackend {
             return Ok(Vec::new());
         }
 
-        let mut prefixes = Vec::new();
+        let mut prefixes = std::collections::HashSet::new();
         // Recursively find all directories containing deltaglider files
         Self::find_deltaspaces_recursive(&deltaspaces_dir, &deltaspaces_dir, &mut prefixes).await?;
 
-        Ok(prefixes)
+        Ok(prefixes.into_iter().collect())
     }
 
     async fn total_size(&self) -> Result<u64, StorageError> {

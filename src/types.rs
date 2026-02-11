@@ -55,12 +55,9 @@ impl ObjectKey {
     }
 
     /// Get the deltaspace identifier for this key
+    /// Returns empty string for root-level files (no prefix folder created)
     pub fn deltaspace_id(&self) -> String {
-        if self.prefix.is_empty() {
-            "_root_".to_string()
-        } else {
-            self.prefix.clone()
-        }
+        self.prefix.clone()
     }
 
     /// Validate this key for object operations (PUT/GET/HEAD/DELETE).
@@ -289,28 +286,6 @@ pub struct StoreResult {
     pub stored_size: u64,
 }
 
-/// Legacy compatibility type for existing code
-/// TODO: Remove after full migration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type")]
-pub enum StorageType {
-    Reference,
-    Delta { ratio: f32 },
-    Direct,
-}
-
-impl From<&StorageInfo> for StorageType {
-    fn from(info: &StorageInfo) -> Self {
-        match info {
-            StorageInfo::Reference { .. } => StorageType::Reference,
-            StorageInfo::Delta { .. } => StorageType::Delta {
-                ratio: 0.0, // Legacy field, not used
-            },
-            StorageInfo::Direct => StorageType::Direct,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,7 +304,7 @@ mod tests {
         let key = ObjectKey::parse("mybucket", "file.zip");
         assert_eq!(key.prefix, "");
         assert_eq!(key.filename, "file.zip");
-        assert_eq!(key.deltaspace_id(), "_root_");
+        assert_eq!(key.deltaspace_id(), ""); // Root-level files have empty deltaspace_id
     }
 
     #[test]

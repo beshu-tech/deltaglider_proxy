@@ -6,7 +6,7 @@ use axum::response::{IntoResponse, Response};
 use thiserror::Error;
 
 /// S3 API errors
-#[derive(Debug, Clone, Error)]
+#[derive(Debug, Error)]
 pub enum S3Error {
     #[error("NoSuchKey: The specified key does not exist.")]
     NoSuchKey(String),

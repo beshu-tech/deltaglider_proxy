@@ -435,6 +435,16 @@ async fn copy_object_inner(
         source_bucket, source_key, bucket, key
     );
 
+    // Check source object size before loading into memory to avoid transient
+    // memory spikes if max_object_size was reduced after the object was stored.
+    let source_meta_head = state.engine.head(source_bucket, source_key).await?;
+    if source_meta_head.file_size > state.engine.max_object_size() {
+        return Err(S3Error::EntityTooLarge {
+            size: source_meta_head.file_size,
+            max: state.engine.max_object_size(),
+        });
+    }
+
     // Retrieve source object
     let (data, source_meta) = state.engine.retrieve(source_bucket, source_key).await?;
 

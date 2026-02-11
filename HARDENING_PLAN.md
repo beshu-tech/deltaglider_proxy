@@ -92,32 +92,32 @@ The `store()` method does a check-then-act (`has_reference` → `set_reference`)
 
 ---
 
-## Phase 2: Operational Stability Under Load
+## Phase 2: Operational Stability Under Load ✅ COMPLETED
 
 **Rationale**: Once data integrity is guaranteed, the next priority is ensuring the system doesn't fall over under production workloads. These issues cause OOM, excessive latency, or resource exhaustion.
 
-### 2.1 Configurable SHA256 Verification on GET
+### 2.1 ✅ Configurable SHA256 Verification on GET
 
 **Severity**: CRITICAL (performance) | **File**: `src/deltaglider/engine.rs`, `src/config.rs`
 - Add `verify_on_read: bool` to `Config` (default: `true` for safety, configurable to `false` for performance)
 - Skip SHA256 computation in `retrieve()` when disabled
 - Log a startup warning when verification is disabled
 
-### 2.2 Validate xdelta3 CLI at Startup, Not Per-Request
+### 2.2 ✅ Validate xdelta3 CLI at Startup, Not Per-Request
 
 **Severity**: HIGH | **File**: `src/deltaglider/codec.rs`, `src/main.rs`
 - Add `cli_available: bool` field to `DeltaCodec`, probed once at construction via `xdelta3 -V`
 - Skip CLI fallback path in `decode()` when binary not found
 - Log clear warning at startup if CLI is unavailable (degraded interop mode)
 
-### 2.3 Fix `put_reference_metadata` No-Op on S3
+### 2.3 ✅ Fix `put_reference_metadata` No-Op on S3
 
 **Severity**: HIGH | **File**: `src/storage/s3.rs`
 - Implement S3 copy-object-with-new-metadata (CopyObject with MetadataDirective=REPLACE)
 - This is the standard S3 pattern for updating metadata without re-uploading data
 - Without this fix, legacy migration silently fails on S3, causing every legacy `retrieve()` to re-trigger migration on every request
 
-### 2.4 Bounded Concurrency for Delta Encoding
+### 2.4 ✅ Bounded Concurrency for Delta Encoding
 
 **Severity**: MEDIUM | **File**: `src/deltaglider/engine.rs`
 - Add `tokio::sync::Semaphore` with configurable permits (default: num_cpus)
@@ -125,7 +125,7 @@ The `store()` method does a check-then-act (`has_reference` → `set_reference`)
 - Composes with Task 1.6's prefix locks: prefix lock = correctness, semaphore = stability
 - Prevents CPU saturation and ensures health checks remain responsive
 
-### 2.5 Zero-Copy Cache with `Bytes`
+### 2.5 ✅ Zero-Copy Cache with `Bytes`
 
 **Severity**: MEDIUM | **File**: `src/deltaglider/cache.rs`, `src/deltaglider/engine.rs`
 - Change cache value type from `Vec<u8>` to `bytes::Bytes`
@@ -133,7 +133,7 @@ The `store()` method does a check-then-act (`has_reference` → `set_reference`)
 - `Bytes` derefs to `&[u8]`, so callers of `get_reference_cached()` need no changes
 - Cleaner after Task 1.1 merged cache into single `Mutex<CacheInner>`
 
-### 2.6 Disk-Full Detection and Reporting
+### 2.6 ✅ Disk-Full Detection and Reporting
 
 **Severity**: MEDIUM | **File**: `src/storage/traits.rs`, `src/storage/filesystem.rs`, `src/api/errors.rs`
 - Add `StorageError::DiskFull` variant
@@ -141,7 +141,7 @@ The `store()` method does a check-then-act (`has_reference` → `set_reference`)
 - After Task 1.4's `atomic_write()`, ENOSPC can manifest in `NamedTempFile::new_in()` or `write_all()` — error kind is preserved through `spawn_blocking`
 - Map to specific S3 error with actionable message
 
-### 2.7 XML Injection in `S3Error::to_xml()`
+### 2.7 ✅ XML Injection in `S3Error::to_xml()`
 
 **Severity**: MEDIUM | **File**: `src/api/errors.rs`
 
@@ -152,57 +152,79 @@ Same class of vulnerability fixed in Task 1.2. `S3Error::to_xml()` interpolates 
 
 ---
 
-## Phase 3: Performance & Code Quality
+## Phase 3: Performance & Code Quality ✅ COMPLETED
 
 **Rationale**: With data safety and stability addressed, these changes improve throughput, reduce resource waste, and clean up technical debt.
 
-### 3.1 Incremental `list_objects_v2` (Don't Load Everything)
+### 3.1 ✅ Prefix-Filtered `list_objects_v2`
 
 **Severity**: HIGH | **File**: `src/deltaglider/engine.rs`
-- Refactor to scan only the deltaspaces matching the requested prefix
-- Stop scanning once `max_keys` objects are collected
-- Use the continuation token to skip already-returned deltaspaces
 
-### 3.2 FileRouter Allocation Optimization
+Current implementation scans ALL deltaspaces and ALL their files, builds a full HashMap, then filters/paginates. For 10,000 deltaspaces, listing 10 objects is O(N) in total objects.
+
+**Changes**:
+- Filter `deltaspace_ids` to only those whose prefix could produce matching keys before scanning their files
+- A deltaspace ID `releases/v1.0` can only produce keys starting with `releases/v1.0/`, so skip deltaspaces that don't match the requested prefix
+- This captures ~80% of the optimization value with minimal complexity
+- Full incremental scanning with early termination deferred (objects from different deltaspaces interleave in sorted order, making true early exit complex)
+
+### 3.2 ✅ FileRouter Allocation Optimization
 
 **Severity**: LOW | **File**: `src/deltaglider/file_router.rs`
-- Extract extension once with `rsplit('.')`
-- Look up in a `HashSet<&'static str>` instead of iterating and allocating
 
-### 3.3 Remove Legacy `StorageType` Enum
+`route()` calls `format!(".{}", ext)` for each of 18 extensions on every invocation, allocating 18 small Strings per PUT request.
+
+**Changes**:
+- Pre-format dot-prefixed extensions at construction time (e.g., store `".tar.gz"`, `".zip"`)
+- Keep `ends_with` matching to preserve compound extension support (`tar.gz`, `tar.bz2`, `tar.xz`) which a simple HashSet + `rsplit('.')` would miss
+- Eliminates per-call allocations; the `to_lowercase()` allocation is unavoidable
+
+### 3.3 ✅ Remove Legacy `StorageType` Enum
 
 **Severity**: LOW | **File**: `src/types.rs`
 - Remove `StorageType` enum and its `From<&StorageInfo>` impl
 - Confirmed: zero references outside `types.rs` — pure dead code
+- Handlers use inline string matches on `StorageInfo`, not `StorageType`
 
 ### ~~3.4 Drop `async_trait` for Native Async Fn in Traits~~ DROPPED
 
 **Reason**: The codebase uses `Box<dyn StorageBackend>` via `DynEngine`. Native `async fn` in traits produces opaque `impl Future` return types that are NOT object-safe — `dyn StorageBackend` dispatch would break. The `async_trait` Box overhead (~50 bytes/call) is negligible compared to disk I/O and network I/O in every storage operation. The refactoring risk (23 methods × 3 impl blocks) far outweighs the benefit.
 
-### 3.4 `HashSet` in `find_deltaspaces_recursive`
+### 3.4 ✅ `HashSet` in `find_deltaspaces_recursive`
 
 **Severity**: LOW | **File**: `src/storage/filesystem.rs`
 - Replace `Vec<String>` + `contains()` with `HashSet<String>`
-- O(1) dedup instead of O(n)
+- O(1) dedup instead of O(n) — though duplicates are technically impossible given the recursive traversal visits each directory exactly once
+- Convert to `Vec<String>` at the caller boundary (`list_deltaspaces` returns `Vec`)
 
-### 3.5 Size Guard on Object Copy
+### 3.5 ✅ Size Guard on Object Copy
 
-**Severity**: MEDIUM | **File**: `src/api/handlers.rs`
-- Check source object size against `max_object_size` before storing the copy
-- Prevents memory exhaustion from copying large objects
+**Severity**: LOW | **File**: `src/api/handlers.rs`
 
-### 3.6 Remove `Clone` from `S3Error`
+The copy handler calls `retrieve()` (loading full object into memory) then `store()` (which checks size). By the time `store()` rejects, the data is already in memory.
+
+**Changes**:
+- Call `engine.head()` first to get metadata, check `file_size` against `max_object_size`, then proceed with `retrieve()` + `store()`
+- Add public `max_object_size()` getter to engine
+- Note: Source object was originally stored within limits; this only guards against config reductions. Priority downgraded from MEDIUM to LOW.
+
+### 3.6 ✅ Remove `Clone` from `S3Error`
 
 **Severity**: LOW | **File**: `src/api/errors.rs`
 - Remove `#[derive(Clone)]` from `S3Error`
-- Confirmed: `Clone` is never called on `S3Error` itself; `.clone()` calls in `to_xml()` operate on inner `String` fields
+- Confirmed: `Clone` is never called on `S3Error` itself
+- Phase 2 Task 2.7 replaced inner `.clone()` calls with `escape_xml()` which takes `&str`
 
-### 3.7 Prefix Lock Map Cleanup
+### 3.7 ✅ Prefix Lock Map Cleanup
 
 **Severity**: LOW | **File**: `src/deltaglider/engine.rs`
-- The `prefix_locks` HashMap grows unboundedly as new prefixes are accessed (~100 bytes/entry)
-- Prune entries where `Arc::strong_count() == 1` (only the map holds a reference = no active lock)
-- Trigger cleanup periodically or after each `delete()` operation
+
+The `prefix_locks` HashMap grows unboundedly (~100 bytes/entry). After Phase 1 Task 1.6 introduced the map, it never shrinks.
+
+**Changes**:
+- Add `cleanup_prefix_locks()` method that prunes entries where `Arc::strong_count() == 1` (only the map holds a reference = no active lock)
+- Call from `delete()` AFTER the `_lock` guard is dropped (while guard is held, strong_count is 2)
+- Only run cleanup when map exceeds a size threshold (1024 entries) to avoid overhead on every delete
 
 ---
 

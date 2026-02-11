@@ -9,10 +9,12 @@ pub enum CompressionStrategy {
     DirectStore,
 }
 
-/// Routes files to appropriate compression strategy based on extension
+/// Routes files to appropriate compression strategy based on extension.
+/// Dot-prefixed suffixes are pre-formatted at construction time to avoid
+/// per-call allocations in `route()`.
 pub struct FileRouter {
-    /// Extensions that benefit from delta compression
-    delta_extensions: Vec<&'static str>,
+    /// Pre-formatted dot-prefixed suffixes (e.g., ".tar.gz", ".zip")
+    delta_suffixes: Vec<String>,
 }
 
 impl Default for FileRouter {
@@ -24,16 +26,22 @@ impl Default for FileRouter {
 impl FileRouter {
     /// Create a new file router with default delta-eligible extensions
     pub fn new() -> Self {
+        let extensions: &[&str] = &[
+            // Archives
+            "zip", "tar", "tgz", "tar.gz", "tar.bz2", "tar.xz",
+            // Java/JVM packages
+            "jar", "war", "ear",
+            // Other archive formats
+            "rar", "7z",
+            // Disk images (often similar between versions)
+            "dmg", "iso",
+            // Database dumps
+            "sql", "dump",
+            // Backups
+            "bak", "backup",
+        ];
         Self {
-            delta_extensions: vec![
-                // Archives
-                "zip", "tar", "tgz", "tar.gz", "tar.bz2", "tar.xz", // Java/JVM packages
-                "jar", "war", "ear", // Other archive formats
-                "rar", "7z", // Disk images (often similar between versions)
-                "dmg", "iso", // Database dumps
-                "sql", "dump", // Backups
-                "bak", "backup",
-            ],
+            delta_suffixes: extensions.iter().map(|ext| format!(".{}", ext)).collect(),
         }
     }
 
@@ -41,9 +49,8 @@ impl FileRouter {
     pub fn route(&self, filename: &str) -> CompressionStrategy {
         let lower = filename.to_lowercase();
 
-        // Check for compound extensions first (e.g., .tar.gz)
-        for ext in &self.delta_extensions {
-            if lower.ends_with(&format!(".{}", ext)) {
+        for suffix in &self.delta_suffixes {
+            if lower.ends_with(suffix) {
                 return CompressionStrategy::DeltaEligible;
             }
         }

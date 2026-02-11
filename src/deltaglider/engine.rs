@@ -152,6 +152,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.codec.is_cli_available()
     }
 
+    /// Returns the maximum object size in bytes.
+    pub fn max_object_size(&self) -> u64 {
+        self.max_object_size
+    }
+
     /// Acquire a per-deltaspace async lock. Different prefixes do not contend.
     async fn acquire_prefix_lock(
         &self,
@@ -165,6 +170,24 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 .clone()
         };
         mutex.lock_owned().await
+    }
+
+    /// Prune prefix lock entries that are no longer actively held.
+    /// An entry with `Arc::strong_count() == 1` means only the map references it
+    /// (no outstanding `OwnedMutexGuard`), so it can be safely removed.
+    /// Only runs when the map exceeds a size threshold to avoid overhead.
+    fn cleanup_prefix_locks(&self) {
+        const CLEANUP_THRESHOLD: usize = 1024;
+        let mut locks = self.prefix_locks.lock();
+        if locks.len() <= CLEANUP_THRESHOLD {
+            return;
+        }
+        let before = locks.len();
+        locks.retain(|_, arc| Arc::strong_count(arc) > 1);
+        let removed = before - locks.len();
+        if removed > 0 {
+            debug!("Pruned {} idle prefix locks ({} remaining)", removed, locks.len());
+        }
     }
 
     /// Store an object with automatic delta compression
@@ -555,6 +578,23 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .collect())
     }
 
+    /// Returns `true` if a deltaspace could contain keys matching the given prefix.
+    /// Used to skip entire deltaspaces during listing, avoiding unnecessary I/O.
+    fn deltaspace_could_match(deltaspace_id: &str, prefix: &str) -> bool {
+        if prefix.is_empty() {
+            return true;
+        }
+        if deltaspace_id.is_empty() {
+            // Root-level keys are bare filenames (no '/'). They can only match
+            // a prefix that doesn't contain '/' (e.g. prefix="app" matches "app.zip").
+            return !prefix.contains('/');
+        }
+        let dsid_slash = format!("{}/", deltaspace_id);
+        // Include if: the deltaspace path starts with the prefix (prefix is broader),
+        // OR the prefix drills into this deltaspace (prefix is narrower/equal).
+        dsid_slash.starts_with(prefix) || prefix.starts_with(&dsid_slash)
+    }
+
     /// ListObjectsV2-style listing across all deltaspaces, with simple pagination.
     #[instrument(skip(self))]
     pub async fn list_objects_v2(
@@ -571,6 +611,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             std::collections::HashMap::new();
 
         for deltaspace_id in deltaspace_ids {
+            // Skip deltaspaces that cannot produce keys matching the requested prefix.
+            if !Self::deltaspace_could_match(&deltaspace_id, prefix) {
+                continue;
+            }
+
             let metas = self.deltaspace_mgr.list_objects(&deltaspace_id).await?;
 
             // deltaspace_id is now the actual prefix (empty string for root-level files)
@@ -693,6 +738,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             self.cache.invalidate(&deltaspace_id);
             self.deltaspace_mgr.delete_reference(&deltaspace_id).await?;
         }
+
+        // Release the per-prefix lock before cleanup so strong_count drops to 1.
+        drop(_lock);
+        self.cleanup_prefix_locks();
 
         debug!("Deleted {}/{}", bucket, key);
         Ok(())
@@ -929,5 +978,28 @@ mod tests {
         // Verify retrieval works
         let (retrieved, _meta) = engine.retrieve("bucket", "releases/v2.zip").await.unwrap();
         assert_eq!(retrieved, random_data);
+    }
+
+    #[test]
+    fn test_deltaspace_could_match() {
+        // Empty prefix matches everything
+        assert!(DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match("releases/v1.0", ""));
+        assert!(DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match("", ""));
+
+        // Prefix drills into a deltaspace
+        assert!(DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match("releases/v1.0", "releases/v1.0/"));
+        assert!(DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match("releases/v1.0", "releases/v1.0/app"));
+
+        // Prefix is broader than deltaspace
+        assert!(DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match("releases/v1.0", "releases/"));
+        assert!(DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match("releases/v1.0", "rel"));
+
+        // No match — disjoint paths
+        assert!(!DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match("releases/v1.0", "backups/"));
+        assert!(!DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match("releases/v1.0", "staging/"));
+
+        // Root deltaspace (empty dsid) — matches only prefixes without '/'
+        assert!(DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match("", "app"));
+        assert!(!DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match("", "releases/"));
     }
 }
