@@ -172,7 +172,6 @@ src/
 ├── deltaglider/
 │   ├── engine.rs      # Core delta compression logic
 │   ├── codec.rs       # xdelta3 encode/decode
-│   ├── deltaspace.rs  # Deltaspace management
 │   ├── cache.rs       # Reference file LRU cache
 │   └── file_router.rs # File type routing
 ├── storage/
@@ -208,7 +207,7 @@ PUT responses include `x-amz-storage-type`:
 
 ```bash
 curl -i -X PUT --data-binary @releases/v2.zip http://localhost:9000/default/releases/v2.zip
-# x-amz-storage-type: Delta  # or "Direct"
+# x-amz-storage-type: delta  # or "direct"
 ```
 
 Typical savings for versioned artifacts:

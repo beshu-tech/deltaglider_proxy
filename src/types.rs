@@ -169,6 +169,17 @@ pub enum StorageInfo {
     Direct,
 }
 
+impl StorageInfo {
+    /// Consistent human-readable label for logging and headers.
+    pub fn label(&self) -> &'static str {
+        match self {
+            StorageInfo::Reference { .. } => "reference",
+            StorageInfo::Delta { .. } => "delta",
+            StorageInfo::Direct => "direct",
+        }
+    }
+}
+
 impl FileMetadata {
     /// Create metadata for a new reference file
     pub fn new_reference(

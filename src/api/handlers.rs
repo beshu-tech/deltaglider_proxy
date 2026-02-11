@@ -8,7 +8,6 @@ use super::xml::{
     DeletedObject, ListBucketResult, ListBucketsResult, S3Object,
 };
 use crate::deltaglider::DynEngine;
-use crate::types::StorageInfo;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -65,11 +64,7 @@ async fn put_object_inner(
         .store(&bucket, key, &body, content_type)
         .await?;
 
-    let storage_type = match &result.metadata.storage_info {
-        StorageInfo::Reference { .. } => "Reference",
-        StorageInfo::Delta { .. } => "Delta",
-        StorageInfo::Direct => "Direct",
-    };
+    let storage_type = result.metadata.storage_info.label();
 
     debug!(
         "Stored {}/{} as {}, saved {} bytes",
@@ -101,11 +96,7 @@ pub async fn get_object(
 
     let (data, metadata) = state.engine.retrieve(&bucket, &key).await?;
 
-    let storage_type = match &metadata.storage_info {
-        StorageInfo::Reference { .. } => "reference",
-        StorageInfo::Delta { .. } => "delta",
-        StorageInfo::Direct => "direct",
-    };
+    let storage_type = metadata.storage_info.label();
 
     debug!(
         "Retrieved {}/{} ({} bytes, stored as {})",

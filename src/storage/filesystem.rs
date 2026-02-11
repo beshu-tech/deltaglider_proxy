@@ -276,6 +276,82 @@ impl FilesystemBackend {
         })
     }
 
+    // === Private helpers to eliminate delta/direct duplication ===
+
+    /// Generic get for delta or direct files.
+    async fn get_object_file(
+        &self,
+        data_path: &Path,
+        label: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<Vec<u8>, StorageError> {
+        if !path_exists(data_path).await {
+            return Err(StorageError::NotFound(format!(
+                "{}: {}/{}",
+                label, prefix, filename
+            )));
+        }
+        let data = fs::read(data_path).await?;
+        debug!(
+            "Read {} ({} bytes) for {}/{}",
+            label,
+            data.len(),
+            prefix,
+            filename
+        );
+        Ok(data)
+    }
+
+    /// Generic put for delta or direct files (data-first, metadata-as-commit).
+    #[allow(clippy::too_many_arguments)]
+    async fn put_object_file(
+        &self,
+        data_path: &Path,
+        meta_path: &Path,
+        data: &[u8],
+        metadata: &FileMetadata,
+        label: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<(), StorageError> {
+        self.ensure_dir(data_path).await?;
+        atomic_write(data_path, data).await?;
+        self.write_metadata(meta_path, metadata).await?;
+        debug!(
+            "Wrote {} ({} bytes) for {}/{}",
+            label,
+            data.len(),
+            prefix,
+            filename
+        );
+        Ok(())
+    }
+
+    /// Generic delete for delta or direct files (metadata-first, reverse of write).
+    async fn delete_object_file(
+        &self,
+        data_path: &Path,
+        meta_path: &Path,
+        label: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<(), StorageError> {
+        if !path_exists(data_path).await {
+            return Err(StorageError::NotFound(format!(
+                "{}: {}/{}",
+                label, prefix, filename
+            )));
+        }
+        // Metadata first (reverse of write ordering)
+        if path_exists(meta_path).await {
+            fs::remove_file(meta_path).await?;
+        }
+        fs::remove_file(data_path).await?;
+        debug!("Deleted {} for {}/{}", label, prefix, filename);
+        Ok(())
+    }
+
     /// Read metadata from a .meta file
     async fn read_metadata(&self, meta_path: &Path) -> Result<FileMetadata, StorageError> {
         if !path_exists(meta_path).await {
@@ -447,21 +523,8 @@ impl StorageBackend for FilesystemBackend {
 
     #[instrument(skip(self))]
     async fn get_delta(&self, prefix: &str, filename: &str) -> Result<Vec<u8>, StorageError> {
-        let path = self.delta_path(prefix, filename);
-        if !path_exists(&path).await {
-            return Err(StorageError::NotFound(format!(
-                "Delta: {}/{}",
-                prefix, filename
-            )));
-        }
-        let data = fs::read(&path).await?;
-        debug!(
-            "Read delta ({} bytes) for {}/{}",
-            data.len(),
-            prefix,
-            filename
-        );
-        Ok(data)
+        self.get_object_file(&self.delta_path(prefix, filename), "delta", prefix, filename)
+            .await
     }
 
     #[instrument(skip(self, data, metadata))]
@@ -472,20 +535,11 @@ impl StorageBackend for FilesystemBackend {
         data: &[u8],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        let data_path = self.delta_path(prefix, filename);
-        let meta_path = self.delta_meta_path(prefix, filename);
-
-        self.ensure_dir(&data_path).await?;
-        atomic_write(&data_path, data).await?;
-        self.write_metadata(&meta_path, metadata).await?;
-
-        debug!(
-            "Wrote delta ({} bytes) for {}/{}",
-            data.len(),
-            prefix,
-            filename
-        );
-        Ok(())
+        self.put_object_file(
+            &self.delta_path(prefix, filename),
+            &self.delta_meta_path(prefix, filename),
+            data, metadata, "delta", prefix, filename,
+        ).await
     }
 
     #[instrument(skip(self))]
@@ -494,51 +548,24 @@ impl StorageBackend for FilesystemBackend {
         prefix: &str,
         filename: &str,
     ) -> Result<FileMetadata, StorageError> {
-        let meta_path = self.delta_meta_path(prefix, filename);
-        self.read_metadata(&meta_path).await
+        self.read_metadata(&self.delta_meta_path(prefix, filename)).await
     }
 
     #[instrument(skip(self))]
     async fn delete_delta(&self, prefix: &str, filename: &str) -> Result<(), StorageError> {
-        let data_path = self.delta_path(prefix, filename);
-        let meta_path = self.delta_meta_path(prefix, filename);
-
-        if !path_exists(&data_path).await {
-            return Err(StorageError::NotFound(format!(
-                "Delta: {}/{}",
-                prefix, filename
-            )));
-        }
-
-        // Metadata first (reverse of write ordering)
-        if path_exists(&meta_path).await {
-            fs::remove_file(&meta_path).await?;
-        }
-        fs::remove_file(&data_path).await?;
-
-        debug!("Deleted delta for {}/{}", prefix, filename);
-        Ok(())
+        self.delete_object_file(
+            &self.delta_path(prefix, filename),
+            &self.delta_meta_path(prefix, filename),
+            "delta", prefix, filename,
+        ).await
     }
 
     // === Direct operations ===
 
     #[instrument(skip(self))]
     async fn get_direct(&self, prefix: &str, filename: &str) -> Result<Vec<u8>, StorageError> {
-        let path = self.direct_path(prefix, filename);
-        if !path_exists(&path).await {
-            return Err(StorageError::NotFound(format!(
-                "Direct: {}/{}",
-                prefix, filename
-            )));
-        }
-        let data = fs::read(&path).await?;
-        debug!(
-            "Read direct ({} bytes) for {}/{}",
-            data.len(),
-            prefix,
-            filename
-        );
-        Ok(data)
+        self.get_object_file(&self.direct_path(prefix, filename), "direct", prefix, filename)
+            .await
     }
 
     #[instrument(skip(self, data, metadata))]
@@ -549,20 +576,11 @@ impl StorageBackend for FilesystemBackend {
         data: &[u8],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        let data_path = self.direct_path(prefix, filename);
-        let meta_path = self.direct_meta_path(prefix, filename);
-
-        self.ensure_dir(&data_path).await?;
-        atomic_write(&data_path, data).await?;
-        self.write_metadata(&meta_path, metadata).await?;
-
-        debug!(
-            "Wrote direct ({} bytes) for {}/{}",
-            data.len(),
-            prefix,
-            filename
-        );
-        Ok(())
+        self.put_object_file(
+            &self.direct_path(prefix, filename),
+            &self.direct_meta_path(prefix, filename),
+            data, metadata, "direct", prefix, filename,
+        ).await
     }
 
     #[instrument(skip(self))]
@@ -571,30 +589,16 @@ impl StorageBackend for FilesystemBackend {
         prefix: &str,
         filename: &str,
     ) -> Result<FileMetadata, StorageError> {
-        let meta_path = self.direct_meta_path(prefix, filename);
-        self.read_metadata(&meta_path).await
+        self.read_metadata(&self.direct_meta_path(prefix, filename)).await
     }
 
     #[instrument(skip(self))]
     async fn delete_direct(&self, prefix: &str, filename: &str) -> Result<(), StorageError> {
-        let data_path = self.direct_path(prefix, filename);
-        let meta_path = self.direct_meta_path(prefix, filename);
-
-        if !path_exists(&data_path).await {
-            return Err(StorageError::NotFound(format!(
-                "Direct: {}/{}",
-                prefix, filename
-            )));
-        }
-
-        // Metadata first (reverse of write ordering)
-        if path_exists(&meta_path).await {
-            fs::remove_file(&meta_path).await?;
-        }
-        fs::remove_file(&data_path).await?;
-
-        debug!("Deleted direct for {}/{}", prefix, filename);
-        Ok(())
+        self.delete_object_file(
+            &self.direct_path(prefix, filename),
+            &self.direct_meta_path(prefix, filename),
+            "direct", prefix, filename,
+        ).await
     }
 
     // === Scanning operations ===
