@@ -49,19 +49,6 @@ jobs:
   test:
     name: Tests
     runs-on: ubuntu-latest
-    services:
-      minio:
-        image: quay.io/minio/minio:latest
-        ports:
-          - 9000:9000
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-        options: >-
-          --health-cmd "curl -sf http://localhost:9000/minio/health/live || exit 1"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -73,9 +60,20 @@ jobs:
         run: cd demo/s3-browser/ui && npm ci && npm run build
       - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            quay.io/minio/minio:latest server /data
+          # Wait for MinIO to be healthy
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:9000/minio/health/live && break
+            sleep 1
+          done
       - name: Create MinIO test buckets
         run: |
-          curl -sf http://localhost:9000/minio/health/live
           wget -q https://dl.min.io/client/mc/release/linux-amd64/mc && chmod +x mc
           ./mc alias set local http://localhost:9000 minioadmin minioadmin
           ./mc mb --ignore-existing local/deltaglider-test
