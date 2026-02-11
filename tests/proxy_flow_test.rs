@@ -31,7 +31,10 @@ async fn server_available() -> bool {
     let client = reqwest::Client::new();
     // Try a bucket request - server returns 404 for non-existent objects but responds
     match client
-        .get(format!("{}/test-bucket/health-check", DELTAGLIDER_PROXY_URL))
+        .get(format!(
+            "{}/test-bucket/health-check",
+            DELTAGLIDER_PROXY_URL
+        ))
         .send()
         .await
     {
@@ -55,7 +58,10 @@ fn test_key(prefix: &str) -> String {
 #[tokio::test]
 async fn test_proxy_basic_crud() {
     if !server_available().await {
-        eprintln!("SKIP: DeltaGlider Proxy server not available at {}", DELTAGLIDER_PROXY_URL);
+        eprintln!(
+            "SKIP: DeltaGlider Proxy server not available at {}",
+            DELTAGLIDER_PROXY_URL
+        );
         eprintln!("Start the server with S3 backend to run this test");
         return;
     }
@@ -399,7 +405,10 @@ async fn test_proxy_multiple_versions() {
     ];
 
     for (name, content) in &versions {
-        let url = format!("{}/{}/{}/{}", DELTAGLIDER_PROXY_URL, bucket, deltaspace, name);
+        let url = format!(
+            "{}/{}/{}/{}",
+            DELTAGLIDER_PROXY_URL, bucket, deltaspace, name
+        );
         let resp = client
             .put(&url)
             .body(content.clone())
@@ -420,7 +429,10 @@ async fn test_proxy_multiple_versions() {
 
     // Verify all versions can be retrieved correctly
     for (name, expected) in &versions {
-        let url = format!("{}/{}/{}/{}", DELTAGLIDER_PROXY_URL, bucket, deltaspace, name);
+        let url = format!(
+            "{}/{}/{}/{}",
+            DELTAGLIDER_PROXY_URL, bucket, deltaspace, name
+        );
         let resp = client.get(&url).send().await.expect("GET failed");
         let body = resp.bytes().await.expect("Read failed");
         assert_eq!(

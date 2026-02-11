@@ -59,10 +59,7 @@ async fn put_object_inner(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    let result = state
-        .engine
-        .store(&bucket, key, &body, content_type)
-        .await?;
+    let result = state.engine.store(bucket, key, body, content_type).await?;
 
     let storage_type = result.metadata.storage_info.label();
 
@@ -106,6 +103,9 @@ pub async fn get_object(
         storage_type
     );
 
+    let storage_type = metadata.storage_info.label();
+    let stored_size = metadata.delta_size().unwrap_or(metadata.file_size);
+
     let content_type = metadata
         .content_type
         .clone()
@@ -124,6 +124,8 @@ pub async fn get_object(
                     .format("%a, %d %b %Y %H:%M:%S GMT")
                     .to_string(),
             ),
+            ("x-amz-storage-type", storage_type.to_string()),
+            ("x-deltaglider-stored-size", stored_size.to_string()),
         ],
         data,
     )
@@ -141,6 +143,9 @@ pub async fn head_object(
 
     let metadata = state.engine.head(&bucket, &key).await?;
 
+    let storage_type = metadata.storage_info.label();
+    let stored_size = metadata.delta_size().unwrap_or(metadata.file_size);
+
     let content_type = metadata
         .content_type
         .clone()
@@ -159,6 +164,8 @@ pub async fn head_object(
                     .format("%a, %d %b %Y %H:%M:%S GMT")
                     .to_string(),
             ),
+            ("x-amz-storage-type", storage_type.to_string()),
+            ("x-deltaglider-stored-size", stored_size.to_string()),
         ],
     )
         .into_response())
@@ -337,14 +344,12 @@ pub async fn delete_objects(
     }
 
     // Parse XML body
-    let body_str = String::from_utf8(body.to_vec())
-        .map_err(|_| S3Error::MalformedXML)?;
+    let body_str = String::from_utf8(body.to_vec()).map_err(|_| S3Error::MalformedXML)?;
 
-    let delete_req = DeleteRequest::from_xml(&body_str)
-        .map_err(|e| {
-            warn!("Failed to parse DeleteObjects XML: {}", e);
-            S3Error::MalformedXML
-        })?;
+    let delete_req = DeleteRequest::from_xml(&body_str).map_err(|e| {
+        warn!("Failed to parse DeleteObjects XML: {}", e);
+        S3Error::MalformedXML
+    })?;
 
     info!(
         "DELETE multiple objects in {} ({} objects)",
@@ -413,9 +418,9 @@ async fn copy_object_inner(
         .map_err(|_| S3Error::InvalidArgument("Invalid copy source encoding".to_string()))?;
     let copy_source = copy_source.trim_start_matches('/');
 
-    let (source_bucket, source_key) = copy_source.split_once('/').ok_or_else(|| {
-        S3Error::InvalidArgument("Copy source must be bucket/key".to_string())
-    })?;
+    let (source_bucket, source_key) = copy_source
+        .split_once('/')
+        .ok_or_else(|| S3Error::InvalidArgument("Copy source must be bucket/key".to_string()))?;
 
     if source_bucket != state.default_bucket {
         return Err(S3Error::NoSuchBucket(source_bucket.to_string()));
@@ -586,12 +591,7 @@ pub async fn create_bucket(
 
     // The bucket always "exists" (it's created on first use)
     // Return 200 OK (S3 returns 200 for existing owned bucket)
-    Ok((
-        StatusCode::OK,
-        [("Location", format!("/{}", bucket))],
-        "",
-    )
-        .into_response())
+    Ok((StatusCode::OK, [("Location", format!("/{}", bucket))], "").into_response())
 }
 
 /// DELETE bucket handler
@@ -617,9 +617,7 @@ pub async fn delete_bucket(
 /// HEAD bucket handler
 /// HEAD /{bucket}
 #[instrument]
-pub async fn head_bucket(
-    ValidatedBucket(bucket): ValidatedBucket,
-) -> Result<Response, S3Error> {
+pub async fn head_bucket(ValidatedBucket(bucket): ValidatedBucket) -> Result<Response, S3Error> {
     info!("HEAD bucket {}", bucket);
 
     // Bucket exists (validated by extractor)
@@ -629,9 +627,7 @@ pub async fn head_bucket(
 /// LIST buckets handler
 /// GET /
 #[instrument(skip(state))]
-pub async fn list_buckets(
-    State(state): State<Arc<AppState>>,
-) -> Result<Response, S3Error> {
+pub async fn list_buckets(State(state): State<Arc<AppState>>) -> Result<Response, S3Error> {
     info!("LIST buckets");
 
     // Return the single configured bucket
@@ -646,6 +642,51 @@ pub async fn list_buckets(
     let xml = result.to_xml();
 
     Ok((StatusCode::OK, [("Content-Type", "application/xml")], xml).into_response())
+}
+
+// ============================================================================
+// Stats
+// ============================================================================
+
+/// Aggregate storage statistics
+#[derive(Debug, Serialize)]
+pub struct StatsResponse {
+    pub total_objects: u64,
+    pub total_original_size: u64,
+    pub total_stored_size: u64,
+    pub savings_percentage: f64,
+}
+
+/// Stats handler
+/// GET /stats
+pub async fn get_stats(State(state): State<Arc<AppState>>) -> Result<Json<StatsResponse>, S3Error> {
+    let page = state
+        .engine
+        .list_objects_v2(&state.default_bucket, "", u32::MAX, None)
+        .await?;
+
+    let mut total_objects: u64 = 0;
+    let mut total_original_size: u64 = 0;
+    let mut total_stored_size: u64 = 0;
+
+    for (_key, meta) in &page.objects {
+        total_objects += 1;
+        total_original_size += meta.file_size;
+        total_stored_size += meta.delta_size().unwrap_or(meta.file_size);
+    }
+
+    let savings_percentage = if total_original_size > 0 {
+        (1.0 - total_stored_size as f64 / total_original_size as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    Ok(Json(StatsResponse {
+        total_objects,
+        total_original_size,
+        total_stored_size,
+        savings_percentage,
+    }))
 }
 
 // ============================================================================

@@ -170,9 +170,7 @@ impl FilesystemBackend {
             return;
         }
         let mut orphans = Vec::new();
-        if let Err(e) =
-            Self::find_orphans_recursive(&deltaspaces_dir, &mut orphans).await
-        {
+        if let Err(e) = Self::find_orphans_recursive(&deltaspaces_dir, &mut orphans).await {
             warn!("Failed to scan for orphaned files: {}", e);
             return;
         }
@@ -217,7 +215,10 @@ impl FilesystemBackend {
 
                     if is_data_file {
                         let meta_path = path.with_extension(
-                            path.extension().unwrap_or_default().to_string_lossy().to_string()
+                            path.extension()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string()
                                 + ".meta",
                         );
                         // For reference.bin -> reference.bin.meta
@@ -523,8 +524,13 @@ impl StorageBackend for FilesystemBackend {
 
     #[instrument(skip(self))]
     async fn get_delta(&self, prefix: &str, filename: &str) -> Result<Vec<u8>, StorageError> {
-        self.get_object_file(&self.delta_path(prefix, filename), "delta", prefix, filename)
-            .await
+        self.get_object_file(
+            &self.delta_path(prefix, filename),
+            "delta",
+            prefix,
+            filename,
+        )
+        .await
     }
 
     #[instrument(skip(self, data, metadata))]
@@ -538,8 +544,13 @@ impl StorageBackend for FilesystemBackend {
         self.put_object_file(
             &self.delta_path(prefix, filename),
             &self.delta_meta_path(prefix, filename),
-            data, metadata, "delta", prefix, filename,
-        ).await
+            data,
+            metadata,
+            "delta",
+            prefix,
+            filename,
+        )
+        .await
     }
 
     #[instrument(skip(self))]
@@ -548,7 +559,8 @@ impl StorageBackend for FilesystemBackend {
         prefix: &str,
         filename: &str,
     ) -> Result<FileMetadata, StorageError> {
-        self.read_metadata(&self.delta_meta_path(prefix, filename)).await
+        self.read_metadata(&self.delta_meta_path(prefix, filename))
+            .await
     }
 
     #[instrument(skip(self))]
@@ -556,16 +568,24 @@ impl StorageBackend for FilesystemBackend {
         self.delete_object_file(
             &self.delta_path(prefix, filename),
             &self.delta_meta_path(prefix, filename),
-            "delta", prefix, filename,
-        ).await
+            "delta",
+            prefix,
+            filename,
+        )
+        .await
     }
 
     // === Direct operations ===
 
     #[instrument(skip(self))]
     async fn get_direct(&self, prefix: &str, filename: &str) -> Result<Vec<u8>, StorageError> {
-        self.get_object_file(&self.direct_path(prefix, filename), "direct", prefix, filename)
-            .await
+        self.get_object_file(
+            &self.direct_path(prefix, filename),
+            "direct",
+            prefix,
+            filename,
+        )
+        .await
     }
 
     #[instrument(skip(self, data, metadata))]
@@ -579,8 +599,13 @@ impl StorageBackend for FilesystemBackend {
         self.put_object_file(
             &self.direct_path(prefix, filename),
             &self.direct_meta_path(prefix, filename),
-            data, metadata, "direct", prefix, filename,
-        ).await
+            data,
+            metadata,
+            "direct",
+            prefix,
+            filename,
+        )
+        .await
     }
 
     #[instrument(skip(self))]
@@ -589,7 +614,8 @@ impl StorageBackend for FilesystemBackend {
         prefix: &str,
         filename: &str,
     ) -> Result<FileMetadata, StorageError> {
-        self.read_metadata(&self.direct_meta_path(prefix, filename)).await
+        self.read_metadata(&self.direct_meta_path(prefix, filename))
+            .await
     }
 
     #[instrument(skip(self))]
@@ -597,8 +623,11 @@ impl StorageBackend for FilesystemBackend {
         self.delete_object_file(
             &self.direct_path(prefix, filename),
             &self.direct_meta_path(prefix, filename),
-            "direct", prefix, filename,
-        ).await
+            "direct",
+            prefix,
+            filename,
+        )
+        .await
     }
 
     // === Scanning operations ===

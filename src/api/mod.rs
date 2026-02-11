@@ -1,5 +1,6 @@
 //! S3 API implementation
 
+mod aws_chunked;
 mod errors;
 mod extractors;
 pub mod handlers;

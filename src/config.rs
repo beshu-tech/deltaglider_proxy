@@ -208,7 +208,10 @@ impl Config {
         }
 
         // Try default config file locations
-        for path in &["deltaglider_proxy.toml", "/etc/deltaglider_proxy/config.toml"] {
+        for path in &[
+            "deltaglider_proxy.toml",
+            "/etc/deltaglider_proxy/config.toml",
+        ] {
             if std::path::Path::new(path).exists() {
                 if let Ok(config) = Self::from_file(path) {
                     return config;

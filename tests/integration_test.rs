@@ -31,7 +31,10 @@ impl TestServer {
         let data_dir = TempDir::new().expect("Failed to create temp dir");
 
         let mut process = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"))
-            .env("DELTAGLIDER_PROXY_LISTEN_ADDR", format!("127.0.0.1:{}", port))
+            .env(
+                "DELTAGLIDER_PROXY_LISTEN_ADDR",
+                format!("127.0.0.1:{}", port),
+            )
             .env("DELTAGLIDER_PROXY_DATA_DIR", data_dir.path())
             .env("DELTAGLIDER_PROXY_DEFAULT_BUCKET", "bucket")
             .env("RUST_LOG", "deltaglider_proxy=warn")
@@ -50,7 +53,10 @@ impl TestServer {
             }
 
             if let Ok(Some(status)) = process.try_wait() {
-                panic!("DeltaGlider Proxy server exited before becoming ready: {}", status);
+                panic!(
+                    "DeltaGlider Proxy server exited before becoming ready: {}",
+                    status
+                );
             }
 
             sleep(Duration::from_millis(100)).await;
@@ -58,7 +64,10 @@ impl TestServer {
 
         if !ready {
             let _ = process.kill();
-            panic!("Timed out waiting for DeltaGlider Proxy server to listen on {}", addr);
+            panic!(
+                "Timed out waiting for DeltaGlider Proxy server to listen on {}",
+                addr
+            );
         }
 
         Self {
@@ -570,7 +579,11 @@ async fn test_delete_objects_batch() {
         .send()
         .await
         .expect("LIST should succeed");
-    assert_eq!(list_after.key_count(), Some(0), "All objects should be deleted");
+    assert_eq!(
+        list_after.key_count(),
+        Some(0),
+        "All objects should be deleted"
+    );
 }
 
 #[tokio::test]
@@ -579,13 +592,12 @@ async fn test_head_bucket() {
     let client = server.s3_client().await;
 
     // HEAD bucket should succeed for the default bucket
-    let result = client
-        .head_bucket()
-        .bucket("bucket")
-        .send()
-        .await;
+    let result = client.head_bucket().bucket("bucket").send().await;
 
-    assert!(result.is_ok(), "HEAD bucket should succeed for default bucket");
+    assert!(
+        result.is_ok(),
+        "HEAD bucket should succeed for default bucket"
+    );
 }
 
 #[tokio::test]
@@ -600,7 +612,10 @@ async fn test_head_bucket_not_found() {
         .send()
         .await;
 
-    assert!(result.is_err(), "HEAD bucket should fail for non-existent bucket");
+    assert!(
+        result.is_err(),
+        "HEAD bucket should fail for non-existent bucket"
+    );
 }
 
 #[tokio::test]
@@ -630,11 +645,7 @@ async fn test_create_bucket_default() {
     let client = server.s3_client().await;
 
     // CREATE the default bucket should succeed (it already exists conceptually)
-    let result = client
-        .create_bucket()
-        .bucket("bucket")
-        .send()
-        .await;
+    let result = client.create_bucket().bucket("bucket").send().await;
 
     assert!(result.is_ok(), "CREATE default bucket should succeed");
 }
@@ -645,11 +656,7 @@ async fn test_delete_empty_bucket() {
     let client = server.s3_client().await;
 
     // DELETE empty bucket should succeed
-    let result = client
-        .delete_bucket()
-        .bucket("bucket")
-        .send()
-        .await;
+    let result = client.delete_bucket().bucket("bucket").send().await;
 
     assert!(result.is_ok(), "DELETE empty bucket should succeed");
 }
@@ -670,11 +677,7 @@ async fn test_delete_non_empty_bucket_fails() {
         .expect("PUT should succeed");
 
     // DELETE bucket should fail (not empty)
-    let result = client
-        .delete_bucket()
-        .bucket("bucket")
-        .send()
-        .await;
+    let result = client.delete_bucket().bucket("bucket").send().await;
 
     assert!(result.is_err(), "DELETE non-empty bucket should fail");
 }

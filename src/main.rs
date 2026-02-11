@@ -2,17 +2,19 @@
 
 use axum::{extract::DefaultBodyLimit, routing::get, Router};
 use clap::Parser;
-use std::sync::Arc;
 use deltaglider_proxy::api::handlers::{
-    create_bucket, delete_bucket, delete_object, delete_objects, get_object, head_bucket,
-    head_object, health_check, list_buckets, list_objects, post_object, put_object_or_copy, AppState,
+    create_bucket, delete_bucket, delete_object, delete_objects, get_object, get_stats,
+    head_bucket, head_object, health_check, list_buckets, list_objects, post_object,
+    put_object_or_copy, AppState,
 };
 use deltaglider_proxy::config::{BackendConfig, Config};
 use deltaglider_proxy::deltaglider::DynEngine;
 use deltaglider_proxy::storage::FilesystemBackend;
+use std::sync::Arc;
 use tokio::net::TcpListener;
-use tower_http::trace::TraceLayer;
 use tokio::signal;
+use tower_http::cors::CorsLayer;
+use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -136,8 +138,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //   HEAD /{bucket}/{key...} - get object metadata
     //   DELETE /{bucket}/{key...} - delete object
     let app = Router::new()
-        // Health check endpoint
+        // Health check and stats endpoints
         .route("/health", get(health_check))
+        .route("/stats", get(get_stats))
         // Root: list buckets
         .route("/", get(list_buckets))
         // Object operations (wildcard routes first - more specific)
@@ -167,6 +170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .head(head_bucket)
                 .post(delete_objects),
         )
+        .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         // Increase body size limit to match max_object_size config (default 2MB is too small)
         .layer(DefaultBodyLimit::max(config.max_object_size as usize))
@@ -174,7 +178,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start server with graceful shutdown
     let listener = TcpListener::bind(&config.listen_addr).await?;
-    info!("DeltaGlider Proxy listening on http://{}", config.listen_addr);
+    info!(
+        "DeltaGlider Proxy listening on http://{}",
+        config.listen_addr
+    );
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

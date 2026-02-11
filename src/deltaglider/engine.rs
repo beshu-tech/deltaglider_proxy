@@ -157,10 +157,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     }
 
     /// Acquire a per-deltaspace async lock. Different prefixes do not contend.
-    async fn acquire_prefix_lock(
-        &self,
-        prefix: &str,
-    ) -> tokio::sync::OwnedMutexGuard<()> {
+    async fn acquire_prefix_lock(&self, prefix: &str) -> tokio::sync::OwnedMutexGuard<()> {
         let mutex = {
             let mut locks = self.prefix_locks.lock();
             locks
@@ -185,7 +182,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         locks.retain(|_, arc| Arc::strong_count(arc) > 1);
         let removed = before - locks.len();
         if removed > 0 {
-            debug!("Pruned {} idle prefix locks ({} remaining)", removed, locks.len());
+            debug!(
+                "Pruned {} idle prefix locks ({} remaining)",
+                removed,
+                locks.len()
+            );
         }
     }
 
@@ -198,7 +199,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     ) -> Result<Option<FileMetadata>, StorageError> {
         let filename = original_name.rsplit('/').next().unwrap_or(original_name);
         let delta = self.storage.get_delta_metadata(prefix, filename).await.ok();
-        let direct = self.storage.get_direct_metadata(prefix, filename).await.ok();
+        let direct = self
+            .storage
+            .get_direct_metadata(prefix, filename)
+            .await
+            .ok();
         match (delta, direct) {
             (Some(d), Some(di)) => Ok(Some(if d.created_at >= di.created_at { d } else { di })),
             (Some(meta), None) | (None, Some(meta)) => Ok(Some(meta)),
@@ -285,9 +290,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         // Ensure deltaspace has an internal reference baseline.
         let ref_meta = if has_existing_reference {
-            self.storage
-                .get_reference_metadata(&deltaspace_id)
-                .await?
+            self.storage.get_reference_metadata(&deltaspace_id).await?
         } else {
             debug!("No reference in deltaspace, creating baseline");
             self.set_reference_baseline(
@@ -475,7 +478,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             ref_meta.content_type.clone(),
         );
 
-        self.delete_direct_if_exists(deltaspace_id, filename).await?;
+        self.delete_direct_if_exists(deltaspace_id, filename)
+            .await?;
         self.storage
             .put_delta(deltaspace_id, filename, &delta, &delta_meta)
             .await?;
@@ -515,9 +519,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         // Get data based on storage type
         let data = match &metadata.storage_info {
-            StorageInfo::Reference { .. } => {
-                self.storage.get_reference(&deltaspace_id).await?
-            }
+            StorageInfo::Reference { .. } => self.storage.get_reference(&deltaspace_id).await?,
             StorageInfo::Direct => {
                 self.storage
                     .get_direct(&deltaspace_id, &obj_key.filename)
@@ -580,11 +582,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     #[instrument(skip(self))]
     pub async fn list(&self, bucket: &str, prefix: &str) -> Result<Vec<FileMetadata>, EngineError> {
         let page = self.list_objects_v2(bucket, prefix, u32::MAX, None).await?;
-        Ok(page
-            .objects
-            .into_iter()
-            .map(|(_key, meta)| meta)
-            .collect())
+        Ok(page.objects.into_iter().map(|(_key, meta)| meta).collect())
     }
 
     /// Returns `true` if a deltaspace could contain keys matching the given prefix.
@@ -811,7 +809,10 @@ mod tests {
             .store("bucket", "releases/v1.zip", &data, None)
             .await
             .unwrap();
-        assert!(matches!(result.metadata.storage_info, StorageInfo::Delta { .. }));
+        assert!(matches!(
+            result.metadata.storage_info,
+            StorageInfo::Delta { .. }
+        ));
 
         // Retrieve it
         let (retrieved, _meta) = engine.retrieve("bucket", "releases/v1.zip").await.unwrap();
@@ -897,10 +898,18 @@ mod tests {
             vec!["prefix/a.zip", "prefix/b.zip"]
         );
         assert!(page1.is_truncated);
-        assert_eq!(page1.next_continuation_token.as_deref(), Some("prefix/b.zip"));
+        assert_eq!(
+            page1.next_continuation_token.as_deref(),
+            Some("prefix/b.zip")
+        );
 
         let page2 = engine
-            .list_objects_v2("bucket", "prefix/", 2, page1.next_continuation_token.as_deref())
+            .list_objects_v2(
+                "bucket",
+                "prefix/",
+                2,
+                page1.next_continuation_token.as_deref(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -955,7 +964,10 @@ mod tests {
             .store("bucket", "releases/v1.zip", &base_data, None)
             .await
             .unwrap();
-        assert!(matches!(result1.metadata.storage_info, StorageInfo::Delta { .. }));
+        assert!(matches!(
+            result1.metadata.storage_info,
+            StorageInfo::Delta { .. }
+        ));
 
         // Second file is completely different (random bytes) - poor delta ratio
         // But since reference already exists, it should still be stored as delta
@@ -979,20 +991,49 @@ mod tests {
     #[test]
     fn test_deltaspace_could_match() {
         // Empty prefix matches everything
-        assert!(DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match("releases/v1.0", ""));
+        assert!(
+            DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match("releases/v1.0", "")
+        );
         assert!(DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match("", ""));
 
         // Prefix drills into a deltaspace
-        assert!(DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match("releases/v1.0", "releases/v1.0/"));
-        assert!(DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match("releases/v1.0", "releases/v1.0/app"));
+        assert!(
+            DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match(
+                "releases/v1.0",
+                "releases/v1.0/"
+            )
+        );
+        assert!(
+            DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match(
+                "releases/v1.0",
+                "releases/v1.0/app"
+            )
+        );
 
         // Prefix is broader than deltaspace
-        assert!(DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match("releases/v1.0", "releases/"));
-        assert!(DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match("releases/v1.0", "rel"));
+        assert!(
+            DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match(
+                "releases/v1.0",
+                "releases/"
+            )
+        );
+        assert!(
+            DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match("releases/v1.0", "rel")
+        );
 
         // No match — disjoint paths
-        assert!(!DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match("releases/v1.0", "backups/"));
-        assert!(!DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match("releases/v1.0", "staging/"));
+        assert!(
+            !DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match(
+                "releases/v1.0",
+                "backups/"
+            )
+        );
+        assert!(
+            !DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match(
+                "releases/v1.0",
+                "staging/"
+            )
+        );
 
         // Root deltaspace (empty dsid) — matches only prefixes without '/'
         assert!(DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match("", "app"));

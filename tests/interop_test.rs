@@ -153,22 +153,27 @@ fn run_deltaglider_cli(args: &[&str]) -> std::io::Result<std::process::Output> {
         "run",
         "--rm",
         "--network=host",
-        "-e", &access_key_env,
-        "-e", &secret_key_env,
-        "-e", &endpoint_env,
-        "-e", "DG_LOG_LEVEL=DEBUG",
+        "-e",
+        &access_key_env,
+        "-e",
+        &secret_key_env,
+        "-e",
+        &endpoint_env,
+        "-e",
+        "DG_LOG_LEVEL=DEBUG",
         DELTAGLIDER_IMAGE,
     ];
     docker_args.extend(args);
 
-    Command::new("docker")
-        .args(&docker_args)
-        .output()
+    Command::new("docker").args(&docker_args).output()
 }
 
 /// Run DeltaGlider CLI with stdin data
 #[allow(dead_code)]
-fn run_deltaglider_cli_with_stdin(args: &[&str], stdin_data: &[u8]) -> std::io::Result<std::process::Output> {
+fn run_deltaglider_cli_with_stdin(
+    args: &[&str],
+    stdin_data: &[u8],
+) -> std::io::Result<std::process::Output> {
     use std::io::Write;
 
     let access_key_env = format!("AWS_ACCESS_KEY_ID={}", MINIO_ACCESS_KEY);
@@ -180,10 +185,14 @@ fn run_deltaglider_cli_with_stdin(args: &[&str], stdin_data: &[u8]) -> std::io::
         "--rm",
         "-i",
         "--network=host",
-        "-e", &access_key_env,
-        "-e", &secret_key_env,
-        "-e", &endpoint_env,
-        "-e", "DG_LOG_LEVEL=DEBUG",
+        "-e",
+        &access_key_env,
+        "-e",
+        &secret_key_env,
+        "-e",
+        &endpoint_env,
+        "-e",
+        "DG_LOG_LEVEL=DEBUG",
         DELTAGLIDER_IMAGE,
     ];
     docker_args.extend(args);
@@ -216,7 +225,10 @@ impl TestProxyServer {
         let data_dir = TempDir::new().expect("Failed to create temp dir");
 
         let process = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"))
-            .env("DELTAGLIDER_PROXY_LISTEN_ADDR", format!("127.0.0.1:{}", port))
+            .env(
+                "DELTAGLIDER_PROXY_LISTEN_ADDR",
+                format!("127.0.0.1:{}", port),
+            )
             .env("DELTAGLIDER_PROXY_S3_BUCKET", MINIO_BUCKET)
             .env("DELTAGLIDER_PROXY_S3_ENDPOINT", MINIO_ENDPOINT)
             .env("DELTAGLIDER_PROXY_S3_REGION", "us-east-1")
@@ -315,24 +327,41 @@ async fn test_original_cli_upload_metadata_structure() {
 
     let result = Command::new("docker")
         .args([
-            "run", "--rm",
+            "run",
+            "--rm",
             "--network=host",
-            "-v", &volume_mount,
-            "-e", &access_key,
-            "-e", &secret_key,
-            "-e", &endpoint,
-            "-e", "DG_LOG_LEVEL=INFO",
+            "-v",
+            &volume_mount,
+            "-e",
+            &access_key,
+            "-e",
+            &secret_key,
+            "-e",
+            &endpoint,
+            "-e",
+            "DG_LOG_LEVEL=INFO",
             DELTAGLIDER_IMAGE,
-            "cp", "/data/v1.zip", &s3_dest,
+            "cp",
+            "/data/v1.zip",
+            &s3_dest,
         ])
         .output()
         .expect("Failed to run deltaglider cp");
 
-    println!("DeltaGlider CLI stdout: {}", String::from_utf8_lossy(&result.stdout));
-    println!("DeltaGlider CLI stderr: {}", String::from_utf8_lossy(&result.stderr));
+    println!(
+        "DeltaGlider CLI stdout: {}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+    println!(
+        "DeltaGlider CLI stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
 
     if !result.status.success() {
-        panic!("DeltaGlider CLI upload failed: {}", String::from_utf8_lossy(&result.stderr));
+        panic!(
+            "DeltaGlider CLI upload failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
 
     // List what was actually stored in MinIO
@@ -346,7 +375,11 @@ async fn test_original_cli_upload_metadata_structure() {
 
     println!("Objects stored by original CLI:");
     for obj in list_result.contents() {
-        println!("  - {} ({} bytes)", obj.key().unwrap_or("?"), obj.size().unwrap_or(0));
+        println!(
+            "  - {} ({} bytes)",
+            obj.key().unwrap_or("?"),
+            obj.size().unwrap_or(0)
+        );
     }
 
     // The original CLI should have stored either:
@@ -354,14 +387,17 @@ async fn test_original_cli_upload_metadata_structure() {
     // - Or directly the file with metadata
 
     // Check for reference.bin (indicates delta compression was used)
-    let has_reference = list_result.contents().iter()
-        .any(|o| o.key().map(|k| k.contains("reference.bin")).unwrap_or(false));
+    let has_reference = list_result.contents().iter().any(|o| {
+        o.key()
+            .map(|k| k.contains("reference.bin"))
+            .unwrap_or(false)
+    });
 
     // Get the object and check its metadata
     let head_result = client
         .head_object()
         .bucket(MINIO_BUCKET)
-        .key(&format!("{}/reference.bin", prefix))
+        .key(format!("{}/reference.bin", prefix))
         .send()
         .await;
 
@@ -422,20 +458,31 @@ async fn test_original_cli_download_checksum_match() {
     for (_file, name) in [(&v1_file, "v1.zip"), (&v2_file, "v2.zip")] {
         let result = Command::new("docker")
             .args([
-                "run", "--rm",
+                "run",
+                "--rm",
                 "--network=host",
-                "-v", &format!("{}:/data", temp_dir.path().display()),
-                "-e", &format!("AWS_ACCESS_KEY_ID={}", MINIO_ACCESS_KEY),
-                "-e", &format!("AWS_SECRET_ACCESS_KEY={}", MINIO_SECRET_KEY),
-                "-e", &format!("AWS_ENDPOINT_URL={}", MINIO_ENDPOINT),
+                "-v",
+                &format!("{}:/data", temp_dir.path().display()),
+                "-e",
+                &format!("AWS_ACCESS_KEY_ID={}", MINIO_ACCESS_KEY),
+                "-e",
+                &format!("AWS_SECRET_ACCESS_KEY={}", MINIO_SECRET_KEY),
+                "-e",
+                &format!("AWS_ENDPOINT_URL={}", MINIO_ENDPOINT),
                 DELTAGLIDER_IMAGE,
-                "cp", &format!("/data/{}", name), &format!("s3://{}/{}/{}", MINIO_BUCKET, prefix, name),
+                "cp",
+                &format!("/data/{}", name),
+                &format!("s3://{}/{}/{}", MINIO_BUCKET, prefix, name),
             ])
             .output()
             .expect("Failed to run deltaglider cp");
 
         if !result.status.success() {
-            panic!("Upload {} failed: {}", name, String::from_utf8_lossy(&result.stderr));
+            panic!(
+                "Upload {} failed: {}",
+                name,
+                String::from_utf8_lossy(&result.stderr)
+            );
         }
         println!("Uploaded {} via original CLI", name);
     }
@@ -455,27 +502,40 @@ async fn test_original_cli_download_checksum_match() {
 
         let result = Command::new("docker")
             .args([
-                "run", "--rm",
+                "run",
+                "--rm",
                 "--network=host",
-                "-v", &download_mount,
-                "-w", "/workdir",
-                "-e", "TMPDIR=/workdir",
-                "-e", &access_key_dl,
-                "-e", &secret_key_dl,
-                "-e", &endpoint_dl,
+                "-v",
+                &download_mount,
+                "-w",
+                "/workdir",
+                "-e",
+                "TMPDIR=/workdir",
+                "-e",
+                &access_key_dl,
+                "-e",
+                &secret_key_dl,
+                "-e",
+                &endpoint_dl,
                 DELTAGLIDER_IMAGE,
-                "cp", &s3_src, &dest,
+                "cp",
+                &s3_src,
+                &dest,
             ])
             .output()
             .expect("Failed to run deltaglider cp download");
 
         if !result.status.success() {
-            panic!("Download {} failed: {}", name, String::from_utf8_lossy(&result.stderr));
+            panic!(
+                "Download {} failed: {}",
+                name,
+                String::from_utf8_lossy(&result.stderr)
+            );
         }
 
         // Read downloaded file and verify checksum
         let downloaded = std::fs::read(download_dir.path().join(name))
-            .expect(&format!("Failed to read downloaded {}", name));
+            .unwrap_or_else(|_| panic!("Failed to read downloaded {}", name));
         let actual_sha256 = sha256_hex(&downloaded);
 
         assert_eq!(
@@ -519,7 +579,7 @@ async fn test_proxy_upload_original_cli_download() {
     proxy_client
         .put_object()
         .bucket("default")
-        .key(&format!("{}/v1.zip", prefix))
+        .key(format!("{}/v1.zip", prefix))
         .body(ByteStream::from(v1_data.clone()))
         .send()
         .await
@@ -530,7 +590,7 @@ async fn test_proxy_upload_original_cli_download() {
     proxy_client
         .put_object()
         .bucket("default")
-        .key(&format!("{}/v2.zip", prefix))
+        .key(format!("{}/v2.zip", prefix))
         .body(ByteStream::from(v2_data.clone()))
         .send()
         .await
@@ -549,7 +609,11 @@ async fn test_proxy_upload_original_cli_download() {
 
     println!("Objects stored by proxy:");
     for obj in list_result.contents() {
-        println!("  - {} ({} bytes)", obj.key().unwrap_or("?"), obj.size().unwrap_or(0));
+        println!(
+            "  - {} ({} bytes)",
+            obj.key().unwrap_or("?"),
+            obj.size().unwrap_or(0)
+        );
     }
 
     // Download via our proxy and verify
@@ -557,10 +621,10 @@ async fn test_proxy_upload_original_cli_download() {
         let get_result = proxy_client
             .get_object()
             .bucket("default")
-            .key(&format!("{}/{}", prefix, name))
+            .key(format!("{}/{}", prefix, name))
             .send()
             .await
-            .expect(&format!("Failed to GET {} via proxy", name));
+            .unwrap_or_else(|_| panic!("Failed to GET {} via proxy", name));
 
         let body = get_result
             .body
@@ -621,14 +685,21 @@ async fn test_cross_tool_delta_reconstruction() {
     for name in ["v1.zip", "v2.zip"] {
         let result = Command::new("docker")
             .args([
-                "run", "--rm",
+                "run",
+                "--rm",
                 "--network=host",
-                "-v", &format!("{}:/data", temp_dir.path().display()),
-                "-e", &format!("AWS_ACCESS_KEY_ID={}", MINIO_ACCESS_KEY),
-                "-e", &format!("AWS_SECRET_ACCESS_KEY={}", MINIO_SECRET_KEY),
-                "-e", &format!("AWS_ENDPOINT_URL={}", MINIO_ENDPOINT),
+                "-v",
+                &format!("{}:/data", temp_dir.path().display()),
+                "-e",
+                &format!("AWS_ACCESS_KEY_ID={}", MINIO_ACCESS_KEY),
+                "-e",
+                &format!("AWS_SECRET_ACCESS_KEY={}", MINIO_SECRET_KEY),
+                "-e",
+                &format!("AWS_ENDPOINT_URL={}", MINIO_ENDPOINT),
                 DELTAGLIDER_IMAGE,
-                "cp", &format!("/data/{}", name), &format!("s3://{}/{}/{}", MINIO_BUCKET, prefix_cli, name),
+                "cp",
+                &format!("/data/{}", name),
+                &format!("s3://{}/{}/{}", MINIO_BUCKET, prefix_cli, name),
             ])
             .output()
             .expect("Failed to run deltaglider cp");
@@ -675,7 +746,7 @@ async fn test_cross_tool_delta_reconstruction() {
     proxy_client
         .put_object()
         .bucket("default")
-        .key(&format!("{}/v1.zip", prefix_proxy))
+        .key(format!("{}/v1.zip", prefix_proxy))
         .body(ByteStream::from(v1_data.clone()))
         .send()
         .await
@@ -684,7 +755,7 @@ async fn test_cross_tool_delta_reconstruction() {
     proxy_client
         .put_object()
         .bucket("default")
-        .key(&format!("{}/v2.zip", prefix_proxy))
+        .key(format!("{}/v2.zip", prefix_proxy))
         .body(ByteStream::from(v2_data.clone()))
         .send()
         .await
@@ -721,36 +792,63 @@ async fn test_cross_tool_delta_reconstruction() {
 
         let result = Command::new("docker")
             .args([
-                "run", "--rm",
+                "run",
+                "--rm",
                 "--network=host",
-                "-v", &dl_mount,
-                "-w", "/workdir",
-                "-e", "TMPDIR=/workdir",
-                "-e", &ak,
-                "-e", &sk,
-                "-e", &ep,
+                "-v",
+                &dl_mount,
+                "-w",
+                "/workdir",
+                "-e",
+                "TMPDIR=/workdir",
+                "-e",
+                &ak,
+                "-e",
+                &sk,
+                "-e",
+                &ep,
                 DELTAGLIDER_IMAGE,
-                "cp", &s3_src, &dest,
+                "cp",
+                &s3_src,
+                &dest,
             ])
             .output()
             .expect("Failed to run deltaglider cp download");
 
-        println!("CLI download {} stdout: {}", name, String::from_utf8_lossy(&result.stdout));
-        println!("CLI download {} stderr: {}", name, String::from_utf8_lossy(&result.stderr));
+        println!(
+            "CLI download {} stdout: {}",
+            name,
+            String::from_utf8_lossy(&result.stdout)
+        );
+        println!(
+            "CLI download {} stderr: {}",
+            name,
+            String::from_utf8_lossy(&result.stderr)
+        );
 
         if result.status.success() {
             let downloaded = std::fs::read(download_dir.path().join(name))
-                .expect(&format!("Failed to read {}", name));
+                .unwrap_or_else(|_| panic!("Failed to read {}", name));
             let actual_sha256 = sha256_hex(&downloaded);
 
-            let expected = if name == "v1.zip" { &v1_sha256 } else { &v2_sha256 };
+            let expected = if name == "v1.zip" {
+                &v1_sha256
+            } else {
+                &v2_sha256
+            };
             if actual_sha256 == *expected {
                 println!("✓ {} checksum matches: {}", name, actual_sha256);
             } else {
-                println!("✗ {} checksum MISMATCH: expected {}, got {}", name, expected, actual_sha256);
+                println!(
+                    "✗ {} checksum MISMATCH: expected {}, got {}",
+                    name, expected, actual_sha256
+                );
             }
         } else {
-            println!("⚠ CLI couldn't download {} - storage format incompatibility", name);
+            println!(
+                "⚠ CLI couldn't download {} - storage format incompatibility",
+                name
+            );
         }
     }
 
@@ -786,20 +884,31 @@ async fn test_proxy_reads_cli_format() {
     for name in ["v1.zip", "v2.zip"] {
         let result = Command::new("docker")
             .args([
-                "run", "--rm",
+                "run",
+                "--rm",
                 "--network=host",
-                "-v", &format!("{}:/data", temp_dir.path().display()),
-                "-e", &format!("AWS_ACCESS_KEY_ID={}", MINIO_ACCESS_KEY),
-                "-e", &format!("AWS_SECRET_ACCESS_KEY={}", MINIO_SECRET_KEY),
-                "-e", &format!("AWS_ENDPOINT_URL={}", MINIO_ENDPOINT),
+                "-v",
+                &format!("{}:/data", temp_dir.path().display()),
+                "-e",
+                &format!("AWS_ACCESS_KEY_ID={}", MINIO_ACCESS_KEY),
+                "-e",
+                &format!("AWS_SECRET_ACCESS_KEY={}", MINIO_SECRET_KEY),
+                "-e",
+                &format!("AWS_ENDPOINT_URL={}", MINIO_ENDPOINT),
                 DELTAGLIDER_IMAGE,
-                "cp", &format!("/data/{}", name), &format!("s3://{}/{}/{}", MINIO_BUCKET, prefix, name),
+                "cp",
+                &format!("/data/{}", name),
+                &format!("s3://{}/{}/{}", MINIO_BUCKET, prefix, name),
             ])
             .output()
             .expect("Failed to upload via CLI");
 
-        assert!(result.status.success(), "CLI upload {} failed: {}",
-            name, String::from_utf8_lossy(&result.stderr));
+        assert!(
+            result.status.success(),
+            "CLI upload {} failed: {}",
+            name,
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
 
     // Now start proxy and try to serve these files
@@ -826,9 +935,11 @@ async fn test_proxy_reads_cli_format() {
 
     println!("Proxy sees objects:");
     for obj in list_result.contents() {
-        println!("  - {} ({} bytes)",
+        println!(
+            "  - {} ({} bytes)",
             obj.key().unwrap_or("?"),
-            obj.size().unwrap_or(0));
+            obj.size().unwrap_or(0)
+        );
     }
 
     // Try to GET the files via proxy
@@ -837,7 +948,7 @@ async fn test_proxy_reads_cli_format() {
         let get_result = proxy_client
             .get_object()
             .bucket("default")
-            .key(&format!("{}/{}", prefix, name))
+            .key(format!("{}/{}", prefix, name))
             .send()
             .await;
 
@@ -852,10 +963,15 @@ async fn test_proxy_reads_cli_format() {
 
                 let actual_sha256 = sha256_hex(&body);
                 if actual_sha256 == *expected_sha256 {
-                    println!("✓ Proxy successfully served CLI-uploaded {}: {}", name, actual_sha256);
+                    println!(
+                        "✓ Proxy successfully served CLI-uploaded {}: {}",
+                        name, actual_sha256
+                    );
                 } else {
-                    println!("✗ Proxy served {} but checksum mismatch: expected {}, got {}",
-                        name, expected_sha256, actual_sha256);
+                    println!(
+                        "✗ Proxy served {} but checksum mismatch: expected {}, got {}",
+                        name, expected_sha256, actual_sha256
+                    );
                 }
             }
             Err(e) => {
@@ -896,14 +1012,21 @@ async fn test_document_storage_format_differences() {
     for name in ["v1.zip", "v2.zip"] {
         let _ = Command::new("docker")
             .args([
-                "run", "--rm",
+                "run",
+                "--rm",
                 "--network=host",
-                "-v", &format!("{}:/data", temp_dir.path().display()),
-                "-e", &format!("AWS_ACCESS_KEY_ID={}", MINIO_ACCESS_KEY),
-                "-e", &format!("AWS_SECRET_ACCESS_KEY={}", MINIO_SECRET_KEY),
-                "-e", &format!("AWS_ENDPOINT_URL={}", MINIO_ENDPOINT),
+                "-v",
+                &format!("{}:/data", temp_dir.path().display()),
+                "-e",
+                &format!("AWS_ACCESS_KEY_ID={}", MINIO_ACCESS_KEY),
+                "-e",
+                &format!("AWS_SECRET_ACCESS_KEY={}", MINIO_SECRET_KEY),
+                "-e",
+                &format!("AWS_ENDPOINT_URL={}", MINIO_ENDPOINT),
                 DELTAGLIDER_IMAGE,
-                "cp", &format!("/data/{}", name), &format!("s3://{}/{}/{}", MINIO_BUCKET, prefix_cli, name),
+                "cp",
+                &format!("/data/{}", name),
+                &format!("s3://{}/{}/{}", MINIO_BUCKET, prefix_cli, name),
             ])
             .output();
     }
@@ -916,7 +1039,7 @@ async fn test_document_storage_format_differences() {
         let _ = proxy_client
             .put_object()
             .bucket("default")
-            .key(&format!("{}/{}", prefix_proxy, name))
+            .key(format!("{}/{}", prefix_proxy, name))
             .body(ByteStream::from(data.clone()))
             .send()
             .await;
@@ -943,7 +1066,13 @@ async fn test_document_storage_format_differences() {
         println!("\nObject: {}", key);
         println!("  Size: {} bytes", obj.size().unwrap_or(0));
 
-        if let Ok(head) = minio.head_object().bucket(MINIO_BUCKET).key(key).send().await {
+        if let Ok(head) = minio
+            .head_object()
+            .bucket(MINIO_BUCKET)
+            .key(key)
+            .send()
+            .await
+        {
             if let Some(metadata) = head.metadata() {
                 println!("  S3 Metadata:");
                 for (k, v) in metadata {
@@ -970,8 +1099,19 @@ async fn test_document_storage_format_differences() {
 
         // If it's a .meta file, print its contents
         if key.ends_with(".meta") {
-            if let Ok(get) = minio.get_object().bucket(MINIO_BUCKET).key(key).send().await {
-                let body = get.body.collect().await.expect("Failed to read meta").into_bytes();
+            if let Ok(get) = minio
+                .get_object()
+                .bucket(MINIO_BUCKET)
+                .key(key)
+                .send()
+                .await
+            {
+                let body = get
+                    .body
+                    .collect()
+                    .await
+                    .expect("Failed to read meta")
+                    .into_bytes();
                 if let Ok(json) = String::from_utf8(body.to_vec()) {
                     println!("  JSON Content:");
                     // Pretty print JSON
@@ -982,13 +1122,17 @@ async fn test_document_storage_format_differences() {
                     }
                 }
             }
-        } else {
-            if let Ok(head) = minio.head_object().bucket(MINIO_BUCKET).key(key).send().await {
-                if let Some(metadata) = head.metadata() {
-                    println!("  S3 Metadata:");
-                    for (k, v) in metadata {
-                        println!("    x-amz-meta-{}: {}", k, v);
-                    }
+        } else if let Ok(head) = minio
+            .head_object()
+            .bucket(MINIO_BUCKET)
+            .key(key)
+            .send()
+            .await
+        {
+            if let Some(metadata) = head.metadata() {
+                println!("  S3 Metadata:");
+                for (k, v) in metadata {
+                    println!("    x-amz-meta-{}: {}", k, v);
                 }
             }
         }

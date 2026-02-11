@@ -28,16 +28,11 @@ impl FileRouter {
     pub fn new() -> Self {
         let extensions: &[&str] = &[
             // Archives
-            "zip", "tar", "tgz", "tar.gz", "tar.bz2", "tar.xz",
-            // Java/JVM packages
-            "jar", "war", "ear",
-            // Other archive formats
-            "rar", "7z",
-            // Disk images (often similar between versions)
-            "dmg", "iso",
-            // Database dumps
-            "sql", "dump",
-            // Backups
+            "zip", "tar", "tgz", "tar.gz", "tar.bz2", "tar.xz", // Java/JVM packages
+            "jar", "war", "ear", // Other archive formats
+            "rar", "7z", // Disk images (often similar between versions)
+            "dmg", "iso", // Database dumps
+            "sql", "dump", // Backups
             "bak", "backup",
         ];
         Self {

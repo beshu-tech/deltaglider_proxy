@@ -73,7 +73,8 @@ impl S3Backend {
 
         // Use explicit credentials if provided, otherwise rely on default credential chain
         if let (Some(ref key_id), Some(ref secret)) = (access_key_id, secret_access_key) {
-            let credentials = Credentials::new(key_id, secret, None, None, "deltaglider_proxy-config");
+            let credentials =
+                Credentials::new(key_id, secret, None, None, "deltaglider_proxy-config");
             config_loader = config_loader.credentials_provider(credentials);
         }
 
@@ -134,12 +135,18 @@ impl S3Backend {
 
         // Common fields
         headers.insert("dg-tool".to_string(), metadata.tool.clone());
-        headers.insert("dg-original-name".to_string(), metadata.original_name.clone());
+        headers.insert(
+            "dg-original-name".to_string(),
+            metadata.original_name.clone(),
+        );
         headers.insert("dg-file-sha256".to_string(), metadata.file_sha256.clone());
         headers.insert("dg-file-size".to_string(), metadata.file_size.to_string());
         headers.insert(
             "dg-created-at".to_string(),
-            metadata.created_at.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string(),
+            metadata
+                .created_at
+                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+                .to_string(),
         );
 
         // Storage-type specific fields
@@ -169,7 +176,10 @@ impl S3Backend {
     }
 
     /// Convert S3 metadata headers to FileMetadata
-    fn headers_to_metadata(&self, headers: &HashMap<String, String>) -> Result<FileMetadata, StorageError> {
+    fn headers_to_metadata(
+        &self,
+        headers: &HashMap<String, String>,
+    ) -> Result<FileMetadata, StorageError> {
         // Helper to get a value with multiple possible keys
         let get_value = |keys: &[&str]| -> Option<String> {
             for key in keys {
@@ -184,17 +194,22 @@ impl S3Backend {
 
         let tool = get_value(&["dg-tool", "tool"])
             .ok_or_else(|| StorageError::Other("Missing dg-tool".to_string()))?;
-        let original_name = get_value(&["dg-original-name", "original-name", "dg-source-name", "source-name"])
-            .ok_or_else(|| StorageError::Other("Missing dg-original-name".to_string()))?;
+        let original_name = get_value(&[
+            "dg-original-name",
+            "original-name",
+            "dg-source-name",
+            "source-name",
+        ])
+        .ok_or_else(|| StorageError::Other("Missing dg-original-name".to_string()))?;
         let file_sha256 = get_value(&["dg-file-sha256", "file-sha256"])
             .ok_or_else(|| StorageError::Other("Missing dg-file-sha256".to_string()))?;
-        let file_size_str = get_value(&["dg-file-size", "file-size"])
-            .unwrap_or_else(|| "0".to_string());
+        let file_size_str =
+            get_value(&["dg-file-size", "file-size"]).unwrap_or_else(|| "0".to_string());
         let file_size: u64 = file_size_str
             .parse()
             .map_err(|_| StorageError::Other(format!("Invalid file size: {}", file_size_str)))?;
-        let created_at_str = get_value(&["dg-created-at", "created-at"])
-            .unwrap_or_else(|| Utc::now().to_rfc3339());
+        let created_at_str =
+            get_value(&["dg-created-at", "created-at"]).unwrap_or_else(|| Utc::now().to_rfc3339());
         // Parse timestamp - handle various formats
         let created_at: DateTime<Utc> = {
             let ts = created_at_str.trim_end_matches('Z');
@@ -219,24 +234,26 @@ impl S3Backend {
         let ref_key_opt = get_value(&["dg-ref-key", "ref-key"]);
         let is_reference = note.as_deref() == Some("reference");
         let is_delta = ref_key_opt.is_some()
-            || note.as_ref().map(|n| n == "delta" || n.starts_with("zero-diff")).unwrap_or(false);
+            || note
+                .as_ref()
+                .map(|n| n == "delta" || n.starts_with("zero-diff"))
+                .unwrap_or(false);
 
         let storage_info = if is_reference {
             let source_name = get_value(&["dg-source-name", "source-name"])
                 .unwrap_or_else(|| original_name.clone());
             StorageInfo::Reference { source_name }
         } else if is_delta {
-            let ref_key = ref_key_opt
-                .ok_or_else(|| StorageError::Other("Missing dg-ref-key".to_string()))?;
+            let ref_key =
+                ref_key_opt.ok_or_else(|| StorageError::Other("Missing dg-ref-key".to_string()))?;
             let ref_sha256 = get_value(&["dg-ref-sha256", "ref-sha256"])
                 .ok_or_else(|| StorageError::Other("Missing dg-ref-sha256".to_string()))?;
-            let delta_size_str = get_value(&["dg-delta-size", "delta-size"])
-                .unwrap_or_else(|| "0".to_string());
-            let delta_size: u64 = delta_size_str
-                .parse()
-                .map_err(|_| StorageError::Other(format!("Invalid delta size: {}", delta_size_str)))?;
-            let delta_cmd = get_value(&["dg-delta-cmd", "delta-cmd"])
-                .unwrap_or_default();
+            let delta_size_str =
+                get_value(&["dg-delta-size", "delta-size"]).unwrap_or_else(|| "0".to_string());
+            let delta_size: u64 = delta_size_str.parse().map_err(|_| {
+                StorageError::Other(format!("Invalid delta size: {}", delta_size_str))
+            })?;
+            let delta_cmd = get_value(&["dg-delta-cmd", "delta-cmd"]).unwrap_or_default();
             StorageInfo::Delta {
                 ref_key,
                 ref_sha256,
@@ -248,7 +265,10 @@ impl S3Backend {
         };
 
         // MD5 is not in the original DeltaGlider format, generate a placeholder
-        let md5 = headers.get("dg-md5").cloned().unwrap_or_else(|| "".to_string());
+        let md5 = headers
+            .get("dg-md5")
+            .cloned()
+            .unwrap_or_else(|| "".to_string());
 
         Ok(FileMetadata {
             tool,
@@ -485,7 +505,11 @@ impl StorageBackend for S3Backend {
     ) -> Result<(), StorageError> {
         let key = self.reference_key(prefix);
         self.put_object_with_metadata(&key, data, metadata).await?;
-        debug!("Stored reference for {} ({} bytes) with DG headers", prefix, data.len());
+        debug!(
+            "Stored reference for {} ({} bytes) with DG headers",
+            prefix,
+            data.len()
+        );
         Ok(())
     }
 
@@ -514,10 +538,9 @@ impl StorageBackend for S3Backend {
             request = request.metadata(k, v);
         }
 
-        request
-            .send()
-            .await
-            .map_err(|e| StorageError::S3(format!("copy_object (metadata update) failed: {}", e)))?;
+        request.send().await.map_err(|e| {
+            StorageError::S3(format!("copy_object (metadata update) failed: {}", e))
+        })?;
 
         debug!("Updated reference metadata for {} via CopyObject", prefix);
         Ok(())
@@ -563,7 +586,9 @@ impl StorageBackend for S3Backend {
         self.put_object_with_metadata(&key, data, metadata).await?;
         debug!(
             "Stored delta for {}/{} ({} bytes) with DG headers",
-            prefix, filename, data.len()
+            prefix,
+            filename,
+            data.len()
         );
         Ok(())
     }
@@ -606,7 +631,9 @@ impl StorageBackend for S3Backend {
         self.put_object_with_metadata(&key, data, metadata).await?;
         debug!(
             "Stored direct for {}/{} ({} bytes) with DG headers",
-            prefix, filename, data.len()
+            prefix,
+            filename,
+            data.len()
         );
         Ok(())
     }

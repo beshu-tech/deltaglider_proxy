@@ -270,10 +270,7 @@ impl ListBucketsResult {
         xml.push('\n');
 
         xml.push_str("  <Owner>\n");
-        xml.push_str(&format!(
-            "    <ID>{}</ID>\n",
-            escape_xml(&self.owner_id)
-        ));
+        xml.push_str(&format!("    <ID>{}</ID>\n", escape_xml(&self.owner_id)));
         xml.push_str(&format!(
             "    <DisplayName>{}</DisplayName>\n",
             escape_xml(&self.owner_display_name)
@@ -283,7 +280,10 @@ impl ListBucketsResult {
         xml.push_str("  <Buckets>\n");
         for bucket in &self.buckets {
             xml.push_str("    <Bucket>\n");
-            xml.push_str(&format!("      <Name>{}</Name>\n", escape_xml(&bucket.name)));
+            xml.push_str(&format!(
+                "      <Name>{}</Name>\n",
+                escape_xml(&bucket.name)
+            ));
             xml.push_str(&format!(
                 "      <CreationDate>{}</CreationDate>\n",
                 bucket.creation_date.format("%Y-%m-%dT%H:%M:%S%.3fZ")

@@ -65,7 +65,9 @@ impl ObjectKey {
         validate_key_path(&self.prefix, true)?;
         validate_key_path(&self.filename, false)?;
         if self.filename.is_empty() {
-            return Err(KeyValidationError("Object key must not be empty".to_string()));
+            return Err(KeyValidationError(
+                "Object key must not be empty".to_string(),
+            ));
         }
         if self.filename == "." || self.filename == ".." {
             return Err(KeyValidationError("Invalid object filename".to_string()));
@@ -87,7 +89,9 @@ impl fmt::Display for ObjectKey {
 
 fn validate_key_path(value: &str, allow_slashes: bool) -> Result<(), KeyValidationError> {
     if value.contains('\0') {
-        return Err(KeyValidationError("Key must not contain NUL bytes".to_string()));
+        return Err(KeyValidationError(
+            "Key must not contain NUL bytes".to_string(),
+        ));
     }
     if value.contains('\\') {
         return Err(KeyValidationError(

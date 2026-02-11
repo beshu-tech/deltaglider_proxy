@@ -43,7 +43,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 lru = "0.12"
 parking_lot = "0.12"
 bytes = "1"
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
 urlencoding = "2"
 tempfile = "3"
 
