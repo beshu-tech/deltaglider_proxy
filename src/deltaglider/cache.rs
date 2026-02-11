@@ -1,5 +1,6 @@
 //! LRU cache for reference files
 
+use bytes::Bytes;
 use lru::LruCache;
 use parking_lot::Mutex;
 use std::num::NonZeroUsize;
@@ -7,11 +8,12 @@ use tracing::debug;
 
 /// Internal cache state protected by a single mutex to prevent deadlocks
 struct CacheInner {
-    cache: LruCache<String, Vec<u8>>,
+    cache: LruCache<String, Bytes>,
     current_size: usize,
 }
 
-/// LRU cache for frequently accessed reference files
+/// LRU cache for frequently accessed reference files.
+/// Uses `Bytes` for zero-copy cloning (refcount increment instead of memcpy).
 pub struct ReferenceCache {
     inner: Mutex<CacheInner>,
     max_size_bytes: usize,
@@ -31,8 +33,8 @@ impl ReferenceCache {
         }
     }
 
-    /// Get a reference from cache
-    pub fn get(&self, prefix: &str) -> Option<Vec<u8>> {
+    /// Get a reference from cache. Returns a `Bytes` handle (cheap refcount clone).
+    pub fn get(&self, prefix: &str) -> Option<Bytes> {
         let mut inner = self.inner.lock();
         let result = inner.cache.get(prefix).cloned();
         if result.is_some() {
@@ -72,8 +74,9 @@ impl ReferenceCache {
             }
         }
 
-        // Add to cache
-        if let Some(old) = inner.cache.put(prefix.to_string(), data) {
+        // Add to cache (convert Vec<u8> → Bytes for zero-copy sharing)
+        let bytes_data = Bytes::from(data);
+        if let Some(old) = inner.cache.put(prefix.to_string(), bytes_data) {
             inner.current_size = inner.current_size.saturating_sub(old.len());
         }
         inner.current_size += data_size;
@@ -130,7 +133,7 @@ mod tests {
         cache.put("prefix1", data.clone());
 
         let retrieved = cache.get("prefix1");
-        assert_eq!(retrieved, Some(data));
+        assert_eq!(retrieved.as_deref(), Some(data.as_slice()));
     }
 
     #[test]

@@ -30,6 +30,12 @@ pub struct Config {
     /// Default bucket name (single-bucket mode)
     #[serde(default = "default_bucket")]
     pub default_bucket: String,
+
+    /// Verify SHA256 checksums on object retrieval (GET).
+    /// Default: true (safe). Set to false for higher throughput when
+    /// the storage backend is trusted and bit-rot detection is not needed.
+    #[serde(default = "default_verify_on_read")]
+    pub verify_on_read: bool,
 }
 
 /// Storage backend configuration
@@ -91,6 +97,10 @@ fn default_bucket() -> String {
     "default".to_string()
 }
 
+fn default_verify_on_read() -> bool {
+    true
+}
+
 fn default_region() -> String {
     "us-east-1".to_string()
 }
@@ -116,6 +126,7 @@ impl Default for Config {
             max_object_size: default_max_object_size(),
             cache_size_mb: default_cache_size_mb(),
             default_bucket: default_bucket(),
+            verify_on_read: default_verify_on_read(),
         }
     }
 }
@@ -178,6 +189,10 @@ impl Config {
 
         if let Ok(bucket) = std::env::var("DELTAGLIDER_PROXY_DEFAULT_BUCKET") {
             config.default_bucket = bucket;
+        }
+
+        if let Ok(verify) = std::env::var("DELTAGLIDER_PROXY_VERIFY_ON_READ") {
+            config.verify_on_read = verify != "false" && verify != "0";
         }
 
         config

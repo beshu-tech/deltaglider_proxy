@@ -12,6 +12,7 @@ use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use tracing::{debug, info, instrument, warn};
 
 /// Errors from the DeltaGlider engine
@@ -72,6 +73,10 @@ pub struct DeltaGliderEngine<S: StorageBackend> {
     cache: ReferenceCache,
     max_delta_ratio: f32,
     max_object_size: u64,
+    /// Whether to verify SHA256 checksums on read (GET).
+    verify_on_read: bool,
+    /// Limits concurrent delta encode/decode operations to prevent CPU saturation.
+    codec_semaphore: Arc<Semaphore>,
     /// Per-deltaspace locks to prevent concurrent reference overwrites.
     /// Outer parking_lot::Mutex for fast synchronous map access;
     /// inner tokio::sync::Mutex for async-compatible per-prefix locking.
@@ -132,8 +137,19 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             cache: ReferenceCache::new(config.cache_size_mb),
             max_delta_ratio: config.max_delta_ratio,
             max_object_size: config.max_object_size,
+            verify_on_read: config.verify_on_read,
+            codec_semaphore: Arc::new(Semaphore::new(
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4),
+            )),
             prefix_locks: parking_lot::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Returns whether the xdelta3 CLI binary is available for legacy delta decoding.
+    pub fn is_cli_available(&self) -> bool {
+        self.codec.is_cli_available()
     }
 
     /// Acquire a per-deltaspace async lock. Different prefixes do not contend.
@@ -223,9 +239,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .await?
         };
 
-        // Try to compute delta
+        // Try to compute delta (bounded by semaphore to prevent CPU saturation)
         let reference = self.get_reference_cached(&deltaspace_id).await?;
+        let _codec_permit = self.codec_semaphore.acquire().await.map_err(|_| {
+            EngineError::Storage(StorageError::Other("codec semaphore closed".into()))
+        })?;
         let delta = self.codec.encode(&reference, data)?;
+        drop(_codec_permit);
         let ratio = DeltaCodec::compression_ratio(data.len(), delta.len());
 
         info!(
@@ -376,7 +396,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
 
         let reference = self.get_reference_cached(deltaspace_id).await?;
+        let _codec_permit = self.codec_semaphore.acquire().await.map_err(|_| {
+            EngineError::Storage(StorageError::Other("codec semaphore closed".into()))
+        })?;
         let delta = self.codec.encode(&reference, &reference)?;
+        drop(_codec_permit);
 
         let delta_meta = FileMetadata::new_delta(
             filename.to_string(),
@@ -455,30 +479,37 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     .await?
             }
             StorageInfo::Delta { .. } => {
-                // Reconstruct from reference + delta
+                // Reconstruct from reference + delta (bounded concurrency)
                 let reference = self.get_reference_cached(&deltaspace_id).await?;
                 let delta = self
                     .deltaspace_mgr
                     .get_delta(&deltaspace_id, &obj_key.filename)
                     .await?;
-                self.codec.decode(&reference, &delta)?
+                let _codec_permit = self.codec_semaphore.acquire().await.map_err(|_| {
+                    EngineError::Storage(StorageError::Other("codec semaphore closed".into()))
+                })?;
+                let result = self.codec.decode(&reference, &delta)?;
+                drop(_codec_permit);
+                result
             }
         };
 
-        // Verify checksum
-        let actual_sha256 = hex::encode(Sha256::digest(&data));
-        if actual_sha256 != metadata.file_sha256 {
-            warn!(
-                "Checksum mismatch for {}: expected {}, got {}",
-                obj_key.full_key(),
-                metadata.file_sha256,
-                actual_sha256
-            );
-            return Err(EngineError::ChecksumMismatch {
-                key: obj_key.full_key(),
-                expected: metadata.file_sha256.clone(),
-                actual: actual_sha256,
-            });
+        // Verify checksum (configurable — disable for throughput when storage is trusted)
+        if self.verify_on_read {
+            let actual_sha256 = hex::encode(Sha256::digest(&data));
+            if actual_sha256 != metadata.file_sha256 {
+                warn!(
+                    "Checksum mismatch for {}: expected {}, got {}",
+                    obj_key.full_key(),
+                    metadata.file_sha256,
+                    actual_sha256
+                );
+                return Err(EngineError::ChecksumMismatch {
+                    key: obj_key.full_key(),
+                    expected: metadata.file_sha256.clone(),
+                    actual: actual_sha256,
+                });
+            }
         }
 
         debug!("Retrieved {} bytes for {}", data.len(), obj_key.full_key());
@@ -667,9 +698,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         Ok(())
     }
 
-    /// Get reference with caching
-    async fn get_reference_cached(&self, deltaspace_id: &str) -> Result<Vec<u8>, EngineError> {
-        // Check cache first
+    /// Get reference with caching. Returns `Bytes` for zero-copy sharing.
+    async fn get_reference_cached(&self, deltaspace_id: &str) -> Result<bytes::Bytes, EngineError> {
+        // Check cache first (Bytes clone is a cheap refcount increment)
         if let Some(data) = self.cache.get(deltaspace_id) {
             return Ok(data);
         }
@@ -681,10 +712,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .await
             .map_err(|_| EngineError::MissingReference(deltaspace_id.to_string()))?;
 
-        // Cache it
+        // Cache it (Vec<u8> is moved into Bytes inside the cache)
         self.cache.put(deltaspace_id, data.clone());
 
-        Ok(data)
+        Ok(data.into())
     }
 }
 

@@ -100,6 +100,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.max_object_size / 1024 / 1024
     );
     info!("  Cache size: {} MB", config.cache_size_mb);
+    if !config.verify_on_read {
+        warn!("  SHA256 verification on read is DISABLED — data integrity is not checked on GET");
+    }
 
     // Check for orphaned data files from interrupted writes (filesystem only)
     if let BackendConfig::Filesystem { ref path } = config.backend {
@@ -110,6 +113,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create engine (async initialization with dynamic backend)
     let engine = DynEngine::new(&config).await?;
+    if engine.is_cli_available() {
+        info!("  xdelta3 CLI: available (legacy delta interop enabled)");
+    } else {
+        warn!("  xdelta3 CLI: NOT found — legacy DeltaGlider CLI deltas cannot be decoded");
+    }
     let state = Arc::new(AppState {
         engine,
         default_bucket: config.default_bucket.clone(),

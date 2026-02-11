@@ -22,6 +22,18 @@ async fn is_dir(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// ENOSPC raw error code on Linux and macOS.
+const ENOSPC: i32 = 28;
+
+/// Convert an io::Error into StorageError, detecting disk-full (ENOSPC).
+fn io_to_storage_error(e: std::io::Error) -> StorageError {
+    if e.raw_os_error() == Some(ENOSPC) {
+        StorageError::DiskFull
+    } else {
+        StorageError::Io(e)
+    }
+}
+
 /// Atomically write data to a file using write-to-temp + fsync + rename.
 ///
 /// Creates a temp file in the same parent directory (guaranteeing same-filesystem
@@ -37,11 +49,11 @@ async fn atomic_write(path: &Path, data: &[u8]) -> Result<(), StorageError> {
     let data = data.to_vec();
 
     tokio::task::spawn_blocking(move || {
-        let mut tmp = NamedTempFile::new_in(&parent)?;
-        tmp.write_all(&data)?;
-        tmp.as_file().sync_all()?;
+        let mut tmp = NamedTempFile::new_in(&parent).map_err(io_to_storage_error)?;
+        tmp.write_all(&data).map_err(io_to_storage_error)?;
+        tmp.as_file().sync_all().map_err(io_to_storage_error)?;
         tmp.persist(&path)
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| io_to_storage_error(e.error))?;
         Ok(())
     })
     .await

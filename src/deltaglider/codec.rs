@@ -29,12 +29,33 @@ pub enum CodecError {
 /// Delta codec using xdelta3
 pub struct DeltaCodec {
     max_size: usize,
+    /// Whether the xdelta3 CLI binary is available for legacy delta decoding.
+    /// Probed once at construction time to avoid per-request discovery failures.
+    cli_available: bool,
 }
 
 impl DeltaCodec {
-    /// Create a new codec with size limit
+    /// Create a new codec with size limit.
+    /// Probes for the xdelta3 CLI binary once at construction.
     pub fn new(max_size: usize) -> Self {
-        Self { max_size }
+        let cli_available = Self::probe_cli();
+        Self {
+            max_size,
+            cli_available,
+        }
+    }
+
+    /// Check if the xdelta3 CLI binary is available.
+    fn probe_cli() -> bool {
+        match Command::new("xdelta3").arg("-V").output() {
+            Ok(output) => output.status.success(),
+            Err(_) => false,
+        }
+    }
+
+    /// Returns whether the xdelta3 CLI is available for legacy delta decoding.
+    pub fn is_cli_available(&self) -> bool {
+        self.cli_available
     }
 
     /// Encode a delta between source (reference) and target (new file)
@@ -98,6 +119,11 @@ impl DeltaCodec {
         }
 
         // Fallback to CLI for compatibility with original DeltaGlider CLI deltas
+        if !self.cli_available {
+            return Err(CodecError::DecodeFailed(
+                "Rust xdelta3 crate decode failed and CLI binary is not available".to_string(),
+            ));
+        }
         debug!("Rust crate decode failed, falling back to xdelta3 CLI");
         self.decode_via_cli(source, delta)
     }
@@ -170,6 +196,15 @@ impl DeltaCodec {
 impl Default for DeltaCodec {
     fn default() -> Self {
         Self::new(100 * 1024 * 1024) // 100MB default
+    }
+}
+
+impl std::fmt::Debug for DeltaCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeltaCodec")
+            .field("max_size", &self.max_size)
+            .field("cli_available", &self.cli_available)
+            .finish()
     }
 }
 

@@ -27,7 +27,7 @@ use aws_sdk_s3::Client;
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, instrument};
 
 /// S3 storage backend for DeltaGlider objects
 pub struct S3Backend {
@@ -94,21 +94,36 @@ impl S3Backend {
     // === Key generation helpers ===
 
     /// Get the S3 key for a reference file
+    /// For root-level files (empty prefix), returns "reference.bin"
     fn reference_key(&self, prefix: &str) -> String {
-        format!("{}/reference.bin", prefix)
+        if prefix.is_empty() {
+            "reference.bin".to_string()
+        } else {
+            format!("{}/reference.bin", prefix)
+        }
     }
 
     /// Get the S3 key for a delta file
+    /// For root-level files (empty prefix), returns "{filename}.delta"
     fn delta_key(&self, prefix: &str, filename: &str) -> String {
-        format!("{}/{}.delta", prefix, filename)
+        if prefix.is_empty() {
+            format!("{}.delta", filename)
+        } else {
+            format!("{}/{}.delta", prefix, filename)
+        }
     }
 
     /// Get the S3 key for a direct file (non-delta eligible files)
     /// Note: Original CLI doesn't have a separate .direct suffix - it stores
     /// non-delta files without any suffix. For now we keep .direct for internal
     /// consistency but may need to change this for full interop.
+    /// For root-level files (empty prefix), returns "{filename}.direct"
     fn direct_key(&self, prefix: &str, filename: &str) -> String {
-        format!("{}/{}.direct", prefix, filename)
+        if prefix.is_empty() {
+            format!("{}.direct", filename)
+        } else {
+            format!("{}/{}.direct", prefix, filename)
+        }
     }
 
     // === Metadata conversion helpers ===
@@ -480,11 +495,31 @@ impl StorageBackend for S3Backend {
         prefix: &str,
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        // For S3, we need to copy the object with new metadata
-        // This is a limitation - metadata can only be set at PUT time
-        // For now, we skip this operation as reference data+metadata are always PUT together
-        warn!("put_reference_metadata called on S3 backend - metadata can only be set at PUT time");
-        let _ = (prefix, metadata);
+        // S3 metadata can only be set at PUT time. To update metadata on an
+        // existing object, we use CopyObject with the same source and destination
+        // key and MetadataDirective=REPLACE.
+        let key = self.reference_key(prefix);
+        let copy_source = format!("{}/{}", self.bucket, key);
+        let headers = self.metadata_to_headers(metadata);
+
+        let mut request = self
+            .client
+            .copy_object()
+            .bucket(&self.bucket)
+            .copy_source(&copy_source)
+            .key(&key)
+            .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace);
+
+        for (k, v) in headers {
+            request = request.metadata(k, v);
+        }
+
+        request
+            .send()
+            .await
+            .map_err(|e| StorageError::S3(format!("copy_object (metadata update) failed: {}", e)))?;
+
+        debug!("Updated reference metadata for {} via CopyObject", prefix);
         Ok(())
     }
 
@@ -604,7 +639,13 @@ impl StorageBackend for S3Backend {
 
     #[instrument(skip(self))]
     async fn scan_deltaspace(&self, prefix: &str) -> Result<Vec<FileMetadata>, StorageError> {
-        let search_prefix = format!("{}/", prefix);
+        // For root-level files (empty prefix), list all objects without a prefix filter
+        // and filter by DeltaGlider file extensions
+        let search_prefix = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", prefix)
+        };
         let keys = self.list_objects_with_prefix(&search_prefix).await?;
 
         let mut metadata_list = Vec::new();
@@ -612,7 +653,13 @@ impl StorageBackend for S3Backend {
         // Read metadata from object headers for DeltaGlider files
         for key in keys {
             // Skip non-DeltaGlider files
-            if !key.ends_with("/reference.bin") && !key.ends_with(".delta") && !key.ends_with(".direct") {
+            // Note: root-level reference.bin has no prefix, so we check for exact match or /reference.bin
+            let is_reference = key == "reference.bin" || key.ends_with("/reference.bin");
+            if !is_reference && !key.ends_with(".delta") && !key.ends_with(".direct") {
+                continue;
+            }
+            // For empty prefix, skip files that have a directory prefix (they belong to other deltaspaces)
+            if prefix.is_empty() && key.contains('/') {
                 continue;
             }
 
@@ -640,14 +687,18 @@ impl StorageBackend for S3Backend {
 
         for key in keys {
             // Check if this is a deltaglider file
-            if key.ends_with("/reference.bin")
-                || key.ends_with(".delta")
-                || key.ends_with(".direct")
-            {
+            let is_reference = key == "reference.bin" || key.ends_with("/reference.bin");
+            let is_delta_or_direct = key.ends_with(".delta") || key.ends_with(".direct");
+
+            if is_reference || is_delta_or_direct {
                 // Extract the prefix (everything before the last /)
+                // Root-level files (no /) have empty prefix
                 if let Some(idx) = key.rfind('/') {
                     let prefix = &key[..idx];
                     prefixes.insert(prefix.to_string());
+                } else {
+                    // Root-level file - use empty string as prefix
+                    prefixes.insert(String::new());
                 }
             }
         }
@@ -721,13 +772,23 @@ mod tests {
 
     #[test]
     fn test_root_prefix_key_generation() {
-        let prefix = "_root_";
+        // Root-level files (empty prefix) should have no directory prefix
+        let prefix = "";
         let filename = "data.bin";
 
-        assert_eq!(format!("{}/reference.bin", prefix), "_root_/reference.bin");
-        assert_eq!(
-            format!("{}/{}.direct", prefix, filename),
-            "_root_/data.bin.direct"
-        );
+        // Test key formats for root-level files
+        let reference_key = if prefix.is_empty() {
+            "reference.bin".to_string()
+        } else {
+            format!("{}/reference.bin", prefix)
+        };
+        assert_eq!(reference_key, "reference.bin");
+
+        let direct_key = if prefix.is_empty() {
+            format!("{}.direct", filename)
+        } else {
+            format!("{}/{}.direct", prefix, filename)
+        };
+        assert_eq!(direct_key, "data.bin.direct");
     }
 }
