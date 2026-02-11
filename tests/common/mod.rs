@@ -16,7 +16,8 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::sleep;
 
-/// Port counter to avoid conflicts between tests
+/// Port counter to avoid conflicts between tests.
+/// Increments by 2 because each server uses two ports: S3 (N) and demo UI (N+1).
 static PORT_COUNTER: AtomicU16 = AtomicU16::new(19000);
 
 /// MinIO configuration constants
@@ -36,7 +37,7 @@ pub struct TestServer {
 impl TestServer {
     /// Start a test server with filesystem backend (no Docker needed)
     pub async fn filesystem() -> Self {
-        let port = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let port = PORT_COUNTER.fetch_add(2, Ordering::SeqCst);
         let data_dir = TempDir::new().expect("Failed to create temp dir");
 
         let process = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"))
@@ -62,7 +63,7 @@ impl TestServer {
 
     /// Start a test server with S3 backend (needs MinIO running)
     pub async fn s3() -> Self {
-        let port = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let port = PORT_COUNTER.fetch_add(2, Ordering::SeqCst);
 
         let process = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"))
             .env(
