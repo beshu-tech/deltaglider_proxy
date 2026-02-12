@@ -51,6 +51,11 @@ pub async fn sigv4_auth_middleware(
         None => return Ok(next.run(request).await),
     };
 
+    // Let CORS preflight requests through — browsers send OPTIONS without credentials
+    if request.method() == axum::http::Method::OPTIONS {
+        return Ok(next.run(request).await);
+    }
+
     // Extract the Authorization header
     let auth_header = match request.headers().get("authorization") {
         Some(v) => match v.to_str() {
