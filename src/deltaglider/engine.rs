@@ -403,6 +403,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     }
 
     /// Store the internal deltaspace reference baseline.
+    #[allow(clippy::too_many_arguments)]
     async fn set_reference_baseline(
         &self,
         bucket: &str,
