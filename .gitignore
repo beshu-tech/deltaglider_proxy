@@ -9,3 +9,4 @@ dist/
 
 # Screenshots and demo images
 *.png
+!docs/*.png
