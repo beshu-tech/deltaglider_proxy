@@ -8,6 +8,39 @@ use std::fmt;
 /// Tool version identifier — uses crate name and version from Cargo.toml
 pub const DELTAGLIDER_TOOL: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
+/// S3 metadata key names (stored as `x-amz-meta-{KEY}` in S3 headers).
+/// Used in both storage/s3.rs (metadata_to_headers/headers_to_metadata)
+/// and api/handlers.rs (build_metadata_headers).
+pub mod meta_keys {
+    pub const TOOL: &str = "dg-tool";
+    pub const ORIGINAL_NAME: &str = "dg-original-name";
+    pub const FILE_SHA256: &str = "dg-file-sha256";
+    pub const FILE_SIZE: &str = "dg-file-size";
+    pub const MD5: &str = "dg-md5";
+    pub const CREATED_AT: &str = "dg-created-at";
+    pub const NOTE: &str = "dg-note";
+    pub const SOURCE_NAME: &str = "dg-source-name";
+    pub const REF_KEY: &str = "dg-ref-key";
+    pub const REF_SHA256: &str = "dg-ref-sha256";
+    pub const DELTA_SIZE: &str = "dg-delta-size";
+    pub const DELTA_CMD: &str = "dg-delta-cmd";
+
+    /// S3 response header prefix for user-defined metadata.
+    pub const AMZ_META_PREFIX: &str = "x-amz-meta-";
+
+    // Full x-amz-meta-dg-* header names for HTTP response headers.
+    pub const H_TOOL: &str = "x-amz-meta-dg-tool";
+    pub const H_ORIGINAL_NAME: &str = "x-amz-meta-dg-original-name";
+    pub const H_FILE_SHA256: &str = "x-amz-meta-dg-file-sha256";
+    pub const H_FILE_SIZE: &str = "x-amz-meta-dg-file-size";
+    pub const H_NOTE: &str = "x-amz-meta-dg-note";
+    pub const H_SOURCE_NAME: &str = "x-amz-meta-dg-source-name";
+    pub const H_REF_KEY: &str = "x-amz-meta-dg-ref-key";
+    pub const H_REF_SHA256: &str = "x-amz-meta-dg-ref-sha256";
+    pub const H_DELTA_SIZE: &str = "x-amz-meta-dg-delta-size";
+    pub const H_DELTA_CMD: &str = "x-amz-meta-dg-delta-cmd";
+}
+
 /// Errors that can occur when validating user-provided bucket/key inputs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyValidationError(String);
@@ -23,7 +56,7 @@ impl std::error::Error for KeyValidationError {}
 /// S3 object key parsed into components
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ObjectKey {
-    /// Virtual bucket name
+    /// Bucket name
     pub bucket: String,
     /// Parent path = DeltaSpace identifier (empty string for root)
     pub prefix: String,
@@ -55,8 +88,9 @@ impl ObjectKey {
         }
     }
 
-    /// Get the deltaspace identifier for this key
-    /// Returns empty string for root-level files (no prefix folder created)
+    /// Get the deltaspace identifier for this key.
+    /// This is the prefix path within the bucket (no bucket name included).
+    /// Bucket routing is handled at the storage layer.
     pub fn deltaspace_id(&self) -> String {
         self.prefix.clone()
     }

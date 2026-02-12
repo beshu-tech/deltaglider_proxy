@@ -7,9 +7,9 @@ use super::xml::{
     escape_xml, BucketInfo, CopyObjectResult, DeleteError, DeleteRequest, DeleteResult,
     DeletedObject, ListBucketResult, ListBucketsResult, S3Object,
 };
-use crate::deltaglider::DynEngine;
+use crate::deltaglider::{DynEngine, RetrieveResponse};
 use crate::types::{FileMetadata, StorageInfo};
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -18,6 +18,9 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, info, instrument, warn};
+
+const MULTIPART_NOT_SUPPORTED: &str =
+    "Multipart upload is not supported. Use single PUT for uploads.";
 
 /// Application state shared across handlers
 pub struct AppState {
@@ -62,11 +65,12 @@ async fn put_object_inner(
         .map(|s| s.to_string());
 
     // Extract user-provided x-amz-meta-* headers (stored without the prefix)
+    use crate::types::meta_keys as mk;
     let user_metadata: std::collections::HashMap<String, String> = headers
         .iter()
         .filter_map(|(name, value)| {
             let name_str = name.as_str();
-            if let Some(suffix) = name_str.strip_prefix("x-amz-meta-") {
+            if let Some(suffix) = name_str.strip_prefix(mk::AMZ_META_PREFIX) {
                 if !suffix.starts_with("dg-") {
                     // Skip DeltaGlider internal metadata (x-amz-meta-dg-*)
                     if let Ok(v) = value.to_str() {
@@ -129,18 +133,16 @@ fn build_object_headers(metadata: &FileMetadata) -> HeaderMap {
     headers.insert("x-deltaglider-stored-size", hval(&stored_size.to_string()));
 
     // DeltaGlider custom metadata (x-amz-meta-dg-*)
-    headers.insert("x-amz-meta-dg-tool", hval(&metadata.tool));
-    headers.insert("x-amz-meta-dg-original-name", hval(&metadata.original_name));
-    headers.insert("x-amz-meta-dg-file-sha256", hval(&metadata.file_sha256));
-    headers.insert(
-        "x-amz-meta-dg-file-size",
-        hval(&metadata.file_size.to_string()),
-    );
+    use crate::types::meta_keys as mk;
+    headers.insert(mk::H_TOOL, hval(&metadata.tool));
+    headers.insert(mk::H_ORIGINAL_NAME, hval(&metadata.original_name));
+    headers.insert(mk::H_FILE_SHA256, hval(&metadata.file_sha256));
+    headers.insert(mk::H_FILE_SIZE, hval(&metadata.file_size.to_string()));
 
     match &metadata.storage_info {
         StorageInfo::Reference { source_name } => {
-            headers.insert("x-amz-meta-dg-note", hval("reference"));
-            headers.insert("x-amz-meta-dg-source-name", hval(source_name));
+            headers.insert(mk::H_NOTE, hval("reference"));
+            headers.insert(mk::H_SOURCE_NAME, hval(source_name));
         }
         StorageInfo::Delta {
             ref_key,
@@ -148,14 +150,14 @@ fn build_object_headers(metadata: &FileMetadata) -> HeaderMap {
             delta_size,
             delta_cmd,
         } => {
-            headers.insert("x-amz-meta-dg-note", hval("delta"));
-            headers.insert("x-amz-meta-dg-ref-key", hval(ref_key));
-            headers.insert("x-amz-meta-dg-ref-sha256", hval(ref_sha256));
-            headers.insert("x-amz-meta-dg-delta-size", hval(&delta_size.to_string()));
-            headers.insert("x-amz-meta-dg-delta-cmd", hval(delta_cmd));
+            headers.insert(mk::H_NOTE, hval("delta"));
+            headers.insert(mk::H_REF_KEY, hval(ref_key));
+            headers.insert(mk::H_REF_SHA256, hval(ref_sha256));
+            headers.insert(mk::H_DELTA_SIZE, hval(&delta_size.to_string()));
+            headers.insert(mk::H_DELTA_CMD, hval(delta_cmd));
         }
         StorageInfo::Direct => {
-            headers.insert("x-amz-meta-dg-note", hval("direct"));
+            headers.insert(mk::H_NOTE, hval("direct"));
         }
     }
 
@@ -176,6 +178,9 @@ fn hval(s: &str) -> HeaderValue {
 
 /// GET object handler
 /// GET /{bucket}/{key}
+///
+/// Direct files are streamed from the backend (constant memory, low TTFB).
+/// Delta files are reconstructed in memory and sent as a buffered response.
 #[instrument(skip(state))]
 pub async fn get_object(
     State(state): State<Arc<AppState>>,
@@ -183,18 +188,32 @@ pub async fn get_object(
 ) -> Result<Response, S3Error> {
     info!("GET {}/{}", bucket, key);
 
-    let (data, metadata) = state.engine.retrieve(&bucket, &key).await?;
+    let response = state.engine.retrieve_stream(&bucket, &key).await?;
 
-    debug!(
-        "Retrieved {}/{} ({} bytes, stored as {})",
-        bucket,
-        key,
-        data.len(),
-        metadata.storage_info.label()
-    );
-
-    let headers = build_object_headers(&metadata);
-    Ok((StatusCode::OK, headers, data).into_response())
+    match response {
+        RetrieveResponse::Streamed { stream, metadata } => {
+            debug!(
+                "Streaming {}/{} (stored as {})",
+                bucket,
+                key,
+                metadata.storage_info.label()
+            );
+            let headers = build_object_headers(&metadata);
+            let body = Body::from_stream(stream);
+            Ok((StatusCode::OK, headers, body).into_response())
+        }
+        RetrieveResponse::Buffered { data, metadata } => {
+            debug!(
+                "Retrieved {}/{} ({} bytes, stored as {})",
+                bucket,
+                key,
+                data.len(),
+                metadata.storage_info.label()
+            );
+            let headers = build_object_headers(&metadata);
+            Ok((StatusCode::OK, headers, data).into_response())
+        }
+    }
 }
 
 /// HEAD object handler
@@ -343,15 +362,6 @@ async fn list_multipart_uploads(bucket: &str) -> Result<Response, S3Error> {
     Ok((StatusCode::OK, [("Content-Type", "application/xml")], xml).into_response())
 }
 
-/// Alias for backward compatibility
-pub async fn list_objects(
-    state: State<Arc<AppState>>,
-    bucket: ValidatedBucket,
-    query: Query<BucketGetQuery>,
-) -> Result<Response, S3Error> {
-    bucket_get_handler(state, bucket, query).await
-}
-
 /// DELETE object handler
 /// DELETE /{bucket}/{key}
 #[instrument(skip(state))]
@@ -488,10 +498,6 @@ async fn copy_object_inner(
         .split_once('/')
         .ok_or_else(|| S3Error::InvalidArgument("Copy source must be bucket/key".to_string()))?;
 
-    if source_bucket != state.default_bucket {
-        return Err(S3Error::NoSuchBucket(source_bucket.to_string()));
-    }
-
     info!(
         "COPY {}/{} -> {}/{}",
         source_bucket, source_key, bucket, key
@@ -559,7 +565,7 @@ pub async fn put_object_or_copy(
             bucket, key, part_num, upload_id
         );
         return Err(S3Error::NotImplemented(
-            "Multipart upload is not supported. Use single PUT for uploads.".to_string(),
+            MULTIPART_NOT_SUPPORTED.to_string(),
         ));
     }
 
@@ -614,7 +620,7 @@ pub async fn post_object(
     if query.uploads.is_some() {
         info!("CreateMultipartUpload {}/{}", bucket, key);
         return Err(S3Error::NotImplemented(
-            "Multipart upload is not supported. Use single PUT for uploads.".to_string(),
+            MULTIPART_NOT_SUPPORTED.to_string(),
         ));
     }
 
@@ -625,7 +631,7 @@ pub async fn post_object(
             bucket, key, upload_id
         );
         return Err(S3Error::NotImplemented(
-            "Multipart upload is not supported. Use single PUT for uploads.".to_string(),
+            MULTIPART_NOT_SUPPORTED.to_string(),
         ));
     }
 
@@ -647,17 +653,15 @@ pub async fn create_bucket(
 ) -> Result<Response, S3Error> {
     info!("CREATE bucket {}", bucket);
 
-    // Only allow creating the configured default bucket
-    if bucket != state.default_bucket {
-        // In a multi-bucket implementation, we'd create a new bucket here
-        // For now, we only support the single configured bucket
-        return Err(S3Error::InvalidRequest(
-            "Only the configured default bucket is supported".to_string(),
+    if bucket.is_empty() {
+        return Err(S3Error::InvalidArgument(
+            "Bucket name cannot be empty".to_string(),
         ));
     }
 
-    // The bucket always "exists" (it's created on first use)
-    // Return 200 OK (S3 returns 200 for existing owned bucket)
+    // Create the real bucket on the storage backend
+    state.engine.create_bucket(&bucket).await?;
+
     Ok((StatusCode::OK, [("Location", format!("/{}", bucket))], "").into_response())
 }
 
@@ -670,24 +674,33 @@ pub async fn delete_bucket(
 ) -> Result<Response, S3Error> {
     info!("DELETE bucket {}", bucket);
 
-    // Check if bucket is empty
-    let objects = state.engine.list(&bucket, "").await?;
-    if !objects.is_empty() {
-        return Err(S3Error::BucketNotEmpty(bucket));
+    // Check if bucket is empty (S3 requires buckets to be empty before deletion)
+    let page = state.engine.list_objects_v2(&bucket, "", 1, None).await?;
+    if !page.objects.is_empty() {
+        return Err(S3Error::BucketNotEmpty(bucket.to_string()));
     }
 
-    // Bucket is empty - in single-bucket mode, we just confirm it can be deleted
-    // (actual deletion would require removing the bucket directory/prefix)
+    // Delete the real bucket on the storage backend
+    state.engine.delete_bucket(&bucket).await?;
+
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// HEAD bucket handler
 /// HEAD /{bucket}
-#[instrument]
-pub async fn head_bucket(ValidatedBucket(bucket): ValidatedBucket) -> Result<Response, S3Error> {
+#[instrument(skip(state))]
+pub async fn head_bucket(
+    State(state): State<Arc<AppState>>,
+    ValidatedBucket(bucket): ValidatedBucket,
+) -> Result<Response, S3Error> {
     info!("HEAD bucket {}", bucket);
 
-    // Bucket exists (validated by extractor)
+    // Check if bucket exists on the storage backend
+    let exists = state.engine.head_bucket(&bucket).await?;
+    if !exists {
+        return Err(S3Error::NoSuchBucket(bucket.to_string()));
+    }
+
     Ok((StatusCode::OK, [("x-amz-bucket-region", "us-east-1")]).into_response())
 }
 
@@ -697,14 +710,20 @@ pub async fn head_bucket(ValidatedBucket(bucket): ValidatedBucket) -> Result<Res
 pub async fn list_buckets(State(state): State<Arc<AppState>>) -> Result<Response, S3Error> {
     info!("LIST buckets");
 
-    // Return the single configured bucket
+    // List real buckets from storage backend
+    let mut bucket_list = state.engine.list_buckets().await?;
+    bucket_list.sort();
+
     let result = ListBucketsResult {
         owner_id: "deltaglider_proxy".to_string(),
         owner_display_name: "DeltaGlider Proxy".to_string(),
-        buckets: vec![BucketInfo {
-            name: state.default_bucket.clone(),
-            creation_date: Utc::now(), // We don't track actual creation time
-        }],
+        buckets: bucket_list
+            .into_iter()
+            .map(|name| BucketInfo {
+                name,
+                creation_date: Utc::now(),
+            })
+            .collect(),
     };
     let xml = result.to_xml();
 
@@ -714,6 +733,12 @@ pub async fn list_buckets(State(state): State<Arc<AppState>>) -> Result<Response
 // ============================================================================
 // Stats
 // ============================================================================
+
+/// Query parameters for /stats endpoint
+#[derive(Debug, Deserialize, Default)]
+pub struct StatsQuery {
+    pub bucket: Option<String>,
+}
 
 /// Aggregate storage statistics
 #[derive(Debug, Serialize)]
@@ -725,21 +750,33 @@ pub struct StatsResponse {
 }
 
 /// Stats handler
-/// GET /stats
-pub async fn get_stats(State(state): State<Arc<AppState>>) -> Result<Json<StatsResponse>, S3Error> {
-    let page = state
-        .engine
-        .list_objects_v2(&state.default_bucket, "", u32::MAX, None)
-        .await?;
+/// GET /stats — aggregate stats across all buckets
+/// GET /stats?bucket=NAME — stats for a specific bucket
+pub async fn get_stats(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<StatsQuery>,
+) -> Result<Json<StatsResponse>, S3Error> {
+    let buckets_to_scan: Vec<String> = if let Some(ref bucket) = query.bucket {
+        vec![bucket.clone()]
+    } else {
+        // Aggregate across all real buckets from storage
+        state.engine.list_buckets().await.unwrap_or_default()
+    };
 
     let mut total_objects: u64 = 0;
     let mut total_original_size: u64 = 0;
     let mut total_stored_size: u64 = 0;
 
-    for (_key, meta) in &page.objects {
-        total_objects += 1;
-        total_original_size += meta.file_size;
-        total_stored_size += meta.delta_size().unwrap_or(meta.file_size);
+    for bucket in &buckets_to_scan {
+        let page = state
+            .engine
+            .list_objects_v2(bucket, "", u32::MAX, None)
+            .await?;
+        for (_key, meta) in &page.objects {
+            total_objects += 1;
+            total_original_size += meta.file_size;
+            total_stored_size += meta.delta_size().unwrap_or(meta.file_size);
+        }
     }
 
     let savings_percentage = if total_original_size > 0 {

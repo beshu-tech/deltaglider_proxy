@@ -12,11 +12,6 @@ export function savingsPercent(obj: S3Object): number | null {
   return Math.max(0, (1 - obj.storedSize / obj.size) * 100);
 }
 
-export function badgeClass(type?: string): string {
-  if (!type) return 'badge';
-  return `badge badge-${type}`;
-}
-
 /** Extract the display name from a full S3 key given the current prefix */
 export function displayName(key: string, prefix: string): string {
   return key.startsWith(prefix) ? key.slice(prefix.length) : key;

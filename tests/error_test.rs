@@ -29,14 +29,20 @@ async fn test_nosuchbucket_xml_response() {
     let server = TestServer::filesystem().await;
     let client = reqwest::Client::new();
 
+    // HEAD on a bucket that has no objects and was never created → NoSuchBucket
+    let url = format!("{}/nonexistent-bucket", server.endpoint());
+    let resp = client.head(&url).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+
+    // GET on a key inside a valid-but-empty bucket → NoSuchKey (multi-bucket: any bucket is accepted)
     let url = format!("{}/nonexistent-bucket/file.txt", server.endpoint());
     let resp = client.get(&url).send().await.unwrap();
 
     assert_eq!(resp.status().as_u16(), 404);
     let body = resp.text().await.unwrap();
     assert!(
-        body.contains("<Code>NoSuchBucket</Code>"),
-        "Should contain NoSuchBucket error code, got: {}",
+        body.contains("<Code>NoSuchKey</Code>"),
+        "Multi-bucket mode: unknown bucket with missing key returns NoSuchKey, got: {}",
         body
     );
 }

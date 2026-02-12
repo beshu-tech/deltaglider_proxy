@@ -3,19 +3,10 @@
 //! This backend stores metadata in S3 object metadata headers (x-amz-meta-dg-*)
 //! for compatibility with the original DeltaGlider CLI (beshultd/deltaglider).
 //!
-//! Metadata format follows DeltaGlider conventions:
-//! - x-amz-meta-dg-tool: "deltaglider/0.1.0"
-//! - x-amz-meta-dg-file-sha256: SHA256 hash of original file
-//! - x-amz-meta-dg-original-name: Original filename
-//! - x-amz-meta-dg-file-size: Size of original file in bytes
-//! - x-amz-meta-dg-created-at: ISO8601 timestamp
-//! - x-amz-meta-dg-note: "reference", "delta", or "direct"
-//! - x-amz-meta-dg-ref-key: Reference file key (for deltas)
-//! - x-amz-meta-dg-ref-sha256: SHA256 of reference file (for deltas)
-//! - x-amz-meta-dg-delta-size: Size of delta in bytes (for deltas)
-//! - x-amz-meta-dg-delta-cmd: xdelta3 command used (for deltas)
+//! Each API bucket maps 1:1 to a real S3 bucket on the backend.
 
 use super::traits::{StorageBackend, StorageError};
+use bytes::Bytes;
 use crate::config::BackendConfig;
 use crate::types::{FileMetadata, StorageInfo};
 use async_trait::async_trait;
@@ -25,31 +16,30 @@ use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use chrono::{DateTime, Utc};
+use futures::stream::BoxStream;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+
 use tracing::{debug, instrument};
 
 /// S3 storage backend for DeltaGlider objects
 pub struct S3Backend {
     client: Client,
-    bucket: String,
 }
 
 impl S3Backend {
     /// Create a new S3 backend from configuration
     pub async fn new(config: &BackendConfig) -> Result<Self, StorageError> {
-        let (endpoint, bucket, region, force_path_style, access_key_id, secret_access_key) =
+        let (endpoint, region, force_path_style, access_key_id, secret_access_key) =
             match config {
                 BackendConfig::S3 {
                     endpoint,
-                    bucket,
                     region,
                     force_path_style,
                     access_key_id,
                     secret_access_key,
+                    ..
                 } => (
                     endpoint.clone(),
-                    bucket.clone(),
                     region.clone(),
                     *force_path_style,
                     access_key_id.clone(),
@@ -87,15 +77,14 @@ impl S3Backend {
 
         let client = Client::from_conf(s3_config);
 
-        debug!("S3Backend initialized for bucket: {}", bucket);
+        debug!("S3Backend initialized (multi-bucket mode)");
 
-        Ok(Self { client, bucket })
+        Ok(Self { client })
     }
 
     // === Key generation helpers ===
 
     /// Get the S3 key for a reference file
-    /// For root-level files (empty prefix), returns "reference.bin"
     fn reference_key(&self, prefix: &str) -> String {
         if prefix.is_empty() {
             "reference.bin".to_string()
@@ -105,7 +94,6 @@ impl S3Backend {
     }
 
     /// Get the S3 key for a delta file
-    /// For root-level files (empty prefix), returns "{filename}.delta"
     fn delta_key(&self, prefix: &str, filename: &str) -> String {
         if prefix.is_empty() {
             format!("{}.delta", filename)
@@ -114,11 +102,7 @@ impl S3Backend {
         }
     }
 
-    /// Get the S3 key for a direct file (non-delta eligible files)
-    /// Note: Original CLI doesn't have a separate .direct suffix - it stores
-    /// non-delta files without any suffix. For now we keep .direct for internal
-    /// consistency but may need to change this for full interop.
-    /// For root-level files (empty prefix), returns "{filename}.direct"
+    /// Get the S3 key for a direct file
     fn direct_key(&self, prefix: &str, filename: &str) -> String {
         if prefix.is_empty() {
             format!("{}.direct", filename)
@@ -131,33 +115,29 @@ impl S3Backend {
 
     /// Convert FileMetadata to S3 metadata headers (dg-* format)
     fn metadata_to_headers(&self, metadata: &FileMetadata) -> HashMap<String, String> {
+        use crate::types::meta_keys as mk;
         let mut headers = HashMap::new();
 
-        // Common fields
-        headers.insert("dg-tool".to_string(), metadata.tool.clone());
-        headers.insert(
-            "dg-original-name".to_string(),
-            metadata.original_name.clone(),
-        );
-        headers.insert("dg-file-sha256".to_string(), metadata.file_sha256.clone());
-        headers.insert("dg-file-size".to_string(), metadata.file_size.to_string());
-        headers.insert("dg-md5".to_string(), metadata.md5.clone());
+        headers.insert(mk::TOOL.to_string(), metadata.tool.clone());
+        headers.insert(mk::ORIGINAL_NAME.to_string(), metadata.original_name.clone());
+        headers.insert(mk::FILE_SHA256.to_string(), metadata.file_sha256.clone());
+        headers.insert(mk::FILE_SIZE.to_string(), metadata.file_size.to_string());
+        headers.insert(mk::MD5.to_string(), metadata.md5.clone());
         if let Some(ref ct) = metadata.content_type {
             headers.insert("content-type".to_string(), ct.clone());
         }
         headers.insert(
-            "dg-created-at".to_string(),
+            mk::CREATED_AT.to_string(),
             metadata
                 .created_at
                 .format("%Y-%m-%dT%H:%M:%S%.6fZ")
                 .to_string(),
         );
 
-        // Storage-type specific fields
         match &metadata.storage_info {
             StorageInfo::Reference { source_name } => {
-                headers.insert("dg-note".to_string(), "reference".to_string());
-                headers.insert("dg-source-name".to_string(), source_name.clone());
+                headers.insert(mk::NOTE.to_string(), "reference".to_string());
+                headers.insert(mk::SOURCE_NAME.to_string(), source_name.clone());
             }
             StorageInfo::Delta {
                 ref_key,
@@ -165,18 +145,17 @@ impl S3Backend {
                 delta_size,
                 delta_cmd,
             } => {
-                headers.insert("dg-note".to_string(), "delta".to_string());
-                headers.insert("dg-ref-key".to_string(), ref_key.clone());
-                headers.insert("dg-ref-sha256".to_string(), ref_sha256.clone());
-                headers.insert("dg-delta-size".to_string(), delta_size.to_string());
-                headers.insert("dg-delta-cmd".to_string(), delta_cmd.clone());
+                headers.insert(mk::NOTE.to_string(), "delta".to_string());
+                headers.insert(mk::REF_KEY.to_string(), ref_key.clone());
+                headers.insert(mk::REF_SHA256.to_string(), ref_sha256.clone());
+                headers.insert(mk::DELTA_SIZE.to_string(), delta_size.to_string());
+                headers.insert(mk::DELTA_CMD.to_string(), delta_cmd.clone());
             }
             StorageInfo::Direct => {
-                headers.insert("dg-note".to_string(), "direct".to_string());
+                headers.insert(mk::NOTE.to_string(), "direct".to_string());
             }
         }
 
-        // User-provided custom metadata (stored with "user-" prefix)
         for (key, value) in &metadata.user_metadata {
             headers.insert(format!("user-{}", key), value.clone());
         }
@@ -189,7 +168,8 @@ impl S3Backend {
         &self,
         headers: &HashMap<String, String>,
     ) -> Result<FileMetadata, StorageError> {
-        // Helper to get a value with multiple possible keys
+        use crate::types::meta_keys as mk;
+
         let get_value = |keys: &[&str]| -> Option<String> {
             for key in keys {
                 if let Some(v) = headers.get(*key) {
@@ -201,46 +181,37 @@ impl S3Backend {
             None
         };
 
-        let tool = get_value(&["dg-tool", "tool"])
-            .ok_or_else(|| StorageError::Other("Missing dg-tool".to_string()))?;
+        let tool = get_value(&[mk::TOOL, "tool"])
+            .ok_or_else(|| StorageError::Other(format!("Missing {}", mk::TOOL)))?;
         let original_name = get_value(&[
-            "dg-original-name",
+            mk::ORIGINAL_NAME,
             "original-name",
-            "dg-source-name",
+            mk::SOURCE_NAME,
             "source-name",
         ])
-        .ok_or_else(|| StorageError::Other("Missing dg-original-name".to_string()))?;
-        let file_sha256 = get_value(&["dg-file-sha256", "file-sha256"])
-            .ok_or_else(|| StorageError::Other("Missing dg-file-sha256".to_string()))?;
+        .ok_or_else(|| StorageError::Other(format!("Missing {}", mk::ORIGINAL_NAME)))?;
+        let file_sha256 = get_value(&[mk::FILE_SHA256, "file-sha256"])
+            .ok_or_else(|| StorageError::Other(format!("Missing {}", mk::FILE_SHA256)))?;
         let file_size_str =
-            get_value(&["dg-file-size", "file-size"]).unwrap_or_else(|| "0".to_string());
+            get_value(&[mk::FILE_SIZE, "file-size"]).unwrap_or_else(|| "0".to_string());
         let file_size: u64 = file_size_str
             .parse()
             .map_err(|_| StorageError::Other(format!("Invalid file size: {}", file_size_str)))?;
         let created_at_str =
-            get_value(&["dg-created-at", "created-at"]).unwrap_or_else(|| Utc::now().to_rfc3339());
-        // Parse timestamp - handle various formats
+            get_value(&[mk::CREATED_AT, "created-at"]).unwrap_or_else(|| Utc::now().to_rfc3339());
         let created_at: DateTime<Utc> = {
             let ts = created_at_str.trim_end_matches('Z');
-            // Try RFC3339 with timezone
             DateTime::parse_from_rfc3339(&format!("{}+00:00", ts))
                 .map(|dt| dt.with_timezone(&Utc))
                 .or_else(|_| {
-                    // Try parsing as naive datetime
                     chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.f")
                         .map(|ndt| ndt.and_utc())
                 })
                 .unwrap_or_else(|_| Utc::now())
         };
 
-        let note = get_value(&["dg-note", "note"]);
-
-        // Determine storage type:
-        // 1. If note == "reference", it's a reference file
-        // 2. If dg-ref-key exists OR note contains "delta" or "zero-diff", it's a delta file
-        //    (Original CLI doesn't always set dg-note for delta files)
-        // 3. Otherwise it's direct storage
-        let ref_key_opt = get_value(&["dg-ref-key", "ref-key"]);
+        let note = get_value(&[mk::NOTE, "note"]);
+        let ref_key_opt = get_value(&[mk::REF_KEY, "ref-key"]);
         let is_reference = note.as_deref() == Some("reference");
         let is_delta = ref_key_opt.is_some()
             || note
@@ -249,20 +220,20 @@ impl S3Backend {
                 .unwrap_or(false);
 
         let storage_info = if is_reference {
-            let source_name = get_value(&["dg-source-name", "source-name"])
+            let source_name = get_value(&[mk::SOURCE_NAME, "source-name"])
                 .unwrap_or_else(|| original_name.clone());
             StorageInfo::Reference { source_name }
         } else if is_delta {
             let ref_key =
-                ref_key_opt.ok_or_else(|| StorageError::Other("Missing dg-ref-key".to_string()))?;
-            let ref_sha256 = get_value(&["dg-ref-sha256", "ref-sha256"])
-                .ok_or_else(|| StorageError::Other("Missing dg-ref-sha256".to_string()))?;
+                ref_key_opt.ok_or_else(|| StorageError::Other(format!("Missing {}", mk::REF_KEY)))?;
+            let ref_sha256 = get_value(&[mk::REF_SHA256, "ref-sha256"])
+                .ok_or_else(|| StorageError::Other(format!("Missing {}", mk::REF_SHA256)))?;
             let delta_size_str =
-                get_value(&["dg-delta-size", "delta-size"]).unwrap_or_else(|| "0".to_string());
+                get_value(&[mk::DELTA_SIZE, "delta-size"]).unwrap_or_else(|| "0".to_string());
             let delta_size: u64 = delta_size_str.parse().map_err(|_| {
                 StorageError::Other(format!("Invalid delta size: {}", delta_size_str))
             })?;
-            let delta_cmd = get_value(&["dg-delta-cmd", "delta-cmd"]).unwrap_or_default();
+            let delta_cmd = get_value(&[mk::DELTA_CMD, "delta-cmd"]).unwrap_or_default();
             StorageInfo::Delta {
                 ref_key,
                 ref_sha256,
@@ -273,13 +244,11 @@ impl S3Backend {
             StorageInfo::Direct
         };
 
-        // MD5 is not in the original DeltaGlider format, generate a placeholder
         let md5 = headers
-            .get("dg-md5")
+            .get(mk::MD5)
             .cloned()
             .unwrap_or_else(|| "".to_string());
 
-        // Extract user metadata (keys starting with "user-" prefix in S3 metadata)
         let user_metadata: std::collections::HashMap<String, String> = headers
             .iter()
             .filter_map(|(k, v)| {
@@ -306,6 +275,7 @@ impl S3Backend {
     /// Put an object to S3 with metadata headers
     async fn put_object_with_metadata(
         &self,
+        bucket: &str,
         key: &str,
         data: &[u8],
         metadata: &FileMetadata,
@@ -315,12 +285,11 @@ impl S3Backend {
         let mut request = self
             .client
             .put_object()
-            .bucket(&self.bucket)
+            .bucket(bucket)
             .key(key)
             .body(ByteStream::from(data.to_vec()))
             .content_type("application/octet-stream");
 
-        // Add all metadata headers
         for (k, v) in headers {
             request = request.metadata(k, v);
         }
@@ -330,31 +299,16 @@ impl S3Backend {
             .await
             .map_err(|e| StorageError::S3(format!("put_object failed: {}", e)))?;
 
-        debug!("S3 PUT {} ({} bytes) with DG metadata", key, data.len());
-        Ok(())
-    }
-
-    /// Put a raw object to S3 (no metadata)
-    async fn put_object(&self, key: &str, data: &[u8]) -> Result<(), StorageError> {
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .body(ByteStream::from(data.to_vec()))
-            .send()
-            .await
-            .map_err(|e| StorageError::S3(format!("put_object failed: {}", e)))?;
-
-        debug!("S3 PUT {} ({} bytes)", key, data.len());
+        debug!("S3 PUT {}/{} ({} bytes) with DG metadata", bucket, key, data.len());
         Ok(())
     }
 
     /// Get an object from S3
-    async fn get_object(&self, key: &str) -> Result<Vec<u8>, StorageError> {
+    async fn get_object(&self, bucket: &str, key: &str) -> Result<Vec<u8>, StorageError> {
         let response = self
             .client
             .get_object()
-            .bucket(&self.bucket)
+            .bucket(bucket)
             .key(key)
             .send()
             .await
@@ -378,16 +332,16 @@ impl S3Backend {
             .into_bytes()
             .to_vec();
 
-        debug!("S3 GET {} ({} bytes)", key, data.len());
+        debug!("S3 GET {}/{} ({} bytes)", bucket, key, data.len());
         Ok(data)
     }
 
     /// Get object metadata from S3 headers
-    async fn get_object_metadata(&self, key: &str) -> Result<FileMetadata, StorageError> {
+    async fn get_object_metadata(&self, bucket: &str, key: &str) -> Result<FileMetadata, StorageError> {
         let response = self
             .client
             .head_object()
-            .bucket(&self.bucket)
+            .bucket(bucket)
             .key(key)
             .send()
             .await
@@ -419,32 +373,32 @@ impl S3Backend {
     }
 
     /// Delete an object from S3
-    async fn delete_object(&self, key: &str) -> Result<(), StorageError> {
+    async fn delete_s3_object(&self, bucket: &str, key: &str) -> Result<(), StorageError> {
         self.client
             .delete_object()
-            .bucket(&self.bucket)
+            .bucket(bucket)
             .key(key)
             .send()
             .await
             .map_err(|e| StorageError::S3(format!("delete_object failed: {}", e)))?;
 
-        debug!("S3 DELETE {}", key);
+        debug!("S3 DELETE {}/{}", bucket, key);
         Ok(())
     }
 
     /// Check if an object exists in S3
-    async fn object_exists(&self, key: &str) -> bool {
+    async fn object_exists(&self, bucket: &str, key: &str) -> bool {
         self.client
             .head_object()
-            .bucket(&self.bucket)
+            .bucket(bucket)
             .key(key)
             .send()
             .await
             .is_ok()
     }
 
-    /// List objects with a prefix
-    async fn list_objects_with_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+    /// List objects with a prefix in a specific bucket
+    async fn list_objects_with_prefix(&self, bucket: &str, prefix: &str) -> Result<Vec<String>, StorageError> {
         let mut keys = Vec::new();
         let mut continuation_token: Option<String> = None;
 
@@ -452,7 +406,7 @@ impl S3Backend {
             let mut request = self
                 .client
                 .list_objects_v2()
-                .bucket(&self.bucket)
+                .bucket(bucket)
                 .prefix(prefix);
 
             if let Some(token) = continuation_token {
@@ -485,49 +439,74 @@ impl S3Backend {
 
 #[async_trait]
 impl StorageBackend for S3Backend {
-    // === Raw operations (Path-based, for completeness) ===
+    // === Bucket operations ===
 
-    async fn put_raw(&self, path: &Path, data: &[u8]) -> Result<(), StorageError> {
-        let key = path.to_string_lossy().to_string();
-        self.put_object(&key, data).await
+    #[instrument(skip(self))]
+    async fn create_bucket(&self, bucket: &str) -> Result<(), StorageError> {
+        self.client
+            .create_bucket()
+            .bucket(bucket)
+            .send()
+            .await
+            .map_err(|e| StorageError::S3(format!("create_bucket failed: {}", e)))?;
+        debug!("Created S3 bucket: {}", bucket);
+        Ok(())
     }
 
-    async fn get_raw(&self, path: &Path) -> Result<Vec<u8>, StorageError> {
-        let key = path.to_string_lossy().to_string();
-        self.get_object(&key).await
+    #[instrument(skip(self))]
+    async fn delete_bucket(&self, bucket: &str) -> Result<(), StorageError> {
+        self.client
+            .delete_bucket()
+            .bucket(bucket)
+            .send()
+            .await
+            .map_err(|e| StorageError::S3(format!("delete_bucket failed: {}", e)))?;
+        debug!("Deleted S3 bucket: {}", bucket);
+        Ok(())
     }
 
-    async fn exists(&self, path: &Path) -> bool {
-        let key = path.to_string_lossy().to_string();
-        self.object_exists(&key).await
+    #[instrument(skip(self))]
+    async fn list_buckets(&self) -> Result<Vec<String>, StorageError> {
+        let response = self
+            .client
+            .list_buckets()
+            .send()
+            .await
+            .map_err(|e| StorageError::S3(format!("list_buckets failed: {}", e)))?;
+
+        let mut names: Vec<String> = response
+            .buckets()
+            .iter()
+            .filter_map(|b| b.name().map(|n| n.to_string()))
+            .collect();
+        names.sort();
+        debug!("Listed {} S3 buckets", names.len());
+        Ok(names)
     }
 
-    async fn delete(&self, path: &Path) -> Result<(), StorageError> {
-        let key = path.to_string_lossy().to_string();
-        self.delete_object(&key).await
-    }
-
-    async fn list_prefix(&self, prefix: &Path) -> Result<Vec<String>, StorageError> {
-        let prefix_str = prefix.to_string_lossy().to_string();
-        self.list_objects_with_prefix(&prefix_str).await
+    #[instrument(skip(self))]
+    async fn head_bucket(&self, bucket: &str) -> Result<bool, StorageError> {
+        match self.client.head_bucket().bucket(bucket).send().await {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        }
     }
 
     // === Reference file operations ===
-    // Metadata is stored in S3 object headers (x-amz-meta-dg-*) for CLI compatibility
 
     #[instrument(skip(self, data, metadata))]
     async fn put_reference(
         &self,
+        bucket: &str,
         prefix: &str,
         data: &[u8],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         let key = self.reference_key(prefix);
-        self.put_object_with_metadata(&key, data, metadata).await?;
+        self.put_object_with_metadata(bucket, &key, data, metadata).await?;
         debug!(
-            "Stored reference for {} ({} bytes) with DG headers",
-            prefix,
-            data.len()
+            "Stored reference for {}/{} ({} bytes)",
+            bucket, prefix, data.len()
         );
         Ok(())
     }
@@ -535,20 +514,18 @@ impl StorageBackend for S3Backend {
     #[instrument(skip(self, metadata))]
     async fn put_reference_metadata(
         &self,
+        bucket: &str,
         prefix: &str,
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        // S3 metadata can only be set at PUT time. To update metadata on an
-        // existing object, we use CopyObject with the same source and destination
-        // key and MetadataDirective=REPLACE.
         let key = self.reference_key(prefix);
-        let copy_source = format!("{}/{}", self.bucket, key);
+        let copy_source = format!("{}/{}", bucket, key);
         let headers = self.metadata_to_headers(metadata);
 
         let mut request = self
             .client
             .copy_object()
-            .bucket(&self.bucket)
+            .bucket(bucket)
             .copy_source(&copy_source)
             .key(&key)
             .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace);
@@ -561,33 +538,33 @@ impl StorageBackend for S3Backend {
             StorageError::S3(format!("copy_object (metadata update) failed: {}", e))
         })?;
 
-        debug!("Updated reference metadata for {} via CopyObject", prefix);
+        debug!("Updated reference metadata for {}/{}", bucket, prefix);
         Ok(())
     }
 
     #[instrument(skip(self))]
-    async fn get_reference(&self, prefix: &str) -> Result<Vec<u8>, StorageError> {
+    async fn get_reference(&self, bucket: &str, prefix: &str) -> Result<Vec<u8>, StorageError> {
         let key = self.reference_key(prefix);
-        self.get_object(&key).await
+        self.get_object(bucket, &key).await
     }
 
     #[instrument(skip(self))]
-    async fn get_reference_metadata(&self, prefix: &str) -> Result<FileMetadata, StorageError> {
+    async fn get_reference_metadata(&self, bucket: &str, prefix: &str) -> Result<FileMetadata, StorageError> {
         let key = self.reference_key(prefix);
-        self.get_object_metadata(&key).await
+        self.get_object_metadata(bucket, &key).await
     }
 
     #[instrument(skip(self))]
-    async fn has_reference(&self, prefix: &str) -> bool {
+    async fn has_reference(&self, bucket: &str, prefix: &str) -> bool {
         let key = self.reference_key(prefix);
-        self.object_exists(&key).await
+        self.object_exists(bucket, &key).await
     }
 
     #[instrument(skip(self))]
-    async fn delete_reference(&self, prefix: &str) -> Result<(), StorageError> {
+    async fn delete_reference(&self, bucket: &str, prefix: &str) -> Result<(), StorageError> {
         let key = self.reference_key(prefix);
-        self.delete_object(&key).await?;
-        debug!("Deleted reference for {}", prefix);
+        self.delete_s3_object(bucket, &key).await?;
+        debug!("Deleted reference for {}/{}", bucket, prefix);
         Ok(())
     }
 
@@ -596,43 +573,43 @@ impl StorageBackend for S3Backend {
     #[instrument(skip(self, data, metadata))]
     async fn put_delta(
         &self,
+        bucket: &str,
         prefix: &str,
         filename: &str,
         data: &[u8],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         let key = self.delta_key(prefix, filename);
-        self.put_object_with_metadata(&key, data, metadata).await?;
+        self.put_object_with_metadata(bucket, &key, data, metadata).await?;
         debug!(
-            "Stored delta for {}/{} ({} bytes) with DG headers",
-            prefix,
-            filename,
-            data.len()
+            "Stored delta for {}/{}/{} ({} bytes)",
+            bucket, prefix, filename, data.len()
         );
         Ok(())
     }
 
     #[instrument(skip(self))]
-    async fn get_delta(&self, prefix: &str, filename: &str) -> Result<Vec<u8>, StorageError> {
+    async fn get_delta(&self, bucket: &str, prefix: &str, filename: &str) -> Result<Vec<u8>, StorageError> {
         let key = self.delta_key(prefix, filename);
-        self.get_object(&key).await
+        self.get_object(bucket, &key).await
     }
 
     #[instrument(skip(self))]
     async fn get_delta_metadata(
         &self,
+        bucket: &str,
         prefix: &str,
         filename: &str,
     ) -> Result<FileMetadata, StorageError> {
         let key = self.delta_key(prefix, filename);
-        self.get_object_metadata(&key).await
+        self.get_object_metadata(bucket, &key).await
     }
 
     #[instrument(skip(self))]
-    async fn delete_delta(&self, prefix: &str, filename: &str) -> Result<(), StorageError> {
+    async fn delete_delta(&self, bucket: &str, prefix: &str, filename: &str) -> Result<(), StorageError> {
         let key = self.delta_key(prefix, filename);
-        self.delete_object(&key).await?;
-        debug!("Deleted delta for {}/{}", prefix, filename);
+        self.delete_s3_object(bucket, &key).await?;
+        debug!("Deleted delta for {}/{}/{}", bucket, prefix, filename);
         Ok(())
     }
 
@@ -641,148 +618,186 @@ impl StorageBackend for S3Backend {
     #[instrument(skip(self, data, metadata))]
     async fn put_direct(
         &self,
+        bucket: &str,
         prefix: &str,
         filename: &str,
         data: &[u8],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         let key = self.direct_key(prefix, filename);
-        self.put_object_with_metadata(&key, data, metadata).await?;
+        self.put_object_with_metadata(bucket, &key, data, metadata).await?;
         debug!(
-            "Stored direct for {}/{} ({} bytes) with DG headers",
-            prefix,
-            filename,
-            data.len()
+            "Stored direct for {}/{}/{} ({} bytes)",
+            bucket, prefix, filename, data.len()
         );
         Ok(())
     }
 
     #[instrument(skip(self))]
-    async fn get_direct(&self, prefix: &str, filename: &str) -> Result<Vec<u8>, StorageError> {
+    async fn get_direct(&self, bucket: &str, prefix: &str, filename: &str) -> Result<Vec<u8>, StorageError> {
         let key = self.direct_key(prefix, filename);
-        self.get_object(&key).await
+        self.get_object(bucket, &key).await
     }
 
     #[instrument(skip(self))]
     async fn get_direct_metadata(
         &self,
+        bucket: &str,
         prefix: &str,
         filename: &str,
     ) -> Result<FileMetadata, StorageError> {
         let key = self.direct_key(prefix, filename);
-        self.get_object_metadata(&key).await
+        self.get_object_metadata(bucket, &key).await
     }
 
     #[instrument(skip(self))]
-    async fn delete_direct(&self, prefix: &str, filename: &str) -> Result<(), StorageError> {
+    async fn delete_direct(&self, bucket: &str, prefix: &str, filename: &str) -> Result<(), StorageError> {
         let key = self.direct_key(prefix, filename);
-        self.delete_object(&key).await?;
-        debug!("Deleted direct for {}/{}", prefix, filename);
+        self.delete_s3_object(bucket, &key).await?;
+        debug!("Deleted direct for {}/{}/{}", bucket, prefix, filename);
         Ok(())
+    }
+
+    // === Streaming operations ===
+
+    #[instrument(skip(self))]
+    async fn get_direct_stream(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<BoxStream<'static, Result<Bytes, StorageError>>, StorageError> {
+        let key = self.direct_key(prefix, filename);
+        let response = self
+            .client
+            .get_object()
+            .bucket(bucket)
+            .key(&key)
+            .send()
+            .await
+            .map_err(|e| {
+                if let SdkError::ServiceError(service_error) = &e {
+                    if matches!(
+                        service_error.err(),
+                        aws_sdk_s3::operation::get_object::GetObjectError::NoSuchKey(_)
+                    ) {
+                        return StorageError::NotFound(key.clone());
+                    }
+                }
+                StorageError::S3(format!("get_object failed: {}", e))
+            })?;
+
+        let data = response
+            .body
+            .collect()
+            .await
+            .map_err(|e| StorageError::S3(format!("Failed to read response body: {}", e)))?
+            .into_bytes();
+
+        debug!("S3 GET stream {}/{} ({} bytes)", bucket, key, data.len());
+        Ok(Box::pin(futures::stream::once(async {
+            Ok(data)
+        })))
     }
 
     // === Scanning operations ===
 
     #[instrument(skip(self))]
-    async fn scan_deltaspace(&self, prefix: &str) -> Result<Vec<FileMetadata>, StorageError> {
-        // For root-level files (empty prefix), list all objects without a prefix filter
-        // and filter by DeltaGlider file extensions
+    async fn scan_deltaspace(&self, bucket: &str, prefix: &str) -> Result<Vec<FileMetadata>, StorageError> {
         let search_prefix = if prefix.is_empty() {
             String::new()
         } else {
             format!("{}/", prefix)
         };
-        let keys = self.list_objects_with_prefix(&search_prefix).await?;
+        let keys = self.list_objects_with_prefix(bucket, &search_prefix).await?;
 
         let mut metadata_list = Vec::new();
 
-        // Read metadata from object headers for DeltaGlider files
         for key in keys {
-            // Skip non-DeltaGlider files
-            // Note: root-level reference.bin has no prefix, so we check for exact match or /reference.bin
             let is_reference = key == "reference.bin" || key.ends_with("/reference.bin");
             if !is_reference && !key.ends_with(".delta") && !key.ends_with(".direct") {
                 continue;
             }
-            // For empty prefix, skip files that have a directory prefix (they belong to other deltaspaces)
             if prefix.is_empty() && key.contains('/') {
                 continue;
             }
 
-            match self.get_object_metadata(&key).await {
+            match self.get_object_metadata(bucket, &key).await {
                 Ok(meta) => metadata_list.push(meta),
                 Err(e) => {
-                    debug!("Failed to read metadata from {}: {}", key, e);
+                    debug!("Failed to read metadata from {}/{}: {}", bucket, key, e);
                 }
             }
         }
 
         debug!(
-            "Scanned {} objects in deltaspace {}",
+            "Scanned {} objects in deltaspace {}/{}",
             metadata_list.len(),
+            bucket,
             prefix
         );
         Ok(metadata_list)
     }
 
     #[instrument(skip(self))]
-    async fn list_deltaspaces(&self) -> Result<Vec<String>, StorageError> {
-        // List all objects and extract unique prefixes
-        let keys = self.list_objects_with_prefix("").await?;
+    async fn list_deltaspaces(&self, bucket: &str) -> Result<Vec<String>, StorageError> {
+        let keys = self.list_objects_with_prefix(bucket, "").await?;
         let mut prefixes = HashSet::new();
 
         for key in keys {
-            // Check if this is a deltaglider file
             let is_reference = key == "reference.bin" || key.ends_with("/reference.bin");
             let is_delta_or_direct = key.ends_with(".delta") || key.ends_with(".direct");
 
             if is_reference || is_delta_or_direct {
-                // Extract the prefix (everything before the last /)
-                // Root-level files (no /) have empty prefix
                 if let Some(idx) = key.rfind('/') {
                     let prefix = &key[..idx];
                     prefixes.insert(prefix.to_string());
                 } else {
-                    // Root-level file - use empty string as prefix
                     prefixes.insert(String::new());
                 }
             }
         }
 
         let result: Vec<String> = prefixes.into_iter().collect();
-        debug!("Found {} deltaspaces", result.len());
+        debug!("Found {} deltaspaces in bucket {}", result.len(), bucket);
         Ok(result)
     }
 
     #[instrument(skip(self))]
-    async fn total_size(&self) -> Result<u64, StorageError> {
+    async fn total_size(&self, bucket: Option<&str>) -> Result<u64, StorageError> {
+        let buckets_to_scan = if let Some(b) = bucket {
+            vec![b.to_string()]
+        } else {
+            self.list_buckets().await?
+        };
+
         let mut total = 0u64;
-        let mut continuation_token: Option<String> = None;
+        for b in &buckets_to_scan {
+            let mut continuation_token: Option<String> = None;
+            loop {
+                let mut request = self.client.list_objects_v2().bucket(b);
+                if let Some(token) = continuation_token {
+                    request = request.continuation_token(token);
+                }
 
-        loop {
-            let mut request = self.client.list_objects_v2().bucket(&self.bucket);
+                let response = request
+                    .send()
+                    .await
+                    .map_err(|e| StorageError::S3(format!("list_objects_v2 failed: {}", e)))?;
 
-            if let Some(token) = continuation_token {
-                request = request.continuation_token(token);
-            }
-
-            let response = request
-                .send()
-                .await
-                .map_err(|e| StorageError::S3(format!("list_objects_v2 failed: {}", e)))?;
-
-            if let Some(contents) = response.contents {
-                for object in contents {
-                    if let Some(size) = object.size {
-                        total += size as u64;
+                if let Some(contents) = response.contents {
+                    for object in contents {
+                        if let Some(size) = object.size {
+                            total += size as u64;
+                        }
                     }
                 }
-            }
 
-            if response.is_truncated.unwrap_or(false) {
-                continuation_token = response.next_continuation_token;
-            } else {
-                break;
+                if response.is_truncated.unwrap_or(false) {
+                    continuation_token = response.next_continuation_token;
+                } else {
+                    break;
+                }
             }
         }
 

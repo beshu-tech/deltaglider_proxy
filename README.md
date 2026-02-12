@@ -4,13 +4,7 @@
 
 DeltaGlider Proxy sits between your S3 clients and backend storage, automatically deduplicating similar files using [xdelta3](https://github.com/jmacd/xdelta). Your existing tools work unchanged while storage costs drop significantly for versioned artifacts.
 
-```
-┌─────────────────┐       ┌─────────────────┐       ┌─────────────────┐
-│   S3 Client     │──────▶│  DeltaGlider    │──────▶│   Backend S3    │
-│   (aws-cli,     │◀──────│     Proxy       │◀──────│ (AWS/MinIO/R2)  │
-│   boto3, etc)   │       │   (xdelta3)     │       │                 │
-└─────────────────┘       └─────────────────┘       └─────────────────┘
-```
+![DeltaGlider Proxy Architecture](docs/diagram.png)
 
 ## Why DeltaGlider Proxy?
 
@@ -92,12 +86,27 @@ More details:
 
 ## Configuration
 
+### Authentication
+
+DeltaGlider Proxy supports optional SigV4 authentication. When configured, all requests must be signed with the proxy's credentials:
+
+```bash
+export DELTAGLIDER_PROXY_ACCESS_KEY_ID=myaccesskey
+export DELTAGLIDER_PROXY_SECRET_ACCESS_KEY=mysecretkey
+```
+
+Standard S3 tools (aws-cli, boto3, Terraform) work out of the box — just configure them with the proxy's credentials. See [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) for details.
+
 ### Environment Variables
 
 ```bash
 # Server
 DELTAGLIDER_PROXY_LISTEN_ADDR=0.0.0.0:9000
 DELTAGLIDER_PROXY_DEFAULT_BUCKET=default
+
+# Authentication (optional — both must be set to enable)
+DELTAGLIDER_PROXY_ACCESS_KEY_ID=...
+DELTAGLIDER_PROXY_SECRET_ACCESS_KEY=...
 
 # DeltaGlider
 DELTAGLIDER_PROXY_MAX_DELTA_RATIO=0.5      # Store as delta if ratio < 50%
@@ -161,70 +170,30 @@ cd demo/s3-browser && docker compose up --build
 
 The UI auto-detects the S3 endpoint (port - 1) from its own URL, so it works out of the box with zero configuration.
 
-## Development
+## Contributing
 
-### Prerequisites
-
-- Rust 1.75+
-- Node.js 20+ (for demo UI build)
-- Docker (for MinIO testing)
-
-### Build & Test
-
-```bash
-# Build
-cargo build
-
-# Run unit tests
-cargo test
-
-# Run with MinIO for integration tests
-docker compose up -d
-cargo test -- --ignored  # Runs S3 backend tests
-```
-
-### Project Structure
-
-```
-src/
-├── api/
-│   ├── handlers.rs    # S3 API endpoint handlers
-│   ├── extractors.rs  # Axum request extractors
-│   ├── errors.rs      # S3 error responses
-│   └── xml.rs         # S3 XML response builders
-├── deltaglider/
-│   ├── engine.rs      # Core delta compression logic
-│   ├── codec.rs       # xdelta3 encode/decode
-│   ├── cache.rs       # Reference file LRU cache
-│   └── file_router.rs # File type routing
-├── storage/
-│   ├── traits.rs      # StorageBackend trait
-│   ├── filesystem.rs  # Local filesystem backend
-│   └── s3.rs          # S3 backend
-├── config.rs          # Configuration loading
-├── types.rs           # Core types (FileMetadata, etc)
-├── demo.rs            # Embedded React demo UI (rust-embed, served on S3 port + 1)
-└── main.rs            # Server entry point
-demo/s3-browser/ui/    # React demo UI source (Vite + TypeScript)
-```
+See [CONTRIBUTING.md](docs/CONTRIBUTING.md) for build instructions, project structure, and how to submit changes.
 
 ## S3 API Compatibility
 
+DeltaGlider Proxy intercepts the S3 operations it needs for delta compression (PUT, GET, HEAD, DELETE, LIST, COPY) and handles them directly. Other S3 operations are not currently proxied through to the backend.
+
 | Operation | Status | Notes |
 |-----------|--------|-------|
-| PutObject | ✅ | Full support |
-| GetObject | ✅ | Full support |
-| HeadObject | ✅ | Full support |
-| DeleteObject | ✅ | Full support |
-| ListObjectsV2 | ✅ | Full support |
+| PutObject | ✅ | Delta compression applied when eligible |
+| GetObject | ✅ | Transparent reconstruction from deltas |
+| HeadObject | ✅ | Returns original object metadata |
+| DeleteObject | ✅ | Cleans up deltas and references |
+| ListObjectsV2 | ✅ | Returns logical keys (hides delta internals) |
 | DeleteObjects | ✅ | Batch delete |
 | CopyObject | ✅ | Via x-amz-copy-source header |
 | CreateBucket | ✅ | Single-bucket mode |
 | HeadBucket | ✅ | Single-bucket mode |
 | DeleteBucket | ✅ | Must be empty |
 | ListBuckets | ✅ | Returns configured bucket |
-
-**Not implemented**: Multipart upload, versioning, ACLs, lifecycle policies.
+| Multipart upload | ❌ | Returns 501; use single PUT |
+| Versioning | ❌ | Not supported |
+| ACLs, lifecycle | ❌ | Not supported |
 
 ## Performance
 

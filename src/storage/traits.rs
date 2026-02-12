@@ -1,8 +1,9 @@
 //! Storage backend trait definitions
 
+use bytes::Bytes;
 use crate::types::FileMetadata;
 use async_trait::async_trait;
-use std::path::Path;
+use futures::stream::{self, BoxStream};
 use thiserror::Error;
 
 /// Errors that can occur during storage operations
@@ -29,6 +30,12 @@ pub enum StorageError {
     #[error("S3 error: {0}")]
     S3(String),
 
+    #[error("Bucket not found: {0}")]
+    BucketNotFound(String),
+
+    #[error("Bucket not empty: {0}")]
+    BucketNotEmpty(String),
+
     #[error("Storage error: {0}")]
     Other(String),
 }
@@ -37,31 +44,34 @@ pub enum StorageError {
 /// Uses per-file metadata sidecars following DeltaGlider schema
 ///
 /// This trait is object-safe and can be used with `Box<dyn StorageBackend>`.
+///
+/// All methods take a `bucket` parameter which maps to a real storage bucket
+/// (S3 bucket or filesystem directory).
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
-    /// Store raw bytes at a path
-    async fn put_raw(&self, path: &Path, data: &[u8]) -> Result<(), StorageError>;
+    // === Bucket operations ===
 
-    /// Retrieve raw bytes from a path
-    async fn get_raw(&self, path: &Path) -> Result<Vec<u8>, StorageError>;
+    /// Create a new bucket
+    async fn create_bucket(&self, bucket: &str) -> Result<(), StorageError>;
 
-    /// Check if a path exists
-    async fn exists(&self, path: &Path) -> bool;
+    /// Delete a bucket (must be empty)
+    async fn delete_bucket(&self, bucket: &str) -> Result<(), StorageError>;
 
-    /// Delete a path
-    async fn delete(&self, path: &Path) -> Result<(), StorageError>;
+    /// List all buckets
+    async fn list_buckets(&self) -> Result<Vec<String>, StorageError>;
 
-    /// List all files under a prefix
-    async fn list_prefix(&self, prefix: &Path) -> Result<Vec<String>, StorageError>;
+    /// Check if a bucket exists
+    async fn head_bucket(&self, bucket: &str) -> Result<bool, StorageError>;
 
     // === Reference file operations ===
 
     /// Get the reference file for a deltaspace
-    async fn get_reference(&self, prefix: &str) -> Result<Vec<u8>, StorageError>;
+    async fn get_reference(&self, bucket: &str, prefix: &str) -> Result<Vec<u8>, StorageError>;
 
     /// Store a reference file with its metadata
     async fn put_reference(
         &self,
+        bucket: &str,
         prefix: &str,
         data: &[u8],
         metadata: &FileMetadata,
@@ -70,27 +80,29 @@ pub trait StorageBackend: Send + Sync {
     /// Store/update reference metadata without rewriting reference data.
     async fn put_reference_metadata(
         &self,
+        bucket: &str,
         prefix: &str,
         metadata: &FileMetadata,
     ) -> Result<(), StorageError>;
 
     /// Get reference file metadata
-    async fn get_reference_metadata(&self, prefix: &str) -> Result<FileMetadata, StorageError>;
+    async fn get_reference_metadata(&self, bucket: &str, prefix: &str) -> Result<FileMetadata, StorageError>;
 
     /// Check if reference exists
-    async fn has_reference(&self, prefix: &str) -> bool;
+    async fn has_reference(&self, bucket: &str, prefix: &str) -> bool;
 
     /// Delete a reference file and its metadata
-    async fn delete_reference(&self, prefix: &str) -> Result<(), StorageError>;
+    async fn delete_reference(&self, bucket: &str, prefix: &str) -> Result<(), StorageError>;
 
     // === Delta file operations ===
 
     /// Get a delta file
-    async fn get_delta(&self, prefix: &str, filename: &str) -> Result<Vec<u8>, StorageError>;
+    async fn get_delta(&self, bucket: &str, prefix: &str, filename: &str) -> Result<Vec<u8>, StorageError>;
 
     /// Store a delta file with its metadata
     async fn put_delta(
         &self,
+        bucket: &str,
         prefix: &str,
         filename: &str,
         data: &[u8],
@@ -100,21 +112,23 @@ pub trait StorageBackend: Send + Sync {
     /// Get delta file metadata
     async fn get_delta_metadata(
         &self,
+        bucket: &str,
         prefix: &str,
         filename: &str,
     ) -> Result<FileMetadata, StorageError>;
 
     /// Delete a delta file and its metadata
-    async fn delete_delta(&self, prefix: &str, filename: &str) -> Result<(), StorageError>;
+    async fn delete_delta(&self, bucket: &str, prefix: &str, filename: &str) -> Result<(), StorageError>;
 
     // === Direct file operations ===
 
     /// Get a direct (non-delta) file
-    async fn get_direct(&self, prefix: &str, filename: &str) -> Result<Vec<u8>, StorageError>;
+    async fn get_direct(&self, bucket: &str, prefix: &str, filename: &str) -> Result<Vec<u8>, StorageError>;
 
     /// Store a direct (non-delta) file with its metadata
     async fn put_direct(
         &self,
+        bucket: &str,
         prefix: &str,
         filename: &str,
         data: &[u8],
@@ -124,143 +138,76 @@ pub trait StorageBackend: Send + Sync {
     /// Get direct file metadata
     async fn get_direct_metadata(
         &self,
+        bucket: &str,
         prefix: &str,
         filename: &str,
     ) -> Result<FileMetadata, StorageError>;
 
     /// Delete a direct (non-delta) file and its metadata
-    async fn delete_direct(&self, prefix: &str, filename: &str) -> Result<(), StorageError>;
+    async fn delete_direct(&self, bucket: &str, prefix: &str, filename: &str) -> Result<(), StorageError>;
+
+    // === Streaming operations ===
+
+    /// Stream a direct file's contents without buffering the entire file in memory.
+    /// Default implementation falls back to `get_direct()` and wraps in a single-chunk stream.
+    async fn get_direct_stream(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<BoxStream<'static, Result<Bytes, StorageError>>, StorageError> {
+        let data = self.get_direct(bucket, prefix, filename).await?;
+        Ok(Box::pin(stream::once(async { Ok(Bytes::from(data)) })))
+    }
 
     // === Scanning operations ===
 
     /// Scan a deltaspace directory and return all file metadata
     /// This replaces the centralized index - state is derived from files
-    async fn scan_deltaspace(&self, prefix: &str) -> Result<Vec<FileMetadata>, StorageError>;
+    async fn scan_deltaspace(&self, bucket: &str, prefix: &str) -> Result<Vec<FileMetadata>, StorageError>;
 
-    /// List all deltaspace prefixes (directories with stored files)
-    async fn list_deltaspaces(&self) -> Result<Vec<String>, StorageError>;
+    /// List all deltaspace prefixes within a bucket
+    async fn list_deltaspaces(&self, bucket: &str) -> Result<Vec<String>, StorageError>;
 
-    /// Get total storage size used (for metrics)
-    async fn total_size(&self) -> Result<u64, StorageError>;
+    /// Get total storage size used (for metrics), optionally scoped to a bucket
+    async fn total_size(&self, bucket: Option<&str>) -> Result<u64, StorageError>;
 }
 
-/// Blanket implementation for boxed trait objects, enabling dynamic dispatch
-#[async_trait]
-impl StorageBackend for Box<dyn StorageBackend> {
-    async fn put_raw(&self, path: &Path, data: &[u8]) -> Result<(), StorageError> {
-        (**self).put_raw(path, data).await
-    }
+/// Generate the blanket `impl StorageBackend for Box<dyn StorageBackend>`
+/// that forwards every method through dynamic dispatch.
+macro_rules! impl_storage_backend_for_box {
+    () => {
+        #[async_trait]
+        impl StorageBackend for Box<dyn StorageBackend> {
+            async fn create_bucket(&self, bucket: &str) -> Result<(), StorageError> { (**self).create_bucket(bucket).await }
+            async fn delete_bucket(&self, bucket: &str) -> Result<(), StorageError> { (**self).delete_bucket(bucket).await }
+            async fn list_buckets(&self) -> Result<Vec<String>, StorageError> { (**self).list_buckets().await }
+            async fn head_bucket(&self, bucket: &str) -> Result<bool, StorageError> { (**self).head_bucket(bucket).await }
 
-    async fn get_raw(&self, path: &Path) -> Result<Vec<u8>, StorageError> {
-        (**self).get_raw(path).await
-    }
+            async fn get_reference(&self, bucket: &str, prefix: &str) -> Result<Vec<u8>, StorageError> { (**self).get_reference(bucket, prefix).await }
+            async fn put_reference(&self, bucket: &str, prefix: &str, data: &[u8], metadata: &FileMetadata) -> Result<(), StorageError> { (**self).put_reference(bucket, prefix, data, metadata).await }
+            async fn put_reference_metadata(&self, bucket: &str, prefix: &str, metadata: &FileMetadata) -> Result<(), StorageError> { (**self).put_reference_metadata(bucket, prefix, metadata).await }
+            async fn get_reference_metadata(&self, bucket: &str, prefix: &str) -> Result<FileMetadata, StorageError> { (**self).get_reference_metadata(bucket, prefix).await }
+            async fn has_reference(&self, bucket: &str, prefix: &str) -> bool { (**self).has_reference(bucket, prefix).await }
+            async fn delete_reference(&self, bucket: &str, prefix: &str) -> Result<(), StorageError> { (**self).delete_reference(bucket, prefix).await }
 
-    async fn exists(&self, path: &Path) -> bool {
-        (**self).exists(path).await
-    }
+            async fn get_delta(&self, bucket: &str, prefix: &str, filename: &str) -> Result<Vec<u8>, StorageError> { (**self).get_delta(bucket, prefix, filename).await }
+            async fn put_delta(&self, bucket: &str, prefix: &str, filename: &str, data: &[u8], metadata: &FileMetadata) -> Result<(), StorageError> { (**self).put_delta(bucket, prefix, filename, data, metadata).await }
+            async fn get_delta_metadata(&self, bucket: &str, prefix: &str, filename: &str) -> Result<FileMetadata, StorageError> { (**self).get_delta_metadata(bucket, prefix, filename).await }
+            async fn delete_delta(&self, bucket: &str, prefix: &str, filename: &str) -> Result<(), StorageError> { (**self).delete_delta(bucket, prefix, filename).await }
 
-    async fn delete(&self, path: &Path) -> Result<(), StorageError> {
-        (**self).delete(path).await
-    }
+            async fn get_direct(&self, bucket: &str, prefix: &str, filename: &str) -> Result<Vec<u8>, StorageError> { (**self).get_direct(bucket, prefix, filename).await }
+            async fn put_direct(&self, bucket: &str, prefix: &str, filename: &str, data: &[u8], metadata: &FileMetadata) -> Result<(), StorageError> { (**self).put_direct(bucket, prefix, filename, data, metadata).await }
+            async fn get_direct_metadata(&self, bucket: &str, prefix: &str, filename: &str) -> Result<FileMetadata, StorageError> { (**self).get_direct_metadata(bucket, prefix, filename).await }
+            async fn delete_direct(&self, bucket: &str, prefix: &str, filename: &str) -> Result<(), StorageError> { (**self).delete_direct(bucket, prefix, filename).await }
 
-    async fn list_prefix(&self, prefix: &Path) -> Result<Vec<String>, StorageError> {
-        (**self).list_prefix(prefix).await
-    }
+            async fn get_direct_stream(&self, bucket: &str, prefix: &str, filename: &str) -> Result<BoxStream<'static, Result<Bytes, StorageError>>, StorageError> { (**self).get_direct_stream(bucket, prefix, filename).await }
 
-    async fn get_reference(&self, prefix: &str) -> Result<Vec<u8>, StorageError> {
-        (**self).get_reference(prefix).await
-    }
-
-    async fn put_reference(
-        &self,
-        prefix: &str,
-        data: &[u8],
-        metadata: &FileMetadata,
-    ) -> Result<(), StorageError> {
-        (**self).put_reference(prefix, data, metadata).await
-    }
-
-    async fn put_reference_metadata(
-        &self,
-        prefix: &str,
-        metadata: &FileMetadata,
-    ) -> Result<(), StorageError> {
-        (**self).put_reference_metadata(prefix, metadata).await
-    }
-
-    async fn get_reference_metadata(&self, prefix: &str) -> Result<FileMetadata, StorageError> {
-        (**self).get_reference_metadata(prefix).await
-    }
-
-    async fn has_reference(&self, prefix: &str) -> bool {
-        (**self).has_reference(prefix).await
-    }
-
-    async fn delete_reference(&self, prefix: &str) -> Result<(), StorageError> {
-        (**self).delete_reference(prefix).await
-    }
-
-    async fn get_delta(&self, prefix: &str, filename: &str) -> Result<Vec<u8>, StorageError> {
-        (**self).get_delta(prefix, filename).await
-    }
-
-    async fn put_delta(
-        &self,
-        prefix: &str,
-        filename: &str,
-        data: &[u8],
-        metadata: &FileMetadata,
-    ) -> Result<(), StorageError> {
-        (**self).put_delta(prefix, filename, data, metadata).await
-    }
-
-    async fn get_delta_metadata(
-        &self,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<FileMetadata, StorageError> {
-        (**self).get_delta_metadata(prefix, filename).await
-    }
-
-    async fn delete_delta(&self, prefix: &str, filename: &str) -> Result<(), StorageError> {
-        (**self).delete_delta(prefix, filename).await
-    }
-
-    async fn get_direct(&self, prefix: &str, filename: &str) -> Result<Vec<u8>, StorageError> {
-        (**self).get_direct(prefix, filename).await
-    }
-
-    async fn put_direct(
-        &self,
-        prefix: &str,
-        filename: &str,
-        data: &[u8],
-        metadata: &FileMetadata,
-    ) -> Result<(), StorageError> {
-        (**self).put_direct(prefix, filename, data, metadata).await
-    }
-
-    async fn get_direct_metadata(
-        &self,
-        prefix: &str,
-        filename: &str,
-    ) -> Result<FileMetadata, StorageError> {
-        (**self).get_direct_metadata(prefix, filename).await
-    }
-
-    async fn delete_direct(&self, prefix: &str, filename: &str) -> Result<(), StorageError> {
-        (**self).delete_direct(prefix, filename).await
-    }
-
-    async fn scan_deltaspace(&self, prefix: &str) -> Result<Vec<FileMetadata>, StorageError> {
-        (**self).scan_deltaspace(prefix).await
-    }
-
-    async fn list_deltaspaces(&self) -> Result<Vec<String>, StorageError> {
-        (**self).list_deltaspaces().await
-    }
-
-    async fn total_size(&self) -> Result<u64, StorageError> {
-        (**self).total_size().await
-    }
+            async fn scan_deltaspace(&self, bucket: &str, prefix: &str) -> Result<Vec<FileMetadata>, StorageError> { (**self).scan_deltaspace(bucket, prefix).await }
+            async fn list_deltaspaces(&self, bucket: &str) -> Result<Vec<String>, StorageError> { (**self).list_deltaspaces(bucket).await }
+            async fn total_size(&self, bucket: Option<&str>) -> Result<u64, StorageError> { (**self).total_size(bucket).await }
+        }
+    };
 }
+
+impl_storage_backend_for_box!();

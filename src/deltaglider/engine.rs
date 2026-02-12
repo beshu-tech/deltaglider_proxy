@@ -3,9 +3,11 @@
 use super::cache::ReferenceCache;
 use super::codec::{CodecError, DeltaCodec};
 use super::file_router::FileRouter;
+use bytes::Bytes;
 use crate::config::{BackendConfig, Config};
 use crate::storage::{FilesystemBackend, S3Backend, StorageBackend, StorageError};
 use crate::types::{FileMetadata, ObjectKey, StorageInfo, StoreResult};
+use futures::stream::BoxStream;
 use md5::{Digest as Md5Digest, Md5};
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -48,6 +50,20 @@ pub struct ListObjectsV2Page {
     pub objects: Vec<(String, FileMetadata)>,
     pub is_truncated: bool,
     pub next_continuation_token: Option<String>,
+}
+
+/// Response from `retrieve_stream()` — either a streaming or buffered response.
+pub enum RetrieveResponse {
+    /// Direct file streamed from backend (zero-copy, constant memory).
+    Streamed {
+        stream: BoxStream<'static, Result<Bytes, StorageError>>,
+        metadata: FileMetadata,
+    },
+    /// Delta-reconstructed file buffered in memory.
+    Buffered {
+        data: Vec<u8>,
+        metadata: FileMetadata,
+    },
 }
 
 impl From<EngineError> for crate::api::S3Error {
@@ -194,14 +210,15 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// returning the most recent version if both exist.
     async fn resolve_object_metadata(
         &self,
+        bucket: &str,
         prefix: &str,
         original_name: &str,
     ) -> Result<Option<FileMetadata>, StorageError> {
         let filename = original_name.rsplit('/').next().unwrap_or(original_name);
-        let delta = self.storage.get_delta_metadata(prefix, filename).await.ok();
+        let delta = self.storage.get_delta_metadata(bucket, prefix, filename).await.ok();
         let direct = self
             .storage
-            .get_direct_metadata(prefix, filename)
+            .get_direct_metadata(bucket, prefix, filename)
             .await
             .ok();
         match (delta, direct) {
@@ -216,19 +233,20 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// reference object, then retries the lookup.
     async fn resolve_metadata_with_migration(
         &self,
+        bucket: &str,
         deltaspace_id: &str,
         obj_key: &ObjectKey,
     ) -> Result<Option<FileMetadata>, EngineError> {
         let mut metadata = self
-            .resolve_object_metadata(deltaspace_id, &obj_key.full_key())
+            .resolve_object_metadata(bucket, deltaspace_id, &obj_key.full_key())
             .await?;
         if metadata.is_none()
             && self
-                .migrate_legacy_reference_object_if_needed(deltaspace_id, &obj_key.filename)
+                .migrate_legacy_reference_object_if_needed(bucket, deltaspace_id, &obj_key.filename)
                 .await?
         {
             metadata = self
-                .resolve_object_metadata(deltaspace_id, &obj_key.full_key())
+                .resolve_object_metadata(bucket, deltaspace_id, &obj_key.full_key())
                 .await?;
         }
         Ok(metadata)
@@ -274,10 +292,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         if !self.file_router.is_delta_eligible(&obj_key.filename) {
             debug!("File type not delta-eligible, storing directly");
             let _lock = self.acquire_prefix_lock(&deltaspace_id).await;
-            self.delete_delta_if_exists(&deltaspace_id, &obj_key.filename)
+            self.delete_delta_if_exists(bucket, &deltaspace_id, &obj_key.filename)
                 .await?;
             return self
                 .store_direct(
+                    bucket,
                     &obj_key,
                     &deltaspace_id,
                     data,
@@ -295,14 +314,15 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let _lock = self.acquire_prefix_lock(&deltaspace_id).await;
 
         // Check if deltaspace already has a reference (existing deltaspace)
-        let has_existing_reference = self.storage.has_reference(&deltaspace_id).await;
+        let has_existing_reference = self.storage.has_reference(bucket, &deltaspace_id).await;
 
         // Ensure deltaspace has an internal reference baseline.
         let ref_meta = if has_existing_reference {
-            self.storage.get_reference_metadata(&deltaspace_id).await?
+            self.storage.get_reference_metadata(bucket, &deltaspace_id).await?
         } else {
             debug!("No reference in deltaspace, creating baseline");
             self.set_reference_baseline(
+                bucket,
                 &obj_key,
                 &deltaspace_id,
                 data,
@@ -314,7 +334,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         };
 
         // Try to compute delta (bounded by semaphore to prevent CPU saturation)
-        let reference = self.get_reference_cached(&deltaspace_id).await?;
+        let reference = self.get_reference_cached(bucket, &deltaspace_id).await?;
         let _codec_permit = self.codec_semaphore.acquire().await.map_err(|_| {
             EngineError::Storage(StorageError::Other("codec semaphore closed".into()))
         })?;
@@ -338,12 +358,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 ratio, self.max_delta_ratio
             );
             // Clean up the reference we just created since we're not using it
-            self.cache.invalidate(&deltaspace_id);
-            self.storage.delete_reference(&deltaspace_id).await?;
-            self.delete_delta_if_exists(&deltaspace_id, &obj_key.filename)
+            let cache_key = format!("{}/{}", bucket, deltaspace_id);
+            self.cache.invalidate(&cache_key);
+            self.storage.delete_reference(bucket, &deltaspace_id).await?;
+            self.delete_delta_if_exists(bucket, &deltaspace_id, &obj_key.filename)
                 .await?;
             return self
                 .store_direct(
+                    bucket,
                     &obj_key,
                     &deltaspace_id,
                     data,
@@ -368,10 +390,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         );
         metadata.user_metadata = user_metadata;
 
-        self.delete_direct_if_exists(&deltaspace_id, &obj_key.filename)
+        self.delete_direct_if_exists(bucket, &deltaspace_id, &obj_key.filename)
             .await?;
         self.storage
-            .put_delta(&deltaspace_id, &obj_key.filename, &delta, &metadata)
+            .put_delta(bucket, &deltaspace_id, &obj_key.filename, &delta, &metadata)
             .await?;
 
         Ok(StoreResult {
@@ -383,6 +405,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Store the internal deltaspace reference baseline.
     async fn set_reference_baseline(
         &self,
+        bucket: &str,
         obj_key: &ObjectKey,
         deltaspace_id: &str,
         data: &[u8],
@@ -400,11 +423,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         );
 
         self.storage
-            .put_reference(deltaspace_id, data, &metadata)
+            .put_reference(bucket, deltaspace_id, data, &metadata)
             .await?;
 
-        // Cache the reference
-        self.cache.put(deltaspace_id, data.to_vec());
+        // Cache the reference (use bucket/prefix as cache key for uniqueness)
+        let cache_key = format!("{}/{}", bucket, deltaspace_id);
+        self.cache.put(&cache_key, data.to_vec());
 
         Ok(metadata)
     }
@@ -413,6 +437,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     #[allow(clippy::too_many_arguments)]
     async fn store_direct(
         &self,
+        bucket: &str,
         obj_key: &ObjectKey,
         deltaspace_id: &str,
         data: &[u8],
@@ -431,7 +456,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         metadata.user_metadata = user_metadata;
 
         self.storage
-            .put_direct(deltaspace_id, &obj_key.filename, data, &metadata)
+            .put_direct(bucket, deltaspace_id, &obj_key.filename, data, &metadata)
             .await?;
 
         Ok(StoreResult {
@@ -442,10 +467,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     async fn delete_delta_if_exists(
         &self,
+        bucket: &str,
         deltaspace_id: &str,
         filename: &str,
     ) -> Result<(), EngineError> {
-        match self.storage.delete_delta(deltaspace_id, filename).await {
+        match self.storage.delete_delta(bucket, deltaspace_id, filename).await {
             Ok(()) => Ok(()),
             Err(StorageError::NotFound(_)) => Ok(()),
             Err(other) => Err(other.into()),
@@ -454,10 +480,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     async fn delete_direct_if_exists(
         &self,
+        bucket: &str,
         deltaspace_id: &str,
         filename: &str,
     ) -> Result<(), EngineError> {
-        match self.storage.delete_direct(deltaspace_id, filename).await {
+        match self.storage.delete_direct(bucket, deltaspace_id, filename).await {
             Ok(()) => Ok(()),
             Err(StorageError::NotFound(_)) => Ok(()),
             Err(other) => Err(other.into()),
@@ -466,14 +493,15 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     async fn migrate_legacy_reference_object_if_needed(
         &self,
+        bucket: &str,
         deltaspace_id: &str,
         filename: &str,
     ) -> Result<bool, EngineError> {
-        if !self.storage.has_reference(deltaspace_id).await {
+        if !self.storage.has_reference(bucket, deltaspace_id).await {
             return Ok(false);
         }
 
-        let mut ref_meta = self.storage.get_reference_metadata(deltaspace_id).await?;
+        let mut ref_meta = self.storage.get_reference_metadata(bucket, deltaspace_id).await?;
         if ref_meta.original_name == Self::INTERNAL_REFERENCE_NAME {
             return Ok(false);
         }
@@ -481,7 +509,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             return Ok(false);
         }
 
-        let reference = self.get_reference_cached(deltaspace_id).await?;
+        let reference = self.get_reference_cached(bucket, deltaspace_id).await?;
         let _codec_permit = self.codec_semaphore.acquire().await.map_err(|_| {
             EngineError::Storage(StorageError::Other("codec semaphore closed".into()))
         })?;
@@ -499,27 +527,55 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             ref_meta.content_type.clone(),
         );
 
-        self.delete_direct_if_exists(deltaspace_id, filename)
+        self.delete_direct_if_exists(bucket, deltaspace_id, filename)
             .await?;
         self.storage
-            .put_delta(deltaspace_id, filename, &delta, &delta_meta)
+            .put_delta(bucket, deltaspace_id, filename, &delta, &delta_meta)
             .await?;
 
         ref_meta.original_name = Self::INTERNAL_REFERENCE_NAME.to_string();
         self.storage
-            .put_reference_metadata(deltaspace_id, &ref_meta)
+            .put_reference_metadata(bucket, deltaspace_id, &ref_meta)
             .await?;
 
         Ok(true)
     }
 
-    /// Retrieve an object, reconstructing from delta if necessary
+    /// Retrieve an object fully buffered, reconstructing from delta if necessary.
+    ///
+    /// For callers that need the full data in memory (e.g. copy_object).
+    /// Delegates to `retrieve_stream()` and collects any streamed response.
     #[instrument(skip(self))]
     pub async fn retrieve(
         &self,
         bucket: &str,
         key: &str,
     ) -> Result<(Vec<u8>, FileMetadata), EngineError> {
+        use futures::TryStreamExt;
+
+        match self.retrieve_stream(bucket, key).await? {
+            RetrieveResponse::Buffered { data, metadata } => Ok((data, metadata)),
+            RetrieveResponse::Streamed { stream, metadata } => {
+                let chunks: Vec<Bytes> = stream
+                    .map_err(EngineError::Storage)
+                    .try_collect()
+                    .await?;
+                let data: Vec<u8> = chunks.into_iter().flat_map(|b| b.to_vec()).collect();
+                Ok((data, metadata))
+            }
+        }
+    }
+
+    /// Retrieve an object with streaming support for direct files.
+    ///
+    /// Direct files are streamed from the backend without buffering (constant memory).
+    /// Delta/reference files are reconstructed in memory (buffering required by xdelta3).
+    #[instrument(skip(self))]
+    pub async fn retrieve_stream(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<RetrieveResponse, EngineError> {
         let obj_key = ObjectKey::parse(bucket, key);
         obj_key
             .validate_object()
@@ -527,7 +583,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let deltaspace_id = obj_key.deltaspace_id();
 
         let metadata = self
-            .resolve_metadata_with_migration(&deltaspace_id, &obj_key)
+            .resolve_metadata_with_migration(bucket, &deltaspace_id, &obj_key)
             .await?
             .ok_or_else(|| EngineError::NotFound(obj_key.full_key()))?;
 
@@ -538,27 +594,63 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             metadata.storage_info.label()
         );
 
-        // Get data based on storage type
-        let data = match &metadata.storage_info {
-            StorageInfo::Reference { .. } => self.storage.get_reference(&deltaspace_id).await?,
+        match &metadata.storage_info {
             StorageInfo::Direct => {
-                self.storage
-                    .get_direct(&deltaspace_id, &obj_key.filename)
-                    .await?
+                // Stream directly from backend — no buffering needed
+                let stream = self
+                    .storage
+                    .get_direct_stream(bucket, &deltaspace_id, &obj_key.filename)
+                    .await?;
+                debug!("Streaming direct file for {}", obj_key.full_key());
+                Ok(RetrieveResponse::Streamed { stream, metadata })
+            }
+            StorageInfo::Reference { .. } | StorageInfo::Delta { .. } => {
+                let data = self
+                    .retrieve_buffered(bucket, &deltaspace_id, &obj_key, &metadata)
+                    .await?;
+                debug!(
+                    "Retrieved (buffered) {} bytes for {}",
+                    data.len(),
+                    obj_key.full_key()
+                );
+                Ok(RetrieveResponse::Buffered { data, metadata })
+            }
+        }
+    }
+
+    /// Fetch and reconstruct a reference or delta object, with checksum verification.
+    async fn retrieve_buffered(
+        &self,
+        bucket: &str,
+        deltaspace_id: &str,
+        obj_key: &ObjectKey,
+        metadata: &FileMetadata,
+    ) -> Result<Vec<u8>, EngineError> {
+        let data = match &metadata.storage_info {
+            StorageInfo::Reference { .. } => {
+                self.storage.get_reference(bucket, deltaspace_id).await?
             }
             StorageInfo::Delta { .. } => {
-                // Reconstruct from reference + delta (bounded concurrency)
-                let reference = self.get_reference_cached(&deltaspace_id).await?;
+                let reference = self.get_reference_cached(bucket, deltaspace_id).await?;
                 let delta = self
                     .storage
-                    .get_delta(&deltaspace_id, &obj_key.filename)
+                    .get_delta(bucket, deltaspace_id, &obj_key.filename)
                     .await?;
-                let _codec_permit = self.codec_semaphore.acquire().await.map_err(|_| {
-                    EngineError::Storage(StorageError::Other("codec semaphore closed".into()))
-                })?;
+                let _codec_permit =
+                    self.codec_semaphore.acquire().await.map_err(|_| {
+                        EngineError::Storage(StorageError::Other(
+                            "codec semaphore closed".into(),
+                        ))
+                    })?;
                 let result = self.codec.decode(&reference, &delta)?;
                 drop(_codec_permit);
                 result
+            }
+            StorageInfo::Direct => {
+                // Should not reach here — callers route Direct to streaming path
+                self.storage
+                    .get_direct(bucket, deltaspace_id, &obj_key.filename)
+                    .await?
             }
         };
 
@@ -580,9 +672,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             }
         }
 
-        debug!("Retrieved {} bytes for {}", data.len(), obj_key.full_key());
-
-        Ok((data, metadata))
+        Ok(data)
     }
 
     /// Retrieve object metadata without reading object bodies.
@@ -594,69 +684,60 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
         let deltaspace_id = obj_key.deltaspace_id();
 
-        self.resolve_metadata_with_migration(&deltaspace_id, &obj_key)
+        self.resolve_metadata_with_migration(bucket, &deltaspace_id, &obj_key)
             .await?
             .ok_or_else(|| EngineError::NotFound(obj_key.full_key()))
     }
 
-    /// List objects matching a prefix
-    #[instrument(skip(self))]
-    pub async fn list(&self, bucket: &str, prefix: &str) -> Result<Vec<FileMetadata>, EngineError> {
-        let page = self.list_objects_v2(bucket, prefix, u32::MAX, None).await?;
-        Ok(page.objects.into_iter().map(|(_key, meta)| meta).collect())
-    }
-
-    /// Returns `true` if a deltaspace could contain keys matching the given prefix.
+    /// Returns `true` if a local prefix (bucket-relative) could contain keys
+    /// matching the given user prefix.
     /// Used to skip entire deltaspaces during listing, avoiding unnecessary I/O.
-    fn deltaspace_could_match(deltaspace_id: &str, prefix: &str) -> bool {
+    fn local_prefix_could_match(local_prefix: &str, prefix: &str) -> bool {
         if prefix.is_empty() {
             return true;
         }
-        if deltaspace_id.is_empty() {
+        if local_prefix.is_empty() {
             // Root-level keys are bare filenames (no '/'). They can only match
             // a prefix that doesn't contain '/' (e.g. prefix="app" matches "app.zip").
             return !prefix.contains('/');
         }
-        let dsid_slash = format!("{}/", deltaspace_id);
-        // Include if: the deltaspace path starts with the prefix (prefix is broader),
-        // OR the prefix drills into this deltaspace (prefix is narrower/equal).
-        dsid_slash.starts_with(prefix) || prefix.starts_with(&dsid_slash)
+        let lp_slash = format!("{}/", local_prefix);
+        // Include if: the local prefix starts with the user prefix (prefix is broader),
+        // OR the user prefix drills into this local prefix (prefix is narrower/equal).
+        lp_slash.starts_with(prefix) || prefix.starts_with(&lp_slash)
     }
 
-    /// ListObjectsV2-style listing across all deltaspaces, with simple pagination.
+    /// ListObjectsV2-style listing scoped to a real bucket.
     #[instrument(skip(self))]
     pub async fn list_objects_v2(
         &self,
-        _bucket: &str,
+        bucket: &str,
         prefix: &str,
         max_keys: u32,
         continuation_token: Option<&str>,
     ) -> Result<ListObjectsV2Page, EngineError> {
         ObjectKey::validate_prefix(prefix)
             .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
-        let deltaspace_ids = self.storage.list_deltaspaces().await?;
+        let deltaspace_ids = self.storage.list_deltaspaces(bucket).await?;
         let mut latest: std::collections::HashMap<String, FileMetadata> =
             std::collections::HashMap::new();
 
-        for deltaspace_id in deltaspace_ids {
+        for local_prefix in deltaspace_ids {
             // Skip deltaspaces that cannot produce keys matching the requested prefix.
-            if !Self::deltaspace_could_match(&deltaspace_id, prefix) {
+            if !Self::local_prefix_could_match(&local_prefix, prefix) {
                 continue;
             }
 
-            let metas = self.storage.scan_deltaspace(&deltaspace_id).await?;
-
-            // deltaspace_id is now the actual prefix (empty string for root-level files)
-            let key_prefix = deltaspace_id.as_str();
+            let metas = self.storage.scan_deltaspace(bucket, &local_prefix).await?;
 
             for meta in metas {
                 if matches!(meta.storage_info, StorageInfo::Reference { .. }) {
                     continue;
                 }
-                let full_key = if key_prefix.is_empty() {
+                let full_key = if local_prefix.is_empty() {
                     meta.original_name.clone()
                 } else {
-                    format!("{}/{}", key_prefix, meta.original_name)
+                    format!("{}/{}", local_prefix, meta.original_name)
                 };
                 match latest.entry(full_key) {
                     std::collections::hash_map::Entry::Vacant(entry) => {
@@ -705,6 +786,28 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         })
     }
 
+    // === Bucket operations (delegate to storage) ===
+
+    /// Create a real bucket on the storage backend.
+    pub async fn create_bucket(&self, bucket: &str) -> Result<(), EngineError> {
+        Ok(self.storage.create_bucket(bucket).await?)
+    }
+
+    /// Delete a real bucket on the storage backend (must be empty).
+    pub async fn delete_bucket(&self, bucket: &str) -> Result<(), EngineError> {
+        Ok(self.storage.delete_bucket(bucket).await?)
+    }
+
+    /// List all real buckets from the storage backend.
+    pub async fn list_buckets(&self) -> Result<Vec<String>, EngineError> {
+        Ok(self.storage.list_buckets().await?)
+    }
+
+    /// Check if a real bucket exists on the storage backend.
+    pub async fn head_bucket(&self, bucket: &str) -> Result<bool, EngineError> {
+        Ok(self.storage.head_bucket(bucket).await?)
+    }
+
     /// Delete an object
     #[instrument(skip(self))]
     pub async fn delete(&self, bucket: &str, key: &str) -> Result<(), EngineError> {
@@ -721,7 +824,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let _lock = self.acquire_prefix_lock(&deltaspace_id).await;
 
         let metadata = self
-            .resolve_metadata_with_migration(&deltaspace_id, &obj_key)
+            .resolve_metadata_with_migration(bucket, &deltaspace_id, &obj_key)
             .await?
             .ok_or_else(|| EngineError::NotFound(obj_key.full_key()))?;
 
@@ -729,12 +832,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         match &metadata.storage_info {
             StorageInfo::Direct => {
                 self.storage
-                    .delete_direct(&deltaspace_id, &obj_key.filename)
+                    .delete_direct(bucket, &deltaspace_id, &obj_key.filename)
                     .await?;
             }
             StorageInfo::Delta { .. } => {
                 self.storage
-                    .delete_delta(&deltaspace_id, &obj_key.filename)
+                    .delete_delta(bucket, &deltaspace_id, &obj_key.filename)
                     .await?;
             }
             StorageInfo::Reference { .. } => {
@@ -745,13 +848,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
 
         // If this deltaspace no longer has any objects, clean up its reference baseline.
-        let remaining = self.storage.scan_deltaspace(&deltaspace_id).await?;
+        let remaining = self.storage.scan_deltaspace(bucket, &deltaspace_id).await?;
         let has_objects = remaining
             .iter()
             .any(|m| !matches!(m.storage_info, StorageInfo::Reference { .. }));
-        if !has_objects && self.storage.has_reference(&deltaspace_id).await {
-            self.cache.invalidate(&deltaspace_id);
-            self.storage.delete_reference(&deltaspace_id).await?;
+        if !has_objects && self.storage.has_reference(bucket, &deltaspace_id).await {
+            let cache_key = format!("{}/{}", bucket, deltaspace_id);
+            self.cache.invalidate(&cache_key);
+            self.storage.delete_reference(bucket, &deltaspace_id).await?;
         }
 
         // Release the per-prefix lock before cleanup so strong_count drops to 1.
@@ -763,21 +867,23 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     }
 
     /// Get reference with caching. Returns `Bytes` for zero-copy sharing.
-    async fn get_reference_cached(&self, deltaspace_id: &str) -> Result<bytes::Bytes, EngineError> {
+    async fn get_reference_cached(&self, bucket: &str, deltaspace_id: &str) -> Result<bytes::Bytes, EngineError> {
+        let cache_key = format!("{}/{}", bucket, deltaspace_id);
+
         // Check cache first (Bytes clone is a cheap refcount increment)
-        if let Some(data) = self.cache.get(deltaspace_id) {
+        if let Some(data) = self.cache.get(&cache_key) {
             return Ok(data);
         }
 
         // Load from storage
         let data = self
             .storage
-            .get_reference(deltaspace_id)
+            .get_reference(bucket, deltaspace_id)
             .await
             .map_err(|_| EngineError::MissingReference(deltaspace_id.to_string()))?;
 
         // Cache it (Vec<u8> is moved into Bytes inside the cache)
-        self.cache.put(deltaspace_id, data.clone());
+        self.cache.put(&cache_key, data.clone());
 
         Ok(data.into())
     }
@@ -788,22 +894,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_deltaspace_could_match() {
+    fn test_local_prefix_could_match() {
         // Empty prefix matches everything
         assert!(
-            DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match("releases/v1.0", "")
+            DeltaGliderEngine::<FilesystemBackend>::local_prefix_could_match("releases/v1.0", "")
         );
-        assert!(DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match("", ""));
+        assert!(DeltaGliderEngine::<FilesystemBackend>::local_prefix_could_match("", ""));
 
         // Prefix drills into a deltaspace
         assert!(
-            DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match(
+            DeltaGliderEngine::<FilesystemBackend>::local_prefix_could_match(
                 "releases/v1.0",
                 "releases/v1.0/"
             )
         );
         assert!(
-            DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match(
+            DeltaGliderEngine::<FilesystemBackend>::local_prefix_could_match(
                 "releases/v1.0",
                 "releases/v1.0/app"
             )
@@ -811,31 +917,38 @@ mod tests {
 
         // Prefix is broader than deltaspace
         assert!(
-            DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match(
+            DeltaGliderEngine::<FilesystemBackend>::local_prefix_could_match(
                 "releases/v1.0",
                 "releases/"
             )
         );
         assert!(
-            DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match("releases/v1.0", "rel")
+            DeltaGliderEngine::<FilesystemBackend>::local_prefix_could_match(
+                "releases/v1.0",
+                "rel"
+            )
         );
 
         // No match — disjoint paths
         assert!(
-            !DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match(
+            !DeltaGliderEngine::<FilesystemBackend>::local_prefix_could_match(
                 "releases/v1.0",
                 "backups/"
             )
         );
         assert!(
-            !DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match(
+            !DeltaGliderEngine::<FilesystemBackend>::local_prefix_could_match(
                 "releases/v1.0",
                 "staging/"
             )
         );
 
-        // Root deltaspace (empty dsid) — matches only prefixes without '/'
-        assert!(DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match("", "app"));
-        assert!(!DeltaGliderEngine::<FilesystemBackend>::deltaspace_could_match("", "releases/"));
+        // Root local prefix (empty) — matches only prefixes without '/'
+        assert!(DeltaGliderEngine::<FilesystemBackend>::local_prefix_could_match("", "app"));
+        assert!(!DeltaGliderEngine::<FilesystemBackend>::local_prefix_could_match(
+            "",
+            "releases/"
+        ));
     }
+
 }

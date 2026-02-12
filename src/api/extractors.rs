@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 /// Validated bucket extractor
 ///
-/// Automatically validates that the bucket in the path matches the configured
-/// default bucket. Returns `S3Error::NoSuchBucket` if validation fails.
+/// Validates that the bucket name in the path is non-empty and syntactically
+/// valid. Any bucket name is accepted (multi-bucket support).
 ///
 /// # Example
 /// ```ignore
@@ -51,9 +51,10 @@ where
             .await
             .map_err(|_| S3Error::InvalidArgument("Invalid bucket path".to_string()))?;
 
-        let app_state = Arc::<AppState>::from_ref(state);
-        if bucket != app_state.default_bucket {
-            return Err(S3Error::NoSuchBucket(bucket));
+        if bucket.is_empty() {
+            return Err(S3Error::InvalidArgument(
+                "Bucket name cannot be empty".to_string(),
+            ));
         }
 
         Ok(ValidatedBucket(bucket))
@@ -62,8 +63,8 @@ where
 
 /// Validated bucket and key extractor
 ///
-/// Automatically validates the bucket and normalizes the key by removing
-/// leading slashes. Returns `S3Error::NoSuchBucket` if bucket validation fails.
+/// Validates the bucket name and normalizes the key by removing leading
+/// slashes. Any bucket name is accepted (multi-bucket support).
 ///
 /// # Example
 /// ```ignore
@@ -93,9 +94,10 @@ where
             .await
             .map_err(|_| S3Error::InvalidArgument("Invalid bucket/key path".to_string()))?;
 
-        let app_state = Arc::<AppState>::from_ref(state);
-        if bucket != app_state.default_bucket {
-            return Err(S3Error::NoSuchBucket(bucket));
+        if bucket.is_empty() {
+            return Err(S3Error::InvalidArgument(
+                "Bucket name cannot be empty".to_string(),
+            ));
         }
 
         // Normalize key by removing leading slashes

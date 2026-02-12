@@ -229,7 +229,6 @@ impl TestProxyServer {
                 "DELTAGLIDER_PROXY_LISTEN_ADDR",
                 format!("127.0.0.1:{}", port),
             )
-            .env("DELTAGLIDER_PROXY_S3_BUCKET", MINIO_BUCKET)
             .env("DELTAGLIDER_PROXY_S3_ENDPOINT", MINIO_ENDPOINT)
             .env("DELTAGLIDER_PROXY_S3_REGION", "us-east-1")
             .env("DELTAGLIDER_PROXY_S3_FORCE_PATH_STYLE", "true")

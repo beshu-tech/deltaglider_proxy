@@ -7,5 +7,5 @@ mod file_router;
 
 pub use cache::ReferenceCache;
 pub use codec::{CodecError, DeltaCodec};
-pub use engine::{DeltaGliderEngine, DynEngine};
+pub use engine::{DeltaGliderEngine, DynEngine, RetrieveResponse};
 pub use file_router::{CompressionStrategy, FileRouter};

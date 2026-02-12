@@ -2,11 +2,12 @@
 
 mod demo;
 
-use axum::{extract::DefaultBodyLimit, routing::get, Router};
+use axum::{extract::DefaultBodyLimit, middleware, routing::get, Router};
 use clap::Parser;
+use deltaglider_proxy::api::auth::{sigv4_auth_middleware, AuthConfig};
 use deltaglider_proxy::api::handlers::{
-    create_bucket, delete_bucket, delete_object, delete_objects, get_object, get_stats,
-    head_bucket, head_object, health_check, list_buckets, list_objects, post_object,
+    bucket_get_handler, create_bucket, delete_bucket, delete_object, delete_objects, get_object,
+    get_stats, head_bucket, head_object, health_check, list_buckets, post_object,
     put_object_or_copy, AppState,
 };
 use deltaglider_proxy::config::{BackendConfig, Config};
@@ -85,12 +86,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         BackendConfig::S3 {
             endpoint,
-            bucket,
             region,
             ..
         } => {
             info!("  Backend: S3");
-            info!("  Bucket: {}", bucket);
             info!("  Region: {}", region);
             if let Some(ep) = endpoint {
                 info!("  Endpoint: {}", ep);
@@ -108,6 +107,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         warn!("  SHA256 verification on read is DISABLED — data integrity is not checked on GET");
     }
 
+    if config.auth_enabled() {
+        info!("  Authentication: SigV4 ENABLED (access key: {})", config.access_key_id.as_deref().unwrap_or(""));
+    } else {
+        warn!("  Authentication: DISABLED (open access) — set DELTAGLIDER_PROXY_ACCESS_KEY_ID and DELTAGLIDER_PROXY_SECRET_ACCESS_KEY to enable");
+    }
+
     // Check for orphaned data files from interrupted writes (filesystem only)
     if let BackendConfig::Filesystem { ref path } = config.backend {
         if let Ok(backend) = FilesystemBackend::new(path.clone()).await {
@@ -122,10 +127,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         warn!("  xdelta3 CLI: NOT found — legacy DeltaGlider CLI deltas cannot be decoded");
     }
+
+    // Ensure the default bucket exists on the storage backend
+    match engine.create_bucket(&config.default_bucket).await {
+        Ok(()) => info!("  Default bucket '{}' created", config.default_bucket),
+        Err(e) => {
+            // AlreadyExists is fine — bucket was already there
+            let msg = e.to_string();
+            if msg.contains("already exists") || msg.contains("AlreadyExists") || msg.contains("Already") {
+                info!("  Default bucket '{}' already exists", config.default_bucket);
+            } else {
+                warn!("  Failed to create default bucket '{}': {}", config.default_bucket, e);
+            }
+        }
+    }
+
     let state = Arc::new(AppState {
         engine,
         default_bucket: config.default_bucket.clone(),
     });
+
+    // Build auth config (None if credentials not configured)
+    let auth_config: Option<Arc<AuthConfig>> =
+        if let (Some(ref key_id), Some(ref secret)) =
+            (&config.access_key_id, &config.secret_access_key)
+        {
+            Some(Arc::new(AuthConfig {
+                access_key_id: key_id.clone(),
+                secret_access_key: secret.clone(),
+            }))
+        } else {
+            None
+        };
 
     // Build router with S3-style paths
     // S3 API paths:
@@ -157,7 +190,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Bucket operations (without trailing slash)
         .route(
             "/:bucket",
-            get(list_objects)
+            get(bucket_get_handler)
                 .put(create_bucket)
                 .delete(delete_bucket)
                 .head(head_bucket)
@@ -166,7 +199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Bucket operations (with trailing slash)
         .route(
             "/:bucket/",
-            get(list_objects)
+            get(bucket_get_handler)
                 .put(create_bucket)
                 .delete(delete_bucket)
                 .head(head_bucket)
@@ -174,6 +207,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
+        // SigV4 authentication (no-op when auth_config is None)
+        .layer(middleware::from_fn(sigv4_auth_middleware))
+        .layer(axum::Extension(auth_config))
         // Increase body size limit to match max_object_size config (default 2MB is too small)
         .layer(DefaultBodyLimit::max(config.max_object_size as usize))
         .with_state(state);

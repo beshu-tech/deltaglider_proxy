@@ -1,4 +1,7 @@
+import { Breadcrumb as AntBreadcrumb } from 'antd';
+import { DatabaseOutlined } from '@ant-design/icons';
 import { prefixSegments } from '../utils';
+import { getBucket } from '../s3client';
 
 interface Props {
   prefix: string;
@@ -8,25 +11,29 @@ interface Props {
 export default function Breadcrumb({ prefix, onNavigate }: Props) {
   const segments = prefixSegments(prefix);
 
-  return (
-    <nav className="breadcrumb">
-      <span
-        className={`breadcrumb-item ${prefix === '' ? 'active' : 'clickable'}`}
-        onClick={() => prefix && onNavigate('')}
-      >
-        &#128463; Root
-      </span>
-      {segments.map((seg) => (
-        <span key={seg.prefix}>
-          <span className="breadcrumb-sep">/</span>
-          <span
-            className={`breadcrumb-item ${seg.prefix === prefix ? 'active' : 'clickable'}`}
-            onClick={() => seg.prefix !== prefix && onNavigate(seg.prefix)}
-          >
-            {seg.label}
-          </span>
+  const items = [
+    {
+      title: (
+        <span
+          onClick={() => prefix && onNavigate('')}
+          style={{ cursor: prefix ? 'pointer' : 'default' }}
+        >
+          <DatabaseOutlined style={{ marginRight: 6 }} />
+          {getBucket()}
         </span>
-      ))}
-    </nav>
-  );
+      ),
+    },
+    ...segments.map((seg) => ({
+      title: (
+        <span
+          onClick={() => seg.prefix !== prefix && onNavigate(seg.prefix)}
+          style={{ cursor: seg.prefix !== prefix ? 'pointer' : 'default' }}
+        >
+          {seg.label}
+        </span>
+      ),
+    })),
+  ];
+
+  return <AntBreadcrumb items={items} />;
 }

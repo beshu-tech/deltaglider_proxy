@@ -1,0 +1,12 @@
+/* ── Self-hosted Manrope (variable weight 200–800) ── */
+@font-face {
+  font-family: 'Manrope';
+  src: url('/fonts/manrope-variable.woff2') format('woff2');
+  font-weight: 200 800;
+  font-style: normal;
+  font-display: swap;
+}
+
+body {
+  margin: 0;
+}

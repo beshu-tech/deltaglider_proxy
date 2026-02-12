@@ -37,6 +37,12 @@ pub enum S3Error {
 
     #[error("NotImplemented: {0}")]
     NotImplemented(String),
+
+    #[error("AccessDenied: Access Denied")]
+    AccessDenied,
+
+    #[error("SignatureDoesNotMatch: The request signature we calculated does not match the signature you provided.")]
+    SignatureDoesNotMatch,
 }
 
 impl S3Error {
@@ -53,6 +59,8 @@ impl S3Error {
             S3Error::InvalidRequest(_) => "InvalidRequest",
             S3Error::MalformedXML => "MalformedXML",
             S3Error::NotImplemented(_) => "NotImplemented",
+            S3Error::AccessDenied => "AccessDenied",
+            S3Error::SignatureDoesNotMatch => "SignatureDoesNotMatch",
         }
     }
 
@@ -69,6 +77,8 @@ impl S3Error {
             S3Error::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             S3Error::MalformedXML => StatusCode::BAD_REQUEST,
             S3Error::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
+            S3Error::AccessDenied => StatusCode::FORBIDDEN,
+            S3Error::SignatureDoesNotMatch => StatusCode::FORBIDDEN,
         }
     }
 
@@ -108,6 +118,9 @@ impl From<crate::storage::StorageError> for S3Error {
     fn from(err: crate::storage::StorageError) -> Self {
         match err {
             crate::storage::StorageError::NotFound(key) => S3Error::NoSuchKey(key),
+            crate::storage::StorageError::BucketNotFound(b) => S3Error::NoSuchBucket(b),
+            crate::storage::StorageError::BucketNotEmpty(b) => S3Error::BucketNotEmpty(b),
+            crate::storage::StorageError::AlreadyExists(b) => S3Error::BucketAlreadyExists(b),
             crate::storage::StorageError::TooLarge { size, max } => {
                 S3Error::EntityTooLarge { size, max }
             }

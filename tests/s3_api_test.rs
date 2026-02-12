@@ -1109,16 +1109,26 @@ async fn test_create_bucket_default() {
 }
 
 #[tokio::test]
-async fn test_create_bucket_wrong_name() {
+async fn test_create_bucket_any_name() {
     let server = TestServer::filesystem().await;
     let client = server.s3_client().await;
 
+    // Multi-bucket mode: creating any bucket should succeed
     let result = client
         .create_bucket()
-        .bucket("wrong-bucket-name")
+        .bucket("custom-bucket")
         .send()
         .await;
-    assert!(result.is_err(), "CREATE non-default bucket should fail");
+    assert!(result.is_ok(), "CREATE any bucket should succeed in multi-bucket mode");
+
+    // Verify the new bucket appears in list_buckets
+    let buckets = client.list_buckets().send().await.unwrap();
+    let names: Vec<&str> = buckets
+        .buckets()
+        .iter()
+        .map(|b| b.name().unwrap_or(""))
+        .collect();
+    assert!(names.contains(&"custom-bucket"), "New bucket should appear in list: {:?}", names);
 }
 
 #[tokio::test]

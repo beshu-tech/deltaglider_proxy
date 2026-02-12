@@ -27,7 +27,7 @@ pub struct Config {
     #[serde(default = "default_cache_size_mb")]
     pub cache_size_mb: usize,
 
-    /// Default bucket name (single-bucket mode)
+    /// Default bucket name (initial bucket, always available)
     #[serde(default = "default_bucket")]
     pub default_bucket: String,
 
@@ -36,6 +36,17 @@ pub struct Config {
     /// the storage backend is trusted and bit-rot detection is not needed.
     #[serde(default = "default_verify_on_read")]
     pub verify_on_read: bool,
+
+    /// Proxy access key ID for SigV4 authentication.
+    /// When both access_key_id and secret_access_key are set, all requests
+    /// must be SigV4-signed with these credentials. When unset, open access.
+    #[serde(default)]
+    pub access_key_id: Option<String>,
+
+    /// Proxy secret access key for SigV4 authentication.
+    /// Must be set together with access_key_id.
+    #[serde(default)]
+    pub secret_access_key: Option<String>,
 }
 
 /// Storage backend configuration
@@ -54,9 +65,6 @@ pub enum BackendConfig {
         /// If not specified, uses AWS default endpoint
         #[serde(default)]
         endpoint: Option<String>,
-
-        /// S3 bucket name for storing DeltaGlider objects
-        bucket: String,
 
         /// AWS region
         #[serde(default = "default_region")]
@@ -127,6 +135,8 @@ impl Default for Config {
             cache_size_mb: default_cache_size_mb(),
             default_bucket: default_bucket(),
             verify_on_read: default_verify_on_read(),
+            access_key_id: None,
+            secret_access_key: None,
         }
     }
 }
@@ -151,10 +161,11 @@ impl Config {
         }
 
         // Check for S3 backend configuration
-        if let Ok(bucket) = std::env::var("DELTAGLIDER_PROXY_S3_BUCKET") {
+        if std::env::var("DELTAGLIDER_PROXY_S3_ENDPOINT").is_ok()
+            || std::env::var("DELTAGLIDER_PROXY_S3_REGION").is_ok()
+        {
             config.backend = BackendConfig::S3 {
                 endpoint: std::env::var("DELTAGLIDER_PROXY_S3_ENDPOINT").ok(),
-                bucket,
                 region: std::env::var("DELTAGLIDER_PROXY_S3_REGION")
                     .unwrap_or_else(|_| "us-east-1".to_string()),
                 force_path_style: std::env::var("DELTAGLIDER_PROXY_S3_FORCE_PATH_STYLE")
@@ -195,6 +206,10 @@ impl Config {
             config.verify_on_read = verify != "false" && verify != "0";
         }
 
+        // Proxy authentication credentials
+        config.access_key_id = std::env::var("DELTAGLIDER_PROXY_ACCESS_KEY_ID").ok();
+        config.secret_access_key = std::env::var("DELTAGLIDER_PROXY_SECRET_ACCESS_KEY").ok();
+
         config
     }
 
@@ -223,13 +238,11 @@ impl Config {
         Self::from_env()
     }
 
-    /// Get the data directory (for filesystem backend compatibility)
-    pub fn data_dir(&self) -> PathBuf {
-        match &self.backend {
-            BackendConfig::Filesystem { path } => path.clone(),
-            BackendConfig::S3 { .. } => PathBuf::from("/tmp/deltaglider_proxy-cache"),
-        }
+    /// Returns true if SigV4 authentication is enabled (both credentials are set).
+    pub fn auth_enabled(&self) -> bool {
+        self.access_key_id.is_some() && self.secret_access_key.is_some()
     }
+
 }
 
 /// Configuration errors
@@ -284,7 +297,6 @@ mod tests {
             [backend]
             type = "s3"
             endpoint = "http://localhost:9000"
-            bucket = "deltaglider-data"
             region = "us-east-1"
             force_path_style = true
         "#;
@@ -294,13 +306,11 @@ mod tests {
         match config.backend {
             BackendConfig::S3 {
                 endpoint,
-                bucket,
                 region,
                 force_path_style,
                 ..
             } => {
                 assert_eq!(endpoint, Some("http://localhost:9000".to_string()));
-                assert_eq!(bucket, "deltaglider-data");
                 assert_eq!(region, "us-east-1");
                 assert!(force_path_style);
             }

@@ -20,3 +20,8 @@ export interface StorageStats {
   total_stored_size: number;
   savings_percentage: number;
 }
+
+export interface BucketInfo {
+  name: string;
+  creationDate: string;
+}

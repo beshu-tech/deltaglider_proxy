@@ -131,7 +131,7 @@ demo/s3-browser/ui/             # React demo UI source (Vite + TypeScript)
 ```rust
 /// S3 object key parsed into components
 pub struct ObjectKey {
-    pub bucket: String,        // Virtual bucket (we use single-bucket mode)
+    pub bucket: String,        // Real S3 bucket name
     pub prefix: String,        // Parent path = DeltaSpace identifier
     pub filename: String,      // Object name
 }

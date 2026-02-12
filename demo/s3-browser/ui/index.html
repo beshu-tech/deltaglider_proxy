@@ -1,11 +1,18 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" class="dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>DeltaGlider S3 Browser</title>
+    <title>DeltaGlider Proxy</title>
   </head>
   <body>
+    <script>
+      // Prevent theme flash: apply saved theme before first paint
+      (function() {
+        var t = localStorage.getItem('dg-theme');
+        if (t === 'light') document.documentElement.classList.remove('dark');
+      })();
+    </script>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

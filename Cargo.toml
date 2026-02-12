@@ -27,8 +27,9 @@ async-trait = "0.1"
 # Delta compression
 xdelta3 = "0.1.5"
 
-# Hashing
+# Hashing & HMAC (sha2 + hmac used for SigV4 verification)
 sha2 = "0.10"
+hmac = "0.12"
 md-5 = "0.10"
 hex = "0.4"
 
@@ -43,6 +44,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 lru = "0.16"
 parking_lot = "0.12"
 bytes = "1"
+futures = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 urlencoding = "2"
 tempfile = "3"

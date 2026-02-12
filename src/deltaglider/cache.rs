@@ -97,26 +97,4 @@ impl ReferenceCache {
         }
     }
 
-    /// Clear the entire cache
-    pub fn clear(&self) {
-        let mut inner = self.inner.lock();
-        inner.cache.clear();
-        inner.current_size = 0;
-        debug!("Cache cleared");
-    }
-
-    /// Get current cache size in bytes
-    pub fn size(&self) -> usize {
-        self.inner.lock().current_size
-    }
-
-    /// Get number of entries in cache
-    pub fn len(&self) -> usize {
-        self.inner.lock().cache.len()
-    }
-
-    /// Check if cache is empty
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
 }
