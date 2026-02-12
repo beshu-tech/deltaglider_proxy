@@ -242,7 +242,6 @@ impl Config {
     pub fn auth_enabled(&self) -> bool {
         self.access_key_id.is_some() && self.secret_access_key.is_some()
     }
-
 }
 
 /// Configuration errors

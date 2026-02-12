@@ -1,9 +1,9 @@
 //! Filesystem-based storage backend with per-file metadata sidecars
 
 use super::traits::{StorageBackend, StorageError};
-use bytes::Bytes;
 use crate::types::FileMetadata;
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::stream::BoxStream;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -106,7 +106,8 @@ impl FilesystemBackend {
 
     /// Get the path for reference metadata
     fn reference_meta_path(&self, bucket: &str, prefix: &str) -> PathBuf {
-        self.deltaspace_dir(bucket, prefix).join("reference.bin.meta")
+        self.deltaspace_dir(bucket, prefix)
+            .join("reference.bin.meta")
     }
 
     /// Get the path for a delta file
@@ -488,7 +489,11 @@ impl StorageBackend for FilesystemBackend {
     }
 
     #[instrument(skip(self))]
-    async fn get_reference_metadata(&self, bucket: &str, prefix: &str) -> Result<FileMetadata, StorageError> {
+    async fn get_reference_metadata(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<FileMetadata, StorageError> {
         let meta_path = self.reference_meta_path(bucket, prefix);
         self.read_metadata(&meta_path).await
     }
@@ -521,7 +526,12 @@ impl StorageBackend for FilesystemBackend {
     // === Delta operations ===
 
     #[instrument(skip(self))]
-    async fn get_delta(&self, bucket: &str, prefix: &str, filename: &str) -> Result<Vec<u8>, StorageError> {
+    async fn get_delta(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<Vec<u8>, StorageError> {
         self.get_object_file(
             &self.delta_path(bucket, prefix, filename),
             "delta",
@@ -564,7 +574,12 @@ impl StorageBackend for FilesystemBackend {
     }
 
     #[instrument(skip(self))]
-    async fn delete_delta(&self, bucket: &str, prefix: &str, filename: &str) -> Result<(), StorageError> {
+    async fn delete_delta(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<(), StorageError> {
         self.delete_object_file(
             &self.delta_path(bucket, prefix, filename),
             &self.delta_meta_path(bucket, prefix, filename),
@@ -578,7 +593,12 @@ impl StorageBackend for FilesystemBackend {
     // === Direct operations ===
 
     #[instrument(skip(self))]
-    async fn get_direct(&self, bucket: &str, prefix: &str, filename: &str) -> Result<Vec<u8>, StorageError> {
+    async fn get_direct(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<Vec<u8>, StorageError> {
         self.get_object_file(
             &self.direct_path(bucket, prefix, filename),
             "direct",
@@ -621,7 +641,12 @@ impl StorageBackend for FilesystemBackend {
     }
 
     #[instrument(skip(self))]
-    async fn delete_direct(&self, bucket: &str, prefix: &str, filename: &str) -> Result<(), StorageError> {
+    async fn delete_direct(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<(), StorageError> {
         self.delete_object_file(
             &self.direct_path(bucket, prefix, filename),
             &self.direct_meta_path(bucket, prefix, filename),
@@ -664,7 +689,11 @@ impl StorageBackend for FilesystemBackend {
     // === Scanning operations ===
 
     #[instrument(skip(self))]
-    async fn scan_deltaspace(&self, bucket: &str, prefix: &str) -> Result<Vec<FileMetadata>, StorageError> {
+    async fn scan_deltaspace(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Vec<FileMetadata>, StorageError> {
         let dir = self.deltaspace_dir(bucket, prefix);
         if !path_exists(&dir).await {
             return Ok(Vec::new());

@@ -1114,12 +1114,11 @@ async fn test_create_bucket_any_name() {
     let client = server.s3_client().await;
 
     // Multi-bucket mode: creating any bucket should succeed
-    let result = client
-        .create_bucket()
-        .bucket("custom-bucket")
-        .send()
-        .await;
-    assert!(result.is_ok(), "CREATE any bucket should succeed in multi-bucket mode");
+    let result = client.create_bucket().bucket("custom-bucket").send().await;
+    assert!(
+        result.is_ok(),
+        "CREATE any bucket should succeed in multi-bucket mode"
+    );
 
     // Verify the new bucket appears in list_buckets
     let buckets = client.list_buckets().send().await.unwrap();
@@ -1128,7 +1127,11 @@ async fn test_create_bucket_any_name() {
         .iter()
         .map(|b| b.name().unwrap_or(""))
         .collect();
-    assert!(names.contains(&"custom-bucket"), "New bucket should appear in list: {:?}", names);
+    assert!(
+        names.contains(&"custom-bucket"),
+        "New bucket should appear in list: {:?}",
+        names
+    );
 }
 
 #[tokio::test]

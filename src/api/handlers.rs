@@ -564,9 +564,7 @@ pub async fn put_object_or_copy(
             "UploadPart {}/{} part={} uploadId={}",
             bucket, key, part_num, upload_id
         );
-        return Err(S3Error::NotImplemented(
-            MULTIPART_NOT_SUPPORTED.to_string(),
-        ));
+        return Err(S3Error::NotImplemented(MULTIPART_NOT_SUPPORTED.to_string()));
     }
 
     // Check if this is a copy operation
@@ -619,9 +617,7 @@ pub async fn post_object(
     // CreateMultipartUpload
     if query.uploads.is_some() {
         info!("CreateMultipartUpload {}/{}", bucket, key);
-        return Err(S3Error::NotImplemented(
-            MULTIPART_NOT_SUPPORTED.to_string(),
-        ));
+        return Err(S3Error::NotImplemented(MULTIPART_NOT_SUPPORTED.to_string()));
     }
 
     // CompleteMultipartUpload
@@ -630,9 +626,7 @@ pub async fn post_object(
             "CompleteMultipartUpload {}/{} uploadId={}",
             bucket, key, upload_id
         );
-        return Err(S3Error::NotImplemented(
-            MULTIPART_NOT_SUPPORTED.to_string(),
-        ));
+        return Err(S3Error::NotImplemented(MULTIPART_NOT_SUPPORTED.to_string()));
     }
 
     Err(S3Error::InvalidRequest(

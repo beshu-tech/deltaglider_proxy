@@ -85,9 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("  Data directory: {:?}", path);
         }
         BackendConfig::S3 {
-            endpoint,
-            region,
-            ..
+            endpoint, region, ..
         } => {
             info!("  Backend: S3");
             info!("  Region: {}", region);
@@ -108,7 +106,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if config.auth_enabled() {
-        info!("  Authentication: SigV4 ENABLED (access key: {})", config.access_key_id.as_deref().unwrap_or(""));
+        info!(
+            "  Authentication: SigV4 ENABLED (access key: {})",
+            config.access_key_id.as_deref().unwrap_or("")
+        );
     } else {
         warn!("  Authentication: DISABLED (open access) — set DELTAGLIDER_PROXY_ACCESS_KEY_ID and DELTAGLIDER_PROXY_SECRET_ACCESS_KEY to enable");
     }
@@ -134,10 +135,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => {
             // AlreadyExists is fine — bucket was already there
             let msg = e.to_string();
-            if msg.contains("already exists") || msg.contains("AlreadyExists") || msg.contains("Already") {
-                info!("  Default bucket '{}' already exists", config.default_bucket);
+            if msg.contains("already exists")
+                || msg.contains("AlreadyExists")
+                || msg.contains("Already")
+            {
+                info!(
+                    "  Default bucket '{}' already exists",
+                    config.default_bucket
+                );
             } else {
-                warn!("  Failed to create default bucket '{}': {}", config.default_bucket, e);
+                warn!(
+                    "  Failed to create default bucket '{}': {}",
+                    config.default_bucket, e
+                );
             }
         }
     }
@@ -148,17 +158,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Build auth config (None if credentials not configured)
-    let auth_config: Option<Arc<AuthConfig>> =
-        if let (Some(ref key_id), Some(ref secret)) =
-            (&config.access_key_id, &config.secret_access_key)
-        {
-            Some(Arc::new(AuthConfig {
-                access_key_id: key_id.clone(),
-                secret_access_key: secret.clone(),
-            }))
-        } else {
-            None
-        };
+    let auth_config: Option<Arc<AuthConfig>> = if let (Some(ref key_id), Some(ref secret)) =
+        (&config.access_key_id, &config.secret_access_key)
+    {
+        Some(Arc::new(AuthConfig {
+            access_key_id: key_id.clone(),
+            secret_access_key: secret.clone(),
+        }))
+    } else {
+        None
+    };
 
     // Build router with S3-style paths
     // S3 API paths:

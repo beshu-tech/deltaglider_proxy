@@ -163,10 +163,7 @@ pub async fn sigv4_auth_middleware(
     debug!("SigV4 string to sign:\n{}", string_to_sign);
 
     // Derive the signing key
-    let signing_key = derive_signing_key(
-        &auth.secret_access_key,
-        &parsed.credential_scope,
-    );
+    let signing_key = derive_signing_key(&auth.secret_access_key, &parsed.credential_scope);
 
     // Compute the signature
     let computed_signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
@@ -288,10 +285,7 @@ fn percent_decode(input: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(
-                &input[i + 1..i + 3],
-                16,
-            ) {
+            if let Ok(byte) = u8::from_str_radix(&input[i + 1..i + 3], 16) {
                 result.push(byte);
                 i += 3;
                 continue;
@@ -351,8 +345,7 @@ fn derive_signing_key(secret_access_key: &str, credential_scope: &str) -> Vec<u8
 
 /// Compute HMAC-SHA256.
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac =
-        HmacSha256::new_from_slice(key).expect("HMAC can take key of any size");
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC can take key of any size");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
 }

@@ -6,7 +6,6 @@
 //! Each API bucket maps 1:1 to a real S3 bucket on the backend.
 
 use super::traits::{StorageBackend, StorageError};
-use bytes::Bytes;
 use crate::config::BackendConfig;
 use crate::types::{FileMetadata, StorageInfo};
 use async_trait::async_trait;
@@ -15,6 +14,7 @@ use aws_credential_types::Credentials;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::stream::BoxStream;
 use std::collections::{HashMap, HashSet};
@@ -29,28 +29,27 @@ pub struct S3Backend {
 impl S3Backend {
     /// Create a new S3 backend from configuration
     pub async fn new(config: &BackendConfig) -> Result<Self, StorageError> {
-        let (endpoint, region, force_path_style, access_key_id, secret_access_key) =
-            match config {
-                BackendConfig::S3 {
-                    endpoint,
-                    region,
-                    force_path_style,
-                    access_key_id,
-                    secret_access_key,
-                    ..
-                } => (
-                    endpoint.clone(),
-                    region.clone(),
-                    *force_path_style,
-                    access_key_id.clone(),
-                    secret_access_key.clone(),
-                ),
-                _ => {
-                    return Err(StorageError::Other(
-                        "S3Backend requires S3 configuration".to_string(),
-                    ))
-                }
-            };
+        let (endpoint, region, force_path_style, access_key_id, secret_access_key) = match config {
+            BackendConfig::S3 {
+                endpoint,
+                region,
+                force_path_style,
+                access_key_id,
+                secret_access_key,
+                ..
+            } => (
+                endpoint.clone(),
+                region.clone(),
+                *force_path_style,
+                access_key_id.clone(),
+                secret_access_key.clone(),
+            ),
+            _ => {
+                return Err(StorageError::Other(
+                    "S3Backend requires S3 configuration".to_string(),
+                ))
+            }
+        };
 
         // Build AWS SDK config
         let mut config_loader = aws_config::defaults(BehaviorVersion::latest())
@@ -119,7 +118,10 @@ impl S3Backend {
         let mut headers = HashMap::new();
 
         headers.insert(mk::TOOL.to_string(), metadata.tool.clone());
-        headers.insert(mk::ORIGINAL_NAME.to_string(), metadata.original_name.clone());
+        headers.insert(
+            mk::ORIGINAL_NAME.to_string(),
+            metadata.original_name.clone(),
+        );
         headers.insert(mk::FILE_SHA256.to_string(), metadata.file_sha256.clone());
         headers.insert(mk::FILE_SIZE.to_string(), metadata.file_size.to_string());
         headers.insert(mk::MD5.to_string(), metadata.md5.clone());
@@ -224,8 +226,8 @@ impl S3Backend {
                 .unwrap_or_else(|| original_name.clone());
             StorageInfo::Reference { source_name }
         } else if is_delta {
-            let ref_key =
-                ref_key_opt.ok_or_else(|| StorageError::Other(format!("Missing {}", mk::REF_KEY)))?;
+            let ref_key = ref_key_opt
+                .ok_or_else(|| StorageError::Other(format!("Missing {}", mk::REF_KEY)))?;
             let ref_sha256 = get_value(&[mk::REF_SHA256, "ref-sha256"])
                 .ok_or_else(|| StorageError::Other(format!("Missing {}", mk::REF_SHA256)))?;
             let delta_size_str =
@@ -299,7 +301,12 @@ impl S3Backend {
             .await
             .map_err(|e| StorageError::S3(format!("put_object failed: {}", e)))?;
 
-        debug!("S3 PUT {}/{} ({} bytes) with DG metadata", bucket, key, data.len());
+        debug!(
+            "S3 PUT {}/{} ({} bytes) with DG metadata",
+            bucket,
+            key,
+            data.len()
+        );
         Ok(())
     }
 
@@ -337,7 +344,11 @@ impl S3Backend {
     }
 
     /// Get object metadata from S3 headers
-    async fn get_object_metadata(&self, bucket: &str, key: &str) -> Result<FileMetadata, StorageError> {
+    async fn get_object_metadata(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<FileMetadata, StorageError> {
         let response = self
             .client
             .head_object()
@@ -398,16 +409,16 @@ impl S3Backend {
     }
 
     /// List objects with a prefix in a specific bucket
-    async fn list_objects_with_prefix(&self, bucket: &str, prefix: &str) -> Result<Vec<String>, StorageError> {
+    async fn list_objects_with_prefix(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Vec<String>, StorageError> {
         let mut keys = Vec::new();
         let mut continuation_token: Option<String> = None;
 
         loop {
-            let mut request = self
-                .client
-                .list_objects_v2()
-                .bucket(bucket)
-                .prefix(prefix);
+            let mut request = self.client.list_objects_v2().bucket(bucket).prefix(prefix);
 
             if let Some(token) = continuation_token {
                 request = request.continuation_token(token);
@@ -503,10 +514,13 @@ impl StorageBackend for S3Backend {
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         let key = self.reference_key(prefix);
-        self.put_object_with_metadata(bucket, &key, data, metadata).await?;
+        self.put_object_with_metadata(bucket, &key, data, metadata)
+            .await?;
         debug!(
             "Stored reference for {}/{} ({} bytes)",
-            bucket, prefix, data.len()
+            bucket,
+            prefix,
+            data.len()
         );
         Ok(())
     }
@@ -549,7 +563,11 @@ impl StorageBackend for S3Backend {
     }
 
     #[instrument(skip(self))]
-    async fn get_reference_metadata(&self, bucket: &str, prefix: &str) -> Result<FileMetadata, StorageError> {
+    async fn get_reference_metadata(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<FileMetadata, StorageError> {
         let key = self.reference_key(prefix);
         self.get_object_metadata(bucket, &key).await
     }
@@ -580,16 +598,25 @@ impl StorageBackend for S3Backend {
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         let key = self.delta_key(prefix, filename);
-        self.put_object_with_metadata(bucket, &key, data, metadata).await?;
+        self.put_object_with_metadata(bucket, &key, data, metadata)
+            .await?;
         debug!(
             "Stored delta for {}/{}/{} ({} bytes)",
-            bucket, prefix, filename, data.len()
+            bucket,
+            prefix,
+            filename,
+            data.len()
         );
         Ok(())
     }
 
     #[instrument(skip(self))]
-    async fn get_delta(&self, bucket: &str, prefix: &str, filename: &str) -> Result<Vec<u8>, StorageError> {
+    async fn get_delta(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<Vec<u8>, StorageError> {
         let key = self.delta_key(prefix, filename);
         self.get_object(bucket, &key).await
     }
@@ -606,7 +633,12 @@ impl StorageBackend for S3Backend {
     }
 
     #[instrument(skip(self))]
-    async fn delete_delta(&self, bucket: &str, prefix: &str, filename: &str) -> Result<(), StorageError> {
+    async fn delete_delta(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<(), StorageError> {
         let key = self.delta_key(prefix, filename);
         self.delete_s3_object(bucket, &key).await?;
         debug!("Deleted delta for {}/{}/{}", bucket, prefix, filename);
@@ -625,16 +657,25 @@ impl StorageBackend for S3Backend {
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         let key = self.direct_key(prefix, filename);
-        self.put_object_with_metadata(bucket, &key, data, metadata).await?;
+        self.put_object_with_metadata(bucket, &key, data, metadata)
+            .await?;
         debug!(
             "Stored direct for {}/{}/{} ({} bytes)",
-            bucket, prefix, filename, data.len()
+            bucket,
+            prefix,
+            filename,
+            data.len()
         );
         Ok(())
     }
 
     #[instrument(skip(self))]
-    async fn get_direct(&self, bucket: &str, prefix: &str, filename: &str) -> Result<Vec<u8>, StorageError> {
+    async fn get_direct(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<Vec<u8>, StorageError> {
         let key = self.direct_key(prefix, filename);
         self.get_object(bucket, &key).await
     }
@@ -651,7 +692,12 @@ impl StorageBackend for S3Backend {
     }
 
     #[instrument(skip(self))]
-    async fn delete_direct(&self, bucket: &str, prefix: &str, filename: &str) -> Result<(), StorageError> {
+    async fn delete_direct(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<(), StorageError> {
         let key = self.direct_key(prefix, filename);
         self.delete_s3_object(bucket, &key).await?;
         debug!("Deleted direct for {}/{}/{}", bucket, prefix, filename);
@@ -695,21 +741,25 @@ impl StorageBackend for S3Backend {
             .into_bytes();
 
         debug!("S3 GET stream {}/{} ({} bytes)", bucket, key, data.len());
-        Ok(Box::pin(futures::stream::once(async {
-            Ok(data)
-        })))
+        Ok(Box::pin(futures::stream::once(async { Ok(data) })))
     }
 
     // === Scanning operations ===
 
     #[instrument(skip(self))]
-    async fn scan_deltaspace(&self, bucket: &str, prefix: &str) -> Result<Vec<FileMetadata>, StorageError> {
+    async fn scan_deltaspace(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Vec<FileMetadata>, StorageError> {
         let search_prefix = if prefix.is_empty() {
             String::new()
         } else {
             format!("{}/", prefix)
         };
-        let keys = self.list_objects_with_prefix(bucket, &search_prefix).await?;
+        let keys = self
+            .list_objects_with_prefix(bucket, &search_prefix)
+            .await?;
 
         let mut metadata_list = Vec::new();
 

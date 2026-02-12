@@ -96,5 +96,4 @@ impl ReferenceCache {
             debug!("Invalidated cache entry for {}", prefix);
         }
     }
-
 }
