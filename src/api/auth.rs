@@ -261,9 +261,13 @@ fn build_canonical_query_string(query: &str) -> String {
         .filter(|s| !s.is_empty())
         .map(|pair| {
             if let Some((k, v)) = pair.split_once('=') {
-                (uri_encode(k, true), uri_encode(v, true))
+                // SigV4 spec: decode first, then re-encode to normalize
+                let k_decoded = percent_decode(k);
+                let v_decoded = percent_decode(v);
+                (uri_encode(&k_decoded, true), uri_encode(&v_decoded, true))
             } else {
-                (uri_encode(pair, true), String::new())
+                let k_decoded = percent_decode(pair);
+                (uri_encode(&k_decoded, true), String::new())
             }
         })
         .collect();
@@ -275,6 +279,28 @@ fn build_canonical_query_string(query: &str) -> String {
         .map(|(k, v)| format!("{}={}", k, v))
         .collect::<Vec<_>>()
         .join("&")
+}
+
+/// Percent-decode a URI component (e.g. `%2F` → `/`).
+fn percent_decode(input: &str) -> String {
+    let mut result = Vec::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(
+                &input[i + 1..i + 3],
+                16,
+            ) {
+                result.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        result.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&result).into_owned()
 }
 
 /// URI-encode a path component per SigV4 spec.
@@ -381,6 +407,11 @@ mod tests {
         assert_eq!(
             build_canonical_query_string("list-type=2&prefix=test"),
             "list-type=2&prefix=test"
+        );
+        // Pre-encoded values should not be double-encoded
+        assert_eq!(
+            build_canonical_query_string("delimiter=%2F&list-type=2&prefix="),
+            "delimiter=%2F&list-type=2&prefix="
         );
     }
 
