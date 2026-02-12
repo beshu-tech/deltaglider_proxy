@@ -63,6 +63,12 @@ impl TestServer {
 
     /// Start a test server with S3 backend (needs MinIO running)
     pub async fn s3() -> Self {
+        Self::s3_with_endpoint(MINIO_ENDPOINT, MINIO_BUCKET).await
+    }
+
+    /// Start a test server with S3 backend pointing at a custom endpoint/bucket.
+    /// Useful for ephemeral MinIO containers with dynamic ports.
+    pub async fn s3_with_endpoint(endpoint: &str, bucket: &str) -> Self {
         let port = PORT_COUNTER.fetch_add(2, Ordering::SeqCst);
 
         let process = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"))
@@ -70,11 +76,11 @@ impl TestServer {
                 "DELTAGLIDER_PROXY_LISTEN_ADDR",
                 format!("127.0.0.1:{}", port),
             )
-            .env("DELTAGLIDER_PROXY_S3_ENDPOINT", MINIO_ENDPOINT)
+            .env("DELTAGLIDER_PROXY_S3_ENDPOINT", endpoint)
             .env("DELTAGLIDER_PROXY_S3_FORCE_PATH_STYLE", "true")
             .env("AWS_ACCESS_KEY_ID", MINIO_ACCESS_KEY)
             .env("AWS_SECRET_ACCESS_KEY", MINIO_SECRET_KEY)
-            .env("DELTAGLIDER_PROXY_DEFAULT_BUCKET", MINIO_BUCKET)
+            .env("DELTAGLIDER_PROXY_DEFAULT_BUCKET", bucket)
             .env("RUST_LOG", "deltaglider_proxy=warn")
             .spawn()
             .expect("Failed to start server");
@@ -83,7 +89,7 @@ impl TestServer {
             process,
             port,
             _data_dir: None,
-            bucket: MINIO_BUCKET.to_string(),
+            bucket: bucket.to_string(),
         };
         server.wait_ready().await;
         server
@@ -201,6 +207,29 @@ macro_rules! skip_unless_minio {
     () => {
         if !common::minio_available().await {
             eprintln!("MinIO not available, skipping test");
+            return;
+        }
+    };
+}
+
+/// Check if Docker is available by running `docker version`
+pub fn docker_available() -> bool {
+    Command::new("docker")
+        .arg("version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Macro to skip a test if Docker is not available.
+/// Use at the start of any test that requires an ephemeral container.
+#[macro_export]
+macro_rules! skip_unless_docker {
+    () => {
+        if !common::docker_available() {
+            eprintln!("Docker not available, skipping test");
             return;
         }
     };
