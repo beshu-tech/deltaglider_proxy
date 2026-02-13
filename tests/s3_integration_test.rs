@@ -20,11 +20,53 @@ use testcontainers::ContainerAsync;
 use testcontainers_modules::minio::MinIO;
 use tokio::sync::OnceCell;
 
-/// Shared MinIO container for all tests in this file
-static MINIO_CONTAINER: OnceCell<ContainerAsync<MinIO>> = OnceCell::const_new();
+/// Shared MinIO container for all tests in this file.
+/// Wrapped in `ContainerGuard` to ensure Docker cleanup even though statics don't drop.
+static MINIO_CONTAINER: OnceCell<ContainerGuard> = OnceCell::const_new();
 
 /// Counter for unique test prefixes
 static PREFIX_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Wrapper that registers an atexit handler to stop+remove the Docker container.
+/// `static` values are never dropped in Rust, so `ContainerAsync::Drop` never fires.
+/// This guard captures the container ID at creation and registers a synchronous
+/// `docker rm -f` via `std::process::atexit` to ensure cleanup.
+struct ContainerGuard {
+    inner: ContainerAsync<MinIO>,
+}
+
+impl ContainerGuard {
+    fn new(container: ContainerAsync<MinIO>) -> Self {
+        // Register a process-exit hook that force-removes this container.
+        // Uses `docker rm -f` which is synchronous and doesn't need the tokio runtime.
+        let id = container.id().to_string();
+        // Safety: atexit handler must be safe to call; std::process::Command is fine.
+        // We intentionally leak the String so the closure is 'static.
+        let id_leaked: &'static str = String::leak(id);
+        unsafe {
+            libc::atexit(cleanup_container_trampoline);
+        }
+        CONTAINER_ID_FOR_CLEANUP
+            .set(id_leaked)
+            .unwrap_or_else(|_| panic!("ContainerGuard created more than once"));
+
+        Self { inner: container }
+    }
+}
+
+/// The container ID to clean up at exit.
+static CONTAINER_ID_FOR_CLEANUP: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// C-compatible atexit callback — force-removes the Docker container.
+extern "C" fn cleanup_container_trampoline() {
+    if let Some(id) = CONTAINER_ID_FOR_CLEANUP.get() {
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", id])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
 
 /// The bucket name used for integration tests
 const TEST_BUCKET: &str = "integration-test";
@@ -41,17 +83,18 @@ fn unique_prefix() -> String {
 
 /// Get or start the shared MinIO container, returning its S3 endpoint URL.
 async fn minio_endpoint() -> String {
-    let container = MINIO_CONTAINER
+    let guard = MINIO_CONTAINER
         .get_or_init(|| async {
-            MinIO::default()
+            let container = MinIO::default()
                 .start()
                 .await
-                .expect("Failed to start MinIO container")
+                .expect("Failed to start MinIO container");
+            ContainerGuard::new(container)
         })
         .await;
 
-    let host = container.get_host().await.unwrap();
-    let port = container.get_host_port_ipv4(9000.tcp()).await.unwrap();
+    let host = guard.inner.get_host().await.unwrap();
+    let port = guard.inner.get_host_port_ipv4(9000.tcp()).await.unwrap();
     format!("http://{}:{}", host, port)
 }
 
@@ -967,5 +1010,902 @@ async fn test_full_lifecycle_with_delete() {
         )
         .await,
         v1_replacement
+    );
+}
+
+// ============================================================================
+// Group 6: Multipart Upload
+// ============================================================================
+
+/// Helper: initiate a multipart upload via raw HTTP, return upload_id
+async fn create_multipart_upload(
+    client: &reqwest::Client,
+    endpoint: &str,
+    bucket: &str,
+    key: &str,
+) -> String {
+    let url = format!("{}/{}/{}?uploads", endpoint, bucket, key);
+    let resp = client
+        .post(&url)
+        .header("content-type", "application/octet-stream")
+        .send()
+        .await
+        .expect("CreateMultipartUpload failed");
+    assert!(
+        resp.status().is_success(),
+        "CreateMultipartUpload failed: {}",
+        resp.status()
+    );
+    let body = resp.text().await.unwrap();
+    // Parse upload_id from XML response
+    let start = body.find("<UploadId>").expect("No UploadId in response") + 10;
+    let end = body[start..]
+        .find("</UploadId>")
+        .expect("No closing UploadId")
+        + start;
+    body[start..end].to_string()
+}
+
+/// Helper: upload a part via raw HTTP, return ETag
+async fn upload_part(
+    client: &reqwest::Client,
+    endpoint: &str,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: u32,
+    data: Vec<u8>,
+) -> String {
+    let url = format!(
+        "{}/{}/{}?partNumber={}&uploadId={}",
+        endpoint, bucket, key, part_number, upload_id
+    );
+    let resp = client
+        .put(&url)
+        .body(data)
+        .send()
+        .await
+        .expect("UploadPart failed");
+    assert!(
+        resp.status().is_success(),
+        "UploadPart {} failed: {}",
+        part_number,
+        resp.status()
+    );
+    resp.headers()
+        .get("etag")
+        .expect("No ETag header in UploadPart response")
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Helper: complete a multipart upload via raw HTTP
+async fn complete_multipart_upload(
+    client: &reqwest::Client,
+    endpoint: &str,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    parts: &[(u32, &str)],
+) -> reqwest::Response {
+    let url = format!("{}/{}/{}?uploadId={}", endpoint, bucket, key, upload_id);
+    let mut xml = String::from("<CompleteMultipartUpload>");
+    for (num, etag) in parts {
+        xml.push_str(&format!(
+            "<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>",
+            num, etag
+        ));
+    }
+    xml.push_str("</CompleteMultipartUpload>");
+
+    client
+        .post(&url)
+        .header("content-type", "application/xml")
+        .body(xml)
+        .send()
+        .await
+        .expect("CompleteMultipartUpload failed")
+}
+
+#[tokio::test]
+async fn test_multipart_basic_roundtrip() {
+    skip_unless_docker!();
+    let server = proxy_server().await;
+    let http = reqwest::Client::new();
+    let prefix = unique_prefix();
+    let key = format!("{}/multipart.bin", prefix);
+
+    let part1_data = generate_binary(1024, 100);
+    let part2_data = generate_binary(2048, 200);
+    let part3_data = generate_binary(512, 300);
+
+    let upload_id = create_multipart_upload(&http, &server.endpoint(), server.bucket(), &key).await;
+
+    let etag1 = upload_part(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        &key,
+        &upload_id,
+        1,
+        part1_data.clone(),
+    )
+    .await;
+    let etag2 = upload_part(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        &key,
+        &upload_id,
+        2,
+        part2_data.clone(),
+    )
+    .await;
+    let etag3 = upload_part(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        &key,
+        &upload_id,
+        3,
+        part3_data.clone(),
+    )
+    .await;
+
+    let resp = complete_multipart_upload(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        &key,
+        &upload_id,
+        &[(1, &etag1), (2, &etag2), (3, &etag3)],
+    )
+    .await;
+    assert!(
+        resp.status().is_success(),
+        "CompleteMultipartUpload failed: {}",
+        resp.status()
+    );
+
+    // GET and verify
+    let retrieved = get_bytes(&http, &server.endpoint(), server.bucket(), &key).await;
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&part1_data);
+    expected.extend_from_slice(&part2_data);
+    expected.extend_from_slice(&part3_data);
+    assert_eq!(
+        retrieved, expected,
+        "Multipart assembled data should match concatenated parts"
+    );
+}
+
+#[tokio::test]
+async fn test_multipart_single_part() {
+    skip_unless_docker!();
+    let server = proxy_server().await;
+    let http = reqwest::Client::new();
+    let prefix = unique_prefix();
+    let key = format!("{}/single-part.bin", prefix);
+
+    let data = generate_binary(4096, 42);
+
+    let upload_id = create_multipart_upload(&http, &server.endpoint(), server.bucket(), &key).await;
+    let etag = upload_part(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        &key,
+        &upload_id,
+        1,
+        data.clone(),
+    )
+    .await;
+
+    let resp = complete_multipart_upload(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        &key,
+        &upload_id,
+        &[(1, &etag)],
+    )
+    .await;
+    assert!(resp.status().is_success());
+
+    let retrieved = get_bytes(&http, &server.endpoint(), server.bucket(), &key).await;
+    assert_eq!(retrieved, data);
+}
+
+#[tokio::test]
+async fn test_multipart_abort() {
+    skip_unless_docker!();
+    let server = proxy_server().await;
+    let http = reqwest::Client::new();
+    let prefix = unique_prefix();
+    let key = format!("{}/abort.bin", prefix);
+
+    let upload_id = create_multipart_upload(&http, &server.endpoint(), server.bucket(), &key).await;
+    upload_part(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        &key,
+        &upload_id,
+        1,
+        vec![0u8; 100],
+    )
+    .await;
+
+    // Abort
+    let abort_url = format!(
+        "{}/{}/{}?uploadId={}",
+        server.endpoint(),
+        server.bucket(),
+        key,
+        upload_id
+    );
+    let resp = http.delete(&abort_url).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 204, "Abort should return 204");
+
+    // UploadPart with same ID should fail (NoSuchUpload)
+    let url = format!(
+        "{}/{}/{}?partNumber=2&uploadId={}",
+        server.endpoint(),
+        server.bucket(),
+        key,
+        upload_id
+    );
+    let resp = http.put(&url).body(vec![0u8; 50]).send().await.unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        404,
+        "UploadPart after abort should return 404"
+    );
+}
+
+#[tokio::test]
+async fn test_multipart_list_parts() {
+    skip_unless_docker!();
+    let server = proxy_server().await;
+    let http = reqwest::Client::new();
+    let prefix = unique_prefix();
+    let key = format!("{}/list-parts.bin", prefix);
+
+    let upload_id = create_multipart_upload(&http, &server.endpoint(), server.bucket(), &key).await;
+
+    let mut etags = Vec::new();
+    for i in 1..=5 {
+        let etag = upload_part(
+            &http,
+            &server.endpoint(),
+            server.bucket(),
+            &key,
+            &upload_id,
+            i,
+            generate_binary(256 * i as usize, i as u64),
+        )
+        .await;
+        etags.push(etag);
+    }
+
+    // ListParts
+    let list_url = format!(
+        "{}/{}/{}?uploadId={}",
+        server.endpoint(),
+        server.bucket(),
+        key,
+        upload_id
+    );
+    let resp = http.get(&list_url).send().await.unwrap();
+    assert!(resp.status().is_success());
+    let body = resp.text().await.unwrap();
+
+    // Verify all 5 parts are listed
+    for i in 1..=5 {
+        assert!(
+            body.contains(&format!("<PartNumber>{}</PartNumber>", i)),
+            "ListParts should contain part {}",
+            i
+        );
+    }
+
+    // Verify ETags are present
+    for etag in &etags {
+        let clean = etag.trim_matches('"');
+        assert!(
+            body.contains(clean),
+            "ListParts should contain ETag {}",
+            clean
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_multipart_list_uploads() {
+    skip_unless_docker!();
+    let server = proxy_server().await;
+    let http = reqwest::Client::new();
+    let prefix = unique_prefix();
+
+    // Create 3 uploads
+    let key1 = format!("{}/file1.bin", prefix);
+    let key2 = format!("{}/file2.bin", prefix);
+    let key3 = format!("{}/file3.bin", prefix);
+
+    let uid1 = create_multipart_upload(&http, &server.endpoint(), server.bucket(), &key1).await;
+    let uid2 = create_multipart_upload(&http, &server.endpoint(), server.bucket(), &key2).await;
+    let uid3 = create_multipart_upload(&http, &server.endpoint(), server.bucket(), &key3).await;
+
+    // ListMultipartUploads
+    let list_url = format!(
+        "{}/{}?uploads&prefix={}",
+        server.endpoint(),
+        server.bucket(),
+        prefix
+    );
+    let resp = http.get(&list_url).send().await.unwrap();
+    assert!(resp.status().is_success());
+    let body = resp.text().await.unwrap();
+
+    // All 3 uploads should be listed
+    assert!(body.contains(&uid1), "Should list upload 1");
+    assert!(body.contains(&uid2), "Should list upload 2");
+    assert!(body.contains(&uid3), "Should list upload 3");
+
+    // Complete one upload, then list again — should have 2
+    let etag = upload_part(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        &key1,
+        &uid1,
+        1,
+        vec![1u8; 64],
+    )
+    .await;
+    let resp = complete_multipart_upload(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        &key1,
+        &uid1,
+        &[(1, &etag)],
+    )
+    .await;
+    assert!(resp.status().is_success());
+
+    let resp = http.get(&list_url).send().await.unwrap();
+    let body = resp.text().await.unwrap();
+    assert!(
+        !body.contains(&uid1),
+        "Completed upload should not be listed"
+    );
+    assert!(body.contains(&uid2), "Upload 2 should still be listed");
+    assert!(body.contains(&uid3), "Upload 3 should still be listed");
+}
+
+#[tokio::test]
+async fn test_multipart_delta_compression() {
+    skip_unless_docker!();
+    let server = proxy_server().await;
+    let http = reqwest::Client::new();
+    let prefix = unique_prefix();
+
+    // Upload base via single PUT
+    let base = generate_binary(100_000, 42);
+    let st_base = put_and_get_storage_type(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        &format!("{}/base.zip", prefix),
+        base.clone(),
+        "application/zip",
+    )
+    .await;
+    assert!(
+        st_base == "reference" || st_base == "delta",
+        "Base should be reference, got: {}",
+        st_base
+    );
+
+    // Upload variant via multipart
+    let variant = mutate_binary(&base, 0.01);
+    let variant_key = format!("{}/variant.zip", prefix);
+
+    let upload_id =
+        create_multipart_upload(&http, &server.endpoint(), server.bucket(), &variant_key).await;
+
+    // Split variant into 2 parts
+    let mid = variant.len() / 2;
+    let etag1 = upload_part(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        &variant_key,
+        &upload_id,
+        1,
+        variant[..mid].to_vec(),
+    )
+    .await;
+    let etag2 = upload_part(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        &variant_key,
+        &upload_id,
+        2,
+        variant[mid..].to_vec(),
+    )
+    .await;
+
+    let resp = complete_multipart_upload(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        &variant_key,
+        &upload_id,
+        &[(1, &etag1), (2, &etag2)],
+    )
+    .await;
+    assert!(resp.status().is_success());
+
+    // Check storage type header
+    let st = resp
+        .headers()
+        .get("x-amz-storage-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown");
+    assert_eq!(
+        st, "delta",
+        "Multipart variant should be stored as delta, got: {}",
+        st
+    );
+
+    // Verify data integrity
+    let retrieved = get_bytes(&http, &server.endpoint(), server.bucket(), &variant_key).await;
+    assert_eq!(retrieved, variant);
+}
+
+#[tokio::test]
+async fn test_multipart_invalid_upload_id() {
+    skip_unless_docker!();
+    let server = proxy_server().await;
+    let http = reqwest::Client::new();
+    let prefix = unique_prefix();
+    let key = format!("{}/invalid.bin", prefix);
+
+    let fake_id = "nonexistent_upload_id_12345678";
+
+    // UploadPart with nonexistent ID should fail
+    let url = format!(
+        "{}/{}/{}?partNumber=1&uploadId={}",
+        server.endpoint(),
+        server.bucket(),
+        key,
+        fake_id
+    );
+    let resp = http.put(&url).body(vec![0u8; 50]).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+
+    // CompleteMultipartUpload with nonexistent ID should fail
+    let resp = complete_multipart_upload(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        &key,
+        fake_id,
+        &[(1, "\"abc\"")],
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 404);
+
+    // AbortMultipartUpload with nonexistent ID should fail
+    let abort_url = format!(
+        "{}/{}/{}?uploadId={}",
+        server.endpoint(),
+        server.bucket(),
+        key,
+        fake_id
+    );
+    let resp = http.delete(&abort_url).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+}
+
+#[tokio::test]
+async fn test_multipart_aws_sdk_compat() {
+    skip_unless_docker!();
+    let server = proxy_server().await;
+    let prefix = unique_prefix();
+    let key = format!("{}/sdk-multipart.bin", prefix);
+
+    // Use AWS SDK S3 client pointed at the proxy
+    let client = server.s3_client().await;
+
+    // CreateMultipartUpload
+    let create_resp = client
+        .create_multipart_upload()
+        .bucket(server.bucket())
+        .key(&key)
+        .content_type("application/octet-stream")
+        .send()
+        .await
+        .expect("SDK CreateMultipartUpload should succeed");
+    let upload_id = create_resp.upload_id().expect("Should have upload_id");
+
+    // Upload 3 parts
+    let part1 = generate_binary(1024, 10);
+    let part2 = generate_binary(2048, 20);
+    let part3 = generate_binary(512, 30);
+
+    let up1 = client
+        .upload_part()
+        .bucket(server.bucket())
+        .key(&key)
+        .upload_id(upload_id)
+        .part_number(1)
+        .body(aws_sdk_s3::primitives::ByteStream::from(part1.clone()))
+        .send()
+        .await
+        .expect("SDK UploadPart 1 should succeed");
+
+    let up2 = client
+        .upload_part()
+        .bucket(server.bucket())
+        .key(&key)
+        .upload_id(upload_id)
+        .part_number(2)
+        .body(aws_sdk_s3::primitives::ByteStream::from(part2.clone()))
+        .send()
+        .await
+        .expect("SDK UploadPart 2 should succeed");
+
+    let up3 = client
+        .upload_part()
+        .bucket(server.bucket())
+        .key(&key)
+        .upload_id(upload_id)
+        .part_number(3)
+        .body(aws_sdk_s3::primitives::ByteStream::from(part3.clone()))
+        .send()
+        .await
+        .expect("SDK UploadPart 3 should succeed");
+
+    // CompleteMultipartUpload
+    use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+    let completed_parts = CompletedMultipartUpload::builder()
+        .parts(
+            CompletedPart::builder()
+                .part_number(1)
+                .e_tag(up1.e_tag().unwrap_or_default())
+                .build(),
+        )
+        .parts(
+            CompletedPart::builder()
+                .part_number(2)
+                .e_tag(up2.e_tag().unwrap_or_default())
+                .build(),
+        )
+        .parts(
+            CompletedPart::builder()
+                .part_number(3)
+                .e_tag(up3.e_tag().unwrap_or_default())
+                .build(),
+        )
+        .build();
+
+    client
+        .complete_multipart_upload()
+        .bucket(server.bucket())
+        .key(&key)
+        .upload_id(upload_id)
+        .multipart_upload(completed_parts)
+        .send()
+        .await
+        .expect("SDK CompleteMultipartUpload should succeed");
+
+    // Verify round-trip via SDK GetObject
+    let get_resp = client
+        .get_object()
+        .bucket(server.bucket())
+        .key(&key)
+        .send()
+        .await
+        .expect("SDK GetObject should succeed");
+
+    let retrieved = get_resp
+        .body
+        .collect()
+        .await
+        .expect("Body collect should succeed")
+        .into_bytes()
+        .to_vec();
+
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&part1);
+    expected.extend_from_slice(&part2);
+    expected.extend_from_slice(&part3);
+
+    assert_eq!(
+        retrieved, expected,
+        "SDK multipart upload round-trip data should match"
+    );
+}
+
+// ============================================================================
+// Group 7: Multi-Bucket
+// ============================================================================
+
+/// Create a bucket through the proxy endpoint (not directly on MinIO)
+async fn ensure_bucket_via_proxy(client: &reqwest::Client, endpoint: &str, bucket: &str) {
+    let url = format!("{}/{}", endpoint, bucket);
+    let resp = client.put(&url).send().await.expect("CREATE bucket failed");
+    let status = resp.status().as_u16();
+    assert!(
+        status == 200 || status == 409,
+        "CREATE bucket {} should return 200 or 409, got: {}",
+        bucket,
+        status
+    );
+}
+
+#[tokio::test]
+async fn test_multi_bucket_create_and_list() {
+    skip_unless_docker!();
+    let server = proxy_server().await;
+    let http = reqwest::Client::new();
+    let prefix = unique_prefix();
+
+    let bucket_a = format!("mb-a-{}", prefix);
+    let bucket_b = format!("mb-b-{}", prefix);
+
+    // Create two buckets through the proxy
+    ensure_bucket_via_proxy(&http, &server.endpoint(), &bucket_a).await;
+    ensure_bucket_via_proxy(&http, &server.endpoint(), &bucket_b).await;
+
+    // ListBuckets and verify both appear
+    let resp = http
+        .get(&format!("{}/", server.endpoint()))
+        .send()
+        .await
+        .expect("ListBuckets failed");
+    assert!(resp.status().is_success());
+    let body = resp.text().await.unwrap();
+
+    assert!(
+        body.contains(&format!("<Name>{}</Name>", bucket_a)),
+        "Bucket '{}' should appear in ListBuckets response",
+        bucket_a
+    );
+    assert!(
+        body.contains(&format!("<Name>{}</Name>", bucket_b)),
+        "Bucket '{}' should appear in ListBuckets response",
+        bucket_b
+    );
+}
+
+#[tokio::test]
+async fn test_multi_bucket_put_get_isolation() {
+    skip_unless_docker!();
+    let server = proxy_server().await;
+    let http = reqwest::Client::new();
+    let prefix = unique_prefix();
+
+    let bucket_a = format!("iso-a-{}", prefix);
+    let bucket_b = format!("iso-b-{}", prefix);
+
+    ensure_bucket_via_proxy(&http, &server.endpoint(), &bucket_a).await;
+    ensure_bucket_via_proxy(&http, &server.endpoint(), &bucket_b).await;
+
+    let data_a = b"data-for-bucket-a";
+    let data_b = b"data-for-bucket-b";
+
+    // PUT object into bucket-a
+    put_and_get_storage_type(
+        &http,
+        &server.endpoint(),
+        &bucket_a,
+        "shared-key.txt",
+        data_a.to_vec(),
+        "text/plain",
+    )
+    .await;
+
+    // PUT different object into bucket-b with the same key
+    put_and_get_storage_type(
+        &http,
+        &server.endpoint(),
+        &bucket_b,
+        "shared-key.txt",
+        data_b.to_vec(),
+        "text/plain",
+    )
+    .await;
+
+    // GET from each bucket — verify data isolation
+    let retrieved_a = get_bytes(&http, &server.endpoint(), &bucket_a, "shared-key.txt").await;
+    let retrieved_b = get_bytes(&http, &server.endpoint(), &bucket_b, "shared-key.txt").await;
+
+    assert_eq!(
+        retrieved_a,
+        data_a.as_slice(),
+        "bucket-a should return data-a"
+    );
+    assert_eq!(
+        retrieved_b,
+        data_b.as_slice(),
+        "bucket-b should return data-b"
+    );
+}
+
+#[tokio::test]
+async fn test_multi_bucket_list_objects_isolation() {
+    skip_unless_docker!();
+    let server = proxy_server().await;
+    let http = reqwest::Client::new();
+    let prefix = unique_prefix();
+
+    let bucket_a = format!("lst-a-{}", prefix);
+    let bucket_b = format!("lst-b-{}", prefix);
+
+    ensure_bucket_via_proxy(&http, &server.endpoint(), &bucket_a).await;
+    ensure_bucket_via_proxy(&http, &server.endpoint(), &bucket_b).await;
+
+    // PUT objects into bucket-a
+    put_and_get_storage_type(
+        &http,
+        &server.endpoint(),
+        &bucket_a,
+        "only-in-a.txt",
+        b"aaa".to_vec(),
+        "text/plain",
+    )
+    .await;
+
+    // PUT objects into bucket-b
+    put_and_get_storage_type(
+        &http,
+        &server.endpoint(),
+        &bucket_b,
+        "only-in-b.txt",
+        b"bbb".to_vec(),
+        "text/plain",
+    )
+    .await;
+
+    // ListObjectsV2 on bucket-a
+    let resp_a = http
+        .get(&format!("{}/{}?list-type=2", server.endpoint(), bucket_a))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp_a.status().is_success());
+    let body_a = resp_a.text().await.unwrap();
+
+    assert!(
+        body_a.contains("<Key>only-in-a.txt</Key>"),
+        "bucket-a should list only-in-a.txt"
+    );
+    assert!(
+        !body_a.contains("<Key>only-in-b.txt</Key>"),
+        "bucket-a should NOT list only-in-b.txt"
+    );
+
+    // ListObjectsV2 on bucket-b
+    let resp_b = http
+        .get(&format!("{}/{}?list-type=2", server.endpoint(), bucket_b))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp_b.status().is_success());
+    let body_b = resp_b.text().await.unwrap();
+
+    assert!(
+        body_b.contains("<Key>only-in-b.txt</Key>"),
+        "bucket-b should list only-in-b.txt"
+    );
+    assert!(
+        !body_b.contains("<Key>only-in-a.txt</Key>"),
+        "bucket-b should NOT list only-in-a.txt"
+    );
+}
+
+#[tokio::test]
+async fn test_multi_bucket_cross_bucket_copy() {
+    skip_unless_docker!();
+    let server = proxy_server().await;
+    let http = reqwest::Client::new();
+    let prefix = unique_prefix();
+
+    let bucket_src = format!("cpy-s-{}", prefix);
+    let bucket_dst = format!("cpy-d-{}", prefix);
+
+    ensure_bucket_via_proxy(&http, &server.endpoint(), &bucket_src).await;
+    ensure_bucket_via_proxy(&http, &server.endpoint(), &bucket_dst).await;
+
+    let original_data = b"cross-bucket-copy-payload";
+
+    // PUT object into source bucket
+    put_and_get_storage_type(
+        &http,
+        &server.endpoint(),
+        &bucket_src,
+        "source.txt",
+        original_data.to_vec(),
+        "text/plain",
+    )
+    .await;
+
+    // COPY to destination bucket via x-amz-copy-source
+    let copy_url = format!("{}/{}/copied.txt", server.endpoint(), bucket_dst);
+    let copy_source = format!("/{}/source.txt", bucket_src);
+    let resp = http
+        .put(&copy_url)
+        .header("x-amz-copy-source", &copy_source)
+        .send()
+        .await
+        .expect("COPY failed");
+    assert!(
+        resp.status().is_success(),
+        "COPY should succeed, got: {}",
+        resp.status()
+    );
+
+    // GET from destination bucket and byte-compare
+    let retrieved = get_bytes(&http, &server.endpoint(), &bucket_dst, "copied.txt").await;
+    assert_eq!(
+        retrieved,
+        original_data.as_slice(),
+        "Cross-bucket copy should preserve data"
+    );
+}
+
+#[tokio::test]
+async fn test_multi_bucket_delete_bucket() {
+    skip_unless_docker!();
+    let server = proxy_server().await;
+    let http = reqwest::Client::new();
+    let prefix = unique_prefix();
+
+    let bucket = format!("del-mb-{}", prefix);
+
+    // Create bucket through proxy
+    ensure_bucket_via_proxy(&http, &server.endpoint(), &bucket).await;
+
+    // PUT an object
+    put_and_get_storage_type(
+        &http,
+        &server.endpoint(),
+        &bucket,
+        "temp.txt",
+        b"temporary".to_vec(),
+        "text/plain",
+    )
+    .await;
+
+    // DELETE object
+    let del_obj_url = format!("{}/{}/temp.txt", server.endpoint(), bucket);
+    let resp = http.delete(&del_obj_url).send().await.unwrap();
+    assert!(
+        resp.status().as_u16() == 204 || resp.status().is_success(),
+        "DELETE object should succeed"
+    );
+
+    // DELETE bucket (now empty)
+    let del_bucket_url = format!("{}/{}", server.endpoint(), bucket);
+    let resp = http.delete(&del_bucket_url).send().await.unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        204,
+        "DELETE empty bucket should return 204"
+    );
+
+    // HEAD bucket should return 404
+    let head_url = format!("{}/{}", server.endpoint(), bucket);
+    let resp = http.head(&head_url).send().await.unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        404,
+        "HEAD deleted bucket should return 404"
     );
 }

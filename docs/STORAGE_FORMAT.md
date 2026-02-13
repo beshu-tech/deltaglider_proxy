@@ -50,7 +50,7 @@ If a deltaspace prefix contains `/`, it becomes nested directories under `deltas
 
 ## S3 backend layout
 
-The configured backend bucket (`DELTAGLIDER_PROXY_S3_BUCKET`) stores DeltaGlider artifacts using the same naming scheme as the filesystem backend:
+Each API bucket maps 1:1 to a real S3 bucket. DeltaGlider artifacts are stored using the same naming scheme as the filesystem backend:
 
 ```text
 releases/reference.bin

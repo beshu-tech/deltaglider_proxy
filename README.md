@@ -33,7 +33,6 @@ DELTAGLIDER_PROXY_DATA_DIR=./data ./target/release/deltaglider_proxy
 # Or with S3 backend (example: MinIO on :9000; run DeltaGlider Proxy on a different port)
 docker compose up -d
 DELTAGLIDER_PROXY_LISTEN_ADDR=127.0.0.1:9002 \
-DELTAGLIDER_PROXY_S3_BUCKET=deltaglider_proxy-data \
 DELTAGLIDER_PROXY_S3_ENDPOINT=http://localhost:9000 \
 AWS_ACCESS_KEY_ID=minioadmin \
 AWS_SECRET_ACCESS_KEY=minioadmin \
@@ -116,8 +115,7 @@ DELTAGLIDER_PROXY_CACHE_SIZE_MB=100         # Reference cache for fast reconstru
 # Filesystem backend
 DELTAGLIDER_PROXY_DATA_DIR=./data
 
-# S3 backend (takes precedence if DELTAGLIDER_PROXY_S3_BUCKET is set)
-DELTAGLIDER_PROXY_S3_BUCKET=deltaglider_proxy-data
+# S3 backend
 DELTAGLIDER_PROXY_S3_ENDPOINT=http://localhost:9000
 DELTAGLIDER_PROXY_S3_REGION=us-east-1
 DELTAGLIDER_PROXY_S3_FORCE_PATH_STYLE=true
@@ -176,7 +174,7 @@ See [CONTRIBUTING.md](docs/CONTRIBUTING.md) for build instructions, project stru
 
 ## S3 API Compatibility
 
-DeltaGlider Proxy intercepts the S3 operations it needs for delta compression (PUT, GET, HEAD, DELETE, LIST, COPY) and handles them directly. Other S3 operations are not currently proxied through to the backend.
+DeltaGlider Proxy intercepts the S3 operations it needs for delta compression (PUT, GET, HEAD, DELETE, LIST, COPY, multipart upload) and handles them directly. Other S3 operations are not currently proxied through to the backend.
 
 | Operation | Status | Notes |
 |-----------|--------|-------|
@@ -187,11 +185,16 @@ DeltaGlider Proxy intercepts the S3 operations it needs for delta compression (P
 | ListObjectsV2 | ✅ | Returns logical keys (hides delta internals) |
 | DeleteObjects | ✅ | Batch delete |
 | CopyObject | ✅ | Via x-amz-copy-source header |
-| CreateBucket | ✅ | Single-bucket mode |
-| HeadBucket | ✅ | Single-bucket mode |
+| CreateBucket | ✅ | Multi-bucket support |
+| HeadBucket | ✅ | Multi-bucket support |
 | DeleteBucket | ✅ | Must be empty |
-| ListBuckets | ✅ | Returns configured bucket |
-| Multipart upload | ❌ | Returns 501; use single PUT |
+| ListBuckets | ✅ | Lists all buckets |
+| CreateMultipartUpload | ✅ | `POST /{bucket}/{key}?uploads` |
+| UploadPart | ✅ | `PUT /{bucket}/{key}?partNumber=N&uploadId=X` |
+| CompleteMultipartUpload | ✅ | `POST /{bucket}/{key}?uploadId=X` |
+| AbortMultipartUpload | ✅ | `DELETE /{bucket}/{key}?uploadId=X` |
+| ListParts | ✅ | `GET /{bucket}/{key}?uploadId=X` |
+| ListMultipartUploads | ✅ | `GET /{bucket}?uploads` |
 | Versioning | ❌ | Not supported |
 | ACLs, lifecycle | ❌ | Not supported |
 

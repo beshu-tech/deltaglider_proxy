@@ -51,7 +51,7 @@ services:
     image: deltaglider-proxy:latest
     build:
       context: ../..
-      dockerfile: demo/jfrog_artifactory/Dockerfile.deltaglider
+      dockerfile: demo/s3-browser/Dockerfile.deltaglider
     container_name: s3browser-deltaglider
     ports:
       - "9002:9002"
@@ -59,7 +59,6 @@ services:
     environment:
       DELTAGLIDER_PROXY_LISTEN_ADDR: "0.0.0.0:9002"
       DELTAGLIDER_PROXY_DEFAULT_BUCKET: "data"
-      DELTAGLIDER_PROXY_S3_BUCKET: "deltaglider-data"
       DELTAGLIDER_PROXY_S3_ENDPOINT: "http://minio:9000"
       DELTAGLIDER_PROXY_S3_REGION: "us-east-1"
       DELTAGLIDER_PROXY_S3_FORCE_PATH_STYLE: "true"

@@ -4,10 +4,12 @@ use super::aws_chunked::{decode_aws_chunked, get_decoded_content_length, is_aws_
 use super::errors::S3Error;
 use super::extractors::{ValidatedBucket, ValidatedPath};
 use super::xml::{
-    escape_xml, BucketInfo, CopyObjectResult, DeleteError, DeleteRequest, DeleteResult,
-    DeletedObject, ListBucketResult, ListBucketsResult, S3Object,
+    BucketInfo, CompleteMultipartUploadRequest, CompleteMultipartUploadResult, CopyObjectResult,
+    DeleteError, DeleteRequest, DeleteResult, DeletedObject, InitiateMultipartUploadResult,
+    ListBucketResult, ListBucketsResult, ListMultipartUploadsResult, ListPartsResult, S3Object,
 };
 use crate::deltaglider::{DynEngine, RetrieveResponse};
+use crate::multipart::MultipartStore;
 use crate::types::{FileMetadata, StorageInfo};
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
@@ -19,13 +21,10 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, info, instrument, warn};
 
-const MULTIPART_NOT_SUPPORTED: &str =
-    "Multipart upload is not supported. Use single PUT for uploads.";
-
 /// Application state shared across handlers
 pub struct AppState {
     pub engine: DynEngine,
-    pub default_bucket: String,
+    pub multipart: Arc<MultipartStore>,
 }
 
 /// Query parameters for bucket-level GET operations
@@ -64,23 +63,7 @@ async fn put_object_inner(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    // Extract user-provided x-amz-meta-* headers (stored without the prefix)
-    use crate::types::meta_keys as mk;
-    let user_metadata: std::collections::HashMap<String, String> = headers
-        .iter()
-        .filter_map(|(name, value)| {
-            let name_str = name.as_str();
-            if let Some(suffix) = name_str.strip_prefix(mk::AMZ_META_PREFIX) {
-                if !suffix.starts_with("dg-") {
-                    // Skip DeltaGlider internal metadata (x-amz-meta-dg-*)
-                    if let Ok(v) = value.to_str() {
-                        return Some((suffix.to_string(), v.to_string()));
-                    }
-                }
-            }
-            None
-        })
-        .collect();
+    let user_metadata = extract_user_metadata(headers);
 
     let result = state
         .engine
@@ -176,8 +159,36 @@ fn hval(s: &str) -> HeaderValue {
     HeaderValue::from_bytes(s.as_bytes()).unwrap_or_else(|_| HeaderValue::from_static(""))
 }
 
+/// Extract user-provided x-amz-meta-* headers, excluding DeltaGlider internal metadata (dg-*).
+fn extract_user_metadata(headers: &HeaderMap) -> std::collections::HashMap<String, String> {
+    use crate::types::meta_keys as mk;
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let name_str = name.as_str();
+            if let Some(suffix) = name_str.strip_prefix(mk::AMZ_META_PREFIX) {
+                if !suffix.starts_with("dg-") {
+                    if let Ok(v) = value.to_str() {
+                        return Some((suffix.to_string(), v.to_string()));
+                    }
+                }
+            }
+            None
+        })
+        .collect()
+}
+
+/// Decode base64 string to bytes (for Content-MD5 validation)
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(input.trim())
+        .ok()
+}
+
 /// GET object handler
 /// GET /{bucket}/{key}
+/// GET /{bucket}/{key}?uploadId=X - ListParts
 ///
 /// Direct files are streamed from the backend (constant memory, low TTFB).
 /// Delta files are reconstructed in memory and sent as a buffered response.
@@ -185,7 +196,24 @@ fn hval(s: &str) -> HeaderValue {
 pub async fn get_object(
     State(state): State<Arc<AppState>>,
     ValidatedPath { bucket, key }: ValidatedPath,
+    Query(query): Query<ObjectQuery>,
 ) -> Result<Response, S3Error> {
+    // ListParts
+    if let Some(upload_id) = &query.upload_id {
+        info!("ListParts {}/{} uploadId={}", bucket, key, upload_id);
+        let parts = state.multipart.list_parts(upload_id, &bucket, &key)?;
+        let result = ListPartsResult {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            upload_id: upload_id.clone(),
+            parts,
+            max_parts: 1000,
+            is_truncated: false,
+        };
+        let xml = result.to_xml();
+        return Ok((StatusCode::OK, [("Content-Type", "application/xml")], xml).into_response());
+    }
+
     info!("GET {}/{}", bucket, key);
 
     let response = state.engine.retrieve_stream(&bucket, &key).await?;
@@ -257,7 +285,8 @@ pub async fn bucket_get_handler(
     // Check for ListMultipartUploads
     if query.uploads.is_some() {
         info!("LIST multipart uploads: {}", bucket);
-        return list_multipart_uploads(&bucket).await;
+        let prefix = query.prefix.as_deref();
+        return list_multipart_uploads(&state, &bucket, prefix).await;
     }
 
     // Default: ListObjects
@@ -344,31 +373,44 @@ async fn get_bucket_versioning(_bucket: &str) -> Result<Response, S3Error> {
     Ok((StatusCode::OK, [("Content-Type", "application/xml")], xml).into_response())
 }
 
-/// ListMultipartUploads handler (stub)
+/// ListMultipartUploads handler
 /// GET /{bucket}?uploads
-async fn list_multipart_uploads(bucket: &str) -> Result<Response, S3Error> {
-    // Return empty list - no ongoing multipart uploads
-    let xml = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-  <Bucket>{}</Bucket>
-  <KeyMarker/>
-  <UploadIdMarker/>
-  <MaxUploads>1000</MaxUploads>
-  <IsTruncated>false</IsTruncated>
-</ListMultipartUploadsResult>"#,
-        escape_xml(bucket)
-    );
+async fn list_multipart_uploads(
+    state: &Arc<AppState>,
+    bucket: &str,
+    prefix: Option<&str>,
+) -> Result<Response, S3Error> {
+    let uploads = state.multipart.list_uploads(Some(bucket), prefix);
+    let result = ListMultipartUploadsResult {
+        bucket: bucket.to_string(),
+        uploads,
+        prefix: prefix.unwrap_or("").to_string(),
+        max_uploads: 1000,
+        is_truncated: false,
+    };
+    let xml = result.to_xml();
     Ok((StatusCode::OK, [("Content-Type", "application/xml")], xml).into_response())
 }
 
 /// DELETE object handler
 /// DELETE /{bucket}/{key}
+/// DELETE /{bucket}/{key}?uploadId=X - AbortMultipartUpload
 #[instrument(skip(state))]
 pub async fn delete_object(
     State(state): State<Arc<AppState>>,
     ValidatedPath { bucket, key }: ValidatedPath,
+    Query(query): Query<ObjectQuery>,
 ) -> Result<Response, S3Error> {
+    // AbortMultipartUpload
+    if let Some(upload_id) = &query.upload_id {
+        info!(
+            "AbortMultipartUpload {}/{} uploadId={}",
+            bucket, key, upload_id
+        );
+        state.multipart.abort(upload_id, &bucket, &key)?;
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+
     info!("DELETE {}/{}", bucket, key);
 
     if let Err(err) = state.engine.delete(&bucket, &key).await {
@@ -558,48 +600,65 @@ pub async fn put_object_or_copy(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, S3Error> {
+    // Decode AWS chunked transfer encoding if present
+    let decoded_body = if is_aws_chunked(&headers) {
+        let expected_len = get_decoded_content_length(&headers);
+        debug!(
+            "Decoding AWS chunked payload: {} bytes, expected decoded: {:?}",
+            body.len(),
+            expected_len
+        );
+        match decode_aws_chunked(&body, expected_len) {
+            Some(decoded) => {
+                debug!(
+                    "Successfully decoded AWS chunked: {} -> {} bytes",
+                    body.len(),
+                    decoded.len()
+                );
+                decoded
+            }
+            None => {
+                warn!(
+                    "Failed to decode AWS chunked payload, using raw body ({} bytes)",
+                    body.len()
+                );
+                body
+            }
+        }
+    } else {
+        body
+    };
+
     // Check if this is a multipart upload part
     if let (Some(part_num), Some(upload_id)) = (&query.part_number, &query.upload_id) {
         info!(
             "UploadPart {}/{} part={} uploadId={}",
             bucket, key, part_num, upload_id
         );
-        return Err(S3Error::NotImplemented(MULTIPART_NOT_SUPPORTED.to_string()));
+
+        // Validate Content-MD5 header if present
+        if let Some(content_md5) = headers.get("content-md5").and_then(|v| v.to_str().ok()) {
+            use md5::Digest;
+            let computed = md5::Md5::digest(&decoded_body);
+            let expected = base64_decode(content_md5);
+            if let Some(expected) = expected {
+                if computed.as_slice() != expected.as_slice() {
+                    return Err(S3Error::BadDigest);
+                }
+            }
+        }
+
+        let etag =
+            state
+                .multipart
+                .upload_part(upload_id, &bucket, &key, *part_num, decoded_body)?;
+        return Ok((StatusCode::OK, [("ETag", etag)], "").into_response());
     }
 
     // Check if this is a copy operation
     if headers.contains_key("x-amz-copy-source") {
         copy_object_inner(&state, &bucket, &key, &headers).await
     } else {
-        // Decode AWS chunked transfer encoding if present
-        let decoded_body = if is_aws_chunked(&headers) {
-            let expected_len = get_decoded_content_length(&headers);
-            debug!(
-                "Decoding AWS chunked payload: {} bytes, expected decoded: {:?}",
-                body.len(),
-                expected_len
-            );
-            match decode_aws_chunked(&body, expected_len) {
-                Some(decoded) => {
-                    debug!(
-                        "Successfully decoded AWS chunked: {} -> {} bytes",
-                        body.len(),
-                        decoded.len()
-                    );
-                    decoded
-                }
-                None => {
-                    warn!(
-                        "Failed to decode AWS chunked payload, using raw body ({} bytes)",
-                        body.len()
-                    );
-                    body
-                }
-            }
-        } else {
-            body
-        };
-
         put_object_inner(&state, &bucket, &key, &headers, &decoded_body).await
     }
 }
@@ -607,17 +666,36 @@ pub async fn put_object_or_copy(
 /// POST object handler for multipart upload operations
 /// POST /{bucket}/{key}?uploads - CreateMultipartUpload
 /// POST /{bucket}/{key}?uploadId=X - CompleteMultipartUpload
-#[instrument(skip(_state, _body))]
+#[instrument(skip(state, body))]
 pub async fn post_object(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     ValidatedPath { bucket, key }: ValidatedPath,
     Query(query): Query<ObjectQuery>,
-    _body: Bytes,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Response, S3Error> {
     // CreateMultipartUpload
     if query.uploads.is_some() {
         info!("CreateMultipartUpload {}/{}", bucket, key);
-        return Err(S3Error::NotImplemented(MULTIPART_NOT_SUPPORTED.to_string()));
+
+        let content_type = headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        let user_metadata = extract_user_metadata(&headers);
+
+        let upload_id = state
+            .multipart
+            .create(&bucket, &key, content_type, user_metadata);
+
+        let result = InitiateMultipartUploadResult {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            upload_id,
+        };
+        let xml = result.to_xml();
+        return Ok((StatusCode::OK, [("Content-Type", "application/xml")], xml).into_response());
     }
 
     // CompleteMultipartUpload
@@ -626,7 +704,67 @@ pub async fn post_object(
             "CompleteMultipartUpload {}/{} uploadId={}",
             bucket, key, upload_id
         );
-        return Err(S3Error::NotImplemented(MULTIPART_NOT_SUPPORTED.to_string()));
+
+        let body_str = String::from_utf8(body.to_vec()).map_err(|_| S3Error::MalformedXML)?;
+        let complete_req = CompleteMultipartUploadRequest::from_xml(&body_str).map_err(|e| {
+            warn!("Failed to parse CompleteMultipartUpload XML: {}", e);
+            S3Error::MalformedXML
+        })?;
+
+        let requested_parts: Vec<(u32, String)> = complete_req
+            .parts
+            .iter()
+            .map(|p| (p.part_number, p.etag.clone()))
+            .collect();
+
+        let completed = state
+            .multipart
+            .complete(upload_id, &bucket, &key, &requested_parts)?;
+
+        let multipart_etag = completed.etag.clone();
+
+        // Store assembled object through the engine
+        let store_result = state
+            .engine
+            .store(
+                &bucket,
+                &key,
+                &completed.data,
+                completed.content_type,
+                completed.user_metadata,
+            )
+            .await?;
+
+        // Remove upload only after successful store
+        state.multipart.remove(upload_id);
+
+        debug!(
+            "CompleteMultipartUpload {}/{} stored as {}, {} bytes",
+            bucket,
+            key,
+            store_result.metadata.storage_info.label(),
+            completed.data.len()
+        );
+
+        let result = CompleteMultipartUploadResult {
+            location: format!("/{}/{}", bucket, key),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            etag: multipart_etag,
+        };
+        let xml = result.to_xml();
+        return Ok((
+            StatusCode::OK,
+            [
+                ("Content-Type", "application/xml"),
+                (
+                    "x-amz-storage-type",
+                    store_result.metadata.storage_info.label(),
+                ),
+            ],
+            xml,
+        )
+            .into_response());
     }
 
     Err(S3Error::InvalidRequest(

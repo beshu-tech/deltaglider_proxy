@@ -22,7 +22,6 @@ Run MinIO on `:9000`, run DeltaGlider Proxy on a different port (example `:9002`
 docker compose up -d
 
 DELTAGLIDER_PROXY_LISTEN_ADDR=127.0.0.1:9002 \
-DELTAGLIDER_PROXY_S3_BUCKET=deltaglider_proxy-data \
 DELTAGLIDER_PROXY_S3_ENDPOINT=http://127.0.0.1:9000 \
 AWS_ACCESS_KEY_ID=minioadmin \
 AWS_SECRET_ACCESS_KEY=minioadmin \
@@ -72,7 +71,8 @@ RUST_LOG=deltaglider_proxy=debug,tower_http=info cargo run --release
 
 ## Security model (read this twice)
 
-- No request authentication (no SigV4). Treat DeltaGlider Proxy like an internal service and put it behind network policy / a trusted reverse proxy.
+- **Optional SigV4 authentication**: When `DELTAGLIDER_PROXY_ACCESS_KEY_ID` and `DELTAGLIDER_PROXY_SECRET_ACCESS_KEY` are both set, all requests must be signed with valid AWS Signature V4 credentials. Standard S3 tools (aws-cli, boto3, Terraform) work out of the box. See [AUTHENTICATION.md](AUTHENTICATION.md) for details.
+- **Without authentication**: If credentials are not configured, DeltaGlider Proxy accepts all requests. Treat it like an internal service and put it behind network policy / a trusted reverse proxy.
 - Keys are validated to reject `..` path segments and backslashes, but you should still avoid exposing the proxy directly to untrusted clients.
 
 ## Performance knobs

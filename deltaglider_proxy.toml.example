@@ -4,8 +4,8 @@
 # Server listen address
 listen_addr = "127.0.0.1:9000"
 
-# Default bucket name (single-bucket mode)
-# Clients must use this bucket name in their S3 requests
+# Default bucket name (created automatically on startup)
+# Additional buckets can be created via the S3 CreateBucket API
 default_bucket = "default"
 
 # DeltaGlider Settings
@@ -43,9 +43,6 @@ path = "./data"
 # # S3 endpoint (optional for AWS, required for MinIO/LocalStack)
 # endpoint = "http://localhost:9000"
 #
-# # S3 bucket for storing DeltaGlider objects
-# bucket = "deltaglider_proxy-data"
-#
 # # AWS region
 # region = "us-east-1"
 #
@@ -69,7 +66,6 @@ path = "./data"
 # DELTAGLIDER_PROXY_CACHE_SIZE_MB    - Cache size in MB
 #
 # For S3 backend:
-# DELTAGLIDER_PROXY_S3_BUCKET        - S3 bucket name (enables S3 backend)
 # DELTAGLIDER_PROXY_S3_ENDPOINT      - S3 endpoint URL
 # DELTAGLIDER_PROXY_S3_REGION        - AWS region
 # DELTAGLIDER_PROXY_S3_FORCE_PATH_STYLE - Use path-style URLs (true/false)

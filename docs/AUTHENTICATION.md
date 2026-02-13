@@ -48,7 +48,6 @@ export DELTAGLIDER_PROXY_SECRET_ACCESS_KEY=proxy-secret
 # Backend auth (what the proxy uses to talk to S3/MinIO)
 export AWS_ACCESS_KEY_ID=minioadmin
 export AWS_SECRET_ACCESS_KEY=minioadmin
-export DELTAGLIDER_PROXY_S3_BUCKET=deltaglider-data
 export DELTAGLIDER_PROXY_S3_ENDPOINT=http://localhost:9000
 ```
 

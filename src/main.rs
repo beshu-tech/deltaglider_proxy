@@ -12,8 +12,10 @@ use deltaglider_proxy::api::handlers::{
 };
 use deltaglider_proxy::config::{BackendConfig, Config};
 use deltaglider_proxy::deltaglider::DynEngine;
+use deltaglider_proxy::multipart::MultipartStore;
 use deltaglider_proxy::storage::FilesystemBackend;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tower_http::cors::CorsLayer;
@@ -152,10 +154,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let state = Arc::new(AppState {
-        engine,
-        default_bucket: config.default_bucket.clone(),
-    });
+    let multipart = Arc::new(MultipartStore::new(config.max_object_size));
+
+    // Spawn periodic cleanup task for expired multipart uploads
+    {
+        let mp = multipart.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            loop {
+                interval.tick().await;
+                mp.cleanup_expired(Duration::from_secs(3600));
+            }
+        });
+    }
+
+    let state = Arc::new(AppState { engine, multipart });
 
     // Build auth config (None if credentials not configured)
     let auth_config: Option<Arc<AuthConfig>> = if let (Some(ref key_id), Some(ref secret)) =
