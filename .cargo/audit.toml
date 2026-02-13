@@ -1,4 +1,27 @@
 [advisories]
-# shlex 0.1.1: transitive build-dep from xdelta3 -> bindgen 0.52.
-# Cannot upgrade without forking xdelta3. Build-time only, not runtime.
-ignore = ["RUSTSEC-2024-0006"]
+ignore = [
+    # shlex 0.1.1: transitive build-dep from xdelta3 -> bindgen 0.52.
+    # Cannot upgrade without forking xdelta3. Build-time only, not runtime.
+    "RUSTSEC-2024-0006",
+
+    # ansi_term 0.12.1 (unmaintained): xdelta3 -> bindgen 0.52 -> clap 2.x.
+    # Build-time only, not runtime.
+    "RUSTSEC-2021-0139",
+
+    # atty 0.2.14 (unmaintained + unsound on Windows): xdelta3 -> bindgen 0.52 -> clap 2.x.
+    # Build-time only, not runtime. Unsoundness only affects Windows.
+    "RUSTSEC-2024-0375",
+    "RUSTSEC-2021-0145",
+
+    # proc-macro-error 1.0.4 (unmaintained): transitive dep via procedural macros.
+    # Compile-time only.
+    "RUSTSEC-2024-0370",
+
+    # rand_os 0.1.3 (unmaintained): xdelta3 -> rand 0.6.
+    # Cannot upgrade without forking xdelta3.
+    "RUSTSEC-2025-0124",
+
+    # rustls-pemfile 2.2.0 (unmaintained): transitive from reqwest/aws-sdk TLS stack.
+    # Upstream needs to migrate to rustls-pki-types PemObject.
+    "RUSTSEC-2025-0134",
+]
