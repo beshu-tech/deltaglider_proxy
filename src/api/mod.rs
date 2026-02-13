@@ -9,3 +9,4 @@ mod xml;
 
 pub use errors::S3Error;
 pub use extractors::{ValidatedBucket, ValidatedPath};
+pub use xml::{PartInfo, UploadInfo};

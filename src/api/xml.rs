@@ -313,6 +313,213 @@ impl ListBucketsResult {
     }
 }
 
+// ============================================================================
+// Multipart Upload Request/Response
+// ============================================================================
+
+/// Part in a CompleteMultipartUpload request
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompletePart {
+    #[serde(rename = "PartNumber")]
+    pub part_number: u32,
+    #[serde(rename = "ETag")]
+    pub etag: String,
+}
+
+/// CompleteMultipartUpload request body
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompleteMultipartUploadRequest {
+    #[serde(rename = "Part")]
+    pub parts: Vec<CompletePart>,
+}
+
+impl CompleteMultipartUploadRequest {
+    /// Parse from XML body
+    pub fn from_xml(xml: &str) -> Result<Self, quick_xml::DeError> {
+        quick_xml::de::from_str(xml)
+    }
+}
+
+/// InitiateMultipartUpload response
+#[derive(Debug, Clone)]
+pub struct InitiateMultipartUploadResult {
+    pub bucket: String,
+    pub key: String,
+    pub upload_id: String,
+}
+
+impl InitiateMultipartUploadResult {
+    pub fn to_xml(&self) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Bucket>{}</Bucket>
+  <Key>{}</Key>
+  <UploadId>{}</UploadId>
+</InitiateMultipartUploadResult>"#,
+            escape_xml(&self.bucket),
+            escape_xml(&self.key),
+            escape_xml(&self.upload_id),
+        )
+    }
+}
+
+/// CompleteMultipartUpload response
+#[derive(Debug, Clone)]
+pub struct CompleteMultipartUploadResult {
+    pub location: String,
+    pub bucket: String,
+    pub key: String,
+    pub etag: String,
+}
+
+impl CompleteMultipartUploadResult {
+    pub fn to_xml(&self) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Location>{}</Location>
+  <Bucket>{}</Bucket>
+  <Key>{}</Key>
+  <ETag>{}</ETag>
+</CompleteMultipartUploadResult>"#,
+            escape_xml(&self.location),
+            escape_xml(&self.bucket),
+            escape_xml(&self.key),
+            escape_xml(&self.etag),
+        )
+    }
+}
+
+/// Part info for ListParts response
+#[derive(Debug, Clone)]
+pub struct PartInfo {
+    pub part_number: u32,
+    pub etag: String,
+    pub size: u64,
+    pub last_modified: DateTime<Utc>,
+}
+
+/// ListParts response
+#[derive(Debug, Clone)]
+pub struct ListPartsResult {
+    pub bucket: String,
+    pub key: String,
+    pub upload_id: String,
+    pub parts: Vec<PartInfo>,
+    pub max_parts: u32,
+    pub is_truncated: bool,
+}
+
+impl ListPartsResult {
+    pub fn to_xml(&self) -> String {
+        let mut xml = String::new();
+        xml.push_str(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
+        xml.push('\n');
+        xml.push_str(r#"<ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#);
+        xml.push('\n');
+        xml.push_str(&format!(
+            "  <Bucket>{}</Bucket>\n",
+            escape_xml(&self.bucket)
+        ));
+        xml.push_str(&format!("  <Key>{}</Key>\n", escape_xml(&self.key)));
+        xml.push_str(&format!(
+            "  <UploadId>{}</UploadId>\n",
+            escape_xml(&self.upload_id)
+        ));
+        xml.push_str(&format!("  <MaxParts>{}</MaxParts>\n", self.max_parts));
+        xml.push_str(&format!(
+            "  <IsTruncated>{}</IsTruncated>\n",
+            self.is_truncated
+        ));
+
+        for part in &self.parts {
+            xml.push_str("  <Part>\n");
+            xml.push_str(&format!(
+                "    <PartNumber>{}</PartNumber>\n",
+                part.part_number
+            ));
+            xml.push_str(&format!("    <ETag>{}</ETag>\n", escape_xml(&part.etag)));
+            xml.push_str(&format!("    <Size>{}</Size>\n", part.size));
+            xml.push_str(&format!(
+                "    <LastModified>{}</LastModified>\n",
+                part.last_modified.format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            ));
+            xml.push_str("  </Part>\n");
+        }
+
+        xml.push_str("</ListPartsResult>");
+        xml
+    }
+}
+
+/// Upload info for ListMultipartUploads response
+#[derive(Debug, Clone)]
+pub struct UploadInfo {
+    pub key: String,
+    pub upload_id: String,
+    pub initiated: DateTime<Utc>,
+}
+
+/// ListMultipartUploads response
+#[derive(Debug, Clone)]
+pub struct ListMultipartUploadsResult {
+    pub bucket: String,
+    pub uploads: Vec<UploadInfo>,
+    pub prefix: String,
+    pub max_uploads: u32,
+    pub is_truncated: bool,
+}
+
+impl ListMultipartUploadsResult {
+    pub fn to_xml(&self) -> String {
+        let mut xml = String::new();
+        xml.push_str(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
+        xml.push('\n');
+        xml.push_str(
+            r#"<ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
+        );
+        xml.push('\n');
+        xml.push_str(&format!(
+            "  <Bucket>{}</Bucket>\n",
+            escape_xml(&self.bucket)
+        ));
+        xml.push_str("  <KeyMarker/>\n");
+        xml.push_str("  <UploadIdMarker/>\n");
+        if !self.prefix.is_empty() {
+            xml.push_str(&format!(
+                "  <Prefix>{}</Prefix>\n",
+                escape_xml(&self.prefix)
+            ));
+        }
+        xml.push_str(&format!(
+            "  <MaxUploads>{}</MaxUploads>\n",
+            self.max_uploads
+        ));
+        xml.push_str(&format!(
+            "  <IsTruncated>{}</IsTruncated>\n",
+            self.is_truncated
+        ));
+
+        for upload in &self.uploads {
+            xml.push_str("  <Upload>\n");
+            xml.push_str(&format!("    <Key>{}</Key>\n", escape_xml(&upload.key)));
+            xml.push_str(&format!(
+                "    <UploadId>{}</UploadId>\n",
+                escape_xml(&upload.upload_id)
+            ));
+            xml.push_str(&format!(
+                "    <Initiated>{}</Initiated>\n",
+                upload.initiated.format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            ));
+            xml.push_str("  </Upload>\n");
+        }
+
+        xml.push_str("</ListMultipartUploadsResult>");
+        xml
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

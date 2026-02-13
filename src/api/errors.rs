@@ -35,6 +35,18 @@ pub enum S3Error {
     #[error("MalformedXML: The XML you provided was not well-formed.")]
     MalformedXML,
 
+    #[error("NoSuchUpload: The specified multipart upload does not exist.")]
+    NoSuchUpload(String),
+
+    #[error("InvalidPart: {0}")]
+    InvalidPart(String),
+
+    #[error("InvalidPartOrder: The list of parts was not in ascending order.")]
+    InvalidPartOrder,
+
+    #[error("BadDigest: The Content-MD5 you specified did not match what we received.")]
+    BadDigest,
+
     #[error("NotImplemented: {0}")]
     NotImplemented(String),
 
@@ -58,6 +70,10 @@ impl S3Error {
             S3Error::InvalidArgument(_) => "InvalidArgument",
             S3Error::InvalidRequest(_) => "InvalidRequest",
             S3Error::MalformedXML => "MalformedXML",
+            S3Error::NoSuchUpload(_) => "NoSuchUpload",
+            S3Error::InvalidPart(_) => "InvalidPart",
+            S3Error::InvalidPartOrder => "InvalidPartOrder",
+            S3Error::BadDigest => "BadDigest",
             S3Error::NotImplemented(_) => "NotImplemented",
             S3Error::AccessDenied => "AccessDenied",
             S3Error::SignatureDoesNotMatch => "SignatureDoesNotMatch",
@@ -76,6 +92,10 @@ impl S3Error {
             S3Error::InvalidArgument(_) => StatusCode::BAD_REQUEST,
             S3Error::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             S3Error::MalformedXML => StatusCode::BAD_REQUEST,
+            S3Error::NoSuchUpload(_) => StatusCode::NOT_FOUND,
+            S3Error::InvalidPart(_) => StatusCode::BAD_REQUEST,
+            S3Error::InvalidPartOrder => StatusCode::BAD_REQUEST,
+            S3Error::BadDigest => StatusCode::BAD_REQUEST,
             S3Error::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             S3Error::AccessDenied => StatusCode::FORBIDDEN,
             S3Error::SignatureDoesNotMatch => StatusCode::FORBIDDEN,

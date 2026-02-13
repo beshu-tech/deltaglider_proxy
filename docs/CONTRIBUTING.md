@@ -35,9 +35,8 @@ The S3 API starts on `http://localhost:9000` and the demo UI on `http://localhos
 # Unit tests (no external services needed)
 cargo test
 
-# Integration tests with MinIO (needs Docker)
-docker compose up -d
-cargo test -- --ignored
+# Integration tests (needs Docker — MinIO is started automatically via testcontainers)
+cargo test --test s3_integration_test
 ```
 
 ### Code Quality Checks
@@ -58,7 +57,7 @@ src/
 │   ├── handlers.rs    # S3 API endpoint handlers
 │   ├── extractors.rs  # Axum request extractors
 │   ├── errors.rs      # S3 error responses
-│   └── xml.rs         # S3 XML response builders
+│   └── xml.rs         # S3 XML response/request builders
 ├── deltaglider/
 │   ├── engine.rs      # Core delta compression logic
 │   ├── codec.rs       # xdelta3 encode/decode
@@ -68,7 +67,9 @@ src/
 │   ├── traits.rs      # StorageBackend trait
 │   ├── filesystem.rs  # Local filesystem backend
 │   └── s3.rs          # S3 backend
+├── auth.rs            # SigV4 authentication middleware
 ├── config.rs          # Configuration loading
+├── multipart.rs       # In-memory multipart upload state management
 ├── types.rs           # Core types (FileMetadata, etc)
 ├── demo.rs            # Embedded React demo UI (rust-embed)
 └── main.rs            # Server entry point

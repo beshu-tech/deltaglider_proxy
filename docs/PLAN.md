@@ -10,9 +10,10 @@ DeltaGlider Proxy is an S3-compatible object storage server implementing the **D
 - ML model checkpoints
 - Any versioned binary content with incremental changes
 
-### Scope (MVP)
-- **Endpoints**: PUT, GET, LIST (ListObjectsV2)
-- **Storage**: Local filesystem (S3-like structure)
+### Scope
+- **Endpoints**: PUT, GET, HEAD, DELETE, LIST, COPY, multipart upload (Create, UploadPart, Complete, Abort, ListParts, ListUploads), bucket operations
+- **Storage**: Local filesystem or upstream S3 backend
+- **Authentication**: Optional SigV4 with CORS preflight support
 - **Deduplication**: DeltaGlider with xdelta3
 - **Limitations**: 100MB max object size, single-node
 
@@ -99,13 +100,15 @@ PUT object
 src/
 ├── main.rs                     # Axum server bootstrap, config
 ├── config.rs                   # Configuration (port, data_dir, max_ratio)
+├── auth.rs                     # SigV4 authentication middleware
+├── multipart.rs                # In-memory multipart upload state management
 ├── demo.rs                     # Embedded React demo UI (rust-embed, served on S3 port + 1)
 │
 ├── api/
 │   ├── mod.rs
-│   ├── handlers.rs             # PUT, GET, LIST request handlers
-│   ├── xml.rs                  # S3 XML response builders
-│   └── errors.rs               # S3 error codes (NoSuchKey, etc.)
+│   ├── handlers.rs             # S3 API endpoint handlers (PUT, GET, LIST, multipart, etc.)
+│   ├── xml.rs                  # S3 XML response/request builders
+│   └── errors.rs               # S3 error codes (NoSuchKey, NoSuchUpload, etc.)
 │
 ├── deltaglider/
 │   ├── mod.rs
@@ -118,7 +121,8 @@ src/
 ├── storage/
 │   ├── mod.rs
 │   ├── traits.rs               # StorageBackend trait (ports)
-│   └── filesystem.rs           # Filesystem implementation (adapter)
+│   ├── filesystem.rs           # Filesystem implementation (adapter)
+│   └── s3.rs                   # S3 backend implementation
 │
 └── types.rs                    # ObjectKey, ContentHash, ObjectMetadata
 demo/s3-browser/ui/             # React demo UI source (Vite + TypeScript)
@@ -461,7 +465,7 @@ rand = "0.8"
 - Multi-node clustering with distributed deltaspace
 - Streaming for large files (>10MB)
 - Automatic reference rotation (better compression over time)
-- DELETE endpoint with garbage collection
-- Multipart upload support
-- Bucket creation/deletion APIs
-- Authentication (S3 signature v4)
+- ~~DELETE endpoint with garbage collection~~ — ✅ Implemented
+- ~~Multipart upload support~~ — ✅ Implemented (CreateMultipartUpload, UploadPart, CompleteMultipartUpload, AbortMultipartUpload, ListParts, ListMultipartUploads)
+- ~~Bucket creation/deletion APIs~~ — ✅ Implemented (CreateBucket, HeadBucket, DeleteBucket, ListBuckets)
+- ~~Authentication (S3 signature v4)~~ — ✅ Implemented (optional SigV4 with CORS preflight support)

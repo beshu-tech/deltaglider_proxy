@@ -32,6 +32,7 @@ sha2 = "0.10"
 hmac = "0.12"
 md-5 = "0.10"
 hex = "0.4"
+base64 = "0.22"
 
 # XML for S3 responses
 quick-xml = { version = "0.36", features = ["serialize"] }
@@ -63,3 +64,4 @@ tokio-test = "0.4"
 reqwest = { version = "0.12", features = ["json"] }
 testcontainers = "0.26"
 testcontainers-modules = { version = "0.14", features = ["minio"] }
+libc = "0.2"

@@ -98,31 +98,6 @@ pub struct DeltaGliderEngine<S: StorageBackend> {
     prefix_locks: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
-impl DeltaGliderEngine<FilesystemBackend> {
-    /// Create a new engine with filesystem backend from configuration
-    pub async fn new_filesystem(config: &Config) -> Result<Self, StorageError> {
-        let path = match &config.backend {
-            BackendConfig::Filesystem { path } => path.clone(),
-            _ => {
-                return Err(StorageError::Other(
-                    "Expected Filesystem backend configuration".to_string(),
-                ));
-            }
-        };
-
-        let storage = Arc::new(FilesystemBackend::new(path).await?);
-        Ok(Self::new_with_backend(storage, config))
-    }
-}
-
-impl DeltaGliderEngine<S3Backend> {
-    /// Create a new engine with S3 backend from configuration
-    pub async fn new_s3(config: &Config) -> Result<Self, StorageError> {
-        let storage = Arc::new(S3Backend::new(&config.backend).await?);
-        Ok(Self::new_with_backend(storage, config))
-    }
-}
-
 /// Type alias for engine with dynamic backend dispatch
 pub type DynEngine = DeltaGliderEngine<Box<dyn StorageBackend>>;
 
@@ -474,21 +449,28 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         })
     }
 
+    /// Delete a storage object, ignoring NotFound errors (idempotent delete).
+    async fn delete_ignoring_not_found(
+        result: Result<(), StorageError>,
+    ) -> Result<(), EngineError> {
+        match result {
+            Ok(()) | Err(StorageError::NotFound(_)) => Ok(()),
+            Err(other) => Err(other.into()),
+        }
+    }
+
     async fn delete_delta_if_exists(
         &self,
         bucket: &str,
         deltaspace_id: &str,
         filename: &str,
     ) -> Result<(), EngineError> {
-        match self
-            .storage
-            .delete_delta(bucket, deltaspace_id, filename)
-            .await
-        {
-            Ok(()) => Ok(()),
-            Err(StorageError::NotFound(_)) => Ok(()),
-            Err(other) => Err(other.into()),
-        }
+        Self::delete_ignoring_not_found(
+            self.storage
+                .delete_delta(bucket, deltaspace_id, filename)
+                .await,
+        )
+        .await
     }
 
     async fn delete_direct_if_exists(
@@ -497,15 +479,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         deltaspace_id: &str,
         filename: &str,
     ) -> Result<(), EngineError> {
-        match self
-            .storage
-            .delete_direct(bucket, deltaspace_id, filename)
-            .await
-        {
-            Ok(()) => Ok(()),
-            Err(StorageError::NotFound(_)) => Ok(()),
-            Err(other) => Err(other.into()),
-        }
+        Self::delete_ignoring_not_found(
+            self.storage
+                .delete_direct(bucket, deltaspace_id, filename)
+                .await,
+        )
+        .await
     }
 
     async fn migrate_legacy_reference_object_if_needed(

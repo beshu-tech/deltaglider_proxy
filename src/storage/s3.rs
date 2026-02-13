@@ -733,15 +733,23 @@ impl StorageBackend for S3Backend {
                 StorageError::S3(format!("get_object failed: {}", e))
             })?;
 
-        let data = response
-            .body
-            .collect()
-            .await
-            .map_err(|e| StorageError::S3(format!("Failed to read response body: {}", e)))?
-            .into_bytes();
+        debug!("S3 GET stream {}/{}", bucket, key);
 
-        debug!("S3 GET stream {}/{} ({} bytes)", bucket, key, data.len());
-        Ok(Box::pin(futures::stream::once(async { Ok(data) })))
+        // Stream chunks directly from the S3 response body without buffering.
+        let stream = futures::stream::unfold(response.body, |mut body| async {
+            match body.try_next().await {
+                Ok(Some(chunk)) => Some((Ok(chunk), body)),
+                Ok(None) => None,
+                Err(e) => Some((
+                    Err(StorageError::S3(format!(
+                        "Failed to read response body: {}",
+                        e
+                    ))),
+                    body,
+                )),
+            }
+        });
+        Ok(Box::pin(stream))
     }
 
     // === Scanning operations ===
