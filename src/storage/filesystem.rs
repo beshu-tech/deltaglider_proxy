@@ -657,6 +657,56 @@ impl StorageBackend for FilesystemBackend {
         .await
     }
 
+    // === Chunked write operations ===
+
+    #[instrument(skip(self, chunks, metadata))]
+    async fn put_direct_chunked(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        chunks: &[Bytes],
+        metadata: &FileMetadata,
+    ) -> Result<(), StorageError> {
+        let data_path = self.direct_path(bucket, prefix, filename);
+        let meta_path = self.direct_meta_path(bucket, prefix, filename);
+
+        self.ensure_dir(&data_path).await?;
+
+        // Write chunks sequentially to a temp file, then fsync + rename.
+        // This avoids allocating a contiguous buffer for the entire object.
+        let parent = data_path
+            .parent()
+            .ok_or_else(|| {
+                StorageError::Other("Cannot write to a path with no parent".into())
+            })?
+            .to_path_buf();
+        let target = data_path.clone();
+        let chunks: Vec<Bytes> = chunks.to_vec();
+        let num_chunks = chunks.len();
+
+        tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
+            let mut tmp = NamedTempFile::new_in(&parent).map_err(io_to_storage_error)?;
+            for chunk in &chunks {
+                tmp.write_all(chunk).map_err(io_to_storage_error)?;
+            }
+            tmp.as_file().sync_all().map_err(io_to_storage_error)?;
+            tmp.persist(&target)
+                .map_err(|e| io_to_storage_error(e.error))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| StorageError::Other(format!("spawn_blocking join failed: {}", e)))??;
+
+        self.write_metadata(&meta_path, metadata).await?;
+
+        debug!(
+            "Wrote direct chunked ({} chunks) for {}/{}",
+            num_chunks, prefix, filename
+        );
+        Ok(())
+    }
+
     // === Streaming operations ===
 
     #[instrument(skip(self))]

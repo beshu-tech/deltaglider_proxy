@@ -417,6 +417,79 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         Ok(metadata)
     }
 
+    /// Check if a key's filename is eligible for delta compression.
+    pub fn is_delta_eligible(&self, key: &str) -> bool {
+        let obj_key = ObjectKey::parse("_", key);
+        self.file_router.is_delta_eligible(&obj_key.filename)
+    }
+
+    /// Store a non-delta-eligible object from pre-split chunks without assembling
+    /// into a contiguous buffer. Computes SHA256 and MD5 incrementally.
+    #[instrument(skip(self, chunks, user_metadata))]
+    pub async fn store_direct_chunked(
+        &self,
+        bucket: &str,
+        key: &str,
+        chunks: &[Bytes],
+        total_size: u64,
+        content_type: Option<String>,
+        user_metadata: HashMap<String, String>,
+    ) -> Result<StoreResult, EngineError> {
+        if total_size > self.max_object_size {
+            return Err(EngineError::TooLarge {
+                size: total_size,
+                max: self.max_object_size,
+            });
+        }
+
+        let obj_key = ObjectKey::parse(bucket, key);
+        obj_key
+            .validate_object()
+            .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
+        let deltaspace_id = obj_key.deltaspace_id();
+
+        // Compute SHA256 + MD5 incrementally across chunks
+        let mut sha256_hasher = Sha256::new();
+        let mut md5_hasher = Md5::new();
+        for chunk in chunks {
+            sha256_hasher.update(chunk);
+            md5_hasher.update(chunk);
+        }
+        let sha256 = hex::encode(sha256_hasher.finalize());
+        let md5 = hex::encode(md5_hasher.finalize());
+
+        info!(
+            "Storing chunked {}/{} ({} bytes, {} chunks, sha256={})",
+            bucket,
+            key,
+            total_size,
+            chunks.len(),
+            &sha256[..8]
+        );
+
+        let _lock = self.acquire_prefix_lock(&deltaspace_id).await;
+        self.delete_delta_if_exists(bucket, &deltaspace_id, &obj_key.filename)
+            .await?;
+
+        let mut metadata = FileMetadata::new_direct(
+            obj_key.filename.clone(),
+            sha256,
+            md5,
+            total_size,
+            content_type,
+        );
+        metadata.user_metadata = user_metadata;
+
+        self.storage
+            .put_direct_chunked(bucket, &deltaspace_id, &obj_key.filename, chunks, &metadata)
+            .await?;
+
+        Ok(StoreResult {
+            metadata,
+            stored_size: total_size,
+        })
+    }
+
     /// Store directly without delta compression
     #[allow(clippy::too_many_arguments)]
     async fn store_direct(

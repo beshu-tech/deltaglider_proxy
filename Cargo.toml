@@ -50,6 +50,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 urlencoding = "2"
 tempfile = "3"
+libc = "0.2"
 
 # Embedded demo UI
 rust-embed = { version = "8", features = ["compression"] }
@@ -64,4 +65,3 @@ tokio-test = "0.4"
 reqwest = { version = "0.12", features = ["json"] }
 testcontainers = "0.26"
 testcontainers-modules = { version = "0.14", features = ["minio"] }
-libc = "0.2"

@@ -717,33 +717,52 @@ pub async fn post_object(
             .map(|p| (p.part_number, p.etag.clone()))
             .collect();
 
-        let completed = state
-            .multipart
-            .complete(upload_id, &bucket, &key, &requested_parts)?;
-
-        let multipart_etag = completed.etag.clone();
-
-        // Store assembled object through the engine
-        let store_result = state
-            .engine
-            .store(
-                &bucket,
-                &key,
-                &completed.data,
-                completed.content_type,
-                completed.user_metadata,
-            )
-            .await?;
+        // Bifurcate: non-delta-eligible files use the chunked path to avoid
+        // assembling all parts into a single contiguous buffer (~2x memory savings).
+        let (multipart_etag, store_result) = if !state.engine.is_delta_eligible(&key) {
+            let completed = state
+                .multipart
+                .complete_parts(upload_id, &bucket, &key, &requested_parts)?;
+            let etag = completed.etag.clone();
+            let total_size = completed.total_size;
+            let result = state
+                .engine
+                .store_direct_chunked(
+                    &bucket,
+                    &key,
+                    &completed.parts,
+                    total_size,
+                    completed.content_type,
+                    completed.user_metadata,
+                )
+                .await?;
+            (etag, result)
+        } else {
+            let completed = state
+                .multipart
+                .complete(upload_id, &bucket, &key, &requested_parts)?;
+            let etag = completed.etag.clone();
+            let result = state
+                .engine
+                .store(
+                    &bucket,
+                    &key,
+                    &completed.data,
+                    completed.content_type,
+                    completed.user_metadata,
+                )
+                .await?;
+            (etag, result)
+        };
 
         // Remove upload only after successful store
         state.multipart.remove(upload_id);
 
         debug!(
-            "CompleteMultipartUpload {}/{} stored as {}, {} bytes",
+            "CompleteMultipartUpload {}/{} stored as {}",
             bucket,
             key,
             store_result.metadata.storage_info.label(),
-            completed.data.len()
         );
 
         let result = CompleteMultipartUploadResult {
@@ -935,6 +954,26 @@ pub struct HealthResponse {
     pub status: String,
     pub version: String,
     pub backend: String,
+    pub peak_rss_bytes: u64,
+}
+
+/// Return the process-lifetime peak RSS (high-water mark) in bytes.
+/// Uses `getrusage(RUSAGE_SELF)` which captures even microsecond-lived allocations.
+fn get_peak_rss_bytes() -> u64 {
+    unsafe {
+        let mut usage: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut usage) == 0 {
+            let ru_maxrss = usage.ru_maxrss as u64;
+            // macOS reports ru_maxrss in bytes; Linux reports in KB
+            if cfg!(target_os = "macos") {
+                ru_maxrss
+            } else {
+                ru_maxrss * 1024
+            }
+        } else {
+            0
+        }
+    }
 }
 
 /// Health check handler
@@ -944,5 +983,6 @@ pub async fn health_check() -> Json<HealthResponse> {
         status: "healthy".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         backend: "ready".to_string(),
+        peak_rss_bytes: get_peak_rss_bytes(),
     })
 }

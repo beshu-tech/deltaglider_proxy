@@ -41,6 +41,16 @@ pub struct CompletedUpload {
     pub user_metadata: HashMap<String, String>,
 }
 
+/// Result of completing a multipart upload without assembling into a contiguous buffer.
+/// Used for non-delta-eligible files to avoid the ~2x memory spike from assembly.
+pub struct CompletedParts {
+    pub parts: Vec<Bytes>,
+    pub etag: String,
+    pub total_size: u64,
+    pub content_type: Option<String>,
+    pub user_metadata: HashMap<String, String>,
+}
+
 /// Thread-safe in-memory store for multipart upload state
 pub struct MultipartStore {
     uploads: RwLock<HashMap<String, MultipartUpload>>,
@@ -207,6 +217,77 @@ impl MultipartStore {
         Ok(CompletedUpload {
             data: assembled.freeze(),
             etag,
+            content_type: upload.content_type.clone(),
+            user_metadata: upload.user_metadata.clone(),
+        })
+    }
+
+    /// Return ordered part data without assembling into a contiguous buffer.
+    /// Used for non-delta-eligible files to skip the expensive assembly step.
+    pub fn complete_parts(
+        &self,
+        upload_id: &str,
+        bucket: &str,
+        key: &str,
+        requested_parts: &[(u32, String)],
+    ) -> Result<CompletedParts, S3Error> {
+        let uploads = self.uploads.read();
+        let upload = uploads
+            .get(upload_id)
+            .ok_or_else(|| S3Error::NoSuchUpload(upload_id.to_string()))?;
+
+        if upload.bucket != bucket || upload.key != key {
+            return Err(S3Error::NoSuchUpload(upload_id.to_string()));
+        }
+
+        if requested_parts.is_empty() {
+            return Err(S3Error::InvalidPart(
+                "You must specify at least one part".to_string(),
+            ));
+        }
+
+        for window in requested_parts.windows(2) {
+            if window[0].0 >= window[1].0 {
+                return Err(S3Error::InvalidPartOrder);
+            }
+        }
+
+        let mut total_size: u64 = 0;
+        let mut md5_concat = Vec::new();
+        let mut parts = Vec::with_capacity(requested_parts.len());
+
+        for (part_number, requested_etag) in requested_parts {
+            let part = upload.parts.get(part_number).ok_or_else(|| {
+                S3Error::InvalidPart(format!("Part {} has not been uploaded", part_number))
+            })?;
+
+            let requested_clean = requested_etag.trim_matches('"');
+            if requested_clean != part.md5_hex {
+                return Err(S3Error::InvalidPart(format!(
+                    "ETag mismatch for part {}: expected \"{}\", got \"{}\"",
+                    part_number, part.md5_hex, requested_clean
+                )));
+            }
+
+            total_size += part.size;
+            if total_size > self.max_object_size {
+                return Err(S3Error::InvalidArgument(format!(
+                    "Assembled object size {} exceeds maximum {}",
+                    total_size, self.max_object_size
+                )));
+            }
+
+            md5_concat.extend_from_slice(&part.md5_raw);
+            parts.push(part.data.clone());
+        }
+
+        let final_md5 = Md5::digest(&md5_concat);
+        let etag = format!("\"{}-{}\"", hex::encode(final_md5), requested_parts.len());
+
+        Ok(CompletedParts {
+            parts,
+            etag,
+            total_size,
             content_type: upload.content_type.clone(),
             user_metadata: upload.user_metadata.clone(),
         })

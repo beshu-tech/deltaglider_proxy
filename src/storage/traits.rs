@@ -184,6 +184,25 @@ pub trait StorageBackend: Send + Sync {
         Ok(Box::pin(stream::once(async { Ok(Bytes::from(data)) })))
     }
 
+    /// Store a direct file from pre-split chunks without assembling into a contiguous buffer.
+    /// Default implementation collects chunks and delegates to `put_direct()`.
+    async fn put_direct_chunked(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        chunks: &[Bytes],
+        metadata: &FileMetadata,
+    ) -> Result<(), StorageError> {
+        let total_len: usize = chunks.iter().map(|c| c.len()).sum();
+        let mut buf = Vec::with_capacity(total_len);
+        for chunk in chunks {
+            buf.extend_from_slice(chunk);
+        }
+        self.put_direct(bucket, prefix, filename, &buf, metadata)
+            .await
+    }
+
     // === Scanning operations ===
 
     /// Scan a deltaspace directory and return all file metadata
@@ -345,6 +364,19 @@ macro_rules! impl_storage_backend_for_box {
                 filename: &str,
             ) -> Result<BoxStream<'static, Result<Bytes, StorageError>>, StorageError> {
                 (**self).get_direct_stream(bucket, prefix, filename).await
+            }
+
+            async fn put_direct_chunked(
+                &self,
+                bucket: &str,
+                prefix: &str,
+                filename: &str,
+                chunks: &[Bytes],
+                metadata: &FileMetadata,
+            ) -> Result<(), StorageError> {
+                (**self)
+                    .put_direct_chunked(bucket, prefix, filename, chunks, metadata)
+                    .await
             }
 
             async fn scan_deltaspace(

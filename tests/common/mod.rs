@@ -138,6 +138,41 @@ impl TestServer {
     pub fn bucket(&self) -> &str {
         &self.bucket
     }
+
+    /// Get the child process PID
+    pub fn pid(&self) -> u32 {
+        self.process.id()
+    }
+
+    /// Start a test server with filesystem backend and a custom max object size
+    pub async fn filesystem_with_max_object_size(max_size: u64) -> Self {
+        let port = PORT_COUNTER.fetch_add(2, Ordering::SeqCst);
+        let data_dir = TempDir::new().expect("Failed to create temp dir");
+
+        let process = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"))
+            .env(
+                "DELTAGLIDER_PROXY_LISTEN_ADDR",
+                format!("127.0.0.1:{}", port),
+            )
+            .env("DELTAGLIDER_PROXY_DATA_DIR", data_dir.path())
+            .env("DELTAGLIDER_PROXY_DEFAULT_BUCKET", "bucket")
+            .env(
+                "DELTAGLIDER_PROXY_MAX_OBJECT_SIZE",
+                max_size.to_string(),
+            )
+            .env("RUST_LOG", "deltaglider_proxy=warn")
+            .spawn()
+            .expect("Failed to start server");
+
+        let mut server = Self {
+            process,
+            port,
+            _data_dir: Some(data_dir),
+            bucket: "bucket".to_string(),
+        };
+        server.wait_ready().await;
+        server
+    }
 }
 
 impl Drop for TestServer {
