@@ -1,5 +1,6 @@
 //! S3 API implementation
 
+pub mod admin;
 pub mod auth;
 mod aws_chunked;
 mod errors;

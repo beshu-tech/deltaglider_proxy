@@ -2,7 +2,7 @@
 //!
 //! Verifies that the server process's peak RSS stays bounded during large
 //! multipart uploads of non-delta-eligible files. The streaming pass-through
-//! path (`store_direct_chunked`) avoids assembling all parts into a contiguous
+//! path (`store_passthrough_chunked`) avoids assembling all parts into a contiguous
 //! buffer, keeping the memory spike proportional to a single part rather than
 //! the entire object.
 //!

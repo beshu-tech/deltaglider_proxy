@@ -12,13 +12,7 @@ export interface S3Object {
 export interface ListResult {
   objects: S3Object[];
   folders: string[];
-}
-
-export interface StorageStats {
-  total_objects: number;
-  total_original_size: number;
-  total_stored_size: number;
-  savings_percentage: number;
+  isTruncated: boolean;
 }
 
 export interface BucketInfo {

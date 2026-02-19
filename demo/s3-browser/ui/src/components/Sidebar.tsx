@@ -1,62 +1,80 @@
 import { useState, useEffect, useRef } from 'react';
-import { Menu, Statistic, Progress, Button, Space, Typography, Input, Drawer, theme, message, Popconfirm } from 'antd';
-import { HomeOutlined, FolderOutlined, UploadOutlined, DatabaseOutlined, PlusOutlined, DeleteOutlined } from '@ant-design/icons';
-import { getStats, listBuckets, createBucket, deleteBucket, getBucket, setBucket } from '../s3client';
-import { formatBytes } from '../utils';
-import type { StorageStats, BucketInfo } from '../types';
+import { Layout, Button, Space, Typography, Input, Drawer, theme, message, Popconfirm, Tooltip } from 'antd';
+import type { InputRef } from 'antd';
+import {
+  FolderOutlined,
+  SettingOutlined,
+  FileTextOutlined,
+  PlusOutlined,
+  DeleteOutlined,
+  UploadOutlined,
+  LogoutOutlined,
+} from '@ant-design/icons';
+import { listBuckets, createBucket, deleteBucket, getBucket, setBucket } from '../s3client';
+import type { BucketInfo } from '../types';
 import DemoDataGenerator from './DemoDataGenerator';
+import { useColors } from '../ThemeContext';
 
+const { Sider } = Layout;
 const { Text } = Typography;
 
+/** Format the compile-time ISO timestamp into a human-readable string. */
+function formatBuildTime(): string {
+  try {
+    const d = new Date(__BUILD_TIME__);
+    return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
+      + ' ' + d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  } catch {
+    return __BUILD_TIME__;
+  }
+}
+
 interface Props {
-  folders: string[];
-  prefix: string;
-  onNavigate: (prefix: string) => void;
-  onUploadFiles: (files: FileList) => void;
-  uploading: boolean;
+  onUploadClick: () => void;
   onMutate: () => void;
   refreshTrigger: number;
   onBucketChange: (bucket: string) => void;
   open: boolean;
   onClose: () => void;
+  isMobile: boolean;
+  onSettingsClick?: () => void;
+  onLogout?: () => void;
 }
 
 export default function Sidebar({
-  folders,
-  prefix,
-  onNavigate,
-  onUploadFiles,
-  uploading,
+  onUploadClick,
   onMutate,
   refreshTrigger,
   onBucketChange,
   open,
   onClose,
+  isMobile,
+  onSettingsClick,
+  onLogout,
 }: Props) {
-  const [stats, setStats] = useState<StorageStats | null>(null);
+  const {
+    BG_SIDEBAR, BORDER, TEXT_PRIMARY, TEXT_SECONDARY,
+    TEXT_MUTED, TEXT_FAINT, ACCENT_BLUE, ACCENT_BLUE_LIGHT, ACCENT_RED,
+  } = useColors();
   const [buckets, setBuckets] = useState<BucketInfo[]>([]);
   const [newBucketName, setNewBucketName] = useState('');
   const [creatingBucket, setCreatingBucket] = useState(false);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const newBucketInputRef = useRef<InputRef>(null);
   const { token } = theme.useToken();
   const [messageApi, contextHolder] = message.useMessage();
 
   useEffect(() => {
-    getStats()
-      .then(setStats)
-      .catch(() => setStats(null));
-  }, [refreshTrigger]);
-
-  useEffect(() => {
     listBuckets()
-      .then(setBuckets)
+      .then((list) => {
+        setBuckets(list);
+        // Auto-select first bucket if current one doesn't exist in the list
+        if (list.length > 0 && !list.some((b) => b.name === getBucket())) {
+          setBucket(list[0].name);
+          onBucketChange(list[0].name);
+        }
+      })
       .catch(() => setBuckets([]));
   }, [refreshTrigger]);
-
-  const topFolders = folders.map((f) => {
-    const display = f.startsWith(prefix) ? f.slice(prefix.length) : f;
-    return { path: f, name: display.replace(/\/$/, '') };
-  });
 
   const handleCreateBucket = async () => {
     const name = newBucketName.trim();
@@ -99,183 +117,248 @@ export default function Sidebar({
 
   const activeBucket = getBucket();
 
-  const bucketMenuItems = buckets.map((b) => ({
-    key: b.name,
-    icon: <DatabaseOutlined />,
-    label: (
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%' }}>
-        <span style={{ fontFamily: 'monospace', fontSize: 12 }}>{b.name}</span>
-        {b.name !== activeBucket && (
-          <Popconfirm
-            title={`Delete bucket "${b.name}"?`}
-            description="Bucket must be empty."
-            onConfirm={(e) => { e?.stopPropagation(); handleDeleteBucket(b.name); }}
-            onCancel={(e) => e?.stopPropagation()}
-            okText="Delete"
-            okType="danger"
-          >
+  const sidebarContent = (
+    <div className="dot-grid-bg" style={{ display: 'flex', flexDirection: 'column', height: '100%', background: BG_SIDEBAR }}>
+      {contextHolder}
+
+      {/* YOUR BUCKETS */}
+      <nav aria-label="Bucket list" style={{ padding: '20px 16px 0', overflow: 'auto' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+          <Text style={{ fontSize: 10, fontWeight: 700, letterSpacing: 1.5, textTransform: 'uppercase', color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>
+            Your Buckets ({buckets.length})
+          </Text>
+          <Tooltip title="Create bucket">
             <Button
               type="text"
               size="small"
-              danger
-              icon={<DeleteOutlined />}
-              onClick={(e) => e.stopPropagation()}
-              style={{ marginLeft: 4 }}
+              icon={<PlusOutlined />}
+              aria-label="Create bucket"
+              style={{ color: TEXT_MUTED, fontSize: 11 }}
+              onClick={() => {
+                newBucketInputRef.current?.focus();
+              }}
             />
-          </Popconfirm>
-        )}
-      </div>
-    ),
-  }));
-
-  const folderMenuItems = [
-    {
-      key: '',
-      icon: <HomeOutlined />,
-      label: 'All Objects',
-    },
-    ...topFolders.map(({ path, name }) => ({
-      key: path,
-      icon: <FolderOutlined />,
-      label: <span style={{ fontFamily: 'monospace', fontSize: 12 }}>{name}</span>,
-    })),
-  ];
-
-  const sidebarContent = (
-    <>
-      {contextHolder}
-
-      {/* Bucket section */}
-      <div style={{ borderBottom: `1px solid ${token.colorBorderSecondary}` }}>
-        <div style={{ padding: '12px 16px 4px' }}>
-          <Text
-            type="secondary"
-            strong
-            style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: 1 }}
-          >
-            Buckets
-          </Text>
+          </Tooltip>
         </div>
-        <Menu
-          mode="inline"
-          selectedKeys={[activeBucket]}
-          items={bucketMenuItems}
-          onClick={({ key }) => handleSelectBucket(key)}
-          style={{ borderInlineEnd: 'none' }}
-        />
-        <div style={{ padding: '4px 16px 12px' }}>
+
+        <ul style={{ listStyle: 'none', margin: 0, padding: 0 }}>
+          {buckets.map((b) => (
+            <li key={b.name}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <button
+                  className="btn-reset"
+                  onClick={() => handleSelectBucket(b.name)}
+                  aria-current={b.name === activeBucket ? 'true' : undefined}
+                  style={{
+                    flex: 1,
+                    padding: '8px 12px',
+                    borderRadius: 8,
+                    marginBottom: 2,
+                    gap: 10,
+                    background: b.name === activeBucket ? `rgba(45, 212, 191, 0.1)` : 'transparent',
+                    color: b.name === activeBucket ? ACCENT_BLUE_LIGHT : TEXT_SECONDARY,
+                    transition: 'all 0.15s ease',
+                    borderLeft: b.name === activeBucket ? `2px solid ${ACCENT_BLUE}` : '2px solid transparent',
+                  }}
+                  onMouseEnter={(e) => {
+                    if (b.name !== activeBucket) e.currentTarget.style.background = 'var(--surface-hover)';
+                  }}
+                  onMouseLeave={(e) => {
+                    if (b.name !== activeBucket) e.currentTarget.style.background = 'transparent';
+                  }}
+                >
+                  <FolderOutlined aria-hidden="true" style={{ fontSize: 14 }} />
+                  <span style={{ fontFamily: "var(--font-mono)", fontSize: 13, fontWeight: b.name === activeBucket ? 600 : 400 }}>
+                    {b.name}
+                  </span>
+                </button>
+                {b.name !== activeBucket && (
+                  <Popconfirm
+                    title={`Delete bucket "${b.name}"?`}
+                    description="Bucket must be empty."
+                    onConfirm={(e) => { e?.stopPropagation(); handleDeleteBucket(b.name); }}
+                    onCancel={(e) => e?.stopPropagation()}
+                    okText="Delete"
+                    okType="danger"
+                  >
+                    <Button
+                      type="text"
+                      size="small"
+                      danger
+                      icon={<DeleteOutlined />}
+                      aria-label={`Delete bucket ${b.name}`}
+                      onClick={(e) => e.stopPropagation()}
+                      style={{ opacity: 0.4, fontSize: 11, transition: 'opacity 0.15s' }}
+                      onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.opacity = '1'; }}
+                      onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.opacity = '0.4'; }}
+                    />
+                  </Popconfirm>
+                )}
+              </div>
+            </li>
+          ))}
+        </ul>
+
+        {/* New bucket input */}
+        <div style={{ padding: '8px 0' }}>
           <Space.Compact style={{ width: '100%' }}>
             <Input
+              ref={newBucketInputRef}
               size="small"
               placeholder="New bucket..."
+              aria-label="New bucket name"
               value={newBucketName}
               onChange={(e) => setNewBucketName(e.target.value)}
               onPressEnter={handleCreateBucket}
+              style={{ background: 'var(--input-bg)', borderColor: BORDER, fontSize: 12, fontFamily: "var(--font-mono)" }}
             />
             <Button
               size="small"
               icon={<PlusOutlined />}
               onClick={handleCreateBucket}
               loading={creatingBucket}
+              aria-label="Create bucket"
             />
           </Space.Compact>
         </div>
-      </div>
 
-      {/* Folder navigation */}
-      <Menu
-        mode="inline"
-        selectedKeys={[prefix]}
-        items={folderMenuItems}
-        onClick={({ key }) => onNavigate(key)}
-        style={{ borderInlineEnd: 'none' }}
-      />
-
-      {/* Storage stats */}
-      <div style={{ padding: '16px', borderTop: `1px solid ${token.colorBorderSecondary}` }}>
-        <Text type="secondary" strong style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: 1 }}>
-          Storage
-        </Text>
-        <div style={{ marginTop: 12 }}>
-          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-            <Statistic
-              title="Objects"
-              value={stats ? stats.total_objects : '--'}
-              valueStyle={{ fontSize: 14 }}
-              style={{ flex: 1, minWidth: 80 }}
-            />
-            <Statistic
-              title="Original"
-              value={stats ? formatBytes(stats.total_original_size) : '--'}
-              valueStyle={{ fontSize: 14 }}
-              style={{ flex: 1, minWidth: 80 }}
-            />
-          </div>
-          <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
-            <Statistic
-              title="Stored"
-              value={stats ? formatBytes(stats.total_stored_size) : '--'}
-              valueStyle={{ fontSize: 14 }}
-              style={{ flex: 1, minWidth: 80 }}
-            />
-            <Statistic
-              title="Savings"
-              value={stats ? `${stats.savings_percentage.toFixed(1)}%` : '--'}
-              valueStyle={{ fontSize: 14, color: token.colorSuccess }}
-              style={{ flex: 1, minWidth: 80 }}
-            />
-          </div>
-          {stats && (
-            <Progress
-              percent={Math.round(stats.savings_percentage)}
-              size="small"
-              strokeColor={token.colorSuccess}
-              style={{ marginTop: 8 }}
-            />
-          )}
-        </div>
-      </div>
-
-      {/* Actions */}
-      <div style={{ padding: '0 16px 16px', borderTop: `1px solid ${token.colorBorderSecondary}` }}>
-        <Text
-          type="secondary"
-          strong
-          style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: 1, display: 'block', padding: '12px 0 8px' }}
-        >
-          Actions
-        </Text>
-        <Space direction="vertical" style={{ width: '100%' }} size={8}>
-          <Button
-            icon={<UploadOutlined />}
-            block
-            onClick={() => inputRef.current?.click()}
-            loading={uploading}
+        {/* Upload + Demo */}
+        <div style={{ padding: '4px 0', borderTop: `1px solid ${token.colorBorderSecondary}`, marginTop: 4 }}>
+          <button
+            className="btn-reset"
+            onClick={onUploadClick}
+            style={{
+              gap: 10,
+              padding: '7px 4px',
+              color: TEXT_SECONDARY,
+              fontSize: 12,
+              width: '100%',
+              transition: 'color 0.15s',
+              fontFamily: "var(--font-ui)",
+            }}
+            onMouseEnter={(e) => { e.currentTarget.style.color = TEXT_PRIMARY; }}
+            onMouseLeave={(e) => { e.currentTarget.style.color = TEXT_SECONDARY; }}
           >
-            {uploading ? 'Uploading...' : 'Upload Files'}
-          </Button>
-          <input
-            ref={inputRef}
-            type="file"
-            multiple
-            style={{ display: 'none' }}
-            onChange={(e) => e.target.files && onUploadFiles(e.target.files)}
-          />
+            <UploadOutlined aria-hidden="true" style={{ fontSize: 13, width: 20, textAlign: 'center', display: 'inline-flex', justifyContent: 'center' }} />
+            <span>Upload Files</span>
+          </button>
           <DemoDataGenerator onDone={onMutate} />
-        </Space>
-      </div>
-    </>
+        </div>
+      </nav>
+
+      {/* Bottom group: navigation + branding + logout — pinned to bottom */}
+      <div style={{ marginTop: 'auto' }}>
+        {/* Navigation */}
+        <div style={{ padding: '12px 16px', borderTop: `1px solid ${BORDER}` }}>
+          <nav aria-label="Settings and help">
+            <button
+              className="btn-reset"
+              onClick={onSettingsClick}
+              style={{
+                gap: 10,
+                padding: '7px 4px',
+                color: TEXT_SECONDARY,
+                fontSize: 12,
+                width: '100%',
+                transition: 'color 0.15s',
+                fontFamily: "var(--font-ui)",
+              }}
+              onMouseEnter={(e) => { e.currentTarget.style.color = TEXT_PRIMARY; }}
+              onMouseLeave={(e) => { e.currentTarget.style.color = TEXT_SECONDARY; }}
+            >
+              <SettingOutlined aria-hidden="true" style={{ fontSize: 13, width: 20, textAlign: 'center', display: 'inline-flex', justifyContent: 'center' }} />
+              <span>Admin Settings</span>
+            </button>
+            <a
+              href="https://github.com/beshu-tech/deltaglider"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="btn-reset"
+              style={{
+                gap: 10,
+                padding: '7px 4px',
+                color: TEXT_SECONDARY,
+                fontSize: 12,
+                width: '100%',
+                textDecoration: 'none',
+                transition: 'color 0.15s',
+                fontFamily: "var(--font-ui)",
+              }}
+              onMouseEnter={(e) => { e.currentTarget.style.color = TEXT_PRIMARY; }}
+              onMouseLeave={(e) => { e.currentTarget.style.color = TEXT_SECONDARY; }}
+            >
+              <FileTextOutlined aria-hidden="true" style={{ fontSize: 13, width: 20, textAlign: 'center', display: 'inline-flex', justifyContent: 'center' }} />
+              <span>Documentation</span>
+            </a>
+            {onLogout && (
+              <button
+                className="btn-reset"
+                onClick={onLogout}
+                style={{
+                  gap: 10,
+                  padding: '7px 4px',
+                  color: TEXT_SECONDARY,
+                  fontSize: 12,
+                  width: '100%',
+                  transition: 'color 0.15s',
+                  fontFamily: "var(--font-ui)",
+                }}
+                onMouseEnter={(e) => { e.currentTarget.style.color = ACCENT_RED; }}
+                onMouseLeave={(e) => { e.currentTarget.style.color = TEXT_SECONDARY; }}
+              >
+                <LogoutOutlined aria-hidden="true" style={{ fontSize: 13, width: 20, textAlign: 'center', display: 'inline-flex', justifyContent: 'center' }} />
+                <span>Logout</span>
+              </button>
+            )}
+          </nav>
+        </div>
+
+        {/* Branding */}
+        <div style={{ padding: '16px 16px 20px', borderTop: `1px solid ${BORDER}` }}>
+          <div style={{ fontSize: 18, fontWeight: 800, letterSpacing: 3, color: TEXT_PRIMARY, lineHeight: 1.2, fontFamily: "var(--font-ui)" }}>
+            DELTAGLIDER
+          </div>
+          <div style={{ fontSize: 12, fontWeight: 600, letterSpacing: 2.5, color: ACCENT_BLUE, textTransform: 'uppercase', marginTop: 3, fontFamily: "var(--font-mono)" }}>
+            Proxy
+          </div>
+          <div style={{ fontSize: 10, color: TEXT_FAINT, marginTop: 6, fontFamily: "var(--font-mono)" }}>
+            Built {formatBuildTime()}
+          </div>
+        </div>
+      </div>{/* end bottom group */}
+    </div>
   );
 
+  if (isMobile) {
+    return (
+      <Drawer
+        placement="left"
+        size={260}
+        open={open}
+        onClose={onClose}
+        styles={{ body: { padding: 0, background: BG_SIDEBAR } }}
+      >
+        {sidebarContent}
+      </Drawer>
+    );
+  }
+
   return (
-    <Drawer
-      placement="left"
-      width={300}
-      open={open}
-      onClose={onClose}
-      styles={{ body: { padding: 0 } }}
+    <Sider
+      width={250}
+      style={{
+        background: BG_SIDEBAR,
+        borderRight: `1px solid ${BORDER}`,
+        overflow: 'auto',
+        height: '100vh',
+        position: 'sticky',
+        top: 0,
+        left: 0,
+      }}
     >
-      {sidebarContent}
-    </Drawer>
+      <aside aria-label="Sidebar" style={{ height: '100%' }}>
+        {sidebarContent}
+      </aside>
+    </Sider>
   );
 }

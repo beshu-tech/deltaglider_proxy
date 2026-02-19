@@ -1,33 +1,35 @@
-# DeltaGlider Proxy S3 Proxy Configuration
-# Copy this file to deltaglider_proxy.toml and adjust settings as needed
+# DeltaGlider Proxy Configuration
+# Copy this file to deltaglider_proxy.toml and adjust settings as needed.
 
 # Server listen address
 listen_addr = "127.0.0.1:9000"
 
-# Default bucket name (created automatically on startup)
-# Additional buckets can be created via the S3 CreateBucket API
-default_bucket = "default"
+# Delta Compression
+# -----------------
 
-# DeltaGlider Settings
-# -------------------
-
-# Maximum delta ratio - store as delta only if (delta_size / original_size) < this value
-# Lower values = more aggressive storage savings, but more compute
-# Higher values = store more files as deltas even with modest savings
+# Maximum delta ratio — store as delta only if (delta_size / original_size) < this value.
+# Lower = more aggressive savings but more compute. Higher = more files stored as deltas.
 max_delta_ratio = 0.5
 
-# Maximum object size in bytes that can be delta-compressed
-# Objects larger than this are stored directly without compression
-# Default: 100MB (xdelta3 memory constraint)
+# Maximum object size in bytes for delta compression.
+# Objects larger than this are stored directly. Default: 100 MB (xdelta3 constraint).
 max_object_size = 104857600
 
-# Reference cache size in MB
-# Larger cache = faster delta reconstruction, more memory usage
+# Reference cache size in MB.
+# Larger cache = faster delta reconstruction, more memory usage.
 cache_size_mb = 100
+
+# Authentication (optional)
+# -------------------------
+# When both are set, all S3 requests must be SigV4-signed (header or presigned URL).
+# When unset, open access.
+#
+# access_key_id = "myaccesskey"
+# secret_access_key = "mysecretkey"
 
 # Backend Configuration
 # ---------------------
-# Choose either filesystem or s3 backend
+# Choose either filesystem or s3 backend.
 
 # Option 1: Filesystem backend (for local development)
 [backend]
@@ -49,28 +51,40 @@ path = "./data"
 # # Use path-style URLs (required for MinIO, LocalStack)
 # force_path_style = true
 #
-# # Credentials (optional if using env vars or instance credentials)
-# # access_key_id = "your-access-key"
-# # secret_access_key = "your-secret-key"
+# # Backend credentials (optional if using env vars or instance credentials)
+# # access_key_id = "backend-access-key"
+# # secret_access_key = "backend-secret-key"
 
 # Environment Variables
 # ---------------------
-# The following environment variables can override config settings:
+# All settings above can be set via environment variables instead:
 #
-# DELTAGLIDER_PROXY_CONFIG           - Path to config file
-# DELTAGLIDER_PROXY_LISTEN_ADDR      - Listen address
-# DELTAGLIDER_PROXY_DATA_DIR         - Filesystem backend directory
-# DELTAGLIDER_PROXY_DEFAULT_BUCKET   - Default bucket name
-# DELTAGLIDER_PROXY_MAX_DELTA_RATIO  - Max delta ratio
-# DELTAGLIDER_PROXY_MAX_OBJECT_SIZE  - Max object size
-# DELTAGLIDER_PROXY_CACHE_SIZE_MB    - Cache size in MB
+# Server:
+#   DGP_CONFIG                - Path to this config file
+#   DGP_LISTEN_ADDR           - Listen address (e.g. "0.0.0.0:9000")
 #
-# For S3 backend:
-# DELTAGLIDER_PROXY_S3_ENDPOINT      - S3 endpoint URL
-# DELTAGLIDER_PROXY_S3_REGION        - AWS region
-# DELTAGLIDER_PROXY_S3_FORCE_PATH_STYLE - Use path-style URLs (true/false)
+# Proxy authentication (client-to-proxy):
+#   DGP_ACCESS_KEY_ID         - Proxy access key
+#   DGP_SECRET_ACCESS_KEY     - Proxy secret key
 #
-# AWS credentials:
-# AWS_ACCESS_KEY_ID        - AWS access key
-# AWS_SECRET_ACCESS_KEY    - AWS secret key
-# AWS_SESSION_TOKEN        - AWS session token (for temporary credentials)
+# Admin GUI:
+#   DGP_ADMIN_PASSWORD_HASH   - Bcrypt hash of admin password (auto-generated if unset)
+#
+# Logging:
+#   DGP_LOG_LEVEL             - Log level filter (e.g. "deltaglider_proxy=info,tower_http=warn")
+#                                Overridden by RUST_LOG if set. Changeable at runtime via admin GUI.
+#
+# Delta compression:
+#   DGP_MAX_DELTA_RATIO       - Max delta ratio (e.g. "0.5")
+#   DGP_MAX_OBJECT_SIZE       - Max object size in bytes
+#   DGP_CACHE_MB              - Cache size in MB
+#
+# Filesystem backend:
+#   DGP_DATA_DIR              - Data directory (activates filesystem backend)
+#
+# S3 backend (activates when DGP_S3_ENDPOINT or DGP_S3_REGION is set):
+#   DGP_S3_ENDPOINT           - S3 endpoint URL
+#   DGP_S3_REGION             - AWS region (default: us-east-1)
+#   DGP_S3_PATH_STYLE         - Use path-style URLs (true/false, default: true)
+#   DGP_BE_AWS_ACCESS_KEY_ID   - Backend S3 access key (required)
+#   DGP_BE_AWS_SECRET_ACCESS_KEY - Backend S3 secret key (required)

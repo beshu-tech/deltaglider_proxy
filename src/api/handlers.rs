@@ -8,6 +8,7 @@ use super::xml::{
     DeleteError, DeleteRequest, DeleteResult, DeletedObject, InitiateMultipartUploadResult,
     ListBucketResult, ListBucketsResult, ListMultipartUploadsResult, ListPartsResult, S3Object,
 };
+use arc_swap::ArcSwap;
 use crate::deltaglider::{DynEngine, RetrieveResponse};
 use crate::multipart::MultipartStore;
 use crate::types::{FileMetadata, StorageInfo};
@@ -23,7 +24,7 @@ use tracing::{debug, info, instrument, warn};
 
 /// Application state shared across handlers
 pub struct AppState {
-    pub engine: DynEngine,
+    pub engine: ArcSwap<DynEngine>,
     pub multipart: Arc<MultipartStore>,
 }
 
@@ -36,8 +37,14 @@ pub struct BucketGetQuery {
     pub list_type: Option<u8>,
     #[serde(rename = "max-keys")]
     pub max_keys: Option<u32>,
+    /// v2 pagination
     #[serde(rename = "continuation-token")]
     pub continuation_token: Option<String>,
+    /// v1 pagination
+    pub marker: Option<String>,
+    /// Encoding type for keys/prefixes in the response (e.g. "url")
+    #[serde(rename = "encoding-type")]
+    pub encoding_type: Option<String>,
     /// GetBucketLocation query parameter
     pub location: Option<String>,
     /// GetBucketVersioning query parameter
@@ -58,6 +65,30 @@ async fn put_object_inner(
 ) -> Result<Response, S3Error> {
     info!("PUT {}/{} ({} bytes)", bucket, key, body.len());
 
+    // S3 directory marker: zero-byte object with trailing slash (e.g. "folder/")
+    // Used by Cyberduck, AWS Console, etc. to create "folders".
+    // Bypass delta engine and store directly on the backend.
+    if key.ends_with('/') && body.is_empty() {
+        info!("Creating directory marker: {}/{}", bucket, key);
+        state
+            .engine
+            .load()
+            .storage()
+            .put_directory_marker(bucket, key)
+            .await
+            .map_err(|e| S3Error::InternalError(e.to_string()))?;
+        // MD5 of empty content: d41d8cd98f00b204e9800998ecf8427e
+        return Ok((
+            StatusCode::OK,
+            [
+                ("ETag", "\"d41d8cd98f00b204e9800998ecf8427e\"".to_string()),
+                ("x-amz-storage-type", "directory".to_string()),
+            ],
+            "",
+        )
+            .into_response());
+    }
+
     let content_type = headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
@@ -66,7 +97,7 @@ async fn put_object_inner(
     let user_metadata = extract_user_metadata(headers);
 
     let result = state
-        .engine
+        .engine.load()
         .store(bucket, key, body, content_type, user_metadata)
         .await?;
 
@@ -139,8 +170,8 @@ fn build_object_headers(metadata: &FileMetadata) -> HeaderMap {
             headers.insert(mk::H_DELTA_SIZE, hval(&delta_size.to_string()));
             headers.insert(mk::H_DELTA_CMD, hval(delta_cmd));
         }
-        StorageInfo::Direct => {
-            headers.insert(mk::H_NOTE, hval("direct"));
+        StorageInfo::Passthrough => {
+            headers.insert(mk::H_NOTE, hval("passthrough"));
         }
     }
 
@@ -216,7 +247,7 @@ pub async fn get_object(
 
     info!("GET {}/{}", bucket, key);
 
-    let response = state.engine.retrieve_stream(&bucket, &key).await?;
+    let response = state.engine.load().retrieve_stream(&bucket, &key).await?;
 
     match response {
         RetrieveResponse::Streamed { stream, metadata } => {
@@ -253,7 +284,7 @@ pub async fn head_object(
 ) -> Result<Response, S3Error> {
     info!("HEAD {}/{}", bucket, key);
 
-    let metadata = state.engine.head(&bucket, &key).await?;
+    let metadata = state.engine.load().head(&bucket, &key).await?;
 
     let headers = build_object_headers(&metadata);
     Ok((StatusCode::OK, headers).into_response())
@@ -289,68 +320,74 @@ pub async fn bucket_get_handler(
         return list_multipart_uploads(&state, &bucket, prefix).await;
     }
 
-    // Default: ListObjects
-    if let Some(list_type) = query.list_type {
-        if list_type != 2 {
-            return Err(S3Error::InvalidArgument(
-                "Only ListObjectsV2 is supported (list-type=2)".to_string(),
-            ));
-        }
-    }
+    // Default: ListObjects (v1 or v2)
+    let is_v2 = query.list_type == Some(2);
     let prefix = query.prefix.unwrap_or_default();
     let delimiter = query.delimiter.clone();
-    info!("LIST {}/{}*", bucket, prefix);
+    let max_keys = query.max_keys.unwrap_or(1000);
 
+    // v1 uses `marker`, v2 uses `continuation-token` — both serve as "start after" key
+    let pagination_token = if is_v2 {
+        query.continuation_token.as_deref()
+    } else {
+        query.marker.as_deref()
+    };
+
+    info!(
+        "LIST {}/{}* (v{})",
+        bucket,
+        prefix,
+        if is_v2 { "2" } else { "1" }
+    );
+
+    // Engine handles prefix filtering, delimiter collapsing, and pagination as
+    // a single atomic operation (they're coupled: CommonPrefixes count toward
+    // max-keys and must be deduplicated across pages).
     let page = state
-        .engine
-        .list_objects_v2(
+        .engine.load()
+        .list_objects(
             &bucket,
             &prefix,
-            query.max_keys.unwrap_or(1000),
-            query.continuation_token.as_deref(),
+            delimiter.as_deref(),
+            max_keys,
+            pagination_token,
         )
         .await?;
 
-    let all_objects: Vec<S3Object> = page
+    let s3_objects: Vec<S3Object> = page
         .objects
         .into_iter()
         .map(|(key, meta)| S3Object::new(key, meta.file_size, meta.created_at, meta.etag()))
         .collect();
 
-    // If a delimiter is set, compute CommonPrefixes and filter objects
-    let (s3_objects, common_prefixes) = if let Some(ref delim) = delimiter {
-        let mut prefixes = std::collections::BTreeSet::new();
-        let mut direct_objects = Vec::new();
-
-        for obj in all_objects {
-            let after_prefix = &obj.key[prefix.len()..];
-            if let Some(pos) = after_prefix.find(delim.as_str()) {
-                // This key contains the delimiter after the prefix — it belongs to a common prefix
-                let common = format!("{}{}{}", prefix, &after_prefix[..pos], delim);
-                prefixes.insert(common);
-            } else {
-                // This key is directly at this level
-                direct_objects.push(obj);
-            }
-        }
-
-        (direct_objects, prefixes.into_iter().collect::<Vec<_>>())
+    let xml = if is_v2 {
+        ListBucketResult::new_v2(
+            bucket,
+            prefix,
+            delimiter,
+            max_keys,
+            s3_objects,
+            page.common_prefixes,
+            query.continuation_token,
+            page.next_continuation_token,
+            page.is_truncated,
+        )
+        .to_xml()
     } else {
-        (all_objects, Vec::new())
+        ListBucketResult::new_v1(
+            bucket,
+            prefix,
+            delimiter,
+            max_keys,
+            s3_objects,
+            page.common_prefixes,
+            query.marker,
+            page.next_continuation_token,
+            page.is_truncated,
+            query.encoding_type,
+        )
+        .to_xml()
     };
-
-    let result = ListBucketResult::new_v2(
-        bucket,
-        prefix,
-        delimiter,
-        query.max_keys.unwrap_or(1000),
-        s3_objects,
-        common_prefixes,
-        query.continuation_token,
-        page.next_continuation_token,
-        page.is_truncated,
-    );
-    let xml = result.to_xml();
 
     Ok((StatusCode::OK, [("Content-Type", "application/xml")], xml).into_response())
 }
@@ -413,7 +450,7 @@ pub async fn delete_object(
 
     info!("DELETE {}/{}", bucket, key);
 
-    if let Err(err) = state.engine.delete(&bucket, &key).await {
+    if let Err(err) = state.engine.load().delete(&bucket, &key).await {
         match S3Error::from(err) {
             S3Error::NoSuchKey(_) => {}
             other => return Err(other),
@@ -481,7 +518,7 @@ pub async fn delete_objects(
 
     for obj in delete_req.objects {
         let key = obj.key.trim_start_matches('/');
-        match state.engine.delete(&bucket, key).await {
+        match state.engine.load().delete(&bucket, key).await {
             Ok(()) => {
                 debug!("Deleted {}/{}", bucket, key);
                 deleted.push(DeletedObject {
@@ -547,20 +584,20 @@ async fn copy_object_inner(
 
     // Check source object size before loading into memory to avoid transient
     // memory spikes if max_object_size was reduced after the object was stored.
-    let source_meta_head = state.engine.head(source_bucket, source_key).await?;
-    if source_meta_head.file_size > state.engine.max_object_size() {
+    let source_meta_head = state.engine.load().head(source_bucket, source_key).await?;
+    if source_meta_head.file_size > state.engine.load().max_object_size() {
         return Err(S3Error::EntityTooLarge {
             size: source_meta_head.file_size,
-            max: state.engine.max_object_size(),
+            max: state.engine.load().max_object_size(),
         });
     }
 
     // Retrieve source object
-    let (data, source_meta) = state.engine.retrieve(source_bucket, source_key).await?;
+    let (data, source_meta) = state.engine.load().retrieve(source_bucket, source_key).await?;
 
     // Store as new object, preserving user metadata from source
     let result = state
-        .engine
+        .engine.load()
         .store(
             bucket,
             key,
@@ -663,9 +700,7 @@ pub async fn put_object_or_copy(
     }
 }
 
-/// POST object handler for multipart upload operations
-/// POST /{bucket}/{key}?uploads - CreateMultipartUpload
-/// POST /{bucket}/{key}?uploadId=X - CompleteMultipartUpload
+/// POST object handler — dispatches multipart upload operations by query param.
 #[instrument(skip(state, body))]
 pub async fn post_object(
     State(state): State<Arc<AppState>>,
@@ -674,121 +709,112 @@ pub async fn post_object(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, S3Error> {
-    // CreateMultipartUpload
     if query.uploads.is_some() {
-        info!("CreateMultipartUpload {}/{}", bucket, key);
+        initiate_multipart_upload(&state, &bucket, &key, &headers)
+    } else if let Some(upload_id) = &query.upload_id {
+        complete_multipart_upload(&state, &bucket, &key, upload_id, body).await
+    } else {
+        Err(S3Error::InvalidRequest(
+            "POST on object requires ?uploads or ?uploadId parameter".to_string(),
+        ))
+    }
+}
 
-        let content_type = headers
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+/// POST /{bucket}/{key}?uploads — CreateMultipartUpload
+fn initiate_multipart_upload(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    headers: &HeaderMap,
+) -> Result<Response, S3Error> {
+    info!("CreateMultipartUpload {}/{}", bucket, key);
 
-        let user_metadata = extract_user_metadata(&headers);
+    let content_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
-        let upload_id = state
+    let user_metadata = extract_user_metadata(headers);
+    let upload_id = state.multipart.create(bucket, key, content_type, user_metadata);
+
+    let xml = InitiateMultipartUploadResult {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        upload_id,
+    }
+    .to_xml();
+    Ok((StatusCode::OK, [("Content-Type", "application/xml")], xml).into_response())
+}
+
+/// POST /{bucket}/{key}?uploadId=X — CompleteMultipartUpload
+async fn complete_multipart_upload(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    body: Bytes,
+) -> Result<Response, S3Error> {
+    info!("CompleteMultipartUpload {}/{} uploadId={}", bucket, key, upload_id);
+
+    let body_str = String::from_utf8(body.to_vec()).map_err(|_| S3Error::MalformedXML)?;
+    let complete_req = CompleteMultipartUploadRequest::from_xml(&body_str).map_err(|e| {
+        warn!("Failed to parse CompleteMultipartUpload XML: {}", e);
+        S3Error::MalformedXML
+    })?;
+
+    let requested_parts: Vec<(u32, String)> = complete_req
+        .parts
+        .iter()
+        .map(|p| (p.part_number, p.etag.clone()))
+        .collect();
+
+    // Bifurcate: non-delta-eligible files use the chunked path to avoid
+    // assembling all parts into a single contiguous buffer (~2x memory savings).
+    let (multipart_etag, store_result) = if !state.engine.load().is_delta_eligible(key) {
+        let completed = state
             .multipart
-            .create(&bucket, &key, content_type, user_metadata);
+            .complete_parts(upload_id, bucket, key, &requested_parts)?;
+        let etag = completed.etag.clone();
+        let result = state
+            .engine.load()
+            .store_passthrough_chunked(bucket, key, &completed.parts, completed.total_size, completed.content_type, completed.user_metadata)
+            .await?;
+        (etag, result)
+    } else {
+        let completed = state
+            .multipart
+            .complete(upload_id, bucket, key, &requested_parts)?;
+        let etag = completed.etag.clone();
+        let result = state
+            .engine.load()
+            .store(bucket, key, &completed.data, completed.content_type, completed.user_metadata)
+            .await?;
+        (etag, result)
+    };
 
-        let result = InitiateMultipartUploadResult {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            upload_id,
-        };
-        let xml = result.to_xml();
-        return Ok((StatusCode::OK, [("Content-Type", "application/xml")], xml).into_response());
+    state.multipart.remove(upload_id);
+
+    debug!(
+        "CompleteMultipartUpload {}/{} stored as {}",
+        bucket, key, store_result.metadata.storage_info.label(),
+    );
+
+    let xml = CompleteMultipartUploadResult {
+        location: format!("/{}/{}", bucket, key),
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        etag: multipart_etag,
     }
-
-    // CompleteMultipartUpload
-    if let Some(upload_id) = &query.upload_id {
-        info!(
-            "CompleteMultipartUpload {}/{} uploadId={}",
-            bucket, key, upload_id
-        );
-
-        let body_str = String::from_utf8(body.to_vec()).map_err(|_| S3Error::MalformedXML)?;
-        let complete_req = CompleteMultipartUploadRequest::from_xml(&body_str).map_err(|e| {
-            warn!("Failed to parse CompleteMultipartUpload XML: {}", e);
-            S3Error::MalformedXML
-        })?;
-
-        let requested_parts: Vec<(u32, String)> = complete_req
-            .parts
-            .iter()
-            .map(|p| (p.part_number, p.etag.clone()))
-            .collect();
-
-        // Bifurcate: non-delta-eligible files use the chunked path to avoid
-        // assembling all parts into a single contiguous buffer (~2x memory savings).
-        let (multipart_etag, store_result) = if !state.engine.is_delta_eligible(&key) {
-            let completed = state
-                .multipart
-                .complete_parts(upload_id, &bucket, &key, &requested_parts)?;
-            let etag = completed.etag.clone();
-            let total_size = completed.total_size;
-            let result = state
-                .engine
-                .store_direct_chunked(
-                    &bucket,
-                    &key,
-                    &completed.parts,
-                    total_size,
-                    completed.content_type,
-                    completed.user_metadata,
-                )
-                .await?;
-            (etag, result)
-        } else {
-            let completed = state
-                .multipart
-                .complete(upload_id, &bucket, &key, &requested_parts)?;
-            let etag = completed.etag.clone();
-            let result = state
-                .engine
-                .store(
-                    &bucket,
-                    &key,
-                    &completed.data,
-                    completed.content_type,
-                    completed.user_metadata,
-                )
-                .await?;
-            (etag, result)
-        };
-
-        // Remove upload only after successful store
-        state.multipart.remove(upload_id);
-
-        debug!(
-            "CompleteMultipartUpload {}/{} stored as {}",
-            bucket,
-            key,
-            store_result.metadata.storage_info.label(),
-        );
-
-        let result = CompleteMultipartUploadResult {
-            location: format!("/{}/{}", bucket, key),
-            bucket: bucket.clone(),
-            key: key.clone(),
-            etag: multipart_etag,
-        };
-        let xml = result.to_xml();
-        return Ok((
-            StatusCode::OK,
-            [
-                ("Content-Type", "application/xml"),
-                (
-                    "x-amz-storage-type",
-                    store_result.metadata.storage_info.label(),
-                ),
-            ],
-            xml,
-        )
-            .into_response());
-    }
-
-    Err(S3Error::InvalidRequest(
-        "POST on object requires ?uploads or ?uploadId parameter".to_string(),
-    ))
+    .to_xml();
+    Ok((
+        StatusCode::OK,
+        [
+            ("Content-Type", "application/xml"),
+            ("x-amz-storage-type", store_result.metadata.storage_info.label()),
+        ],
+        xml,
+    )
+        .into_response())
 }
 
 // ============================================================================
@@ -811,7 +837,7 @@ pub async fn create_bucket(
     }
 
     // Create the real bucket on the storage backend
-    state.engine.create_bucket(&bucket).await?;
+    state.engine.load().create_bucket(&bucket).await?;
 
     Ok((StatusCode::OK, [("Location", format!("/{}", bucket))], "").into_response())
 }
@@ -826,13 +852,13 @@ pub async fn delete_bucket(
     info!("DELETE bucket {}", bucket);
 
     // Check if bucket is empty (S3 requires buckets to be empty before deletion)
-    let page = state.engine.list_objects_v2(&bucket, "", 1, None).await?;
+    let page = state.engine.load().list_objects(&bucket, "", None, 1, None).await?;
     if !page.objects.is_empty() {
         return Err(S3Error::BucketNotEmpty(bucket.to_string()));
     }
 
     // Delete the real bucket on the storage backend
-    state.engine.delete_bucket(&bucket).await?;
+    state.engine.load().delete_bucket(&bucket).await?;
 
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -847,7 +873,7 @@ pub async fn head_bucket(
     info!("HEAD bucket {}", bucket);
 
     // Check if bucket exists on the storage backend
-    let exists = state.engine.head_bucket(&bucket).await?;
+    let exists = state.engine.load().head_bucket(&bucket).await?;
     if !exists {
         return Err(S3Error::NoSuchBucket(bucket.to_string()));
     }
@@ -862,7 +888,7 @@ pub async fn list_buckets(State(state): State<Arc<AppState>>) -> Result<Response
     info!("LIST buckets");
 
     // List real buckets from storage backend
-    let mut bucket_list = state.engine.list_buckets().await?;
+    let mut bucket_list = state.engine.load().list_buckets().await?;
     bucket_list.sort();
 
     let result = ListBucketsResult {
@@ -911,7 +937,7 @@ pub async fn get_stats(
         vec![bucket.clone()]
     } else {
         // Aggregate across all real buckets from storage
-        state.engine.list_buckets().await.unwrap_or_default()
+        state.engine.load().list_buckets().await.unwrap_or_default()
     };
 
     let mut total_objects: u64 = 0;
@@ -920,8 +946,8 @@ pub async fn get_stats(
 
     for bucket in &buckets_to_scan {
         let page = state
-            .engine
-            .list_objects_v2(bucket, "", u32::MAX, None)
+            .engine.load()
+            .list_objects(bucket, "", None, u32::MAX, None)
             .await?;
         for (_key, meta) in &page.objects {
             total_objects += 1;
@@ -974,6 +1000,17 @@ fn get_peak_rss_bytes() -> u64 {
             0
         }
     }
+}
+
+/// S3 root HEAD handler — connection probe used by Cyberduck and other S3 clients
+/// HEAD /
+pub async fn head_root() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("server", "DeltaGliderProxy")
+        .header("x-amz-request-id", "0")
+        .body(Body::empty())
+        .unwrap()
 }
 
 /// Health check handler

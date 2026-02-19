@@ -1,23 +1,90 @@
-import { Layout, Space, Tag, Button, Typography, theme } from 'antd';
-import { BulbOutlined, BulbFilled, MenuOutlined } from '@ant-design/icons';
+import { useRef, useState, useEffect } from 'react';
+import { Layout, Space, Button, Input, theme } from 'antd';
+import { MenuOutlined, SearchOutlined, CloseOutlined, ReloadOutlined, SunOutlined, MoonOutlined } from '@ant-design/icons';
 import Breadcrumb from './Breadcrumb';
-import ConnectionSettings from './ConnectionSettings';
+import { useColors, useTheme } from '../ThemeContext';
 
 const { Header } = Layout;
-const { Text } = Typography;
 
 interface Props {
   prefix: string;
   onNavigate: (prefix: string) => void;
-  connected: boolean;
-  isDark: boolean;
-  onToggleTheme: () => void;
   isMobile: boolean;
   onMenuClick: () => void;
+  onRefresh: () => void;
+  searchQuery: string;
+  onSearchChange: (query: string) => void;
+  refreshing: boolean;
 }
 
-export default function TopBar({ prefix, onNavigate, connected, isDark, onToggleTheme, isMobile, onMenuClick }: Props) {
+function SearchInput({
+  inputRef,
+  placeholder,
+  value,
+  onChange,
+  onClose,
+  size,
+  style,
+}: {
+  inputRef: React.Ref<HTMLInputElement>;
+  placeholder: string;
+  value: string;
+  onChange: (value: string) => void;
+  onClose: () => void;
+  size?: 'small' | 'middle' | 'large';
+  style?: React.CSSProperties;
+}) {
+  const { TEXT_MUTED, BORDER, TEXT_PRIMARY } = useColors();
+  return (
+    <Input
+      ref={inputRef as React.Ref<any>}
+      placeholder={placeholder}
+      aria-label="Filter objects and folders"
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      prefix={<SearchOutlined aria-hidden="true" style={{ color: TEXT_MUTED }} />}
+      suffix={
+        <Button
+          type="text"
+          size="small"
+          icon={<CloseOutlined />}
+          aria-label="Close search"
+          style={{ color: TEXT_MUTED, fontSize: 12 }}
+          onClick={onClose}
+        />
+      }
+      allowClear={false}
+      size={size}
+      style={{
+        background: 'var(--input-bg)',
+        borderColor: BORDER,
+        color: TEXT_PRIMARY,
+        borderRadius: 8,
+        fontFamily: "var(--font-mono)",
+        fontSize: 13,
+        ...style,
+      }}
+    />
+  );
+}
+
+export default function TopBar({ prefix, onNavigate, isMobile, onMenuClick, onRefresh, searchQuery, onSearchChange, refreshing }: Props) {
   const { token } = theme.useToken();
+  const { ACCENT_BLUE, TEXT_MUTED, BORDER } = useColors();
+  const { isDark, toggleTheme } = useTheme();
+  const [searchOpen, setSearchOpen] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (searchOpen) {
+      setTimeout(() => inputRef.current?.focus(), 50);
+    }
+  }, [searchOpen]);
+
+  const handleCloseSearch = () => {
+    setSearchOpen(false);
+    onSearchChange('');
+  };
 
   return (
     <Header
@@ -25,56 +92,72 @@ export default function TopBar({ prefix, onNavigate, connected, isDark, onToggle
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'space-between',
-        padding: isMobile ? '0 12px' : '0 24px',
-        height: 56,
-        lineHeight: '56px',
+        padding: isMobile ? '0 12px' : '0 20px',
+        height: 52,
+        lineHeight: '52px',
         background: token.colorBgContainer,
-        borderBottom: `1px solid ${token.colorBorderSecondary}`,
+        borderBottom: `1px solid ${BORDER}`,
       }}
     >
-      {/* Left: hamburger on mobile, logo + brand on desktop */}
-      <Space align="center" size={isMobile ? 8 : 12} style={{ flexShrink: 0 }}>
-        <Button type="text" icon={<MenuOutlined />} onClick={onMenuClick} />
-        <div
-          style={{
-            width: 32,
-            height: 32,
-            borderRadius: 8,
-            background: token.colorPrimary,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-          }}
-        >
-          <span style={{ color: '#fff', fontSize: 16, fontWeight: 700 }}>{'\u0394'}</span>
-        </div>
-        {!isMobile && (
-          <Space size={8} align="center">
-            <Text strong style={{ fontSize: 15 }}>
-              <span style={{ color: token.colorPrimary }}>Delta</span>
-              <span>Glider Proxy</span>
-            </Text>
-            <Tag style={{ marginInlineEnd: 0 }}>v0.1</Tag>
-          </Space>
+      {/* Left: hamburger on mobile, breadcrumb or search on desktop */}
+      <div style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 12, paddingLeft: isMobile ? 0 : 40 }}>
+        {isMobile && (
+          <Button type="text" icon={<MenuOutlined />} onClick={onMenuClick} size="small" aria-label="Open navigation menu" />
         )}
-      </Space>
+        {!isMobile && (
+          searchOpen ? (
+            <SearchInput
+              inputRef={inputRef}
+              placeholder="Filter objects and folders..."
+              value={searchQuery}
+              onChange={onSearchChange}
+              onClose={handleCloseSearch}
+              style={{ maxWidth: 400 }}
+            />
+          ) : (
+            <Breadcrumb prefix={prefix} onNavigate={onNavigate} />
+          )
+        )}
+      </div>
 
-      {/* Breadcrumb (center) — hidden on mobile */}
-      {!isMobile && (
-        <div style={{ flex: 1, margin: '0 32px', minWidth: 0 }}>
-          <Breadcrumb prefix={prefix} onNavigate={onNavigate} />
-        </div>
-      )}
-
-      {/* Controls (right) */}
-      <Space size={8} style={{ flexShrink: 0 }}>
+      {/* Right: action icons */}
+      <Space size={4} style={{ flexShrink: 0 }}>
+        {isMobile && searchOpen ? (
+          <SearchInput
+            inputRef={inputRef}
+            placeholder="Filter..."
+            value={searchQuery}
+            onChange={onSearchChange}
+            onClose={handleCloseSearch}
+            size="small"
+            style={{ width: 160 }}
+          />
+        ) : (
+          <Button
+            type="text"
+            icon={<SearchOutlined />}
+            size="small"
+            aria-label="Search objects"
+            style={{ color: searchOpen ? ACCENT_BLUE : TEXT_MUTED, transition: 'color 0.15s' }}
+            onClick={() => setSearchOpen(!searchOpen)}
+          />
+        )}
         <Button
           type="text"
-          icon={isDark ? <BulbFilled /> : <BulbOutlined />}
-          onClick={onToggleTheme}
-          title={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
+          icon={<ReloadOutlined spin={refreshing} />}
+          size="small"
+          onClick={onRefresh}
+          aria-label="Refresh object list"
+          style={{ color: TEXT_MUTED, transition: 'color 0.15s' }}
         />
-        <ConnectionSettings connected={connected} isMobile={isMobile} />
+        <Button
+          type="text"
+          icon={isDark ? <MoonOutlined /> : <SunOutlined />}
+          size="small"
+          onClick={toggleTheme}
+          aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
+          style={{ color: TEXT_MUTED, transition: 'color 0.15s' }}
+        />
       </Space>
     </Header>
   );

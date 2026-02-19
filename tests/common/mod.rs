@@ -40,13 +40,21 @@ impl TestServer {
         let port = PORT_COUNTER.fetch_add(2, Ordering::SeqCst);
         let data_dir = TempDir::new().expect("Failed to create temp dir");
 
+        // Write a config with the correct listen address and data dir to prevent
+        // the server from loading deltaglider_proxy.toml from CWD.
+        let test_config = data_dir.path().join("test.toml");
+        std::fs::write(
+            &test_config,
+            format!(
+                "listen_addr = \"127.0.0.1:{}\"\n\n[backend]\ntype = \"filesystem\"\npath = \"{}\"\n",
+                port,
+                data_dir.path().display()
+            ),
+        )
+        .expect("Failed to write test config");
+
         let process = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"))
-            .env(
-                "DELTAGLIDER_PROXY_LISTEN_ADDR",
-                format!("127.0.0.1:{}", port),
-            )
-            .env("DELTAGLIDER_PROXY_DATA_DIR", data_dir.path())
-            .env("DELTAGLIDER_PROXY_DEFAULT_BUCKET", "bucket")
+            .env("DGP_CONFIG", &test_config)
             .env("RUST_LOG", "deltaglider_proxy=warn")
             .spawn()
             .expect("Failed to start server");
@@ -58,6 +66,7 @@ impl TestServer {
             bucket: "bucket".to_string(),
         };
         server.wait_ready().await;
+        server.ensure_bucket().await;
         server
     }
 
@@ -71,16 +80,29 @@ impl TestServer {
     pub async fn s3_with_endpoint(endpoint: &str, bucket: &str) -> Self {
         let port = PORT_COUNTER.fetch_add(2, Ordering::SeqCst);
 
+        // Write a config with the correct listen address and S3 backend to prevent
+        // the server from loading deltaglider_proxy.toml from CWD.
+        let test_config = std::env::temp_dir().join(format!("dgp_test_{}.toml", port));
+        std::fs::write(
+            &test_config,
+            format!(
+                concat!(
+                    "listen_addr = \"127.0.0.1:{}\"\n\n",
+                    "[backend]\n",
+                    "type = \"s3\"\n",
+                    "endpoint = \"{}\"\n",
+                    "region = \"us-east-1\"\n",
+                    "force_path_style = true\n",
+                    "access_key_id = \"{}\"\n",
+                    "secret_access_key = \"{}\"\n",
+                ),
+                port, endpoint, MINIO_ACCESS_KEY, MINIO_SECRET_KEY,
+            ),
+        )
+        .expect("Failed to write test config");
+
         let process = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"))
-            .env(
-                "DELTAGLIDER_PROXY_LISTEN_ADDR",
-                format!("127.0.0.1:{}", port),
-            )
-            .env("DELTAGLIDER_PROXY_S3_ENDPOINT", endpoint)
-            .env("DELTAGLIDER_PROXY_S3_FORCE_PATH_STYLE", "true")
-            .env("AWS_ACCESS_KEY_ID", MINIO_ACCESS_KEY)
-            .env("AWS_SECRET_ACCESS_KEY", MINIO_SECRET_KEY)
-            .env("DELTAGLIDER_PROXY_DEFAULT_BUCKET", bucket)
+            .env("DGP_CONFIG", &test_config)
             .env("RUST_LOG", "deltaglider_proxy=warn")
             .spawn()
             .expect("Failed to start server");
@@ -92,6 +114,7 @@ impl TestServer {
             bucket: bucket.to_string(),
         };
         server.wait_ready().await;
+        server.ensure_bucket().await;
         server
     }
 
@@ -112,6 +135,16 @@ impl TestServer {
 
         let _ = self.process.kill();
         panic!("Timed out waiting for server on {}", addr);
+    }
+
+    /// Create the test bucket via the S3 API (replaces the removed DGP_BUCKET auto-create)
+    async fn ensure_bucket(&self) {
+        let client = self.s3_client().await;
+        let _ = client
+            .create_bucket()
+            .bucket(&self.bucket)
+            .send()
+            .await;
     }
 
     /// Create an S3 client configured for this test server
@@ -144,6 +177,85 @@ impl TestServer {
         self.process.id()
     }
 
+    /// Start a test server with S3 backend and a custom max delta ratio.
+    pub async fn s3_with_endpoint_and_delta_ratio(
+        endpoint: &str,
+        bucket: &str,
+        max_delta_ratio: f32,
+    ) -> Self {
+        let port = PORT_COUNTER.fetch_add(2, Ordering::SeqCst);
+
+        let test_config = std::env::temp_dir().join(format!("dgp_test_{}.toml", port));
+        std::fs::write(
+            &test_config,
+            format!(
+                concat!(
+                    "listen_addr = \"127.0.0.1:{}\"\n",
+                    "max_delta_ratio = {}\n\n",
+                    "[backend]\n",
+                    "type = \"s3\"\n",
+                    "endpoint = \"{}\"\n",
+                    "region = \"us-east-1\"\n",
+                    "force_path_style = true\n",
+                    "access_key_id = \"{}\"\n",
+                    "secret_access_key = \"{}\"\n",
+                ),
+                port, max_delta_ratio, endpoint, MINIO_ACCESS_KEY, MINIO_SECRET_KEY,
+            ),
+        )
+        .expect("Failed to write test config");
+
+        let process = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"))
+            .env("DGP_CONFIG", &test_config)
+            .env("RUST_LOG", "deltaglider_proxy=warn")
+            .spawn()
+            .expect("Failed to start server");
+
+        let mut server = Self {
+            process,
+            port,
+            _data_dir: None,
+            bucket: bucket.to_string(),
+        };
+        server.wait_ready().await;
+        server.ensure_bucket().await;
+        server
+    }
+
+    /// Start a test server with filesystem backend and a custom max delta ratio
+    pub async fn filesystem_with_max_delta_ratio(max_delta_ratio: f32) -> Self {
+        let port = PORT_COUNTER.fetch_add(2, Ordering::SeqCst);
+        let data_dir = TempDir::new().expect("Failed to create temp dir");
+
+        let test_config = data_dir.path().join("test.toml");
+        std::fs::write(
+            &test_config,
+            format!(
+                "listen_addr = \"127.0.0.1:{}\"\nmax_delta_ratio = {}\n\n[backend]\ntype = \"filesystem\"\npath = \"{}\"\n",
+                port,
+                max_delta_ratio,
+                data_dir.path().display()
+            ),
+        )
+        .expect("Failed to write test config");
+
+        let process = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"))
+            .env("DGP_CONFIG", &test_config)
+            .env("RUST_LOG", "deltaglider_proxy=warn")
+            .spawn()
+            .expect("Failed to start server");
+
+        let mut server = Self {
+            process,
+            port,
+            _data_dir: Some(data_dir),
+            bucket: "bucket".to_string(),
+        };
+        server.wait_ready().await;
+        server.ensure_bucket().await;
+        server
+    }
+
     /// Start a test server with filesystem backend and a custom max object size
     pub async fn filesystem_with_max_object_size(max_size: u64) -> Self {
         let port = PORT_COUNTER.fetch_add(2, Ordering::SeqCst);
@@ -151,13 +263,12 @@ impl TestServer {
 
         let process = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"))
             .env(
-                "DELTAGLIDER_PROXY_LISTEN_ADDR",
+                "DGP_LISTEN_ADDR",
                 format!("127.0.0.1:{}", port),
             )
-            .env("DELTAGLIDER_PROXY_DATA_DIR", data_dir.path())
-            .env("DELTAGLIDER_PROXY_DEFAULT_BUCKET", "bucket")
+            .env("DGP_DATA_DIR", data_dir.path())
             .env(
-                "DELTAGLIDER_PROXY_MAX_OBJECT_SIZE",
+                "DGP_MAX_OBJECT_SIZE",
                 max_size.to_string(),
             )
             .env("RUST_LOG", "deltaglider_proxy=warn")
@@ -171,6 +282,7 @@ impl TestServer {
             bucket: "bucket".to_string(),
         };
         server.wait_ready().await;
+        server.ensure_bucket().await;
         server
     }
 }

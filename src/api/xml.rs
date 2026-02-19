@@ -25,7 +25,7 @@ impl S3Object {
     }
 }
 
-/// ListObjectsV2 response
+/// ListObjects v1/v2 response
 #[derive(Debug, Clone)]
 pub struct ListBucketResult {
     pub name: String,
@@ -36,11 +36,62 @@ pub struct ListBucketResult {
     pub is_truncated: bool,
     pub contents: Vec<S3Object>,
     pub common_prefixes: Vec<String>,
+    /// v2 pagination
     pub continuation_token: Option<String>,
     pub next_continuation_token: Option<String>,
+    /// v1 pagination
+    pub marker: Option<String>,
+    pub next_marker: Option<String>,
+    /// Whether to URL-encode keys/prefixes in the XML response
+    pub encoding_type: Option<String>,
+    /// v1 vs v2 flag
+    pub is_v1: bool,
 }
 
 impl ListBucketResult {
+    /// Encode a key/prefix value: URL-encode if encoding_type is "url", otherwise XML-escape.
+    fn encode_value(&self, s: &str) -> String {
+        if self.encoding_type.as_deref() == Some("url") {
+            urlencoding::encode(s).into_owned()
+        } else {
+            escape_xml(s)
+        }
+    }
+
+    /// Create a ListObjects v1 response
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_v1(
+        name: String,
+        prefix: String,
+        delimiter: Option<String>,
+        max_keys: u32,
+        contents: Vec<S3Object>,
+        common_prefixes: Vec<String>,
+        marker: Option<String>,
+        next_marker: Option<String>,
+        is_truncated: bool,
+        encoding_type: Option<String>,
+    ) -> Self {
+        let key_count = (contents.len() + common_prefixes.len()) as u32;
+        Self {
+            name,
+            prefix,
+            delimiter,
+            max_keys,
+            key_count,
+            is_truncated,
+            contents,
+            common_prefixes,
+            continuation_token: None,
+            next_continuation_token: None,
+            marker,
+            next_marker,
+            encoding_type,
+            is_v1: true,
+        }
+    }
+
+    /// Create a ListObjectsV2 response
     #[allow(clippy::too_many_arguments)]
     pub fn new_v2(
         name: String,
@@ -65,10 +116,14 @@ impl ListBucketResult {
             common_prefixes,
             continuation_token,
             next_continuation_token,
+            marker: None,
+            next_marker: None,
+            encoding_type: None,
+            is_v1: false,
         }
     }
 
-    /// Convert to S3 XML format
+    /// Convert to S3 XML format (v1 or v2 depending on construction)
     pub fn to_xml(&self) -> String {
         let mut xml = String::new();
         xml.push_str(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
@@ -79,35 +134,60 @@ impl ListBucketResult {
         xml.push_str(&format!("  <Name>{}</Name>\n", escape_xml(&self.name)));
         xml.push_str(&format!(
             "  <Prefix>{}</Prefix>\n",
-            escape_xml(&self.prefix)
+            self.encode_value(&self.prefix)
         ));
         if let Some(ref delim) = self.delimiter {
             xml.push_str(&format!("  <Delimiter>{}</Delimiter>\n", escape_xml(delim)));
         }
-        xml.push_str(&format!("  <MaxKeys>{}</MaxKeys>\n", self.max_keys));
-        xml.push_str(&format!("  <KeyCount>{}</KeyCount>\n", self.key_count));
-        xml.push_str(&format!(
-            "  <IsTruncated>{}</IsTruncated>\n",
-            self.is_truncated
-        ));
-
-        if let Some(ref token) = self.continuation_token {
-            xml.push_str(&format!(
-                "  <ContinuationToken>{}</ContinuationToken>\n",
-                escape_xml(token)
-            ));
+        if let Some(ref enc) = self.encoding_type {
+            xml.push_str(&format!("  <EncodingType>{}</EncodingType>\n", escape_xml(enc)));
         }
+        xml.push_str(&format!("  <MaxKeys>{}</MaxKeys>\n", self.max_keys));
 
-        if let Some(ref token) = self.next_continuation_token {
+        if self.is_v1 {
+            // v1: <Marker>, <NextMarker>, no <KeyCount>
             xml.push_str(&format!(
-                "  <NextContinuationToken>{}</NextContinuationToken>\n",
-                escape_xml(token)
+                "  <Marker>{}</Marker>\n",
+                self.encode_value(self.marker.as_deref().unwrap_or(""))
             ));
+            xml.push_str(&format!(
+                "  <IsTruncated>{}</IsTruncated>\n",
+                self.is_truncated
+            ));
+            if self.is_truncated {
+                if let Some(ref nm) = self.next_marker {
+                    xml.push_str(&format!(
+                        "  <NextMarker>{}</NextMarker>\n",
+                        self.encode_value(nm)
+                    ));
+                }
+            }
+        } else {
+            // v2: <KeyCount>, <ContinuationToken>, <NextContinuationToken>
+            xml.push_str(&format!("  <KeyCount>{}</KeyCount>\n", self.key_count));
+            xml.push_str(&format!(
+                "  <IsTruncated>{}</IsTruncated>\n",
+                self.is_truncated
+            ));
+
+            if let Some(ref token) = self.continuation_token {
+                xml.push_str(&format!(
+                    "  <ContinuationToken>{}</ContinuationToken>\n",
+                    escape_xml(token)
+                ));
+            }
+
+            if let Some(ref token) = self.next_continuation_token {
+                xml.push_str(&format!(
+                    "  <NextContinuationToken>{}</NextContinuationToken>\n",
+                    escape_xml(token)
+                ));
+            }
         }
 
         for obj in &self.contents {
             xml.push_str("  <Contents>\n");
-            xml.push_str(&format!("    <Key>{}</Key>\n", escape_xml(&obj.key)));
+            xml.push_str(&format!("    <Key>{}</Key>\n", self.encode_value(&obj.key)));
             xml.push_str(&format!(
                 "    <LastModified>{}</LastModified>\n",
                 obj.last_modified.format("%Y-%m-%dT%H:%M:%S%.3fZ")
@@ -123,7 +203,7 @@ impl ListBucketResult {
 
         for cp in &self.common_prefixes {
             xml.push_str("  <CommonPrefixes>\n");
-            xml.push_str(&format!("    <Prefix>{}</Prefix>\n", escape_xml(cp)));
+            xml.push_str(&format!("    <Prefix>{}</Prefix>\n", self.encode_value(cp)));
             xml.push_str("  </CommonPrefixes>\n");
         }
 

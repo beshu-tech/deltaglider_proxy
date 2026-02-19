@@ -138,7 +138,7 @@ async fn test_three_versions_all_retrievable() {
 }
 
 #[tokio::test]
-async fn test_txt_file_stored_direct() {
+async fn test_txt_file_stored_passthrough() {
     let server = TestServer::filesystem().await;
     let http = reqwest::Client::new();
 
@@ -152,7 +152,7 @@ async fn test_txt_file_stored_direct() {
     )
     .await;
 
-    assert_eq!(st, "direct", ".txt files should be stored directly");
+    assert_eq!(st, "passthrough", ".txt files should be stored as passthrough");
 }
 
 #[tokio::test]
@@ -185,7 +185,7 @@ async fn test_mixed_types_same_prefix() {
         st_zip == "reference" || st_zip == "delta",
         "zip should be reference or delta"
     );
-    assert_eq!(st_txt, "direct", "txt should be direct");
+    assert_eq!(st_txt, "passthrough", "txt should be passthrough");
 }
 
 #[tokio::test]
@@ -335,5 +335,275 @@ async fn test_first_zip_creates_reference() {
         st == "reference" || st == "delta",
         "First zip should establish reference, got: {}",
         st
+    );
+}
+
+// ============================================================================
+// Listing & Pagination
+// ============================================================================
+
+/// Helper to make a raw ListObjectsV2 request and return the XML body
+async fn list_objects_raw(
+    client: &reqwest::Client,
+    endpoint: &str,
+    bucket: &str,
+    params: &str,
+) -> String {
+    let url = format!("{}/{}?list-type=2&{}", endpoint, bucket, params);
+    let resp = client.get(&url).send().await.unwrap();
+    assert!(
+        resp.status().is_success(),
+        "ListObjects failed: {}",
+        resp.status()
+    );
+    resp.text().await.unwrap()
+}
+
+#[tokio::test]
+async fn test_list_objects_reports_original_sizes() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+
+    // Upload a base zip (reference)
+    let base = generate_binary(1024, 42);
+    put_and_get_storage_type(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        "sizes_test/base.zip",
+        base.clone(),
+        "application/zip",
+    )
+    .await;
+
+    // Upload a similar variant (should be stored as delta, much smaller on disk)
+    let variant = mutate_binary(&base, 0.01);
+    let variant_len = variant.len();
+    let st = put_and_get_storage_type(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        "sizes_test/v1.zip",
+        variant,
+        "application/zip",
+    )
+    .await;
+    assert_eq!(st, "delta", "Variant should be stored as delta");
+
+    // List and check sizes
+    let xml = list_objects_raw(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        "prefix=sizes_test/",
+    )
+    .await;
+
+    // Extract all <Size> values
+    let sizes: Vec<u64> = xml
+        .match_indices("<Size>")
+        .map(|(start, _)| {
+            let rest = &xml[start + 6..];
+            let end = rest.find("</Size>").unwrap();
+            rest[..end].parse::<u64>().unwrap()
+        })
+        .collect();
+
+    assert_eq!(sizes.len(), 2, "Should list 2 objects, got: {:?}", sizes);
+    // Both sizes should be the original file sizes, not delta sizes
+    for size in &sizes {
+        assert!(
+            *size >= 1000,
+            "Listed size {} should be original size (~1024), not delta size",
+            size
+        );
+    }
+    // The variant's listed size should match its original length
+    // Find the size for v1.zip specifically
+    let v1_pos = xml.find("<Key>sizes_test/v1.zip</Key>").unwrap();
+    let size_after_v1 = &xml[v1_pos..];
+    let size_start = size_after_v1.find("<Size>").unwrap() + 6;
+    let size_end = size_after_v1[size_start..].find("</Size>").unwrap() + size_start;
+    let v1_listed_size: u64 = size_after_v1[size_start..size_end].parse().unwrap();
+    assert_eq!(
+        v1_listed_size, variant_len as u64,
+        "v1.zip listed size should be original size {}, got {}",
+        variant_len, v1_listed_size
+    );
+}
+
+#[tokio::test]
+async fn test_list_objects_delimiter_common_prefixes() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+
+    // Upload objects under different sub-prefixes
+    for key in &[
+        "delim/a/file1.zip",
+        "delim/a/file2.zip",
+        "delim/b/file1.zip",
+    ] {
+        put_and_get_storage_type(
+            &http,
+            &server.endpoint(),
+            server.bucket(),
+            key,
+            generate_binary(1024, 42),
+            "application/zip",
+        )
+        .await;
+    }
+
+    // List with delimiter — should collapse into CommonPrefixes
+    let xml = list_objects_raw(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        "prefix=delim/&delimiter=/",
+    )
+    .await;
+
+    // Should have CommonPrefixes for delim/a/ and delim/b/
+    assert!(
+        xml.contains("<Prefix>delim/a/</Prefix>"),
+        "Should contain CommonPrefix delim/a/, got:\n{}",
+        xml
+    );
+    assert!(
+        xml.contains("<Prefix>delim/b/</Prefix>"),
+        "Should contain CommonPrefix delim/b/, got:\n{}",
+        xml
+    );
+
+    // Should have no <Contents> since all objects are behind sub-prefixes
+    assert!(
+        !xml.contains("<Key>"),
+        "Should have no direct <Key> entries with delimiter, got:\n{}",
+        xml
+    );
+}
+
+#[tokio::test]
+async fn test_list_objects_pagination() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+
+    // Upload 4 files
+    for i in 1..=4 {
+        put_and_get_storage_type(
+            &http,
+            &server.endpoint(),
+            server.bucket(),
+            &format!("page_test/file{}.zip", i),
+            generate_binary(1024, i as u64),
+            "application/zip",
+        )
+        .await;
+    }
+
+    // First page: max-keys=2
+    let xml1 = list_objects_raw(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        "prefix=page_test/&max-keys=2",
+    )
+    .await;
+
+    assert!(
+        xml1.contains("<IsTruncated>true</IsTruncated>"),
+        "First page should be truncated, got:\n{}",
+        xml1
+    );
+    assert!(
+        xml1.contains("<KeyCount>2</KeyCount>"),
+        "First page should have KeyCount=2, got:\n{}",
+        xml1
+    );
+
+    // Extract NextContinuationToken
+    let token_start = xml1.find("<NextContinuationToken>").unwrap() + 23;
+    let token_end = xml1[token_start..]
+        .find("</NextContinuationToken>")
+        .unwrap()
+        + token_start;
+    let token = &xml1[token_start..token_end];
+
+    // Second page with continuation token
+    let xml2 = list_objects_raw(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        &format!(
+            "prefix=page_test/&max-keys=2&continuation-token={}",
+            token
+        ),
+    )
+    .await;
+
+    assert!(
+        xml2.contains("<IsTruncated>false</IsTruncated>"),
+        "Second page should not be truncated, got:\n{}",
+        xml2
+    );
+    assert!(
+        xml2.contains("<KeyCount>2</KeyCount>"),
+        "Second page should have KeyCount=2, got:\n{}",
+        xml2
+    );
+
+    // Collect all keys across both pages
+    let all_xml = format!("{}{}", xml1, xml2);
+    let mut keys: Vec<&str> = Vec::new();
+    let mut search_from = 0;
+    while let Some(pos) = all_xml[search_from..].find("<Key>") {
+        let abs_pos = search_from + pos + 5;
+        let end = all_xml[abs_pos..].find("</Key>").unwrap() + abs_pos;
+        keys.push(&all_xml[abs_pos..end]);
+        search_from = end;
+    }
+    assert_eq!(
+        keys.len(),
+        4,
+        "Should have 4 keys total across both pages: {:?}",
+        keys
+    );
+}
+
+#[tokio::test]
+async fn test_first_file_bad_delta_ratio_passthrough() {
+    // Use a very low max_delta_ratio so the identity delta (first file against itself)
+    // exceeds the threshold and triggers the passthrough fallback
+    let server = TestServer::filesystem_with_max_delta_ratio(0.001).await;
+    let http = reqwest::Client::new();
+
+    let data = generate_binary(1024, 99999);
+
+    let st = put_and_get_storage_type(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        "bad_ratio/random.zip",
+        data.clone(),
+        "application/zip",
+    )
+    .await;
+    assert_eq!(
+        st, "passthrough",
+        "First file with delta ratio exceeding threshold should be passthrough, got: {}",
+        st
+    );
+
+    // Verify the data round-trips correctly
+    let retrieved = get_bytes(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        "bad_ratio/random.zip",
+    )
+    .await;
+    assert_eq!(
+        retrieved, data,
+        "Passthrough file should round-trip correctly"
     );
 }

@@ -24,7 +24,7 @@ cd demo/s3-browser/ui && npm install && npm run build && cd -
 cargo build
 
 # 4. Run it
-DELTAGLIDER_PROXY_DATA_DIR=./data cargo run
+DGP_DATA_DIR=./data cargo run
 ```
 
 The S3 API starts on `http://localhost:9000` and the demo UI on `http://localhost:9001`.
@@ -54,23 +54,30 @@ cargo test --all              # Tests
 ```
 src/
 ├── api/
+│   ├── mod.rs         # API module root, S3Error type
 │   ├── handlers.rs    # S3 API endpoint handlers
+│   ├── auth.rs        # SigV4 authentication middleware (header + presigned URL)
+│   ├── admin.rs       # Admin GUI API (login, config, sessions)
+│   ├── aws_chunked.rs # AWS chunked transfer encoding decoder
 │   ├── extractors.rs  # Axum request extractors
 │   ├── errors.rs      # S3 error responses
 │   └── xml.rs         # S3 XML response/request builders
 ├── deltaglider/
+│   ├── mod.rs         # DeltaGlider module root
 │   ├── engine.rs      # Core delta compression logic
 │   ├── codec.rs       # xdelta3 encode/decode
 │   ├── cache.rs       # Reference file LRU cache
 │   └── file_router.rs # File type routing
 ├── storage/
+│   ├── mod.rs         # Storage module root
 │   ├── traits.rs      # StorageBackend trait
 │   ├── filesystem.rs  # Local filesystem backend
 │   └── s3.rs          # S3 backend
-├── auth.rs            # SigV4 authentication middleware
 ├── config.rs          # Configuration loading
 ├── multipart.rs       # In-memory multipart upload state management
+├── session.rs         # In-memory session store for admin GUI auth
 ├── types.rs           # Core types (FileMetadata, etc)
+├── lib.rs             # Library root (re-exports modules)
 ├── demo.rs            # Embedded React demo UI (rust-embed)
 └── main.rs            # Server entry point
 demo/s3-browser/ui/    # React demo UI source (Vite + TypeScript)
@@ -83,7 +90,7 @@ docs/                  # Additional documentation
 - **DeltaSpace**: A group of objects under the same directory prefix that share a single baseline for delta compression. For example, all objects under `releases/` form one deltaspace.
 - **Reference file**: The internal baseline stored once per deltaspace. All deltas are computed against it (no chaining), so reconstruction is always O(1).
 - **StorageBackend**: A trait abstracting where bytes live — local filesystem or upstream S3. Adding a new backend means implementing this trait.
-- **File router**: Decides whether a file is delta-eligible based on its extension (`.zip`, `.tar.gz`, etc.) or should be stored directly (`.jpg`, `.mp4`, etc.).
+- **File router**: Decides whether a file is delta-eligible based on its extension (`.zip`, `.tar.gz`, etc.) or should be stored as passthrough (`.jpg`, `.mp4`, etc.).
 
 ## Submitting Changes
 

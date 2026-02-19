@@ -27,6 +27,12 @@ async-trait = "0.1"
 # Delta compression
 xdelta3 = "0.1.5"
 
+# Password hashing
+bcrypt = "0.15"
+
+# Random number generation
+rand = { version = "0.8", features = ["std_rng"] }
+
 # Hashing & HMAC (sha2 + hmac used for SigV4 verification)
 sha2 = "0.10"
 hmac = "0.12"
@@ -48,9 +54,11 @@ bytes = "1"
 futures = "0.3"
 tokio-util = { version = "0.7", features = ["io"] }
 tower-http = { version = "0.6", features = ["trace", "cors"] }
+arc-swap = "1"
 urlencoding = "2"
 tempfile = "3"
 libc = "0.2"
+xattr = "1"
 
 # Embedded demo UI
 rust-embed = { version = "8", features = ["compression"] }
@@ -60,7 +68,6 @@ mime_guess = "2"
 clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
-rand = { version = "0.8", features = ["std_rng"] }
 tokio-test = "0.4"
 reqwest = { version = "0.12", features = ["json"] }
 testcontainers = "0.26"

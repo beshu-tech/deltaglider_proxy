@@ -57,12 +57,15 @@ export default function DropZone({ onDrop, prefix }: Props) {
 
   return (
     <div
+      role="dialog"
+      aria-label="Drop files to upload"
       style={{
         position: 'fixed',
         inset: 0,
         zIndex: 1000,
-        background: token.colorBgMask,
-        backdropFilter: 'blur(4px)',
+        background: 'var(--overlay-bg)',
+        backdropFilter: 'blur(8px)',
+        WebkitBackdropFilter: 'blur(8px)',
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
@@ -71,15 +74,17 @@ export default function DropZone({ onDrop, prefix }: Props) {
       <div
         style={{
           border: `2px dashed ${token.colorPrimary}`,
-          borderRadius: 16,
+          borderRadius: 20,
           padding: '64px',
           textAlign: 'center',
           maxWidth: 500,
+          animation: 'dropGlow 2s ease-in-out infinite',
+          background: 'var(--drop-glow)',
         }}
       >
-        <CloudUploadOutlined style={{ fontSize: 48, color: token.colorPrimary, marginBottom: 16 }} />
-        <Title level={4}>Drop files to upload</Title>
-        <Text type="secondary">
+        <CloudUploadOutlined aria-hidden="true" style={{ fontSize: 56, color: token.colorPrimary, marginBottom: 16 }} />
+        <Title level={4} style={{ fontFamily: "var(--font-ui)", fontWeight: 700 }}>Drop files to upload</Title>
+        <Text type="secondary" style={{ fontFamily: "var(--font-mono)", fontSize: 13 }}>
           to <Text code>{prefix || '/'}</Text>
         </Text>
       </div>

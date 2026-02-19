@@ -41,7 +41,7 @@ pub enum StorageError {
 }
 
 /// Abstract storage backend for S3-like object storage
-/// Uses per-file metadata sidecars following DeltaGlider schema
+/// Uses per-file metadata following DeltaGlider schema (xattr on filesystem, sidecars on S3)
 ///
 /// This trait is object-safe and can be used with `Box<dyn StorageBackend>`.
 ///
@@ -134,18 +134,18 @@ pub trait StorageBackend: Send + Sync {
         filename: &str,
     ) -> Result<(), StorageError>;
 
-    // === Direct file operations ===
+    // === Passthrough file operations (stored as-is with original filename) ===
 
-    /// Get a direct (non-delta) file
-    async fn get_direct(
+    /// Get a passthrough (non-delta) file
+    async fn get_passthrough(
         &self,
         bucket: &str,
         prefix: &str,
         filename: &str,
     ) -> Result<Vec<u8>, StorageError>;
 
-    /// Store a direct (non-delta) file with its metadata
-    async fn put_direct(
+    /// Store a passthrough (non-delta) file with its metadata
+    async fn put_passthrough(
         &self,
         bucket: &str,
         prefix: &str,
@@ -154,16 +154,16 @@ pub trait StorageBackend: Send + Sync {
         metadata: &FileMetadata,
     ) -> Result<(), StorageError>;
 
-    /// Get direct file metadata
-    async fn get_direct_metadata(
+    /// Get passthrough file metadata
+    async fn get_passthrough_metadata(
         &self,
         bucket: &str,
         prefix: &str,
         filename: &str,
     ) -> Result<FileMetadata, StorageError>;
 
-    /// Delete a direct (non-delta) file and its metadata
-    async fn delete_direct(
+    /// Delete a passthrough (non-delta) file and its metadata
+    async fn delete_passthrough(
         &self,
         bucket: &str,
         prefix: &str,
@@ -172,21 +172,21 @@ pub trait StorageBackend: Send + Sync {
 
     // === Streaming operations ===
 
-    /// Stream a direct file's contents without buffering the entire file in memory.
-    /// Default implementation falls back to `get_direct()` and wraps in a single-chunk stream.
-    async fn get_direct_stream(
+    /// Stream a passthrough file's contents without buffering the entire file in memory.
+    /// Default implementation falls back to `get_passthrough()` and wraps in a single-chunk stream.
+    async fn get_passthrough_stream(
         &self,
         bucket: &str,
         prefix: &str,
         filename: &str,
     ) -> Result<BoxStream<'static, Result<Bytes, StorageError>>, StorageError> {
-        let data = self.get_direct(bucket, prefix, filename).await?;
+        let data = self.get_passthrough(bucket, prefix, filename).await?;
         Ok(Box::pin(stream::once(async { Ok(Bytes::from(data)) })))
     }
 
-    /// Store a direct file from pre-split chunks without assembling into a contiguous buffer.
-    /// Default implementation collects chunks and delegates to `put_direct()`.
-    async fn put_direct_chunked(
+    /// Store a passthrough file from pre-split chunks without assembling into a contiguous buffer.
+    /// Default implementation collects chunks and delegates to `put_passthrough()`.
+    async fn put_passthrough_chunked(
         &self,
         bucket: &str,
         prefix: &str,
@@ -199,7 +199,7 @@ pub trait StorageBackend: Send + Sync {
         for chunk in chunks {
             buf.extend_from_slice(chunk);
         }
-        self.put_direct(bucket, prefix, filename, &buf, metadata)
+        self.put_passthrough(bucket, prefix, filename, &buf, metadata)
             .await
     }
 
@@ -218,6 +218,64 @@ pub trait StorageBackend: Send + Sync {
 
     /// Get total storage size used (for metrics), optionally scoped to a bucket
     async fn total_size(&self, bucket: Option<&str>) -> Result<u64, StorageError>;
+
+    /// Store a zero-byte S3 directory marker (key ending with '/').
+    /// Used by Cyberduck, AWS Console, etc. to create "folders".
+    /// Default: no-op (directories are implicit in S3).
+    async fn put_directory_marker(
+        &self,
+        _bucket: &str,
+        _key: &str,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    /// List directory markers (zero-byte objects ending with '/') in a bucket.
+    /// Returns keys like "folder/" that represent S3 directory markers.
+    /// Default: empty (filesystem backend doesn't use directory markers).
+    async fn list_directory_markers(
+        &self,
+        _bucket: &str,
+        _prefix: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        Ok(vec![])
+    }
+
+    /// List all objects in a bucket matching a prefix, in a single pass.
+    /// Returns `(user_visible_key, FileMetadata)` pairs — references are excluded,
+    /// directory markers are included. This replaces the three-step
+    /// list_deltaspaces → scan_deltaspace × N → list_directory_markers dance.
+    async fn bulk_list_objects(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Vec<(String, FileMetadata)>, StorageError>;
+
+    /// Optimised listing with delimiter support.
+    ///
+    /// Backends that can delegate delimiter collapsing to the underlying store
+    /// (e.g. S3) override this to avoid fetching every object just to collapse
+    /// them into CommonPrefixes.  Returns `None` by default so the engine
+    /// falls back to `bulk_list_objects` + in-memory collapsing.
+    async fn list_objects_delegated(
+        &self,
+        _bucket: &str,
+        _prefix: &str,
+        _delimiter: &str,
+        _max_keys: u32,
+        _continuation_token: Option<&str>,
+    ) -> Result<Option<DelegatedListResult>, StorageError> {
+        Ok(None)
+    }
+}
+
+/// Result from `list_objects_delegated` when the backend handles delimiter
+/// collapsing natively.
+pub struct DelegatedListResult {
+    pub objects: Vec<(String, FileMetadata)>,
+    pub common_prefixes: Vec<String>,
+    pub is_truncated: bool,
+    pub next_continuation_token: Option<String>,
 }
 
 /// Generate the blanket `impl StorageBackend for Box<dyn StorageBackend>`
@@ -320,15 +378,15 @@ macro_rules! impl_storage_backend_for_box {
                 (**self).delete_delta(bucket, prefix, filename).await
             }
 
-            async fn get_direct(
+            async fn get_passthrough(
                 &self,
                 bucket: &str,
                 prefix: &str,
                 filename: &str,
             ) -> Result<Vec<u8>, StorageError> {
-                (**self).get_direct(bucket, prefix, filename).await
+                (**self).get_passthrough(bucket, prefix, filename).await
             }
-            async fn put_direct(
+            async fn put_passthrough(
                 &self,
                 bucket: &str,
                 prefix: &str,
@@ -337,36 +395,36 @@ macro_rules! impl_storage_backend_for_box {
                 metadata: &FileMetadata,
             ) -> Result<(), StorageError> {
                 (**self)
-                    .put_direct(bucket, prefix, filename, data, metadata)
+                    .put_passthrough(bucket, prefix, filename, data, metadata)
                     .await
             }
-            async fn get_direct_metadata(
+            async fn get_passthrough_metadata(
                 &self,
                 bucket: &str,
                 prefix: &str,
                 filename: &str,
             ) -> Result<FileMetadata, StorageError> {
-                (**self).get_direct_metadata(bucket, prefix, filename).await
+                (**self).get_passthrough_metadata(bucket, prefix, filename).await
             }
-            async fn delete_direct(
+            async fn delete_passthrough(
                 &self,
                 bucket: &str,
                 prefix: &str,
                 filename: &str,
             ) -> Result<(), StorageError> {
-                (**self).delete_direct(bucket, prefix, filename).await
+                (**self).delete_passthrough(bucket, prefix, filename).await
             }
 
-            async fn get_direct_stream(
+            async fn get_passthrough_stream(
                 &self,
                 bucket: &str,
                 prefix: &str,
                 filename: &str,
             ) -> Result<BoxStream<'static, Result<Bytes, StorageError>>, StorageError> {
-                (**self).get_direct_stream(bucket, prefix, filename).await
+                (**self).get_passthrough_stream(bucket, prefix, filename).await
             }
 
-            async fn put_direct_chunked(
+            async fn put_passthrough_chunked(
                 &self,
                 bucket: &str,
                 prefix: &str,
@@ -375,7 +433,7 @@ macro_rules! impl_storage_backend_for_box {
                 metadata: &FileMetadata,
             ) -> Result<(), StorageError> {
                 (**self)
-                    .put_direct_chunked(bucket, prefix, filename, chunks, metadata)
+                    .put_passthrough_chunked(bucket, prefix, filename, chunks, metadata)
                     .await
             }
 
@@ -391,6 +449,37 @@ macro_rules! impl_storage_backend_for_box {
             }
             async fn total_size(&self, bucket: Option<&str>) -> Result<u64, StorageError> {
                 (**self).total_size(bucket).await
+            }
+            async fn put_directory_marker(
+                &self,
+                bucket: &str,
+                key: &str,
+            ) -> Result<(), StorageError> {
+                (**self).put_directory_marker(bucket, key).await
+            }
+            async fn list_directory_markers(
+                &self,
+                bucket: &str,
+                prefix: &str,
+            ) -> Result<Vec<String>, StorageError> {
+                (**self).list_directory_markers(bucket, prefix).await
+            }
+            async fn bulk_list_objects(
+                &self,
+                bucket: &str,
+                prefix: &str,
+            ) -> Result<Vec<(String, FileMetadata)>, StorageError> {
+                (**self).bulk_list_objects(bucket, prefix).await
+            }
+            async fn list_objects_delegated(
+                &self,
+                bucket: &str,
+                prefix: &str,
+                delimiter: &str,
+                max_keys: u32,
+                continuation_token: Option<&str>,
+            ) -> Result<Option<DelegatedListResult>, StorageError> {
+                (**self).list_objects_delegated(bucket, prefix, delimiter, max_keys, continuation_token).await
             }
         }
     };

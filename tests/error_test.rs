@@ -71,18 +71,18 @@ async fn test_malformed_xml_delete_request() {
 }
 
 #[tokio::test]
-async fn test_multipart_returns_501() {
+async fn test_multipart_create_upload() {
     let server = TestServer::filesystem().await;
     let client = reqwest::Client::new();
 
     let url = format!("{}/{}/test.zip?uploads", server.endpoint(), server.bucket());
     let resp = client.post(&url).send().await.unwrap();
 
-    assert_eq!(resp.status().as_u16(), 501);
+    assert_eq!(resp.status().as_u16(), 200);
     let body = resp.text().await.unwrap();
     assert!(
-        body.contains("<Code>NotImplemented</Code>"),
-        "Should contain NotImplemented error code, got: {}",
+        body.contains("<UploadId>"),
+        "CreateMultipartUpload should return an UploadId, got: {}",
         body
     );
 }

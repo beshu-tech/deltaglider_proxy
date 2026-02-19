@@ -75,7 +75,7 @@ mod tests {
     }
 
     #[test]
-    fn test_direct_store_extensions() {
+    fn test_passthrough_store_extensions() {
         let router = FileRouter::new();
 
         assert!(!router.is_delta_eligible("app.exe"));

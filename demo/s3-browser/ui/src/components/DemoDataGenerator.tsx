@@ -1,9 +1,7 @@
 import { useState } from 'react';
-import { Button, Typography } from 'antd';
-import { ExperimentOutlined } from '@ant-design/icons';
+import { ExperimentOutlined, LoadingOutlined } from '@ant-design/icons';
 import { uploadObject } from '../s3client';
-
-const { Text } = Typography;
+import { useColors } from '../ThemeContext';
 
 interface Props {
   onDone: () => void;
@@ -54,17 +52,33 @@ export default function DemoDataGenerator({ onDone }: Props) {
     }
   };
 
+  const { TEXT_PRIMARY, TEXT_SECONDARY } = useColors();
+
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-      <Button
-        icon={<ExperimentOutlined />}
+    <div>
+      <button
+        className="btn-reset"
         onClick={generate}
-        loading={generating}
-        block
+        disabled={generating}
+        style={{
+          gap: 10,
+          padding: '7px 4px',
+          color: TEXT_SECONDARY,
+          fontSize: 12,
+          width: '100%',
+          transition: 'color 0.15s',
+          fontFamily: "var(--font-ui)",
+          opacity: generating ? 0.6 : 1,
+        }}
+        onMouseEnter={(e) => { if (!generating) e.currentTarget.style.color = TEXT_PRIMARY; }}
+        onMouseLeave={(e) => { e.currentTarget.style.color = TEXT_SECONDARY; }}
       >
-        Demo Data
-      </Button>
-      {progress && <Text type="secondary" style={{ fontSize: 12 }}>{progress}</Text>}
+        {generating
+          ? <LoadingOutlined aria-hidden="true" style={{ fontSize: 13, width: 20, textAlign: 'center', display: 'inline-flex', justifyContent: 'center' }} />
+          : <ExperimentOutlined aria-hidden="true" style={{ fontSize: 13, width: 20, textAlign: 'center', display: 'inline-flex', justifyContent: 'center' }} />
+        }
+        <span>{progress || 'Demo Data'}</span>
+      </button>
     </div>
   );
 }

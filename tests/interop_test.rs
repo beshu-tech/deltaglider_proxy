@@ -226,15 +226,14 @@ impl TestProxyServer {
 
         let process = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"))
             .env(
-                "DELTAGLIDER_PROXY_LISTEN_ADDR",
+                "DGP_LISTEN_ADDR",
                 format!("127.0.0.1:{}", port),
             )
-            .env("DELTAGLIDER_PROXY_S3_ENDPOINT", MINIO_ENDPOINT)
-            .env("DELTAGLIDER_PROXY_S3_REGION", "us-east-1")
-            .env("DELTAGLIDER_PROXY_S3_FORCE_PATH_STYLE", "true")
-            .env("AWS_ACCESS_KEY_ID", MINIO_ACCESS_KEY)
-            .env("AWS_SECRET_ACCESS_KEY", MINIO_SECRET_KEY)
-            .env("DELTAGLIDER_PROXY_DEFAULT_BUCKET", "default")
+            .env("DGP_S3_ENDPOINT", MINIO_ENDPOINT)
+            .env("DGP_S3_REGION", "us-east-1")
+            .env("DGP_S3_PATH_STYLE", "true")
+            .env("DGP_BE_AWS_ACCESS_KEY_ID", MINIO_ACCESS_KEY)
+            .env("DGP_BE_AWS_SECRET_ACCESS_KEY", MINIO_SECRET_KEY)
             .env("RUST_LOG", "deltaglider_proxy=debug")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -251,11 +250,17 @@ impl TestProxyServer {
             sleep(Duration::from_millis(100)).await;
         }
 
-        Self {
+        let server = Self {
             process,
             port,
             _data_dir: data_dir,
-        }
+        };
+
+        // Create the "default" bucket explicitly (no more DGP_BUCKET auto-create)
+        let client = server.s3_client().await;
+        let _ = client.create_bucket().bucket("default").send().await;
+
+        server
     }
 
     /// Create S3 client for this proxy
@@ -574,7 +579,7 @@ async fn test_proxy_upload_original_cli_download() {
     let v2_data = mutate_archive(&v1_data, 0.05, 400);
     let v2_sha256 = sha256_hex(&v2_data);
 
-    // Upload v1 (should become reference or direct)
+    // Upload v1 (should become reference or passthrough)
     proxy_client
         .put_object()
         .bucket("default")

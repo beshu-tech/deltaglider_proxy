@@ -24,5 +24,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=rust-build /app/target/release/deltaglider_proxy /usr/local/bin/
 EXPOSE 9000 9001
-ENV DELTAGLIDER_PROXY_LISTEN_ADDR=0.0.0.0:9000
+ENV DGP_LISTEN_ADDR=0.0.0.0:9000
 ENTRYPOINT ["deltaglider_proxy"]

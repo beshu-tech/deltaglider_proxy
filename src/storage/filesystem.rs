@@ -1,6 +1,7 @@
-//! Filesystem-based storage backend with per-file metadata sidecars
+//! Filesystem-based storage backend with xattr-based metadata
 
 use super::traits::{StorageBackend, StorageError};
+use super::xattr_meta;
 use crate::types::FileMetadata;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -10,7 +11,7 @@ use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 use tokio::fs;
 use tokio_util::io::ReaderStream;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, instrument};
 
 /// Async-safe path existence check (avoids blocking the Tokio runtime)
 async fn path_exists(path: &Path) -> bool {
@@ -63,13 +64,13 @@ async fn atomic_write(path: &Path, data: &[u8]) -> Result<(), StorageError> {
 /// Storage layout:
 /// ```text
 /// {root}/{bucket}/deltaspaces/{prefix}/
-///   reference.bin         # Reference file data
-///   reference.bin.meta    # Reference metadata (JSON)
-///   {name}.delta          # Delta file data
-///   {name}.delta.meta     # Delta metadata (JSON)
-///   {name}.direct         # Direct file data
-///   {name}.direct.meta    # Direct metadata (JSON)
+///   reference.bin         # Reference file data (metadata in xattr)
+///   {name}.delta          # Delta file data (metadata in xattr)
+///   {name}                # Passthrough file data with original name (metadata in xattr)
 /// ```
+///
+/// Metadata is stored as a `user.dg.metadata` extended attribute on each
+/// data file's inode — no sidecar `.meta` files needed.
 ///
 /// Each bucket is a real subdirectory under the root.
 pub struct FilesystemBackend {
@@ -78,10 +79,16 @@ pub struct FilesystemBackend {
 }
 
 impl FilesystemBackend {
-    /// Create a new filesystem backend with the given root directory
+    /// Create a new filesystem backend with the given root directory.
+    ///
+    /// Validates xattr support at startup.
     pub async fn new(root: PathBuf) -> Result<Self, StorageError> {
         // Ensure root directory exists
         fs::create_dir_all(&root).await?;
+
+        // Validate that the filesystem supports xattrs
+        xattr_meta::validate_xattr_support(&root).await?;
+
         Ok(Self { root })
     }
 
@@ -104,34 +111,15 @@ impl FilesystemBackend {
         self.deltaspace_dir(bucket, prefix).join("reference.bin")
     }
 
-    /// Get the path for reference metadata
-    fn reference_meta_path(&self, bucket: &str, prefix: &str) -> PathBuf {
-        self.deltaspace_dir(bucket, prefix)
-            .join("reference.bin.meta")
-    }
-
     /// Get the path for a delta file
     fn delta_path(&self, bucket: &str, prefix: &str, filename: &str) -> PathBuf {
         self.deltaspace_dir(bucket, prefix)
             .join(format!("{}.delta", filename))
     }
 
-    /// Get the path for delta metadata
-    fn delta_meta_path(&self, bucket: &str, prefix: &str, filename: &str) -> PathBuf {
-        self.deltaspace_dir(bucket, prefix)
-            .join(format!("{}.delta.meta", filename))
-    }
-
-    /// Get the path for a direct file
-    fn direct_path(&self, bucket: &str, prefix: &str, filename: &str) -> PathBuf {
-        self.deltaspace_dir(bucket, prefix)
-            .join(format!("{}.direct", filename))
-    }
-
-    /// Get the path for direct metadata
-    fn direct_meta_path(&self, bucket: &str, prefix: &str, filename: &str) -> PathBuf {
-        self.deltaspace_dir(bucket, prefix)
-            .join(format!("{}.direct.meta", filename))
+    /// Get the path for a passthrough file (stored with original filename)
+    fn passthrough_path(&self, bucket: &str, prefix: &str, filename: &str) -> PathBuf {
+        self.deltaspace_dir(bucket, prefix).join(filename)
     }
 
     /// Ensure a directory exists
@@ -160,88 +148,6 @@ impl FilesystemBackend {
         Ok(total)
     }
 
-    /// Log warnings for orphaned data files (data without corresponding metadata).
-    pub async fn warn_orphaned_files(&self) {
-        // Scan all bucket directories
-        let mut entries = match fs::read_dir(&self.root).await {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        while let Some(entry) = entries.next_entry().await.unwrap_or(None) {
-            let path = entry.path();
-            if !is_dir(&path).await {
-                continue;
-            }
-            let deltaspaces_dir = path.join("deltaspaces");
-            if !path_exists(&deltaspaces_dir).await {
-                continue;
-            }
-            let mut orphans = Vec::new();
-            if let Err(e) = Self::find_orphans_recursive(&deltaspaces_dir, &mut orphans).await {
-                warn!("Failed to scan for orphaned files: {}", e);
-                continue;
-            }
-            for orphan in &orphans {
-                warn!(
-                    "Orphaned data file (no metadata): {} — likely from an interrupted write",
-                    orphan.display()
-                );
-            }
-            if !orphans.is_empty() {
-                warn!(
-                    "Found {} orphaned data file(s). These consume disk but are not served. \
-                     They can be safely deleted.",
-                    orphans.len()
-                );
-            }
-        }
-    }
-
-    /// Recursively find data files that have no corresponding .meta sidecar
-    fn find_orphans_recursive<'a>(
-        dir: &'a Path,
-        orphans: &'a mut Vec<PathBuf>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), StorageError>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            let mut entries = match fs::read_dir(dir).await {
-                Ok(e) => e,
-                Err(_) => return Ok(()),
-            };
-
-            while let Some(entry) = entries.next_entry().await? {
-                let path = entry.path();
-                let ft = entry.file_type().await?;
-                if ft.is_dir() {
-                    Self::find_orphans_recursive(&path, orphans).await?;
-                } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    let is_data_file = name == "reference.bin"
-                        || (name.ends_with(".delta") && !name.ends_with(".delta.meta"))
-                        || (name.ends_with(".direct") && !name.ends_with(".direct.meta"));
-
-                    if is_data_file {
-                        let meta_path = path.with_extension(
-                            path.extension()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .to_string()
-                                + ".meta",
-                        );
-                        let meta_path = if name == "reference.bin" {
-                            dir.join("reference.bin.meta")
-                        } else {
-                            meta_path
-                        };
-                        if !path_exists(&meta_path).await {
-                            orphans.push(path);
-                        }
-                    }
-                }
-            }
-            Ok(())
-        })
-    }
-
     /// Recursively find all deltaspaces (directories containing deltaglider files)
     fn find_deltaspaces_recursive<'a>(
         base_dir: &'a Path,
@@ -259,10 +165,11 @@ impl FilesystemBackend {
                 if ft.is_dir() {
                     Self::find_deltaspaces_recursive(base_dir, &path, prefixes).await?;
                 } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    // Any data file (reference, delta, or passthrough with original name)
+                    // indicates this directory is an active deltaspace.
                     if name == "reference.bin"
                         || name.ends_with(".delta")
-                        || name.ends_with(".direct")
-                        || name.ends_with(".meta")
+                        || !name.starts_with('.')
                     {
                         has_deltaglider_files = true;
                     }
@@ -279,7 +186,67 @@ impl FilesystemBackend {
         })
     }
 
-    // === Private helpers to eliminate delta/direct duplication ===
+    /// Recursively walk directories, reading xattr metadata for each data file
+    /// and producing (user_visible_key, FileMetadata) pairs in a single pass.
+    fn bulk_walk_recursive<'a>(
+        deltaspaces_dir: &'a Path,
+        current_dir: &'a Path,
+        results: &'a mut Vec<(String, FileMetadata)>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), StorageError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut entries = fs::read_dir(current_dir).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+                let ft = entry.file_type().await?;
+                if ft.is_dir() {
+                    Self::bulk_walk_recursive(deltaspaces_dir, &path, results).await?;
+                    continue;
+                }
+
+                let name = match path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n.to_string(),
+                    None => continue,
+                };
+
+                // Skip hidden files and internal reference files
+                if name.starts_with('.') || name == "reference.bin" {
+                    continue;
+                }
+
+                // Read xattr metadata
+                let meta = match xattr_meta::read_metadata(&path).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        debug!("Failed to read xattr metadata {:?}: {}", path, e);
+                        continue;
+                    }
+                };
+
+                // Skip Reference storage info entries
+                if matches!(meta.storage_info, crate::types::StorageInfo::Reference { .. }) {
+                    continue;
+                }
+
+                // Compute user-visible key from relative path
+                let relative_dir = current_dir
+                    .strip_prefix(deltaspaces_dir)
+                    .unwrap_or(Path::new(""));
+                let dir_str = relative_dir.to_string_lossy();
+
+                let user_key = if dir_str.is_empty() {
+                    meta.original_name.clone()
+                } else {
+                    format!("{}/{}", dir_str, meta.original_name)
+                };
+
+                results.push((user_key, meta));
+            }
+            Ok(())
+        })
+    }
+
+    // === Private helpers to eliminate delta/passthrough duplication ===
 
     async fn get_object_file(
         &self,
@@ -305,11 +272,9 @@ impl FilesystemBackend {
         Ok(data)
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn put_object_file(
         &self,
         data_path: &Path,
-        meta_path: &Path,
         data: &[u8],
         metadata: &FileMetadata,
         label: &str,
@@ -318,7 +283,7 @@ impl FilesystemBackend {
     ) -> Result<(), StorageError> {
         self.ensure_dir(data_path).await?;
         atomic_write(data_path, data).await?;
-        self.write_metadata(meta_path, metadata).await?;
+        xattr_meta::write_metadata(data_path, metadata).await?;
         debug!(
             "Wrote {} ({} bytes) for {}/{}",
             label,
@@ -332,7 +297,6 @@ impl FilesystemBackend {
     async fn delete_object_file(
         &self,
         data_path: &Path,
-        meta_path: &Path,
         label: &str,
         prefix: &str,
         filename: &str,
@@ -343,34 +307,8 @@ impl FilesystemBackend {
                 label, prefix, filename
             )));
         }
-        if path_exists(meta_path).await {
-            fs::remove_file(meta_path).await?;
-        }
         fs::remove_file(data_path).await?;
         debug!("Deleted {} for {}/{}", label, prefix, filename);
-        Ok(())
-    }
-
-    /// Read metadata from a .meta file
-    async fn read_metadata(&self, meta_path: &Path) -> Result<FileMetadata, StorageError> {
-        if !path_exists(meta_path).await {
-            return Err(StorageError::NotFound(meta_path.display().to_string()));
-        }
-        let data = fs::read(meta_path).await?;
-        let metadata: FileMetadata = serde_json::from_slice(&data)?;
-        Ok(metadata)
-    }
-
-    /// Write metadata to a .meta file
-    async fn write_metadata(
-        &self,
-        meta_path: &Path,
-        metadata: &FileMetadata,
-    ) -> Result<(), StorageError> {
-        self.ensure_dir(meta_path).await?;
-        let data = serde_json::to_vec_pretty(metadata)?;
-        atomic_write(meta_path, &data).await?;
-        debug!("Wrote metadata to {:?}", meta_path);
         Ok(())
     }
 }
@@ -462,11 +400,10 @@ impl StorageBackend for FilesystemBackend {
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         let data_path = self.reference_path(bucket, prefix);
-        let meta_path = self.reference_meta_path(bucket, prefix);
 
         self.ensure_dir(&data_path).await?;
         atomic_write(&data_path, data).await?;
-        self.write_metadata(&meta_path, metadata).await?;
+        xattr_meta::write_metadata(&data_path, metadata).await?;
 
         debug!(
             "Wrote reference ({} bytes) for {}/{}",
@@ -484,8 +421,8 @@ impl StorageBackend for FilesystemBackend {
         prefix: &str,
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        let meta_path = self.reference_meta_path(bucket, prefix);
-        self.write_metadata(&meta_path, metadata).await
+        let data_path = self.reference_path(bucket, prefix);
+        xattr_meta::write_metadata(&data_path, metadata).await
     }
 
     #[instrument(skip(self))]
@@ -494,8 +431,8 @@ impl StorageBackend for FilesystemBackend {
         bucket: &str,
         prefix: &str,
     ) -> Result<FileMetadata, StorageError> {
-        let meta_path = self.reference_meta_path(bucket, prefix);
-        self.read_metadata(&meta_path).await
+        let data_path = self.reference_path(bucket, prefix);
+        xattr_meta::read_metadata(&data_path).await
     }
 
     async fn has_reference(&self, bucket: &str, prefix: &str) -> bool {
@@ -505,7 +442,6 @@ impl StorageBackend for FilesystemBackend {
     #[instrument(skip(self))]
     async fn delete_reference(&self, bucket: &str, prefix: &str) -> Result<(), StorageError> {
         let data_path = self.reference_path(bucket, prefix);
-        let meta_path = self.reference_meta_path(bucket, prefix);
 
         if !path_exists(&data_path).await {
             return Err(StorageError::NotFound(format!(
@@ -514,9 +450,6 @@ impl StorageBackend for FilesystemBackend {
             )));
         }
 
-        if path_exists(&meta_path).await {
-            fs::remove_file(&meta_path).await?;
-        }
         fs::remove_file(&data_path).await?;
 
         debug!("Deleted reference for {}/{}", bucket, prefix);
@@ -552,7 +485,6 @@ impl StorageBackend for FilesystemBackend {
     ) -> Result<(), StorageError> {
         self.put_object_file(
             &self.delta_path(bucket, prefix, filename),
-            &self.delta_meta_path(bucket, prefix, filename),
             data,
             metadata,
             "delta",
@@ -569,8 +501,7 @@ impl StorageBackend for FilesystemBackend {
         prefix: &str,
         filename: &str,
     ) -> Result<FileMetadata, StorageError> {
-        self.read_metadata(&self.delta_meta_path(bucket, prefix, filename))
-            .await
+        xattr_meta::read_metadata(&self.delta_path(bucket, prefix, filename)).await
     }
 
     #[instrument(skip(self))]
@@ -582,7 +513,6 @@ impl StorageBackend for FilesystemBackend {
     ) -> Result<(), StorageError> {
         self.delete_object_file(
             &self.delta_path(bucket, prefix, filename),
-            &self.delta_meta_path(bucket, prefix, filename),
             "delta",
             prefix,
             filename,
@@ -590,18 +520,18 @@ impl StorageBackend for FilesystemBackend {
         .await
     }
 
-    // === Direct operations ===
+    // === Passthrough operations (stored with original filename) ===
 
     #[instrument(skip(self))]
-    async fn get_direct(
+    async fn get_passthrough(
         &self,
         bucket: &str,
         prefix: &str,
         filename: &str,
     ) -> Result<Vec<u8>, StorageError> {
         self.get_object_file(
-            &self.direct_path(bucket, prefix, filename),
-            "direct",
+            &self.passthrough_path(bucket, prefix, filename),
+            "passthrough",
             prefix,
             filename,
         )
@@ -609,7 +539,7 @@ impl StorageBackend for FilesystemBackend {
     }
 
     #[instrument(skip(self, data, metadata))]
-    async fn put_direct(
+    async fn put_passthrough(
         &self,
         bucket: &str,
         prefix: &str,
@@ -618,11 +548,10 @@ impl StorageBackend for FilesystemBackend {
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         self.put_object_file(
-            &self.direct_path(bucket, prefix, filename),
-            &self.direct_meta_path(bucket, prefix, filename),
+            &self.passthrough_path(bucket, prefix, filename),
             data,
             metadata,
-            "direct",
+            "passthrough",
             prefix,
             filename,
         )
@@ -630,27 +559,25 @@ impl StorageBackend for FilesystemBackend {
     }
 
     #[instrument(skip(self))]
-    async fn get_direct_metadata(
+    async fn get_passthrough_metadata(
         &self,
         bucket: &str,
         prefix: &str,
         filename: &str,
     ) -> Result<FileMetadata, StorageError> {
-        self.read_metadata(&self.direct_meta_path(bucket, prefix, filename))
-            .await
+        xattr_meta::read_metadata(&self.passthrough_path(bucket, prefix, filename)).await
     }
 
     #[instrument(skip(self))]
-    async fn delete_direct(
+    async fn delete_passthrough(
         &self,
         bucket: &str,
         prefix: &str,
         filename: &str,
     ) -> Result<(), StorageError> {
         self.delete_object_file(
-            &self.direct_path(bucket, prefix, filename),
-            &self.direct_meta_path(bucket, prefix, filename),
-            "direct",
+            &self.passthrough_path(bucket, prefix, filename),
+            "passthrough",
             prefix,
             filename,
         )
@@ -660,7 +587,7 @@ impl StorageBackend for FilesystemBackend {
     // === Chunked write operations ===
 
     #[instrument(skip(self, chunks, metadata))]
-    async fn put_direct_chunked(
+    async fn put_passthrough_chunked(
         &self,
         bucket: &str,
         prefix: &str,
@@ -668,8 +595,7 @@ impl StorageBackend for FilesystemBackend {
         chunks: &[Bytes],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        let data_path = self.direct_path(bucket, prefix, filename);
-        let meta_path = self.direct_meta_path(bucket, prefix, filename);
+        let data_path = self.passthrough_path(bucket, prefix, filename);
 
         self.ensure_dir(&data_path).await?;
 
@@ -698,10 +624,10 @@ impl StorageBackend for FilesystemBackend {
         .await
         .map_err(|e| StorageError::Other(format!("spawn_blocking join failed: {}", e)))??;
 
-        self.write_metadata(&meta_path, metadata).await?;
+        xattr_meta::write_metadata(&data_path, metadata).await?;
 
         debug!(
-            "Wrote direct chunked ({} chunks) for {}/{}",
+            "Wrote passthrough chunked ({} chunks) for {}/{}",
             num_chunks, prefix, filename
         );
         Ok(())
@@ -710,7 +636,7 @@ impl StorageBackend for FilesystemBackend {
     // === Streaming operations ===
 
     #[instrument(skip(self))]
-    async fn get_direct_stream(
+    async fn get_passthrough_stream(
         &self,
         bucket: &str,
         prefix: &str,
@@ -718,10 +644,10 @@ impl StorageBackend for FilesystemBackend {
     ) -> Result<BoxStream<'static, Result<Bytes, StorageError>>, StorageError> {
         use futures::StreamExt;
 
-        let data_path = self.direct_path(bucket, prefix, filename);
+        let data_path = self.passthrough_path(bucket, prefix, filename);
         if !path_exists(&data_path).await {
             return Err(StorageError::NotFound(format!(
-                "direct: {}/{}",
+                "passthrough: {}/{}",
                 prefix, filename
             )));
         }
@@ -730,7 +656,7 @@ impl StorageBackend for FilesystemBackend {
         let reader_stream = ReaderStream::new(file);
         let stream = reader_stream.map(|result| result.map_err(StorageError::Io));
         debug!(
-            "Opened direct file stream for {}/{}/{}",
+            "Opened passthrough file stream for {}/{}/{}",
             bucket, prefix, filename
         );
         Ok(Box::pin(stream))
@@ -756,11 +682,16 @@ impl StorageBackend for FilesystemBackend {
             let path = entry.path();
 
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.ends_with(".meta") {
-                    match self.read_metadata(&path).await {
+                // Match data files: reference.bin, *.delta, or passthrough files (any other file)
+                let is_data_file = name == "reference.bin"
+                    || name.ends_with(".delta")
+                    || !name.starts_with('.');  // passthrough files have original names
+
+                if is_data_file {
+                    match xattr_meta::read_metadata(&path).await {
                         Ok(meta) => metadata_list.push(meta),
                         Err(e) => {
-                            debug!("Failed to read metadata {:?}: {}", path, e);
+                            debug!("Failed to read xattr metadata {:?}: {}", path, e);
                         }
                     }
                 }
@@ -795,5 +726,34 @@ impl StorageBackend for FilesystemBackend {
         } else {
             self.dir_size(&self.root).await
         }
+    }
+
+    #[instrument(skip(self))]
+    async fn bulk_list_objects(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Vec<(String, FileMetadata)>, StorageError> {
+        let deltaspaces_dir = self.bucket_dir(bucket).join("deltaspaces");
+        let walk_root = if prefix.is_empty() {
+            deltaspaces_dir.clone()
+        } else {
+            deltaspaces_dir.join(prefix)
+        };
+
+        if !path_exists(&walk_root).await {
+            return Ok(Vec::new());
+        }
+
+        let mut results: Vec<(String, FileMetadata)> = Vec::new();
+        Self::bulk_walk_recursive(&deltaspaces_dir, &walk_root, &mut results).await?;
+
+        debug!(
+            "Bulk listed {} objects in {}/{}",
+            results.len(),
+            bucket,
+            prefix
+        );
+        Ok(results)
     }
 }

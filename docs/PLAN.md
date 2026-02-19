@@ -66,7 +66,7 @@ PUT object
     │
     ▼
 ┌─────────────────┐
-│ File type       │──── .exe/.dll/unknown ────▶ Store directly (no delta benefit)
+│ File type       │──── .exe/.dll/unknown ────▶ Store as passthrough (no delta benefit)
 │ detection       │
 └────────┬────────┘
          │ .zip/.jar/.tar.gz
@@ -84,7 +84,7 @@ PUT object
          │
          ▼
 ┌─────────────────┐
-│ delta_size /    │──── ratio >= 0.5 ────▶ Store directly (poor compression)
+│ delta_size /    │──── ratio >= 0.5 ────▶ Store as passthrough (poor compression)
 │ original_size   │
 └────────┬────────┘
          │ ratio < 0.5
@@ -144,7 +144,7 @@ pub struct ObjectKey {
 pub enum StorageType {
     Reference,                 // Full content, serves as delta base
     Delta { ratio: f32 },      // Compressed diff from reference
-    Direct,                    // Stored as-is (non-delta-eligible type)
+    Passthrough,               // Stored as-is (non-delta-eligible type)
 }
 
 /// Object metadata persisted alongside content
@@ -176,7 +176,7 @@ pub struct Config {
 
 ## Phase 1: Foundation
 
-**Goal**: Working S3 server with direct storage (no delta compression yet)
+**Goal**: Working S3 server with passthrough storage (no delta compression yet)
 
 ### Tasks
 
@@ -218,7 +218,7 @@ pub struct Config {
 
 1. **File router**
    - Extension detection: `.zip`, `.jar`, `.war`, `.tar`, `.tar.gz`, `.tgz`
-   - Strategy enum: `DeltaEligible` | `DirectStore`
+   - Strategy enum: `DeltaEligible` | `Passthrough`
    - Configurable extension list
 
 2. **xdelta3 codec wrapper**
@@ -332,8 +332,8 @@ async fn test_delta_deduplication_e2e() {
 
 | Test | Description |
 |------|-------------|
-| `test_non_delta_file` | Upload .exe file → stored directly, no delta |
-| `test_poor_compression_ratio` | Upload very different file → stored directly |
+| `test_non_delta_file` | Upload .exe file → stored as passthrough, no delta |
+| `test_poor_compression_ratio` | Upload very different file → stored as passthrough |
 | `test_empty_deltaspace` | First upload becomes reference |
 | `test_concurrent_uploads` | Multiple uploads to same deltaspace |
 | `test_get_nonexistent` | GET missing key → 404 NoSuchKey |
@@ -362,7 +362,7 @@ async fn test_delta_deduplication_e2e() {
 
 **Problem**: When a new file has poor delta ratio (>0.5), should it replace the reference?
 
-**Decision**: NO. The original reference is "sticky". Poor-ratio files are stored directly alongside. This avoids:
+**Decision**: NO. The original reference is "sticky". Poor-ratio files are stored as passthrough alongside. This avoids:
 - Invalidating existing deltas
 - Complex re-encoding logic
 - Race conditions during replacement

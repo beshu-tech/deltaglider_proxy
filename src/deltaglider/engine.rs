@@ -46,15 +46,18 @@ pub enum EngineError {
 }
 
 #[derive(Debug, Clone)]
-pub struct ListObjectsV2Page {
+pub struct ListObjectsPage {
+    /// Direct objects at this level (after delimiter collapsing, if delimiter was provided)
     pub objects: Vec<(String, FileMetadata)>,
+    /// CommonPrefixes produced by delimiter collapsing (empty if no delimiter)
+    pub common_prefixes: Vec<String>,
     pub is_truncated: bool,
     pub next_continuation_token: Option<String>,
 }
 
 /// Response from `retrieve_stream()` — either a streaming or buffered response.
 pub enum RetrieveResponse {
-    /// Direct file streamed from backend (zero-copy, constant memory).
+    /// Passthrough file streamed from backend (zero-copy, constant memory).
     Streamed {
         stream: BoxStream<'static, Result<Bytes, StorageError>>,
         metadata: FileMetadata,
@@ -88,8 +91,6 @@ pub struct DeltaGliderEngine<S: StorageBackend> {
     cache: ReferenceCache,
     max_delta_ratio: f32,
     max_object_size: u64,
-    /// Whether to verify SHA256 checksums on read (GET).
-    verify_on_read: bool,
     /// Limits concurrent delta encode/decode operations to prevent CPU saturation.
     codec_semaphore: Arc<Semaphore>,
     /// Per-deltaspace locks to prevent concurrent reference overwrites.
@@ -118,6 +119,11 @@ impl DynEngine {
 impl<S: StorageBackend> DeltaGliderEngine<S> {
     const INTERNAL_REFERENCE_NAME: &'static str = "__reference__";
 
+    /// Access the underlying storage backend (for operations that bypass the delta engine)
+    pub fn storage(&self) -> &S {
+        &self.storage
+    }
+
     /// Create a new engine with a custom storage backend
     pub fn new_with_backend(storage: Arc<S>, config: &Config) -> Self {
         Self {
@@ -127,7 +133,6 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             cache: ReferenceCache::new(config.cache_size_mb),
             max_delta_ratio: config.max_delta_ratio,
             max_object_size: config.max_object_size,
-            verify_on_read: config.verify_on_read,
             codec_semaphore: Arc::new(Semaphore::new(
                 std::thread::available_parallelism()
                     .map(|n| n.get())
@@ -181,7 +186,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
     }
 
-    /// Look up object metadata by checking both delta and direct storage,
+    /// Look up object metadata by checking both delta and passthrough storage,
     /// returning the most recent version if both exist.
     async fn resolve_object_metadata(
         &self,
@@ -195,13 +200,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .get_delta_metadata(bucket, prefix, filename)
             .await
             .ok();
-        let direct = self
+        let passthrough = self
             .storage
-            .get_direct_metadata(bucket, prefix, filename)
+            .get_passthrough_metadata(bucket, prefix, filename)
             .await
             .ok();
-        match (delta, direct) {
-            (Some(d), Some(di)) => Ok(Some(if d.created_at >= di.created_at { d } else { di })),
+        match (delta, passthrough) {
+            (Some(d), Some(p)) => Ok(Some(if d.created_at >= p.created_at { d } else { p })),
             (Some(meta), None) | (None, Some(meta)) => Ok(Some(meta)),
             (None, None) => Ok(None),
         }
@@ -269,12 +274,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         // Check if file type is eligible for delta compression
         if !self.file_router.is_delta_eligible(&obj_key.filename) {
-            debug!("File type not delta-eligible, storing directly");
+            debug!("File type not delta-eligible, storing as passthrough");
             let _lock = self.acquire_prefix_lock(&deltaspace_id).await;
             self.delete_delta_if_exists(bucket, &deltaspace_id, &obj_key.filename)
                 .await?;
             return self
-                .store_direct(
+                .store_passthrough(
                     bucket,
                     &obj_key,
                     &deltaspace_id,
@@ -314,8 +319,39 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .await?
         };
 
-        // Try to compute delta (bounded by semaphore to prevent CPU saturation)
-        let reference = self.get_reference_cached(bucket, &deltaspace_id).await?;
+        // Encode delta and decide: keep as delta or fall back to direct storage
+        self.encode_and_store(
+            bucket,
+            &obj_key,
+            &deltaspace_id,
+            data,
+            sha256,
+            md5,
+            content_type,
+            user_metadata,
+            &ref_meta,
+            has_existing_reference,
+        )
+        .await
+    }
+
+    /// Encode a delta against the reference, evaluate the compression ratio,
+    /// and either commit as delta or fall back to passthrough storage.
+    #[allow(clippy::too_many_arguments)]
+    async fn encode_and_store(
+        &self,
+        bucket: &str,
+        obj_key: &ObjectKey,
+        deltaspace_id: &str,
+        data: &[u8],
+        sha256: String,
+        md5: String,
+        content_type: Option<String>,
+        user_metadata: HashMap<String, String>,
+        ref_meta: &FileMetadata,
+        has_existing_reference: bool,
+    ) -> Result<StoreResult, EngineError> {
+        let reference = self.get_reference_cached(bucket, deltaspace_id).await?;
         let _codec_permit = self.codec_semaphore.acquire().await.map_err(|_| {
             EngineError::Storage(StorageError::Other("codec semaphore closed".into()))
         })?;
@@ -331,26 +367,25 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         );
 
         // Only apply the threshold when NO reference exists yet (first file in deltaspace).
-        // Once a reference exists, ALWAYS store as delta - the deltaspace is committed to
+        // Once a reference exists, ALWAYS store as delta — the deltaspace is committed to
         // delta storage and we want all related files to benefit from the shared reference.
         if !has_existing_reference && ratio >= self.max_delta_ratio {
             debug!(
-                "First file in deltaspace with poor delta ratio {:.2} >= {:.2}, storing directly",
+                "First file in deltaspace with poor delta ratio {:.2} >= {:.2}, storing as passthrough",
                 ratio, self.max_delta_ratio
             );
-            // Clean up the reference we just created since we're not using it
             let cache_key = format!("{}/{}", bucket, deltaspace_id);
             self.cache.invalidate(&cache_key);
             self.storage
-                .delete_reference(bucket, &deltaspace_id)
+                .delete_reference(bucket, deltaspace_id)
                 .await?;
-            self.delete_delta_if_exists(bucket, &deltaspace_id, &obj_key.filename)
+            self.delete_delta_if_exists(bucket, deltaspace_id, &obj_key.filename)
                 .await?;
             return self
-                .store_direct(
+                .store_passthrough(
                     bucket,
-                    &obj_key,
-                    &deltaspace_id,
+                    obj_key,
+                    deltaspace_id,
                     data,
                     sha256,
                     md5,
@@ -360,23 +395,23 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 .await;
         }
 
-        // Store as delta
+        // Commit as delta
         let mut metadata = FileMetadata::new_delta(
             obj_key.filename.clone(),
             sha256,
             md5,
             data.len() as u64,
             format!("{}/reference.bin", deltaspace_id),
-            ref_meta.file_sha256,
+            ref_meta.file_sha256.clone(),
             delta.len() as u64,
             content_type,
         );
         metadata.user_metadata = user_metadata;
 
-        self.delete_direct_if_exists(bucket, &deltaspace_id, &obj_key.filename)
+        self.delete_passthrough_if_exists(bucket, deltaspace_id, &obj_key.filename)
             .await?;
         self.storage
-            .put_delta(bucket, &deltaspace_id, &obj_key.filename, &delta, &metadata)
+            .put_delta(bucket, deltaspace_id, &obj_key.filename, &delta, &metadata)
             .await?;
 
         Ok(StoreResult {
@@ -426,7 +461,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Store a non-delta-eligible object from pre-split chunks without assembling
     /// into a contiguous buffer. Computes SHA256 and MD5 incrementally.
     #[instrument(skip(self, chunks, user_metadata))]
-    pub async fn store_direct_chunked(
+    pub async fn store_passthrough_chunked(
         &self,
         bucket: &str,
         key: &str,
@@ -471,7 +506,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.delete_delta_if_exists(bucket, &deltaspace_id, &obj_key.filename)
             .await?;
 
-        let mut metadata = FileMetadata::new_direct(
+        let mut metadata = FileMetadata::new_passthrough(
             obj_key.filename.clone(),
             sha256,
             md5,
@@ -481,7 +516,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         metadata.user_metadata = user_metadata;
 
         self.storage
-            .put_direct_chunked(bucket, &deltaspace_id, &obj_key.filename, chunks, &metadata)
+            .put_passthrough_chunked(bucket, &deltaspace_id, &obj_key.filename, chunks, &metadata)
             .await?;
 
         Ok(StoreResult {
@@ -490,9 +525,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         })
     }
 
-    /// Store directly without delta compression
+    /// Store as passthrough without delta compression
     #[allow(clippy::too_many_arguments)]
-    async fn store_direct(
+    async fn store_passthrough(
         &self,
         bucket: &str,
         obj_key: &ObjectKey,
@@ -503,7 +538,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
     ) -> Result<StoreResult, EngineError> {
-        let mut metadata = FileMetadata::new_direct(
+        let mut metadata = FileMetadata::new_passthrough(
             obj_key.filename.clone(),
             sha256,
             md5,
@@ -513,7 +548,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         metadata.user_metadata = user_metadata;
 
         self.storage
-            .put_direct(bucket, deltaspace_id, &obj_key.filename, data, &metadata)
+            .put_passthrough(bucket, deltaspace_id, &obj_key.filename, data, &metadata)
             .await?;
 
         Ok(StoreResult {
@@ -546,7 +581,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         .await
     }
 
-    async fn delete_direct_if_exists(
+    async fn delete_passthrough_if_exists(
         &self,
         bucket: &str,
         deltaspace_id: &str,
@@ -554,7 +589,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     ) -> Result<(), EngineError> {
         Self::delete_ignoring_not_found(
             self.storage
-                .delete_direct(bucket, deltaspace_id, filename)
+                .delete_passthrough(bucket, deltaspace_id, filename)
                 .await,
         )
         .await
@@ -599,7 +634,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             ref_meta.content_type.clone(),
         );
 
-        self.delete_direct_if_exists(bucket, deltaspace_id, filename)
+        self.delete_passthrough_if_exists(bucket, deltaspace_id, filename)
             .await?;
         self.storage
             .put_delta(bucket, deltaspace_id, filename, &delta, &delta_meta)
@@ -635,9 +670,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
     }
 
-    /// Retrieve an object with streaming support for direct files.
+    /// Retrieve an object with streaming support for passthrough files.
     ///
-    /// Direct files are streamed from the backend without buffering (constant memory).
+    /// Passthrough files are streamed from the backend without buffering (constant memory).
     /// Delta/reference files are reconstructed in memory (buffering required by xdelta3).
     #[instrument(skip(self))]
     pub async fn retrieve_stream(
@@ -664,13 +699,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         );
 
         match &metadata.storage_info {
-            StorageInfo::Direct => {
+            StorageInfo::Passthrough => {
                 // Stream directly from backend — no buffering needed
                 let stream = self
                     .storage
-                    .get_direct_stream(bucket, &deltaspace_id, &obj_key.filename)
+                    .get_passthrough_stream(bucket, &deltaspace_id, &obj_key.filename)
                     .await?;
-                debug!("Streaming direct file for {}", obj_key.full_key());
+                debug!("Streaming passthrough file for {}", obj_key.full_key());
                 Ok(RetrieveResponse::Streamed { stream, metadata })
             }
             StorageInfo::Reference { .. } | StorageInfo::Delta { .. } => {
@@ -712,30 +747,28 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 drop(_codec_permit);
                 result
             }
-            StorageInfo::Direct => {
-                // Should not reach here — callers route Direct to streaming path
+            StorageInfo::Passthrough => {
+                // Should not reach here — callers route Passthrough to streaming path
                 self.storage
-                    .get_direct(bucket, deltaspace_id, &obj_key.filename)
+                    .get_passthrough(bucket, deltaspace_id, &obj_key.filename)
                     .await?
             }
         };
 
-        // Verify checksum (configurable — disable for throughput when storage is trusted)
-        if self.verify_on_read {
-            let actual_sha256 = hex::encode(Sha256::digest(&data));
-            if actual_sha256 != metadata.file_sha256 {
-                warn!(
-                    "Checksum mismatch for {}: expected {}, got {}",
-                    obj_key.full_key(),
-                    metadata.file_sha256,
-                    actual_sha256
-                );
-                return Err(EngineError::ChecksumMismatch {
-                    key: obj_key.full_key(),
-                    expected: metadata.file_sha256.clone(),
-                    actual: actual_sha256,
-                });
-            }
+        // Always verify checksum on read — detect corruption or delta reconstruction bugs
+        let actual_sha256 = hex::encode(Sha256::digest(&data));
+        if actual_sha256 != metadata.file_sha256 {
+            warn!(
+                "Checksum mismatch for {}: expected {}, got {}",
+                obj_key.full_key(),
+                metadata.file_sha256,
+                actual_sha256
+            );
+            return Err(EngineError::ChecksumMismatch {
+                key: obj_key.full_key(),
+                expected: metadata.file_sha256.clone(),
+                actual: actual_sha256,
+            });
         }
 
         Ok(data)
@@ -757,7 +790,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     /// Returns `true` if a local prefix (bucket-relative) could contain keys
     /// matching the given user prefix.
-    /// Used to skip entire deltaspaces during listing, avoiding unnecessary I/O.
+    #[cfg(test)]
     fn local_prefix_could_match(local_prefix: &str, prefix: &str) -> bool {
         if prefix.is_empty() {
             return true;
@@ -773,46 +806,54 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         lp_slash.starts_with(prefix) || prefix.starts_with(&lp_slash)
     }
 
-    /// ListObjectsV2-style listing scoped to a real bucket.
+    /// S3 ListObjects — the single owner of prefix filtering, delimiter collapsing,
+    /// and pagination. All three are coupled (CommonPrefixes count toward max-keys
+    /// and must be deduplicated across pages), so they must live in one place.
     #[instrument(skip(self))]
-    pub async fn list_objects_v2(
+    pub async fn list_objects(
         &self,
         bucket: &str,
         prefix: &str,
+        delimiter: Option<&str>,
         max_keys: u32,
         continuation_token: Option<&str>,
-    ) -> Result<ListObjectsV2Page, EngineError> {
+    ) -> Result<ListObjectsPage, EngineError> {
         ObjectKey::validate_prefix(prefix)
             .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
-        let deltaspace_ids = self.storage.list_deltaspaces(bucket).await?;
+
+        // Fast path: delegate delimiter collapsing to the storage backend (S3
+        // handles this natively, avoiding the need to fetch every object).
+        if let Some(delim) = delimiter {
+            if let Some(result) = self
+                .storage
+                .list_objects_delegated(bucket, prefix, delim, max_keys, continuation_token)
+                .await?
+            {
+                return Ok(ListObjectsPage {
+                    objects: result.objects,
+                    common_prefixes: result.common_prefixes,
+                    is_truncated: result.is_truncated,
+                    next_continuation_token: result.next_continuation_token,
+                });
+            }
+            // Backend doesn't support delegated listing — fall through to
+            // the generic bulk_list + in-memory collapsing path below.
+        }
+
+        // Single-pass listing: replaces list_deltaspaces + scan_deltaspace×N + list_directory_markers
+        let bulk = self.storage.bulk_list_objects(bucket, prefix).await?;
+
+        // Dedup by key, keeping latest version
         let mut latest: std::collections::HashMap<String, FileMetadata> =
             std::collections::HashMap::new();
-
-        for local_prefix in deltaspace_ids {
-            // Skip deltaspaces that cannot produce keys matching the requested prefix.
-            if !Self::local_prefix_could_match(&local_prefix, prefix) {
-                continue;
-            }
-
-            let metas = self.storage.scan_deltaspace(bucket, &local_prefix).await?;
-
-            for meta in metas {
-                if matches!(meta.storage_info, StorageInfo::Reference { .. }) {
-                    continue;
+        for (key, meta) in bulk {
+            match latest.entry(key) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(meta);
                 }
-                let full_key = if local_prefix.is_empty() {
-                    meta.original_name.clone()
-                } else {
-                    format!("{}/{}", local_prefix, meta.original_name)
-                };
-                match latest.entry(full_key) {
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        entry.insert(meta);
-                    }
-                    std::collections::hash_map::Entry::Occupied(mut entry) => {
-                        if meta.created_at > entry.get().created_at {
-                            entry.insert(meta);
-                        }
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    if meta.created_at > e.get().created_at {
+                        e.insert(meta);
                     }
                 }
             }
@@ -826,30 +867,88 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         items.sort_by(|a, b| a.0.cmp(&b.0));
 
-        if let Some(token) = continuation_token {
-            items.retain(|(key, _meta)| key.as_str() > token);
+        // --- Delimiter collapsing + pagination as a single operation ---
+        //
+        // When a delimiter is present, objects whose key (after the prefix)
+        // contains the delimiter are collapsed into CommonPrefixes. Each
+        // CommonPrefix counts as one entry toward max-keys, and is emitted
+        // exactly once across all pages.
+
+        if let Some(delim) = delimiter {
+            // Collapse into interleaved entries (objects + CommonPrefixes sorted together)
+            enum Entry { Obj(String, FileMetadata), Prefix(String) }
+            let mut entries: Vec<(String, Entry)> = Vec::new();
+            let mut seen_prefixes = std::collections::BTreeSet::new();
+
+            for (key, meta) in items {
+                let after = &key[prefix.len()..];
+                if let Some(pos) = after.find(delim) {
+                    let cp = format!("{}{}{}", prefix, &after[..pos], delim);
+                    if seen_prefixes.insert(cp.clone()) {
+                        entries.push((cp.clone(), Entry::Prefix(cp)));
+                    }
+                } else {
+                    entries.push((key.clone(), Entry::Obj(key, meta)));
+                }
+            }
+
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+            if let Some(token) = continuation_token {
+                entries.retain(|(key, _)| key.as_str() > token);
+            }
+
+            let max = max_keys as usize;
+            let is_truncated = entries.len() > max;
+            if is_truncated {
+                entries.truncate(max);
+            }
+            let next_token = if is_truncated {
+                entries.last().map(|(key, _)| key.clone())
+            } else {
+                None
+            };
+
+            let mut objects = Vec::new();
+            let mut common_prefixes = Vec::new();
+            for (_, entry) in entries {
+                match entry {
+                    Entry::Obj(key, meta) => objects.push((key, meta)),
+                    Entry::Prefix(p) => common_prefixes.push(p),
+                }
+            }
+
+            Ok(ListObjectsPage {
+                objects,
+                common_prefixes,
+                is_truncated,
+                next_continuation_token: next_token,
+            })
+        } else {
+            // No delimiter — paginate raw objects
+            if let Some(token) = continuation_token {
+                items.retain(|(key, _meta)| key.as_str() > token);
+            }
+
+            let max_keys = max_keys as usize;
+            let is_truncated = items.len() > max_keys;
+            if is_truncated {
+                items.truncate(max_keys);
+            }
+
+            let next_token = if is_truncated {
+                items.last().map(|(key, _)| key.clone())
+            } else {
+                None
+            };
+
+            Ok(ListObjectsPage {
+                objects: items,
+                common_prefixes: Vec::new(),
+                is_truncated,
+                next_continuation_token: next_token,
+            })
         }
-
-        let max_keys = max_keys as usize;
-        let is_truncated = max_keys < items.len();
-        let page = if is_truncated {
-            items.truncate(max_keys);
-            items
-        } else {
-            items
-        };
-
-        let next_token = if is_truncated {
-            page.last().map(|(key, _)| key.clone())
-        } else {
-            None
-        };
-
-        Ok(ListObjectsV2Page {
-            objects: page,
-            is_truncated,
-            next_continuation_token: next_token,
-        })
     }
 
     // === Bucket operations (delegate to storage) ===
@@ -896,9 +995,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         // Delete based on storage type
         match &metadata.storage_info {
-            StorageInfo::Direct => {
+            StorageInfo::Passthrough => {
                 self.storage
-                    .delete_direct(bucket, &deltaspace_id, &obj_key.filename)
+                    .delete_passthrough(bucket, &deltaspace_id, &obj_key.filename)
                     .await?;
             }
             StorageInfo::Delta { .. } => {

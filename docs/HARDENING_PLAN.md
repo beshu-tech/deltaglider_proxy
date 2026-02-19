@@ -41,7 +41,7 @@ Multiple `StorageBackend` methods call synchronous `path.exists()` and `path.is_
 **Changes**:
 - Replace `path.exists()` with `tokio::fs::try_exists(&path).await.unwrap_or(false)`
 - Replace `path.is_dir()` with `tokio::fs::metadata(&path).await.map(|m| m.is_dir()).unwrap_or(false)`
-- Apply to: `has_reference`, `get_reference`, `delete_reference`, `get_delta`, `delete_delta`, `get_direct`, `delete_direct`, `scan_deltaspace`, `list_deltaspaces`, `exists`, `delete`, `get_raw`, `list_prefix`, `read_metadata`, `dir_size`
+- Apply to: `has_reference`, `get_reference`, `delete_reference`, `get_delta`, `delete_delta`, `get_passthrough`, `delete_passthrough`, `scan_deltaspace`, `list_deltaspaces`, `exists`, `delete`, `get_raw`, `list_prefix`, `read_metadata`, `dir_size`
 
 ### 1.4 ✅ Atomic Filesystem Writes (Write-to-Temp + Rename)
 
@@ -55,7 +55,7 @@ Every `fs::write()` is a non-atomic operation. A crash mid-write produces a trun
   - Creates a `NamedTempFile` in the same parent directory (same filesystem = atomic rename)
   - Writes data, calls `flush()` + `sync_all()`
   - Uses `persist()` (which does rename) to atomically replace the target
-- Replace all `fs::write()` calls with `atomic_write()` in `put_raw`, `put_reference`, `put_delta`, `put_direct`, `write_metadata`
+- Replace all `fs::write()` calls with `atomic_write()` in `put_raw`, `put_reference`, `put_delta`, `put_passthrough`, `write_metadata`
 
 ### 1.5 ✅ Transactional Data + Metadata Write Ordering
 
@@ -86,7 +86,7 @@ The `store()` method does a check-then-act (`has_reference` → `set_reference`)
 **Changes**:
 - Add `prefix_locks: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>` to `DeltaGliderEngine`
 - Add `async fn acquire_prefix_lock(&self, prefix: &str) -> OwnedMutexGuard<()>` helper
-- Wrap the critical section in `store()` (from `has_reference` check through `store_delta`/`store_direct`) with the per-prefix lock
+- Wrap the critical section in `store()` (from `has_reference` check through `store_delta`/`store_passthrough`) with the per-prefix lock
 - Also wrap `delete()` since it may clean up the reference
 - Lock granularity: per-deltaspace-prefix, so different prefixes don't block each other
 
@@ -96,12 +96,11 @@ The `store()` method does a check-then-act (`has_reference` → `set_reference`)
 
 **Rationale**: Once data integrity is guaranteed, the next priority is ensuring the system doesn't fall over under production workloads. These issues cause OOM, excessive latency, or resource exhaustion.
 
-### 2.1 ✅ Configurable SHA256 Verification on GET
+### 2.1 ✅ SHA256 Verification on GET (always on)
 
-**Severity**: CRITICAL (performance) | **File**: `src/deltaglider/engine.rs`, `src/config.rs`
-- Add `verify_on_read: bool` to `Config` (default: `true` for safety, configurable to `false` for performance)
-- Skip SHA256 computation in `retrieve()` when disabled
-- Log a startup warning when verification is disabled
+**Severity**: CRITICAL (data integrity) | **File**: `src/deltaglider/engine.rs`
+- SHA256 checksum is verified unconditionally on every GET — detects corruption, delta reconstruction bugs, and bit-rot
+- Not configurable; integrity verification is a non-negotiable safety guarantee
 
 ### 2.2 ✅ Validate xdelta3 CLI at Startup, Not Per-Request
 

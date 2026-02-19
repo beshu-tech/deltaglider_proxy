@@ -7,13 +7,15 @@ use clap::Parser;
 use deltaglider_proxy::api::auth::{sigv4_auth_middleware, AuthConfig};
 use deltaglider_proxy::api::handlers::{
     bucket_get_handler, create_bucket, delete_bucket, delete_object, delete_objects, get_object,
-    get_stats, head_bucket, head_object, health_check, list_buckets, post_object,
+    get_stats, head_bucket, head_object, head_root, health_check, list_buckets, post_object,
     put_object_or_copy, AppState,
 };
+use arc_swap::ArcSwap;
+use deltaglider_proxy::api::admin::AdminState;
 use deltaglider_proxy::config::{BackendConfig, Config};
 use deltaglider_proxy::deltaglider::DynEngine;
 use deltaglider_proxy::multipart::MultipartStore;
-use deltaglider_proxy::storage::FilesystemBackend;
+use deltaglider_proxy::session::SessionStore;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -21,7 +23,8 @@ use tokio::signal;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, reload};
 
 /// DeltaGlider Proxy - DeltaGlider compression for S3 storage
 #[derive(Parser, Debug)]
@@ -36,10 +39,6 @@ struct Cli {
     #[arg(short, long, value_name = "ADDR")]
     listen: Option<String>,
 
-    /// Default bucket name (overrides config)
-    #[arg(short, long, value_name = "BUCKET")]
-    bucket: Option<String>,
-
     /// Enable verbose logging
     #[arg(short, long)]
     verbose: bool,
@@ -49,18 +48,23 @@ struct Cli {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    // Initialize tracing
-    let log_level = if cli.verbose {
-        "deltaglider_proxy=trace,tower_http=trace"
-    } else {
-        "deltaglider_proxy=debug,tower_http=debug"
-    };
+    // Initialize tracing with reload support
+    // Priority: RUST_LOG > DGP_LOG_LEVEL > --verbose > default
+    let initial_filter = EnvFilter::try_from_default_env()
+        .or_else(|_| {
+            std::env::var("DGP_LOG_LEVEL").map(|v| EnvFilter::new(v))
+        })
+        .unwrap_or_else(|_| {
+            if cli.verbose {
+                EnvFilter::new("deltaglider_proxy=trace,tower_http=trace")
+            } else {
+                EnvFilter::new("deltaglider_proxy=debug,tower_http=debug")
+            }
+        });
 
+    let (filter_layer, log_reload_handle) = reload::Layer::new(initial_filter);
     tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| log_level.into()),
-        )
+        .with(filter_layer)
         .with(tracing_subscriber::fmt::layer())
         .init();
 
@@ -74,9 +78,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // CLI overrides
     if let Some(ref addr) = cli.listen {
         config.listen_addr = addr.parse()?;
-    }
-    if let Some(ref bucket) = cli.bucket {
-        config.default_bucket = bucket.clone();
     }
     info!("Starting DeltaGlider Proxy S3 server");
     info!("  Listen address: {}", config.listen_addr);
@@ -103,9 +104,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.max_object_size / 1024 / 1024
     );
     info!("  Cache size: {} MB", config.cache_size_mb);
-    if !config.verify_on_read {
-        warn!("  SHA256 verification on read is DISABLED — data integrity is not checked on GET");
-    }
 
     if config.auth_enabled() {
         info!(
@@ -113,14 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.access_key_id.as_deref().unwrap_or("")
         );
     } else {
-        warn!("  Authentication: DISABLED (open access) — set DELTAGLIDER_PROXY_ACCESS_KEY_ID and DELTAGLIDER_PROXY_SECRET_ACCESS_KEY to enable");
-    }
-
-    // Check for orphaned data files from interrupted writes (filesystem only)
-    if let BackendConfig::Filesystem { ref path } = config.backend {
-        if let Ok(backend) = FilesystemBackend::new(path.clone()).await {
-            backend.warn_orphaned_files().await;
-        }
+        warn!("  Authentication: DISABLED (open access) — set DGP_ACCESS_KEY_ID and DGP_SECRET_ACCESS_KEY to enable");
     }
 
     // Create engine (async initialization with dynamic backend)
@@ -129,29 +120,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("  xdelta3 CLI: available (legacy delta interop enabled)");
     } else {
         warn!("  xdelta3 CLI: NOT found — legacy DeltaGlider CLI deltas cannot be decoded");
-    }
-
-    // Ensure the default bucket exists on the storage backend
-    match engine.create_bucket(&config.default_bucket).await {
-        Ok(()) => info!("  Default bucket '{}' created", config.default_bucket),
-        Err(e) => {
-            // AlreadyExists is fine — bucket was already there
-            let msg = e.to_string();
-            if msg.contains("already exists")
-                || msg.contains("AlreadyExists")
-                || msg.contains("Already")
-            {
-                info!(
-                    "  Default bucket '{}' already exists",
-                    config.default_bucket
-                );
-            } else {
-                warn!(
-                    "  Failed to create default bucket '{}': {}",
-                    config.default_bucket, e
-                );
-            }
-        }
     }
 
     let multipart = Arc::new(MultipartStore::new(config.max_object_size));
@@ -168,7 +136,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let state = Arc::new(AppState { engine, multipart });
+    let state = Arc::new(AppState {
+        engine: ArcSwap::from_pointee(engine),
+        multipart,
+    });
 
     // Build auth config (None if credentials not configured)
     let auth_config: Option<Arc<AuthConfig>> = if let (Some(ref key_id), Some(ref secret)) =
@@ -198,8 +169,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Health check and stats endpoints
         .route("/health", get(health_check))
         .route("/stats", get(get_stats))
-        // Root: list buckets
-        .route("/", get(list_buckets))
+        // Root: list buckets + HEAD probe for S3 client compatibility (Cyberduck, etc.)
+        .route("/", get(list_buckets).head(head_root))
         // Object operations (wildcard routes first - more specific)
         .route(
             "/:bucket/*key",
@@ -227,18 +198,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .head(head_bucket)
                 .post(delete_objects),
         )
-        .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         // SigV4 authentication (no-op when auth_config is None)
         .layer(middleware::from_fn(sigv4_auth_middleware))
         .layer(axum::Extension(auth_config))
         // Increase body size limit to match max_object_size config (default 2MB is too small)
         .layer(DefaultBodyLimit::max(config.max_object_size as usize))
-        .with_state(state);
+        // CORS must be outermost to handle OPTIONS preflight before auth
+        .layer(CorsLayer::permissive())
+        .with_state(state.clone());
+
+    // Admin GUI: ensure password hash is available, create session store
+    let admin_password_hash = config.ensure_admin_password_hash();
+    let session_store = Arc::new(SessionStore::new());
+
+    // Spawn periodic cleanup for expired admin sessions (every 5 minutes)
+    {
+        let sessions = session_store.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            loop {
+                interval.tick().await;
+                sessions.cleanup_expired();
+            }
+        });
+    }
+
+    let shared_config = config.clone().into_shared();
+
+    let admin_state = Arc::new(AdminState {
+        password_hash: parking_lot::RwLock::new(admin_password_hash),
+        sessions: session_store,
+        config: shared_config,
+        log_reload: log_reload_handle,
+        s3_state: state.clone(),
+    });
 
     // Start embedded demo UI on a separate port (S3 port + 1)
     let s3_port = config.listen_addr.port();
-    tokio::spawn(demo::serve(s3_port));
+    tokio::spawn(demo::serve(s3_port, admin_state));
 
     // Start S3 server with graceful shutdown
     let listener = TcpListener::bind(&config.listen_addr).await?;

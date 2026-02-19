@@ -1,21 +1,24 @@
-import React, { useState } from 'react'
+import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { ConfigProvider } from 'antd'
 import App from './App'
 import { lightTheme, darkTheme } from './theme'
+import { ThemeProvider, useTheme } from './ThemeContext'
 import './theme.css'
 
 function Root() {
-  const [isDark, setIsDark] = useState(true);
+  const { isDark } = useTheme();
   return (
     <ConfigProvider theme={isDark ? darkTheme : lightTheme}>
-      <App isDark={isDark} onToggleTheme={() => setIsDark(!isDark)} />
+      <App />
     </ConfigProvider>
   );
 }
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <Root />
+    <ThemeProvider>
+      <Root />
+    </ThemeProvider>
   </React.StrictMode>,
 )

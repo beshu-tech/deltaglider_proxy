@@ -149,7 +149,7 @@ fn validate_key_path(value: &str, allow_slashes: bool) -> Result<(), KeyValidati
 }
 
 /// Per-file metadata following DeltaGlider schema
-/// Stored as sidecar .meta JSON files alongside data files
+/// Stored as `user.dg.metadata` extended attributes on data file inodes
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMetadata {
     /// Tool version: "deltaglider/0.1.0"
@@ -207,9 +207,9 @@ pub enum StorageInfo {
         delta_cmd: String,
     },
 
-    /// Direct storage (non-delta eligible or poor compression ratio)
-    #[serde(rename = "direct")]
-    Direct,
+    /// Passthrough storage — stored as-is with original filename (non-delta eligible or poor compression ratio)
+    #[serde(rename = "passthrough", alias = "direct")]
+    Passthrough,
 }
 
 impl StorageInfo {
@@ -218,7 +218,7 @@ impl StorageInfo {
         match self {
             StorageInfo::Reference { .. } => "reference",
             StorageInfo::Delta { .. } => "delta",
-            StorageInfo::Direct => "direct",
+            StorageInfo::Passthrough => "passthrough",
         }
     }
 }
@@ -280,8 +280,8 @@ impl FileMetadata {
         }
     }
 
-    /// Create metadata for a direct file
-    pub fn new_direct(
+    /// Create metadata for a passthrough file (stored as-is with original name)
+    pub fn new_passthrough(
         original_name: String,
         sha256: String,
         md5: String,
@@ -297,7 +297,22 @@ impl FileMetadata {
             created_at: Utc::now(),
             content_type,
             user_metadata: HashMap::new(),
-            storage_info: StorageInfo::Direct,
+            storage_info: StorageInfo::Passthrough,
+        }
+    }
+
+    /// Create metadata for an S3 directory marker (zero-byte "folder/" object).
+    pub fn directory_marker(key: &str) -> Self {
+        Self {
+            tool: DELTAGLIDER_TOOL.to_string(),
+            original_name: key.to_string(),
+            file_sha256: String::new(),
+            file_size: 0,
+            md5: "d41d8cd98f00b204e9800998ecf8427e".to_string(),
+            created_at: Utc::now(),
+            content_type: Some("application/x-directory".to_string()),
+            user_metadata: HashMap::new(),
+            storage_info: StorageInfo::Passthrough,
         }
     }
 

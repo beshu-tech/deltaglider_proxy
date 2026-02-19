@@ -1,7 +1,8 @@
 //! AWS Signature Version 4 (SigV4) verification middleware
 //!
 //! When proxy credentials are configured, all incoming requests must carry a valid
-//! `Authorization: AWS4-HMAC-SHA256 ...` header signed with the proxy's credentials.
+//! `Authorization: AWS4-HMAC-SHA256 ...` header signed with the proxy's credentials,
+//! or use a presigned URL with SigV4 query string authentication.
 //!
 //! The middleware reconstructs the canonical request from the incoming HTTP request,
 //! derives the signing key from the proxy's secret access key, and compares the
@@ -31,6 +32,246 @@ pub struct AuthConfig {
     pub secret_access_key: String,
 }
 
+/// Common intermediate representation for SigV4 parameters,
+/// populated from either Authorization header or presigned URL query params.
+struct SigV4Params {
+    access_key: String,
+    credential_scope: String,
+    signed_headers: String,
+    signature: String,
+    amz_date: String,
+    payload_hash: String,
+    canonical_query_string: String,
+}
+
+impl SigV4Params {
+    /// Extract SigV4 parameters from the Authorization header path.
+    fn from_headers(request: &Request<Body>) -> Result<Self, Response> {
+        let auth_header = match request.headers().get("authorization") {
+            Some(v) => match v.to_str() {
+                Ok(s) => s.to_string(),
+                Err(_) => {
+                    warn!("SigV4: invalid Authorization header encoding");
+                    return Err(S3Error::InvalidArgument(
+                        "Invalid Authorization header encoding".to_string(),
+                    )
+                    .into_response());
+                }
+            },
+            None => {
+                debug!("SigV4: no Authorization header, rejecting");
+                return Err(S3Error::AccessDenied.into_response());
+            }
+        };
+
+        let parsed = match parse_auth_header(&auth_header) {
+            Some(p) => p,
+            None => {
+                warn!("SigV4: failed to parse Authorization header");
+                return Err(S3Error::InvalidArgument(
+                    "Invalid Authorization header format".to_string(),
+                )
+                .into_response());
+            }
+        };
+
+        let payload_hash = request
+            .headers()
+            .get("x-amz-content-sha256")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("UNSIGNED-PAYLOAD")
+            .to_string();
+
+        let amz_date = get_amz_date(request.headers());
+
+        let query_string = request.uri().query().unwrap_or("");
+        let canonical_query_string = build_canonical_query_string(query_string, &[]);
+
+        Ok(SigV4Params {
+            access_key: parsed.access_key,
+            credential_scope: parsed.credential_scope,
+            signed_headers: parsed.signed_headers,
+            signature: parsed.signature,
+            amz_date,
+            payload_hash,
+            canonical_query_string,
+        })
+    }
+
+    /// Extract SigV4 parameters from presigned URL query params.
+    fn from_query(request: &Request<Body>) -> Result<Self, Response> {
+        let query_string = request.uri().query().unwrap_or("");
+
+        let params: std::collections::HashMap<String, String> = query_string
+            .split('&')
+            .filter(|s| !s.is_empty())
+            .filter_map(|pair| {
+                let (k, v) = pair.split_once('=')?;
+                Some((percent_decode(k), percent_decode(v)))
+            })
+            .collect();
+
+        let credential = params.get("X-Amz-Credential").cloned().unwrap_or_default();
+        let signed_headers = params
+            .get("X-Amz-SignedHeaders")
+            .cloned()
+            .unwrap_or_default();
+        let signature = params.get("X-Amz-Signature").cloned().unwrap_or_default();
+        let amz_date = params.get("X-Amz-Date").cloned().unwrap_or_default();
+        let expires = params.get("X-Amz-Expires").cloned().unwrap_or_default();
+
+        if credential.is_empty() || signature.is_empty() {
+            debug!("SigV4 presigned: missing credential or signature");
+            return Err(S3Error::AccessDenied.into_response());
+        }
+
+        // Parse credential: AKID/date/region/service/aws4_request
+        let (access_key, credential_scope) = match credential.split_once('/') {
+            Some(pair) => pair,
+            None => {
+                warn!("SigV4 presigned: invalid credential format");
+                return Err(S3Error::AccessDenied.into_response());
+            }
+        };
+
+        // Check expiration — hard-fail on parse errors
+        if !expires.is_empty() {
+            let expires_secs: i64 = expires.parse().map_err(|_| {
+                warn!("SigV4 presigned: unparseable X-Amz-Expires: {:?}", expires);
+                S3Error::InvalidArgument(format!("Invalid X-Amz-Expires: {}", expires))
+                    .into_response()
+            })?;
+
+            let request_time =
+                chrono::NaiveDateTime::parse_from_str(&amz_date, "%Y%m%dT%H%M%SZ").map_err(
+                    |_| {
+                        warn!("SigV4 presigned: unparseable X-Amz-Date: {:?}", amz_date);
+                        S3Error::InvalidArgument(format!("Invalid X-Amz-Date: {}", amz_date))
+                            .into_response()
+                    },
+                )?;
+
+            let request_utc = request_time.and_utc();
+            let now = chrono::Utc::now();
+            let expiry = request_utc + chrono::Duration::seconds(expires_secs);
+            if now > expiry {
+                debug!("SigV4 presigned: URL expired (expired at {})", expiry);
+                return Err(S3Error::AccessDenied.into_response());
+            }
+        }
+
+        let canonical_query_string =
+            build_canonical_query_string(query_string, &["X-Amz-Signature"]);
+
+        Ok(SigV4Params {
+            access_key: access_key.to_string(),
+            credential_scope: credential_scope.to_string(),
+            signed_headers,
+            signature,
+            amz_date,
+            payload_hash: "UNSIGNED-PAYLOAD".to_string(),
+            canonical_query_string,
+        })
+    }
+}
+
+/// Verify the SigV4 signature against the reconstructed canonical request.
+fn verify_signature(
+    params: &SigV4Params,
+    auth: &AuthConfig,
+    method: &str,
+    uri_path: &str,
+    headers: &axum::http::HeaderMap,
+) -> Result<(), Response> {
+    // Verify the access key matches
+    if params.access_key != auth.access_key_id {
+        debug!("SigV4: access key mismatch");
+        return Err(S3Error::AccessDenied.into_response());
+    }
+
+    // Build sorted signed headers
+    let signed_headers_list: Vec<&str> = params.signed_headers.split(';').collect();
+    let mut header_pairs: Vec<(String, String)> = Vec::new();
+    for header_name in &signed_headers_list {
+        let value = if *header_name == "host" {
+            headers
+                .get("host")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+                .unwrap_or_default()
+        } else {
+            headers
+                .get(*header_name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string()
+        };
+        // Trim header values per SigV4 spec (collapse spaces, trim)
+        let trimmed = value.split_whitespace().collect::<Vec<_>>().join(" ");
+        header_pairs.push((header_name.to_string(), trimmed));
+    }
+    header_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let canonical_headers: String = header_pairs
+        .iter()
+        .map(|(k, v)| format!("{}:{}\n", k, v))
+        .collect();
+
+    // Build the canonical request
+    let canonical_request = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        method,
+        uri_encode_path(uri_path),
+        params.canonical_query_string,
+        canonical_headers,
+        params.signed_headers,
+        params.payload_hash
+    );
+
+    debug!("SigV4 canonical request:\n{}", canonical_request);
+
+    // Hash the canonical request
+    let canonical_request_hash = hex::encode(Sha256::digest(canonical_request.as_bytes()));
+
+    // Build the string to sign
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{}\n{}\n{}",
+        params.amz_date, params.credential_scope, canonical_request_hash
+    );
+
+    debug!("SigV4 string to sign:\n{}", string_to_sign);
+
+    // Derive the signing key and compute signature
+    let signing_key = derive_signing_key(&auth.secret_access_key, &params.credential_scope);
+    let computed_signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+
+    debug!(
+        "SigV4: computed={}, provided={}",
+        &computed_signature[..8],
+        &params.signature[..std::cmp::min(8, params.signature.len())]
+    );
+
+    if computed_signature != params.signature {
+        warn!("SigV4: signature mismatch");
+        return Err(S3Error::SignatureDoesNotMatch.into_response());
+    }
+
+    debug!("SigV4: signature verified successfully");
+    Ok(())
+}
+
+/// Check whether the query string contains presigned URL parameters.
+/// Uses proper key-level parsing instead of substring matching.
+fn has_presigned_query_params(query: &str) -> bool {
+    query
+        .split('&')
+        .filter(|s| !s.is_empty())
+        .any(|pair| {
+            let key = pair.split_once('=').map(|(k, _)| k).unwrap_or(pair);
+            percent_decode(key) == "X-Amz-Algorithm"
+        })
+}
+
 /// Axum middleware that verifies SigV4 signatures when auth is configured.
 ///
 /// Inserted as a layer around the router. If `auth` is `None` (no credentials
@@ -51,140 +292,38 @@ pub async fn sigv4_auth_middleware(
         None => return Ok(next.run(request).await),
     };
 
+    // Log every incoming request before auth check for debugging
+    debug!(
+        "Incoming request: {} {} (has auth header: {})",
+        request.method(),
+        request.uri(),
+        request.headers().contains_key("authorization")
+    );
+
     // Let CORS preflight requests through — browsers send OPTIONS without credentials
     if request.method() == axum::http::Method::OPTIONS {
         return Ok(next.run(request).await);
     }
 
-    // Extract the Authorization header
-    let auth_header = match request.headers().get("authorization") {
-        Some(v) => match v.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => {
-                warn!("SigV4: invalid Authorization header encoding");
-                return Err(S3Error::InvalidArgument(
-                    "Invalid Authorization header encoding".to_string(),
-                )
-                .into_response());
-            }
-        },
-        None => {
-            debug!("SigV4: no Authorization header, rejecting");
-            return Err(S3Error::AccessDenied.into_response());
-        }
-    };
-
-    // Parse the SigV4 Authorization header
-    let parsed = match parse_auth_header(&auth_header) {
-        Some(p) => p,
-        None => {
-            warn!("SigV4: failed to parse Authorization header");
-            return Err(S3Error::InvalidArgument(
-                "Invalid Authorization header format".to_string(),
-            )
-            .into_response());
-        }
-    };
-
-    // Verify the access key matches
-    if parsed.access_key != auth.access_key_id {
-        debug!("SigV4: access key mismatch");
-        return Err(S3Error::AccessDenied.into_response());
+    // Let HEAD / through unauthenticated — S3 clients (Cyberduck, etc.) use this as
+    // a connection probe before sending real requests. Real S3 returns 200 for HEAD /.
+    if request.method() == axum::http::Method::HEAD && request.uri().path() == "/" {
+        debug!("SigV4: allowing unauthenticated HEAD / (connection probe)");
+        return Ok(next.run(request).await);
     }
 
-    // Reconstruct canonical request and verify signature
+    let query_string = request.uri().query().unwrap_or("");
+    let params = if has_presigned_query_params(query_string) {
+        SigV4Params::from_query(&request)?
+    } else {
+        SigV4Params::from_headers(&request)?
+    };
+
     let method = request.method().as_str().to_string();
     let uri_path = request.uri().path().to_string();
-    let query_string = request.uri().query().unwrap_or("").to_string();
 
-    // Get the payload hash from x-amz-content-sha256 header
-    let payload_hash = request
-        .headers()
-        .get("x-amz-content-sha256")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("UNSIGNED-PAYLOAD")
-        .to_string();
+    verify_signature(&params, &auth, &method, &uri_path, request.headers())?;
 
-    // Build sorted signed headers
-    let signed_headers_list: Vec<&str> = parsed.signed_headers.split(';').collect();
-    let mut header_pairs: Vec<(String, String)> = Vec::new();
-    for header_name in &signed_headers_list {
-        let value = if *header_name == "host" {
-            // Host header might be in the URI or in the headers
-            request
-                .headers()
-                .get("host")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-                .or_else(|| request.uri().authority().map(|a| a.to_string()))
-                .unwrap_or_default()
-        } else {
-            request
-                .headers()
-                .get(*header_name)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string()
-        };
-        // Trim header values per SigV4 spec (collapse spaces, trim)
-        let trimmed = value.split_whitespace().collect::<Vec<_>>().join(" ");
-        header_pairs.push((header_name.to_string(), trimmed));
-    }
-    header_pairs.sort_by(|a, b| a.0.cmp(&b.0));
-
-    // Build canonical headers string
-    let canonical_headers: String = header_pairs
-        .iter()
-        .map(|(k, v)| format!("{}:{}\n", k, v))
-        .collect();
-
-    // Build canonical query string (sorted by parameter name)
-    let canonical_query_string = build_canonical_query_string(&query_string);
-
-    // Build the canonical request
-    let canonical_request = format!(
-        "{}\n{}\n{}\n{}\n{}\n{}",
-        method,
-        uri_encode_path(&uri_path),
-        canonical_query_string,
-        canonical_headers,
-        parsed.signed_headers,
-        payload_hash
-    );
-
-    debug!("SigV4 canonical request:\n{}", canonical_request);
-
-    // Hash the canonical request
-    let canonical_request_hash = hex::encode(Sha256::digest(canonical_request.as_bytes()));
-
-    // Build the string to sign
-    let string_to_sign = format!(
-        "AWS4-HMAC-SHA256\n{}\n{}\n{}",
-        get_amz_date(request.headers()),
-        parsed.credential_scope,
-        canonical_request_hash
-    );
-
-    debug!("SigV4 string to sign:\n{}", string_to_sign);
-
-    // Derive the signing key
-    let signing_key = derive_signing_key(&auth.secret_access_key, &parsed.credential_scope);
-
-    // Compute the signature
-    let computed_signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
-
-    debug!(
-        "SigV4: computed={}, provided={}",
-        &computed_signature[..8],
-        &parsed.signature[..std::cmp::min(8, parsed.signature.len())]
-    );
-
-    if computed_signature != parsed.signature {
-        warn!("SigV4: signature mismatch");
-        return Err(S3Error::SignatureDoesNotMatch.into_response());
-    }
-
-    debug!("SigV4: signature verified successfully");
     Ok(next.run(request).await)
 }
 
@@ -253,7 +392,8 @@ fn get_amz_date(headers: &axum::http::HeaderMap) -> String {
 }
 
 /// Build sorted canonical query string from raw query.
-fn build_canonical_query_string(query: &str) -> String {
+/// Keys in `exclude_keys` are omitted (used for presigned URLs to strip X-Amz-Signature).
+fn build_canonical_query_string(query: &str, exclude_keys: &[&str]) -> String {
     if query.is_empty() {
         return String::new();
     }
@@ -261,15 +401,20 @@ fn build_canonical_query_string(query: &str) -> String {
     let mut pairs: Vec<(String, String)> = query
         .split('&')
         .filter(|s| !s.is_empty())
-        .map(|pair| {
+        .filter_map(|pair| {
             if let Some((k, v)) = pair.split_once('=') {
-                // SigV4 spec: decode first, then re-encode to normalize
                 let k_decoded = percent_decode(k);
+                if exclude_keys.contains(&k_decoded.as_str()) {
+                    return None;
+                }
                 let v_decoded = percent_decode(v);
-                (uri_encode(&k_decoded, true), uri_encode(&v_decoded, true))
+                Some((uri_encode(&k_decoded, true), uri_encode(&v_decoded, true)))
             } else {
                 let k_decoded = percent_decode(pair);
-                (uri_encode(&k_decoded, true), String::new())
+                if exclude_keys.contains(&k_decoded.as_str()) {
+                    return None;
+                }
+                Some((uri_encode(&k_decoded, true), String::new()))
             }
         })
         .collect();
@@ -304,9 +449,10 @@ fn percent_decode(input: &str) -> String {
 
 /// URI-encode a path component per SigV4 spec.
 /// Path encoding preserves '/' characters.
+/// Decodes first to avoid double-encoding (e.g. `%20` → `%2520`).
 fn uri_encode_path(path: &str) -> String {
     path.split('/')
-        .map(|segment| uri_encode(segment, false))
+        .map(|segment| uri_encode(&percent_decode(segment), false))
         .collect::<Vec<_>>()
         .join("/")
 }
@@ -397,20 +543,44 @@ mod tests {
 
     #[test]
     fn test_canonical_query_string() {
-        assert_eq!(build_canonical_query_string(""), "");
-        assert_eq!(build_canonical_query_string("a=1&b=2"), "a=1&b=2");
+        assert_eq!(build_canonical_query_string("", &[]), "");
+        assert_eq!(build_canonical_query_string("a=1&b=2", &[]), "a=1&b=2");
         // Should sort by key
-        assert_eq!(build_canonical_query_string("b=2&a=1"), "a=1&b=2");
+        assert_eq!(build_canonical_query_string("b=2&a=1", &[]), "a=1&b=2");
         // Handles list-type parameter
         assert_eq!(
-            build_canonical_query_string("list-type=2&prefix=test"),
+            build_canonical_query_string("list-type=2&prefix=test", &[]),
             "list-type=2&prefix=test"
         );
         // Pre-encoded values should not be double-encoded
         assert_eq!(
-            build_canonical_query_string("delimiter=%2F&list-type=2&prefix="),
+            build_canonical_query_string("delimiter=%2F&list-type=2&prefix=", &[]),
             "delimiter=%2F&list-type=2&prefix="
         );
+    }
+
+    #[test]
+    fn test_canonical_query_string_with_exclusions() {
+        assert_eq!(
+            build_canonical_query_string("a=1&X-Amz-Signature=abc&b=2", &["X-Amz-Signature"]),
+            "a=1&b=2"
+        );
+        // Exclude multiple keys
+        assert_eq!(
+            build_canonical_query_string("a=1&drop=x&b=2&skip=y", &["drop", "skip"]),
+            "a=1&b=2"
+        );
+    }
+
+    #[test]
+    fn test_has_presigned_query_params() {
+        assert!(has_presigned_query_params(
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=foo"
+        ));
+        assert!(!has_presigned_query_params("list-type=2&prefix=test"));
+        assert!(!has_presigned_query_params(""));
+        // Should not match substring (e.g. a value containing "X-Amz-Algorithm=")
+        assert!(!has_presigned_query_params("foo=X-Amz-Algorithm%3Dbar"));
     }
 
     #[test]
@@ -426,6 +596,11 @@ mod tests {
         assert_eq!(uri_encode_path("/bucket/key"), "/bucket/key");
         assert_eq!(
             uri_encode_path("/bucket/my file.zip"),
+            "/bucket/my%20file.zip"
+        );
+        // Pre-encoded paths must not be double-encoded
+        assert_eq!(
+            uri_encode_path("/bucket/my%20file.zip"),
             "/bucket/my%20file.zip"
         );
     }
