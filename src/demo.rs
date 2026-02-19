@@ -53,15 +53,12 @@ pub async fn serve(s3_port: u16, admin_state: Arc<AdminState>) {
         .route("/*path", get(static_or_fallback))
         .layer(CorsLayer::permissive());
 
-    match TcpListener::bind(&addr).await {
-        Ok(listener) => {
-            info!("  Demo UI: http://localhost:{demo_port}");
-            axum::serve(listener, app).await.ok();
-        }
-        Err(e) => {
-            tracing::warn!("Demo UI failed to bind {addr}: {e}");
-        }
-    }
+    let listener = TcpListener::bind(&addr).await.unwrap_or_else(|e| {
+        tracing::error!("Demo UI failed to bind {addr}: {e}");
+        std::process::exit(1);
+    });
+    info!("  Demo UI: http://localhost:{demo_port}");
+    axum::serve(listener, app).await.ok();
 }
 
 async fn index() -> impl IntoResponse {

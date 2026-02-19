@@ -46,6 +46,10 @@ struct Cli {
     /// Run interactive configuration wizard
     #[arg(long)]
     init: bool,
+
+    /// Set admin password from stdin, then exit
+    #[arg(long)]
+    set_admin_password: bool,
 }
 
 #[tokio::main]
@@ -61,6 +65,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
         }
+    }
+
+    // Set admin password from stdin (runs synchronously, exits before tokio runtime)
+    if cli.set_admin_password {
+        use std::io::BufRead;
+        let mut line = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut line)
+            .expect("Failed to read password from stdin");
+        let password = line.trim_end_matches('\n').trim_end_matches('\r');
+        if password.is_empty() {
+            eprintln!("Error: password must not be empty");
+            std::process::exit(1);
+        }
+        let hash =
+            bcrypt::hash(password, bcrypt::DEFAULT_COST).expect("bcrypt hashing failed");
+        let state_file = ".deltaglider_admin_hash";
+        std::fs::write(state_file, &hash).expect("Failed to write admin hash file");
+        eprintln!("Admin password hash written to {state_file}");
+        std::process::exit(0);
     }
 
     // Initialize tracing with reload support
