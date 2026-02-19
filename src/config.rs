@@ -90,7 +90,7 @@ pub enum BackendConfig {
 
 // Default value functions for serde
 fn default_listen_addr() -> SocketAddr {
-    "127.0.0.1:9000".parse().unwrap()
+    "0.0.0.0:9000".parse().unwrap()
 }
 
 fn default_max_delta_ratio() -> f32 {

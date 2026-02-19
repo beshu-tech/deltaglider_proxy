@@ -89,11 +89,7 @@ async fn put_object_inner(
             .into_response());
     }
 
-    let content_type = headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
+    let content_type = extract_content_type(headers);
     let user_metadata = extract_user_metadata(headers);
 
     let result = state
@@ -191,6 +187,29 @@ fn hval(s: &str) -> HeaderValue {
     HeaderValue::from_bytes(s.as_bytes()).unwrap_or_else(|_| HeaderValue::from_static(""))
 }
 
+/// Build an XML response with correct Content-Type header.
+fn xml_response(xml: impl Into<String>) -> Response {
+    (
+        StatusCode::OK,
+        [("Content-Type", "application/xml")],
+        xml.into(),
+    )
+        .into_response()
+}
+
+/// Extract Content-Type header as an owned String.
+fn extract_content_type(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+/// Parse request body as UTF-8 string, mapping errors to MalformedXML.
+fn body_to_utf8(body: &Bytes) -> Result<String, S3Error> {
+    String::from_utf8(body.to_vec()).map_err(|_| S3Error::MalformedXML)
+}
+
 /// Extract user-provided x-amz-meta-* headers, excluding DeltaGlider internal metadata (dg-*).
 fn extract_user_metadata(headers: &HeaderMap) -> std::collections::HashMap<String, String> {
     use crate::types::meta_keys as mk;
@@ -243,7 +262,7 @@ pub async fn get_object(
             is_truncated: false,
         };
         let xml = result.to_xml();
-        return Ok((StatusCode::OK, [("Content-Type", "application/xml")], xml).into_response());
+        return Ok(xml_response(xml));
     }
 
     info!("GET {}/{}", bucket, key);
@@ -391,7 +410,7 @@ pub async fn bucket_get_handler(
         .to_xml()
     };
 
-    Ok((StatusCode::OK, [("Content-Type", "application/xml")], xml).into_response())
+    Ok(xml_response(xml))
 }
 
 /// GetBucketLocation handler
@@ -400,7 +419,7 @@ async fn get_bucket_location(_bucket: &str) -> Result<Response, S3Error> {
     // Return a fixed location - we use us-east-1 as default
     let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">us-east-1</LocationConstraint>"#;
-    Ok((StatusCode::OK, [("Content-Type", "application/xml")], xml).into_response())
+    Ok(xml_response(xml))
 }
 
 /// GetBucketVersioning handler
@@ -409,7 +428,7 @@ async fn get_bucket_versioning(_bucket: &str) -> Result<Response, S3Error> {
     // Return empty VersioningConfiguration - versioning is not enabled
     let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>"#;
-    Ok((StatusCode::OK, [("Content-Type", "application/xml")], xml).into_response())
+    Ok(xml_response(xml))
 }
 
 /// ListMultipartUploads handler
@@ -428,7 +447,7 @@ async fn list_multipart_uploads(
         is_truncated: false,
     };
     let xml = result.to_xml();
-    Ok((StatusCode::OK, [("Content-Type", "application/xml")], xml).into_response())
+    Ok(xml_response(xml))
 }
 
 /// DELETE object handler
@@ -501,7 +520,7 @@ pub async fn delete_objects(
     }
 
     // Parse XML body
-    let body_str = String::from_utf8(body.to_vec()).map_err(|_| S3Error::MalformedXML)?;
+    let body_str = body_to_utf8(&body)?;
 
     let delete_req = DeleteRequest::from_xml(&body_str).map_err(|e| {
         warn!("Failed to parse DeleteObjects XML: {}", e);
@@ -552,7 +571,7 @@ pub async fn delete_objects(
     let result = DeleteResult { deleted, errors };
     let xml = result.to_xml(quiet);
 
-    Ok((StatusCode::OK, [("Content-Type", "application/xml")], xml).into_response())
+    Ok(xml_response(xml))
 }
 
 /// COPY object handler (internal)
@@ -629,7 +648,7 @@ async fn copy_object_inner(
     };
     let xml = copy_result.to_xml();
 
-    Ok((StatusCode::OK, [("Content-Type", "application/xml")], xml).into_response())
+    Ok(xml_response(xml))
 }
 
 /// PUT object handler with copy detection and multipart upload support
@@ -736,11 +755,7 @@ fn initiate_multipart_upload(
 ) -> Result<Response, S3Error> {
     info!("CreateMultipartUpload {}/{}", bucket, key);
 
-    let content_type = headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
+    let content_type = extract_content_type(headers);
     let user_metadata = extract_user_metadata(headers);
     let upload_id = state
         .multipart
@@ -752,7 +767,7 @@ fn initiate_multipart_upload(
         upload_id,
     }
     .to_xml();
-    Ok((StatusCode::OK, [("Content-Type", "application/xml")], xml).into_response())
+    Ok(xml_response(xml))
 }
 
 /// POST /{bucket}/{key}?uploadId=X — CompleteMultipartUpload
@@ -768,7 +783,7 @@ async fn complete_multipart_upload(
         bucket, key, upload_id
     );
 
-    let body_str = String::from_utf8(body.to_vec()).map_err(|_| S3Error::MalformedXML)?;
+    let body_str = body_to_utf8(&body)?;
     let complete_req = CompleteMultipartUploadRequest::from_xml(&body_str).map_err(|e| {
         warn!("Failed to parse CompleteMultipartUpload XML: {}", e);
         S3Error::MalformedXML
@@ -940,7 +955,7 @@ pub async fn list_buckets(State(state): State<Arc<AppState>>) -> Result<Response
     };
     let xml = result.to_xml();
 
-    Ok((StatusCode::OK, [("Content-Type", "application/xml")], xml).into_response())
+    Ok(xml_response(xml))
 }
 
 // ============================================================================

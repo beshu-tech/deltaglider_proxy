@@ -77,9 +77,11 @@ export default function useUploadQueue(destination: string) {
 
   const pendingCount = queue.filter((i) => i.status === 'pending' || i.status === 'uploading').length;
 
-  const savings = stats.originalSize > 0
+  const rawSavings = stats.originalSize > 0
     ? Math.max(0, ((stats.originalSize - stats.storedSize) / stats.originalSize) * 100)
     : 0;
+  // Cap at 99.9% unless stored size is truly zero (avoid misleading "100.0%")
+  const savings = rawSavings >= 100 && stats.storedSize !== 0 ? 99.9 : rawSavings;
 
   return { queue, stats, savings, pendingCount, addFiles, clearCompleted };
 }

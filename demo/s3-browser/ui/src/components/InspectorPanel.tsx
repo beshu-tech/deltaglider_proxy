@@ -87,10 +87,12 @@ export default function InspectorPanel({ object, onClose, onDeleted, isMobile, h
   const headers = headData?.headers ?? {};
   const storageType = headData?.storageType;
   const storedSize = headData?.storedSize;
-  const savings =
+  const rawSavings =
     storedSize != null && object.size > 0
       ? ((1 - storedSize / object.size) * 100)
       : 0;
+  // Cap at 99.9% unless stored size is truly zero (avoid misleading "100.0%")
+  const savings = rawSavings >= 100 && storedSize !== 0 ? 99.9 : rawSavings;
   const savedBytes = storedSize != null ? Math.max(0, object.size - storedSize) : 0;
 
   const dgMeta = getDgMetadata(headers);
