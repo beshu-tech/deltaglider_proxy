@@ -98,8 +98,8 @@ function AdminGate({ onSuccess, onBack }: { onSuccess: () => void; onBack: () =>
 
   return (
     <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '70vh', padding: 24 }}>
-      <div className="glass-card animate-fade-in" style={{ borderRadius: 14, padding: 'clamp(28px, 4vw, 40px)', width: '100%', maxWidth: 400 }}>
-        <Space direction="vertical" size="large" style={{ width: '100%' }}>
+      <form onSubmit={(e) => { e.preventDefault(); handleSubmit(); }} className="glass-card animate-fade-in" style={{ borderRadius: 14, padding: 'clamp(28px, 4vw, 40px)', width: '100%', maxWidth: 400 }}>
+        <Space orientation="vertical" size="large" style={{ width: '100%' }}>
           <div style={{ textAlign: 'center' }}>
             <div style={{
               width: 56, height: 56, borderRadius: 14,
@@ -119,14 +119,14 @@ function AdminGate({ onSuccess, onBack }: { onSuccess: () => void; onBack: () =>
             placeholder="Password"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
-            onPressEnter={handleSubmit}
             size="large"
             autoFocus
+            autoComplete="current-password"
             style={{ background: 'var(--input-bg)', borderColor: BORDER, borderRadius: 10, height: 48, fontFamily: "var(--font-mono)" }}
           />
 
-          <Space direction="vertical" size="small" style={{ width: '100%' }}>
-            <Button type="primary" block size="large" loading={loading} disabled={!password} onClick={handleSubmit}
+          <Space orientation="vertical" size="small" style={{ width: '100%' }}>
+            <Button type="primary" htmlType="submit" block size="large" loading={loading} disabled={!password}
               style={{ height: 48, borderRadius: 10, fontWeight: 700, fontFamily: "var(--font-ui)", fontSize: 15 }}>
               Sign In
             </Button>
@@ -136,7 +136,7 @@ function AdminGate({ onSuccess, onBack }: { onSuccess: () => void; onBack: () =>
             </Button>
           </Space>
         </Space>
-      </div>
+      </form>
     </div>
   );
 }

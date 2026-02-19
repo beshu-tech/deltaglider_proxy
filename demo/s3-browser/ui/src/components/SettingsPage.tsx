@@ -97,7 +97,7 @@ function BrowserConnectionCard() {
   const [testResult, setTestResult] = useState<{ ok: boolean; buckets?: string[]; error?: string } | null>(null);
 
   return (
-    <div style={cardStyle}>
+    <form onSubmit={(e) => e.preventDefault()} style={cardStyle}>
       <SectionHeader icon={<CloudOutlined />} title="Browser Connection" />
       <Text type="secondary" style={{ fontSize: 12, fontFamily: "var(--font-ui)", display: 'block', marginBottom: 12 }}>
         How this browser connects to the DeltaGlider proxy.
@@ -129,6 +129,7 @@ function BrowserConnectionCard() {
           value={accessKey}
           onChange={(e) => setConnAccessKey(e.target.value)}
           placeholder="minioadmin"
+          autoComplete="username"
           style={{ ...inputRadius, fontFamily: "var(--font-mono)", fontSize: 13 }}
         />
       </div>
@@ -139,6 +140,7 @@ function BrowserConnectionCard() {
           value={secretKey}
           onChange={(e) => setConnSecretKey(e.target.value)}
           placeholder="minioadmin"
+          autoComplete="current-password"
           style={{ ...inputRadius }}
         />
       </div>
@@ -187,7 +189,7 @@ function BrowserConnectionCard() {
           description={testResult.ok ? testResult.buckets?.join(', ') : testResult.error}
         />
       )}
-    </div>
+    </form>
   );
 }
 
@@ -214,20 +216,22 @@ function PasswordChangeCard() {
   };
 
   return (
-    <div style={cardStyle}>
-      <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+    <form onSubmit={(e) => { e.preventDefault(); handleSubmit(); }} style={cardStyle}>
+      <Space orientation="vertical" size="middle" style={{ width: '100%' }}>
         <SectionHeader icon={<LockOutlined />} title="Change Admin Password" />
 
         <Input.Password
           placeholder="Current password"
           value={currentPassword}
           onChange={(e) => setCurrentPassword(e.target.value)}
+          autoComplete="current-password"
           style={inputRadius}
         />
         <Input.Password
           placeholder="New password"
           value={newPassword}
           onChange={(e) => setNewPassword(e.target.value)}
+          autoComplete="new-password"
           style={inputRadius}
         />
 
@@ -241,7 +245,7 @@ function PasswordChangeCard() {
         )}
 
         <Button
-          onClick={handleSubmit}
+          htmlType="submit"
           loading={changing}
           disabled={!currentPassword || !newPassword}
           block
@@ -250,7 +254,7 @@ function PasswordChangeCard() {
           Change Password
         </Button>
       </Space>
-    </div>
+    </form>
   );
 }
 
@@ -371,7 +375,7 @@ export default function SettingsPage({ onBack }: Props) {
   /* -- Tab: Backend ------------------------------------------------------- */
 
   const backendTab = (
-    <div style={tabPane}><div style={cardStyle}>
+    <div style={tabPane}><form onSubmit={(e) => { e.preventDefault(); handleSave(); }} style={cardStyle}>
       <SectionHeader icon={<DatabaseOutlined />} title="Backend Configuration" />
       <div style={{ marginTop: 12 }}>
         <span style={labelStyle}>Listen Address</span>
@@ -557,13 +561,13 @@ export default function SettingsPage({ onBack }: Props) {
       >
         Save Configuration
       </Button>
-    </div></div>
+    </form></div>
   );
 
   /* -- Tab: Proxy --------------------------------------------------------- */
 
   const proxyTab = (
-    <div style={tabPane}><Space direction="vertical" size={0} style={{ width: '100%' }}>
+    <div style={tabPane}><form onSubmit={(e) => { e.preventDefault(); handleSave(); }}><Space orientation="vertical" size={0} style={{ width: '100%' }}>
       <div style={cardStyle}>
         <SectionHeader icon={<SafetyOutlined />} title="Proxy Tuning" />
 
@@ -707,7 +711,7 @@ export default function SettingsPage({ onBack }: Props) {
       >
         Save Configuration
       </Button>
-    </Space></div>
+    </Space></form></div>
   );
 
   /* -- Tab: Security ------------------------------------------------------ */

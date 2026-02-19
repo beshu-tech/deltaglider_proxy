@@ -77,7 +77,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
           maxWidth: 440,
         }}
       >
-        <Space direction="vertical" size="large" style={{ width: '100%' }}>
+        <Space orientation="vertical" size="large" style={{ width: '100%' }}>
           <div style={{ textAlign: 'center' }}>
             <div style={{
               width: 56,
