@@ -12,7 +12,7 @@ cargo run --release
 DGP_DATA_DIR=./data cargo run --release
 ```
 
-By default DeltaGlider Proxy listens on `127.0.0.1:9000`. Create buckets via the S3 API (`CreateBucket`) or the demo UI.
+By default DeltaGlider Proxy listens on `0.0.0.0:9000`. Create buckets via the S3 API (`CreateBucket`) or the demo UI.
 
 ### S3 backend (MinIO example)
 

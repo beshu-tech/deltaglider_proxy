@@ -5,6 +5,7 @@
 pub mod api;
 pub mod config;
 pub mod deltaglider;
+pub mod init;
 pub mod multipart;
 pub mod session;
 pub mod storage;

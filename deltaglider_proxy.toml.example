@@ -2,7 +2,7 @@
 # Copy this file to deltaglider_proxy.toml and adjust settings as needed.
 
 # Server listen address
-listen_addr = "127.0.0.1:9000"
+listen_addr = "0.0.0.0:9000"
 
 # Delta Compression
 # -----------------

@@ -42,11 +42,26 @@ struct Cli {
     /// Enable verbose logging
     #[arg(short, long)]
     verbose: bool,
+
+    /// Run interactive configuration wizard
+    #[arg(long)]
+    init: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+
+    // Interactive config wizard (runs synchronously, exits before tokio runtime)
+    if cli.init {
+        match deltaglider_proxy::init::run_interactive_init("deltaglider_proxy.toml") {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     // Initialize tracing with reload support
     // Priority: RUST_LOG > DGP_LOG_LEVEL > --verbose > default
