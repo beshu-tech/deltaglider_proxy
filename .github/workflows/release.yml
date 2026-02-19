@@ -92,10 +92,6 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
 
-          # Windows x86_64
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
