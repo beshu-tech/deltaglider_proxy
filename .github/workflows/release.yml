@@ -159,19 +159,19 @@ jobs:
         run: |
           cd artifacts
           # Move all archives out of per-target subdirectories
-          find . -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec mv {} . \;
+          find . -type f -name "*.tar.gz" -exec mv {} . \;
           # Remove now-empty subdirectories
           find . -mindepth 1 -type d -exec rmdir {} + 2>/dev/null || true
 
           # Fail if no archives were produced
-          ARCHIVES=$(ls *.tar.gz *.zip 2>/dev/null | wc -l)
+          ARCHIVES=$(ls *.tar.gz 2>/dev/null | wc -l)
           if [ "$ARCHIVES" -eq 0 ]; then
             echo "::error::No release archives found — build may have failed"
             exit 1
           fi
           echo "Found $ARCHIVES release archive(s)"
 
-          sha256sum *.tar.gz *.zip 2>/dev/null | sort -k2 > SHA256SUMS.txt
+          sha256sum *.tar.gz 2>/dev/null | sort -k2 > SHA256SUMS.txt
           echo "--- SHA256SUMS.txt ---"
           cat SHA256SUMS.txt
 
@@ -184,7 +184,7 @@ jobs:
       - name: Attest build provenance
         uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
         with:
-          subject-path: "artifacts/*.tar.gz,artifacts/*.zip"
+          subject-path: "artifacts/*.tar.gz"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
@@ -193,7 +193,6 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             artifacts/*.tar.gz
-            artifacts/*.zip
             artifacts/SHA256SUMS.txt
             artifacts/sbom-spdx.json
         env:
