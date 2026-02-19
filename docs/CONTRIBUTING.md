@@ -6,7 +6,7 @@ Thanks for your interest in contributing! Whether it's a bug report, feature ide
 
 ### Prerequisites
 
-- **Rust 1.75+** — install via [rustup](https://rustup.rs/)
+- **Rust stable** — install via [rustup](https://rustup.rs/) (the repo's `rust-toolchain.toml` pins the channel automatically)
 - **Node.js 20+** — needed to build the embedded demo UI
 - **Docker** — optional, used for running MinIO in integration tests
 
@@ -44,9 +44,9 @@ cargo test --test s3_integration_test
 The CI runs these on every push — make sure they pass before submitting a PR:
 
 ```bash
-cargo fmt --all -- --check   # Formatting
-cargo clippy -- -D warnings  # Lints
-cargo test --all              # Tests
+cargo fmt --all -- --check                                          # Formatting
+cargo clippy --locked --all-targets --all-features -- -D warnings   # Lints
+cargo test --all --locked                                           # Tests
 ```
 
 ## Project Structure
@@ -72,7 +72,8 @@ src/
 │   ├── mod.rs         # Storage module root
 │   ├── traits.rs      # StorageBackend trait
 │   ├── filesystem.rs  # Local filesystem backend
-│   └── s3.rs          # S3 backend
+│   ├── s3.rs          # S3 backend
+│   └── xattr_meta.rs  # Extended attribute helpers (filesystem metadata)
 ├── config.rs          # Configuration loading
 ├── multipart.rs       # In-memory multipart upload state management
 ├── session.rs         # In-memory session store for admin GUI auth

@@ -1,5 +1,7 @@
 # DeltaGlider Proxy: S3-Compatible Object Storage with DeltaGlider Deduplication
 
+> **Note:** This is the original design document. Phases 1-4 are complete. Some implementation details (file names, type names, module layout, size limits) evolved during development — see `STORAGE_FORMAT.md`, `CONTRIBUTING.md`, and `HARDENING_PLAN.md` for current specifics.
+
 ## Overview
 
 DeltaGlider Proxy is an S3-compatible object storage server implementing the **DeltaGlider algorithm** for transparent delta-based deduplication. By storing similar files as compact binary deltas (using xdelta3), DeltaGlider Proxy achieves 90-99% storage reduction for versioned artifacts.

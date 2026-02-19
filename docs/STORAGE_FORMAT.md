@@ -51,7 +51,7 @@ On the filesystem backend, metadata is stored as a `user.dg.metadata` extended a
 
 ## S3 backend layout
 
-Each API bucket maps 1:1 to a real S3 bucket. DeltaGlider artifacts are stored using the same naming scheme as the filesystem backend, with `.meta` sidecar objects for metadata:
+Each API bucket maps 1:1 to a real S3 bucket. DeltaGlider artifacts are stored using the same naming scheme as the filesystem backend:
 
 ```text
 releases/reference.bin
@@ -59,7 +59,7 @@ releases/v1.zip.delta
 releases/readme.txt            # Passthrough: stored with original filename
 ```
 
-Metadata is stored as S3 user metadata headers (`x-amz-meta-dg-*`) on each object.
+Metadata is stored as S3 user metadata headers (`x-amz-meta-dg-*`) on each object. No sidecar files are used — all metadata travels with the object via S3's native user metadata mechanism.
 
 ## Metadata schema
 

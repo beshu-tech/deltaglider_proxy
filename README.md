@@ -1,4 +1,4 @@
-li# DeltaGlider Proxy
+# DeltaGlider Proxy
 
 **S3-compatible proxy with transparent delta compression**
 
@@ -139,7 +139,7 @@ See [deltaglider_proxy.toml.example](deltaglider_proxy.toml.example) for all opt
 ### CLI
 
 ```
-deltaglider_proxy 0.1.1
+deltaglider_proxy 0.1.3
 S3-compatible proxy with delta compression
 
 USAGE:
