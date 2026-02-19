@@ -28,6 +28,9 @@ function formatBuildTime(): string {
   }
 }
 
+/* Shared inline style constants for sidebar menu items */
+const MENU_ICON_STYLE: React.CSSProperties = { fontSize: 14, width: 22, textAlign: 'center', display: 'inline-flex', justifyContent: 'center' };
+
 interface Props {
   onUploadClick: () => void;
   onMutate: () => void;
@@ -66,7 +69,6 @@ export default function Sidebar({
     listBuckets()
       .then((list) => {
         setBuckets(list);
-        // Auto-select first bucket if current one doesn't exist in the list
         if (list.length > 0 && !list.some((b) => b.name === getBucket())) {
           setBucket(list[0].name);
           onBucketChange(list[0].name);
@@ -116,15 +118,25 @@ export default function Sidebar({
 
   const activeBucket = getBucket();
 
+  const menuItemStyle: React.CSSProperties = {
+    gap: 10,
+    padding: '8px 6px',
+    color: TEXT_SECONDARY,
+    fontSize: 13,
+    width: '100%',
+    transition: 'color 0.15s',
+    fontFamily: "var(--font-ui)",
+  };
+
   const sidebarContent = (
     <div className="dot-grid-bg" style={{ display: 'flex', flexDirection: 'column', height: '100%', background: BG_SIDEBAR }}>
       {contextHolder}
 
-      {/* YOUR BUCKETS */}
+      {/* BUCKETS */}
       <nav aria-label="Bucket list" style={{ padding: '20px 16px 0', overflow: 'auto' }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-          <Text style={{ fontSize: 10, fontWeight: 700, letterSpacing: 1.5, textTransform: 'uppercase', color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>
-            Your Buckets ({buckets.length})
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+          <Text style={{ fontSize: 11, fontWeight: 700, letterSpacing: 1.5, textTransform: 'uppercase', color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>
+            Buckets ({buckets.length})
           </Text>
           <Tooltip title="Create bucket">
             <Button
@@ -132,10 +144,8 @@ export default function Sidebar({
               size="small"
               icon={<PlusOutlined />}
               aria-label="Create bucket"
-              style={{ color: TEXT_MUTED, fontSize: 11 }}
-              onClick={() => {
-                newBucketInputRef.current?.focus();
-              }}
+              style={{ color: TEXT_MUTED, fontSize: 13 }}
+              onClick={() => { newBucketInputRef.current?.focus(); }}
             />
           </Tooltip>
         </div>
@@ -150,9 +160,9 @@ export default function Sidebar({
                 style={{
                   flex: 1,
                   minWidth: 0,
-                  padding: '6px 8px',
+                  padding: '7px 10px',
                   borderRadius: 6,
-                  marginBottom: 1,
+                  marginBottom: 2,
                   background: b.name === activeBucket ? `rgba(45, 212, 191, 0.1)` : 'transparent',
                   color: b.name === activeBucket ? ACCENT_BLUE_LIGHT : TEXT_SECONDARY,
                   transition: 'all 0.15s ease',
@@ -167,7 +177,7 @@ export default function Sidebar({
               >
                 <span style={{
                   fontFamily: "var(--font-mono)",
-                  fontSize: 12,
+                  fontSize: 13,
                   fontWeight: b.name === activeBucket ? 600 : 400,
                   overflow: 'hidden',
                   textOverflow: 'ellipsis',
@@ -193,7 +203,7 @@ export default function Sidebar({
                     icon={<DeleteOutlined />}
                     aria-label={`Delete bucket ${b.name}`}
                     onClick={(e) => e.stopPropagation()}
-                    style={{ opacity: 0.4, fontSize: 11, flexShrink: 0, transition: 'opacity 0.15s' }}
+                    style={{ opacity: 0.4, fontSize: 12, flexShrink: 0, transition: 'opacity 0.15s' }}
                     onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.opacity = '1'; }}
                     onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.opacity = '0.4'; }}
                   />
@@ -214,7 +224,7 @@ export default function Sidebar({
               value={newBucketName}
               onChange={(e) => setNewBucketName(e.target.value)}
               onPressEnter={handleCreateBucket}
-              style={{ background: 'var(--input-bg)', borderColor: BORDER, fontSize: 12, fontFamily: "var(--font-mono)" }}
+              style={{ background: 'var(--input-bg)', borderColor: BORDER, fontSize: 13, fontFamily: "var(--font-mono)" }}
             />
             <Button
               size="small"
@@ -231,46 +241,30 @@ export default function Sidebar({
           <button
             className="btn-reset"
             onClick={onUploadClick}
-            style={{
-              gap: 10,
-              padding: '7px 4px',
-              color: TEXT_SECONDARY,
-              fontSize: 12,
-              width: '100%',
-              transition: 'color 0.15s',
-              fontFamily: "var(--font-ui)",
-            }}
+            style={menuItemStyle}
             onMouseEnter={(e) => { e.currentTarget.style.color = TEXT_PRIMARY; }}
             onMouseLeave={(e) => { e.currentTarget.style.color = TEXT_SECONDARY; }}
           >
-            <UploadOutlined aria-hidden="true" style={{ fontSize: 13, width: 20, textAlign: 'center', display: 'inline-flex', justifyContent: 'center' }} />
+            <UploadOutlined aria-hidden="true" style={MENU_ICON_STYLE} />
             <span>Upload Files</span>
           </button>
           <DemoDataGenerator onDone={onMutate} />
         </div>
       </nav>
 
-      {/* Bottom group: navigation + branding + logout — pinned to bottom */}
+      {/* Bottom group: navigation + branding — pinned to bottom */}
       <div style={{ marginTop: 'auto' }}>
         {/* Navigation */}
-        <div style={{ padding: '12px 16px', borderTop: `1px solid ${BORDER}` }}>
+        <div style={{ padding: '10px 16px 8px', borderTop: `1px solid ${BORDER}` }}>
           <nav aria-label="Settings and help">
             <button
               className="btn-reset"
               onClick={onSettingsClick}
-              style={{
-                gap: 10,
-                padding: '7px 4px',
-                color: TEXT_SECONDARY,
-                fontSize: 12,
-                width: '100%',
-                transition: 'color 0.15s',
-                fontFamily: "var(--font-ui)",
-              }}
+              style={menuItemStyle}
               onMouseEnter={(e) => { e.currentTarget.style.color = TEXT_PRIMARY; }}
               onMouseLeave={(e) => { e.currentTarget.style.color = TEXT_SECONDARY; }}
             >
-              <SettingOutlined aria-hidden="true" style={{ fontSize: 13, width: 20, textAlign: 'center', display: 'inline-flex', justifyContent: 'center' }} />
+              <SettingOutlined aria-hidden="true" style={MENU_ICON_STYLE} />
               <span>Admin Settings</span>
             </button>
             <a
@@ -278,39 +272,22 @@ export default function Sidebar({
               target="_blank"
               rel="noopener noreferrer"
               className="btn-reset"
-              style={{
-                gap: 10,
-                padding: '7px 4px',
-                color: TEXT_SECONDARY,
-                fontSize: 12,
-                width: '100%',
-                textDecoration: 'none',
-                transition: 'color 0.15s',
-                fontFamily: "var(--font-ui)",
-              }}
+              style={{ ...menuItemStyle, textDecoration: 'none' }}
               onMouseEnter={(e) => { e.currentTarget.style.color = TEXT_PRIMARY; }}
               onMouseLeave={(e) => { e.currentTarget.style.color = TEXT_SECONDARY; }}
             >
-              <FileTextOutlined aria-hidden="true" style={{ fontSize: 13, width: 20, textAlign: 'center', display: 'inline-flex', justifyContent: 'center' }} />
+              <FileTextOutlined aria-hidden="true" style={MENU_ICON_STYLE} />
               <span>Documentation</span>
             </a>
             {onLogout && (
               <button
                 className="btn-reset"
                 onClick={onLogout}
-                style={{
-                  gap: 10,
-                  padding: '7px 4px',
-                  color: TEXT_SECONDARY,
-                  fontSize: 12,
-                  width: '100%',
-                  transition: 'color 0.15s',
-                  fontFamily: "var(--font-ui)",
-                }}
+                style={menuItemStyle}
                 onMouseEnter={(e) => { e.currentTarget.style.color = ACCENT_RED; }}
                 onMouseLeave={(e) => { e.currentTarget.style.color = TEXT_SECONDARY; }}
               >
-                <LogoutOutlined aria-hidden="true" style={{ fontSize: 13, width: 20, textAlign: 'center', display: 'inline-flex', justifyContent: 'center' }} />
+                <LogoutOutlined aria-hidden="true" style={MENU_ICON_STYLE} />
                 <span>Logout</span>
               </button>
             )}
@@ -318,15 +295,15 @@ export default function Sidebar({
         </div>
 
         {/* Branding */}
-        <div style={{ padding: '16px 16px 20px', borderTop: `1px solid ${BORDER}` }}>
-          <div style={{ fontSize: 18, fontWeight: 800, letterSpacing: 3, color: TEXT_PRIMARY, lineHeight: 1.2, fontFamily: "var(--font-ui)" }}>
-            DELTAGLIDER
+        <div style={{ padding: '28px 16px 32px', borderTop: `1px solid ${BORDER}` }}>
+          <div style={{ fontSize: 16, fontWeight: 800, letterSpacing: 4, color: TEXT_PRIMARY, lineHeight: 1, fontFamily: "var(--font-ui)", textTransform: 'uppercase' }}>
+            DeltaGlider
           </div>
-          <div style={{ fontSize: 12, fontWeight: 600, letterSpacing: 2.5, color: ACCENT_BLUE, textTransform: 'uppercase', marginTop: 3, fontFamily: "var(--font-mono)" }}>
+          <div style={{ fontSize: 11, fontWeight: 600, letterSpacing: 3, color: ACCENT_BLUE, textTransform: 'uppercase', marginTop: 5, fontFamily: "var(--font-mono)" }}>
             Proxy
           </div>
-          <div style={{ fontSize: 10, color: TEXT_FAINT, marginTop: 6, fontFamily: "var(--font-mono)" }}>
-            Built {formatBuildTime()}
+          <div style={{ fontSize: 10, color: TEXT_FAINT, marginTop: 14, fontFamily: "var(--font-mono)", letterSpacing: 0.3 }}>
+            {formatBuildTime()}
           </div>
         </div>
       </div>{/* end bottom group */}

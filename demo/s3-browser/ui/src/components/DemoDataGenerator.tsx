@@ -62,9 +62,9 @@ export default function DemoDataGenerator({ onDone }: Props) {
         disabled={generating}
         style={{
           gap: 10,
-          padding: '7px 4px',
+          padding: '8px 6px',
           color: TEXT_SECONDARY,
-          fontSize: 12,
+          fontSize: 13,
           width: '100%',
           transition: 'color 0.15s',
           fontFamily: "var(--font-ui)",
@@ -74,8 +74,8 @@ export default function DemoDataGenerator({ onDone }: Props) {
         onMouseLeave={(e) => { e.currentTarget.style.color = TEXT_SECONDARY; }}
       >
         {generating
-          ? <LoadingOutlined aria-hidden="true" style={{ fontSize: 13, width: 20, textAlign: 'center', display: 'inline-flex', justifyContent: 'center' }} />
-          : <ExperimentOutlined aria-hidden="true" style={{ fontSize: 13, width: 20, textAlign: 'center', display: 'inline-flex', justifyContent: 'center' }} />
+          ? <LoadingOutlined aria-hidden="true" style={{ fontSize: 14, width: 22, textAlign: 'center', display: 'inline-flex', justifyContent: 'center' }} />
+          : <ExperimentOutlined aria-hidden="true" style={{ fontSize: 14, width: 22, textAlign: 'center', display: 'inline-flex', justifyContent: 'center' }} />
         }
         <span>{progress || 'Demo Data'}</span>
       </button>

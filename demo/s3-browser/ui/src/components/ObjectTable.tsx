@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Table, Tag, Tooltip, Typography, Alert, Progress, theme } from 'antd';
+import { Table, Tag, Tooltip, Typography, Alert, Progress, Checkbox, theme } from 'antd';
 import { FolderOutlined, FileOutlined, LoadingOutlined } from '@ant-design/icons';
 import type { S3Object } from '../types';
 import { formatBytes, displayName, timeAgo } from '../utils';
@@ -97,9 +97,6 @@ export default function ObjectTable({
       </Tag>
     );
   }
-  const totalSelectable = objects.length + folders.length;
-  const allChecked = totalSelectable > 0 && selectedKeys.size === totalSelectable;
-
   const folderRows: RowData[] = folders.map((f) => ({
     _isFolder: true as const,
     key: `folder:${f}`,
@@ -114,8 +111,30 @@ export default function ObjectTable({
 
   const dataSource = [...folderRows, ...objectRows];
   const totalItems = dataSource.length;
+  const totalSelectable = totalItems;
+  const allChecked = totalSelectable > 0 && selectedKeys.size === totalSelectable;
+  const someChecked = selectedKeys.size > 0 && selectedKeys.size < totalSelectable;
 
   const columns: ColumnsType<RowData> = [
+    {
+      title: () => (
+        <Checkbox
+          checked={allChecked}
+          indeterminate={someChecked}
+          onChange={onToggleAll}
+          aria-label="Select all"
+        />
+      ),
+      key: 'select',
+      width: 40,
+      render: (_: unknown, record: RowData) => (
+        <Checkbox
+          checked={selectedKeys.has(record.key)}
+          onChange={() => onToggleKey(record.key)}
+          aria-label={`Select ${record.name}`}
+        />
+      ),
+    },
     {
       title: () => <span style={{ fontSize: 11, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>Name</span>,
       dataIndex: 'name',
@@ -200,31 +219,6 @@ export default function ObjectTable({
     },
   ];
 
-  const rowSelection = {
-    selectedRowKeys: Array.from(selectedKeys),
-    onChange: (keys: React.Key[]) => {
-      const newSet = new Set(keys.map(String));
-      for (const k of keys) {
-        const ks = String(k);
-        if (!selectedKeys.has(ks)) onToggleKey(ks);
-      }
-      for (const k of selectedKeys) {
-        if (!newSet.has(k)) onToggleKey(k);
-      }
-    },
-    getCheckboxProps: (record: RowData) => ({
-      title: `Select ${record.name}`,
-    }),
-    selections: [
-      {
-        key: 'all',
-        text: allChecked ? 'Deselect all' : 'Select all',
-        onSelect: () => onToggleAll(),
-      },
-    ],
-    columnWidth: 40,
-  };
-
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
       {refreshing && (
@@ -241,7 +235,6 @@ export default function ObjectTable({
           columns={columns}
           dataSource={dataSource}
           rowKey="key"
-          rowSelection={rowSelection}
           pagination={{
             pageSize: PAGE_SIZE,
             current: currentPage,
