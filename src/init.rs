@@ -21,11 +21,11 @@ pub enum InitError {
 }
 
 /// Public entry point wiring stdin/stdout.
-pub fn run_interactive_init(output_path: &str) -> Result<(), InitError> {
+pub fn run_interactive_init(default_output_path: &str) -> Result<(), InitError> {
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     let mut writer = io::stdout();
-    run_init_inner(output_path, &mut reader, &mut writer)
+    run_init_inner(default_output_path, &mut reader, &mut writer)
 }
 
 /// Prompt the user for a string value, returning `default` on empty input.
@@ -95,7 +95,7 @@ where
 
 /// Core wizard logic, testable with any `BufRead`/`Write`.
 pub fn run_init_inner(
-    output_path: &str,
+    default_output_path: &str,
     reader: &mut impl BufRead,
     writer: &mut impl Write,
 ) -> Result<(), InitError> {
@@ -104,8 +104,12 @@ pub fn run_init_inner(
     writeln!(writer, "==============================================")?;
     writeln!(writer)?;
 
+    // --- Output file ---
+    let output_path = prompt(reader, writer, "Output config file", default_output_path)?;
+    writeln!(writer)?;
+
     // Check if file already exists
-    if std::path::Path::new(output_path).exists() {
+    if std::path::Path::new(&output_path).exists() {
         let overwrite = prompt_yes_no(
             reader,
             writer,
@@ -126,6 +130,12 @@ pub fn run_init_inner(
         writer,
         "Listen address",
         "0.0.0.0:9000".parse().unwrap(),
+    )?;
+    let log_level = prompt(
+        reader,
+        writer,
+        "Log level",
+        "deltaglider_proxy=debug,tower_http=debug",
     )?;
 
     writeln!(writer)?;
@@ -246,7 +256,7 @@ pub fn run_init_inner(
         access_key_id,
         secret_access_key,
         admin_password_hash: None,
-        log_level: String::new(),
+        log_level,
     };
 
     // Show summary
@@ -259,7 +269,7 @@ pub fn run_init_inner(
     let do_write = prompt_yes_no(reader, writer, &format!("Write to {output_path}?"), true)?;
 
     if do_write {
-        config.persist_to_file(output_path)?;
+        config.persist_to_file(&output_path)?;
         writeln!(writer, "Configuration written to {output_path}")?;
     } else {
         writeln!(writer, "Cancelled. No file written.")?;
@@ -296,21 +306,23 @@ mod tests {
 
     #[test]
     fn test_defaults_filesystem() {
-        // Accept all defaults: listen addr, filesystem, data dir, delta ratio,
-        // max obj size, cache size, no auth, confirm write.
-        // Prompts: listen_addr, backend, data_dir, delta_ratio, max_obj, cache, auth(n), write(y)
-        let input = "\n\n\n\n\n\nn\ny\n";
+        // Accept all defaults: output path, listen addr, log level, filesystem,
+        // data dir, delta ratio, max obj size, cache size, no auth, confirm write.
+        let input = "\n\n\n\n\n\n\n\nn\ny\n";
         let (output, file) = run_wizard(input);
         assert!(output.contains("DeltaGlider Proxy"));
         let file = file.expect("file should be written");
         assert!(file.contains("listen_addr"));
         assert!(file.contains("filesystem"));
+        assert!(file.contains("log_level"));
     }
 
     #[test]
     fn test_s3_backend() {
         let input = concat!(
+            "\n",                      // output path default
             "\n",                      // listen addr default
+            "\n",                      // log level default
             "s3\n",                    // backend = s3
             "http://localhost:9000\n", // endpoint
             "eu-west-1\n",             // region
@@ -331,7 +343,9 @@ mod tests {
 
     #[test]
     fn test_cancel_write() {
-        let input = "\n\n\n\n\n\n\nn\nn\n";
+        // output path, listen addr, log level, backend, data dir, delta ratio,
+        // max obj size, cache size, auth(n), write(n)
+        let input = "\n\n\n\n\n\n\n\nn\nn\n";
         let (output, file) = run_wizard(input);
         assert!(output.contains("Cancelled"));
         assert!(file.is_none());
@@ -356,8 +370,8 @@ mod tests {
         let path = tmp.path().to_str().unwrap().to_string();
         std::fs::write(&path, "existing content").unwrap();
 
-        // Decline overwrite
-        let input = "n\n";
+        // Accept default output path, then decline overwrite
+        let input = "\nn\n";
         let mut reader = Cursor::new(input.as_bytes().to_vec());
         let mut output = Vec::new();
         run_init_inner(&path, &mut reader, &mut output).unwrap();
@@ -400,7 +414,9 @@ mod tests {
     #[test]
     fn test_with_auth() {
         let input = concat!(
+            "\n",         // output path
             "\n",         // listen addr
+            "\n",         // log level
             "\n",         // filesystem
             "\n",         // data dir
             "\n",         // delta ratio

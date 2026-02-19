@@ -47,9 +47,10 @@ pub struct Config {
     #[serde(default)]
     pub admin_password_hash: Option<String>,
 
-    /// Current log level filter string (runtime operational, not persisted to TOML).
-    /// Set via DGP_LOG_LEVEL env var. Default: "deltaglider_proxy=debug,tower_http=debug"
-    #[serde(skip)]
+    /// Log level filter string.
+    /// Set via config file, DGP_LOG_LEVEL env var, or admin GUI. Overridden by RUST_LOG.
+    /// Default: "deltaglider_proxy=debug,tower_http=debug"
+    #[serde(default = "default_log_level")]
     pub log_level: String,
 }
 
@@ -113,6 +114,10 @@ fn default_force_path_style() -> bool {
     true
 }
 
+fn default_log_level() -> String {
+    "deltaglider_proxy=debug,tower_http=debug".to_string()
+}
+
 impl Default for BackendConfig {
     fn default() -> Self {
         BackendConfig::Filesystem {
@@ -132,7 +137,7 @@ impl Default for Config {
             access_key_id: None,
             secret_access_key: None,
             admin_password_hash: None,
-            log_level: "deltaglider_proxy=debug,tower_http=debug".to_string(),
+            log_level: default_log_level(),
         }
     }
 }
