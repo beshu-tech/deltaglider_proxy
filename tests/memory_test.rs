@@ -21,7 +21,11 @@ const MB: u64 = 1024 * 1024;
 async fn get_peak_rss(client: &reqwest::Client, endpoint: &str) -> u64 {
     let url = format!("{}/health", endpoint);
     let resp = client.get(&url).send().await.expect("GET /health failed");
-    assert!(resp.status().is_success(), "GET /health returned {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "GET /health returned {}",
+        resp.status()
+    );
     let body: serde_json::Value = resp.json().await.expect("Failed to parse /health JSON");
     body["peak_rss_bytes"]
         .as_u64()
@@ -122,7 +126,12 @@ async fn complete_multipart_upload(
 async fn get_bytes(client: &reqwest::Client, endpoint: &str, bucket: &str, key: &str) -> Vec<u8> {
     let url = format!("{}/{}/{}", endpoint, bucket, key);
     let resp = client.get(&url).send().await.expect("GET failed");
-    assert!(resp.status().is_success(), "GET {} failed: {}", key, resp.status());
+    assert!(
+        resp.status().is_success(),
+        "GET {} failed: {}",
+        key,
+        resp.status()
+    );
     resp.bytes().await.unwrap().to_vec()
 }
 
@@ -195,7 +204,15 @@ async fn test_multipart_memory_bounded() {
         .enumerate()
         .map(|(i, etag)| ((i + 1) as u32, etag.as_str()))
         .collect();
-    let resp = complete_multipart_upload(&http, &endpoint, bucket, key, &upload_id, &parts_for_complete).await;
+    let resp = complete_multipart_upload(
+        &http,
+        &endpoint,
+        bucket,
+        key,
+        &upload_id,
+        &parts_for_complete,
+    )
+    .await;
     assert!(
         resp.status().is_success(),
         "CompleteMultipartUpload failed: {}",

@@ -25,18 +25,16 @@ fn io_to_storage_error(e: std::io::Error) -> StorageError {
 /// Returns `StorageError::NotFound` if the xattr is absent.
 pub async fn read_metadata(path: &Path) -> Result<FileMetadata, StorageError> {
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        match xattr::get(&path, XATTR_NAME) {
-            Ok(Some(data)) => {
-                let metadata: FileMetadata = serde_json::from_slice(&data)?;
-                Ok(metadata)
-            }
-            Ok(None) => Err(StorageError::NotFound(format!(
-                "No metadata xattr on {}",
-                path.display()
-            ))),
-            Err(e) => Err(io_to_storage_error(e)),
+    tokio::task::spawn_blocking(move || match xattr::get(&path, XATTR_NAME) {
+        Ok(Some(data)) => {
+            let metadata: FileMetadata = serde_json::from_slice(&data)?;
+            Ok(metadata)
         }
+        Ok(None) => Err(StorageError::NotFound(format!(
+            "No metadata xattr on {}",
+            path.display()
+        ))),
+        Err(e) => Err(io_to_storage_error(e)),
     })
     .await
     .map_err(|e| StorageError::Other(format!("spawn_blocking join failed: {}", e)))?
@@ -116,4 +114,3 @@ pub async fn validate_xattr_support(root: &Path) -> Result<(), StorageError> {
     .await
     .map_err(|e| StorageError::Other(format!("spawn_blocking join failed: {}", e)))?
 }
-

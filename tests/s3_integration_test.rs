@@ -725,7 +725,9 @@ async fn test_metadata_for_all_storage_types() {
         "Passthrough files should not have dg-ref-key"
     );
     assert!(
-        passthrough_headers.get("x-amz-meta-dg-delta-size").is_none(),
+        passthrough_headers
+            .get("x-amz-meta-dg-delta-size")
+            .is_none(),
         "Passthrough files should not have dg-delta-size"
     );
 }
@@ -1665,7 +1667,7 @@ async fn test_multi_bucket_create_and_list() {
 
     // ListBuckets and verify both appear
     let resp = http
-        .get(&format!("{}/", server.endpoint()))
+        .get(format!("{}/", server.endpoint()))
         .send()
         .await
         .expect("ListBuckets failed");
@@ -1775,7 +1777,7 @@ async fn test_multi_bucket_list_objects_isolation() {
 
     // ListObjectsV2 on bucket-a
     let resp_a = http
-        .get(&format!("{}/{}?list-type=2", server.endpoint(), bucket_a))
+        .get(format!("{}/{}?list-type=2", server.endpoint(), bucket_a))
         .send()
         .await
         .unwrap();
@@ -1793,7 +1795,7 @@ async fn test_multi_bucket_list_objects_isolation() {
 
     // ListObjectsV2 on bucket-b
     let resp_b = http
-        .get(&format!("{}/{}?list-type=2", server.endpoint(), bucket_b))
+        .get(format!("{}/{}?list-type=2", server.endpoint(), bucket_b))
         .send()
         .await
         .unwrap();
@@ -2113,10 +2115,7 @@ async fn test_list_objects_pagination() {
         &http,
         &server.endpoint(),
         server.bucket(),
-        &format!(
-            "prefix={}/&max-keys=2&continuation-token={}",
-            prefix, token
-        ),
+        &format!("prefix={}/&max-keys=2&continuation-token={}", prefix, token),
     )
     .await;
 
@@ -2156,8 +2155,7 @@ async fn test_first_file_bad_delta_ratio_passthrough() {
     // exceeds the threshold and triggers the passthrough fallback
     let endpoint = minio_endpoint().await;
     ensure_bucket(&endpoint).await;
-    let server =
-        TestServer::s3_with_endpoint_and_delta_ratio(&endpoint, TEST_BUCKET, 0.001).await;
+    let server = TestServer::s3_with_endpoint_and_delta_ratio(&endpoint, TEST_BUCKET, 0.001).await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
 

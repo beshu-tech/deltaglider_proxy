@@ -106,7 +106,11 @@ impl S3Backend {
     ///
     /// Many S3 providers (e.g. Hetzner, Ceph) return `AccessDenied` (403) instead
     /// of `NoSuchBucket` for non-existent buckets to prevent bucket enumeration.
-    fn classify_s3_error(bucket: &str, e: &SdkError<impl std::fmt::Debug>, context: &str) -> StorageError {
+    fn classify_s3_error(
+        bucket: &str,
+        e: &SdkError<impl std::fmt::Debug>,
+        context: &str,
+    ) -> StorageError {
         let debug_str = format!("{:?}", e);
         if debug_str.contains("NoSuchBucket") {
             return StorageError::BucketNotFound(bucket.to_string());
@@ -608,9 +612,10 @@ impl StorageBackend for S3Backend {
             request = request.metadata(k, v);
         }
 
-        request.send().await.map_err(|e| {
-            Self::classify_s3_error(bucket, &e, "copy_object (metadata update)")
-        })?;
+        request
+            .send()
+            .await
+            .map_err(|e| Self::classify_s3_error(bucket, &e, "copy_object (metadata update)"))?;
 
         debug!("Updated reference metadata for {}/{}", bucket, prefix);
         Ok(())
@@ -825,9 +830,7 @@ impl StorageBackend for S3Backend {
         } else {
             format!("{}/", prefix)
         };
-        let listed = self
-            .list_objects_full(bucket, &search_prefix)
-            .await?;
+        let listed = self.list_objects_full(bucket, &search_prefix).await?;
 
         // Filter to only files at this prefix level (not in subdirectories)
         let eligible: Vec<S3ListedObject> = listed
@@ -865,12 +868,11 @@ impl StorageBackend for S3Backend {
             })
             .collect();
 
-        let head_results: HashMap<String, FileMetadata> =
-            futures::future::join_all(head_futures)
-                .await
-                .into_iter()
-                .filter_map(|(key, result)| result.ok().map(|meta| (key, meta)))
-                .collect();
+        let head_results: HashMap<String, FileMetadata> = futures::future::join_all(head_futures)
+            .await
+            .into_iter()
+            .filter_map(|(key, result)| result.ok().map(|meta| (key, meta)))
+            .collect();
 
         let metadata_list: Vec<FileMetadata> = items
             .into_iter()
@@ -882,14 +884,9 @@ impl StorageBackend for S3Backend {
                     }
                 }
 
-                let filename = obj.key
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(&obj.key);
+                let filename = obj.key.rsplit('/').next().unwrap_or(&obj.key);
 
-                let original_name = filename
-                    .trim_end_matches(".delta")
-                    .to_string();
+                let original_name = filename.trim_end_matches(".delta").to_string();
 
                 let storage_info = if is_delta {
                     StorageInfo::Delta {
@@ -1002,11 +999,7 @@ impl StorageBackend for S3Backend {
         let mut continuation_token: Option<String> = None;
 
         loop {
-            let mut request = self
-                .client
-                .list_objects_v2()
-                .bucket(bucket)
-                .prefix(prefix);
+            let mut request = self.client.list_objects_v2().bucket(bucket).prefix(prefix);
 
             if let Some(token) = continuation_token {
                 request = request.continuation_token(token);
@@ -1113,12 +1106,11 @@ impl StorageBackend for S3Backend {
             })
             .collect();
 
-        let head_results: HashMap<String, FileMetadata> =
-            futures::future::join_all(head_futures)
-                .await
-                .into_iter()
-                .filter_map(|(key, result)| result.ok().map(|meta| (key, meta)))
-                .collect();
+        let head_results: HashMap<String, FileMetadata> = futures::future::join_all(head_futures)
+            .await
+            .into_iter()
+            .filter_map(|(key, result)| result.ok().map(|meta| (key, meta)))
+            .collect();
 
         // Build final results, using HEAD metadata for deltas when available
         for entry in classified {
@@ -1130,8 +1122,12 @@ impl StorageBackend for S3Backend {
                     let obj = &entry.listing_meta;
                     FileMetadata {
                         tool: DELTAGLIDER_TOOL.to_string(),
-                        original_name: entry.user_key.rsplit('/').next()
-                            .unwrap_or(&entry.user_key).to_string(),
+                        original_name: entry
+                            .user_key
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(&entry.user_key)
+                            .to_string(),
                         file_sha256: String::new(),
                         file_size: obj.size,
                         md5: obj.etag.clone().unwrap_or_default(),
@@ -1151,8 +1147,12 @@ impl StorageBackend for S3Backend {
                 let obj = &entry.listing_meta;
                 FileMetadata {
                     tool: DELTAGLIDER_TOOL.to_string(),
-                    original_name: entry.user_key.rsplit('/').next()
-                        .unwrap_or(&entry.user_key).to_string(),
+                    original_name: entry
+                        .user_key
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&entry.user_key)
+                        .to_string(),
                     file_sha256: String::new(),
                     file_size: obj.size,
                     md5: obj.etag.clone().unwrap_or_default(),
@@ -1283,10 +1283,7 @@ impl StorageBackend for S3Backend {
 
             // Directory marker
             if obj.key.ends_with('/') && obj.size == 0 {
-                dir_markers.push((
-                    obj.key.clone(),
-                    FileMetadata::directory_marker(&obj.key),
-                ));
+                dir_markers.push((obj.key.clone(), FileMetadata::directory_marker(&obj.key)));
                 continue;
             }
 
@@ -1329,12 +1326,11 @@ impl StorageBackend for S3Backend {
             })
             .collect();
 
-        let head_results: HashMap<String, FileMetadata> =
-            futures::future::join_all(head_futures)
-                .await
-                .into_iter()
-                .filter_map(|(key, result)| result.ok().map(|meta| (key, meta)))
-                .collect();
+        let head_results: HashMap<String, FileMetadata> = futures::future::join_all(head_futures)
+            .await
+            .into_iter()
+            .filter_map(|(key, result)| result.ok().map(|meta| (key, meta)))
+            .collect();
 
         // Build final objects list
         let mut objects: Vec<(String, FileMetadata)> = Vec::new();
@@ -1415,12 +1411,12 @@ impl StorageBackend for S3Backend {
 
         // Interleave and paginate (CommonPrefixes count toward max_keys)
         enum Entry {
-            Obj(String, FileMetadata),
+            Obj(String, Box<FileMetadata>),
             Prefix(String),
         }
         let mut entries: Vec<(String, Entry)> = Vec::new();
         for (key, meta) in objects {
-            entries.push((key.clone(), Entry::Obj(key, meta)));
+            entries.push((key.clone(), Entry::Obj(key, Box::new(meta))));
         }
         for cp in common_prefixes {
             entries.push((cp.clone(), Entry::Prefix(cp)));
@@ -1442,7 +1438,7 @@ impl StorageBackend for S3Backend {
         let mut final_prefixes = Vec::new();
         for (_, entry) in entries {
             match entry {
-                Entry::Obj(key, meta) => final_objects.push((key, meta)),
+                Entry::Obj(key, meta) => final_objects.push((key, *meta)),
                 Entry::Prefix(p) => final_prefixes.push(p),
             }
         }
@@ -1463,11 +1459,7 @@ impl StorageBackend for S3Backend {
         }))
     }
 
-    async fn put_directory_marker(
-        &self,
-        bucket: &str,
-        key: &str,
-    ) -> Result<(), StorageError> {
+    async fn put_directory_marker(&self, bucket: &str, key: &str) -> Result<(), StorageError> {
         self.client
             .put_object()
             .bucket(bucket)

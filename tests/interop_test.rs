@@ -225,10 +225,7 @@ impl TestProxyServer {
         let data_dir = TempDir::new().expect("Failed to create temp dir");
 
         let process = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"))
-            .env(
-                "DGP_LISTEN_ADDR",
-                format!("127.0.0.1:{}", port),
-            )
+            .env("DGP_LISTEN_ADDR", format!("127.0.0.1:{}", port))
             .env("DGP_S3_ENDPOINT", MINIO_ENDPOINT)
             .env("DGP_S3_REGION", "us-east-1")
             .env("DGP_S3_PATH_STYLE", "true")

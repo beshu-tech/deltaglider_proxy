@@ -152,7 +152,10 @@ async fn test_txt_file_stored_passthrough() {
     )
     .await;
 
-    assert_eq!(st, "passthrough", ".txt files should be stored as passthrough");
+    assert_eq!(
+        st, "passthrough",
+        ".txt files should be stored as passthrough"
+    );
 }
 
 #[tokio::test]
@@ -534,10 +537,7 @@ async fn test_list_objects_pagination() {
         &http,
         &server.endpoint(),
         server.bucket(),
-        &format!(
-            "prefix=page_test/&max-keys=2&continuation-token={}",
-            token
-        ),
+        &format!("prefix=page_test/&max-keys=2&continuation-token={}", token),
     )
     .await;
 

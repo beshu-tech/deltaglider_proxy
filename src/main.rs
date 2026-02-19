@@ -2,16 +2,16 @@
 
 mod demo;
 
+use arc_swap::ArcSwap;
 use axum::{extract::DefaultBodyLimit, middleware, routing::get, Router};
 use clap::Parser;
+use deltaglider_proxy::api::admin::AdminState;
 use deltaglider_proxy::api::auth::{sigv4_auth_middleware, AuthConfig};
 use deltaglider_proxy::api::handlers::{
     bucket_get_handler, create_bucket, delete_bucket, delete_object, delete_objects, get_object,
     get_stats, head_bucket, head_object, head_root, health_check, list_buckets, post_object,
     put_object_or_copy, AppState,
 };
-use arc_swap::ArcSwap;
-use deltaglider_proxy::api::admin::AdminState;
 use deltaglider_proxy::config::{BackendConfig, Config};
 use deltaglider_proxy::deltaglider::DynEngine;
 use deltaglider_proxy::multipart::MultipartStore;
@@ -24,7 +24,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, reload};
+use tracing_subscriber::{layer::SubscriberExt, reload, util::SubscriberInitExt};
 
 /// DeltaGlider Proxy - DeltaGlider compression for S3 storage
 #[derive(Parser, Debug)]
@@ -51,9 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing with reload support
     // Priority: RUST_LOG > DGP_LOG_LEVEL > --verbose > default
     let initial_filter = EnvFilter::try_from_default_env()
-        .or_else(|_| {
-            std::env::var("DGP_LOG_LEVEL").map(|v| EnvFilter::new(v))
-        })
+        .or_else(|_| std::env::var("DGP_LOG_LEVEL").map(EnvFilter::new))
         .unwrap_or_else(|_| {
             if cli.verbose {
                 EnvFilter::new("deltaglider_proxy=trace,tower_http=trace")

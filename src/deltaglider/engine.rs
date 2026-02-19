@@ -376,9 +376,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             );
             let cache_key = format!("{}/{}", bucket, deltaspace_id);
             self.cache.invalidate(&cache_key);
-            self.storage
-                .delete_reference(bucket, deltaspace_id)
-                .await?;
+            self.storage.delete_reference(bucket, deltaspace_id).await?;
             self.delete_delta_if_exists(bucket, deltaspace_id, &obj_key.filename)
                 .await?;
             return self
@@ -876,7 +874,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         if let Some(delim) = delimiter {
             // Collapse into interleaved entries (objects + CommonPrefixes sorted together)
-            enum Entry { Obj(String, FileMetadata), Prefix(String) }
+            enum Entry {
+                Obj(String, Box<FileMetadata>),
+                Prefix(String),
+            }
             let mut entries: Vec<(String, Entry)> = Vec::new();
             let mut seen_prefixes = std::collections::BTreeSet::new();
 
@@ -888,7 +889,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                         entries.push((cp.clone(), Entry::Prefix(cp)));
                     }
                 } else {
-                    entries.push((key.clone(), Entry::Obj(key, meta)));
+                    entries.push((key.clone(), Entry::Obj(key, Box::new(meta))));
                 }
             }
 
@@ -913,7 +914,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             let mut common_prefixes = Vec::new();
             for (_, entry) in entries {
                 match entry {
-                    Entry::Obj(key, meta) => objects.push((key, meta)),
+                    Entry::Obj(key, meta) => objects.push((key, *meta)),
                     Entry::Prefix(p) => common_prefixes.push(p),
                 }
             }

@@ -140,7 +140,10 @@ impl ListBucketResult {
             xml.push_str(&format!("  <Delimiter>{}</Delimiter>\n", escape_xml(delim)));
         }
         if let Some(ref enc) = self.encoding_type {
-            xml.push_str(&format!("  <EncodingType>{}</EncodingType>\n", escape_xml(enc)));
+            xml.push_str(&format!(
+                "  <EncodingType>{}</EncodingType>\n",
+                escape_xml(enc)
+            ));
         }
         xml.push_str(&format!("  <MaxKeys>{}</MaxKeys>\n", self.max_keys));
 

@@ -167,9 +167,7 @@ impl FilesystemBackend {
                 } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                     // Any data file (reference, delta, or passthrough with original name)
                     // indicates this directory is an active deltaspace.
-                    if name == "reference.bin"
-                        || name.ends_with(".delta")
-                        || !name.starts_with('.')
+                    if name == "reference.bin" || name.ends_with(".delta") || !name.starts_with('.')
                     {
                         has_deltaglider_files = true;
                     }
@@ -224,7 +222,10 @@ impl FilesystemBackend {
                 };
 
                 // Skip Reference storage info entries
-                if matches!(meta.storage_info, crate::types::StorageInfo::Reference { .. }) {
+                if matches!(
+                    meta.storage_info,
+                    crate::types::StorageInfo::Reference { .. }
+                ) {
                     continue;
                 }
 
@@ -603,9 +604,7 @@ impl StorageBackend for FilesystemBackend {
         // This avoids allocating a contiguous buffer for the entire object.
         let parent = data_path
             .parent()
-            .ok_or_else(|| {
-                StorageError::Other("Cannot write to a path with no parent".into())
-            })?
+            .ok_or_else(|| StorageError::Other("Cannot write to a path with no parent".into()))?
             .to_path_buf();
         let target = data_path.clone();
         let chunks: Vec<Bytes> = chunks.to_vec();
@@ -683,9 +682,8 @@ impl StorageBackend for FilesystemBackend {
 
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 // Match data files: reference.bin, *.delta, or passthrough files (any other file)
-                let is_data_file = name == "reference.bin"
-                    || name.ends_with(".delta")
-                    || !name.starts_with('.');  // passthrough files have original names
+                let is_data_file =
+                    name == "reference.bin" || name.ends_with(".delta") || !name.starts_with('.'); // passthrough files have original names
 
                 if is_data_file {
                     match xattr_meta::read_metadata(&path).await {

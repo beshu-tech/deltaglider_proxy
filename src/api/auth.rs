@@ -46,6 +46,7 @@ struct SigV4Params {
 
 impl SigV4Params {
     /// Extract SigV4 parameters from the Authorization header path.
+    #[allow(clippy::result_large_err)]
     fn from_headers(request: &Request<Body>) -> Result<Self, Response> {
         let auth_header = match request.headers().get("authorization") {
             Some(v) => match v.to_str() {
@@ -99,6 +100,7 @@ impl SigV4Params {
     }
 
     /// Extract SigV4 parameters from presigned URL query params.
+    #[allow(clippy::result_large_err)]
     fn from_query(request: &Request<Body>) -> Result<Self, Response> {
         let query_string = request.uri().query().unwrap_or("");
 
@@ -142,14 +144,12 @@ impl SigV4Params {
                     .into_response()
             })?;
 
-            let request_time =
-                chrono::NaiveDateTime::parse_from_str(&amz_date, "%Y%m%dT%H%M%SZ").map_err(
-                    |_| {
-                        warn!("SigV4 presigned: unparseable X-Amz-Date: {:?}", amz_date);
-                        S3Error::InvalidArgument(format!("Invalid X-Amz-Date: {}", amz_date))
-                            .into_response()
-                    },
-                )?;
+            let request_time = chrono::NaiveDateTime::parse_from_str(&amz_date, "%Y%m%dT%H%M%SZ")
+                .map_err(|_| {
+                warn!("SigV4 presigned: unparseable X-Amz-Date: {:?}", amz_date);
+                S3Error::InvalidArgument(format!("Invalid X-Amz-Date: {}", amz_date))
+                    .into_response()
+            })?;
 
             let request_utc = request_time.and_utc();
             let now = chrono::Utc::now();
@@ -176,6 +176,7 @@ impl SigV4Params {
 }
 
 /// Verify the SigV4 signature against the reconstructed canonical request.
+#[allow(clippy::result_large_err)]
 fn verify_signature(
     params: &SigV4Params,
     auth: &AuthConfig,
@@ -263,13 +264,10 @@ fn verify_signature(
 /// Check whether the query string contains presigned URL parameters.
 /// Uses proper key-level parsing instead of substring matching.
 fn has_presigned_query_params(query: &str) -> bool {
-    query
-        .split('&')
-        .filter(|s| !s.is_empty())
-        .any(|pair| {
-            let key = pair.split_once('=').map(|(k, _)| k).unwrap_or(pair);
-            percent_decode(key) == "X-Amz-Algorithm"
-        })
+    query.split('&').filter(|s| !s.is_empty()).any(|pair| {
+        let key = pair.split_once('=').map(|(k, _)| k).unwrap_or(pair);
+        percent_decode(key) == "X-Amz-Algorithm"
+    })
 }
 
 /// Axum middleware that verifies SigV4 signatures when auth is configured.

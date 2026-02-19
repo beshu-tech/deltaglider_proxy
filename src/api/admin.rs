@@ -116,7 +116,12 @@ pub async fn login(
     let valid = bcrypt::verify(&body.password, &hash).unwrap_or(false);
 
     if !valid {
-        return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(LoginResponse { ok: false })).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            HeaderMap::new(),
+            Json(LoginResponse { ok: false }),
+        )
+            .into_response();
     }
 
     let token = state.sessions.create_session();
@@ -133,10 +138,7 @@ pub async fn login(
 }
 
 /// POST /api/admin/logout — clear session.
-pub async fn logout(
-    State(state): State<Arc<AdminState>>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+pub async fn logout(State(state): State<Arc<AdminState>>, headers: HeaderMap) -> impl IntoResponse {
     if let Some(token) = extract_session_token(&headers) {
         state.sessions.remove(&token);
     }
@@ -145,7 +147,11 @@ pub async fn logout(
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert(header::SET_COOKIE, cookie.parse().unwrap());
 
-    (StatusCode::OK, resp_headers, Json(LoginResponse { ok: true }))
+    (
+        StatusCode::OK,
+        resp_headers,
+        Json(LoginResponse { ok: true }),
+    )
 }
 
 /// GET /api/admin/session — check if current session is valid.
@@ -161,31 +167,40 @@ pub async fn check_session(
 }
 
 /// GET /api/admin/config — return sanitized config (no secrets).
-pub async fn get_config(
-    State(state): State<Arc<AdminState>>,
-) -> impl IntoResponse {
+pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
     let cfg = state.config.read().await;
 
-    let (backend_type, backend_path, backend_endpoint, backend_region, backend_force_path_style, backend_has_credentials) =
-        match &cfg.backend {
-            crate::config::BackendConfig::Filesystem { path } => {
-                ("filesystem", Some(path.display().to_string()), None, None, None, false)
-            }
-            crate::config::BackendConfig::S3 {
-                endpoint,
-                region,
-                force_path_style,
-                access_key_id,
-                ..
-            } => (
-                "s3",
-                None,
-                endpoint.clone(),
-                Some(region.clone()),
-                Some(*force_path_style),
-                access_key_id.is_some(),
-            ),
-        };
+    let (
+        backend_type,
+        backend_path,
+        backend_endpoint,
+        backend_region,
+        backend_force_path_style,
+        backend_has_credentials,
+    ) = match &cfg.backend {
+        crate::config::BackendConfig::Filesystem { path } => (
+            "filesystem",
+            Some(path.display().to_string()),
+            None,
+            None,
+            None,
+            false,
+        ),
+        crate::config::BackendConfig::S3 {
+            endpoint,
+            region,
+            force_path_style,
+            access_key_id,
+            ..
+        } => (
+            "s3",
+            None,
+            endpoint.clone(),
+            Some(region.clone()),
+            Some(*force_path_style),
+            access_key_id.is_some(),
+        ),
+    };
 
     // Read the current log filter from the reload handle
     let log_level = state
@@ -229,10 +244,18 @@ pub async fn update_config(
         cfg.max_object_size = size;
     }
     if let Some(ref key) = body.access_key_id {
-        cfg.access_key_id = if key.is_empty() { None } else { Some(key.clone()) };
+        cfg.access_key_id = if key.is_empty() {
+            None
+        } else {
+            Some(key.clone())
+        };
     }
     if let Some(ref secret) = body.secret_access_key {
-        cfg.secret_access_key = if secret.is_empty() { None } else { Some(secret.clone()) };
+        cfg.secret_access_key = if secret.is_empty() {
+            None
+        } else {
+            Some(secret.clone())
+        };
     }
 
     // Hot-reloadable: log level
@@ -261,8 +284,14 @@ pub async fn update_config(
     let type_changed = requested_type != current_backend_type;
 
     // Check if any backend field changed
-    let be_key_changed = body.backend_access_key_id.as_ref().map_or(false, |k| !k.is_empty());
-    let be_secret_changed = body.backend_secret_access_key.as_ref().map_or(false, |s| !s.is_empty());
+    let be_key_changed = body
+        .backend_access_key_id
+        .as_ref()
+        .is_some_and(|k| !k.is_empty());
+    let be_secret_changed = body
+        .backend_secret_access_key
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
     let backend_fields_changed = type_changed
         || body.backend_endpoint.is_some()
         || body.backend_region.is_some()
@@ -278,7 +307,10 @@ pub async fn update_config(
             // Construct a new BackendConfig variant
             match requested_type {
                 "filesystem" => {
-                    let path = body.backend_path.clone().unwrap_or_else(|| "./data".to_string());
+                    let path = body
+                        .backend_path
+                        .clone()
+                        .unwrap_or_else(|| "./data".to_string());
                     cfg.backend = crate::config::BackendConfig::Filesystem {
                         path: std::path::PathBuf::from(path),
                     };
@@ -291,10 +323,16 @@ pub async fn update_config(
                 "s3" => {
                     cfg.backend = crate::config::BackendConfig::S3 {
                         endpoint: body.backend_endpoint.clone(),
-                        region: body.backend_region.clone().unwrap_or_else(|| "us-east-1".to_string()),
+                        region: body
+                            .backend_region
+                            .clone()
+                            .unwrap_or_else(|| "us-east-1".to_string()),
                         force_path_style: body.backend_force_path_style.unwrap_or(true),
                         access_key_id: body.backend_access_key_id.clone().filter(|k| !k.is_empty()),
-                        secret_access_key: body.backend_secret_access_key.clone().filter(|s| !s.is_empty()),
+                        secret_access_key: body
+                            .backend_secret_access_key
+                            .clone()
+                            .filter(|s| !s.is_empty()),
                     };
                     need_engine_swap = true;
                     warnings.push(
@@ -303,7 +341,10 @@ pub async fn update_config(
                     );
                 }
                 other => {
-                    warnings.push(format!("Unknown backend type: '{}'. Must be 'filesystem' or 's3'.", other));
+                    warnings.push(format!(
+                        "Unknown backend type: '{}'. Must be 'filesystem' or 's3'.",
+                        other
+                    ));
                 }
             }
         } else {
@@ -323,7 +364,11 @@ pub async fn update_config(
                     ref mut secret_access_key,
                 } => {
                     if let Some(ref ep) = body.backend_endpoint {
-                        *endpoint = if ep.is_empty() { None } else { Some(ep.clone()) };
+                        *endpoint = if ep.is_empty() {
+                            None
+                        } else {
+                            Some(ep.clone())
+                        };
                         need_engine_swap = true;
                     }
                     if let Some(ref r) = body.backend_region {
@@ -372,7 +417,10 @@ pub async fn update_config(
             if cfg.listen_addr != parsed {
                 cfg.listen_addr = parsed;
                 requires_restart = true;
-                warnings.push(format!("listen_addr changed to {} — restart required", addr));
+                warnings.push(format!(
+                    "listen_addr changed to {} — restart required",
+                    addr
+                ));
             }
         } else {
             warnings.push(format!("Invalid listen_addr: {}", addr));
@@ -382,7 +430,10 @@ pub async fn update_config(
         if cfg.cache_size_mb != cache {
             cfg.cache_size_mb = cache;
             requires_restart = true;
-            warnings.push(format!("cache_size_mb changed to {} — restart required", cache));
+            warnings.push(format!(
+                "cache_size_mb changed to {} — restart required",
+                cache
+            ));
         }
     }
 
@@ -413,7 +464,8 @@ pub async fn change_password(
                 ok: false,
                 error: Some("Current password is incorrect".to_string()),
             }),
-        ).into_response();
+        )
+            .into_response();
     }
 
     let new_hash = match bcrypt::hash(&body.new_password, bcrypt::DEFAULT_COST) {
@@ -425,7 +477,8 @@ pub async fn change_password(
                     ok: false,
                     error: Some(format!("Hashing failed: {}", e)),
                 }),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
@@ -444,7 +497,14 @@ pub async fn change_password(
         cfg.admin_password_hash = Some(new_hash);
     }
 
-    (StatusCode::OK, Json(PasswordChangeResponse { ok: true, error: None })).into_response()
+    (
+        StatusCode::OK,
+        Json(PasswordChangeResponse {
+            ok: true,
+            error: None,
+        }),
+    )
+        .into_response()
 }
 
 // === Test S3 Connection ===
@@ -495,10 +555,22 @@ pub async fn test_s3_connection(
     };
 
     let merged_endpoint = body.endpoint.clone().or(saved_endpoint);
-    let merged_region = body.region.clone().or(saved_region).unwrap_or_else(|| "us-east-1".to_string());
+    let merged_region = body
+        .region
+        .clone()
+        .or(saved_region)
+        .unwrap_or_else(|| "us-east-1".to_string());
     let merged_fps = body.force_path_style.or(saved_fps).unwrap_or(true);
-    let merged_key = body.access_key_id.clone().filter(|k| !k.is_empty()).or(saved_key);
-    let merged_secret = body.secret_access_key.clone().filter(|s| !s.is_empty()).or(saved_secret);
+    let merged_key = body
+        .access_key_id
+        .clone()
+        .filter(|k| !k.is_empty())
+        .or(saved_key);
+    let merged_secret = body
+        .secret_access_key
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or(saved_secret);
 
     // Drop the config lock before doing I/O
     drop(cfg);
@@ -590,7 +662,11 @@ pub async fn require_session(
         .unwrap_or(false);
 
     if !valid {
-        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "unauthorized"}))).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "unauthorized"})),
+        )
+            .into_response();
     }
 
     next.run(request).await.into_response()
@@ -605,10 +681,7 @@ fn extract_session_token(headers: &HeaderMap) -> Option<String> {
         .split(';')
         .find_map(|part| {
             let part = part.trim();
-            if let Some(value) = part.strip_prefix("dgp_session=") {
-                Some(value.to_string())
-            } else {
-                None
-            }
+            part.strip_prefix("dgp_session=")
+                .map(|value| value.to_string())
         })
 }

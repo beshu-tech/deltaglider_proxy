@@ -222,11 +222,7 @@ pub trait StorageBackend: Send + Sync {
     /// Store a zero-byte S3 directory marker (key ending with '/').
     /// Used by Cyberduck, AWS Console, etc. to create "folders".
     /// Default: no-op (directories are implicit in S3).
-    async fn put_directory_marker(
-        &self,
-        _bucket: &str,
-        _key: &str,
-    ) -> Result<(), StorageError> {
+    async fn put_directory_marker(&self, _bucket: &str, _key: &str) -> Result<(), StorageError> {
         Ok(())
     }
 
@@ -404,7 +400,9 @@ macro_rules! impl_storage_backend_for_box {
                 prefix: &str,
                 filename: &str,
             ) -> Result<FileMetadata, StorageError> {
-                (**self).get_passthrough_metadata(bucket, prefix, filename).await
+                (**self)
+                    .get_passthrough_metadata(bucket, prefix, filename)
+                    .await
             }
             async fn delete_passthrough(
                 &self,
@@ -421,7 +419,9 @@ macro_rules! impl_storage_backend_for_box {
                 prefix: &str,
                 filename: &str,
             ) -> Result<BoxStream<'static, Result<Bytes, StorageError>>, StorageError> {
-                (**self).get_passthrough_stream(bucket, prefix, filename).await
+                (**self)
+                    .get_passthrough_stream(bucket, prefix, filename)
+                    .await
             }
 
             async fn put_passthrough_chunked(
@@ -479,7 +479,9 @@ macro_rules! impl_storage_backend_for_box {
                 max_keys: u32,
                 continuation_token: Option<&str>,
             ) -> Result<Option<DelegatedListResult>, StorageError> {
-                (**self).list_objects_delegated(bucket, prefix, delimiter, max_keys, continuation_token).await
+                (**self)
+                    .list_objects_delegated(bucket, prefix, delimiter, max_keys, continuation_token)
+                    .await
             }
         }
     };

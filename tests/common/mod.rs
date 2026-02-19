@@ -140,11 +140,7 @@ impl TestServer {
     /// Create the test bucket via the S3 API (replaces the removed DGP_BUCKET auto-create)
     async fn ensure_bucket(&self) {
         let client = self.s3_client().await;
-        let _ = client
-            .create_bucket()
-            .bucket(&self.bucket)
-            .send()
-            .await;
+        let _ = client.create_bucket().bucket(&self.bucket).send().await;
     }
 
     /// Create an S3 client configured for this test server
@@ -262,15 +258,9 @@ impl TestServer {
         let data_dir = TempDir::new().expect("Failed to create temp dir");
 
         let process = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"))
-            .env(
-                "DGP_LISTEN_ADDR",
-                format!("127.0.0.1:{}", port),
-            )
+            .env("DGP_LISTEN_ADDR", format!("127.0.0.1:{}", port))
             .env("DGP_DATA_DIR", data_dir.path())
-            .env(
-                "DGP_MAX_OBJECT_SIZE",
-                max_size.to_string(),
-            )
+            .env("DGP_MAX_OBJECT_SIZE", max_size.to_string())
             .env("RUST_LOG", "deltaglider_proxy=warn")
             .spawn()
             .expect("Failed to start server");

@@ -2,7 +2,6 @@ import { useState, useEffect, useRef } from 'react';
 import { Layout, Button, Space, Typography, Input, Drawer, theme, message, Popconfirm, Tooltip } from 'antd';
 import type { InputRef } from 'antd';
 import {
-  FolderOutlined,
   SettingOutlined,
   FileTextOutlined,
   PlusOutlined,
@@ -143,58 +142,63 @@ export default function Sidebar({
 
         <ul style={{ listStyle: 'none', margin: 0, padding: 0 }}>
           {buckets.map((b) => (
-            <li key={b.name}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <button
-                  className="btn-reset"
-                  onClick={() => handleSelectBucket(b.name)}
-                  aria-current={b.name === activeBucket ? 'true' : undefined}
-                  style={{
-                    flex: 1,
-                    padding: '8px 12px',
-                    borderRadius: 8,
-                    marginBottom: 2,
-                    gap: 10,
-                    background: b.name === activeBucket ? `rgba(45, 212, 191, 0.1)` : 'transparent',
-                    color: b.name === activeBucket ? ACCENT_BLUE_LIGHT : TEXT_SECONDARY,
-                    transition: 'all 0.15s ease',
-                    borderLeft: b.name === activeBucket ? `2px solid ${ACCENT_BLUE}` : '2px solid transparent',
-                  }}
-                  onMouseEnter={(e) => {
-                    if (b.name !== activeBucket) e.currentTarget.style.background = 'var(--surface-hover)';
-                  }}
-                  onMouseLeave={(e) => {
-                    if (b.name !== activeBucket) e.currentTarget.style.background = 'transparent';
-                  }}
+            <li key={b.name} style={{ display: 'flex', alignItems: 'center', minWidth: 0 }}>
+              <button
+                className="btn-reset"
+                onClick={() => handleSelectBucket(b.name)}
+                aria-current={b.name === activeBucket ? 'true' : undefined}
+                style={{
+                  flex: 1,
+                  minWidth: 0,
+                  padding: '6px 8px',
+                  borderRadius: 6,
+                  marginBottom: 1,
+                  background: b.name === activeBucket ? `rgba(45, 212, 191, 0.1)` : 'transparent',
+                  color: b.name === activeBucket ? ACCENT_BLUE_LIGHT : TEXT_SECONDARY,
+                  transition: 'all 0.15s ease',
+                  borderLeft: b.name === activeBucket ? `2px solid ${ACCENT_BLUE}` : '2px solid transparent',
+                }}
+                onMouseEnter={(e) => {
+                  if (b.name !== activeBucket) e.currentTarget.style.background = 'var(--surface-hover)';
+                }}
+                onMouseLeave={(e) => {
+                  if (b.name !== activeBucket) e.currentTarget.style.background = 'transparent';
+                }}
+              >
+                <span style={{
+                  fontFamily: "var(--font-mono)",
+                  fontSize: 12,
+                  fontWeight: b.name === activeBucket ? 600 : 400,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                  display: 'block',
+                }}>
+                  {b.name}
+                </span>
+              </button>
+              {b.name !== activeBucket && (
+                <Popconfirm
+                  title={`Delete bucket "${b.name}"?`}
+                  description="Bucket must be empty."
+                  onConfirm={(e) => { e?.stopPropagation(); handleDeleteBucket(b.name); }}
+                  onCancel={(e) => e?.stopPropagation()}
+                  okText="Delete"
+                  okType="danger"
                 >
-                  <FolderOutlined aria-hidden="true" style={{ fontSize: 14 }} />
-                  <span style={{ fontFamily: "var(--font-mono)", fontSize: 13, fontWeight: b.name === activeBucket ? 600 : 400 }}>
-                    {b.name}
-                  </span>
-                </button>
-                {b.name !== activeBucket && (
-                  <Popconfirm
-                    title={`Delete bucket "${b.name}"?`}
-                    description="Bucket must be empty."
-                    onConfirm={(e) => { e?.stopPropagation(); handleDeleteBucket(b.name); }}
-                    onCancel={(e) => e?.stopPropagation()}
-                    okText="Delete"
-                    okType="danger"
-                  >
-                    <Button
-                      type="text"
-                      size="small"
-                      danger
-                      icon={<DeleteOutlined />}
-                      aria-label={`Delete bucket ${b.name}`}
-                      onClick={(e) => e.stopPropagation()}
-                      style={{ opacity: 0.4, fontSize: 11, transition: 'opacity 0.15s' }}
-                      onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.opacity = '1'; }}
-                      onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.opacity = '0.4'; }}
-                    />
-                  </Popconfirm>
-                )}
-              </div>
+                  <Button
+                    type="text"
+                    size="small"
+                    danger
+                    icon={<DeleteOutlined />}
+                    aria-label={`Delete bucket ${b.name}`}
+                    onClick={(e) => e.stopPropagation()}
+                    style={{ opacity: 0.4, fontSize: 11, flexShrink: 0, transition: 'opacity 0.15s' }}
+                    onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.opacity = '1'; }}
+                    onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.opacity = '0.4'; }}
+                  />
+                </Popconfirm>
+              )}
             </li>
           ))}
         </ul>

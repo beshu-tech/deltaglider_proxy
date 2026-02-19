@@ -28,7 +28,10 @@ pub async fn serve(s3_port: u16, admin_state: Arc<AdminState>) {
     // Admin API routes that require authentication
     let protected = Router::new()
         .route("/api/admin/logout", post(admin::logout))
-        .route("/api/admin/config", get(admin::get_config).put(admin::update_config))
+        .route(
+            "/api/admin/config",
+            get(admin::get_config).put(admin::update_config),
+        )
         .route("/api/admin/password", put(admin::change_password))
         .route("/api/admin/session", get(admin::check_session))
         .route("/api/admin/test-s3", post(admin::test_s3_connection))

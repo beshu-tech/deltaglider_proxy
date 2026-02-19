@@ -157,13 +157,10 @@ impl Config {
         }
 
         // Check for S3 backend configuration
-        if std::env::var("DGP_S3_ENDPOINT").is_ok()
-            || std::env::var("DGP_S3_REGION").is_ok()
-        {
+        if std::env::var("DGP_S3_ENDPOINT").is_ok() || std::env::var("DGP_S3_REGION").is_ok() {
             config.backend = BackendConfig::S3 {
                 endpoint: std::env::var("DGP_S3_ENDPOINT").ok(),
-                region: std::env::var("DGP_S3_REGION")
-                    .unwrap_or_else(|_| "us-east-1".to_string()),
+                region: std::env::var("DGP_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
                 force_path_style: std::env::var("DGP_S3_PATH_STYLE")
                     .map(|v| v == "true" || v == "1")
                     .unwrap_or(true),
@@ -275,12 +272,15 @@ impl Config {
             })
             .collect();
 
-        let hash = bcrypt::hash(&password, bcrypt::DEFAULT_COST)
-            .expect("bcrypt hashing failed");
+        let hash = bcrypt::hash(&password, bcrypt::DEFAULT_COST).expect("bcrypt hashing failed");
 
         // Persist the hash
         if let Err(e) = std::fs::write(state_file, &hash) {
-            eprintln!("Warning: could not persist admin hash to {}: {}", state_file.display(), e);
+            eprintln!(
+                "Warning: could not persist admin hash to {}: {}",
+                state_file.display(),
+                e
+            );
         }
 
         // Print prominently to stderr

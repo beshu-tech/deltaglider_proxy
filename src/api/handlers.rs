@@ -8,10 +8,10 @@ use super::xml::{
     DeleteError, DeleteRequest, DeleteResult, DeletedObject, InitiateMultipartUploadResult,
     ListBucketResult, ListBucketsResult, ListMultipartUploadsResult, ListPartsResult, S3Object,
 };
-use arc_swap::ArcSwap;
 use crate::deltaglider::{DynEngine, RetrieveResponse};
 use crate::multipart::MultipartStore;
 use crate::types::{FileMetadata, StorageInfo};
+use arc_swap::ArcSwap;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -97,7 +97,8 @@ async fn put_object_inner(
     let user_metadata = extract_user_metadata(headers);
 
     let result = state
-        .engine.load()
+        .engine
+        .load()
         .store(bucket, key, body, content_type, user_metadata)
         .await?;
 
@@ -344,7 +345,8 @@ pub async fn bucket_get_handler(
     // a single atomic operation (they're coupled: CommonPrefixes count toward
     // max-keys and must be deduplicated across pages).
     let page = state
-        .engine.load()
+        .engine
+        .load()
         .list_objects(
             &bucket,
             &prefix,
@@ -593,11 +595,16 @@ async fn copy_object_inner(
     }
 
     // Retrieve source object
-    let (data, source_meta) = state.engine.load().retrieve(source_bucket, source_key).await?;
+    let (data, source_meta) = state
+        .engine
+        .load()
+        .retrieve(source_bucket, source_key)
+        .await?;
 
     // Store as new object, preserving user metadata from source
     let result = state
-        .engine.load()
+        .engine
+        .load()
         .store(
             bucket,
             key,
@@ -735,7 +742,9 @@ fn initiate_multipart_upload(
         .map(|s| s.to_string());
 
     let user_metadata = extract_user_metadata(headers);
-    let upload_id = state.multipart.create(bucket, key, content_type, user_metadata);
+    let upload_id = state
+        .multipart
+        .create(bucket, key, content_type, user_metadata);
 
     let xml = InitiateMultipartUploadResult {
         bucket: bucket.to_string(),
@@ -754,7 +763,10 @@ async fn complete_multipart_upload(
     upload_id: &str,
     body: Bytes,
 ) -> Result<Response, S3Error> {
-    info!("CompleteMultipartUpload {}/{} uploadId={}", bucket, key, upload_id);
+    info!(
+        "CompleteMultipartUpload {}/{} uploadId={}",
+        bucket, key, upload_id
+    );
 
     let body_str = String::from_utf8(body.to_vec()).map_err(|_| S3Error::MalformedXML)?;
     let complete_req = CompleteMultipartUploadRequest::from_xml(&body_str).map_err(|e| {
@@ -776,8 +788,16 @@ async fn complete_multipart_upload(
             .complete_parts(upload_id, bucket, key, &requested_parts)?;
         let etag = completed.etag.clone();
         let result = state
-            .engine.load()
-            .store_passthrough_chunked(bucket, key, &completed.parts, completed.total_size, completed.content_type, completed.user_metadata)
+            .engine
+            .load()
+            .store_passthrough_chunked(
+                bucket,
+                key,
+                &completed.parts,
+                completed.total_size,
+                completed.content_type,
+                completed.user_metadata,
+            )
             .await?;
         (etag, result)
     } else {
@@ -786,8 +806,15 @@ async fn complete_multipart_upload(
             .complete(upload_id, bucket, key, &requested_parts)?;
         let etag = completed.etag.clone();
         let result = state
-            .engine.load()
-            .store(bucket, key, &completed.data, completed.content_type, completed.user_metadata)
+            .engine
+            .load()
+            .store(
+                bucket,
+                key,
+                &completed.data,
+                completed.content_type,
+                completed.user_metadata,
+            )
             .await?;
         (etag, result)
     };
@@ -796,7 +823,9 @@ async fn complete_multipart_upload(
 
     debug!(
         "CompleteMultipartUpload {}/{} stored as {}",
-        bucket, key, store_result.metadata.storage_info.label(),
+        bucket,
+        key,
+        store_result.metadata.storage_info.label(),
     );
 
     let xml = CompleteMultipartUploadResult {
@@ -810,7 +839,10 @@ async fn complete_multipart_upload(
         StatusCode::OK,
         [
             ("Content-Type", "application/xml"),
-            ("x-amz-storage-type", store_result.metadata.storage_info.label()),
+            (
+                "x-amz-storage-type",
+                store_result.metadata.storage_info.label(),
+            ),
         ],
         xml,
     )
@@ -852,7 +884,11 @@ pub async fn delete_bucket(
     info!("DELETE bucket {}", bucket);
 
     // Check if bucket is empty (S3 requires buckets to be empty before deletion)
-    let page = state.engine.load().list_objects(&bucket, "", None, 1, None).await?;
+    let page = state
+        .engine
+        .load()
+        .list_objects(&bucket, "", None, 1, None)
+        .await?;
     if !page.objects.is_empty() {
         return Err(S3Error::BucketNotEmpty(bucket.to_string()));
     }
@@ -946,7 +982,8 @@ pub async fn get_stats(
 
     for bucket in &buckets_to_scan {
         let page = state
-            .engine.load()
+            .engine
+            .load()
             .list_objects(bucket, "", None, u32::MAX, None)
             .await?;
         for (_key, meta) in &page.objects {
