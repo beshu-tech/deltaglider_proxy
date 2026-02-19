@@ -1,12 +1,33 @@
-node_modules/
+# Rust
 /target
-.vscode
-data/
+
+# Node
+node_modules/
 dist/
 
-# Playwright MCP
-.playwright-mcp/
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 
-# Screenshots and demo images
+# Runtime data
+data/
+
+# Config (contains secrets/credentials)
+deltaglider_proxy.toml
+.deltaglider_admin_hash
+
+# Debugging screenshots & logs
 *.png
 !docs/*.png
+.playwright-mcp/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*

@@ -1,8 +1,39 @@
+# Rust build (rebuilt inside container)
 target/
+
+# Node (rebuilt inside container)
 node_modules/
-data/
 dist/
+
+# Git & IDE
 .git/
+.github/
 .vscode/
+.idea/
+.cargo/
+
+# Runtime data & secrets
+data/
+deltaglider_proxy.toml
+.deltaglider_admin_hash
+.env
+.env.*
+
+# Debugging artifacts
 .playwright-mcp/
 *.png
+!docs/*.png
+
+# Docs (not needed in image)
+docs/
+*.md
+!README.md
+LICENSE
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tests (not needed in image)
+tests/
+docker-compose.yml
