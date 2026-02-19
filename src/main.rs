@@ -80,8 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("Error: password must not be empty");
             std::process::exit(1);
         }
-        let hash =
-            bcrypt::hash(password, bcrypt::DEFAULT_COST).expect("bcrypt hashing failed");
+        let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST).expect("bcrypt hashing failed");
         let state_file = ".deltaglider_admin_hash";
         std::fs::write(state_file, &hash).expect("Failed to write admin hash file");
         eprintln!("Admin password hash written to {state_file}");
