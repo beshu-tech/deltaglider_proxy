@@ -162,16 +162,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let multipart = Arc::new(MultipartStore::new(config.max_object_size));
 
     // Spawn periodic cleanup task for expired multipart uploads
-    {
+    spawn_periodic(Duration::from_secs(300), {
         let mp = multipart.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(300));
-            loop {
-                interval.tick().await;
-                mp.cleanup_expired(Duration::from_secs(3600));
-            }
-        });
-    }
+        move || mp.cleanup_expired(Duration::from_secs(3600))
+    });
 
     let state = Arc::new(AppState {
         engine: ArcSwap::from_pointee(engine),
@@ -250,16 +244,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session_store = Arc::new(SessionStore::new());
 
     // Spawn periodic cleanup for expired admin sessions (every 5 minutes)
-    {
+    spawn_periodic(Duration::from_secs(300), {
         let sessions = session_store.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(300));
-            loop {
-                interval.tick().await;
-                sessions.cleanup_expired();
-            }
-        });
-    }
+        move || sessions.cleanup_expired()
+    });
 
     let shared_config = config.clone().into_shared();
 
@@ -319,6 +307,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Server shutdown complete");
     Ok(())
+}
+
+/// Spawn a background task that runs `f` every `interval`.
+fn spawn_periodic(interval: Duration, f: impl Fn() + Send + 'static) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        loop {
+            tick.tick().await;
+            f();
+        }
+    });
 }
 
 /// Handle shutdown signals (SIGINT, SIGTERM)
