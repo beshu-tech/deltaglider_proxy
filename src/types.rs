@@ -11,6 +11,9 @@ pub const DELTAGLIDER_TOOL: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CA
 /// S3 metadata key names (stored as `x-amz-meta-{KEY}` in S3 headers).
 /// Used in both storage/s3.rs (metadata_to_headers/headers_to_metadata)
 /// and api/handlers.rs (build_metadata_headers).
+///
+/// The `H_*` constants are the full HTTP header names, derived from the bare
+/// keys via `concat!` so they can never desync.
 pub mod meta_keys {
     pub const TOOL: &str = "dg-tool";
     pub const ORIGINAL_NAME: &str = "dg-original-name";
@@ -28,17 +31,17 @@ pub mod meta_keys {
     /// S3 response header prefix for user-defined metadata.
     pub const AMZ_META_PREFIX: &str = "x-amz-meta-";
 
-    // Full x-amz-meta-dg-* header names for HTTP response headers.
-    pub const H_TOOL: &str = "x-amz-meta-dg-tool";
-    pub const H_ORIGINAL_NAME: &str = "x-amz-meta-dg-original-name";
-    pub const H_FILE_SHA256: &str = "x-amz-meta-dg-file-sha256";
-    pub const H_FILE_SIZE: &str = "x-amz-meta-dg-file-size";
-    pub const H_NOTE: &str = "x-amz-meta-dg-note";
-    pub const H_SOURCE_NAME: &str = "x-amz-meta-dg-source-name";
-    pub const H_REF_KEY: &str = "x-amz-meta-dg-ref-key";
-    pub const H_REF_SHA256: &str = "x-amz-meta-dg-ref-sha256";
-    pub const H_DELTA_SIZE: &str = "x-amz-meta-dg-delta-size";
-    pub const H_DELTA_CMD: &str = "x-amz-meta-dg-delta-cmd";
+    // Full x-amz-meta-dg-* header names — derived from bare keys to prevent desync.
+    pub const H_TOOL: &str = concat!("x-amz-meta-", "dg-tool");
+    pub const H_ORIGINAL_NAME: &str = concat!("x-amz-meta-", "dg-original-name");
+    pub const H_FILE_SHA256: &str = concat!("x-amz-meta-", "dg-file-sha256");
+    pub const H_FILE_SIZE: &str = concat!("x-amz-meta-", "dg-file-size");
+    pub const H_NOTE: &str = concat!("x-amz-meta-", "dg-note");
+    pub const H_SOURCE_NAME: &str = concat!("x-amz-meta-", "dg-source-name");
+    pub const H_REF_KEY: &str = concat!("x-amz-meta-", "dg-ref-key");
+    pub const H_REF_SHA256: &str = concat!("x-amz-meta-", "dg-ref-sha256");
+    pub const H_DELTA_SIZE: &str = concat!("x-amz-meta-", "dg-delta-size");
+    pub const H_DELTA_CMD: &str = concat!("x-amz-meta-", "dg-delta-cmd");
 }
 
 /// Errors that can occur when validating user-provided bucket/key inputs.

@@ -29,6 +29,16 @@ struct S3ListedObject {
     etag: Option<String>,
 }
 
+/// An S3 listed object classified into a user-visible key, with enough info
+/// to decide whether a HEAD call is needed for full metadata.
+struct ClassifiedObject {
+    user_key: String,
+    s3_key: String,
+    listing_meta: S3ListedObject,
+    /// Delta files need a HEAD call to get the real original file_size.
+    needs_head: bool,
+}
+
 /// S3 storage backend for DeltaGlider objects
 pub struct S3Backend {
     client: Client,
@@ -450,6 +460,164 @@ impl S3Backend {
             .send()
             .await
             .is_ok()
+    }
+
+    // === Listing classification helpers ===
+    //
+    // Both `bulk_list_objects` and `list_objects_delegated` need to:
+    //   1. Classify raw S3 keys into user-visible objects vs internal files
+    //   2. Fire parallel HEAD calls for delta files (listing size != original size)
+    //   3. Build FileMetadata from HEAD results or listing fallback
+    //   4. Dedup by user key, keeping the latest version
+    //
+    // These helpers centralise that logic so changes only need to happen once.
+
+    /// Classify a batch of S3 listed objects into user-visible entries and
+    /// directory markers. Internal files (reference.bin) are filtered out.
+    fn classify_listed_objects(
+        objects: Vec<S3ListedObject>,
+    ) -> (Vec<ClassifiedObject>, Vec<(String, FileMetadata)>) {
+        let mut classified = Vec::new();
+        let mut dir_markers = Vec::new();
+
+        for obj in objects {
+            let filename = obj.key.rsplit('/').next().unwrap_or(&obj.key);
+
+            // Directory marker: zero-byte key ending with '/'
+            if obj.key.ends_with('/') && obj.size == 0 {
+                dir_markers.push((obj.key.clone(), FileMetadata::directory_marker(&obj.key)));
+                continue;
+            }
+
+            // Skip internal reference files
+            if filename == "reference.bin" {
+                continue;
+            }
+
+            let key_prefix = if obj.key.contains('/') {
+                &obj.key[..obj.key.len() - filename.len() - 1]
+            } else {
+                ""
+            };
+
+            let is_delta = filename.ends_with(".delta");
+            let original_name = if is_delta {
+                filename.trim_end_matches(".delta").to_string()
+            } else {
+                filename.to_string()
+            };
+
+            let user_key = if key_prefix.is_empty() {
+                original_name
+            } else {
+                format!("{}/{}", key_prefix, original_name)
+            };
+
+            classified.push(ClassifiedObject {
+                user_key,
+                s3_key: obj.key.clone(),
+                listing_meta: obj,
+                needs_head: is_delta,
+            });
+        }
+
+        (classified, dir_markers)
+    }
+
+    /// Fire parallel HEAD calls for classified objects that need them (deltas),
+    /// then resolve each entry to final `(user_key, FileMetadata)` pairs,
+    /// deduplicating by user key (keeping the latest version).
+    async fn resolve_classified_metadata(
+        &self,
+        bucket: &str,
+        classified: Vec<ClassifiedObject>,
+        mut seed_results: Vec<(String, FileMetadata)>,
+    ) -> Vec<(String, FileMetadata)> {
+        // Parallel HEAD calls for delta files
+        let head_futures: Vec<_> = classified
+            .iter()
+            .filter(|c| c.needs_head)
+            .map(|c| {
+                let s3_key = c.s3_key.clone();
+                async move {
+                    let meta_result = self.get_object_metadata(bucket, &s3_key).await;
+                    (s3_key, meta_result)
+                }
+            })
+            .collect();
+
+        let head_results: HashMap<String, FileMetadata> = futures::future::join_all(head_futures)
+            .await
+            .into_iter()
+            .filter_map(|(key, result)| result.ok().map(|meta| (key, meta)))
+            .collect();
+
+        // Dedup by user key, keeping latest version
+        let mut latest: HashMap<String, FileMetadata> = HashMap::new();
+
+        for entry in classified {
+            let meta = if entry.needs_head {
+                if let Some(head_meta) = head_results.get(&entry.s3_key) {
+                    head_meta.clone()
+                } else {
+                    Self::fallback_metadata_from_listing(
+                        &entry.listing_meta,
+                        &entry.user_key,
+                        StorageInfo::Delta {
+                            ref_key: String::new(),
+                            ref_sha256: String::new(),
+                            delta_size: entry.listing_meta.size,
+                            delta_cmd: String::new(),
+                        },
+                    )
+                }
+            } else {
+                Self::fallback_metadata_from_listing(
+                    &entry.listing_meta,
+                    &entry.user_key,
+                    StorageInfo::Passthrough,
+                )
+            };
+
+            match latest.entry(entry.user_key) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(meta);
+                }
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    if meta.created_at > e.get().created_at {
+                        e.insert(meta);
+                    }
+                }
+            }
+        }
+
+        for (key, meta) in latest {
+            seed_results.push((key, meta));
+        }
+
+        seed_results.sort_by(|a, b| a.0.cmp(&b.0));
+        seed_results
+    }
+
+    /// Build a best-effort FileMetadata from S3 listing info alone (no HEAD).
+    /// Used when HEAD fails or isn't needed (passthrough files).
+    fn fallback_metadata_from_listing(
+        obj: &S3ListedObject,
+        user_key: &str,
+        storage_info: StorageInfo,
+    ) -> FileMetadata {
+        use crate::types::DELTAGLIDER_TOOL;
+        FileMetadata {
+            tool: DELTAGLIDER_TOOL.to_string(),
+            original_name: user_key.rsplit('/').next().unwrap_or(user_key).to_string(),
+            file_sha256: String::new(),
+            file_size: obj.size,
+            md5: obj.etag.clone().unwrap_or_default(),
+            created_at: obj.last_modified.unwrap_or_else(Utc::now),
+            content_type: None,
+            user_metadata: HashMap::new(),
+            storage_info,
+        }
     }
 
     /// List objects with a prefix in a specific bucket (keys only)
@@ -1035,136 +1203,11 @@ impl StorageBackend for S3Backend {
         bucket: &str,
         prefix: &str,
     ) -> Result<Vec<(String, FileMetadata)>, StorageError> {
-        use crate::types::DELTAGLIDER_TOOL;
-
         let listed = self.list_objects_full(bucket, prefix).await?;
-
-        // First pass: classify objects and collect S3 keys that need HEAD
-        // (delta and passthrough files with DG metadata).
-        struct Classified {
-            user_key: String,
-            s3_key: String,
-            listing_meta: S3ListedObject,
-            needs_head: bool,
-        }
-
-        let mut classified: Vec<Classified> = Vec::new();
-        let mut results: Vec<(String, FileMetadata)> = Vec::new();
-
-        for obj in listed {
-            let filename = obj.key.rsplit('/').next().unwrap_or(&obj.key);
-            let key_prefix = if obj.key.contains('/') {
-                &obj.key[..obj.key.len() - filename.len() - 1]
-            } else {
-                ""
-            };
-
-            // Directory marker: zero-byte key ending with '/'
-            if obj.key.ends_with('/') && obj.size == 0 {
-                results.push((obj.key.clone(), FileMetadata::directory_marker(&obj.key)));
-                continue;
-            }
-
-            // Skip internal reference files
-            if filename == "reference.bin" {
-                continue;
-            }
-
-            let is_delta = filename.ends_with(".delta");
-            let original_name = if is_delta {
-                filename.trim_end_matches(".delta").to_string()
-            } else {
-                filename.to_string()
-            };
-
-            let user_key = if key_prefix.is_empty() {
-                original_name.clone()
-            } else {
-                format!("{}/{}", key_prefix, original_name)
-            };
-
-            // Delta files need HEAD to get the real original file_size from metadata.
-            // Passthrough files: ListObjectsV2 Size == original size, no HEAD needed.
-            classified.push(Classified {
-                user_key,
-                s3_key: obj.key.clone(),
-                listing_meta: obj,
-                needs_head: is_delta,
-            });
-        }
-
-        // Parallel HEAD calls for delta files to retrieve real metadata
-        let head_futures: Vec<_> = classified
-            .iter()
-            .filter(|c| c.needs_head)
-            .map(|c| {
-                let s3_key = c.s3_key.clone();
-                async move {
-                    let meta_result = self.get_object_metadata(bucket, &s3_key).await;
-                    (s3_key, meta_result)
-                }
-            })
-            .collect();
-
-        let head_results: HashMap<String, FileMetadata> = futures::future::join_all(head_futures)
-            .await
-            .into_iter()
-            .filter_map(|(key, result)| result.ok().map(|meta| (key, meta)))
-            .collect();
-
-        // Build final results, using HEAD metadata for deltas when available
-        for entry in classified {
-            let meta = if entry.needs_head {
-                if let Some(head_meta) = head_results.get(&entry.s3_key) {
-                    head_meta.clone()
-                } else {
-                    // HEAD failed — fall back to listing-only metadata
-                    let obj = &entry.listing_meta;
-                    FileMetadata {
-                        tool: DELTAGLIDER_TOOL.to_string(),
-                        original_name: entry
-                            .user_key
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or(&entry.user_key)
-                            .to_string(),
-                        file_sha256: String::new(),
-                        file_size: obj.size,
-                        md5: obj.etag.clone().unwrap_or_default(),
-                        created_at: obj.last_modified.unwrap_or_else(Utc::now),
-                        content_type: None,
-                        user_metadata: HashMap::new(),
-                        storage_info: StorageInfo::Delta {
-                            ref_key: String::new(),
-                            ref_sha256: String::new(),
-                            delta_size: obj.size,
-                            delta_cmd: String::new(),
-                        },
-                    }
-                }
-            } else {
-                // Passthrough: ListObjectsV2 Size is the real file size
-                let obj = &entry.listing_meta;
-                FileMetadata {
-                    tool: DELTAGLIDER_TOOL.to_string(),
-                    original_name: entry
-                        .user_key
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or(&entry.user_key)
-                        .to_string(),
-                    file_sha256: String::new(),
-                    file_size: obj.size,
-                    md5: obj.etag.clone().unwrap_or_default(),
-                    created_at: obj.last_modified.unwrap_or_else(Utc::now),
-                    content_type: None,
-                    user_metadata: HashMap::new(),
-                    storage_info: StorageInfo::Passthrough,
-                }
-            };
-
-            results.push((entry.user_key, meta));
-        }
+        let (classified, dir_markers) = Self::classify_listed_objects(listed);
+        let results = self
+            .resolve_classified_metadata(bucket, classified, dir_markers)
+            .await;
 
         debug!(
             "Bulk listed {} objects in {}/{}",
@@ -1189,8 +1232,6 @@ impl StorageBackend for S3Backend {
         max_keys: u32,
         continuation_token: Option<&str>,
     ) -> Result<Option<DelegatedListResult>, StorageError> {
-        use crate::types::DELTAGLIDER_TOOL;
-
         // We need to over-fetch from upstream because internal files
         // (reference.bin, .delta suffixes) inflate the key count.
         // Fetch in pages until we have enough user-visible entries.
@@ -1262,149 +1303,11 @@ impl StorageBackend for S3Backend {
             }
         }
 
-        // --- Classify and translate raw objects (same logic as bulk_list_objects) ---
-        struct Classified {
-            user_key: String,
-            s3_key: String,
-            listing_meta: S3ListedObject,
-            needs_head: bool,
-        }
-
-        let mut classified: Vec<Classified> = Vec::new();
-        let mut dir_markers: Vec<(String, FileMetadata)> = Vec::new();
-
-        for obj in raw_objects {
-            let filename = obj.key.rsplit('/').next().unwrap_or(&obj.key);
-            let key_prefix = if obj.key.contains('/') {
-                &obj.key[..obj.key.len() - filename.len() - 1]
-            } else {
-                ""
-            };
-
-            // Directory marker
-            if obj.key.ends_with('/') && obj.size == 0 {
-                dir_markers.push((obj.key.clone(), FileMetadata::directory_marker(&obj.key)));
-                continue;
-            }
-
-            // Skip internal reference files
-            if filename == "reference.bin" {
-                continue;
-            }
-
-            let is_delta = filename.ends_with(".delta");
-            let original_name = if is_delta {
-                filename.trim_end_matches(".delta").to_string()
-            } else {
-                filename.to_string()
-            };
-
-            let user_key = if key_prefix.is_empty() {
-                original_name.clone()
-            } else {
-                format!("{}/{}", key_prefix, original_name)
-            };
-
-            classified.push(Classified {
-                user_key,
-                s3_key: obj.key.clone(),
-                listing_meta: obj,
-                needs_head: is_delta,
-            });
-        }
-
-        // Parallel HEAD calls for delta files (should be few at this level)
-        let head_futures: Vec<_> = classified
-            .iter()
-            .filter(|c| c.needs_head)
-            .map(|c| {
-                let s3_key = c.s3_key.clone();
-                async move {
-                    let meta_result = self.get_object_metadata(bucket, &s3_key).await;
-                    (s3_key, meta_result)
-                }
-            })
-            .collect();
-
-        let head_results: HashMap<String, FileMetadata> = futures::future::join_all(head_futures)
-            .await
-            .into_iter()
-            .filter_map(|(key, result)| result.ok().map(|meta| (key, meta)))
-            .collect();
-
-        // Build final objects list
-        let mut objects: Vec<(String, FileMetadata)> = Vec::new();
-
-        // Dedup by user key, keeping latest version
-        let mut latest: HashMap<String, FileMetadata> = HashMap::new();
-
-        for entry in classified {
-            let meta = if entry.needs_head {
-                if let Some(head_meta) = head_results.get(&entry.s3_key) {
-                    head_meta.clone()
-                } else {
-                    let obj = &entry.listing_meta;
-                    FileMetadata {
-                        tool: DELTAGLIDER_TOOL.to_string(),
-                        original_name: entry
-                            .user_key
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or(&entry.user_key)
-                            .to_string(),
-                        file_sha256: String::new(),
-                        file_size: obj.size,
-                        md5: obj.etag.clone().unwrap_or_default(),
-                        created_at: obj.last_modified.unwrap_or_else(Utc::now),
-                        content_type: None,
-                        user_metadata: HashMap::new(),
-                        storage_info: StorageInfo::Delta {
-                            ref_key: String::new(),
-                            ref_sha256: String::new(),
-                            delta_size: obj.size,
-                            delta_cmd: String::new(),
-                        },
-                    }
-                }
-            } else {
-                let obj = &entry.listing_meta;
-                FileMetadata {
-                    tool: DELTAGLIDER_TOOL.to_string(),
-                    original_name: entry
-                        .user_key
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or(&entry.user_key)
-                        .to_string(),
-                    file_sha256: String::new(),
-                    file_size: obj.size,
-                    md5: obj.etag.clone().unwrap_or_default(),
-                    created_at: obj.last_modified.unwrap_or_else(Utc::now),
-                    content_type: None,
-                    user_metadata: HashMap::new(),
-                    storage_info: StorageInfo::Passthrough,
-                }
-            };
-
-            match latest.entry(entry.user_key.clone()) {
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(meta);
-                }
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    if meta.created_at > e.get().created_at {
-                        e.insert(meta);
-                    }
-                }
-            }
-        }
-
-        for (key, meta) in latest {
-            objects.push((key, meta));
-        }
-        for (key, meta) in dir_markers {
-            objects.push((key, meta));
-        }
-        objects.sort_by(|a, b| a.0.cmp(&b.0));
+        // Classify and resolve metadata using shared helpers
+        let (classified, dir_markers) = Self::classify_listed_objects(raw_objects);
+        let objects = self
+            .resolve_classified_metadata(bucket, classified, dir_markers)
+            .await;
 
         // Apply max_keys across both objects and common_prefixes (interleaved)
         let common_prefixes: Vec<String> = all_common_prefixes.into_iter().collect();
