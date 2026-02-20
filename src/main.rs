@@ -156,7 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if engine.is_cli_available() {
         info!("  xdelta3 CLI: available (legacy delta interop enabled)");
     } else {
-        warn!("  xdelta3 CLI: NOT found — legacy DeltaGlider CLI deltas cannot be decoded");
+        return Err("xdelta3 CLI not found. Install xdelta3 before starting the proxy.".into());
     }
 
     let multipart = Arc::new(MultipartStore::new(config.max_object_size));
