@@ -220,6 +220,7 @@ function PasswordChangeCard() {
       <Space orientation="vertical" size="middle" style={{ width: '100%' }}>
         <SectionHeader icon={<LockOutlined />} title="Change Admin Password" />
 
+        <input type="text" autoComplete="username" defaultValue="admin" aria-hidden="true" style={{ display: 'none' }} />
         <Input.Password
           placeholder="Current password"
           value={currentPassword}
@@ -466,10 +467,12 @@ export default function SettingsPage({ onBack }: Props) {
 
           <div style={{ marginTop: 12 }}>
             <span style={labelStyle}>Backend Secret Access Key</span>
+            <input type="text" autoComplete="username" value={beAccessKeyId} readOnly aria-hidden="true" style={{ display: 'none' }} />
             <Input.Password
               value={beSecretAccessKey}
               onChange={(e) => setBeSecretAccessKey(e.target.value)}
               placeholder={config.backend_has_credentials ? 'Leave empty to keep current' : 'Enter secret access key'}
+              autoComplete="off"
               style={{ ...inputRadius }}
             />
           </div>
@@ -664,10 +667,12 @@ export default function SettingsPage({ onBack }: Props) {
 
         <div style={{ marginTop: 12 }}>
           <span style={labelStyle}>Secret Access Key</span>
+          <input type="text" autoComplete="username" value={accessKeyId} readOnly aria-hidden="true" style={{ display: 'none' }} />
           <Input.Password
             value={secretAccessKey}
             onChange={(e) => setSecretAccessKey(e.target.value)}
             placeholder="Leave empty to keep current"
+            autoComplete="off"
             style={{ ...inputRadius }}
           />
         </div>
