@@ -183,6 +183,7 @@ fn verify_signature(
     method: &str,
     uri_path: &str,
     headers: &axum::http::HeaderMap,
+    uri: &axum::http::Uri,
 ) -> Result<(), Response> {
     // Verify the access key matches
     if params.access_key != auth.access_key_id {
@@ -195,10 +196,13 @@ fn verify_signature(
     let mut header_pairs: Vec<(String, String)> = Vec::new();
     for header_name in &signed_headers_list {
         let value = if *header_name == "host" {
+            // HTTP/1.1 sends Host header; HTTP/2 uses :authority pseudo-header
+            // which hyper exposes via the request URI authority, not the headers map.
             headers
                 .get("host")
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string())
+                .or_else(|| uri.authority().map(|a| a.to_string()))
                 .unwrap_or_default()
         } else {
             headers
@@ -319,8 +323,9 @@ pub async fn sigv4_auth_middleware(
 
     let method = request.method().as_str().to_string();
     let uri_path = request.uri().path().to_string();
+    let uri = request.uri().clone();
 
-    verify_signature(&params, &auth, &method, &uri_path, request.headers())?;
+    verify_signature(&params, &auth, &method, &uri_path, request.headers(), &uri)?;
 
     Ok(next.run(request).await)
 }
