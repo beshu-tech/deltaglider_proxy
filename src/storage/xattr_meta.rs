@@ -10,15 +10,7 @@ use std::path::Path;
 /// The single xattr name used for all DeltaGlider metadata.
 const XATTR_NAME: &str = "user.dg.metadata";
 
-/// Convert an io::Error into StorageError, detecting disk-full (ENOSPC).
-fn io_to_storage_error(e: std::io::Error) -> StorageError {
-    const ENOSPC: i32 = 28;
-    if e.raw_os_error() == Some(ENOSPC) {
-        StorageError::DiskFull
-    } else {
-        StorageError::Io(e)
-    }
-}
+use super::io_to_storage_error;
 
 /// Read metadata from the xattr on a data file.
 ///

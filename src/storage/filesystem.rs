@@ -26,17 +26,7 @@ async fn is_dir(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// ENOSPC raw error code on Linux and macOS.
-const ENOSPC: i32 = 28;
-
-/// Convert an io::Error into StorageError, detecting disk-full (ENOSPC).
-fn io_to_storage_error(e: std::io::Error) -> StorageError {
-    if e.raw_os_error() == Some(ENOSPC) {
-        StorageError::DiskFull
-    } else {
-        StorageError::Io(e)
-    }
-}
+use super::io_to_storage_error;
 
 /// Atomically write data to a file using write-to-temp + fsync + rename.
 async fn atomic_write(path: &Path, data: &[u8]) -> Result<(), StorageError> {
