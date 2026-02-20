@@ -9,6 +9,7 @@ edition = "2021"
 [dependencies]
 # Web framework
 axum = "0.7"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 tokio = { version = "1", features = ["full"] }
 
 # Serialization
@@ -26,6 +27,9 @@ async-trait = "0.1"
 
 # Delta compression
 xdelta3 = "0.1.5"
+
+# TLS certificate generation
+rcgen = "0.13"
 
 # Password hashing
 bcrypt = "0.15"

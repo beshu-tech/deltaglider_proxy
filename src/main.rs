@@ -271,20 +271,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         s3_state: state.clone(),
     });
 
+    // Build TLS config if enabled
+    let rustls_config = if config.tls_enabled() {
+        let tls_cfg = config.tls.as_ref().unwrap();
+        let rc = deltaglider_proxy::tls::build_rustls_config(tls_cfg).await?;
+        if tls_cfg.cert_path.is_some() {
+            info!("  TLS: enabled (user-provided certificate)");
+        } else {
+            warn!("  TLS: enabled (auto-generated self-signed certificate)");
+        }
+        Some(rc)
+    } else {
+        None
+    };
+
     // Start embedded demo UI on a separate port (S3 port + 1)
     let s3_port = config.listen_addr.port();
-    tokio::spawn(demo::serve(s3_port, admin_state));
+    tokio::spawn(demo::serve(s3_port, admin_state, rustls_config.clone()));
 
     // Start S3 server with graceful shutdown
-    let listener = TcpListener::bind(&config.listen_addr).await?;
-    info!(
-        "DeltaGlider Proxy listening on http://{}",
-        config.listen_addr
-    );
+    if let Some(rustls_config) = rustls_config {
+        let handle = axum_server::Handle::new();
+        let shutdown_handle = handle.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            shutdown_handle.graceful_shutdown(Some(Duration::from_secs(10)));
+        });
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+        info!(
+            "DeltaGlider Proxy listening on https://{}",
+            config.listen_addr
+        );
+        axum_server::bind_rustls(config.listen_addr, rustls_config)
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await?;
+    } else {
+        let listener = TcpListener::bind(&config.listen_addr).await?;
+        info!(
+            "DeltaGlider Proxy listening on http://{}",
+            config.listen_addr
+        );
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+    }
 
     info!("Server shutdown complete");
     Ok(())

@@ -9,4 +9,5 @@ pub mod init;
 pub mod multipart;
 pub mod session;
 pub mod storage;
+pub mod tls;
 pub mod types;

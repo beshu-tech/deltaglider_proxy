@@ -27,6 +27,17 @@ cache_size_mb = 100
 # access_key_id = "myaccesskey"
 # secret_access_key = "mysecretkey"
 
+# TLS (optional)
+# --------------
+# Enable HTTPS for both S3 and admin UI ports.
+# Mode 1: Self-signed (no cert_path/key_path — auto-generates on startup)
+# Mode 2: User-provided (set cert_path + key_path to PEM files)
+#
+# [tls]
+# enabled = true
+# cert_path = "/path/to/cert.pem"
+# key_path = "/path/to/key.pem"
+
 # Backend Configuration
 # ---------------------
 # Choose either filesystem or s3 backend.
@@ -81,6 +92,11 @@ path = "./data"
 #
 # Filesystem backend:
 #   DGP_DATA_DIR              - Data directory (activates filesystem backend)
+#
+# TLS:
+#   DGP_TLS_ENABLED           - Enable TLS (true/false)
+#   DGP_TLS_CERT              - Path to PEM certificate file
+#   DGP_TLS_KEY               - Path to PEM private key file
 #
 # S3 backend (activates when DGP_S3_ENDPOINT or DGP_S3_REGION is set):
 #   DGP_S3_ENDPOINT           - S3 endpoint URL
