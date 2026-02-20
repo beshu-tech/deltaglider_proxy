@@ -52,6 +52,25 @@ pub struct Config {
     /// Default: "deltaglider_proxy=debug,tower_http=debug"
     #[serde(default = "default_log_level")]
     pub log_level: String,
+
+    /// TLS configuration (optional).
+    /// When enabled, both the S3 port and the demo UI port serve HTTPS.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+}
+
+/// TLS configuration (optional)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsConfig {
+    /// Enable TLS
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to PEM certificate file (optional — auto-generates self-signed if omitted)
+    #[serde(default)]
+    pub cert_path: Option<String>,
+    /// Path to PEM private key file (required if cert_path is set)
+    #[serde(default)]
+    pub key_path: Option<String>,
 }
 
 /// Storage backend configuration
@@ -138,6 +157,7 @@ impl Default for Config {
             secret_access_key: None,
             admin_password_hash: None,
             log_level: default_log_level(),
+            tls: None,
         }
     }
 }
@@ -208,6 +228,17 @@ impl Config {
             config.log_level = level;
         }
 
+        // TLS configuration
+        if let Ok(enabled) = std::env::var("DGP_TLS_ENABLED") {
+            if enabled == "true" || enabled == "1" {
+                config.tls = Some(TlsConfig {
+                    enabled: true,
+                    cert_path: std::env::var("DGP_TLS_CERT").ok(),
+                    key_path: std::env::var("DGP_TLS_KEY").ok(),
+                });
+            }
+        }
+
         config
     }
 
@@ -239,6 +270,11 @@ impl Config {
     /// Returns true if SigV4 authentication is enabled (both credentials are set).
     pub fn auth_enabled(&self) -> bool {
         self.access_key_id.is_some() && self.secret_access_key.is_some()
+    }
+
+    /// Returns true if TLS is enabled.
+    pub fn tls_enabled(&self) -> bool {
+        self.tls.as_ref().is_some_and(|t| t.enabled)
     }
 
     /// Ensure admin_password_hash is set. Resolution order:

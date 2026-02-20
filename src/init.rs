@@ -3,7 +3,7 @@
 //! Walks the user through creating a `deltaglider_proxy.toml` file,
 //! similar to `npm init` or `cargo init`.
 
-use crate::config::{BackendConfig, Config, ConfigError};
+use crate::config::{BackendConfig, Config, ConfigError, TlsConfig};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
@@ -246,6 +246,40 @@ pub fn run_init_inner(
         (None, None)
     };
 
+    writeln!(writer)?;
+
+    // --- TLS ---
+    writeln!(writer, "--- TLS ---")?;
+    let tls_enabled = prompt_yes_no(reader, writer, "Enable TLS?", false)?;
+    let tls = if tls_enabled {
+        let own_cert = prompt_yes_no(reader, writer, "Provide your own certificate?", false)?;
+        if own_cert {
+            let cert_path = prompt(reader, writer, "Certificate PEM path", "")?;
+            let key_path = prompt(reader, writer, "Private key PEM path", "")?;
+            Some(TlsConfig {
+                enabled: true,
+                cert_path: if cert_path.is_empty() {
+                    None
+                } else {
+                    Some(cert_path)
+                },
+                key_path: if key_path.is_empty() {
+                    None
+                } else {
+                    Some(key_path)
+                },
+            })
+        } else {
+            Some(TlsConfig {
+                enabled: true,
+                cert_path: None,
+                key_path: None,
+            })
+        }
+    } else {
+        None
+    };
+
     // Build Config
     let config = Config {
         listen_addr,
@@ -257,6 +291,7 @@ pub fn run_init_inner(
         secret_access_key,
         admin_password_hash: None,
         log_level,
+        tls,
     };
 
     // Show summary
@@ -307,8 +342,8 @@ mod tests {
     #[test]
     fn test_defaults_filesystem() {
         // Accept all defaults: output path, listen addr, log level, filesystem,
-        // data dir, delta ratio, max obj size, cache size, no auth, confirm write.
-        let input = "\n\n\n\n\n\n\n\nn\ny\n";
+        // data dir, delta ratio, max obj size, cache size, no auth, no tls, confirm write.
+        let input = "\n\n\n\n\n\n\n\nn\nn\ny\n";
         let (output, file) = run_wizard(input);
         assert!(output.contains("DeltaGlider Proxy"));
         let file = file.expect("file should be written");
@@ -332,6 +367,7 @@ mod tests {
             "\n",                      // max obj size default
             "\n",                      // cache size default
             "n\n",                     // no auth
+            "n\n",                     // no tls
             "y\n",                     // confirm write
         );
         let (output, file) = run_wizard(input);
@@ -344,8 +380,8 @@ mod tests {
     #[test]
     fn test_cancel_write() {
         // output path, listen addr, log level, backend, data dir, delta ratio,
-        // max obj size, cache size, auth(n), write(n)
-        let input = "\n\n\n\n\n\n\n\nn\nn\n";
+        // max obj size, cache size, auth(n), tls(n), write(n)
+        let input = "\n\n\n\n\n\n\n\nn\nn\nn\n";
         let (output, file) = run_wizard(input);
         assert!(output.contains("Cancelled"));
         assert!(file.is_none());
@@ -425,6 +461,7 @@ mod tests {
             "y\n",        // enable auth
             "mykey\n",    // access key
             "mysecret\n", // secret key
+            "n\n",        // no tls
             "y\n",        // confirm write
         );
         let (_, file) = run_wizard(input);

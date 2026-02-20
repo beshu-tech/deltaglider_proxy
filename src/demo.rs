@@ -8,6 +8,7 @@ use axum::{
     routing::{get, post, put},
     Router,
 };
+use axum_server::tls_rustls::RustlsConfig;
 use rust_embed::Embed;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -21,7 +22,9 @@ use deltaglider_proxy::api::admin::{self, AdminState};
 struct DemoAssets;
 
 /// Start the demo UI server on port `s3_port + 1`.
-pub async fn serve(s3_port: u16, admin_state: Arc<AdminState>) {
+///
+/// When `tls` is `Some`, the demo server uses HTTPS (same cert as the S3 port).
+pub async fn serve(s3_port: u16, admin_state: Arc<AdminState>, tls: Option<RustlsConfig>) {
     let demo_port = s3_port + 1;
     let addr = format!("0.0.0.0:{demo_port}");
 
@@ -53,12 +56,21 @@ pub async fn serve(s3_port: u16, admin_state: Arc<AdminState>) {
         .route("/*path", get(static_or_fallback))
         .layer(CorsLayer::permissive());
 
-    let listener = TcpListener::bind(&addr).await.unwrap_or_else(|e| {
-        tracing::error!("Demo UI failed to bind {addr}: {e}");
-        std::process::exit(1);
-    });
-    info!("  Demo UI: http://localhost:{demo_port}");
-    axum::serve(listener, app).await.ok();
+    if let Some(rustls_config) = tls {
+        let addr_parsed: std::net::SocketAddr = addr.parse().unwrap();
+        info!("  Demo UI: https://localhost:{demo_port}");
+        axum_server::bind_rustls(addr_parsed, rustls_config)
+            .serve(app.into_make_service())
+            .await
+            .ok();
+    } else {
+        let listener = TcpListener::bind(&addr).await.unwrap_or_else(|e| {
+            tracing::error!("Demo UI failed to bind {addr}: {e}");
+            std::process::exit(1);
+        });
+        info!("  Demo UI: http://localhost:{demo_port}");
+        axum::serve(listener, app).await.ok();
+    }
 }
 
 async fn index() -> impl IntoResponse {
