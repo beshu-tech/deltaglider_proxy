@@ -29,6 +29,16 @@ export default function useS3Browser() {
 
   const selection = useSelection(filteredObjects, filteredFolders);
 
+  /** Clear objects, folders, head cache, and mark as initial load. */
+  const resetBrowseState = useCallback(() => {
+    setObjects([]);
+    setFolders([]);
+    setHeadCache({});
+    headInflight.current.clear();
+    isInitialLoad.current = true;
+    selection.clearSelection();
+  }, [selection.clearSelection]);
+
   const refresh = useCallback(() => {
     setRefreshTrigger((k) => k + 1);
   }, []);
@@ -111,40 +121,24 @@ export default function useS3Browser() {
   }, [refresh]);
 
   const navigate = useCallback((newPrefix: string) => {
-    // Clear data so spinner shows immediately for the new prefix
-    setObjects([]);
-    setFolders([]);
-    setHeadCache({});
-    headInflight.current.clear();
-    isInitialLoad.current = true;
+    resetBrowseState();
     setPrefix(newPrefix);
-    selection.clearSelection();
     setSearchQuery('');
-  }, [selection.clearSelection]);
+  }, [resetBrowseState]);
 
   const changeBucket = useCallback((newBucket: string) => {
     setBucketState(newBucket);
-    setObjects([]);
-    setFolders([]);
-    setHeadCache({});
-    headInflight.current.clear();
-    isInitialLoad.current = true;
+    resetBrowseState();
     setPrefix('');
-    selection.clearSelection();
     setRefreshTrigger((k) => k + 1);
-  }, [selection.clearSelection]);
+  }, [resetBrowseState]);
 
   const reconnect = useCallback(() => {
-    setObjects([]);
-    setFolders([]);
-    setHeadCache({});
-    headInflight.current.clear();
-    isInitialLoad.current = true;
+    resetBrowseState();
     setPrefix('');
-    selection.clearSelection();
     setConnected(hasCredentials());
     setRefreshTrigger((k) => k + 1);
-  }, [selection.clearSelection]);
+  }, [resetBrowseState]);
 
   const bulkDelete = useCallback(async () => {
     if (selection.selectedKeys.size === 0) return;
