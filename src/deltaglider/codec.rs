@@ -1,8 +1,7 @@
 //! xdelta3 codec wrapper for delta encoding/decoding
 //!
-//! Uses the xdelta3 CLI binary for decoding to ensure compatibility with
-//! deltas created by the original DeltaGlider Python CLI, and the Rust
-//! xdelta3 crate for encoding (which produces CLI-compatible deltas).
+//! Uses the xdelta3 CLI binary for both encoding and decoding to ensure
+//! compatibility with deltas created by the original DeltaGlider Python CLI.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -26,10 +25,10 @@ pub enum CodecError {
     Io(#[from] std::io::Error),
 }
 
-/// Delta codec using xdelta3
+/// Delta codec using the xdelta3 CLI binary
 pub struct DeltaCodec {
     max_size: usize,
-    /// Whether the xdelta3 CLI binary is available for legacy delta decoding.
+    /// Whether the xdelta3 CLI binary is available.
     /// Probed once at construction time to avoid per-request discovery failures.
     cli_available: bool,
 }
@@ -53,7 +52,7 @@ impl DeltaCodec {
         }
     }
 
-    /// Returns whether the xdelta3 CLI is available for legacy delta decoding.
+    /// Returns whether the xdelta3 CLI is available.
     pub fn is_cli_available(&self) -> bool {
         self.cli_available
     }
@@ -82,21 +81,64 @@ impl DeltaCodec {
             target.len()
         );
 
-        // xdelta3::encode(new_data, old_data) - note the parameter order!
-        let delta = xdelta3::encode(target, source)
-            .ok_or_else(|| CodecError::EncodeFailed("xdelta3 encoding failed".to_string()))?;
+        // Write source and target to temporary files
+        let mut source_file = NamedTempFile::new()?;
+        source_file.write_all(source)?;
+        source_file.flush()?;
 
-        debug!(
-            "Delta encoded: {} bytes (ratio: {:.2}%)",
-            delta.len(),
-            (delta.len() as f64 / target.len() as f64) * 100.0
-        );
+        let mut target_file = NamedTempFile::new()?;
+        target_file.write_all(target)?;
+        target_file.flush()?;
 
-        Ok(delta)
+        let output_file = NamedTempFile::new()?;
+        let output_path = output_file.path().to_owned();
+
+        // Run xdelta3 -e -f -s source target output
+        // -e for encode, -f to overwrite output file, -s for source (reference)
+        let result = Command::new("xdelta3")
+            .args([
+                "-e",
+                "-f",
+                "-s",
+                source_file.path().to_str().unwrap(),
+                target_file.path().to_str().unwrap(),
+                output_path.to_str().unwrap(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output();
+
+        match result {
+            Ok(output) => {
+                if output.status.success() {
+                    let delta = std::fs::read(&output_path)?;
+                    debug!(
+                        "Delta encoded: {} bytes (ratio: {:.2}%)",
+                        delta.len(),
+                        (delta.len() as f64 / target.len() as f64) * 100.0
+                    );
+                    Ok(delta)
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    warn!("xdelta3 CLI encode failed: {}", stderr);
+                    Err(CodecError::EncodeFailed(format!(
+                        "xdelta3 CLI failed: {}",
+                        stderr
+                    )))
+                }
+            }
+            Err(e) => {
+                warn!("Failed to execute xdelta3 CLI: {}", e);
+                Err(CodecError::EncodeFailed(format!(
+                    "xdelta3 CLI not available: {}",
+                    e
+                )))
+            }
+        }
     }
 
     /// Decode a delta to reconstruct the target from source + delta
-    /// Uses the xdelta3 CLI binary for compatibility with original DeltaGlider CLI
     #[instrument(skip(self, source, delta))]
     pub fn decode(&self, source: &[u8], delta: &[u8]) -> Result<Vec<u8>, CodecError> {
         if source.len() > self.max_size {
@@ -112,25 +154,12 @@ impl DeltaCodec {
             delta.len()
         );
 
-        // Try Rust crate first (faster, works for deltas we created)
-        if let Some(target) = xdelta3::decode(delta, source) {
-            debug!("Delta decoded via Rust crate: {} bytes", target.len());
-            return Ok(target);
-        }
-
-        // Fallback to CLI for compatibility with original DeltaGlider CLI deltas
         if !self.cli_available {
             return Err(CodecError::DecodeFailed(
-                "Rust xdelta3 crate decode failed and CLI binary is not available".to_string(),
+                "xdelta3 CLI binary is not available".to_string(),
             ));
         }
-        debug!("Rust crate decode failed, falling back to xdelta3 CLI");
-        self.decode_via_cli(source, delta)
-    }
 
-    /// Decode using the xdelta3 CLI binary
-    /// This handles deltas created by the original DeltaGlider Python CLI
-    fn decode_via_cli(&self, source: &[u8], delta: &[u8]) -> Result<Vec<u8>, CodecError> {
         // Write source and delta to temporary files
         let mut source_file = NamedTempFile::new()?;
         source_file.write_all(source)?;
@@ -163,7 +192,7 @@ impl DeltaCodec {
             Ok(output) => {
                 if output.status.success() {
                     let target = std::fs::read(&output_path)?;
-                    debug!("Delta decoded via CLI: {} bytes", target.len());
+                    debug!("Delta decoded: {} bytes", target.len());
                     Ok(target)
                 } else {
                     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -229,13 +258,16 @@ mod tests {
     fn test_identical_files() {
         let codec = DeltaCodec::default();
 
-        let data = b"Same content in both files";
-        let delta = codec.encode(data, data).unwrap();
+        // Use a larger payload so the delta is meaningfully smaller than the original.
+        // The xdelta3 CLI has ~50 bytes of header overhead, so tiny inputs may
+        // produce a delta larger than the source.
+        let data = vec![0x42u8; 1024];
+        let delta = codec.encode(&data, &data).unwrap();
 
-        // Delta for identical files should be very small
+        // Delta for identical files should be much smaller than 1 KiB of data
         assert!(delta.len() < data.len());
 
-        let reconstructed = codec.decode(data, &delta).unwrap();
+        let reconstructed = codec.decode(&data, &delta).unwrap();
         assert_eq!(reconstructed, data);
     }
 
