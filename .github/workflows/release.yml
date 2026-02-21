@@ -11,7 +11,7 @@ permissions: {}
 env:
   CARGO_TERM_COLOR: always
   BINARY_NAME: deltaglider_proxy
-  DOCKERHUB_REPO: beshutech/deltaglider_proxy
+  DOCKERHUB_REPO: beshultd/deltaglider_proxy
 
 jobs:
   # ── Job 1: CI Gate ──────────────────────────────────────────────────
