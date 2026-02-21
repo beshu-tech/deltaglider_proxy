@@ -1,240 +1,149 @@
 # DeltaGlider Proxy
 
-**S3-compatible proxy with transparent delta compression**
+**Drop-in S3 proxy that delta-compresses versioned binaries. Clients see standard S3. Storage drops 60-95%.**
 
-DeltaGlider Proxy sits between your S3 clients and backend storage, automatically deduplicating similar files using [xdelta3](https://github.com/jmacd/xdelta). Your existing tools work unchanged while storage costs drop significantly for versioned artifacts.
+![DeltaGlider UI showing 98.4% savings on ReadOnlyREST builds](docs/screenshot.png)
 
-![DeltaGlider Proxy Architecture](docs/diagram.png)
+---
 
-## Why DeltaGlider Proxy?
+You store versioned binaries (releases, firmware, ML checkpoints, Docker layers). Each version is 90%+ identical to the last. S3 stores each one in full. You pay for all of it.
 
-**The problem**: You're storing versioned binary artifacts (Docker images, ML models, game builds, firmware). Each version is 90% identical to the previous, but S3 stores them as completely separate objects.
+DeltaGlider sits between your S3 clients and your storage backend. It intercepts PUTs, computes xdelta3 diffs against a per-prefix baseline, and stores the delta when it's smaller. GETs reconstruct the original on the fly. Your clients never know.
 
-**The solution**: DeltaGlider Proxy stores only the deltas. v2.zip that's 95% similar to v1.zip? Stored as a ~5% sized delta. Clients still GET the full file - reconstruction is transparent.
-
-```bash
-# Your workflow doesn't change (aside from pointing at DeltaGlider Proxy)
-DGP_ENDPOINT=http://localhost:9000
-aws --endpoint-url "$DGP_ENDPOINT" s3 mb s3://mybucket                                       # Create a bucket first
-aws --endpoint-url "$DGP_ENDPOINT" s3 cp releases/v1.zip s3://mybucket/releases/v1.zip  # Seeds the deltaspace baseline
-aws --endpoint-url "$DGP_ENDPOINT" s3 cp releases/v2.zip s3://mybucket/releases/v2.zip  # Stored as delta (~5% size)
-aws --endpoint-url "$DGP_ENDPOINT" s3 cp s3://mybucket/releases/v2.zip ./               # Reconstructed transparently
+```
+PUT releases/v2.zip ──▶ DeltaGlider ──▶ stored as 1.4MB delta (was 82MB)
+GET releases/v2.zip ──▶ DeltaGlider ──▶ reconstructed, streamed back as 82MB
 ```
 
-## Quick Start
+## Quick start
 
 ```bash
-# Build (requires Node.js for the demo UI)
-cd demo/s3-browser/ui && npm install && npm run build && cd -
+# Docker (easiest)
+docker run -p 9000:9000 -p 9001:9001 beshutech/deltaglider-proxy
+
+# Or build from source
+cd demo/s3-browser/ui && npm ci && npm run build && cd -
 cargo build --release
-
-# Run with filesystem backend (for testing)
 DGP_DATA_DIR=./data ./target/release/deltaglider_proxy
-
-# Or with S3 backend (example: MinIO on :9000; run DeltaGlider Proxy on a different port)
-docker compose up -d
-DGP_LISTEN_ADDR=127.0.0.1:9002 \
-DGP_S3_ENDPOINT=http://localhost:9000 \
-DGP_BE_AWS_ACCESS_KEY_ID=minioadmin \
-DGP_BE_AWS_SECRET_ACCESS_KEY=minioadmin \
-./target/release/deltaglider_proxy
 ```
 
-An embedded demo UI automatically starts on **S3 port + 1** (e.g. `http://localhost:9001` or `http://localhost:9003`).
-
-Point your S3 client at DeltaGlider Proxy (default `http://localhost:9000`, or `http://localhost:9002` in the MinIO example above). Create a bucket first, then upload:
+Then use it like any S3 endpoint:
 
 ```bash
-# aws-cli
-DGP_ENDPOINT=http://localhost:9000
-aws --endpoint-url "$DGP_ENDPOINT" s3 mb s3://mybucket
-aws --endpoint-url "$DGP_ENDPOINT" s3 cp file.zip s3://mybucket/file.zip
-
-# boto3
-import os, boto3
-s3 = boto3.client('s3', endpoint_url=os.environ.get('DGP_ENDPOINT', 'http://localhost:9000'))
-s3.create_bucket(Bucket='mybucket')
-s3.upload_file('file.zip', 'mybucket', 'file.zip')
+export AWS_ENDPOINT_URL=http://localhost:9000
+aws s3 mb s3://builds
+aws s3 cp v1.zip s3://builds/releases/v1.zip   # seeds baseline
+aws s3 cp v2.zip s3://builds/releases/v2.zip   # stored as delta
+aws s3 cp s3://builds/releases/v2.zip ./v2.zip  # full file back, byte-identical
 ```
 
-## How It Works
+A built-in browser UI starts on port 9001 (S3 port + 1). No extra containers.
 
-DeltaGlider Proxy organizes objects into **deltaspaces** based on directory path:
+## How it works
+
+Objects sharing a path prefix form a **deltaspace**. The first upload seeds an internal baseline. Subsequent uploads are stored as xdelta3 diffs when the ratio beats the threshold (default: 50%). Files that don't compress well (images, video, already-compressed formats) pass through untouched.
 
 ```
 releases/v1.zip  ─┐
-releases/v2.zip  ─┼─▶ deltaspace "releases" (internal baseline + per-object deltas)
-releases/v3.zip  ─┘
-
-models/bert.tar.gz  ─┐
-models/gpt.tar.gz   ─┼─▶ deltaspace "models"
+releases/v2.zip  ─┼─▶  deltaspace "releases/"
+releases/v3.zip  ─┘    baseline: reference.bin (internal)
+                        v2.zip.delta: 1.4MB (was 82MB)
+                        v3.zip.delta: 0.9MB (was 82MB)
 ```
 
-Within each deltaspace:
-1. DeltaGlider Proxy maintains one internal **baseline** (`reference.bin`) seeded by the first delta-eligible upload
-2. Eligible uploads are stored as a delta against that baseline when `delta_size/original_size < max_delta_ratio`
-3. Otherwise, the object is stored as passthrough (original file unchanged)
-4. GET/HEAD operate on the original user key; reconstruction is transparent
+**Delta-eligible by default**: `.zip`, `.tar`, `.tgz`, `.tar.gz`, `.tar.bz2`, `.tar.xz`, `.jar`, `.war`, `.ear`, `.rar`, `.7z`, `.dmg`, `.iso`, `.sql`, `.dump`, `.bak`, `.backup`
 
-**What gets delta-compressed?**
+**Passthrough (skip delta)**: `.jpg`, `.png`, `.mp4`, and other already-compressed formats.
 
-By default: `.zip`, `.tar`, `.tgz`, `.tar.gz`, `.tar.bz2`, `.tar.xz`, `.jar`, `.war`, `.ear`, `.rar`, `.7z`, `.dmg`, `.iso`, `.sql`, `.dump`, `.bak`, `.backup`
+## Storage backends
 
-Files like `.jpg`, `.png`, `.mp4` are stored as passthrough (already compressed, don't delta well).
+| Backend | Use case | Config |
+|---------|----------|--------|
+| **Filesystem** | Local dev, single-node | `DGP_DATA_DIR=./data` |
+| **S3/MinIO** | Production, existing infra | `DGP_S3_ENDPOINT=http://minio:9000` |
 
-More details:
-- `docs/OPERATIONS.md`
-- `docs/STORAGE_FORMAT.md`
+Metadata lives alongside objects (xattr on filesystem, S3 user-metadata on S3). No external database.
 
 ## Configuration
 
-### Authentication
-
-DeltaGlider Proxy supports optional SigV4 authentication via both the standard `Authorization` header and presigned URLs (query string auth). When configured, all requests must be signed with the proxy's credentials:
+Environment variables (prefix `DGP_`) or TOML config file. Everything has sensible defaults.
 
 ```bash
-export DGP_ACCESS_KEY_ID=myaccesskey
-export DGP_SECRET_ACCESS_KEY=mysecretkey
-```
+# Core
+DGP_LISTEN_ADDR=0.0.0.0:9000       # bind address
+DGP_MAX_DELTA_RATIO=0.5             # store delta if ratio < 50%
+DGP_MAX_OBJECT_SIZE=104857600       # 100MB cap (xdelta3 constraint)
+DGP_CACHE_MB=100                    # reference cache for reconstruction
 
-Standard S3 tools (aws-cli, boto3, Terraform) and presigned URLs (`aws s3 presign`) work out of the box — just configure them with the proxy's credentials. The proxy verifies client signatures, then re-signs upstream requests with separate backend credentials. See [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) for details including the presigned URL flow diagram.
+# Auth (optional — both required to enable SigV4)
+DGP_ACCESS_KEY_ID=mykey
+DGP_SECRET_ACCESS_KEY=mysecret
 
-### Environment Variables
-
-```bash
-# Server
-DGP_LISTEN_ADDR=0.0.0.0:9000
-
-# Authentication (optional — both must be set to enable)
-DGP_ACCESS_KEY_ID=...
-DGP_SECRET_ACCESS_KEY=...
-
-# Logging
-DGP_LOG_LEVEL=deltaglider_proxy=info,tower_http=info  # Overridden by RUST_LOG; changeable at runtime via admin GUI
-
-# DeltaGlider
-DGP_MAX_DELTA_RATIO=0.5      # Store as delta if ratio < 50%
-DGP_MAX_OBJECT_SIZE=104857600 # 100MB max (xdelta3 constraint)
-DGP_CACHE_MB=100              # Reference cache for fast reconstruction
-
-# Filesystem backend
-DGP_DATA_DIR=./data
+# TLS (optional — omit cert/key for auto self-signed)
+DGP_TLS_ENABLED=true
 
 # S3 backend
 DGP_S3_ENDPOINT=http://localhost:9000
 DGP_S3_REGION=us-east-1
-DGP_S3_PATH_STYLE=true
-DGP_BE_AWS_ACCESS_KEY_ID=...
-DGP_BE_AWS_SECRET_ACCESS_KEY=...
+DGP_BE_AWS_ACCESS_KEY_ID=backend-key
+DGP_BE_AWS_SECRET_ACCESS_KEY=backend-secret
 ```
 
-### Config File
+Full reference: [deltaglider_proxy.toml.example](deltaglider_proxy.toml.example)
+
+## S3 compatibility
+
+Implements the S3 operations that matter for object storage workloads:
+
+| | Operations |
+|-|------------|
+| **Objects** | PutObject, GetObject, HeadObject, DeleteObject, CopyObject |
+| **Listing** | ListObjectsV2, DeleteObjects (batch) |
+| **Buckets** | CreateBucket, HeadBucket, DeleteBucket, ListBuckets |
+| **Multipart** | Create, UploadPart, Complete, Abort, ListParts, ListUploads |
+| **Auth** | SigV4 header auth, presigned URLs |
+
+Not implemented: versioning, ACLs, lifecycle policies.
+
+## Architecture
+
+~9K lines of Rust. Async throughout (Tokio + axum). No database — state is derived from storage metadata.
+
+```
+S3 request
+  → SigV4 auth (optional)
+  → FileRouter (delta-eligible vs passthrough)
+  → DeltaGlider engine (compress / reconstruct / cache)
+  → StorageBackend trait (filesystem or S3)
+```
+
+- SHA-256 verified on every GET. Corruption detected immediately.
+- LRU reference cache for fast reconstruction.
+- `x-amz-storage-type` response header exposes strategy (delta/passthrough/reference) for debugging.
+
+## Requirements
+
+- **xdelta3** CLI must be installed (`apt install xdelta3` / `brew install xdelta3`)
+- Rust 1.75+ to build from source
+- Node.js 18+ to build the demo UI (or use Docker, which handles both)
+
+## Docker
+
+Multi-stage build. UI, Rust compilation, and slim Debian runtime. Multi-arch images published on release.
 
 ```bash
-./deltaglider_proxy --config deltaglider_proxy.toml
+docker build -t deltaglider-proxy .
+# or
+docker compose up -d  # includes MinIO for S3 backend
 ```
 
-See [deltaglider_proxy.toml.example](deltaglider_proxy.toml.example) for all options.
+## Docs
 
-### CLI
-
-```
-deltaglider_proxy 0.1.3
-S3-compatible proxy with delta compression
-
-USAGE:
-    deltaglider_proxy [OPTIONS]
-
-OPTIONS:
-    -c, --config <FILE>     Path to configuration file
-    -l, --listen <ADDR>     Listen address (overrides config)
-    -v, --verbose           Enable verbose logging
-    -h, --help              Print help
-    -V, --version           Print version
-```
-
-## Demo UI
-
-An embedded React-based S3 browser ships inside the binary (via [rust-embed](https://crates.io/crates/rust-embed)). It starts automatically on **S3 port + 1** — no extra container needed.
-
-```bash
-# Local dev: build the UI first, then the Rust binary
-cd demo/s3-browser/ui && npm install && npm run build && cd -
-cargo run -- --listen 127.0.0.1:9002
-# S3 API  → http://localhost:9002
-# Demo UI → http://localhost:9003  (auto-connects to S3 API)
-
-# Docker: the Dockerfile handles the Node build automatically
-cd demo/s3-browser && docker compose up --build
-# S3 API  → http://localhost:9002
-# Demo UI → http://localhost:9003
-```
-
-The UI auto-detects the S3 endpoint (port - 1) from its own URL, so it works out of the box with zero configuration. Features include dark/light theme switching (persisted to localStorage), multi-environment management for connecting to different S3 backends, an admin settings panel, and drag-and-drop uploads with delta compression stats.
-
-## Contributing
-
-See [CONTRIBUTING.md](docs/CONTRIBUTING.md) for build instructions, project structure, and how to submit changes.
-
-## S3 API Compatibility
-
-DeltaGlider Proxy intercepts the S3 operations it needs for delta compression (PUT, GET, HEAD, DELETE, LIST, COPY, multipart upload) and handles them directly. Other S3 operations are not currently proxied through to the backend.
-
-| Operation | Status | Notes |
-|-----------|--------|-------|
-| PutObject | ✅ | Delta compression applied when eligible |
-| GetObject | ✅ | Transparent reconstruction from deltas |
-| HeadObject | ✅ | Returns original object metadata |
-| DeleteObject | ✅ | Cleans up deltas and references |
-| ListObjectsV2 | ✅ | Returns logical keys (hides delta internals) |
-| DeleteObjects | ✅ | Batch delete |
-| CopyObject | ✅ | Via x-amz-copy-source header |
-| CreateBucket | ✅ | Multi-bucket support |
-| HeadBucket | ✅ | Multi-bucket support |
-| DeleteBucket | ✅ | Must be empty |
-| ListBuckets | ✅ | Lists all buckets |
-| CreateMultipartUpload | ✅ | `POST /{bucket}/{key}?uploads` |
-| UploadPart | ✅ | `PUT /{bucket}/{key}?partNumber=N&uploadId=X` |
-| CompleteMultipartUpload | ✅ | `POST /{bucket}/{key}?uploadId=X` |
-| AbortMultipartUpload | ✅ | `DELETE /{bucket}/{key}?uploadId=X` |
-| ListParts | ✅ | `GET /{bucket}/{key}?uploadId=X` |
-| ListMultipartUploads | ✅ | `GET /{bucket}?uploads` |
-| Versioning | ❌ | Not supported |
-| ACLs, lifecycle | ❌ | Not supported |
-
-## Performance
-
-PUT responses include `x-amz-storage-type`:
-
-```bash
-curl -i -X PUT --data-binary @releases/v2.zip http://localhost:9000/default/releases/v2.zip
-# x-amz-storage-type: delta  # or "passthrough"
-```
-
-Typical savings for versioned artifacts:
-
-| Use Case | Typical Savings |
-|----------|-----------------|
-| Docker layers | 60-80% |
-| ML model checkpoints | 70-90% |
-| Game builds | 50-70% |
-| Firmware images | 80-95% |
-
-## Architecture Notes
-
-- **No database**: State is derived from storage. Each file carries checksums and storage info in metadata (xattr on filesystem, S3 user metadata headers on S3).
-- **Checksums everywhere**: SHA-256 verified on every GET. Corruption is detected immediately.
-- **Async throughout**: Tokio runtime, async S3 SDK, non-blocking I/O.
-- **Dynamic backends**: Same code paths for filesystem and S3. Backend is a trait object.
+- [Operations guide](docs/OPERATIONS.md)
+- [Storage format internals](docs/STORAGE_FORMAT.md)
+- [Authentication & presigned URLs](docs/AUTHENTICATION.md)
+- [Contributing](docs/CONTRIBUTING.md)
 
 ## License
 
-GPLv2 (GPL-2.0-only).
-
-See [LICENSE](LICENSE) for the full license text.
-
-## See Also
-
-- [xdelta3](https://github.com/jmacd/xdelta) - The delta compression library
-- [rsync](https://rsync.samba.org/) - Rolling checksums, different approach
-- [casync](https://github.com/systemd/casync) - Content-addressable sync
+[GPLv2](LICENSE)
