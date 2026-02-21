@@ -9,7 +9,7 @@ RUN npm run build
 # ── Build stage: Rust dependency cache ──
 FROM rust:1-bookworm AS rust-deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    clang libclang-dev pkg-config \
+    pkg-config \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
@@ -23,7 +23,12 @@ RUN mkdir -p src && echo 'fn main() {}' > src/main.rs && touch src/lib.rs \
 FROM rust-deps AS rust-build
 COPY src/ src/
 COPY --from=ui-build /app/demo/s3-browser/ui/dist demo/s3-browser/ui/dist
-RUN cargo build --release
+# Remove all dummy crate artifacts so cargo fully rebuilds our code
+RUN rm -f target/release/deltaglider_proxy \
+           target/release/deps/deltaglider_proxy-* \
+           target/release/deps/libdeltaglider_proxy-* \
+    && rm -rf target/release/.fingerprint/deltaglider_proxy-* \
+    && cargo build --release
 
 # ── Runtime ──
 FROM debian:bookworm-slim
