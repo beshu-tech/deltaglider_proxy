@@ -19,7 +19,7 @@ GET releases/v2.zip ──▶ DeltaGlider ──▶ reconstructed, streamed back
 
 ```bash
 # Docker (easiest)
-docker run -p 9000:9000 -p 9001:9001 beshutech/deltaglider-proxy
+docker run -p 9000:9000 -p 9001:9001 beshultd/deltaglider_proxy
 
 # Or build from source
 cd demo/s3-browser/ui && npm ci && npm run build && cd -
