@@ -1,6 +1,6 @@
 [package]
 name = "deltaglider_proxy"
-version = "0.1.6"
+version = "0.1.7"
 description = "S3-compatible proxy with transparent delta compression"
 license = "GPL-2.0-only"
 readme = "README.md"
@@ -25,8 +25,7 @@ aws-credential-types = "1"
 # Async support
 async-trait = "0.1"
 
-# Delta compression
-xdelta3 = "0.1.5"
+# Delta compression (uses xdelta3 CLI binary, no Rust crate needed)
 
 # TLS certificate generation
 rcgen = "0.13"
