@@ -314,11 +314,6 @@ pub async fn sigv4_auth_middleware(
         return Ok(next.run(request).await);
     }
 
-    // Let /health through unauthenticated — used by Docker HEALTHCHECK and load balancers
-    if request.uri().path() == "/health" {
-        return Ok(next.run(request).await);
-    }
-
     let query_string = request.uri().query().unwrap_or("");
     let params = if has_presigned_query_params(query_string) {
         SigV4Params::from_query(&request)?
