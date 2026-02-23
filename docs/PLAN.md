@@ -37,7 +37,7 @@ DeltaGlider Proxy is an S3-compatible object storage server implementing the **D
 │  └─────────────┘  └──────────────┘  └────────────────────────┘  │
 ├─────────────────────────────────────────────────────────────────┤
 │                      Storage Backend                            │
-│              Filesystem with metadata (xattr/sidecar)           │
+│              Filesystem with metadata (xattr / S3 headers)      │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -193,7 +193,7 @@ pub struct Config {
 3. **Storage backend**
    - `StorageBackend` trait: `put`, `get`, `list`, `delete`, `exists`
    - Filesystem implementation with directory structure
-   - Metadata storage via sidecar `.meta.json` files
+   - Metadata storage via xattr (filesystem) or S3 user metadata headers (S3)
 
 4. **S3 API handlers**
    - PUT: `PUT /{bucket}/{key}` → store object

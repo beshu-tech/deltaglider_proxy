@@ -1,6 +1,6 @@
-import { useState, useEffect } from 'react';
-import { Drawer, Button, message, Tag, Skeleton } from 'antd';
-import { DownloadOutlined, DeleteOutlined, LinkOutlined, FileOutlined, CloseOutlined } from '@ant-design/icons';
+import { useState, useEffect, useRef } from 'react';
+import { Drawer, Button, Modal, message, Tag, Skeleton, Input, Spin } from 'antd';
+import { DownloadOutlined, DeleteOutlined, LinkOutlined, FileOutlined, CloseOutlined, CheckCircleFilled, CopyOutlined, LoadingOutlined } from '@ant-design/icons';
 import { deleteObject, downloadObject, getPresignedUrl, getObjectUrl, headObject } from '../s3client';
 import { formatBytes } from '../utils';
 import type { S3Object } from '../types';
@@ -35,6 +35,14 @@ export default function InspectorPanel({ object, onClose, onDeleted, isMobile, h
 
   const [headData, setHeadData] = useState<{ headers: Record<string, string>; storageType?: string; storedSize?: number } | null>(null);
   const [headLoading, setHeadLoading] = useState(false);
+
+  // Modal state for download / share operations (must be declared before early return)
+  const [modalState, setModalState] = useState<
+    | { mode: 'download'; phase: 'loading' | 'ready' | 'error'; error?: string }
+    | { mode: 'share'; phase: 'loading' | 'ready' | 'error'; url?: string; error?: string }
+    | null
+  >(null);
+  const blobRef = useRef<{ blob: Blob; name: string } | null>(null);
 
   useEffect(() => {
     if (!object) { setHeadData(null); return; }
@@ -112,31 +120,50 @@ export default function InspectorPanel({ object, onClose, onDeleted, isMobile, h
   };
 
   const handleDownload = async () => {
-    const blob = await downloadObject(object.key);
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = fileName;
-    a.click();
-    URL.revokeObjectURL(url);
-  };
-
-  const generateUrl = async (): Promise<string> => {
+    setModalState({ mode: 'download', phase: 'loading' });
+    blobRef.current = null;
     try {
-      return await getPresignedUrl(object.key);
+      const blob = await downloadObject(object.key);
+      blobRef.current = { blob, name: fileName };
+      setModalState({ mode: 'download', phase: 'ready' });
     } catch (e) {
-      console.warn('Presigned URL failed, falling back to direct URL:', e);
-      return getObjectUrl(object.key);
+      setModalState({ mode: 'download', phase: 'error', error: String(e) });
     }
   };
 
+  const triggerBlobDownload = () => {
+    if (!blobRef.current) return;
+    const url = URL.createObjectURL(blobRef.current.blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = blobRef.current.name;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    setModalState(null);
+  };
+
   const handleCopyLink = async () => {
+    setModalState({ mode: 'share', phase: 'loading' });
     try {
-      const url = await generateUrl();
-      await navigator.clipboard.writeText(url);
+      let url: string;
+      try {
+        url = await getPresignedUrl(object.key);
+      } catch (e) {
+        console.warn('Presigned URL failed, falling back to direct URL:', e);
+        url = getObjectUrl(object.key);
+      }
+      setModalState({ mode: 'share', phase: 'ready', url });
+    } catch (e) {
+      setModalState({ mode: 'share', phase: 'error', error: String(e) });
+    }
+  };
+
+  const handleCopyUrl = async () => {
+    if (modalState?.mode === 'share' && modalState.url) {
+      await navigator.clipboard.writeText(modalState.url);
       messageApi.success('Link copied');
-    } catch {
-      messageApi.error('Failed to copy link');
     }
   };
 
@@ -357,6 +384,148 @@ export default function InspectorPanel({ object, onClose, onDeleted, isMobile, h
           </div>
         </div>
       </Drawer>
+
+      {/* Download / Share modal */}
+      <Modal
+        open={!!modalState}
+        onCancel={() => { setModalState(null); blobRef.current = null; }}
+        footer={null}
+        centered
+        width={420}
+        closable={modalState?.phase !== 'loading'}
+        mask={{ closable: modalState?.phase !== 'loading' }}
+        styles={{ body: { padding: '32px 24px', textAlign: 'center' } }}
+      >
+        {modalState?.mode === 'download' && (
+          <>
+            {modalState.phase === 'loading' && (
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 16 }}>
+                <Spin indicator={<LoadingOutlined style={{ fontSize: 40, color: ACCENT_GREEN }} />} />
+                <div>
+                  <div style={{ fontSize: 16, fontWeight: 600, color: TEXT_PRIMARY, marginBottom: 6, fontFamily: "var(--font-ui)" }}>
+                    Reconstructing file…
+                  </div>
+                  <div style={{ fontSize: 13, color: TEXT_MUTED, lineHeight: 1.5, fontFamily: "var(--font-ui)" }}>
+                    The proxy is assembling the original file from its
+                    delta-compressed storage. This may take a moment for
+                    large files.
+                  </div>
+                  <div style={{ fontSize: 12, color: TEXT_FAINT, marginTop: 8, fontFamily: "var(--font-mono)" }}>
+                    {fileName} · {formatBytes(object.size)}
+                  </div>
+                </div>
+              </div>
+            )}
+            {modalState.phase === 'ready' && (
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 16 }}>
+                <CheckCircleFilled style={{ fontSize: 40, color: ACCENT_GREEN }} />
+                <div>
+                  <div style={{ fontSize: 16, fontWeight: 600, color: TEXT_PRIMARY, marginBottom: 6, fontFamily: "var(--font-ui)" }}>
+                    File ready
+                  </div>
+                  <div style={{ fontSize: 12, color: TEXT_FAINT, fontFamily: "var(--font-mono)" }}>
+                    {fileName} · {formatBytes(object.size)}
+                  </div>
+                </div>
+                <Button
+                  type="primary"
+                  size="large"
+                  icon={<DownloadOutlined />}
+                  onClick={triggerBlobDownload}
+                  style={{
+                    background: ACCENT_GREEN,
+                    borderColor: ACCENT_GREEN,
+                    fontWeight: 600,
+                    borderRadius: 10,
+                    fontFamily: "var(--font-ui)",
+                    minWidth: 180,
+                  }}
+                >
+                  Save file
+                </Button>
+              </div>
+            )}
+            {modalState.phase === 'error' && (
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 16 }}>
+                <DeleteOutlined style={{ fontSize: 40, color: ACCENT_RED }} />
+                <div>
+                  <div style={{ fontSize: 16, fontWeight: 600, color: ACCENT_RED, marginBottom: 6, fontFamily: "var(--font-ui)" }}>
+                    Download failed
+                  </div>
+                  <div style={{ fontSize: 13, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>
+                    {modalState.error || 'An unexpected error occurred'}
+                  </div>
+                </div>
+              </div>
+            )}
+          </>
+        )}
+
+        {modalState?.mode === 'share' && (
+          <>
+            {modalState.phase === 'loading' && (
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 16 }}>
+                <Spin indicator={<LoadingOutlined style={{ fontSize: 40, color: ACCENT_BLUE }} />} />
+                <div>
+                  <div style={{ fontSize: 16, fontWeight: 600, color: TEXT_PRIMARY, marginBottom: 6, fontFamily: "var(--font-ui)" }}>
+                    Generating signed link…
+                  </div>
+                  <div style={{ fontSize: 13, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>
+                    Creating a pre-signed URL for direct access.
+                  </div>
+                </div>
+              </div>
+            )}
+            {modalState.phase === 'ready' && (
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 16 }}>
+                <CheckCircleFilled style={{ fontSize: 40, color: ACCENT_BLUE }} />
+                <div style={{ width: '100%' }}>
+                  <div style={{ fontSize: 16, fontWeight: 600, color: TEXT_PRIMARY, marginBottom: 12, fontFamily: "var(--font-ui)" }}>
+                    Signed link ready
+                  </div>
+                  <Input.TextArea
+                    value={modalState.url}
+                    readOnly
+                    autoSize={{ minRows: 2, maxRows: 4 }}
+                    style={{
+                      fontFamily: "var(--font-mono)",
+                      fontSize: 12,
+                      borderRadius: 8,
+                      marginBottom: 12,
+                    }}
+                  />
+                  <Button
+                    type="primary"
+                    icon={<CopyOutlined />}
+                    onClick={handleCopyUrl}
+                    style={{
+                      fontWeight: 600,
+                      borderRadius: 10,
+                      fontFamily: "var(--font-ui)",
+                      minWidth: 180,
+                    }}
+                  >
+                    Copy link
+                  </Button>
+                </div>
+              </div>
+            )}
+            {modalState.phase === 'error' && (
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 16 }}>
+                <DeleteOutlined style={{ fontSize: 40, color: ACCENT_RED }} />
+                <div>
+                  <div style={{ fontSize: 16, fontWeight: 600, color: ACCENT_RED, marginBottom: 6, fontFamily: "var(--font-ui)" }}>
+                    Failed to generate link
+                  </div>
+                  <div style={{ fontSize: 13, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>
+                    {modalState.error || 'An unexpected error occurred'}
+                  </div>
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </Modal>
     </>
   );
 }

@@ -41,7 +41,7 @@ pub enum StorageError {
 }
 
 /// Abstract storage backend for S3-like object storage
-/// Uses per-file metadata following DeltaGlider schema (xattr on filesystem, sidecars on S3)
+/// Uses per-file metadata following DeltaGlider schema (xattr on filesystem, S3 user metadata headers on S3)
 ///
 /// This trait is object-safe and can be used with `Box<dyn StorageBackend>`.
 ///
