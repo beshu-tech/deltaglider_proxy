@@ -686,8 +686,39 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         let metadata = self
             .resolve_metadata_with_migration(bucket, &deltaspace_id, &obj_key)
-            .await?
-            .ok_or_else(|| EngineError::NotFound(obj_key.full_key()))?;
+            .await?;
+
+        let metadata = match metadata {
+            Some(m) => m,
+            None => {
+                // No DG metadata — try streaming directly from the original key
+                // (file may exist in upstream storage but was never processed by DG)
+                info!(
+                    "No DG metadata for {}/{}, attempting direct passthrough",
+                    bucket, key
+                );
+                match self
+                    .storage
+                    .get_passthrough_stream(bucket, &deltaspace_id, &obj_key.filename)
+                    .await
+                {
+                    Ok(stream) => {
+                        let fallback_meta = FileMetadata::new_passthrough(
+                            obj_key.filename.clone(),
+                            String::new(),
+                            String::new(),
+                            0,
+                            None,
+                        );
+                        return Ok(RetrieveResponse::Streamed {
+                            stream,
+                            metadata: fallback_meta,
+                        });
+                    }
+                    Err(_) => return Err(EngineError::NotFound(obj_key.full_key())),
+                }
+            }
+        };
 
         info!(
             "Retrieving {}/{} (stored as {})",
@@ -781,9 +812,22 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
         let deltaspace_id = obj_key.deltaspace_id();
 
-        self.resolve_metadata_with_migration(bucket, &deltaspace_id, &obj_key)
+        match self
+            .resolve_metadata_with_migration(bucket, &deltaspace_id, &obj_key)
             .await?
-            .ok_or_else(|| EngineError::NotFound(obj_key.full_key()))
+        {
+            Some(meta) => Ok(meta),
+            None => {
+                // No DG metadata — try reading passthrough metadata (lightweight HEAD).
+                // If that also fails (unmanaged file with no DG headers), return NotFound.
+                // The UI handles HEAD failures gracefully; the download path
+                // (retrieve_stream) has its own fallback for unmanaged files.
+                self.storage
+                    .get_passthrough_metadata(bucket, &deltaspace_id, &obj_key.filename)
+                    .await
+                    .map_err(|_| EngineError::NotFound(obj_key.full_key()))
+            }
+        }
     }
 
     /// Returns `true` if a local prefix (bucket-relative) could contain keys

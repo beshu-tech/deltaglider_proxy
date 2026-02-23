@@ -40,7 +40,7 @@ HTTP request
   → deltaglider/engine.rs   Orchestration: route, compress, cache, reconstruct
   → storage/traits.rs       StorageBackend trait (async_trait, object-safe)
   → storage/filesystem.rs   Local filesystem impl (xattr metadata)
-  → storage/s3.rs           AWS S3/MinIO impl (sidecar .meta files)
+  → storage/s3.rs           AWS S3/MinIO impl (S3 user metadata headers)
 ```
 
 **Key data flow:**

@@ -71,7 +71,7 @@ Even with atomic individual writes, the *order* matters. If we write metadata fi
 
 **Changes**:
 - Ensure all `put_*` methods write data file FIRST, then metadata
-- Verify `scan_deltaspace` only returns objects with valid `.meta` files (already the case)
+- Verify `scan_deltaspace` only returns objects with valid metadata (already the case)
 - Add startup log warning for orphaned data files (data without metadata)
 
 ### 1.6 ✅ Per-DeltaSpace Concurrency Control (Striped Locking)
