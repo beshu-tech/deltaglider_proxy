@@ -235,15 +235,9 @@ pub fn mutate_binary(data: &[u8], change_ratio: f64) -> Vec<u8> {
 
 // === MinIO gating ===
 
-/// Check if MinIO is available (TCP probe + ListBuckets with 2s timeout)
-pub async fn minio_available() -> bool {
-    // Quick TCP check first
-    if std::net::TcpStream::connect("localhost:9000").is_err() {
-        return false;
-    }
-
+/// Create an S3 client pointing directly at MinIO (not through the proxy)
+pub async fn minio_client() -> Client {
     let credentials = Credentials::new(MINIO_ACCESS_KEY, MINIO_SECRET_KEY, None, None, "test");
-
     let config = aws_sdk_s3::Config::builder()
         .behavior_version(BehaviorVersion::latest())
         .region(Region::new("us-east-1"))
@@ -251,8 +245,17 @@ pub async fn minio_available() -> bool {
         .credentials_provider(credentials)
         .force_path_style(true)
         .build();
+    Client::from_conf(config)
+}
 
-    let client = Client::from_conf(config);
+/// Check if MinIO is available (TCP probe + HeadBucket with 2s timeout)
+pub async fn minio_available() -> bool {
+    // Quick TCP check first
+    if std::net::TcpStream::connect("localhost:9000").is_err() {
+        return false;
+    }
+
+    let client = minio_client().await;
 
     // Verify the specific test bucket exists (not just any S3-compatible service)
     let result = tokio::time::timeout(
