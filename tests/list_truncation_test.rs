@@ -36,8 +36,14 @@ async fn upload_test_tree(client: &Client, bucket: &str, prefix: &str) -> BTreeS
 
     // Root-level files
     for (name, body) in [
-        (format!("{prefix}/config.json"), b"{\"version\":\"test\"}".to_vec()),
-        (format!("{prefix}/README.txt"), b"Test artifact tree".to_vec()),
+        (
+            format!("{prefix}/config.json"),
+            b"{\"version\":\"test\"}".to_vec(),
+        ),
+        (
+            format!("{prefix}/README.txt"),
+            b"Test artifact tree".to_vec(),
+        ),
     ] {
         client
             .put_object()
@@ -171,8 +177,14 @@ async fn test_list_no_truncation_filesystem() {
 
     // Try multiple max_keys values to exercise pagination at different boundaries
     for max_keys in [5, 10, 20, 1000] {
-        let (keys, _) =
-            list_all_objects(&client, server.bucket(), &format!("{prefix}/"), None, max_keys).await;
+        let (keys, _) = list_all_objects(
+            &client,
+            server.bucket(),
+            &format!("{prefix}/"),
+            None,
+            max_keys,
+        )
+        .await;
 
         let key_set: BTreeSet<String> = keys.iter().cloned().collect();
 
@@ -249,7 +261,11 @@ async fn test_list_with_delimiter_filesystem() {
             "Missing version prefix {version}/, got: {prefix_set:?}"
         );
     }
-    assert_eq!(prefix_set.len(), 3, "Should have exactly 3 version prefixes");
+    assert_eq!(
+        prefix_set.len(),
+        3,
+        "Should have exactly 3 version prefixes"
+    );
 
     // Drill into build/1.0.0/ — should see 5 platform prefixes + release-notes.txt
     let (keys, prefixes) = list_all_objects(
@@ -297,8 +313,14 @@ async fn test_list_no_truncation_s3() {
     let expected = upload_test_tree(&client, server.bucket(), &prefix).await;
 
     for max_keys in [5, 10, 20, 1000] {
-        let (keys, _) =
-            list_all_objects(&client, server.bucket(), &format!("{prefix}/"), None, max_keys).await;
+        let (keys, _) = list_all_objects(
+            &client,
+            server.bucket(),
+            &format!("{prefix}/"),
+            None,
+            max_keys,
+        )
+        .await;
 
         let key_set: BTreeSet<String> = keys.iter().cloned().collect();
 
@@ -309,7 +331,8 @@ async fn test_list_no_truncation_s3() {
         );
 
         assert_eq!(
-            key_set, expected,
+            key_set,
+            expected,
             "max_keys={max_keys}: key set mismatch.\n  Missing: {:?}\n  Extra: {:?}",
             expected.difference(&key_set).collect::<Vec<_>>(),
             key_set.difference(&expected).collect::<Vec<_>>(),
@@ -398,7 +421,11 @@ async fn test_list_with_delimiter_s3() {
     let key_set: BTreeSet<String> = keys.into_iter().collect();
     let prefix_set: BTreeSet<String> = prefixes.into_iter().collect();
 
-    assert_eq!(key_set.len(), 2, "Root should have 2 files, got: {key_set:?}");
+    assert_eq!(
+        key_set.len(),
+        2,
+        "Root should have 2 files, got: {key_set:?}"
+    );
     assert!(
         prefix_set.contains(&format!("{prefix}/build/")),
         "Should contain build/ prefix"
@@ -483,7 +510,8 @@ async fn test_list_small_pages_s3() {
 
     // Exact match
     assert_eq!(
-        key_set, expected,
+        key_set,
+        expected,
         "Small pages: key set mismatch.\n  Missing: {:?}\n  Extra: {:?}",
         expected.difference(&key_set).collect::<Vec<_>>(),
         key_set.difference(&expected).collect::<Vec<_>>(),
