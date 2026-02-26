@@ -24,9 +24,4 @@ ignore = [
     # rustls-pemfile 2.2.0 (unmaintained): transitive from reqwest/aws-sdk TLS stack.
     # Upstream needs to migrate to rustls-pki-types PemObject.
     "RUSTSEC-2025-0134",
-
-    # protobuf 2.28.0 (stack overflow on untrusted input): transitive from prometheus 0.13.4.
-    # Cannot upgrade without prometheus migrating to protobuf v3. DoS-only, low risk
-    # since /metrics endpoint is not exposed to untrusted input.
-    "RUSTSEC-2024-0437",
 ]

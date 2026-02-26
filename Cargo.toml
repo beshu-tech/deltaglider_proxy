@@ -72,7 +72,7 @@ mime_guess = "2"
 clap = { version = "4", features = ["derive"] }
 
 # Metrics
-prometheus = { version = "0.13", features = ["process"] }
+prometheus = { version = "0.13", default-features = false, features = ["process"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
