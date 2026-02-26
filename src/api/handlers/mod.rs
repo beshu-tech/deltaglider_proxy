@@ -13,6 +13,7 @@ mod status;
 
 use super::errors::S3Error;
 use crate::deltaglider::DynEngine;
+use crate::metrics::Metrics;
 use crate::multipart::MultipartStore;
 use crate::types::{FileMetadata, StorageInfo};
 use arc_swap::ArcSwap;
@@ -28,10 +29,14 @@ pub use multipart::post_object;
 pub use object::{delete_object, delete_objects, get_object, head_object, put_object_or_copy};
 pub use status::{get_stats, head_root, health_check, HealthResponse, StatsQuery, StatsResponse};
 
+// Re-export for use by metrics module
+pub(crate) use status::get_peak_rss_bytes;
+
 /// Application state shared across handlers
 pub struct AppState {
     pub engine: ArcSwap<DynEngine>,
     pub multipart: Arc<MultipartStore>,
+    pub metrics: Option<Arc<Metrics>>,
 }
 
 /// Query parameters for object-level operations (multipart upload)
@@ -59,9 +64,16 @@ fn build_object_headers(metadata: &FileMetadata) -> HeaderMap {
         .clone()
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
+    // PERF: itoa::Buffer is stack-allocated (~40 bytes) and formats integers
+    // directly to a &str without heap allocation. The old code used
+    // `metadata.file_size.to_string()` which heap-allocates a String per call.
+    // This function is called on EVERY object response (GET, HEAD, LIST), so
+    // saving 3-4 heap allocs per request adds up. Do NOT replace with .to_string().
+    let mut itoa_buf = itoa::Buffer::new();
+
     let mut headers = HeaderMap::new();
     headers.insert("ETag", hval(&metadata.etag()));
-    headers.insert("Content-Length", hval(&metadata.file_size.to_string()));
+    headers.insert("Content-Length", hval(itoa_buf.format(metadata.file_size)));
     headers.insert("Content-Type", hval(&content_type));
     headers.insert(
         "Last-Modified",
@@ -73,14 +85,17 @@ fn build_object_headers(metadata: &FileMetadata) -> HeaderMap {
         ),
     );
     headers.insert("x-amz-storage-type", hval(metadata.storage_info.label()));
-    headers.insert("x-deltaglider-stored-size", hval(&stored_size.to_string()));
+    headers.insert(
+        "x-deltaglider-stored-size",
+        hval(itoa_buf.format(stored_size)),
+    );
 
     // DeltaGlider custom metadata (x-amz-meta-dg-*)
     use crate::types::meta_keys as mk;
     headers.insert(mk::H_TOOL, hval(&metadata.tool));
     headers.insert(mk::H_ORIGINAL_NAME, hval(&metadata.original_name));
     headers.insert(mk::H_FILE_SHA256, hval(&metadata.file_sha256));
-    headers.insert(mk::H_FILE_SIZE, hval(&metadata.file_size.to_string()));
+    headers.insert(mk::H_FILE_SIZE, hval(itoa_buf.format(metadata.file_size)));
 
     match &metadata.storage_info {
         StorageInfo::Reference { source_name } => {
@@ -96,7 +111,7 @@ fn build_object_headers(metadata: &FileMetadata) -> HeaderMap {
             headers.insert(mk::H_NOTE, hval("delta"));
             headers.insert(mk::H_REF_KEY, hval(ref_key));
             headers.insert(mk::H_REF_SHA256, hval(ref_sha256));
-            headers.insert(mk::H_DELTA_SIZE, hval(&delta_size.to_string()));
+            headers.insert(mk::H_DELTA_SIZE, hval(itoa_buf.format(*delta_size)));
             headers.insert(mk::H_DELTA_CMD, hval(delta_cmd));
         }
         StorageInfo::Passthrough => {
@@ -137,9 +152,15 @@ fn extract_content_type(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Parse request body as UTF-8 string, mapping errors to MalformedXML.
-fn body_to_utf8(body: &axum::body::Bytes) -> Result<String, S3Error> {
-    String::from_utf8(body.to_vec()).map_err(|_| S3Error::MalformedXML)
+/// Parse request body as UTF-8, mapping errors to MalformedXML.
+///
+/// PERF: Returns a borrowed `&str` into the existing `Bytes` buffer — zero-copy.
+/// The old code used `String::from_utf8(body.to_vec())` which copied the entire
+/// request body into a new Vec, then into a String. For a 100KB XML delete request,
+/// that was 200KB of unnecessary allocation.
+/// Do NOT change the return type to `String` or call `body.to_vec()`.
+fn body_to_utf8(body: &axum::body::Bytes) -> Result<&str, S3Error> {
+    std::str::from_utf8(body).map_err(|_| S3Error::MalformedXML)
 }
 
 /// Extract user-provided x-amz-meta-* headers, excluding DeltaGlider internal metadata (dg-*).

@@ -9,14 +9,15 @@ use super::traits::{DelegatedListResult, StorageBackend, StorageError};
 use crate::config::BackendConfig;
 use crate::types::{FileMetadata, StorageInfo};
 use async_trait::async_trait;
-use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
+use aws_sdk_s3::config::BehaviorVersion;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::stream::BoxStream;
+use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
 
 use tracing::{debug, instrument};
@@ -45,6 +46,12 @@ pub struct S3Backend {
 }
 
 impl S3Backend {
+    /// Max concurrent HEAD requests to avoid S3 503 SlowDown throttling.
+    /// See `bounded_head_calls()` for rationale.
+    const MAX_CONCURRENT_HEADS: usize = 50;
+}
+
+impl S3Backend {
     /// Build an S3 client from a BackendConfig without creating an S3Backend.
     /// Useful for one-off operations like testing connectivity.
     pub async fn build_client(config: &BackendConfig) -> Result<Client, StorageError> {
@@ -70,38 +77,31 @@ impl S3Backend {
             }
         };
 
-        // Build AWS SDK config
-        let mut config_loader = aws_config::defaults(BehaviorVersion::latest())
-            .region(aws_sdk_s3::config::Region::new(region));
-
-        // Set custom endpoint if provided (for MinIO, LocalStack, etc.)
-        if let Some(ref ep) = endpoint {
-            config_loader = config_loader.endpoint_url(ep);
-        }
-
         // Require explicit credentials — never fall back to the default AWS credential chain
         // (env vars, ~/.aws/credentials, instance metadata, etc.)
-        match (access_key_id, secret_access_key) {
+        let credentials = match (access_key_id, secret_access_key) {
             (Some(ref key_id), Some(ref secret)) => {
-                let credentials =
-                    Credentials::new(key_id, secret, None, None, "deltaglider_proxy-config");
-                config_loader = config_loader.credentials_provider(credentials);
+                Credentials::new(key_id, secret, None, None, "deltaglider_proxy-config")
             }
             _ => {
                 return Err(StorageError::Other(
                     "S3 backend requires explicit credentials: set DGP_BE_AWS_ACCESS_KEY_ID and DGP_BE_AWS_SECRET_ACCESS_KEY".to_string(),
                 ));
             }
+        };
+
+        // Build S3 client directly — no aws-config needed since we use static credentials
+        let mut s3_config_builder = aws_sdk_s3::config::Builder::new()
+            .behavior_version(BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new(region))
+            .credentials_provider(credentials)
+            .force_path_style(force_path_style);
+
+        if let Some(ref ep) = endpoint {
+            s3_config_builder = s3_config_builder.endpoint_url(ep);
         }
 
-        let sdk_config = config_loader.load().await;
-
-        // Build S3-specific config with path-style option
-        let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
-            .force_path_style(force_path_style)
-            .build();
-
-        Ok(Client::from_conf(s3_config))
+        Ok(Client::from_conf(s3_config_builder.build()))
     }
 
     /// Create a new S3 backend from configuration
@@ -524,6 +524,38 @@ impl S3Backend {
         (classified, dir_markers)
     }
 
+    /// Fire bounded parallel HEAD calls for a set of S3 keys, returning metadata
+    /// for each key that responded successfully.
+    ///
+    /// PERF: Uses `buffer_unordered(MAX_CONCURRENT_HEADS)` instead of `join_all()`
+    /// to avoid blasting thousands of concurrent HEADs at S3 (which triggers 503
+    /// SlowDown throttling). Do NOT replace with `join_all()`.
+    ///
+    /// LIFETIME SUBTLETY: Keys and bucket are cloned into owned Strings and futures
+    /// are collected into a Vec BEFORE streaming. Without this, the async closures
+    /// capture `&self` and `&str` which can't satisfy the `'static` bound that
+    /// `buffer_unordered` requires.
+    async fn bounded_head_calls<'a, I>(&self, bucket: &str, keys: I) -> HashMap<String, FileMetadata>
+    where
+        I: Iterator<Item = &'a str>,
+    {
+        let head_futs: Vec<_> = keys
+            .map(|key| {
+                let key = key.to_string();
+                let bucket = bucket.to_string();
+                async move {
+                    let meta_result = self.get_object_metadata(&bucket, &key).await;
+                    (key, meta_result)
+                }
+            })
+            .collect();
+        futures::stream::iter(head_futs)
+            .buffer_unordered(Self::MAX_CONCURRENT_HEADS)
+            .filter_map(|(key, result)| async move { result.ok().map(|meta| (key, meta)) })
+            .collect()
+            .await
+    }
+
     /// Fire parallel HEAD calls for classified objects that need them (deltas),
     /// then resolve each entry to final `(user_key, FileMetadata)` pairs,
     /// deduplicating by user key (keeping the latest version).
@@ -533,24 +565,15 @@ impl S3Backend {
         classified: Vec<ClassifiedObject>,
         mut seed_results: Vec<(String, FileMetadata)>,
     ) -> Vec<(String, FileMetadata)> {
-        // Parallel HEAD calls for delta files
-        let head_futures: Vec<_> = classified
-            .iter()
-            .filter(|c| c.needs_head)
-            .map(|c| {
-                let s3_key = c.s3_key.clone();
-                async move {
-                    let meta_result = self.get_object_metadata(bucket, &s3_key).await;
-                    (s3_key, meta_result)
-                }
-            })
-            .collect();
-
-        let head_results: HashMap<String, FileMetadata> = futures::future::join_all(head_futures)
-            .await
-            .into_iter()
-            .filter_map(|(key, result)| result.ok().map(|meta| (key, meta)))
-            .collect();
+        let head_results = self
+            .bounded_head_calls(
+                bucket,
+                classified
+                    .iter()
+                    .filter(|c| c.needs_head)
+                    .map(|c| c.s3_key.as_str()),
+            )
+            .await;
 
         // Dedup by user key, keeping latest version
         let mut latest: HashMap<String, FileMetadata> = HashMap::new();
@@ -1027,20 +1050,9 @@ impl StorageBackend for S3Backend {
             items.push((obj, is_delta));
         }
 
-        // Parallel HEAD calls for delta files
-        let head_futures: Vec<_> = delta_keys
-            .iter()
-            .map(|key| async move {
-                let meta_result = self.get_object_metadata(bucket, key).await;
-                (key.clone(), meta_result)
-            })
-            .collect();
-
-        let head_results: HashMap<String, FileMetadata> = futures::future::join_all(head_futures)
-            .await
-            .into_iter()
-            .filter_map(|(key, result)| result.ok().map(|meta| (key, meta)))
-            .collect();
+        let head_results = self
+            .bounded_head_calls(bucket, delta_keys.iter().map(|k| k.as_str()))
+            .await;
 
         let metadata_list: Vec<FileMetadata> = items
             .into_iter()

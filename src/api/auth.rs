@@ -14,6 +14,7 @@
 //! downstream by the engine's SHA-256 check).
 
 use super::S3Error;
+use crate::metrics::Metrics;
 use axum::body::Body;
 use axum::http::Request;
 use axum::middleware::Next;
@@ -289,6 +290,19 @@ pub async fn sigv4_auth_middleware(
         .cloned()
         .flatten();
 
+    let metrics = request
+        .extensions()
+        .get::<Option<Arc<Metrics>>>()
+        .cloned()
+        .flatten();
+
+    let record_auth_failure = |reason: &str| {
+        if let Some(m) = &metrics {
+            m.auth_attempts_total.with_label_values(&["failure"]).inc();
+            m.auth_failures_total.with_label_values(&[reason]).inc();
+        }
+    };
+
     let auth = match auth {
         Some(a) => a,
         None => return Ok(next.run(request).await),
@@ -316,16 +330,40 @@ pub async fn sigv4_auth_middleware(
 
     let query_string = request.uri().query().unwrap_or("");
     let params = if has_presigned_query_params(query_string) {
-        SigV4Params::from_query(&request)?
+        SigV4Params::from_query(&request).inspect_err(|_| {
+            record_auth_failure("invalid_presigned");
+        })?
     } else {
-        SigV4Params::from_headers(&request)?
+        SigV4Params::from_headers(&request).inspect_err(|_| {
+            record_auth_failure("missing_header");
+        })?
     };
 
-    let method = request.method().as_str().to_string();
-    let uri_path = request.uri().path().to_string();
-    let uri = request.uri().clone();
+    // PERF: Borrow method and uri_path as &str instead of .to_string(). These are
+    // called on EVERY authenticated request. The old code cloned both into owned
+    // Strings (2 heap allocs) just to pass them to verify_signature, which only
+    // needed &str. Do NOT add .to_string() here.
+    let method = request.method().as_str();
+    let uri_path = request.uri().path();
 
-    verify_signature(&params, &auth, &method, &uri_path, request.headers(), &uri)?;
+    match verify_signature(
+        &params,
+        &auth,
+        method,
+        uri_path,
+        request.headers(),
+        request.uri(),
+    ) {
+        Ok(()) => {
+            if let Some(m) = &metrics {
+                m.auth_attempts_total.with_label_values(&["success"]).inc();
+            }
+        }
+        Err(e) => {
+            record_auth_failure("invalid_signature");
+            return Err(e);
+        }
+    }
 
     Ok(next.run(request).await)
 }

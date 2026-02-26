@@ -365,7 +365,7 @@ pub async fn delete_objects(
     // Parse XML body
     let body_str = body_to_utf8(&body)?;
 
-    let delete_req = DeleteRequest::from_xml(&body_str).map_err(|e| {
+    let delete_req = DeleteRequest::from_xml(body_str).map_err(|e| {
         warn!("Failed to parse DeleteObjects XML: {}", e);
         S3Error::MalformedXML
     })?;

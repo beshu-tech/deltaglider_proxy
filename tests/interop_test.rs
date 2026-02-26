@@ -17,9 +17,8 @@
 //! - MinIO running on localhost:9000
 //! - Docker available for running deltaglider CLI
 
-use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
-use aws_sdk_s3::config::Region;
+use aws_sdk_s3::config::{BehaviorVersion, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use rand::{Rng, SeedableRng};

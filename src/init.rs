@@ -290,6 +290,8 @@ pub fn run_init_inner(
         access_key_id,
         secret_access_key,
         admin_password_hash: None,
+        codec_concurrency: None,
+        blocking_threads: None,
         log_level,
         tls,
     };

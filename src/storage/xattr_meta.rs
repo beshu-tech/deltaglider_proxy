@@ -45,25 +45,6 @@ pub async fn write_metadata(path: &Path, metadata: &FileMetadata) -> Result<(), 
     .map_err(|e| StorageError::Other(format!("spawn_blocking join failed: {}", e)))?
 }
 
-/// Remove metadata xattr from a data file.
-///
-/// Silently succeeds if the xattr is already absent.
-#[allow(dead_code)]
-pub async fn remove_metadata(path: &Path) -> Result<(), StorageError> {
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        match xattr::remove(&path, XATTR_NAME) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            // ENODATA (61 on Linux, 93 on macOS) means the attribute doesn't exist
-            Err(e) if e.raw_os_error() == Some(93) || e.raw_os_error() == Some(61) => Ok(()),
-            Err(e) => Err(io_to_storage_error(e)),
-        }
-    })
-    .await
-    .map_err(|e| StorageError::Other(format!("spawn_blocking join failed: {}", e)))?
-}
-
 /// Validate that the filesystem at `root` supports extended attributes.
 ///
 /// Creates a probe file, writes a test xattr, reads it back, then cleans up.

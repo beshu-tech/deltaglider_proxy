@@ -2,9 +2,12 @@ import { useState, useEffect } from 'react';
 import { Button, Input, InputNumber, Select, Switch, Typography, Space, Alert, Spin, Tabs } from 'antd';
 import { SaveOutlined, LockOutlined, WarningOutlined, DatabaseOutlined, ControlOutlined, SafetyOutlined, KeyOutlined, ApiOutlined, CloudOutlined, ArrowLeftOutlined } from '@ant-design/icons';
 import type { AdminConfig, TestS3Response } from '../adminApi';
-import { getAdminConfig, updateAdminConfig, changeAdminPassword, testS3Connection } from '../adminApi';
-import { getEndpoint, setEndpoint, getRegion, setRegion, getCredentials, setCredentials, testConnection } from '../s3client';
+import { getAdminConfig, updateAdminConfig, testS3Connection } from '../adminApi';
 import { useColors } from '../ThemeContext';
+import { useCardStyles } from './shared-styles';
+import SectionHeader from './SectionHeader';
+import BrowserConnectionCard from './BrowserConnectionCard';
+import PasswordChangeCard from './PasswordChangeCard';
 
 const { Title, Text } = Typography;
 
@@ -32,236 +35,12 @@ function findMatchingPreset(logLevel: string): string | null {
 
 interface Props {
   onBack: () => void;
-}
-
-function SectionHeader({ icon, title }: { icon: React.ReactNode; title: string }) {
-  const { ACCENT_BLUE, TEXT_PRIMARY } = useColors();
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4 }}>
-      <div style={{
-        width: 28,
-        height: 28,
-        borderRadius: 7,
-        background: `linear-gradient(135deg, ${ACCENT_BLUE}18, ${ACCENT_BLUE}08)`,
-        border: `1px solid ${ACCENT_BLUE}22`,
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        flexShrink: 0,
-        fontSize: 14,
-        color: ACCENT_BLUE,
-      }}>
-        {icon}
-      </div>
-      <Text strong style={{ fontFamily: "var(--font-ui)", fontSize: 15, color: TEXT_PRIMARY }}>{title}</Text>
-    </div>
-  );
-}
-
-/* -- Shared style helpers ------------------------------------------------- */
-
-function useCardStyles() {
-  const { BG_CARD, BORDER, TEXT_MUTED } = useColors();
-  const cardStyle: React.CSSProperties = {
-    background: BG_CARD,
-    border: `1px solid ${BORDER}`,
-    borderRadius: 12,
-    padding: 'clamp(16px, 3vw, 24px)',
-    marginBottom: 16,
-  };
-  const labelStyle: React.CSSProperties = {
-    color: TEXT_MUTED,
-    fontSize: 11,
-    fontWeight: 600,
-    letterSpacing: 0.5,
-    textTransform: 'uppercase' as const,
-    marginBottom: 6,
-    display: 'block',
-    fontFamily: "var(--font-ui)",
-  };
-  const inputRadius = { borderRadius: 8 };
-  return { cardStyle, labelStyle, inputRadius };
-}
-
-/* -- BrowserConnectionCard ------------------------------------------------ */
-
-function BrowserConnectionCard() {
-  const { cardStyle, labelStyle, inputRadius } = useCardStyles();
-
-  const [endpoint, setConnEndpoint] = useState(getEndpoint());
-  const [region, setConnRegion] = useState(getRegion());
-  const savedCreds = getCredentials();
-  const [accessKey, setConnAccessKey] = useState(savedCreds.accessKeyId);
-  const [secretKey, setConnSecretKey] = useState(savedCreds.secretAccessKey);
-  const [testing, setTesting] = useState(false);
-  const [testResult, setTestResult] = useState<{ ok: boolean; buckets?: string[]; error?: string } | null>(null);
-
-  return (
-    <form onSubmit={(e) => e.preventDefault()} style={cardStyle}>
-      <SectionHeader icon={<CloudOutlined />} title="Browser Connection" />
-      <Text type="secondary" style={{ fontSize: 12, fontFamily: "var(--font-ui)", display: 'block', marginBottom: 12 }}>
-        How this browser connects to the DeltaGlider proxy.
-      </Text>
-
-      <div style={{ marginTop: 12 }}>
-        <span style={labelStyle}>Proxy Endpoint</span>
-        <Input
-          value={endpoint}
-          onChange={(e) => setConnEndpoint(e.target.value)}
-          placeholder="http://localhost:9000"
-          style={{ ...inputRadius, fontFamily: "var(--font-mono)", fontSize: 13 }}
-        />
-      </div>
-
-      <div style={{ marginTop: 12 }}>
-        <span style={labelStyle}>Region</span>
-        <Input
-          value={region}
-          onChange={(e) => setConnRegion(e.target.value)}
-          placeholder="us-east-1"
-          style={{ ...inputRadius, fontFamily: "var(--font-mono)", fontSize: 13 }}
-        />
-      </div>
-
-      <div style={{ marginTop: 12 }}>
-        <span style={labelStyle}>Access Key ID</span>
-        <Input
-          value={accessKey}
-          onChange={(e) => setConnAccessKey(e.target.value)}
-          placeholder="minioadmin"
-          autoComplete="username"
-          style={{ ...inputRadius, fontFamily: "var(--font-mono)", fontSize: 13 }}
-        />
-      </div>
-
-      <div style={{ marginTop: 12 }}>
-        <span style={labelStyle}>Secret Access Key</span>
-        <Input.Password
-          value={secretKey}
-          onChange={(e) => setConnSecretKey(e.target.value)}
-          placeholder="minioadmin"
-          autoComplete="current-password"
-          style={{ ...inputRadius }}
-        />
-      </div>
-
-      <Space style={{ width: '100%', marginTop: 16 }} size={8}>
-        <Button
-          icon={<ApiOutlined />}
-          loading={testing}
-          onClick={async () => {
-            setTesting(true);
-            setTestResult(null);
-            const result = await testConnection(endpoint, accessKey, secretKey, region);
-            setTestResult(result);
-            setTesting(false);
-          }}
-          style={{ borderRadius: 8, fontFamily: "var(--font-ui)", fontWeight: 600 }}
-        >
-          Test
-        </Button>
-        <Button
-          type="primary"
-          icon={<SaveOutlined />}
-          onClick={() => {
-            setEndpoint(endpoint);
-            setRegion(region);
-            setCredentials(accessKey, secretKey);
-            setTestResult({ ok: true, buckets: [] });
-            window.location.reload();
-          }}
-          style={{ borderRadius: 8, fontFamily: "var(--font-ui)", fontWeight: 600 }}
-        >
-          Save &amp; Reconnect
-        </Button>
-      </Space>
-
-      {testResult && (
-        <Alert
-          style={{ marginTop: 12, borderRadius: 8 }}
-          type={testResult.ok ? 'success' : 'error'}
-          showIcon
-          message={
-            testResult.ok
-              ? `Connected — ${testResult.buckets?.length ?? 0} bucket${(testResult.buckets?.length ?? 0) === 1 ? '' : 's'} found`
-              : 'Connection failed'
-          }
-          description={testResult.ok ? testResult.buckets?.join(', ') : testResult.error}
-        />
-      )}
-    </form>
-  );
-}
-
-/* -- PasswordChangeCard --------------------------------------------------- */
-
-function PasswordChangeCard() {
-  const { cardStyle, inputRadius } = useCardStyles();
-
-  const [currentPassword, setCurrentPassword] = useState('');
-  const [newPassword, setNewPassword] = useState('');
-  const [changing, setChanging] = useState(false);
-  const [result, setResult] = useState<{ ok: boolean; error?: string } | null>(null);
-
-  const handleSubmit = async () => {
-    setChanging(true);
-    setResult(null);
-    const res = await changeAdminPassword(currentPassword, newPassword);
-    setResult(res);
-    if (res.ok) {
-      setCurrentPassword('');
-      setNewPassword('');
-    }
-    setChanging(false);
-  };
-
-  return (
-    <form onSubmit={(e) => { e.preventDefault(); handleSubmit(); }} style={cardStyle}>
-      <Space orientation="vertical" size="middle" style={{ width: '100%' }}>
-        <SectionHeader icon={<LockOutlined />} title="Change Admin Password" />
-
-        <input type="text" autoComplete="username" defaultValue="admin" aria-hidden="true" style={{ display: 'none' }} />
-        <Input.Password
-          placeholder="Current password"
-          value={currentPassword}
-          onChange={(e) => setCurrentPassword(e.target.value)}
-          autoComplete="current-password"
-          style={inputRadius}
-        />
-        <Input.Password
-          placeholder="New password"
-          value={newPassword}
-          onChange={(e) => setNewPassword(e.target.value)}
-          autoComplete="new-password"
-          style={inputRadius}
-        />
-
-        {result && (
-          <Alert
-            type={result.ok ? 'success' : 'error'}
-            message={result.ok ? 'Password changed successfully.' : (result.error || 'Failed')}
-            showIcon
-            style={{ borderRadius: 8 }}
-          />
-        )}
-
-        <Button
-          htmlType="submit"
-          loading={changing}
-          disabled={!currentPassword || !newPassword}
-          block
-          style={{ ...inputRadius, fontFamily: "var(--font-ui)", fontWeight: 600 }}
-        >
-          Change Password
-        </Button>
-      </Space>
-    </form>
-  );
+  onSessionExpired?: () => void;
 }
 
 /* -- SettingsPage (main) -------------------------------------------------- */
 
-export default function SettingsPage({ onBack }: Props) {
+export default function SettingsPage({ onBack, onSessionExpired }: Props) {
   const colors = useColors();
   const { cardStyle, labelStyle, inputRadius } = useCardStyles();
 
@@ -271,7 +50,7 @@ export default function SettingsPage({ onBack }: Props) {
   const [saveResult, setSaveResult] = useState<{ warnings: string[]; requires_restart: boolean } | null>(null);
 
   const [maxDeltaRatio, setMaxDeltaRatio] = useState<number>(0.5);
-  const [maxObjectSize, setMaxObjectSize] = useState<number>(104857600);
+  const [maxObjectSizeMb, setMaxObjectSizeMb] = useState<number>(100);
   const [accessKeyId, setAccessKeyId] = useState('');
   const [secretAccessKey, setSecretAccessKey] = useState('');
   const [cacheSizeMb, setCacheSizeMb] = useState<number>(100);
@@ -297,7 +76,7 @@ export default function SettingsPage({ onBack }: Props) {
       if (cfg) {
         setConfig(cfg);
         setMaxDeltaRatio(cfg.max_delta_ratio);
-        setMaxObjectSize(cfg.max_object_size);
+        setMaxObjectSizeMb(Math.round(cfg.max_object_size / (1024 * 1024)));
         setAccessKeyId(cfg.access_key_id || '');
         setCacheSizeMb(cfg.cache_size_mb);
         setBackendType(cfg.backend_type);
@@ -314,6 +93,10 @@ export default function SettingsPage({ onBack }: Props) {
           setLogLevel(cfg.log_level || 'deltaglider_proxy=debug,tower_http=debug');
           setLogLevelCustom(true);
         }
+      } else {
+        // Config load failed (401) — session expired or invalid.
+        // Signal parent to reset admin state so AdminGate re-appears.
+        onSessionExpired?.();
       }
       setLoading(false);
     });
@@ -324,7 +107,7 @@ export default function SettingsPage({ onBack }: Props) {
     setSaveResult(null);
     const payload: Record<string, unknown> = {
       max_delta_ratio: maxDeltaRatio,
-      max_object_size: maxObjectSize,
+      max_object_size: maxObjectSizeMb * 1024 * 1024,
       access_key_id: accessKeyId || null,
       cache_size_mb: cacheSizeMb,
       log_level: logLevel,
@@ -359,8 +142,11 @@ export default function SettingsPage({ onBack }: Props) {
   if (!config) {
     return (
       <div style={{ padding: 24 }}>
-        <Alert type="error" message="Failed to load configuration. Are you logged in?" showIcon />
-        <Button onClick={onBack} style={{ marginTop: 16 }}>Back</Button>
+        <Alert type="error" message="Session expired. Please log in again." showIcon />
+        <Space style={{ marginTop: 16 }}>
+          <Button type="primary" onClick={() => onSessionExpired?.()}>Log in again</Button>
+          <Button onClick={onBack}>Back to browser</Button>
+        </Space>
       </div>
     );
   }
@@ -590,14 +376,13 @@ export default function SettingsPage({ onBack }: Props) {
         </div>
 
         <div style={{ marginTop: 16 }}>
-          <span style={labelStyle}>Max Object Size (bytes)</span>
+          <span style={labelStyle}>Max Object Size (MB)</span>
           <InputNumber
-            value={maxObjectSize}
-            onChange={(v) => v !== null && setMaxObjectSize(v)}
-            min={1024}
-            step={1048576}
+            value={maxObjectSizeMb}
+            onChange={(v) => v !== null && setMaxObjectSizeMb(v)}
+            min={1}
+            step={10}
             style={{ width: '100%', ...inputRadius }}
-            formatter={(v) => `${v}`.replace(/\B(?=(\d{3})+(?!\d))/g, ',')}
           />
         </div>
 

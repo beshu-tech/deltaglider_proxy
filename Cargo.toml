@@ -17,9 +17,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 
-# AWS S3 SDK (for backend storage) — no-default-features to drop SSO/STS/sigv4a bloat
+# AWS S3 SDK (for backend storage) — direct client config, no aws-config/STS bloat
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }
-aws-config = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }
 aws-credential-types = "1"
 
 # Async support
@@ -51,8 +50,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-lru = "0.16"
 parking_lot = "0.12"
+dashmap = "6"
+moka = { version = "0.12", features = ["sync"] }
+itoa = "1"
 bytes = "1"
 futures = { version = "0.3", default-features = false, features = ["std", "alloc"] }
 tokio-util = { version = "0.7", features = ["io"] }
@@ -69,6 +70,9 @@ mime_guess = "2"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
+
+# Metrics
+prometheus = { version = "0.13", features = ["process"] }
 
 [dev-dependencies]
 tokio-test = "0.4"

@@ -5,50 +5,10 @@
 
 mod common;
 
-use common::{generate_binary, mutate_binary, TestServer};
-
-/// Helper to PUT via reqwest and return the x-amz-storage-type header
-async fn put_and_get_storage_type(
-    client: &reqwest::Client,
-    endpoint: &str,
-    bucket: &str,
-    key: &str,
-    data: Vec<u8>,
-    content_type: &str,
-) -> String {
-    let url = format!("{}/{}/{}", endpoint, bucket, key);
-    let resp = client
-        .put(&url)
-        .header("content-type", content_type)
-        .body(data)
-        .send()
-        .await
-        .expect("PUT failed");
-    assert!(
-        resp.status().is_success(),
-        "PUT {} failed: {}",
-        key,
-        resp.status()
-    );
-    resp.headers()
-        .get("x-amz-storage-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string()
-}
-
-/// Helper to GET via reqwest and return bytes
-async fn get_bytes(client: &reqwest::Client, endpoint: &str, bucket: &str, key: &str) -> Vec<u8> {
-    let url = format!("{}/{}/{}", endpoint, bucket, key);
-    let resp = client.get(&url).send().await.expect("GET failed");
-    assert!(
-        resp.status().is_success(),
-        "GET {} failed: {}",
-        key,
-        resp.status()
-    );
-    resp.bytes().await.unwrap().to_vec()
-}
+use common::{
+    generate_binary, get_bytes, list_objects_raw, mutate_binary, put_and_get_storage_type,
+    TestServer,
+};
 
 #[tokio::test]
 async fn test_similar_files_stored_as_delta() {
@@ -344,23 +304,6 @@ async fn test_first_zip_creates_reference() {
 // ============================================================================
 // Listing & Pagination
 // ============================================================================
-
-/// Helper to make a raw ListObjectsV2 request and return the XML body
-async fn list_objects_raw(
-    client: &reqwest::Client,
-    endpoint: &str,
-    bucket: &str,
-    params: &str,
-) -> String {
-    let url = format!("{}/{}?list-type=2&{}", endpoint, bucket, params);
-    let resp = client.get(&url).send().await.unwrap();
-    assert!(
-        resp.status().is_success(),
-        "ListObjects failed: {}",
-        resp.status()
-    );
-    resp.text().await.unwrap()
-}
 
 #[tokio::test]
 async fn test_list_objects_reports_original_sizes() {

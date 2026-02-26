@@ -80,7 +80,7 @@ pub struct HealthResponse {
 
 /// Return the process-lifetime peak RSS (high-water mark) in bytes.
 /// Uses `getrusage(RUSAGE_SELF)` which captures even microsecond-lived allocations.
-fn get_peak_rss_bytes() -> u64 {
+pub(crate) fn get_peak_rss_bytes() -> u64 {
     // SAFETY: `libc::getrusage` is a POSIX syscall that writes into a caller-provided
     // `rusage` struct. We zero-initialise it first, and the call is infallible for
     // RUSAGE_SELF. No aliasing or lifetime issues — `usage` is a local stack variable.

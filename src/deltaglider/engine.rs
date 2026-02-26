@@ -4,14 +4,17 @@ use super::cache::ReferenceCache;
 use super::codec::{CodecError, DeltaCodec};
 use super::file_router::FileRouter;
 use crate::config::{BackendConfig, Config};
+use crate::metrics::Metrics;
 use crate::storage::{FilesystemBackend, S3Backend, StorageBackend, StorageError};
 use crate::types::{FileMetadata, ObjectKey, StorageInfo, StoreResult};
 use bytes::Bytes;
+use dashmap::DashMap;
 use futures::stream::BoxStream;
 use md5::{Digest as Md5Digest, Md5};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use tracing::{debug, info, instrument, warn};
@@ -92,19 +95,31 @@ pub struct DeltaGliderEngine<S: StorageBackend> {
     max_delta_ratio: f32,
     max_object_size: u64,
     /// Limits concurrent delta encode/decode operations to prevent CPU saturation.
+    /// PERF: Configurable via `codec_concurrency` config (defaults to CPU count).
+    /// Each encode/decode spawns an xdelta3 subprocess, so unbounded concurrency
+    /// would saturate CPU and cause OOM from too many concurrent buffers.
     codec_semaphore: Arc<Semaphore>,
     /// Per-deltaspace locks to prevent concurrent reference overwrites.
-    /// Outer parking_lot::Mutex for fast synchronous map access;
-    /// inner tokio::sync::Mutex for async-compatible per-prefix locking.
-    prefix_locks: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    ///
+    /// PERF: Uses DashMap (sharded concurrent hash map) instead of
+    /// `Mutex<HashMap>`. The old design held a global mutex just to LOOK UP
+    /// the per-prefix lock — meaning all prefixes contended on one lock even
+    /// though they operate on independent data. DashMap shards the keyspace
+    /// so lookups for different prefixes never contend.
+    /// Do NOT replace with `parking_lot::Mutex<HashMap<...>>` — it re-introduces
+    /// the global lock bottleneck.
+    prefix_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// Optional Prometheus metrics (None in tests).
+    metrics: Option<Arc<Metrics>>,
 }
 
 /// Type alias for engine with dynamic backend dispatch
 pub type DynEngine = DeltaGliderEngine<Box<dyn StorageBackend>>;
 
 impl DynEngine {
-    /// Create a new engine with the appropriate backend based on configuration
-    pub async fn new(config: &Config) -> Result<Self, StorageError> {
+    /// Create a new engine with the appropriate backend based on configuration.
+    /// Pass `metrics` to enable Prometheus instrumentation (None disables it).
+    pub async fn new(config: &Config, metrics: Option<Arc<Metrics>>) -> Result<Self, StorageError> {
         let storage: Box<dyn StorageBackend> = match &config.backend {
             BackendConfig::Filesystem { path } => {
                 Box::new(FilesystemBackend::new(path.clone()).await?)
@@ -112,7 +127,7 @@ impl DynEngine {
             BackendConfig::S3 { .. } => Box::new(S3Backend::new(&config.backend).await?),
         };
 
-        Ok(Self::new_with_backend(Arc::new(storage), config))
+        Ok(Self::new_with_backend(Arc::new(storage), config, metrics))
     }
 }
 
@@ -124,8 +139,21 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         &self.storage
     }
 
-    /// Create a new engine with a custom storage backend
-    pub fn new_with_backend(storage: Arc<S>, config: &Config) -> Self {
+    /// Create a new engine with a custom storage backend.
+    pub fn new_with_backend(
+        storage: Arc<S>,
+        config: &Config,
+        metrics: Option<Arc<Metrics>>,
+    ) -> Self {
+        // PERF: codec_concurrency controls how many xdelta3 subprocesses can run
+        // in parallel. Defaults to CPU count, configurable via DGP_CODEC_CONCURRENCY.
+        // Too high → CPU saturation + memory pressure from concurrent buffers.
+        // Too low → underutilized cores, higher tail latency under load.
+        let codec_concurrency = config.codec_concurrency.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        });
         Self {
             storage,
             codec: DeltaCodec::new(config.max_object_size as usize),
@@ -133,12 +161,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             cache: ReferenceCache::new(config.cache_size_mb),
             max_delta_ratio: config.max_delta_ratio,
             max_object_size: config.max_object_size,
-            codec_semaphore: Arc::new(Semaphore::new(
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4),
-            )),
-            prefix_locks: parking_lot::Mutex::new(HashMap::new()),
+            codec_semaphore: Arc::new(Semaphore::new(codec_concurrency)),
+            prefix_locks: DashMap::new(),
+            metrics,
         }
     }
 
@@ -152,15 +177,28 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.max_object_size
     }
 
+    /// Return the number of entries in the reference cache (O(1) atomic read).
+    pub fn cache_entry_count(&self) -> u64 {
+        self.cache.entry_count()
+    }
+
+    /// Return the weighted size of the reference cache in bytes (O(1) atomic read).
+    pub fn cache_weighted_size(&self) -> u64 {
+        self.cache.weighted_size()
+    }
+
+    /// Return available codec semaphore permits.
+    pub fn codec_available_permits(&self) -> usize {
+        self.codec_semaphore.available_permits()
+    }
+
     /// Acquire a per-deltaspace async lock. Different prefixes do not contend.
     async fn acquire_prefix_lock(&self, prefix: &str) -> tokio::sync::OwnedMutexGuard<()> {
-        let mutex = {
-            let mut locks = self.prefix_locks.lock();
-            locks
-                .entry(prefix.to_string())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
-        };
+        let mutex = self
+            .prefix_locks
+            .entry(prefix.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
         mutex.lock_owned().await
     }
 
@@ -170,18 +208,18 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Only runs when the map exceeds a size threshold to avoid overhead.
     fn cleanup_prefix_locks(&self) {
         const CLEANUP_THRESHOLD: usize = 1024;
-        let mut locks = self.prefix_locks.lock();
-        if locks.len() <= CLEANUP_THRESHOLD {
+        if self.prefix_locks.len() <= CLEANUP_THRESHOLD {
             return;
         }
-        let before = locks.len();
-        locks.retain(|_, arc| Arc::strong_count(arc) > 1);
-        let removed = before - locks.len();
+        let before = self.prefix_locks.len();
+        self.prefix_locks
+            .retain(|_, arc| Arc::strong_count(arc) > 1);
+        let removed = before - self.prefix_locks.len();
         if removed > 0 {
             debug!(
                 "Pruned {} idle prefix locks ({} remaining)",
                 removed,
-                locks.len()
+                self.prefix_locks.len()
             );
         }
     }
@@ -275,9 +313,18 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // Check if file type is eligible for delta compression
         if !self.file_router.is_delta_eligible(&obj_key.filename) {
             debug!("File type not delta-eligible, storing as passthrough");
+            if let Some(m) = &self.metrics {
+                m.delta_decisions_total
+                    .with_label_values(&["passthrough"])
+                    .inc();
+            }
             let _lock = self.acquire_prefix_lock(&deltaspace_id).await;
-            self.delete_delta_if_exists(bucket, &deltaspace_id, &obj_key.filename)
-                .await?;
+            Self::delete_ignoring_not_found(
+                self.storage
+                    .delete_delta(bucket, &deltaspace_id, &obj_key.filename)
+                    .await,
+            )
+            .await?;
             return self
                 .store_passthrough(
                     bucket,
@@ -355,9 +402,17 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let _codec_permit = self.codec_semaphore.acquire().await.map_err(|_| {
             EngineError::Storage(StorageError::Other("codec semaphore closed".into()))
         })?;
+        let encode_start = Instant::now();
         let delta = self.codec.encode(&reference, data)?;
+        let encode_secs = encode_start.elapsed().as_secs_f64();
         drop(_codec_permit);
+
         let ratio = DeltaCodec::compression_ratio(data.len(), delta.len());
+
+        if let Some(m) = &self.metrics {
+            m.delta_encode_duration_seconds.observe(encode_secs);
+            m.delta_compression_ratio.observe(ratio as f64);
+        }
 
         info!(
             "Delta computed: {} bytes -> {} bytes (ratio: {:.2}%)",
@@ -374,11 +429,20 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 "First file in deltaspace with poor delta ratio {:.2} >= {:.2}, storing as passthrough",
                 ratio, self.max_delta_ratio
             );
+            if let Some(m) = &self.metrics {
+                m.delta_decisions_total
+                    .with_label_values(&["passthrough"])
+                    .inc();
+            }
             let cache_key = format!("{}/{}", bucket, deltaspace_id);
             self.cache.invalidate(&cache_key);
             self.storage.delete_reference(bucket, deltaspace_id).await?;
-            self.delete_delta_if_exists(bucket, deltaspace_id, &obj_key.filename)
-                .await?;
+            Self::delete_ignoring_not_found(
+                self.storage
+                    .delete_delta(bucket, deltaspace_id, &obj_key.filename)
+                    .await,
+            )
+            .await?;
             return self
                 .store_passthrough(
                     bucket,
@@ -394,6 +458,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
 
         // Commit as delta
+        if let Some(m) = &self.metrics {
+            m.delta_decisions_total.with_label_values(&["delta"]).inc();
+            let saved = data.len().saturating_sub(delta.len()) as u64;
+            m.delta_bytes_saved_total.inc_by(saved);
+        }
         let mut metadata = FileMetadata::new_delta(
             obj_key.filename.clone(),
             sha256,
@@ -406,8 +475,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         );
         metadata.user_metadata = user_metadata;
 
-        self.delete_passthrough_if_exists(bucket, deltaspace_id, &obj_key.filename)
-            .await?;
+        Self::delete_ignoring_not_found(
+            self.storage
+                .delete_passthrough(bucket, deltaspace_id, &obj_key.filename)
+                .await,
+        )
+        .await?;
         self.storage
             .put_delta(bucket, deltaspace_id, &obj_key.filename, &delta, &metadata)
             .await?;
@@ -443,9 +516,18 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .put_reference(bucket, deltaspace_id, data, &metadata)
             .await?;
 
-        // Cache the reference (use bucket/prefix as cache key for uniqueness)
+        if let Some(m) = &self.metrics {
+            m.delta_decisions_total
+                .with_label_values(&["reference"])
+                .inc();
+        }
+
+        // Cache the reference (use bucket/prefix as cache key for uniqueness).
+        // PERF: copy_from_slice here because `data` is `&[u8]` (borrowed from
+        // caller) — one unavoidable copy. Compare with the other cache.put
+        // call site which uses `Bytes::from(vec)` for zero-copy.
         let cache_key = format!("{}/{}", bucket, deltaspace_id);
-        self.cache.put(&cache_key, data.to_vec());
+        self.cache.put(&cache_key, Bytes::copy_from_slice(data));
 
         Ok(metadata)
     }
@@ -501,8 +583,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         );
 
         let _lock = self.acquire_prefix_lock(&deltaspace_id).await;
-        self.delete_delta_if_exists(bucket, &deltaspace_id, &obj_key.filename)
-            .await?;
+        Self::delete_ignoring_not_found(
+            self.storage
+                .delete_delta(bucket, &deltaspace_id, &obj_key.filename)
+                .await,
+        )
+        .await?;
 
         let mut metadata = FileMetadata::new_passthrough(
             obj_key.filename.clone(),
@@ -565,34 +651,6 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
     }
 
-    async fn delete_delta_if_exists(
-        &self,
-        bucket: &str,
-        deltaspace_id: &str,
-        filename: &str,
-    ) -> Result<(), EngineError> {
-        Self::delete_ignoring_not_found(
-            self.storage
-                .delete_delta(bucket, deltaspace_id, filename)
-                .await,
-        )
-        .await
-    }
-
-    async fn delete_passthrough_if_exists(
-        &self,
-        bucket: &str,
-        deltaspace_id: &str,
-        filename: &str,
-    ) -> Result<(), EngineError> {
-        Self::delete_ignoring_not_found(
-            self.storage
-                .delete_passthrough(bucket, deltaspace_id, filename)
-                .await,
-        )
-        .await
-    }
-
     async fn migrate_legacy_reference_object_if_needed(
         &self,
         bucket: &str,
@@ -632,8 +690,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             ref_meta.content_type.clone(),
         );
 
-        self.delete_passthrough_if_exists(bucket, deltaspace_id, filename)
-            .await?;
+        Self::delete_ignoring_not_found(
+            self.storage
+                .delete_passthrough(bucket, deltaspace_id, filename)
+                .await,
+        )
+        .await?;
         self.storage
             .put_delta(bucket, deltaspace_id, filename, &delta, &delta_meta)
             .await?;
@@ -661,8 +723,17 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         match self.retrieve_stream(bucket, key).await? {
             RetrieveResponse::Buffered { data, metadata } => Ok((data, metadata)),
             RetrieveResponse::Streamed { stream, metadata } => {
+                // PERF: Pre-allocate the exact total size, then extend_from_slice
+                // each chunk. The old code used `.flat_map(|b| b.to_vec()).collect()`
+                // which allocated an intermediate Vec for EVERY chunk (to_vec()),
+                // gave no size hint to collect(), and caused repeated reallocs.
+                // Do NOT replace with `.flat_map(|b| b.to_vec()).collect()`.
                 let chunks: Vec<Bytes> = stream.map_err(EngineError::Storage).try_collect().await?;
-                let data: Vec<u8> = chunks.into_iter().flat_map(|b| b.to_vec()).collect();
+                let total_len: usize = chunks.iter().map(|b| b.len()).sum();
+                let mut data = Vec::with_capacity(total_len);
+                for chunk in &chunks {
+                    data.extend_from_slice(chunk);
+                }
                 Ok((data, metadata))
             }
         }
@@ -772,8 +843,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 let _codec_permit = self.codec_semaphore.acquire().await.map_err(|_| {
                     EngineError::Storage(StorageError::Other("codec semaphore closed".into()))
                 })?;
+                let decode_start = Instant::now();
                 let result = self.codec.decode(&reference, &delta)?;
+                let decode_secs = decode_start.elapsed().as_secs_f64();
                 drop(_codec_permit);
+                if let Some(m) = &self.metrics {
+                    m.delta_decode_duration_seconds.observe(decode_secs);
+                }
                 result
             }
             StorageInfo::Passthrough => {
@@ -1088,7 +1164,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         // Check cache first (Bytes clone is a cheap refcount increment)
         if let Some(data) = self.cache.get(&cache_key) {
+            if let Some(m) = &self.metrics {
+                m.cache_hits_total.inc();
+            }
             return Ok(data);
+        }
+
+        if let Some(m) = &self.metrics {
+            m.cache_misses_total.inc();
         }
 
         // Load from storage
@@ -1098,8 +1181,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .await
             .map_err(|_| EngineError::MissingReference(deltaspace_id.to_string()))?;
 
-        // Cache it (Vec<u8> is moved into Bytes inside the cache)
-        self.cache.put(&cache_key, data.clone());
+        // PERF: Bytes::from(Vec<u8>) is a zero-copy ownership transfer (no memcpy).
+        // We clone `data` first because it's still needed for the return value.
+        // The clone is the one unavoidable copy; the Bytes::from is free.
+        // Do NOT change to `Bytes::copy_from_slice(&data)` — that would be a
+        // redundant second copy.
+        self.cache.put(&cache_key, Bytes::from(data.clone()));
 
         Ok(data.into())
     }

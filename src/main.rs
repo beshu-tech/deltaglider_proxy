@@ -14,6 +14,7 @@ use deltaglider_proxy::api::handlers::{
 };
 use deltaglider_proxy::config::{BackendConfig, Config};
 use deltaglider_proxy::deltaglider::DynEngine;
+use deltaglider_proxy::metrics::Metrics;
 use deltaglider_proxy::multipart::MultipartStore;
 use deltaglider_proxy::session::SessionStore;
 use std::sync::Arc;
@@ -26,10 +27,24 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::{layer::SubscriberExt, reload, util::SubscriberInitExt};
 
-/// DeltaGlider Proxy - DeltaGlider compression for S3 storage
+/// Version string including build timestamp for --version output
+fn version_long() -> &'static str {
+    // e.g. "0.1.8 (built 2026-02-23T21:40:07Z)"
+    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    V.get_or_init(|| {
+        format!(
+            "{} (built {})",
+            env!("CARGO_PKG_VERSION"),
+            env!("DGP_BUILD_TIME"),
+        )
+    })
+}
+
+/// DeltaGlider Proxy — S3-compatible proxy with transparent delta compression
 #[derive(Parser, Debug)]
 #[command(name = "deltaglider_proxy")]
-#[command(author, version, about, long_about = None)]
+#[command(version = version_long())]
+#[command(author, about, long_about = None)]
 struct Cli {
     /// Path to configuration file
     #[arg(short, long, value_name = "FILE")]
@@ -52,8 +67,7 @@ struct Cli {
     set_admin_password: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     // Interactive config wizard (runs synchronously, exits before tokio runtime)
@@ -87,6 +101,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(0);
     }
 
+    // PERF: Config is loaded TWICE intentionally — once here (before the tokio
+    // runtime exists) to read blocking_threads, and again inside async_main()
+    // for the full async initialization. We cannot build the runtime with the
+    // right blocking thread count unless we read the config first.
+    // Do NOT remove this "redundant" config load — it gates runtime construction.
+    let pre_config = if let Some(ref path) = cli.config {
+        deltaglider_proxy::config::Config::from_file(path)
+            .unwrap_or_else(|_| deltaglider_proxy::config::Config::load())
+    } else {
+        deltaglider_proxy::config::Config::load()
+    };
+
+    // PERF: Explicit runtime builder instead of `#[tokio::main]` so we can
+    // configure `max_blocking_threads` from config/env (DGP_BLOCKING_THREADS).
+    // The default tokio blocking pool (512 threads) is excessive for most
+    // deployments and wastes memory. Do NOT replace with `#[tokio::main]`
+    // unless you find another way to configure blocking threads before the
+    // runtime starts.
+    let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
+    runtime_builder.enable_all();
+    if let Some(bt) = pre_config.blocking_threads {
+        runtime_builder.max_blocking_threads(bt);
+    }
+    let runtime = runtime_builder.build()?;
+
+    runtime.block_on(async_main(cli))
+}
+
+async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing with reload support
     // Priority: RUST_LOG > DGP_LOG_LEVEL > --verbose > default
     let initial_filter = EnvFilter::try_from_default_env()
@@ -116,7 +159,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref addr) = cli.listen {
         config.listen_addr = addr.parse()?;
     }
-    info!("Starting DeltaGlider Proxy S3 server");
+    info!(
+        "Starting DeltaGlider Proxy v{} (built {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("DGP_BUILD_TIME"),
+    );
     info!("  Listen address: {}", config.listen_addr);
 
     match &config.backend {
@@ -151,8 +198,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         warn!("  Authentication: DISABLED (open access) — set DGP_ACCESS_KEY_ID and DGP_SECRET_ACCESS_KEY to enable");
     }
 
+    // Create Prometheus metrics
+    let metrics = Arc::new(Metrics::new());
+    metrics.process_start_time_seconds.set(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64(),
+    );
+    let backend_type = match &config.backend {
+        BackendConfig::Filesystem { .. } => "filesystem",
+        BackendConfig::S3 { .. } => "s3",
+    };
+    metrics
+        .build_info
+        .with_label_values(&[env!("CARGO_PKG_VERSION"), backend_type])
+        .set(1.0);
+
     // Create engine (async initialization with dynamic backend)
-    let engine = DynEngine::new(&config).await?;
+    let engine = DynEngine::new(&config, Some(metrics.clone())).await?;
     if engine.is_cli_available() {
         info!("  xdelta3 CLI: available (legacy delta interop enabled)");
     } else {
@@ -170,6 +234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(AppState {
         engine: ArcSwap::from_pointee(engine),
         multipart,
+        metrics: Some(metrics.clone()),
     });
 
     // Build auth config (None if credentials not configured)
@@ -230,9 +295,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .post(delete_objects),
         )
         .layer(TraceLayer::new_for_http())
+        // HTTP metrics middleware (records request counts, durations, sizes)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            deltaglider_proxy::metrics::http_metrics_middleware,
+        ))
         // SigV4 authentication (no-op when auth_config is None)
         .layer(middleware::from_fn(sigv4_auth_middleware))
         .layer(axum::Extension(auth_config))
+        // Metrics extension for auth middleware to extract
+        .layer(axum::Extension(Some(metrics) as Option<Arc<Metrics>>))
         // Increase body size limit to match max_object_size config (default 2MB is too small)
         .layer(DefaultBodyLimit::max(config.max_object_size as usize))
         // CORS must be outermost to handle OPTIONS preflight before auth
