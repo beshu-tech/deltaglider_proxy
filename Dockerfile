@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 # Dummy sources to compile dependencies only (cached until Cargo.toml/lock change)
 RUN mkdir -p src && echo 'fn main() {}' > src/main.rs && touch src/lib.rs \
     && mkdir -p demo/s3-browser/ui/dist \
