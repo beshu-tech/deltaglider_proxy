@@ -421,12 +421,7 @@ pub async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
             .into_response();
     }
 
-    (
-        StatusCode::OK,
-        [("content-type", TEXT_FORMAT)],
-        buffer,
-    )
-        .into_response()
+    (StatusCode::OK, [("content-type", TEXT_FORMAT)], buffer).into_response()
 }
 
 #[cfg(test)]

@@ -535,7 +535,11 @@ impl S3Backend {
     /// are collected into a Vec BEFORE streaming. Without this, the async closures
     /// capture `&self` and `&str` which can't satisfy the `'static` bound that
     /// `buffer_unordered` requires.
-    async fn bounded_head_calls<'a, I>(&self, bucket: &str, keys: I) -> HashMap<String, FileMetadata>
+    async fn bounded_head_calls<'a, I>(
+        &self,
+        bucket: &str,
+        keys: I,
+    ) -> HashMap<String, FileMetadata>
     where
         I: Iterator<Item = &'a str>,
     {
