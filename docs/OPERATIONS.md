@@ -63,6 +63,7 @@ The Docker build handles the Node.js UI build automatically via a multi-stage Do
 ## Health & Observability
 
 - `GET /health` returns JSON with `status` and `version`.
+- `GET http://localhost:9001/metrics` returns Prometheus text format with 20+ metrics covering HTTP requests, delta compression, cache, codec concurrency, and auth. See [METRICS.md](METRICS.md) for the full reference, PromQL examples, Grafana dashboard panels, and alerting rules.
 - Logging uses `tracing`. The log level is resolved in this priority order:
   1. `RUST_LOG` env var (standard tracing-subscriber)
   2. `DGP_LOG_LEVEL` env var (e.g. `DGP_LOG_LEVEL=deltaglider_proxy=warn,tower_http=warn`)

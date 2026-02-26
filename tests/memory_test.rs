@@ -12,7 +12,7 @@
 
 mod common;
 
-use common::{generate_binary, TestServer};
+use common::{generate_binary, get_bytes, TestServer};
 use sha2::{Digest, Sha256};
 
 const MB: u64 = 1024 * 1024;
@@ -120,19 +120,6 @@ async fn complete_multipart_upload(
         .send()
         .await
         .expect("CompleteMultipartUpload failed")
-}
-
-/// GET an object and return the bytes
-async fn get_bytes(client: &reqwest::Client, endpoint: &str, bucket: &str, key: &str) -> Vec<u8> {
-    let url = format!("{}/{}/{}", endpoint, bucket, key);
-    let resp = client.get(&url).send().await.expect("GET failed");
-    assert!(
-        resp.status().is_success(),
-        "GET {} failed: {}",
-        key,
-        resp.status()
-    );
-    resp.bytes().await.unwrap().to_vec()
 }
 
 /// Verify that peak RSS does not spike excessively during a large multipart

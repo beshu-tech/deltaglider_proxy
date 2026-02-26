@@ -11,7 +11,10 @@
 
 mod common;
 
-use common::{generate_binary, mutate_binary, TestServer, MINIO_ACCESS_KEY, MINIO_SECRET_KEY};
+use common::{
+    generate_binary, get_bytes, head_headers, list_objects_raw, mutate_binary,
+    put_and_get_storage_type, TestServer, MINIO_ACCESS_KEY, MINIO_SECRET_KEY,
+};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
 use testcontainers::core::IntoContainerPort;
@@ -109,7 +112,7 @@ async fn minio_direct_client(endpoint: &str) -> aws_sdk_s3::Client {
     );
 
     let config = aws_sdk_s3::Config::builder()
-        .behavior_version(aws_config::BehaviorVersion::latest())
+        .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
         .region(aws_sdk_s3::config::Region::new("us-east-1"))
         .endpoint_url(endpoint)
         .credentials_provider(credentials)
@@ -130,67 +133,6 @@ async fn proxy_server() -> TestServer {
     let endpoint = minio_endpoint().await;
     ensure_bucket(&endpoint).await;
     TestServer::s3_with_endpoint(&endpoint, TEST_BUCKET).await
-}
-
-/// Helper to PUT via reqwest and return the x-amz-storage-type header
-async fn put_and_get_storage_type(
-    client: &reqwest::Client,
-    endpoint: &str,
-    bucket: &str,
-    key: &str,
-    data: Vec<u8>,
-    content_type: &str,
-) -> String {
-    let url = format!("{}/{}/{}", endpoint, bucket, key);
-    let resp = client
-        .put(&url)
-        .header("content-type", content_type)
-        .body(data)
-        .send()
-        .await
-        .expect("PUT failed");
-    assert!(
-        resp.status().is_success(),
-        "PUT {} failed: {}",
-        key,
-        resp.status()
-    );
-    resp.headers()
-        .get("x-amz-storage-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string()
-}
-
-/// Helper to GET via reqwest and return bytes
-async fn get_bytes(client: &reqwest::Client, endpoint: &str, bucket: &str, key: &str) -> Vec<u8> {
-    let url = format!("{}/{}/{}", endpoint, bucket, key);
-    let resp = client.get(&url).send().await.expect("GET failed");
-    assert!(
-        resp.status().is_success(),
-        "GET {} failed: {}",
-        key,
-        resp.status()
-    );
-    resp.bytes().await.unwrap().to_vec()
-}
-
-/// Helper to HEAD via reqwest and return all response headers
-async fn head_headers(
-    client: &reqwest::Client,
-    endpoint: &str,
-    bucket: &str,
-    key: &str,
-) -> reqwest::header::HeaderMap {
-    let url = format!("{}/{}/{}", endpoint, bucket, key);
-    let resp = client.head(&url).send().await.expect("HEAD failed");
-    assert!(
-        resp.status().is_success(),
-        "HEAD {} failed: {}",
-        key,
-        resp.status()
-    );
-    resp.headers().clone()
 }
 
 // ============================================================================
@@ -1915,23 +1857,6 @@ async fn test_multi_bucket_delete_bucket() {
 // ============================================================================
 // Group 8: Listing & Pagination
 // ============================================================================
-
-/// Helper to make a raw ListObjectsV2 request and return the XML body
-async fn list_objects_raw(
-    client: &reqwest::Client,
-    endpoint: &str,
-    bucket: &str,
-    params: &str,
-) -> String {
-    let url = format!("{}/{}?list-type=2&{}", endpoint, bucket, params);
-    let resp = client.get(&url).send().await.unwrap();
-    assert!(
-        resp.status().is_success(),
-        "ListObjects failed: {}",
-        resp.status()
-    );
-    resp.text().await.unwrap()
-}
 
 #[tokio::test]
 async fn test_list_objects_reports_original_sizes() {

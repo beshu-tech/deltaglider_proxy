@@ -33,17 +33,29 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - name: Extract and verify version
+      - name: Stamp version from git tag into Cargo.toml
         id: meta
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
-          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          echo "Tag version:   $TAG_VERSION"
-          echo "Cargo version: $CARGO_VERSION"
-          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
-            echo "::error::Tag version ($TAG_VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
+          echo "Tag version: $TAG_VERSION"
+
+          # Validate semver format
+          if ! echo "$TAG_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::Tag $GITHUB_REF_NAME is not valid semver"
             exit 1
           fi
+
+          # Stamp the tag version into Cargo.toml (first version = line)
+          sed -i "s/^version = \".*\"/version = \"$TAG_VERSION\"/" Cargo.toml
+
+          # Verify it took effect
+          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "Cargo.toml now: $CARGO_VERSION"
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Failed to stamp version into Cargo.toml"
+            exit 1
+          fi
+
           echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Verify Cargo.lock is committed
@@ -64,7 +76,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
 
       - name: Dry-run build check
-        run: cargo check --locked
+        run: cargo check
 
   # ── Job 3: Build ────────────────────────────────────────────────────
   build:
@@ -96,6 +108,11 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
+      - name: Stamp version from git tag
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          sed -i'' -e "s/^version = \".*\"/version = \"$TAG_VERSION\"/" Cargo.toml
+
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "20"
@@ -115,7 +132,7 @@ jobs:
           key: release-${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Prepare artifacts (Unix)
         if: runner.os != 'Windows'
@@ -148,6 +165,11 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Stamp version from git tag
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          sed -i "s/^version = \".*\"/version = \"$TAG_VERSION\"/" Cargo.toml
 
       - name: Set up QEMU (for ARM64 cross-build)
         uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0

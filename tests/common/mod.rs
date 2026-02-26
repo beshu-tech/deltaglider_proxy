@@ -5,9 +5,8 @@
 
 #![allow(dead_code)]
 
-use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
-use aws_sdk_s3::config::Region;
+use aws_sdk_s3::config::{BehaviorVersion, Region};
 use aws_sdk_s3::Client;
 use rand::{Rng, SeedableRng};
 use std::process::{Child, Command};
@@ -64,6 +63,17 @@ impl TestServer {
         let config = format!(
             "max_object_size = {}\n\n[backend]\ntype = \"filesystem\"\npath = \"{}\"\n",
             max_size,
+            data_dir.path().display()
+        );
+        Self::spawn_with_config(&config, "bucket", Some(data_dir)).await
+    }
+
+    /// Start a test server with filesystem backend and custom codec concurrency
+    pub async fn filesystem_with_codec_concurrency(concurrency: usize) -> Self {
+        let data_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = format!(
+            "codec_concurrency = {}\n\n[backend]\ntype = \"filesystem\"\npath = \"{}\"\n",
+            concurrency,
             data_dir.path().display()
         );
         Self::spawn_with_config(&config, "bucket", Some(data_dir)).await
@@ -207,6 +217,118 @@ impl Drop for TestServer {
     fn drop(&mut self) {
         let _ = self.process.kill();
     }
+}
+
+// === Shared HTTP helpers (reqwest) ===
+
+/// PUT an object via reqwest and return the response.
+pub async fn put_object(
+    client: &reqwest::Client,
+    endpoint: &str,
+    bucket: &str,
+    key: &str,
+    data: Vec<u8>,
+    content_type: &str,
+) -> reqwest::Response {
+    let url = format!("{}/{}/{}", endpoint, bucket, key);
+    let resp = client
+        .put(&url)
+        .header("content-type", content_type)
+        .body(data)
+        .send()
+        .await
+        .expect("PUT failed");
+    assert!(
+        resp.status().is_success(),
+        "PUT {} failed: {}",
+        key,
+        resp.status()
+    );
+    resp
+}
+
+/// PUT an object and return the x-amz-storage-type header value.
+pub async fn put_and_get_storage_type(
+    client: &reqwest::Client,
+    endpoint: &str,
+    bucket: &str,
+    key: &str,
+    data: Vec<u8>,
+    content_type: &str,
+) -> String {
+    let resp = put_object(client, endpoint, bucket, key, data, content_type).await;
+    resp.headers()
+        .get("x-amz-storage-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// GET an object and return the body bytes.
+pub async fn get_bytes(
+    client: &reqwest::Client,
+    endpoint: &str,
+    bucket: &str,
+    key: &str,
+) -> Vec<u8> {
+    let url = format!("{}/{}/{}", endpoint, bucket, key);
+    let resp = client.get(&url).send().await.expect("GET failed");
+    assert!(
+        resp.status().is_success(),
+        "GET {} failed: {}",
+        key,
+        resp.status()
+    );
+    resp.bytes().await.unwrap().to_vec()
+}
+
+/// HEAD an object and return response headers.
+pub async fn head_headers(
+    client: &reqwest::Client,
+    endpoint: &str,
+    bucket: &str,
+    key: &str,
+) -> reqwest::header::HeaderMap {
+    let url = format!("{}/{}/{}", endpoint, bucket, key);
+    let resp = client.head(&url).send().await.expect("HEAD failed");
+    assert!(
+        resp.status().is_success(),
+        "HEAD {} failed: {}",
+        key,
+        resp.status()
+    );
+    resp.headers().clone()
+}
+
+/// DELETE an object via reqwest (tolerates 204 and 404).
+pub async fn delete_object(client: &reqwest::Client, endpoint: &str, bucket: &str, key: &str) {
+    let url = format!("{}/{}/{}", endpoint, bucket, key);
+    let resp = client.delete(&url).send().await.expect("DELETE failed");
+    assert!(
+        resp.status().is_success()
+            || resp.status().as_u16() == 204
+            || resp.status().as_u16() == 404,
+        "DELETE {} failed: {}",
+        key,
+        resp.status()
+    );
+}
+
+/// Make a raw ListObjectsV2 request and return the XML body.
+pub async fn list_objects_raw(
+    client: &reqwest::Client,
+    endpoint: &str,
+    bucket: &str,
+    params: &str,
+) -> String {
+    let url = format!("{}/{}?list-type=2&{}", endpoint, bucket, params);
+    let resp = client.get(&url).send().await.unwrap();
+    assert!(
+        resp.status().is_success(),
+        "ListObjects failed: {}",
+        resp.status()
+    );
+    resp.text().await.unwrap()
 }
 
 // === Data generators ===

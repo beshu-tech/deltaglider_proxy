@@ -47,6 +47,16 @@ pub struct Config {
     #[serde(default)]
     pub admin_password_hash: Option<String>,
 
+    /// Maximum concurrent delta encode/decode operations.
+    /// Defaults to the number of available CPU cores.
+    #[serde(default)]
+    pub codec_concurrency: Option<usize>,
+
+    /// Maximum blocking threads for the tokio runtime.
+    /// Defaults to tokio's built-in default (512).
+    #[serde(default)]
+    pub blocking_threads: Option<usize>,
+
     /// Log level filter string.
     /// Set via config file, DGP_LOG_LEVEL env var, or admin GUI. Overridden by RUST_LOG.
     /// Default: "deltaglider_proxy=debug,tower_http=debug"
@@ -156,6 +166,8 @@ impl Default for Config {
             access_key_id: None,
             secret_access_key: None,
             admin_password_hash: None,
+            codec_concurrency: None,
+            blocking_threads: None,
             log_level: default_log_level(),
             tls: None,
         }
@@ -176,8 +188,9 @@ impl Config {
         let mut config = Self::default();
 
         if let Ok(addr) = std::env::var("DGP_LISTEN_ADDR") {
-            if let Ok(parsed) = addr.parse() {
-                config.listen_addr = parsed;
+            match addr.parse() {
+                Ok(parsed) => config.listen_addr = parsed,
+                Err(e) => eprintln!("Warning: ignoring invalid DGP_LISTEN_ADDR=\"{addr}\": {e}"),
             }
         }
 
@@ -199,20 +212,45 @@ impl Config {
         }
 
         if let Ok(ratio) = std::env::var("DGP_MAX_DELTA_RATIO") {
-            if let Ok(parsed) = ratio.parse() {
-                config.max_delta_ratio = parsed;
+            match ratio.parse() {
+                Ok(parsed) => config.max_delta_ratio = parsed,
+                Err(e) => {
+                    eprintln!("Warning: ignoring invalid DGP_MAX_DELTA_RATIO=\"{ratio}\": {e}")
+                }
             }
         }
 
         if let Ok(size) = std::env::var("DGP_MAX_OBJECT_SIZE") {
-            if let Ok(parsed) = size.parse() {
-                config.max_object_size = parsed;
+            match size.parse() {
+                Ok(parsed) => config.max_object_size = parsed,
+                Err(e) => {
+                    eprintln!("Warning: ignoring invalid DGP_MAX_OBJECT_SIZE=\"{size}\": {e}")
+                }
             }
         }
 
         if let Ok(cache) = std::env::var("DGP_CACHE_MB") {
-            if let Ok(parsed) = cache.parse() {
-                config.cache_size_mb = parsed;
+            match cache.parse() {
+                Ok(parsed) => config.cache_size_mb = parsed,
+                Err(e) => eprintln!("Warning: ignoring invalid DGP_CACHE_MB=\"{cache}\": {e}"),
+            }
+        }
+
+        if let Ok(val) = std::env::var("DGP_CODEC_CONCURRENCY") {
+            match val.parse() {
+                Ok(parsed) => config.codec_concurrency = Some(parsed),
+                Err(e) => {
+                    eprintln!("Warning: ignoring invalid DGP_CODEC_CONCURRENCY=\"{val}\": {e}")
+                }
+            }
+        }
+
+        if let Ok(val) = std::env::var("DGP_BLOCKING_THREADS") {
+            match val.parse() {
+                Ok(parsed) => config.blocking_threads = Some(parsed),
+                Err(e) => {
+                    eprintln!("Warning: ignoring invalid DGP_BLOCKING_THREADS=\"{val}\": {e}")
+                }
             }
         }
 

@@ -223,7 +223,7 @@ export default function App() {
           />
         );
       }
-      return <SettingsPage onBack={() => setView('browser')} />;
+      return <SettingsPage onBack={() => setView('browser')} onSessionExpired={() => setIsAdmin(false)} />;
     }
 
     if (view === 'upload') {

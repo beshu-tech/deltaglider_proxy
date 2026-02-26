@@ -44,6 +44,11 @@ pub async fn serve(s3_port: u16, admin_state: Arc<AdminState>, tls: Option<Rustl
         ))
         .with_state(admin_state.clone());
 
+    // Metrics route with its own state (Arc<AppState>)
+    let metrics_router = Router::new()
+        .route("/metrics", get(deltaglider_proxy::metrics::metrics_handler))
+        .with_state(admin_state.s3_state.clone());
+
     // Public admin route (login)
     let public_admin = Router::new()
         .route("/api/admin/login", post(admin::login))
@@ -52,6 +57,7 @@ pub async fn serve(s3_port: u16, admin_state: Arc<AdminState>, tls: Option<Rustl
     let app = Router::new()
         .merge(protected)
         .merge(public_admin)
+        .merge(metrics_router)
         .route("/", get(index))
         .route("/*path", get(static_or_fallback))
         .layer(CorsLayer::permissive());

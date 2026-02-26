@@ -73,7 +73,7 @@ async fn complete_multipart_upload(
     );
 
     let body_str = body_to_utf8(&body)?;
-    let complete_req = CompleteMultipartUploadRequest::from_xml(&body_str).map_err(|e| {
+    let complete_req = CompleteMultipartUploadRequest::from_xml(body_str).map_err(|e| {
         warn!("Failed to parse CompleteMultipartUpload XML: {}", e);
         S3Error::MalformedXML
     })?;

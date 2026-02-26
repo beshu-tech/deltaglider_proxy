@@ -396,7 +396,7 @@ pub async fn update_config(
         }
 
         if need_engine_swap {
-            match DynEngine::new(&cfg).await {
+            match DynEngine::new(&cfg, state.s3_state.metrics.clone()).await {
                 Ok(new_engine) => {
                     state.s3_state.engine.store(Arc::new(new_engine));
                     tracing::info!("Backend engine rebuilt successfully");
