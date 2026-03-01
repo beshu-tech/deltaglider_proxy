@@ -55,24 +55,18 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
-    services:
-      minio:
-        image: bitnami/minio:latest
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-        ports:
-          - 9000:9000
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Build demo UI (required by rust-embed)
         run: cd demo/s3-browser/ui && npm ci && npm run build
-      - name: Wait for MinIO and create test buckets
-        env:
-          MINIO_ENDPOINT: http://minio:9000
+      - name: Start MinIO
         run: |
+          docker run -d --name minio --network host \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
           for i in $(seq 1 30); do
-            mc alias set local "$MINIO_ENDPOINT" minioadmin minioadmin 2>/dev/null && break
+            mc alias set local http://localhost:9000 minioadmin minioadmin 2>/dev/null && break
             sleep 1
           done
           mc mb --ignore-existing local/deltaglider-test
@@ -80,7 +74,6 @@ jobs:
       - name: cargo test
         env:
           RUST_BACKTRACE: "1"
-          MINIO_ENDPOINT: http://minio:9000
         run: cargo test --all --locked
 
   audit:
