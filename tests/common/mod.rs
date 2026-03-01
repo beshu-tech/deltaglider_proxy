@@ -20,8 +20,12 @@ use tokio::time::sleep;
 static PORT_COUNTER: AtomicU16 = AtomicU16::new(19000);
 
 /// MinIO configuration constants
-pub const MINIO_ENDPOINT: &str = "http://localhost:9000";
 pub const MINIO_BUCKET: &str = "deltaglider-test";
+
+/// MinIO endpoint — reads MINIO_ENDPOINT env var, falls back to localhost:9000
+pub fn minio_endpoint_url() -> String {
+    std::env::var("MINIO_ENDPOINT").unwrap_or_else(|_| "http://localhost:9000".to_string())
+}
 pub const MINIO_ACCESS_KEY: &str = "minioadmin";
 pub const MINIO_SECRET_KEY: &str = "minioadmin";
 
@@ -81,7 +85,7 @@ impl TestServer {
 
     /// Start a test server with S3 backend (needs MinIO running)
     pub async fn s3() -> Self {
-        Self::s3_with_endpoint(MINIO_ENDPOINT, MINIO_BUCKET).await
+        Self::s3_with_endpoint(&minio_endpoint_url(), MINIO_BUCKET).await
     }
 
     /// Start a test server with S3 backend pointing at a custom endpoint/bucket.
@@ -363,7 +367,7 @@ pub async fn minio_client() -> Client {
     let config = aws_sdk_s3::Config::builder()
         .behavior_version(BehaviorVersion::latest())
         .region(Region::new("us-east-1"))
-        .endpoint_url(MINIO_ENDPOINT)
+        .endpoint_url(minio_endpoint_url())
         .credentials_provider(credentials)
         .force_path_style(true)
         .build();
@@ -372,8 +376,12 @@ pub async fn minio_client() -> Client {
 
 /// Check if MinIO is available (TCP probe + HeadBucket with 2s timeout)
 pub async fn minio_available() -> bool {
-    // Quick TCP check first
-    if std::net::TcpStream::connect("localhost:9000").is_err() {
+    // Quick TCP check first — parse host:port from endpoint URL
+    let endpoint = minio_endpoint_url();
+    let addr = endpoint
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
+    if std::net::TcpStream::connect(addr).is_err() {
         return false;
     }
 
