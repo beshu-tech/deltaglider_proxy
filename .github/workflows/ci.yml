@@ -61,7 +61,8 @@ jobs:
         run: cd demo/s3-browser/ui && npm ci && npm run build
       - name: Start MinIO
         run: |
-          docker run -d --name minio --network host \
+          # Share network namespace with the job container so MinIO is on localhost
+          docker run -d --name minio-ci --network container:$(hostname) \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
             minio/minio:latest server /data
@@ -75,6 +76,9 @@ jobs:
         env:
           RUST_BACKTRACE: "1"
         run: cargo test --all --locked
+      - name: Stop MinIO
+        if: always()
+        run: docker rm -f minio-ci 2>/dev/null || true
 
   audit:
     name: RustSec Audit
