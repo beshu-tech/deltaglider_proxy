@@ -23,7 +23,7 @@ jobs:
     name: Rustfmt
     runs-on: k3s
     container:
-      image: ghcr.io/sscarduzio/sulfite/builder:latest
+      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -36,7 +36,7 @@ jobs:
     name: Clippy
     runs-on: k3s
     container:
-      image: ghcr.io/sscarduzio/sulfite/builder:latest
+      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -51,7 +51,7 @@ jobs:
     name: Tests
     runs-on: k3s
     container:
-      image: ghcr.io/sscarduzio/sulfite/builder:latest
+      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -87,7 +87,7 @@ jobs:
     name: RustSec Audit
     runs-on: k3s
     container:
-      image: ghcr.io/sscarduzio/sulfite/builder:latest
+      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}

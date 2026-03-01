@@ -1,6 +1,6 @@
 FROM ubuntu:24.04
 
-LABEL org.opencontainers.image.source="https://github.com/sscarduzio/sulfite"
+LABEL org.opencontainers.image.source="https://github.com/beshu-tech/deltaglider_proxy"
 LABEL org.opencontainers.image.description="CI builder for DeltaGlider Proxy — Rust + Node + xdelta3 + Docker CLI"
 
 ENV DEBIAN_FRONTEND=noninteractive
