@@ -57,7 +57,7 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     services:
       minio:
-        image: quay.io/minio/minio:latest
+        image: bitnami/minio:latest
         env:
           MINIO_ROOT_USER: minioadmin
           MINIO_ROOT_PASSWORD: minioadmin
