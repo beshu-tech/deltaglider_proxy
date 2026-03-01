@@ -28,7 +28,7 @@ jobs:
     needs: ci
     runs-on: k3s
     container:
-      image: ghcr.io/sscarduzio/sulfite/builder:latest
+      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -84,7 +84,7 @@ jobs:
     needs: validate
     runs-on: k3s
     container:
-      image: ghcr.io/sscarduzio/sulfite/builder:latest
+      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -240,7 +240,7 @@ jobs:
     needs: [validate, build-linux-x86_64, build-other, docker]
     runs-on: k3s
     container:
-      image: ghcr.io/sscarduzio/sulfite/builder:latest
+      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
