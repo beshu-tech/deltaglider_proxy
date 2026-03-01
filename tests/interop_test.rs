@@ -35,8 +35,10 @@ static PORT_COUNTER: AtomicU16 = AtomicU16::new(19100);
 /// Test prefix counter for isolation
 static TEST_PREFIX_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// MinIO configuration
-const MINIO_ENDPOINT: &str = "http://localhost:9000";
+/// MinIO configuration — reads MINIO_ENDPOINT env var, falls back to localhost:9000
+fn minio_endpoint() -> String {
+    std::env::var("MINIO_ENDPOINT").unwrap_or_else(|_| "http://localhost:9000".to_string())
+}
 const MINIO_BUCKET: &str = "deltaglider-test";
 const MINIO_ACCESS_KEY: &str = "minioadmin";
 const MINIO_SECRET_KEY: &str = "minioadmin";
@@ -101,7 +103,7 @@ async fn minio_available() -> bool {
     let config = aws_sdk_s3::Config::builder()
         .behavior_version(BehaviorVersion::latest())
         .region(Region::new("us-east-1"))
-        .endpoint_url(MINIO_ENDPOINT)
+        .endpoint_url(minio_endpoint())
         .credentials_provider(credentials)
         .force_path_style(true)
         .build();
@@ -132,7 +134,7 @@ async fn minio_client() -> Client {
     let config = aws_sdk_s3::Config::builder()
         .behavior_version(BehaviorVersion::latest())
         .region(Region::new("us-east-1"))
-        .endpoint_url(MINIO_ENDPOINT)
+        .endpoint_url(minio_endpoint())
         .credentials_provider(credentials)
         .force_path_style(true)
         .build();
@@ -146,7 +148,7 @@ fn run_deltaglider_cli(args: &[&str]) -> std::io::Result<std::process::Output> {
     // Use host network to access MinIO on localhost
     let access_key_env = format!("AWS_ACCESS_KEY_ID={}", MINIO_ACCESS_KEY);
     let secret_key_env = format!("AWS_SECRET_ACCESS_KEY={}", MINIO_SECRET_KEY);
-    let endpoint_env = format!("AWS_ENDPOINT_URL={}", MINIO_ENDPOINT);
+    let endpoint_env = format!("AWS_ENDPOINT_URL={}", minio_endpoint());
 
     let mut docker_args = vec![
         "run",
@@ -177,7 +179,7 @@ fn run_deltaglider_cli_with_stdin(
 
     let access_key_env = format!("AWS_ACCESS_KEY_ID={}", MINIO_ACCESS_KEY);
     let secret_key_env = format!("AWS_SECRET_ACCESS_KEY={}", MINIO_SECRET_KEY);
-    let endpoint_env = format!("AWS_ENDPOINT_URL={}", MINIO_ENDPOINT);
+    let endpoint_env = format!("AWS_ENDPOINT_URL={}", minio_endpoint());
 
     let mut docker_args = vec![
         "run",
@@ -225,7 +227,7 @@ impl TestProxyServer {
 
         let process = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"))
             .env("DGP_LISTEN_ADDR", format!("127.0.0.1:{}", port))
-            .env("DGP_S3_ENDPOINT", MINIO_ENDPOINT)
+            .env("DGP_S3_ENDPOINT", minio_endpoint())
             .env("DGP_S3_REGION", "us-east-1")
             .env("DGP_S3_PATH_STYLE", "true")
             .env("DGP_BE_AWS_ACCESS_KEY_ID", MINIO_ACCESS_KEY)
@@ -322,7 +324,7 @@ async fn test_original_cli_upload_metadata_structure() {
     let volume_mount = format!("{}:/data", temp_dir.path().display());
     let access_key = format!("AWS_ACCESS_KEY_ID={}", MINIO_ACCESS_KEY);
     let secret_key = format!("AWS_SECRET_ACCESS_KEY={}", MINIO_SECRET_KEY);
-    let endpoint = format!("AWS_ENDPOINT_URL={}", MINIO_ENDPOINT);
+    let endpoint = format!("AWS_ENDPOINT_URL={}", minio_endpoint());
     let s3_dest = format!("s3://{}/{}/v1.zip", MINIO_BUCKET, prefix);
 
     let result = Command::new("docker")
@@ -468,7 +470,7 @@ async fn test_original_cli_download_checksum_match() {
                 "-e",
                 &format!("AWS_SECRET_ACCESS_KEY={}", MINIO_SECRET_KEY),
                 "-e",
-                &format!("AWS_ENDPOINT_URL={}", MINIO_ENDPOINT),
+                &format!("AWS_ENDPOINT_URL={}", minio_endpoint()),
                 DELTAGLIDER_IMAGE,
                 "cp",
                 &format!("/data/{}", name),
@@ -494,7 +496,7 @@ async fn test_original_cli_download_checksum_match() {
     let download_mount = format!("{}:/workdir", download_dir.path().display());
     let access_key_dl = format!("AWS_ACCESS_KEY_ID={}", MINIO_ACCESS_KEY);
     let secret_key_dl = format!("AWS_SECRET_ACCESS_KEY={}", MINIO_SECRET_KEY);
-    let endpoint_dl = format!("AWS_ENDPOINT_URL={}", MINIO_ENDPOINT);
+    let endpoint_dl = format!("AWS_ENDPOINT_URL={}", minio_endpoint());
 
     for (name, expected_sha256) in [("v1.zip", &v1_sha256), ("v2.zip", &v2_sha256)] {
         let s3_src = format!("s3://{}/{}/{}", MINIO_BUCKET, prefix, name);
@@ -695,7 +697,7 @@ async fn test_cross_tool_delta_reconstruction() {
                 "-e",
                 &format!("AWS_SECRET_ACCESS_KEY={}", MINIO_SECRET_KEY),
                 "-e",
-                &format!("AWS_ENDPOINT_URL={}", MINIO_ENDPOINT),
+                &format!("AWS_ENDPOINT_URL={}", minio_endpoint()),
                 DELTAGLIDER_IMAGE,
                 "cp",
                 &format!("/data/{}", name),
@@ -782,7 +784,7 @@ async fn test_cross_tool_delta_reconstruction() {
     let dl_mount = format!("{}:/workdir", download_dir.path().display());
     let ak = format!("AWS_ACCESS_KEY_ID={}", MINIO_ACCESS_KEY);
     let sk = format!("AWS_SECRET_ACCESS_KEY={}", MINIO_SECRET_KEY);
-    let ep = format!("AWS_ENDPOINT_URL={}", MINIO_ENDPOINT);
+    let ep = format!("AWS_ENDPOINT_URL={}", minio_endpoint());
 
     // Note: The CLI may not understand proxy's .meta sidecar format
     // This test documents the compatibility gap if any
@@ -894,7 +896,7 @@ async fn test_proxy_reads_cli_format() {
                 "-e",
                 &format!("AWS_SECRET_ACCESS_KEY={}", MINIO_SECRET_KEY),
                 "-e",
-                &format!("AWS_ENDPOINT_URL={}", MINIO_ENDPOINT),
+                &format!("AWS_ENDPOINT_URL={}", minio_endpoint()),
                 DELTAGLIDER_IMAGE,
                 "cp",
                 &format!("/data/{}", name),
@@ -1022,7 +1024,7 @@ async fn test_document_storage_format_differences() {
                 "-e",
                 &format!("AWS_SECRET_ACCESS_KEY={}", MINIO_SECRET_KEY),
                 "-e",
-                &format!("AWS_ENDPOINT_URL={}", MINIO_ENDPOINT),
+                &format!("AWS_ENDPOINT_URL={}", minio_endpoint()),
                 DELTAGLIDER_IMAGE,
                 "cp",
                 &format!("/data/{}", name),
