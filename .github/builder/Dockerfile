@@ -41,6 +41,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 # ── Cargo tools (baked in, zero runtime install) ───────────────────
 RUN cargo install cargo-audit --locked \
   && cargo install cargo-sbom --locked \
+  && cargo install sccache --locked \
   && rm -rf "$CARGO_HOME"/registry "$CARGO_HOME"/git
 
 # ── MinIO client (mc) ──────────────────────────────────────────────
@@ -57,6 +58,7 @@ RUN echo "--- Builder image verification ---" \
   && cargo clippy --version \
   && cargo audit --version \
   && cargo sbom --help | head -1 \
+  && sccache --version \
   && xdelta3 -V \
   && mc --version \
   && docker --version \
