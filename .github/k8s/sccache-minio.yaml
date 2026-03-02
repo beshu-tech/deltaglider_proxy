@@ -1,0 +1,152 @@
+# ============================================================================
+# SCCACHE MinIO — Persistent Rust compilation cache store
+# ============================================================================
+# PURPOSE:  Dedicated S3-compatible store for sccache (Rust compiler cache).
+#           This is NOT the CI test MinIO. This is NOT an application backend.
+#           This exists solely to cache Rust compilation artifacts locally
+#           so CI builds don't need to download from GitHub's remote servers.
+#
+# ACCESS:   sccache-minio.sccache.svc.cluster.local:9000
+# BUCKET:   sccache-rust
+# CREDS:    sccache / sccache-secret-key  (internal only, not exposed)
+# ============================================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sccache
+  labels:
+    app.kubernetes.io/name: sccache-minio
+    app.kubernetes.io/component: compilation-cache
+    app.kubernetes.io/part-of: ci-infrastructure
+    purpose: rust-compilation-cache
+  annotations:
+    description: "Persistent MinIO for sccache Rust compilation cache — NOT for CI tests or application data"
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sccache-minio-data
+  namespace: sccache
+  labels:
+    app.kubernetes.io/name: sccache-minio
+    app.kubernetes.io/component: compilation-cache
+    app.kubernetes.io/part-of: ci-infrastructure
+    purpose: rust-compilation-cache
+  annotations:
+    description: "Persistent storage for sccache MinIO — Rust compilation cache objects"
+spec:
+  storageClassName: local-path
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sccache-minio
+  namespace: sccache
+  labels:
+    app.kubernetes.io/name: sccache-minio
+    app.kubernetes.io/component: compilation-cache
+    app.kubernetes.io/part-of: ci-infrastructure
+    purpose: rust-compilation-cache
+  annotations:
+    description: |
+      SCCACHE MinIO — Persistent Rust compilation cache.
+      NOT the ephemeral CI test MinIO. NOT an application backend.
+      Used exclusively by sccache in GitHub Actions CI jobs.
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate  # single-replica with PVC, no rolling update needed
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sccache-minio
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sccache-minio
+        app.kubernetes.io/component: compilation-cache
+        app.kubernetes.io/part-of: ci-infrastructure
+        purpose: rust-compilation-cache
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio:latest
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - name: MINIO_ROOT_USER
+              value: "sccache"
+            - name: MINIO_ROOT_PASSWORD
+              value: "sccache-secret-key"
+            # Distinctive MinIO console branding
+            - name: MINIO_BROWSER_REDIRECT_URL
+              value: ""
+          ports:
+            - name: s3-api
+              containerPort: 9000
+              protocol: TCP
+            - name: console
+              containerPort: 9001
+              protocol: TCP
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: 9000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: 9000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: sccache-minio-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sccache-minio
+  namespace: sccache
+  labels:
+    app.kubernetes.io/name: sccache-minio
+    app.kubernetes.io/component: compilation-cache
+    app.kubernetes.io/part-of: ci-infrastructure
+    purpose: rust-compilation-cache
+  annotations:
+    description: |
+      Internal S3 endpoint for sccache Rust compilation cache.
+      Access: sccache-minio.sccache.svc.cluster.local:9000
+      NOT the CI test MinIO endpoint.
+spec:
+  selector:
+    app.kubernetes.io/name: sccache-minio
+  ports:
+    - name: s3-api
+      port: 9000
+      targetPort: 9000
+      protocol: TCP
+    - name: console
+      port: 9001
+      targetPort: 9001
+      protocol: TCP
+  type: ClusterIP
