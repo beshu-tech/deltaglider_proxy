@@ -12,6 +12,15 @@ env:
   CARGO_TERM_COLOR: always
   BINARY_NAME: deltaglider_proxy
   DOCKERHUB_REPO: beshultd/deltaglider_proxy
+  # ── sccache: local MinIO compilation cache (NOT the CI test MinIO) ──
+  RUSTC_WRAPPER: sccache
+  CARGO_INCREMENTAL: "0"
+  SCCACHE_BUCKET: sccache-rust
+  SCCACHE_ENDPOINT: http://sccache-minio.sccache.svc.cluster.local:9000
+  SCCACHE_REGION: auto
+  SCCACHE_S3_USE_SSL: "false"
+  AWS_ACCESS_KEY_ID: sccache
+  AWS_SECRET_ACCESS_KEY: sccache-secret-key
 
 jobs:
   # ── Job 1: CI Gate ──────────────────────────────────────────────────
@@ -94,10 +103,6 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
-        with:
-          key: release-x86_64-unknown-linux-gnu
-
       - name: Stamp version from git tag
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
@@ -130,6 +135,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
+    env:
+      # Disable sccache for non-k3s runners (no access to local MinIO)
+      RUSTC_WRAPPER: ""
+      CARGO_INCREMENTAL: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -196,6 +205,8 @@ jobs:
     runs-on: k3s
     permissions:
       contents: read
+    env:
+      RUSTC_WRAPPER: ""  # Docker build has its own caching
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
