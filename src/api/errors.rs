@@ -188,10 +188,7 @@ mod tests {
             S3Error::BucketNotEmpty("b".into()).status_code(),
             StatusCode::CONFLICT
         );
-        assert_eq!(
-            S3Error::AccessDenied.status_code(),
-            StatusCode::FORBIDDEN
-        );
+        assert_eq!(S3Error::AccessDenied.status_code(), StatusCode::FORBIDDEN);
         assert_eq!(
             S3Error::SignatureDoesNotMatch.status_code(),
             StatusCode::FORBIDDEN

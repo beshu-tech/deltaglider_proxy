@@ -418,8 +418,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let codec = self.codec.clone();
         let encode_start = Instant::now();
         let delta = tokio::task::spawn_blocking(move || codec.encode(&ref_clone, &data_owned))
-        .await
-        .map_err(|e| EngineError::Storage(StorageError::Other(format!("codec task panicked: {}", e))))??;
+            .await
+            .map_err(|e| {
+                EngineError::Storage(StorageError::Other(format!("codec task panicked: {}", e)))
+            })??;
         let encode_secs = encode_start.elapsed().as_secs_f64();
         drop(_codec_permit);
 
@@ -857,9 +859,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     .get_delta(bucket, deltaspace_id, &obj_key.filename)
                     .await?;
                 let _codec_permit = self.codec_semaphore.try_acquire().map_err(|_| {
-                    EngineError::Overloaded(
-                        "all delta codec slots busy — try again later".into(),
-                    )
+                    EngineError::Overloaded("all delta codec slots busy — try again later".into())
                 })?;
                 // PERF: Run blocking xdelta3 subprocess off the Tokio worker pool.
                 // `reference` is Bytes (cheap clone); `delta` is already an owned Vec.
@@ -867,8 +867,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 let codec = self.codec.clone();
                 let decode_start = Instant::now();
                 let result = tokio::task::spawn_blocking(move || codec.decode(&ref_clone, &delta))
-                .await
-                .map_err(|e| EngineError::Storage(StorageError::Other(format!("codec task panicked: {}", e))))??;
+                    .await
+                    .map_err(|e| {
+                        EngineError::Storage(StorageError::Other(format!(
+                            "codec task panicked: {}",
+                            e
+                        )))
+                    })??;
                 let decode_secs = decode_start.elapsed().as_secs_f64();
                 drop(_codec_permit);
                 if let Some(m) = &self.metrics {
