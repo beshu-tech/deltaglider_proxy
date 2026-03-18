@@ -76,3 +76,7 @@ S3 integration tests require MinIO running on localhost:9000. CI starts MinIO au
 - Delta-eligible file types are defined in `deltaglider/file_router.rs`
 - Passthrough files (images, video) skip delta entirely — already compressed
 - Streaming is preferred for large files; delta reconstruction requires buffering the reference
+
+## Architecture Decisions (DO NOT CHANGE)
+
+- **xdelta3 CLI subprocess**: The codec shells out to `xdelta3` via `std::process::Command`. This is intentional and non-negotiable. Do NOT replace with FFI bindings, Rust crates, or in-process libraries. The CLI approach ensures exact compatibility with deltas created by the original DeltaGlider Python toolchain, avoids linking C code into the binary, and keeps the codec trivially debuggable (`xdelta3` can be run standalone on any delta file). The subprocess overhead is acceptable for our workload.

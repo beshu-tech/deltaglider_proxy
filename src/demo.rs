@@ -25,7 +25,13 @@ struct DemoAssets;
 ///
 /// When `tls` is `Some`, the demo server uses HTTPS (same cert as the S3 port).
 pub async fn serve(s3_port: u16, admin_state: Arc<AdminState>, tls: Option<RustlsConfig>) {
-    let demo_port = s3_port + 1;
+    let Some(demo_port) = s3_port.checked_add(1) else {
+        tracing::error!(
+            "Cannot start Demo UI: S3 port {} + 1 overflows u16. Use a port below 65535.",
+            s3_port
+        );
+        return;
+    };
     let addr = format!("0.0.0.0:{demo_port}");
 
     // Admin API routes that require authentication

@@ -57,6 +57,11 @@ impl DeltaCodec {
         self.cli_available
     }
 
+    /// Returns the max object size this codec will accept (in bytes).
+    pub fn max_size(&self) -> usize {
+        self.max_size
+    }
+
     /// Encode a delta between source (reference) and target (new file)
     /// Returns the delta patch that can transform source into target.
     ///

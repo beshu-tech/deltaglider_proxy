@@ -55,6 +55,9 @@ pub enum S3Error {
 
     #[error("SignatureDoesNotMatch: The request signature we calculated does not match the signature you provided.")]
     SignatureDoesNotMatch,
+
+    #[error("SlowDown: Please reduce your request rate.")]
+    SlowDown(String),
 }
 
 impl S3Error {
@@ -77,6 +80,7 @@ impl S3Error {
             S3Error::NotImplemented(_) => "NotImplemented",
             S3Error::AccessDenied => "AccessDenied",
             S3Error::SignatureDoesNotMatch => "SignatureDoesNotMatch",
+            S3Error::SlowDown(_) => "SlowDown",
         }
     }
 
@@ -87,7 +91,7 @@ impl S3Error {
             S3Error::NoSuchBucket(_) => StatusCode::NOT_FOUND,
             S3Error::BucketNotEmpty(_) => StatusCode::CONFLICT,
             S3Error::BucketAlreadyExists(_) => StatusCode::CONFLICT,
-            S3Error::EntityTooLarge { .. } => StatusCode::BAD_REQUEST,
+            S3Error::EntityTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             S3Error::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             S3Error::InvalidArgument(_) => StatusCode::BAD_REQUEST,
             S3Error::InvalidRequest(_) => StatusCode::BAD_REQUEST,
@@ -99,6 +103,7 @@ impl S3Error {
             S3Error::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             S3Error::AccessDenied => StatusCode::FORBIDDEN,
             S3Error::SignatureDoesNotMatch => StatusCode::FORBIDDEN,
+            S3Error::SlowDown(_) => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -149,5 +154,56 @@ impl From<crate::storage::StorageError> for S3Error {
             ),
             other => S3Error::InternalError(other.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: EntityTooLarge must return 413, not 400.
+    /// S3 clients rely on the status code to distinguish size errors from bad requests.
+    #[test]
+    fn entity_too_large_returns_413() {
+        let err = S3Error::EntityTooLarge {
+            size: 200,
+            max: 100,
+        };
+        assert_eq!(err.status_code(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(err.status_code().as_u16(), 413);
+    }
+
+    /// Verify all S3 error status codes match S3 API specification.
+    #[test]
+    fn error_status_codes_match_s3_spec() {
+        assert_eq!(
+            S3Error::NoSuchKey("k".into()).status_code(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            S3Error::NoSuchBucket("b".into()).status_code(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            S3Error::BucketNotEmpty("b".into()).status_code(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            S3Error::AccessDenied.status_code(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            S3Error::SignatureDoesNotMatch.status_code(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    /// SlowDown (codec backpressure) must return 503 with the correct S3 error code.
+    #[test]
+    fn slow_down_returns_503() {
+        let err = S3Error::SlowDown("busy".into());
+        assert_eq!(err.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.status_code().as_u16(), 503);
+        assert_eq!(err.code(), "SlowDown");
     }
 }

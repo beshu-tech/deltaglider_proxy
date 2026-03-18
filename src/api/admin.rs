@@ -11,10 +11,15 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
+use crate::api::auth::AuthConfig;
 use crate::api::handlers::AppState;
 use crate::config::SharedConfig;
 use crate::deltaglider::DynEngine;
 use crate::session::SessionStore;
+
+/// Thread-safe, hot-swappable auth configuration.
+/// Shared between the SigV4 middleware and the admin API.
+pub type SharedAuthConfig = Arc<arc_swap::ArcSwap<Option<AuthConfig>>>;
 
 /// Type alias for the tracing reload handle.
 pub type LogReloadHandle =
@@ -27,6 +32,7 @@ pub struct AdminState {
     pub config: SharedConfig,
     pub log_reload: LogReloadHandle,
     pub s3_state: Arc<AppState>,
+    pub auth_config: SharedAuthConfig,
 }
 
 #[derive(Deserialize)]
@@ -113,7 +119,18 @@ pub async fn login(
     Json(body): Json<LoginRequest>,
 ) -> impl IntoResponse {
     let hash = state.password_hash.read().clone();
-    let valid = bcrypt::verify(&body.password, &hash).unwrap_or(false);
+    let valid = match bcrypt::verify(&body.password, &hash) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("bcrypt verify failed (corrupted hash?): {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                HeaderMap::new(),
+                Json(LoginResponse { ok: false }),
+            )
+                .into_response();
+        }
+    };
 
     if !valid {
         return (
@@ -437,6 +454,22 @@ pub async fn update_config(
         }
     }
 
+    // Hot-reload auth credentials into the live SigV4 middleware
+    if body.access_key_id.is_some() || body.secret_access_key.is_some() {
+        let new_auth =
+            if let (Some(ref key_id), Some(ref secret)) = (&cfg.access_key_id, &cfg.secret_access_key)
+            {
+                Some(AuthConfig {
+                    access_key_id: key_id.clone(),
+                    secret_access_key: secret.clone(),
+                })
+            } else {
+                None
+            };
+        state.auth_config.store(Arc::new(new_auth));
+        tracing::info!("Auth credentials hot-reloaded (auth enabled: {})", cfg.auth_enabled());
+    }
+
     // Persist to TOML file
     if let Err(e) = cfg.persist_to_file("deltaglider_proxy.toml") {
         warnings.push(format!("Failed to persist config: {}", e));
@@ -455,7 +488,23 @@ pub async fn change_password(
     Json(body): Json<PasswordChangeRequest>,
 ) -> impl IntoResponse {
     let current_hash = state.password_hash.read().clone();
-    let valid = bcrypt::verify(&body.current_password, &current_hash).unwrap_or(false);
+    let valid = match bcrypt::verify(&body.current_password, &current_hash) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("bcrypt verify failed (corrupted hash?): {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(PasswordChangeResponse {
+                    ok: false,
+                    error: Some(
+                        "Password hash is corrupted. Delete .deltaglider_admin_hash and restart."
+                            .to_string(),
+                    ),
+                }),
+            )
+                .into_response();
+        }
+    };
 
     if !valid {
         return (
@@ -684,4 +733,58 @@ fn extract_session_token(headers: &HeaderMap) -> Option<String> {
             part.strip_prefix("dgp_session=")
                 .map(|value| value.to_string())
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: SharedAuthConfig must reflect credential updates immediately.
+    /// This guards against reverting to a static Extension<Option<Arc<AuthConfig>>>.
+    #[test]
+    fn shared_auth_config_reflects_updates() {
+        let shared: SharedAuthConfig = Arc::new(arc_swap::ArcSwap::from_pointee(None));
+
+        // Initially no auth
+        assert!(shared.load().is_none());
+
+        // Simulate admin API updating credentials
+        shared.store(Arc::new(Some(AuthConfig {
+            access_key_id: "new-key".to_string(),
+            secret_access_key: "new-secret".to_string(),
+        })));
+
+        // Middleware must see the update
+        let loaded = shared.load();
+        let auth = loaded.as_ref().as_ref().unwrap();
+        assert_eq!(auth.access_key_id, "new-key");
+        assert_eq!(auth.secret_access_key, "new-secret");
+
+        // Simulate disabling auth (clearing both credentials)
+        shared.store(Arc::new(None));
+        assert!(shared.load().is_none());
+    }
+
+    #[test]
+    fn extract_session_token_from_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, "dgp_session=abc123".parse().unwrap());
+        assert_eq!(extract_session_token(&headers).unwrap(), "abc123");
+
+        // Multiple cookies
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            "foo=bar; dgp_session=xyz789; baz=qux".parse().unwrap(),
+        );
+        assert_eq!(extract_session_token(&headers).unwrap(), "xyz789");
+
+        // No session cookie
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, "foo=bar".parse().unwrap());
+        assert!(extract_session_token(&headers).is_none());
+
+        // No cookie header at all
+        assert!(extract_session_token(&HeaderMap::new()).is_none());
+    }
 }

@@ -46,7 +46,7 @@ async fn atomic_write(path: &Path, data: &[u8]) -> Result<(), StorageError> {
         Ok(())
     })
     .await
-    .map_err(|e| StorageError::Other(format!("spawn_blocking join failed: {}", e)))?
+    .map_err(super::join_error)?
 }
 
 /// Filesystem storage backend
@@ -362,24 +362,19 @@ impl StorageBackend for FilesystemBackend {
     }
 
     // === Reference operations ===
+    // Delegates to the shared get/put/delete_object_file helpers using
+    // the fixed "reference.bin" filename, keeping the same error/debug
+    // format as delta and passthrough operations.
 
     #[instrument(skip(self))]
     async fn get_reference(&self, bucket: &str, prefix: &str) -> Result<Vec<u8>, StorageError> {
-        let path = self.reference_path(bucket, prefix);
-        if !path_exists(&path).await {
-            return Err(StorageError::NotFound(format!(
-                "Reference for {}/{}",
-                bucket, prefix
-            )));
-        }
-        let data = fs::read(&path).await?;
-        debug!(
-            "Read reference ({} bytes) for {}/{}",
-            data.len(),
-            bucket,
-            prefix
-        );
-        Ok(data)
+        self.get_object_file(
+            &self.reference_path(bucket, prefix),
+            "reference",
+            prefix,
+            "reference.bin",
+        )
+        .await
     }
 
     #[instrument(skip(self, data, metadata))]
@@ -390,19 +385,15 @@ impl StorageBackend for FilesystemBackend {
         data: &[u8],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        let data_path = self.reference_path(bucket, prefix);
-
-        self.ensure_dir(&data_path).await?;
-        atomic_write(&data_path, data).await?;
-        xattr_meta::write_metadata(&data_path, metadata).await?;
-
-        debug!(
-            "Wrote reference ({} bytes) for {}/{}",
-            data.len(),
-            bucket,
-            prefix
-        );
-        Ok(())
+        self.put_object_file(
+            &self.reference_path(bucket, prefix),
+            data,
+            metadata,
+            "reference",
+            prefix,
+            "reference.bin",
+        )
+        .await
     }
 
     #[instrument(skip(self, metadata))]
@@ -412,8 +403,7 @@ impl StorageBackend for FilesystemBackend {
         prefix: &str,
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        let data_path = self.reference_path(bucket, prefix);
-        xattr_meta::write_metadata(&data_path, metadata).await
+        xattr_meta::write_metadata(&self.reference_path(bucket, prefix), metadata).await
     }
 
     #[instrument(skip(self))]
@@ -422,8 +412,7 @@ impl StorageBackend for FilesystemBackend {
         bucket: &str,
         prefix: &str,
     ) -> Result<FileMetadata, StorageError> {
-        let data_path = self.reference_path(bucket, prefix);
-        xattr_meta::read_metadata(&data_path).await
+        xattr_meta::read_metadata(&self.reference_path(bucket, prefix)).await
     }
 
     async fn has_reference(&self, bucket: &str, prefix: &str) -> bool {
@@ -432,19 +421,13 @@ impl StorageBackend for FilesystemBackend {
 
     #[instrument(skip(self))]
     async fn delete_reference(&self, bucket: &str, prefix: &str) -> Result<(), StorageError> {
-        let data_path = self.reference_path(bucket, prefix);
-
-        if !path_exists(&data_path).await {
-            return Err(StorageError::NotFound(format!(
-                "Reference for {}/{}",
-                bucket, prefix
-            )));
-        }
-
-        fs::remove_file(&data_path).await?;
-
-        debug!("Deleted reference for {}/{}", bucket, prefix);
-        Ok(())
+        self.delete_object_file(
+            &self.reference_path(bucket, prefix),
+            "reference",
+            prefix,
+            "reference.bin",
+        )
+        .await
     }
 
     // === Delta operations ===
@@ -611,7 +594,7 @@ impl StorageBackend for FilesystemBackend {
             Ok(())
         })
         .await
-        .map_err(|e| StorageError::Other(format!("spawn_blocking join failed: {}", e)))??;
+        .map_err(super::join_error)??;
 
         xattr_meta::write_metadata(&data_path, metadata).await?;
 

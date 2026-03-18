@@ -14,6 +14,7 @@
 //! downstream by the engine's SHA-256 check).
 
 use super::S3Error;
+use crate::api::admin::SharedAuthConfig;
 use crate::metrics::Metrics;
 use axum::body::Body;
 use axum::http::Request;
@@ -283,12 +284,12 @@ pub async fn sigv4_auth_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Result<Response, Response> {
-    // Auth config is stored in request extensions by the Extension layer
-    let auth = request
+    // Auth config is read from an ArcSwap so admin API credential
+    // updates take effect immediately without restart.
+    let auth_snapshot = request
         .extensions()
-        .get::<Option<Arc<AuthConfig>>>()
-        .cloned()
-        .flatten();
+        .get::<SharedAuthConfig>()
+        .map(|swap| swap.load_full());
 
     let metrics = request
         .extensions()
@@ -303,9 +304,10 @@ pub async fn sigv4_auth_middleware(
         }
     };
 
-    let auth = match auth {
-        Some(a) => a,
-        None => return Ok(next.run(request).await),
+    // If no SharedAuthConfig extension, or credentials are None → open access
+    let auth = match auth_snapshot.as_deref() {
+        Some(Some(a)) => a,
+        _ => return Ok(next.run(request).await),
     };
 
     // Log every incoming request before auth check for debugging
@@ -348,7 +350,7 @@ pub async fn sigv4_auth_middleware(
 
     match verify_signature(
         &params,
-        &auth,
+        auth,
         method,
         uri_path,
         request.headers(),

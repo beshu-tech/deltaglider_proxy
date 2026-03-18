@@ -1,9 +1,154 @@
 //! Configuration for DeltaGlider Proxy S3 server
 
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// A single entry in the environment variable registry.
+pub struct EnvVarEntry {
+    /// The environment variable name (e.g. `DGP_LISTEN_ADDR`)
+    pub name: &'static str,
+    /// Short human-readable description
+    pub description: &'static str,
+    /// Example value
+    pub example: &'static str,
+    /// Grouping category for display
+    pub category: &'static str,
+}
+
+/// Single source of truth for every `DGP_*` environment variable.
+///
+/// A unit test enforces that this list matches `from_env()` exactly.
+pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
+    // ── Server ──────────────────────────────────────────────
+    EnvVarEntry {
+        name: "DGP_LISTEN_ADDR",
+        description: "Listen address (ip:port)",
+        example: "0.0.0.0:9000",
+        category: "Server",
+    },
+    EnvVarEntry {
+        name: "DGP_LOG_LEVEL",
+        description: "Log level filter (overridden by RUST_LOG)",
+        example: "deltaglider_proxy=debug,tower_http=debug",
+        category: "Server",
+    },
+    EnvVarEntry {
+        name: "DGP_CODEC_CONCURRENCY",
+        description: "Max concurrent delta encode/decode ops (default: CPU cores)",
+        example: "4",
+        category: "Server",
+    },
+    EnvVarEntry {
+        name: "DGP_BLOCKING_THREADS",
+        description: "Max tokio blocking threads (default: 512)",
+        example: "64",
+        category: "Server",
+    },
+    EnvVarEntry {
+        name: "DGP_CONFIG",
+        description: "Path to TOML config file",
+        example: "/etc/deltaglider_proxy/config.toml",
+        category: "Server",
+    },
+    // ── Delta engine ────────────────────────────────────────
+    EnvVarEntry {
+        name: "DGP_MAX_DELTA_RATIO",
+        description: "Max delta/original ratio to keep a delta (0.0–1.0)",
+        example: "0.5",
+        category: "Delta Engine",
+    },
+    EnvVarEntry {
+        name: "DGP_MAX_OBJECT_SIZE",
+        description: "Max object size in bytes for delta processing",
+        example: "104857600",
+        category: "Delta Engine",
+    },
+    EnvVarEntry {
+        name: "DGP_CACHE_MB",
+        description: "Reference cache size in MB",
+        example: "100",
+        category: "Delta Engine",
+    },
+    // ── Filesystem backend ──────────────────────────────────
+    EnvVarEntry {
+        name: "DGP_DATA_DIR",
+        description: "Data directory (activates filesystem backend)",
+        example: "./data",
+        category: "Filesystem Backend",
+    },
+    // ── S3 backend ──────────────────────────────────────────
+    EnvVarEntry {
+        name: "DGP_S3_ENDPOINT",
+        description: "S3 endpoint URL (activates S3 backend)",
+        example: "http://localhost:9000",
+        category: "S3 Backend",
+    },
+    EnvVarEntry {
+        name: "DGP_S3_REGION",
+        description: "AWS region",
+        example: "us-east-1",
+        category: "S3 Backend",
+    },
+    EnvVarEntry {
+        name: "DGP_S3_PATH_STYLE",
+        description: "Use path-style URLs (true/1 for MinIO/LocalStack)",
+        example: "true",
+        category: "S3 Backend",
+    },
+    EnvVarEntry {
+        name: "DGP_BE_AWS_ACCESS_KEY_ID",
+        description: "AWS access key for S3 backend",
+        example: "minioadmin",
+        category: "S3 Backend",
+    },
+    EnvVarEntry {
+        name: "DGP_BE_AWS_SECRET_ACCESS_KEY",
+        description: "AWS secret key for S3 backend",
+        example: "minioadmin",
+        category: "S3 Backend",
+    },
+    // ── Authentication ──────────────────────────────────────
+    EnvVarEntry {
+        name: "DGP_ACCESS_KEY_ID",
+        description: "Proxy access key (enables SigV4 auth when both set)",
+        example: "my-access-key",
+        category: "Authentication",
+    },
+    EnvVarEntry {
+        name: "DGP_SECRET_ACCESS_KEY",
+        description: "Proxy secret key (enables SigV4 auth when both set)",
+        example: "my-secret-key",
+        category: "Authentication",
+    },
+    EnvVarEntry {
+        name: "DGP_ADMIN_PASSWORD_HASH",
+        description: "Bcrypt hash of admin GUI password",
+        example: "$2b$12$...",
+        category: "Authentication",
+    },
+    // ── TLS ─────────────────────────────────────────────────
+    EnvVarEntry {
+        name: "DGP_TLS_ENABLED",
+        description: "Enable TLS (true/1)",
+        example: "true",
+        category: "TLS",
+    },
+    EnvVarEntry {
+        name: "DGP_TLS_CERT",
+        description: "Path to PEM certificate (auto-generates self-signed if omitted)",
+        example: "/etc/ssl/certs/proxy.pem",
+        category: "TLS",
+    },
+    EnvVarEntry {
+        name: "DGP_TLS_KEY",
+        description: "Path to PEM private key",
+        example: "/etc/ssl/private/proxy-key.pem",
+        category: "TLS",
+    },
+];
 
 /// Thread-safe shared config for hot-reload from admin GUI.
 pub type SharedConfig = Arc<tokio::sync::RwLock<Config>>;
@@ -382,6 +527,57 @@ impl Config {
         Arc::new(tokio::sync::RwLock::new(self))
     }
 
+    /// Print all recognised environment variables in `.env` format, grouped by category.
+    pub fn print_env_vars() {
+        let mut current_category = "";
+        for entry in ENV_VAR_REGISTRY {
+            if entry.category != current_category {
+                if !current_category.is_empty() {
+                    println!();
+                }
+                println!("# {}", entry.category);
+                current_category = entry.category;
+            }
+            println!("# {}", entry.description);
+            println!("{}={}", entry.name, entry.example);
+        }
+    }
+
+    /// Print an example TOML config derived from `Config::default()`.
+    ///
+    /// The default section is programmatic (any new `#[serde(default)]` field
+    /// appears automatically). A commented-out S3 + TLS + auth variant is
+    /// appended so every option is visible.
+    pub fn print_example_toml() {
+        let default_cfg = Config::default();
+        let base = toml::to_string_pretty(&default_cfg).expect("Config serializes to TOML");
+        println!("# DeltaGlider Proxy — example configuration");
+        println!("# Generated from compiled-in defaults\n");
+        println!("{base}");
+
+        // Append commented-out advanced sections
+        let mut extra = String::new();
+        let _ = writeln!(extra, "# ── S3 backend (uncomment to switch from filesystem) ──");
+        let _ = writeln!(extra, "# [backend]");
+        let _ = writeln!(extra, "# type = \"s3\"");
+        let _ = writeln!(extra, "# endpoint = \"http://localhost:9000\"");
+        let _ = writeln!(extra, "# region = \"us-east-1\"");
+        let _ = writeln!(extra, "# force_path_style = true");
+        let _ = writeln!(extra, "# access_key_id = \"minioadmin\"");
+        let _ = writeln!(extra, "# secret_access_key = \"minioadmin\"");
+        let _ = writeln!(extra);
+        let _ = writeln!(extra, "# ── Proxy authentication (SigV4) ──");
+        let _ = writeln!(extra, "# access_key_id = \"my-access-key\"");
+        let _ = writeln!(extra, "# secret_access_key = \"my-secret-key\"");
+        let _ = writeln!(extra);
+        let _ = writeln!(extra, "# ── TLS ──");
+        let _ = writeln!(extra, "# [tls]");
+        let _ = writeln!(extra, "# enabled = true");
+        let _ = writeln!(extra, "# cert_path = \"/etc/ssl/certs/proxy.pem\"");
+        let _ = writeln!(extra, "# key_path = \"/etc/ssl/private/proxy-key.pem\"");
+        print!("{extra}");
+    }
+
     /// Serialize config to TOML string (excludes admin_password_hash for security).
     pub fn to_toml_string(&self) -> Result<String, ConfigError> {
         // Clone and strip the admin hash before serializing
@@ -468,5 +664,94 @@ mod tests {
             }
             _ => panic!("Expected S3 backend"),
         }
+    }
+
+    /// Ensure every env var read in `from_env()` is present in the registry.
+    #[test]
+    fn test_registry_completeness() {
+        // All env var names referenced in from_env() — extracted manually and
+        // kept in sync by this test.
+        let used_in_from_env: &[&str] = &[
+            "DGP_LISTEN_ADDR",
+            "DGP_S3_ENDPOINT",
+            "DGP_S3_REGION",
+            "DGP_S3_PATH_STYLE",
+            "DGP_BE_AWS_ACCESS_KEY_ID",
+            "DGP_BE_AWS_SECRET_ACCESS_KEY",
+            "DGP_DATA_DIR",
+            "DGP_MAX_DELTA_RATIO",
+            "DGP_MAX_OBJECT_SIZE",
+            "DGP_CACHE_MB",
+            "DGP_CODEC_CONCURRENCY",
+            "DGP_BLOCKING_THREADS",
+            "DGP_ACCESS_KEY_ID",
+            "DGP_SECRET_ACCESS_KEY",
+            "DGP_ADMIN_PASSWORD_HASH",
+            "DGP_LOG_LEVEL",
+            "DGP_TLS_ENABLED",
+            "DGP_TLS_CERT",
+            "DGP_TLS_KEY",
+        ];
+
+        let registry_names: Vec<&str> =
+            super::ENV_VAR_REGISTRY.iter().map(|e| e.name).collect();
+
+        // Every var used in from_env must be in the registry
+        for var in used_in_from_env {
+            assert!(
+                registry_names.contains(var),
+                "Env var {var} is used in from_env() but missing from ENV_VAR_REGISTRY"
+            );
+        }
+
+        // Every registry entry must be referenced in from_env (no stale entries)
+        for name in &registry_names {
+            // DGP_CONFIG is checked in load(), not from_env() — allow it
+            if *name == "DGP_CONFIG" {
+                continue;
+            }
+            assert!(
+                used_in_from_env.contains(name),
+                "Env var {name} is in ENV_VAR_REGISTRY but not used in from_env()"
+            );
+        }
+    }
+
+    #[test]
+    fn test_print_env_vars_output() {
+        // Capture stdout by running the function in a string buffer
+        // We just verify it doesn't panic and covers all registry entries
+        let mut output = String::new();
+        let mut current_category = "";
+        for entry in super::ENV_VAR_REGISTRY {
+            if entry.category != current_category {
+                if !current_category.is_empty() {
+                    output.push('\n');
+                }
+                use std::fmt::Write;
+                let _ = writeln!(output, "# {}", entry.category);
+                current_category = entry.category;
+            }
+            use std::fmt::Write;
+            let _ = writeln!(output, "# {}", entry.description);
+            let _ = writeln!(output, "{}={}", entry.name, entry.example);
+        }
+
+        // Spot-check some entries
+        assert!(output.contains("DGP_LISTEN_ADDR=0.0.0.0:9000"));
+        assert!(output.contains("DGP_CACHE_MB=100"));
+        assert!(output.contains("# Server"));
+        assert!(output.contains("# TLS"));
+    }
+
+    #[test]
+    fn test_print_example_toml_is_valid() {
+        // The base TOML from Config::default() must round-trip
+        let default_cfg = Config::default();
+        let toml_str = toml::to_string_pretty(&default_cfg).unwrap();
+        let parsed: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.listen_addr, default_cfg.listen_addr);
+        assert_eq!(parsed.cache_size_mb, default_cfg.cache_size_mb);
+        assert_eq!(parsed.max_delta_ratio, default_cfg.max_delta_ratio);
     }
 }

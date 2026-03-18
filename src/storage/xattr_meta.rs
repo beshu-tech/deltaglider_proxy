@@ -29,7 +29,7 @@ pub async fn read_metadata(path: &Path) -> Result<FileMetadata, StorageError> {
         Err(e) => Err(io_to_storage_error(e)),
     })
     .await
-    .map_err(|e| StorageError::Other(format!("spawn_blocking join failed: {}", e)))?
+    .map_err(super::join_error)?
 }
 
 /// Write metadata as an xattr on a data file.
@@ -42,7 +42,7 @@ pub async fn write_metadata(path: &Path, metadata: &FileMetadata) -> Result<(), 
         xattr::set(&path, XATTR_NAME, &json).map_err(io_to_storage_error)
     })
     .await
-    .map_err(|e| StorageError::Other(format!("spawn_blocking join failed: {}", e)))?
+    .map_err(super::join_error)?
 }
 
 /// Validate that the filesystem at `root` supports extended attributes.
@@ -85,5 +85,5 @@ pub async fn validate_xattr_support(root: &Path) -> Result<(), StorageError> {
         })
     })
     .await
-    .map_err(|e| StorageError::Other(format!("spawn_blocking join failed: {}", e)))?
+    .map_err(super::join_error)?
 }

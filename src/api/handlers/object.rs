@@ -162,6 +162,72 @@ async fn copy_object_inner(
     Ok(xml_response(xml))
 }
 
+/// Decode the request body, handling AWS chunked transfer encoding if present.
+fn decode_body(headers: &HeaderMap, body: Bytes) -> Result<Bytes, S3Error> {
+    if !is_aws_chunked(headers) {
+        return Ok(body);
+    }
+
+    let expected_len = get_decoded_content_length(headers);
+    debug!(
+        "Decoding AWS chunked payload: {} bytes, expected decoded: {:?}",
+        body.len(),
+        expected_len
+    );
+    match decode_aws_chunked(&body, expected_len) {
+        Some(decoded) => {
+            debug!(
+                "Successfully decoded AWS chunked: {} -> {} bytes",
+                body.len(),
+                decoded.len()
+            );
+            Ok(decoded)
+        }
+        None => {
+            warn!(
+                "Failed to decode AWS chunked payload ({} bytes), rejecting request",
+                body.len()
+            );
+            Err(S3Error::InvalidArgument(
+                "Failed to decode AWS chunked transfer encoding".to_string(),
+            ))
+        }
+    }
+}
+
+/// Handle a multipart upload part (PUT with ?partNumber&uploadId).
+fn upload_part(
+    state: &Arc<AppState>,
+    bucket: &str,
+    key: &str,
+    headers: &HeaderMap,
+    part_num: u32,
+    upload_id: &str,
+    body: Bytes,
+) -> Result<Response, S3Error> {
+    info!(
+        "UploadPart {}/{} part={} uploadId={}",
+        bucket, key, part_num, upload_id
+    );
+
+    // Validate Content-MD5 header if present
+    if let Some(content_md5) = headers.get("content-md5").and_then(|v| v.to_str().ok()) {
+        use md5::Digest;
+        let computed = md5::Md5::digest(&body);
+        let expected = base64_decode(content_md5);
+        if let Some(expected) = expected {
+            if computed.as_slice() != expected.as_slice() {
+                return Err(S3Error::BadDigest);
+            }
+        }
+    }
+
+    let etag = state
+        .multipart
+        .upload_part(upload_id, bucket, key, part_num, body)?;
+    Ok((StatusCode::OK, [("ETag", etag)], "").into_response())
+}
+
 /// PUT object handler with copy detection and multipart upload support
 /// PUT /{bucket}/{key}
 /// Detects x-amz-copy-source header to dispatch to copy operation
@@ -174,62 +240,14 @@ pub async fn put_object_or_copy(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, S3Error> {
-    // Decode AWS chunked transfer encoding if present
-    let decoded_body = if is_aws_chunked(&headers) {
-        let expected_len = get_decoded_content_length(&headers);
-        debug!(
-            "Decoding AWS chunked payload: {} bytes, expected decoded: {:?}",
-            body.len(),
-            expected_len
-        );
-        match decode_aws_chunked(&body, expected_len) {
-            Some(decoded) => {
-                debug!(
-                    "Successfully decoded AWS chunked: {} -> {} bytes",
-                    body.len(),
-                    decoded.len()
-                );
-                decoded
-            }
-            None => {
-                warn!(
-                    "Failed to decode AWS chunked payload, using raw body ({} bytes)",
-                    body.len()
-                );
-                body
-            }
-        }
-    } else {
-        body
-    };
+    let decoded_body = decode_body(&headers, body)?;
 
-    // Check if this is a multipart upload part
+    // Multipart upload part
     if let (Some(part_num), Some(upload_id)) = (&query.part_number, &query.upload_id) {
-        info!(
-            "UploadPart {}/{} part={} uploadId={}",
-            bucket, key, part_num, upload_id
-        );
-
-        // Validate Content-MD5 header if present
-        if let Some(content_md5) = headers.get("content-md5").and_then(|v| v.to_str().ok()) {
-            use md5::Digest;
-            let computed = md5::Md5::digest(&decoded_body);
-            let expected = base64_decode(content_md5);
-            if let Some(expected) = expected {
-                if computed.as_slice() != expected.as_slice() {
-                    return Err(S3Error::BadDigest);
-                }
-            }
-        }
-
-        let etag =
-            state
-                .multipart
-                .upload_part(upload_id, &bucket, &key, *part_num, decoded_body)?;
-        return Ok((StatusCode::OK, [("ETag", etag)], "").into_response());
+        return upload_part(&state, &bucket, &key, &headers, *part_num, upload_id, decoded_body);
     }
 
-    // Check if this is a copy operation
+    // Copy vs direct put
     if headers.contains_key("x-amz-copy-source") {
         copy_object_inner(&state, &bucket, &key, &headers).await
     } else {
