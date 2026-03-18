@@ -208,7 +208,7 @@ mod tests {
             "test.bin".to_string(),
             String::new(),
             String::new(),
-            0,    // unknown size
+            0, // unknown size
             None,
         );
         let headers = build_object_headers(&meta);
