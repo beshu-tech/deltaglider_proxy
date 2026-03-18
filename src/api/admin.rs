@@ -413,14 +413,18 @@ pub async fn update_config(
         }
 
         if need_engine_swap {
-            match DynEngine::new(&cfg, state.s3_state.metrics.clone()).await {
+            // Save old backend config so we can rollback if engine creation fails.
+            let old_backend = cfg.backend.clone();
+            match DynEngine::new(&cfg, Some(state.s3_state.metrics.clone())).await {
                 Ok(new_engine) => {
                     state.s3_state.engine.store(Arc::new(new_engine));
                     tracing::info!("Backend engine rebuilt successfully");
                 }
                 Err(e) => {
+                    // Rollback: restore old backend config so config and engine stay consistent.
+                    cfg.backend = old_backend;
                     warnings.push(format!(
-                        "Failed to create engine with new backend config (keeping old engine): {}",
+                        "Failed to create engine with new backend config (config rolled back): {}",
                         e
                     ));
                 }

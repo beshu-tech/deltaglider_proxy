@@ -365,10 +365,7 @@ pub async fn http_metrics_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let metrics = match &state.metrics {
-        Some(m) => m,
-        None => return next.run(request).await,
-    };
+    let metrics = &state.metrics;
 
     let method = request.method().to_string();
     let path = request.uri().path().to_string();
@@ -420,12 +417,7 @@ pub async fn http_metrics_middleware(
 
 /// Handler for GET /metrics — returns Prometheus text format.
 pub async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let metrics = match &state.metrics {
-        Some(m) => m,
-        None => {
-            return (StatusCode::NOT_FOUND, "Metrics not enabled").into_response();
-        }
-    };
+    let metrics = &state.metrics;
 
     // Update on-demand gauges (all O(1) atomic reads)
     let engine = state.engine.load();

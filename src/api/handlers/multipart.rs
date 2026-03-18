@@ -120,7 +120,7 @@ async fn complete_multipart_upload(
         (etag, result)
     };
 
-    state.multipart.remove(upload_id);
+    // Upload already removed atomically inside complete() — no separate remove() needed.
 
     debug!(
         "CompleteMultipartUpload {}/{} stored as {}",

@@ -356,48 +356,35 @@ impl Config {
             };
         }
 
-        if let Ok(ratio) = std::env::var("DGP_MAX_DELTA_RATIO") {
-            match ratio.parse() {
-                Ok(parsed) => config.max_delta_ratio = parsed,
-                Err(e) => {
-                    eprintln!("Warning: ignoring invalid DGP_MAX_DELTA_RATIO=\"{ratio}\": {e}")
+        /// Parse an env var into a typed value, warning on invalid input.
+        fn parse_env<T: std::str::FromStr>(var: &str, field: &mut T)
+        where
+            T::Err: std::fmt::Display,
+        {
+            if let Ok(raw) = std::env::var(var) {
+                match raw.parse() {
+                    Ok(parsed) => *field = parsed,
+                    Err(e) => eprintln!("Warning: ignoring invalid {var}=\"{raw}\": {e}"),
+                }
+            }
+        }
+        fn parse_env_opt<T: std::str::FromStr>(var: &str, field: &mut Option<T>)
+        where
+            T::Err: std::fmt::Display,
+        {
+            if let Ok(raw) = std::env::var(var) {
+                match raw.parse() {
+                    Ok(parsed) => *field = Some(parsed),
+                    Err(e) => eprintln!("Warning: ignoring invalid {var}=\"{raw}\": {e}"),
                 }
             }
         }
 
-        if let Ok(size) = std::env::var("DGP_MAX_OBJECT_SIZE") {
-            match size.parse() {
-                Ok(parsed) => config.max_object_size = parsed,
-                Err(e) => {
-                    eprintln!("Warning: ignoring invalid DGP_MAX_OBJECT_SIZE=\"{size}\": {e}")
-                }
-            }
-        }
-
-        if let Ok(cache) = std::env::var("DGP_CACHE_MB") {
-            match cache.parse() {
-                Ok(parsed) => config.cache_size_mb = parsed,
-                Err(e) => eprintln!("Warning: ignoring invalid DGP_CACHE_MB=\"{cache}\": {e}"),
-            }
-        }
-
-        if let Ok(val) = std::env::var("DGP_CODEC_CONCURRENCY") {
-            match val.parse() {
-                Ok(parsed) => config.codec_concurrency = Some(parsed),
-                Err(e) => {
-                    eprintln!("Warning: ignoring invalid DGP_CODEC_CONCURRENCY=\"{val}\": {e}")
-                }
-            }
-        }
-
-        if let Ok(val) = std::env::var("DGP_BLOCKING_THREADS") {
-            match val.parse() {
-                Ok(parsed) => config.blocking_threads = Some(parsed),
-                Err(e) => {
-                    eprintln!("Warning: ignoring invalid DGP_BLOCKING_THREADS=\"{val}\": {e}")
-                }
-            }
-        }
+        parse_env("DGP_MAX_DELTA_RATIO", &mut config.max_delta_ratio);
+        parse_env("DGP_MAX_OBJECT_SIZE", &mut config.max_object_size);
+        parse_env("DGP_CACHE_MB", &mut config.cache_size_mb);
+        parse_env_opt("DGP_CODEC_CONCURRENCY", &mut config.codec_concurrency);
+        parse_env_opt("DGP_BLOCKING_THREADS", &mut config.blocking_threads);
 
         // Proxy authentication credentials
         config.access_key_id = std::env::var("DGP_ACCESS_KEY_ID").ok();

@@ -25,6 +25,55 @@ pub enum CodecError {
     Io(#[from] std::io::Error),
 }
 
+type IoResult<T> = Result<T, std::io::Error>;
+
+/// Pipe data to a child process's stdin while concurrently reading stdout and
+/// draining stderr. All three streams are consumed concurrently to prevent
+/// pipe-buffer deadlocks.
+///
+/// Returns `(write_result, stdout_bytes, stderr_bytes)`.
+///
+/// PERF: We MUST handle stdin/stdout/stderr concurrently using `thread::scope`.
+/// If any pipe buffer fills (~64KB Linux, ~16KB macOS), the child blocks on
+/// write() and we deadlock. All three pipes must be drained in parallel.
+fn pipe_stdin_stdout_stderr(
+    child_stdin: std::process::ChildStdin,
+    mut child_stdout: std::process::ChildStdout,
+    mut child_stderr: std::process::ChildStderr,
+    input: &[u8],
+) -> (IoResult<()>, IoResult<Vec<u8>>, IoResult<Vec<u8>>) {
+    std::thread::scope(|s| {
+        let writer = s.spawn(|| {
+            let mut stdin = child_stdin;
+            stdin.write_all(input)?;
+            stdin.flush()?;
+            // CRITICAL: drop(stdin) closes the pipe so the child sees EOF
+            // and finishes processing. Without this, the child hangs forever
+            // waiting for more input.
+            drop(stdin);
+            Ok::<(), std::io::Error>(()) // close stdin → child sees EOF
+        });
+
+        let stdout_reader = s.spawn(|| {
+            let mut buf = Vec::new();
+            child_stdout.read_to_end(&mut buf)?;
+            Ok::<Vec<u8>, std::io::Error>(buf)
+        });
+
+        let stderr_reader = s.spawn(|| {
+            let mut buf = Vec::new();
+            child_stderr.read_to_end(&mut buf)?;
+            Ok::<Vec<u8>, std::io::Error>(buf)
+        });
+
+        (
+            writer.join().unwrap(),
+            stdout_reader.join().unwrap(),
+            stderr_reader.join().unwrap(),
+        )
+    })
+}
+
 /// Delta codec using the xdelta3 CLI binary
 pub struct DeltaCodec {
     max_size: usize,
@@ -111,40 +160,17 @@ impl DeltaCodec {
         match result {
             Ok(mut child) => {
                 let child_stdin = child.stdin.take().unwrap();
-                let mut child_stdout = child.stdout.take().unwrap();
+                let child_stdout = child.stdout.take().unwrap();
+                let child_stderr = child.stderr.take().unwrap();
 
-                // PERF: We MUST read stdout and write stdin concurrently using
-                // thread::scope. If we write all data to stdin first THEN read
-                // stdout, the OS pipe buffer (~64KB on Linux, ~16KB on macOS) will
-                // fill up and xdelta3 will block on write(stdout) while we're still
-                // blocked on write(stdin) → classic pipe deadlock. Do NOT "simplify"
-                // this into sequential write-then-read.
-                let (write_result, delta) = std::thread::scope(|s| {
-                    let writer = s.spawn(|| {
-                        let mut stdin = child_stdin;
-                        stdin.write_all(target)?;
-                        stdin.flush()?;
-                        // CRITICAL: drop(stdin) closes the pipe so xdelta3 sees EOF
-                        // and finishes processing. Without this, xdelta3 hangs
-                        // forever waiting for more input.
-                        drop(stdin);
-                        Ok::<(), std::io::Error>(())
-                    });
-
-                    let reader = s.spawn(|| {
-                        let mut buf = Vec::new();
-                        child_stdout.read_to_end(&mut buf)?;
-                        Ok::<Vec<u8>, std::io::Error>(buf)
-                    });
-
-                    (writer.join().unwrap(), reader.join().unwrap())
-                });
-
+                let (write_result, delta, stderr_result) =
+                    pipe_stdin_stdout_stderr(child_stdin, child_stdout, child_stderr, target);
                 write_result?;
                 let delta = delta?;
+                let stderr_bytes = stderr_result.unwrap_or_default();
 
-                let output = child.wait_with_output()?;
-                if output.status.success() {
+                let status = child.wait()?;
+                if status.success() {
                     debug!(
                         "Delta encoded: {} bytes (ratio: {:.2}%)",
                         delta.len(),
@@ -152,7 +178,7 @@ impl DeltaCodec {
                     );
                     Ok(delta)
                 } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stderr = String::from_utf8_lossy(&stderr_bytes);
                     warn!("xdelta3 CLI encode failed: {}", stderr);
                     Err(CodecError::EncodeFailed(format!(
                         "xdelta3 CLI failed: {}",
@@ -213,37 +239,21 @@ impl DeltaCodec {
         match result {
             Ok(mut child) => {
                 let child_stdin = child.stdin.take().unwrap();
-                let mut child_stdout = child.stdout.take().unwrap();
+                let child_stdout = child.stdout.take().unwrap();
+                let child_stderr = child.stderr.take().unwrap();
 
-                // PERF: Concurrent stdin/stdout — see encode() comment for why
-                // sequential write-then-read causes pipe deadlocks.
-                let (write_result, target) = std::thread::scope(|s| {
-                    let writer = s.spawn(|| {
-                        let mut stdin = child_stdin;
-                        stdin.write_all(delta)?;
-                        stdin.flush()?;
-                        drop(stdin); // CRITICAL: EOF signal, see encode()
-                        Ok::<(), std::io::Error>(())
-                    });
-
-                    let reader = s.spawn(|| {
-                        let mut buf = Vec::new();
-                        child_stdout.read_to_end(&mut buf)?;
-                        Ok::<Vec<u8>, std::io::Error>(buf)
-                    });
-
-                    (writer.join().unwrap(), reader.join().unwrap())
-                });
-
+                let (write_result, target, stderr_result) =
+                    pipe_stdin_stdout_stderr(child_stdin, child_stdout, child_stderr, delta);
                 write_result?;
                 let target = target?;
+                let stderr_bytes = stderr_result.unwrap_or_default();
 
-                let output = child.wait_with_output()?;
-                if output.status.success() {
+                let status = child.wait()?;
+                if status.success() {
                     debug!("Delta decoded: {} bytes", target.len());
                     Ok(target)
                 } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stderr = String::from_utf8_lossy(&stderr_bytes);
                     warn!("xdelta3 CLI decode failed: {}", stderr);
                     Err(CodecError::DecodeFailed(format!(
                         "xdelta3 CLI failed: {}",

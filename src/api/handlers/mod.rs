@@ -36,7 +36,7 @@ pub(crate) use status::get_peak_rss_bytes;
 pub struct AppState {
     pub engine: ArcSwap<DynEngine>,
     pub multipart: Arc<MultipartStore>,
-    pub metrics: Option<Arc<Metrics>>,
+    pub metrics: Arc<Metrics>,
 }
 
 /// Query parameters for object-level operations (multipart upload)
@@ -72,40 +72,49 @@ fn build_object_headers(metadata: &FileMetadata) -> HeaderMap {
     let mut itoa_buf = itoa::Buffer::new();
 
     let mut headers = HeaderMap::new();
-    headers.insert("ETag", hval(&metadata.etag()));
+    headers.insert("ETag", header_value(&metadata.etag()));
     // Only set Content-Length when we actually know the file size.
     // When file_size is 0 and the body is streamed, omitting Content-Length
     // lets HTTP chunked transfer encoding work correctly.
     if metadata.file_size > 0 {
-        headers.insert("Content-Length", hval(itoa_buf.format(metadata.file_size)));
+        headers.insert(
+            "Content-Length",
+            header_value(itoa_buf.format(metadata.file_size)),
+        );
     }
-    headers.insert("Content-Type", hval(&content_type));
+    headers.insert("Content-Type", header_value(&content_type));
     headers.insert(
         "Last-Modified",
-        hval(
+        header_value(
             &metadata
                 .created_at
                 .format("%a, %d %b %Y %H:%M:%S GMT")
                 .to_string(),
         ),
     );
-    headers.insert("x-amz-storage-type", hval(metadata.storage_info.label()));
+    headers.insert(
+        "x-amz-storage-type",
+        header_value(metadata.storage_info.label()),
+    );
     headers.insert(
         "x-deltaglider-stored-size",
-        hval(itoa_buf.format(stored_size)),
+        header_value(itoa_buf.format(stored_size)),
     );
 
     // DeltaGlider custom metadata (x-amz-meta-dg-*)
     use crate::types::meta_keys as mk;
-    headers.insert(mk::H_TOOL, hval(&metadata.tool));
-    headers.insert(mk::H_ORIGINAL_NAME, hval(&metadata.original_name));
-    headers.insert(mk::H_FILE_SHA256, hval(&metadata.file_sha256));
-    headers.insert(mk::H_FILE_SIZE, hval(itoa_buf.format(metadata.file_size)));
+    headers.insert(mk::H_TOOL, header_value(&metadata.tool));
+    headers.insert(mk::H_ORIGINAL_NAME, header_value(&metadata.original_name));
+    headers.insert(mk::H_FILE_SHA256, header_value(&metadata.file_sha256));
+    headers.insert(
+        mk::H_FILE_SIZE,
+        header_value(itoa_buf.format(metadata.file_size)),
+    );
 
     match &metadata.storage_info {
         StorageInfo::Reference { source_name } => {
-            headers.insert(mk::H_NOTE, hval("reference"));
-            headers.insert(mk::H_SOURCE_NAME, hval(source_name));
+            headers.insert(mk::H_NOTE, header_value("reference"));
+            headers.insert(mk::H_SOURCE_NAME, header_value(source_name));
         }
         StorageInfo::Delta {
             ref_key,
@@ -113,14 +122,14 @@ fn build_object_headers(metadata: &FileMetadata) -> HeaderMap {
             delta_size,
             delta_cmd,
         } => {
-            headers.insert(mk::H_NOTE, hval("delta"));
-            headers.insert(mk::H_REF_KEY, hval(ref_key));
-            headers.insert(mk::H_REF_SHA256, hval(ref_sha256));
-            headers.insert(mk::H_DELTA_SIZE, hval(itoa_buf.format(*delta_size)));
-            headers.insert(mk::H_DELTA_CMD, hval(delta_cmd));
+            headers.insert(mk::H_NOTE, header_value("delta"));
+            headers.insert(mk::H_REF_KEY, header_value(ref_key));
+            headers.insert(mk::H_REF_SHA256, header_value(ref_sha256));
+            headers.insert(mk::H_DELTA_SIZE, header_value(itoa_buf.format(*delta_size)));
+            headers.insert(mk::H_DELTA_CMD, header_value(delta_cmd));
         }
         StorageInfo::Passthrough => {
-            headers.insert(mk::H_NOTE, hval("passthrough"));
+            headers.insert(mk::H_NOTE, header_value("passthrough"));
         }
     }
 
@@ -128,14 +137,15 @@ fn build_object_headers(metadata: &FileMetadata) -> HeaderMap {
     for (key, value) in &metadata.user_metadata {
         let header_name = format!("x-amz-meta-{}", key);
         if let Ok(name) = axum::http::header::HeaderName::from_bytes(header_name.as_bytes()) {
-            headers.insert(name, hval(value));
+            headers.insert(name, header_value(value));
         }
     }
 
     headers
 }
 
-fn hval(s: &str) -> HeaderValue {
+/// Convert a string to an HTTP header value, falling back to empty on invalid bytes.
+fn header_value(s: &str) -> HeaderValue {
     HeaderValue::from_bytes(s.as_bytes()).unwrap_or_else(|_| HeaderValue::from_static(""))
 }
 
