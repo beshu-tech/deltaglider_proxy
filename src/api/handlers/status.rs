@@ -76,6 +76,10 @@ pub struct HealthResponse {
     pub version: String,
     pub backend: String,
     pub peak_rss_bytes: u64,
+    pub cache_size_bytes: u64,
+    pub cache_max_bytes: u64,
+    pub cache_entries: u64,
+    pub cache_utilization_pct: f64,
 }
 
 /// Return the process-lifetime peak RSS (high-water mark) in bytes.
@@ -113,11 +117,25 @@ pub async fn head_root() -> Response {
 
 /// Health check handler
 /// GET /health
-pub async fn health_check() -> Json<HealthResponse> {
+pub async fn health_check(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
+    let engine = state.engine.load();
+    let cache_size_bytes = engine.cache_weighted_size();
+    let cache_max_bytes = engine.cache_max_capacity();
+    let cache_entries = engine.cache_entry_count();
+    let cache_utilization_pct = if cache_max_bytes > 0 {
+        (cache_size_bytes as f64 / cache_max_bytes as f64) * 100.0
+    } else {
+        0.0
+    };
+
     Json(HealthResponse {
         status: "healthy".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         backend: "ready".to_string(),
         peak_rss_bytes: get_peak_rss_bytes(),
+        cache_size_bytes,
+        cache_max_bytes,
+        cache_entries,
+        cache_utilization_pct,
     })
 }

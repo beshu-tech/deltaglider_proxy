@@ -67,11 +67,15 @@ pub enum RetrieveResponse {
     Streamed {
         stream: BoxStream<'static, Result<Bytes, StorageError>>,
         metadata: FileMetadata,
+        /// Not applicable for streamed responses (no cache involved).
+        cache_hit: Option<bool>,
     },
     /// Delta-reconstructed file buffered in memory.
     Buffered {
         data: Vec<u8>,
         metadata: FileMetadata,
+        /// Whether the reference was served from cache (true) or loaded from storage (false).
+        cache_hit: Option<bool>,
     },
 }
 
@@ -189,6 +193,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Return the weighted size of the reference cache in bytes (O(1) atomic read).
     pub fn cache_weighted_size(&self) -> u64 {
         self.cache.weighted_size()
+    }
+
+    /// Return the configured maximum cache capacity in bytes.
+    pub fn cache_max_capacity(&self) -> u64 {
+        self.cache.max_capacity_bytes()
     }
 
     /// Return available codec semaphore permits.
@@ -402,7 +411,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         ref_meta: &FileMetadata,
         has_existing_reference: bool,
     ) -> Result<StoreResult, EngineError> {
-        let reference = self.get_reference_cached(bucket, deltaspace_id).await?;
+        let (reference, _cache_hit) = self.get_reference_cached(bucket, deltaspace_id).await?;
         // PERF: try_acquire instead of acquire — fail fast with 503 when all codec
         // slots are busy rather than queuing unbounded requests in memory (each
         // holding a full object body while waiting for a permit).
@@ -690,7 +699,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             return Ok(false);
         }
 
-        let reference = self.get_reference_cached(bucket, deltaspace_id).await?;
+        let (reference, _cache_hit) = self.get_reference_cached(bucket, deltaspace_id).await?;
         let _codec_permit = self.codec_semaphore.acquire().await.map_err(|_| {
             EngineError::Storage(StorageError::Other("codec semaphore closed".into()))
         })?;
@@ -739,8 +748,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         use futures::TryStreamExt;
 
         match self.retrieve_stream(bucket, key).await? {
-            RetrieveResponse::Buffered { data, metadata } => Ok((data, metadata)),
-            RetrieveResponse::Streamed { stream, metadata } => {
+            RetrieveResponse::Buffered { data, metadata, .. } => Ok((data, metadata)),
+            RetrieveResponse::Streamed {
+                stream, metadata, ..
+            } => {
                 // PERF: Pre-allocate the exact total size, then extend_from_slice
                 // each chunk. The old code used `.flat_map(|b| b.to_vec()).collect()`
                 // which allocated an intermediate Vec for EVERY chunk (to_vec()),
@@ -802,6 +813,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                         return Ok(RetrieveResponse::Streamed {
                             stream,
                             metadata: fallback_meta,
+                            cache_hit: None,
                         });
                     }
                     Err(_) => return Err(EngineError::NotFound(obj_key.full_key())),
@@ -824,10 +836,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     .get_passthrough_stream(bucket, &deltaspace_id, &obj_key.filename)
                     .await?;
                 debug!("Streaming passthrough file for {}", obj_key.full_key());
-                Ok(RetrieveResponse::Streamed { stream, metadata })
+                Ok(RetrieveResponse::Streamed {
+                    stream,
+                    metadata,
+                    cache_hit: None,
+                })
             }
             StorageInfo::Reference { .. } | StorageInfo::Delta { .. } => {
-                let data = self
+                let (data, cache_hit) = self
                     .retrieve_buffered(bucket, &deltaspace_id, &obj_key, &metadata)
                     .await?;
                 debug!(
@@ -835,25 +851,32 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     data.len(),
                     obj_key.full_key()
                 );
-                Ok(RetrieveResponse::Buffered { data, metadata })
+                Ok(RetrieveResponse::Buffered {
+                    data,
+                    metadata,
+                    cache_hit,
+                })
             }
         }
     }
 
     /// Fetch and reconstruct a reference or delta object, with checksum verification.
+    /// Returns `(data, cache_hit)` where `cache_hit` is `Some(bool)` for delta objects.
     async fn retrieve_buffered(
         &self,
         bucket: &str,
         deltaspace_id: &str,
         obj_key: &ObjectKey,
         metadata: &FileMetadata,
-    ) -> Result<Vec<u8>, EngineError> {
-        let data = match &metadata.storage_info {
-            StorageInfo::Reference { .. } => {
-                self.storage.get_reference(bucket, deltaspace_id).await?
-            }
+    ) -> Result<(Vec<u8>, Option<bool>), EngineError> {
+        let (data, cache_hit) = match &metadata.storage_info {
+            StorageInfo::Reference { .. } => (
+                self.storage.get_reference(bucket, deltaspace_id).await?,
+                None,
+            ),
             StorageInfo::Delta { .. } => {
-                let reference = self.get_reference_cached(bucket, deltaspace_id).await?;
+                let (reference, cache_hit) =
+                    self.get_reference_cached(bucket, deltaspace_id).await?;
                 let delta = self
                     .storage
                     .get_delta(bucket, deltaspace_id, &obj_key.filename)
@@ -879,22 +902,33 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 if let Some(m) = &self.metrics {
                     m.delta_decode_duration_seconds.observe(decode_secs);
                 }
-                result
+                (result, Some(cache_hit))
             }
             StorageInfo::Passthrough => {
                 // Should not reach here — callers route Passthrough to streaming path
-                self.storage
-                    .get_passthrough(bucket, deltaspace_id, &obj_key.filename)
-                    .await?
+                (
+                    self.storage
+                        .get_passthrough(bucket, deltaspace_id, &obj_key.filename)
+                        .await?,
+                    None,
+                )
             }
         };
 
         // Always verify checksum on read — detect corruption or delta reconstruction bugs
         let actual_sha256 = hex::encode(Sha256::digest(&data));
         if actual_sha256 != metadata.file_sha256 {
+            // Evict the cached reference for this deltaspace — it may be the
+            // source of corruption. Without this, a corrupted reference loaded
+            // from storage would poison the cache indefinitely, causing every
+            // subsequent delta GET in this deltaspace to fail until the cache
+            // entry is naturally evicted or the process restarts.
+            let cache_key = format!("{}/{}", bucket, deltaspace_id);
+            self.cache.invalidate(&cache_key);
             warn!(
-                "Checksum mismatch for {}: expected {}, got {}",
+                "Checksum mismatch for {} (cache evicted for {}): expected {}, got {}",
                 obj_key.full_key(),
+                cache_key,
                 metadata.file_sha256,
                 actual_sha256
             );
@@ -905,7 +939,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             });
         }
 
-        Ok(data)
+        Ok((data, cache_hit))
     }
 
     /// Retrieve object metadata without reading object bodies.
@@ -1184,11 +1218,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     }
 
     /// Get reference with caching. Returns `Bytes` for zero-copy sharing.
+    /// Returns `(reference_data, cache_hit)`.
     async fn get_reference_cached(
         &self,
         bucket: &str,
         deltaspace_id: &str,
-    ) -> Result<bytes::Bytes, EngineError> {
+    ) -> Result<(bytes::Bytes, bool), EngineError> {
         let cache_key = format!("{}/{}", bucket, deltaspace_id);
 
         // Check cache first (Bytes clone is a cheap refcount increment)
@@ -1196,7 +1231,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             if let Some(m) = &self.metrics {
                 m.cache_hits_total.inc();
             }
-            return Ok(data);
+            return Ok((data, true));
         }
 
         if let Some(m) = &self.metrics {
@@ -1210,14 +1245,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .await
             .map_err(|_| EngineError::MissingReference(deltaspace_id.to_string()))?;
 
-        // PERF: Bytes::from(Vec<u8>) is a zero-copy ownership transfer (no memcpy).
-        // We clone `data` first because it's still needed for the return value.
-        // The clone is the one unavoidable copy; the Bytes::from is free.
-        // Do NOT change to `Bytes::copy_from_slice(&data)` — that would be a
-        // redundant second copy.
-        self.cache.put(&cache_key, Bytes::from(data.clone()));
+        // PERF: Convert Vec→Bytes once (zero-copy ownership transfer), then
+        // clone the Bytes for the cache (refcount increment, no memcpy).
+        // The old code did data.clone() (full 80MB memcpy) + Bytes::from — this
+        // saves one memcpy per cache miss.
+        let bytes = Bytes::from(data);
+        self.cache.put(&cache_key, bytes.clone());
 
-        Ok(data.into())
+        Ok((bytes, false))
     }
 }
 

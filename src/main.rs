@@ -207,7 +207,16 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         "  Max object size: {} MB",
         config.max_object_size / 1024 / 1024
     );
-    info!("  Cache size: {} MB", config.cache_size_mb);
+    if config.cache_size_mb == 0 {
+        warn!("[cache] Reference cache is DISABLED (0 MB). Every delta GET will read the full reference from storage.");
+    } else if config.cache_size_mb < 1024 {
+        warn!(
+            "[cache] Reference cache is only {} MB — recommend ≥1024 MB for production. Set cache_size_mb or DGP_CACHE_MB.",
+            config.cache_size_mb
+        );
+    } else {
+        info!("[cache] Reference cache: {} MB", config.cache_size_mb);
+    }
 
     if config.auth_enabled() {
         info!(
@@ -243,6 +252,11 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         return Err("xdelta3 CLI not found. Install xdelta3 before starting the proxy.".into());
     }
 
+    // Set constant cache_max_bytes gauge once at startup
+    metrics
+        .cache_max_bytes
+        .set(engine.cache_max_capacity() as f64);
+
     let multipart = Arc::new(MultipartStore::new(config.max_object_size));
 
     // Spawn periodic cleanup task for expired multipart uploads
@@ -256,6 +270,53 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         multipart,
         metrics: Some(metrics.clone()),
     });
+
+    // Spawn periodic cache health monitor (every 60s)
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let cache_max_bytes = state.engine.load().cache_max_capacity();
+        let monitor_state = state.clone();
+        let prev_hits = Arc::new(AtomicU64::new(metrics.cache_hits_total.get()));
+        let prev_misses = Arc::new(AtomicU64::new(metrics.cache_misses_total.get()));
+        let monitor_metrics = metrics.clone();
+
+        spawn_periodic(Duration::from_secs(60), move || {
+            let engine = monitor_state.engine.load();
+
+            // Check utilization
+            let used = engine.cache_weighted_size();
+            if cache_max_bytes > 0 {
+                let pct = (used as f64 / cache_max_bytes as f64) * 100.0;
+                let entries = engine.cache_entry_count();
+                let used_mb = used / (1024 * 1024);
+                let max_mb = cache_max_bytes / (1024 * 1024);
+                if pct > 90.0 {
+                    tracing::warn!(
+                        "[cache] utilization {:.0}% ({}/{} MB, {} entries) — consider increasing cache_size_mb",
+                        pct, used_mb, max_mb, entries
+                    );
+                }
+            }
+
+            // Check miss rate over interval
+            let cur_hits = monitor_metrics.cache_hits_total.get();
+            let cur_misses = monitor_metrics.cache_misses_total.get();
+            let prev_h = prev_hits.swap(cur_hits, Ordering::Relaxed);
+            let prev_m = prev_misses.swap(cur_misses, Ordering::Relaxed);
+            let interval_hits = cur_hits.saturating_sub(prev_h);
+            let interval_misses = cur_misses.saturating_sub(prev_m);
+            let interval_total = interval_hits + interval_misses;
+            if interval_total >= 10 {
+                let miss_pct = (interval_misses as f64 / interval_total as f64) * 100.0;
+                if miss_pct > 50.0 {
+                    tracing::warn!(
+                        "[cache] miss rate {:.0}% ({}/{} in last 60s) — active deltaspaces may exceed cache capacity",
+                        miss_pct, interval_misses, interval_total
+                    );
+                }
+            }
+        });
+    }
 
     // Build auth config as a hot-swappable ArcSwap so the admin API can
     // update credentials without a restart.
