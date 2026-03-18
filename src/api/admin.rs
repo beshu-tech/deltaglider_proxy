@@ -456,18 +456,21 @@ pub async fn update_config(
 
     // Hot-reload auth credentials into the live SigV4 middleware
     if body.access_key_id.is_some() || body.secret_access_key.is_some() {
-        let new_auth =
-            if let (Some(ref key_id), Some(ref secret)) = (&cfg.access_key_id, &cfg.secret_access_key)
-            {
-                Some(AuthConfig {
-                    access_key_id: key_id.clone(),
-                    secret_access_key: secret.clone(),
-                })
-            } else {
-                None
-            };
+        let new_auth = if let (Some(ref key_id), Some(ref secret)) =
+            (&cfg.access_key_id, &cfg.secret_access_key)
+        {
+            Some(AuthConfig {
+                access_key_id: key_id.clone(),
+                secret_access_key: secret.clone(),
+            })
+        } else {
+            None
+        };
         state.auth_config.store(Arc::new(new_auth));
-        tracing::info!("Auth credentials hot-reloaded (auth enabled: {})", cfg.auth_enabled());
+        tracing::info!(
+            "Auth credentials hot-reloaded (auth enabled: {})",
+            cfg.auth_enabled()
+        );
     }
 
     // Persist to TOML file
