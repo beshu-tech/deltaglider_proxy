@@ -218,7 +218,10 @@ async fn test_concurrent_delta_puts_different_prefixes() {
 
 #[tokio::test]
 async fn test_concurrent_gets_same_delta() {
-    let server = TestServer::filesystem().await;
+    // Use high codec concurrency — this test validates concurrent delta
+    // reconstruction correctness, not backpressure. With the default
+    // (CPU-count) permits on a 2-core CI runner, most GETs would get 503.
+    let server = TestServer::filesystem_with_codec_concurrency(20).await;
     let http = reqwest::Client::new();
 
     let base = generate_binary(50_000, 42);

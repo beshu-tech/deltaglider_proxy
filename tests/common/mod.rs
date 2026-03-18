@@ -67,10 +67,7 @@ impl TestServer {
 
     /// Start a test server with filesystem backend and custom codec concurrency
     pub async fn filesystem_with_codec_concurrency(concurrency: usize) -> Self {
-        Self::builder()
-            .codec_concurrency(concurrency)
-            .build()
-            .await
+        Self::builder().codec_concurrency(concurrency).build().await
     }
 
     /// Start a test server with S3 backend (needs MinIO running)

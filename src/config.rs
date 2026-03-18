@@ -557,7 +557,10 @@ impl Config {
 
         // Append commented-out advanced sections
         let mut extra = String::new();
-        let _ = writeln!(extra, "# ── S3 backend (uncomment to switch from filesystem) ──");
+        let _ = writeln!(
+            extra,
+            "# ── S3 backend (uncomment to switch from filesystem) ──"
+        );
         let _ = writeln!(extra, "# [backend]");
         let _ = writeln!(extra, "# type = \"s3\"");
         let _ = writeln!(extra, "# endpoint = \"http://localhost:9000\"");
@@ -693,8 +696,7 @@ mod tests {
             "DGP_TLS_KEY",
         ];
 
-        let registry_names: Vec<&str> =
-            super::ENV_VAR_REGISTRY.iter().map(|e| e.name).collect();
+        let registry_names: Vec<&str> = super::ENV_VAR_REGISTRY.iter().map(|e| e.name).collect();
 
         // Every var used in from_env must be in the registry
         for var in used_in_from_env {

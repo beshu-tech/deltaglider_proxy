@@ -244,7 +244,15 @@ pub async fn put_object_or_copy(
 
     // Multipart upload part
     if let (Some(part_num), Some(upload_id)) = (&query.part_number, &query.upload_id) {
-        return upload_part(&state, &bucket, &key, &headers, *part_num, upload_id, decoded_body);
+        return upload_part(
+            &state,
+            &bucket,
+            &key,
+            &headers,
+            *part_num,
+            upload_id,
+            decoded_body,
+        );
     }
 
     // Copy vs direct put
