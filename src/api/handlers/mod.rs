@@ -73,7 +73,12 @@ fn build_object_headers(metadata: &FileMetadata) -> HeaderMap {
 
     let mut headers = HeaderMap::new();
     headers.insert("ETag", hval(&metadata.etag()));
-    headers.insert("Content-Length", hval(itoa_buf.format(metadata.file_size)));
+    // Only set Content-Length when we actually know the file size.
+    // When file_size is 0 and the body is streamed, omitting Content-Length
+    // lets HTTP chunked transfer encoding work correctly.
+    if metadata.file_size > 0 {
+        headers.insert("Content-Length", hval(itoa_buf.format(metadata.file_size)));
+    }
     headers.insert("Content-Type", hval(&content_type));
     headers.insert(
         "Last-Modified",
@@ -188,4 +193,45 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
     base64::engine::general_purpose::STANDARD
         .decode(input.trim())
         .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: When file_size is 0 (unknown, e.g. metadata-less fallback path),
+    /// Content-Length must be omitted so HTTP chunked transfer works correctly.
+    /// A `Content-Length: 0` header with a non-empty streaming body breaks clients.
+    #[test]
+    fn zero_file_size_omits_content_length() {
+        let meta = FileMetadata::new_passthrough(
+            "test.bin".to_string(),
+            String::new(),
+            String::new(),
+            0,    // unknown size
+            None,
+        );
+        let headers = build_object_headers(&meta);
+        assert!(
+            headers.get("Content-Length").is_none(),
+            "Content-Length must be omitted when file_size is 0"
+        );
+    }
+
+    /// When file_size is known and non-zero, Content-Length must be present.
+    #[test]
+    fn known_file_size_sets_content_length() {
+        let meta = FileMetadata::new_passthrough(
+            "test.bin".to_string(),
+            "abc123".to_string(),
+            "def456".to_string(),
+            42,
+            None,
+        );
+        let headers = build_object_headers(&meta);
+        assert_eq!(
+            headers.get("Content-Length").unwrap().to_str().unwrap(),
+            "42"
+        );
+    }
 }

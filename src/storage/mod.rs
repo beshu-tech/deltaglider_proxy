@@ -21,3 +21,8 @@ pub(crate) fn io_to_storage_error(e: std::io::Error) -> StorageError {
         StorageError::Io(e)
     }
 }
+
+/// Convert a `tokio::task::JoinError` from `spawn_blocking` into `StorageError`.
+pub(crate) fn join_error(e: tokio::task::JoinError) -> StorageError {
+    StorageError::Other(format!("spawn_blocking join failed: {}", e))
+}

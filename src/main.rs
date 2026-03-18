@@ -6,6 +6,7 @@ use arc_swap::ArcSwap;
 use axum::{extract::DefaultBodyLimit, middleware, routing::get, Router};
 use clap::Parser;
 use deltaglider_proxy::api::admin::AdminState;
+use deltaglider_proxy::api::admin::SharedAuthConfig;
 use deltaglider_proxy::api::auth::{sigv4_auth_middleware, AuthConfig};
 use deltaglider_proxy::api::handlers::{
     bucket_get_handler, create_bucket, delete_bucket, delete_object, delete_objects, get_object,
@@ -17,6 +18,7 @@ use deltaglider_proxy::deltaglider::DynEngine;
 use deltaglider_proxy::metrics::Metrics;
 use deltaglider_proxy::multipart::MultipartStore;
 use deltaglider_proxy::session::SessionStore;
+use std::io::IsTerminal;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -65,6 +67,14 @@ struct Cli {
     /// Set admin password from stdin, then exit
     #[arg(long)]
     set_admin_password: bool,
+
+    /// Print all DGP_* environment variables in .env format, then exit
+    #[arg(long)]
+    show_env: bool,
+
+    /// Print an example TOML config with all options, then exit
+    #[arg(long)]
+    show_toml: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -98,6 +108,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let state_file = ".deltaglider_admin_hash";
         std::fs::write(state_file, &hash).expect("Failed to write admin hash file");
         eprintln!("Admin password hash written to {state_file}");
+        std::process::exit(0);
+    }
+
+    // Dump env vars or example TOML and exit (no runtime needed)
+    if cli.show_env {
+        Config::print_env_vars();
+        std::process::exit(0);
+    }
+    if cli.show_toml {
+        Config::print_example_toml();
         std::process::exit(0);
     }
 
@@ -145,7 +165,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let (filter_layer, log_reload_handle) = reload::Layer::new(initial_filter);
     tracing_subscriber::registry()
         .with(filter_layer)
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_ansi(std::io::stdout().is_terminal()))
         .init();
 
     // Load configuration from file if specified, otherwise use default loading
@@ -237,17 +257,20 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         metrics: Some(metrics.clone()),
     });
 
-    // Build auth config (None if credentials not configured)
-    let auth_config: Option<Arc<AuthConfig>> = if let (Some(ref key_id), Some(ref secret)) =
-        (&config.access_key_id, &config.secret_access_key)
-    {
-        Some(Arc::new(AuthConfig {
-            access_key_id: key_id.clone(),
-            secret_access_key: secret.clone(),
-        }))
-    } else {
-        None
-    };
+    // Build auth config as a hot-swappable ArcSwap so the admin API can
+    // update credentials without a restart.
+    let auth_config: SharedAuthConfig = Arc::new(arc_swap::ArcSwap::from_pointee(
+        if let (Some(ref key_id), Some(ref secret)) =
+            (&config.access_key_id, &config.secret_access_key)
+        {
+            Some(AuthConfig {
+                access_key_id: key_id.clone(),
+                secret_access_key: secret.clone(),
+            })
+        } else {
+            None
+        },
+    ));
 
     // Build router with S3-style paths
     // S3 API paths:
@@ -302,7 +325,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         ))
         // SigV4 authentication (no-op when auth_config is None)
         .layer(middleware::from_fn(sigv4_auth_middleware))
-        .layer(axum::Extension(auth_config))
+        .layer(axum::Extension(auth_config.clone()))
         // Metrics extension for auth middleware to extract
         .layer(axum::Extension(Some(metrics) as Option<Arc<Metrics>>))
         // Increase body size limit to match max_object_size config (default 2MB is too small)
@@ -329,6 +352,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         config: shared_config,
         log_reload: log_reload_handle,
         s3_state: state.clone(),
+        auth_config,
     });
 
     // Build TLS config if enabled

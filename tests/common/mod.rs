@@ -38,60 +38,57 @@ pub struct TestServer {
 }
 
 impl TestServer {
-    // ── Factory methods ──
+    // ── Builder ──
+
+    /// Returns a builder for configuring and spawning a test server.
+    pub fn builder() -> TestServerBuilder {
+        TestServerBuilder::default()
+    }
+
+    // ── Convenience factory methods (delegate to builder) ──
 
     /// Start a test server with filesystem backend (no Docker needed)
     pub async fn filesystem() -> Self {
-        let data_dir = TempDir::new().expect("Failed to create temp dir");
-        let config = format!(
-            "[backend]\ntype = \"filesystem\"\npath = \"{}\"\n",
-            data_dir.path().display()
-        );
-        Self::spawn_with_config(&config, "bucket", Some(data_dir)).await
+        Self::builder().build().await
     }
 
     /// Start a test server with filesystem backend and a custom max delta ratio
     pub async fn filesystem_with_max_delta_ratio(max_delta_ratio: f32) -> Self {
-        let data_dir = TempDir::new().expect("Failed to create temp dir");
-        let config = format!(
-            "max_delta_ratio = {}\n\n[backend]\ntype = \"filesystem\"\npath = \"{}\"\n",
-            max_delta_ratio,
-            data_dir.path().display()
-        );
-        Self::spawn_with_config(&config, "bucket", Some(data_dir)).await
+        Self::builder()
+            .max_delta_ratio(max_delta_ratio)
+            .build()
+            .await
     }
 
     /// Start a test server with filesystem backend and a custom max object size
     pub async fn filesystem_with_max_object_size(max_size: u64) -> Self {
-        let data_dir = TempDir::new().expect("Failed to create temp dir");
-        let config = format!(
-            "max_object_size = {}\n\n[backend]\ntype = \"filesystem\"\npath = \"{}\"\n",
-            max_size,
-            data_dir.path().display()
-        );
-        Self::spawn_with_config(&config, "bucket", Some(data_dir)).await
+        Self::builder().max_object_size(max_size).build().await
     }
 
     /// Start a test server with filesystem backend and custom codec concurrency
     pub async fn filesystem_with_codec_concurrency(concurrency: usize) -> Self {
-        let data_dir = TempDir::new().expect("Failed to create temp dir");
-        let config = format!(
-            "codec_concurrency = {}\n\n[backend]\ntype = \"filesystem\"\npath = \"{}\"\n",
-            concurrency,
-            data_dir.path().display()
-        );
-        Self::spawn_with_config(&config, "bucket", Some(data_dir)).await
+        Self::builder()
+            .codec_concurrency(concurrency)
+            .build()
+            .await
     }
 
     /// Start a test server with S3 backend (needs MinIO running)
     pub async fn s3() -> Self {
-        Self::s3_with_endpoint(&minio_endpoint_url(), MINIO_BUCKET).await
+        Self::builder()
+            .s3_endpoint(&minio_endpoint_url())
+            .bucket(MINIO_BUCKET)
+            .build()
+            .await
     }
 
     /// Start a test server with S3 backend pointing at a custom endpoint/bucket.
     pub async fn s3_with_endpoint(endpoint: &str, bucket: &str) -> Self {
-        let config = s3_config_block(endpoint, None);
-        Self::spawn_with_config(&config, bucket, None).await
+        Self::builder()
+            .s3_endpoint(endpoint)
+            .bucket(bucket)
+            .build()
+            .await
     }
 
     /// Start a test server with S3 backend and a custom max delta ratio.
@@ -100,8 +97,12 @@ impl TestServer {
         bucket: &str,
         max_delta_ratio: f32,
     ) -> Self {
-        let config = s3_config_block(endpoint, Some(max_delta_ratio));
-        Self::spawn_with_config(&config, bucket, None).await
+        Self::builder()
+            .s3_endpoint(endpoint)
+            .bucket(bucket)
+            .max_delta_ratio(max_delta_ratio)
+            .build()
+            .await
     }
 
     // ── Shared spawn logic ──
@@ -196,25 +197,102 @@ impl TestServer {
     }
 }
 
-/// Build the S3 backend TOML config block with optional extra settings.
-fn s3_config_block(endpoint: &str, max_delta_ratio: Option<f32>) -> String {
-    let mut config = String::new();
-    if let Some(ratio) = max_delta_ratio {
-        config.push_str(&format!("max_delta_ratio = {}\n\n", ratio));
+/// Builder for constructing `TestServer` instances with arbitrary config knobs.
+///
+/// Defaults to a filesystem backend. Call `.s3_endpoint()` to switch to S3.
+/// Adding a new config knob is a one-line method + one line in `build_config()`.
+pub struct TestServerBuilder {
+    bucket: String,
+    max_delta_ratio: Option<f32>,
+    max_object_size: Option<u64>,
+    codec_concurrency: Option<usize>,
+    /// When set, uses S3 backend pointing at this endpoint instead of filesystem.
+    s3_endpoint: Option<String>,
+}
+
+impl Default for TestServerBuilder {
+    fn default() -> Self {
+        Self {
+            bucket: "bucket".to_string(),
+            max_delta_ratio: None,
+            max_object_size: None,
+            codec_concurrency: None,
+            s3_endpoint: None,
+        }
     }
-    config.push_str(&format!(
-        concat!(
-            "[backend]\n",
-            "type = \"s3\"\n",
-            "endpoint = \"{}\"\n",
-            "region = \"us-east-1\"\n",
-            "force_path_style = true\n",
-            "access_key_id = \"{}\"\n",
-            "secret_access_key = \"{}\"\n",
-        ),
-        endpoint, MINIO_ACCESS_KEY, MINIO_SECRET_KEY,
-    ));
-    config
+}
+
+impl TestServerBuilder {
+    pub fn bucket(mut self, bucket: &str) -> Self {
+        self.bucket = bucket.to_string();
+        self
+    }
+
+    pub fn max_delta_ratio(mut self, ratio: f32) -> Self {
+        self.max_delta_ratio = Some(ratio);
+        self
+    }
+
+    pub fn max_object_size(mut self, size: u64) -> Self {
+        self.max_object_size = Some(size);
+        self
+    }
+
+    pub fn codec_concurrency(mut self, n: usize) -> Self {
+        self.codec_concurrency = Some(n);
+        self
+    }
+
+    pub fn s3_endpoint(mut self, endpoint: &str) -> Self {
+        self.s3_endpoint = Some(endpoint.to_string());
+        self
+    }
+
+    /// Build the TOML config string and spawn the test server.
+    pub async fn build(self) -> TestServer {
+        let (config, data_dir) = self.build_config();
+        TestServer::spawn_with_config(&config, &self.bucket, data_dir).await
+    }
+
+    /// Assemble a TOML config string (and optional TempDir for filesystem backend).
+    fn build_config(&self) -> (String, Option<TempDir>) {
+        let mut config = String::new();
+
+        // Top-level knobs
+        if let Some(ratio) = self.max_delta_ratio {
+            config.push_str(&format!("max_delta_ratio = {}\n", ratio));
+        }
+        if let Some(size) = self.max_object_size {
+            config.push_str(&format!("max_object_size = {}\n", size));
+        }
+        if let Some(n) = self.codec_concurrency {
+            config.push_str(&format!("codec_concurrency = {}\n", n));
+        }
+
+        // Backend section
+        if let Some(ref endpoint) = self.s3_endpoint {
+            config.push_str(&format!(
+                concat!(
+                    "\n[backend]\n",
+                    "type = \"s3\"\n",
+                    "endpoint = \"{}\"\n",
+                    "region = \"us-east-1\"\n",
+                    "force_path_style = true\n",
+                    "access_key_id = \"{}\"\n",
+                    "secret_access_key = \"{}\"\n",
+                ),
+                endpoint, MINIO_ACCESS_KEY, MINIO_SECRET_KEY,
+            ));
+            (config, None)
+        } else {
+            let data_dir = TempDir::new().expect("Failed to create temp dir");
+            config.push_str(&format!(
+                "\n[backend]\ntype = \"filesystem\"\npath = \"{}\"\n",
+                data_dir.path().display()
+            ));
+            (config, Some(data_dir))
+        }
+    }
 }
 
 impl Drop for TestServer {

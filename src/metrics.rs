@@ -60,34 +60,44 @@ impl Default for Metrics {
     }
 }
 
+/// Helper: create a metric, register it, and return the clone.
+/// Panics only on duplicate metric names (programmer bug, not runtime failure).
+macro_rules! register {
+    ($registry:expr, $metric:expr) => {{
+        let m = $metric;
+        $registry
+            .register(Box::new(m.clone()))
+            .expect("duplicate metric name");
+        m
+    }};
+}
+
 impl Metrics {
     pub fn new() -> Self {
         let registry = Registry::new();
 
         // -- Process & Build --
-        let process_start_time_seconds =
-            Gauge::new("process_start_time_seconds", "Start time of the process").unwrap();
-        registry
-            .register(Box::new(process_start_time_seconds.clone()))
-            .unwrap();
+        let process_start_time_seconds = register!(
+            registry,
+            Gauge::new("process_start_time_seconds", "Start time of the process").unwrap()
+        );
+        let build_info = register!(
+            registry,
+            GaugeVec::new(
+                Opts::new("deltaglider_build_info", "Build information"),
+                &["version", "backend_type"],
+            )
+            .unwrap()
+        );
+        let process_peak_rss_bytes = register!(
+            registry,
+            Gauge::new(
+                "process_peak_rss_bytes",
+                "Peak resident set size in bytes (updated on scrape)",
+            )
+            .unwrap()
+        );
 
-        let build_info = GaugeVec::new(
-            Opts::new("deltaglider_build_info", "Build information"),
-            &["version", "backend_type"],
-        )
-        .unwrap();
-        registry.register(Box::new(build_info.clone())).unwrap();
-
-        let process_peak_rss_bytes = Gauge::new(
-            "process_peak_rss_bytes",
-            "Peak resident set size in bytes (updated on scrape)",
-        )
-        .unwrap();
-        registry
-            .register(Box::new(process_peak_rss_bytes.clone()))
-            .unwrap();
-
-        // Register standard process metrics (RSS, CPU, open FDs on Linux)
         #[cfg(target_os = "linux")]
         {
             let pc = prometheus::process_collector::ProcessCollector::for_self();
@@ -95,58 +105,56 @@ impl Metrics {
         }
 
         // -- HTTP Requests --
-        let http_requests_total = IntCounterVec::new(
-            Opts::new(
-                "deltaglider_http_requests_total",
-                "Total HTTP requests by method, status, and operation",
-            ),
-            &["method", "status", "operation"],
-        )
-        .unwrap();
-        registry
-            .register(Box::new(http_requests_total.clone()))
-            .unwrap();
+        let http_requests_total = register!(
+            registry,
+            IntCounterVec::new(
+                Opts::new(
+                    "deltaglider_http_requests_total",
+                    "Total HTTP requests by method, status, and operation",
+                ),
+                &["method", "status", "operation"],
+            )
+            .unwrap()
+        );
 
-        let body_size_buckets = prometheus::exponential_buckets(1024.0, 10.0, 6).unwrap();
         // [1KB, 10KB, 100KB, 1MB, 10MB, 100MB]
+        let body_size_buckets = prometheus::exponential_buckets(1024.0, 10.0, 6).unwrap();
 
-        let http_request_duration_seconds = HistogramVec::new(
-            HistogramOpts::new(
-                "deltaglider_http_request_duration_seconds",
-                "HTTP request duration in seconds",
-            ),
-            &["method", "operation"],
-        )
-        .unwrap();
-        registry
-            .register(Box::new(http_request_duration_seconds.clone()))
-            .unwrap();
-
-        let http_request_size_bytes = HistogramVec::new(
-            HistogramOpts::new(
-                "deltaglider_http_request_size_bytes",
-                "HTTP request body size in bytes",
+        let http_request_duration_seconds = register!(
+            registry,
+            HistogramVec::new(
+                HistogramOpts::new(
+                    "deltaglider_http_request_duration_seconds",
+                    "HTTP request duration in seconds",
+                ),
+                &["method", "operation"],
             )
-            .buckets(body_size_buckets.clone()),
-            &["method"],
-        )
-        .unwrap();
-        registry
-            .register(Box::new(http_request_size_bytes.clone()))
-            .unwrap();
-
-        let http_response_size_bytes = HistogramVec::new(
-            HistogramOpts::new(
-                "deltaglider_http_response_size_bytes",
-                "HTTP response body size in bytes",
+            .unwrap()
+        );
+        let http_request_size_bytes = register!(
+            registry,
+            HistogramVec::new(
+                HistogramOpts::new(
+                    "deltaglider_http_request_size_bytes",
+                    "HTTP request body size in bytes",
+                )
+                .buckets(body_size_buckets.clone()),
+                &["method"],
             )
-            .buckets(body_size_buckets),
-            &["method"],
-        )
-        .unwrap();
-        registry
-            .register(Box::new(http_response_size_bytes.clone()))
-            .unwrap();
+            .unwrap()
+        );
+        let http_response_size_bytes = register!(
+            registry,
+            HistogramVec::new(
+                HistogramOpts::new(
+                    "deltaglider_http_response_size_bytes",
+                    "HTTP response body size in bytes",
+                )
+                .buckets(body_size_buckets),
+                &["method"],
+            )
+            .unwrap()
+        );
 
         // -- Delta Compression --
         let codec_duration_buckets = vec![
@@ -156,120 +164,112 @@ impl Metrics {
             0.01, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0,
         ];
 
-        let delta_compression_ratio = Histogram::with_opts(
-            HistogramOpts::new(
-                "deltaglider_delta_compression_ratio",
-                "Delta compression ratio distribution",
+        let delta_compression_ratio = register!(
+            registry,
+            Histogram::with_opts(
+                HistogramOpts::new(
+                    "deltaglider_delta_compression_ratio",
+                    "Delta compression ratio distribution",
+                )
+                .buckets(ratio_buckets),
             )
-            .buckets(ratio_buckets),
-        )
-        .unwrap();
-        registry
-            .register(Box::new(delta_compression_ratio.clone()))
-            .unwrap();
-
-        let delta_bytes_saved_total = IntCounter::new(
-            "deltaglider_delta_bytes_saved_total",
-            "Total bytes saved by delta compression",
-        )
-        .unwrap();
-        registry
-            .register(Box::new(delta_bytes_saved_total.clone()))
-            .unwrap();
-
-        let delta_encode_duration_seconds = Histogram::with_opts(
-            HistogramOpts::new(
-                "deltaglider_delta_encode_duration_seconds",
-                "Delta encode duration in seconds",
+            .unwrap()
+        );
+        let delta_bytes_saved_total = register!(
+            registry,
+            IntCounter::new(
+                "deltaglider_delta_bytes_saved_total",
+                "Total bytes saved by delta compression",
             )
-            .buckets(codec_duration_buckets.clone()),
-        )
-        .unwrap();
-        registry
-            .register(Box::new(delta_encode_duration_seconds.clone()))
-            .unwrap();
-
-        let delta_decode_duration_seconds = Histogram::with_opts(
-            HistogramOpts::new(
-                "deltaglider_delta_decode_duration_seconds",
-                "Delta decode duration in seconds",
+            .unwrap()
+        );
+        let delta_encode_duration_seconds = register!(
+            registry,
+            Histogram::with_opts(
+                HistogramOpts::new(
+                    "deltaglider_delta_encode_duration_seconds",
+                    "Delta encode duration in seconds",
+                )
+                .buckets(codec_duration_buckets.clone()),
             )
-            .buckets(codec_duration_buckets),
-        )
-        .unwrap();
-        registry
-            .register(Box::new(delta_decode_duration_seconds.clone()))
-            .unwrap();
-
-        let delta_decisions_total = IntCounterVec::new(
-            Opts::new(
-                "deltaglider_delta_decisions_total",
-                "Delta storage decisions by type",
-            ),
-            &["decision"],
-        )
-        .unwrap();
-        registry
-            .register(Box::new(delta_decisions_total.clone()))
-            .unwrap();
+            .unwrap()
+        );
+        let delta_decode_duration_seconds = register!(
+            registry,
+            Histogram::with_opts(
+                HistogramOpts::new(
+                    "deltaglider_delta_decode_duration_seconds",
+                    "Delta decode duration in seconds",
+                )
+                .buckets(codec_duration_buckets),
+            )
+            .unwrap()
+        );
+        let delta_decisions_total = register!(
+            registry,
+            IntCounterVec::new(
+                Opts::new(
+                    "deltaglider_delta_decisions_total",
+                    "Delta storage decisions by type",
+                ),
+                &["decision"],
+            )
+            .unwrap()
+        );
 
         // -- Cache --
-        let cache_hits_total =
-            IntCounter::new("deltaglider_cache_hits_total", "Total reference cache hits").unwrap();
-        registry
-            .register(Box::new(cache_hits_total.clone()))
-            .unwrap();
-
-        let cache_misses_total = IntCounter::new(
-            "deltaglider_cache_misses_total",
-            "Total reference cache misses",
-        )
-        .unwrap();
-        registry
-            .register(Box::new(cache_misses_total.clone()))
-            .unwrap();
-
-        let cache_size_bytes = Gauge::new(
-            "deltaglider_cache_size_bytes",
-            "Current cache size in bytes (updated on scrape)",
-        )
-        .unwrap();
-        registry
-            .register(Box::new(cache_size_bytes.clone()))
-            .unwrap();
-
-        let cache_entries =
-            Gauge::new("deltaglider_cache_entries", "Current cache entry count").unwrap();
-        registry.register(Box::new(cache_entries.clone())).unwrap();
+        let cache_hits_total = register!(
+            registry,
+            IntCounter::new("deltaglider_cache_hits_total", "Total reference cache hits").unwrap()
+        );
+        let cache_misses_total = register!(
+            registry,
+            IntCounter::new(
+                "deltaglider_cache_misses_total",
+                "Total reference cache misses",
+            )
+            .unwrap()
+        );
+        let cache_size_bytes = register!(
+            registry,
+            Gauge::new(
+                "deltaglider_cache_size_bytes",
+                "Current cache size in bytes (updated on scrape)",
+            )
+            .unwrap()
+        );
+        let cache_entries = register!(
+            registry,
+            Gauge::new("deltaglider_cache_entries", "Current cache entry count").unwrap()
+        );
 
         // -- Codec Concurrency --
-        let codec_semaphore_available = Gauge::new(
-            "deltaglider_codec_semaphore_available",
-            "Available codec semaphore permits",
-        )
-        .unwrap();
-        registry
-            .register(Box::new(codec_semaphore_available.clone()))
-            .unwrap();
+        let codec_semaphore_available = register!(
+            registry,
+            Gauge::new(
+                "deltaglider_codec_semaphore_available",
+                "Available codec semaphore permits",
+            )
+            .unwrap()
+        );
 
         // -- Auth --
-        let auth_attempts_total = IntCounterVec::new(
-            Opts::new("deltaglider_auth_attempts_total", "Auth attempts by result"),
-            &["result"],
-        )
-        .unwrap();
-        registry
-            .register(Box::new(auth_attempts_total.clone()))
-            .unwrap();
-
-        let auth_failures_total = IntCounterVec::new(
-            Opts::new("deltaglider_auth_failures_total", "Auth failures by reason"),
-            &["reason"],
-        )
-        .unwrap();
-        registry
-            .register(Box::new(auth_failures_total.clone()))
-            .unwrap();
+        let auth_attempts_total = register!(
+            registry,
+            IntCounterVec::new(
+                Opts::new("deltaglider_auth_attempts_total", "Auth attempts by result"),
+                &["result"],
+            )
+            .unwrap()
+        );
+        let auth_failures_total = register!(
+            registry,
+            IntCounterVec::new(
+                Opts::new("deltaglider_auth_failures_total", "Auth failures by reason"),
+                &["reason"],
+            )
+            .unwrap()
+        );
 
         Metrics {
             registry,

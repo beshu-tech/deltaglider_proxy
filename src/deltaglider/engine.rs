@@ -46,6 +46,9 @@ pub enum EngineError {
 
     #[error("InvalidArgument: {0}")]
     InvalidArgument(String),
+
+    #[error("Service overloaded: {0}")]
+    Overloaded(String),
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +83,7 @@ impl From<EngineError> for crate::api::S3Error {
                 crate::api::S3Error::EntityTooLarge { size, max }
             }
             EngineError::InvalidArgument(msg) => crate::api::S3Error::InvalidArgument(msg),
+            EngineError::Overloaded(msg) => crate::api::S3Error::SlowDown(msg),
             EngineError::Storage(e) => e.into(),
             other => crate::api::S3Error::InternalError(other.to_string()),
         }
@@ -89,7 +93,7 @@ impl From<EngineError> for crate::api::S3Error {
 /// Main DeltaGlider engine - generic over storage backend
 pub struct DeltaGliderEngine<S: StorageBackend> {
     storage: Arc<S>,
-    codec: DeltaCodec,
+    codec: Arc<DeltaCodec>,
     file_router: FileRouter,
     cache: ReferenceCache,
     max_delta_ratio: f32,
@@ -156,7 +160,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         });
         Self {
             storage,
-            codec: DeltaCodec::new(config.max_object_size as usize),
+            codec: Arc::new(DeltaCodec::new(config.max_object_size as usize)),
             file_router: FileRouter::new(),
             cache: ReferenceCache::new(config.cache_size_mb),
             max_delta_ratio: config.max_delta_ratio,
@@ -399,11 +403,23 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         has_existing_reference: bool,
     ) -> Result<StoreResult, EngineError> {
         let reference = self.get_reference_cached(bucket, deltaspace_id).await?;
-        let _codec_permit = self.codec_semaphore.acquire().await.map_err(|_| {
-            EngineError::Storage(StorageError::Other("codec semaphore closed".into()))
+        // PERF: try_acquire instead of acquire — fail fast with 503 when all codec
+        // slots are busy rather than queuing unbounded requests in memory (each
+        // holding a full object body while waiting for a permit).
+        let _codec_permit = self.codec_semaphore.try_acquire().map_err(|_| {
+            EngineError::Overloaded("all delta codec slots busy — try again later".into())
         })?;
+        // PERF: Run the blocking xdelta3 subprocess on a dedicated thread so it
+        // doesn't stall the Tokio worker pool. The data must be owned because
+        // spawn_blocking requires 'static. `reference` is Bytes (cheap refcount
+        // clone); `data` must be copied into a Vec.
+        let ref_clone = reference.clone();
+        let data_owned = data.to_vec();
+        let codec = self.codec.clone();
         let encode_start = Instant::now();
-        let delta = self.codec.encode(&reference, data)?;
+        let delta = tokio::task::spawn_blocking(move || codec.encode(&ref_clone, &data_owned))
+        .await
+        .map_err(|e| EngineError::Storage(StorageError::Other(format!("codec task panicked: {}", e))))??;
         let encode_secs = encode_start.elapsed().as_secs_f64();
         drop(_codec_permit);
 
@@ -840,11 +856,19 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     .storage
                     .get_delta(bucket, deltaspace_id, &obj_key.filename)
                     .await?;
-                let _codec_permit = self.codec_semaphore.acquire().await.map_err(|_| {
-                    EngineError::Storage(StorageError::Other("codec semaphore closed".into()))
+                let _codec_permit = self.codec_semaphore.try_acquire().map_err(|_| {
+                    EngineError::Overloaded(
+                        "all delta codec slots busy — try again later".into(),
+                    )
                 })?;
+                // PERF: Run blocking xdelta3 subprocess off the Tokio worker pool.
+                // `reference` is Bytes (cheap clone); `delta` is already an owned Vec.
+                let ref_clone = reference.clone();
+                let codec = self.codec.clone();
                 let decode_start = Instant::now();
-                let result = self.codec.decode(&reference, &delta)?;
+                let result = tokio::task::spawn_blocking(move || codec.decode(&ref_clone, &delta))
+                .await
+                .map_err(|e| EngineError::Storage(StorageError::Other(format!("codec task panicked: {}", e))))??;
                 let decode_secs = decode_start.elapsed().as_secs_f64();
                 drop(_codec_permit);
                 if let Some(m) = &self.metrics {

@@ -155,4 +155,17 @@ mod tests {
         let result = decode_aws_chunked(&body, Some(0)).unwrap();
         assert!(result.is_empty());
     }
+
+    /// Regression: Malformed AWS chunked payload must return None (not silently
+    /// pass through the raw body including chunk headers as file content).
+    #[test]
+    fn test_decode_malformed_returns_none() {
+        // Garbage that doesn't follow the chunk format
+        let body = Bytes::from("this is not chunked data at all");
+        assert!(decode_aws_chunked(&body, None).is_none());
+
+        // Truncated chunk: header says 100 bytes but body has only 5
+        let body = Bytes::from("64;chunk-signature=abc\r\nhello");
+        assert!(decode_aws_chunked(&body, None).is_none());
+    }
 }
