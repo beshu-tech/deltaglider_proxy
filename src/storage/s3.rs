@@ -122,13 +122,21 @@ impl S3Backend {
         context: &str,
     ) -> StorageError {
         let debug_str = format!("{:?}", e);
+        // Explicit NoSuchBucket in the error body → bucket doesn't exist.
         if debug_str.contains("NoSuchBucket") {
             return StorageError::BucketNotFound(bucket.to_string());
         }
-        // Many providers return 403 AccessDenied for non-existent buckets
+        // Some S3-compatible providers (MinIO, Ceph) return 403 for non-existent
+        // buckets to prevent bucket enumeration. Only treat 403 as BucketNotFound
+        // if context suggests a bucket-level operation. Object-level 403 errors
+        // are genuine AccessDenied and should not be misclassified.
         if let SdkError::ServiceError(ref svc) = e {
-            let raw = svc.raw();
-            if raw.status().as_u16() == 403 {
+            let status = svc.raw().status().as_u16();
+            if status == 403
+                && (context.starts_with("head_bucket")
+                    || context.starts_with("list_objects")
+                    || context.starts_with("create_bucket"))
+            {
                 return StorageError::BucketNotFound(bucket.to_string());
             }
         }
@@ -137,31 +145,28 @@ impl S3Backend {
 
     // === Key generation helpers ===
 
-    /// Get the S3 key for a reference file
-    fn reference_key(&self, prefix: &str) -> String {
-        if prefix.is_empty() {
-            "reference.bin".to_string()
-        } else {
-            format!("{}/reference.bin", prefix)
-        }
-    }
-
-    /// Get the S3 key for a delta file
-    fn delta_key(&self, prefix: &str, filename: &str) -> String {
-        if prefix.is_empty() {
-            format!("{}.delta", filename)
-        } else {
-            format!("{}/{}.delta", prefix, filename)
-        }
-    }
-
-    /// Get the S3 key for a passthrough file (stored with original filename, no suffix)
-    fn passthrough_key(&self, prefix: &str, filename: &str) -> String {
+    /// Join a prefix and filename into an S3 key, omitting the prefix if empty.
+    fn prefixed_key(prefix: &str, filename: &str) -> String {
         if prefix.is_empty() {
             filename.to_string()
         } else {
             format!("{}/{}", prefix, filename)
         }
+    }
+
+    /// Get the S3 key for a reference file
+    fn reference_key(&self, prefix: &str) -> String {
+        Self::prefixed_key(prefix, "reference.bin")
+    }
+
+    /// Get the S3 key for a delta file
+    fn delta_key(&self, prefix: &str, filename: &str) -> String {
+        Self::prefixed_key(prefix, &format!("{}.delta", filename))
+    }
+
+    /// Get the S3 key for a passthrough file (stored with original filename, no suffix)
+    fn passthrough_key(&self, prefix: &str, filename: &str) -> String {
+        Self::prefixed_key(prefix, filename)
     }
 
     // === Metadata conversion helpers ===

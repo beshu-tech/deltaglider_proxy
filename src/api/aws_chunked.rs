@@ -85,15 +85,17 @@ pub fn decode_aws_chunked(body: &Bytes, expected_length: Option<usize>) -> Optio
         }
     }
 
-    // Verify length if expected
+    // Reject if decoded length doesn't match the declared content-length.
+    // A mismatch means the payload is truncated or malformed — storing it
+    // would silently corrupt the object.
     if let Some(expected) = expected_length {
         if result.len() != expected {
             warn!(
-                "AWS chunked: decoded length {} doesn't match expected {}",
+                "AWS chunked: decoded length {} doesn't match expected {}, rejecting",
                 result.len(),
                 expected
             );
-            // Return anyway, some clients might have slightly different behavior
+            return None;
         }
     }
 

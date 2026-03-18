@@ -291,11 +291,7 @@ pub async fn sigv4_auth_middleware(
         .get::<SharedAuthConfig>()
         .map(|swap| swap.load_full());
 
-    let metrics = request
-        .extensions()
-        .get::<Option<Arc<Metrics>>>()
-        .cloned()
-        .flatten();
+    let metrics = request.extensions().get::<Arc<Metrics>>().cloned();
 
     let record_auth_failure = |reason: &str| {
         if let Some(m) = &metrics {
@@ -328,6 +324,17 @@ pub async fn sigv4_auth_middleware(
     if request.method() == axum::http::Method::HEAD && request.uri().path() == "/" {
         debug!("SigV4: allowing unauthenticated HEAD / (connection probe)");
         return Ok(next.run(request).await);
+    }
+
+    // Operational endpoints are always unauthenticated — they expose no user data
+    // and are needed by monitoring systems (Prometheus, load balancers, admin GUI).
+    // Strip trailing slashes for robustness (e.g., "/health/" should still match).
+    let path = request.uri().path().trim_end_matches('/');
+    match path {
+        "/health" | "/stats" | "/metrics" => {
+            return Ok(next.run(request).await);
+        }
+        _ => {}
     }
 
     let query_string = request.uri().query().unwrap_or("");
@@ -447,14 +454,22 @@ fn build_canonical_query_string(query: &str, exclude_keys: &[&str]) -> String {
         .filter_map(|pair| {
             if let Some((k, v)) = pair.split_once('=') {
                 let k_decoded = percent_decode(k);
-                if exclude_keys.contains(&k_decoded.as_str()) {
+                // Case-insensitive exclusion: query param names like
+                // "x-amz-signature" and "X-Amz-Signature" must both be excluded.
+                if exclude_keys
+                    .iter()
+                    .any(|ek| ek.eq_ignore_ascii_case(&k_decoded))
+                {
                     return None;
                 }
                 let v_decoded = percent_decode(v);
                 Some((uri_encode(&k_decoded, true), uri_encode(&v_decoded, true)))
             } else {
                 let k_decoded = percent_decode(pair);
-                if exclude_keys.contains(&k_decoded.as_str()) {
+                if exclude_keys
+                    .iter()
+                    .any(|ek| ek.eq_ignore_ascii_case(&k_decoded))
+                {
                     return None;
                 }
                 Some((uri_encode(&k_decoded, true), String::new()))
@@ -503,6 +518,7 @@ fn uri_encode_path(path: &str) -> String {
 /// URI-encode a string per SigV4 spec (RFC 3986).
 /// Unreserved characters: A-Z a-z 0-9 - _ . ~
 fn uri_encode(input: &str, encode_slash: bool) -> String {
+    use std::fmt::Write;
     let mut encoded = String::with_capacity(input.len() * 3);
     for byte in input.bytes() {
         match byte {
@@ -513,7 +529,8 @@ fn uri_encode(input: &str, encode_slash: bool) -> String {
                 encoded.push('/');
             }
             _ => {
-                encoded.push_str(&format!("%{:02X}", byte));
+                // write! on String is infallible and avoids the format!() heap allocation.
+                let _ = write!(encoded, "%{:02X}", byte);
             }
         }
     }

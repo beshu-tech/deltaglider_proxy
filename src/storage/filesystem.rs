@@ -28,18 +28,30 @@ async fn is_dir(path: &Path) -> bool {
 
 use super::io_to_storage_error;
 
-/// Atomically write data to a file using write-to-temp + fsync + rename.
-async fn atomic_write(path: &Path, data: &[u8]) -> Result<(), StorageError> {
+/// Atomically write data + metadata to a file using write-to-temp + xattr + fsync + rename.
+///
+/// The xattr is written to the temp file BEFORE the rename, so a crash can never
+/// leave a data file without its metadata. Either both are visible or neither is.
+async fn atomic_write_with_metadata(
+    path: &Path,
+    data: &[u8],
+    metadata: Option<&FileMetadata>,
+) -> Result<(), StorageError> {
     let parent = path
         .parent()
         .ok_or_else(|| StorageError::Other("Cannot atomic-write to a path with no parent".into()))?
         .to_path_buf();
     let path = path.to_path_buf();
     let data = data.to_vec();
+    let meta_json = metadata.map(serde_json::to_vec).transpose()?;
 
     tokio::task::spawn_blocking(move || {
         let mut tmp = NamedTempFile::new_in(&parent).map_err(io_to_storage_error)?;
         tmp.write_all(&data).map_err(io_to_storage_error)?;
+        // Write xattr to temp file BEFORE rename — atomic metadata+data visibility.
+        if let Some(json) = &meta_json {
+            xattr::set(tmp.path(), xattr_meta::XATTR_NAME, json).map_err(io_to_storage_error)?;
+        }
         tmp.as_file().sync_all().map_err(io_to_storage_error)?;
         tmp.persist(&path)
             .map_err(|e| io_to_storage_error(e.error))?;
@@ -273,8 +285,7 @@ impl FilesystemBackend {
         filename: &str,
     ) -> Result<(), StorageError> {
         self.ensure_dir(data_path).await?;
-        atomic_write(data_path, data).await?;
-        xattr_meta::write_metadata(data_path, metadata).await?;
+        atomic_write_with_metadata(data_path, data, Some(metadata)).await?;
         debug!(
             "Wrote {} ({} bytes) for {}/{}",
             label,
@@ -582,12 +593,16 @@ impl StorageBackend for FilesystemBackend {
         let target = data_path.clone();
         let chunks: Vec<Bytes> = chunks.to_vec();
         let num_chunks = chunks.len();
+        let meta_json = serde_json::to_vec(metadata)?;
 
         tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
             let mut tmp = NamedTempFile::new_in(&parent).map_err(io_to_storage_error)?;
             for chunk in &chunks {
                 tmp.write_all(chunk).map_err(io_to_storage_error)?;
             }
+            // Write xattr before rename — atomic metadata+data visibility.
+            xattr::set(tmp.path(), xattr_meta::XATTR_NAME, &meta_json)
+                .map_err(io_to_storage_error)?;
             tmp.as_file().sync_all().map_err(io_to_storage_error)?;
             tmp.persist(&target)
                 .map_err(|e| io_to_storage_error(e.error))?;
@@ -595,8 +610,6 @@ impl StorageBackend for FilesystemBackend {
         })
         .await
         .map_err(super::join_error)??;
-
-        xattr_meta::write_metadata(&data_path, metadata).await?;
 
         debug!(
             "Wrote passthrough chunked ({} chunks) for {}/{}",

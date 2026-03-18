@@ -8,7 +8,7 @@ use crate::types::FileMetadata;
 use std::path::Path;
 
 /// The single xattr name used for all DeltaGlider metadata.
-const XATTR_NAME: &str = "user.dg.metadata";
+pub(crate) const XATTR_NAME: &str = "user.dg.metadata";
 
 use super::io_to_storage_error;
 

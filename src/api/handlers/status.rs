@@ -8,6 +8,15 @@ use axum::response::Response;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Instant;
+
+/// Cached stats response — avoids re-scanning storage on every dashboard poll.
+/// Uses tokio::sync::Mutex so the lock can be held across the async compute_stats()
+/// call, preventing thundering herd (N concurrent requests all scanning storage).
+static STATS_CACHE: std::sync::LazyLock<tokio::sync::Mutex<Option<(Instant, StatsResponse)>>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
+
+const STATS_CACHE_TTL_SECS: u64 = 10;
 
 /// Query parameters for /stats endpoint
 #[derive(Debug, Deserialize, Default)]
@@ -16,42 +25,75 @@ pub struct StatsQuery {
 }
 
 /// Aggregate storage statistics
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct StatsResponse {
     pub total_objects: u64,
     pub total_original_size: u64,
     pub total_stored_size: u64,
     pub savings_percentage: f64,
+    /// True if the scan was truncated at the limit (more objects exist).
+    pub truncated: bool,
 }
 
 /// Stats handler
-/// GET /stats — aggregate stats across all buckets
-/// GET /stats?bucket=NAME — stats for a specific bucket
+/// GET /stats — aggregate stats across all buckets (cached for 10s)
+/// GET /stats?bucket=NAME — stats for a specific bucket (uncached)
 pub async fn get_stats(
     State(state): State<Arc<AppState>>,
     Query(query): Query<StatsQuery>,
 ) -> Result<Json<StatsResponse>, S3Error> {
-    let buckets_to_scan: Vec<String> = if let Some(ref bucket) = query.bucket {
-        vec![bucket.clone()]
+    // Bucket-specific queries bypass the cache
+    if query.bucket.is_some() {
+        let result = compute_stats(&state, query.bucket.as_deref()).await?;
+        return Ok(Json(result));
+    }
+
+    // Hold the lock across compute to prevent thundering herd:
+    // only one request computes stats, others wait and get the cached result.
+    let mut cache = STATS_CACHE.lock().await;
+    if let Some((ts, cached)) = cache.as_ref() {
+        if ts.elapsed().as_secs() < STATS_CACHE_TTL_SECS {
+            return Ok(Json(cached.clone()));
+        }
+    }
+
+    let result = compute_stats(&state, None).await?;
+    *cache = Some((Instant::now(), result.clone()));
+
+    Ok(Json(result))
+}
+
+async fn compute_stats(
+    state: &AppState,
+    bucket_filter: Option<&str>,
+) -> Result<StatsResponse, S3Error> {
+    let buckets_to_scan: Vec<String> = if let Some(bucket) = bucket_filter {
+        vec![bucket.to_string()]
     } else {
-        // Aggregate across all real buckets from storage
         state.engine.load().list_buckets().await.unwrap_or_default()
     };
+
+    const SCAN_LIMIT: u64 = 1000;
 
     let mut total_objects: u64 = 0;
     let mut total_original_size: u64 = 0;
     let mut total_stored_size: u64 = 0;
+    let mut truncated = false;
 
-    for bucket in &buckets_to_scan {
+    'outer: for bucket in &buckets_to_scan {
         let page = state
             .engine
             .load()
-            .list_objects(bucket, "", None, u32::MAX, None)
+            .list_objects(bucket, "", None, SCAN_LIMIT as u32, None)
             .await?;
         for (_key, meta) in &page.objects {
             total_objects += 1;
             total_original_size += meta.file_size;
             total_stored_size += meta.delta_size().unwrap_or(meta.file_size);
+            if total_objects >= SCAN_LIMIT {
+                truncated = true;
+                break 'outer;
+            }
         }
     }
 
@@ -61,12 +103,13 @@ pub async fn get_stats(
         0.0
     };
 
-    Ok(Json(StatsResponse {
+    Ok(StatsResponse {
         total_objects,
         total_original_size,
         total_stored_size,
         savings_percentage,
-    }))
+        truncated,
+    })
 }
 
 /// Health check response

@@ -14,7 +14,8 @@
     "@aws-sdk/s3-request-presigner": "^3.988.0",
     "antd": "^6.3.0",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "recharts": "^3.8.0"
   },
   "devDependencies": {
     "@types/react": "^18.3.12",

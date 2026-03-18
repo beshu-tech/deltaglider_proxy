@@ -300,6 +300,11 @@ impl Drop for TestServer {
 
 // === Shared HTTP helpers (reqwest) ===
 
+/// Build an S3 object URL from endpoint, bucket, and key.
+fn object_url(endpoint: &str, bucket: &str, key: &str) -> String {
+    format!("{}/{}/{}", endpoint, bucket, key)
+}
+
 /// PUT an object via reqwest and return the response.
 pub async fn put_object(
     client: &reqwest::Client,
@@ -309,7 +314,7 @@ pub async fn put_object(
     data: Vec<u8>,
     content_type: &str,
 ) -> reqwest::Response {
-    let url = format!("{}/{}/{}", endpoint, bucket, key);
+    let url = object_url(endpoint, bucket, key);
     let resp = client
         .put(&url)
         .header("content-type", content_type)
@@ -350,7 +355,7 @@ pub async fn get_bytes(
     bucket: &str,
     key: &str,
 ) -> Vec<u8> {
-    let url = format!("{}/{}/{}", endpoint, bucket, key);
+    let url = object_url(endpoint, bucket, key);
     let resp = client.get(&url).send().await.expect("GET failed");
     assert!(
         resp.status().is_success(),
@@ -368,7 +373,7 @@ pub async fn head_headers(
     bucket: &str,
     key: &str,
 ) -> reqwest::header::HeaderMap {
-    let url = format!("{}/{}/{}", endpoint, bucket, key);
+    let url = object_url(endpoint, bucket, key);
     let resp = client.head(&url).send().await.expect("HEAD failed");
     assert!(
         resp.status().is_success(),
@@ -381,7 +386,7 @@ pub async fn head_headers(
 
 /// DELETE an object via reqwest (tolerates 204 and 404).
 pub async fn delete_object(client: &reqwest::Client, endpoint: &str, bucket: &str, key: &str) {
-    let url = format!("{}/{}/{}", endpoint, bucket, key);
+    let url = object_url(endpoint, bucket, key);
     let resp = client.delete(&url).send().await.expect("DELETE failed");
     assert!(
         resp.status().is_success()

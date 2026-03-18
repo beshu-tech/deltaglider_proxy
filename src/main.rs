@@ -268,7 +268,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(AppState {
         engine: ArcSwap::from_pointee(engine),
         multipart,
-        metrics: Some(metrics.clone()),
+        metrics: metrics.clone(),
     });
 
     // Spawn periodic cache health monitor (every 60s)
@@ -388,7 +388,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .layer(middleware::from_fn(sigv4_auth_middleware))
         .layer(axum::Extension(auth_config.clone()))
         // Metrics extension for auth middleware to extract
-        .layer(axum::Extension(Some(metrics) as Option<Arc<Metrics>>))
+        .layer(axum::Extension(metrics.clone()))
         // Increase body size limit to match max_object_size config (default 2MB is too small)
         .layer(DefaultBodyLimit::max(config.max_object_size as usize))
         // CORS must be outermost to handle OPTIONS preflight before auth

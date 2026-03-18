@@ -147,8 +147,8 @@ impl MultipartStore {
         Ok(etag)
     }
 
-    /// Assemble parts into a single object. Does NOT remove the upload —
-    /// caller should call `remove()` after `engine.store()` succeeds.
+    /// Assemble parts into a single object and remove the upload atomically.
+    /// Takes ownership under write lock (fast), then assembles without holding it.
     pub fn complete(
         &self,
         upload_id: &str,
@@ -156,15 +156,22 @@ impl MultipartStore {
         key: &str,
         requested_parts: &[(u32, String)], // (part_number, etag)
     ) -> Result<CompletedUpload, S3Error> {
-        let uploads = self.uploads.read();
-        let upload = uploads
-            .get(upload_id)
-            .ok_or_else(|| S3Error::NoSuchUpload(upload_id.to_string()))?;
-
-        // Validate bucket+key match
-        if upload.bucket != bucket || upload.key != key {
-            return Err(S3Error::NoSuchUpload(upload_id.to_string()));
-        }
+        // Take ownership under write lock — prevents double-completion and
+        // releases the lock before the expensive assembly loop.
+        let upload = {
+            let mut uploads = self.uploads.write();
+            let upload = uploads
+                .remove(upload_id)
+                .ok_or_else(|| S3Error::NoSuchUpload(upload_id.to_string()))?;
+            if upload.bucket != bucket || upload.key != key {
+                // Put it back — wrong bucket/key
+                uploads.insert(upload_id.to_string(), upload);
+                return Err(S3Error::NoSuchUpload(upload_id.to_string()));
+            }
+            upload
+            // Write lock released here
+        };
+        let upload = &upload;
 
         if requested_parts.is_empty() {
             return Err(S3Error::InvalidPart(
@@ -224,6 +231,9 @@ impl MultipartStore {
 
     /// Return ordered part data without assembling into a contiguous buffer.
     /// Used for non-delta-eligible files to skip the expensive assembly step.
+    /// Like `complete()`, but returns individual part buffers instead of
+    /// assembling into one contiguous buffer. Used for non-delta-eligible files
+    /// to avoid ~2x memory usage.
     pub fn complete_parts(
         &self,
         upload_id: &str,
@@ -231,14 +241,18 @@ impl MultipartStore {
         key: &str,
         requested_parts: &[(u32, String)],
     ) -> Result<CompletedParts, S3Error> {
-        let uploads = self.uploads.read();
-        let upload = uploads
-            .get(upload_id)
-            .ok_or_else(|| S3Error::NoSuchUpload(upload_id.to_string()))?;
-
-        if upload.bucket != bucket || upload.key != key {
-            return Err(S3Error::NoSuchUpload(upload_id.to_string()));
-        }
+        let upload = {
+            let mut uploads = self.uploads.write();
+            let upload = uploads
+                .remove(upload_id)
+                .ok_or_else(|| S3Error::NoSuchUpload(upload_id.to_string()))?;
+            if upload.bucket != bucket || upload.key != key {
+                uploads.insert(upload_id.to_string(), upload);
+                return Err(S3Error::NoSuchUpload(upload_id.to_string()));
+            }
+            upload
+        };
+        let upload = &upload;
 
         if requested_parts.is_empty() {
             return Err(S3Error::InvalidPart(
@@ -291,11 +305,6 @@ impl MultipartStore {
             content_type: upload.content_type.clone(),
             user_metadata: upload.user_metadata.clone(),
         })
-    }
-
-    /// Remove upload after successful finalization.
-    pub fn remove(&self, upload_id: &str) {
-        self.uploads.write().remove(upload_id);
     }
 
     /// Abort a multipart upload. Validates bucket+key match.
