@@ -296,7 +296,9 @@ pub async fn get_object(
     let response = state.engine.load().retrieve_stream(&bucket, &key).await?;
 
     match response {
-        RetrieveResponse::Streamed { stream, metadata } => {
+        RetrieveResponse::Streamed {
+            stream, metadata, ..
+        } => {
             debug!(
                 "Streaming {}/{} (stored as {})",
                 bucket,
@@ -307,7 +309,11 @@ pub async fn get_object(
             let body = Body::from_stream(stream);
             Ok((StatusCode::OK, headers, body).into_response())
         }
-        RetrieveResponse::Buffered { data, metadata } => {
+        RetrieveResponse::Buffered {
+            data,
+            metadata,
+            cache_hit,
+        } => {
             debug!(
                 "Retrieved {}/{} ({} bytes, stored as {})",
                 bucket,
@@ -315,7 +321,17 @@ pub async fn get_object(
                 data.len(),
                 metadata.storage_info.label()
             );
-            let headers = build_object_headers(&metadata);
+            let mut headers = build_object_headers(&metadata);
+            if let Some(hit) = cache_hit {
+                headers.insert(
+                    "x-deltaglider-cache",
+                    if hit {
+                        axum::http::HeaderValue::from_static("hit")
+                    } else {
+                        axum::http::HeaderValue::from_static("miss")
+                    },
+                );
+            }
             Ok((StatusCode::OK, headers, data).into_response())
         }
     }

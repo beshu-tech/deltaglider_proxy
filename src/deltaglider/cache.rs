@@ -33,6 +33,7 @@ use tracing::debug;
 /// Do NOT change put() to accept `Vec<u8>` — it defeats the zero-copy path.
 pub struct ReferenceCache {
     cache: Cache<String, Bytes>,
+    max_capacity_bytes: u64,
 }
 
 impl ReferenceCache {
@@ -53,7 +54,15 @@ impl ReferenceCache {
             })
             .build();
 
-        Self { cache }
+        Self {
+            cache,
+            max_capacity_bytes: max_size_bytes,
+        }
+    }
+
+    /// Return the configured maximum cache capacity in bytes.
+    pub fn max_capacity_bytes(&self) -> u64 {
+        self.max_capacity_bytes
     }
 
     /// Get a reference from cache. Returns a `Bytes` handle (cheap refcount clone).

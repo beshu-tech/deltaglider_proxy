@@ -45,6 +45,9 @@ pub struct Metrics {
     pub cache_misses_total: IntCounter,
     pub cache_size_bytes: Gauge,
     pub cache_entries: Gauge,
+    pub cache_max_bytes: Gauge,
+    pub cache_utilization_ratio: Gauge,
+    pub cache_miss_rate_ratio: Gauge,
 
     // -- Codec Concurrency --
     pub codec_semaphore_available: Gauge,
@@ -242,6 +245,30 @@ impl Metrics {
             registry,
             Gauge::new("deltaglider_cache_entries", "Current cache entry count").unwrap()
         );
+        let cache_max_bytes = register!(
+            registry,
+            Gauge::new(
+                "deltaglider_cache_max_bytes",
+                "Configured maximum cache capacity in bytes",
+            )
+            .unwrap()
+        );
+        let cache_utilization_ratio = register!(
+            registry,
+            Gauge::new(
+                "deltaglider_cache_utilization_ratio",
+                "Cache utilization ratio (weighted_size / max_capacity, 0.0-1.0)",
+            )
+            .unwrap()
+        );
+        let cache_miss_rate_ratio = register!(
+            registry,
+            Gauge::new(
+                "deltaglider_cache_miss_rate_ratio",
+                "Cache miss rate ratio since startup (misses / total, 0.0-1.0)",
+            )
+            .unwrap()
+        );
 
         // -- Codec Concurrency --
         let codec_semaphore_available = register!(
@@ -289,6 +316,9 @@ impl Metrics {
             cache_misses_total,
             cache_size_bytes,
             cache_entries,
+            cache_max_bytes,
+            cache_utilization_ratio,
+            cache_miss_rate_ratio,
             codec_semaphore_available,
             auth_attempts_total,
             auth_failures_total,
@@ -406,6 +436,19 @@ pub async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
         .cache_size_bytes
         .set(engine.cache_weighted_size() as f64);
     metrics.cache_entries.set(engine.cache_entry_count() as f64);
+    // Derived cache gauges (computed from existing atomic counters — zero overhead)
+    let max = engine.cache_max_capacity() as f64;
+    if max > 0.0 {
+        metrics
+            .cache_utilization_ratio
+            .set(engine.cache_weighted_size() as f64 / max);
+    }
+    let hits = metrics.cache_hits_total.get() as f64;
+    let misses = metrics.cache_misses_total.get() as f64;
+    let total = hits + misses;
+    if total > 0.0 {
+        metrics.cache_miss_rate_ratio.set(misses / total);
+    }
     metrics
         .codec_semaphore_available
         .set(engine.codec_available_permits() as f64);
