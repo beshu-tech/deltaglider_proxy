@@ -8,6 +8,7 @@ import {
   DeleteOutlined,
   UploadOutlined,
   LogoutOutlined,
+  DashboardOutlined,
 } from '@ant-design/icons';
 import { listBuckets, createBucket, deleteBucket, getBucket, setBucket } from '../s3client';
 import type { BucketInfo } from '../types';
@@ -40,6 +41,7 @@ interface Props {
   onClose: () => void;
   isMobile: boolean;
   onSettingsClick?: () => void;
+  onMetricsClick?: () => void;
   onLogout?: () => void;
 }
 
@@ -52,6 +54,7 @@ export default function Sidebar({
   onClose,
   isMobile,
   onSettingsClick,
+  onMetricsClick,
   onLogout,
 }: Props) {
   const {
@@ -257,6 +260,16 @@ export default function Sidebar({
         {/* Navigation */}
         <div style={{ padding: '10px 16px 8px', borderTop: `1px solid ${BORDER}` }}>
           <nav aria-label="Settings and help">
+            <button
+              className="btn-reset"
+              onClick={onMetricsClick}
+              style={menuItemStyle}
+              onMouseEnter={(e) => { e.currentTarget.style.color = TEXT_PRIMARY; }}
+              onMouseLeave={(e) => { e.currentTarget.style.color = TEXT_SECONDARY; }}
+            >
+              <DashboardOutlined aria-hidden="true" style={MENU_ICON_STYLE} />
+              <span>Metrics</span>
+            </button>
             <button
               className="btn-reset"
               onClick={onSettingsClick}

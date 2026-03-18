@@ -10,6 +10,7 @@ import DropZone from './components/DropZone';
 import UploadPage from './components/UploadPage';
 import ConnectPage from './components/ConnectPage';
 import SettingsPage from './components/SettingsPage';
+import MetricsPage from './components/MetricsPage';
 import { getBucket, hasCredentials, setCredentials } from './s3client';
 import { checkSession, adminLogin, adminLogout } from './adminApi';
 import { useColors } from './ThemeContext';
@@ -17,7 +18,7 @@ import { useColors } from './ThemeContext';
 const { Content } = Layout;
 const { useBreakpoint } = Grid;
 
-type View = 'browser' | 'upload' | 'settings';
+type View = 'browser' | 'upload' | 'settings' | 'metrics';
 
 const HASH_TO_VIEW: Record<string, View> = {
   '': 'browser',
@@ -25,12 +26,14 @@ const HASH_TO_VIEW: Record<string, View> = {
   '#/browse': 'browser',
   '#/upload': 'upload',
   '#/settings': 'settings',
+  '#/metrics': 'metrics',
 };
 
 const VIEW_TO_HASH: Record<View, string> = {
   browser: '#/browse',
   upload: '#/upload',
   settings: '#/settings',
+  metrics: '#/metrics',
 };
 
 function readViewFromHash(): View {
@@ -167,6 +170,7 @@ export default function App() {
       browser: `${getBucket()} — DeltaGlider Proxy`,
       upload: 'Upload — DeltaGlider Proxy',
       settings: 'Settings — DeltaGlider Proxy',
+      metrics: 'Metrics — DeltaGlider Proxy',
     };
     document.title = titles[view];
   }, [view]);
@@ -214,6 +218,10 @@ export default function App() {
   }
 
   const renderContent = () => {
+    if (view === 'metrics') {
+      return <MetricsPage onBack={() => setView('browser')} />;
+    }
+
     if (view === 'settings') {
       if (!isAdmin) {
         return (
@@ -313,6 +321,10 @@ export default function App() {
           open={siderOpen}
           onClose={() => setSiderOpen(false)}
           isMobile={isMobile}
+          onMetricsClick={() => {
+            setView('metrics');
+            setSiderOpen(false);
+          }}
           onSettingsClick={() => {
             setView('settings');
             setSiderOpen(false);
