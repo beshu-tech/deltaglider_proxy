@@ -49,7 +49,19 @@ CLI flags override anything loaded from the file/env:
 
 An embedded React-based S3 browser starts automatically on **S3 port + 1**. For example, if DeltaGlider Proxy listens on `:9002`, the demo UI is available at `http://localhost:9003`.
 
-The UI auto-detects the S3 endpoint from its own URL (port - 1), so no manual configuration is needed. It supports browsing objects, uploading files, viewing delta compression stats, navigating folders, and dark/light theme switching (persisted to localStorage). An admin panel is available for tuning proxy settings and managing authentication.
+The UI auto-detects the S3 endpoint from its own URL (port - 1), so no manual configuration is needed. Features include:
+
+- **S3 Object Browser** — browse, upload, download, delete objects across buckets
+- **Proxy Dashboard** (`#/metrics`) — live Prometheus metrics with interactive charts:
+  - Cache health: utilization gauge, hit/miss rate, time-series chart
+  - Delta compression: encode/decode latency, compression ratio distribution, storage decisions
+  - HTTP traffic: request breakdown by operation (bar + pie chart), latency distribution, status codes, live request rate
+  - Authentication: success/failure counts with failure reason breakdown
+  - Top-line KPIs: uptime, peak memory, total requests, storage savings %
+- **Admin Settings** — hot-reload configuration, change backend, tune compression, manage credentials
+- **Demo Data Generator** — populate test data for evaluation
+
+Charts auto-refresh every 5s. Storage stats (from `/stats`) refresh every 60s and are capped at 1,000 objects.
 
 To build for local development:
 
@@ -62,8 +74,33 @@ The Docker build handles the Node.js UI build automatically via a multi-stage Do
 
 ## Health & Observability
 
-- `GET /health` returns JSON with `status` and `version`.
-- `GET http://localhost:9001/metrics` returns Prometheus text format with 20+ metrics covering HTTP requests, delta compression, cache, codec concurrency, and auth. See [METRICS.md](METRICS.md) for the full reference, PromQL examples, Grafana dashboard panels, and alerting rules.
+- `GET /health` returns JSON with `status`, `version`, `peak_rss_bytes`, and cache state (`cache_size_bytes`, `cache_max_bytes`, `cache_entries`, `cache_utilization_pct`).
+- `GET /stats` returns aggregate storage statistics with 10s server-side cache, capped at 1,000 objects.
+- `GET /metrics` returns Prometheus text format with 20+ metrics covering HTTP requests, delta compression, cache, codec concurrency, and auth. See [METRICS.md](METRICS.md) for the full reference.
+- Operational endpoints (`/health`, `/stats`, `/metrics`) are exempted from SigV4 authentication — accessible by monitoring systems without S3 credentials.
+
+### Cache health observability
+
+Four layers of defense against silent cache degradation:
+
+1. **Startup warnings** — log lines with `[cache]` prefix:
+   - `cache_size_mb == 0`: warns cache is DISABLED
+   - `cache_size_mb < 1024`: warns about undersized cache for production
+   - Normal: `info!("[cache] Reference cache: {N} MB")`
+
+2. **Periodic monitor** (every 60s) — warns when thresholds are breached:
+   - Cache utilization >90%: `[cache] utilization 94% (940/1024 MB, 12 entries)`
+   - Miss rate >50% over interval (min 10 ops): `[cache] miss rate 67% (8/12 in last 60s)`
+
+3. **Prometheus metrics** — three derived gauges computed on scrape:
+   - `deltaglider_cache_max_bytes` (constant, set at startup)
+   - `deltaglider_cache_utilization_ratio` (0.0–1.0)
+   - `deltaglider_cache_miss_rate_ratio` (0.0–1.0)
+
+4. **Per-response header** — `x-deltaglider-cache: hit` or `miss` on every delta-reconstructed GET. Passthrough files (no cache involved) omit the header.
+
+### Logging
+
 - Logging uses `tracing`. The log level is resolved in this priority order:
   1. `RUST_LOG` env var (standard tracing-subscriber)
   2. `DGP_LOG_LEVEL` env var (e.g. `DGP_LOG_LEVEL=deltaglider_proxy=warn,tower_http=warn`)

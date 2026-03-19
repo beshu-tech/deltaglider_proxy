@@ -37,7 +37,7 @@ aws s3 cp v2.zip s3://builds/releases/v2.zip   # stored as delta
 aws s3 cp s3://builds/releases/v2.zip ./v2.zip  # full file back, byte-identical
 ```
 
-A built-in browser UI starts on port 9001 (S3 port + 1). No extra containers.
+A built-in browser UI with live metrics dashboard starts on port 9001 (S3 port + 1). No extra containers.
 
 ## How it works
 
@@ -107,7 +107,7 @@ Not implemented: versioning, ACLs, lifecycle policies.
 
 ## Architecture
 
-~9K lines of Rust. Async throughout (Tokio + axum). No database — state is derived from storage metadata.
+~12K lines of Rust. Async throughout (Tokio + axum). No database — state is derived from storage metadata.
 
 ```
 S3 request
@@ -118,8 +118,9 @@ S3 request
 ```
 
 - SHA-256 verified on every GET. Corruption detected immediately.
-- LRU reference cache for fast reconstruction.
+- LRU reference cache (moka) for fast reconstruction. Cache health exposed via startup warnings, periodic monitors, Prometheus gauges, and per-response `x-deltaglider-cache: hit|miss` header.
 - `x-amz-storage-type` response header exposes strategy (delta/passthrough/reference) for debugging.
+- Built-in Proxy Dashboard with live charts for cache, compression, HTTP traffic, and auth metrics.
 
 ## Requirements
 
