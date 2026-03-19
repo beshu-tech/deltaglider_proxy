@@ -139,6 +139,16 @@ Start with `docker compose -f docker-compose.monitoring.yml up -d`, then open Gr
 | `deltaglider_cache_misses_total` | Counter | -- | Reference cache misses (triggers backend read) |
 | `deltaglider_cache_size_bytes` | Gauge | -- | Current weighted cache size in bytes (updated on scrape) |
 | `deltaglider_cache_entries` | Gauge | -- | Current number of cached reference entries (updated on scrape) |
+| `deltaglider_cache_max_bytes` | Gauge | -- | Configured maximum cache capacity in bytes (constant, set at startup) |
+| `deltaglider_cache_utilization_ratio` | Gauge | -- | `weighted_size / max_capacity` (0.0–1.0, computed on scrape) |
+| `deltaglider_cache_miss_rate_ratio` | Gauge | -- | `misses / (hits + misses)` since startup (0.0–1.0, computed on scrape) |
+
+These derived gauges enable standard Prometheus alerting without PromQL arithmetic:
+
+```promql
+deltaglider_cache_utilization_ratio > 0.9   # cache nearly full
+deltaglider_cache_miss_rate_ratio > 0.5     # cache thrashing
+```
 
 ### Codec Concurrency
 
@@ -368,7 +378,7 @@ groups:
 
 ## What is NOT in /metrics
 
-The existing `/stats` JSON endpoint (`GET http://localhost:9000/stats`) returns aggregate storage statistics (`total_objects`, `total_original_size`, `total_stored_size`, `savings_percentage`). These are **intentionally excluded** from `/metrics` because they require an O(N) scan of all objects on every call. Prometheus scrapes every 15-30s, which would make this unacceptably expensive. Use `/stats` for on-demand dashboards or one-off checks instead.
+The `/stats` JSON endpoint (`GET /stats`) returns aggregate storage statistics (`total_objects`, `total_original_size`, `total_stored_size`, `savings_percentage`, `truncated`). These are intentionally excluded from `/metrics` because computing them requires scanning storage objects. The endpoint has a **10-second server-side cache** (only one scan per 10s regardless of concurrent callers) and **caps at 1,000 objects** — the `truncated` field indicates when more exist. Use `/stats` for dashboards; the built-in Proxy Dashboard fetches it automatically.
 
 ## Implementation details
 

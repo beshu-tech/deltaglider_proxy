@@ -51,16 +51,17 @@ HTTP request
 **Important types:**
 - `StorageBackend` (trait in `storage/traits.rs`) — all storage operations; two impls: Filesystem, S3
 - `SharedConfig` = `Arc<RwLock<Config>>` — hot-reloadable via admin API
-- `RetrieveResponse` — enum: `Streamed` (zero-copy passthrough) vs `Buffered` (delta reconstruction)
+- `RetrieveResponse` — enum: `Streamed` (zero-copy passthrough) vs `Buffered` (delta reconstruction, includes `cache_hit: Option<bool>`)
 - `FileMetadata` (in `types.rs`) — per-object metadata with DG-specific tags
+- `StoreContext` (in `engine.rs`) — parameter object for the store pipeline (bucket, key, data, hashes, metadata)
 
 **Config:** TOML file (`deltaglider_proxy.toml`) with env var overrides (`DGP_*` prefix). See `deltaglider_proxy.toml.example`.
 
 ## Frontend (demo/s3-browser/ui)
 
-React 18 + TypeScript + Ant Design 6. Hash-based routing (`#/browse`, `#/upload`, `#/settings`). Embedded in the Rust binary via `rust-embed` and served on listen_addr + 1 (e.g., proxy on :9000, UI on :9001).
+React 18 + TypeScript + Ant Design 6 + Recharts. Hash-based routing (`#/browse`, `#/upload`, `#/settings`, `#/metrics`). Embedded in the Rust binary via `rust-embed` and served on listen_addr + 1 (e.g., proxy on :9000, UI on :9001).
 
-Key hooks: `useS3Browser`, `useSelection`, `useUploadQueue`. Admin API in `adminApi.ts`, S3 operations in `s3client.ts`.
+Key components: `MetricsPage` (Prometheus dashboard with live charts), `ObjectTable`, `InspectorPanel`, `SettingsPage`. Admin API in `adminApi.ts`, S3 operations in `s3client.ts`. The demo server exposes `/metrics`, `/stats`, and `/health` endpoints (proxied from the S3 server state).
 
 ## Testing
 
