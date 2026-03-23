@@ -516,13 +516,16 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     .with_label_values(&["passthrough"])
                     .inc()
             });
-            let cache_key = Self::cache_key(ctx.bucket, ctx.deltaspace_id);
-            self.cache.invalidate(&cache_key);
+            // Delete storage BEFORE invalidating cache — prevents a concurrent GET
+            // from loading the reference between invalidation and deletion, then
+            // caching it as stale data.
             self.storage
                 .delete_reference(ctx.bucket, ctx.deltaspace_id)
                 .await?;
             self.delete_delta_idempotent(ctx.bucket, ctx.deltaspace_id, &ctx.obj_key.filename)
                 .await?;
+            let cache_key = Self::cache_key(ctx.bucket, ctx.deltaspace_id);
+            self.cache.invalidate(&cache_key);
             return self.store_passthrough(ctx).await;
         }
 
@@ -774,6 +777,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.storage
             .put_reference_metadata(bucket, deltaspace_id, &ref_meta)
             .await?;
+
+        // Invalidate cache — reference metadata changed (though data is unchanged,
+        // the cached Bytes doesn't include metadata, so this is precautionary).
+        let cache_key = Self::cache_key(bucket, deltaspace_id);
+        self.cache.invalidate(&cache_key);
 
         Ok(true)
     }
@@ -1235,11 +1243,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .iter()
             .any(|m| !matches!(m.storage_info, StorageInfo::Reference { .. }));
         if !has_objects && self.storage.has_reference(bucket, &deltaspace_id).await {
-            let cache_key = Self::cache_key(bucket, &deltaspace_id);
-            self.cache.invalidate(&cache_key);
+            // Delete storage BEFORE invalidating cache — prevents stale cache entries
+            // from a concurrent GET loading between invalidation and deletion.
             self.storage
                 .delete_reference(bucket, &deltaspace_id)
                 .await?;
+            let cache_key = Self::cache_key(bucket, &deltaspace_id);
+            self.cache.invalidate(&cache_key);
         }
 
         // Release the per-prefix lock before cleanup so strong_count drops to 1.
