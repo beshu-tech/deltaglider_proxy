@@ -10,7 +10,7 @@ use crate::types::{FileMetadata, ObjectKey, StorageInfo, StoreResult};
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::stream::BoxStream;
-use md5::{Digest as Md5Digest, Md5};
+use md5::{Digest, Md5};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -826,67 +826,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let metadata = match metadata {
             Some(m) => m,
             None => {
-                // No DG metadata — try streaming directly from the original key
-                // (file may exist in upstream storage but was never processed by DG)
+                // No DG metadata — try streaming as an unmanaged passthrough object
                 info!(
                     "No DG metadata for {}/{}, attempting direct passthrough",
                     bucket, key
                 );
-                // First try get_passthrough_metadata (same source as HEAD) for consistent metadata
-                match self
-                    .storage
-                    .get_passthrough_metadata(bucket, &deltaspace_id, &obj_key.filename)
-                    .await
-                {
-                    Ok(meta) => {
-                        // Got proper metadata — now get the stream
-                        match self
-                            .storage
-                            .get_passthrough_stream(bucket, &deltaspace_id, &obj_key.filename)
-                            .await
-                        {
-                            Ok(stream) => {
-                                return Ok(RetrieveResponse::Streamed {
-                                    stream,
-                                    metadata: meta,
-                                    cache_hit: None,
-                                });
-                            }
-                            Err(StorageError::NotFound(msg)) => {
-                                return Err(EngineError::NotFound(msg));
-                            }
-                            Err(e) => return Err(EngineError::Storage(e)),
-                        }
-                    }
-                    Err(StorageError::NotFound(_)) => {
-                        // Metadata lookup failed with NotFound — try stream as last resort
-                        match self
-                            .storage
-                            .get_passthrough_stream(bucket, &deltaspace_id, &obj_key.filename)
-                            .await
-                        {
-                            Ok(stream) => {
-                                let fallback_meta = FileMetadata::new_passthrough(
-                                    obj_key.filename.clone(),
-                                    String::new(),
-                                    String::new(),
-                                    0,
-                                    None,
-                                );
-                                return Ok(RetrieveResponse::Streamed {
-                                    stream,
-                                    metadata: fallback_meta,
-                                    cache_hit: None,
-                                });
-                            }
-                            Err(StorageError::NotFound(_)) => {
-                                return Err(EngineError::NotFound(obj_key.full_key()));
-                            }
-                            Err(e) => return Err(EngineError::Storage(e)),
-                        }
-                    }
-                    Err(e) => return Err(EngineError::Storage(e)),
-                }
+                return self
+                    .try_unmanaged_passthrough(bucket, &deltaspace_id, &obj_key)
+                    .await;
             }
         };
 
@@ -1008,6 +955,51 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
 
         Ok((data, cache_hit))
+    }
+
+    /// Try to stream an unmanaged object (no DG metadata) with best-effort metadata.
+    /// First tries `get_passthrough_metadata` for proper size/etag, then falls back
+    /// to streaming with minimal metadata if the metadata lookup fails.
+    async fn try_unmanaged_passthrough(
+        &self,
+        bucket: &str,
+        deltaspace_id: &str,
+        obj_key: &ObjectKey,
+    ) -> Result<RetrieveResponse, EngineError> {
+        // Try metadata first (same source as HEAD) for consistent Content-Length/ETag
+        let meta = match self
+            .storage
+            .get_passthrough_metadata(bucket, deltaspace_id, &obj_key.filename)
+            .await
+        {
+            Ok(m) => m,
+            Err(StorageError::NotFound(_)) => {
+                // No metadata at all — use minimal fallback
+                FileMetadata::new_passthrough(
+                    obj_key.filename.clone(),
+                    String::new(),
+                    String::new(),
+                    0,
+                    None,
+                )
+            }
+            Err(e) => return Err(EngineError::Storage(e)),
+        };
+
+        // Stream the object
+        match self
+            .storage
+            .get_passthrough_stream(bucket, deltaspace_id, &obj_key.filename)
+            .await
+        {
+            Ok(stream) => Ok(RetrieveResponse::Streamed {
+                stream,
+                metadata: meta,
+                cache_hit: None,
+            }),
+            Err(StorageError::NotFound(_)) => Err(EngineError::NotFound(obj_key.full_key())),
+            Err(e) => Err(EngineError::Storage(e)),
+        }
     }
 
     /// Retrieve object metadata without reading object bodies.
