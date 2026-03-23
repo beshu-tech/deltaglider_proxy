@@ -90,12 +90,19 @@ impl S3Backend {
             }
         };
 
-        // Build S3 client directly — no aws-config needed since we use static credentials
+        // Build S3 client directly — no aws-config needed since we use static credentials.
+        // Disable automatic request checksums (CRC32/CRC64) added by the SDK by default.
+        // S3-compatible stores (Hetzner, MinIO, Backblaze B2) reject these headers with
+        // BadRequest. Setting WhenRequired preserves compatibility with both AWS S3 and
+        // S3-compatible endpoints. See: Python deltaglider [6.1.1] for the equivalent fix.
         let mut s3_config_builder = aws_sdk_s3::config::Builder::new()
             .behavior_version(BehaviorVersion::latest())
             .region(aws_sdk_s3::config::Region::new(region))
             .credentials_provider(credentials)
-            .force_path_style(force_path_style);
+            .force_path_style(force_path_style)
+            .request_checksum_calculation(
+                aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+            );
 
         if let Some(ref ep) = endpoint {
             s3_config_builder = s3_config_builder.endpoint_url(ep);
