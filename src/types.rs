@@ -519,4 +519,46 @@ mod tests {
     fn test_validate_prefix_allows_normal() {
         assert!(ObjectKey::validate_prefix("releases/v1.0/").is_ok());
     }
+
+    #[test]
+    fn test_validate_rejects_reference_bin() {
+        let key = ObjectKey::parse("bucket", "prefix/reference.bin");
+        assert!(key.validate_object().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_dot_delta_suffix() {
+        let key = ObjectKey::parse("bucket", "prefix/file.zip.delta");
+        assert!(key.validate_object().is_err());
+    }
+
+    #[test]
+    fn test_validate_allows_reference_in_prefix() {
+        // "reference.bin" is only reserved as a filename, not in the prefix
+        let key = ObjectKey::parse("bucket", "reference.bin/file.txt");
+        assert!(key.validate_object().is_ok());
+    }
+
+    #[test]
+    fn test_validate_allows_delta_like_name() {
+        // "delta" without the dot prefix is fine
+        let key = ObjectKey::parse("bucket", "prefix/my-delta");
+        assert!(key.validate_object().is_ok());
+    }
+
+    #[test]
+    fn test_fallback_metadata_has_passthrough_storage_info() {
+        let meta = FileMetadata::fallback(
+            "test.bin".to_string(),
+            1024,
+            "abc123".to_string(),
+            chrono::Utc::now(),
+            Some("application/octet-stream".to_string()),
+            StorageInfo::Passthrough,
+        );
+        assert_eq!(meta.file_size, 1024);
+        assert_eq!(meta.original_name, "test.bin");
+        assert!(meta.file_sha256.is_empty());
+        assert!(matches!(meta.storage_info, StorageInfo::Passthrough));
+    }
 }
