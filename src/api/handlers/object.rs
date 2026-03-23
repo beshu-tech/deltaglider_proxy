@@ -122,6 +122,8 @@ async fn copy_object_inner(
 
     // Check source object size before loading into memory to avoid transient
     // memory spikes if max_object_size was reduced after the object was stored.
+    // Note: file_size may be 0 for unmanaged objects (fallback metadata), so we
+    // also check the actual data size after retrieval below.
     let source_meta_head = engine.head(source_bucket, source_key).await?;
     if source_meta_head.file_size > engine.max_object_size() {
         return Err(S3Error::EntityTooLarge {
@@ -132,6 +134,14 @@ async fn copy_object_inner(
 
     // Retrieve source object
     let (data, source_meta) = engine.retrieve(source_bucket, source_key).await?;
+
+    // Double-check actual data size (metadata may report 0 for unmanaged objects)
+    if data.len() as u64 > engine.max_object_size() {
+        return Err(S3Error::EntityTooLarge {
+            size: data.len() as u64,
+            max: engine.max_object_size(),
+        });
+    }
 
     // Store as new object, preserving user metadata from source
     let result = engine

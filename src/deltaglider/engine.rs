@@ -293,16 +293,30 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         original_name: &str,
     ) -> Result<Option<FileMetadata>, StorageError> {
         let filename = original_name.rsplit('/').next().unwrap_or(original_name);
-        let delta = self
-            .storage
-            .get_delta_metadata(bucket, prefix, filename)
-            .await
-            .ok();
-        let passthrough = self
-            .storage
-            .get_passthrough_metadata(bucket, prefix, filename)
-            .await
-            .ok();
+        let delta = match self.storage.get_delta_metadata(bucket, prefix, filename).await {
+            Ok(meta) => Some(meta),
+            Err(StorageError::NotFound(_)) => None,
+            // I/O errors (e.g. file being atomically replaced during concurrent access)
+            // are treated as "metadata not available" with a warning, not hard failures.
+            Err(StorageError::Io(ref e)) => {
+                warn!("I/O error reading delta metadata for {}/{}: {}", prefix, filename, e);
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        let passthrough =
+            match self.storage.get_passthrough_metadata(bucket, prefix, filename).await {
+                Ok(meta) => Some(meta),
+                Err(StorageError::NotFound(_)) => None,
+                Err(StorageError::Io(ref e)) => {
+                    warn!(
+                        "I/O error reading passthrough metadata for {}/{}: {}",
+                        prefix, filename, e
+                    );
+                    None
+                }
+                Err(e) => return Err(e),
+            };
         match (delta, passthrough) {
             (Some(d), Some(p)) => Ok(Some(if d.created_at >= p.created_at { d } else { p })),
             (Some(meta), None) | (None, Some(meta)) => Ok(Some(meta)),
@@ -810,26 +824,60 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     "No DG metadata for {}/{}, attempting direct passthrough",
                     bucket, key
                 );
+                // First try get_passthrough_metadata (same source as HEAD) for consistent metadata
                 match self
                     .storage
-                    .get_passthrough_stream(bucket, &deltaspace_id, &obj_key.filename)
+                    .get_passthrough_metadata(bucket, &deltaspace_id, &obj_key.filename)
                     .await
                 {
-                    Ok(stream) => {
-                        let fallback_meta = FileMetadata::new_passthrough(
-                            obj_key.filename.clone(),
-                            String::new(),
-                            String::new(),
-                            0,
-                            None,
-                        );
-                        return Ok(RetrieveResponse::Streamed {
-                            stream,
-                            metadata: fallback_meta,
-                            cache_hit: None,
-                        });
+                    Ok(meta) => {
+                        // Got proper metadata — now get the stream
+                        match self
+                            .storage
+                            .get_passthrough_stream(bucket, &deltaspace_id, &obj_key.filename)
+                            .await
+                        {
+                            Ok(stream) => {
+                                return Ok(RetrieveResponse::Streamed {
+                                    stream,
+                                    metadata: meta,
+                                    cache_hit: None,
+                                });
+                            }
+                            Err(StorageError::NotFound(msg)) => {
+                                return Err(EngineError::NotFound(msg));
+                            }
+                            Err(e) => return Err(EngineError::Storage(e)),
+                        }
                     }
-                    Err(_) => return Err(EngineError::NotFound(obj_key.full_key())),
+                    Err(StorageError::NotFound(_)) => {
+                        // Metadata lookup failed with NotFound — try stream as last resort
+                        match self
+                            .storage
+                            .get_passthrough_stream(bucket, &deltaspace_id, &obj_key.filename)
+                            .await
+                        {
+                            Ok(stream) => {
+                                let fallback_meta = FileMetadata::new_passthrough(
+                                    obj_key.filename.clone(),
+                                    String::new(),
+                                    String::new(),
+                                    0,
+                                    None,
+                                );
+                                return Ok(RetrieveResponse::Streamed {
+                                    stream,
+                                    metadata: fallback_meta,
+                                    cache_hit: None,
+                                });
+                            }
+                            Err(StorageError::NotFound(_)) => {
+                                return Err(EngineError::NotFound(obj_key.full_key()));
+                            }
+                            Err(e) => return Err(EngineError::Storage(e)),
+                        }
+                    }
+                    Err(e) => return Err(EngineError::Storage(e)),
                 }
             }
         };
@@ -976,7 +1024,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 self.storage
                     .get_passthrough_metadata(bucket, &deltaspace_id, &obj_key.filename)
                     .await
-                    .map_err(|_| EngineError::NotFound(obj_key.full_key()))
+                    .map_err(|e| match e {
+                        StorageError::NotFound(_) => EngineError::NotFound(obj_key.full_key()),
+                        other => EngineError::Storage(other),
+                    })
             }
         }
     }

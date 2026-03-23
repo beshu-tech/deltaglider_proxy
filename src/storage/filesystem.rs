@@ -251,7 +251,7 @@ impl FilesystemBackend {
                 // Read xattr metadata, falling back to filesystem stats for unmanaged files
                 let meta = match xattr_meta::read_metadata(&path).await {
                     Ok(m) => m,
-                    Err(_) => {
+                    Err(StorageError::NotFound(_)) => {
                         match Self::fallback_metadata_from_path(&path, &name).await {
                             Ok(m) => m,
                             Err(e) => {
@@ -259,6 +259,10 @@ impl FilesystemBackend {
                                 continue;
                             }
                         }
+                    }
+                    Err(e) => {
+                        debug!("Error reading xattr for {:?}: {}", path, e);
+                        continue;
                     }
                 };
 
@@ -462,7 +466,15 @@ impl StorageBackend for FilesystemBackend {
         bucket: &str,
         prefix: &str,
     ) -> Result<FileMetadata, StorageError> {
-        xattr_meta::read_metadata(&self.reference_path(bucket, prefix)).await
+        let path = self.reference_path(bucket, prefix);
+        match xattr_meta::read_metadata(&path).await {
+            Ok(meta) => Ok(meta),
+            Err(StorageError::NotFound(_)) => {
+                // No xattr metadata — fall back to filesystem stats if the file exists.
+                Self::fallback_metadata_from_path(&path, "reference.bin").await
+            }
+            Err(other) => Err(other),
+        }
     }
 
     async fn has_reference(&self, bucket: &str, prefix: &str) -> bool {
@@ -525,7 +537,15 @@ impl StorageBackend for FilesystemBackend {
         prefix: &str,
         filename: &str,
     ) -> Result<FileMetadata, StorageError> {
-        xattr_meta::read_metadata(&self.delta_path(bucket, prefix, filename)).await
+        let path = self.delta_path(bucket, prefix, filename);
+        match xattr_meta::read_metadata(&path).await {
+            Ok(meta) => Ok(meta),
+            Err(StorageError::NotFound(_)) => {
+                // No xattr metadata — fall back to filesystem stats if the file exists.
+                Self::fallback_metadata_from_path(&path, filename).await
+            }
+            Err(other) => Err(other),
+        }
     }
 
     #[instrument(skip(self))]
@@ -592,11 +612,12 @@ impl StorageBackend for FilesystemBackend {
         let path = self.passthrough_path(bucket, prefix, filename);
         match xattr_meta::read_metadata(&path).await {
             Ok(meta) => Ok(meta),
-            Err(_) => {
+            Err(StorageError::NotFound(_)) => {
                 // No xattr metadata — file may exist without DG metadata (unmanaged).
                 // Fall back to filesystem stats if the file exists.
                 Self::fallback_metadata_from_path(&path, filename).await
             }
+            Err(other) => Err(other),
         }
     }
 
@@ -721,13 +742,16 @@ impl StorageBackend for FilesystemBackend {
                 if is_data_file {
                     match xattr_meta::read_metadata(&path).await {
                         Ok(meta) => metadata_list.push(meta),
-                        Err(_) => {
+                        Err(StorageError::NotFound(_)) => {
                             // No xattr — try filesystem stats for unmanaged files
                             if let Ok(meta) =
                                 Self::fallback_metadata_from_path(&path, name).await
                             {
                                 metadata_list.push(meta);
                             }
+                        }
+                        Err(e) => {
+                            debug!("Error reading xattr for {:?}: {}", path, e);
                         }
                     }
                 }

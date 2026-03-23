@@ -432,35 +432,46 @@ impl S3Backend {
             .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
             .unwrap_or_default();
 
-        if headers.is_empty() {
-            // Object exists on upstream S3 but has no DeltaGlider metadata.
-            // Treat it as a passthrough object with best-effort metadata from HEAD response.
-            use crate::types::DELTAGLIDER_TOOL;
-            let file_size = response.content_length().unwrap_or(0) as u64;
-            let last_modified = response
-                .last_modified()
-                .and_then(|t| {
-                    DateTime::parse_from_rfc3339(&t.to_string())
-                        .ok()
-                        .map(|dt| dt.with_timezone(&Utc))
-                })
-                .unwrap_or_else(Utc::now);
-            let etag = response.e_tag().unwrap_or_default().to_string();
-            let content_type = response.content_type().map(|s| s.to_string());
-            return Ok(FileMetadata {
-                tool: DELTAGLIDER_TOOL.to_string(),
-                original_name: key.rsplit('/').next().unwrap_or(key).to_string(),
-                file_sha256: String::new(),
-                file_size,
-                md5: etag,
-                created_at: last_modified,
-                content_type,
-                user_metadata: HashMap::new(),
-                storage_info: StorageInfo::Passthrough,
-            });
+        // Try parsing DG metadata from headers. If headers are empty or
+        // corrupted (missing required fields), fall back to passthrough metadata
+        // from the HEAD response itself.
+        if !headers.is_empty() {
+            match self.headers_to_metadata(&headers) {
+                Ok(meta) => return Ok(meta),
+                Err(e) => {
+                    debug!(
+                        "Corrupt DG metadata for {}/{}, falling back to passthrough: {}",
+                        bucket, key, e
+                    );
+                }
+            }
         }
 
-        self.headers_to_metadata(&headers)
+        // Object exists on upstream S3 but has no (or corrupt) DeltaGlider metadata.
+        // Treat as passthrough with best-effort metadata from HEAD response.
+        use crate::types::DELTAGLIDER_TOOL;
+        let file_size = response.content_length().unwrap_or(0) as u64;
+        let last_modified = response
+            .last_modified()
+            .and_then(|t| {
+                DateTime::parse_from_rfc3339(&t.to_string())
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            })
+            .unwrap_or_else(Utc::now);
+        let etag = response.e_tag().unwrap_or_default().to_string();
+        let content_type = response.content_type().map(|s| s.to_string());
+        Ok(FileMetadata {
+            tool: DELTAGLIDER_TOOL.to_string(),
+            original_name: key.rsplit('/').next().unwrap_or(key).to_string(),
+            file_sha256: String::new(),
+            file_size,
+            md5: etag,
+            created_at: last_modified,
+            content_type,
+            user_metadata: HashMap::new(),
+            storage_info: StorageInfo::Passthrough,
+        })
     }
 
     /// Delete an object from S3

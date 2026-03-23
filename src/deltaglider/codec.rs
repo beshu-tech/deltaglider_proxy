@@ -5,9 +5,38 @@
 
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use tracing::{debug, instrument, warn};
+
+/// Maximum time to wait for xdelta3 subprocess to complete.
+const CODEC_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Wait for a child process with a timeout. Kills the child if the deadline is exceeded.
+fn wait_with_timeout(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus, CodecError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait(); // reap zombie
+                    return Err(CodecError::EncodeFailed(format!(
+                        "xdelta3 subprocess timed out after {}s",
+                        timeout.as_secs()
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(CodecError::Io(e)),
+        }
+    }
+}
 
 /// Errors that can occur during delta encoding/decoding
 #[derive(Debug, Error)]
@@ -169,7 +198,7 @@ impl DeltaCodec {
                 let delta = delta?;
                 let stderr_bytes = stderr_result.unwrap_or_default();
 
-                let status = child.wait()?;
+                let status = wait_with_timeout(&mut child, CODEC_TIMEOUT)?;
                 if status.success() {
                     debug!(
                         "Delta encoded: {} bytes (ratio: {:.2}%)",
@@ -248,7 +277,7 @@ impl DeltaCodec {
                 let target = target?;
                 let stderr_bytes = stderr_result.unwrap_or_default();
 
-                let status = child.wait()?;
+                let status = wait_with_timeout(&mut child, CODEC_TIMEOUT)?;
                 if status.success() {
                     debug!("Delta decoded: {} bytes", target.len());
                     Ok(target)
