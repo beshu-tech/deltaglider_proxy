@@ -449,7 +449,6 @@ impl S3Backend {
 
         // Object exists on upstream S3 but has no (or corrupt) DeltaGlider metadata.
         // Treat as passthrough with best-effort metadata from HEAD response.
-        use crate::types::DELTAGLIDER_TOOL;
         let file_size = response.content_length().unwrap_or(0) as u64;
         let last_modified = response
             .last_modified()
@@ -461,17 +460,14 @@ impl S3Backend {
             .unwrap_or_else(Utc::now);
         let etag = response.e_tag().unwrap_or_default().to_string();
         let content_type = response.content_type().map(|s| s.to_string());
-        Ok(FileMetadata {
-            tool: DELTAGLIDER_TOOL.to_string(),
-            original_name: key.rsplit('/').next().unwrap_or(key).to_string(),
-            file_sha256: String::new(),
+        Ok(FileMetadata::fallback(
+            key.rsplit('/').next().unwrap_or(key).to_string(),
             file_size,
-            md5: etag,
-            created_at: last_modified,
+            etag,
+            last_modified,
             content_type,
-            user_metadata: HashMap::new(),
-            storage_info: StorageInfo::Passthrough,
-        })
+            StorageInfo::Passthrough,
+        ))
     }
 
     /// Delete an object from S3
@@ -670,18 +666,14 @@ impl S3Backend {
         user_key: &str,
         storage_info: StorageInfo,
     ) -> FileMetadata {
-        use crate::types::DELTAGLIDER_TOOL;
-        FileMetadata {
-            tool: DELTAGLIDER_TOOL.to_string(),
-            original_name: user_key.rsplit('/').next().unwrap_or(user_key).to_string(),
-            file_sha256: String::new(),
-            file_size: obj.size,
-            md5: obj.etag.clone().unwrap_or_default(),
-            created_at: obj.last_modified.unwrap_or_else(Utc::now),
-            content_type: None,
-            user_metadata: HashMap::new(),
+        FileMetadata::fallback(
+            user_key.rsplit('/').next().unwrap_or(user_key).to_string(),
+            obj.size,
+            obj.etag.clone().unwrap_or_default(),
+            obj.last_modified.unwrap_or_else(Utc::now),
+            None,
             storage_info,
-        }
+        )
     }
 
     /// List objects with a prefix in a specific bucket (keys only)
@@ -1124,17 +1116,14 @@ impl StorageBackend for S3Backend {
                     StorageInfo::Passthrough
                 };
 
-                FileMetadata {
-                    tool: crate::types::DELTAGLIDER_TOOL.to_string(),
+                FileMetadata::fallback(
                     original_name,
-                    file_sha256: String::new(),
-                    file_size: obj.size,
-                    md5: obj.etag.unwrap_or_default(),
-                    created_at: obj.last_modified.unwrap_or_else(Utc::now),
-                    content_type: None,
-                    user_metadata: HashMap::new(),
+                    obj.size,
+                    obj.etag.unwrap_or_default(),
+                    obj.last_modified.unwrap_or_else(Utc::now),
+                    None,
                     storage_info,
-                }
+                )
             })
             .collect();
 

@@ -315,6 +315,30 @@ impl FileMetadata {
         }
     }
 
+    /// Create best-effort fallback metadata for an object that exists in storage
+    /// but has no DeltaGlider metadata (unmanaged file). Used by both S3 and
+    /// filesystem backends when metadata headers/xattrs are absent.
+    pub fn fallback(
+        original_name: String,
+        size: u64,
+        md5: String,
+        created_at: DateTime<Utc>,
+        content_type: Option<String>,
+        storage_info: StorageInfo,
+    ) -> Self {
+        Self {
+            tool: DELTAGLIDER_TOOL.to_string(),
+            original_name,
+            file_sha256: String::new(),
+            file_size: size,
+            md5,
+            created_at,
+            content_type,
+            user_metadata: HashMap::new(),
+            storage_info,
+        }
+    }
+
     /// Create metadata for an S3 directory marker (zero-byte "folder/" object).
     pub fn directory_marker(key: &str) -> Self {
         Self {
