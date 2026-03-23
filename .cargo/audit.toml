@@ -24,4 +24,8 @@ ignore = [
     # rustls-pemfile 2.2.0 (unmaintained): transitive from reqwest/aws-sdk TLS stack.
     # Upstream needs to migrate to rustls-pki-types PemObject.
     "RUSTSEC-2025-0134",
+
+    # astral-tokio-tar 0.5.6: PAX extension validation. Dev-only dep
+    # (testcontainers), severity 1.7 (low). Waiting for testcontainers upgrade.
+    "RUSTSEC-2026-0066",
 ]
