@@ -388,7 +388,6 @@ impl S3Backend {
         }
 
         let backoff_ms = [100, 200, 400];
-        let mut last_err = None;
 
         for attempt in 0..=backoff_ms.len() {
             let mut request = self
@@ -448,7 +447,6 @@ impl S3Backend {
                             backoff_ms[attempt] as u64,
                         ))
                         .await;
-                        last_err = Some(e);
                         continue;
                     }
 
@@ -457,12 +455,9 @@ impl S3Backend {
             }
         }
 
-        // All retries exhausted (unreachable — loop returns on last attempt)
-        Err(Self::classify_s3_error(
-            bucket,
-            last_err.as_ref().unwrap(),
-            "put_object",
-        ))
+        // Unreachable: the loop always returns (success on Ok, error on final attempt).
+        // Kept as a safety net — if control flow changes, this is better than silent success.
+        unreachable!("retry loop must return on every path")
     }
 
     /// Get an object from S3
