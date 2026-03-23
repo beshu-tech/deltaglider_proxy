@@ -20,7 +20,7 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
 
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 
 /// Lightweight object info from ListObjectsV2 (no HEAD requests needed)
 struct S3ListedObject {
@@ -102,6 +102,9 @@ impl S3Backend {
             .force_path_style(force_path_style)
             .request_checksum_calculation(
                 aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+            )
+            .response_checksum_validation(
+                aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
             );
 
         if let Some(ref ep) = endpoint {
@@ -118,16 +121,40 @@ impl S3Backend {
         Ok(Self { client })
     }
 
-    /// Classify an S3 SDK error, mapping bucket-level access/existence errors
-    /// to `StorageError::BucketNotFound`.
+    /// Classify an S3 SDK error with full diagnostic context.
     ///
-    /// Many S3 providers (e.g. Hetzner, Ceph) return `AccessDenied` (403) instead
-    /// of `NoSuchBucket` for non-existent buckets to prevent bucket enumeration.
+    /// Logs bucket, key, body size, HTTP status, error code, and request-id
+    /// for production debugging (per Python DeltaGlider team recommendations).
+    /// Maps bucket-level 403 to BucketNotFound (Hetzner, Ceph return 403 for
+    /// non-existent buckets to prevent enumeration).
     fn classify_s3_error(
         bucket: &str,
         e: &SdkError<impl std::fmt::Debug>,
         context: &str,
     ) -> StorageError {
+        // Extract diagnostic details from the SDK error
+        let (status, request_id) = if let SdkError::ServiceError(ref svc) = e {
+            let raw = svc.raw();
+            let status = raw.status().as_u16();
+            let rid = raw
+                .headers()
+                .get("x-amz-request-id")
+                .unwrap_or("-");
+            (Some(status), rid.to_string())
+        } else {
+            (None, "-".to_string())
+        };
+
+        // Log full context for production debugging
+        warn!(
+            "S3 error: op={} bucket={} status={} request_id={} error={:?}",
+            context,
+            bucket,
+            status.map(|s| s.to_string()).unwrap_or_else(|| "-".to_string()),
+            request_id,
+            e,
+        );
+
         let debug_str = format!("{:?}", e);
         // Explicit NoSuchBucket in the error body → bucket doesn't exist.
         if debug_str.contains("NoSuchBucket") {
@@ -137,9 +164,8 @@ impl S3Backend {
         // buckets to prevent bucket enumeration. Only treat 403 as BucketNotFound
         // if context suggests a bucket-level operation. Object-level 403 errors
         // are genuine AccessDenied and should not be misclassified.
-        if let SdkError::ServiceError(ref svc) = e {
-            let status = svc.raw().status().as_u16();
-            if status == 403
+        if let Some(s) = status {
+            if s == 403
                 && (context.starts_with("head_bucket")
                     || context.starts_with("list_objects")
                     || context.starts_with("create_bucket"))
@@ -147,7 +173,7 @@ impl S3Backend {
                 return StorageError::BucketNotFound(bucket.to_string());
             }
         }
-        StorageError::S3(format!("{} failed: {}", context, e))
+        StorageError::S3(format!("{} failed (status={}): {}", context, status.unwrap_or(0), e))
     }
 
     // === Key generation helpers ===
@@ -340,7 +366,9 @@ impl S3Backend {
 
     // === Internal helpers ===
 
-    /// Put an object to S3 with metadata headers
+    /// Put an object to S3 with metadata headers.
+    /// Retries on transient errors (400 BadRequest from Hetzner, 503 SlowDown)
+    /// with exponential backoff. Data is already fully buffered — retry is safe.
     async fn put_object_with_metadata(
         &self,
         bucket: &str,
@@ -359,30 +387,82 @@ impl S3Backend {
             )));
         }
 
-        let mut request = self
-            .client
-            .put_object()
-            .bucket(bucket)
-            .key(key)
-            .body(ByteStream::from(data.to_vec()))
-            .content_type("application/octet-stream");
+        let backoff_ms = [100, 200, 400];
+        let mut last_err = None;
 
-        for (k, v) in headers {
-            request = request.metadata(k, v);
+        for attempt in 0..=backoff_ms.len() {
+            let mut request = self
+                .client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from(data.to_vec()))
+                .content_type("application/octet-stream");
+
+            for (k, v) in &headers {
+                request = request.metadata(k.clone(), v.clone());
+            }
+
+            match request.send().await {
+                Ok(_) => {
+                    if attempt > 0 {
+                        debug!(
+                            "S3 PUT {}/{} succeeded on attempt {} ({} bytes)",
+                            bucket,
+                            key,
+                            attempt + 1,
+                            data.len()
+                        );
+                    } else {
+                        debug!(
+                            "S3 PUT {}/{} ({} bytes) with DG metadata",
+                            bucket,
+                            key,
+                            data.len()
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    let is_retryable = if let SdkError::ServiceError(ref svc) = e {
+                        let status = svc.raw().status().as_u16();
+                        // Hetzner returns transient 400s with connection:close and no
+                        // request-id (~1-2% of requests). 503 is standard SlowDown.
+                        status == 400 || status == 503
+                    } else {
+                        // Network/dispatch errors are retryable
+                        matches!(e, SdkError::DispatchFailure(_) | SdkError::TimeoutError(_))
+                    };
+
+                    if is_retryable && attempt < backoff_ms.len() {
+                        warn!(
+                            "S3 PUT {}/{} ({} bytes) failed (attempt {}), retrying in {}ms: {:?}",
+                            bucket,
+                            key,
+                            data.len(),
+                            attempt + 1,
+                            backoff_ms[attempt],
+                            e,
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            backoff_ms[attempt] as u64,
+                        ))
+                        .await;
+                        last_err = Some(e);
+                        continue;
+                    }
+
+                    return Err(Self::classify_s3_error(bucket, &e, "put_object"));
+                }
+            }
         }
 
-        request
-            .send()
-            .await
-            .map_err(|e| Self::classify_s3_error(bucket, &e, "put_object"))?;
-
-        debug!(
-            "S3 PUT {}/{} ({} bytes) with DG metadata",
+        // All retries exhausted (unreachable — loop returns on last attempt)
+        Err(Self::classify_s3_error(
             bucket,
-            key,
-            data.len()
-        );
-        Ok(())
+            last_err.as_ref().unwrap(),
+            "put_object",
+        ))
     }
 
     /// Get an object from S3
