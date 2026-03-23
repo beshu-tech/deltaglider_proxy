@@ -124,6 +124,40 @@ impl FilesystemBackend {
         self.deltaspace_dir(bucket, prefix).join(filename)
     }
 
+    /// Build a best-effort FileMetadata from filesystem stats alone (no xattr).
+    /// Used when a file exists but has no DeltaGlider metadata (unmanaged file).
+    async fn fallback_metadata_from_path(
+        path: &Path,
+        filename: &str,
+    ) -> Result<FileMetadata, StorageError> {
+        use crate::types::{StorageInfo, DELTAGLIDER_TOOL};
+        use chrono::{DateTime, Utc};
+
+        let stat = fs::metadata(path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StorageError::NotFound(path.display().to_string())
+            } else {
+                StorageError::from(e)
+            }
+        })?;
+        let size = stat.len();
+        let modified: DateTime<Utc> = stat
+            .modified()
+            .map(DateTime::<Utc>::from)
+            .unwrap_or_else(|_| Utc::now());
+        Ok(FileMetadata {
+            tool: DELTAGLIDER_TOOL.to_string(),
+            original_name: filename.to_string(),
+            file_sha256: String::new(),
+            file_size: size,
+            md5: String::new(),
+            created_at: modified,
+            content_type: None,
+            user_metadata: std::collections::HashMap::new(),
+            storage_info: StorageInfo::Passthrough,
+        })
+    }
+
     /// Ensure a directory exists
     async fn ensure_dir(&self, path: &Path) -> Result<(), StorageError> {
         if let Some(parent) = path.parent() {
@@ -214,12 +248,17 @@ impl FilesystemBackend {
                     continue;
                 }
 
-                // Read xattr metadata
+                // Read xattr metadata, falling back to filesystem stats for unmanaged files
                 let meta = match xattr_meta::read_metadata(&path).await {
                     Ok(m) => m,
-                    Err(e) => {
-                        debug!("Failed to read xattr metadata {:?}: {}", path, e);
-                        continue;
+                    Err(_) => {
+                        match Self::fallback_metadata_from_path(&path, &name).await {
+                            Ok(m) => m,
+                            Err(e) => {
+                                debug!("Failed to read metadata for {:?}: {}", path, e);
+                                continue;
+                            }
+                        }
                     }
                 };
 
@@ -550,7 +589,15 @@ impl StorageBackend for FilesystemBackend {
         prefix: &str,
         filename: &str,
     ) -> Result<FileMetadata, StorageError> {
-        xattr_meta::read_metadata(&self.passthrough_path(bucket, prefix, filename)).await
+        let path = self.passthrough_path(bucket, prefix, filename);
+        match xattr_meta::read_metadata(&path).await {
+            Ok(meta) => Ok(meta),
+            Err(_) => {
+                // No xattr metadata — file may exist without DG metadata (unmanaged).
+                // Fall back to filesystem stats if the file exists.
+                Self::fallback_metadata_from_path(&path, filename).await
+            }
+        }
     }
 
     #[instrument(skip(self))]
@@ -674,8 +721,13 @@ impl StorageBackend for FilesystemBackend {
                 if is_data_file {
                     match xattr_meta::read_metadata(&path).await {
                         Ok(meta) => metadata_list.push(meta),
-                        Err(e) => {
-                            debug!("Failed to read xattr metadata {:?}: {}", path, e);
+                        Err(_) => {
+                            // No xattr — try filesystem stats for unmanaged files
+                            if let Ok(meta) =
+                                Self::fallback_metadata_from_path(&path, name).await
+                            {
+                                metadata_list.push(meta);
+                            }
                         }
                     }
                 }
