@@ -58,6 +58,9 @@ pub enum S3Error {
 
     #[error("SlowDown: Please reduce your request rate.")]
     SlowDown(String),
+
+    #[error("RequestTimeTooSkewed: The difference between the request time and the server's time is too large.")]
+    RequestTimeTooSkewed,
 }
 
 impl S3Error {
@@ -81,6 +84,7 @@ impl S3Error {
             S3Error::AccessDenied => "AccessDenied",
             S3Error::SignatureDoesNotMatch => "SignatureDoesNotMatch",
             S3Error::SlowDown(_) => "SlowDown",
+            S3Error::RequestTimeTooSkewed => "RequestTimeTooSkewed",
         }
     }
 
@@ -104,6 +108,7 @@ impl S3Error {
             S3Error::AccessDenied => StatusCode::FORBIDDEN,
             S3Error::SignatureDoesNotMatch => StatusCode::FORBIDDEN,
             S3Error::SlowDown(_) => StatusCode::SERVICE_UNAVAILABLE,
+            S3Error::RequestTimeTooSkewed => StatusCode::FORBIDDEN,
         }
     }
 

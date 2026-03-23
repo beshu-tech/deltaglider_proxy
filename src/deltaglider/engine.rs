@@ -1270,7 +1270,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .storage
             .get_reference(bucket, deltaspace_id)
             .await
-            .map_err(|_| EngineError::MissingReference(deltaspace_id.to_string()))?;
+            .map_err(|e| match e {
+                StorageError::NotFound(_) => {
+                    EngineError::MissingReference(deltaspace_id.to_string())
+                }
+                other => EngineError::Storage(other),
+            })?;
 
         // PERF: Convert Vec→Bytes once (zero-copy ownership transfer), then
         // clone the Bytes for the cache (refcount increment, no memcpy).

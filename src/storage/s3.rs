@@ -350,6 +350,18 @@ impl S3Backend {
     ) -> Result<(), StorageError> {
         let headers = self.metadata_to_headers(metadata);
 
+        // S3 has a 2KB limit on total user metadata size. Warn if we're close.
+        let total_meta_size: usize = headers
+            .iter()
+            .map(|(k, v)| k.len() + v.len())
+            .sum();
+        if total_meta_size > 2048 {
+            return Err(StorageError::Other(format!(
+                "DG metadata exceeds S3's 2KB limit ({} bytes) for {}/{}",
+                total_meta_size, bucket, key
+            )));
+        }
+
         let mut request = self
             .client
             .put_object()
