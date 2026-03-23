@@ -268,7 +268,7 @@ jobs:
   docker-merge:
     name: Docker manifest merge
     needs: [validate, docker-build]
-    runs-on: k3s
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     env:
