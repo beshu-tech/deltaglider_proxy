@@ -13,10 +13,7 @@ use std::path::Path;
 /// This simulates an object that exists on upstream storage but was never
 /// stored through the proxy.
 fn write_unmanaged_file(data_dir: &Path, bucket: &str, prefix: &str, filename: &str, data: &[u8]) {
-    let dir = data_dir
-        .join(bucket)
-        .join("deltaspaces")
-        .join(prefix);
+    let dir = data_dir.join(bucket).join("deltaspaces").join(prefix);
     std::fs::create_dir_all(&dir).expect("Failed to create deltaspace dir");
     std::fs::write(dir.join(filename), data).expect("Failed to write unmanaged file");
 }
@@ -63,7 +60,11 @@ async fn test_get_unmanaged_object_returns_content() {
         resp.status()
     );
     let body = resp.bytes().await.unwrap();
-    assert_eq!(body.as_ref(), content, "GET body should match written content");
+    assert_eq!(
+        body.as_ref(),
+        content,
+        "GET body should match written content"
+    );
 }
 
 #[tokio::test]
@@ -170,7 +171,10 @@ async fn test_delete_unmanaged_object() {
 
     // Verify it exists first
     let resp = client.get(&url).send().await.unwrap();
-    assert!(resp.status().is_success(), "GET before DELETE should succeed");
+    assert!(
+        resp.status().is_success(),
+        "GET before DELETE should succeed"
+    );
 
     // DELETE
     let resp = client.delete(&url).send().await.unwrap();
@@ -357,7 +361,13 @@ async fn test_copy_unmanaged_object_succeeds() {
     let data_dir = server.data_dir().expect("filesystem backend has data_dir");
     let content = b"copy me from unmanaged source";
 
-    write_unmanaged_file(data_dir, server.bucket(), "copy-src", "original.bin", content);
+    write_unmanaged_file(
+        data_dir,
+        server.bucket(),
+        "copy-src",
+        "original.bin",
+        content,
+    );
 
     let client = reqwest::Client::new();
     let dest_url = format!(
@@ -383,7 +393,11 @@ async fn test_copy_unmanaged_object_succeeds() {
     let get_resp = client.get(&dest_url).send().await.unwrap();
     assert!(get_resp.status().is_success());
     let body = get_resp.bytes().await.unwrap();
-    assert_eq!(body.as_ref(), content, "Copied content should match original");
+    assert_eq!(
+        body.as_ref(),
+        content,
+        "Copied content should match original"
+    );
 }
 
 /// Regression test for M5: copy_object with unmanaged source that exceeds

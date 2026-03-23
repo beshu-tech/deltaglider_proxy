@@ -52,8 +52,9 @@ HTTP request
 - `StorageBackend` (trait in `storage/traits.rs`) — all storage operations; two impls: Filesystem, S3
 - `SharedConfig` = `Arc<RwLock<Config>>` — hot-reloadable via admin API
 - `RetrieveResponse` — enum: `Streamed` (zero-copy passthrough) vs `Buffered` (delta reconstruction, includes `cache_hit: Option<bool>`)
-- `FileMetadata` (in `types.rs`) — per-object metadata with DG-specific tags
+- `FileMetadata` (in `types.rs`) — per-object metadata with DG-specific tags; `fallback()` constructor for unmanaged objects
 - `StoreContext` (in `engine.rs`) — parameter object for the store pipeline (bucket, key, data, hashes, metadata)
+- `Engine::validated_key()` — shared parse+validate+deltaspace_id helper used by all public engine methods
 
 **Config:** TOML file (`deltaglider_proxy.toml`) with env var overrides (`DGP_*` prefix). See `deltaglider_proxy.toml.example`.
 
