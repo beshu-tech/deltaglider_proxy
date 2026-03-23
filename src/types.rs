@@ -110,6 +110,17 @@ impl ObjectKey {
         if self.filename == "." || self.filename == ".." {
             return Err(KeyValidationError("Invalid object filename".to_string()));
         }
+        // Reject filenames that collide with DeltaGlider internal storage files
+        if self.filename == "reference.bin" {
+            return Err(KeyValidationError(
+                "Object key 'reference.bin' is reserved for internal use".to_string(),
+            ));
+        }
+        if self.filename.ends_with(".delta") {
+            return Err(KeyValidationError(
+                "Object keys ending in '.delta' are reserved for internal use".to_string(),
+            ));
+        }
         Ok(())
     }
 
