@@ -130,7 +130,7 @@ impl FilesystemBackend {
         path: &Path,
         filename: &str,
     ) -> Result<FileMetadata, StorageError> {
-        use crate::types::{StorageInfo, DELTAGLIDER_TOOL};
+        use crate::types::StorageInfo;
         use chrono::{DateTime, Utc};
 
         let stat = fs::metadata(path).await.map_err(|e| {
@@ -140,22 +140,18 @@ impl FilesystemBackend {
                 StorageError::from(e)
             }
         })?;
-        let size = stat.len();
         let modified: DateTime<Utc> = stat
             .modified()
             .map(DateTime::<Utc>::from)
             .unwrap_or_else(|_| Utc::now());
-        Ok(FileMetadata {
-            tool: DELTAGLIDER_TOOL.to_string(),
-            original_name: filename.to_string(),
-            file_sha256: String::new(),
-            file_size: size,
-            md5: String::new(),
-            created_at: modified,
-            content_type: None,
-            user_metadata: std::collections::HashMap::new(),
-            storage_info: StorageInfo::Passthrough,
-        })
+        Ok(FileMetadata::fallback(
+            filename.to_string(),
+            stat.len(),
+            String::new(),
+            modified,
+            None,
+            StorageInfo::Passthrough,
+        ))
     }
 
     /// Ensure a directory exists

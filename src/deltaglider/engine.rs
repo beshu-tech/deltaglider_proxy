@@ -284,6 +284,16 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
     }
 
+    /// Parse and validate an S3 key, returning the parsed key and deltaspace ID.
+    fn validated_key(bucket: &str, key: &str) -> Result<(ObjectKey, String), EngineError> {
+        let obj_key = ObjectKey::parse(bucket, key);
+        obj_key
+            .validate_object()
+            .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
+        let deltaspace_id = obj_key.deltaspace_id();
+        Ok((obj_key, deltaspace_id))
+    }
+
     /// Look up object metadata by checking both delta and passthrough storage,
     /// returning the most recent version if both exist.
     async fn resolve_object_metadata(
@@ -366,11 +376,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             });
         }
 
-        let obj_key = ObjectKey::parse(bucket, key);
-        obj_key
-            .validate_object()
-            .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
-        let deltaspace_id = obj_key.deltaspace_id();
+        let (obj_key, deltaspace_id) = Self::validated_key(bucket, key)?;
 
         // Calculate hashes
         let sha256 = hex::encode(Sha256::digest(data));
@@ -601,11 +607,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             });
         }
 
-        let obj_key = ObjectKey::parse(bucket, key);
-        obj_key
-            .validate_object()
-            .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
-        let deltaspace_id = obj_key.deltaspace_id();
+        let (obj_key, deltaspace_id) = Self::validated_key(bucket, key)?;
 
         // Compute SHA256 + MD5 incrementally across chunks
         let mut sha256_hasher = Sha256::new();
@@ -805,11 +807,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         bucket: &str,
         key: &str,
     ) -> Result<RetrieveResponse, EngineError> {
-        let obj_key = ObjectKey::parse(bucket, key);
-        obj_key
-            .validate_object()
-            .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
-        let deltaspace_id = obj_key.deltaspace_id();
+        let (obj_key, deltaspace_id) = Self::validated_key(bucket, key)?;
 
         let metadata = self
             .resolve_metadata_with_migration(bucket, &deltaspace_id, &obj_key)
@@ -1005,11 +1003,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Retrieve object metadata without reading object bodies.
     #[instrument(skip(self))]
     pub async fn head(&self, bucket: &str, key: &str) -> Result<FileMetadata, EngineError> {
-        let obj_key = ObjectKey::parse(bucket, key);
-        obj_key
-            .validate_object()
-            .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
-        let deltaspace_id = obj_key.deltaspace_id();
+        let (obj_key, deltaspace_id) = Self::validated_key(bucket, key)?;
 
         match self
             .resolve_metadata_with_migration(bucket, &deltaspace_id, &obj_key)
@@ -1201,11 +1195,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Delete an object
     #[instrument(skip(self))]
     pub async fn delete(&self, bucket: &str, key: &str) -> Result<(), EngineError> {
-        let obj_key = ObjectKey::parse(bucket, key);
-        obj_key
-            .validate_object()
-            .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
-        let deltaspace_id = obj_key.deltaspace_id();
+        let (obj_key, deltaspace_id) = Self::validated_key(bucket, key)?;
 
         info!("Deleting {}/{}", bucket, key);
 
