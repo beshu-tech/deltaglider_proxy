@@ -193,6 +193,24 @@ fn verify_signature(
         return Err(S3Error::AccessDenied.into_response());
     }
 
+    // Validate clock skew (AWS rejects requests where the date differs
+    // from server time by more than 15 minutes — prevents replay attacks)
+    if !params.amz_date.is_empty() {
+        if let Ok(request_time) =
+            chrono::NaiveDateTime::parse_from_str(&params.amz_date, "%Y%m%dT%H%M%SZ")
+        {
+            let now = chrono::Utc::now().naive_utc();
+            let skew = (now - request_time).num_seconds().unsigned_abs();
+            if skew > 15 * 60 {
+                warn!(
+                    "SigV4: request time skew {}s exceeds 15-minute limit (request: {}, server: {})",
+                    skew, params.amz_date, now.format("%Y%m%dT%H%M%SZ")
+                );
+                return Err(S3Error::RequestTimeTooSkewed.into_response());
+            }
+        }
+    }
+
     // Build sorted signed headers
     let signed_headers_list: Vec<&str> = params.signed_headers.split(';').collect();
     let mut header_pairs: Vec<(String, String)> = Vec::new();

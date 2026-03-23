@@ -415,26 +415,43 @@ impl Config {
     /// Load configuration from file if it exists, otherwise from environment
     pub fn load() -> Self {
         // Try config file first
-        if let Ok(path) = std::env::var("DGP_CONFIG") {
+        let config = if let Ok(path) = std::env::var("DGP_CONFIG") {
             if let Ok(config) = Self::from_file(&path) {
-                return config;
+                config
+            } else {
+                Self::from_env()
             }
-        }
-
-        // Try default config file locations
-        for path in &[
-            "deltaglider_proxy.toml",
-            "/etc/deltaglider_proxy/config.toml",
-        ] {
-            if std::path::Path::new(path).exists() {
-                if let Ok(config) = Self::from_file(path) {
-                    return config;
+        } else {
+            // Try default config file locations
+            let mut found = None;
+            for path in &[
+                "deltaglider_proxy.toml",
+                "/etc/deltaglider_proxy/config.toml",
+            ] {
+                if std::path::Path::new(path).exists() {
+                    if let Ok(config) = Self::from_file(path) {
+                        found = Some(config);
+                        break;
+                    }
                 }
             }
-        }
+            found.unwrap_or_else(Self::from_env)
+        };
+        config.validate();
+        config
+    }
 
-        // Fall back to environment variables
-        Self::from_env()
+    /// Validate config values are in acceptable ranges. Called after loading.
+    pub fn validate(&self) {
+        if self.max_delta_ratio < 0.0 || self.max_delta_ratio > 1.0 {
+            eprintln!(
+                "Warning: max_delta_ratio={} is outside [0.0, 1.0], clamping to range",
+                self.max_delta_ratio
+            );
+        }
+        if self.max_object_size == 0 {
+            eprintln!("Warning: max_object_size=0 will reject all uploads");
+        }
     }
 
     /// Returns true if SigV4 authentication is enabled (both credentials are set).
