@@ -136,10 +136,7 @@ impl S3Backend {
         let (status, request_id) = if let SdkError::ServiceError(ref svc) = e {
             let raw = svc.raw();
             let status = raw.status().as_u16();
-            let rid = raw
-                .headers()
-                .get("x-amz-request-id")
-                .unwrap_or("-");
+            let rid = raw.headers().get("x-amz-request-id").unwrap_or("-");
             (Some(status), rid.to_string())
         } else {
             (None, "-".to_string())
@@ -150,7 +147,9 @@ impl S3Backend {
             "S3 error: op={} bucket={} status={} request_id={} error={:?}",
             context,
             bucket,
-            status.map(|s| s.to_string()).unwrap_or_else(|| "-".to_string()),
+            status
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "-".to_string()),
             request_id,
             e,
         );
@@ -173,7 +172,12 @@ impl S3Backend {
                 return StorageError::BucketNotFound(bucket.to_string());
             }
         }
-        StorageError::S3(format!("{} failed (status={}): {}", context, status.unwrap_or(0), e))
+        StorageError::S3(format!(
+            "{} failed (status={}): {}",
+            context,
+            status.unwrap_or(0),
+            e
+        ))
     }
 
     // === Key generation helpers ===
