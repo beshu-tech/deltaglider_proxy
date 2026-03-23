@@ -6,29 +6,32 @@ RUN npm ci
 COPY demo/s3-browser/ui/ ./
 RUN npm run build
 
-# ── Build stage: Rust dependency cache ──
-FROM rust:1-bookworm AS rust-deps
+# ── Build stage: cargo-chef plan (captures dependency graph) ──
+FROM rust:1-bookworm AS chef
+RUN cargo install cargo-chef --locked
+WORKDIR /app
+
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY src/ src/
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ── Build stage: dependency cache (only reruns when recipe.json changes) ──
+FROM chef AS rust-deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
-WORKDIR /app
-COPY Cargo.toml Cargo.lock build.rs ./
-# Dummy sources to compile dependencies only (cached until Cargo.toml/lock change)
-RUN mkdir -p src && echo 'fn main() {}' > src/main.rs && touch src/lib.rs \
-    && mkdir -p demo/s3-browser/ui/dist \
-    && cargo build --release \
-    && rm -rf src/
+COPY --from=planner /app/recipe.json recipe.json
+# Cook dependencies — this layer is cached until Cargo.toml/lock changes
+RUN mkdir -p demo/s3-browser/ui/dist \
+    && cargo chef cook --release --recipe-path recipe.json
 
 # ── Build stage: Rust ──
 FROM rust-deps AS rust-build
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY src/ src/
 COPY --from=ui-build /app/demo/s3-browser/ui/dist demo/s3-browser/ui/dist
-# Remove all dummy crate artifacts so cargo fully rebuilds our code
-RUN rm -f target/release/deltaglider_proxy \
-           target/release/deps/deltaglider_proxy-* \
-           target/release/deps/libdeltaglider_proxy-* \
-    && rm -rf target/release/.fingerprint/deltaglider_proxy-* \
-    && cargo build --release
+RUN cargo build --release
 
 # ── Runtime ──
 FROM debian:bookworm-slim
