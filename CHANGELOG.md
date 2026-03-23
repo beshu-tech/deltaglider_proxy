@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.3.0
+
+### S3-Compatible Endpoint Support
+
+- **Disabled automatic request checksums**: AWS SDK for Rust (like boto3 1.36+) adds CRC32/CRC64 checksum headers to PUT requests by default. S3-compatible stores (Hetzner Object Storage, Backblaze B2, some MinIO configs) reject these with BadRequest. Now sets `request_checksum_calculation=WhenRequired` for compatibility with both AWS S3 and S3-compatible endpoints. (Port of Python DeltaGlider [6.1.1] fix.)
+
+### Unmanaged Object Support (Fixes #3, #4)
+
+Objects that exist on the backend storage but were never stored through the proxy (no DeltaGlider metadata) are now fully accessible:
+
+- **S3 backend**: HEAD, GET, and LIST now return fallback metadata from the S3 HEAD response (size, ETag, Last-Modified) instead of 404
+- **Filesystem backend**: HEAD, GET, and LIST now return fallback metadata from filesystem stats (size, mtime) instead of 404
+- **HEAD/GET consistency**: Both operations return metadata from the same source, ensuring consistent Content-Length and ETag
+- **Delta and reference files**: Fallback metadata also works for delta/reference files without metadata (xattr or S3 headers)
+- **Corrupt metadata recovery**: S3 objects with partial/corrupt DG headers now fall back to passthrough instead of hard-failing
+
+### Error Handling Hardening
+
+- **Error discrimination**: Replaced blanket `.ok()` and `map_err(|_| NotFound)` patterns with explicit error matching throughout the engine. `NotFound` → expected (object doesn't exist), `Io` → warn + retry path (concurrent access), other errors → propagate as 500
+- **ENOENT classification**: `io_to_storage_error()` now maps file-not-found I/O errors to `StorageError::NotFound` instead of `StorageError::Io`, preventing false 500s for missing files
+- **Filesystem xattr errors**: Only fall back to filesystem stats on `NotFound`; permission denied and other I/O errors are now propagated instead of silently swallowed
+- **Reference cache errors**: `get_reference_cached()` now discriminates `NotFound` (→ MissingReference) from other storage errors (→ Storage)
+
+### Security
+
+- **SigV4 clock skew validation**: Regular (non-presigned) SigV4 requests now enforce a 15-minute clock skew window, matching AWS S3 behavior. Prevents replay attacks with arbitrarily old timestamps. Returns new `RequestTimeTooSkewed` error (403).
+- **Reserved filename validation**: PUT requests for `reference.bin` and `*.delta` keys are rejected with 400 to prevent collision with internal storage files
+
+### Reliability
+
+- **Codec subprocess timeout**: xdelta3 subprocess now has a 5-minute timeout via `try_wait` polling loop. Kills hung processes and returns an error instead of blocking indefinitely.
+- **Copy object size check**: `copy_object` now verifies actual data size after retrieval, catching cases where fallback metadata reports `file_size=0` that would bypass the pre-copy size check
+- **S3 metadata size validation**: Rejects PUT if DeltaGlider metadata headers exceed S3's 2KB limit, instead of letting the upstream S3 return an opaque 400
+- **Config validation**: Warns on `max_delta_ratio` outside [0.0, 1.0] and `max_object_size=0` at startup
+
+### DRY Cleanup
+
+- **`FileMetadata::fallback()`**: New constructor consolidates 4 duplicate fallback metadata construction sites across S3 and filesystem backends
+- **`Engine::validated_key()`**: Extracts the 5x repeated `ObjectKey::parse + validate_object + deltaspace_id` pattern
+
+### Testing
+
+- 12 new regression tests covering unmanaged object operations (HEAD, GET, LIST, DELETE, mixed managed/unmanaged), HEAD/GET metadata consistency, reserved filename rejection, and copy operations with unmanaged sources
+
 ## v0.2.0
 
 ### Cache Health Observability

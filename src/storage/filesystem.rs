@@ -740,9 +740,7 @@ impl StorageBackend for FilesystemBackend {
                         Ok(meta) => metadata_list.push(meta),
                         Err(StorageError::NotFound(_)) => {
                             // No xattr — try filesystem stats for unmanaged files
-                            if let Ok(meta) =
-                                Self::fallback_metadata_from_path(&path, name).await
-                            {
+                            if let Ok(meta) = Self::fallback_metadata_from_path(&path, name).await {
                                 metadata_list.push(meta);
                             }
                         }

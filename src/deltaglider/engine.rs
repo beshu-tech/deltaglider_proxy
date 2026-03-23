@@ -303,30 +303,40 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         original_name: &str,
     ) -> Result<Option<FileMetadata>, StorageError> {
         let filename = original_name.rsplit('/').next().unwrap_or(original_name);
-        let delta = match self.storage.get_delta_metadata(bucket, prefix, filename).await {
+        let delta = match self
+            .storage
+            .get_delta_metadata(bucket, prefix, filename)
+            .await
+        {
             Ok(meta) => Some(meta),
             Err(StorageError::NotFound(_)) => None,
             // I/O errors (e.g. file being atomically replaced during concurrent access)
             // are treated as "metadata not available" with a warning, not hard failures.
             Err(StorageError::Io(ref e)) => {
-                warn!("I/O error reading delta metadata for {}/{}: {}", prefix, filename, e);
+                warn!(
+                    "I/O error reading delta metadata for {}/{}: {}",
+                    prefix, filename, e
+                );
                 None
             }
             Err(e) => return Err(e),
         };
-        let passthrough =
-            match self.storage.get_passthrough_metadata(bucket, prefix, filename).await {
-                Ok(meta) => Some(meta),
-                Err(StorageError::NotFound(_)) => None,
-                Err(StorageError::Io(ref e)) => {
-                    warn!(
-                        "I/O error reading passthrough metadata for {}/{}: {}",
-                        prefix, filename, e
-                    );
-                    None
-                }
-                Err(e) => return Err(e),
-            };
+        let passthrough = match self
+            .storage
+            .get_passthrough_metadata(bucket, prefix, filename)
+            .await
+        {
+            Ok(meta) => Some(meta),
+            Err(StorageError::NotFound(_)) => None,
+            Err(StorageError::Io(ref e)) => {
+                warn!(
+                    "I/O error reading passthrough metadata for {}/{}: {}",
+                    prefix, filename, e
+                );
+                None
+            }
+            Err(e) => return Err(e),
+        };
         match (delta, passthrough) {
             (Some(d), Some(p)) => Ok(Some(if d.created_at >= p.created_at { d } else { p })),
             (Some(meta), None) | (None, Some(meta)) => Ok(Some(meta)),
