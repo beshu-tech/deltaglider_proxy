@@ -971,8 +971,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             None => {
                 // No DG metadata — try reading passthrough metadata (lightweight HEAD).
                 // If that also fails (unmanaged file with no DG headers), return NotFound.
-                // The UI handles HEAD failures gracefully; the download path
-                // (retrieve_stream) has its own fallback for unmanaged files.
+                // Both S3 and filesystem backends now return fallback metadata for files
+                // that exist without DG metadata, so this should succeed for any existing file.
                 self.storage
                     .get_passthrough_metadata(bucket, &deltaspace_id, &obj_key.filename)
                     .await

@@ -192,6 +192,11 @@ impl TestServer {
     pub fn pid(&self) -> u32 {
         self.process.id()
     }
+
+    /// Get the data directory path (filesystem backend only)
+    pub fn data_dir(&self) -> Option<&std::path::Path> {
+        self._data_dir.as_ref().map(|d| d.path())
+    }
 }
 
 /// Builder for constructing `TestServer` instances with arbitrary config knobs.
