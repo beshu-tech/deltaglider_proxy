@@ -521,13 +521,21 @@ async fn test_user_metadata_round_trip() {
         .headers()
         .get("x-amz-meta-author")
         .and_then(|v| v.to_str().ok());
-    assert_eq!(author, Some("test-user"), "x-amz-meta-author should survive round-trip");
+    assert_eq!(
+        author,
+        Some("test-user"),
+        "x-amz-meta-author should survive round-trip"
+    );
 
     let version = resp
         .headers()
         .get("x-amz-meta-version")
         .and_then(|v| v.to_str().ok());
-    assert_eq!(version, Some("42"), "x-amz-meta-version should survive round-trip");
+    assert_eq!(
+        version,
+        Some("42"),
+        "x-amz-meta-version should survive round-trip"
+    );
 
     // Verify content-type is preserved
     let ct = resp
@@ -570,7 +578,11 @@ async fn test_delta_round_trip_byte_integrity() {
         .send()
         .await
         .unwrap();
-    assert!(resp.status().is_success(), "PUT base failed: {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "PUT base failed: {}",
+        resp.status()
+    );
 
     // PUT variant (should be stored as delta)
     let url2 = format!(
@@ -585,7 +597,11 @@ async fn test_delta_round_trip_byte_integrity() {
         .send()
         .await
         .unwrap();
-    assert!(resp.status().is_success(), "PUT variant failed: {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "PUT variant failed: {}",
+        resp.status()
+    );
 
     // GET base and verify exact bytes
     let resp = client.get(&url1).send().await.unwrap();
@@ -631,7 +647,11 @@ async fn test_multipart_etag_format() {
         .key("multi/test.bin")
         .upload_id(upload_id)
         .part_number(1)
-        .body(aws_sdk_s3::primitives::ByteStream::from(vec![0xAA; 5 * 1024 * 1024]))
+        .body(aws_sdk_s3::primitives::ByteStream::from(vec![
+            0xAA;
+            5 * 1024
+                * 1024
+        ]))
         .send()
         .await
         .unwrap();
