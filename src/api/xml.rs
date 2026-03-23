@@ -72,7 +72,7 @@ impl ListBucketResult {
         is_truncated: bool,
         encoding_type: Option<String>,
     ) -> Self {
-        let key_count = (contents.len() + common_prefixes.len()) as u32;
+        let key_count = u32::try_from(contents.len() + common_prefixes.len()).unwrap_or(u32::MAX);
         Self {
             name,
             prefix,
@@ -104,7 +104,7 @@ impl ListBucketResult {
         next_continuation_token: Option<String>,
         is_truncated: bool,
     ) -> Self {
-        let key_count = (contents.len() + common_prefixes.len()) as u32;
+        let key_count = u32::try_from(contents.len() + common_prefixes.len()).unwrap_or(u32::MAX);
         Self {
             name,
             prefix,
