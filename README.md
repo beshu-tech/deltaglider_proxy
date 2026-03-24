@@ -117,7 +117,8 @@ S3 request
   → StorageBackend trait (filesystem or S3)
 ```
 
-- SHA-256 verified on every GET. Corruption detected immediately.
+- **Transparent reconstruction**: Delta-compressed files are [reconstructed on the fly](docs/DELTA_RECONSTRUCTION.md) — clients receive the exact original bytes with correct `Content-Length` and `ETag`. Auth (SigV4/presigned URLs) is verified before reconstruction begins.
+- SHA-256 verified on every reconstructed GET. Corruption detected immediately.
 - LRU reference cache (moka) for fast reconstruction. Cache health exposed via startup warnings, periodic monitors, Prometheus gauges, and per-response `x-deltaglider-cache: hit|miss` header.
 - `x-amz-storage-type` response header exposes strategy (delta/passthrough/reference) for debugging.
 - Built-in Proxy Dashboard with live charts for cache, compression, HTTP traffic, and auth metrics.
@@ -140,6 +141,7 @@ docker compose up -d  # includes MinIO for S3 backend
 
 ## Docs
 
+- [How delta reconstruction works](docs/DELTA_RECONSTRUCTION.md)
 - [Operations guide](docs/OPERATIONS.md)
 - [Storage format internals](docs/STORAGE_FORMAT.md)
 - [Authentication & presigned URLs](docs/AUTHENTICATION.md)
