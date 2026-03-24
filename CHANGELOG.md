@@ -4,7 +4,9 @@
 
 ### S3-Compatible Endpoint Support
 
-- **Disabled automatic request checksums**: AWS SDK for Rust (like boto3 1.36+) adds CRC32/CRC64 checksum headers to PUT requests by default. S3-compatible stores (Hetzner Object Storage, Backblaze B2, some MinIO configs) reject these with BadRequest. Now sets `request_checksum_calculation=WhenRequired` for compatibility with both AWS S3 and S3-compatible endpoints. (Port of Python DeltaGlider [6.1.1] fix.)
+- **Disabled automatic request/response checksums**: AWS SDK for Rust (like boto3 1.36+) adds CRC32/CRC64 checksum headers by default. S3-compatible stores (Hetzner Object Storage, Backblaze B2, some MinIO configs) reject these with BadRequest. Now sets both `request_checksum_calculation` and `response_checksum_validation` to `WhenRequired`. (Port of Python DeltaGlider [6.1.1] fix.)
+- **Retry with exponential backoff on PUT**: Hetzner returns transient 400 BadRequest errors (~1-2% of requests) with `connection: close` and no request-id. PUT operations now retry on 400 and 503 with 100/200/400ms backoff (3 retries). Also retries on network/timeout errors.
+- **Verbose S3 error logging**: Every S3 error now logs operation, bucket, HTTP status code, `x-amz-request-id`, and full error details for production debugging.
 
 ### Unmanaged Object Support (Fixes #3, #4)
 
@@ -34,15 +36,22 @@ Objects that exist on the backend storage but were never stored through the prox
 - **Copy object size check**: `copy_object` now verifies actual data size after retrieval, catching cases where fallback metadata reports `file_size=0` that would bypass the pre-copy size check
 - **S3 metadata size validation**: Rejects PUT if DeltaGlider metadata headers exceed S3's 2KB limit, instead of letting the upstream S3 return an opaque 400
 - **Config validation**: Warns on `max_delta_ratio` outside [0.0, 1.0] and `max_object_size=0` at startup
+- **Cache invalidation ordering**: Reference is now deleted from storage BEFORE cache invalidation, preventing concurrent GET from re-caching a stale reference between invalidation and deletion. Fixed in 3 code paths (passthrough fallback, deltaspace cleanup, legacy migration).
 
 ### DRY Cleanup
 
 - **`FileMetadata::fallback()`**: New constructor consolidates 4 duplicate fallback metadata construction sites across S3 and filesystem backends
 - **`Engine::validated_key()`**: Extracts the 5x repeated `ObjectKey::parse + validate_object + deltaspace_id` pattern
+- **`try_unmanaged_passthrough()`**: Extracted 60-line nested match block from `retrieve_stream()` into a focused helper with flat control flow
 
 ### Testing
 
-- 12 new regression tests covering unmanaged object operations (HEAD, GET, LIST, DELETE, mixed managed/unmanaged), HEAD/GET metadata consistency, reserved filename rejection, and copy operations with unmanaged sources
+- 26 new tests (244 total, up from 218): unmanaged object operations, HEAD/GET metadata consistency, reserved filename rejection, copy with unmanaged sources, error discrimination (`io_to_storage_error` unit tests), delta byte-level round-trip integrity, multipart ETag format, user metadata round-trip, external file deletion → 404
+
+### Infrastructure
+
+- Docker build: native ARM64 on Blacksmith runners (no QEMU), cargo-chef for dep caching — ~5x faster builds
+- RustSec: updated deps to fix 6 advisories in aws-lc-sys and rustls-webpki
 
 ## v0.2.0
 
