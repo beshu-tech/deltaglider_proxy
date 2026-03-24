@@ -357,11 +357,6 @@ jobs:
           cargo sbom --output-format spdx_json_2_3 > artifacts/sbom-spdx.json
           echo "SBOM generated ($(wc -c < artifacts/sbom-spdx.json) bytes)"
 
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
-        with:
-          subject-path: "artifacts/*.tar.gz"
-
       - name: Create GitHub Release
         uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
         with:
@@ -373,3 +368,10 @@ jobs:
             artifacts/sbom-spdx.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        timeout-minutes: 10
+        continue-on-error: true
+        with:
+          subject-path: "artifacts/*.tar.gz"
