@@ -102,6 +102,60 @@ impl ConfigDb {
         Ok(())
     }
 
+    // === Row mapping helpers (single source of truth for field order) ===
+
+    /// Map a row from the users table to an IamUser (without permissions).
+    fn user_from_row(row: &rusqlite::Row) -> rusqlite::Result<IamUser> {
+        Ok(IamUser {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            access_key_id: row.get(2)?,
+            secret_access_key: row.get(3)?,
+            enabled: row.get::<_, i32>(4)? != 0,
+            created_at: row.get(5)?,
+            permissions: Vec::new(),
+        })
+    }
+
+    /// Map a row from the permissions table to a Permission.
+    fn permission_from_row(row: &rusqlite::Row) -> rusqlite::Result<Permission> {
+        let actions_json: String = row.get(1)?;
+        let resources_json: String = row.get(2)?;
+        Ok(Permission {
+            id: row.get(0)?,
+            actions: serde_json::from_str(&actions_json).unwrap_or_default(),
+            resources: serde_json::from_str(&resources_json).unwrap_or_default(),
+        })
+    }
+
+    /// Load permissions for a user by ID.
+    fn load_permissions(&self, user_id: i64) -> Result<Vec<Permission>, ConfigDbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, actions, resources FROM permissions WHERE user_id = ?1")?;
+        let perms = stmt
+            .query_map(params![user_id], Self::permission_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(perms)
+    }
+
+    /// Insert permission rows for a user.
+    fn insert_permissions(
+        &self,
+        user_id: i64,
+        permissions: &[Permission],
+    ) -> Result<(), ConfigDbError> {
+        for perm in permissions {
+            let actions_json = serde_json::to_string(&perm.actions).unwrap_or_default();
+            let resources_json = serde_json::to_string(&perm.resources).unwrap_or_default();
+            self.conn.execute(
+                "INSERT INTO permissions (user_id, actions, resources) VALUES (?1, ?2, ?3)",
+                params![user_id, actions_json, resources_json],
+            )?;
+        }
+        Ok(())
+    }
+
     // === User CRUD ===
 
     /// Load all users with their permissions.
@@ -111,38 +165,12 @@ impl ConfigDb {
         )?;
 
         let users: Vec<IamUser> = stmt
-            .query_map([], |row| {
-                Ok(IamUser {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    access_key_id: row.get(2)?,
-                    secret_access_key: row.get(3)?,
-                    enabled: row.get::<_, i32>(4)? != 0,
-                    created_at: row.get(5)?,
-                    permissions: Vec::new(), // filled below
-                })
-            })?
+            .query_map([], Self::user_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
-
-        // Load permissions for each user
-        let mut perm_stmt = self
-            .conn
-            .prepare("SELECT id, actions, resources FROM permissions WHERE user_id = ?")?;
 
         let mut result = Vec::with_capacity(users.len());
         for mut user in users {
-            let perms: Vec<Permission> = perm_stmt
-                .query_map(params![user.id], |row| {
-                    let actions_json: String = row.get(1)?;
-                    let resources_json: String = row.get(2)?;
-                    Ok(Permission {
-                        id: row.get(0)?,
-                        actions: serde_json::from_str(&actions_json).unwrap_or_default(),
-                        resources: serde_json::from_str(&resources_json).unwrap_or_default(),
-                    })
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            user.permissions = perms;
+            user.permissions = self.load_permissions(user.id)?;
             result.push(user);
         }
 
@@ -163,17 +191,7 @@ impl ConfigDb {
             params![name, access_key_id, secret_access_key, enabled as i32],
         )?;
         let user_id = self.conn.last_insert_rowid();
-
-        for perm in permissions {
-            let actions_json = serde_json::to_string(&perm.actions).unwrap_or_default();
-            let resources_json = serde_json::to_string(&perm.resources).unwrap_or_default();
-            self.conn.execute(
-                "INSERT INTO permissions (user_id, actions, resources) VALUES (?1, ?2, ?3)",
-                params![user_id, actions_json, resources_json],
-            )?;
-        }
-
-        // Reload to get all fields including generated ones
+        self.insert_permissions(user_id, permissions)?;
         self.get_user_by_id(user_id)
     }
 
@@ -203,14 +221,7 @@ impl ConfigDb {
                 "DELETE FROM permissions WHERE user_id = ?1",
                 params![user_id],
             )?;
-            for perm in perms {
-                let actions_json = serde_json::to_string(&perm.actions).unwrap_or_default();
-                let resources_json = serde_json::to_string(&perm.resources).unwrap_or_default();
-                self.conn.execute(
-                    "INSERT INTO permissions (user_id, actions, resources) VALUES (?1, ?2, ?3)",
-                    params![user_id, actions_json, resources_json],
-                )?;
-            }
+            self.insert_permissions(user_id, perms)?;
         }
 
         self.get_user_by_id(user_id)
@@ -265,41 +276,13 @@ impl ConfigDb {
     }
 
     fn get_user_by_id(&self, user_id: i64) -> Result<IamUser, ConfigDbError> {
-        let user = self.conn.query_row(
+        let mut user = self.conn.query_row(
             "SELECT id, name, access_key_id, secret_access_key, enabled, created_at FROM users WHERE id = ?1",
             params![user_id],
-            |row| {
-                Ok(IamUser {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    access_key_id: row.get(2)?,
-                    secret_access_key: row.get(3)?,
-                    enabled: row.get::<_, i32>(4)? != 0,
-                    created_at: row.get(5)?,
-                    permissions: Vec::new(),
-                })
-            },
+            Self::user_from_row,
         )?;
-
-        let mut perm_stmt = self
-            .conn
-            .prepare("SELECT id, actions, resources FROM permissions WHERE user_id = ?1")?;
-        let perms: Vec<Permission> = perm_stmt
-            .query_map(params![user_id], |row| {
-                let actions_json: String = row.get(1)?;
-                let resources_json: String = row.get(2)?;
-                Ok(Permission {
-                    id: row.get(0)?,
-                    actions: serde_json::from_str(&actions_json).unwrap_or_default(),
-                    resources: serde_json::from_str(&resources_json).unwrap_or_default(),
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(IamUser {
-            permissions: perms,
-            ..user
-        })
+        user.permissions = self.load_permissions(user_id)?;
+        Ok(user)
     }
 
     // === S3 Sync ===
