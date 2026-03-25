@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Typography, Button, Input, Alert, Space } from 'antd';
+import { Typography, Button, Input, Alert, Space, Spin } from 'antd';
 import { checkSession, adminLogin } from '../adminApi';
 import {
   CloseOutlined,
@@ -126,7 +126,13 @@ export default function AdminOverlay({ open, onClose, onSessionExpired }: AdminO
     );
   }
 
-  if (checkingSession) return null; // brief flash while checking
+  if (checkingSession) {
+    return (
+      <div style={{ position: 'fixed', inset: 0, zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', background: colors.BG_BASE }}>
+        <Spin size="large" />
+      </div>
+    );
+  }
 
   return (
     <div style={{
