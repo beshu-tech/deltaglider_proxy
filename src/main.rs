@@ -411,6 +411,39 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     let shared_config = config.clone().into_shared();
 
+    // Initialize IAM config database (encrypted SQLCipher, next to config file).
+    // Uses the admin password hash as the encryption key. DB starts empty —
+    // IAM mode activates when the first user is created via the admin GUI.
+    let config_db = {
+        let db_path = std::env::var("DGP_CONFIG")
+            .ok()
+            .and_then(|p| std::path::Path::new(&p).parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let db_file = db_path.join("deltaglider_config.db");
+        match deltaglider_proxy::config_db::ConfigDb::open_or_create(&db_file, &admin_password_hash)
+        {
+            Ok(db) => {
+                // If DB has existing users, switch to IAM mode
+                if let Ok(users) = db.load_users() {
+                    if !users.is_empty() {
+                        info!(
+                            "Loaded {} IAM users from {}",
+                            users.len(),
+                            db_file.display()
+                        );
+                        let index = deltaglider_proxy::iam::IamIndex::from_users(users);
+                        iam_state.store(Arc::new(IamState::Iam(index)));
+                    }
+                }
+                Some(tokio::sync::Mutex::new(db))
+            }
+            Err(e) => {
+                warn!("Could not open IAM config database: {} — IAM disabled", e);
+                None
+            }
+        }
+    };
+
     let admin_state = Arc::new(AdminState {
         password_hash: parking_lot::RwLock::new(admin_password_hash),
         sessions: session_store,
@@ -418,7 +451,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         log_reload: log_reload_handle,
         s3_state: state.clone(),
         iam_state,
-        config_db: None, // IAM DB initialized when config_bucket is configured
+        config_db,
     });
 
     // Build TLS config if enabled
