@@ -11,14 +11,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
-use crate::api::auth::{AuthConfig, IamState, SharedIamState};
 use crate::api::handlers::AppState;
 use crate::config::SharedConfig;
 use crate::deltaglider::DynEngine;
+use crate::iam::{AuthConfig, IamState, SharedIamState};
 use crate::session::SessionStore;
-
-/// Re-export for backward compatibility — old code may reference this type.
-pub type SharedAuthConfig = SharedIamState;
 
 /// Type alias for the tracing reload handle.
 pub type LogReloadHandle =
@@ -31,7 +28,7 @@ pub struct AdminState {
     pub config: SharedConfig,
     pub log_reload: LogReloadHandle,
     pub s3_state: Arc<AppState>,
-    pub auth_config: SharedIamState,
+    pub iam_state: SharedIamState,
 }
 
 #[derive(Deserialize)]
@@ -469,7 +466,7 @@ pub async fn update_config(
         } else {
             IamState::Disabled
         };
-        state.auth_config.store(Arc::new(new_state));
+        state.iam_state.store(Arc::new(new_state));
         tracing::info!(
             "Auth credentials hot-reloaded (auth enabled: {})",
             cfg.auth_enabled()

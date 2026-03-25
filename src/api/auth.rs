@@ -14,9 +14,8 @@
 //! downstream by the engine's SHA-256 check).
 
 use super::S3Error;
-use crate::iam::{AuthenticatedUser, IamIndex};
+use crate::iam::{AuthenticatedUser, IamState, SharedIamState};
 use crate::metrics::Metrics;
-use arc_swap::ArcSwap;
 use axum::body::Body;
 use axum::http::Request;
 use axum::middleware::Next;
@@ -27,26 +26,6 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 
 type HmacSha256 = Hmac<Sha256>;
-
-/// Shared auth configuration extracted from Config at startup.
-#[derive(Clone)]
-pub struct AuthConfig {
-    pub access_key_id: String,
-    pub secret_access_key: String,
-}
-
-/// Runtime IAM state — supports legacy single-credential mode and multi-user IAM.
-pub enum IamState {
-    /// No auth configured — open access.
-    Disabled,
-    /// Legacy single credential pair (backward compatible with old config).
-    Legacy(AuthConfig),
-    /// Multi-user IAM with per-user credentials and permissions.
-    Iam(IamIndex),
-}
-
-/// Thread-safe, hot-swappable IAM state.
-pub type SharedIamState = Arc<ArcSwap<IamState>>;
 
 /// Common intermediate representation for SigV4 parameters,
 /// populated from either Authorization header or presigned URL query params.

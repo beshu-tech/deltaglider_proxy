@@ -4,6 +4,7 @@
 //! At runtime, users are indexed in a `HashMap<access_key_id, IamUser>` for
 //! O(1) lookup during SigV4 authentication.
 
+use arc_swap::ArcSwap;
 use axum::body::Body;
 use axum::http::Request;
 use axum::middleware::Next;
@@ -11,7 +12,28 @@ use axum::response::{IntoResponse, Response};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::{debug, warn};
+
+/// Shared auth configuration extracted from Config at startup.
+#[derive(Clone)]
+pub struct AuthConfig {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+}
+
+/// Runtime IAM state — supports legacy single-credential mode and multi-user IAM.
+pub enum IamState {
+    /// No auth configured — open access.
+    Disabled,
+    /// Legacy single credential pair (backward compatible with old config).
+    Legacy(AuthConfig),
+    /// Multi-user IAM with per-user credentials and permissions.
+    Iam(IamIndex),
+}
+
+/// Thread-safe, hot-swappable IAM state.
+pub type SharedIamState = Arc<ArcSwap<IamState>>;
 
 /// An IAM user with S3 credentials and permissions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,8 +274,14 @@ pub async fn authorization_middleware(
     // Determine the S3 action
     let mut action = classify_action(&method, &path);
 
-    // POST /{bucket}?delete is a batch DELETE, not a write
-    if method == axum::http::Method::POST && query.contains("delete") {
+    // POST /{bucket}?delete is a batch DELETE, not a write.
+    // Must check for exact "delete" query parameter, not substring
+    // (otherwise ?delimiter= would also match).
+    if method == axum::http::Method::POST
+        && query
+            .split('&')
+            .any(|p| p == "delete" || p.starts_with("delete="))
+    {
         action = S3Action::Delete;
     }
 
