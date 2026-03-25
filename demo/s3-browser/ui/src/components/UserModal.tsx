@@ -107,7 +107,9 @@ export default function UserModal({ open, user, onClose, onSaved }: UserModalPro
         if (akChanged || skChanged) {
           const rotated = await rotateUserKeys(
             user.id,
-            akChanged ? accessKeyId.trim() : undefined,
+            // Always pass the access key — if unchanged, pass current value
+            // to prevent the backend from auto-generating a new one
+            accessKeyId.trim() || user.access_key_id,
             skChanged ? editSecretKey.trim() : undefined,
           );
           setNewSecret(rotated.secret_access_key ?? null);
