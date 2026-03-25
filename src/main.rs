@@ -6,7 +6,7 @@ use arc_swap::ArcSwap;
 use axum::{extract::DefaultBodyLimit, middleware, routing::get, Router};
 use clap::Parser;
 use deltaglider_proxy::api::admin::AdminState;
-use deltaglider_proxy::api::auth::{sigv4_auth_middleware, AuthConfig, IamState, SharedIamState};
+use deltaglider_proxy::api::auth::sigv4_auth_middleware;
 use deltaglider_proxy::api::handlers::{
     bucket_get_handler, create_bucket, delete_bucket, delete_object, delete_objects, get_object,
     get_stats, head_bucket, head_object, head_root, health_check, list_buckets, post_object,
@@ -15,6 +15,7 @@ use deltaglider_proxy::api::handlers::{
 use deltaglider_proxy::config::{BackendConfig, Config};
 use deltaglider_proxy::deltaglider::DynEngine;
 use deltaglider_proxy::iam::authorization_middleware;
+use deltaglider_proxy::iam::{AuthConfig, IamState, SharedIamState};
 use deltaglider_proxy::metrics::Metrics;
 use deltaglider_proxy::multipart::MultipartStore;
 use deltaglider_proxy::session::SessionStore;
@@ -416,7 +417,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         config: shared_config,
         log_reload: log_reload_handle,
         s3_state: state.clone(),
-        auth_config: iam_state,
+        iam_state,
     });
 
     // Build TLS config if enabled
