@@ -6,8 +6,7 @@ use arc_swap::ArcSwap;
 use axum::{extract::DefaultBodyLimit, middleware, routing::get, Router};
 use clap::Parser;
 use deltaglider_proxy::api::admin::AdminState;
-use deltaglider_proxy::api::admin::SharedAuthConfig;
-use deltaglider_proxy::api::auth::{sigv4_auth_middleware, AuthConfig};
+use deltaglider_proxy::api::auth::{sigv4_auth_middleware, AuthConfig, IamState, SharedIamState};
 use deltaglider_proxy::api::handlers::{
     bucket_get_handler, create_bucket, delete_bucket, delete_object, delete_objects, get_object,
     get_stats, head_bucket, head_object, head_root, health_check, list_buckets, post_object,
@@ -15,6 +14,7 @@ use deltaglider_proxy::api::handlers::{
 };
 use deltaglider_proxy::config::{BackendConfig, Config};
 use deltaglider_proxy::deltaglider::DynEngine;
+use deltaglider_proxy::iam::authorization_middleware;
 use deltaglider_proxy::metrics::Metrics;
 use deltaglider_proxy::multipart::MultipartStore;
 use deltaglider_proxy::session::SessionStore;
@@ -318,18 +318,19 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Build auth config as a hot-swappable ArcSwap so the admin API can
-    // update credentials without a restart.
-    let auth_config: SharedAuthConfig = Arc::new(arc_swap::ArcSwap::from_pointee(
+    // Build IAM state as a hot-swappable ArcSwap so the admin API can
+    // update credentials/users without a restart.
+    // Supports legacy single-credential mode and multi-user IAM.
+    let iam_state: SharedIamState = Arc::new(arc_swap::ArcSwap::from_pointee(
         if let (Some(ref key_id), Some(ref secret)) =
             (&config.access_key_id, &config.secret_access_key)
         {
-            Some(AuthConfig {
+            IamState::Legacy(AuthConfig {
                 access_key_id: key_id.clone(),
                 secret_access_key: secret.clone(),
             })
         } else {
-            None
+            IamState::Disabled
         },
     ));
 
@@ -384,9 +385,11 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             state.clone(),
             deltaglider_proxy::metrics::http_metrics_middleware,
         ))
-        // SigV4 authentication (no-op when auth_config is None)
+        // IAM authorization (checks permissions after auth, before handlers)
+        .layer(middleware::from_fn(authorization_middleware))
+        // SigV4 authentication (looks up user, verifies signature)
         .layer(middleware::from_fn(sigv4_auth_middleware))
-        .layer(axum::Extension(auth_config.clone()))
+        .layer(axum::Extension(iam_state.clone()))
         // Metrics extension for auth middleware to extract
         .layer(axum::Extension(metrics.clone()))
         // Increase body size limit to match max_object_size config (default 2MB is too small)
@@ -413,7 +416,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         config: shared_config,
         log_reload: log_reload_handle,
         s3_state: state.clone(),
-        auth_config,
+        auth_config: iam_state,
     });
 
     // Build TLS config if enabled

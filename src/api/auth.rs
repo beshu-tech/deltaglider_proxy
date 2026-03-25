@@ -14,8 +14,9 @@
 //! downstream by the engine's SHA-256 check).
 
 use super::S3Error;
-use crate::api::admin::SharedAuthConfig;
+use crate::iam::{AuthenticatedUser, IamIndex};
 use crate::metrics::Metrics;
+use arc_swap::ArcSwap;
 use axum::body::Body;
 use axum::http::Request;
 use axum::middleware::Next;
@@ -33,6 +34,19 @@ pub struct AuthConfig {
     pub access_key_id: String,
     pub secret_access_key: String,
 }
+
+/// Runtime IAM state — supports legacy single-credential mode and multi-user IAM.
+pub enum IamState {
+    /// No auth configured — open access.
+    Disabled,
+    /// Legacy single credential pair (backward compatible with old config).
+    Legacy(AuthConfig),
+    /// Multi-user IAM with per-user credentials and permissions.
+    Iam(IamIndex),
+}
+
+/// Thread-safe, hot-swappable IAM state.
+pub type SharedIamState = Arc<ArcSwap<IamState>>;
 
 /// Common intermediate representation for SigV4 parameters,
 /// populated from either Authorization header or presigned URL query params.
@@ -179,20 +193,17 @@ impl SigV4Params {
 
 /// Verify the SigV4 signature against the reconstructed canonical request.
 #[allow(clippy::result_large_err)]
+/// Verify SigV4 signature given the user's secret key.
+/// The access key lookup is done by the caller (middleware) — this function
+/// only verifies the cryptographic signature and clock skew.
 fn verify_signature(
     params: &SigV4Params,
-    auth: &AuthConfig,
+    secret_access_key: &str,
     method: &str,
     uri_path: &str,
     headers: &axum::http::HeaderMap,
     uri: &axum::http::Uri,
 ) -> Result<(), Response> {
-    // Verify the access key matches
-    if params.access_key != auth.access_key_id {
-        debug!("SigV4: access key mismatch");
-        return Err(S3Error::AccessDenied.into_response());
-    }
-
     // Validate clock skew (AWS rejects requests where the date differs
     // from server time by more than 15 minutes — prevents replay attacks)
     if !params.amz_date.is_empty() {
@@ -267,7 +278,7 @@ fn verify_signature(
     debug!("SigV4 string to sign:\n{}", string_to_sign);
 
     // Derive the signing key and compute signature
-    let signing_key = derive_signing_key(&auth.secret_access_key, &params.credential_scope);
+    let signing_key = derive_signing_key(secret_access_key, &params.credential_scope);
     let computed_signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
 
     debug!(
@@ -299,14 +310,14 @@ fn has_presigned_query_params(query: &str) -> bool {
 /// Inserted as a layer around the router. If `auth` is `None` (no credentials
 /// configured), all requests pass through unchanged.
 pub async fn sigv4_auth_middleware(
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Result<Response, Response> {
-    // Auth config is read from an ArcSwap so admin API credential
+    // IAM state is read from an ArcSwap so admin API user management
     // updates take effect immediately without restart.
-    let auth_snapshot = request
+    let iam_snapshot = request
         .extensions()
-        .get::<SharedAuthConfig>()
+        .get::<SharedIamState>()
         .map(|swap| swap.load_full());
 
     let metrics = request.extensions().get::<Arc<Metrics>>().cloned();
@@ -318,11 +329,16 @@ pub async fn sigv4_auth_middleware(
         }
     };
 
-    // If no SharedAuthConfig extension, or credentials are None → open access
-    let auth = match auth_snapshot.as_deref() {
-        Some(Some(a)) => a,
-        _ => return Ok(next.run(request).await),
+    // Determine auth mode from IamState
+    let iam_state = match iam_snapshot.as_deref() {
+        Some(state) => state,
+        None => return Ok(next.run(request).await), // no extension = open access
     };
+
+    // If auth is disabled, pass through
+    if matches!(iam_state, IamState::Disabled) {
+        return Ok(next.run(request).await);
+    }
 
     // Log every incoming request before auth check for debugging
     debug!(
@@ -346,7 +362,6 @@ pub async fn sigv4_auth_middleware(
 
     // Operational endpoints are always unauthenticated — they expose no user data
     // and are needed by monitoring systems (Prometheus, load balancers, admin GUI).
-    // Strip trailing slashes for robustness (e.g., "/health/" should still match).
     let path = request.uri().path().trim_end_matches('/');
     match path {
         "/health" | "/stats" | "/metrics" => {
@@ -366,16 +381,47 @@ pub async fn sigv4_auth_middleware(
         })?
     };
 
-    // PERF: Borrow method and uri_path as &str instead of .to_string(). These are
-    // called on EVERY authenticated request. The old code cloned both into owned
-    // Strings (2 heap allocs) just to pass them to verify_signature, which only
-    // needed &str. Do NOT add .to_string() here.
+    // Look up the user's secret key and build the authenticated identity
+    let (secret_key, authenticated_user) = match iam_state {
+        IamState::Disabled => unreachable!(), // handled above
+        IamState::Legacy(auth) => {
+            if params.access_key != auth.access_key_id {
+                debug!("SigV4: access key mismatch (legacy mode)");
+                record_auth_failure("invalid_access_key");
+                return Err(S3Error::AccessDenied.into_response());
+            }
+            // Legacy user has full access — no AuthenticatedUser inserted
+            (auth.secret_access_key.clone(), None)
+        }
+        IamState::Iam(index) => {
+            let user = match index.get(&params.access_key) {
+                Some(u) => u,
+                None => {
+                    debug!("SigV4: unknown access key '{}'", &params.access_key);
+                    record_auth_failure("invalid_access_key");
+                    return Err(S3Error::AccessDenied.into_response());
+                }
+            };
+            if !user.enabled {
+                debug!("SigV4: user '{}' is disabled", user.name);
+                record_auth_failure("user_disabled");
+                return Err(S3Error::AccessDenied.into_response());
+            }
+            let auth_user = AuthenticatedUser {
+                name: user.name.clone(),
+                access_key_id: user.access_key_id.clone(),
+                permissions: user.permissions.clone(),
+            };
+            (user.secret_access_key.clone(), Some(auth_user))
+        }
+    };
+
     let method = request.method().as_str();
     let uri_path = request.uri().path();
 
     match verify_signature(
         &params,
-        auth,
+        &secret_key,
         method,
         uri_path,
         request.headers(),
@@ -390,6 +436,12 @@ pub async fn sigv4_auth_middleware(
             record_auth_failure("invalid_signature");
             return Err(e);
         }
+    }
+
+    // Insert authenticated user into request extensions (for authorization middleware)
+    if let Some(user) = authenticated_user {
+        debug!("SigV4: authenticated user '{}'", user.name);
+        request.extensions_mut().insert(user);
     }
 
     Ok(next.run(request).await)
