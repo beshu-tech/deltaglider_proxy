@@ -3,6 +3,7 @@ import { Modal, Input, Switch, Select, Button, Alert, Space, Divider, Typography
 import { PlusOutlined, DeleteOutlined } from '@ant-design/icons';
 import type { IamUser, IamPermission, CreateUserRequest, UpdateUserRequest } from '../adminApi';
 import { createUser, updateUser, rotateUserKeys } from '../adminApi';
+import { setCredentials } from '../s3client';
 import { useCardStyles } from './shared-styles';
 import { useColors } from '../ThemeContext';
 
@@ -111,6 +112,15 @@ export default function UserModal({ open, user, onClose, onSaved }: UserModalPro
           );
           setNewSecret(rotated.secret_access_key ?? null);
           setNewAccessKey(rotated.access_key_id);
+
+          // Prevent self-lockout: if the rotated user is the one currently
+          // used by the S3 browser, update the stored credentials so the
+          // browser session doesn't break with 403.
+          const browserAk = localStorage.getItem('dg-access-key-id');
+          if (browserAk === user.access_key_id && rotated.secret_access_key) {
+            setCredentials(rotated.access_key_id, rotated.secret_access_key);
+          }
+
           onSaved();
           // Don't close — show the new secret
           return;
