@@ -330,6 +330,7 @@ export default function App() {
             setSiderOpen(false);
           }}
           onLogout={handleLogout}
+          currentUser={localStorage.getItem('dg-access-key-id') || undefined}
         />
 
         <Layout style={{ flex: 1, background: colors.BG_BASE }}>

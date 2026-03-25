@@ -165,8 +165,19 @@ export async function deleteUser(id: number): Promise<void> {
   if (!res.ok) throw new Error(`Failed to delete user: ${res.status}`);
 }
 
-export async function rotateUserKeys(id: number): Promise<IamUser> {
-  const res = await adminFetch(`/api/admin/users/${id}/rotate-keys`, 'POST');
+export async function rotateUserKeys(
+  id: number,
+  accessKeyId?: string,
+  secretAccessKey?: string,
+): Promise<IamUser> {
+  const body: Record<string, string> = {};
+  if (accessKeyId) body.access_key_id = accessKeyId;
+  if (secretAccessKey) body.secret_access_key = secretAccessKey;
+  const res = await adminFetch(
+    `/api/admin/users/${id}/rotate-keys`,
+    'POST',
+    Object.keys(body).length > 0 ? body : undefined,
+  );
   if (!res.ok) throw new Error(`Failed to rotate keys: ${res.status}`);
   return res.json();
 }

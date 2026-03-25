@@ -775,20 +775,58 @@ fn mask_user(user: &IamUser) -> IamUser {
 
 /// Rebuild the in-memory IamIndex from the database and store it.
 /// If no users exist, restores Disabled mode to avoid locking out all access.
+/// On first IAM user creation (Legacy → IAM transition), auto-migrates the
+/// legacy TOML credentials as a "legacy-admin" user with full access so
+/// existing S3 clients don't break.
 fn rebuild_iam_index(db: &ConfigDb, iam_state: &SharedIamState) -> Result<(), StatusCode> {
-    let users = db.load_users().map_err(|e| {
+    let mut users = db.load_users().map_err(|e| {
         tracing::error!("Failed to load users from config DB: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     if users.is_empty() {
         tracing::info!("No IAM users in database — disabling auth (open access)");
         iam_state.store(Arc::new(IamState::Disabled));
-    } else {
-        let count = users.len();
-        let index = IamIndex::from_users(users);
-        iam_state.store(Arc::new(IamState::Iam(index)));
-        tracing::debug!("IAM index rebuilt with {} users", count);
+        return Ok(());
     }
+
+    // Migrate legacy credentials on first IAM user creation so existing
+    // S3 clients continue working after the switch to IAM mode.
+    let current = iam_state.load();
+    if let IamState::Legacy(ref legacy) = **current {
+        let already_migrated = users
+            .iter()
+            .any(|u| u.access_key_id == legacy.access_key_id);
+        if !already_migrated {
+            let admin_perms = vec![Permission {
+                id: 0,
+                actions: vec!["*".into()],
+                resources: vec!["*".into()],
+            }];
+            match db.create_user(
+                "legacy-admin",
+                &legacy.access_key_id,
+                &legacy.secret_access_key,
+                true,
+                &admin_perms,
+            ) {
+                Ok(migrated) => {
+                    tracing::info!(
+                        "Migrated legacy credentials to IAM user 'legacy-admin' ({})",
+                        migrated.access_key_id
+                    );
+                    users.push(migrated);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to migrate legacy credentials: {}", e);
+                }
+            }
+        }
+    }
+
+    let count = users.len();
+    let index = IamIndex::from_users(users);
+    iam_state.store(Arc::new(IamState::Iam(index)));
+    tracing::debug!("IAM index rebuilt with {} users", count);
     Ok(())
 }
 
@@ -890,16 +928,35 @@ pub async fn delete_user(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// POST /api/admin/users/:id/rotate-keys — regenerate access keys.
+#[derive(Deserialize)]
+pub struct RotateKeysRequest {
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
+}
+
+/// POST /api/admin/users/:id/rotate-keys — set or regenerate access keys.
+/// If access_key_id or secret_access_key are provided, uses those values.
+/// Otherwise auto-generates new ones.
 pub async fn rotate_user_keys(
     State(state): State<Arc<AdminState>>,
     axum::extract::Path(user_id): axum::extract::Path<i64>,
+    body: Option<Json<RotateKeysRequest>>,
 ) -> Result<Json<IamUser>, StatusCode> {
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let db = db.lock().await;
 
-    let new_access_key = iam::generate_access_key_id();
-    let new_secret_key = iam::generate_secret_access_key();
+    let (new_access_key, new_secret_key) = match body {
+        Some(Json(req)) => (
+            req.access_key_id
+                .unwrap_or_else(iam::generate_access_key_id),
+            req.secret_access_key
+                .unwrap_or_else(iam::generate_secret_access_key),
+        ),
+        None => (
+            iam::generate_access_key_id(),
+            iam::generate_secret_access_key(),
+        ),
+    };
 
     let user = db
         .rotate_keys(user_id, &new_access_key, &new_secret_key)
