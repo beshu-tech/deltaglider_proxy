@@ -43,6 +43,7 @@ interface Props {
   onSettingsClick?: () => void;
   onMetricsClick?: () => void;
   onLogout?: () => void;
+  currentUser?: string;
 }
 
 export default function Sidebar({
@@ -56,6 +57,7 @@ export default function Sidebar({
   onSettingsClick,
   onMetricsClick,
   onLogout,
+  currentUser,
 }: Props) {
   const {
     BG_SIDEBAR, BORDER, TEXT_PRIMARY, TEXT_SECONDARY,
@@ -293,16 +295,27 @@ export default function Sidebar({
               <span>Documentation</span>
             </a>
             {onLogout && (
-              <button
-                className="btn-reset"
-                onClick={onLogout}
-                style={menuItemStyle}
-                onMouseEnter={(e) => { e.currentTarget.style.color = ACCENT_RED; }}
-                onMouseLeave={(e) => { e.currentTarget.style.color = TEXT_SECONDARY; }}
+              <Popconfirm
+                title="Disconnect?"
+                description="This will clear your credentials and return to the login screen."
+                onConfirm={onLogout}
+                okText="Disconnect"
+                okButtonProps={{ danger: true }}
               >
-                <LogoutOutlined aria-hidden="true" style={MENU_ICON_STYLE} />
-                <span>Logout</span>
-              </button>
+                <Tooltip title="Disconnect & clear credentials" placement="right">
+                  <button
+                    className="btn-reset"
+                    style={menuItemStyle}
+                    onMouseEnter={(e) => { e.currentTarget.style.color = ACCENT_RED; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.color = TEXT_SECONDARY; }}
+                  >
+                    <LogoutOutlined aria-hidden="true" style={MENU_ICON_STYLE} />
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {currentUser || 'Logout'}
+                    </span>
+                  </button>
+                </Tooltip>
+              </Popconfirm>
             )}
           </nav>
         </div>

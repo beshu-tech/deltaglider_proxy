@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
-import { Modal, Input, Switch, Select, Button, Alert, Space, Divider, Typography, message } from 'antd';
-import { PlusOutlined, DeleteOutlined, CopyOutlined, ReloadOutlined } from '@ant-design/icons';
+import { Modal, Input, Switch, Select, Button, Alert, Space, Divider, Typography } from 'antd';
+import { PlusOutlined, DeleteOutlined } from '@ant-design/icons';
 import type { IamUser, IamPermission, CreateUserRequest, UpdateUserRequest } from '../adminApi';
 import { createUser, updateUser, rotateUserKeys } from '../adminApi';
 import { useCardStyles } from './shared-styles';
@@ -57,6 +57,7 @@ export default function UserModal({ open, user, onClose, onSaved }: UserModalPro
 
   const [name, setName] = useState('');
   const [accessKeyId, setAccessKeyId] = useState('');
+  const [editSecretKey, setEditSecretKey] = useState('');
   const [enabled, setEnabled] = useState(true);
   const [permissions, setPermissions] = useState<PermissionRow[]>([]);
   const [saving, setSaving] = useState(false);
@@ -69,11 +70,13 @@ export default function UserModal({ open, user, onClose, onSaved }: UserModalPro
       if (user) {
         setName(user.name);
         setAccessKeyId(user.access_key_id);
+        setEditSecretKey('');
         setEnabled(user.enabled);
         setPermissions(permissionsToRows(user.permissions));
       } else {
         setName('');
         setAccessKeyId('');
+        setEditSecretKey('');
         setEnabled(true);
         setPermissions([]);
       }
@@ -89,12 +92,30 @@ export default function UserModal({ open, user, onClose, onSaved }: UserModalPro
     setError('');
     try {
       if (isEdit) {
+        // Save name, enabled, permissions
         const req: UpdateUserRequest = {
           name: name.trim(),
           enabled,
           permissions: rowsToPermissions(permissions),
         };
         await updateUser(user.id, req);
+
+        // If access key or secret changed, update keys too
+        const akChanged = accessKeyId.trim() && accessKeyId.trim() !== user.access_key_id;
+        const skChanged = editSecretKey.trim().length > 0;
+        if (akChanged || skChanged) {
+          const rotated = await rotateUserKeys(
+            user.id,
+            akChanged ? accessKeyId.trim() : undefined,
+            skChanged ? editSecretKey.trim() : undefined,
+          );
+          setNewSecret(rotated.secret_access_key ?? null);
+          setNewAccessKey(rotated.access_key_id);
+          onSaved();
+          // Don't close — show the new secret
+          return;
+        }
+
         onSaved();
         onClose();
       } else {
@@ -116,29 +137,7 @@ export default function UserModal({ open, user, onClose, onSaved }: UserModalPro
     }
   };
 
-  const handleRotateKeys = async () => {
-    if (!user) return;
-    setSaving(true);
-    setError('');
-    try {
-      const rotated = await rotateUserKeys(user.id);
-      setNewSecret(rotated.secret_access_key ?? null);
-      setNewAccessKey(rotated.access_key_id);
-      onSaved();
-      message.success('Keys rotated');
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Key rotation failed');
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const copyToClipboard = (text: string, label: string) => {
-    navigator.clipboard.writeText(text).then(
-      () => message.success(`${label} copied`),
-      () => message.error('Copy failed'),
-    );
-  };
+  // No separate rotate handler — key changes are saved via the main Save button
 
   const addPermissionRow = () => {
     setPermissions([...permissions, { actions: [], resources: '' }]);
@@ -236,21 +235,27 @@ export default function UserModal({ open, user, onClose, onSaved }: UserModalPro
         <Text type="secondary" style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 600 }}>
           Access Key ID {!isEdit && <Text type="secondary" style={{ fontSize: 10, textTransform: 'none', fontWeight: 400 }}>(auto-generated if empty)</Text>}
         </Text>
-        {isEdit ? (
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 4 }}>
-            <Text code style={{ fontFamily: 'var(--font-mono)' }}>{user?.access_key_id}</Text>
-            <Button size="small" icon={<CopyOutlined />} onClick={() => copyToClipboard(user?.access_key_id ?? '', 'Access Key')} />
-            <Button size="small" icon={<ReloadOutlined />} onClick={handleRotateKeys} loading={saving}>Rotate Keys</Button>
-          </div>
-        ) : (
-          <Input
-            value={accessKeyId}
-            onChange={e => setAccessKeyId(e.target.value)}
-            placeholder="e.g. ci-bot@mycompany.com or leave empty"
+        <Input
+          value={accessKeyId}
+          onChange={e => setAccessKeyId(e.target.value)}
+          placeholder={isEdit ? user?.access_key_id : 'e.g. ci-bot@mycompany.com or leave empty'}
+          style={{ ...inputRadius, marginTop: 4, fontFamily: 'var(--font-mono)' }}
+        />
+      </div>
+
+      {isEdit && (
+        <div style={{ marginBottom: 16 }}>
+          <Text type="secondary" style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 600 }}>
+            Secret Access Key <Text type="secondary" style={{ fontSize: 10, textTransform: 'none', fontWeight: 400 }}>(leave empty to keep current)</Text>
+          </Text>
+          <Input.Password
+            value={editSecretKey}
+            onChange={e => setEditSecretKey(e.target.value)}
+            placeholder="Enter new secret or leave empty to keep current"
             style={{ ...inputRadius, marginTop: 4, fontFamily: 'var(--font-mono)' }}
           />
-        )}
-      </div>
+        </div>
+      )}
 
       <div style={{ marginBottom: 16, display: 'flex', alignItems: 'center', gap: 12 }}>
         <Text type="secondary" style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 600 }}>Enabled</Text>
