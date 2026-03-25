@@ -418,6 +418,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         log_reload: log_reload_handle,
         s3_state: state.clone(),
         iam_state,
+        config_db: None, // IAM DB initialized when config_bucket is configured
     });
 
     // Build TLS config if enabled

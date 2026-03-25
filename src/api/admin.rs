@@ -13,8 +13,9 @@ use tracing_subscriber::EnvFilter;
 
 use crate::api::handlers::AppState;
 use crate::config::SharedConfig;
+use crate::config_db::ConfigDb;
 use crate::deltaglider::DynEngine;
-use crate::iam::{AuthConfig, IamState, SharedIamState};
+use crate::iam::{self, AuthConfig, IamIndex, IamState, IamUser, Permission, SharedIamState};
 use crate::session::SessionStore;
 
 /// Type alias for the tracing reload handle.
@@ -29,6 +30,8 @@ pub struct AdminState {
     pub log_reload: LogReloadHandle,
     pub s3_state: Arc<AppState>,
     pub iam_state: SharedIamState,
+    /// Encrypted config database for IAM users (None in legacy/open-access mode).
+    pub config_db: Option<tokio::sync::Mutex<ConfigDb>>,
 }
 
 #[derive(Deserialize)]
@@ -736,6 +739,172 @@ fn extract_session_token(headers: &HeaderMap) -> Option<String> {
             part.strip_prefix("dgp_session=")
                 .map(|value| value.to_string())
         })
+}
+
+// === IAM User Management Handlers ===
+
+#[derive(Deserialize)]
+pub struct CreateUserRequest {
+    pub name: String,
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub permissions: Vec<Permission>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+pub struct UpdateUserRequest {
+    pub name: Option<String>,
+    pub enabled: Option<bool>,
+    pub permissions: Option<Vec<Permission>>,
+}
+
+/// Mask the secret_access_key for API responses (shown only on create/rotate).
+fn mask_user(user: &IamUser) -> IamUser {
+    IamUser {
+        secret_access_key: "****".to_string(),
+        ..user.clone()
+    }
+}
+
+/// Rebuild the in-memory IamIndex from the database and store it.
+fn rebuild_iam_index(db: &ConfigDb, iam_state: &SharedIamState) -> Result<(), StatusCode> {
+    let users = db.load_users().map_err(|e| {
+        tracing::error!("Failed to load users from config DB: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let index = IamIndex::from_users(users);
+    iam_state.store(Arc::new(IamState::Iam(index)));
+    Ok(())
+}
+
+/// GET /api/admin/users — list all users (secrets masked).
+pub async fn list_users(
+    State(state): State<Arc<AdminState>>,
+) -> Result<Json<Vec<IamUser>>, StatusCode> {
+    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let db = db.lock().await;
+    let users = db.load_users().map_err(|e| {
+        tracing::error!("Failed to load users: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(users.iter().map(mask_user).collect()))
+}
+
+/// POST /api/admin/users — create a new user (returns full secret once).
+pub async fn create_user(
+    State(state): State<Arc<AdminState>>,
+    Json(body): Json<CreateUserRequest>,
+) -> Result<(StatusCode, Json<IamUser>), StatusCode> {
+    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let db = db.lock().await;
+
+    let access_key_id = body
+        .access_key_id
+        .unwrap_or_else(iam::generate_access_key_id);
+    let secret_access_key = body
+        .secret_access_key
+        .unwrap_or_else(iam::generate_secret_access_key);
+
+    let user = db
+        .create_user(
+            &body.name,
+            &access_key_id,
+            &secret_access_key,
+            body.enabled,
+            &body.permissions,
+        )
+        .map_err(|e| {
+            tracing::warn!("Failed to create user '{}': {}", body.name, e);
+            StatusCode::CONFLICT
+        })?;
+
+    rebuild_iam_index(&db, &state.iam_state)?;
+
+    tracing::info!("IAM user '{}' created ({})", user.name, user.access_key_id);
+    // Return full user including secret (shown only once)
+    Ok((StatusCode::CREATED, Json(user)))
+}
+
+/// PUT /api/admin/users/:id — update a user.
+pub async fn update_user(
+    State(state): State<Arc<AdminState>>,
+    axum::extract::Path(user_id): axum::extract::Path<i64>,
+    Json(body): Json<UpdateUserRequest>,
+) -> Result<Json<IamUser>, StatusCode> {
+    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let db = db.lock().await;
+
+    let user = db
+        .update_user(
+            user_id,
+            body.name.as_deref(),
+            body.enabled,
+            body.permissions.as_deref(),
+        )
+        .map_err(|e| {
+            tracing::warn!("Failed to update user {}: {}", user_id, e);
+            StatusCode::NOT_FOUND
+        })?;
+
+    rebuild_iam_index(&db, &state.iam_state)?;
+
+    tracing::info!("IAM user '{}' updated", user.name);
+    Ok(Json(mask_user(&user)))
+}
+
+/// DELETE /api/admin/users/:id — delete a user.
+pub async fn delete_user(
+    State(state): State<Arc<AdminState>>,
+    axum::extract::Path(user_id): axum::extract::Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let db = db.lock().await;
+
+    db.delete_user(user_id).map_err(|e| {
+        tracing::warn!("Failed to delete user {}: {}", user_id, e);
+        StatusCode::NOT_FOUND
+    })?;
+
+    rebuild_iam_index(&db, &state.iam_state)?;
+
+    tracing::info!("IAM user {} deleted", user_id);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /api/admin/users/:id/rotate-keys — regenerate access keys.
+pub async fn rotate_user_keys(
+    State(state): State<Arc<AdminState>>,
+    axum::extract::Path(user_id): axum::extract::Path<i64>,
+) -> Result<Json<IamUser>, StatusCode> {
+    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let db = db.lock().await;
+
+    let new_access_key = iam::generate_access_key_id();
+    let new_secret_key = iam::generate_secret_access_key();
+
+    let user = db
+        .rotate_keys(user_id, &new_access_key, &new_secret_key)
+        .map_err(|e| {
+            tracing::warn!("Failed to rotate keys for user {}: {}", user_id, e);
+            StatusCode::NOT_FOUND
+        })?;
+
+    rebuild_iam_index(&db, &state.iam_state)?;
+
+    tracing::info!(
+        "IAM user '{}' keys rotated (new: {})",
+        user.name,
+        user.access_key_id
+    );
+    // Return full user including new secret (shown only once)
+    Ok(Json(user))
 }
 
 #[cfg(test)]
