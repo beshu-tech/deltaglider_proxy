@@ -6,6 +6,7 @@ import TopBar from './components/TopBar';
 import Sidebar from './components/Sidebar';
 import ObjectTable from './components/ObjectTable';
 import InspectorPanel from './components/InspectorPanel';
+import FilePreview from './components/FilePreview';
 import DropZone from './components/DropZone';
 import UploadPage from './components/UploadPage';
 import ConnectPage from './components/ConnectPage';
@@ -152,6 +153,7 @@ export default function App() {
   const [needsConnect, setNeedsConnect] = useState(!hasCredentials());
   const [firstLoadDone, setFirstLoadDone] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
+  const [previewObject, setPreviewObject] = useState<import('./types').S3Object | null>(null);
 
   // Check admin session on mount
   useEffect(() => {
@@ -298,8 +300,14 @@ export default function App() {
               refreshing={s3.refreshing}
               headCache={s3.headCache}
               onEnrichKeys={s3.enrichKeys}
+              onPreview={setPreviewObject}
             />
           )}
+          <FilePreview
+            open={previewObject !== null}
+            object={previewObject}
+            onClose={() => setPreviewObject(null)}
+          />
         </div>
       </>
     );
