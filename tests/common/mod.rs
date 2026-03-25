@@ -35,6 +35,8 @@ pub struct TestServer {
     port: u16,
     _data_dir: Option<TempDir>,
     bucket: String,
+    /// Auth credentials for the test server (None = open access).
+    auth_creds: Option<(String, String)>,
 }
 
 impl TestServer {
@@ -106,7 +108,12 @@ impl TestServer {
 
     /// Allocate a port, write a TOML config, spawn the proxy, wait for readiness,
     /// and create the test bucket. All factory methods delegate here.
-    async fn spawn_with_config(config_body: &str, bucket: &str, data_dir: Option<TempDir>) -> Self {
+    async fn spawn_with_config(
+        config_body: &str,
+        bucket: &str,
+        data_dir: Option<TempDir>,
+        auth_creds: Option<(String, String)>,
+    ) -> Self {
         let port = PORT_COUNTER.fetch_add(2, Ordering::SeqCst);
 
         // Build full config with listen_addr prepended
@@ -130,6 +137,7 @@ impl TestServer {
             port,
             _data_dir: data_dir,
             bucket: bucket.to_string(),
+            auth_creds,
         };
         server.wait_ready().await;
         server.ensure_bucket().await;
@@ -163,9 +171,18 @@ impl TestServer {
         let _ = client.create_bucket().bucket(&self.bucket).send().await;
     }
 
-    /// Create an S3 client configured for this test server
+    /// Create an S3 client configured for this test server (uses server's auth creds if set).
     pub async fn s3_client(&self) -> Client {
-        let credentials = Credentials::new("test", "test", None, None, "test");
+        let (key, secret) = match &self.auth_creds {
+            Some((k, s)) => (k.as_str(), s.as_str()),
+            None => ("test", "test"),
+        };
+        self.s3_client_with_creds(key, secret).await
+    }
+
+    /// Create an S3 client with specific credentials.
+    pub async fn s3_client_with_creds(&self, access_key: &str, secret_key: &str) -> Client {
+        let credentials = Credentials::new(access_key, secret_key, None, None, "test");
 
         let config = aws_sdk_s3::Config::builder()
             .behavior_version(BehaviorVersion::latest())
@@ -210,6 +227,8 @@ pub struct TestServerBuilder {
     codec_concurrency: Option<usize>,
     /// When set, uses S3 backend pointing at this endpoint instead of filesystem.
     s3_endpoint: Option<String>,
+    /// SigV4 auth credentials (access_key_id, secret_access_key).
+    auth_creds: Option<(String, String)>,
 }
 
 impl Default for TestServerBuilder {
@@ -220,6 +239,7 @@ impl Default for TestServerBuilder {
             max_object_size: None,
             codec_concurrency: None,
             s3_endpoint: None,
+            auth_creds: None,
         }
     }
 }
@@ -250,10 +270,16 @@ impl TestServerBuilder {
         self
     }
 
+    pub fn auth(mut self, access_key_id: &str, secret_access_key: &str) -> Self {
+        self.auth_creds = Some((access_key_id.to_string(), secret_access_key.to_string()));
+        self
+    }
+
     /// Build the TOML config string and spawn the test server.
     pub async fn build(self) -> TestServer {
         let (config, data_dir) = self.build_config();
-        TestServer::spawn_with_config(&config, &self.bucket, data_dir).await
+        let auth = self.auth_creds.clone();
+        TestServer::spawn_with_config(&config, &self.bucket, data_dir, auth).await
     }
 
     /// Assemble a TOML config string (and optional TempDir for filesystem backend).
@@ -269,6 +295,12 @@ impl TestServerBuilder {
         }
         if let Some(n) = self.codec_concurrency {
             config.push_str(&format!("codec_concurrency = {}\n", n));
+        }
+        if let Some((ref key_id, ref secret)) = self.auth_creds {
+            config.push_str(&format!(
+                "access_key_id = \"{}\"\nsecret_access_key = \"{}\"\n",
+                key_id, secret
+            ));
         }
 
         // Backend section
