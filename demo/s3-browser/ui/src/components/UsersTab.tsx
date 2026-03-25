@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Table, Button, Tag, Alert, Space, Popconfirm, Typography, Spin, message } from 'antd';
-import { PlusOutlined, ReloadOutlined, CopyOutlined } from '@ant-design/icons';
+import { PlusOutlined, ReloadOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import type { IamUser } from '../adminApi';
 import { getUsers, deleteUser } from '../adminApi';
@@ -66,72 +66,63 @@ export default function UsersTab({ onSessionExpired }: UsersTabProps) {
     setModalOpen(true);
   };
 
+  const colHeader = (text: string) => (
+    <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: 0.5, whiteSpace: 'nowrap' }}>{text}</span>
+  );
+
   const columns: ColumnsType<IamUser> = [
     {
-      title: <Text type="secondary" style={{ fontSize: 11, fontWeight: 600, letterSpacing: 0.5 }}>NAME</Text>,
+      title: colHeader('Name'),
       dataIndex: 'name',
       key: 'name',
+      width: 120,
+      ellipsis: true,
       render: (text: string) => <Text strong>{text}</Text>,
     },
     {
-      title: <Text type="secondary" style={{ fontSize: 11, fontWeight: 600, letterSpacing: 0.5 }}>ACCESS KEY</Text>,
+      title: colHeader('Access Key'),
       dataIndex: 'access_key_id',
       key: 'access_key_id',
-      width: 200,
+      width: 150,
       render: (text: string) => (
-        <Space size={4}>
-          <Text code style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>
-            {text.substring(0, 8)}...{text.substring(text.length - 4)}
-          </Text>
-          <Button
-            type="text"
-            size="small"
-            icon={<CopyOutlined />}
-            onClick={e => {
-              e.stopPropagation();
-              navigator.clipboard.writeText(text).then(
-                () => message.success('Access key copied'),
-                () => message.error('Copy failed'),
-              );
-            }}
-          />
-        </Space>
+        <Text code copyable={{ tooltips: false }} style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }}>
+          {text.substring(0, 6)}...{text.substring(text.length - 4)}
+        </Text>
       ),
     },
     {
-      title: <Text type="secondary" style={{ fontSize: 11, fontWeight: 600, letterSpacing: 0.5 }}>STATUS</Text>,
+      title: colHeader('Status'),
       dataIndex: 'enabled',
       key: 'enabled',
-      width: 90,
+      width: 75,
       render: (enabled: boolean) => (
-        <Tag color={enabled ? 'green' : 'default'}>{enabled ? 'Active' : 'Disabled'}</Tag>
+        <Tag color={enabled ? 'green' : 'default'} style={{ margin: 0 }}>{enabled ? 'Active' : 'Off'}</Tag>
       ),
     },
     {
-      title: <Text type="secondary" style={{ fontSize: 11, fontWeight: 600, letterSpacing: 0.5 }}>PERMISSIONS</Text>,
+      title: colHeader('Perms'),
       key: 'permissions',
-      width: 120,
+      width: 80,
       render: (_: unknown, record: IamUser) => {
         const summary = permissionSummary(record);
         const color = summary === 'Full admin' ? 'blue' : summary === 'No access' ? 'default' : 'cyan';
-        return <Tag color={color}>{summary}</Tag>;
+        return <Tag color={color} style={{ margin: 0 }}>{summary}</Tag>;
       },
     },
     {
-      title: <Text type="secondary" style={{ fontSize: 11, fontWeight: 600, letterSpacing: 0.5 }}>ACTIONS</Text>,
+      title: colHeader(''),
       key: 'actions',
-      width: 140,
+      width: 100,
       render: (_: unknown, record: IamUser) => (
-        <Space size={4}>
-          <Button type="text" size="small" onClick={() => handleEdit(record)}>Edit</Button>
+        <Space size={0}>
+          <Button type="link" size="small" onClick={() => handleEdit(record)}>Edit</Button>
           <Popconfirm
-            title={`Delete user "${record.name}"?`}
-            description="This cannot be undone."
+            title={`Delete "${record.name}"?`}
             onConfirm={() => handleDelete(record)}
             okText="Delete"
             okButtonProps={{ danger: true }}
           >
-            <Button type="text" danger size="small">Delete</Button>
+            <Button type="link" danger size="small">Del</Button>
           </Popconfirm>
         </Space>
       ),
@@ -182,6 +173,7 @@ export default function UsersTab({ onSessionExpired }: UsersTabProps) {
               rowKey="id"
               pagination={false}
               size="small"
+              scroll={{ x: 560 }}
               style={{ borderRadius: 8 }}
               locale={{ emptyText: 'No users' }}
             />

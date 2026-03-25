@@ -565,7 +565,7 @@ export default function SettingsPage({ onBack, onSessionExpired }: Props) {
   ];
 
   return (
-    <div className="animate-fade-in" style={{ maxWidth: 640, width: '100%', margin: '0 auto', padding: 'clamp(16px, 3vw, 24px) clamp(12px, 2vw, 16px)' }}>
+    <div className="animate-fade-in" style={{ maxWidth: 800, width: '100%', margin: '0 auto', padding: 'clamp(16px, 3vw, 24px) clamp(12px, 2vw, 16px)' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
         <Title level={4} style={{ margin: 0, fontFamily: "var(--font-ui)", fontWeight: 700 }}>Settings</Title>
         <Button onClick={onBack} size="small" icon={<ArrowLeftOutlined />} style={inputRadius}>Back</Button>

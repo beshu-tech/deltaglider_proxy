@@ -56,6 +56,7 @@ export default function UserModal({ open, user, onClose, onSaved }: UserModalPro
   const colors = useColors();
 
   const [name, setName] = useState('');
+  const [accessKeyId, setAccessKeyId] = useState('');
   const [enabled, setEnabled] = useState(true);
   const [permissions, setPermissions] = useState<PermissionRow[]>([]);
   const [saving, setSaving] = useState(false);
@@ -67,10 +68,12 @@ export default function UserModal({ open, user, onClose, onSaved }: UserModalPro
     if (open) {
       if (user) {
         setName(user.name);
+        setAccessKeyId(user.access_key_id);
         setEnabled(user.enabled);
         setPermissions(permissionsToRows(user.permissions));
       } else {
         setName('');
+        setAccessKeyId('');
         setEnabled(true);
         setPermissions([]);
       }
@@ -99,6 +102,7 @@ export default function UserModal({ open, user, onClose, onSaved }: UserModalPro
           name: name.trim(),
           enabled,
           permissions: rowsToPermissions(permissions),
+          ...(accessKeyId.trim() ? { access_key_id: accessKeyId.trim() } : {}),
         };
         const created = await createUser(req);
         setNewSecret(created.secret_access_key ?? null);
@@ -194,7 +198,7 @@ export default function UserModal({ open, user, onClose, onSaved }: UserModalPro
       open={open}
       title={isEdit ? `Edit User: ${user?.name}` : 'Create User'}
       onCancel={onClose}
-      width={600}
+      width={720}
       footer={
         <Space>
           <Button onClick={onClose}>Cancel</Button>
@@ -228,16 +232,25 @@ export default function UserModal({ open, user, onClose, onSaved }: UserModalPro
         <Input value={name} onChange={e => setName(e.target.value)} placeholder="e.g. ci-bot" style={{ ...inputRadius, marginTop: 4 }} />
       </div>
 
-      {isEdit && (
-        <div style={{ marginBottom: 16 }}>
-          <Text type="secondary" style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 600 }}>Access Key</Text>
+      <div style={{ marginBottom: 16 }}>
+        <Text type="secondary" style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 600 }}>
+          Access Key ID {!isEdit && <Text type="secondary" style={{ fontSize: 10, textTransform: 'none', fontWeight: 400 }}>(auto-generated if empty)</Text>}
+        </Text>
+        {isEdit ? (
           <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 4 }}>
             <Text code style={{ fontFamily: 'var(--font-mono)' }}>{user?.access_key_id}</Text>
             <Button size="small" icon={<CopyOutlined />} onClick={() => copyToClipboard(user?.access_key_id ?? '', 'Access Key')} />
             <Button size="small" icon={<ReloadOutlined />} onClick={handleRotateKeys} loading={saving}>Rotate Keys</Button>
           </div>
-        </div>
-      )}
+        ) : (
+          <Input
+            value={accessKeyId}
+            onChange={e => setAccessKeyId(e.target.value)}
+            placeholder="e.g. ci-bot@mycompany.com or leave empty"
+            style={{ ...inputRadius, marginTop: 4, fontFamily: 'var(--font-mono)' }}
+          />
+        )}
+      </div>
 
       <div style={{ marginBottom: 16, display: 'flex', alignItems: 'center', gap: 12 }}>
         <Text type="secondary" style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 600 }}>Enabled</Text>
