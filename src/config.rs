@@ -445,7 +445,7 @@ impl Config {
     pub fn validate(&self) {
         if self.max_delta_ratio < 0.0 || self.max_delta_ratio > 1.0 {
             eprintln!(
-                "Warning: max_delta_ratio={} is outside [0.0, 1.0], clamping to range",
+                "Warning: max_delta_ratio={} is outside [0.0, 1.0] — delta compression decisions may behave unexpectedly",
                 self.max_delta_ratio
             );
         }
