@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Modal, Input, Switch, Select, Button, Alert, Space, Divider, Typography } from 'antd';
+import { Modal, Input, Switch, Select, Button, Alert, Space, Divider, Typography, Popconfirm } from 'antd';
 import { PlusOutlined, DeleteOutlined } from '@ant-design/icons';
 import type { IamUser, IamPermission, CreateUserRequest, UpdateUserRequest } from '../adminApi';
 import { createUser, updateUser, rotateUserKeys } from '../adminApi';
@@ -87,13 +87,18 @@ export default function UserModal({ open, user, onClose, onSaved }: UserModalPro
     }
   }, [open, user]);
 
-  const handleSave = async () => {
+  // Whether key changes need confirmation before save
+  const hasKeyChanges = isEdit && (
+    (accessKeyId.trim() && accessKeyId.trim() !== user?.access_key_id) ||
+    editSecretKey.trim().length > 0
+  );
+
+  const doSave = async () => {
     if (!name.trim()) { setError('Name is required'); return; }
     setSaving(true);
     setError('');
     try {
       if (isEdit) {
-        // Save name, enabled, permissions
         const req: UpdateUserRequest = {
           name: name.trim(),
           enabled,
@@ -101,31 +106,24 @@ export default function UserModal({ open, user, onClose, onSaved }: UserModalPro
         };
         await updateUser(user.id, req);
 
-        // If access key or secret changed, update keys too
         const akChanged = accessKeyId.trim() && accessKeyId.trim() !== user.access_key_id;
         const skChanged = editSecretKey.trim().length > 0;
         if (akChanged || skChanged) {
           const rotated = await rotateUserKeys(
             user.id,
-            // Always pass the access key — if unchanged, pass current value
-            // to prevent the backend from auto-generating a new one
             accessKeyId.trim() || user.access_key_id,
             skChanged ? editSecretKey.trim() : undefined,
           );
           setNewSecret(rotated.secret_access_key ?? null);
           setNewAccessKey(rotated.access_key_id);
 
-          // Prevent self-lockout: if the rotated user is the one currently
-          // used by the S3 browser, update the stored credentials so the
-          // browser session doesn't break with 403.
           const browserAk = localStorage.getItem('dg-access-key-id');
           if (browserAk === user.access_key_id && rotated.secret_access_key) {
             setCredentials(rotated.access_key_id, rotated.secret_access_key);
           }
 
           onSaved();
-          // Don't close — show the new secret
-          return;
+          return; // stay open to show credentials
         }
 
         onSaved();
@@ -149,7 +147,14 @@ export default function UserModal({ open, user, onClose, onSaved }: UserModalPro
     }
   };
 
-  // No separate rotate handler — key changes are saved via the main Save button
+  const handleSave = () => {
+    if (hasKeyChanges) {
+      // Confirmation handled by Popconfirm on the Save button
+      doSave();
+    } else {
+      doSave();
+    }
+  };
 
   const addPermissionRow = () => {
     setPermissions([...permissions, { actions: [], resources: '' }]);
@@ -173,12 +178,12 @@ export default function UserModal({ open, user, onClose, onSaved }: UserModalPro
     setPermissions([...PRESETS[presetName]]);
   };
 
-  // After create: show the secret once
-  if (newSecret && !isEdit) {
+  // After create or key rotation: show credentials once, then dismiss
+  if (newSecret) {
     return (
       <Modal
         open={open}
-        title="User Created"
+        title={isEdit ? "Credentials Updated" : "User Created"}
         onCancel={onClose}
         footer={<Button type="primary" onClick={onClose}>Done</Button>}
       >
@@ -213,30 +218,25 @@ export default function UserModal({ open, user, onClose, onSaved }: UserModalPro
       footer={
         <Space>
           <Button onClick={onClose}>Cancel</Button>
-          <Button type="primary" onClick={handleSave} loading={saving}>
-            {isEdit ? 'Save' : 'Create'}
-          </Button>
+          {hasKeyChanges ? (
+            <Popconfirm
+              title="Change credentials?"
+              description="This will update the access key and/or secret. The new secret will be shown once — make sure to save it."
+              onConfirm={doSave}
+              okText="Yes, update credentials"
+              okButtonProps={{ loading: saving }}
+            >
+              <Button type="primary" loading={saving}>Save</Button>
+            </Popconfirm>
+          ) : (
+            <Button type="primary" onClick={handleSave} loading={saving}>
+              {isEdit ? 'Save' : 'Create'}
+            </Button>
+          )}
         </Space>
       }
     >
       {error && <Alert type="error" message={error} showIcon closable onClose={() => setError('')} style={{ marginBottom: 16, borderRadius: 8 }} />}
-
-      {/* After key rotation: show new secret */}
-      {newSecret && isEdit && (
-        <Alert
-          type="success"
-          showIcon
-          message="New keys generated — save the secret, it will not be shown again."
-          description={
-            <div style={{ marginTop: 8 }}>
-              <Text code copyable style={{ fontFamily: 'var(--font-mono)' }}>{newAccessKey}</Text>
-              <br />
-              <Text code copyable style={{ fontFamily: 'var(--font-mono)', wordBreak: 'break-all' }}>{newSecret}</Text>
-            </div>
-          }
-          style={{ marginBottom: 16, borderRadius: 8 }}
-        />
-      )}
 
       <div style={{ marginBottom: 16 }}>
         <Text type="secondary" style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 600 }}>Name</Text>
