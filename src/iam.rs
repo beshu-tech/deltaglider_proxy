@@ -7,6 +7,7 @@
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use tracing::warn;
 
 /// An IAM user with S3 credentials and permissions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,9 +84,17 @@ pub struct IamIndex {
 
 impl IamIndex {
     /// Build the index from a list of users (keyed by access_key_id).
+    /// Logs warnings for enabled users with no permissions (deny-by-default
+    /// means they can authenticate but cannot access any resources).
     pub fn from_users(users: Vec<IamUser>) -> Self {
         let mut map = HashMap::with_capacity(users.len());
         for user in users {
+            if user.enabled && user.permissions.is_empty() {
+                warn!(
+                    "IAM user '{}' ({}) is enabled but has no permissions — all operations will be denied",
+                    user.name, user.access_key_id
+                );
+            }
             map.insert(user.access_key_id.clone(), user);
         }
         Self { users: map }

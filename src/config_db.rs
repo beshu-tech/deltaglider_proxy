@@ -24,6 +24,12 @@ impl ConfigDb {
     /// Open an existing DB or create a new one at `local_path`.
     /// The `passphrase` is used as the SQLCipher encryption key.
     pub fn open_or_create(local_path: &Path, passphrase: &str) -> Result<Self, ConfigDbError> {
+        if passphrase.is_empty() {
+            return Err(ConfigDbError::WrongPassphrase(
+                "Config database passphrase must not be empty".to_string(),
+            ));
+        }
+
         let conn = Connection::open(local_path)?;
 
         // Set the encryption key (PRAGMA key must be the first statement)
@@ -42,6 +48,9 @@ impl ConfigDb {
             }
         }
 
+        // Enable foreign keys (per-connection setting, not persisted)
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+
         // Run migrations
         Self::migrate(&conn)?;
 
@@ -59,6 +68,7 @@ impl ConfigDb {
     pub fn in_memory(passphrase: &str) -> Result<Self, ConfigDbError> {
         let conn = Connection::open_in_memory()?;
         conn.pragma_update(None, "key", passphrase)?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
         Self::migrate(&conn)?;
         Ok(Self {
             conn,
@@ -91,9 +101,7 @@ impl ConfigDb {
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_users_access_key ON users(access_key_id);
-                CREATE INDEX IF NOT EXISTS idx_permissions_user ON permissions(user_id);
-
-                PRAGMA foreign_keys = ON;",
+                CREATE INDEX IF NOT EXISTS idx_permissions_user ON permissions(user_id);",
             )?;
         }
 
@@ -178,6 +186,7 @@ impl ConfigDb {
     }
 
     /// Create a new user. Returns the user with generated ID.
+    /// Wrapped in a transaction — if permission insertion fails, the user row is rolled back.
     pub fn create_user(
         &self,
         name: &str,
@@ -186,16 +195,29 @@ impl ConfigDb {
         enabled: bool,
         permissions: &[Permission],
     ) -> Result<IamUser, ConfigDbError> {
-        self.conn.execute(
-            "INSERT INTO users (name, access_key_id, secret_access_key, enabled) VALUES (?1, ?2, ?3, ?4)",
-            params![name, access_key_id, secret_access_key, enabled as i32],
-        )?;
-        let user_id = self.conn.last_insert_rowid();
-        self.insert_permissions(user_id, permissions)?;
-        self.get_user_by_id(user_id)
+        self.conn.execute("BEGIN", [])?;
+        let result = (|| {
+            self.conn.execute(
+                "INSERT INTO users (name, access_key_id, secret_access_key, enabled) VALUES (?1, ?2, ?3, ?4)",
+                params![name, access_key_id, secret_access_key, enabled as i32],
+            )?;
+            let user_id = self.conn.last_insert_rowid();
+            self.insert_permissions(user_id, permissions)?;
+            self.get_user_by_id(user_id)
+        })();
+        match &result {
+            Ok(_) => {
+                self.conn.execute("COMMIT", [])?;
+            }
+            Err(_) => {
+                let _ = self.conn.execute("ROLLBACK", []);
+            }
+        }
+        result
     }
 
     /// Update an existing user by ID.
+    /// Wrapped in a transaction — partial updates are rolled back on failure.
     pub fn update_user(
         &self,
         user_id: i64,
@@ -203,28 +225,38 @@ impl ConfigDb {
         enabled: Option<bool>,
         permissions: Option<&[Permission]>,
     ) -> Result<IamUser, ConfigDbError> {
-        if let Some(n) = name {
-            self.conn.execute(
-                "UPDATE users SET name = ?1 WHERE id = ?2",
-                params![n, user_id],
-            )?;
+        self.conn.execute("BEGIN", [])?;
+        let result = (|| {
+            if let Some(n) = name {
+                self.conn.execute(
+                    "UPDATE users SET name = ?1 WHERE id = ?2",
+                    params![n, user_id],
+                )?;
+            }
+            if let Some(e) = enabled {
+                self.conn.execute(
+                    "UPDATE users SET enabled = ?1 WHERE id = ?2",
+                    params![e as i32, user_id],
+                )?;
+            }
+            if let Some(perms) = permissions {
+                self.conn.execute(
+                    "DELETE FROM permissions WHERE user_id = ?1",
+                    params![user_id],
+                )?;
+                self.insert_permissions(user_id, perms)?;
+            }
+            self.get_user_by_id(user_id)
+        })();
+        match &result {
+            Ok(_) => {
+                self.conn.execute("COMMIT", [])?;
+            }
+            Err(_) => {
+                let _ = self.conn.execute("ROLLBACK", []);
+            }
         }
-        if let Some(e) = enabled {
-            self.conn.execute(
-                "UPDATE users SET enabled = ?1 WHERE id = ?2",
-                params![e as i32, user_id],
-            )?;
-        }
-        if let Some(perms) = permissions {
-            // Replace all permissions
-            self.conn.execute(
-                "DELETE FROM permissions WHERE user_id = ?1",
-                params![user_id],
-            )?;
-            self.insert_permissions(user_id, perms)?;
-        }
-
-        self.get_user_by_id(user_id)
+        result
     }
 
     /// Delete a user by ID. Permissions are cascade-deleted.
@@ -312,6 +344,8 @@ impl ConfigDb {
         .map_err(|e| {
             ConfigDbError::WrongPassphrase(format!("Cannot decrypt after re-download: {}", e))
         })?;
+        // Per-connection settings (not persisted in DB)
+        conn.pragma_update(None, "foreign_keys", "ON")?;
         self.conn = conn;
         info!("Config database re-opened after S3 sync");
         Ok(())
@@ -544,5 +578,45 @@ mod tests {
         let db = ConfigDb::in_memory("test-pass").unwrap();
         let result = db.delete_user(99999);
         assert!(matches!(result, Err(ConfigDbError::NotFound(_))));
+    }
+
+    #[test]
+    fn test_empty_passphrase_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let result = ConfigDb::open_or_create(&path, "");
+        assert!(
+            matches!(result, Err(ConfigDbError::WrongPassphrase(_))),
+            "Empty passphrase should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_transaction_rollback_on_duplicate_key() {
+        let db = ConfigDb::in_memory("test-pass").unwrap();
+
+        // Create first user
+        db.create_user("user1", "AKFIRST1", "secret1", true, &[])
+            .unwrap();
+
+        // Try to create second user with same access_key_id — should fail
+        let perms = vec![Permission {
+            id: 0,
+            actions: vec!["read".into()],
+            resources: vec!["*".into()],
+        }];
+        let result = db.create_user("user2", "AKFIRST1", "secret2", true, &perms);
+        assert!(result.is_err());
+
+        // Verify no partial state: still exactly 1 user, 0 permissions
+        let users = db.load_users().unwrap();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].name, "user1");
+
+        let perm_count: i32 = db
+            .conn
+            .query_row("SELECT count(*) FROM permissions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(perm_count, 0, "No orphaned permissions should exist");
     }
 }
