@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Button, Input, InputNumber, Select, Switch, Typography, Space, Alert, Spin, Tabs } from 'antd';
-import { SaveOutlined, LockOutlined, WarningOutlined, DatabaseOutlined, ControlOutlined, SafetyOutlined, KeyOutlined, ApiOutlined, CloudOutlined, ArrowLeftOutlined } from '@ant-design/icons';
+import { SaveOutlined, LockOutlined, WarningOutlined, DatabaseOutlined, ControlOutlined, SafetyOutlined, KeyOutlined, ApiOutlined, CloudOutlined, ArrowLeftOutlined, TeamOutlined } from '@ant-design/icons';
 import type { AdminConfig, TestS3Response } from '../adminApi';
 import { getAdminConfig, updateAdminConfig, testS3Connection } from '../adminApi';
 import { useColors } from '../ThemeContext';
@@ -8,6 +8,7 @@ import { useCardStyles } from './shared-styles';
 import SectionHeader from './SectionHeader';
 import BrowserConnectionCard from './BrowserConnectionCard';
 import PasswordChangeCard from './PasswordChangeCard';
+import UsersTab from './UsersTab';
 
 const { Title, Text } = Typography;
 
@@ -540,6 +541,16 @@ export default function SettingsPage({ onBack, onSessionExpired }: Props) {
         </span>
       ),
       children: proxyTab,
+    },
+    {
+      key: 'users',
+      label: (
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          <TeamOutlined aria-hidden="true" />
+          <span>Users</span>
+        </span>
+      ),
+      children: <UsersTab onSessionExpired={onSessionExpired} />,
     },
     {
       key: 'security',
