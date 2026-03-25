@@ -44,6 +44,19 @@ pub async fn serve(s3_port: u16, admin_state: Arc<AdminState>, tls: Option<Rustl
         .route("/api/admin/password", put(admin::change_password))
         .route("/api/admin/session", get(admin::check_session))
         .route("/api/admin/test-s3", post(admin::test_s3_connection))
+        // IAM user management
+        .route(
+            "/api/admin/users",
+            get(admin::list_users).post(admin::create_user),
+        )
+        .route(
+            "/api/admin/users/:id",
+            put(admin::update_user).delete(admin::delete_user),
+        )
+        .route(
+            "/api/admin/users/:id/rotate-keys",
+            post(admin::rotate_user_keys),
+        )
         .layer(middleware::from_fn_with_state(
             admin_state.clone(),
             admin::require_session,
