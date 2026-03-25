@@ -27,6 +27,16 @@ cache_size_mb = 100
 # access_key_id = "myaccesskey"
 # secret_access_key = "mysecretkey"
 
+# IAM Users (optional)
+# --------------------
+# Multi-user access control is managed via the admin GUI (Settings → Users tab).
+# Users are stored in an encrypted database (deltaglider_config.db) created
+# automatically next to this config file. The database is encrypted with the
+# admin GUI password hash — changing the admin password re-encrypts the DB.
+#
+# When IAM users exist, the legacy access_key_id/secret_access_key above are
+# ignored and each user authenticates with their own credentials.
+
 # TLS (optional)
 # --------------
 # Enable HTTPS for both S3 and admin UI ports.
