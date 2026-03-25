@@ -23,6 +23,7 @@ interface Props {
   refreshing: boolean;
   headCache: Record<string, { storageType?: string; storedSize?: number }>;
   onEnrichKeys: (keys: string[]) => void;
+  onPreview?: (obj: S3Object) => void;
 }
 
 type RowData = { _isFolder: true; key: string; name: string } | (S3Object & { _isFolder: false; name: string });
@@ -42,6 +43,7 @@ export default function ObjectTable({
   refreshing,
   headCache,
   onEnrichKeys,
+  onPreview,
 }: Props) {
   const { token } = theme.useToken();
   const { TEXT_PRIMARY, TEXT_SECONDARY, TEXT_MUTED, ACCENT_BLUE, ACCENT_AMBER, ACCENT_PURPLE, STORAGE_TYPE_COLORS, STORAGE_TYPE_DEFAULT } = useColors();
@@ -250,10 +252,14 @@ export default function ObjectTable({
             if (!record._isFolder && selected?.key === record.key) return 'ant-table-row-selected';
             return '';
           }}
-          onRow={() => ({
+          onRow={(record) => ({
+            onDoubleClick: () => {
+              if (!record._isFolder && onPreview) onPreview(record);
+            },
             style: {
               borderBottom: `1px solid ${token.colorBorderSecondary}`,
               transition: 'background 0.15s ease',
+              cursor: !record._isFolder && onPreview ? 'pointer' : undefined,
             },
           })}
         />
