@@ -774,21 +774,33 @@ fn mask_user(user: &IamUser) -> IamUser {
 }
 
 /// Rebuild the in-memory IamIndex from the database and store it.
+/// If no users exist, restores Disabled mode to avoid locking out all access.
 fn rebuild_iam_index(db: &ConfigDb, iam_state: &SharedIamState) -> Result<(), StatusCode> {
     let users = db.load_users().map_err(|e| {
         tracing::error!("Failed to load users from config DB: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    let index = IamIndex::from_users(users);
-    iam_state.store(Arc::new(IamState::Iam(index)));
+    if users.is_empty() {
+        tracing::info!("No IAM users in database — disabling auth (open access)");
+        iam_state.store(Arc::new(IamState::Disabled));
+    } else {
+        let count = users.len();
+        let index = IamIndex::from_users(users);
+        iam_state.store(Arc::new(IamState::Iam(index)));
+        tracing::debug!("IAM index rebuilt with {} users", count);
+    }
     Ok(())
 }
 
 /// GET /api/admin/users — list all users (secrets masked).
+/// Returns empty list if IAM DB is not initialized (legacy/open mode).
 pub async fn list_users(
     State(state): State<Arc<AdminState>>,
 ) -> Result<Json<Vec<IamUser>>, StatusCode> {
-    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let db = match state.config_db.as_ref() {
+        Some(db) => db,
+        None => return Ok(Json(vec![])), // No IAM DB → empty list (not an error)
+    };
     let db = db.lock().await;
     let users = db.load_users().map_err(|e| {
         tracing::error!("Failed to load users: {}", e);
