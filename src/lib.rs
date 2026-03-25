@@ -4,7 +4,9 @@
 
 pub mod api;
 pub mod config;
+pub mod config_db;
 pub mod deltaglider;
+pub mod iam;
 pub mod init;
 pub mod metrics;
 pub mod multipart;

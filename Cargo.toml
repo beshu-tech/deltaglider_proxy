@@ -73,6 +73,7 @@ clap = { version = "4", features = ["derive"] }
 
 # Metrics
 prometheus = { version = "0.13", default-features = false, features = ["process"] }
+rusqlite = { version = "0.39.0", features = ["bundled-sqlcipher"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
