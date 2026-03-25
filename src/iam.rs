@@ -4,10 +4,14 @@
 //! At runtime, users are indexed in a `HashMap<access_key_id, IamUser>` for
 //! O(1) lookup during SigV4 authentication.
 
+use axum::body::Body;
+use axum::http::Request;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// An IAM user with S3 credentials and permissions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,6 +179,100 @@ fn matches_resource(pattern: &str, resource: &str) -> bool {
     } else {
         resource == pattern
     }
+}
+
+// === Authorization Middleware ===
+
+/// Map an HTTP method + path to an S3 action.
+fn classify_action(method: &axum::http::Method, path: &str) -> S3Action {
+    let is_bucket_level = path.trim_matches('/').split('/').count() <= 1;
+
+    match *method {
+        axum::http::Method::GET | axum::http::Method::HEAD => {
+            if is_bucket_level {
+                S3Action::List
+            } else {
+                S3Action::Read
+            }
+        }
+        axum::http::Method::PUT => {
+            if is_bucket_level {
+                S3Action::Admin
+            } else {
+                S3Action::Write
+            }
+        }
+        axum::http::Method::DELETE => {
+            if is_bucket_level {
+                S3Action::Admin
+            } else {
+                S3Action::Delete
+            }
+        }
+        axum::http::Method::POST => {
+            // POST is used for multipart uploads, batch delete, etc.
+            // Check query string for ?delete (batch delete)
+            S3Action::Write
+        }
+        _ => S3Action::Read,
+    }
+}
+
+/// Extract bucket and key from the URI path (path-style: /{bucket}/{key...}).
+fn parse_bucket_key(path: &str) -> (&str, &str) {
+    let trimmed = path.trim_start_matches('/');
+    match trimmed.split_once('/') {
+        Some((bucket, key)) => (bucket, key),
+        None => (trimmed, ""),
+    }
+}
+
+/// Axum middleware that checks IAM permissions after SigV4 authentication.
+///
+/// If an `AuthenticatedUser` is present in request extensions (inserted by
+/// the SigV4 middleware in IAM mode), evaluates their permissions against
+/// the requested action and resource. Denies with 403 if not permitted.
+///
+/// In legacy mode or open access, no `AuthenticatedUser` is present and
+/// the request passes through unchecked.
+pub async fn authorization_middleware(
+    request: Request<Body>,
+    next: Next,
+) -> Result<Response, Response> {
+    // Only enforce if an AuthenticatedUser was inserted by SigV4 middleware
+    let user = match request.extensions().get::<AuthenticatedUser>() {
+        Some(u) => u.clone(),
+        None => return Ok(next.run(request).await),
+    };
+
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let query = request.uri().query().unwrap_or("");
+
+    // Determine the S3 action
+    let mut action = classify_action(&method, &path);
+
+    // POST /{bucket}?delete is a batch DELETE, not a write
+    if method == axum::http::Method::POST && query.contains("delete") {
+        action = S3Action::Delete;
+    }
+
+    let (bucket, key) = parse_bucket_key(&path);
+
+    if !evaluate_permissions(&user.permissions, action, bucket, key) {
+        debug!(
+            "IAM denied: user='{}' action={:?} bucket='{}' key='{}'",
+            user.name, action, bucket, key
+        );
+        return Err(crate::api::S3Error::AccessDenied.into_response());
+    }
+
+    debug!(
+        "IAM allowed: user='{}' action={:?} bucket='{}' key='{}'",
+        user.name, action, bucket, key
+    );
+
+    Ok(next.run(request).await)
 }
 
 // === Key Generation ===

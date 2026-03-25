@@ -11,15 +11,14 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
-use crate::api::auth::AuthConfig;
+use crate::api::auth::{AuthConfig, IamState, SharedIamState};
 use crate::api::handlers::AppState;
 use crate::config::SharedConfig;
 use crate::deltaglider::DynEngine;
 use crate::session::SessionStore;
 
-/// Thread-safe, hot-swappable auth configuration.
-/// Shared between the SigV4 middleware and the admin API.
-pub type SharedAuthConfig = Arc<arc_swap::ArcSwap<Option<AuthConfig>>>;
+/// Re-export for backward compatibility — old code may reference this type.
+pub type SharedAuthConfig = SharedIamState;
 
 /// Type alias for the tracing reload handle.
 pub type LogReloadHandle =
@@ -32,7 +31,7 @@ pub struct AdminState {
     pub config: SharedConfig,
     pub log_reload: LogReloadHandle,
     pub s3_state: Arc<AppState>,
-    pub auth_config: SharedAuthConfig,
+    pub auth_config: SharedIamState,
 }
 
 #[derive(Deserialize)]
@@ -460,17 +459,17 @@ pub async fn update_config(
 
     // Hot-reload auth credentials into the live SigV4 middleware
     if body.access_key_id.is_some() || body.secret_access_key.is_some() {
-        let new_auth = if let (Some(ref key_id), Some(ref secret)) =
+        let new_state = if let (Some(ref key_id), Some(ref secret)) =
             (&cfg.access_key_id, &cfg.secret_access_key)
         {
-            Some(AuthConfig {
+            IamState::Legacy(AuthConfig {
                 access_key_id: key_id.clone(),
                 secret_access_key: secret.clone(),
             })
         } else {
-            None
+            IamState::Disabled
         };
-        state.auth_config.store(Arc::new(new_auth));
+        state.auth_config.store(Arc::new(new_state));
         tracing::info!(
             "Auth credentials hot-reloaded (auth enabled: {})",
             cfg.auth_enabled()
@@ -750,26 +749,30 @@ mod tests {
     /// This guards against reverting to a static Extension<Option<Arc<AuthConfig>>>.
     #[test]
     fn shared_auth_config_reflects_updates() {
-        let shared: SharedAuthConfig = Arc::new(arc_swap::ArcSwap::from_pointee(None));
+        let shared: SharedIamState = Arc::new(arc_swap::ArcSwap::from_pointee(IamState::Disabled));
 
         // Initially no auth
-        assert!(shared.load().is_none());
+        assert!(matches!(&**shared.load(), IamState::Disabled));
 
         // Simulate admin API updating credentials
-        shared.store(Arc::new(Some(AuthConfig {
+        shared.store(Arc::new(IamState::Legacy(AuthConfig {
             access_key_id: "new-key".to_string(),
             secret_access_key: "new-secret".to_string(),
         })));
 
         // Middleware must see the update
         let loaded = shared.load();
-        let auth = loaded.as_ref().as_ref().unwrap();
-        assert_eq!(auth.access_key_id, "new-key");
-        assert_eq!(auth.secret_access_key, "new-secret");
+        match &**loaded {
+            IamState::Legacy(auth) => {
+                assert_eq!(auth.access_key_id, "new-key");
+                assert_eq!(auth.secret_access_key, "new-secret");
+            }
+            _ => panic!("Expected IamState::Legacy"),
+        }
 
         // Simulate disabling auth (clearing both credentials)
-        shared.store(Arc::new(None));
-        assert!(shared.load().is_none());
+        shared.store(Arc::new(IamState::Disabled));
+        assert!(matches!(&**shared.load(), IamState::Disabled));
     }
 
     #[test]
