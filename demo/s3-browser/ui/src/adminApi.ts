@@ -106,3 +106,67 @@ export async function changeAdminPassword(
   });
   return res.json();
 }
+
+// === IAM User Management ===
+
+export interface IamPermission {
+  id: number;
+  actions: string[];
+  resources: string[];
+}
+
+export interface IamUser {
+  id: number;
+  name: string;
+  access_key_id: string;
+  secret_access_key?: string;
+  enabled: boolean;
+  created_at: string;
+  permissions: IamPermission[];
+}
+
+export interface CreateUserRequest {
+  name: string;
+  access_key_id?: string;
+  secret_access_key?: string;
+  enabled?: boolean;
+  permissions: IamPermission[];
+}
+
+export interface UpdateUserRequest {
+  name?: string;
+  enabled?: boolean;
+  permissions?: IamPermission[];
+}
+
+export async function getUsers(): Promise<IamUser[]> {
+  const res = await adminFetch('/api/admin/users');
+  if (!res.ok) throw new Error(`Failed to load users: ${res.status}`);
+  return res.json();
+}
+
+export async function createUser(req: CreateUserRequest): Promise<IamUser> {
+  const res = await adminFetch('/api/admin/users', 'POST', req);
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(text || `Failed to create user: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function updateUser(id: number, req: UpdateUserRequest): Promise<IamUser> {
+  const res = await adminFetch(`/api/admin/users/${id}`, 'PUT', req);
+  if (!res.ok) throw new Error(`Failed to update user: ${res.status}`);
+  return res.json();
+}
+
+export async function deleteUser(id: number): Promise<void> {
+  const res = await adminFetch(`/api/admin/users/${id}`, 'DELETE');
+  if (!res.ok) throw new Error(`Failed to delete user: ${res.status}`);
+}
+
+export async function rotateUserKeys(id: number): Promise<IamUser> {
+  const res = await adminFetch(`/api/admin/users/${id}/rotate-keys`, 'POST');
+  if (!res.ok) throw new Error(`Failed to rotate keys: ${res.status}`);
+  return res.json();
+}
