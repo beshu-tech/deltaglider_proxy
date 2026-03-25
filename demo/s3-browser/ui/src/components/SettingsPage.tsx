@@ -37,11 +37,13 @@ function findMatchingPreset(logLevel: string): string | null {
 interface Props {
   onBack: () => void;
   onSessionExpired?: () => void;
+  /** When set, renders only the content for this tab (no tabs bar, no header). Used by AdminOverlay. */
+  embeddedTab?: string;
 }
 
 /* -- SettingsPage (main) -------------------------------------------------- */
 
-export default function SettingsPage({ onBack, onSessionExpired }: Props) {
+export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: Props) {
   const colors = useColors();
   const { cardStyle, labelStyle, inputRadius } = useCardStyles();
 
@@ -508,6 +510,21 @@ export default function SettingsPage({ onBack, onSessionExpired }: Props) {
   /* -- Tab: Security ------------------------------------------------------ */
 
   const securityTab = <div style={tabPane}><PasswordChangeCard /></div>;
+
+  // When embedded in AdminOverlay, render just the requested tab content
+  if (embeddedTab) {
+    const tabMap: Record<string, React.ReactNode> = {
+      connection: connectionTab,
+      backend: backendTab,
+      proxy: proxyTab,
+      security: securityTab,
+    };
+    return (
+      <div style={{ maxWidth: 640, margin: '0 auto', padding: 'clamp(16px, 3vw, 24px)' }}>
+        {tabMap[embeddedTab] ?? null}
+      </div>
+    );
+  }
 
   /* -- Tab items ---------------------------------------------------------- */
 

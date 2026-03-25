@@ -7,6 +7,7 @@ import Sidebar from './components/Sidebar';
 import ObjectTable from './components/ObjectTable';
 import InspectorPanel from './components/InspectorPanel';
 import FilePreview from './components/FilePreview';
+import AdminOverlay from './components/AdminOverlay';
 import DropZone from './components/DropZone';
 import UploadPage from './components/UploadPage';
 import ConnectPage from './components/ConnectPage';
@@ -154,6 +155,7 @@ export default function App() {
   const [firstLoadDone, setFirstLoadDone] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
   const [previewObject, setPreviewObject] = useState<import('./types').S3Object | null>(null);
+  const [adminOpen, setAdminOpen] = useState(false);
 
   // Check admin session on mount
   useEffect(() => {
@@ -334,7 +336,7 @@ export default function App() {
             setSiderOpen(false);
           }}
           onSettingsClick={() => {
-            setView('settings');
+            setAdminOpen(true);
             setSiderOpen(false);
           }}
           onLogout={handleLogout}
@@ -370,6 +372,13 @@ export default function App() {
       />
 
       {view === 'browser' && <DropZone onDrop={s3.uploadFiles} prefix={s3.prefix} />}
+      {adminOpen && (
+        <AdminOverlay
+          open={adminOpen}
+          onClose={() => setAdminOpen(false)}
+          onSessionExpired={() => { setAdminOpen(false); setIsAdmin(false); }}
+        />
+      )}
     </Layout>
   );
 }
