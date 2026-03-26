@@ -458,22 +458,38 @@ pub async fn update_config(
     }
 
     // Hot-reload auth credentials into the live SigV4 middleware
+    // Hot-reload auth credentials — but only when NOT in IAM mode.
+    // In IAM mode, the IamIndex is the source of truth; overwriting it
+    // with Legacy mode would silently destroy all IAM user authentication.
     if body.access_key_id.is_some() || body.secret_access_key.is_some() {
-        let new_state = if let (Some(ref key_id), Some(ref secret)) =
-            (&cfg.access_key_id, &cfg.secret_access_key)
-        {
-            IamState::Legacy(AuthConfig {
-                access_key_id: key_id.clone(),
-                secret_access_key: secret.clone(),
-            })
+        let current = state.iam_state.load();
+        if matches!(&**current, IamState::Iam(_)) {
+            tracing::warn!(
+                "Ignoring legacy credential update — IAM mode is active. \
+                 Use the Users panel to manage credentials."
+            );
+            warnings.push(
+                "Legacy credentials updated in config but NOT applied — \
+                 IAM mode is active. Manage users via the Users panel."
+                    .to_string(),
+            );
         } else {
-            IamState::Disabled
-        };
-        state.iam_state.store(Arc::new(new_state));
-        tracing::info!(
-            "Auth credentials hot-reloaded (auth enabled: {})",
-            cfg.auth_enabled()
-        );
+            let new_state = if let (Some(ref key_id), Some(ref secret)) =
+                (&cfg.access_key_id, &cfg.secret_access_key)
+            {
+                IamState::Legacy(AuthConfig {
+                    access_key_id: key_id.clone(),
+                    secret_access_key: secret.clone(),
+                })
+            } else {
+                IamState::Disabled
+            };
+            state.iam_state.store(Arc::new(new_state));
+            tracing::info!(
+                "Auth credentials hot-reloaded (auth enabled: {})",
+                cfg.auth_enabled()
+            );
+        }
     }
 
     // Persist to TOML file
@@ -539,6 +555,20 @@ pub async fn change_password(
 
     // Update in-memory
     *state.password_hash.write() = new_hash.clone();
+
+    // Re-encrypt the IAM config database with the new password hash.
+    // Without this, the next restart would fail to open the DB (wrong key).
+    if let Some(ref db_mutex) = state.config_db {
+        let db = db_mutex.lock().await;
+        if let Err(e) = db.rekey(&new_hash) {
+            tracing::error!(
+                "Failed to re-encrypt config DB after password change: {}",
+                e
+            );
+        } else {
+            tracing::info!("Config DB re-encrypted with new admin password hash");
+        }
+    }
 
     // Persist to state file
     let state_file = std::path::Path::new(".deltaglider_admin_hash");
