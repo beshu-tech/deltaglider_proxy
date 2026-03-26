@@ -159,10 +159,19 @@ export default function App() {
 
   if (needsConnect) {
     return (
-      <ConnectPage
-        onConnect={() => { setNeedsConnect(false); s3.reconnect(); }}
-        showError={hasCredentials()}
-      />
+      <>
+        <ConnectPage
+          onConnect={() => { setNeedsConnect(false); s3.reconnect(); }}
+          showError={hasCredentials()}
+        />
+        {adminOpen && (
+          <AdminOverlay
+            open={adminOpen}
+            onClose={closeAdmin}
+            onSessionExpired={closeAdmin}
+          />
+        )}
+      </>
     );
   }
 
