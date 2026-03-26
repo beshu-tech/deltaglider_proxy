@@ -952,9 +952,19 @@ pub async fn delete_user(
         StatusCode::NOT_FOUND
     })?;
 
+    // Check if this was the last user before rebuilding
+    let remaining = db.load_users().map(|u| u.len()).unwrap_or(0);
+    if remaining == 0 {
+        tracing::warn!("Last IAM user deleted — switching to open access (no authentication)");
+    }
+
     rebuild_iam_index(&db, &state.iam_state)?;
 
-    tracing::info!("IAM user {} deleted", user_id);
+    tracing::info!(
+        "IAM user {} deleted ({} users remaining)",
+        user_id,
+        remaining
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
