@@ -1,8 +1,8 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Button, Typography, Spin, Alert, Input } from 'antd';
-import { PlusOutlined, SearchOutlined, TeamOutlined } from '@ant-design/icons';
+import { Button, Typography, Spin, Alert, Input, Popconfirm } from 'antd';
+import { PlusOutlined, SearchOutlined, TeamOutlined, DeleteOutlined } from '@ant-design/icons';
 import type { IamUser } from '../adminApi';
-import { getUsers } from '../adminApi';
+import { getUsers, deleteUser } from '../adminApi';
 import { useColors } from '../ThemeContext';
 import UserForm from './UserForm';
 
@@ -139,12 +139,14 @@ export default function UsersPanel({ onSessionExpired }: UsersPanelProps) {
               <div
                 key={user.id}
                 onClick={() => handleSelect(user)}
+                className="user-list-item"
                 style={{
                   padding: '10px 16px',
                   cursor: 'pointer',
                   background: isSelected ? colors.ACCENT_BLUE + '18' : 'transparent',
                   borderLeft: isSelected ? `3px solid ${colors.ACCENT_BLUE}` : '3px solid transparent',
                   transition: 'all 0.15s ease',
+                  position: 'relative',
                 }}
                 onMouseEnter={e => { if (!isSelected) e.currentTarget.style.background = colors.BORDER + '40'; }}
                 onMouseLeave={e => { if (!isSelected) e.currentTarget.style.background = 'transparent'; }}
@@ -155,9 +157,34 @@ export default function UsersPanel({ onSessionExpired }: UsersPanelProps) {
                     background: user.enabled ? '#52c41a' : colors.TEXT_MUTED,
                     flexShrink: 0,
                   }} />
-                  <Text strong style={{ fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  <Text strong style={{ fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
                     {user.name}
                   </Text>
+                  <Popconfirm
+                    title={`Delete "${user.name}"?`}
+                    description="This cannot be undone."
+                    onConfirm={async (e) => {
+                      e?.stopPropagation();
+                      try {
+                        await deleteUser(user.id);
+                        handleDeleted();
+                      } catch { /* error shown in form if selected */ }
+                    }}
+                    onCancel={e => e?.stopPropagation()}
+                    okText="Delete"
+                    okButtonProps={{ danger: true }}
+                  >
+                    <Button
+                      type="text"
+                      danger
+                      size="small"
+                      icon={<DeleteOutlined />}
+                      onClick={e => e.stopPropagation()}
+                      style={{ opacity: 0.5, padding: '2px 4px', minWidth: 0 }}
+                      onMouseEnter={e => { e.currentTarget.style.opacity = '1'; }}
+                      onMouseLeave={e => { e.currentTarget.style.opacity = '0.5'; }}
+                    />
+                  </Popconfirm>
                 </div>
                 <div style={{ marginLeft: 16, marginTop: 2 }}>
                   <Text type="secondary" style={{ fontSize: 11, fontFamily: 'var(--font-mono)' }}>
