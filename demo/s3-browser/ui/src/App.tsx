@@ -12,6 +12,7 @@ import DropZone from './components/DropZone';
 import UploadPage from './components/UploadPage';
 import ConnectPage from './components/ConnectPage';
 import MetricsPage from './components/MetricsPage';
+import ApiDocsPage from './components/ApiDocsPage';
 import { getBucket, hasCredentials, setCredentials } from './s3client';
 import { adminLogout } from './adminApi';
 import { useColors } from './ThemeContext';
@@ -19,7 +20,7 @@ import { useColors } from './ThemeContext';
 const { Content } = Layout;
 const { useBreakpoint } = Grid;
 
-type View = 'browser' | 'upload' | 'metrics';
+type View = 'browser' | 'upload' | 'metrics' | 'docs';
 
 const HASH_TO_VIEW: Record<string, View> = {
   '': 'browser',
@@ -29,12 +30,14 @@ const HASH_TO_VIEW: Record<string, View> = {
   '#/settings': 'browser', // legacy redirect
   '#/admin': 'browser', // admin overlay handled separately
   '#/metrics': 'metrics',
+  '#/docs': 'docs',
 };
 
 const VIEW_TO_HASH: Record<View, string> = {
   browser: '#/browse',
   upload: '#/upload',
   metrics: '#/metrics',
+  docs: '#/docs',
 };
 
 function readViewFromHash(): View {
@@ -117,6 +120,7 @@ export default function App() {
       browser: `${getBucket()} — DeltaGlider Proxy`,
       upload: 'Upload — DeltaGlider Proxy',
       metrics: 'Metrics — DeltaGlider Proxy',
+      docs: 'API Reference — DeltaGlider Proxy',
     };
     document.title = titles[view];
   }, [view]);
@@ -165,6 +169,10 @@ export default function App() {
   const renderContent = () => {
     if (view === 'metrics') {
       return <MetricsPage onBack={() => setView('browser')} />;
+    }
+
+    if (view === 'docs') {
+      return <ApiDocsPage onBack={() => setView('browser')} />;
     }
 
     if (view === 'upload') {
@@ -266,6 +274,10 @@ export default function App() {
           }}
           onSettingsClick={() => {
             openAdmin();
+            setSiderOpen(false);
+          }}
+          onDocsClick={() => {
+            setView('docs');
             setSiderOpen(false);
           }}
           onLogout={handleLogout}
