@@ -26,7 +26,8 @@ const HASH_TO_VIEW: Record<string, View> = {
   '#/': 'browser',
   '#/browse': 'browser',
   '#/upload': 'upload',
-  '#/settings': 'browser', // settings is now an overlay, redirect to browser
+  '#/settings': 'browser', // legacy redirect
+  '#/admin': 'browser', // admin overlay handled separately
   '#/metrics': 'metrics',
 };
 
@@ -81,7 +82,28 @@ export default function App() {
   const [needsConnect, setNeedsConnect] = useState(!hasCredentials());
   const [firstLoadDone, setFirstLoadDone] = useState(false);
   const [previewObject, setPreviewObject] = useState<import('./types').S3Object | null>(null);
-  const [adminOpen, setAdminOpen] = useState(false);
+  const [adminOpen, setAdminOpen] = useState(window.location.hash === '#/admin');
+
+  const openAdmin = useCallback(() => {
+    setAdminOpen(true);
+    window.history.pushState(null, '', '#/admin');
+  }, []);
+
+  const closeAdmin = useCallback(() => {
+    setAdminOpen(false);
+    if (window.location.hash === '#/admin') {
+      window.history.pushState(null, '', '#/browse');
+    }
+  }, []);
+
+  // Sync admin overlay with hash (supports browser back button + refresh)
+  useEffect(() => {
+    const onHashChange = () => {
+      setAdminOpen(window.location.hash === '#/admin');
+    };
+    window.addEventListener('hashchange', onHashChange);
+    return () => window.removeEventListener('hashchange', onHashChange);
+  }, []);
 
   const screens = useBreakpoint();
   const isMobile = !screens.md;
@@ -243,7 +265,7 @@ export default function App() {
             setSiderOpen(false);
           }}
           onSettingsClick={() => {
-            setAdminOpen(true);
+            openAdmin();
             setSiderOpen(false);
           }}
           onLogout={handleLogout}
@@ -282,8 +304,8 @@ export default function App() {
       {adminOpen && (
         <AdminOverlay
           open={adminOpen}
-          onClose={() => setAdminOpen(false)}
-          onSessionExpired={() => setAdminOpen(false)}
+          onClose={closeAdmin}
+          onSessionExpired={closeAdmin}
         />
       )}
     </Layout>
