@@ -162,6 +162,32 @@ export default function UserForm({ user, onSaved, onDeleted, onCancel }: UserFor
     </div>
   );
 
+  // After successful CREATE: show only credentials, nothing else
+  if (savedCredentials && !isEdit) {
+    return (
+      <div style={{ padding: '24px 28px', maxWidth: 600 }}>
+        <Alert
+          type="success"
+          showIcon
+          message="User created"
+          description={
+            <div style={{ marginTop: 8 }}>
+              <Text type="secondary" style={{ fontSize: 10, textTransform: 'uppercase' }}>Access Key</Text>
+              <div><Text code copyable style={{ fontFamily: 'var(--font-mono)' }}>{savedCredentials.ak}</Text></div>
+              <Text type="secondary" style={{ fontSize: 10, textTransform: 'uppercase', marginTop: 8, display: 'block' }}>Secret Key</Text>
+              <div><Text code copyable style={{ fontFamily: 'var(--font-mono)', wordBreak: 'break-all' }}>{savedCredentials.sk}</Text></div>
+              <Text type="warning" style={{ fontSize: 11, marginTop: 8, display: 'block' }}>The secret will not be shown again.</Text>
+            </div>
+          }
+          style={{ borderRadius: 8 }}
+        />
+        <div style={{ marginTop: 16, textAlign: 'right' }}>
+          <Button type="primary" onClick={() => { setSavedCredentials(null); onCancel?.(); }}>Done</Button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div style={{ padding: '24px 28px', maxWidth: 600, overflow: 'auto', height: '100%' }}>
       <Title level={5} style={{ margin: '0 0 20px', fontFamily: 'var(--font-ui)' }}>
