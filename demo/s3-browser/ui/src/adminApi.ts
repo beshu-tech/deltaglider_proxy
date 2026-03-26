@@ -68,6 +68,7 @@ export interface ConfigUpdateResponse {
 
 export async function updateAdminConfig(updates: Record<string, unknown>): Promise<ConfigUpdateResponse> {
   const res = await adminFetch('/api/admin/config', 'PUT', updates);
+  if (!res.ok) throw new Error(`Config update failed: ${res.status}`);
   return res.json();
 }
 
