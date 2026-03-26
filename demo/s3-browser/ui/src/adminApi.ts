@@ -190,15 +190,21 @@ export interface WhoamiResponse {
   user: { name: string; access_key_id: string; is_admin: boolean } | null;
 }
 
-export async function whoami(accessKeyId?: string): Promise<WhoamiResponse> {
-  const params = accessKeyId ? `?access_key_id=${encodeURIComponent(accessKeyId)}` : '';
-  const res = await adminFetch(`/api/whoami${params}`);
+export async function whoami(accessKeyId?: string, secretAccessKey?: string): Promise<WhoamiResponse> {
+  const params = new URLSearchParams();
+  if (accessKeyId) params.set('access_key_id', accessKeyId);
+  if (secretAccessKey) params.set('secret_access_key', secretAccessKey);
+  const qs = params.toString();
+  const res = await adminFetch(`/api/whoami${qs ? '?' + qs : ''}`);
   if (!res.ok) return { mode: 'bootstrap', user: null };
   return res.json();
 }
 
-export async function loginAs(accessKeyId: string): Promise<{ ok: boolean; error?: string }> {
-  const res = await adminFetch('/api/admin/login-as', 'POST', { access_key_id: accessKeyId });
+export async function loginAs(accessKeyId: string, secretAccessKey: string): Promise<{ ok: boolean; error?: string }> {
+  const res = await adminFetch('/api/admin/login-as', 'POST', {
+    access_key_id: accessKeyId,
+    secret_access_key: secretAccessKey,
+  });
   if (res.ok) return { ok: true };
-  return { ok: false, error: 'Admin access denied' };
+  return { ok: false, error: 'Admin access denied — invalid credentials or insufficient permissions' };
 }

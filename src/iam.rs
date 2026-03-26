@@ -104,11 +104,15 @@ pub struct AuthenticatedUser {
 }
 
 impl IamUser {
-    /// Returns true if this user has admin-level permissions (actions contain "*" or "admin").
+    /// Returns true if this user has full admin permissions:
+    /// actions must contain "*" or "admin", AND resources must contain "*".
+    /// A user with actions=["*"] on a specific bucket is NOT considered admin.
     pub fn is_admin(&self) -> bool {
-        self.permissions
-            .iter()
-            .any(|p| p.actions.iter().any(|a| a == "*" || a == "admin"))
+        self.permissions.iter().any(|p| {
+            let has_admin_action = p.actions.iter().any(|a| a == "*" || a == "admin");
+            let has_wildcard_resource = p.resources.iter().any(|r| r == "*");
+            has_admin_action && has_wildcard_resource
+        })
     }
 }
 
