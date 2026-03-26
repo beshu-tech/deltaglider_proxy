@@ -54,6 +54,7 @@ pub struct SessionResponse {
 #[derive(Deserialize)]
 pub struct WhoamiQuery {
     access_key_id: Option<String>,
+    secret_access_key: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -72,6 +73,7 @@ pub struct WhoamiResponse {
 #[derive(Deserialize)]
 pub struct LoginAsRequest {
     access_key_id: String,
+    secret_access_key: String,
 }
 
 #[derive(Serialize)]
@@ -208,7 +210,9 @@ pub async fn check_session(
 }
 
 /// GET /api/whoami — returns current auth mode and user info for a given access key.
-/// Public endpoint — no session required.
+/// Public endpoint — no session required. Only reveals mode and whether the
+/// access key exists (not names or admin status, to prevent enumeration attacks).
+/// The is_admin field requires the secret_access_key as proof of identity.
 pub async fn whoami(
     State(state): State<Arc<AdminState>>,
     axum::extract::Query(params): axum::extract::Query<WhoamiQuery>,
@@ -224,10 +228,20 @@ pub async fn whoami(
             user: None,
         }),
         IamState::Iam(index) => {
+            // Only reveal user info if both access_key_id AND secret_access_key match.
+            // This prevents enumeration attacks (attacker can't probe access keys
+            // without knowing the secret).
             let user = params
                 .access_key_id
                 .as_deref()
                 .and_then(|ak| index.get(ak))
+                .filter(|u| {
+                    params
+                        .secret_access_key
+                        .as_deref()
+                        .map(|sk| sk == u.secret_access_key)
+                        .unwrap_or(false)
+                })
                 .map(|u| WhoamiUser {
                     name: u.name.clone(),
                     access_key_id: u.access_key_id.clone(),
@@ -242,7 +256,7 @@ pub async fn whoami(
 }
 
 /// POST /api/admin/login-as — create admin session for an IAM user with admin permissions.
-/// Public endpoint — the user already proved identity via SigV4 on the S3 port.
+/// Requires both access_key_id AND secret_access_key for authentication.
 pub async fn login_as(
     State(state): State<Arc<AdminState>>,
     Json(body): Json<LoginAsRequest>,
@@ -254,6 +268,13 @@ pub async fn login_as(
     };
 
     let user = user.ok_or(StatusCode::FORBIDDEN)?;
+
+    // Verify the secret key matches (critical — prevents auth bypass)
+    if user.secret_access_key != body.secret_access_key {
+        tracing::warn!("login-as: secret mismatch for '{}'", body.access_key_id);
+        return Err(StatusCode::FORBIDDEN);
+    }
+
     if !user.enabled || !user.is_admin() {
         return Err(StatusCode::FORBIDDEN);
     }

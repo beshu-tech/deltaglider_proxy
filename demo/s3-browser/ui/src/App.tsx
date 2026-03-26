@@ -93,7 +93,10 @@ export default function App() {
   useEffect(() => {
     if (!needsConnect) {
       const ak = localStorage.getItem('dg-access-key-id') || undefined;
-      whoami(ak).then(setIdentity);
+      const sk = localStorage.getItem('dg-secret-access-key') || undefined;
+      whoami(ak, sk).then(setIdentity);
+    } else {
+      setIdentity(null);
     }
   }, [needsConnect]);
 

@@ -58,12 +58,13 @@ export default function AdminOverlay({ open, onClose, onSessionExpired }: AdminO
 
       // Check auth mode and try auto-login for IAM admins
       const ak = localStorage.getItem('dg-access-key-id') || undefined;
-      const info = await whoami(ak);
+      const sk = localStorage.getItem('dg-secret-access-key') || undefined;
+      const info = await whoami(ak, sk);
       setAuthMode(info.mode);
 
-      if (info.mode === 'iam' && info.user?.is_admin) {
-        // Auto-login: create session from IAM identity
-        const result = await loginAs(info.user.access_key_id);
+      if (info.mode === 'iam' && info.user?.is_admin && sk) {
+        // Auto-login: prove identity with secret key to get admin session
+        const result = await loginAs(info.user.access_key_id, sk);
         if (result.ok) {
           setAuthed(true);
         } else {
