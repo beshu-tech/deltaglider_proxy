@@ -103,6 +103,15 @@ pub struct AuthenticatedUser {
     pub permissions: Vec<Permission>,
 }
 
+impl IamUser {
+    /// Returns true if this user has admin-level permissions (actions contain "*" or "admin").
+    pub fn is_admin(&self) -> bool {
+        self.permissions
+            .iter()
+            .any(|p| p.actions.iter().any(|a| a == "*" || a == "admin"))
+    }
+}
+
 /// Fast O(1) user lookup index, rebuilt from the database on load/sync.
 pub struct IamIndex {
     users: HashMap<String, IamUser>,
