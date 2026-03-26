@@ -42,6 +42,7 @@ interface Props {
   isMobile: boolean;
   onSettingsClick?: () => void;
   onMetricsClick?: () => void;
+  onDocsClick?: () => void;
   onLogout?: () => void;
   currentUser?: string;
 }
@@ -56,6 +57,7 @@ export default function Sidebar({
   isMobile,
   onSettingsClick,
   onMetricsClick,
+  onDocsClick,
   onLogout,
   currentUser,
 }: Props) {
@@ -282,18 +284,16 @@ export default function Sidebar({
               <SettingOutlined aria-hidden="true" style={MENU_ICON_STYLE} />
               <span>Admin Settings</span>
             </button>
-            <a
-              href="https://github.com/beshu-tech/deltaglider"
-              target="_blank"
-              rel="noopener noreferrer"
+            <button
               className="btn-reset"
-              style={{ ...menuItemStyle, textDecoration: 'none' }}
+              onClick={onDocsClick}
+              style={menuItemStyle}
               onMouseEnter={(e) => { e.currentTarget.style.color = TEXT_PRIMARY; }}
               onMouseLeave={(e) => { e.currentTarget.style.color = TEXT_SECONDARY; }}
             >
               <FileTextOutlined aria-hidden="true" style={MENU_ICON_STYLE} />
-              <span>Documentation</span>
-            </a>
+              <span>API Reference</span>
+            </button>
             {onLogout && (
               <Popconfirm
                 title="Disconnect?"
