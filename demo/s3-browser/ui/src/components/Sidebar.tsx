@@ -45,6 +45,7 @@ interface Props {
   onDocsClick?: () => void;
   onLogout?: () => void;
   currentUser?: string;
+  canAdmin?: boolean;
 }
 
 export default function Sidebar({
@@ -60,6 +61,7 @@ export default function Sidebar({
   onDocsClick,
   onLogout,
   currentUser,
+  canAdmin,
 }: Props) {
   const {
     BG_SIDEBAR, BORDER, TEXT_PRIMARY, TEXT_SECONDARY,
@@ -274,16 +276,18 @@ export default function Sidebar({
               <DashboardOutlined aria-hidden="true" style={MENU_ICON_STYLE} />
               <span>Metrics</span>
             </button>
-            <button
-              className="btn-reset"
-              onClick={onSettingsClick}
-              style={menuItemStyle}
-              onMouseEnter={(e) => { e.currentTarget.style.color = TEXT_PRIMARY; }}
-              onMouseLeave={(e) => { e.currentTarget.style.color = TEXT_SECONDARY; }}
-            >
-              <SettingOutlined aria-hidden="true" style={MENU_ICON_STYLE} />
-              <span>Admin Settings</span>
-            </button>
+            {canAdmin !== false && (
+              <button
+                className="btn-reset"
+                onClick={onSettingsClick}
+                style={menuItemStyle}
+                onMouseEnter={(e) => { e.currentTarget.style.color = TEXT_PRIMARY; }}
+                onMouseLeave={(e) => { e.currentTarget.style.color = TEXT_SECONDARY; }}
+              >
+                <SettingOutlined aria-hidden="true" style={MENU_ICON_STYLE} />
+                <span>Admin Settings</span>
+              </button>
+            )}
             <button
               className="btn-reset"
               onClick={onDocsClick}

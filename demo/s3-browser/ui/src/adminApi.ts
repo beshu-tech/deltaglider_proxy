@@ -182,3 +182,23 @@ export async function rotateUserKeys(
   if (!res.ok) throw new Error(`Failed to rotate keys: ${res.status}`);
   return res.json();
 }
+
+// === Whoami / Login-as ===
+
+export interface WhoamiResponse {
+  mode: 'bootstrap' | 'iam' | 'open';
+  user: { name: string; access_key_id: string; is_admin: boolean } | null;
+}
+
+export async function whoami(accessKeyId?: string): Promise<WhoamiResponse> {
+  const params = accessKeyId ? `?access_key_id=${encodeURIComponent(accessKeyId)}` : '';
+  const res = await adminFetch(`/api/whoami${params}`);
+  if (!res.ok) return { mode: 'bootstrap', user: null };
+  return res.json();
+}
+
+export async function loginAs(accessKeyId: string): Promise<{ ok: boolean; error?: string }> {
+  const res = await adminFetch('/api/admin/login-as', 'POST', { access_key_id: accessKeyId });
+  if (res.ok) return { ok: true };
+  return { ok: false, error: 'Admin access denied' };
+}

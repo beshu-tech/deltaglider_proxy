@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Typography, Button, Input, Alert, Space, Spin } from 'antd';
-import { checkSession, adminLogin } from '../adminApi';
+import { checkSession, adminLogin, whoami, loginAs } from '../adminApi';
 import {
   CloseOutlined,
   CloudOutlined,
@@ -35,18 +35,47 @@ export default function AdminOverlay({ open, onClose, onSessionExpired }: AdminO
   const [activeTab, setActiveTab] = useState('users');
   const [authed, setAuthed] = useState(false);
   const [checkingSession, setCheckingSession] = useState(true);
+  const [, setAuthMode] = useState<'bootstrap' | 'iam' | 'open'>('bootstrap');
+  const [accessDenied, setAccessDenied] = useState(false);
   const [password, setPassword] = useState('');
   const [loginLoading, setLoginLoading] = useState(false);
   const [loginError, setLoginError] = useState('');
 
-  // Check existing session on open
+  // Check existing session on open, or auto-login for IAM admins
   useEffect(() => {
     if (!open) return;
     setCheckingSession(true);
-    checkSession().then(valid => {
-      setAuthed(valid);
+    setAccessDenied(false);
+
+    (async () => {
+      // First check if we already have a valid session
+      const hasSession = await checkSession();
+      if (hasSession) {
+        setAuthed(true);
+        setCheckingSession(false);
+        return;
+      }
+
+      // Check auth mode and try auto-login for IAM admins
+      const ak = localStorage.getItem('dg-access-key-id') || undefined;
+      const info = await whoami(ak);
+      setAuthMode(info.mode);
+
+      if (info.mode === 'iam' && info.user?.is_admin) {
+        // Auto-login: create session from IAM identity
+        const result = await loginAs(info.user.access_key_id);
+        if (result.ok) {
+          setAuthed(true);
+        } else {
+          setAccessDenied(true);
+        }
+      } else if (info.mode === 'iam' && info.user && !info.user.is_admin) {
+        setAccessDenied(true);
+      }
+      // bootstrap/open mode: show password form (authed stays false)
+
       setCheckingSession(false);
-    });
+    })();
   }, [open]);
 
   // Close on Escape
@@ -95,15 +124,31 @@ export default function AdminOverlay({ open, onClose, onSessionExpired }: AdminO
     );
   };
 
-  // Login gate
+  // Access denied (IAM user without admin permissions)
+  if (!authed && !checkingSession && accessDenied) {
+    return (
+      <div style={{ position: 'fixed', inset: 0, zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', background: colors.BG_BASE }}>
+        <div style={{ width: 380, padding: 40, textAlign: 'center' }}>
+          <LockOutlined style={{ fontSize: 32, color: colors.ACCENT_RED, marginBottom: 12 }} />
+          <div><Text strong style={{ fontSize: 18, fontFamily: 'var(--font-ui)' }}>Access Denied</Text></div>
+          <Text type="secondary" style={{ fontSize: 13, display: 'block', marginTop: 8, marginBottom: 24 }}>
+            Your account does not have admin permissions. Contact an administrator to grant you the &quot;admin&quot; action.
+          </Text>
+          <Button type="primary" onClick={onClose} style={{ borderRadius: 10 }}>Close</Button>
+        </div>
+      </div>
+    );
+  }
+
+  // Bootstrap login gate (only in bootstrap/open mode)
   if (!authed && !checkingSession) {
     return (
       <div style={{ position: 'fixed', inset: 0, zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', background: colors.BG_BASE }}>
         <form onSubmit={e => { e.preventDefault(); handleLogin(); }} style={{ width: 380, padding: 40 }}>
           <div style={{ textAlign: 'center', marginBottom: 24 }}>
             <LockOutlined style={{ fontSize: 32, color: colors.ACCENT_BLUE, marginBottom: 12 }} />
-            <div><Text strong style={{ fontSize: 18, fontFamily: 'var(--font-ui)' }}>Admin Login</Text></div>
-            <Text type="secondary" style={{ fontSize: 13 }}>Enter the admin password to continue.</Text>
+            <div><Text strong style={{ fontSize: 18, fontFamily: 'var(--font-ui)' }}>Bootstrap Login</Text></div>
+            <Text type="secondary" style={{ fontSize: 13 }}>Enter the bootstrap password to continue.</Text>
           </div>
           {loginError && <Alert type="error" message={loginError} showIcon style={{ marginBottom: 16, borderRadius: 8 }} />}
           <Input.Password
