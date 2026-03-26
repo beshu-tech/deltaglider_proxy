@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Layout, Spin, Empty, Grid, Button, Input, Alert, Space, Typography } from 'antd';
-import { DeleteOutlined, LockOutlined, ArrowLeftOutlined } from '@ant-design/icons';
+import { Layout, Spin, Empty, Grid, Button } from 'antd';
+import { DeleteOutlined } from '@ant-design/icons';
 import useS3Browser from './useS3Browser';
 import TopBar from './components/TopBar';
 import Sidebar from './components/Sidebar';
@@ -11,30 +11,28 @@ import AdminOverlay from './components/AdminOverlay';
 import DropZone from './components/DropZone';
 import UploadPage from './components/UploadPage';
 import ConnectPage from './components/ConnectPage';
-import SettingsPage from './components/SettingsPage';
 import MetricsPage from './components/MetricsPage';
 import { getBucket, hasCredentials, setCredentials } from './s3client';
-import { checkSession, adminLogin, adminLogout } from './adminApi';
+import { adminLogout } from './adminApi';
 import { useColors } from './ThemeContext';
 
 const { Content } = Layout;
 const { useBreakpoint } = Grid;
 
-type View = 'browser' | 'upload' | 'settings' | 'metrics';
+type View = 'browser' | 'upload' | 'metrics';
 
 const HASH_TO_VIEW: Record<string, View> = {
   '': 'browser',
   '#/': 'browser',
   '#/browse': 'browser',
   '#/upload': 'upload',
-  '#/settings': 'settings',
+  '#/settings': 'browser', // settings is now an overlay, redirect to browser
   '#/metrics': 'metrics',
 };
 
 const VIEW_TO_HASH: Record<View, string> = {
   browser: '#/browse',
   upload: '#/upload',
-  settings: '#/settings',
   metrics: '#/metrics',
 };
 
@@ -74,77 +72,6 @@ function useHashRouter() {
   return [view, setView] as const;
 }
 
-const { Text } = Typography;
-
-function AdminGate({ onSuccess, onBack }: { onSuccess: () => void; onBack: () => void }) {
-  const { BORDER, TEXT_MUTED, ACCENT_BLUE } = useColors();
-  const [password, setPassword] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
-
-  const handleSubmit = async () => {
-    setLoading(true);
-    setError('');
-    try {
-      const res = await adminLogin(password);
-      if (res.ok) {
-        onSuccess();
-      } else {
-        setError(res.error || 'Login failed');
-        setPassword('');
-      }
-    } catch {
-      setError('Network error');
-      setPassword('');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  return (
-    <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '70vh', padding: 24 }}>
-      <form onSubmit={(e) => { e.preventDefault(); handleSubmit(); }} className="glass-card animate-fade-in" style={{ borderRadius: 14, padding: 'clamp(28px, 4vw, 40px)', width: '100%', maxWidth: 400 }}>
-        <Space orientation="vertical" size="large" style={{ width: '100%' }}>
-          <div style={{ textAlign: 'center' }}>
-            <div style={{
-              width: 56, height: 56, borderRadius: 14,
-              background: `linear-gradient(135deg, ${ACCENT_BLUE}22, ${ACCENT_BLUE}08)`,
-              border: `1px solid ${ACCENT_BLUE}33`,
-              display: 'inline-flex', alignItems: 'center', justifyContent: 'center', marginBottom: 16,
-            }}>
-              <LockOutlined style={{ fontSize: 24, color: ACCENT_BLUE }} />
-            </div>
-            <Text strong style={{ display: 'block', fontSize: 18, fontFamily: "var(--font-ui)" }}>Admin Login</Text>
-            <Text style={{ color: TEXT_MUTED, fontSize: 13 }}>Enter the admin password to access settings.</Text>
-          </div>
-
-          {error && <Alert type="error" message={error} showIcon />}
-
-          <Input.Password
-            placeholder="Password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            size="large"
-            autoFocus
-            autoComplete="current-password"
-            style={{ background: 'var(--input-bg)', borderColor: BORDER, borderRadius: 10, height: 48, fontFamily: "var(--font-mono)" }}
-          />
-
-          <Space orientation="vertical" size="small" style={{ width: '100%' }}>
-            <Button type="primary" htmlType="submit" block size="large" loading={loading} disabled={!password}
-              style={{ height: 48, borderRadius: 10, fontWeight: 700, fontFamily: "var(--font-ui)", fontSize: 15 }}>
-              Sign In
-            </Button>
-            <Button type="text" block icon={<ArrowLeftOutlined />} onClick={onBack}
-              style={{ color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>
-              Back to browser
-            </Button>
-          </Space>
-        </Space>
-      </form>
-    </div>
-  );
-}
 
 export default function App() {
   const colors = useColors();
@@ -153,14 +80,8 @@ export default function App() {
   const [siderOpen, setSiderOpen] = useState(false);
   const [needsConnect, setNeedsConnect] = useState(!hasCredentials());
   const [firstLoadDone, setFirstLoadDone] = useState(false);
-  const [isAdmin, setIsAdmin] = useState(false);
   const [previewObject, setPreviewObject] = useState<import('./types').S3Object | null>(null);
   const [adminOpen, setAdminOpen] = useState(false);
-
-  // Check admin session on mount
-  useEffect(() => {
-    checkSession().then(setIsAdmin);
-  }, []);
 
   const screens = useBreakpoint();
   const isMobile = !screens.md;
@@ -173,7 +94,6 @@ export default function App() {
     const titles: Record<View, string> = {
       browser: `${getBucket()} — DeltaGlider Proxy`,
       upload: 'Upload — DeltaGlider Proxy',
-      settings: 'Settings — DeltaGlider Proxy',
       metrics: 'Metrics — DeltaGlider Proxy',
     };
     document.title = titles[view];
@@ -199,7 +119,6 @@ export default function App() {
     setCredentials('', '');
     // Clear admin session
     adminLogout().catch(() => {});
-    setIsAdmin(false);
     setFirstLoadDone(false);
     setNeedsConnect(true);
     setView('browser');
@@ -224,18 +143,6 @@ export default function App() {
   const renderContent = () => {
     if (view === 'metrics') {
       return <MetricsPage onBack={() => setView('browser')} />;
-    }
-
-    if (view === 'settings') {
-      if (!isAdmin) {
-        return (
-          <AdminGate
-            onSuccess={() => setIsAdmin(true)}
-            onBack={() => setView('browser')}
-          />
-        );
-      }
-      return <SettingsPage onBack={() => setView('browser')} onSessionExpired={() => setIsAdmin(false)} />;
     }
 
     if (view === 'upload') {
@@ -376,7 +283,7 @@ export default function App() {
         <AdminOverlay
           open={adminOpen}
           onClose={() => setAdminOpen(false)}
-          onSessionExpired={() => { setAdminOpen(false); setIsAdmin(false); }}
+          onSessionExpired={() => setAdminOpen(false)}
         />
       )}
     </Layout>
