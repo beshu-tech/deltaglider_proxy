@@ -22,7 +22,7 @@ const IMAGE_EXTENSIONS = new Set([
 
 const MAX_TEXT_PREVIEW = 512 * 1024; // 512 KB
 
-function getPreviewMode(filename: string): 'text' | 'image' | null {
+export function getPreviewMode(filename: string): 'text' | 'image' | null {
   const ext = filename.split('.').pop()?.toLowerCase() ?? '';
   const basename = filename.split('/').pop()?.toLowerCase() ?? '';
   if (TEXT_EXTENSIONS.has(ext) || TEXT_EXTENSIONS.has(basename)) return 'text';

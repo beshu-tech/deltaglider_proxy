@@ -5,6 +5,7 @@ import type { S3Object } from '../types';
 import { formatBytes, displayName, timeAgo } from '../utils';
 import type { ColumnsType } from 'antd/es/table';
 import { useColors } from '../ThemeContext';
+import { getPreviewMode } from './FilePreview';
 
 const { Link, Text } = Typography;
 
@@ -156,15 +157,24 @@ export default function ObjectTable({
             </button>
           );
         }
+        const canPreview = onPreview && getPreviewMode(record.name) !== null;
+        const nameEl = (
+          <Link
+            onClick={() => onSelect(record)}
+            onDoubleClick={(e) => { e.stopPropagation(); if (onPreview) onPreview(record); }}
+            style={{ fontFamily: "var(--font-mono)", fontSize: 13, color: TEXT_PRIMARY, cursor: canPreview ? 'pointer' : undefined }}
+          >
+            {record.name}
+          </Link>
+        );
         return (
           <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <FileOutlined aria-hidden="true" style={{ color: fileIconColor(record.name), fontSize: 14 }} />
-            <Link
-              onClick={() => onSelect(record)}
-              style={{ fontFamily: "var(--font-mono)", fontSize: 13, color: TEXT_PRIMARY }}
-            >
-              {record.name}
-            </Link>
+            {canPreview ? (
+              <Tooltip title="Double-click to preview" mouseEnterDelay={0.5}>
+                {nameEl}
+              </Tooltip>
+            ) : nameEl}
           </span>
         );
       },
