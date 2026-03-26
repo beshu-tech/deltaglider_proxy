@@ -14,7 +14,8 @@ import ConnectPage from './components/ConnectPage';
 import MetricsPage from './components/MetricsPage';
 import ApiDocsPage from './components/ApiDocsPage';
 import { getBucket, hasCredentials, setCredentials } from './s3client';
-import { adminLogout } from './adminApi';
+import { adminLogout, whoami } from './adminApi';
+import type { WhoamiResponse } from './adminApi';
 import { useColors } from './ThemeContext';
 
 const { Content } = Layout;
@@ -86,6 +87,15 @@ export default function App() {
   const [firstLoadDone, setFirstLoadDone] = useState(false);
   const [previewObject, setPreviewObject] = useState<import('./types').S3Object | null>(null);
   const [adminOpen, setAdminOpen] = useState(window.location.hash === '#/admin');
+  const [identity, setIdentity] = useState<WhoamiResponse | null>(null);
+
+  // Check identity after S3 connection is established
+  useEffect(() => {
+    if (!needsConnect) {
+      const ak = localStorage.getItem('dg-access-key-id') || undefined;
+      whoami(ak).then(setIdentity);
+    }
+  }, [needsConnect]);
 
   const openAdmin = useCallback(() => {
     setAdminOpen(true);
@@ -291,6 +301,7 @@ export default function App() {
           }}
           onLogout={handleLogout}
           currentUser={localStorage.getItem('dg-access-key-id') || undefined}
+          canAdmin={identity?.mode === 'bootstrap' || identity?.mode === 'open' || identity?.user?.is_admin === true}
         />
 
         <Layout style={{ flex: 1, background: colors.BG_BASE }}>
