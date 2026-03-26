@@ -124,8 +124,8 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Authentication",
     },
     EnvVarEntry {
-        name: "DGP_ADMIN_PASSWORD_HASH",
-        description: "Bcrypt hash of admin GUI password",
+        name: "DGP_BOOTSTRAP_PASSWORD_HASH",
+        description: "Bcrypt hash of bootstrap password (seeds DB encryption + admin GUI)",
         example: "$2b$12$...",
         category: "Authentication",
     },
@@ -187,10 +187,11 @@ pub struct Config {
     #[serde(default)]
     pub secret_access_key: Option<String>,
 
-    /// Bcrypt hash of the admin GUI password.
-    /// Set via DGP_ADMIN_PASSWORD_HASH env var, or auto-generated on first run.
-    #[serde(default)]
-    pub admin_password_hash: Option<String>,
+    /// Bcrypt hash of the bootstrap password.
+    /// Seeds DB encryption, admin GUI access, and session signing.
+    /// Set via DGP_BOOTSTRAP_PASSWORD_HASH (or legacy DGP_ADMIN_PASSWORD_HASH).
+    #[serde(default, alias = "admin_password_hash")]
+    pub bootstrap_password_hash: Option<String>,
 
     /// Maximum concurrent delta encode/decode operations.
     /// Defaults to the number of available CPU cores.
@@ -310,7 +311,7 @@ impl Default for Config {
             cache_size_mb: default_cache_size_mb(),
             access_key_id: None,
             secret_access_key: None,
-            admin_password_hash: None,
+            bootstrap_password_hash: None,
             codec_concurrency: None,
             blocking_threads: None,
             log_level: default_log_level(),
@@ -391,7 +392,9 @@ impl Config {
         config.secret_access_key = std::env::var("DGP_SECRET_ACCESS_KEY").ok();
 
         // Admin GUI password hash
-        config.admin_password_hash = std::env::var("DGP_ADMIN_PASSWORD_HASH").ok();
+        config.bootstrap_password_hash = std::env::var("DGP_BOOTSTRAP_PASSWORD_HASH")
+            .or_else(|_| std::env::var("DGP_ADMIN_PASSWORD_HASH"))
+            .ok();
 
         // Log level (runtime operational)
         if let Ok(level) = std::env::var("DGP_LOG_LEVEL") {
@@ -464,23 +467,30 @@ impl Config {
         self.tls.as_ref().is_some_and(|t| t.enabled)
     }
 
-    /// Ensure admin_password_hash is set. Resolution order:
+    /// Ensure bootstrap_password_hash is set. Resolution order:
     /// 1. Already set in config (env var or TOML) — use it.
-    /// 2. Persisted state file `.deltaglider_admin_hash` — load it.
+    /// 2. Persisted state file `.deltaglider_bootstrap_hash` (or legacy `.deltaglider_admin_hash`).
     /// 3. Generate a random password, hash it, persist, and print to stderr.
     ///
     /// Returns the bcrypt hash.
-    pub fn ensure_admin_password_hash(&mut self) -> String {
-        if let Some(ref hash) = self.admin_password_hash {
+    pub fn ensure_bootstrap_password_hash(&mut self) -> String {
+        if let Some(ref hash) = self.bootstrap_password_hash {
             return hash.clone();
         }
 
-        let state_file = std::path::Path::new(".deltaglider_admin_hash");
+        // Check new file first, fall back to legacy file name
+        let new_file = std::path::Path::new(".deltaglider_bootstrap_hash");
+        let legacy_file = std::path::Path::new(".deltaglider_admin_hash");
+        let state_file = if new_file.exists() {
+            new_file
+        } else {
+            legacy_file
+        };
         if state_file.exists() {
             if let Ok(hash) = std::fs::read_to_string(state_file) {
                 let hash = hash.trim().to_string();
                 if !hash.is_empty() {
-                    self.admin_password_hash = Some(hash.clone());
+                    self.bootstrap_password_hash = Some(hash.clone());
                     return hash;
                 }
             }
@@ -502,27 +512,28 @@ impl Config {
 
         let hash = bcrypt::hash(&password, bcrypt::DEFAULT_COST).expect("bcrypt hashing failed");
 
-        // Persist the hash
-        if let Err(e) = std::fs::write(state_file, &hash) {
+        // Persist the hash (use new file name)
+        let persist_file = std::path::Path::new(".deltaglider_bootstrap_hash");
+        if let Err(e) = std::fs::write(persist_file, &hash) {
             eprintln!(
-                "Warning: could not persist admin hash to {}: {}",
-                state_file.display(),
+                "Warning: could not persist bootstrap hash to {}: {}",
+                persist_file.display(),
                 e
             );
         }
 
         // Print prominently to stderr
         eprintln!();
-        eprintln!("╔══════════════════════════════════════════════════════════╗");
-        eprintln!("║  ADMIN PASSWORD (first run — save this!)                ║");
-        eprintln!("║                                                          ║");
-        eprintln!("║  Password: {:<45}║", password);
-        eprintln!("║                                                          ║");
-        eprintln!("║  Set DGP_ADMIN_PASSWORD_HASH to skip auto-generation.   ║");
-        eprintln!("╚══════════════════════════════════════════════════════════╝");
+        eprintln!("╔══════════════════════════════════════════════════════════════╗");
+        eprintln!("║  BOOTSTRAP PASSWORD (first run — save this!)                ║");
+        eprintln!("║                                                              ║");
+        eprintln!("║  Password: {:<49}║", password);
+        eprintln!("║                                                              ║");
+        eprintln!("║  Set DGP_BOOTSTRAP_PASSWORD_HASH to skip auto-generation.   ║");
+        eprintln!("╚══════════════════════════════════════════════════════════════╝");
         eprintln!();
 
-        self.admin_password_hash = Some(hash.clone());
+        self.bootstrap_password_hash = Some(hash.clone());
         hash
     }
 
@@ -585,11 +596,11 @@ impl Config {
         print!("{extra}");
     }
 
-    /// Serialize config to TOML string (excludes admin_password_hash for security).
+    /// Serialize config to TOML string (excludes bootstrap_password_hash for security).
     pub fn to_toml_string(&self) -> Result<String, ConfigError> {
         // Clone and strip the admin hash before serializing
         let mut export = self.clone();
-        export.admin_password_hash = None;
+        export.bootstrap_password_hash = None;
         toml::to_string_pretty(&export).map_err(|e| ConfigError::Parse(e.to_string()))
     }
 
@@ -693,7 +704,7 @@ mod tests {
             "DGP_BLOCKING_THREADS",
             "DGP_ACCESS_KEY_ID",
             "DGP_SECRET_ACCESS_KEY",
-            "DGP_ADMIN_PASSWORD_HASH",
+            "DGP_BOOTSTRAP_PASSWORD_HASH",
             "DGP_LOG_LEVEL",
             "DGP_TLS_ENABLED",
             "DGP_TLS_CERT",

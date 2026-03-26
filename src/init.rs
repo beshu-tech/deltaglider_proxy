@@ -289,7 +289,7 @@ pub fn run_init_inner(
         cache_size_mb,
         access_key_id,
         secret_access_key,
-        admin_password_hash: None,
+        bootstrap_password_hash: None,
         codec_concurrency: None,
         blocking_threads: None,
         log_level,

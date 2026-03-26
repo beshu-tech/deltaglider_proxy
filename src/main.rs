@@ -65,9 +65,10 @@ struct Cli {
     #[arg(long)]
     init: bool,
 
-    /// Set admin password from stdin, then exit
-    #[arg(long)]
-    set_admin_password: bool,
+    /// Set bootstrap password from stdin, then exit.
+    /// WARNING: Changing the bootstrap password invalidates the encrypted IAM database.
+    #[arg(long, alias = "set-admin-password")]
+    set_bootstrap_password: bool,
 
     /// Print all DGP_* environment variables in .env format, then exit
     #[arg(long)]
@@ -92,8 +93,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Set admin password from stdin (runs synchronously, exits before tokio runtime)
-    if cli.set_admin_password {
+    // Set bootstrap password from stdin (runs synchronously, exits before tokio runtime)
+    if cli.set_bootstrap_password {
         use std::io::BufRead;
         let mut line = String::new();
         std::io::stdin()
@@ -106,9 +107,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
         let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST).expect("bcrypt hashing failed");
-        let state_file = ".deltaglider_admin_hash";
-        std::fs::write(state_file, &hash).expect("Failed to write admin hash file");
-        eprintln!("Admin password hash written to {state_file}");
+        // Write to new file, keep old file name as fallback for existing deployments
+        let state_file = ".deltaglider_bootstrap_hash";
+        std::fs::write(state_file, &hash).expect("Failed to write bootstrap hash file");
+        eprintln!();
+        eprintln!("⚠ WARNING: If an encrypted IAM database exists, it will become");
+        eprintln!("  unreadable on next restart (encrypted with the old password).");
+        eprintln!("  All IAM users will be lost. The proxy will return to bootstrap mode.");
+        eprintln!();
+        eprintln!("Bootstrap password hash written to {state_file}");
         std::process::exit(0);
     }
 
@@ -400,7 +407,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .with_state(state.clone());
 
     // Admin GUI: ensure password hash is available, create session store
-    let admin_password_hash = config.ensure_admin_password_hash();
+    let admin_password_hash = config.ensure_bootstrap_password_hash();
     let session_store = Arc::new(SessionStore::new());
 
     // Spawn periodic cleanup for expired admin sessions (every 5 minutes)

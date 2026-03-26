@@ -66,9 +66,11 @@ pub async fn serve(s3_port: u16, admin_state: Arc<AdminState>, tls: Option<Rustl
     // Grab S3 state before admin_state is moved
     let s3_state = admin_state.s3_state.clone();
 
-    // Public admin route (login)
+    // Public admin routes (no session required)
     let public_admin = Router::new()
         .route("/api/admin/login", post(admin::login))
+        .route("/api/admin/login-as", post(admin::login_as))
+        .route("/api/whoami", get(admin::whoami))
         .with_state(admin_state);
 
     let app = Router::new()

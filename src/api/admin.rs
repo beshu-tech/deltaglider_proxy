@@ -49,6 +49,31 @@ pub struct SessionResponse {
     valid: bool,
 }
 
+// === Whoami / Login-as ===
+
+#[derive(Deserialize)]
+pub struct WhoamiQuery {
+    access_key_id: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct WhoamiUser {
+    name: String,
+    access_key_id: String,
+    is_admin: bool,
+}
+
+#[derive(Serialize)]
+pub struct WhoamiResponse {
+    mode: String,
+    user: Option<WhoamiUser>,
+}
+
+#[derive(Deserialize)]
+pub struct LoginAsRequest {
+    access_key_id: String,
+}
+
 #[derive(Serialize)]
 pub struct ConfigResponse {
     listen_addr: String,
@@ -180,6 +205,76 @@ pub async fn check_session(
         .unwrap_or(false);
 
     Json(SessionResponse { valid })
+}
+
+/// GET /api/whoami — returns current auth mode and user info for a given access key.
+/// Public endpoint — no session required.
+pub async fn whoami(
+    State(state): State<Arc<AdminState>>,
+    axum::extract::Query(params): axum::extract::Query<WhoamiQuery>,
+) -> Json<WhoamiResponse> {
+    let iam_state = state.iam_state.load();
+    match &**iam_state {
+        IamState::Disabled => Json(WhoamiResponse {
+            mode: "open".into(),
+            user: None,
+        }),
+        IamState::Legacy(_) => Json(WhoamiResponse {
+            mode: "bootstrap".into(),
+            user: None,
+        }),
+        IamState::Iam(index) => {
+            let user = params
+                .access_key_id
+                .as_deref()
+                .and_then(|ak| index.get(ak))
+                .map(|u| WhoamiUser {
+                    name: u.name.clone(),
+                    access_key_id: u.access_key_id.clone(),
+                    is_admin: u.is_admin(),
+                });
+            Json(WhoamiResponse {
+                mode: "iam".into(),
+                user,
+            })
+        }
+    }
+}
+
+/// POST /api/admin/login-as — create admin session for an IAM user with admin permissions.
+/// Public endpoint — the user already proved identity via SigV4 on the S3 port.
+pub async fn login_as(
+    State(state): State<Arc<AdminState>>,
+    Json(body): Json<LoginAsRequest>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let iam_state = state.iam_state.load();
+    let user = match &**iam_state {
+        IamState::Iam(index) => index.get(&body.access_key_id),
+        _ => None,
+    };
+
+    let user = user.ok_or(StatusCode::FORBIDDEN)?;
+    if !user.enabled || !user.is_admin() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let token = state.sessions.create_session();
+    tracing::info!(
+        "Admin session created via login-as for '{}' ({})",
+        user.name,
+        user.access_key_id
+    );
+
+    let cookie = format!(
+        "dgp_session={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400",
+        token
+    );
+
+    Ok((
+        StatusCode::OK,
+        [(header::SET_COOKIE, cookie)],
+        Json(LoginResponse { ok: true }),
+    ))
 }
 
 /// GET /api/admin/config — return sanitized config (no secrets).
@@ -519,7 +614,7 @@ pub async fn change_password(
                 Json(PasswordChangeResponse {
                     ok: false,
                     error: Some(
-                        "Password hash is corrupted. Delete .deltaglider_admin_hash and restart."
+                        "Password hash is corrupted. Delete .deltaglider_bootstrap_hash and restart."
                             .to_string(),
                     ),
                 }),
@@ -571,7 +666,7 @@ pub async fn change_password(
     }
 
     // Persist to state file
-    let state_file = std::path::Path::new(".deltaglider_admin_hash");
+    let state_file = std::path::Path::new(".deltaglider_bootstrap_hash");
     if let Err(e) = std::fs::write(state_file, &new_hash) {
         tracing::warn!("Failed to persist new admin hash: {}", e);
     }
@@ -579,7 +674,7 @@ pub async fn change_password(
     // Also update config
     {
         let mut cfg = state.config.write().await;
-        cfg.admin_password_hash = Some(new_hash);
+        cfg.bootstrap_password_hash = Some(new_hash);
     }
 
     (
