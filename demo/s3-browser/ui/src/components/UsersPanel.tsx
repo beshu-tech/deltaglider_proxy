@@ -27,6 +27,7 @@ export default function UsersPanel({ onSessionExpired }: UsersPanelProps) {
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [creating, setCreating] = useState(false);
   const [search, setSearch] = useState('');
+  const [newCreds, setNewCreds] = useState<{ ak: string; sk: string } | null>(null);
 
   const loadUsers = useCallback(async () => {
     setLoading(true);
@@ -53,20 +54,33 @@ export default function UsersPanel({ onSessionExpired }: UsersPanelProps) {
   const handleSelect = (user: IamUser) => {
     setCreating(false);
     setSelectedId(user.id);
+    setNewCreds(null);
   };
 
   const handleCreate = () => {
     setSelectedId(null);
     setCreating(true);
+    setNewCreds(null);
   };
 
   const handleSaved = () => {
     loadUsers();
   };
 
+  const handleCreated = async (ak: string, sk: string) => {
+    // Reload users, select the new one, show credentials banner
+    const data = await getUsers().catch(() => []);
+    setUsers(data);
+    const newUser = data.find(u => u.access_key_id === ak);
+    if (newUser) setSelectedId(newUser.id);
+    setCreating(false);
+    setNewCreds({ ak, sk });
+  };
+
   const handleDeleted = () => {
     setSelectedId(null);
     setCreating(false);
+    setNewCreds(null);
     loadUsers();
   };
 
@@ -163,10 +177,34 @@ export default function UsersPanel({ onSessionExpired }: UsersPanelProps) {
 
       {/* Right: Detail Form */}
       <div style={{ flex: 1, overflow: 'auto', background: colors.BG_CARD }}>
+        {/* Credentials banner after create */}
+        {newCreds && (
+          <div style={{ padding: '16px 28px 0' }}>
+            <Alert
+              type="success"
+              showIcon
+              closable
+              onClose={() => setNewCreds(null)}
+              message="User created — save these credentials"
+              description={
+                <div style={{ marginTop: 8 }}>
+                  <Text type="secondary" style={{ fontSize: 10, textTransform: 'uppercase' }}>Access Key</Text>
+                  <div><Text code copyable style={{ fontFamily: 'var(--font-mono)' }}>{newCreds.ak}</Text></div>
+                  <Text type="secondary" style={{ fontSize: 10, textTransform: 'uppercase', marginTop: 8, display: 'block' }}>Secret Key</Text>
+                  <div><Text code copyable style={{ fontFamily: 'var(--font-mono)', wordBreak: 'break-all' }}>{newCreds.sk}</Text></div>
+                  <Text type="warning" style={{ fontSize: 11, marginTop: 8, display: 'block' }}>The secret will not be shown again.</Text>
+                </div>
+              }
+              style={{ borderRadius: 8 }}
+            />
+          </div>
+        )}
+
         {creating ? (
           <UserForm
             user={null}
             onSaved={handleSaved}
+            onCreated={handleCreated}
             onCancel={() => setCreating(false)}
           />
         ) : selectedUser ? (
