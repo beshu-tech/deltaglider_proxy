@@ -332,6 +332,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     /// Acquire a per-deltaspace async lock. Different prefixes do not contend.
     async fn acquire_prefix_lock(&self, prefix: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        // Periodic cleanup on every lock acquisition (cheap — just checks len())
+        self.cleanup_prefix_locks();
         let mutex = self
             .prefix_locks
             .entry(prefix.to_string())
