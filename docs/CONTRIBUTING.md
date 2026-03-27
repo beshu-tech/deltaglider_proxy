@@ -27,7 +27,7 @@ cargo build
 DGP_DATA_DIR=./data cargo run
 ```
 
-The S3 API starts on `http://localhost:9000` and the demo UI on `http://localhost:9001`.
+The S3 API and demo UI both start on `http://localhost:9000`. The UI is available at `http://localhost:9000/_/`.
 
 ### Running Tests
 

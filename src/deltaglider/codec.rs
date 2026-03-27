@@ -11,7 +11,9 @@ use thiserror::Error;
 use tracing::{debug, instrument, warn};
 
 /// Maximum time to wait for xdelta3 subprocess to complete.
-const CODEC_TIMEOUT: Duration = Duration::from_secs(300);
+/// 60 seconds is generous for 100MB max object size — xdelta3 typically
+/// processes 100MB in <5s. Hung processes are killed to prevent cascading.
+const CODEC_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Wait for a child process with a timeout. Kills the child if the deadline is exceeded.
 fn wait_with_timeout(

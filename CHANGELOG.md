@@ -1,5 +1,60 @@
 # Changelog
 
+## v0.4.0
+
+### Single-Port Architecture
+
+- **UI served at `/_/`**: The embedded admin UI and all admin APIs are now served under `/_/` on the same port as the S3 API. No more separate port (was port+1). The `/_/` prefix is safe because `_` is not a valid S3 bucket name character. Health, stats, and metrics endpoints are available at both root (`/health`) and under `/_/` (`/_/health`).
+
+### IAM & Authentication
+
+- **Bootstrap password**: Renamed from "admin password". A single infrastructure secret that encrypts the SQLCipher config DB, signs admin session cookies, and gates admin GUI access in bootstrap mode. Auto-generated on first run. Backward-compatible aliases (`DGP_ADMIN_PASSWORD_HASH`, `--set-admin-password`) still work.
+- **Multi-user IAM (ABAC)**: Per-user credentials stored in encrypted SQLCipher database (`deltaglider_config.db`). Each user has access key, secret key, and permission rules with actions (`read`, `write`, `delete`, `list`, `admin`, `*`) and resource patterns (`bucket/*`). Admin = wildcard actions AND wildcard resources.
+- **IAM mode auto-activation**: When the first IAM user is created, the proxy switches from bootstrap mode to IAM mode. Bootstrap credentials are migrated as "legacy-admin" user. Admin GUI access becomes permission-based (no password needed for IAM admins).
+- **Admin API**: `/_/api/admin/users` CRUD, `/_/api/admin/users/:id/rotate-keys`, `/_/whoami`, `/_/api/admin/login-as` for IAM user impersonation.
+
+### S3 API Compatibility
+
+- **Range requests**: `Range` header support with 206 Partial Content responses, `Accept-Ranges: bytes` header on all object responses.
+- **Conditional headers**: `If-Match` / `If-Unmodified-Since` (412 Precondition Failed), `If-None-Match` / `If-Modified-Since` (304 Not Modified).
+- **Content-MD5 validation**: Validates `Content-MD5` header on PUT and UploadPart, rejects with 400 on mismatch.
+- **Copy metadata directive**: `x-amz-metadata-directive: COPY` (default) or `REPLACE` on CopyObject.
+- **ACL stubs**: GET/PUT `?acl` accepted and ignored for SDK compatibility.
+- **Response header overrides**: `response-content-type`, `response-content-disposition`, `response-content-encoding`, `response-content-language`, `response-expires` query parameters on GET.
+- **Per-request UUIDs**: `x-amz-request-id` header with unique UUID on every response.
+- **Bucket naming validation**: Extracted `ValidatedBucket` and `ValidatedPath` extractors for automatic S3 path validation.
+- **ListObjectsV2 improvements**: `start-after` parameter, `encoding-type` passthrough, `fetch-owner` support, base64 continuation tokens, max-keys capped at 1000.
+- **Real creation dates**: `ListBuckets` returns actual bucket creation timestamps.
+
+### Performance
+
+- **Lite LIST optimization**: LIST operations no longer issue per-object HEAD calls. Sizes shown are stored (compressed) sizes. ~8x faster for large listings.
+- **FS delimiter optimization**: `list_objects_delegated()` for filesystem backend uses a single `read_dir` at the prefix directory instead of a recursive walk when a delimiter is specified. Dramatically faster for buckets with many prefixes.
+
+### Security
+
+- **OsRng for tokens**: Session tokens and IAM access keys use `OsRng` (cryptographically secure) instead of `thread_rng`.
+- **DB rekey verification**: Bootstrap password changes verify the new key can open the database before committing.
+- **Proper transactions**: IAM user creation uses database transactions for atomicity.
+
+### Code Quality
+
+- **`S3Op` enum** (`storage/s3.rs`): Operation context for S3 error classification, replacing string-based operation names.
+- **Session cookie helpers** (`session.rs`): Extracted session store into its own module with `OsRng` token generation.
+- **`env_parse()` DRY** (`config.rs`): Extracted environment variable parsing boilerplate into reusable helpers.
+- **Dead code cleanup**: Removed `AdminGate`, unused `#/settings` route, dead `UsersTab` and `UserModal` components.
+
+### UI Features
+
+- **File preview**: Double-click on any previewable file (text, images) to view inline via the inspector panel. Tooltip indicates previewable files.
+- **Show/hide system files**: Toggle to show or hide DeltaGlider internal files (`.dg/` directory contents) in the object browser.
+- **Folder size computation**: Folder sizes computed and displayed in the object table.
+- **Delete user confirmation**: User deletion requires `window.confirm` dialog.
+- **Full-screen admin overlay**: Admin settings now use a full-screen overlay with master-detail layout for user management.
+- **Interactive API reference**: New `#/docs` page with interactive API documentation.
+- **Key rotation safety**: Prevents self-lockout on key rotation; changing only the secret key no longer regenerates the access key.
+- **Credentials display**: After creating a user, shows only the credentials with a dismissible banner before returning to the user list.
+
 ## v0.3.0
 
 ### S3-Compatible Endpoint Support

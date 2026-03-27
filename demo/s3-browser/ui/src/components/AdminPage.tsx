@@ -1,54 +1,103 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { Typography, Button, Input, Alert, Space, Spin } from 'antd';
 import { checkSession, adminLogin, whoami, loginAs } from '../adminApi';
 import {
-  CloseOutlined,
   CloudOutlined,
   DatabaseOutlined,
   ControlOutlined,
   TeamOutlined,
+  FolderOutlined,
   LockOutlined,
   ArrowLeftOutlined,
+  DashboardOutlined,
 } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import SettingsPage from './SettingsPage';
 import UsersPanel from './UsersPanel';
+import GroupsPanel from './GroupsPanel';
+import MetricsPage from './MetricsPage';
 
 const { Text } = Typography;
 
+const TAB_KEY_TO_HASH: Record<string, string> = {
+  users: '#/admin/users',
+  groups: '#/admin/groups',
+  metrics: '#/admin/metrics',
+  connection: '#/admin/connection',
+  backend: '#/admin/backend',
+  proxy: '#/admin/proxy',
+  security: '#/admin/bootstrap',
+};
+
+const HASH_TO_TAB: Record<string, string> = {
+  '#/admin': 'users',
+  '#/admin/users': 'users',
+  '#/admin/groups': 'groups',
+  '#/admin/metrics': 'metrics',
+  '#/admin/connection': 'connection',
+  '#/admin/backend': 'backend',
+  '#/admin/proxy': 'proxy',
+  '#/admin/bootstrap': 'security',
+};
+
+function readTabFromHash(): string {
+  return HASH_TO_TAB[window.location.hash] ?? 'users';
+}
+
 const TABS = [
+  { key: 'users', label: 'Users', icon: <TeamOutlined /> },
+  { key: 'groups', label: 'Groups', icon: <FolderOutlined /> },
+  { key: 'metrics', label: 'Metrics', icon: <DashboardOutlined /> },
   { key: 'connection', label: 'Connection', icon: <CloudOutlined /> },
   { key: 'backend', label: 'Backend', icon: <DatabaseOutlined /> },
   { key: 'proxy', label: 'Proxy', icon: <ControlOutlined /> },
-  { key: 'users', label: 'Users', icon: <TeamOutlined /> },
-  { key: 'security', label: 'Security', icon: <LockOutlined /> },
+  { key: 'security', label: 'Bootstrap', icon: <LockOutlined /> },
 ];
 
-interface AdminOverlayProps {
-  open: boolean;
-  onClose: () => void;
+interface AdminPageProps {
+  onBack: () => void;
   onSessionExpired?: () => void;
 }
 
-export default function AdminOverlay({ open, onClose, onSessionExpired }: AdminOverlayProps) {
+export default function AdminPage({ onBack, onSessionExpired }: AdminPageProps) {
   const colors = useColors();
-  const [activeTab, setActiveTab] = useState('users');
+  const [activeTab, setActiveTabState] = useState(readTabFromHash);
+
+  const setActiveTab = useCallback((tab: string) => {
+    setActiveTabState(tab);
+    const hash = TAB_KEY_TO_HASH[tab] || '#/admin/users';
+    if (window.location.hash !== hash) {
+      window.history.pushState(null, '', hash);
+    }
+  }, []);
+
+  // Sync tab from hash on browser back/forward
+  useEffect(() => {
+    const onHashChange = () => {
+      const tab = readTabFromHash();
+      setActiveTabState(tab);
+    };
+    window.addEventListener('hashchange', onHashChange);
+    return () => window.removeEventListener('hashchange', onHashChange);
+  }, []);
+
   const [authed, setAuthed] = useState(false);
   const [checkingSession, setCheckingSession] = useState(true);
   const [, setAuthMode] = useState<'bootstrap' | 'iam' | 'open'>('bootstrap');
   const [accessDenied, setAccessDenied] = useState(false);
   const [password, setPassword] = useState('');
   const [loginLoading, setLoginLoading] = useState(false);
+  const [pendingGroupId, setPendingGroupId] = useState<number | null>(null);
   const [loginError, setLoginError] = useState('');
+  const savingRef = { current: false };
+  const setSaving = useCallback((v: boolean) => { savingRef.current = v; }, []);
 
-  // Check existing session on open, or auto-login for IAM admins
+  // Check existing session on mount, or auto-login for IAM admins
   useEffect(() => {
-    if (!open) return;
     setCheckingSession(true);
     setAccessDenied(false);
 
     (async () => {
-      // First check if we already have a valid session
       const hasSession = await checkSession();
       if (hasSession) {
         setAuthed(true);
@@ -56,14 +105,12 @@ export default function AdminOverlay({ open, onClose, onSessionExpired }: AdminO
         return;
       }
 
-      // Check auth mode and try auto-login for IAM admins
       const ak = localStorage.getItem('dg-access-key-id') || undefined;
       const sk = localStorage.getItem('dg-secret-access-key') || undefined;
       const info = await whoami(ak, sk);
       setAuthMode(info.mode);
 
       if (info.mode === 'iam' && info.user?.is_admin && sk) {
-        // Auto-login: prove identity with secret key to get admin session
         const result = await loginAs(info.user.access_key_id, sk);
         if (result.ok) {
           setAuthed(true);
@@ -73,21 +120,10 @@ export default function AdminOverlay({ open, onClose, onSessionExpired }: AdminO
       } else if (info.mode === 'iam' && info.user && !info.user.is_admin) {
         setAccessDenied(true);
       }
-      // bootstrap/open mode: show password form (authed stays false)
 
       setCheckingSession(false);
     })();
-  }, [open]);
-
-  // Close on Escape
-  useEffect(() => {
-    if (!open) return;
-    const handleKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKey);
-    return () => window.removeEventListener('keydown', handleKey);
-  }, [open, onClose]);
+  }, []);
 
   const handleLogin = async () => {
     setLoginLoading(true);
@@ -108,17 +144,36 @@ export default function AdminOverlay({ open, onClose, onSessionExpired }: AdminO
     }
   };
 
-  if (!open) return null;
+  // Periodic session check every 5 minutes while page is active
+  useEffect(() => {
+    if (!authed) return;
+    const id = setInterval(async () => {
+      const valid = await checkSession();
+      if (!valid) {
+        onSessionExpired?.();
+      }
+    }, 5 * 60 * 1000);
+    return () => clearInterval(id);
+  }, [authed, onSessionExpired]);
+
+  const navigateToGroup = useCallback((groupId: number) => {
+    setPendingGroupId(groupId);
+    setActiveTab('groups');
+  }, [setActiveTab]);
 
   const renderContent = () => {
     if (activeTab === 'users') {
-      return <UsersPanel onSessionExpired={onSessionExpired} />;
+      return <UsersPanel onSessionExpired={onSessionExpired} onSavingChange={setSaving} onNavigateToGroup={navigateToGroup} />;
     }
-    // For non-Users tabs, render the existing SettingsPage content
-    // SettingsPage manages its own state — we pass the active tab to it
+    if (activeTab === 'groups') {
+      return <GroupsPanel onSessionExpired={onSessionExpired} onSavingChange={setSaving} initialGroupId={pendingGroupId} onGroupSelected={() => setPendingGroupId(null)} />;
+    }
+    if (activeTab === 'metrics') {
+      return <MetricsPage onBack={onBack} embedded />;
+    }
     return (
       <SettingsPage
-        onBack={onClose}
+        onBack={onBack}
         onSessionExpired={onSessionExpired}
         embeddedTab={activeTab}
       />
@@ -128,14 +183,14 @@ export default function AdminOverlay({ open, onClose, onSessionExpired }: AdminO
   // Access denied (IAM user without admin permissions)
   if (!authed && !checkingSession && accessDenied) {
     return (
-      <div style={{ position: 'fixed', inset: 0, zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', background: colors.BG_BASE }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 1, background: colors.BG_BASE }}>
         <div style={{ width: 380, padding: 40, textAlign: 'center' }}>
           <LockOutlined style={{ fontSize: 32, color: colors.ACCENT_RED, marginBottom: 12 }} />
           <div><Text strong style={{ fontSize: 18, fontFamily: 'var(--font-ui)' }}>Access Denied</Text></div>
           <Text type="secondary" style={{ fontSize: 13, display: 'block', marginTop: 8, marginBottom: 24 }}>
             Your account does not have admin permissions. Contact an administrator to grant you the &quot;admin&quot; action.
           </Text>
-          <Button type="primary" onClick={onClose} style={{ borderRadius: 10 }}>Close</Button>
+          <Button type="primary" onClick={onBack} style={{ borderRadius: 10 }}>Back to Browser</Button>
         </div>
       </div>
     );
@@ -144,7 +199,7 @@ export default function AdminOverlay({ open, onClose, onSessionExpired }: AdminO
   // Bootstrap login gate (only in bootstrap/open mode)
   if (!authed && !checkingSession) {
     return (
-      <div style={{ position: 'fixed', inset: 0, zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', background: colors.BG_BASE }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 1, background: colors.BG_BASE }}>
         <form onSubmit={e => { e.preventDefault(); handleLogin(); }} style={{ width: 380, padding: 40 }}>
           <div style={{ textAlign: 'center', marginBottom: 24 }}>
             <LockOutlined style={{ fontSize: 32, color: colors.ACCENT_BLUE, marginBottom: 12 }} />
@@ -165,7 +220,7 @@ export default function AdminOverlay({ open, onClose, onSessionExpired }: AdminO
               style={{ borderRadius: 10, height: 44, fontWeight: 600 }}>
               Sign In
             </Button>
-            <Button type="text" block onClick={onClose} style={{ color: colors.TEXT_MUTED }}>Cancel</Button>
+            <Button type="text" block onClick={onBack} style={{ color: colors.TEXT_MUTED }}>Cancel</Button>
           </Space>
         </form>
       </div>
@@ -174,7 +229,7 @@ export default function AdminOverlay({ open, onClose, onSessionExpired }: AdminO
 
   if (checkingSession) {
     return (
-      <div style={{ position: 'fixed', inset: 0, zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', background: colors.BG_BASE }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 1, background: colors.BG_BASE }}>
         <Spin size="large" />
       </div>
     );
@@ -182,11 +237,9 @@ export default function AdminOverlay({ open, onClose, onSessionExpired }: AdminO
 
   return (
     <div style={{
-      position: 'fixed',
-      inset: 0,
-      zIndex: 1000,
       display: 'flex',
       flexDirection: 'column',
+      flex: 1,
       background: colors.BG_BASE,
     }}>
       {/* Header */}
@@ -203,7 +256,7 @@ export default function AdminOverlay({ open, onClose, onSessionExpired }: AdminO
         <Button
           type="text"
           icon={<ArrowLeftOutlined />}
-          onClick={onClose}
+          onClick={onBack}
           style={{ color: colors.TEXT_SECONDARY, fontWeight: 500 }}
         >
           Back to Browser
@@ -211,7 +264,8 @@ export default function AdminOverlay({ open, onClose, onSessionExpired }: AdminO
         <Text strong style={{ fontSize: 15, fontFamily: 'var(--font-ui)', letterSpacing: 1, textTransform: 'uppercase', color: colors.TEXT_MUTED }}>
           Admin Settings
         </Text>
-        <Button type="text" icon={<CloseOutlined />} onClick={onClose} style={{ color: colors.TEXT_MUTED }} />
+        {/* Spacer to balance the header layout */}
+        <div style={{ width: 120 }} />
       </div>
 
       {/* Body: sidebar tabs + content */}

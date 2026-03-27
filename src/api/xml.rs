@@ -11,16 +11,26 @@ pub struct S3Object {
     pub last_modified: DateTime<Utc>,
     pub etag: String,
     pub storage_class: String,
+    /// Optional user metadata (MinIO `metadata=true` extension for ListObjectsV2)
+    #[serde(skip)]
+    pub user_metadata: Option<std::collections::HashMap<String, String>>,
 }
 
 impl S3Object {
-    pub fn new(key: String, size: u64, last_modified: DateTime<Utc>, etag: String) -> Self {
+    pub fn new(
+        key: String,
+        size: u64,
+        last_modified: DateTime<Utc>,
+        etag: String,
+        user_metadata: Option<std::collections::HashMap<String, String>>,
+    ) -> Self {
         Self {
             key,
             size,
             last_modified,
             etag,
             storage_class: "STANDARD".to_string(),
+            user_metadata,
         }
     }
 }
@@ -46,6 +56,10 @@ pub struct ListBucketResult {
     pub encoding_type: Option<String>,
     /// v1 vs v2 flag
     pub is_v1: bool,
+    /// v2: whether to include owner info in each <Contents>
+    pub fetch_owner: bool,
+    /// v2: the original start-after value from the request
+    pub start_after: Option<String>,
 }
 
 impl ListBucketResult {
@@ -88,6 +102,8 @@ impl ListBucketResult {
             next_marker,
             encoding_type,
             is_v1: true,
+            fetch_owner: false,
+            start_after: None,
         }
     }
 
@@ -103,6 +119,9 @@ impl ListBucketResult {
         continuation_token: Option<String>,
         next_continuation_token: Option<String>,
         is_truncated: bool,
+        encoding_type: Option<String>,
+        fetch_owner: bool,
+        start_after: Option<String>,
     ) -> Self {
         let key_count = u32::try_from(contents.len() + common_prefixes.len()).unwrap_or(u32::MAX);
         Self {
@@ -118,8 +137,10 @@ impl ListBucketResult {
             next_continuation_token,
             marker: None,
             next_marker: None,
-            encoding_type: None,
+            encoding_type,
             is_v1: false,
+            fetch_owner,
+            start_after,
         }
     }
 
@@ -157,7 +178,8 @@ impl ListBucketResult {
                 "  <IsTruncated>{}</IsTruncated>\n",
                 self.is_truncated
             ));
-            if self.is_truncated {
+            // Gap 7: per S3 spec, NextMarker is only emitted when a delimiter is present
+            if self.is_truncated && self.delimiter.is_some() {
                 if let Some(ref nm) = self.next_marker {
                     xml.push_str(&format!(
                         "  <NextMarker>{}</NextMarker>\n",
@@ -166,7 +188,7 @@ impl ListBucketResult {
                 }
             }
         } else {
-            // v2: <KeyCount>, <ContinuationToken>, <NextContinuationToken>
+            // v2: <KeyCount>, <ContinuationToken>, <NextContinuationToken>, <StartAfter>
             xml.push_str(&format!("  <KeyCount>{}</KeyCount>\n", self.key_count));
             xml.push_str(&format!(
                 "  <IsTruncated>{}</IsTruncated>\n",
@@ -186,6 +208,14 @@ impl ListBucketResult {
                     escape_xml(token)
                 ));
             }
+
+            // Gap 6: emit <StartAfter> when the request included start-after
+            if let Some(ref sa) = self.start_after {
+                xml.push_str(&format!(
+                    "  <StartAfter>{}</StartAfter>\n",
+                    self.encode_value(sa)
+                ));
+            }
         }
 
         for obj in &self.contents {
@@ -201,6 +231,30 @@ impl ListBucketResult {
                 "    <StorageClass>{}</StorageClass>\n",
                 obj.storage_class
             ));
+            // Gap 4: include <Owner> when fetch_owner is true
+            if self.fetch_owner {
+                xml.push_str("    <Owner>\n");
+                xml.push_str("      <ID>dgp</ID>\n");
+                xml.push_str("      <DisplayName>deltaglider</DisplayName>\n");
+                xml.push_str("    </Owner>\n");
+            }
+            // MinIO extension: include <UserMetadata> when metadata=true
+            if let Some(ref um) = obj.user_metadata {
+                if !um.is_empty() {
+                    xml.push_str("    <UserMetadata>\n");
+                    let mut keys: Vec<&String> = um.keys().collect();
+                    keys.sort();
+                    for key in keys {
+                        let value = &um[key];
+                        xml.push_str(&format!(
+                            "      <Items><Key>{}</Key><Value>{}</Value></Items>\n",
+                            escape_xml(key),
+                            escape_xml(value)
+                        ));
+                    }
+                    xml.push_str("    </UserMetadata>\n");
+                }
+            }
             xml.push_str("  </Contents>\n");
         }
 

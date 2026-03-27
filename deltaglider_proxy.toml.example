@@ -19,27 +19,44 @@ max_object_size = 104857600
 # Larger cache = faster delta reconstruction, more memory usage.
 cache_size_mb = 100
 
-# Authentication (optional)
-# -------------------------
-# When both are set, all S3 requests must be SigV4-signed (header or presigned URL).
+# S3 Authentication (bootstrap mode)
+# -----------------------------------
+# Initial S3 credentials used before IAM users are created.
+# When both are set, all S3 requests must be SigV4-signed.
 # When unset, open access.
 #
 # access_key_id = "myaccesskey"
 # secret_access_key = "mysecretkey"
 
-# IAM Users (optional)
-# --------------------
-# Multi-user access control is managed via the admin GUI (Settings → Users tab).
-# Users are stored in an encrypted database (deltaglider_config.db) created
-# automatically next to this config file. The database is encrypted with the
-# admin GUI password hash — changing the admin password re-encrypts the DB.
+# Bootstrap Password
+# ------------------
+# A single infrastructure secret that:
+#   - Encrypts the IAM user database (SQLCipher)
+#   - Gates admin GUI access before IAM users exist
+#   - Signs admin session cookies
 #
-# When IAM users exist, the legacy access_key_id/secret_access_key above are
-# ignored and each user authenticates with their own credentials.
+# Auto-generated on first run (printed to stderr). Set explicitly via:
+#   --set-bootstrap-password CLI flag, or DGP_BOOTSTRAP_PASSWORD_HASH env var.
+#
+# Reset: --set-bootstrap-password (WARNING: invalidates encrypted IAM database)
+#
+# bootstrap_password_hash = "$2b$12$..."
+
+# IAM Users
+# ---------
+# Multi-user access control managed via the admin GUI (Admin Settings → Users).
+# Users are stored in deltaglider_config.db (encrypted with bootstrap password).
+# Created automatically on first run.
+#
+# Once IAM users exist:
+#   - S3 auth switches to per-user credentials
+#   - Admin GUI access is determined by user permissions (actions: ["*"] or ["admin"])
+#   - The bootstrap S3 credentials above are migrated as "legacy-admin" user
+#   - No bootstrap password needed for admin GUI (IAM admins log in directly)
 
 # TLS (optional)
 # --------------
-# Enable HTTPS for both S3 and admin UI ports.
+# Enable HTTPS. S3 API and admin UI are served on the same port.
 # Mode 1: Self-signed (no cert_path/key_path — auto-generates on startup)
 # Mode 2: User-provided (set cert_path + key_path to PEM files)
 #
@@ -88,8 +105,9 @@ path = "./data"
 #   DGP_ACCESS_KEY_ID         - Proxy access key
 #   DGP_SECRET_ACCESS_KEY     - Proxy secret key
 #
-# Admin GUI:
-#   DGP_ADMIN_PASSWORD_HASH   - Bcrypt hash of admin password (auto-generated if unset)
+# Bootstrap password:
+#   DGP_BOOTSTRAP_PASSWORD_HASH - Bcrypt hash of bootstrap password (auto-generated if unset)
+#   DGP_ADMIN_PASSWORD_HASH     - Deprecated alias for DGP_BOOTSTRAP_PASSWORD_HASH
 #
 # Logging:
 #   DGP_LOG_LEVEL             - Log level filter (e.g. "deltaglider_proxy=info,tower_http=warn")

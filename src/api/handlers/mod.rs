@@ -9,6 +9,7 @@
 mod bucket;
 mod multipart;
 mod object;
+mod object_helpers;
 mod status;
 
 use super::errors::S3Error;
@@ -50,6 +51,21 @@ pub struct ObjectQuery {
     /// UploadPart (PUT with ?partNumber)
     #[serde(rename = "partNumber")]
     pub part_number: Option<u32>,
+    /// ACL operations (GET/PUT with ?acl)
+    pub acl: Option<String>,
+    /// Response header overrides for presigned URLs
+    #[serde(rename = "response-content-type")]
+    pub response_content_type: Option<String>,
+    #[serde(rename = "response-content-disposition")]
+    pub response_content_disposition: Option<String>,
+    #[serde(rename = "response-cache-control")]
+    pub response_cache_control: Option<String>,
+    #[serde(rename = "response-content-encoding")]
+    pub response_content_encoding: Option<String>,
+    #[serde(rename = "response-content-language")]
+    pub response_content_language: Option<String>,
+    #[serde(rename = "response-expires")]
+    pub response_expires: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -72,6 +88,12 @@ fn build_object_headers(metadata: &FileMetadata) -> HeaderMap {
     let mut itoa_buf = itoa::Buffer::new();
 
     let mut headers = HeaderMap::new();
+    // S3 compatibility: per-request unique ID and range support advertisement
+    headers.insert(
+        "x-amz-request-id",
+        header_value(&uuid::Uuid::new_v4().to_string()),
+    );
+    headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
     headers.insert("ETag", header_value(&metadata.etag()));
     // Only set Content-Length when we actually know the file size.
     // When file_size is 0 and the body is streamed, omitting Content-Length

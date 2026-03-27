@@ -60,6 +60,15 @@ pub trait StorageBackend: Send + Sync {
     /// List all buckets
     async fn list_buckets(&self) -> Result<Vec<String>, StorageError>;
 
+    /// List all buckets with their creation dates.
+    /// Default implementation falls back to `list_buckets()` with current time.
+    async fn list_buckets_with_dates(
+        &self,
+    ) -> Result<Vec<(String, chrono::DateTime<chrono::Utc>)>, StorageError> {
+        let names = self.list_buckets().await?;
+        Ok(names.into_iter().map(|n| (n, chrono::Utc::now())).collect())
+    }
+
     /// Check if a bucket exists
     async fn head_bucket(&self, bucket: &str) -> Result<bool, StorageError>;
 
@@ -247,6 +256,20 @@ pub trait StorageBackend: Send + Sync {
         prefix: &str,
     ) -> Result<Vec<(String, FileMetadata)>, StorageError>;
 
+    /// Enrich listed objects with full metadata from HEAD calls.
+    /// Used by the `metadata=true` MinIO ListObjectsV2 extension.
+    ///
+    /// The default implementation returns objects unchanged (suitable for
+    /// backends like filesystem that already populate full metadata in
+    /// `bulk_list_objects`).
+    async fn enrich_list_metadata(
+        &self,
+        _bucket: &str,
+        objects: Vec<(String, FileMetadata)>,
+    ) -> Result<Vec<(String, FileMetadata)>, StorageError> {
+        Ok(objects)
+    }
+
     /// Optimised listing with delimiter support.
     ///
     /// Backends that can delegate delimiter collapsing to the underlying store
@@ -288,6 +311,11 @@ macro_rules! impl_storage_backend_for_box {
             }
             async fn list_buckets(&self) -> Result<Vec<String>, StorageError> {
                 (**self).list_buckets().await
+            }
+            async fn list_buckets_with_dates(
+                &self,
+            ) -> Result<Vec<(String, chrono::DateTime<chrono::Utc>)>, StorageError> {
+                (**self).list_buckets_with_dates().await
             }
             async fn head_bucket(&self, bucket: &str) -> Result<bool, StorageError> {
                 (**self).head_bucket(bucket).await
@@ -470,6 +498,13 @@ macro_rules! impl_storage_backend_for_box {
                 prefix: &str,
             ) -> Result<Vec<(String, FileMetadata)>, StorageError> {
                 (**self).bulk_list_objects(bucket, prefix).await
+            }
+            async fn enrich_list_metadata(
+                &self,
+                bucket: &str,
+                objects: Vec<(String, FileMetadata)>,
+            ) -> Result<Vec<(String, FileMetadata)>, StorageError> {
+                (**self).enrich_list_metadata(bucket, objects).await
             }
             async fn list_objects_delegated(
                 &self,

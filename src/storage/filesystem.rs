@@ -1,11 +1,12 @@
 //! Filesystem-based storage backend with xattr-based metadata
 
-use super::traits::{StorageBackend, StorageError};
+use super::traits::{DelegatedListResult, StorageBackend, StorageError};
 use super::xattr_meta;
 use crate::types::FileMetadata;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
@@ -388,6 +389,14 @@ impl StorageBackend for FilesystemBackend {
 
     #[instrument(skip(self))]
     async fn list_buckets(&self) -> Result<Vec<String>, StorageError> {
+        let dated = self.list_buckets_with_dates().await?;
+        Ok(dated.into_iter().map(|(name, _)| name).collect())
+    }
+
+    #[instrument(skip(self))]
+    async fn list_buckets_with_dates(
+        &self,
+    ) -> Result<Vec<(String, chrono::DateTime<chrono::Utc>)>, StorageError> {
         let mut buckets = Vec::new();
         if !path_exists(&self.root).await {
             return Ok(buckets);
@@ -397,11 +406,18 @@ impl StorageBackend for FilesystemBackend {
             let ft = entry.file_type().await?;
             if ft.is_dir() {
                 if let Some(name) = entry.file_name().to_str() {
-                    buckets.push(name.to_string());
+                    let created = entry
+                        .metadata()
+                        .await
+                        .ok()
+                        .and_then(|m| m.created().ok().or_else(|| m.modified().ok()))
+                        .map(chrono::DateTime::<chrono::Utc>::from)
+                        .unwrap_or_else(chrono::Utc::now);
+                    buckets.push((name.to_string(), created));
                 }
             }
         }
-        buckets.sort();
+        buckets.sort_by(|a, b| a.0.cmp(&b.0));
         debug!("Listed {} filesystem buckets", buckets.len());
         Ok(buckets)
     }
@@ -809,5 +825,237 @@ impl StorageBackend for FilesystemBackend {
             prefix
         );
         Ok(results)
+    }
+
+    /// Optimised single-level listing for `delimiter = "/"`.
+    ///
+    /// Instead of recursively walking every subdirectory and then collapsing
+    /// results in-memory, we do a single `read_dir` at the directory implied
+    /// by `prefix` and classify entries into objects vs common-prefixes.
+    #[instrument(skip(self))]
+    async fn list_objects_delegated(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: &str,
+        max_keys: u32,
+        continuation_token: Option<&str>,
+    ) -> Result<Option<DelegatedListResult>, StorageError> {
+        // Only handle the "/" delimiter; fall back for anything else.
+        if delimiter != "/" {
+            return Ok(None);
+        }
+
+        let deltaspaces_dir = self.bucket_dir(bucket).join("deltaspaces");
+
+        // Split prefix into (directory to read, filename filter).
+        // e.g. "builds/v" → dir = "builds", filter = "v"
+        // e.g. "builds/"  → dir = "builds", filter = ""
+        // e.g. ""         → dir = "",        filter = ""
+        let (dir_part, name_filter) = if prefix.is_empty() {
+            ("", "")
+        } else if let Some(idx) = prefix.rfind('/') {
+            (&prefix[..idx], &prefix[idx + 1..])
+        } else {
+            // prefix has no slash → listing root with a name filter
+            ("", prefix)
+        };
+
+        let read_dir_path = if dir_part.is_empty() {
+            deltaspaces_dir.clone()
+        } else {
+            deltaspaces_dir.join(dir_part)
+        };
+
+        // Non-existent directory → empty result (not an error).
+        if !path_exists(&read_dir_path).await {
+            return Ok(Some(DelegatedListResult {
+                objects: Vec::new(),
+                common_prefixes: Vec::new(),
+                is_truncated: false,
+                next_continuation_token: None,
+            }));
+        }
+
+        // Single-level read_dir.
+        let mut entries = fs::read_dir(&read_dir_path).await?;
+
+        // Collect common prefixes and candidate object files.
+        // Use BTreeMap for objects keyed by user-visible key so that
+        // delta+passthrough duplicates are resolved (delta wins).
+        let mut common_prefixes = std::collections::BTreeSet::new();
+        let mut object_map: BTreeMap<String, (PathBuf, bool)> = BTreeMap::new(); // key → (path, is_delta)
+
+        while let Some(entry) = entries.next_entry().await? {
+            let ft = entry.file_type().await?;
+            let os_name = entry.file_name();
+            let name = match os_name.to_str() {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+
+            // Skip hidden/internal entries.
+            if name.starts_with('.') {
+                continue;
+            }
+
+            if ft.is_dir() {
+                // Skip the `.dg` internal directory (already caught by dot check
+                // above, but be explicit for clarity).
+                if name == ".dg" {
+                    continue;
+                }
+
+                // Build user-visible common-prefix: dir_part + name + "/"
+                let cp = if dir_part.is_empty() {
+                    format!("{}/", name)
+                } else {
+                    format!("{}/{}/", dir_part, name)
+                };
+
+                // Apply name filter: the directory name must start with name_filter.
+                if !name_filter.is_empty() && !name.starts_with(name_filter) {
+                    continue;
+                }
+
+                common_prefixes.insert(cp);
+            } else {
+                // File — skip reference.bin.
+                if name == "reference.bin" {
+                    continue;
+                }
+
+                let is_delta = name.ends_with(".delta");
+                let user_filename = if is_delta {
+                    // Strip ".delta" suffix to get the user-visible name.
+                    name[..name.len() - 6].to_string()
+                } else {
+                    name.clone()
+                };
+
+                // Apply name filter.
+                if !name_filter.is_empty() && !user_filename.starts_with(name_filter) {
+                    continue;
+                }
+
+                // Build the full user-visible key.
+                let user_key = if dir_part.is_empty() {
+                    user_filename
+                } else {
+                    format!("{}/{}", dir_part, user_filename)
+                };
+
+                // Dedup: prefer delta metadata over passthrough when both exist.
+                match object_map.get(&user_key) {
+                    Some((_, existing_is_delta)) => {
+                        if is_delta && !existing_is_delta {
+                            // Delta takes precedence over passthrough.
+                            object_map.insert(user_key, (entry.path(), true));
+                        }
+                        // If existing is already delta, or both are passthrough, keep existing.
+                    }
+                    None => {
+                        object_map.insert(user_key, (entry.path(), is_delta));
+                    }
+                }
+            }
+        }
+
+        // Interleave objects and common prefixes for unified sort+pagination.
+        // S3 ListObjectsV2 counts both objects and common prefixes toward max_keys.
+        enum Entry {
+            Obj(String, PathBuf),
+            Prefix(String),
+        }
+        let mut all_entries: Vec<(String, Entry)> = Vec::new();
+
+        for (key, (path, _)) in object_map {
+            all_entries.push((key.clone(), Entry::Obj(key, path)));
+        }
+        for cp in &common_prefixes {
+            all_entries.push((cp.clone(), Entry::Prefix(cp.clone())));
+        }
+
+        // Sort lexicographically by key (already mostly sorted from BTreeMap/BTreeSet).
+        all_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Apply continuation_token: skip entries <= token.
+        if let Some(token) = continuation_token {
+            all_entries.retain(|e| e.0.as_str() > token);
+        }
+
+        // Truncate at max_keys.
+        let max = max_keys as usize;
+        let is_truncated = all_entries.len() > max;
+        if all_entries.len() > max {
+            all_entries.truncate(max);
+        }
+        let next_token = if is_truncated {
+            all_entries.last().map(|(key, _)| key.clone())
+        } else {
+            None
+        };
+
+        // Resolve metadata for object entries.
+        let mut final_objects: Vec<(String, FileMetadata)> = Vec::new();
+        let mut final_prefixes: Vec<String> = Vec::new();
+
+        for (_, entry) in all_entries {
+            match entry {
+                Entry::Obj(key, path) => {
+                    let filename = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or_default();
+                    let meta = match xattr_meta::read_metadata(&path).await {
+                        Ok(m) => m,
+                        Err(StorageError::NotFound(_)) => {
+                            match Self::fallback_metadata_from_path(&path, filename).await {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    debug!(
+                                        "Skipping {:?} in delegated list (metadata error): {}",
+                                        path, e
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            debug!("Skipping {:?} in delegated list (xattr error): {}", path, e);
+                            continue;
+                        }
+                    };
+
+                    // Skip Reference storage info (should not appear as user objects).
+                    if matches!(
+                        meta.storage_info,
+                        crate::types::StorageInfo::Reference { .. }
+                    ) {
+                        continue;
+                    }
+
+                    final_objects.push((key, meta));
+                }
+                Entry::Prefix(p) => {
+                    final_prefixes.push(p);
+                }
+            }
+        }
+
+        debug!(
+            "Delegated list (fs): {} objects + {} prefixes in {}/{}",
+            final_objects.len(),
+            final_prefixes.len(),
+            bucket,
+            prefix
+        );
+
+        Ok(Some(DelegatedListResult {
+            objects: final_objects,
+            common_prefixes: final_prefixes,
+            is_truncated,
+            next_continuation_token: next_token,
+        }))
     }
 }

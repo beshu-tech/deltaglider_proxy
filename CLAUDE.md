@@ -16,7 +16,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 
 # Demo UI (must be built before cargo build — rust-embed embeds dist/)
 cd demo/s3-browser/ui && npm ci && npm run build
-npm run dev                    # dev server on :5173, proxies /api to :9001
+npm run dev                    # dev server on :5173, proxies /api to :9000
 
 # Tests (MinIO required for S3 integration tests)
 cargo test --all --locked
@@ -35,12 +35,20 @@ CI runs: `fmt` → `clippy -D warnings` → `test` (with MinIO) → RustSec audi
 
 ```
 HTTP request
-  → api/handlers.rs    S3-compatible handlers (GET/PUT/HEAD/DELETE/LIST)
-  → api/auth.rs        Optional SigV4 authentication middleware
+  → api/handlers/       S3-compatible handlers split by domain:
+      object.rs            GET/PUT/HEAD/DELETE (range, conditional, Content-MD5, ACL stubs)
+      bucket.rs            Bucket CRUD and ListObjectsV2 (start-after, encoding-type, fetch-owner, base64 tokens)
+      multipart.rs         Multipart upload lifecycle
+      status.rs            /health, /stats, /metrics
+  → api/auth.rs         SigV4 authentication middleware (bootstrap or per-user IAM)
   → deltaglider/engine.rs   Orchestration: route, compress, cache, reconstruct
   → storage/traits.rs       StorageBackend trait (async_trait, object-safe)
-  → storage/filesystem.rs   Local filesystem impl (xattr metadata)
-  → storage/s3.rs           AWS S3/MinIO impl (S3 user metadata headers)
+  → storage/filesystem.rs   Local filesystem impl (xattr metadata, list_objects_delegated)
+  → storage/s3.rs           AWS S3/MinIO impl (S3 user metadata headers, S3Op enum)
+  → demo.rs                 Embedded UI + admin API router, mounted under /_/
+  → session.rs              In-memory session store (OsRng tokens, 24h TTL)
+  → iam.rs                  IAM types, ABAC permissions, auth middleware
+  → config_db.rs            Encrypted SQLCipher database for IAM users
 ```
 
 **Key data flow:**
@@ -49,7 +57,7 @@ HTTP request
 - **Deltaspace layout**: `bucket/prefix/.dg/reference.bin` + `bucket/prefix/key[.delta]`
 
 **Important types:**
-- `StorageBackend` (trait in `storage/traits.rs`) — all storage operations; two impls: Filesystem, S3
+- `StorageBackend` (trait in `storage/traits.rs`) — all storage operations; two impls: Filesystem, S3. Includes `list_objects_delegated()` for optimized delimiter-based listing.
 - `SharedConfig` = `Arc<RwLock<Config>>` — hot-reloadable via admin API
 - `RetrieveResponse` — enum: `Streamed` (zero-copy passthrough) vs `Buffered` (delta reconstruction, includes `cache_hit: Option<bool>`)
 - `FileMetadata` (in `types.rs`) — per-object metadata with DG-specific tags; `fallback()` constructor for unmanaged objects
@@ -57,14 +65,35 @@ HTTP request
 - `Engine::validated_key()` — shared parse+validate+deltaspace_id helper used by all public engine methods
 - `IamState` (in `iam.rs`) — enum: `Disabled`, `Legacy(AuthConfig)`, or `Iam(IamIndex)` for multi-user auth
 - `ConfigDb` (in `config_db.rs`) — encrypted SQLCipher database for IAM users, stored as `deltaglider_config.db`
+- `S3Op` (in `storage/s3.rs`) — enum for S3 operation context in error classification
+- `SessionStore` (in `session.rs`) — in-memory session store with OsRng token generation and 24h TTL
+- `env_parse()` / `env_parse_opt()` (in `config.rs`) — DRY helpers for environment variable parsing
 
 **Config:** TOML file (`deltaglider_proxy.toml`) with env var overrides (`DGP_*` prefix). See `deltaglider_proxy.toml.example`.
 
+## Authentication & IAM
+
+Two auth modes, determined at runtime by whether IAM users exist in the config DB:
+
+- **Bootstrap mode**: Single credential pair from TOML/env vars. Admin GUI requires the bootstrap password. This is the default on fresh installs.
+- **IAM mode**: Per-user credentials from encrypted SQLCipher DB (`deltaglider_config.db`). Admin GUI access is permission-based (no password needed for IAM admins).
+
+The **bootstrap password** is a single infrastructure secret that:
+1. Encrypts the SQLCipher config DB
+2. Signs admin GUI session cookies
+3. Gates admin GUI access in bootstrap mode (before IAM users exist)
+
+Auto-generated on first run (printed to stderr). Reset via `--set-bootstrap-password` CLI flag (warning: invalidates encrypted IAM database).
+
+IAM users have ABAC permissions: `{ actions: ["read", "write", "delete", "list", "admin"], resources: ["bucket/*"] }`. Admin = wildcard actions AND wildcard resources.
+
+Key files: `src/iam.rs` (types, permissions, middleware), `src/config_db.rs` (SQLCipher CRUD), `src/api/admin.rs` (user management API + whoami/login-as).
+
 ## Frontend (demo/s3-browser/ui)
 
-React 18 + TypeScript + Ant Design 6 + Recharts. Hash-based routing (`#/browse`, `#/upload`, `#/settings`, `#/metrics`). Embedded in the Rust binary via `rust-embed` and served on listen_addr + 1 (e.g., proxy on :9000, UI on :9001).
+React 18 + TypeScript + Ant Design 6 + Recharts. Hash-based routing (`#/browse`, `#/upload`, `#/metrics`, `#/docs`, `#/admin`). Embedded in the Rust binary via `rust-embed` and served under `/_/` on the same port as the S3 API (e.g., `http://localhost:9000/_/`). The `/_/` prefix is safe because `_` is not a valid S3 bucket name character. Single-port architecture: no separate UI port.
 
-Key components: `MetricsPage` (Prometheus dashboard with live charts), `ObjectTable`, `InspectorPanel`, `SettingsPage`. Admin API in `adminApi.ts`, S3 operations in `s3client.ts`. The demo server exposes `/metrics`, `/stats`, and `/health` endpoints (proxied from the S3 server state).
+Key components: `MetricsPage` (Prometheus dashboard with live charts), `ObjectTable`, `FilePreview` (double-click preview for text/images), `AdminOverlay` (full-screen settings with user management), `UsersPanel` (master-detail IAM user CRUD with ABAC permissions, key rotation, delete with `window.confirm`), `UserForm`, `ApiDocsPage` (interactive API reference). Admin API at `/_/api/admin/*` (login, login-as, whoami, users CRUD, config, password). S3 operations in `s3client.ts`. Metrics at `/_/metrics`, stats at `/_/stats`, health at `/_/health`.
 
 ## Testing
 

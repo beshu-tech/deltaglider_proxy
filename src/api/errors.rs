@@ -47,6 +47,9 @@ pub enum S3Error {
     #[error("BadDigest: The Content-MD5 you specified did not match what we received.")]
     BadDigest,
 
+    #[error("InvalidDigest: The Content-MD5 you specified is not valid.")]
+    InvalidDigest,
+
     #[error("NotImplemented: {0}")]
     NotImplemented(String),
 
@@ -61,6 +64,18 @@ pub enum S3Error {
 
     #[error("RequestTimeTooSkewed: The difference between the request time and the server's time is too large.")]
     RequestTimeTooSkewed,
+
+    #[error("InvalidBucketName: The specified bucket is not valid.")]
+    InvalidBucketName(String),
+
+    #[error("InvalidRange: The requested range is not satisfiable.")]
+    InvalidRange,
+
+    #[error("NotModified")]
+    NotModified { etag: String, last_modified: String },
+
+    #[error("PreconditionFailed: At least one of the pre-conditions you specified did not hold.")]
+    PreconditionFailed,
 }
 
 impl S3Error {
@@ -80,11 +95,16 @@ impl S3Error {
             S3Error::InvalidPart(_) => "InvalidPart",
             S3Error::InvalidPartOrder => "InvalidPartOrder",
             S3Error::BadDigest => "BadDigest",
+            S3Error::InvalidDigest => "InvalidDigest",
             S3Error::NotImplemented(_) => "NotImplemented",
             S3Error::AccessDenied => "AccessDenied",
             S3Error::SignatureDoesNotMatch => "SignatureDoesNotMatch",
             S3Error::SlowDown(_) => "SlowDown",
             S3Error::RequestTimeTooSkewed => "RequestTimeTooSkewed",
+            S3Error::InvalidBucketName(_) => "InvalidBucketName",
+            S3Error::InvalidRange => "InvalidRange",
+            S3Error::NotModified { .. } => "NotModified",
+            S3Error::PreconditionFailed => "PreconditionFailed",
         }
     }
 
@@ -104,16 +124,21 @@ impl S3Error {
             S3Error::InvalidPart(_) => StatusCode::BAD_REQUEST,
             S3Error::InvalidPartOrder => StatusCode::BAD_REQUEST,
             S3Error::BadDigest => StatusCode::BAD_REQUEST,
+            S3Error::InvalidDigest => StatusCode::BAD_REQUEST,
             S3Error::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             S3Error::AccessDenied => StatusCode::FORBIDDEN,
             S3Error::SignatureDoesNotMatch => StatusCode::FORBIDDEN,
             S3Error::SlowDown(_) => StatusCode::SERVICE_UNAVAILABLE,
             S3Error::RequestTimeTooSkewed => StatusCode::FORBIDDEN,
+            S3Error::InvalidBucketName(_) => StatusCode::BAD_REQUEST,
+            S3Error::InvalidRange => StatusCode::RANGE_NOT_SATISFIABLE,
+            S3Error::NotModified { .. } => StatusCode::NOT_MODIFIED,
+            S3Error::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
         }
     }
 
-    /// Generate XML error response
-    pub fn to_xml(&self) -> String {
+    /// Generate XML error response with a unique request ID.
+    pub fn to_xml(&self, request_id: &str) -> String {
         let resource = match self {
             S3Error::NoSuchKey(key) => escape_xml(key),
             S3Error::NoSuchBucket(bucket) => escape_xml(bucket),
@@ -126,11 +151,12 @@ impl S3Error {
     <Code>{}</Code>
     <Message>{}</Message>
     <Resource>{}</Resource>
-    <RequestId>00000000-0000-0000-0000-000000000000</RequestId>
+    <RequestId>{}</RequestId>
 </Error>"#,
             self.code(),
             self,
-            resource
+            resource,
+            request_id
         )
     }
 }
@@ -138,9 +164,35 @@ impl S3Error {
 impl IntoResponse for S3Error {
     fn into_response(self) -> Response {
         let status = self.status_code();
-        let body = self.to_xml();
+        let request_id = uuid::Uuid::new_v4().to_string();
 
-        (status, [("Content-Type", "application/xml")], body).into_response()
+        // NotModified has no body per HTTP spec, but MUST include ETag and Last-Modified (RFC 7232)
+        if let S3Error::NotModified {
+            ref etag,
+            ref last_modified,
+        } = self
+        {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                "x-amz-request-id",
+                axum::http::HeaderValue::from_str(&request_id).unwrap(),
+            );
+            headers.insert("ETag", axum::http::HeaderValue::from_str(etag).unwrap());
+            headers.insert(
+                "Last-Modified",
+                axum::http::HeaderValue::from_str(last_modified).unwrap(),
+            );
+            return (status, headers).into_response();
+        }
+
+        let body = self.to_xml(&request_id);
+
+        let mut response = (status, [("Content-Type", "application/xml")], body).into_response();
+        response.headers_mut().insert(
+            "x-amz-request-id",
+            axum::http::HeaderValue::from_str(&request_id).unwrap(),
+        );
+        response
     }
 }
 

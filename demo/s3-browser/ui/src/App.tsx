@@ -7,7 +7,7 @@ import Sidebar from './components/Sidebar';
 import ObjectTable from './components/ObjectTable';
 import InspectorPanel from './components/InspectorPanel';
 import FilePreview from './components/FilePreview';
-import AdminOverlay from './components/AdminOverlay';
+import AdminPage from './components/AdminPage';
 import DropZone from './components/DropZone';
 import UploadPage from './components/UploadPage';
 import ConnectPage from './components/ConnectPage';
@@ -17,11 +17,12 @@ import { getBucket, hasCredentials, setCredentials } from './s3client';
 import { adminLogout, whoami } from './adminApi';
 import type { WhoamiResponse } from './adminApi';
 import { useColors } from './ThemeContext';
+import useComputeSize from './useComputeSize';
 
 const { Content } = Layout;
 const { useBreakpoint } = Grid;
 
-type View = 'browser' | 'upload' | 'metrics' | 'docs';
+type View = 'browser' | 'upload' | 'metrics' | 'docs' | 'admin';
 
 const HASH_TO_VIEW: Record<string, View> = {
   '': 'browser',
@@ -29,7 +30,14 @@ const HASH_TO_VIEW: Record<string, View> = {
   '#/browse': 'browser',
   '#/upload': 'upload',
   '#/settings': 'browser', // legacy redirect
-  '#/admin': 'browser', // admin overlay handled separately
+  '#/admin': 'admin',
+  '#/admin/users': 'admin',
+  '#/admin/groups': 'admin',
+  '#/admin/connection': 'admin',
+  '#/admin/backend': 'admin',
+  '#/admin/proxy': 'admin',
+  '#/admin/metrics': 'admin',
+  '#/admin/bootstrap': 'admin',
   '#/metrics': 'metrics',
   '#/docs': 'docs',
 };
@@ -39,6 +47,7 @@ const VIEW_TO_HASH: Record<View, string> = {
   upload: '#/upload',
   metrics: '#/metrics',
   docs: '#/docs',
+  admin: '#/admin',
 };
 
 function readViewFromHash(): View {
@@ -86,7 +95,6 @@ export default function App() {
   const [needsConnect, setNeedsConnect] = useState(!hasCredentials());
   const [firstLoadDone, setFirstLoadDone] = useState(false);
   const [previewObject, setPreviewObject] = useState<import('./types').S3Object | null>(null);
-  const [adminOpen, setAdminOpen] = useState(window.location.hash === '#/admin');
   const [identity, setIdentity] = useState<WhoamiResponse | null>(null);
 
   // Check identity after S3 connection is established
@@ -100,32 +108,19 @@ export default function App() {
     }
   }, [needsConnect]);
 
-  const openAdmin = useCallback(() => {
-    setAdminOpen(true);
-    window.history.pushState(null, '', '#/admin');
-  }, []);
-
-  const closeAdmin = useCallback(() => {
-    setAdminOpen(false);
-    if (window.location.hash === '#/admin') {
-      window.history.pushState(null, '', '#/browse');
-    }
-  }, []);
-
-  // Sync admin overlay with hash (supports browser back button + refresh)
-  useEffect(() => {
-    const onHashChange = () => {
-      setAdminOpen(window.location.hash === '#/admin');
-    };
-    window.addEventListener('hashchange', onHashChange);
-    return () => window.removeEventListener('hashchange', onHashChange);
-  }, []);
-
   const screens = useBreakpoint();
   const isMobile = !screens.md;
   const mainRef = useRef<HTMLElement>(null);
 
   const s3 = useS3Browser();
+  const folderSize = useComputeSize();
+
+  // Clear folder size computations and preview when prefix or bucket changes
+  useEffect(() => {
+    folderSize.cancelAll();
+    setPreviewObject(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [s3.prefix]);
 
   // Dynamic page title on view change
   useEffect(() => {
@@ -134,6 +129,7 @@ export default function App() {
       upload: 'Upload — DeltaGlider Proxy',
       metrics: 'Metrics — DeltaGlider Proxy',
       docs: 'API Reference — DeltaGlider Proxy',
+      admin: 'Admin Settings — DeltaGlider Proxy',
     };
     document.title = titles[view];
   }, [view]);
@@ -172,23 +168,23 @@ export default function App() {
 
   if (needsConnect) {
     return (
-      <>
-        <ConnectPage
-          onConnect={() => { setNeedsConnect(false); s3.reconnect(); }}
-          showError={hasCredentials()}
-        />
-        {adminOpen && (
-          <AdminOverlay
-            open={adminOpen}
-            onClose={closeAdmin}
-            onSessionExpired={closeAdmin}
-          />
-        )}
-      </>
+      <ConnectPage
+        onConnect={() => { setNeedsConnect(false); s3.reconnect(); }}
+        showError={hasCredentials()}
+      />
     );
   }
 
   const renderContent = () => {
+    if (view === 'admin') {
+      return (
+        <AdminPage
+          onBack={() => setView('browser')}
+          onSessionExpired={() => setView('browser')}
+        />
+      );
+    }
+
     if (view === 'metrics') {
       return <MetricsPage onBack={() => setView('browser')} />;
     }
@@ -261,14 +257,11 @@ export default function App() {
               refreshing={s3.refreshing}
               headCache={s3.headCache}
               onEnrichKeys={s3.enrichKeys}
-              onPreview={setPreviewObject}
+              folderSizes={folderSize.sizes}
+              onComputeSize={folderSize.compute}
+              onCancelSize={folderSize.cancel}
             />
           )}
-          <FilePreview
-            open={previewObject !== null}
-            object={previewObject}
-            onClose={() => setPreviewObject(null)}
-          />
         </div>
       </>
     );
@@ -282,45 +275,48 @@ export default function App() {
       </a>
 
       <Layout style={{ flexDirection: 'row', flex: 1 }}>
-        <Sidebar
-          onUploadClick={() => { setView('upload'); setSiderOpen(false); }}
-          onMutate={s3.mutate}
-          refreshTrigger={s3.refreshTrigger}
-          onBucketChange={handleBucketChange}
-          open={siderOpen}
-          onClose={() => setSiderOpen(false)}
-          isMobile={isMobile}
-          onMetricsClick={() => {
-            setView('metrics');
-            setSiderOpen(false);
-          }}
-          onSettingsClick={() => {
-            openAdmin();
-            setSiderOpen(false);
-          }}
-          onDocsClick={() => {
-            setView('docs');
-            setSiderOpen(false);
-          }}
-          onLogout={handleLogout}
-          currentUser={localStorage.getItem('dg-access-key-id') || undefined}
-          canAdmin={identity?.mode === 'bootstrap' || identity?.mode === 'open' || identity?.user?.is_admin === true}
-        />
+        {view !== 'admin' && (
+          <Sidebar
+            onUploadClick={() => { setView('upload'); setSiderOpen(false); }}
+            onMutate={s3.mutate}
+            refreshTrigger={s3.refreshTrigger}
+            onBucketChange={handleBucketChange}
+            open={siderOpen}
+            onClose={() => setSiderOpen(false)}
+            isMobile={isMobile}
+            onSettingsClick={() => {
+              setView('admin');
+              setSiderOpen(false);
+            }}
+            onDocsClick={() => {
+              setView('docs');
+              setSiderOpen(false);
+            }}
+            onLogout={handleLogout}
+            currentUser={localStorage.getItem('dg-access-key-id') || undefined}
+            displayName={identity?.user?.name || undefined}
+            canAdmin={identity?.mode === 'bootstrap' || identity?.mode === 'open' || identity?.user?.is_admin === true}
+          />
+        )}
 
         <Layout style={{ flex: 1, background: colors.BG_BASE }}>
-          <TopBar
-            prefix={s3.prefix}
-            onNavigate={(p) => { setView('browser'); s3.navigate(p); }}
-            isMobile={isMobile}
-            onMenuClick={() => setSiderOpen(true)}
-            onRefresh={s3.mutate}
-            searchQuery={s3.searchQuery}
-            onSearchChange={s3.setSearchQuery}
-            refreshing={s3.refreshing}
-          />
+          {view !== 'admin' && (
+            <TopBar
+              prefix={s3.prefix}
+              onNavigate={(p) => { setView('browser'); s3.navigate(p); }}
+              isMobile={isMobile}
+              onMenuClick={() => setSiderOpen(true)}
+              onRefresh={s3.mutate}
+              searchQuery={s3.searchQuery}
+              onSearchChange={s3.setSearchQuery}
+              refreshing={s3.refreshing}
+              showHidden={s3.showHidden}
+              onToggleHidden={() => s3.setShowHidden(!s3.showHidden)}
+            />
+          )}
 
-          <main id="main-content" ref={mainRef} tabIndex={-1} style={{ outline: 'none', flex: 1, overflow: 'auto' }}>
-            <Content style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+          <main id="main-content" ref={mainRef} tabIndex={-1} style={{ outline: 'none', flex: 1, overflow: 'auto', display: 'flex', flexDirection: 'column' }}>
+            <Content style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
               {renderContent()}
             </Content>
           </main>
@@ -331,18 +327,17 @@ export default function App() {
         object={s3.selected}
         onClose={() => s3.setSelected(null)}
         onDeleted={s3.mutate}
+        onPreview={setPreviewObject}
         isMobile={isMobile}
         headCache={s3.headCache}
       />
 
+      <FilePreview
+        open={previewObject !== null}
+        object={previewObject}
+        onClose={() => setPreviewObject(null)}
+      />
       {view === 'browser' && <DropZone onDrop={s3.uploadFiles} prefix={s3.prefix} />}
-      {adminOpen && (
-        <AdminOverlay
-          open={adminOpen}
-          onClose={closeAdmin}
-          onSessionExpired={closeAdmin}
-        />
-      )}
     </Layout>
   );
 }

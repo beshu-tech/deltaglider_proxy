@@ -1,62 +1,127 @@
 # Authentication
 
-DeltaGlider Proxy supports AWS Signature Version 4 (SigV4) authentication. When configured, all S3 API requests must be signed with the proxy's credentials — either via the standard `Authorization` header or via presigned URL query parameters.
+DeltaGlider Proxy supports AWS Signature Version 4 (SigV4) authentication with two operational modes: **bootstrap mode** (single credential pair) and **IAM mode** (per-user credentials with attribute-based access control).
 
-## How It Works
+## Auth Modes
 
-The proxy maintains its own credential pair, independent of any backend storage credentials. Clients sign requests using the standard SigV4 algorithm. The proxy verifies the signature, then makes its own separately-authenticated requests to the backend.
+### Bootstrap Mode (default on fresh install)
 
-- **Filesystem backend**: Proxy credentials are the only auth layer
-- **S3 backend**: Proxy credentials authenticate clients to the proxy; separate AWS credentials authenticate the proxy to the upstream S3 service
-
-When no credentials are configured, the proxy operates in open-access mode (no authentication required).
-
-### Two Authentication Paths
-
-The proxy accepts SigV4 credentials from two sources, unified internally into a single verification pipeline:
-
-| Path | Source | Use case |
-|------|--------|----------|
-| **Header auth** | `Authorization: AWS4-HMAC-SHA256 ...` header + `x-amz-date` + `x-amz-content-sha256` headers | Standard S3 SDK calls (aws-cli, boto3, etc.) |
-| **Presigned URL** | `X-Amz-Algorithm`, `X-Amz-Credential`, `X-Amz-Signature`, `X-Amz-Date`, `X-Amz-Expires`, `X-Amz-SignedHeaders` query parameters | Browser downloads, shareable links, `aws s3 presign` |
-
-Both paths extract parameters into the same internal representation, then run identical signature verification logic — reconstruct canonical request, derive signing key, compare HMAC-SHA256 signatures.
-
-## Configuration
-
-### Environment Variables
+A single S3 credential pair is configured via TOML or environment variables. All clients share the same credentials. Admin GUI access requires the **bootstrap password**.
 
 ```bash
+# S3 credentials (client-to-proxy)
 export DGP_ACCESS_KEY_ID=myaccesskey
 export DGP_SECRET_ACCESS_KEY=mysecretkey
 ```
 
-Both must be set together. If only one is set, auth remains disabled.
+### IAM Mode (activates when IAM users exist)
 
-### Config File
+Per-user credentials stored in an encrypted SQLCipher database (`deltaglider_config.db`). Each user has their own access key, secret key, and permission rules. Admin GUI access is permission-based — IAM admins don't need a password.
 
-```toml
-access_key_id = "myaccesskey"
-secret_access_key = "mysecretkey"
+IAM mode activates automatically when the first IAM user is created via the admin GUI. The bootstrap credentials are migrated as a "legacy-admin" user.
 
-[backend]
-type = "filesystem"
-path = "./data"
+### Open Access
+
+When no credentials are configured, the proxy operates without authentication.
+
+## Bootstrap Password
+
+A single infrastructure secret that serves three purposes:
+
+1. **Encrypts the config database** — IAM users are stored in SQLCipher, encrypted with the bcrypt hash of this password
+2. **Signs admin session cookies** — HMAC-based session authentication for the admin GUI
+3. **Gates admin GUI access** — In bootstrap mode (before IAM users exist), this password is required to access settings
+
+### Lifecycle
+
+- **Auto-generated** on first run if not set (printed to stderr, hash saved to `.deltaglider_bootstrap_hash`)
+- **Set explicitly** via `DGP_BOOTSTRAP_PASSWORD_HASH` env var or `bootstrap_password_hash` in TOML
+- **Reset** via `--set-bootstrap-password` CLI flag
+
+> **Warning**: Resetting the bootstrap password invalidates the encrypted IAM database. All IAM users will be lost on next restart.
+
+### Backward Compatibility
+
+| New | Old (deprecated alias) |
+|-----|------------------------|
+| `DGP_BOOTSTRAP_PASSWORD_HASH` | `DGP_ADMIN_PASSWORD_HASH` |
+| `bootstrap_password_hash` (TOML) | `admin_password_hash` |
+| `--set-bootstrap-password` | `--set-admin-password` |
+| `.deltaglider_bootstrap_hash` | `.deltaglider_admin_hash` (read as fallback) |
+
+## IAM Permissions (ABAC)
+
+Each IAM user has one or more permission rules:
+
+```json
+{
+  "actions": ["read", "write", "delete", "list"],
+  "resources": ["mybucket/*"]
+}
 ```
 
-### S3 Backend with Separate Credentials
+### Actions
 
-When using the S3 backend, the proxy needs two sets of credentials:
+| Action | S3 Operations |
+|--------|---------------|
+| `read` | GetObject, HeadObject |
+| `write` | PutObject, CopyObject, CreateMultipartUpload, UploadPart, CompleteMultipartUpload |
+| `delete` | DeleteObject, DeleteObjects |
+| `list` | ListBuckets, ListObjectsV2, ListMultipartUploads, ListParts |
+| `admin` | Admin GUI access |
+| `*` | All actions |
 
-1. **Proxy credentials** (`DGP_ACCESS_KEY_ID` / `DGP_SECRET_ACCESS_KEY`) — for client-to-proxy auth
-2. **Backend credentials** (`DGP_BE_AWS_ACCESS_KEY_ID` / `DGP_BE_AWS_SECRET_ACCESS_KEY`) — for proxy-to-S3 auth
+### Resources
+
+Glob patterns matching `bucket/key`:
+- `*` — all buckets and keys (full admin)
+- `mybucket/*` — all keys in `mybucket`
+- `mybucket/releases/*` — keys under `releases/` prefix
+
+A user is considered an **admin** when they have both wildcard actions (`*` or `admin`) AND wildcard resources (`*`).
+
+## Admin GUI Access Flow
+
+```
+Fresh install (no IAM users)
+  → Bootstrap mode
+  → Admin GUI requires bootstrap password
+  → Create IAM users via admin GUI
+
+IAM users exist
+  → IAM mode activates
+  → Admin GUI auto-detects mode via /_/whoami
+  → IAM admins: auto-login (no password needed)
+  → Non-admin IAM users: "Access Denied" message
+  → Bootstrap password only needed for DB encryption/recovery
+```
+
+## SigV4 Verification
+
+The proxy verifies SigV4 signatures from two sources:
+
+| Path | Source | Use case |
+|------|--------|----------|
+| **Header auth** | `Authorization: AWS4-HMAC-SHA256 ...` header | Standard S3 SDK calls (aws-cli, boto3, etc.) |
+| **Presigned URL** | `X-Amz-Algorithm`, `X-Amz-Credential`, `X-Amz-Signature` query parameters | Browser downloads, shareable links |
+
+Both paths extract the access key ID, look up the user (bootstrap: single credential; IAM: lookup by access key in IamIndex), and verify the HMAC-SHA256 signature against the user's secret key.
+
+### Verify-Then-Re-sign
+
+SigV4 signatures are bound to the Host header and URI path. The proxy's host/port differs from upstream S3, and internal storage paths (deltaspaces, references, deltas) differ from the logical keys clients use.
+
+The proxy cannot forward the client's signature — it verifies it, discards it, and makes its own authenticated requests to the backend using the AWS SDK (which signs automatically with the backend credentials).
+
+## S3 Backend Credentials
+
+When using the S3 backend, the proxy needs two credential sets:
+
+1. **Proxy credentials** — for client-to-proxy auth (bootstrap or per-user IAM)
+2. **Backend credentials** — for proxy-to-upstream-S3 auth
 
 ```bash
-# Proxy auth (what clients use)
-export DGP_ACCESS_KEY_ID=proxy-key
-export DGP_SECRET_ACCESS_KEY=proxy-secret
-
-# Backend auth (what the proxy uses to talk to S3/MinIO)
+# Backend auth (proxy → upstream S3/MinIO)
 export DGP_BE_AWS_ACCESS_KEY_ID=minioadmin
 export DGP_BE_AWS_SECRET_ACCESS_KEY=minioadmin
 export DGP_S3_ENDPOINT=http://localhost:9000
@@ -71,16 +136,8 @@ export AWS_ACCESS_KEY_ID=myaccesskey
 export AWS_SECRET_ACCESS_KEY=mysecretkey
 export AWS_DEFAULT_REGION=us-east-1
 
-# Upload
 aws --endpoint-url http://localhost:9000 s3 cp file.zip s3://mybucket/file.zip
-
-# Download
-aws --endpoint-url http://localhost:9000 s3 cp s3://mybucket/file.zip ./
-
-# List
 aws --endpoint-url http://localhost:9000 s3 ls s3://mybucket/
-
-# Generate a presigned download URL (valid 1 hour)
 aws --endpoint-url http://localhost:9000 s3 presign s3://mybucket/file.zip --expires-in 3600
 ```
 
@@ -98,9 +155,6 @@ s3 = boto3.client(
 )
 
 s3.upload_file('file.zip', 'mybucket', 'file.zip')
-s3.download_file('mybucket', 'file.zip', 'downloaded.zip')
-
-# Generate a presigned download URL
 url = s3.generate_presigned_url(
     'get_object',
     Params={'Bucket': 'mybucket', 'Key': 'file.zip'},
@@ -108,111 +162,21 @@ url = s3.generate_presigned_url(
 )
 ```
 
-### curl (unsigned — will be rejected when auth is enabled)
-
-```bash
-# This will return 403 AccessDenied when auth is enabled
-curl http://localhost:9000/mybucket/file.zip
-```
-
-When auth is enabled, all requests must be SigV4-signed. Use aws-cli, boto3, or another S3 SDK that handles signing automatically.
-
-## Why the Proxy Verifies (and Re-signs) Itself
-
-SigV4 signatures are bound to the **Host header** and **URI path** of the request. The proxy's host/port differs from upstream S3, and internal storage paths (deltaspaces, references, deltas) differ from the logical keys clients use.
-
-A client's signature for `GET /mybucket/releases/v2.zip` at `proxy:9000` would be invalid for `GET /releases/v2.zip.delta` at `s3.amazonaws.com`. The proxy cannot forward the client's signature — it must verify it, discard it, and make its own authenticated requests to the backend using the AWS SDK (which signs automatically with the backend credentials).
-
-This is true for both header-auth and presigned URL requests. The presigned URL query parameters are never forwarded upstream.
-
-## Presigned URL Flow
-
-Presigned URLs carry SigV4 credentials in query parameters instead of headers. The proxy verifies them the same way, then makes a fresh SDK-signed request to the backend.
-
-```
-  ┌────────┐                  ┌─────────────────┐                ┌──────────┐
-  │ Client │                  │ DeltaGlider     │                │ Backend  │
-  │        │                  │ Proxy           │                │ S3       │
-  └───┬────┘                  └───────┬─────────┘                └────┬─────┘
-      │                               │                               │
-      │  GET /bucket/key              │                               │
-      │  ?X-Amz-Algorithm=...        │                               │
-      │  &X-Amz-Credential=PROXY_AK  │                               │
-      │  &X-Amz-Signature=abc123     │                               │
-      │  &X-Amz-Date=20260215T...    │                               │
-      │  &X-Amz-Expires=3600         │                               │
-      │ ─────────────────────────────>│                               │
-      │                               │                               │
-      │                    ┌──────────┴──────────┐                    │
-      │                    │ 1. Detect presigned  │                    │
-      │                    │    (X-Amz-Algorithm  │                    │
-      │                    │    in query params)  │                    │
-      │                    │ 2. Parse credentials │                    │
-      │                    │ 3. Check expiration  │                    │
-      │                    │ 4. Rebuild canonical │                    │
-      │                    │    request (without  │                    │
-      │                    │    X-Amz-Signature)  │                    │
-      │                    │ 5. Derive signing key│                    │
-      │                    │    from PROXY secret │                    │
-      │                    │ 6. Verify signature  │                    │
-      │                    └──────────┬──────────┘                    │
-      │                               │                               │
-      │                               │  GET /internal/storage/path   │
-      │                               │  Authorization: AWS4-HMAC-... │
-      │                               │  (signed by AWS SDK with      │
-      │                               │   BACKEND credentials)        │
-      │                               │ ─────────────────────────────>│
-      │                               │                               │
-      │                               │  200 OK + stored data         │
-      │                               │ <─────────────────────────────│
-      │                               │                               │
-      │  200 OK + reconstructed file  │                               │
-      │  (delta patched if needed)    │                               │
-      │ <─────────────────────────────│                               │
-      │                               │                               │
-```
-
-Key points:
-- The client signs against the **proxy's** credentials and host
-- The proxy verifies once, then discards all SigV4 artifacts
-- The upstream request uses **backend** credentials, possibly targeting different storage paths (deltas, references)
-- The two signature contexts are completely independent
-- Expiration (`X-Amz-Expires`) is enforced — expired presigned URLs are rejected immediately
-- Unparseable `X-Amz-Expires` or `X-Amz-Date` values are rejected (hard failure, not silently ignored)
-
-## Header Auth Flow
-
-Standard header-based auth follows the same verify-then-re-sign pattern:
-
-```
-1. Client sends request with Authorization: AWS4-HMAC-SHA256 ... header
-2. Proxy extracts access key, credential scope, signed headers, and signature
-3. Proxy verifies the access key matches its configured key
-4. Proxy reconstructs the canonical request from the HTTP request
-5. Proxy derives the signing key from its secret access key
-6. Proxy computes the expected signature and compares
-7. On match: request proceeds to the handler
-   On mismatch: 403 SignatureDoesNotMatch returned
-8. Handler makes backend requests via AWS SDK (re-signed with backend credentials)
-```
-
-For GET/HEAD/DELETE requests, the payload hash is `UNSIGNED-PAYLOAD` or the SHA-256 of the empty string — verification is header-only and inexpensive.
-
-For PUT requests, the `x-amz-content-sha256` header value is used as the payload hash in signature verification. The actual body integrity is verified downstream by the engine's SHA-256 checksum.
-
 ## Error Responses
 
 | Error Code | HTTP Status | Cause |
 |---|---|---|
-| `AccessDenied` | 403 | Missing credentials, access key mismatch, or expired presigned URL |
+| `AccessDenied` | 403 | Missing credentials, access key mismatch, expired presigned URL, or insufficient permissions |
 | `SignatureDoesNotMatch` | 403 | Signature verification failed |
-| `InvalidArgument` | 400 | Malformed Authorization header, unparseable `X-Amz-Expires`, or unparseable `X-Amz-Date` |
+| `RequestTimeTooSkewed` | 403 | Client clock differs from server by more than 15 minutes |
+| `InvalidArgument` | 400 | Malformed Authorization header or unparseable date/expiry values |
 
 All errors are returned as standard S3 XML error responses.
 
 ## Security Considerations
 
-- **Use HTTPS in production**: SigV4 authenticates requests but does not encrypt the transport. Use a TLS-terminating reverse proxy (nginx, Caddy, ALB) in front of DeltaGlider Proxy for production deployments.
-- **Credential management**: Store credentials securely. Use environment variables or a secrets manager rather than config files in version control.
-- **Presigned URL expiration**: Presigned URLs are validated against `X-Amz-Expires`. Generate short-lived URLs when possible.
+- **Use HTTPS in production**: SigV4 authenticates but does not encrypt. Use a TLS-terminating reverse proxy or enable DeltaGlider's built-in TLS.
+- **Bootstrap password security**: The bootstrap password encrypts the IAM database. Treat it like a master key. Store it securely.
+- **Credential rotation**: IAM user keys can be rotated via the admin GUI without downtime.
+- **Presigned URL expiration**: Generate short-lived URLs when possible. Expiration is enforced server-side.
 - **Region**: The proxy accepts any region in the credential scope. Standard S3 tools default to `us-east-1`.

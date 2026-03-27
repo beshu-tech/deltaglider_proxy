@@ -1,6 +1,7 @@
 //! In-memory session store for admin GUI authentication.
 
 use parking_lot::RwLock;
+use rand::rngs::OsRng;
 use rand::Rng;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -32,9 +33,8 @@ impl SessionStore {
 
     /// Create a new session and return the token (64-char hex string).
     pub fn create_session(&self) -> String {
-        let mut rng = rand::thread_rng();
         let mut bytes = [0u8; 32];
-        rng.fill(&mut bytes);
+        OsRng.fill(&mut bytes);
         let token = hex::encode(bytes);
 
         self.sessions.write().insert(

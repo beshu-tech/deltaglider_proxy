@@ -1,17 +1,19 @@
 import { useState, useEffect, useRef } from 'react';
 import { Drawer, Button, Modal, message, Tag, Skeleton, Input, Spin } from 'antd';
-import { DownloadOutlined, DeleteOutlined, LinkOutlined, FileOutlined, CloseOutlined, CheckCircleFilled, CopyOutlined, LoadingOutlined } from '@ant-design/icons';
+import { DownloadOutlined, DeleteOutlined, LinkOutlined, FileOutlined, CloseOutlined, CheckCircleFilled, CopyOutlined, LoadingOutlined, EyeOutlined } from '@ant-design/icons';
 import { deleteObject, downloadObject, getPresignedUrl, getObjectUrl, headObject } from '../s3client';
 import { formatBytes } from '../utils';
 import type { S3Object } from '../types';
 import { useColors } from '../ThemeContext';
+import { getPreviewMode } from './FilePreview';
 
 interface Props {
   object: S3Object | null;
   onClose: () => void;
   onDeleted: () => void;
+  onPreview?: (obj: S3Object) => void;
   isMobile?: boolean;
-  headCache?: Record<string, { storageType?: string; storedSize?: number }>;
+  headCache?: Record<string, { storageType?: string; storedSize?: number; error?: boolean }>;
 }
 
 function getDgMetadata(headers: Record<string, string>): [string, string][] {
@@ -26,7 +28,7 @@ function getUserMetadata(headers: Record<string, string>): [string, string][] {
     .map(([k, v]) => [k.replace('x-amz-meta-', ''), v]);
 }
 
-export default function InspectorPanel({ object, onClose, onDeleted, isMobile, headCache }: Props) {
+export default function InspectorPanel({ object, onClose, onDeleted, onPreview, isMobile, headCache }: Props) {
   const {
     BG_SIDEBAR, BORDER, TEXT_PRIMARY, TEXT_MUTED, TEXT_FAINT,
     ACCENT_BLUE, ACCENT_GREEN, ACCENT_RED, STORAGE_TYPE_COLORS, STORAGE_TYPE_DEFAULT,
@@ -224,6 +226,24 @@ export default function InspectorPanel({ object, onClose, onDeleted, isMobile, h
 
           {/* Content */}
           <div style={{ flex: 1, overflow: 'auto', padding: '16px 20px' }}>
+            {/* Preview button (only for previewable files) */}
+            {onPreview && object && getPreviewMode(object.key) && (
+              <Button
+                block
+                size="large"
+                icon={<EyeOutlined />}
+                onClick={() => onPreview(object)}
+                style={{
+                  fontWeight: 600,
+                  borderRadius: 10,
+                  fontFamily: "var(--font-ui)",
+                  marginBottom: 8,
+                }}
+              >
+                Preview
+              </Button>
+            )}
+
             {/* Download & Share buttons */}
             <div style={{ display: 'flex', gap: 8, marginBottom: 20 }}>
               <Button

@@ -1,13 +1,13 @@
-import { useState, useEffect, useCallback } from 'react';
-import { Table, Tag, Tooltip, Typography, Alert, Progress, Checkbox, theme } from 'antd';
-import { FolderOutlined, FileOutlined, LoadingOutlined } from '@ant-design/icons';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { Table, Tag, Tooltip, Typography, Alert, Progress, Checkbox, theme, Button } from 'antd';
+import { FolderOutlined, FileOutlined, LoadingOutlined, CalculatorOutlined, CloseCircleOutlined, WarningOutlined } from '@ant-design/icons';
 import type { S3Object } from '../types';
 import { formatBytes, displayName, timeAgo } from '../utils';
 import type { ColumnsType } from 'antd/es/table';
 import { useColors } from '../ThemeContext';
-import { getPreviewMode } from './FilePreview';
+import type { FolderSizeState } from '../useComputeSize';
 
-const { Link, Text } = Typography;
+const { Text } = Typography;
 
 interface Props {
   objects: S3Object[];
@@ -22,9 +22,11 @@ interface Props {
   isMobile: boolean;
   isTruncated: boolean;
   refreshing: boolean;
-  headCache: Record<string, { storageType?: string; storedSize?: number }>;
+  headCache: Record<string, { storageType?: string; storedSize?: number; error?: boolean }>;
   onEnrichKeys: (keys: string[]) => void;
-  onPreview?: (obj: S3Object) => void;
+  folderSizes: Record<string, FolderSizeState>;
+  onComputeSize: (prefix: string) => void;
+  onCancelSize: (prefix: string) => void;
 }
 
 type RowData = { _isFolder: true; key: string; name: string } | (S3Object & { _isFolder: false; name: string });
@@ -44,13 +46,25 @@ export default function ObjectTable({
   refreshing,
   headCache,
   onEnrichKeys,
-  onPreview,
+  folderSizes,
+  onComputeSize,
+  onCancelSize,
 }: Props) {
   const { token } = theme.useToken();
   const { TEXT_PRIMARY, TEXT_SECONDARY, TEXT_MUTED, ACCENT_BLUE, ACCENT_AMBER, ACCENT_PURPLE, STORAGE_TYPE_COLORS, STORAGE_TYPE_DEFAULT } = useColors();
 
   const PAGE_SIZE = 100;
   const [currentPage, setCurrentPage] = useState(1);
+
+  // Guard against rapid folder clicks (issue #4)
+  const navigatingRef = useRef(false);
+  const guardedNavigate = useCallback((p: string) => {
+    if (navigatingRef.current) return;
+    navigatingRef.current = true;
+    onNavigate(p);
+    // Reset after a short delay to allow next navigation
+    setTimeout(() => { navigatingRef.current = false; }, 300);
+  }, [onNavigate]);
 
   // Reset to page 1 when data changes (prefix navigation, search, etc.)
   useEffect(() => { setCurrentPage(1); }, [prefix]);
@@ -149,7 +163,7 @@ export default function ObjectTable({
           return (
             <button
               className="btn-reset"
-              onClick={() => onNavigate(record.key.replace('folder:', ''))}
+              onClick={() => guardedNavigate(record.key.replace('folder:', ''))}
               style={{ fontWeight: 500, color: TEXT_PRIMARY, gap: 8, fontFamily: "var(--font-ui)" }}
             >
               <FolderOutlined aria-hidden="true" style={{ color: ACCENT_BLUE, fontSize: 15 }} />
@@ -157,24 +171,12 @@ export default function ObjectTable({
             </button>
           );
         }
-        const canPreview = onPreview && getPreviewMode(record.name) !== null;
-        const nameEl = (
-          <Link
-            onClick={() => onSelect(record)}
-            onDoubleClick={(e) => { e.stopPropagation(); if (onPreview) onPreview(record); }}
-            style={{ fontFamily: "var(--font-mono)", fontSize: 13, color: TEXT_PRIMARY, cursor: canPreview ? 'pointer' : undefined }}
-          >
-            {record.name}
-          </Link>
-        );
         return (
           <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <FileOutlined aria-hidden="true" style={{ color: fileIconColor(record.name), fontSize: 14 }} />
-            {canPreview ? (
-              <Tooltip title="Double-click to preview" mouseEnterDelay={0.5}>
-                {nameEl}
-              </Tooltip>
-            ) : nameEl}
+            <span style={{ fontFamily: "var(--font-mono)", fontSize: 13, color: TEXT_PRIMARY, cursor: 'pointer', flex: 1 }}>
+              {record.name}
+            </span>
           </span>
         );
       },
@@ -189,7 +191,63 @@ export default function ObjectTable({
         return sa - sb;
       },
       render: (_: unknown, record: RowData) => {
-        if (record._isFolder) return null;
+        if (record._isFolder) {
+          const folderPrefix = record.key.replace('folder:', '');
+          const sizeState = folderSizes[folderPrefix];
+          if (sizeState?.loading) {
+            return (
+              <Tooltip title={`${sizeState.progress ? formatBytes(sizeState.progress.totalSize) + ' stored across ' + sizeState.progress.totalFiles.toLocaleString() + ' files so far...' : 'Starting...'}`}>
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<CloseCircleOutlined />}
+                  onClick={(e) => { e.stopPropagation(); onCancelSize(folderPrefix); }}
+                  style={{ fontSize: 11, fontFamily: "var(--font-mono)", color: TEXT_SECONDARY, padding: '0 4px', height: 'auto' }}
+                >
+                  <LoadingOutlined style={{ marginRight: 4 }} />
+                  {sizeState.progress ? formatBytes(sizeState.progress.totalSize) : '...'}
+                </Button>
+              </Tooltip>
+            );
+          }
+          if (sizeState?.progress?.done) {
+            return (
+              <Tooltip title={`${sizeState.progress.totalFiles.toLocaleString()} files — stored (compressed) size`}>
+                <span
+                  style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: TEXT_SECONDARY, cursor: 'default' }}
+                >
+                  {formatBytes(sizeState.progress.totalSize)}
+                </span>
+              </Tooltip>
+            );
+          }
+          if (sizeState?.error) {
+            return (
+              <Tooltip title={sizeState.error}>
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<CalculatorOutlined />}
+                  onClick={(e) => { e.stopPropagation(); onComputeSize(folderPrefix); }}
+                  style={{ fontSize: 11, color: TEXT_MUTED, padding: '0 4px', height: 'auto' }}
+                >
+                  Retry
+                </Button>
+              </Tooltip>
+            );
+          }
+          return (
+            <Button
+              type="text"
+              size="small"
+              icon={<CalculatorOutlined />}
+              onClick={(e) => { e.stopPropagation(); onComputeSize(folderPrefix); }}
+              style={{ fontSize: 11, color: TEXT_MUTED, padding: '0 4px', height: 'auto' }}
+            >
+              Size
+            </Button>
+          );
+        }
         return <span style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: TEXT_SECONDARY }}>{formatBytes(record.size)}</span>;
       },
     },
@@ -226,6 +284,7 @@ export default function ObjectTable({
         if (record._isFolder) return null;
         const cached = headCache[record.key];
         if (!cached) return <LoadingOutlined style={{ fontSize: 12, color: TEXT_MUTED }} />;
+        if (cached.error) return <Tooltip title="Failed to load metadata"><WarningOutlined style={{ fontSize: 12, color: ACCENT_AMBER }} /></Tooltip>;
         return compressionTag(cached.storageType);
       },
     },
@@ -263,13 +322,13 @@ export default function ObjectTable({
             return '';
           }}
           onRow={(record) => ({
-            onDoubleClick: () => {
-              if (!record._isFolder && onPreview) onPreview(record);
+            onClick: () => {
+              if (!record._isFolder) onSelect(record);
             },
             style: {
               borderBottom: `1px solid ${token.colorBorderSecondary}`,
               transition: 'background 0.15s ease',
-              cursor: !record._isFolder && onPreview ? 'pointer' : undefined,
+              cursor: !record._isFolder ? 'pointer' : undefined,
             },
           })}
         />

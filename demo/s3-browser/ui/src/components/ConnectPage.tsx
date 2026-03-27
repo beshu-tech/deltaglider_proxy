@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { Button, Input, Typography, Space, Alert } from 'antd';
 import { ApiOutlined } from '@ant-design/icons';
 import { testConnection, setEndpoint, setCredentials, setBucket } from '../s3client';
-import { adminLogin } from '../adminApi';
+import { adminLogin, whoami } from '../adminApi';
 import { detectDefaultEndpoint } from '../utils';
 import { useColors } from '../ThemeContext';
 
@@ -21,13 +21,16 @@ export default function ConnectPage({ onConnect, showError }: Props) {
   const [adminPassword, setAdminPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [authMode, setAuthMode] = useState<'bootstrap' | 'iam' | 'open' | null>(null);
 
   const handleConnect = async () => {
     setLoading(true);
     setError('');
     try {
+      // Trim trailing slashes from endpoint
+      const cleanEndpoint = endpoint.trim().replace(/\/+$/, '');
       // Step 1: Test S3 connection
-      const result = await testConnection(endpoint, accessKey, secretKey);
+      const result = await testConnection(cleanEndpoint, accessKey, secretKey);
       if (!result.ok) {
         setError(`S3 connection failed: ${result.error || 'Unknown error'}`);
         setLoading(false);
@@ -35,10 +38,18 @@ export default function ConnectPage({ onConnect, showError }: Props) {
       }
 
       // S3 succeeded — persist credentials
-      setEndpoint(endpoint);
+      setEndpoint(cleanEndpoint);
       setCredentials(accessKey, secretKey);
       if (result.buckets && result.buckets.length > 0) {
         setBucket(result.buckets[0]);
+      }
+
+      // Detect auth mode after successful S3 connection
+      try {
+        const info = await whoami(accessKey, secretKey);
+        setAuthMode(info.mode);
+      } catch {
+        // Non-critical — continue without auth mode detection
       }
 
       // Step 2: Admin login (optional — don't block connect on failure)
@@ -167,29 +178,31 @@ export default function ConnectPage({ onConnect, showError }: Props) {
             />
           </div>
 
-          <div>
-            <label style={{ fontSize: 12, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)", marginBottom: 4, display: 'block' }}>
-              Admin Password
-            </label>
-            <Input.Password
-              value={adminPassword}
-              onChange={(e) => setAdminPassword(e.target.value)}
-              onPressEnter={handleConnect}
-              placeholder="Admin password (optional)"
-              size="large"
-              style={{
-                background: 'var(--input-bg)',
-                borderColor: BORDER,
-                borderRadius: 10,
-                height: 44,
-                fontFamily: "var(--font-mono)",
-                fontSize: 13,
-              }}
-            />
-            <Text style={{ color: TEXT_FAINT, fontSize: 11, marginTop: 4, display: 'block' }}>
-              Password for proxy admin settings
-            </Text>
-          </div>
+          {authMode !== 'iam' && (
+            <div>
+              <label style={{ fontSize: 12, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)", marginBottom: 4, display: 'block' }}>
+                Bootstrap Password
+              </label>
+              <Input.Password
+                value={adminPassword}
+                onChange={(e) => setAdminPassword(e.target.value)}
+                onPressEnter={handleConnect}
+                placeholder="Bootstrap password (optional)"
+                size="large"
+                style={{
+                  background: 'var(--input-bg)',
+                  borderColor: BORDER,
+                  borderRadius: 10,
+                  height: 44,
+                  fontFamily: "var(--font-mono)",
+                  fontSize: 13,
+                }}
+              />
+              <Text style={{ color: TEXT_FAINT, fontSize: 11, marginTop: 4, display: 'block' }}>
+                Required for admin settings before IAM users are created
+              </Text>
+            </div>
+          )}
 
           <Button
             type="primary"

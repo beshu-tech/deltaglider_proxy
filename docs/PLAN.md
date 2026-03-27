@@ -104,11 +104,11 @@ src/
 ├── config.rs                   # Configuration (port, data_dir, max_ratio)
 ├── auth.rs                     # SigV4 authentication middleware
 ├── multipart.rs                # In-memory multipart upload state management
-├── demo.rs                     # Embedded React demo UI (rust-embed, served on S3 port + 1)
+├── demo.rs                     # Embedded React demo UI (rust-embed, served under /_/ on same port)
 │
 ├── api/
 │   ├── mod.rs
-│   ├── handlers.rs             # S3 API endpoint handlers (PUT, GET, LIST, multipart, etc.)
+│   ├── handlers/               # S3 API endpoint handlers (object, bucket, multipart, status)
 │   ├── xml.rs                  # S3 XML response/request builders
 │   └── errors.rs               # S3 error codes (NoSuchKey, NoSuchUpload, etc.)
 │

@@ -1,19 +1,16 @@
-//! Embedded demo UI served on a dedicated port.
+//! Embedded demo UI and admin API, served under `/_/` on the main S3 port.
 
 use axum::{
     extract::Path,
     http::{header, StatusCode},
     middleware,
     response::{Html, IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
     Router,
 };
-use axum_server::tls_rustls::RustlsConfig;
 use rust_embed::Embed;
 use std::sync::Arc;
-use tokio::net::TcpListener;
-use tower_http::cors::CorsLayer;
-use tracing::info;
+use tower_http::cors::{Any, CorsLayer};
 
 use deltaglider_proxy::api::admin::{self, AdminState};
 
@@ -21,41 +18,50 @@ use deltaglider_proxy::api::admin::{self, AdminState};
 #[folder = "demo/s3-browser/ui/dist"]
 struct DemoAssets;
 
-/// Start the demo UI server on port `s3_port + 1`.
+/// Build the UI + admin API router, mounted under `/_/`.
 ///
-/// When `tls` is `Some`, the demo server uses HTTPS (same cert as the S3 port).
-pub async fn serve(s3_port: u16, admin_state: Arc<AdminState>, tls: Option<RustlsConfig>) {
-    let Some(demo_port) = s3_port.checked_add(1) else {
-        tracing::error!(
-            "Cannot start Demo UI: S3 port {} + 1 overflows u16. Use a port below 65535.",
-            s3_port
-        );
-        return;
-    };
-    let addr = format!("0.0.0.0:{demo_port}");
-
-    // Admin API routes that require authentication
+/// This router is merged into the main S3 router BEFORE auth middleware,
+/// so admin routes handle their own authentication (session cookies).
+pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
+    // Admin API routes that require session authentication
     let protected = Router::new()
-        .route("/api/admin/logout", post(admin::logout))
+        .route("/_/api/admin/logout", post(admin::logout))
         .route(
-            "/api/admin/config",
+            "/_/api/admin/config",
             get(admin::get_config).put(admin::update_config),
         )
-        .route("/api/admin/password", put(admin::change_password))
-        .route("/api/admin/session", get(admin::check_session))
-        .route("/api/admin/test-s3", post(admin::test_s3_connection))
+        .route("/_/api/admin/password", put(admin::change_password))
+        .route("/_/api/admin/session", get(admin::check_session))
+        .route("/_/api/admin/test-s3", post(admin::test_s3_connection))
         // IAM user management
         .route(
-            "/api/admin/users",
+            "/_/api/admin/users",
             get(admin::list_users).post(admin::create_user),
         )
         .route(
-            "/api/admin/users/:id",
+            "/_/api/admin/users/:id",
             put(admin::update_user).delete(admin::delete_user),
         )
         .route(
-            "/api/admin/users/:id/rotate-keys",
+            "/_/api/admin/users/:id/rotate-keys",
             post(admin::rotate_user_keys),
+        )
+        // IAM group management
+        .route(
+            "/_/api/admin/groups",
+            get(admin::list_groups).post(admin::create_group),
+        )
+        .route(
+            "/_/api/admin/groups/:id",
+            put(admin::update_group).delete(admin::delete_group),
+        )
+        .route(
+            "/_/api/admin/groups/:id/members",
+            post(admin::add_group_member),
+        )
+        .route(
+            "/_/api/admin/groups/:id/members/:user_id",
+            delete(admin::remove_group_member),
         )
         .layer(middleware::from_fn_with_state(
             admin_state.clone(),
@@ -68,45 +74,43 @@ pub async fn serve(s3_port: u16, admin_state: Arc<AdminState>, tls: Option<Rustl
 
     // Public admin routes (no session required)
     let public_admin = Router::new()
-        .route("/api/admin/login", post(admin::login))
-        .route("/api/admin/login-as", post(admin::login_as))
-        .route("/api/whoami", get(admin::whoami))
+        .route("/_/api/admin/login", post(admin::login))
+        .route("/_/api/admin/login-as", post(admin::login_as))
+        .route("/_/api/admin/policies", get(admin::get_canned_policies))
+        .route("/_/api/whoami", get(admin::whoami))
         .with_state(admin_state);
 
-    let app = Router::new()
-        .merge(protected)
-        .merge(public_admin)
+    // Metrics/stats/health under /_/ (also available on root for S3 clients)
+    let metrics_routes = Router::new()
         .route(
-            "/metrics",
+            "/_/metrics",
             get(deltaglider_proxy::metrics::metrics_handler).with_state(s3_state.clone()),
         )
         .route(
-            "/stats",
+            "/_/stats",
             get(deltaglider_proxy::api::handlers::get_stats).with_state(s3_state.clone()),
         )
         .route(
-            "/health",
+            "/_/health",
             get(deltaglider_proxy::api::handlers::health_check).with_state(s3_state),
-        )
-        .route("/", get(index))
-        .route("/*path", get(static_or_fallback))
-        .layer(CorsLayer::permissive());
+        );
 
-    if let Some(rustls_config) = tls {
-        let addr_parsed: std::net::SocketAddr = addr.parse().unwrap();
-        info!("  Demo UI: https://localhost:{demo_port}");
-        axum_server::bind_rustls(addr_parsed, rustls_config)
-            .serve(app.into_make_service())
-            .await
-            .ok();
-    } else {
-        let listener = TcpListener::bind(&addr).await.unwrap_or_else(|e| {
-            tracing::error!("Demo UI failed to bind {addr}: {e}");
-            std::process::exit(1);
-        });
-        info!("  Demo UI: http://localhost:{demo_port}");
-        axum::serve(listener, app).await.ok();
-    }
+    // Static UI assets
+    let static_routes = Router::new()
+        .route("/_/", get(index))
+        .route("/_/*path", get(static_or_fallback));
+
+    Router::new()
+        .merge(protected)
+        .merge(public_admin)
+        .merge(metrics_routes)
+        .merge(static_routes)
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any) // Dev server may be on different port
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
 }
 
 async fn index() -> impl IntoResponse {

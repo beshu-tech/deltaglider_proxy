@@ -210,9 +210,9 @@ interface StatsData {
    Main component
    ═══════════════════════════════════════════════════════════ */
 
-interface Props { onBack: () => void; }
+interface Props { onBack: () => void; embedded?: boolean; }
 
-export default function MetricsPage({ onBack }: Props) {
+export default function MetricsPage({ onBack, embedded }: Props) {
   const colors = useColors();
   const { cardStyle } = useCardStyles();
   const [metricsMap, setMetricsMap] = useState<Map<string, ParsedMetric>>(new Map());
@@ -360,7 +360,7 @@ export default function MetricsPage({ onBack }: Props) {
         <Space>
           <Tooltip title="Live refresh every 5s"><Switch size="small" checked={autoRefresh} onChange={setAutoRefresh} /></Tooltip>
           <Button size="small" icon={<ReloadOutlined />} onClick={fetchMetrics} style={{ borderRadius: 8 }}>Refresh</Button>
-          <Button size="small" icon={<ArrowLeftOutlined />} onClick={onBack} style={{ borderRadius: 8 }}>Back</Button>
+          {!embedded && <Button size="small" icon={<ArrowLeftOutlined />} onClick={onBack} style={{ borderRadius: 8 }}>Back</Button>}
         </Space>
       </div>
 

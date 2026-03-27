@@ -41,8 +41,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN groupadd --system dg && useradd --system --gid dg --no-create-home dg
 COPY --from=rust-build /app/target/release/deltaglider_proxy /usr/local/bin/
 USER dg
-EXPOSE 9000 9001
+EXPOSE 9000
 ENV DGP_LISTEN_ADDR=0.0.0.0:9000
 HEALTHCHECK --interval=15s --timeout=3s --retries=3 \
-    CMD curl -f http://localhost:9001/ || exit 1
+    CMD curl -f http://localhost:9000/health || exit 1
 ENTRYPOINT ["deltaglider_proxy"]

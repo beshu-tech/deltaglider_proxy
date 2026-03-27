@@ -16,7 +16,7 @@ use tempfile::TempDir;
 use tokio::time::sleep;
 
 /// Port counter to avoid conflicts between tests.
-/// Increments by 2 because each server uses two ports: S3 (N) and demo UI (N+1).
+/// Single port per server (UI served under /_/ on the same port).
 static PORT_COUNTER: AtomicU16 = AtomicU16::new(19000);
 
 /// MinIO configuration constants
@@ -114,7 +114,7 @@ impl TestServer {
         data_dir: Option<TempDir>,
         auth_creds: Option<(String, String)>,
     ) -> Self {
-        let port = PORT_COUNTER.fetch_add(2, Ordering::SeqCst);
+        let port = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
 
         // Build full config with listen_addr prepended
         let full_config = format!("listen_addr = \"127.0.0.1:{}\"\n{}", port, config_body);
@@ -450,6 +450,36 @@ pub async fn list_objects_raw(
         resp.status()
     );
     resp.text().await.unwrap()
+}
+
+// === Quick-setup helpers (reduce test boilerplate) ===
+
+/// Quick setup: filesystem server + reqwest client
+pub async fn test_setup() -> (TestServer, reqwest::Client) {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+    (server, http)
+}
+
+/// Upload a simple test file, return its bytes
+pub async fn upload_test_data(
+    http: &reqwest::Client,
+    endpoint: &str,
+    bucket: &str,
+    key: &str,
+    size: usize,
+) -> Vec<u8> {
+    let data = generate_binary(size, 42);
+    put_object(
+        http,
+        endpoint,
+        bucket,
+        key,
+        data.clone(),
+        "application/octet-stream",
+    )
+    .await;
+    data
 }
 
 // === Data generators ===
