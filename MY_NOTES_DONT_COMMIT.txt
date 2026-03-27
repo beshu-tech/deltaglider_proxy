@@ -1,0 +1,35 @@
+new integration test case.
+1. list a bucket prefix that we know has many files in it, including nested prefixes (e.g. ror-builds-xdelta > build > 1.69.0-pre4)
+2. Count the amount of files returned
+3. Connect directly to the S3 backend, repeat the same query and compare the results
+4. Discover if we are truncating the listing
+
+I would like to automate this test case in our docker minio harness. You will need to reproduce similar files and nesitng.
+
+---------------
+
+Use comments to document optimization subtleties. Seed headsups to PREVENT next developers to fuck them up. 
+
+-------
+
+Good job with optimization! Now, go back at what you did, I want you to precisely craft tests and integration tests that PROVE the optimization work,
+and others that SPECIFICALLY might expose possible implementation WEAKNESSES tied to this kind of optimizations you did. Edge cases included. Be EVIL. 
+
+
+Convert this toml to env vars so it will be equivalent in when we run the server
+
+listen_addr = "0.0.0.0:9000"
+max_delta_ratio = 0.5
+max_object_size = 314572800
+cache_size_mb = 600
+access_key_id = "dada"
+secret_access_key = "dada"
+log_level = "deltaglider_proxy=debug,tower_http=debug"
+
+[backend]
+type = "s3"
+endpoint = "https://fsn1.your-objectstorage.com"
+region = "fsn1"
+force_path_style = true
+access_key_id = "MD61KMA143ET3MPVQ5HR"
+secret_access_key = "2ydqTSZSLcyWHRbnjud6zpZsqDmsVzPqKwSqmAz2"
