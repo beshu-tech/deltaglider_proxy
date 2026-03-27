@@ -46,7 +46,8 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
     }
   }, [onSessionExpired]);
 
-  useEffect(() => { loadUsers(); }, [loadUsers]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { loadUsers(); }, []);  // Load once on mount; mutations call loadUsers() explicitly
 
   const selectedUser = users.find(u => u.id === selectedId) ?? null;
   const filtered = search

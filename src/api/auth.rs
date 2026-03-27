@@ -14,7 +14,7 @@
 //! downstream by the engine's SHA-256 check).
 
 use super::S3Error;
-use crate::iam::{AuthenticatedUser, IamState, SharedIamState};
+use crate::iam::{AuthenticatedUser, IamState, Permission, SharedIamState};
 use crate::metrics::Metrics;
 use crate::rate_limiter::{self, RateLimiter};
 use axum::body::Body;
@@ -337,19 +337,7 @@ pub async fn sigv4_auth_middleware(
     let client_ip = rate_limiter::extract_client_ip(request.headers());
 
     // Extract audit fields from request headers before the closure captures them
-    let audit_ip = request
-        .headers()
-        .get("x-forwarded-for")
-        .or_else(|| request.headers().get("x-real-ip"))
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string();
-    let audit_ua = request
-        .headers()
-        .get("user-agent")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let (audit_ip, audit_ua) = crate::audit::extract_client_info(request.headers());
 
     let record_auth_failure = {
         let metrics = metrics.clone();
@@ -445,8 +433,25 @@ pub async fn sigv4_auth_middleware(
                 record_auth_failure("invalid_access_key");
                 return Err(S3Error::AccessDenied.into_response());
             }
-            // Legacy user has full access — no AuthenticatedUser inserted
-            (auth.secret_access_key.clone(), None)
+            // Legacy user gets full access via wildcard permissions
+            let bootstrap_perms = vec![Permission {
+                id: 0,
+                effect: "Allow".to_string(),
+                actions: vec!["*".to_string()],
+                resources: vec!["*".to_string()],
+                conditions: None,
+            }];
+            let bootstrap_policies: Vec<iam_rs::IAMPolicy> = bootstrap_perms
+                .iter()
+                .map(crate::iam::permissions::permission_to_iam_policy)
+                .collect();
+            let auth_user = AuthenticatedUser {
+                name: "$bootstrap".to_string(),
+                access_key_id: auth.access_key_id.clone(),
+                permissions: bootstrap_perms,
+                iam_policies: bootstrap_policies,
+            };
+            (auth.secret_access_key.clone(), Some(auth_user))
         }
         IamState::Iam(index) => {
             let user = match index.get(&params.access_key) {
@@ -466,6 +471,7 @@ pub async fn sigv4_auth_middleware(
                 name: user.name.clone(),
                 access_key_id: user.access_key_id.clone(),
                 permissions: user.permissions.clone(),
+                iam_policies: user.iam_policies.clone(),
             };
             (user.secret_access_key.clone(), Some(auth_user))
         }

@@ -5,7 +5,7 @@ use super::{
     base64_decode, build_object_headers, extract_content_type, extract_user_metadata, header_value,
     xml_response, AppState, ObjectQuery, S3Error,
 };
-use crate::iam::{evaluate_permissions, AuthenticatedUser, S3Action};
+use crate::iam::{AuthenticatedUser, S3Action};
 use crate::types::FileMetadata;
 use axum::body::Bytes;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -129,7 +129,7 @@ pub(super) async fn copy_object_inner(
 
     // IAM check: verify the authenticated user has read access to the copy source
     if let Some(ref user) = auth_user {
-        if !evaluate_permissions(&user.permissions, S3Action::Read, source_bucket, source_key) {
+        if !user.can(S3Action::Read, source_bucket, source_key) {
             return Err(S3Error::AccessDenied);
         }
     }
@@ -311,7 +311,7 @@ pub(super) async fn upload_part_copy(
 
     // IAM check: verify the authenticated user has read access to the copy source
     if let Some(ref user) = auth_user {
-        if !evaluate_permissions(&user.permissions, S3Action::Read, source_bucket, source_key) {
+        if !user.can(S3Action::Read, source_bucket, source_key) {
             return Err(S3Error::AccessDenied);
         }
     }

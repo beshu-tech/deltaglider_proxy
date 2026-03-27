@@ -45,6 +45,11 @@ impl SessionStore {
         }
     }
 
+    /// The configured session TTL.
+    pub fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
     /// Create a new session and return the token (64-char hex string).
     /// Stores the client IP for later validation.
     /// If the maximum number of concurrent sessions is reached, the oldest session is evicted.

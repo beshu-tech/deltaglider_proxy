@@ -7,7 +7,7 @@ use super::object_helpers::{
 };
 use super::{audit_log_s3, build_object_headers, xml_response, AppState, ObjectQuery, S3Error};
 use crate::deltaglider::RetrieveResponse;
-use crate::iam::AuthenticatedUser;
+use crate::iam::{AuthenticatedUser, S3Action};
 use axum::body::{Body, Bytes};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -341,6 +341,21 @@ pub async fn delete_objects(
 
     for obj in delete_req.objects {
         let key = obj.key.trim_start_matches('/');
+
+        // Per-key authorization check: the middleware only validated at bucket level,
+        // but each key needs its own permission check for prefix-scoped policies.
+        if let Some(axum::Extension(ref user)) = auth_user {
+            if !user.can(S3Action::Delete, &bucket, key) {
+                errors.push(DeleteError {
+                    key: obj.key.clone(),
+                    version_id: obj.version_id.clone(),
+                    code: "AccessDenied".to_string(),
+                    message: "Access Denied".to_string(),
+                });
+                continue;
+            }
+        }
+
         match state.engine.load().delete(&bucket, key).await {
             Ok(()) => {
                 debug!("Deleted {}/{}", bucket, key);

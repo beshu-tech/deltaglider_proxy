@@ -6,7 +6,7 @@ use axum::Json;
 use serde::Deserialize;
 use std::sync::Arc;
 
-use crate::iam::{Group, Permission};
+use crate::iam::{normalize_permissions, validate_permissions, Group, Permission};
 
 use super::users::rebuild_iam_index;
 use super::{audit_log, trigger_config_sync, AdminState};
@@ -57,8 +57,15 @@ pub async fn create_group(
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let db = db.lock().await;
 
+    let mut perms = body.permissions.clone();
+    normalize_permissions(&mut perms);
+    if let Err(msg) = validate_permissions(&perms) {
+        tracing::warn!("Invalid permissions for group '{}': {}", body.name, msg);
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     let group = db
-        .create_group(&body.name, &body.description, &body.permissions)
+        .create_group(&body.name, &body.description, &perms)
         .map_err(|e| {
             tracing::warn!("Failed to create group '{}': {}", body.name, e);
             StatusCode::CONFLICT
@@ -82,12 +89,24 @@ pub async fn update_group(
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let db = db.lock().await;
 
+    let normalized_perms = body.permissions.as_ref().map(|p| {
+        let mut perms = p.clone();
+        normalize_permissions(&mut perms);
+        perms
+    });
+    if let Some(ref perms) = normalized_perms {
+        if let Err(msg) = validate_permissions(perms) {
+            tracing::warn!("Invalid permissions for group {}: {}", group_id, msg);
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+
     let group = db
         .update_group(
             group_id,
             body.name.as_deref(),
             body.description.as_deref(),
-            body.permissions.as_deref(),
+            normalized_perms.as_deref(),
         )
         .map_err(|e| {
             tracing::warn!("Failed to update group {}: {}", group_id, e);

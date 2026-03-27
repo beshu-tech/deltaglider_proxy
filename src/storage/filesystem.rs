@@ -963,99 +963,71 @@ impl StorageBackend for FilesystemBackend {
 
         // Interleave objects and common prefixes for unified sort+pagination.
         // S3 ListObjectsV2 counts both objects and common prefixes toward max_keys.
-        enum Entry {
-            Obj(String, PathBuf),
-            Prefix(String),
-        }
-        let mut all_entries: Vec<(String, Entry)> = Vec::new();
+        let obj_entries: Vec<(String, PathBuf)> = object_map
+            .into_iter()
+            .map(|(key, (path, _))| (key, path))
+            .collect();
+        let cp_entries: Vec<String> = common_prefixes.into_iter().collect();
 
-        for (key, (path, _)) in object_map {
-            all_entries.push((key.clone(), Entry::Obj(key, path)));
-        }
-        for cp in &common_prefixes {
-            all_entries.push((cp.clone(), Entry::Prefix(cp.clone())));
-        }
+        let page = crate::deltaglider::interleave_and_paginate(
+            obj_entries,
+            cp_entries,
+            max_keys,
+            continuation_token,
+        );
 
-        // Sort lexicographically by key (already mostly sorted from BTreeMap/BTreeSet).
-        all_entries.sort_by(|a, b| a.0.cmp(&b.0));
-
-        // Apply continuation_token: skip entries <= token.
-        if let Some(token) = continuation_token {
-            all_entries.retain(|e| e.0.as_str() > token);
-        }
-
-        // Truncate at max_keys.
-        let max = max_keys as usize;
-        let is_truncated = all_entries.len() > max;
-        if all_entries.len() > max {
-            all_entries.truncate(max);
-        }
-        let next_token = if is_truncated {
-            all_entries.last().map(|(key, _)| key.clone())
-        } else {
-            None
-        };
-
-        // Resolve metadata for object entries.
+        // Resolve metadata for object entries (after pagination to minimize I/O).
         let mut final_objects: Vec<(String, FileMetadata)> = Vec::new();
-        let mut final_prefixes: Vec<String> = Vec::new();
 
-        for (_, entry) in all_entries {
-            match entry {
-                Entry::Obj(key, path) => {
-                    let filename = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or_default();
-                    let meta = match xattr_meta::read_metadata(&path).await {
+        for (key, path) in page.objects {
+            let filename = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            let meta = match xattr_meta::read_metadata(&path).await {
+                Ok(m) => m,
+                Err(StorageError::NotFound(_)) => {
+                    match Self::fallback_metadata_from_path(&path, filename).await {
                         Ok(m) => m,
-                        Err(StorageError::NotFound(_)) => {
-                            match Self::fallback_metadata_from_path(&path, filename).await {
-                                Ok(m) => m,
-                                Err(e) => {
-                                    debug!(
-                                        "Skipping {:?} in delegated list (metadata error): {}",
-                                        path, e
-                                    );
-                                    continue;
-                                }
-                            }
-                        }
                         Err(e) => {
-                            debug!("Skipping {:?} in delegated list (xattr error): {}", path, e);
+                            debug!(
+                                "Skipping {:?} in delegated list (metadata error): {}",
+                                path, e
+                            );
                             continue;
                         }
-                    };
-
-                    // Skip Reference storage info (should not appear as user objects).
-                    if matches!(
-                        meta.storage_info,
-                        crate::types::StorageInfo::Reference { .. }
-                    ) {
-                        continue;
                     }
+                }
+                Err(e) => {
+                    debug!("Skipping {:?} in delegated list (xattr error): {}", path, e);
+                    continue;
+                }
+            };
 
-                    final_objects.push((key, meta));
-                }
-                Entry::Prefix(p) => {
-                    final_prefixes.push(p);
-                }
+            // Skip Reference storage info (should not appear as user objects).
+            if matches!(
+                meta.storage_info,
+                crate::types::StorageInfo::Reference { .. }
+            ) {
+                continue;
             }
+
+            final_objects.push((key, meta));
         }
 
         debug!(
             "Delegated list (fs): {} objects + {} prefixes in {}/{}",
             final_objects.len(),
-            final_prefixes.len(),
+            page.common_prefixes.len(),
             bucket,
             prefix
         );
 
         Ok(Some(DelegatedListResult {
             objects: final_objects,
-            common_prefixes: final_prefixes,
-            is_truncated,
-            next_continuation_token: next_token,
+            common_prefixes: page.common_prefixes,
+            is_truncated: page.is_truncated,
+            next_continuation_token: page.next_continuation_token,
         }))
     }
 }

@@ -57,6 +57,75 @@ fn paginate_sorted<T>(
     (is_truncated, next_token)
 }
 
+/// Result of interleaving objects and common prefixes with pagination.
+pub(crate) struct InterleavedPage<O> {
+    pub objects: Vec<(String, O)>,
+    pub common_prefixes: Vec<String>,
+    pub is_truncated: bool,
+    pub next_continuation_token: Option<String>,
+}
+
+/// Interleave objects and common prefixes into a single sorted list, apply
+/// continuation-token filtering and max-keys pagination, then split back.
+///
+/// S3 ListObjectsV2 counts both objects and common prefixes toward max-keys
+/// and requires lexicographic ordering across both sets. This function is the
+/// single source of truth for that logic (used by engine, S3 backend, and
+/// filesystem backend).
+pub(crate) fn interleave_and_paginate<O>(
+    objects: Vec<(String, O)>,
+    common_prefixes: Vec<String>,
+    max_keys: u32,
+    continuation_token: Option<&str>,
+) -> InterleavedPage<O> {
+    enum Entry<T> {
+        Obj(String, T),
+        Prefix(String),
+    }
+
+    let mut entries: Vec<(String, Entry<O>)> =
+        Vec::with_capacity(objects.len() + common_prefixes.len());
+    for (key, obj) in objects {
+        entries.push((key.clone(), Entry::Obj(key, obj)));
+    }
+    for cp in common_prefixes {
+        entries.push((cp.clone(), Entry::Prefix(cp)));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Apply continuation_token: skip entries <= token.
+    if let Some(token) = continuation_token {
+        entries.retain(|e| e.0.as_str() > token);
+    }
+
+    let max = max_keys as usize;
+    let is_truncated = entries.len() > max;
+    if entries.len() > max {
+        entries.truncate(max);
+    }
+    let next_token = if is_truncated {
+        entries.last().map(|(key, _)| key.clone())
+    } else {
+        None
+    };
+
+    let mut final_objects = Vec::new();
+    let mut final_prefixes = Vec::new();
+    for (_, entry) in entries {
+        match entry {
+            Entry::Obj(key, obj) => final_objects.push((key, obj)),
+            Entry::Prefix(p) => final_prefixes.push(p),
+        }
+    }
+
+    InterleavedPage {
+        objects: final_objects,
+        common_prefixes: final_prefixes,
+        is_truncated,
+        next_continuation_token: next_token,
+    }
+}
+
 /// Errors from the DeltaGlider engine
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -1263,45 +1332,33 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // exactly once across all pages.
 
         if let Some(delim) = delimiter {
-            // Collapse into interleaved entries (objects + CommonPrefixes sorted together)
-            enum Entry {
-                Obj(String, Box<FileMetadata>),
-                Prefix(String),
-            }
-            let mut entries: Vec<(String, Entry)> = Vec::new();
+            // Collapse objects into CommonPrefixes where the key contains the delimiter
+            let mut collapsed_objects = Vec::new();
             let mut seen_prefixes = std::collections::BTreeSet::new();
 
             for (key, meta) in items {
                 let after = &key[prefix.len()..];
                 if let Some(pos) = after.find(delim) {
                     let cp = format!("{}{}{}", prefix, &after[..pos], delim);
-                    if seen_prefixes.insert(cp.clone()) {
-                        entries.push((cp.clone(), Entry::Prefix(cp)));
-                    }
+                    seen_prefixes.insert(cp);
                 } else {
-                    entries.push((key.clone(), Entry::Obj(key, Box::new(meta))));
+                    collapsed_objects.push((key, meta));
                 }
             }
 
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-
-            let (is_truncated, next_token) =
-                paginate_sorted(&mut entries, max_keys, continuation_token, |(k, _)| k);
-
-            let mut objects = Vec::new();
-            let mut common_prefixes = Vec::new();
-            for (_, entry) in entries {
-                match entry {
-                    Entry::Obj(key, meta) => objects.push((key, *meta)),
-                    Entry::Prefix(p) => common_prefixes.push(p),
-                }
-            }
+            let collapsed_prefixes: Vec<String> = seen_prefixes.into_iter().collect();
+            let page = interleave_and_paginate(
+                collapsed_objects,
+                collapsed_prefixes,
+                max_keys,
+                continuation_token,
+            );
 
             Ok(ListObjectsPage {
-                objects,
-                common_prefixes,
-                is_truncated,
-                next_continuation_token: next_token,
+                objects: page.objects,
+                common_prefixes: page.common_prefixes,
+                is_truncated: page.is_truncated,
+                next_continuation_token: page.next_continuation_token,
             })
         } else {
             // No delimiter — paginate raw objects

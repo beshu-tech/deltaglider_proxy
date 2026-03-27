@@ -349,13 +349,20 @@ fn validate_bucket_name(name: &str) -> Result<(), S3Error> {
         )));
     }
 
-    // Only lowercase letters, numbers, and hyphens
+    // Only lowercase letters, numbers, hyphens, and dots
     if !name
         .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
     {
         return Err(S3Error::InvalidBucketName(
-            "Bucket name can only contain lowercase letters, numbers, and hyphens".to_string(),
+            "Bucket name can only contain lowercase letters, numbers, hyphens, and dots"
+                .to_string(),
+        ));
+    }
+    // No consecutive dots
+    if name.contains("..") {
+        return Err(S3Error::InvalidBucketName(
+            "Bucket name must not contain consecutive dots".to_string(),
         ));
     }
 
@@ -451,12 +458,21 @@ pub async fn head_bucket(
 /// LIST buckets handler
 /// GET /
 #[instrument(skip(state))]
-pub async fn list_buckets(State(state): State<Arc<AppState>>) -> Result<Response, S3Error> {
+pub async fn list_buckets(
+    State(state): State<Arc<AppState>>,
+    auth_user: Option<axum::Extension<AuthenticatedUser>>,
+) -> Result<Response, S3Error> {
     info!("LIST buckets");
 
     // List real buckets from storage backend with actual creation dates
     let mut bucket_list = state.engine.load().list_buckets_with_dates().await?;
     bucket_list.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // IAM: filter to only buckets the user has ANY permission on.
+    // A user with resource "my-bucket/prefix/*" should still see "my-bucket" in the list.
+    if let Some(axum::Extension(ref user)) = auth_user {
+        bucket_list.retain(|(name, _)| user.can_see_bucket(name));
+    }
 
     let result = ListBucketsResult {
         owner_id: "deltaglider_proxy".to_string(),

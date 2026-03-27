@@ -9,8 +9,7 @@ use deltaglider_proxy::api::admin::AdminState;
 use deltaglider_proxy::api::auth::sigv4_auth_middleware;
 use deltaglider_proxy::api::handlers::{
     bucket_get_handler, create_bucket, delete_bucket, delete_object, delete_objects, get_object,
-    get_stats, head_bucket, head_object, head_root, health_check, list_buckets, post_object,
-    put_object_or_copy, AppState,
+    head_bucket, head_object, head_root, list_buckets, post_object, put_object_or_copy, AppState,
 };
 use deltaglider_proxy::config::{BackendConfig, Config};
 use deltaglider_proxy::config_db_sync::ConfigDbSync;
@@ -533,9 +532,7 @@ fn build_s3_router(
     //   HEAD /{bucket}/{key...} - get object metadata
     //   DELETE /{bucket}/{key...} - delete object
     Router::new()
-        // Health check and stats endpoints
-        .route("/health", get(health_check))
-        .route("/stats", get(get_stats))
+        // Health and stats are under /_/ (see demo.rs) — not on the S3 router
         // Root: list buckets + HEAD probe for S3 client compatibility (Cyberduck, etc.)
         .route("/", get(list_buckets).head(head_root))
         // Object operations (wildcard routes first - more specific)
@@ -605,14 +602,17 @@ fn init_config_db(
             // If DB has existing users, switch to IAM mode
             if let Ok(users) = db.load_users() {
                 if !users.is_empty() {
+                    let groups = db.load_groups().unwrap_or_default();
                     info!(
-                        "Loaded {} IAM users from {}",
+                        "Loaded {} IAM users, {} groups from {}",
                         users.len(),
+                        groups.len(),
                         db_file.display()
                     );
-                    let index = deltaglider_proxy::iam::IamIndex::from_users(users);
-                    iam_state.store(Arc::new(IamState::Iam(index)));
+                    let state = deltaglider_proxy::iam::IamIndex::build_iam_state(users, groups);
+                    iam_state.store(Arc::new(state));
                 }
+                // If no users exist, keep current IamState (Legacy or Disabled)
             }
             Some(Arc::new(tokio::sync::Mutex::new(db)))
         }
@@ -696,17 +696,17 @@ async fn reopen_and_rebuild_iam(
         } else {
             // Rebuild IAM index from the new DB
             let users = db.load_users().unwrap_or_default();
-            if !users.is_empty() {
-                let groups = db.load_groups().unwrap_or_default();
-                let count = users.len();
-                let group_count = groups.len();
-                let index = deltaglider_proxy::iam::IamIndex::from_users_and_groups(users, groups);
-                iam_state.store(Arc::new(IamState::Iam(index)));
+            let groups = db.load_groups().unwrap_or_default();
+            let count = users.len();
+            let group_count = groups.len();
+            let state = deltaglider_proxy::iam::IamIndex::build_iam_state(users, groups);
+            if matches!(&state, IamState::Iam(_)) {
                 info!(
                     "IAM index rebuilt from S3-synced DB ({} users, {} groups) [{}]",
                     count, group_count, context
                 );
             }
+            iam_state.store(Arc::new(state));
         }
     }
 }

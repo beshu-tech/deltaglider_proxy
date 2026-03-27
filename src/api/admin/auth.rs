@@ -57,13 +57,9 @@ pub struct LoginAsRequest {
 }
 
 /// Format a session cookie for setting a login token.
-/// Max-Age matches session TTL (default 4h = 14400s, overridable via DGP_SESSION_TTL_HOURS).
-pub(super) fn session_cookie(token: &str) -> String {
-    let ttl_hours: u64 = std::env::var("DGP_SESSION_TTL_HOURS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(4);
-    let max_age = ttl_hours * 3600;
+/// Max-Age matches the session store's TTL.
+pub(super) fn session_cookie(token: &str, ttl: std::time::Duration) -> String {
+    let max_age = ttl.as_secs();
     format!(
         "dgp_session={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
         token, max_age
@@ -147,7 +143,12 @@ pub async fn login(
         .create_session(rate_limiter::extract_client_ip(&req_headers));
 
     let mut headers = HeaderMap::new();
-    headers.insert(header::SET_COOKIE, session_cookie(&token).parse().unwrap());
+    headers.insert(
+        header::SET_COOKIE,
+        session_cookie(&token, state.sessions.ttl())
+            .parse()
+            .unwrap(),
+    );
 
     (StatusCode::OK, headers, Json(LoginResponse { ok: true })).into_response()
 }
@@ -300,7 +301,10 @@ pub async fn login_as(
 
     Ok((
         StatusCode::OK,
-        [(header::SET_COOKIE, session_cookie(&token))],
+        [(
+            header::SET_COOKIE,
+            session_cookie(&token, state.sessions.ttl()),
+        )],
         Json(LoginResponse { ok: true }),
     ))
 }

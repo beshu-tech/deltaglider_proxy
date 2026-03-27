@@ -9,7 +9,10 @@ use serde::Deserialize;
 use std::sync::Arc;
 
 use crate::config_db::ConfigDb;
-use crate::iam::{self, IamIndex, IamState, IamUser, Permission, SharedIamState};
+use crate::iam::{
+    self, normalize_permissions, validate_permissions, IamIndex, IamState, IamUser, Permission,
+    SharedIamState,
+};
 
 use super::{audit_log, trigger_config_sync, AdminState};
 
@@ -77,6 +80,7 @@ pub(super) fn rebuild_iam_index(
                 effect: "Allow".into(),
                 actions: vec!["*".into()],
                 resources: vec!["*".into()],
+                conditions: None,
             }];
             match db.create_user(
                 "legacy-admin",
@@ -106,13 +110,13 @@ pub(super) fn rebuild_iam_index(
 
     let count = users.len();
     let group_count = groups.len();
-    let index = IamIndex::from_users_and_groups(users, groups);
-    iam_state.store(Arc::new(IamState::Iam(index)));
+    let state = IamIndex::build_iam_state(users, groups);
     tracing::debug!(
         "IAM index rebuilt with {} users and {} groups",
         count,
         group_count
     );
+    iam_state.store(Arc::new(state));
     Ok(())
 }
 
@@ -163,13 +167,26 @@ pub async fn create_user(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    // Block reserved names
+    if body.name.starts_with('$') {
+        tracing::warn!("User name cannot start with '$': {:?}", body.name);
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let mut perms = body.permissions.clone();
+    normalize_permissions(&mut perms);
+    if let Err(msg) = validate_permissions(&perms) {
+        tracing::warn!("Invalid permissions for user '{}': {}", body.name, msg);
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     let user = db
         .create_user(
             &body.name,
             &access_key_id,
             &secret_access_key,
             body.enabled,
-            &body.permissions,
+            &perms,
         )
         .map_err(|e| {
             tracing::warn!("Failed to create user '{}': {}", body.name, e);
@@ -195,12 +212,24 @@ pub async fn update_user(
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let db = db.lock().await;
 
+    let normalized_perms = body.permissions.as_ref().map(|p| {
+        let mut perms = p.clone();
+        normalize_permissions(&mut perms);
+        perms
+    });
+    if let Some(ref perms) = normalized_perms {
+        if let Err(msg) = validate_permissions(perms) {
+            tracing::warn!("Invalid permissions for user {}: {}", user_id, msg);
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+
     let user = db
         .update_user(
             user_id,
             body.name.as_deref(),
             body.enabled,
-            body.permissions.as_deref(),
+            normalized_perms.as_deref(),
         )
         .map_err(|e| {
             tracing::warn!("Failed to update user {}: {}", user_id, e);

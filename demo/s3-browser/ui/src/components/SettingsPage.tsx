@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Button, Input, InputNumber, Select, Switch, Typography, Space, Alert, Spin, Tabs } from 'antd';
+import { Button, Input, InputNumber, Radio, Select, Switch, Typography, Space, Alert, Spin, Tabs } from 'antd';
 import { SaveOutlined, LockOutlined, WarningOutlined, DatabaseOutlined, ControlOutlined, SafetyOutlined, KeyOutlined, ApiOutlined, CloudOutlined, ArrowLeftOutlined } from '@ant-design/icons';
 import type { AdminConfig, TestS3Response } from '../adminApi';
 import { getAdminConfig, updateAdminConfig, testS3Connection } from '../adminApi';
@@ -409,9 +409,10 @@ export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: 
 
         <div style={{ marginTop: 16 }}>
           <span style={labelStyle}>Log Level</span>
-          <Select
+          <Radio.Group
             value={logLevelCustom ? '__custom__' : logLevel}
-            onChange={(val) => {
+            onChange={(e) => {
+              const val = e.target.value;
               if (val === '__custom__') {
                 setLogLevelCustom(true);
               } else {
@@ -419,9 +420,14 @@ export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: 
                 setLogLevel(val);
               }
             }}
-            style={{ width: '100%' }}
-            options={LOG_LEVEL_PRESETS}
-          />
+            style={{ display: 'flex', flexWrap: 'wrap', gap: 0 }}
+          >
+            {LOG_LEVEL_PRESETS.map(p => (
+              <Radio.Button key={p.value} value={p.value} style={{ fontSize: 13 }}>
+                {p.label}
+              </Radio.Button>
+            ))}
+          </Radio.Group>
         </div>
 
         {logLevelCustom && (

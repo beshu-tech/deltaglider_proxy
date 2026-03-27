@@ -18,7 +18,7 @@ pub struct ConfigDb {
 }
 
 /// Schema version — bump when adding migrations.
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
 
 impl ConfigDb {
     /// Open an existing DB or create a new one at `local_path`.
@@ -64,7 +64,6 @@ impl ConfigDb {
     }
 
     /// Create an in-memory DB for testing.
-    #[cfg(test)]
     pub fn in_memory(passphrase: &str) -> Result<Self, ConfigDbError> {
         let conn = Connection::open_in_memory()?;
         conn.pragma_update(None, "key", passphrase)?;
@@ -144,6 +143,17 @@ impl ConfigDb {
             );
         }
 
+        if version < 4 {
+            conn.execute_batch(
+                "ALTER TABLE permissions ADD COLUMN conditions_json TEXT;
+                 ALTER TABLE group_permissions ADD COLUMN conditions_json TEXT;",
+            )?;
+            info!(
+                "Migrated config DB schema from v{} to v4 (added conditions column)",
+                version
+            );
+        }
+
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         debug!("Config DB schema at version {}", SCHEMA_VERSION);
         Ok(())
@@ -162,6 +172,7 @@ impl ConfigDb {
             created_at: row.get(5)?,
             permissions: Vec::new(),
             group_ids: Vec::new(),
+            iam_policies: Vec::new(),
         })
     }
 
@@ -172,19 +183,24 @@ impl ConfigDb {
         let effect: String = row
             .get::<_, String>(3)
             .unwrap_or_else(|_| "Allow".to_string());
+        let conditions: Option<serde_json::Value> = row
+            .get::<_, Option<String>>(4)
+            .unwrap_or(None)
+            .and_then(|s| serde_json::from_str(&s).ok());
         Ok(Permission {
             id: row.get(0)?,
             effect,
             actions: serde_json::from_str(&actions_json).unwrap_or_default(),
             resources: serde_json::from_str(&resources_json).unwrap_or_default(),
+            conditions,
         })
     }
 
     /// Load permissions for a user by ID.
     fn load_permissions(&self, user_id: i64) -> Result<Vec<Permission>, ConfigDbError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, actions, resources, effect FROM permissions WHERE user_id = ?1")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, actions, resources, effect, conditions_json FROM permissions WHERE user_id = ?1",
+        )?;
         let perms = stmt
             .query_map(params![user_id], Self::permission_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
@@ -193,11 +209,18 @@ impl ConfigDb {
 
     /// Insert permission rows for a user.
     /// Accepts a `conn` parameter so it can operate within a transaction.
-    fn insert_permissions(
+    /// Insert permission rows into a table. Used for both user and group permissions.
+    fn insert_permission_rows(
         conn: &Connection,
-        user_id: i64,
+        table: &str,
+        fk_column: &str,
+        fk_value: i64,
         permissions: &[Permission],
     ) -> Result<(), ConfigDbError> {
+        let sql = format!(
+            "INSERT INTO {} ({}, actions, resources, effect, conditions_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            table, fk_column
+        );
         for perm in permissions {
             let actions_json = serde_json::to_string(&perm.actions).unwrap_or_default();
             let resources_json = serde_json::to_string(&perm.resources).unwrap_or_default();
@@ -206,12 +229,30 @@ impl ConfigDb {
             } else {
                 &perm.effect
             };
+            let conditions_json: Option<String> = perm
+                .conditions
+                .as_ref()
+                .map(|c| serde_json::to_string(c).unwrap_or_default());
             conn.execute(
-                "INSERT INTO permissions (user_id, actions, resources, effect) VALUES (?1, ?2, ?3, ?4)",
-                params![user_id, actions_json, resources_json, effect],
+                &sql,
+                params![
+                    fk_value,
+                    actions_json,
+                    resources_json,
+                    effect,
+                    conditions_json
+                ],
             )?;
         }
         Ok(())
+    }
+
+    fn insert_permissions(
+        conn: &Connection,
+        user_id: i64,
+        permissions: &[Permission],
+    ) -> Result<(), ConfigDbError> {
+        Self::insert_permission_rows(conn, "permissions", "user_id", user_id, permissions)
     }
 
     // === User CRUD ===
@@ -356,7 +397,7 @@ impl ConfigDb {
     /// Load permissions for a group by ID.
     fn load_group_permissions(&self, group_id: i64) -> Result<Vec<Permission>, ConfigDbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, actions, resources, effect FROM group_permissions WHERE group_id = ?1",
+            "SELECT id, actions, resources, effect, conditions_json FROM group_permissions WHERE group_id = ?1",
         )?;
         let perms = stmt
             .query_map(params![group_id], Self::permission_from_row)?
@@ -370,20 +411,7 @@ impl ConfigDb {
         group_id: i64,
         permissions: &[Permission],
     ) -> Result<(), ConfigDbError> {
-        for perm in permissions {
-            let actions_json = serde_json::to_string(&perm.actions).unwrap_or_default();
-            let resources_json = serde_json::to_string(&perm.resources).unwrap_or_default();
-            let effect = if perm.effect.is_empty() {
-                "Allow"
-            } else {
-                &perm.effect
-            };
-            conn.execute(
-                "INSERT INTO group_permissions (group_id, actions, resources, effect) VALUES (?1, ?2, ?3, ?4)",
-                params![group_id, actions_json, resources_json, effect],
-            )?;
-        }
-        Ok(())
+        Self::insert_permission_rows(conn, "group_permissions", "group_id", group_id, permissions)
     }
 
     /// Get member user IDs for a group.
@@ -634,6 +662,7 @@ mod tests {
             effect: "Allow".into(),
             actions: vec!["read".into(), "write".into()],
             resources: vec!["releases/*".into()],
+            conditions: None,
         }];
 
         let user = db
@@ -689,6 +718,7 @@ mod tests {
             effect: "Allow".into(),
             actions: vec!["read".into()],
             resources: vec!["*".into()],
+            conditions: None,
         }];
         let user = db
             .create_user("user1", "AKUSER01", "secret", true, &initial_perms)
@@ -701,12 +731,14 @@ mod tests {
                 effect: "Allow".into(),
                 actions: vec!["read".into(), "write".into()],
                 resources: vec!["releases/*".into()],
+                conditions: None,
             },
             Permission {
                 id: 0,
                 effect: "Allow".into(),
                 actions: vec!["list".into()],
                 resources: vec!["*".into()],
+                conditions: None,
             },
         ];
         let updated = db
@@ -726,6 +758,7 @@ mod tests {
             effect: "Allow".into(),
             actions: vec!["read".into()],
             resources: vec!["*".into()],
+            conditions: None,
         }];
         let user = db
             .create_user("to-delete", "AKDEL001", "secret", true, &perms)
@@ -833,6 +866,7 @@ mod tests {
             effect: "Allow".into(),
             actions: vec!["read".into(), "list".into()],
             resources: vec!["*".into()],
+            conditions: None,
         }];
 
         let group = db
@@ -886,6 +920,7 @@ mod tests {
             effect: "Allow".into(),
             actions: vec!["read".into()],
             resources: vec!["*".into()],
+            conditions: None,
         }];
         let group = db.create_group("old-name", "old desc", &perms).unwrap();
 
@@ -894,6 +929,7 @@ mod tests {
             effect: "Allow".into(),
             actions: vec!["read".into(), "write".into()],
             resources: vec!["releases/*".into()],
+            conditions: None,
         }];
         let updated = db
             .update_group(
@@ -919,6 +955,7 @@ mod tests {
             effect: "Allow".into(),
             actions: vec!["read".into()],
             resources: vec!["*".into()],
+            conditions: None,
         }];
         let group = db.create_group("to-delete", "", &perms).unwrap();
         let user = db
@@ -975,6 +1012,7 @@ mod tests {
             effect: "Allow".into(),
             actions: vec!["read".into()],
             resources: vec!["*".into()],
+            conditions: None,
         }];
         let result = db.create_user("user2", "AKFIRST1", "secret2", true, &perms);
         assert!(result.is_err());
