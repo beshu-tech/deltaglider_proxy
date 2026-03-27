@@ -19,6 +19,11 @@ max_object_size = 104857600
 # Larger cache = faster delta reconstruction, more memory usage.
 cache_size_mb = 100
 
+# Metadata cache size in MB.
+# Caches object metadata (FileMetadata) to eliminate repeated HEAD calls.
+# Budget: ~125K–150K entries at 50 MB. TTL: 10 minutes.
+metadata_cache_mb = 50
+
 # S3 Authentication (bootstrap mode)
 # -----------------------------------
 # Initial S3 credentials used before IAM users are created.
@@ -132,3 +137,12 @@ path = "./data"
 #   DGP_S3_PATH_STYLE         - Use path-style URLs (true/false, default: true)
 #   DGP_BE_AWS_ACCESS_KEY_ID   - Backend S3 access key (required)
 #   DGP_BE_AWS_SECRET_ACCESS_KEY - Backend S3 secret key (required)
+#
+# Performance:
+#   DGP_METADATA_CACHE_MB     - Metadata cache size in MB (default: 50)
+#
+# Security:
+#   DGP_SESSION_TTL_HOURS     - Admin session TTL in hours (default: 4)
+#   DGP_CLOCK_SKEW_SECONDS    - SigV4 clock skew tolerance in seconds (default: 300)
+#   DGP_MAX_MULTIPART_UPLOADS - Max concurrent multipart uploads (default: 100)
+#   DGP_DEBUG_HEADERS         - Expose debug/fingerprinting headers (default: false)

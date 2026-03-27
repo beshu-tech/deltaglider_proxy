@@ -4,6 +4,7 @@ use super::cache::ReferenceCache;
 use super::codec::{CodecError, DeltaCodec};
 use super::file_router::FileRouter;
 use crate::config::{BackendConfig, Config};
+use crate::metadata_cache::MetadataCache;
 use crate::metrics::Metrics;
 use crate::storage::{FilesystemBackend, S3Backend, StorageBackend, StorageError};
 use crate::types::{FileMetadata, ObjectKey, StorageInfo, StoreResult};
@@ -146,6 +147,8 @@ pub struct DeltaGliderEngine<S: StorageBackend> {
     prefix_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
     /// Optional Prometheus metrics (None in tests).
     metrics: Option<Arc<Metrics>>,
+    /// In-memory cache for object metadata (eliminates HEAD requests).
+    metadata_cache: MetadataCache,
 }
 
 /// Type alias for engine with dynamic backend dispatch
@@ -199,7 +202,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             codec_semaphore: Arc::new(Semaphore::new(codec_concurrency)),
             prefix_locks: DashMap::new(),
             metrics,
+            metadata_cache: MetadataCache::new((config.metadata_cache_mb as u64) * 1024 * 1024),
         }
+    }
+
+    /// Return a reference to the metadata cache (for handler-level access).
+    pub fn metadata_cache(&self) -> &MetadataCache {
+        &self.metadata_cache
     }
 
     /// Returns whether the xdelta3 CLI binary is available for legacy delta decoding.
@@ -378,6 +387,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         content_type: Option<String>,
         user_metadata: std::collections::HashMap<String, String>,
     ) -> Result<StoreResult, EngineError> {
+        // Invalidate stale metadata on overwrite (before the write, so concurrent
+        // readers don't see outdated metadata during the write window).
+        self.metadata_cache.invalidate(bucket, key);
+
         // Check size limit
         if data.len() as u64 > self.max_object_size {
             return Err(EngineError::TooLarge {
@@ -421,7 +434,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 content_type,
                 user_metadata,
             };
-            return self.store_passthrough(ctx).await;
+            let result = self.store_passthrough(ctx).await?;
+            self.metadata_cache
+                .insert(bucket, key, result.metadata.clone());
+            return Ok(result);
         }
 
         // Acquire per-deltaspace lock to prevent concurrent reference overwrites.
@@ -457,8 +473,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         };
 
         // Encode delta and decide: keep as delta or fall back to direct storage
-        self.encode_and_store(ctx, &ref_meta, has_existing_reference)
-            .await
+        let result = self
+            .encode_and_store(ctx, &ref_meta, has_existing_reference)
+            .await?;
+        self.metadata_cache
+            .insert(bucket, key, result.metadata.clone());
+        Ok(result)
     }
 
     /// Encode a delta against the reference, evaluate the compression ratio,
@@ -634,6 +654,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             });
         }
 
+        // Invalidate stale metadata on overwrite
+        self.metadata_cache.invalidate(bucket, key);
+
         let (obj_key, deltaspace_id) = Self::validated_key(bucket, key)?;
 
         // Compute SHA256 + MD5 incrementally across chunks
@@ -672,10 +695,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .put_passthrough_chunked(bucket, &deltaspace_id, &obj_key.filename, chunks, &metadata)
             .await?;
 
-        Ok(StoreResult {
+        let result = StoreResult {
             metadata,
             stored_size: total_size,
-        })
+        };
+        self.metadata_cache
+            .insert(bucket, key, result.metadata.clone());
+        Ok(result)
     }
 
     /// Store as passthrough without delta compression
@@ -841,12 +867,20 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     ) -> Result<RetrieveResponse, EngineError> {
         let (obj_key, deltaspace_id) = Self::validated_key(bucket, key)?;
 
-        let metadata = self
-            .resolve_metadata_with_migration(bucket, &deltaspace_id, &obj_key)
-            .await?;
+        // Check metadata cache first (avoids resolve_metadata_with_migration I/O)
+        let metadata = if let Some(cached) = self.metadata_cache.get(bucket, key) {
+            Some(cached)
+        } else {
+            self.resolve_metadata_with_migration(bucket, &deltaspace_id, &obj_key)
+                .await?
+        };
 
         let metadata = match metadata {
-            Some(m) => m,
+            Some(m) => {
+                // Populate metadata cache on resolve
+                self.metadata_cache.insert(bucket, key, m.clone());
+                m
+            }
             None => {
                 // No DG metadata — try streaming as an unmanaged passthrough object
                 info!(
@@ -919,6 +953,18 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     .storage
                     .get_delta(bucket, deltaspace_id, &obj_key.filename)
                     .await?;
+
+                // Guard against oversized inputs before spawning the codec task.
+                // The reference + delta combined size is a lower bound for the
+                // reconstructed object; reject early to avoid OOM.
+                let combined_size = reference.len() as u64 + delta.len() as u64;
+                if combined_size > self.max_object_size {
+                    return Err(EngineError::TooLarge {
+                        size: combined_size,
+                        max: self.max_object_size,
+                    });
+                }
+
                 let _codec_permit = self.try_acquire_codec()?;
                 let ref_clone = reference.clone();
                 let codec = self.codec.clone();
@@ -1025,15 +1071,22 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     }
 
     /// Retrieve object metadata without reading object bodies.
+    /// Checks the in-memory metadata cache first; on miss, queries storage
+    /// and populates the cache for subsequent calls.
     #[instrument(skip(self))]
     pub async fn head(&self, bucket: &str, key: &str) -> Result<FileMetadata, EngineError> {
+        // Fast path: metadata cache hit
+        if let Some(cached) = self.metadata_cache.get(bucket, key) {
+            return Ok(cached);
+        }
+
         let (obj_key, deltaspace_id) = Self::validated_key(bucket, key)?;
 
-        match self
+        let meta = match self
             .resolve_metadata_with_migration(bucket, &deltaspace_id, &obj_key)
             .await?
         {
-            Some(meta) => Ok(meta),
+            Some(meta) => meta,
             None => {
                 // No DG metadata — try reading passthrough metadata (lightweight HEAD).
                 // If that also fails (unmanaged file with no DG headers), return NotFound.
@@ -1045,9 +1098,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     .map_err(|e| match e {
                         StorageError::NotFound(_) => EngineError::NotFound(obj_key.full_key()),
                         other => EngineError::Storage(other),
-                    })
+                    })?
             }
-        }
+        };
+
+        // Populate metadata cache on successful backend lookup
+        self.metadata_cache.insert(bucket, key, meta.clone());
+        Ok(meta)
     }
 
     /// Returns `true` if a local prefix (bucket-relative) could contain keys
@@ -1112,14 +1169,50 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 .await?
         };
 
+        // Even without metadata=true, use the metadata cache to correct
+        // file_size for delta objects. The lite LIST returns delta (stored) size,
+        // but if we have the original size cached from a previous HEAD/PUT,
+        // use it for a more accurate LIST response. No extra I/O — just cache lookups.
+        if !metadata && !page.objects.is_empty() {
+            for (key, meta) in &mut page.objects {
+                if let Some(cached) = self.metadata_cache.get(bucket, key) {
+                    // Replace file_size with the cached original size
+                    meta.file_size = cached.file_size;
+                }
+            }
+        }
+
         // When metadata=true (MinIO extension), enrich objects with full
-        // metadata from HEAD calls. This populates user_metadata fields
-        // that the lite listing path doesn't fetch.
+        // metadata from HEAD calls. Use the metadata cache to avoid HEAD
+        // for objects we already know about — the biggest performance win
+        // (1000 objects → 1000 cache lookups instead of 1000 HEADs).
         if metadata && !page.objects.is_empty() {
-            page.objects = self
-                .storage
-                .enrich_list_metadata(bucket, page.objects)
-                .await?;
+            let mut cache_hits = Vec::new();
+            let mut cache_misses = Vec::new();
+
+            for (key, meta) in page.objects {
+                if let Some(cached) = self.metadata_cache.get(bucket, &key) {
+                    cache_hits.push((key, cached));
+                } else {
+                    cache_misses.push((key, meta));
+                }
+            }
+
+            if !cache_misses.is_empty() {
+                let enriched = self
+                    .storage
+                    .enrich_list_metadata(bucket, cache_misses)
+                    .await?;
+                // Cache the newly enriched metadata
+                for (key, meta) in &enriched {
+                    self.metadata_cache.insert(bucket, key, meta.clone());
+                }
+                cache_hits.extend(enriched);
+            }
+
+            // Re-sort by key to maintain S3 lexicographic ordering
+            cache_hits.sort_by(|a, b| a.0.cmp(&b.0));
+            page.objects = cache_hits;
         }
 
         Ok(page)
@@ -1302,6 +1395,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             let cache_key = Self::cache_key(bucket, &deltaspace_id);
             self.cache.invalidate(&cache_key);
         }
+
+        // Invalidate metadata cache for the deleted key
+        self.metadata_cache.invalidate(bucket, key);
 
         // Release the per-prefix lock before cleanup so strong_count drops to 1.
         drop(_guard);

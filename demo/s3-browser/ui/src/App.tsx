@@ -260,6 +260,7 @@ export default function App() {
               folderSizes={folderSize.sizes}
               onComputeSize={folderSize.compute}
               onCancelSize={folderSize.cancel}
+              onAutoPopulateSizes={folderSize.autoPopulate}
             />
           )}
         </div>

@@ -9,8 +9,8 @@
 mod common;
 
 use common::{
-    generate_binary, mutate_binary, put_and_get_storage_type, put_object, test_setup,
-    upload_test_data, TestServer,
+    admin_http_client, generate_binary, mutate_binary, put_and_get_storage_type, put_object,
+    test_setup, upload_test_data, TestServer,
 };
 
 // ============================================================================
@@ -2226,4 +2226,510 @@ async fn test_get_acl_nonexistent_bucket_returns_404() {
         "GET ?acl on nonexistent bucket should return 404, got {}",
         resp.status()
     );
+}
+
+// ============================================================================
+// UploadPartCopy
+// ============================================================================
+
+#[tokio::test]
+async fn test_upload_part_copy() {
+    let (server, http) = test_setup().await;
+    let endpoint = server.endpoint();
+    let bucket = server.bucket();
+
+    // Upload a source object
+    let source_data = b"hello world from source object for copy part test";
+    put_object(
+        &http,
+        &endpoint,
+        bucket,
+        "copy-source.txt",
+        source_data.to_vec(),
+        "text/plain",
+    )
+    .await;
+
+    // Initiate multipart upload
+    let resp = http
+        .post(format!("{}/{}/copy-dest.txt?uploads", endpoint, bucket))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let body = resp.text().await.unwrap();
+    let upload_id = body
+        .split("<UploadId>")
+        .nth(1)
+        .unwrap()
+        .split("</UploadId>")
+        .next()
+        .unwrap();
+
+    // UploadPartCopy: copy source object as part 1
+    let resp = http
+        .put(format!(
+            "{}/{}/copy-dest.txt?partNumber=1&uploadId={}",
+            endpoint, bucket, upload_id
+        ))
+        .header("x-amz-copy-source", format!("{}/copy-source.txt", bucket))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "UploadPartCopy should succeed, got {}",
+        resp.status()
+    );
+    let copy_result = resp.text().await.unwrap();
+    assert!(
+        copy_result.contains("<CopyPartResult"),
+        "Response should be CopyPartResult XML: {}",
+        copy_result
+    );
+    assert!(
+        copy_result.contains("<ETag>"),
+        "CopyPartResult should contain ETag"
+    );
+
+    // Extract ETag from CopyPartResult
+    let etag = copy_result
+        .split("<ETag>")
+        .nth(1)
+        .unwrap()
+        .split("</ETag>")
+        .next()
+        .unwrap();
+
+    // Complete multipart upload
+    let complete_xml = format!(
+        r#"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>"#,
+        etag
+    );
+    let resp = http
+        .post(format!(
+            "{}/{}/copy-dest.txt?uploadId={}",
+            endpoint, bucket, upload_id
+        ))
+        .header("content-type", "application/xml")
+        .body(complete_xml)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "CompleteMultipartUpload should succeed after UploadPartCopy, got {}",
+        resp.status()
+    );
+
+    // Verify the copied object has the same content
+    let resp = http
+        .get(format!("{}/{}/copy-dest.txt", endpoint, bucket))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let result_data = resp.bytes().await.unwrap();
+    assert_eq!(
+        result_data.as_ref(),
+        source_data,
+        "Copied object should have same content as source"
+    );
+}
+
+#[tokio::test]
+async fn test_upload_part_copy_with_range() {
+    let (server, http) = test_setup().await;
+    let endpoint = server.endpoint();
+    let bucket = server.bucket();
+
+    // Upload a source object
+    let source_data = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    put_object(
+        &http,
+        &endpoint,
+        bucket,
+        "range-source.txt",
+        source_data.to_vec(),
+        "text/plain",
+    )
+    .await;
+
+    // Initiate multipart upload
+    let resp = http
+        .post(format!("{}/{}/range-dest.txt?uploads", endpoint, bucket))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let body = resp.text().await.unwrap();
+    let upload_id = body
+        .split("<UploadId>")
+        .nth(1)
+        .unwrap()
+        .split("</UploadId>")
+        .next()
+        .unwrap();
+
+    // UploadPartCopy with range: bytes=5-14 (FGHIJKLMNO, 10 bytes)
+    let resp = http
+        .put(format!(
+            "{}/{}/range-dest.txt?partNumber=1&uploadId={}",
+            endpoint, bucket, upload_id
+        ))
+        .header("x-amz-copy-source", format!("{}/range-source.txt", bucket))
+        .header("x-amz-copy-source-range", "bytes=5-14")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "UploadPartCopy with range should succeed, got {}",
+        resp.status()
+    );
+    let copy_result = resp.text().await.unwrap();
+    let etag = copy_result
+        .split("<ETag>")
+        .nth(1)
+        .unwrap()
+        .split("</ETag>")
+        .next()
+        .unwrap();
+
+    // Complete multipart upload
+    let complete_xml = format!(
+        r#"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>"#,
+        etag
+    );
+    let resp = http
+        .post(format!(
+            "{}/{}/range-dest.txt?uploadId={}",
+            endpoint, bucket, upload_id
+        ))
+        .header("content-type", "application/xml")
+        .body(complete_xml)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "CompleteMultipartUpload should succeed, got {}",
+        resp.status()
+    );
+
+    // Verify the object contains only the ranged bytes
+    let resp = http
+        .get(format!("{}/{}/range-dest.txt", endpoint, bucket))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let result_data = resp.bytes().await.unwrap();
+    assert_eq!(
+        result_data.as_ref(),
+        b"FGHIJKLMNO",
+        "Ranged copy should contain bytes 5-14 of source"
+    );
+}
+
+// ============================================================================
+// Tagging Stubs
+// ============================================================================
+
+#[tokio::test]
+async fn test_get_object_tagging_empty() {
+    let (server, http) = test_setup().await;
+    let endpoint = server.endpoint();
+    let bucket = server.bucket();
+
+    put_object(
+        &http,
+        &endpoint,
+        bucket,
+        "tagged.txt",
+        b"data".to_vec(),
+        "text/plain",
+    )
+    .await;
+
+    let resp = http
+        .get(format!("{}/{}/tagged.txt?tagging", endpoint, bucket))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "GET ?tagging should succeed, got {}",
+        resp.status()
+    );
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("<Tagging>") && body.contains("<TagSet/>"),
+        "Should return empty TagSet XML: {}",
+        body
+    );
+}
+
+#[tokio::test]
+async fn test_put_object_tagging_accepted() {
+    let (server, http) = test_setup().await;
+    let endpoint = server.endpoint();
+    let bucket = server.bucket();
+
+    put_object(
+        &http,
+        &endpoint,
+        bucket,
+        "tag-put.txt",
+        b"data".to_vec(),
+        "text/plain",
+    )
+    .await;
+
+    let tagging_xml =
+        r#"<Tagging><TagSet><Tag><Key>env</Key><Value>test</Value></Tag></TagSet></Tagging>"#;
+    let resp = http
+        .put(format!("{}/{}/tag-put.txt?tagging", endpoint, bucket))
+        .header("content-type", "application/xml")
+        .body(tagging_xml)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "PUT ?tagging should return 200, got {}",
+        resp.status()
+    );
+}
+
+#[tokio::test]
+async fn test_delete_object_tagging() {
+    let (server, http) = test_setup().await;
+    let endpoint = server.endpoint();
+    let bucket = server.bucket();
+
+    put_object(
+        &http,
+        &endpoint,
+        bucket,
+        "tag-del.txt",
+        b"data".to_vec(),
+        "text/plain",
+    )
+    .await;
+
+    let resp = http
+        .delete(format!("{}/{}/tag-del.txt?tagging", endpoint, bucket))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        204,
+        "DELETE ?tagging should return 204, got {}",
+        resp.status()
+    );
+}
+
+#[tokio::test]
+async fn test_get_bucket_tagging_empty() {
+    let (server, http) = test_setup().await;
+    let endpoint = server.endpoint();
+    let bucket = server.bucket();
+
+    let resp = http
+        .get(format!("{}/{}?tagging", endpoint, bucket))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "GET bucket ?tagging should succeed, got {}",
+        resp.status()
+    );
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("<Tagging>") && body.contains("<TagSet/>"),
+        "Should return empty TagSet XML: {}",
+        body
+    );
+}
+
+#[tokio::test]
+async fn test_put_bucket_versioning_accepted() {
+    let (server, http) = test_setup().await;
+    let endpoint = server.endpoint();
+    let bucket = server.bucket();
+
+    let versioning_xml = r#"<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>"#;
+    let resp = http
+        .put(format!("{}/{}?versioning", endpoint, bucket))
+        .header("content-type", "application/xml")
+        .body(versioning_xml)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "PUT ?versioning should return 200, got {}",
+        resp.status()
+    );
+}
+
+// ============================================================================
+// Usage Scanner API
+// ============================================================================
+
+#[tokio::test]
+async fn test_scan_prefix_usage() {
+    let (server, http) = test_setup().await;
+    let endpoint = server.endpoint();
+    let bucket = server.bucket();
+
+    // Upload a few files under different prefixes
+    put_object(
+        &http,
+        &endpoint,
+        bucket,
+        "scan/a/file1.txt",
+        b"hello world".to_vec(),
+        "text/plain",
+    )
+    .await;
+    put_object(
+        &http,
+        &endpoint,
+        bucket,
+        "scan/a/file2.txt",
+        b"more data here".to_vec(),
+        "text/plain",
+    )
+    .await;
+    put_object(
+        &http,
+        &endpoint,
+        bucket,
+        "scan/b/file3.txt",
+        b"another file".to_vec(),
+        "text/plain",
+    )
+    .await;
+
+    // Login to admin API
+    let admin = admin_http_client(&endpoint).await;
+
+    // Trigger scan
+    let resp = admin
+        .post(format!("{}/_/api/admin/usage/scan", endpoint))
+        .json(&serde_json::json!({"bucket": bucket, "prefix": "scan/"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 202, "POST scan should return 202");
+
+    // Poll for result (max 10 seconds)
+    let mut result = None;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let resp = admin
+            .get(format!(
+                "{}/_/api/admin/usage?bucket={}&prefix=scan/",
+                endpoint, bucket
+            ))
+            .send()
+            .await
+            .unwrap();
+        if resp.status().as_u16() == 200 {
+            result = Some(resp.json::<serde_json::Value>().await.unwrap());
+            break;
+        }
+    }
+
+    let result = result.expect("Usage scan should complete within 10 seconds");
+    assert_eq!(result["bucket"], bucket);
+    assert_eq!(result["prefix"], "scan/");
+    assert_eq!(result["total_objects"], 3);
+    // total_size = 11 + 14 + 12 = 37
+    assert_eq!(result["total_size"], 37);
+
+    // Check children
+    let children = result["children"].as_object().unwrap();
+    assert!(
+        children.contains_key("scan/a/"),
+        "should have child scan/a/"
+    );
+    assert!(
+        children.contains_key("scan/b/"),
+        "should have child scan/b/"
+    );
+    assert_eq!(children["scan/a/"]["objects"], 2);
+    assert_eq!(children["scan/b/"]["objects"], 1);
+}
+
+#[tokio::test]
+async fn test_usage_cache_returns_result() {
+    let (server, http) = test_setup().await;
+    let endpoint = server.endpoint();
+    let bucket = server.bucket();
+
+    // Upload a file
+    put_object(
+        &http,
+        &endpoint,
+        bucket,
+        "cache_test/file.txt",
+        b"cached content".to_vec(),
+        "text/plain",
+    )
+    .await;
+
+    // Login to admin API
+    let admin = admin_http_client(&endpoint).await;
+
+    // Trigger scan
+    admin
+        .post(format!("{}/_/api/admin/usage/scan", endpoint))
+        .json(&serde_json::json!({"bucket": bucket, "prefix": "cache_test/"}))
+        .send()
+        .await
+        .unwrap();
+
+    // Wait for scan to complete
+    let mut completed = false;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let resp = admin
+            .get(format!(
+                "{}/_/api/admin/usage?bucket={}&prefix=cache_test/",
+                endpoint, bucket
+            ))
+            .send()
+            .await
+            .unwrap();
+        if resp.status().as_u16() == 200 {
+            completed = true;
+            break;
+        }
+    }
+    assert!(completed, "First scan should complete");
+
+    // Second GET should return cached result immediately
+    let resp = admin
+        .get(format!(
+            "{}/_/api/admin/usage?bucket={}&prefix=cache_test/",
+            endpoint, bucket
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "Cached result should be returned immediately"
+    );
+    let result = resp.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(result["total_objects"], 1);
+    assert_eq!(result["total_size"], 14); // "cached content" = 14 bytes
 }

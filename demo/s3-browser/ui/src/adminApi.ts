@@ -297,6 +297,38 @@ export async function whoami(accessKeyId?: string, secretAccessKey?: string): Pr
   }
 }
 
+// === Usage Scanner ===
+
+export interface ChildUsage {
+  size: number;
+  objects: number;
+}
+
+export interface UsageEntry {
+  prefix: string;
+  bucket: string;
+  total_size: number;
+  total_objects: number;
+  children: Record<string, ChildUsage>;
+  computed_at: string;
+  stale_seconds: number;
+}
+
+/** Trigger a background usage scan for a bucket/prefix. */
+export async function scanPrefixUsage(bucket: string, prefix: string): Promise<void> {
+  const res = await adminFetch('/api/admin/usage/scan', 'POST', { bucket, prefix });
+  if (!res.ok) throw new Error(`Scan request failed: ${res.status}`);
+}
+
+/** Get cached usage entry for a bucket/prefix, or null if not cached. */
+export async function getPrefixUsage(bucket: string, prefix: string): Promise<UsageEntry | null> {
+  const params = new URLSearchParams({ bucket, prefix });
+  const res = await adminFetch(`/api/admin/usage?${params}`);
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`Usage query failed: ${res.status}`);
+  return safeJson(res);
+}
+
 export async function loginAs(accessKeyId: string, secretAccessKey: string): Promise<{ ok: boolean; error?: string }> {
   const res = await adminFetch('/api/admin/login-as', 'POST', {
     access_key_id: accessKeyId,

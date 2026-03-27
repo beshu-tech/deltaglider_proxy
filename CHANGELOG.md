@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.5.0
+
+### Metadata Cache
+
+- **In-memory metadata cache**: New moka-based cache (`MetadataCache` in `metadata_cache.rs`) eliminates redundant HEAD calls for object metadata. 50 MB default budget (~125K–150K entries), 10-minute TTL. Populated on PUT, HEAD, and LIST+metadata=true. Consulted on HEAD, GET, and LIST (including for file_size correction on delta-compressed objects). Invalidated on DELETE and prefix delete. Configurable via `DGP_METADATA_CACHE_MB` env var or `metadata_cache_mb` TOML setting.
+
+### Security Hardening
+
+#### Tier 1 — Authentication & Session Security
+- **Rate limiting**: Per-IP token bucket rate limiter on auth endpoints — 5 attempts per 15-minute window, 30-minute lockout after exhaustion. Prevents brute-force attacks on admin login.
+- **Session IP binding**: Admin sessions are bound to the originating IP address. Requests from a different IP are rejected even with a valid session token.
+- **Session concurrency cap**: Maximum 10 concurrent admin sessions. Oldest session evicted when the limit is reached.
+- **Configurable session TTL**: Default reduced from 24h to 4h. Override with `DGP_SESSION_TTL_HOURS`.
+- **Password quality enforcement**: Min 12 chars, max 128 chars, common password blocklist. Validated on both admin API and CLI password set flows.
+- **SigV4 replay detection**: Duplicate signatures within a 5-second window are rejected to prevent request replay attacks.
+- **Presigned URL max expiry**: Capped at 7 days (604,800 seconds), matching AWS S3.
+- **Configurable clock skew**: `DGP_CLOCK_SKEW_SECONDS` (default 300s) controls SigV4 timestamp tolerance.
+
+#### Tier 2 — Response Hardening & Anti-Fingerprinting
+- **Security response headers**: All responses include `X-Content-Type-Options: nosniff` and `X-Frame-Options: DENY`. HSTS header added when TLS is enabled.
+- **Anti-fingerprinting**: Debug/fingerprinting headers (`Server`, `x-amz-storage-type`, `x-deltaglider-cache`) suppressed by default. Enable with `DGP_DEBUG_HEADERS=true`.
+- **Bootstrap password TTY safety**: Auto-generated bootstrap password displayed in plaintext only when stderr is a TTY. Hidden in container/CI/piped output to prevent credential leaks in log aggregators.
+- **Multipart upload limits**: Concurrent multipart uploads capped at 100 (configurable via `DGP_MAX_MULTIPART_UPLOADS`) to prevent resource exhaustion.
+
+### Usage Scanner
+
+- **Background prefix size scanner**: `/_/api/admin/usage` endpoint computes prefix sizes asynchronously with 5-minute cached results, 1,000-entry LRU cache, and 100K-object scan cap per prefix.
+
 ## v0.4.0
 
 ### Single-Port Architecture

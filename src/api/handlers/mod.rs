@@ -38,6 +38,9 @@ pub struct AppState {
     pub engine: ArcSwap<DynEngine>,
     pub multipart: Arc<MultipartStore>,
     pub metrics: Arc<Metrics>,
+    /// Emit debug headers (x-amz-storage-type, x-deltaglider-stored-size).
+    /// Controlled by `DGP_DEBUG_HEADERS=true` env var. Off by default.
+    pub debug_headers: bool,
 }
 
 /// Query parameters for object-level operations (multipart upload)
@@ -53,6 +56,8 @@ pub struct ObjectQuery {
     pub part_number: Option<u32>,
     /// ACL operations (GET/PUT with ?acl)
     pub acl: Option<String>,
+    /// Tagging operations (GET/PUT/DELETE with ?tagging)
+    pub tagging: Option<String>,
     /// Response header overrides for presigned URLs
     #[serde(rename = "response-content-type")]
     pub response_content_type: Option<String>,
@@ -71,6 +76,17 @@ pub struct ObjectQuery {
 // ---------------------------------------------------------------------------
 // Shared utility functions used across handler submodules
 // ---------------------------------------------------------------------------
+
+/// Whether to emit debug headers (x-amz-storage-type, x-deltaglider-stored-size).
+/// Checked once at startup from the `DGP_DEBUG_HEADERS` env var.
+fn debug_headers_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("DGP_DEBUG_HEADERS")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false)
+    })
+}
 
 /// Build response headers for an object including DeltaGlider custom metadata.
 fn build_object_headers(metadata: &FileMetadata) -> HeaderMap {
@@ -114,14 +130,17 @@ fn build_object_headers(metadata: &FileMetadata) -> HeaderMap {
                 .to_string(),
         ),
     );
-    headers.insert(
-        "x-amz-storage-type",
-        header_value(metadata.storage_info.label()),
-    );
-    headers.insert(
-        "x-deltaglider-stored-size",
-        header_value(itoa_buf.format(stored_size)),
-    );
+    // Only emit fingerprinting headers when debug mode is enabled (DGP_DEBUG_HEADERS=true)
+    if debug_headers_enabled() {
+        headers.insert(
+            "x-amz-storage-type",
+            header_value(metadata.storage_info.label()),
+        );
+        headers.insert(
+            "x-deltaglider-stored-size",
+            header_value(itoa_buf.format(stored_size)),
+        );
+    }
 
     // DeltaGlider custom metadata (x-amz-meta-dg-*)
     use crate::types::meta_keys as mk;
@@ -156,7 +175,12 @@ fn build_object_headers(metadata: &FileMetadata) -> HeaderMap {
     }
 
     // User-provided custom metadata (x-amz-meta-*)
+    // Skip any keys with the internal "dg-" prefix (case-insensitive) to prevent
+    // user-injected metadata from masquerading as DeltaGlider internal headers.
     for (key, value) in &metadata.user_metadata {
+        if key.to_lowercase().starts_with("dg-") {
+            continue;
+        }
         let header_name = format!("x-amz-meta-{}", key);
         if let Ok(name) = axum::http::header::HeaderName::from_bytes(header_name.as_bytes()) {
             headers.insert(name, header_value(value));
@@ -208,7 +232,7 @@ fn extract_user_metadata(headers: &HeaderMap) -> std::collections::HashMap<Strin
         .filter_map(|(name, value)| {
             let name_str = name.as_str();
             if let Some(suffix) = name_str.strip_prefix(mk::AMZ_META_PREFIX) {
-                if !suffix.starts_with("dg-") {
+                if !suffix.to_lowercase().starts_with("dg-") {
                     if let Ok(v) = value.to_str() {
                         return Some((suffix.to_string(), v.to_string()));
                     }

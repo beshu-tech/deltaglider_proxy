@@ -72,6 +72,12 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         example: "100",
         category: "Delta Engine",
     },
+    EnvVarEntry {
+        name: "DGP_METADATA_CACHE_MB",
+        description: "Metadata cache size in MB (object metadata, eliminates HEAD requests)",
+        example: "50",
+        category: "Delta Engine",
+    },
     // ── Filesystem backend ──────────────────────────────────
     EnvVarEntry {
         name: "DGP_DATA_DIR",
@@ -175,6 +181,11 @@ pub struct Config {
     /// Reference cache size in MB
     #[serde(default = "default_cache_size_mb")]
     pub cache_size_mb: usize,
+
+    /// Metadata cache size in MB (object metadata, eliminates HEAD requests).
+    /// Default: 50 MB (~125K entries). Set to 0 to disable.
+    #[serde(default = "default_metadata_cache_mb")]
+    pub metadata_cache_mb: usize,
 
     /// Proxy access key ID for SigV4 authentication.
     /// When both access_key_id and secret_access_key are set, all requests
@@ -281,6 +292,10 @@ fn default_cache_size_mb() -> usize {
     100
 }
 
+fn default_metadata_cache_mb() -> usize {
+    50
+}
+
 fn default_region() -> String {
     "us-east-1".to_string()
 }
@@ -309,6 +324,7 @@ impl Default for Config {
             max_delta_ratio: default_max_delta_ratio(),
             max_object_size: default_max_object_size(),
             cache_size_mb: default_cache_size_mb(),
+            metadata_cache_mb: default_metadata_cache_mb(),
             access_key_id: None,
             secret_access_key: None,
             bootstrap_password_hash: None,
@@ -377,6 +393,9 @@ impl Config {
         }
         if let Some(v) = env_parse::<usize>("DGP_CACHE_MB") {
             config.cache_size_mb = v;
+        }
+        if let Some(v) = env_parse::<usize>("DGP_METADATA_CACHE_MB") {
+            config.metadata_cache_mb = v;
         }
         if let Some(v) = env_parse::<usize>("DGP_CODEC_CONCURRENCY") {
             config.codec_concurrency = Some(v);
@@ -520,15 +539,27 @@ impl Config {
             );
         }
 
-        // Print prominently to stderr
+        // Print prominently to stderr — but only expose the plaintext password
+        // when stderr is a TTY (interactive terminal). In containers/CI the
+        // plaintext would leak into captured logs, so we print only the bcrypt
+        // hash and tell the operator to set the env var.
+        use std::io::IsTerminal;
         eprintln!();
-        eprintln!("╔══════════════════════════════════════════════════════════════╗");
-        eprintln!("║  BOOTSTRAP PASSWORD (first run — save this!)                ║");
-        eprintln!("║                                                              ║");
-        eprintln!("║  Password: {:<49}║", password);
-        eprintln!("║                                                              ║");
-        eprintln!("║  Set DGP_BOOTSTRAP_PASSWORD_HASH to skip auto-generation.   ║");
-        eprintln!("╚══════════════════════════════════════════════════════════════╝");
+        if std::io::stderr().is_terminal() {
+            eprintln!("╔══════════════════════════════════════════════════════════════╗");
+            eprintln!("║  BOOTSTRAP PASSWORD (first run — save this!)                ║");
+            eprintln!("║                                                              ║");
+            eprintln!("║  Password: {:<49}║", password);
+            eprintln!("║                                                              ║");
+            eprintln!("║  This password appears ONCE. Store it securely.              ║");
+            eprintln!("║  Set DGP_BOOTSTRAP_PASSWORD_HASH to skip auto-generation.   ║");
+            eprintln!("╚══════════════════════════════════════════════════════════════╝");
+        } else {
+            eprintln!("BOOTSTRAP PASSWORD auto-generated (not a TTY — plaintext hidden).");
+            eprintln!("  Hash: {}", hash);
+            eprintln!("  Set DGP_BOOTSTRAP_PASSWORD_HASH={}", hash);
+            eprintln!("  Or run interactively to see the plaintext password.");
+        }
         eprintln!();
 
         self.bootstrap_password_hash = Some(hash.clone());
@@ -698,6 +729,7 @@ mod tests {
             "DGP_MAX_DELTA_RATIO",
             "DGP_MAX_OBJECT_SIZE",
             "DGP_CACHE_MB",
+            "DGP_METADATA_CACHE_MB",
             "DGP_CODEC_CONCURRENCY",
             "DGP_BLOCKING_THREADS",
             "DGP_ACCESS_KEY_ID",

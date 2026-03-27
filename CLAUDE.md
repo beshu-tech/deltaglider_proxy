@@ -16,7 +16,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 
 # Demo UI (must be built before cargo build — rust-embed embeds dist/)
 cd demo/s3-browser/ui && npm ci && npm run build
-npm run dev                    # dev server on :5173, proxies /api to :9000
+npm run dev                    # dev server on :5173, proxies /api to :9001
 
 # Tests (MinIO required for S3 integration tests)
 cargo test --all --locked
@@ -65,8 +65,11 @@ HTTP request
 - `Engine::validated_key()` — shared parse+validate+deltaspace_id helper used by all public engine methods
 - `IamState` (in `iam.rs`) — enum: `Disabled`, `Legacy(AuthConfig)`, or `Iam(IamIndex)` for multi-user auth
 - `ConfigDb` (in `config_db.rs`) — encrypted SQLCipher database for IAM users, stored as `deltaglider_config.db`
+- `MetadataCache` (in `metadata_cache.rs`) — 50MB moka-based in-memory cache for `FileMetadata`. Populated on PUT, HEAD, and LIST+metadata=true. Consulted on HEAD, GET, and LIST (even without metadata=true, for file_size correction). Invalidated on DELETE (exact key) and prefix delete (all matching keys). 10-minute TTL. Configurable size via `DGP_METADATA_CACHE_MB` (default: 50).
+- `RateLimiter` (in `rate_limiter.rs`) — per-IP token bucket rate limiter for auth endpoints. 5 attempts per 15-minute window, 30-minute lockout after exhaustion. Expired entries cleaned up periodically.
+- `UsageScanner` (in `usage_scanner.rs`) — background prefix size scanner with 5-minute cached results, 1000-entry LRU, and 100K-object scan cap per prefix.
 - `S3Op` (in `storage/s3.rs`) — enum for S3 operation context in error classification
-- `SessionStore` (in `session.rs`) — in-memory session store with OsRng token generation and 24h TTL
+- `SessionStore` (in `session.rs`) — in-memory session store with OsRng token generation, configurable TTL (`DGP_SESSION_TTL_HOURS`, default 4h), IP binding, max 10 concurrent sessions with oldest-eviction.
 - `env_parse()` / `env_parse_opt()` (in `config.rs`) — DRY helpers for environment variable parsing
 
 **Config:** TOML file (`deltaglider_proxy.toml`) with env var overrides (`DGP_*` prefix). See `deltaglider_proxy.toml.example`.

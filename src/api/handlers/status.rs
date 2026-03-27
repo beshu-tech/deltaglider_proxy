@@ -116,7 +116,6 @@ async fn compute_stats(
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
     pub status: String,
-    pub version: String,
     pub backend: String,
     pub peak_rss_bytes: u64,
     pub cache_size_bytes: u64,
@@ -152,7 +151,6 @@ pub(crate) fn get_peak_rss_bytes() -> u64 {
 pub async fn head_root() -> Response {
     Response::builder()
         .status(StatusCode::OK)
-        .header("server", "DeltaGliderProxy")
         .header("x-amz-request-id", "0")
         .body(Body::empty())
         .unwrap()
@@ -173,7 +171,6 @@ pub async fn health_check(State(state): State<Arc<AppState>>) -> Json<HealthResp
 
     Json(HealthResponse {
         status: "healthy".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
         backend: "ready".to_string(),
         peak_rss_bytes: get_peak_rss_bytes(),
         cache_size_bytes,
