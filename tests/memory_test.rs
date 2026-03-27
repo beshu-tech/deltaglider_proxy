@@ -17,9 +17,9 @@ use sha2::{Digest, Sha256};
 
 const MB: u64 = 1024 * 1024;
 
-/// GET /health and extract `peak_rss_bytes` from JSON response
+/// GET /_/health and extract `peak_rss_bytes` from JSON response
 async fn get_peak_rss(client: &reqwest::Client, endpoint: &str) -> u64 {
-    let url = format!("{}/health", endpoint);
+    let url = format!("{}/_/health", endpoint);
     let resp = client.get(&url).send().await.expect("GET /health failed");
     assert!(
         resp.status().is_success(),

@@ -97,13 +97,23 @@ pub async fn login(
 
     // Check rate limit before processing
     if state.rate_limiter.is_limited(&client_ip) {
-        tracing::warn!("Rate limited login attempt from {}", client_ip);
+        let count = state.rate_limiter.failure_count(&client_ip);
+        tracing::warn!(
+            "SECURITY | event=admin_brute_force_blocked | ip={} | attempts={}",
+            client_ip,
+            count
+        );
         return (
             StatusCode::TOO_MANY_REQUESTS,
             HeaderMap::new(),
             Json(LoginResponse { ok: false }),
         )
             .into_response();
+    }
+    // Progressive delay: slow down responses under brute force
+    let delay = state.rate_limiter.progressive_delay(&client_ip);
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
     }
 
     let hash = state.password_hash.read().clone();
@@ -122,6 +132,14 @@ pub async fn login(
 
     if !valid {
         let locked = state.rate_limiter.record_failure(&client_ip);
+        let count = state.rate_limiter.failure_count(&client_ip);
+        if locked {
+            tracing::warn!(
+                "SECURITY | event=admin_brute_force_lockout | ip={} | attempts={}",
+                client_ip,
+                count
+            );
+        }
         tracing::warn!(
             "Failed login attempt from {} (locked={})",
             client_ip,
@@ -241,8 +259,18 @@ pub async fn login_as(
 
     // Check rate limit before processing
     if state.rate_limiter.is_limited(&client_ip) {
-        tracing::warn!("Rate limited login-as attempt from {}", client_ip);
+        let count = state.rate_limiter.failure_count(&client_ip);
+        tracing::warn!(
+            "SECURITY | event=login_as_brute_force_blocked | ip={} | attempts={}",
+            client_ip,
+            count
+        );
         return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    // Progressive delay under brute force
+    let delay = state.rate_limiter.progressive_delay(&client_ip);
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
     }
 
     let iam_state = state.iam_state.load();
