@@ -15,7 +15,9 @@ use crate::api::handlers::AppState;
 use crate::config::SharedConfig;
 use crate::config_db::ConfigDb;
 use crate::deltaglider::DynEngine;
-use crate::iam::{self, AuthConfig, IamIndex, IamState, IamUser, Permission, SharedIamState};
+use crate::iam::{
+    self, AuthConfig, Group, IamIndex, IamState, IamUser, Permission, SharedIamState,
+};
 use crate::session::SessionStore;
 
 /// Type alias for the tracing reload handle.
@@ -139,6 +141,19 @@ pub struct PasswordChangeResponse {
     error: Option<String>,
 }
 
+/// Format a session cookie for setting a login token.
+fn session_cookie(token: &str) -> String {
+    format!(
+        "dgp_session={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400",
+        token
+    )
+}
+
+/// Format a session cookie that clears the login token.
+fn session_cookie_clear() -> &'static str {
+    "dgp_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
+}
+
 /// POST /api/admin/login — verify password, set session cookie.
 pub async fn login(
     State(state): State<Arc<AdminState>>,
@@ -169,13 +184,8 @@ pub async fn login(
 
     let token = state.sessions.create_session();
 
-    let cookie = format!(
-        "dgp_session={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400",
-        token
-    );
-
     let mut headers = HeaderMap::new();
-    headers.insert(header::SET_COOKIE, cookie.parse().unwrap());
+    headers.insert(header::SET_COOKIE, session_cookie(&token).parse().unwrap());
 
     (StatusCode::OK, headers, Json(LoginResponse { ok: true })).into_response()
 }
@@ -186,9 +196,8 @@ pub async fn logout(State(state): State<Arc<AdminState>>, headers: HeaderMap) ->
         state.sessions.remove(&token);
     }
 
-    let cookie = "dgp_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0";
     let mut resp_headers = HeaderMap::new();
-    resp_headers.insert(header::SET_COOKIE, cookie.parse().unwrap());
+    resp_headers.insert(header::SET_COOKIE, session_cookie_clear().parse().unwrap());
 
     (
         StatusCode::OK,
@@ -286,14 +295,9 @@ pub async fn login_as(
         user.access_key_id
     );
 
-    let cookie = format!(
-        "dgp_session={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400",
-        token
-    );
-
     Ok((
         StatusCode::OK,
-        [(header::SET_COOKIE, cookie)],
+        [(header::SET_COOKIE, session_cookie(&token))],
         Json(LoginResponse { ok: true }),
     ))
 }
@@ -620,7 +624,7 @@ pub async fn update_config(
     })
 }
 
-/// PUT /api/admin/password — change admin password.
+/// PUT /api/admin/password — change bootstrap password.
 pub async fn change_password(
     State(state): State<Arc<AdminState>>,
     Json(body): Json<PasswordChangeRequest>,
@@ -669,11 +673,9 @@ pub async fn change_password(
         }
     };
 
-    // Update in-memory
-    *state.password_hash.write() = new_hash.clone();
-
-    // Re-encrypt the IAM config database with the new password hash.
-    // Without this, the next restart would fail to open the DB (wrong key).
+    // Re-encrypt the IAM config database with the new password hash FIRST.
+    // If this fails, we must NOT update the in-memory hash or persist — the DB
+    // would become out of sync and the next restart would fail to open it.
     if let Some(ref db_mutex) = state.config_db {
         let db = db_mutex.lock().await;
         if let Err(e) = db.rekey(&new_hash) {
@@ -681,10 +683,20 @@ pub async fn change_password(
                 "Failed to re-encrypt config DB after password change: {}",
                 e
             );
-        } else {
-            tracing::info!("Config DB re-encrypted with new admin password hash");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(PasswordChangeResponse {
+                    ok: false,
+                    error: Some(format!("Failed to re-encrypt config database: {}", e)),
+                }),
+            )
+                .into_response();
         }
+        tracing::info!("Config DB re-encrypted with new bootstrap password hash");
     }
+
+    // Update in-memory only after DB rekey succeeded
+    *state.password_hash.write() = new_hash.clone();
 
     // Persist to state file
     let state_file = std::path::Path::new(".deltaglider_bootstrap_hash");
@@ -887,6 +899,13 @@ fn extract_session_token(headers: &HeaderMap) -> Option<String> {
         })
 }
 
+// === Canned Policies ===
+
+/// GET /api/admin/policies — return predefined policy templates.
+pub async fn get_canned_policies() -> impl IntoResponse {
+    Json(iam::canned_policies())
+}
+
 // === IAM User Management Handlers ===
 
 #[derive(Deserialize)]
@@ -894,14 +913,10 @@ pub struct CreateUserRequest {
     pub name: String,
     pub access_key_id: Option<String>,
     pub secret_access_key: Option<String>,
-    #[serde(default = "default_true")]
+    #[serde(default = "crate::types::default_true")]
     pub enabled: bool,
     #[serde(default)]
     pub permissions: Vec<Permission>,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[derive(Deserialize)]
@@ -945,6 +960,7 @@ fn rebuild_iam_index(db: &ConfigDb, iam_state: &SharedIamState) -> Result<(), St
         if !already_migrated {
             let admin_perms = vec![Permission {
                 id: 0,
+                effect: "Allow".into(),
                 actions: vec!["*".into()],
                 resources: vec!["*".into()],
             }];
@@ -969,10 +985,20 @@ fn rebuild_iam_index(db: &ConfigDb, iam_state: &SharedIamState) -> Result<(), St
         }
     }
 
+    let groups = db.load_groups().map_err(|e| {
+        tracing::error!("Failed to load groups from config DB: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
     let count = users.len();
-    let index = IamIndex::from_users(users);
+    let group_count = groups.len();
+    let index = IamIndex::from_users_and_groups(users, groups);
     iam_state.store(Arc::new(IamState::Iam(index)));
-    tracing::debug!("IAM index rebuilt with {} users", count);
+    tracing::debug!(
+        "IAM index rebuilt with {} users and {} groups",
+        count,
+        group_count
+    );
     Ok(())
 }
 
@@ -1007,6 +1033,15 @@ pub async fn create_user(
     let secret_access_key = body
         .secret_access_key
         .unwrap_or_else(iam::generate_secret_access_key);
+
+    // Validate access key format: must be non-empty, ASCII, no whitespace
+    if access_key_id.is_empty()
+        || !access_key_id.is_ascii()
+        || access_key_id.contains(char::is_whitespace)
+    {
+        tracing::warn!("Invalid access key format: {:?}", access_key_id);
+        return Err(StatusCode::BAD_REQUEST);
+    }
 
     let user = db
         .create_user(
@@ -1130,6 +1165,161 @@ pub async fn rotate_user_keys(
     );
     // Return full user including new secret (shown only once)
     Ok(Json(user))
+}
+
+// === IAM Group Management Handlers ===
+
+#[derive(Deserialize)]
+pub struct CreateGroupRequest {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub permissions: Vec<Permission>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateGroupRequest {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub permissions: Option<Vec<Permission>>,
+}
+
+#[derive(Deserialize)]
+pub struct AddGroupMemberRequest {
+    pub user_id: i64,
+}
+
+/// GET /api/admin/groups — list all groups.
+pub async fn list_groups(
+    State(state): State<Arc<AdminState>>,
+) -> Result<Json<Vec<Group>>, StatusCode> {
+    let db = match state.config_db.as_ref() {
+        Some(db) => db,
+        None => return Ok(Json(vec![])),
+    };
+    let db = db.lock().await;
+    let groups = db.load_groups().map_err(|e| {
+        tracing::error!("Failed to load groups: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(groups))
+}
+
+/// POST /api/admin/groups — create a new group.
+pub async fn create_group(
+    State(state): State<Arc<AdminState>>,
+    Json(body): Json<CreateGroupRequest>,
+) -> Result<(StatusCode, Json<Group>), StatusCode> {
+    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let db = db.lock().await;
+
+    let group = db
+        .create_group(&body.name, &body.description, &body.permissions)
+        .map_err(|e| {
+            tracing::warn!("Failed to create group '{}': {}", body.name, e);
+            StatusCode::CONFLICT
+        })?;
+
+    rebuild_iam_index(&db, &state.iam_state)?;
+
+    tracing::info!("IAM group '{}' created (id={})", group.name, group.id);
+    Ok((StatusCode::CREATED, Json(group)))
+}
+
+/// PUT /api/admin/groups/:id — update a group.
+pub async fn update_group(
+    State(state): State<Arc<AdminState>>,
+    axum::extract::Path(group_id): axum::extract::Path<i64>,
+    Json(body): Json<UpdateGroupRequest>,
+) -> Result<Json<Group>, StatusCode> {
+    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let db = db.lock().await;
+
+    let group = db
+        .update_group(
+            group_id,
+            body.name.as_deref(),
+            body.description.as_deref(),
+            body.permissions.as_deref(),
+        )
+        .map_err(|e| {
+            tracing::warn!("Failed to update group {}: {}", group_id, e);
+            StatusCode::NOT_FOUND
+        })?;
+
+    rebuild_iam_index(&db, &state.iam_state)?;
+
+    tracing::info!("IAM group '{}' updated", group.name);
+    Ok(Json(group))
+}
+
+/// DELETE /api/admin/groups/:id — delete a group.
+pub async fn delete_group(
+    State(state): State<Arc<AdminState>>,
+    axum::extract::Path(group_id): axum::extract::Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let db = db.lock().await;
+
+    db.delete_group(group_id).map_err(|e| {
+        tracing::warn!("Failed to delete group {}: {}", group_id, e);
+        StatusCode::NOT_FOUND
+    })?;
+
+    rebuild_iam_index(&db, &state.iam_state)?;
+
+    tracing::info!("IAM group {} deleted", group_id);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /api/admin/groups/:id/members — add a user to a group.
+pub async fn add_group_member(
+    State(state): State<Arc<AdminState>>,
+    axum::extract::Path(group_id): axum::extract::Path<i64>,
+    Json(body): Json<AddGroupMemberRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let db = db.lock().await;
+
+    db.add_user_to_group(group_id, body.user_id).map_err(|e| {
+        tracing::warn!(
+            "Failed to add user {} to group {}: {}",
+            body.user_id,
+            group_id,
+            e
+        );
+        StatusCode::BAD_REQUEST
+    })?;
+
+    rebuild_iam_index(&db, &state.iam_state)?;
+
+    tracing::info!("User {} added to group {}", body.user_id, group_id);
+    Ok(StatusCode::OK)
+}
+
+/// DELETE /api/admin/groups/:id/members/:user_id — remove a user from a group.
+pub async fn remove_group_member(
+    State(state): State<Arc<AdminState>>,
+    axum::extract::Path((group_id, user_id)): axum::extract::Path<(i64, i64)>,
+) -> Result<StatusCode, StatusCode> {
+    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let db = db.lock().await;
+
+    db.remove_user_from_group(group_id, user_id).map_err(|e| {
+        tracing::warn!(
+            "Failed to remove user {} from group {}: {}",
+            user_id,
+            group_id,
+            e
+        );
+        StatusCode::BAD_REQUEST
+    })?;
+
+    rebuild_iam_index(&db, &state.iam_state)?;
+
+    tracing::info!("User {} removed from group {}", user_id, group_id);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]

@@ -9,22 +9,19 @@ Clients see a standard S3 API. The proxy silently deduplicates using xdelta3 aga
 ```bash
 docker run -d \
   -p 9000:9000 \
-  -p 9001:9001 \
   -v dgp-data:/data \
   beshultd/deltaglider_proxy
 ```
 
-- **Port 9000** — S3-compatible API (point your S3 client here)
-- **Port 9001** — Admin GUI + Prometheus metrics dashboard
+- **Port 9000** — S3-compatible API + Admin GUI (everything on one port)
 
-Then open `http://localhost:9001` for the built-in browser and dashboard.
+Then open `http://localhost:9000/_/` for the built-in browser and dashboard.
 
 ## With MinIO as Backend
 
 ```bash
 docker run -d \
   -p 9000:9000 \
-  -p 9001:9001 \
   -e DGP_S3_ENDPOINT=http://minio:9000 \
   -e DGP_S3_REGION=us-east-1 \
   -e DGP_BE_AWS_ACCESS_KEY_ID=minioadmin \
@@ -48,7 +45,6 @@ services:
     image: beshultd/deltaglider_proxy
     ports:
       - "9000:9000"
-      - "9001:9001"
     environment:
       DGP_S3_ENDPOINT: http://minio:9000
       DGP_S3_REGION: us-east-1
@@ -92,6 +88,7 @@ All settings via environment variables:
 | `DGP_S3_REGION` | `us-east-1` | S3 backend region |
 | `DGP_BE_AWS_ACCESS_KEY_ID` | *(unset)* | Backend S3 credentials |
 | `DGP_BE_AWS_SECRET_ACCESS_KEY` | *(unset)* | Backend S3 credentials |
+| `DGP_BOOTSTRAP_PASSWORD_HASH` | *(auto-generated)* | Bootstrap password bcrypt hash (for DB encryption + admin access) |
 | `DGP_LOG_LEVEL` | `debug` | Log filter (changeable at runtime via admin GUI) |
 | `DGP_TLS_ENABLED` | `false` | Enable HTTPS |
 
@@ -104,19 +101,20 @@ docker run -v ./my-config.toml:/etc/deltaglider_proxy.toml \
 
 ## Built-in Admin GUI
 
-The admin GUI on port 9001 provides:
+The admin GUI is served at `/_/` on the same port as the S3 API:
 
-- **S3 Object Browser** — browse, upload, download, delete objects
+- **S3 Object Browser** — browse, upload, download, delete objects; file preview on double-click
 - **Proxy Dashboard** — live Prometheus metrics with charts (cache health, compression stats, HTTP traffic, auth)
-- **Settings** — hot-reload configuration, change backend, tune compression, manage credentials
+- **Settings** — hot-reload configuration, change backend, tune compression
+- **IAM User Management** — create, edit, delete users with ABAC permissions
+- **API Reference** — interactive API documentation
 - **Demo Data Generator** — populate test data for evaluation
 
 ## Ports
 
 | Port | Protocol | Purpose |
 |------|----------|---------|
-| 9000 | HTTP/S | S3-compatible API |
-| 9001 | HTTP/S | Admin GUI + `/metrics` + `/health` + `/stats` |
+| 9000 | HTTP/S | S3-compatible API + Admin GUI (`/_/`) + `/metrics` + `/health` + `/stats` |
 
 ## Health Checks
 
@@ -131,7 +129,7 @@ curl http://localhost:9000/metrics
 curl http://localhost:9000/stats
 ```
 
-The Docker image includes a built-in healthcheck on port 9001 (15s interval).
+The Docker image includes a built-in healthcheck on port 9000 (15s interval).
 
 ## Image Details
 

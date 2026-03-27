@@ -84,7 +84,7 @@ async fn compute_stats(
         let page = state
             .engine
             .load()
-            .list_objects(bucket, "", None, SCAN_LIMIT as u32, None)
+            .list_objects(bucket, "", None, SCAN_LIMIT as u32, None, false)
             .await?;
         for (_key, meta) in &page.objects {
             total_objects += 1;

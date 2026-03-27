@@ -22,6 +22,41 @@ use std::collections::{HashMap, HashSet};
 
 use tracing::{debug, instrument, warn};
 
+/// Operation context for S3 error classification.
+#[derive(Debug)]
+enum S3Op {
+    ListObjects,
+    CreateBucket,
+    PutObject,
+    GetObject,
+    DeleteObject,
+    HeadObject,
+    Other(&'static str),
+}
+
+impl std::fmt::Display for S3Op {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            S3Op::ListObjects => write!(f, "list_objects"),
+            S3Op::CreateBucket => write!(f, "create_bucket"),
+            S3Op::PutObject => write!(f, "put_object"),
+            S3Op::GetObject => write!(f, "get_object"),
+            S3Op::DeleteObject => write!(f, "delete_object"),
+            S3Op::HeadObject => write!(f, "head_object"),
+            S3Op::Other(s) => write!(f, "{}", s),
+        }
+    }
+}
+
+impl S3Op {
+    /// Returns true if this operation is a bucket-level operation where a 403
+    /// should be treated as BucketNotFound (S3-compatible providers like MinIO
+    /// and Ceph return 403 for non-existent buckets).
+    fn is_bucket_level(&self) -> bool {
+        matches!(self, S3Op::ListObjects | S3Op::CreateBucket)
+    }
+}
+
 /// Lightweight object info from ListObjectsV2 (no HEAD requests needed)
 struct S3ListedObject {
     key: String,
@@ -36,8 +71,6 @@ struct ClassifiedObject {
     user_key: String,
     s3_key: String,
     listing_meta: S3ListedObject,
-    /// Delta files need a HEAD call to get the real original file_size.
-    needs_head: bool,
 }
 
 /// S3 storage backend for DeltaGlider objects
@@ -130,7 +163,7 @@ impl S3Backend {
     fn classify_s3_error(
         bucket: &str,
         e: &SdkError<impl std::fmt::Debug>,
-        context: &str,
+        op: S3Op,
     ) -> StorageError {
         // Extract diagnostic details from the SDK error
         let (status, request_id) = if let SdkError::ServiceError(ref svc) = e {
@@ -145,7 +178,7 @@ impl S3Backend {
         // Log full context for production debugging
         warn!(
             "S3 error: op={} bucket={} status={} request_id={} error={:?}",
-            context,
+            op,
             bucket,
             status
                 .map(|s| s.to_string())
@@ -161,20 +194,16 @@ impl S3Backend {
         }
         // Some S3-compatible providers (MinIO, Ceph) return 403 for non-existent
         // buckets to prevent bucket enumeration. Only treat 403 as BucketNotFound
-        // if context suggests a bucket-level operation. Object-level 403 errors
-        // are genuine AccessDenied and should not be misclassified.
+        // if the operation is bucket-level. Object-level 403 errors are genuine
+        // AccessDenied and should not be misclassified.
         if let Some(s) = status {
-            if s == 403
-                && (context.starts_with("head_bucket")
-                    || context.starts_with("list_objects")
-                    || context.starts_with("create_bucket"))
-            {
+            if s == 403 && op.is_bucket_level() {
                 return StorageError::BucketNotFound(bucket.to_string());
             }
         }
         StorageError::S3(format!(
             "{} failed (status={}): {}",
-            context,
+            op,
             status.unwrap_or(0),
             e
         ))
@@ -454,7 +483,7 @@ impl S3Backend {
                         continue;
                     }
 
-                    return Err(Self::classify_s3_error(bucket, &e, "put_object"));
+                    return Err(Self::classify_s3_error(bucket, &e, S3Op::PutObject));
                 }
             }
         }
@@ -482,7 +511,7 @@ impl S3Backend {
                         return StorageError::NotFound(key.to_string());
                     }
                 }
-                Self::classify_s3_error(bucket, &e, "get_object")
+                Self::classify_s3_error(bucket, &e, S3Op::GetObject)
             })?;
 
         let data = response
@@ -519,7 +548,7 @@ impl S3Backend {
                         return StorageError::NotFound(key.to_string());
                     }
                 }
-                Self::classify_s3_error(bucket, &e, "head_object")
+                Self::classify_s3_error(bucket, &e, S3Op::HeadObject)
             })?;
 
         let headers: HashMap<String, String> = response
@@ -573,7 +602,7 @@ impl S3Backend {
             .key(key)
             .send()
             .await
-            .map_err(|e| Self::classify_s3_error(bucket, &e, "delete_object"))?;
+            .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::DeleteObject))?;
 
         debug!("S3 DELETE {}/{}", bucket, key);
         Ok(())
@@ -645,7 +674,6 @@ impl S3Backend {
                 user_key,
                 s3_key: obj.key.clone(),
                 listing_meta: obj,
-                needs_head: is_delta,
             });
         }
 
@@ -688,51 +716,27 @@ impl S3Backend {
             .await
     }
 
-    /// Fire parallel HEAD calls for classified objects that need them (deltas),
-    /// then resolve each entry to final `(user_key, FileMetadata)` pairs,
-    /// deduplicating by user key (keeping the latest version).
-    async fn resolve_classified_metadata(
-        &self,
-        bucket: &str,
+    /// Resolve classified objects to `(user_key, FileMetadata)` pairs using
+    /// listing data only (no HEAD calls). Deduplicates by user key, keeping
+    /// the latest version.
+    fn resolve_classified_lite(
         classified: Vec<ClassifiedObject>,
         mut seed_results: Vec<(String, FileMetadata)>,
     ) -> Vec<(String, FileMetadata)> {
-        let head_results = self
-            .bounded_head_calls(
-                bucket,
-                classified
-                    .iter()
-                    .filter(|c| c.needs_head)
-                    .map(|c| c.s3_key.as_str()),
-            )
-            .await;
-
-        // Dedup by user key, keeping latest version
         let mut latest: HashMap<String, FileMetadata> = HashMap::new();
 
         for entry in classified {
-            let meta = if entry.needs_head {
-                if let Some(head_meta) = head_results.get(&entry.s3_key) {
-                    head_meta.clone()
-                } else {
-                    Self::fallback_metadata_from_listing(
-                        &entry.listing_meta,
-                        &entry.user_key,
-                        StorageInfo::Delta {
-                            ref_key: String::new(),
-                            ref_sha256: String::new(),
-                            delta_size: entry.listing_meta.size,
-                            delta_cmd: String::new(),
-                        },
-                    )
-                }
+            let is_delta = entry.s3_key.ends_with(".delta");
+            let storage_info = if is_delta {
+                StorageInfo::delta_stub(entry.listing_meta.size)
             } else {
-                Self::fallback_metadata_from_listing(
-                    &entry.listing_meta,
-                    &entry.user_key,
-                    StorageInfo::Passthrough,
-                )
+                StorageInfo::Passthrough
             };
+            let meta = Self::fallback_metadata_from_listing(
+                &entry.listing_meta,
+                &entry.user_key,
+                storage_info,
+            );
 
             match latest.entry(entry.user_key) {
                 std::collections::hash_map::Entry::Vacant(e) => {
@@ -800,7 +804,7 @@ impl S3Backend {
             let response = request
                 .send()
                 .await
-                .map_err(|e| Self::classify_s3_error(bucket, &e, "list_objects_v2"))?;
+                .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::ListObjects))?;
 
             if let Some(contents) = response.contents {
                 for object in contents {
@@ -842,7 +846,7 @@ impl StorageBackend for S3Backend {
             .bucket(bucket)
             .send()
             .await
-            .map_err(|e| Self::classify_s3_error(bucket, &e, "create_bucket"))?;
+            .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::CreateBucket))?;
         debug!("Created S3 bucket: {}", bucket);
         Ok(())
     }
@@ -854,13 +858,19 @@ impl StorageBackend for S3Backend {
             .bucket(bucket)
             .send()
             .await
-            .map_err(|e| Self::classify_s3_error(bucket, &e, "delete_bucket"))?;
+            .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::Other("delete_bucket")))?;
         debug!("Deleted S3 bucket: {}", bucket);
         Ok(())
     }
 
     #[instrument(skip(self))]
     async fn list_buckets(&self) -> Result<Vec<String>, StorageError> {
+        let dated = self.list_buckets_with_dates().await?;
+        Ok(dated.into_iter().map(|(name, _)| name).collect())
+    }
+
+    #[instrument(skip(self))]
+    async fn list_buckets_with_dates(&self) -> Result<Vec<(String, DateTime<Utc>)>, StorageError> {
         let response = self
             .client
             .list_buckets()
@@ -868,14 +878,26 @@ impl StorageBackend for S3Backend {
             .await
             .map_err(|e| StorageError::S3(format!("list_buckets failed: {}", e)))?;
 
-        let mut names: Vec<String> = response
+        let mut buckets: Vec<(String, DateTime<Utc>)> = response
             .buckets()
             .iter()
-            .filter_map(|b| b.name().map(|n| n.to_string()))
+            .filter_map(|b| {
+                b.name().map(|n| {
+                    let created = b
+                        .creation_date()
+                        .and_then(|d| {
+                            let secs = d.secs();
+                            let nanos = d.subsec_nanos();
+                            chrono::DateTime::from_timestamp(secs, nanos)
+                        })
+                        .unwrap_or_else(Utc::now);
+                    (n.to_string(), created)
+                })
+            })
             .collect();
-        names.sort();
-        debug!("Listed {} S3 buckets", names.len());
-        Ok(names)
+        buckets.sort_by(|a, b| a.0.cmp(&b.0));
+        debug!("Listed {} S3 buckets", buckets.len());
+        Ok(buckets)
     }
 
     #[instrument(skip(self))]
@@ -931,10 +953,9 @@ impl StorageBackend for S3Backend {
             request = request.metadata(k, v);
         }
 
-        request
-            .send()
-            .await
-            .map_err(|e| Self::classify_s3_error(bucket, &e, "copy_object (metadata update)"))?;
+        request.send().await.map_err(|e| {
+            Self::classify_s3_error(bucket, &e, S3Op::Other("copy_object (metadata update)"))
+        })?;
 
         debug!("Updated reference metadata for {}/{}", bucket, prefix);
         Ok(())
@@ -1114,7 +1135,7 @@ impl StorageBackend for S3Backend {
                         return StorageError::NotFound(key.clone());
                     }
                 }
-                Self::classify_s3_error(bucket, &e, "get_object")
+                Self::classify_s3_error(bucket, &e, S3Op::GetObject)
             })?;
 
         debug!("S3 GET stream {}/{}", bucket, key);
@@ -1197,12 +1218,7 @@ impl StorageBackend for S3Backend {
                 let original_name = filename.trim_end_matches(".delta").to_string();
 
                 let storage_info = if is_delta {
-                    StorageInfo::Delta {
-                        ref_key: String::new(),
-                        ref_sha256: String::new(),
-                        delta_size: obj.size,
-                        delta_cmd: String::new(),
-                    }
+                    StorageInfo::delta_stub(obj.size)
                 } else if obj.key.ends_with("/reference.bin") || obj.key == "reference.bin" {
                     StorageInfo::Reference {
                         source_name: String::new(),
@@ -1273,7 +1289,7 @@ impl StorageBackend for S3Backend {
                 let response = request
                     .send()
                     .await
-                    .map_err(|e| Self::classify_s3_error(b, &e, "list_objects_v2"))?;
+                    .map_err(|e| Self::classify_s3_error(b, &e, S3Op::ListObjects))?;
 
                 if let Some(contents) = response.contents {
                     for object in contents {
@@ -1313,7 +1329,7 @@ impl StorageBackend for S3Backend {
             let response = request
                 .send()
                 .await
-                .map_err(|e| Self::classify_s3_error(bucket, &e, "list_directory_markers"))?;
+                .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::ListObjects))?;
 
             if let Some(contents) = response.contents {
                 for object in contents {
@@ -1335,6 +1351,59 @@ impl StorageBackend for S3Backend {
         Ok(markers)
     }
 
+    /// Enrich listed objects with full metadata from bounded HEAD calls.
+    /// Maps user-visible keys back to actual S3 keys (appending `.delta` for
+    /// delta files) and fires parallel HEAD requests with concurrency control.
+    async fn enrich_list_metadata(
+        &self,
+        bucket: &str,
+        objects: Vec<(String, FileMetadata)>,
+    ) -> Result<Vec<(String, FileMetadata)>, StorageError> {
+        // Build a mapping from S3 key -> user key so we can HEAD the right
+        // objects and map results back.
+        let s3_keys: Vec<String> = objects
+            .iter()
+            .map(|(user_key, meta)| {
+                if meta.is_delta() {
+                    // Delta files are stored with .delta suffix
+                    let obj = crate::types::ObjectKey::parse("_", user_key);
+                    let prefix = obj.prefix;
+                    let filename = obj.filename;
+                    if prefix.is_empty() {
+                        format!("{}.delta", filename)
+                    } else {
+                        format!("{}/{}.delta", prefix, filename)
+                    }
+                } else {
+                    user_key.clone()
+                }
+            })
+            .collect();
+
+        let head_results = self
+            .bounded_head_calls(bucket, s3_keys.iter().map(|s| s.as_str()))
+            .await;
+
+        let enriched: Vec<(String, FileMetadata)> = objects
+            .into_iter()
+            .zip(s3_keys.iter())
+            .map(|((user_key, fallback_meta), s3_key)| {
+                if let Some(head_meta) = head_results.get(s3_key) {
+                    (user_key, head_meta.clone())
+                } else {
+                    (user_key, fallback_meta)
+                }
+            })
+            .collect();
+
+        debug!(
+            "Enriched {} objects with HEAD metadata in {}",
+            enriched.len(),
+            bucket
+        );
+        Ok(enriched)
+    }
+
     async fn bulk_list_objects(
         &self,
         bucket: &str,
@@ -1342,12 +1411,21 @@ impl StorageBackend for S3Backend {
     ) -> Result<Vec<(String, FileMetadata)>, StorageError> {
         let listed = self.list_objects_full(bucket, prefix).await?;
         let (classified, dir_markers) = Self::classify_listed_objects(listed);
-        let results = self
-            .resolve_classified_metadata(bucket, classified, dir_markers)
-            .await;
+
+        // Build FileMetadata from LIST data only — no HEAD calls.
+        // DG metadata (storage type, delta size, SHA) is fetched lazily via
+        // HEAD when clients actually need it (GUI enrichKeys, inspector panel).
+        //
+        // NOTE: For delta files, file_size = delta size (not original size).
+        // This is a known trade-off: accurate original sizes require HEAD per
+        // delta file. The GUI handles this via lazy HEAD enrichment for visible
+        // files. Third-party clients see the stored (delta) size, which is
+        // technically correct from an S3 perspective.
+        let results: Vec<(String, FileMetadata)> =
+            Self::resolve_classified_lite(classified, dir_markers);
 
         debug!(
-            "Bulk listed {} objects in {}/{}",
+            "Bulk listed {} objects (lite, no HEAD) in {}/{}",
             results.len(),
             bucket,
             prefix
@@ -1403,7 +1481,7 @@ impl StorageBackend for S3Backend {
             let response = request
                 .send()
                 .await
-                .map_err(|e| Self::classify_s3_error(bucket, &e, "list_objects_delegated"))?;
+                .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::ListObjects))?;
 
             // Collect CommonPrefixes
             if let Some(cps) = response.common_prefixes {
@@ -1440,11 +1518,10 @@ impl StorageBackend for S3Backend {
             }
         }
 
-        // Classify and resolve metadata using shared helpers
+        // Classify and build lite metadata (no HEAD calls — same as bulk_list_objects).
         let (classified, dir_markers) = Self::classify_listed_objects(raw_objects);
-        let objects = self
-            .resolve_classified_metadata(bucket, classified, dir_markers)
-            .await;
+        let objects: Vec<(String, FileMetadata)> =
+            Self::resolve_classified_lite(classified, dir_markers);
 
         // Apply max_keys across both objects and common_prefixes (interleaved)
         let common_prefixes: Vec<String> = all_common_prefixes.into_iter().collect();
@@ -1509,7 +1586,7 @@ impl StorageBackend for S3Backend {
             .body(ByteStream::from(vec![]))
             .send()
             .await
-            .map_err(|e| Self::classify_s3_error(bucket, &e, "put_directory_marker"))?;
+            .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::PutObject))?;
 
         debug!("Created directory marker: {}/{}", bucket, key);
         Ok(())

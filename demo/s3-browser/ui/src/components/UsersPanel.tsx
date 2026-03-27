@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Button, Typography, Spin, Alert, Input, Popconfirm } from 'antd';
+import { Button, Typography, Spin, Alert, Input } from 'antd';
 import { PlusOutlined, SearchOutlined, TeamOutlined, DeleteOutlined } from '@ant-design/icons';
 import type { IamUser } from '../adminApi';
 import { getUsers, deleteUser } from '../adminApi';
@@ -17,9 +17,11 @@ function permissionSummary(user: IamUser): string {
 
 interface UsersPanelProps {
   onSessionExpired?: () => void;
+  onSavingChange?: (saving: boolean) => void;
+  onNavigateToGroup?: (groupId: number) => void;
 }
 
-export default function UsersPanel({ onSessionExpired }: UsersPanelProps) {
+export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigateToGroup }: UsersPanelProps) {
   const colors = useColors();
   const [users, setUsers] = useState<IamUser[]>([]);
   const [loading, setLoading] = useState(true);
@@ -160,31 +162,25 @@ export default function UsersPanel({ onSessionExpired }: UsersPanelProps) {
                   <Text strong style={{ fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
                     {user.name}
                   </Text>
-                  <Popconfirm
-                    title={`Delete "${user.name}"?`}
-                    description="This cannot be undone."
-                    onConfirm={async (e) => {
-                      e?.stopPropagation();
-                      try {
-                        await deleteUser(user.id);
-                        handleDeleted();
-                      } catch { /* error shown in form if selected */ }
-                    }}
-                    onCancel={e => e?.stopPropagation()}
-                    okText="Delete"
-                    okButtonProps={{ danger: true }}
-                  >
-                    <Button
+                  <Button
                       type="text"
                       danger
                       size="small"
                       icon={<DeleteOutlined />}
-                      onClick={e => e.stopPropagation()}
+                      onClick={async (e) => {
+                        e.stopPropagation();
+                        if (!window.confirm(`Delete "${user.name}"? This cannot be undone.`)) return;
+                        try {
+                          await deleteUser(user.id);
+                          handleDeleted();
+                        } catch (err) {
+                          console.error('Delete user failed:', err);
+                        }
+                      }}
                       style={{ opacity: 0.5, padding: '2px 4px', minWidth: 0 }}
                       onMouseEnter={e => { e.currentTarget.style.opacity = '1'; }}
                       onMouseLeave={e => { e.currentTarget.style.opacity = '0.5'; }}
                     />
-                  </Popconfirm>
                 </div>
                 <div style={{ marginLeft: 16, marginTop: 2 }}>
                   <Text type="secondary" style={{ fontSize: 11, fontFamily: 'var(--font-mono)' }}>
@@ -233,6 +229,8 @@ export default function UsersPanel({ onSessionExpired }: UsersPanelProps) {
             onSaved={handleSaved}
             onCreated={handleCreated}
             onCancel={() => setCreating(false)}
+            onSavingChange={onSavingChange}
+            onNavigateToGroup={onNavigateToGroup}
           />
         ) : selectedUser ? (
           <UserForm
@@ -240,6 +238,8 @@ export default function UsersPanel({ onSessionExpired }: UsersPanelProps) {
             user={selectedUser}
             onSaved={handleSaved}
             onDeleted={handleDeleted}
+            onSavingChange={onSavingChange}
+            onNavigateToGroup={onNavigateToGroup}
           />
         ) : (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: colors.TEXT_MUTED }}>

@@ -3,6 +3,8 @@ import { listObjects, deleteObjects, deletePrefix, uploadObject, getBucket, head
 import useSelection from './useSelection';
 import type { S3Object } from './types';
 
+const MAX_HEAD_CACHE_SIZE = 5000;
+
 export default function useS3Browser() {
   const [refreshTrigger, setRefreshTrigger] = useState(0);
   const [objects, setObjects] = useState<S3Object[]>([]);
@@ -15,7 +17,13 @@ export default function useS3Browser() {
   const [connected, setConnected] = useState(hasCredentials());
   const [bucket, setBucketState] = useState(getBucket());
   const [searchQuery, setSearchQuery] = useState('');
-  const [headCache, setHeadCache] = useState<Record<string, { storageType?: string; storedSize?: number }>>({});
+  const [showHidden, setShowHiddenState] = useState(() => localStorage.getItem('dg-show-hidden') === 'true');
+  const setShowHidden = useCallback((v: boolean) => {
+    setShowHiddenState(v);
+    localStorage.setItem('dg-show-hidden', String(v));
+  }, []);
+  const [headCache, setHeadCache] = useState<Record<string, { storageType?: string; storedSize?: number; error?: boolean }>>({});
+  const [error, setError] = useState<string | null>(null);
   const headCacheRef = useRef(headCache);
   headCacheRef.current = headCache;
   const headInflight = useRef(new Set<string>());
@@ -25,7 +33,13 @@ export default function useS3Browser() {
 
   const query = searchQuery.toLowerCase();
   const filteredObjects = query ? objects.filter((o) => o.key.toLowerCase().includes(query)) : objects;
-  const filteredFolders = query ? folders.filter((f) => f.toLowerCase().includes(query)) : folders;
+
+  // Filter hidden DG system folders unless showHidden is on
+  const visibleFolders = showHidden ? folders : folders.filter(d => {
+    const name = d.replace(/\/$/, '').split('/').pop() ?? '';
+    return name !== '.deltaglider' && name !== '.dg';
+  });
+  const filteredFolders = query ? visibleFolders.filter((f) => f.toLowerCase().includes(query)) : visibleFolders;
 
   const selection = useSelection(filteredObjects, filteredFolders);
 
@@ -34,6 +48,7 @@ export default function useS3Browser() {
     setObjects([]);
     setFolders([]);
     setHeadCache({});
+    setError(null);
     headInflight.current.clear();
     isInitialLoad.current = true;
     selection.clearSelection();
@@ -68,11 +83,12 @@ export default function useS3Browser() {
         setFolders(dirs);
         setIsTruncated(trunc);
         setConnected(true);
+        setError(null);
         selection.reconcile(objs, dirs);
       })
-      .catch(() => {
-        setObjects([]);
-        setFolders([]);
+      .catch((err) => {
+        // Keep stale data on error instead of clearing
+        setError(err instanceof Error ? err.message : 'Failed to load objects');
         setConnected(false);
       })
       .finally(() => {
@@ -101,15 +117,21 @@ export default function useS3Browser() {
     Promise.all(
       toFetch.map((key) =>
         headObject(key)
-          .then(({ storageType, storedSize }) => ({ key, storageType, storedSize }))
-          .catch(() => ({ key, storageType: undefined, storedSize: undefined }))
+          .then(({ storageType, storedSize }) => ({ key, storageType, storedSize, error: false }))
+          .catch(() => ({ key, storageType: undefined, storedSize: undefined, error: true }))
       )
     ).then((results) => {
       setHeadCache((prev) => {
         const next = { ...prev };
         for (const r of results) {
-          next[r.key] = { storageType: r.storageType, storedSize: r.storedSize };
+          next[r.key] = { storageType: r.storageType, storedSize: r.storedSize, error: false };
           headInflight.current.delete(r.key);
+        }
+        // Evict oldest entries if cache exceeds max size
+        const keys = Object.keys(next);
+        if (keys.length > MAX_HEAD_CACHE_SIZE) {
+          const toRemove = keys.slice(0, keys.length - MAX_HEAD_CACHE_SIZE);
+          for (const k of toRemove) delete next[k];
         }
         return next;
       });
@@ -191,6 +213,7 @@ export default function useS3Browser() {
     headCache,
     connected,
     refreshTrigger,
+    error,
     // Selection (delegated)
     selected: selection.selected,
     setSelected: selection.setSelected,
@@ -210,5 +233,8 @@ export default function useS3Browser() {
     // Search
     searchQuery,
     setSearchQuery,
+    // Hidden files
+    showHidden,
+    setShowHidden,
   };
 }

@@ -503,6 +503,20 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             ratio * 100.0
         );
 
+        self.commit_delta_or_passthrough(ctx, ref_meta, has_existing_reference, delta, ratio)
+            .await
+    }
+
+    /// Decide whether to commit the encoded delta or fall back to passthrough,
+    /// then persist the chosen storage strategy.
+    async fn commit_delta_or_passthrough(
+        &self,
+        ctx: StoreContext<'_>,
+        ref_meta: &FileMetadata,
+        has_existing_reference: bool,
+        delta: Vec<u8>,
+        ratio: f32,
+    ) -> Result<StoreResult, EngineError> {
         // Only apply the threshold when NO reference exists yet (first file in deltaspace).
         // Once a reference exists, ALWAYS store as delta — the deltaspace is committed to
         // delta storage and we want all related files to benefit from the shared reference.
@@ -1065,6 +1079,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         delimiter: Option<&str>,
         max_keys_raw: u32,
         continuation_token: Option<&str>,
+        metadata: bool,
     ) -> Result<ListObjectsPage, EngineError> {
         // S3 requires max-keys >= 1; clamp to prevent pagination invariant violations.
         let max_keys = max_keys_raw.max(1);
@@ -1074,23 +1089,52 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         // Fast path: delegate delimiter collapsing to the storage backend (S3
         // handles this natively, avoiding the need to fetch every object).
-        if let Some(delim) = delimiter {
+        let mut page = if let Some(delim) = delimiter {
             if let Some(result) = self
                 .storage
                 .list_objects_delegated(bucket, prefix, delim, max_keys, continuation_token)
                 .await?
             {
-                return Ok(ListObjectsPage {
+                ListObjectsPage {
                     objects: result.objects,
                     common_prefixes: result.common_prefixes,
                     is_truncated: result.is_truncated,
                     next_continuation_token: result.next_continuation_token,
-                });
+                }
+            } else {
+                // Backend doesn't support delegated listing — fall through to
+                // the generic bulk_list + in-memory collapsing path.
+                self.list_objects_bulk(bucket, prefix, Some(delim), max_keys, continuation_token)
+                    .await?
             }
-            // Backend doesn't support delegated listing — fall through to
-            // the generic bulk_list + in-memory collapsing path below.
+        } else {
+            self.list_objects_bulk(bucket, prefix, None, max_keys, continuation_token)
+                .await?
+        };
+
+        // When metadata=true (MinIO extension), enrich objects with full
+        // metadata from HEAD calls. This populates user_metadata fields
+        // that the lite listing path doesn't fetch.
+        if metadata && !page.objects.is_empty() {
+            page.objects = self
+                .storage
+                .enrich_list_metadata(bucket, page.objects)
+                .await?;
         }
 
+        Ok(page)
+    }
+
+    /// Internal: build a ListObjectsPage from bulk_list_objects + in-memory
+    /// delimiter collapsing and pagination.
+    async fn list_objects_bulk(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        max_keys: u32,
+        continuation_token: Option<&str>,
+    ) -> Result<ListObjectsPage, EngineError> {
         // Single-pass listing: replaces list_deltaspaces + scan_deltaspace×N + list_directory_markers
         let bulk = self.storage.bulk_list_objects(bucket, prefix).await?;
 
@@ -1195,6 +1239,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// List all real buckets from the storage backend.
     pub async fn list_buckets(&self) -> Result<Vec<String>, EngineError> {
         Ok(self.storage.list_buckets().await?)
+    }
+
+    /// List all real buckets with their creation dates.
+    pub async fn list_buckets_with_dates(
+        &self,
+    ) -> Result<Vec<(String, chrono::DateTime<chrono::Utc>)>, EngineError> {
+        Ok(self.storage.list_buckets_with_dates().await?)
     }
 
     /// Check if a real bucket exists on the storage backend.

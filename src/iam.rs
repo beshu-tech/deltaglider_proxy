@@ -9,6 +9,7 @@ use axum::body::Body;
 use axum::http::Request;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use rand::rngs::OsRng;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -44,27 +45,48 @@ pub struct IamUser {
     pub access_key_id: String,
     #[serde(skip_serializing_if = "is_masked")]
     pub secret_access_key: String,
-    #[serde(default = "default_true")]
+    #[serde(default = "crate::types::default_true")]
     pub enabled: bool,
     #[serde(default)]
     pub created_at: String,
     #[serde(default)]
     pub permissions: Vec<Permission>,
+    #[serde(default)]
+    pub group_ids: Vec<i64>,
+}
+
+/// An IAM group with permissions and member user IDs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Group {
+    pub id: i64,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub permissions: Vec<Permission>,
+    #[serde(default)]
+    pub member_ids: Vec<i64>,
+    #[serde(default)]
+    pub created_at: String,
 }
 
 fn is_masked(s: &str) -> bool {
     s == "****"
 }
 
-fn default_true() -> bool {
-    true
+/// Default effect for permissions (Allow).
+fn default_allow() -> String {
+    "Allow".to_string()
 }
 
-/// A permission rule (Allow-only for v1).
+/// A permission rule with Allow/Deny effect.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Permission {
     #[serde(default)]
     pub id: i64,
+    /// "Allow" or "Deny" — Deny rules override Allow rules.
+    #[serde(default = "default_allow")]
+    pub effect: String,
     /// Action verbs: "read", "write", "delete", "list", "admin", or "*"
     pub actions: Vec<String>,
     /// Resource patterns: "bucket/*", "bucket/prefix*", or "*"
@@ -108,10 +130,21 @@ impl IamUser {
     /// actions must contain "*" or "admin", AND resources must contain "*".
     /// A user with actions=["*"] on a specific bucket is NOT considered admin.
     pub fn is_admin(&self) -> bool {
+        // Check if any Deny rule blocks admin access
+        let has_deny = self.permissions.iter().any(|p| {
+            p.effect == "Deny"
+                && p.actions.iter().any(|a| a == "*" || a == "admin")
+                && p.resources.iter().any(|r| r == "*")
+        });
+        if has_deny {
+            return false;
+        }
+
+        // Check for Allow rule granting admin
         self.permissions.iter().any(|p| {
-            let has_admin_action = p.actions.iter().any(|a| a == "*" || a == "admin");
-            let has_wildcard_resource = p.resources.iter().any(|r| r == "*");
-            has_admin_action && has_wildcard_resource
+            p.effect != "Deny"
+                && p.actions.iter().any(|a| a == "*" || a == "admin")
+                && p.resources.iter().any(|r| r == "*")
         })
     }
 }
@@ -119,6 +152,7 @@ impl IamUser {
 /// Fast O(1) user lookup index, rebuilt from the database on load/sync.
 pub struct IamIndex {
     users: HashMap<String, IamUser>,
+    groups: Vec<Group>,
 }
 
 impl IamIndex {
@@ -126,8 +160,28 @@ impl IamIndex {
     /// Logs warnings for enabled users with no permissions (deny-by-default
     /// means they can authenticate but cannot access any resources).
     pub fn from_users(users: Vec<IamUser>) -> Self {
+        Self::from_users_and_groups(users, Vec::new())
+    }
+
+    /// Build the index from users and groups, merging group permissions into each user's
+    /// effective permission set. The user's `permissions` field in the index will contain
+    /// both direct and group-inherited permissions.
+    pub fn from_users_and_groups(users: Vec<IamUser>, groups: Vec<Group>) -> Self {
+        // Build a map of group_id -> permissions for fast lookup
+        let group_perms: HashMap<i64, &[Permission]> = groups
+            .iter()
+            .map(|g| (g.id, g.permissions.as_slice()))
+            .collect();
+
         let mut map = HashMap::with_capacity(users.len());
-        for user in users {
+        for mut user in users {
+            // Merge group permissions into the user's permissions
+            for gid in &user.group_ids {
+                if let Some(perms) = group_perms.get(gid) {
+                    user.permissions.extend(perms.iter().cloned());
+                }
+            }
+
             if user.enabled && user.permissions.is_empty() {
                 warn!(
                     "IAM user '{}' ({}) is enabled but has no permissions — all operations will be denied",
@@ -136,7 +190,7 @@ impl IamIndex {
             }
             map.insert(user.access_key_id.clone(), user);
         }
-        Self { users: map }
+        Self { users: map, groups }
     }
 
     /// Look up a user by access_key_id. O(1).
@@ -152,13 +206,40 @@ impl IamIndex {
     pub fn is_empty(&self) -> bool {
         self.users.is_empty()
     }
+
+    /// Get the groups stored in the index.
+    pub fn groups(&self) -> &[Group] {
+        &self.groups
+    }
 }
 
 // === Permission Evaluation ===
 
+/// Check whether a permission rule matches the given action and resource.
+fn matches_action_and_resource(
+    perm: &Permission,
+    action_str: &str,
+    bucket: &str,
+    key: &str,
+) -> bool {
+    let action_matches = perm.actions.iter().any(|a| a == "*" || a == action_str);
+    if !action_matches {
+        return false;
+    }
+
+    let resource = if key.is_empty() {
+        bucket.to_string()
+    } else {
+        format!("{}/{}", bucket, key)
+    };
+
+    perm.resources
+        .iter()
+        .any(|pattern| matches_resource(pattern, &resource))
+}
+
 /// Check if a user's permissions allow the given action on the given resource.
-/// Allow-only evaluation (v1): any matching Allow rule permits the action.
-/// No match = implicit deny.
+/// Two-pass evaluation: explicit Deny overrides Allow. No match = implicit deny.
 pub fn evaluate_permissions(
     permissions: &[Permission],
     action: S3Action,
@@ -167,26 +248,16 @@ pub fn evaluate_permissions(
 ) -> bool {
     let action_str = action.as_str();
 
+    // Pass 1: Any explicit Deny? Reject immediately.
     for perm in permissions {
-        // Check if this rule covers the action
-        let action_matches = perm.actions.iter().any(|a| a == "*" || a == action_str);
-        if !action_matches {
-            continue;
+        if perm.effect == "Deny" && matches_action_and_resource(perm, action_str, bucket, key) {
+            return false;
         }
+    }
 
-        // Check if this rule covers the resource
-        let resource = if key.is_empty() {
-            bucket.to_string()
-        } else {
-            format!("{}/{}", bucket, key)
-        };
-
-        let resource_matches = perm
-            .resources
-            .iter()
-            .any(|pattern| matches_resource(pattern, &resource));
-
-        if resource_matches {
+    // Pass 2: Any Allow? Permit.
+    for perm in permissions {
+        if perm.effect == "Allow" && matches_action_and_resource(perm, action_str, bucket, key) {
             return true;
         }
     }
@@ -249,7 +320,7 @@ fn classify_action(method: &axum::http::Method, path: &str) -> S3Action {
             // Check query string for ?delete (batch delete)
             S3Action::Write
         }
-        _ => S3Action::Read,
+        _ => S3Action::Admin, // Unknown methods require admin permissions
     }
 }
 
@@ -274,6 +345,11 @@ pub async fn authorization_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Result<Response, Response> {
+    // OPTIONS (CORS preflight) always passes through without auth
+    if request.method() == axum::http::Method::OPTIONS {
+        return Ok(next.run(request).await);
+    }
+
     // Only enforce if an AuthenticatedUser was inserted by SigV4 middleware
     let user = match request.extensions().get::<AuthenticatedUser>() {
         Some(u) => u.clone(),
@@ -316,11 +392,75 @@ pub async fn authorization_middleware(
     Ok(next.run(request).await)
 }
 
+// === Canned Policies ===
+
+/// A predefined policy template for quick user setup.
+#[derive(Debug, Clone, Serialize)]
+pub struct CannedPolicy {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub permissions: Vec<Permission>,
+}
+
+/// Return predefined policy templates for the admin UI.
+pub fn canned_policies() -> Vec<CannedPolicy> {
+    vec![
+        CannedPolicy {
+            name: "Full Access",
+            description: "All S3 operations on all resources",
+            permissions: vec![Permission {
+                id: 0,
+                effect: "Allow".into(),
+                actions: vec!["*".into()],
+                resources: vec!["*".into()],
+            }],
+        },
+        CannedPolicy {
+            name: "Read Only",
+            description: "Read and list all resources",
+            permissions: vec![Permission {
+                id: 0,
+                effect: "Allow".into(),
+                actions: vec!["read".into(), "list".into()],
+                resources: vec!["*".into()],
+            }],
+        },
+        CannedPolicy {
+            name: "Read/Write",
+            description: "Read, write, and list all resources",
+            permissions: vec![Permission {
+                id: 0,
+                effect: "Allow".into(),
+                actions: vec!["read".into(), "write".into(), "list".into()],
+                resources: vec!["*".into()],
+            }],
+        },
+        CannedPolicy {
+            name: "Read/Write (No Delete)",
+            description: "Full access except delete operations are denied",
+            permissions: vec![
+                Permission {
+                    id: 0,
+                    effect: "Allow".into(),
+                    actions: vec!["*".into()],
+                    resources: vec!["*".into()],
+                },
+                Permission {
+                    id: 0,
+                    effect: "Deny".into(),
+                    actions: vec!["delete".into()],
+                    resources: vec!["*".into()],
+                },
+            ],
+        },
+    ]
+}
+
 // === Key Generation ===
 
 /// Generate an AWS-like access key ID (20 chars: "AK" + 18 uppercase alphanumeric).
 pub fn generate_access_key_id() -> String {
-    let mut rng = rand::thread_rng();
+    let mut rng = OsRng;
     let chars: Vec<char> = (0..18)
         .map(|_| {
             let idx = rng.gen_range(0..36);
@@ -336,7 +476,7 @@ pub fn generate_access_key_id() -> String {
 
 /// Generate an AWS-like secret access key (40 chars, base64-alphabet).
 pub fn generate_secret_access_key() -> String {
-    let mut rng = rand::thread_rng();
+    let mut rng = OsRng;
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     (0..40)
         .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
@@ -351,6 +491,7 @@ mod tests {
     fn test_evaluate_permissions_allow_read() {
         let perms = vec![Permission {
             id: 0,
+            effect: "Allow".into(),
             actions: vec!["read".into()],
             resources: vec!["releases/*".into()],
         }];
@@ -379,6 +520,7 @@ mod tests {
     fn test_evaluate_permissions_wildcard_action() {
         let perms = vec![Permission {
             id: 0,
+            effect: "Allow".into(),
             actions: vec!["*".into()],
             resources: vec!["*".into()],
         }];
@@ -404,11 +546,13 @@ mod tests {
         let perms = vec![
             Permission {
                 id: 0,
+                effect: "Allow".into(),
                 actions: vec!["read".into(), "list".into()],
                 resources: vec!["releases/*".into()],
             },
             Permission {
                 id: 0,
+                effect: "Allow".into(),
                 actions: vec!["write".into()],
                 resources: vec!["uploads/*".into()],
             },
@@ -445,6 +589,7 @@ mod tests {
     fn test_evaluate_permissions_exact_resource() {
         let perms = vec![Permission {
             id: 0,
+            effect: "Allow".into(),
             actions: vec!["read".into()],
             resources: vec!["specific-bucket/exact-key.txt".into()],
         }];
@@ -467,6 +612,7 @@ mod tests {
     fn test_evaluate_permissions_bucket_level() {
         let perms = vec![Permission {
             id: 0,
+            effect: "Allow".into(),
             actions: vec!["list".into()],
             resources: vec!["my-bucket".into()],
         }];
@@ -491,6 +637,7 @@ mod tests {
     fn test_evaluate_permissions_bucket_wildcard() {
         let perms = vec![Permission {
             id: 0,
+            effect: "Allow".into(),
             actions: vec!["list".into(), "read".into()],
             resources: vec!["my-bucket/*".into()],
         }];
@@ -552,6 +699,146 @@ mod tests {
     }
 
     #[test]
+    fn test_deny_overrides_allow() {
+        // Broad Allow on all resources, specific Deny on releases
+        let perms = vec![
+            Permission {
+                id: 0,
+                effect: "Allow".into(),
+                actions: vec!["*".into()],
+                resources: vec!["*".into()],
+            },
+            Permission {
+                id: 1,
+                effect: "Deny".into(),
+                actions: vec!["delete".into()],
+                resources: vec!["releases/*".into()],
+            },
+        ];
+
+        // Read on releases: allowed
+        assert!(evaluate_permissions(
+            &perms,
+            S3Action::Read,
+            "releases",
+            "v1.zip"
+        ));
+        // Delete on releases: denied by explicit Deny
+        assert!(!evaluate_permissions(
+            &perms,
+            S3Action::Delete,
+            "releases",
+            "v1.zip"
+        ));
+        // Delete on other bucket: allowed (Deny doesn't cover it)
+        assert!(evaluate_permissions(
+            &perms,
+            S3Action::Delete,
+            "uploads",
+            "file.bin"
+        ));
+    }
+
+    #[test]
+    fn test_deny_all_blocks_everything() {
+        let perms = vec![
+            Permission {
+                id: 0,
+                effect: "Allow".into(),
+                actions: vec!["*".into()],
+                resources: vec!["*".into()],
+            },
+            Permission {
+                id: 1,
+                effect: "Deny".into(),
+                actions: vec!["*".into()],
+                resources: vec!["*".into()],
+            },
+        ];
+
+        assert!(!evaluate_permissions(&perms, S3Action::Read, "any", "key"));
+        assert!(!evaluate_permissions(&perms, S3Action::Write, "any", "key"));
+        assert!(!evaluate_permissions(
+            &perms,
+            S3Action::Delete,
+            "any",
+            "key"
+        ));
+        assert!(!evaluate_permissions(&perms, S3Action::List, "any", ""));
+        assert!(!evaluate_permissions(&perms, S3Action::Admin, "any", ""));
+    }
+
+    #[test]
+    fn test_allow_without_deny() {
+        // Backward compat: Allow-only rules work as before
+        let perms = vec![Permission {
+            id: 0,
+            effect: "Allow".into(),
+            actions: vec!["read".into(), "list".into()],
+            resources: vec!["*".into()],
+        }];
+
+        assert!(evaluate_permissions(
+            &perms,
+            S3Action::Read,
+            "bucket",
+            "key"
+        ));
+        assert!(evaluate_permissions(&perms, S3Action::List, "bucket", ""));
+        assert!(!evaluate_permissions(
+            &perms,
+            S3Action::Write,
+            "bucket",
+            "key"
+        ));
+        assert!(!evaluate_permissions(
+            &perms,
+            S3Action::Delete,
+            "bucket",
+            "key"
+        ));
+    }
+
+    #[test]
+    fn test_mixed_deny_allow() {
+        // Allow read+write on everything, Deny write on releases
+        let perms = vec![
+            Permission {
+                id: 0,
+                effect: "Allow".into(),
+                actions: vec!["read".into(), "write".into(), "list".into()],
+                resources: vec!["*".into()],
+            },
+            Permission {
+                id: 1,
+                effect: "Deny".into(),
+                actions: vec!["write".into()],
+                resources: vec!["releases/*".into()],
+            },
+        ];
+
+        assert!(evaluate_permissions(
+            &perms,
+            S3Action::Read,
+            "releases",
+            "v1.zip"
+        ));
+        assert!(!evaluate_permissions(
+            &perms,
+            S3Action::Write,
+            "releases",
+            "v1.zip"
+        ));
+        assert!(evaluate_permissions(
+            &perms,
+            S3Action::Write,
+            "uploads",
+            "file.bin"
+        ));
+        assert!(evaluate_permissions(&perms, S3Action::List, "releases", ""));
+    }
+
+    #[test]
     fn test_iam_index_lookup() {
         let users = vec![
             IamUser {
@@ -562,6 +849,7 @@ mod tests {
                 enabled: true,
                 created_at: String::new(),
                 permissions: vec![],
+                group_ids: vec![],
             },
             IamUser {
                 id: 2,
@@ -571,6 +859,7 @@ mod tests {
                 enabled: false,
                 created_at: String::new(),
                 permissions: vec![],
+                group_ids: vec![],
             },
         ];
 
@@ -585,5 +874,302 @@ mod tests {
         assert!(!viewer.enabled);
 
         assert!(index.get("AKNOTHERE").is_none());
+    }
+
+    #[test]
+    fn test_is_admin_with_allow() {
+        let user = IamUser {
+            id: 1,
+            name: "admin".into(),
+            access_key_id: "AK1".into(),
+            secret_access_key: "s".into(),
+            enabled: true,
+            created_at: String::new(),
+            permissions: vec![Permission {
+                id: 0,
+                effect: "Allow".into(),
+                actions: vec!["*".into()],
+                resources: vec!["*".into()],
+            }],
+            group_ids: vec![],
+        };
+        assert!(user.is_admin());
+    }
+
+    #[test]
+    fn test_is_admin_denied_by_deny_rule() {
+        let user = IamUser {
+            id: 1,
+            name: "not-admin".into(),
+            access_key_id: "AK1".into(),
+            secret_access_key: "s".into(),
+            enabled: true,
+            created_at: String::new(),
+            permissions: vec![
+                Permission {
+                    id: 0,
+                    effect: "Allow".into(),
+                    actions: vec!["*".into()],
+                    resources: vec!["*".into()],
+                },
+                Permission {
+                    id: 1,
+                    effect: "Deny".into(),
+                    actions: vec!["admin".into()],
+                    resources: vec!["*".into()],
+                },
+            ],
+            group_ids: vec![],
+        };
+        assert!(!user.is_admin(), "Deny on admin should override Allow");
+    }
+
+    #[test]
+    fn test_is_admin_denied_by_wildcard_deny() {
+        let user = IamUser {
+            id: 1,
+            name: "blocked".into(),
+            access_key_id: "AK1".into(),
+            secret_access_key: "s".into(),
+            enabled: true,
+            created_at: String::new(),
+            permissions: vec![
+                Permission {
+                    id: 0,
+                    effect: "Allow".into(),
+                    actions: vec!["*".into()],
+                    resources: vec!["*".into()],
+                },
+                Permission {
+                    id: 1,
+                    effect: "Deny".into(),
+                    actions: vec!["*".into()],
+                    resources: vec!["*".into()],
+                },
+            ],
+            group_ids: vec![],
+        };
+        assert!(!user.is_admin(), "Wildcard Deny should block admin");
+    }
+
+    #[test]
+    fn test_is_admin_not_admin_without_wildcard_resource() {
+        let user = IamUser {
+            id: 1,
+            name: "bucket-admin".into(),
+            access_key_id: "AK1".into(),
+            secret_access_key: "s".into(),
+            enabled: true,
+            created_at: String::new(),
+            permissions: vec![Permission {
+                id: 0,
+                effect: "Allow".into(),
+                actions: vec!["*".into()],
+                resources: vec!["my-bucket/*".into()],
+            }],
+            group_ids: vec![],
+        };
+        assert!(
+            !user.is_admin(),
+            "Wildcard actions on specific bucket is NOT admin"
+        );
+    }
+
+    #[test]
+    fn test_classify_action_unknown_method_requires_admin() {
+        let action = classify_action(&axum::http::Method::PATCH, "/bucket/key");
+        assert_eq!(action, S3Action::Admin);
+        let action = classify_action(&axum::http::Method::TRACE, "/bucket/key");
+        assert_eq!(action, S3Action::Admin);
+    }
+
+    #[test]
+    fn test_group_permissions_merged_with_user() {
+        // User has read-only, group grants write — merged should allow both
+        let users = vec![IamUser {
+            id: 1,
+            name: "dev".into(),
+            access_key_id: "AK1".into(),
+            secret_access_key: "s".into(),
+            enabled: true,
+            created_at: String::new(),
+            permissions: vec![Permission {
+                id: 0,
+                effect: "Allow".into(),
+                actions: vec!["read".into()],
+                resources: vec!["*".into()],
+            }],
+            group_ids: vec![10],
+        }];
+        let groups = vec![Group {
+            id: 10,
+            name: "writers".into(),
+            description: String::new(),
+            permissions: vec![Permission {
+                id: 0,
+                effect: "Allow".into(),
+                actions: vec!["write".into()],
+                resources: vec!["*".into()],
+            }],
+            member_ids: vec![1],
+            created_at: String::new(),
+        }];
+        let index = IamIndex::from_users_and_groups(users, groups);
+        let user = index.get("AK1").unwrap();
+        // User should now have both read (direct) and write (from group)
+        assert!(evaluate_permissions(
+            &user.permissions,
+            S3Action::Read,
+            "bucket",
+            "key"
+        ));
+        assert!(evaluate_permissions(
+            &user.permissions,
+            S3Action::Write,
+            "bucket",
+            "key"
+        ));
+        // Delete should still be denied (neither user nor group grants it)
+        assert!(!evaluate_permissions(
+            &user.permissions,
+            S3Action::Delete,
+            "bucket",
+            "key"
+        ));
+    }
+
+    #[test]
+    fn test_group_deny_overrides_user_allow() {
+        // User allows all, group denies delete — delete should be blocked
+        let users = vec![IamUser {
+            id: 1,
+            name: "dev".into(),
+            access_key_id: "AK1".into(),
+            secret_access_key: "s".into(),
+            enabled: true,
+            created_at: String::new(),
+            permissions: vec![Permission {
+                id: 0,
+                effect: "Allow".into(),
+                actions: vec!["*".into()],
+                resources: vec!["*".into()],
+            }],
+            group_ids: vec![10],
+        }];
+        let groups = vec![Group {
+            id: 10,
+            name: "no-delete".into(),
+            description: String::new(),
+            permissions: vec![Permission {
+                id: 0,
+                effect: "Deny".into(),
+                actions: vec!["delete".into()],
+                resources: vec!["releases/*".into()],
+            }],
+            member_ids: vec![1],
+            created_at: String::new(),
+        }];
+        let index = IamIndex::from_users_and_groups(users, groups);
+        let user = index.get("AK1").unwrap();
+        // Read is still allowed
+        assert!(evaluate_permissions(
+            &user.permissions,
+            S3Action::Read,
+            "releases",
+            "v1.zip"
+        ));
+        // Delete on releases is denied by group
+        assert!(!evaluate_permissions(
+            &user.permissions,
+            S3Action::Delete,
+            "releases",
+            "v1.zip"
+        ));
+        // Delete on other buckets is still allowed
+        assert!(evaluate_permissions(
+            &user.permissions,
+            S3Action::Delete,
+            "uploads",
+            "file.bin"
+        ));
+    }
+
+    #[test]
+    fn test_user_in_multiple_groups() {
+        // User in two groups — permissions from both should be merged
+        let users = vec![IamUser {
+            id: 1,
+            name: "dev".into(),
+            access_key_id: "AK1".into(),
+            secret_access_key: "s".into(),
+            enabled: true,
+            created_at: String::new(),
+            permissions: vec![],
+            group_ids: vec![10, 20],
+        }];
+        let groups = vec![
+            Group {
+                id: 10,
+                name: "readers".into(),
+                description: String::new(),
+                permissions: vec![Permission {
+                    id: 0,
+                    effect: "Allow".into(),
+                    actions: vec!["read".into(), "list".into()],
+                    resources: vec!["*".into()],
+                }],
+                member_ids: vec![1],
+                created_at: String::new(),
+            },
+            Group {
+                id: 20,
+                name: "writers".into(),
+                description: String::new(),
+                permissions: vec![Permission {
+                    id: 0,
+                    effect: "Allow".into(),
+                    actions: vec!["write".into()],
+                    resources: vec!["uploads/*".into()],
+                }],
+                member_ids: vec![1],
+                created_at: String::new(),
+            },
+        ];
+        let index = IamIndex::from_users_and_groups(users, groups);
+        let user = index.get("AK1").unwrap();
+        // From group "readers"
+        assert!(evaluate_permissions(
+            &user.permissions,
+            S3Action::Read,
+            "bucket",
+            "key"
+        ));
+        assert!(evaluate_permissions(
+            &user.permissions,
+            S3Action::List,
+            "bucket",
+            ""
+        ));
+        // From group "writers"
+        assert!(evaluate_permissions(
+            &user.permissions,
+            S3Action::Write,
+            "uploads",
+            "file.bin"
+        ));
+        // Write on other bucket not granted by either group
+        assert!(!evaluate_permissions(
+            &user.permissions,
+            S3Action::Write,
+            "releases",
+            "v1.zip"
+        ));
+        // Delete not granted by any group
+        assert!(!evaluate_permissions(
+            &user.permissions,
+            S3Action::Delete,
+            "bucket",
+            "key"
+        ));
     }
 }

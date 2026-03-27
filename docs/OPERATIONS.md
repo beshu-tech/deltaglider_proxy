@@ -47,21 +47,24 @@ CLI flags override anything loaded from the file/env:
 
 ## Demo UI
 
-An embedded React-based S3 browser starts automatically on **S3 port + 1**. For example, if DeltaGlider Proxy listens on `:9002`, the demo UI is available at `http://localhost:9003`.
+An embedded React-based S3 browser is served under `/_/` on the same port as the S3 API. For example, if DeltaGlider Proxy listens on `:9000`, the UI is available at `http://localhost:9000/_/`. The `/_/` prefix is safe because `_` is not a valid S3 bucket name character, so there is no conflict with S3 operations.
 
-The UI auto-detects the S3 endpoint from its own URL (port - 1), so no manual configuration is needed. Features include:
+No extra ports, no extra containers, no manual configuration needed. Features include:
 
-- **S3 Object Browser** — browse, upload, download, delete objects across buckets
+- **S3 Object Browser** — browse, upload, download, delete objects across buckets; show/hide system files toggle; compute folder sizes
+- **File Preview** — double-click any previewable file (text, images) to preview inline via the inspector panel
 - **Proxy Dashboard** (`#/metrics`) — live Prometheus metrics with interactive charts:
   - Cache health: utilization gauge, hit/miss rate, time-series chart
   - Delta compression: encode/decode latency, compression ratio distribution, storage decisions
   - HTTP traffic: request breakdown by operation (bar + pie chart), latency distribution, status codes, live request rate
   - Authentication: success/failure counts with failure reason breakdown
   - Top-line KPIs: uptime, peak memory, total requests, storage savings %
-- **Admin Settings** — hot-reload configuration, change backend, tune compression, manage credentials
+- **Admin Settings** — full-screen overlay with hot-reload configuration, change backend, tune compression
+- **IAM User Management** — master-detail user panel: create, edit, delete users with ABAC permissions; key rotation with self-lockout prevention; delete confirmation via `window.confirm`
+- **API Reference** (`#/docs`) — interactive API documentation page
 - **Demo Data Generator** — populate test data for evaluation
 
-Charts auto-refresh every 5s. Storage stats (from `/stats`) refresh every 60s and are capped at 1,000 objects.
+Charts auto-refresh every 5s. Storage stats (from `/_/stats`) refresh every 60s and are capped at 1,000 objects.
 
 To build for local development:
 
@@ -74,10 +77,10 @@ The Docker build handles the Node.js UI build automatically via a multi-stage Do
 
 ## Health & Observability
 
-- `GET /health` returns JSON with `status`, `version`, `peak_rss_bytes`, and cache state (`cache_size_bytes`, `cache_max_bytes`, `cache_entries`, `cache_utilization_pct`).
-- `GET /stats` returns aggregate storage statistics with 10s server-side cache, capped at 1,000 objects.
-- `GET /metrics` returns Prometheus text format with 20+ metrics covering HTTP requests, delta compression, cache, codec concurrency, and auth. See [METRICS.md](METRICS.md) for the full reference.
-- Operational endpoints (`/health`, `/stats`, `/metrics`) are exempted from SigV4 authentication — accessible by monitoring systems without S3 credentials.
+- `GET /health` (or `/_/health`) returns JSON with `status`, `version`, `peak_rss_bytes`, and cache state (`cache_size_bytes`, `cache_max_bytes`, `cache_entries`, `cache_utilization_pct`).
+- `GET /stats` (or `/_/stats`) returns aggregate storage statistics with 10s server-side cache, capped at 1,000 objects.
+- `GET /metrics` (or `/_/metrics`) returns Prometheus text format with 20+ metrics covering HTTP requests, delta compression, cache, codec concurrency, and auth. See [METRICS.md](METRICS.md) for the full reference.
+- Operational endpoints (`/health`, `/stats`, `/metrics`) are exempted from SigV4 authentication — accessible by monitoring systems without S3 credentials. Available on both root paths and under `/_/`.
 
 ### Cache health observability
 
@@ -121,7 +124,8 @@ DGP_LOG_LEVEL=deltaglider_proxy=warn cargo run --release
 
 - **Optional SigV4 authentication**: When `DGP_ACCESS_KEY_ID` and `DGP_SECRET_ACCESS_KEY` are both set, all requests must be signed with valid AWS Signature V4 credentials — either via the `Authorization` header or via presigned URL query parameters. Standard S3 tools (aws-cli, boto3, Terraform) and presigned URLs (`aws s3 presign`) work out of the box. The proxy verifies client signatures, then re-signs upstream requests with separate backend credentials via the AWS SDK. See [AUTHENTICATION.md](AUTHENTICATION.md) for details and the presigned URL flow diagram.
 - **Without authentication**: If credentials are not configured, DeltaGlider Proxy accepts all requests. Treat it like an internal service and put it behind network policy / a trusted reverse proxy.
-- **Admin GUI**: The embedded demo UI includes an admin interface protected by a separate password hash (`DGP_ADMIN_PASSWORD_HASH`). Admin sessions use in-memory tokens with 24-hour TTL, independent of S3 SigV4 auth.
+- **Bootstrap password**: A single infrastructure secret that encrypts the IAM config database (SQLCipher), signs admin session cookies, and gates admin GUI access before IAM users exist. Auto-generated on first run (printed to stderr). Set via `DGP_BOOTSTRAP_PASSWORD_HASH` env var or `--set-bootstrap-password` CLI flag. See [AUTHENTICATION.md](AUTHENTICATION.md) for details.
+- **IAM mode**: When IAM users exist in the config DB, the proxy switches to per-user credentials with ABAC permissions. Admin GUI access is permission-based (no password needed for IAM admins). Session tokens generated with `OsRng` for cryptographic security. Admin sessions use in-memory tokens with 24-hour TTL, independent of S3 SigV4 auth.
 - Keys are validated to reject `..` path segments and backslashes, but you should still avoid exposing the proxy directly to untrusted clients.
 
 ## Performance knobs

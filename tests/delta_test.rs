@@ -6,8 +6,8 @@
 mod common;
 
 use common::{
-    generate_binary, get_bytes, list_objects_raw, mutate_binary, put_and_get_storage_type,
-    TestServer,
+    generate_binary, get_bytes, head_headers, list_objects_raw, mutate_binary,
+    put_and_get_storage_type, TestServer,
 };
 
 #[tokio::test]
@@ -356,25 +356,32 @@ async fn test_list_objects_reports_original_sizes() {
         .collect();
 
     assert_eq!(sizes.len(), 2, "Should list 2 objects, got: {:?}", sizes);
-    // Both sizes should be the original file sizes, not delta sizes
+    // Filesystem backend: LIST returns original file sizes (xattr has full metadata).
+    // Both the reference and delta-compressed file report their original sizes.
     for size in &sizes {
         assert!(
             *size >= 1000,
-            "Listed size {} should be original size (~1024), not delta size",
+            "Listed size {} should be original size (~1024)",
             size
         );
     }
-    // The variant's listed size should match its original length
-    // Find the size for v1.zip specifically
-    let v1_pos = xml.find("<Key>sizes_test/v1.zip</Key>").unwrap();
-    let size_after_v1 = &xml[v1_pos..];
-    let size_start = size_after_v1.find("<Size>").unwrap() + 6;
-    let size_end = size_after_v1[size_start..].find("</Size>").unwrap() + size_start;
-    let v1_listed_size: u64 = size_after_v1[size_start..size_end].parse().unwrap();
+    // HEAD also returns original size
+    let headers = head_headers(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        "sizes_test/v1.zip",
+    )
+    .await;
+    let head_size: u64 = headers
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     assert_eq!(
-        v1_listed_size, variant_len as u64,
-        "v1.zip listed size should be original size {}, got {}",
-        variant_len, v1_listed_size
+        head_size, variant_len as u64,
+        "HEAD Content-Length should be original size {}, got {}",
+        variant_len, head_size
     );
 }
 

@@ -8,7 +8,6 @@ import {
   DeleteOutlined,
   UploadOutlined,
   LogoutOutlined,
-  DashboardOutlined,
 } from '@ant-design/icons';
 import { listBuckets, createBucket, deleteBucket, getBucket, setBucket } from '../s3client';
 import type { BucketInfo } from '../types';
@@ -41,10 +40,10 @@ interface Props {
   onClose: () => void;
   isMobile: boolean;
   onSettingsClick?: () => void;
-  onMetricsClick?: () => void;
   onDocsClick?: () => void;
   onLogout?: () => void;
   currentUser?: string;
+  displayName?: string;
   canAdmin?: boolean;
 }
 
@@ -57,10 +56,10 @@ export default function Sidebar({
   onClose,
   isMobile,
   onSettingsClick,
-  onMetricsClick,
   onDocsClick,
   onLogout,
   currentUser,
+  displayName,
   canAdmin,
 }: Props) {
   const {
@@ -245,7 +244,7 @@ export default function Sidebar({
           </Space.Compact>
         </div>
 
-        {/* Upload + Demo */}
+        {/* Upload */}
         <div style={{ padding: '4px 0', borderTop: `1px solid ${token.colorBorderSecondary}`, marginTop: 4 }}>
           <button
             className="btn-reset"
@@ -257,7 +256,6 @@ export default function Sidebar({
             <UploadOutlined aria-hidden="true" style={MENU_ICON_STYLE} />
             <span>Upload Files</span>
           </button>
-          <DemoDataGenerator onDone={onMutate} />
         </div>
       </nav>
 
@@ -266,16 +264,6 @@ export default function Sidebar({
         {/* Navigation */}
         <div style={{ padding: '10px 16px 8px', borderTop: `1px solid ${BORDER}` }}>
           <nav aria-label="Settings and help">
-            <button
-              className="btn-reset"
-              onClick={onMetricsClick}
-              style={menuItemStyle}
-              onMouseEnter={(e) => { e.currentTarget.style.color = TEXT_PRIMARY; }}
-              onMouseLeave={(e) => { e.currentTarget.style.color = TEXT_SECONDARY; }}
-            >
-              <DashboardOutlined aria-hidden="true" style={MENU_ICON_STYLE} />
-              <span>Metrics</span>
-            </button>
             {canAdmin !== false && (
               <button
                 className="btn-reset"
@@ -299,29 +287,39 @@ export default function Sidebar({
               <span>API Reference</span>
             </button>
             {onLogout && (
-              <Popconfirm
-                title="Disconnect?"
-                description="This will clear your credentials and return to the login screen."
-                onConfirm={onLogout}
-                okText="Disconnect"
-                okButtonProps={{ danger: true }}
-              >
-                <Tooltip title="Disconnect & clear credentials" placement="right">
-                  <button
-                    className="btn-reset"
-                    style={menuItemStyle}
-                    onMouseEnter={(e) => { e.currentTarget.style.color = ACCENT_RED; }}
-                    onMouseLeave={(e) => { e.currentTarget.style.color = TEXT_SECONDARY; }}
+              <div style={{ padding: '6px 0 2px' }}>
+                <div style={{ padding: '4px 6px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                  <span style={{ fontSize: 11, color: TEXT_MUTED, fontFamily: "var(--font-ui)", overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    Logged in as <strong style={{ color: TEXT_SECONDARY, fontWeight: 600 }}>{displayName || currentUser || 'user'}</strong>
+                  </span>
+                  <Popconfirm
+                    title="Disconnect?"
+                    description="This will clear your credentials and return to the login screen."
+                    onConfirm={onLogout}
+                    okText="Disconnect"
+                    okButtonProps={{ danger: true }}
                   >
-                    <LogoutOutlined aria-hidden="true" style={MENU_ICON_STYLE} />
-                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                      {currentUser || 'Logout'}
-                    </span>
-                  </button>
-                </Tooltip>
-              </Popconfirm>
+                    <Tooltip title="Disconnect & clear credentials" placement="right">
+                      <button
+                        className="btn-reset"
+                        style={{ color: TEXT_MUTED, fontSize: 14, padding: 4, flexShrink: 0, transition: 'color 0.15s' }}
+                        onMouseEnter={(e) => { e.currentTarget.style.color = ACCENT_RED; }}
+                        onMouseLeave={(e) => { e.currentTarget.style.color = TEXT_MUTED; }}
+                        aria-label="Disconnect"
+                      >
+                        <LogoutOutlined aria-hidden="true" />
+                      </button>
+                    </Tooltip>
+                  </Popconfirm>
+                </div>
+              </div>
             )}
           </nav>
+        </div>
+
+        {/* Demo data — less prominent utility */}
+        <div style={{ padding: '0 16px 4px' }}>
+          <DemoDataGenerator onDone={onMutate} />
         </div>
 
         {/* Branding */}

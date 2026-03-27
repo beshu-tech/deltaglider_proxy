@@ -4,7 +4,7 @@
 //! The DB file is cached locally and synced to/from S3 for multi-instance
 //! consistency. Encryption key is derived from the admin GUI password.
 
-use crate::iam::{IamUser, Permission};
+use crate::iam::{Group, IamUser, Permission};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
@@ -18,7 +18,7 @@ pub struct ConfigDb {
 }
 
 /// Schema version — bump when adding migrations.
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 3;
 
 impl ConfigDb {
     /// Open an existing DB or create a new one at `local_path`.
@@ -42,7 +42,7 @@ impl ConfigDb {
             Ok(_) => {}
             Err(e) => {
                 return Err(ConfigDbError::WrongPassphrase(format!(
-                    "Cannot decrypt config database (wrong admin password?): {}",
+                    "Cannot decrypt config database (wrong bootstrap password?): {}",
                     e
                 )));
             }
@@ -105,6 +105,45 @@ impl ConfigDb {
             )?;
         }
 
+        if version < 2 {
+            conn.execute_batch(
+                "ALTER TABLE permissions ADD COLUMN effect TEXT NOT NULL DEFAULT 'Allow';",
+            )?;
+            info!(
+                "Migrated config DB schema from v{} to v2 (added effect column)",
+                version
+            );
+        }
+
+        if version < 3 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS groups (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name        TEXT NOT NULL UNIQUE,
+                    description TEXT DEFAULT '',
+                    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                CREATE TABLE IF NOT EXISTS group_members (
+                    group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+                    user_id  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    PRIMARY KEY (group_id, user_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS group_permissions (
+                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    group_id  INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+                    actions   TEXT NOT NULL,
+                    resources TEXT NOT NULL,
+                    effect    TEXT NOT NULL DEFAULT 'Allow'
+                );",
+            )?;
+            info!(
+                "Migrated config DB schema from v{} to v3 (added groups tables)",
+                version
+            );
+        }
+
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         debug!("Config DB schema at version {}", SCHEMA_VERSION);
         Ok(())
@@ -122,6 +161,7 @@ impl ConfigDb {
             enabled: row.get::<_, i32>(4)? != 0,
             created_at: row.get(5)?,
             permissions: Vec::new(),
+            group_ids: Vec::new(),
         })
     }
 
@@ -129,8 +169,12 @@ impl ConfigDb {
     fn permission_from_row(row: &rusqlite::Row) -> rusqlite::Result<Permission> {
         let actions_json: String = row.get(1)?;
         let resources_json: String = row.get(2)?;
+        let effect: String = row
+            .get::<_, String>(3)
+            .unwrap_or_else(|_| "Allow".to_string());
         Ok(Permission {
             id: row.get(0)?,
+            effect,
             actions: serde_json::from_str(&actions_json).unwrap_or_default(),
             resources: serde_json::from_str(&resources_json).unwrap_or_default(),
         })
@@ -140,7 +184,7 @@ impl ConfigDb {
     fn load_permissions(&self, user_id: i64) -> Result<Vec<Permission>, ConfigDbError> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, actions, resources FROM permissions WHERE user_id = ?1")?;
+            .prepare("SELECT id, actions, resources, effect FROM permissions WHERE user_id = ?1")?;
         let perms = stmt
             .query_map(params![user_id], Self::permission_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
@@ -148,17 +192,23 @@ impl ConfigDb {
     }
 
     /// Insert permission rows for a user.
+    /// Accepts a `conn` parameter so it can operate within a transaction.
     fn insert_permissions(
-        &self,
+        conn: &Connection,
         user_id: i64,
         permissions: &[Permission],
     ) -> Result<(), ConfigDbError> {
         for perm in permissions {
             let actions_json = serde_json::to_string(&perm.actions).unwrap_or_default();
             let resources_json = serde_json::to_string(&perm.resources).unwrap_or_default();
-            self.conn.execute(
-                "INSERT INTO permissions (user_id, actions, resources) VALUES (?1, ?2, ?3)",
-                params![user_id, actions_json, resources_json],
+            let effect = if perm.effect.is_empty() {
+                "Allow"
+            } else {
+                &perm.effect
+            };
+            conn.execute(
+                "INSERT INTO permissions (user_id, actions, resources, effect) VALUES (?1, ?2, ?3, ?4)",
+                params![user_id, actions_json, resources_json, effect],
             )?;
         }
         Ok(())
@@ -179,6 +229,7 @@ impl ConfigDb {
         let mut result = Vec::with_capacity(users.len());
         for mut user in users {
             user.permissions = self.load_permissions(user.id)?;
+            user.group_ids = self.get_user_group_ids(user.id)?;
             result.push(user);
         }
 
@@ -195,25 +246,16 @@ impl ConfigDb {
         enabled: bool,
         permissions: &[Permission],
     ) -> Result<IamUser, ConfigDbError> {
-        self.conn.execute("BEGIN", [])?;
-        let result = (|| {
-            self.conn.execute(
-                "INSERT INTO users (name, access_key_id, secret_access_key, enabled) VALUES (?1, ?2, ?3, ?4)",
-                params![name, access_key_id, secret_access_key, enabled as i32],
-            )?;
-            let user_id = self.conn.last_insert_rowid();
-            self.insert_permissions(user_id, permissions)?;
-            self.get_user_by_id(user_id)
-        })();
-        match &result {
-            Ok(_) => {
-                self.conn.execute("COMMIT", [])?;
-            }
-            Err(_) => {
-                let _ = self.conn.execute("ROLLBACK", []);
-            }
-        }
-        result
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO users (name, access_key_id, secret_access_key, enabled) VALUES (?1, ?2, ?3, ?4)",
+            params![name, access_key_id, secret_access_key, enabled as i32],
+        )?;
+        let user_id = tx.last_insert_rowid();
+        Self::insert_permissions(&tx, user_id, permissions)?;
+        tx.commit()?;
+        // Read the committed user after the transaction is committed
+        self.get_user_by_id(user_id)
     }
 
     /// Update an existing user by ID.
@@ -225,38 +267,29 @@ impl ConfigDb {
         enabled: Option<bool>,
         permissions: Option<&[Permission]>,
     ) -> Result<IamUser, ConfigDbError> {
-        self.conn.execute("BEGIN", [])?;
-        let result = (|| {
-            if let Some(n) = name {
-                self.conn.execute(
-                    "UPDATE users SET name = ?1 WHERE id = ?2",
-                    params![n, user_id],
-                )?;
-            }
-            if let Some(e) = enabled {
-                self.conn.execute(
-                    "UPDATE users SET enabled = ?1 WHERE id = ?2",
-                    params![e as i32, user_id],
-                )?;
-            }
-            if let Some(perms) = permissions {
-                self.conn.execute(
-                    "DELETE FROM permissions WHERE user_id = ?1",
-                    params![user_id],
-                )?;
-                self.insert_permissions(user_id, perms)?;
-            }
-            self.get_user_by_id(user_id)
-        })();
-        match &result {
-            Ok(_) => {
-                self.conn.execute("COMMIT", [])?;
-            }
-            Err(_) => {
-                let _ = self.conn.execute("ROLLBACK", []);
-            }
+        let tx = self.conn.unchecked_transaction()?;
+        if let Some(n) = name {
+            tx.execute(
+                "UPDATE users SET name = ?1 WHERE id = ?2",
+                params![n, user_id],
+            )?;
         }
-        result
+        if let Some(e) = enabled {
+            tx.execute(
+                "UPDATE users SET enabled = ?1 WHERE id = ?2",
+                params![e as i32, user_id],
+            )?;
+        }
+        if let Some(perms) = permissions {
+            tx.execute(
+                "DELETE FROM permissions WHERE user_id = ?1",
+                params![user_id],
+            )?;
+            Self::insert_permissions(&tx, user_id, perms)?;
+        }
+        tx.commit()?;
+        // Read the committed user after the transaction is committed
+        self.get_user_by_id(user_id)
     }
 
     /// Delete a user by ID. Permissions are cascade-deleted.
@@ -314,7 +347,202 @@ impl ConfigDb {
             Self::user_from_row,
         )?;
         user.permissions = self.load_permissions(user_id)?;
+        user.group_ids = self.get_user_group_ids(user_id)?;
         Ok(user)
+    }
+
+    // === Group CRUD ===
+
+    /// Load permissions for a group by ID.
+    fn load_group_permissions(&self, group_id: i64) -> Result<Vec<Permission>, ConfigDbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, actions, resources, effect FROM group_permissions WHERE group_id = ?1",
+        )?;
+        let perms = stmt
+            .query_map(params![group_id], Self::permission_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(perms)
+    }
+
+    /// Insert permission rows for a group.
+    fn insert_group_permissions(
+        conn: &Connection,
+        group_id: i64,
+        permissions: &[Permission],
+    ) -> Result<(), ConfigDbError> {
+        for perm in permissions {
+            let actions_json = serde_json::to_string(&perm.actions).unwrap_or_default();
+            let resources_json = serde_json::to_string(&perm.resources).unwrap_or_default();
+            let effect = if perm.effect.is_empty() {
+                "Allow"
+            } else {
+                &perm.effect
+            };
+            conn.execute(
+                "INSERT INTO group_permissions (group_id, actions, resources, effect) VALUES (?1, ?2, ?3, ?4)",
+                params![group_id, actions_json, resources_json, effect],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Get member user IDs for a group.
+    pub fn get_group_members(&self, group_id: i64) -> Result<Vec<i64>, ConfigDbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT user_id FROM group_members WHERE group_id = ?1")?;
+        let ids = stmt
+            .query_map(params![group_id], |row| row.get(0))?
+            .collect::<Result<Vec<i64>, _>>()?;
+        Ok(ids)
+    }
+
+    /// Get group IDs that a user belongs to.
+    pub fn get_user_group_ids(&self, user_id: i64) -> Result<Vec<i64>, ConfigDbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT group_id FROM group_members WHERE user_id = ?1")?;
+        let ids = stmt
+            .query_map(params![user_id], |row| row.get(0))?
+            .collect::<Result<Vec<i64>, _>>()?;
+        Ok(ids)
+    }
+
+    /// Load all groups with their permissions and member IDs.
+    pub fn load_groups(&self) -> Result<Vec<Group>, ConfigDbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name, description, created_at FROM groups")?;
+        let groups: Vec<(i64, String, String, String)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get::<_, String>(2).unwrap_or_default(),
+                    row.get(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut result = Vec::with_capacity(groups.len());
+        for (id, name, description, created_at) in groups {
+            let permissions = self.load_group_permissions(id)?;
+            let member_ids = self.get_group_members(id)?;
+            result.push(Group {
+                id,
+                name,
+                description,
+                permissions,
+                member_ids,
+                created_at,
+            });
+        }
+        Ok(result)
+    }
+
+    /// Get a single group by ID with permissions and members.
+    pub fn get_group_by_id(&self, group_id: i64) -> Result<Group, ConfigDbError> {
+        let (id, name, description, created_at) = self.conn.query_row(
+            "SELECT id, name, description, created_at FROM groups WHERE id = ?1",
+            params![group_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2).unwrap_or_default(),
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )?;
+        let permissions = self.load_group_permissions(id)?;
+        let member_ids = self.get_group_members(id)?;
+        Ok(Group {
+            id,
+            name,
+            description,
+            permissions,
+            member_ids,
+            created_at,
+        })
+    }
+
+    /// Create a new group. Returns the group with generated ID.
+    pub fn create_group(
+        &self,
+        name: &str,
+        description: &str,
+        permissions: &[Permission],
+    ) -> Result<Group, ConfigDbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO groups (name, description) VALUES (?1, ?2)",
+            params![name, description],
+        )?;
+        let group_id = tx.last_insert_rowid();
+        Self::insert_group_permissions(&tx, group_id, permissions)?;
+        tx.commit()?;
+        self.get_group_by_id(group_id)
+    }
+
+    /// Update an existing group by ID.
+    pub fn update_group(
+        &self,
+        group_id: i64,
+        name: Option<&str>,
+        description: Option<&str>,
+        permissions: Option<&[Permission]>,
+    ) -> Result<Group, ConfigDbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        if let Some(n) = name {
+            tx.execute(
+                "UPDATE groups SET name = ?1 WHERE id = ?2",
+                params![n, group_id],
+            )?;
+        }
+        if let Some(d) = description {
+            tx.execute(
+                "UPDATE groups SET description = ?1 WHERE id = ?2",
+                params![d, group_id],
+            )?;
+        }
+        if let Some(perms) = permissions {
+            tx.execute(
+                "DELETE FROM group_permissions WHERE group_id = ?1",
+                params![group_id],
+            )?;
+            Self::insert_group_permissions(&tx, group_id, perms)?;
+        }
+        tx.commit()?;
+        self.get_group_by_id(group_id)
+    }
+
+    /// Delete a group by ID. Permissions and memberships are cascade-deleted.
+    pub fn delete_group(&self, group_id: i64) -> Result<(), ConfigDbError> {
+        let rows = self
+            .conn
+            .execute("DELETE FROM groups WHERE id = ?1", params![group_id])?;
+        if rows == 0 {
+            return Err(ConfigDbError::NotFound(format!("Group ID {}", group_id)));
+        }
+        Ok(())
+    }
+
+    /// Add a user to a group.
+    pub fn add_user_to_group(&self, group_id: i64, user_id: i64) -> Result<(), ConfigDbError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO group_members (group_id, user_id) VALUES (?1, ?2)",
+            params![group_id, user_id],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a user from a group.
+    pub fn remove_user_from_group(&self, group_id: i64, user_id: i64) -> Result<(), ConfigDbError> {
+        self.conn.execute(
+            "DELETE FROM group_members WHERE group_id = ?1 AND user_id = ?2",
+            params![group_id, user_id],
+        )?;
+        Ok(())
     }
 
     // === S3 Sync ===
@@ -351,7 +579,7 @@ impl ConfigDb {
         Ok(())
     }
 
-    /// Re-encrypt the database with a new passphrase (after admin password change).
+    /// Re-encrypt the database with a new passphrase (after bootstrap password change).
     pub fn rekey(&self, new_passphrase: &str) -> Result<(), ConfigDbError> {
         self.conn.pragma_update(None, "rekey", new_passphrase)?;
         info!("Config database re-encrypted with new passphrase");
@@ -403,6 +631,7 @@ mod tests {
 
         let perms = vec![Permission {
             id: 0,
+            effect: "Allow".into(),
             actions: vec!["read".into(), "write".into()],
             resources: vec!["releases/*".into()],
         }];
@@ -457,6 +686,7 @@ mod tests {
 
         let initial_perms = vec![Permission {
             id: 0,
+            effect: "Allow".into(),
             actions: vec!["read".into()],
             resources: vec!["*".into()],
         }];
@@ -468,11 +698,13 @@ mod tests {
         let new_perms = vec![
             Permission {
                 id: 0,
+                effect: "Allow".into(),
                 actions: vec!["read".into(), "write".into()],
                 resources: vec!["releases/*".into()],
             },
             Permission {
                 id: 0,
+                effect: "Allow".into(),
                 actions: vec!["list".into()],
                 resources: vec!["*".into()],
             },
@@ -491,6 +723,7 @@ mod tests {
 
         let perms = vec![Permission {
             id: 0,
+            effect: "Allow".into(),
             actions: vec!["read".into()],
             resources: vec!["*".into()],
         }];
@@ -592,6 +825,143 @@ mod tests {
     }
 
     #[test]
+    fn test_create_and_load_group() {
+        let db = ConfigDb::in_memory("test-pass").unwrap();
+
+        let perms = vec![Permission {
+            id: 0,
+            effect: "Allow".into(),
+            actions: vec!["read".into(), "list".into()],
+            resources: vec!["*".into()],
+        }];
+
+        let group = db
+            .create_group("readers", "Read-only access", &perms)
+            .unwrap();
+
+        assert_eq!(group.name, "readers");
+        assert_eq!(group.description, "Read-only access");
+        assert_eq!(group.permissions.len(), 1);
+        assert_eq!(group.permissions[0].actions, vec!["read", "list"]);
+        assert!(group.member_ids.is_empty());
+
+        let groups = db.load_groups().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "readers");
+    }
+
+    #[test]
+    fn test_group_membership() {
+        let db = ConfigDb::in_memory("test-pass").unwrap();
+
+        let group = db.create_group("devs", "", &[]).unwrap();
+        let user = db
+            .create_user("alice", "AKALICE1", "secret", true, &[])
+            .unwrap();
+
+        db.add_user_to_group(group.id, user.id).unwrap();
+
+        let members = db.get_group_members(group.id).unwrap();
+        assert_eq!(members, vec![user.id]);
+
+        let user_groups = db.get_user_group_ids(user.id).unwrap();
+        assert_eq!(user_groups, vec![group.id]);
+
+        // Reload user and verify group_ids populated
+        let reloaded = db.load_users().unwrap();
+        assert_eq!(reloaded[0].group_ids, vec![group.id]);
+
+        // Remove membership
+        db.remove_user_from_group(group.id, user.id).unwrap();
+        let members = db.get_group_members(group.id).unwrap();
+        assert!(members.is_empty());
+    }
+
+    #[test]
+    fn test_update_group() {
+        let db = ConfigDb::in_memory("test-pass").unwrap();
+
+        let perms = vec![Permission {
+            id: 0,
+            effect: "Allow".into(),
+            actions: vec!["read".into()],
+            resources: vec!["*".into()],
+        }];
+        let group = db.create_group("old-name", "old desc", &perms).unwrap();
+
+        let new_perms = vec![Permission {
+            id: 0,
+            effect: "Allow".into(),
+            actions: vec!["read".into(), "write".into()],
+            resources: vec!["releases/*".into()],
+        }];
+        let updated = db
+            .update_group(
+                group.id,
+                Some("new-name"),
+                Some("new desc"),
+                Some(&new_perms),
+            )
+            .unwrap();
+
+        assert_eq!(updated.name, "new-name");
+        assert_eq!(updated.description, "new desc");
+        assert_eq!(updated.permissions.len(), 1);
+        assert_eq!(updated.permissions[0].actions, vec!["read", "write"]);
+    }
+
+    #[test]
+    fn test_delete_group_cascades() {
+        let db = ConfigDb::in_memory("test-pass").unwrap();
+
+        let perms = vec![Permission {
+            id: 0,
+            effect: "Allow".into(),
+            actions: vec!["read".into()],
+            resources: vec!["*".into()],
+        }];
+        let group = db.create_group("to-delete", "", &perms).unwrap();
+        let user = db
+            .create_user("bob", "AKBOB001", "secret", true, &[])
+            .unwrap();
+        db.add_user_to_group(group.id, user.id).unwrap();
+
+        db.delete_group(group.id).unwrap();
+
+        // Group gone
+        let groups = db.load_groups().unwrap();
+        assert!(groups.is_empty());
+
+        // Membership gone
+        let user_groups = db.get_user_group_ids(user.id).unwrap();
+        assert!(user_groups.is_empty());
+
+        // Group permissions gone
+        let perm_count: i32 = db
+            .conn
+            .query_row("SELECT count(*) FROM group_permissions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(perm_count, 0);
+    }
+
+    #[test]
+    fn test_delete_user_removes_group_membership() {
+        let db = ConfigDb::in_memory("test-pass").unwrap();
+
+        let group = db.create_group("team", "", &[]).unwrap();
+        let user = db
+            .create_user("temp", "AKTEMP01", "secret", true, &[])
+            .unwrap();
+        db.add_user_to_group(group.id, user.id).unwrap();
+
+        db.delete_user(user.id).unwrap();
+
+        // Membership should be cascade-deleted
+        let members = db.get_group_members(group.id).unwrap();
+        assert!(members.is_empty());
+    }
+
+    #[test]
     fn test_transaction_rollback_on_duplicate_key() {
         let db = ConfigDb::in_memory("test-pass").unwrap();
 
@@ -602,6 +972,7 @@ mod tests {
         // Try to create second user with same access_key_id — should fail
         let perms = vec![Permission {
             id: 0,
+            effect: "Allow".into(),
             actions: vec!["read".into()],
             resources: vec!["*".into()],
         }];

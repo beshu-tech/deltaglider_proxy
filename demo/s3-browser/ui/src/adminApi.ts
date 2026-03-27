@@ -1,6 +1,6 @@
 // Admin API client helpers
 
-const BASE = '';
+const BASE = '/_';
 
 /** Shared fetch wrapper — handles credentials, JSON serialization, content-type. */
 async function adminFetch(path: string, method = 'GET', body?: unknown): Promise<Response> {
@@ -46,14 +46,14 @@ export interface AdminConfig {
 export async function getAdminConfig(): Promise<AdminConfig | null> {
   const res = await adminFetch('/api/admin/config');
   if (!res.ok) return null;
-  return res.json();
+  return safeJson(res);
 }
 
 export async function checkSession(): Promise<boolean> {
   try {
     const res = await adminFetch('/api/admin/session');
     if (!res.ok) return false;
-    const data = await res.json();
+    const data = await safeJson<{ valid?: boolean }>(res);
     return data.valid === true;
   } catch {
     return false;
@@ -66,10 +66,24 @@ export interface ConfigUpdateResponse {
   requires_restart: boolean;
 }
 
+/** Safely parse JSON from response, falling back to text for non-JSON content types. */
+async function safeJson<T>(res: Response): Promise<T> {
+  const ct = res.headers.get('content-type') || '';
+  if (ct.includes('application/json')) {
+    return res.json();
+  }
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(text || `Unexpected response (${res.status})`);
+  }
+}
+
 export async function updateAdminConfig(updates: Record<string, unknown>): Promise<ConfigUpdateResponse> {
   const res = await adminFetch('/api/admin/config', 'PUT', updates);
   if (!res.ok) throw new Error(`Config update failed: ${res.status}`);
-  return res.json();
+  return safeJson(res);
 }
 
 export interface PasswordChangeResponse {
@@ -94,7 +108,7 @@ export interface TestS3Response {
 
 export async function testS3Connection(req: TestS3Request): Promise<TestS3Response> {
   const res = await adminFetch('/api/admin/test-s3', 'POST', req);
-  return res.json();
+  return safeJson(res);
 }
 
 export async function changeAdminPassword(
@@ -105,15 +119,34 @@ export async function changeAdminPassword(
     current_password: currentPassword,
     new_password: newPassword,
   });
-  return res.json();
+  return safeJson(res);
 }
 
 // === IAM User Management ===
 
 export interface IamPermission {
   id: number;
+  effect?: string; // "Allow" or "Deny", defaults to "Allow"
   actions: string[];
   resources: string[];
+}
+
+// === Canned Policies ===
+
+export interface CannedPolicy {
+  name: string;
+  description: string;
+  permissions: IamPermission[];
+}
+
+export async function getCannedPolicies(): Promise<CannedPolicy[]> {
+  try {
+    const res = await adminFetch('/api/admin/policies');
+    if (!res.ok) return [];
+    return safeJson(res);
+  } catch {
+    return [];
+  }
 }
 
 export interface IamUser {
@@ -143,7 +176,7 @@ export interface UpdateUserRequest {
 export async function getUsers(): Promise<IamUser[]> {
   const res = await adminFetch('/api/admin/users');
   if (!res.ok) throw new Error(`Failed to load users: ${res.status}`);
-  return res.json();
+  return safeJson(res);
 }
 
 export async function createUser(req: CreateUserRequest): Promise<IamUser> {
@@ -152,13 +185,13 @@ export async function createUser(req: CreateUserRequest): Promise<IamUser> {
     const text = await res.text().catch(() => '');
     throw new Error(text || `Failed to create user: ${res.status}`);
   }
-  return res.json();
+  return safeJson(res);
 }
 
 export async function updateUser(id: number, req: UpdateUserRequest): Promise<IamUser> {
   const res = await adminFetch(`/api/admin/users/${id}`, 'PUT', req);
   if (!res.ok) throw new Error(`Failed to update user: ${res.status}`);
-  return res.json();
+  return safeJson(res);
 }
 
 export async function deleteUser(id: number): Promise<void> {
@@ -180,7 +213,66 @@ export async function rotateUserKeys(
     Object.keys(body).length > 0 ? body : undefined,
   );
   if (!res.ok) throw new Error(`Failed to rotate keys: ${res.status}`);
-  return res.json();
+  return safeJson(res);
+}
+
+// === IAM Group Management ===
+
+export interface IamGroup {
+  id: number;
+  name: string;
+  description: string;
+  permissions: IamPermission[];
+  member_ids: number[];
+  created_at: string;
+}
+
+export interface CreateGroupRequest {
+  name: string;
+  description?: string;
+  permissions: IamPermission[];
+}
+
+export interface UpdateGroupRequest {
+  name?: string;
+  description?: string;
+  permissions?: IamPermission[];
+}
+
+export async function getGroups(): Promise<IamGroup[]> {
+  const res = await adminFetch('/api/admin/groups');
+  if (!res.ok) throw new Error(`Failed to load groups: ${res.status}`);
+  return safeJson(res);
+}
+
+export async function createGroup(req: CreateGroupRequest): Promise<IamGroup> {
+  const res = await adminFetch('/api/admin/groups', 'POST', req);
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(text || `Failed to create group: ${res.status}`);
+  }
+  return safeJson(res);
+}
+
+export async function updateGroup(id: number, req: UpdateGroupRequest): Promise<IamGroup> {
+  const res = await adminFetch(`/api/admin/groups/${id}`, 'PUT', req);
+  if (!res.ok) throw new Error(`Failed to update group: ${res.status}`);
+  return safeJson(res);
+}
+
+export async function deleteGroup(id: number): Promise<void> {
+  const res = await adminFetch(`/api/admin/groups/${id}`, 'DELETE');
+  if (!res.ok) throw new Error(`Failed to delete group: ${res.status}`);
+}
+
+export async function addGroupMember(groupId: number, userId: number): Promise<void> {
+  const res = await adminFetch(`/api/admin/groups/${groupId}/members`, 'POST', { user_id: userId });
+  if (!res.ok) throw new Error(`Failed to add member: ${res.status}`);
+}
+
+export async function removeGroupMember(groupId: number, userId: number): Promise<void> {
+  const res = await adminFetch(`/api/admin/groups/${groupId}/members/${userId}`, 'DELETE');
+  if (!res.ok) throw new Error(`Failed to remove member: ${res.status}`);
 }
 
 // === Whoami / Login-as ===
@@ -191,13 +283,18 @@ export interface WhoamiResponse {
 }
 
 export async function whoami(accessKeyId?: string, secretAccessKey?: string): Promise<WhoamiResponse> {
-  const params = new URLSearchParams();
-  if (accessKeyId) params.set('access_key_id', accessKeyId);
-  if (secretAccessKey) params.set('secret_access_key', secretAccessKey);
-  const qs = params.toString();
-  const res = await adminFetch(`/api/whoami${qs ? '?' + qs : ''}`);
-  if (!res.ok) return { mode: 'bootstrap', user: null };
-  return res.json();
+  try {
+    const params = new URLSearchParams();
+    if (accessKeyId) params.set('access_key_id', accessKeyId);
+    if (secretAccessKey) params.set('secret_access_key', secretAccessKey);
+    const qs = params.toString();
+    const res = await adminFetch(`/api/whoami${qs ? '?' + qs : ''}`);
+    if (!res.ok) return { mode: 'bootstrap', user: null };
+    return await safeJson(res);
+  } catch (err) {
+    console.warn('whoami request failed:', err);
+    return { mode: 'bootstrap', user: null };
+  }
 }
 
 export async function loginAs(accessKeyId: string, secretAccessKey: string): Promise<{ ok: boolean; error?: string }> {

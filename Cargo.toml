@@ -71,6 +71,9 @@ mime_guess = "2"
 # CLI
 clap = { version = "4", features = ["derive"] }
 
+# Per-request unique IDs
+uuid = { version = "1", features = ["v4"] }
+
 # Metrics
 prometheus = { version = "0.13", default-features = false, features = ["process"] }
 rusqlite = { version = "0.39.0", features = ["bundled-sqlcipher"] }

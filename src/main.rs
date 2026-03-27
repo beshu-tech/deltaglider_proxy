@@ -406,7 +406,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .layer(CorsLayer::permissive())
         .with_state(state.clone());
 
-    // Admin GUI: ensure password hash is available, create session store
+    // Bootstrap password: ensure hash is available, create session store
     let admin_password_hash = config.ensure_bootstrap_password_hash();
     let session_store = Arc::new(SessionStore::new());
 
@@ -419,7 +419,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let shared_config = config.clone().into_shared();
 
     // Initialize IAM config database (encrypted SQLCipher, next to config file).
-    // Uses the admin password hash as the encryption key. DB starts empty —
+    // Uses the bootstrap password hash as the encryption key. DB starts empty —
     // IAM mode activates when the first user is created via the admin GUI.
     let config_db = {
         let db_path = std::env::var("DGP_CONFIG")
@@ -475,9 +475,10 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Start embedded demo UI on a separate port (S3 port + 1)
-    let s3_port = config.listen_addr.port();
-    tokio::spawn(demo::serve(s3_port, admin_state, rustls_config.clone()));
+    // Merge embedded UI + admin API into the main app under /_/
+    // UI routes are OUTSIDE the S3 auth middleware (they use session cookies instead)
+    let app = demo::ui_router(admin_state).merge(app);
+    info!("  Dashboard: http://{}/_/", config.listen_addr);
 
     // Start S3 server with graceful shutdown
     if let Some(rustls_config) = rustls_config {

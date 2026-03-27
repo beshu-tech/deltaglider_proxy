@@ -37,7 +37,7 @@ function findMatchingPreset(logLevel: string): string | null {
 interface Props {
   onBack: () => void;
   onSessionExpired?: () => void;
-  /** When set, renders only the content for this tab (no tabs bar, no header). Used by AdminOverlay. */
+  /** When set, renders only the content for this tab (no tabs bar, no header). Used by AdminPage. */
   embeddedTab?: string;
 }
 
@@ -511,7 +511,7 @@ export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: 
 
   const securityTab = <div style={tabPane}><PasswordChangeCard /></div>;
 
-  // When embedded in AdminOverlay, render just the requested tab content
+  // When embedded in AdminPage, render just the requested tab content
   if (embeddedTab) {
     const tabMap: Record<string, React.ReactNode> = {
       connection: connectionTab,

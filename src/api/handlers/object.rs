@@ -1,18 +1,19 @@
 //! Object-level S3 handlers: GET, HEAD, PUT (with copy detection), DELETE.
 
-use super::{
-    base64_decode, build_object_headers, extract_content_type, extract_user_metadata, xml_response,
-    AppState, ObjectQuery, S3Error,
+use super::bucket::get_acl_response;
+use super::object_helpers::{
+    apply_response_overrides, build_range_response, check_conditionals, copy_object_inner,
+    decode_body, parse_range_header, put_object_inner, upload_part,
 };
+use super::{build_object_headers, xml_response, AppState, ObjectQuery, S3Error};
 use crate::deltaglider::RetrieveResponse;
 use axum::body::{Body, Bytes};
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use std::sync::Arc;
 use tracing::{debug, info, instrument, warn};
 
-use crate::api::aws_chunked::{decode_aws_chunked, get_decoded_content_length, is_aws_chunked};
 use crate::api::extractors::{ValidatedBucket, ValidatedPath};
 use crate::api::xml::{DeleteError, DeleteRequest, DeleteResult, DeletedObject, ListPartsResult};
 
@@ -20,222 +21,6 @@ use crate::api::xml::{DeleteError, DeleteRequest, DeleteResult, DeletedObject, L
 #[derive(Debug, serde::Deserialize, Default)]
 pub struct BucketPostQuery {
     pub delete: Option<String>,
-}
-
-/// PUT object handler (internal)
-/// Called by put_object_or_copy after validation
-#[instrument(skip(state, body))]
-async fn put_object_inner(
-    state: &Arc<AppState>,
-    bucket: &str,
-    key: &str,
-    headers: &HeaderMap,
-    body: &Bytes,
-) -> Result<Response, S3Error> {
-    info!("PUT {}/{} ({} bytes)", bucket, key, body.len());
-
-    // S3 directory marker: zero-byte object with trailing slash (e.g. "folder/")
-    // Used by Cyberduck, AWS Console, etc. to create "folders".
-    // Bypass delta engine and store directly on the backend.
-    if key.ends_with('/') && body.is_empty() {
-        info!("Creating directory marker: {}/{}", bucket, key);
-        state
-            .engine
-            .load()
-            .storage()
-            .put_directory_marker(bucket, key)
-            .await
-            .map_err(|e| S3Error::InternalError(e.to_string()))?;
-        // MD5 of empty content: d41d8cd98f00b204e9800998ecf8427e
-        return Ok((
-            StatusCode::OK,
-            [
-                ("ETag", "\"d41d8cd98f00b204e9800998ecf8427e\"".to_string()),
-                ("x-amz-storage-type", "directory".to_string()),
-            ],
-            "",
-        )
-            .into_response());
-    }
-
-    let content_type = extract_content_type(headers);
-    let user_metadata = extract_user_metadata(headers);
-
-    let result = state
-        .engine
-        .load()
-        .store(bucket, key, body, content_type, user_metadata)
-        .await?;
-
-    let storage_type = result.metadata.storage_info.label();
-
-    debug!(
-        "Stored {}/{} as {}, saved {} bytes",
-        bucket,
-        key,
-        storage_type,
-        result.metadata.file_size as i64 - result.stored_size as i64
-    );
-
-    Ok((
-        StatusCode::OK,
-        [
-            ("ETag", result.metadata.etag()),
-            ("x-amz-storage-type", storage_type.to_string()),
-        ],
-        "",
-    )
-        .into_response())
-}
-
-/// COPY object handler (internal)
-/// Called by put_object_or_copy after validation
-#[instrument(skip(state))]
-async fn copy_object_inner(
-    state: &Arc<AppState>,
-    bucket: &str,
-    key: &str,
-    headers: &HeaderMap,
-) -> Result<Response, S3Error> {
-    // Get copy source
-    let copy_source = headers
-        .get("x-amz-copy-source")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| S3Error::InvalidRequest("Missing x-amz-copy-source header".to_string()))?;
-
-    // Parse source: /bucket/key or bucket/key (URL-encoded)
-    let copy_source = urlencoding::decode(copy_source)
-        .map_err(|_| S3Error::InvalidArgument("Invalid copy source encoding".to_string()))?;
-    let copy_source = copy_source.trim_start_matches('/');
-
-    let (source_bucket, source_key) = copy_source
-        .split_once('/')
-        .ok_or_else(|| S3Error::InvalidArgument("Copy source must be bucket/key".to_string()))?;
-
-    info!(
-        "COPY {}/{} -> {}/{}",
-        source_bucket, source_key, bucket, key
-    );
-
-    // Load engine once for the entire copy operation to ensure consistency.
-    let engine = state.engine.load();
-
-    // Check source object size before loading into memory to avoid transient
-    // memory spikes if max_object_size was reduced after the object was stored.
-    // Note: file_size may be 0 for unmanaged objects (fallback metadata), so we
-    // also check the actual data size after retrieval below.
-    let source_meta_head = engine.head(source_bucket, source_key).await?;
-    if source_meta_head.file_size > engine.max_object_size() {
-        return Err(S3Error::EntityTooLarge {
-            size: source_meta_head.file_size,
-            max: engine.max_object_size(),
-        });
-    }
-
-    // Retrieve source object
-    let (data, source_meta) = engine.retrieve(source_bucket, source_key).await?;
-
-    // Double-check actual data size (metadata may report 0 for unmanaged objects)
-    if data.len() as u64 > engine.max_object_size() {
-        return Err(S3Error::EntityTooLarge {
-            size: data.len() as u64,
-            max: engine.max_object_size(),
-        });
-    }
-
-    // Store as new object, preserving user metadata from source
-    let result = engine
-        .store(
-            bucket,
-            key,
-            &data,
-            source_meta.content_type.clone(),
-            source_meta.user_metadata.clone(),
-        )
-        .await?;
-
-    debug!(
-        "Copied {}/{} -> {}/{} ({} bytes)",
-        source_bucket,
-        source_key,
-        bucket,
-        key,
-        data.len()
-    );
-
-    let copy_result = crate::api::xml::CopyObjectResult {
-        etag: result.metadata.etag(),
-        last_modified: result.metadata.created_at,
-    };
-    let xml = copy_result.to_xml();
-
-    Ok(xml_response(xml))
-}
-
-/// Decode the request body, handling AWS chunked transfer encoding if present.
-fn decode_body(headers: &HeaderMap, body: Bytes) -> Result<Bytes, S3Error> {
-    if !is_aws_chunked(headers) {
-        return Ok(body);
-    }
-
-    let expected_len = get_decoded_content_length(headers);
-    debug!(
-        "Decoding AWS chunked payload: {} bytes, expected decoded: {:?}",
-        body.len(),
-        expected_len
-    );
-    match decode_aws_chunked(&body, expected_len) {
-        Some(decoded) => {
-            debug!(
-                "Successfully decoded AWS chunked: {} -> {} bytes",
-                body.len(),
-                decoded.len()
-            );
-            Ok(decoded)
-        }
-        None => {
-            warn!(
-                "Failed to decode AWS chunked payload ({} bytes), rejecting request",
-                body.len()
-            );
-            Err(S3Error::InvalidArgument(
-                "Failed to decode AWS chunked transfer encoding".to_string(),
-            ))
-        }
-    }
-}
-
-/// Handle a multipart upload part (PUT with ?partNumber&uploadId).
-fn upload_part(
-    state: &Arc<AppState>,
-    bucket: &str,
-    key: &str,
-    headers: &HeaderMap,
-    part_num: u32,
-    upload_id: &str,
-    body: Bytes,
-) -> Result<Response, S3Error> {
-    info!(
-        "UploadPart {}/{} part={} uploadId={}",
-        bucket, key, part_num, upload_id
-    );
-
-    // Validate Content-MD5 header if present
-    if let Some(content_md5) = headers.get("content-md5").and_then(|v| v.to_str().ok()) {
-        use md5::Digest;
-        let computed = md5::Md5::digest(&body);
-        let expected = base64_decode(content_md5);
-        if let Some(expected) = expected {
-            if computed.as_slice() != expected.as_slice() {
-                return Err(S3Error::BadDigest);
-            }
-        }
-    }
-
-    let etag = state
-        .multipart
-        .upload_part(upload_id, bucket, key, part_num, body)?;
-    Ok((StatusCode::OK, [("ETag", etag)], "").into_response())
 }
 
 /// PUT object handler with copy detection and multipart upload support
@@ -250,6 +35,12 @@ pub async fn put_object_or_copy(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, S3Error> {
+    // PUT /{bucket}/{key}?acl — accept and ignore (ACL stub)
+    if query.acl.is_some() {
+        info!("PUT object ACL (stub): {}/{}", bucket, key);
+        return Ok(StatusCode::OK.into_response());
+    }
+
     let decoded_body = decode_body(&headers, body)?;
 
     // Multipart upload part
@@ -279,12 +70,22 @@ pub async fn put_object_or_copy(
 ///
 /// Direct files are streamed from the backend (constant memory, low TTFB).
 /// Delta files are reconstructed in memory and sent as a buffered response.
+/// Supports Range requests and conditional headers.
 #[instrument(skip(state))]
 pub async fn get_object(
     State(state): State<Arc<AppState>>,
     ValidatedPath { bucket, key }: ValidatedPath,
     Query(query): Query<ObjectQuery>,
+    req_headers: HeaderMap,
 ) -> Result<Response, S3Error> {
+    // GET /{bucket}/{key}?acl — return canned ACL response
+    if query.acl.is_some() {
+        info!("GET object ACL: {}/{}", bucket, key);
+        // Verify the object exists first; S3 returns 404 for ACL on non-existent objects
+        state.engine.load().head(&bucket, &key).await?;
+        return get_acl_response();
+    }
+
     // ListParts
     if let Some(upload_id) = &query.upload_id {
         info!("ListParts {}/{} uploadId={}", bucket, key, upload_id);
@@ -303,6 +104,12 @@ pub async fn get_object(
 
     info!("GET {}/{}", bucket, key);
 
+    // Parse Range header early (before retrieval) so we know if it's requested
+    let range_request = req_headers
+        .get("range")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_range_header);
+
     let response = state.engine.load().retrieve_stream(&bucket, &key).await?;
 
     match response {
@@ -315,7 +122,30 @@ pub async fn get_object(
                 key,
                 metadata.storage_info.label()
             );
-            let headers = build_object_headers(&metadata);
+
+            // Check conditional headers before streaming body
+            if let Some(err) = check_conditionals(&req_headers, &metadata) {
+                return Err(err);
+            }
+
+            // For streamed responses with Range requests, we need to buffer first
+            if let Some(ref range) = range_request {
+                use futures::TryStreamExt;
+                let chunks: Vec<Bytes> = stream
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+                    .try_collect()
+                    .await
+                    .map_err(|e| S3Error::InternalError(e.to_string()))?;
+                let total_len: usize = chunks.iter().map(|b| b.len()).sum();
+                let mut data = Vec::with_capacity(total_len);
+                for chunk in &chunks {
+                    data.extend_from_slice(chunk);
+                }
+                return build_range_response(data, &metadata, range, None, &query);
+            }
+
+            let mut headers = build_object_headers(&metadata);
+            apply_response_overrides(&mut headers, &query);
             let body = Body::from_stream(stream);
             Ok((StatusCode::OK, headers, body).into_response())
         }
@@ -331,17 +161,29 @@ pub async fn get_object(
                 data.len(),
                 metadata.storage_info.label()
             );
+
+            // Check conditional headers before returning body
+            if let Some(err) = check_conditionals(&req_headers, &metadata) {
+                return Err(err);
+            }
+
+            // Handle Range request
+            if let Some(ref range) = range_request {
+                return build_range_response(data, &metadata, range, cache_hit, &query);
+            }
+
             let mut headers = build_object_headers(&metadata);
             if let Some(hit) = cache_hit {
                 headers.insert(
                     "x-deltaglider-cache",
                     if hit {
-                        axum::http::HeaderValue::from_static("hit")
+                        HeaderValue::from_static("hit")
                     } else {
-                        axum::http::HeaderValue::from_static("miss")
+                        HeaderValue::from_static("miss")
                     },
                 );
             }
+            apply_response_overrides(&mut headers, &query);
             Ok((StatusCode::OK, headers, data).into_response())
         }
     }
@@ -349,14 +191,21 @@ pub async fn get_object(
 
 /// HEAD object handler
 /// HEAD /{bucket}/{key}
+/// Supports conditional headers (If-Match, If-None-Match, If-Modified-Since, If-Unmodified-Since).
 #[instrument(skip(state))]
 pub async fn head_object(
     State(state): State<Arc<AppState>>,
     ValidatedPath { bucket, key }: ValidatedPath,
+    req_headers: HeaderMap,
 ) -> Result<Response, S3Error> {
     info!("HEAD {}/{}", bucket, key);
 
     let metadata = state.engine.load().head(&bucket, &key).await?;
+
+    // Check conditional headers
+    if let Some(err) = check_conditionals(&req_headers, &metadata) {
+        return Err(err);
+    }
 
     let headers = build_object_headers(&metadata);
     Ok((StatusCode::OK, headers).into_response())

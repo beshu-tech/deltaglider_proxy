@@ -8,6 +8,12 @@ use std::fmt;
 /// Tool version identifier — uses crate name and version from Cargo.toml
 pub const DELTAGLIDER_TOOL: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
+/// Serde default for `bool` fields that should default to `true`.
+/// Used by `IamUser.enabled` and `CreateUserRequest.enabled`.
+pub fn default_true() -> bool {
+    true
+}
+
 /// S3 metadata key names (stored as `x-amz-meta-{KEY}` in S3 headers).
 /// Used in both storage/s3.rs (metadata_to_headers/headers_to_metadata)
 /// and api/handlers.rs (build_metadata_headers).
@@ -235,6 +241,17 @@ impl StorageInfo {
             StorageInfo::Passthrough => "passthrough",
         }
     }
+
+    /// Create a placeholder Delta with only the delta_size known (from listing).
+    /// Used when building metadata from LIST results without a HEAD call.
+    pub fn delta_stub(delta_size: u64) -> Self {
+        StorageInfo::Delta {
+            ref_key: String::new(),
+            ref_sha256: String::new(),
+            delta_size,
+            delta_cmd: String::new(),
+        }
+    }
 }
 
 impl FileMetadata {
@@ -352,6 +369,97 @@ impl FileMetadata {
             user_metadata: HashMap::new(),
             storage_info: StorageInfo::Passthrough,
         }
+    }
+
+    /// Build the full `x-amz-meta-*` map as it would appear in S3 response headers.
+    /// Used by the `metadata=true` MinIO ListObjectsV2 extension.
+    pub fn all_amz_metadata(&self) -> HashMap<String, String> {
+        use crate::types::meta_keys as mk;
+        let mut map = HashMap::new();
+
+        map.insert(
+            format!("{}{}", mk::AMZ_META_PREFIX, mk::TOOL),
+            self.tool.clone(),
+        );
+        map.insert(
+            format!("{}{}", mk::AMZ_META_PREFIX, mk::ORIGINAL_NAME),
+            self.original_name.clone(),
+        );
+        map.insert(
+            format!("{}{}", mk::AMZ_META_PREFIX, mk::FILE_SHA256),
+            self.file_sha256.clone(),
+        );
+        map.insert(
+            format!("{}{}", mk::AMZ_META_PREFIX, mk::FILE_SIZE),
+            self.file_size.to_string(),
+        );
+        map.insert(
+            format!("{}{}", mk::AMZ_META_PREFIX, mk::MD5),
+            self.md5.clone(),
+        );
+        map.insert(
+            format!("{}{}", mk::AMZ_META_PREFIX, mk::CREATED_AT),
+            self.created_at.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string(),
+        );
+
+        match &self.storage_info {
+            StorageInfo::Reference { source_name } => {
+                map.insert(
+                    format!("{}{}", mk::AMZ_META_PREFIX, mk::NOTE),
+                    "reference".to_string(),
+                );
+                map.insert(
+                    format!("{}{}", mk::AMZ_META_PREFIX, mk::SOURCE_NAME),
+                    source_name.clone(),
+                );
+            }
+            StorageInfo::Delta {
+                ref_key,
+                ref_sha256,
+                delta_size,
+                delta_cmd,
+            } => {
+                map.insert(
+                    format!("{}{}", mk::AMZ_META_PREFIX, mk::NOTE),
+                    "delta".to_string(),
+                );
+                map.insert(
+                    format!("{}{}", mk::AMZ_META_PREFIX, mk::REF_KEY),
+                    ref_key.clone(),
+                );
+                map.insert(
+                    format!("{}{}", mk::AMZ_META_PREFIX, mk::REF_SHA256),
+                    ref_sha256.clone(),
+                );
+                map.insert(
+                    format!("{}{}", mk::AMZ_META_PREFIX, mk::DELTA_SIZE),
+                    delta_size.to_string(),
+                );
+                map.insert(
+                    format!("{}{}", mk::AMZ_META_PREFIX, mk::DELTA_CMD),
+                    delta_cmd.clone(),
+                );
+            }
+            StorageInfo::Passthrough => {
+                map.insert(
+                    format!("{}{}", mk::AMZ_META_PREFIX, mk::NOTE),
+                    "passthrough".to_string(),
+                );
+            }
+        }
+
+        if let Some(ref ct) = self.content_type {
+            map.insert("content-type".to_string(), ct.clone());
+        }
+
+        for (key, value) in &self.user_metadata {
+            map.insert(
+                format!("{}user-{}", mk::AMZ_META_PREFIX, key),
+                value.clone(),
+            );
+        }
+
+        map
     }
 
     /// Get ETag value (quoted MD5)

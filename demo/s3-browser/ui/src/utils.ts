@@ -36,15 +36,7 @@ export function timeAgo(date: Date): string {
   return `${years}y ago`;
 }
 
-/** Detect the S3 endpoint from the current browser URL (UI port - 1, or 9000 for Vite dev) */
+/** Detect the S3 endpoint from the current browser URL (same origin in single-port mode) */
 export function detectDefaultEndpoint(): string {
-  if (typeof window !== 'undefined') {
-    const port = parseInt(window.location.port, 10);
-    if (port) {
-      // Vite dev server runs on 5173; proxy is on 9000
-      if (port === 5173) return `${window.location.protocol}//${window.location.hostname}:9000`;
-      return `${window.location.protocol}//${window.location.hostname}:${port - 1}`;
-    }
-  }
-  return 'http://localhost:9000';
+  return window.location.origin;
 }

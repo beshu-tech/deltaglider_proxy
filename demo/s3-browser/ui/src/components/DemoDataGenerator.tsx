@@ -61,14 +61,14 @@ export default function DemoDataGenerator({ onDone }: Props) {
         onClick={generate}
         disabled={generating}
         style={{
-          gap: 10,
-          padding: '8px 6px',
+          gap: 8,
+          padding: '6px 6px',
           color: TEXT_SECONDARY,
-          fontSize: 13,
+          fontSize: 11,
           width: '100%',
           transition: 'color 0.15s',
           fontFamily: "var(--font-ui)",
-          opacity: generating ? 0.6 : 1,
+          opacity: generating ? 0.6 : 0.7,
         }}
         onMouseEnter={(e) => { if (!generating) e.currentTarget.style.color = TEXT_PRIMARY; }}
         onMouseLeave={(e) => { e.currentTarget.style.color = TEXT_SECONDARY; }}

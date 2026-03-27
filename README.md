@@ -19,7 +19,7 @@ GET releases/v2.zip ──▶ DeltaGlider ──▶ reconstructed, streamed back
 
 ```bash
 # Docker (easiest)
-docker run -p 9000:9000 -p 9001:9001 beshultd/deltaglider_proxy
+docker run -p 9000:9000 beshultd/deltaglider_proxy
 
 # Or build from source
 cd demo/s3-browser/ui && npm ci && npm run build && cd -
@@ -37,7 +37,7 @@ aws s3 cp v2.zip s3://builds/releases/v2.zip   # stored as delta
 aws s3 cp s3://builds/releases/v2.zip ./v2.zip  # full file back, byte-identical
 ```
 
-A built-in browser UI with live metrics dashboard starts on port 9001 (S3 port + 1). No extra containers.
+A built-in browser UI with live metrics dashboard is available at `/_/` on the same port (e.g., `http://localhost:9000/_/`). No extra containers, no extra ports.
 
 ## How it works
 
@@ -75,9 +75,12 @@ DGP_MAX_DELTA_RATIO=0.5             # store delta if ratio < 50%
 DGP_MAX_OBJECT_SIZE=104857600       # 100MB cap (xdelta3 constraint)
 DGP_CACHE_MB=100                    # reference cache for reconstruction
 
-# Auth (optional — both required to enable SigV4)
+# Bootstrap S3 auth (used before IAM users are created)
 DGP_ACCESS_KEY_ID=mykey
 DGP_SECRET_ACCESS_KEY=mysecret
+
+# Bootstrap password (auto-generated on first run if not set)
+# DGP_BOOTSTRAP_PASSWORD_HASH=$2b$12$...
 
 # TLS (optional — omit cert/key for auto self-signed)
 DGP_TLS_ENABLED=true
@@ -98,29 +101,39 @@ Implements the S3 operations that matter for object storage workloads:
 | | Operations |
 |-|------------|
 | **Objects** | PutObject, GetObject, HeadObject, DeleteObject, CopyObject |
-| **Listing** | ListObjectsV2, DeleteObjects (batch) |
-| **Buckets** | CreateBucket, HeadBucket, DeleteBucket, ListBuckets |
+| **Listing** | ListObjectsV2 (with start-after, encoding-type, fetch-owner, base64 continuation tokens, max-keys cap at 1000), DeleteObjects (batch) |
+| **Buckets** | CreateBucket, HeadBucket, DeleteBucket, ListBuckets (with real creation dates) |
 | **Multipart** | Create, UploadPart, Complete, Abort, ListParts, ListUploads |
-| **Auth** | SigV4 header auth, presigned URLs |
+| **Auth** | SigV4 header auth, presigned URLs, per-user IAM (ABAC) |
+| **Conditional** | If-Match, If-None-Match (304), If-Modified-Since (304), If-Unmodified-Since (412) |
+| **Range** | Range requests (206 Partial Content), Accept-Ranges header |
+| **Validation** | Content-MD5 on PUT/UploadPart, bucket naming validation |
+| **Copy** | x-amz-metadata-directive (COPY/REPLACE) |
+| **Stubs** | GET/PUT ACL (accept and ignore for SDK compatibility) |
+| **Response** | Per-request x-amz-request-id (UUID), response-content-type/disposition/encoding/language/expires overrides |
 
-Not implemented: versioning, ACLs, lifecycle policies.
+Not implemented: versioning, lifecycle policies, object lock.
 
 ## Architecture
 
-~12K lines of Rust. Async throughout (Tokio + axum). No database — state is derived from storage metadata.
+~14K lines of Rust. Async throughout (Tokio + axum). Encrypted SQLCipher database for IAM users; all other state derived from storage metadata.
 
 ```
 S3 request
-  → SigV4 auth (optional)
+  → SigV4 auth (optional, bootstrap or per-user IAM)
   → FileRouter (delta-eligible vs passthrough)
   → DeltaGlider engine (compress / reconstruct / cache)
   → StorageBackend trait (filesystem or S3)
 ```
 
+Everything served on a single port: S3 API on `/`, admin UI and APIs under `/_/`.
+
 - **Transparent reconstruction**: Delta-compressed files are [reconstructed on the fly](docs/DELTA_RECONSTRUCTION.md) — clients receive the exact original bytes with correct `Content-Length` and `ETag`. Auth (SigV4/presigned URLs) is verified before reconstruction begins.
 - SHA-256 verified on every reconstructed GET. Corruption detected immediately.
 - LRU reference cache (moka) for fast reconstruction. Cache health exposed via startup warnings, periodic monitors, Prometheus gauges, and per-response `x-deltaglider-cache: hit|miss` header.
 - `x-amz-storage-type` response header exposes strategy (delta/passthrough/reference) for debugging.
+- **Lite LIST optimization**: No HEAD calls during LIST — sizes shown are stored (compressed) sizes, ~8x faster than per-object HEAD.
+- **FS delimiter optimization**: `list_objects_delegated()` for filesystem backend uses a single `read_dir` instead of recursive walk when a delimiter is specified.
 - Built-in Proxy Dashboard with live charts for cache, compression, HTTP traffic, and auth metrics.
 
 ## Requirements
@@ -131,10 +144,11 @@ S3 request
 
 ## Docker
 
-Multi-stage build. UI, Rust compilation, and slim Debian runtime. Multi-arch images published on release.
+Multi-stage build. UI, Rust compilation, and slim Debian runtime. Multi-arch images published on release. Only one port needed — S3 API and admin UI are served together.
 
 ```bash
 docker build -t deltaglider-proxy .
+docker run -p 9000:9000 deltaglider-proxy
 # or
 docker compose up -d  # includes MinIO for S3 backend
 ```

@@ -320,6 +320,18 @@ impl Default for Config {
     }
 }
 
+/// Parse an env var into a typed value, warning on invalid input.
+fn env_parse<T: std::str::FromStr>(var: &str) -> Option<T>
+where
+    T::Err: std::fmt::Display,
+{
+    std::env::var(var).ok().and_then(|raw| {
+        raw.parse()
+            .map_err(|e| eprintln!("Warning: ignoring invalid {var}=\"{raw}\": {e}"))
+            .ok()
+    })
+}
+
 impl Config {
     /// Load configuration from a TOML file
     pub fn from_file(path: &str) -> Result<Self, ConfigError> {
@@ -357,35 +369,21 @@ impl Config {
             };
         }
 
-        /// Parse an env var into a typed value, warning on invalid input.
-        fn parse_env<T: std::str::FromStr>(var: &str, field: &mut T)
-        where
-            T::Err: std::fmt::Display,
-        {
-            if let Ok(raw) = std::env::var(var) {
-                match raw.parse() {
-                    Ok(parsed) => *field = parsed,
-                    Err(e) => eprintln!("Warning: ignoring invalid {var}=\"{raw}\": {e}"),
-                }
-            }
+        if let Some(v) = env_parse::<f32>("DGP_MAX_DELTA_RATIO") {
+            config.max_delta_ratio = v;
         }
-        fn parse_env_opt<T: std::str::FromStr>(var: &str, field: &mut Option<T>)
-        where
-            T::Err: std::fmt::Display,
-        {
-            if let Ok(raw) = std::env::var(var) {
-                match raw.parse() {
-                    Ok(parsed) => *field = Some(parsed),
-                    Err(e) => eprintln!("Warning: ignoring invalid {var}=\"{raw}\": {e}"),
-                }
-            }
+        if let Some(v) = env_parse::<u64>("DGP_MAX_OBJECT_SIZE") {
+            config.max_object_size = v;
         }
-
-        parse_env("DGP_MAX_DELTA_RATIO", &mut config.max_delta_ratio);
-        parse_env("DGP_MAX_OBJECT_SIZE", &mut config.max_object_size);
-        parse_env("DGP_CACHE_MB", &mut config.cache_size_mb);
-        parse_env_opt("DGP_CODEC_CONCURRENCY", &mut config.codec_concurrency);
-        parse_env_opt("DGP_BLOCKING_THREADS", &mut config.blocking_threads);
+        if let Some(v) = env_parse::<usize>("DGP_CACHE_MB") {
+            config.cache_size_mb = v;
+        }
+        if let Some(v) = env_parse::<usize>("DGP_CODEC_CONCURRENCY") {
+            config.codec_concurrency = Some(v);
+        }
+        if let Some(v) = env_parse::<usize>("DGP_BLOCKING_THREADS") {
+            config.blocking_threads = Some(v);
+        }
 
         // Proxy authentication credentials
         config.access_key_id = std::env::var("DGP_ACCESS_KEY_ID").ok();

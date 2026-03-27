@@ -36,7 +36,7 @@ const ADMIN_API: Endpoint[] = [
   { method: 'PUT', path: '/api/admin/config', summary: 'Update proxy configuration', auth: 'admin',
     body: '{"max_delta_ratio": 0.5}',
     response: '{"success": true, "warnings": [], "requires_restart": false}' },
-  { method: 'PUT', path: '/api/admin/password', summary: 'Change admin password', auth: 'admin',
+  { method: 'PUT', path: '/api/admin/password', summary: 'Change bootstrap password', auth: 'admin',
     body: '{"current_password": "old", "new_password": "new"}' },
   { method: 'POST', path: '/api/admin/test-s3', summary: 'Test S3 backend connectivity', auth: 'admin',
     body: '{"endpoint": "https://s3.amazonaws.com", "region": "us-east-1"}',

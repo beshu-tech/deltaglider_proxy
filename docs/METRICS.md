@@ -1,15 +1,15 @@
 # Prometheus Metrics
 
-DeltaGlider Proxy exposes a `/metrics` endpoint in Prometheus text format on the admin port (S3 port + 1, default `9001`). Metrics are collected via lightweight atomics on the hot path -- no locks, no sampling, no performance impact.
+DeltaGlider Proxy exposes a `/metrics` endpoint in Prometheus text format on the same port as the S3 API (default `9000`). Also available at `/_/metrics`. Metrics are collected via lightweight atomics on the hot path -- no locks, no sampling, no performance impact.
 
 ## Quick start
 
 ```bash
 # Verify metrics are working
-curl -s http://localhost:9001/metrics | head -20
+curl -s http://localhost:9000/metrics | head -20
 
 # Validate format (if you have promtool)
-curl -s http://localhost:9001/metrics | promtool check metrics
+curl -s http://localhost:9000/metrics | promtool check metrics
 ```
 
 ## Scrape configuration
@@ -23,7 +23,7 @@ scrape_configs:
   - job_name: deltaglider
     scrape_interval: 15s
     static_configs:
-      - targets: ["localhost:9001"]
+      - targets: ["localhost:9000"]
 ```
 
 For multiple instances behind a load balancer, use service discovery or list each target:
@@ -34,9 +34,9 @@ scrape_configs:
     scrape_interval: 15s
     static_configs:
       - targets:
-          - "dgp-1:9001"
-          - "dgp-2:9001"
-          - "dgp-3:9001"
+          - "dgp-1:9000"
+          - "dgp-2:9000"
+          - "dgp-3:9000"
 ```
 
 ### Docker Compose (Prometheus + Grafana)
