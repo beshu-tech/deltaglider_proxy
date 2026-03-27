@@ -497,7 +497,7 @@ pub(super) fn parse_range_header(range_str: &str) -> Option<ByteRange> {
 
 /// Resolve a ByteRange to concrete (start, end) inclusive offsets given a total file size.
 /// Returns None if the range is not satisfiable.
-fn resolve_range(range: &ByteRange, total: u64) -> Option<(u64, u64)> {
+pub(super) fn resolve_range(range: &ByteRange, total: u64) -> Option<(u64, u64)> {
     if total == 0 {
         return None;
     }

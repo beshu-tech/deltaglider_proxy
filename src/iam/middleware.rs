@@ -142,20 +142,16 @@ pub async fn authorization_middleware(
     }
 
     // ListObjects (GET /bucket) with prefix-scoped permissions:
-    // Allow listing if the user has ANY permission on the bucket.
-    // When conditions are present, respect the iam-rs evaluation fully.
+    // Allow listing if the user has ANY permission on the bucket,
+    // BUT respect explicit Deny rules (including those with conditions).
     let allowed = if action == S3Action::List && key.is_empty() {
         if user.can_with_context(action, bucket, key, &context) {
             true
         } else if user.is_explicitly_denied(action, bucket, key, &context) {
-            false
-        } else if user.has_any_conditions() {
-            // User has condition-based policies — don't fall back to can_see_bucket,
-            // as that would bypass prefix/IP conditions.
+            // An explicit Deny matched (possibly via condition) — blocked
             false
         } else {
-            // No conditions, no explicit deny — fall back to bucket visibility
-            // (allows prefix-scoped Allow without conditions to enable bucket listing)
+            // No explicit deny — fall back to bucket visibility
             user.can_see_bucket(bucket)
         }
     } else {

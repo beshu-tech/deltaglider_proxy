@@ -727,6 +727,39 @@ impl StorageBackend for FilesystemBackend {
         Ok(Box::pin(stream))
     }
 
+    #[instrument(skip(self))]
+    async fn get_passthrough_stream_range(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), StorageError> {
+        use futures::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+        let data_path = self.passthrough_path(bucket, prefix, filename);
+        if !path_exists(&data_path).await {
+            return Err(StorageError::NotFound(format!(
+                "passthrough: {}/{}",
+                prefix, filename
+            )));
+        }
+
+        let mut file = tokio::fs::File::open(&data_path).await?;
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+        let range_len = end - start + 1;
+        let limited = file.take(range_len);
+        let reader_stream = ReaderStream::new(limited);
+        let stream = reader_stream.map(|result| result.map_err(StorageError::Io));
+        debug!(
+            "Opened passthrough range stream for {}/{}/{} (bytes {}-{})",
+            bucket, prefix, filename, start, end
+        );
+        Ok((Box::pin(stream), range_len))
+    }
+
     // === Scanning operations ===
 
     #[instrument(skip(self))]

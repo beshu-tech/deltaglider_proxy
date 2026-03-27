@@ -193,6 +193,26 @@ pub trait StorageBackend: Send + Sync {
         Ok(Box::pin(stream::once(async { Ok(Bytes::from(data)) })))
     }
 
+    /// Stream a byte range of a passthrough file without buffering the entire object.
+    /// Default falls back to the full stream (caller will handle slicing).
+    /// Backends that support native range reads (S3, filesystem) override this.
+    /// Returns `(stream, content_length)` where `content_length` is the number of
+    /// bytes in the range (0 signals "full stream, not a range").
+    async fn get_passthrough_stream_range(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        _start: u64,
+        _end: u64, // inclusive
+    ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), StorageError> {
+        // Default: fall back to full stream (caller will handle slicing)
+        let stream = self
+            .get_passthrough_stream(bucket, prefix, filename)
+            .await?;
+        Ok((stream, 0)) // 0 signals "full stream, not range"
+    }
+
     /// Store a passthrough file from pre-split chunks without assembling into a contiguous buffer.
     /// Default implementation collects chunks and delegates to `put_passthrough()`.
     async fn put_passthrough_chunked(
@@ -449,6 +469,19 @@ macro_rules! impl_storage_backend_for_box {
             ) -> Result<BoxStream<'static, Result<Bytes, StorageError>>, StorageError> {
                 (**self)
                     .get_passthrough_stream(bucket, prefix, filename)
+                    .await
+            }
+
+            async fn get_passthrough_stream_range(
+                &self,
+                bucket: &str,
+                prefix: &str,
+                filename: &str,
+                start: u64,
+                end: u64,
+            ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), StorageError> {
+                (**self)
+                    .get_passthrough_stream_range(bucket, prefix, filename, start, end)
                     .await
             }
 
