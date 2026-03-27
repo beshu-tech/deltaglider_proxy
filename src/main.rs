@@ -646,7 +646,14 @@ async fn init_config_sync(
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let db_file = db_path.join("deltaglider_config.db");
 
-    let sync = match ConfigDbSync::new(&config.backend, sync_bucket.clone(), db_file).await {
+    let sync = match ConfigDbSync::new(
+        &config.backend,
+        sync_bucket.clone(),
+        db_file,
+        admin_password_hash.to_string(),
+    )
+    .await
+    {
         Ok(s) => Arc::new(s),
         Err(e) => {
             warn!("Config DB S3 sync: failed to initialize: {}", e);

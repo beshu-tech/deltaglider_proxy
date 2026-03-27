@@ -18,6 +18,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 use crate::config::BackendConfig;
+use crate::config_db::ConfigDb;
 
 /// S3 key for the config database file.
 const S3_CONFIG_KEY: &str = ".deltaglider/config.db";
@@ -28,6 +29,8 @@ pub struct ConfigDbSync {
     bucket: String,
     local_path: PathBuf,
     last_etag: Arc<RwLock<Option<String>>>,
+    /// The local bootstrap password hash, used to validate downloaded DBs.
+    bootstrap_password_hash: String,
 }
 
 impl ConfigDbSync {
@@ -39,13 +42,22 @@ impl ConfigDbSync {
         backend_config: &BackendConfig,
         sync_bucket: String,
         local_path: PathBuf,
+        bootstrap_password_hash: String,
     ) -> Result<Self, String> {
         let client = Self::build_client(backend_config).await?;
+
+        // Clean up orphaned .db.tmp files from previous interrupted downloads
+        let tmp_path = local_path.with_extension("db.tmp");
+        if tmp_path.exists() {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+
         Ok(Self {
             s3_client: client,
             bucket: sync_bucket,
             local_path,
             last_etag: Arc::new(RwLock::new(None)),
+            bootstrap_password_hash,
         })
     }
 
@@ -163,11 +175,30 @@ impl ConfigDbSync {
             return Err("Downloaded config DB from S3 is empty".to_string());
         }
 
-        // Write to a temp file first, then rename for atomicity
+        // Write to a temp file first, then validate before replacing
         let tmp_path = self.local_path.with_extension("db.tmp");
         tokio::fs::write(&tmp_path, &data)
             .await
             .map_err(|e| format!("Failed to write temp config DB: {}", e))?;
+
+        // Validate we can open the downloaded DB with our local bootstrap password.
+        // If the remote DB was encrypted with a different password, we must NOT replace
+        // our local copy — it would be unreadable and break IAM.
+        match ConfigDb::open_or_create(&tmp_path, &self.bootstrap_password_hash) {
+            Ok(_) => {
+                debug!("Downloaded config DB passed passphrase validation");
+            }
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                tracing::warn!(
+                    "Config DB downloaded from S3 is encrypted with a different bootstrap password — \
+                     NOT replacing local copy: {}",
+                    e
+                );
+                return Ok(false);
+            }
+        }
+
         tokio::fs::rename(&tmp_path, &self.local_path)
             .await
             .map_err(|e| format!("Failed to rename temp config DB: {}", e))?;
