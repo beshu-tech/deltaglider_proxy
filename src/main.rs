@@ -165,8 +165,166 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing with reload support
-    // Priority: RUST_LOG > DGP_LOG_LEVEL > --verbose > default
+    // --- Logging ---
+    let log_reload_handle = init_tracing(&cli);
+
+    // --- Configuration ---
+    let mut config = if let Some(ref path) = cli.config {
+        Config::from_file(path)?
+    } else {
+        Config::load()
+    };
+    if let Some(ref addr) = cli.listen {
+        config.listen_addr = addr.parse()?;
+    }
+    log_startup_banner(&config);
+
+    // --- Metrics ---
+    let metrics = init_metrics(&config);
+
+    // --- Engine ---
+    let engine = DynEngine::new(&config, Some(metrics.clone())).await?;
+    if engine.is_cli_available() {
+        info!("  xdelta3 CLI: available (legacy delta interop enabled)");
+    } else {
+        return Err("xdelta3 CLI not found. Install xdelta3 before starting the proxy.".into());
+    }
+    metrics
+        .cache_max_bytes
+        .set(engine.cache_max_capacity() as f64);
+
+    // --- Multipart uploads ---
+    let multipart = Arc::new(MultipartStore::new(config.max_object_size));
+    spawn_periodic(Duration::from_secs(300), {
+        let mp = multipart.clone();
+        move || mp.cleanup_expired(Duration::from_secs(3600))
+    });
+
+    // --- Rate limiter & replay cache ---
+    let rate_limiter = RateLimiter::default_auth();
+    spawn_periodic(Duration::from_secs(300), {
+        let rl = rate_limiter.clone();
+        move || rl.cleanup_expired()
+    });
+    let replay_cache = init_replay_cache();
+
+    // --- Debug headers ---
+    let debug_headers = std::env::var("DGP_DEBUG_HEADERS")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    if debug_headers {
+        info!("  Debug headers: enabled (DGP_DEBUG_HEADERS=true)");
+    }
+
+    // --- App state ---
+    let state = Arc::new(AppState {
+        engine: ArcSwap::from_pointee(engine),
+        multipart,
+        metrics: metrics.clone(),
+        debug_headers,
+    });
+
+    // --- Background monitors ---
+    spawn_cache_monitor(&state, &metrics);
+
+    // --- IAM ---
+    let iam_state = init_iam_state(&config);
+
+    // --- S3 router ---
+    let app = build_s3_router(
+        &state,
+        &iam_state,
+        &metrics,
+        &rate_limiter,
+        &replay_cache,
+        &config,
+    );
+
+    // --- Admin / sessions / config DB ---
+    let admin_password_hash = config.ensure_bootstrap_password_hash();
+    let session_store = Arc::new(SessionStore::new());
+    spawn_periodic(Duration::from_secs(300), {
+        let sessions = session_store.clone();
+        move || sessions.cleanup_expired()
+    });
+    let shared_config = config.clone().into_shared();
+    let config_db = init_config_db(&admin_password_hash, &iam_state);
+
+    let admin_state = Arc::new(AdminState {
+        password_hash: parking_lot::RwLock::new(admin_password_hash),
+        sessions: session_store,
+        config: shared_config,
+        log_reload: log_reload_handle,
+        s3_state: state.clone(),
+        iam_state,
+        config_db,
+        usage_scanner: Arc::new(UsageScanner::new()),
+        rate_limiter,
+    });
+
+    // --- TLS ---
+    let rustls_config = init_tls(&config).await?;
+
+    // --- Merge UI + security headers ---
+    let app = demo::ui_router(admin_state).merge(app);
+    info!("  Dashboard: http://{}/_/", config.listen_addr);
+
+    let tls_enabled = config.tls_enabled();
+    let app = app.layer(middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| async move {
+            let mut response = next.run(request).await;
+            let headers = response.headers_mut();
+            headers.insert("x-content-type-options", "nosniff".parse().unwrap());
+            headers.insert("x-frame-options", "DENY".parse().unwrap());
+            if tls_enabled {
+                headers.insert(
+                    "strict-transport-security",
+                    "max-age=31536000; includeSubDomains".parse().unwrap(),
+                );
+            }
+            response
+        },
+    ));
+
+    // --- Start server ---
+    if let Some(rustls_config) = rustls_config {
+        let handle = axum_server::Handle::new();
+        let shutdown_handle = handle.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            shutdown_handle.graceful_shutdown(Some(Duration::from_secs(10)));
+        });
+
+        info!(
+            "DeltaGlider Proxy listening on https://{}",
+            config.listen_addr
+        );
+        axum_server::bind_rustls(config.listen_addr, rustls_config)
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await?;
+    } else {
+        let listener = TcpListener::bind(&config.listen_addr).await?;
+        info!(
+            "DeltaGlider Proxy listening on http://{}",
+            config.listen_addr
+        );
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+    }
+
+    info!("Server shutdown complete");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Extracted helpers
+// ---------------------------------------------------------------------------
+
+/// Initialize tracing with reload support.
+/// Priority: RUST_LOG > DGP_LOG_LEVEL > --verbose > default.
+fn init_tracing(cli: &Cli) -> reload::Handle<EnvFilter, tracing_subscriber::Registry> {
     let initial_filter = EnvFilter::try_from_default_env()
         .or_else(|_| std::env::var("DGP_LOG_LEVEL").map(EnvFilter::new))
         .unwrap_or_else(|_| {
@@ -177,23 +335,17 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         });
 
-    let (filter_layer, log_reload_handle) = reload::Layer::new(initial_filter);
+    let (filter_layer, reload_handle) = reload::Layer::new(initial_filter);
     tracing_subscriber::registry()
         .with(filter_layer)
         .with(tracing_subscriber::fmt::layer().with_ansi(std::io::stdout().is_terminal()))
         .init();
 
-    // Load configuration from file if specified, otherwise use default loading
-    let mut config = if let Some(ref path) = cli.config {
-        Config::from_file(path)?
-    } else {
-        Config::load()
-    };
+    reload_handle
+}
 
-    // CLI overrides
-    if let Some(ref addr) = cli.listen {
-        config.listen_addr = addr.parse()?;
-    }
+/// Log the startup banner with config summary.
+fn log_startup_banner(config: &Config) {
     info!(
         "Starting DeltaGlider Proxy v{} (built {})",
         env!("CARGO_PKG_VERSION"),
@@ -225,7 +377,10 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     if config.metadata_cache_mb == 0 {
         warn!("[cache] In-memory metadata cache is DISABLED (0 MB). Every HEAD/LIST will query storage.");
     } else {
-        info!("[cache] In-memory metadata cache: {} MB (object metadata for HEAD/LIST acceleration)", config.metadata_cache_mb);
+        info!(
+            "[cache] In-memory metadata cache: {} MB (object metadata for HEAD/LIST acceleration)",
+            config.metadata_cache_mb
+        );
     }
     if config.cache_size_mb == 0 {
         warn!("[cache] In-memory reference cache is DISABLED (0 MB). Every delta GET will read the full reference from storage.");
@@ -235,7 +390,10 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             config.cache_size_mb
         );
     } else {
-        info!("[cache] In-memory reference cache: {} MB (delta reconstruction baselines)", config.cache_size_mb);
+        info!(
+            "[cache] In-memory reference cache: {} MB (delta reconstruction baselines)",
+            config.cache_size_mb
+        );
     }
 
     if config.auth_enabled() {
@@ -246,8 +404,10 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         warn!("  Authentication: DISABLED (open access) — set DGP_ACCESS_KEY_ID and DGP_SECRET_ACCESS_KEY to enable");
     }
+}
 
-    // Create Prometheus metrics
+/// Create Prometheus metrics and set initial gauges.
+fn init_metrics(config: &Config) -> Arc<Metrics> {
     let metrics = Arc::new(Metrics::new());
     metrics.process_start_time_seconds.set(
         std::time::SystemTime::now()
@@ -263,41 +423,12 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .build_info
         .with_label_values(&[env!("CARGO_PKG_VERSION"), backend_type])
         .set(1.0);
-
-    // Create engine (async initialization with dynamic backend)
-    let engine = DynEngine::new(&config, Some(metrics.clone())).await?;
-    if engine.is_cli_available() {
-        info!("  xdelta3 CLI: available (legacy delta interop enabled)");
-    } else {
-        return Err("xdelta3 CLI not found. Install xdelta3 before starting the proxy.".into());
-    }
-
-    // Set constant cache_max_bytes gauge once at startup
     metrics
-        .cache_max_bytes
-        .set(engine.cache_max_capacity() as f64);
+}
 
-    let multipart = Arc::new(MultipartStore::new(config.max_object_size));
-
-    // Spawn periodic cleanup task for expired multipart uploads
-    spawn_periodic(Duration::from_secs(300), {
-        let mp = multipart.clone();
-        move || mp.cleanup_expired(Duration::from_secs(3600))
-    });
-
-    // Create shared rate limiter for auth endpoints (5 attempts / 15 min, 30 min lockout)
-    let rate_limiter = RateLimiter::default_auth();
-
-    // Spawn periodic cleanup for expired rate limiter entries (every 5 minutes)
-    spawn_periodic(Duration::from_secs(300), {
-        let rl = rate_limiter.clone();
-        move || rl.cleanup_expired()
-    });
-
-    // Replay attack detection cache: tracks recently seen SigV4 signatures
+/// Create the replay-attack detection cache and spawn its periodic cleanup.
+fn init_replay_cache() -> deltaglider_proxy::api::auth::ReplayCache {
     let replay_cache: deltaglider_proxy::api::auth::ReplayCache = Arc::new(dashmap::DashMap::new());
-
-    // Spawn periodic cleanup for replay cache entries (every 60 seconds)
     spawn_periodic(Duration::from_secs(60), {
         let cache = replay_cache.clone();
         move || {
@@ -305,72 +436,59 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             cache.retain(|_, instant: &mut std::time::Instant| *instant > cutoff);
         }
     });
+    replay_cache
+}
 
-    let debug_headers = std::env::var("DGP_DEBUG_HEADERS")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
-    if debug_headers {
-        info!("  Debug headers: enabled (DGP_DEBUG_HEADERS=true)");
-    }
+/// Spawn periodic cache health monitor (utilization + miss rate, every 60s).
+fn spawn_cache_monitor(state: &Arc<AppState>, metrics: &Arc<Metrics>) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let cache_max_bytes = state.engine.load().cache_max_capacity();
+    let monitor_state = state.clone();
+    let prev_hits = Arc::new(AtomicU64::new(metrics.cache_hits_total.get()));
+    let prev_misses = Arc::new(AtomicU64::new(metrics.cache_misses_total.get()));
+    let monitor_metrics = metrics.clone();
 
-    let state = Arc::new(AppState {
-        engine: ArcSwap::from_pointee(engine),
-        multipart,
-        metrics: metrics.clone(),
-        debug_headers,
+    spawn_periodic(Duration::from_secs(60), move || {
+        let engine = monitor_state.engine.load();
+
+        // Check utilization
+        let used = engine.cache_weighted_size();
+        if cache_max_bytes > 0 {
+            let pct = (used as f64 / cache_max_bytes as f64) * 100.0;
+            let entries = engine.cache_entry_count();
+            let used_mb = used / (1024 * 1024);
+            let max_mb = cache_max_bytes / (1024 * 1024);
+            if pct > 90.0 {
+                tracing::warn!(
+                    "[cache] In-memory reference cache utilization {:.0}% ({}/{} MB, {} entries) — consider increasing cache_size_mb",
+                    pct, used_mb, max_mb, entries
+                );
+            }
+        }
+
+        // Check miss rate over interval
+        let cur_hits = monitor_metrics.cache_hits_total.get();
+        let cur_misses = monitor_metrics.cache_misses_total.get();
+        let prev_h = prev_hits.swap(cur_hits, Ordering::Relaxed);
+        let prev_m = prev_misses.swap(cur_misses, Ordering::Relaxed);
+        let interval_hits = cur_hits.saturating_sub(prev_h);
+        let interval_misses = cur_misses.saturating_sub(prev_m);
+        let interval_total = interval_hits + interval_misses;
+        if interval_total >= 10 {
+            let miss_pct = (interval_misses as f64 / interval_total as f64) * 100.0;
+            if miss_pct > 50.0 {
+                tracing::warn!(
+                    "[cache] In-memory reference cache miss rate {:.0}% ({}/{} in last 60s) — active deltaspaces may exceed cache capacity",
+                    miss_pct, interval_misses, interval_total
+                );
+            }
+        }
     });
+}
 
-    // Spawn periodic cache health monitor (every 60s)
-    {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        let cache_max_bytes = state.engine.load().cache_max_capacity();
-        let monitor_state = state.clone();
-        let prev_hits = Arc::new(AtomicU64::new(metrics.cache_hits_total.get()));
-        let prev_misses = Arc::new(AtomicU64::new(metrics.cache_misses_total.get()));
-        let monitor_metrics = metrics.clone();
-
-        spawn_periodic(Duration::from_secs(60), move || {
-            let engine = monitor_state.engine.load();
-
-            // Check utilization
-            let used = engine.cache_weighted_size();
-            if cache_max_bytes > 0 {
-                let pct = (used as f64 / cache_max_bytes as f64) * 100.0;
-                let entries = engine.cache_entry_count();
-                let used_mb = used / (1024 * 1024);
-                let max_mb = cache_max_bytes / (1024 * 1024);
-                if pct > 90.0 {
-                    tracing::warn!(
-                        "[cache] In-memory reference cache utilization {:.0}% ({}/{} MB, {} entries) — consider increasing cache_size_mb",
-                        pct, used_mb, max_mb, entries
-                    );
-                }
-            }
-
-            // Check miss rate over interval
-            let cur_hits = monitor_metrics.cache_hits_total.get();
-            let cur_misses = monitor_metrics.cache_misses_total.get();
-            let prev_h = prev_hits.swap(cur_hits, Ordering::Relaxed);
-            let prev_m = prev_misses.swap(cur_misses, Ordering::Relaxed);
-            let interval_hits = cur_hits.saturating_sub(prev_h);
-            let interval_misses = cur_misses.saturating_sub(prev_m);
-            let interval_total = interval_hits + interval_misses;
-            if interval_total >= 10 {
-                let miss_pct = (interval_misses as f64 / interval_total as f64) * 100.0;
-                if miss_pct > 50.0 {
-                    tracing::warn!(
-                        "[cache] In-memory reference cache miss rate {:.0}% ({}/{} in last 60s) — active deltaspaces may exceed cache capacity",
-                        miss_pct, interval_misses, interval_total
-                    );
-                }
-            }
-        });
-    }
-
-    // Build IAM state as a hot-swappable ArcSwap so the admin API can
-    // update credentials/users without a restart.
-    // Supports legacy single-credential mode and multi-user IAM.
-    let iam_state: SharedIamState = Arc::new(arc_swap::ArcSwap::from_pointee(
+/// Build IAM state from config (legacy single-credential or disabled).
+fn init_iam_state(config: &Config) -> SharedIamState {
+    Arc::new(arc_swap::ArcSwap::from_pointee(
         if let (Some(ref key_id), Some(ref secret)) =
             (&config.access_key_id, &config.secret_access_key)
         {
@@ -381,9 +499,18 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         } else {
             IamState::Disabled
         },
-    ));
+    ))
+}
 
-    // Build router with S3-style paths
+/// Build the S3-compatible router with all routes and middleware layers.
+fn build_s3_router(
+    state: &Arc<AppState>,
+    iam_state: &SharedIamState,
+    metrics: &Arc<Metrics>,
+    rate_limiter: &RateLimiter,
+    replay_cache: &deltaglider_proxy::api::auth::ReplayCache,
+    config: &Config,
+) -> Router {
     // S3 API paths:
     //   GET / - list buckets
     //   PUT /{bucket} - create bucket
@@ -395,7 +522,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     //   GET /{bucket}/{key...} - download object
     //   HEAD /{bucket}/{key...} - get object metadata
     //   DELETE /{bucket}/{key...} - delete object
-    let app = Router::new()
+    Router::new()
         // Health check and stats endpoints
         .route("/health", get(health_check))
         .route("/stats", get(get_stats))
@@ -440,7 +567,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .layer(middleware::from_fn(sigv4_auth_middleware))
         .layer(axum::Extension(iam_state.clone()))
         // Replay attack detection cache for SigV4
-        .layer(axum::Extension(replay_cache))
+        .layer(axum::Extension(replay_cache.clone()))
         // Rate limiter extension for auth middleware
         .layer(axum::Extension(rate_limiter.clone()))
         // Metrics extension for auth middleware to extract
@@ -449,69 +576,48 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .layer(DefaultBodyLimit::max(config.max_object_size as usize))
         // CORS must be outermost to handle OPTIONS preflight before auth
         .layer(CorsLayer::permissive())
-        .with_state(state.clone());
+        .with_state(state.clone())
+}
 
-    // Bootstrap password: ensure hash is available, create session store
-    let admin_password_hash = config.ensure_bootstrap_password_hash();
-    let session_store = Arc::new(SessionStore::new());
-
-    // Spawn periodic cleanup for expired admin sessions (every 5 minutes)
-    spawn_periodic(Duration::from_secs(300), {
-        let sessions = session_store.clone();
-        move || sessions.cleanup_expired()
-    });
-
-    let shared_config = config.clone().into_shared();
-
-    // Initialize IAM config database (encrypted SQLCipher, next to config file).
-    // Uses the bootstrap password hash as the encryption key. DB starts empty —
-    // IAM mode activates when the first user is created via the admin GUI.
-    let config_db = {
-        let db_path = std::env::var("DGP_CONFIG")
-            .ok()
-            .and_then(|p| std::path::Path::new(&p).parent().map(|d| d.to_path_buf()))
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-        let db_file = db_path.join("deltaglider_config.db");
-        match deltaglider_proxy::config_db::ConfigDb::open_or_create(&db_file, &admin_password_hash)
-        {
-            Ok(db) => {
-                // If DB has existing users, switch to IAM mode
-                if let Ok(users) = db.load_users() {
-                    if !users.is_empty() {
-                        info!(
-                            "Loaded {} IAM users from {}",
-                            users.len(),
-                            db_file.display()
-                        );
-                        let index = deltaglider_proxy::iam::IamIndex::from_users(users);
-                        iam_state.store(Arc::new(IamState::Iam(index)));
-                    }
+/// Initialize the encrypted IAM config database. If it contains existing users,
+/// switch to IAM mode immediately.
+fn init_config_db(
+    admin_password_hash: &str,
+    iam_state: &SharedIamState,
+) -> Option<tokio::sync::Mutex<deltaglider_proxy::config_db::ConfigDb>> {
+    let db_path = std::env::var("DGP_CONFIG")
+        .ok()
+        .and_then(|p| std::path::Path::new(&p).parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let db_file = db_path.join("deltaglider_config.db");
+    match deltaglider_proxy::config_db::ConfigDb::open_or_create(&db_file, admin_password_hash) {
+        Ok(db) => {
+            // If DB has existing users, switch to IAM mode
+            if let Ok(users) = db.load_users() {
+                if !users.is_empty() {
+                    info!(
+                        "Loaded {} IAM users from {}",
+                        users.len(),
+                        db_file.display()
+                    );
+                    let index = deltaglider_proxy::iam::IamIndex::from_users(users);
+                    iam_state.store(Arc::new(IamState::Iam(index)));
                 }
-                Some(tokio::sync::Mutex::new(db))
             }
-            Err(e) => {
-                warn!("Could not open IAM config database: {} — IAM disabled", e);
-                None
-            }
+            Some(tokio::sync::Mutex::new(db))
         }
-    };
+        Err(e) => {
+            warn!("Could not open IAM config database: {} — IAM disabled", e);
+            None
+        }
+    }
+}
 
-    let usage_scanner = Arc::new(UsageScanner::new());
-
-    let admin_state = Arc::new(AdminState {
-        password_hash: parking_lot::RwLock::new(admin_password_hash),
-        sessions: session_store,
-        config: shared_config,
-        log_reload: log_reload_handle,
-        s3_state: state.clone(),
-        iam_state,
-        config_db,
-        usage_scanner,
-        rate_limiter,
-    });
-
-    // Build TLS config if enabled
-    let rustls_config = if config.tls_enabled() {
+/// Build TLS config if enabled in config.
+async fn init_tls(
+    config: &Config,
+) -> Result<Option<axum_server::tls_rustls::RustlsConfig>, Box<dyn std::error::Error>> {
+    if config.tls_enabled() {
         let tls_cfg = config.tls.as_ref().unwrap();
         let rc = deltaglider_proxy::tls::build_rustls_config(tls_cfg).await?;
         if tls_cfg.cert_path.is_some() {
@@ -519,65 +625,15 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         } else {
             warn!("  TLS: enabled (auto-generated self-signed certificate)");
         }
-        Some(rc)
+        Ok(Some(rc))
     } else {
-        None
-    };
-
-    // Merge embedded UI + admin API into the main app under /_/
-    // UI routes are OUTSIDE the S3 auth middleware (they use session cookies instead)
-    let app = demo::ui_router(admin_state).merge(app);
-    info!("  Dashboard: http://{}/_/", config.listen_addr);
-
-    // Security response headers middleware (outermost layer — applied to ALL responses)
-    let tls_enabled = config.tls_enabled();
-    let app = app.layer(middleware::from_fn(
-        move |request: axum::extract::Request, next: axum::middleware::Next| async move {
-            let mut response = next.run(request).await;
-            let headers = response.headers_mut();
-            headers.insert("x-content-type-options", "nosniff".parse().unwrap());
-            headers.insert("x-frame-options", "DENY".parse().unwrap());
-            if tls_enabled {
-                headers.insert(
-                    "strict-transport-security",
-                    "max-age=31536000; includeSubDomains".parse().unwrap(),
-                );
-            }
-            response
-        },
-    ));
-
-    // Start S3 server with graceful shutdown
-    if let Some(rustls_config) = rustls_config {
-        let handle = axum_server::Handle::new();
-        let shutdown_handle = handle.clone();
-        tokio::spawn(async move {
-            shutdown_signal().await;
-            shutdown_handle.graceful_shutdown(Some(Duration::from_secs(10)));
-        });
-
-        info!(
-            "DeltaGlider Proxy listening on https://{}",
-            config.listen_addr
-        );
-        axum_server::bind_rustls(config.listen_addr, rustls_config)
-            .handle(handle)
-            .serve(app.into_make_service())
-            .await?;
-    } else {
-        let listener = TcpListener::bind(&config.listen_addr).await?;
-        info!(
-            "DeltaGlider Proxy listening on http://{}",
-            config.listen_addr
-        );
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
-            .await?;
+        Ok(None)
     }
-
-    info!("Server shutdown complete");
-    Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
 
 /// Spawn a background task that runs `f` every `interval`.
 fn spawn_periodic(interval: Duration, f: impl Fn() + Send + 'static) {

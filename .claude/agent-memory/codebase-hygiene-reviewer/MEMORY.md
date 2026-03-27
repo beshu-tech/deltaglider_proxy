@@ -1,0 +1,1 @@
+- [Admin overlay migration](project_admin_overlay_migration.md) — AdminOverlay replaced SettingsPage; old UsersTab/UserModal deleted; #/settings route still redundant
