@@ -581,6 +581,14 @@ fn build_s3_router(
         .layer(axum::Extension(metrics.clone()))
         // Increase body size limit to match max_object_size config (default 2MB is too small)
         .layer(DefaultBodyLimit::max(config.max_object_size as usize))
+        // Limit total concurrent in-flight requests to prevent resource exhaustion.
+        // Default: 1024. Override via DGP_MAX_CONCURRENT_REQUESTS.
+        .layer(tower::limit::ConcurrencyLimitLayer::new(
+            std::env::var("DGP_MAX_CONCURRENT_REQUESTS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1024usize),
+        ))
         // CORS must be outermost to handle OPTIONS preflight before auth
         .layer(CorsLayer::permissive())
         .with_state(state.clone())

@@ -80,6 +80,7 @@ uuid = { version = "1", features = ["v4"] }
 prometheus = { version = "0.13", default-features = false, features = ["process"] }
 rusqlite = { version = "0.39.0", features = ["bundled-sqlcipher"] }
 iam-rs = "0.0.23"
+tower = { version = "0.5.3", features = ["limit"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
