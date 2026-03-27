@@ -14,7 +14,7 @@ use subtle::ConstantTimeEq;
 use crate::iam::IamState;
 use crate::rate_limiter;
 
-use super::AdminState;
+use super::{audit_log, AdminState};
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
@@ -131,6 +131,7 @@ pub async fn login(
             client_ip,
             locked
         );
+        audit_log("login_failed", "", "bootstrap", &req_headers);
         return (
             StatusCode::UNAUTHORIZED,
             HeaderMap::new(),
@@ -258,6 +259,7 @@ pub async fn login_as(
                 client_ip,
                 body.access_key_id
             );
+            audit_log("login_failed", "", &body.access_key_id, &req_headers);
             return Err(StatusCode::FORBIDDEN);
         }
     };
@@ -276,6 +278,7 @@ pub async fn login_as(
             client_ip,
             body.access_key_id
         );
+        audit_log("login_failed", "", &body.access_key_id, &req_headers);
         return Err(StatusCode::FORBIDDEN);
     }
 

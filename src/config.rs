@@ -154,6 +154,13 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         example: "/etc/ssl/private/proxy-key.pem",
         category: "TLS",
     },
+    // ── Config DB Sync ─────────────────────────────────────
+    EnvVarEntry {
+        name: "DGP_CONFIG_SYNC_BUCKET",
+        description: "S3 bucket for config DB sync (enables multi-instance IAM sync)",
+        example: "my-config-bucket",
+        category: "Config Sync",
+    },
 ];
 
 /// Thread-safe shared config for hot-reload from admin GUI.
@@ -753,8 +760,9 @@ mod tests {
 
         // Every registry entry must be referenced in from_env (no stale entries)
         for name in &registry_names {
-            // DGP_CONFIG is checked in load(), not from_env() — allow it
-            if *name == "DGP_CONFIG" {
+            // DGP_CONFIG is checked in load(), not from_env() — allow it.
+            // DGP_CONFIG_SYNC_BUCKET is checked in main.rs init_config_sync(), not from_env().
+            if *name == "DGP_CONFIG" || *name == "DGP_CONFIG_SYNC_BUCKET" {
                 continue;
             }
             assert!(

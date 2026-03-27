@@ -34,7 +34,34 @@ COPY --from=ui-build /app/demo/s3-browser/ui/dist demo/s3-browser/ui/dist
 RUN cargo build --release
 
 # ── Runtime ──
+# Security notes:
+# - Runs as non-root user 'dg' (least privilege).
+# - Only ca-certificates, xdelta3, and curl are installed (minimal attack surface).
+#   curl is required for the HEALTHCHECK probe; no shell utilities beyond busybox.
+# - No secrets are embedded in the image — all credentials are provided at runtime
+#   via environment variables or mounted config files.
+#
+# Kubernetes / container orchestrator hardening (apply in your deployment manifest):
+#   securityContext:
+#     runAsNonRoot: true
+#     readOnlyRootFilesystem: true
+#     allowPrivilegeEscalation: false
+#     capabilities:
+#       drop: [ALL]
+#   # Mount a writable volume for the config DB and data directory:
+#   volumeMounts:
+#     - name: data
+#       mountPath: /data
+#     - name: tmp
+#       mountPath: /tmp
 FROM debian:bookworm-slim
+
+LABEL org.opencontainers.image.title="DeltaGlider Proxy" \
+      org.opencontainers.image.description="S3-compatible proxy with transparent delta compression" \
+      org.opencontainers.image.vendor="DeltaGlider" \
+      org.opencontainers.image.source="https://github.com/sscarduzio/deltaglider-proxy" \
+      org.opencontainers.image.licenses="MIT"
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates xdelta3 curl \
     && rm -rf /var/lib/apt/lists/*

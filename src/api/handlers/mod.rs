@@ -22,6 +22,35 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use std::sync::Arc;
 
+/// Audit log helper for S3 mutation operations (PUT, DELETE, bucket create/delete).
+/// Emits a structured log line to stdout for security auditing.
+pub(crate) fn audit_log_s3(
+    action: &str,
+    user: &str,
+    headers: &HeaderMap,
+    bucket: &str,
+    path: &str,
+) {
+    let ip = headers
+        .get("x-forwarded-for")
+        .or_else(|| headers.get("x-real-ip"))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown");
+    let ua = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    tracing::info!(
+        "AUDIT | action={} | user={} | target= | ip={} | ua={} | bucket={} | path={}",
+        action,
+        user,
+        ip,
+        ua,
+        bucket,
+        path
+    );
+}
+
 // Re-export all public handlers and types so callers don't change.
 pub use bucket::{
     bucket_get_handler, create_bucket, delete_bucket, head_bucket, list_buckets, BucketGetQuery,

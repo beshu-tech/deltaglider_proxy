@@ -1,14 +1,17 @@
 //! User handlers: list, create, update, delete, rotate keys, canned policies,
 //! plus rebuild_iam_index and mask_user helpers.
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse;
+use axum::Json;
 use serde::Deserialize;
 use std::sync::Arc;
 
 use crate::config_db::ConfigDb;
 use crate::iam::{self, IamIndex, IamState, IamUser, Permission, SharedIamState};
 
-use super::AdminState;
+use super::{audit_log, trigger_config_sync, AdminState};
 
 #[derive(Deserialize)]
 pub struct CreateUserRequest {
@@ -138,6 +141,7 @@ pub async fn list_users(
 /// POST /api/admin/users — create a new user (returns full secret once).
 pub async fn create_user(
     State(state): State<Arc<AdminState>>,
+    headers: HeaderMap,
     Json(body): Json<CreateUserRequest>,
 ) -> Result<(StatusCode, Json<IamUser>), StatusCode> {
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
@@ -173,8 +177,10 @@ pub async fn create_user(
         })?;
 
     rebuild_iam_index(&db, &state.iam_state)?;
+    trigger_config_sync(&state);
 
     tracing::info!("IAM user '{}' created ({})", user.name, user.access_key_id);
+    audit_log("create_user", "admin", &user.name, &headers);
     // Return full user including secret (shown only once)
     Ok((StatusCode::CREATED, Json(user)))
 }
@@ -183,6 +189,7 @@ pub async fn create_user(
 pub async fn update_user(
     State(state): State<Arc<AdminState>>,
     axum::extract::Path(user_id): axum::extract::Path<i64>,
+    headers: HeaderMap,
     Json(body): Json<UpdateUserRequest>,
 ) -> Result<Json<IamUser>, StatusCode> {
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
@@ -201,8 +208,10 @@ pub async fn update_user(
         })?;
 
     rebuild_iam_index(&db, &state.iam_state)?;
+    trigger_config_sync(&state);
 
     tracing::info!("IAM user '{}' updated", user.name);
+    audit_log("update_user", "admin", &user.name, &headers);
     Ok(Json(mask_user(&user)))
 }
 
@@ -210,6 +219,7 @@ pub async fn update_user(
 pub async fn delete_user(
     State(state): State<Arc<AdminState>>,
     axum::extract::Path(user_id): axum::extract::Path<i64>,
+    headers: HeaderMap,
 ) -> Result<StatusCode, StatusCode> {
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let db = db.lock().await;
@@ -226,12 +236,14 @@ pub async fn delete_user(
     }
 
     rebuild_iam_index(&db, &state.iam_state)?;
+    trigger_config_sync(&state);
 
     tracing::info!(
         "IAM user {} deleted ({} users remaining)",
         user_id,
         remaining
     );
+    audit_log("delete_user", "admin", &user_id.to_string(), &headers);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -241,6 +253,7 @@ pub async fn delete_user(
 pub async fn rotate_user_keys(
     State(state): State<Arc<AdminState>>,
     axum::extract::Path(user_id): axum::extract::Path<i64>,
+    headers: HeaderMap,
     body: Option<Json<RotateKeysRequest>>,
 ) -> Result<Json<IamUser>, StatusCode> {
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
@@ -267,12 +280,14 @@ pub async fn rotate_user_keys(
         })?;
 
     rebuild_iam_index(&db, &state.iam_state)?;
+    trigger_config_sync(&state);
 
     tracing::info!(
         "IAM user '{}' keys rotated (new: {})",
         user.name,
         user.access_key_id
     );
+    audit_log("rotate_keys", "admin", &user.name, &headers);
     // Return full user including new secret (shown only once)
     Ok(Json(user))
 }

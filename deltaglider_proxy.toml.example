@@ -138,6 +138,9 @@ path = "./data"
 #   DGP_BE_AWS_ACCESS_KEY_ID   - Backend S3 access key (required)
 #   DGP_BE_AWS_SECRET_ACCESS_KEY - Backend S3 secret key (required)
 #
+# Config DB S3 Sync (multi-instance IAM):
+#   DGP_CONFIG_SYNC_BUCKET    - S3 bucket for config DB sync (enables multi-instance IAM sync)
+#
 # Performance:
 #   DGP_METADATA_CACHE_MB     - Metadata cache size in MB (default: 50)
 #

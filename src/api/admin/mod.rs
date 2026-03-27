@@ -13,6 +13,7 @@ use tracing_subscriber::EnvFilter;
 use crate::api::handlers::AppState;
 use crate::config::SharedConfig;
 use crate::config_db::ConfigDb;
+use crate::config_db_sync::ConfigDbSync;
 use crate::iam::SharedIamState;
 use crate::rate_limiter::RateLimiter;
 use crate::session::SessionStore;
@@ -51,11 +52,55 @@ pub struct AdminState {
     pub s3_state: Arc<AppState>,
     pub iam_state: SharedIamState,
     /// Encrypted config database for IAM users (None in legacy/open-access mode).
-    pub config_db: Option<tokio::sync::Mutex<ConfigDb>>,
+    pub config_db: Option<Arc<tokio::sync::Mutex<ConfigDb>>>,
     /// Background usage scanner for computing prefix sizes.
     pub usage_scanner: Arc<UsageScanner>,
     /// Per-IP rate limiter for login endpoints and auth failures.
     pub rate_limiter: RateLimiter,
+    /// S3 sync for the config database (None if DGP_CONFIG_SYNC_BUCKET is not set).
+    pub config_sync: Option<Arc<ConfigDbSync>>,
+}
+
+/// Trigger an async config DB upload to S3 if sync is enabled.
+/// Spawns a background task so the caller is not blocked.
+pub(crate) fn trigger_config_sync(state: &Arc<AdminState>) {
+    if let Some(ref sync) = state.config_sync {
+        tokio::spawn({
+            let sync = sync.clone();
+            async move {
+                if let Err(e) = sync.upload().await {
+                    tracing::warn!("Config DB S3 sync upload failed: {}", e);
+                }
+            }
+        });
+    }
+}
+
+/// Audit log helper for admin mutation operations (user/group CRUD, password changes).
+/// Emits a structured log line to stdout for security auditing and compliance.
+pub(crate) fn audit_log(
+    action: &str,
+    admin_user: &str,
+    target: &str,
+    headers: &axum::http::HeaderMap,
+) {
+    let ip = headers
+        .get("x-forwarded-for")
+        .or_else(|| headers.get("x-real-ip"))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown");
+    let ua = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    tracing::info!(
+        "AUDIT | action={} | user={} | target={} | ip={} | ua={} | bucket= | path=",
+        action,
+        admin_user,
+        target,
+        ip,
+        ua
+    );
 }
 
 /// Common password validation for both admin API and CLI.
