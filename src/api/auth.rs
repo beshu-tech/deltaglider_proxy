@@ -349,10 +349,21 @@ pub async fn sigv4_auth_middleware(
                 m.auth_attempts_total.with_label_values(&["failure"]).inc();
                 m.auth_failures_total.with_label_values(&[reason]).inc();
             }
-            // Record failure in rate limiter
+            // Record failure in rate limiter + security logging
             if let (Some(rl), Some(ip)) = (&rate_limiter, &client_ip) {
-                rl.record_failure(ip);
-                warn!("SigV4 auth failure from {} (reason: {})", ip, reason);
+                let locked = rl.record_failure(ip);
+                let count = rl.failure_count(ip);
+                if locked {
+                    warn!(
+                        "SECURITY | event=brute_force_lockout | ip={} | attempts={} | reason={} | ua={}",
+                        ip, count, reason, audit_ua
+                    );
+                } else if count >= 3 {
+                    warn!(
+                        "SECURITY | event=repeated_auth_failure | ip={} | attempts={} | reason={} | ua={}",
+                        ip, count, reason, audit_ua
+                    );
+                }
             }
             info!(
                 "AUDIT | action=login_failed | user= | target={} | ip={} | ua={} | bucket= | path=",
@@ -375,11 +386,21 @@ pub async fn sigv4_auth_middleware(
     // Check rate limit before processing auth
     if let (Some(rl), Some(ip)) = (&rate_limiter, &client_ip) {
         if rl.is_limited(ip) {
-            warn!("SigV4: rate limited request from {}", ip);
+            let count = rl.failure_count(ip);
+            warn!(
+                "SECURITY | event=brute_force_blocked | ip={} | attempts={} | action=blocked",
+                ip, count
+            );
             return Err(
                 S3Error::SlowDown("Rate limited due to repeated auth failures".into())
                     .into_response(),
             );
+        }
+        // Progressive delay: slow down responses proportional to failure count.
+        // Makes brute force expensive even before lockout threshold.
+        let delay = rl.progressive_delay(ip);
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
         }
     }
 

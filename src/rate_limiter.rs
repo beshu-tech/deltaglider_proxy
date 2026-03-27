@@ -77,6 +77,27 @@ impl RateLimiter {
         false
     }
 
+    /// Get the progressive delay for an IP based on failure count.
+    /// Returns a duration to sleep before responding (makes brute force expensive).
+    /// Delay doubles with each failure: 0, 100ms, 200ms, 400ms, 800ms, 1.6s, 3.2s...
+    /// Capped at 5 seconds to avoid tying up connections forever.
+    pub fn progressive_delay(&self, ip: &IpAddr) -> Duration {
+        let entry = match self.entries.get(ip) {
+            Some(e) => e,
+            None => return Duration::ZERO,
+        };
+        if entry.count == 0 {
+            return Duration::ZERO;
+        }
+        let delay_ms = 100u64.saturating_mul(1u64 << entry.count.min(6));
+        Duration::from_millis(delay_ms.min(5000))
+    }
+
+    /// Get the current failure count for an IP (for logging).
+    pub fn failure_count(&self, ip: &IpAddr) -> u32 {
+        self.entries.get(ip).map(|e| e.count).unwrap_or(0)
+    }
+
     /// Record a failed authentication attempt for an IP.
     /// Returns `true` if the IP is now rate-limited (should block further attempts).
     pub fn record_failure(&self, ip: &IpAddr) -> bool {
