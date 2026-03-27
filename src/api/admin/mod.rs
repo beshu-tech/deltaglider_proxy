@@ -76,6 +76,14 @@ pub(crate) fn trigger_config_sync(state: &Arc<AdminState>) {
     }
 }
 
+/// Sanitize a value for structured audit log output.
+/// Prevents newline injection and pipe-delimiter confusion.
+fn sanitize_audit(s: &str) -> String {
+    s.replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('|', "\\|")
+}
+
 /// Audit log helper for admin mutation operations (user/group CRUD, password changes).
 /// Emits a structured log line to stdout for security auditing and compliance.
 pub(crate) fn audit_log(
@@ -89,17 +97,18 @@ pub(crate) fn audit_log(
         .or_else(|| headers.get("x-real-ip"))
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown");
-    let ua = headers
+    let ua_raw = headers
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+    let ua = ua_raw.get(..256.min(ua_raw.len())).unwrap_or(ua_raw);
     tracing::info!(
         "AUDIT | action={} | user={} | target={} | ip={} | ua={} | bucket= | path=",
-        action,
-        admin_user,
-        target,
-        ip,
-        ua
+        sanitize_audit(action),
+        sanitize_audit(admin_user),
+        sanitize_audit(target),
+        sanitize_audit(ip),
+        sanitize_audit(ua)
     );
 }
 

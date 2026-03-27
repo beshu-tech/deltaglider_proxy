@@ -75,7 +75,8 @@ pub async fn put_object_or_copy(
     }
 
     // Copy vs direct put
-    let result = if headers.contains_key("x-amz-copy-source") {
+    let is_copy = headers.contains_key("x-amz-copy-source");
+    let result = if is_copy {
         copy_object_inner(&state, &bucket, &key, &headers, &auth_user).await
     } else {
         put_object_inner(&state, &bucket, &key, &headers, &decoded_body).await
@@ -86,7 +87,8 @@ pub async fn put_object_or_copy(
             .as_ref()
             .map(|u| u.name.as_str())
             .unwrap_or("anonymous");
-        audit_log_s3("s3_put", user_name, &headers, &bucket, &key);
+        let action = if is_copy { "s3_copy" } else { "s3_put" };
+        audit_log_s3(action, user_name, &headers, &bucket, &key);
     }
 
     result

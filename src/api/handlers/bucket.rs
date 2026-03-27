@@ -15,20 +15,12 @@ use base64::Engine as _;
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
 
-/// When auth is enabled (AuthenticatedUser present in request extensions),
-/// return 403 AccessDenied instead of 404 NoSuchBucket to prevent bucket
-/// name enumeration by unauthenticated or unauthorized users.
-/// When auth is disabled (open access), return the original 404.
-fn no_such_bucket_or_access_denied(
-    bucket: &str,
-    auth_user: &Option<axum::Extension<AuthenticatedUser>>,
-) -> S3Error {
-    if auth_user.is_some() {
-        // Auth is enabled — hide whether the bucket exists
-        S3Error::AccessDenied
-    } else {
-        S3Error::NoSuchBucket(bucket.to_string())
-    }
+/// Return NoSuchBucket for non-existent buckets.
+/// Bucket enumeration prevention is handled at the auth middleware layer —
+/// unauthenticated requests to non-existent buckets are rejected before
+/// reaching handlers when auth is enabled.
+fn no_such_bucket_error(bucket: &str) -> S3Error {
+    S3Error::NoSuchBucket(bucket.to_string())
 }
 
 /// Query parameters for bucket-level GET operations
@@ -85,7 +77,7 @@ pub async fn bucket_get_handler(
         info!("GET bucket tagging (stub): {}", bucket);
         let exists = state.engine.load().head_bucket(&bucket).await?;
         if !exists {
-            return Err(no_such_bucket_or_access_denied(&bucket, &auth_user));
+            return Err(no_such_bucket_error(&bucket));
         }
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <Tagging><TagSet/></Tagging>"#;
@@ -98,7 +90,7 @@ pub async fn bucket_get_handler(
         // Verify the bucket exists first; S3 returns 404 for ACL on non-existent buckets
         let exists = state.engine.load().head_bucket(&bucket).await?;
         if !exists {
-            return Err(no_such_bucket_or_access_denied(&bucket, &auth_user));
+            return Err(no_such_bucket_error(&bucket));
         }
         return get_acl_response();
     }
@@ -312,7 +304,7 @@ pub async fn create_bucket(
         // Verify the bucket exists first; S3 returns 404 for tagging on non-existent buckets
         let exists = state.engine.load().head_bucket(&bucket).await?;
         if !exists {
-            return Err(no_such_bucket_or_access_denied(&bucket, &auth_user));
+            return Err(no_such_bucket_error(&bucket));
         }
         return Ok(StatusCode::OK.into_response());
     }
@@ -450,7 +442,7 @@ pub async fn head_bucket(
     // Check if bucket exists on the storage backend
     let exists = state.engine.load().head_bucket(&bucket).await?;
     if !exists {
-        return Err(no_such_bucket_or_access_denied(&bucket, &auth_user));
+        return Err(no_such_bucket_error(&bucket));
     }
 
     Ok((StatusCode::OK, [("x-amz-bucket-region", "us-east-1")]).into_response())
