@@ -1911,22 +1911,16 @@ async fn test_list_objects_reports_original_sizes() {
         .collect();
 
     assert_eq!(sizes.len(), 2, "Should list 2 objects, got: {:?}", sizes);
-    // Lite LIST optimization: sizes are stored (delta) sizes, not original sizes.
-    // The reference file keeps its original size; the delta file shows the smaller
-    // stored size. Original sizes are only available via HEAD (lazy hydration).
-    let ref_size = sizes.iter().max().unwrap();
-    let delta_size = sizes.iter().min().unwrap();
-    assert!(
-        *ref_size >= 1000,
-        "Reference size {} should be ~1024 (stored as-is)",
-        ref_size
-    );
-    assert!(
-        *delta_size < *ref_size,
-        "Delta stored size {} should be smaller than reference {}",
-        delta_size,
-        ref_size
-    );
+    // With the metadata cache, LIST returns original (pre-compression) sizes
+    // for all objects — both the reference and the delta-compressed file report
+    // their original size (~1024 bytes), not the stored delta size.
+    for size in &sizes {
+        assert!(
+            *size >= 1000,
+            "Listed size {} should be original size (~1024), not delta size",
+            size
+        );
+    }
 
     // Verify the delta file's original size is available via HEAD
     let v1_key = format!("{}/v1.zip", prefix);
