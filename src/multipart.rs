@@ -178,22 +178,16 @@ impl MultipartStore {
         key: &str,
         requested_parts: &[(u32, String)], // (part_number, etag)
     ) -> Result<CompletedUpload, S3Error> {
-        // Take ownership under write lock — prevents double-completion and
-        // releases the lock before the expensive assembly loop.
-        let upload = {
-            let mut uploads = self.uploads.write();
-            let upload = uploads
-                .remove(upload_id)
-                .ok_or_else(|| S3Error::NoSuchUpload(upload_id.to_string()))?;
-            if upload.bucket != bucket || upload.key != key {
-                // Put it back — wrong bucket/key
-                uploads.insert(upload_id.to_string(), upload);
-                return Err(S3Error::NoSuchUpload(upload_id.to_string()));
-            }
-            upload
-            // Write lock released here
-        };
-        let upload = &upload;
+        // Borrow under read lock for assembly — the upload stays in the map until
+        // the caller confirms the store succeeded (via remove_upload).
+        // This prevents data loss if engine.store() fails after assembly.
+        let uploads = self.uploads.read();
+        let upload = uploads
+            .get(upload_id)
+            .ok_or_else(|| S3Error::NoSuchUpload(upload_id.to_string()))?;
+        if upload.bucket != bucket || upload.key != key {
+            return Err(S3Error::NoSuchUpload(upload_id.to_string()));
+        }
 
         if requested_parts.is_empty() {
             return Err(S3Error::InvalidPart(
@@ -263,18 +257,14 @@ impl MultipartStore {
         key: &str,
         requested_parts: &[(u32, String)],
     ) -> Result<CompletedParts, S3Error> {
-        let upload = {
-            let mut uploads = self.uploads.write();
-            let upload = uploads
-                .remove(upload_id)
-                .ok_or_else(|| S3Error::NoSuchUpload(upload_id.to_string()))?;
-            if upload.bucket != bucket || upload.key != key {
-                uploads.insert(upload_id.to_string(), upload);
-                return Err(S3Error::NoSuchUpload(upload_id.to_string()));
-            }
-            upload
-        };
-        let upload = &upload;
+        // Borrow under read lock — upload stays in map until remove_upload() after store succeeds.
+        let uploads = self.uploads.read();
+        let upload = uploads
+            .get(upload_id)
+            .ok_or_else(|| S3Error::NoSuchUpload(upload_id.to_string()))?;
+        if upload.bucket != bucket || upload.key != key {
+            return Err(S3Error::NoSuchUpload(upload_id.to_string()));
+        }
 
         if requested_parts.is_empty() {
             return Err(S3Error::InvalidPart(
@@ -327,6 +317,13 @@ impl MultipartStore {
             content_type: upload.content_type.clone(),
             user_metadata: upload.user_metadata.clone(),
         })
+    }
+
+    /// Remove a completed upload from the map.
+    /// Called AFTER engine.store() succeeds to finalize the completion.
+    /// This prevents data loss if store fails — the upload remains retryable.
+    pub fn remove_upload(&self, upload_id: &str) {
+        self.uploads.write().remove(upload_id);
     }
 
     /// Abort a multipart upload. Validates bucket+key match.

@@ -50,7 +50,8 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
     }
   }, [onSessionExpired]);
 
-  useEffect(() => { loadData(); }, [loadData]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { loadData(); }, []);  // Load once on mount; mutations call loadData() explicitly
 
   // Navigate to a specific group when coming from UserForm
   useEffect(() => {

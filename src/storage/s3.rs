@@ -573,7 +573,7 @@ impl S3Backend {
 
         // Object exists on upstream S3 but has no (or corrupt) DeltaGlider metadata.
         // Treat as passthrough with best-effort metadata from HEAD response.
-        let file_size = response.content_length().unwrap_or(0) as u64;
+        let file_size = response.content_length().unwrap_or(0).max(0) as u64;
         let last_modified = response
             .last_modified()
             .and_then(|t| {
@@ -646,7 +646,7 @@ impl S3Backend {
                 continue;
             }
 
-            // Skip internal reference files
+            // Skip internal deltaspace files: reference.bin and anything inside .dg/
             if filename == "reference.bin" {
                 continue;
             }
@@ -1526,53 +1526,26 @@ impl StorageBackend for S3Backend {
         // Apply max_keys across both objects and common_prefixes (interleaved)
         let common_prefixes: Vec<String> = all_common_prefixes.into_iter().collect();
 
-        // Interleave and paginate (CommonPrefixes count toward max_keys)
-        enum Entry {
-            Obj(String, Box<FileMetadata>),
-            Prefix(String),
-        }
-        let mut entries: Vec<(String, Entry)> = Vec::new();
-        for (key, meta) in objects {
-            entries.push((key.clone(), Entry::Obj(key, Box::new(meta))));
-        }
-        for cp in common_prefixes {
-            entries.push((cp.clone(), Entry::Prefix(cp)));
-        }
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let max = max_keys as usize;
-        let is_truncated = entries.len() > max;
-        if entries.len() > max {
-            entries.truncate(max);
-        }
-        let next_token = if is_truncated {
-            entries.last().map(|(key, _)| key.clone())
-        } else {
-            None
-        };
-
-        let mut final_objects = Vec::new();
-        let mut final_prefixes = Vec::new();
-        for (_, entry) in entries {
-            match entry {
-                Entry::Obj(key, meta) => final_objects.push((key, *meta)),
-                Entry::Prefix(p) => final_prefixes.push(p),
-            }
-        }
+        let page = crate::deltaglider::interleave_and_paginate(
+            objects,
+            common_prefixes,
+            max_keys,
+            continuation_token,
+        );
 
         debug!(
             "Delegated list: {} objects + {} prefixes in {}/{}",
-            final_objects.len(),
-            final_prefixes.len(),
+            page.objects.len(),
+            page.common_prefixes.len(),
             bucket,
             prefix
         );
 
         Ok(Some(DelegatedListResult {
-            objects: final_objects,
-            common_prefixes: final_prefixes,
-            is_truncated,
-            next_continuation_token: next_token,
+            objects: page.objects,
+            common_prefixes: page.common_prefixes,
+            is_truncated: page.is_truncated,
+            next_continuation_token: page.next_continuation_token,
         }))
     }
 

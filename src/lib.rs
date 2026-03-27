@@ -3,6 +3,7 @@
 //! This library provides the core functionality for the DeltaGlider Proxy S3 server.
 
 pub mod api;
+pub mod audit;
 pub mod config;
 pub mod config_db;
 pub mod config_db_sync;

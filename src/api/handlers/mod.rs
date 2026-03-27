@@ -22,16 +22,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use std::sync::Arc;
 
-/// Sanitize a value for structured audit log output.
-/// Prevents newline injection and pipe-delimiter confusion.
-fn sanitize_audit(s: &str) -> String {
-    s.replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('|', "\\|")
-}
-
-/// Audit log helper for S3 mutation operations (PUT, DELETE, bucket create/delete).
-/// Emits a structured log line to stdout for security auditing.
+/// S3 audit log helper — delegates to the shared audit module.
 pub(crate) fn audit_log_s3(
     action: &str,
     user: &str,
@@ -39,25 +30,7 @@ pub(crate) fn audit_log_s3(
     bucket: &str,
     path: &str,
 ) {
-    let ip = headers
-        .get("x-forwarded-for")
-        .or_else(|| headers.get("x-real-ip"))
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown");
-    let ua_raw = headers
-        .get("user-agent")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let ua = ua_raw.get(..256.min(ua_raw.len())).unwrap_or(ua_raw);
-    tracing::info!(
-        "AUDIT | action={} | user={} | target= | ip={} | ua={} | bucket={} | path={}",
-        sanitize_audit(action),
-        sanitize_audit(user),
-        sanitize_audit(ip),
-        sanitize_audit(ua),
-        sanitize_audit(bucket),
-        sanitize_audit(path)
-    );
+    crate::audit::audit_log(action, user, "", headers, bucket, path);
 }
 
 // Re-export all public handlers and types so callers don't change.

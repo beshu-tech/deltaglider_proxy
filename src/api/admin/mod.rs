@@ -76,40 +76,14 @@ pub(crate) fn trigger_config_sync(state: &Arc<AdminState>) {
     }
 }
 
-/// Sanitize a value for structured audit log output.
-/// Prevents newline injection and pipe-delimiter confusion.
-fn sanitize_audit(s: &str) -> String {
-    s.replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('|', "\\|")
-}
-
-/// Audit log helper for admin mutation operations (user/group CRUD, password changes).
-/// Emits a structured log line to stdout for security auditing and compliance.
+/// Admin audit log helper — delegates to the shared audit module.
 pub(crate) fn audit_log(
     action: &str,
     admin_user: &str,
     target: &str,
     headers: &axum::http::HeaderMap,
 ) {
-    let ip = headers
-        .get("x-forwarded-for")
-        .or_else(|| headers.get("x-real-ip"))
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown");
-    let ua_raw = headers
-        .get("user-agent")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let ua = ua_raw.get(..256.min(ua_raw.len())).unwrap_or(ua_raw);
-    tracing::info!(
-        "AUDIT | action={} | user={} | target={} | ip={} | ua={} | bucket= | path=",
-        sanitize_audit(action),
-        sanitize_audit(admin_user),
-        sanitize_audit(target),
-        sanitize_audit(ip),
-        sanitize_audit(ua)
-    );
+    crate::audit::audit_log(action, admin_user, target, headers, "", "");
 }
 
 /// Common password validation for both admin API and CLI.

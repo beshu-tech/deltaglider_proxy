@@ -120,7 +120,9 @@ async fn complete_multipart_upload(
         (etag, result)
     };
 
-    // Upload already removed atomically inside complete() — no separate remove() needed.
+    // Store succeeded — now safe to remove the upload from the map.
+    // (If store had failed, the upload would still be retryable.)
+    state.multipart.remove_upload(upload_id);
 
     debug!(
         "CompleteMultipartUpload {}/{} stored as {}",

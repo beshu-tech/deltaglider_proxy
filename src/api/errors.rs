@@ -154,7 +154,7 @@ impl S3Error {
     <RequestId>{}</RequestId>
 </Error>"#,
             self.code(),
-            self,
+            escape_xml(&self.to_string()),
             resource,
             request_id
         )

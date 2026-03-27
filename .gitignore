@@ -18,6 +18,12 @@ data/
 # Config (contains secrets/credentials)
 deltaglider_proxy.toml
 .deltaglider_admin_hash
+.deltaglider_bootstrap_hash
+deltaglider_config.db
+
+# Personal notes (not part of the project)
+MY_NOTES_DONT_COMMIT.txt
+ENTERPRISE_STRATEGY.md
 
 # Debugging screenshots & logs
 *.png

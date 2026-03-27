@@ -81,9 +81,15 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         .route("/_/api/admin/login-as", post(admin::login_as))
         .route("/_/api/admin/policies", get(admin::get_canned_policies))
         .route("/_/api/whoami", get(admin::whoami))
-        .with_state(admin_state);
+        .with_state(admin_state.clone());
 
-    // Metrics/stats/health under /_/ (also available on root for S3 clients)
+    // Health check (unauthenticated — needed for load balancer probes)
+    let health_route = Router::new().route(
+        "/_/health",
+        get(deltaglider_proxy::api::handlers::health_check).with_state(s3_state.clone()),
+    );
+
+    // Metrics/stats under /_/ — session-protected (sensitive operational data)
     let metrics_routes = Router::new()
         .route(
             "/_/metrics",
@@ -91,12 +97,13 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         )
         .route(
             "/_/stats",
-            get(deltaglider_proxy::api::handlers::get_stats).with_state(s3_state.clone()),
+            get(deltaglider_proxy::api::handlers::get_stats).with_state(s3_state),
         )
-        .route(
-            "/_/health",
-            get(deltaglider_proxy::api::handlers::health_check).with_state(s3_state),
-        );
+        .layer(middleware::from_fn_with_state(
+            admin_state.clone(),
+            admin::require_session,
+        ))
+        .with_state(admin_state.clone());
 
     // Static UI assets
     let static_routes = Router::new()
@@ -106,6 +113,7 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
     Router::new()
         .merge(protected)
         .merge(public_admin)
+        .merge(health_route)
         .merge(metrics_routes)
         .merge(static_routes)
         .layer(

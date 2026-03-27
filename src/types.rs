@@ -489,7 +489,11 @@ impl FileMetadata {
     pub fn compression_ratio(&self) -> Option<f32> {
         match &self.storage_info {
             StorageInfo::Delta { delta_size, .. } => {
-                Some(*delta_size as f32 / self.file_size as f32)
+                if self.file_size == 0 {
+                    Some(1.0)
+                } else {
+                    Some(*delta_size as f32 / self.file_size as f32)
+                }
             }
             _ => None,
         }
