@@ -1075,10 +1075,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// and populates the cache for subsequent calls.
     #[instrument(skip(self))]
     pub async fn head(&self, bucket: &str, key: &str) -> Result<FileMetadata, EngineError> {
-        // Fast path: metadata cache hit
-        if let Some(cached) = self.metadata_cache.get(bucket, key) {
-            return Ok(cached);
-        }
+        // Note: we do NOT use the metadata cache for HEAD. The cache is used for
+        // LIST enrichment and file_size correction, but HEAD must always verify
+        // the object exists on storage to handle out-of-band deletions correctly.
+        // The cost is one storage call per HEAD, but HEAD is already a storage call.
 
         let (obj_key, deltaspace_id) = Self::validated_key(bucket, key)?;
 
