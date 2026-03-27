@@ -5,7 +5,7 @@ use super::object_helpers::{
     apply_response_overrides, build_range_response, check_conditionals, copy_object_inner,
     decode_body, parse_range_header, put_object_inner, upload_part, upload_part_copy,
 };
-use super::{build_object_headers, xml_response, AppState, ObjectQuery, S3Error};
+use super::{audit_log_s3, build_object_headers, xml_response, AppState, ObjectQuery, S3Error};
 use crate::deltaglider::RetrieveResponse;
 use crate::iam::AuthenticatedUser;
 use axum::body::{Body, Bytes};
@@ -75,11 +75,21 @@ pub async fn put_object_or_copy(
     }
 
     // Copy vs direct put
-    if headers.contains_key("x-amz-copy-source") {
+    let result = if headers.contains_key("x-amz-copy-source") {
         copy_object_inner(&state, &bucket, &key, &headers, &auth_user).await
     } else {
         put_object_inner(&state, &bucket, &key, &headers, &decoded_body).await
+    };
+
+    if result.is_ok() {
+        let user_name = auth_user
+            .as_ref()
+            .map(|u| u.name.as_str())
+            .unwrap_or("anonymous");
+        audit_log_s3("s3_put", user_name, &headers, &bucket, &key);
     }
+
+    result
 }
 
 /// GET object handler
@@ -247,6 +257,8 @@ pub async fn delete_object(
     State(state): State<Arc<AppState>>,
     ValidatedPath { bucket, key }: ValidatedPath,
     Query(query): Query<ObjectQuery>,
+    auth_user: Option<axum::Extension<AuthenticatedUser>>,
+    headers: HeaderMap,
 ) -> Result<Response, S3Error> {
     // DELETE /{bucket}/{key}?tagging — no-op (tagging stub)
     if query.tagging.is_some() {
@@ -277,6 +289,12 @@ pub async fn delete_object(
 
     debug!("Deleted {}/{}", bucket, key);
 
+    let user_name = auth_user
+        .as_ref()
+        .map(|u| u.name.as_str())
+        .unwrap_or("anonymous");
+    audit_log_s3("s3_delete", user_name, &headers, &bucket, &key);
+
     // S3 returns 204 No Content on successful delete
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -288,6 +306,8 @@ pub async fn delete_objects(
     State(state): State<Arc<AppState>>,
     ValidatedBucket(bucket): ValidatedBucket,
     Query(query): Query<BucketPostQuery>,
+    auth_user: Option<axum::Extension<AuthenticatedUser>>,
+    req_headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, S3Error> {
     use super::body_to_utf8;
@@ -345,6 +365,17 @@ pub async fn delete_objects(
                     });
                 }
             }
+        }
+    }
+
+    // Audit log each successfully deleted object
+    if !deleted.is_empty() {
+        let user_name = auth_user
+            .as_ref()
+            .map(|u| u.name.as_str())
+            .unwrap_or("anonymous");
+        for d in &deleted {
+            audit_log_s3("s3_delete", user_name, &req_headers, &bucket, &d.key);
         }
     }
 

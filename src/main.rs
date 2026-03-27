@@ -13,6 +13,7 @@ use deltaglider_proxy::api::handlers::{
     put_object_or_copy, AppState,
 };
 use deltaglider_proxy::config::{BackendConfig, Config};
+use deltaglider_proxy::config_db_sync::ConfigDbSync;
 use deltaglider_proxy::deltaglider::DynEngine;
 use deltaglider_proxy::iam::authorization_middleware;
 use deltaglider_proxy::iam::{AuthConfig, IamState, SharedIamState};
@@ -250,6 +251,14 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let shared_config = config.clone().into_shared();
     let config_db = init_config_db(&admin_password_hash, &iam_state);
 
+    // --- Config DB S3 sync ---
+    let config_sync = init_config_sync(&config, &admin_password_hash, &config_db, &iam_state).await;
+
+    // Start periodic config DB S3 poll (every 5 minutes)
+    if let Some(ref sync) = config_sync {
+        spawn_config_sync_poll(sync.clone(), &config_db, &iam_state, &admin_password_hash);
+    }
+
     let admin_state = Arc::new(AdminState {
         password_hash: parking_lot::RwLock::new(admin_password_hash),
         sessions: session_store,
@@ -260,6 +269,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         config_db,
         usage_scanner: Arc::new(UsageScanner::new()),
         rate_limiter,
+        config_sync,
     });
 
     // --- TLS ---
@@ -584,7 +594,7 @@ fn build_s3_router(
 fn init_config_db(
     admin_password_hash: &str,
     iam_state: &SharedIamState,
-) -> Option<tokio::sync::Mutex<deltaglider_proxy::config_db::ConfigDb>> {
+) -> Option<Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::ConfigDb>>> {
     let db_path = std::env::var("DGP_CONFIG")
         .ok()
         .and_then(|p| std::path::Path::new(&p).parent().map(|d| d.to_path_buf()))
@@ -604,13 +614,126 @@ fn init_config_db(
                     iam_state.store(Arc::new(IamState::Iam(index)));
                 }
             }
-            Some(tokio::sync::Mutex::new(db))
+            Some(Arc::new(tokio::sync::Mutex::new(db)))
         }
         Err(e) => {
             warn!("Could not open IAM config database: {} — IAM disabled", e);
             None
         }
     }
+}
+
+/// Initialize config DB S3 sync if DGP_CONFIG_SYNC_BUCKET is set.
+/// On startup: downloads from S3 if newer, reopens the DB, and rebuilds IAM index.
+async fn init_config_sync(
+    config: &Config,
+    admin_password_hash: &str,
+    config_db: &Option<Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::ConfigDb>>>,
+    iam_state: &SharedIamState,
+) -> Option<Arc<ConfigDbSync>> {
+    let sync_bucket = match std::env::var("DGP_CONFIG_SYNC_BUCKET") {
+        Ok(b) if !b.is_empty() => b,
+        _ => {
+            info!("Config DB S3 sync: disabled (set DGP_CONFIG_SYNC_BUCKET to enable)");
+            return None;
+        }
+    };
+
+    // Determine the local DB path (same logic as init_config_db)
+    let db_path = std::env::var("DGP_CONFIG")
+        .ok()
+        .and_then(|p| std::path::Path::new(&p).parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let db_file = db_path.join("deltaglider_config.db");
+
+    let sync = match ConfigDbSync::new(&config.backend, sync_bucket.clone(), db_file).await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            warn!("Config DB S3 sync: failed to initialize: {}", e);
+            return None;
+        }
+    };
+
+    info!("Config DB S3 sync: enabled (bucket={})", sync_bucket);
+
+    // Try to download a newer version from S3
+    match sync.download_if_newer().await {
+        Ok(true) => {
+            reopen_and_rebuild_iam(config_db, admin_password_hash, iam_state, "startup").await;
+        }
+        Ok(false) => {
+            info!("Config DB S3 sync: local copy is current");
+        }
+        Err(e) => {
+            warn!("Config DB S3 sync: startup download failed: {}", e);
+        }
+    }
+
+    Some(sync)
+}
+
+/// Reopen the config DB after an S3 download and rebuild the IAM index.
+async fn reopen_and_rebuild_iam(
+    config_db: &Option<Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::ConfigDb>>>,
+    admin_password_hash: &str,
+    iam_state: &SharedIamState,
+    context: &str,
+) {
+    if let Some(ref db_arc) = config_db {
+        let mut db = db_arc.lock().await;
+        if let Err(e) = db.reopen(admin_password_hash) {
+            warn!(
+                "Config DB S3 sync ({}): failed to reopen after download: {}",
+                context, e
+            );
+        } else {
+            // Rebuild IAM index from the new DB
+            let users = db.load_users().unwrap_or_default();
+            if !users.is_empty() {
+                let groups = db.load_groups().unwrap_or_default();
+                let count = users.len();
+                let group_count = groups.len();
+                let index = deltaglider_proxy::iam::IamIndex::from_users_and_groups(users, groups);
+                iam_state.store(Arc::new(IamState::Iam(index)));
+                info!(
+                    "IAM index rebuilt from S3-synced DB ({} users, {} groups) [{}]",
+                    count, group_count, context
+                );
+            }
+        }
+    }
+}
+
+/// Spawn periodic config DB S3 sync poll (every 5 minutes).
+fn spawn_config_sync_poll(
+    sync: Arc<ConfigDbSync>,
+    config_db: &Option<Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::ConfigDb>>>,
+    iam_state: &SharedIamState,
+    admin_password_hash: &str,
+) {
+    let db_arc = config_db.clone();
+    let iam = iam_state.clone();
+    let password_hash = admin_password_hash.to_string();
+
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(300));
+        // Skip the immediate first tick (startup sync already ran)
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            match sync.poll_and_sync().await {
+                Ok(true) => {
+                    reopen_and_rebuild_iam(&db_arc, &password_hash, &iam, "periodic poll").await;
+                }
+                Ok(false) => {
+                    tracing::debug!("Config DB S3 sync poll: no changes");
+                }
+                Err(e) => {
+                    warn!("Config DB S3 sync poll failed: {}", e);
+                }
+            }
+        }
+    });
 }
 
 /// Build TLS config if enabled in config.

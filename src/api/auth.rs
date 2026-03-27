@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Instant;
 use subtle::ConstantTimeEq;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use zeroize::Zeroize;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -336,9 +336,26 @@ pub async fn sigv4_auth_middleware(
     // Extract client IP for rate limiting
     let client_ip = rate_limiter::extract_client_ip(request.headers());
 
+    // Extract audit fields from request headers before the closure captures them
+    let audit_ip = request
+        .headers()
+        .get("x-forwarded-for")
+        .or_else(|| request.headers().get("x-real-ip"))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+    let audit_ua = request
+        .headers()
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
     let record_auth_failure = {
         let metrics = metrics.clone();
         let rate_limiter = rate_limiter.clone();
+        let audit_ip = audit_ip.clone();
+        let audit_ua = audit_ua.clone();
         move |reason: &str| {
             if let Some(m) = &metrics {
                 m.auth_attempts_total.with_label_values(&["failure"]).inc();
@@ -349,6 +366,10 @@ pub async fn sigv4_auth_middleware(
                 rl.record_failure(ip);
                 warn!("SigV4 auth failure from {} (reason: {})", ip, reason);
             }
+            info!(
+                "AUDIT | action=login_failed | user= | target={} | ip={} | ua={} | bucket= | path=",
+                reason, audit_ip, audit_ua
+            );
         }
     };
 

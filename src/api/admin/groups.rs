@@ -1,13 +1,15 @@
 //! Group handlers: list, create, update, delete, add/remove members.
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use axum::Json;
 use serde::Deserialize;
 use std::sync::Arc;
 
 use crate::iam::{Group, Permission};
 
 use super::users::rebuild_iam_index;
-use super::AdminState;
+use super::{audit_log, trigger_config_sync, AdminState};
 
 #[derive(Deserialize)]
 pub struct CreateGroupRequest {
@@ -49,6 +51,7 @@ pub async fn list_groups(
 /// POST /api/admin/groups — create a new group.
 pub async fn create_group(
     State(state): State<Arc<AdminState>>,
+    headers: HeaderMap,
     Json(body): Json<CreateGroupRequest>,
 ) -> Result<(StatusCode, Json<Group>), StatusCode> {
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
@@ -62,8 +65,10 @@ pub async fn create_group(
         })?;
 
     rebuild_iam_index(&db, &state.iam_state)?;
+    trigger_config_sync(&state);
 
     tracing::info!("IAM group '{}' created (id={})", group.name, group.id);
+    audit_log("create_group", "admin", &group.name, &headers);
     Ok((StatusCode::CREATED, Json(group)))
 }
 
@@ -71,6 +76,7 @@ pub async fn create_group(
 pub async fn update_group(
     State(state): State<Arc<AdminState>>,
     axum::extract::Path(group_id): axum::extract::Path<i64>,
+    headers: HeaderMap,
     Json(body): Json<UpdateGroupRequest>,
 ) -> Result<Json<Group>, StatusCode> {
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
@@ -89,8 +95,10 @@ pub async fn update_group(
         })?;
 
     rebuild_iam_index(&db, &state.iam_state)?;
+    trigger_config_sync(&state);
 
     tracing::info!("IAM group '{}' updated", group.name);
+    audit_log("update_group", "admin", &group.name, &headers);
     Ok(Json(group))
 }
 
@@ -98,6 +106,7 @@ pub async fn update_group(
 pub async fn delete_group(
     State(state): State<Arc<AdminState>>,
     axum::extract::Path(group_id): axum::extract::Path<i64>,
+    headers: HeaderMap,
 ) -> Result<StatusCode, StatusCode> {
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let db = db.lock().await;
@@ -108,8 +117,10 @@ pub async fn delete_group(
     })?;
 
     rebuild_iam_index(&db, &state.iam_state)?;
+    trigger_config_sync(&state);
 
     tracing::info!("IAM group {} deleted", group_id);
+    audit_log("delete_group", "admin", &group_id.to_string(), &headers);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -117,6 +128,7 @@ pub async fn delete_group(
 pub async fn add_group_member(
     State(state): State<Arc<AdminState>>,
     axum::extract::Path(group_id): axum::extract::Path<i64>,
+    headers: HeaderMap,
     Json(body): Json<AddGroupMemberRequest>,
 ) -> Result<StatusCode, StatusCode> {
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
@@ -133,8 +145,15 @@ pub async fn add_group_member(
     })?;
 
     rebuild_iam_index(&db, &state.iam_state)?;
+    trigger_config_sync(&state);
 
     tracing::info!("User {} added to group {}", body.user_id, group_id);
+    audit_log(
+        "add_member",
+        "admin",
+        &format!("group:{}+user:{}", group_id, body.user_id),
+        &headers,
+    );
     Ok(StatusCode::OK)
 }
 
@@ -142,6 +161,7 @@ pub async fn add_group_member(
 pub async fn remove_group_member(
     State(state): State<Arc<AdminState>>,
     axum::extract::Path((group_id, user_id)): axum::extract::Path<(i64, i64)>,
+    headers: HeaderMap,
 ) -> Result<StatusCode, StatusCode> {
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let db = db.lock().await;
@@ -157,7 +177,14 @@ pub async fn remove_group_member(
     })?;
 
     rebuild_iam_index(&db, &state.iam_state)?;
+    trigger_config_sync(&state);
 
     tracing::info!("User {} removed from group {}", user_id, group_id);
+    audit_log(
+        "remove_member",
+        "admin",
+        &format!("group:{}+user:{}", group_id, user_id),
+        &headers,
+    );
     Ok(StatusCode::NO_CONTENT)
 }

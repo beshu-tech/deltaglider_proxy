@@ -1,18 +1,35 @@
 //! Bucket-level S3 handlers: CREATE, DELETE, HEAD, LIST, and sub-operations
 //! (GetBucketLocation, GetBucketVersioning, ListMultipartUploads).
 
-use super::{xml_response, AppState, S3Error};
+use super::{audit_log_s3, xml_response, AppState, S3Error};
 use crate::api::extractors::ValidatedBucket;
 use crate::api::xml::{
     BucketInfo, ListBucketResult, ListBucketsResult, ListMultipartUploadsResult, S3Object,
 };
+use crate::iam::AuthenticatedUser;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
+
+/// When auth is enabled (AuthenticatedUser present in request extensions),
+/// return 403 AccessDenied instead of 404 NoSuchBucket to prevent bucket
+/// name enumeration by unauthenticated or unauthorized users.
+/// When auth is disabled (open access), return the original 404.
+fn no_such_bucket_or_access_denied(
+    bucket: &str,
+    auth_user: &Option<axum::Extension<AuthenticatedUser>>,
+) -> S3Error {
+    if auth_user.is_some() {
+        // Auth is enabled — hide whether the bucket exists
+        S3Error::AccessDenied
+    } else {
+        S3Error::NoSuchBucket(bucket.to_string())
+    }
+}
 
 /// Query parameters for bucket-level GET operations
 #[derive(Debug, serde::Deserialize, Default)]
@@ -61,13 +78,14 @@ pub async fn bucket_get_handler(
     State(state): State<Arc<AppState>>,
     ValidatedBucket(bucket): ValidatedBucket,
     Query(query): Query<BucketGetQuery>,
+    auth_user: Option<axum::Extension<AuthenticatedUser>>,
 ) -> Result<Response, S3Error> {
     // Check for tagging request
     if query.tagging.is_some() {
         info!("GET bucket tagging (stub): {}", bucket);
         let exists = state.engine.load().head_bucket(&bucket).await?;
         if !exists {
-            return Err(S3Error::NoSuchBucket(bucket.to_string()));
+            return Err(no_such_bucket_or_access_denied(&bucket, &auth_user));
         }
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <Tagging><TagSet/></Tagging>"#;
@@ -80,7 +98,7 @@ pub async fn bucket_get_handler(
         // Verify the bucket exists first; S3 returns 404 for ACL on non-existent buckets
         let exists = state.engine.load().head_bucket(&bucket).await?;
         if !exists {
-            return Err(S3Error::NoSuchBucket(bucket.to_string()));
+            return Err(no_such_bucket_or_access_denied(&bucket, &auth_user));
         }
         return get_acl_response();
     }
@@ -279,6 +297,8 @@ pub async fn create_bucket(
     State(state): State<Arc<AppState>>,
     Path(bucket): Path<String>,
     Query(query): Query<BucketGetQuery>,
+    auth_user: Option<axum::Extension<AuthenticatedUser>>,
+    headers: HeaderMap,
 ) -> Result<Response, S3Error> {
     // PUT /{bucket}?acl — accept and ignore (ACL stub)
     if query.acl.is_some() {
@@ -292,7 +312,7 @@ pub async fn create_bucket(
         // Verify the bucket exists first; S3 returns 404 for tagging on non-existent buckets
         let exists = state.engine.load().head_bucket(&bucket).await?;
         if !exists {
-            return Err(S3Error::NoSuchBucket(bucket.to_string()));
+            return Err(no_such_bucket_or_access_denied(&bucket, &auth_user));
         }
         return Ok(StatusCode::OK.into_response());
     }
@@ -313,6 +333,12 @@ pub async fn create_bucket(
 
     // Create the real bucket on the storage backend
     state.engine.load().create_bucket(&bucket).await?;
+
+    let user_name = auth_user
+        .as_ref()
+        .map(|u| u.name.as_str())
+        .unwrap_or("anonymous");
+    audit_log_s3("s3_create_bucket", user_name, &headers, &bucket, "");
 
     Ok((StatusCode::OK, [("Location", format!("/{}", bucket))], "").into_response())
 }
@@ -384,6 +410,8 @@ fn is_ip_format(s: &str) -> bool {
 pub async fn delete_bucket(
     State(state): State<Arc<AppState>>,
     ValidatedBucket(bucket): ValidatedBucket,
+    auth_user: Option<axum::Extension<AuthenticatedUser>>,
+    headers: HeaderMap,
 ) -> Result<Response, S3Error> {
     info!("DELETE bucket {}", bucket);
 
@@ -400,6 +428,12 @@ pub async fn delete_bucket(
     // Delete the real bucket on the storage backend
     state.engine.load().delete_bucket(&bucket).await?;
 
+    let user_name = auth_user
+        .as_ref()
+        .map(|u| u.name.as_str())
+        .unwrap_or("anonymous");
+    audit_log_s3("s3_delete_bucket", user_name, &headers, &bucket, "");
+
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -409,13 +443,14 @@ pub async fn delete_bucket(
 pub async fn head_bucket(
     State(state): State<Arc<AppState>>,
     ValidatedBucket(bucket): ValidatedBucket,
+    auth_user: Option<axum::Extension<AuthenticatedUser>>,
 ) -> Result<Response, S3Error> {
     info!("HEAD bucket {}", bucket);
 
     // Check if bucket exists on the storage backend
     let exists = state.engine.load().head_bucket(&bucket).await?;
     if !exists {
-        return Err(S3Error::NoSuchBucket(bucket.to_string()));
+        return Err(no_such_bucket_or_access_denied(&bucket, &auth_user));
     }
 
     Ok((StatusCode::OK, [("x-amz-bucket-region", "us-east-1")]).into_response())

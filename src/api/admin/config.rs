@@ -1,6 +1,9 @@
 //! Config handlers: get_config, update_config, change_password, test_s3_connection.
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse;
+use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
@@ -8,7 +11,7 @@ use tracing_subscriber::EnvFilter;
 use crate::deltaglider::DynEngine;
 use crate::iam::{AuthConfig, IamState};
 
-use super::{validate_password, AdminState};
+use super::{audit_log, trigger_config_sync, validate_password, AdminState};
 
 #[derive(Serialize)]
 pub struct ConfigResponse {
@@ -418,6 +421,7 @@ pub async fn update_config(
 /// PUT /api/admin/password — change bootstrap password.
 pub async fn change_password(
     State(state): State<Arc<AdminState>>,
+    headers: HeaderMap,
     Json(body): Json<PasswordChangeRequest>,
 ) -> impl IntoResponse {
     let current_hash = state.password_hash.read().clone();
@@ -496,6 +500,8 @@ pub async fn change_password(
                 .into_response();
         }
         tracing::info!("Config DB re-encrypted with new bootstrap password hash");
+        // Upload re-encrypted DB to S3
+        trigger_config_sync(&state);
     }
 
     // Update in-memory only after DB rekey succeeded
@@ -512,6 +518,8 @@ pub async fn change_password(
         let mut cfg = state.config.write().await;
         cfg.bootstrap_password_hash = Some(new_hash);
     }
+
+    audit_log("change_password", "bootstrap", "", &headers);
 
     (
         StatusCode::OK,
