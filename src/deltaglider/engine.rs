@@ -1037,6 +1037,90 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
     }
 
+    /// Retrieve a byte range of a passthrough object with streaming support.
+    ///
+    /// Only passthrough objects benefit from range passthrough (the backend streams
+    /// just the requested bytes). Delta/reference objects need full reconstruction
+    /// regardless, so this method falls back to `retrieve_stream` for those.
+    ///
+    /// Returns `Ok(Some((stream, content_length)))` when the range was handled
+    /// natively by the backend (passthrough only). Returns `Ok(None)` when the
+    /// caller should fall back to the buffered path (delta/reference, or
+    /// unmanaged objects where we don't know the storage type up front).
+    #[instrument(skip(self))]
+    #[allow(clippy::type_complexity)]
+    pub async fn retrieve_stream_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<
+        Option<(
+            BoxStream<'static, Result<Bytes, StorageError>>,
+            u64,
+            FileMetadata,
+        )>,
+        EngineError,
+    > {
+        let (obj_key, deltaspace_id) = Self::validated_key(bucket, key)?;
+
+        // Check metadata cache first
+        let metadata = if let Some(cached) = self.metadata_cache.get(bucket, key) {
+            Some(cached)
+        } else {
+            self.resolve_metadata_with_migration(bucket, &deltaspace_id, &obj_key)
+                .await?
+        };
+
+        let metadata = match metadata {
+            Some(m) => {
+                self.metadata_cache.insert(bucket, key, m.clone());
+                m
+            }
+            None => {
+                // Unmanaged object — we don't know if it's passthrough.
+                // Signal caller to use the non-range path.
+                return Ok(None);
+            }
+        };
+
+        match &metadata.storage_info {
+            StorageInfo::Passthrough => {
+                let (stream, content_length) = self
+                    .storage
+                    .get_passthrough_stream_range(
+                        bucket,
+                        &deltaspace_id,
+                        &obj_key.filename,
+                        start,
+                        end,
+                    )
+                    .await?;
+
+                if content_length == 0 {
+                    // Backend returned full stream (default impl), signal caller
+                    // to fall back to the buffered slicing path.
+                    return Ok(None);
+                }
+
+                debug!(
+                    "Streaming passthrough range for {} (bytes {}-{}, {} bytes)",
+                    obj_key.full_key(),
+                    start,
+                    end,
+                    content_length
+                );
+                Ok(Some((stream, content_length, metadata)))
+            }
+            StorageInfo::Reference { .. } | StorageInfo::Delta { .. } => {
+                // Delta/reference objects need full reconstruction — signal
+                // caller to use the buffered path.
+                Ok(None)
+            }
+        }
+    }
+
     /// Fetch and reconstruct a reference or delta object, with checksum verification.
     /// Returns `(data, cache_hit)` where `cache_hit` is `Some(bool)` for delta objects.
     async fn retrieve_buffered(

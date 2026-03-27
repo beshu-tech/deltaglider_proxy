@@ -1157,6 +1157,59 @@ impl StorageBackend for S3Backend {
         Ok(Box::pin(stream))
     }
 
+    #[instrument(skip(self))]
+    async fn get_passthrough_stream_range(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), StorageError> {
+        let key = self.passthrough_key(prefix, filename);
+        let range_header = format!("bytes={}-{}", start, end);
+        let response = self
+            .client
+            .get_object()
+            .bucket(bucket)
+            .key(&key)
+            .range(&range_header)
+            .send()
+            .await
+            .map_err(|e| {
+                if let SdkError::ServiceError(service_error) = &e {
+                    if matches!(
+                        service_error.err(),
+                        aws_sdk_s3::operation::get_object::GetObjectError::NoSuchKey(_)
+                    ) {
+                        return StorageError::NotFound(key.clone());
+                    }
+                }
+                Self::classify_s3_error(bucket, &e, S3Op::GetObject)
+            })?;
+
+        let content_length = response.content_length.unwrap_or(0) as u64;
+        debug!(
+            "S3 GET range stream {}/{} ({}, {} bytes)",
+            bucket, key, range_header, content_length
+        );
+
+        let stream = futures::stream::unfold(response.body, |mut body| async {
+            match body.try_next().await {
+                Ok(Some(chunk)) => Some((Ok(chunk), body)),
+                Ok(None) => None,
+                Err(e) => Some((
+                    Err(StorageError::S3(format!(
+                        "Failed to read response body: {}",
+                        e
+                    ))),
+                    body,
+                )),
+            }
+        });
+        Ok((Box::pin(stream), content_length))
+    }
+
     // === Scanning operations ===
 
     #[instrument(skip(self))]

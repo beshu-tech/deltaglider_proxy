@@ -3,7 +3,8 @@
 use super::bucket::get_acl_response;
 use super::object_helpers::{
     apply_response_overrides, build_range_response, check_conditionals, copy_object_inner,
-    decode_body, parse_range_header, put_object_inner, upload_part, upload_part_copy,
+    decode_body, parse_range_header, put_object_inner, resolve_range, upload_part,
+    upload_part_copy,
 };
 use super::{audit_log_s3, build_object_headers, xml_response, AppState, ObjectQuery, S3Error};
 use crate::deltaglider::RetrieveResponse;
@@ -150,6 +151,72 @@ pub async fn get_object(
         .and_then(|v| v.to_str().ok())
         .and_then(parse_range_header);
 
+    // For Range requests on passthrough objects, try the range-aware path first
+    // to avoid buffering the entire file.
+    if let Some(ref range) = range_request {
+        // We need to know the total file size to resolve the range.
+        // HEAD is cheap and gives us the metadata we need.
+        let metadata = state.engine.load().head(&bucket, &key).await?;
+
+        // Check conditional headers before fetching body
+        if let Some(err) = check_conditionals(&req_headers, &metadata) {
+            return Err(err);
+        }
+
+        let total = metadata.file_size;
+        let (start, end) = resolve_range(range, total).ok_or(S3Error::InvalidRange)?;
+
+        // Try range-aware streaming (only succeeds for passthrough objects)
+        if let Some((stream, content_length, meta)) = state
+            .engine
+            .load()
+            .retrieve_stream_range(&bucket, &key, start, end)
+            .await?
+        {
+            // Build 206 Partial Content response from the range stream
+            let mut headers = build_object_headers(&meta);
+            let range_len = content_length;
+            headers.insert(
+                "Content-Length",
+                HeaderValue::from_str(&range_len.to_string()).unwrap(),
+            );
+            headers.insert(
+                "Content-Range",
+                HeaderValue::from_str(&format!("bytes {}-{}/{}", start, end, total)).unwrap(),
+            );
+            apply_response_overrides(&mut headers, &query);
+            let body = Body::from_stream(stream);
+            return Ok((StatusCode::PARTIAL_CONTENT, headers, body).into_response());
+        }
+
+        // Fall through: delta/reference/unmanaged objects need full retrieval
+        // then buffered slicing.
+        let response = state.engine.load().retrieve_stream(&bucket, &key).await?;
+        return match response {
+            RetrieveResponse::Streamed {
+                stream, metadata, ..
+            } => {
+                use futures::TryStreamExt;
+                let chunks: Vec<Bytes> = stream
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+                    .try_collect()
+                    .await
+                    .map_err(|e| S3Error::InternalError(e.to_string()))?;
+                let total_len: usize = chunks.iter().map(|b| b.len()).sum();
+                let mut data = Vec::with_capacity(total_len);
+                for chunk in &chunks {
+                    data.extend_from_slice(chunk);
+                }
+                build_range_response(data, &metadata, range, None, &query)
+            }
+            RetrieveResponse::Buffered {
+                data,
+                metadata,
+                cache_hit,
+            } => build_range_response(data, &metadata, range, cache_hit, &query),
+        };
+    }
+
     let response = state.engine.load().retrieve_stream(&bucket, &key).await?;
 
     match response {
@@ -166,22 +233,6 @@ pub async fn get_object(
             // Check conditional headers before streaming body
             if let Some(err) = check_conditionals(&req_headers, &metadata) {
                 return Err(err);
-            }
-
-            // For streamed responses with Range requests, we need to buffer first
-            if let Some(ref range) = range_request {
-                use futures::TryStreamExt;
-                let chunks: Vec<Bytes> = stream
-                    .map_err(|e| std::io::Error::other(e.to_string()))
-                    .try_collect()
-                    .await
-                    .map_err(|e| S3Error::InternalError(e.to_string()))?;
-                let total_len: usize = chunks.iter().map(|b| b.len()).sum();
-                let mut data = Vec::with_capacity(total_len);
-                for chunk in &chunks {
-                    data.extend_from_slice(chunk);
-                }
-                return build_range_response(data, &metadata, range, None, &query);
             }
 
             let mut headers = build_object_headers(&metadata);
