@@ -491,8 +491,6 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     .inc()
             });
             let _guard = self.acquire_prefix_lock(&deltaspace_id).await;
-            self.delete_delta_idempotent(bucket, &deltaspace_id, &obj_key.filename)
-                .await?;
             let ctx = StoreContext {
                 bucket,
                 obj_key: &obj_key,
@@ -504,6 +502,16 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 user_metadata,
             };
             let result = self.store_passthrough(ctx).await?;
+            // Write succeeded — now safe to clean up old delta variant
+            if let Err(e) = self
+                .delete_delta_idempotent(bucket, &deltaspace_id, &obj_key.filename)
+                .await
+            {
+                warn!(
+                    "Failed to clean up old delta after passthrough write: {}",
+                    e
+                );
+            }
             self.metadata_cache
                 .insert(bucket, key, result.metadata.clone());
             return Ok(result);
@@ -619,17 +627,27 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     .with_label_values(&["passthrough"])
                     .inc()
             });
-            // Delete storage BEFORE invalidating cache — prevents a concurrent GET
-            // from loading the reference between invalidation and deletion, then
-            // caching it as stale data.
-            self.storage
-                .delete_reference(ctx.bucket, ctx.deltaspace_id)
-                .await?;
-            self.delete_delta_idempotent(ctx.bucket, ctx.deltaspace_id, &ctx.obj_key.filename)
-                .await?;
-            let cache_key = Self::cache_key(ctx.bucket, ctx.deltaspace_id);
+            // Write passthrough first, then clean up old delta/reference.
+            // This prevents transient 404s on concurrent GETs during strategy transition.
+            let del_bucket = ctx.bucket.to_string();
+            let del_dsid = ctx.deltaspace_id.to_string();
+            let del_filename = ctx.obj_key.filename.clone();
+            let result = self.store_passthrough(ctx).await?;
+            let cache_key = Self::cache_key(&del_bucket, &del_dsid);
             self.cache.invalidate(&cache_key);
-            return self.store_passthrough(ctx).await;
+            if let Err(e) = self.storage.delete_reference(&del_bucket, &del_dsid).await {
+                warn!(
+                    "Failed to clean up reference after passthrough write: {}",
+                    e
+                );
+            }
+            if let Err(e) = self
+                .delete_delta_idempotent(&del_bucket, &del_dsid, &del_filename)
+                .await
+            {
+                warn!("Failed to clean up delta after passthrough write: {}", e);
+            }
+            return Ok(result);
         }
 
         // Commit as delta
@@ -650,8 +668,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         );
         metadata.user_metadata = ctx.user_metadata;
 
-        self.delete_passthrough_idempotent(ctx.bucket, ctx.deltaspace_id, &ctx.obj_key.filename)
-            .await?;
+        // Write delta first, then clean up old passthrough variant
         self.storage
             .put_delta(
                 ctx.bucket,
@@ -661,6 +678,15 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 &metadata,
             )
             .await?;
+        if let Err(e) = self
+            .delete_passthrough_idempotent(ctx.bucket, ctx.deltaspace_id, &ctx.obj_key.filename)
+            .await
+        {
+            warn!(
+                "Failed to clean up old passthrough after delta write: {}",
+                e
+            );
+        }
 
         Ok(StoreResult {
             metadata,
@@ -748,8 +774,6 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         );
 
         let _guard = self.acquire_prefix_lock(&deltaspace_id).await;
-        self.delete_delta_idempotent(bucket, &deltaspace_id, &obj_key.filename)
-            .await?;
 
         let mut metadata = FileMetadata::new_passthrough(
             obj_key.filename.clone(),
@@ -763,6 +787,16 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.storage
             .put_passthrough_chunked(bucket, &deltaspace_id, &obj_key.filename, chunks, &metadata)
             .await?;
+        // Write succeeded — now safe to clean up old delta variant
+        if let Err(e) = self
+            .delete_delta_idempotent(bucket, &deltaspace_id, &obj_key.filename)
+            .await
+        {
+            warn!(
+                "Failed to clean up old delta after chunked passthrough write: {}",
+                e
+            );
+        }
 
         let result = StoreResult {
             metadata,
