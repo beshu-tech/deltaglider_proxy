@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
+use subtle::ConstantTimeEq;
+
 use crate::api::handlers::AppState;
 use crate::config::SharedConfig;
 use crate::config_db::ConfigDb;
@@ -18,7 +20,9 @@ use crate::deltaglider::DynEngine;
 use crate::iam::{
     self, AuthConfig, Group, IamIndex, IamState, IamUser, Permission, SharedIamState,
 };
+use crate::rate_limiter::{self, RateLimiter};
 use crate::session::SessionStore;
+use crate::usage_scanner::UsageScanner;
 
 /// Type alias for the tracing reload handle.
 pub type LogReloadHandle =
@@ -34,6 +38,10 @@ pub struct AdminState {
     pub iam_state: SharedIamState,
     /// Encrypted config database for IAM users (None in legacy/open-access mode).
     pub config_db: Option<tokio::sync::Mutex<ConfigDb>>,
+    /// Background usage scanner for computing prefix sizes.
+    pub usage_scanner: Arc<UsageScanner>,
+    /// Per-IP rate limiter for login endpoints and auth failures.
+    pub rate_limiter: RateLimiter,
 }
 
 #[derive(Deserialize)]
@@ -142,10 +150,16 @@ pub struct PasswordChangeResponse {
 }
 
 /// Format a session cookie for setting a login token.
+/// Max-Age matches session TTL (default 4h = 14400s, overridable via DGP_SESSION_TTL_HOURS).
 fn session_cookie(token: &str) -> String {
+    let ttl_hours: u64 = std::env::var("DGP_SESSION_TTL_HOURS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    let max_age = ttl_hours * 3600;
     format!(
-        "dgp_session={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400",
-        token
+        "dgp_session={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+        token, max_age
     )
 }
 
@@ -154,11 +168,69 @@ fn session_cookie_clear() -> &'static str {
     "dgp_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
 }
 
+/// Common password validation for both admin API and CLI.
+/// Returns `Ok(())` if valid, `Err(message)` if invalid.
+pub fn validate_password(password: &str) -> Result<(), &'static str> {
+    if password.len() < 12 {
+        return Err("Password must be at least 12 characters");
+    }
+    if password.len() > 128 {
+        return Err("Password too long (max 128 characters)");
+    }
+
+    // Top 20 common passwords (12+ chars to match minimum length)
+    const COMMON_PASSWORDS: &[&str] = &[
+        "password1234",
+        "123456789012",
+        "admin1234567",
+        "admin123456!",
+        "password1234!",
+        "qwerty123456",
+        "letmein12345",
+        "welcome12345",
+        "monkey1234567",
+        "dragon1234567",
+        "master1234567",
+        "1234567890ab",
+        "changeme1234",
+        "password12345",
+        "adminadminadmin",
+        "abcdefghijkl",
+        "aaaaaaaaaaaa",
+        "123456789abc",
+        "passw0rd1234",
+        "p@ssword1234",
+    ];
+
+    let lower = password.to_lowercase();
+    if COMMON_PASSWORDS.iter().any(|p| lower == *p) {
+        return Err("Password is too common");
+    }
+
+    Ok(())
+}
+
 /// POST /api/admin/login — verify password, set session cookie.
 pub async fn login(
     State(state): State<Arc<AdminState>>,
+    req_headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> impl IntoResponse {
+    // Extract client IP for rate limiting
+    let client_ip = rate_limiter::extract_client_ip(&req_headers)
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+
+    // Check rate limit before processing
+    if state.rate_limiter.is_limited(&client_ip) {
+        tracing::warn!("Rate limited login attempt from {}", client_ip);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            HeaderMap::new(),
+            Json(LoginResponse { ok: false }),
+        )
+            .into_response();
+    }
+
     let hash = state.password_hash.read().clone();
     let valid = match bcrypt::verify(&body.password, &hash) {
         Ok(v) => v,
@@ -174,6 +246,12 @@ pub async fn login(
     };
 
     if !valid {
+        let locked = state.rate_limiter.record_failure(&client_ip);
+        tracing::warn!(
+            "Failed login attempt from {} (locked={})",
+            client_ip,
+            locked
+        );
         return (
             StatusCode::UNAUTHORIZED,
             HeaderMap::new(),
@@ -182,7 +260,11 @@ pub async fn login(
             .into_response();
     }
 
-    let token = state.sessions.create_session();
+    // Successful login — reset rate limiter for this IP
+    state.rate_limiter.record_success(&client_ip);
+    let token = state
+        .sessions
+        .create_session(rate_limiter::extract_client_ip(&req_headers));
 
     let mut headers = HeaderMap::new();
     headers.insert(header::SET_COOKIE, session_cookie(&token).parse().unwrap());
@@ -211,8 +293,9 @@ pub async fn check_session(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let client_ip = rate_limiter::extract_client_ip(&headers);
     let valid = extract_session_token(&headers)
-        .map(|t| state.sessions.validate(&t))
+        .map(|t| state.sessions.validate(&t, client_ip))
         .unwrap_or(false);
 
     Json(SessionResponse { valid })
@@ -248,7 +331,7 @@ pub async fn whoami(
                     params
                         .secret_access_key
                         .as_deref()
-                        .map(|sk| sk == u.secret_access_key)
+                        .map(|sk| bool::from(sk.as_bytes().ct_eq(u.secret_access_key.as_bytes())))
                         .unwrap_or(false)
                 })
                 .map(|u| WhoamiUser {
@@ -268,19 +351,52 @@ pub async fn whoami(
 /// Requires both access_key_id AND secret_access_key for authentication.
 pub async fn login_as(
     State(state): State<Arc<AdminState>>,
+    req_headers: HeaderMap,
     Json(body): Json<LoginAsRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
+    // Extract client IP for rate limiting
+    let client_ip = rate_limiter::extract_client_ip(&req_headers)
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+
+    // Check rate limit before processing
+    if state.rate_limiter.is_limited(&client_ip) {
+        tracing::warn!("Rate limited login-as attempt from {}", client_ip);
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+
     let iam_state = state.iam_state.load();
     let user = match &**iam_state {
         IamState::Iam(index) => index.get(&body.access_key_id),
         _ => None,
     };
 
-    let user = user.ok_or(StatusCode::FORBIDDEN)?;
+    let user = match user {
+        Some(u) => u,
+        None => {
+            state.rate_limiter.record_failure(&client_ip);
+            tracing::warn!(
+                "Failed login-as attempt from {} (unknown access key '{}')",
+                client_ip,
+                body.access_key_id
+            );
+            return Err(StatusCode::FORBIDDEN);
+        }
+    };
 
     // Verify the secret key matches (critical — prevents auth bypass)
-    if user.secret_access_key != body.secret_access_key {
-        tracing::warn!("login-as: secret mismatch for '{}'", body.access_key_id);
+    // Use constant-time comparison to prevent timing side-channel attacks.
+    if user
+        .secret_access_key
+        .as_bytes()
+        .ct_ne(body.secret_access_key.as_bytes())
+        .into()
+    {
+        state.rate_limiter.record_failure(&client_ip);
+        tracing::warn!(
+            "Failed login-as attempt from {} (secret mismatch for '{}')",
+            client_ip,
+            body.access_key_id
+        );
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -288,7 +404,12 @@ pub async fn login_as(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let token = state.sessions.create_session();
+    // Successful login — reset rate limiter
+    state.rate_limiter.record_success(&client_ip);
+
+    let token = state
+        .sessions
+        .create_session(rate_limiter::extract_client_ip(&req_headers));
     tracing::info!(
         "Admin session created via login-as for '{}' ({})",
         user.name,
@@ -659,6 +780,18 @@ pub async fn change_password(
             .into_response();
     }
 
+    // Validate new password quality
+    if let Err(msg) = validate_password(&body.new_password) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(PasswordChangeResponse {
+                ok: false,
+                error: Some(msg.to_string()),
+            }),
+        )
+            .into_response();
+    }
+
     let new_hash = match bcrypt::hash(&body.new_password, bcrypt::DEFAULT_COST) {
         Ok(h) => h,
         Err(e) => {
@@ -870,8 +1003,9 @@ pub async fn require_session(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> impl IntoResponse {
+    let client_ip = rate_limiter::extract_client_ip(&headers);
     let valid = extract_session_token(&headers)
-        .map(|t| state.sessions.validate(&t))
+        .map(|t| state.sessions.validate(&t, client_ip))
         .unwrap_or(false);
 
     if !valid {
@@ -1377,5 +1511,62 @@ mod tests {
 
         // No cookie header at all
         assert!(extract_session_token(&HeaderMap::new()).is_none());
+    }
+}
+
+// ============================================================================
+// Usage Scanner API
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct ScanUsageRequest {
+    bucket: String,
+    prefix: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct UsageQuery {
+    bucket: String,
+    prefix: Option<String>,
+}
+
+/// POST /_/api/admin/usage/scan — trigger a background usage scan.
+pub async fn scan_usage(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<ScanUsageRequest>,
+) -> impl IntoResponse {
+    let prefix = req.prefix.unwrap_or_default();
+    let started = state
+        .usage_scanner
+        .enqueue_scan(req.bucket, prefix, state.s3_state.clone());
+    if started {
+        (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({"status": "scan_started"})),
+        )
+    } else {
+        (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({"status": "scan_already_running"})),
+        )
+    }
+}
+
+/// GET /_/api/admin/usage?bucket=X&prefix=Y — return cached usage entry.
+pub async fn get_usage(
+    State(state): State<Arc<AdminState>>,
+    axum::extract::Query(q): axum::extract::Query<UsageQuery>,
+) -> impl IntoResponse {
+    let prefix = q.prefix.unwrap_or_default();
+    match state.usage_scanner.get(&q.bucket, &prefix) {
+        Some(entry) => (StatusCode::OK, Json(serde_json::json!(entry))).into_response(),
+        None => {
+            let scanning = state.usage_scanner.is_scanning(&q.bucket, &prefix);
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "not_cached", "scanning": scanning})),
+            )
+                .into_response()
+        }
     }
 }

@@ -48,7 +48,7 @@ fn initiate_multipart_upload(
     let user_metadata = extract_user_metadata(headers);
     let upload_id = state
         .multipart
-        .create(bucket, key, content_type, user_metadata);
+        .create(bucket, key, content_type, user_metadata)?;
 
     let xml = InitiateMultipartUploadResult {
         bucket: bucket.to_string(),

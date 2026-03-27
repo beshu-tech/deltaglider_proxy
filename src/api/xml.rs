@@ -396,6 +396,31 @@ impl CopyObjectResult {
 }
 
 // ============================================================================
+// CopyPartResult Response (UploadPartCopy)
+// ============================================================================
+
+/// UploadPartCopy response
+#[derive(Debug, Clone)]
+pub struct CopyPartResult {
+    pub etag: String,
+    pub last_modified: DateTime<Utc>,
+}
+
+impl CopyPartResult {
+    pub fn to_xml(&self) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<CopyPartResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <ETag>{}</ETag>
+  <LastModified>{}</LastModified>
+</CopyPartResult>"#,
+            escape_xml(&self.etag),
+            self.last_modified.format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        )
+    }
+}
+
+// ============================================================================
 // ListBuckets Response
 // ============================================================================
 

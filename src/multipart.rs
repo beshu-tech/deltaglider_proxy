@@ -51,10 +51,20 @@ pub struct CompletedParts {
     pub user_metadata: HashMap<String, String>,
 }
 
+/// Default maximum number of concurrent multipart uploads.
+/// Overridable via `DGP_MAX_MULTIPART_UPLOADS` env var.
+fn default_max_uploads() -> usize {
+    std::env::var("DGP_MAX_MULTIPART_UPLOADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000)
+}
+
 /// Thread-safe in-memory store for multipart upload state
 pub struct MultipartStore {
     uploads: RwLock<HashMap<String, MultipartUpload>>,
     max_object_size: u64,
+    max_uploads: usize,
     id_counter: AtomicU64,
 }
 
@@ -63,18 +73,20 @@ impl MultipartStore {
         Self {
             uploads: RwLock::new(HashMap::new()),
             max_object_size,
+            max_uploads: default_max_uploads(),
             id_counter: AtomicU64::new(0),
         }
     }
 
     /// Create a new multipart upload, returns the upload ID.
+    /// Returns `S3Error::SlowDown` if the maximum number of concurrent uploads is reached.
     pub fn create(
         &self,
         bucket: &str,
         key: &str,
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
-    ) -> String {
+    ) -> Result<String, S3Error> {
         let counter = self.id_counter.fetch_add(1, Ordering::SeqCst);
         let now = Utc::now();
         let nanos = now.timestamp_nanos_opt().unwrap_or(0);
@@ -88,6 +100,16 @@ impl MultipartStore {
         let hash = hasher.finalize();
         let upload_id = hex::encode(&hash[..16]); // 32 hex chars
 
+        let mut uploads = self.uploads.write();
+
+        // Enforce maximum concurrent uploads to prevent resource exhaustion
+        if uploads.len() >= self.max_uploads {
+            return Err(S3Error::SlowDown(format!(
+                "Too many concurrent multipart uploads (max {})",
+                self.max_uploads
+            )));
+        }
+
         let upload = MultipartUpload {
             upload_id: upload_id.clone(),
             bucket: bucket.to_string(),
@@ -98,8 +120,8 @@ impl MultipartStore {
             parts: HashMap::new(),
         };
 
-        self.uploads.write().insert(upload_id.clone(), upload);
-        upload_id
+        uploads.insert(upload_id.clone(), upload);
+        Ok(upload_id)
     }
 
     /// Upload a part, returns the quoted ETag (MD5 hex).
@@ -394,7 +416,9 @@ mod tests {
     #[test]
     fn test_create_and_upload_part() {
         let store = MultipartStore::new(100 * 1024 * 1024);
-        let upload_id = store.create("bucket", "key.bin", None, HashMap::new());
+        let upload_id = store
+            .create("bucket", "key.bin", None, HashMap::new())
+            .unwrap();
 
         let data = Bytes::from(vec![0u8; 1024]);
         let etag = store
@@ -407,7 +431,9 @@ mod tests {
     #[test]
     fn test_complete_roundtrip() {
         let store = MultipartStore::new(100 * 1024 * 1024);
-        let upload_id = store.create("bucket", "key.bin", None, HashMap::new());
+        let upload_id = store
+            .create("bucket", "key.bin", None, HashMap::new())
+            .unwrap();
 
         let part1 = Bytes::from(vec![1u8; 100]);
         let part2 = Bytes::from(vec![2u8; 200]);
@@ -431,7 +457,9 @@ mod tests {
     #[test]
     fn test_abort() {
         let store = MultipartStore::new(100 * 1024 * 1024);
-        let upload_id = store.create("bucket", "key.bin", None, HashMap::new());
+        let upload_id = store
+            .create("bucket", "key.bin", None, HashMap::new())
+            .unwrap();
         store.abort(&upload_id, "bucket", "key.bin").unwrap();
 
         let result = store.upload_part(
@@ -447,7 +475,9 @@ mod tests {
     #[test]
     fn test_bucket_key_mismatch() {
         let store = MultipartStore::new(100 * 1024 * 1024);
-        let upload_id = store.create("bucket-a", "key.bin", None, HashMap::new());
+        let upload_id = store
+            .create("bucket-a", "key.bin", None, HashMap::new())
+            .unwrap();
 
         let result = store.upload_part(
             &upload_id,
@@ -462,7 +492,9 @@ mod tests {
     #[test]
     fn test_invalid_part_number() {
         let store = MultipartStore::new(100 * 1024 * 1024);
-        let upload_id = store.create("bucket", "key.bin", None, HashMap::new());
+        let upload_id = store
+            .create("bucket", "key.bin", None, HashMap::new())
+            .unwrap();
 
         let result = store.upload_part(
             &upload_id,
@@ -486,7 +518,9 @@ mod tests {
     #[test]
     fn test_list_parts() {
         let store = MultipartStore::new(100 * 1024 * 1024);
-        let upload_id = store.create("bucket", "key.bin", None, HashMap::new());
+        let upload_id = store
+            .create("bucket", "key.bin", None, HashMap::new())
+            .unwrap();
 
         for i in 1..=3 {
             store
@@ -510,7 +544,9 @@ mod tests {
     #[test]
     fn test_overwrite_part() {
         let store = MultipartStore::new(100 * 1024 * 1024);
-        let upload_id = store.create("bucket", "key.bin", None, HashMap::new());
+        let upload_id = store
+            .create("bucket", "key.bin", None, HashMap::new())
+            .unwrap();
 
         let etag1 = store
             .upload_part(
@@ -536,5 +572,26 @@ mod tests {
         let parts = store.list_parts(&upload_id, "bucket", "key.bin").unwrap();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].etag, etag2);
+    }
+
+    #[test]
+    fn test_max_uploads_limit() {
+        let store = MultipartStore::new(100 * 1024 * 1024);
+        // Override max_uploads for testing
+        let store = MultipartStore {
+            max_uploads: 3,
+            ..store
+        };
+
+        // Create 3 uploads (at limit)
+        for i in 0..3 {
+            store
+                .create("bucket", &format!("key{}.bin", i), None, HashMap::new())
+                .unwrap();
+        }
+
+        // 4th upload should fail
+        let result = store.create("bucket", "key3.bin", None, HashMap::new());
+        assert!(result.is_err());
     }
 }

@@ -3,10 +3,11 @@
 use super::bucket::get_acl_response;
 use super::object_helpers::{
     apply_response_overrides, build_range_response, check_conditionals, copy_object_inner,
-    decode_body, parse_range_header, put_object_inner, upload_part,
+    decode_body, parse_range_header, put_object_inner, upload_part, upload_part_copy,
 };
 use super::{build_object_headers, xml_response, AppState, ObjectQuery, S3Error};
 use crate::deltaglider::RetrieveResponse;
+use crate::iam::AuthenticatedUser;
 use axum::body::{Body, Bytes};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -32,19 +33,36 @@ pub async fn put_object_or_copy(
     State(state): State<Arc<AppState>>,
     ValidatedPath { bucket, key }: ValidatedPath,
     Query(query): Query<ObjectQuery>,
+    auth_user: Option<axum::Extension<AuthenticatedUser>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, S3Error> {
+    let auth_user = auth_user.map(|axum::Extension(u)| u);
+
     // PUT /{bucket}/{key}?acl — accept and ignore (ACL stub)
     if query.acl.is_some() {
         info!("PUT object ACL (stub): {}/{}", bucket, key);
         return Ok(StatusCode::OK.into_response());
     }
 
+    // PUT /{bucket}/{key}?tagging — accept and ignore (tagging stub)
+    if query.tagging.is_some() {
+        info!("PUT object tagging (stub): {}/{}", bucket, key);
+        // Verify the object exists first; S3 returns 404 for tagging on non-existent objects
+        state.engine.load().head(&bucket, &key).await?;
+        return Ok(StatusCode::OK.into_response());
+    }
+
     let decoded_body = decode_body(&headers, body)?;
 
-    // Multipart upload part
+    // Multipart upload part (with optional copy-source)
     if let (Some(part_num), Some(upload_id)) = (&query.part_number, &query.upload_id) {
+        if headers.contains_key("x-amz-copy-source") {
+            return upload_part_copy(
+                &state, &bucket, &key, &headers, *part_num, upload_id, &auth_user,
+            )
+            .await;
+        }
         return upload_part(
             &state,
             &bucket,
@@ -58,7 +76,7 @@ pub async fn put_object_or_copy(
 
     // Copy vs direct put
     if headers.contains_key("x-amz-copy-source") {
-        copy_object_inner(&state, &bucket, &key, &headers).await
+        copy_object_inner(&state, &bucket, &key, &headers, &auth_user).await
     } else {
         put_object_inner(&state, &bucket, &key, &headers, &decoded_body).await
     }
@@ -78,6 +96,16 @@ pub async fn get_object(
     Query(query): Query<ObjectQuery>,
     req_headers: HeaderMap,
 ) -> Result<Response, S3Error> {
+    // GET /{bucket}/{key}?tagging — return empty tagging response
+    if query.tagging.is_some() {
+        info!("GET object tagging (stub): {}/{}", bucket, key);
+        // Verify the object exists first; S3 returns 404 for tagging on non-existent objects
+        state.engine.load().head(&bucket, &key).await?;
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Tagging><TagSet/></Tagging>"#;
+        return Ok(xml_response(xml));
+    }
+
     // GET /{bucket}/{key}?acl — return canned ACL response
     if query.acl.is_some() {
         info!("GET object ACL: {}/{}", bucket, key);
@@ -220,6 +248,14 @@ pub async fn delete_object(
     ValidatedPath { bucket, key }: ValidatedPath,
     Query(query): Query<ObjectQuery>,
 ) -> Result<Response, S3Error> {
+    // DELETE /{bucket}/{key}?tagging — no-op (tagging stub)
+    if query.tagging.is_some() {
+        info!("DELETE object tagging (stub): {}/{}", bucket, key);
+        // Verify the object exists first; S3 returns 404 for tagging on non-existent objects
+        state.engine.load().head(&bucket, &key).await?;
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+
     // AbortMultipartUpload
     if let Some(upload_id) = &query.upload_id {
         info!(

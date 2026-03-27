@@ -1,28 +1,15 @@
 import { useState, useEffect } from 'react';
-import { Input, Switch, Button, Alert, Space, Divider, Typography, Segmented, Tooltip, Tag, Checkbox } from 'antd';
-import { PlusOutlined, DeleteOutlined, ThunderboltOutlined, CheckCircleFilled, MinusCircleFilled, CrownFilled } from '@ant-design/icons';
-import type { IamUser, IamPermission, IamGroup, CreateUserRequest, UpdateUserRequest, CannedPolicy } from '../adminApi';
+import { Input, Switch, Button, Alert, Space, Divider, Typography, Tag } from 'antd';
+import { ThunderboltOutlined, CheckCircleFilled, MinusCircleFilled, CrownFilled } from '@ant-design/icons';
+import type { IamUser, IamGroup, CreateUserRequest, UpdateUserRequest, CannedPolicy } from '../adminApi';
 import { createUser, updateUser, deleteUser, rotateUserKeys, getCannedPolicies, getGroups } from '../adminApi';
 import { setCredentials } from '../s3client';
 import { useCardStyles } from './shared-styles';
 import { useColors } from '../ThemeContext';
+import PermissionEditor, { permissionsToRows, rowsToPermissions } from './PermissionEditor';
+import type { PermissionRow } from './PermissionEditor';
 
 const { Text, Title } = Typography;
-
-const ACTION_OPTIONS = [
-  { label: 'Read (GET/HEAD)', value: 'read' },
-  { label: 'Write (PUT)', value: 'write' },
-  { label: 'Delete (DELETE)', value: 'delete' },
-  { label: 'List (ListObjects)', value: 'list' },
-  { label: 'Admin (Bucket ops)', value: 'admin' },
-  { label: 'All (*)', value: '*' },
-];
-
-interface PermissionRow {
-  effect: string; // "Allow" or "Deny"
-  actions: string[];
-  resources: string;
-}
 
 // Fallback presets used if the API is unavailable
 const FALLBACK_PRESETS: Record<string, PermissionRow[]> = {
@@ -30,21 +17,6 @@ const FALLBACK_PRESETS: Record<string, PermissionRow[]> = {
   'Read/Write': [{ effect: 'Allow', actions: ['read', 'write', 'list'], resources: '*' }],
   'Read Only': [{ effect: 'Allow', actions: ['read', 'list'], resources: '*' }],
 };
-
-function permissionsToRows(perms: IamPermission[]): PermissionRow[] {
-  return perms.map(p => ({ effect: p.effect || 'Allow', actions: [...p.actions], resources: p.resources.join(', ') }));
-}
-
-function rowsToPermissions(rows: PermissionRow[]): IamPermission[] {
-  return rows
-    .filter(r => r.actions.length > 0 && r.resources.trim() !== '')
-    .map(r => ({
-      id: 0,
-      effect: r.effect || 'Allow',
-      actions: r.actions,
-      resources: r.resources.split(',').map(s => s.trim()).filter(Boolean),
-    }));
-}
 
 function generateId(): string {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
@@ -337,86 +309,7 @@ export default function UserForm({ user, onSaved, onDeleted, onCancel, onCreated
           })}
       </div>
 
-      {permissions.map((row, i) => {
-        const isDeny = row.effect === 'Deny';
-        return (
-        <div key={i} style={{
-          border: `1px solid ${isDeny ? '#ff4d4f40' : colors.BORDER}`,
-          borderLeft: isDeny ? '3px solid #ff4d4f' : `1px solid ${colors.BORDER}`,
-          borderRadius: 8,
-          padding: 12,
-          marginBottom: 8,
-          background: isDeny ? '#ff4d4f08' : colors.BG_BASE,
-        }}>
-          <div style={{ marginBottom: 8, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <Tooltip title="Deny rules override Allow rules">
-              <Segmented
-                size="small"
-                value={row.effect || 'Allow'}
-                onChange={v => {
-                  const updated = [...permissions];
-                  updated[i] = { ...updated[i], effect: v as string };
-                  setPermissions(updated);
-                }}
-                options={[
-                  { label: 'Allow', value: 'Allow' },
-                  { label: <span style={{ color: isDeny ? '#ff4d4f' : undefined, fontWeight: isDeny ? 600 : undefined }}>Deny</span>, value: 'Deny' },
-                ]}
-              />
-            </Tooltip>
-            <Button type="text" danger size="small" icon={<DeleteOutlined />} onClick={() => setPermissions(permissions.filter((_, j) => j !== i))}>
-              Remove
-            </Button>
-          </div>
-          <div style={{ marginBottom: 8 }}>
-            <Text type="secondary" style={{ fontSize: 12, fontWeight: 500 }}>Actions</Text>
-            <Checkbox.Group
-              value={row.actions}
-              onChange={v => {
-                const updated = [...permissions];
-                updated[i] = { ...updated[i], actions: v as string[] };
-                setPermissions(updated);
-              }}
-              style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 4 }}
-            >
-              {ACTION_OPTIONS.map(opt => (
-                <Checkbox key={opt.value} value={opt.value} style={{ fontSize: 12 }}>{opt.label}</Checkbox>
-              ))}
-            </Checkbox.Group>
-          </div>
-          <div style={{ marginBottom: 4 }}>
-            <Text type="secondary" style={{ fontSize: 12, fontWeight: 500 }}>Resources</Text>
-            <Input
-              value={row.resources}
-              onChange={e => {
-                const updated = [...permissions];
-                updated[i] = { ...updated[i], resources: e.target.value };
-                setPermissions(updated);
-              }}
-              placeholder="e.g. my-bucket/*, my-bucket/releases/*"
-              style={{ ...inputRadius, marginTop: 2 }}
-            />
-            <div style={{ fontSize: 11, color: colors.TEXT_MUTED, marginTop: 6, display: 'flex', flexWrap: 'wrap', gap: '4px 12px' }}>
-              {[
-                ['*', 'all buckets & keys'],
-                ['my-bucket/*', 'everything in one bucket'],
-                ['my-bucket/builds/*', 'one prefix only'],
-              ].map(([pattern, desc]) => (
-                <span key={pattern} style={{ whiteSpace: 'nowrap' }}>
-                  <code style={{ background: 'var(--input-bg)', border: `1px solid ${colors.BORDER}`, padding: '1px 5px', borderRadius: 3, fontFamily: 'var(--font-mono)', fontSize: 10, color: colors.ACCENT_BLUE }}>{pattern}</code>
-                  <span style={{ margin: '0 3px', opacity: 0.4 }}>→</span>
-                  <span style={{ fontSize: 10 }}>{desc}</span>
-                </span>
-              ))}
-            </div>
-          </div>
-        </div>
-        );
-      })}
-
-      <Button type="dashed" icon={<PlusOutlined />} onClick={() => setPermissions([...permissions, { effect: 'Allow', actions: [], resources: '' }])} block style={{ borderRadius: 8, marginBottom: 16 }}>
-        Add Permission Rule
-      </Button>
+      <PermissionEditor permissions={permissions} onChange={setPermissions} />
 
       {isEdit && (() => {
         const memberGroups = userGroups.filter(g => user && g.member_ids.includes(user.id));

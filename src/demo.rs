@@ -63,6 +63,9 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             "/_/api/admin/groups/:id/members/:user_id",
             delete(admin::remove_group_member),
         )
+        // Usage scanner
+        .route("/_/api/admin/usage/scan", post(admin::scan_usage))
+        .route("/_/api/admin/usage", get(admin::get_usage))
         .layer(middleware::from_fn_with_state(
             admin_state.clone(),
             admin::require_session,

@@ -19,6 +19,10 @@ use tokio::time::sleep;
 /// Single port per server (UI served under /_/ on the same port).
 static PORT_COUNTER: AtomicU16 = AtomicU16::new(19000);
 
+/// Known bootstrap password used by all test servers.
+/// The hash is bcrypt($2b$04$) of "testpass" with a low cost factor for speed.
+pub const TEST_BOOTSTRAP_PASSWORD: &str = "testpass";
+
 /// MinIO configuration constants
 pub const MINIO_BUCKET: &str = "deltaglider-test";
 
@@ -129,6 +133,8 @@ impl TestServer {
         let process = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"))
             .env("DGP_CONFIG", &config_path)
             .env("RUST_LOG", "deltaglider_proxy=warn")
+            // Enable debug headers so tests can inspect x-amz-storage-type etc.
+            .env("DGP_DEBUG_HEADERS", "true")
             .spawn()
             .expect("Failed to start server");
 
@@ -286,6 +292,13 @@ impl TestServerBuilder {
     fn build_config(&self) -> (String, Option<TempDir>) {
         let mut config = String::new();
 
+        // Set a known bootstrap password hash so tests can log into the admin API
+        let bootstrap_hash = bcrypt::hash(TEST_BOOTSTRAP_PASSWORD, 4).expect("bcrypt hash failed");
+        config.push_str(&format!(
+            "bootstrap_password_hash = \"{}\"\n",
+            bootstrap_hash
+        ));
+
         // Top-level knobs
         if let Some(ratio) = self.max_delta_ratio {
             config.push_str(&format!("max_delta_ratio = {}\n", ratio));
@@ -333,6 +346,29 @@ impl Drop for TestServer {
     fn drop(&mut self) {
         let _ = self.process.kill();
     }
+}
+
+/// Create a reqwest client that is logged in to the admin API.
+/// Uses the known TEST_BOOTSTRAP_PASSWORD to authenticate.
+pub async fn admin_http_client(endpoint: &str) -> reqwest::Client {
+    let jar = std::sync::Arc::new(reqwest::cookie::Jar::default());
+    let client = reqwest::Client::builder()
+        .cookie_provider(jar)
+        .build()
+        .unwrap();
+
+    let resp = client
+        .post(format!("{}/_/api/admin/login", endpoint))
+        .json(&serde_json::json!({"password": TEST_BOOTSTRAP_PASSWORD}))
+        .send()
+        .await
+        .expect("Admin login request failed");
+    assert!(
+        resp.status().is_success(),
+        "Admin login failed: {}",
+        resp.status()
+    );
+    client
 }
 
 // === Shared HTTP helpers (reqwest) ===

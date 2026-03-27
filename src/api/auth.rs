@@ -16,16 +16,24 @@
 use super::S3Error;
 use crate::iam::{AuthenticatedUser, IamState, SharedIamState};
 use crate::metrics::Metrics;
+use crate::rate_limiter::{self, RateLimiter};
 use axum::body::Body;
 use axum::http::Request;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use dashmap::DashMap;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use std::time::Instant;
+use subtle::ConstantTimeEq;
 use tracing::{debug, warn};
+use zeroize::Zeroize;
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// Shared replay cache type: signature string -> timestamp of first use.
+pub type ReplayCache = Arc<DashMap<String, Instant>>;
 
 /// Common intermediate representation for SigV4 parameters,
 /// populated from either Authorization header or presigned URL query params.
@@ -132,12 +140,27 @@ impl SigV4Params {
         };
 
         // Check expiration — hard-fail on parse errors
+        // AWS caps presigned URL expiry at 7 days (604,800 seconds).
+        const MAX_PRESIGNED_EXPIRY: i64 = 604_800;
+
         if !expires.is_empty() {
             let expires_secs: i64 = expires.parse().map_err(|_| {
                 warn!("SigV4 presigned: unparseable X-Amz-Expires: {:?}", expires);
                 S3Error::InvalidArgument(format!("Invalid X-Amz-Expires: {}", expires))
                     .into_response()
             })?;
+
+            if expires_secs > MAX_PRESIGNED_EXPIRY {
+                warn!(
+                    "SigV4 presigned: X-Amz-Expires={} exceeds 7-day maximum ({})",
+                    expires_secs, MAX_PRESIGNED_EXPIRY
+                );
+                return Err(S3Error::InvalidArgument(format!(
+                    "X-Amz-Expires={} exceeds maximum of {} seconds (7 days)",
+                    expires_secs, MAX_PRESIGNED_EXPIRY
+                ))
+                .into_response());
+            }
 
             let request_time = chrono::NaiveDateTime::parse_from_str(&amz_date, "%Y%m%dT%H%M%SZ")
                 .map_err(|_| {
@@ -183,18 +206,21 @@ fn verify_signature(
     headers: &axum::http::HeaderMap,
     uri: &axum::http::Uri,
 ) -> Result<(), Response> {
-    // Validate clock skew (AWS rejects requests where the date differs
-    // from server time by more than 15 minutes — prevents replay attacks)
+    // Validate clock skew — configurable via DGP_CLOCK_SKEW_SECONDS (default 300s = 5 min)
+    let max_skew_secs: u64 = std::env::var("DGP_CLOCK_SKEW_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
     if !params.amz_date.is_empty() {
         if let Ok(request_time) =
             chrono::NaiveDateTime::parse_from_str(&params.amz_date, "%Y%m%dT%H%M%SZ")
         {
             let now = chrono::Utc::now().naive_utc();
             let skew = (now - request_time).num_seconds().unsigned_abs();
-            if skew > 15 * 60 {
+            if skew > max_skew_secs {
                 warn!(
-                    "SigV4: request time skew {}s exceeds 15-minute limit (request: {}, server: {})",
-                    skew, params.amz_date, now.format("%Y%m%dT%H%M%SZ")
+                    "SigV4: request time skew {}s exceeds {}-second limit (request: {}, server: {})",
+                    skew, max_skew_secs, params.amz_date, now.format("%Y%m%dT%H%M%SZ")
                 );
                 return Err(S3Error::RequestTimeTooSkewed.into_response());
             }
@@ -266,7 +292,11 @@ fn verify_signature(
         &params.signature[..std::cmp::min(8, params.signature.len())]
     );
 
-    if computed_signature != params.signature {
+    if computed_signature
+        .as_bytes()
+        .ct_ne(params.signature.as_bytes())
+        .into()
+    {
         warn!("SigV4: signature mismatch");
         return Err(S3Error::SignatureDoesNotMatch.into_response());
     }
@@ -300,11 +330,25 @@ pub async fn sigv4_auth_middleware(
         .map(|swap| swap.load_full());
 
     let metrics = request.extensions().get::<Arc<Metrics>>().cloned();
+    let rate_limiter = request.extensions().get::<RateLimiter>().cloned();
+    let replay_cache = request.extensions().get::<ReplayCache>().cloned();
 
-    let record_auth_failure = |reason: &str| {
-        if let Some(m) = &metrics {
-            m.auth_attempts_total.with_label_values(&["failure"]).inc();
-            m.auth_failures_total.with_label_values(&[reason]).inc();
+    // Extract client IP for rate limiting
+    let client_ip = rate_limiter::extract_client_ip(request.headers());
+
+    let record_auth_failure = {
+        let metrics = metrics.clone();
+        let rate_limiter = rate_limiter.clone();
+        move |reason: &str| {
+            if let Some(m) = &metrics {
+                m.auth_attempts_total.with_label_values(&["failure"]).inc();
+                m.auth_failures_total.with_label_values(&[reason]).inc();
+            }
+            // Record failure in rate limiter
+            if let (Some(rl), Some(ip)) = (&rate_limiter, &client_ip) {
+                rl.record_failure(ip);
+                warn!("SigV4 auth failure from {} (reason: {})", ip, reason);
+            }
         }
     };
 
@@ -317,6 +361,17 @@ pub async fn sigv4_auth_middleware(
     // If auth is disabled, pass through
     if matches!(iam_state, IamState::Disabled) {
         return Ok(next.run(request).await);
+    }
+
+    // Check rate limit before processing auth
+    if let (Some(rl), Some(ip)) = (&rate_limiter, &client_ip) {
+        if rl.is_limited(ip) {
+            warn!("SigV4: rate limited request from {}", ip);
+            return Err(
+                S3Error::SlowDown("Rate limited due to repeated auth failures".into())
+                    .into_response(),
+            );
+        }
     }
 
     // Log every incoming request before auth check for debugging
@@ -415,6 +470,21 @@ pub async fn sigv4_auth_middleware(
             record_auth_failure("invalid_signature");
             return Err(e);
         }
+    }
+
+    // Replay attack detection: reject duplicate signatures within 5 seconds
+    if let Some(ref cache) = replay_cache {
+        let sig = &params.signature;
+        if let Some(first_seen) = cache.get(sig) {
+            if first_seen.elapsed() < std::time::Duration::from_secs(5) {
+                warn!("SigV4: replay attack detected (duplicate signature within 5s)");
+                record_auth_failure("replay");
+                return Err(
+                    S3Error::InvalidArgument("Request replay detected".to_string()).into_response(),
+                );
+            }
+        }
+        cache.insert(sig.clone(), Instant::now());
     }
 
     // Insert authenticated user into request extensions (for authorization middleware)
@@ -587,6 +657,7 @@ fn uri_encode(input: &str, encode_slash: bool) -> String {
 }
 
 /// Derive the SigV4 signing key from the secret access key and credential scope.
+/// Intermediate keys are zeroized after use to prevent memory disclosure.
 ///
 /// credential_scope format: `20260101/us-east-1/s3/aws4_request`
 fn derive_signing_key(secret_access_key: &str, credential_scope: &str) -> Vec<u8> {
@@ -596,11 +667,16 @@ fn derive_signing_key(secret_access_key: &str, credential_scope: &str) -> Vec<u8
     let region = parts.get(1).copied().unwrap_or("");
     let service = parts.get(2).copied().unwrap_or("");
 
-    let k_secret = format!("AWS4{}", secret_access_key);
-    let k_date = hmac_sha256(k_secret.as_bytes(), date.as_bytes());
-    let k_region = hmac_sha256(&k_date, region.as_bytes());
-    let k_service = hmac_sha256(&k_region, service.as_bytes());
-    hmac_sha256(&k_service, b"aws4_request")
+    let mut k_secret = format!("AWS4{}", secret_access_key);
+    let mut k_date = hmac_sha256(k_secret.as_bytes(), date.as_bytes());
+    k_secret.zeroize();
+    let mut k_region = hmac_sha256(&k_date, region.as_bytes());
+    k_date.zeroize();
+    let mut k_service = hmac_sha256(&k_region, service.as_bytes());
+    k_region.zeroize();
+    let result = hmac_sha256(&k_service, b"aws4_request");
+    k_service.zeroize();
+    result
 }
 
 /// Compute HMAC-SHA256.

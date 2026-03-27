@@ -74,6 +74,13 @@ DGP_LISTEN_ADDR=0.0.0.0:9000       # bind address
 DGP_MAX_DELTA_RATIO=0.5             # store delta if ratio < 50%
 DGP_MAX_OBJECT_SIZE=104857600       # 100MB cap (xdelta3 constraint)
 DGP_CACHE_MB=100                    # reference cache for reconstruction
+DGP_METADATA_CACHE_MB=50            # metadata cache (eliminates repeated HEADs)
+
+# Security tuning
+DGP_SESSION_TTL_HOURS=4             # admin session lifetime (default: 4h)
+DGP_CLOCK_SKEW_SECONDS=300          # SigV4 clock skew tolerance (default: 5 min)
+DGP_MAX_MULTIPART_UPLOADS=100       # concurrent multipart upload limit
+DGP_DEBUG_HEADERS=false             # expose server fingerprinting headers (off by default)
 
 # Bootstrap S3 auth (used before IAM users are created)
 DGP_ACCESS_KEY_ID=mykey
@@ -131,6 +138,7 @@ Everything served on a single port: S3 API on `/`, admin UI and APIs under `/_/`
 - **Transparent reconstruction**: Delta-compressed files are [reconstructed on the fly](docs/DELTA_RECONSTRUCTION.md) — clients receive the exact original bytes with correct `Content-Length` and `ETag`. Auth (SigV4/presigned URLs) is verified before reconstruction begins.
 - SHA-256 verified on every reconstructed GET. Corruption detected immediately.
 - LRU reference cache (moka) for fast reconstruction. Cache health exposed via startup warnings, periodic monitors, Prometheus gauges, and per-response `x-deltaglider-cache: hit|miss` header.
+- Metadata cache (moka, 50MB default) eliminates repeated HEAD calls for object metadata. Populated on PUT/HEAD/LIST, invalidated on DELETE. Configurable via `DGP_METADATA_CACHE_MB`.
 - `x-amz-storage-type` response header exposes strategy (delta/passthrough/reference) for debugging.
 - **Lite LIST optimization**: No HEAD calls during LIST — sizes shown are stored (compressed) sizes, ~8x faster than per-object HEAD.
 - **FS delimiter optimization**: `list_objects_delegated()` for filesystem backend uses a single `read_dir` instead of recursive walk when a delimiter is specified.

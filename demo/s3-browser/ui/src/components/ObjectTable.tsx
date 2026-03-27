@@ -27,6 +27,7 @@ interface Props {
   folderSizes: Record<string, FolderSizeState>;
   onComputeSize: (prefix: string) => void;
   onCancelSize: (prefix: string) => void;
+  onAutoPopulateSizes?: (currentPrefix: string, folderPrefixes: string[]) => void;
 }
 
 type RowData = { _isFolder: true; key: string; name: string } | (S3Object & { _isFolder: false; name: string });
@@ -49,6 +50,7 @@ export default function ObjectTable({
   folderSizes,
   onComputeSize,
   onCancelSize,
+  onAutoPopulateSizes,
 }: Props) {
   const { token } = theme.useToken();
   const { TEXT_PRIMARY, TEXT_SECONDARY, TEXT_MUTED, ACCENT_BLUE, ACCENT_AMBER, ACCENT_PURPLE, STORAGE_TYPE_COLORS, STORAGE_TYPE_DEFAULT } = useColors();
@@ -88,6 +90,13 @@ export default function ObjectTable({
   useEffect(() => {
     if (objects.length > 0) enrichPage(currentPage);
   }, [currentPage, objects, enrichPage]);
+
+  // Auto-populate folder sizes from cached scanner results
+  useEffect(() => {
+    if (folders.length > 0 && onAutoPopulateSizes) {
+      onAutoPopulateSizes(prefix, folders);
+    }
+  }, [prefix, folders, onAutoPopulateSizes]);
 
   function fileIconColor(name: string): string {
     const ext = name.split('.').pop()?.toLowerCase() || '';

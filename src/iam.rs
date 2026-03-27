@@ -1172,4 +1172,216 @@ mod tests {
             "key"
         ));
     }
+
+    // === Property-based tests ===
+    // These test invariants of the permission evaluation algorithm
+    // using randomized inputs to catch edge cases.
+
+    fn random_action(i: usize) -> S3Action {
+        match i % 5 {
+            0 => S3Action::Read,
+            1 => S3Action::Write,
+            2 => S3Action::Delete,
+            3 => S3Action::List,
+            _ => S3Action::Admin,
+        }
+    }
+
+    fn random_bucket(i: usize) -> &'static str {
+        match i % 4 {
+            0 => "alpha",
+            1 => "beta",
+            2 => "gamma",
+            _ => "delta",
+        }
+    }
+
+    fn random_key(i: usize) -> &'static str {
+        match i % 5 {
+            0 => "file.zip",
+            1 => "builds/v1.zip",
+            2 => "releases/latest.tar.gz",
+            3 => "",
+            _ => "deep/nested/path/file.bin",
+        }
+    }
+
+    #[test]
+    fn prop_deny_always_overrides_allow() {
+        // Invariant: if a Deny rule matches, the result is ALWAYS false,
+        // regardless of how many Allow rules also match.
+        for i in 0..100 {
+            let action = random_action(i);
+            let bucket = random_bucket(i);
+            let key = random_key(i);
+            let action_str = action.as_str().to_string();
+
+            let perms = vec![
+                Permission {
+                    id: 0,
+                    effect: "Allow".into(),
+                    actions: vec!["*".into()],
+                    resources: vec!["*".into()],
+                },
+                Permission {
+                    id: 1,
+                    effect: "Allow".into(),
+                    actions: vec![action_str.clone()],
+                    resources: vec![format!("{}/*", bucket)],
+                },
+                Permission {
+                    id: 2,
+                    effect: "Deny".into(),
+                    actions: vec!["*".into()],
+                    resources: vec!["*".into()],
+                },
+            ];
+
+            assert!(
+                !evaluate_permissions(&perms, action, bucket, key),
+                "Deny * should override Allow * for action={:?} bucket={} key={}",
+                action_str,
+                bucket,
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn prop_no_matching_rule_means_deny() {
+        // Invariant: if no Allow rule matches (and no Deny rule matches),
+        // the result is always false (implicit deny).
+        for i in 0..100 {
+            let action = random_action(i);
+            let bucket = random_bucket(i);
+            let key = random_key(i);
+
+            // Rules that don't match: allow "read" on "nonexistent-bucket/*"
+            let perms = vec![Permission {
+                id: 0,
+                effect: "Allow".into(),
+                actions: vec!["read".into()],
+                resources: vec!["nonexistent-bucket/*".into()],
+            }];
+
+            // Unless action is Read AND bucket is nonexistent-bucket, should deny
+            if action.as_str() != "read" || bucket != "nonexistent-bucket" {
+                assert!(
+                    !evaluate_permissions(&perms, action, bucket, key),
+                    "Non-matching rule should deny: action={} bucket={} key={}",
+                    action.as_str(),
+                    bucket,
+                    key
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prop_wildcard_allow_permits_everything_without_deny() {
+        // Invariant: Allow * on * permits every action on every resource
+        // when there are no Deny rules.
+        let perms = vec![Permission {
+            id: 0,
+            effect: "Allow".into(),
+            actions: vec!["*".into()],
+            resources: vec!["*".into()],
+        }];
+
+        for i in 0..100 {
+            let action = random_action(i);
+            let bucket = random_bucket(i);
+            let key = random_key(i);
+
+            assert!(
+                evaluate_permissions(&perms, action, bucket, key),
+                "Allow * should permit action={} bucket={} key={}",
+                action.as_str(),
+                bucket,
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn prop_specific_deny_only_blocks_matching_action() {
+        // Invariant: Deny on a specific action only blocks that action,
+        // not other actions.
+        for i in 0..100 {
+            let action = random_action(i);
+            let bucket = random_bucket(i);
+            let key = random_key(i);
+
+            let perms = vec![
+                Permission {
+                    id: 0,
+                    effect: "Allow".into(),
+                    actions: vec!["*".into()],
+                    resources: vec!["*".into()],
+                },
+                Permission {
+                    id: 1,
+                    effect: "Deny".into(),
+                    actions: vec!["delete".into()],
+                    resources: vec!["*".into()],
+                },
+            ];
+
+            let result = evaluate_permissions(&perms, action, bucket, key);
+
+            if action.as_str() == "delete" {
+                assert!(
+                    !result,
+                    "Deny delete should block delete on {}/{}",
+                    bucket, key
+                );
+            } else {
+                assert!(
+                    result,
+                    "Deny delete should NOT block {} on {}/{}",
+                    action.as_str(),
+                    bucket,
+                    key
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prop_resource_scoping_respected() {
+        // Invariant: Allow on bucket-a/* only permits access to bucket-a,
+        // never to bucket-b.
+        let perms = vec![Permission {
+            id: 0,
+            effect: "Allow".into(),
+            actions: vec!["*".into()],
+            resources: vec!["alpha/*".into()],
+        }];
+
+        for i in 0..100 {
+            let action = random_action(i);
+            let key = random_key(i);
+
+            // Should allow on alpha
+            assert!(
+                evaluate_permissions(&perms, action, "alpha", key),
+                "Should allow {} on alpha/{}",
+                action.as_str(),
+                key
+            );
+
+            // Should deny on any other bucket
+            for other_bucket in &["beta", "gamma", "delta"] {
+                if !key.is_empty() {
+                    assert!(
+                        !evaluate_permissions(&perms, action, other_bucket, key),
+                        "Should deny {} on {}/{}",
+                        action.as_str(),
+                        other_bucket,
+                        key
+                    );
+                }
+            }
+        }
+    }
 }

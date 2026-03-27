@@ -18,7 +18,9 @@ use deltaglider_proxy::iam::authorization_middleware;
 use deltaglider_proxy::iam::{AuthConfig, IamState, SharedIamState};
 use deltaglider_proxy::metrics::Metrics;
 use deltaglider_proxy::multipart::MultipartStore;
+use deltaglider_proxy::rate_limiter::RateLimiter;
 use deltaglider_proxy::session::SessionStore;
+use deltaglider_proxy::usage_scanner::UsageScanner;
 use std::io::IsTerminal;
 use std::sync::Arc;
 use std::time::Duration;
@@ -104,6 +106,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let password = line.trim_end_matches('\n').trim_end_matches('\r');
         if password.is_empty() {
             eprintln!("Error: password must not be empty");
+            std::process::exit(1);
+        }
+        // Validate password quality
+        if let Err(msg) = deltaglider_proxy::api::admin::validate_password(password) {
+            eprintln!("Error: {}", msg);
             std::process::exit(1);
         }
         let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST).expect("bcrypt hashing failed");
@@ -215,15 +222,20 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         "  Max object size: {} MB",
         config.max_object_size / 1024 / 1024
     );
+    if config.metadata_cache_mb == 0 {
+        warn!("[cache] In-memory metadata cache is DISABLED (0 MB). Every HEAD/LIST will query storage.");
+    } else {
+        info!("[cache] In-memory metadata cache: {} MB (object metadata for HEAD/LIST acceleration)", config.metadata_cache_mb);
+    }
     if config.cache_size_mb == 0 {
-        warn!("[cache] Reference cache is DISABLED (0 MB). Every delta GET will read the full reference from storage.");
+        warn!("[cache] In-memory reference cache is DISABLED (0 MB). Every delta GET will read the full reference from storage.");
     } else if config.cache_size_mb < 1024 {
         warn!(
-            "[cache] Reference cache is only {} MB — recommend ≥1024 MB for production. Set cache_size_mb or DGP_CACHE_MB.",
+            "[cache] In-memory reference cache is only {} MB — recommend ≥1024 MB for production. Set cache_size_mb or DGP_CACHE_MB.",
             config.cache_size_mb
         );
     } else {
-        info!("[cache] Reference cache: {} MB", config.cache_size_mb);
+        info!("[cache] In-memory reference cache: {} MB (delta reconstruction baselines)", config.cache_size_mb);
     }
 
     if config.auth_enabled() {
@@ -273,10 +285,39 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         move || mp.cleanup_expired(Duration::from_secs(3600))
     });
 
+    // Create shared rate limiter for auth endpoints (5 attempts / 15 min, 30 min lockout)
+    let rate_limiter = RateLimiter::default_auth();
+
+    // Spawn periodic cleanup for expired rate limiter entries (every 5 minutes)
+    spawn_periodic(Duration::from_secs(300), {
+        let rl = rate_limiter.clone();
+        move || rl.cleanup_expired()
+    });
+
+    // Replay attack detection cache: tracks recently seen SigV4 signatures
+    let replay_cache: deltaglider_proxy::api::auth::ReplayCache = Arc::new(dashmap::DashMap::new());
+
+    // Spawn periodic cleanup for replay cache entries (every 60 seconds)
+    spawn_periodic(Duration::from_secs(60), {
+        let cache = replay_cache.clone();
+        move || {
+            let cutoff = std::time::Instant::now() - Duration::from_secs(60);
+            cache.retain(|_, instant: &mut std::time::Instant| *instant > cutoff);
+        }
+    });
+
+    let debug_headers = std::env::var("DGP_DEBUG_HEADERS")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    if debug_headers {
+        info!("  Debug headers: enabled (DGP_DEBUG_HEADERS=true)");
+    }
+
     let state = Arc::new(AppState {
         engine: ArcSwap::from_pointee(engine),
         multipart,
         metrics: metrics.clone(),
+        debug_headers,
     });
 
     // Spawn periodic cache health monitor (every 60s)
@@ -300,7 +341,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let max_mb = cache_max_bytes / (1024 * 1024);
                 if pct > 90.0 {
                     tracing::warn!(
-                        "[cache] utilization {:.0}% ({}/{} MB, {} entries) — consider increasing cache_size_mb",
+                        "[cache] In-memory reference cache utilization {:.0}% ({}/{} MB, {} entries) — consider increasing cache_size_mb",
                         pct, used_mb, max_mb, entries
                     );
                 }
@@ -318,7 +359,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let miss_pct = (interval_misses as f64 / interval_total as f64) * 100.0;
                 if miss_pct > 50.0 {
                     tracing::warn!(
-                        "[cache] miss rate {:.0}% ({}/{} in last 60s) — active deltaspaces may exceed cache capacity",
+                        "[cache] In-memory reference cache miss rate {:.0}% ({}/{} in last 60s) — active deltaspaces may exceed cache capacity",
                         miss_pct, interval_misses, interval_total
                     );
                 }
@@ -398,6 +439,10 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         // SigV4 authentication (looks up user, verifies signature)
         .layer(middleware::from_fn(sigv4_auth_middleware))
         .layer(axum::Extension(iam_state.clone()))
+        // Replay attack detection cache for SigV4
+        .layer(axum::Extension(replay_cache))
+        // Rate limiter extension for auth middleware
+        .layer(axum::Extension(rate_limiter.clone()))
         // Metrics extension for auth middleware to extract
         .layer(axum::Extension(metrics.clone()))
         // Increase body size limit to match max_object_size config (default 2MB is too small)
@@ -451,6 +496,8 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    let usage_scanner = Arc::new(UsageScanner::new());
+
     let admin_state = Arc::new(AdminState {
         password_hash: parking_lot::RwLock::new(admin_password_hash),
         sessions: session_store,
@@ -459,6 +506,8 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         s3_state: state.clone(),
         iam_state,
         config_db,
+        usage_scanner,
+        rate_limiter,
     });
 
     // Build TLS config if enabled
@@ -479,6 +528,24 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // UI routes are OUTSIDE the S3 auth middleware (they use session cookies instead)
     let app = demo::ui_router(admin_state).merge(app);
     info!("  Dashboard: http://{}/_/", config.listen_addr);
+
+    // Security response headers middleware (outermost layer — applied to ALL responses)
+    let tls_enabled = config.tls_enabled();
+    let app = app.layer(middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| async move {
+            let mut response = next.run(request).await;
+            let headers = response.headers_mut();
+            headers.insert("x-content-type-options", "nosniff".parse().unwrap());
+            headers.insert("x-frame-options", "DENY".parse().unwrap());
+            if tls_enabled {
+                headers.insert(
+                    "strict-transport-security",
+                    "max-age=31536000; includeSubDomains".parse().unwrap(),
+                );
+            }
+            response
+        },
+    ));
 
     // Start S3 server with graceful shutdown
     if let Some(rustls_config) = rustls_config {

@@ -5,6 +5,7 @@ use super::{
     base64_decode, build_object_headers, extract_content_type, extract_user_metadata, header_value,
     xml_response, AppState, ObjectQuery, S3Error,
 };
+use crate::iam::{evaluate_permissions, AuthenticatedUser, S3Action};
 use crate::types::FileMetadata;
 use axum::body::Bytes;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -103,12 +104,13 @@ pub(super) async fn put_object_inner(
 
 /// COPY object handler (internal)
 /// Called by put_object_or_copy after validation
-#[instrument(skip(state))]
+#[instrument(skip(state, auth_user))]
 pub(super) async fn copy_object_inner(
     state: &Arc<AppState>,
     bucket: &str,
     key: &str,
     headers: &HeaderMap,
+    auth_user: &Option<AuthenticatedUser>,
 ) -> Result<Response, S3Error> {
     // Get copy source
     let copy_source = headers
@@ -124,6 +126,13 @@ pub(super) async fn copy_object_inner(
     let (source_bucket, source_key) = copy_source
         .split_once('/')
         .ok_or_else(|| S3Error::InvalidArgument("Copy source must be bucket/key".to_string()))?;
+
+    // IAM check: verify the authenticated user has read access to the copy source
+    if let Some(ref user) = auth_user {
+        if !evaluate_permissions(&user.permissions, S3Action::Read, source_bucket, source_key) {
+            return Err(S3Error::AccessDenied);
+        }
+    }
 
     info!(
         "COPY {}/{} -> {}/{}",
@@ -271,6 +280,91 @@ pub(super) fn upload_part(
         .multipart
         .upload_part(upload_id, bucket, key, part_num, body)?;
     Ok((StatusCode::OK, [("ETag", etag)], "").into_response())
+}
+
+/// Handle UploadPartCopy: PUT with ?partNumber&uploadId and x-amz-copy-source header.
+/// Retrieves data from the source object (optionally sliced by x-amz-copy-source-range),
+/// then stores it as a multipart part.
+#[instrument(skip(state, auth_user))]
+pub(super) async fn upload_part_copy(
+    state: &Arc<AppState>,
+    bucket: &str,
+    key: &str,
+    headers: &HeaderMap,
+    part_num: u32,
+    upload_id: &str,
+    auth_user: &Option<AuthenticatedUser>,
+) -> Result<Response, S3Error> {
+    // Parse x-amz-copy-source header (reuses same logic as copy_object_inner)
+    let copy_source = headers
+        .get("x-amz-copy-source")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| S3Error::InvalidRequest("Missing x-amz-copy-source header".to_string()))?;
+
+    let copy_source = urlencoding::decode(copy_source)
+        .map_err(|_| S3Error::InvalidArgument("Invalid copy source encoding".to_string()))?;
+    let copy_source = copy_source.trim_start_matches('/');
+
+    let (source_bucket, source_key) = copy_source
+        .split_once('/')
+        .ok_or_else(|| S3Error::InvalidArgument("Copy source must be bucket/key".to_string()))?;
+
+    // IAM check: verify the authenticated user has read access to the copy source
+    if let Some(ref user) = auth_user {
+        if !evaluate_permissions(&user.permissions, S3Action::Read, source_bucket, source_key) {
+            return Err(S3Error::AccessDenied);
+        }
+    }
+
+    info!(
+        "UploadPartCopy {}/{} part={} uploadId={} from {}/{}",
+        bucket, key, part_num, upload_id, source_bucket, source_key
+    );
+
+    // Retrieve source object data
+    let engine = state.engine.load();
+    let (data, _source_meta) = engine.retrieve(source_bucket, source_key).await?;
+
+    // Optionally apply x-amz-copy-source-range: bytes=X-Y
+    let part_data = if let Some(range_str) = headers
+        .get("x-amz-copy-source-range")
+        .and_then(|v| v.to_str().ok())
+    {
+        let range_str = range_str.strip_prefix("bytes=").ok_or_else(|| {
+            S3Error::InvalidArgument("Invalid copy-source-range format".to_string())
+        })?;
+        let (start_str, end_str) = range_str.split_once('-').ok_or_else(|| {
+            S3Error::InvalidArgument("Invalid copy-source-range format".to_string())
+        })?;
+        let start: usize = start_str
+            .parse()
+            .map_err(|_| S3Error::InvalidArgument("Invalid range start".to_string()))?;
+        let end: usize = end_str
+            .parse()
+            .map_err(|_| S3Error::InvalidArgument("Invalid range end".to_string()))?;
+
+        if start > end || end >= data.len() {
+            return Err(S3Error::InvalidRange);
+        }
+
+        Bytes::from(data[start..=end].to_vec())
+    } else {
+        Bytes::from(data)
+    };
+
+    // Store as multipart part (same as upload_part)
+    let etag = state
+        .multipart
+        .upload_part(upload_id, bucket, key, part_num, part_data)?;
+
+    // Return CopyPartResult XML
+    let result = crate::api::xml::CopyPartResult {
+        etag: etag.clone(),
+        last_modified: chrono::Utc::now(),
+    };
+    let xml = result.to_xml();
+
+    Ok(xml_response(xml))
 }
 
 // ---------------------------------------------------------------------------

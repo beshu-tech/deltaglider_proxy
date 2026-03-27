@@ -40,6 +40,8 @@ sha2 = "0.10"
 hmac = "0.12"
 md-5 = "0.10"
 hex = "0.4"
+subtle = "2"
+zeroize = "1"
 base64 = "0.22"
 
 # XML for S3 responses
@@ -80,6 +82,6 @@ rusqlite = { version = "0.39.0", features = ["bundled-sqlcipher"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "cookies"] }
 testcontainers = "0.26"
 testcontainers-modules = { version = "0.14", features = ["minio"] }

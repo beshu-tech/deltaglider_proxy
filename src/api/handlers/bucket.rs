@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use std::sync::Arc;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 /// Query parameters for bucket-level GET operations
 #[derive(Debug, serde::Deserialize, Default)]
@@ -45,6 +45,8 @@ pub struct BucketGetQuery {
     pub uploads: Option<String>,
     /// ACL operations (GET/PUT with ?acl)
     pub acl: Option<String>,
+    /// Tagging operations (GET/PUT with ?tagging)
+    pub tagging: Option<String>,
     /// MinIO extension: include per-object user metadata in ListObjectsV2 response
     pub metadata: Option<bool>,
 }
@@ -60,6 +62,18 @@ pub async fn bucket_get_handler(
     ValidatedBucket(bucket): ValidatedBucket,
     Query(query): Query<BucketGetQuery>,
 ) -> Result<Response, S3Error> {
+    // Check for tagging request
+    if query.tagging.is_some() {
+        info!("GET bucket tagging (stub): {}", bucket);
+        let exists = state.engine.load().head_bucket(&bucket).await?;
+        if !exists {
+            return Err(S3Error::NoSuchBucket(bucket.to_string()));
+        }
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Tagging><TagSet/></Tagging>"#;
+        return Ok(xml_response(xml));
+    }
+
     // Check for ACL request
     if query.acl.is_some() {
         info!("GET bucket ACL: {}", bucket);
@@ -269,6 +283,26 @@ pub async fn create_bucket(
     // PUT /{bucket}?acl — accept and ignore (ACL stub)
     if query.acl.is_some() {
         info!("PUT bucket ACL (stub): {}", bucket);
+        return Ok(StatusCode::OK.into_response());
+    }
+
+    // PUT /{bucket}?tagging — accept and ignore (tagging stub)
+    if query.tagging.is_some() {
+        info!("PUT bucket tagging (stub): {}", bucket);
+        // Verify the bucket exists first; S3 returns 404 for tagging on non-existent buckets
+        let exists = state.engine.load().head_bucket(&bucket).await?;
+        if !exists {
+            return Err(S3Error::NoSuchBucket(bucket.to_string()));
+        }
+        return Ok(StatusCode::OK.into_response());
+    }
+
+    // PUT /{bucket}?versioning — accept and ignore (versioning stub)
+    if query.versioning.is_some() {
+        warn!(
+            "PUT bucket versioning (stub): {} — versioning is not supported, ignoring",
+            bucket
+        );
         return Ok(StatusCode::OK.into_response());
     }
 
