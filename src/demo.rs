@@ -63,6 +63,11 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             "/_/api/admin/groups/:id/members/:user_id",
             delete(admin::remove_group_member),
         )
+        // IAM backup/restore
+        .route(
+            "/_/api/admin/backup",
+            get(admin::export_backup).post(admin::import_backup),
+        )
         // Usage scanner
         .route("/_/api/admin/usage/scan", post(admin::scan_usage))
         .route("/_/api/admin/usage", get(admin::get_usage))

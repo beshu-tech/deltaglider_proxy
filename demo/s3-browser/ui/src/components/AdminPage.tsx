@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Typography, Button, Input, Alert, Space, Spin } from 'antd';
-import { checkSession, adminLogin, whoami, loginAs } from '../adminApi';
+import { Typography, Button, Input, Alert, Space, Spin, message } from 'antd';
+import { checkSession, adminLogin, whoami, loginAs, exportBackup, importBackup } from '../adminApi';
 import {
   CloudOutlined,
   DatabaseOutlined,
@@ -10,6 +10,8 @@ import {
   LockOutlined,
   ArrowLeftOutlined,
   DashboardOutlined,
+  DownloadOutlined,
+  UploadOutlined,
 } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import SettingsPage from './SettingsPage';
@@ -307,6 +309,63 @@ export default function AdminPage({ onBack, onSessionExpired }: AdminPageProps) 
               </button>
             );
           })}
+          {/* Backup/Restore */}
+          <div style={{ borderTop: `1px solid ${colors.BORDER}`, margin: '8px 12px 0', padding: '10px 0 0' }}>
+            <div style={{ fontSize: 10, fontWeight: 600, letterSpacing: 0.5, textTransform: 'uppercase', color: colors.TEXT_MUTED, padding: '0 8px 6px', fontFamily: 'var(--font-ui)' }}>
+              Backup
+            </div>
+            <div style={{ display: 'flex', gap: 4, padding: '0 8px' }}>
+              <Button
+                size="small"
+                icon={<DownloadOutlined />}
+                onClick={async () => {
+                  try {
+                    const data = await exportBackup();
+                    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `dgp-iam-backup-${new Date().toISOString().slice(0, 10)}.json`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                    message.success('IAM backup exported');
+                  } catch (e) {
+                    message.error('Export failed: ' + (e instanceof Error ? e.message : 'unknown'));
+                  }
+                }}
+                style={{ flex: 1, fontSize: 11 }}
+              >
+                Export
+              </Button>
+              <Button
+                size="small"
+                icon={<UploadOutlined />}
+                onClick={() => {
+                  const input = document.createElement('input');
+                  input.type = 'file';
+                  input.accept = '.json';
+                  input.onchange = async () => {
+                    const file = input.files?.[0];
+                    if (!file) return;
+                    try {
+                      const text = await file.text();
+                      const data = JSON.parse(text);
+                      const result = await importBackup(data);
+                      message.success(`Imported: ${result.users_created} users, ${result.groups_created} groups (${result.users_skipped} skipped)`);
+                      // Reload current tab
+                      window.location.reload();
+                    } catch (e) {
+                      message.error('Import failed: ' + (e instanceof Error ? e.message : 'invalid JSON'));
+                    }
+                  };
+                  input.click();
+                }}
+                style={{ flex: 1, fontSize: 11 }}
+              >
+                Import
+              </Button>
+            </div>
+          </div>
         </nav>
 
         {/* Tab content */}
