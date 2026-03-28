@@ -161,25 +161,52 @@ impl RateLimiter {
     }
 }
 
+/// Whether proxy-set headers (X-Forwarded-For, X-Real-IP) should be trusted
+/// for client IP extraction. When `false`, these headers are ignored to prevent
+/// IP spoofing by untrusted clients.
+///
+/// Controlled by `DGP_TRUST_PROXY_HEADERS=true`. Defaults to `false` (safe default).
+///
+/// **IMPORTANT**: Only enable this when the proxy sits behind a trusted reverse proxy
+/// (nginx, Caddy, ALB) that sets/overwrites these headers. Direct-to-internet deployments
+/// MUST leave this disabled, otherwise attackers can spoof IPs to bypass rate limiting
+/// and poison `aws:SourceIp` IAM conditions.
+fn trust_proxy_headers() -> bool {
+    std::env::var("DGP_TRUST_PROXY_HEADERS")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+}
+
 /// Extract client IP from request headers/connection info.
-/// Checks X-Forwarded-For first (for reverse proxies), then falls back to ConnectInfo.
+///
+/// When `DGP_TRUST_PROXY_HEADERS=true`, checks X-Forwarded-For and X-Real-IP
+/// (for deployments behind a trusted reverse proxy). Otherwise ignores these
+/// headers to prevent IP spoofing.
+///
+/// Returns `None` if no IP can be determined. In this case, rate limiting is
+/// skipped for this request (the SigV4 signature check still applies).
+/// To enable per-IP rate limiting without a reverse proxy, set
+/// `DGP_TRUST_PROXY_HEADERS=true` and have your proxy set these headers,
+/// or consider adding axum `ConnectInfo` support in the future.
 pub fn extract_client_ip(headers: &axum::http::HeaderMap) -> Option<IpAddr> {
-    // Check X-Forwarded-For header (first IP is the client)
-    if let Some(xff) = headers.get("x-forwarded-for") {
-        if let Ok(xff_str) = xff.to_str() {
-            if let Some(first_ip) = xff_str.split(',').next() {
-                if let Ok(ip) = first_ip.trim().parse::<IpAddr>() {
-                    return Some(ip);
+    if trust_proxy_headers() {
+        // Check X-Forwarded-For header (first IP is the client)
+        if let Some(xff) = headers.get("x-forwarded-for") {
+            if let Ok(xff_str) = xff.to_str() {
+                if let Some(first_ip) = xff_str.split(',').next() {
+                    if let Ok(ip) = first_ip.trim().parse::<IpAddr>() {
+                        return Some(ip);
+                    }
                 }
             }
         }
-    }
 
-    // Check X-Real-IP header
-    if let Some(real_ip) = headers.get("x-real-ip") {
-        if let Ok(ip_str) = real_ip.to_str() {
-            if let Ok(ip) = ip_str.trim().parse::<IpAddr>() {
-                return Some(ip);
+        // Check X-Real-IP header
+        if let Some(real_ip) = headers.get("x-real-ip") {
+            if let Ok(ip_str) = real_ip.to_str() {
+                if let Ok(ip) = ip_str.trim().parse::<IpAddr>() {
+                    return Some(ip);
+                }
             }
         }
     }
@@ -191,6 +218,16 @@ pub fn extract_client_ip(headers: &axum::http::HeaderMap) -> Option<IpAddr> {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn test_extract_client_ip_ignores_xff_by_default() {
+        // DGP_TRUST_PROXY_HEADERS is not set in tests (default false)
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        // Should return None when proxy headers are not trusted
+        let ip = extract_client_ip(&headers);
+        assert_eq!(ip, None, "XFF should be ignored when trust is disabled");
+    }
 
     #[test]
     fn test_allows_under_limit() {

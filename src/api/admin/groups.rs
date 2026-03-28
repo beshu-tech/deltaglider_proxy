@@ -74,7 +74,10 @@ pub async fn create_group(
             StatusCode::CONFLICT
         })?;
 
-    // Add members if provided in the creation request
+    // Add members if provided in the creation request.
+    // INSERT OR IGNORE silently skips non-existent user IDs — the reloaded
+    // group response will only contain successfully added members.
+    let mut failed_ids = Vec::new();
     for user_id in &body.member_ids {
         if let Err(e) = db.add_user_to_group(group.id, *user_id) {
             tracing::warn!(
@@ -83,7 +86,17 @@ pub async fn create_group(
                 group.name,
                 e
             );
+            failed_ids.push(*user_id);
         }
+    }
+    if !failed_ids.is_empty() {
+        tracing::warn!(
+            "Group '{}': {} of {} member_ids could not be added: {:?}",
+            group.name,
+            failed_ids.len(),
+            body.member_ids.len(),
+            failed_ids
+        );
     }
 
     // Reload group to include member_ids in the response

@@ -216,6 +216,16 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         info!("  Debug headers: enabled (DGP_DEBUG_HEADERS=true)");
     }
 
+    // --- Proxy header trust ---
+    let trust_proxy = std::env::var("DGP_TRUST_PROXY_HEADERS")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    if trust_proxy {
+        info!("  Proxy headers: trusted (DGP_TRUST_PROXY_HEADERS=true) — X-Forwarded-For/X-Real-IP used for rate limiting and aws:SourceIp");
+    } else {
+        info!("  Proxy headers: untrusted (default) — X-Forwarded-For/X-Real-IP ignored; set DGP_TRUST_PROXY_HEADERS=true behind a reverse proxy");
+    }
+
     // --- App state ---
     let state = Arc::new(AppState {
         engine: ArcSwap::from_pointee(engine),
