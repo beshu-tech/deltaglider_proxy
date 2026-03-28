@@ -118,8 +118,12 @@ pub(crate) fn evaluate_iam(
             if result.decision == Decision::Allow {
                 return true;
             }
-            // For bucket-level operations, also try with trailing slash
-            // (resource "bucket/*" should match bucket-level LIST on "bucket")
+            // Explicit Deny on the exact resource takes priority — don't try the alt path.
+            if result.decision == Decision::Deny {
+                return false;
+            }
+            // For bucket-level operations where no rule matched (implicit deny),
+            // also try with trailing slash so "bucket/*" can match bucket-level LIST.
             if key.is_empty() {
                 let alt_str = format!("arn:aws:s3:::{}/", bucket);
                 if let Ok(alt_arn) = Arn::parse(&alt_str) {

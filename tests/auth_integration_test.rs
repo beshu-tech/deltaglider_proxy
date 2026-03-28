@@ -705,8 +705,11 @@ async fn test_user_lifecycle_crud() {
     );
 
     // 5. Verify user can now write (permissions updated via hot-swap)
-    // Wait briefly for IAM index rebuild after permission update
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Wait for IAM index rebuild + recreate client to avoid stale SigV4 context
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let s3 = server
+        .s3_client_with_creds(&user.access_key_id, &user.secret_access_key)
+        .await;
     let put_result = s3
         .put_object()
         .bucket(server.bucket())
@@ -881,26 +884,17 @@ async fn test_iam_prefix_condition_blocks_dotfile_listing() {
         "listing with normal prefix should succeed"
     );
 
-    // List with dotfile prefix — Deny condition should fire.
-    // The middleware's fallback (can_see_bucket) may still allow listing
-    // if the explicit deny doesn't match the IAM evaluation path exactly.
-    // We verify the condition *wiring* by checking the response differs
-    // from a totally unauthorized request (which would be 403).
+    // List with dotfile prefix — Deny condition should fire
     let dotfile_list = s3
         .list_objects_v2()
         .bucket(server.bucket())
         .prefix(".hidden/")
         .send()
         .await;
-
-    // If conditions are enforced, this is Err; if not, it's still a valid
-    // integration point to verify. Log the result for visibility.
-    if dotfile_list.is_ok() {
-        eprintln!(
-            "NOTE: dotfile prefix listing was allowed — condition may not be \
-             enforced at middleware level (middleware fallback: can_see_bucket)"
-        );
-    }
+    assert!(
+        dotfile_list.is_err(),
+        "listing with dotfile prefix should be denied by Deny+condition"
+    );
 }
 
 // ============================================================================
@@ -959,12 +953,13 @@ async fn test_group_creation_and_permission_inheritance() {
     let result = s3.list_objects_v2().bucket(server.bucket()).send().await;
     assert!(result.is_err(), "user with no permissions should be denied");
 
-    // Create a group with read+list permissions
+    // Create a group with read+list permissions AND add the user as a member in one call
     let resp = admin
         .post(format!("{}/_/api/admin/groups", server.endpoint()))
         .json(&json!({
             "name": "readers",
-            "permissions": [{"effect": "Allow", "actions": ["read", "list"], "resources": ["*"]}]
+            "permissions": [{"effect": "Allow", "actions": ["read", "list"], "resources": ["*"]}],
+            "member_ids": [user.id]
         }))
         .send()
         .await
@@ -972,26 +967,7 @@ async fn test_group_creation_and_permission_inheritance() {
 
     assert!(
         resp.status().is_success(),
-        "create group should succeed, got {}",
-        resp.status()
-    );
-    let group_body: serde_json::Value = resp.json().await.unwrap();
-    let group_id = group_body["id"].as_i64().unwrap();
-
-    // Add user to the group
-    let resp = admin
-        .post(format!(
-            "{}/_/api/admin/groups/{}/members",
-            server.endpoint(),
-            group_id
-        ))
-        .json(&json!({"user_id": user.id}))
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        resp.status().is_success(),
-        "add member to group should succeed, got {}",
+        "create group with member_ids should succeed, got {}",
         resp.status()
     );
 
