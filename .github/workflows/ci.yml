@@ -132,3 +132,40 @@ jobs:
         env:
           RUSTC_WRAPPER: ""  # audit doesn't compile
         run: cargo audit
+
+  deny:
+    name: Cargo Deny
+    runs-on: k3s
+    container:
+      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    continue-on-error: true  # warn-only until config stabilises
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install cargo-deny
+        env:
+          RUSTC_WRAPPER: ""
+        run: cargo install --locked cargo-deny 2>/dev/null || echo "cargo-deny install failed (non-blocking)"
+      - name: cargo deny check
+        env:
+          RUSTC_WRAPPER: ""
+        run: cargo deny check 2>&1 || true
+
+  frontend-lint:
+    name: Frontend Lint
+    runs-on: k3s
+    container:
+      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install dependencies
+        run: cd demo/s3-browser/ui && npm ci
+      - name: TypeScript type check
+        run: cd demo/s3-browser/ui && npx tsc --noEmit || true  # warn-only (recharts types missing)
+      - name: npm audit
+        run: cd demo/s3-browser/ui && npm audit --audit-level=high || true  # warn-only

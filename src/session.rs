@@ -33,6 +33,7 @@ pub struct S3SessionCredentials {
 }
 
 impl Drop for S3SessionCredentials {
+    #[allow(unsafe_code)]
     fn drop(&mut self) {
         // Zero out the secret on drop to prevent lingering in memory.
         // SAFETY: we own the String and are about to drop it; overwriting

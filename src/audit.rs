@@ -33,6 +33,9 @@ pub fn extract_client_info(headers: &HeaderMap) -> (String, String) {
 /// Emit a structured audit log line for any mutation operation.
 ///
 /// Format: `AUDIT | action=X | user=X | target=X | ip=X | ua=X | bucket=X | path=X`
+///
+/// `bucket` and `path` default to `""` when not applicable (admin API calls).
+/// Use `audit_log_admin()` for admin actions that don't involve S3 resources.
 pub fn audit_log(
     action: &str,
     user: &str,

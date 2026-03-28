@@ -79,7 +79,8 @@ pub(crate) fn trigger_config_sync(state: &Arc<AdminState>) {
     }
 }
 
-/// Admin audit log helper — delegates to the shared audit module.
+/// Admin audit log helper — delegates to `crate::audit::audit_log` with empty bucket/path.
+/// Exists to avoid passing `"", ""` at every admin API call site.
 pub(crate) fn audit_log(
     action: &str,
     admin_user: &str,

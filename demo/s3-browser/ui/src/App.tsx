@@ -310,7 +310,7 @@ export default function App() {
               setSiderOpen(false);
             }}
             onLogout={handleLogout}
-            currentUser={localStorage.getItem('dg-access-key-id') || undefined}
+            currentUser={getCredentials().accessKeyId || undefined}
             displayName={identity?.user?.name || undefined}
             canAdmin={identity?.mode === 'bootstrap' || identity?.mode === 'open' || identity?.user?.is_admin === true}
           />
