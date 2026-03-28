@@ -151,8 +151,6 @@ async fn minio_client() -> Client {
     Client::from_conf(config)
 }
 
-
-
 /// Test server wrapper for DeltaGlider Proxy
 struct TestProxyServer {
     process: Child,
@@ -180,8 +178,8 @@ impl TestProxyServer {
         // Write stderr to a file instead of null — keeps debug output for diagnosis
         // without the pipe buffer deadlock risk of Stdio::piped() (>64KB blocks).
         let stderr_path = data_dir.path().join("proxy.stderr.log");
-        let stderr_file = std::fs::File::create(&stderr_path)
-            .expect("Failed to create proxy stderr log");
+        let stderr_file =
+            std::fs::File::create(&stderr_path).expect("Failed to create proxy stderr log");
 
         let process = cmd
             .env("DGP_LISTEN_ADDR", format!("127.0.0.1:{}", port))
@@ -244,7 +242,6 @@ impl TestProxyServer {
 
         Client::from_conf(config)
     }
-
 }
 
 impl Drop for TestProxyServer {
