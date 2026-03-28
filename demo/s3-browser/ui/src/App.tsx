@@ -13,7 +13,7 @@ import UploadPage from './components/UploadPage';
 import ConnectPage from './components/ConnectPage';
 import MetricsPage from './components/MetricsPage';
 import ApiDocsPage from './components/ApiDocsPage';
-import { getBucket, hasCredentials, setCredentials } from './s3client';
+import { getBucket, hasCredentials, disconnect, initFromSession, getCredentials } from './s3client';
 import { adminLogout, whoami } from './adminApi';
 import type { WhoamiResponse } from './adminApi';
 import { useColors } from './ThemeContext';
@@ -92,17 +92,25 @@ export default function App() {
 
   const [view, setView] = useHashRouter();
   const [siderOpen, setSiderOpen] = useState(false);
-  const [needsConnect, setNeedsConnect] = useState(!hasCredentials());
+  const [needsConnect, setNeedsConnect] = useState(true); // start true, resolved in useEffect
+  const [sessionLoading, setSessionLoading] = useState(true);
   const [firstLoadDone, setFirstLoadDone] = useState(false);
   const [previewObject, setPreviewObject] = useState<import('./types').S3Object | null>(null);
   const [identity, setIdentity] = useState<WhoamiResponse | null>(null);
 
+    // Restore credentials from server-side session on mount
+  useEffect(() => {
+    initFromSession().then((restored) => {
+      setNeedsConnect(!restored);
+      setSessionLoading(false);
+    });
+  }, []);
+
   // Check identity after S3 connection is established
   useEffect(() => {
     if (!needsConnect) {
-      const ak = localStorage.getItem('dg-access-key-id') || undefined;
-      const sk = localStorage.getItem('dg-secret-access-key') || undefined;
-      whoami(ak, sk).then(setIdentity);
+      const creds = getCredentials();
+      whoami(creds.accessKeyId, creds.secretAccessKey).then(setIdentity);
     } else {
       setIdentity(null);
     }
@@ -151,7 +159,7 @@ export default function App() {
 
   const handleLogout = () => {
     // Clear S3 credentials
-    setCredentials('', '');
+    disconnect();
     // Clear admin session
     adminLogout().catch(() => {});
     setFirstLoadDone(false);
@@ -165,6 +173,14 @@ export default function App() {
   };
 
   const isEmpty = s3.objects.length === 0 && s3.folders.length === 0;
+
+  if (sessionLoading) {
+    return (
+      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh' }}>
+        <Spin size="large" tip="Restoring session..." />
+      </div>
+    );
+  }
 
   if (needsConnect) {
     return (

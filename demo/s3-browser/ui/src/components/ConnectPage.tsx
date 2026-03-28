@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Button, Input, Typography, Space, Alert } from 'antd';
 import { ApiOutlined } from '@ant-design/icons';
-import { testConnection, setEndpoint, setCredentials, setBucket } from '../s3client';
+import { testConnection, setEndpoint, setCredentials, setBucket, initFromSession } from '../s3client';
 import { adminLogin, whoami } from '../adminApi';
 import { detectDefaultEndpoint } from '../utils';
 import { useColors } from '../ThemeContext';
@@ -27,9 +27,37 @@ export default function ConnectPage({ onConnect, showError }: Props) {
     setLoading(true);
     setError('');
     try {
-      // Trim trailing slashes from endpoint
+      // Step 1: Admin login first (if password provided) — this auto-populates
+      // S3 credentials in the server-side session, so we may not need manual S3 creds.
+      if (adminPassword) {
+        const adminResult = await adminLogin(adminPassword);
+        if (!adminResult.ok) {
+          setError(`Admin login failed: ${adminResult.error || 'Invalid password'}`);
+          setLoading(false);
+          return;
+        }
+
+        // Try to restore S3 creds from the session (auto-populated by login)
+        const restored = await initFromSession();
+        if (restored) {
+          // Login auto-connected us — discover buckets
+          try {
+            const info = await whoami(accessKey || undefined, secretKey || undefined);
+            setAuthMode(info.mode);
+          } catch { /* non-critical */ }
+          onConnect();
+          return;
+        }
+        // If no creds came back (open-access mode), fall through to manual S3 entry
+      }
+
+      // Step 2: Manual S3 connection (if no admin login, or admin had no S3 creds)
       const cleanEndpoint = endpoint.trim().replace(/\/+$/, '');
-      // Step 1: Test S3 connection
+      if (!accessKey.trim() || !secretKey.trim()) {
+        setError('S3 Access Key and Secret Key are required');
+        setLoading(false);
+        return;
+      }
       const result = await testConnection(cleanEndpoint, accessKey, secretKey);
       if (!result.ok) {
         setError(`S3 connection failed: ${result.error || 'Unknown error'}`);
@@ -37,29 +65,18 @@ export default function ConnectPage({ onConnect, showError }: Props) {
         return;
       }
 
-      // S3 succeeded — persist credentials
+      // S3 succeeded — persist credentials to server session
       setEndpoint(cleanEndpoint);
       setCredentials(accessKey, secretKey);
       if (result.buckets && result.buckets.length > 0) {
         setBucket(result.buckets[0]);
       }
 
-      // Detect auth mode after successful S3 connection
+      // Detect auth mode
       try {
         const info = await whoami(accessKey, secretKey);
         setAuthMode(info.mode);
-      } catch {
-        // Non-critical — continue without auth mode detection
-      }
-
-      // Step 2: Admin login (optional — don't block connect on failure)
-      if (adminPassword) {
-        const adminResult = await adminLogin(adminPassword);
-        if (!adminResult.ok) {
-          setError(`Connected to S3, but admin login failed: ${adminResult.error || 'Invalid password'}. You can access settings later.`);
-          // Still proceed — S3 works
-        }
-      }
+      } catch { /* non-critical */ }
 
       onConnect();
     } catch (e) {
@@ -69,7 +86,8 @@ export default function ConnectPage({ onConnect, showError }: Props) {
     }
   };
 
-  const canSubmit = endpoint.trim() && accessKey.trim() && secretKey.trim();
+  // Admin password alone is enough (login auto-connects). S3 creds are needed only for manual connect.
+  const canSubmit = adminPassword.trim() || (endpoint.trim() && accessKey.trim() && secretKey.trim());
 
   return (
     <div style={{

@@ -3,6 +3,7 @@
 use parking_lot::RwLock;
 use rand::rngs::OsRng;
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
@@ -20,9 +21,35 @@ fn default_session_ttl() -> Duration {
     Duration::from_secs(hours * 3600)
 }
 
+/// S3 credentials stored in a server-side session.
+/// Held in memory only — never written to disk or localStorage.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct S3SessionCredentials {
+    pub endpoint: String,
+    pub region: String,
+    pub bucket: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+}
+
+impl Drop for S3SessionCredentials {
+    fn drop(&mut self) {
+        // Zero out the secret on drop to prevent lingering in memory.
+        // SAFETY: we own the String and are about to drop it; overwriting
+        // the UTF-8 bytes with zeros is safe (zeros are valid UTF-8).
+        unsafe {
+            self.secret_access_key
+                .as_bytes_mut()
+                .iter_mut()
+                .for_each(|b| *b = 0);
+        }
+    }
+}
+
 struct SessionInfo {
     created_at: Instant,
     ip: Option<IpAddr>,
+    s3_creds: Option<S3SessionCredentials>,
 }
 
 /// Thread-safe in-memory session store.
@@ -82,6 +109,7 @@ impl SessionStore {
             SessionInfo {
                 created_at: Instant::now(),
                 ip,
+                s3_creds: None,
             },
         );
 
@@ -116,6 +144,33 @@ impl SessionStore {
     /// Remove a session (logout).
     pub fn remove(&self, token: &str) {
         self.sessions.write().remove(token);
+    }
+
+    /// Store S3 credentials in an existing session.
+    pub fn set_s3_creds(&self, token: &str, creds: S3SessionCredentials) {
+        let mut sessions = self.sessions.write();
+        if let Some(info) = sessions.get_mut(token) {
+            info.s3_creds = Some(creds);
+        }
+    }
+
+    /// Retrieve S3 credentials from a session (if present and session is valid).
+    pub fn get_s3_creds(&self, token: &str) -> Option<S3SessionCredentials> {
+        let sessions = self.sessions.read();
+        sessions.get(token).and_then(|info| {
+            if info.created_at.elapsed() >= self.ttl {
+                return None;
+            }
+            info.s3_creds.clone()
+        })
+    }
+
+    /// Clear S3 credentials from a session.
+    pub fn clear_s3_creds(&self, token: &str) {
+        let mut sessions = self.sessions.write();
+        if let Some(info) = sessions.get_mut(token) {
+            info.s3_creds = None;
+        }
     }
 
     /// Remove all expired sessions.

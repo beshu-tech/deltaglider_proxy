@@ -68,6 +68,13 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             "/_/api/admin/backup",
             get(admin::export_backup).post(admin::import_backup),
         )
+        // S3 session credentials (server-side credential storage)
+        .route(
+            "/_/api/admin/session/s3-credentials",
+            get(admin::get_s3_session_creds)
+                .put(admin::set_s3_session_creds)
+                .delete(admin::clear_s3_session_creds),
+        )
         // Usage scanner
         .route("/_/api/admin/usage/scan", post(admin::scan_usage))
         .route("/_/api/admin/usage", get(admin::get_usage))

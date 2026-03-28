@@ -22,8 +22,9 @@ use crate::usage_scanner::UsageScanner;
 
 // Re-export everything so external code doesn't need import changes.
 pub use auth::{
-    check_session, login, login_as, logout, require_session, whoami, LoginAsRequest, LoginResponse,
-    SessionResponse, WhoamiQuery, WhoamiResponse, WhoamiUser,
+    check_session, clear_s3_session_creds, get_s3_session_creds, login, login_as, logout,
+    require_session, set_s3_session_creds, whoami, LoginAsRequest, LoginResponse, SessionResponse,
+    WhoamiQuery, WhoamiResponse, WhoamiUser,
 };
 pub use backup::{export_backup, import_backup};
 pub use config::{

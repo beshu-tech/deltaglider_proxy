@@ -25,6 +25,7 @@ export async function adminLogin(password: string): Promise<{ ok: boolean; error
 
 export async function adminLogout(): Promise<void> {
   await adminFetch('/api/admin/logout', 'POST');
+  // Session is destroyed server-side — S3 credentials are cleared with it
 }
 
 export interface AdminConfig {
