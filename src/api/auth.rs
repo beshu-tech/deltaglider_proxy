@@ -513,6 +513,11 @@ pub async fn sigv4_auth_middleware(
             if let Some(m) = &metrics {
                 m.auth_attempts_total.with_label_values(&["success"]).inc();
             }
+            // Reset rate limiter on successful auth so legitimate users
+            // aren't permanently penalized after a single failure
+            if let (Some(rl), Some(ip)) = (&rate_limiter, &client_ip) {
+                rl.record_success(ip);
+            }
         }
         Err(e) => {
             record_auth_failure("invalid_signature");
