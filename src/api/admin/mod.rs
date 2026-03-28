@@ -1,6 +1,7 @@
 //! Admin GUI API handlers (separate from S3 SigV4 auth).
 
 mod auth;
+mod backup;
 mod config;
 mod groups;
 mod scanner;
@@ -24,6 +25,7 @@ pub use auth::{
     check_session, login, login_as, logout, require_session, whoami, LoginAsRequest, LoginResponse,
     SessionResponse, WhoamiQuery, WhoamiResponse, WhoamiUser,
 };
+pub use backup::{export_backup, import_backup};
 pub use config::{
     change_password, get_config, test_s3_connection, update_config, ConfigResponse,
     ConfigUpdateRequest, ConfigUpdateResponse, PasswordChangeRequest, PasswordChangeResponse,

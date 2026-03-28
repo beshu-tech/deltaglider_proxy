@@ -330,6 +330,20 @@ export async function getPrefixUsage(bucket: string, prefix: string): Promise<Us
   return safeJson(res);
 }
 
+// === IAM Backup/Restore ===
+
+export async function exportBackup(): Promise<unknown> {
+  const res = await adminFetch('/api/admin/backup');
+  if (!res.ok) throw new Error(`Export failed: ${res.status}`);
+  return safeJson(res);
+}
+
+export async function importBackup(data: unknown): Promise<{ users_created: number; groups_created: number; users_skipped: number; groups_skipped: number }> {
+  const res = await adminFetch('/api/admin/backup', 'POST', data);
+  if (!res.ok) throw new Error(`Import failed: ${res.status}`);
+  return safeJson(res);
+}
+
 export async function loginAs(accessKeyId: string, secretAccessKey: string): Promise<{ ok: boolean; error?: string }> {
   const res = await adminFetch('/api/admin/login-as', 'POST', {
     access_key_id: accessKeyId,
