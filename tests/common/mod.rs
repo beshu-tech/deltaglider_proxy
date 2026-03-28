@@ -135,6 +135,8 @@ impl TestServer {
             .env("RUST_LOG", "deltaglider_proxy=warn")
             // Enable debug headers so tests can inspect x-amz-storage-type etc.
             .env("DGP_DEBUG_HEADERS", "true")
+            // Trust proxy headers in tests so rate limiting and aws:SourceIp work
+            .env("DGP_TRUST_PROXY_HEADERS", "true")
             .spawn()
             .expect("Failed to start server");
 

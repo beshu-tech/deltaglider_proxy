@@ -151,33 +151,7 @@ async fn minio_client() -> Client {
     Client::from_conf(config)
 }
 
-/// Run DeltaGlider CLI command natively
-#[allow(dead_code)]
-fn run_deltaglider_cli(args: &[&str]) -> std::io::Result<std::process::Output> {
-    deltaglider_cmd().args(args).output()
-}
 
-/// Run DeltaGlider CLI with stdin data
-#[allow(dead_code)]
-fn run_deltaglider_cli_with_stdin(
-    args: &[&str],
-    stdin_data: &[u8],
-) -> std::io::Result<std::process::Output> {
-    use std::io::Write;
-
-    let mut child = deltaglider_cmd()
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(stdin_data)?;
-    }
-
-    child.wait_with_output()
-}
 
 /// Test server wrapper for DeltaGlider Proxy
 struct TestProxyServer {
@@ -192,8 +166,24 @@ impl TestProxyServer {
         let port = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
         let data_dir = TempDir::new().expect("Failed to create temp dir");
 
-        let process = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"))
-            .env_clear()
+        // env_clear() prevents sccache/AWS var leaks, but we must pass through
+        // system vars the binary may need (dynamic linker, temp dirs, etc.)
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"));
+        cmd.env_clear();
+        // Pass through essential system environment variables
+        for var in ["PATH", "LD_LIBRARY_PATH", "HOME", "TMPDIR"] {
+            if let Ok(val) = std::env::var(var) {
+                cmd.env(var, val);
+            }
+        }
+
+        // Write stderr to a file instead of null — keeps debug output for diagnosis
+        // without the pipe buffer deadlock risk of Stdio::piped() (>64KB blocks).
+        let stderr_path = data_dir.path().join("proxy.stderr.log");
+        let stderr_file = std::fs::File::create(&stderr_path)
+            .expect("Failed to create proxy stderr log");
+
+        let process = cmd
             .env("DGP_LISTEN_ADDR", format!("127.0.0.1:{}", port))
             .env("DGP_S3_ENDPOINT", minio_endpoint())
             .env("DGP_S3_REGION", "us-east-1")
@@ -201,10 +191,8 @@ impl TestProxyServer {
             .env("DGP_BE_AWS_ACCESS_KEY_ID", MINIO_ACCESS_KEY)
             .env("DGP_BE_AWS_SECRET_ACCESS_KEY", MINIO_SECRET_KEY)
             .env("RUST_LOG", "deltaglider_proxy=debug")
-            // Use null instead of piped to avoid pipe buffer deadlock
-            // (proxy may write >64KB to stdout/stderr, blocking on full pipe)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr_file))
             .spawn()
             .expect("Failed to start proxy server");
 
@@ -220,9 +208,12 @@ impl TestProxyServer {
             sleep(Duration::from_millis(100)).await;
         }
         if !ready {
+            // Dump proxy stderr for diagnosis
+            let stderr_log = std::fs::read_to_string(&stderr_path).unwrap_or_default();
             panic!(
-                "Proxy server failed to start on port {} within 15 seconds",
-                port
+                "Proxy server failed to start on port {} within 15 seconds.\nProxy stderr:\n{}",
+                port,
+                &stderr_log[..stderr_log.len().min(4096)]
             );
         }
 
@@ -254,10 +245,6 @@ impl TestProxyServer {
         Client::from_conf(config)
     }
 
-    #[allow(dead_code)]
-    fn endpoint(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
-    }
 }
 
 impl Drop for TestProxyServer {

@@ -91,11 +91,13 @@ jobs:
           done
           mc mb --ignore-existing local/deltaglider-test
           mc mb --ignore-existing local/deltaglider-data
+          # Exported as env var for interop tests — read by minio_endpoint() in tests/interop_test.rs
           echo "MINIO_ENDPOINT=http://localhost:9000" >> $GITHUB_ENV
       - name: Install DeltaGlider CLI
         run: |
           # Builder image is rust:1-bookworm — install pip if missing
-          command -v pip3 >/dev/null 2>&1 || apt-get update -qq && apt-get install -y -qq python3-pip >/dev/null
+          # NB: braces required — `||` has lower precedence than `&&` in shell
+          command -v pip3 >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq python3-pip >/dev/null; }
           pip3 install --quiet --break-system-packages deltaglider
           deltaglider --version
       - name: cargo test (all, including interop)

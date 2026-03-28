@@ -130,20 +130,30 @@ pub async fn authorization_middleware(
         }
     }
 
-    // aws:SourceIp — from headers
-    let client_ip = request
-        .headers()
-        .get("x-forwarded-for")
-        .or_else(|| request.headers().get("x-real-ip"))
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string());
-    if let Some(ip) = client_ip {
-        context.insert("aws:SourceIp".to_string(), iam_rs::ContextValue::String(ip));
+    // aws:SourceIp — from proxy headers (only when DGP_TRUST_PROXY_HEADERS=true)
+    // Uses the same trust check as rate_limiter to prevent IP spoofing.
+    if let Some(ip) = crate::rate_limiter::extract_client_ip(request.headers()) {
+        context.insert(
+            "aws:SourceIp".to_string(),
+            iam_rs::ContextValue::String(ip.to_string()),
+        );
     }
 
-    // ListObjects (GET /bucket) with prefix-scoped permissions:
-    // Allow listing if the user has ANY permission on the bucket,
-    // BUT respect explicit Deny rules (including those with conditions).
+    // ListObjects (GET /bucket) — three-way evaluation:
+    //
+    // 1. If an Allow rule matches (possibly via trailing-slash alt-path in evaluate_iam),
+    //    the request is allowed. This handles `"resources": ["bucket/*"]` matching bucket-level LIST.
+    //
+    // 2. If an explicit Deny matches (including condition-based Deny like `s3:prefix ".*"`),
+    //    the request is blocked immediately — Deny always wins.
+    //
+    // 3. If neither Allow nor Deny matched (implicit deny from no matching rules),
+    //    fall back to bucket visibility: allow LIST if the user has ANY permission
+    //    that references this bucket. This ensures users with prefix-scoped permissions
+    //    (e.g. `"bucket/myprefix/*"`) can still LIST the bucket to discover their objects.
+    //
+    // This matches AWS behaviour where a user with s3:GetObject on bucket/* can
+    // ListBucket even without an explicit s3:ListBucket statement.
     let allowed = if action == S3Action::List && key.is_empty() {
         if user.can_with_context(action, bucket, key, &context) {
             true

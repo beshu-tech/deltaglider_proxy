@@ -554,21 +554,20 @@ async fn test_replay_attack_detected() {
         .await
         .unwrap();
 
-    // The second request should either:
-    // - Be rejected as replay (400 or 403)
-    // - OR both succeed if replay cache doesn't catch it (implementation may vary)
-    // We check that if the first succeeded, the second is flagged
-    if status1.is_success() || status1 == StatusCode::NOT_FOUND {
-        // The first request was valid (not a clock skew issue).
-        // The second may be flagged as replay.
-        // Note: this depends on whether the replay cache is enabled.
-        // We just verify no server error (500).
-        assert_ne!(
-            resp2.status(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "replay should not cause server error"
-        );
-    }
+    // The first request should succeed (valid credentials, current timestamp).
+    assert!(
+        status1.is_success() || status1 == StatusCode::NOT_FOUND,
+        "first request should not be rejected, got {}",
+        status1
+    );
+
+    // The second request uses the exact same signature — replay cache should catch it.
+    // Expected: 400 (InvalidArgument "Request replay detected") per auth.rs.
+    assert!(
+        resp2.status() == StatusCode::BAD_REQUEST || resp2.status() == StatusCode::FORBIDDEN,
+        "replayed request should be rejected as 400 or 403, got {}",
+        resp2.status()
+    );
 }
 
 // ============================================================================
@@ -774,7 +773,8 @@ async fn test_brute_force_rate_limiting() {
 
     let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
 
-    // Send 15 rapid requests with wrong credentials
+    // Send 15 rapid requests with wrong credentials from the same "IP"
+    // (via X-Forwarded-For header, trusted because DGP_TRUST_PROXY_HEADERS=true in tests)
     let mut statuses = Vec::new();
     for i in 0..15 {
         let resp = build_signed_get(
@@ -784,6 +784,7 @@ async fn test_brute_force_rate_limiting() {
             &format!("wrong_secret_{}", i),
             &now,
         )
+        .header("x-forwarded-for", "10.0.0.99")
         .send()
         .await
         .unwrap();
@@ -803,33 +804,29 @@ async fn test_brute_force_rate_limiting() {
         );
     }
 
-    // Check if any requests got rate-limited (429 or 503)
-    let rate_limited = statuses
+    // Rate limiter threshold is 5 failures per 15-min window (default_auth()).
+    // After 15 rapid failures, we must see 503 SlowDown responses.
+    let rate_limited_count = statuses
         .iter()
-        .any(|s| *s == StatusCode::SERVICE_UNAVAILABLE || s.as_u16() == 429 || s.as_u16() == 503);
+        .filter(|s| s.as_u16() == 503 || s.as_u16() == 429)
+        .count();
 
-    // If rate limiting is active, verify that a valid request still works
-    // (rate limiting is per-IP, and our test client IP may be 127.0.0.1)
-    let valid_resp = server
-        .s3_client_with_creds("testkey", "testsecret")
-        .await
-        .list_objects_v2()
-        .bucket(server.bucket())
-        .send()
-        .await;
+    // At least some requests after the 5th should be rate-limited
+    assert!(
+        rate_limited_count > 0,
+        "expected rate limiting after 15 failures, but all {} responses were: {:?}",
+        statuses.len(),
+        statuses
+    );
 
-    // Note: valid request may also be rate-limited if it comes from same IP.
-    // This test mainly verifies the server stays stable under brute force.
-    if rate_limited {
-        // Good — rate limiting kicked in
-        eprintln!("Rate limiting triggered after {} attempts", statuses.len());
-    } else {
-        eprintln!("No rate limiting observed (may not be enabled or threshold not reached)");
-    }
-
-    // Final sanity: valid credentials should not get a 500
-    if let Ok(result) = valid_resp {
-        assert!(result.key_count().is_some());
+    // Verify the server didn't crash — no 500s
+    for (i, status) in statuses.iter().enumerate() {
+        assert_ne!(
+            *status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "attempt {} should not cause server error",
+            i
+        );
     }
 }
 

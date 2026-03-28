@@ -14,13 +14,11 @@ pub fn sanitize(s: &str) -> String {
 }
 
 /// Extract client IP and user-agent from request headers.
+/// Uses `rate_limiter::extract_client_ip` which respects `DGP_TRUST_PROXY_HEADERS`.
 pub fn extract_client_info(headers: &HeaderMap) -> (String, String) {
-    let ip = headers
-        .get("x-forwarded-for")
-        .or_else(|| headers.get("x-real-ip"))
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string();
+    let ip = crate::rate_limiter::extract_client_ip(headers)
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
     let ua_raw = headers
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
