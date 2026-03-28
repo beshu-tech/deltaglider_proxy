@@ -129,6 +129,7 @@ export interface IamPermission {
   effect?: string; // "Allow" or "Deny", defaults to "Allow"
   actions: string[];
   resources: string[];
+  conditions?: Record<string, Record<string, string | string[]>>;
 }
 
 // === Canned Policies ===
