@@ -5,6 +5,7 @@ import type { IamUser } from '../adminApi';
 import { getUsers, deleteUser } from '../adminApi';
 import { useColors } from '../ThemeContext';
 import UserForm from './UserForm';
+import CredentialsBanner from './CredentialsBanner';
 
 const { Text } = Typography;
 
@@ -204,22 +205,11 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
         {/* Credentials banner after create */}
         {newCreds && (
           <div style={{ padding: '16px 28px 0' }}>
-            <Alert
-              type="success"
-              showIcon
-              closable
-              onClose={() => setNewCreds(null)}
+            <CredentialsBanner
+              accessKey={newCreds.ak}
+              secretKey={newCreds.sk}
               message="User created — save these credentials"
-              description={
-                <div style={{ marginTop: 8 }}>
-                  <Text type="secondary" style={{ fontSize: 10, textTransform: 'uppercase' }}>Access Key</Text>
-                  <div><Text code copyable style={{ fontFamily: 'var(--font-mono)' }}>{newCreds.ak}</Text></div>
-                  <Text type="secondary" style={{ fontSize: 10, textTransform: 'uppercase', marginTop: 8, display: 'block' }}>Secret Key</Text>
-                  <div><Text code copyable style={{ fontFamily: 'var(--font-mono)', wordBreak: 'break-all' }}>{newCreds.sk}</Text></div>
-                  <Text type="warning" style={{ fontSize: 11, marginTop: 8, display: 'block' }}>The secret will not be shown again.</Text>
-                </div>
-              }
-              style={{ borderRadius: 8 }}
+              onClose={() => setNewCreds(null)}
             />
           </div>
         )}
