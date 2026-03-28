@@ -13,9 +13,37 @@ import type { ListObjectsV2CommandOutput } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import type { S3Object, ListResult, BucketInfo } from './types';
 import { detectDefaultEndpoint } from './utils';
+import {
+  fetchSessionCredentials,
+  storeSessionCredentials,
+  clearSessionCredentials,
+} from './sessionApi';
 
-let activeBucket = localStorage.getItem('dg-bucket') || 'ror-builds-xdelta';
-let activeRegion = localStorage.getItem('dg-region') || 'us-east-1';
+// ── In-memory credential store (never persisted to localStorage) ──
+
+let activeBucket = localStorage.getItem('dg-bucket') || '';
+let activeRegion = 'us-east-1';
+let activeEndpoint = '';
+let activeAccessKeyId = '';
+let activeSecretAccessKey = '';
+
+/**
+ * Initialise credentials from the server-side session.
+ * Called once on app startup — if the session has stored S3 creds
+ * (auto-populated after login), they're loaded into memory.
+ * Returns true if credentials were restored.
+ */
+export async function initFromSession(): Promise<boolean> {
+  const creds = await fetchSessionCredentials();
+  if (!creds) return false;
+  activeEndpoint = creds.endpoint || detectDefaultEndpoint();
+  activeRegion = creds.region || 'us-east-1';
+  activeAccessKeyId = creds.access_key_id;
+  activeSecretAccessKey = creds.secret_access_key;
+  if (creds.bucket) activeBucket = creds.bucket;
+  cachedClient = null;
+  return Boolean(creds.access_key_id && creds.secret_access_key);
+}
 
 export function getBucket(): string {
   return activeBucket;
@@ -32,36 +60,54 @@ export function getRegion(): string {
 
 export function setRegion(region: string) {
   activeRegion = region;
-  localStorage.setItem('dg-region', region);
   cachedClient = null;
 }
 
 export function getEndpoint(): string {
-  return localStorage.getItem('dg-endpoint') || detectDefaultEndpoint();
+  return activeEndpoint || detectDefaultEndpoint();
 }
 
 export function setEndpoint(url: string) {
-  localStorage.setItem('dg-endpoint', url);
+  activeEndpoint = url;
   cachedClient = null;
 }
 
 export function getCredentials(): { accessKeyId: string; secretAccessKey: string } {
   return {
-    accessKeyId: localStorage.getItem('dg-access-key-id') || '',
-    secretAccessKey: localStorage.getItem('dg-secret-access-key') || '',
+    accessKeyId: activeAccessKeyId,
+    secretAccessKey: activeSecretAccessKey,
   };
 }
 
 export function setCredentials(accessKeyId: string, secretAccessKey: string) {
-  localStorage.setItem('dg-access-key-id', accessKeyId);
-  localStorage.setItem('dg-secret-access-key', secretAccessKey);
+  activeAccessKeyId = accessKeyId;
+  activeSecretAccessKey = secretAccessKey;
   cachedClient = null;
+  // Persist to server-side session (fire-and-forget)
+  storeSessionCredentials({
+    endpoint: activeEndpoint,
+    region: activeRegion,
+    bucket: activeBucket,
+    access_key_id: accessKeyId,
+    secret_access_key: secretAccessKey,
+  });
 }
 
 export function hasCredentials(): boolean {
-  const ak = localStorage.getItem('dg-access-key-id');
-  const sk = localStorage.getItem('dg-secret-access-key');
-  return Boolean(ak && sk);
+  return Boolean(activeAccessKeyId && activeSecretAccessKey);
+}
+
+/** Clear all credentials from memory and server session. */
+export function disconnect() {
+  activeAccessKeyId = '';
+  activeSecretAccessKey = '';
+  activeEndpoint = '';
+  cachedClient = null;
+  // Remove legacy localStorage keys (migration cleanup)
+  localStorage.removeItem('dg-access-key-id');
+  localStorage.removeItem('dg-secret-access-key');
+  localStorage.removeItem('dg-endpoint');
+  clearSessionCredentials();
 }
 
 let cachedClient: S3Client | null = null;

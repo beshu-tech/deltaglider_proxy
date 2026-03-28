@@ -13,6 +13,7 @@ use subtle::ConstantTimeEq;
 
 use crate::iam::IamState;
 use crate::rate_limiter;
+use crate::session::S3SessionCredentials;
 
 use super::{audit_log, AdminState};
 
@@ -159,6 +160,29 @@ pub async fn login(
     let token = state
         .sessions
         .create_session(rate_limiter::extract_client_ip(&req_headers));
+
+    // Auto-populate S3 credentials from config so "login IS connect".
+    // The legacy access_key_id/secret_access_key are the proxy's own auth credentials.
+    {
+        let config = state.config.read();
+        if let (Some(ak), Some(sk)) = (&config.access_key_id, &config.secret_access_key) {
+            let region = match &config.backend {
+                crate::config::BackendConfig::S3 { region, .. } => region.clone(),
+                _ => "us-east-1".to_string(),
+            };
+            state.sessions.set_s3_creds(
+                &token,
+                S3SessionCredentials {
+                    // Empty endpoint = same origin (GUI is served by the proxy)
+                    endpoint: String::new(),
+                    region,
+                    bucket: String::new(), // frontend discovers via ListBuckets
+                    access_key_id: ak.clone(),
+                    secret_access_key: sk.clone(),
+                },
+            );
+        }
+    }
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -321,6 +345,26 @@ pub async fn login_as(
     let token = state
         .sessions
         .create_session(rate_limiter::extract_client_ip(&req_headers));
+
+    // Auto-populate S3 credentials from the IAM login so "login IS connect"
+    {
+        let config = state.config.read();
+        let region = match &config.backend {
+            crate::config::BackendConfig::S3 { region, .. } => region.clone(),
+            _ => "us-east-1".to_string(),
+        };
+        state.sessions.set_s3_creds(
+            &token,
+            S3SessionCredentials {
+                endpoint: String::new(), // same origin
+                region,
+                bucket: String::new(),
+                access_key_id: body.access_key_id.clone(),
+                secret_access_key: body.secret_access_key.clone(),
+            },
+        );
+    }
+
     tracing::info!(
         "Admin session created via login-as for '{}' ({})",
         user.name,
@@ -359,6 +403,52 @@ pub async fn require_session(
     }
 
     next.run(request).await.into_response()
+}
+
+// ── S3 Session Credentials ──
+
+/// GET /api/admin/session/s3-credentials — retrieve stored S3 credentials.
+/// Returns 404 if no credentials are stored in this session.
+pub async fn get_s3_session_creds(
+    State(state): State<Arc<AdminState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let token = match extract_session_token(&headers) {
+        Some(t) => t,
+        None => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+    match state.sessions.get_s3_creds(&token) {
+        Some(creds) => (StatusCode::OK, Json(creds)).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// PUT /api/admin/session/s3-credentials — store or update S3 credentials.
+/// Used by the ConnectPage when connecting to a custom endpoint.
+pub async fn set_s3_session_creds(
+    State(state): State<Arc<AdminState>>,
+    headers: HeaderMap,
+    Json(creds): Json<S3SessionCredentials>,
+) -> impl IntoResponse {
+    let token = match extract_session_token(&headers) {
+        Some(t) => t,
+        None => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+    state.sessions.set_s3_creds(&token, creds);
+    StatusCode::OK.into_response()
+}
+
+/// DELETE /api/admin/session/s3-credentials — clear S3 credentials (disconnect).
+pub async fn clear_s3_session_creds(
+    State(state): State<Arc<AdminState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let token = match extract_session_token(&headers) {
+        Some(t) => t,
+        None => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+    state.sessions.clear_s3_creds(&token);
+    StatusCode::OK.into_response()
 }
 
 #[cfg(test)]
