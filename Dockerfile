@@ -18,7 +18,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 # ── Build stage: dependency cache (only reruns when recipe.json changes) ──
 FROM chef AS rust-deps
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get -o Acquire::Retries=3 update && apt-get install -y --no-install-recommends \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=planner /app/recipe.json recipe.json
@@ -62,7 +62,7 @@ LABEL org.opencontainers.image.title="DeltaGlider Proxy" \
       org.opencontainers.image.source="https://github.com/sscarduzio/deltaglider-proxy" \
       org.opencontainers.image.licenses="MIT"
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get -o Acquire::Retries=3 update && apt-get install -y --no-install-recommends \
     ca-certificates xdelta3 curl \
     && rm -rf /var/lib/apt/lists/*
 RUN groupadd --system dg && useradd --system --gid dg --no-create-home dg
