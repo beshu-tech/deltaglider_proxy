@@ -174,7 +174,12 @@ impl RateLimiter {
 fn trust_proxy_headers() -> bool {
     std::env::var("DGP_TRUST_PROXY_HEADERS")
         .map(|v| v == "true" || v == "1")
-        .unwrap_or(false)
+        // Default true: preserves pre-v0.5.2 behaviour. Rate limiting and
+        // aws:SourceIp conditions require an IP, which currently only comes
+        // from these headers. Set to "false" only if clients connect directly
+        // (no reverse proxy) AND you accept that rate limiting is disabled.
+        // TODO: add ConnectInfo<SocketAddr> for real peer IP extraction.
+        .unwrap_or(true)
 }
 
 /// Extract client IP from request headers/connection info.
@@ -220,13 +225,23 @@ mod tests {
     use std::net::Ipv4Addr;
 
     #[test]
-    fn test_extract_client_ip_ignores_xff_by_default() {
-        // DGP_TRUST_PROXY_HEADERS is not set in tests (default false)
+    fn test_extract_client_ip_reads_xff_by_default() {
+        // DGP_TRUST_PROXY_HEADERS defaults to true (preserves pre-v0.5.2 behaviour)
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
-        // Should return None when proxy headers are not trusted
         let ip = extract_client_ip(&headers);
-        assert_eq!(ip, None, "XFF should be ignored when trust is disabled");
+        assert_eq!(
+            ip,
+            Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))),
+            "XFF should be trusted by default"
+        );
+    }
+
+    #[test]
+    fn test_extract_client_ip_without_headers() {
+        let headers = axum::http::HeaderMap::new();
+        let ip = extract_client_ip(&headers);
+        assert_eq!(ip, None, "should return None when no proxy headers present");
     }
 
     #[test]

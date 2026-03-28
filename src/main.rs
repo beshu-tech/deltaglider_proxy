@@ -217,13 +217,19 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // --- Proxy header trust ---
-    let trust_proxy = std::env::var("DGP_TRUST_PROXY_HEADERS")
+    let trust_proxy_explicit = std::env::var("DGP_TRUST_PROXY_HEADERS").ok();
+    let trust_proxy = trust_proxy_explicit
+        .as_deref()
         .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
+        .unwrap_or(true); // default true — see rate_limiter::trust_proxy_headers()
     if trust_proxy {
-        info!("  Proxy headers: trusted (DGP_TRUST_PROXY_HEADERS=true) — X-Forwarded-For/X-Real-IP used for rate limiting and aws:SourceIp");
+        if trust_proxy_explicit.is_none() {
+            warn!("  Proxy headers: trusted (default) — X-Forwarded-For/X-Real-IP headers are used for rate limiting and IAM conditions. If this proxy is exposed directly to the internet (no reverse proxy), clients can spoof IPs. Set DGP_TRUST_PROXY_HEADERS=false to disable, or =true to silence this warning.");
+        } else {
+            info!("  Proxy headers: trusted (DGP_TRUST_PROXY_HEADERS=true) — X-Forwarded-For/X-Real-IP used for rate limiting and aws:SourceIp");
+        }
     } else {
-        info!("  Proxy headers: untrusted (default) — X-Forwarded-For/X-Real-IP ignored; set DGP_TRUST_PROXY_HEADERS=true behind a reverse proxy");
+        info!("  Proxy headers: untrusted (DGP_TRUST_PROXY_HEADERS=false) — rate limiting requires ConnectInfo (not yet implemented); aws:SourceIp conditions will not match");
     }
 
     // --- App state ---
