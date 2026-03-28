@@ -164,7 +164,7 @@ pub async fn login(
     // Auto-populate S3 credentials from config so "login IS connect".
     // The legacy access_key_id/secret_access_key are the proxy's own auth credentials.
     {
-        let config = state.config.read();
+        let config = state.config.read().await;
         if let (Some(ak), Some(sk)) = (&config.access_key_id, &config.secret_access_key) {
             let region = match &config.backend {
                 crate::config::BackendConfig::S3 { region, .. } => region.clone(),
@@ -173,10 +173,9 @@ pub async fn login(
             state.sessions.set_s3_creds(
                 &token,
                 S3SessionCredentials {
-                    // Empty endpoint = same origin (GUI is served by the proxy)
                     endpoint: String::new(),
                     region,
-                    bucket: String::new(), // frontend discovers via ListBuckets
+                    bucket: String::new(),
                     access_key_id: ak.clone(),
                     secret_access_key: sk.clone(),
                 },
@@ -348,7 +347,7 @@ pub async fn login_as(
 
     // Auto-populate S3 credentials from the IAM login so "login IS connect"
     {
-        let config = state.config.read();
+        let config = state.config.read().await;
         let region = match &config.backend {
             crate::config::BackendConfig::S3 { region, .. } => region.clone(),
             _ => "us-east-1".to_string(),
@@ -356,7 +355,7 @@ pub async fn login_as(
         state.sessions.set_s3_creds(
             &token,
             S3SessionCredentials {
-                endpoint: String::new(), // same origin
+                endpoint: String::new(),
                 region,
                 bucket: String::new(),
                 access_key_id: body.access_key_id.clone(),
