@@ -1,7 +1,7 @@
 //! Interoperability tests with original DeltaGlider CLI
 //!
 //! These tests verify full interoperability between DeltaGlider Proxy and the
-//! original DeltaGlider CLI (beshultd/deltaglider Docker image).
+//! original DeltaGlider CLI (`pip install deltaglider`).
 //!
 //! Test scenarios:
 //! 1. Files uploaded with original DeltaGlider CLI can be read by this proxy
@@ -10,12 +10,13 @@
 //!
 //! Usage:
 //!   docker compose up -d                    # Start MinIO
+//!   pip install deltaglider                 # Install CLI
 //!   cargo test --test interop_test -- --ignored --nocapture
 //!   docker compose down
 //!
 //! Requirements:
 //! - MinIO running on localhost:9000
-//! - Docker available for running deltaglider CLI
+//! - `deltaglider` CLI on PATH (pip install deltaglider)
 
 use aws_credential_types::Credentials;
 use aws_sdk_s3::config::{BehaviorVersion, Region};
@@ -43,8 +44,16 @@ const MINIO_BUCKET: &str = "deltaglider-test";
 const MINIO_ACCESS_KEY: &str = "minioadmin";
 const MINIO_SECRET_KEY: &str = "minioadmin";
 
-/// DeltaGlider CLI Docker image
-const DELTAGLIDER_IMAGE: &str = "beshultd/deltaglider:latest";
+/// Build a `Command` for the DeltaGlider CLI with standard MinIO env vars.
+/// Uses the native `deltaglider` binary (install via `pip install deltaglider`).
+fn deltaglider_cmd() -> std::process::Command {
+    let mut cmd = std::process::Command::new("deltaglider");
+    cmd.env("AWS_ACCESS_KEY_ID", MINIO_ACCESS_KEY);
+    cmd.env("AWS_SECRET_ACCESS_KEY", MINIO_SECRET_KEY);
+    cmd.env("AWS_ENDPOINT_URL", minio_endpoint());
+    cmd.env("DG_LOG_LEVEL", "INFO");
+    cmd
+}
 
 /// Generate unique test prefix
 fn unique_prefix() -> String {
@@ -116,10 +125,10 @@ async fn minio_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Check if Docker is available and can pull the deltaglider image
-fn docker_available() -> bool {
-    Command::new("docker")
-        .args(["version"])
+/// Check if the DeltaGlider CLI is installed and available on PATH
+fn deltaglider_available() -> bool {
+    Command::new("deltaglider")
+        .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -142,31 +151,10 @@ async fn minio_client() -> Client {
     Client::from_conf(config)
 }
 
-/// Run DeltaGlider CLI command via Docker
+/// Run DeltaGlider CLI command natively
 #[allow(dead_code)]
 fn run_deltaglider_cli(args: &[&str]) -> std::io::Result<std::process::Output> {
-    // Use host network to access MinIO on localhost
-    let access_key_env = format!("AWS_ACCESS_KEY_ID={}", MINIO_ACCESS_KEY);
-    let secret_key_env = format!("AWS_SECRET_ACCESS_KEY={}", MINIO_SECRET_KEY);
-    let endpoint_env = format!("AWS_ENDPOINT_URL={}", minio_endpoint());
-
-    let mut docker_args = vec![
-        "run",
-        "--rm",
-        "--network=host",
-        "-e",
-        &access_key_env,
-        "-e",
-        &secret_key_env,
-        "-e",
-        &endpoint_env,
-        "-e",
-        "DG_LOG_LEVEL=DEBUG",
-        DELTAGLIDER_IMAGE,
-    ];
-    docker_args.extend(args);
-
-    Command::new("docker").args(&docker_args).output()
+    deltaglider_cmd().args(args).output()
 }
 
 /// Run DeltaGlider CLI with stdin data
@@ -177,29 +165,8 @@ fn run_deltaglider_cli_with_stdin(
 ) -> std::io::Result<std::process::Output> {
     use std::io::Write;
 
-    let access_key_env = format!("AWS_ACCESS_KEY_ID={}", MINIO_ACCESS_KEY);
-    let secret_key_env = format!("AWS_SECRET_ACCESS_KEY={}", MINIO_SECRET_KEY);
-    let endpoint_env = format!("AWS_ENDPOINT_URL={}", minio_endpoint());
-
-    let mut docker_args = vec![
-        "run",
-        "--rm",
-        "-i",
-        "--network=host",
-        "-e",
-        &access_key_env,
-        "-e",
-        &secret_key_env,
-        "-e",
-        &endpoint_env,
-        "-e",
-        "DG_LOG_LEVEL=DEBUG",
-        DELTAGLIDER_IMAGE,
-    ];
-    docker_args.extend(args);
-
-    let mut child = Command::new("docker")
-        .args(&docker_args)
+    let mut child = deltaglider_cmd()
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -297,14 +264,14 @@ impl Drop for TestProxyServer {
 /// This test verifies that files uploaded via the original DeltaGlider CLI
 /// follow the expected storage format that our proxy can understand.
 #[tokio::test]
-#[ignore = "Requires MinIO and Docker: docker compose up -d"]
+#[ignore = "Requires MinIO and deltaglider CLI: docker compose up -d && pip install deltaglider"]
 async fn test_original_cli_upload_metadata_structure() {
     if !minio_available().await {
         eprintln!("MinIO not available, skipping test");
         return;
     }
-    if !docker_available() {
-        eprintln!("Docker not available, skipping test");
+    if !deltaglider_available() {
+        eprintln!("DeltaGlider CLI not available (pip install deltaglider), skipping test");
         return;
     }
 
@@ -320,33 +287,13 @@ async fn test_original_cli_upload_metadata_structure() {
 
     // Upload via original DeltaGlider CLI using cp
     // The CLI expects: deltaglider cp <local-path> s3://bucket/key
-    // Note: Volume must be read-write because CLI creates temp files for encryption
-    let volume_mount = format!("{}:/data", temp_dir.path().display());
-    let access_key = format!("AWS_ACCESS_KEY_ID={}", MINIO_ACCESS_KEY);
-    let secret_key = format!("AWS_SECRET_ACCESS_KEY={}", MINIO_SECRET_KEY);
-    let endpoint = format!("AWS_ENDPOINT_URL={}", minio_endpoint());
     let s3_dest = format!("s3://{}/{}/v1.zip", MINIO_BUCKET, prefix);
+    let local_path = test_file.display().to_string();
 
-    let result = Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "--network=host",
-            "-v",
-            &volume_mount,
-            "-e",
-            &access_key,
-            "-e",
-            &secret_key,
-            "-e",
-            &endpoint,
-            "-e",
-            "DG_LOG_LEVEL=INFO",
-            DELTAGLIDER_IMAGE,
-            "cp",
-            "/data/v1.zip",
-            &s3_dest,
-        ])
+    let result = deltaglider_cmd()
+        .arg("cp")
+        .arg(&local_path)
+        .arg(&s3_dest)
         .output()
         .expect("Failed to run deltaglider cp");
 
@@ -430,14 +377,14 @@ async fn test_original_cli_upload_metadata_structure() {
 
 /// Test 2: Files compressed by original CLI can be downloaded and match checksum
 #[tokio::test]
-#[ignore = "Requires MinIO and Docker: docker compose up -d"]
+#[ignore = "Requires MinIO and deltaglider CLI: docker compose up -d && pip install deltaglider"]
 async fn test_original_cli_download_checksum_match() {
     if !minio_available().await {
         eprintln!("MinIO not available, skipping test");
         return;
     }
-    if !docker_available() {
-        eprintln!("Docker not available, skipping test");
+    if !deltaglider_available() {
+        eprintln!("DeltaGlider CLI not available (pip install deltaglider), skipping test");
         return;
     }
 
@@ -458,24 +405,12 @@ async fn test_original_cli_download_checksum_match() {
 
     // Upload both via original CLI
     for (_file, name) in [(&v1_file, "v1.zip"), (&v2_file, "v2.zip")] {
-        let result = Command::new("docker")
-            .args([
-                "run",
-                "--rm",
-                "--network=host",
-                "-v",
-                &format!("{}:/data", temp_dir.path().display()),
-                "-e",
-                &format!("AWS_ACCESS_KEY_ID={}", MINIO_ACCESS_KEY),
-                "-e",
-                &format!("AWS_SECRET_ACCESS_KEY={}", MINIO_SECRET_KEY),
-                "-e",
-                &format!("AWS_ENDPOINT_URL={}", minio_endpoint()),
-                DELTAGLIDER_IMAGE,
-                "cp",
-                &format!("/data/{}", name),
-                &format!("s3://{}/{}/{}", MINIO_BUCKET, prefix, name),
-            ])
+        let local_path = temp_dir.path().join(name).display().to_string();
+        let s3_path = format!("s3://{}/{}/{}", MINIO_BUCKET, prefix, name);
+        let result = deltaglider_cmd()
+            .arg("cp")
+            .arg(&local_path)
+            .arg(&s3_path)
             .output()
             .expect("Failed to run deltaglider cp");
 
@@ -490,40 +425,16 @@ async fn test_original_cli_download_checksum_match() {
     }
 
     // Download via original CLI and verify checksums
-    // Note: We mount the download dir as /tmp inside the container to avoid
-    // cross-device link errors (CLI uses /tmp for intermediate files)
     let download_dir = TempDir::new().expect("Failed to create download dir");
-    let download_mount = format!("{}:/workdir", download_dir.path().display());
-    let access_key_dl = format!("AWS_ACCESS_KEY_ID={}", MINIO_ACCESS_KEY);
-    let secret_key_dl = format!("AWS_SECRET_ACCESS_KEY={}", MINIO_SECRET_KEY);
-    let endpoint_dl = format!("AWS_ENDPOINT_URL={}", minio_endpoint());
 
     for (name, expected_sha256) in [("v1.zip", &v1_sha256), ("v2.zip", &v2_sha256)] {
         let s3_src = format!("s3://{}/{}/{}", MINIO_BUCKET, prefix, name);
-        let dest = format!("/workdir/{}", name);
+        let dest = download_dir.path().join(name).display().to_string();
 
-        let result = Command::new("docker")
-            .args([
-                "run",
-                "--rm",
-                "--network=host",
-                "-v",
-                &download_mount,
-                "-w",
-                "/workdir",
-                "-e",
-                "TMPDIR=/workdir",
-                "-e",
-                &access_key_dl,
-                "-e",
-                &secret_key_dl,
-                "-e",
-                &endpoint_dl,
-                DELTAGLIDER_IMAGE,
-                "cp",
-                &s3_src,
-                &dest,
-            ])
+        let result = deltaglider_cmd()
+            .arg("cp")
+            .arg(&s3_src)
+            .arg(&dest)
             .output()
             .expect("Failed to run deltaglider cp download");
 
@@ -553,14 +464,14 @@ async fn test_original_cli_download_checksum_match() {
 
 /// Test 3: Files uploaded via this proxy can be read by original CLI
 #[tokio::test]
-#[ignore = "Requires MinIO and Docker: docker compose up -d"]
+#[ignore = "Requires MinIO and deltaglider CLI: docker compose up -d && pip install deltaglider"]
 async fn test_proxy_upload_original_cli_download() {
     if !minio_available().await {
         eprintln!("MinIO not available, skipping test");
         return;
     }
-    if !docker_available() {
-        eprintln!("Docker not available, skipping test");
+    if !deltaglider_available() {
+        eprintln!("DeltaGlider CLI not available (pip install deltaglider), skipping test");
         return;
     }
 
@@ -652,14 +563,14 @@ async fn test_proxy_upload_original_cli_download() {
 /// This is the critical interoperability test: upload via one tool,
 /// download via the other, verify byte-exact match.
 #[tokio::test]
-#[ignore = "Requires MinIO and Docker: docker compose up -d"]
+#[ignore = "Requires MinIO and deltaglider CLI: docker compose up -d && pip install deltaglider"]
 async fn test_cross_tool_delta_reconstruction() {
     if !minio_available().await {
         eprintln!("MinIO not available, skipping test");
         return;
     }
-    if !docker_available() {
-        eprintln!("Docker not available, skipping test");
+    if !deltaglider_available() {
+        eprintln!("DeltaGlider CLI not available (pip install deltaglider), skipping test");
         return;
     }
 
@@ -685,24 +596,12 @@ async fn test_cross_tool_delta_reconstruction() {
 
     // Upload via original CLI
     for name in ["v1.zip", "v2.zip"] {
-        let result = Command::new("docker")
-            .args([
-                "run",
-                "--rm",
-                "--network=host",
-                "-v",
-                &format!("{}:/data", temp_dir.path().display()),
-                "-e",
-                &format!("AWS_ACCESS_KEY_ID={}", MINIO_ACCESS_KEY),
-                "-e",
-                &format!("AWS_SECRET_ACCESS_KEY={}", MINIO_SECRET_KEY),
-                "-e",
-                &format!("AWS_ENDPOINT_URL={}", minio_endpoint()),
-                DELTAGLIDER_IMAGE,
-                "cp",
-                &format!("/data/{}", name),
-                &format!("s3://{}/{}/{}", MINIO_BUCKET, prefix_cli, name),
-            ])
+        let local_path = temp_dir.path().join(name).display().to_string();
+        let s3_path = format!("s3://{}/{}/{}", MINIO_BUCKET, prefix_cli, name);
+        let result = deltaglider_cmd()
+            .arg("cp")
+            .arg(&local_path)
+            .arg(&s3_path)
             .output()
             .expect("Failed to run deltaglider cp");
 
@@ -779,41 +678,18 @@ async fn test_cross_tool_delta_reconstruction() {
     }
 
     // Download via original CLI
-    // Note: We mount the download dir and set TMPDIR to avoid cross-device link errors
     let download_dir = TempDir::new().expect("Failed to create download dir");
-    let dl_mount = format!("{}:/workdir", download_dir.path().display());
-    let ak = format!("AWS_ACCESS_KEY_ID={}", MINIO_ACCESS_KEY);
-    let sk = format!("AWS_SECRET_ACCESS_KEY={}", MINIO_SECRET_KEY);
-    let ep = format!("AWS_ENDPOINT_URL={}", minio_endpoint());
 
     // Note: The CLI may not understand proxy's .meta sidecar format
     // This test documents the compatibility gap if any
     for name in ["v1.zip", "v2.zip"] {
         let s3_src = format!("s3://{}/{}/{}", MINIO_BUCKET, prefix_proxy, name);
-        let dest = format!("/workdir/{}", name);
+        let dest = download_dir.path().join(name).display().to_string();
 
-        let result = Command::new("docker")
-            .args([
-                "run",
-                "--rm",
-                "--network=host",
-                "-v",
-                &dl_mount,
-                "-w",
-                "/workdir",
-                "-e",
-                "TMPDIR=/workdir",
-                "-e",
-                &ak,
-                "-e",
-                &sk,
-                "-e",
-                &ep,
-                DELTAGLIDER_IMAGE,
-                "cp",
-                &s3_src,
-                &dest,
-            ])
+        let result = deltaglider_cmd()
+            .arg("cp")
+            .arg(&s3_src)
+            .arg(&dest)
             .output()
             .expect("Failed to run deltaglider cp download");
 
@@ -859,14 +735,14 @@ async fn test_cross_tool_delta_reconstruction() {
 
 /// Test 5: Verify the proxy can read original CLI's storage format
 #[tokio::test]
-#[ignore = "Requires MinIO and Docker: docker compose up -d"]
+#[ignore = "Requires MinIO and deltaglider CLI: docker compose up -d && pip install deltaglider"]
 async fn test_proxy_reads_cli_format() {
     if !minio_available().await {
         eprintln!("MinIO not available, skipping test");
         return;
     }
-    if !docker_available() {
-        eprintln!("Docker not available, skipping test");
+    if !deltaglider_available() {
+        eprintln!("DeltaGlider CLI not available (pip install deltaglider), skipping test");
         return;
     }
 
@@ -884,26 +760,14 @@ async fn test_proxy_reads_cli_format() {
 
     // Upload via original CLI to establish baseline format
     for name in ["v1.zip", "v2.zip"] {
-        let result = Command::new("docker")
-            .args([
-                "run",
-                "--rm",
-                "--network=host",
-                "-v",
-                &format!("{}:/data", temp_dir.path().display()),
-                "-e",
-                &format!("AWS_ACCESS_KEY_ID={}", MINIO_ACCESS_KEY),
-                "-e",
-                &format!("AWS_SECRET_ACCESS_KEY={}", MINIO_SECRET_KEY),
-                "-e",
-                &format!("AWS_ENDPOINT_URL={}", minio_endpoint()),
-                DELTAGLIDER_IMAGE,
-                "cp",
-                &format!("/data/{}", name),
-                &format!("s3://{}/{}/{}", MINIO_BUCKET, prefix, name),
-            ])
+        let local_path = temp_dir.path().join(name).display().to_string();
+        let s3_path = format!("s3://{}/{}/{}", MINIO_BUCKET, prefix, name);
+        let result = deltaglider_cmd()
+            .arg("cp")
+            .arg(&local_path)
+            .arg(&s3_path)
             .output()
-            .expect("Failed to upload via CLI");
+            .expect("Failed to run deltaglider cp");
 
         assert!(
             result.status.success(),
@@ -988,14 +852,14 @@ async fn test_proxy_reads_cli_format() {
 
 /// Test 6: Document the storage format differences
 #[tokio::test]
-#[ignore = "Requires MinIO and Docker: docker compose up -d"]
+#[ignore = "Requires MinIO and deltaglider CLI: docker compose up -d && pip install deltaglider"]
 async fn test_document_storage_format_differences() {
     if !minio_available().await {
         eprintln!("MinIO not available, skipping test");
         return;
     }
-    if !docker_available() {
-        eprintln!("Docker not available, skipping test");
+    if !deltaglider_available() {
+        eprintln!("DeltaGlider CLI not available (pip install deltaglider), skipping test");
         return;
     }
 
@@ -1012,24 +876,12 @@ async fn test_document_storage_format_differences() {
 
     // Upload via CLI
     for name in ["v1.zip", "v2.zip"] {
-        let _ = Command::new("docker")
-            .args([
-                "run",
-                "--rm",
-                "--network=host",
-                "-v",
-                &format!("{}:/data", temp_dir.path().display()),
-                "-e",
-                &format!("AWS_ACCESS_KEY_ID={}", MINIO_ACCESS_KEY),
-                "-e",
-                &format!("AWS_SECRET_ACCESS_KEY={}", MINIO_SECRET_KEY),
-                "-e",
-                &format!("AWS_ENDPOINT_URL={}", minio_endpoint()),
-                DELTAGLIDER_IMAGE,
-                "cp",
-                &format!("/data/{}", name),
-                &format!("s3://{}/{}/{}", MINIO_BUCKET, prefix_cli, name),
-            ])
+        let local_path = temp_dir.path().join(name).display().to_string();
+        let s3_path = format!("s3://{}/{}/{}", MINIO_BUCKET, prefix_cli, name);
+        let _ = deltaglider_cmd()
+            .arg("cp")
+            .arg(&local_path)
+            .arg(&s3_path)
             .output();
     }
 
