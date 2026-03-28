@@ -18,6 +18,9 @@ pub struct CreateGroupRequest {
     pub description: String,
     #[serde(default)]
     pub permissions: Vec<Permission>,
+    /// Optional list of user IDs to add as members during creation.
+    #[serde(default)]
+    pub member_ids: Vec<i64>,
 }
 
 #[derive(Deserialize)]
@@ -70,6 +73,28 @@ pub async fn create_group(
             tracing::warn!("Failed to create group '{}': {}", body.name, e);
             StatusCode::CONFLICT
         })?;
+
+    // Add members if provided in the creation request
+    for user_id in &body.member_ids {
+        if let Err(e) = db.add_user_to_group(group.id, *user_id) {
+            tracing::warn!(
+                "Failed to add user {} to group '{}': {}",
+                user_id,
+                group.name,
+                e
+            );
+        }
+    }
+
+    // Reload group to include member_ids in the response
+    let group = if !body.member_ids.is_empty() {
+        db.get_group_by_id(group.id).map_err(|e| {
+            tracing::error!("Failed to reload group after adding members: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    } else {
+        group
+    };
 
     rebuild_iam_index(&db, &state.iam_state)?;
     trigger_config_sync(&state);
