@@ -2,6 +2,60 @@
 
 ## v0.5.0
 
+### IAM Policy Conditions (iam-rs)
+
+- **Full AWS IAM condition support**: Integrated `iam-rs` crate for standards-compliant policy evaluation with all AWS condition operators (StringEquals, StringLike, IpAddress, NumericLessThan, etc.).
+- **`s3:prefix` condition**: Deny LIST requests based on the prefix query parameter. Example: `{"StringLike": {"s3:prefix": ".*"}}` blocks listing dotfiles.
+- **`aws:SourceIp` condition**: Restrict operations to specific IP ranges. Example: `{"IpAddress": {"aws:SourceIp": "10.0.0.0/8"}}`.
+- **DB schema v4**: New `conditions_json` column on permissions and group_permissions tables. Backward compatible — existing permissions work unchanged.
+- **Permission validation**: Effect normalization (case-insensitive), max 100 rules per user/group, resource pattern validation (trailing wildcard only), `$`-prefix names blocked.
+- **Frontend conditions UI**: Collapsible conditions section per permission rule with prefix and IP restriction inputs.
+
+### IAM Module Refactor
+
+- **Split `iam.rs` into module**: `iam/types.rs`, `iam/permissions.rs`, `iam/middleware.rs`, `iam/keygen.rs`, `iam/mod.rs`. Pure permission evaluation logic separated from framework-specific middleware.
+- **Centralized permission authority**: All permission checks go through `AuthenticatedUser.can()`, `.can_with_context()`, `.can_see_bucket()`, `.is_admin()`.
+- **Legacy admin as AuthenticatedUser**: Bootstrap credentials now create a `$bootstrap` AuthenticatedUser with wildcard permissions instead of bypassing authorization entirely.
+- **Groups loaded on startup**: Previously groups were only loaded on first IAM mutation.
+- **ListBuckets per-user filtering**: Users see only buckets they have permissions on.
+- **IAM backup/restore**: Export/import all users, groups, permissions, and credentials as JSON via `/_/api/admin/backup`.
+
+### Security Fixes
+
+- **Batch delete per-key authorization**: Previously the middleware only checked delete permission at bucket level; now each key in a batch delete is individually authorized.
+- **Progressive auth delay**: Failed auth attempts trigger exponential backoff (100ms→5s), making brute force expensive before lockout.
+- **Attack detection logging**: `SECURITY |` log events for brute force detection, lockout, and repeated failures with IP and attempt count.
+- **Condition parse fail-closed**: Malformed conditions produce an empty policy (deny-all) instead of stripping conditions (fail-open).
+- **Error XML escaping**: Error `<Message>` now XML-escaped to prevent malformed responses.
+- **Bucket names with dots**: S3-compliant validation now accepts dots in bucket names.
+- **is_admin strict check**: Uses `== "Allow"` instead of `!= "Deny"`.
+
+### Performance
+
+- **Range passthrough**: Range requests on passthrough objects pass the Range header through to upstream S3 (or seek on filesystem) instead of buffering the entire file. A 1KB range on a 100MB file reads only 1KB from storage.
+- **Request concurrency limit**: `tower::limit::ConcurrencyLimitLayer` with configurable max (default 1024, `DGP_MAX_CONCURRENT_REQUESTS`).
+- **Write-before-delete**: Storage strategy transitions (delta↔passthrough) now write the new variant before deleting the old one, preventing transient 404s on concurrent GETs.
+- **Prefix lock cleanup**: `cleanup_prefix_locks()` runs on every lock acquisition instead of only on delete.
+- **Interleave-and-paginate dedup**: Shared function for the interleave/sort/paginate pattern used by engine, S3 backend, and filesystem backend.
+
+### Unified Audit Logging
+
+- **`src/audit.rs`**: Single audit module with `sanitize()`, `extract_client_info()`, and `audit_log()`. Eliminates duplicated sanitization and IP extraction across handlers and admin API.
+- **Session TTL decoupled**: `SessionStore::ttl()` method replaces re-parsing `DGP_SESSION_TTL_HOURS` in the cookie formatter.
+
+### Frontend
+
+- **Conditions UI**: Permission editor supports prefix restriction and IP restriction inputs with collapsible conditions panel per rule.
+- **IAM backup buttons**: Export/Import buttons in admin sidebar for JSON backup/restore.
+- **Log level radio buttons**: Replaced broken Select dropdown with Radio.Group.
+- **Polling fix**: Users/Groups panels load once on mount instead of re-polling on every render.
+- **Deduplicated formatters**: Unified byte formatters, extracted CredentialsBanner and InspectorSection components.
+
+### Tests
+
+- **222 tests**: 180 unit + 42 integration (23 new persona tests covering groups, ListBuckets filtering, prefix scoping, cross-user isolation, multipart, content verification, deny-from-groups, IAM conditions).
+- **iam-rs condition tests**: Unit tests for prefix deny with StringLike, IP deny with IpAddress.
+
 ### Metadata Cache
 
 - **In-memory metadata cache**: New moka-based cache (`MetadataCache` in `metadata_cache.rs`) eliminates redundant HEAD calls for object metadata. 50 MB default budget (~125K–150K entries), 10-minute TTL. Populated on PUT, HEAD, and LIST+metadata=true. Consulted on HEAD, GET, and LIST (including for file_size correction on delta-compressed objects). Invalidated on DELETE and prefix delete. Configurable via `DGP_METADATA_CACHE_MB` env var or `metadata_cache_mb` TOML setting.
