@@ -18,7 +18,7 @@ use std::sync::Arc;
 /// valid. Any bucket name is accepted (multi-bucket support).
 ///
 /// # Example
-/// ```ignore
+/// ```text
 /// async fn list_objects(
 ///     State(state): State<Arc<AppState>>,
 ///     ValidatedBucket(bucket): ValidatedBucket,
@@ -67,7 +67,7 @@ where
 /// slashes. Any bucket name is accepted (multi-bucket support).
 ///
 /// # Example
-/// ```ignore
+/// ```text
 /// async fn get_object(
 ///     State(state): State<Arc<AppState>>,
 ///     ValidatedPath { bucket, key }: ValidatedPath,
