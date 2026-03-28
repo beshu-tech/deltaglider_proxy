@@ -3,6 +3,7 @@ import { Modal, Spin, Alert, Button, Typography } from 'antd';
 import { DownloadOutlined } from '@ant-design/icons';
 import type { S3Object } from '../types';
 import { downloadObject, getPresignedUrl } from '../s3client';
+import { formatBytes } from '../utils';
 import { useColors } from '../ThemeContext';
 
 const { Text } = Typography;
@@ -28,12 +29,6 @@ export function getPreviewMode(filename: string): 'text' | 'image' | null {
   if (TEXT_EXTENSIONS.has(ext) || TEXT_EXTENSIONS.has(basename)) return 'text';
   if (IMAGE_EXTENSIONS.has(ext)) return 'image';
   return null;
-}
-
-function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 interface FilePreviewProps {
@@ -112,7 +107,7 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
       footer={
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <Text type="secondary" style={{ fontSize: 12 }}>
-            {formatSize(object.size)}
+            {formatBytes(object.size)}
             {object.headers?.['content-type'] ? ` · ${object.headers['content-type']}` : ''}
           </Text>
           <Button icon={<DownloadOutlined />} onClick={handleDownload}>Download</Button>
@@ -131,7 +126,7 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
         <Alert
           type="info"
           showIcon
-          message={`File too large for preview (${formatSize(object.size)})`}
+          message={`File too large for preview (${formatBytes(object.size)})`}
           description="Text preview is limited to 512 KB. Use the Download button to view the full file."
           style={{ borderRadius: 8 }}
         />

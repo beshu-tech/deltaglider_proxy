@@ -8,6 +8,7 @@ import { useCardStyles } from './shared-styles';
 import { useColors } from '../ThemeContext';
 import PermissionEditor, { permissionsToRows, rowsToPermissions } from './PermissionEditor';
 import type { PermissionRow } from './PermissionEditor';
+import CredentialsBanner from './CredentialsBanner';
 
 const { Text, Title } = Typography;
 
@@ -202,23 +203,14 @@ export default function UserForm({ user, onSaved, onDeleted, onCancel, onCreated
       </div>
 
       {savedCredentials && (
-        <Alert
-          type="success"
-          showIcon
-          closable
-          onClose={() => setSavedCredentials(null)}
-          message={isEdit ? 'Credentials updated' : 'User created'}
-          description={
-            <div style={{ marginTop: 8 }}>
-              <Text type="secondary" style={{ fontSize: 10, textTransform: 'uppercase' }}>Access Key</Text>
-              <div><Text code copyable style={{ fontFamily: 'var(--font-mono)' }}>{savedCredentials.ak}</Text></div>
-              <Text type="secondary" style={{ fontSize: 10, textTransform: 'uppercase', marginTop: 8, display: 'block' }}>Secret Key</Text>
-              <div><Text code copyable style={{ fontFamily: 'var(--font-mono)', wordBreak: 'break-all' }}>{savedCredentials.sk}</Text></div>
-              <Text type="warning" style={{ fontSize: 11, marginTop: 8, display: 'block' }}>The secret will not be shown again.</Text>
-            </div>
-          }
-          style={{ marginBottom: 20, borderRadius: 8 }}
-        />
+        <div style={{ marginBottom: 20 }}>
+          <CredentialsBanner
+            accessKey={savedCredentials.ak}
+            secretKey={savedCredentials.sk}
+            message={isEdit ? 'Credentials updated' : 'User created'}
+            onClose={() => setSavedCredentials(null)}
+          />
+        </div>
       )}
 
       {error && <Alert type="error" message={error} showIcon closable onClose={() => setError('')} style={{ marginBottom: 16, borderRadius: 8 }} />}

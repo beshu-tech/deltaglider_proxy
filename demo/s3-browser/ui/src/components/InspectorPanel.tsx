@@ -28,6 +28,39 @@ function getUserMetadata(headers: Record<string, string>): [string, string][] {
     .map(([k, v]) => [k.replace('x-amz-meta-', ''), v]);
 }
 
+/** Section heading for inspector panels. Defined at module level to avoid React reconciliation issues. */
+function InspectorSection({ title, children }: { title: string; children: React.ReactNode }) {
+  const { TEXT_MUTED } = useColors();
+  return (
+    <section style={{ marginBottom: 20 }} aria-label={title}>
+      <h3 style={{
+        fontSize: 10,
+        fontWeight: 700,
+        letterSpacing: 1.5,
+        textTransform: 'uppercase',
+        color: TEXT_MUTED,
+        marginBottom: 10,
+        margin: '0 0 10px',
+        fontFamily: "var(--font-ui)",
+      }}>
+        {title}
+      </h3>
+      {children}
+    </section>
+  );
+}
+
+/** Key-value row for inspector metadata. Defined at module level to avoid React reconciliation issues. */
+function InfoRow({ label, value }: { label: string; value: string }) {
+  const { BG_SIDEBAR, TEXT_MUTED, TEXT_PRIMARY } = useColors();
+  return (
+    <div style={{ padding: '8px 12px', background: BG_SIDEBAR, borderRadius: 8, marginBottom: 4 }}>
+      <div style={{ fontSize: 11, color: TEXT_MUTED, marginBottom: 2, fontFamily: "var(--font-ui)", fontWeight: 500 }}>{label}</div>
+      <div style={{ fontSize: 13, color: TEXT_PRIMARY, wordBreak: 'break-all', fontFamily: "var(--font-mono)" }}>{value}</div>
+    </div>
+  );
+}
+
 export default function InspectorPanel({ object, onClose, onDeleted, onPreview, isMobile, headCache }: Props) {
   const {
     BG_SIDEBAR, BORDER, TEXT_PRIMARY, TEXT_MUTED, TEXT_FAINT,
@@ -63,35 +96,6 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
   }, [object?.key]);
 
   if (!object) return null;
-
-  function Section({ title, children }: { title: string; children: React.ReactNode }) {
-    return (
-      <section style={{ marginBottom: 20 }} aria-label={title}>
-        <h3 style={{
-          fontSize: 10,
-          fontWeight: 700,
-          letterSpacing: 1.5,
-          textTransform: 'uppercase',
-          color: TEXT_MUTED,
-          marginBottom: 10,
-          margin: '0 0 10px',
-          fontFamily: "var(--font-ui)",
-        }}>
-          {title}
-        </h3>
-        {children}
-      </section>
-    );
-  }
-
-  function InfoRow({ label, value }: { label: string; value: string }) {
-    return (
-      <div style={{ padding: '8px 12px', background: BG_SIDEBAR, borderRadius: 8, marginBottom: 4 }}>
-        <div style={{ fontSize: 11, color: TEXT_MUTED, marginBottom: 2, fontFamily: "var(--font-ui)", fontWeight: 500 }}>{label}</div>
-        <div style={{ fontSize: 13, color: TEXT_PRIMARY, wordBreak: 'break-all', fontFamily: "var(--font-mono)" }}>{value}</div>
-      </div>
-    );
-  }
 
   const fileName = object.key.split('/').pop() || object.key;
   const headers = headData?.headers ?? {};
@@ -279,7 +283,7 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
             </div>
 
             {/* STORAGE STATS */}
-            <Section title="Storage Stats">
+            <InspectorSection title="Storage Stats">
               {headLoading ? (
                 <Skeleton active paragraph={{ rows: 4 }} />
               ) : (
@@ -337,19 +341,19 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
                   </Tag>
                 </div>
               )}
-            </Section>
+            </InspectorSection>
 
             {/* OBJECT INFO */}
-            <Section title="Object Info">
+            <InspectorSection title="Object Info">
               <InfoRow
                 label="Last modified"
                 value={object.lastModified ? new Date(object.lastModified).toLocaleString() : '--'}
               />
               <InfoRow label="Accept-Ranges" value="Disabled" />
-            </Section>
+            </InspectorSection>
 
             {/* S3 METADATA */}
-            <Section title="S3 Metadata">
+            <InspectorSection title="S3 Metadata">
               {headLoading ? (
                 <Skeleton active paragraph={{ rows: 1 }} />
               ) : (
@@ -358,10 +362,10 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
                   value={headers['content-type'] || 'binary/octet-stream'}
                 />
               )}
-            </Section>
+            </InspectorSection>
 
             {/* CUSTOM METADATA (DG + User) */}
-            <Section title="Custom Metadata">
+            <InspectorSection title="Custom Metadata">
               {headLoading ? (
                 <Skeleton active paragraph={{ rows: 2 }} />
               ) : dgMeta.length === 0 && userMeta.length === 0 ? (
@@ -374,14 +378,14 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
                   {userMeta.map(([k, v]) => <InfoRow key={k} label={k} value={v} />)}
                 </>
               )}
-            </Section>
+            </InspectorSection>
 
             {/* TAGS */}
-            <Section title="Tags">
+            <InspectorSection title="Tags">
               <div style={{ fontSize: 12, color: TEXT_FAINT, display: 'flex', alignItems: 'center', gap: 6, fontFamily: "var(--font-ui)" }}>
                 No tags available
               </div>
-            </Section>
+            </InspectorSection>
           </div>
 
           {/* Delete button at bottom */}

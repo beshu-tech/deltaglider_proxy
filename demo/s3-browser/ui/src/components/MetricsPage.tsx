@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { Typography, Space, Button, Spin, Tooltip, Switch, Progress, Tag } from 'antd';
 import { ArrowLeftOutlined, ReloadOutlined, InfoCircleOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
+import { formatBytes } from '../utils';
 import { useCardStyles } from './shared-styles';
 import {
   AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
@@ -114,12 +115,6 @@ function multiLabelValues(m: Map<string, ParsedMetric>, name: string): { labels:
    Formatters
    ═══════════════════════════════════════════════════════════ */
 
-function fmtBytes(b: number): string {
-  if (b >= 1024 ** 3) return `${(b / 1024 ** 3).toFixed(1)} GB`;
-  if (b >= 1024 ** 2) return `${(b / 1024 ** 2).toFixed(1)} MB`;
-  if (b >= 1024) return `${(b / 1024).toFixed(1)} KB`;
-  return `${b.toFixed(0)} B`;
-}
 function fmtDuration(s: number): string {
   if (s === 0) return '—';
   if (s < 0.001) return `${(s * 1e6).toFixed(0)}us`;
@@ -371,32 +366,32 @@ export default function MetricsPage({ onBack, embedded }: Props) {
         <StatCard
           label="Objects Stored"
           value={stats ? `${fmtNum(stats.total_objects)}${stats.truncated ? '+' : ''}` : '...'}
-          description={stats ? `${fmtBytes(stats.total_original_size)}${stats.truncated ? '+ ' : ' '}original data${stats.truncated ? ' (sampled first 1,000)' : ''}` : 'Loading...'}
+          description={stats ? `${formatBytes(stats.total_original_size)}${stats.truncated ? '+ ' : ' '}original data${stats.truncated ? ' (sampled first 1,000)' : ''}` : 'Loading...'}
         />
         <StatCard
           label="Storage Savings"
           value={stats && stats.total_original_size > 0 ? `${stats.savings_percentage.toFixed(1)}%` : '—'}
           description={stats && stats.total_original_size > 0
-            ? `${fmtBytes(stats.total_original_size - stats.total_stored_size)} saved (${fmtBytes(stats.total_stored_size)} on disk)${stats.truncated ? ' — sampled' : ''}`
+            ? `${formatBytes(stats.total_original_size - stats.total_stored_size)} saved (${formatBytes(stats.total_stored_size)} on disk)${stats.truncated ? ' — sampled' : ''}`
             : 'No data yet'}
           color={stats && stats.savings_percentage > 10 ? colors.ACCENT_GREEN : undefined}
         />
         <StatCard label="Total Requests" value={fmtNum(totalHttp)} description={`Avg latency: ${fmtDuration(latencyStats.avg)}`}
           warn={errorRate > 0.05 ? `${fmtPct(errorRate)} error rate` : undefined} />
-        <StatCard label="Peak Memory" value={fmtBytes(peakRss)} description="Process RSS high-water mark" />
+        <StatCard label="Peak Memory" value={formatBytes(peakRss)} description="Process RSS high-water mark" />
       </div>
 
       {/* ════════════════ Cache Health ════════════════ */}
       <Section title="Reference Cache" description="LRU cache for reference files used in delta reconstruction. A high miss rate means the cache is undersized for the number of active deltaspaces — each miss forces a full read from storage.">
         <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 12 }}>
-          <StatCard label="Utilization" value={fmtPct(cacheUtil)} description={`${fmtBytes(cacheUsed)} of ${fmtBytes(cacheMax)}`}
+          <StatCard label="Utilization" value={fmtPct(cacheUtil)} description={`${formatBytes(cacheUsed)} of ${formatBytes(cacheMax)}`}
             warn={cacheUtil > 0.9 ? 'Cache nearly full — consider increasing cache_size_mb' : undefined}>
             <Progress percent={Math.round(cacheUtil * 100)} size="small" strokeColor={cacheUtil > 0.9 ? colors.ACCENT_RED : colors.ACCENT_GREEN} showInfo={false} style={{ marginTop: 8 }} />
           </StatCard>
           <StatCard label="Hit Rate" value={cacheTotal > 0 ? fmtPct(1 - cacheMissRate) : '—'} description={`${fmtNum(cacheHits)} hits / ${fmtNum(cacheMisses)} misses`}
             color={cacheTotal > 0 ? cacheHealthColor : undefined}
             warn={cacheMissRate > 0.5 ? 'Over half of lookups miss cache — active deltaspaces exceed cache capacity' : undefined} />
-          <StatCard label="Entries" value={fmtNum(cacheEntries)} description={cacheMax > 0 ? `${fmtBytes(cacheMax / Math.max(cacheEntries, 1))} avg per entry` : 'Cache disabled'} />
+          <StatCard label="Entries" value={fmtNum(cacheEntries)} description={cacheMax > 0 ? `${formatBytes(cacheMax / Math.max(cacheEntries, 1))} avg per entry` : 'Cache disabled'} />
         </div>
 
         {history.length > 1 && (<>
@@ -458,8 +453,8 @@ export default function MetricsPage({ onBack, embedded }: Props) {
       <Section title="HTTP Traffic" description="All S3-compatible API requests processed by the proxy. Includes GET (downloads), PUT (uploads), HEAD (metadata), LIST, and DELETE operations.">
         <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 12 }}>
           <StatCard label="Avg Latency" value={latencyStats.count > 0 ? fmtDuration(latencyStats.avg) : '—'} description={`${fmtNum(latencyStats.count)} requests measured`} />
-          <StatCard label="Avg Upload Size" value={reqSizeStats.count > 0 ? fmtBytes(reqSizeStats.avg) : '—'} description={`${fmtNum(reqSizeStats.count)} uploads with Content-Length`} />
-          <StatCard label="Avg Download Size" value={resSizeStats.count > 0 ? fmtBytes(resSizeStats.avg) : '—'} description={`${fmtNum(resSizeStats.count)} responses with Content-Length`} />
+          <StatCard label="Avg Upload Size" value={reqSizeStats.count > 0 ? formatBytes(reqSizeStats.avg) : '—'} description={`${fmtNum(reqSizeStats.count)} uploads with Content-Length`} />
+          <StatCard label="Avg Download Size" value={resSizeStats.count > 0 ? formatBytes(resSizeStats.avg) : '—'} description={`${fmtNum(resSizeStats.count)} responses with Content-Length`} />
           <StatCard label="Error Rate" value={totalHttp > 0 ? fmtPct(errorRate) : '—'}
             description={`${fmtNum((httpByStatus['4xx'] ?? 0) + (httpByStatus['5xx'] ?? 0))} errors of ${fmtNum(totalHttp)}`}
             color={errorRate > 0.05 ? colors.ACCENT_RED : errorRate > 0 ? '#fbbf24' : colors.ACCENT_GREEN}
