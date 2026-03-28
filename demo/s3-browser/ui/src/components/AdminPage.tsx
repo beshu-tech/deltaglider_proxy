@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Typography, Button, Input, Alert, Space, Spin, message } from 'antd';
 import { checkSession, adminLogin, whoami, loginAs, exportBackup, importBackup } from '../adminApi';
+import { getCredentials } from '../s3client';
 import {
   CloudOutlined,
   DatabaseOutlined,
@@ -107,8 +108,9 @@ export default function AdminPage({ onBack, onSessionExpired }: AdminPageProps) 
         return;
       }
 
-      const ak = localStorage.getItem('dg-access-key-id') || undefined;
-      const sk = localStorage.getItem('dg-secret-access-key') || undefined;
+      const creds = getCredentials();
+      const ak = creds.accessKeyId || undefined;
+      const sk = creds.secretAccessKey || undefined;
       const info = await whoami(ak, sk);
       setAuthMode(info.mode);
 

@@ -36,11 +36,15 @@ static PORT_COUNTER: AtomicU16 = AtomicU16::new(19100);
 /// Test prefix counter for isolation
 static TEST_PREFIX_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// MinIO configuration — reads MINIO_ENDPOINT env var, falls back to localhost:9000
-fn minio_endpoint() -> String {
-    std::env::var("MINIO_ENDPOINT").unwrap_or_else(|_| "http://localhost:9000".to_string())
-}
+mod common;
+
 const MINIO_BUCKET: &str = "deltaglider-test";
+
+/// Delegates to shared `common::minio_endpoint_url()` — single source of truth.
+fn minio_endpoint() -> String {
+    common::minio_endpoint_url()
+}
+// Re-export shared MinIO constants for local use
 const MINIO_ACCESS_KEY: &str = "minioadmin";
 const MINIO_SECRET_KEY: &str = "minioadmin";
 

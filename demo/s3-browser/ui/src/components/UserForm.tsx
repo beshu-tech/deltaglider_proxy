@@ -3,7 +3,7 @@ import { Input, Switch, Button, Alert, Space, Divider, Typography, Tag } from 'a
 import { ThunderboltOutlined, CheckCircleFilled, MinusCircleFilled, CrownFilled } from '@ant-design/icons';
 import type { IamUser, IamGroup, CreateUserRequest, UpdateUserRequest, CannedPolicy } from '../adminApi';
 import { createUser, updateUser, deleteUser, rotateUserKeys, getCannedPolicies, getGroups } from '../adminApi';
-import { setCredentials } from '../s3client';
+import { setCredentials, getCredentials } from '../s3client';
 import { useCardStyles } from './shared-styles';
 import { useColors } from '../ThemeContext';
 import PermissionEditor, { permissionsToRows, rowsToPermissions } from './PermissionEditor';
@@ -109,7 +109,7 @@ export default function UserForm({ user, onSaved, onDeleted, onCancel, onCreated
             accessKeyId.trim() || user.access_key_id,
             skChanged ? secretKey.trim() : undefined,
           );
-          const browserAk = localStorage.getItem('dg-access-key-id');
+          const browserAk = getCredentials().accessKeyId;
           // Compare against both old AK and new AK to avoid self-lockout when user changes their own AK
           if ((browserAk === user.access_key_id || browserAk === accessKeyId.trim()) && rotated.secret_access_key) {
             setCredentials(rotated.access_key_id, rotated.secret_access_key);
