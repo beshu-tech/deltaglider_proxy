@@ -193,6 +193,7 @@ impl TestProxyServer {
         let data_dir = TempDir::new().expect("Failed to create temp dir");
 
         let process = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"))
+            .env_clear()
             .env("DGP_LISTEN_ADDR", format!("127.0.0.1:{}", port))
             .env("DGP_S3_ENDPOINT", minio_endpoint())
             .env("DGP_S3_REGION", "us-east-1")
@@ -200,19 +201,29 @@ impl TestProxyServer {
             .env("DGP_BE_AWS_ACCESS_KEY_ID", MINIO_ACCESS_KEY)
             .env("DGP_BE_AWS_SECRET_ACCESS_KEY", MINIO_SECRET_KEY)
             .env("RUST_LOG", "deltaglider_proxy=debug")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            // Use null instead of piped to avoid pipe buffer deadlock
+            // (proxy may write >64KB to stdout/stderr, blocking on full pipe)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .expect("Failed to start proxy server");
 
-        // Wait for server to be ready
+        // Wait for server to be ready (max 15s)
         let addr = format!("127.0.0.1:{}", port);
-        for _ in 0..100 {
+        let mut ready = false;
+        for i in 0..150 {
             if std::net::TcpStream::connect(&addr).is_ok() {
-                sleep(Duration::from_millis(100)).await;
+                println!("Proxy ready on port {} after {}ms", port, i * 100);
+                ready = true;
                 break;
             }
             sleep(Duration::from_millis(100)).await;
+        }
+        if !ready {
+            panic!(
+                "Proxy server failed to start on port {} within 15 seconds",
+                port
+            );
         }
 
         let server = Self {
