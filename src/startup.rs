@@ -136,10 +136,17 @@ pub fn init_metrics(config: &Config) -> Arc<Metrics> {
 /// Create the replay-attack detection cache and spawn its periodic cleanup.
 pub fn init_replay_cache() -> deltaglider_proxy::api::auth::ReplayCache {
     let replay_cache: deltaglider_proxy::api::auth::ReplayCache = Arc::new(dashmap::DashMap::new());
+    // Cleanup cutoff must match the replay detection window (DGP_CLOCK_SKEW_SECONDS,
+    // default 300s). Using a shorter cutoff would evict entries while they're still
+    // within the valid clock-skew window, allowing replayed requests to succeed.
+    let replay_window_secs: u64 = std::env::var("DGP_CLOCK_SKEW_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
     spawn_periodic(Duration::from_secs(60), {
         let cache = replay_cache.clone();
         move || {
-            let cutoff = std::time::Instant::now() - Duration::from_secs(60);
+            let cutoff = std::time::Instant::now() - Duration::from_secs(replay_window_secs);
             cache.retain(|_, instant: &mut std::time::Instant| *instant > cutoff);
         }
     });

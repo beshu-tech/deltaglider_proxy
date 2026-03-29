@@ -307,14 +307,15 @@ pub async fn login_as(
         }
     };
 
-    // Verify the secret key matches (critical — prevents auth bypass)
-    // Use constant-time comparison to prevent timing side-channel attacks.
-    if user
-        .secret_access_key
-        .as_bytes()
-        .ct_ne(body.secret_access_key.as_bytes())
-        .into()
-    {
+    // Verify the secret key matches (critical — prevents auth bypass).
+    // Hash both sides to a fixed 32-byte digest before comparing, so that
+    // (a) comparison is constant-time, and (b) the length of the stored
+    // secret is not leaked via timing (ct_eq on unequal-length slices
+    // returns immediately).
+    use sha2::{Digest, Sha256};
+    let stored_hash = Sha256::digest(user.secret_access_key.as_bytes());
+    let provided_hash = Sha256::digest(body.secret_access_key.as_bytes());
+    if stored_hash.ct_ne(&provided_hash).into() {
         state.rate_limiter.record_failure(&client_ip);
         tracing::warn!(
             "Failed login-as attempt from {} (secret mismatch for '{}')",

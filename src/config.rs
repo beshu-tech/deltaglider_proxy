@@ -538,7 +538,7 @@ impl Config {
 
         // Persist the hash (use new file name)
         let persist_file = std::path::Path::new(".deltaglider_bootstrap_hash");
-        if let Err(e) = std::fs::write(persist_file, &hash) {
+        if let Err(e) = write_bootstrap_hash_file(persist_file, &hash) {
             eprintln!(
                 "Warning: could not persist bootstrap hash to {}: {}",
                 persist_file.display(),
@@ -655,6 +655,19 @@ pub enum ConfigError {
 
     #[error("Parse error: {0}")]
     Parse(String),
+}
+
+/// Write the bootstrap hash file with restrictive permissions (0600).
+/// This file doubles as the SQLCipher encryption key, so it must not be
+/// world-readable.
+pub fn write_bootstrap_hash_file(path: &std::path::Path, hash: &str) -> std::io::Result<()> {
+    std::fs::write(path, hash)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

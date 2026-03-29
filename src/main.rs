@@ -104,7 +104,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST).expect("bcrypt hashing failed");
         // Write to new file, keep old file name as fallback for existing deployments
         let state_file = ".deltaglider_bootstrap_hash";
-        std::fs::write(state_file, &hash).expect("Failed to write bootstrap hash file");
+        deltaglider_proxy::config::write_bootstrap_hash_file(
+            std::path::Path::new(state_file),
+            &hash,
+        )
+        .expect("Failed to write bootstrap hash file");
         eprintln!();
         eprintln!("⚠ WARNING: If an encrypted IAM database exists, it will become");
         eprintln!("  unreadable on next restart (encrypted with the old password).");

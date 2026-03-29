@@ -62,6 +62,10 @@ type IoResult<T> = Result<T, std::io::Error>;
 /// draining stderr. All three streams are consumed concurrently to prevent
 /// pipe-buffer deadlocks.
 ///
+/// `max_stdout` caps how many bytes are read from stdout to guard against
+/// decompression bombs (a crafted VCDIFF delta can amplify small input to
+/// gigabytes of output). If exceeded, the read is aborted with an error.
+///
 /// Returns `(write_result, stdout_bytes, stderr_bytes)`.
 ///
 /// PERF: We MUST handle stdin/stdout/stderr concurrently using `thread::scope`.
@@ -69,9 +73,10 @@ type IoResult<T> = Result<T, std::io::Error>;
 /// write() and we deadlock. All three pipes must be drained in parallel.
 fn pipe_stdin_stdout_stderr(
     child_stdin: std::process::ChildStdin,
-    mut child_stdout: std::process::ChildStdout,
+    child_stdout: std::process::ChildStdout,
     mut child_stderr: std::process::ChildStderr,
     input: &[u8],
+    max_stdout: usize,
 ) -> (IoResult<()>, IoResult<Vec<u8>>, IoResult<Vec<u8>>) {
     std::thread::scope(|s| {
         let writer = s.spawn(|| {
@@ -85,9 +90,18 @@ fn pipe_stdin_stdout_stderr(
             Ok::<(), std::io::Error>(()) // close stdin → child sees EOF
         });
 
-        let stdout_reader = s.spawn(|| {
+        let stdout_reader = s.spawn(move || {
+            // Read with a size cap to prevent decompression bombs.
             let mut buf = Vec::new();
-            child_stdout.read_to_end(&mut buf)?;
+            let mut limited = child_stdout.take(max_stdout as u64 + 1);
+            limited.read_to_end(&mut buf)?;
+            if buf.len() > max_stdout {
+                return Err(std::io::Error::other(format!(
+                    "output exceeds maximum size ({} > {} bytes)",
+                    buf.len(),
+                    max_stdout
+                )));
+            }
             Ok::<Vec<u8>, std::io::Error>(buf)
         });
 
@@ -194,8 +208,13 @@ impl DeltaCodec {
                 let child_stdout = child.stdout.take().unwrap();
                 let child_stderr = child.stderr.take().unwrap();
 
-                let (write_result, delta, stderr_result) =
-                    pipe_stdin_stdout_stderr(child_stdin, child_stdout, child_stderr, target);
+                let (write_result, delta, stderr_result) = pipe_stdin_stdout_stderr(
+                    child_stdin,
+                    child_stdout,
+                    child_stderr,
+                    target,
+                    self.max_size,
+                );
                 write_result?;
                 let delta = delta?;
                 let stderr_bytes = stderr_result.unwrap_or_default();
@@ -273,8 +292,13 @@ impl DeltaCodec {
                 let child_stdout = child.stdout.take().unwrap();
                 let child_stderr = child.stderr.take().unwrap();
 
-                let (write_result, target, stderr_result) =
-                    pipe_stdin_stdout_stderr(child_stdin, child_stdout, child_stderr, delta);
+                let (write_result, target, stderr_result) = pipe_stdin_stdout_stderr(
+                    child_stdin,
+                    child_stdout,
+                    child_stderr,
+                    delta,
+                    self.max_size,
+                );
                 write_result?;
                 let target = target?;
                 let stderr_bytes = stderr_result.unwrap_or_default();
