@@ -32,26 +32,13 @@ pub struct SessionResponse {
     valid: bool,
 }
 
-/// Query parameters for the whoami endpoint.
-/// Fields are accepted but ignored — kept for backward compatibility with
-/// older frontends that may still send `access_key_id`.
+/// Query parameters for the whoami endpoint (no fields required).
 #[derive(Deserialize)]
-#[allow(dead_code)]
-pub struct WhoamiQuery {
-    access_key_id: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct WhoamiUser {
-    name: String,
-    access_key_id: String,
-    is_admin: bool,
-}
+pub struct WhoamiQuery {}
 
 #[derive(Serialize)]
 pub struct WhoamiResponse {
     mode: String,
-    user: Option<WhoamiUser>,
 }
 
 #[derive(Deserialize)]
@@ -254,10 +241,7 @@ pub async fn whoami(
         IamState::Legacy(_) => "bootstrap",
         IamState::Iam(_) => "iam",
     };
-    Json(WhoamiResponse {
-        mode: mode.into(),
-        user: None,
-    })
+    Json(WhoamiResponse { mode: mode.into() })
 }
 
 /// POST /api/admin/login-as — create admin session for an IAM user with admin permissions.

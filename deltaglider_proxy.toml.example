@@ -147,5 +147,10 @@ path = "./data"
 # Security:
 #   DGP_SESSION_TTL_HOURS     - Admin session TTL in hours (default: 4)
 #   DGP_CLOCK_SKEW_SECONDS    - SigV4 clock skew tolerance in seconds (default: 300)
-#   DGP_MAX_MULTIPART_UPLOADS - Max concurrent multipart uploads (default: 100)
+#   DGP_MAX_MULTIPART_UPLOADS - Max concurrent multipart uploads (default: 1000)
 #   DGP_DEBUG_HEADERS         - Expose debug/fingerprinting headers (default: false)
+#   DGP_SECURE_COOKIES        - Set session cookies with Secure flag (default: true)
+#                                Set to "false" only for local dev over plain HTTP.
+#   DGP_CORS_PERMISSIVE       - Allow cross-origin requests to admin API (default: false)
+#                                Set to "true" only for local dev with separate UI server.
+#   DGP_MAX_CONCURRENT_REQUESTS - Global concurrent request limit (default: 1024)

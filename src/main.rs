@@ -8,7 +8,7 @@ use arc_swap::ArcSwap;
 use axum::middleware;
 use clap::Parser;
 use deltaglider_proxy::api::admin::AdminState;
-use deltaglider_proxy::api::handlers::AppState;
+use deltaglider_proxy::api::handlers::{debug_headers_enabled, AppState};
 use deltaglider_proxy::config::Config;
 use deltaglider_proxy::deltaglider::DynEngine;
 use deltaglider_proxy::multipart::MultipartStore;
@@ -201,10 +201,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let replay_cache = init_replay_cache();
 
     // --- Debug headers ---
-    let debug_headers = std::env::var("DGP_DEBUG_HEADERS")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
-    if debug_headers {
+    if debug_headers_enabled() {
         info!("  Debug headers: enabled (DGP_DEBUG_HEADERS=true)");
     }
 
@@ -229,7 +226,6 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         engine: ArcSwap::from_pointee(engine),
         multipart,
         metrics: metrics.clone(),
-        debug_headers,
     });
 
     // --- Background monitors ---
