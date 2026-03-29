@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
+use zeroize::Zeroize;
 
 /// Maximum number of concurrent sessions. Oldest sessions are evicted on overflow.
 const MAX_SESSIONS: usize = 10;
@@ -33,17 +34,11 @@ pub struct S3SessionCredentials {
 }
 
 impl Drop for S3SessionCredentials {
-    #[allow(unsafe_code)]
     fn drop(&mut self) {
-        // Zero out the secret on drop to prevent lingering in memory.
-        // SAFETY: we own the String and are about to drop it; overwriting
-        // the UTF-8 bytes with zeros is safe (zeros are valid UTF-8).
-        unsafe {
-            self.secret_access_key
-                .as_bytes_mut()
-                .iter_mut()
-                .for_each(|b| *b = 0);
-        }
+        // Zero out the secret on drop to prevent it from lingering in memory
+        // after the session is invalidated. Uses the `zeroize` crate which is
+        // designed for this purpose and avoids the need for unsafe code.
+        self.secret_access_key.zeroize();
     }
 }
 
