@@ -427,16 +427,55 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
     }
 
-    /// Resolve metadata with legacy migration fallback.
-    /// Tries a direct lookup first; if not found, attempts to migrate a legacy
-    /// reference object, then retries the lookup.
+    /// Resolve metadata for an object key, with no migration attempt.
+    ///
+    /// Use this from callers that **already hold** the per-deltaspace prefix lock
+    /// (e.g. `delete()`). Calling `resolve_metadata_with_migration` from such a
+    /// caller would deadlock because tokio's async Mutex is not reentrant.
+    async fn resolve_metadata(
+        &self,
+        bucket: &str,
+        deltaspace_id: &str,
+        obj_key: &ObjectKey,
+    ) -> Result<Option<FileMetadata>, EngineError> {
+        Ok(self
+            .resolve_object_metadata(bucket, deltaspace_id, &obj_key.full_key())
+            .await?)
+    }
+
+    /// Resolve metadata with legacy migration fallback, acquiring the per-deltaspace
+    /// prefix lock before migration to prevent races with concurrent `store()` calls.
+    ///
+    /// Uses double-checked locking:
+    /// 1. Fast path: look up metadata without the lock.
+    /// 2. If not found, acquire the prefix lock.
+    /// 3. Re-check under the lock (a concurrent writer may have already migrated).
+    /// 4. If still not found, attempt migration under the lock.
+    ///
+    /// **Do not call this from a caller that already holds the prefix lock** — use
+    /// `resolve_metadata` instead to avoid a deadlock.
     async fn resolve_metadata_with_migration(
         &self,
         bucket: &str,
         deltaspace_id: &str,
         obj_key: &ObjectKey,
     ) -> Result<Option<FileMetadata>, EngineError> {
-        let mut metadata = self
+        // Fast path: most objects are found immediately without acquiring the lock.
+        let metadata = self
+            .resolve_object_metadata(bucket, deltaspace_id, &obj_key.full_key())
+            .await?;
+        if metadata.is_some() {
+            return Ok(metadata);
+        }
+
+        // Slow path: metadata not found. Acquire the prefix lock before attempting
+        // migration so we don't race with a concurrent store() that might write to
+        // the same deltaspace while migration is in progress.
+        let _migration_guard = self.acquire_prefix_lock(deltaspace_id).await;
+
+        // Re-check under the lock: a concurrent writer may have already migrated
+        // the legacy object (or written a new one) while we were waiting.
+        let metadata = self
             .resolve_object_metadata(bucket, deltaspace_id, &obj_key.full_key())
             .await?;
         if metadata.is_none()
@@ -444,9 +483,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 .migrate_legacy_reference_object_if_needed(bucket, deltaspace_id, &obj_key.filename)
                 .await?
         {
-            metadata = self
+            return Ok(self
                 .resolve_object_metadata(bucket, deltaspace_id, &obj_key.full_key())
-                .await?;
+                .await?);
         }
         Ok(metadata)
     }
@@ -722,8 +761,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // operations that may create or clean up the reference.
         let _guard = self.acquire_prefix_lock(&deltaspace_id).await;
 
+        // Use resolve_metadata (no migration) — we already hold the prefix lock, and
+        // tokio::sync::Mutex is not reentrant, so calling resolve_metadata_with_migration
+        // here would deadlock. Legacy objects that haven't been migrated yet will appear
+        // as NotFound; a prior GET/HEAD on the key will have triggered migration.
         let metadata = self
-            .resolve_metadata_with_migration(bucket, &deltaspace_id, &obj_key)
+            .resolve_metadata(bucket, &deltaspace_id, &obj_key)
             .await?
             .ok_or_else(|| EngineError::NotFound(obj_key.full_key()))?;
 

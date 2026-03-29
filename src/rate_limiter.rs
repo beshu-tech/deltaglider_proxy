@@ -165,20 +165,22 @@ impl RateLimiter {
 /// for client IP extraction. When `false`, these headers are ignored to prevent
 /// IP spoofing by untrusted clients.
 ///
-/// Controlled by `DGP_TRUST_PROXY_HEADERS=true`. Defaults to `false` (safe default).
+/// Controlled by `DGP_TRUST_PROXY_HEADERS`. **Defaults to `true`** to preserve
+/// behaviour from versions prior to v0.5.2, where proxy headers were always trusted.
 ///
-/// **IMPORTANT**: Only enable this when the proxy sits behind a trusted reverse proxy
-/// (nginx, Caddy, ALB) that sets/overwrites these headers. Direct-to-internet deployments
-/// MUST leave this disabled, otherwise attackers can spoof IPs to bypass rate limiting
-/// and poison `aws:SourceIp` IAM conditions.
+/// **Security note**: the default of `true` is only safe when the proxy sits behind
+/// a trusted reverse proxy (nginx, Caddy, ALB) that sets/overwrites these headers.
+/// Direct-to-internet deployments should set `DGP_TRUST_PROXY_HEADERS=false`,
+/// otherwise any client can spoof their IP to bypass rate limiting and poison
+/// `aws:SourceIp` IAM conditions.
+///
+/// TODO: add axum `ConnectInfo<SocketAddr>` support so the real peer IP is
+/// always available and proxy-header trust is unnecessary for rate limiting.
 fn trust_proxy_headers() -> bool {
     std::env::var("DGP_TRUST_PROXY_HEADERS")
         .map(|v| v == "true" || v == "1")
-        // Default true: preserves pre-v0.5.2 behaviour. Rate limiting and
-        // aws:SourceIp conditions require an IP, which currently only comes
-        // from these headers. Set to "false" only if clients connect directly
-        // (no reverse proxy) AND you accept that rate limiting is disabled.
-        // TODO: add ConnectInfo<SocketAddr> for real peer IP extraction.
+        // Defaults to true for backwards compatibility with pre-v0.5.2 deployments.
+        // See doc comment above for the security implications.
         .unwrap_or(true)
 }
 
