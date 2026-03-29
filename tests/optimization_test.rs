@@ -167,7 +167,9 @@ async fn test_concurrent_delta_puts_same_prefix() {
 
 #[tokio::test]
 async fn test_concurrent_delta_puts_different_prefixes() {
-    let server = TestServer::filesystem().await;
+    // Use high codec concurrency — this test spawns 20 concurrent delta PUTs
+    // and would exhaust the default (CPU-count) permits on small CI runners.
+    let server = TestServer::filesystem_with_codec_concurrency(20).await;
     let http = reqwest::Client::new();
 
     let mut handles = Vec::new();

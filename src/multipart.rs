@@ -9,9 +9,8 @@ use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Duration, Utc};
 use md5::{Digest, Md5};
 use parking_lot::RwLock;
-use sha2::Sha256;
+use rand::Rng;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Data for a single uploaded part
 struct PartData {
@@ -51,6 +50,13 @@ pub struct CompletedParts {
     pub user_metadata: HashMap<String, String>,
 }
 
+/// Internal: validated parts from the shared validation step.
+struct ValidatedParts {
+    part_data: Vec<Bytes>,
+    etag: String,
+    total_size: u64,
+}
+
 /// Default maximum number of concurrent multipart uploads.
 /// Overridable via `DGP_MAX_MULTIPART_UPLOADS` env var.
 fn default_max_uploads() -> usize {
@@ -65,7 +71,6 @@ pub struct MultipartStore {
     uploads: RwLock<HashMap<String, MultipartUpload>>,
     max_object_size: u64,
     max_uploads: usize,
-    id_counter: AtomicU64,
 }
 
 impl MultipartStore {
@@ -74,7 +79,6 @@ impl MultipartStore {
             uploads: RwLock::new(HashMap::new()),
             max_object_size,
             max_uploads: default_max_uploads(),
-            id_counter: AtomicU64::new(0),
         }
     }
 
@@ -87,18 +91,12 @@ impl MultipartStore {
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
     ) -> Result<String, S3Error> {
-        let counter = self.id_counter.fetch_add(1, Ordering::SeqCst);
         let now = Utc::now();
-        let nanos = now.timestamp_nanos_opt().unwrap_or(0);
 
-        // SHA256(counter + timestamp_nanos + bucket + key), first 32 hex chars
-        let mut hasher = Sha256::new();
-        hasher.update(counter.to_le_bytes());
-        hasher.update(nanos.to_le_bytes());
-        hasher.update(bucket.as_bytes());
-        hasher.update(key.as_bytes());
-        let hash = hasher.finalize();
-        let upload_id = hex::encode(&hash[..16]); // 32 hex chars
+        // Cryptographically random upload ID (matches AWS S3 behavior).
+        let mut random_bytes = [0u8; 16];
+        rand::rngs::OsRng.fill(&mut random_bytes);
+        let upload_id = hex::encode(random_bytes); // 32 hex chars
 
         let mut uploads = self.uploads.write();
 
@@ -178,10 +176,60 @@ impl MultipartStore {
         key: &str,
         requested_parts: &[(u32, String)], // (part_number, etag)
     ) -> Result<CompletedUpload, S3Error> {
-        // Borrow under read lock for assembly — the upload stays in the map until
-        // the caller confirms the store succeeded (via remove_upload).
-        // This prevents data loss if engine.store() fails after assembly.
         let uploads = self.uploads.read();
+        let (validated, upload) =
+            self.validate_parts(&uploads, upload_id, bucket, key, requested_parts)?;
+
+        let mut assembled = BytesMut::new();
+        for part in &validated.part_data {
+            assembled.extend_from_slice(part);
+        }
+
+        Ok(CompletedUpload {
+            data: assembled.freeze(),
+            etag: validated.etag,
+            content_type: upload.content_type.clone(),
+            user_metadata: upload.user_metadata.clone(),
+        })
+    }
+
+    /// Return ordered part data without assembling into a contiguous buffer.
+    /// Like `complete()`, but returns individual part buffers instead of
+    /// assembling into one contiguous buffer. Used for non-delta-eligible files
+    /// to avoid ~2x memory usage.
+    pub fn complete_parts(
+        &self,
+        upload_id: &str,
+        bucket: &str,
+        key: &str,
+        requested_parts: &[(u32, String)],
+    ) -> Result<CompletedParts, S3Error> {
+        let uploads = self.uploads.read();
+        let (validated, upload) =
+            self.validate_parts(&uploads, upload_id, bucket, key, requested_parts)?;
+
+        Ok(CompletedParts {
+            parts: validated.part_data,
+            etag: validated.etag,
+            total_size: validated.total_size,
+            content_type: upload.content_type.clone(),
+            user_metadata: upload.user_metadata.clone(),
+        })
+    }
+
+    /// Shared validation for `complete()` and `complete_parts()`.
+    ///
+    /// Looks up the upload, validates part ordering and ETags, enforces size limits,
+    /// and computes the S3-compatible multipart ETag. Returns validated part data
+    /// and a reference to the upload (for content_type / user_metadata).
+    fn validate_parts<'a>(
+        &self,
+        uploads: &'a HashMap<String, MultipartUpload>,
+        upload_id: &str,
+        bucket: &str,
+        key: &str,
+        requested_parts: &[(u32, String)],
+    ) -> Result<(ValidatedParts, &'a MultipartUpload), S3Error> {
         let upload = uploads
             .get(upload_id)
             .ok_or_else(|| S3Error::NoSuchUpload(upload_id.to_string()))?;
@@ -205,7 +253,7 @@ impl MultipartStore {
         // Validate each part exists and ETags match; compute total size
         let mut total_size: u64 = 0;
         let mut md5_concat = Vec::new();
-        let mut assembled = BytesMut::new();
+        let mut part_data = Vec::with_capacity(requested_parts.len());
 
         for (part_number, requested_etag) in requested_parts {
             let part = upload.parts.get(part_number).ok_or_else(|| {
@@ -230,93 +278,21 @@ impl MultipartStore {
             }
 
             md5_concat.extend_from_slice(&part.md5_raw);
-            assembled.extend_from_slice(&part.data);
+            part_data.push(part.data.clone());
         }
 
         // S3-compatible multipart ETag: MD5(concat of part MD5 raw bytes)-N
         let final_md5 = Md5::digest(&md5_concat);
         let etag = format!("\"{}-{}\"", hex::encode(final_md5), requested_parts.len());
 
-        Ok(CompletedUpload {
-            data: assembled.freeze(),
-            etag,
-            content_type: upload.content_type.clone(),
-            user_metadata: upload.user_metadata.clone(),
-        })
-    }
-
-    /// Return ordered part data without assembling into a contiguous buffer.
-    /// Used for non-delta-eligible files to skip the expensive assembly step.
-    /// Like `complete()`, but returns individual part buffers instead of
-    /// assembling into one contiguous buffer. Used for non-delta-eligible files
-    /// to avoid ~2x memory usage.
-    pub fn complete_parts(
-        &self,
-        upload_id: &str,
-        bucket: &str,
-        key: &str,
-        requested_parts: &[(u32, String)],
-    ) -> Result<CompletedParts, S3Error> {
-        // Borrow under read lock — upload stays in map until remove_upload() after store succeeds.
-        let uploads = self.uploads.read();
-        let upload = uploads
-            .get(upload_id)
-            .ok_or_else(|| S3Error::NoSuchUpload(upload_id.to_string()))?;
-        if upload.bucket != bucket || upload.key != key {
-            return Err(S3Error::NoSuchUpload(upload_id.to_string()));
-        }
-
-        if requested_parts.is_empty() {
-            return Err(S3Error::InvalidPart(
-                "You must specify at least one part".to_string(),
-            ));
-        }
-
-        for window in requested_parts.windows(2) {
-            if window[0].0 >= window[1].0 {
-                return Err(S3Error::InvalidPartOrder);
-            }
-        }
-
-        let mut total_size: u64 = 0;
-        let mut md5_concat = Vec::new();
-        let mut parts = Vec::with_capacity(requested_parts.len());
-
-        for (part_number, requested_etag) in requested_parts {
-            let part = upload.parts.get(part_number).ok_or_else(|| {
-                S3Error::InvalidPart(format!("Part {} has not been uploaded", part_number))
-            })?;
-
-            let requested_clean = requested_etag.trim_matches('"');
-            if requested_clean != part.md5_hex {
-                return Err(S3Error::InvalidPart(format!(
-                    "ETag mismatch for part {}: expected \"{}\", got \"{}\"",
-                    part_number, part.md5_hex, requested_clean
-                )));
-            }
-
-            total_size += part.size;
-            if total_size > self.max_object_size {
-                return Err(S3Error::InvalidArgument(format!(
-                    "Assembled object size {} exceeds maximum {}",
-                    total_size, self.max_object_size
-                )));
-            }
-
-            md5_concat.extend_from_slice(&part.md5_raw);
-            parts.push(part.data.clone());
-        }
-
-        let final_md5 = Md5::digest(&md5_concat);
-        let etag = format!("\"{}-{}\"", hex::encode(final_md5), requested_parts.len());
-
-        Ok(CompletedParts {
-            parts,
-            etag,
-            total_size,
-            content_type: upload.content_type.clone(),
-            user_metadata: upload.user_metadata.clone(),
-        })
+        Ok((
+            ValidatedParts {
+                part_data,
+                etag,
+                total_size,
+            },
+            upload,
+        ))
     }
 
     /// Remove a completed upload from the map.

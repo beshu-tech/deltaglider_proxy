@@ -60,7 +60,12 @@ type IoResult<T> = Result<T, std::io::Error>;
 
 /// Pipe data to a child process's stdin while concurrently reading stdout and
 /// draining stderr. All three streams are consumed concurrently to prevent
-/// pipe-buffer deadlocks.
+/// pipe-buffer deadlocks. A watchdog thread kills the child after `timeout`
+/// to prevent hung xdelta3 processes from permanently consuming codec slots.
+///
+/// `max_stdout` caps how many bytes are read from stdout to guard against
+/// decompression bombs (a crafted VCDIFF delta can amplify small input to
+/// gigabytes of output). If exceeded, the read is aborted with an error.
 ///
 /// Returns `(write_result, stdout_bytes, stderr_bytes)`.
 ///
@@ -69,11 +74,49 @@ type IoResult<T> = Result<T, std::io::Error>;
 /// write() and we deadlock. All three pipes must be drained in parallel.
 fn pipe_stdin_stdout_stderr(
     child_stdin: std::process::ChildStdin,
-    mut child_stdout: std::process::ChildStdout,
+    child_stdout: std::process::ChildStdout,
     mut child_stderr: std::process::ChildStderr,
     input: &[u8],
+    max_stdout: usize,
+    child_id: u32,
+    timeout: Duration,
 ) -> (IoResult<()>, IoResult<Vec<u8>>, IoResult<Vec<u8>>) {
+    // Flag set to true when pipe I/O completes normally, signalling the
+    // watchdog to stand down. Using AtomicBool + Condvar so the watchdog
+    // can wake immediately instead of sleeping the full timeout.
+    let done = std::sync::Arc::new((
+        std::sync::atomic::AtomicBool::new(false),
+        std::sync::Condvar::new(),
+        std::sync::Mutex::new(()),
+    ));
+
     std::thread::scope(|s| {
+        // Watchdog: kills the child if pipe I/O takes longer than CODEC_TIMEOUT.
+        // When the child is killed, its pipe ends close, unblocking the reader
+        // threads. Without this, a hung xdelta3 blocks read_to_end() forever
+        // and the codec semaphore slot is permanently lost.
+        let done_clone = done.clone();
+        s.spawn(move || {
+            let (ref flag, ref condvar, ref mutex) = *done_clone;
+            let guard = mutex.lock().unwrap();
+            let _result = condvar.wait_timeout(guard, timeout).unwrap();
+            if !flag.load(std::sync::atomic::Ordering::Acquire) {
+                // Timeout expired and I/O hasn't finished — kill the child.
+                // Use raw kill(pid, SIGKILL) since we don't own the Child handle.
+                #[cfg(unix)]
+                {
+                    unsafe {
+                        libc::kill(child_id as i32, libc::SIGKILL);
+                    }
+                }
+                warn!(
+                    "Watchdog killed hung xdelta3 process (pid {}) after {}s",
+                    child_id,
+                    timeout.as_secs()
+                );
+            }
+        });
+
         let writer = s.spawn(|| {
             let mut stdin = child_stdin;
             stdin.write_all(input)?;
@@ -85,9 +128,18 @@ fn pipe_stdin_stdout_stderr(
             Ok::<(), std::io::Error>(()) // close stdin → child sees EOF
         });
 
-        let stdout_reader = s.spawn(|| {
+        let stdout_reader = s.spawn(move || {
+            // Read with a size cap to prevent decompression bombs.
             let mut buf = Vec::new();
-            child_stdout.read_to_end(&mut buf)?;
+            let mut limited = child_stdout.take(max_stdout as u64 + 1);
+            limited.read_to_end(&mut buf)?;
+            if buf.len() > max_stdout {
+                return Err(std::io::Error::other(format!(
+                    "output exceeds maximum size ({} > {} bytes)",
+                    buf.len(),
+                    max_stdout
+                )));
+            }
             Ok::<Vec<u8>, std::io::Error>(buf)
         });
 
@@ -97,11 +149,18 @@ fn pipe_stdin_stdout_stderr(
             Ok::<Vec<u8>, std::io::Error>(buf)
         });
 
-        (
+        let result = (
             writer.join().unwrap(),
             stdout_reader.join().unwrap(),
             stderr_reader.join().unwrap(),
-        )
+        );
+
+        // Signal the watchdog to stand down
+        let (ref flag, ref condvar, _) = *done;
+        flag.store(true, std::sync::atomic::Ordering::Release);
+        condvar.notify_one();
+
+        result
     })
 }
 
@@ -190,12 +249,20 @@ impl DeltaCodec {
 
         match result {
             Ok(mut child) => {
+                let child_id = child.id();
                 let child_stdin = child.stdin.take().unwrap();
                 let child_stdout = child.stdout.take().unwrap();
                 let child_stderr = child.stderr.take().unwrap();
 
-                let (write_result, delta, stderr_result) =
-                    pipe_stdin_stdout_stderr(child_stdin, child_stdout, child_stderr, target);
+                let (write_result, delta, stderr_result) = pipe_stdin_stdout_stderr(
+                    child_stdin,
+                    child_stdout,
+                    child_stderr,
+                    target,
+                    self.max_size,
+                    child_id,
+                    CODEC_TIMEOUT,
+                );
                 write_result?;
                 let delta = delta?;
                 let stderr_bytes = stderr_result.unwrap_or_default();
@@ -269,12 +336,20 @@ impl DeltaCodec {
 
         match result {
             Ok(mut child) => {
+                let child_id = child.id();
                 let child_stdin = child.stdin.take().unwrap();
                 let child_stdout = child.stdout.take().unwrap();
                 let child_stderr = child.stderr.take().unwrap();
 
-                let (write_result, target, stderr_result) =
-                    pipe_stdin_stdout_stderr(child_stdin, child_stdout, child_stderr, delta);
+                let (write_result, target, stderr_result) = pipe_stdin_stdout_stderr(
+                    child_stdin,
+                    child_stdout,
+                    child_stderr,
+                    delta,
+                    self.max_size,
+                    child_id,
+                    CODEC_TIMEOUT,
+                );
                 write_result?;
                 let target = target?;
                 let stderr_bytes = stderr_result.unwrap_or_default();

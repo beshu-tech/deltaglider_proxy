@@ -284,13 +284,9 @@ export interface WhoamiResponse {
   user: { name: string; access_key_id: string; is_admin: boolean } | null;
 }
 
-export async function whoami(accessKeyId?: string, _secretAccessKey?: string): Promise<WhoamiResponse> {
+export async function whoami(): Promise<WhoamiResponse> {
   try {
-    // Only send access_key_id (never send secret in URL query params — it leaks to logs/history)
-    const params = new URLSearchParams();
-    if (accessKeyId) params.set('access_key_id', accessKeyId);
-    const qs = params.toString();
-    const res = await adminFetch(`/api/whoami${qs ? '?' + qs : ''}`);
+    const res = await adminFetch('/api/whoami');
     if (!res.ok) return { mode: 'bootstrap', user: null };
     return await safeJson(res);
   } catch (err) {

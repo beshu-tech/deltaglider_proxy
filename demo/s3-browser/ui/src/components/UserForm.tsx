@@ -19,14 +19,21 @@ const FALLBACK_PRESETS: Record<string, PermissionRow[]> = {
   'Read Only': [{ effect: 'Allow', actions: ['read', 'list'], resources: '*' }],
 };
 
+/** Cryptographically secure random string from the given alphabet. */
+function secureRandom(alphabet: string, length: number): string {
+  const buf = new Uint8Array(length);
+  crypto.getRandomValues(buf);
+  return Array.from(buf, (b) => alphabet[b % alphabet.length]).join('');
+}
+
 function generateId(): string {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  return 'AK' + Array.from({ length: 18 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+  return 'AK' + secureRandom(chars, 18);
 }
 
 function generateSecret(): string {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-  return Array.from({ length: 40 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+  return secureRandom(chars, 40);
 }
 
 interface UserFormProps {

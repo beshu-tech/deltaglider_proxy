@@ -471,10 +471,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             ref_meta.content_type.clone(),
         );
 
-        self.delete_passthrough_idempotent(bucket, deltaspace_id, filename)
-            .await?;
+        // Write the delta BEFORE deleting the passthrough. If put_delta fails,
+        // the passthrough still exists and the object remains accessible.
         self.storage
             .put_delta(bucket, deltaspace_id, filename, &delta, &delta_meta)
+            .await?;
+        self.delete_passthrough_idempotent(bucket, deltaspace_id, filename)
             .await?;
 
         ref_meta.original_name = Self::INTERNAL_REFERENCE_NAME.to_string();

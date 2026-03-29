@@ -8,7 +8,7 @@ use arc_swap::ArcSwap;
 use axum::middleware;
 use clap::Parser;
 use deltaglider_proxy::api::admin::AdminState;
-use deltaglider_proxy::api::handlers::AppState;
+use deltaglider_proxy::api::handlers::{debug_headers_enabled, AppState};
 use deltaglider_proxy::config::Config;
 use deltaglider_proxy::deltaglider::DynEngine;
 use deltaglider_proxy::multipart::MultipartStore;
@@ -104,7 +104,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST).expect("bcrypt hashing failed");
         // Write to new file, keep old file name as fallback for existing deployments
         let state_file = ".deltaglider_bootstrap_hash";
-        std::fs::write(state_file, &hash).expect("Failed to write bootstrap hash file");
+        deltaglider_proxy::config::write_bootstrap_hash_file(
+            std::path::Path::new(state_file),
+            &hash,
+        )
+        .expect("Failed to write bootstrap hash file");
         eprintln!();
         eprintln!("⚠ WARNING: If an encrypted IAM database exists, it will become");
         eprintln!("  unreadable on next restart (encrypted with the old password).");
@@ -197,10 +201,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let replay_cache = init_replay_cache();
 
     // --- Debug headers ---
-    let debug_headers = std::env::var("DGP_DEBUG_HEADERS")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
-    if debug_headers {
+    if debug_headers_enabled() {
         info!("  Debug headers: enabled (DGP_DEBUG_HEADERS=true)");
     }
 
@@ -225,7 +226,6 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         engine: ArcSwap::from_pointee(engine),
         multipart,
         metrics: metrics.clone(),
-        debug_headers,
     });
 
     // --- Background monitors ---

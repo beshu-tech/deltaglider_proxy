@@ -29,6 +29,18 @@ use crate::Cli;
 // Extracted helpers
 // ---------------------------------------------------------------------------
 
+/// Compute the path to the IAM config database file.
+///
+/// Derives the directory from `DGP_CONFIG` (parent of the TOML config file)
+/// or falls back to the current working directory.
+fn config_db_path() -> std::path::PathBuf {
+    let db_dir = std::env::var("DGP_CONFIG")
+        .ok()
+        .and_then(|p| std::path::Path::new(&p).parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    db_dir.join("deltaglider_config.db")
+}
+
 /// Initialize tracing with reload support.
 /// Priority: RUST_LOG > DGP_LOG_LEVEL > --verbose > default.
 pub fn init_tracing(cli: &Cli) -> reload::Handle<EnvFilter, tracing_subscriber::Registry> {
@@ -136,10 +148,17 @@ pub fn init_metrics(config: &Config) -> Arc<Metrics> {
 /// Create the replay-attack detection cache and spawn its periodic cleanup.
 pub fn init_replay_cache() -> deltaglider_proxy::api::auth::ReplayCache {
     let replay_cache: deltaglider_proxy::api::auth::ReplayCache = Arc::new(dashmap::DashMap::new());
+    // Cleanup cutoff must match the replay detection window (DGP_CLOCK_SKEW_SECONDS,
+    // default 300s). Using a shorter cutoff would evict entries while they're still
+    // within the valid clock-skew window, allowing replayed requests to succeed.
+    let replay_window_secs: u64 = std::env::var("DGP_CLOCK_SKEW_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
     spawn_periodic(Duration::from_secs(60), {
         let cache = replay_cache.clone();
         move || {
-            let cutoff = std::time::Instant::now() - Duration::from_secs(60);
+            let cutoff = std::time::Instant::now() - Duration::from_secs(replay_window_secs);
             cache.retain(|_, instant: &mut std::time::Instant| *instant > cutoff);
         }
     });
@@ -298,11 +317,7 @@ pub fn init_config_db(
     admin_password_hash: &str,
     iam_state: &SharedIamState,
 ) -> Option<Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::ConfigDb>>> {
-    let db_path = std::env::var("DGP_CONFIG")
-        .ok()
-        .and_then(|p| std::path::Path::new(&p).parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let db_file = db_path.join("deltaglider_config.db");
+    let db_file = config_db_path();
     match deltaglider_proxy::config_db::ConfigDb::open_or_create(&db_file, admin_password_hash) {
         Ok(db) => {
             // If DB has existing users, switch to IAM mode
@@ -345,12 +360,7 @@ pub async fn init_config_sync(
         }
     };
 
-    // Determine the local DB path (same logic as init_config_db)
-    let db_path = std::env::var("DGP_CONFIG")
-        .ok()
-        .and_then(|p| std::path::Path::new(&p).parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let db_file = db_path.join("deltaglider_config.db");
+    let db_file = config_db_path();
 
     let sync = match ConfigDbSync::new(
         &config.backend,

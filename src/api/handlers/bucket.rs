@@ -292,6 +292,10 @@ pub async fn create_bucket(
     auth_user: Option<axum::Extension<AuthenticatedUser>>,
     headers: HeaderMap,
 ) -> Result<Response, S3Error> {
+    // Validate bucket name per S3 spec — must run before any stub returns
+    // to prevent path traversal via unvalidated bucket names
+    validate_bucket_name(&bucket)?;
+
     // PUT /{bucket}?acl — accept and ignore (ACL stub)
     if query.acl.is_some() {
         info!("PUT bucket ACL (stub): {}", bucket);
@@ -319,9 +323,6 @@ pub async fn create_bucket(
     }
 
     info!("CREATE bucket {}", bucket);
-
-    // Validate bucket name per S3 spec
-    validate_bucket_name(&bucket)?;
 
     // Create the real bucket on the storage backend
     state.engine.load().create_bucket(&bucket).await?;

@@ -108,21 +108,23 @@ export default function AdminPage({ onBack, onSessionExpired }: AdminPageProps) 
         return;
       }
 
-      const creds = getCredentials();
-      const ak = creds.accessKeyId || undefined;
-      const sk = creds.secretAccessKey || undefined;
-      const info = await whoami(ak, sk);
+      const info = await whoami();
       setAuthMode(info.mode);
 
-      if (info.mode === 'iam' && info.user?.is_admin && sk) {
-        const result = await loginAs(info.user.access_key_id, sk);
-        if (result.ok) {
-          setAuthed(true);
-        } else {
-          setAccessDenied(true);
+      // In IAM mode, attempt auto-login with the current S3 credentials.
+      // loginAs will succeed if the user is an IAM admin, or return 403 otherwise.
+      if (info.mode === 'iam') {
+        const creds = getCredentials();
+        const ak = creds.accessKeyId;
+        const sk = creds.secretAccessKey;
+        if (ak && sk) {
+          const result = await loginAs(ak, sk);
+          if (result.ok) {
+            setAuthed(true);
+          } else {
+            setAccessDenied(true);
+          }
         }
-      } else if (info.mode === 'iam' && info.user && !info.user.is_admin) {
-        setAccessDenied(true);
       }
 
       setCheckingSession(false);

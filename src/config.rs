@@ -161,6 +161,49 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         example: "my-config-bucket",
         category: "Config Sync",
     },
+    // ── Security / Runtime ─────────────────────────────────
+    EnvVarEntry {
+        name: "DGP_DEBUG_HEADERS",
+        description: "Expose debug/fingerprinting headers (x-amz-storage-type etc.)",
+        example: "true",
+        category: "Server",
+    },
+    EnvVarEntry {
+        name: "DGP_TRUST_PROXY_HEADERS",
+        description: "Trust X-Forwarded-For/X-Real-IP for rate limiting and IAM conditions",
+        example: "false",
+        category: "Security",
+    },
+    EnvVarEntry {
+        name: "DGP_SESSION_TTL_HOURS",
+        description: "Admin session TTL in hours (default: 4)",
+        example: "4",
+        category: "Security",
+    },
+    EnvVarEntry {
+        name: "DGP_MAX_MULTIPART_UPLOADS",
+        description: "Max concurrent multipart uploads (default: 1000)",
+        example: "1000",
+        category: "Server",
+    },
+    EnvVarEntry {
+        name: "DGP_CLOCK_SKEW_SECONDS",
+        description: "SigV4 clock skew tolerance in seconds (default: 300)",
+        example: "300",
+        category: "Security",
+    },
+    EnvVarEntry {
+        name: "DGP_MAX_CONCURRENT_REQUESTS",
+        description: "Max concurrent HTTP requests (tower ConcurrencyLimit, default: 1024)",
+        example: "1024",
+        category: "Server",
+    },
+    EnvVarEntry {
+        name: "DGP_CORS_PERMISSIVE",
+        description: "Enable permissive CORS for dev mode (default: false)",
+        example: "true",
+        category: "Server",
+    },
 ];
 
 /// Thread-safe shared config for hot-reload from admin GUI.
@@ -538,7 +581,7 @@ impl Config {
 
         // Persist the hash (use new file name)
         let persist_file = std::path::Path::new(".deltaglider_bootstrap_hash");
-        if let Err(e) = std::fs::write(persist_file, &hash) {
+        if let Err(e) = write_bootstrap_hash_file(persist_file, &hash) {
             eprintln!(
                 "Warning: could not persist bootstrap hash to {}: {}",
                 persist_file.display(),
@@ -657,6 +700,19 @@ pub enum ConfigError {
     Parse(String),
 }
 
+/// Write the bootstrap hash file with restrictive permissions (0600).
+/// This file doubles as the SQLCipher encryption key, so it must not be
+/// world-readable.
+pub fn write_bootstrap_hash_file(path: &std::path::Path, hash: &str) -> std::io::Result<()> {
+    std::fs::write(path, hash)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -758,16 +814,26 @@ mod tests {
             );
         }
 
-        // Every registry entry must be referenced in from_env (no stale entries)
+        // Every registry entry must be referenced somewhere in the codebase.
+        // Vars not in from_env() are read at other call sites (startup, session, etc.).
+        let used_outside_from_env: &[&str] = &[
+            "DGP_CONFIG",                  // config::load()
+            "DGP_CONFIG_SYNC_BUCKET",      // startup::init_config_sync()
+            "DGP_DEBUG_HEADERS",           // api::handlers::debug_headers_enabled()
+            "DGP_TRUST_PROXY_HEADERS",     // main.rs proxy header trust
+            "DGP_SESSION_TTL_HOURS",       // session::default_session_ttl()
+            "DGP_MAX_MULTIPART_UPLOADS",   // multipart::default_max_uploads()
+            "DGP_CLOCK_SKEW_SECONDS",      // api::auth + startup replay cache
+            "DGP_MAX_CONCURRENT_REQUESTS", // startup::build_s3_router()
+            "DGP_CORS_PERMISSIVE",         // demo::ui_router()
+        ];
         for name in &registry_names {
-            // DGP_CONFIG is checked in load(), not from_env() — allow it.
-            // DGP_CONFIG_SYNC_BUCKET is checked in main.rs init_config_sync(), not from_env().
-            if *name == "DGP_CONFIG" || *name == "DGP_CONFIG_SYNC_BUCKET" {
+            if used_outside_from_env.contains(name) {
                 continue;
             }
             assert!(
                 used_in_from_env.contains(name),
-                "Env var {name} is in ENV_VAR_REGISTRY but not used in from_env()"
+                "Env var {name} is in ENV_VAR_REGISTRY but not used in from_env() or listed in used_outside_from_env"
             );
         }
     }

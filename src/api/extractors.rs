@@ -12,10 +12,47 @@ use axum::{
 };
 use std::sync::Arc;
 
+/// Reject bucket names that could cause path traversal or other mischief.
+/// This is a security-critical check: on the filesystem backend, the bucket
+/// name becomes a directory under the data root. Without validation, names
+/// like `..` or `../../etc` would escape the data directory.
+///
+/// Uses the same S3 bucket naming rules as `create_bucket`:
+/// 3-63 chars, lowercase ASCII + digits + hyphens + dots, no `..`.
+fn validate_bucket(name: &str) -> Result<(), S3Error> {
+    if name.is_empty() {
+        return Err(S3Error::InvalidArgument(
+            "Bucket name cannot be empty".to_string(),
+        ));
+    }
+    let len = name.len();
+    if !(3..=63).contains(&len) {
+        return Err(S3Error::InvalidBucketName(format!(
+            "Bucket name must be between 3 and 63 characters long, got {}",
+            len
+        )));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+    {
+        return Err(S3Error::InvalidBucketName(
+            "Bucket name can only contain lowercase letters, numbers, hyphens, and dots"
+                .to_string(),
+        ));
+    }
+    if name.contains("..") {
+        return Err(S3Error::InvalidBucketName(
+            "Bucket name must not contain consecutive dots".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validated bucket extractor
 ///
 /// Validates that the bucket name in the path is non-empty and syntactically
-/// valid. Any bucket name is accepted (multi-bucket support).
+/// valid per S3 naming rules. Rejects names that could cause path traversal.
 ///
 /// # Example
 /// ```text
@@ -51,11 +88,7 @@ where
             .await
             .map_err(|_| S3Error::InvalidArgument("Invalid bucket path".to_string()))?;
 
-        if bucket.is_empty() {
-            return Err(S3Error::InvalidArgument(
-                "Bucket name cannot be empty".to_string(),
-            ));
-        }
+        validate_bucket(&bucket)?;
 
         Ok(ValidatedBucket(bucket))
     }
@@ -94,14 +127,17 @@ where
             .await
             .map_err(|_| S3Error::InvalidArgument("Invalid bucket/key path".to_string()))?;
 
-        if bucket.is_empty() {
-            return Err(S3Error::InvalidArgument(
-                "Bucket name cannot be empty".to_string(),
-            ));
-        }
+        validate_bucket(&bucket)?;
 
         // Normalize key by removing leading slashes
         let key = key.trim_start_matches('/').to_string();
+
+        // Reject keys containing path traversal segments
+        if key.split('/').any(|seg| seg == ".." || seg == ".") {
+            return Err(S3Error::InvalidArgument(
+                "Key must not contain '.' or '..' path segments".to_string(),
+            ));
+        }
 
         Ok(ValidatedPath { bucket, key })
     }
