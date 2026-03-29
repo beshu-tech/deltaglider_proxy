@@ -9,7 +9,7 @@ use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Duration, Utc};
 use md5::{Digest, Md5};
 use parking_lot::RwLock;
-use sha2::Sha256;
+use rand::Rng;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -87,18 +87,15 @@ impl MultipartStore {
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
     ) -> Result<String, S3Error> {
-        let counter = self.id_counter.fetch_add(1, Ordering::SeqCst);
+        let _counter = self.id_counter.fetch_add(1, Ordering::SeqCst);
         let now = Utc::now();
-        let nanos = now.timestamp_nanos_opt().unwrap_or(0);
 
-        // SHA256(counter + timestamp_nanos + bucket + key), first 32 hex chars
-        let mut hasher = Sha256::new();
-        hasher.update(counter.to_le_bytes());
-        hasher.update(nanos.to_le_bytes());
-        hasher.update(bucket.as_bytes());
-        hasher.update(key.as_bytes());
-        let hash = hasher.finalize();
-        let upload_id = hex::encode(&hash[..16]); // 32 hex chars
+        // Cryptographically random upload ID (matches AWS S3 behavior).
+        // The old SHA256(counter + timestamp + bucket + key) was predictable
+        // if an attacker knew the bucket, key, and approximate time.
+        let mut random_bytes = [0u8; 16];
+        rand::rngs::OsRng.fill(&mut random_bytes);
+        let upload_id = hex::encode(random_bytes); // 32 hex chars
 
         let mut uploads = self.uploads.write();
 
