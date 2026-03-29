@@ -121,9 +121,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     ) -> Result<RetrieveResponse, EngineError> {
         match &metadata.storage_info {
             StorageInfo::Passthrough => {
+                // Use the stored original_name (may differ from obj_key.filename if the file
+                // was copied with a .delta suffix from another deployment)
+                let stored_name = &metadata.original_name;
                 let stream = self
                     .storage
-                    .get_passthrough_stream(bucket, deltaspace_id, &obj_key.filename)
+                    .get_passthrough_stream(bucket, deltaspace_id, stored_name)
                     .await?;
                 debug!("Streaming passthrough file for {}", obj_key.full_key());
                 Ok(RetrieveResponse::Streamed {
@@ -200,15 +203,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         match &metadata.storage_info {
             StorageInfo::Passthrough => {
+                let stored_name = &metadata.original_name;
                 let (stream, content_length) = self
                     .storage
-                    .get_passthrough_stream_range(
-                        bucket,
-                        &deltaspace_id,
-                        &obj_key.filename,
-                        start,
-                        end,
-                    )
+                    .get_passthrough_stream_range(bucket, &deltaspace_id, stored_name, start, end)
                     .await?;
 
                 if content_length == 0 {
