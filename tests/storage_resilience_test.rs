@@ -82,10 +82,7 @@ async fn http_list_keys(
     bucket: &str,
     prefix: &str,
 ) -> Vec<String> {
-    let url = format!(
-        "{}/{}?list-type=2&prefix={}",
-        endpoint, bucket, prefix
-    );
+    let url = format!("{}/{}?list-type=2&prefix={}", endpoint, bucket, prefix);
     let resp = client.get(&url).send().await.expect("LIST request failed");
     let body = resp.text().await.unwrap_or_default();
     // Simple XML parsing — extract <Key>...</Key> elements
@@ -273,7 +270,8 @@ async fn test_content_roundtrip_sha256_match() {
         let download_sha = hex::encode(Sha256::digest(&body));
 
         assert_eq!(
-            upload_sha, download_sha,
+            upload_sha,
+            download_sha,
             "Content roundtrip SHA256 mismatch for {}: uploaded {} bytes, downloaded {} bytes",
             key,
             data.len(),
@@ -309,14 +307,28 @@ async fn test_unmanaged_file_triangle_invariant() {
     );
 
     // HEAD should work
-    let (head_status, head_cl) =
-        http_head(&http, &server.endpoint(), server.bucket(), "direct/report.txt").await;
+    let (head_status, head_cl) = http_head(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        "direct/report.txt",
+    )
+    .await;
     assert_eq!(head_status, 200, "HEAD should work for unmanaged file");
-    assert_eq!(head_cl, content.len() as u64, "HEAD content-length should match");
+    assert_eq!(
+        head_cl,
+        content.len() as u64,
+        "HEAD content-length should match"
+    );
 
     // GET should return correct content
-    let (get_status, get_body) =
-        http_get(&http, &server.endpoint(), server.bucket(), "direct/report.txt").await;
+    let (get_status, get_body) = http_get(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        "direct/report.txt",
+    )
+    .await;
     assert_eq!(get_status, 200, "GET should work for unmanaged file");
     assert_eq!(get_body, content, "GET content should match");
 }
