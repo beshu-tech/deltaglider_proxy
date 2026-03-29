@@ -49,9 +49,6 @@ pub struct AppState {
     pub engine: ArcSwap<DynEngine>,
     pub multipart: Arc<MultipartStore>,
     pub metrics: Arc<Metrics>,
-    /// Emit debug headers (x-amz-storage-type, x-deltaglider-stored-size).
-    /// Controlled by `DGP_DEBUG_HEADERS=true` env var. Off by default.
-    pub debug_headers: bool,
 }
 
 /// Query parameters for object-level operations (multipart upload)
@@ -90,7 +87,7 @@ pub struct ObjectQuery {
 
 /// Whether to emit debug headers (x-amz-storage-type, x-deltaglider-stored-size).
 /// Checked once at startup from the `DGP_DEBUG_HEADERS` env var.
-fn debug_headers_enabled() -> bool {
+pub fn debug_headers_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("DGP_DEBUG_HEADERS")

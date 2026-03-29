@@ -509,7 +509,7 @@ pub async fn change_password(
 
     // Persist to state file
     let state_file = std::path::Path::new(".deltaglider_bootstrap_hash");
-    if let Err(e) = std::fs::write(state_file, &new_hash) {
+    if let Err(e) = crate::config::write_bootstrap_hash_file(state_file, &new_hash) {
         tracing::warn!("Failed to persist new admin hash: {}", e);
     }
 

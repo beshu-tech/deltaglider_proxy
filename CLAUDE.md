@@ -29,7 +29,7 @@ cargo test --lib                          # unit tests only, no integration
 docker build -t deltaglider-proxy .
 ```
 
-CI runs: `fmt` → `clippy -D warnings` → `test` (with MinIO) → RustSec audit. All must pass.
+CI runs: `fmt` → `clippy -D warnings` → `test` (with MinIO) → RustSec audit → Cargo deny → Frontend lint → claude-review. All must pass.
 
 ## Architecture
 
@@ -41,14 +41,24 @@ HTTP request
       multipart.rs         Multipart upload lifecycle
       status.rs            /health, /stats, /metrics
   → api/auth.rs         SigV4 authentication middleware (bootstrap or per-user IAM)
-  → deltaglider/engine.rs   Orchestration: route, compress, cache, reconstruct
+  → api/extractors.rs   ValidatedBucket/ValidatedPath extractors (S3 name rules, path traversal protection)
+  → deltaglider/engine/   Orchestration split into submodules:
+      mod.rs               Core engine: route, compress, cache, metadata resolution
+      store.rs             PUT pipeline: delta encoding, migration, reference management
+      retrieve.rs          GET pipeline: delta reconstruction, streaming, range requests
   → storage/traits.rs       StorageBackend trait (async_trait, object-safe)
   → storage/filesystem.rs   Local filesystem impl (xattr metadata, list_objects_delegated)
   → storage/s3.rs           AWS S3/MinIO impl (S3 user metadata headers, S3Op enum)
   → demo.rs                 Embedded UI + admin API router, mounted under /_/
-  → session.rs              In-memory session store (OsRng tokens, 24h TTL)
-  → iam.rs                  IAM types, ABAC permissions, auth middleware
+  → session.rs              In-memory session store (OsRng tokens, 4h default TTL)
+  → iam/                    IAM module:
+      mod.rs                 IamState enum, auth mode detection
+      types.rs               IamUser, AuthenticatedUser, Permission types
+      permissions.rs         ABAC evaluation, is_admin, action matching
+      middleware.rs          Per-request auth middleware
+      keygen.rs              Secure key generation
   → config_db.rs            Encrypted SQLCipher database for IAM users
+  → config_db_sync.rs       Multi-instance IAM sync via S3 (DGP_CONFIG_SYNC_BUCKET)
 ```
 
 **Key data flow:**
@@ -61,9 +71,8 @@ HTTP request
 - `SharedConfig` = `Arc<RwLock<Config>>` — hot-reloadable via admin API
 - `RetrieveResponse` — enum: `Streamed` (zero-copy passthrough) vs `Buffered` (delta reconstruction, includes `cache_hit: Option<bool>`)
 - `FileMetadata` (in `types.rs`) — per-object metadata with DG-specific tags; `fallback()` constructor for unmanaged objects
-- `StoreContext` (in `engine.rs`) — parameter object for the store pipeline (bucket, key, data, hashes, metadata)
 - `Engine::validated_key()` — shared parse+validate+deltaspace_id helper used by all public engine methods
-- `IamState` (in `iam.rs`) — enum: `Disabled`, `Legacy(AuthConfig)`, or `Iam(IamIndex)` for multi-user auth
+- `IamState` (in `iam/mod.rs`) — enum: `Disabled`, `Legacy(AuthConfig)`, or `Iam(IamIndex)` for multi-user auth
 - `ConfigDb` (in `config_db.rs`) — encrypted SQLCipher database for IAM users, stored as `deltaglider_config.db`
 - `MetadataCache` (in `metadata_cache.rs`) — 50MB moka-based in-memory cache for `FileMetadata`. Populated on PUT, HEAD, and LIST+metadata=true. Consulted on HEAD, GET, and LIST (even without metadata=true, for file_size correction). Invalidated on DELETE (exact key) and prefix delete (all matching keys). 10-minute TTL. Configurable size via `DGP_METADATA_CACHE_MB` (default: 50).
 - `RateLimiter` (in `rate_limiter.rs`) — per-IP token bucket rate limiter for auth endpoints. 5 attempts per 15-minute window, 30-minute lockout after exhaustion. Expired entries cleaned up periodically.
@@ -90,7 +99,7 @@ Auto-generated on first run (printed to stderr). Reset via `--set-bootstrap-pass
 
 IAM users have ABAC permissions: `{ actions: ["read", "write", "delete", "list", "admin"], resources: ["bucket/*"] }`. Admin = wildcard actions AND wildcard resources.
 
-Key files: `src/iam.rs` (types, permissions, middleware), `src/config_db.rs` (SQLCipher CRUD), `src/api/admin.rs` (user management API + whoami/login-as).
+Key files: `src/iam/` (types, permissions, middleware, keygen), `src/config_db.rs` (SQLCipher CRUD), `src/api/admin/` (auth, users CRUD, config, groups, backup, scanner).
 
 ## Frontend (demo/s3-browser/ui)
 

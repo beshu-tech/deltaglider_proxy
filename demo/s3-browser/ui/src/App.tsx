@@ -109,8 +109,7 @@ export default function App() {
   // Check identity after S3 connection is established
   useEffect(() => {
     if (!needsConnect) {
-      const creds = getCredentials();
-      whoami(creds.accessKeyId, creds.secretAccessKey).then(setIdentity);
+      whoami().then(setIdentity);
     } else {
       setIdentity(null);
     }

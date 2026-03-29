@@ -31,13 +31,19 @@ impl MetadataCache {
     pub fn new(max_bytes: u64) -> Self {
         let cache = Cache::builder()
             .max_capacity(max_bytes)
-            .weigher(|key: &String, _value: &FileMetadata| -> u32 {
-                // Approximate weight: key length + fixed struct overhead.
-                // FileMetadata contains several Strings and a HashMap, so the
-                // actual heap size varies. We use key.len() + 350 as a rough
-                // estimate to avoid both over- and under-counting.
+            .weigher(|key: &String, value: &FileMetadata| -> u32 {
+                // Approximate weight: key length + fixed struct overhead + user metadata.
+                // FileMetadata contains several Strings (~350 bytes baseline) and a
+                // HashMap<String, String> for user_metadata (S3 allows up to 2KB).
+                // Account for actual user_metadata size to prevent memory over-commit
+                // when entries carry large custom metadata.
                 let key_bytes = key.len() as u32;
-                key_bytes.saturating_add(350)
+                let meta_bytes: u32 = value
+                    .user_metadata
+                    .iter()
+                    .map(|(k, v)| (k.len() + v.len() + 80) as u32) // 80 bytes HashMap entry overhead
+                    .sum();
+                key_bytes.saturating_add(350).saturating_add(meta_bytes)
             })
             .time_to_live(Duration::from_secs(600)) // 10 min TTL
             .build();

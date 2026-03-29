@@ -43,11 +43,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let (obj_key, deltaspace_id) = Self::validated_key(bucket, key)?;
 
         // Check metadata cache first (avoids resolve_metadata_with_migration I/O)
-        let metadata = if let Some(cached) = self.metadata_cache.get(bucket, key) {
-            Some(cached)
+        let (metadata, from_cache) = if let Some(cached) = self.metadata_cache.get(bucket, key) {
+            (Some(cached), true)
         } else {
-            self.resolve_metadata_with_migration(bucket, &deltaspace_id, &obj_key)
-                .await?
+            let resolved = self
+                .resolve_metadata_with_migration(bucket, &deltaspace_id, &obj_key)
+                .await?;
+            (resolved, false)
         };
 
         let metadata = match metadata {
@@ -75,12 +77,53 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             metadata.storage_info.label()
         );
 
+        match self
+            .retrieve_with_metadata(bucket, key, &deltaspace_id, &obj_key, metadata.clone())
+            .await
+        {
+            Ok(response) => Ok(response),
+            Err(EngineError::NotFound(_)) if from_cache => {
+                // Stale cache entry — the object's storage type may have changed
+                // (e.g., passthrough → delta) during a concurrent PUT. Invalidate
+                // the cache and retry with fresh metadata from storage.
+                warn!(
+                    "Stale metadata cache for {}/{}, retrying with fresh metadata",
+                    bucket, key
+                );
+                self.metadata_cache.invalidate(bucket, key);
+                let fresh = self
+                    .resolve_metadata_with_migration(bucket, &deltaspace_id, &obj_key)
+                    .await?;
+                match fresh {
+                    Some(m) => {
+                        self.metadata_cache.insert(bucket, key, m.clone());
+                        self.retrieve_with_metadata(bucket, key, &deltaspace_id, &obj_key, m)
+                            .await
+                    }
+                    None => {
+                        self.try_unmanaged_passthrough(bucket, &deltaspace_id, &obj_key)
+                            .await
+                    }
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Inner retrieve that uses pre-resolved metadata.
+    async fn retrieve_with_metadata(
+        &self,
+        bucket: &str,
+        _key: &str,
+        deltaspace_id: &str,
+        obj_key: &super::ObjectKey,
+        metadata: FileMetadata,
+    ) -> Result<RetrieveResponse, EngineError> {
         match &metadata.storage_info {
             StorageInfo::Passthrough => {
-                // Stream directly from backend — no buffering needed
                 let stream = self
                     .storage
-                    .get_passthrough_stream(bucket, &deltaspace_id, &obj_key.filename)
+                    .get_passthrough_stream(bucket, deltaspace_id, &obj_key.filename)
                     .await?;
                 debug!("Streaming passthrough file for {}", obj_key.full_key());
                 Ok(RetrieveResponse::Streamed {
@@ -91,7 +134,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             }
             StorageInfo::Reference { .. } | StorageInfo::Delta { .. } => {
                 let (data, cache_hit) = self
-                    .retrieve_buffered(bucket, &deltaspace_id, &obj_key, &metadata)
+                    .retrieve_buffered(bucket, deltaspace_id, obj_key, &metadata)
                     .await?;
                 debug!(
                     "Retrieved (buffered) {} bytes for {}",

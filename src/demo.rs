@@ -128,12 +128,25 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         .merge(health_route)
         .merge(metrics_routes)
         .merge(static_routes)
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any) // Dev server may be on different port
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
+        .layer({
+            // SECURITY: In production (single-port architecture), CORS is not needed
+            // because the UI is served from the same origin. allow_origin(Any) would
+            // enable CSRF attacks against session-cookie-authenticated admin endpoints.
+            // Only enable permissive CORS when DGP_CORS_PERMISSIVE=true (dev mode).
+            let permissive = std::env::var("DGP_CORS_PERMISSIVE")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false);
+            if permissive {
+                CorsLayer::new()
+                    .allow_origin(Any)
+                    .allow_methods(Any)
+                    .allow_headers(Any)
+            } else {
+                // Same-origin requests don't need CORS headers; cross-origin
+                // requests are blocked by the browser's same-origin policy.
+                CorsLayer::new()
+            }
+        })
 }
 
 async fn index() -> impl IntoResponse {

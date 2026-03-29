@@ -207,24 +207,34 @@ fn verify_signature(
     uri: &axum::http::Uri,
 ) -> Result<(), Response> {
     // Validate clock skew — configurable via DGP_CLOCK_SKEW_SECONDS (default 300s = 5 min)
+    // SigV4 requires a date header; reject requests without one to prevent replay attacks
+    // with indefinitely-valid signatures.
     let max_skew_secs: u64 = std::env::var("DGP_CLOCK_SKEW_SECONDS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(300);
-    if !params.amz_date.is_empty() {
-        if let Ok(request_time) =
-            chrono::NaiveDateTime::parse_from_str(&params.amz_date, "%Y%m%dT%H%M%SZ")
-        {
-            let now = chrono::Utc::now().naive_utc();
-            let skew = (now - request_time).num_seconds().unsigned_abs();
-            if skew > max_skew_secs {
-                warn!(
-                    "SigV4: request time skew {}s exceeds {}-second limit (request: {}, server: {})",
-                    skew, max_skew_secs, params.amz_date, now.format("%Y%m%dT%H%M%SZ")
-                );
-                return Err(S3Error::RequestTimeTooSkewed.into_response());
-            }
+    if params.amz_date.is_empty() {
+        warn!("SigV4: request missing x-amz-date/date header");
+        return Err(S3Error::AccessDenied.into_response());
+    }
+    if let Ok(request_time) =
+        chrono::NaiveDateTime::parse_from_str(&params.amz_date, "%Y%m%dT%H%M%SZ")
+    {
+        let now = chrono::Utc::now().naive_utc();
+        let skew = (now - request_time).num_seconds().unsigned_abs();
+        if skew > max_skew_secs {
+            warn!(
+                "SigV4: request time skew {}s exceeds {}-second limit (request: {}, server: {})",
+                skew,
+                max_skew_secs,
+                params.amz_date,
+                now.format("%Y%m%dT%H%M%SZ")
+            );
+            return Err(S3Error::RequestTimeTooSkewed.into_response());
         }
+    } else {
+        warn!("SigV4: unparseable date: {}", params.amz_date);
+        return Err(S3Error::AccessDenied.into_response());
     }
 
     // Build sorted signed headers
