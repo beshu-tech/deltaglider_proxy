@@ -32,10 +32,13 @@ pub struct SessionResponse {
     valid: bool,
 }
 
+/// Query parameters for the whoami endpoint.
+/// Fields are accepted but ignored — kept for backward compatibility with
+/// older frontends that may still send `access_key_id`.
 #[derive(Deserialize)]
+#[allow(dead_code)]
 pub struct WhoamiQuery {
     access_key_id: Option<String>,
-    secret_access_key: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -57,19 +60,33 @@ pub struct LoginAsRequest {
     secret_access_key: String,
 }
 
+/// Whether session cookies should include the `Secure` flag (HTTPS-only).
+/// Controlled by `DGP_SECURE_COOKIES`. Defaults to `true` — set to `false`
+/// only for local development over plain HTTP.
+fn secure_cookies() -> bool {
+    std::env::var("DGP_SECURE_COOKIES")
+        .map(|v| v != "false" && v != "0")
+        .unwrap_or(true)
+}
+
 /// Format a session cookie for setting a login token.
 /// Max-Age matches the session store's TTL.
 pub(super) fn session_cookie(token: &str, ttl: std::time::Duration) -> String {
     let max_age = ttl.as_secs();
+    let secure = if secure_cookies() { "; Secure" } else { "" };
     format!(
-        "dgp_session={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
-        token, max_age
+        "dgp_session={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
+        token, max_age, secure
     )
 }
 
 /// Format a session cookie that clears the login token.
-pub(super) fn session_cookie_clear() -> &'static str {
-    "dgp_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
+pub(super) fn session_cookie_clear() -> String {
+    let secure = if secure_cookies() { "; Secure" } else { "" };
+    format!(
+        "dgp_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
+        secure
+    )
 }
 
 /// Extract the `dgp_session` token from the Cookie header.
@@ -223,50 +240,24 @@ pub async fn check_session(
     Json(SessionResponse { valid })
 }
 
-/// GET /api/whoami — returns current auth mode and user info for a given access key.
-/// Public endpoint — no session required. Only reveals mode and whether the
-/// access key exists (not names or admin status, to prevent enumeration attacks).
-/// The is_admin field requires the secret_access_key as proof of identity.
+/// GET /api/whoami — returns current auth mode.
+/// Public endpoint — no session required. Only reveals the auth mode
+/// ("open", "bootstrap", "iam") — never user details, to prevent enumeration.
+/// User identity is established via login / login-as (POST), not this endpoint.
 pub async fn whoami(
     State(state): State<Arc<AdminState>>,
-    axum::extract::Query(params): axum::extract::Query<WhoamiQuery>,
+    axum::extract::Query(_params): axum::extract::Query<WhoamiQuery>,
 ) -> Json<WhoamiResponse> {
     let iam_state = state.iam_state.load();
-    match &**iam_state {
-        IamState::Disabled => Json(WhoamiResponse {
-            mode: "open".into(),
-            user: None,
-        }),
-        IamState::Legacy(_) => Json(WhoamiResponse {
-            mode: "bootstrap".into(),
-            user: None,
-        }),
-        IamState::Iam(index) => {
-            // Only reveal user info if both access_key_id AND secret_access_key match.
-            // This prevents enumeration attacks (attacker can't probe access keys
-            // without knowing the secret).
-            let user = params
-                .access_key_id
-                .as_deref()
-                .and_then(|ak| index.get(ak))
-                .filter(|u| {
-                    params
-                        .secret_access_key
-                        .as_deref()
-                        .map(|sk| bool::from(sk.as_bytes().ct_eq(u.secret_access_key.as_bytes())))
-                        .unwrap_or(false)
-                })
-                .map(|u| WhoamiUser {
-                    name: u.name.clone(),
-                    access_key_id: u.access_key_id.clone(),
-                    is_admin: u.is_admin(),
-                });
-            Json(WhoamiResponse {
-                mode: "iam".into(),
-                user,
-            })
-        }
-    }
+    let mode = match &**iam_state {
+        IamState::Disabled => "open",
+        IamState::Legacy(_) => "bootstrap",
+        IamState::Iam(_) => "iam",
+    };
+    Json(WhoamiResponse {
+        mode: mode.into(),
+        user: None,
+    })
 }
 
 /// POST /api/admin/login-as — create admin session for an IAM user with admin permissions.

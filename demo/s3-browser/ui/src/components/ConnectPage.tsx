@@ -42,7 +42,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
         if (restored) {
           // Login auto-connected us — discover buckets
           try {
-            const info = await whoami(accessKey || undefined, secretKey || undefined);
+            const info = await whoami();
             setAuthMode(info.mode);
           } catch { /* non-critical */ }
           onConnect();
@@ -74,7 +74,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
 
       // Detect auth mode
       try {
-        const info = await whoami(accessKey, secretKey);
+        const info = await whoami();
         setAuthMode(info.mode);
       } catch { /* non-critical */ }
 
