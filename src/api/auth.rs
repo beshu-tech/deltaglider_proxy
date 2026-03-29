@@ -525,19 +525,49 @@ pub async fn sigv4_auth_middleware(
         }
     }
 
-    // Replay attack detection: reject duplicate signatures within 5 seconds
+    // Replay attack detection: reject duplicate signatures within the clock-skew window.
+    //
+    // Previously this used get() + insert() on two separate DashMap operations, which
+    // is not atomic: two concurrent requests with the same signature could both pass
+    // the get() check before either inserted. Fixed by using the entry() API which
+    // acquires the per-key shard lock for the entire check-and-insert sequence.
+    //
+    // The window matches DGP_CLOCK_SKEW_SECONDS (default 300 s) so that any request
+    // that is still within the valid timestamp window is also covered by replay
+    // detection. A 5-second window only blocks network-level retries, not deliberate
+    // replays made seconds later.
     if let Some(ref cache) = replay_cache {
         let sig = &params.signature;
-        if let Some(first_seen) = cache.get(sig) {
-            if first_seen.elapsed() < std::time::Duration::from_secs(5) {
-                warn!("SigV4: replay attack detected (duplicate signature within 5s)");
-                record_auth_failure("replay");
-                return Err(
-                    S3Error::InvalidArgument("Request replay detected".to_string()).into_response(),
-                );
-            }
+        let replay_window = std::time::Duration::from_secs(
+            std::env::var("DGP_CLOCK_SKEW_SECONDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300),
+        );
+
+        let mut rejected = false;
+        cache
+            .entry(sig.clone())
+            .and_modify(|first_seen: &mut Instant| {
+                if first_seen.elapsed() < replay_window {
+                    rejected = true;
+                } else {
+                    // Window expired — reset so the slot can be reused.
+                    *first_seen = Instant::now();
+                }
+            })
+            .or_insert_with(Instant::now);
+
+        if rejected {
+            warn!(
+                "SigV4: replay attack detected (duplicate signature within {:?})",
+                replay_window
+            );
+            record_auth_failure("replay");
+            return Err(
+                S3Error::InvalidArgument("Request replay detected".to_string()).into_response(),
+            );
         }
-        cache.insert(sig.clone(), Instant::now());
     }
 
     // Insert authenticated user into request extensions (for authorization middleware)
