@@ -58,6 +58,7 @@ async fn http_head(
 }
 
 /// PUT an object via HTTP client, return status.
+#[allow(dead_code)]
 async fn http_put(
     client: &reqwest::Client,
     endpoint: &str,
