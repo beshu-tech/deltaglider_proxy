@@ -57,25 +57,6 @@ async fn http_head(
     (status, cl)
 }
 
-/// PUT an object via HTTP client, return status.
-#[allow(dead_code)]
-async fn http_put(
-    client: &reqwest::Client,
-    endpoint: &str,
-    bucket: &str,
-    key: &str,
-    data: Vec<u8>,
-) -> u16 {
-    let url = format!("{}/{}/{}", endpoint, bucket, key);
-    let resp = client
-        .put(&url)
-        .body(data)
-        .send()
-        .await
-        .expect("PUT request failed");
-    resp.status().as_u16()
-}
-
 /// LIST a prefix, return list of keys.
 async fn http_list_keys(
     client: &reqwest::Client,
