@@ -298,6 +298,18 @@ pub fn build_s3_router(
         .layer(axum::Extension(metrics.clone()))
         // Increase body size limit to match max_object_size config (default 2MB is too small)
         .layer(DefaultBodyLimit::max(config.max_object_size as usize))
+        // Per-request timeout: prevents slow clients from holding concurrency slots forever.
+        // Default: 300s. Override via DGP_REQUEST_TIMEOUT_SECS.
+        // Returns HTTP 504 Gateway Timeout (appropriate for a proxy).
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            axum::http::StatusCode::GATEWAY_TIMEOUT,
+            std::time::Duration::from_secs(
+                std::env::var("DGP_REQUEST_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(300u64),
+            ),
+        ))
         // Limit total concurrent in-flight requests to prevent resource exhaustion.
         // Default: 1024. Override via DGP_MAX_CONCURRENT_REQUESTS.
         .layer(tower::limit::ConcurrencyLimitLayer::new(
