@@ -1,5 +1,99 @@
 # Changelog
 
+## v0.5.4
+
+### Security & Hardening
+
+- **Per-request timeout**: Added `tower_http::timeout::TimeoutLayer` returning HTTP 504 Gateway Timeout after 300s (configurable via `DGP_REQUEST_TIMEOUT_SECS`). Prevents slow clients from holding concurrency slots forever.
+- **Replay cache cap**: Replay cache capped at 500K entries. If exceeded (flood attack), cache is cleared with a `SECURITY |` warning.
+- **Recursive delete IAM enforcement**: Server-side recursive prefix delete (`DELETE /bucket/prefix/`) now checks per-object IAM permissions. Previously bypassed individual Deny rules.
+- **Bootstrap hash format validation**: Rejects malformed bcrypt hashes at startup instead of failing silently on first auth attempt.
+
+### Features
+
+- **Server-side recursive delete**: `DELETE /bucket/prefix/` (trailing slash) deletes all objects under the prefix. Per-object IAM checks enforced. Filesystem backend uses native `remove_dir_all`.
+- **S3 batch delete**: Batch delete (`POST /?delete`) uses `DeleteObjects` API instead of per-file DELETE for ~10x fewer API calls.
+- **Base64 bootstrap password hash**: `DGP_BOOTSTRAP_PASSWORD_HASH` accepts base64-encoded bcrypt hashes to avoid `$` escaping issues in Docker/env vars. Auto-detected format.
+- **Config DB resilience**: If the encrypted config DB can't be opened (wrong password, corruption), creates a fresh database instead of crashing.
+- **`config_sync_bucket` in TOML**: Config DB S3 sync bucket now configurable via TOML (was env-only).
+
+### UI
+
+- **Favicon**: Teal chain-link icon on dark background.
+- **Reduced polling**: Browser file listing polls every 30s instead of every second.
+
+### Defaults
+
+- **`max_delta_ratio`**: Default raised from 0.5 to 0.75 (more files stored as deltas, better space savings for typical workloads).
+
+### Code Quality
+
+- Removed dead `http_put` test helper from storage resilience tests.
+
+## v0.5.3
+
+### Performance
+
+- **Parallel delta reconstruction**: Reference and delta fetched concurrently via `tokio::join!` instead of sequentially. Saves ~100ms per delta GET on S3 backends.
+- **Parallel metadata HEAD calls**: `resolve_object_metadata` fetches delta and passthrough metadata concurrently.
+- **Legacy migration off GET path**: `migrate_legacy_reference_object_if_needed` no longer runs during GET (was adding 60+ seconds of xdelta3 encoding). Available via batch migration endpoint instead.
+
+### Correctness
+
+- **PATHOLOGICAL warnings**: Delta and reference files missing DG metadata now log prominent warnings instead of silently falling back.
+- **`dg-ref-key` → `dg-ref-path` rename**: Reference paths stored as relative paths for portable deltaspaces. Legacy `dg-ref-key` read with automatic fallback.
+
+### Testing
+
+- **Metadata validation tests**: 7 new tests for missing, corrupt, partial, and wrong metadata scenarios.
+
+### UI
+
+- **Connect page simplification**: Shows only relevant fields per auth mode (bootstrap password OR S3 credentials, not both). Removed endpoint URL field (derived from window location).
+
+## v0.5.2
+
+### Correctness (Critical)
+
+- **Fix GET on rclone-copied delta files**: `retrieve_stream` used `obj_key.filename` instead of `metadata.original_name` for storage lookups, causing 404 on files whose S3 key had a `.delta` suffix. This bug was not caught by 222 tests because they all follow the clean PUT→GET path.
+
+### Testing
+
+- **Storage resilience tests**: 6 new adversarial tests that would have caught the above bug:
+  - Triangle invariant (LIST→HEAD→GET must all succeed for every key)
+  - HEAD/GET content-length consistency
+  - SHA256 roundtrip verification across all storage strategies
+  - Unmanaged file triangle invariant (directly placed files)
+  - External delete → 404 (not stale cached data)
+  - LIST never exposes `.delta` suffix or `reference.bin`
+
+### Security
+
+- **Session cookie hardening**: Secure, HttpOnly, SameSite=Strict attributes.
+- **Remove secrets from whoami**: `/whoami` endpoint no longer exposes secret access keys.
+- **Cleanup `.bak` files**: Removed leftover backup files from refactoring.
+
+## v0.5.1
+
+### Security Fixes (Post-Release Audit)
+
+- **Deny condition bypass**: Fixed condition evaluation that could skip Deny rules under certain group membership combinations.
+- **Group `member_ids` persistence**: Group member lists were not persisted correctly to SQLCipher DB.
+- **`evaluate_iam` alternate path**: Fixed edge case where IAM evaluation took a non-standard code path.
+- **Session storage**: Server-side session storage for S3 credentials (no longer stored client-side).
+- **`env_clear()` on subprocess**: xdelta3 subprocess environment cleared to prevent credential leaks.
+- **`DGP_TRUST_PROXY_HEADERS`**: Default changed to `true` for reverse proxy deployments.
+
+### Testing
+
+- **Auth integration tests**: SigV4 signature verification, presigned URLs, clock skew rejection, IAM lifecycle.
+- **IAM persona tests**: 23 tests for groups, ListBuckets filtering, prefix scoping, conditions.
+
+### Infrastructure
+
+- **Docker retry**: `apt-get` retries on network blips (`Acquire::Retries=3`).
+- **Startup refactor**: Extracted `startup.rs` from `main.rs`, split `engine.rs` and `config_db.rs` into sub-modules.
+
 ## v0.5.0
 
 ### IAM Policy Conditions (iam-rs)
