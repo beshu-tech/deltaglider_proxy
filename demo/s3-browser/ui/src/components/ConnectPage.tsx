@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Button, Input, Typography, Space, Alert } from 'antd';
 import { ApiOutlined } from '@ant-design/icons';
 import { testConnection, setEndpoint, setCredentials, setBucket, initFromSession } from '../s3client';
@@ -15,7 +15,6 @@ interface Props {
 
 export default function ConnectPage({ onConnect, showError }: Props) {
   const { BORDER, TEXT_MUTED, TEXT_FAINT, TEXT_PRIMARY, ACCENT_BLUE } = useColors();
-  const [endpoint, setEndpointVal] = useState(detectDefaultEndpoint());
   const [accessKey, setAccessKey] = useState('');
   const [secretKey, setSecretKey] = useState('');
   const [adminPassword, setAdminPassword] = useState('');
@@ -23,12 +22,16 @@ export default function ConnectPage({ onConnect, showError }: Props) {
   const [error, setError] = useState('');
   const [authMode, setAuthMode] = useState<'bootstrap' | 'iam' | 'open' | null>(null);
 
+  // Detect auth mode on mount (before user interacts)
+  useEffect(() => {
+    whoami().then(info => setAuthMode(info.mode as 'bootstrap' | 'iam' | 'open')).catch(() => {});
+  }, []);
+
   const handleConnect = async () => {
     setLoading(true);
     setError('');
     try {
-      // Step 1: Admin login first (if password provided) — this auto-populates
-      // S3 credentials in the server-side session, so we may not need manual S3 creds.
+      // Step 1: Admin login first (if password provided)
       if (adminPassword) {
         const adminResult = await adminLogin(adminPassword);
         if (!adminResult.ok) {
@@ -37,45 +40,41 @@ export default function ConnectPage({ onConnect, showError }: Props) {
           return;
         }
 
-        // Try to restore S3 creds from the session (auto-populated by login)
+        // Try to restore S3 creds from the session
         const restored = await initFromSession();
         if (restored) {
-          // Login auto-connected us — discover buckets
           try {
             const info = await whoami();
-            setAuthMode(info.mode);
+            setAuthMode(info.mode as 'bootstrap' | 'iam' | 'open');
           } catch { /* non-critical */ }
           onConnect();
           return;
         }
-        // If no creds came back (open-access mode), fall through to manual S3 entry
       }
 
-      // Step 2: Manual S3 connection (if no admin login, or admin had no S3 creds)
-      const cleanEndpoint = endpoint.trim().replace(/\/+$/, '');
+      // Step 2: Manual S3 connection
+      const cleanEndpoint = detectDefaultEndpoint().replace(/\/+$/, '');
       if (!accessKey.trim() || !secretKey.trim()) {
-        setError('S3 Access Key and Secret Key are required');
+        setError('Access Key and Secret Key are required');
         setLoading(false);
         return;
       }
       const result = await testConnection(cleanEndpoint, accessKey, secretKey);
       if (!result.ok) {
-        setError(`S3 connection failed: ${result.error || 'Unknown error'}`);
+        setError(`Connection failed: ${result.error || 'Unknown error'}`);
         setLoading(false);
         return;
       }
 
-      // S3 succeeded — persist credentials to server session
       setEndpoint(cleanEndpoint);
       setCredentials(accessKey, secretKey);
       if (result.buckets && result.buckets.length > 0) {
         setBucket(result.buckets[0]);
       }
 
-      // Detect auth mode
       try {
         const info = await whoami();
-        setAuthMode(info.mode);
+        setAuthMode(info.mode as 'bootstrap' | 'iam' | 'open');
       } catch { /* non-critical */ }
 
       onConnect();
@@ -86,8 +85,17 @@ export default function ConnectPage({ onConnect, showError }: Props) {
     }
   };
 
-  // Admin password alone is enough (login auto-connects). S3 creds are needed only for manual connect.
-  const canSubmit = adminPassword.trim() || (endpoint.trim() && accessKey.trim() && secretKey.trim());
+  const showBootstrap = authMode === 'bootstrap' || authMode === null;
+  const canSubmit = (showBootstrap && adminPassword.trim()) || (accessKey.trim() && secretKey.trim());
+
+  const inputStyle = {
+    background: 'var(--input-bg)',
+    borderColor: BORDER,
+    borderRadius: 10,
+    height: 44,
+    fontFamily: "var(--font-mono)" as const,
+    fontSize: 13,
+  };
 
   return (
     <div style={{
@@ -106,7 +114,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
           maxWidth: 440,
         }}
       >
-        <Space orientation="vertical" size="large" style={{ width: '100%' }}>
+        <Space direction="vertical" size="large" style={{ width: '100%' }}>
           <div style={{ textAlign: 'center' }}>
             <div style={{
               width: 56,
@@ -127,33 +135,15 @@ export default function ConnectPage({ onConnect, showError }: Props) {
             <div style={{ fontSize: 12, fontWeight: 600, letterSpacing: 2.5, color: ACCENT_BLUE, textTransform: 'uppercase', marginTop: 3, fontFamily: "var(--font-mono)" }}>
               Proxy
             </div>
-            <Text style={{ color: TEXT_MUTED, fontSize: 13, display: 'block', marginTop: 12 }}>Connect to your S3-compatible endpoint.</Text>
+            <Text style={{ color: TEXT_MUTED, fontSize: 13, display: 'block', marginTop: 12 }}>
+              {showBootstrap ? 'Sign in with your credentials.' : 'Sign in with your S3 credentials.'}
+            </Text>
           </div>
 
           {showError && !error && (
             <Alert type="warning" message="Stored credentials are invalid or the endpoint is unreachable." showIcon />
           )}
           {error && <Alert type="error" message={error} showIcon />}
-
-          <div>
-            <label style={{ fontSize: 12, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)", marginBottom: 4, display: 'block' }}>
-              Endpoint URL
-            </label>
-            <Input
-              value={endpoint}
-              onChange={(e) => setEndpointVal(e.target.value)}
-              placeholder="http://localhost:9000"
-              size="large"
-              style={{
-                background: 'var(--input-bg)',
-                borderColor: BORDER,
-                borderRadius: 10,
-                height: 44,
-                fontFamily: "var(--font-mono)",
-                fontSize: 13,
-              }}
-            />
-          </div>
 
           <div>
             <label style={{ fontSize: 12, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)", marginBottom: 4, display: 'block' }}>
@@ -165,14 +155,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
               placeholder="Access Key ID"
               size="large"
               autoFocus
-              style={{
-                background: 'var(--input-bg)',
-                borderColor: BORDER,
-                borderRadius: 10,
-                height: 44,
-                fontFamily: "var(--font-mono)",
-                fontSize: 13,
-              }}
+              style={inputStyle}
             />
           </div>
 
@@ -185,18 +168,12 @@ export default function ConnectPage({ onConnect, showError }: Props) {
               onChange={(e) => setSecretKey(e.target.value)}
               placeholder="Secret Access Key"
               size="large"
-              style={{
-                background: 'var(--input-bg)',
-                borderColor: BORDER,
-                borderRadius: 10,
-                height: 44,
-                fontFamily: "var(--font-mono)",
-                fontSize: 13,
-              }}
+              onPressEnter={!showBootstrap ? handleConnect : undefined}
+              style={inputStyle}
             />
           </div>
 
-          {authMode !== 'iam' && (
+          {showBootstrap && (
             <div>
               <label style={{ fontSize: 12, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)", marginBottom: 4, display: 'block' }}>
                 Bootstrap Password
@@ -205,19 +182,12 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                 value={adminPassword}
                 onChange={(e) => setAdminPassword(e.target.value)}
                 onPressEnter={handleConnect}
-                placeholder="Bootstrap password (optional)"
+                placeholder="Bootstrap password"
                 size="large"
-                style={{
-                  background: 'var(--input-bg)',
-                  borderColor: BORDER,
-                  borderRadius: 10,
-                  height: 44,
-                  fontFamily: "var(--font-mono)",
-                  fontSize: 13,
-                }}
+                style={inputStyle}
               />
               <Text style={{ color: TEXT_FAINT, fontSize: 11, marginTop: 4, display: 'block' }}>
-                Required for admin settings before IAM users are created
+                Required for admin access before IAM users are created
               </Text>
             </div>
           )}
@@ -229,6 +199,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
             loading={loading}
             disabled={!canSubmit}
             onClick={handleConnect}
+            onKeyDown={(e) => e.key === 'Enter' && canSubmit && handleConnect()}
             style={{
               height: 48,
               borderRadius: 10,
