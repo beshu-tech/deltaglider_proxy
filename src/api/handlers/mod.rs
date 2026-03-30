@@ -166,13 +166,13 @@ fn build_object_headers(metadata: &FileMetadata) -> HeaderMap {
             headers.insert(mk::H_SOURCE_NAME, header_value(source_name));
         }
         StorageInfo::Delta {
-            ref_key,
+            ref_path,
             ref_sha256,
             delta_size,
             delta_cmd,
         } => {
             headers.insert(mk::H_NOTE, header_value("delta"));
-            headers.insert(mk::H_REF_KEY, header_value(ref_key));
+            headers.insert(mk::H_REF_PATH, header_value(ref_path));
             headers.insert(mk::H_REF_SHA256, header_value(ref_sha256));
             headers.insert(mk::H_DELTA_SIZE, header_value(itoa_buf.format(*delta_size)));
             headers.insert(mk::H_DELTA_CMD, header_value(delta_cmd));

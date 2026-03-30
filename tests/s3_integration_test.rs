@@ -595,8 +595,9 @@ async fn test_head_returns_dg_metadata_headers() {
 
     // Verify delta-specific headers exist
     assert!(
-        headers.get("x-amz-meta-dg-ref-key").is_some(),
-        "dg-ref-key should be present for delta files"
+        headers.get("x-amz-meta-dg-ref-path").is_some()
+            || headers.get("x-amz-meta-dg-ref-key").is_some(),
+        "dg-ref-path (or legacy dg-ref-key) should be present for delta files"
     );
     assert!(
         headers.get("x-amz-meta-dg-delta-size").is_some(),
@@ -663,8 +664,9 @@ async fn test_metadata_for_all_storage_types() {
 
     // Passthrough files should NOT have delta-specific metadata
     assert!(
-        passthrough_headers.get("x-amz-meta-dg-ref-key").is_none(),
-        "Passthrough files should not have dg-ref-key"
+        passthrough_headers.get("x-amz-meta-dg-ref-path").is_none()
+            && passthrough_headers.get("x-amz-meta-dg-ref-key").is_none(),
+        "Passthrough files should not have dg-ref-path or dg-ref-key"
     );
     assert!(
         passthrough_headers

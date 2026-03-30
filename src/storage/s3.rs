@@ -267,13 +267,14 @@ impl S3Backend {
                 headers.insert(mk::SOURCE_NAME.to_string(), source_name.clone());
             }
             StorageInfo::Delta {
-                ref_key,
+                ref_path,
                 ref_sha256,
                 delta_size,
                 delta_cmd,
             } => {
                 headers.insert(mk::NOTE.to_string(), "delta".to_string());
-                headers.insert(mk::REF_KEY.to_string(), ref_key.clone());
+                // Write as dg-ref-path (new canonical name)
+                headers.insert(mk::REF_PATH.to_string(), ref_path.clone());
                 headers.insert(mk::REF_SHA256.to_string(), ref_sha256.clone());
                 headers.insert(mk::DELTA_SIZE.to_string(), delta_size.to_string());
                 headers.insert(mk::DELTA_CMD.to_string(), delta_cmd.clone());
@@ -338,9 +339,10 @@ impl S3Backend {
         };
 
         let note = get_value(&[mk::NOTE, "note"]);
-        let ref_key_opt = get_value(&[mk::REF_KEY, "ref-key"]);
+        // Read ref path: try new name (dg-ref-path) first, fall back to legacy (dg-ref-key, ref-key)
+        let ref_path_opt = get_value(&[mk::REF_PATH, mk::REF_KEY, "ref-path", "ref-key"]);
         let is_reference = note.as_deref() == Some("reference");
-        let is_delta = ref_key_opt.is_some()
+        let is_delta = ref_path_opt.is_some()
             || note
                 .as_ref()
                 .map(|n| n == "delta" || n.starts_with("zero-diff"))
@@ -351,8 +353,18 @@ impl S3Backend {
                 .unwrap_or_else(|| original_name.clone());
             StorageInfo::Reference { source_name }
         } else if is_delta {
-            let ref_key = ref_key_opt
-                .ok_or_else(|| StorageError::Other(format!("Missing {}", mk::REF_KEY)))?;
+            let raw_ref_path = ref_path_opt
+                .ok_or_else(|| StorageError::Other(format!("Missing {}", mk::REF_PATH)))?;
+            // Normalize: if absolute (legacy), extract just the filename (typically "reference.bin")
+            let ref_path = if raw_ref_path.contains('/') {
+                raw_ref_path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&raw_ref_path)
+                    .to_string()
+            } else {
+                raw_ref_path
+            };
             let ref_sha256 = get_value(&[mk::REF_SHA256, "ref-sha256"])
                 .ok_or_else(|| StorageError::Other(format!("Missing {}", mk::REF_SHA256)))?;
             let delta_size_str =
@@ -362,7 +374,7 @@ impl S3Backend {
             })?;
             let delta_cmd = get_value(&[mk::DELTA_CMD, "delta-cmd"]).unwrap_or_default();
             StorageInfo::Delta {
-                ref_key,
+                ref_path,
                 ref_sha256,
                 delta_size,
                 delta_cmd,
