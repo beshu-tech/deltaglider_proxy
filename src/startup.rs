@@ -352,10 +352,10 @@ pub async fn init_config_sync(
     config_db: &Option<Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::ConfigDb>>>,
     iam_state: &SharedIamState,
 ) -> Option<Arc<ConfigDbSync>> {
-    let sync_bucket = match std::env::var("DGP_CONFIG_SYNC_BUCKET") {
-        Ok(b) if !b.is_empty() => b,
+    let sync_bucket = match &config.config_sync_bucket {
+        Some(b) if !b.is_empty() => b.clone(),
         _ => {
-            info!("Config DB S3 sync: disabled (set DGP_CONFIG_SYNC_BUCKET to enable)");
+            info!("Config DB S3 sync: disabled (set config_sync_bucket in TOML or DGP_CONFIG_SYNC_BUCKET env var)");
             return None;
         }
     };
