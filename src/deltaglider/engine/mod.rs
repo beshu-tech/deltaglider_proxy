@@ -263,7 +263,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             let cpus = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4);
-            (cpus * 4).max(8)
+            (cpus * 4).max(16)
         });
         Self {
             storage,
