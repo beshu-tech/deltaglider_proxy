@@ -29,6 +29,9 @@ pub mod meta_keys {
     pub const CREATED_AT: &str = "dg-created-at";
     pub const NOTE: &str = "dg-note";
     pub const SOURCE_NAME: &str = "dg-source-name";
+    /// New canonical name — relative path to reference (e.g. "reference.bin")
+    pub const REF_PATH: &str = "dg-ref-path";
+    /// Legacy name — kept for backward compatibility on read
     pub const REF_KEY: &str = "dg-ref-key";
     pub const REF_SHA256: &str = "dg-ref-sha256";
     pub const DELTA_SIZE: &str = "dg-delta-size";
@@ -44,6 +47,7 @@ pub mod meta_keys {
     pub const H_FILE_SIZE: &str = concat!("x-amz-meta-", "dg-file-size");
     pub const H_NOTE: &str = concat!("x-amz-meta-", "dg-note");
     pub const H_SOURCE_NAME: &str = concat!("x-amz-meta-", "dg-source-name");
+    pub const H_REF_PATH: &str = concat!("x-amz-meta-", "dg-ref-path");
     pub const H_REF_KEY: &str = concat!("x-amz-meta-", "dg-ref-key");
     pub const H_REF_SHA256: &str = concat!("x-amz-meta-", "dg-ref-sha256");
     pub const H_DELTA_SIZE: &str = concat!("x-amz-meta-", "dg-delta-size");
@@ -217,8 +221,9 @@ pub enum StorageInfo {
     /// Delta-compressed file
     #[serde(rename = "delta")]
     Delta {
-        /// Path to reference file (e.g., "releases/reference.bin")
-        ref_key: String,
+        /// Relative path to reference file (e.g., "reference.bin")
+        #[serde(alias = "ref_key")]
+        ref_path: String,
         /// SHA256 of the reference file
         ref_sha256: String,
         /// Size of the delta file in bytes
@@ -246,7 +251,7 @@ impl StorageInfo {
     /// Used when building metadata from LIST results without a HEAD call.
     pub fn delta_stub(delta_size: u64) -> Self {
         StorageInfo::Delta {
-            ref_key: String::new(),
+            ref_path: String::new(),
             ref_sha256: String::new(),
             delta_size,
             delta_cmd: String::new(),
@@ -284,7 +289,7 @@ impl FileMetadata {
         sha256: String,
         md5: String,
         file_size: u64,
-        ref_key: String,
+        ref_path: String,
         ref_sha256: String,
         delta_size: u64,
         content_type: Option<String>,
@@ -303,7 +308,7 @@ impl FileMetadata {
             content_type,
             user_metadata: HashMap::new(),
             storage_info: StorageInfo::Delta {
-                ref_key,
+                ref_path,
                 ref_sha256,
                 delta_size,
                 delta_cmd,
@@ -414,7 +419,7 @@ impl FileMetadata {
                 );
             }
             StorageInfo::Delta {
-                ref_key,
+                ref_path,
                 ref_sha256,
                 delta_size,
                 delta_cmd,
@@ -423,9 +428,10 @@ impl FileMetadata {
                     format!("{}{}", mk::AMZ_META_PREFIX, mk::NOTE),
                     "delta".to_string(),
                 );
+                // Write as dg-ref-path (new canonical name)
                 map.insert(
-                    format!("{}{}", mk::AMZ_META_PREFIX, mk::REF_KEY),
-                    ref_key.clone(),
+                    format!("{}{}", mk::AMZ_META_PREFIX, mk::REF_PATH),
+                    ref_path.clone(),
                 );
                 map.insert(
                     format!("{}{}", mk::AMZ_META_PREFIX, mk::REF_SHA256),
@@ -582,7 +588,7 @@ mod tests {
         );
         let json = serde_json::to_string_pretty(&meta).unwrap();
         assert!(json.contains(DELTAGLIDER_TOOL));
-        assert!(json.contains("ref_key"));
+        assert!(json.contains("ref_path"));
         assert!(json.contains("delta_cmd"));
 
         // Deserialize back
