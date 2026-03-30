@@ -19,7 +19,7 @@ use std::time::Duration;
 use tokio::signal;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::{layer::SubscriberExt, reload, util::SubscriberInitExt};
 
@@ -338,8 +338,28 @@ pub fn init_config_db(
             Some(Arc::new(tokio::sync::Mutex::new(db)))
         }
         Err(e) => {
-            warn!("Could not open IAM config database: {} — IAM disabled", e);
-            None
+            warn!(
+                "Could not open IAM config database: {} — creating fresh database",
+                e
+            );
+            // Delete the corrupt/incompatible DB and create a fresh one
+            let _ = std::fs::remove_file(&db_file);
+            match deltaglider_proxy::config_db::ConfigDb::open_or_create(
+                &db_file,
+                admin_password_hash,
+            ) {
+                Ok(db) => {
+                    info!("Created fresh IAM config database: {}", db_file.display());
+                    Some(Arc::new(tokio::sync::Mutex::new(db)))
+                }
+                Err(e2) => {
+                    error!(
+                        "Failed to create fresh config database: {} — IAM disabled",
+                        e2
+                    );
+                    None
+                }
+            }
         }
     }
 }

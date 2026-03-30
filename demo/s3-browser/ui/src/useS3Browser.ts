@@ -101,11 +101,11 @@ export default function useS3Browser() {
 
   useEffect(load, [load, refreshTrigger]);
 
-  // Smart auto-refresh: 15s interval, skip when tab is hidden
+  // Smart auto-refresh: 60s interval, skip when tab is hidden
   useEffect(() => {
     const id = setInterval(() => {
       if (!document.hidden) refresh();
-    }, 15000);
+    }, 60000);
     return () => clearInterval(id);
   }, [refresh]);
 
