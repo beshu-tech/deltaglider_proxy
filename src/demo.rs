@@ -75,6 +75,8 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
                 .put(admin::set_s3_session_creds)
                 .delete(admin::clear_s3_session_creds),
         )
+        // Legacy migration
+        .route("/_/api/admin/migrate", post(admin::migrate_legacy))
         // Usage scanner
         .route("/_/api/admin/usage/scan", post(admin::scan_usage))
         .route("/_/api/admin/usage", get(admin::get_usage))

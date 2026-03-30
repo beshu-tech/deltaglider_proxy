@@ -36,7 +36,7 @@ pub use groups::{
     add_group_member, create_group, delete_group, list_groups, remove_group_member, update_group,
     AddGroupMemberRequest, CreateGroupRequest, UpdateGroupRequest,
 };
-pub use scanner::{get_usage, scan_usage, ScanUsageRequest, UsageQuery};
+pub use scanner::{get_usage, migrate_legacy, scan_usage, ScanUsageRequest, UsageQuery};
 pub use users::{
     create_user, delete_user, get_canned_policies, list_users, rotate_user_keys, update_user,
     CreateUserRequest, RotateKeysRequest, UpdateUserRequest,
