@@ -466,26 +466,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             return Ok(metadata);
         }
 
-        // Slow path: metadata not found. Acquire the prefix lock before attempting
-        // migration so we don't race with a concurrent store() that might write to
-        // the same deltaspace while migration is in progress.
-        let _migration_guard = self.acquire_prefix_lock(deltaspace_id).await;
-
-        // Re-check under the lock: a concurrent writer may have already migrated
-        // the legacy object (or written a new one) while we were waiting.
-        let metadata = self
-            .resolve_object_metadata(bucket, deltaspace_id, &obj_key.full_key())
-            .await?;
-        if metadata.is_none()
-            && self
-                .migrate_legacy_reference_object_if_needed(bucket, deltaspace_id, &obj_key.filename)
-                .await?
-        {
-            return Ok(self
-                .resolve_object_metadata(bucket, deltaspace_id, &obj_key.full_key())
-                .await?);
-        }
-        Ok(metadata)
+        // Legacy migration removed from GET hot path — it was blocking downloads
+        // for 60+ seconds on large reference files. Migration is now batch-only
+        // via the /_/api/admin/migrate endpoint.
+        //
+        // If the object still isn't found, return None and let the caller
+        // fall through to the unmanaged passthrough path.
+        Ok(None)
     }
 
     pub async fn head(&self, bucket: &str, key: &str) -> Result<FileMetadata, EngineError> {

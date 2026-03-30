@@ -491,4 +491,59 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         Ok(true)
     }
+
+    /// Batch-migrate all legacy reference objects in a bucket.
+    /// Returns (migrated_count, skipped_count, error_count).
+    pub async fn migrate_legacy_references(
+        &self,
+        bucket: &str,
+    ) -> Result<(u32, u32, u32), EngineError> {
+        let deltaspaces = self.storage.list_deltaspaces(bucket).await?;
+        let mut migrated = 0u32;
+        let mut skipped = 0u32;
+        let mut errors = 0u32;
+
+        for ds in &deltaspaces {
+            // Check if reference exists and needs migration
+            if !self.storage.has_reference(bucket, ds).await {
+                skipped += 1;
+                continue;
+            }
+
+            let ref_meta = match self.storage.get_reference_metadata(bucket, ds).await {
+                Ok(m) => m,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+
+            if ref_meta.original_name == Self::INTERNAL_REFERENCE_NAME {
+                skipped += 1;
+                continue;
+            }
+
+            // This is a legacy reference — migrate it
+            let filename = ref_meta.original_name.clone();
+            let _guard = self.acquire_prefix_lock(ds).await;
+            match self
+                .migrate_legacy_reference_object_if_needed(bucket, ds, &filename)
+                .await
+            {
+                Ok(true) => {
+                    tracing::info!("Migrated legacy reference in {}/{}", bucket, ds);
+                    migrated += 1;
+                }
+                Ok(false) => {
+                    skipped += 1;
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to migrate {}/{}: {}", bucket, ds, e);
+                    errors += 1;
+                }
+            }
+        }
+
+        Ok((migrated, skipped, errors))
+    }
 }

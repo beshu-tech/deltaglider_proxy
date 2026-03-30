@@ -1,4 +1,4 @@
-//! Usage scanner handlers: scan_usage, get_usage.
+//! Usage scanner handlers: scan_usage, get_usage, migrate_legacy.
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::Deserialize;
@@ -38,6 +38,38 @@ pub async fn scan_usage(
             Json(serde_json::json!({"status": "scan_already_running"})),
         )
     }
+}
+
+/// POST /_/api/admin/migrate — batch-migrate legacy reference objects.
+/// Converts old-format references (original_name != "__reference__") to the new format.
+/// This is a potentially long-running operation — runs synchronously and returns results.
+pub async fn migrate_legacy(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<MigrateRequest>,
+) -> impl IntoResponse {
+    let engine = state.s3_state.engine.load();
+    match engine.migrate_legacy_references(&req.bucket).await {
+        Ok((migrated, skipped, errors)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "bucket": req.bucket,
+                "migrated": migrated,
+                "skipped": skipped,
+                "errors": errors,
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct MigrateRequest {
+    bucket: String,
 }
 
 /// GET /_/api/admin/usage?bucket=X&prefix=Y — return cached usage entry.
