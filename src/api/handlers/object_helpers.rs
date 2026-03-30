@@ -17,6 +17,54 @@ use tracing::{debug, info, instrument, warn};
 use crate::api::aws_chunked::{decode_aws_chunked, get_decoded_content_length, is_aws_chunked};
 
 // ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+/// Validate the Content-MD5 header against the actual body content.
+/// Returns Ok(()) if the header is absent or matches; Err on mismatch or bad encoding.
+fn validate_content_md5(headers: &HeaderMap, body: &[u8]) -> Result<(), S3Error> {
+    if let Some(content_md5) = headers.get("content-md5").and_then(|v| v.to_str().ok()) {
+        use md5::Digest;
+        let computed = md5::Md5::digest(body);
+        match base64_decode(content_md5) {
+            Some(expected) if computed.as_slice() == expected.as_slice() => Ok(()),
+            Some(_) => Err(S3Error::BadDigest),
+            None => Err(S3Error::InvalidDigest),
+        }
+    } else {
+        Ok(())
+    }
+}
+
+/// Parse the x-amz-copy-source header, URL-decode it, and verify IAM read access.
+/// Returns `(source_bucket, source_key)` on success.
+fn parse_copy_source(
+    headers: &HeaderMap,
+    auth_user: &Option<AuthenticatedUser>,
+) -> Result<(String, String), S3Error> {
+    let copy_source = headers
+        .get("x-amz-copy-source")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| S3Error::InvalidRequest("Missing x-amz-copy-source header".to_string()))?;
+
+    let copy_source = urlencoding::decode(copy_source)
+        .map_err(|_| S3Error::InvalidArgument("Invalid copy source encoding".to_string()))?;
+    let copy_source = copy_source.trim_start_matches('/');
+
+    let (source_bucket, source_key) = copy_source
+        .split_once('/')
+        .ok_or_else(|| S3Error::InvalidArgument("Copy source must be bucket/key".to_string()))?;
+
+    if let Some(ref user) = auth_user {
+        if !user.can(S3Action::Read, source_bucket, source_key) {
+            return Err(S3Error::AccessDenied);
+        }
+    }
+
+    Ok((source_bucket.to_string(), source_key.to_string()))
+}
+
+// ---------------------------------------------------------------------------
 // PUT / COPY internals
 // ---------------------------------------------------------------------------
 
@@ -32,21 +80,24 @@ pub(super) async fn put_object_inner(
 ) -> Result<Response, S3Error> {
     info!("PUT {}/{} ({} bytes)", bucket, key, body.len());
 
-    // Validate Content-MD5 header if present (same pattern as upload_part)
-    if let Some(content_md5) = headers.get("content-md5").and_then(|v| v.to_str().ok()) {
-        use md5::Digest;
-        let computed = md5::Md5::digest(body);
-        match base64_decode(content_md5) {
-            Some(expected) => {
-                if computed.as_slice() != expected.as_slice() {
-                    return Err(S3Error::BadDigest);
-                }
-            }
-            None => {
-                return Err(S3Error::InvalidDigest);
-            }
+    // Reject requests where Content-Length disagrees with actual body size.
+    // Catches truncated uploads that could silently store partial data.
+    if let Some(cl) = headers
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        if cl != body.len() as u64 {
+            warn!(
+                "Content-Length mismatch: header={} actual={}",
+                cl,
+                body.len()
+            );
+            return Err(S3Error::IncompleteBody);
         }
     }
+
+    validate_content_md5(headers, body)?;
 
     // S3 directory marker: zero-byte object with trailing slash (e.g. "folder/")
     // Used by Cyberduck, AWS Console, etc. to create "folders".
@@ -112,27 +163,7 @@ pub(super) async fn copy_object_inner(
     headers: &HeaderMap,
     auth_user: &Option<AuthenticatedUser>,
 ) -> Result<Response, S3Error> {
-    // Get copy source
-    let copy_source = headers
-        .get("x-amz-copy-source")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| S3Error::InvalidRequest("Missing x-amz-copy-source header".to_string()))?;
-
-    // Parse source: /bucket/key or bucket/key (URL-encoded)
-    let copy_source = urlencoding::decode(copy_source)
-        .map_err(|_| S3Error::InvalidArgument("Invalid copy source encoding".to_string()))?;
-    let copy_source = copy_source.trim_start_matches('/');
-
-    let (source_bucket, source_key) = copy_source
-        .split_once('/')
-        .ok_or_else(|| S3Error::InvalidArgument("Copy source must be bucket/key".to_string()))?;
-
-    // IAM check: verify the authenticated user has read access to the copy source
-    if let Some(ref user) = auth_user {
-        if !user.can(S3Action::Read, source_bucket, source_key) {
-            return Err(S3Error::AccessDenied);
-        }
-    }
+    let (source_bucket, source_key) = parse_copy_source(headers, auth_user)?;
 
     info!(
         "COPY {}/{} -> {}/{}",
@@ -146,7 +177,7 @@ pub(super) async fn copy_object_inner(
     // memory spikes if max_object_size was reduced after the object was stored.
     // Note: file_size may be 0 for unmanaged objects (fallback metadata), so we
     // also check the actual data size after retrieval below.
-    let source_meta_head = engine.head(source_bucket, source_key).await?;
+    let source_meta_head = engine.head(&source_bucket, &source_key).await?;
     if source_meta_head.file_size > engine.max_object_size() {
         return Err(S3Error::EntityTooLarge {
             size: source_meta_head.file_size,
@@ -155,7 +186,7 @@ pub(super) async fn copy_object_inner(
     }
 
     // Retrieve source object
-    let (data, source_meta) = engine.retrieve(source_bucket, source_key).await?;
+    let (data, source_meta) = engine.retrieve(&source_bucket, &source_key).await?;
 
     // Double-check actual data size (metadata may report 0 for unmanaged objects)
     if data.len() as u64 > engine.max_object_size() {
@@ -260,21 +291,7 @@ pub(super) fn upload_part(
         bucket, key, part_num, upload_id
     );
 
-    // Validate Content-MD5 header if present
-    if let Some(content_md5) = headers.get("content-md5").and_then(|v| v.to_str().ok()) {
-        use md5::Digest;
-        let computed = md5::Md5::digest(&body);
-        match base64_decode(content_md5) {
-            Some(expected) => {
-                if computed.as_slice() != expected.as_slice() {
-                    return Err(S3Error::BadDigest);
-                }
-            }
-            None => {
-                return Err(S3Error::InvalidDigest);
-            }
-        }
-    }
+    validate_content_md5(headers, &body)?;
 
     let etag = state
         .multipart
@@ -295,26 +312,7 @@ pub(super) async fn upload_part_copy(
     upload_id: &str,
     auth_user: &Option<AuthenticatedUser>,
 ) -> Result<Response, S3Error> {
-    // Parse x-amz-copy-source header (reuses same logic as copy_object_inner)
-    let copy_source = headers
-        .get("x-amz-copy-source")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| S3Error::InvalidRequest("Missing x-amz-copy-source header".to_string()))?;
-
-    let copy_source = urlencoding::decode(copy_source)
-        .map_err(|_| S3Error::InvalidArgument("Invalid copy source encoding".to_string()))?;
-    let copy_source = copy_source.trim_start_matches('/');
-
-    let (source_bucket, source_key) = copy_source
-        .split_once('/')
-        .ok_or_else(|| S3Error::InvalidArgument("Copy source must be bucket/key".to_string()))?;
-
-    // IAM check: verify the authenticated user has read access to the copy source
-    if let Some(ref user) = auth_user {
-        if !user.can(S3Action::Read, source_bucket, source_key) {
-            return Err(S3Error::AccessDenied);
-        }
-    }
+    let (source_bucket, source_key) = parse_copy_source(headers, auth_user)?;
 
     info!(
         "UploadPartCopy {}/{} part={} uploadId={} from {}/{}",
@@ -323,7 +321,7 @@ pub(super) async fn upload_part_copy(
 
     // Retrieve source object data
     let engine = state.engine.load();
-    let (data, _source_meta) = engine.retrieve(source_bucket, source_key).await?;
+    let (data, _source_meta) = engine.retrieve(&source_bucket, &source_key).await?;
 
     // Optionally apply x-amz-copy-source-range: bytes=X-Y
     let part_data = if let Some(range_str) = headers

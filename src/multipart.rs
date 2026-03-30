@@ -30,6 +30,9 @@ struct MultipartUpload {
     content_type: Option<String>,
     user_metadata: HashMap<String, String>,
     parts: HashMap<u32, PartData>,
+    /// Prevents two concurrent CompleteMultipartUpload from both succeeding.
+    /// Set to true under write lock; cleared on failure.
+    completing: bool,
 }
 
 /// Result of assembling a completed multipart upload
@@ -116,6 +119,7 @@ impl MultipartStore {
             content_type,
             user_metadata,
             parts: HashMap::new(),
+            completing: false,
         };
 
         uploads.insert(upload_id.clone(), upload);
@@ -135,6 +139,15 @@ impl MultipartStore {
             return Err(S3Error::InvalidArgument(
                 "Part number must be between 1 and 10000".to_string(),
             ));
+        }
+
+        // Reject individual parts larger than max_object_size.
+        // Prevents memory exhaustion from accumulating oversized parts.
+        if data.len() as u64 > self.max_object_size {
+            return Err(S3Error::EntityTooLarge {
+                size: data.len() as u64,
+                max: self.max_object_size,
+            });
         }
 
         let md5_raw: [u8; 16] = Md5::digest(&data).into();
@@ -167,8 +180,9 @@ impl MultipartStore {
         Ok(etag)
     }
 
-    /// Assemble parts into a single object and remove the upload atomically.
-    /// Takes ownership under write lock (fast), then assembles without holding it.
+    /// Assemble parts into a single contiguous buffer.
+    /// Uses write lock + `completing` flag to prevent two concurrent
+    /// CompleteMultipartUpload requests from both succeeding.
     pub fn complete(
         &self,
         upload_id: &str,
@@ -176,9 +190,17 @@ impl MultipartStore {
         key: &str,
         requested_parts: &[(u32, String)], // (part_number, etag)
     ) -> Result<CompletedUpload, S3Error> {
-        let uploads = self.uploads.read();
-        let (validated, upload) =
-            self.validate_parts(&uploads, upload_id, bucket, key, requested_parts)?;
+        let (validated, content_type, user_metadata) = {
+            let mut uploads = self.uploads.write();
+            Self::check_not_completing(&uploads, upload_id)?;
+            let (validated, upload) =
+                self.validate_parts(&uploads, upload_id, bucket, key, requested_parts)?;
+            let ct = upload.content_type.clone();
+            let um = upload.user_metadata.clone();
+            // Mark as completing to block concurrent attempts
+            uploads.get_mut(upload_id).unwrap().completing = true;
+            (validated, ct, um)
+        };
 
         let mut assembled = BytesMut::new();
         for part in &validated.part_data {
@@ -188,8 +210,8 @@ impl MultipartStore {
         Ok(CompletedUpload {
             data: assembled.freeze(),
             etag: validated.etag,
-            content_type: upload.content_type.clone(),
-            user_metadata: upload.user_metadata.clone(),
+            content_type,
+            user_metadata,
         })
     }
 
@@ -204,17 +226,47 @@ impl MultipartStore {
         key: &str,
         requested_parts: &[(u32, String)],
     ) -> Result<CompletedParts, S3Error> {
-        let uploads = self.uploads.read();
-        let (validated, upload) =
-            self.validate_parts(&uploads, upload_id, bucket, key, requested_parts)?;
+        let (validated, content_type, user_metadata) = {
+            let mut uploads = self.uploads.write();
+            Self::check_not_completing(&uploads, upload_id)?;
+            let (validated, upload) =
+                self.validate_parts(&uploads, upload_id, bucket, key, requested_parts)?;
+            let ct = upload.content_type.clone();
+            let um = upload.user_metadata.clone();
+            uploads.get_mut(upload_id).unwrap().completing = true;
+            (validated, ct, um)
+        };
 
         Ok(CompletedParts {
             parts: validated.part_data,
             etag: validated.etag,
             total_size: validated.total_size,
-            content_type: upload.content_type.clone(),
-            user_metadata: upload.user_metadata.clone(),
+            content_type,
+            user_metadata,
         })
+    }
+
+    /// Clear the `completing` flag so a failed store can be retried.
+    pub fn mark_complete_failed(&self, upload_id: &str) {
+        let mut uploads = self.uploads.write();
+        if let Some(upload) = uploads.get_mut(upload_id) {
+            upload.completing = false;
+        }
+    }
+
+    /// Reject if another thread is already completing this upload.
+    fn check_not_completing(
+        uploads: &HashMap<String, MultipartUpload>,
+        upload_id: &str,
+    ) -> Result<(), S3Error> {
+        if let Some(upload) = uploads.get(upload_id) {
+            if upload.completing {
+                return Err(S3Error::InvalidRequest(
+                    "Upload is already being completed".to_string(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Shared validation for `complete()` and `complete_parts()`.

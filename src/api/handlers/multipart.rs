@@ -92,7 +92,7 @@ async fn complete_multipart_upload(
             .multipart
             .complete_parts(upload_id, bucket, key, &requested_parts)?;
         let etag = completed.etag.clone();
-        let result = engine
+        match engine
             .store_passthrough_chunked(
                 bucket,
                 key,
@@ -101,14 +101,20 @@ async fn complete_multipart_upload(
                 completed.content_type,
                 completed.user_metadata,
             )
-            .await?;
-        (etag, result)
+            .await
+        {
+            Ok(result) => (etag, result),
+            Err(e) => {
+                state.multipart.mark_complete_failed(upload_id);
+                return Err(e.into());
+            }
+        }
     } else {
         let completed = state
             .multipart
             .complete(upload_id, bucket, key, &requested_parts)?;
         let etag = completed.etag.clone();
-        let result = engine
+        match engine
             .store(
                 bucket,
                 key,
@@ -116,12 +122,17 @@ async fn complete_multipart_upload(
                 completed.content_type,
                 completed.user_metadata,
             )
-            .await?;
-        (etag, result)
+            .await
+        {
+            Ok(result) => (etag, result),
+            Err(e) => {
+                state.multipart.mark_complete_failed(upload_id);
+                return Err(e.into());
+            }
+        }
     };
 
     // Store succeeded — now safe to remove the upload from the map.
-    // (If store had failed, the upload would still be retryable.)
     state.multipart.remove_upload(upload_id);
 
     debug!(
