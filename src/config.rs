@@ -270,6 +270,11 @@ pub struct Config {
     #[serde(default = "default_log_level")]
     pub log_level: String,
 
+    /// S3 bucket for config DB sync (multi-instance IAM).
+    /// When set, the encrypted config DB is synced to/from this S3 bucket.
+    #[serde(default)]
+    pub config_sync_bucket: Option<String>,
+
     /// TLS configuration (optional).
     /// When enabled, both the S3 port and the demo UI port serve HTTPS.
     #[serde(default)]
@@ -381,6 +386,7 @@ impl Default for Config {
             codec_concurrency: None,
             blocking_threads: None,
             log_level: default_log_level(),
+            config_sync_bucket: None,
             tls: None,
         }
     }
@@ -466,6 +472,11 @@ impl Config {
         // Log level (runtime operational)
         if let Ok(level) = std::env::var("DGP_LOG_LEVEL") {
             config.log_level = level;
+        }
+
+        // Config DB S3 sync
+        if let Ok(bucket) = std::env::var("DGP_CONFIG_SYNC_BUCKET") {
+            config.config_sync_bucket = Some(bucket);
         }
 
         // TLS configuration

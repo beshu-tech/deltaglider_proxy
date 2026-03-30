@@ -294,6 +294,7 @@ pub fn run_init_inner(
         codec_concurrency: None,
         blocking_threads: None,
         log_level,
+        config_sync_bucket: None,
         tls,
     };
 
