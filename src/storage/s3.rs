@@ -575,8 +575,9 @@ impl S3Backend {
             match self.headers_to_metadata(&headers) {
                 Ok(meta) => return Ok(meta),
                 Err(e) => {
-                    debug!(
-                        "Corrupt DG metadata for {}/{}, falling back to passthrough: {}",
+                    warn!(
+                        "PATHOLOGICAL | Missing/corrupt DG metadata for {}/{} — falling back to passthrough. \
+                         This file was likely copied without --metadata flag. Error: {}",
                         bucket, key, e
                     );
                 }
@@ -584,6 +585,19 @@ impl S3Backend {
         }
 
         // Object exists on upstream S3 but has no (or corrupt) DeltaGlider metadata.
+        // This is a pathological condition — delta features are disabled for this object.
+        let is_delta_file = key.ends_with(".delta");
+        let is_reference = key.ends_with("reference.bin");
+        if is_delta_file || is_reference {
+            warn!(
+                "PATHOLOGICAL | {} file {}/{} has NO DG metadata! \
+                 Delta reconstruction will not work. Was this file copied without preserving S3 metadata? \
+                 Re-copy with: rclone copy src:bucket dst:bucket --metadata",
+                if is_reference { "Reference" } else { "Delta" },
+                bucket,
+                key
+            );
+        }
         // Treat as passthrough with best-effort metadata from HEAD response.
         let file_size = response.content_length().unwrap_or(0).max(0) as u64;
         let last_modified = response

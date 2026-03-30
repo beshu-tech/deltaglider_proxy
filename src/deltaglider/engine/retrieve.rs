@@ -60,10 +60,18 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             }
             None => {
                 // No DG metadata — try streaming as an unmanaged passthrough object
-                info!(
-                    "No DG metadata for {}/{}, attempting direct passthrough",
-                    bucket, key
-                );
+                if key.ends_with(".delta") || key.contains("reference.bin") {
+                    warn!(
+                        "PATHOLOGICAL | {}/{} has no DG metadata but looks like a delta/reference file. \
+                         Delta reconstruction disabled. Re-upload through the proxy or re-copy with --metadata.",
+                        bucket, key
+                    );
+                } else {
+                    info!(
+                        "No DG metadata for {}/{}, attempting direct passthrough",
+                        bucket, key
+                    );
+                }
                 return self
                     .try_unmanaged_passthrough(bucket, &deltaspace_id, &obj_key)
                     .await;
@@ -355,6 +363,16 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             }
             Err(e) => return Err(EngineError::Storage(e)),
         };
+
+        // Inject warning into metadata for UI display if this looks like a delta artifact
+        let mut meta = meta;
+        if obj_key.filename.ends_with(".delta") || obj_key.filename == "reference.bin" {
+            meta.user_metadata.insert(
+                "dg-warning".to_string(),
+                "Missing DG metadata — delta features disabled. Re-copy with --metadata flag."
+                    .to_string(),
+            );
+        }
 
         // Stream the object
         match self
