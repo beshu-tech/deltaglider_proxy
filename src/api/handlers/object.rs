@@ -331,6 +331,22 @@ pub async fn delete_object(
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
 
+    // Recursive prefix delete: DELETE /{bucket}/{prefix}/ (trailing slash)
+    if key.ends_with('/') {
+        info!("DELETE recursive {}/{}*", bucket, key);
+        let deleted = state.engine.load().delete_prefix(&bucket, &key).await?;
+        let user_name = auth_user
+            .as_ref()
+            .map(|axum::Extension(u)| u.name.as_str())
+            .unwrap_or("anonymous");
+        audit_log_s3("s3_delete_recursive", user_name, &headers, &bucket, &key);
+        return Ok((
+            StatusCode::OK,
+            axum::Json(serde_json::json!({"deleted": deleted})),
+        )
+            .into_response());
+    }
+
     info!("DELETE {}/{}", bucket, key);
 
     if let Err(err) = state.engine.load().delete(&bucket, &key).await {

@@ -298,24 +298,12 @@ export async function computePrefixSize(
   return result;
 }
 
-/** Recursively list and delete all objects under a prefix (folder). */
+/** Server-side recursive delete: DELETE /{bucket}/{prefix}/ */
 export async function deletePrefix(pfx: string): Promise<void> {
   const client = getClient();
-  let continuationToken: string | undefined;
-  for (;;) {
-    const resp = await client.send(
-      new ListObjectsV2Command({
-        Bucket: activeBucket,
-        Prefix: pfx,
-        ContinuationToken: continuationToken,
-      })
-    );
-    const keys = (resp.Contents || []).map((o) => o.Key).filter(Boolean) as string[];
-    if (keys.length > 0) await deleteObjects(keys);
-    if (!resp.IsTruncated) break;
-    continuationToken = resp.NextContinuationToken;
-    if (!continuationToken) break;
-  }
+  // Ensure trailing slash — signals recursive delete to the proxy
+  const key = pfx.endsWith('/') ? pfx : pfx + '/';
+  await client.send(new DeleteObjectCommand({ Bucket: activeBucket, Key: key }));
 }
 
 export async function downloadObject(key: string): Promise<Blob> {
