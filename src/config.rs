@@ -336,7 +336,7 @@ fn default_listen_addr() -> SocketAddr {
 }
 
 fn default_max_delta_ratio() -> f32 {
-    0.5
+    0.75
 }
 
 fn default_max_object_size() -> u64 {

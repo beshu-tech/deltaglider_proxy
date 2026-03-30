@@ -547,6 +547,16 @@ pub async fn sigv4_auth_middleware(
     // detection. A 5-second window only blocks network-level retries, not deliberate
     // replays made seconds later.
     if let Some(ref cache) = replay_cache {
+        // Cap replay cache size to prevent memory exhaustion under attack
+        const MAX_REPLAY_ENTRIES: usize = 500_000;
+        if cache.len() > MAX_REPLAY_ENTRIES {
+            warn!(
+                "SECURITY | Replay cache exceeded {} entries — possible flood attack. Clearing.",
+                MAX_REPLAY_ENTRIES
+            );
+            cache.clear();
+        }
+
         let sig = &params.signature;
         let replay_window = std::time::Duration::from_secs(
             std::env::var("DGP_CLOCK_SKEW_SECONDS")

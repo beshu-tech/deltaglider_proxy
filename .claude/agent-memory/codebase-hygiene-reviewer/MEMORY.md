@@ -1,2 +1,2 @@
-- [Admin overlay migration](project_admin_overlay_migration.md) — AdminOverlay replaced SettingsPage; old UsersTab/UserModal deleted; #/settings route still redundant
-- [Architecture analysis](project_architecture_analysis.md) — Testability/modularity findings: iam.rs mixed concerns, AdminState god struct, duplicated audit/is_admin logic
+- [Admin UI migration](project_admin_overlay_migration.md) — AdminPage embeds SettingsPage for config tabs; SettingsPage is NOT dead code
+- [Architecture analysis](project_architecture_analysis.md) — Codebase hygiene findings: delete_prefix unused, s3.rs is 1646 lines, eprintln usage is intentional
