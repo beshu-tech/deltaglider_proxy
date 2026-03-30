@@ -292,25 +292,22 @@ export default function Sidebar({
                   <span style={{ fontSize: 11, color: TEXT_MUTED, fontFamily: "var(--font-ui)", overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     Logged in as <strong style={{ color: TEXT_SECONDARY, fontWeight: 600 }}>{displayName || currentUser || 'user'}</strong>
                   </span>
-                  <Popconfirm
-                    title="Disconnect?"
-                    description="This will clear your credentials and return to the login screen."
-                    onConfirm={onLogout}
-                    okText="Disconnect"
-                    okButtonProps={{ danger: true }}
-                  >
-                    <Tooltip title="Disconnect & clear credentials" placement="right">
-                      <button
-                        className="btn-reset"
-                        style={{ color: TEXT_MUTED, fontSize: 14, padding: 4, flexShrink: 0, transition: 'color 0.15s' }}
-                        onMouseEnter={(e) => { e.currentTarget.style.color = ACCENT_RED; }}
-                        onMouseLeave={(e) => { e.currentTarget.style.color = TEXT_MUTED; }}
-                        aria-label="Disconnect"
-                      >
-                        <LogoutOutlined aria-hidden="true" />
-                      </button>
-                    </Tooltip>
-                  </Popconfirm>
+                  <Tooltip title="Disconnect & clear credentials" placement="right">
+                    <button
+                      className="btn-reset"
+                      style={{ color: TEXT_MUTED, fontSize: 14, padding: 4, flexShrink: 0, transition: 'color 0.15s' }}
+                      onMouseEnter={(e) => { e.currentTarget.style.color = ACCENT_RED; }}
+                      onMouseLeave={(e) => { e.currentTarget.style.color = TEXT_MUTED; }}
+                      aria-label="Disconnect"
+                      onClick={() => {
+                        if (window.confirm('Disconnect? This will clear your credentials and return to the login screen.')) {
+                          onLogout();
+                        }
+                      }}
+                    >
+                      <LogoutOutlined aria-hidden="true" />
+                    </button>
+                  </Tooltip>
                 </div>
               </div>
             )}
