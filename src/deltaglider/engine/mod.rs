@@ -801,11 +801,19 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     }
 
     /// Delete all objects under a prefix (server-side recursive delete).
-    /// Lists all objects, then deletes each one. Returns the count of deleted objects.
+    /// Tries the storage backend's native delete first (filesystem = rm -rf).
+    /// Falls back to list + individual delete for S3.
     pub async fn delete_prefix(&self, bucket: &str, prefix: &str) -> Result<u32, EngineError> {
         info!("Recursive delete: {}/{}*", bucket, prefix);
 
-        // List all objects under this prefix (no delimiter = flat recursive list)
+        // Try native backend delete (filesystem = rm -rf, instant)
+        if self.storage.delete_prefix(bucket, prefix).await? {
+            self.metadata_cache.invalidate_prefix(bucket, prefix);
+            info!("Recursive delete (native): {}/{}*", bucket, prefix);
+            return Ok(u32::MAX);
+        }
+
+        // Fallback: list + delete one by one (S3 backend)
         let page = self
             .list_objects(bucket, prefix, None, u32::MAX, None, false)
             .await?;
@@ -814,15 +822,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         for (key, _meta) in &page.objects {
             match self.delete(bucket, key).await {
                 Ok(()) => deleted += 1,
-                Err(EngineError::NotFound(_)) => {
-                    // Already gone (concurrent delete) — count as success
-                    deleted += 1;
-                }
+                Err(EngineError::NotFound(_)) => deleted += 1,
                 Err(e) => {
-                    warn!(
-                        "Failed to delete {}/{} during prefix delete: {}",
-                        bucket, key, e
-                    );
+                    warn!("Failed to delete {}/{}: {}", bucket, key, e);
                 }
             }
         }
