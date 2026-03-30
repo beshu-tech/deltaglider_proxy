@@ -46,13 +46,33 @@ impl RateLimiter {
         }
     }
 
-    /// Create a rate limiter with default security settings:
-    /// 5 attempts per 15-minute window, 30-minute lockout.
+    /// Create a rate limiter from environment variables with secure defaults:
+    /// - `DGP_RATE_LIMIT_MAX_ATTEMPTS`: max failures before lockout (default: 10)
+    /// - `DGP_RATE_LIMIT_WINDOW_SECS`: rolling window in seconds (default: 900 = 15 min)
+    /// - `DGP_RATE_LIMIT_LOCKOUT_SECS`: lockout duration in seconds (default: 1800 = 30 min)
     pub fn default_auth() -> Self {
+        let max_attempts = std::env::var("DGP_RATE_LIMIT_MAX_ATTEMPTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50u32);
+        let window_secs = std::env::var("DGP_RATE_LIMIT_WINDOW_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(900u64);
+        let lockout_secs = std::env::var("DGP_RATE_LIMIT_LOCKOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1800u64);
+        tracing::info!(
+            "Rate limiter: {} attempts per {}s window, {}s lockout",
+            max_attempts,
+            window_secs,
+            lockout_secs
+        );
         Self::new(
-            5,
-            Duration::from_secs(15 * 60),
-            Duration::from_secs(30 * 60),
+            max_attempts,
+            Duration::from_secs(window_secs),
+            Duration::from_secs(lockout_secs),
         )
     }
 
