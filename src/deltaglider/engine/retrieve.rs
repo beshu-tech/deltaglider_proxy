@@ -275,7 +275,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     });
                 }
 
-                let _codec_permit = self.try_acquire_codec()?;
+                // Wait up to 60s for a codec slot (GET should queue, not fail fast)
+                let _codec_permit = self
+                    .acquire_codec_timeout(std::time::Duration::from_secs(60))
+                    .await?;
                 let ref_clone = reference.clone();
                 let codec = self.codec.clone();
                 let decode_start = Instant::now();
