@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Button, Input, Typography, Space, Alert } from 'antd';
+import { Button, Input, Typography, Space, Alert, Spin } from 'antd';
 import { ApiOutlined } from '@ant-design/icons';
 import { testConnection, setEndpoint, setCredentials, setBucket, initFromSession } from '../s3client';
 import { adminLogin, whoami } from '../adminApi';
@@ -21,38 +21,45 @@ export default function ConnectPage({ onConnect, showError }: Props) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [authMode, setAuthMode] = useState<'bootstrap' | 'iam' | 'open' | null>(null);
+  const [detecting, setDetecting] = useState(true);
 
-  // Detect auth mode on mount (before user interacts)
+  // Detect auth mode on mount
   useEffect(() => {
-    whoami().then(info => setAuthMode(info.mode as 'bootstrap' | 'iam' | 'open')).catch(() => {});
+    whoami()
+      .then(info => setAuthMode(info.mode as 'bootstrap' | 'iam' | 'open'))
+      .catch(() => {})
+      .finally(() => setDetecting(false));
   }, []);
 
   const handleConnect = async () => {
     setLoading(true);
     setError('');
     try {
-      // Step 1: Admin login first (if password provided)
-      if (adminPassword) {
-        const adminResult = await adminLogin(adminPassword);
-        if (!adminResult.ok) {
-          setError(`Admin login failed: ${adminResult.error || 'Invalid password'}`);
+      if (authMode === 'bootstrap') {
+        // Bootstrap mode: login with password, session auto-provides S3 creds
+        if (!adminPassword.trim()) {
+          setError('Bootstrap password is required');
           setLoading(false);
           return;
         }
-
-        // Try to restore S3 creds from the session
+        const adminResult = await adminLogin(adminPassword);
+        if (!adminResult.ok) {
+          setError(`Login failed: ${adminResult.error || 'Invalid password'}`);
+          setLoading(false);
+          return;
+        }
         const restored = await initFromSession();
         if (restored) {
-          try {
-            const info = await whoami();
-            setAuthMode(info.mode as 'bootstrap' | 'iam' | 'open');
-          } catch { /* non-critical */ }
           onConnect();
           return;
         }
+        // Session didn't provide creds — shouldn't happen in bootstrap, but fall through
+        setError('Login succeeded but no S3 credentials available. Check server config.');
+        setLoading(false);
+        return;
       }
 
-      // Step 2: Manual S3 connection
+      // IAM mode: connect with S3 credentials
       const cleanEndpoint = detectDefaultEndpoint().replace(/\/+$/, '');
       if (!accessKey.trim() || !secretKey.trim()) {
         setError('Access Key and Secret Key are required');
@@ -61,7 +68,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
       }
       const result = await testConnection(cleanEndpoint, accessKey, secretKey);
       if (!result.ok) {
-        setError(`Connection failed: ${result.error || 'Unknown error'}`);
+        setError(`Connection failed: ${result.error || 'Invalid credentials'}`);
         setLoading(false);
         return;
       }
@@ -72,11 +79,6 @@ export default function ConnectPage({ onConnect, showError }: Props) {
         setBucket(result.buckets[0]);
       }
 
-      try {
-        const info = await whoami();
-        setAuthMode(info.mode as 'bootstrap' | 'iam' | 'open');
-      } catch { /* non-critical */ }
-
       onConnect();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Connection failed');
@@ -85,8 +87,8 @@ export default function ConnectPage({ onConnect, showError }: Props) {
     }
   };
 
-  const showBootstrap = authMode === 'bootstrap' || authMode === null;
-  const canSubmit = (showBootstrap && adminPassword.trim()) || (accessKey.trim() && secretKey.trim());
+  const isBootstrap = authMode === 'bootstrap';
+  const canSubmit = isBootstrap ? adminPassword.trim() : (accessKey.trim() && secretKey.trim());
 
   const inputStyle = {
     background: 'var(--input-bg)',
@@ -96,6 +98,14 @@ export default function ConnectPage({ onConnect, showError }: Props) {
     fontFamily: "var(--font-mono)" as const,
     fontSize: 13,
   };
+
+  if (detecting) {
+    return (
+      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh' }}>
+        <Spin size="large" />
+      </div>
+    );
+  }
 
   return (
     <div style={{
@@ -136,7 +146,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
               Proxy
             </div>
             <Text style={{ color: TEXT_MUTED, fontSize: 13, display: 'block', marginTop: 12 }}>
-              {showBootstrap ? 'Sign in with your credentials.' : 'Sign in with your S3 credentials.'}
+              {isBootstrap ? 'Enter the bootstrap password to sign in.' : 'Sign in with your S3 credentials.'}
             </Text>
           </div>
 
@@ -145,35 +155,8 @@ export default function ConnectPage({ onConnect, showError }: Props) {
           )}
           {error && <Alert type="error" message={error} showIcon />}
 
-          <div>
-            <label style={{ fontSize: 12, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)", marginBottom: 4, display: 'block' }}>
-              Access Key ID
-            </label>
-            <Input
-              value={accessKey}
-              onChange={(e) => setAccessKey(e.target.value)}
-              placeholder="Access Key ID"
-              size="large"
-              autoFocus
-              style={inputStyle}
-            />
-          </div>
-
-          <div>
-            <label style={{ fontSize: 12, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)", marginBottom: 4, display: 'block' }}>
-              Secret Access Key
-            </label>
-            <Input.Password
-              value={secretKey}
-              onChange={(e) => setSecretKey(e.target.value)}
-              placeholder="Secret Access Key"
-              size="large"
-              onPressEnter={!showBootstrap ? handleConnect : undefined}
-              style={inputStyle}
-            />
-          </div>
-
-          {showBootstrap && (
+          {isBootstrap ? (
+            /* Bootstrap mode: password only */
             <div>
               <label style={{ fontSize: 12, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)", marginBottom: 4, display: 'block' }}>
                 Bootstrap Password
@@ -184,12 +167,44 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                 onPressEnter={handleConnect}
                 placeholder="Bootstrap password"
                 size="large"
+                autoFocus
                 style={inputStyle}
               />
               <Text style={{ color: TEXT_FAINT, fontSize: 11, marginTop: 4, display: 'block' }}>
-                Required for admin access before IAM users are created
+                The admin password configured at deployment
               </Text>
             </div>
+          ) : (
+            /* IAM mode: access key + secret key */
+            <>
+              <div>
+                <label style={{ fontSize: 12, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)", marginBottom: 4, display: 'block' }}>
+                  Access Key ID
+                </label>
+                <Input
+                  value={accessKey}
+                  onChange={(e) => setAccessKey(e.target.value)}
+                  placeholder="Access Key ID"
+                  size="large"
+                  autoFocus
+                  style={inputStyle}
+                />
+              </div>
+
+              <div>
+                <label style={{ fontSize: 12, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)", marginBottom: 4, display: 'block' }}>
+                  Secret Access Key
+                </label>
+                <Input.Password
+                  value={secretKey}
+                  onChange={(e) => setSecretKey(e.target.value)}
+                  onPressEnter={handleConnect}
+                  placeholder="Secret Access Key"
+                  size="large"
+                  style={inputStyle}
+                />
+              </div>
+            </>
           )}
 
           <Button
@@ -199,7 +214,6 @@ export default function ConnectPage({ onConnect, showError }: Props) {
             loading={loading}
             disabled={!canSubmit}
             onClick={handleConnect}
-            onKeyDown={(e) => e.key === 'Enter' && canSubmit && handleConnect()}
             style={{
               height: 48,
               borderRadius: 10,
@@ -210,7 +224,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
               marginTop: 4,
             }}
           >
-            Connect
+            {isBootstrap ? 'Sign In' : 'Connect'}
           </Button>
         </Space>
       </div>
