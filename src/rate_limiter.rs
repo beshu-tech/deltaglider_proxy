@@ -54,7 +54,7 @@ impl RateLimiter {
         let max_attempts = std::env::var("DGP_RATE_LIMIT_MAX_ATTEMPTS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(50u32);
+            .unwrap_or(100u32);
         let window_secs = std::env::var("DGP_RATE_LIMIT_WINDOW_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -99,17 +99,19 @@ impl RateLimiter {
 
     /// Get the progressive delay for an IP based on failure count.
     /// Returns a duration to sleep before responding (makes brute force expensive).
-    /// Delay doubles with each failure: 0, 100ms, 200ms, 400ms, 800ms, 1.6s, 3.2s...
+    /// No delay for the first 10 failures (normal typos/misconfiguration).
+    /// After that, doubles each time: 100ms, 200ms, 400ms, 800ms, 1.6s, 3.2s, 5s.
     /// Capped at 5 seconds to avoid tying up connections forever.
     pub fn progressive_delay(&self, ip: &IpAddr) -> Duration {
         let entry = match self.entries.get(ip) {
             Some(e) => e,
             None => return Duration::ZERO,
         };
-        if entry.count == 0 {
+        if entry.count <= 10 {
             return Duration::ZERO;
         }
-        let delay_ms = 100u64.saturating_mul(1u64 << entry.count.min(6));
+        let excess = entry.count - 10;
+        let delay_ms = 100u64.saturating_mul(1u64 << excess.min(6));
         Duration::from_millis(delay_ms.min(5000))
     }
 
