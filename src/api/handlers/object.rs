@@ -334,7 +334,36 @@ pub async fn delete_object(
     // Recursive prefix delete: DELETE /{bucket}/{prefix}/ (trailing slash)
     if key.ends_with('/') {
         info!("DELETE recursive {}/{}*", bucket, key);
-        let deleted = state.engine.load().delete_prefix(&bucket, &key).await?;
+        let engine = state.engine.load();
+
+        // List all objects under the prefix
+        let page = engine
+            .list_objects(&bucket, &key, None, u32::MAX, None, false)
+            .await?;
+
+        let mut deleted = 0u32;
+        let mut denied = 0u32;
+        for (obj_key, _meta) in &page.objects {
+            // Per-object IAM check (respects Deny rules on sub-prefixes)
+            if let Some(axum::Extension(ref user)) = auth_user {
+                if !user.can(S3Action::Delete, &bucket, obj_key) {
+                    denied += 1;
+                    continue;
+                }
+            }
+            match engine.delete(&bucket, obj_key).await {
+                Ok(()) => deleted += 1,
+                Err(e) => {
+                    let s3_err = S3Error::from(e);
+                    if matches!(s3_err, S3Error::NoSuchKey(_)) {
+                        deleted += 1; // Already gone
+                    } else {
+                        warn!("Failed to delete {}/{}: {}", bucket, obj_key, s3_err);
+                    }
+                }
+            }
+        }
+
         let user_name = auth_user
             .as_ref()
             .map(|axum::Extension(u)| u.name.as_str())
@@ -342,7 +371,7 @@ pub async fn delete_object(
         audit_log_s3("s3_delete_recursive", user_name, &headers, &bucket, &key);
         return Ok((
             StatusCode::OK,
-            axum::Json(serde_json::json!({"deleted": deleted})),
+            axum::Json(serde_json::json!({"deleted": deleted, "denied": denied})),
         )
             .into_response());
     }

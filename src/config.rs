@@ -546,10 +546,10 @@ impl Config {
     }
 
     /// Decode a hash value: if it looks like base64 (no `$` prefix), decode it.
-    /// Otherwise return as-is (raw bcrypt hash).
+    /// Otherwise return as-is (raw bcrypt hash). Validates the result is a bcrypt hash.
     fn decode_hash(value: &str) -> String {
         let trimmed = value.trim();
-        if trimmed.starts_with('$') {
+        let hash = if trimmed.starts_with('$') {
             // Raw bcrypt hash like $2b$12$...
             trimmed.to_string()
         } else if !trimmed.is_empty() {
@@ -557,14 +557,34 @@ impl Config {
             use base64::Engine;
             match base64::engine::general_purpose::STANDARD.decode(trimmed) {
                 Ok(bytes) => match String::from_utf8(bytes) {
-                    Ok(decoded) if decoded.starts_with('$') => decoded,
-                    _ => trimmed.to_string(), // Not a valid bcrypt hash after decode
+                    Ok(decoded) if decoded.starts_with("$2") => decoded,
+                    _ => {
+                        eprintln!(
+                            "WARNING: DGP_BOOTSTRAP_PASSWORD_HASH is not a valid bcrypt hash \
+                             (base64 decoded but not bcrypt format). Login will fail."
+                        );
+                        trimmed.to_string()
+                    }
                 },
-                Err(_) => trimmed.to_string(), // Not valid base64
+                Err(_) => {
+                    eprintln!(
+                        "WARNING: DGP_BOOTSTRAP_PASSWORD_HASH is not a valid bcrypt hash \
+                         or base64-encoded hash. Login will fail."
+                    );
+                    trimmed.to_string()
+                }
             }
         } else {
             String::new()
+        };
+        // Final validation: bcrypt hashes start with $2
+        if !hash.is_empty() && !hash.starts_with("$2") {
+            eprintln!(
+                "WARNING: Bootstrap password hash does not look like bcrypt (expected $2b$... or $2a$...). \
+                 Admin login will fail."
+            );
         }
+        hash
     }
 
     /// Ensure bootstrap_password_hash is set. Resolution order:
