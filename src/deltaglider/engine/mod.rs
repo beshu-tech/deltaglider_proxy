@@ -256,13 +256,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         metrics: Option<Arc<Metrics>>,
     ) -> Self {
         // PERF: codec_concurrency controls how many xdelta3 subprocesses can run
-        // in parallel. Defaults to CPU count, configurable via DGP_CODEC_CONCURRENCY.
-        // Too high → CPU saturation + memory pressure from concurrent buffers.
-        // Too low → underutilized cores, higher tail latency under load.
+        // in parallel. Defaults to num_cpus * 4 (xdelta3 decode is fast — the bottleneck
+        // is network I/O fetching reference+delta from S3, not CPU). Minimum 8.
+        // Configurable via DGP_CODEC_CONCURRENCY.
         let codec_concurrency = config.codec_concurrency.unwrap_or_else(|| {
-            std::thread::available_parallelism()
+            let cpus = std::thread::available_parallelism()
                 .map(|n| n.get())
-                .unwrap_or(4)
+                .unwrap_or(4);
+            (cpus * 4).max(8)
         });
         Self {
             storage,
