@@ -246,8 +246,6 @@ async fn test_corrupt_xattr_metadata_graceful_fallback() {
 
     let http = reqwest::Client::new();
 
-    let http = reqwest::Client::new();
-
     // Corrupt metadata may cause deserialization failure — the proxy should
     // either fallback to passthrough (200) or return a clean error (404/500).
     // It must NOT panic or hang.
