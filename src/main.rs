@@ -115,6 +115,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("  All IAM users will be lost. The proxy will return to bootstrap mode.");
         eprintln!();
         eprintln!("Bootstrap password hash written to {state_file}");
+        // Print base64-encoded version for Docker/env var use (no $ escaping needed)
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&hash);
+        eprintln!();
+        eprintln!("For Docker/env vars (base64, no escaping needed):");
+        eprintln!("  DGP_BOOTSTRAP_PASSWORD_HASH={b64}");
         std::process::exit(0);
     }
 

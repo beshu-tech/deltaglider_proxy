@@ -545,15 +545,40 @@ impl Config {
         self.tls.as_ref().is_some_and(|t| t.enabled)
     }
 
+    /// Decode a hash value: if it looks like base64 (no `$` prefix), decode it.
+    /// Otherwise return as-is (raw bcrypt hash).
+    fn decode_hash(value: &str) -> String {
+        let trimmed = value.trim();
+        if trimmed.starts_with('$') {
+            // Raw bcrypt hash like $2b$12$...
+            trimmed.to_string()
+        } else if !trimmed.is_empty() {
+            // Try base64 decode
+            use base64::Engine;
+            match base64::engine::general_purpose::STANDARD.decode(trimmed) {
+                Ok(bytes) => match String::from_utf8(bytes) {
+                    Ok(decoded) if decoded.starts_with('$') => decoded,
+                    _ => trimmed.to_string(), // Not a valid bcrypt hash after decode
+                },
+                Err(_) => trimmed.to_string(), // Not valid base64
+            }
+        } else {
+            String::new()
+        }
+    }
+
     /// Ensure bootstrap_password_hash is set. Resolution order:
     /// 1. Already set in config (env var or TOML) — use it.
     /// 2. Persisted state file `.deltaglider_bootstrap_hash` (or legacy `.deltaglider_admin_hash`).
     /// 3. Generate a random password, hash it, persist, and print to stderr.
     ///
-    /// Returns the bcrypt hash.
+    /// Accepts both raw bcrypt hash (`$2b$12$...`) and base64-encoded bcrypt hash.
+    /// Base64 encoding avoids `$` escaping issues in Docker/shell/env vars.
+    ///
+    /// Returns the bcrypt hash (always raw, never base64).
     pub fn ensure_bootstrap_password_hash(&mut self) -> String {
         if let Some(ref hash) = self.bootstrap_password_hash {
-            return hash.clone();
+            return Self::decode_hash(hash);
         }
 
         // Check new file first, fall back to legacy file name
@@ -565,8 +590,8 @@ impl Config {
             legacy_file
         };
         if state_file.exists() {
-            if let Ok(hash) = std::fs::read_to_string(state_file) {
-                let hash = hash.trim().to_string();
+            if let Ok(raw) = std::fs::read_to_string(state_file) {
+                let hash = Self::decode_hash(raw.trim());
                 if !hash.is_empty() {
                     self.bootstrap_password_hash = Some(hash.clone());
                     return hash;
