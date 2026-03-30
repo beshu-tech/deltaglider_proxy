@@ -800,6 +800,40 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         Ok(())
     }
 
+    /// Delete all objects under a prefix (server-side recursive delete).
+    /// Lists all objects, then deletes each one. Returns the count of deleted objects.
+    pub async fn delete_prefix(&self, bucket: &str, prefix: &str) -> Result<u32, EngineError> {
+        info!("Recursive delete: {}/{}*", bucket, prefix);
+
+        // List all objects under this prefix (no delimiter = flat recursive list)
+        let page = self
+            .list_objects(bucket, prefix, None, u32::MAX, None, false)
+            .await?;
+
+        let mut deleted = 0u32;
+        for (key, _meta) in &page.objects {
+            match self.delete(bucket, key).await {
+                Ok(()) => deleted += 1,
+                Err(EngineError::NotFound(_)) => {
+                    // Already gone (concurrent delete) — count as success
+                    deleted += 1;
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to delete {}/{} during prefix delete: {}",
+                        bucket, key, e
+                    );
+                }
+            }
+        }
+
+        info!(
+            "Recursive delete complete: {}/{} — {} objects deleted",
+            bucket, prefix, deleted
+        );
+        Ok(deleted)
+    }
+
     /// Get reference with caching. Returns `Bytes` for zero-copy sharing.
     /// Returns `(reference_data, cache_hit)`.
     async fn get_reference_cached(
