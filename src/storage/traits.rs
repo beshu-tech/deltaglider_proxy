@@ -232,6 +232,14 @@ pub trait StorageBackend: Send + Sync {
             .await
     }
 
+    /// Delete all objects under a prefix (recursive).
+    /// Default: not implemented (returns false). Backends that support efficient
+    /// recursive delete (like filesystem) override this.
+    /// Returns true if handled natively, false if the caller should do it manually.
+    async fn delete_prefix(&self, _bucket: &str, _prefix: &str) -> Result<bool, StorageError> {
+        Ok(false) // Not supported — caller will list+delete manually
+    }
+
     // === Scanning operations ===
 
     /// Scan a deltaspace directory and return all file metadata
@@ -459,6 +467,14 @@ macro_rules! impl_storage_backend_for_box {
                 filename: &str,
             ) -> Result<(), StorageError> {
                 (**self).delete_passthrough(bucket, prefix, filename).await
+            }
+
+            async fn delete_prefix(
+                &self,
+                bucket: &str,
+                prefix: &str,
+            ) -> Result<bool, StorageError> {
+                (**self).delete_prefix(bucket, prefix).await
             }
 
             async fn get_passthrough_stream(
