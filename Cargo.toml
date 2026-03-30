@@ -1,6 +1,6 @@
 [package]
 name = "deltaglider_proxy"
-version = "0.5.3"
+version = "0.5.4"
 description = "S3-compatible proxy with transparent delta compression"
 license = "GPL-2.0-only"
 readme = "README.md"
@@ -80,7 +80,7 @@ uuid = { version = "1", features = ["v4"] }
 prometheus = { version = "0.13", default-features = false, features = ["process"] }
 rusqlite = { version = "0.39.0", features = ["bundled-sqlcipher"] }
 iam-rs = "0.0.23"
-tower = { version = "0.5.3", features = ["limit"] }
+tower = { version = "0.5", features = ["limit"] }
 
 [dev-dependencies]
 tokio-test = "0.4"

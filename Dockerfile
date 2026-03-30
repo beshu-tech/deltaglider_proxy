@@ -67,9 +67,11 @@ RUN apt-get -o Acquire::Retries=3 update && apt-get install -y --no-install-reco
     && rm -rf /var/lib/apt/lists/*
 RUN groupadd --system dg && useradd --system --gid dg --no-create-home dg
 COPY --from=rust-build /app/target/release/deltaglider_proxy /usr/local/bin/
+RUN mkdir -p /data && chown dg:dg /data
 USER dg
+WORKDIR /data
 EXPOSE 9000
 ENV DGP_LISTEN_ADDR=0.0.0.0:9000
 HEALTHCHECK --interval=15s --timeout=3s --retries=3 \
-    CMD curl -f http://localhost:9000/health || exit 1
+    CMD curl -f http://localhost:9000/_/health || exit 1
 ENTRYPOINT ["deltaglider_proxy"]
