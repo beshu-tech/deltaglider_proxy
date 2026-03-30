@@ -247,12 +247,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 None,
             ),
             StorageInfo::Delta { .. } => {
-                let (reference, cache_hit) =
-                    self.get_reference_cached(bucket, deltaspace_id).await?;
-                let delta = self
-                    .storage
-                    .get_delta(bucket, deltaspace_id, &obj_key.filename)
-                    .await?;
+                // Fetch reference and delta in parallel — saves one S3 round-trip
+                let (ref_result, delta_result) = tokio::join!(
+                    self.get_reference_cached(bucket, deltaspace_id),
+                    self.storage
+                        .get_delta(bucket, deltaspace_id, &obj_key.filename)
+                );
+                let (reference, cache_hit) = ref_result?;
+                let delta = delta_result?;
 
                 // Guard against oversized inputs before spawning the codec task.
                 // The reference + delta combined size is a lower bound for the
