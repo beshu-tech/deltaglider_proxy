@@ -327,10 +327,26 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     }
 
     /// Try to acquire a codec permit, returning `Overloaded` if all slots are busy.
+    /// Use for PUT (fail fast — don't queue uploads holding large bodies in memory).
     fn try_acquire_codec(&self) -> Result<tokio::sync::SemaphorePermit<'_>, EngineError> {
         self.codec_semaphore.try_acquire().map_err(|_| {
             EngineError::Overloaded("all delta codec slots busy — try again later".into())
         })
+    }
+
+    /// Wait for a codec permit with a timeout. Use for GET (users expect downloads to
+    /// work even if they queue briefly behind other reconstructions).
+    async fn acquire_codec_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<tokio::sync::SemaphorePermit<'_>, EngineError> {
+        match tokio::time::timeout(timeout, self.codec_semaphore.acquire()).await {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_closed)) => Err(EngineError::Overloaded("codec semaphore closed".into())),
+            Err(_elapsed) => Err(EngineError::Overloaded(
+                "timed out waiting for codec slot — server too busy".into(),
+            )),
+        }
     }
 
     /// Acquire a per-deltaspace async lock. Different prefixes do not contend.
