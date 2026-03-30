@@ -386,15 +386,17 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         original_name: &str,
     ) -> Result<Option<FileMetadata>, StorageError> {
         let filename = original_name.rsplit('/').next().unwrap_or(original_name);
-        let delta = match self
-            .storage
-            .get_delta_metadata(bucket, prefix, filename)
-            .await
-        {
+
+        // Fetch delta and passthrough metadata in parallel — saves one S3 round-trip
+        let (delta_result, passthrough_result) = tokio::join!(
+            self.storage.get_delta_metadata(bucket, prefix, filename),
+            self.storage
+                .get_passthrough_metadata(bucket, prefix, filename),
+        );
+
+        let delta = match delta_result {
             Ok(meta) => Some(meta),
             Err(StorageError::NotFound(_)) => None,
-            // I/O errors (e.g. file being atomically replaced during concurrent access)
-            // are treated as "metadata not available" with a warning, not hard failures.
             Err(StorageError::Io(ref e)) => {
                 warn!(
                     "I/O error reading delta metadata for {}/{}: {}",
@@ -404,11 +406,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             }
             Err(e) => return Err(e),
         };
-        let passthrough = match self
-            .storage
-            .get_passthrough_metadata(bucket, prefix, filename)
-            .await
-        {
+        let passthrough = match passthrough_result {
             Ok(meta) => Some(meta),
             Err(StorageError::NotFound(_)) => None,
             Err(StorageError::Io(ref e)) => {
