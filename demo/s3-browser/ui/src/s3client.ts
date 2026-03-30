@@ -4,6 +4,7 @@ import {
   HeadObjectCommand,
   PutObjectCommand,
   DeleteObjectCommand,
+  DeleteObjectsCommand,
   GetObjectCommand,
   ListBucketsCommand,
   CreateBucketCommand,
@@ -231,7 +232,18 @@ export async function deleteObject(key: string): Promise<void> {
 }
 
 export async function deleteObjects(keys: string[]): Promise<void> {
-  await Promise.all(keys.map((key) => deleteObject(key)));
+  if (keys.length === 0) return;
+  const client = getClient();
+  // S3 batch delete: up to 1000 objects per request
+  for (let i = 0; i < keys.length; i += 1000) {
+    const batch = keys.slice(i, i + 1000);
+    await client.send(
+      new DeleteObjectsCommand({
+        Bucket: activeBucket,
+        Delete: { Objects: batch.map((Key) => ({ Key })), Quiet: true },
+      })
+    );
+  }
 }
 
 /** Progress callback for prefix size computation. */
