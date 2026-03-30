@@ -9,7 +9,10 @@ import './theme.css'
 function Root() {
   const { isDark } = useTheme();
   return (
-    <ConfigProvider theme={isDark ? darkTheme : lightTheme}>
+    <ConfigProvider
+      theme={isDark ? darkTheme : lightTheme}
+      getPopupContainer={() => document.getElementById('root') || document.body}
+    >
       <App />
     </ConfigProvider>
   );

@@ -62,7 +62,7 @@ export default function DropZone({ onDrop, prefix }: Props) {
       style={{
         position: 'fixed',
         inset: 0,
-        zIndex: 1000,
+        zIndex: 999,
         background: 'var(--overlay-bg)',
         backdropFilter: 'blur(8px)',
         WebkitBackdropFilter: 'blur(8px)',
