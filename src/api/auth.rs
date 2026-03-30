@@ -547,14 +547,25 @@ pub async fn sigv4_auth_middleware(
     // detection. A 5-second window only blocks network-level retries, not deliberate
     // replays made seconds later.
     if let Some(ref cache) = replay_cache {
-        // Cap replay cache size to prevent memory exhaustion under attack
+        // Cap replay cache size to prevent memory exhaustion under attack.
+        // Evict expired entries first; only if still over cap, evict oldest half.
         const MAX_REPLAY_ENTRIES: usize = 500_000;
         if cache.len() > MAX_REPLAY_ENTRIES {
-            warn!(
-                "SECURITY | Replay cache exceeded {} entries — possible flood attack. Clearing.",
-                MAX_REPLAY_ENTRIES
+            let replay_window_evict = std::time::Duration::from_secs(
+                std::env::var("DGP_CLOCK_SKEW_SECONDS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(300),
             );
-            cache.clear();
+            // First pass: evict expired entries
+            cache.retain(|_, instant| instant.elapsed() < replay_window_evict);
+            // If still over cap after eviction, log warning (genuine flood)
+            if cache.len() > MAX_REPLAY_ENTRIES {
+                warn!(
+                    "SECURITY | Replay cache still at {} entries after eviction — possible flood attack",
+                    cache.len()
+                );
+            }
         }
 
         let sig = &params.signature;
