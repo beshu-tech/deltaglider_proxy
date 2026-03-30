@@ -58,11 +58,11 @@ impl RateLimiter {
         let window_secs = std::env::var("DGP_RATE_LIMIT_WINDOW_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(900u64);
+            .unwrap_or(300u64); // 5 minutes
         let lockout_secs = std::env::var("DGP_RATE_LIMIT_LOCKOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(1800u64);
+            .unwrap_or(600u64); // 10 minutes
         tracing::info!(
             "Rate limiter: {} attempts per {}s window, {}s lockout",
             max_attempts,
