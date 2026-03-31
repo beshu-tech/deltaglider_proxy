@@ -63,33 +63,10 @@ jobs:
         if: always()
         run: sccache --show-stats
 
-  test-unit:
-    name: Unit Tests
+  test:
+    name: Tests
     runs-on: k3s
-    timeout-minutes: 15
-    container:
-      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: sccache stats (pre)
-        run: sccache --show-stats
-      - name: Build demo UI (required by rust-embed)
-        run: cd demo/s3-browser/ui && npm ci && npm run build
-      - name: cargo test --lib
-        env:
-          RUST_BACKTRACE: "1"
-        run: cargo test --lib --locked -- --nocapture
-      - name: sccache stats (post)
-        if: always()
-        run: sccache --show-stats
-
-  test-fast:
-    name: Integration Tests (fast)
-    runs-on: k3s
-    timeout-minutes: 15
+    timeout-minutes: 30
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       credentials:
@@ -103,6 +80,7 @@ jobs:
         run: cd demo/s3-browser/ui && npm ci && npm run build
       - name: Start MinIO for tests
         run: |
+          # Ephemeral MinIO for integration tests — NOT the sccache MinIO
           docker run -d --name minio-ci --network container:$(hostname) \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
@@ -113,34 +91,23 @@ jobs:
           done
           mc mb --ignore-existing local/deltaglider-test
           mc mb --ignore-existing local/deltaglider-data
+          # Exported as env var for interop tests — read by minio_endpoint() in tests/interop_test.rs
           echo "MINIO_ENDPOINT=http://localhost:9000" >> $GITHUB_ENV
       - name: Install DeltaGlider CLI
         run: |
+          # Builder image is rust:1-bookworm — install pip if missing
+          # NB: braces required — `||` has lower precedence than `&&` in shell
           command -v pip3 >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq python3-pip >/dev/null; }
           pip3 install --quiet --break-system-packages deltaglider
           deltaglider --version
-      - name: Fast integration tests
+      - name: cargo test (all, including interop)
         env:
           RUST_BACKTRACE: "1"
-        run: |
-          cargo test --locked --test auth_integration_test -- --nocapture
-          cargo test --locked --test concurrency_test -- --nocapture
-          cargo test --locked --test error_test -- --nocapture
-          cargo test --locked --test iam_authorization_test -- --nocapture
-          cargo test --locked --test iam_persona_test -- --nocapture
-          cargo test --locked --test iam_test -- --nocapture
-          cargo test --locked --test interop_test -- --include-ignored --nocapture
-          cargo test --locked --test list_truncation_test -- --nocapture
-          cargo test --locked --test metadata_validation_test -- --nocapture
-          cargo test --locked --test s3_api_test -- --nocapture
-          cargo test --locked --test s3_backend_test -- --nocapture
-          cargo test --locked --test s3_compat_test -- --nocapture
-          cargo test --locked --test s3_integration_test -- --nocapture
-          cargo test --locked --test storage_resilience_test -- --nocapture
-          cargo test --locked --test unmanaged_objects_test -- --nocapture
+        run: cargo test --all --locked -- --include-ignored --nocapture
       - name: Clean up MinIO test data
         if: always()
         run: |
+          # Persistent volumes — clean up interop test objects
           mc rm --recursive --force local/deltaglider-test/ 2>/dev/null || true
           mc rm --recursive --force local/deltaglider-data/ 2>/dev/null || true
       - name: sccache stats (post)
@@ -149,32 +116,6 @@ jobs:
       - name: Stop MinIO
         if: always()
         run: docker rm -f minio-ci 2>/dev/null || true
-
-  test-slow:
-    name: Integration Tests (slow - delta/optimization)
-    runs-on: k3s
-    timeout-minutes: 15
-    container:
-      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: sccache stats (pre)
-        run: sccache --show-stats
-      - name: Build demo UI (required by rust-embed)
-        run: cd demo/s3-browser/ui && npm ci && npm run build
-      - name: Slow integration tests (delta encoding, optimization)
-        env:
-          RUST_BACKTRACE: "1"
-        run: |
-          cargo test --locked --test delta_test -- --nocapture
-          cargo test --locked --test optimization_test -- --nocapture
-          cargo test --locked --test memory_test -- --nocapture
-      - name: sccache stats (post)
-        if: always()
-        run: sccache --show-stats
 
   audit:
     name: RustSec Audit
