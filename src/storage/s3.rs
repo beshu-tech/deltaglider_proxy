@@ -505,6 +505,43 @@ impl S3Backend {
         unreachable!("retry loop must return on every path")
     }
 
+    /// Classify a GetObject SDK error, mapping NoSuchKey to NotFound.
+    fn classify_get_error(
+        bucket: &str,
+        key: &str,
+        e: &SdkError<aws_sdk_s3::operation::get_object::GetObjectError>,
+    ) -> StorageError {
+        if let SdkError::ServiceError(service_error) = e {
+            if matches!(
+                service_error.err(),
+                aws_sdk_s3::operation::get_object::GetObjectError::NoSuchKey(_)
+            ) {
+                return StorageError::NotFound(key.to_string());
+            }
+        }
+        Self::classify_s3_error(bucket, e, S3Op::GetObject)
+    }
+
+    /// Convert an S3 response body into a streaming `BoxStream` of `Bytes` chunks.
+    /// Used by both `get_passthrough_stream` and `get_passthrough_stream_range`.
+    fn s3_body_to_stream(
+        body: aws_sdk_s3::primitives::ByteStream,
+    ) -> BoxStream<'static, Result<Bytes, StorageError>> {
+        Box::pin(futures::stream::unfold(body, |mut body| async {
+            match body.try_next().await {
+                Ok(Some(chunk)) => Some((Ok(chunk), body)),
+                Ok(None) => None,
+                Err(e) => Some((
+                    Err(StorageError::S3(format!(
+                        "Failed to read response body: {}",
+                        e
+                    ))),
+                    body,
+                )),
+            }
+        }))
+    }
+
     /// Get an object from S3
     async fn get_object(&self, bucket: &str, key: &str) -> Result<Vec<u8>, StorageError> {
         let response = self
@@ -514,17 +551,7 @@ impl S3Backend {
             .key(key)
             .send()
             .await
-            .map_err(|e| {
-                if let SdkError::ServiceError(service_error) = &e {
-                    if matches!(
-                        service_error.err(),
-                        aws_sdk_s3::operation::get_object::GetObjectError::NoSuchKey(_)
-                    ) {
-                        return StorageError::NotFound(key.to_string());
-                    }
-                }
-                Self::classify_s3_error(bucket, &e, S3Op::GetObject)
-            })?;
+            .map_err(|e| Self::classify_get_error(bucket, key, &e))?;
 
         let data = response
             .body
@@ -1152,35 +1179,11 @@ impl StorageBackend for S3Backend {
             .key(&key)
             .send()
             .await
-            .map_err(|e| {
-                if let SdkError::ServiceError(service_error) = &e {
-                    if matches!(
-                        service_error.err(),
-                        aws_sdk_s3::operation::get_object::GetObjectError::NoSuchKey(_)
-                    ) {
-                        return StorageError::NotFound(key.clone());
-                    }
-                }
-                Self::classify_s3_error(bucket, &e, S3Op::GetObject)
-            })?;
+            .map_err(|e| Self::classify_get_error(bucket, &key, &e))?;
 
         debug!("S3 GET stream {}/{}", bucket, key);
 
-        // Stream chunks directly from the S3 response body without buffering.
-        let stream = futures::stream::unfold(response.body, |mut body| async {
-            match body.try_next().await {
-                Ok(Some(chunk)) => Some((Ok(chunk), body)),
-                Ok(None) => None,
-                Err(e) => Some((
-                    Err(StorageError::S3(format!(
-                        "Failed to read response body: {}",
-                        e
-                    ))),
-                    body,
-                )),
-            }
-        });
-        Ok(Box::pin(stream))
+        Ok(Box::pin(Self::s3_body_to_stream(response.body)))
     }
 
     #[instrument(skip(self))]
@@ -1202,17 +1205,7 @@ impl StorageBackend for S3Backend {
             .range(&range_header)
             .send()
             .await
-            .map_err(|e| {
-                if let SdkError::ServiceError(service_error) = &e {
-                    if matches!(
-                        service_error.err(),
-                        aws_sdk_s3::operation::get_object::GetObjectError::NoSuchKey(_)
-                    ) {
-                        return StorageError::NotFound(key.clone());
-                    }
-                }
-                Self::classify_s3_error(bucket, &e, S3Op::GetObject)
-            })?;
+            .map_err(|e| Self::classify_get_error(bucket, &key, &e))?;
 
         let content_length = response.content_length.unwrap_or(0) as u64;
         debug!(
@@ -1220,20 +1213,10 @@ impl StorageBackend for S3Backend {
             bucket, key, range_header, content_length
         );
 
-        let stream = futures::stream::unfold(response.body, |mut body| async {
-            match body.try_next().await {
-                Ok(Some(chunk)) => Some((Ok(chunk), body)),
-                Ok(None) => None,
-                Err(e) => Some((
-                    Err(StorageError::S3(format!(
-                        "Failed to read response body: {}",
-                        e
-                    ))),
-                    body,
-                )),
-            }
-        });
-        Ok((Box::pin(stream), content_length))
+        Ok((
+            Box::pin(Self::s3_body_to_stream(response.body)),
+            content_length,
+        ))
     }
 
     // === Scanning operations ===
@@ -1358,32 +1341,8 @@ impl StorageBackend for S3Backend {
 
         let mut total = 0u64;
         for b in &buckets_to_scan {
-            let mut continuation_token: Option<String> = None;
-            loop {
-                let mut request = self.client.list_objects_v2().bucket(b);
-                if let Some(token) = continuation_token {
-                    request = request.continuation_token(token);
-                }
-
-                let response = request
-                    .send()
-                    .await
-                    .map_err(|e| Self::classify_s3_error(b, &e, S3Op::ListObjects))?;
-
-                if let Some(contents) = response.contents {
-                    for object in contents {
-                        if let Some(size) = object.size {
-                            total += size as u64;
-                        }
-                    }
-                }
-
-                if response.is_truncated.unwrap_or(false) {
-                    continuation_token = response.next_continuation_token;
-                } else {
-                    break;
-                }
-            }
+            let objects = self.list_objects_full(b, "").await?;
+            total += objects.iter().map(|o| o.size).sum::<u64>();
         }
 
         debug!("Total S3 storage size: {} bytes", total);
@@ -1395,39 +1354,12 @@ impl StorageBackend for S3Backend {
         bucket: &str,
         prefix: &str,
     ) -> Result<Vec<String>, StorageError> {
-        let mut markers = Vec::new();
-        let mut continuation_token: Option<String> = None;
-
-        loop {
-            let mut request = self.client.list_objects_v2().bucket(bucket).prefix(prefix);
-
-            if let Some(token) = continuation_token {
-                request = request.continuation_token(token);
-            }
-
-            let response = request
-                .send()
-                .await
-                .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::ListObjects))?;
-
-            if let Some(contents) = response.contents {
-                for object in contents {
-                    if let Some(key) = object.key {
-                        if key.ends_with('/') && object.size.unwrap_or(0) == 0 {
-                            markers.push(key);
-                        }
-                    }
-                }
-            }
-
-            if response.is_truncated.unwrap_or(false) {
-                continuation_token = response.next_continuation_token;
-            } else {
-                break;
-            }
-        }
-
-        Ok(markers)
+        let objects = self.list_objects_full(bucket, prefix).await?;
+        Ok(objects
+            .into_iter()
+            .filter(|o| o.key.ends_with('/') && o.size == 0)
+            .map(|o| o.key)
+            .collect())
     }
 
     /// Enrich listed objects with full metadata from bounded HEAD calls.
