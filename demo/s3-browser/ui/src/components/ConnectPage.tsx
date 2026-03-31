@@ -163,14 +163,15 @@ export default function ConnectPage({ onConnect, showError }: Props) {
         <div className="glass-card animate-fade-in" style={{ borderRadius: 14, padding: 'clamp(28px, 4vw, 40px)', width: '100%', maxWidth: 520 }}>
           <Space direction="vertical" size="large" style={{ width: '100%' }}>
             {recoveredHash ? (
-              /* Success state */
               <>
                 <div style={{ textAlign: 'center' }}>
                   <CheckCircleOutlined style={{ fontSize: 48, color: '#52c41a', marginBottom: 16 }} />
-                  <div style={{ fontSize: 18, fontWeight: 700, color: TEXT_PRIMARY }}>Database Recovered</div>
-                  <Text style={{ color: TEXT_MUTED, fontSize: 13, display: 'block', marginTop: 8 }}>
+                  <div style={{ fontSize: 18, fontWeight: 800, letterSpacing: 1, color: TEXT_PRIMARY, fontFamily: "var(--font-ui)" }}>
+                    Database Recovered
+                  </div>
+                  <div style={{ color: TEXT_MUTED, fontSize: 13, marginTop: 8, fontFamily: "var(--font-ui)" }}>
                     Update your configuration with this hash, then restart the server.
-                  </Text>
+                  </div>
                 </div>
                 <div style={{ background: 'var(--input-bg)', borderRadius: 10, padding: 16 }}>
                   <div style={{ marginBottom: 12 }}>
@@ -181,7 +182,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                     </div>
                   </div>
                   <div>
-                    <label style={{ fontSize: 11, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>Base64 (for Docker/env vars)</label>
+                    <label style={{ fontSize: 11, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>Base64 (for Docker / env vars)</label>
                     <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
                       <Input value={recoveredHash.base64} readOnly style={{ ...inputStyle, flex: 1, fontSize: 11 }} />
                       <Button icon={<CopyOutlined />} onClick={() => copyToClipboard(recoveredHash.base64, 'Base64 hash')} />
@@ -189,32 +190,41 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                   </div>
                 </div>
                 <Alert type="info" showIcon message={
-                  <span>Set <code>DGP_BOOTSTRAP_PASSWORD_HASH</code> in your environment or <code>bootstrap_password_hash</code> in your TOML config, then restart.</span>
+                  <span style={{ fontFamily: "var(--font-ui)", fontSize: 12 }}>
+                    Set <code style={{ fontFamily: "var(--font-mono)" }}>DGP_BOOTSTRAP_PASSWORD_HASH</code> in your environment
+                    or <code style={{ fontFamily: "var(--font-mono)" }}>bootstrap_password_hash</code> in your TOML config, then restart.
+                  </span>
                 } />
               </>
             ) : (
-              /* Recovery form */
               <>
                 <div style={{ textAlign: 'center' }}>
                   <WarningOutlined style={{ fontSize: 48, color: '#faad14', marginBottom: 16 }} />
-                  <div style={{ fontSize: 18, fontWeight: 700, color: TEXT_PRIMARY }}>Config Database Locked</div>
-                  <Text style={{ color: TEXT_MUTED, fontSize: 13, display: 'block', marginTop: 8 }}>
-                    The bootstrap password in your configuration does not match the encryption key of the existing IAM database. No IAM changes can be made until this is resolved.
-                  </Text>
+                  <div style={{ fontSize: 18, fontWeight: 800, letterSpacing: 1, color: TEXT_PRIMARY, fontFamily: "var(--font-ui)" }}>
+                    Config Database Locked
+                  </div>
+                  <div style={{ color: TEXT_MUTED, fontSize: 13, marginTop: 10, fontFamily: "var(--font-ui)", lineHeight: 1.6 }}>
+                    The bootstrap password hash in your configuration does not match the
+                    encryption key of the existing IAM database.
+                  </div>
+                  <div style={{ color: TEXT_FAINT, fontSize: 11, marginTop: 10, fontFamily: "var(--font-ui)", lineHeight: 1.6 }}>
+                    Paste the original <code style={{ fontFamily: "var(--font-mono)", fontSize: 10 }}>DGP_BOOTSTRAP_PASSWORD_HASH</code> value
+                    (bcrypt hash or its base64 encoding). Check your previous deployment config,
+                    environment variables, or <code style={{ fontFamily: "var(--font-mono)", fontSize: 10 }}>.deltaglider_bootstrap_hash</code> file.
+                  </div>
                 </div>
                 {recoveryError && <Alert type="error" message={recoveryError} showIcon />}
                 <div>
                   <label style={{ fontSize: 12, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)", marginBottom: 4, display: 'block' }}>
-                    Original Bootstrap Password
+                    Original Bootstrap Password Hash
                   </label>
-                  <Input.Password
+                  <Input.TextArea
                     value={recoveryPassword}
                     onChange={(e) => setRecoveryPassword(e.target.value)}
-                    onPressEnter={handleRecover}
-                    placeholder="Enter the password that was used to create the database"
-                    size="large"
+                    placeholder="$2b$12$... or base64-encoded hash"
                     autoFocus
-                    style={inputStyle}
+                    rows={2}
+                    style={{ ...inputStyle, height: 'auto', fontSize: 11 }}
                   />
                 </div>
                 <Button
@@ -224,9 +234,9 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                   loading={recoveryLoading}
                   disabled={!recoveryPassword.trim()}
                   onClick={handleRecover}
-                  style={{ height: 48, borderRadius: 10, fontWeight: 700, fontFamily: "var(--font-ui)", fontSize: 15 }}
+                  style={{ height: 48, borderRadius: 10, fontWeight: 700, fontFamily: "var(--font-ui)", fontSize: 15, letterSpacing: '0.02em', marginTop: 4 }}
                 >
-                  Try Password
+                  Try Hash
                 </Button>
               </>
             )}
