@@ -22,12 +22,17 @@ export default function ConnectPage({ onConnect, showError }: Props) {
   const [error, setError] = useState('');
   const [authMode, setAuthMode] = useState<'bootstrap' | 'iam' | 'open' | null>(null);
   const [detecting, setDetecting] = useState(true);
-  // Recovery wizard state
+  // Recovery wizard state — persist success in sessionStorage so refresh doesn't reset
   const [showRecovery, setShowRecovery] = useState(false);
   const [recoveryPassword, setRecoveryPassword] = useState('');
   const [recoveryLoading, setRecoveryLoading] = useState(false);
   const [recoveryError, setRecoveryError] = useState('');
-  const [recoveredHash, setRecoveredHash] = useState<{ hash: string; base64: string } | null>(null);
+  const [recoveredHash, setRecoveredHash] = useState<{ hash: string; base64: string } | null>(() => {
+    try {
+      const saved = sessionStorage.getItem('dg-recovered-hash');
+      return saved ? JSON.parse(saved) : null;
+    } catch { return null; }
+  });
   const [messageApi, contextHolder] = message.useMessage();
 
   // Detect auth mode on mount — show recovery wizard immediately if mismatch
@@ -115,10 +120,12 @@ export default function ConnectPage({ onConnect, showError }: Props) {
     try {
       const result = await recoverDb(recoveryPassword);
       if (result.success && result.correct_hash) {
-        setRecoveredHash({
+        const recovered = {
           hash: result.correct_hash,
           base64: result.correct_hash_base64 || '',
-        });
+        };
+        setRecoveredHash(recovered);
+        try { sessionStorage.setItem('dg-recovered-hash', JSON.stringify(recovered)); } catch {}
       } else {
         setRecoveryError(result.error || 'Password does not match');
       }
