@@ -766,6 +766,11 @@ async fn test_user_lifecycle_crud() {
 /// Multiple rapid auth failures should trigger rate limiting (progressive delay or lockout).
 #[tokio::test]
 async fn test_brute_force_rate_limiting() {
+    // Override rate limiter to small values for fast testing
+    std::env::set_var("DGP_RATE_LIMIT_MAX_ATTEMPTS", "5");
+    std::env::set_var("DGP_RATE_LIMIT_WINDOW_SECS", "60");
+    std::env::set_var("DGP_RATE_LIMIT_LOCKOUT_SECS", "60");
+
     let server = TestServer::builder()
         .auth("testkey", "testsecret")
         .build()
@@ -773,8 +778,9 @@ async fn test_brute_force_rate_limiting() {
 
     let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
 
-    // Send 15 rapid requests with wrong credentials from the same "IP"
+    // Send rapid requests with wrong credentials from the same "IP"
     // (via X-Forwarded-For header, trusted because DGP_TRUST_PROXY_HEADERS=true in tests)
+    // Rate limit overridden to 5 attempts for this test.
     let mut statuses = Vec::new();
     for i in 0..15 {
         let resp = build_signed_get(
@@ -804,7 +810,7 @@ async fn test_brute_force_rate_limiting() {
         );
     }
 
-    // Rate limiter threshold is 5 failures per 15-min window (default_auth()).
+    // Rate limiter threshold overridden to 5 failures for this test.
     // After 15 rapid failures, we must see 503 SlowDown responses.
     let rate_limited_count = statuses
         .iter()
@@ -814,9 +820,9 @@ async fn test_brute_force_rate_limiting() {
     // At least some requests after the 5th should be rate-limited
     assert!(
         rate_limited_count > 0,
-        "expected rate limiting after 15 failures, but all {} responses were: {:?}",
+        "expected rate limiting after 5+ failures, but all {} responses were: {:?}",
         statuses.len(),
-        statuses
+        statuses.iter().map(|s| s.as_u16()).collect::<Vec<_>>()
     );
 
     // Verify the server didn't crash — no 500s
