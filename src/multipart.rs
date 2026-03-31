@@ -176,7 +176,9 @@ impl MultipartStore {
         key: &str,
         requested_parts: &[(u32, String)], // (part_number, etag)
     ) -> Result<CompletedUpload, S3Error> {
-        let uploads = self.uploads.read();
+        // Take write lock to prevent double-completion race: validates, assembles,
+        // and removes the upload atomically so a concurrent complete() sees NoSuchUpload.
+        let mut uploads = self.uploads.write();
         let (validated, upload) =
             self.validate_parts(&uploads, upload_id, bucket, key, requested_parts)?;
 
@@ -185,12 +187,17 @@ impl MultipartStore {
             assembled.extend_from_slice(part);
         }
 
-        Ok(CompletedUpload {
+        let result = CompletedUpload {
             data: assembled.freeze(),
             etag: validated.etag,
             content_type: upload.content_type.clone(),
             user_metadata: upload.user_metadata.clone(),
-        })
+        };
+
+        // Remove under the same write lock — second complete() will get NoSuchUpload
+        uploads.remove(upload_id);
+
+        Ok(result)
     }
 
     /// Return ordered part data without assembling into a contiguous buffer.
@@ -204,17 +211,22 @@ impl MultipartStore {
         key: &str,
         requested_parts: &[(u32, String)],
     ) -> Result<CompletedParts, S3Error> {
-        let uploads = self.uploads.read();
+        // Write lock for same reason as complete() — atomic validate + remove
+        let mut uploads = self.uploads.write();
         let (validated, upload) =
             self.validate_parts(&uploads, upload_id, bucket, key, requested_parts)?;
 
-        Ok(CompletedParts {
+        let result = CompletedParts {
             parts: validated.part_data,
             etag: validated.etag,
             total_size: validated.total_size,
             content_type: upload.content_type.clone(),
             user_metadata: upload.user_metadata.clone(),
-        })
+        };
+
+        uploads.remove(upload_id);
+
+        Ok(result)
     }
 
     /// Shared validation for `complete()` and `complete_parts()`.

@@ -46,6 +46,17 @@ fn validate_bucket(name: &str) -> Result<(), S3Error> {
             "Bucket name must not contain consecutive dots".to_string(),
         ));
     }
+    // Must start and end with alphanumeric (S3 spec)
+    if !name.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+        return Err(S3Error::InvalidBucketName(
+            "Bucket name must start with a letter or number".to_string(),
+        ));
+    }
+    if !name.ends_with(|c: char| c.is_ascii_alphanumeric()) {
+        return Err(S3Error::InvalidBucketName(
+            "Bucket name must end with a letter or number".to_string(),
+        ));
+    }
     Ok(())
 }
 

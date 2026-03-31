@@ -13,10 +13,10 @@ use tracing::{debug, instrument, warn};
 /// Maximum time to wait for xdelta3 subprocess to complete.
 /// Default 60s is generous for 100MB max object size — xdelta3 typically
 /// processes 100MB in <5s. Hung processes are killed to prevent cascading.
-/// Override via `DGP_codec_timeout()_SECS` for testing or constrained environments.
+/// Override via `DGP_CODEC_TIMEOUT_SECS` for testing or constrained environments.
 fn codec_timeout() -> Duration {
     Duration::from_secs(
-        std::env::var("DGP_codec_timeout()_SECS")
+        std::env::var("DGP_CODEC_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(60),

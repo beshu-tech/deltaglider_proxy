@@ -121,15 +121,26 @@ impl SessionStore {
                 if info.created_at.elapsed() >= self.ttl {
                     return false;
                 }
-                // If the session has a stored IP, the caller's IP must match
-                if let (Some(stored_ip), Some(caller_ip)) = (info.ip, ip) {
-                    if stored_ip != caller_ip {
-                        tracing::warn!(
-                            "Session IP mismatch: stored={}, caller={}",
-                            stored_ip,
-                            caller_ip
-                        );
-                        return false;
+                // If the session was created with an IP, the caller must provide
+                // a matching IP. Missing IP (None) does not bypass the check.
+                if let Some(stored_ip) = info.ip {
+                    match ip {
+                        Some(caller_ip) if caller_ip == stored_ip => {}
+                        Some(caller_ip) => {
+                            tracing::warn!(
+                                "Session IP mismatch: stored={}, caller={}",
+                                stored_ip,
+                                caller_ip
+                            );
+                            return false;
+                        }
+                        None => {
+                            tracing::warn!(
+                                "Session has IP binding ({}) but caller provided no IP",
+                                stored_ip
+                            );
+                            return false;
+                        }
                     }
                 }
                 true
@@ -217,8 +228,8 @@ mod tests {
         assert!(store.validate(&token, Some(ip1)));
         // Different IP rejected
         assert!(!store.validate(&token, Some(ip2)));
-        // No caller IP provided — passes (graceful for proxies that strip IP)
-        assert!(store.validate(&token, None));
+        // No caller IP provided — rejected (session has IP binding)
+        assert!(!store.validate(&token, None));
     }
 
     #[test]

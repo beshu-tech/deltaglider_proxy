@@ -126,11 +126,11 @@ pub async fn bucket_get_handler(
     let pagination_token = if is_v2 {
         if let Some(ref token) = query.continuation_token {
             // Gap 5: base64-decode the incoming continuation token
-            let decoded = BASE64
+            let bytes = BASE64
                 .decode(token)
-                .ok()
-                .and_then(|bytes| String::from_utf8(bytes).ok())
-                .unwrap_or_else(|| token.clone());
+                .map_err(|_| S3Error::InvalidArgument("Invalid continuation token".into()))?;
+            let decoded = String::from_utf8(bytes)
+                .map_err(|_| S3Error::InvalidArgument("Invalid continuation token".into()))?;
             Some(decoded)
         } else {
             // Gap 2: when no continuation-token, use start-after as pagination start
