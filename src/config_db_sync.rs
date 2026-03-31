@@ -253,4 +253,30 @@ impl ConfigDbSync {
     pub async fn poll_and_sync(&self) -> Result<bool, String> {
         self.download_if_newer().await
     }
+
+    /// Download the raw config DB bytes from S3 without passphrase validation.
+    /// Used by the recovery endpoint to try candidate passwords against the S3 copy.
+    pub async fn download_raw(&self) -> Result<Vec<u8>, String> {
+        let get_result = self
+            .s3_client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(S3_CONFIG_KEY)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to download config DB from S3: {}", e))?;
+
+        let body = get_result
+            .body
+            .collect()
+            .await
+            .map_err(|e| format!("Failed to read config DB body from S3: {}", e))?;
+
+        let data = body.into_bytes().to_vec();
+        if data.is_empty() {
+            return Err("Config DB in S3 is empty".to_string());
+        }
+
+        Ok(data)
+    }
 }

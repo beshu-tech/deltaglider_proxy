@@ -282,6 +282,7 @@ export async function removeGroupMember(groupId: number, userId: number): Promis
 export interface WhoamiResponse {
   mode: 'bootstrap' | 'iam' | 'open';
   user: { name: string; access_key_id: string; is_admin: boolean } | null;
+  config_db_mismatch?: boolean;
 }
 
 export async function whoami(): Promise<WhoamiResponse> {
@@ -348,4 +349,20 @@ export async function loginAs(accessKeyId: string, secretAccessKey: string): Pro
   });
   if (res.ok) return { ok: true };
   return { ok: false, error: 'Admin access denied — invalid credentials or insufficient permissions' };
+}
+
+// === Config DB Recovery ===
+
+export interface RecoverDbResponse {
+  success: boolean;
+  correct_hash?: string;
+  correct_hash_base64?: string;
+  error?: string;
+}
+
+export async function recoverDb(candidatePassword: string): Promise<RecoverDbResponse> {
+  const res = await adminFetch('/api/admin/recover-db', 'POST', {
+    candidate_password: candidatePassword,
+  });
+  return safeJson(res);
 }

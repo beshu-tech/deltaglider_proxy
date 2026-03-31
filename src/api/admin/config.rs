@@ -650,3 +650,179 @@ pub async fn test_s3_connection(
         }),
     }
 }
+
+// ============================================================================
+// Config DB recovery
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct RecoverDbRequest {
+    candidate_password: String,
+}
+
+#[derive(Serialize)]
+pub struct RecoverDbResponse {
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    correct_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    correct_hash_base64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// POST /api/admin/recover-db — try a candidate password against the locked config DB.
+///
+/// Only available when `config_db_mismatch` is true. Returns the correct bcrypt
+/// hash (and base64 version) if the candidate password successfully decrypts the DB.
+pub async fn recover_db(
+    State(state): State<Arc<AdminState>>,
+    headers: HeaderMap,
+    Json(body): Json<RecoverDbRequest>,
+) -> impl IntoResponse {
+    if !state.config_db_mismatch {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(RecoverDbResponse {
+                success: false,
+                correct_hash: None,
+                correct_hash_base64: None,
+                error: Some("No config DB mismatch detected".into()),
+            }),
+        );
+    }
+
+    // Rate limit recovery attempts
+    let client_ip = crate::rate_limiter::extract_client_ip(&headers);
+    if let Some(ip) = &client_ip {
+        if state.rate_limiter.is_limited(ip) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(RecoverDbResponse {
+                    success: false,
+                    correct_hash: None,
+                    correct_hash_base64: None,
+                    error: Some("Too many attempts — try again later".into()),
+                }),
+            );
+        }
+    }
+
+    // Hash the candidate password
+    let candidate_hash = match bcrypt::hash(&body.candidate_password, bcrypt::DEFAULT_COST) {
+        Ok(h) => h,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(RecoverDbResponse {
+                    success: false,
+                    correct_hash: None,
+                    correct_hash_base64: None,
+                    error: Some(format!("Failed to hash password: {}", e)),
+                }),
+            );
+        }
+    };
+
+    // Try local .db.bak first
+    let bak_path = crate::config_db::config_db_path().with_extension("db.bak");
+    let try_path = if bak_path.exists() {
+        Some(bak_path)
+    } else {
+        // Try S3 fallback if config_sync is enabled
+        if let Some(ref sync) = state.config_sync {
+            match sync.download_raw().await {
+                Ok(data) => {
+                    let tmp_path = crate::config_db::config_db_path().with_extension("db.recovery");
+                    if let Err(e) = std::fs::write(&tmp_path, &data) {
+                        tracing::warn!("Failed to write recovery temp file: {}", e);
+                        None
+                    } else {
+                        Some(tmp_path)
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to download config DB from S3 for recovery: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
+    let Some(db_path) = try_path else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(RecoverDbResponse {
+                success: false,
+                correct_hash: None,
+                correct_hash_base64: None,
+                error: Some(
+                    "No config database found to recover (no .bak file and no S3 copy)".into(),
+                ),
+            }),
+        );
+    };
+
+    // Try to open with the candidate hash
+    match crate::config_db::ConfigDb::open_or_create(&db_path, &candidate_hash) {
+        Ok(_db) => {
+            // Success! Clean up recovery temp file if it was from S3
+            if db_path
+                .extension()
+                .map(|e| e == "recovery")
+                .unwrap_or(false)
+            {
+                let _ = std::fs::remove_file(&db_path);
+            }
+
+            // Reset rate limiter on success
+            if let Some(ip) = &client_ip {
+                state.rate_limiter.record_success(ip);
+            }
+
+            let hash_base64 = base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                candidate_hash.as_bytes(),
+            );
+
+            audit_log("recover_db_success", "admin", "", &headers);
+
+            (
+                StatusCode::OK,
+                Json(RecoverDbResponse {
+                    success: true,
+                    correct_hash: Some(candidate_hash),
+                    correct_hash_base64: Some(hash_base64),
+                    error: None,
+                }),
+            )
+        }
+        Err(_) => {
+            // Clean up recovery temp file
+            if db_path
+                .extension()
+                .map(|e| e == "recovery")
+                .unwrap_or(false)
+            {
+                let _ = std::fs::remove_file(&db_path);
+            }
+
+            // Record failure for rate limiting
+            if let Some(ip) = &client_ip {
+                state.rate_limiter.record_failure(ip);
+            }
+
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(RecoverDbResponse {
+                    success: false,
+                    correct_hash: None,
+                    correct_hash_base64: None,
+                    error: Some("Password does not match the encrypted database".into()),
+                }),
+            )
+        }
+    }
+}

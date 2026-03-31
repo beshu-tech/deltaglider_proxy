@@ -258,7 +258,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         move || sessions.cleanup_expired()
     });
     let shared_config = config.clone().into_shared();
-    let config_db = init_config_db(&admin_password_hash, &iam_state);
+    let (config_db, config_db_mismatch) = init_config_db(&admin_password_hash, &iam_state);
 
     // --- Config DB S3 sync ---
     let config_sync = init_config_sync(&config, &admin_password_hash, &config_db, &iam_state).await;
@@ -279,6 +279,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         usage_scanner: Arc::new(UsageScanner::new()),
         rate_limiter,
         config_sync,
+        config_db_mismatch,
     });
 
     // --- TLS ---

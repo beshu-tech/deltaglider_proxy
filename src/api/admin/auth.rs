@@ -39,6 +39,8 @@ pub struct WhoamiQuery {}
 #[derive(Serialize)]
 pub struct WhoamiResponse {
     mode: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    config_db_mismatch: bool,
 }
 
 #[derive(Deserialize)]
@@ -241,7 +243,10 @@ pub async fn whoami(
         IamState::Legacy(_) => "bootstrap",
         IamState::Iam(_) => "iam",
     };
-    Json(WhoamiResponse { mode: mode.into() })
+    Json(WhoamiResponse {
+        mode: mode.into(),
+        config_db_mismatch: state.config_db_mismatch,
+    })
 }
 
 /// POST /api/admin/login-as — create admin session for an IAM user with admin permissions.
