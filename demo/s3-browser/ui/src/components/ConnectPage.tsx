@@ -30,10 +30,15 @@ export default function ConnectPage({ onConnect, showError }: Props) {
   const [recoveredHash, setRecoveredHash] = useState<{ hash: string; base64: string } | null>(null);
   const [messageApi, contextHolder] = message.useMessage();
 
-  // Detect auth mode on mount
+  // Detect auth mode on mount — show recovery wizard immediately if mismatch
   useEffect(() => {
     whoami()
-      .then(info => setAuthMode(info.mode as 'bootstrap' | 'iam' | 'open'))
+      .then(info => {
+        setAuthMode(info.mode as 'bootstrap' | 'iam' | 'open');
+        if (info.config_db_mismatch) {
+          setShowRecovery(true);
+        }
+      })
       .catch(() => {})
       .finally(() => setDetecting(false));
   }, []);
