@@ -11,9 +11,17 @@ use thiserror::Error;
 use tracing::{debug, instrument, warn};
 
 /// Maximum time to wait for xdelta3 subprocess to complete.
-/// 60 seconds is generous for 100MB max object size — xdelta3 typically
+/// Default 60s is generous for 100MB max object size — xdelta3 typically
 /// processes 100MB in <5s. Hung processes are killed to prevent cascading.
-const CODEC_TIMEOUT: Duration = Duration::from_secs(60);
+/// Override via `DGP_codec_timeout()_SECS` for testing or constrained environments.
+fn codec_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("DGP_codec_timeout()_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60),
+    )
+}
 
 /// Wait for a child process with a timeout. Kills the child if the deadline is exceeded.
 fn wait_with_timeout(
@@ -91,7 +99,7 @@ fn pipe_stdin_stdout_stderr(
     ));
 
     std::thread::scope(|s| {
-        // Watchdog: kills the child if pipe I/O takes longer than CODEC_TIMEOUT.
+        // Watchdog: kills the child if pipe I/O takes longer than codec_timeout().
         // When the child is killed, its pipe ends close, unblocking the reader
         // threads. Without this, a hung xdelta3 blocks read_to_end() forever
         // and the codec semaphore slot is permanently lost.
@@ -261,13 +269,13 @@ impl DeltaCodec {
                     target,
                     self.max_size,
                     child_id,
-                    CODEC_TIMEOUT,
+                    codec_timeout(),
                 );
                 write_result?;
                 let delta = delta?;
                 let stderr_bytes = stderr_result.unwrap_or_default();
 
-                let status = wait_with_timeout(&mut child, CODEC_TIMEOUT)?;
+                let status = wait_with_timeout(&mut child, codec_timeout())?;
                 if status.success() {
                     debug!(
                         "Delta encoded: {} bytes (ratio: {:.2}%)",
@@ -348,13 +356,13 @@ impl DeltaCodec {
                     delta,
                     self.max_size,
                     child_id,
-                    CODEC_TIMEOUT,
+                    codec_timeout(),
                 );
                 write_result?;
                 let target = target?;
                 let stderr_bytes = stderr_result.unwrap_or_default();
 
-                let status = wait_with_timeout(&mut child, CODEC_TIMEOUT)?;
+                let status = wait_with_timeout(&mut child, codec_timeout())?;
                 if status.success() {
                     debug!("Delta decoded: {} bytes", target.len());
                     Ok(target)
