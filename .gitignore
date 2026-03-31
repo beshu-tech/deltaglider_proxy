@@ -19,7 +19,6 @@ data/
 deltaglider_proxy.toml
 .deltaglider_admin_hash
 .deltaglider_bootstrap_hash
-deltaglider_config.db
 
 # Personal notes (not part of the project)
 MY_NOTES_DONT_COMMIT.txt
@@ -36,5 +35,6 @@ Thumbs.db
 
 # Environment
 .env
-.env.*deltaglider_config.db.bak
 deltaglider_config.db
+deltaglider_config.db.bak
+deltaglider_config.db.recovery
