@@ -17,6 +17,7 @@ export const darkTheme = {
     colorError: '#fb7185',
     colorWarning: '#fbbf24',
     colorTextBase: '#e4e9f2',
+    fontSize: 14,
     borderRadius: 8,
     fontFamilyCode: "'JetBrains Mono', 'Fira Code', monospace",
   },

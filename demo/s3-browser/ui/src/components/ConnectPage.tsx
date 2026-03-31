@@ -14,7 +14,7 @@ interface Props {
 }
 
 export default function ConnectPage({ onConnect, showError }: Props) {
-  const { BORDER, TEXT_MUTED, TEXT_FAINT, TEXT_PRIMARY, ACCENT_BLUE } = useColors();
+  const { BORDER, TEXT_MUTED, TEXT_FAINT, TEXT_PRIMARY, TEXT_SECONDARY, ACCENT_BLUE } = useColors();
   const [accessKey, setAccessKey] = useState('');
   const [secretKey, setSecretKey] = useState('');
   const [adminPassword, setAdminPassword] = useState('');
@@ -171,13 +171,15 @@ export default function ConnectPage({ onConnect, showError }: Props) {
           <Space direction="vertical" size="large" style={{ width: '100%' }}>
             {recoveredHash ? (
               <>
-                <div style={{ textAlign: 'center' }}>
-                  <CheckCircleOutlined style={{ fontSize: 48, color: '#52c41a', marginBottom: 16 }} />
-                  <div style={{ fontSize: 18, fontWeight: 800, letterSpacing: 1, color: TEXT_PRIMARY, fontFamily: "var(--font-ui)" }}>
-                    Database Recovered
+                <div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
+                    <CheckCircleOutlined style={{ fontSize: 28, color: '#52c41a', flexShrink: 0 }} />
+                    <div style={{ fontSize: 20, fontWeight: 700, color: TEXT_PRIMARY, fontFamily: "var(--font-ui)" }}>
+                      Database Recovered
+                    </div>
                   </div>
-                  <div style={{ color: TEXT_MUTED, fontSize: 13, marginTop: 8, fontFamily: "var(--font-ui)" }}>
-                    Update your configuration with this hash, then restart the server.
+                  <div style={{ color: TEXT_SECONDARY, fontSize: 14, fontFamily: "var(--font-ui)", lineHeight: 1.7 }}>
+                    Update your configuration with the hash below, then restart the server.
                   </div>
                 </div>
                 <div style={{ background: 'var(--input-bg)', borderRadius: 10, padding: 16 }}>
@@ -205,24 +207,26 @@ export default function ConnectPage({ onConnect, showError }: Props) {
               </>
             ) : (
               <>
-                <div style={{ textAlign: 'center' }}>
-                  <WarningOutlined style={{ fontSize: 48, color: '#faad14', marginBottom: 16 }} />
-                  <div style={{ fontSize: 18, fontWeight: 800, letterSpacing: 1, color: TEXT_PRIMARY, fontFamily: "var(--font-ui)" }}>
-                    Config Database Locked
+                <div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
+                    <WarningOutlined style={{ fontSize: 28, color: '#faad14', flexShrink: 0 }} />
+                    <div style={{ fontSize: 20, fontWeight: 700, color: TEXT_PRIMARY, fontFamily: "var(--font-ui)" }}>
+                      Config Database Locked
+                    </div>
                   </div>
-                  <div style={{ color: TEXT_MUTED, fontSize: 13, marginTop: 10, fontFamily: "var(--font-ui)", lineHeight: 1.6 }}>
+                  <div style={{ color: TEXT_SECONDARY, fontSize: 14, lineHeight: 1.7, fontFamily: "var(--font-ui)" }}>
                     The bootstrap password hash in your configuration does not match the
-                    encryption key of the existing IAM database.
+                    encryption key of the existing IAM database. S3 API access is blocked until resolved.
                   </div>
-                  <div style={{ color: TEXT_FAINT, fontSize: 11, marginTop: 10, fontFamily: "var(--font-ui)", lineHeight: 1.6 }}>
-                    Paste the original <code style={{ fontFamily: "var(--font-mono)", fontSize: 10 }}>DGP_BOOTSTRAP_PASSWORD_HASH</code> value
-                    (bcrypt hash or its base64 encoding). Check your previous deployment config,
-                    environment variables, or <code style={{ fontFamily: "var(--font-mono)", fontSize: 10 }}>.deltaglider_bootstrap_hash</code> file.
+                  <div style={{ color: TEXT_MUTED, fontSize: 13, marginTop: 12, lineHeight: 1.7, fontFamily: "var(--font-ui)" }}>
+                    Paste the original <code style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: ACCENT_BLUE }}>DGP_BOOTSTRAP_PASSWORD_HASH</code> value
+                    below. Check your previous deployment config, environment variables,
+                    or <code style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: ACCENT_BLUE }}>.deltaglider_bootstrap_hash</code> file.
                   </div>
                 </div>
                 {recoveryError && <Alert type="error" message={recoveryError} showIcon />}
                 <div>
-                  <label style={{ fontSize: 12, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)", marginBottom: 4, display: 'block' }}>
+                  <label style={{ fontSize: 13, fontWeight: 600, color: TEXT_SECONDARY, fontFamily: "var(--font-ui)", marginBottom: 6, display: 'block' }}>
                     Original Bootstrap Password Hash
                   </label>
                   <Input.TextArea
@@ -231,7 +235,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                     placeholder="$2b$12$... or base64-encoded hash"
                     autoFocus
                     rows={2}
-                    style={{ ...inputStyle, height: 'auto', fontSize: 11 }}
+                    style={{ ...inputStyle, height: 'auto', fontSize: 13 }}
                   />
                 </div>
                 <Button

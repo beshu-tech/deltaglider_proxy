@@ -9,8 +9,8 @@ const darkColors = {
   BORDER: '#1e2d45',
   TEXT_PRIMARY: '#e4e9f2',
   TEXT_SECONDARY: '#8b99b0',
-  TEXT_MUTED: '#5c6d85',
-  TEXT_FAINT: '#3d4f66',
+  TEXT_MUTED: '#8494ab',
+  TEXT_FAINT: '#5e7290',
   ACCENT_BLUE: '#2dd4bf',     // teal as primary accent
   ACCENT_BLUE_LIGHT: '#5eead4',
   ACCENT_GREEN: '#34d399',
