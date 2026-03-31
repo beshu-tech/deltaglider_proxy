@@ -6,7 +6,7 @@
 mod common;
 
 use common::{
-    generate_binary, get_bytes, head_headers, list_objects_raw, mutate_binary,
+    generate_binary, get_bytes, head_headers, list_objects_raw, mutate_binary, put_object,
     put_and_get_storage_type, TestServer,
 };
 
@@ -555,5 +555,107 @@ async fn test_first_file_bad_delta_ratio_passthrough() {
     assert_eq!(
         retrieved, data,
         "Passthrough file should round-trip correctly"
+    );
+}
+
+// ============================================================================
+// Range request on delta-reconstructed file
+// ============================================================================
+
+/// Range GET on a delta-stored file must return the correct byte slice
+/// of the reconstructed content (not the raw delta bytes).
+#[tokio::test]
+async fn test_range_request_on_delta_file() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+
+    // Upload base + variant to create a delta
+    let base = generate_binary(100_000, 42);
+    let variant = mutate_binary(&base, 0.01);
+
+    put_object(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        "range_delta/base.zip",
+        base,
+        "application/zip",
+    )
+    .await;
+    put_object(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        "range_delta/v1.zip",
+        variant.clone(),
+        "application/zip",
+    )
+    .await;
+
+    // Full GET to get expected content
+    let full_body = get_bytes(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        "range_delta/v1.zip",
+    )
+    .await;
+    assert_eq!(full_body.len(), variant.len(), "full GET size mismatch");
+
+    // Range GET: first 100 bytes
+    let url = format!(
+        "{}/{}/range_delta/v1.zip",
+        server.endpoint(),
+        server.bucket()
+    );
+    let resp = http
+        .get(&url)
+        .header("Range", "bytes=0-99")
+        .send()
+        .await
+        .expect("range GET failed");
+
+    assert_eq!(
+        resp.status().as_u16(),
+        206,
+        "expected 206 Partial Content, got {}",
+        resp.status()
+    );
+
+    let content_range = resp
+        .headers()
+        .get("content-range")
+        .expect("missing Content-Range header")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        content_range.starts_with("bytes 0-99/"),
+        "Content-Range should start with 'bytes 0-99/', got: {}",
+        content_range
+    );
+
+    let range_body = resp.bytes().await.unwrap();
+    assert_eq!(range_body.len(), 100, "range body should be 100 bytes");
+    assert_eq!(
+        &range_body[..],
+        &full_body[..100],
+        "range bytes must match first 100 bytes of full GET"
+    );
+
+    // Range GET: last 50 bytes
+    let resp = http
+        .get(&url)
+        .header("Range", "bytes=-50")
+        .send()
+        .await
+        .expect("range GET (suffix) failed");
+    assert_eq!(resp.status().as_u16(), 206);
+    let range_body = resp.bytes().await.unwrap();
+    assert_eq!(range_body.len(), 50);
+    assert_eq!(
+        &range_body[..],
+        &full_body[full_body.len() - 50..],
+        "suffix range bytes must match last 50 bytes of full GET"
     );
 }

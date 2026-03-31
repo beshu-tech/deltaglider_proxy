@@ -548,6 +548,78 @@ mod tests {
     }
 
     #[test]
+    fn test_complete_with_zero_parts() {
+        let store = MultipartStore::new(100 * 1024 * 1024);
+        let upload_id = store
+            .create("bucket", "key.bin", None, HashMap::new())
+            .unwrap();
+        store
+            .upload_part(
+                &upload_id,
+                "bucket",
+                "key.bin",
+                1,
+                Bytes::from(vec![1u8; 100]),
+            )
+            .unwrap();
+
+        // Complete with empty parts list should fail
+        let result = store.complete(&upload_id, "bucket", "key.bin", &[]);
+        assert!(result.is_err(), "complete with zero parts should fail");
+    }
+
+    #[test]
+    fn test_complete_with_wrong_etag() {
+        let store = MultipartStore::new(100 * 1024 * 1024);
+        let upload_id = store
+            .create("bucket", "key.bin", None, HashMap::new())
+            .unwrap();
+        store
+            .upload_part(
+                &upload_id,
+                "bucket",
+                "key.bin",
+                1,
+                Bytes::from(vec![1u8; 100]),
+            )
+            .unwrap();
+
+        // Complete with wrong etag should fail
+        let result = store.complete(
+            &upload_id,
+            "bucket",
+            "key.bin",
+            &[(1, "\"wrong_etag\"".to_string())],
+        );
+        assert!(result.is_err(), "complete with wrong etag should fail");
+    }
+
+    #[test]
+    fn test_complete_with_non_contiguous_parts() {
+        let store = MultipartStore::new(100 * 1024 * 1024);
+        let upload_id = store
+            .create("bucket", "key.bin", None, HashMap::new())
+            .unwrap();
+
+        let part1 = Bytes::from(vec![1u8; 100]);
+        let part3 = Bytes::from(vec![3u8; 100]);
+        let etag1 = store
+            .upload_part(&upload_id, "bucket", "key.bin", 1, part1)
+            .unwrap();
+        let etag3 = store
+            .upload_part(&upload_id, "bucket", "key.bin", 3, part3)
+            .unwrap();
+
+        // Parts 1 and 3 (skip 2) — should succeed per S3 spec
+        let result = store
+            .complete(&upload_id, "bucket", "key.bin", &[(1, etag1), (3, etag3)])
+            .unwrap();
+        assert_eq!(result.data.len(), 200);
+        assert_eq!(&result.data[..100], &[1u8; 100]);
+        assert_eq!(&result.data[100..], &[3u8; 100]);
+    }
+
+    #[test]
     fn test_max_uploads_limit() {
         let store = MultipartStore::new(100 * 1024 * 1024);
         // Override max_uploads for testing
