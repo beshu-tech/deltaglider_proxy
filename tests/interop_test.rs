@@ -185,8 +185,14 @@ impl TestProxyServer {
         let stderr_file =
             std::fs::File::create(&stderr_path).expect("Failed to create proxy stderr log");
 
+        // Point DGP_CONFIG to temp dir so each test gets its own config DB
+        // (prevents interference from .db.bak files left by other tests)
+        let config_path = data_dir.path().join("deltaglider_proxy.toml");
+        std::fs::write(&config_path, "").expect("Failed to create empty config");
+
         let process = cmd
             .env("DGP_LISTEN_ADDR", format!("127.0.0.1:{}", port))
+            .env("DGP_CONFIG", config_path.to_str().unwrap())
             .env("DGP_S3_ENDPOINT", minio_endpoint())
             .env("DGP_S3_REGION", "us-east-1")
             .env("DGP_S3_PATH_STYLE", "true")
