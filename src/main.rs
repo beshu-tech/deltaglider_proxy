@@ -240,17 +240,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // --- IAM ---
     let iam_state = init_iam_state(&config);
 
-    // --- S3 router ---
-    let app = build_s3_router(
-        &state,
-        &iam_state,
-        &metrics,
-        &rate_limiter,
-        &replay_cache,
-        &config,
-    );
-
-    // --- Admin / sessions / config DB ---
+    // --- Admin / sessions / config DB (must be before S3 router for mismatch guard) ---
     let admin_password_hash = config.ensure_bootstrap_password_hash();
     let session_store = Arc::new(SessionStore::new());
     spawn_periodic(Duration::from_secs(300), {
@@ -259,6 +249,17 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     });
     let shared_config = config.clone().into_shared();
     let (config_db, config_db_mismatch) = init_config_db(&admin_password_hash, &iam_state);
+
+    // --- S3 router ---
+    let app = build_s3_router(
+        &state,
+        &iam_state,
+        &metrics,
+        &rate_limiter,
+        &replay_cache,
+        &config,
+        config_db_mismatch,
+    );
 
     // --- Config DB S3 sync ---
     let config_sync = init_config_sync(&config, &admin_password_hash, &config_db, &iam_state).await;

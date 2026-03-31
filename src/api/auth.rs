@@ -382,6 +382,20 @@ pub async fn sigv4_auth_middleware(
         }
     };
 
+    // If config DB mismatch is active, reject ALL S3 requests.
+    // The proxy must not serve data without authentication.
+    if request
+        .extensions()
+        .get::<crate::api::ConfigDbMismatchGuard>()
+        .is_some()
+    {
+        return Err(crate::api::S3Error::InternalError(
+            "Service unavailable — bootstrap password mismatch. Use admin GUI (/_/) to recover."
+                .into(),
+        )
+        .into_response());
+    }
+
     // Determine auth mode from IamState
     let iam_state = match iam_snapshot.as_deref() {
         Some(state) => state,
