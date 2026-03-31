@@ -80,8 +80,6 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         // Usage scanner
         .route("/_/api/admin/usage/scan", post(admin::scan_usage))
         .route("/_/api/admin/usage", get(admin::get_usage))
-        // Config DB recovery
-        .route("/_/api/admin/recover-db", post(admin::recover_db))
         .layer(middleware::from_fn_with_state(
             admin_state.clone(),
             admin::require_session,
@@ -97,6 +95,9 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         .route("/_/api/admin/login-as", post(admin::login_as))
         .route("/_/api/admin/policies", get(admin::get_canned_policies))
         .route("/_/api/whoami", get(admin::whoami))
+        // Recovery endpoint is public — the bootstrap hash may be invalid,
+        // making session login impossible. Rate-limited internally.
+        .route("/_/api/admin/recover-db", post(admin::recover_db))
         .with_state(admin_state.clone());
 
     // Health check (unauthenticated — needed for load balancer probes)

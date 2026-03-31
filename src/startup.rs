@@ -220,6 +220,8 @@ pub fn init_iam_state(config: &Config) -> SharedIamState {
 }
 
 /// Build the S3-compatible router with all routes and middleware layers.
+use deltaglider_proxy::api::ConfigDbMismatchGuard;
+
 pub fn build_s3_router(
     state: &Arc<AppState>,
     iam_state: &SharedIamState,
@@ -227,6 +229,7 @@ pub fn build_s3_router(
     rate_limiter: &RateLimiter,
     replay_cache: &deltaglider_proxy::api::auth::ReplayCache,
     config: &Config,
+    config_db_mismatch: bool,
 ) -> Router {
     // S3 API paths:
     //   GET / - list buckets
@@ -239,7 +242,7 @@ pub fn build_s3_router(
     //   GET /{bucket}/{key...} - download object
     //   HEAD /{bucket}/{key...} - get object metadata
     //   DELETE /{bucket}/{key...} - delete object
-    Router::new()
+    let mut router = Router::new()
         // Health and stats are under /_/ (see demo.rs) — not on the S3 router
         // Root: list buckets + HEAD probe for S3 client compatibility (Cyberduck, etc.)
         .route("/", get(list_buckets).head(head_root))
@@ -280,7 +283,17 @@ pub fn build_s3_router(
         .layer(middleware::from_fn(authorization_middleware))
         // SigV4 authentication (looks up user, verifies signature)
         .layer(middleware::from_fn(sigv4_auth_middleware))
-        .layer(axum::Extension(iam_state.clone()))
+        .layer(axum::Extension(iam_state.clone()));
+
+    // If config DB mismatch, inject guard that blocks all S3 API requests
+    if config_db_mismatch {
+        error!(
+            "S3 API LOCKED — all requests will be rejected until bootstrap password mismatch is resolved via /_/"
+        );
+        router = router.layer(axum::Extension(ConfigDbMismatchGuard));
+    }
+
+    router
         // Replay attack detection cache for SigV4
         .layer(axum::Extension(replay_cache.clone()))
         // Rate limiter extension for auth middleware
