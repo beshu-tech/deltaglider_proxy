@@ -385,23 +385,21 @@ pub fn init_config_db(
             }
 
             // Create a fresh DB so the proxy can start (in bootstrap/legacy mode)
+            let mismatch = bak_path.exists() || db_file.exists();
             match deltaglider_proxy::config_db::ConfigDb::open_or_create(
                 &db_file,
                 admin_password_hash,
             ) {
                 Ok(db) => {
                     info!("Created fresh IAM config database: {}", db_file.display());
-                    (
-                        Some(Arc::new(tokio::sync::Mutex::new(db))),
-                        bak_path.exists(),
-                    )
+                    (Some(Arc::new(tokio::sync::Mutex::new(db))), mismatch)
                 }
                 Err(e2) => {
                     error!(
                         "Failed to create fresh config database: {} — IAM disabled",
                         e2
                     );
-                    (None, bak_path.exists())
+                    (None, mismatch)
                 }
             }
         }
