@@ -6,8 +6,8 @@
 mod common;
 
 use common::{
-    generate_binary, get_bytes, head_headers, list_objects_raw, mutate_binary, put_object,
-    put_and_get_storage_type, TestServer,
+    generate_binary, get_bytes, head_headers, list_objects_raw, mutate_binary,
+    put_and_get_storage_type, put_object, TestServer,
 };
 
 #[tokio::test]
