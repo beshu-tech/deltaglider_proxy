@@ -36,4 +36,5 @@ Thumbs.db
 
 # Environment
 .env
-.env.*
+.env.*deltaglider_config.db.bak
+deltaglider_config.db
