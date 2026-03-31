@@ -708,19 +708,52 @@ pub async fn recover_db(
         }
     }
 
-    // Hash the candidate password
-    let candidate_hash = match bcrypt::hash(&body.candidate_password, bcrypt::DEFAULT_COST) {
-        Ok(h) => h,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(RecoverDbResponse {
-                    success: false,
-                    correct_hash: None,
-                    correct_hash_base64: None,
-                    error: Some(format!("Failed to hash password: {}", e)),
-                }),
-            );
+    // The SQLCipher DB is encrypted with the bcrypt HASH string (not the plaintext
+    // password). Accept the hash in either raw ($2b$12$...) or base64 form.
+    let candidate = body.candidate_password.trim().to_string();
+    let candidate_hash = if candidate.starts_with("$2") {
+        // Raw bcrypt hash
+        candidate.clone()
+    } else {
+        // Try base64 decode
+        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &candidate) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(decoded) if decoded.starts_with("$2") => decoded,
+                _ => {
+                    if let Some(ip) = &client_ip {
+                        state.rate_limiter.record_failure(ip);
+                    }
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(RecoverDbResponse {
+                            success: false,
+                            correct_hash: None,
+                            correct_hash_base64: None,
+                            error: Some(
+                                "Input is not a bcrypt hash. Provide the hash ($2b$12$...) or its base64 encoding."
+                                    .into(),
+                            ),
+                        }),
+                    );
+                }
+            },
+            Err(_) => {
+                if let Some(ip) = &client_ip {
+                    state.rate_limiter.record_failure(ip);
+                }
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(RecoverDbResponse {
+                        success: false,
+                        correct_hash: None,
+                        correct_hash_base64: None,
+                        error: Some(
+                            "Input is not a bcrypt hash. Provide the hash ($2b$12$...) or its base64 encoding."
+                                .into(),
+                        ),
+                    }),
+                );
+            }
         }
     };
 
