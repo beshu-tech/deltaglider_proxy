@@ -4,7 +4,7 @@ description: Deep analysis of DeltaGlider Proxy architecture for testability and
 type: project
 ---
 
-## Architecture Findings (updated 2026-03-29)
+## Architecture Findings (updated 2026-03-30)
 
 **Resolved issues (from prior analysis):**
 - Duplicated `sanitize_audit` fn -- resolved, now centralized in `audit.rs`
@@ -13,11 +13,15 @@ type: project
 - `eprintln!` in iam/permissions.rs evaluate_iam -- resolved, now uses `tracing::warn!`
 - Inline IP extraction in api/auth.rs -- resolved, now uses `audit::extract_client_info()`
 - Dead `http_put` in storage_resilience_test.rs -- resolved, removed (2026-03-29)
+- 3x duplicated GetObject NoSuchKey error mapping in s3.rs -- resolved, extracted `classify_get_error()` helper (2026-03-30)
+- 2x duplicated S3 body-to-stream unfold pattern in s3.rs -- resolved, extracted `s3_body_to_stream()` helper (2026-03-30)
+- 3x duplicated S3 ListObjectsV2 pagination loops (total_size, list_directory_markers, list_objects_full) -- resolved, total_size and list_directory_markers now delegate to list_objects_full (2026-03-30)
 
 **Remaining structural observations:**
 - `Engine::delete_prefix()` and its StorageBackend trait method are never called from any handler, test, or admin route. They exist as internal code only. The filesystem impl does rm -rf. If this is planned functionality, it needs a caller; if not, it's dead code.
+- `list_directory_markers` trait method is vestigial -- directory markers are now handled inline by `classify_listed_objects()` in the S3 backend. The S3 override still exists (now thin, 5 lines) but is never called from the engine. Removing it from the trait would be high-risk (cascading change) for low benefit.
 - `session.rs` parses `DGP_SESSION_TTL_HOURS` independently from config's `env_parse()` helper. Low impact -- `env_parse` is private and session module runs before config is fully loaded.
-- s3.rs is the largest file (1646 lines of production code, no test module). It's dense but well-structured with clear internal helper grouping.
+- s3.rs is 1578 lines (down from 1646). It's dense but well-structured with clear internal helper grouping.
 - Client IP extraction exists in two forms: `rate_limiter::extract_client_ip()` (returns `Option<IpAddr>`) and `audit::extract_client_info()` (returns `(String, String)` with UA). These serve different purposes and are reasonable to keep separate.
 
 **Good patterns:**
@@ -28,9 +32,10 @@ type: project
 - ConfigDb has in_memory() test constructor
 - init.rs is testable (parameterized BufRead/Write)
 - `interleave_and_paginate()` is the single source of truth for list pagination
-- Clippy is fully clean with -D warnings, 182 unit tests pass
+- Clippy is fully clean with -D warnings, 185 unit tests pass
 - `eprintln!`/`println!` usage in config.rs and main.rs is all intentional (pre-logger startup output)
 - `ref_key` serde alias in types.rs is needed for backwards-compat with existing .meta files
+- `classify_get_error()` and `s3_body_to_stream()` centralize GetObject error handling and body streaming
 
 **Why:** Understanding structural debt helps prioritize refactoring with maximum testability impact.
 **How to apply:** Use this as a reference when planning refactoring work on main.rs or admin API.
