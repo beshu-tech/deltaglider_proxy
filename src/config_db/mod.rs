@@ -23,6 +23,18 @@ const SCHEMA_VERSION: i32 = 4;
 mod groups;
 mod users;
 
+/// Compute the path to the IAM config database file.
+///
+/// Derives the directory from `DGP_CONFIG` (parent of the TOML config file)
+/// or falls back to the current working directory.
+pub fn config_db_path() -> PathBuf {
+    let db_dir = std::env::var("DGP_CONFIG")
+        .ok()
+        .and_then(|p| std::path::Path::new(&p).parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    db_dir.join("deltaglider_config.db")
+}
+
 impl ConfigDb {
     /// Open an existing DB or create a new one at `local_path`.
     /// The `passphrase` is used as the SQLCipher encryption key.

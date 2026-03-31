@@ -29,17 +29,8 @@ use crate::Cli;
 // Extracted helpers
 // ---------------------------------------------------------------------------
 
-/// Compute the path to the IAM config database file.
-///
-/// Derives the directory from `DGP_CONFIG` (parent of the TOML config file)
-/// or falls back to the current working directory.
-fn config_db_path() -> std::path::PathBuf {
-    let db_dir = std::env::var("DGP_CONFIG")
-        .ok()
-        .and_then(|p| std::path::Path::new(&p).parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    db_dir.join("deltaglider_config.db")
-}
+/// Re-export for binary crate convenience.
+pub use deltaglider_proxy::config_db::config_db_path;
 
 /// Initialize tracing with reload support.
 /// Priority: RUST_LOG > DGP_LOG_LEVEL > --verbose > default.
@@ -325,10 +316,16 @@ pub fn build_s3_router(
 
 /// Initialize the encrypted IAM config database. If it contains existing users,
 /// switch to IAM mode immediately.
+///
+/// Returns `(config_db, mismatch)` where `mismatch` is true if the bootstrap
+/// password hash doesn't match the existing DB encryption key.
 pub fn init_config_db(
     admin_password_hash: &str,
     iam_state: &SharedIamState,
-) -> Option<Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::ConfigDb>>> {
+) -> (
+    Option<Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::ConfigDb>>>,
+    bool,
+) {
     let db_file = config_db_path();
     match deltaglider_proxy::config_db::ConfigDb::open_or_create(&db_file, admin_password_hash) {
         Ok(db) => {
@@ -347,29 +344,51 @@ pub fn init_config_db(
                 }
                 // If no users exist, keep current IamState (Legacy or Disabled)
             }
-            Some(Arc::new(tokio::sync::Mutex::new(db)))
+            (Some(Arc::new(tokio::sync::Mutex::new(db))), false)
         }
         Err(e) => {
-            warn!(
-                "Could not open IAM config database: {} — creating fresh database",
-                e
-            );
-            // Delete the corrupt/incompatible DB and create a fresh one
-            let _ = std::fs::remove_file(&db_file);
+            // Preserve the existing DB as .bak instead of deleting — recovery needs it
+            let bak_path = db_file.with_extension("db.bak");
+            if db_file.exists() {
+                if let Err(rename_err) = std::fs::rename(&db_file, &bak_path) {
+                    warn!(
+                        "Failed to backup config DB to {}: {}",
+                        bak_path.display(),
+                        rename_err
+                    );
+                } else {
+                    error!(
+                        "Bootstrap password does not match config DB — original preserved as {}. \
+                         Use the admin GUI recovery wizard to resolve.",
+                        bak_path.display()
+                    );
+                }
+            } else {
+                warn!(
+                    "Config DB file does not exist: {} (error: {})",
+                    db_file.display(),
+                    e
+                );
+            }
+
+            // Create a fresh DB so the proxy can start (in bootstrap/legacy mode)
             match deltaglider_proxy::config_db::ConfigDb::open_or_create(
                 &db_file,
                 admin_password_hash,
             ) {
                 Ok(db) => {
                     info!("Created fresh IAM config database: {}", db_file.display());
-                    Some(Arc::new(tokio::sync::Mutex::new(db)))
+                    (
+                        Some(Arc::new(tokio::sync::Mutex::new(db))),
+                        bak_path.exists(),
+                    )
                 }
                 Err(e2) => {
                     error!(
                         "Failed to create fresh config database: {} — IAM disabled",
                         e2
                     );
-                    None
+                    (None, bak_path.exists())
                 }
             }
         }

@@ -1,8 +1,8 @@
 import { useState, useEffect } from 'react';
-import { Button, Input, Typography, Space, Alert, Spin } from 'antd';
-import { ApiOutlined } from '@ant-design/icons';
+import { Button, Input, Typography, Space, Alert, Spin, message } from 'antd';
+import { ApiOutlined, WarningOutlined, CheckCircleOutlined, CopyOutlined } from '@ant-design/icons';
 import { testConnection, setEndpoint, setCredentials, setBucket, initFromSession } from '../s3client';
-import { adminLogin, whoami } from '../adminApi';
+import { adminLogin, whoami, recoverDb } from '../adminApi';
 import { detectDefaultEndpoint } from '../utils';
 import { useColors } from '../ThemeContext';
 
@@ -22,6 +22,13 @@ export default function ConnectPage({ onConnect, showError }: Props) {
   const [error, setError] = useState('');
   const [authMode, setAuthMode] = useState<'bootstrap' | 'iam' | 'open' | null>(null);
   const [detecting, setDetecting] = useState(true);
+  // Recovery wizard state
+  const [showRecovery, setShowRecovery] = useState(false);
+  const [recoveryPassword, setRecoveryPassword] = useState('');
+  const [recoveryLoading, setRecoveryLoading] = useState(false);
+  const [recoveryError, setRecoveryError] = useState('');
+  const [recoveredHash, setRecoveredHash] = useState<{ hash: string; base64: string } | null>(null);
+  const [messageApi, contextHolder] = message.useMessage();
 
   // Detect auth mode on mount
   useEffect(() => {
@@ -48,6 +55,15 @@ export default function ConnectPage({ onConnect, showError }: Props) {
           setLoading(false);
           return;
         }
+
+        // Check for config DB mismatch after successful login
+        const info = await whoami();
+        if (info.config_db_mismatch) {
+          setShowRecovery(true);
+          setLoading(false);
+          return;
+        }
+
         const restored = await initFromSession();
         if (restored) {
           onConnect();
@@ -87,6 +103,33 @@ export default function ConnectPage({ onConnect, showError }: Props) {
     }
   };
 
+  const handleRecover = async () => {
+    if (!recoveryPassword.trim()) return;
+    setRecoveryLoading(true);
+    setRecoveryError('');
+    try {
+      const result = await recoverDb(recoveryPassword);
+      if (result.success && result.correct_hash) {
+        setRecoveredHash({
+          hash: result.correct_hash,
+          base64: result.correct_hash_base64 || '',
+        });
+      } else {
+        setRecoveryError(result.error || 'Password does not match');
+      }
+    } catch (e) {
+      setRecoveryError(e instanceof Error ? e.message : 'Recovery failed');
+    } finally {
+      setRecoveryLoading(false);
+    }
+  };
+
+  const copyToClipboard = (text: string, label: string) => {
+    navigator.clipboard.writeText(text).then(() => {
+      messageApi.success(`${label} copied to clipboard`);
+    });
+  };
+
   const isBootstrap = authMode === 'bootstrap';
   const canSubmit = isBootstrap ? adminPassword.trim() : (accessKey.trim() && secretKey.trim());
 
@@ -103,6 +146,87 @@ export default function ConnectPage({ onConnect, showError }: Props) {
     return (
       <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh' }}>
         <Spin size="large" />
+      </div>
+    );
+  }
+
+  // Recovery wizard
+  if (showRecovery) {
+    return (
+      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh', padding: 24 }}>
+        {contextHolder}
+        <div className="glass-card animate-fade-in" style={{ borderRadius: 14, padding: 'clamp(28px, 4vw, 40px)', width: '100%', maxWidth: 520 }}>
+          <Space direction="vertical" size="large" style={{ width: '100%' }}>
+            {recoveredHash ? (
+              /* Success state */
+              <>
+                <div style={{ textAlign: 'center' }}>
+                  <CheckCircleOutlined style={{ fontSize: 48, color: '#52c41a', marginBottom: 16 }} />
+                  <div style={{ fontSize: 18, fontWeight: 700, color: TEXT_PRIMARY }}>Database Recovered</div>
+                  <Text style={{ color: TEXT_MUTED, fontSize: 13, display: 'block', marginTop: 8 }}>
+                    Update your configuration with this hash, then restart the server.
+                  </Text>
+                </div>
+                <div style={{ background: 'var(--input-bg)', borderRadius: 10, padding: 16 }}>
+                  <div style={{ marginBottom: 12 }}>
+                    <label style={{ fontSize: 11, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>Hash</label>
+                    <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+                      <Input value={recoveredHash.hash} readOnly style={{ ...inputStyle, flex: 1, fontSize: 11 }} />
+                      <Button icon={<CopyOutlined />} onClick={() => copyToClipboard(recoveredHash.hash, 'Hash')} />
+                    </div>
+                  </div>
+                  <div>
+                    <label style={{ fontSize: 11, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>Base64 (for Docker/env vars)</label>
+                    <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+                      <Input value={recoveredHash.base64} readOnly style={{ ...inputStyle, flex: 1, fontSize: 11 }} />
+                      <Button icon={<CopyOutlined />} onClick={() => copyToClipboard(recoveredHash.base64, 'Base64 hash')} />
+                    </div>
+                  </div>
+                </div>
+                <Alert type="info" showIcon message={
+                  <span>Set <code>DGP_BOOTSTRAP_PASSWORD_HASH</code> in your environment or <code>bootstrap_password_hash</code> in your TOML config, then restart.</span>
+                } />
+              </>
+            ) : (
+              /* Recovery form */
+              <>
+                <div style={{ textAlign: 'center' }}>
+                  <WarningOutlined style={{ fontSize: 48, color: '#faad14', marginBottom: 16 }} />
+                  <div style={{ fontSize: 18, fontWeight: 700, color: TEXT_PRIMARY }}>Config Database Locked</div>
+                  <Text style={{ color: TEXT_MUTED, fontSize: 13, display: 'block', marginTop: 8 }}>
+                    The bootstrap password in your configuration does not match the encryption key of the existing IAM database. No IAM changes can be made until this is resolved.
+                  </Text>
+                </div>
+                {recoveryError && <Alert type="error" message={recoveryError} showIcon />}
+                <div>
+                  <label style={{ fontSize: 12, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)", marginBottom: 4, display: 'block' }}>
+                    Original Bootstrap Password
+                  </label>
+                  <Input.Password
+                    value={recoveryPassword}
+                    onChange={(e) => setRecoveryPassword(e.target.value)}
+                    onPressEnter={handleRecover}
+                    placeholder="Enter the password that was used to create the database"
+                    size="large"
+                    autoFocus
+                    style={inputStyle}
+                  />
+                </div>
+                <Button
+                  type="primary"
+                  block
+                  size="large"
+                  loading={recoveryLoading}
+                  disabled={!recoveryPassword.trim()}
+                  onClick={handleRecover}
+                  style={{ height: 48, borderRadius: 10, fontWeight: 700, fontFamily: "var(--font-ui)", fontSize: 15 }}
+                >
+                  Try Password
+                </Button>
+              </>
+            )}
+          </Space>
+        </div>
       </div>
     );
   }

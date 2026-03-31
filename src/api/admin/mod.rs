@@ -28,7 +28,7 @@ pub use auth::{
 };
 pub use backup::{export_backup, import_backup};
 pub use config::{
-    change_password, get_config, test_s3_connection, update_config, ConfigResponse,
+    change_password, get_config, recover_db, test_s3_connection, update_config, ConfigResponse,
     ConfigUpdateRequest, ConfigUpdateResponse, PasswordChangeRequest, PasswordChangeResponse,
     TestS3Request, TestS3Response,
 };
@@ -62,11 +62,19 @@ pub struct AdminState {
     pub rate_limiter: RateLimiter,
     /// S3 sync for the config database (None if DGP_CONFIG_SYNC_BUCKET is not set).
     pub config_sync: Option<Arc<ConfigDbSync>>,
+    /// True if the bootstrap password hash doesn't match the existing config DB.
+    /// When set, config sync is blocked and a recovery wizard is shown in the GUI.
+    pub config_db_mismatch: bool,
 }
 
 /// Trigger an async config DB upload to S3 if sync is enabled.
 /// Spawns a background task so the caller is not blocked.
+/// No-op when config_db_mismatch is true (prevents overwriting good DB with empty one).
 pub(crate) fn trigger_config_sync(state: &Arc<AdminState>) {
+    if state.config_db_mismatch {
+        tracing::warn!("Config sync blocked — bootstrap password mismatch (recovery required)");
+        return;
+    }
     if let Some(ref sync) = state.config_sync {
         tokio::spawn({
             let sync = sync.clone();
