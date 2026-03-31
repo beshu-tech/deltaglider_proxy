@@ -63,10 +63,14 @@ jobs:
         if: always()
         run: sccache --show-stats
 
-  test:
-    name: Tests
+  # ── Test jobs: split into 3 parallel groups for ~3x faster wall-clock ──
+  # Each job compiles via sccache (near-instant after first job populates cache).
+  # Split by execution time: unit (~60s), integration-fast (~50s), integration-slow (~70s).
+
+  test-unit:
+    name: Unit Tests
     runs-on: k3s
-    timeout-minutes: 30
+    timeout-minutes: 15
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       credentials:
@@ -74,13 +78,28 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: sccache stats (pre)
-        run: sccache --show-stats
+      - name: Build demo UI (required by rust-embed)
+        run: cd demo/s3-browser/ui && npm ci && npm run build
+      - name: cargo test --lib
+        env:
+          RUST_BACKTRACE: "1"
+        run: cargo test --lib --locked
+
+  test-integration:
+    name: Integration Tests
+    runs-on: k3s
+    timeout-minutes: 15
+    container:
+      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Build demo UI (required by rust-embed)
         run: cd demo/s3-browser/ui && npm ci && npm run build
       - name: Start MinIO for tests
         run: |
-          # Ephemeral MinIO for integration tests — NOT the sccache MinIO
           docker run -d --name minio-ci --network container:$(hostname) \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
@@ -91,31 +110,64 @@ jobs:
           done
           mc mb --ignore-existing local/deltaglider-test
           mc mb --ignore-existing local/deltaglider-data
-          # Exported as env var for interop tests — read by minio_endpoint() in tests/interop_test.rs
           echo "MINIO_ENDPOINT=http://localhost:9000" >> $GITHUB_ENV
       - name: Install DeltaGlider CLI
         run: |
-          # Builder image is rust:1-bookworm — install pip if missing
-          # NB: braces required — `||` has lower precedence than `&&` in shell
           command -v pip3 >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq python3-pip >/dev/null; }
           pip3 install --quiet --break-system-packages deltaglider
           deltaglider --version
-      - name: cargo test (all, including interop)
+      - name: Integration tests (fast — S3 API, IAM, auth, compat)
         env:
           RUST_BACKTRACE: "1"
-        run: cargo test --all --locked -- --include-ignored --nocapture
+        run: |
+          cargo test --locked \
+            --test auth_integration_test \
+            --test concurrency_test \
+            --test error_test \
+            --test iam_authorization_test \
+            --test iam_persona_test \
+            --test iam_test \
+            --test list_truncation_test \
+            --test metadata_validation_test \
+            --test s3_api_test \
+            --test s3_backend_test \
+            --test s3_compat_test \
+            --test s3_integration_test \
+            --test storage_resilience_test \
+            --test unmanaged_objects_test \
+            --test interop_test \
+            -- --include-ignored --nocapture
       - name: Clean up MinIO test data
         if: always()
         run: |
-          # Persistent volumes — clean up interop test objects
           mc rm --recursive --force local/deltaglider-test/ 2>/dev/null || true
           mc rm --recursive --force local/deltaglider-data/ 2>/dev/null || true
-      - name: sccache stats (post)
-        if: always()
-        run: sccache --show-stats
       - name: Stop MinIO
         if: always()
         run: docker rm -f minio-ci 2>/dev/null || true
+
+  test-delta:
+    name: Delta & Optimization Tests
+    runs-on: k3s
+    timeout-minutes: 15
+    container:
+      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Build demo UI (required by rust-embed)
+        run: cd demo/s3-browser/ui && npm ci && npm run build
+      - name: Delta, optimization, and memory tests
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          cargo test --locked \
+            --test delta_test \
+            --test optimization_test \
+            --test memory_test \
+            -- --nocapture
 
   audit:
     name: RustSec Audit
