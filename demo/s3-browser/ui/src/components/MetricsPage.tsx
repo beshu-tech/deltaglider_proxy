@@ -229,7 +229,7 @@ export default function MetricsPage({ onBack, embedded }: Props) {
   const statsTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const fetchStats = useCallback(async () => {
     try {
-      const res = await fetch('/stats');
+      const res = await fetch('/_/stats', { credentials: 'include' });
       if (res.ok) setStats(await res.json());
     } catch { /* non-blocking */ }
   }, []);
@@ -242,7 +242,7 @@ export default function MetricsPage({ onBack, embedded }: Props) {
 
   const fetchMetrics = useCallback(async () => {
     try {
-      const metricsRes = await fetch('/metrics');
+      const metricsRes = await fetch('/_/metrics', { credentials: 'include' });
       if (!metricsRes.ok) throw new Error(`HTTP ${metricsRes.status}`);
       const parsed = parsePrometheus(await metricsRes.text());
       setMetricsMap(parsed);
