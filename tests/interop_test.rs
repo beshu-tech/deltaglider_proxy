@@ -31,14 +31,9 @@ use tempfile::TempDir;
 use tokio::time::sleep;
 
 /// Port counter for proxy instances
-/// Find a free TCP port by binding to port 0 and reading back.
-fn find_free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind to port 0")
-        .local_addr()
-        .expect("local_addr")
-        .port()
-}
+/// Port counter for interop tests — uses high range (29500+) to avoid
+/// conflicts with other test binaries (common tests use 19000+).
+static INTEROP_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(29500);
 
 /// Test prefix counter for isolation
 static TEST_PREFIX_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -172,7 +167,7 @@ struct TestProxyServer {
 impl TestProxyServer {
     /// Start proxy server with S3 backend pointing to MinIO
     async fn start_with_s3_backend() -> Self {
-        let port = find_free_port();
+        let port = INTEROP_PORT.fetch_add(1, Ordering::SeqCst);
         let data_dir = TempDir::new().expect("Failed to create temp dir");
 
         // env_clear() prevents sccache/AWS var leaks, but we must pass through
