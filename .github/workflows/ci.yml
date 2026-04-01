@@ -99,7 +99,9 @@ jobs:
       - name: Build demo UI (required by rust-embed)
         run: cd demo/s3-browser/ui && npm ci && npm run build
       - name: Clean up stale config DB files
-        run: rm -f deltaglider_config.db deltaglider_config.db.bak .deltaglider_bootstrap_hash
+        run: |
+          rm -f deltaglider_config.db deltaglider_config.db.bak .deltaglider_bootstrap_hash
+          rm -f /tmp/deltaglider_config.db /tmp/deltaglider_config.db.bak /tmp/.deltaglider_bootstrap_hash
       - name: Start MinIO for tests
         run: |
           docker run -d --name minio-ci --network container:$(hostname) \
