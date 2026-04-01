@@ -25,13 +25,20 @@ use aws_sdk_s3::Client;
 use rand::{Rng, SeedableRng};
 use sha2::{Digest, Sha256};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::sleep;
 
 /// Port counter for proxy instances
-static PORT_COUNTER: AtomicU16 = AtomicU16::new(19500);
+/// Find a free TCP port by binding to port 0 and reading back.
+fn find_free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind to port 0")
+        .local_addr()
+        .expect("local_addr")
+        .port()
+}
 
 /// Test prefix counter for isolation
 static TEST_PREFIX_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -165,7 +172,7 @@ struct TestProxyServer {
 impl TestProxyServer {
     /// Start proxy server with S3 backend pointing to MinIO
     async fn start_with_s3_backend() -> Self {
-        let port = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let port = find_free_port();
         let data_dir = TempDir::new().expect("Failed to create temp dir");
 
         // env_clear() prevents sccache/AWS var leaks, but we must pass through
