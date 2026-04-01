@@ -556,63 +556,67 @@ pub async fn sigv4_auth_middleware(
     // the get() check before either inserted. Fixed by using the entry() API which
     // acquires the per-key shard lock for the entire check-and-insert sequence.
     //
-    // The window matches DGP_CLOCK_SKEW_SECONDS (default 300 s) so that any request
-    // that is still within the valid timestamp window is also covered by replay
-    // detection. A 5-second window only blocks network-level retries, not deliberate
-    // replays made seconds later.
+    // Replay detection: skip for presigned URLs (they're designed to be reused —
+    // the same signature is valid for the entire expiry window).
+    // For regular SigV4 requests, use a 2-second window to catch network retries.
+    let is_presigned = has_presigned_query_params(request.uri().query().unwrap_or(""));
     if let Some(ref cache) = replay_cache {
-        // Cap replay cache size to prevent memory exhaustion under attack.
-        // Evict expired entries first; only if still over cap, evict oldest half.
-        const MAX_REPLAY_ENTRIES: usize = 500_000;
-        if cache.len() > MAX_REPLAY_ENTRIES {
-            let replay_window_evict = std::time::Duration::from_secs(
-                std::env::var("DGP_CLOCK_SKEW_SECONDS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(300),
-            );
-            // First pass: evict expired entries
-            cache.retain(|_, instant| instant.elapsed() < replay_window_evict);
-            // If still over cap after eviction, log warning (genuine flood)
+        if is_presigned {
+            // Presigned URLs have fixed signatures — replay detection doesn't apply
+        } else {
+            // Cap replay cache size to prevent memory exhaustion under attack.
+            // Evict expired entries first; only if still over cap, evict oldest half.
+            const MAX_REPLAY_ENTRIES: usize = 500_000;
             if cache.len() > MAX_REPLAY_ENTRIES {
-                warn!(
+                let replay_window_evict = std::time::Duration::from_secs(
+                    std::env::var("DGP_REPLAY_WINDOW_SECS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(2),
+                );
+                // First pass: evict expired entries
+                cache.retain(|_, instant| instant.elapsed() < replay_window_evict);
+                // If still over cap after eviction, log warning (genuine flood)
+                if cache.len() > MAX_REPLAY_ENTRIES {
+                    warn!(
                     "SECURITY | Replay cache still at {} entries after eviction — possible flood attack",
                     cache.len()
                 );
-            }
-        }
-
-        let sig = &params.signature;
-        let replay_window = std::time::Duration::from_secs(
-            std::env::var("DGP_CLOCK_SKEW_SECONDS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(300),
-        );
-
-        let mut rejected = false;
-        cache
-            .entry(sig.clone())
-            .and_modify(|first_seen: &mut Instant| {
-                if first_seen.elapsed() < replay_window {
-                    rejected = true;
-                } else {
-                    // Window expired — reset so the slot can be reused.
-                    *first_seen = Instant::now();
                 }
-            })
-            .or_insert_with(Instant::now);
+            }
 
-        if rejected {
-            warn!(
-                "SigV4: replay attack detected (duplicate signature within {:?})",
-                replay_window
+            let sig = &params.signature;
+            let replay_window = std::time::Duration::from_secs(
+                std::env::var("DGP_REPLAY_WINDOW_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(2),
             );
-            record_auth_failure("replay");
-            return Err(
-                S3Error::InvalidArgument("Request replay detected".to_string()).into_response(),
-            );
-        }
+
+            let mut rejected = false;
+            cache
+                .entry(sig.clone())
+                .and_modify(|first_seen: &mut Instant| {
+                    if first_seen.elapsed() < replay_window {
+                        rejected = true;
+                    } else {
+                        // Window expired — reset so the slot can be reused.
+                        *first_seen = Instant::now();
+                    }
+                })
+                .or_insert_with(Instant::now);
+
+            if rejected {
+                warn!(
+                    "SigV4: replay attack detected (duplicate signature within {:?})",
+                    replay_window
+                );
+                record_auth_failure("replay");
+                return Err(
+                    S3Error::InvalidArgument("Request replay detected".to_string()).into_response(),
+                );
+            }
+        } // else (not presigned)
     }
 
     // Insert authenticated user into request extensions (for authorization middleware)
