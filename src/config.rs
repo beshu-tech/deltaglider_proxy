@@ -416,17 +416,23 @@ impl Config {
     /// Load configuration from environment variables
     pub fn from_env() -> Self {
         let mut config = Self::default();
+        config.apply_env_overrides();
+        config
+    }
 
+    /// Apply environment variable overrides on top of existing config.
+    /// Environment variables always take precedence over file-based config.
+    fn apply_env_overrides(&mut self) {
         if let Ok(addr) = std::env::var("DGP_LISTEN_ADDR") {
             match addr.parse() {
-                Ok(parsed) => config.listen_addr = parsed,
+                Ok(parsed) => self.listen_addr = parsed,
                 Err(e) => eprintln!("Warning: ignoring invalid DGP_LISTEN_ADDR=\"{addr}\": {e}"),
             }
         }
 
         // Check for S3 backend configuration
         if std::env::var("DGP_S3_ENDPOINT").is_ok() || std::env::var("DGP_S3_REGION").is_ok() {
-            config.backend = BackendConfig::S3 {
+            self.backend = BackendConfig::S3 {
                 endpoint: std::env::var("DGP_S3_ENDPOINT").ok(),
                 region: std::env::var("DGP_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
                 force_path_style: std::env::var("DGP_S3_PATH_STYLE")
@@ -436,72 +442,72 @@ impl Config {
                 secret_access_key: std::env::var("DGP_BE_AWS_SECRET_ACCESS_KEY").ok(),
             };
         } else if let Ok(dir) = std::env::var("DGP_DATA_DIR") {
-            config.backend = BackendConfig::Filesystem {
+            self.backend = BackendConfig::Filesystem {
                 path: PathBuf::from(dir),
             };
         }
 
         if let Some(v) = env_parse::<f32>("DGP_MAX_DELTA_RATIO") {
-            config.max_delta_ratio = v;
+            self.max_delta_ratio = v;
         }
         if let Some(v) = env_parse::<u64>("DGP_MAX_OBJECT_SIZE") {
-            config.max_object_size = v;
+            self.max_object_size = v;
         }
         if let Some(v) = env_parse::<usize>("DGP_CACHE_MB") {
-            config.cache_size_mb = v;
+            self.cache_size_mb = v;
         }
         if let Some(v) = env_parse::<usize>("DGP_METADATA_CACHE_MB") {
-            config.metadata_cache_mb = v;
+            self.metadata_cache_mb = v;
         }
         if let Some(v) = env_parse::<usize>("DGP_CODEC_CONCURRENCY") {
-            config.codec_concurrency = Some(v);
+            self.codec_concurrency = Some(v);
         }
         if let Some(v) = env_parse::<usize>("DGP_BLOCKING_THREADS") {
-            config.blocking_threads = Some(v);
+            self.blocking_threads = Some(v);
         }
 
         // Proxy authentication credentials
-        config.access_key_id = std::env::var("DGP_ACCESS_KEY_ID").ok();
-        config.secret_access_key = std::env::var("DGP_SECRET_ACCESS_KEY").ok();
+        if let Ok(v) = std::env::var("DGP_ACCESS_KEY_ID") {
+            self.access_key_id = Some(v);
+        }
+        if let Ok(v) = std::env::var("DGP_SECRET_ACCESS_KEY") {
+            self.secret_access_key = Some(v);
+        }
 
         // Admin GUI password hash
-        config.bootstrap_password_hash = std::env::var("DGP_BOOTSTRAP_PASSWORD_HASH")
+        if let Ok(v) = std::env::var("DGP_BOOTSTRAP_PASSWORD_HASH")
             .or_else(|_| std::env::var("DGP_ADMIN_PASSWORD_HASH"))
-            .ok();
+        {
+            self.bootstrap_password_hash = Some(v);
+        }
 
         // Log level (runtime operational)
         if let Ok(level) = std::env::var("DGP_LOG_LEVEL") {
-            config.log_level = level;
+            self.log_level = level;
         }
 
         // Config DB S3 sync
         if let Ok(bucket) = std::env::var("DGP_CONFIG_SYNC_BUCKET") {
-            config.config_sync_bucket = Some(bucket);
+            self.config_sync_bucket = Some(bucket);
         }
 
         // TLS configuration
         if let Ok(enabled) = std::env::var("DGP_TLS_ENABLED") {
             if enabled == "true" || enabled == "1" {
-                config.tls = Some(TlsConfig {
+                self.tls = Some(TlsConfig {
                     enabled: true,
                     cert_path: std::env::var("DGP_TLS_CERT").ok(),
                     key_path: std::env::var("DGP_TLS_KEY").ok(),
                 });
             }
         }
-
-        config
     }
 
-    /// Load configuration from file if it exists, otherwise from environment
+    /// Load configuration: file first, then env var overrides on top.
+    /// Environment variables always take precedence over file-based config.
     pub fn load() -> Self {
-        // Try config file first
-        let config = if let Ok(path) = std::env::var("DGP_CONFIG") {
-            if let Ok(config) = Self::from_file(&path) {
-                config
-            } else {
-                Self::from_env()
-            }
+        let mut config = if let Ok(path) = std::env::var("DGP_CONFIG") {
+            Self::from_file(&path).unwrap_or_default()
         } else {
             // Try default config file locations
             let mut found = None;
@@ -516,8 +522,11 @@ impl Config {
                     }
                 }
             }
-            found.unwrap_or_else(Self::from_env)
+            found.unwrap_or_default()
         };
+
+        // Environment variables always override file config
+        config.apply_env_overrides();
         config.validate();
         config
     }
