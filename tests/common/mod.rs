@@ -123,11 +123,21 @@ impl TestServer {
         // Build full config with listen_addr prepended
         let full_config = format!("listen_addr = \"127.0.0.1:{}\"\n{}", port, config_body);
 
-        // Write config to a temp file (inside data_dir if available, else system temp)
-        let config_path = match &data_dir {
-            Some(d) => d.path().join("test.toml"),
-            None => std::env::temp_dir().join(format!("dgp_test_{}.toml", port)),
+        // Write config to a temp file inside a per-instance directory.
+        // config_db_path() derives the DB path from the config file's parent,
+        // so each test instance MUST have its own directory to avoid sharing
+        // the encrypted config DB (which causes mismatch errors).
+        let config_dir = match &data_dir {
+            Some(d) => d.path().to_path_buf(),
+            None => {
+                let d = tempfile::tempdir().expect("Failed to create config temp dir");
+                // Leak the TempDir so it lives until the test process ends
+                let path = d.path().to_path_buf();
+                std::mem::forget(d);
+                path
+            }
         };
+        let config_path = config_dir.join("test.toml");
         std::fs::write(&config_path, &full_config).expect("Failed to write test config");
 
         let process = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"))
