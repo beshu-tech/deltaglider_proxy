@@ -116,7 +116,7 @@ jobs:
           command -v pip3 >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq python3-pip >/dev/null; }
           pip3 install --quiet --break-system-packages deltaglider
           deltaglider --version
-      - name: Integration tests (fast — S3 API, IAM, auth, compat)
+      - name: Integration tests (fast)
         env:
           RUST_BACKTRACE: "1"
         run: |
@@ -135,8 +135,12 @@ jobs:
             --test s3_integration_test \
             --test storage_resilience_test \
             --test unmanaged_objects_test \
-            --test interop_test \
-            -- --include-ignored --nocapture
+            -- --nocapture
+      - name: Interop tests (separate — spawns proxy subprocesses)
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          cargo test --locked --test interop_test -- --include-ignored --nocapture
       - name: Clean up MinIO test data
         if: always()
         run: |
