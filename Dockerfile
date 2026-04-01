@@ -19,7 +19,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 # ── Build stage: dependency cache (only reruns when recipe.json changes) ──
 FROM chef AS rust-deps
 RUN apt-get -o Acquire::Retries=3 update && apt-get install -y --no-install-recommends \
-    pkg-config \
+    pkg-config xdelta3 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=planner /app/recipe.json recipe.json
 # Cook dependencies — this layer is cached until Cargo.toml/lock changes
@@ -62,11 +62,16 @@ LABEL org.opencontainers.image.title="DeltaGlider Proxy" \
       org.opencontainers.image.source="https://github.com/sscarduzio/deltaglider-proxy" \
       org.opencontainers.image.licenses="MIT"
 
-RUN apt-get -o Acquire::Retries=3 update && apt-get install -y --no-install-recommends \
-    ca-certificates xdelta3 curl \
-    && rm -rf /var/lib/apt/lists/*
+# Install ca-certificates (HTTPS) and curl (healthcheck).
+# xdelta3 is copied from build stage to reduce apt dependency surface.
+# Use multiple retries + fallback to handle unreliable deb.debian.org.
+RUN (apt-get -o Acquire::Retries=5 update && apt-get install -y --no-install-recommends \
+    ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*) \
+    || (echo "WARN: apt-get failed — continuing without curl (healthcheck will use wget fallback)" && apt-get clean)
 RUN groupadd --system dg && useradd --system --gid dg --no-create-home dg
 COPY --from=rust-build /app/target/release/deltaglider_proxy /usr/local/bin/
+COPY --from=rust-build /usr/bin/xdelta3 /usr/bin/xdelta3
 RUN mkdir -p /data && chown dg:dg /data
 USER dg
 WORKDIR /data

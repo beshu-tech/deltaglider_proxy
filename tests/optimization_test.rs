@@ -648,7 +648,8 @@ async fn test_large_passthrough_roundtrip() {
 async fn test_codec_concurrency_one() {
     let server = TestServer::filesystem_with_codec_concurrency(1).await;
     let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
+        // 180s: 5 serial xdelta3 encodes with concurrency=1 can take >60s on slow CI runners
+        .timeout(Duration::from_secs(180))
         .build()
         .unwrap();
 
