@@ -140,11 +140,11 @@ jobs:
             --test storage_resilience_test \
             --test unmanaged_objects_test \
             -- --nocapture
-      - name: Interop tests (separate — spawns proxy subprocesses, serial)
+      - name: Interop tests (spawns proxy subprocesses)
         env:
           RUST_BACKTRACE: "1"
         run: |
-          cargo test --locked --test interop_test -- --include-ignored --nocapture --test-threads=1
+          cargo test --locked --test interop_test -- --include-ignored --nocapture
       - name: Clean up MinIO test data
         if: always()
         run: |
