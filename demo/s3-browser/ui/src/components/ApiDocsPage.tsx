@@ -16,12 +16,12 @@ interface Endpoint {
   response?: string; // example response
 }
 
-const METHOD_COLORS: Record<string, string> = {
-  GET: '#52c41a',
-  POST: '#1677ff',
-  PUT: '#fa8c16',
-  DELETE: '#ff4d4f',
-  HEAD: '#722ed1',
+const METHOD_COLORS: Record<string, { text: string; bg: string; border: string }> = {
+  GET:    { text: '#4ade80', bg: 'rgba(74, 222, 128, 0.10)', border: 'rgba(74, 222, 128, 0.25)' },
+  POST:   { text: '#60a5fa', bg: 'rgba(96, 165, 250, 0.10)', border: 'rgba(96, 165, 250, 0.25)' },
+  PUT:    { text: '#fbbf24', bg: 'rgba(251, 191, 36, 0.10)', border: 'rgba(251, 191, 36, 0.25)' },
+  DELETE: { text: '#fb7185', bg: 'rgba(251, 113, 133, 0.10)', border: 'rgba(251, 113, 133, 0.25)' },
+  HEAD:   { text: '#a78bfa', bg: 'rgba(167, 139, 250, 0.10)', border: 'rgba(167, 139, 250, 0.25)' },
 };
 
 const ADMIN_API: Endpoint[] = [
@@ -146,9 +146,15 @@ function EndpointCard({ ep }: { ep: Endpoint }) {
           background: expanded ? colors.BG_BASE : 'transparent',
         }}
       >
-        <Tag color={METHOD_COLORS[ep.method]} style={{ margin: 0, fontWeight: 700, minWidth: 60, textAlign: 'center' }}>
+        <span style={{
+          margin: 0, fontWeight: 700, minWidth: 60, textAlign: 'center', display: 'inline-block',
+          padding: '2px 10px', borderRadius: 6, fontSize: 12, fontFamily: 'var(--font-mono)',
+          color: METHOD_COLORS[ep.method]?.text || '#ccc',
+          background: METHOD_COLORS[ep.method]?.bg || 'transparent',
+          border: `1px solid ${METHOD_COLORS[ep.method]?.border || 'transparent'}`,
+        }}>
           {ep.method}
-        </Tag>
+        </span>
         <Text code style={{ fontFamily: 'var(--font-mono)', fontSize: 13, flex: 1 }}>{ep.path}</Text>
         <Text type="secondary" style={{ fontSize: 12 }}>{ep.summary}</Text>
         {authTag}
