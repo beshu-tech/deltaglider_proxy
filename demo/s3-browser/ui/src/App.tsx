@@ -14,7 +14,7 @@ import ConnectPage from './components/ConnectPage';
 import MetricsPage from './components/MetricsPage';
 import ApiDocsPage from './components/ApiDocsPage';
 import { getBucket, hasCredentials, disconnect, initFromSession, getCredentials } from './s3client';
-import { adminLogout, whoami } from './adminApi';
+import { adminLogout, whoami, checkSession } from './adminApi';
 import type { WhoamiResponse } from './adminApi';
 import { useColors } from './ThemeContext';
 import useComputeSize from './useComputeSize';
@@ -106,12 +106,17 @@ export default function App() {
     });
   }, []);
 
+  const [hasAdminSession, setHasAdminSession] = useState(false);
+
   // Check identity after S3 connection is established
   useEffect(() => {
     if (!needsConnect) {
       whoami().then(setIdentity);
+      // In IAM mode, check if user has an admin session (login-as only succeeds for admins)
+      checkSession().then(setHasAdminSession);
     } else {
       setIdentity(null);
+      setHasAdminSession(false);
     }
   }, [needsConnect]);
 
@@ -311,7 +316,7 @@ export default function App() {
             onLogout={handleLogout}
             currentUser={getCredentials().accessKeyId || undefined}
             displayName={identity?.user?.name || undefined}
-            canAdmin={identity?.mode === 'bootstrap' || identity?.mode === 'open' || identity?.user?.is_admin === true}
+            canAdmin={identity?.mode === 'bootstrap' || identity?.mode === 'open' || identity?.user?.is_admin === true || hasAdminSession}
           />
         )}
 
