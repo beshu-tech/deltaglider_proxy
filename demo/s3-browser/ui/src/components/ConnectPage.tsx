@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { Button, Input, Typography, Space, Alert, Spin, message } from 'antd';
 import { ApiOutlined, WarningOutlined, CheckCircleOutlined, CopyOutlined } from '@ant-design/icons';
 import { testConnection, setEndpoint, setCredentials, setBucket, initFromSession } from '../s3client';
-import { adminLogin, whoami, recoverDb } from '../adminApi';
+import { adminLogin, loginAs, whoami, recoverDb } from '../adminApi';
 import { detectDefaultEndpoint } from '../utils';
 import { useColors } from '../ThemeContext';
 
@@ -104,6 +104,9 @@ export default function ConnectPage({ onConnect, showError }: Props) {
       if (result.buckets && result.buckets.length > 0) {
         setBucket(result.buckets[0]);
       }
+
+      // Try to establish admin session (best-effort — only succeeds for admin users)
+      loginAs(accessKey, secretKey).catch(() => {});
 
       onConnect();
     } catch (e) {
