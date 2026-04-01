@@ -31,7 +31,7 @@ use tempfile::TempDir;
 use tokio::time::sleep;
 
 /// Port counter for proxy instances
-static PORT_COUNTER: AtomicU16 = AtomicU16::new(19100);
+static PORT_COUNTER: AtomicU16 = AtomicU16::new(19500);
 
 /// Test prefix counter for isolation
 static TEST_PREFIX_COUNTER: AtomicU64 = AtomicU64::new(0);
