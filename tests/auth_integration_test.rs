@@ -134,6 +134,62 @@ fn build_signed_get(
         .header("host", host)
 }
 
+/// Build a manually signed PUT request (empty body) for replay detection tests.
+fn build_signed_put(
+    endpoint: &str,
+    path: &str,
+    access_key: &str,
+    secret_key: &str,
+    timestamp: &str,
+) -> reqwest::RequestBuilder {
+    let date = &timestamp[..8];
+    let region = "us-east-1";
+    let service = "s3";
+    let credential_scope = format!("{}/{}/{}/aws4_request", date, region, service);
+
+    let host = endpoint
+        .strip_prefix("http://")
+        .or_else(|| endpoint.strip_prefix("https://"))
+        .unwrap_or(endpoint)
+        .to_string();
+
+    let payload_hash = sha256_hex(b"");
+
+    let canonical_headers = format!(
+        "host:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n",
+        host, payload_hash, timestamp
+    );
+    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+
+    let canonical_request = format!(
+        "PUT\n{}\n\n{}\n{}\n{}",
+        path, canonical_headers, signed_headers, payload_hash
+    );
+
+    let canonical_request_hash = sha256_hex(canonical_request.as_bytes());
+
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{}\n{}\n{}",
+        timestamp, credential_scope, canonical_request_hash
+    );
+
+    let signing_key = derive_signing_key(secret_key, date, region, service);
+    let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+
+    let auth_header = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
+        access_key, credential_scope, signed_headers, signature
+    );
+
+    let full_url = format!("{}{}", endpoint, path);
+    reqwest::Client::new()
+        .put(&full_url)
+        .header("authorization", auth_header)
+        .header("x-amz-date", timestamp)
+        .header("x-amz-content-sha256", &payload_hash)
+        .header("host", host)
+}
+
 // ============================================================================
 // 1. Presigned URL tests
 // ============================================================================
@@ -529,7 +585,10 @@ async fn test_no_auth_header_rejected_when_auth_enabled() {
 // 4. Replay attack detection
 // ============================================================================
 
-/// Sending the exact same signed request twice within 5 seconds should trigger replay detection.
+/// Sending the exact same signed PUT request twice within 5 seconds should trigger replay detection.
+/// Replay detection only applies to mutating methods (PUT/DELETE) — idempotent methods
+/// (GET/HEAD) are exempt because clients legitimately retry them and sequential probes
+/// (e.g. checksum auto-detection) can produce identical signatures.
 #[tokio::test]
 async fn test_replay_attack_detected() {
     let server = TestServer::builder()
@@ -538,10 +597,10 @@ async fn test_replay_attack_detected() {
         .await;
 
     let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-    let path = format!("/{}", server.bucket());
+    let path = format!("/{}/replay-test.txt", server.bucket());
 
-    // First request — should succeed (or at least not be flagged as replay)
-    let resp1 = build_signed_get(&server.endpoint(), &path, "testkey", "testsecret", &now)
+    // Use PUT (mutating method) — replay detection applies to these.
+    let resp1 = build_signed_put(&server.endpoint(), &path, "testkey", "testsecret", &now)
         .send()
         .await
         .unwrap();
@@ -549,14 +608,14 @@ async fn test_replay_attack_detected() {
     let status1 = resp1.status();
 
     // Same exact request (same signature because same timestamp+path+key)
-    let resp2 = build_signed_get(&server.endpoint(), &path, "testkey", "testsecret", &now)
+    let resp2 = build_signed_put(&server.endpoint(), &path, "testkey", "testsecret", &now)
         .send()
         .await
         .unwrap();
 
     // The first request should succeed (valid credentials, current timestamp).
     assert!(
-        status1.is_success() || status1 == StatusCode::NOT_FOUND,
+        status1.is_success(),
         "first request should not be rejected, got {}",
         status1
     );
@@ -566,6 +625,42 @@ async fn test_replay_attack_detected() {
     assert!(
         resp2.status() == StatusCode::BAD_REQUEST || resp2.status() == StatusCode::FORBIDDEN,
         "replayed request should be rejected as 400 or 403, got {}",
+        resp2.status()
+    );
+}
+
+/// Sending the same signed GET request twice should NOT trigger replay detection,
+/// because idempotent methods are exempt. This prevents false rejections of
+/// sequential HEAD probes (checksum auto-detection) and legitimate retries.
+#[tokio::test]
+async fn test_idempotent_requests_not_flagged_as_replay() {
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .build()
+        .await;
+
+    let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let path = format!("/{}", server.bucket());
+
+    // Send two identical GET requests with the same timestamp
+    let resp1 = build_signed_get(&server.endpoint(), &path, "testkey", "testsecret", &now)
+        .send()
+        .await
+        .unwrap();
+    let resp2 = build_signed_get(&server.endpoint(), &path, "testkey", "testsecret", &now)
+        .send()
+        .await
+        .unwrap();
+
+    // Both should succeed — GET is idempotent, no replay rejection
+    assert!(
+        resp1.status().is_success() || resp1.status() == StatusCode::NOT_FOUND,
+        "first GET should not be rejected, got {}",
+        resp1.status()
+    );
+    assert!(
+        resp2.status().is_success() || resp2.status() == StatusCode::NOT_FOUND,
+        "second GET should not be flagged as replay, got {}",
         resp2.status()
     );
 }
