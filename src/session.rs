@@ -90,8 +90,8 @@ impl SessionStore {
                 .min_by_key(|(_, info)| info.created_at)
                 .map(|(token, _)| token.clone())
             {
-                tracing::debug!(
-                    "Evicting oldest session to make room (max {})",
+                tracing::warn!(
+                    "Evicting oldest admin session to make room (max {})",
                     MAX_SESSIONS
                 );
                 sessions.remove(&oldest_token);

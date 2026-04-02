@@ -70,7 +70,15 @@ async fn compute_stats(
     let buckets_to_scan: Vec<String> = if let Some(bucket) = bucket_filter {
         vec![bucket.to_string()]
     } else {
-        state.engine.load().list_buckets().await.unwrap_or_default()
+        state
+            .engine
+            .load()
+            .list_buckets()
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("Stats: failed to list buckets: {}", e);
+                Vec::new()
+            })
     };
 
     const SCAN_LIMIT: u64 = 1000;

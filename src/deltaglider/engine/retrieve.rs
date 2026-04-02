@@ -285,6 +285,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 let result = tokio::task::spawn_blocking(move || codec.decode(&ref_clone, &delta))
                     .await
                     .map_err(|e| {
+                        tracing::error!("Delta decode task panicked: {}", e);
                         EngineError::Storage(StorageError::Other(format!(
                             "codec task panicked: {}",
                             e
