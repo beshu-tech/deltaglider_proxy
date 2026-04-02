@@ -66,6 +66,10 @@ impl ConfigDb {
         // Enable foreign keys (per-connection setting, not persisted)
         conn.pragma_update(None, "foreign_keys", "ON")?;
 
+        // Wait up to 5s for locks instead of failing immediately.
+        // Prevents "database is locked" errors during concurrent S3 sync + admin ops.
+        conn.pragma_update(None, "busy_timeout", "5000")?;
+
         // Run migrations
         Self::migrate(&conn)?;
 
@@ -299,6 +303,7 @@ impl ConfigDb {
         })?;
         // Per-connection settings (not persisted in DB)
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "busy_timeout", "5000")?;
         self.conn = conn;
         info!("Config database re-opened after S3 sync");
         Ok(())

@@ -142,6 +142,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let delta = tokio::task::spawn_blocking(move || codec.encode(&ref_clone, &data_owned))
             .await
             .map_err(|e| {
+                tracing::error!("Delta encode task panicked: {}", e);
                 EngineError::Storage(StorageError::Other(format!("codec task panicked: {}", e)))
             })??;
         let encode_secs = encode_start.elapsed().as_secs_f64();

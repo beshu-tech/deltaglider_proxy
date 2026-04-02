@@ -221,11 +221,18 @@ fn verify_signature(
         chrono::NaiveDateTime::parse_from_str(&params.amz_date, "%Y%m%dT%H%M%SZ")
     {
         let now = chrono::Utc::now().naive_utc();
-        let skew = (now - request_time).num_seconds().unsigned_abs();
+        let diff_secs = (now - request_time).num_seconds();
+        let skew = diff_secs.unsigned_abs();
         if skew > max_skew_secs {
+            let direction = if diff_secs > 0 {
+                "client behind server"
+            } else {
+                "server behind client"
+            };
             warn!(
-                "SigV4: request time skew {}s exceeds {}-second limit (request: {}, server: {})",
+                "SigV4: clock skew {}s ({}) exceeds {}-second limit (request: {}, server: {})",
                 skew,
+                direction,
                 max_skew_secs,
                 params.amz_date,
                 now.format("%Y%m%dT%H%M%SZ")
@@ -307,7 +314,14 @@ fn verify_signature(
         .ct_ne(params.signature.as_bytes())
         .into()
     {
-        warn!("SigV4: signature mismatch");
+        warn!(
+            "SigV4: signature mismatch — {} {} scope={} computed={}… provided={}…",
+            method,
+            uri_path,
+            params.credential_scope,
+            &computed_signature[..computed_signature.len().min(12)],
+            &params.signature[..params.signature.len().min(12)]
+        );
         return Err(S3Error::SignatureDoesNotMatch.into_response());
     }
 
@@ -614,7 +628,10 @@ pub async fn sigv4_auth_middleware(
 
             if rejected {
                 warn!(
-                    "SigV4: replay attack detected (duplicate signature within {:?})",
+                    "SigV4: replay detected — {} {} sig={}… (duplicate within {:?})",
+                    request.method(),
+                    request.uri().path(),
+                    &params.signature[..params.signature.len().min(12)],
                     replay_window
                 );
                 record_auth_failure("replay");

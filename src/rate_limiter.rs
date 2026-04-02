@@ -46,10 +46,10 @@ impl RateLimiter {
         }
     }
 
-    /// Create a rate limiter from environment variables with secure defaults:
-    /// - `DGP_RATE_LIMIT_MAX_ATTEMPTS`: max failures before lockout (default: 10)
-    /// - `DGP_RATE_LIMIT_WINDOW_SECS`: rolling window in seconds (default: 900 = 15 min)
-    /// - `DGP_RATE_LIMIT_LOCKOUT_SECS`: lockout duration in seconds (default: 1800 = 30 min)
+    /// Create a rate limiter from environment variables with defaults:
+    /// - `DGP_RATE_LIMIT_MAX_ATTEMPTS`: max failures before lockout (default: 100)
+    /// - `DGP_RATE_LIMIT_WINDOW_SECS`: rolling window in seconds (default: 300 = 5 min)
+    /// - `DGP_RATE_LIMIT_LOCKOUT_SECS`: lockout duration in seconds (default: 600 = 10 min)
     pub fn default_auth() -> Self {
         let max_attempts = std::env::var("DGP_RATE_LIMIT_MAX_ATTEMPTS")
             .ok()
