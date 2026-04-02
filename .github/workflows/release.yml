@@ -88,9 +88,11 @@ jobs:
         run: cargo check
 
   # ── Job 3a: Build Linux x86_64 (self-hosted, builder image) ────────
+  # Depends on ci (not validate) — builds start as soon as CI passes.
+  # validate runs in parallel as a sanity check; finalize waits for both.
   build-linux-x86_64:
     name: Build x86_64-unknown-linux-gnu
-    needs: validate
+    needs: ci
     runs-on: k3s
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
@@ -118,20 +120,20 @@ jobs:
         run: |
           cd target/x86_64-unknown-linux-gnu/release
           strip ${{ env.BINARY_NAME }} || true
-          tar czvf ../../../${{ env.BINARY_NAME }}-v${{ needs.validate.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz ${{ env.BINARY_NAME }}
+          tar czvf ../../../${{ env.BINARY_NAME }}-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz ${{ env.BINARY_NAME }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ env.BINARY_NAME }}-x86_64-unknown-linux-gnu
-          path: ${{ env.BINARY_NAME }}-v${{ needs.validate.outputs.version }}-x86_64-unknown-linux-gnu.*
+          path: ${{ env.BINARY_NAME }}-${{ github.ref_name }}-x86_64-unknown-linux-gnu.*
           if-no-files-found: error
           retention-days: 1
 
   # ── Job 3b: Build non-x86_64 targets (GitHub-hosted runners) ───────
   build-other:
     name: Build ${{ matrix.target }}
-    needs: validate
+    needs: ci
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -188,13 +190,13 @@ jobs:
         run: |
           cd target/${{ matrix.target }}/release
           strip ${{ env.BINARY_NAME }} || true
-          tar czvf ../../../${{ env.BINARY_NAME }}-v${{ needs.validate.outputs.version }}-${{ matrix.target }}.tar.gz ${{ env.BINARY_NAME }}
+          tar czvf ../../../${{ env.BINARY_NAME }}-${{ github.ref_name }}-${{ matrix.target }}.tar.gz ${{ env.BINARY_NAME }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ env.BINARY_NAME }}-${{ matrix.target }}
-          path: ${{ env.BINARY_NAME }}-v${{ needs.validate.outputs.version }}-${{ matrix.target }}.*
+          path: ${{ env.BINARY_NAME }}-${{ github.ref_name }}-${{ matrix.target }}.*
           if-no-files-found: error
           retention-days: 1
 
@@ -203,7 +205,7 @@ jobs:
   # This cuts ARM64 build time from ~40min (QEMU) to ~6min (native).
   docker-build:
     name: Docker ${{ matrix.platform }}
-    needs: validate
+    needs: ci
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
