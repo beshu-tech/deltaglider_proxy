@@ -556,13 +556,19 @@ pub async fn sigv4_auth_middleware(
     // the get() check before either inserted. Fixed by using the entry() API which
     // acquires the per-key shard lock for the entire check-and-insert sequence.
     //
-    // Replay detection: skip for presigned URLs (they're designed to be reused —
-    // the same signature is valid for the entire expiry window).
-    // For regular SigV4 requests, use a 2-second window to catch network retries.
+    // Skip replay detection for:
+    // - Presigned URLs: designed to be reused (same signature for entire expiry window)
+    // - Idempotent methods (GET/HEAD): clients legitimately retry these, and sequential
+    //   HEAD probes (e.g. checksum auto-detection) can produce identical signatures when
+    //   they land in the same timestamp second. Rejecting these causes false 400s.
     let is_presigned = has_presigned_query_params(request.uri().query().unwrap_or(""));
+    let is_idempotent = matches!(
+        *request.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD
+    );
     if let Some(ref cache) = replay_cache {
-        if is_presigned {
-            // Presigned URLs have fixed signatures — replay detection doesn't apply
+        if is_presigned || is_idempotent {
+            // No replay detection for presigned URLs or idempotent methods
         } else {
             // Cap replay cache size to prevent memory exhaustion under attack.
             // Evict expired entries first; only if still over cap, evict oldest half.
