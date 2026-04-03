@@ -1,4 +1,6 @@
-# CI Infrastructure Guide
+# CI Infrastructure
+
+*Build, test, and deployment pipeline*
 
 This document describes the self-hosted CI infrastructure for DeltaGlider Proxy, the design decisions behind it, and how to reproduce or adapt this setup for other Rust projects.
 

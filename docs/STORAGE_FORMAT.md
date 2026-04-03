@@ -1,4 +1,6 @@
-# Storage format
+# Storage Format
+
+*On-disk layout and metadata schema*
 
 This document is for debugging, incident response, and "what exactly is in my bucket?" curiosity.
 

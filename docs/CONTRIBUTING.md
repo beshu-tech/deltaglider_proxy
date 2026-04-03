@@ -1,4 +1,6 @@
-# Contributing to DeltaGlider Proxy
+# Contributing
+
+*Build, test, project structure*
 
 Thanks for your interest in contributing! Whether it's a bug report, feature idea, or code change, we appreciate your help.
 
