@@ -27,6 +27,7 @@ ENTERPRISE_STRATEGY.md
 # Debugging screenshots & logs
 *.png
 !docs/*.png
+!docs/screenshots/*.png
 .playwright-mcp/
 
 # OS
