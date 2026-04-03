@@ -144,7 +144,7 @@ export default function DocsPage({ initialDoc }: Props) {
         ))}
       </nav>
 
-      {/* Center: markdown content */}
+      {/* Center: markdown content + sticky ToC */}
       <div
         ref={contentRef}
         style={{
@@ -153,83 +153,82 @@ export default function DocsPage({ initialDoc }: Props) {
           padding: 'clamp(20px, 4vw, 40px)',
         }}
       >
-        {selectedDoc && (
-          <article className="docs-content" style={{ maxWidth: 800, margin: '0 auto' }}>
-            <ReactMarkdown
-              remarkPlugins={[remarkGfm]}
-              rehypePlugins={[rehypeHighlight, rehypeSlug]}
-              components={{
-                // Inter-page link resolution
-                a: ({ href, children, ...props }) => {
-                  if (href && href.endsWith('.md')) {
-                    return (
-                      <a
-                        {...props}
-                        href="#"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          handleLinkClick(href);
-                        }}
-                        style={{ color: colors.ACCENT_BLUE, cursor: 'pointer' }}
-                      >
-                        {children}
-                      </a>
-                    );
-                  }
-                  // External links open in new tab
-                  if (href && (href.startsWith('http://') || href.startsWith('https://'))) {
-                    return <a {...props} href={href} target="_blank" rel="noopener noreferrer">{children}</a>;
-                  }
-                  return <a {...props} href={href}>{children}</a>;
-                },
-              }}
-            >
-              {selectedDoc.content}
-            </ReactMarkdown>
-          </article>
-        )}
-      </div>
+        <div style={{ display: 'flex', gap: 32, maxWidth: 1100, margin: '0 auto' }}>
+          {/* Markdown content */}
+          {selectedDoc && (
+            <article className="docs-content" style={{ flex: 1, minWidth: 0 }}>
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                rehypePlugins={[rehypeHighlight, rehypeSlug]}
+                components={{
+                  a: ({ href, children, ...props }) => {
+                    if (href && href.endsWith('.md')) {
+                      return (
+                        <a
+                          {...props}
+                          href="#"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            handleLinkClick(href);
+                          }}
+                        >
+                          {children}
+                        </a>
+                      );
+                    }
+                    if (href && (href.startsWith('http://') || href.startsWith('https://'))) {
+                      return <a {...props} href={href} target="_blank" rel="noopener noreferrer">{children}</a>;
+                    }
+                    return <a {...props} href={href}>{children}</a>;
+                  },
+                }}
+              >
+                {selectedDoc.content}
+              </ReactMarkdown>
+            </article>
+          )}
 
-      {/* Right sidebar: ToC */}
-      {headings.length > 2 && (
-        <nav className="docs-toc" style={{
-          width: 180,
-          flexShrink: 0,
-          borderLeft: `1px solid ${colors.BORDER}`,
-          overflowY: 'auto',
-          padding: '16px 12px',
-          position: 'sticky',
-          top: 0,
-          alignSelf: 'flex-start',
-          maxHeight: '100vh',
-        }}>
-          <div style={{
-            fontSize: 10,
-            fontWeight: 700,
-            textTransform: 'uppercase',
-            letterSpacing: 1.5,
-            color: colors.TEXT_FAINT,
-            fontFamily: 'var(--font-ui)',
-            marginBottom: 8,
-          }}>
-            On this page
-          </div>
-          {headings.map(h => (
-            <a
-              key={h.id}
-              href={`#${h.id}`}
-              className={`${h.level === 3 ? 'toc-h3' : ''} ${activeHeading === h.id ? 'active' : ''}`}
-              onClick={(e) => {
-                e.preventDefault();
-                const el = contentRef.current?.querySelector(`#${CSS.escape(h.id)}`);
-                el?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-              }}
-            >
-              {h.text}
-            </a>
-          ))}
-        </nav>
-      )}
+          {/* ToC — sticky inside the scroll container */}
+          {headings.length > 2 && (
+            <nav className="docs-toc" style={{
+              width: 180,
+              flexShrink: 0,
+              position: 'sticky',
+              top: 0,
+              alignSelf: 'flex-start',
+              maxHeight: 'calc(100vh - 80px)',
+              overflowY: 'auto',
+              paddingTop: 8,
+            }}>
+              <div style={{
+                fontSize: 10,
+                fontWeight: 700,
+                textTransform: 'uppercase',
+                letterSpacing: 1.5,
+                color: colors.TEXT_FAINT,
+                fontFamily: 'var(--font-ui)',
+                marginBottom: 8,
+              }}>
+                On this page
+              </div>
+              {headings.map(h => (
+                <a
+                  key={h.id}
+                  href={`#${h.id}`}
+                  className={`${h.level === 3 ? 'toc-h3' : ''} ${activeHeading === h.id ? 'active' : ''}`}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    const el = contentRef.current?.querySelector(`#${CSS.escape(h.id)}`);
+                    el?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                  }}
+                >
+                  {h.text}
+                </a>
+              ))}
+            </nav>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
