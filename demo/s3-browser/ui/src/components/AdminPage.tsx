@@ -26,9 +26,7 @@ const TAB_KEY_TO_HASH: Record<string, string> = {
   users: '#/admin/users',
   groups: '#/admin/groups',
   metrics: '#/admin/metrics',
-  connection: '#/admin/connection',
   backend: '#/admin/backend',
-  proxy: '#/admin/proxy',
   security: '#/admin/bootstrap',
 };
 
@@ -37,9 +35,7 @@ const HASH_TO_TAB: Record<string, string> = {
   '#/admin/users': 'users',
   '#/admin/groups': 'groups',
   '#/admin/metrics': 'metrics',
-  '#/admin/connection': 'connection',
   '#/admin/backend': 'backend',
-  '#/admin/proxy': 'proxy',
   '#/admin/bootstrap': 'security',
 };
 

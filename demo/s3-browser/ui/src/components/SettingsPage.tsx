@@ -6,7 +6,6 @@ import { getAdminConfig, updateAdminConfig, testS3Connection } from '../adminApi
 import { useColors } from '../ThemeContext';
 import { useCardStyles } from './shared-styles';
 import SectionHeader from './SectionHeader';
-import BrowserConnectionCard from './BrowserConnectionCard';
 import PasswordChangeCard from './PasswordChangeCard';
 
 
@@ -161,7 +160,6 @@ export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: 
 
   /* -- Tab: Connection ---------------------------------------------------- */
 
-  const connectionTab = <div style={tabPane}><BrowserConnectionCard /></div>;
 
   /* -- Tab: Backend ------------------------------------------------------- */
 
@@ -535,7 +533,6 @@ export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: 
   // When embedded in AdminPage, render just the requested tab content
   if (embeddedTab) {
     const tabMap: Record<string, React.ReactNode> = {
-      connection: connectionTab,
       backend: backendTab,
       compression: compressionTab,
       limits: limitsTab,
