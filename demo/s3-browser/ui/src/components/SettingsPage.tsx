@@ -358,131 +358,25 @@ export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: 
 
   /* -- Tab: Proxy --------------------------------------------------------- */
 
-  const proxyTab = (
-    <div style={tabPane}><form onSubmit={(e) => { e.preventDefault(); handleSave(); }}><Space orientation="vertical" size={0} style={{ width: '100%' }}>
-      <div style={cardStyle}>
-        <SectionHeader icon={<SafetyOutlined />} title="Proxy Tuning" />
+  /* -- Helper: read-only display field ------------------------------------ */
+  const readOnlyField = (label: string, value: string | number | boolean | undefined, description?: string, badge?: string) => (
+    <div style={{ marginTop: 16 }}>
+      <span style={labelStyle}>
+        {label}
+        {badge && <span style={{ fontSize: 10, color: colors.ACCENT_AMBER, marginLeft: 8, fontWeight: 400 }}>{badge}</span>}
+      </span>
+      <Input value={String(value ?? '—')} readOnly style={{ ...inputRadius, fontFamily: "var(--font-mono)", fontSize: 13, opacity: 0.7 }} />
+      {description && <Text type="secondary" style={{ fontSize: 12, fontFamily: "var(--font-ui)" }}>{description}</Text>}
+    </div>
+  );
 
-        <div style={{ marginTop: 16 }}>
-          <span style={labelStyle}>Max Delta Ratio</span>
-          <InputNumber
-            value={maxDeltaRatio}
-            onChange={(v) => v !== null && setMaxDeltaRatio(v)}
-            min={0}
-            max={1}
-            step={0.05}
-            style={{ width: '100%', ...inputRadius }}
-          />
-          <Text type="secondary" style={{ fontSize: 12, fontFamily: "var(--font-ui)" }}>
-            Store as delta only if delta_size/original_size is below this ratio.
-          </Text>
-        </div>
-
-        <div style={{ marginTop: 16 }}>
-          <span style={labelStyle}>Max Object Size (MB)</span>
-          <InputNumber
-            value={maxObjectSizeMb}
-            onChange={(v) => v !== null && setMaxObjectSizeMb(v)}
-            min={1}
-            step={10}
-            style={{ width: '100%', ...inputRadius }}
-          />
-        </div>
-
-        <div style={{ marginTop: 16 }}>
-          <span style={labelStyle}>Cache Size (MB)</span>
-          <InputNumber
-            value={cacheSizeMb}
-            onChange={(v) => v !== null && setCacheSizeMb(v)}
-            min={1}
-            step={10}
-            style={{ width: '100%', ...inputRadius }}
-          />
-          <Text type="secondary" style={{ fontSize: 12, fontFamily: "var(--font-ui)" }}>
-            Reference cache size. Changes require restart.
-          </Text>
-        </div>
-      </div>
-
-      <div style={cardStyle}>
-        <SectionHeader icon={<ControlOutlined />} title="Logging" />
-
-        <div style={{ marginTop: 16 }}>
-          <span style={labelStyle}>Log Level</span>
-          <Radio.Group
-            value={logLevelCustom ? '__custom__' : logLevel}
-            onChange={(e) => {
-              const val = e.target.value;
-              if (val === '__custom__') {
-                setLogLevelCustom(true);
-              } else {
-                setLogLevelCustom(false);
-                setLogLevel(val);
-              }
-            }}
-            style={{ display: 'flex', flexWrap: 'wrap', gap: 0 }}
-          >
-            {LOG_LEVEL_PRESETS.map(p => (
-              <Radio.Button key={p.value} value={p.value} style={{ fontSize: 13 }}>
-                {p.label}
-              </Radio.Button>
-            ))}
-          </Radio.Group>
-        </div>
-
-        {logLevelCustom && (
-          <div style={{ marginTop: 12 }}>
-            <span style={labelStyle}>Custom Filter (RUST_LOG syntax)</span>
-            <Input
-              value={logLevel}
-              onChange={(e) => setLogLevel(e.target.value)}
-              placeholder="deltaglider_proxy=debug,tower_http=info"
-              style={{ ...inputRadius, fontFamily: "var(--font-mono)", fontSize: 13 }}
-            />
-            <Text type="secondary" style={{ fontSize: 12, fontFamily: "var(--font-ui)" }}>
-              Comma-separated tracing directives, e.g. "deltaglider_proxy=debug,tower_http=warn"
-            </Text>
-          </div>
-        )}
-      </div>
-
-      <div style={cardStyle}>
-        <SectionHeader icon={<KeyOutlined />} title="Proxy Authentication (SigV4)" />
-
-        <div style={{ marginTop: 16 }}>
-          <span style={labelStyle}>Access Key ID</span>
-          <Input
-            value={accessKeyId}
-            onChange={(e) => setAccessKeyId(e.target.value)}
-            placeholder="Leave empty to disable auth"
-            style={{ ...inputRadius, fontFamily: "var(--font-mono)", fontSize: 13 }}
-          />
-        </div>
-
-        <div style={{ marginTop: 12 }}>
-          <span style={labelStyle}>Secret Access Key</span>
-          <input type="text" autoComplete="username" value={accessKeyId} readOnly aria-hidden="true" style={{ display: 'none' }} />
-          <Input.Password
-            value={secretAccessKey}
-            onChange={(e) => setSecretAccessKey(e.target.value)}
-            placeholder="Leave empty to keep current"
-            autoComplete="off"
-            style={{ ...inputRadius }}
-          />
-        </div>
-      </div>
-
+  /* -- Save button + result shared across editable tabs ------------------- */
+  const saveSection = (
+    <>
       {saveResult && (
         <>
           {saveResult.requires_restart && (
-            <Alert
-              type="warning"
-              icon={<WarningOutlined />}
-              message="Restart Required"
-              description={saveResult.warnings.join('. ')}
-              showIcon
-              style={{ borderRadius: 8, marginBottom: 16 }}
-            />
+            <Alert type="warning" icon={<WarningOutlined />} message="Restart Required" description={saveResult.warnings.join('. ')} showIcon style={{ borderRadius: 8, marginBottom: 16 }} />
           )}
           {saveResult.warnings.length > 0 && !saveResult.requires_restart && (
             <Alert type="info" message={saveResult.warnings.join('. ')} showIcon style={{ borderRadius: 8, marginBottom: 16 }} />
@@ -492,38 +386,164 @@ export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: 
           )}
         </>
       )}
-
-      <Button
-        type="primary"
-        icon={<SaveOutlined />}
-        loading={saving}
-        onClick={handleSave}
-        block
-        size="large"
-        style={{
-          borderRadius: 10,
-          height: 48,
-          fontWeight: 700,
-          fontFamily: "var(--font-ui)",
-          fontSize: 15,
-        }}
-      >
+      <Button type="primary" icon={<SaveOutlined />} loading={saving} onClick={handleSave} block size="large"
+        style={{ borderRadius: 10, height: 48, fontWeight: 700, fontFamily: "var(--font-ui)", fontSize: 15 }}>
         Save Configuration
       </Button>
+    </>
+  );
+
+  /* -- Tab: Compression --------------------------------------------------- */
+  const compressionTab = (
+    <div style={tabPane}><form onSubmit={(e) => { e.preventDefault(); handleSave(); }}><Space direction="vertical" size={0} style={{ width: '100%' }}>
+      <div style={cardStyle}>
+        <SectionHeader icon={<SafetyOutlined />} title="Delta Encoding" description="Controls when files are stored as deltas vs full copies" />
+        <div style={{ marginTop: 16 }}>
+          <span style={labelStyle}>Max Delta Ratio</span>
+          <InputNumber value={maxDeltaRatio} onChange={(v) => v !== null && setMaxDeltaRatio(v)} min={0} max={1} step={0.05} style={{ width: '100%', ...inputRadius }} />
+          <Text type="secondary" style={{ fontSize: 12, fontFamily: "var(--font-ui)" }}>
+            Store as delta only if compressed size is less than this fraction of the original. E.g. 0.75 means deltas must save at least 25% space.
+          </Text>
+        </div>
+        <div style={{ marginTop: 16 }}>
+          <span style={labelStyle}>Max Object Size (MB)</span>
+          <InputNumber value={maxObjectSizeMb} onChange={(v) => v !== null && setMaxObjectSizeMb(v)} min={1} step={10} style={{ width: '100%', ...inputRadius }} />
+          <Text type="secondary" style={{ fontSize: 12, fontFamily: "var(--font-ui)" }}>
+            Files larger than this are always stored as-is (xdelta3 memory constraint).
+          </Text>
+        </div>
+      </div>
+
+      <div style={cardStyle}>
+        <SectionHeader icon={<DatabaseOutlined />} title="Cache" description="In-memory caches that speed up reads. Larger = faster but more RAM." />
+        <div style={{ marginTop: 16 }}>
+          <span style={labelStyle}>Reference Cache Size (MB) <span style={{ fontSize: 10, color: colors.ACCENT_AMBER }}>restart required</span></span>
+          <InputNumber value={cacheSizeMb} onChange={(v) => v !== null && setCacheSizeMb(v)} min={0} step={100} style={{ width: '100%', ...inputRadius }} />
+          <Text type="secondary" style={{ fontSize: 12, fontFamily: "var(--font-ui)" }}>
+            Cache for delta baselines. Each active deltaspace needs its reference in cache for fast reconstruction. Recommend 1024+ MB for production.
+          </Text>
+        </div>
+        {readOnlyField('Metadata Cache (MB)', config?.metadata_cache_mb, 'Cache for object metadata (HEAD/LIST). Eliminates redundant S3 HEAD calls.', 'restart required')}
+      </div>
+
+      <div style={cardStyle}>
+        <SectionHeader icon={<ControlOutlined />} title="Advanced Compression" description="Codec subprocess settings — usually auto-configured." />
+        {readOnlyField('Codec Concurrency', config?.codec_concurrency, 'Max parallel xdelta3 encode/decode operations. Auto-detected from CPU cores.', 'restart required')}
+        {readOnlyField('Codec Timeout (seconds)', config?.codec_timeout_secs, 'Kill xdelta3 subprocess if it takes longer than this. Prevents hung processes.', 'restart required')}
+      </div>
+
+      {saveSection}
     </Space></form></div>
   );
 
-  /* -- Tab: Security ------------------------------------------------------ */
+  /* -- Tab: Limits -------------------------------------------------------- */
+  const limitsTab = (
+    <div style={tabPane}><Space direction="vertical" size={0} style={{ width: '100%' }}>
+      <div style={cardStyle}>
+        <SectionHeader icon={<SafetyOutlined />} title="Request Limits" description="Protect the server from overload and abuse. All require restart to change." />
+        {readOnlyField('Request Timeout (seconds)', config?.request_timeout_secs, 'Maximum time for any single request. Returns HTTP 504 Gateway Timeout when exceeded.', 'restart required')}
+        {readOnlyField('Max Concurrent Requests', config?.max_concurrent_requests, 'Maximum in-flight HTTP requests. Additional requests queue until a slot opens.', 'restart required')}
+        {readOnlyField('Max Multipart Uploads', config?.max_multipart_uploads, 'Maximum concurrent multipart uploads. Each holds part data in memory.', 'restart required')}
+      </div>
+    </Space></div>
+  );
 
-  const securityTab = <div style={tabPane}><PasswordChangeCard /></div>;
+  /* -- Tab: Security ------------------------------------------------------ */
+  const [showAdvancedSecurity, setShowAdvancedSecurity] = useState(false);
+
+  const securityTab = (
+    <div style={tabPane}><form onSubmit={(e) => { e.preventDefault(); handleSave(); }}><Space direction="vertical" size={0} style={{ width: '100%' }}>
+      <div style={cardStyle}>
+        <SectionHeader icon={<KeyOutlined />} title="Authentication" description="Controls how S3 clients authenticate with the proxy" />
+        <div style={{ marginTop: 16 }}>
+          <span style={labelStyle}>Access Key ID</span>
+          <Input value={accessKeyId} onChange={(e) => setAccessKeyId(e.target.value)} placeholder="AKIAIOSFODNN7EXAMPLE" style={{ ...inputRadius, fontFamily: "var(--font-mono)", fontSize: 13 }} />
+          <Text type="secondary" style={{ fontSize: 12, fontFamily: "var(--font-ui)" }}>Clients use this key to sign S3 requests. Leave empty to disable auth.</Text>
+        </div>
+        <div style={{ marginTop: 12 }}>
+          <span style={labelStyle}>Secret Access Key</span>
+          <input type="text" autoComplete="username" value={accessKeyId} readOnly aria-hidden="true" style={{ display: 'none' }} />
+          <Input.Password value={secretAccessKey} onChange={(e) => setSecretAccessKey(e.target.value)} placeholder="Leave empty to keep current" autoComplete="off" style={{ ...inputRadius }} />
+          <Text type="secondary" style={{ fontSize: 12, fontFamily: "var(--font-ui)" }}>Shared secret for SigV4 signature verification.</Text>
+        </div>
+      </div>
+
+      <PasswordChangeCard />
+
+      <div style={{ ...cardStyle, cursor: 'pointer' }} onClick={() => setShowAdvancedSecurity(!showAdvancedSecurity)}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <SectionHeader icon={<LockOutlined />} title="Advanced Security" description="Rate limiting, session, and protocol settings" />
+          <Switch checked={showAdvancedSecurity} onChange={setShowAdvancedSecurity} size="small" />
+        </div>
+      </div>
+
+      {showAdvancedSecurity && (
+        <>
+          <div style={cardStyle}>
+            <SectionHeader icon={<SafetyOutlined />} title="Session & Headers" />
+            {readOnlyField('Trust Proxy Headers', config?.trust_proxy_headers ? 'Enabled' : 'Disabled', 'Trust X-Forwarded-For/X-Real-IP for rate limiting and IAM conditions. Disable if exposed directly to the internet.', 'restart required')}
+            {readOnlyField('Session TTL (hours)', config?.session_ttl_hours, 'Admin session expiry. Lower = more secure, higher = less frequent re-login.', 'restart required')}
+            {readOnlyField('Clock Skew Tolerance (seconds)', config?.clock_skew_seconds, 'Maximum allowed time difference between client and server clocks for SigV4 signatures. 300 = 5 minutes, matches AWS S3.', 'restart required')}
+            {readOnlyField('Secure Cookies', config?.secure_cookies ? 'Enabled' : 'Disabled', 'Require HTTPS for admin session cookies. Disable only for local development.', 'restart required')}
+            {readOnlyField('Debug Headers', config?.debug_headers ? 'Enabled' : 'Disabled', 'Expose x-amz-storage-type and x-deltaglider-cache headers. Disable in production.', 'restart required')}
+          </div>
+
+          <div style={cardStyle}>
+            <SectionHeader icon={<LockOutlined />} title="Rate Limiting" description="Brute-force protection for authentication endpoints" />
+            {readOnlyField('Max Attempts', config?.rate_limit_max_attempts, 'Failed auth attempts before IP lockout.', 'restart required')}
+            {readOnlyField('Window (seconds)', config?.rate_limit_window_secs, 'Rolling time window for counting failures.', 'restart required')}
+            {readOnlyField('Lockout Duration (seconds)', config?.rate_limit_lockout_secs, 'How long a locked-out IP is blocked.', 'restart required')}
+            {readOnlyField('Replay Window (seconds)', config?.replay_window_secs, 'Duplicate SigV4 signature rejection window. Lower = fewer false positives.', 'restart required')}
+          </div>
+        </>
+      )}
+
+      {saveSection}
+    </Space></form></div>
+  );
+
+  /* -- Tab: Logging ------------------------------------------------------- */
+  const loggingTab = (
+    <div style={tabPane}><form onSubmit={(e) => { e.preventDefault(); handleSave(); }}><Space direction="vertical" size={0} style={{ width: '100%' }}>
+      <div style={cardStyle}>
+        <SectionHeader icon={<ControlOutlined />} title="Log Level" description="Controls verbosity of proxy logs. Changes take effect immediately." />
+        <div style={{ marginTop: 16 }}>
+          <Radio.Group
+            value={logLevelCustom ? '__custom__' : logLevel}
+            onChange={(e) => {
+              const val = e.target.value;
+              if (val === '__custom__') { setLogLevelCustom(true); } else { setLogLevelCustom(false); setLogLevel(val); }
+            }}
+            style={{ display: 'flex', flexWrap: 'wrap', gap: 0 }}
+          >
+            {LOG_LEVEL_PRESETS.map(p => (
+              <Radio.Button key={p.value} value={p.value} style={{ fontSize: 13 }}>{p.label}</Radio.Button>
+            ))}
+          </Radio.Group>
+        </div>
+        {logLevelCustom && (
+          <div style={{ marginTop: 12 }}>
+            <span style={labelStyle}>Custom Filter (RUST_LOG syntax)</span>
+            <Input value={logLevel} onChange={(e) => setLogLevel(e.target.value)} placeholder="deltaglider_proxy=debug,tower_http=info" style={{ ...inputRadius, fontFamily: "var(--font-mono)", fontSize: 13 }} />
+            <Text type="secondary" style={{ fontSize: 12, fontFamily: "var(--font-ui)" }}>Comma-separated tracing directives, e.g. &quot;deltaglider_proxy=debug,tower_http=warn&quot;</Text>
+          </div>
+        )}
+      </div>
+      {saveSection}
+    </Space></form></div>
+  );
 
   // When embedded in AdminPage, render just the requested tab content
   if (embeddedTab) {
     const tabMap: Record<string, React.ReactNode> = {
       connection: connectionTab,
       backend: backendTab,
-      proxy: proxyTab,
+      compression: compressionTab,
+      limits: limitsTab,
       security: securityTab,
+      logging: loggingTab,
+      // Legacy alias
+      proxy: compressionTab,
     };
     return (
       <div style={{ maxWidth: 640, margin: '0 auto', padding: 'clamp(16px, 3vw, 24px)' }}>
@@ -535,46 +555,11 @@ export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: 
   /* -- Tab items ---------------------------------------------------------- */
 
   const tabItems = [
-    {
-      key: 'connection',
-      label: (
-        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-          <CloudOutlined aria-hidden="true" />
-          <span>Connection</span>
-        </span>
-      ),
-      children: connectionTab,
-    },
-    {
-      key: 'backend',
-      label: (
-        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-          <DatabaseOutlined aria-hidden="true" />
-          <span>Backend</span>
-        </span>
-      ),
-      children: backendTab,
-    },
-    {
-      key: 'proxy',
-      label: (
-        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-          <ControlOutlined aria-hidden="true" />
-          <span>Proxy</span>
-        </span>
-      ),
-      children: proxyTab,
-    },
-    {
-      key: 'security',
-      label: (
-        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-          <LockOutlined aria-hidden="true" />
-          <span>Security</span>
-        </span>
-      ),
-      children: securityTab,
-    },
+    { key: 'backend', label: <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}><DatabaseOutlined aria-hidden="true" /><span>Backend</span></span>, children: backendTab },
+    { key: 'compression', label: <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}><ControlOutlined aria-hidden="true" /><span>Compression</span></span>, children: compressionTab },
+    { key: 'limits', label: <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}><CloudOutlined aria-hidden="true" /><span>Limits</span></span>, children: limitsTab },
+    { key: 'security', label: <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}><LockOutlined aria-hidden="true" /><span>Security</span></span>, children: securityTab },
+    { key: 'logging', label: <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}><ApiOutlined aria-hidden="true" /><span>Logging</span></span>, children: loggingTab },
   ];
 
   return (

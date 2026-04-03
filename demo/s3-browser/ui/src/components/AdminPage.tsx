@@ -51,10 +51,11 @@ const TABS = [
   { key: 'users', label: 'Users', icon: <TeamOutlined /> },
   { key: 'groups', label: 'Groups', icon: <FolderOutlined /> },
   { key: 'metrics', label: 'Metrics', icon: <DashboardOutlined /> },
-  { key: 'connection', label: 'Connection', icon: <CloudOutlined /> },
   { key: 'backend', label: 'Backend', icon: <DatabaseOutlined /> },
-  { key: 'proxy', label: 'Proxy', icon: <ControlOutlined /> },
-  { key: 'security', label: 'Bootstrap', icon: <LockOutlined /> },
+  { key: 'compression', label: 'Compression', icon: <ControlOutlined /> },
+  { key: 'limits', label: 'Limits', icon: <CloudOutlined /> },
+  { key: 'security', label: 'Security', icon: <LockOutlined /> },
+  { key: 'logging', label: 'Logging', icon: <DatabaseOutlined /> },
 ];
 
 interface AdminPageProps {
