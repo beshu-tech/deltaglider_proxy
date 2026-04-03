@@ -115,9 +115,9 @@
 /* Images */
 .docs-content img { max-width: 100%; border-radius: 8px; margin: 12px 0; }
 
-/* Mermaid diagrams — fill width, centered */
+/* Mermaid diagrams — fill width, centered, scale naturally */
 .docs-content [data-mermaid-svg] { width: 100%; margin: 24px 0; }
-.docs-content [data-mermaid-svg] svg { width: 100%; height: auto; max-height: 600px; }
+.docs-content [data-mermaid-svg] svg { width: 100% !important; height: auto !important; }
 
 /* Syntax highlighting — all via CSS variables */
 .docs-content .hljs { background: transparent; color: var(--docs-text); }
