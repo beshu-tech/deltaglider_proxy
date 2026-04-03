@@ -12,7 +12,7 @@ import DropZone from './components/DropZone';
 import UploadPage from './components/UploadPage';
 import ConnectPage from './components/ConnectPage';
 import MetricsPage from './components/MetricsPage';
-import ApiDocsPage from './components/ApiDocsPage';
+import DocsPage from './components/DocsPage';
 import { getBucket, hasCredentials, disconnect, initFromSession, getCredentials } from './s3client';
 import { adminLogout, whoami, checkSession } from './adminApi';
 import type { WhoamiResponse } from './adminApi';
@@ -210,7 +210,7 @@ export default function App() {
     }
 
     if (view === 'docs') {
-      return <ApiDocsPage onBack={() => setView('browser')} />;
+      return <DocsPage />;
     }
 
     if (view === 'upload') {

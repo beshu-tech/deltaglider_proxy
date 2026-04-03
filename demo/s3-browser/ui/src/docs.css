@@ -1,0 +1,181 @@
+/* Markdown content styling — integrates with DeltaGlider dark theme */
+
+.docs-content {
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.8;
+  color: var(--docs-text, #e4e9f2);
+}
+
+.docs-content h1 {
+  font-size: 28px;
+  font-weight: 800;
+  margin: 0 0 16px 0;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--docs-border, #1e2d45);
+  letter-spacing: -0.5px;
+}
+
+.docs-content h2 {
+  font-size: 20px;
+  font-weight: 700;
+  margin: 32px 0 12px 0;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--docs-border, #1e2d45);
+}
+
+.docs-content h3 {
+  font-size: 16px;
+  font-weight: 600;
+  margin: 24px 0 8px 0;
+}
+
+.docs-content h4 {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 20px 0 6px 0;
+}
+
+.docs-content p {
+  margin: 0 0 12px 0;
+}
+
+.docs-content a {
+  color: #2dd4bf;
+  text-decoration: none;
+}
+.docs-content a:hover {
+  text-decoration: underline;
+}
+
+/* Code blocks */
+.docs-content pre {
+  background: #0b1120;
+  border: 1px solid #1e2d45;
+  border-radius: 8px;
+  padding: 16px;
+  overflow-x: auto;
+  margin: 12px 0;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.docs-content code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+
+.docs-content :not(pre) > code {
+  background: rgba(45, 212, 191, 0.08);
+  border: 1px solid rgba(45, 212, 191, 0.15);
+  border-radius: 4px;
+  padding: 1px 6px;
+  color: #5eead4;
+}
+
+/* Tables */
+.docs-content table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 12px 0;
+  font-size: 13px;
+}
+
+.docs-content th {
+  background: #0b1120;
+  font-weight: 600;
+  text-align: left;
+  padding: 10px 12px;
+  border: 1px solid #1e2d45;
+  white-space: nowrap;
+}
+
+.docs-content td {
+  padding: 8px 12px;
+  border: 1px solid #1e2d45;
+  vertical-align: top;
+}
+
+.docs-content tr:nth-child(even) td {
+  background: rgba(11, 17, 32, 0.4);
+}
+
+/* Blockquotes */
+.docs-content blockquote {
+  border-left: 3px solid #2dd4bf;
+  margin: 12px 0;
+  padding: 8px 16px;
+  background: rgba(45, 212, 191, 0.04);
+  color: #8494ab;
+}
+
+.docs-content blockquote p {
+  margin: 0;
+}
+
+/* Lists */
+.docs-content ul, .docs-content ol {
+  padding-left: 24px;
+  margin: 8px 0;
+}
+
+.docs-content li {
+  margin: 4px 0;
+}
+
+/* Horizontal rule */
+.docs-content hr {
+  border: none;
+  border-top: 1px solid #1e2d45;
+  margin: 24px 0;
+}
+
+/* Images */
+.docs-content img {
+  max-width: 100%;
+  border-radius: 8px;
+  margin: 12px 0;
+}
+
+/* Highlight.js theme overrides for dark navy */
+.docs-content .hljs {
+  background: transparent;
+  color: #e4e9f2;
+}
+.docs-content .hljs-keyword { color: #a78bfa; }
+.docs-content .hljs-string { color: #34d399; }
+.docs-content .hljs-number { color: #fbbf24; }
+.docs-content .hljs-comment { color: #5e7290; font-style: italic; }
+.docs-content .hljs-built_in { color: #60a5fa; }
+.docs-content .hljs-attr { color: #fb7185; }
+.docs-content .hljs-title { color: #2dd4bf; }
+.docs-content .hljs-section { color: #2dd4bf; font-weight: 700; }
+.docs-content .hljs-literal { color: #fbbf24; }
+.docs-content .hljs-meta { color: #8494ab; }
+.docs-content .hljs-variable { color: #fb7185; }
+.docs-content .hljs-type { color: #fbbf24; }
+
+/* ToC sidebar */
+.docs-toc {
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.docs-toc a {
+  color: #8494ab;
+  text-decoration: none;
+  display: block;
+  padding: 3px 0;
+  transition: color 0.15s;
+}
+
+.docs-toc a:hover,
+.docs-toc a.active {
+  color: #2dd4bf;
+}
+
+.docs-toc a.toc-h3 {
+  padding-left: 12px;
+  font-size: 11px;
+}

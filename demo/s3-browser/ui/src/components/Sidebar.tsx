@@ -284,7 +284,7 @@ export default function Sidebar({
               onMouseLeave={(e) => { e.currentTarget.style.color = TEXT_SECONDARY; }}
             >
               <FileTextOutlined aria-hidden="true" style={MENU_ICON_STYLE} />
-              <span>API Reference</span>
+              <span>Documentation</span>
             </button>
             {onLogout && (
               <div style={{ padding: '6px 0 2px' }}>
