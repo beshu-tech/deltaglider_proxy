@@ -210,7 +210,7 @@ export default function App() {
     }
 
     if (view === 'docs') {
-      return <DocsPage />;
+      return <DocsPage onBack={() => setView('browser')} />;
     }
 
     if (view === 'upload') {
@@ -296,7 +296,7 @@ export default function App() {
       </a>
 
       <Layout style={{ flexDirection: 'row', flex: 1 }}>
-        {view !== 'admin' && (
+        {view !== 'admin' && view !== 'docs' && (
           <Sidebar
             onUploadClick={() => { setView('upload'); setSiderOpen(false); }}
             onMutate={s3.mutate}
@@ -321,7 +321,7 @@ export default function App() {
         )}
 
         <Layout style={{ flex: 1, background: colors.BG_BASE }}>
-          {view !== 'admin' && (
+          {view !== 'admin' && view !== 'docs' && (
             <TopBar
               prefix={s3.prefix}
               onNavigate={(p) => { setView('browser'); s3.navigate(p); }}

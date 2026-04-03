@@ -1,4 +1,6 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import { Button } from 'antd';
+import { ArrowLeftOutlined } from '@ant-design/icons';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
@@ -29,9 +31,10 @@ function extractHeadings(markdown: string): TocItem[] {
 
 interface Props {
   initialDoc?: string;
+  onBack?: () => void;
 }
 
-export default function DocsPage({ initialDoc }: Props) {
+export default function DocsPage({ initialDoc, onBack }: Props) {
   const colors = useColors();
   const [selectedId, setSelectedId] = useState(initialDoc || DOCS[0]?.id || '');
   const [activeHeading, setActiveHeading] = useState('');
@@ -89,7 +92,34 @@ export default function DocsPage({ initialDoc }: Props) {
   }, []);
 
   return (
-    <div style={{ display: 'flex', height: '100%', overflow: 'hidden' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
+      {/* Header bar with back button */}
+      {onBack && (
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          padding: '8px 16px',
+          borderBottom: `1px solid ${colors.BORDER}`,
+          background: colors.BG_CARD,
+          flexShrink: 0,
+        }}>
+          <Button
+            type="text"
+            icon={<ArrowLeftOutlined />}
+            onClick={onBack}
+            style={{ color: colors.TEXT_SECONDARY, fontWeight: 500 }}
+          >
+            Back to Browser
+          </Button>
+          <span style={{ fontSize: 15, fontFamily: 'var(--font-ui)', fontWeight: 700, letterSpacing: 1, textTransform: 'uppercase', color: colors.TEXT_MUTED }}>
+            Documentation
+          </span>
+          <div style={{ width: 140 }} />
+        </div>
+      )}
+
+      <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
       {/* Left sidebar: doc navigation */}
       <nav style={{
         width: 200,
@@ -227,6 +257,7 @@ export default function DocsPage({ initialDoc }: Props) {
               ))}
             </nav>
           )}
+          </div>
         </div>
       </div>
     </div>
