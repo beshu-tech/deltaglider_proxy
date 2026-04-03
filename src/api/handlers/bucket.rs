@@ -119,6 +119,11 @@ pub async fn bucket_get_handler(
     let prefix = query.prefix.unwrap_or_default();
     let delimiter = query.delimiter.clone();
     // Gap 3: cap max_keys at 1000 (S3/MinIO standard upper bound)
+    if let Some(0) = query.max_keys {
+        return Err(S3Error::InvalidArgument(
+            "max-keys must be greater than 0".into(),
+        ));
+    }
     let max_keys = query.max_keys.unwrap_or(1000).min(1000);
 
     // v1 uses `marker`, v2 uses `continuation-token` — both serve as "start after" key

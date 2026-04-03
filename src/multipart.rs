@@ -30,6 +30,9 @@ struct MultipartUpload {
     content_type: Option<String>,
     user_metadata: HashMap<String, String>,
     parts: HashMap<u32, PartData>,
+    /// Set to true after successful complete(). Prevents double-completion
+    /// while allowing the upload to stay in the map until store() succeeds.
+    completed: bool,
 }
 
 /// Result of assembling a completed multipart upload
@@ -116,6 +119,7 @@ impl MultipartStore {
             content_type,
             user_metadata,
             parts: HashMap::new(),
+            completed: false,
         };
 
         uploads.insert(upload_id.clone(), upload);
@@ -176,9 +180,19 @@ impl MultipartStore {
         key: &str,
         requested_parts: &[(u32, String)], // (part_number, etag)
     ) -> Result<CompletedUpload, S3Error> {
-        // Take write lock to prevent double-completion race: validates, assembles,
-        // and removes the upload atomically so a concurrent complete() sees NoSuchUpload.
+        // Write lock: mark as completed to prevent double-completion race.
+        // Do NOT remove the upload — it stays in the map so the client can
+        // retry CompleteMultipartUpload if the subsequent store() fails.
+        // The handler calls remove_upload() only after store() succeeds.
         let mut uploads = self.uploads.write();
+
+        // Check if already completed (double-completion race)
+        if let Some(u) = uploads.get(upload_id) {
+            if u.completed {
+                return Err(S3Error::NoSuchUpload(upload_id.to_string()));
+            }
+        }
+
         let (validated, upload) =
             self.validate_parts(&uploads, upload_id, bucket, key, requested_parts)?;
 
@@ -194,8 +208,10 @@ impl MultipartStore {
             user_metadata: upload.user_metadata.clone(),
         };
 
-        // Remove under the same write lock — second complete() will get NoSuchUpload
-        uploads.remove(upload_id);
+        // Mark completed (prevents double-completion) but keep in map
+        if let Some(u) = uploads.get_mut(upload_id) {
+            u.completed = true;
+        }
 
         Ok(result)
     }
@@ -211,8 +227,14 @@ impl MultipartStore {
         key: &str,
         requested_parts: &[(u32, String)],
     ) -> Result<CompletedParts, S3Error> {
-        // Write lock for same reason as complete() — atomic validate + remove
         let mut uploads = self.uploads.write();
+
+        if let Some(u) = uploads.get(upload_id) {
+            if u.completed {
+                return Err(S3Error::NoSuchUpload(upload_id.to_string()));
+            }
+        }
+
         let (validated, upload) =
             self.validate_parts(&uploads, upload_id, bucket, key, requested_parts)?;
 
@@ -224,7 +246,9 @@ impl MultipartStore {
             user_metadata: upload.user_metadata.clone(),
         };
 
-        uploads.remove(upload_id);
+        if let Some(u) = uploads.get_mut(upload_id) {
+            u.completed = true;
+        }
 
         Ok(result)
     }

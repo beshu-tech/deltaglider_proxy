@@ -139,6 +139,18 @@ impl SigV4Params {
             }
         };
 
+        // Validate credential scope format: date/region/s3/aws4_request
+        let scope_parts: Vec<&str> = credential_scope.split('/').collect();
+        if scope_parts.len() != 4 || scope_parts[2] != "s3" || scope_parts[3] != "aws4_request" {
+            warn!(
+                "SigV4 presigned: malformed credential scope: {}",
+                credential_scope
+            );
+            return Err(
+                S3Error::InvalidArgument("Invalid credential scope format".into()).into_response(),
+            );
+        }
+
         // Check expiration — hard-fail on parse errors
         // AWS caps presigned URL expiry at 7 days (604,800 seconds).
         const MAX_PRESIGNED_EXPIRY: i64 = 604_800;
@@ -691,6 +703,12 @@ fn parse_auth_header(header: &str) -> Option<ParsedAuthHeader> {
 
     // Parse credential: AKID/date/region/service/aws4_request
     let (access_key, credential_scope) = credential.split_once('/')?;
+
+    // Validate scope format: date/region/s3/aws4_request
+    let scope_parts: Vec<&str> = credential_scope.split('/').collect();
+    if scope_parts.len() != 4 || scope_parts[2] != "s3" || scope_parts[3] != "aws4_request" {
+        return None;
+    }
 
     Some(ParsedAuthHeader {
         access_key: access_key.to_string(),
