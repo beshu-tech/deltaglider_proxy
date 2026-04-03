@@ -646,32 +646,15 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         max_keys: u32,
         continuation_token: Option<&str>,
     ) -> Result<ListObjectsPage, EngineError> {
-        // Single-pass listing: replaces list_deltaspaces + scan_deltaspace×N + list_directory_markers
+        // Single-pass listing: replaces list_deltaspaces + scan_deltaspace×N
         let bulk = self.storage.bulk_list_objects(bucket, prefix).await?;
 
-        // Dedup by key, keeping latest version
-        let mut latest: std::collections::HashMap<String, FileMetadata> =
-            std::collections::HashMap::new();
-        for (key, meta) in bulk {
-            match latest.entry(key) {
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(meta);
-                }
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    if meta.created_at > e.get().created_at {
-                        e.insert(meta);
-                    }
-                }
-            }
-        }
-
-        let mut items: Vec<(String, FileMetadata)> = latest.into_iter().collect();
+        // Dedup by key, keeping latest version (shared logic with S3 backend)
+        let mut items = crate::types::dedup_keep_latest(bulk);
 
         if !prefix.is_empty() {
             items.retain(|(key, _meta)| key.starts_with(prefix));
         }
-
-        items.sort_by(|a, b| a.0.cmp(&b.0));
 
         // --- Delimiter collapsing + pagination as a single operation ---
         //

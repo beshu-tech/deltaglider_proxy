@@ -73,6 +73,7 @@ export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: 
 
   const [testingS3, setTestingS3] = useState(false);
   const [testS3Result, setTestS3Result] = useState<TestS3Response | null>(null);
+  const [showAdvancedSecurity, setShowAdvancedSecurity] = useState(false);
 
   useEffect(() => {
     getAdminConfig().then((cfg) => {
@@ -449,8 +450,6 @@ export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: 
   );
 
   /* -- Tab: Security ------------------------------------------------------ */
-  const [showAdvancedSecurity, setShowAdvancedSecurity] = useState(false);
-
   const securityTab = (
     <div style={tabPane}><form onSubmit={(e) => { e.preventDefault(); handleSave(); }}><Space direction="vertical" size={0} style={{ width: '100%' }}>
       <div style={cardStyle}>

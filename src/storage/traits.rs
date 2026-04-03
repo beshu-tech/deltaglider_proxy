@@ -232,14 +232,6 @@ pub trait StorageBackend: Send + Sync {
             .await
     }
 
-    /// Delete all objects under a prefix (recursive).
-    /// Default: not implemented (returns false). Backends that support efficient
-    /// recursive delete (like filesystem) override this.
-    /// Returns true if handled natively, false if the caller should do it manually.
-    async fn delete_prefix(&self, _bucket: &str, _prefix: &str) -> Result<bool, StorageError> {
-        Ok(false) // Not supported — caller will list+delete manually
-    }
-
     // === Scanning operations ===
 
     /// Scan a deltaspace directory and return all file metadata
@@ -261,17 +253,6 @@ pub trait StorageBackend: Send + Sync {
     /// Default: no-op (directories are implicit in S3).
     async fn put_directory_marker(&self, _bucket: &str, _key: &str) -> Result<(), StorageError> {
         Ok(())
-    }
-
-    /// List directory markers (zero-byte objects ending with '/') in a bucket.
-    /// Returns keys like "folder/" that represent S3 directory markers.
-    /// Default: empty (filesystem backend doesn't use directory markers).
-    async fn list_directory_markers(
-        &self,
-        _bucket: &str,
-        _prefix: &str,
-    ) -> Result<Vec<String>, StorageError> {
-        Ok(vec![])
     }
 
     /// List all objects in a bucket matching a prefix, in a single pass.
@@ -469,14 +450,6 @@ macro_rules! impl_storage_backend_for_box {
                 (**self).delete_passthrough(bucket, prefix, filename).await
             }
 
-            async fn delete_prefix(
-                &self,
-                bucket: &str,
-                prefix: &str,
-            ) -> Result<bool, StorageError> {
-                (**self).delete_prefix(bucket, prefix).await
-            }
-
             async fn get_passthrough_stream(
                 &self,
                 bucket: &str,
@@ -533,13 +506,6 @@ macro_rules! impl_storage_backend_for_box {
                 key: &str,
             ) -> Result<(), StorageError> {
                 (**self).put_directory_marker(bucket, key).await
-            }
-            async fn list_directory_markers(
-                &self,
-                bucket: &str,
-                prefix: &str,
-            ) -> Result<Vec<String>, StorageError> {
-                (**self).list_directory_markers(bucket, prefix).await
             }
             async fn bulk_list_objects(
                 &self,

@@ -649,18 +649,6 @@ impl StorageBackend for FilesystemBackend {
         .await
     }
 
-    /// Filesystem recursive delete: rm -rf the deltaspace directory.
-    async fn delete_prefix(&self, bucket: &str, prefix: &str) -> Result<bool, StorageError> {
-        let dir = self.deltaspace_dir(bucket, prefix);
-        if dir.exists() {
-            tokio::fs::remove_dir_all(&dir).await?;
-            tracing::info!("Deleted deltaspace directory: {}", dir.display());
-            Ok(true)
-        } else {
-            Ok(true) // Already gone
-        }
-    }
-
     // === Chunked write operations ===
 
     #[instrument(skip(self, chunks, metadata))]
