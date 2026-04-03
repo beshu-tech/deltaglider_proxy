@@ -1,4 +1,6 @@
-# Delta Reconstruction: How GET Works
+# Delta Reconstruction
+
+*How GET reconstructs files from reference + delta*
 
 When a client downloads a delta-compressed file, the proxy transparently reconstructs the original on the fly. The client receives the exact bytes it uploaded — it never sees deltas.
 

@@ -1,4 +1,6 @@
-# How-To: Securing Your DeltaGlider Proxy
+# Security Basics
+
+*Step-by-step guide from open access to production security*
 
 A step-by-step guide to taking your proxy from open access to production-ready security. Each step explains **what** to configure, **why** it matters, and shows the exact configuration.
 

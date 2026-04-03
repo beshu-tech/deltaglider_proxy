@@ -1,4 +1,6 @@
-# DeltaGlider Proxy Hardening Plan
+# Hardening Plan
+
+*Security hardening roadmap and completed phases*
 
 Three-phase plan addressing critical-to-low severity issues from the senior engineering review.
 Ordered strategically: data integrity first, then operational stability, then performance/polish.

@@ -1,4 +1,6 @@
-# Releasing DeltaGlider Proxy
+# Releasing
+
+*Release process, tagging, and Docker builds*
 
 How to cut a new release. The entire build/publish pipeline is automated — your job is to prepare the code, tag it, and verify.
 

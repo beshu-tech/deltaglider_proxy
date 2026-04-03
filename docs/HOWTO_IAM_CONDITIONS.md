@@ -1,4 +1,6 @@
-# How-To: Advanced IAM with Conditions
+# IAM Conditions
+
+*Advanced access control with IP and prefix restrictions*
 
 A step-by-step guide to using IAM policy conditions for fine-grained access control. Conditions let you restrict **where** and **how** users can access data, beyond just what actions they can perform.
 

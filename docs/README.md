@@ -1,4 +1,6 @@
-# Documentation
+# Overview
+
+*Project overview, quickstart, API compatibility*
 
 - Start here: `README.md` (project overview, quickstart, API compatibility)
 - Operations guide: `docs/OPERATIONS.md`

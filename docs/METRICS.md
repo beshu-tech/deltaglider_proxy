@@ -1,4 +1,6 @@
-# Prometheus Metrics
+# Metrics
+
+*Prometheus metrics and Grafana setup*
 
 DeltaGlider Proxy exposes a `/metrics` endpoint in Prometheus text format on the same port as the S3 API (default `9000`). Also available at `/_/metrics`. Metrics are collected via lightweight atomics on the hot path -- no locks, no sampling, no performance impact.
 

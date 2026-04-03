@@ -1,4 +1,6 @@
-# Rate Limiting & Throttling
+# Rate Limiting
+
+*Throttling, concurrency limits, and abuse prevention*
 
 DeltaGlider Proxy has several layers of protection against overload, abuse, and resource exhaustion. All limits have sensible defaults and are configurable via environment variables.
 
