@@ -1,5 +1,5 @@
 import { useRef, useState, useEffect } from 'react';
-import { Layout, Space, Button, Input, Tooltip, theme } from 'antd';
+import { Layout, Space, Button, Input, theme } from 'antd';
 import { MenuOutlined, SearchOutlined, CloseOutlined, ReloadOutlined, SunOutlined, MoonOutlined, EyeOutlined, EyeInvisibleOutlined } from '@ant-design/icons';
 import Breadcrumb from './Breadcrumb';
 import { useColors, useTheme } from '../ThemeContext';
@@ -135,49 +135,45 @@ export default function TopBar({ prefix, onNavigate, isMobile, onMenuClick, onRe
             style={{ width: 160 }}
           />
         ) : (
-          <Tooltip title="Search objects">
-            <Button
+          <Button
               type="text"
               icon={<SearchOutlined />}
               size="small"
+              title="Search objects"
               aria-label="Search objects"
               style={{ color: searchOpen ? ACCENT_BLUE : TEXT_MUTED, transition: 'color 0.15s' }}
               onClick={() => setSearchOpen(!searchOpen)}
             />
-          </Tooltip>
         )}
-        <Tooltip title={showHidden ? 'Hide system files' : 'Show system files'} placement="bottom">
-          <Button
-            type="text"
-            icon={showHidden ? <EyeOutlined /> : <EyeInvisibleOutlined />}
-            size="small"
-            onClick={onToggleHidden}
-            aria-label={showHidden ? 'Hide system files' : 'Show system files'}
-            style={{ color: showHidden ? ACCENT_BLUE : TEXT_MUTED, transition: 'color 0.15s' }}
-          />
-        </Tooltip>
+        <Button
+          type="text"
+          icon={showHidden ? <EyeOutlined /> : <EyeInvisibleOutlined />}
+          size="small"
+          title={showHidden ? 'Hide system files' : 'Show system files'}
+          onClick={onToggleHidden}
+          aria-label={showHidden ? 'Hide system files' : 'Show system files'}
+          style={{ color: showHidden ? ACCENT_BLUE : TEXT_MUTED, transition: 'color 0.15s' }}
+        />
         {/* Divider between view toggles and utility actions */}
         <div style={{ width: 1, height: 20, background: BORDER, margin: '0 4px', flexShrink: 0 }} />
-        <Tooltip title="Refresh">
-          <Button
-            type="text"
-            icon={<ReloadOutlined spin={refreshing} />}
-            size="small"
-            onClick={onRefresh}
-            aria-label="Refresh object list"
-            style={{ color: TEXT_MUTED, transition: 'color 0.15s' }}
-          />
-        </Tooltip>
-        <Tooltip title={isDark ? 'Switch to light mode' : 'Switch to dark mode'}>
-          <Button
-            type="text"
-            icon={isDark ? <MoonOutlined /> : <SunOutlined />}
-            size="small"
-            onClick={toggleTheme}
-            aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
-            style={{ color: TEXT_MUTED, transition: 'color 0.15s' }}
-          />
-        </Tooltip>
+        <Button
+          type="text"
+          icon={<ReloadOutlined spin={refreshing} />}
+          size="small"
+          title="Refresh"
+          onClick={onRefresh}
+          aria-label="Refresh object list"
+          style={{ color: TEXT_MUTED, transition: 'color 0.15s' }}
+        />
+        <Button
+          type="text"
+          icon={isDark ? <MoonOutlined /> : <SunOutlined />}
+          size="small"
+          title={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
+          onClick={toggleTheme}
+          aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
+          style={{ color: TEXT_MUTED, transition: 'color 0.15s' }}
+        />
       </Space>
     </Header>
   );

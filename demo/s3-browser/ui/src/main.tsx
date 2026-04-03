@@ -11,7 +11,6 @@ function Root() {
   return (
     <ConfigProvider
       theme={isDark ? darkTheme : lightTheme}
-      getPopupContainer={() => document.body}
     >
       <App />
     </ConfigProvider>
