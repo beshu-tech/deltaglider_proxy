@@ -10,23 +10,10 @@ import FullScreenHeader from './FullScreenHeader';
 import DocSearch from './DocSearch';
 import '../docs.css';
 
-// Initialize mermaid with dark theme
+// Initialize mermaid with dark theme and expose on window for DOM post-processing
 mermaid.initialize({ startOnLoad: false, theme: 'dark', themeVariables: { primaryColor: '#2dd4bf', lineColor: '#5e7290' } });
+(window as unknown as Record<string, unknown>).__mermaid = mermaid;
 
-/** Renders a mermaid code block as an SVG diagram */
-function MermaidBlock({ code }: { code: string }) {
-  const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!ref.current) return;
-    const id = `mermaid-${Math.random().toString(36).slice(2, 8)}`;
-    mermaid.render(id, code).then(({ svg }) => {
-      if (ref.current) ref.current.innerHTML = svg;
-    }).catch(() => {
-      if (ref.current) ref.current.textContent = code;
-    });
-  }, [code]);
-  return <div ref={ref} style={{ margin: '16px 0', textAlign: 'center' }} />;
-}
 
 interface TocItem {
   id: string;
@@ -66,6 +53,36 @@ export default function DocsPage({ initialDoc, onBack }: Props) {
   useEffect(() => {
     contentRef.current?.scrollTo(0, 0);
     setActiveHeading('');
+  }, [selectedId]);
+
+  // Render mermaid diagrams after doc content is in the DOM
+  useEffect(() => {
+
+    // Post-process: find mermaid code blocks and render them as SVGs.
+    // Uses a small delay to ensure React has committed the DOM update.
+    const timer = setTimeout(async () => {
+      const mermaidCodes = document.querySelectorAll('code.language-mermaid, code[class*="language-mermaid"]');
+      console.log('[mermaid] Found', mermaidCodes.length, 'mermaid code blocks for doc', selectedId);
+      for (const codeEl of Array.from(mermaidCodes)) {
+        const pre = codeEl.parentElement;
+        if (!pre || pre.tagName !== 'PRE' || pre.dataset.mermaidRendered) continue;
+        pre.dataset.mermaidRendered = 'true';
+        const source = codeEl.textContent || '';
+        try {
+          const id = `mermaid-${Math.random().toString(36).slice(2, 8)}`;
+          const { svg } = await mermaid.render(id, source);
+          const div = document.createElement('div');
+          div.innerHTML = svg;
+          div.style.textAlign = 'center';
+          div.style.margin = '16px 0';
+          pre.replaceWith(div);
+        } catch (e) {
+          console.warn('Mermaid render failed:', e);
+        }
+      }
+    }, 300);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId]);
 
   // Intersection observer for active heading tracking
@@ -209,13 +226,6 @@ export default function DocsPage({ initialDoc, onBack }: Props) {
                       return <a {...props} href={href} target="_blank" rel="noopener noreferrer">{children}</a>;
                     }
                     return <a {...props} href={href}>{children}</a>;
-                  },
-                  // Render mermaid code blocks as diagrams
-                  code: ({ className, children, ...props }) => {
-                    if (className === 'language-mermaid') {
-                      return <MermaidBlock code={String(children).trim()} />;
-                    }
-                    return <code className={className} {...props}>{children}</code>;
                   },
                 }}
               >
