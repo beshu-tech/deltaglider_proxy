@@ -9,12 +9,12 @@ import {
   TeamOutlined,
   FolderOutlined,
   LockOutlined,
-  ArrowLeftOutlined,
   DashboardOutlined,
   DownloadOutlined,
   UploadOutlined,
 } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
+import FullScreenHeader from './FullScreenHeader';
 import SettingsPage from './SettingsPage';
 import UsersPanel from './UsersPanel';
 import GroupsPanel from './GroupsPanel';
@@ -249,31 +249,7 @@ export default function AdminPage({ onBack, onSessionExpired }: AdminPageProps) 
       flex: 1,
       background: colors.BG_BASE,
     }}>
-      {/* Header */}
-      <div style={{
-        height: 52,
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'space-between',
-        padding: '0 20px',
-        borderBottom: `1px solid ${colors.BORDER}`,
-        background: colors.BG_CARD,
-        flexShrink: 0,
-      }}>
-        <Button
-          type="text"
-          icon={<ArrowLeftOutlined />}
-          onClick={onBack}
-          style={{ color: colors.TEXT_SECONDARY, fontWeight: 500 }}
-        >
-          Back to Browser
-        </Button>
-        <Text strong style={{ fontSize: 15, fontFamily: 'var(--font-ui)', letterSpacing: 1, textTransform: 'uppercase', color: colors.TEXT_MUTED }}>
-          Admin Settings
-        </Text>
-        {/* Spacer to balance the header layout */}
-        <div style={{ width: 120 }} />
-      </div>
+      <FullScreenHeader title="Admin Settings" onBack={onBack} />
 
       {/* Body: sidebar tabs + content */}
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>

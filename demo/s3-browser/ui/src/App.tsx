@@ -24,6 +24,9 @@ const { useBreakpoint } = Grid;
 
 type View = 'browser' | 'upload' | 'metrics' | 'docs' | 'admin';
 
+/** Full-screen views hide the main sidebar and TopBar */
+const FULLSCREEN_VIEWS: Set<View> = new Set(['admin', 'docs']);
+
 const HASH_TO_VIEW: Record<string, View> = {
   '': 'browser',
   '#/': 'browser',
@@ -296,7 +299,7 @@ export default function App() {
       </a>
 
       <Layout style={{ flexDirection: 'row', flex: 1 }}>
-        {view !== 'admin' && view !== 'docs' && (
+        {!FULLSCREEN_VIEWS.has(view) && (
           <Sidebar
             onUploadClick={() => { setView('upload'); setSiderOpen(false); }}
             onMutate={s3.mutate}
@@ -321,7 +324,7 @@ export default function App() {
         )}
 
         <Layout style={{ flex: 1, background: colors.BG_BASE }}>
-          {view !== 'admin' && view !== 'docs' && (
+          {!FULLSCREEN_VIEWS.has(view) && (
             <TopBar
               prefix={s3.prefix}
               onNavigate={(p) => { setView('browser'); s3.navigate(p); }}
