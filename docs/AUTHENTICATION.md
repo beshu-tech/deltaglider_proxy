@@ -82,18 +82,17 @@ A user is considered an **admin** when they have both wildcard actions (`*` or `
 
 ## Admin GUI Access Flow
 
-```
-Fresh install (no IAM users)
-  → Bootstrap mode
-  → Admin GUI requires bootstrap password
-  → Create IAM users via admin GUI
+```mermaid
+graph TD
+    START{"IAM users exist?"} -- "No" --> BOOT["Bootstrap mode"]
+    BOOT --> PWD["Admin GUI requires<br/>bootstrap password"]
+    PWD --> CREATE["Create IAM users<br/>via admin GUI"]
 
-IAM users exist
-  → IAM mode activates
-  → Admin GUI auto-detects mode via /_/whoami
-  → IAM admins: auto-login (no password needed)
-  → Non-admin IAM users: "Access Denied" message
-  → Bootstrap password only needed for DB encryption/recovery
+    START -- "Yes" --> IAM["IAM mode activates"]
+    IAM --> DETECT["Admin GUI auto-detects<br/>mode via /_/whoami"]
+    DETECT --> ADMIN["IAM admins:<br/>auto-login (no password needed)"]
+    DETECT --> NONADMIN["Non-admin IAM users:<br/>'Access Denied' message"]
+    DETECT --> BSPWD["Bootstrap password only needed<br/>for DB encryption/recovery"]
 ```
 
 ## SigV4 Verification
