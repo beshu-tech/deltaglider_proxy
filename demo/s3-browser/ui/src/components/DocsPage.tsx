@@ -55,18 +55,20 @@ export default function DocsPage({ initialDoc, onBack }: Props) {
     setActiveHeading('');
   }, [selectedId]);
 
-  // Render mermaid diagrams after doc content is in the DOM
+  // Render mermaid diagrams after doc content is in the DOM.
+  // Hides the <pre> and inserts an SVG sibling; cleanup removes the SVG.
   useEffect(() => {
+    const insertedDivs: HTMLDivElement[] = [];
+    const hiddenPres: HTMLPreElement[] = [];
 
-    // Post-process: find mermaid code blocks and render them as SVGs.
-    // Uses a small delay to ensure React has committed the DOM update.
     const timer = setTimeout(async () => {
-      const mermaidCodes = document.querySelectorAll('code.language-mermaid, code[class*="language-mermaid"]');
-      console.log('[mermaid] Found', mermaidCodes.length, 'mermaid code blocks for doc', selectedId);
+      const container = contentRef.current;
+      if (!container) return;
+      const mermaidCodes = container.querySelectorAll('code[class*="language-mermaid"]');
       for (const codeEl of Array.from(mermaidCodes)) {
-        const pre = codeEl.parentElement;
-        if (!pre || pre.tagName !== 'PRE' || pre.dataset.mermaidRendered) continue;
-        pre.dataset.mermaidRendered = 'true';
+        const pre = codeEl.parentElement as HTMLPreElement | null;
+        if (!pre || pre.tagName !== 'PRE' || pre.dataset.mermaidDone) continue;
+        pre.dataset.mermaidDone = 'true';
         const source = codeEl.textContent || '';
         try {
           const id = `mermaid-${Math.random().toString(36).slice(2, 8)}`;
@@ -75,13 +77,26 @@ export default function DocsPage({ initialDoc, onBack }: Props) {
           div.innerHTML = svg;
           div.style.textAlign = 'center';
           div.style.margin = '16px 0';
-          pre.replaceWith(div);
+          div.dataset.mermaidSvg = 'true';
+          pre.style.display = 'none';
+          pre.after(div);
+          insertedDivs.push(div);
+          hiddenPres.push(pre);
         } catch (e) {
           console.warn('Mermaid render failed:', e);
         }
       }
     }, 300);
-    return () => clearTimeout(timer);
+
+    return () => {
+      clearTimeout(timer);
+      // Cleanup: remove inserted SVGs and unhide <pre> blocks
+      for (const div of insertedDivs) div.remove();
+      for (const pre of hiddenPres) {
+        pre.style.display = '';
+        delete pre.dataset.mermaidDone;
+      }
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId]);
 
