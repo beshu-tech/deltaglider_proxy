@@ -1,5 +1,5 @@
 // Central registry of all docs — imported as raw strings via Vite
-// Grouped for sidebar navigation
+// Titles are extracted from the first `# heading` in each file (single source of truth)
 
 import README from '../../../../docs/README.md?raw';
 import OPERATIONS from '../../../../docs/OPERATIONS.md?raw';
@@ -13,6 +13,17 @@ import STORAGE_FORMAT from '../../../../docs/STORAGE_FORMAT.md?raw';
 import METRICS from '../../../../docs/METRICS.md?raw';
 import CONTRIBUTING from '../../../../docs/CONTRIBUTING.md?raw';
 import RELEASING from '../../../../docs/RELEASING.md?raw';
+import CI_INFRA from '../../../../docs/CI_INFRA.md?raw';
+import HARDENING_PLAN from '../../../../docs/HARDENING_PLAN.md?raw';
+
+/** Extract the first `# heading` from markdown content */
+function extractTitle(content: string): string {
+  for (const line of content.split('\n')) {
+    const m = line.match(/^#\s+(.+)/);
+    if (m) return m[1].trim();
+  }
+  return 'Untitled';
+}
 
 export interface DocEntry {
   id: string;
@@ -29,29 +40,42 @@ export const DOC_GROUPS = [
   'Operations',
 ] as const;
 
-export const DOCS: DocEntry[] = [
+// Only filename, content, and group are manually configured.
+// Title is derived from the first # heading in each markdown file.
+const RAW_DOCS: { filename: string; content: string; group: string }[] = [
   // Getting Started
-  { id: 'readme', title: 'Overview', filename: 'README.md', content: README, group: 'Getting Started' },
-  { id: 'operations', title: 'Operations', filename: 'OPERATIONS.md', content: OPERATIONS, group: 'Getting Started' },
-  { id: 'configuration', title: 'Configuration', filename: 'CONFIGURATION.md', content: CONFIGURATION, group: 'Getting Started' },
+  { filename: 'README.md', content: README, group: 'Getting Started' },
+  { filename: 'OPERATIONS.md', content: OPERATIONS, group: 'Getting Started' },
+  { filename: 'CONFIGURATION.md', content: CONFIGURATION, group: 'Getting Started' },
 
   // Security
-  { id: 'authentication', title: 'Authentication', filename: 'AUTHENTICATION.md', content: AUTHENTICATION, group: 'Security' },
-  { id: 'security-basics', title: 'Security Basics', filename: 'HOWTO_SECURITY_BASICS.md', content: HOWTO_SECURITY_BASICS, group: 'Security' },
-  { id: 'iam-conditions', title: 'IAM Conditions', filename: 'HOWTO_IAM_CONDITIONS.md', content: HOWTO_IAM_CONDITIONS, group: 'Security' },
-  { id: 'rate-limiting', title: 'Rate Limiting', filename: 'RATE_LIMITING.md', content: RATE_LIMITING, group: 'Security' },
+  { filename: 'AUTHENTICATION.md', content: AUTHENTICATION, group: 'Security' },
+  { filename: 'HOWTO_SECURITY_BASICS.md', content: HOWTO_SECURITY_BASICS, group: 'Security' },
+  { filename: 'HOWTO_IAM_CONDITIONS.md', content: HOWTO_IAM_CONDITIONS, group: 'Security' },
+  { filename: 'RATE_LIMITING.md', content: RATE_LIMITING, group: 'Security' },
+  { filename: 'HARDENING_PLAN.md', content: HARDENING_PLAN, group: 'Security' },
 
   // Internals
-  { id: 'delta-reconstruction', title: 'Delta Reconstruction', filename: 'DELTA_RECONSTRUCTION.md', content: DELTA_RECONSTRUCTION, group: 'Internals' },
-  { id: 'storage-format', title: 'Storage Format', filename: 'STORAGE_FORMAT.md', content: STORAGE_FORMAT, group: 'Internals' },
-  { id: 'metrics', title: 'Metrics', filename: 'METRICS.md', content: METRICS, group: 'Internals' },
+  { filename: 'DELTA_RECONSTRUCTION.md', content: DELTA_RECONSTRUCTION, group: 'Internals' },
+  { filename: 'STORAGE_FORMAT.md', content: STORAGE_FORMAT, group: 'Internals' },
+  { filename: 'METRICS.md', content: METRICS, group: 'Internals' },
 
   // Operations
-  { id: 'contributing', title: 'Contributing', filename: 'CONTRIBUTING.md', content: CONTRIBUTING, group: 'Operations' },
-  { id: 'releasing', title: 'Releasing', filename: 'RELEASING.md', content: RELEASING, group: 'Operations' },
+  { filename: 'CONTRIBUTING.md', content: CONTRIBUTING, group: 'Operations' },
+  { filename: 'RELEASING.md', content: RELEASING, group: 'Operations' },
+  { filename: 'CI_INFRA.md', content: CI_INFRA, group: 'Operations' },
 ];
+
+export const DOCS: DocEntry[] = RAW_DOCS.map(d => ({
+  id: d.filename.replace(/\.md$/, '').toLowerCase().replace(/[^a-z0-9]+/g, '-'),
+  title: extractTitle(d.content),
+  filename: d.filename,
+  content: d.content,
+  group: d.group,
+}));
 
 /** Find a doc by its .md filename (for inter-page link resolution) */
 export function findDocByFilename(filename: string): DocEntry | undefined {
-  return DOCS.find(d => d.filename === filename || d.filename === filename.replace(/^.*\//, ''));
+  const bare = filename.replace(/^.*\//, '');
+  return DOCS.find(d => d.filename === bare);
 }

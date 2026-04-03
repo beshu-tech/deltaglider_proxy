@@ -146,7 +146,7 @@ export default function TopBar({ prefix, onNavigate, isMobile, onMenuClick, onRe
             />
           </Tooltip>
         )}
-        <Tooltip title={showHidden ? 'Hide system files' : 'Show system files'}>
+        <Tooltip title={showHidden ? 'Hide system files' : 'Show system files'} placement="bottom">
           <Button
             type="text"
             icon={showHidden ? <EyeOutlined /> : <EyeInvisibleOutlined />}
