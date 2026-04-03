@@ -6,21 +6,19 @@ This document describes the self-hosted CI infrastructure for DeltaGlider Proxy,
 
 ## Architecture Overview
 
-```
-GitHub Actions
-  |
-  v
-k3s cluster (AMD Ryzen 7 3700X, 16 threads, 64GB RAM, NVMe RAID1)
-  |
-  +-- arc-systems namespace
-  |     +-- actions-runner-controller (summerwind ARC v0.27.6)
-  |     +-- RunnerSet: 4 runner pods, label "k3s"
-  |           +-- Per-pod PVC (local-path, 15Gi each, direct SSD)
-  |           +-- Docker sidecar (for container: jobs + test MinIO)
-  |
-  +-- sccache namespace
-        +-- sccache-minio (persistent MinIO, 10Gi PVC)
-              Bucket: sccache-rust (30-day lifecycle expiry)
+```mermaid
+graph TD
+    GH["GitHub Actions"] --> K3S["k3s cluster<br/><i>AMD Ryzen 7 3700X, 16 threads, 64GB RAM, NVMe RAID1</i>"]
+
+    K3S --> ARC["<b>arc-systems namespace</b>"]
+    K3S --> SCC["<b>sccache namespace</b>"]
+
+    ARC --> CTRL["actions-runner-controller<br/><i>summerwind ARC v0.27.6</i>"]
+    ARC --> RS["RunnerSet: 4 runner pods<br/>label: 'k3s'"]
+    RS --> PVC["Per-pod PVC<br/><i>local-path, 15Gi each, direct SSD</i>"]
+    RS --> DKR["Docker sidecar<br/><i>for container: jobs + test MinIO</i>"]
+
+    SCC --> MINIO["sccache-minio<br/><i>persistent MinIO, 10Gi PVC</i><br/>Bucket: sccache-rust (30-day expiry)"]
 ```
 
 All CI jobs run inside a custom **builder image** (`ghcr.io/beshu-tech/deltaglider_proxy/builder:latest`) pulled as a `container:` job. The image is based on Ubuntu 24.04 with all tools pre-installed: Rust stable, Node.js 20, clippy, rustfmt, cargo-audit, cargo-sbom, sccache, xdelta3, Docker CLI, and MinIO client (mc).
@@ -180,21 +178,27 @@ The `--network container:$(hostname)` flag shares the runner pod's network names
 
 ### CI Pipeline (`ci.yml`)
 
-```
-fmt ─────┐
-clippy ──┤  (all run in parallel)
-test ────┤
-audit ───┘
+```mermaid
+graph LR
+    FMT["fmt"] --> DONE["done"]
+    CLIPPY["clippy"] --> DONE
+    TEST["test"] --> DONE
+    AUDIT["audit"] --> DONE
 ```
 
 All four jobs run concurrently on separate runner pods. Each uses the builder image as a `container:` job.
 
 ### Release Pipeline (`release.yml`)
 
-```
-ci (gate) → validate → build-linux-x86_64 ──┐
-                     → build-other (matrix) ──┼→ release
-                     → docker ────────────────┘
+```mermaid
+graph LR
+    CI["ci (gate)"] --> VALIDATE["validate"]
+    VALIDATE --> BX86["build-linux-x86_64"]
+    VALIDATE --> BOTHER["build-other (matrix)"]
+    VALIDATE --> DOCKER["docker"]
+    BX86 --> RELEASE["release"]
+    BOTHER --> RELEASE
+    DOCKER --> RELEASE
 ```
 
 - `build-linux-x86_64`: k3s with sccache (fastest)

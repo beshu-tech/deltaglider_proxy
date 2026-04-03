@@ -8,14 +8,11 @@ A step-by-step guide to taking your proxy from open access to production-ready s
 
 A fresh DeltaGlider Proxy installation runs in **open access mode** — no authentication required. This is fine for local development, but **never acceptable in production**. This guide walks you through each security layer.
 
-```
-                    INTERNET
-                       |
-              [Reverse Proxy]     <-- Step 5: TLS + proxy headers
-                       |
-             [DeltaGlider Proxy]  <-- Steps 1-4: auth, IAM, rate limiting
-                       |
-                 [S3 Backend]     <-- Backend credentials (separate from proxy auth)
+```mermaid
+graph TD
+    A["INTERNET"] --> B["Reverse Proxy<br/><i>Step 5: TLS + proxy headers</i>"]
+    B --> C["DeltaGlider Proxy<br/><i>Steps 1-4: auth, IAM, rate limiting</i>"]
+    C --> D["S3 Backend<br/><i>Backend credentials (separate from proxy auth)</i>"]
 ```
 
 ---
@@ -100,14 +97,9 @@ DGP_BOOTSTRAP_PASSWORD_HASH=JDJiJDEyJENYbDVPRm84bDg2...
 4. Click **Create User**
 5. Set permissions:
 
-```
-┌─────────────────────────────────────────┐
-│  User: ci-builder                       │
-│  Access Key: auto-generated             │
-│  Permissions:                           │
-│    Allow read,write,list on builds/*    │
-│    Deny  delete on *                    │
-└─────────────────────────────────────────┘
+```mermaid
+graph TD
+    U["<b>User: ci-builder</b><br/>Access Key: auto-generated<br/><br/><b>Permissions:</b><br/>Allow read, write, list on builds/*<br/>Deny delete on *"]
 ```
 
 **Permission examples:**
