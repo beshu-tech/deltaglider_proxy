@@ -14,7 +14,6 @@ import METRICS from '../../../../docs/METRICS.md?raw';
 import CONTRIBUTING from '../../../../docs/CONTRIBUTING.md?raw';
 import RELEASING from '../../../../docs/RELEASING.md?raw';
 import CI_INFRA from '../../../../docs/CI_INFRA.md?raw';
-import HARDENING_PLAN from '../../../../docs/HARDENING_PLAN.md?raw';
 
 /** Extract the first `# heading` from markdown content */
 function extractTitle(content: string): string {
@@ -37,7 +36,7 @@ export const DOC_GROUPS = [
   'Getting Started',
   'Security',
   'Internals',
-  'Operations',
+  'Developer',
 ] as const;
 
 // Only filename, content, and group are manually configured.
@@ -53,17 +52,16 @@ const RAW_DOCS: { filename: string; content: string; group: string }[] = [
   { filename: 'HOWTO_SECURITY_BASICS.md', content: HOWTO_SECURITY_BASICS, group: 'Security' },
   { filename: 'HOWTO_IAM_CONDITIONS.md', content: HOWTO_IAM_CONDITIONS, group: 'Security' },
   { filename: 'RATE_LIMITING.md', content: RATE_LIMITING, group: 'Security' },
-  { filename: 'HARDENING_PLAN.md', content: HARDENING_PLAN, group: 'Security' },
 
   // Internals
   { filename: 'DELTA_RECONSTRUCTION.md', content: DELTA_RECONSTRUCTION, group: 'Internals' },
   { filename: 'STORAGE_FORMAT.md', content: STORAGE_FORMAT, group: 'Internals' },
   { filename: 'METRICS.md', content: METRICS, group: 'Internals' },
 
-  // Operations
-  { filename: 'CONTRIBUTING.md', content: CONTRIBUTING, group: 'Operations' },
-  { filename: 'RELEASING.md', content: RELEASING, group: 'Operations' },
-  { filename: 'CI_INFRA.md', content: CI_INFRA, group: 'Operations' },
+  // Developer
+  { filename: 'CONTRIBUTING.md', content: CONTRIBUTING, group: 'Developer' },
+  { filename: 'RELEASING.md', content: RELEASING, group: 'Developer' },
+  { filename: 'CI_INFRA.md', content: CI_INFRA, group: 'Developer' },
 ];
 
 export const DOCS: DocEntry[] = RAW_DOCS.map(d => ({

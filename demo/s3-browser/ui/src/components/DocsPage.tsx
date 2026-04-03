@@ -3,10 +3,30 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import rehypeSlug from 'rehype-slug';
+import mermaid from 'mermaid';
 import { DOCS, DOC_GROUPS, findDocByFilename, type DocEntry } from '../docs-imports';
 import { useColors } from '../ThemeContext';
 import FullScreenHeader from './FullScreenHeader';
+import DocSearch from './DocSearch';
 import '../docs.css';
+
+// Initialize mermaid with dark theme
+mermaid.initialize({ startOnLoad: false, theme: 'dark', themeVariables: { primaryColor: '#2dd4bf', lineColor: '#5e7290' } });
+
+/** Renders a mermaid code block as an SVG diagram */
+function MermaidBlock({ code }: { code: string }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!ref.current) return;
+    const id = `mermaid-${Math.random().toString(36).slice(2, 8)}`;
+    mermaid.render(id, code).then(({ svg }) => {
+      if (ref.current) ref.current.innerHTML = svg;
+    }).catch(() => {
+      if (ref.current) ref.current.textContent = code;
+    });
+  }, [code]);
+  return <div ref={ref} style={{ margin: '16px 0', textAlign: 'center' }} />;
+}
 
 interface TocItem {
   id: string;
@@ -95,15 +115,18 @@ export default function DocsPage({ initialDoc, onBack }: Props) {
       {onBack && <FullScreenHeader title="Documentation" onBack={onBack} />}
 
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
-      {/* Left sidebar: doc navigation */}
+      {/* Left sidebar: search + doc navigation */}
       <nav style={{
-        width: 200,
+        width: 220,
         flexShrink: 0,
         borderRight: `1px solid ${colors.BORDER}`,
         overflowY: 'auto',
-        padding: '16px 0',
         background: colors.BG_SIDEBAR,
+        display: 'flex',
+        flexDirection: 'column',
       }}>
+        <DocSearch onSelect={setSelectedId} />
+        <div style={{ padding: '0 0 16px', flex: 1, overflowY: 'auto' }}>
         {Array.from(grouped.entries()).map(([group, docs]) => (
           <div key={group} style={{ marginBottom: 16 }}>
             <div style={{
@@ -147,6 +170,7 @@ export default function DocsPage({ initialDoc, onBack }: Props) {
             ))}
           </div>
         ))}
+        </div>
       </nav>
 
       {/* Center: markdown content + sticky ToC */}
@@ -185,6 +209,13 @@ export default function DocsPage({ initialDoc, onBack }: Props) {
                       return <a {...props} href={href} target="_blank" rel="noopener noreferrer">{children}</a>;
                     }
                     return <a {...props} href={href}>{children}</a>;
+                  },
+                  // Render mermaid code blocks as diagrams
+                  code: ({ className, children, ...props }) => {
+                    if (className === 'language-mermaid') {
+                      return <MermaidBlock code={String(children).trim()} />;
+                    }
+                    return <code className={className} {...props}>{children}</code>;
                   },
                 }}
               >

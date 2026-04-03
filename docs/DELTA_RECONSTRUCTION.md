@@ -6,42 +6,22 @@ When a client downloads a delta-compressed file, the proxy transparently reconst
 
 ## The Flow
 
-```
-Client                          Proxy                           Storage
-  |                               |                               |
-  |  GET /bucket/releases/v2.zip  |                               |
-  |  Authorization: AWS4-HMAC-... |                               |
-  |  ---------------------------> |                               |
-  |                               |                               |
-  |                    [1. Verify SigV4 signature]                 |
-  |                    [   (covers request only,                   |
-  |                    [    not the response body)                 |
-  |                               |                               |
-  |                    [2. Look up metadata]                       |
-  |                    [   -> StorageInfo::Delta]                  |
-  |                               |                               |
-  |                               |  get reference.bin            |
-  |                               |  (from cache or storage)      |
-  |                               |  -----------------------------> |
-  |                               |  <--- reference bytes          |
-  |                               |                               |
-  |                               |  get v2.zip.delta             |
-  |                               |  -----------------------------> |
-  |                               |  <--- delta bytes              |
-  |                               |                               |
-  |                    [3. xdelta3 decode]                         |
-  |                    [   reference + delta = original]           |
-  |                               |                               |
-  |                    [4. SHA-256 verification]                   |
-  |                    [   decoded bytes must match]               |
-  |                    [   stored hash from PUT time]              |
-  |                               |                               |
-  |  200 OK                       |                               |
-  |  Content-Length: 82000000     |  <- original size, not delta   |
-  |  ETag: "abc123..."           |  <- original file's hash       |
-  |  x-amz-storage-type: delta   |  <- debug hint only            |
-  |  <82MB of original bytes>    |                               |
-  |  <--------------------------- |                               |
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant P as Proxy
+    participant S as Storage
+
+    C->>P: GET /bucket/releases/v2.zip
+    Note over P: 1. Verify SigV4 signature
+    Note over P: 2. Look up metadata → Delta
+    P->>S: fetch reference.bin (or cache)
+    S-->>P: reference bytes
+    P->>S: fetch v2.zip.delta
+    S-->>P: delta bytes
+    Note over P: 3. xdelta3 decode (ref + delta = original)
+    Note over P: 4. SHA-256 verification
+    P-->>C: 200 OK (82MB original bytes)
 ```
 
 ## What the Client Sees
