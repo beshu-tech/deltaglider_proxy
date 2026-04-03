@@ -82,6 +82,36 @@ pub fn permission_to_iam_policy(perm: &Permission) -> IAMPolicy {
     IAMPolicy::new().add_statement(stmt)
 }
 
+/// Build the S3 resource ARN string from bucket and key.
+fn build_resource_arn(bucket: &str, key: &str) -> String {
+    if key.is_empty() {
+        format!("arn:aws:s3:::{}", bucket)
+    } else {
+        format!("arn:aws:s3:::{}/{}", bucket, key)
+    }
+}
+
+/// Build an IAM request and evaluator from common parameters.
+/// Returns `None` if the ARN cannot be parsed (caller decides fail-open vs fail-closed).
+fn build_iam_evaluator(
+    policies: &[IAMPolicy],
+    action: S3Action,
+    bucket: &str,
+    key: &str,
+    context: &Context,
+) -> Option<(IAMRequest, PolicyEvaluator, String)> {
+    let resource_str = build_resource_arn(bucket, key);
+    let resource = Arn::parse(&resource_str).ok()?;
+    let request = IAMRequest::new_with_context(
+        Principal::Aws(PrincipalId::String("000000000000".into())),
+        action.to_iam_action(),
+        resource,
+        context.clone(),
+    );
+    let evaluator = PolicyEvaluator::with_policies(policies.to_vec());
+    Some((request, evaluator, resource_str))
+}
+
 /// Evaluate permissions using iam-rs policy engine.
 /// Supports conditions (s3:prefix, aws:SourceIp, etc.) via the context parameter.
 pub(crate) fn evaluate_iam(
@@ -91,28 +121,12 @@ pub(crate) fn evaluate_iam(
     key: &str,
     context: &Context,
 ) -> bool {
-    let iam_action = action.to_iam_action();
+    let (request, evaluator, resource_str) =
+        match build_iam_evaluator(policies, action, bucket, key, context) {
+            Some(t) => t,
+            None => return false, // fail closed
+        };
 
-    // Build the resource ARN
-    let resource_str = if key.is_empty() {
-        format!("arn:aws:s3:::{}", bucket)
-    } else {
-        format!("arn:aws:s3:::{}/{}", bucket, key)
-    };
-
-    let resource = match Arn::parse(&resource_str) {
-        Ok(arn) => arn,
-        Err(_) => return false,
-    };
-
-    let request = IAMRequest::new_with_context(
-        Principal::Aws(PrincipalId::String("000000000000".into())),
-        iam_action,
-        resource,
-        context.clone(),
-    );
-
-    let evaluator = PolicyEvaluator::with_policies(policies.to_vec());
     match evaluator.evaluate(&request) {
         Ok(result) => {
             if result.decision == Decision::Allow {
@@ -129,7 +143,7 @@ pub(crate) fn evaluate_iam(
                 if let Ok(alt_arn) = Arn::parse(&alt_str) {
                     let alt_request = IAMRequest::new_with_context(
                         Principal::Aws(PrincipalId::String("000000000000".into())),
-                        iam_action,
+                        action.to_iam_action(),
                         alt_arn,
                         context.clone(),
                     );
@@ -144,7 +158,7 @@ pub(crate) fn evaluate_iam(
             tracing::warn!(
                 "IAM policy evaluation error: {} (action={}, resource={})",
                 e,
-                iam_action,
+                action.to_iam_action(),
                 resource_str
             );
             false // fail closed
@@ -161,22 +175,12 @@ pub(crate) fn is_explicitly_denied_iam(
     key: &str,
     context: &Context,
 ) -> bool {
-    let iam_action = action.to_iam_action();
-    let resource_str = if key.is_empty() {
-        format!("arn:aws:s3:::{}", bucket)
-    } else {
-        format!("arn:aws:s3:::{}/{}", bucket, key)
+    let (request, evaluator, _) = match build_iam_evaluator(policies, action, bucket, key, context)
+    {
+        Some(t) => t,
+        None => return true, // fail closed: assume denied if ARN can't be parsed
     };
 
-    let resource = match Arn::parse(&resource_str) {
-        Ok(arn) => arn,
-        Err(_) => return true, // fail closed: assume denied if ARN can't be parsed
-    };
-
-    let principal = Principal::Aws(PrincipalId::String("000000000000".into()));
-    let request = IAMRequest::new_with_context(principal, iam_action, resource, context.clone());
-
-    let evaluator = PolicyEvaluator::with_policies(policies.to_vec());
     matches!(
         evaluator.evaluate(&request),
         Ok(result) if result.decision == Decision::Deny

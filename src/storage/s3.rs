@@ -776,39 +776,26 @@ impl S3Backend {
         classified: Vec<ClassifiedObject>,
         mut seed_results: Vec<(String, FileMetadata)>,
     ) -> Vec<(String, FileMetadata)> {
-        let mut latest: HashMap<String, FileMetadata> = HashMap::new();
+        let classified_pairs: Vec<(String, FileMetadata)> = classified
+            .into_iter()
+            .map(|entry| {
+                let is_delta = entry.s3_key.ends_with(".delta");
+                let storage_info = if is_delta {
+                    StorageInfo::delta_stub(entry.listing_meta.size)
+                } else {
+                    StorageInfo::Passthrough
+                };
+                let meta = Self::fallback_metadata_from_listing(
+                    &entry.listing_meta,
+                    &entry.user_key,
+                    storage_info,
+                );
+                (entry.user_key, meta)
+            })
+            .collect();
 
-        for entry in classified {
-            let is_delta = entry.s3_key.ends_with(".delta");
-            let storage_info = if is_delta {
-                StorageInfo::delta_stub(entry.listing_meta.size)
-            } else {
-                StorageInfo::Passthrough
-            };
-            let meta = Self::fallback_metadata_from_listing(
-                &entry.listing_meta,
-                &entry.user_key,
-                storage_info,
-            );
-
-            match latest.entry(entry.user_key) {
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(meta);
-                }
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    if meta.created_at > e.get().created_at {
-                        e.insert(meta);
-                    }
-                }
-            }
-        }
-
-        for (key, meta) in latest {
-            seed_results.push((key, meta));
-        }
-
-        seed_results.sort_by(|a, b| a.0.cmp(&b.0));
-        seed_results
+        seed_results.extend(classified_pairs);
+        crate::types::dedup_keep_latest(seed_results)
     }
 
     /// Build a best-effort FileMetadata from S3 listing info alone (no HEAD).
@@ -1347,19 +1334,6 @@ impl StorageBackend for S3Backend {
 
         debug!("Total S3 storage size: {} bytes", total);
         Ok(total)
-    }
-
-    async fn list_directory_markers(
-        &self,
-        bucket: &str,
-        prefix: &str,
-    ) -> Result<Vec<String>, StorageError> {
-        let objects = self.list_objects_full(bucket, prefix).await?;
-        Ok(objects
-            .into_iter()
-            .filter(|o| o.key.ends_with('/') && o.size == 0)
-            .map(|o| o.key)
-            .collect())
     }
 
     /// Enrich listed objects with full metadata from bounded HEAD calls.

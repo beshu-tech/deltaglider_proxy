@@ -514,6 +514,31 @@ pub struct StoreResult {
     pub stored_size: u64,
 }
 
+/// Deduplicate `(key, FileMetadata)` pairs, keeping only the entry with the
+/// latest `created_at` for each key. Returns the result sorted by key.
+///
+/// Used by both the engine's `list_objects_bulk` and the S3 backend's
+/// `resolve_classified_lite` to ensure a single source of truth for the
+/// "which version wins" policy.
+pub fn dedup_keep_latest(items: Vec<(String, FileMetadata)>) -> Vec<(String, FileMetadata)> {
+    let mut latest: HashMap<String, FileMetadata> = HashMap::new();
+    for (key, meta) in items {
+        match latest.entry(key) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(meta);
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if meta.created_at > e.get().created_at {
+                    e.insert(meta);
+                }
+            }
+        }
+    }
+    let mut result: Vec<(String, FileMetadata)> = latest.into_iter().collect();
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
