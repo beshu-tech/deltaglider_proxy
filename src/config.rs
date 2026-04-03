@@ -204,6 +204,48 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         example: "true",
         category: "Server",
     },
+    EnvVarEntry {
+        name: "DGP_REQUEST_TIMEOUT_SECS",
+        description: "Per-request timeout in seconds (default: 300)",
+        example: "300",
+        category: "Server",
+    },
+    EnvVarEntry {
+        name: "DGP_CODEC_TIMEOUT_SECS",
+        description: "xdelta3 subprocess timeout in seconds (default: 60)",
+        example: "60",
+        category: "Delta Engine",
+    },
+    EnvVarEntry {
+        name: "DGP_RATE_LIMIT_MAX_ATTEMPTS",
+        description: "Max failed auth attempts before IP lockout (default: 100)",
+        example: "100",
+        category: "Security",
+    },
+    EnvVarEntry {
+        name: "DGP_RATE_LIMIT_WINDOW_SECS",
+        description: "Rate limit rolling window in seconds (default: 300)",
+        example: "300",
+        category: "Security",
+    },
+    EnvVarEntry {
+        name: "DGP_RATE_LIMIT_LOCKOUT_SECS",
+        description: "Rate limit lockout duration in seconds (default: 600)",
+        example: "600",
+        category: "Security",
+    },
+    EnvVarEntry {
+        name: "DGP_REPLAY_WINDOW_SECS",
+        description: "SigV4 replay detection window in seconds (default: 2)",
+        example: "2",
+        category: "Security",
+    },
+    EnvVarEntry {
+        name: "DGP_SECURE_COOKIES",
+        description: "Require HTTPS for admin session cookies (default: true)",
+        example: "true",
+        category: "Security",
+    },
 ];
 
 /// Thread-safe shared config for hot-reload from admin GUI.
@@ -885,12 +927,19 @@ mod tests {
             "DGP_CONFIG",                  // config::load()
             "DGP_CONFIG_SYNC_BUCKET",      // startup::init_config_sync()
             "DGP_DEBUG_HEADERS",           // api::handlers::debug_headers_enabled()
-            "DGP_TRUST_PROXY_HEADERS",     // main.rs proxy header trust
+            "DGP_TRUST_PROXY_HEADERS",     // rate_limiter::trust_proxy_headers()
             "DGP_SESSION_TTL_HOURS",       // session::default_session_ttl()
             "DGP_MAX_MULTIPART_UPLOADS",   // multipart::default_max_uploads()
             "DGP_CLOCK_SKEW_SECONDS",      // api::auth + startup replay cache
             "DGP_MAX_CONCURRENT_REQUESTS", // startup::build_s3_router()
             "DGP_CORS_PERMISSIVE",         // demo::ui_router()
+            "DGP_REQUEST_TIMEOUT_SECS",    // startup::build_s3_router()
+            "DGP_CODEC_TIMEOUT_SECS",      // deltaglider::codec::codec_timeout()
+            "DGP_RATE_LIMIT_MAX_ATTEMPTS", // rate_limiter::default_auth()
+            "DGP_RATE_LIMIT_WINDOW_SECS",  // rate_limiter::default_auth()
+            "DGP_RATE_LIMIT_LOCKOUT_SECS", // rate_limiter::default_auth()
+            "DGP_REPLAY_WINDOW_SECS",      // api::auth replay detection
+            "DGP_SECURE_COOKIES",          // api::admin::auth::secure_cookies()
         ];
         for name in &registry_names {
             if used_outside_from_env.contains(name) {

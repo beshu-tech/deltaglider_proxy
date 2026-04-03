@@ -22,12 +22,32 @@ pub struct ConfigResponse {
     backend_endpoint: Option<String>,
     backend_region: Option<String>,
     backend_force_path_style: Option<bool>,
-    // Tuning
+    // Compression
     max_delta_ratio: f32,
     max_object_size: u64,
     cache_size_mb: usize,
+    metadata_cache_mb: usize,
+    codec_concurrency: usize,
+    codec_timeout_secs: u64,
+    // Limits
+    request_timeout_secs: u64,
+    max_concurrent_requests: usize,
+    max_multipart_uploads: usize,
+    // Auth
     auth_enabled: bool,
     access_key_id: Option<String>,
+    // Security
+    clock_skew_seconds: u64,
+    replay_window_secs: u64,
+    rate_limit_max_attempts: u32,
+    rate_limit_window_secs: u64,
+    rate_limit_lockout_secs: u64,
+    session_ttl_hours: u64,
+    trust_proxy_headers: bool,
+    secure_cookies: bool,
+    debug_headers: bool,
+    // Sync
+    config_sync_bucket: Option<String>,
     // Log level
     log_level: String,
     // Backend credentials indicator
@@ -138,6 +158,29 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
         .with_current(|f| f.to_string())
         .unwrap_or_else(|_| cfg.log_level.clone());
 
+    // Read startup-time settings from env vars (these aren't in Config)
+    let env_u64 = |name: &str, default: u64| -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let env_usize = |name: &str, default: usize| -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let env_bool = |name: &str, default: bool| -> bool {
+        std::env::var(name)
+            .ok()
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(default)
+    };
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+
     Json(ConfigResponse {
         listen_addr: cfg.listen_addr.to_string(),
         backend_type: backend_type.to_string(),
@@ -145,11 +188,33 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
         backend_endpoint,
         backend_region,
         backend_force_path_style,
+        // Compression
         max_delta_ratio: cfg.max_delta_ratio,
         max_object_size: cfg.max_object_size,
         cache_size_mb: cfg.cache_size_mb,
+        metadata_cache_mb: cfg.metadata_cache_mb,
+        codec_concurrency: cfg.codec_concurrency.unwrap_or_else(|| (cpus * 4).max(16)),
+        codec_timeout_secs: env_u64("DGP_CODEC_TIMEOUT_SECS", 60),
+        // Limits
+        request_timeout_secs: env_u64("DGP_REQUEST_TIMEOUT_SECS", 300),
+        max_concurrent_requests: env_usize("DGP_MAX_CONCURRENT_REQUESTS", 1024),
+        max_multipart_uploads: env_usize("DGP_MAX_MULTIPART_UPLOADS", 1000),
+        // Auth
         auth_enabled: cfg.auth_enabled(),
         access_key_id: cfg.access_key_id.clone(),
+        // Security
+        clock_skew_seconds: env_u64("DGP_CLOCK_SKEW_SECONDS", 300),
+        replay_window_secs: env_u64("DGP_REPLAY_WINDOW_SECS", 2),
+        rate_limit_max_attempts: env_u64("DGP_RATE_LIMIT_MAX_ATTEMPTS", 100) as u32,
+        rate_limit_window_secs: env_u64("DGP_RATE_LIMIT_WINDOW_SECS", 300),
+        rate_limit_lockout_secs: env_u64("DGP_RATE_LIMIT_LOCKOUT_SECS", 600),
+        session_ttl_hours: env_u64("DGP_SESSION_TTL_HOURS", 4),
+        trust_proxy_headers: env_bool("DGP_TRUST_PROXY_HEADERS", true),
+        secure_cookies: env_bool("DGP_SECURE_COOKIES", true),
+        debug_headers: env_bool("DGP_DEBUG_HEADERS", false),
+        // Sync
+        config_sync_bucket: cfg.config_sync_bucket.clone(),
+        // Logging
         log_level,
         backend_has_credentials,
     })

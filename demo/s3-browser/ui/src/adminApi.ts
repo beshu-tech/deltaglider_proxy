@@ -34,14 +34,36 @@ export interface AdminConfig {
   backend_path: string | null;
   backend_endpoint: string | null;
   backend_region: string | null;
+  backend_force_path_style: boolean | null;
+  backend_has_credentials: boolean;
+  // Compression
   max_delta_ratio: number;
   max_object_size: number;
   cache_size_mb: number;
+  metadata_cache_mb: number;
+  codec_concurrency: number;
+  codec_timeout_secs: number;
+  // Limits
+  request_timeout_secs: number;
+  max_concurrent_requests: number;
+  max_multipart_uploads: number;
+  // Auth
   auth_enabled: boolean;
   access_key_id: string | null;
+  // Security
+  clock_skew_seconds: number;
+  replay_window_secs: number;
+  rate_limit_max_attempts: number;
+  rate_limit_window_secs: number;
+  rate_limit_lockout_secs: number;
+  session_ttl_hours: number;
+  trust_proxy_headers: boolean;
+  secure_cookies: boolean;
+  debug_headers: boolean;
+  // Sync
+  config_sync_bucket: string | null;
+  // Logging
   log_level: string;
-  backend_has_credentials: boolean;
-  backend_force_path_style: boolean | null;
 }
 
 export async function getAdminConfig(): Promise<AdminConfig | null> {
