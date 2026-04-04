@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, type ReactNode } from 'react';
+import { useState, useCallback, useEffect, useRef, type ReactNode } from 'react';
 import { useColors } from '../ThemeContext';
 
 interface Props {
@@ -14,6 +14,28 @@ export default function Lightbox({ children, caption }: Props) {
   const colors = useColors();
 
   const handleClose = useCallback(() => setOpen(false), []);
+  const lightboxRef = useRef<HTMLDivElement>(null);
+
+  // When lightbox opens, post-process any Mermaid SVGs to fix viewBox
+  useEffect(() => {
+    if (!open || !lightboxRef.current) return;
+    const timer = setTimeout(() => {
+      const svgs = lightboxRef.current?.querySelectorAll('.mermaid-diagram svg');
+      svgs?.forEach(svg => {
+        try {
+          const bb = (svg as SVGSVGElement).getBBox();
+          const pad = 8;
+          svg.setAttribute('viewBox', `${bb.x - pad} ${bb.y - pad} ${bb.width + pad * 2} ${bb.height + pad * 2}`);
+          svg.removeAttribute('width');
+          svg.removeAttribute('height');
+          (svg as SVGSVGElement).style.width = '100%';
+          (svg as SVGSVGElement).style.height = 'auto';
+          (svg as SVGSVGElement).style.maxWidth = 'none';
+        } catch { /* getBBox fails if not visible */ }
+      });
+    }, 100);
+    return () => clearTimeout(timer);
+  }, [open]);
 
   // ESC to close
   useEffect(() => {
@@ -71,6 +93,7 @@ export default function Lightbox({ children, caption }: Props) {
           }}
         >
           <div
+            ref={lightboxRef}
             onClick={e => e.stopPropagation()}
             style={{
               maxWidth: '90vw',
