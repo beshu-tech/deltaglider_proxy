@@ -103,9 +103,9 @@ Key files: `src/iam/` (types, permissions, middleware, keygen), `src/config_db.r
 
 ## Frontend (demo/s3-browser/ui)
 
-React 18 + TypeScript + Ant Design 6 + Recharts. Hash-based routing (`#/browse`, `#/upload`, `#/metrics`, `#/docs`, `#/admin`). Embedded in the Rust binary via `rust-embed` and served under `/_/` on the same port as the S3 API (e.g., `http://localhost:9000/_/`). The `/_/` prefix is safe because `_` is not a valid S3 bucket name character. Single-port architecture: no separate UI port.
+React 18 + TypeScript + Ant Design 6 + Recharts. Path-based routing (`/_/browse`, `/_/upload`, `/_/metrics`, `/_/docs/configuration`, `/_/admin/users`). Custom `usePathRouter` hook (no react-router dependency). `NavigationContext` provides `navigate()` and `subPath` to child components. Embedded in the Rust binary via `rust-embed` and served under `/_/` on the same port as the S3 API (e.g., `http://localhost:9000/_/`). The `/_/` prefix is safe because `_` is not a valid S3 bucket name character. Single-port architecture: no separate UI port.
 
-Key components: `MetricsPage` (Prometheus dashboard with live charts), `ObjectTable`, `FilePreview` (double-click preview for text/images), `AdminOverlay` (full-screen settings with user management), `UsersPanel` (master-detail IAM user CRUD with ABAC permissions, key rotation, delete with `window.confirm`), `UserForm`, `ApiDocsPage` (interactive API reference). Admin API at `/_/api/admin/*` (login, login-as, whoami, users CRUD, config, password). S3 operations in `s3client.ts`. Metrics at `/_/metrics`, stats at `/_/stats`, health at `/_/health`.
+Key components: `MetricsPage` (Prometheus dashboard with live charts), `ObjectTable`, `FilePreview` (double-click preview for text/images), `AdminPage` (full-screen settings with user management, 8 tabs), `UsersPanel` (master-detail IAM user CRUD with ABAC permissions, key rotation, delete with `window.confirm`), `UserForm`, `DocsPage` (embedded markdown docs with search, Mermaid diagrams, lightbox), `DocsLanding` (landing page with screenshots and feature cards), `FullScreenHeader` (shared header for Admin/Docs with branding and theme toggle). Admin API at `/_/api/admin/*` (login, login-as, whoami, users CRUD, config, password). S3 operations in `s3client.ts`. Metrics at `/_/metrics`, stats at `/_/stats`, health at `/_/health`.
 
 ## Testing
 
