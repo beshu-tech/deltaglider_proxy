@@ -9,10 +9,10 @@ A step-by-step guide to taking your proxy from open access to production-ready s
 A fresh DeltaGlider Proxy installation runs in **open access mode** — no authentication required. This is fine for local development, but **never acceptable in production**. This guide walks you through each security layer.
 
 ```mermaid
-graph TD
-    A["INTERNET"] --> B["Reverse Proxy<br/><i>Step 5: TLS + proxy headers</i>"]
-    B --> C["DeltaGlider Proxy<br/><i>Steps 1-4: auth, IAM, rate limiting</i>"]
-    C --> D["S3 Backend<br/><i>Backend credentials (separate from proxy auth)</i>"]
+graph LR
+    A["INTERNET"] --> B["Reverse Proxy<br/>TLS + headers"]
+    B --> C["DeltaGlider Proxy<br/>auth, IAM, rate limiting"]
+    C --> D["S3 Backend"]
 ```
 
 ---
