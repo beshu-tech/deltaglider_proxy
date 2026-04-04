@@ -18,6 +18,7 @@ import { adminLogout, whoami, checkSession } from './adminApi';
 import type { WhoamiResponse } from './adminApi';
 import { useColors } from './ThemeContext';
 import useComputeSize from './useComputeSize';
+import { NavigationContext } from './NavigationContext';
 
 const { Content } = Layout;
 const { useBreakpoint } = Grid;
@@ -27,71 +28,73 @@ type View = 'browser' | 'upload' | 'metrics' | 'docs' | 'admin';
 /** Full-screen views hide the main sidebar and TopBar */
 const FULLSCREEN_VIEWS: Set<View> = new Set(['admin', 'docs']);
 
-const HASH_TO_VIEW: Record<string, View> = {
+const BASE = '/_/';
+
+const SEGMENT_TO_VIEW: Record<string, View> = {
   '': 'browser',
-  '#/': 'browser',
-  '#/browse': 'browser',
-  '#/upload': 'upload',
-  '#/settings': 'browser', // legacy redirect
-  '#/admin': 'admin',
-  '#/admin/users': 'admin',
-  '#/admin/groups': 'admin',
-  '#/admin/backend': 'admin',
-  '#/admin/metrics': 'admin',
-  '#/admin/bootstrap': 'admin',
-  '#/metrics': 'metrics',
-  '#/docs': 'docs',
+  'browse': 'browser',
+  'upload': 'upload',
+  'metrics': 'metrics',
+  'docs': 'docs',
+  'admin': 'admin',
 };
 
-const VIEW_TO_HASH: Record<View, string> = {
-  browser: '#/browse',
-  upload: '#/upload',
-  metrics: '#/metrics',
-  docs: '#/docs',
-  admin: '#/admin',
-};
+/** Parse pathname into view + sub-path */
+function parsePath(): { view: View; subPath: string } {
+  let path = window.location.pathname;
+  if (path.startsWith(BASE)) path = path.slice(BASE.length);
+  else if (path.startsWith('/')) path = path.slice(1);
+  path = path.replace(/\/+$/, ''); // trim trailing slashes
 
-function readViewFromHash(): View {
-  return HASH_TO_VIEW[window.location.hash] ?? 'browser';
+  const segments = path.split('/');
+  const view = SEGMENT_TO_VIEW[segments[0] || ''] ?? 'browser';
+  const subPath = segments.slice(1).join('/');
+  return { view, subPath };
 }
 
-function useHashRouter() {
-  const [view, setViewState] = useState<View>(readViewFromHash);
-  const skipNextHashChange = useRef(false);
+function usePathRouter() {
+  const [state, setState] = useState(parsePath);
+  const skipNext = useRef(false);
 
-  const setView = useCallback((v: View, replace = false) => {
-    setViewState(v);
-    const hash = VIEW_TO_HASH[v];
-    if (window.location.hash !== hash) {
-      skipNextHashChange.current = true;
-      if (replace) {
-        window.history.replaceState(null, '', hash);
-      } else {
-        window.history.pushState(null, '', hash);
-      }
+  // Redirect old hash-based URLs on first load
+  useEffect(() => {
+    if (window.location.hash.startsWith('#/')) {
+      const oldPath = window.location.hash.slice(1); // e.g., "/admin/users"
+      window.history.replaceState(null, '', BASE + oldPath.replace(/^\//, ''));
+      setState(parsePath());
     }
   }, []);
 
-  useEffect(() => {
-    const onHashChange = () => {
-      if (skipNextHashChange.current) {
-        skipNextHashChange.current = false;
-        return;
-      }
-      setViewState(readViewFromHash());
-    };
-    window.addEventListener('hashchange', onHashChange);
-    return () => window.removeEventListener('hashchange', onHashChange);
+  const navigate = useCallback((path: string, replace = false) => {
+    const cleanPath = path.replace(/^\//, '');
+    const fullPath = BASE + cleanPath;
+    if (window.location.pathname + window.location.hash === fullPath) return;
+    skipNext.current = true;
+    if (replace) {
+      window.history.replaceState(null, '', fullPath);
+    } else {
+      window.history.pushState(null, '', fullPath);
+    }
+    setState(parsePath());
   }, []);
 
-  return [view, setView] as const;
+  useEffect(() => {
+    const onPopState = () => {
+      if (skipNext.current) { skipNext.current = false; return; }
+      setState(parsePath());
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
+
+  return { view: state.view, subPath: state.subPath, navigate };
 }
 
 
 export default function App() {
   const colors = useColors();
 
-  const [view, setView] = useHashRouter();
+  const { view, subPath, navigate } = usePathRouter();
   const [siderOpen, setSiderOpen] = useState(false);
   const [needsConnect, setNeedsConnect] = useState(true); // start true, resolved in useEffect
   const [sessionLoading, setSessionLoading] = useState(true);
@@ -169,12 +172,12 @@ export default function App() {
     adminLogout().catch(() => {});
     setFirstLoadDone(false);
     setNeedsConnect(true);
-    setView('browser');
+    navigate('browse');
   };
 
   const handleBucketChange = (newBucket: string) => {
     s3.changeBucket(newBucket);
-    setView('browser');
+    navigate('browse');
   };
 
   const isEmpty = s3.objects.length === 0 && s3.folders.length === 0;
@@ -200,25 +203,26 @@ export default function App() {
     if (view === 'admin') {
       return (
         <AdminPage
-          onBack={() => setView('browser')}
-          onSessionExpired={() => setView('browser')}
+          onBack={() => navigate('browse')}
+          onSessionExpired={() => navigate('browse')}
+          subPath={subPath}
         />
       );
     }
 
     if (view === 'metrics') {
-      return <MetricsPage onBack={() => setView('browser')} />;
+      return <MetricsPage onBack={() => navigate('browse')} />;
     }
 
     if (view === 'docs') {
-      return <DocsPage onBack={() => setView('browser')} />;
+      return <DocsPage onBack={() => navigate('browse')} docId={subPath || undefined} />;
     }
 
     if (view === 'upload') {
       return (
         <UploadPage
           prefix={s3.prefix}
-          onBack={() => setView('browser')}
+          onBack={() => navigate('browse')}
           onDone={() => s3.mutate()}
         />
       );
@@ -269,7 +273,7 @@ export default function App() {
               prefix={s3.prefix}
               selected={s3.selected}
               onSelect={s3.setSelected}
-              onNavigate={(p) => { setView('browser'); s3.navigate(p); }}
+              onNavigate={(p) => { navigate('browse'); s3.navigate(p); }}
               selectedKeys={s3.selectedKeys}
               onToggleKey={s3.toggleKey}
               onToggleAll={s3.toggleAll}
@@ -290,6 +294,7 @@ export default function App() {
   };
 
   return (
+    <NavigationContext.Provider value={{ navigate, subPath }}>
     <Layout style={{ minHeight: '100vh', background: colors.BG_BASE }}>
       {/* Skip to content link */}
       <a href="#main-content" className="sr-only sr-only-focusable">
@@ -299,7 +304,7 @@ export default function App() {
       <Layout style={{ flexDirection: 'row', flex: 1 }}>
         {!FULLSCREEN_VIEWS.has(view) && (
           <Sidebar
-            onUploadClick={() => { setView('upload'); setSiderOpen(false); }}
+            onUploadClick={() => { navigate('upload'); setSiderOpen(false); }}
             onMutate={s3.mutate}
             refreshTrigger={s3.refreshTrigger}
             onBucketChange={handleBucketChange}
@@ -307,11 +312,11 @@ export default function App() {
             onClose={() => setSiderOpen(false)}
             isMobile={isMobile}
             onSettingsClick={() => {
-              setView('admin');
+              navigate('admin');
               setSiderOpen(false);
             }}
             onDocsClick={() => {
-              setView('docs');
+              navigate('docs');
               setSiderOpen(false);
             }}
             onLogout={handleLogout}
@@ -325,7 +330,7 @@ export default function App() {
           {!FULLSCREEN_VIEWS.has(view) && (
             <TopBar
               prefix={s3.prefix}
-              onNavigate={(p) => { setView('browser'); s3.navigate(p); }}
+              onNavigate={(p) => { navigate('browse'); s3.navigate(p); }}
               isMobile={isMobile}
               onMenuClick={() => setSiderOpen(true)}
               onRefresh={s3.mutate}
@@ -361,5 +366,6 @@ export default function App() {
       />
       {view === 'browser' && <DropZone onDrop={s3.uploadFiles} prefix={s3.prefix} />}
     </Layout>
+    </NavigationContext.Provider>
   );
 }

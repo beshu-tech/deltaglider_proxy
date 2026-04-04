@@ -19,29 +19,11 @@ import SettingsPage from './SettingsPage';
 import UsersPanel from './UsersPanel';
 import GroupsPanel from './GroupsPanel';
 import MetricsPage from './MetricsPage';
+import { useNavigation } from '../NavigationContext';
 
 const { Text } = Typography;
 
-const TAB_KEY_TO_HASH: Record<string, string> = {
-  users: '#/admin/users',
-  groups: '#/admin/groups',
-  metrics: '#/admin/metrics',
-  backend: '#/admin/backend',
-  security: '#/admin/bootstrap',
-};
-
-const HASH_TO_TAB: Record<string, string> = {
-  '#/admin': 'users',
-  '#/admin/users': 'users',
-  '#/admin/groups': 'groups',
-  '#/admin/metrics': 'metrics',
-  '#/admin/backend': 'backend',
-  '#/admin/bootstrap': 'security',
-};
-
-function readTabFromHash(): string {
-  return HASH_TO_TAB[window.location.hash] ?? 'users';
-}
+const VALID_TABS = new Set(['users', 'groups', 'metrics', 'backend', 'compression', 'limits', 'security', 'logging']);
 
 const TABS = [
   { key: 'users', label: 'Users', icon: <TeamOutlined /> },
@@ -57,29 +39,18 @@ const TABS = [
 interface AdminPageProps {
   onBack: () => void;
   onSessionExpired?: () => void;
+  subPath?: string;
 }
 
-export default function AdminPage({ onBack, onSessionExpired }: AdminPageProps) {
+export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPageProps) {
   const colors = useColors();
-  const [activeTab, setActiveTabState] = useState(readTabFromHash);
+  const { navigate } = useNavigation();
 
+  // Derive active tab from URL sub-path
+  const activeTab = VALID_TABS.has(subPath || '') ? subPath! : 'users';
   const setActiveTab = useCallback((tab: string) => {
-    setActiveTabState(tab);
-    const hash = TAB_KEY_TO_HASH[tab] || '#/admin/users';
-    if (window.location.hash !== hash) {
-      window.history.pushState(null, '', hash);
-    }
-  }, []);
-
-  // Sync tab from hash on browser back/forward
-  useEffect(() => {
-    const onHashChange = () => {
-      const tab = readTabFromHash();
-      setActiveTabState(tab);
-    };
-    window.addEventListener('hashchange', onHashChange);
-    return () => window.removeEventListener('hashchange', onHashChange);
-  }, []);
+    navigate(`admin/${tab}`);
+  }, [navigate]);
 
   const [authed, setAuthed] = useState(false);
   const [checkingSession, setCheckingSession] = useState(true);

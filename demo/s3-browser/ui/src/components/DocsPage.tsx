@@ -9,6 +9,7 @@ import { useColors } from '../ThemeContext';
 import FullScreenHeader from './FullScreenHeader';
 import DocSearch from './DocSearch';
 import Lightbox from './Lightbox';
+import { useNavigation } from '../NavigationContext';
 import '../docs.css';
 
 mermaid.initialize({
@@ -90,13 +91,31 @@ function extractHeadings(markdown: string): TocItem[] {
 }
 
 interface Props {
-  initialDoc?: string;
+  /** Doc ID from URL path (e.g., 'configuration' from /_/docs/configuration) */
+  docId?: string;
   onBack?: () => void;
 }
 
-export default function DocsPage({ initialDoc, onBack }: Props) {
+export default function DocsPage({ docId, onBack }: Props) {
   const colors = useColors();
-  const [selectedId, setSelectedId] = useState(initialDoc || DOCS[0]?.id || '');
+  const { navigate } = useNavigation();
+
+  // Resolve doc ID: URL-driven if provided, else default to first doc
+  const resolvedId = (docId && DOCS.some(d => d.id === docId)) ? docId : DOCS[0]?.id || '';
+  const [selectedId, setSelectedIdState] = useState(resolvedId);
+
+  // Sync selectedId when URL changes (browser back/forward)
+  useEffect(() => {
+    if (docId && DOCS.some(d => d.id === docId)) {
+      setSelectedIdState(docId);
+    }
+  }, [docId]);
+
+  // Navigate + update state when user selects a doc
+  const setSelectedId = useCallback((id: string) => {
+    setSelectedIdState(id);
+    navigate(`docs/${id}`);
+  }, [navigate]);
   const [activeHeading, setActiveHeading] = useState('');
   const contentRef = useRef<HTMLDivElement>(null);
 
