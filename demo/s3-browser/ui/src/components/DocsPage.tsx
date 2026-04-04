@@ -10,7 +10,13 @@ import FullScreenHeader from './FullScreenHeader';
 import DocSearch from './DocSearch';
 import '../docs.css';
 
-mermaid.initialize({ startOnLoad: false, theme: 'dark', themeVariables: { primaryColor: '#2dd4bf', lineColor: '#5e7290' } });
+mermaid.initialize({
+  startOnLoad: false,
+  theme: 'dark',
+  themeVariables: { primaryColor: '#2dd4bf', lineColor: '#5e7290' },
+  flowchart: { useMaxWidth: false },
+  sequence: { useMaxWidth: false },
+});
 
 /** Self-contained Mermaid diagram React component */
 function Mermaid({ chart }: { chart: string }) {
@@ -27,7 +33,13 @@ function Mermaid({ chart }: { chart: string }) {
   }, [chart]);
 
   if (!svg) return <pre><code>{chart}</code></pre>;
-  return <div ref={ref} className="mermaid-diagram" dangerouslySetInnerHTML={{ __html: svg }} />;
+  // Remove mermaid's inline max-width and width constraints entirely.
+  // Let the SVG render at its natural viewBox size, then scale to fill container via CSS.
+  const cleanSvg = svg
+    .replace(/max-width:\s*[\d.]+px;?/g, '')
+    .replace(/width="100%"/g, '')
+    .replace(/style=""/g, '');
+  return <div ref={ref} className="mermaid-diagram" dangerouslySetInnerHTML={{ __html: cleanSvg }} />;
 }
 
 
