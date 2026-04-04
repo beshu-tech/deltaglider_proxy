@@ -479,7 +479,13 @@ pub async fn update_config(
 
     // Update per-bucket policies (hot-reloadable — triggers engine rebuild)
     if let Some(ref bucket_policies) = body.bucket_policies {
-        cfg.buckets = bucket_policies.clone();
+        // Normalize bucket names to lowercase before storing (S3 bucket names are lowercase)
+        let normalized: std::collections::HashMap<String, _> = bucket_policies
+            .iter()
+            .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+            .collect();
+        let old_buckets = cfg.buckets.clone();
+        cfg.buckets = normalized;
         // Engine rebuild needed to update BucketPolicyRegistry
         match DynEngine::new(&cfg, Some(state.s3_state.metrics.clone())).await {
             Ok(new_engine) => {
@@ -487,6 +493,8 @@ pub async fn update_config(
                 tracing::info!("Bucket policies updated, engine rebuilt");
             }
             Err(e) => {
+                // Rollback: restore old policies so config and engine stay consistent
+                cfg.buckets = old_buckets;
                 warnings.push(format!("Failed to apply bucket policies: {}", e));
             }
         }
