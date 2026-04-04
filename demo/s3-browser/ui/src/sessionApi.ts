@@ -2,7 +2,7 @@
 // Credentials are stored in an httpOnly session cookie on the server —
 // never in localStorage — to prevent XSS exfiltration.
 
-const BASE = '/_';
+import { adminFetch } from './adminApi';
 
 export interface SessionS3Credentials {
   endpoint: string;
@@ -15,9 +15,7 @@ export interface SessionS3Credentials {
 /** Fetch S3 credentials stored in the current server-side session. */
 export async function fetchSessionCredentials(): Promise<SessionS3Credentials | null> {
   try {
-    const res = await fetch(`${BASE}/api/admin/session/s3-credentials`, {
-      credentials: 'include',
-    });
+    const res = await adminFetch('/api/admin/session/s3-credentials');
     if (!res.ok) return null;
     return await res.json();
   } catch {
@@ -28,12 +26,7 @@ export async function fetchSessionCredentials(): Promise<SessionS3Credentials | 
 /** Store or update S3 credentials in the server-side session. */
 export async function storeSessionCredentials(creds: SessionS3Credentials): Promise<boolean> {
   try {
-    const res = await fetch(`${BASE}/api/admin/session/s3-credentials`, {
-      method: 'PUT',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(creds),
-    });
+    const res = await adminFetch('/api/admin/session/s3-credentials', 'PUT', creds);
     return res.ok;
   } catch {
     return false;
@@ -43,10 +36,7 @@ export async function storeSessionCredentials(creds: SessionS3Credentials): Prom
 /** Clear S3 credentials from the server-side session (disconnect). */
 export async function clearSessionCredentials(): Promise<void> {
   try {
-    await fetch(`${BASE}/api/admin/session/s3-credentials`, {
-      method: 'DELETE',
-      credentials: 'include',
-    });
+    await adminFetch('/api/admin/session/s3-credentials', 'DELETE');
   } catch {
     // Best-effort
   }

@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
-import { Button, Input, InputNumber, Radio, Select, Switch, Typography, Space, Alert, Spin, Tabs } from 'antd';
-import { SaveOutlined, LockOutlined, WarningOutlined, DatabaseOutlined, ControlOutlined, SafetyOutlined, KeyOutlined, ApiOutlined, CloudOutlined, ArrowLeftOutlined, PlusOutlined, DeleteOutlined, FolderOutlined } from '@ant-design/icons';
+import { Button, Input, InputNumber, Radio, Select, Switch, Typography, Space, Alert, Spin } from 'antd';
+import { SaveOutlined, LockOutlined, WarningOutlined, DatabaseOutlined, ControlOutlined, SafetyOutlined, KeyOutlined, ApiOutlined, PlusOutlined, DeleteOutlined, FolderOutlined } from '@ant-design/icons';
 import type { AdminConfig, TestS3Response } from '../adminApi';
 import { getAdminConfig, updateAdminConfig, testS3Connection } from '../adminApi';
 import { useColors } from '../ThemeContext';
@@ -9,7 +9,7 @@ import SectionHeader from './SectionHeader';
 import PasswordChangeCard from './PasswordChangeCard';
 
 
-const { Title, Text } = Typography;
+const { Text } = Typography;
 
 const LOG_LEVEL_PRESETS = [
   { label: 'Error', value: 'deltaglider_proxy=error,tower_http=error' },
@@ -34,15 +34,14 @@ function findMatchingPreset(logLevel: string): string | null {
 }
 
 interface Props {
-  onBack: () => void;
   onSessionExpired?: () => void;
-  /** When set, renders only the content for this tab (no tabs bar, no header). Used by AdminPage. */
+  /** Which tab to render. Defaults to 'backend'. Used by AdminPage. */
   embeddedTab?: string;
 }
 
 /* -- SettingsPage (main) -------------------------------------------------- */
 
-export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: Props) {
+export default function SettingsPage({ onSessionExpired, embeddedTab }: Props) {
   const colors = useColors();
   const { cardStyle, labelStyle, inputRadius } = useCardStyles();
 
@@ -188,10 +187,9 @@ export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: 
     return (
       <div style={{ padding: 24 }}>
         <Alert type="error" message="Session expired. Please log in again." showIcon />
-        <Space style={{ marginTop: 16 }}>
+        <div style={{ marginTop: 16 }}>
           <Button type="primary" onClick={() => onSessionExpired?.()}>Log in again</Button>
-          <Button onClick={onBack}>Back to browser</Button>
-        </Space>
+        </div>
       </div>
     );
   }
@@ -645,51 +643,18 @@ export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: 
   );
 
   // When embedded in AdminPage, render just the requested tab content
-  if (embeddedTab) {
-    const tabMap: Record<string, React.ReactNode> = {
-      backend: backendTab,
-      compression: compressionTab,
-      limits: limitsTab,
-      security: securityTab,
-      logging: loggingTab,
-      // Legacy alias
-      proxy: compressionTab,
-    };
-    return (
-      <div style={{ maxWidth: 640, margin: '0 auto', padding: 'clamp(16px, 3vw, 24px)' }}>
-        {tabMap[embeddedTab] ?? null}
-      </div>
-    );
-  }
-
-  /* -- Tab items ---------------------------------------------------------- */
-
-  const tabItems = [
-    { key: 'backend', label: <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}><DatabaseOutlined aria-hidden="true" /><span>Backend</span></span>, children: backendTab },
-    { key: 'compression', label: <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}><ControlOutlined aria-hidden="true" /><span>Compression</span></span>, children: compressionTab },
-    { key: 'limits', label: <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}><CloudOutlined aria-hidden="true" /><span>Limits</span></span>, children: limitsTab },
-    { key: 'security', label: <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}><LockOutlined aria-hidden="true" /><span>Security</span></span>, children: securityTab },
-    { key: 'logging', label: <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}><ApiOutlined aria-hidden="true" /><span>Logging</span></span>, children: loggingTab },
-  ];
-
+  const tabMap: Record<string, React.ReactNode> = {
+    backend: backendTab,
+    compression: compressionTab,
+    limits: limitsTab,
+    security: securityTab,
+    logging: loggingTab,
+    // Legacy alias
+    proxy: compressionTab,
+  };
   return (
-    <div className="animate-fade-in" style={{ maxWidth: 800, width: '100%', margin: '0 auto', padding: 'clamp(16px, 3vw, 24px) clamp(12px, 2vw, 16px)' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-        <Title level={4} style={{ margin: 0, fontFamily: "var(--font-ui)", fontWeight: 700 }}>Settings</Title>
-        <Button onClick={onBack} size="small" icon={<ArrowLeftOutlined />} style={inputRadius}>Back</Button>
-      </div>
-
-      <Tabs
-        items={tabItems}
-        defaultActiveKey="connection"
-        size="middle"
-        tabBarStyle={{
-          fontFamily: "var(--font-ui)",
-          fontWeight: 600,
-          marginBottom: 20,
-        }}
-        style={{ minHeight: 300, width: '100%' }}
-      />
+    <div style={{ maxWidth: 640, margin: '0 auto', padding: 'clamp(16px, 3vw, 24px)' }}>
+      {tabMap[embeddedTab ?? 'backend'] ?? null}
     </div>
   );
 }

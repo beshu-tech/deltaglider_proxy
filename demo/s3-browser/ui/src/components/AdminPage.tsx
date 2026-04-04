@@ -147,7 +147,6 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
     }
     return (
       <SettingsPage
-        onBack={onBack}
         onSessionExpired={onSessionExpired}
         embeddedTab={activeTab}
       />

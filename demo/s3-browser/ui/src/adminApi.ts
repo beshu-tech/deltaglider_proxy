@@ -3,7 +3,7 @@
 const BASE = '/_';
 
 /** Shared fetch wrapper — handles credentials, JSON serialization, content-type. */
-async function adminFetch(path: string, method = 'GET', body?: unknown): Promise<Response> {
+export async function adminFetch(path: string, method = 'GET', body?: unknown): Promise<Response> {
   const opts: RequestInit = { method, credentials: 'include' };
   if (body !== undefined) {
     opts.headers = { 'Content-Type': 'application/json' };

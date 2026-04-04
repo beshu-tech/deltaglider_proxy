@@ -228,6 +228,23 @@ fn compute_tainted_fields(runtime: &crate::config::Config) -> Vec<String> {
     tainted
 }
 
+/// Rebuild the engine from current config, storing the new engine on success.
+/// Returns `Ok(())` on success, or an error message string on failure.
+async fn rebuild_engine(
+    state: &Arc<AdminState>,
+    cfg: &crate::config::Config,
+    context: &str,
+) -> Result<(), String> {
+    match DynEngine::new(cfg, Some(state.s3_state.metrics.clone())).await {
+        Ok(new_engine) => {
+            state.s3_state.engine.store(Arc::new(new_engine));
+            tracing::info!("{}", context);
+            Ok(())
+        }
+        Err(e) => Err(format!("{}", e)),
+    }
+}
+
 /// GET /api/admin/config — return sanitized config (no secrets).
 pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
     let cfg = state.config.read().await;
@@ -507,21 +524,14 @@ pub async fn update_config(
         }
 
         if need_engine_swap {
-            // Save old backend config so we can rollback if engine creation fails.
             let old_backend = cfg.backend.clone();
-            match DynEngine::new(&cfg, Some(state.s3_state.metrics.clone())).await {
-                Ok(new_engine) => {
-                    state.s3_state.engine.store(Arc::new(new_engine));
-                    tracing::info!("Backend engine rebuilt successfully");
-                }
-                Err(e) => {
-                    // Rollback: restore old backend config so config and engine stay consistent.
-                    cfg.backend = old_backend;
-                    warnings.push(format!(
-                        "Failed to create engine with new backend config (config rolled back): {}",
-                        e
-                    ));
-                }
+            if let Err(e) = rebuild_engine(&state, &cfg, "Backend engine rebuilt successfully").await
+            {
+                cfg.backend = old_backend;
+                warnings.push(format!(
+                    "Failed to create engine with new backend config (config rolled back): {}",
+                    e
+                ));
             }
         }
     }
@@ -596,17 +606,11 @@ pub async fn update_config(
             .collect();
         let old_buckets = cfg.buckets.clone();
         cfg.buckets = normalized;
-        // Engine rebuild needed to update BucketPolicyRegistry
-        match DynEngine::new(&cfg, Some(state.s3_state.metrics.clone())).await {
-            Ok(new_engine) => {
-                state.s3_state.engine.store(Arc::new(new_engine));
-                tracing::info!("Bucket policies updated, engine rebuilt");
-            }
-            Err(e) => {
-                // Rollback: restore old policies so config and engine stay consistent
-                cfg.buckets = old_buckets;
-                warnings.push(format!("Failed to apply bucket policies: {}", e));
-            }
+        if let Err(e) =
+            rebuild_engine(&state, &cfg, "Bucket policies updated, engine rebuilt").await
+        {
+            cfg.buckets = old_buckets;
+            warnings.push(format!("Failed to apply bucket policies: {}", e));
         }
     }
 
