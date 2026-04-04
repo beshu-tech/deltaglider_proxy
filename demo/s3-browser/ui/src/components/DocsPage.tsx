@@ -8,6 +8,7 @@ import { DOCS, DOC_GROUPS, findDocByFilename, type DocEntry } from '../docs-impo
 import { useColors } from '../ThemeContext';
 import FullScreenHeader from './FullScreenHeader';
 import DocSearch from './DocSearch';
+import Lightbox from './Lightbox';
 import '../docs.css';
 
 mermaid.initialize({
@@ -19,7 +20,7 @@ mermaid.initialize({
 });
 
 /** Self-contained Mermaid diagram React component */
-function Mermaid({ chart }: { chart: string }) {
+function Mermaid({ chart, caption }: { chart: string; caption?: string }) {
   const ref = useRef<HTMLDivElement>(null);
   const [svg, setSvg] = useState('');
 
@@ -33,26 +34,33 @@ function Mermaid({ chart }: { chart: string }) {
   }, [chart]);
 
   if (!svg) return <pre><code>{chart}</code></pre>;
-  // Replace mermaid's inline max-width with 100% width so diagram fills
-  // container but never exceeds it. Preserves viewBox for proper scaling.
   const cleanSvg = svg
     .replace(/style="[^"]*"/, 'style="width:100%;height:auto"')
     .replace(/width="100%"/, '');
-  return <div ref={ref} className="mermaid-diagram" dangerouslySetInnerHTML={{ __html: cleanSvg }} />;
+  return (
+    <Lightbox caption={caption}>
+      <div ref={ref} className="mermaid-diagram" dangerouslySetInnerHTML={{ __html: cleanSvg }} />
+    </Lightbox>
+  );
 }
 
 
 /** Split markdown into text segments and mermaid code blocks */
-function splitMermaid(md: string): { type: 'text' | 'mermaid'; content: string }[] {
-  const segments: { type: 'text' | 'mermaid'; content: string }[] = [];
+function splitMermaid(md: string): { type: 'text' | 'mermaid'; content: string; caption?: string }[] {
+  const segments: { type: 'text' | 'mermaid'; content: string; caption?: string }[] = [];
   const regex = /```mermaid\n([\s\S]*?)```/g;
   let lastIndex = 0;
   let match;
   while ((match = regex.exec(md)) !== null) {
-    if (match.index > lastIndex) {
-      segments.push({ type: 'text', content: md.slice(lastIndex, match.index) });
+    const textBefore = md.slice(lastIndex, match.index);
+    if (textBefore) {
+      segments.push({ type: 'text', content: textBefore });
     }
-    segments.push({ type: 'mermaid', content: match[1].trim() });
+    // Use the last heading before the mermaid block as caption
+    const lines = textBefore.trim().split('\n');
+    const lastHeading = [...lines].reverse().find(l => /^#{2,4}\s/.test(l));
+    const caption = lastHeading?.replace(/^#+\s+/, '').trim();
+    segments.push({ type: 'mermaid', content: match[1].trim(), caption });
     lastIndex = match.index + match[0].length;
   }
   if (lastIndex < md.length) {
@@ -222,7 +230,7 @@ export default function DocsPage({ initialDoc, onBack }: Props) {
             <article className="docs-content" style={{ flex: 1, minWidth: 0 }}>
               {splitMermaid(selectedDoc.content).map((segment, i) =>
                 segment.type === 'mermaid' ? (
-                  <Mermaid key={i} chart={segment.content} />
+                  <Mermaid key={i} chart={segment.content} caption={segment.caption} />
                 ) : (
                   <ReactMarkdown
                     key={i}
@@ -242,6 +250,12 @@ export default function DocsPage({ initialDoc, onBack }: Props) {
                         }
                         return <a {...props} href={href}>{children}</a>;
                       },
+                      // Wrap images in Lightbox — alt text becomes caption
+                      img: ({ alt, src, ...props }) => (
+                        <Lightbox caption={alt}>
+                          <img {...props} alt={alt} src={src} style={{ width: '100%', display: 'block' }} />
+                        </Lightbox>
+                      ),
                     }}
                   >
                     {segment.content}
