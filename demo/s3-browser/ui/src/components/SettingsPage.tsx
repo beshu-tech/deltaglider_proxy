@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Button, Input, InputNumber, Radio, Select, Switch, Typography, Space, Alert, Spin } from 'antd';
+import { Button, Input, InputNumber, Radio, Switch, Typography, Space, Alert, Spin } from 'antd';
 import { SaveOutlined, LockOutlined, WarningOutlined, DatabaseOutlined, ControlOutlined, SafetyOutlined, KeyOutlined, ApiOutlined, PlusOutlined, DeleteOutlined, FolderOutlined } from '@ant-design/icons';
 import type { AdminConfig, TestS3Response } from '../adminApi';
 import { getAdminConfig, updateAdminConfig, testS3Connection } from '../adminApi';
@@ -217,15 +217,14 @@ export default function SettingsPage({ onSessionExpired, embeddedTab }: Props) {
 
       <div style={{ marginTop: 16 }}>
         <span style={labelStyle}>Backend Type {taintBadge('backend_type')}</span>
-        <Select
+        <Radio.Group
           value={backendType}
-          onChange={(val) => setBackendType(val)}
-          style={{ width: '100%', ...inputRadius }}
-          options={[
-            { label: 'Filesystem', value: 'filesystem' },
-            { label: 'S3', value: 's3' },
-          ]}
-        />
+          onChange={(e) => setBackendType(e.target.value)}
+          style={{ display: 'flex', gap: 0 }}
+        >
+          <Radio.Button value="filesystem" style={{ fontSize: 13 }}>Filesystem</Radio.Button>
+          <Radio.Button value="s3" style={{ fontSize: 13 }}>S3</Radio.Button>
+        </Radio.Group>
       </div>
 
       {backendType !== originalBackendType && (
