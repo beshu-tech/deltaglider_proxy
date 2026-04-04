@@ -598,16 +598,17 @@ pub async fn sigv4_auth_middleware(
         } else {
             // Cap replay cache size to prevent memory exhaustion under attack.
             // Evict expired entries first; only if still over cap, evict oldest half.
+            let replay_window = std::time::Duration::from_secs(
+                std::env::var("DGP_REPLAY_WINDOW_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(2),
+            );
+
             const MAX_REPLAY_ENTRIES: usize = 500_000;
             if cache.len() > MAX_REPLAY_ENTRIES {
-                let replay_window_evict = std::time::Duration::from_secs(
-                    std::env::var("DGP_REPLAY_WINDOW_SECS")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(2),
-                );
                 // First pass: evict expired entries
-                cache.retain(|_, instant| instant.elapsed() < replay_window_evict);
+                cache.retain(|_, instant| instant.elapsed() < replay_window);
                 // If still over cap after eviction, log warning (genuine flood)
                 if cache.len() > MAX_REPLAY_ENTRIES {
                     warn!(
@@ -618,12 +619,6 @@ pub async fn sigv4_auth_middleware(
             }
 
             let sig = &params.signature;
-            let replay_window = std::time::Duration::from_secs(
-                std::env::var("DGP_REPLAY_WINDOW_SECS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(2),
-            );
 
             let mut rejected = false;
             cache
