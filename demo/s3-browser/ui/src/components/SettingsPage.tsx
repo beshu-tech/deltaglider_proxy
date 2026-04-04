@@ -77,6 +77,15 @@ export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: 
   // Bucket policies state: array for ordered editing
   const [bucketPolicies, setBucketPolicies] = useState<Array<{ name: string; compression: boolean; max_delta_ratio: number | null }>>([]);
 
+  // Taint detection: fields that differ from TOML file on disk
+  const [taintedFields, setTaintedFields] = useState<Set<string>>(new Set());
+
+  /** Render an amber "modified" indicator next to a field label when tainted. */
+  const taintBadge = (field: string) =>
+    taintedFields.has(field)
+      ? <span title="Value differs from config file on disk" style={{ fontSize: 10, color: colors.ACCENT_AMBER, marginLeft: 6, fontWeight: 400, cursor: 'help' }}>modified</span>
+      : null;
+
   useEffect(() => {
     getAdminConfig().then((cfg) => {
       if (cfg) {
@@ -91,6 +100,8 @@ export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: 
         setBackendEndpoint(cfg.backend_endpoint || '');
         setBackendRegion(cfg.backend_region || 'us-east-1');
         setBackendForcePathStyle(cfg.backend_force_path_style ?? true);
+        // Tainted fields
+        setTaintedFields(new Set(cfg.tainted_fields || []));
         // Bucket policies
         if (cfg.bucket_policies) {
           setBucketPolicies(
@@ -152,6 +163,9 @@ export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: 
       payload.bucket_policies = bp;
       const result = await updateAdminConfig(payload);
       setSaveResult({ warnings: result.warnings, requires_restart: result.requires_restart });
+      // Re-fetch config to update taint status (save persists to TOML, so taint should clear)
+      const refreshed = await getAdminConfig();
+      if (refreshed) setTaintedFields(new Set(refreshed.tainted_fields || []));
       setOriginalBackendType(backendType);
       setBeAccessKeyId('');
       setBeSecretAccessKey('');
@@ -204,7 +218,7 @@ export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: 
       </div>
 
       <div style={{ marginTop: 16 }}>
-        <span style={labelStyle}>Backend Type</span>
+        <span style={labelStyle}>Backend Type {taintBadge('backend_type')}</span>
         <Select
           value={backendType}
           onChange={(val) => setBackendType(val)}
@@ -229,7 +243,7 @@ export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: 
 
       {backendType === 'filesystem' && (
         <div style={{ marginTop: 16 }}>
-          <span style={labelStyle}>Data Directory</span>
+          <span style={labelStyle}>Data Directory {taintBadge('backend_path')}</span>
           <Input
             value={backendPath}
             onChange={(e) => setBackendPath(e.target.value)}
@@ -242,7 +256,7 @@ export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: 
       {backendType === 's3' && (
         <>
           <div style={{ marginTop: 16 }}>
-            <span style={labelStyle}>S3 Endpoint</span>
+            <span style={labelStyle}>S3 Endpoint {taintBadge('backend_endpoint')}</span>
             <Input
               value={backendEndpoint}
               onChange={(e) => setBackendEndpoint(e.target.value)}
@@ -251,7 +265,7 @@ export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: 
             />
           </div>
           <div style={{ marginTop: 12 }}>
-            <span style={labelStyle}>S3 Region</span>
+            <span style={labelStyle}>S3 Region {taintBadge('backend_region')}</span>
             <Input
               value={backendRegion}
               onChange={(e) => setBackendRegion(e.target.value)}
@@ -426,14 +440,14 @@ export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: 
       <div style={cardStyle}>
         <SectionHeader icon={<SafetyOutlined />} title="Delta Encoding" description="Controls when files are stored as deltas vs full copies" />
         <div style={{ marginTop: 16 }}>
-          <span style={labelStyle}>Max Delta Ratio</span>
+          <span style={labelStyle}>Max Delta Ratio {taintBadge('max_delta_ratio')}</span>
           <InputNumber value={maxDeltaRatio} onChange={(v) => v !== null && setMaxDeltaRatio(v)} min={0} max={1} step={0.05} style={{ width: '100%', ...inputRadius }} />
           <Text type="secondary" style={{ fontSize: 12, fontFamily: "var(--font-ui)" }}>
             Store as delta only if compressed size is less than this fraction of the original. E.g. 0.75 means deltas must save at least 25% space.
           </Text>
         </div>
         <div style={{ marginTop: 16 }}>
-          <span style={labelStyle}>Max Object Size (MB)</span>
+          <span style={labelStyle}>Max Object Size (MB) {taintBadge('max_object_size')}</span>
           <InputNumber value={maxObjectSizeMb} onChange={(v) => v !== null && setMaxObjectSizeMb(v)} min={1} step={10} style={{ width: '100%', ...inputRadius }} />
           <Text type="secondary" style={{ fontSize: 12, fontFamily: "var(--font-ui)" }}>
             Files larger than this are always stored as-is (xdelta3 memory constraint).
@@ -444,7 +458,7 @@ export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: 
       <div style={cardStyle}>
         <SectionHeader icon={<DatabaseOutlined />} title="Cache" description="In-memory caches that speed up reads. Larger = faster but more RAM." />
         <div style={{ marginTop: 16 }}>
-          <span style={labelStyle}>Reference Cache Size (MB) <span style={{ fontSize: 10, color: colors.ACCENT_AMBER }}>restart required</span></span>
+          <span style={labelStyle}>Reference Cache Size (MB) {taintBadge('cache_size_mb')} <span style={{ fontSize: 10, color: colors.ACCENT_AMBER }}>restart required</span></span>
           <InputNumber value={cacheSizeMb} onChange={(v) => v !== null && setCacheSizeMb(v)} min={0} step={100} style={{ width: '100%', ...inputRadius }} />
           <Text type="secondary" style={{ fontSize: 12, fontFamily: "var(--font-ui)" }}>
             Cache for delta baselines. Each active deltaspace needs its reference in cache for fast reconstruction. Recommend 1024+ MB for production.
@@ -460,7 +474,7 @@ export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: 
       </div>
 
       <div style={cardStyle}>
-        <SectionHeader icon={<FolderOutlined />} title="Bucket Policies" description="Override compression settings per bucket. Unconfigured buckets use global defaults above." />
+        <SectionHeader icon={<FolderOutlined />} title={<>Bucket Policies {taintBadge('bucket_policies')}</>} description="Override compression settings per bucket. Unconfigured buckets use global defaults above." />
         {bucketPolicies.map((bp, idx) => (
           <div key={idx} style={{ marginTop: idx === 0 ? 16 : 12, padding: '12px 14px', border: `1px solid ${colors.BORDER}`, borderRadius: 8, background: colors.BG_ELEVATED }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
@@ -553,7 +567,7 @@ export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: 
       <div style={cardStyle}>
         <SectionHeader icon={<KeyOutlined />} title="Authentication" description="Controls how S3 clients authenticate with the proxy" />
         <div style={{ marginTop: 16 }}>
-          <span style={labelStyle}>Access Key ID</span>
+          <span style={labelStyle}>Access Key ID {taintBadge('access_key_id')}</span>
           <Input value={accessKeyId} onChange={(e) => setAccessKeyId(e.target.value)} placeholder="AKIAIOSFODNN7EXAMPLE" style={{ ...inputRadius, fontFamily: "var(--font-mono)", fontSize: 13 }} />
           <Text type="secondary" style={{ fontSize: 12, fontFamily: "var(--font-ui)" }}>Clients use this key to sign S3 requests. Leave empty to disable auth.</Text>
         </div>
@@ -603,7 +617,7 @@ export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: 
   const loggingTab = (
     <div style={tabPane}><form onSubmit={(e) => { e.preventDefault(); handleSave(); }}><Space direction="vertical" size={0} style={{ width: '100%' }}>
       <div style={cardStyle}>
-        <SectionHeader icon={<ControlOutlined />} title="Log Level" description="Controls verbosity of proxy logs. Changes take effect immediately." />
+        <SectionHeader icon={<ControlOutlined />} title={<>Log Level {taintBadge('log_level')}</>} description="Controls verbosity of proxy logs. Changes take effect immediately." />
         <div style={{ marginTop: 16 }}>
           <Radio.Group
             value={logLevelCustom ? '__custom__' : logLevel}
