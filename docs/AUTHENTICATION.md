@@ -135,9 +135,6 @@ flowchart TD
     START -- "Yes" --> I_STATE
 ```
 
-*Vision Concept vs Actual Implementation Rendering:*
-![Auth Diagram Concept](../demo/s3-browser/ui/public/screenshots/docs-diagrams/auth_flow_diagram_v2.png)
-
 ## SigV4 Verification
 
 The proxy verifies SigV4 signatures from two sources:

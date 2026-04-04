@@ -73,7 +73,7 @@ export default function Lightbox({ children, caption }: Props) {
           <div
             onClick={e => e.stopPropagation()}
             style={{
-              maxWidth: '90vw',
+              width: '90vw',
               maxHeight: '85vh',
               overflow: 'auto',
               borderRadius: 8,
