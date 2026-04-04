@@ -33,12 +33,11 @@ function Mermaid({ chart }: { chart: string }) {
   }, [chart]);
 
   if (!svg) return <pre><code>{chart}</code></pre>;
-  // Remove mermaid's inline max-width and width constraints entirely.
-  // Let the SVG render at its natural viewBox size, then scale to fill container via CSS.
+  // Replace mermaid's inline max-width with 100% width so diagram fills
+  // container but never exceeds it. Preserves viewBox for proper scaling.
   const cleanSvg = svg
-    .replace(/max-width:\s*[\d.]+px;?/g, '')
-    .replace(/width="100%"/g, '')
-    .replace(/style=""/g, '');
+    .replace(/style="[^"]*"/, 'style="width:100%;height:auto"')
+    .replace(/width="100%"/, '');
   return <div ref={ref} className="mermaid-diagram" dangerouslySetInnerHTML={{ __html: cleanSvg }} />;
 }
 

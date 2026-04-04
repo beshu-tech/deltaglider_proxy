@@ -115,16 +115,15 @@
 /* Images */
 .docs-content img { max-width: 100%; border-radius: 8px; margin: 12px 0; }
 
-/* Mermaid diagrams — scale to fill content width */
+/* Mermaid diagrams — fit to content width, never overflow */
 .docs-content .mermaid-diagram {
   margin: 24px 0;
   text-align: center;
-  overflow-x: auto;
 }
 .docs-content .mermaid-diagram svg {
   display: block;
   margin: 0 auto;
-  min-width: 100%;
+  width: 100%;
   height: auto;
 }
 
