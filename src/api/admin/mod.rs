@@ -28,9 +28,9 @@ pub use auth::{
 };
 pub use backup::{export_backup, import_backup};
 pub use config::{
-    change_password, get_config, recover_db, test_s3_connection, update_config, ConfigResponse,
-    ConfigUpdateRequest, ConfigUpdateResponse, PasswordChangeRequest, PasswordChangeResponse,
-    TestS3Request, TestS3Response,
+    change_password, get_config, recover_db, test_s3_connection, update_config,
+    BackendInfoResponse, ConfigResponse, ConfigUpdateRequest, ConfigUpdateResponse,
+    PasswordChangeRequest, PasswordChangeResponse, TestS3Request, TestS3Response,
 };
 pub use groups::{
     add_group_member, create_group, delete_group, list_groups, remove_group_member, update_group,

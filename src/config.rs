@@ -327,6 +327,26 @@ pub struct Config {
     /// Unconfigured buckets inherit the global defaults.
     #[serde(default)]
     pub buckets: std::collections::HashMap<String, crate::bucket_policy::BucketPolicyConfig>,
+
+    /// Named backends for multi-backend routing.
+    /// When non-empty, the legacy `backend` field is ignored.
+    #[serde(default)]
+    pub backends: Vec<NamedBackendConfig>,
+
+    /// Name of the default backend (used for buckets without explicit routing).
+    /// Must reference a name in `backends`. Defaults to the first entry.
+    #[serde(default)]
+    pub default_backend: Option<String>,
+}
+
+/// A named storage backend with its connection configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NamedBackendConfig {
+    /// Human-readable name (e.g., "local", "hetzner", "aws")
+    pub name: String,
+    /// The actual backend configuration
+    #[serde(flatten)]
+    pub backend: BackendConfig,
 }
 
 /// TLS configuration (optional)
@@ -437,6 +457,8 @@ impl Default for Config {
             config_sync_bucket: None,
             tls: None,
             buckets: std::collections::HashMap::new(),
+            backends: Vec::new(),
+            default_backend: None,
         }
     }
 }

@@ -54,8 +54,23 @@ pub struct ConfigResponse {
     log_level: String,
     // Backend credentials indicator
     backend_has_credentials: bool,
+    // Multi-backend
+    backends: Vec<BackendInfoResponse>,
+    default_backend: Option<String>,
     // Fields that differ from the TOML config file on disk
     tainted_fields: Vec<String>,
+}
+
+/// Sanitized backend info (no secrets) for the admin API.
+#[derive(Serialize, Clone)]
+pub struct BackendInfoResponse {
+    pub name: String,
+    pub backend_type: String,
+    pub path: Option<String>,
+    pub endpoint: Option<String>,
+    pub region: Option<String>,
+    pub force_path_style: Option<bool>,
+    pub has_credentials: bool,
 }
 
 #[derive(Deserialize)]
@@ -312,6 +327,42 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
 
     let tainted_fields = compute_tainted_fields(&cfg);
 
+    // Build sanitized backends list
+    let backends_info: Vec<BackendInfoResponse> = cfg
+        .backends
+        .iter()
+        .map(|named| {
+            let (bt, path, endpoint, region, fps, has_creds) = match &named.backend {
+                crate::config::BackendConfig::Filesystem { path } => {
+                    ("filesystem", Some(path.display().to_string()), None, None, None, false)
+                }
+                crate::config::BackendConfig::S3 {
+                    endpoint,
+                    region,
+                    force_path_style,
+                    access_key_id,
+                    ..
+                } => (
+                    "s3",
+                    None,
+                    endpoint.clone(),
+                    Some(region.clone()),
+                    Some(*force_path_style),
+                    access_key_id.is_some(),
+                ),
+            };
+            BackendInfoResponse {
+                name: named.name.clone(),
+                backend_type: bt.to_string(),
+                path,
+                endpoint,
+                region,
+                force_path_style: fps,
+                has_credentials: has_creds,
+            }
+        })
+        .collect();
+
     Json(ConfigResponse {
         listen_addr: cfg.listen_addr.to_string(),
         backend_type: backend_type.to_string(),
@@ -349,6 +400,8 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
         // Logging
         log_level,
         backend_has_credentials,
+        backends: backends_info,
+        default_backend: cfg.default_backend.clone(),
         tainted_fields,
     })
 }
