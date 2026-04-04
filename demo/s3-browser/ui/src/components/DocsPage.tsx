@@ -57,14 +57,9 @@ function Mermaid({ chart, caption }: { chart: string; caption?: string }) {
     }
   }, [svg]);
   return (
-    <figure style={{ margin: '24px 0' }}>
+    <Lightbox caption={caption}>
       <div ref={ref} className="mermaid-diagram" dangerouslySetInnerHTML={{ __html: svg }} />
-      {caption && (
-        <figcaption style={{ textAlign: 'center', fontSize: 12, color: 'var(--docs-toc-text)', fontFamily: 'var(--font-ui)', fontStyle: 'italic', marginTop: 8 }}>
-          {caption}
-        </figcaption>
-      )}
-    </figure>
+    </Lightbox>
   );
 }
 
