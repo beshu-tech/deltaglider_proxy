@@ -54,6 +54,8 @@ pub struct ConfigResponse {
     log_level: String,
     // Backend credentials indicator
     backend_has_credentials: bool,
+    // Fields that differ from the TOML config file on disk
+    tainted_fields: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -121,6 +123,111 @@ pub struct TestS3Response {
     pub error_kind: Option<String>,
 }
 
+/// Compare the runtime config against the TOML file on disk.
+/// Returns a list of field names where the runtime value differs from disk.
+fn compute_tainted_fields(runtime: &crate::config::Config) -> Vec<String> {
+    let disk = match crate::config::Config::resolve_config_path() {
+        Some(path) => match crate::config::Config::from_file(&path) {
+            Ok(cfg) => cfg,
+            Err(_) => return vec![], // Can't read file — nothing to compare
+        },
+        None => return vec![], // No config file on disk
+    };
+
+    let mut tainted = Vec::new();
+
+    // Compression settings
+    if (runtime.max_delta_ratio - disk.max_delta_ratio).abs() > f32::EPSILON {
+        tainted.push("max_delta_ratio".to_string());
+    }
+    if runtime.max_object_size != disk.max_object_size {
+        tainted.push("max_object_size".to_string());
+    }
+    if runtime.cache_size_mb != disk.cache_size_mb {
+        tainted.push("cache_size_mb".to_string());
+    }
+    if runtime.metadata_cache_mb != disk.metadata_cache_mb {
+        tainted.push("metadata_cache_mb".to_string());
+    }
+
+    // Backend type
+    let runtime_type = match &runtime.backend {
+        crate::config::BackendConfig::Filesystem { .. } => "filesystem",
+        crate::config::BackendConfig::S3 { .. } => "s3",
+    };
+    let disk_type = match &disk.backend {
+        crate::config::BackendConfig::Filesystem { .. } => "filesystem",
+        crate::config::BackendConfig::S3 { .. } => "s3",
+    };
+    if runtime_type != disk_type {
+        tainted.push("backend_type".to_string());
+    }
+
+    // Backend details (only compare within same type)
+    match (&runtime.backend, &disk.backend) {
+        (
+            crate::config::BackendConfig::Filesystem { path: rp },
+            crate::config::BackendConfig::Filesystem { path: dp },
+        ) => {
+            if rp != dp {
+                tainted.push("backend_path".to_string());
+            }
+        }
+        (
+            crate::config::BackendConfig::S3 {
+                endpoint: re,
+                region: rr,
+                force_path_style: rf,
+                ..
+            },
+            crate::config::BackendConfig::S3 {
+                endpoint: de,
+                region: dr,
+                force_path_style: df,
+                ..
+            },
+        ) => {
+            if re != de {
+                tainted.push("backend_endpoint".to_string());
+            }
+            if rr != dr {
+                tainted.push("backend_region".to_string());
+            }
+            if rf != df {
+                tainted.push("backend_force_path_style".to_string());
+            }
+        }
+        _ => {} // Different backend types already flagged above
+    }
+
+    // Auth
+    if runtime.access_key_id != disk.access_key_id {
+        tainted.push("access_key_id".to_string());
+    }
+
+    // Log level
+    if runtime.log_level != disk.log_level {
+        tainted.push("log_level".to_string());
+    }
+
+    // Config sync
+    if runtime.config_sync_bucket != disk.config_sync_bucket {
+        tainted.push("config_sync_bucket".to_string());
+    }
+
+    // Listen address
+    if runtime.listen_addr != disk.listen_addr {
+        tainted.push("listen_addr".to_string());
+    }
+
+    // Bucket policies
+    if runtime.buckets != disk.buckets {
+        tainted.push("bucket_policies".to_string());
+    }
+
+    tainted
+}
+
 /// GET /api/admin/config — return sanitized config (no secrets).
 pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
     let cfg = state.config.read().await;
@@ -186,6 +293,8 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
         .map(|n| n.get())
         .unwrap_or(4);
 
+    let tainted_fields = compute_tainted_fields(&cfg);
+
     Json(ConfigResponse {
         listen_addr: cfg.listen_addr.to_string(),
         backend_type: backend_type.to_string(),
@@ -223,6 +332,7 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
         // Logging
         log_level,
         backend_has_credentials,
+        tainted_fields,
     })
 }
 

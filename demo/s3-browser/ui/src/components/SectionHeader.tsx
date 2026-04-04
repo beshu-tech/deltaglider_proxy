@@ -3,7 +3,7 @@ import { useColors } from '../ThemeContext';
 
 const { Text } = Typography;
 
-export default function SectionHeader({ icon, title, description }: { icon: React.ReactNode; title: string; description?: string }) {
+export default function SectionHeader({ icon, title, description }: { icon: React.ReactNode; title: React.ReactNode; description?: string }) {
   const { ACCENT_BLUE, TEXT_PRIMARY, TEXT_MUTED } = useColors();
   return (
     <div style={{ marginBottom: 4 }}>

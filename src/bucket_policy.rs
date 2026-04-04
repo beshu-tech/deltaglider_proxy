@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 /// Per-bucket policy overrides. All fields are optional — `None` means
 /// "use the global default".
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct BucketPolicyConfig {
     /// Enable/disable delta compression for this bucket.
     /// When `false`, all files in this bucket are stored as passthrough

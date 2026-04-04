@@ -552,6 +552,22 @@ impl Config {
         }
     }
 
+    /// Resolve the path to the active config file on disk.
+    /// Returns `None` if no config file is found.
+    pub fn resolve_config_path() -> Option<String> {
+        if let Ok(path) = std::env::var("DGP_CONFIG") {
+            if std::path::Path::new(&path).exists() {
+                return Some(path);
+            }
+        }
+        for path in &["deltaglider_proxy.toml", "/etc/deltaglider_proxy/config.toml"] {
+            if std::path::Path::new(path).exists() {
+                return Some(path.to_string());
+            }
+        }
+        None
+    }
+
     /// Load configuration: file first, then env var overrides on top.
     /// Environment variables always take precedence over file-based config.
     pub fn load() -> Self {

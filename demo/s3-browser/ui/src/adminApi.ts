@@ -66,6 +66,8 @@ export interface AdminConfig {
   bucket_policies: Record<string, { compression?: boolean; max_delta_ratio?: number }>;
   // Logging
   log_level: string;
+  // Taint detection
+  tainted_fields: string[];
 }
 
 export async function getAdminConfig(): Promise<AdminConfig | null> {
