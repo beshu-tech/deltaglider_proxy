@@ -4,6 +4,7 @@
 
 pub mod api;
 pub mod audit;
+pub mod bucket_policy;
 pub mod config;
 pub mod config_db;
 pub mod config_db_sync;

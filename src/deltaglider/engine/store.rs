@@ -43,9 +43,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             &sha256[..8]
         );
 
-        // Check if file type is eligible for delta compression
-        if !self.file_router.is_delta_eligible(&obj_key.filename) {
-            debug!("File type not delta-eligible, storing as passthrough");
+        // Check per-bucket compression policy + file type eligibility
+        let compression_disabled = !self.bucket_policies.compression_enabled(bucket);
+        if compression_disabled || !self.file_router.is_delta_eligible(&obj_key.filename) {
+            if compression_disabled {
+                debug!("Compression disabled for bucket '{bucket}', storing as passthrough");
+            } else {
+                debug!("File type not delta-eligible, storing as passthrough");
+            }
             self.with_metrics(|m| {
                 m.delta_decisions_total
                     .with_label_values(&["passthrough"])
@@ -179,10 +184,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // Only apply the threshold when NO reference exists yet (first file in deltaspace).
         // Once a reference exists, ALWAYS store as delta — the deltaspace is committed to
         // delta storage and we want all related files to benefit from the shared reference.
-        if !has_existing_reference && ratio >= self.max_delta_ratio {
+        let effective_ratio = self.bucket_policies.max_delta_ratio(ctx.bucket);
+        if !has_existing_reference && ratio >= effective_ratio {
             debug!(
                 "First file in deltaspace with poor delta ratio {:.2} >= {:.2}, storing as passthrough",
-                ratio, self.max_delta_ratio
+                ratio, effective_ratio
             );
             self.with_metrics(|m| {
                 m.delta_decisions_total

@@ -321,6 +321,12 @@ pub struct Config {
     /// When enabled, both the S3 port and the demo UI port serve HTTPS.
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+
+    /// Per-bucket policy overrides.
+    /// Each entry overrides global compression settings for a specific bucket.
+    /// Unconfigured buckets inherit the global defaults.
+    #[serde(default)]
+    pub buckets: std::collections::HashMap<String, crate::bucket_policy::BucketPolicyConfig>,
 }
 
 /// TLS configuration (optional)
@@ -430,6 +436,7 @@ impl Default for Config {
             log_level: default_log_level(),
             config_sync_bucket: None,
             tls: None,
+            buckets: std::collections::HashMap::new(),
         }
     }
 }
