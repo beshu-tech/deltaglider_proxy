@@ -10,10 +10,45 @@ import FullScreenHeader from './FullScreenHeader';
 import DocSearch from './DocSearch';
 import '../docs.css';
 
-// Initialize mermaid with dark theme and expose on window for DOM post-processing
 mermaid.initialize({ startOnLoad: false, theme: 'dark', themeVariables: { primaryColor: '#2dd4bf', lineColor: '#5e7290' } });
-(window as unknown as Record<string, unknown>).__mermaid = mermaid;
 
+/** Self-contained Mermaid diagram React component */
+function Mermaid({ chart }: { chart: string }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [svg, setSvg] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    const id = `mermaid-${Math.random().toString(36).slice(2, 8)}`;
+    mermaid.render(id, chart).then(({ svg: rendered }) => {
+      if (!cancelled) setSvg(rendered);
+    }).catch(console.warn);
+    return () => { cancelled = true; };
+  }, [chart]);
+
+  if (!svg) return <pre><code>{chart}</code></pre>;
+  return <div ref={ref} className="mermaid-diagram" dangerouslySetInnerHTML={{ __html: svg }} />;
+}
+
+
+/** Split markdown into text segments and mermaid code blocks */
+function splitMermaid(md: string): { type: 'text' | 'mermaid'; content: string }[] {
+  const segments: { type: 'text' | 'mermaid'; content: string }[] = [];
+  const regex = /```mermaid\n([\s\S]*?)```/g;
+  let lastIndex = 0;
+  let match;
+  while ((match = regex.exec(md)) !== null) {
+    if (match.index > lastIndex) {
+      segments.push({ type: 'text', content: md.slice(lastIndex, match.index) });
+    }
+    segments.push({ type: 'mermaid', content: match[1].trim() });
+    lastIndex = match.index + match[0].length;
+  }
+  if (lastIndex < md.length) {
+    segments.push({ type: 'text', content: md.slice(lastIndex) });
+  }
+  return segments;
+}
 
 interface TocItem {
   id: string;
@@ -55,50 +90,6 @@ export default function DocsPage({ initialDoc, onBack }: Props) {
     setActiveHeading('');
   }, [selectedId]);
 
-  // Render mermaid diagrams after doc content is in the DOM.
-  // Hides the <pre> and inserts an SVG sibling; cleanup removes the SVG.
-  useEffect(() => {
-    const insertedDivs: HTMLDivElement[] = [];
-    const hiddenPres: HTMLPreElement[] = [];
-
-    const timer = setTimeout(async () => {
-      const container = contentRef.current;
-      if (!container) return;
-      const mermaidCodes = container.querySelectorAll('code[class*="language-mermaid"]');
-      for (const codeEl of Array.from(mermaidCodes)) {
-        const pre = codeEl.parentElement as HTMLPreElement | null;
-        if (!pre || pre.tagName !== 'PRE' || pre.dataset.mermaidDone) continue;
-        pre.dataset.mermaidDone = 'true';
-        const source = codeEl.textContent || '';
-        try {
-          const id = `mermaid-${Math.random().toString(36).slice(2, 8)}`;
-          const { svg } = await mermaid.render(id, source);
-          const div = document.createElement('div');
-          div.innerHTML = svg;
-          div.style.textAlign = 'center';
-          div.style.margin = '16px 0';
-          div.dataset.mermaidSvg = 'true';
-          pre.style.display = 'none';
-          pre.after(div);
-          insertedDivs.push(div);
-          hiddenPres.push(pre);
-        } catch (e) {
-          console.warn('Mermaid render failed:', e);
-        }
-      }
-    }, 300);
-
-    return () => {
-      clearTimeout(timer);
-      // Cleanup: remove inserted SVGs and unhide <pre> blocks
-      for (const div of insertedDivs) div.remove();
-      for (const pre of hiddenPres) {
-        pre.style.display = '';
-        delete pre.dataset.mermaidDone;
-      }
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedId]);
 
   // Intersection observer for active heading tracking
   useEffect(() => {
@@ -215,37 +206,37 @@ export default function DocsPage({ initialDoc, onBack }: Props) {
         }}
       >
         <div style={{ display: 'flex', gap: 32, maxWidth: 1100, margin: '0 auto' }}>
-          {/* Markdown content */}
+          {/* Markdown content — split into text + mermaid segments */}
           {selectedDoc && (
             <article className="docs-content" style={{ flex: 1, minWidth: 0 }}>
-              <ReactMarkdown
-                remarkPlugins={[remarkGfm]}
-                rehypePlugins={[rehypeHighlight, rehypeSlug]}
-                components={{
-                  a: ({ href, children, ...props }) => {
-                    if (href && href.endsWith('.md')) {
-                      return (
-                        <a
-                          {...props}
-                          href="#"
-                          onClick={(e) => {
-                            e.preventDefault();
-                            handleLinkClick(href);
-                          }}
-                        >
-                          {children}
-                        </a>
-                      );
-                    }
-                    if (href && (href.startsWith('http://') || href.startsWith('https://'))) {
-                      return <a {...props} href={href} target="_blank" rel="noopener noreferrer">{children}</a>;
-                    }
-                    return <a {...props} href={href}>{children}</a>;
-                  },
-                }}
-              >
-                {selectedDoc.content}
-              </ReactMarkdown>
+              {splitMermaid(selectedDoc.content).map((segment, i) =>
+                segment.type === 'mermaid' ? (
+                  <Mermaid key={i} chart={segment.content} />
+                ) : (
+                  <ReactMarkdown
+                    key={i}
+                    remarkPlugins={[remarkGfm]}
+                    rehypePlugins={[rehypeHighlight, rehypeSlug]}
+                    components={{
+                      a: ({ href, children, ...props }) => {
+                        if (href && href.endsWith('.md')) {
+                          return (
+                            <a {...props} href="#" onClick={(e) => { e.preventDefault(); handleLinkClick(href); }}>
+                              {children}
+                            </a>
+                          );
+                        }
+                        if (href && (href.startsWith('http://') || href.startsWith('https://'))) {
+                          return <a {...props} href={href} target="_blank" rel="noopener noreferrer">{children}</a>;
+                        }
+                        return <a {...props} href={href}>{children}</a>;
+                      },
+                    }}
+                  >
+                    {segment.content}
+                  </ReactMarkdown>
+                )
+              )}
             </article>
           )}
 
