@@ -158,7 +158,7 @@ export default function DocsPage({ docId, onBack }: Props) {
       return true;
     }
     return false;
-  }, []);
+  }, [setSelectedId]);
 
   // Group docs by category
   const grouped = useMemo(() => {
