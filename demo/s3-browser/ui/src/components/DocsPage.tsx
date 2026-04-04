@@ -20,7 +20,9 @@ mermaid.initialize({
   sequence: { useMaxWidth: false },
 });
 
-/** Self-contained Mermaid diagram React component */
+/** Self-contained Mermaid diagram React component.
+ * After render, measures the actual content bbox and rewrites the viewBox
+ * to fit tightly — Mermaid's default viewBox is often 2-3x larger than the content. */
 function Mermaid({ chart, caption }: { chart: string; caption?: string }) {
   const ref = useRef<HTMLDivElement>(null);
   const [svg, setSvg] = useState('');
@@ -34,13 +36,27 @@ function Mermaid({ chart, caption }: { chart: string; caption?: string }) {
     return () => { cancelled = true; };
   }, [chart]);
 
-  if (!svg) return <pre><code>{chart}</code></pre>;
-  const cleanSvg = svg
-    .replace(/style="[^"]*"/, 'style="width:100%;height:auto"')
-    .replace(/width="100%"/, '');
+  // After SVG is in the DOM, measure actual content and fix viewBox
+  useEffect(() => {
+    if (!svg || !ref.current) return;
+    const svgEl = ref.current.querySelector('svg');
+    if (!svgEl) return;
+    try {
+      const bb = svgEl.getBBox();
+      const pad = 16;
+      svgEl.setAttribute('viewBox', `${bb.x - pad} ${bb.y - pad} ${bb.width + pad * 2} ${bb.height + pad * 2}`);
+      svgEl.removeAttribute('width');
+      svgEl.removeAttribute('height');
+      svgEl.style.width = '100%';
+      svgEl.style.height = 'auto';
+      svgEl.style.maxWidth = 'none';
+    } catch {
+      // getBBox can fail if SVG is not visible
+    }
+  }, [svg]);
   return (
     <Lightbox caption={caption}>
-      <div ref={ref} className="mermaid-diagram" dangerouslySetInnerHTML={{ __html: cleanSvg }} />
+      <div ref={ref} className="mermaid-diagram" dangerouslySetInnerHTML={{ __html: svg }} />
     </Lightbox>
   );
 }
