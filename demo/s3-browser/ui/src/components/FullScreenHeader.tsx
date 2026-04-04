@@ -1,6 +1,6 @@
 import { Button } from 'antd';
-import { ArrowLeftOutlined } from '@ant-design/icons';
-import { useColors } from '../ThemeContext';
+import { ArrowLeftOutlined, SunOutlined, MoonOutlined } from '@ant-design/icons';
+import { useColors, useTheme } from '../ThemeContext';
 
 interface Props {
   title: string;
@@ -12,6 +12,7 @@ interface Props {
 /** Shared header bar for full-screen views (Admin, Docs) */
 export default function FullScreenHeader({ title, onBack, extra }: Props) {
   const colors = useColors();
+  const { isDark, toggleTheme } = useTheme();
   return (
     <div style={{
       display: 'flex',
@@ -75,9 +76,17 @@ export default function FullScreenHeader({ title, onBack, extra }: Props) {
         </span>
       </div>
 
-      {/* Right: extra content or spacer */}
-      <div style={{ minWidth: 100, display: 'flex', justifyContent: 'flex-end' }}>
+      {/* Right: extra content + theme toggle */}
+      <div style={{ minWidth: 100, display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 4 }}>
         {extra}
+        <Button
+          type="text"
+          icon={isDark ? <MoonOutlined /> : <SunOutlined />}
+          size="small"
+          title={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
+          onClick={toggleTheme}
+          style={{ color: colors.TEXT_MUTED, transition: 'color 0.15s' }}
+        />
       </div>
     </div>
   );

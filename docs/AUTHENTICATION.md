@@ -107,33 +107,36 @@ flowchart TD
     classDef denied fill:#e11d48,stroke:#fb7185,stroke-width:2px,color:#ffffff,rx:4,ry:4
     classDef storage fill:#ea580c,stroke:#fdba74,stroke-width:2px,color:#ffffff,rx:4,ry:4
     
-    START{"⚙️ DB Check:<br/>Do IAM Users Exist?"}:::initial
+    START(["⚙️ DB Check: IAM Users Exist?"]):::initial
     
     subgraph BOOTSTRAP [🔋 Phase 1: Bootstrap Mode]
-        B_STATE["**Mode Active:** Bootstrap"]:::default
-        B_AUTH["🔒 **Authentication**<br/>GUI requires Bootstrap Password"]:::default
-        B_ACT["🛠️ **Action**<br/>Provision initial IAM Admins"]:::allowed
+        B_STATE["Mode: Bootstrap"]:::default
+        B_AUTH["🔒 Requires Bootstrap Password"]:::default
+        B_ACT["🛠️ Provision Initial Admins"]:::allowed
         
         B_STATE --> B_AUTH --> B_ACT
     end
     
     subgraph OVERRIDE [🛡️ Phase 2: IAM Security Mode]
-        I_STATE["**Mode Active:** IAM (ABAC)"]:::default
-        I_AUTH["⚡ **Zero-Touch Auth**<br/>Auto-discovery via `/_/whoami`"]:::default
+        I_STATE["Mode: IAM (ABAC)"]:::default
+        I_AUTH["⚡ Auto-discovery via /_/whoami"]:::default
         
-        I_ADMIN["✅ **IAM Admins**<br/>Passwordless Auto-Login"]:::allowed
-        I_USER["⛔ **Standard Users**<br/>Access Denied (API only)"]:::denied
-        I_CRYPT["🔑 **Crypto Recovery**<br/>Bootstrap password retained<br/>exclusively for Config DB"]:::storage
+        I_ADMIN["✅ Admins: Auto-Login"]:::allowed
+        I_USER["⛔ Users: Access Denied"]:::denied
+        I_CRYPT["🔑 DB Encryption Only"]:::storage
         
         I_STATE --> I_AUTH
         I_AUTH -->|"Is Admin"| I_ADMIN
-        I_AUTH -->|"No Admin scopes"| I_USER
-        I_AUTH -.->|"Offline use"| I_CRYPT
+        I_AUTH -->|"No Scopes"| I_USER
+        I_AUTH -.->|"Offline"| I_CRYPT
     end
     
     START -- "No" --> B_STATE
     START -- "Yes" --> I_STATE
 ```
+
+*Vision Concept vs Actual Implementation Rendering:*
+![Auth Diagram Concept](../demo/s3-browser/ui/public/screenshots/docs-diagrams/auth_flow_diagram_v2.png)
 
 ## SigV4 Verification
 

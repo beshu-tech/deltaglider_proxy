@@ -10,6 +10,7 @@ import FullScreenHeader from './FullScreenHeader';
 import DocSearch from './DocSearch';
 import Lightbox from './Lightbox';
 import { useNavigation } from '../NavigationContext';
+import DocsLanding from './DocsLanding';
 import '../docs.css';
 
 mermaid.initialize({
@@ -263,8 +264,12 @@ export default function DocsPage({ docId, onBack }: Props) {
         }}
       >
         <div style={{ display: 'flex', gap: 32, maxWidth: 1100, margin: '0 auto' }}>
-          {/* Markdown content — split into text + mermaid segments */}
-          {selectedDoc && (
+          {/* Landing page for overview, markdown for everything else */}
+          {selectedId === 'readme' || !selectedDoc ? (
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <DocsLanding onSelectDoc={setSelectedId} />
+            </div>
+          ) : selectedDoc && (
             <article className="docs-content" style={{ flex: 1, minWidth: 0 }}>
               {splitMermaid(selectedDoc.content).map((segment, i) =>
                 segment.type === 'mermaid' ? (
@@ -303,8 +308,8 @@ export default function DocsPage({ docId, onBack }: Props) {
             </article>
           )}
 
-          {/* ToC — sticky inside the scroll container */}
-          {headings.length > 2 && (
+          {/* ToC — sticky inside the scroll container (hidden on landing page) */}
+          {selectedId !== 'readme' && headings.length > 2 && (
             <nav className="docs-toc" style={{
               width: 180,
               flexShrink: 0,
