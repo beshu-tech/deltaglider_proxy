@@ -48,6 +48,8 @@ pub struct ConfigResponse {
     debug_headers: bool,
     // Sync
     config_sync_bucket: Option<String>,
+    // Per-bucket policies
+    bucket_policies: std::collections::HashMap<String, crate::bucket_policy::BucketPolicyConfig>,
     // Log level
     log_level: String,
     // Backend credentials indicator
@@ -74,6 +76,9 @@ pub struct ConfigUpdateRequest {
     // Backend S3 credentials (triggers engine swap)
     pub backend_access_key_id: Option<String>,
     pub backend_secret_access_key: Option<String>,
+    // Per-bucket compression policies
+    pub bucket_policies:
+        Option<std::collections::HashMap<String, crate::bucket_policy::BucketPolicyConfig>>,
 }
 
 #[derive(Serialize)]
@@ -214,6 +219,7 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
         debug_headers: env_bool("DGP_DEBUG_HEADERS", false),
         // Sync
         config_sync_bucket: cfg.config_sync_bucket.clone(),
+        bucket_policies: cfg.buckets.clone(),
         // Logging
         log_level,
         backend_has_credentials,
@@ -468,6 +474,21 @@ pub async fn update_config(
                 "Auth credentials hot-reloaded (auth enabled: {})",
                 cfg.auth_enabled()
             );
+        }
+    }
+
+    // Update per-bucket policies (hot-reloadable — triggers engine rebuild)
+    if let Some(ref bucket_policies) = body.bucket_policies {
+        cfg.buckets = bucket_policies.clone();
+        // Engine rebuild needed to update BucketPolicyRegistry
+        match DynEngine::new(&cfg, Some(state.s3_state.metrics.clone())).await {
+            Ok(new_engine) => {
+                state.s3_state.engine.store(Arc::new(new_engine));
+                tracing::info!("Bucket policies updated, engine rebuilt");
+            }
+            Err(e) => {
+                warnings.push(format!("Failed to apply bucket policies: {}", e));
+            }
         }
     }
 
