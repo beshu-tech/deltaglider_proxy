@@ -75,7 +75,6 @@ export default function Lightbox({ children, caption }: Props) {
             style={{
               maxWidth: '90vw',
               maxHeight: '85vh',
-              minWidth: 320,
               overflow: 'auto',
               borderRadius: 8,
               background: colors.BG_CARD,
