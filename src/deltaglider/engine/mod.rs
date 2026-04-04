@@ -210,7 +210,6 @@ pub struct DeltaGliderEngine<S: StorageBackend> {
     codec: Arc<DeltaCodec>,
     file_router: FileRouter,
     cache: ReferenceCache,
-    max_delta_ratio: f32,
     max_object_size: u64,
     /// Limits concurrent xdelta3 subprocesses (configurable via `codec_concurrency`).
     codec_semaphore: Arc<Semaphore>,
@@ -221,6 +220,8 @@ pub struct DeltaGliderEngine<S: StorageBackend> {
     metrics: Option<Arc<Metrics>>,
     /// In-memory cache for object metadata (eliminates HEAD requests).
     metadata_cache: MetadataCache,
+    /// Per-bucket compression policy overrides.
+    bucket_policies: crate::bucket_policy::BucketPolicyRegistry,
 }
 
 /// Type alias for engine with dynamic backend dispatch
@@ -270,12 +271,15 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             codec: Arc::new(DeltaCodec::new(config.max_object_size as usize)),
             file_router: FileRouter::new(),
             cache: ReferenceCache::new(config.cache_size_mb),
-            max_delta_ratio: config.max_delta_ratio,
             max_object_size: config.max_object_size,
             codec_semaphore: Arc::new(Semaphore::new(codec_concurrency)),
             prefix_locks: DashMap::new(),
             metrics,
             metadata_cache: MetadataCache::new((config.metadata_cache_mb as u64) * 1024 * 1024),
+            bucket_policies: crate::bucket_policy::BucketPolicyRegistry::new(
+                config.buckets.clone(),
+                config.max_delta_ratio,
+            ),
         }
     }
 

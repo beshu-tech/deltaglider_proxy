@@ -296,6 +296,7 @@ pub fn run_init_inner(
         log_level,
         config_sync_bucket: None,
         tls,
+        buckets: std::collections::HashMap::new(),
     };
 
     // Show summary
