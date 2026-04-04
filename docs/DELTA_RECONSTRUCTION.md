@@ -13,15 +13,15 @@ sequenceDiagram
     participant S as Storage
 
     C->>P: GET /bucket/releases/v2.zip
-    Note over P: 1. Verify SigV4 signature
-    Note over P: 2. Look up metadata → Delta
-    P->>S: fetch reference.bin (or cache)
+    Note over P: 1. Verify SigV4
+    Note over P: 2. Metadata → Delta
+    P->>S: fetch reference.bin
     S-->>P: reference bytes
     P->>S: fetch v2.zip.delta
     S-->>P: delta bytes
-    Note over P: 3. xdelta3 decode (ref + delta = original)
-    Note over P: 4. SHA-256 verification
-    P-->>C: 200 OK (82MB original bytes)
+    Note over P: 3. xdelta3 decode<br/>(ref + delta = original)
+    Note over P: 4. SHA-256 verify
+    P-->>C: 200 OK (original bytes)
 ```
 
 ## What the Client Sees
