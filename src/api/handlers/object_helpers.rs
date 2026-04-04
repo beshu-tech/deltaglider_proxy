@@ -127,6 +127,13 @@ pub(super) async fn copy_object_inner(
         .split_once('/')
         .ok_or_else(|| S3Error::InvalidArgument("Copy source must be bucket/key".to_string()))?;
 
+    // Validate source bucket and key to prevent path traversal on filesystem backend
+    if source_bucket.contains("..") || source_key.contains("..") {
+        return Err(S3Error::InvalidArgument(
+            "Copy source must not contain '..'".to_string(),
+        ));
+    }
+
     // IAM check: verify the authenticated user has read access to the copy source
     if let Some(ref user) = auth_user {
         if !user.can(S3Action::Read, source_bucket, source_key) {
@@ -308,6 +315,13 @@ pub(super) async fn upload_part_copy(
     let (source_bucket, source_key) = copy_source
         .split_once('/')
         .ok_or_else(|| S3Error::InvalidArgument("Copy source must be bucket/key".to_string()))?;
+
+    // Validate source bucket and key to prevent path traversal on filesystem backend
+    if source_bucket.contains("..") || source_key.contains("..") {
+        return Err(S3Error::InvalidArgument(
+            "Copy source must not contain '..'".to_string(),
+        ));
+    }
 
     // IAM check: verify the authenticated user has read access to the copy source
     if let Some(ref user) = auth_user {

@@ -37,6 +37,22 @@ impl BucketPolicyRegistry {
         policies: HashMap<String, BucketPolicyConfig>,
         default_max_delta_ratio: f32,
     ) -> Self {
+        // Normalize bucket names to lowercase and validate ratio values
+        let policies = policies
+            .into_iter()
+            .map(|(k, mut v)| {
+                if let Some(ratio) = v.max_delta_ratio {
+                    if !(0.0..=1.0).contains(&ratio) {
+                        tracing::warn!(
+                            "Bucket '{}' has invalid max_delta_ratio {:.2} (must be 0.0-1.0), ignoring override",
+                            k, ratio
+                        );
+                        v.max_delta_ratio = None;
+                    }
+                }
+                (k.to_ascii_lowercase(), v)
+            })
+            .collect();
         Self {
             policies,
             default_compression: true,
