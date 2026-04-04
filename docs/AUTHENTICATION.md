@@ -83,16 +83,56 @@ A user is considered an **admin** when they have both wildcard actions (`*` or `
 ## Admin GUI Access Flow
 
 ```mermaid
-graph TD
-    START{"IAM users exist?"} -- "No" --> BOOT["Bootstrap mode"]
-    BOOT --> PWD["Admin GUI requires<br/>bootstrap password"]
-    PWD --> CREATE["Create IAM users<br/>via admin GUI"]
-
-    START -- "Yes" --> IAM["IAM mode activates"]
-    IAM --> DETECT["Admin GUI auto-detects<br/>mode via /_/whoami"]
-    DETECT --> ADMIN["IAM admins:<br/>auto-login (no password needed)"]
-    DETECT --> NONADMIN["Non-admin IAM users:<br/>'Access Denied' message"]
-    DETECT --> BSPWD["Bootstrap password only needed<br/>for DB encryption/recovery"]
+%%{
+  init: {
+    'theme': 'base',
+    'themeVariables': {
+      'primaryColor': '#0f172a',
+      'primaryTextColor': '#f8fafc',
+      'primaryBorderColor': '#334155',
+      'lineColor': '#38bdf8',
+      'secondaryColor': '#1e293b',
+      'tertiaryColor': '#0f172a',
+      'clusterBkg': '#020617',
+      'clusterBorder': '#38bdf8',
+      'fontSize': '14px',
+      'fontFamily': 'Inter, system-ui, sans-serif'
+    }
+  }
+}%%
+flowchart TD
+    classDef initial fill:#0ea5e9,stroke:#bae6fd,stroke-width:2px,color:#ffffff,rx:8,ry:8
+    classDef default fill:#1e293b,stroke:#475569,stroke-width:1px,color:#f8fafc,rx:4,ry:4
+    classDef allowed fill:#059669,stroke:#34d399,stroke-width:2px,color:#ffffff,rx:4,ry:4
+    classDef denied fill:#e11d48,stroke:#fb7185,stroke-width:2px,color:#ffffff,rx:4,ry:4
+    classDef storage fill:#ea580c,stroke:#fdba74,stroke-width:2px,color:#ffffff,rx:4,ry:4
+    
+    START{"⚙️ DB Check:<br/>Do IAM Users Exist?"}:::initial
+    
+    subgraph BOOTSTRAP [🔋 Phase 1: Bootstrap Mode]
+        B_STATE["**Mode Active:** Bootstrap"]:::default
+        B_AUTH["🔒 **Authentication**<br/>GUI requires Bootstrap Password"]:::default
+        B_ACT["🛠️ **Action**<br/>Provision initial IAM Admins"]:::allowed
+        
+        B_STATE --> B_AUTH --> B_ACT
+    end
+    
+    subgraph OVERRIDE [🛡️ Phase 2: IAM Security Mode]
+        I_STATE["**Mode Active:** IAM (ABAC)"]:::default
+        I_AUTH["⚡ **Zero-Touch Auth**<br/>Auto-discovery via `/_/whoami`"]:::default
+        
+        I_ADMIN["✅ **IAM Admins**<br/>Passwordless Auto-Login"]:::allowed
+        I_USER["⛔ **Standard Users**<br/>Access Denied (API only)"]:::denied
+        I_CRYPT["🔑 **Crypto Recovery**<br/>Bootstrap password retained<br/>exclusively for Config DB"]:::storage
+        
+        I_STATE --> I_AUTH
+        I_AUTH -->|"Is Admin"| I_ADMIN
+        I_AUTH -->|"No Admin scopes"| I_USER
+        I_AUTH -.->|"Offline use"| I_CRYPT
+    end
+    
+    START -- "No" --> B_STATE
+    START -- "Yes" --> I_STATE
 ```
 
 ## SigV4 Verification
