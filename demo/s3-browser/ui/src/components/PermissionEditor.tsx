@@ -151,12 +151,12 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
 
         return (
           <div key={i} style={{
-            border: `1px solid ${isDeny ? '#ff4d4f40' : colors.BORDER}`,
-            borderLeft: isDeny ? '3px solid #ff4d4f' : `1px solid ${colors.BORDER}`,
+            border: `1px solid ${isDeny ? `${colors.ACCENT_RED}40` : colors.BORDER}`,
+            borderLeft: isDeny ? `3px solid ${colors.ACCENT_RED}` : `1px solid ${colors.BORDER}`,
             borderRadius: 8,
             padding: 12,
             marginBottom: 8,
-            background: isDeny ? '#ff4d4f08' : colors.BG_BASE,
+            background: isDeny ? `${colors.ACCENT_RED}08` : colors.BG_BASE,
           }}>
             {/* Header: Allow/Deny + Conditions toggle + Remove */}
             <div style={{ marginBottom: 8, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -172,7 +172,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                     }}
                     options={[
                       { label: 'Allow', value: 'Allow' },
-                      { label: <span style={{ color: isDeny ? '#ff4d4f' : undefined, fontWeight: isDeny ? 600 : undefined }}>Deny</span>, value: 'Deny' },
+                      { label: <span style={{ color: isDeny ? colors.ACCENT_RED : undefined, fontWeight: isDeny ? 600 : undefined }}>Deny</span>, value: 'Deny' },
                     ]}
                   />
                 </Tooltip>

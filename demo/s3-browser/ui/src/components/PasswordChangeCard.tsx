@@ -10,7 +10,7 @@ const { Text } = Typography;
 
 export default function PasswordChangeCard() {
   const { cardStyle, inputRadius } = useCardStyles();
-  const { TEXT_MUTED, ACCENT_AMBER } = useColors();
+  const { TEXT_MUTED, TEXT_PRIMARY, ACCENT_AMBER } = useColors();
 
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
@@ -84,7 +84,7 @@ export default function PasswordChangeCard() {
           loading={changing}
           disabled={!currentPassword || !newPassword}
           block
-          style={{ ...inputRadius, fontFamily: "var(--font-ui)", fontWeight: 600, background: ACCENT_AMBER, borderColor: ACCENT_AMBER, color: '#000' }}
+          style={{ ...inputRadius, fontFamily: "var(--font-ui)", fontWeight: 600, background: ACCENT_AMBER, borderColor: ACCENT_AMBER, color: TEXT_PRIMARY }}
         >
           Change Bootstrap Password
         </Button>

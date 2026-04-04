@@ -85,7 +85,7 @@ export default function Lightbox({ children, caption }: Props) {
           </div>
           {caption && (
             <div style={{
-              color: '#ccc',
+              color: colors.TEXT_MUTED,
               fontSize: 14,
               fontFamily: 'var(--font-ui)',
               fontStyle: 'italic',
@@ -100,7 +100,7 @@ export default function Lightbox({ children, caption }: Props) {
             position: 'absolute',
             top: 16,
             right: 24,
-            color: '#888',
+            color: colors.TEXT_FAINT,
             fontSize: 12,
             fontFamily: 'var(--font-mono)',
           }}>

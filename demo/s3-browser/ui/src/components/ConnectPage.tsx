@@ -176,7 +176,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
               <>
                 <div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
-                    <CheckCircleOutlined style={{ fontSize: 28, color: '#52c41a', flexShrink: 0 }} />
+                    <CheckCircleOutlined style={{ fontSize: 28, color: 'var(--accent-success)', flexShrink: 0 }} />
                     <div style={{ fontSize: 20, fontWeight: 700, color: TEXT_PRIMARY, fontFamily: "var(--font-ui)" }}>
                       Database Recovered
                     </div>
@@ -212,7 +212,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
               <>
                 <div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
-                    <WarningOutlined style={{ fontSize: 28, color: '#faad14', flexShrink: 0 }} />
+                    <WarningOutlined style={{ fontSize: 28, color: 'var(--accent-warning)', flexShrink: 0 }} />
                     <div style={{ fontSize: 20, fontWeight: 700, color: TEXT_PRIMARY, fontFamily: "var(--font-ui)" }}>
                       Config Database Locked
                     </div>

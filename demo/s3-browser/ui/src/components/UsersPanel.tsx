@@ -158,7 +158,7 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                   <div style={{
                     width: 8, height: 8, borderRadius: '50%',
-                    background: user.enabled ? '#52c41a' : colors.TEXT_MUTED,
+                    background: user.enabled ? colors.ACCENT_GREEN : colors.TEXT_MUTED,
                     flexShrink: 0,
                   }} />
                   <Text strong style={{ fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>

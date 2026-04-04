@@ -197,7 +197,7 @@ export default function DocsPage({ docId, onBack }: Props) {
 
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
       {/* Left sidebar: search + doc navigation */}
-      <nav style={{
+      <nav className="hide-mobile" style={{
         width: 220,
         flexShrink: 0,
         borderRight: `1px solid ${colors.BORDER}`,
@@ -310,7 +310,7 @@ export default function DocsPage({ docId, onBack }: Props) {
 
           {/* ToC — sticky inside the scroll container (hidden on landing page) */}
           {selectedId !== 'readme' && headings.length > 2 && (
-            <nav className="docs-toc" style={{
+            <nav className="docs-toc hide-mobile" style={{
               width: 180,
               flexShrink: 0,
               position: 'sticky',
