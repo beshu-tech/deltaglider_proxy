@@ -61,7 +61,10 @@ function splitMermaid(md: string): { type: 'text' | 'mermaid'; content: string; 
     const lines = textBefore.trim().split('\n');
     const lastHeading = [...lines].reverse().find(l => /^#{2,4}\s/.test(l));
     const caption = lastHeading?.replace(/^#+\s+/, '').trim();
-    segments.push({ type: 'mermaid', content: match[1].trim(), caption });
+    const mermaidContent = match[1].trim();
+    if (mermaidContent) {
+      segments.push({ type: 'mermaid', content: mermaidContent, caption });
+    }
     lastIndex = match.index + match[0].length;
   }
   if (lastIndex < md.length) {

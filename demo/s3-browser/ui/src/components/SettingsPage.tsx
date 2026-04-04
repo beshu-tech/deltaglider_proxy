@@ -108,30 +108,35 @@ export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: 
   const handleSave = async () => {
     setSaving(true);
     setSaveResult(null);
-    const payload: Record<string, unknown> = {
-      max_delta_ratio: maxDeltaRatio,
-      max_object_size: maxObjectSizeMb * 1024 * 1024,
-      access_key_id: accessKeyId || null,
-      cache_size_mb: cacheSizeMb,
-      log_level: logLevel,
-      backend_type: backendType,
-    };
-    if (backendType === 'filesystem') {
-      payload.backend_path = backendPath;
-    } else {
-      payload.backend_endpoint = backendEndpoint || null;
-      payload.backend_region = backendRegion;
-      payload.backend_force_path_style = backendForcePathStyle;
+    try {
+      const payload: Record<string, unknown> = {
+        max_delta_ratio: maxDeltaRatio,
+        max_object_size: maxObjectSizeMb * 1024 * 1024,
+        access_key_id: accessKeyId || null,
+        cache_size_mb: cacheSizeMb,
+        log_level: logLevel,
+        backend_type: backendType,
+      };
+      if (backendType === 'filesystem') {
+        payload.backend_path = backendPath;
+      } else {
+        payload.backend_endpoint = backendEndpoint || null;
+        payload.backend_region = backendRegion;
+        payload.backend_force_path_style = backendForcePathStyle;
+      }
+      if (secretAccessKey) payload.secret_access_key = secretAccessKey;
+      if (beAccessKeyId) payload.backend_access_key_id = beAccessKeyId;
+      if (beSecretAccessKey) payload.backend_secret_access_key = beSecretAccessKey;
+      const result = await updateAdminConfig(payload);
+      setSaveResult({ warnings: result.warnings, requires_restart: result.requires_restart });
+      setOriginalBackendType(backendType);
+      setBeAccessKeyId('');
+      setBeSecretAccessKey('');
+    } catch (e) {
+      setSaveResult({ warnings: [e instanceof Error ? e.message : 'Failed to save configuration'], requires_restart: false });
+    } finally {
+      setSaving(false);
     }
-    if (secretAccessKey) payload.secret_access_key = secretAccessKey;
-    if (beAccessKeyId) payload.backend_access_key_id = beAccessKeyId;
-    if (beSecretAccessKey) payload.backend_secret_access_key = beSecretAccessKey;
-    const result = await updateAdminConfig(payload);
-    setSaveResult({ warnings: result.warnings, requires_restart: result.requires_restart });
-    setOriginalBackendType(backendType);
-    setBeAccessKeyId('');
-    setBeSecretAccessKey('');
-    setSaving(false);
   };
 
   if (loading) {
