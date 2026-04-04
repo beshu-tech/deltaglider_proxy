@@ -45,12 +45,13 @@ function Mermaid({ chart, caption }: { chart: string; caption?: string }) {
     try {
       const bb = svgEl.getBBox();
       const pad = 16;
-      svgEl.setAttribute('viewBox', `${bb.x - pad} ${bb.y - pad} ${bb.width + pad * 2} ${bb.height + pad * 2}`);
-      svgEl.removeAttribute('width');
-      svgEl.removeAttribute('height');
-      svgEl.style.width = '100%';
+      const w = Math.ceil(bb.width + pad * 2);
+      const h = Math.ceil(bb.height + pad * 2);
+      svgEl.setAttribute('viewBox', `${bb.x - pad} ${bb.y - pad} ${w} ${h}`);
+      svgEl.setAttribute('width', String(w));
+      svgEl.setAttribute('height', String(h));
+      svgEl.style.maxWidth = '100%';
       svgEl.style.height = 'auto';
-      svgEl.style.maxWidth = 'none';
     } catch {
       // getBBox can fail if SVG is not visible
     }

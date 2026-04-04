@@ -73,8 +73,9 @@ export default function Lightbox({ children, caption }: Props) {
           <div
             onClick={e => e.stopPropagation()}
             style={{
-              width: '90vw',
+              maxWidth: '90vw',
               maxHeight: '85vh',
+              minWidth: 320,
               overflow: 'auto',
               borderRadius: 8,
               background: colors.BG_CARD,

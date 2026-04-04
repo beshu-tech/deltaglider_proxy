@@ -97,10 +97,13 @@ DGP_BOOTSTRAP_PASSWORD_HASH=JDJiJDEyJENYbDVPRm84bDg2...
 4. Click **Create User**
 5. Set permissions:
 
-```mermaid
-graph TD
-    U["<b>User: ci-builder</b><br/>Access Key: auto-generated<br/><br/><b>Permissions:</b><br/>Allow read, write, list on builds/*<br/>Deny delete on *"]
-```
+> [!TIP] Example Profile: CI Pipeline User
+> **Username:** `ci-builder`
+> **Access Key:** *(auto-generated)*
+> 
+> **Permissions Rules:**
+> 1. `Allow` | Actions: `read, write, list` | Resources: `builds/*`
+> 2. `Deny`  | Actions: `delete` | Resources: `*`
 
 **Permission examples:**
 
