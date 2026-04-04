@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.5.10
+
+### UI & Documentation
+- **Path-based routing**: Clean URLs (`/_/browse`, `/_/admin/users`, `/_/docs/configuration`) replace hash routing. Deep-linking to doc pages with heading anchors. Old hash bookmarks auto-redirect.
+- **Embedded docs**: Full-text search (minisearch + Cmd+K), Mermaid diagram rendering with getBBox viewBox fix, Lightbox for images, landing page with screenshots and feature cards.
+- **Admin GUI**: All 39 settings surfaced across 5 tabs (Backend, Compression, Limits, Security, Logging). Theme toggle in Admin/Docs header.
+- **Design system**: 16 new CSS color variables for dark/light themes. Responsive breakpoints (grids collapse on mobile, panels hide).
+
+### Correctness
+- **SettingsPage**: handleSave wrapped in try-catch (prevents stuck save button on network error).
+- **Multipart**: complete() no longer removes upload before store() succeeds (prevents data loss on transient failure).
+- **SigV4**: Credential scope format validation in both presigned and header auth paths.
+- **ListObjectsV2**: max-keys=0 returns InvalidArgument per S3 spec.
+- **DocsPage**: Fixed stale useCallback dependency in handleLinkClick.
+
+### Infrastructure
+- **build.rs**: `rerun-if-changed` for dist/ directory (no more stale embedded UI assets).
+- **Dead code**: Removed ApiDocsPage, BrowserConnectionCard, dead hash routes (~400 lines).
+- **DRY**: FullScreenHeader shared component, FULLSCREEN_VIEWS set, dedup-by-key unified.
+
+## v0.5.9
+
+### Bug Fixes
+- **SigV4 replay**: Fixed false positives — presigned URLs and idempotent methods (GET/HEAD) skip replay detection. Replay window reduced from 300s to 2s.
+- **Logging**: SigV4 mismatch logs method, path, scope, signature prefixes. Clock skew logs direction.
+- **Config DB**: Added PRAGMA busy_timeout=5000ms on open and reopen.
+
 ## v0.5.4
 
 ### Security & Hardening
