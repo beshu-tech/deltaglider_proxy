@@ -24,6 +24,21 @@ cache_size_mb = 100
 # Budget: ~125K–150K entries at 50 MB. TTL: 10 minutes.
 metadata_cache_mb = 50
 
+# Per-Bucket Policies
+# -------------------
+# Override compression settings for specific buckets.
+# Buckets not listed here inherit the global defaults above.
+# Bucket names are case-insensitive (normalized to lowercase).
+
+# [buckets.my-archive]
+# compression = false              # Disable delta compression entirely for this bucket
+
+# [buckets.high-dedup]
+# max_delta_ratio = 0.95           # Accept deltas up to 95% of original (more aggressive)
+
+# [buckets.images]
+# compression = false              # Already-compressed content, skip delta encoding
+
 # S3 Authentication (bootstrap mode)
 # -----------------------------------
 # Initial S3 credentials used before IAM users are created.

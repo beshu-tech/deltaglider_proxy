@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Button, Input, InputNumber, Radio, Select, Switch, Typography, Space, Alert, Spin, Tabs } from 'antd';
-import { SaveOutlined, LockOutlined, WarningOutlined, DatabaseOutlined, ControlOutlined, SafetyOutlined, KeyOutlined, ApiOutlined, CloudOutlined, ArrowLeftOutlined } from '@ant-design/icons';
+import { SaveOutlined, LockOutlined, WarningOutlined, DatabaseOutlined, ControlOutlined, SafetyOutlined, KeyOutlined, ApiOutlined, CloudOutlined, ArrowLeftOutlined, PlusOutlined, DeleteOutlined, FolderOutlined } from '@ant-design/icons';
 import type { AdminConfig, TestS3Response } from '../adminApi';
 import { getAdminConfig, updateAdminConfig, testS3Connection } from '../adminApi';
 import { useColors } from '../ThemeContext';
@@ -74,6 +74,9 @@ export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: 
   const [testS3Result, setTestS3Result] = useState<TestS3Response | null>(null);
   const [showAdvancedSecurity, setShowAdvancedSecurity] = useState(false);
 
+  // Bucket policies state: array for ordered editing
+  const [bucketPolicies, setBucketPolicies] = useState<Array<{ name: string; compression: boolean; max_delta_ratio: number | null }>>([]);
+
   useEffect(() => {
     getAdminConfig().then((cfg) => {
       if (cfg) {
@@ -88,6 +91,16 @@ export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: 
         setBackendEndpoint(cfg.backend_endpoint || '');
         setBackendRegion(cfg.backend_region || 'us-east-1');
         setBackendForcePathStyle(cfg.backend_force_path_style ?? true);
+        // Bucket policies
+        if (cfg.bucket_policies) {
+          setBucketPolicies(
+            Object.entries(cfg.bucket_policies).map(([name, p]) => ({
+              name,
+              compression: p.compression ?? true,
+              max_delta_ratio: p.max_delta_ratio ?? null,
+            }))
+          );
+        }
         const matchedPreset = findMatchingPreset(cfg.log_level || '');
         if (matchedPreset) {
           setLogLevel(matchedPreset);
@@ -127,6 +140,16 @@ export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: 
       if (secretAccessKey) payload.secret_access_key = secretAccessKey;
       if (beAccessKeyId) payload.backend_access_key_id = beAccessKeyId;
       if (beSecretAccessKey) payload.backend_secret_access_key = beSecretAccessKey;
+      // Bucket policies — convert array to map
+      const bp: Record<string, { compression?: boolean; max_delta_ratio?: number }> = {};
+      for (const p of bucketPolicies) {
+        if (!p.name.trim()) continue;
+        bp[p.name.trim().toLowerCase()] = {
+          ...(p.compression === false ? { compression: false } : {}),
+          ...(p.max_delta_ratio !== null ? { max_delta_ratio: p.max_delta_ratio } : {}),
+        };
+      }
+      payload.bucket_policies = bp;
       const result = await updateAdminConfig(payload);
       setSaveResult({ warnings: result.warnings, requires_restart: result.requires_restart });
       setOriginalBackendType(backendType);
@@ -434,6 +457,78 @@ export default function SettingsPage({ onBack, onSessionExpired, embeddedTab }: 
         <SectionHeader icon={<ControlOutlined />} title="Advanced Compression" description="Codec subprocess settings — usually auto-configured." />
         {readOnlyField('Codec Concurrency', config?.codec_concurrency, 'Max parallel xdelta3 encode/decode operations. Auto-detected from CPU cores.', 'restart required')}
         {readOnlyField('Codec Timeout (seconds)', config?.codec_timeout_secs, 'Kill xdelta3 subprocess if it takes longer than this. Prevents hung processes.', 'restart required')}
+      </div>
+
+      <div style={cardStyle}>
+        <SectionHeader icon={<FolderOutlined />} title="Bucket Policies" description="Override compression settings per bucket. Unconfigured buckets use global defaults above." />
+        {bucketPolicies.map((bp, idx) => (
+          <div key={idx} style={{ marginTop: idx === 0 ? 16 : 12, padding: '12px 14px', border: `1px solid ${colors.BORDER}`, borderRadius: 8, background: colors.BG_ELEVATED }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+              <Input
+                value={bp.name}
+                onChange={(e) => {
+                  const next = [...bucketPolicies];
+                  next[idx] = { ...next[idx], name: e.target.value };
+                  setBucketPolicies(next);
+                }}
+                placeholder="bucket-name"
+                style={{ flex: 1, ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }}
+              />
+              <Button
+                icon={<DeleteOutlined />}
+                size="small"
+                danger
+                onClick={() => setBucketPolicies(bucketPolicies.filter((_, i) => i !== idx))}
+                title="Remove policy"
+              />
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <Switch
+                  checked={bp.compression}
+                  onChange={(checked) => {
+                    const next = [...bucketPolicies];
+                    next[idx] = { ...next[idx], compression: checked };
+                    setBucketPolicies(next);
+                  }}
+                  size="small"
+                />
+                <Text style={{ fontSize: 13, fontFamily: 'var(--font-ui)' }}>Compression</Text>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <Text style={{ fontSize: 13, fontFamily: 'var(--font-ui)', whiteSpace: 'nowrap' }}>Max ratio:</Text>
+                <InputNumber
+                  value={bp.max_delta_ratio ?? undefined}
+                  onChange={(v) => {
+                    const next = [...bucketPolicies];
+                    next[idx] = { ...next[idx], max_delta_ratio: v ?? null };
+                    setBucketPolicies(next);
+                  }}
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  placeholder="global"
+                  style={{ width: 100, ...inputRadius }}
+                  size="small"
+                />
+              </div>
+            </div>
+          </div>
+        ))}
+        <Button
+          icon={<PlusOutlined />}
+          onClick={() => setBucketPolicies([...bucketPolicies, { name: '', compression: true, max_delta_ratio: null }])}
+          style={{ marginTop: 12, borderRadius: 8, fontFamily: 'var(--font-ui)' }}
+          block
+          type="dashed"
+        >
+          Add Bucket Policy
+        </Button>
+        {bucketPolicies.length === 0 && (
+          <Text type="secondary" style={{ fontSize: 12, fontFamily: 'var(--font-ui)', display: 'block', marginTop: 8 }}>
+            No per-bucket overrides. All buckets use global compression settings.
+          </Text>
+        )}
       </div>
 
       {saveSection}
