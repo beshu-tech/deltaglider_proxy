@@ -45,7 +45,7 @@ export default function FullScreenHeader({ title, onBack, extra }: Props) {
         gap: 10,
         userSelect: 'none',
       }}>
-        <span style={{
+        <span className="hide-mobile" style={{
           fontSize: 13,
           fontWeight: 700,
           letterSpacing: 3,
@@ -55,7 +55,7 @@ export default function FullScreenHeader({ title, onBack, extra }: Props) {
         }}>
           DeltaGlider
         </span>
-        <span style={{
+        <span className="hide-mobile" style={{
           width: 1,
           height: 14,
           background: colors.BORDER,

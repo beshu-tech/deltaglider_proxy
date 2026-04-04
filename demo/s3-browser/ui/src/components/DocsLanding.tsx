@@ -60,7 +60,7 @@ export default function DocsLanding({ onSelectDoc }: Props) {
       </div>
 
       {/* Screenshots */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 32 }}>
+      <div className="responsive-grid-2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 32 }}>
         <Lightbox caption="S3 object browser with compression indicators">
           <img src="/_/screenshots/browser-dark.png" alt="Object Browser" style={{ width: '100%', display: 'block' }} />
         </Lightbox>
@@ -70,7 +70,7 @@ export default function DocsLanding({ onSelectDoc }: Props) {
       </div>
 
       {/* Features grid */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12, marginBottom: 40 }}>
+      <div className="responsive-grid-3" style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12, marginBottom: 40 }}>
         {FEATURES.map(f => (
           <div key={f.title} style={card}>
             <div style={{ fontSize: 24, marginBottom: 8 }}>{f.icon}</div>
@@ -85,7 +85,7 @@ export default function DocsLanding({ onSelectDoc }: Props) {
       </div>
 
       {/* Doc sections */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+      <div className="responsive-grid-2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
         {Array.from(grouped.entries()).map(([group, docs]) => (
           <div key={group} style={{ ...card, cursor: 'default' }}>
             <div style={{

@@ -180,9 +180,9 @@ export default function UserForm({ user, onSaved, onDeleted, onCancel, onCreated
               <span style={{
                 display: 'inline-flex', alignItems: 'center', gap: 4,
                 fontSize: 11, fontWeight: 600, padding: '2px 8px', borderRadius: 10,
-                background: enabled ? '#52c41a18' : '#00000010',
-                color: enabled ? '#52c41a' : '#999',
-                border: `1px solid ${enabled ? '#52c41a30' : '#00000015'}`,
+                background: enabled ? `${colors.ACCENT_GREEN}18` : `${colors.TEXT_MUTED}10`,
+                color: enabled ? colors.ACCENT_GREEN : colors.TEXT_MUTED,
+                border: `1px solid ${enabled ? `${colors.ACCENT_GREEN}30` : `${colors.TEXT_MUTED}15`}`,
               }}>
                 {enabled
                   ? <><CheckCircleFilled style={{ fontSize: 10 }} /> Active</>
@@ -193,8 +193,8 @@ export default function UserForm({ user, onSaved, onDeleted, onCancel, onCreated
                 <span style={{
                   display: 'inline-flex', alignItems: 'center', gap: 4,
                   fontSize: 11, fontWeight: 600, padding: '2px 8px', borderRadius: 10,
-                  background: '#faad1418', color: '#faad14',
-                  border: '1px solid #faad1430',
+                  background: `${colors.ACCENT_AMBER}18`, color: colors.ACCENT_AMBER,
+                  border: `1px solid ${colors.ACCENT_AMBER}30`,
                 }}>
                   <CrownFilled style={{ fontSize: 10 }} /> Admin
                 </span>
@@ -323,13 +323,13 @@ export default function UserForm({ user, onSaved, onDeleted, onCancel, onCreated
               const isDeny = perm.effect === 'Deny';
               return (
                 <div key={i} style={{
-                  border: `1px solid ${isDeny ? '#ff4d4f20' : colors.BORDER}`,
-                  borderLeft: isDeny ? '3px solid #ff4d4f60' : `1px solid ${colors.BORDER}`,
+                  border: `1px solid ${isDeny ? `${colors.ACCENT_RED}20` : colors.BORDER}`,
+                  borderLeft: isDeny ? `3px solid ${colors.ACCENT_RED}60` : `1px solid ${colors.BORDER}`,
                   borderRadius: 8,
                   padding: 10,
                   marginBottom: 6,
                   opacity: 0.6,
-                  background: isDeny ? '#ff4d4f05' : colors.BG_BASE,
+                  background: isDeny ? `${colors.ACCENT_RED}05` : colors.BG_BASE,
                 }}>
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
                     <Tag color={isDeny ? 'red' : 'green'} style={{ fontSize: 10, borderRadius: 4 }}>{perm.effect}</Tag>

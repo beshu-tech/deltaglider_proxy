@@ -44,6 +44,24 @@ body {
   --docs-toc-active: #2dd4bf;
   --docs-link: #2dd4bf;
   --docs-heading: #e4e9f2;
+  /* Semantic status colors */
+  --accent-success: #52c41a;
+  --accent-warning: #faad14;
+  --accent-deny: #ff4d4f;
+  /* Status code colors (metrics) */
+  --status-2xx: #2dd4bf;
+  --status-3xx: #60a5fa;
+  --status-4xx: #fbbf24;
+  --status-5xx: #fb7185;
+  /* Chart palette */
+  --chart-1: #2dd4bf;
+  --chart-2: #60a5fa;
+  --chart-3: #a78bfa;
+  --chart-4: #fbbf24;
+  --chart-5: #fb7185;
+  --chart-6: #34d399;
+  --chart-7: #f472b6;
+  --chart-8: #818cf8;
   /* Syntax highlighting */
   --hljs-keyword: #a78bfa;
   --hljs-string: #34d399;
@@ -93,7 +111,35 @@ body {
   --hljs-builtin: #2563eb;
   --hljs-attr: #e11d48;
   --hljs-title: #0d9488;
+  /* Semantic status */
+  --accent-success: #389e0d;
+  --accent-warning: #d48806;
+  --accent-deny: #cf1322;
+  /* Status codes */
+  --status-2xx: #0d9488;
+  --status-3xx: #2563eb;
+  --status-4xx: #d97706;
+  --status-5xx: #e11d48;
+  /* Chart palette */
+  --chart-1: #0d9488;
+  --chart-2: #2563eb;
+  --chart-3: #7c3aed;
+  --chart-4: #d97706;
+  --chart-5: #e11d48;
+  --chart-6: #059669;
+  --chart-7: #db2777;
+  --chart-8: #4f46e5;
   color-scheme: light;
+}
+
+/* ───── Responsive breakpoints ───── */
+@media (max-width: 768px) {
+  .responsive-grid-3 { grid-template-columns: 1fr !important; }
+  .responsive-grid-2 { grid-template-columns: 1fr !important; }
+  .hide-mobile { display: none !important; }
+}
+@media (min-width: 769px) and (max-width: 1024px) {
+  .responsive-grid-3 { grid-template-columns: repeat(2, 1fr) !important; }
 }
 
 /* ───── Scrollbar styling ───── */
