@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.5.11
+
+### Features
+- **Per-bucket compression**: Configure compression enable/disable and max delta ratio per bucket via TOML (`[buckets.<name>]`), admin API, or GUI. Unconfigured buckets inherit global defaults.
+- **Bucket Policies GUI**: New "Bucket Policies" section in Compression tab — add, remove, edit per-bucket overrides with live save.
+
+### Security
+- **COPY source path traversal**: Reject `..` in `x-amz-copy-source` bucket and key (filesystem backend).
+
+### Bug Fixes
+- **Bucket policy hot-reload**: Fixed case normalization mismatch (config stored original case, engine expected lowercase). Added rollback on engine rebuild failure.
+
 ## v0.5.10
 
 ### UI & Documentation
