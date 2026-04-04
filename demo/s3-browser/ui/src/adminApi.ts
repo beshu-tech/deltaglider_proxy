@@ -62,6 +62,8 @@ export interface AdminConfig {
   debug_headers: boolean;
   // Sync
   config_sync_bucket: string | null;
+  // Per-bucket policies
+  bucket_policies: Record<string, { compression?: boolean; max_delta_ratio?: number }>;
   // Logging
   log_level: string;
 }
