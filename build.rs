@@ -2,6 +2,12 @@ fn main() {
     // Embed UTC build timestamp so the binary always knows when it was compiled.
     let now = time_now_utc();
     println!("cargo:rustc-env=DGP_BUILD_TIME={now}");
+
+    // Force recompilation when the embedded UI dist changes.
+    // rust-embed embeds demo/s3-browser/ui/dist/ at compile time, but cargo
+    // doesn't track changes to non-Rust files. This tells cargo to recompile
+    // whenever the dist directory is modified (e.g., after npm run build).
+    println!("cargo:rerun-if-changed=demo/s3-browser/ui/dist");
 }
 
 /// Minimal UTC timestamp without pulling in chrono for the build script.
