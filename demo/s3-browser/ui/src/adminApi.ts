@@ -63,11 +63,24 @@ export interface AdminConfig {
   // Sync
   config_sync_bucket: string | null;
   // Per-bucket policies
-  bucket_policies: Record<string, { compression?: boolean; max_delta_ratio?: number }>;
+  bucket_policies: Record<string, { compression?: boolean; max_delta_ratio?: number; backend?: string; alias?: string }>;
+  // Multi-backend
+  backends: BackendInfo[];
+  default_backend: string | null;
   // Logging
   log_level: string;
   // Taint detection
   tainted_fields: string[];
+}
+
+export interface BackendInfo {
+  name: string;
+  backend_type: string;
+  path: string | null;
+  endpoint: string | null;
+  region: string | null;
+  force_path_style: boolean | null;
+  has_credentials: boolean;
 }
 
 export async function getAdminConfig(): Promise<AdminConfig | null> {

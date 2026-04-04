@@ -113,6 +113,34 @@ path = "./data"
 # # access_key_id = "backend-access-key"
 # # secret_access_key = "backend-secret-key"
 
+# Multi-Backend Configuration (advanced)
+# ---------------------------------------
+# Route different buckets to different storage backends.
+# When [[backends]] is configured, the [backend] section above is ignored.
+# Buckets without explicit routing use the default_backend.
+#
+# default_backend = "local"
+#
+# [[backends]]
+# name = "local"
+# type = "filesystem"
+# path = "./data"
+#
+# [[backends]]
+# name = "hetzner"
+# type = "s3"
+# endpoint = "https://fsn1.your-objectstorage.com"
+# region = "fsn1"
+# force_path_style = true
+# access_key_id = "..."
+# secret_access_key = "..."
+#
+# # Route a bucket to a specific backend (with optional alias):
+# [buckets.archive]
+# backend = "hetzner"
+# alias = "prod-archive-2024"      # real bucket name on the backend
+# compression = false               # also disable compression for this bucket
+
 # Environment Variables
 # ---------------------
 # All settings above can be set via environment variables instead:

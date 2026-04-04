@@ -1,12 +1,14 @@
 //! Storage backend abstraction
 
 mod filesystem;
+pub(crate) mod routing;
 mod s3;
 mod traits;
 #[cfg(unix)]
 pub(crate) mod xattr_meta;
 
 pub use filesystem::FilesystemBackend;
+pub use routing::RoutingBackend;
 pub use s3::S3Backend;
 pub use traits::{DelegatedListResult, StorageBackend, StorageError};
 

@@ -230,12 +230,48 @@ pub type DynEngine = DeltaGliderEngine<Box<dyn StorageBackend>>;
 impl DynEngine {
     /// Create a new engine with the appropriate backend based on configuration.
     /// Pass `metrics` to enable Prometheus instrumentation (None disables it).
+    ///
+    /// When `config.backends` is non-empty, constructs a `RoutingBackend` that
+    /// routes calls to the correct underlying backend per bucket. Otherwise,
+    /// uses the legacy single-backend path from `config.backend`.
     pub async fn new(config: &Config, metrics: Option<Arc<Metrics>>) -> Result<Self, StorageError> {
-        let storage: Box<dyn StorageBackend> = match &config.backend {
-            BackendConfig::Filesystem { path } => {
-                Box::new(FilesystemBackend::new(path.clone()).await?)
+        let storage: Box<dyn StorageBackend> = if config.backends.is_empty() {
+            // Legacy single-backend path
+            match &config.backend {
+                BackendConfig::Filesystem { path } => {
+                    Box::new(FilesystemBackend::new(path.clone()).await?)
+                }
+                BackendConfig::S3 { .. } => Box::new(S3Backend::new(&config.backend).await?),
             }
-            BackendConfig::S3 { .. } => Box::new(S3Backend::new(&config.backend).await?),
+        } else {
+            // Multi-backend: construct each backend, wrap in RoutingBackend
+            let mut backends = std::collections::HashMap::new();
+            for named in &config.backends {
+                let backend: Box<dyn StorageBackend> = match &named.backend {
+                    BackendConfig::Filesystem { path } => {
+                        Box::new(FilesystemBackend::new(path.clone()).await?)
+                    }
+                    BackendConfig::S3 { .. } => Box::new(S3Backend::new(&named.backend).await?),
+                };
+                backends.insert(named.name.clone(), Arc::new(backend));
+            }
+            let default_name = config
+                .default_backend
+                .clone()
+                .unwrap_or_else(|| config.backends[0].name.clone());
+
+            // Build routing table from bucket policies
+            let registry = crate::bucket_policy::BucketPolicyRegistry::new(
+                config.buckets.clone(),
+                config.max_delta_ratio,
+            );
+            let routes = registry.routing_table();
+
+            Box::new(crate::storage::RoutingBackend::new(
+                backends,
+                routes,
+                default_name,
+            )?)
         };
 
         Ok(Self::new_with_backend(Arc::new(storage), config, metrics))

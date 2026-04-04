@@ -297,6 +297,8 @@ pub fn run_init_inner(
         config_sync_bucket: None,
         tls,
         buckets: std::collections::HashMap::new(),
+        backends: Vec::new(),
+        default_backend: None,
     };
 
     // Show summary
