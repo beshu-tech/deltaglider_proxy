@@ -74,7 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Interactive config wizard (runs synchronously, exits before tokio runtime)
     if cli.init {
-        match deltaglider_proxy::init::run_interactive_init("deltaglider_proxy.toml") {
+        match deltaglider_proxy::init::run_interactive_init(deltaglider_proxy::config::DEFAULT_CONFIG_FILENAME) {
             Ok(()) => std::process::exit(0),
             Err(e) => {
                 eprintln!("Error: {e}");

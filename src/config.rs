@@ -248,6 +248,9 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
 ];
 
+/// Default config filename (used for load, persist, and resolve).
+pub const DEFAULT_CONFIG_FILENAME: &str = "deltaglider_proxy.toml";
+
 /// Thread-safe shared config for hot-reload from admin GUI.
 pub type SharedConfig = Arc<tokio::sync::RwLock<Config>>;
 
@@ -582,7 +585,7 @@ impl Config {
                 return Some(path);
             }
         }
-        for path in &["deltaglider_proxy.toml", "/etc/deltaglider_proxy/config.toml"] {
+        for path in &[DEFAULT_CONFIG_FILENAME, "/etc/deltaglider_proxy/config.toml"] {
             if std::path::Path::new(path).exists() {
                 return Some(path.to_string());
             }
@@ -599,7 +602,7 @@ impl Config {
             // Try default config file locations
             let mut found = None;
             for path in &[
-                "deltaglider_proxy.toml",
+                DEFAULT_CONFIG_FILENAME,
                 "/etc/deltaglider_proxy/config.toml",
             ] {
                 if std::path::Path::new(path).exists() {
