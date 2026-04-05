@@ -35,8 +35,8 @@ function findMatchingPreset(logLevel: string): string | null {
 
 interface Props {
   onSessionExpired?: () => void;
-  /** Which tab to render. Defaults to 'backend'. Used by AdminPage. */
-  embeddedTab?: string;
+  /** Which tab to render. Used by AdminPage. */
+  embeddedTab: string;
 }
 
 /* -- SettingsPage (main) -------------------------------------------------- */
@@ -202,8 +202,28 @@ export default function SettingsPage({ onSessionExpired, embeddedTab }: Props) {
      minHeight prevents vertical collapse on short tabs (Security). */
   const tabPane: React.CSSProperties = { width: '100%', minWidth: 0, minHeight: 420 };
 
-  /* -- Tab: Connection ---------------------------------------------------- */
-
+  /* -- Save button + result shared across editable tabs ------------------- */
+  const saveSection = (
+    <>
+      {saveResult && (
+        <>
+          {saveResult.requires_restart && (
+            <Alert type="warning" icon={<WarningOutlined />} message="Restart Required" description={saveResult.warnings.join('. ')} showIcon style={{ borderRadius: 8, marginBottom: 16 }} />
+          )}
+          {saveResult.warnings.length > 0 && !saveResult.requires_restart && (
+            <Alert type="info" message={saveResult.warnings.join('. ')} showIcon style={{ borderRadius: 8, marginBottom: 16 }} />
+          )}
+          {saveResult.warnings.length === 0 && (
+            <Alert type="success" message="Configuration saved." showIcon style={{ borderRadius: 8, marginBottom: 16 }} />
+          )}
+        </>
+      )}
+      <Button type="primary" icon={<SaveOutlined />} loading={saving} onClick={handleSave} block size="large"
+        style={{ borderRadius: 10, height: 48, fontWeight: 700, fontFamily: "var(--font-ui)", fontSize: 15 }}>
+        Save Configuration
+      </Button>
+    </>
+  );
 
   /* -- Tab: Backend ------------------------------------------------------- */
 
@@ -356,45 +376,7 @@ export default function SettingsPage({ onSessionExpired, embeddedTab }: Props) {
         </>
       )}
 
-      {saveResult && (
-        <div style={{ marginTop: 16 }}>
-          {saveResult.requires_restart && (
-            <Alert
-              type="warning"
-              icon={<WarningOutlined />}
-              message="Restart Required"
-              description={saveResult.warnings.join('. ')}
-              showIcon
-              style={{ borderRadius: 8 }}
-            />
-          )}
-          {saveResult.warnings.length > 0 && !saveResult.requires_restart && (
-            <Alert type="info" message={saveResult.warnings.join('. ')} showIcon style={{ borderRadius: 8 }} />
-          )}
-          {saveResult.warnings.length === 0 && (
-            <Alert type="success" message="Configuration saved." showIcon style={{ borderRadius: 8 }} />
-          )}
-        </div>
-      )}
-
-      <Button
-        type="primary"
-        icon={<SaveOutlined />}
-        loading={saving}
-        onClick={handleSave}
-        block
-        size="large"
-        style={{
-          borderRadius: 10,
-          height: 48,
-          fontWeight: 700,
-          fontFamily: "var(--font-ui)",
-          fontSize: 15,
-          marginTop: 20,
-        }}
-      >
-        Save Configuration
-      </Button>
+      {saveSection}
     </form></div>
   );
 
@@ -416,29 +398,6 @@ export default function SettingsPage({ onSessionExpired, embeddedTab }: Props) {
         </div>
       )}
     </div>
-  );
-
-  /* -- Save button + result shared across editable tabs ------------------- */
-  const saveSection = (
-    <>
-      {saveResult && (
-        <>
-          {saveResult.requires_restart && (
-            <Alert type="warning" icon={<WarningOutlined />} message="Restart Required" description={saveResult.warnings.join('. ')} showIcon style={{ borderRadius: 8, marginBottom: 16 }} />
-          )}
-          {saveResult.warnings.length > 0 && !saveResult.requires_restart && (
-            <Alert type="info" message={saveResult.warnings.join('. ')} showIcon style={{ borderRadius: 8, marginBottom: 16 }} />
-          )}
-          {saveResult.warnings.length === 0 && (
-            <Alert type="success" message="Configuration saved." showIcon style={{ borderRadius: 8, marginBottom: 16 }} />
-          )}
-        </>
-      )}
-      <Button type="primary" icon={<SaveOutlined />} loading={saving} onClick={handleSave} block size="large"
-        style={{ borderRadius: 10, height: 48, fontWeight: 700, fontFamily: "var(--font-ui)", fontSize: 15 }}>
-        Save Configuration
-      </Button>
-    </>
   );
 
   /* -- Tab: Compression --------------------------------------------------- */
@@ -705,7 +664,7 @@ export default function SettingsPage({ onSessionExpired, embeddedTab }: Props) {
   };
   return (
     <div style={{ maxWidth: 640, margin: '0 auto', padding: 'clamp(16px, 3vw, 24px)' }}>
-      {tabMap[embeddedTab ?? 'backend'] ?? null}
+      {tabMap[embeddedTab] ?? null}
     </div>
   );
 }

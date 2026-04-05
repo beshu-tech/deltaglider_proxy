@@ -73,6 +73,37 @@ pub struct BackendInfoResponse {
     pub has_credentials: bool,
 }
 
+impl From<&crate::config::NamedBackendConfig> for BackendInfoResponse {
+    fn from(named: &crate::config::NamedBackendConfig) -> Self {
+        match &named.backend {
+            crate::config::BackendConfig::Filesystem { path } => Self {
+                name: named.name.clone(),
+                backend_type: "filesystem".into(),
+                path: Some(path.display().to_string()),
+                endpoint: None,
+                region: None,
+                force_path_style: None,
+                has_credentials: false,
+            },
+            crate::config::BackendConfig::S3 {
+                endpoint,
+                region,
+                force_path_style,
+                access_key_id,
+                ..
+            } => Self {
+                name: named.name.clone(),
+                backend_type: "s3".into(),
+                path: None,
+                endpoint: endpoint.clone(),
+                region: Some(region.clone()),
+                force_path_style: Some(*force_path_style),
+                has_credentials: access_key_id.is_some(),
+            },
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub struct ConfigUpdateRequest {
     pub max_delta_ratio: Option<f32>,
@@ -245,7 +276,7 @@ fn compute_tainted_fields(runtime: &crate::config::Config) -> Vec<String> {
 
 /// Rebuild the engine from current config, storing the new engine on success.
 /// Returns `Ok(())` on success, or an error message string on failure.
-async fn rebuild_engine(
+pub(super) async fn rebuild_engine(
     state: &Arc<AdminState>,
     cfg: &crate::config::Config,
     context: &str,
@@ -327,41 +358,8 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
 
     let tainted_fields = compute_tainted_fields(&cfg);
 
-    // Build sanitized backends list
-    let backends_info: Vec<BackendInfoResponse> = cfg
-        .backends
-        .iter()
-        .map(|named| {
-            let (bt, path, endpoint, region, fps, has_creds) = match &named.backend {
-                crate::config::BackendConfig::Filesystem { path } => {
-                    ("filesystem", Some(path.display().to_string()), None, None, None, false)
-                }
-                crate::config::BackendConfig::S3 {
-                    endpoint,
-                    region,
-                    force_path_style,
-                    access_key_id,
-                    ..
-                } => (
-                    "s3",
-                    None,
-                    endpoint.clone(),
-                    Some(region.clone()),
-                    Some(*force_path_style),
-                    access_key_id.is_some(),
-                ),
-            };
-            BackendInfoResponse {
-                name: named.name.clone(),
-                backend_type: bt.to_string(),
-                path,
-                endpoint,
-                region,
-                force_path_style: fps,
-                has_credentials: has_creds,
-            }
-        })
-        .collect();
+    let backends_info: Vec<BackendInfoResponse> =
+        cfg.backends.iter().map(BackendInfoResponse::from).collect();
 
     Json(ConfigResponse {
         listen_addr: cfg.listen_addr.to_string(),
@@ -668,7 +666,7 @@ pub async fn update_config(
     }
 
     // Persist to TOML file
-    if let Err(e) = cfg.persist_to_file("deltaglider_proxy.toml") {
+    if let Err(e) = cfg.persist_to_file(crate::config::DEFAULT_CONFIG_FILENAME) {
         warnings.push(format!("Failed to persist config: {}", e));
     }
 

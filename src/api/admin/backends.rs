@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::config::{BackendConfig, NamedBackendConfig};
-use crate::deltaglider::DynEngine;
 
 use super::{trigger_config_sync, AdminState};
 
@@ -69,36 +68,7 @@ pub async fn list_backends(State(state): State<Arc<AdminState>>) -> impl IntoRes
     let backends = cfg
         .backends
         .iter()
-        .map(|named| {
-            let (bt, path, endpoint, region, fps, has_creds) = match &named.backend {
-                BackendConfig::Filesystem { path } => {
-                    ("filesystem", Some(path.display().to_string()), None, None, None, false)
-                }
-                BackendConfig::S3 {
-                    endpoint,
-                    region,
-                    force_path_style,
-                    access_key_id,
-                    ..
-                } => (
-                    "s3",
-                    None,
-                    endpoint.clone(),
-                    Some(region.clone()),
-                    Some(*force_path_style),
-                    access_key_id.is_some(),
-                ),
-            };
-            super::config::BackendInfoResponse {
-                name: named.name.clone(),
-                backend_type: bt.to_string(),
-                path,
-                endpoint,
-                region,
-                force_path_style: fps,
-                has_credentials: has_creds,
-            }
-        })
+        .map(super::config::BackendInfoResponse::from)
         .collect();
 
     Json(BackendListResponse {
@@ -164,27 +134,26 @@ pub async fn create_backend(
         cfg.default_backend = Some(name.clone());
     }
 
-    // Rebuild engine
-    match DynEngine::new(&cfg, Some(state.s3_state.metrics.clone())).await {
-        Ok(new_engine) => {
-            state.s3_state.engine.store(Arc::new(new_engine));
-            tracing::info!("Backend '{}' added, engine rebuilt", name);
-        }
-        Err(e) => {
-            cfg.backends = old_backends;
-            cfg.default_backend = old_default;
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(BackendMutationResponse {
-                    success: false,
-                    error: Some(format!("Failed to rebuild engine: {}", e)),
-                    requires_restart: false,
-                }),
-            );
-        }
+    if let Err(e) = super::config::rebuild_engine(
+        &state,
+        &cfg,
+        &format!("Backend '{}' added, engine rebuilt", name),
+    )
+    .await
+    {
+        cfg.backends = old_backends;
+        cfg.default_backend = old_default;
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(BackendMutationResponse {
+                success: false,
+                error: Some(format!("Failed to rebuild engine: {}", e)),
+                requires_restart: false,
+            }),
+        );
     }
 
-    if let Err(e) = cfg.persist_to_file("deltaglider_proxy.toml") {
+    if let Err(e) = cfg.persist_to_file(crate::config::DEFAULT_CONFIG_FILENAME) {
         tracing::warn!("Failed to persist config: {}", e);
     }
     trigger_config_sync(&state);
@@ -255,26 +224,25 @@ pub async fn delete_backend(
     let old_backends = cfg.backends.clone();
     cfg.backends.retain(|b| b.name != name);
 
-    // Rebuild engine
-    match DynEngine::new(&cfg, Some(state.s3_state.metrics.clone())).await {
-        Ok(new_engine) => {
-            state.s3_state.engine.store(Arc::new(new_engine));
-            tracing::info!("Backend '{}' removed, engine rebuilt", name);
-        }
-        Err(e) => {
-            cfg.backends = old_backends;
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(BackendMutationResponse {
-                    success: false,
-                    error: Some(format!("Failed to rebuild engine: {}", e)),
-                    requires_restart: false,
-                }),
-            );
-        }
+    if let Err(e) = super::config::rebuild_engine(
+        &state,
+        &cfg,
+        &format!("Backend '{}' removed, engine rebuilt", name),
+    )
+    .await
+    {
+        cfg.backends = old_backends;
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(BackendMutationResponse {
+                success: false,
+                error: Some(format!("Failed to rebuild engine: {}", e)),
+                requires_restart: false,
+            }),
+        );
     }
 
-    if let Err(e) = cfg.persist_to_file("deltaglider_proxy.toml") {
+    if let Err(e) = cfg.persist_to_file(crate::config::DEFAULT_CONFIG_FILENAME) {
         tracing::warn!("Failed to persist config: {}", e);
     }
     trigger_config_sync(&state);
