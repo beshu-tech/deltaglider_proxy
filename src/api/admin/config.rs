@@ -271,6 +271,20 @@ fn compute_tainted_fields(runtime: &crate::config::Config) -> Vec<String> {
         tainted.push("bucket_policies".to_string());
     }
 
+    // Multi-backend
+    if runtime.backends.len() != disk.backends.len()
+        || runtime
+            .backends
+            .iter()
+            .zip(disk.backends.iter())
+            .any(|(r, d)| r.name != d.name)
+    {
+        tainted.push("backends".to_string());
+    }
+    if runtime.default_backend != disk.default_backend {
+        tainted.push("default_backend".to_string());
+    }
+
     tainted
 }
 

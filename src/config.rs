@@ -622,7 +622,7 @@ impl Config {
     }
 
     /// Validate config values are in acceptable ranges. Called after loading.
-    pub fn validate(&self) {
+    pub fn validate(&mut self) {
         if self.max_delta_ratio < 0.0 || self.max_delta_ratio > 1.0 {
             eprintln!(
                 "Warning: max_delta_ratio={} is outside [0.0, 1.0] — delta compression decisions may behave unexpectedly",
@@ -631,6 +631,28 @@ impl Config {
         }
         if self.max_object_size == 0 {
             eprintln!("Warning: max_object_size=0 will reject all uploads");
+        }
+        // Validate default_backend references an existing named backend
+        if let Some(ref default) = self.default_backend {
+            if !self.backends.is_empty() && !self.backends.iter().any(|b| &b.name == default) {
+                eprintln!(
+                    "Warning: default_backend='{}' not found in backends list {:?} — clearing",
+                    default,
+                    self.backends.iter().map(|b| &b.name).collect::<Vec<_>>()
+                );
+                self.default_backend = None;
+            }
+        }
+        // Validate bucket policy backend references
+        for (bucket, policy) in &self.buckets {
+            if let Some(ref backend) = policy.backend {
+                if !self.backends.is_empty() && !self.backends.iter().any(|b| &b.name == backend) {
+                    eprintln!(
+                        "Warning: bucket '{}' routes to unknown backend '{}' — route will be ignored",
+                        bucket, backend
+                    );
+                }
+            }
         }
     }
 

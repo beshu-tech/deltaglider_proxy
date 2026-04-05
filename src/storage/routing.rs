@@ -178,18 +178,14 @@ impl StorageBackend for RoutingBackend {
     }
 
     /// Aggregate buckets with dates across all backends.
+    /// Queries backends first to get real dates, then adds routed virtual
+    /// names (with current time) only if they weren't already found.
     async fn list_buckets_with_dates(
         &self,
     ) -> Result<Vec<(String, chrono::DateTime<chrono::Utc>)>, StorageError> {
         let mut all_buckets: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
 
-        // Include all explicitly routed virtual names with current time
-        for virtual_name in self.routes.keys() {
-            all_buckets
-                .entry(virtual_name.clone())
-                .or_insert_with(chrono::Utc::now);
-        }
-
+        // Query backends first — real dates take precedence
         for (backend_name, backend) in &self.backends {
             match backend.list_buckets_with_dates().await {
                 Ok(buckets) => {
@@ -208,6 +204,14 @@ impl StorageBackend for RoutingBackend {
                     );
                 }
             }
+        }
+
+        // Add routed virtual names that weren't found on any backend
+        // (bucket may not exist yet, but the route is configured)
+        for virtual_name in self.routes.keys() {
+            all_buckets
+                .entry(virtual_name.clone())
+                .or_insert_with(chrono::Utc::now);
         }
 
         let mut result: Vec<_> = all_buckets.into_iter().collect();
