@@ -390,6 +390,41 @@ export async function loginAs(accessKeyId: string, secretAccessKey: string): Pro
   return { ok: false, error: 'Admin access denied — invalid credentials or insufficient permissions' };
 }
 
+// === Multi-Backend Management ===
+
+export interface BackendListResponse {
+  backends: BackendInfo[];
+  default_backend: string | null;
+}
+
+export interface CreateBackendRequest {
+  name: string;
+  type: string;
+  path?: string;
+  endpoint?: string;
+  region?: string;
+  force_path_style?: boolean;
+  access_key_id?: string;
+  secret_access_key?: string;
+  set_default?: boolean;
+}
+
+export async function getBackends(): Promise<BackendListResponse> {
+  const res = await adminFetch('/api/admin/backends');
+  if (!res.ok) throw new Error(`Failed to load backends: ${res.status}`);
+  return safeJson(res);
+}
+
+export async function createBackend(req: CreateBackendRequest): Promise<{ success: boolean; error?: string }> {
+  const res = await adminFetch('/api/admin/backends', 'POST', req);
+  return safeJson(res);
+}
+
+export async function deleteBackend(name: string): Promise<{ success: boolean; error?: string }> {
+  const res = await adminFetch(`/api/admin/backends/${encodeURIComponent(name)}`, 'DELETE');
+  return safeJson(res);
+}
+
 // === Config DB Recovery ===
 
 export interface RecoverDbResponse {
