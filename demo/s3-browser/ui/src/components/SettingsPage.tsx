@@ -74,7 +74,7 @@ export default function SettingsPage({ onSessionExpired, embeddedTab }: Props) {
   const [showAdvancedSecurity, setShowAdvancedSecurity] = useState(false);
 
   // Bucket policies state: array for ordered editing
-  const [bucketPolicies, setBucketPolicies] = useState<Array<{ name: string; compression: boolean; max_delta_ratio: number | null }>>([]);
+  const [bucketPolicies, setBucketPolicies] = useState<Array<{ name: string; compression: boolean; max_delta_ratio: number | null; backend: string; alias: string }>>([]);
 
   // Taint detection: fields that differ from TOML file on disk
   const [taintedFields, setTaintedFields] = useState<Set<string>>(new Set());
@@ -108,6 +108,8 @@ export default function SettingsPage({ onSessionExpired, embeddedTab }: Props) {
               name,
               compression: p.compression ?? true,
               max_delta_ratio: p.max_delta_ratio ?? null,
+              backend: p.backend ?? '',
+              alias: p.alias ?? '',
             }))
           );
         }
@@ -151,12 +153,14 @@ export default function SettingsPage({ onSessionExpired, embeddedTab }: Props) {
       if (beAccessKeyId) payload.backend_access_key_id = beAccessKeyId;
       if (beSecretAccessKey) payload.backend_secret_access_key = beSecretAccessKey;
       // Bucket policies — convert array to map
-      const bp: Record<string, { compression?: boolean; max_delta_ratio?: number }> = {};
+      const bp: Record<string, { compression?: boolean; max_delta_ratio?: number; backend?: string; alias?: string }> = {};
       for (const p of bucketPolicies) {
         if (!p.name.trim()) continue;
         bp[p.name.trim().toLowerCase()] = {
           ...(p.compression === false ? { compression: false } : {}),
           ...(p.max_delta_ratio !== null ? { max_delta_ratio: p.max_delta_ratio } : {}),
+          ...(p.backend ? { backend: p.backend } : {}),
+          ...(p.alias ? { alias: p.alias } : {}),
         };
       }
       payload.bucket_policies = bp;
@@ -512,12 +516,40 @@ export default function SettingsPage({ onSessionExpired, embeddedTab }: Props) {
                 </div>
               )}
             </div>
+            {(config?.backends?.length ?? 0) > 0 && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8, marginLeft: 22, flexWrap: 'wrap' }}>
+                <Text style={{ fontSize: 12, fontFamily: 'var(--font-ui)', color: colors.TEXT_MUTED, whiteSpace: 'nowrap' }}>Backend:</Text>
+                <Input
+                  value={bp.backend}
+                  onChange={(e) => {
+                    const next = [...bucketPolicies];
+                    next[idx] = { ...next[idx], backend: e.target.value };
+                    setBucketPolicies(next);
+                  }}
+                  placeholder="default"
+                  style={{ width: 120, ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 12 }}
+                  size="small"
+                />
+                <Text style={{ fontSize: 12, fontFamily: 'var(--font-ui)', color: colors.TEXT_MUTED, whiteSpace: 'nowrap' }}>Alias:</Text>
+                <Input
+                  value={bp.alias}
+                  onChange={(e) => {
+                    const next = [...bucketPolicies];
+                    next[idx] = { ...next[idx], alias: e.target.value };
+                    setBucketPolicies(next);
+                  }}
+                  placeholder="same as bucket name"
+                  style={{ width: 160, ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 12 }}
+                  size="small"
+                />
+              </div>
+            )}
           </div>
         ))}
 
         <Button
           icon={<PlusOutlined />}
-          onClick={() => setBucketPolicies([...bucketPolicies, { name: '', compression: true, max_delta_ratio: null }])}
+          onClick={() => setBucketPolicies([...bucketPolicies, { name: '', compression: true, max_delta_ratio: null, backend: '', alias: '' }])}
           style={{ marginTop: 12, borderRadius: 8, fontFamily: 'var(--font-ui)', fontWeight: 600 }}
           block
           type="dashed"

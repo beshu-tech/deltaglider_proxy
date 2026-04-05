@@ -4,6 +4,7 @@ import { checkSession, adminLogin, whoami, loginAs, exportBackup, importBackup }
 import { getCredentials } from '../s3client';
 import {
   CloudOutlined,
+  CloudServerOutlined,
   DatabaseOutlined,
   ControlOutlined,
   TeamOutlined,
@@ -18,18 +19,20 @@ import FullScreenHeader from './FullScreenHeader';
 import SettingsPage from './SettingsPage';
 import UsersPanel from './UsersPanel';
 import GroupsPanel from './GroupsPanel';
+import BackendsPanel from './BackendsPanel';
 import MetricsPage from './MetricsPage';
 import { useNavigation } from '../NavigationContext';
 
 const { Text } = Typography;
 
-const VALID_TABS = new Set(['users', 'groups', 'metrics', 'backend', 'compression', 'limits', 'security', 'logging']);
+const VALID_TABS = new Set(['users', 'groups', 'metrics', 'backends', 'backend', 'compression', 'limits', 'security', 'logging']);
 
 const TABS = [
   { key: 'users', label: 'Users', icon: <TeamOutlined /> },
   { key: 'groups', label: 'Groups', icon: <FolderOutlined /> },
   { key: 'metrics', label: 'Metrics', icon: <DashboardOutlined /> },
-  { key: 'backend', label: 'Backend', icon: <DatabaseOutlined /> },
+  { key: 'backends', label: 'Backends', icon: <CloudServerOutlined /> },
+  { key: 'backend', label: 'Connection', icon: <DatabaseOutlined /> },
   { key: 'compression', label: 'Compression', icon: <ControlOutlined /> },
   { key: 'limits', label: 'Limits', icon: <CloudOutlined /> },
   { key: 'security', label: 'Security', icon: <LockOutlined /> },
@@ -141,6 +144,9 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
     }
     if (activeTab === 'groups') {
       return <GroupsPanel onSessionExpired={onSessionExpired} onSavingChange={setSaving} initialGroupId={pendingGroupId} onGroupSelected={() => setPendingGroupId(null)} />;
+    }
+    if (activeTab === 'backends') {
+      return <BackendsPanel onSessionExpired={onSessionExpired} />;
     }
     if (activeTab === 'metrics') {
       return <MetricsPage onBack={onBack} embedded />;

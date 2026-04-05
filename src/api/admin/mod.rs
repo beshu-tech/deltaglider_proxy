@@ -2,6 +2,7 @@
 
 mod auth;
 mod backup;
+pub(crate) mod backends;
 mod config;
 mod groups;
 mod scanner;
@@ -26,6 +27,7 @@ pub use auth::{
     require_session, set_s3_session_creds, whoami, LoginAsRequest, LoginResponse, SessionResponse,
     WhoamiQuery, WhoamiResponse,
 };
+pub use backends::{create_backend, delete_backend, list_backends};
 pub use backup::{export_backup, import_backup};
 pub use config::{
     change_password, get_config, recover_db, test_s3_connection, update_config,

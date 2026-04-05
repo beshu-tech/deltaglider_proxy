@@ -33,6 +33,15 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         .route("/_/api/admin/password", put(admin::change_password))
         .route("/_/api/admin/session", get(admin::check_session))
         .route("/_/api/admin/test-s3", post(admin::test_s3_connection))
+        // Multi-backend management
+        .route(
+            "/_/api/admin/backends",
+            get(admin::list_backends).post(admin::create_backend),
+        )
+        .route(
+            "/_/api/admin/backends/:name",
+            delete(admin::delete_backend),
+        )
         // IAM user management
         .route(
             "/_/api/admin/users",
