@@ -4,6 +4,8 @@ WORKDIR /app/demo/s3-browser/ui
 COPY demo/s3-browser/ui/package.json demo/s3-browser/ui/package-lock.json ./
 RUN npm ci
 COPY demo/s3-browser/ui/ ./
+# docs/ is referenced by src/docs-imports.ts via relative path (../../../../docs/)
+COPY docs/ /app/docs/
 RUN npm run build
 
 # ── Build stage: cargo-chef plan (captures dependency graph) ──
