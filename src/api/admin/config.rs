@@ -590,7 +590,8 @@ pub async fn update_config(
 
         if need_engine_swap {
             let old_backend = cfg.backend.clone();
-            if let Err(e) = rebuild_engine(&state, &cfg, "Backend engine rebuilt successfully").await
+            if let Err(e) =
+                rebuild_engine(&state, &cfg, "Backend engine rebuilt successfully").await
             {
                 cfg.backend = old_backend;
                 warnings.push(format!(

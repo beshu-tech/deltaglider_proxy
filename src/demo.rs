@@ -38,10 +38,7 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             "/_/api/admin/backends",
             get(admin::list_backends).post(admin::create_backend),
         )
-        .route(
-            "/_/api/admin/backends/:name",
-            delete(admin::delete_backend),
-        )
+        .route("/_/api/admin/backends/:name", delete(admin::delete_backend))
         // IAM user management
         .route(
             "/_/api/admin/users",

@@ -1,8 +1,8 @@
 //! Admin GUI API handlers (separate from S3 SigV4 auth).
 
 mod auth;
-mod backup;
 pub(crate) mod backends;
+mod backup;
 mod config;
 mod groups;
 mod scanner;

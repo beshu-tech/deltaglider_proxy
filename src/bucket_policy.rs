@@ -112,10 +112,7 @@ impl BucketPolicyRegistry {
             .iter()
             .filter_map(|(bucket, policy)| {
                 policy.backend.as_ref().map(|backend_name| {
-                    (
-                        bucket.clone(),
-                        (backend_name.clone(), policy.alias.clone()),
-                    )
+                    (bucket.clone(), (backend_name.clone(), policy.alias.clone()))
                 })
             })
             .collect()
