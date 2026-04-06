@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.6.0
+
+### Features
+- **Multi-backend routing**: Route different buckets to different storage backends (filesystem, S3, mixed). `RoutingBackend` implements `StorageBackend` transparently — zero engine changes, shared caches/codec/locks. Configure via `[[backends]]` TOML array or Admin GUI.
+- **Backends admin panel**: New "Backends" tab in Admin Settings. Add/remove named backends, test S3 connections, set default backend. Safety checks prevent deleting in-use or default backends.
+- **Bucket routing UI**: Per-bucket policy cards now show Backend + Alias fields when multi-backend is active. Route virtual bucket names to specific backends with optional real-name aliasing.
+- **TOML/env config hints**: Read-only settings (Limits, Security, Advanced Compression) now show copyable `TOML:` and `ENV:` examples below each field.
+- **Bucket policies promoted**: Per-Bucket Compression section moved to top of Compression tab with improved UX — contextual labels, amber tint on disabled buckets, empty state explains use cases.
+
+### Bug Fixes
+- **Dropdown positioning**: Replaced Ant Design `<Select>` with `<Radio.Group>` for backend type chooser. Fixes broken dropdown positioning at non-100% browser zoom (known `@rc-component/trigger` bug).
+- **list_buckets_with_dates**: Routed virtual buckets no longer mask real creation dates with `now()`. Backends are queried first; route names added only if not already found.
+- **Config validation**: `default_backend` is now validated against the `backends` list at load time. Invalid references are cleared with a warning. Bucket policy backend references are also validated.
+- **S3 credential validation**: `POST /api/admin/backends` now validates credentials upfront (400) instead of failing at engine rebuild (500).
+- **Taint detection**: `compute_tainted_fields` now compares `backends` and `default_backend` between runtime and disk config.
+
+### Code Quality
+- **DRY**: `BackendInfoResponse::from()` impl replaces copy-pasted conversion in two files. `rebuild_engine` made `pub(super)` and shared across config.rs and backends.rs. `DEFAULT_CONFIG_FILENAME` constant replaces 6 magic strings.
+- **Dead code**: Removed inline save block from backendTab (uses shared `saveSection`). `embeddedTab` prop made required.
+- **Replay window**: Hoisted duplicate `DGP_REPLAY_WINDOW_SECS` env parse to single variable.
+
 ## v0.5.11
 
 ### Features
