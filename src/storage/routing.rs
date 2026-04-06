@@ -473,7 +473,13 @@ impl StorageBackend for RoutingBackend {
     ) -> Result<Option<DelegatedListResult>, StorageError> {
         let (backend, real_bucket) = self.resolve(bucket);
         backend
-            .list_objects_delegated(&real_bucket, prefix, delimiter, max_keys, continuation_token)
+            .list_objects_delegated(
+                &real_bucket,
+                prefix,
+                delimiter,
+                max_keys,
+                continuation_token,
+            )
             .await
     }
 }

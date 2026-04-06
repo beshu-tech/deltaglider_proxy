@@ -42,11 +42,7 @@ pub struct BackendMutationResponse {
 fn build_backend_config(req: &CreateBackendRequest) -> Result<BackendConfig, String> {
     match req.backend_type.as_str() {
         "filesystem" => {
-            let path = req
-                .path
-                .as_deref()
-                .unwrap_or("./data")
-                .to_string();
+            let path = req.path.as_deref().unwrap_or("./data").to_string();
             Ok(BackendConfig::Filesystem {
                 path: std::path::PathBuf::from(path),
             })
@@ -57,19 +53,22 @@ fn build_backend_config(req: &CreateBackendRequest) -> Result<BackendConfig, Str
             if req.access_key_id.as_ref().is_none_or(|s| s.is_empty())
                 || req.secret_access_key.as_ref().is_none_or(|s| s.is_empty())
             {
-                return Err(
-                    "S3 backend requires both access_key_id and secret_access_key".into(),
-                );
+                return Err("S3 backend requires both access_key_id and secret_access_key".into());
             }
             Ok(BackendConfig::S3 {
                 endpoint: req.endpoint.clone(),
-                region: req.region.clone().unwrap_or_else(|| "us-east-1".to_string()),
+                region: req
+                    .region
+                    .clone()
+                    .unwrap_or_else(|| "us-east-1".to_string()),
                 force_path_style: req.force_path_style.unwrap_or(true),
                 access_key_id: req.access_key_id.clone(),
                 secret_access_key: req.secret_access_key.clone(),
             })
         }
-        other => Err(format!("Unknown backend type: '{other}'. Must be 'filesystem' or 's3'.")),
+        other => Err(format!(
+            "Unknown backend type: '{other}'. Must be 'filesystem' or 's3'."
+        )),
     }
 }
 
@@ -204,7 +203,9 @@ pub async fn delete_backend(
             axum::http::StatusCode::CONFLICT,
             Json(BackendMutationResponse {
                 success: false,
-                error: Some("Cannot delete the default backend. Assign a new default first.".into()),
+                error: Some(
+                    "Cannot delete the default backend. Assign a new default first.".into(),
+                ),
                 requires_restart: false,
             }),
         );

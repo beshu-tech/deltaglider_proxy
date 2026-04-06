@@ -585,7 +585,10 @@ impl Config {
                 return Some(path);
             }
         }
-        for path in &[DEFAULT_CONFIG_FILENAME, "/etc/deltaglider_proxy/config.toml"] {
+        for path in &[
+            DEFAULT_CONFIG_FILENAME,
+            "/etc/deltaglider_proxy/config.toml",
+        ] {
             if std::path::Path::new(path).exists() {
                 return Some(path.to_string());
             }
