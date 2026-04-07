@@ -626,7 +626,16 @@ impl Config {
     /// Environment variables always take precedence over file-based config.
     pub fn load() -> Self {
         let mut config = if let Ok(path) = std::env::var("DGP_CONFIG") {
-            Self::from_file(&path).unwrap_or_default()
+            match Self::from_file(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "WARNING: Failed to parse config file '{}': {} — using defaults",
+                        path, e
+                    );
+                    Self::default()
+                }
+            }
         } else {
             // Try default config file locations
             let mut found = None;
