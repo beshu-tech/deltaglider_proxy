@@ -140,15 +140,6 @@ impl TestServer {
         let config_path = config_dir.join("test.toml");
         std::fs::write(&config_path, &full_config).expect("Failed to write test config");
 
-        // Debug: print config for CI troubleshooting
-        if std::env::var("CI").is_ok() {
-            eprintln!(
-                "[TEST] Config for port {}: {}",
-                port,
-                full_config.replace('\n', " | ")
-            );
-        }
-
         let process = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"))
             .env("DGP_CONFIG", &config_path)
             .env("RUST_LOG", "deltaglider_proxy=warn")

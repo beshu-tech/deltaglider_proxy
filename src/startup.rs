@@ -116,13 +116,6 @@ pub fn log_startup_banner(config: &Config) {
 /// - `authentication = "none"` → explicit open access (with loud warnings)
 /// - Nothing configured → **FATAL error, process exits**
 fn validate_auth_config(config: &Config) {
-    // Diagnostic: log the raw authentication field value (temporarily at warn level for CI debugging)
-    tracing::warn!(
-        "validate_auth_config: authentication={:?}, auth_enabled={}",
-        config.authentication,
-        config.auth_enabled()
-    );
-
     // Normalize the authentication field: lowercase + trim whitespace
     let auth_mode = config
         .authentication

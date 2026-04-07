@@ -195,6 +195,7 @@ impl TestProxyServer {
         let process = cmd
             .env("DGP_LISTEN_ADDR", format!("127.0.0.1:{}", port))
             .env("DGP_CONFIG", config_path.to_str().unwrap())
+            .env("DGP_AUTHENTICATION", "none")
             .env("DGP_S3_ENDPOINT", minio_endpoint())
             .env("DGP_S3_REGION", "us-east-1")
             .env("DGP_S3_PATH_STYLE", "true")
