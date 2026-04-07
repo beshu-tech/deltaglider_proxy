@@ -24,9 +24,9 @@ deltaglider_proxy.toml
 *.png
 !docs/*.png
 
-# Docs (not needed in image)
-docs/
+# Docs — keep docs/ for UI build (docs-imports.ts reads markdown from docs/)
 *.md
+!docs/*.md
 !README.md
 LICENSE
 
