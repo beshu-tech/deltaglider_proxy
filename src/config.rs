@@ -1089,6 +1089,40 @@ mod tests {
     }
 
     #[test]
+    fn test_authentication_field_deserializes() {
+        let toml = r#"
+            listen_addr = "127.0.0.1:9000"
+            authentication = "none"
+
+            [backend]
+            type = "filesystem"
+            path = "/tmp/test"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.authentication.as_deref(),
+            Some("none"),
+            "authentication field must be deserialized from TOML"
+        );
+    }
+
+    #[test]
+    fn test_authentication_field_absent_is_none() {
+        let toml = r#"
+            listen_addr = "127.0.0.1:9000"
+
+            [backend]
+            type = "filesystem"
+            path = "/tmp/test"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(
+            config.authentication.is_none(),
+            "absent authentication field must be None"
+        );
+    }
+
+    #[test]
     fn test_print_example_toml_is_valid() {
         // The base TOML from Config::default() must round-trip
         let default_cfg = Config::default();

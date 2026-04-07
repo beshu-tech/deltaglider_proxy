@@ -18,7 +18,10 @@ permissions:
 env:
   BUILDER_IMAGE: ghcr.io/${{ github.repository }}/builder:latest
   # ── sccache: local MinIO compilation cache (NOT the CI test MinIO) ──
-  RUSTC_WRAPPER: sccache
+  # NOTE: sccache temporarily disabled for v0.7.0 release to ensure
+  # the new `authentication` Config field is compiled fresh.
+  # Re-enable by uncommenting after this release.
+  # RUSTC_WRAPPER: sccache
   CARGO_INCREMENTAL: "0"
   SCCACHE_BUCKET: sccache-rust
   SCCACHE_ENDPOINT: http://sccache-minio.sccache.svc.cluster.local:9000
