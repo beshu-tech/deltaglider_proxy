@@ -106,13 +106,78 @@ pub fn log_startup_banner(config: &Config) {
         );
     }
 
+    validate_auth_config(config);
+}
+
+/// Validate authentication configuration and refuse to start if unsafe.
+///
+/// The proxy requires explicit authentication configuration:
+/// - Credentials present → bootstrap/IAM mode (auto-detected)
+/// - `authentication = "none"` → explicit open access (with loud warnings)
+/// - Nothing configured → **FATAL error, process exits**
+fn validate_auth_config(config: &Config) {
+    // Normalize the authentication field: lowercase + trim whitespace
+    let auth_mode = config
+        .authentication
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase());
+    let auth_mode = auth_mode.as_deref();
+
     if config.auth_enabled() {
+        // Credentials are set — auth is on regardless of `authentication` field
         info!(
             "  Authentication: SigV4 ENABLED (access key: {})",
             config.access_key_id.as_deref().unwrap_or("")
         );
-    } else {
-        warn!("  Authentication: DISABLED (open access) — set DGP_ACCESS_KEY_ID and DGP_SECRET_ACCESS_KEY to enable");
+        if auth_mode == Some("none") {
+            warn!("  Note: authentication = \"none\" is ignored because S3 credentials are configured");
+        }
+        return;
+    }
+
+    // No credentials — check the `authentication` field
+    match auth_mode {
+        Some("none") => {
+            warn!("  Authentication: DISABLED (authentication = \"none\")");
+            warn!("  ╔══════════════════════════════════════════════════════════════════╗");
+            warn!("  ║  WARNING: All S3 data is accessible without credentials.        ║");
+            warn!("  ║  Set access_key_id + secret_access_key for production use.      ║");
+            warn!("  ╚══════════════════════════════════════════════════════════════════╝");
+        }
+        Some(other) => {
+            error!(
+                "FATAL: Unrecognized authentication mode: \"{}\"",
+                config.authentication.as_deref().unwrap_or(other)
+            );
+            error!("");
+            error!("  Accepted values:");
+            error!("    authentication = \"none\"    — open access (development only)");
+            error!("    (omit field)               — auto-detect from credentials");
+            error!("");
+            error!("  Or set S3 credentials instead:");
+            error!("    access_key_id = \"...\"");
+            error!("    secret_access_key = \"...\"");
+            std::process::exit(1);
+        }
+        None => {
+            // No credentials AND no explicit authentication mode → refuse to start
+            error!("FATAL: No authentication configured.");
+            error!("");
+            error!("  The proxy refuses to start without explicit authentication configuration.");
+            error!("  This prevents accidental exposure of S3 data.");
+            error!("");
+            error!("  Options:");
+            error!("    1. Set S3 credentials (recommended):");
+            error!("       access_key_id = \"...\"");
+            error!("       secret_access_key = \"...\"");
+            error!("");
+            error!("    2. Explicitly allow open access (development only):");
+            error!("       authentication = \"none\"");
+            error!("");
+            error!("  Environment variables:");
+            error!("    DGP_ACCESS_KEY_ID + DGP_SECRET_ACCESS_KEY, or DGP_AUTHENTICATION=none");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -413,6 +478,7 @@ pub async fn init_config_sync(
     admin_password_hash: &str,
     config_db: &Option<Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::ConfigDb>>>,
     iam_state: &SharedIamState,
+    external_auth: &Option<Arc<deltaglider_proxy::iam::external_auth::ExternalAuthManager>>,
 ) -> Option<Arc<ConfigDbSync>> {
     let sync_bucket = match &config.config_sync_bucket {
         Some(b) if !b.is_empty() => b.clone(),
@@ -444,7 +510,14 @@ pub async fn init_config_sync(
     // Try to download a newer version from S3
     match sync.download_if_newer().await {
         Ok(true) => {
-            reopen_and_rebuild_iam(config_db, admin_password_hash, iam_state, "startup").await;
+            reopen_and_rebuild_iam(
+                config_db,
+                admin_password_hash,
+                iam_state,
+                external_auth,
+                "startup",
+            )
+            .await;
         }
         Ok(false) => {
             info!("Config DB S3 sync: local copy is current");
@@ -462,6 +535,7 @@ pub async fn reopen_and_rebuild_iam(
     config_db: &Option<Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::ConfigDb>>>,
     admin_password_hash: &str,
     iam_state: &SharedIamState,
+    external_auth: &Option<Arc<deltaglider_proxy::iam::external_auth::ExternalAuthManager>>,
     context: &str,
 ) {
     if let Some(ref db_arc) = config_db {
@@ -485,6 +559,21 @@ pub async fn reopen_and_rebuild_iam(
                 );
             }
             iam_state.store(Arc::new(state));
+
+            // Rebuild ExternalAuthManager from the new DB
+            if let Some(ref ext_auth) = external_auth {
+                let providers = db.load_auth_providers().unwrap_or_default();
+                if !providers.is_empty() {
+                    ext_auth.rebuild(&providers);
+                    drop(db); // Release lock before async discovery
+                    ext_auth.discover_all().await;
+                    info!(
+                        "External auth providers rebuilt from S3-synced DB ({} providers) [{}]",
+                        ext_auth.provider_names().len(),
+                        context
+                    );
+                }
+            }
         }
     }
 }
@@ -494,10 +583,12 @@ pub fn spawn_config_sync_poll(
     sync: Arc<ConfigDbSync>,
     config_db: &Option<Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::ConfigDb>>>,
     iam_state: &SharedIamState,
+    external_auth: &Option<Arc<deltaglider_proxy::iam::external_auth::ExternalAuthManager>>,
     admin_password_hash: &str,
 ) {
     let db_arc = config_db.clone();
     let iam = iam_state.clone();
+    let ext_auth = external_auth.clone();
     let password_hash = admin_password_hash.to_string();
 
     tokio::spawn(async move {
@@ -508,7 +599,14 @@ pub fn spawn_config_sync_poll(
             tick.tick().await;
             match sync.poll_and_sync().await {
                 Ok(true) => {
-                    reopen_and_rebuild_iam(&db_arc, &password_hash, &iam, "periodic poll").await;
+                    reopen_and_rebuild_iam(
+                        &db_arc,
+                        &password_hash,
+                        &iam,
+                        &ext_auth,
+                        "periodic poll",
+                    )
+                    .await;
                 }
                 Ok(false) => {
                     tracing::debug!("Config DB S3 sync poll: no changes");

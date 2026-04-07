@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Typography, Button, Input, Alert, Space, Spin, message } from 'antd';
-import { checkSession, adminLogin, whoami, loginAs, exportBackup, importBackup } from '../adminApi';
+import { checkSession, adminLogin, whoami, loginAs, exportBackup, importBackup, type ExternalProviderInfo } from '../adminApi';
 import { getCredentials } from '../s3client';
 import {
   CloudOutlined,
@@ -13,23 +13,26 @@ import {
   DashboardOutlined,
   DownloadOutlined,
   UploadOutlined,
+  SafetyOutlined,
 } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import FullScreenHeader from './FullScreenHeader';
 import SettingsPage from './SettingsPage';
 import UsersPanel from './UsersPanel';
 import GroupsPanel from './GroupsPanel';
+import AuthenticationPanel from './AuthenticationPanel';
 import BackendsPanel from './BackendsPanel';
 import MetricsPage from './MetricsPage';
 import { useNavigation } from '../NavigationContext';
 
 const { Text } = Typography;
 
-const VALID_TABS = new Set(['users', 'groups', 'metrics', 'backends', 'backend', 'compression', 'limits', 'security', 'logging']);
+const VALID_TABS = new Set(['users', 'groups', 'auth', 'metrics', 'backends', 'backend', 'compression', 'limits', 'security', 'logging']);
 
 const TABS = [
   { key: 'users', label: 'Users', icon: <TeamOutlined /> },
   { key: 'groups', label: 'Groups', icon: <FolderOutlined /> },
+  { key: 'auth', label: 'Authentication', icon: <SafetyOutlined /> },
   { key: 'metrics', label: 'Metrics', icon: <DashboardOutlined /> },
   { key: 'backends', label: 'Backends', icon: <CloudServerOutlined /> },
   { key: 'backend', label: 'Connection', icon: <DatabaseOutlined /> },
@@ -58,6 +61,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
   const [authed, setAuthed] = useState(false);
   const [checkingSession, setCheckingSession] = useState(true);
   const [, setAuthMode] = useState<'bootstrap' | 'iam' | 'open'>('bootstrap');
+  const [externalProviders, setExternalProviders] = useState<ExternalProviderInfo[]>([]);
   const [accessDenied, setAccessDenied] = useState(false);
   const [password, setPassword] = useState('');
   const [loginLoading, setLoginLoading] = useState(false);
@@ -81,6 +85,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
 
       const info = await whoami();
       setAuthMode(info.mode);
+      setExternalProviders(info.external_providers || []);
 
       // In IAM mode, attempt auto-login with the current S3 credentials.
       // loginAs will succeed if the user is an IAM admin, or return 403 otherwise.
@@ -145,6 +150,9 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
     if (activeTab === 'groups') {
       return <GroupsPanel onSessionExpired={onSessionExpired} onSavingChange={setSaving} initialGroupId={pendingGroupId} onGroupSelected={() => setPendingGroupId(null)} />;
     }
+    if (activeTab === 'auth') {
+      return <AuthenticationPanel onSessionExpired={onSessionExpired} />;
+    }
     if (activeTab === 'backends') {
       return <BackendsPanel onSessionExpired={onSessionExpired} />;
     }
@@ -175,23 +183,55 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
     );
   }
 
-  // Bootstrap login gate (only in bootstrap/open mode)
+  // Login gate (bootstrap password + optional OAuth buttons)
   if (!authed && !checkingSession) {
     return (
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 1, background: colors.BG_BASE }}>
         <form onSubmit={e => { e.preventDefault(); handleLogin(); }} style={{ width: 380, padding: 40 }}>
           <div style={{ textAlign: 'center', marginBottom: 24 }}>
             <LockOutlined style={{ fontSize: 32, color: colors.ACCENT_BLUE, marginBottom: 12 }} />
-            <div><Text strong style={{ fontSize: 18, fontFamily: 'var(--font-ui)' }}>Bootstrap Login</Text></div>
-            <Text type="secondary" style={{ fontSize: 13 }}>Enter the bootstrap password to continue.</Text>
+            <div><Text strong style={{ fontSize: 18, fontFamily: 'var(--font-ui)' }}>Admin Login</Text></div>
+            <Text type="secondary" style={{ fontSize: 13 }}>
+              {externalProviders.length > 0 ? 'Sign in to continue.' : 'Enter the bootstrap password to continue.'}
+            </Text>
           </div>
+          {/* OAuth provider buttons */}
+          {externalProviders.length > 0 && (
+            <div style={{ marginBottom: 16 }}>
+              {externalProviders.map(p => (
+                <a
+                  key={p.name}
+                  href={`/_/api/admin/oauth/authorize/${encodeURIComponent(p.name)}?next=${encodeURIComponent('/_/admin')}`}
+                  style={{
+                    display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10,
+                    width: '100%', padding: '10px 16px', marginBottom: 8,
+                    borderRadius: 10, border: `1px solid ${colors.BORDER}`,
+                    background: colors.BG_CARD, color: colors.TEXT_PRIMARY,
+                    fontSize: 14, fontWeight: 600, fontFamily: 'var(--font-ui)',
+                    textDecoration: 'none', cursor: 'pointer',
+                    transition: 'border-color 0.15s, background 0.15s',
+                  }}
+                  onMouseEnter={e => { (e.target as HTMLElement).style.borderColor = colors.ACCENT_BLUE; }}
+                  onMouseLeave={e => { (e.target as HTMLElement).style.borderColor = colors.BORDER; }}
+                >
+                  <SafetyOutlined />
+                  Sign in with {p.display_name}
+                </a>
+              ))}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12, margin: '16px 0' }}>
+                <div style={{ flex: 1, height: 1, background: colors.BORDER }} />
+                <Text type="secondary" style={{ fontSize: 12 }}>or</Text>
+                <div style={{ flex: 1, height: 1, background: colors.BORDER }} />
+              </div>
+            </div>
+          )}
           {loginError && <Alert type="error" message={loginError} showIcon style={{ marginBottom: 16, borderRadius: 8 }} />}
           <Input.Password
-            placeholder="Password"
+            placeholder="Bootstrap password"
             value={password}
             onChange={e => setPassword(e.target.value)}
             size="large"
-            autoFocus
+            autoFocus={externalProviders.length === 0}
             style={{ borderRadius: 10, marginBottom: 16 }}
           />
           <Space style={{ width: '100%' }} direction="vertical">

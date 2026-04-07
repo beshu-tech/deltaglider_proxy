@@ -20,9 +20,21 @@ Per-user credentials stored in an encrypted SQLCipher database (`deltaglider_con
 
 IAM mode activates automatically when the first IAM user is created via the admin GUI. The bootstrap credentials are migrated as a "legacy-admin" user.
 
-### Open Access
+### Open Access (development only)
 
-When no credentials are configured, the proxy operates without authentication.
+By default, the proxy **refuses to start** without authentication credentials. To explicitly run without authentication:
+
+```toml
+authentication = "none"
+```
+
+Or via environment variable:
+
+```bash
+export DGP_AUTHENTICATION=none
+```
+
+> **Security**: Open access exposes all S3 data without credentials. Never use in production.
 
 ## Bootstrap Password
 

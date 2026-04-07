@@ -288,6 +288,7 @@ pub fn run_init_inner(
         max_object_size: max_object_size_mb * 1024 * 1024,
         cache_size_mb,
         metadata_cache_mb: 50,
+        authentication: None,
         access_key_id,
         secret_access_key,
         bootstrap_password_hash: None,

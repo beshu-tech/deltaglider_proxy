@@ -85,10 +85,11 @@ HTTP request
 
 ## Authentication & IAM
 
-Two auth modes, determined at runtime by whether IAM users exist in the config DB:
+The proxy **refuses to start** without authentication credentials unless `authentication = "none"` is explicitly set (dev only). Two auth modes at runtime, determined by whether IAM users exist in the config DB:
 
-- **Bootstrap mode**: Single credential pair from TOML/env vars. Admin GUI requires the bootstrap password. This is the default on fresh installs.
+- **Bootstrap mode**: Single credential pair from TOML/env vars (`DGP_ACCESS_KEY_ID` + `DGP_SECRET_ACCESS_KEY`). Admin GUI requires the bootstrap password. This is the default on fresh installs.
 - **IAM mode**: Per-user credentials from encrypted SQLCipher DB (`deltaglider_config.db`). Admin GUI access is permission-based (no password needed for IAM admins).
+- **Open access** (dev only): Set `authentication = "none"` or `DGP_AUTHENTICATION=none`. No SigV4 verification.
 
 The **bootstrap password** is a single infrastructure secret that:
 1. Encrypts the SQLCipher config DB

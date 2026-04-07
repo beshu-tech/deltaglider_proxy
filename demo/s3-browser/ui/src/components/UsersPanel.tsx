@@ -193,6 +193,11 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
                   <Text type="secondary" style={{ fontSize: 11, marginLeft: 8 }}>
                     · {permissionSummary(user)}
                   </Text>
+                  {user.auth_source === 'external' && (
+                    <Text style={{ fontSize: 10, marginLeft: 8, color: colors.ACCENT_PURPLE, fontWeight: 600 }}>
+                      EXTERNAL
+                    </Text>
+                  )}
                 </div>
               </div>
             );

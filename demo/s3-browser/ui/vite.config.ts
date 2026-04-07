@@ -9,7 +9,10 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      '/_': 'http://localhost:9000',
+      '/_/api': 'http://localhost:9000',
+      '/_/health': 'http://localhost:9000',
+      '/_/stats': 'http://localhost:9000',
+      '/_/metrics': 'http://localhost:9000',
     },
   },
 })

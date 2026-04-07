@@ -198,6 +198,7 @@ export interface IamUser {
   enabled: boolean;
   created_at: string;
   permissions: IamPermission[];
+  auth_source?: string; // "local" or "external"
 }
 
 export interface CreateUserRequest {
@@ -318,10 +319,17 @@ export async function removeGroupMember(groupId: number, userId: number): Promis
 
 // === Whoami / Login-as ===
 
+export interface ExternalProviderInfo {
+  name: string;
+  type: string;
+  display_name: string;
+}
+
 export interface WhoamiResponse {
   mode: 'bootstrap' | 'iam' | 'open';
   user: { name: string; access_key_id: string; is_admin: boolean } | null;
   config_db_mismatch?: boolean;
+  external_providers?: ExternalProviderInfo[];
 }
 
 export async function whoami(): Promise<WhoamiResponse> {
@@ -438,5 +446,187 @@ export async function recoverDb(candidatePassword: string): Promise<RecoverDbRes
   const res = await adminFetch('/api/admin/recover-db', 'POST', {
     candidate_password: candidatePassword,
   });
+  return safeJson(res);
+}
+
+// === External Auth (OAuth/OIDC) ===
+
+export interface AuthProvider {
+  id: number;
+  name: string;
+  provider_type: string;
+  enabled: boolean;
+  priority: number;
+  display_name?: string;
+  client_id?: string;
+  client_secret?: string;
+  issuer_url?: string;
+  scopes: string;
+  extra_config?: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateAuthProviderRequest {
+  name: string;
+  provider_type: string;
+  enabled?: boolean;
+  priority?: number;
+  display_name?: string;
+  client_id?: string;
+  client_secret?: string;
+  issuer_url?: string;
+  scopes?: string;
+  extra_config?: Record<string, unknown>;
+}
+
+export interface UpdateAuthProviderRequest {
+  name?: string;
+  provider_type?: string;
+  enabled?: boolean;
+  priority?: number;
+  display_name?: string;
+  client_id?: string;
+  client_secret?: string;
+  issuer_url?: string;
+  scopes?: string;
+  extra_config?: Record<string, unknown>;
+}
+
+export interface ProviderTestResult {
+  success: boolean;
+  issuer?: string;
+  authorization_endpoint?: string;
+  error?: string;
+}
+
+export async function getAuthProviders(): Promise<AuthProvider[]> {
+  const res = await adminFetch('/api/admin/ext-auth/providers');
+  if (!res.ok) throw new Error(`Failed to load providers: ${res.status}`);
+  return safeJson(res);
+}
+
+export async function createAuthProvider(req: CreateAuthProviderRequest): Promise<AuthProvider> {
+  const res = await adminFetch('/api/admin/ext-auth/providers', 'POST', req);
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(text || `Failed to create provider: ${res.status}`);
+  }
+  return safeJson(res);
+}
+
+export async function updateAuthProvider(id: number, req: UpdateAuthProviderRequest): Promise<AuthProvider> {
+  const res = await adminFetch(`/api/admin/ext-auth/providers/${id}`, 'PUT', req);
+  if (!res.ok) throw new Error(`Failed to update provider: ${res.status}`);
+  return safeJson(res);
+}
+
+export async function deleteAuthProvider(id: number): Promise<void> {
+  const res = await adminFetch(`/api/admin/ext-auth/providers/${id}`, 'DELETE');
+  if (!res.ok) throw new Error(`Failed to delete provider: ${res.status}`);
+}
+
+export async function testAuthProvider(id: number): Promise<ProviderTestResult> {
+  const res = await adminFetch(`/api/admin/ext-auth/providers/${id}/test`, 'POST');
+  if (!res.ok) throw new Error(`Test failed: ${res.status}`);
+  return safeJson(res);
+}
+
+// === Group Mapping Rules ===
+
+export interface MappingRule {
+  id: number;
+  provider_id: number | null;
+  priority: number;
+  match_type: string;
+  match_field: string;
+  match_value: string;
+  group_id: number;
+  created_at: string;
+}
+
+export interface CreateMappingRuleRequest {
+  provider_id?: number | null;
+  priority?: number;
+  match_type: string;
+  match_field?: string;
+  match_value: string;
+  group_id: number;
+}
+
+export interface UpdateMappingRuleRequest {
+  provider_id?: number | null;
+  priority?: number;
+  match_type?: string;
+  match_field?: string;
+  match_value?: string;
+  group_id?: number;
+}
+
+export async function getMappingRules(): Promise<MappingRule[]> {
+  const res = await adminFetch('/api/admin/ext-auth/mappings');
+  if (!res.ok) throw new Error(`Failed to load mappings: ${res.status}`);
+  return safeJson(res);
+}
+
+export async function createMappingRule(req: CreateMappingRuleRequest): Promise<MappingRule> {
+  const res = await adminFetch('/api/admin/ext-auth/mappings', 'POST', req);
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(text || `Failed to create mapping: ${res.status}`);
+  }
+  return safeJson(res);
+}
+
+export async function updateMappingRule(id: number, req: UpdateMappingRuleRequest): Promise<MappingRule> {
+  const res = await adminFetch(`/api/admin/ext-auth/mappings/${id}`, 'PUT', req);
+  if (!res.ok) throw new Error(`Failed to update mapping: ${res.status}`);
+  return safeJson(res);
+}
+
+export async function deleteMappingRule(id: number): Promise<void> {
+  const res = await adminFetch(`/api/admin/ext-auth/mappings/${id}`, 'DELETE');
+  if (!res.ok) throw new Error(`Failed to delete mapping: ${res.status}`);
+}
+
+export interface MappingPreviewResponse {
+  group_ids: number[];
+  group_names: string[];
+}
+
+export async function previewMapping(email: string): Promise<MappingPreviewResponse> {
+  const res = await adminFetch('/api/admin/ext-auth/mappings/preview', 'POST', { email });
+  if (!res.ok) throw new Error(`Preview failed: ${res.status}`);
+  return safeJson(res);
+}
+
+// === External Identities ===
+
+export interface ExternalIdentity {
+  id: number;
+  user_id: number;
+  provider_id: number;
+  external_sub: string;
+  email?: string;
+  display_name?: string;
+  last_login?: string;
+  raw_claims?: Record<string, unknown>;
+  created_at: string;
+}
+
+export async function getExternalIdentities(): Promise<ExternalIdentity[]> {
+  const res = await adminFetch('/api/admin/ext-auth/identities');
+  if (!res.ok) throw new Error(`Failed to load identities: ${res.status}`);
+  return safeJson(res);
+}
+
+export interface SyncResult {
+  users_updated: number;
+  memberships_changed: number;
+}
+
+export async function syncMemberships(): Promise<SyncResult> {
+  const res = await adminFetch('/api/admin/ext-auth/sync-memberships', 'POST');
+  if (!res.ok) throw new Error(`Sync failed: ${res.status}`);
   return safeJson(res);
 }

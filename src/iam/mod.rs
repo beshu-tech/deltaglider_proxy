@@ -12,6 +12,7 @@
 //! - `keygen` — Cryptographic key generation
 //! - `index` — `IamIndex` for O(1) user lookup and `IamState` enum
 
+pub mod external_auth;
 pub mod keygen;
 pub mod middleware;
 pub mod permissions;
@@ -200,6 +201,7 @@ mod tests {
                 created_at: String::new(),
                 permissions: vec![],
                 group_ids: vec![],
+                auth_source: "local".into(),
                 iam_policies: vec![],
             },
             IamUser {
@@ -211,6 +213,7 @@ mod tests {
                 created_at: String::new(),
                 permissions: vec![],
                 group_ids: vec![],
+                auth_source: "local".into(),
                 iam_policies: vec![],
             },
         ];
@@ -245,6 +248,7 @@ mod tests {
                 conditions: None,
             }],
             group_ids: vec![10],
+            auth_source: "local".into(),
             iam_policies: vec![],
         }];
         let groups = vec![Group {
@@ -291,6 +295,7 @@ mod tests {
                 conditions: None,
             }],
             group_ids: vec![10],
+            auth_source: "local".into(),
             iam_policies: vec![],
         }];
         let groups = vec![Group {
@@ -331,6 +336,7 @@ mod tests {
             created_at: String::new(),
             permissions: vec![],
             group_ids: vec![10, 20],
+            auth_source: "local".into(),
             iam_policies: vec![],
         }];
         let groups = vec![
@@ -395,6 +401,7 @@ mod tests {
             created_at: String::new(),
             permissions: vec![],
             group_ids: vec![],
+            auth_source: "local".into(),
             iam_policies: vec![],
         }];
         let state = IamIndex::build_iam_state(users, vec![]);
