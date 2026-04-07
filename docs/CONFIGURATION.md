@@ -345,7 +345,30 @@ secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 
 ## Authentication
 
-Controls how S3 clients authenticate with the proxy. When both `access_key_id` and `secret_access_key` are set, all requests must be SigV4-signed. When unset, the proxy runs in open access mode.
+Controls how S3 clients authenticate with the proxy. The proxy **refuses to start** without credentials unless you explicitly set `authentication = "none"`.
+
+### `authentication`
+
+Explicit authentication mode selector. When omitted, the proxy infers the mode from credentials. When no credentials are configured, the proxy requires this field to be set to `"none"` — otherwise it exits with an error.
+
+| | |
+|---|---|
+| **Env var** | `DGP_AUTHENTICATION` |
+| **TOML** | `authentication` |
+| **Default** | None (auto-detect from credentials; exits if no credentials) |
+| **Hot-reload** | No (restart required) |
+
+| Value | Meaning |
+|-------|---------|
+| `"none"` | Open access — no SigV4 verification (development only) |
+| *(omitted)* | Auto-detect: credentials present → bootstrap/IAM; credentials absent → fatal error |
+
+```toml
+# Development only:
+authentication = "none"
+```
+
+Future values: `"oidc"`, `"ldap"`, `"saml"`, or combinations.
 
 ### `access_key_id` / `secret_access_key`
 
@@ -355,7 +378,7 @@ Proxy-level SigV4 credentials. This is the single credential pair used in bootst
 |---|---|
 | **Env var** | `DGP_ACCESS_KEY_ID` / `DGP_SECRET_ACCESS_KEY` |
 | **TOML** | `access_key_id` / `secret_access_key` |
-| **Default** | None (open access) |
+| **Default** | None (proxy refuses to start without `authentication = "none"`) |
 | **Hot-reload** | Yes |
 
 ```toml

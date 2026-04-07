@@ -72,9 +72,19 @@ pub fn permission_to_iam_policy(perm: &Permission) -> IAMPolicy {
             }
             Err(e) => {
                 tracing::warn!("Failed to parse conditions: {} — input: {}", e, cond_json);
-                // Fail closed: skip this statement entirely rather than creating
-                // a condition-less policy (which would be broader than intended)
-                return IAMPolicy::new();
+                if perm.effect.eq_ignore_ascii_case("Deny") {
+                    // For Deny rules: fail safe by applying the Deny WITHOUT conditions.
+                    // A Deny with unparseable conditions should still deny (broadest deny).
+                    // Dropping it would silently allow access the admin intended to block.
+                    tracing::warn!(
+                        "  Applying Deny rule WITHOUT conditions (fail-safe for Deny rules)"
+                    );
+                    // Fall through — stmt is already built without conditions
+                } else {
+                    // For Allow rules: fail closed by skipping the statement entirely.
+                    // An Allow with unparseable conditions should NOT grant access.
+                    return IAMPolicy::new();
+                }
             }
         }
     }

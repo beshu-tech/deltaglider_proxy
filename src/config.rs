@@ -118,6 +118,13 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     // ── Authentication ──────────────────────────────────────
     EnvVarEntry {
+        name: "DGP_AUTHENTICATION",
+        description:
+            "Auth mode: omit to auto-detect (requires credentials), or \"none\" for open access",
+        example: "none",
+        category: "Authentication",
+    },
+    EnvVarEntry {
         name: "DGP_ACCESS_KEY_ID",
         description: "Proxy access key (enables SigV4 auth when both set)",
         example: "my-access-key",
@@ -282,9 +289,22 @@ pub struct Config {
     #[serde(default = "default_metadata_cache_mb")]
     pub metadata_cache_mb: usize,
 
+    /// Explicit authentication mode selector.
+    ///
+    /// Accepted values:
+    ///   - `"none"` — Open access, no SigV4 verification. Must be explicit.
+    ///
+    /// When absent, the proxy infers the mode from credentials:
+    ///   - Credentials present → bootstrap or IAM mode (auto-detected)
+    ///   - Credentials absent → **FATAL error** (proxy refuses to start)
+    ///
+    /// Future values: `"oidc"`, `"ldap"`, `"saml"`, or combinations.
+    #[serde(default)]
+    pub authentication: Option<String>,
+
     /// Proxy access key ID for SigV4 authentication.
     /// When both access_key_id and secret_access_key are set, all requests
-    /// must be SigV4-signed with these credentials. When unset, open access.
+    /// must be SigV4-signed with these credentials.
     #[serde(default)]
     pub access_key_id: Option<String>,
 
@@ -451,6 +471,7 @@ impl Default for Config {
             max_object_size: default_max_object_size(),
             cache_size_mb: default_cache_size_mb(),
             metadata_cache_mb: default_metadata_cache_mb(),
+            authentication: None,
             access_key_id: None,
             secret_access_key: None,
             bootstrap_password_hash: None,
@@ -538,6 +559,11 @@ impl Config {
         }
         if let Some(v) = env_parse::<usize>("DGP_BLOCKING_THREADS") {
             self.blocking_threads = Some(v);
+        }
+
+        // Authentication mode
+        if let Ok(v) = std::env::var("DGP_AUTHENTICATION") {
+            self.authentication = Some(v);
         }
 
         // Proxy authentication credentials
@@ -975,6 +1001,7 @@ mod tests {
             "DGP_METADATA_CACHE_MB",
             "DGP_CODEC_CONCURRENCY",
             "DGP_BLOCKING_THREADS",
+            "DGP_AUTHENTICATION",
             "DGP_ACCESS_KEY_ID",
             "DGP_SECRET_ACCESS_KEY",
             "DGP_BOOTSTRAP_PASSWORD_HASH",

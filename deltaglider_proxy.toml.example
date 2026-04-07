@@ -39,14 +39,19 @@ metadata_cache_mb = 50
 # [buckets.images]
 # compression = false              # Already-compressed content, skip delta encoding
 
-# S3 Authentication (bootstrap mode)
-# -----------------------------------
-# Initial S3 credentials used before IAM users are created.
-# When both are set, all S3 requests must be SigV4-signed.
-# When unset, open access.
+# S3 Authentication
+# -----------------
+# The proxy REQUIRES authentication configuration. It refuses to start
+# without S3 credentials unless you explicitly opt out.
 #
+# Set both to enable SigV4 auth (recommended):
 # access_key_id = "myaccesskey"
 # secret_access_key = "mysecretkey"
+#
+# To run without authentication (local development only — NEVER in production):
+# authentication = "none"
+#
+# Future: authentication = "oidc" | "ldap" | "saml"
 
 # Bootstrap Password
 # ------------------
@@ -150,6 +155,7 @@ path = "./data"
 #   DGP_LISTEN_ADDR           - Listen address (e.g. "0.0.0.0:9000")
 #
 # Proxy authentication (client-to-proxy):
+#   DGP_AUTHENTICATION        - Auth mode: "none" for open access (default: requires credentials)
 #   DGP_ACCESS_KEY_ID         - Proxy access key
 #   DGP_SECRET_ACCESS_KEY     - Proxy secret key
 #

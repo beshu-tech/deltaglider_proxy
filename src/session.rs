@@ -42,10 +42,22 @@ impl Drop for S3SessionCredentials {
     }
 }
 
+/// How the admin session was created (for audit logging and UI display).
+#[derive(Debug, Clone)]
+pub enum AuthMethod {
+    /// Bootstrap password login.
+    Bootstrap,
+    /// IAM user login via access key + secret.
+    IamLoginAs { access_key_id: String },
+    /// External provider login (OAuth/OIDC).
+    External { provider_name: String, user_id: i64 },
+}
+
 struct SessionInfo {
     created_at: Instant,
     ip: Option<IpAddr>,
     s3_creds: Option<S3SessionCredentials>,
+    auth_method: AuthMethod,
 }
 
 /// Thread-safe in-memory session store.
@@ -76,7 +88,7 @@ impl SessionStore {
     /// Create a new session and return the token (64-char hex string).
     /// Stores the client IP for later validation.
     /// If the maximum number of concurrent sessions is reached, the oldest session is evicted.
-    pub fn create_session(&self, ip: Option<IpAddr>) -> String {
+    pub fn create_session(&self, ip: Option<IpAddr>, auth_method: AuthMethod) -> String {
         let mut bytes = [0u8; 32];
         OsRng.fill(&mut bytes);
         let token = hex::encode(bytes);
@@ -106,6 +118,7 @@ impl SessionStore {
                 created_at: Instant::now(),
                 ip,
                 s3_creds: None,
+                auth_method,
             },
         );
 
@@ -172,6 +185,12 @@ impl SessionStore {
         })
     }
 
+    /// Get the auth method for a session.
+    pub fn auth_method(&self, token: &str) -> Option<AuthMethod> {
+        let sessions = self.sessions.read();
+        sessions.get(token).map(|info| info.auth_method.clone())
+    }
+
     /// Clear S3 credentials from a session.
     pub fn clear_s3_creds(&self, token: &str) {
         let mut sessions = self.sessions.write();
@@ -196,7 +215,7 @@ mod tests {
     #[test]
     fn test_create_and_validate() {
         let store = SessionStore::new();
-        let token = store.create_session(None);
+        let token = store.create_session(None, AuthMethod::Bootstrap);
         assert_eq!(token.len(), 64);
         assert!(store.validate(&token, None));
     }
@@ -210,7 +229,7 @@ mod tests {
     #[test]
     fn test_remove() {
         let store = SessionStore::new();
-        let token = store.create_session(None);
+        let token = store.create_session(None, AuthMethod::Bootstrap);
         assert!(store.validate(&token, None));
         store.remove(&token);
         assert!(!store.validate(&token, None));
@@ -222,7 +241,7 @@ mod tests {
         let ip1: IpAddr = "10.0.0.1".parse().unwrap();
         let ip2: IpAddr = "10.0.0.2".parse().unwrap();
 
-        let token = store.create_session(Some(ip1));
+        let token = store.create_session(Some(ip1), AuthMethod::Bootstrap);
 
         // Same IP works
         assert!(store.validate(&token, Some(ip1)));
@@ -237,7 +256,7 @@ mod tests {
         let store = SessionStore::new();
         let mut tokens = Vec::new();
         for _ in 0..MAX_SESSIONS {
-            tokens.push(store.create_session(None));
+            tokens.push(store.create_session(None, AuthMethod::Bootstrap));
         }
 
         // All sessions valid
@@ -246,9 +265,66 @@ mod tests {
         }
 
         // Add one more — oldest should be evicted
-        let new_token = store.create_session(None);
+        let new_token = store.create_session(None, AuthMethod::Bootstrap);
         assert!(store.validate(&new_token, None));
         assert!(!store.validate(&tokens[0], None)); // oldest evicted
         assert_eq!(store.sessions.read().len(), MAX_SESSIONS);
+    }
+
+    // ── AuthMethod tests ──
+
+    #[test]
+    fn test_auth_method_bootstrap() {
+        let store = SessionStore::new();
+        let token = store.create_session(None, AuthMethod::Bootstrap);
+        let method = store.auth_method(&token);
+        assert!(matches!(method, Some(AuthMethod::Bootstrap)));
+    }
+
+    #[test]
+    fn test_auth_method_iam_login_as() {
+        let store = SessionStore::new();
+        let token = store.create_session(
+            None,
+            AuthMethod::IamLoginAs {
+                access_key_id: "AKTEST01".into(),
+            },
+        );
+        let method = store.auth_method(&token).unwrap();
+        match method {
+            AuthMethod::IamLoginAs { access_key_id } => {
+                assert_eq!(access_key_id, "AKTEST01");
+            }
+            _ => panic!("Expected IamLoginAs"),
+        }
+    }
+
+    #[test]
+    fn test_auth_method_external() {
+        let store = SessionStore::new();
+        let token = store.create_session(
+            None,
+            AuthMethod::External {
+                provider_name: "google".into(),
+                user_id: 42,
+            },
+        );
+        let method = store.auth_method(&token).unwrap();
+        match method {
+            AuthMethod::External {
+                provider_name,
+                user_id,
+            } => {
+                assert_eq!(provider_name, "google");
+                assert_eq!(user_id, 42);
+            }
+            _ => panic!("Expected External"),
+        }
+    }
+
+    #[test]
+    fn test_auth_method_none_for_invalid_token() {
+        let store = SessionStore::new();
+        assert!(store.auth_method("nonexistent").is_none());
     }
 }

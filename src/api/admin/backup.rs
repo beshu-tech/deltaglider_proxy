@@ -6,17 +6,27 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+use crate::config_db::auth_providers::{AuthProviderConfig, ExternalIdentity, GroupMappingRule};
 use crate::iam::{normalize_permissions, validate_permissions, Permission};
 
 use super::users::rebuild_iam_index;
 use super::{audit_log, trigger_config_sync, AdminState};
 
-/// Full IAM backup: users (with credentials) + groups + memberships.
+/// Full IAM backup: users (with credentials) + groups + memberships + external auth.
 #[derive(Serialize, Deserialize)]
 pub struct IamBackup {
     pub version: u32,
     pub users: Vec<BackupUser>,
     pub groups: Vec<BackupGroup>,
+    /// External auth providers (v2+, optional for backward compat).
+    #[serde(default)]
+    pub auth_providers: Vec<AuthProviderConfig>,
+    /// Group mapping rules (v2+, optional for backward compat).
+    #[serde(default)]
+    pub mapping_rules: Vec<GroupMappingRule>,
+    /// External identities (v2+, optional for backward compat).
+    #[serde(default)]
+    pub external_identities: Vec<ExternalIdentity>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -56,8 +66,12 @@ pub async fn export_backup(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    let auth_providers = db.load_auth_providers().unwrap_or_default();
+    let mapping_rules = db.load_group_mapping_rules().unwrap_or_default();
+    let external_identities = db.list_external_identities().unwrap_or_default();
+
     let backup = IamBackup {
-        version: 1,
+        version: 2,
         users: users
             .into_iter()
             .map(|u| BackupUser {
@@ -79,6 +93,9 @@ pub async fn export_backup(
                 member_ids: g.member_ids,
             })
             .collect(),
+        auth_providers,
+        mapping_rules,
+        external_identities,
     };
 
     Ok(Json(backup))
@@ -220,6 +237,74 @@ pub async fn import_backup(
         }
     }
 
+    // Import auth providers (v2+), with ID remapping for mapping rules
+    let mut provider_id_map: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    let existing_providers = db.load_auth_providers().unwrap_or_default();
+    let existing_provider_names: std::collections::HashSet<String> =
+        existing_providers.iter().map(|p| p.name.clone()).collect();
+
+    for bp in &backup.auth_providers {
+        if existing_provider_names.contains(&bp.name) {
+            // Map old ID to existing provider's ID
+            if let Some(existing) = existing_providers.iter().find(|p| p.name == bp.name) {
+                provider_id_map.insert(bp.id, existing.id);
+            }
+            continue;
+        }
+        let req = crate::config_db::auth_providers::CreateAuthProviderRequest {
+            name: bp.name.clone(),
+            provider_type: bp.provider_type.clone(),
+            enabled: bp.enabled,
+            priority: bp.priority,
+            display_name: bp.display_name.clone(),
+            client_id: bp.client_id.clone(),
+            client_secret: bp.client_secret.clone(),
+            issuer_url: bp.issuer_url.clone(),
+            scopes: bp.scopes.clone(),
+            extra_config: bp.extra_config.clone(),
+        };
+        match db.create_auth_provider(&req) {
+            Ok(created) => {
+                provider_id_map.insert(bp.id, created.id);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to import auth provider '{}': {}", bp.name, e);
+            }
+        }
+    }
+
+    // Import group mapping rules (v2+), remapping provider_id and group_id
+    for rule in &backup.mapping_rules {
+        let new_provider_id = rule
+            .provider_id
+            .and_then(|old_id| provider_id_map.get(&old_id).copied());
+        let new_group_id = match group_id_map.get(&rule.group_id) {
+            Some(&gid) => gid,
+            None => {
+                tracing::warn!(
+                    "Skipping mapping rule: group_id {} not found in backup",
+                    rule.group_id
+                );
+                continue;
+            }
+        };
+        let req = crate::config_db::auth_providers::CreateMappingRuleRequest {
+            provider_id: new_provider_id,
+            priority: rule.priority,
+            match_type: rule.match_type.clone(),
+            match_field: rule.match_field.clone(),
+            match_value: rule.match_value.clone(),
+            group_id: new_group_id,
+        };
+        if let Err(e) = db.create_group_mapping_rule(&req) {
+            tracing::warn!("Failed to import mapping rule: {}", e);
+        }
+    }
+
+    // Note: external_identities are NOT imported — they reference user IDs that
+    // may differ between systems, and the identity links are re-created on the
+    // next OAuth login. Importing them would create dangling references.
+
     // Rebuild IAM index
     rebuild_iam_index(&db, &state.iam_state)?;
     trigger_config_sync(&state);
@@ -244,4 +329,98 @@ pub struct ImportResult {
     pub groups_created: u32,
     pub groups_skipped: u32,
     pub memberships_created: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_v1_backup_deserializes_without_external_fields() {
+        // v1 backups have no auth_providers/mapping_rules/external_identities
+        let json = r#"{
+            "version": 1,
+            "users": [],
+            "groups": []
+        }"#;
+        let backup: IamBackup = serde_json::from_str(json).unwrap();
+        assert_eq!(backup.version, 1);
+        assert!(backup.auth_providers.is_empty());
+        assert!(backup.mapping_rules.is_empty());
+        assert!(backup.external_identities.is_empty());
+    }
+
+    #[test]
+    fn test_v2_backup_roundtrip() {
+        let backup = IamBackup {
+            version: 2,
+            users: vec![BackupUser {
+                name: "alice".into(),
+                access_key_id: "AK1".into(),
+                secret_access_key: "SK1".into(),
+                enabled: true,
+                permissions: vec![],
+                group_ids: vec![1],
+            }],
+            groups: vec![BackupGroup {
+                id: 1,
+                name: "devs".into(),
+                description: "Dev team".into(),
+                permissions: vec![],
+                member_ids: vec![],
+            }],
+            auth_providers: vec![AuthProviderConfig {
+                id: 1,
+                name: "google".into(),
+                provider_type: "oidc".into(),
+                enabled: true,
+                priority: 10,
+                display_name: Some("Google".into()),
+                client_id: Some("cid".into()),
+                client_secret: Some("****".into()),
+                issuer_url: Some("https://accounts.google.com".into()),
+                scopes: "openid email".into(),
+                extra_config: None,
+                created_at: "2024-01-01".into(),
+                updated_at: "2024-01-01".into(),
+            }],
+            mapping_rules: vec![GroupMappingRule {
+                id: 1,
+                provider_id: Some(1),
+                priority: 0,
+                match_type: "email_domain".into(),
+                match_field: "email".into(),
+                match_value: "company.com".into(),
+                group_id: 1,
+                created_at: "2024-01-01".into(),
+            }],
+            external_identities: vec![ExternalIdentity {
+                id: 1,
+                user_id: 1,
+                provider_id: 1,
+                external_sub: "google-123".into(),
+                email: Some("alice@company.com".into()),
+                display_name: Some("Alice".into()),
+                last_login: None,
+                raw_claims: Some(serde_json::json!({"sub": "google-123"})),
+                created_at: "2024-01-01".into(),
+            }],
+        };
+
+        let json = serde_json::to_string(&backup).unwrap();
+        let restored: IamBackup = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.version, 2);
+        assert_eq!(restored.users.len(), 1);
+        assert_eq!(restored.groups.len(), 1);
+        assert_eq!(restored.auth_providers.len(), 1);
+        assert_eq!(restored.auth_providers[0].name, "google");
+        assert_eq!(restored.mapping_rules.len(), 1);
+        assert_eq!(restored.mapping_rules[0].match_value, "company.com");
+        assert_eq!(restored.external_identities.len(), 1);
+        assert_eq!(
+            restored.external_identities[0].email.as_deref(),
+            Some("alice@company.com")
+        );
+    }
 }

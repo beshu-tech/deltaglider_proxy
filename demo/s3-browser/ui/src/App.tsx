@@ -102,22 +102,24 @@ export default function App() {
   const [previewObject, setPreviewObject] = useState<import('./types').S3Object | null>(null);
   const [identity, setIdentity] = useState<WhoamiResponse | null>(null);
 
-    // Restore credentials from server-side session on mount
+  const [hasAdminSession, setHasAdminSession] = useState(false);
+
+    // Restore credentials from server-side session on mount.
+  // Also check for admin session (OAuth sets a session cookie even if S3 creds
+  // don't have permissions — the user IS authenticated, just may lack S3 access).
   useEffect(() => {
-    initFromSession().then((restored) => {
-      setNeedsConnect(!restored);
+    Promise.all([initFromSession(), checkSession()]).then(([restored, hasSession]) => {
+      setHasAdminSession(hasSession);
+      // If S3 creds restored OR we have an admin session (OAuth), don't show ConnectPage
+      setNeedsConnect(!restored && !hasSession);
       setSessionLoading(false);
     });
   }, []);
 
-  const [hasAdminSession, setHasAdminSession] = useState(false);
-
-  // Check identity after S3 connection is established
+  // Check identity after connection is established
   useEffect(() => {
     if (!needsConnect) {
       whoami().then(setIdentity);
-      // In IAM mode, check if user has an admin session (login-as only succeeds for admins)
-      checkSession().then(setHasAdminSession);
     } else {
       setIdentity(null);
       setHasAdminSession(false);
@@ -155,15 +157,17 @@ export default function App() {
     mainRef.current?.focus();
   }, [view]);
 
-  // One-time stale-credential check after first load
+  // One-time stale-credential check after first load.
+  // If we have a valid admin session (e.g. from OAuth), don't bounce to ConnectPage
+  // even if S3 calls fail — the user is authenticated but may lack S3 permissions.
   useEffect(() => {
     if (!s3.loading && !firstLoadDone) {
       setFirstLoadDone(true);
-      if (!s3.connected) {
+      if (!s3.connected && !hasAdminSession) {
         setNeedsConnect(true);
       }
     }
-  }, [s3.loading, s3.connected, firstLoadDone]);
+  }, [s3.loading, s3.connected, firstLoadDone, hasAdminSession]);
 
   const handleLogout = () => {
     // Clear S3 credentials

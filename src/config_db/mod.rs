@@ -18,8 +18,9 @@ pub struct ConfigDb {
 }
 
 /// Schema version — bump when adding migrations.
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
 
+pub(crate) mod auth_providers;
 mod groups;
 mod users;
 
@@ -173,6 +174,59 @@ impl ConfigDb {
             );
         }
 
+        if version < 5 {
+            conn.execute_batch(
+                "ALTER TABLE users ADD COLUMN auth_source TEXT NOT NULL DEFAULT 'local';
+
+                CREATE TABLE IF NOT EXISTS auth_providers (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name          TEXT NOT NULL UNIQUE,
+                    provider_type TEXT NOT NULL,
+                    enabled       INTEGER NOT NULL DEFAULT 1,
+                    priority      INTEGER NOT NULL DEFAULT 0,
+                    display_name  TEXT,
+                    client_id     TEXT,
+                    client_secret TEXT,
+                    issuer_url    TEXT,
+                    scopes        TEXT DEFAULT 'openid email profile',
+                    extra_config  TEXT,
+                    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                CREATE TABLE IF NOT EXISTS group_mapping_rules (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    provider_id  INTEGER REFERENCES auth_providers(id) ON DELETE CASCADE,
+                    priority     INTEGER NOT NULL DEFAULT 0,
+                    match_type   TEXT NOT NULL,
+                    match_field  TEXT NOT NULL DEFAULT 'email',
+                    match_value  TEXT NOT NULL,
+                    group_id     INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+                    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_group_mapping_provider ON group_mapping_rules(provider_id);
+
+                CREATE TABLE IF NOT EXISTS external_identities (
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    provider_id    INTEGER NOT NULL REFERENCES auth_providers(id) ON DELETE CASCADE,
+                    external_sub   TEXT NOT NULL,
+                    email          TEXT,
+                    display_name   TEXT,
+                    last_login     TEXT,
+                    raw_claims     TEXT,
+                    created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(provider_id, external_sub)
+                );
+                CREATE INDEX IF NOT EXISTS idx_ext_identity_user ON external_identities(user_id);
+                CREATE INDEX IF NOT EXISTS idx_ext_identity_lookup ON external_identities(provider_id, external_sub);",
+            )?;
+            info!(
+                "Migrated config DB schema from v{} to v5 (added external auth tables)",
+                version
+            );
+        }
+
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         debug!("Config DB schema at version {}", SCHEMA_VERSION);
         Ok(())
@@ -189,6 +243,9 @@ impl ConfigDb {
             secret_access_key: row.get(3)?,
             enabled: row.get::<_, i32>(4)? != 0,
             created_at: row.get(5)?,
+            auth_source: row
+                .get::<_, String>(6)
+                .unwrap_or_else(|_| "local".to_string()),
             permissions: Vec::new(),
             group_ids: Vec::new(),
             iam_policies: Vec::new(),

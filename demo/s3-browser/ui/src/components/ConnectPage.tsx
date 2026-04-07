@@ -1,8 +1,9 @@
 import { useState, useEffect } from 'react';
 import { Button, Input, Typography, Space, Alert, Spin, message } from 'antd';
-import { ApiOutlined, WarningOutlined, CheckCircleOutlined, CopyOutlined } from '@ant-design/icons';
+import { ApiOutlined, WarningOutlined, CheckCircleOutlined, CopyOutlined, SafetyOutlined } from '@ant-design/icons';
 import { testConnection, setEndpoint, setCredentials, setBucket, initFromSession } from '../s3client';
 import { adminLogin, loginAs, whoami, recoverDb } from '../adminApi';
+import type { ExternalProviderInfo } from '../adminApi';
 import { detectDefaultEndpoint } from '../utils';
 import { useColors } from '../ThemeContext';
 
@@ -21,6 +22,8 @@ export default function ConnectPage({ onConnect, showError }: Props) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [authMode, setAuthMode] = useState<'bootstrap' | 'iam' | 'open' | null>(null);
+  const [externalProviders, setExternalProviders] = useState<ExternalProviderInfo[]>([]);
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const [detecting, setDetecting] = useState(true);
   // Recovery wizard state — persist success in sessionStorage so refresh doesn't reset
   const [showRecovery, setShowRecovery] = useState(false);
@@ -35,17 +38,33 @@ export default function ConnectPage({ onConnect, showError }: Props) {
   });
   const [messageApi, contextHolder] = message.useMessage();
 
-  // Detect auth mode on mount — show recovery wizard immediately if mismatch
+  // Detect auth mode on mount — auto-connect in open mode, show recovery wizard if mismatch
   useEffect(() => {
     whoami()
-      .then(info => {
+      .then(async (info) => {
         setAuthMode(info.mode as 'bootstrap' | 'iam' | 'open');
+        setExternalProviders(info.external_providers || []);
         if (info.config_db_mismatch) {
           setShowRecovery(true);
+          setDetecting(false);
+          return;
         }
+        // In open access mode, auto-connect with the proxy's own endpoint (no credentials needed)
+        if (info.mode === 'open') {
+          const endpoint = detectDefaultEndpoint().replace(/\/+$/, '');
+          setEndpoint(endpoint);
+          setCredentials('anonymous', 'anonymous');
+          const result = await testConnection(endpoint, 'anonymous', 'anonymous').catch(() => ({ ok: false } as const));
+          if (result.ok && 'buckets' in result && result.buckets && result.buckets.length > 0) {
+            setBucket(result.buckets[0]);
+          }
+          onConnect();
+          return;
+        }
+        setDetecting(false);
       })
-      .catch(() => {})
-      .finally(() => setDetecting(false));
+      .catch(() => setDetecting(false));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const handleConnect = async () => {
@@ -299,7 +318,11 @@ export default function ConnectPage({ onConnect, showError }: Props) {
               Proxy
             </div>
             <Text style={{ color: TEXT_MUTED, fontSize: 13, display: 'block', marginTop: 12 }}>
-              {isBootstrap ? 'Enter the bootstrap password to sign in.' : 'Sign in with your S3 credentials.'}
+              {externalProviders.length > 0
+                ? 'Sign in to continue.'
+                : isBootstrap
+                  ? 'Enter the bootstrap password to sign in.'
+                  : 'Sign in with your S3 credentials.'}
             </Text>
           </div>
 
@@ -308,77 +331,128 @@ export default function ConnectPage({ onConnect, showError }: Props) {
           )}
           {error && <Alert type="error" message={error} showIcon />}
 
-          {isBootstrap ? (
-            /* Bootstrap mode: password only */
+          {/* OAuth provider buttons — shown prominently when available */}
+          {externalProviders.length > 0 && (
             <div>
-              <label style={{ fontSize: 12, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)", marginBottom: 4, display: 'block' }}>
-                Bootstrap Password
-              </label>
-              <Input.Password
-                value={adminPassword}
-                onChange={(e) => setAdminPassword(e.target.value)}
-                onPressEnter={handleConnect}
-                placeholder="Bootstrap password"
-                size="large"
-                autoFocus
-                style={inputStyle}
-              />
-              <Text style={{ color: TEXT_FAINT, fontSize: 11, marginTop: 4, display: 'block' }}>
-                The admin password configured at deployment
-              </Text>
+              {externalProviders.map(p => (
+                <a
+                  key={p.name}
+                  href={`/_/api/admin/oauth/authorize/${encodeURIComponent(p.name)}?next=${encodeURIComponent(window.location.pathname)}`}
+                  style={{
+                    display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10,
+                    width: '100%', padding: '12px 16px', marginBottom: 8,
+                    borderRadius: 10, border: `1px solid ${BORDER}`,
+                    background: 'var(--input-bg)', color: TEXT_PRIMARY,
+                    fontSize: 15, fontWeight: 600, fontFamily: 'var(--font-ui)',
+                    textDecoration: 'none', cursor: 'pointer',
+                    transition: 'border-color 0.15s, background 0.15s',
+                    height: 48,
+                  }}
+                  onMouseEnter={e => { (e.currentTarget as HTMLElement).style.borderColor = ACCENT_BLUE; }}
+                  onMouseLeave={e => { (e.currentTarget as HTMLElement).style.borderColor = BORDER; }}
+                >
+                  <SafetyOutlined style={{ fontSize: 18 }} />
+                  Sign in with {p.display_name}
+                </a>
+              ))}
             </div>
-          ) : (
-            /* IAM mode: access key + secret key */
-            <>
-              <div>
-                <label style={{ fontSize: 12, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)", marginBottom: 4, display: 'block' }}>
-                  Access Key ID
-                </label>
-                <Input
-                  value={accessKey}
-                  onChange={(e) => setAccessKey(e.target.value)}
-                  placeholder="Access Key ID"
-                  size="large"
-                  autoFocus
-                  style={inputStyle}
-                />
-              </div>
-
-              <div>
-                <label style={{ fontSize: 12, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)", marginBottom: 4, display: 'block' }}>
-                  Secret Access Key
-                </label>
-                <Input.Password
-                  value={secretKey}
-                  onChange={(e) => setSecretKey(e.target.value)}
-                  onPressEnter={handleConnect}
-                  placeholder="Secret Access Key"
-                  size="large"
-                  style={inputStyle}
-                />
-              </div>
-            </>
           )}
 
-          <Button
-            type="primary"
-            block
-            size="large"
-            loading={loading}
-            disabled={!canSubmit}
-            onClick={handleConnect}
-            style={{
-              height: 48,
-              borderRadius: 10,
-              fontWeight: 700,
-              fontFamily: "var(--font-ui)",
-              fontSize: 15,
-              letterSpacing: '0.02em',
-              marginTop: 4,
-            }}
-          >
-            {isBootstrap ? 'Sign In' : 'Connect'}
-          </Button>
+          {/* Credential form — collapsible when OAuth is available */}
+          {externalProviders.length > 0 && !showAdvanced ? (
+            <div style={{ textAlign: 'center' }}>
+              <Button
+                type="link"
+                size="small"
+                onClick={() => setShowAdvanced(true)}
+                style={{ color: TEXT_MUTED, fontSize: 12 }}
+              >
+                Sign in with credentials instead
+              </Button>
+            </div>
+          ) : (
+            <>
+              {externalProviders.length > 0 && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12, margin: '4px 0' }}>
+                  <div style={{ flex: 1, height: 1, background: BORDER }} />
+                  <Text style={{ color: TEXT_MUTED, fontSize: 11 }}>or use credentials</Text>
+                  <div style={{ flex: 1, height: 1, background: BORDER }} />
+                </div>
+              )}
+
+              {isBootstrap ? (
+                /* Bootstrap mode: password only */
+                <div>
+                  <label style={{ fontSize: 12, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)", marginBottom: 4, display: 'block' }}>
+                    Bootstrap Password
+                  </label>
+                  <Input.Password
+                    value={adminPassword}
+                    onChange={(e) => setAdminPassword(e.target.value)}
+                    onPressEnter={handleConnect}
+                    placeholder="Bootstrap password"
+                    size="large"
+                    autoFocus={externalProviders.length === 0}
+                    style={inputStyle}
+                  />
+                  <Text style={{ color: TEXT_FAINT, fontSize: 11, marginTop: 4, display: 'block' }}>
+                    The admin password configured at deployment
+                  </Text>
+                </div>
+              ) : (
+                /* IAM mode: access key + secret key */
+                <>
+                  <div>
+                    <label style={{ fontSize: 12, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)", marginBottom: 4, display: 'block' }}>
+                      Access Key ID
+                    </label>
+                    <Input
+                      value={accessKey}
+                      onChange={(e) => setAccessKey(e.target.value)}
+                      placeholder="Access Key ID"
+                      size="large"
+                      autoFocus={externalProviders.length === 0}
+                      style={inputStyle}
+                    />
+                  </div>
+
+                  <div>
+                    <label style={{ fontSize: 12, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)", marginBottom: 4, display: 'block' }}>
+                      Secret Access Key
+                    </label>
+                    <Input.Password
+                      value={secretKey}
+                      onChange={(e) => setSecretKey(e.target.value)}
+                      onPressEnter={handleConnect}
+                      placeholder="Secret Access Key"
+                      size="large"
+                      style={inputStyle}
+                    />
+                  </div>
+                </>
+              )}
+
+              <Button
+                type="primary"
+                block
+                size="large"
+                loading={loading}
+                disabled={!canSubmit}
+                onClick={handleConnect}
+                style={{
+                  height: 48,
+                  borderRadius: 10,
+                  fontWeight: 700,
+                  fontFamily: "var(--font-ui)",
+                  fontSize: 15,
+                  letterSpacing: '0.02em',
+                  marginTop: 4,
+                }}
+              >
+                {isBootstrap ? 'Sign In' : 'Connect'}
+              </Button>
+            </>
+          )}
         </Space>
       </div>
     </div>

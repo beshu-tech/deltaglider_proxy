@@ -29,9 +29,16 @@ pub struct IamUser {
     pub permissions: Vec<Permission>,
     #[serde(default)]
     pub group_ids: Vec<i64>,
+    /// How this user was created: "local" (manually) or "external" (auto-provisioned via OAuth).
+    #[serde(default = "default_local")]
+    pub auth_source: String,
     /// Precomputed IAM policies from permissions (built at index time, not serialized).
     #[serde(skip)]
     pub iam_policies: Vec<IAMPolicy>,
+}
+
+fn default_local() -> String {
+    "local".to_string()
 }
 
 /// An IAM group with permissions and member user IDs.

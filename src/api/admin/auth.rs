@@ -13,7 +13,7 @@ use subtle::ConstantTimeEq;
 
 use crate::iam::IamState;
 use crate::rate_limiter;
-use crate::session::S3SessionCredentials;
+use crate::session::{AuthMethod, S3SessionCredentials};
 
 use super::{audit_log, AdminState};
 
@@ -41,6 +41,16 @@ pub struct WhoamiResponse {
     mode: String,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     config_db_mismatch: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    external_providers: Vec<ExternalProviderInfo>,
+}
+
+#[derive(Serialize)]
+pub struct ExternalProviderInfo {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub provider_type: String,
+    pub display_name: String,
 }
 
 #[derive(Deserialize)]
@@ -50,12 +60,20 @@ pub struct LoginAsRequest {
 }
 
 /// Whether session cookies should include the `Secure` flag (HTTPS-only).
-/// Controlled by `DGP_SECURE_COOKIES`. Defaults to `true` — set to `false`
-/// only for local development over plain HTTP.
+/// Controlled by `DGP_SECURE_COOKIES`. When not set, auto-detects based on TLS:
+/// TLS enabled → Secure=true; TLS disabled → Secure=false.
+/// Set explicitly to `"true"` to force Secure flag regardless of TLS.
 fn secure_cookies() -> bool {
-    std::env::var("DGP_SECURE_COOKIES")
-        .map(|v| v != "false" && v != "0")
-        .unwrap_or(true)
+    match std::env::var("DGP_SECURE_COOKIES") {
+        Ok(v) if v == "true" || v == "1" => true,
+        Ok(v) if v == "false" || v == "0" => false,
+        _ => {
+            // Auto-detect: check if TLS is enabled
+            std::env::var("DGP_TLS_ENABLED")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false)
+        }
+    }
 }
 
 /// Format a session cookie for setting a login token.
@@ -63,10 +81,39 @@ fn secure_cookies() -> bool {
 pub(super) fn session_cookie(token: &str, ttl: std::time::Duration) -> String {
     let max_age = ttl.as_secs();
     let secure = if secure_cookies() { "; Secure" } else { "" };
+    // Use SameSite=Lax (not Strict) to allow the cookie to be sent on top-level
+    // navigations — required for OAuth callback redirects from external IdPs.
+    // Lax still protects against CSRF on POST/PUT/DELETE requests.
     format!(
-        "dgp_session={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
+        "dgp_session={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}{}",
         token, max_age, secure
     )
+}
+
+/// Auto-populate S3 credentials in a session so "login IS connect".
+/// Reads the backend region from config and creates an S3SessionCredentials
+/// with the provided access key/secret pair.
+pub(super) async fn auto_populate_s3_creds(
+    state: &AdminState,
+    token: &str,
+    access_key_id: String,
+    secret_access_key: String,
+) {
+    let config = state.config.read().await;
+    let region = match &config.backend {
+        crate::config::BackendConfig::S3 { region, .. } => region.clone(),
+        _ => "us-east-1".to_string(),
+    };
+    state.sessions.set_s3_creds(
+        token,
+        S3SessionCredentials {
+            endpoint: String::new(),
+            region,
+            bucket: String::new(),
+            access_key_id,
+            secret_access_key,
+        },
+    );
 }
 
 /// Format a session cookie that clears the login token.
@@ -163,29 +210,22 @@ pub async fn login(
 
     // Successful login — reset rate limiter for this IP
     state.rate_limiter.record_success(&client_ip);
-    let token = state
-        .sessions
-        .create_session(rate_limiter::extract_client_ip(&req_headers));
+    let token = state.sessions.create_session(
+        rate_limiter::extract_client_ip(&req_headers),
+        AuthMethod::Bootstrap,
+    );
 
     // Auto-populate S3 credentials from config so "login IS connect".
     // The legacy access_key_id/secret_access_key are the proxy's own auth credentials.
     {
         let config = state.config.read().await;
-        if let (Some(ak), Some(sk)) = (&config.access_key_id, &config.secret_access_key) {
-            let region = match &config.backend {
-                crate::config::BackendConfig::S3 { region, .. } => region.clone(),
-                _ => "us-east-1".to_string(),
-            };
-            state.sessions.set_s3_creds(
-                &token,
-                S3SessionCredentials {
-                    endpoint: String::new(),
-                    region,
-                    bucket: String::new(),
-                    access_key_id: ak.clone(),
-                    secret_access_key: sk.clone(),
-                },
-            );
+        let creds = config
+            .access_key_id
+            .clone()
+            .zip(config.secret_access_key.clone());
+        drop(config);
+        if let Some((ak, sk)) = creds {
+            auto_populate_s3_creds(&state, &token, ak, sk).await;
         }
     }
 
@@ -243,9 +283,35 @@ pub async fn whoami(
         IamState::Legacy(_) => "bootstrap",
         IamState::Iam(_) => "iam",
     };
+
+    // Include enabled external auth providers so the login page can show OAuth buttons.
+    let external_providers = if let Some(ref ext_auth) = state.external_auth {
+        if let Some(ref config_db) = state.config_db {
+            let db = config_db.lock().await;
+            db.load_auth_providers()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|p| p.enabled)
+                .map(|p| ExternalProviderInfo {
+                    name: p.name,
+                    provider_type: p.provider_type,
+                    display_name: p
+                        .display_name
+                        .unwrap_or_else(|| "External Login".to_string()),
+                })
+                .collect()
+        } else {
+            let _ = ext_auth; // suppress unused warning
+            vec![]
+        }
+    } else {
+        vec![]
+    };
+
     Json(WhoamiResponse {
         mode: mode.into(),
         config_db_mismatch: state.config_db_mismatch,
+        external_providers,
     })
 }
 
@@ -322,28 +388,21 @@ pub async fn login_as(
     // Successful login — reset rate limiter
     state.rate_limiter.record_success(&client_ip);
 
-    let token = state
-        .sessions
-        .create_session(rate_limiter::extract_client_ip(&req_headers));
+    let token = state.sessions.create_session(
+        rate_limiter::extract_client_ip(&req_headers),
+        AuthMethod::IamLoginAs {
+            access_key_id: body.access_key_id.clone(),
+        },
+    );
 
     // Auto-populate S3 credentials from the IAM login so "login IS connect"
-    {
-        let config = state.config.read().await;
-        let region = match &config.backend {
-            crate::config::BackendConfig::S3 { region, .. } => region.clone(),
-            _ => "us-east-1".to_string(),
-        };
-        state.sessions.set_s3_creds(
-            &token,
-            S3SessionCredentials {
-                endpoint: String::new(),
-                region,
-                bucket: String::new(),
-                access_key_id: body.access_key_id.clone(),
-                secret_access_key: body.secret_access_key.clone(),
-            },
-        );
-    }
+    auto_populate_s3_creds(
+        &state,
+        &token,
+        body.access_key_id.clone(),
+        body.secret_access_key.clone(),
+    )
+    .await;
 
     tracing::info!(
         "Admin session created via login-as for '{}' ({})",

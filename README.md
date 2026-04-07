@@ -127,7 +127,7 @@ Not implemented: versioning, lifecycle policies, object lock.
 
 ```
 S3 request
-  → SigV4 auth (optional, bootstrap or per-user IAM)
+  → SigV4 auth (required — bootstrap or per-user IAM)
   → FileRouter (delta-eligible vs passthrough)
   → DeltaGlider engine (compress / reconstruct / cache)
   → StorageBackend trait (filesystem or S3)

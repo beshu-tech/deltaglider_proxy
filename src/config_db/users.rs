@@ -9,7 +9,7 @@ impl ConfigDb {
     /// Load all users with their permissions.
     pub fn load_users(&self) -> Result<Vec<IamUser>, ConfigDbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, access_key_id, secret_access_key, enabled, created_at FROM users",
+            "SELECT id, name, access_key_id, secret_access_key, enabled, created_at, auth_source FROM users",
         )?;
 
         let users: Vec<IamUser> = stmt
@@ -130,9 +130,9 @@ impl ConfigDb {
         }
     }
 
-    fn get_user_by_id(&self, user_id: i64) -> Result<IamUser, ConfigDbError> {
+    pub(crate) fn get_user_by_id(&self, user_id: i64) -> Result<IamUser, ConfigDbError> {
         let mut user = self.conn.query_row(
-            "SELECT id, name, access_key_id, secret_access_key, enabled, created_at FROM users WHERE id = ?1",
+            "SELECT id, name, access_key_id, secret_access_key, enabled, created_at, auth_source FROM users WHERE id = ?1",
             params![user_id],
             Self::user_from_row,
         )?;

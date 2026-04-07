@@ -6,7 +6,7 @@ A step-by-step guide to taking your proxy from open access to production-ready s
 
 ## Before You Start
 
-A fresh DeltaGlider Proxy installation runs in **open access mode** — no authentication required. This is fine for local development, but **never acceptable in production**. This guide walks you through each security layer.
+A fresh DeltaGlider Proxy installation **refuses to start** without authentication credentials. To run in open access mode for local development, you must explicitly set `authentication = "none"` in the config or `DGP_AUTHENTICATION=none` as an environment variable. This is never acceptable in production. This guide walks you through each security layer.
 
 ```mermaid
 graph LR

@@ -86,6 +86,42 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         // Usage scanner
         .route("/_/api/admin/usage/scan", post(admin::scan_usage))
         .route("/_/api/admin/usage", get(admin::get_usage))
+        // External auth provider management
+        .route(
+            "/_/api/admin/ext-auth/providers",
+            get(admin::external_auth::list_providers).post(admin::external_auth::create_provider),
+        )
+        .route(
+            "/_/api/admin/ext-auth/providers/:id",
+            put(admin::external_auth::update_provider)
+                .delete(admin::external_auth::delete_provider),
+        )
+        .route(
+            "/_/api/admin/ext-auth/providers/:id/test",
+            post(admin::external_auth::test_provider),
+        )
+        // Group mapping rules
+        .route(
+            "/_/api/admin/ext-auth/mappings",
+            get(admin::external_auth::list_mappings).post(admin::external_auth::create_mapping),
+        )
+        .route(
+            "/_/api/admin/ext-auth/mappings/:id",
+            put(admin::external_auth::update_mapping).delete(admin::external_auth::delete_mapping),
+        )
+        .route(
+            "/_/api/admin/ext-auth/mappings/preview",
+            post(admin::external_auth::preview_mapping),
+        )
+        // External identities
+        .route(
+            "/_/api/admin/ext-auth/identities",
+            get(admin::external_auth::list_identities),
+        )
+        .route(
+            "/_/api/admin/ext-auth/sync-memberships",
+            post(admin::external_auth::sync_memberships),
+        )
         .layer(middleware::from_fn_with_state(
             admin_state.clone(),
             admin::require_session,
@@ -101,6 +137,15 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         .route("/_/api/admin/login-as", post(admin::login_as))
         .route("/_/api/admin/policies", get(admin::get_canned_policies))
         .route("/_/api/whoami", get(admin::whoami))
+        // OAuth flow (public — browser redirects back here)
+        .route(
+            "/_/api/admin/oauth/authorize/:provider",
+            get(admin::external_auth::oauth_authorize),
+        )
+        .route(
+            "/_/api/admin/oauth/callback",
+            get(admin::external_auth::oauth_callback),
+        )
         // Recovery endpoint is public — the bootstrap hash may be invalid,
         // making session login impossible. Rate-limited internally.
         .route("/_/api/admin/recover-db", post(admin::recover_db))

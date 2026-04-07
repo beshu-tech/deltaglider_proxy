@@ -263,12 +263,50 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         config_db_mismatch,
     );
 
+    // --- External auth (OAuth/OIDC) ---
+    let external_auth = {
+        use deltaglider_proxy::iam::external_auth::ExternalAuthManager;
+        let manager = Arc::new(ExternalAuthManager::new());
+        if let Some(ref db_mutex) = config_db {
+            let db = db_mutex.lock().await;
+            let providers = db.load_auth_providers().unwrap_or_default();
+            if !providers.is_empty() {
+                manager.rebuild(&providers);
+                drop(db);
+                manager.discover_all().await;
+                info!(
+                    "  External auth: {} provider(s) configured",
+                    manager.provider_names().len()
+                );
+            }
+        }
+        // Periodic cleanup for expired pending OAuth flows (every 60s)
+        spawn_periodic(Duration::from_secs(60), {
+            let mgr = manager.clone();
+            move || mgr.cleanup_expired_pending()
+        });
+        Some(manager)
+    };
+
     // --- Config DB S3 sync ---
-    let config_sync = init_config_sync(&config, &admin_password_hash, &config_db, &iam_state).await;
+    let config_sync = init_config_sync(
+        &config,
+        &admin_password_hash,
+        &config_db,
+        &iam_state,
+        &external_auth,
+    )
+    .await;
 
     // Start periodic config DB S3 poll (every 5 minutes)
     if let Some(ref sync) = config_sync {
-        spawn_config_sync_poll(sync.clone(), &config_db, &iam_state, &admin_password_hash);
+        spawn_config_sync_poll(
+            sync.clone(),
+            &config_db,
+            &iam_state,
+            &external_auth,
+            &admin_password_hash,
+        );
     }
 
     let admin_state = Arc::new(AdminState {
@@ -283,6 +321,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         rate_limiter,
         config_sync,
         config_db_mismatch,
+        external_auth,
     });
 
     // --- TLS ---

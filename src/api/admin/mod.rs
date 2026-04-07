@@ -4,6 +4,7 @@ mod auth;
 pub(crate) mod backends;
 mod backup;
 mod config;
+pub mod external_auth;
 mod groups;
 mod scanner;
 pub(crate) mod users;
@@ -16,6 +17,7 @@ use crate::api::handlers::AppState;
 use crate::config::SharedConfig;
 use crate::config_db::ConfigDb;
 use crate::config_db_sync::ConfigDbSync;
+use crate::iam::external_auth::ExternalAuthManager;
 use crate::iam::SharedIamState;
 use crate::rate_limiter::RateLimiter;
 use crate::session::SessionStore;
@@ -67,6 +69,8 @@ pub struct AdminState {
     /// True if the bootstrap password hash doesn't match the existing config DB.
     /// When set, config sync is blocked and a recovery wizard is shown in the GUI.
     pub config_db_mismatch: bool,
+    /// External authentication manager (OAuth/OIDC). None if no providers configured.
+    pub external_auth: Option<Arc<ExternalAuthManager>>,
 }
 
 /// Trigger an async config DB upload to S3 if sync is enabled.
