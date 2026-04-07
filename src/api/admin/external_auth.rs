@@ -70,20 +70,30 @@ pub async fn oauth_authorize(
 
     let client_ip = rate_limiter::extract_client_ip(&req_headers);
 
+    // If discovery isn't cached yet, run it on-demand before initiating auth.
+    // This avoids the "provider not ready" error on first click after startup.
+    if let Some(provider) = ext_auth.get_provider(&provider_name) {
+        if !provider.is_discovery_cached() {
+            tracing::info!("Running on-demand OIDC discovery for '{}'", provider_name);
+            if let Err(e) = provider.discover().await {
+                tracing::warn!("On-demand discovery failed for '{}': {}", provider_name, e);
+            }
+        }
+    }
+
     match ext_auth.initiate_auth(&provider_name, &redirect_uri, client_ip, next_url) {
         Ok(auth_req) => Redirect::temporary(&auth_req.redirect_url).into_response(),
         Err(ExternalAuthError::ProviderNotFound(_)) => {
             (StatusCode::NOT_FOUND, "Provider not found").into_response()
         }
         Err(ExternalAuthError::DiscoveryFailed(msg)) => {
-            tracing::warn!("OAuth authorize failed for '{}': {}", provider_name, msg);
-            // Return a user-friendly error page
+            tracing::error!("OIDC discovery failed for '{}': {}", provider_name, msg);
             error_page(
-                "Provider Not Ready",
+                "Provider Unavailable",
                 &format!(
-                "The authentication provider '{}' is not ready. Please try again in a moment. ({})",
-                provider_name, msg
-            ),
+                    "Could not reach the authentication provider '{}'. Check the issuer URL and network connectivity. ({})",
+                    provider_name, msg
+                ),
             )
             .into_response()
         }
