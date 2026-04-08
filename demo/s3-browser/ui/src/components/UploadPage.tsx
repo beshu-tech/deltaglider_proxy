@@ -129,8 +129,9 @@ export default function UploadPage({ prefix, onBack, onDone }: Props) {
         <div style={{ display: 'flex', gap: 8 }}>
           <Input
             id="upload-destination"
-            value={destination || '/'}
+            value={destination}
             onChange={(e) => setDestination(e.target.value)}
+            placeholder="/ (bucket root)"
             style={{ background: 'var(--input-bg)', borderColor: BORDER, color: TEXT_PRIMARY, fontFamily: "var(--font-mono)", fontSize: 13, flex: 1, borderRadius: 8 }}
           />
           <Button

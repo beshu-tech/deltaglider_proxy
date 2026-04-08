@@ -120,7 +120,7 @@ pub(super) async fn auto_populate_s3_creds(
 pub(super) fn session_cookie_clear() -> String {
     let secure = if secure_cookies() { "; Secure" } else { "" };
     format!(
-        "dgp_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
+        "dgp_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{}",
         secure
     )
 }

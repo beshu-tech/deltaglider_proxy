@@ -35,6 +35,9 @@ type: project
 - AdminPage `savingRef` was plain object (not useRef), never read -- resolved, removed dead code (2026-04-06)
 - AdminPage `authMode` state was write-only -- resolved, removed (2026-04-06)
 - OAuth provider buttons duplicated between ConnectPage and AdminPage (with e.target bug in AdminPage) -- resolved, extracted OAuthProviderList component (2026-04-06)
+- SettingsPage silently sent stale maxDeltaRatio/maxObjectSizeMb/cacheSizeMb on save after compression tab removal -- resolved, removed orphaned state vars (2026-04-06)
+- 2x duplicated group-membership merge loop in external_auth.rs (oauth_callback + sync_memberships) -- resolved, extracted `merge_group_memberships()` helper (2026-04-06)
+- session_cookie_clear used SameSite=Strict while session_cookie used SameSite=Lax -- resolved, aligned to SameSite=Lax (2026-04-06)
 
 **Open issues (2026-04-06 hygiene review):**
 - 2x duplicated `BackendConfig` -> `BackendInfoResponse` conversion in config.rs:331-364 and backends.rs:69-101. Fix: add `From<&NamedBackendConfig>` impl.
@@ -73,6 +76,11 @@ type: project
 - `auto_populate_s3_creds()` centralizes the "login IS connect" S3 credential setup
 - `collect_matching_groups()` is the single source of truth for group mapping evaluation
 - `OAuthProviderList` component is the single source of truth for OAuth sign-in buttons (ConnectPage + AdminPage)
+- `merge_group_memberships()` centralizes the additive group merge logic (preserve manual assignments)
+- SimpleSelect and SimpleAutoComplete share ~60 lines of dropdown overlay code (positioning, outside-click, hover) -- acceptable for 2 consumers, extract if a 3rd variant is needed
+- `popupRoot` in main.tsx is still needed for Ant Design Tooltip/Modal/Drawer/message/Popconfirm
+- `mutate` in useS3Browser.ts is a semantic alias for `refresh` -- stable API naming, not dead code
+- `secure_cookies()` reads env vars per-call (2 calls total, login/logout only) -- documented in config.rs, acceptable
 
 **Why:** Understanding structural debt helps prioritize refactoring with maximum testability impact.
 **How to apply:** Use this as a reference when planning refactoring work on admin API or auth middleware.

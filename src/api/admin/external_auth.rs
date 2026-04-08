@@ -327,12 +327,7 @@ pub async fn oauth_callback(
     let rules = db.load_group_mapping_rules().unwrap_or_default();
     let rule_groups = mapping::evaluate_mappings(&rules, &identity, provider_config.id);
     let existing_groups = db.get_user_group_ids(user.id).unwrap_or_default();
-    let mut merged: Vec<i64> = existing_groups;
-    for gid in &rule_groups {
-        if !merged.contains(gid) {
-            merged.push(*gid);
-        }
-    }
+    let merged = merge_group_memberships(existing_groups, &rule_groups);
     if let Err(e) = db.set_user_group_memberships(user.id, &merged) {
         tracing::warn!(
             "Failed to update group memberships for user {}: {}",
@@ -724,12 +719,7 @@ pub async fn sync_memberships(
         let current_groups = db.get_user_group_ids(ext_id.user_id).unwrap_or_default();
 
         // Merge: add rule-matched groups to existing memberships (preserve manual assignments)
-        let mut merged = current_groups.clone();
-        for gid in &rule_groups {
-            if !merged.contains(gid) {
-                merged.push(*gid);
-            }
-        }
+        let merged = merge_group_memberships(current_groups.clone(), &rule_groups);
 
         if merged != current_groups {
             if let Err(e) = db.set_user_group_memberships(ext_id.user_id, &merged) {
@@ -823,6 +813,18 @@ fn error_page(title: &str, message: &str) -> impl IntoResponse {
         message = message,
     );
     axum::response::Html(html)
+}
+
+/// Merge rule-evaluated groups into existing memberships, preserving manual assignments.
+/// Returns the union of `existing` and `rule_groups` (order-preserving, no duplicates).
+fn merge_group_memberships(existing: Vec<i64>, rule_groups: &[i64]) -> Vec<i64> {
+    let mut merged = existing;
+    for gid in rule_groups {
+        if !merged.contains(gid) {
+            merged.push(*gid);
+        }
+    }
+    merged
 }
 
 fn symmetric_diff_count(a: &[i64], b: &[i64]) -> usize {

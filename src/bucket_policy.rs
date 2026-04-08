@@ -80,11 +80,22 @@ impl BucketPolicyRegistry {
     }
 
     /// The max delta ratio for this bucket (per-bucket override or global).
+    /// When a bucket has compression explicitly enabled but no threshold set,
+    /// and the global ratio is 0 (compression disabled globally), use 0.75
+    /// as a sensible default — otherwise the per-bucket compression flag
+    /// would have no effect.
     pub fn max_delta_ratio(&self, bucket: &str) -> f32 {
-        self.policies
-            .get(bucket)
-            .and_then(|p| p.max_delta_ratio)
-            .unwrap_or(self.default_max_delta_ratio)
+        if let Some(policy) = self.policies.get(bucket) {
+            if let Some(ratio) = policy.max_delta_ratio {
+                return ratio;
+            }
+            // Per-bucket compression explicitly ON, but no threshold set
+            // and global is 0 (disabled) → use sensible default
+            if policy.compression == Some(true) && self.default_max_delta_ratio == 0.0 {
+                return 0.75;
+            }
+        }
+        self.default_max_delta_ratio
     }
 
     /// Resolve routing for a bucket: returns (backend_name, real_bucket_name).

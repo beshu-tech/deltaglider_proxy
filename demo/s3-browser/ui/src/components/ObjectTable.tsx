@@ -1,11 +1,12 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Table, Tag, Tooltip, Typography, Alert, Progress, Checkbox, theme, Button } from 'antd';
+import { Table, Tag, Typography, Alert, Progress, Checkbox, theme, Button } from 'antd';
 import { FolderOutlined, FileOutlined, LoadingOutlined, CalculatorOutlined, CloseCircleOutlined, WarningOutlined } from '@ant-design/icons';
 import type { S3Object } from '../types';
 import { formatBytes, displayName, timeAgo } from '../utils';
 import type { ColumnsType } from 'antd/es/table';
 import { useColors } from '../ThemeContext';
 import type { FolderSizeState } from '../useComputeSize';
+import { getPreviewMode } from './FilePreview';
 
 const { Text } = Typography;
 
@@ -28,6 +29,7 @@ interface Props {
   onComputeSize: (prefix: string) => void;
   onCancelSize: (prefix: string) => void;
   onAutoPopulateSizes?: (currentPrefix: string, folderPrefixes: string[]) => void;
+  onPreview?: (obj: S3Object) => void;
 }
 
 type RowData = { _isFolder: true; key: string; name: string } | (S3Object & { _isFolder: false; name: string });
@@ -51,6 +53,7 @@ export default function ObjectTable({
   onComputeSize,
   onCancelSize,
   onAutoPopulateSizes,
+  onPreview,
 }: Props) {
   const { token } = theme.useToken();
   const { TEXT_PRIMARY, TEXT_SECONDARY, TEXT_MUTED, ACCENT_BLUE, ACCENT_AMBER, ACCENT_PURPLE, STORAGE_TYPE_COLORS, STORAGE_TYPE_DEFAULT } = useColors();
@@ -205,44 +208,41 @@ export default function ObjectTable({
           const sizeState = folderSizes[folderPrefix];
           if (sizeState?.loading) {
             return (
-              <Tooltip title={`${sizeState.progress ? formatBytes(sizeState.progress.totalSize) + ' stored across ' + sizeState.progress.totalFiles.toLocaleString() + ' files so far...' : 'Starting...'}`}>
-                <Button
-                  type="text"
-                  size="small"
-                  icon={<CloseCircleOutlined />}
-                  onClick={(e) => { e.stopPropagation(); onCancelSize(folderPrefix); }}
-                  style={{ fontSize: 11, fontFamily: "var(--font-mono)", color: TEXT_SECONDARY, padding: '0 4px', height: 'auto' }}
-                >
-                  <LoadingOutlined style={{ marginRight: 4 }} />
-                  {sizeState.progress ? formatBytes(sizeState.progress.totalSize) : '...'}
-                </Button>
-              </Tooltip>
+              <Button
+                title={sizeState.progress ? formatBytes(sizeState.progress.totalSize) + ' stored across ' + sizeState.progress.totalFiles.toLocaleString() + ' files so far...' : 'Starting...'}
+                type="text"
+                size="small"
+                icon={<CloseCircleOutlined />}
+                onClick={(e) => { e.stopPropagation(); onCancelSize(folderPrefix); }}
+                style={{ fontSize: 11, fontFamily: "var(--font-mono)", color: TEXT_SECONDARY, padding: '0 4px', height: 'auto' }}
+              >
+                <LoadingOutlined style={{ marginRight: 4 }} />
+                {sizeState.progress ? formatBytes(sizeState.progress.totalSize) : '...'}
+              </Button>
             );
           }
           if (sizeState?.progress?.done) {
             return (
-              <Tooltip title={`${sizeState.progress.totalFiles.toLocaleString()} files — stored (compressed) size`}>
-                <span
-                  style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: TEXT_SECONDARY, cursor: 'default' }}
-                >
-                  {formatBytes(sizeState.progress.totalSize)}
-                </span>
-              </Tooltip>
+              <span
+                title={`${sizeState.progress.totalFiles.toLocaleString()} files — stored (compressed) size`}
+                style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: TEXT_SECONDARY, cursor: 'default' }}
+              >
+                {formatBytes(sizeState.progress.totalSize)}
+              </span>
             );
           }
           if (sizeState?.error) {
             return (
-              <Tooltip title={sizeState.error}>
-                <Button
-                  type="text"
-                  size="small"
-                  icon={<CalculatorOutlined />}
-                  onClick={(e) => { e.stopPropagation(); onComputeSize(folderPrefix); }}
-                  style={{ fontSize: 11, color: TEXT_MUTED, padding: '0 4px', height: 'auto' }}
-                >
-                  Retry
-                </Button>
-              </Tooltip>
+              <Button
+                title={sizeState.error}
+                type="text"
+                size="small"
+                icon={<CalculatorOutlined />}
+                onClick={(e) => { e.stopPropagation(); onComputeSize(folderPrefix); }}
+                style={{ fontSize: 11, color: TEXT_MUTED, padding: '0 4px', height: 'auto' }}
+              >
+                Retry
+              </Button>
             );
           }
           return (
@@ -275,11 +275,9 @@ export default function ObjectTable({
         if (!record.lastModified) return <span style={{ fontSize: 12, color: TEXT_MUTED }}>--</span>;
         const date = new Date(record.lastModified);
         return (
-          <Tooltip title={date.toLocaleString()}>
-            <span style={{ fontSize: 12, color: TEXT_SECONDARY, cursor: 'default' }}>
-              {timeAgo(date)}
-            </span>
-          </Tooltip>
+          <span title={date.toLocaleString()} style={{ fontSize: 12, color: TEXT_SECONDARY, cursor: 'default' }}>
+            {timeAgo(date)}
+          </span>
         );
       },
     },
@@ -293,7 +291,7 @@ export default function ObjectTable({
         if (record._isFolder) return null;
         const cached = headCache[record.key];
         if (!cached) return <LoadingOutlined style={{ fontSize: 12, color: TEXT_MUTED }} />;
-        if (cached.error) return <Tooltip title="Failed to load metadata"><WarningOutlined style={{ fontSize: 12, color: ACCENT_AMBER }} /></Tooltip>;
+        if (cached.error) return <WarningOutlined title="Failed to load metadata" style={{ fontSize: 12, color: ACCENT_AMBER }} />;
         return compressionTag(cached.storageType);
       },
     },
@@ -315,6 +313,7 @@ export default function ObjectTable({
           columns={columns}
           dataSource={dataSource}
           rowKey="key"
+          showSorterTooltip={false} /* Ant Design 6 rc-table renders sort tooltips inline in <th>, causing layout shift */
           pagination={{
             pageSize: PAGE_SIZE,
             current: currentPage,
@@ -333,6 +332,11 @@ export default function ObjectTable({
           onRow={(record) => ({
             onClick: () => {
               if (!record._isFolder) onSelect(record);
+            },
+            onDoubleClick: () => {
+              if (!record._isFolder && onPreview && getPreviewMode(record.key)) {
+                onPreview(record as S3Object);
+              }
             },
             style: {
               borderBottom: `1px solid ${token.colorBorderSecondary}`,
