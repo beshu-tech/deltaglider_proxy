@@ -110,8 +110,14 @@ export default function App() {
   useEffect(() => {
     Promise.all([initFromSession(), checkSession()]).then(([restored, hasSession]) => {
       setHasAdminSession(hasSession);
-      // If S3 creds restored OR we have an admin session (OAuth), don't show ConnectPage
-      setNeedsConnect(!restored && !hasSession);
+      const connected = restored || hasSession;
+      setNeedsConnect(!connected);
+      // Trigger S3 browser reload now that credentials are available
+      if (connected) s3.reconnect();
+    }).catch(() => {
+      // Session check failed (network error, server down) — show connect page
+      setNeedsConnect(true);
+    }).finally(() => {
       setSessionLoading(false);
     });
   }, []);
@@ -170,12 +176,12 @@ export default function App() {
   }, [s3.loading, s3.connected, firstLoadDone, hasAdminSession]);
 
   const handleLogout = () => {
-    // Clear S3 credentials
     disconnect();
-    // Clear admin session
     adminLogout().catch(() => {});
     setFirstLoadDone(false);
     setNeedsConnect(true);
+    setIdentity(null);
+    setHasAdminSession(false);
     navigate('browse');
   };
 

@@ -23,7 +23,7 @@ pub enum S3Error {
     #[error("EntityTooLarge: Your proposed upload exceeds the maximum allowed size.")]
     EntityTooLarge { size: u64, max: u64 },
 
-    #[error("InternalError: We encountered an internal error. Please try again.")]
+    #[error("InternalError: {0}")]
     InternalError(String),
 
     #[error("InvalidArgument: {0}")]

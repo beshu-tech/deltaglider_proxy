@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
-import { Button, Input, InputNumber, Radio, Switch, Typography, Space, Alert, Spin } from 'antd';
-import { SaveOutlined, LockOutlined, WarningOutlined, DatabaseOutlined, ControlOutlined, SafetyOutlined, KeyOutlined, ApiOutlined, PlusOutlined, DeleteOutlined, FolderOutlined } from '@ant-design/icons';
+import { Button, Input, Radio, Switch, Typography, Space, Alert, Spin } from 'antd';
+import { SaveOutlined, LockOutlined, WarningOutlined, DatabaseOutlined, ControlOutlined, SafetyOutlined, KeyOutlined, ApiOutlined } from '@ant-design/icons';
 import type { AdminConfig, TestS3Response } from '../adminApi';
 import { getAdminConfig, updateAdminConfig, testS3Connection } from '../adminApi';
 import { useColors } from '../ThemeContext';
@@ -73,9 +73,6 @@ export default function SettingsPage({ onSessionExpired, embeddedTab }: Props) {
   const [testS3Result, setTestS3Result] = useState<TestS3Response | null>(null);
   const [showAdvancedSecurity, setShowAdvancedSecurity] = useState(false);
 
-  // Bucket policies state: array for ordered editing
-  const [bucketPolicies, setBucketPolicies] = useState<Array<{ name: string; compression: boolean; max_delta_ratio: number | null; backend: string; alias: string }>>([]);
-
   // Taint detection: fields that differ from TOML file on disk
   const [taintedFields, setTaintedFields] = useState<Set<string>>(new Set());
 
@@ -101,18 +98,6 @@ export default function SettingsPage({ onSessionExpired, embeddedTab }: Props) {
         setBackendForcePathStyle(cfg.backend_force_path_style ?? true);
         // Tainted fields
         setTaintedFields(new Set(cfg.tainted_fields || []));
-        // Bucket policies
-        if (cfg.bucket_policies) {
-          setBucketPolicies(
-            Object.entries(cfg.bucket_policies).map(([name, p]) => ({
-              name,
-              compression: p.compression ?? true,
-              max_delta_ratio: p.max_delta_ratio ?? null,
-              backend: p.backend ?? '',
-              alias: p.alias ?? '',
-            }))
-          );
-        }
         const matchedPreset = findMatchingPreset(cfg.log_level || '');
         if (matchedPreset) {
           setLogLevel(matchedPreset);
@@ -152,18 +137,6 @@ export default function SettingsPage({ onSessionExpired, embeddedTab }: Props) {
       if (secretAccessKey) payload.secret_access_key = secretAccessKey;
       if (beAccessKeyId) payload.backend_access_key_id = beAccessKeyId;
       if (beSecretAccessKey) payload.backend_secret_access_key = beSecretAccessKey;
-      // Bucket policies — convert array to map
-      const bp: Record<string, { compression?: boolean; max_delta_ratio?: number; backend?: string; alias?: string }> = {};
-      for (const p of bucketPolicies) {
-        if (!p.name.trim()) continue;
-        bp[p.name.trim().toLowerCase()] = {
-          ...(p.compression === false ? { compression: false } : {}),
-          ...(p.max_delta_ratio !== null ? { max_delta_ratio: p.max_delta_ratio } : {}),
-          ...(p.backend ? { backend: p.backend } : {}),
-          ...(p.alias ? { alias: p.alias } : {}),
-        };
-      }
-      payload.bucket_policies = bp;
       const result = await updateAdminConfig(payload);
       setSaveResult({ warnings: result.warnings, requires_restart: result.requires_restart });
       // Re-fetch config to update taint status (save persists to TOML, so taint should clear)
@@ -400,162 +373,7 @@ export default function SettingsPage({ onSessionExpired, embeddedTab }: Props) {
     </div>
   );
 
-  /* -- Tab: Compression --------------------------------------------------- */
-  const compressionTab = (
-    <div style={tabPane}><form onSubmit={(e) => { e.preventDefault(); handleSave(); }}><Space direction="vertical" size={0} style={{ width: '100%' }}>
-
-      <div style={cardStyle}>
-        <SectionHeader icon={<FolderOutlined />} title={<>Per-Bucket Compression {taintBadge('bucket_policies')}</>} description="Disable delta compression or tune the savings threshold for specific buckets. Buckets without a policy use the global defaults below." />
-
-        {bucketPolicies.length === 0 && (
-          <div style={{ marginTop: 16, padding: '16px 14px', border: `1px dashed ${colors.BORDER}`, borderRadius: 8, textAlign: 'center' }}>
-            <Text type="secondary" style={{ fontSize: 13, fontFamily: 'var(--font-ui)', display: 'block' }}>
-              No per-bucket overrides yet. All buckets use global settings.
-            </Text>
-            <Text type="secondary" style={{ fontSize: 12, fontFamily: 'var(--font-ui)', display: 'block', marginTop: 4 }}>
-              Use this to skip compression for buckets that store already-compressed data (images, video, archives) or to set a tighter savings threshold for high-churn buckets.
-            </Text>
-          </div>
-        )}
-
-        {bucketPolicies.map((bp, idx) => (
-          <div key={idx} style={{ marginTop: idx === 0 ? 16 : 12, padding: '12px 14px', border: `1px solid ${bp.compression ? colors.BORDER : colors.ACCENT_AMBER + '66'}`, borderRadius: 8, background: bp.compression ? colors.BG_ELEVATED : colors.ACCENT_AMBER + '0a' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
-              <FolderOutlined style={{ fontSize: 14, color: colors.TEXT_MUTED, flexShrink: 0 }} />
-              <Input
-                value={bp.name}
-                onChange={(e) => {
-                  const next = [...bucketPolicies];
-                  next[idx] = { ...next[idx], name: e.target.value };
-                  setBucketPolicies(next);
-                }}
-                placeholder="Enter bucket name"
-                style={{ flex: 1, ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }}
-              />
-              <Button
-                icon={<DeleteOutlined />}
-                size="small"
-                danger
-                onClick={() => setBucketPolicies(bucketPolicies.filter((_, i) => i !== idx))}
-                title="Remove this bucket override"
-              />
-            </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 20, flexWrap: 'wrap', marginLeft: 22 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <Switch
-                  checked={bp.compression}
-                  onChange={(checked) => {
-                    const next = [...bucketPolicies];
-                    next[idx] = { ...next[idx], compression: checked };
-                    setBucketPolicies(next);
-                  }}
-                  size="small"
-                />
-                <Text style={{ fontSize: 13, fontFamily: 'var(--font-ui)', color: bp.compression ? colors.TEXT_PRIMARY : colors.ACCENT_AMBER }}>
-                  {bp.compression ? 'Delta compression on' : 'Compression disabled — stored as-is'}
-                </Text>
-              </div>
-              {bp.compression && (
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <Text style={{ fontSize: 12, fontFamily: 'var(--font-ui)', whiteSpace: 'nowrap', color: colors.TEXT_MUTED }}>Savings threshold:</Text>
-                  <InputNumber
-                    value={bp.max_delta_ratio ?? undefined}
-                    onChange={(v) => {
-                      const next = [...bucketPolicies];
-                      next[idx] = { ...next[idx], max_delta_ratio: v ?? null };
-                      setBucketPolicies(next);
-                    }}
-                    min={0}
-                    max={1}
-                    step={0.05}
-                    placeholder="global"
-                    style={{ width: 90, ...inputRadius }}
-                    size="small"
-                  />
-                </div>
-              )}
-            </div>
-            {(config?.backends?.length ?? 0) > 0 && (
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8, marginLeft: 22, flexWrap: 'wrap' }}>
-                <Text style={{ fontSize: 12, fontFamily: 'var(--font-ui)', color: colors.TEXT_MUTED, whiteSpace: 'nowrap' }}>Backend:</Text>
-                <Input
-                  value={bp.backend}
-                  onChange={(e) => {
-                    const next = [...bucketPolicies];
-                    next[idx] = { ...next[idx], backend: e.target.value };
-                    setBucketPolicies(next);
-                  }}
-                  placeholder="default"
-                  style={{ width: 120, ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 12 }}
-                  size="small"
-                />
-                <Text style={{ fontSize: 12, fontFamily: 'var(--font-ui)', color: colors.TEXT_MUTED, whiteSpace: 'nowrap' }}>Alias:</Text>
-                <Input
-                  value={bp.alias}
-                  onChange={(e) => {
-                    const next = [...bucketPolicies];
-                    next[idx] = { ...next[idx], alias: e.target.value };
-                    setBucketPolicies(next);
-                  }}
-                  placeholder="same as bucket name"
-                  style={{ width: 160, ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 12 }}
-                  size="small"
-                />
-              </div>
-            )}
-          </div>
-        ))}
-
-        <Button
-          icon={<PlusOutlined />}
-          onClick={() => setBucketPolicies([...bucketPolicies, { name: '', compression: true, max_delta_ratio: null, backend: '', alias: '' }])}
-          style={{ marginTop: 12, borderRadius: 8, fontFamily: 'var(--font-ui)', fontWeight: 600 }}
-          block
-          type="dashed"
-        >
-          Add Bucket Override
-        </Button>
-      </div>
-
-      <div style={cardStyle}>
-        <SectionHeader icon={<SafetyOutlined />} title="Global Defaults" description="These apply to all buckets unless overridden above" />
-        <div style={{ marginTop: 16 }}>
-          <span style={labelStyle}>Max Delta Ratio {taintBadge('max_delta_ratio')}</span>
-          <InputNumber value={maxDeltaRatio} onChange={(v) => v !== null && setMaxDeltaRatio(v)} min={0} max={1} step={0.05} style={{ width: '100%', ...inputRadius }} />
-          <Text type="secondary" style={{ fontSize: 12, fontFamily: "var(--font-ui)" }}>
-            Store as delta only if compressed size is less than this fraction of the original. E.g. 0.75 means deltas must save at least 25% space.
-          </Text>
-        </div>
-        <div style={{ marginTop: 16 }}>
-          <span style={labelStyle}>Max Object Size (MB) {taintBadge('max_object_size')}</span>
-          <InputNumber value={maxObjectSizeMb} onChange={(v) => v !== null && setMaxObjectSizeMb(v)} min={1} step={10} style={{ width: '100%', ...inputRadius }} />
-          <Text type="secondary" style={{ fontSize: 12, fontFamily: "var(--font-ui)" }}>
-            Files larger than this are always stored as-is (xdelta3 memory constraint).
-          </Text>
-        </div>
-      </div>
-
-      <div style={cardStyle}>
-        <SectionHeader icon={<DatabaseOutlined />} title="Cache" description="In-memory caches that speed up reads. Larger = faster but more RAM." />
-        <div style={{ marginTop: 16 }}>
-          <span style={labelStyle}>Reference Cache Size (MB) {taintBadge('cache_size_mb')} <span style={{ fontSize: 10, color: colors.ACCENT_AMBER }}>restart required</span></span>
-          <InputNumber value={cacheSizeMb} onChange={(v) => v !== null && setCacheSizeMb(v)} min={0} step={100} style={{ width: '100%', ...inputRadius }} />
-          <Text type="secondary" style={{ fontSize: 12, fontFamily: "var(--font-ui)" }}>
-            Cache for delta baselines. Each active deltaspace needs its reference in cache for fast reconstruction. Recommend 1024+ MB for production.
-          </Text>
-        </div>
-        {readOnlyField('Metadata Cache (MB)', config?.metadata_cache_mb, 'Cache for object metadata (HEAD/LIST). Eliminates redundant S3 HEAD calls.', 'restart required', { toml: 'metadata_cache_mb = 50', env: 'DGP_METADATA_CACHE_MB=50' })}
-      </div>
-
-      <div style={cardStyle}>
-        <SectionHeader icon={<ControlOutlined />} title="Advanced Compression" description="Codec subprocess settings — usually auto-configured." />
-        {readOnlyField('Codec Concurrency', config?.codec_concurrency, 'Max parallel xdelta3 encode/decode operations. Auto-detected from CPU cores.', 'restart required', { toml: 'codec_concurrency = 16', env: 'DGP_CODEC_CONCURRENCY=16' })}
-        {readOnlyField('Codec Timeout (seconds)', config?.codec_timeout_secs, 'Kill xdelta3 subprocess if it takes longer than this. Prevents hung processes.', 'restart required', { toml: 'codec_timeout_secs = 60', env: 'DGP_CODEC_TIMEOUT_SECS=60' })}
-      </div>
-
-      {saveSection}
-    </Space></form></div>
-  );
+  /* -- Tab: Compression — removed, merged into BackendsPanel -------------- */
 
   /* -- Tab: Limits -------------------------------------------------------- */
   const limitsTab = (
@@ -655,12 +473,9 @@ export default function SettingsPage({ onSessionExpired, embeddedTab }: Props) {
   // When embedded in AdminPage, render just the requested tab content
   const tabMap: Record<string, React.ReactNode> = {
     backend: backendTab,
-    compression: compressionTab,
     limits: limitsTab,
     security: securityTab,
     logging: loggingTab,
-    // Legacy alias
-    proxy: compressionTab,
   };
   return (
     <div style={{ maxWidth: 640, margin: '0 auto', padding: 'clamp(16px, 3vw, 24px)' }}>

@@ -255,13 +255,51 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 None,
             ),
             StorageInfo::Delta { .. } => {
-                // Fetch reference and delta in parallel — saves one S3 round-trip
+                // Fetch reference and delta in parallel — saves one S3 round-trip.
+                // The reference is sibling to the delta: same parent directory + "reference.bin".
                 let (ref_result, delta_result) = tokio::join!(
                     self.get_reference_cached(bucket, deltaspace_id),
                     self.storage
                         .get_delta(bucket, deltaspace_id, &obj_key.filename)
                 );
-                let (reference, cache_hit) = ref_result?;
+
+                // Fallback: if get_reference fails (uses internal deltaspace key),
+                // try get_passthrough which goes through the full routing+aliasing pipeline.
+                // This covers the case where reference.bin was uploaded via the Python CLI
+                // to the real S3 path, but the proxy's internal deltaspace key differs
+                // from the aliased path that the routing layer resolves.
+                let (reference, cache_hit) = match ref_result {
+                    Ok(r) => r,
+                    Err(EngineError::MissingReference(_)) => {
+                        tracing::info!(
+                            "Reference not found via internal key — trying passthrough fallback: {}/reference.bin",
+                            deltaspace_id
+                        );
+                        match self
+                            .storage
+                            .get_passthrough(bucket, deltaspace_id, "reference.bin")
+                            .await
+                        {
+                            Ok(data) => {
+                                tracing::info!(
+                                    "Reference passthrough fallback succeeded ({} bytes)",
+                                    data.len()
+                                );
+                                let bytes = bytes::Bytes::from(data);
+                                let cache_key = Self::cache_key(bucket, deltaspace_id);
+                                self.cache.put(&cache_key, bytes.clone());
+                                (bytes, false)
+                            }
+                            Err(_) => {
+                                return Err(EngineError::MissingReference(format!(
+                                    "{} (reference.bin not found via any method)",
+                                    deltaspace_id
+                                )));
+                            }
+                        }
+                    }
+                    Err(e) => return Err(e),
+                };
                 let delta = delta_result?;
 
                 // Guard against oversized inputs before spawning the codec task.

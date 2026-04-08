@@ -1,11 +1,14 @@
 import { useState, useEffect } from 'react';
-import { Button, Input, Radio, Switch, Typography, Space, Alert, Spin } from 'antd';
-import { PlusOutlined, DeleteOutlined, DatabaseOutlined, CloudOutlined, CheckCircleOutlined, ApiOutlined } from '@ant-design/icons';
-import type { BackendInfo, CreateBackendRequest } from '../adminApi';
-import { getBackends, createBackend, deleteBackend, testS3Connection } from '../adminApi';
+import { Button, Input, Radio, Switch, Typography, Space, Alert, Spin, InputNumber } from 'antd';
+import { PlusOutlined, DeleteOutlined, DatabaseOutlined, CloudOutlined, CheckCircleOutlined, ApiOutlined, FolderOutlined } from '@ant-design/icons';
+import type { BackendInfo, CreateBackendRequest, AdminConfig } from '../adminApi';
+import { getBackends, createBackend, deleteBackend, testS3Connection, getAdminConfig, updateAdminConfig } from '../adminApi';
+import { listBuckets } from '../s3client';
 import { useColors } from '../ThemeContext';
 import { useCardStyles } from './shared-styles';
 import SectionHeader from './SectionHeader';
+import SimpleSelect from './SimpleSelect';
+import SimpleAutoComplete from './SimpleAutoComplete';
 
 const { Text } = Typography;
 
@@ -19,8 +22,15 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
 
   const [backends, setBackends] = useState<BackendInfo[]>([]);
   const [defaultBackend, setDefaultBackend] = useState<string | null>(null);
+  const [config, setConfig] = useState<AdminConfig | null>(null);
+  const [availableBuckets, setAvailableBuckets] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // Per-bucket policies (local edit state)
+  const [bucketPolicies, setBucketPolicies] = useState<Array<{ name: string; compression: boolean; max_delta_ratio: number | null; backend: string; alias: string }>>([]);
+  const [policyDirty, setPolicyDirty] = useState(false);
+  const [policySaving, setPolicySaving] = useState(false);
 
   // New backend form
   const [showForm, setShowForm] = useState(false);
@@ -41,22 +51,69 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
 
   const refresh = async () => {
     try {
-      const data = await getBackends();
+      const [data, cfg, buckets] = await Promise.all([
+        getBackends(),
+        getAdminConfig(),
+        listBuckets().catch(() => []),
+      ]);
       setBackends(data.backends);
       setDefaultBackend(data.default_backend);
+      setConfig(cfg);
+      setAvailableBuckets(buckets.map((b: { name: string }) => b.name));
+      if (cfg?.bucket_policies) {
+        setBucketPolicies(
+          Object.entries(cfg.bucket_policies).map(([name, p]) => ({
+            name,
+            compression: p.compression ?? true,
+            max_delta_ratio: p.max_delta_ratio ?? null,
+            backend: p.backend ?? '',
+            alias: p.alias ?? '',
+          }))
+        );
+      }
       setError(null);
     } catch (e) {
       if (e instanceof Error && e.message.includes('401')) {
         onSessionExpired?.();
         return;
       }
-      setError(e instanceof Error ? e.message : 'Failed to load backends');
+      setError(e instanceof Error ? e.message : 'Failed to load');
     } finally {
       setLoading(false);
     }
   };
 
   useEffect(() => { refresh(); }, []);
+
+  const handleSavePolicies = async () => {
+    setPolicySaving(true);
+    try {
+      const bp: Record<string, { compression?: boolean; max_delta_ratio?: number; backend?: string; alias?: string }> = {};
+      for (const p of bucketPolicies) {
+        if (!p.name) continue;
+        bp[p.name] = {
+          compression: p.compression,
+          ...(p.max_delta_ratio != null ? { max_delta_ratio: p.max_delta_ratio } : {}),
+          ...(p.backend ? { backend: p.backend } : {}),
+          ...(p.alias ? { alias: p.alias } : {}),
+        };
+      }
+      await updateAdminConfig({ bucket_policies: bp });
+      setPolicyDirty(false);
+      setSaveResult({ ok: true, message: 'Bucket policies saved' });
+    } catch (e) {
+      setSaveResult({ ok: false, message: e instanceof Error ? e.message : 'Save failed' });
+    } finally {
+      setPolicySaving(false);
+    }
+  };
+
+  const updatePolicy = (idx: number, patch: Partial<typeof bucketPolicies[number]>) => {
+    const next = [...bucketPolicies];
+    next[idx] = { ...next[idx], ...patch };
+    setBucketPolicies(next);
+    setPolicyDirty(true);
+  };
 
   const handleCreate = async () => {
     setSaving(true);
@@ -132,16 +189,12 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
   };
 
   const resetForm = () => {
-    setFormName('');
-    setFormType('filesystem');
-    setFormPath('./data');
-    setFormEndpoint('');
-    setFormRegion('us-east-1');
-    setFormForcePathStyle(true);
-    setFormAccessKey('');
-    setFormSecretKey('');
-    setFormSetDefault(false);
+    setFormName(''); setFormType('filesystem'); setFormPath('./data');
+    setFormEndpoint(''); setFormRegion('us-east-1'); setFormForcePathStyle(true);
+    setFormAccessKey(''); setFormSecretKey(''); setFormSetDefault(false);
   };
+
+  const globalCompressionOn = (config?.max_delta_ratio ?? 0.75) > 0;
 
   if (loading) {
     return <div style={{ display: 'flex', justifyContent: 'center', padding: 64 }}><Spin /></div>;
@@ -152,34 +205,52 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
       <Space direction="vertical" size={0} style={{ width: '100%' }}>
 
         {saveResult && (
-          <Alert
-            type={saveResult.ok ? 'success' : 'error'}
-            message={saveResult.message}
-            showIcon
-            closable
-            onClose={() => setSaveResult(null)}
-            style={{ borderRadius: 8, marginBottom: 12 }}
-          />
+          <Alert type={saveResult.ok ? 'success' : 'error'} message={saveResult.message} showIcon closable onClose={() => setSaveResult(null)} style={{ borderRadius: 8, marginBottom: 12 }} />
         )}
-
         {error && (
           <Alert type="error" message={error} showIcon style={{ borderRadius: 8, marginBottom: 12 }} />
         )}
 
+        {/* Default compression policy */}
+        <div style={cardStyle}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <Switch
+              checked={globalCompressionOn}
+              onChange={async (on) => {
+                try {
+                  await updateAdminConfig({ max_delta_ratio: on ? 0.75 : 0 });
+                  await refresh();
+                } catch {}
+              }}
+            />
+            <div>
+              <Text style={{ fontSize: 14, fontWeight: 700, fontFamily: 'var(--font-ui)', color: colors.TEXT_PRIMARY }}>
+                Default compression: <span style={{ color: globalCompressionOn ? colors.ACCENT_GREEN : colors.ACCENT_AMBER }}>{globalCompressionOn ? 'ON' : 'OFF'}</span>
+              </Text>
+              <Text type="secondary" style={{ fontSize: 12, fontFamily: 'var(--font-ui)', display: 'block', marginTop: 2, lineHeight: 1.6 }}>
+                {globalCompressionOn
+                  ? 'New buckets compress by default. Versioned binaries are stored as xdelta3 deltas (30-70% savings). GETs reconstruct transparently. Already-compressed formats (images, video) are skipped automatically.'
+                  : 'New buckets store files as-is by default. You can still enable compression for individual buckets below.'}
+                {' '}Per-bucket overrides always take precedence.
+              </Text>
+            </div>
+          </div>
+        </div>
+
+        {/* Storage Backends */}
         <div style={cardStyle}>
           <SectionHeader
             icon={<DatabaseOutlined />}
             title="Storage Backends"
             description={backends.length === 0
-              ? 'No named backends configured. Using legacy single-backend mode.'
-              : `${backends.length} backend${backends.length !== 1 ? 's' : ''} configured. Buckets route to the default unless overridden in Compression → Per-Bucket Policies.`
+              ? 'No named backends. Using legacy single-backend mode.'
+              : `${backends.length} backend${backends.length !== 1 ? 's' : ''} configured.`
             }
           />
 
           {backends.map((b) => (
             <div key={b.name} style={{
-              marginTop: 12,
-              padding: '12px 14px',
+              marginTop: 12, padding: '12px 14px',
               border: `1px solid ${b.name === defaultBackend ? colors.ACCENT_BLUE + '66' : colors.BORDER}`,
               borderRadius: 8,
               background: b.name === defaultBackend ? colors.ACCENT_BLUE + '08' : colors.BG_ELEVATED,
@@ -200,57 +271,30 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                   </div>
                 </div>
                 {b.backend_type === 's3' && (
-                  <Button
-                    size="small"
-                    icon={<ApiOutlined />}
-                    loading={testingBackend === b.name}
-                    onClick={() => handleTestConnection(b)}
-                    title="Test connection"
-                  />
+                  <Button size="small" icon={<ApiOutlined />} loading={testingBackend === b.name} onClick={() => handleTestConnection(b)} title="Test connection" />
                 )}
-                <Button
-                  size="small"
-                  icon={<DeleteOutlined />}
-                  danger
-                  onClick={() => handleDelete(b.name)}
-                  title="Remove backend"
-                />
+                <Button size="small" icon={<DeleteOutlined />} danger onClick={() => handleDelete(b.name)} title="Remove backend" />
               </div>
               {testResult?.name === b.name && (
-                <Alert
-                  type={testResult.ok ? 'success' : 'error'}
-                  message={testResult.message}
-                  showIcon
-                  style={{ marginTop: 8, borderRadius: 6 }}
-                />
+                <Alert type={testResult.ok ? 'success' : 'error'} message={testResult.message} showIcon style={{ marginTop: 8, borderRadius: 6 }} />
               )}
             </div>
           ))}
 
           {!showForm && (
-            <Button
-              icon={<PlusOutlined />}
-              onClick={() => setShowForm(true)}
-              style={{ marginTop: 12, borderRadius: 8, fontFamily: 'var(--font-ui)', fontWeight: 600 }}
-              block
-              type="dashed"
-            >
+            <Button icon={<PlusOutlined />} onClick={() => setShowForm(true)} style={{ marginTop: 12, borderRadius: 8, fontFamily: 'var(--font-ui)', fontWeight: 600 }} block type="dashed">
               Add Backend
             </Button>
           )}
         </div>
 
+        {/* New Backend Form */}
         {showForm && (
           <div style={cardStyle}>
             <SectionHeader icon={<PlusOutlined />} title="New Backend" />
             <div style={{ marginTop: 16 }}>
               <span style={labelStyle}>Name</span>
-              <Input
-                value={formName}
-                onChange={(e) => setFormName(e.target.value)}
-                placeholder="e.g. local, hetzner, aws-prod"
-                style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }}
-              />
+              <Input value={formName} onChange={(e) => setFormName(e.target.value)} placeholder="e.g. local, hetzner, aws-prod" style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }} />
             </div>
             <div style={{ marginTop: 12 }}>
               <span style={labelStyle}>Type</span>
@@ -259,19 +303,17 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                 <Radio.Button value="s3" style={{ fontSize: 13 }}>S3</Radio.Button>
               </Radio.Group>
             </div>
-
             {formType === 'filesystem' && (
               <div style={{ marginTop: 12 }}>
                 <span style={labelStyle}>Data Directory</span>
                 <Input value={formPath} onChange={(e) => setFormPath(e.target.value)} placeholder="./data" style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }} />
               </div>
             )}
-
             {formType === 's3' && (
               <>
                 <div style={{ marginTop: 12 }}>
                   <span style={labelStyle}>Endpoint</span>
-                  <Input value={formEndpoint} onChange={(e) => setFormEndpoint(e.target.value)} placeholder="https://fsn1.your-objectstorage.com (leave empty for AWS)" style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }} />
+                  <Input value={formEndpoint} onChange={(e) => setFormEndpoint(e.target.value)} placeholder="https://fsn1.your-objectstorage.com" style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }} />
                 </div>
                 <div style={{ marginTop: 8 }}>
                   <span style={labelStyle}>Region</span>
@@ -291,29 +333,91 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                 </div>
               </>
             )}
-
             <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 8 }}>
               <Switch checked={formSetDefault} onChange={setFormSetDefault} size="small" />
               <Text style={{ fontSize: 13, fontFamily: 'var(--font-ui)' }}>Set as default backend</Text>
             </div>
-
             <div style={{ marginTop: 16, display: 'flex', gap: 8 }}>
-              <Button
-                type="primary"
-                icon={<CheckCircleOutlined />}
-                onClick={handleCreate}
-                loading={saving}
-                disabled={!formName.trim()}
-                style={{ flex: 1, borderRadius: 8, fontWeight: 600 }}
-              >
+              <Button type="primary" icon={<CheckCircleOutlined />} onClick={handleCreate} loading={saving} disabled={!formName.trim()} style={{ flex: 1, borderRadius: 8, fontWeight: 600 }}>
                 Create Backend
               </Button>
-              <Button onClick={() => { setShowForm(false); resetForm(); }} style={{ borderRadius: 8 }}>
-                Cancel
-              </Button>
+              <Button onClick={() => { setShowForm(false); resetForm(); }} style={{ borderRadius: 8 }}>Cancel</Button>
             </div>
           </div>
         )}
+
+        {/* Per-Bucket Policies */}
+        <div style={cardStyle}>
+          <SectionHeader
+            icon={<FolderOutlined />}
+            title="Per-Bucket Policies"
+            description="Override compression, backend routing, or aliasing for specific buckets."
+          />
+
+          {bucketPolicies.map((bp, idx) => (
+            <div key={idx} style={{
+              marginTop: idx === 0 ? 12 : 8, padding: '10px 12px',
+              border: `1px solid ${bp.compression ? colors.BORDER : colors.ACCENT_AMBER + '66'}`,
+              borderRadius: 8,
+              background: bp.compression ? colors.BG_ELEVATED : colors.ACCENT_AMBER + '0a',
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                {backends.length > 0 && (
+                  <SimpleSelect
+                    value={bp.backend}
+                    onChange={(v) => updatePolicy(idx, { backend: v })}
+                    placeholder="Backend"
+                    allowClear
+                    size="small"
+                    style={{ width: 170 }}
+                    options={backends.map(b => ({ value: b.name, label: b.name, sublabel: b.backend_type }))}
+                  />
+                )}
+                <SimpleAutoComplete
+                  value={bp.name}
+                  onChange={(v) => updatePolicy(idx, { name: v.toLowerCase().replace(/[^a-z0-9.\-]/g, '') })}
+                  options={availableBuckets.filter(b => !bucketPolicies.some((p, i) => i !== idx && p.name === b))}
+                  placeholder="Bucket name"
+                  style={{ flex: 1 }}
+                />
+                <Button size="small" danger icon={<DeleteOutlined />} onClick={() => { setBucketPolicies(bucketPolicies.filter((_, i) => i !== idx)); setPolicyDirty(true); }} />
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <Switch checked={bp.compression} onChange={(v) => updatePolicy(idx, { compression: v })} size="small" />
+                  <Text style={{ fontSize: 12, fontFamily: 'var(--font-ui)', color: bp.compression ? colors.TEXT_PRIMARY : colors.ACCENT_AMBER }}>
+                    {bp.compression ? 'Compression' : 'No compression'}
+                  </Text>
+                </div>
+                {bp.compression && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                    <Text style={{ fontSize: 11, color: colors.TEXT_MUTED }}>Threshold:</Text>
+                    <InputNumber value={bp.max_delta_ratio ?? undefined} onChange={(v) => updatePolicy(idx, { max_delta_ratio: v ?? null })} min={0} max={1} step={0.05} placeholder="global" style={{ width: 80, ...inputRadius }} size="small" />
+                  </div>
+                )}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <Text style={{ fontSize: 11, color: colors.TEXT_MUTED }}>Alias:</Text>
+                  <Input value={bp.alias} onChange={(e) => updatePolicy(idx, { alias: e.target.value })} placeholder="same as bucket" style={{ width: 130, ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 11 }} size="small" />
+                </div>
+              </div>
+            </div>
+          ))}
+
+          <Button
+            icon={<PlusOutlined />}
+            onClick={() => { setBucketPolicies([...bucketPolicies, { name: '', compression: true, max_delta_ratio: null, backend: '', alias: '' }]); setPolicyDirty(true); }}
+            style={{ marginTop: 12, borderRadius: 8, fontFamily: 'var(--font-ui)', fontWeight: 600 }}
+            block type="dashed"
+          >
+            Add Bucket Policy
+          </Button>
+
+          {policyDirty && (
+            <Button type="primary" onClick={handleSavePolicies} loading={policySaving} style={{ marginTop: 12, borderRadius: 8, fontWeight: 600 }} block>
+              Save Bucket Policies
+            </Button>
+          )}
+        </div>
 
       </Space>
     </div>
