@@ -50,11 +50,8 @@ export default function SettingsPage({ onSessionExpired, embeddedTab }: Props) {
   const [saving, setSaving] = useState(false);
   const [saveResult, setSaveResult] = useState<{ warnings: string[]; requires_restart: boolean } | null>(null);
 
-  const [maxDeltaRatio, setMaxDeltaRatio] = useState<number>(0.5);
-  const [maxObjectSizeMb, setMaxObjectSizeMb] = useState<number>(100);
   const [accessKeyId, setAccessKeyId] = useState('');
   const [secretAccessKey, setSecretAccessKey] = useState('');
-  const [cacheSizeMb, setCacheSizeMb] = useState<number>(100);
 
   const [logLevel, setLogLevel] = useState('');
   const [logLevelCustom, setLogLevelCustom] = useState(false);
@@ -86,10 +83,7 @@ export default function SettingsPage({ onSessionExpired, embeddedTab }: Props) {
     getAdminConfig().then((cfg) => {
       if (cfg) {
         setConfig(cfg);
-        setMaxDeltaRatio(cfg.max_delta_ratio);
-        setMaxObjectSizeMb(Math.round(cfg.max_object_size / (1024 * 1024)));
         setAccessKeyId(cfg.access_key_id || '');
-        setCacheSizeMb(cfg.cache_size_mb);
         setBackendType(cfg.backend_type);
         setOriginalBackendType(cfg.backend_type);
         setBackendPath(cfg.backend_path || './data');
@@ -120,10 +114,7 @@ export default function SettingsPage({ onSessionExpired, embeddedTab }: Props) {
     setSaveResult(null);
     try {
       const payload: Record<string, unknown> = {
-        max_delta_ratio: maxDeltaRatio,
-        max_object_size: maxObjectSizeMb * 1024 * 1024,
         access_key_id: accessKeyId || null,
-        cache_size_mb: cacheSizeMb,
         log_level: logLevel,
         backend_type: backendType,
       };

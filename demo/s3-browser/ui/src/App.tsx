@@ -110,27 +110,25 @@ export default function App() {
   useEffect(() => {
     Promise.all([initFromSession(), checkSession()]).then(([restored, hasSession]) => {
       setHasAdminSession(hasSession);
-      const connected = restored || hasSession;
-      setNeedsConnect(!connected);
-      // Trigger S3 browser reload now that credentials are available
-      if (connected) s3.reconnect();
+      setNeedsConnect(!(restored || hasSession));
     }).catch(() => {
-      // Session check failed (network error, server down) — show connect page
       setNeedsConnect(true);
     }).finally(() => {
       setSessionLoading(false);
     });
   }, []);
 
-  // Check identity after connection is established
+  // When session is restored and we're connected, reload the S3 browser
+  // and fetch identity. Runs AFTER React commits the needsConnect state.
   useEffect(() => {
-    if (!needsConnect) {
+    if (!needsConnect && !sessionLoading) {
+      s3.reconnect();
       whoami().then(setIdentity);
-    } else {
+    } else if (needsConnect) {
       setIdentity(null);
       setHasAdminSession(false);
     }
-  }, [needsConnect]);
+  }, [needsConnect, sessionLoading]);
 
   const screens = useBreakpoint();
   const isMobile = !screens.md;
@@ -296,6 +294,7 @@ export default function App() {
               onComputeSize={folderSize.compute}
               onCancelSize={folderSize.cancel}
               onAutoPopulateSizes={folderSize.autoPopulate}
+              onPreview={setPreviewObject}
             />
           )}
         </div>

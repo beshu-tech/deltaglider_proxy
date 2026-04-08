@@ -305,8 +305,21 @@ pub async fn import_backup(
     // may differ between systems, and the identity links are re-created on the
     // next OAuth login. Importing them would create dangling references.
 
-    // Rebuild IAM index
+    // Rebuild IAM index + external auth manager
     rebuild_iam_index(&db, &state.iam_state)?;
+    // Reload OAuth providers into memory (otherwise imported providers
+    // won't work until restart)
+    if let Some(ref ext_auth) = state.external_auth {
+        let providers = db.load_auth_providers().unwrap_or_default();
+        if !providers.is_empty() {
+            ext_auth.rebuild(&providers);
+        }
+    }
+    drop(db);
+    // Discover OIDC endpoints for newly imported providers
+    if let Some(ref ext_auth) = state.external_auth {
+        ext_auth.discover_all().await;
+    }
     trigger_config_sync(&state);
 
     audit_log(
