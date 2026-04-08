@@ -1,9 +1,10 @@
 import { useState, useEffect } from 'react';
 import { Button, Input, Typography, Space, Alert, Spin, message } from 'antd';
-import { ApiOutlined, WarningOutlined, CheckCircleOutlined, CopyOutlined, SafetyOutlined } from '@ant-design/icons';
+import { ApiOutlined, WarningOutlined, CheckCircleOutlined, CopyOutlined } from '@ant-design/icons';
 import { testConnection, setEndpoint, setCredentials, setBucket, initFromSession } from '../s3client';
 import { adminLogin, loginAs, whoami, recoverDb } from '../adminApi';
 import type { ExternalProviderInfo } from '../adminApi';
+import OAuthProviderList from './OAuthProviderList';
 import { detectDefaultEndpoint } from '../utils';
 import { useColors } from '../ThemeContext';
 
@@ -57,8 +58,13 @@ export default function ConnectPage({ onConnect, showError }: Props) {
           const result = await testConnection(endpoint, 'anonymous', 'anonymous').catch(() => ({ ok: false } as const));
           if (result.ok && 'buckets' in result && result.buckets && result.buckets.length > 0) {
             setBucket(result.buckets[0]);
+            onConnect();
+            return;
           }
-          onConnect();
+          // S3 backend unreachable in open mode — fall through to show connect page
+          // so user can see the error and retry
+          setDetecting(false);
+          setError('Open access mode but S3 backend is unreachable. Check server configuration.');
           return;
         }
         setDetecting(false);
@@ -333,29 +339,12 @@ export default function ConnectPage({ onConnect, showError }: Props) {
 
           {/* OAuth provider buttons — shown prominently when available */}
           {externalProviders.length > 0 && (
-            <div>
-              {externalProviders.map(p => (
-                <a
-                  key={p.name}
-                  href={`/_/api/admin/oauth/authorize/${encodeURIComponent(p.name)}?next=${encodeURIComponent(window.location.pathname)}`}
-                  style={{
-                    display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10,
-                    width: '100%', padding: '12px 16px', marginBottom: 8,
-                    borderRadius: 10, border: `1px solid ${BORDER}`,
-                    background: 'var(--input-bg)', color: TEXT_PRIMARY,
-                    fontSize: 15, fontWeight: 600, fontFamily: 'var(--font-ui)',
-                    textDecoration: 'none', cursor: 'pointer',
-                    transition: 'border-color 0.15s, background 0.15s',
-                    height: 48,
-                  }}
-                  onMouseEnter={e => { (e.currentTarget as HTMLElement).style.borderColor = ACCENT_BLUE; }}
-                  onMouseLeave={e => { (e.currentTarget as HTMLElement).style.borderColor = BORDER; }}
-                >
-                  <SafetyOutlined style={{ fontSize: 18 }} />
-                  Sign in with {p.display_name}
-                </a>
-              ))}
-            </div>
+            <OAuthProviderList
+              providers={externalProviders}
+              nextUrl={window.location.pathname}
+              height={48}
+              fontSize={15}
+            />
           )}
 
           {/* Credential form — collapsible when OAuth is available */}

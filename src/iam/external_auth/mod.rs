@@ -81,6 +81,16 @@ impl ExternalAuthManager {
             }
         }
         *self.providers.write() = providers;
+        // Invalidate all pending OAuth flows — they hold references to old provider configs
+        // (client_id, secrets) that may no longer match. Users will need to restart the flow.
+        let cleared = self.pending.write().len();
+        self.pending.write().clear();
+        if cleared > 0 {
+            tracing::info!(
+                "Cleared {} pending OAuth flow(s) after provider rebuild",
+                cleared
+            );
+        }
     }
 
     /// Run OIDC discovery for all providers (fetch endpoints and JWKS).

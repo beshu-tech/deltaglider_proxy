@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Button, Typography, Input, Alert, Switch, Select, Divider, Spin, message } from 'antd';
+import { Button, Typography, Input, Alert, Switch, Divider, Spin, message } from 'antd';
+import SimpleSelect from './SimpleSelect';
 import { PlusOutlined, DeleteOutlined, SearchOutlined, CopyOutlined, SafetyOutlined, CheckCircleOutlined, CloseCircleOutlined, SyncOutlined } from '@ant-design/icons';
 import {
   getAuthProviders, createAuthProvider, updateAuthProvider, deleteAuthProvider, testAuthProvider,
@@ -37,6 +38,10 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
   const [saving, setSaving] = useState(false);
   const [testResult, setTestResult] = useState<ProviderTestResult | null>(null);
   const [testing, setTesting] = useState(false);
+
+  // Mapping rules dirty/saving state
+  const [rulesDirty, setRulesDirty] = useState(false);
+  const [rulesSaving, setRulesSaving] = useState(false);
 
   // Mapping preview
   const [previewEmail, setPreviewEmail] = useState('');
@@ -341,24 +346,61 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
         <Text type="secondary" style={{ fontSize: 12 }}>No rules configured. Add allowed email patterns (e.g. *@company.com) and assign them to groups.</Text>
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 16 }}>
-          {rules.map(rule => (
+          {rules.map((rule, idx) => (
             <MappingRuleRow
               key={rule.id}
               rule={rule}
               providers={providers}
               groups={groups}
               colors={colors}
-              onUpdate={async (req) => {
-                await updateMappingRule(rule.id, req);
-                await loadData();
+              onUpdate={(req) => {
+                // Local edit only — no API call. Save button appears below.
+                const next = [...rules];
+                next[idx] = { ...next[idx], ...req as Partial<typeof rule> };
+                setRules(next);
+                setRulesDirty(true);
               }}
               onDelete={async () => {
                 await deleteMappingRule(rule.id);
                 await loadData();
+                setRulesDirty(false);
               }}
             />
           ))}
         </div>
+      )}
+
+      {rulesDirty && (
+        <Button
+          type="primary"
+          loading={rulesSaving}
+          onClick={async () => {
+            setRulesSaving(true);
+            try {
+              for (const rule of rules) {
+                await updateMappingRule(rule.id, {
+                  match_type: rule.match_type,
+                  match_field: rule.match_field,
+                  match_value: rule.match_value,
+                  group_id: rule.group_id,
+                  provider_id: rule.provider_id,
+                  priority: rule.priority,
+                });
+              }
+              message.success('Mapping rules saved');
+              setRulesDirty(false);
+              await loadData();
+            } catch (e) {
+              message.error(e instanceof Error ? e.message : 'Save failed');
+            } finally {
+              setRulesSaving(false);
+            }
+          }}
+          style={{ borderRadius: 8, fontWeight: 600, marginBottom: 16 }}
+          block
+        >
+          Save Rules
+        </Button>
       )}
 
       {/* Preview */}
@@ -437,8 +479,8 @@ interface MappingRuleRowProps {
   providers: AuthProvider[];
   groups: IamGroup[];
   colors: ReturnType<typeof useColors>;
-  onUpdate: (req: Record<string, unknown>) => Promise<void>;
-  onDelete: () => Promise<void>;
+  onUpdate: (req: Record<string, unknown>) => void;
+  onDelete: () => void;
 }
 
 const MATCH_TYPES = [
@@ -457,12 +499,12 @@ function MappingRuleRow({ rule, providers, groups, colors, onUpdate, onDelete }:
       flexWrap: 'wrap',
     }}>
       <Text style={{ fontSize: 12, color: colors.TEXT_MUTED, whiteSpace: 'nowrap' }}>When</Text>
-      <Select
+      <SimpleSelect
         size="small"
         value={rule.match_type}
         onChange={v => onUpdate({ match_type: v })}
-        options={MATCH_TYPES}
-        style={{ width: 130 }}
+        options={MATCH_TYPES.map(t => ({ value: t.value, label: t.label }))}
+        style={{ width: 140 }}
       />
       {rule.match_type === 'claim_value' && (
         <>
@@ -489,22 +531,23 @@ function MappingRuleRow({ rule, providers, groups, colors, onUpdate, onDelete }:
         }
       />
       <Text style={{ fontSize: 12, color: colors.TEXT_MUTED, whiteSpace: 'nowrap' }}>assign to</Text>
-      <Select
+      <SimpleSelect
         size="small"
-        value={rule.group_id}
-        onChange={v => onUpdate({ group_id: v })}
-        options={groups.map(g => ({ value: g.id, label: g.name }))}
+        value={String(rule.group_id)}
+        onChange={v => onUpdate({ group_id: Number(v) })}
+        options={groups.map(g => ({ value: String(g.id), label: g.name }))}
         style={{ width: 140 }}
       />
-      <Select
+      <SimpleSelect
         size="small"
-        value={rule.provider_id ?? 0}
-        onChange={v => onUpdate({ provider_id: v === 0 ? null : v })}
+        value={String(rule.provider_id ?? 0)}
+        onChange={v => onUpdate({ provider_id: Number(v) === 0 ? null : Number(v) })}
         options={[
-          { value: 0, label: 'All providers' },
-          ...providers.map(p => ({ value: p.id, label: p.display_name || p.name })),
+          { value: '0', label: 'All providers' },
+          ...providers.map(p => ({ value: String(p.id), label: p.display_name || p.name })),
         ]}
         style={{ width: 130 }}
+
       />
       <Button size="small" danger icon={<DeleteOutlined />} onClick={onDelete} />
     </div>

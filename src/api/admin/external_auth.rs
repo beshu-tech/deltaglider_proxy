@@ -321,10 +321,19 @@ pub async fn oauth_callback(
         .into_response();
     }
 
-    // Evaluate group mapping rules and reconcile memberships
+    // Evaluate group mapping rules and MERGE with existing memberships.
+    // Manual group assignments (e.g., admin added user to "administrators" via GUI)
+    // are preserved — mapping rules only ADD groups, never remove manually-assigned ones.
     let rules = db.load_group_mapping_rules().unwrap_or_default();
-    let target_groups = mapping::evaluate_mappings(&rules, &identity, provider_config.id);
-    if let Err(e) = db.set_user_group_memberships(user.id, &target_groups) {
+    let rule_groups = mapping::evaluate_mappings(&rules, &identity, provider_config.id);
+    let existing_groups = db.get_user_group_ids(user.id).unwrap_or_default();
+    let mut merged: Vec<i64> = existing_groups;
+    for gid in &rule_groups {
+        if !merged.contains(gid) {
+            merged.push(*gid);
+        }
+    }
+    if let Err(e) = db.set_user_group_memberships(user.id, &merged) {
         tracing::warn!(
             "Failed to update group memberships for user {}: {}",
             user.id,
@@ -711,11 +720,19 @@ pub async fn sync_memberships(
             raw_claims: ext_id.raw_claims.clone().unwrap_or(serde_json::json!({})),
         };
 
-        let target_groups = mapping::evaluate_mappings(&rules, &identity_info, ext_id.provider_id);
+        let rule_groups = mapping::evaluate_mappings(&rules, &identity_info, ext_id.provider_id);
         let current_groups = db.get_user_group_ids(ext_id.user_id).unwrap_or_default();
 
-        if target_groups != current_groups {
-            if let Err(e) = db.set_user_group_memberships(ext_id.user_id, &target_groups) {
+        // Merge: add rule-matched groups to existing memberships (preserve manual assignments)
+        let mut merged = current_groups.clone();
+        for gid in &rule_groups {
+            if !merged.contains(gid) {
+                merged.push(*gid);
+            }
+        }
+
+        if merged != current_groups {
+            if let Err(e) = db.set_user_group_memberships(ext_id.user_id, &merged) {
                 tracing::warn!(
                     "Failed to sync memberships for user {}: {}",
                     ext_id.user_id,
@@ -723,7 +740,7 @@ pub async fn sync_memberships(
                 );
                 continue;
             }
-            memberships_changed += symmetric_diff_count(&current_groups, &target_groups);
+            memberships_changed += symmetric_diff_count(&current_groups, &merged);
             users_updated += 1;
         }
     }
@@ -742,18 +759,25 @@ pub async fn sync_memberships(
 
 // ── Helpers ──
 
-/// Build the OAuth callback URI from the request's Host header.
+/// Build the OAuth callback URI from request headers.
+/// Respects X-Forwarded-Proto/X-Forwarded-Host from reverse proxies.
 fn build_callback_uri(headers: &HeaderMap) -> String {
     let host = headers
-        .get(header::HOST)
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(header::HOST))
         .and_then(|v| v.to_str().ok())
         .unwrap_or("localhost");
 
-    let scheme = if host.starts_with("localhost") || host.starts_with("127.0.0.1") {
-        "http"
-    } else {
-        "https"
-    };
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_else(|| {
+            if host.starts_with("localhost") || host.starts_with("127.0.0.1") {
+                "http"
+            } else {
+                "https"
+            }
+        });
 
     format!("{}://{}/_/api/admin/oauth/callback", scheme, host)
 }

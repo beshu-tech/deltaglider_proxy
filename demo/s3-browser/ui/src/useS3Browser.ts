@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { listObjects, deleteObjects, deletePrefix, uploadObject, getBucket, headObject, hasCredentials } from './s3client';
+import { listObjects, deleteObjects, deletePrefix, uploadObject, getBucket, setBucket, headObject, hasCredentials } from './s3client';
 import useSelection from './useSelection';
 import type { S3Object } from './types';
 
@@ -149,7 +149,8 @@ export default function useS3Browser() {
   }, [resetBrowseState]);
 
   const changeBucket = useCallback((newBucket: string) => {
-    setBucketState(newBucket);
+    setBucket(newBucket);       // Update the s3client's active bucket FIRST
+    setBucketState(newBucket);  // Then update React state
     resetBrowseState();
     setPrefix('');
     setRefreshTrigger((k) => k + 1);

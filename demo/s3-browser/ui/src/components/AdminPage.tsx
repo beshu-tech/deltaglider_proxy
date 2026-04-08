@@ -6,7 +6,6 @@ import {
   CloudOutlined,
   CloudServerOutlined,
   DatabaseOutlined,
-  ControlOutlined,
   TeamOutlined,
   FolderOutlined,
   LockOutlined,
@@ -23,23 +22,26 @@ import GroupsPanel from './GroupsPanel';
 import AuthenticationPanel from './AuthenticationPanel';
 import BackendsPanel from './BackendsPanel';
 import MetricsPage from './MetricsPage';
+import OAuthProviderList from './OAuthProviderList';
 import { useNavigation } from '../NavigationContext';
+import TabHeader from './TabHeader';
 
 const { Text } = Typography;
 
-const VALID_TABS = new Set(['users', 'groups', 'auth', 'metrics', 'backends', 'backend', 'compression', 'limits', 'security', 'logging']);
+const VALID_TABS = new Set(['users', 'groups', 'auth', 'metrics', 'backends', 'backend', 'limits', 'security', 'logging']);
+// Redirect old compression tab URLs to backends
+const TAB_REDIRECTS: Record<string, string> = { compression: 'backends' };
 
-const TABS = [
-  { key: 'users', label: 'Users', icon: <TeamOutlined /> },
-  { key: 'groups', label: 'Groups', icon: <FolderOutlined /> },
-  { key: 'auth', label: 'Authentication', icon: <SafetyOutlined /> },
-  { key: 'metrics', label: 'Metrics', icon: <DashboardOutlined /> },
-  { key: 'backends', label: 'Backends', icon: <CloudServerOutlined /> },
-  { key: 'backend', label: 'Connection', icon: <DatabaseOutlined /> },
-  { key: 'compression', label: 'Compression', icon: <ControlOutlined /> },
-  { key: 'limits', label: 'Limits', icon: <CloudOutlined /> },
-  { key: 'security', label: 'Security', icon: <LockOutlined /> },
-  { key: 'logging', label: 'Logging', icon: <DatabaseOutlined /> },
+const TABS: Array<{ key: string; label: string; icon: React.ReactNode; title: string; description: string }> = [
+  { key: 'users', label: 'Users', icon: <TeamOutlined />, title: 'User Management', description: 'Create and manage IAM users with fine-grained S3 permissions. Each user gets their own access key and secret for SigV4 authentication.' },
+  { key: 'groups', label: 'Groups', icon: <FolderOutlined />, title: 'Groups', description: 'Organize users into groups with shared permission policies. Users inherit all permissions from their groups.' },
+  { key: 'auth', label: 'Authentication', icon: <SafetyOutlined />, title: 'External Authentication', description: 'Configure OAuth/OIDC providers for single sign-on. Map employee emails to groups for automatic permission assignment.' },
+  { key: 'metrics', label: 'Metrics', icon: <DashboardOutlined />, title: 'Metrics & Monitoring', description: 'Live Prometheus metrics for request traffic, cache performance, delta compression ratios, and storage savings.' },
+  { key: 'backends', label: 'Storage', icon: <CloudServerOutlined />, title: 'Storage & Compression', description: 'Configure storage backends, delta compression defaults, per-bucket routing and policies.' },
+  { key: 'backend', label: 'Connection', icon: <DatabaseOutlined />, title: 'Primary Backend', description: 'Configure the default storage backend connection. This is used when no named backends are configured or as fallback.' },
+  { key: 'limits', label: 'Limits', icon: <CloudOutlined />, title: 'Request Limits', description: 'Protect the server from overload with request timeouts, concurrency limits, and multipart upload caps.' },
+  { key: 'security', label: 'Security', icon: <LockOutlined />, title: 'Security & Sessions', description: 'Configure SigV4 clock skew tolerance, replay detection, rate limiting, session TTL, and cookie security.' },
+  { key: 'logging', label: 'Logging', icon: <DatabaseOutlined />, title: 'Logging', description: 'Control log verbosity at runtime. Changes take effect immediately without restart.' },
 ];
 
 interface AdminPageProps {
@@ -52,23 +54,21 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
   const colors = useColors();
   const { navigate } = useNavigation();
 
-  // Derive active tab from URL sub-path
-  const activeTab = VALID_TABS.has(subPath || '') ? subPath! : 'users';
+  // Derive active tab from URL sub-path, with redirects for renamed tabs
+  const rawTab = subPath || '';
+  const activeTab = VALID_TABS.has(rawTab) ? rawTab : TAB_REDIRECTS[rawTab] || 'users';
   const setActiveTab = useCallback((tab: string) => {
     navigate(`admin/${tab}`);
   }, [navigate]);
 
   const [authed, setAuthed] = useState(false);
   const [checkingSession, setCheckingSession] = useState(true);
-  const [, setAuthMode] = useState<'bootstrap' | 'iam' | 'open'>('bootstrap');
   const [externalProviders, setExternalProviders] = useState<ExternalProviderInfo[]>([]);
   const [accessDenied, setAccessDenied] = useState(false);
   const [password, setPassword] = useState('');
   const [loginLoading, setLoginLoading] = useState(false);
   const [pendingGroupId, setPendingGroupId] = useState<number | null>(null);
   const [loginError, setLoginError] = useState('');
-  const savingRef = { current: false };
-  const setSaving = useCallback((v: boolean) => { savingRef.current = v; }, []);
 
   // Check existing session on mount, or auto-login for IAM admins
   useEffect(() => {
@@ -84,7 +84,6 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
       }
 
       const info = await whoami();
-      setAuthMode(info.mode);
       setExternalProviders(info.external_providers || []);
 
       // In IAM mode, attempt auto-login with the current S3 credentials.
@@ -144,26 +143,32 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
   }, [setActiveTab]);
 
   const renderContent = () => {
+    const tab = TABS.find(t => t.key === activeTab);
+    const header = tab ? <TabHeader icon={tab.icon} title={tab.title} description={tab.description} /> : null;
+
     if (activeTab === 'users') {
-      return <UsersPanel onSessionExpired={onSessionExpired} onSavingChange={setSaving} onNavigateToGroup={navigateToGroup} />;
+      return <>{header}<UsersPanel onSessionExpired={onSessionExpired} onNavigateToGroup={navigateToGroup} /></>;
     }
     if (activeTab === 'groups') {
-      return <GroupsPanel onSessionExpired={onSessionExpired} onSavingChange={setSaving} initialGroupId={pendingGroupId} onGroupSelected={() => setPendingGroupId(null)} />;
+      return <>{header}<GroupsPanel onSessionExpired={onSessionExpired} initialGroupId={pendingGroupId} onGroupSelected={() => setPendingGroupId(null)} /></>;
     }
     if (activeTab === 'auth') {
-      return <AuthenticationPanel onSessionExpired={onSessionExpired} />;
+      return <>{header}<AuthenticationPanel onSessionExpired={onSessionExpired} /></>;
     }
     if (activeTab === 'backends') {
-      return <BackendsPanel onSessionExpired={onSessionExpired} />;
+      return <>{header}<BackendsPanel onSessionExpired={onSessionExpired} /></>;
     }
     if (activeTab === 'metrics') {
-      return <MetricsPage onBack={onBack} embedded />;
+      return <>{header}<MetricsPage onBack={onBack} embedded /></>;
     }
     return (
-      <SettingsPage
-        onSessionExpired={onSessionExpired}
-        embeddedTab={activeTab}
-      />
+      <>
+        {header}
+        <SettingsPage
+          onSessionExpired={onSessionExpired}
+          embeddedTab={activeTab}
+        />
+      </>
     );
   };
 
@@ -198,26 +203,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
           {/* OAuth provider buttons */}
           {externalProviders.length > 0 && (
             <div style={{ marginBottom: 16 }}>
-              {externalProviders.map(p => (
-                <a
-                  key={p.name}
-                  href={`/_/api/admin/oauth/authorize/${encodeURIComponent(p.name)}?next=${encodeURIComponent('/_/admin')}`}
-                  style={{
-                    display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10,
-                    width: '100%', padding: '10px 16px', marginBottom: 8,
-                    borderRadius: 10, border: `1px solid ${colors.BORDER}`,
-                    background: colors.BG_CARD, color: colors.TEXT_PRIMARY,
-                    fontSize: 14, fontWeight: 600, fontFamily: 'var(--font-ui)',
-                    textDecoration: 'none', cursor: 'pointer',
-                    transition: 'border-color 0.15s, background 0.15s',
-                  }}
-                  onMouseEnter={e => { (e.target as HTMLElement).style.borderColor = colors.ACCENT_BLUE; }}
-                  onMouseLeave={e => { (e.target as HTMLElement).style.borderColor = colors.BORDER; }}
-                >
-                  <SafetyOutlined />
-                  Sign in with {p.display_name}
-                </a>
-              ))}
+              <OAuthProviderList providers={externalProviders} nextUrl="/_/admin" />
               <div style={{ display: 'flex', alignItems: 'center', gap: 12, margin: '16px 0' }}>
                 <div style={{ flex: 1, height: 1, background: colors.BORDER }} />
                 <Text type="secondary" style={{ fontSize: 12 }}>or</Text>
