@@ -287,6 +287,7 @@ pub fn init_iam_state(config: &Config) -> SharedIamState {
 /// Build the S3-compatible router with all routes and middleware layers.
 use deltaglider_proxy::api::ConfigDbMismatchGuard;
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_s3_router(
     state: &Arc<AppState>,
     iam_state: &SharedIamState,
@@ -295,6 +296,7 @@ pub fn build_s3_router(
     replay_cache: &deltaglider_proxy::api::auth::ReplayCache,
     config: &Config,
     config_db_mismatch: bool,
+    public_prefix_snapshot: &deltaglider_proxy::bucket_policy::SharedPublicPrefixSnapshot,
 ) -> Router {
     // S3 API paths:
     //   GET / - list buckets
@@ -348,7 +350,8 @@ pub fn build_s3_router(
         .layer(middleware::from_fn(authorization_middleware))
         // SigV4 authentication (looks up user, verifies signature)
         .layer(middleware::from_fn(sigv4_auth_middleware))
-        .layer(axum::Extension(iam_state.clone()));
+        .layer(axum::Extension(iam_state.clone()))
+        .layer(axum::Extension(public_prefix_snapshot.clone()));
 
     // If config DB mismatch, inject guard that blocks all S3 API requests
     if config_db_mismatch {

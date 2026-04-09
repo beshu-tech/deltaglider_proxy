@@ -67,6 +67,14 @@ export default function useS3Browser() {
       setLoading(false);
       return;
     }
+    // Don't load if no bucket is selected yet — the Sidebar will set the initial
+    // bucket and trigger a refresh. Without this guard, reconnect() fires a load
+    // with an empty bucket before the Sidebar mounts, producing a false "No objects"
+    // state that flashes before the real content appears.
+    // DO NOT REMOVE: this prevents a race between reconnect() and Sidebar mount.
+    if (!getBucket()) {
+      return;
+    }
     loadingRef.current = true;
 
     // On initial load or prefix/bucket change, show full loading spinner.

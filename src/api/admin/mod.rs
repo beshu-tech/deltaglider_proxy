@@ -71,6 +71,8 @@ pub struct AdminState {
     pub config_db_mismatch: bool,
     /// External authentication manager (OAuth/OIDC). None if no providers configured.
     pub external_auth: Option<Arc<ExternalAuthManager>>,
+    /// Public prefix snapshot for unauthenticated read-only access. Hot-swappable.
+    pub public_prefix_snapshot: crate::bucket_policy::SharedPublicPrefixSnapshot,
 }
 
 /// Trigger an async config DB upload to S3 if sync is enabled.

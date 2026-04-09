@@ -28,7 +28,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
   const [error, setError] = useState<string | null>(null);
 
   // Per-bucket policies (local edit state)
-  const [bucketPolicies, setBucketPolicies] = useState<Array<{ name: string; compression: boolean; max_delta_ratio: number | null; backend: string; alias: string }>>([]);
+  const [bucketPolicies, setBucketPolicies] = useState<Array<{ name: string; compression: boolean; max_delta_ratio: number | null; backend: string; alias: string; public_prefixes: string[] }>>([]);
   const [policyDirty, setPolicyDirty] = useState(false);
   const [policySaving, setPolicySaving] = useState(false);
 
@@ -68,6 +68,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
             max_delta_ratio: p.max_delta_ratio ?? null,
             backend: p.backend ?? '',
             alias: p.alias ?? '',
+            public_prefixes: p.public_prefixes ?? [],
           }))
         );
       }
@@ -88,7 +89,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
   const handleSavePolicies = async () => {
     setPolicySaving(true);
     try {
-      const bp: Record<string, { compression?: boolean; max_delta_ratio?: number; backend?: string; alias?: string }> = {};
+      const bp: Record<string, { compression?: boolean; max_delta_ratio?: number; backend?: string; alias?: string; public_prefixes?: string[] }> = {};
       for (const p of bucketPolicies) {
         if (!p.name) continue;
         bp[p.name] = {
@@ -96,6 +97,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
           ...(p.max_delta_ratio != null ? { max_delta_ratio: p.max_delta_ratio } : {}),
           ...(p.backend ? { backend: p.backend } : {}),
           ...(p.alias ? { alias: p.alias } : {}),
+          ...(p.public_prefixes.length > 0 ? { public_prefixes: p.public_prefixes.filter(s => s.length > 0) } : {}),
         };
       }
       await updateAdminConfig({ bucket_policies: bp });
@@ -400,12 +402,56 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                   <Input value={bp.alias} onChange={(e) => updatePolicy(idx, { alias: e.target.value })} placeholder="same as bucket" style={{ width: 130, ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 11 }} size="small" />
                 </div>
               </div>
+              {/* Public Prefixes */}
+              <div style={{ marginTop: 8, paddingTop: 8, borderTop: `1px solid ${colors.BORDER}` }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                  <Text style={{ fontSize: 11, fontWeight: 600, color: bp.public_prefixes.length > 0 ? colors.ACCENT_AMBER : colors.TEXT_MUTED, fontFamily: 'var(--font-ui)' }}>
+                    Public Prefixes {bp.public_prefixes.length > 0 && `(${bp.public_prefixes.length})`}
+                  </Text>
+                  <Button type="text" size="small" icon={<PlusOutlined />} onClick={() => {
+                    updatePolicy(idx, { public_prefixes: [...bp.public_prefixes, ''] });
+                  }} style={{ fontSize: 10, color: colors.TEXT_MUTED, padding: '0 4px' }}>Add</Button>
+                </div>
+                {bp.public_prefixes.map((prefix, pi) => (
+                  <div key={pi} style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 3 }}>
+                    <Input
+                      value={prefix}
+                      onChange={(e) => {
+                        const next = [...bp.public_prefixes];
+                        next[pi] = e.target.value;
+                        updatePolicy(idx, { public_prefixes: next });
+                      }}
+                      onBlur={(e) => {
+                        // Auto-append trailing '/' if missing (UX nudge)
+                        const v = e.target.value;
+                        if (v && !v.endsWith('/')) {
+                          const next = [...bp.public_prefixes];
+                          next[pi] = v + '/';
+                          updatePolicy(idx, { public_prefixes: next });
+                        }
+                      }}
+                      placeholder="e.g. builds/"
+                      style={{ flex: 1, ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 11 }}
+                      size="small"
+                    />
+                    <Button type="text" size="small" danger onClick={() => {
+                      const next = bp.public_prefixes.filter((_, i) => i !== pi);
+                      updatePolicy(idx, { public_prefixes: next });
+                    }} style={{ padding: '0 4px', minWidth: 0 }}>×</Button>
+                  </div>
+                ))}
+                {bp.public_prefixes.length > 0 && (
+                  <Text style={{ fontSize: 10, color: colors.ACCENT_AMBER, fontFamily: 'var(--font-ui)', display: 'block', marginTop: 2 }}>
+                    Objects under these prefixes are publicly accessible without authentication.
+                  </Text>
+                )}
+              </div>
             </div>
           ))}
 
           <Button
             icon={<PlusOutlined />}
-            onClick={() => { setBucketPolicies([...bucketPolicies, { name: '', compression: true, max_delta_ratio: null, backend: '', alias: '' }]); setPolicyDirty(true); }}
+            onClick={() => { setBucketPolicies([...bucketPolicies, { name: '', compression: true, max_delta_ratio: null, backend: '', alias: '', public_prefixes: [] }]); setPolicyDirty(true); }}
             style={{ marginTop: 12, borderRadius: 8, fontFamily: 'var(--font-ui)', fontWeight: 600 }}
             block type="dashed"
           >

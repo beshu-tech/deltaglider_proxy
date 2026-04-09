@@ -94,7 +94,10 @@ export default function UploadPage({ prefix, onBack, onDone }: Props) {
   const handleFolderConfirm = () => {
     const trimmed = folderName.replace(/^\/+|\/+$/g, '');
     if (trimmed) {
-      setDestination((prev) => (prev ? `${prev}${trimmed}/` : `${trimmed}/`));
+      setDestination((prev) => {
+        const base = prev ? prev.replace(/\/+$/, '') : '';
+        return base ? `${base}/${trimmed}/` : `${trimmed}/`;
+      });
     }
     setFolderModalOpen(false);
     setFolderName('');
