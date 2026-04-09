@@ -41,7 +41,7 @@ Clients see standard S3. They don't know which backend stores their bucket. They
 
 ### Delegated Authentication
 
-![OAuth login with Google](docs/screenshots/oauth.jpg)
+![OAuth login with Google](docs/screenshots/oauth_login.jpg)
 
 - **OAuth/OIDC single sign-on** — Let your team log in with Google, Okta, Azure AD, or any OIDC provider. No shared S3 credentials.
 - **Group mapping rules** — Automatically assign permissions based on email domain (`*@company.com`), glob patterns, regex, or identity provider claims. New hires get the right access on first login.
@@ -76,7 +76,11 @@ Everything managed from a web UI served on the same port as the S3 API — no ex
 
 ![Admin GUI — IAM user management with ABAC permissions](docs/screenshots/iam.jpg)
 
+![Storage analytics — per-bucket savings breakdown and cost estimation](docs/screenshots/analytics.jpg)
+
 ### Enterprise Security
+
+![Advanced security settings — rate limiting, session hardening, anti-fingerprinting](docs/screenshots/advanced_security.jpg)
 - **Mandatory authentication** — proxy refuses to start without credentials (no accidental open deployments)
 - **Encrypted config database** — IAM users and OAuth config stored in SQLCipher-encrypted database, synced across instances via S3
 - **Per-IP rate limiting** — progressive delay and lockout on auth endpoints (brute-force resistant)
