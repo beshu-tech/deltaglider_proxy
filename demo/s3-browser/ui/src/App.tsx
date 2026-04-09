@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Layout, Spin, Empty, Grid, Button } from 'antd';
-import { DeleteOutlined } from '@ant-design/icons';
+import { Layout, Spin, Empty, Grid } from 'antd';
 import useS3Browser from './useS3Browser';
 import TopBar from './components/TopBar';
+import BulkActionBar from './components/BulkActionBar';
 import Sidebar from './components/Sidebar';
 import ObjectTable from './components/ObjectTable';
 import InspectorPanel from './components/InspectorPanel';
@@ -239,23 +239,14 @@ export default function App() {
     return (
       <>
         {s3.selectedKeys.size > 0 && (
-          <div style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'flex-end',
-            padding: '8px 20px',
-            borderBottom: `1px solid ${colors.BORDER}`,
-          }}>
-            <Button
-              danger
-              icon={<DeleteOutlined />}
-              onClick={s3.bulkDelete}
-              loading={s3.deleting}
-              size="small"
-            >
-              {s3.deleting ? 'Deleting...' : `Delete ${s3.selectedKeys.size} selected`}
-            </Button>
-          </div>
+          <BulkActionBar
+            selectedCount={s3.selectedKeys.size}
+            onDelete={s3.bulkDelete}
+            onCopy={s3.bulkCopy}
+            onMove={s3.bulkMove}
+            onDownloadZip={s3.downloadZip}
+            deleting={s3.deleting}
+          />
         )}
 
         <div style={{ flex: 1, overflow: 'auto' }}>

@@ -4,6 +4,9 @@ import { ArrowLeftOutlined, ReloadOutlined, InfoCircleOutlined } from '@ant-desi
 import { useColors } from '../ThemeContext';
 import { formatBytes } from '../utils';
 import { useCardStyles } from './shared-styles';
+import AnalyticsSection from './AnalyticsSection';
+import { getAdminConfig } from '../adminApi';
+import type { AdminConfig } from '../adminApi';
 import {
   AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
   XAxis, YAxis, Tooltip as RTooltip, ResponsiveContainer,
@@ -216,6 +219,14 @@ export default function MetricsPage({ onBack, embedded }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [history, setHistory] = useState<Snapshot[]>([]);
+  const [activeView, setActiveView] = useState<'monitoring' | 'analytics'>(() =>
+    (localStorage.getItem('dg-metrics-view') as 'monitoring' | 'analytics') || 'monitoring'
+  );
+  const [adminConfig, setAdminConfig] = useState<AdminConfig | null>(null);
+
+  useEffect(() => {
+    getAdminConfig().then(setAdminConfig).catch(() => {});
+  }, []);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const prevRef = useRef<{ hits: number; misses: number; http: number; latencySum: number; latencyCount: number } | null>(null);
 
@@ -358,6 +369,31 @@ export default function MetricsPage({ onBack, embedded }: Props) {
           {!embedded && <Button size="small" icon={<ArrowLeftOutlined />} onClick={onBack} style={{ borderRadius: 8 }}>Back</Button>}
         </Space>
       </div>
+
+      {/* View toggle */}
+      <div style={{ display: 'flex', gap: 0, marginBottom: 20, background: colors.BG_CARD, borderRadius: 8, border: `1px solid ${colors.BORDER}`, overflow: 'hidden' }}>
+        {(['monitoring', 'analytics'] as const).map(v => (
+          <button
+            key={v}
+            onClick={() => { setActiveView(v); localStorage.setItem('dg-metrics-view', v); }}
+            style={{
+              flex: 1, padding: '10px 16px', border: 'none', cursor: 'pointer',
+              background: activeView === v ? `${colors.ACCENT_BLUE}18` : 'transparent',
+              borderBottom: activeView === v ? `2px solid ${colors.ACCENT_BLUE}` : '2px solid transparent',
+              color: activeView === v ? colors.ACCENT_BLUE : colors.TEXT_SECONDARY,
+              fontSize: 13, fontWeight: 600, fontFamily: 'var(--font-ui)',
+              transition: 'all 0.15s',
+            }}
+          >
+            {v === 'monitoring' ? 'Monitoring' : 'Analytics'}
+          </button>
+        ))}
+      </div>
+
+      {activeView === 'analytics' ? (
+        <AnalyticsSection config={adminConfig} />
+      ) : (
+      <>
 
       {error && <div style={{ ...cardStyle, borderColor: colors.ACCENT_RED, marginBottom: 16 }}><Text style={{ color: colors.ACCENT_RED }}>Failed to load metrics: {error}</Text></div>}
 
@@ -554,6 +590,8 @@ export default function MetricsPage({ onBack, embedded }: Props) {
             </div>
           </>)}
         </Section>
+      )}
+      </>
       )}
     </div>
   );
