@@ -1,10 +1,8 @@
 # DeltaGlider Proxy
 
-**Drop-in S3 proxy that delta-compresses versioned binaries. Clients see standard S3. Storage drops 60-95%.**
+**S3-compatible proxy with transparent delta compression, multi-user IAM, OAuth login, multi-backend routing, and a built-in admin GUI. Single binary, single port.**
 
-You store versioned binaries (releases, firmware, ML checkpoints, Docker layers). Each version is 90%+ identical to the last. S3 stores each one in full. You pay for all of it.
-
-DeltaGlider sits between your S3 clients and your storage backend. It intercepts PUTs, computes xdelta3 diffs against a per-prefix baseline, and stores the delta when it's smaller. GETs reconstruct the original on the fly. Your clients never know.
+DeltaGlider sits between your S3 clients and your storage backend. Clients see a standard S3 API — no SDK changes, no client awareness. The proxy silently deduplicates versioned binaries using xdelta3, cutting storage 60-95% for workloads like release artifacts, firmware, ML checkpoints, and Docker layers.
 
 ```
 PUT releases/v2.zip ──▶ DeltaGlider ──▶ stored as 1.4MB delta (was 82MB)
@@ -13,7 +11,59 @@ GET releases/v2.zip ──▶ DeltaGlider ──▶ reconstructed, streamed back
 
 ![DeltaGlider UI — file browser with delta compression stats](docs/screenshots/browser-dark.png)
 
-## Quick start
+## Features
+
+### Delta Compression
+- Transparent xdelta3 encoding on PUT, on-the-fly reconstruction on GET
+- Per-prefix deltaspace with automatic baseline management
+- SHA-256 verified on every reconstructed GET — corruption detected immediately
+- Per-bucket compression policies (enable/disable, custom ratio thresholds)
+- Intelligent file routing: archives get delta-compressed, images/video pass through untouched
+
+### Authentication & Access Control
+- **SigV4 authentication** — header auth and presigned URLs (up to 7 days)
+- **Multi-user IAM** — per-user credentials stored in encrypted SQLCipher database
+- **ABAC permissions** — Allow/Deny rules with action verbs (read, write, delete, list, admin), resource patterns (bucket/prefix/*), and AWS-style conditions (s3:prefix, aws:SourceIp)
+- **OAuth/OIDC** — Login with Google or any OIDC provider. PKCE, JWT validation, group mapping rules (email domain, glob, regex, claim value)
+- **Public prefixes** — Expose specific bucket/prefix paths for unauthenticated read-only access (downloads + listing)
+- **Mandatory authentication** — proxy refuses to start without credentials unless explicitly opted out
+
+### Multi-Backend Routing
+- Route different buckets to different storage backends (filesystem, S3, mixed)
+- Bucket aliasing — map virtual bucket names to real backend buckets
+- Hot-reloadable backend configuration via admin GUI
+
+### Admin GUI
+Everything managed from a built-in web UI served on the same port as the S3 API (`/_/`):
+
+- **File browser** — navigate, upload, download, preview, bulk copy/move/delete/ZIP
+- **User management** — create IAM users, assign permissions, rotate keys, manage groups
+- **OAuth configuration** — add providers, configure group mapping rules
+- **Storage backends** — add/remove backends, per-bucket routing and compression policies, public prefix configuration
+- **Monitoring dashboard** — live Prometheus metrics (request rates, latencies, cache hit rates, status codes, auth events)
+- **Storage analytics** — per-bucket savings breakdown, estimated monthly cost savings, compression opportunity detection
+- **Embedded documentation** — full-text searchable docs with Mermaid diagrams
+
+![Admin GUI — IAM user management](docs/screenshots/admin-users.png)
+
+### Security
+- Per-IP rate limiting with progressive delay and lockout on auth endpoints
+- Session IP binding, configurable TTL (default 4h), max 10 concurrent sessions
+- SigV4 replay detection (DashMap-based, constant-time signature comparison)
+- Clock skew validation (configurable, default 5 minutes)
+- Anti-fingerprinting (debug headers off by default)
+- Encrypted config database (SQLCipher) with multi-instance S3 sync
+- TLS support (optional)
+
+### Performance
+- Parallel delta reconstruction (reference + delta fetched concurrently)
+- LRU reference cache (moka) for fast reconstruction
+- Metadata cache (50MB default) — eliminates repeated HEAD calls
+- Lite LIST optimization (no per-object HEAD, ~8x faster)
+- Filesystem delimiter optimization (single `read_dir` vs recursive walk)
+- Range request passthrough on non-delta objects
+
+## Quick Start
 
 ```bash
 # Docker (easiest)
@@ -22,7 +72,7 @@ docker run -p 9000:9000 beshultd/deltaglider_proxy
 # Or build from source
 cd demo/s3-browser/ui && npm ci && npm run build && cd -
 cargo build --release
-DGP_DATA_DIR=./data ./target/release/deltaglider_proxy
+./target/release/deltaglider_proxy
 ```
 
 Then use it like any S3 endpoint:
@@ -35,136 +85,89 @@ aws s3 cp v2.zip s3://builds/releases/v2.zip   # stored as delta
 aws s3 cp s3://builds/releases/v2.zip ./v2.zip  # full file back, byte-identical
 ```
 
-A built-in browser UI with live metrics dashboard is available at `/_/` on the same port (e.g., `http://localhost:9000/_/`). No extra containers, no extra ports.
+The admin GUI is at `http://localhost:9000/_/` — same port, no extra containers.
 
-## How it works
-
-Objects sharing a path prefix form a **deltaspace**. The first upload seeds an internal baseline. Subsequent uploads are stored as xdelta3 diffs when the ratio beats the threshold (default: 50%). Files that don't compress well (images, video, already-compressed formats) pass through untouched.
-
-```
-releases/v1.zip  ─┐
-releases/v2.zip  ─┼─▶  deltaspace "releases/"
-releases/v3.zip  ─┘    baseline: reference.bin (internal)
-                        v2.zip.delta: 1.4MB (was 82MB)
-                        v3.zip.delta: 0.9MB (was 82MB)
-```
-
-**Delta-eligible by default**: `.zip`, `.tar`, `.tgz`, `.tar.gz`, `.tar.bz2`, `.tar.xz`, `.jar`, `.war`, `.ear`, `.rar`, `.7z`, `.dmg`, `.iso`, `.sql`, `.dump`, `.bak`, `.backup`
-
-**Passthrough (skip delta)**: `.jpg`, `.png`, `.mp4`, and other already-compressed formats.
-
-## Storage backends
+## Storage Backends
 
 | Backend | Use case | Config |
 |---------|----------|--------|
-| **Filesystem** | Local dev, single-node | `DGP_DATA_DIR=./data` |
-| **S3/MinIO** | Production, existing infra | `DGP_S3_ENDPOINT=http://minio:9000` |
+| **Filesystem** | Local dev, single-node | `[backend] type = "filesystem"` |
+| **S3/MinIO** | Production, existing infra | `[backend] type = "s3"` |
+| **Multi-backend** | Route buckets to different backends | `[[backends]]` array |
 
-Metadata lives alongside objects (xattr on filesystem, S3 user-metadata on S3). No external database.
+Metadata lives alongside objects (xattr on filesystem, S3 user-metadata on S3). No external database required for storage — only the optional IAM config uses SQLCipher.
 
 ## Configuration
 
-Environment variables (prefix `DGP_`) or TOML config file. Everything has sensible defaults.
+TOML config file or environment variables (`DGP_*` prefix). Everything has sensible defaults.
 
-```bash
-# Core
-DGP_LISTEN_ADDR=0.0.0.0:9000       # bind address
-DGP_MAX_DELTA_RATIO=0.5             # store delta if ratio < 50%
-DGP_MAX_OBJECT_SIZE=104857600       # 100MB cap (xdelta3 constraint)
-DGP_CACHE_MB=100                    # reference cache for reconstruction
-DGP_METADATA_CACHE_MB=50            # metadata cache (eliminates repeated HEADs)
+```toml
+listen_addr = "0.0.0.0:9000"
+max_delta_ratio = 0.75
+authentication = "none"  # remove this line to require SigV4 auth
 
-# Security tuning
-DGP_SESSION_TTL_HOURS=4             # admin session lifetime (default: 4h)
-DGP_CLOCK_SKEW_SECONDS=300          # SigV4 clock skew tolerance (default: 5 min)
-DGP_MAX_MULTIPART_UPLOADS=100       # concurrent multipart upload limit
-DGP_DEBUG_HEADERS=false             # expose server fingerprinting headers (off by default)
+[backend]
+type = "s3"
+endpoint = "https://s3.example.com"
+region = "us-east-1"
 
-# Bootstrap S3 auth (used before IAM users are created)
-DGP_ACCESS_KEY_ID=mykey
-DGP_SECRET_ACCESS_KEY=mysecret
+# Per-bucket policies
+[buckets.releases]
+compression = true
+public_prefixes = ["builds/"]   # unauthenticated read access
 
-# Bootstrap password (auto-generated on first run if not set)
-# DGP_BOOTSTRAP_PASSWORD_HASH=$2b$12$...
-
-# TLS (optional — omit cert/key for auto self-signed)
-DGP_TLS_ENABLED=true
-
-# S3 backend
-DGP_S3_ENDPOINT=http://localhost:9000
-DGP_S3_REGION=us-east-1
-DGP_BE_AWS_ACCESS_KEY_ID=backend-key
-DGP_BE_AWS_SECRET_ACCESS_KEY=backend-secret
+[buckets.archive]
+backend = "cold-storage"        # route to a different backend
+alias = "prod-archive-2024"     # real bucket name on that backend
+compression = false
 ```
 
 Full reference: [deltaglider_proxy.toml.example](deltaglider_proxy.toml.example)
 
-## S3 compatibility
-
-Implements the S3 operations that matter for object storage workloads:
+## S3 Compatibility
 
 | | Operations |
 |-|------------|
 | **Objects** | PutObject, GetObject, HeadObject, DeleteObject, CopyObject |
-| **Listing** | ListObjectsV2 (with start-after, encoding-type, fetch-owner, base64 continuation tokens, max-keys cap at 1000), DeleteObjects (batch) |
-| **Buckets** | CreateBucket, HeadBucket, DeleteBucket, ListBuckets (with real creation dates) |
+| **Listing** | ListObjectsV2 (start-after, encoding-type, fetch-owner, continuation tokens) |
+| **Buckets** | CreateBucket, HeadBucket, DeleteBucket, ListBuckets |
 | **Multipart** | Create, UploadPart, Complete, Abort, ListParts, ListUploads |
-| **Auth** | SigV4 header auth, presigned URLs, per-user IAM (ABAC) |
-| **Conditional** | If-Match, If-None-Match (304), If-Modified-Since (304), If-Unmodified-Since (412) |
-| **Range** | Range requests (206 Partial Content), Accept-Ranges header |
-| **Validation** | Content-MD5 on PUT/UploadPart, bucket naming validation |
-| **Copy** | x-amz-metadata-directive (COPY/REPLACE) |
-| **Stubs** | GET/PUT ACL (accept and ignore for SDK compatibility) |
-| **Response** | Per-request x-amz-request-id (UUID), response-content-type/disposition/encoding/language/expires overrides |
+| **Auth** | SigV4 header auth, presigned URLs (up to 7 days), per-user IAM, OAuth/OIDC |
+| **Conditional** | If-Match, If-None-Match (304), If-Modified-Since, If-Unmodified-Since (412) |
+| **Range** | Range requests (206 Partial Content) |
+| **Validation** | Content-MD5 on PUT/UploadPart |
 
 Not implemented: versioning, lifecycle policies, object lock.
 
 ## Architecture
 
-~14K lines of Rust. Async throughout (Tokio + axum). Encrypted SQLCipher database for IAM users; all other state derived from storage metadata.
+Single Rust binary (~17K lines). Async throughout (Tokio + axum). Single port serves S3 API on `/` and admin UI + APIs under `/_/`.
 
 ```
 S3 request
-  → SigV4 auth (required — bootstrap or per-user IAM)
+  → SigV4 auth / public prefix bypass
+  → IAM authorization (ABAC with conditions)
   → FileRouter (delta-eligible vs passthrough)
   → DeltaGlider engine (compress / reconstruct / cache)
-  → StorageBackend trait (filesystem or S3)
+  → StorageBackend trait (filesystem, S3, or multi-backend routing)
 ```
-
-Everything served on a single port: S3 API on `/`, admin UI and APIs under `/_/`.
-
-- **Transparent reconstruction**: Delta-compressed files are [reconstructed on the fly](docs/DELTA_RECONSTRUCTION.md) — clients receive the exact original bytes with correct `Content-Length` and `ETag`. Auth (SigV4/presigned URLs) is verified before reconstruction begins.
-- SHA-256 verified on every reconstructed GET. Corruption detected immediately.
-- LRU reference cache (moka) for fast reconstruction. Cache health exposed via startup warnings, periodic monitors, Prometheus gauges, and per-response `x-deltaglider-cache: hit|miss` header.
-- Metadata cache (moka, 50MB default) eliminates repeated HEAD calls for object metadata. Populated on PUT/HEAD/LIST, invalidated on DELETE. Configurable via `DGP_METADATA_CACHE_MB`.
-- `x-amz-storage-type` response header exposes strategy (delta/passthrough/reference) for debugging.
-- **Lite LIST optimization**: No HEAD calls during LIST — sizes shown are stored (compressed) sizes, ~8x faster than per-object HEAD.
-- **FS delimiter optimization**: `list_objects_delegated()` for filesystem backend uses a single `read_dir` instead of recursive walk when a delimiter is specified.
-- Built-in Proxy Dashboard with live charts for cache, compression, HTTP traffic, and auth metrics.
-
-## Requirements
-
-- **xdelta3** CLI must be installed (`apt install xdelta3` / `brew install xdelta3`)
-- Rust 1.75+ to build from source
-- Node.js 18+ to build the demo UI (or use Docker, which handles both)
 
 ## Docker
 
-Multi-stage build. UI, Rust compilation, and slim Debian runtime. Multi-arch images published on release. Only one port needed — S3 API and admin UI are served together.
+Multi-stage build: UI compilation, Rust compilation, slim Debian runtime. Multi-arch images (amd64 + arm64) published on every release.
 
 ```bash
-docker build -t deltaglider-proxy .
-docker run -p 9000:9000 deltaglider-proxy
-# or
-docker compose up -d  # includes MinIO for S3 backend
+docker run -p 9000:9000 beshultd/deltaglider_proxy
 ```
 
 ## Docs
 
 - [How delta reconstruction works](docs/DELTA_RECONSTRUCTION.md)
+- [Configuration reference](docs/CONFIGURATION.md)
+- [Authentication & IAM](docs/AUTHENTICATION.md)
 - [Operations guide](docs/OPERATIONS.md)
 - [Storage format internals](docs/STORAGE_FORMAT.md)
-- [Authentication & presigned URLs](docs/AUTHENTICATION.md)
+- [Metrics & monitoring](docs/METRICS.md)
 - [Contributing](docs/CONTRIBUTING.md)
 
 ## License
