@@ -14,6 +14,8 @@ DeltaGlider Proxy is configured via a TOML file and/or environment variables. En
   - [Rate Limiting](#rate-limiting)
 - [TLS](#tls)
 - [Config Sync](#config-sync)
+- [Multi-Backend Routing](#multi-backend-routing)
+- [Bucket Policies](#bucket-policies)
 - [Full Example](#full-example)
 
 ---
@@ -368,7 +370,7 @@ Explicit authentication mode selector. When omitted, the proxy infers the mode f
 authentication = "none"
 ```
 
-Future values: `"oidc"`, `"ldap"`, `"saml"`, or combinations.
+OAuth/OIDC providers are configured via the admin GUI (not TOML) and stored in the encrypted config database. See [Authentication](AUTHENTICATION.md) for setup instructions.
 
 ### `access_key_id` / `secret_access_key`
 
@@ -580,6 +582,74 @@ config_sync_bucket = "my-config-bucket"
 
 ---
 
+## Multi-Backend Routing
+
+Route different buckets to different storage backends. When `[[backends]]` is configured, the legacy `[backend]` section is used as a fallback for buckets without an explicit backend assignment.
+
+```toml
+default_backend = "primary"
+
+[[backends]]
+name = "primary"
+type = "s3"
+endpoint = "https://s3.us-east-1.amazonaws.com"
+region = "us-east-1"
+access_key_id = "AWS_KEY"
+secret_access_key = "AWS_SECRET"
+
+[[backends]]
+name = "europe"
+type = "s3"
+endpoint = "https://hel1.your-objectstorage.com"
+region = "hel1"
+access_key_id = "HETZNER_KEY"
+secret_access_key = "HETZNER_SECRET"
+
+[[backends]]
+name = "local"
+type = "filesystem"
+path = "/data/cache"
+```
+
+Backends can be added and removed via the admin GUI (**Backends** tab) without restart.
+
+---
+
+## Bucket Policies
+
+Per-bucket overrides for compression, backend routing, aliasing, and public access. All fields are optional — omitted fields inherit global defaults.
+
+```toml
+[buckets.releases]
+compression = true              # override global compression setting
+max_delta_ratio = 0.9           # override global ratio threshold
+backend = "europe"              # route to a specific named backend
+alias = "prod-releases-2024"    # real bucket name on that backend
+public_prefixes = ["builds/", "artifacts/"]  # unauthenticated read access
+```
+
+### Fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `compression` | bool | global setting | Enable/disable delta compression for this bucket |
+| `max_delta_ratio` | float (0-1) | global setting | Delta kept only if `delta_size/original_size < ratio` |
+| `backend` | string | default backend | Route to a named backend from `[[backends]]` |
+| `alias` | string | same as bucket name | Map virtual bucket name to a real bucket on the backend |
+| `public_prefixes` | string array | `[]` (none) | Key prefixes for unauthenticated read-only access |
+
+### Public Prefixes
+
+When `public_prefixes` is set, anonymous users (no SigV4 credentials) can GET, HEAD, and LIST objects under the specified prefixes. Writes always require authentication.
+
+- Use trailing `/` for directory-aligned matching: `"builds/"` matches `builds/v1.zip` but not `buildscripts/`
+- Empty string `""` makes the entire bucket public (logged as a warning)
+- Prefixes containing `..`, null bytes, or `//` are rejected
+
+Configurable via TOML or the admin GUI (**Backends** → per-bucket policy card → **Public Prefixes**).
+
+---
+
 ## Full Example
 
 ```toml
@@ -595,7 +665,7 @@ codec_concurrency = 32
 # Logging
 log_level = "deltaglider_proxy=info,tower_http=warn"
 
-# SigV4 authentication
+# SigV4 authentication (bootstrap credentials)
 access_key_id = "my-proxy-key"
 secret_access_key = "my-proxy-secret"
 
@@ -605,14 +675,36 @@ bootstrap_password_hash = "JDJiJDEyJENYbDVPRm84bDg2..."
 # Multi-instance config sync
 config_sync_bucket = "my-config-bucket"
 
-# S3 backend
-[backend]
+# Multi-backend routing
+default_backend = "primary"
+
+[[backends]]
+name = "primary"
 type = "s3"
 endpoint = "https://hel1.your-objectstorage.com"
 region = "hel1"
 force_path_style = true
-access_key_id = "BACKEND_KEY"
-secret_access_key = "BACKEND_SECRET"
+access_key_id = "HETZNER_KEY"
+secret_access_key = "HETZNER_SECRET"
+
+[[backends]]
+name = "cold"
+type = "s3"
+endpoint = "https://s3.us-east-1.amazonaws.com"
+region = "us-east-1"
+access_key_id = "AWS_KEY"
+secret_access_key = "AWS_SECRET"
+
+# Per-bucket policies
+[buckets.releases]
+backend = "primary"
+compression = true
+public_prefixes = ["builds/", "artifacts/"]
+
+[buckets.archive]
+backend = "cold"
+alias = "prod-archive-2024"
+compression = false
 
 # TLS (optional)
 [tls]
