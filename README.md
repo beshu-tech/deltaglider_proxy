@@ -24,21 +24,29 @@ DeltaGlider Proxy solves this by sitting in front of all your backends and prese
 
 Clients see standard S3. They don't know which backend stores their bucket. They don't know their binaries are delta-compressed to a fraction of their original size. They authenticate once — with corporate SSO if you want — and the proxy handles the rest.
 
-![DeltaGlider UI — file browser with delta compression stats](docs/screenshots/browser-dark.png)
+![DeltaGlider UI — file browser with delta compression stats](docs/screenshots/filebrowser.jpg)
 
 ---
 
 ## Core Capabilities
 
 ### Unified Storage Gateway
+
+![Storage backends — multi-backend routing with per-bucket policies](docs/screenshots/storage_backends.jpg)
+
 - **Multi-backend routing** — Route each bucket to a different storage backend (AWS S3, Hetzner, Backblaze, MinIO, filesystem). Mix and match providers behind one endpoint.
 - **Bucket aliasing** — Present virtual bucket names to clients while mapping to real buckets on backends. Migrate between providers without changing a single client config.
 - **Single endpoint** — Clients point at one URL. The proxy resolves which backend to use per bucket, transparently.
 - **Hot-reloadable** — Add backends, change routing, update policies — all from the admin GUI, no restart needed.
 
 ### Delegated Authentication
+
+![OAuth login with Google](docs/screenshots/oauth.jpg)
+
 - **OAuth/OIDC single sign-on** — Let your team log in with Google, Okta, Azure AD, or any OIDC provider. No shared S3 credentials.
 - **Group mapping rules** — Automatically assign permissions based on email domain (`*@company.com`), glob patterns, regex, or identity provider claims. New hires get the right access on first login.
+
+![Group mapping rules — automatic permission assignment from identity provider claims](docs/screenshots/oauth_group_mapping.jpg)
 - **Multi-user IAM** — Per-user S3 credentials with ABAC permission rules. Allow/Deny on actions (read, write, delete, list) and resource patterns (bucket/prefix/*), with conditions (IP ranges, prefix restrictions).
 - **SigV4 authentication** — Full AWS Signature V4 support, including presigned URLs up to 7 days. Compatible with every S3 SDK and CLI tool.
 - **Public prefixes** — Publish specific folders (e.g. release artifacts) for anonymous download without exposing the rest of the bucket. Scoped read-only — no writes, no listing beyond the published prefix.
@@ -66,7 +74,7 @@ Everything managed from a web UI served on the same port as the S3 API — no ex
 - **Storage analytics** — Per-bucket savings breakdown, estimated monthly cost savings, compression opportunity detection
 - **Embedded documentation** — Full-text searchable reference docs with architecture diagrams
 
-![Admin GUI — IAM user management with ABAC permissions](docs/screenshots/admin-users.png)
+![Admin GUI — IAM user management with ABAC permissions](docs/screenshots/iam.jpg)
 
 ### Enterprise Security
 - **Mandatory authentication** — proxy refuses to start without credentials (no accidental open deployments)

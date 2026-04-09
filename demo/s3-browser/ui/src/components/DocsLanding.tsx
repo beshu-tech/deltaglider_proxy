@@ -62,10 +62,19 @@ export default function DocsLanding({ onSelectDoc }: Props) {
       {/* Screenshots */}
       <div className="responsive-grid-2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 32 }}>
         <Lightbox caption="S3 object browser with compression indicators">
-          <img src="/_/screenshots/browser-dark.png" alt="Object Browser" style={{ width: '100%', display: 'block' }} />
+          <img src="/_/screenshots/filebrowser.jpg" alt="Object Browser" style={{ width: '100%', display: 'block' }} />
         </Lightbox>
-        <Lightbox caption="IAM user management with fine-grained permissions">
-          <img src="/_/screenshots/admin-users.png" alt="Admin Settings" style={{ width: '100%', display: 'block' }} />
+        <Lightbox caption="IAM user management with ABAC permissions">
+          <img src="/_/screenshots/iam.jpg" alt="IAM Users" style={{ width: '100%', display: 'block' }} />
+        </Lightbox>
+        <Lightbox caption="OAuth/OIDC login with Google SSO">
+          <img src="/_/screenshots/oauth.jpg" alt="OAuth Login" style={{ width: '100%', display: 'block' }} />
+        </Lightbox>
+        <Lightbox caption="Storage backends with multi-backend routing">
+          <img src="/_/screenshots/storage_backends.jpg" alt="Storage Backends" style={{ width: '100%', display: 'block' }} />
+        </Lightbox>
+        <Lightbox caption="OAuth group mapping rules">
+          <img src="/_/screenshots/oauth_group_mapping.jpg" alt="Group Mapping" style={{ width: '100%', display: 'block' }} />
         </Lightbox>
       </div>
 
