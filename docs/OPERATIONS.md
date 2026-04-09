@@ -45,26 +45,22 @@ CLI flags override anything loaded from the file/env:
 ./target/release/deltaglider_proxy --config deltaglider_proxy.toml --listen 0.0.0.0:9000
 ```
 
-## Demo UI
+## Admin GUI
 
-An embedded React-based S3 browser is served under `/_/` on the same port as the S3 API. For example, if DeltaGlider Proxy listens on `:9000`, the UI is available at `http://localhost:9000/_/`. The `/_/` prefix is safe because `_` is not a valid S3 bucket name character, so there is no conflict with S3 operations.
+An embedded React-based management UI is served under `/_/` on the same port as the S3 API. For example, if DeltaGlider Proxy listens on `:9000`, the GUI is at `http://localhost:9000/_/`. The `/_/` prefix is safe because `_` is not a valid S3 bucket name character, so there is no conflict with S3 operations.
 
 No extra ports, no extra containers, no manual configuration needed. Features include:
 
-- **S3 Object Browser** — browse, upload, download, delete objects across buckets; show/hide system files toggle; compute folder sizes
-- **File Preview** — double-click any previewable file (text, images) to preview inline via the inspector panel
-- **Proxy Dashboard** (`#/metrics`) — live Prometheus metrics with interactive charts:
-  - Cache health: utilization gauge, hit/miss rate, time-series chart
-  - Delta compression: encode/decode latency, compression ratio distribution, storage decisions
-  - HTTP traffic: request breakdown by operation (bar + pie chart), latency distribution, status codes, live request rate
-  - Authentication: success/failure counts with failure reason breakdown
-  - Top-line KPIs: uptime, peak memory, total requests, storage savings %
-- **Admin Settings** — full-screen overlay with hot-reload configuration, change backend, tune compression
-- **IAM User Management** — master-detail user panel: create, edit, delete users with ABAC permissions; key rotation with self-lockout prevention; delete confirmation via `window.confirm`
-- **API Reference** (`#/docs`) — interactive API documentation page
+- **S3 File Browser** — navigate buckets, upload, download, preview files (text, images), bulk copy/move/delete, download as ZIP, presigned URL sharing (1h / 24h / 7 days)
+- **User Management** — create, edit, delete IAM users with ABAC permissions (Allow/Deny, actions, resources, conditions); key rotation; organize users into groups
+- **OAuth/OIDC Configuration** — add identity providers (Google, Okta, Azure AD, any OIDC), configure group mapping rules for automatic permission assignment
+- **Backend Management** — add/remove S3 storage backends, configure per-bucket routing and aliasing, per-bucket compression policies, public prefix configuration
+- **Monitoring Dashboard** — live Prometheus metrics with charts: request rates, latencies, cache hit rates, status codes, auth events, uptime, memory
+- **Storage Analytics** — per-bucket storage savings breakdown, estimated monthly cost savings (configurable provider rates), compression opportunity detection
+- **Embedded Documentation** — full-text searchable reference docs with Mermaid diagrams, lightbox image viewer
 - **Demo Data Generator** — populate test data for evaluation
 
-Charts auto-refresh every 5s. Storage stats (from `/_/stats`) refresh every 60s and are capped at 1,000 objects.
+Charts auto-refresh every 5s. Storage stats (from `/_/stats`) refresh every 60s.
 
 To build for local development:
 
@@ -77,7 +73,7 @@ The Docker build handles the Node.js UI build automatically via a multi-stage Do
 
 ## Health & Observability
 
-- `GET /health` (or `/_/health`) returns JSON with `status`, `version`, `peak_rss_bytes`, and cache state (`cache_size_bytes`, `cache_max_bytes`, `cache_entries`, `cache_utilization_pct`).
+- `GET /health` (or `/_/health`) returns JSON with `status`, `peak_rss_bytes`, and cache state (`cache_size_bytes`, `cache_max_bytes`, `cache_entries`, `cache_utilization_pct`). Version is intentionally excluded from health (anti-fingerprinting) — available via the authenticated `/_/api/whoami` endpoint.
 - `GET /stats` (or `/_/stats`) returns aggregate storage statistics with 10s server-side cache, capped at 1,000 objects.
 - `GET /metrics` (or `/_/metrics`) returns Prometheus text format with 20+ metrics covering HTTP requests, delta compression, cache, codec concurrency, and auth. See [METRICS.md](METRICS.md) for the full reference.
 - Operational endpoints (`/health`, `/stats`, `/metrics`) are exempted from SigV4 authentication — accessible by monitoring systems without S3 credentials. Available on both root paths and under `/_/`.

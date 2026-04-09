@@ -56,36 +56,48 @@ cargo test --all --locked                                           # Tests
 ```
 src/
 ├── api/
-│   ├── mod.rs         # API module root, S3Error type
-│   ├── handlers.rs    # S3 API endpoint handlers
-│   ├── auth.rs        # SigV4 authentication middleware (header + presigned URL)
-│   ├── admin.rs       # Admin GUI API (login, config, sessions)
-│   ├── aws_chunked.rs # AWS chunked transfer encoding decoder
-│   ├── extractors.rs  # Axum request extractors
-│   ├── errors.rs      # S3 error responses
-│   └── xml.rs         # S3 XML response/request builders
+│   ├── mod.rs           # API module root, S3Error type
+│   ├── handlers/        # S3 API handlers (object, bucket, multipart, status)
+│   ├── auth.rs          # SigV4 auth middleware + public prefix bypass
+│   ├── admin/           # Admin API (login, config, users, groups, auth providers, backup)
+│   ├── aws_chunked.rs   # AWS chunked transfer encoding decoder
+│   ├── extractors.rs    # Axum request extractors (ValidatedBucket, ValidatedPath)
+│   ├── errors.rs        # S3 error responses
+│   └── xml.rs           # S3 XML response/request builders
 ├── deltaglider/
-│   ├── mod.rs         # DeltaGlider module root
-│   ├── engine.rs      # Core delta compression logic
-│   ├── codec.rs       # xdelta3 encode/decode
-│   ├── cache.rs       # Reference file LRU cache
-│   └── file_router.rs # File type routing
+│   ├── engine/          # Core engine (mod, store, retrieve submodules)
+│   ├── codec.rs         # xdelta3 encode/decode (subprocess)
+│   ├── cache.rs         # Reference file LRU cache (moka)
+│   └── file_router.rs   # File type routing (delta-eligible vs passthrough)
 ├── storage/
-│   ├── mod.rs         # Storage module root
-│   ├── traits.rs      # StorageBackend trait
-│   ├── filesystem.rs  # Local filesystem backend
-│   ├── s3.rs          # S3 backend
-│   └── xattr_meta.rs  # Extended attribute helpers (filesystem metadata)
-├── config.rs          # Configuration loading
-├── multipart.rs       # In-memory multipart upload state management
-├── session.rs         # In-memory session store for admin GUI auth
-├── types.rs           # Core types (FileMetadata, etc)
-├── lib.rs             # Library root (re-exports modules)
-├── demo.rs            # Embedded React demo UI (rust-embed)
-└── main.rs            # Server entry point
-demo/s3-browser/ui/    # React demo UI source (Vite + TypeScript)
-tests/                 # Integration tests
-docs/                  # Additional documentation
+│   ├── traits.rs        # StorageBackend trait (async_trait, object-safe)
+│   ├── filesystem.rs    # Local filesystem backend (xattr metadata)
+│   ├── s3.rs            # S3 backend (AWS SDK)
+│   ├── routing.rs       # Multi-backend routing (virtual bucket → real backend)
+│   └── xattr_meta.rs    # Extended attribute helpers
+├── iam/
+│   ├── mod.rs           # IamState enum, IamIndex, hot-swap
+│   ├── types.rs         # IamUser, Permission, AuthenticatedUser, S3Action
+│   ├── permissions.rs   # ABAC evaluation (legacy + iam-rs with conditions)
+│   ├── middleware.rs     # Per-request IAM authorization middleware
+│   ├── keygen.rs        # Secure access key generation
+│   └── external_auth/   # OAuth/OIDC providers (Google, generic OIDC)
+├── config_db/           # Encrypted SQLCipher database (users, groups, providers)
+├── config.rs            # TOML + env config, SharedConfig
+├── bucket_policy.rs     # Per-bucket policies + PublicPrefixSnapshot
+├── startup.rs           # Server startup, router assembly, middleware stack
+├── session.rs           # Admin session store (OsRng tokens, IP binding)
+├── rate_limiter.rs      # Per-IP rate limiting (token bucket)
+├── metadata_cache.rs    # Object metadata LRU cache (moka)
+├── audit.rs             # Audit logging helpers
+├── multipart.rs         # In-memory multipart upload state
+├── types.rs             # Core types (FileMetadata, StorageInfo, etc.)
+├── demo.rs              # Embedded UI (rust-embed) + admin API router
+├── lib.rs               # Library root
+└── main.rs              # Entry point
+demo/s3-browser/ui/      # React 18 + TypeScript + Ant Design 6 admin GUI
+tests/                   # Integration tests (S3 ops, auth, IAM, public prefixes)
+docs/                    # Documentation
 ```
 
 ### Key Concepts

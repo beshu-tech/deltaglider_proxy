@@ -116,6 +116,47 @@ DGP_BOOTSTRAP_PASSWORD_HASH=JDJiJDEyJENYbDVPRm84bDg2...
 
 ---
 
+## Step 3a: Enable OAuth/OIDC (alternative to manual IAM users)
+
+**What:** Let your team log in with their corporate identity (Google, Okta, Azure AD) instead of managing individual S3 credentials.
+
+**Why:** No shared credentials to leak. No keys to rotate manually. New hires get access on first login. Departing employees lose access when their IdP account is disabled.
+
+1. Open the admin GUI → **Admin Settings** → **Authentication**
+2. Click **Add Provider** (e.g., Google OIDC)
+3. Enter Client ID, Client Secret, and Issuer URL from your identity provider
+4. Add **Mapping Rules** to auto-assign permissions:
+   - `email_domain = "company.com"` → add to `developers` group
+   - `email_glob = "admin-*@company.com"` → add to `admins` group
+5. Save. The login page will now show "Sign in with Google" alongside credentials.
+
+OAuth users get auto-provisioned IAM accounts on first login. Their group memberships (and thus permissions) are updated on every subsequent login based on the mapping rules.
+
+> [!TIP] OAuth + IAM work together
+> You can have both: IAM users for CI pipelines (programmatic access) and OAuth for humans (browser access). They coexist naturally.
+
+---
+
+## Step 3b: Publish Public Folders (optional)
+
+**What:** Make specific folders downloadable without any authentication.
+
+**Why:** Release artifacts, public docs, or shared assets that should be accessible via a simple URL — no S3 credentials, no OAuth, just `curl`.
+
+1. Go to **Admin Settings** → **Backends**
+2. Find the bucket policy card (or create one)
+3. Under **Public Prefixes**, add the folder paths (e.g., `builds/`, `releases/`)
+4. Save
+
+Anonymous users can now GET/HEAD/LIST objects under those prefixes. Writes still require authentication.
+
+```bash
+# Works without credentials:
+curl http://your-proxy:9000/releases/builds/v1.zip -o v1.zip
+```
+
+---
+
 ## Step 4: Configure Rate Limiting
 
 **What:** Limit how many failed authentication attempts an IP can make before being locked out.
