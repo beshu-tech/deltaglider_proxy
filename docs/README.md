@@ -4,7 +4,7 @@
 
 DeltaGlider Proxy sits between your S3 clients and storage backend, silently deduplicating versioned files using xdelta3. Clients see a standard S3 API — the compression is invisible.
 
-![Object Browser](/_/screenshots/browser-dark.png)
+![Object Browser](/_/screenshots/filebrowser.jpg)
 *S3 object browser with bucket navigation, file preview, and compression indicators*
 
 ## Key Features
