@@ -112,13 +112,13 @@ export default function AnalyticsSection({ config }: Props) {
   const savingsPercent = totalOriginal > 0 ? (totalSavings / totalOriginal * 100) : 0;
   const monthlySavings = (totalSavings / (1024 * 1024 * 1024)) * costRate;
 
-  const cardStyle = {
+  const cardStyle: React.CSSProperties = {
     background: colors.BG_CARD,
     border: `1px solid ${colors.BORDER}`,
-    borderRadius: 10,
-    padding: '16px 20px',
-    flex: 1,
-    minWidth: 140,
+    borderRadius: 12,
+    padding: 16,
+    flex: '1 1 180px',
+    minWidth: 160,
   };
 
   // Find compression opportunities — buckets where compression is effectively OFF
@@ -141,33 +141,33 @@ export default function AnalyticsSection({ config }: Props) {
   }));
 
   return (
-    <div style={{ padding: 'clamp(16px, 3vw, 24px)', maxWidth: 900, margin: '0 auto' }}>
+    <div>
       {/* Summary Cards */}
-      <div style={{ display: 'flex', gap: 12, marginBottom: 24, flexWrap: 'wrap' }}>
+      <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
         <div style={cardStyle}>
-          <Text style={{ fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: 0.5, color: colors.TEXT_MUTED, display: 'block' }}>Total Storage</Text>
-          <Text style={{ fontSize: 24, fontWeight: 700, color: colors.TEXT_PRIMARY, fontFamily: 'var(--font-mono)' }}>{formatBytes(totalOriginal)}</Text>
-          <Text style={{ fontSize: 11, color: colors.TEXT_MUTED, display: 'block' }}>original size across {bucketStats.reduce((s, b) => s + b.objectCount, 0).toLocaleString()} objects</Text>
+          <Text style={{ fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: 0.5, color: colors.TEXT_MUTED, display: 'block', fontFamily: 'var(--font-ui)', marginBottom: 4 }}>Total Storage</Text>
+          <Text style={{ fontSize: 26, fontWeight: 700, lineHeight: 1.2, color: colors.TEXT_PRIMARY, fontFamily: 'var(--font-mono)' }}>{formatBytes(totalOriginal)}</Text>
+          <Text style={{ fontSize: 11, color: colors.TEXT_MUTED, display: 'block', fontFamily: 'var(--font-ui)', marginTop: 4 }}>original size across {bucketStats.reduce((s, b) => s + b.objectCount, 0).toLocaleString()} objects</Text>
         </div>
         <div style={cardStyle}>
-          <Text style={{ fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: 0.5, color: colors.ACCENT_GREEN, display: 'block' }}>Space Saved</Text>
-          <Text style={{ fontSize: 24, fontWeight: 700, color: colors.ACCENT_GREEN, fontFamily: 'var(--font-mono)' }}>{formatBytes(totalSavings)}</Text>
-          <Text style={{ fontSize: 11, color: colors.TEXT_MUTED, display: 'block' }}>via delta compression</Text>
+          <Text style={{ fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: 0.5, color: colors.ACCENT_GREEN, display: 'block', fontFamily: 'var(--font-ui)', marginBottom: 4 }}>Space Saved</Text>
+          <Text style={{ fontSize: 26, fontWeight: 700, lineHeight: 1.2, color: colors.ACCENT_GREEN, fontFamily: 'var(--font-mono)' }}>{formatBytes(totalSavings)}</Text>
+          <Text style={{ fontSize: 11, color: colors.TEXT_MUTED, display: 'block', fontFamily: 'var(--font-ui)', marginTop: 4 }}>via delta compression</Text>
         </div>
         <div style={cardStyle}>
-          <Text style={{ fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: 0.5, color: colors.ACCENT_BLUE, display: 'block' }}>Savings</Text>
-          <Text style={{ fontSize: 24, fontWeight: 700, color: colors.ACCENT_BLUE, fontFamily: 'var(--font-mono)' }}>{savingsPercent.toFixed(1)}%</Text>
-          <Text style={{ fontSize: 11, color: colors.TEXT_MUTED, display: 'block' }}>compression ratio</Text>
+          <Text style={{ fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: 0.5, color: colors.ACCENT_BLUE, display: 'block', fontFamily: 'var(--font-ui)', marginBottom: 4 }}>Savings</Text>
+          <Text style={{ fontSize: 26, fontWeight: 700, lineHeight: 1.2, color: colors.ACCENT_BLUE, fontFamily: 'var(--font-mono)' }}>{savingsPercent.toFixed(1)}%</Text>
+          <Text style={{ fontSize: 11, color: colors.TEXT_MUTED, display: 'block', fontFamily: 'var(--font-ui)', marginTop: 4 }}>compression ratio</Text>
         </div>
         <div style={{ ...cardStyle, position: 'relative' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <Text style={{ fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: 0.5, color: colors.ACCENT_PURPLE, display: 'block' }}>Est. Monthly Savings</Text>
+            <Text style={{ fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: 0.5, color: colors.ACCENT_PURPLE, display: 'block', fontFamily: 'var(--font-ui)', marginBottom: 4 }}>Est. Monthly Savings</Text>
             <Button type="text" size="small" icon={<SettingOutlined />} onClick={() => setShowCostConfig(!showCostConfig)} style={{ color: colors.TEXT_MUTED }} />
           </div>
-          <Text style={{ fontSize: 24, fontWeight: 700, color: colors.ACCENT_PURPLE, fontFamily: 'var(--font-mono)' }}>
+          <Text style={{ fontSize: 26, fontWeight: 700, lineHeight: 1.2, color: colors.ACCENT_PURPLE, fontFamily: 'var(--font-mono)' }}>
             ${monthlySavings.toFixed(2)}/mo
           </Text>
-          <Text style={{ fontSize: 11, color: colors.TEXT_MUTED, display: 'block' }}>at ${costRate}/GB/mo</Text>
+          <Text style={{ fontSize: 11, color: colors.TEXT_MUTED, display: 'block', fontFamily: 'var(--font-ui)', marginTop: 4 }}>at ${costRate}/GB/mo</Text>
           {showCostConfig && (
             <div
               role="listbox"
@@ -196,8 +196,8 @@ export default function AnalyticsSection({ config }: Props) {
 
       {/* Per-Bucket Breakdown */}
       {chartData.length > 0 && (
-        <div style={{ background: colors.BG_CARD, border: `1px solid ${colors.BORDER}`, borderRadius: 10, padding: 20, marginBottom: 24 }}>
-          <Text style={{ fontSize: 14, fontWeight: 700, color: colors.TEXT_PRIMARY, fontFamily: 'var(--font-ui)', display: 'block', marginBottom: 16 }}>Storage by Bucket</Text>
+        <div style={{ background: colors.BG_CARD, border: `1px solid ${colors.BORDER}`, borderRadius: 12, padding: 'clamp(16px, 3vw, 24px)', marginBottom: 16 }}>
+          <Text style={{ fontSize: 16, fontWeight: 600, color: colors.TEXT_PRIMARY, fontFamily: 'var(--font-ui)', display: 'block', marginBottom: 16 }}>Storage by Bucket</Text>
           <ResponsiveContainer width="100%" height={Math.max(200, chartData.length * 40)}>
             <BarChart data={chartData} layout="vertical" margin={{ left: 10, right: 20 }}>
               <XAxis type="number" tickFormatter={v => formatBytes(v)} style={{ fontSize: 10 }} />
@@ -215,8 +215,8 @@ export default function AnalyticsSection({ config }: Props) {
 
       {/* Savings Over Time */}
       {savingsHistory.length > 1 && (
-        <div style={{ background: colors.BG_CARD, border: `1px solid ${colors.BORDER}`, borderRadius: 10, padding: 20, marginBottom: 24 }}>
-          <Text style={{ fontSize: 14, fontWeight: 700, color: colors.TEXT_PRIMARY, fontFamily: 'var(--font-ui)', display: 'block', marginBottom: 16 }}>Session Savings</Text>
+        <div style={{ background: colors.BG_CARD, border: `1px solid ${colors.BORDER}`, borderRadius: 12, padding: 'clamp(16px, 3vw, 24px)', marginBottom: 16 }}>
+          <Text style={{ fontSize: 16, fontWeight: 600, color: colors.TEXT_PRIMARY, fontFamily: 'var(--font-ui)', display: 'block', marginBottom: 16 }}>Session Savings</Text>
           <ResponsiveContainer width="100%" height={180}>
             <AreaChart data={savingsHistory}>
               <XAxis dataKey="time" style={{ fontSize: 10 }} />
@@ -229,8 +229,8 @@ export default function AnalyticsSection({ config }: Props) {
 
       {/* Compression Opportunities */}
       {opportunities.length > 0 && (
-        <div style={{ background: colors.BG_CARD, border: `1px solid ${colors.ACCENT_AMBER}30`, borderRadius: 10, padding: 20 }}>
-          <Text style={{ fontSize: 14, fontWeight: 700, color: colors.ACCENT_AMBER, fontFamily: 'var(--font-ui)', display: 'block', marginBottom: 8 }}>
+        <div style={{ background: colors.BG_CARD, border: `1px solid ${colors.ACCENT_AMBER}30`, borderRadius: 12, padding: 'clamp(16px, 3vw, 24px)' }}>
+          <Text style={{ fontSize: 16, fontWeight: 600, color: colors.ACCENT_AMBER, fontFamily: 'var(--font-ui)', display: 'block', marginBottom: 8 }}>
             Compression Opportunities
           </Text>
           <Text style={{ fontSize: 12, color: colors.TEXT_MUTED, display: 'block', marginBottom: 12 }}>

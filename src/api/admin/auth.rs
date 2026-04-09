@@ -37,8 +37,18 @@ pub struct SessionResponse {
 pub struct WhoamiQuery {}
 
 #[derive(Serialize)]
+pub struct WhoamiUserInfo {
+    pub name: String,
+    pub access_key_id: String,
+    pub is_admin: bool,
+}
+
+#[derive(Serialize)]
 pub struct WhoamiResponse {
     mode: String,
+    version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<WhoamiUserInfo>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     config_db_mismatch: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -269,12 +279,10 @@ pub async fn check_session(
     Json(SessionResponse { valid })
 }
 
-/// GET /api/whoami — returns current auth mode.
-/// Public endpoint — no session required. Only reveals the auth mode
-/// ("open", "bootstrap", "iam") — never user details, to prevent enumeration.
-/// User identity is established via login / login-as (POST), not this endpoint.
+/// GET /api/whoami — returns current auth mode and (if session exists) the logged-in user.
 pub async fn whoami(
     State(state): State<Arc<AdminState>>,
+    headers: HeaderMap,
     axum::extract::Query(_params): axum::extract::Query<WhoamiQuery>,
 ) -> Json<WhoamiResponse> {
     let iam_state = state.iam_state.load();
@@ -283,6 +291,9 @@ pub async fn whoami(
         IamState::Legacy(_) => "bootstrap",
         IamState::Iam(_) => "iam",
     };
+
+    // If caller has a valid session, resolve user identity.
+    let user = resolve_session_user(&state, &headers).await;
 
     // Include enabled external auth providers so the login page can show OAuth buttons.
     let external_providers = if let Some(ref ext_auth) = state.external_auth {
@@ -310,9 +321,51 @@ pub async fn whoami(
 
     Json(WhoamiResponse {
         mode: mode.into(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        user,
         config_db_mismatch: state.config_db_mismatch,
         external_providers,
     })
+}
+
+/// Resolve user info from the session cookie (if present and valid).
+async fn resolve_session_user(state: &AdminState, headers: &HeaderMap) -> Option<WhoamiUserInfo> {
+    let token = extract_session_token(headers)?;
+    let auth_method = state.sessions.auth_method(&token)?;
+    match auth_method {
+        crate::session::AuthMethod::Bootstrap => Some(WhoamiUserInfo {
+            name: "admin".into(),
+            access_key_id: "bootstrap".into(),
+            is_admin: true,
+        }),
+        crate::session::AuthMethod::IamLoginAs { access_key_id } => {
+            let db = state.config_db.as_ref()?.lock().await;
+            let user = db.get_user_by_access_key(&access_key_id).ok()??;
+            let is_admin = crate::iam::permissions::is_admin(&user.permissions);
+            Some(WhoamiUserInfo {
+                name: user.name,
+                access_key_id: user.access_key_id,
+                is_admin,
+            })
+        }
+        crate::session::AuthMethod::External { user_id, .. } => {
+            let db = state.config_db.as_ref()?.lock().await;
+            let user = db.get_user_by_id(user_id).ok()?;
+            let is_admin = crate::iam::permissions::is_admin(&user.permissions);
+            // For external users, prefer external identity email > user name
+            let display_name = db
+                .get_external_identities_for_user(user_id)
+                .ok()
+                .and_then(|ids| ids.into_iter().next())
+                .and_then(|ext| ext.email.or(ext.display_name))
+                .unwrap_or(user.name.clone());
+            Some(WhoamiUserInfo {
+                name: display_name,
+                access_key_id: user.access_key_id,
+                is_admin,
+            })
+        }
+    }
 }
 
 /// POST /api/admin/login-as — create admin session for an IAM user with admin permissions.
