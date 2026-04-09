@@ -68,13 +68,19 @@ export default function DocsLanding({ onSelectDoc }: Props) {
           <img src="/_/screenshots/iam.jpg" alt="IAM Users" style={{ width: '100%', display: 'block' }} />
         </Lightbox>
         <Lightbox caption="OAuth/OIDC login with Google SSO">
-          <img src="/_/screenshots/oauth.jpg" alt="OAuth Login" style={{ width: '100%', display: 'block' }} />
+          <img src="/_/screenshots/oauth_login.jpg" alt="OAuth Login" style={{ width: '100%', display: 'block' }} />
         </Lightbox>
         <Lightbox caption="Storage backends with multi-backend routing">
           <img src="/_/screenshots/storage_backends.jpg" alt="Storage Backends" style={{ width: '100%', display: 'block' }} />
         </Lightbox>
         <Lightbox caption="OAuth group mapping rules">
           <img src="/_/screenshots/oauth_group_mapping.jpg" alt="Group Mapping" style={{ width: '100%', display: 'block' }} />
+        </Lightbox>
+        <Lightbox caption="Storage analytics and cost savings">
+          <img src="/_/screenshots/analytics.jpg" alt="Analytics" style={{ width: '100%', display: 'block' }} />
+        </Lightbox>
+        <Lightbox caption="Advanced security settings">
+          <img src="/_/screenshots/advanced_security.jpg" alt="Security Settings" style={{ width: '100%', display: 'block' }} />
         </Lightbox>
       </div>
 

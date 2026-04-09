@@ -15,7 +15,7 @@ DeltaGlider Proxy sits between your S3 clients and storage backend, silently ded
 - **Embedded admin GUI** — user management, metrics dashboard, configuration, documentation
 - **Dual backend** — local filesystem or any S3-compatible storage (AWS, MinIO, Hetzner)
 
-![Admin Settings](/_/screenshots/admin-users.png)
+![Admin Settings](/_/screenshots/iam.jpg)
 *IAM user management with fine-grained permissions and key rotation*
 
 ## Documentation
