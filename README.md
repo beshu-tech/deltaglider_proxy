@@ -2,8 +2,6 @@
 
 **Drop-in S3 proxy that delta-compresses versioned binaries. Clients see standard S3. Storage drops 60-95%.**
 
-![DeltaGlider Proxy — S3 clients on the left, proxy with delta compression in the middle, backend S3 on the right](docs/diagram.png)
-
 You store versioned binaries (releases, firmware, ML checkpoints, Docker layers). Each version is 90%+ identical to the last. S3 stores each one in full. You pay for all of it.
 
 DeltaGlider sits between your S3 clients and your storage backend. It intercepts PUTs, computes xdelta3 diffs against a per-prefix baseline, and stores the delta when it's smaller. GETs reconstruct the original on the fly. Your clients never know.
@@ -13,7 +11,7 @@ PUT releases/v2.zip ──▶ DeltaGlider ──▶ stored as 1.4MB delta (was 8
 GET releases/v2.zip ──▶ DeltaGlider ──▶ reconstructed, streamed back as 82MB
 ```
 
-![DeltaGlider UI showing 98.4% savings on ReadOnlyREST builds](docs/screenshot.png)
+![DeltaGlider UI — file browser with delta compression stats](docs/screenshots/browser-dark.png)
 
 ## Quick start
 
