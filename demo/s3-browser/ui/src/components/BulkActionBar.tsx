@@ -106,7 +106,7 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
         open={modal !== null}
         mode={modal || 'copy'}
         itemCount={selectedCount}
-        onConfirm={(bucket, prefix) => handleOperation(modal!, bucket, prefix)}
+        onConfirm={(bucket, prefix) => { if (modal) handleOperation(modal, bucket, prefix); }}
         onCancel={() => setModal(null)}
         loading={operating}
       />

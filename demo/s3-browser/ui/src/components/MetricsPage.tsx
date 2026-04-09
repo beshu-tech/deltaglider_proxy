@@ -219,9 +219,10 @@ export default function MetricsPage({ onBack, embedded }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [history, setHistory] = useState<Snapshot[]>([]);
-  const [activeView, setActiveView] = useState<'monitoring' | 'analytics'>(() =>
-    (localStorage.getItem('dg-metrics-view') as 'monitoring' | 'analytics') || 'monitoring'
-  );
+  const [activeView, setActiveView] = useState<'monitoring' | 'analytics'>(() => {
+    const saved = localStorage.getItem('dg-metrics-view');
+    return saved === 'analytics' ? 'analytics' : 'monitoring';
+  });
   const [adminConfig, setAdminConfig] = useState<AdminConfig | null>(null);
 
   useEffect(() => {
