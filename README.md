@@ -1,101 +1,102 @@
 # DeltaGlider Proxy
 
-**S3-compatible proxy with transparent delta compression, multi-user IAM, OAuth login, multi-backend routing, and a built-in admin GUI. Single binary, single port.**
+**A unified S3 gateway that aggregates multiple storage backends behind a single endpoint — with delegated authentication, fine-grained access control, transparent delta compression, and a full management GUI. One binary. One port. Zero client changes.**
 
-DeltaGlider sits between your S3 clients and your storage backend. Clients see a standard S3 API — no SDK changes, no client awareness. The proxy silently deduplicates versioned binaries using xdelta3, cutting storage 60-95% for workloads like release artifacts, firmware, ML checkpoints, and Docker layers.
+---
+
+## Why DeltaGlider
+
+Organizations run storage across multiple providers — AWS S3, Hetzner Object Storage, Backblaze B2, MinIO, local NFS. Each has its own credentials, endpoints, and access policies. Teams share credentials in Slack. There's no audit trail. No prefix-level access control. No way to publish a folder without exposing the whole bucket.
+
+DeltaGlider Proxy solves this by sitting in front of all your backends and presenting a single, authenticated S3 endpoint:
+
+```
+                                          ┌──────────────────────┐
+                                     ┌───▶│  AWS S3 (us-east-1)  │
+┌──────────────┐    ┌─────────────┐  │    └──────────────────────┘
+│  S3 clients  │───▶│ DeltaGlider │──┤    ┌──────────────────────┐
+│  (unchanged) │    │    Proxy    │──┼───▶│  Hetzner (Helsinki)  │
+└──────────────┘    └─────────────┘  │    └──────────────────────┘
+                                     │    ┌──────────────────────┐
+                                     └───▶│  Local filesystem    │
+                                          └──────────────────────┘
+```
+
+Clients see standard S3. They don't know which backend stores their bucket. They don't know their binaries are delta-compressed to a fraction of their original size. They authenticate once — with corporate SSO if you want — and the proxy handles the rest.
+
+![DeltaGlider UI — file browser with delta compression stats](docs/screenshots/browser-dark.png)
+
+---
+
+## Core Capabilities
+
+### Unified Storage Gateway
+- **Multi-backend routing** — Route each bucket to a different storage backend (AWS S3, Hetzner, Backblaze, MinIO, filesystem). Mix and match providers behind one endpoint.
+- **Bucket aliasing** — Present virtual bucket names to clients while mapping to real buckets on backends. Migrate between providers without changing a single client config.
+- **Single endpoint** — Clients point at one URL. The proxy resolves which backend to use per bucket, transparently.
+- **Hot-reloadable** — Add backends, change routing, update policies — all from the admin GUI, no restart needed.
+
+### Delegated Authentication
+- **OAuth/OIDC single sign-on** — Let your team log in with Google, Okta, Azure AD, or any OIDC provider. No shared S3 credentials.
+- **Group mapping rules** — Automatically assign permissions based on email domain (`*@company.com`), glob patterns, regex, or identity provider claims. New hires get the right access on first login.
+- **Multi-user IAM** — Per-user S3 credentials with ABAC permission rules. Allow/Deny on actions (read, write, delete, list) and resource patterns (bucket/prefix/*), with conditions (IP ranges, prefix restrictions).
+- **SigV4 authentication** — Full AWS Signature V4 support, including presigned URLs up to 7 days. Compatible with every S3 SDK and CLI tool.
+- **Public prefixes** — Publish specific folders (e.g. release artifacts) for anonymous download without exposing the rest of the bucket. Scoped read-only — no writes, no listing beyond the published prefix.
+
+### Transparent Delta Compression
+- **60-95% storage reduction** on versioned binaries (release artifacts, firmware, ML checkpoints, Docker layers)
+- Clients PUT and GET normally — the proxy intercepts, computes xdelta3 diffs against a per-prefix baseline, and stores the delta when smaller
+- SHA-256 verified on every reconstructed GET — byte-identical to the original, guaranteed
+- Per-bucket compression policies — enable/disable per bucket, custom ratio thresholds
+- Intelligent file routing — archives get delta-compressed, images/video/already-compressed formats pass through untouched
 
 ```
 PUT releases/v2.zip ──▶ DeltaGlider ──▶ stored as 1.4MB delta (was 82MB)
 GET releases/v2.zip ──▶ DeltaGlider ──▶ reconstructed, streamed back as 82MB
 ```
 
-![DeltaGlider UI — file browser with delta compression stats](docs/screenshots/browser-dark.png)
+### Built-in Management GUI
+Everything managed from a web UI served on the same port as the S3 API — no extra containers, no extra infrastructure:
 
-## Features
+- **File browser** — Navigate, upload, download, preview files, bulk copy/move/delete, download as ZIP
+- **User management** — Create IAM users, assign ABAC permissions, rotate keys, organize into groups
+- **OAuth configuration** — Add identity providers, configure group mapping rules, test SSO flows
+- **Backend management** — Add/remove storage backends, configure per-bucket routing, aliasing, compression policies, and public prefixes
+- **Monitoring dashboard** — Live Prometheus metrics: request rates, latencies, cache hit rates, status codes, auth events
+- **Storage analytics** — Per-bucket savings breakdown, estimated monthly cost savings, compression opportunity detection
+- **Embedded documentation** — Full-text searchable reference docs with architecture diagrams
 
-### Delta Compression
-- Transparent xdelta3 encoding on PUT, on-the-fly reconstruction on GET
-- Per-prefix deltaspace with automatic baseline management
-- SHA-256 verified on every reconstructed GET — corruption detected immediately
-- Per-bucket compression policies (enable/disable, custom ratio thresholds)
-- Intelligent file routing: archives get delta-compressed, images/video pass through untouched
+![Admin GUI — IAM user management with ABAC permissions](docs/screenshots/admin-users.png)
 
-### Authentication & Access Control
-- **SigV4 authentication** — header auth and presigned URLs (up to 7 days)
-- **Multi-user IAM** — per-user credentials stored in encrypted SQLCipher database
-- **ABAC permissions** — Allow/Deny rules with action verbs (read, write, delete, list, admin), resource patterns (bucket/prefix/*), and AWS-style conditions (s3:prefix, aws:SourceIp)
-- **OAuth/OIDC** — Login with Google or any OIDC provider. PKCE, JWT validation, group mapping rules (email domain, glob, regex, claim value)
-- **Public prefixes** — Expose specific bucket/prefix paths for unauthenticated read-only access (downloads + listing)
-- **Mandatory authentication** — proxy refuses to start without credentials unless explicitly opted out
+### Enterprise Security
+- **Mandatory authentication** — proxy refuses to start without credentials (no accidental open deployments)
+- **Encrypted config database** — IAM users and OAuth config stored in SQLCipher-encrypted database, synced across instances via S3
+- **Per-IP rate limiting** — progressive delay and lockout on auth endpoints (brute-force resistant)
+- **Session hardening** — IP binding, configurable TTL, max concurrent sessions, SameSite/Secure cookies
+- **SigV4 replay detection** — constant-time signature comparison, clock skew validation
+- **Anti-fingerprinting** — server identity headers suppressed by default
+- **Audit logging** — every access logged with user, IP, action, and resource
+- **TLS support** — optional, auto-detects secure cookies
 
-### Multi-Backend Routing
-- Route different buckets to different storage backends (filesystem, S3, mixed)
-- Bucket aliasing — map virtual bucket names to real backend buckets
-- Hot-reloadable backend configuration via admin GUI
-
-### Admin GUI
-Everything managed from a built-in web UI served on the same port as the S3 API (`/_/`):
-
-- **File browser** — navigate, upload, download, preview, bulk copy/move/delete/ZIP
-- **User management** — create IAM users, assign permissions, rotate keys, manage groups
-- **OAuth configuration** — add providers, configure group mapping rules
-- **Storage backends** — add/remove backends, per-bucket routing and compression policies, public prefix configuration
-- **Monitoring dashboard** — live Prometheus metrics (request rates, latencies, cache hit rates, status codes, auth events)
-- **Storage analytics** — per-bucket savings breakdown, estimated monthly cost savings, compression opportunity detection
-- **Embedded documentation** — full-text searchable docs with Mermaid diagrams
-
-![Admin GUI — IAM user management](docs/screenshots/admin-users.png)
-
-### Security
-- Per-IP rate limiting with progressive delay and lockout on auth endpoints
-- Session IP binding, configurable TTL (default 4h), max 10 concurrent sessions
-- SigV4 replay detection (DashMap-based, constant-time signature comparison)
-- Clock skew validation (configurable, default 5 minutes)
-- Anti-fingerprinting (debug headers off by default)
-- Encrypted config database (SQLCipher) with multi-instance S3 sync
-- TLS support (optional)
-
-### Performance
-- Parallel delta reconstruction (reference + delta fetched concurrently)
-- LRU reference cache (moka) for fast reconstruction
-- Metadata cache (50MB default) — eliminates repeated HEAD calls
-- Lite LIST optimization (no per-object HEAD, ~8x faster)
-- Filesystem delimiter optimization (single `read_dir` vs recursive walk)
-- Range request passthrough on non-delta objects
+---
 
 ## Quick Start
 
 ```bash
-# Docker (easiest)
 docker run -p 9000:9000 beshultd/deltaglider_proxy
-
-# Or build from source
-cd demo/s3-browser/ui && npm ci && npm run build && cd -
-cargo build --release
-./target/release/deltaglider_proxy
 ```
 
-Then use it like any S3 endpoint:
+Then point any S3 client at `http://localhost:9000`:
 
 ```bash
 export AWS_ENDPOINT_URL=http://localhost:9000
 aws s3 mb s3://builds
-aws s3 cp v1.zip s3://builds/releases/v1.zip   # seeds baseline
+aws s3 cp v1.zip s3://builds/releases/v1.zip
 aws s3 cp v2.zip s3://builds/releases/v2.zip   # stored as delta
 aws s3 cp s3://builds/releases/v2.zip ./v2.zip  # full file back, byte-identical
 ```
 
-The admin GUI is at `http://localhost:9000/_/` — same port, no extra containers.
-
-## Storage Backends
-
-| Backend | Use case | Config |
-|---------|----------|--------|
-| **Filesystem** | Local dev, single-node | `[backend] type = "filesystem"` |
-| **S3/MinIO** | Production, existing infra | `[backend] type = "s3"` |
-| **Multi-backend** | Route buckets to different backends | `[[backends]]` array |
-
-Metadata lives alongside objects (xattr on filesystem, S3 user-metadata on S3). No external database required for storage — only the optional IAM config uses SQLCipher.
+Admin GUI at `http://localhost:9000/_/` — same port, zero setup.
 
 ## Configuration
 
@@ -103,22 +104,41 @@ TOML config file or environment variables (`DGP_*` prefix). Everything has sensi
 
 ```toml
 listen_addr = "0.0.0.0:9000"
-max_delta_ratio = 0.75
-authentication = "none"  # remove this line to require SigV4 auth
 
+# Bootstrap credentials (before IAM users exist)
+access_key_id = "admin"
+secret_access_key = "changeme"
+
+# Default backend
 [backend]
 type = "s3"
 endpoint = "https://s3.example.com"
 region = "us-east-1"
 
+# Multi-backend routing
+default_backend = "primary"
+
+[[backends]]
+name = "primary"
+type = "s3"
+endpoint = "https://s3.us-east-1.amazonaws.com"
+region = "us-east-1"
+
+[[backends]]
+name = "europe"
+type = "s3"
+endpoint = "https://hel1.your-objectstorage.com"
+region = "hel1"
+
 # Per-bucket policies
 [buckets.releases]
+backend = "europe"
 compression = true
-public_prefixes = ["builds/"]   # unauthenticated read access
+public_prefixes = ["builds/", "artifacts/"]
 
 [buckets.archive]
-backend = "cold-storage"        # route to a different backend
-alias = "prod-archive-2024"     # real bucket name on that backend
+backend = "primary"
+alias = "prod-archive-2024"
 compression = false
 ```
 
@@ -132,7 +152,7 @@ Full reference: [deltaglider_proxy.toml.example](deltaglider_proxy.toml.example)
 | **Listing** | ListObjectsV2 (start-after, encoding-type, fetch-owner, continuation tokens) |
 | **Buckets** | CreateBucket, HeadBucket, DeleteBucket, ListBuckets |
 | **Multipart** | Create, UploadPart, Complete, Abort, ListParts, ListUploads |
-| **Auth** | SigV4 header auth, presigned URLs (up to 7 days), per-user IAM, OAuth/OIDC |
+| **Auth** | SigV4 header + presigned URLs, per-user IAM, OAuth/OIDC, public prefixes |
 | **Conditional** | If-Match, If-None-Match (304), If-Modified-Since, If-Unmodified-Since (412) |
 | **Range** | Range requests (206 Partial Content) |
 | **Validation** | Content-MD5 on PUT/UploadPart |
@@ -141,30 +161,31 @@ Not implemented: versioning, lifecycle policies, object lock.
 
 ## Architecture
 
-Single Rust binary (~17K lines). Async throughout (Tokio + axum). Single port serves S3 API on `/` and admin UI + APIs under `/_/`.
+Single Rust binary. Async throughout (Tokio + axum). Single port serves S3 API on `/` and admin UI + APIs under `/_/`.
 
 ```
 S3 request
-  → SigV4 auth / public prefix bypass
+  → SigV4 auth / OAuth session / public prefix bypass
   → IAM authorization (ABAC with conditions)
+  → Multi-backend routing (virtual bucket → real backend + bucket)
   → FileRouter (delta-eligible vs passthrough)
   → DeltaGlider engine (compress / reconstruct / cache)
-  → StorageBackend trait (filesystem, S3, or multi-backend routing)
+  → StorageBackend (filesystem, S3, or routed)
 ```
 
 ## Docker
 
-Multi-stage build: UI compilation, Rust compilation, slim Debian runtime. Multi-arch images (amd64 + arm64) published on every release.
+Multi-arch images (amd64 + arm64) published on every release:
 
 ```bash
 docker run -p 9000:9000 beshultd/deltaglider_proxy
 ```
 
-## Docs
+## Documentation
 
-- [How delta reconstruction works](docs/DELTA_RECONSTRUCTION.md)
 - [Configuration reference](docs/CONFIGURATION.md)
 - [Authentication & IAM](docs/AUTHENTICATION.md)
+- [Delta reconstruction](docs/DELTA_RECONSTRUCTION.md)
 - [Operations guide](docs/OPERATIONS.md)
 - [Storage format internals](docs/STORAGE_FORMAT.md)
 - [Metrics & monitoring](docs/METRICS.md)
