@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { listObjects, deleteObjects, deletePrefix, uploadObject, getBucket, setBucket, headObject, hasCredentials } from './s3client';
+import { listObjects, listAllKeys, deleteObjects, deletePrefix, uploadObject, getBucket, setBucket, headObject, hasCredentials, copyObject, getObjectBytes } from './s3client';
 import useSelection from './useSelection';
 import type { S3Object } from './types';
 
@@ -189,6 +189,86 @@ export default function useS3Browser() {
     }
   }, [selection.selectedKeys, selection.clearSelection, refresh]);
 
+  /** Get all object keys from the selection, expanding folders recursively. */
+  /** Resolve selected keys, expanding folders recursively to get ALL nested objects. */
+  const resolveSelectedKeys = useCallback(async (): Promise<string[]> => {
+    const keys: string[] = [];
+    for (const k of selection.selectedKeys) {
+      if (k.startsWith('folder:')) {
+        const pfx = k.slice('folder:'.length);
+        const nested = await listAllKeys(pfx);
+        keys.push(...nested);
+      } else {
+        keys.push(k);
+      }
+    }
+    return keys;
+  }, [selection.selectedKeys]);
+
+  const bulkCopy = useCallback(async (destBucket: string, destPrefix: string) => {
+    const keys = await resolveSelectedKeys();
+    const sourceBucket = getBucket();
+    let succeeded = 0, failed = 0;
+    for (const key of keys) {
+      const filename = key.split('/').pop() || key;
+      const destKey = destPrefix ? `${destPrefix}${filename}` : filename;
+      try {
+        await copyObject(sourceBucket, key, destBucket, destKey);
+        succeeded++;
+      } catch { failed++; }
+    }
+    refresh();
+    return { succeeded, failed };
+  }, [resolveSelectedKeys, refresh]);
+
+  const bulkMove = useCallback(async (destBucket: string, destPrefix: string) => {
+    const keys = await resolveSelectedKeys();
+    const sourceBucket = getBucket();
+    // Copy all first
+    const copied: string[] = [];
+    let failed = 0;
+    for (const key of keys) {
+      const filename = key.split('/').pop() || key;
+      const destKey = destPrefix ? `${destPrefix}${filename}` : filename;
+      try {
+        await copyObject(sourceBucket, key, destBucket, destKey);
+        copied.push(key);
+      } catch { failed++; }
+    }
+    // Only delete sources AFTER all copies succeed
+    if (copied.length > 0) {
+      await deleteObjects(copied).catch(() => {});
+    }
+    selection.clearSelection();
+    refresh();
+    return { succeeded: copied.length, failed };
+  }, [resolveSelectedKeys, selection.clearSelection, refresh]);
+
+  const downloadZip = useCallback(async () => {
+    const { zipSync } = await import('fflate');
+    const keys = await resolveSelectedKeys();
+    if (keys.length === 0) return;
+
+    const files: Record<string, Uint8Array> = {};
+    for (const key of keys) {
+      try {
+        const { data, name } = await getObjectBytes(key);
+        files[name] = data;
+      } catch {
+        // Skip failed files
+      }
+    }
+
+    const zipped = zipSync(files);
+    const blob = new Blob([new Uint8Array(zipped)], { type: 'application/zip' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `deltaglider-${new Date().toISOString().slice(0, 10)}.zip`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [resolveSelectedKeys]);
+
   const uploadFiles = useCallback(async (files: FileList) => {
     const currentPrefix = prefixRef.current;
     try {
@@ -228,6 +308,9 @@ export default function useS3Browser() {
     mutate,
     enrichKeys,
     bulkDelete,
+    bulkCopy,
+    bulkMove,
+    downloadZip,
     uploadFiles,
     // Status
     deleting,

@@ -787,26 +787,33 @@ async fn rebuild_external_auth(state: &Arc<AdminState>) {
 fn error_page(title: &str, message: &str) -> impl IntoResponse {
     let html = format!(
         r#"<!DOCTYPE html>
-<html>
-<head><title>{title}</title>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title>
 <style>
-  body {{ font-family: system-ui, -apple-system, sans-serif; background: #080c14; color: #e2e8f0;
-         display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }}
-  .card {{ background: #111827; border: 1px solid #1f2937; border-radius: 12px; padding: 40px;
-           max-width: 420px; text-align: center; }}
-  h1 {{ font-size: 20px; margin: 0 0 12px; color: #f87171; }}
-  p {{ font-size: 14px; color: #9ca3af; line-height: 1.6; margin: 0 0 24px; }}
-  a {{ display: inline-block; padding: 10px 24px; background: #2dd4bf; color: #080c14;
-       border-radius: 8px; text-decoration: none; font-weight: 600; font-size: 14px; }}
-  a:hover {{ background: #14b8a6; }}
+  :root {{ --bg:#080c14; --card:#111827; --border:#1f2937; --text:#e2e8f0; --muted:#9ca3af;
+          --error:#f87171; --accent:#2dd4bf; --accent-hover:#14b8a6; --accent-text:#080c14; }}
+  :root.light {{ --bg:#f5f7fa; --card:#ffffff; --border:#e2e8f0; --text:#1e293b; --muted:#64748b;
+                 --error:#e11d48; --accent:#0d9488; --accent-hover:#0f766e; --accent-text:#ffffff; }}
+  body {{ font-family: 'Outfit',system-ui,-apple-system,sans-serif; background:var(--bg); color:var(--text);
+         display:flex; align-items:center; justify-content:center; min-height:100vh; margin:0; }}
+  .card {{ background:var(--card); border:1px solid var(--border); border-radius:12px; padding:40px;
+           max-width:420px; text-align:center; }}
+  h1 {{ font-size:20px; margin:0 0 12px; color:var(--error); }} h1[role=alert] {{ }}
+  p {{ font-size:14px; color:var(--muted); line-height:1.6; margin:0 0 24px; }}
+  a {{ display:inline-block; padding:10px 24px; background:var(--accent); color:var(--accent-text);
+       border-radius:8px; text-decoration:none; font-weight:600; font-size:14px; outline-offset:3px; }}
+  a:hover {{ background:var(--accent-hover); }}
+  a:focus-visible {{ outline:2px solid var(--accent); }}
 </style>
 </head>
 <body>
-  <div class="card">
-    <h1>{title}</h1>
+  <div class="card" role="main">
+    <h1 role="alert">{title}</h1>
     <p>{message}</p>
-    <a href="/_/admin">Back to Admin</a>
+    <a href="/_/" aria-label="Return to DeltaGlider Proxy">Back to Home</a>
   </div>
+  <script>try{{var t=localStorage.getItem('dg-theme');if(t==='light'||(!t&&matchMedia('(prefers-color-scheme:light)').matches))document.documentElement.classList.add('light')}}catch(e){{}}</script>
 </body>
 </html>"#,
         title = title,
