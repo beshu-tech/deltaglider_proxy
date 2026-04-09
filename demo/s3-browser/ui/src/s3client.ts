@@ -414,7 +414,7 @@ export async function copyObject(
   await client.send(new CopyObjectCommand({
     Bucket: destBucket,
     Key: destKey,
-    CopySource: `${sourceBucket}/${sourceKey}`,
+    CopySource: `${sourceBucket}/${encodeURIComponent(sourceKey).replace(/%2F/g, '/')}`,
   }));
 }
 

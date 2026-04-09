@@ -784,7 +784,17 @@ async fn rebuild_external_auth(state: &Arc<AdminState>) {
 }
 
 /// Simple HTML error page for OAuth callback errors.
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
 fn error_page(title: &str, message: &str) -> impl IntoResponse {
+    let title = escape_html(title);
+    let message = escape_html(message);
     let html = format!(
         r#"<!DOCTYPE html>
 <html lang="en">

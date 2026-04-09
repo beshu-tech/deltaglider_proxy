@@ -190,19 +190,20 @@ export default function useS3Browser() {
   }, [selection.selectedKeys, selection.clearSelection, refresh]);
 
   /** Get all object keys from the selection, expanding folders recursively. */
-  /** Resolve selected keys, expanding folders recursively to get ALL nested objects. */
+  /** Resolve selected keys, expanding folders recursively. Deduplicates overlapping folders. */
   const resolveSelectedKeys = useCallback(async (): Promise<string[]> => {
-    const keys: string[] = [];
+    const keySet = new Set<string>();
     for (const k of selection.selectedKeys) {
       if (k.startsWith('folder:')) {
         const pfx = k.slice('folder:'.length);
+        if (!pfx) continue; // Reject empty prefix to avoid listing entire bucket
         const nested = await listAllKeys(pfx);
-        keys.push(...nested);
+        for (const nk of nested) keySet.add(nk);
       } else {
-        keys.push(k);
+        keySet.add(k);
       }
     }
-    return keys;
+    return Array.from(keySet);
   }, [selection.selectedKeys]);
 
   const bulkCopy = useCallback(async (destBucket: string, destPrefix: string) => {
@@ -245,17 +246,26 @@ export default function useS3Browser() {
   }, [resolveSelectedKeys, selection.clearSelection, refresh]);
 
   const downloadZip = useCallback(async () => {
+    const MAX_ZIP_BYTES = 500 * 1024 * 1024; // 500MB safety limit
     const { zipSync } = await import('fflate');
     const keys = await resolveSelectedKeys();
     if (keys.length === 0) return;
 
     const files: Record<string, Uint8Array> = {};
+    let totalBytes = 0;
     for (const key of keys) {
       try {
         const { data, name } = await getObjectBytes(key);
-        files[name] = data;
-      } catch {
-        // Skip failed files
+        totalBytes += data.byteLength;
+        if (totalBytes > MAX_ZIP_BYTES) {
+          throw new Error(`ZIP would exceed ${Math.round(MAX_ZIP_BYTES / 1024 / 1024)}MB limit. Select fewer or smaller files.`);
+        }
+        // Deduplicate filenames (from different prefixes)
+        const uniqueName = files[name] ? `${key.replace(/\//g, '_')}` : name;
+        files[uniqueName] = data;
+      } catch (e) {
+        if (e instanceof Error && e.message.includes('limit')) throw e;
+        // Skip individual file failures
       }
     }
 

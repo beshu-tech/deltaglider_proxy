@@ -121,10 +121,12 @@ export default function AnalyticsSection({ config }: Props) {
     minWidth: 140,
   };
 
-  // Find compression opportunities
+  // Find compression opportunities — buckets where compression is effectively OFF
+  const globalCompressionOn = (config?.max_delta_ratio ?? 0.75) > 0;
   const opportunities = bucketStats.filter(b => {
     const policy = config?.bucket_policies?.[b.bucket];
-    return (!policy || policy.compression === false) && b.totalOriginal > 1024 * 1024; // >1MB
+    const bucketCompressionOn = policy?.compression ?? globalCompressionOn;
+    return !bucketCompressionOn && b.totalOriginal > 1024 * 1024; // >1MB with compression off
   });
 
   if (loading && bucketStats.length === 0) {
