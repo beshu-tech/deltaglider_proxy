@@ -1,8 +1,8 @@
-//! Per-bucket policy configuration.
+//! Per-bucket policy configuration and public prefix access control.
 //!
-//! Each bucket can override global compression settings and route to a
-//! specific named backend. Unconfigured buckets inherit global defaults
-//! and use the default backend.
+//! Each bucket can override global compression settings, route to a
+//! specific named backend, and expose key prefixes for unauthenticated
+//! read-only access.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -32,6 +32,13 @@ pub struct BucketPolicyConfig {
     /// When `None`, the virtual bucket name equals the real bucket name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias: Option<String>,
+
+    /// Key prefixes allowing unauthenticated read-only access (GET, HEAD, LIST).
+    /// Example: `["builds/", "releases/v2/"]` allows anonymous download of all
+    /// objects under those prefixes. Empty vec (default) = no public access.
+    /// Use trailing `/` to ensure directory-aligned matching.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub public_prefixes: Vec<String>,
 }
 
 /// Resolved bucket policies with global defaults applied.
@@ -48,7 +55,7 @@ impl BucketPolicyRegistry {
         policies: HashMap<String, BucketPolicyConfig>,
         default_max_delta_ratio: f32,
     ) -> Self {
-        // Normalize bucket names to lowercase and validate ratio values
+        // Normalize bucket names to lowercase and validate ratio values + public prefixes
         let policies = policies
             .into_iter()
             .map(|(k, mut v)| {
@@ -59,6 +66,62 @@ impl BucketPolicyRegistry {
                             k, ratio
                         );
                         v.max_delta_ratio = None;
+                    }
+                }
+                // Validate and normalize public prefixes
+                if !v.public_prefixes.is_empty() {
+                    let original_count = v.public_prefixes.len();
+                    v.public_prefixes = v
+                        .public_prefixes
+                        .into_iter()
+                        .filter_map(|mut p| {
+                            // Strip leading slash
+                            if p.starts_with('/') {
+                                p = p[1..].to_string();
+                            }
+                            // Reject dangerous patterns
+                            if p.contains("..") || p.contains('\0') || p.contains("//") {
+                                tracing::warn!(
+                                    "Bucket '{}': rejecting invalid public_prefix '{}' (contains .., null, or //)",
+                                    k, p
+                                );
+                                return None;
+                            }
+                            // Warn about entire-bucket exposure
+                            if p.is_empty() {
+                                tracing::warn!(
+                                    "Bucket '{}': public_prefix is empty string — the ENTIRE bucket is publicly readable!",
+                                    k
+                                );
+                            }
+                            // Warn about missing trailing slash (easy misconfiguration)
+                            if !p.is_empty() && !p.ends_with('/') {
+                                tracing::warn!(
+                                    "Bucket '{}': public_prefix '{}' has no trailing '/'. \
+                                     This matches '{}anything' — add '{}/' if you meant a directory.",
+                                    k, p, p, p
+                                );
+                            }
+                            Some(p)
+                        })
+                        .collect();
+                    v.public_prefixes.sort();
+                    v.public_prefixes.dedup();
+                    let valid_count = v.public_prefixes.len();
+                    if valid_count > 0 {
+                        tracing::info!(
+                            "Bucket '{}' has {} public prefix(es): {:?}",
+                            k,
+                            valid_count,
+                            v.public_prefixes
+                        );
+                    }
+                    if valid_count < original_count {
+                        tracing::warn!(
+                            "Bucket '{}': {} public prefix(es) rejected during validation",
+                            k,
+                            original_count - valid_count
+                        );
                     }
                 }
                 (k.to_ascii_lowercase(), v)
@@ -129,6 +192,89 @@ impl BucketPolicyRegistry {
             .collect()
     }
 }
+
+/// Check if a key falls under a prefix.
+/// Empty prefix matches everything (entire bucket public).
+/// Otherwise, key must start with prefix.
+fn key_matches_prefix(key: &str, prefix: &str) -> bool {
+    prefix.is_empty() || key.starts_with(prefix)
+}
+
+// ── Public Prefix Snapshot (lock-free, hot-swappable) ──
+
+/// Pre-built snapshot of public prefix config for the SigV4 auth middleware.
+/// Stored in `Arc<ArcSwap<PublicPrefixSnapshot>>` and swapped atomically
+/// on config hot-reload. Reading is lock-free (no mutex on the hot path).
+#[derive(Clone, Debug, Default)]
+pub struct PublicPrefixSnapshot {
+    /// bucket_name (lowercase) → sorted vec of public prefixes
+    entries: HashMap<String, Vec<String>>,
+}
+
+impl PublicPrefixSnapshot {
+    /// Build from bucket policy config (called at startup and on hot-reload).
+    /// Applies the same validation as `BucketPolicyRegistry::new()` — rejects
+    /// dangerous prefixes (`..`, null bytes, `//`) and strips leading `/`.
+    pub fn from_config(buckets: &HashMap<String, BucketPolicyConfig>) -> Self {
+        let entries = buckets
+            .iter()
+            .filter(|(_, v)| !v.public_prefixes.is_empty())
+            .map(|(k, v)| {
+                let validated: Vec<String> = v
+                    .public_prefixes
+                    .iter()
+                    .filter_map(|p| {
+                        let p = p.strip_prefix('/').unwrap_or(p);
+                        if p.contains("..") || p.contains('\0') || p.contains("//") {
+                            None
+                        } else {
+                            Some(p.to_string())
+                        }
+                    })
+                    .collect();
+                (k.to_ascii_lowercase(), validated)
+            })
+            .filter(|(_, v)| !v.is_empty())
+            .collect();
+        Self { entries }
+    }
+
+    /// Check if an object key is publicly readable (GET/HEAD).
+    pub fn is_public_read(&self, bucket: &str, key: &str) -> bool {
+        self.entries
+            .get(bucket)
+            .map(|prefixes| prefixes.iter().any(|p| key_matches_prefix(key, p)))
+            .unwrap_or(false)
+    }
+
+    /// Check if a LIST request prefix overlaps with any public prefix.
+    pub fn list_overlaps_public(&self, bucket: &str, requested_prefix: &str) -> bool {
+        self.entries
+            .get(bucket)
+            .map(|prefixes| {
+                prefixes.iter().any(|pp| {
+                    key_matches_prefix(requested_prefix, pp) || pp.starts_with(requested_prefix)
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    /// Get the public prefixes for a bucket.
+    pub fn public_prefixes_for_bucket(&self, bucket: &str) -> &[String] {
+        self.entries
+            .get(bucket)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// True if any public prefix is configured.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Type alias for the shared, hot-swappable public prefix snapshot.
+pub type SharedPublicPrefixSnapshot = std::sync::Arc<arc_swap::ArcSwap<PublicPrefixSnapshot>>;
 
 #[cfg(test)]
 mod tests {
@@ -210,6 +356,175 @@ mod tests {
         let (backend, real) = registry.resolve_backend("dev-data");
         assert_eq!(backend, Some("local"));
         assert_eq!(real, "dev-data");
+    }
+
+    // ── Public prefix tests (via PublicPrefixSnapshot — the production path) ──
+
+    fn policy_with_public(prefixes: Vec<&str>) -> BucketPolicyConfig {
+        BucketPolicyConfig {
+            public_prefixes: prefixes.into_iter().map(String::from).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Build a snapshot from raw policies, running them through BucketPolicyRegistry
+    /// validation first (leading-slash strip, dotdot rejection, bucket lowercasing)
+    /// to match the production flow.
+    fn snapshot_from(policies: HashMap<String, BucketPolicyConfig>) -> PublicPrefixSnapshot {
+        let reg = BucketPolicyRegistry::new(policies, 0.75);
+        PublicPrefixSnapshot::from_config(reg.policies())
+    }
+
+    #[test]
+    fn test_public_prefix_basic() {
+        let mut policies = HashMap::new();
+        policies.insert("releases".into(), policy_with_public(vec!["builds/"]));
+        let snap = snapshot_from(policies);
+        assert!(snap.is_public_read("releases", "builds/v1.zip"));
+        assert!(snap.is_public_read("releases", "builds/subdir/file.txt"));
+    }
+
+    #[test]
+    fn test_public_prefix_no_match() {
+        let mut policies = HashMap::new();
+        policies.insert("releases".into(), policy_with_public(vec!["builds/"]));
+        let snap = snapshot_from(policies);
+        assert!(!snap.is_public_read("releases", "secret/data.zip"));
+        assert!(!snap.is_public_read("releases", "other.txt"));
+    }
+
+    #[test]
+    fn test_public_prefix_boundary() {
+        // "pub/" must NOT match "public/"
+        let mut policies = HashMap::new();
+        policies.insert("test".into(), policy_with_public(vec!["pub/"]));
+        let snap = snapshot_from(policies);
+        assert!(snap.is_public_read("test", "pub/file.txt"));
+        assert!(!snap.is_public_read("test", "public/file.txt"));
+        assert!(!snap.is_public_read("test", "pubdata/file.txt"));
+    }
+
+    #[test]
+    fn test_public_prefix_exact_key() {
+        let mut policies = HashMap::new();
+        policies.insert("test".into(), policy_with_public(vec!["builds/"]));
+        let snap = snapshot_from(policies);
+        assert!(snap.is_public_read("test", "builds/"));
+    }
+
+    #[test]
+    fn test_public_prefix_empty_no_public() {
+        let snap = snapshot_from(HashMap::new());
+        assert!(!snap.is_public_read("any", "any/key"));
+        assert!(snap.is_empty());
+    }
+
+    #[test]
+    fn test_public_prefix_entire_bucket() {
+        let mut policies = HashMap::new();
+        policies.insert("open".into(), policy_with_public(vec![""]));
+        let snap = snapshot_from(policies);
+        assert!(snap.is_public_read("open", "anything"));
+        assert!(snap.is_public_read("open", "deep/nested/path.zip"));
+        assert!(!snap.is_empty());
+    }
+
+    #[test]
+    fn test_public_prefix_multiple() {
+        let mut policies = HashMap::new();
+        policies.insert("test".into(), policy_with_public(vec!["builds/", "docs/"]));
+        let snap = snapshot_from(policies);
+        assert!(snap.is_public_read("test", "builds/v1.zip"));
+        assert!(snap.is_public_read("test", "docs/readme.md"));
+        assert!(!snap.is_public_read("test", "secret/key"));
+    }
+
+    #[test]
+    fn test_public_prefix_validation_dotdot() {
+        let mut policies = HashMap::new();
+        policies.insert("test".into(), policy_with_public(vec!["../etc/", "ok/"]));
+        // Registry validation strips "../etc/", keeps "ok/"
+        let snap = snapshot_from(policies);
+        assert!(!snap.is_public_read("test", "../etc/passwd"));
+        assert!(snap.is_public_read("test", "ok/file"));
+    }
+
+    #[test]
+    fn test_public_prefix_normalization_leading_slash() {
+        let mut policies = HashMap::new();
+        policies.insert("test".into(), policy_with_public(vec!["/builds/"]));
+        // Registry strips leading "/" → matches "builds/"
+        let snap = snapshot_from(policies);
+        assert!(snap.is_public_read("test", "builds/v1.zip"));
+    }
+
+    #[test]
+    fn test_public_prefix_case_sensitivity() {
+        let mut policies = HashMap::new();
+        policies.insert("MyBucket".into(), policy_with_public(vec!["Builds/"]));
+        // Registry lowercases bucket name, prefix preserved as-is
+        let snap = snapshot_from(policies);
+        assert!(snap.is_public_read("mybucket", "Builds/v1.zip"));
+        assert!(!snap.is_public_read("mybucket", "builds/v1.zip")); // case-sensitive prefix
+    }
+
+    #[test]
+    fn test_list_overlaps_narrower() {
+        let mut policies = HashMap::new();
+        policies.insert("test".into(), policy_with_public(vec!["builds/"]));
+        let snap = snapshot_from(policies);
+        assert!(snap.list_overlaps_public("test", "builds/v2/"));
+    }
+
+    #[test]
+    fn test_list_overlaps_broader() {
+        let mut policies = HashMap::new();
+        policies.insert("test".into(), policy_with_public(vec!["builds/"]));
+        let snap = snapshot_from(policies);
+        assert!(snap.list_overlaps_public("test", ""));
+    }
+
+    #[test]
+    fn test_list_overlaps_disjoint() {
+        let mut policies = HashMap::new();
+        policies.insert("test".into(), policy_with_public(vec!["builds/"]));
+        let snap = snapshot_from(policies);
+        assert!(!snap.list_overlaps_public("test", "secret/"));
+    }
+
+    #[test]
+    fn test_list_overlaps_exact() {
+        let mut policies = HashMap::new();
+        policies.insert("test".into(), policy_with_public(vec!["builds/"]));
+        let snap = snapshot_from(policies);
+        assert!(snap.list_overlaps_public("test", "builds/"));
+    }
+
+    #[test]
+    fn test_public_prefix_snapshot_multi() {
+        let mut policies = HashMap::new();
+        policies.insert(
+            "releases".into(),
+            BucketPolicyConfig {
+                public_prefixes: vec!["builds/".into(), "docs/".into()],
+                ..Default::default()
+            },
+        );
+        let snap = PublicPrefixSnapshot::from_config(&policies);
+        assert!(!snap.is_empty());
+        assert!(snap.is_public_read("releases", "builds/v1.zip"));
+        assert!(snap.is_public_read("releases", "docs/readme.md"));
+        assert!(!snap.is_public_read("releases", "secret/data"));
+        assert!(!snap.is_public_read("other-bucket", "builds/v1.zip"));
+        assert_eq!(snap.public_prefixes_for_bucket("releases").len(), 2);
+        assert_eq!(snap.public_prefixes_for_bucket("other").len(), 0);
+    }
+
+    #[test]
+    fn test_public_prefix_snapshot_empty() {
+        let snap = PublicPrefixSnapshot::from_config(&HashMap::new());
+        assert!(snap.is_empty());
+        assert!(!snap.is_public_read("any", "any"));
     }
 
     #[test]

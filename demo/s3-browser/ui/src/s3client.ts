@@ -168,7 +168,11 @@ export async function listObjects(prefix = ''): Promise<ListResult> {
     );
 
     for (const cp of resp.CommonPrefixes || []) {
-      if (cp.Prefix) folderSet.add(cp.Prefix);
+      // Skip bogus prefixes: empty, equal to current prefix, or ending in "//"
+      // (these show as "/" in the UI and are caused by objects with empty path segments)
+      if (cp.Prefix && cp.Prefix !== prefix && !cp.Prefix.endsWith('//')) {
+        folderSet.add(cp.Prefix);
+      }
     }
 
     for (const o of resp.Contents || []) {

@@ -247,6 +247,8 @@ pub struct TestServerBuilder {
     s3_endpoint: Option<String>,
     /// SigV4 auth credentials (access_key_id, secret_access_key).
     auth_creds: Option<(String, String)>,
+    /// Per-bucket TOML snippets: (bucket_name, toml_body)
+    bucket_policies: Vec<(String, String)>,
 }
 
 impl Default for TestServerBuilder {
@@ -258,6 +260,7 @@ impl Default for TestServerBuilder {
             codec_concurrency: None,
             s3_endpoint: None,
             auth_creds: None,
+            bucket_policies: Vec::new(),
         }
     }
 }
@@ -290,6 +293,14 @@ impl TestServerBuilder {
 
     pub fn auth(mut self, access_key_id: &str, secret_access_key: &str) -> Self {
         self.auth_creds = Some((access_key_id.to_string(), secret_access_key.to_string()));
+        self
+    }
+
+    /// Add a per-bucket TOML policy section. Example:
+    /// `.bucket_policy("releases", r#"public_prefixes = ["builds/"]"#)`
+    pub fn bucket_policy(mut self, bucket: &str, toml_body: &str) -> Self {
+        self.bucket_policies
+            .push((bucket.to_string(), toml_body.to_string()));
         self
     }
 
@@ -330,6 +341,11 @@ impl TestServerBuilder {
             // Explicitly opt in to open access — the proxy refuses to start
             // without credentials unless authentication = "none" is set.
             config.push_str("authentication = \"none\"\n");
+        }
+
+        // Per-bucket policy sections
+        for (bucket, body) in &self.bucket_policies {
+            config.push_str(&format!("\n[buckets.{}]\n{}\n", bucket, body));
         }
 
         // Backend section

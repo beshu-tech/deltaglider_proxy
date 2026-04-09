@@ -160,6 +160,10 @@ pub async fn authorization_middleware(
         } else if user.is_explicitly_denied(action, bucket, key, &context) {
             // An explicit Deny matched (possibly via condition) — blocked
             false
+        } else if user.name == "$anonymous" {
+            // Anonymous users must NOT use the can_see_bucket fallback —
+            // it would allow unscoped LIST, leaking keys outside public prefixes.
+            false
         } else {
             // No explicit deny — fall back to bucket visibility
             user.can_see_bucket(bucket)

@@ -140,8 +140,25 @@ where
 
         validate_bucket(&bucket)?;
 
-        // Normalize key by removing leading slashes
+        // Normalize key: remove leading slashes and collapse consecutive slashes.
+        // Double slashes create ghost "/" folders in LIST responses and are never
+        // intentional in S3 key paths (caused by buggy path concatenation).
         let key = key.trim_start_matches('/').to_string();
+        let key = if key.contains("//") {
+            let normalized = key
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("/");
+            tracing::debug!(
+                "Normalized double-slash in key: '{}' → '{}'",
+                key,
+                normalized
+            );
+            normalized
+        } else {
+            key
+        };
 
         // Reject keys containing path traversal segments
         if key.split('/').any(|seg| seg == ".." || seg == ".") {

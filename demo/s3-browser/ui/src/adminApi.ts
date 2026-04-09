@@ -63,7 +63,7 @@ export interface AdminConfig {
   // Sync
   config_sync_bucket: string | null;
   // Per-bucket policies
-  bucket_policies: Record<string, { compression?: boolean; max_delta_ratio?: number; backend?: string; alias?: string }>;
+  bucket_policies: Record<string, { compression?: boolean; max_delta_ratio?: number; backend?: string; alias?: string; public_prefixes?: string[] }>;
   // Multi-backend
   backends: BackendInfo[];
   default_backend: string | null;

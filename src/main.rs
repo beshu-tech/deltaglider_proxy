@@ -252,6 +252,12 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let shared_config = config.clone().into_shared();
     let (config_db, config_db_mismatch) = init_config_db(&admin_password_hash, &iam_state);
 
+    // --- Public prefix snapshot (lock-free, hot-swappable) ---
+    let public_prefix_snapshot: deltaglider_proxy::bucket_policy::SharedPublicPrefixSnapshot =
+        std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(
+            deltaglider_proxy::bucket_policy::PublicPrefixSnapshot::from_config(&config.buckets),
+        )));
+
     // --- S3 router ---
     let app = build_s3_router(
         &state,
@@ -261,6 +267,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         &replay_cache,
         &config,
         config_db_mismatch,
+        &public_prefix_snapshot,
     );
 
     // --- External auth (OAuth/OIDC) ---
@@ -322,6 +329,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         config_sync,
         config_db_mismatch,
         external_auth,
+        public_prefix_snapshot,
     });
 
     // --- TLS ---

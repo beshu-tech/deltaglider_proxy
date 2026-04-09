@@ -35,6 +35,48 @@ type HmacSha256 = Hmac<Sha256>;
 /// Shared replay cache type: signature string -> timestamp of first use.
 pub type ReplayCache = Arc<DashMap<String, Instant>>;
 
+/// Build an anonymous `AuthenticatedUser` with read+list permissions scoped
+/// to the given public prefixes. Used for unauthenticated public access.
+fn build_anonymous_user(bucket: &str, public_prefixes: &[String]) -> AuthenticatedUser {
+    use crate::iam::permissions::permission_to_iam_policy;
+
+    let mut permissions = Vec::new();
+    let mut iam_policies = Vec::new();
+
+    for prefix in public_prefixes {
+        // Read permission: scoped to bucket/prefix*
+        let read_perm = Permission {
+            id: 0,
+            effect: "Allow".into(),
+            actions: vec!["read".into()],
+            resources: vec![format!("{}/{}*", bucket, prefix)],
+            conditions: None,
+        };
+        iam_policies.push(permission_to_iam_policy(&read_perm));
+        permissions.push(read_perm);
+
+        // List permission: scoped via s3:prefix condition
+        let list_perm = Permission {
+            id: 0,
+            effect: "Allow".into(),
+            actions: vec!["list".into()],
+            resources: vec![format!("{}/*", bucket)],
+            conditions: Some(serde_json::json!({
+                "StringLike": { "s3:prefix": format!("{}*", prefix) }
+            })),
+        };
+        iam_policies.push(permission_to_iam_policy(&list_perm));
+        permissions.push(list_perm);
+    }
+
+    AuthenticatedUser {
+        name: "$anonymous".into(),
+        access_key_id: String::new(),
+        permissions,
+        iam_policies,
+    }
+}
+
 /// Common intermediate representation for SigV4 parameters,
 /// populated from either Authorization header or presigned URL query params.
 struct SigV4Params {
@@ -484,7 +526,69 @@ pub async fn sigv4_auth_middleware(
         _ => {}
     }
 
+    // ── Public prefix bypass: unauthenticated read-only access ──
+    // Check BEFORE SigV4 parsing so requests without auth headers don't error.
+    // Only applies to GET/HEAD (read-only) when no credentials are present.
     let query_string = request.uri().query().unwrap_or("");
+    let method = request.method().clone();
+    let is_read_method = method == axum::http::Method::GET || method == axum::http::Method::HEAD;
+    let has_auth =
+        request.headers().contains_key("authorization") || has_presigned_query_params(query_string);
+
+    if is_read_method && !has_auth {
+        if let Some(snapshot) = request
+            .extensions()
+            .get::<crate::bucket_policy::SharedPublicPrefixSnapshot>()
+            .map(|s| s.load_full())
+        {
+            if !snapshot.is_empty() {
+                // Parse bucket and key from the RAW path (not the trimmed one used
+                // for operational endpoint matching) to preserve trailing slashes in keys.
+                let raw_path = request.uri().path();
+                let trimmed = raw_path.trim_start_matches('/');
+                let (bucket_str, key_str) = trimmed
+                    .split_once('/')
+                    .map(|(b, k)| (b.to_string(), percent_decode(k)))
+                    .unwrap_or_else(|| (trimmed.to_string(), String::new()));
+                let bucket_lower = bucket_str.to_ascii_lowercase();
+
+                // For GET on /<bucket> (LIST), check if prefix overlaps
+                // For GET/HEAD on /<bucket>/<key>, check if key is public
+                let is_public = if key_str.is_empty() {
+                    // LIST request — extract prefix from query params
+                    let prefix = query_string
+                        .split('&')
+                        .find_map(|pair| {
+                            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+                            if k == "prefix" {
+                                Some(percent_decode(v))
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_default();
+                    snapshot.list_overlaps_public(&bucket_lower, &prefix)
+                } else {
+                    snapshot.is_public_read(&bucket_lower, &key_str)
+                };
+
+                if is_public {
+                    // Build scoped anonymous AuthenticatedUser
+                    let public_prefixes = snapshot.public_prefixes_for_bucket(&bucket_lower);
+                    let anon_user = build_anonymous_user(&bucket_lower, public_prefixes);
+
+                    info!(
+                        "AUDIT | action=public_read | user=$anonymous | bucket={} | key={} | ip={} | method={}",
+                        bucket_str, key_str, audit_ip, method
+                    );
+
+                    request.extensions_mut().insert(anon_user);
+
+                    return Ok(next.run(request).await);
+                }
+            }
+        }
+    }
     let params = if has_presigned_query_params(query_string) {
         SigV4Params::from_query(&request).inspect_err(|_| {
             record_auth_failure("invalid_presigned");

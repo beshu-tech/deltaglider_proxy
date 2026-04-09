@@ -42,8 +42,8 @@ export default function useUploadQueue(destination: string) {
       prev.map((item) => (item.id === pending.id ? { ...item, status: 'uploading' as const } : item))
     );
 
-    // Sanitize destination: strip leading slashes, treat "/" or empty as root
-    const cleanDest = destination.replace(/^\/+/, '').replace(/\/+$/, '');
+    // Sanitize destination: strip leading/trailing slashes, collapse consecutive slashes
+    const cleanDest = destination.replace(/^\/+/, '').replace(/\/+$/, '').replace(/\/{2,}/g, '/');
     const key = cleanDest ? `${cleanDest}/${pending.file.name}` : pending.file.name;
 
     uploadObject(key, pending.file)

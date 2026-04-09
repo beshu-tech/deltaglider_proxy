@@ -678,6 +678,11 @@ pub async fn update_config(
             cfg.buckets = old_buckets;
             warnings.push(format!("Failed to apply bucket policies: {}", e));
         }
+        // Rebuild public prefix snapshot (hot-swap, lock-free)
+        let new_snapshot = crate::bucket_policy::PublicPrefixSnapshot::from_config(&cfg.buckets);
+        state
+            .public_prefix_snapshot
+            .store(std::sync::Arc::new(new_snapshot));
     }
 
     // Persist to TOML file
@@ -989,29 +994,16 @@ pub async fn recover_db(
         // Raw bcrypt hash
         candidate.clone()
     } else {
-        // Try base64 decode
-        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &candidate) {
-            Ok(bytes) => match String::from_utf8(bytes) {
-                Ok(decoded) if decoded.starts_with("$2") => decoded,
-                _ => {
-                    if let Some(ip) = &client_ip {
-                        state.rate_limiter.record_failure(ip);
-                    }
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(RecoverDbResponse {
-                            success: false,
-                            correct_hash: None,
-                            correct_hash_base64: None,
-                            error: Some(
-                                "Input is not a bcrypt hash. Provide the hash ($2b$12$...) or its base64 encoding."
-                                    .into(),
-                            ),
-                        }),
-                    );
-                }
-            },
-            Err(_) => {
+        // Try base64 decode → UTF-8 → bcrypt hash prefix check
+        let decoded =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &candidate)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .filter(|s| s.starts_with("$2"));
+
+        match decoded {
+            Some(hash) => hash,
+            None => {
                 if let Some(ip) = &client_ip {
                     state.rate_limiter.record_failure(ip);
                 }
@@ -1073,18 +1065,19 @@ pub async fn recover_db(
     };
 
     // Try to open with the candidate hash
-    match crate::config_db::ConfigDb::open_or_create(&db_path, &candidate_hash) {
-        Ok(_db) => {
-            // Success! Clean up recovery temp file if it was from S3
-            if db_path
-                .extension()
-                .map(|e| e == "recovery")
-                .unwrap_or(false)
-            {
-                let _ = std::fs::remove_file(&db_path);
-            }
+    let is_recovery_temp = db_path
+        .extension()
+        .map(|e| e == "recovery")
+        .unwrap_or(false);
+    let result = crate::config_db::ConfigDb::open_or_create(&db_path, &candidate_hash);
 
-            // Reset rate limiter on success
+    // Always clean up the recovery temp file (from S3 download), regardless of outcome
+    if is_recovery_temp {
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    match result {
+        Ok(_db) => {
             if let Some(ip) = &client_ip {
                 state.rate_limiter.record_success(ip);
             }
@@ -1107,16 +1100,6 @@ pub async fn recover_db(
             )
         }
         Err(_) => {
-            // Clean up recovery temp file
-            if db_path
-                .extension()
-                .map(|e| e == "recovery")
-                .unwrap_or(false)
-            {
-                let _ = std::fs::remove_file(&db_path);
-            }
-
-            // Record failure for rate limiting
             if let Some(ip) = &client_ip {
                 state.rate_limiter.record_failure(ip);
             }
