@@ -68,7 +68,7 @@ LABEL org.opencontainers.image.title="DeltaGlider Proxy" \
 # xdelta3 is copied from build stage to reduce apt dependency surface.
 # Use multiple retries + fallback to handle unreliable deb.debian.org.
 RUN (apt-get -o Acquire::Retries=5 update && apt-get install -y --no-install-recommends \
-    ca-certificates curl \
+    ca-certificates curl ntpstat chrony \
     && rm -rf /var/lib/apt/lists/*) \
     || (echo "WARN: apt-get failed — continuing without curl (healthcheck will use wget fallback)" && apt-get clean)
 RUN groupadd --system dg && useradd --system --gid dg --no-create-home dg

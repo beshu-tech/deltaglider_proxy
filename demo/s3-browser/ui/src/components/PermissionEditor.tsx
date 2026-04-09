@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Input, Button, Typography, Segmented, Tooltip, Checkbox } from 'antd';
+import { Input, Button, Typography, Segmented, Checkbox } from 'antd';
 import { PlusOutlined, DeleteOutlined, FilterOutlined } from '@ant-design/icons';
 import type { IamPermission } from '../adminApi';
 import { useCardStyles } from './shared-styles';
@@ -161,7 +161,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
             {/* Header: Allow/Deny + Conditions toggle + Remove */}
             <div style={{ marginBottom: 8, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <Tooltip title="Deny rules override Allow rules">
+                <span title="Deny rules override Allow rules">
                   <Segmented
                     size="small"
                     value={row.effect || 'Allow'}
@@ -175,7 +175,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                       { label: <span style={{ color: isDeny ? colors.ACCENT_RED : undefined, fontWeight: isDeny ? 600 : undefined }}>Deny</span>, value: 'Deny' },
                     ]}
                   />
-                </Tooltip>
+                </span>
                 {hasCond && !showCond && (
                   <span style={{
                     fontSize: 10,
@@ -193,20 +193,19 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                 )}
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                <Tooltip title="Add conditions (prefix restriction, IP filtering)">
-                  <Button
-                    type="text"
-                    size="small"
-                    icon={<FilterOutlined />}
-                    onClick={() => toggleConditions(i)}
-                    style={{
-                      opacity: showCond || hasCond ? 1 : 0.4,
-                      color: hasCond ? colors.ACCENT_PURPLE : undefined,
-                      padding: '2px 6px',
-                      minWidth: 0,
-                    }}
-                  />
-                </Tooltip>
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<FilterOutlined />}
+                  title="Add conditions (prefix restriction, IP filtering)"
+                  onClick={() => toggleConditions(i)}
+                  style={{
+                    opacity: showCond || hasCond ? 1 : 0.4,
+                    color: hasCond ? colors.ACCENT_PURPLE : undefined,
+                    padding: '2px 6px',
+                    minWidth: 0,
+                  }}
+                />
                 <Button type="text" danger size="small" icon={<DeleteOutlined />} onClick={() => onChange(permissions.filter((_, j) => j !== i))}>
                   Remove
                 </Button>

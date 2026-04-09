@@ -327,6 +327,7 @@ export interface ExternalProviderInfo {
 
 export interface WhoamiResponse {
   mode: 'bootstrap' | 'iam' | 'open';
+  version?: string;
   user: { name: string; access_key_id: string; is_admin: boolean } | null;
   config_db_mismatch?: boolean;
   external_providers?: ExternalProviderInfo[];

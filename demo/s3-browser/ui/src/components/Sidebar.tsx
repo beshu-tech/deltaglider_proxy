@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Layout, Button, Space, Typography, Input, Drawer, theme, message, Popconfirm, Tooltip } from 'antd';
+import { Layout, Button, Space, Typography, Input, Drawer, theme, message, Popconfirm } from 'antd';
 import type { InputRef } from 'antd';
 import {
   SettingOutlined,
@@ -45,6 +45,7 @@ interface Props {
   currentUser?: string;
   displayName?: string;
   canAdmin?: boolean;
+  proxyVersion?: string;
 }
 
 export default function Sidebar({
@@ -61,6 +62,7 @@ export default function Sidebar({
   currentUser,
   displayName,
   canAdmin,
+  proxyVersion,
 }: Props) {
   const {
     BG_SIDEBAR, BORDER, TEXT_PRIMARY, TEXT_SECONDARY,
@@ -146,16 +148,15 @@ export default function Sidebar({
           <Text style={{ fontSize: 11, fontWeight: 700, letterSpacing: 1.5, textTransform: 'uppercase', color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>
             Buckets ({buckets.length})
           </Text>
-          <Tooltip title="Create bucket">
-            <Button
-              type="text"
-              size="small"
-              icon={<PlusOutlined />}
-              aria-label="Create bucket"
-              style={{ color: TEXT_MUTED, fontSize: 13 }}
-              onClick={() => { newBucketInputRef.current?.focus(); }}
-            />
-          </Tooltip>
+          <Button
+            type="text"
+            size="small"
+            icon={<PlusOutlined />}
+            aria-label="Create bucket"
+            title="Create bucket"
+            style={{ color: TEXT_MUTED, fontSize: 13 }}
+            onClick={() => { newBucketInputRef.current?.focus(); }}
+          />
         </div>
 
         <ul style={{ listStyle: 'none', margin: 0, padding: 0 }}>
@@ -288,13 +289,12 @@ export default function Sidebar({
             </button>
             {onLogout && (
               <div style={{ padding: '6px 0 2px' }}>
-                <div style={{ padding: '4px 6px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
-                  <span style={{ fontSize: 11, color: TEXT_MUTED, fontFamily: "var(--font-ui)", overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    Logged in as <strong style={{ color: TEXT_SECONDARY, fontWeight: 600 }}>{displayName || currentUser || 'user'}</strong>
-                  </span>
-                  <Tooltip title="Disconnect & clear credentials" placement="right">
+                <div style={{ padding: '4px 6px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 2 }}>
+                    <span style={{ fontSize: 10, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>Logged in as</span>
                     <button
                       className="btn-reset"
+                      title="Disconnect & clear credentials"
                       style={{ color: TEXT_MUTED, fontSize: 14, padding: 4, flexShrink: 0, transition: 'color 0.15s' }}
                       onMouseEnter={(e) => { e.currentTarget.style.color = ACCENT_RED; }}
                       onMouseLeave={(e) => { e.currentTarget.style.color = TEXT_MUTED; }}
@@ -307,7 +307,10 @@ export default function Sidebar({
                     >
                       <LogoutOutlined aria-hidden="true" />
                     </button>
-                  </Tooltip>
+                  </div>
+                  <div style={{ fontSize: 12, color: TEXT_SECONDARY, fontWeight: 600, fontFamily: "var(--font-mono)", wordBreak: 'break-all', lineHeight: 1.4 }}>
+                    {displayName || currentUser || 'user'}
+                  </div>
                 </div>
               </div>
             )}
@@ -324,8 +327,9 @@ export default function Sidebar({
           <div style={{ fontSize: 16, fontWeight: 800, letterSpacing: 4, color: TEXT_PRIMARY, lineHeight: 1, fontFamily: "var(--font-ui)", textTransform: 'uppercase' }}>
             DeltaGlider
           </div>
-          <div style={{ fontSize: 11, fontWeight: 600, letterSpacing: 3, color: ACCENT_BLUE, textTransform: 'uppercase', marginTop: 5, fontFamily: "var(--font-mono)" }}>
+          <div style={{ fontSize: 11, fontWeight: 600, letterSpacing: 3, color: ACCENT_BLUE, textTransform: 'uppercase', marginTop: 5, fontFamily: "var(--font-mono)", display: 'flex', alignItems: 'baseline', gap: 8 }}>
             Proxy
+            {proxyVersion && <span style={{ fontSize: 10, fontWeight: 400, letterSpacing: 0.5, color: TEXT_MUTED }}>v{proxyVersion}</span>}
           </div>
           <div style={{ fontSize: 10, color: TEXT_FAINT, marginTop: 14, fontFamily: "var(--font-mono)", letterSpacing: 0.3 }}>
             {formatBuildTime()}

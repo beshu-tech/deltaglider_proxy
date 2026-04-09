@@ -158,6 +158,12 @@ body {
   background: var(--scrollbar-thumb-hover, rgba(255, 255, 255, 0.14));
 }
 
+/* ───── Kill ALL Ant Design tooltips/popovers (broken positioning in this layout) ───── */
+.ant-tooltip,
+.ant-popover {
+  display: none !important;
+}
+
 /* ───── Ant Design table overrides ───── */
 .ant-table-wrapper .ant-table-tbody > tr.ant-table-row:hover > td {
   background: var(--table-row-hover) !important;

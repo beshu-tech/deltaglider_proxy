@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Typography, Space, Button, Spin, Tooltip, Switch, Progress, Tag } from 'antd';
+import { Typography, Space, Button, Spin, Switch, Progress, Tag } from 'antd';
 import { ArrowLeftOutlined, ReloadOutlined, InfoCircleOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import { formatBytes } from '../utils';
@@ -140,7 +140,7 @@ function StatCard({ label, value, description, color, warn, children }: {
     <div style={{ background: BG_CARD, border: `1px solid ${BORDER}`, borderRadius: 12, padding: 16, flex: '1 1 180px', minWidth: 160 }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 4 }}>
         <Text style={{ fontSize: 11, fontWeight: 600, letterSpacing: 0.5, textTransform: 'uppercase', color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>{label}</Text>
-        {warn && <Tooltip title={warn}><InfoCircleOutlined style={{ fontSize: 11, color: '#fbbf24' }} /></Tooltip>}
+        {warn && <InfoCircleOutlined title={warn} style={{ fontSize: 11, color: '#fbbf24', cursor: 'help' }} />}
       </div>
       <div style={{ fontSize: 26, fontWeight: 700, fontFamily: "var(--font-mono)", color: color || TEXT_PRIMARY, lineHeight: 1.2 }}>{value}</div>
       <Text style={{ fontSize: 11, color: TEXT_MUTED, fontFamily: "var(--font-ui)", display: 'block', marginTop: 4 }}>{description}</Text>
@@ -365,7 +365,7 @@ export default function MetricsPage({ onBack, embedded }: Props) {
           </Text>
         </div>
         <Space>
-          <Tooltip title="Live refresh every 5s"><Switch size="small" checked={autoRefresh} onChange={setAutoRefresh} /></Tooltip>
+          <span title="Live refresh every 5s"><Switch size="small" checked={autoRefresh} onChange={setAutoRefresh} /></span>
           <Button size="small" icon={<ReloadOutlined />} onClick={fetchMetrics} style={{ borderRadius: 8 }}>Refresh</Button>
           {!embedded && <Button size="small" icon={<ArrowLeftOutlined />} onClick={onBack} style={{ borderRadius: 8 }}>Back</Button>}
         </Space>

@@ -1,5 +1,69 @@
 # Changelog
 
+## v0.7.2
+
+### UI Polish & Usability
+- **Presigned URL duration selector**: Share button is now a split button — main button generates a 7-day link, chevron dropdown offers 1 hour, 24 hours, or 7 days. Share modal displays "Expires in" label.
+- **Version display**: Sidebar branding shows the proxy version (fetched from whoami, not the unauthenticated health endpoint).
+- **OAuth user identity**: Sidebar shows the user's email address (from external identity) instead of the truncated access key ID. Username displayed on its own row for readability.
+- **Ant Design tooltips removed globally**: CSS nuke (`display: none !important`) on `.ant-tooltip, .ant-popover` prevents all layout-shaking tooltip bugs. All 6 `<Tooltip>` usages replaced with native `title` attributes.
+- **Analytics tab padding fix**: Removed double padding (AnalyticsSection had its own wrapper padding on top of the parent MetricsPage padding). Aligned card styles (borderRadius, fontSize, fontFamily, spacing) between Monitoring and Analytics tabs.
+
+### Correctness
+- **Analytics stats**: Stats endpoint now calls `list_objects` with `metadata=true`, so delta compression savings are correctly reported (was always showing 0% savings).
+- **InspectorPanel crash on zip files**: Fixed React error #310 — `useState` for share duration was declared after the early return, causing hook count mismatch.
+- **Whoami returns user info**: `GET /api/whoami` now resolves the logged-in user from the session cookie (name, access_key_id, is_admin). OAuth users show their email, IAM users show their name, bootstrap shows "admin".
+
+### Security
+- **Version removed from health endpoint**: `/_/health` no longer exposes `version` field. Version is only available via the authenticated `/_/api/whoami` endpoint.
+
+### Infrastructure
+- **Docker debugging tools**: `ntpstat` and `chrony` pre-installed in the runtime image for clock skew diagnosis.
+
+## v0.7.1
+
+### Features
+- **Bulk copy/move**: Select multiple objects and copy or move them to a different bucket/prefix via a destination picker modal. Move = copy + delete source (only after all copies succeed).
+- **Bulk download as ZIP**: Select multiple files and download them as a client-side ZIP (fflate). Size warning for selections >500MB.
+- **Storage analytics dashboard**: New Analytics tab in Metrics page with summary cards (total storage, space saved, savings %, estimated monthly cost savings), per-bucket stacked bar chart, session savings area chart, and compression opportunity identifier.
+- **Cost configuration**: Gear icon on the monthly savings card opens a preset selector (AWS S3, S3 IA, Hetzner, Backblaze, Cloudflare R2) with localStorage persistence.
+- **Themed error pages**: OAuth error pages (provider not ready, auth failed, account disabled) respect the user's dark/light theme via CSS custom properties and inline localStorage/prefers-color-scheme detection.
+
+### UI Components
+- **BulkActionBar**: Toolbar with Copy, Move, ZIP, Delete buttons — replaces the inline delete button when objects are selected.
+- **DestinationPickerModal**: Bucket dropdown + prefix autocomplete, preview of destination paths, move-mode deletion warning.
+- **AnalyticsSection**: Summary cards, Recharts bar/area charts, compression opportunity cards.
+
+## v0.7.0
+
+### Features
+- **OAuth/OIDC external authentication**: Login with Google (or any OIDC provider) via the admin GUI. PKCE, state parameter, nonce, JWT validation. Per-provider configuration with display names and custom branding.
+- **Group mapping rules**: Map external identity claims (email domain, email glob, email regex, claim value) to IAM groups. Rules evaluated on every OAuth login; group memberships merged (not replaced).
+- **Mandatory authentication**: Proxy refuses to start without authentication credentials unless `authentication = "none"` is explicitly set. Prevents accidental open-access deployments.
+- **Per-bucket compression policies**: Enable/disable compression per bucket in the Backends panel. When per-bucket compression is ON but global ratio is 0, uses 0.75 default.
+- **Multi-instance config sync**: ExternalAuthManager rebuilds after S3 config sync. Stale pending OAuth flows cleared on provider rebuild.
+
+### UI
+- **OAuth login buttons**: Connect page shows branded OAuth provider buttons with "credentials instead" collapsible.
+- **Authentication panel**: Full OAuth provider CRUD, mapping rules with local state + Save button (not per-keystroke API calls).
+- **Backends panel**: Merged Storage + Compression tabs. Per-bucket policy toggles inline with backend configuration.
+- **Custom dropdowns**: `SimpleSelect` and `SimpleAutoComplete` replace broken Ant Design Select/AutoComplete popups.
+- **Tab headers**: Centered, typographically consistent headers for all admin settings tabs.
+- **Object table fixes**: `showSorterTooltip={false}` prevents sort header shaking. Native `title` attributes replace broken Ant tooltips.
+
+### Security
+- **Session cookie fixes**: SameSite=Lax (not Strict) for OAuth redirect compatibility. Secure flag auto-detects TLS.
+- **XSS protection**: `escape_html()` on OAuth error page parameters.
+- **Rate limiting on OAuth callback**: Prevents brute-force state token guessing.
+- **Group membership merge**: OAuth re-login no longer wipes existing group memberships.
+
+### Bug Fixes
+- **Bucket not loading on first click**: `s3client.setBucket()` called before React state update.
+- **Empty browser after login**: `s3.reconnect()` moved to useEffect (was in Promise callback before state committed).
+- **Upload SignatureDoesNotMatch**: Strip leading/trailing slashes from upload destination path.
+- **InternalError hiding real errors**: Error message now shows actual error, not generic text.
+- **Reference.bin fallback**: GET on aliased bucket paths falls back to passthrough when reference fetch fails.
+
 ## v0.6.0
 
 ### Features

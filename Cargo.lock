@@ -1061,7 +1061,7 @@ dependencies = [
 
 [[package]]
 name = "deltaglider_proxy"
-version = "0.6.0"
+version = "0.7.2"
 dependencies = [
  "arc-swap",
  "async-trait",

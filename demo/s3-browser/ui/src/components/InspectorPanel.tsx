@@ -61,6 +61,137 @@ function InfoRow({ label, value }: { label: string; value: string }) {
   );
 }
 
+/** Split button: main button generates a 7-day link, chevron opens duration picker. */
+function ShareDurationButton({
+  durations,
+  onSelect,
+  accentBlue,
+  border,
+  textMuted,
+  textPrimary,
+  bgSidebar,
+}: {
+  durations: { label: string; seconds: number }[];
+  onSelect: (seconds: number) => void;
+  accentBlue: string;
+  border: string;
+  textMuted: string;
+  textPrimary: string;
+  bgSidebar: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  // Close on outside click
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [open]);
+
+  return (
+    <div ref={ref} style={{ display: 'flex', width: '100%' }}>
+      {/* Main button — default 7 days */}
+      <button
+        onClick={() => { onSelect(durations[durations.length - 1].seconds); setOpen(false); }}
+        style={{
+          flex: 1,
+          height: 40,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          gap: 6,
+          background: accentBlue,
+          color: '#fff',
+          border: 'none',
+          borderRadius: '10px 0 0 10px',
+          fontWeight: 600,
+          fontSize: 14,
+          fontFamily: 'var(--font-ui)',
+          cursor: 'pointer',
+        }}
+        aria-label="Share link (7 days)"
+      >
+        <LinkOutlined /> Share
+      </button>
+      {/* Chevron toggle */}
+      <button
+        onClick={() => setOpen(!open)}
+        aria-label="Choose link duration"
+        aria-expanded={open}
+        style={{
+          width: 32,
+          height: 40,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          background: accentBlue,
+          color: '#fff',
+          border: 'none',
+          borderLeft: '1px solid rgba(255,255,255,0.25)',
+          borderRadius: '0 10px 10px 0',
+          cursor: 'pointer',
+          fontSize: 10,
+        }}
+      >
+        <span style={{ transform: open ? 'rotate(180deg)' : 'none', transition: 'transform 0.15s' }}>&#9660;</span>
+      </button>
+      {/* Duration dropdown */}
+      {open && (
+        <div
+          role="listbox"
+          aria-label="Link expiry duration"
+          style={{
+            position: 'absolute',
+            top: '100%',
+            left: 0,
+            right: 0,
+            marginTop: 4,
+            background: bgSidebar,
+            border: `1px solid ${border}`,
+            borderRadius: 8,
+            boxShadow: '0 8px 24px rgba(0,0,0,0.35)',
+            zIndex: 10,
+            overflow: 'hidden',
+          }}
+        >
+          {durations.map((d) => (
+            <div
+              key={d.seconds}
+              role="option"
+              tabIndex={0}
+              aria-selected={false}
+              onClick={() => { onSelect(d.seconds); setOpen(false); }}
+              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelect(d.seconds); setOpen(false); } }}
+              style={{
+                padding: '10px 14px',
+                cursor: 'pointer',
+                fontSize: 13,
+                fontFamily: 'var(--font-ui)',
+                color: textPrimary,
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                borderBottom: `1px solid ${border}`,
+              }}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLDivElement).style.background = `${accentBlue}18`; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.background = 'transparent'; }}
+            >
+              <span>{d.label}</span>
+              <span style={{ fontSize: 11, color: textMuted, fontFamily: 'var(--font-mono)' }}>
+                <LinkOutlined style={{ marginRight: 4 }} />Share
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function InspectorPanel({ object, onClose, onDeleted, onPreview, isMobile, headCache }: Props) {
   const {
     BG_SIDEBAR, BORDER, TEXT_PRIMARY, TEXT_MUTED, TEXT_FAINT,
@@ -78,6 +209,7 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
     | null
   >(null);
   const blobRef = useRef<{ blob: Blob; name: string } | null>(null);
+  const [shareDuration, setShareDuration] = useState<number | null>(null);
 
   useEffect(() => {
     if (!object) { setHeadData(null); return; }
@@ -150,12 +282,19 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
     setModalState(null);
   };
 
-  const handleCopyLink = async () => {
+  const SHARE_DURATIONS = [
+    { label: '1 hour', seconds: 3600 },
+    { label: '24 hours', seconds: 86400 },
+    { label: '7 days', seconds: 7 * 24 * 3600 - 1 },
+  ];
+
+  const handleCopyLink = async (expiresInSeconds?: number) => {
     setModalState({ mode: 'share', phase: 'loading' });
+    setShareDuration(expiresInSeconds ?? SHARE_DURATIONS[2].seconds);
     try {
       let url: string;
       try {
-        url = await getPresignedUrl(object.key);
+        url = await getPresignedUrl(object.key, expiresInSeconds);
       } catch (e) {
         console.warn('Presigned URL failed, falling back to direct URL:', e);
         url = getObjectUrl(object.key);
@@ -266,20 +405,17 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
               >
                 Download
               </Button>
-              <Button
-                type="primary"
-                size="large"
-                icon={<LinkOutlined />}
-                onClick={handleCopyLink}
-                style={{
-                  flex: 1,
-                  fontWeight: 600,
-                  borderRadius: 10,
-                  fontFamily: "var(--font-ui)",
-                }}
-              >
-                Share
-              </Button>
+              <div style={{ flex: 1, position: 'relative' }}>
+                <ShareDurationButton
+                  durations={SHARE_DURATIONS}
+                  onSelect={(seconds) => handleCopyLink(seconds)}
+                  accentBlue={ACCENT_BLUE}
+                  border={BORDER}
+                  textMuted={TEXT_MUTED}
+                  textPrimary={TEXT_PRIMARY}
+                  bgSidebar={BG_SIDEBAR}
+                />
+              </div>
             </div>
 
             {/* STORAGE STATS */}
@@ -504,8 +640,11 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
               <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 16 }}>
                 <CheckCircleFilled style={{ fontSize: 40, color: ACCENT_BLUE }} />
                 <div style={{ width: '100%' }}>
-                  <div style={{ fontSize: 16, fontWeight: 600, color: TEXT_PRIMARY, marginBottom: 12, fontFamily: "var(--font-ui)" }}>
+                  <div style={{ fontSize: 16, fontWeight: 600, color: TEXT_PRIMARY, marginBottom: 4, fontFamily: "var(--font-ui)" }}>
                     Signed link ready
+                  </div>
+                  <div style={{ fontSize: 12, color: TEXT_MUTED, marginBottom: 12, fontFamily: "var(--font-ui)" }}>
+                    Expires in {SHARE_DURATIONS.find(d => d.seconds === shareDuration)?.label ?? 'unknown'}
                   </div>
                   <Input.TextArea
                     value={modalState.url}
