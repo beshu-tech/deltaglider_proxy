@@ -72,6 +72,8 @@ A single infrastructure secret that serves three purposes:
 
 ## IAM Permissions (ABAC)
 
+![IAM user management with ABAC permissions](/_/screenshots/iam.jpg)
+
 Each IAM user (whether created manually or auto-provisioned via OAuth) has one or more permission rules:
 
 ```json
@@ -126,6 +128,8 @@ Groups are managed via the admin GUI (**Admin Settings > Groups**). OAuth group 
 
 ## OAuth/OIDC Configuration
 
+![OAuth login with Google SSO](/_/screenshots/oauth_login.jpg)
+
 ### Setting Up a Provider
 
 1. Open the admin GUI → **Admin Settings** → **Authentication**
@@ -138,6 +142,8 @@ Groups are managed via the admin GUI (**Admin Settings > Groups**). OAuth group 
 4. Save and test
 
 ### Group Mapping Rules
+
+![OAuth group mapping rules](/_/screenshots/oauth_group_mapping.jpg)
 
 After configuring an OAuth provider, set up mapping rules to auto-assign permissions:
 

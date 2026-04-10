@@ -2,7 +2,9 @@
 
 *Prometheus metrics and Grafana setup*
 
-DeltaGlider Proxy exposes a `/metrics` endpoint in Prometheus text format on the same port as the S3 API (default `9000`). Also available at `/_/metrics`. Metrics are collected via lightweight atomics on the hot path -- no locks, no sampling, no performance impact.
+![Storage analytics dashboard](/_/screenshots/analytics.jpg)
+
+DeltaGlider Proxy exposes a `/metrics` endpoint in Prometheus text format on the same port as the S3 API (default `9000`). Also available at `/_/metrics`. Metrics are collected via lightweight atomics on the hot path -- no locks, no sampling, no performance impact. The built-in admin GUI includes a live monitoring dashboard and a storage analytics tab with per-bucket savings breakdown and cost estimation.
 
 ## Quick start
 
