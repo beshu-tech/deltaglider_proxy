@@ -10,7 +10,9 @@ import CredentialsBanner from './CredentialsBanner';
 const { Text } = Typography;
 
 function permissionSummary(user: IamUser): string {
-  if (user.permissions.length === 0) return 'No access';
+  if (user.permissions.length === 0) {
+    return user.auth_source === 'external' ? 'Via groups' : 'No access';
+  }
   const hasAll = user.permissions.some(p => p.actions.includes('*') && p.resources.includes('*'));
   if (hasAll) return 'Full admin';
   return `${user.permissions.length} rule${user.permissions.length !== 1 ? 's' : ''}`;
