@@ -152,17 +152,20 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         .with_state(admin_state.clone());
 
     // Health check (unauthenticated — needed for load balancer probes)
-    let health_route = Router::new().route(
-        "/_/health",
-        get(deltaglider_proxy::api::handlers::health_check).with_state(s3_state.clone()),
-    );
-
-    // Metrics/stats under /_/ — session-protected (sensitive operational data)
-    let metrics_routes = Router::new()
+    // Operational endpoints — accessible without auth for monitoring systems
+    // (Prometheus scrapers, load balancers, health checks)
+    let operational_routes = Router::new()
+        .route(
+            "/_/health",
+            get(deltaglider_proxy::api::handlers::health_check).with_state(s3_state.clone()),
+        )
         .route(
             "/_/metrics",
             get(deltaglider_proxy::metrics::metrics_handler).with_state(s3_state.clone()),
-        )
+        );
+
+    // Stats endpoint — session-protected (reveals per-bucket storage sizes)
+    let stats_route = Router::new()
         .route(
             "/_/stats",
             get(deltaglider_proxy::api::handlers::get_stats).with_state(s3_state),
@@ -181,8 +184,8 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
     Router::new()
         .merge(protected)
         .merge(public_admin)
-        .merge(health_route)
-        .merge(metrics_routes)
+        .merge(operational_routes)
+        .merge(stats_route)
         .merge(static_routes)
         .layer({
             // SECURITY: In production (single-port architecture), CORS is not needed

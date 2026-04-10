@@ -679,7 +679,7 @@ async fn test_health_endpoint_no_auth_needed() {
 
     let http = reqwest::Client::new();
     let resp = http
-        .get(format!("{}/health", server.endpoint()))
+        .get(format!("{}/_/health", server.endpoint()))
         .send()
         .await
         .unwrap();
@@ -687,7 +687,7 @@ async fn test_health_endpoint_no_auth_needed() {
     assert_eq!(
         resp.status(),
         StatusCode::OK,
-        "/health should work without auth"
+        "/_/health should work without auth"
     );
 }
 
@@ -701,14 +701,14 @@ async fn test_metrics_endpoint_no_auth_needed() {
 
     let http = reqwest::Client::new();
     let resp = http
-        .get(format!("{}/metrics", server.endpoint()))
+        .get(format!("{}/_/metrics", server.endpoint()))
         .send()
         .await
         .unwrap();
 
     assert!(
         resp.status().is_success(),
-        "/metrics should work without auth, got {}",
+        "/_/metrics should work without auth, got {}",
         resp.status()
     );
 }
