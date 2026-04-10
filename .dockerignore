@@ -21,14 +21,16 @@ deltaglider_proxy.toml
 
 # Debugging artifacts
 .playwright-mcp/
-*.png
-!docs/*.png
-!demo/s3-browser/ui/public/screenshots/*.png
 
 # Docs — keep docs/ for UI build (docs-imports.ts reads markdown from docs/)
+# and screenshots for the embedded docs landing page
 *.md
 !docs/*.md
 !README.md
+
+# Screenshots: allow in docs/ and UI public/ (both jpg and png)
+!docs/screenshots/
+!demo/s3-browser/ui/public/screenshots/
 LICENSE
 
 # OS

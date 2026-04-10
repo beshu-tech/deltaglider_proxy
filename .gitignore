@@ -28,6 +28,7 @@ ENTERPRISE_STRATEGY.md
 *.png
 !docs/*.png
 !docs/screenshots/*.png
+!demo/s3-browser/ui/public/screenshots/*
 .playwright-mcp/
 
 # OS
