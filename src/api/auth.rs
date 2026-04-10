@@ -521,15 +521,10 @@ pub async fn sigv4_auth_middleware(
         return Ok(next.run(request).await);
     }
 
-    // Operational endpoints are always unauthenticated — they expose no user data
-    // and are needed by monitoring systems (Prometheus, load balancers, admin GUI).
-    let path = request.uri().path().trim_end_matches('/');
-    match path {
-        "/health" | "/stats" | "/metrics" => {
-            return Ok(next.run(request).await);
-        }
-        _ => {}
-    }
+    // NOTE: Status endpoints (health, stats, metrics) live under /_/ and are served
+    // by the admin router, NOT the S3 router. Do NOT bypass auth for bare /health,
+    // /stats, /metrics here — those are valid S3 bucket names and bypassing auth
+    // would expose any bucket named "health" etc. without credentials.
 
     // ── Public prefix bypass: unauthenticated read-only access ──
     // Check BEFORE SigV4 parsing so requests without auth headers don't error.
