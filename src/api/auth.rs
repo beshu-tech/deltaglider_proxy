@@ -259,43 +259,48 @@ fn verify_signature(
     uri_path: &str,
     headers: &axum::http::HeaderMap,
     uri: &axum::http::Uri,
+    is_presigned: bool,
 ) -> Result<(), Response> {
-    // Validate clock skew — configurable via DGP_CLOCK_SKEW_SECONDS (default 300s = 5 min)
-    // SigV4 requires a date header; reject requests without one to prevent replay attacks
-    // with indefinitely-valid signatures.
-    let max_skew_secs: u64 = std::env::var("DGP_CLOCK_SKEW_SECONDS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(300);
+    // Validate clock skew for header-auth requests only.
+    // Presigned URLs are signed at creation time and used later — their X-Amz-Date
+    // will naturally diverge from the server's current time. They have their own
+    // expiry mechanism (X-Amz-Expires) validated in SigV4Params::from_query().
+    // Applying clock skew to presigned URLs would reject valid URLs after ~5 minutes.
     if params.amz_date.is_empty() {
         warn!("SigV4: request missing x-amz-date/date header");
         return Err(S3Error::AccessDenied.into_response());
     }
-    if let Ok(request_time) =
-        chrono::NaiveDateTime::parse_from_str(&params.amz_date, "%Y%m%dT%H%M%SZ")
-    {
-        let now = chrono::Utc::now().naive_utc();
-        let diff_secs = (now - request_time).num_seconds();
-        let skew = diff_secs.unsigned_abs();
-        if skew > max_skew_secs {
-            let direction = if diff_secs > 0 {
-                "client behind server"
-            } else {
-                "server behind client"
-            };
-            warn!(
-                "SigV4: clock skew {}s ({}) exceeds {}-second limit (request: {}, server: {})",
-                skew,
-                direction,
-                max_skew_secs,
-                params.amz_date,
-                now.format("%Y%m%dT%H%M%SZ")
-            );
-            return Err(S3Error::RequestTimeTooSkewed.into_response());
+    if !is_presigned {
+        let max_skew_secs: u64 = std::env::var("DGP_CLOCK_SKEW_SECONDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+        if let Ok(request_time) =
+            chrono::NaiveDateTime::parse_from_str(&params.amz_date, "%Y%m%dT%H%M%SZ")
+        {
+            let now = chrono::Utc::now().naive_utc();
+            let diff_secs = (now - request_time).num_seconds();
+            let skew = diff_secs.unsigned_abs();
+            if skew > max_skew_secs {
+                let direction = if diff_secs > 0 {
+                    "client behind server"
+                } else {
+                    "server behind client"
+                };
+                warn!(
+                    "SigV4: clock skew {}s ({}) exceeds {}-second limit (request: {}, server: {})",
+                    skew,
+                    direction,
+                    max_skew_secs,
+                    params.amz_date,
+                    now.format("%Y%m%dT%H%M%SZ")
+                );
+                return Err(S3Error::RequestTimeTooSkewed.into_response());
+            }
+        } else {
+            warn!("SigV4: unparseable date: {}", params.amz_date);
+            return Err(S3Error::AccessDenied.into_response());
         }
-    } else {
-        warn!("SigV4: unparseable date: {}", params.amz_date);
-        return Err(S3Error::AccessDenied.into_response());
     }
 
     // Build sorted signed headers
@@ -589,7 +594,8 @@ pub async fn sigv4_auth_middleware(
             }
         }
     }
-    let params = if has_presigned_query_params(query_string) {
+    let is_presigned = has_presigned_query_params(query_string);
+    let params = if is_presigned {
         SigV4Params::from_query(&request).inspect_err(|_| {
             record_auth_failure("invalid_presigned");
         })?
@@ -662,6 +668,7 @@ pub async fn sigv4_auth_middleware(
         uri_path,
         request.headers(),
         request.uri(),
+        is_presigned,
     ) {
         Ok(()) => {
             if let Some(m) = &metrics {

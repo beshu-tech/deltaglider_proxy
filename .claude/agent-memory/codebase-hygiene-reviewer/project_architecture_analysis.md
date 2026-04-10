@@ -4,7 +4,7 @@ description: Deep analysis of DeltaGlider Proxy architecture for testability and
 type: project
 ---
 
-## Architecture Findings (updated 2026-04-06)
+## Architecture Findings (updated 2026-04-09)
 
 **Resolved issues (from prior analysis):**
 - Duplicated `sanitize_audit` fn -- resolved, now centralized in `audit.rs`
@@ -38,12 +38,16 @@ type: project
 - SettingsPage silently sent stale maxDeltaRatio/maxObjectSizeMb/cacheSizeMb on save after compression tab removal -- resolved, removed orphaned state vars (2026-04-06)
 - 2x duplicated group-membership merge loop in external_auth.rs (oauth_callback + sync_memberships) -- resolved, extracted `merge_group_memberships()` helper (2026-04-06)
 - session_cookie_clear used SameSite=Strict while session_cookie used SameSite=Lax -- resolved, aligned to SameSite=Lax (2026-04-06)
+- Duplicated public-prefix methods on BucketPolicyRegistry (is_public_read, list_overlaps_public, public_prefixes, has_any_public) -- resolved, removed dead code, tests migrated to PublicPrefixSnapshot (2026-04-09)
+- Duplicated error response in recover_db for invalid bcrypt hash input -- resolved, collapsed two match arms into single path (2026-04-09)
+- Duplicated recovery-temp-file cleanup in recover_db success/error branches -- resolved, hoisted cleanup before match (2026-04-09)
 
-**Open issues (2026-04-06 hygiene review):**
+**Open issues (2026-04-09 hygiene review):**
+- Scattered `std::env::var("DGP_...").ok().and_then(|v| v.parse().ok()).unwrap_or(default)` pattern across ~15 call sites instead of using centralized `env_parse<T>()` from config.rs. Fix: make `env_parse` public, add `env_parse_with_default`. ~10 files affected.
+- `update_config` handler in api/admin/config.rs is ~275 lines handling 8+ concerns. Well-commented but high cognitive load. Fix: extract helpers for backend/auth/policy sub-sections.
 - 2x duplicated `BackendConfig` -> `BackendInfoResponse` conversion in config.rs:331-364 and backends.rs:69-101. Fix: add `From<&NamedBackendConfig>` impl.
 - 2x duplicated engine rebuild pattern in backends.rs (lines 167-185 and 258-275) instead of using `rebuild_engine()` from config.rs. Fix: make helper pub(super).
 - backendTab in SettingsPage.tsx duplicates saveSection inline (lines 359-397 vs 422-442).
-- `update_config` handler in api/admin/config.rs is ~260 lines. Document-only for now.
 - `update_auth_provider` in config_db/auth_providers.rs uses 11 individual UPDATE statements per field. Works but verbose. Document-only.
 
 **Remaining structural observations:**
@@ -81,6 +85,7 @@ type: project
 - `popupRoot` in main.tsx is still needed for Ant Design Tooltip/Modal/Drawer/message/Popconfirm
 - `mutate` in useS3Browser.ts is a semantic alias for `refresh` -- stable API naming, not dead code
 - `secure_cookies()` reads env vars per-call (2 calls total, login/logout only) -- documented in config.rs, acceptable
+- PublicPrefixSnapshot is the single production path for public prefix checks; BucketPolicyRegistry handles validation/normalization only
 
 **Why:** Understanding structural debt helps prioritize refactoring with maximum testability impact.
 **How to apply:** Use this as a reference when planning refactoring work on admin API or auth middleware.
