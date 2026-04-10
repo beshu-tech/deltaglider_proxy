@@ -165,11 +165,21 @@ impl TestServer {
     // ── Instance methods ──
 
     async fn wait_ready(&mut self) {
-        let addr = format!("127.0.0.1:{}", self.port);
+        // Use the health endpoint instead of raw TCP connect — the HTTP server
+        // may accept TCP connections before routes and middleware are fully
+        // initialized, causing "connection refused" on the first real request.
+        let health_url = format!("http://127.0.0.1:{}/_/health", self.port);
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("health check client");
+
         for _ in 0..150 {
-            if std::net::TcpStream::connect(&addr).is_ok() {
-                sleep(Duration::from_millis(100)).await;
-                return;
+            if let Ok(resp) = client.get(&health_url).send().await {
+                if resp.status().is_success() {
+                    return;
+                }
             }
 
             if let Ok(Some(status)) = self.process.try_wait() {
@@ -180,7 +190,10 @@ impl TestServer {
         }
 
         let _ = self.process.kill();
-        panic!("Timed out waiting for server on {}", addr);
+        panic!(
+            "Timed out waiting for server health on 127.0.0.1:{}",
+            self.port
+        );
     }
 
     /// Create the test bucket via the S3 API (replaces the removed DGP_BUCKET auto-create)
