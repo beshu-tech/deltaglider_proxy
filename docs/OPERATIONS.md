@@ -47,6 +47,8 @@ CLI flags override anything loaded from the file/env:
 
 ## Admin GUI
 
+![S3 file browser](/_/screenshots/filebrowser.jpg)
+
 An embedded React-based management UI is served under `/_/` on the same port as the S3 API. For example, if DeltaGlider Proxy listens on `:9000`, the GUI is at `http://localhost:9000/_/`. The `/_/` prefix is safe because `_` is not a valid S3 bucket name character, so there is no conflict with S3 operations.
 
 No extra ports, no extra containers, no manual configuration needed. Features include:

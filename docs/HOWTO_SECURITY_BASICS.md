@@ -87,6 +87,8 @@ DGP_BOOTSTRAP_PASSWORD_HASH=JDJiJDEyJENYbDVPRm84bDg2...
 
 ## Step 3: Create IAM Users
 
+![IAM user management](/_/screenshots/iam.jpg)
+
 **What:** Move from a single shared credential to per-user access keys with fine-grained permissions.
 
 **Why:** Shared credentials can't be revoked individually. If a CI pipeline's key leaks, you'd have to change the key for everyone. IAM users let you rotate keys per-user and restrict access to specific buckets/prefixes.
@@ -158,6 +160,8 @@ curl http://your-proxy:9000/releases/builds/v1.zip -o v1.zip
 ---
 
 ## Step 4: Configure Rate Limiting
+
+![Advanced security settings](/_/screenshots/advanced_security.jpg)
 
 **What:** Limit how many failed authentication attempts an IP can make before being locked out.
 

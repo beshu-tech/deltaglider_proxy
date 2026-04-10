@@ -584,6 +584,8 @@ config_sync_bucket = "my-config-bucket"
 
 ## Multi-Backend Routing
 
+![Storage backends with per-bucket routing](/_/screenshots/storage_backends.jpg)
+
 Route different buckets to different storage backends. When `[[backends]]` is configured, the legacy `[backend]` section is used as a fallback for buckets without an explicit backend assignment.
 
 ```toml

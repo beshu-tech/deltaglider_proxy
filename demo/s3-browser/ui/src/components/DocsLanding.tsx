@@ -59,28 +59,13 @@ export default function DocsLanding({ onSelectDoc }: Props) {
         </div>
       </div>
 
-      {/* Screenshots */}
+      {/* Hero screenshots — just the two most representative */}
       <div className="responsive-grid-2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 32 }}>
-        <Lightbox caption="S3 object browser with compression indicators">
+        <Lightbox caption="S3 file browser with compression indicators and bulk operations">
           <img src="/_/screenshots/filebrowser.jpg" alt="Object Browser" style={{ width: '100%', display: 'block' }} />
         </Lightbox>
-        <Lightbox caption="IAM user management with ABAC permissions">
-          <img src="/_/screenshots/iam.jpg" alt="IAM Users" style={{ width: '100%', display: 'block' }} />
-        </Lightbox>
-        <Lightbox caption="OAuth/OIDC login with Google SSO">
-          <img src="/_/screenshots/oauth_login.jpg" alt="OAuth Login" style={{ width: '100%', display: 'block' }} />
-        </Lightbox>
-        <Lightbox caption="Storage backends with multi-backend routing">
-          <img src="/_/screenshots/storage_backends.jpg" alt="Storage Backends" style={{ width: '100%', display: 'block' }} />
-        </Lightbox>
-        <Lightbox caption="OAuth group mapping rules">
-          <img src="/_/screenshots/oauth_group_mapping.jpg" alt="Group Mapping" style={{ width: '100%', display: 'block' }} />
-        </Lightbox>
-        <Lightbox caption="Storage analytics and cost savings">
+        <Lightbox caption="Storage analytics — per-bucket savings and cost estimation">
           <img src="/_/screenshots/analytics.jpg" alt="Analytics" style={{ width: '100%', display: 'block' }} />
-        </Lightbox>
-        <Lightbox caption="Advanced security settings">
-          <img src="/_/screenshots/advanced_security.jpg" alt="Security Settings" style={{ width: '100%', display: 'block' }} />
         </Lightbox>
       </div>
 
