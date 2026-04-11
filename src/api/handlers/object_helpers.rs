@@ -17,6 +17,43 @@ use tracing::{debug, info, instrument, warn};
 use crate::api::aws_chunked::{decode_aws_chunked, get_decoded_content_length, is_aws_chunked};
 
 // ---------------------------------------------------------------------------
+// Quota enforcement (shared by PUT, COPY, and multipart complete)
+// ---------------------------------------------------------------------------
+
+/// Check if a write of `incoming_bytes` would exceed the bucket's quota.
+/// Uses cached usage data (soft quota). Returns Ok(()) if allowed.
+/// When quota_bytes=0, always rejects (freeze bucket). When no cache data
+/// is available, triggers a background scan and allows optimistically.
+pub(super) fn check_quota(
+    state: &Arc<AppState>,
+    bucket: &str,
+    incoming_bytes: u64,
+) -> Result<(), S3Error> {
+    let engine = state.engine.load();
+    if let Some(quota) = engine.bucket_policy_registry().quota_bytes(bucket) {
+        // quota=0 means freeze — always reject, even without usage data
+        if quota == 0 {
+            return Err(S3Error::InternalError(
+                "Bucket is frozen (quota = 0)".into(),
+            ));
+        }
+        // get_or_scan: returns cached usage if available, otherwise triggers a
+        // background scan and returns None (first PUT is optimistic).
+        if let Some(usage) = state.usage_scanner.get_or_scan(state, bucket, "") {
+            if usage.total_size.saturating_add(incoming_bytes) > quota {
+                let used_mb = usage.total_size / (1024 * 1024);
+                let quota_mb = quota / (1024 * 1024);
+                return Err(S3Error::InternalError(format!(
+                    "Bucket quota exceeded: {} MB used of {} MB limit",
+                    used_mb, quota_mb,
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // PUT / COPY internals
 // ---------------------------------------------------------------------------
 
@@ -71,6 +108,8 @@ pub(super) async fn put_object_inner(
         )
             .into_response());
     }
+
+    check_quota(state, bucket, body.len() as u64)?;
 
     let content_type = extract_content_type(headers);
     let user_metadata = extract_user_metadata(headers);
@@ -191,6 +230,9 @@ pub(super) async fn copy_object_inner(
                 source_meta.user_metadata.clone(),
             )
         };
+
+    // Quota check on destination bucket before storing
+    check_quota(state, bucket, data.len() as u64)?;
 
     // Store as new object with the chosen metadata
     let result = engine

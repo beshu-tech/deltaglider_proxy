@@ -65,6 +65,25 @@ struct S3ListedObject {
     etag: Option<String>,
 }
 
+impl S3ListedObject {
+    /// Convert an AWS SDK `Object` from a ListObjectsV2 response into our
+    /// lightweight representation.  Returns `None` if the object has no key.
+    fn from_s3_object(object: aws_sdk_s3::types::Object) -> Option<Self> {
+        let key = object.key?;
+        let last_modified = object.last_modified.and_then(|dt| {
+            DateTime::parse_from_rfc3339(&dt.to_string())
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+        });
+        Some(Self {
+            key,
+            size: object.size.unwrap_or(0) as u64,
+            last_modified,
+            etag: object.e_tag.map(|e| e.trim_matches('"').to_string()),
+        })
+    }
+}
+
 /// An S3 listed object classified into a user-visible key, with enough info
 /// to decide whether a HEAD call is needed for full metadata.
 struct ClassifiedObject {
@@ -847,21 +866,11 @@ impl S3Backend {
                 .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::ListObjects))?;
 
             if let Some(contents) = response.contents {
-                for object in contents {
-                    if let Some(key) = object.key {
-                        let last_modified = object.last_modified.and_then(|dt| {
-                            DateTime::parse_from_rfc3339(&dt.to_string())
-                                .ok()
-                                .map(|d| d.with_timezone(&Utc))
-                        });
-                        results.push(S3ListedObject {
-                            key,
-                            size: object.size.unwrap_or(0) as u64,
-                            last_modified,
-                            etag: object.e_tag.map(|e| e.trim_matches('"').to_string()),
-                        });
-                    }
-                }
+                results.extend(
+                    contents
+                        .into_iter()
+                        .filter_map(S3ListedObject::from_s3_object),
+                );
             }
 
             if response.is_truncated.unwrap_or(false) {
@@ -1479,21 +1488,11 @@ impl StorageBackend for S3Backend {
 
             // Collect direct objects at this level
             if let Some(contents) = response.contents {
-                for object in contents {
-                    if let Some(key) = object.key {
-                        let last_modified = object.last_modified.and_then(|dt| {
-                            DateTime::parse_from_rfc3339(&dt.to_string())
-                                .ok()
-                                .map(|d| d.with_timezone(&Utc))
-                        });
-                        raw_objects.push(S3ListedObject {
-                            key,
-                            size: object.size.unwrap_or(0) as u64,
-                            last_modified,
-                            etag: object.e_tag.map(|e| e.trim_matches('"').to_string()),
-                        });
-                    }
-                }
+                raw_objects.extend(
+                    contents
+                        .into_iter()
+                        .filter_map(S3ListedObject::from_s3_object),
+                );
             }
 
             if response.is_truncated.unwrap_or(false) {

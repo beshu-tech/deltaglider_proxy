@@ -230,10 +230,12 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // --- App state ---
+    let usage_scanner = Arc::new(UsageScanner::new());
     let state = Arc::new(AppState {
         engine: ArcSwap::from_pointee(engine),
         multipart,
         metrics: metrics.clone(),
+        usage_scanner: usage_scanner.clone(),
     });
 
     // --- Background monitors ---
@@ -324,7 +326,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         s3_state: state.clone(),
         iam_state,
         config_db,
-        usage_scanner: Arc::new(UsageScanner::new()),
+        usage_scanner: usage_scanner.clone(),
         rate_limiter,
         config_sync,
         config_db_mismatch,

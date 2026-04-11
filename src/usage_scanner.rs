@@ -126,6 +126,23 @@ impl UsageScanner {
         cache.insert(key, entry);
     }
 
+    /// Get cached usage for a bucket/prefix. If not cached, triggers a background
+    /// scan and returns `None` (the scan result will be available on next call).
+    /// Used by quota checks — returns stale data rather than blocking on a scan.
+    pub fn get_or_scan(
+        self: &Arc<Self>,
+        s3_state: &Arc<AppState>,
+        bucket: &str,
+        prefix: &str,
+    ) -> Option<UsageEntry> {
+        let cached = self.get(bucket, prefix);
+        if cached.is_none() || cached.as_ref().is_some_and(|e| e.stale_seconds > 0) {
+            // Trigger background scan when no cache or cache is stale
+            self.enqueue_scan(bucket.to_string(), prefix.to_string(), s3_state.clone());
+        }
+        cached
+    }
+
     /// Enqueue a background scan for the given bucket/prefix.
     /// Returns `true` if a new scan was started, `false` if one is already running.
     pub fn enqueue_scan(

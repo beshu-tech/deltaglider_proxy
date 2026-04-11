@@ -28,7 +28,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
   const [error, setError] = useState<string | null>(null);
 
   // Per-bucket policies (local edit state)
-  const [bucketPolicies, setBucketPolicies] = useState<Array<{ name: string; compression: boolean; max_delta_ratio: number | null; backend: string; alias: string; public_prefixes: string[] }>>([]);
+  const [bucketPolicies, setBucketPolicies] = useState<Array<{ name: string; compression: boolean; max_delta_ratio: number | null; backend: string; alias: string; public_prefixes: string[]; quota_bytes: number | null }>>([]);
   const [policyDirty, setPolicyDirty] = useState(false);
   const [policySaving, setPolicySaving] = useState(false);
 
@@ -69,6 +69,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
             backend: p.backend ?? '',
             alias: p.alias ?? '',
             public_prefixes: p.public_prefixes ?? [],
+            quota_bytes: p.quota_bytes ?? null,
           }))
         );
       }
@@ -98,6 +99,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
           ...(p.backend ? { backend: p.backend } : {}),
           ...(p.alias ? { alias: p.alias } : {}),
           ...(p.public_prefixes.length > 0 ? { public_prefixes: p.public_prefixes.filter(s => s.length > 0) } : {}),
+          ...(p.quota_bytes != null ? { quota_bytes: p.quota_bytes } : {}),
         };
       }
       await updateAdminConfig({ bucket_policies: bp });
@@ -401,6 +403,18 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                   <Text style={{ fontSize: 11, color: colors.TEXT_MUTED }}>Alias:</Text>
                   <Input value={bp.alias} onChange={(e) => updatePolicy(idx, { alias: e.target.value })} placeholder="same as bucket" style={{ width: 130, ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 11 }} size="small" />
                 </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <Text style={{ fontSize: 11, color: bp.quota_bytes != null ? colors.ACCENT_AMBER : colors.TEXT_MUTED }}>Quota:</Text>
+                  <InputNumber
+                    value={bp.quota_bytes != null ? Math.round(bp.quota_bytes / (1024 * 1024 * 1024)) : undefined}
+                    onChange={(v) => updatePolicy(idx, { quota_bytes: v != null ? v * 1024 * 1024 * 1024 : null })}
+                    min={0}
+                    placeholder="unlimited"
+                    style={{ width: 90, ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 11 }}
+                    size="small"
+                    addonAfter="GB"
+                  />
+                </div>
               </div>
               {/* Public Prefixes */}
               <div style={{ marginTop: 8, paddingTop: 8, borderTop: `1px solid ${colors.BORDER}` }}>
@@ -451,7 +465,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
 
           <Button
             icon={<PlusOutlined />}
-            onClick={() => { setBucketPolicies([...bucketPolicies, { name: '', compression: true, max_delta_ratio: null, backend: '', alias: '', public_prefixes: [] }]); setPolicyDirty(true); }}
+            onClick={() => { setBucketPolicies([...bucketPolicies, { name: '', compression: true, max_delta_ratio: null, backend: '', alias: '', public_prefixes: [], quota_bytes: null }]); setPolicyDirty(true); }}
             style={{ marginTop: 12, borderRadius: 8, fontFamily: 'var(--font-ui)', fontWeight: 600 }}
             block type="dashed"
           >

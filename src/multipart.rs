@@ -171,6 +171,15 @@ impl MultipartStore {
         Ok(etag)
     }
 
+    /// Get the size of a specific uploaded part (for quota pre-check).
+    pub fn get_part_size(&self, upload_id: &str, part_number: u32) -> Option<u64> {
+        let uploads = self.uploads.read();
+        uploads
+            .get(upload_id)
+            .and_then(|u| u.parts.get(&part_number))
+            .map(|p| p.data.len() as u64)
+    }
+
     /// Assemble parts into a single object and remove the upload atomically.
     /// Takes ownership under write lock (fast), then assembles without holding it.
     pub fn complete(

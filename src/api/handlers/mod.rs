@@ -49,6 +49,7 @@ pub struct AppState {
     pub engine: ArcSwap<DynEngine>,
     pub multipart: Arc<MultipartStore>,
     pub metrics: Arc<Metrics>,
+    pub usage_scanner: Arc<crate::usage_scanner::UsageScanner>,
 }
 
 /// Query parameters for object-level operations (multipart upload)

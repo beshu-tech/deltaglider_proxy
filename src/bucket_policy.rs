@@ -39,6 +39,13 @@ pub struct BucketPolicyConfig {
     /// Use trailing `/` to ensure directory-aligned matching.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub public_prefixes: Vec<String>,
+
+    /// Maximum storage size in bytes for this bucket. When set, PUT requests
+    /// that would exceed this limit are rejected with 403. Uses cached usage
+    /// data (soft quota — may overshoot by up to 5 minutes of writes).
+    /// Example: `10737418240` = 10 GB. `0` = freeze bucket (block all writes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_bytes: Option<u64>,
 }
 
 /// Resolved bucket policies with global defaults applied.
@@ -159,6 +166,11 @@ impl BucketPolicyRegistry {
             }
         }
         self.default_max_delta_ratio
+    }
+
+    /// Get the quota for a bucket (None = unlimited).
+    pub fn quota_bytes(&self, bucket: &str) -> Option<u64> {
+        self.policies.get(bucket).and_then(|p| p.quota_bytes)
     }
 
     /// Resolve routing for a bucket: returns (backend_name, real_bucket_name).
@@ -552,5 +564,66 @@ mod tests {
             table.get("archive"),
             Some(&("hetzner".to_string(), Some("prod-archive".to_string())))
         );
+    }
+
+    // ── Quota tests ──
+
+    #[test]
+    fn test_quota_bytes_none_when_not_set() {
+        let reg = BucketPolicyRegistry::new(HashMap::new(), 0.75);
+        assert_eq!(reg.quota_bytes("any-bucket"), None);
+    }
+
+    #[test]
+    fn test_quota_bytes_returns_value() {
+        let mut policies = HashMap::new();
+        policies.insert(
+            "limited".into(),
+            BucketPolicyConfig {
+                quota_bytes: Some(10 * 1024 * 1024 * 1024), // 10 GB
+                ..Default::default()
+            },
+        );
+        let reg = BucketPolicyRegistry::new(policies, 0.75);
+        assert_eq!(reg.quota_bytes("limited"), Some(10 * 1024 * 1024 * 1024));
+        assert_eq!(reg.quota_bytes("other"), None);
+    }
+
+    #[test]
+    fn test_quota_bytes_zero() {
+        let mut policies = HashMap::new();
+        policies.insert(
+            "frozen".into(),
+            BucketPolicyConfig {
+                quota_bytes: Some(0),
+                ..Default::default()
+            },
+        );
+        let reg = BucketPolicyRegistry::new(policies, 0.75);
+        assert_eq!(reg.quota_bytes("frozen"), Some(0));
+    }
+
+    #[test]
+    fn test_quota_bytes_toml_roundtrip() {
+        let policy = BucketPolicyConfig {
+            quota_bytes: Some(5368709120), // 5 GB
+            compression: Some(true),
+            ..Default::default()
+        };
+        let toml_str = toml::to_string_pretty(&policy).unwrap();
+        assert!(toml_str.contains("quota_bytes = 5368709120"));
+
+        let parsed: BucketPolicyConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.quota_bytes, Some(5368709120));
+    }
+
+    #[test]
+    fn test_quota_bytes_skip_serializing_when_none() {
+        let policy = BucketPolicyConfig {
+            compression: Some(true),
+            ..Default::default()
+        };
+        let toml_str = toml::to_string_pretty(&policy).unwrap();
+        assert!(!toml_str.contains("quota_bytes"));
     }
 }

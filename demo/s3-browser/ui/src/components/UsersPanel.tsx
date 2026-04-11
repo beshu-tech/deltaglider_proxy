@@ -9,9 +9,11 @@ import CredentialsBanner from './CredentialsBanner';
 
 const { Text } = Typography;
 
-function permissionSummary(user: IamUser): string {
+function permissionSummary(user: IamUser): string | null {
   if (user.permissions.length === 0) {
-    return user.auth_source === 'external' ? 'Via groups' : 'No access';
+    // SSO users with no direct rules get permissions from groups — don't show
+    // a confusing label; the SSO badge and detail panel are enough context.
+    return user.auth_source === 'external' ? null : 'No access';
   }
   const hasAll = user.permissions.some(p => p.actions.includes('*') && p.resources.includes('*'));
   if (hasAll) return 'Full admin';
@@ -141,13 +143,15 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
           )}
           {filtered.map(user => {
             const isSelected = user.id === selectedId && !creating;
+            const isExternal = user.auth_source === 'external';
+            const summary = permissionSummary(user);
             return (
               <div
                 key={user.id}
                 onClick={() => handleSelect(user)}
                 className="user-list-item"
                 style={{
-                  padding: '10px 16px',
+                  padding: '12px 16px',
                   cursor: 'pointer',
                   background: isSelected ? colors.ACCENT_BLUE + '18' : 'transparent',
                   borderLeft: isSelected ? `3px solid ${colors.ACCENT_BLUE}` : '3px solid transparent',
@@ -157,50 +161,55 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
                 onMouseEnter={e => { if (!isSelected) e.currentTarget.style.background = colors.BORDER + '40'; }}
                 onMouseLeave={e => { if (!isSelected) e.currentTarget.style.background = 'transparent'; }}
               >
+                {/* Row 1: status dot + name + badges + delete */}
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                   <div style={{
                     width: 8, height: 8, borderRadius: '50%',
                     background: user.enabled ? colors.ACCENT_GREEN : colors.TEXT_MUTED,
                     flexShrink: 0,
                   }} />
-                  <Text strong style={{ fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
+                  <Text strong style={{ fontSize: 14, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, fontFamily: 'var(--font-ui)' }}>
                     {user.name}
                   </Text>
-                  <Button
-                      type="text"
-                      danger
-                      size="small"
-                      icon={<DeleteOutlined />}
-                      onClick={async (e) => {
-                        e.stopPropagation();
-                        if (!window.confirm(`Delete "${user.name}"? This cannot be undone.`)) return;
-                        try {
-                          await deleteUser(user.id);
-                          handleDeleted();
-                        } catch (err) {
-                          console.error('Delete user failed:', err);
-                        }
-                      }}
-                      style={{ opacity: 0.5, padding: '2px 4px', minWidth: 0 }}
-                      onMouseEnter={e => { e.currentTarget.style.opacity = '1'; }}
-                      onMouseLeave={e => { e.currentTarget.style.opacity = '0.5'; }}
-                    />
-                </div>
-                <div style={{ marginLeft: 16, marginTop: 2 }}>
-                  <Text type="secondary" style={{ fontSize: 11, fontFamily: 'var(--font-mono)' }}>
-                    {user.access_key_id.length > 24
-                      ? user.access_key_id.substring(0, 20) + '...'
-                      : user.access_key_id}
-                  </Text>
-                  <Text type="secondary" style={{ fontSize: 11, marginLeft: 8 }}>
-                    · {permissionSummary(user)}
-                  </Text>
-                  {user.auth_source === 'external' && (
-                    <Text style={{ fontSize: 10, marginLeft: 8, color: colors.ACCENT_PURPLE, fontWeight: 600 }}>
-                      EXTERNAL
-                    </Text>
+                  {isExternal && (
+                    <span style={{
+                      fontSize: 9, fontWeight: 700, letterSpacing: 0.5,
+                      color: colors.ACCENT_PURPLE, background: colors.ACCENT_PURPLE + '18',
+                      padding: '2px 6px', borderRadius: 4, fontFamily: 'var(--font-ui)',
+                      textTransform: 'uppercase', flexShrink: 0,
+                    }}>SSO</span>
                   )}
+                  <Button
+                    type="text"
+                    danger
+                    size="small"
+                    icon={<DeleteOutlined />}
+                    onClick={async (e) => {
+                      e.stopPropagation();
+                      if (!window.confirm(`Delete "${user.name}"? This cannot be undone.`)) return;
+                      try {
+                        await deleteUser(user.id);
+                        handleDeleted();
+                      } catch (err) {
+                        console.error('Delete user failed:', err);
+                      }
+                    }}
+                    style={{ opacity: 0.5, padding: '2px 4px', minWidth: 0, flexShrink: 0 }}
+                    onMouseEnter={e => { e.currentTarget.style.opacity = '1'; }}
+                    onMouseLeave={e => { e.currentTarget.style.opacity = '0.5'; }}
+                  />
                 </div>
+                {/* Row 2: permission summary (hidden for SSO users with group-only access) */}
+                {summary && (
+                  <div style={{ marginLeft: 16, marginTop: 4 }}>
+                    <Text style={{
+                      fontSize: 11, color: summary === 'Full admin' ? colors.ACCENT_GREEN : summary === 'No access' ? colors.ACCENT_RED : colors.TEXT_MUTED,
+                      fontFamily: 'var(--font-ui)', fontWeight: summary === 'Full admin' ? 600 : 400,
+                    }}>
+                      {summary}
+                    </Text>
+                  </div>
+                )}
               </div>
             );
           })}

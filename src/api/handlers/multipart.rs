@@ -61,7 +61,7 @@ fn initiate_multipart_upload(
 
 /// POST /{bucket}/{key}?uploadId=X — CompleteMultipartUpload
 async fn complete_multipart_upload(
-    state: &AppState,
+    state: &Arc<AppState>,
     bucket: &str,
     key: &str,
     upload_id: &str,
@@ -83,6 +83,15 @@ async fn complete_multipart_upload(
         .iter()
         .map(|p| (p.part_number, p.etag.clone()))
         .collect();
+
+    // Quota check before storing — estimate size from parts
+    {
+        let total_parts_size: u64 = requested_parts
+            .iter()
+            .filter_map(|(num, _)| state.multipart.get_part_size(upload_id, *num))
+            .sum();
+        super::object_helpers::check_quota(state, bucket, total_parts_size)?;
+    }
 
     // Bifurcate: non-delta-eligible files use the chunked path to avoid
     // assembling all parts into a single contiguous buffer (~2x memory savings).
