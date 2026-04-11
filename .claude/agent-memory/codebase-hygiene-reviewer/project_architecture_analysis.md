@@ -41,6 +41,15 @@ type: project
 - Duplicated public-prefix methods on BucketPolicyRegistry (is_public_read, list_overlaps_public, public_prefixes, has_any_public) -- resolved, removed dead code, tests migrated to PublicPrefixSnapshot (2026-04-09)
 - Duplicated error response in recover_db for invalid bcrypt hash input -- resolved, collapsed two match arms into single path (2026-04-09)
 - Duplicated recovery-temp-file cleanup in recover_db success/error branches -- resolved, hoisted cleanup before match (2026-04-09)
+- 2x copy-pasted S3 Object-to-S3ListedObject conversion in s3.rs (list_objects_full:849-865 and list_objects_delegated:1481-1497) -- resolved, extracted `S3ListedObject::from_s3_object()` (2026-04-09)
+- 6x repeated PasswordChangeResponse error construction in change_password handler -- resolved, extracted `password_err()` helper (2026-04-09)
+
+**Resolved issues (2026-04-09 deep hygiene review):**
+- DeltaCodec encode()/decode() were 80% copy-pasted (~60 lines each) -- resolved, extracted `run_xdelta3()` private method (2026-04-09)
+- encode() was missing `cli_available` guard that decode() had -- resolved, guard is now in shared `run_xdelta3()` (2026-04-09)
+- 6x production `.unwrap()` in codec subprocess handling (path, stdin/stdout/stderr) -- resolved, `.to_str().unwrap()` replaced with `ok_or_else`, `.take().unwrap()` replaced with `.take().expect("piped ...")` (2026-04-09)
+- CLAUDE.md RateLimiter description said "5 attempts / 15-min / 30-min lockout" but code defaults are 100/5min/10min -- resolved, docs updated (2026-04-09)
+- RateLimiter::new() doc comment said "default: 5" contradicting default_auth() which uses 100 -- resolved, doc comment updated (2026-04-09)
 
 **Open issues (2026-04-09 hygiene review):**
 - Scattered `std::env::var("DGP_...").ok().and_then(|v| v.parse().ok()).unwrap_or(default)` pattern across ~15 call sites instead of using centralized `env_parse<T>()` from config.rs. Fix: make `env_parse` public, add `env_parse_with_default`. ~10 files affected.
@@ -50,9 +59,12 @@ type: project
 - backendTab in SettingsPage.tsx duplicates saveSection inline (lines 359-397 vs 422-442).
 - `update_auth_provider` in config_db/auth_providers.rs uses 11 individual UPDATE statements per field. Works but verbose. Document-only.
 
+**Documented-only (high impact, high risk -- extract on next auth feature touch):**
+- `sigv4_auth_middleware` in api/auth.rs:404-765 is 362 lines -- the longest function in the codebase. Handles rate limiting, CORS, HEAD probe bypass, public prefix bypass, presigned URL detection, SigV4 parsing, user lookup across 3 auth modes, signature verification, replay detection with cache eviction, and user injection. Well-commented but high cognitive load. Natural seams: `check_rate_limit()`, `check_public_prefix_bypass()`, `lookup_user_and_secret()`, `check_replay()`.
+
 **Remaining structural observations:**
 - `session.rs` parses `DGP_SESSION_TTL_HOURS` independently from config's `env_parse()` helper. Low impact.
-- s3.rs is 1552 lines. Dense but well-structured with clear internal helper grouping.
+- s3.rs is 1551 lines. Dense but well-structured with clear internal helper grouping. S3ListedObject::from_s3_object centralizes object conversion.
 - Client IP extraction exists in two forms: `rate_limiter::extract_client_ip()` and `audit::extract_client_info()`. Different purposes, reasonable to keep separate.
 - `paginate_sorted` in engine/mod.rs has only one caller. Clear function, may gain more callers.
 - `admin/config.rs` is 1122 lines with 5 handlers -- splitting would add files without proportional benefit.

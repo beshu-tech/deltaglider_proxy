@@ -177,15 +177,13 @@ pub async fn authorization_middleware(
             "IAM denied: user='{}' action={:?} bucket='{}' key='{}'",
             user.name, action, bucket, key
         );
-        // Drain the request body before returning 403 so the client receives a
-        // clean error response instead of "connection reset". Without this, axum
-        // drops the unread body and closes the connection mid-upload, which breaks
+        // Drain up to 64KB of the request body before returning 403 so the client
+        // receives a clean error response instead of "connection reset". Without this,
+        // axum drops the unread body and closes the connection mid-upload, breaking
         // AWS CLI and other S3 clients that expect a proper HTTP error response.
-        // This matches AWS S3 behavior (consume body, then respond with 403).
-        // Limited to 1MB to prevent DoS from large unauthorized uploads —
-        // bodies larger than this will still get a connection reset, which is
-        // acceptable for obviously-oversized unauthorized uploads.
-        let _ = axum::body::to_bytes(request.into_body(), 1024 * 1024).await;
+        // 64KB is enough for S3 SDKs to read the error; larger bodies get a
+        // connection reset (acceptable, and limits DoS surface).
+        let _ = axum::body::to_bytes(request.into_body(), 64 * 1024).await;
         return Err(crate::api::S3Error::AccessDenied.into_response());
     }
 

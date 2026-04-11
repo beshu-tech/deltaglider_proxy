@@ -697,6 +697,18 @@ pub async fn update_config(
     })
 }
 
+/// Build a `PasswordChangeResponse` error response in one line.
+fn password_err(status: StatusCode, msg: impl Into<String>) -> axum::response::Response {
+    (
+        status,
+        Json(PasswordChangeResponse {
+            ok: false,
+            error: Some(msg.into()),
+        }),
+    )
+        .into_response()
+}
+
 /// PUT /api/admin/password — change bootstrap password.
 pub async fn change_password(
     State(state): State<Arc<AdminState>>,
@@ -708,54 +720,29 @@ pub async fn change_password(
         Ok(v) => v,
         Err(e) => {
             tracing::error!("bcrypt verify failed (corrupted hash?): {}", e);
-            return (
+            return password_err(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(PasswordChangeResponse {
-                    ok: false,
-                    error: Some(
-                        "Password hash is corrupted. Delete .deltaglider_bootstrap_hash and restart."
-                            .to_string(),
-                    ),
-                }),
-            )
-                .into_response();
+                "Password hash is corrupted. Delete .deltaglider_bootstrap_hash and restart.",
+            );
         }
     };
 
     if !valid {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(PasswordChangeResponse {
-                ok: false,
-                error: Some("Current password is incorrect".to_string()),
-            }),
-        )
-            .into_response();
+        return password_err(StatusCode::FORBIDDEN, "Current password is incorrect");
     }
 
     // Validate new password quality
     if let Err(msg) = validate_password(&body.new_password) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(PasswordChangeResponse {
-                ok: false,
-                error: Some(msg.to_string()),
-            }),
-        )
-            .into_response();
+        return password_err(StatusCode::BAD_REQUEST, msg.to_string());
     }
 
     let new_hash = match bcrypt::hash(&body.new_password, bcrypt::DEFAULT_COST) {
         Ok(h) => h,
         Err(e) => {
-            return (
+            return password_err(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(PasswordChangeResponse {
-                    ok: false,
-                    error: Some(format!("Hashing failed: {}", e)),
-                }),
-            )
-                .into_response();
+                format!("Hashing failed: {}", e),
+            );
         }
     };
 
@@ -769,14 +756,10 @@ pub async fn change_password(
                 "Failed to re-encrypt config DB after password change: {}",
                 e
             );
-            return (
+            return password_err(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(PasswordChangeResponse {
-                    ok: false,
-                    error: Some(format!("Failed to re-encrypt config database: {}", e)),
-                }),
-            )
-                .into_response();
+                format!("Failed to re-encrypt config database: {}", e),
+            );
         }
         tracing::info!("Config DB re-encrypted with new bootstrap password hash");
         // Upload re-encrypted DB to S3

@@ -244,13 +244,14 @@ export default function useS3Browser() {
         copied.push(key);
       } catch { failed++; }
     }
-    // Only delete sources AFTER all copies succeed
-    if (copied.length > 0) {
-      await deleteObjects(copied).catch(() => {});
+    // Only delete sources if ALL copies succeeded — partial moves risk data loss.
+    // If any copy failed, keep all source files intact and report the failure.
+    if (failed === 0 && copied.length > 0) {
+      await deleteObjects(copied).catch(() => { failed = copied.length; });
     }
     selection.clearSelection();
     refresh();
-    return { succeeded: copied.length, failed };
+    return { succeeded: failed === 0 ? copied.length : 0, failed: failed > 0 ? keys.length : 0 };
   }, [resolveSelectedKeys, selection.clearSelection, refresh]);
 
   const downloadZip = useCallback(async () => {

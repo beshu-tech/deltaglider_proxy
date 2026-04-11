@@ -1,11 +1,18 @@
 import { useState, useEffect, useRef } from 'react';
 import { Drawer, Button, Modal, message, Tag, Skeleton, Input, Spin } from 'antd';
 import { DownloadOutlined, DeleteOutlined, LinkOutlined, FileOutlined, CloseOutlined, CheckCircleFilled, CopyOutlined, LoadingOutlined, EyeOutlined } from '@ant-design/icons';
-import { deleteObject, downloadObject, getPresignedUrl, getObjectUrl, headObject } from '../s3client';
+import { deleteObject, downloadObject, getPresignedUrl, getObjectUrl, headObject, getBucket } from '../s3client';
+import { GlobalOutlined } from '@ant-design/icons';
 import { formatBytes } from '../utils';
 import type { S3Object } from '../types';
 import { useColors } from '../ThemeContext';
 import { getPreviewMode } from './FilePreview';
+import { getAdminConfig } from '../adminApi';
+
+interface BucketPolicyInfo {
+  compressionEnabled: boolean;
+  publicPrefixes: string[];
+}
 
 interface Props {
   object: S3Object | null;
@@ -210,6 +217,24 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
   >(null);
   const blobRef = useRef<{ blob: Blob; name: string } | null>(null);
   const [shareDuration, setShareDuration] = useState<number | null>(null);
+  const [bucketPolicy, setBucketPolicy] = useState<BucketPolicyInfo | null>(null);
+
+  // Fetch bucket policy (compression + public prefixes) once per bucket
+  const lastBucketRef = useRef<string>('');
+  useEffect(() => {
+    const bucket = getBucket();
+    if (!bucket || bucket === lastBucketRef.current) return;
+    lastBucketRef.current = bucket;
+    getAdminConfig().then(cfg => {
+      if (!cfg) return;
+      const bp = cfg.bucket_policies?.[bucket] || cfg.bucket_policies?.[bucket.toLowerCase()];
+      const globalCompression = (cfg.max_delta_ratio ?? 0.75) > 0;
+      setBucketPolicy({
+        compressionEnabled: bp?.compression ?? globalCompression,
+        publicPrefixes: bp?.public_prefixes ?? [],
+      });
+    }).catch(() => {});
+  }, [object?.key]);
 
   useEffect(() => {
     if (!object) { setHeadData(null); return; }
@@ -233,19 +258,26 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
   const headers = headData?.headers ?? {};
   const storageType = headData?.storageType;
   const storedSize = headData?.storedSize;
+  // Original size: from HEAD metadata (dg-file-size) when available, else from LIST.
+  // LIST returns the *stored* (compressed) size for delta objects ("Lite LIST optimization"),
+  // so object.size is NOT the original size for deltas. The HEAD metadata has the real original.
+  const dgFileSize = headers['x-amz-meta-dg-file-size'];
+  const originalSize = dgFileSize ? parseInt(dgFileSize, 10) : object.size;
   const rawSavings =
-    storedSize != null && object.size > 0
-      ? ((1 - storedSize / object.size) * 100)
+    storedSize != null && originalSize > 0
+      ? ((1 - storedSize / originalSize) * 100)
       : 0;
   // Cap at 99.9% unless stored size is truly zero (avoid misleading "100.0%")
   const savings = rawSavings >= 100 && storedSize !== 0 ? 99.9 : rawSavings;
-  const savedBytes = storedSize != null ? Math.max(0, object.size - storedSize) : 0;
+  const savedBytes = storedSize != null ? Math.max(0, originalSize - storedSize) : 0;
 
   const dgMeta = getDgMetadata(headers);
   const userMeta = getUserMetadata(headers);
 
   const storageTypeLabel = storageType || 'Original';
   const storageTypeColor = STORAGE_TYPE_COLORS[storageType || 'passthrough'] || STORAGE_TYPE_DEFAULT;
+  const compressionEnabled = bucketPolicy?.compressionEnabled ?? true;
+  const isPublic = bucketPolicy?.publicPrefixes.some(pp => pp === '' || object.key.startsWith(pp)) ?? false;
 
   const handleDelete = async () => {
     try {
@@ -418,66 +450,106 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
               </div>
             </div>
 
+            {/* PUBLIC ACCESS BADGE */}
+            {isPublic && (
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 6,
+                padding: '8px 12px', marginBottom: 12,
+                background: `${ACCENT_BLUE}10`, border: `1px solid ${ACCENT_BLUE}30`,
+                borderRadius: 8, fontSize: 12, color: ACCENT_BLUE,
+                fontFamily: 'var(--font-ui)', fontWeight: 600,
+              }}>
+                <GlobalOutlined style={{ fontSize: 14 }} />
+                Publicly accessible — no authentication required
+              </div>
+            )}
+
             {/* STORAGE STATS */}
-            <InspectorSection title="Storage Stats">
-              {headLoading ? (
-                <Skeleton active paragraph={{ rows: 4 }} />
-              ) : (
-                <div style={{
-                  background: BG_SIDEBAR,
-                  borderRadius: 10,
-                  padding: '16px',
-                  textAlign: 'center',
-                }}>
-                  <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: 1, color: TEXT_MUTED, textTransform: 'uppercase', marginBottom: 4, fontFamily: "var(--font-ui)" }}>
-                    Savings
-                  </div>
-                  <div style={{ fontSize: 32, fontWeight: 800, color: ACCENT_GREEN, lineHeight: 1.1, fontFamily: "var(--font-mono)" }}>
-                    {savings.toFixed(1)}%
-                  </div>
-                  <div style={{ fontSize: 11, color: TEXT_MUTED, marginBottom: 12, fontFamily: "var(--font-mono)" }}>
-                    {formatBytes(savedBytes)} saved
-                  </div>
-                  {/* Visual comparison bar */}
-                  <div style={{ marginBottom: 10 }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-                      <div style={{ fontSize: 11, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>Original</div>
-                      <div style={{ fontSize: 12, fontWeight: 600, color: TEXT_PRIMARY, fontFamily: "var(--font-mono)" }}>{formatBytes(object.size)}</div>
-                    </div>
-                    <div style={{ height: 6, borderRadius: 3, background: `${TEXT_FAINT}33`, overflow: 'hidden' }}>
-                      <div style={{ height: '100%', borderRadius: 3, width: '100%', background: `${TEXT_MUTED}66` }} />
+            {compressionEnabled ? (
+              <InspectorSection title="Storage Stats">
+                {headLoading && Object.keys(headers).length === 0 ? (
+                  /* Show spinner until HEAD completes with full metadata */
+                  <div style={{
+                    background: BG_SIDEBAR, borderRadius: 10, padding: '24px 16px',
+                    display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8,
+                  }}>
+                    <Spin indicator={<LoadingOutlined style={{ fontSize: 28, color: ACCENT_GREEN }} />} />
+                    <div style={{ fontSize: 11, color: TEXT_MUTED, fontFamily: 'var(--font-ui)' }}>
+                      Loading compression stats...
                     </div>
                   </div>
-                  <div style={{ marginBottom: 8 }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-                      <div style={{ fontSize: 11, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>Stored</div>
-                      <div style={{ fontSize: 12, fontWeight: 600, color: TEXT_PRIMARY, fontFamily: "var(--font-mono)" }}>
-                        {storedSize != null ? formatBytes(storedSize) : formatBytes(object.size)}
+                ) : (
+                  <div style={{
+                    background: BG_SIDEBAR,
+                    borderRadius: 10,
+                    padding: '16px',
+                    textAlign: 'center',
+                  }}>
+                    <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: 1, color: TEXT_MUTED, textTransform: 'uppercase', marginBottom: 4, fontFamily: "var(--font-ui)" }}>
+                      Savings
+                    </div>
+                    <div style={{ fontSize: 32, fontWeight: 800, color: ACCENT_GREEN, lineHeight: 1.1, fontFamily: "var(--font-mono)" }}>
+                      {savings.toFixed(1)}%
+                    </div>
+                    <div style={{ fontSize: 11, color: TEXT_MUTED, marginBottom: 12, fontFamily: "var(--font-mono)" }}>
+                      {formatBytes(savedBytes)} saved
+                    </div>
+                    {/* Visual comparison bar */}
+                    <div style={{ marginBottom: 10 }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                        <div style={{ fontSize: 11, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>Original</div>
+                        <div style={{ fontSize: 12, fontWeight: 600, color: TEXT_PRIMARY, fontFamily: "var(--font-mono)" }}>{formatBytes(originalSize)}</div>
+                      </div>
+                      <div style={{ height: 6, borderRadius: 3, background: `${TEXT_FAINT}33`, overflow: 'hidden' }}>
+                        <div style={{ height: '100%', borderRadius: 3, width: '100%', background: `${TEXT_MUTED}66` }} />
                       </div>
                     </div>
-                    <div style={{ height: 6, borderRadius: 3, background: `${TEXT_FAINT}33`, overflow: 'hidden' }}>
-                      <div style={{
-                        height: '100%',
-                        borderRadius: 3,
-                        width: `${storedSize != null && object.size > 0 ? Math.max(2, (storedSize / object.size) * 100) : 100}%`,
-                        background: ACCENT_GREEN,
-                        transition: 'width 0.4s ease-out',
-                      }} />
+                    <div style={{ marginBottom: 8 }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                        <div style={{ fontSize: 11, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>Stored</div>
+                        <div style={{ fontSize: 12, fontWeight: 600, color: TEXT_PRIMARY, fontFamily: "var(--font-mono)" }}>
+                          {storedSize != null ? formatBytes(storedSize) : formatBytes(originalSize)}
+                        </div>
+                      </div>
+                      <div style={{ height: 6, borderRadius: 3, background: `${TEXT_FAINT}33`, overflow: 'hidden' }}>
+                        <div style={{
+                          height: '100%',
+                          borderRadius: 3,
+                          width: `${storedSize != null && originalSize > 0 ? Math.max(2, (storedSize / originalSize) * 100) : 100}%`,
+                          background: ACCENT_GREEN,
+                          transition: 'width 0.4s ease-out',
+                        }} />
+                      </div>
                     </div>
+                    <Tag style={{
+                      background: storageTypeColor.bg,
+                      border: `1px solid ${storageTypeColor.border}`,
+                      color: storageTypeColor.text,
+                      fontSize: 12,
+                      borderRadius: 6,
+                      fontFamily: "var(--font-mono)",
+                    }}>
+                      {storageTypeLabel.charAt(0).toUpperCase() + storageTypeLabel.slice(1)}
+                    </Tag>
                   </div>
-                  <Tag style={{
-                    background: storageTypeColor.bg,
-                    border: `1px solid ${storageTypeColor.border}`,
-                    color: storageTypeColor.text,
-                    fontSize: 12,
-                    borderRadius: 6,
-                    fontFamily: "var(--font-mono)",
-                  }}>
-                    {storageTypeLabel.charAt(0).toUpperCase() + storageTypeLabel.slice(1)}
-                  </Tag>
+                )}
+              </InspectorSection>
+            ) : (
+              /* Compression disabled for this bucket — show clean, simple size info */
+              <InspectorSection title="Storage">
+                <div style={{
+                  background: BG_SIDEBAR, borderRadius: 10, padding: '16px', textAlign: 'center',
+                }}>
+                  <div style={{ fontSize: 11, color: TEXT_MUTED, fontFamily: 'var(--font-ui)', marginBottom: 4 }}>Size</div>
+                  <div style={{ fontSize: 28, fontWeight: 700, color: TEXT_PRIMARY, fontFamily: 'var(--font-mono)', lineHeight: 1.2 }}>
+                    {formatBytes(object.size)}
+                  </div>
+                  <div style={{ fontSize: 11, color: TEXT_FAINT, fontFamily: 'var(--font-ui)', marginTop: 8 }}>
+                    Compression disabled for this bucket
+                  </div>
                 </div>
-              )}
-            </InspectorSection>
+              </InspectorSection>
+            )}
 
             {/* OBJECT INFO */}
             <InspectorSection title="Object Info">

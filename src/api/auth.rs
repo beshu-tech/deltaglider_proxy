@@ -197,39 +197,58 @@ impl SigV4Params {
         // AWS caps presigned URL expiry at 7 days (604,800 seconds).
         const MAX_PRESIGNED_EXPIRY: i64 = 604_800;
 
-        if !expires.is_empty() {
-            let expires_secs: i64 = expires.parse().map_err(|_| {
-                warn!("SigV4 presigned: unparseable X-Amz-Expires: {:?}", expires);
-                S3Error::InvalidArgument(format!("Invalid X-Amz-Expires: {}", expires))
-                    .into_response()
-            })?;
+        // X-Amz-Expires is REQUIRED for presigned URLs (AWS S3 spec).
+        // Without it, the URL would have no time limit — reject immediately.
+        if expires.is_empty() {
+            warn!("SigV4 presigned: missing X-Amz-Expires (required)");
+            return Err(S3Error::InvalidArgument(
+                "X-Amz-Expires is required for presigned URLs".into(),
+            )
+            .into_response());
+        }
 
-            if expires_secs > MAX_PRESIGNED_EXPIRY {
-                warn!(
-                    "SigV4 presigned: X-Amz-Expires={} exceeds 7-day maximum ({})",
-                    expires_secs, MAX_PRESIGNED_EXPIRY
-                );
-                return Err(S3Error::InvalidArgument(format!(
-                    "X-Amz-Expires={} exceeds maximum of {} seconds (7 days)",
-                    expires_secs, MAX_PRESIGNED_EXPIRY
-                ))
-                .into_response());
-            }
+        let expires_secs: i64 = expires.parse().map_err(|_| {
+            warn!("SigV4 presigned: unparseable X-Amz-Expires: {:?}", expires);
+            S3Error::InvalidArgument(format!("Invalid X-Amz-Expires: {}", expires)).into_response()
+        })?;
 
-            let request_time = chrono::NaiveDateTime::parse_from_str(&amz_date, "%Y%m%dT%H%M%SZ")
-                .map_err(|_| {
+        if expires_secs > MAX_PRESIGNED_EXPIRY {
+            warn!(
+                "SigV4 presigned: X-Amz-Expires={} exceeds 7-day maximum ({})",
+                expires_secs, MAX_PRESIGNED_EXPIRY
+            );
+            return Err(S3Error::InvalidArgument(format!(
+                "X-Amz-Expires={} exceeds maximum of {} seconds (7 days)",
+                expires_secs, MAX_PRESIGNED_EXPIRY
+            ))
+            .into_response());
+        }
+
+        let request_time = chrono::NaiveDateTime::parse_from_str(&amz_date, "%Y%m%dT%H%M%SZ")
+            .map_err(|_| {
                 warn!("SigV4 presigned: unparseable X-Amz-Date: {:?}", amz_date);
                 S3Error::InvalidArgument(format!("Invalid X-Amz-Date: {}", amz_date))
                     .into_response()
             })?;
 
-            let request_utc = request_time.and_utc();
-            let now = chrono::Utc::now();
-            let expiry = request_utc + chrono::Duration::seconds(expires_secs);
-            if now > expiry {
-                debug!("SigV4 presigned: URL expired (expired at {})", expiry);
-                return Err(S3Error::AccessDenied.into_response());
-            }
+        let request_utc = request_time.and_utc();
+        let now = chrono::Utc::now();
+
+        // Reject presigned URLs signed far in the future — prevents "permanent" URLs
+        // by crafting X-Amz-Date in year 2099. Allow up to MAX_PRESIGNED_EXPIRY in the future.
+        let future_limit = chrono::Duration::seconds(MAX_PRESIGNED_EXPIRY);
+        if request_utc > now + future_limit {
+            warn!(
+                "SigV4 presigned: X-Amz-Date {} is too far in the future (limit: {} seconds ahead)",
+                amz_date, MAX_PRESIGNED_EXPIRY
+            );
+            return Err(S3Error::RequestTimeTooSkewed.into_response());
+        }
+
+        let expiry = request_utc + chrono::Duration::seconds(expires_secs);
+        if now > expiry {
+            debug!("SigV4 presigned: URL expired (expired at {})", expiry);
+            return Err(S3Error::AccessDenied.into_response());
         }
 
         let canonical_query_string =

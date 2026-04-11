@@ -34,9 +34,11 @@ struct RateLimitEntry {
 impl RateLimiter {
     /// Create a new rate limiter.
     ///
-    /// - `max_attempts`: max failures before lockout (default: 5)
-    /// - `window`: time window for counting failures (default: 15 minutes)
-    /// - `lockout`: lockout duration after exceeding max_attempts (default: 30 minutes)
+    /// - `max_attempts`: max failures before lockout
+    /// - `window`: time window for counting failures
+    /// - `lockout`: lockout duration after exceeding max_attempts
+    ///
+    /// See `default_auth()` for production defaults (100 attempts / 5min / 10min).
     pub fn new(max_attempts: u32, window: Duration, lockout: Duration) -> Self {
         Self {
             entries: Arc::new(DashMap::new()),

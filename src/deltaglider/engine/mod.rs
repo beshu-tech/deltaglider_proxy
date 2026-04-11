@@ -286,6 +286,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         &self.storage
     }
 
+    /// Access the bucket policy registry (for quota checks, compression settings, etc.)
+    pub fn bucket_policy_registry(&self) -> &crate::bucket_policy::BucketPolicyRegistry {
+        &self.bucket_policies
+    }
+
     /// Create a new engine with a custom storage backend.
     pub fn new_with_backend(
         storage: Arc<S>,

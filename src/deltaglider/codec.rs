@@ -219,7 +219,7 @@ impl DeltaCodec {
     /// target to a temp file — that was the old slow path.
     #[instrument(skip(self, source, target))]
     pub fn encode(&self, source: &[u8], target: &[u8]) -> Result<Vec<u8>, CodecError> {
-        // Validate sizes
+        // Validate sizes — both source and target must fit within max_size.
         if source.len() > self.max_size {
             return Err(CodecError::TooLarge {
                 size: source.len(),
@@ -239,67 +239,14 @@ impl DeltaCodec {
             target.len()
         );
 
-        // PERF: Source MUST remain a temp file — xdelta3 needs random-access (mmap)
-        // to the source for its sliding-window algorithm. Do NOT try to pipe it via
-        // stdin; xdelta3 can only read source from a seekable file descriptor.
-        let mut source_file = NamedTempFile::new()?;
-        source_file.write_all(source)?;
-        source_file.flush()?;
+        let output = self.run_xdelta3("-e", source, target)?;
 
-        // Run xdelta3 -e -s <source_file> -c
-        // Target data piped to stdin, delta written to stdout (`-c` flag).
-        let result = Command::new("xdelta3")
-            .args(["-e", "-s", source_file.path().to_str().unwrap(), "-c"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
-
-        match result {
-            Ok(mut child) => {
-                let child_id = child.id();
-                let child_stdin = child.stdin.take().unwrap();
-                let child_stdout = child.stdout.take().unwrap();
-                let child_stderr = child.stderr.take().unwrap();
-
-                let (write_result, delta, stderr_result) = pipe_stdin_stdout_stderr(
-                    child_stdin,
-                    child_stdout,
-                    child_stderr,
-                    target,
-                    self.max_size,
-                    child_id,
-                    codec_timeout(),
-                );
-                write_result?;
-                let delta = delta?;
-                let stderr_bytes = stderr_result.unwrap_or_default();
-
-                let status = wait_with_timeout(&mut child, codec_timeout())?;
-                if status.success() {
-                    debug!(
-                        "Delta encoded: {} bytes (ratio: {:.2}%)",
-                        delta.len(),
-                        (delta.len() as f64 / target.len() as f64) * 100.0
-                    );
-                    Ok(delta)
-                } else {
-                    let stderr = String::from_utf8_lossy(&stderr_bytes);
-                    warn!("xdelta3 CLI encode failed: {}", stderr);
-                    Err(CodecError::EncodeFailed(format!(
-                        "xdelta3 CLI failed: {}",
-                        stderr
-                    )))
-                }
-            }
-            Err(e) => {
-                warn!("Failed to execute xdelta3 CLI: {}", e);
-                Err(CodecError::EncodeFailed(format!(
-                    "xdelta3 CLI not available: {}",
-                    e
-                )))
-            }
-        }
+        debug!(
+            "Delta encoded: {} bytes (ratio: {:.2}%)",
+            output.len(),
+            (output.len() as f64 / target.len() as f64) * 100.0
+        );
+        Ok(output)
     }
 
     /// Decode a delta to reconstruct the target from source + delta.
@@ -322,65 +269,89 @@ impl DeltaCodec {
             delta.len()
         );
 
+        let output = self.run_xdelta3("-d", source, delta)?;
+
+        debug!("Delta decoded: {} bytes", output.len());
+        Ok(output)
+    }
+
+    /// Run xdelta3 in encode (`-e`) or decode (`-d`) mode.
+    ///
+    /// Shared implementation for `encode()` and `decode()`. The `mode` argument
+    /// is either `"-e"` (encode) or `"-d"` (decode).
+    ///
+    /// PERF: Source MUST remain a temp file — xdelta3 needs random-access (mmap)
+    /// to the source for its sliding-window algorithm. Do NOT try to pipe it via
+    /// stdin; xdelta3 can only read source from a seekable file descriptor.
+    /// The input (target for encode, delta for decode) is piped via stdin;
+    /// output comes from stdout (`-c` flag).
+    fn run_xdelta3(&self, mode: &str, source: &[u8], input: &[u8]) -> Result<Vec<u8>, CodecError> {
+        let make_error = |msg: String| -> CodecError {
+            if mode == "-e" {
+                CodecError::EncodeFailed(msg)
+            } else {
+                CodecError::DecodeFailed(msg)
+            }
+        };
+
         if !self.cli_available {
-            return Err(CodecError::DecodeFailed(
+            return Err(make_error(
                 "xdelta3 CLI binary is not available".to_string(),
             ));
         }
 
-        // PERF: Source MUST remain a temp file — see encode() comment for why.
         let mut source_file = NamedTempFile::new()?;
         source_file.write_all(source)?;
         source_file.flush()?;
 
-        // Run xdelta3 -d -s <source_file> -c
-        // Delta data piped to stdin, reconstructed target written to stdout (`-c`).
+        let source_path = source_file
+            .path()
+            .to_str()
+            .ok_or_else(|| make_error("temp file path is not valid UTF-8".to_string()))?;
+
         let result = Command::new("xdelta3")
-            .args(["-d", "-s", source_file.path().to_str().unwrap(), "-c"])
+            .args([mode, "-s", source_path, "-c"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn();
 
+        let op_name = if mode == "-e" { "encode" } else { "decode" };
+
         match result {
             Ok(mut child) => {
                 let child_id = child.id();
-                let child_stdin = child.stdin.take().unwrap();
-                let child_stdout = child.stdout.take().unwrap();
-                let child_stderr = child.stderr.take().unwrap();
+                // These .expect() calls are safe: we configured piped stdin/stdout/stderr
+                // above, so .take() only returns None if called twice (which we don't).
+                let child_stdin = child.stdin.take().expect("piped stdin");
+                let child_stdout = child.stdout.take().expect("piped stdout");
+                let child_stderr = child.stderr.take().expect("piped stderr");
 
-                let (write_result, target, stderr_result) = pipe_stdin_stdout_stderr(
+                let (write_result, output, stderr_result) = pipe_stdin_stdout_stderr(
                     child_stdin,
                     child_stdout,
                     child_stderr,
-                    delta,
+                    input,
                     self.max_size,
                     child_id,
                     codec_timeout(),
                 );
                 write_result?;
-                let target = target?;
+                let output = output?;
                 let stderr_bytes = stderr_result.unwrap_or_default();
 
                 let status = wait_with_timeout(&mut child, codec_timeout())?;
                 if status.success() {
-                    debug!("Delta decoded: {} bytes", target.len());
-                    Ok(target)
+                    Ok(output)
                 } else {
                     let stderr = String::from_utf8_lossy(&stderr_bytes);
-                    warn!("xdelta3 CLI decode failed: {}", stderr);
-                    Err(CodecError::DecodeFailed(format!(
-                        "xdelta3 CLI failed: {}",
-                        stderr
-                    )))
+                    warn!("xdelta3 CLI {} failed: {}", op_name, stderr);
+                    Err(make_error(format!("xdelta3 CLI failed: {}", stderr)))
                 }
             }
             Err(e) => {
                 warn!("Failed to execute xdelta3 CLI: {}", e);
-                Err(CodecError::DecodeFailed(format!(
-                    "xdelta3 CLI not available: {}",
-                    e
-                )))
+                Err(make_error(format!("xdelta3 CLI not available: {}", e)))
             }
         }
     }
