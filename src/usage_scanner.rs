@@ -267,3 +267,106 @@ impl UsageScanner {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_entry(bucket: &str, prefix: &str, size: u64, objects: u64) -> UsageEntry {
+        UsageEntry {
+            prefix: prefix.to_string(),
+            bucket: bucket.to_string(),
+            total_size: size,
+            total_objects: objects,
+            children: HashMap::new(),
+            computed_at: Utc::now(),
+            stale_seconds: 0,
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn test_get_returns_none_when_empty() {
+        let scanner = UsageScanner::new();
+        assert!(scanner.get("bucket", "").is_none());
+    }
+
+    #[test]
+    fn test_get_returns_cached_entry() {
+        let scanner = UsageScanner::new();
+        let entry = make_entry("mybucket", "", 1024, 5);
+        UsageScanner::insert_with_eviction(&scanner.cache, "mybucket/".to_string(), entry);
+
+        let result = scanner.get("mybucket", "");
+        assert!(result.is_some());
+        let r = result.unwrap();
+        assert_eq!(r.total_size, 1024);
+        assert_eq!(r.total_objects, 5);
+    }
+
+    #[test]
+    fn test_get_stale_seconds_positive_when_expired() {
+        let scanner = UsageScanner::new();
+        let mut entry = make_entry("mybucket", "", 100, 1);
+        // Backdate to 10 minutes ago (TTL is 5 min = 300s)
+        entry.computed_at = Utc::now() - chrono::Duration::seconds(600);
+        UsageScanner::insert_with_eviction(&scanner.cache, "mybucket/".to_string(), entry);
+
+        let result = scanner.get("mybucket", "").unwrap();
+        // stale_seconds = age(600) - TTL(300) = 300
+        assert!(
+            result.stale_seconds >= 290,
+            "stale_seconds should be ~300, got {}",
+            result.stale_seconds
+        );
+    }
+
+    #[test]
+    fn test_cache_eviction_beyond_max_entries() {
+        let scanner = UsageScanner::new();
+        // Fill cache beyond MAX_CACHE_ENTRIES
+        for i in 0..MAX_CACHE_ENTRIES + 5 {
+            let entry = make_entry(&format!("bucket-{}", i), "", i as u64, 1);
+            UsageScanner::insert_with_eviction(&scanner.cache, format!("bucket-{}/", i), entry);
+        }
+        let cache = scanner.cache.read();
+        assert!(
+            cache.len() <= MAX_CACHE_ENTRIES,
+            "Cache should be at or below max: {} > {}",
+            cache.len(),
+            MAX_CACHE_ENTRIES
+        );
+    }
+
+    #[test]
+    fn test_is_scanning_dedup() {
+        let scanner = UsageScanner::new();
+        // Mark as scanning
+        scanner
+            .scanning
+            .write()
+            .insert("mybucket/prefix/".to_string());
+        assert!(scanner.is_scanning("mybucket", "prefix/"));
+        assert!(!scanner.is_scanning("mybucket", "other/"));
+    }
+
+    #[test]
+    fn test_insert_cleans_stale_entries() {
+        let scanner = UsageScanner::new();
+        // Insert an entry backdated beyond 2x TTL (should be cleaned)
+        let mut stale = make_entry("stale", "", 100, 1);
+        stale.computed_at = Utc::now() - chrono::Duration::seconds(CACHE_TTL_SECS * 3);
+        UsageScanner::insert_with_eviction(&scanner.cache, "stale/".to_string(), stale);
+
+        // Insert a fresh entry — the stale one should be cleaned
+        let fresh = make_entry("fresh", "", 200, 2);
+        UsageScanner::insert_with_eviction(&scanner.cache, "fresh/".to_string(), fresh);
+
+        let cache = scanner.cache.read();
+        assert!(
+            cache.get("stale/").is_none(),
+            "Stale entry should be cleaned"
+        );
+        assert!(cache.get("fresh/").is_some(), "Fresh entry should exist");
+    }
+}
