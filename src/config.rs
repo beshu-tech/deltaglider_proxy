@@ -904,11 +904,13 @@ impl Config {
         print!("{extra}");
     }
 
-    /// Serialize config to TOML string (excludes bootstrap_password_hash for security).
+    /// Serialize config to TOML string (excludes secrets for security).
     pub fn to_toml_string(&self) -> Result<String, ConfigError> {
-        // Clone and strip the admin hash before serializing
+        // Clone and strip secrets before serializing — these should only come
+        // from env vars or CLI, never be written to disk in plaintext.
         let mut export = self.clone();
         export.bootstrap_password_hash = None;
+        export.encryption_key = None;
         toml::to_string_pretty(&export).map_err(|e| ConfigError::Parse(e.to_string()))
     }
 
