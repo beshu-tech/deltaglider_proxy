@@ -44,6 +44,9 @@ subtle = "2"
 zeroize = "1"
 base64 = "0.22"
 
+# Encryption at rest (AES-256-GCM)
+aes-gcm = "0.10"
+
 # XML for S3 responses
 quick-xml = { version = "0.36", features = ["serialize"] }
 
@@ -93,3 +96,4 @@ tokio-test = "0.4"
 reqwest = { version = "0.12", features = ["json", "cookies"] }
 testcontainers = "0.26"
 testcontainers-modules = { version = "0.14", features = ["minio"] }
+walkdir = "2"

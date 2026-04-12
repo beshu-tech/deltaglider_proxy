@@ -33,6 +33,9 @@ pub enum StorageError {
     #[error("Bucket not found: {0}")]
     BucketNotFound(String),
 
+    #[error("Encryption error: {0}")]
+    Encryption(String),
+
     #[error("Bucket not empty: {0}")]
     BucketNotEmpty(String),
 
