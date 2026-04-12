@@ -52,6 +52,8 @@ pub mod meta_keys {
     pub const H_REF_SHA256: &str = concat!("x-amz-meta-", "dg-ref-sha256");
     pub const H_DELTA_SIZE: &str = concat!("x-amz-meta-", "dg-delta-size");
     pub const H_DELTA_CMD: &str = concat!("x-amz-meta-", "dg-delta-cmd");
+    pub const ENCRYPTED: &str = "dg-encrypted";
+    pub const H_ENCRYPTED: &str = concat!("x-amz-meta-", "dg-encrypted");
 }
 
 /// Errors that can occur when validating user-provided bucket/key inputs.

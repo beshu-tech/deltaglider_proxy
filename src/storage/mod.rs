@@ -1,5 +1,6 @@
 //! Storage backend abstraction
 
+pub mod encrypting;
 mod filesystem;
 pub(crate) mod routing;
 mod s3;
@@ -7,6 +8,7 @@ mod traits;
 #[cfg(unix)]
 pub(crate) mod xattr_meta;
 
+pub use encrypting::{EncryptingBackend, EncryptionConfig, EncryptionKey};
 pub use filesystem::FilesystemBackend;
 pub use routing::RoutingBackend;
 pub use s3::S3Backend;

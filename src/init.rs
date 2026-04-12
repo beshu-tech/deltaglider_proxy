@@ -300,6 +300,7 @@ pub fn run_init_inner(
         buckets: std::collections::HashMap::new(),
         backends: Vec::new(),
         default_backend: None,
+        encryption_key: None,
     };
 
     // Show summary

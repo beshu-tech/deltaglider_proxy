@@ -340,6 +340,12 @@ pub struct Config {
     #[serde(default)]
     pub config_sync_bucket: Option<String>,
 
+    /// AES-256 master key for encryption at rest (64-char hex string = 256 bits).
+    /// When set, all new writes are AES-256-GCM encrypted. Existing unencrypted
+    /// objects remain readable (detected via metadata). Env: `DGP_ENCRYPTION_KEY`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption_key: Option<String>,
+
     /// TLS configuration (optional).
     /// When enabled, both the S3 port and the demo UI port serve HTTPS.
     #[serde(default)]
@@ -483,6 +489,7 @@ impl Default for Config {
             buckets: std::collections::HashMap::new(),
             backends: Vec::new(),
             default_backend: None,
+            encryption_key: None,
         }
     }
 }
@@ -589,6 +596,13 @@ impl Config {
         // Config DB S3 sync
         if let Ok(bucket) = std::env::var("DGP_CONFIG_SYNC_BUCKET") {
             self.config_sync_bucket = Some(bucket);
+        }
+
+        // Encryption at rest
+        if let Ok(key) = std::env::var("DGP_ENCRYPTION_KEY") {
+            if !key.is_empty() {
+                self.encryption_key = Some(key);
+            }
         }
 
         // TLS configuration

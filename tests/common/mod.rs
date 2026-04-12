@@ -117,6 +117,7 @@ impl TestServer {
         bucket: &str,
         data_dir: Option<TempDir>,
         auth_creds: Option<(String, String)>,
+        encryption_key: Option<String>,
     ) -> Self {
         let port = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
 
@@ -140,15 +141,15 @@ impl TestServer {
         let config_path = config_dir.join("test.toml");
         std::fs::write(&config_path, &full_config).expect("Failed to write test config");
 
-        let process = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"))
-            .env("DGP_CONFIG", &config_path)
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"));
+        cmd.env("DGP_CONFIG", &config_path)
             .env("RUST_LOG", "deltaglider_proxy=warn")
-            // Enable debug headers so tests can inspect x-amz-storage-type etc.
             .env("DGP_DEBUG_HEADERS", "true")
-            // Trust proxy headers in tests so rate limiting and aws:SourceIp work
-            .env("DGP_TRUST_PROXY_HEADERS", "true")
-            .spawn()
-            .expect("Failed to start server");
+            .env("DGP_TRUST_PROXY_HEADERS", "true");
+        if let Some(ref key) = encryption_key {
+            cmd.env("DGP_ENCRYPTION_KEY", key);
+        }
+        let process = cmd.spawn().expect("Failed to start server");
 
         let mut server = Self {
             process,
@@ -262,6 +263,8 @@ pub struct TestServerBuilder {
     auth_creds: Option<(String, String)>,
     /// Per-bucket TOML snippets: (bucket_name, toml_body)
     bucket_policies: Vec<(String, String)>,
+    /// AES-256 encryption key (64-char hex). When set, DGP_ENCRYPTION_KEY env var is passed.
+    encryption_key: Option<String>,
 }
 
 impl Default for TestServerBuilder {
@@ -274,6 +277,7 @@ impl Default for TestServerBuilder {
             s3_endpoint: None,
             auth_creds: None,
             bucket_policies: Vec::new(),
+            encryption_key: None,
         }
     }
 }
@@ -317,11 +321,18 @@ impl TestServerBuilder {
         self
     }
 
+    /// Set AES-256 encryption key (64-char hex string).
+    pub fn encryption_key(mut self, hex_key: &str) -> Self {
+        self.encryption_key = Some(hex_key.to_string());
+        self
+    }
+
     /// Build the TOML config string and spawn the test server.
     pub async fn build(self) -> TestServer {
         let (config, data_dir) = self.build_config();
         let auth = self.auth_creds.clone();
-        TestServer::spawn_with_config(&config, &self.bucket, data_dir, auth).await
+        TestServer::spawn_with_config(&config, &self.bucket, data_dir, auth, self.encryption_key)
+            .await
     }
 
     /// Assemble a TOML config string (and optional TempDir for filesystem backend).

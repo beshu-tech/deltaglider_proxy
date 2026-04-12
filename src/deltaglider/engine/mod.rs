@@ -1,5 +1,7 @@
 //! DeltaGlider engine - main orchestrator for delta-based storage
 
+use arc_swap::ArcSwap;
+
 use super::cache::ReferenceCache;
 use super::codec::{CodecError, DeltaCodec};
 use super::file_router::FileRouter;
@@ -272,6 +274,19 @@ impl DynEngine {
                 routes,
                 default_name,
             )?)
+        };
+
+        // Wrap with encryption layer if an encryption key is configured
+        let storage: Box<dyn StorageBackend> = if let Some(ref hex_key) = config.encryption_key {
+            let key = crate::storage::EncryptionKey::from_hex(hex_key)
+                .map_err(StorageError::Encryption)?;
+            let enc_config = Arc::new(ArcSwap::new(Arc::new(crate::storage::EncryptionConfig {
+                key: Some(key),
+            })));
+            tracing::info!("Encryption at rest: ENABLED (AES-256-GCM)");
+            Box::new(crate::storage::EncryptingBackend::new(storage, enc_config))
+        } else {
+            storage
         };
 
         Ok(Self::new_with_backend(Arc::new(storage), config, metrics))
