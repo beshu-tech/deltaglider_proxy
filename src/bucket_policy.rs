@@ -41,12 +41,91 @@ pub struct BucketPolicyConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub public_prefixes: Vec<String>,
 
+    /// Shorthand: `public: true` makes the **entire bucket** readable
+    /// anonymously (equivalent to `public_prefixes: [""]`). Expanded at
+    /// load time by [`Self::normalize`]; the canonical exporter prefers
+    /// this shorthand when the expansion is unambiguous so GitOps diffs
+    /// stay compact.
+    ///
+    /// Only one of `public` and `public_prefixes` may be set to a
+    /// non-default value; mixing them is rejected as operator error
+    /// (two sources of truth for the same semantics). `public: false`
+    /// is accepted as an explicit "not public" marker and is a no-op
+    /// on an empty `public_prefixes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public: Option<bool>,
+
     /// Maximum storage size in bytes for this bucket. When set, PUT requests
     /// that would exceed this limit are rejected with 403. Uses cached usage
     /// data (soft quota — may overshoot by up to 5 minutes of writes).
     /// Example: `10737418240` = 10 GB. `0` = freeze bucket (block all writes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_bytes: Option<u64>,
+}
+
+impl BucketPolicyConfig {
+    /// Expand shorthand forms into their canonical representation. Call
+    /// this exactly once, after deserialization and before the config is
+    /// handed off to the engine / snapshot builders.
+    ///
+    /// Currently normalises:
+    /// - `public: true` with empty `public_prefixes` → `public_prefixes:
+    ///   [""]` (the "entire bucket is public" convention consumed by
+    ///   [`PublicPrefixSnapshot::is_public_read`]).
+    /// - `public: false` → no-op; kept as-is so the operator's intent
+    ///   survives a round-trip.
+    ///
+    /// Returns an error when both `public: true` and a non-empty
+    /// `public_prefixes` are set: picking one silently would lose the
+    /// other's semantics. The operator must collapse them manually.
+    pub fn normalize(&mut self) -> Result<(), String> {
+        match self.public {
+            Some(true) => {
+                if !self.public_prefixes.is_empty() {
+                    return Err(format!(
+                        "`public: true` and `public_prefixes: {:?}` cannot both be set on the same bucket — \
+                         they are two syntaxes for the same concept. Use one: `public: true` for \
+                         the entire bucket, or `public_prefixes: [...]` for specific key prefixes.",
+                        self.public_prefixes
+                    ));
+                }
+                // `public_prefixes: [""]` is the existing "entire bucket is
+                // public" convention (see `is_public_read` where the empty
+                // prefix matches everything). The shorthand expands to the
+                // same runtime data, so no evaluator change is needed.
+                self.public_prefixes = vec![String::new()];
+                // Leave `public = Some(true)` set: the canonical exporter
+                // uses it to emit the compact shorthand form again.
+            }
+            Some(false) | None => {
+                // Either explicit "not public" or absence of opinion.
+                // Nothing to expand — `public_prefixes` is the source of
+                // truth. We null out explicit-false to match the default
+                // (absence), which keeps round-tripped YAML minimal.
+                if self.public == Some(false) {
+                    self.public = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Inverse of [`Self::normalize`]: collapse the canonical form back
+    /// into the `public: true` shorthand when it's unambiguous. Called
+    /// by the canonical YAML exporter so GitOps diffs prefer the compact
+    /// shorthand representation.
+    ///
+    /// Returns the policy with `public = Some(true)` and an empty
+    /// `public_prefixes` when the expansion is unambiguous (exactly one
+    /// prefix, equal to `""`). Otherwise returns the policy unchanged.
+    pub fn collapse_to_shorthand(&self) -> Self {
+        let mut out = self.clone();
+        if out.public_prefixes.len() == 1 && out.public_prefixes[0].is_empty() {
+            out.public = Some(true);
+            out.public_prefixes.clear();
+        }
+        out
+    }
 }
 
 /// Resolved bucket policies with global defaults applied.
@@ -639,5 +718,109 @@ mod tests {
         };
         let toml_str = toml::to_string_pretty(&policy).unwrap();
         assert!(!toml_str.contains("quota_bytes"));
+    }
+
+    // ── Phase 3b.1: `public: true` shorthand ────────────────────────────
+
+    #[test]
+    fn test_public_shorthand_expands_to_empty_prefix() {
+        // `public: true` alone expands to the "entire bucket is public"
+        // sentinel (empty-string prefix) that the snapshot already
+        // consumes. No evaluator change needed.
+        let mut policy = BucketPolicyConfig {
+            public: Some(true),
+            ..Default::default()
+        };
+        policy.normalize().unwrap();
+        assert_eq!(policy.public_prefixes, vec![String::new()]);
+        // The shorthand marker survives normalization so the canonical
+        // exporter can round-trip it back to `public: true`.
+        assert_eq!(policy.public, Some(true));
+    }
+
+    #[test]
+    fn test_public_shorthand_conflict_with_explicit_prefixes_is_error() {
+        // Setting BOTH `public: true` and `public_prefixes: [...]` is
+        // operator error — two sources of truth for the same semantics.
+        let mut policy = BucketPolicyConfig {
+            public: Some(true),
+            public_prefixes: vec!["releases/".into()],
+            ..Default::default()
+        };
+        let err = policy
+            .normalize()
+            .expect_err("public: true + non-empty public_prefixes must be rejected");
+        assert!(
+            err.contains("public: true") && err.contains("public_prefixes"),
+            "error must name both conflicting fields, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_public_false_is_noop() {
+        // `public: false` is valid — just means "not public". The
+        // explicit-false is normalised to None so round-tripped YAML
+        // stays minimal (absence = default).
+        let mut policy = BucketPolicyConfig {
+            public: Some(false),
+            ..Default::default()
+        };
+        policy.normalize().unwrap();
+        assert!(policy.public_prefixes.is_empty());
+        assert_eq!(policy.public, None);
+    }
+
+    #[test]
+    fn test_public_absent_is_noop() {
+        let mut policy = BucketPolicyConfig::default();
+        let before = policy.clone();
+        policy.normalize().unwrap();
+        assert_eq!(policy, before);
+    }
+
+    #[test]
+    fn test_public_shorthand_roundtrip_via_collapse() {
+        // Canonical → shorthand → canonical round-trip is stable.
+        let canonical = BucketPolicyConfig {
+            public_prefixes: vec![String::new()],
+            ..Default::default()
+        };
+        let shorthand = canonical.collapse_to_shorthand();
+        assert_eq!(shorthand.public, Some(true));
+        assert!(shorthand.public_prefixes.is_empty());
+
+        // And re-normalising the shorthand gets back to the canonical form.
+        let mut roundtripped = shorthand.clone();
+        roundtripped.normalize().unwrap();
+        assert_eq!(roundtripped.public_prefixes, vec![String::new()]);
+    }
+
+    #[test]
+    fn test_collapse_leaves_specific_prefixes_alone() {
+        // A policy with specific prefixes must NOT be collapsed — the
+        // shorthand is only unambiguous for the `[""]` expansion.
+        let policy = BucketPolicyConfig {
+            public_prefixes: vec!["releases/".into(), "docs/".into()],
+            ..Default::default()
+        };
+        let collapsed = policy.collapse_to_shorthand();
+        assert!(collapsed.public.is_none());
+        assert_eq!(
+            collapsed.public_prefixes,
+            vec!["releases/".to_string(), "docs/".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_collapse_leaves_single_non_empty_prefix_alone() {
+        // `[""]` and `["foo/"]` mean different things; only the former
+        // collapses to `public: true`.
+        let policy = BucketPolicyConfig {
+            public_prefixes: vec!["foo/".into()],
+            ..Default::default()
+        };
+        let collapsed = policy.collapse_to_shorthand();
+        assert!(collapsed.public.is_none());
+        assert_eq!(collapsed.public_prefixes, vec!["foo/".to_string()]);
     }
 }

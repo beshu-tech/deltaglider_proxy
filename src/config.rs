@@ -691,8 +691,9 @@ impl Config {
     /// Load configuration from a TOML file explicitly.
     pub fn from_toml_file(path: &str) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path).map_err(|e| ConfigError::Io(e.to_string()))?;
-        let config: Config =
+        let mut config: Config =
             toml::from_str(&content).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        config.normalize_shorthands()?;
         Ok(config)
     }
 
@@ -732,28 +733,49 @@ impl Config {
         let doc: serde_yaml::Value =
             serde_yaml::from_str(content).map_err(|e| ConfigError::Parse(e.to_string()))?;
 
-        match classify_shape(&doc) {
+        let mut cfg = match classify_shape(&doc) {
             ConfigShape::Sectioned => {
                 let sectioned: crate::config_sections::SectionedConfig =
                     serde_yaml::from_value(doc).map_err(|e| ConfigError::Parse(e.to_string()))?;
-                Ok(sectioned.into_flat())
+                sectioned.into_flat().map_err(ConfigError::Parse)?
             }
-            ConfigShape::Flat => {
-                let flat: Config =
-                    serde_yaml::from_value(doc).map_err(|e| ConfigError::Parse(e.to_string()))?;
-                Ok(flat)
-            }
+            ConfigShape::Flat => serde_yaml::from_value(doc)
+                .map_err(|e| ConfigError::Parse(e.to_string()))?,
             ConfigShape::Mixed {
                 flat_keys,
                 section_keys,
-            } => Err(ConfigError::Parse(format!(
-                "config YAML mixes legacy flat keys ({}) with Phase 3+ section headers ({}); \
-                 pick one shape. The canonical export (`deltaglider_proxy config migrate` / \
-                 the admin API `/config/export`) always emits the sectioned shape.",
-                flat_keys.join(", "),
-                section_keys.join(", "),
-            ))),
+            } => {
+                return Err(ConfigError::Parse(format!(
+                    "config YAML mixes legacy flat keys ({}) with Phase 3+ section headers ({}); \
+                     pick one shape. The canonical export (`deltaglider_proxy config migrate` / \
+                     the admin API `/config/export`) always emits the sectioned shape.",
+                    flat_keys.join(", "),
+                    section_keys.join(", "),
+                )));
+            }
+        };
+        cfg.normalize_shorthands()?;
+        Ok(cfg)
+    }
+
+    /// Expand all shorthand forms in the loaded config into their
+    /// canonical representations. Called exactly once per load, after
+    /// deserialization, before the config is handed to any consumer.
+    ///
+    /// Phase 3b.1 normalises per-bucket `public: true` into
+    /// `public_prefixes: [""]`. Future shorthands (group presets,
+    /// storage shorthand) plug in here.
+    ///
+    /// Returns an error when a shorthand conflicts with its canonical
+    /// form (e.g. `public: true` AND non-empty `public_prefixes:`). The
+    /// operator must resolve the ambiguity before the config is loadable.
+    fn normalize_shorthands(&mut self) -> Result<(), ConfigError> {
+        for (name, policy) in self.buckets.iter_mut() {
+            policy
+                .normalize()
+                .map_err(|e| ConfigError::Parse(format!("bucket `{}`: {}", name, e)))?;
         }
+        Ok(())
     }
 
     /// Load configuration from environment variables
@@ -2247,6 +2269,176 @@ storge:
             DefaultsVersion::V1.is_default(),
             "DefaultsVersion::V1 must be the current default; a future V2 must update this \
              assertion AND provide a migration path for YAML files that omitted `defaults:`"
+        );
+    }
+
+    // ── Phase 3b.1: `public: true` shorthand through the full load path ──
+
+    #[test]
+    fn test_bucket_public_shorthand_normalised_on_yaml_load() {
+        // A sectioned YAML with `public: true` on a bucket expands to
+        // `public_prefixes: [""]` after normalisation, which is the form
+        // the runtime (PublicPrefixSnapshot) already knows how to serve.
+        let yaml = r#"
+storage:
+  buckets:
+    my-bucket:
+      public: true
+"#;
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        let policy = cfg.buckets.get("my-bucket").unwrap();
+        assert_eq!(policy.public_prefixes, vec![String::new()]);
+        assert_eq!(policy.public, Some(true));
+    }
+
+    #[test]
+    fn test_bucket_public_shorthand_conflict_rejected_at_load() {
+        // Mixing `public: true` with `public_prefixes` is operator error
+        // — the loader must refuse, not silently pick one.
+        let yaml = r#"
+storage:
+  buckets:
+    my-bucket:
+      public: true
+      public_prefixes:
+        - "releases/"
+"#;
+        let err =
+            Config::from_yaml_str(yaml).expect_err("public + public_prefixes must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("my-bucket"),
+            "error must name the offending bucket, got: {msg}"
+        );
+        assert!(
+            msg.contains("public"),
+            "error must mention `public`, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_bucket_public_shorthand_roundtrip_via_canonical_yaml() {
+        // Round-trip: YAML with `public: true` → load → export → re-load.
+        // Canonical exporter must use the shorthand form again (cleaner
+        // GitOps diffs), and the re-loaded config must be identical to
+        // the first load.
+        let yaml = r#"
+storage:
+  buckets:
+    my-bucket:
+      public: true
+"#;
+        let cfg1 = Config::from_yaml_str(yaml).unwrap();
+        let exported = cfg1.to_canonical_yaml().unwrap();
+        assert!(
+            exported.contains("public: true"),
+            "canonical export must use the shorthand form, got:\n{exported}"
+        );
+        assert!(
+            !exported.contains("public_prefixes:"),
+            "canonical export must NOT emit the long form when shorthand applies, got:\n{exported}"
+        );
+        let cfg2 = Config::from_yaml_str(&exported).unwrap();
+        assert_eq!(
+            cfg1.buckets, cfg2.buckets,
+            "bucket policies must round-trip losslessly"
+        );
+    }
+
+    #[test]
+    fn test_bucket_specific_prefixes_roundtrip_without_shorthand() {
+        // When a bucket has specific prefixes (not the `[""]` sentinel),
+        // the exporter must keep the long form — shorthand only applies
+        // to the unambiguous "entire bucket is public" case.
+        let yaml = r#"
+storage:
+  buckets:
+    semi-public:
+      public_prefixes:
+        - "releases/"
+        - "docs/"
+"#;
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        let exported = cfg.to_canonical_yaml().unwrap();
+        assert!(
+            exported.contains("public_prefixes:"),
+            "specific-prefix config must round-trip as long form, got:\n{exported}"
+        );
+        assert!(
+            !exported.contains("public: true"),
+            "shorthand must not be emitted for multi-prefix config, got:\n{exported}"
+        );
+    }
+
+    // ── Phase 3b.1: storage shorthand through the full load path ──────
+
+    /// The T1 acceptance example from the plan: a 5-line config that
+    /// loads, starts, and serves S3 traffic. The acceptance gate is
+    /// "loads without error" — downstream startup is tested separately.
+    #[test]
+    fn test_t1_five_line_example_loads() {
+        // Five lines, counting only non-blank content:
+        //   1. storage:
+        //   2.   s3: http://minio:9000
+        //   3.   access_key_id: AKIAEXAMPLE
+        //   4.   secret_access_key: SECRET
+        //   5.   buckets:
+        // (the empty bucket map is elided in YAML counting)
+        let yaml = r#"
+storage:
+  s3: http://minio:9000
+  access_key_id: AKIAEXAMPLE
+  secret_access_key: SECRET
+"#;
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        match &cfg.backend {
+            BackendConfig::S3 {
+                endpoint,
+                region,
+                access_key_id,
+                secret_access_key,
+                ..
+            } => {
+                assert_eq!(endpoint.as_deref(), Some("http://minio:9000"));
+                assert_eq!(region, "us-east-1");
+                assert_eq!(access_key_id.as_deref(), Some("AKIAEXAMPLE"));
+                assert_eq!(secret_access_key.as_deref(), Some("SECRET"));
+            }
+            other => panic!("T1 example must yield S3 backend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_filesystem_shorthand_loads_via_yaml() {
+        let yaml = r#"
+storage:
+  filesystem: /var/lib/dgp
+"#;
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        match &cfg.backend {
+            BackendConfig::Filesystem { path } => {
+                assert_eq!(path.to_str(), Some("/var/lib/dgp"));
+            }
+            other => panic!("filesystem shorthand must yield Filesystem backend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_storage_shorthand_plus_explicit_backend_is_rejected_at_load() {
+        // Operator error surfaces cleanly from the full load path.
+        let yaml = r#"
+storage:
+  s3: http://minio:9000
+  backend:
+    type: filesystem
+    path: /explicit
+"#;
+        let err = Config::from_yaml_str(yaml)
+            .expect_err("shorthand + explicit backend must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("shorthand") || msg.contains("backend"),
+            "error must explain the shorthand/backend conflict, got: {msg}"
         );
     }
 }

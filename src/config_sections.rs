@@ -125,6 +125,32 @@ pub struct AccessSection {
 }
 
 /// Backends + per-bucket overrides.
+///
+/// # Shorthand forms (Phase 3b.1)
+///
+/// The section accepts two compact forms in addition to the full-length
+/// `backend:` sub-map. Operators who run a single backend can write:
+///
+/// ```yaml
+/// storage:
+///   s3: https://example.com       # endpoint URL; triggers S3 backend
+///   region: eu-central-1          # optional (default us-east-1)
+///   access_key_id: AKIA...        # optional
+///   secret_access_key: ...        # optional
+///   buckets: { ... }
+/// ```
+///
+/// or
+///
+/// ```yaml
+/// storage:
+///   filesystem: /var/dgp          # path; triggers filesystem backend
+///   buckets: { ... }
+/// ```
+///
+/// The shorthand fields expand into [`BackendConfig`] at load time via
+/// [`StorageSection::normalize`]. Only one of `backend:` / `s3:` /
+/// `filesystem:` may be set; mixing them is rejected as operator error.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(deny_unknown_fields)]
 pub struct StorageSection {
@@ -145,6 +171,108 @@ pub struct StorageSection {
     /// Per-bucket compression / quota / public-prefix overrides.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub buckets: BTreeMap<String, BucketPolicyConfig>,
+
+    // ── Shorthand fields ─────────────────────────────────────────────
+    //
+    // These never appear in the canonical export — they are operator-
+    // authoring conveniences only. [`normalize`] empties them after
+    // expanding into [`backend`].
+
+    /// Shorthand: S3 endpoint URL. Expanding this sets `backend` to a
+    /// `BackendConfig::S3` with this endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub s3: Option<String>,
+
+    /// Shorthand: filesystem path. Expanding this sets `backend` to a
+    /// `BackendConfig::Filesystem` with this path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filesystem: Option<std::path::PathBuf>,
+
+    /// Optional companion to `s3:` — AWS region (default `us-east-1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+
+    /// Optional companion to `s3:` — access key id. Absent = use the
+    /// environment / IAM instance profile per the AWS SDK's chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_key_id: Option<String>,
+
+    /// Optional companion to `s3:` — secret access key. Must be set
+    /// together with `access_key_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_access_key: Option<String>,
+
+    /// Optional companion to `s3:` — force path-style addressing.
+    /// Default `true` (MinIO-compatible). Set `false` for AWS-native
+    /// virtual-hosted-style.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force_path_style: Option<bool>,
+}
+
+impl StorageSection {
+    /// Expand shorthand forms (`s3:` / `filesystem:`) into a full
+    /// [`BackendConfig`]. Leaves the canonical `backend:` untouched when
+    /// no shorthand is present.
+    ///
+    /// Errors when multiple shorthand+backend combinations are
+    /// ambiguous — the operator should set exactly one.
+    pub fn normalize(&mut self) -> Result<(), String> {
+        let has_s3 = self.s3.is_some();
+        let has_fs = self.filesystem.is_some();
+        let has_backend = !is_backend_default(&self.backend);
+
+        match (has_s3, has_fs, has_backend) {
+            (false, false, _) => {
+                // No shorthand — nothing to expand. `backend` may or may
+                // not be default; either is fine.
+            }
+            (true, false, false) => {
+                // S3 shorthand, no explicit backend. Expand.
+                self.backend = BackendConfig::S3 {
+                    endpoint: self.s3.take(),
+                    region: self.region.take().unwrap_or_else(|| "us-east-1".to_string()),
+                    force_path_style: self.force_path_style.take().unwrap_or(true),
+                    access_key_id: self.access_key_id.take(),
+                    secret_access_key: self.secret_access_key.take(),
+                };
+            }
+            (false, true, false) => {
+                // Filesystem shorthand, no explicit backend. Expand.
+                self.backend = BackendConfig::Filesystem {
+                    path: self.filesystem.take().expect("has_fs asserted above"),
+                };
+            }
+            (true, true, _) => {
+                return Err(
+                    "storage: `s3:` and `filesystem:` cannot both be set — a single backend \
+                     shorthand must pick one"
+                        .to_string(),
+                );
+            }
+            (_, _, true) => {
+                return Err(format!(
+                    "storage: shorthand ({}) cannot be combined with an explicit `backend:` \
+                     — pick one form",
+                    if has_s3 { "`s3:`" } else { "`filesystem:`" }
+                ));
+            }
+        }
+
+        // Stray companion fields without the anchor are operator error —
+        // `region:` alone, for instance, has nothing to attach to.
+        if self.region.is_some()
+            || self.access_key_id.is_some()
+            || self.secret_access_key.is_some()
+            || self.force_path_style.is_some()
+        {
+            return Err(
+                "storage: S3 companion fields (region / access_key_id / secret_access_key / \
+                 force_path_style) can only be set together with `s3:`"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Process-level tunables: listener, TLS, log level, caches, and the
@@ -230,7 +358,25 @@ impl SectionedConfig {
                 backend: flat.backend.clone(),
                 backends: flat.backends.clone(),
                 default_backend: flat.default_backend.clone(),
-                buckets: flat.buckets.clone(),
+                // Prefer the compact shorthand form (`public: true`) when
+                // the canonical expansion is unambiguous. Keeps GitOps
+                // diffs short and maps 1:1 to the GUI's bucket-settings
+                // "Public read" toggle.
+                buckets: flat
+                    .buckets
+                    .iter()
+                    .map(|(name, policy)| (name.clone(), policy.collapse_to_shorthand()))
+                    .collect(),
+                // Shorthand fields never appear in the canonical export —
+                // the expanded `backend:` carries the information instead.
+                // Future `collapse_backend_to_shorthand()` could emit
+                // these, but today we keep the exporter predictable.
+                s3: None,
+                filesystem: None,
+                region: None,
+                access_key_id: None,
+                secret_access_key: None,
+                force_path_style: None,
             },
             advanced: AdvancedSection {
                 // Emit only non-default values to keep the exported YAML
@@ -261,7 +407,20 @@ impl SectionedConfig {
     /// Missing scalars fall back to their `Config::default()` values —
     /// which is the whole point of the `Option<T>` wrapping in
     /// `AdvancedSection`: authors only set the fields they care about.
-    pub fn into_flat(self) -> crate::config::Config {
+    ///
+    /// Shorthand storage forms (`s3:`, `filesystem:`) are expanded in
+    /// place before the flat Config is assembled. Bucket-level
+    /// shorthands (`public: true`) are expanded later by
+    /// `Config::normalize_shorthands`.
+    pub fn into_flat(mut self) -> Result<crate::config::Config, String> {
+        self.storage.normalize()?;
+        Ok(self.into_flat_unchecked())
+    }
+
+    /// Internal: flat projection without any shorthand expansion. Used
+    /// by tests and by the exporter's round-trip verification where
+    /// shorthands have already been resolved.
+    fn into_flat_unchecked(self) -> crate::config::Config {
         let defaults = crate::config::Config::default();
         crate::config::Config {
             defaults_version: self.defaults_version,
@@ -347,7 +506,7 @@ mod tests {
     fn round_trips_default_config() {
         let flat = Config::default();
         let sectioned = SectionedConfig::from_flat(&flat);
-        let back = sectioned.into_flat();
+        let back = sectioned.into_flat().unwrap();
         assert_eq!(flat, back, "default Config must round-trip losslessly");
     }
 
@@ -362,7 +521,7 @@ mod tests {
             ..Config::default()
         };
         let sectioned = SectionedConfig::from_flat(&flat);
-        let back = sectioned.into_flat();
+        let back = sectioned.into_flat().unwrap();
         assert_eq!(flat, back);
     }
 
@@ -402,5 +561,135 @@ mod tests {
             !yaml.contains("storage:"),
             "default storage should be omitted, got: {yaml}"
         );
+    }
+
+    // ── Phase 3b.1: storage shorthand ─────────────────────────────────
+
+    #[test]
+    fn storage_s3_shorthand_expands_to_s3_backend() {
+        let mut storage = StorageSection {
+            s3: Some("https://minio.example.com".into()),
+            region: Some("eu-central-1".into()),
+            access_key_id: Some("AKIA".into()),
+            secret_access_key: Some("secret".into()),
+            ..Default::default()
+        };
+        storage.normalize().unwrap();
+        match &storage.backend {
+            BackendConfig::S3 {
+                endpoint,
+                region,
+                access_key_id,
+                secret_access_key,
+                force_path_style,
+            } => {
+                assert_eq!(endpoint.as_deref(), Some("https://minio.example.com"));
+                assert_eq!(region, "eu-central-1");
+                assert_eq!(access_key_id.as_deref(), Some("AKIA"));
+                assert_eq!(secret_access_key.as_deref(), Some("secret"));
+                assert!(*force_path_style, "force_path_style default is true");
+            }
+            other => panic!("expected S3 backend, got {other:?}"),
+        }
+        // Shorthand fields must be drained after expansion.
+        assert!(storage.s3.is_none());
+        assert!(storage.region.is_none());
+        assert!(storage.access_key_id.is_none());
+        assert!(storage.secret_access_key.is_none());
+    }
+
+    #[test]
+    fn storage_s3_shorthand_uses_us_east_1_when_region_absent() {
+        let mut storage = StorageSection {
+            s3: Some("https://example.com".into()),
+            ..Default::default()
+        };
+        storage.normalize().unwrap();
+        match &storage.backend {
+            BackendConfig::S3 { region, .. } => assert_eq!(region, "us-east-1"),
+            other => panic!("expected S3 backend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn storage_filesystem_shorthand_expands_to_fs_backend() {
+        let mut storage = StorageSection {
+            filesystem: Some("/var/dgp".into()),
+            ..Default::default()
+        };
+        storage.normalize().unwrap();
+        match &storage.backend {
+            BackendConfig::Filesystem { path } => {
+                assert_eq!(path.to_str(), Some("/var/dgp"));
+            }
+            other => panic!("expected Filesystem backend, got {other:?}"),
+        }
+        assert!(storage.filesystem.is_none());
+    }
+
+    #[test]
+    fn storage_shorthand_mixed_s3_and_filesystem_is_error() {
+        let mut storage = StorageSection {
+            s3: Some("https://example.com".into()),
+            filesystem: Some("/var/dgp".into()),
+            ..Default::default()
+        };
+        let err = storage
+            .normalize()
+            .expect_err("s3: and filesystem: together must be rejected");
+        assert!(
+            err.contains("s3") && err.contains("filesystem"),
+            "error must name both fields, got: {err}"
+        );
+    }
+
+    #[test]
+    fn storage_shorthand_combined_with_explicit_backend_is_error() {
+        let mut storage = StorageSection {
+            s3: Some("https://example.com".into()),
+            backend: BackendConfig::Filesystem {
+                path: "/explicit".into(),
+            },
+            ..Default::default()
+        };
+        let err = storage
+            .normalize()
+            .expect_err("s3: together with explicit backend: must be rejected");
+        assert!(
+            err.contains("shorthand") && err.contains("backend"),
+            "error must explain the conflict, got: {err}"
+        );
+    }
+
+    #[test]
+    fn storage_shorthand_companion_without_anchor_is_error() {
+        // `region:` alone has nothing to attach to — it's not valid on
+        // the canonical `backend: { type: S3, ... }` form either. Make
+        // sure the operator sees a clear error.
+        let mut storage = StorageSection {
+            region: Some("eu-central-1".into()),
+            ..Default::default()
+        };
+        let err = storage
+            .normalize()
+            .expect_err("region without s3: must be rejected");
+        assert!(err.contains("region") || err.contains("companion"),
+            "error must name the orphaned field, got: {err}");
+    }
+
+    #[test]
+    fn storage_no_shorthand_is_noop() {
+        // A storage section with only the canonical `backend:` must not
+        // be modified by normalize. This is the hot path for legacy
+        // configs.
+        let original = StorageSection {
+            backend: BackendConfig::Filesystem {
+                path: "/data".into(),
+            },
+            ..Default::default()
+        };
+        let mut storage = original.clone();
+        storage.normalize().unwrap();
+        assert_eq!(storage, original);
     }
 }
