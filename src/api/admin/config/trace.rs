@@ -36,6 +36,11 @@ pub struct TraceRequest {
     /// middleware's Authorization-header-or-presigned-query detection.
     #[serde(default)]
     pub authenticated: bool,
+    /// Synthetic source IP. When `None`, operator-authored source_ip
+    /// predicates evaluate false (fail-closed policy). Accepts any
+    /// string parseable as an `IpAddr` (`"203.0.113.5"`, `"2001:db8::1"`).
+    #[serde(default)]
+    pub source_ip: Option<std::net::IpAddr>,
 }
 
 #[derive(Serialize)]
@@ -110,6 +115,7 @@ pub async fn trace_config(
         key: key.as_deref(),
         list_prefix: list_prefix.as_deref(),
         authenticated: body.authenticated,
+        source_ip: body.source_ip,
     };
 
     let decision = crate::admission::evaluate(&chain, &req_info);

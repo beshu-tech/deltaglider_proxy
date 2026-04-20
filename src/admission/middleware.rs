@@ -1,12 +1,17 @@
 //! Axum middleware that evaluates the admission chain and annotates the
 //! request with the decision for downstream layers.
 //!
-//! Runs **before** SigV4. Today its only observable effect is inserting
-//! [`AdmissionDecisionMarker`] into request extensions; a future variant
-//! will return `403`/`429` responses directly when the chain produces a
-//! `Deny`/`RateLimit` decision. Keeping that logic in the middleware
-//! (rather than in SigV4) is what lets the later actions short-circuit
-//! SigV4 entirely.
+//! Runs **before** SigV4. Phase 3b.2.b expanded responsibilities:
+//!
+//! - `AllowAnonymous` decisions insert [`AdmissionAllowAnonymous`] into
+//!   request extensions so SigV4 can skip verification and continue as
+//!   the `$anonymous` principal.
+//! - `Deny` decisions short-circuit with **403 Forbidden** and an audit
+//!   log line naming the matched block. SigV4 never runs.
+//! - `Reject` decisions short-circuit with the operator-configured
+//!   status + body. SigV4 never runs.
+//! - `Continue` decisions (matched or default-terminal) fall through to
+//!   the existing SigV4 middleware.
 //!
 //! ## Why a request-extension marker
 //!
@@ -20,9 +25,9 @@
 
 use super::{evaluator::RequestInfo, AdmissionChain, Decision, SharedAdmissionChain};
 use axum::body::Body;
-use axum::http::Request;
+use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 
 /// Marker inserted into request extensions when the chain produces
 /// `AllowAnonymous`. SigV4 middleware looks for this marker and, when
@@ -73,9 +78,59 @@ pub async fn admission_middleware(mut request: Request<Body>, next: Next) -> Res
         Decision::Continue { .. } => {
             // Fall through to SigV4 — no extension inserted.
         }
+        Decision::Deny { matched } => {
+            // Short-circuit with 403. Audit log line gives operators the
+            // block name + request context so they can trace denied
+            // requests back to the rule that fired.
+            tracing::warn!(
+                target: "deltaglider_proxy::admission",
+                block = %matched,
+                method = %owned.method,
+                bucket = %owned.bucket,
+                source_ip = ?owned.source_ip,
+                "[admission] DENY matched block `{}`",
+                matched
+            );
+            return s3_style_error(
+                StatusCode::FORBIDDEN,
+                "AccessDenied",
+                &format!("admission-deny:{}", matched),
+            );
+        }
+        Decision::Reject { matched, status, message } => {
+            let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            tracing::warn!(
+                target: "deltaglider_proxy::admission",
+                block = %matched,
+                status = status,
+                "[admission] REJECT matched block `{}` → {}",
+                matched,
+                status
+            );
+            // Custom status + body. Unlike Deny, the operator controls
+            // the HTTP shape — typically used for maintenance-mode pages
+            // or rate-exceeded responses.
+            return (code, message.unwrap_or_default()).into_response();
+        }
     }
 
     next.run(request).await
+}
+
+/// S3-style XML error response used for admission `Deny` decisions.
+/// Matches the shape clients already expect from SigV4 / IAM
+/// rejections so integration tooling doesn't need a special case.
+fn s3_style_error(status: StatusCode, code: &str, message: &str) -> Response {
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <Error><Code>{code}</Code><Message>{message}</Message></Error>"
+    );
+    let mut resp = (status, body).into_response();
+    resp.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/xml"),
+    );
+    resp
 }
 
 /// Parse the request into the shape the evaluator consumes. Extracted so
@@ -86,6 +141,12 @@ pub async fn admission_middleware(mut request: Request<Body>, next: Next) -> Res
 /// Bucket and key parsing mirrors the logic the old inline SigV4 bypass
 /// used (`trim_start_matches('/')` + `split_once('/')`), so the admission
 /// chain sees exactly what that code did.
+///
+/// Source IP comes from the same extractor the rate limiter uses
+/// (`rate_limiter::extract_client_ip`) — honors `DGP_TRUST_PROXY_HEADERS`
+/// for X-Forwarded-For / X-Real-IP, falls back to `ConnectInfo` when
+/// wired through. Admission's policy on missing IP is documented on
+/// [`RequestInfo::source_ip`]: fail-closed.
 fn extract_request_info(request: &Request<Body>) -> OwnedRequestInfo {
     let method = request.method().as_str();
     let raw_path = request.uri().path();
@@ -110,12 +171,21 @@ fn extract_request_info(request: &Request<Body>) -> OwnedRequestInfo {
     let authenticated =
         request.headers().contains_key("authorization") || has_presigned_query_params(query_string);
 
+    // Extract source IP via the same trust-proxy-headers helper the rate
+    // limiter uses. Also try axum ConnectInfo when wired.
+    let source_ip = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip())
+        .or_else(|| crate::rate_limiter::extract_client_ip(request.headers()));
+
     OwnedRequestInfo {
         method: method.to_string(),
         bucket: bucket_lower,
         key: key_str,
         list_prefix,
         authenticated,
+        source_ip,
     }
 }
 
@@ -128,6 +198,7 @@ struct OwnedRequestInfo {
     key: String,
     list_prefix: String,
     authenticated: bool,
+    source_ip: Option<std::net::IpAddr>,
 }
 
 impl OwnedRequestInfo {
@@ -146,6 +217,7 @@ impl OwnedRequestInfo {
                 Some(&self.list_prefix)
             },
             authenticated: self.authenticated,
+            source_ip: self.source_ip,
         }
     }
 }
@@ -199,6 +271,7 @@ mod tests {
             key: "k".into(),
             list_prefix: String::new(),
             authenticated: false,
+            source_ip: None,
         };
         let info = owned.as_ref();
         assert_eq!(info.method, "GET");
@@ -214,6 +287,7 @@ mod tests {
             key: String::new(),
             list_prefix: "p/".into(),
             authenticated: true,
+            source_ip: None,
         };
         let info = owned.as_ref();
         assert_eq!(info.key, None);

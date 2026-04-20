@@ -20,6 +20,8 @@ serde_yaml = "0.9"
 schemars = "0.8"
 # IP + CIDR parsing for admission block source_ip_list authoring.
 ipnet = { version = "2.11", features = ["serde"] }
+# Glob patterns for admission block path_glob matcher.
+globset = "0.4"
 
 # AWS S3 SDK (for backend storage) — direct client config, no aws-config/STS bloat
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }

@@ -83,11 +83,17 @@ pub struct AdmissionBlock {
     pub action: Action,
 }
 
-/// Predicate side of an admission block. Phase 2 ships exactly one
-/// variant. Future variants (IP denylist, method/path globs, maintenance
-/// mode) are additive — when they land, existing match sites should pick
-/// them up via a wildcard arm, so the evaluator can evolve without
-/// retrofitting every caller.
+/// Predicate side of an admission block. Two variants today:
+///
+/// - [`Match::PublicPrefixGrant`] — synthesised from bucket policies
+///   (Phase 2 behavior, unchanged).
+/// - [`Match::Predicates`] — operator-authored compound predicate, the
+///   AND of every `Some(_)` field. Phase 3b.2.b compiles
+///   [`crate::admission::MatchSpec`] into this at chain-build time.
+///
+/// The evaluator dispatches both via explicit arms — no wildcard,
+/// because adding variants should force reviewers to look at every
+/// matching site.
 #[derive(Debug, Clone)]
 pub enum Match {
     /// "Does this request target a publicly-readable location on the named
@@ -96,19 +102,46 @@ pub enum Match {
     /// [`PublicPrefixSnapshot`] — the admission chain delegates to that
     /// data structure so the overlap semantics stay in one place.
     PublicPrefixGrant { bucket: String },
+
+    /// Compound predicate authored by the operator. All populated
+    /// fields are AND'd together — the block fires only when every
+    /// predicate matches the request.
+    Predicates(Predicates),
 }
 
-/// Decision side of an admission block. Phase 2 only emits
-/// [`Action::AllowAnonymous`] (from synthesised public-prefix blocks) and
-/// [`Action::Continue`] (explicit fall-through, or the implicit default
-/// when nothing matched).
+/// Compiled form of [`crate::admission::MatchSpec`]. Immutable after
+/// chain build; the evaluator only reads.
+#[derive(Debug, Clone, Default)]
+pub struct Predicates {
+    /// Allowed HTTP methods (uppercased). `None` = any method.
+    pub methods: Option<Vec<String>>,
+    /// Networks the source IP must fall within. `None` = any IP.
+    /// Bare IPs on the wire were promoted to `/32` / `/128` during
+    /// parse, so the runtime uniformly treats everything as a CIDR.
+    pub source_networks: Option<Vec<ipnet::IpNet>>,
+    /// Bucket the request targets (lowercased). `None` = any bucket.
+    pub bucket: Option<String>,
+    /// Glob-style pattern matched against the full object key.
+    /// Pre-compiled at chain-build time.
+    pub path_glob: Option<globset::GlobMatcher>,
+    /// Fire only on authenticated / unauthenticated requests. `None`
+    /// = either.
+    pub authenticated: Option<bool>,
+    /// Reserved for a future `config_flag` predicate — Phase 3b.2.b
+    /// carries the name but always evaluates false until a flag
+    /// registry exists. Warn is logged at build time.
+    pub config_flag: Option<String>,
+}
+
+/// Decision side of an admission block.
 ///
-/// Future phases will add operator-authored variants — `deny`,
-/// `rate-limit`, `reject` with a custom status — at which point the
-/// evaluator grows arms for them. The serde attributes here (`tag =
-/// "action"`, `rename_all = "kebab-case"`) are chosen so that YAML like
-/// `action: allow-anonymous` deserialises the same way before and after
-/// the enum grows.
+/// - [`Action::AllowAnonymous`] / [`Action::Continue`] — Phase 2
+///   behaviour, unchanged.
+/// - [`Action::Deny`] — new in Phase 3b.2.b. Short-circuits the
+///   middleware with 403 Forbidden, no SigV4 verification.
+/// - [`Action::Reject`] — new in Phase 3b.2.b. Short-circuits with a
+///   custom 4xx/5xx status and optional body. Intended for
+///   maintenance pages and rate-exceed responses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "action")]
 pub enum Action {
@@ -120,6 +153,16 @@ pub enum Action {
     /// action and covers the common case of "no special admission rule
     /// fired — let SigV4 decide".
     Continue,
+    /// Short-circuit with 403 Forbidden. No SigV4 verification runs.
+    Deny,
+    /// Short-circuit with a custom HTTP status + body. Status must be
+    /// 4xx or 5xx (validated at parse time in
+    /// [`crate::admission::ActionSpec::validate`]).
+    Reject {
+        status: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
 }
 
 /// Result of evaluating the chain against a request. The evaluator always
@@ -135,10 +178,23 @@ pub enum Decision {
     },
     /// The request should proceed to authentication. `matched` is `None`
     /// when the default-terminal case applied and `Some(name)` when an
-    /// operator-defined `Continue` block fired (Phase 3+).
+    /// operator-defined `Continue` block fired.
     Continue {
         #[serde(skip_serializing_if = "Option::is_none")]
         matched: Option<String>,
+    },
+    /// The request is denied — middleware returns 403 without calling
+    /// SigV4. `matched` names the block for logs/trace output.
+    Deny {
+        matched: String,
+    },
+    /// The request is rejected with a custom HTTP status + optional
+    /// body. Middleware returns this directly.
+    Reject {
+        matched: String,
+        status: u16,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
     },
 }
 
@@ -159,23 +215,54 @@ impl AdmissionChain {
     }
 
     /// Build a chain from live bucket policies AND operator-authored
-    /// admission blocks (Phase 3b.2.a schema surface).
+    /// admission blocks (Phase 3b.2.b live dispatch).
     ///
-    /// **Phase 3b.2.a behavior:** operator-authored blocks are NOT yet
-    /// dispatched by the evaluator — the only runtime-recognised block
-    /// is still [`Match::PublicPrefixGrant`] / [`Action::AllowAnonymous`].
-    /// When `operator_blocks` is non-empty, a loud `tracing::warn!` fires
-    /// at every chain build so operators don't silently ship inert `deny`
-    /// / `reject` blocks into production. The warn includes the block
-    /// names + count so it's actionable in logs.
+    /// Order semantics:
     ///
-    /// Phase 3b.2.b will replace the warn with real dispatch.
+    /// 1. Operator-authored blocks fire FIRST (RRR order within the
+    ///    operator's list).
+    /// 2. Synthesised `public-prefix:*` blocks follow.
+    ///
+    /// This ordering is deliberate: operator-authored `deny` rules
+    /// (e.g. known-bad IP blocklists) must short-circuit before any
+    /// `allow-anonymous` grant; operators who want public access to
+    /// override a deny can move their allow block further down or
+    /// express the intent directly.
+    ///
+    /// Blocks whose compilation fails (bad glob, unknown config_flag)
+    /// are SKIPPED with a `tracing::warn!` naming the block; the rest
+    /// of the chain still loads. Rationale: a single typo in one block
+    /// should not break the entire chain and take the server down —
+    /// validation already runs at config load time, so getting here
+    /// with a compile error is a rare edge case.
     pub fn from_config_parts(
         buckets: &std::collections::BTreeMap<String, crate::bucket_policy::BucketPolicyConfig>,
         operator_blocks: &[crate::admission::AdmissionBlockSpec],
     ) -> Self {
         let snapshot = PublicPrefixSnapshot::from_config(buckets);
-        let mut blocks: Vec<AdmissionBlock> = buckets
+
+        // 1. Operator-authored blocks (compile → runtime form).
+        let mut blocks: Vec<AdmissionBlock> = operator_blocks
+            .iter()
+            .filter_map(|spec| match compile_block(spec) {
+                Ok(block) => Some(block),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "deltaglider_proxy::admission",
+                        block = %spec.name,
+                        error = %e,
+                        "[admission] skipping block `{}` — compile error: {}",
+                        spec.name,
+                        e
+                    );
+                    None
+                }
+            })
+            .collect();
+
+        // 2. Synthesised public-prefix blocks, sorted by bucket name for
+        //    deterministic trace output.
+        let mut synthesised: Vec<AdmissionBlock> = buckets
             .iter()
             .filter(|(_, policy)| !policy.public_prefixes.is_empty())
             .map(|(name, _)| AdmissionBlock {
@@ -186,28 +273,8 @@ impl AdmissionChain {
                 action: Action::AllowAnonymous,
             })
             .collect();
-        // BTreeMap already yields sorted keys; the sort is a belt-and-braces
-        // guarantee against a future change to the map type.
-        blocks.sort_by(|a, b| a.name.cmp(&b.name));
-
-        if !operator_blocks.is_empty() {
-            // Collect names for the warn so operators can grep logs and
-            // know EXACTLY which rules are inert. The alternative —
-            // logging just a count — lets silent-breach scenarios hide
-            // in a "N blocks inert" message that nobody investigates.
-            let names: Vec<&str> =
-                operator_blocks.iter().map(|b| b.name.as_str()).collect();
-            tracing::warn!(
-                target: "deltaglider_proxy::admission",
-                count = operator_blocks.len(),
-                names = ?names,
-                "[admission] {} operator-authored block(s) are INERT in this build — \
-                 Phase 3b.2.a ships the YAML schema only; the evaluator does not yet \
-                 dispatch deny/reject/custom-match blocks. Upgrade to the Phase 3b.2.b \
-                 release before relying on these rules for access control.",
-                operator_blocks.len()
-            );
-        }
+        synthesised.sort_by(|a, b| a.name.cmp(&b.name));
+        blocks.extend(synthesised);
 
         Self {
             blocks,
@@ -227,6 +294,107 @@ impl AdmissionChain {
     pub fn public_prefixes(&self) -> &std::sync::Arc<PublicPrefixSnapshot> {
         &self.public_prefixes
     }
+}
+
+/// Compile an [`crate::admission::AdmissionBlockSpec`] into its runtime
+/// form. Returns an error when a glob or config_flag is malformed —
+/// those are reported but don't kill the whole chain (see
+/// [`AdmissionChain::from_config_parts`]).
+fn compile_block(
+    spec: &crate::admission::AdmissionBlockSpec,
+) -> Result<AdmissionBlock, String> {
+    use crate::admission::spec as specmod;
+
+    let predicates = Predicates {
+        methods: spec.match_.method.as_ref().map(|ms| {
+            ms.iter().map(|m| m.to_ascii_uppercase()).collect()
+        }),
+        source_networks: {
+            // The spec supports EITHER `source_ip` (single) OR
+            // `source_ip_list` (many). Validation already ran at
+            // config-load time, so we assume at most one is set. If both
+            // somehow arrive here, prefer the list form and warn.
+            match (&spec.match_.source_ip, &spec.match_.source_ip_list) {
+                (Some(_), Some(_)) => {
+                    tracing::warn!(
+                        target: "deltaglider_proxy::admission",
+                        block = %spec.name,
+                        "[admission] block `{}` has both source_ip and source_ip_list — \
+                         using source_ip_list (validation should have caught this at \
+                         config load)",
+                        spec.name
+                    );
+                    Some(spec.match_.source_ip_list.as_ref().unwrap()
+                        .iter()
+                        .map(|e| e.net)
+                        .collect())
+                }
+                (Some(addr), None) => {
+                    let net = match addr {
+                        std::net::IpAddr::V4(v4) => {
+                            ipnet::IpNet::V4(ipnet::Ipv4Net::new(*v4, 32).unwrap())
+                        }
+                        std::net::IpAddr::V6(v6) => {
+                            ipnet::IpNet::V6(ipnet::Ipv6Net::new(*v6, 128).unwrap())
+                        }
+                    };
+                    Some(vec![net])
+                }
+                (None, Some(list)) => {
+                    Some(list.iter().map(|e| e.net).collect())
+                }
+                (None, None) => None,
+            }
+        },
+        bucket: spec.match_.bucket.as_ref().map(|b| b.to_ascii_lowercase()),
+        path_glob: match &spec.match_.path_glob {
+            Some(glob_str) => Some(
+                globset::Glob::new(glob_str)
+                    .map_err(|e| format!("invalid path_glob `{}`: {}", glob_str, e))?
+                    .compile_matcher(),
+            ),
+            None => None,
+        },
+        authenticated: spec.match_.authenticated,
+        config_flag: spec.match_.config_flag.clone(),
+    };
+
+    let action = match &spec.action {
+        specmod::ActionSpec::Simple(specmod::SimpleAction::AllowAnonymous) => {
+            Action::AllowAnonymous
+        }
+        specmod::ActionSpec::Simple(specmod::SimpleAction::Deny) => Action::Deny,
+        specmod::ActionSpec::Simple(specmod::SimpleAction::Continue) => Action::Continue,
+        specmod::ActionSpec::Tagged(specmod::TaggedAction::Reject { status, message }) => {
+            Action::Reject {
+                status: *status,
+                message: message.clone(),
+            }
+        }
+    };
+
+    // Warn on unknown config_flag — validates Phase 3b.2.b's remaining
+    // schema gap (adversarial review M1). Phase 3b.2.c will maintain
+    // a real flag registry.
+    if let Some(flag) = &predicates.config_flag {
+        if flag != "maintenance_mode" {
+            tracing::warn!(
+                target: "deltaglider_proxy::admission",
+                block = %spec.name,
+                config_flag = %flag,
+                "[admission] block `{}` references unknown config_flag `{}` — the predicate \
+                 will always evaluate false. Currently known flags: [maintenance_mode].",
+                spec.name,
+                flag
+            );
+        }
+    }
+
+    Ok(AdmissionBlock {
+        name: spec.name.clone(),
+        match_: Match::Predicates(predicates),
+        action,
+    })
 }
 
 /// Hot-swappable shared handle. Readers clone the inner `Arc` lock-free
@@ -316,6 +484,7 @@ mod tests {
             Match::PublicPrefixGrant { bucket } => {
                 assert_eq!(bucket, "mixedcase");
             }
+            Match::Predicates(_) => panic!("expected PublicPrefixGrant, got Predicates"),
         }
     }
 }

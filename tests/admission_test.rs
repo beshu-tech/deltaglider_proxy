@@ -303,3 +303,387 @@ async fn test_trace_parses_path_components_same_as_middleware() {
     assert_eq!(trace["resolved"]["key"], "deep/path/file name.txt");
     assert_eq!(trace["admission"]["decision"], "allow-anonymous");
 }
+
+// ═══════════════════════════════════════════════════
+// Phase 3b.2.b — operator-authored block dispatch
+// ═══════════════════════════════════════════════════
+
+/// Apply an admission YAML block to a running server and verify the
+/// trace endpoint reports the resulting decision. Exercises the full
+/// pipeline: `/apply` → spec→runtime compile → chain rebuild → trace.
+///
+/// The server's existing config (backend path, credentials) must be
+/// preserved — the engine rebuilds on every apply, so a bare admission
+/// YAML would try to spin up a default filesystem backend that doesn't
+/// match the test's tempdir. We fetch the canonical export, splice the
+/// operator's admission section in, and apply the merged document.
+async fn apply_admission_yaml(
+    admin: &reqwest::Client,
+    endpoint: &str,
+    admission_yaml_fragment: &str,
+) {
+    // Fetch the existing config as the base.
+    let base_yaml: String = admin
+        .get(format!("{}/_/api/admin/config/export", endpoint))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    // Parse the fragment for its `admission:` section, then splice.
+    let fragment: serde_yaml::Value = serde_yaml::from_str(admission_yaml_fragment).unwrap();
+    let frag_admission = fragment
+        .get("admission")
+        .cloned()
+        .expect("fragment must have an `admission:` top-level key");
+
+    let mut base: serde_yaml::Value = serde_yaml::from_str(&base_yaml).unwrap_or(
+        serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+    );
+    let root = base
+        .as_mapping_mut()
+        .expect("base config must be a mapping");
+    root.insert("admission".into(), frag_admission);
+    let merged = serde_yaml::to_string(&base).unwrap();
+
+    let resp = admin
+        .post(format!("{}/_/api/admin/config/apply", endpoint))
+        .json(&json!({ "yaml": merged }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "apply must succeed, got status {status}, body: {text}"
+    );
+}
+
+#[tokio::test]
+async fn test_operator_deny_block_produces_deny_decision() {
+    let server = TestServer::builder()
+        .auth("DENYK1", "DENYS1")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    apply_admission_yaml(
+        &admin,
+        &server.endpoint(),
+        r#"
+admission:
+  blocks:
+    - name: deny-bad-ips
+      match:
+        source_ip_list:
+          - "203.0.113.0/24"
+      action: deny
+"#,
+    )
+    .await;
+
+    // Trace from a blocked IP.
+    let trace: serde_json::Value = admin
+        .post(format!("{}/_/api/admin/config/trace", server.endpoint()))
+        .json(&json!({
+            "method": "GET",
+            "path": "/any-bucket/any-key",
+            "authenticated": false,
+            "source_ip": "203.0.113.42"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(trace["admission"]["decision"], "deny");
+    assert_eq!(trace["admission"]["matched"], "deny-bad-ips");
+
+    // Trace from an IP outside the blocked range — not denied.
+    let trace: serde_json::Value = admin
+        .post(format!("{}/_/api/admin/config/trace", server.endpoint()))
+        .json(&json!({
+            "method": "GET",
+            "path": "/any-bucket/any-key",
+            "authenticated": false,
+            "source_ip": "198.51.100.1"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(trace["admission"]["decision"], "continue");
+}
+
+#[tokio::test]
+async fn test_operator_reject_block_produces_reject_with_status() {
+    let server = TestServer::builder()
+        .auth("REJK1", "REJS1")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    apply_admission_yaml(
+        &admin,
+        &server.endpoint(),
+        r#"
+admission:
+  blocks:
+    - name: maint-reject
+      match: {}
+      action:
+        type: reject
+        status: 503
+        message: "maintenance underway"
+"#,
+    )
+    .await;
+
+    let trace: serde_json::Value = admin
+        .post(format!("{}/_/api/admin/config/trace", server.endpoint()))
+        .json(&json!({
+            "method": "GET",
+            "path": "/b/k",
+            "authenticated": false
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(trace["admission"]["decision"], "reject");
+    assert_eq!(trace["admission"]["matched"], "maint-reject");
+    assert_eq!(trace["admission"]["status"], 503);
+    assert_eq!(trace["admission"]["message"], "maintenance underway");
+}
+
+#[tokio::test]
+async fn test_operator_deny_short_circuits_live_s3_path() {
+    // End-to-end dispatch check: an operator-authored deny block must
+    // stop a live S3 request at the admission middleware — 403 with no
+    // SigV4 attempt. We don't have easy ConnectInfo wiring, but
+    // DGP_TRUST_PROXY_HEADERS=true makes the rate-limiter's
+    // `extract_client_ip` honor X-Forwarded-For, which admission reuses.
+    //
+    // Because the test server won't have that env set, this test
+    // exercises the path_glob + authenticated predicates instead — they
+    // don't need source_ip to fire.
+    let server = TestServer::builder()
+        .auth("DENYLK", "DENYLS")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    apply_admission_yaml(
+        &admin,
+        &server.endpoint(),
+        r#"
+admission:
+  blocks:
+    - name: block-unauth-put
+      match:
+        method: [PUT, POST, DELETE]
+        authenticated: false
+      action: deny
+"#,
+    )
+    .await;
+
+    // Hit an unauthenticated PUT on an arbitrary bucket/key. The
+    // admission middleware should return 403 before SigV4 runs.
+    let resp = reqwest::Client::new()
+        .put(format!("{}/testbkt/somekey", server.endpoint()))
+        .body(b"some data".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "unauthenticated PUT must be denied by admission"
+    );
+    // Body is the S3-style XML error shape.
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("AccessDenied"),
+        "expected S3 AccessDenied XML, got: {body}"
+    );
+    assert!(
+        body.contains("admission-deny:block-unauth-put"),
+        "error message must name the matched block: {body}"
+    );
+}
+
+#[tokio::test]
+async fn test_operator_reject_short_circuits_live_s3_path() {
+    let server = TestServer::builder()
+        .auth("REJLK", "REJLS")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    apply_admission_yaml(
+        &admin,
+        &server.endpoint(),
+        r#"
+admission:
+  blocks:
+    - name: maint
+      match: {}
+      action:
+        type: reject
+        status: 503
+        message: "maintenance window"
+"#,
+    )
+    .await;
+
+    // Any request — authenticated or not — should bounce with 503.
+    let resp = reqwest::Client::new()
+        .get(format!("{}/any-bucket/any-key", server.endpoint()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = resp.text().await.unwrap();
+    assert_eq!(body, "maintenance window");
+}
+
+#[tokio::test]
+async fn test_operator_path_glob_predicate_via_trace() {
+    let server = TestServer::builder()
+        .auth("PGK1", "PGS1")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    apply_admission_yaml(
+        &admin,
+        &server.endpoint(),
+        r#"
+admission:
+  blocks:
+    - name: allow-public-zips
+      match:
+        method: [GET, HEAD]
+        bucket: releases
+        path_glob: "*.zip"
+      action: allow-anonymous
+"#,
+    )
+    .await;
+
+    // Matches the glob → allow-anonymous.
+    let trace: serde_json::Value = admin
+        .post(format!("{}/_/api/admin/config/trace", server.endpoint()))
+        .json(&json!({
+            "method": "GET",
+            "path": "/releases/v1.zip",
+            "authenticated": false
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(trace["admission"]["decision"], "allow-anonymous");
+
+    // Doesn't match the glob → continue.
+    let trace: serde_json::Value = admin
+        .post(format!("{}/_/api/admin/config/trace", server.endpoint()))
+        .json(&json!({
+            "method": "GET",
+            "path": "/releases/v1.tar.gz",
+            "authenticated": false
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(trace["admission"]["decision"], "continue");
+}
+
+#[tokio::test]
+async fn test_admission_blocks_roundtrip_through_export_apply() {
+    // GitOps dogfood for Phase 3b.2.b: apply a block, export the
+    // canonical YAML, re-apply it, trace once more — behavior
+    // unchanged on the second apply.
+    let server = TestServer::builder()
+        .auth("RTK1", "RTS1")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    let original_yaml = r#"
+admission:
+  blocks:
+    - name: deny-bad
+      match:
+        source_ip_list: ["203.0.113.5"]
+      action: deny
+"#;
+
+    apply_admission_yaml(&admin, &server.endpoint(), original_yaml).await;
+
+    // Export and verify the block survived.
+    let exported: String = admin
+        .get(format!("{}/_/api/admin/config/export", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        exported.contains("deny-bad"),
+        "exported YAML must contain the operator block: {exported}"
+    );
+    assert!(
+        exported.contains("203.0.113.5"),
+        "exported YAML must preserve the IP: {exported}"
+    );
+
+    // Re-apply the full export verbatim — must succeed (idempotent).
+    // Note: we POST `exported` directly here (not through the
+    // apply_admission_yaml splicer) because the export is already the
+    // full, merged config.
+    let resp = admin
+        .post(format!(
+            "{}/_/api/admin/config/apply",
+            server.endpoint()
+        ))
+        .json(&json!({ "yaml": exported }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Trace: decision still the same.
+    let trace: serde_json::Value = admin
+        .post(format!("{}/_/api/admin/config/trace", server.endpoint()))
+        .json(&json!({
+            "method": "GET",
+            "path": "/any/any",
+            "authenticated": false,
+            "source_ip": "203.0.113.5"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(trace["admission"]["decision"], "deny");
+    assert_eq!(trace["admission"]["matched"], "deny-bad");
+}
