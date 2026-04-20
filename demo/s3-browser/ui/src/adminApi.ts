@@ -63,7 +63,32 @@ export interface AdminConfig {
   // Sync
   config_sync_bucket: string | null;
   // Per-bucket policies
-  bucket_policies: Record<string, { compression?: boolean; max_delta_ratio?: number; backend?: string; alias?: string; public_prefixes?: string[]; quota_bytes?: number }>;
+  bucket_policies: Record<
+    string,
+    {
+      compression?: boolean;
+      max_delta_ratio?: number;
+      backend?: string;
+      alias?: string;
+      /**
+       * Key prefixes with anonymous read access. The canonical
+       * "entire bucket is public" representation is a single empty
+       * string `[""]` — the PublicPrefixSnapshot treats the empty
+       * prefix as matching every key. Round-trips to/from `public: true`
+       * via the backend's `BucketPolicyConfig::normalize` /
+       * `collapse_to_shorthand`.
+       */
+      public_prefixes?: string[];
+      /**
+       * Shorthand form (Phase 3b.1): `public: true` expands to
+       * `public_prefixes: [""]` server-side. The admin API accepts
+       * either form on PATCH; responses always carry the expanded
+       * form so the UI doesn't need to handle both at display time.
+       */
+      public?: boolean;
+      quota_bytes?: number;
+    }
+  >;
   // Multi-backend
   backends: BackendInfo[];
   default_backend: string | null;

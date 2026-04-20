@@ -93,12 +93,21 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
       const bp: Record<string, { compression?: boolean; max_delta_ratio?: number; backend?: string; alias?: string; public_prefixes?: string[] }> = {};
       for (const p of bucketPolicies) {
         if (!p.name) continue;
+        // Preserve the `[""]` sentinel (entire-bucket-public shorthand
+        // that the backend normalises to/from `public: true`). Only
+        // strip genuinely-empty-by-accident rows by checking whether
+        // the user left ANY prefix non-empty or stuck with the lone
+        // empty-string sentinel.
+        const prefixes = p.public_prefixes;
+        const isEntireBucket = prefixes.length === 1 && prefixes[0] === '';
+        const filtered = isEntireBucket ? [''] : prefixes.filter(s => s.length > 0);
+
         bp[p.name] = {
           compression: p.compression,
           ...(p.max_delta_ratio != null ? { max_delta_ratio: p.max_delta_ratio } : {}),
           ...(p.backend ? { backend: p.backend } : {}),
           ...(p.alias ? { alias: p.alias } : {}),
-          ...(p.public_prefixes.length > 0 ? { public_prefixes: p.public_prefixes.filter(s => s.length > 0) } : {}),
+          ...(filtered.length > 0 ? { public_prefixes: filtered } : {}),
           ...(p.quota_bytes != null ? { quota_bytes: p.quota_bytes } : {}),
         };
       }
