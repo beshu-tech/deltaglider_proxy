@@ -231,20 +231,40 @@ User decisions locked in via AskUserQuestion:
 >   toggle now works end-to-end), idempotent normalize, shorthand
 >   input validation (empty URL, missing scheme, `..` path
 >   components). T1 five-line acceptance example loads.
-> - **3b.2**: PENDING. Operator-authored admission blocks: populate
->   `AdmissionSection` with the serde wire format and extend the
->   evaluator with `Deny`, `RateLimit`, `Reject` action variants +
->   IP/method/path `Match` predicates. The five-block default chain
->   from the plan's scope.
+> - **3b.2.a**: ✅ DONE (commits `11561d0` / `5c85c4e`). Operator-authored
+>   admission block WIRE FORMAT: new `src/admission/spec.rs` module
+>   with `AdmissionBlockSpec`, `MatchSpec`, `ActionSpec`
+>   (Simple = allow-anonymous/deny/continue; Tagged = reject with
+>   status+message). `MatchSpec` carries method / source_ip /
+>   source_ip_list (IPs + CIDRs, promoted to `/32` or `/128`) /
+>   bucket / path_glob / authenticated / config_flag predicates.
+>   `deny_unknown_fields` everywhere; semantic validation (duplicate
+>   names, 4xx/5xx reject, conflicting source_ip forms) runs on
+>   every load path via `normalize_shorthands`. Round-trip preserves
+>   operator's `/32` vs bare IP. Blocks DESERIALIZE and round-trip
+>   cleanly through `/apply`+`/export` but are NOT yet dispatched by
+>   the evaluator — a loud startup warn fires so operators don't
+>   silently ship inert access-control rules into production.
+> - **3b.2.b**: PENDING. Wire operator-authored blocks through the
+>   evaluator + middleware. New `Match` runtime variants (IP CIDR,
+>   method, path-glob, bucket, authenticated, config_flag) + new
+>   `Action` variants (`Deny`, `Reject { status, message }`).
+>   Source-IP extraction via axum `ConnectInfo`. Middleware returns
+>   403/custom-status responses directly without reaching the SigV4
+>   layer. Remove the "blocks are inert" startup warn.
+> - **3b.2.c**: PENDING. RateLimit action variant wired to the
+>   existing `RateLimiter` keyed by IP / principal / IP+bucket. The
+>   five-block default chain from the plan's scope.
 > - **3c**: PENDING. `access.iam_mode: Gui | Declarative` + reconciler
 >   (`src/iam/reconciler.rs`) that sync-diffs DB ↔ YAML on apply.
 > - **3d**: PENDING. Group presets (`{ preset: admin | read-only | ... }`)
 >   expanding to built-in IAM policy documents.
 >
-> **Remaining opening moves for Phase 3b.2:**
-> 1. Extend the admission module to carry the variants Phase 2 deferred (`Deny`, `RateLimit`, `Reject`, plus the `Match` fields for IP/path/method). Write the 5-block default chain.
-> 2. Populate `AdmissionSection` with the serde-level wire format for those blocks; keep `deny_unknown_fields` on by construction.
-> 3. Wire the new evaluator variants through `/api/admin/config/trace`.
+> **Remaining opening moves for Phase 3b.2.b:**
+> 1. Extend runtime `Match` / `Action` enums in `src/admission/mod.rs` with the variants needed to honor operator-authored blocks. Keep arms explicit (no wildcard) so the compiler forces evaluator updates.
+> 2. Teach the evaluator (`src/admission/evaluator.rs`) to dispatch every new variant; extend `RequestInfo` with `source_ip: IpAddr` and `config_flag_is_set: impl Fn(&str) -> Option<bool>`.
+> 3. Axum middleware: plumb `ConnectInfo<SocketAddr>` through; return `403 Forbidden` for `Deny` and the operator's status+body for `Reject` directly from the middleware, short-circuiting SigV4.
+> 4. `/api/admin/config/trace` surfaces the new block + decision shapes.
 >
 > **Helpful artifact already in the repo**: `examples/scrape_full_config.rs`
 > emits a close approximation of the Phase 3 target YAML. As of 3a it
