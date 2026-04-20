@@ -155,6 +155,25 @@ impl AdmissionChain {
     pub fn from_bucket_config(
         buckets: &std::collections::BTreeMap<String, crate::bucket_policy::BucketPolicyConfig>,
     ) -> Self {
+        Self::from_config_parts(buckets, &[])
+    }
+
+    /// Build a chain from live bucket policies AND operator-authored
+    /// admission blocks (Phase 3b.2.a schema surface).
+    ///
+    /// **Phase 3b.2.a behavior:** operator-authored blocks are NOT yet
+    /// dispatched by the evaluator — the only runtime-recognised block
+    /// is still [`Match::PublicPrefixGrant`] / [`Action::AllowAnonymous`].
+    /// When `operator_blocks` is non-empty, a loud `tracing::warn!` fires
+    /// at every chain build so operators don't silently ship inert `deny`
+    /// / `reject` blocks into production. The warn includes the block
+    /// names + count so it's actionable in logs.
+    ///
+    /// Phase 3b.2.b will replace the warn with real dispatch.
+    pub fn from_config_parts(
+        buckets: &std::collections::BTreeMap<String, crate::bucket_policy::BucketPolicyConfig>,
+        operator_blocks: &[crate::admission::AdmissionBlockSpec],
+    ) -> Self {
         let snapshot = PublicPrefixSnapshot::from_config(buckets);
         let mut blocks: Vec<AdmissionBlock> = buckets
             .iter()
@@ -170,6 +189,26 @@ impl AdmissionChain {
         // BTreeMap already yields sorted keys; the sort is a belt-and-braces
         // guarantee against a future change to the map type.
         blocks.sort_by(|a, b| a.name.cmp(&b.name));
+
+        if !operator_blocks.is_empty() {
+            // Collect names for the warn so operators can grep logs and
+            // know EXACTLY which rules are inert. The alternative —
+            // logging just a count — lets silent-breach scenarios hide
+            // in a "N blocks inert" message that nobody investigates.
+            let names: Vec<&str> =
+                operator_blocks.iter().map(|b| b.name.as_str()).collect();
+            tracing::warn!(
+                target: "deltaglider_proxy::admission",
+                count = operator_blocks.len(),
+                names = ?names,
+                "[admission] {} operator-authored block(s) are INERT in this build — \
+                 Phase 3b.2.a ships the YAML schema only; the evaluator does not yet \
+                 dispatch deny/reject/custom-match blocks. Upgrade to the Phase 3b.2.b \
+                 release before relying on these rules for access control.",
+                operator_blocks.len()
+            );
+        }
+
         Self {
             blocks,
             public_prefixes: std::sync::Arc::new(snapshot),
@@ -197,11 +236,25 @@ pub type SharedAdmissionChain = std::sync::Arc<arc_swap::ArcSwap<AdmissionChain>
 
 /// Build a [`SharedAdmissionChain`] from a bucket-config map. Convenience
 /// wrapper used at startup and on every hot-reload site.
+///
+/// Deprecated in favor of [`build_shared_chain_from_parts`], which
+/// accepts operator-authored blocks too. Kept for any callers that
+/// predate Phase 3b.2.a.
 pub fn build_shared_chain(
     buckets: &std::collections::BTreeMap<String, crate::bucket_policy::BucketPolicyConfig>,
 ) -> SharedAdmissionChain {
+    build_shared_chain_from_parts(buckets, &[])
+}
+
+/// Build a [`SharedAdmissionChain`] from bucket policies AND
+/// operator-authored admission blocks. See [`AdmissionChain::from_config_parts`]
+/// for the Phase 3b.2.a behavior (warn-and-ignore until 3b.2.b lands).
+pub fn build_shared_chain_from_parts(
+    buckets: &std::collections::BTreeMap<String, crate::bucket_policy::BucketPolicyConfig>,
+    operator_blocks: &[crate::admission::AdmissionBlockSpec],
+) -> SharedAdmissionChain {
     std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(
-        AdmissionChain::from_bucket_config(buckets),
+        AdmissionChain::from_config_parts(buckets, operator_blocks),
     )))
 }
 

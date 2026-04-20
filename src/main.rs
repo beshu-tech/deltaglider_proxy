@@ -396,12 +396,17 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         )));
 
     // --- Admission chain (lock-free, hot-swappable) ---
-    // Derived from bucket config today; `build_shared_chain` wraps the
-    // resulting chain in the same `Arc<ArcSwap<_>>` shape as the public-
-    // prefix snapshot so hot-reload sites can reuse their existing swap
-    // pattern.
+    // Derived from bucket config + operator-authored admission blocks
+    // (Phase 3b.2.a schema surface). `build_shared_chain_from_parts`
+    // wraps the resulting chain in the same `Arc<ArcSwap<_>>` shape as
+    // the public-prefix snapshot so hot-reload sites reuse the swap
+    // pattern. Operator-authored blocks log a startup warn explaining
+    // they are inert until Phase 3b.2.b lands.
     let admission_chain: deltaglider_proxy::admission::SharedAdmissionChain =
-        deltaglider_proxy::admission::build_shared_chain(&config.buckets);
+        deltaglider_proxy::admission::build_shared_chain_from_parts(
+            &config.buckets,
+            &config.admission_blocks,
+        );
 
     // --- S3 router ---
     let app = build_s3_router(

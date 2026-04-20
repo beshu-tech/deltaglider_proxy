@@ -669,6 +669,11 @@ fn classify_shape(doc: &serde_yaml::Value) -> ConfigShape {
         "encryption_key",
         "tls",
         "buckets",
+        // Phase 3b.2.a: operator-authored admission blocks at the flat
+        // root. Both sectioned (`admission:`) and flat (`admission_blocks:`)
+        // forms exist for round-trip preservation; mixing them is
+        // operator error and the classifier catches it.
+        "admission_blocks",
     ];
 
     let mut flat_keys = Vec::new();
@@ -779,8 +784,10 @@ impl Config {
     /// deserialization, before the config is handed to any consumer.
     ///
     /// Phase 3b.1 normalises per-bucket `public: true` into
-    /// `public_prefixes: [""]`. Future shorthands (group presets,
-    /// storage shorthand) plug in here.
+    /// `public_prefixes: [""]`. Phase 3b.2.a runs semantic validation
+    /// on operator-authored admission blocks (duplicate names, bad
+    /// Reject status, conflicting source_ip forms). Future shorthands
+    /// (group presets, etc.) plug in here.
     ///
     /// Returns an error when a shorthand conflicts with its canonical
     /// form (e.g. `public: true` AND non-empty `public_prefixes:`). The
@@ -790,6 +797,18 @@ impl Config {
             policy
                 .normalize()
                 .map_err(|e| ConfigError::Parse(format!("bucket `{}`: {}", name, e)))?;
+        }
+        // Validate admission blocks on EVERY load path — the sectioned
+        // loader also calls `AdmissionSpec::validate` inside
+        // `into_flat`, but that bypasses flat-shape YAML and TOML.
+        // Running validation here (after both paths converge) closes
+        // the gap.
+        if !self.admission_blocks.is_empty() {
+            let spec = crate::admission::AdmissionSpec {
+                blocks: self.admission_blocks.clone(),
+            };
+            spec.validate()
+                .map_err(|e| ConfigError::Parse(format!("admission: {}", e)))?;
         }
         Ok(())
     }
@@ -2554,5 +2573,69 @@ admission:
             !exported.contains("admission:"),
             "empty admission must be omitted, got:\n{exported}"
         );
+    }
+
+    // ── Phase 3b.2.a hardening: flat-shape + classifier coverage ──────
+
+    #[test]
+    fn test_admission_blocks_flat_shape_also_validates() {
+        // H1 from adversarial review: the flat-shape load path must
+        // ALSO run AdmissionSpec::validate so duplicate names / bad
+        // reject status don't slip through.
+        let yaml = r#"
+listen_addr: "127.0.0.1:9000"
+admission_blocks:
+  - name: same
+    match: {}
+    action: deny
+  - name: same
+    match: {}
+    action: continue
+"#;
+        let err = Config::from_yaml_str(yaml)
+            .expect_err("duplicate block name on flat-shape path must fail");
+        assert!(
+            format!("{err}").contains("duplicate"),
+            "error must say duplicate, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_admission_blocks_flat_only_keys_coverage() {
+        // M2 from adversarial review: `admission_blocks:` at flat root
+        // is valid (flat shape preservation), but mixing it with the
+        // sectioned `admission:` must be rejected as a mixed doc.
+        let yaml = r#"
+admission_blocks:
+  - name: x
+    match: {}
+    action: continue
+admission:
+  blocks: []
+"#;
+        let err = Config::from_yaml_str(yaml)
+            .expect_err("mixed admission_blocks + admission must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("mix") || msg.contains("flat") || msg.contains("section"),
+            "error must explain the mixed-shape, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_admission_blocks_flat_shape_loads_without_sectioned_wrapper() {
+        // Flat-shape YAML with only `admission_blocks:` at root must
+        // parse without error (classifier routes to Flat because there
+        // are no section keys).
+        let yaml = r#"
+admission_blocks:
+  - name: deny-bad
+    match:
+      source_ip_list: ["203.0.113.5"]
+    action: deny
+"#;
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        assert_eq!(cfg.admission_blocks.len(), 1);
+        assert_eq!(cfg.admission_blocks[0].name, "deny-bad");
     }
 }

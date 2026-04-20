@@ -83,22 +83,28 @@ pub(super) async fn rebuild_engine(
 
 /// Rebuild every hot-swappable structure derived from bucket-level config.
 /// Today that's the public-prefix snapshot *and* the admission chain; both
-/// are derived from the same input data (`config.buckets`) and must stay
-/// in sync across config changes. Call this from every handler that
-/// mutates `state.config.buckets` — the helper exists to prevent one
-/// site from drifting behind the other as new derived snapshots are
-/// added (Phase 3 will add operator-defined admission blocks that still
-/// depend on this rebuild pathway).
+/// are derived from the same input data (`config.buckets` + admission
+/// blocks) and must stay in sync across config changes. Call this from
+/// every handler that mutates `state.config.buckets` or
+/// `state.config.admission_blocks` — the helper exists to prevent one
+/// site from drifting behind the other as new derived snapshots are added.
 pub(super) fn rebuild_bucket_derived_snapshots(
     state: &Arc<AdminState>,
     buckets: &std::collections::BTreeMap<String, crate::bucket_policy::BucketPolicyConfig>,
+    operator_blocks: &[crate::admission::AdmissionBlockSpec],
 ) {
     let new_prefix_snapshot = crate::bucket_policy::PublicPrefixSnapshot::from_config(buckets);
     state
         .public_prefix_snapshot
         .store(std::sync::Arc::new(new_prefix_snapshot));
 
-    let new_chain = crate::admission::AdmissionChain::from_bucket_config(buckets);
+    // Rebuild emits the Phase 3b.2.a "inert blocks" warn every time
+    // the config changes. That's intentional — operators who edit
+    // their admission blocks hot-reload hundreds of times in a
+    // GUI/GitOps session, and each edit gets the visibility reminder
+    // that the rules aren't yet enforced.
+    let new_chain =
+        crate::admission::AdmissionChain::from_config_parts(buckets, operator_blocks);
     state.admission_chain.store(std::sync::Arc::new(new_chain));
 }
 
@@ -233,10 +239,17 @@ pub(super) async fn apply_config_transition(
     }
 
     // 4. Bucket-derived snapshots — public prefix + admission chain.
-    //    Rebuild iff the bucket policy set changed; changing other fields
-    //    doesn't affect these.
-    if old_cfg.buckets != new_cfg.buckets {
-        rebuild_bucket_derived_snapshots(state, &new_cfg.buckets);
+    //    Rebuild iff the bucket policy set OR the operator-authored
+    //    admission blocks changed; changing other fields doesn't affect
+    //    these.
+    if old_cfg.buckets != new_cfg.buckets
+        || old_cfg.admission_blocks != new_cfg.admission_blocks
+    {
+        rebuild_bucket_derived_snapshots(
+            state,
+            &new_cfg.buckets,
+            &new_cfg.admission_blocks,
+        );
     }
 
     // 5. Restart-required fields. The values are applied to the config

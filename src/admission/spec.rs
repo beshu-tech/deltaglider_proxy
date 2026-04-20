@@ -141,18 +141,47 @@ pub struct MatchSpec {
 /// Source-IP entry accepting bare IPs and CIDRs. Parsed via a serde
 /// dance (string → either `IpAddr` or `IpNet`) so the operator's YAML
 /// reads naturally: `- 203.0.113.5` and `- 198.51.100.0/24` both work.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SourceIpEntry(pub IpNet);
+///
+/// The original string form is preserved so round-tripping through
+/// export → re-apply doesn't silently rewrite `203.0.113.5/32` to
+/// `203.0.113.5`. GitOps diffs flipping back and forth on every apply
+/// are a pattern that burns operator trust; we keep the operator's
+/// authored form verbatim and only compute `IpNet` for evaluator use.
+#[derive(Debug, Clone)]
+pub struct SourceIpEntry {
+    /// Parsed network (bare IPs promoted to /32 or /128 for uniform
+    /// evaluator dispatch). Public so Phase 3b.2.b's evaluator can
+    /// match against it directly.
+    pub net: IpNet,
+    /// Operator's authored string, re-emitted verbatim on serialize.
+    /// Preserves `/32` vs bare, case in IPv6, etc.
+    raw: String,
+}
+
+impl SourceIpEntry {
+    /// Construct from an `IpNet` with the canonical display form as
+    /// the `raw` source. Intended for programmatic callers (tests,
+    /// future GUI persistence); YAML deserialize preserves whatever
+    /// the operator wrote.
+    pub fn from_net(net: IpNet) -> Self {
+        Self {
+            net,
+            raw: net.to_string(),
+        }
+    }
+}
+
+impl PartialEq for SourceIpEntry {
+    fn eq(&self, other: &Self) -> bool {
+        // Semantic equality on the network; raw-string differences
+        // don't matter for "same block".
+        self.net == other.net
+    }
+}
 
 impl Serialize for SourceIpEntry {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        // Emit bare IPs without the /32 suffix to stay readable.
-        let s_string = match self.0 {
-            IpNet::V4(n) if n.prefix_len() == 32 => n.addr().to_string(),
-            IpNet::V6(n) if n.prefix_len() == 128 => n.addr().to_string(),
-            other => other.to_string(),
-        };
-        s.serialize_str(&s_string)
+        s.serialize_str(&self.raw)
     }
 }
 
@@ -161,14 +190,14 @@ impl<'de> Deserialize<'de> for SourceIpEntry {
         let raw = String::deserialize(d)?;
         // Try CIDR first; fall back to bare IP (promoted to /32 or /128).
         if let Ok(net) = raw.parse::<IpNet>() {
-            return Ok(SourceIpEntry(net));
+            return Ok(SourceIpEntry { net, raw });
         }
         if let Ok(addr) = raw.parse::<IpAddr>() {
             let net = match addr {
                 IpAddr::V4(v4) => IpNet::V4(ipnet::Ipv4Net::new(v4, 32).expect("32 is valid")),
                 IpAddr::V6(v6) => IpNet::V6(ipnet::Ipv6Net::new(v6, 128).expect("128 is valid")),
             };
-            return Ok(SourceIpEntry(net));
+            return Ok(SourceIpEntry { net, raw });
         }
         Err(serde::de::Error::custom(format!(
             "invalid IP or CIDR: `{}` (expected e.g. `203.0.113.5` or `198.51.100.0/24`)",
@@ -351,9 +380,9 @@ action: deny
         let ips = block.match_.source_ip_list.as_ref().unwrap();
         assert_eq!(ips.len(), 2);
         // Bare IP promoted to /32.
-        assert_eq!(ips[0].0.to_string(), "203.0.113.5/32");
+        assert_eq!(ips[0].net.to_string(), "203.0.113.5/32");
         // CIDR preserved.
-        assert_eq!(ips[1].0.to_string(), "198.51.100.0/24");
+        assert_eq!(ips[1].net.to_string(), "198.51.100.0/24");
     }
 
     #[test]
@@ -443,7 +472,7 @@ action:
     #[test]
     fn source_ip_entry_ipv6_parses() {
         let entry: SourceIpEntry = serde_yaml::from_str("\"2001:db8::1\"").unwrap();
-        assert_eq!(entry.0.to_string(), "2001:db8::1/128");
+        assert_eq!(entry.net.to_string(), "2001:db8::1/128");
     }
 
     #[test]
@@ -480,7 +509,7 @@ action:
                 AdmissionBlockSpec {
                     name: "deny-bad".into(),
                     match_: MatchSpec {
-                        source_ip_list: Some(vec![SourceIpEntry(
+                        source_ip_list: Some(vec![SourceIpEntry::from_net(
                             "203.0.113.0/24".parse().unwrap(),
                         )]),
                         ..Default::default()
@@ -533,5 +562,50 @@ action: deny
 "#;
         let err: Result<AdmissionBlockSpec, _> = serde_yaml::from_str(yaml);
         assert!(err.is_err(), "typo in match field must fail parse");
+    }
+
+    #[test]
+    fn source_ip_entry_preserves_explicit_slash_32() {
+        // H2 from adversarial review: an operator authoring
+        // `203.0.113.5/32` must NOT see it rewritten to `203.0.113.5`
+        // on the next export — GitOps diffs would flip back and
+        // forth on every apply.
+        let entry: SourceIpEntry = serde_yaml::from_str("\"203.0.113.5/32\"").unwrap();
+        let emitted = serde_yaml::to_string(&entry).unwrap();
+        assert!(
+            emitted.contains("203.0.113.5/32"),
+            "/32 must survive round-trip, got: {emitted}"
+        );
+    }
+
+    #[test]
+    fn source_ip_entry_preserves_bare_ip_verbatim() {
+        // Symmetric: bare IP stays bare on re-emit.
+        let entry: SourceIpEntry = serde_yaml::from_str("\"203.0.113.5\"").unwrap();
+        let emitted = serde_yaml::to_string(&entry).unwrap();
+        assert!(
+            emitted.contains("203.0.113.5") && !emitted.contains("/32"),
+            "bare IP must not gain a /32 suffix, got: {emitted}"
+        );
+    }
+
+    #[test]
+    fn source_ip_entry_from_net_emits_canonical() {
+        // Programmatic construction (tests, future GUI persistence)
+        // goes through the canonical display — the operator's authored
+        // form is the exception path.
+        let entry = SourceIpEntry::from_net("203.0.113.0/24".parse().unwrap());
+        let emitted = serde_yaml::to_string(&entry).unwrap();
+        assert!(emitted.contains("203.0.113.0/24"));
+    }
+
+    #[test]
+    fn source_ip_entry_equality_is_semantic() {
+        // Two entries authored differently but with the same underlying
+        // network must compare equal. The raw string only matters for
+        // round-trip diffing.
+        let a: SourceIpEntry = serde_yaml::from_str("\"203.0.113.5\"").unwrap();
+        let b: SourceIpEntry = serde_yaml::from_str("\"203.0.113.5/32\"").unwrap();
+        assert_eq!(a, b);
     }
 }
