@@ -199,24 +199,48 @@ User decisions locked in via AskUserQuestion:
 
 ### Phase 3 — Progressive-disclosure YAML schema (2 weeks)
 
-> **❌ STATUS: Not started — this is the critical next target**
+> **🟡 STATUS: Phase 3a DONE, Phase 3b/c/d still pending**
 >
-> Phase 3 blocks the remaining Phases 4 / 5 / 6. It's the largest
-> structural change but the rest of the programme cannot materially
-> advance without it.
+> Phase 3a (sectioned YAML serde boundary) landed in commits
+> `aeb128f` / `6d75ce6` / `b1f2f06`.
 >
-> **Opening moves, in order:**
-> 1. Reshape `Config` to expose `pub admission: Option<AdmissionChain>`, `pub access: AccessConfig`, `pub storage: StorageConfig`, `pub advanced: AdvancedConfig`. Use `#[serde(flatten)]` to keep the wire format (and therefore all existing Phase 0/1/2 tests) stable during the transition.
-> 2. Extend the admission module to carry the variants Phase 2 deferred (`Deny`, `RateLimit`, `Reject`, plus the `Match` fields for IP/path/method). Write the 5-block default chain.
-> 3. Add `src/config/sections/` with the new section types. Shorthand deserialisers for `storage` (single-backend inference + `public: true` → synthesised admission block).
-> 4. Implement `access.iam_mode: Gui | Declarative` + the reconciler (`src/iam/reconciler.rs`) that sync-diffs DB ↔ YAML on apply.
-> 5. Flesh out the admin-API: `/export?section=...` + `/export?resolve=true` (presets expanded) become implementable.
+> **What Phase 3a delivered:**
+> - New module `src/config_sections.rs` with `SectionedConfig` +
+>   `AdmissionSection` / `AccessSection` / `StorageSection` /
+>   `AdvancedSection`. All carry `#[serde(deny_unknown_fields)]` so
+>   typos inside a section surface as a hard parse error naming the
+>   offending field.
+> - `Config::from_yaml_str()` is now dual-shape via a tri-state
+>   `classify_shape()` returning `Sectioned | Flat | Mixed`. The
+>   `Mixed` variant is a hard error naming both the flat and the
+>   section key that collided — no silent merging of two shapes.
+> - `to_canonical_yaml()` always emits sectioned. Default-valued
+>   sections are omitted entirely (cleanest possible GitOps diff).
+>   Infra-secret redaction (bootstrap hash, encryption key) is
+>   preserved.
+> - The admin `/apply` endpoint routes through `from_yaml_str` so
+>   GitOps operators can POST either the legacy flat shape or the
+>   new sectioned shape, and export→apply is a verified no-op.
+>
+> **What Phase 3a deferred to later subphases:**
+> - **3b**: shorthand deserialisers (`storage: { s3: URL, ... }`,
+>   `storage: { filesystem: PATH, ... }`), `bucket: { public: true }`
+>   admission synthesis, populating `AdmissionSection.reserved`
+>   with operator-authored blocks.
+> - **3c**: `access.iam_mode: Gui | Declarative` + reconciler
+>   (`src/iam/reconciler.rs`) that sync-diffs DB ↔ YAML on apply.
+> - **3d**: group presets (`{ preset: admin | read-only | ... }`)
+>   expanding to built-in IAM policy documents.
+>
+> **Remaining opening moves for Phase 3b:**
+> 1. Extend the admission module to carry the variants Phase 2 deferred (`Deny`, `RateLimit`, `Reject`, plus the `Match` fields for IP/path/method). Write the 5-block default chain.
+> 2. Populate `AdmissionSection` with the serde-level wire format for those blocks; keep `deny_unknown_fields` on by construction.
+> 3. Shorthand storage deserialisers via `#[serde(untagged)]` wrappers.
 >
 > **Helpful artifact already in the repo**: `examples/scrape_full_config.rs`
-> emits a close approximation of the Phase 3 target YAML. It's not
-> wire-stable yet (the current `Config` struct doesn't parse it) but it
-> provides a living reference of the shape to aim for. Treat it as the
-> executable spec for this phase.
+> emits a close approximation of the Phase 3 target YAML. As of 3a it
+> is now wire-parseable by `Config::from_yaml_str` modulo the deferred
+> shorthand sugar — treat it as the executable spec.
 
 **Goal:** The 4-section YAML layout with shorthands, presets, and auto-implies is the canonical format. TOML still loads (deprecated).
 
