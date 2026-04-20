@@ -24,6 +24,98 @@ struct DemoAssets;
 /// so admin routes handle their own authentication (session cookies).
 pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
     // Admin API routes that require session authentication
+    // Phase 3c.2: split admin routes into "always-on" (config, session,
+    // backup-read, usage, diagnostics) and "iam-gated" (users / groups /
+    // ext-auth mutations / legacy migrate). The iam-gated subrouter
+    // layers `require_not_declarative` so every IAM mutation returns
+    // 403 when `access.iam_mode` is `Declarative`. Read routes on the
+    // same resources are intentionally NOT gated — the GUI must still
+    // be able to display DB state for diagnostics in declarative mode.
+    //
+    // Both subrouters share `require_session` at the outermost layer
+    // so the authentication invariant still applies uniformly.
+
+    let iam_gated = Router::new()
+        // IAM user management — POST/PUT/DELETE are gated.
+        .route(
+            "/_/api/admin/users",
+            get(admin::list_users).post(admin::create_user),
+        )
+        .route(
+            "/_/api/admin/users/:id",
+            put(admin::update_user).delete(admin::delete_user),
+        )
+        .route(
+            "/_/api/admin/users/:id/rotate-keys",
+            post(admin::rotate_user_keys),
+        )
+        // IAM group management — POST/PUT/DELETE are gated.
+        .route(
+            "/_/api/admin/groups",
+            get(admin::list_groups).post(admin::create_group),
+        )
+        .route(
+            "/_/api/admin/groups/:id",
+            put(admin::update_group).delete(admin::delete_group),
+        )
+        .route(
+            "/_/api/admin/groups/:id/members",
+            post(admin::add_group_member),
+        )
+        .route(
+            "/_/api/admin/groups/:id/members/:user_id",
+            delete(admin::remove_group_member),
+        )
+        // IAM backup restore — export (GET) allowed; import (POST) gated.
+        .route(
+            "/_/api/admin/backup",
+            get(admin::export_backup).post(admin::import_backup),
+        )
+        // Legacy migration: mutates IAM state as its whole purpose.
+        .route("/_/api/admin/migrate", post(admin::migrate_legacy))
+        // External auth provider management.
+        .route(
+            "/_/api/admin/ext-auth/providers",
+            get(admin::external_auth::list_providers).post(admin::external_auth::create_provider),
+        )
+        .route(
+            "/_/api/admin/ext-auth/providers/:id",
+            put(admin::external_auth::update_provider)
+                .delete(admin::external_auth::delete_provider),
+        )
+        .route(
+            "/_/api/admin/ext-auth/providers/:id/test",
+            post(admin::external_auth::test_provider),
+        )
+        // Group mapping rules.
+        .route(
+            "/_/api/admin/ext-auth/mappings",
+            get(admin::external_auth::list_mappings).post(admin::external_auth::create_mapping),
+        )
+        .route(
+            "/_/api/admin/ext-auth/mappings/:id",
+            put(admin::external_auth::update_mapping).delete(admin::external_auth::delete_mapping),
+        )
+        .route(
+            "/_/api/admin/ext-auth/mappings/preview",
+            post(admin::external_auth::preview_mapping),
+        )
+        // External identities — read-only listing (no mutation), but
+        // included here to keep all ext-auth routes colocated. The
+        // gate is a no-op for GETs.
+        .route(
+            "/_/api/admin/ext-auth/identities",
+            get(admin::external_auth::list_identities),
+        )
+        .route(
+            "/_/api/admin/ext-auth/sync-memberships",
+            post(admin::external_auth::sync_memberships),
+        )
+        .layer(middleware::from_fn_with_state(
+            admin_state.clone(),
+            admin::require_not_declarative,
+        ));
+
     let protected = Router::new()
         .route("/_/api/admin/logout", post(admin::logout))
         .route(
@@ -48,41 +140,6 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             get(admin::list_backends).post(admin::create_backend),
         )
         .route("/_/api/admin/backends/:name", delete(admin::delete_backend))
-        // IAM user management
-        .route(
-            "/_/api/admin/users",
-            get(admin::list_users).post(admin::create_user),
-        )
-        .route(
-            "/_/api/admin/users/:id",
-            put(admin::update_user).delete(admin::delete_user),
-        )
-        .route(
-            "/_/api/admin/users/:id/rotate-keys",
-            post(admin::rotate_user_keys),
-        )
-        // IAM group management
-        .route(
-            "/_/api/admin/groups",
-            get(admin::list_groups).post(admin::create_group),
-        )
-        .route(
-            "/_/api/admin/groups/:id",
-            put(admin::update_group).delete(admin::delete_group),
-        )
-        .route(
-            "/_/api/admin/groups/:id/members",
-            post(admin::add_group_member),
-        )
-        .route(
-            "/_/api/admin/groups/:id/members/:user_id",
-            delete(admin::remove_group_member),
-        )
-        // IAM backup/restore
-        .route(
-            "/_/api/admin/backup",
-            get(admin::export_backup).post(admin::import_backup),
-        )
         // S3 session credentials (server-side credential storage)
         .route(
             "/_/api/admin/session/s3-credentials",
@@ -90,47 +147,13 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
                 .put(admin::set_s3_session_creds)
                 .delete(admin::clear_s3_session_creds),
         )
-        // Legacy migration
-        .route("/_/api/admin/migrate", post(admin::migrate_legacy))
         // Usage scanner
         .route("/_/api/admin/usage/scan", post(admin::scan_usage))
         .route("/_/api/admin/usage", get(admin::get_usage))
-        // External auth provider management
-        .route(
-            "/_/api/admin/ext-auth/providers",
-            get(admin::external_auth::list_providers).post(admin::external_auth::create_provider),
-        )
-        .route(
-            "/_/api/admin/ext-auth/providers/:id",
-            put(admin::external_auth::update_provider)
-                .delete(admin::external_auth::delete_provider),
-        )
-        .route(
-            "/_/api/admin/ext-auth/providers/:id/test",
-            post(admin::external_auth::test_provider),
-        )
-        // Group mapping rules
-        .route(
-            "/_/api/admin/ext-auth/mappings",
-            get(admin::external_auth::list_mappings).post(admin::external_auth::create_mapping),
-        )
-        .route(
-            "/_/api/admin/ext-auth/mappings/:id",
-            put(admin::external_auth::update_mapping).delete(admin::external_auth::delete_mapping),
-        )
-        .route(
-            "/_/api/admin/ext-auth/mappings/preview",
-            post(admin::external_auth::preview_mapping),
-        )
-        // External identities
-        .route(
-            "/_/api/admin/ext-auth/identities",
-            get(admin::external_auth::list_identities),
-        )
-        .route(
-            "/_/api/admin/ext-auth/sync-memberships",
-            post(admin::external_auth::sync_memberships),
-        )
+        // Merge the IAM-gated subrouter in; it already carries its own
+        // `require_not_declarative` layer. Both subrouters share the
+        // outer `require_session`.
+        .merge(iam_gated)
         .layer(middleware::from_fn_with_state(
             admin_state.clone(),
             admin::require_session,

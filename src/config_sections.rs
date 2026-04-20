@@ -111,12 +111,31 @@ pub struct AdmissionSection {
     pub blocks: Vec<crate::admission::AdmissionBlockSpec>,
 }
 
-/// Authentication sources and IAM state. Phase 3a only holds the legacy
-/// SigV4 credential pair + authentication mode — the IAM DB stays
-/// authoritative for users/groups/OIDC providers.
+/// Authentication sources and IAM state.
+///
+/// Phase 3c.1 introduces [`AccessSection::iam_mode`]:
+///
+/// - `Gui` (default) — the encrypted IAM DB is the source of truth
+///   for users, groups, OAuth providers, and mapping rules. Runtime
+///   IAM changes go through the admin GUI (or admin API); the YAML
+///   `access:` section holds ONLY the legacy SigV4 credential pair
+///   and the authentication-mode selector.
+/// - `Declarative` — the YAML document is the source of truth. The
+///   reconciler (Phase 3c.3) sync-diffs the DB to YAML on every
+///   `apply`; admin-API mutations on users/groups/providers return
+///   403 (Phase 3c.2).
+///
+/// The enum is deliberately serde-case-insensitive: `gui`, `Gui`,
+/// and `GUI` all parse. Default is `Gui` so existing deployments
+/// silently get the status-quo behavior; operators explicitly opt
+/// into `declarative` by setting the field.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(deny_unknown_fields)]
 pub struct AccessSection {
+    /// GUI vs declarative IAM mode selector. See [`IamMode`].
+    #[serde(default, skip_serializing_if = "IamMode::is_default")]
+    pub iam_mode: IamMode,
+
     /// Explicit auth-mode selector: `"none"` for open access; absent
     /// means "auto-detect from credentials".
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -128,6 +147,31 @@ pub struct AccessSection {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_access_key: Option<String>,
+}
+
+/// Source-of-truth selector for IAM state. See
+/// [`AccessSection::iam_mode`] for semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum IamMode {
+    /// DB is the source of truth. Runtime IAM CRUD through the GUI /
+    /// admin API mutates the DB; YAML `access.users`/`groups`/`providers`
+    /// are applied as seeds only when the DB is empty at startup.
+    #[default]
+    Gui,
+    /// YAML is the source of truth. The reconciler rebuilds the DB to
+    /// match the YAML on every `apply`; admin-API mutations on
+    /// users/groups/providers return 403.
+    Declarative,
+}
+
+impl IamMode {
+    /// `skip_serializing_if` helper: omit the field when it equals the
+    /// server-current default. Keeps the exported YAML minimal so
+    /// default deployments don't grow an `iam_mode: gui` line.
+    pub(crate) fn is_default(&self) -> bool {
+        matches!(self, IamMode::Gui)
+    }
 }
 
 /// Backends + per-bucket overrides.
@@ -453,6 +497,7 @@ impl SectionedConfig {
                 })
             },
             access: AccessSection {
+                iam_mode: flat.iam_mode,
                 authentication: flat.authentication.clone(),
                 access_key_id: flat.access_key_id.clone(),
                 secret_access_key: flat.secret_access_key.clone(),
@@ -558,6 +603,7 @@ impl SectionedConfig {
             authentication: self.access.authentication,
             access_key_id: self.access.access_key_id,
             secret_access_key: self.access.secret_access_key,
+            iam_mode: self.access.iam_mode,
             bootstrap_password_hash: self.advanced.bootstrap_password_hash,
             codec_concurrency: self.advanced.codec_concurrency,
             blocking_threads: self.advanced.blocking_threads,
@@ -569,6 +615,7 @@ impl SectionedConfig {
             backends: self.storage.backends,
             default_backend: self.storage.default_backend,
             admission_blocks: self.admission.map(|s| s.blocks).unwrap_or_default(),
+            // iam_mode already populated above from self.access.iam_mode.
         }
     }
 }

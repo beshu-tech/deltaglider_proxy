@@ -429,6 +429,19 @@ pub struct Config {
     /// admission blocks are sectioned-shape only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub admission_blocks: Vec<crate::admission::AdmissionBlockSpec>,
+
+    /// IAM source-of-truth selector (Phase 3c.1).
+    ///
+    /// Parsed from `access.iam_mode:` in the sectioned YAML. The flat
+    /// shape also accepts `iam_mode:` at the root for round-trip
+    /// symmetry. `Gui` default means existing deployments keep
+    /// DB-authoritative semantics; operators explicitly opt into
+    /// `declarative` to make YAML authoritative.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::config_sections::IamMode::is_default"
+    )]
+    pub iam_mode: crate::config_sections::IamMode,
 }
 
 /// A named storage backend with its connection configuration.
@@ -555,6 +568,7 @@ impl Default for Config {
             default_backend: None,
             encryption_key: None,
             admission_blocks: Vec::new(),
+            iam_mode: crate::config_sections::IamMode::default(),
         }
     }
 }
@@ -674,6 +688,8 @@ fn classify_shape(doc: &serde_yaml::Value) -> ConfigShape {
         // forms exist for round-trip preservation; mixing them is
         // operator error and the classifier catches it.
         "admission_blocks",
+        // Phase 3c.1: IAM source-of-truth selector at the flat root.
+        "iam_mode",
     ];
 
     let mut flat_keys = Vec::new();
@@ -2619,6 +2635,67 @@ admission:
         assert!(
             msg.contains("mix") || msg.contains("flat") || msg.contains("section"),
             "error must explain the mixed-shape, got: {msg}"
+        );
+    }
+
+    // ── Phase 3c.1: iam_mode enum ──────────────────────────────────────
+
+    #[test]
+    fn test_iam_mode_default_is_gui() {
+        let cfg = Config::default();
+        assert_eq!(cfg.iam_mode, crate::config_sections::IamMode::Gui);
+    }
+
+    #[test]
+    fn test_iam_mode_omitted_from_default_export() {
+        // Minimalism invariant: default deployments don't gain an
+        // `iam_mode: gui` line in their exported YAML.
+        let cfg = Config::default();
+        let exported = cfg.to_canonical_yaml().unwrap();
+        assert!(
+            !exported.contains("iam_mode"),
+            "default iam_mode must be omitted, got:\n{exported}"
+        );
+    }
+
+    #[test]
+    fn test_iam_mode_declarative_roundtrips_through_sectioned_yaml() {
+        let yaml = r#"
+access:
+  iam_mode: declarative
+"#;
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        assert_eq!(cfg.iam_mode, crate::config_sections::IamMode::Declarative);
+        let exported = cfg.to_canonical_yaml().unwrap();
+        assert!(
+            exported.contains("iam_mode: declarative"),
+            "declarative mode must survive round-trip, got:\n{exported}"
+        );
+        let reloaded = Config::from_yaml_str(&exported).unwrap();
+        assert_eq!(reloaded.iam_mode, cfg.iam_mode);
+    }
+
+    #[test]
+    fn test_iam_mode_flat_shape_also_accepts() {
+        let yaml = r#"
+listen_addr: "127.0.0.1:9000"
+iam_mode: declarative
+"#;
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        assert_eq!(cfg.iam_mode, crate::config_sections::IamMode::Declarative);
+    }
+
+    #[test]
+    fn test_iam_mode_unknown_variant_rejected() {
+        let yaml = r#"
+access:
+  iam_mode: wat
+"#;
+        let err = Config::from_yaml_str(yaml).expect_err("unknown iam_mode value must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("wat") || msg.contains("iam_mode"),
+            "error must explain the offending value, got: {msg}"
         );
     }
 

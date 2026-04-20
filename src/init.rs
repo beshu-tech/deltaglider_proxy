@@ -303,6 +303,7 @@ pub fn run_init_inner(
         default_backend: None,
         encryption_key: None,
         admission_blocks: Vec::new(),
+        iam_mode: crate::config_sections::IamMode::default(),
     };
 
     // Show summary

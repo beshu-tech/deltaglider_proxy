@@ -465,6 +465,58 @@ pub async fn require_session(
     next.run(request).await.into_response()
 }
 
+/// Middleware: reject IAM mutation requests when `access.iam_mode` is
+/// `Declarative`. The YAML document is the source of truth in that
+/// mode, and a runtime GUI/API mutation would silently diverge from it
+/// (until the next `apply` overwrites the change).
+///
+/// Applied to `POST/PUT/DELETE` routes under:
+///   - `/api/admin/users/*`
+///   - `/api/admin/groups/*`
+///   - `/api/admin/ext-auth/providers/*`
+///   - `/api/admin/ext-auth/mappings/*`
+///   - `/api/admin/ext-auth/sync-memberships`
+///   - `/api/admin/migrate`
+///
+/// Read endpoints (`GET`) are allowed — the GUI should still be able
+/// to display the DB state for diagnostics. Write endpoints return
+/// 403 with an explanatory body pointing to the declarative workflow.
+pub async fn require_not_declarative(
+    State(state): State<Arc<AdminState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> impl IntoResponse {
+    // Read routes are allowed even in declarative mode — diagnostics
+    // still need to show DB state.
+    let method = request.method();
+    let is_mutation = matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
+    if !is_mutation {
+        return next.run(request).await.into_response();
+    }
+
+    // Check the current runtime mode. We do NOT cache this — config is
+    // hot-reloadable and a toggle between GUI and Declarative should
+    // take effect on the very next request.
+    let cfg = state.config.read().await;
+    let is_declarative = matches!(cfg.iam_mode, crate::config_sections::IamMode::Declarative);
+    drop(cfg);
+
+    if !is_declarative {
+        return next.run(request).await.into_response();
+    }
+
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": "iam_declarative",
+            "message": "IAM is managed via the YAML document (access.iam_mode: declarative). \
+                        Edit your config file and POST the full document to /api/admin/config/apply \
+                        instead of mutating users/groups/providers through this endpoint.",
+        })),
+    )
+        .into_response()
+}
+
 // ── S3 Session Credentials ──
 
 /// GET /api/admin/session/s3-credentials — retrieve stored S3 credentials.
