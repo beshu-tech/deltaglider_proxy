@@ -150,7 +150,9 @@ impl StorageBackend for RoutingBackend {
             all_buckets.insert(virtual_name.clone());
         }
 
-        // Query each backend
+        // Query each backend — errors are logged but don't prevent listing
+        // buckets from other backends (partial results are better than no results
+        // for a listing operation).
         for (backend_name, backend) in &self.backends {
             match backend.list_buckets().await {
                 Ok(buckets) => {
@@ -163,8 +165,8 @@ impl StorageBackend for RoutingBackend {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to list buckets from backend '{}': {}",
+                    tracing::error!(
+                        "Failed to list buckets from backend '{}': {} — results may be incomplete",
                         backend_name,
                         e
                     );
@@ -197,8 +199,8 @@ impl StorageBackend for RoutingBackend {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to list buckets from backend '{}': {}",
+                    tracing::error!(
+                        "Failed to list buckets from backend '{}': {} — results may be incomplete",
                         backend_name,
                         e
                     );
@@ -429,11 +431,15 @@ impl StorageBackend for RoutingBackend {
                     match backend.total_size(None).await {
                         Ok(size) => total += size,
                         Err(e) => {
-                            tracing::warn!(
+                            tracing::error!(
                                 "Failed to get total_size from backend '{}': {}",
                                 name,
                                 e
                             );
+                            return Err(StorageError::Other(format!(
+                                "Backend '{}' failed during total_size aggregation: {}",
+                                name, e
+                            )));
                         }
                     }
                 }

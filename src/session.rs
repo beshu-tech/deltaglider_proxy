@@ -15,10 +15,7 @@ const MAX_SESSIONS: usize = 10;
 /// Default session TTL: 4 hours.
 /// Overridable at startup via `DGP_SESSION_TTL_HOURS` env var.
 fn default_session_ttl() -> Duration {
-    let hours: u64 = std::env::var("DGP_SESSION_TTL_HOURS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(4);
+    let hours: u64 = crate::config::env_parse_with_default("DGP_SESSION_TTL_HOURS", 4);
     Duration::from_secs(hours * 3600)
 }
 

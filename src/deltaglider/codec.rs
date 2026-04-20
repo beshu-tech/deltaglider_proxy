@@ -15,12 +15,10 @@ use tracing::{debug, instrument, warn};
 /// processes 100MB in <5s. Hung processes are killed to prevent cascading.
 /// Override via `DGP_CODEC_TIMEOUT_SECS` for testing or constrained environments.
 fn codec_timeout() -> Duration {
-    Duration::from_secs(
-        std::env::var("DGP_CODEC_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(60),
-    )
+    Duration::from_secs(crate::config::env_parse_with_default(
+        "DGP_CODEC_TIMEOUT_SECS",
+        60,
+    ))
 }
 
 /// Wait for a child process with a timeout. Kills the child if the deadline is exceeded.

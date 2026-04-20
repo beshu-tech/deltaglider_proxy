@@ -373,7 +373,8 @@ fn validate_bucket_name(name: &str) -> Result<(), S3Error> {
     }
 
     // Must start with letter or number
-    let first = name.chars().next().unwrap();
+    // Safety: length validated above (3..=63), so first/last are always Some.
+    let first = name.chars().next().expect("bucket name length >= 3");
     if !first.is_ascii_alphanumeric() {
         return Err(S3Error::InvalidBucketName(
             "Bucket name must start with a letter or number".to_string(),
@@ -381,7 +382,7 @@ fn validate_bucket_name(name: &str) -> Result<(), S3Error> {
     }
 
     // Must end with letter or number
-    let last = name.chars().last().unwrap();
+    let last = name.chars().last().expect("bucket name length >= 3");
     if !last.is_ascii_alphanumeric() {
         return Err(S3Error::InvalidBucketName(
             "Bucket name must end with a letter or number".to_string(),

@@ -63,10 +63,7 @@ struct ValidatedParts {
 /// Default maximum number of concurrent multipart uploads.
 /// Overridable via `DGP_MAX_MULTIPART_UPLOADS` env var.
 fn default_max_uploads() -> usize {
-    std::env::var("DGP_MAX_MULTIPART_UPLOADS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1000)
+    crate::config::env_parse_with_default("DGP_MAX_MULTIPART_UPLOADS", 1000)
 }
 
 /// Thread-safe in-memory store for multipart upload state
