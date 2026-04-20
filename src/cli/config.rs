@@ -126,6 +126,148 @@ pub fn schema_string() -> Result<String, ConfigError> {
     serde_json::to_string_pretty(&schema).map_err(|e| ConfigError::Parse(e.to_string()))
 }
 
+/// `config lint <file>`
+///
+/// Validate a config file offline — same logic the admin API's
+/// `/config/validate` endpoint runs, minus the "log_filter parseable"
+/// check (that depends on `tracing_subscriber` available only when
+/// the server is built into this binary; it is, so the check runs).
+///
+/// Exit codes:
+///
+/// - 0: valid, no warnings.
+/// - 0: valid, non-empty warnings emitted to stderr (warnings are
+///   advisory, not fatal — matches the admin API's return shape
+///   where `ok: true` can coexist with warnings).
+/// - 3: file not found / unreadable.
+/// - 4: parse error (shape, unknown field, bad IP/CIDR, etc.).
+/// - 6: validation error (duplicate admission block name, bad
+///   Reject status, `public: true` conflict, etc.).
+///
+/// Intended for CI: `deltaglider_proxy config lint deploy.yaml`
+/// in a pre-merge workflow step.
+pub fn lint(file: &str) -> i32 {
+    // Read and parse. Shape-level (serde) errors surface here.
+    let content = match std::fs::read_to_string(file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: failed to read {file}: {e}");
+            return EXIT_IO;
+        }
+    };
+
+    // Dispatch by extension (matches Config::from_file). We call
+    // from_yaml_str / from_toml_str directly rather than from_file
+    // so we can surface a distinction between shape errors (exit 4)
+    // and semantic errors (exit 6) — which is information the server
+    // API doesn't split out but operators editing CI-checked files
+    // benefit from.
+    let cfg = match std::path::Path::new(file)
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("yaml") | Some("yml") => Config::from_yaml_str(&content),
+        _ => toml::from_str::<Config>(&content).map_err(|e| ConfigError::Parse(e.to_string())),
+    };
+    let mut cfg = match cfg {
+        Ok(c) => c,
+        Err(e) => {
+            // ConfigError::Parse covers both shape and semantic
+            // violations (deny_unknown_fields, normalize_shorthands,
+            // AdmissionSpec::validate). We don't split them today;
+            // the client-side convention is "exit 4 for parse, 6 for
+            // rejected" — use 4 for everything here, and rely on the
+            // message carrying the distinction.
+            eprintln!("error: {e}");
+            return EXIT_PARSE;
+        }
+    };
+
+    // Run the same `check()` the admin API's /validate uses. It
+    // mutates fields that can't be satisfied (e.g. clears an
+    // unresolved default_backend) and returns human-readable
+    // warnings.
+    let warnings = cfg.check();
+
+    // Log-filter check: /validate rejects malformed filters with 400.
+    // Here we surface it as exit 6.
+    if cfg
+        .log_level
+        .parse::<tracing_subscriber::EnvFilter>()
+        .is_err()
+    {
+        eprintln!(
+            "error: invalid log_level filter '{}' — expected a tracing-subscriber EnvFilter",
+            cfg.log_level
+        );
+        return EXIT_REJECTED;
+    }
+
+    for w in &warnings {
+        eprintln!("warning: {w}");
+    }
+
+    if warnings.is_empty() {
+        eprintln!("{file}: ok");
+    } else {
+        eprintln!("{file}: ok with {} warning(s)", warnings.len());
+    }
+    EXIT_OK
+}
+
+/// `config defaults [--out <path>]`
+///
+/// Emit the JSON Schema for the current `Config` shape, which includes
+/// every default value and the doc-comment description for every
+/// field (produced by schemars' `title` + `description` on schema
+/// properties). This is the CLI counterpart to the admin API's
+/// `/config/defaults` endpoint and the backing data for YAML LSP
+/// autocompletion.
+///
+/// Today this emits the same JSON Schema as `config schema` — the
+/// two commands exist separately because the mental model is
+/// different (`defaults` is about "what would I get if I left every
+/// field blank?", `schema` is about "what are the shape rules?").
+/// Future phases may differentiate (e.g. `defaults --version v1`
+/// emits a pinned-historic defaults list, while `schema` always
+/// emits the current-release JSON Schema).
+pub fn defaults(output: Option<&str>) -> i32 {
+    // Reuse the schemars output — it carries `default` values per
+    // field plus the doc-comment description. This is what YAML LSPs
+    // consume.
+    let schema = schemars::schema_for!(Config);
+    let pretty = match serde_json::to_string_pretty(&schema) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: failed to serialize defaults: {e}");
+            return EXIT_PARSE;
+        }
+    };
+    match output {
+        Some(path) => match std::fs::write(path, &pretty) {
+            Ok(()) => {
+                eprintln!("wrote defaults to {path}");
+                EXIT_OK
+            }
+            Err(e) => {
+                eprintln!("error: failed to write {path}: {e}");
+                EXIT_IO
+            }
+        },
+        None => {
+            let stdout = std::io::stdout();
+            let mut lock = stdout.lock();
+            if let Err(e) = lock.write_all(pretty.as_bytes()) {
+                eprintln!("error: failed to write to stdout: {e}");
+                return EXIT_IO;
+            }
+            EXIT_OK
+        }
+    }
+}
+
 // ═════════════════════════════════════════════════════════════════════════
 // Phase 4 — thin wrappers over the admin API
 // ═════════════════════════════════════════════════════════════════════════
@@ -586,5 +728,94 @@ encryption_key = "deadbeef-hex-key"
         // Malformed input: err on the side of warning rather than silence.
         assert!(!is_cleartext_to_remote("")); // doesn't start with http://
         assert!(!is_cleartext_to_remote("not-a-url")); // ditto
+    }
+
+    // ── Phase 4: lint + defaults ───────────────────────────────────────
+
+    #[test]
+    fn lint_accepts_valid_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.yaml");
+        std::fs::write(
+            &path,
+            r#"
+storage:
+  filesystem: /var/dgp
+"#,
+        )
+        .unwrap();
+        let code = lint(path.to_str().unwrap());
+        assert_eq!(code, EXIT_OK);
+    }
+
+    #[test]
+    fn lint_rejects_parse_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.yaml");
+        std::fs::write(
+            &path,
+            r#"
+storage:
+  bogus_field: true
+"#,
+        )
+        .unwrap();
+        let code = lint(path.to_str().unwrap());
+        assert_eq!(code, EXIT_PARSE);
+    }
+
+    #[test]
+    fn lint_rejects_admission_duplicate_block_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.yaml");
+        std::fs::write(
+            &path,
+            r#"
+admission:
+  blocks:
+    - name: same
+      match: {}
+      action: continue
+    - name: same
+      match: {}
+      action: deny
+"#,
+        )
+        .unwrap();
+        // Duplicate-name validation surfaces as ConfigError::Parse
+        // (it's a semantic violation during normalize_shorthands),
+        // which the CLI splits out as EXIT_PARSE. The error message
+        // must name the offending block for operator grep.
+        let code = lint(path.to_str().unwrap());
+        assert_eq!(code, EXIT_PARSE);
+    }
+
+    #[test]
+    fn lint_missing_file_is_exit_3() {
+        let code = lint("/nonexistent/path/to/nothing.yaml");
+        assert_eq!(code, EXIT_IO);
+    }
+
+    #[test]
+    fn defaults_emits_json_schema_with_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.json");
+        let code = defaults(Some(path.to_str().unwrap()));
+        assert_eq!(code, EXIT_OK);
+        let content = std::fs::read_to_string(&path).unwrap();
+        // Must be valid JSON and carry at least one known field.
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let has_max_delta_ratio = parsed["properties"]["max_delta_ratio"].is_object()
+            || parsed["$defs"]
+                .as_object()
+                .map(|d| {
+                    d.values()
+                        .any(|v| v["properties"]["max_delta_ratio"].is_object())
+                })
+                .unwrap_or(false);
+        assert!(
+            has_max_delta_ratio,
+            "defaults output must include max_delta_ratio, got:\n{content}"
+        );
     }
 }

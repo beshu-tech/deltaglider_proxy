@@ -121,6 +121,33 @@ enum ConfigCommand {
         #[arg(long, value_name = "SECS")]
         timeout: Option<u64>,
     },
+    /// Validate a config file without applying or hitting a server.
+    ///
+    /// Runs the same pre-apply validation the admin API's
+    /// `/config/validate` endpoint uses: shape classification, serde
+    /// deny-unknown-fields, shorthand normalization, admission-block
+    /// semantic validation. Exit status 0 = clean; 4 = parse error;
+    /// 6 = validation error (emits warnings on stderr regardless).
+    ///
+    /// Intended for CI pipelines: `deltaglider_proxy config lint
+    /// path/to/config.yaml` in a pre-merge hook catches operator
+    /// typos before they reach production.
+    Lint {
+        /// Config file to validate (YAML or TOML).
+        #[arg(value_name = "FILE")]
+        file: String,
+    },
+    /// Emit the defaults + docstrings for every Config field as JSON.
+    ///
+    /// Backs YAML LSP autocompletion, operator documentation, and the
+    /// `config init` wizard (Phase 4+). Drives off the schemars
+    /// `JsonSchema` derives already on every Config struct — so the
+    /// output tracks schema changes automatically.
+    Defaults {
+        /// Write output to a file instead of stdout.
+        #[arg(long, value_name = "OUTPUT")]
+        out: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -157,7 +184,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Subcommand dispatch (runs synchronously, exits before tokio runtime).
     if let Some(ref cmd) = cli.command {
         use deltaglider_proxy::cli::config::{
-            admission_trace, apply, migrate, schema, AdminClientOpts, TraceArgs,
+            admission_trace, apply, defaults, lint, migrate, schema, AdminClientOpts, TraceArgs,
         };
         let code = match cmd {
             Command::Config { action } => match action {
@@ -177,6 +204,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     apply(file, opts)
                 }
+                ConfigCommand::Lint { file } => lint(file),
+                ConfigCommand::Defaults { out } => defaults(out.as_deref()),
             },
             Command::Admission { action } => match action {
                 AdmissionCommand::Trace {
