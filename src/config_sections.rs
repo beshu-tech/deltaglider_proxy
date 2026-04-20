@@ -215,7 +215,12 @@ impl StorageSection {
     /// no shorthand is present.
     ///
     /// Errors when multiple shorthand+backend combinations are
-    /// ambiguous — the operator should set exactly one.
+    /// ambiguous — the operator should set exactly one. Also validates
+    /// shorthand inputs at the cheap points (non-empty URL, syntactic
+    /// `http[s]://` prefix) so typos surface as load errors rather than
+    /// opaque AWS SDK failures much later. The long-form
+    /// `backend: { type: S3, endpoint }` has no such validation today
+    /// for back-compat; Phase 6 can tighten it symmetrically.
     pub fn normalize(&mut self) -> Result<(), String> {
         let has_s3 = self.s3.is_some();
         let has_fs = self.filesystem.is_some();
@@ -227,7 +232,9 @@ impl StorageSection {
                 // not be default; either is fine.
             }
             (true, false, false) => {
-                // S3 shorthand, no explicit backend. Expand.
+                // S3 shorthand, no explicit backend. Validate endpoint
+                // then expand.
+                validate_s3_endpoint(self.s3.as_deref().expect("has_s3 asserted above"))?;
                 self.backend = BackendConfig::S3 {
                     endpoint: self.s3.take(),
                     region: self.region.take().unwrap_or_else(|| "us-east-1".to_string()),
@@ -237,7 +244,11 @@ impl StorageSection {
                 };
             }
             (false, true, false) => {
-                // Filesystem shorthand, no explicit backend. Expand.
+                // Filesystem shorthand, no explicit backend. Validate
+                // path then expand.
+                validate_filesystem_path(
+                    self.filesystem.as_ref().expect("has_fs asserted above"),
+                )?;
                 self.backend = BackendConfig::Filesystem {
                     path: self.filesystem.take().expect("has_fs asserted above"),
                 };
@@ -273,6 +284,61 @@ impl StorageSection {
         }
         Ok(())
     }
+}
+
+/// Reject obviously-wrong S3 endpoint URLs at load time. The full
+/// URL shape is validated later by the AWS SDK — here we only cheaply
+/// rule out the mistakes a human most often makes:
+///
+/// - empty string (template interpolation left a hole),
+/// - missing scheme (copy-paste of "minio:9000" without the scheme),
+/// - pathological length (>= 4096 chars — no legitimate endpoint hits this).
+fn validate_s3_endpoint(url: &str) -> Result<(), String> {
+    if url.is_empty() {
+        return Err("storage: `s3:` endpoint is empty — this usually means an \
+                    environment variable substitution left a hole. Set a concrete URL."
+            .to_string());
+    }
+    if url.len() > 4096 {
+        return Err(format!(
+            "storage: `s3:` endpoint is {}-chars long; refusing (legitimate endpoints are <1 KB)",
+            url.len()
+        ));
+    }
+    let lower = url.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return Err(format!(
+            "storage: `s3:` endpoint `{}` must start with http:// or https:// — AWS SDK \
+             rejects scheme-less URLs later in the stack anyway; failing loudly here instead",
+            url
+        ));
+    }
+    Ok(())
+}
+
+/// Reject obviously-wrong filesystem paths. We do NOT require the path
+/// to exist at load time — startup may precede the mount — but we
+/// reject empty paths (template interpolation hole) and block relative
+/// `..` escapes that usually indicate a template-variable mixup.
+fn validate_filesystem_path(path: &std::path::Path) -> Result<(), String> {
+    if path.as_os_str().is_empty() {
+        return Err("storage: `filesystem:` path is empty — this usually means an \
+                    environment variable substitution left a hole"
+            .to_string());
+    }
+    // Block `..` anywhere in the path. An operator with a legitimate
+    // symlink-escape use-case can pre-resolve in their deployment
+    // tooling; here we default-closed.
+    for component in path.components() {
+        if component.as_os_str() == ".." {
+            return Err(format!(
+                "storage: `filesystem:` path `{}` contains a `..` component — refusing as a \
+                 probable template-variable mixup; use an absolute path without `..`",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Process-level tunables: listener, TLS, log level, caches, and the
@@ -345,6 +411,27 @@ impl SectionedConfig {
     /// This is the canonical exporter — called by `to_canonical_yaml`.
     /// We deliberately keep default-valued `Option<T>` fields as `None`
     /// so the serialized YAML omits them (cleaner GitOps diffs).
+    ///
+    /// # Shorthand exporting policy
+    ///
+    /// - **Bucket-level `public: true`** IS collapsed from
+    ///   `public_prefixes: [""]` when unambiguous. The shorthand is an
+    ///   exact 1:1 with the expanded form (exactly one prefix, exactly
+    ///   the empty string), so round-tripping is lossless and the GUI's
+    ///   "Public read" toggle maps directly to the YAML.
+    /// - **Storage-level `s3:` / `filesystem:`** are NOT collapsed.
+    ///   Reason: the expanded `backend: { type: S3, endpoint, region,
+    ///   force_path_style, ... }` form carries fields (`force_path_style`,
+    ///   named backends, etc.) that the shorthand can't express without
+    ///   ambiguity, and collapsing selectively would make the exporter
+    ///   non-deterministic. Operators who want the compact form should
+    ///   keep it in their GitOps source-of-truth file; the server's
+    ///   persisted artifact is explicit by contract.
+    ///
+    /// This asymmetry is intentional. Don't "fix" it by adding a
+    /// `collapse_backend_to_shorthand()` without a hard contract that
+    /// the collapse is lossless for ALL current and future backend
+    /// fields.
     pub fn from_flat(flat: &crate::config::Config) -> Self {
         Self {
             defaults_version: flat.defaults_version,
@@ -691,5 +778,94 @@ mod tests {
         let mut storage = original.clone();
         storage.normalize().unwrap();
         assert_eq!(storage, original);
+    }
+
+    // ── Phase 3b.1 hardening: input validation ────────────────────────
+
+    #[test]
+    fn storage_s3_empty_endpoint_rejected() {
+        let mut storage = StorageSection {
+            s3: Some(String::new()),
+            ..Default::default()
+        };
+        let err = storage
+            .normalize()
+            .expect_err("empty s3 endpoint must be rejected");
+        assert!(err.contains("empty"), "error must name the problem, got: {err}");
+    }
+
+    #[test]
+    fn storage_s3_missing_scheme_rejected() {
+        let mut storage = StorageSection {
+            s3: Some("minio:9000".into()),
+            ..Default::default()
+        };
+        let err = storage
+            .normalize()
+            .expect_err("scheme-less s3 endpoint must be rejected");
+        assert!(
+            err.contains("http") && err.contains("minio:9000"),
+            "error must guide the operator, got: {err}"
+        );
+    }
+
+    #[test]
+    fn storage_s3_scheme_case_insensitive() {
+        // HTTP:// and HTTPS:// should be accepted — the AWS SDK is case-
+        // insensitive on schemes.
+        let mut storage = StorageSection {
+            s3: Some("HTTPS://example.com".into()),
+            ..Default::default()
+        };
+        storage.normalize().unwrap();
+    }
+
+    #[test]
+    fn storage_s3_pathological_length_rejected() {
+        let huge = "http://".to_string() + &"a".repeat(5000);
+        let mut storage = StorageSection {
+            s3: Some(huge),
+            ..Default::default()
+        };
+        let err = storage
+            .normalize()
+            .expect_err("pathologically long URL must be rejected");
+        assert!(err.contains("chars"), "error must mention length, got: {err}");
+    }
+
+    #[test]
+    fn storage_filesystem_empty_path_rejected() {
+        let mut storage = StorageSection {
+            filesystem: Some(std::path::PathBuf::new()),
+            ..Default::default()
+        };
+        let err = storage
+            .normalize()
+            .expect_err("empty filesystem path must be rejected");
+        assert!(err.contains("empty"), "error must name the problem, got: {err}");
+    }
+
+    #[test]
+    fn storage_filesystem_parent_escape_rejected() {
+        let mut storage = StorageSection {
+            filesystem: Some("/var/lib/dgp/../../etc".into()),
+            ..Default::default()
+        };
+        let err = storage
+            .normalize()
+            .expect_err("path with `..` components must be rejected");
+        assert!(err.contains(".."), "error must name the problem, got: {err}");
+    }
+
+    #[test]
+    fn storage_filesystem_relative_parent_also_rejected() {
+        let mut storage = StorageSection {
+            filesystem: Some("../oops".into()),
+            ..Default::default()
+        };
+        let err = storage
+            .normalize()
+            .expect_err("relative path with `..` must be rejected");
+        assert!(err.contains(".."));
     }
 }

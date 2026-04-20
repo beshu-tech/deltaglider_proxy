@@ -449,12 +449,27 @@ pub async fn update_config(
         cfg.cache_size_mb = cache;
     }
 
-    // Bucket policies — normalize names to lowercase before storing.
+    // Bucket policies — normalize names to lowercase before storing,
+    // then expand any per-bucket shorthands (`public: true` →
+    // `public_prefixes: [""]`) so the runtime `PublicPrefixSnapshot`
+    // sees the form it expects. Without this call, a PATCH setting
+    // only `public: true` lands as `public_prefixes: []` and is
+    // silently non-functional — the bucket looks public in the admin
+    // UI but anonymous reads 403.
     if let Some(ref bucket_policies) = body.bucket_policies {
-        cfg.buckets = bucket_policies
+        let mut new_buckets: std::collections::BTreeMap<
+            String,
+            crate::bucket_policy::BucketPolicyConfig,
+        > = bucket_policies
             .iter()
             .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
             .collect();
+        for (name, policy) in new_buckets.iter_mut() {
+            if let Err(e) = policy.normalize() {
+                warnings.push(format!("bucket `{}`: {}", name, e));
+            }
+        }
+        cfg.buckets = new_buckets;
     }
 
     // ── Run transition side effects ──────────────────────────────────────

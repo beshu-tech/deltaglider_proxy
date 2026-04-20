@@ -100,6 +100,99 @@ async fn test_config_update_bucket_policies_with_quota() {
     assert_eq!(policies["quota_bytes"], 1073741824u64);
 }
 
+/// Regression test for C1 from Phase 3b.1 adversarial review: a PATCH
+/// that sets `public: true` on a bucket (from the GUI's "Public read"
+/// toggle, or any scripted admin-API client) must expand the shorthand
+/// into `public_prefixes: [""]` before the runtime snapshot rebuilds.
+/// Previously the bucket looked public in the UI but anonymous reads
+/// 403'd because the snapshot filters buckets with empty prefix lists.
+#[tokio::test]
+async fn test_config_patch_expands_public_shorthand() {
+    let server = TestServer::builder()
+        .auth("PUBPKEY", "PUBPSECRET")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    let resp = admin
+        .put(format!("{}/_/api/admin/config", server.endpoint()))
+        .json(&json!({
+            "bucket_policies": {
+                "publicbucket": {
+                    "public": true
+                }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let cfg: serde_json::Value = admin
+        .get(format!("{}/_/api/admin/config", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let policy = &cfg["bucket_policies"]["publicbucket"];
+    // Core assertion: the shorthand `public: true` is expanded on PATCH
+    // so `public_prefixes` carries the empty-string sentinel the
+    // runtime consumes. Before the fix this was the empty vector.
+    let prefixes = policy["public_prefixes"]
+        .as_array()
+        .expect("public_prefixes must be an array");
+    assert_eq!(
+        prefixes.len(),
+        1,
+        "public: true on PATCH must yield exactly one prefix, got: {policy:?}"
+    );
+    assert_eq!(
+        prefixes[0].as_str(),
+        Some(""),
+        "public: true must expand to `public_prefixes: [\"\"]`, got: {policy:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_config_patch_rejects_conflicting_public_and_prefixes() {
+    let server = TestServer::builder()
+        .auth("PUBCFK", "PUBCFSECRET")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    let resp = admin
+        .put(format!("{}/_/api/admin/config", server.endpoint()))
+        .json(&json!({
+            "bucket_policies": {
+                "conflict": {
+                    "public": true,
+                    "public_prefixes": ["releases/"]
+                }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    // The PATCH path surfaces normalize errors as warnings rather than
+    // 400 (preserving the legacy PATCH contract that always returns 200
+    // with warnings). Verify the warning appears.
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let warnings = body["warnings"]
+        .as_array()
+        .expect("warnings array must be present");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("conflict")
+                && w.as_str().unwrap().contains("public")),
+        "expected warning naming the bucket + conflict, got: {warnings:?}"
+    );
+}
+
 #[tokio::test]
 async fn test_config_update_restart_required() {
     let server = TestServer::builder()

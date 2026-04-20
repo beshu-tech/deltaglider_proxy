@@ -79,9 +79,20 @@ impl BucketPolicyConfig {
     /// `public_prefixes` are set: picking one silently would lose the
     /// other's semantics. The operator must collapse them manually.
     pub fn normalize(&mut self) -> Result<(), String> {
+        // Idempotency contract: calling `normalize()` twice must
+        // succeed. Admin paths now call this on PATCH, and defensive
+        // re-validation before persist would double up. If
+        // `public_prefixes` is already exactly the `[""]` sentinel AND
+        // `public: true` is set, that's the post-first-expansion state
+        // — re-accept it as-is rather than treating the sentinel as a
+        // conflict.
+        let already_expanded = self.public == Some(true)
+            && self.public_prefixes.len() == 1
+            && self.public_prefixes[0].is_empty();
+
         match self.public {
             Some(true) => {
-                if !self.public_prefixes.is_empty() {
+                if !already_expanded && !self.public_prefixes.is_empty() {
                     return Err(format!(
                         "`public: true` and `public_prefixes: {:?}` cannot both be set on the same bucket — \
                          they are two syntaxes for the same concept. Use one: `public: true` for \
@@ -93,7 +104,9 @@ impl BucketPolicyConfig {
                 // public" convention (see `is_public_read` where the empty
                 // prefix matches everything). The shorthand expands to the
                 // same runtime data, so no evaluator change is needed.
-                self.public_prefixes = vec![String::new()];
+                if !already_expanded {
+                    self.public_prefixes = vec![String::new()];
+                }
                 // Leave `public = Some(true)` set: the canonical exporter
                 // uses it to emit the compact shorthand form again.
             }
@@ -822,5 +835,35 @@ mod tests {
         let collapsed = policy.collapse_to_shorthand();
         assert!(collapsed.public.is_none());
         assert_eq!(collapsed.public_prefixes, vec!["foo/".to_string()]);
+    }
+
+    #[test]
+    fn test_normalize_is_idempotent() {
+        // Adversarial review found this: calling normalize() twice on
+        // the same policy must not fail. After expansion, state is
+        // `public: Some(true) + public_prefixes: [""]`, which in
+        // earlier drafts tripped the "two sources of truth" error on
+        // the second call. The fix recognises the post-expansion
+        // state and leaves it alone.
+        let mut policy = BucketPolicyConfig {
+            public: Some(true),
+            ..Default::default()
+        };
+        policy.normalize().unwrap();
+        let after_first = policy.clone();
+        policy.normalize().unwrap();
+        assert_eq!(policy, after_first, "normalize() must be idempotent");
+    }
+
+    #[test]
+    fn test_normalize_idempotent_on_specific_prefixes() {
+        let mut policy = BucketPolicyConfig {
+            public_prefixes: vec!["releases/".into()],
+            ..Default::default()
+        };
+        policy.normalize().unwrap();
+        let after_first = policy.clone();
+        policy.normalize().unwrap();
+        assert_eq!(policy, after_first);
     }
 }
