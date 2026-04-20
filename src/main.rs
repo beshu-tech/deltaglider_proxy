@@ -77,10 +77,15 @@ struct Cli {
 /// Top-level subcommands. Grows in later phases (admission, apply, …).
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Configuration-file tooling (migrate, later: apply/show/defaults/lint).
+    /// Configuration-file tooling (migrate, schema, apply, ...).
     Config {
         #[command(subcommand)]
         action: ConfigCommand,
+    },
+    /// Admission-chain tooling (trace, ...).
+    Admission {
+        #[command(subcommand)]
+        action: AdmissionCommand,
     },
 }
 
@@ -101,6 +106,49 @@ enum ConfigCommand {
         #[arg(long, value_name = "OUTPUT")]
         out: Option<String>,
     },
+    /// Push a full YAML config document to a running server via the admin API.
+    ///
+    /// Reads the admin bootstrap password from the DGP_BOOTSTRAP_PASSWORD
+    /// environment variable (NOT a CLI flag — argv would leak it via `ps`).
+    Apply {
+        /// YAML file to apply.
+        #[arg(value_name = "FILE")]
+        file: String,
+        /// Server URL. Defaults to http://127.0.0.1:9000.
+        #[arg(long, value_name = "URL")]
+        server: Option<String>,
+        /// Per-request timeout in seconds. Defaults to 30.
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u64>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AdmissionCommand {
+    /// Dry-run a synthetic request through the admission chain.
+    ///
+    /// Emits the admission decision as JSON on stdout. Requires the admin
+    /// bootstrap password in `DGP_BOOTSTRAP_PASSWORD`.
+    Trace {
+        /// HTTP method (GET, HEAD, PUT, POST, DELETE, …).
+        #[arg(long, value_name = "METHOD")]
+        method: String,
+        /// Request path, e.g. `/my-bucket/releases/v1.zip`.
+        #[arg(long, value_name = "PATH")]
+        path: String,
+        /// Treat the synthetic request as SigV4-signed.
+        #[arg(long)]
+        authenticated: bool,
+        /// Optional query string (e.g. `prefix=releases/`).
+        #[arg(long, value_name = "QUERY")]
+        query: Option<String>,
+        /// Server URL. Defaults to http://127.0.0.1:9000.
+        #[arg(long, value_name = "URL")]
+        server: Option<String>,
+        /// Per-request timeout in seconds. Defaults to 30.
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u64>,
+    },
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -108,13 +156,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Subcommand dispatch (runs synchronously, exits before tokio runtime).
     if let Some(ref cmd) = cli.command {
+        use deltaglider_proxy::cli::config::{
+            admission_trace, apply, migrate, schema, AdminClientOpts, TraceArgs,
+        };
         let code = match cmd {
             Command::Config { action } => match action {
-                ConfigCommand::Migrate { input, out } => {
-                    deltaglider_proxy::cli::config::migrate(input, out.as_deref())
+                ConfigCommand::Migrate { input, out } => migrate(input, out.as_deref()),
+                ConfigCommand::Schema { out } => schema(out.as_deref()),
+                ConfigCommand::Apply {
+                    file,
+                    server,
+                    timeout,
+                } => {
+                    let mut opts = AdminClientOpts::default();
+                    if let Some(s) = server.as_deref() {
+                        opts.server = s.to_string();
+                    }
+                    if let Some(t) = timeout {
+                        opts.timeout_secs = *t;
+                    }
+                    apply(file, opts)
                 }
-                ConfigCommand::Schema { out } => {
-                    deltaglider_proxy::cli::config::schema(out.as_deref())
+            },
+            Command::Admission { action } => match action {
+                AdmissionCommand::Trace {
+                    method,
+                    path,
+                    authenticated,
+                    query,
+                    server,
+                    timeout,
+                } => {
+                    let mut opts = AdminClientOpts::default();
+                    if let Some(s) = server.as_deref() {
+                        opts.server = s.to_string();
+                    }
+                    if let Some(t) = timeout {
+                        opts.timeout_secs = *t;
+                    }
+                    admission_trace(
+                        TraceArgs {
+                            method: method.clone(),
+                            path: path.clone(),
+                            authenticated: *authenticated,
+                            query: query.clone(),
+                        },
+                        opts,
+                    )
                 }
             },
         };

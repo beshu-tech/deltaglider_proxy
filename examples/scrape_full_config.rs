@@ -375,8 +375,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     secrets.record(key, k);
                 }
                 if let Some(ref s) = secret_access_key {
-                    let key =
-                        format!("BACKEND_{}_SECRET_ACCESS_KEY", sanitize_env_name(&named.name));
+                    let key = format!(
+                        "BACKEND_{}_SECRET_ACCESS_KEY",
+                        sanitize_env_name(&named.name)
+                    );
                     out.push_str(&format!("      secret_access_key: !secret {}\n", key));
                     secrets.record(key, s);
                 }
