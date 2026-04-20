@@ -223,19 +223,28 @@ User decisions locked in via AskUserQuestion:
 >   new sectioned shape, and export→apply is a verified no-op.
 >
 > **What Phase 3a deferred to later subphases:**
-> - **3b**: shorthand deserialisers (`storage: { s3: URL, ... }`,
->   `storage: { filesystem: PATH, ... }`), `bucket: { public: true }`
->   admission synthesis, populating `AdmissionSection.reserved`
->   with operator-authored blocks.
-> - **3c**: `access.iam_mode: Gui | Declarative` + reconciler
+> - **3b.1**: ✅ DONE (commits `ff71f9a` / `969d42d`). `bucket.public: true`
+>   shorthand expanding to the existing `public_prefixes: [""]`
+>   sentinel, and `storage: { s3: URL, ... }` / `storage: {
+>   filesystem: PATH, ... }` shorthand expanding to a full
+>   `BackendConfig`. Includes: normalize-on-PATCH fix (GUI public
+>   toggle now works end-to-end), idempotent normalize, shorthand
+>   input validation (empty URL, missing scheme, `..` path
+>   components). T1 five-line acceptance example loads.
+> - **3b.2**: PENDING. Operator-authored admission blocks: populate
+>   `AdmissionSection` with the serde wire format and extend the
+>   evaluator with `Deny`, `RateLimit`, `Reject` action variants +
+>   IP/method/path `Match` predicates. The five-block default chain
+>   from the plan's scope.
+> - **3c**: PENDING. `access.iam_mode: Gui | Declarative` + reconciler
 >   (`src/iam/reconciler.rs`) that sync-diffs DB ↔ YAML on apply.
-> - **3d**: group presets (`{ preset: admin | read-only | ... }`)
+> - **3d**: PENDING. Group presets (`{ preset: admin | read-only | ... }`)
 >   expanding to built-in IAM policy documents.
 >
-> **Remaining opening moves for Phase 3b:**
+> **Remaining opening moves for Phase 3b.2:**
 > 1. Extend the admission module to carry the variants Phase 2 deferred (`Deny`, `RateLimit`, `Reject`, plus the `Match` fields for IP/path/method). Write the 5-block default chain.
 > 2. Populate `AdmissionSection` with the serde-level wire format for those blocks; keep `deny_unknown_fields` on by construction.
-> 3. Shorthand storage deserialisers via `#[serde(untagged)]` wrappers.
+> 3. Wire the new evaluator variants through `/api/admin/config/trace`.
 >
 > **Helpful artifact already in the repo**: `examples/scrape_full_config.rs`
 > emits a close approximation of the Phase 3 target YAML. As of 3a it
