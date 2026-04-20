@@ -32,9 +32,11 @@ pub use auth::{
 pub use backends::{create_backend, delete_backend, list_backends};
 pub use backup::{export_backup, import_backup};
 pub use config::{
-    change_password, get_config, recover_db, test_s3_connection, update_config,
-    BackendInfoResponse, ConfigResponse, ConfigUpdateRequest, ConfigUpdateResponse,
-    PasswordChangeRequest, PasswordChangeResponse, TestS3Request, TestS3Response,
+    apply_config_doc, change_password, config_defaults, export_config, get_config, recover_db,
+    test_s3_connection, trace_config, update_config, validate_config_doc, BackendInfoResponse,
+    ConfigApplyResponse, ConfigDocumentRequest, ConfigResponse, ConfigUpdateRequest,
+    ConfigUpdateResponse, ConfigValidateResponse, PasswordChangeRequest, PasswordChangeResponse,
+    TestS3Request, TestS3Response, TraceRequest, TraceResolved, TraceResponse,
 };
 pub use groups::{
     add_group_member, create_group, delete_group, list_groups, remove_group_member, update_group,
@@ -55,6 +57,13 @@ pub struct AdminState {
     pub password_hash: RwLock<String>,
     pub sessions: Arc<SessionStore>,
     pub config: SharedConfig,
+    /// Absolute path of the config file the server was started with, if any.
+    /// When present, this is the authoritative target for config persistence —
+    /// the admin API must not silently write to a different file resolved via
+    /// `DGP_CONFIG` or the default-search-paths list. `None` means the server
+    /// started with neither `--config` nor any file found on the search path,
+    /// and any persist attempt should fall back to the canonical default.
+    pub config_file_path: Option<String>,
     pub log_reload: LogReloadHandle,
     pub s3_state: Arc<AppState>,
     pub iam_state: SharedIamState,
@@ -73,6 +82,12 @@ pub struct AdminState {
     pub external_auth: Option<Arc<ExternalAuthManager>>,
     /// Public prefix snapshot for unauthenticated read-only access. Hot-swappable.
     pub public_prefix_snapshot: crate::bucket_policy::SharedPublicPrefixSnapshot,
+    /// Admission chain — pre-auth request gating. Hot-swappable via
+    /// `arc_swap::ArcSwap`; readers call `load_full()` lock-free. Rebuilt
+    /// whenever the bucket policy set changes (which is what the chain is
+    /// currently derived from). See [`crate::admission`] for the type
+    /// shape and evaluator.
+    pub admission_chain: crate::admission::SharedAdmissionChain,
 }
 
 /// Trigger an async config DB upload to S3 if sync is enabled.

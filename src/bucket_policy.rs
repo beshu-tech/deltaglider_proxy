@@ -4,12 +4,13 @@
 //! specific named backend, and expose key prefixes for unauthenticated
 //! read-only access.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Per-bucket policy overrides. All fields are optional — `None` means
 /// "use the global default".
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, JsonSchema)]
 pub struct BucketPolicyConfig {
     /// Enable/disable delta compression for this bucket.
     /// When `false`, all files in this bucket are stored as passthrough
@@ -58,10 +59,16 @@ pub struct BucketPolicyRegistry {
 
 impl BucketPolicyRegistry {
     /// Create a registry from per-bucket configs and global defaults.
+    ///
+    /// Accepts any `IntoIterator` over `(bucket_name, policy)` so both
+    /// `HashMap` and the canonical `BTreeMap` on `Config::buckets` flow
+    /// through without a separate conversion call site. The registry's
+    /// internal storage is `HashMap` — lookups are hot, ordering is not.
     pub fn new(
-        policies: HashMap<String, BucketPolicyConfig>,
+        policies: impl IntoIterator<Item = (String, BucketPolicyConfig)>,
         default_max_delta_ratio: f32,
     ) -> Self {
+        let policies: HashMap<String, BucketPolicyConfig> = policies.into_iter().collect();
         // Normalize bucket names to lowercase and validate ratio values + public prefixes
         let policies = policies
             .into_iter()
@@ -227,9 +234,16 @@ impl PublicPrefixSnapshot {
     /// Build from bucket policy config (called at startup and on hot-reload).
     /// Applies the same validation as `BucketPolicyRegistry::new()` — rejects
     /// dangerous prefixes (`..`, null bytes, `//`) and strips leading `/`.
-    pub fn from_config(buckets: &HashMap<String, BucketPolicyConfig>) -> Self {
+    ///
+    /// Accepts any iterator-backed map so both `HashMap` and the canonical
+    /// `BTreeMap` on `Config::buckets` work without a conversion dance at
+    /// the call site.
+    pub fn from_config<'a, I>(buckets: I) -> Self
+    where
+        I: IntoIterator<Item = (&'a String, &'a BucketPolicyConfig)>,
+    {
         let entries = buckets
-            .iter()
+            .into_iter()
             .filter(|(_, v)| !v.public_prefixes.is_empty())
             .map(|(k, v)| {
                 let validated: Vec<String> = v

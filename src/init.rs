@@ -282,6 +282,7 @@ pub fn run_init_inner(
 
     // Build Config
     let config = Config {
+        defaults_version: Default::default(),
         listen_addr,
         backend,
         max_delta_ratio,
@@ -297,7 +298,7 @@ pub fn run_init_inner(
         log_level,
         config_sync_bucket: None,
         tls,
-        buckets: std::collections::HashMap::new(),
+        buckets: std::collections::BTreeMap::new(),
         backends: Vec::new(),
         default_backend: None,
         encryption_key: None,

@@ -290,10 +290,8 @@ fn verify_signature(
         return Err(S3Error::AccessDenied.into_response());
     }
     if !is_presigned {
-        let max_skew_secs: u64 = std::env::var("DGP_CLOCK_SKEW_SECONDS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(300);
+        let max_skew_secs: u64 =
+            crate::config::env_parse_with_default("DGP_CLOCK_SKEW_SECONDS", 300);
         if let Ok(request_time) =
             chrono::NaiveDateTime::parse_from_str(&params.amz_date, "%Y%m%dT%H%M%SZ")
         {
@@ -545,69 +543,39 @@ pub async fn sigv4_auth_middleware(
     // /stats, /metrics here — those are valid S3 bucket names and bypassing auth
     // would expose any bucket named "health" etc. without credentials.
 
-    // ── Public prefix bypass: unauthenticated read-only access ──
-    // Check BEFORE SigV4 parsing so requests without auth headers don't error.
-    // Only applies to GET/HEAD (read-only) when no credentials are present.
-    let query_string = request.uri().query().unwrap_or("");
-    let method = request.method().clone();
-    let is_read_method = method == axum::http::Method::GET || method == axum::http::Method::HEAD;
-    let has_auth =
-        request.headers().contains_key("authorization") || has_presigned_query_params(query_string);
-
-    if is_read_method && !has_auth {
-        if let Some(snapshot) = request
+    // ── Admission-chain anonymous pre-admit ──
+    // The admission middleware (runs before this one) has already decided
+    // whether this request should proceed as anonymous. If it planted an
+    // `AdmissionAllowAnonymous` marker in request extensions, we mint the
+    // scoped `$anonymous` user here and skip signature verification.
+    // Public-prefix matching logic lives in `crate::admission`; this
+    // middleware is now responsible only for materialising the principal.
+    if let Some(admit) = request
+        .extensions()
+        .get::<crate::admission::AdmissionAllowAnonymous>()
+        .cloned()
+    {
+        let snapshot = request
             .extensions()
             .get::<crate::bucket_policy::SharedPublicPrefixSnapshot>()
-            .map(|s| s.load_full())
-        {
-            if !snapshot.is_empty() {
-                // Parse bucket and key from the RAW path (not the trimmed one used
-                // for operational endpoint matching) to preserve trailing slashes in keys.
-                let raw_path = request.uri().path();
-                let trimmed = raw_path.trim_start_matches('/');
-                let (bucket_str, key_str) = trimmed
-                    .split_once('/')
-                    .map(|(b, k)| (b.to_string(), percent_decode(k)))
-                    .unwrap_or_else(|| (trimmed.to_string(), String::new()));
-                let bucket_lower = bucket_str.to_ascii_lowercase();
+            .map(|s| s.load_full());
+        if let Some(snapshot) = snapshot {
+            let public_prefixes = snapshot.public_prefixes_for_bucket(&admit.bucket);
+            let anon_user = build_anonymous_user(&admit.bucket, public_prefixes);
 
-                // For GET on /<bucket> (LIST), check if prefix overlaps
-                // For GET/HEAD on /<bucket>/<key>, check if key is public
-                let is_public = if key_str.is_empty() {
-                    // LIST request — extract prefix from query params
-                    let prefix = query_string
-                        .split('&')
-                        .find_map(|pair| {
-                            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-                            if k == "prefix" {
-                                Some(percent_decode(v))
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or_default();
-                    snapshot.list_overlaps_public(&bucket_lower, &prefix)
-                } else {
-                    snapshot.is_public_read(&bucket_lower, &key_str)
-                };
+            info!(
+                "AUDIT | action=public_read | user=$anonymous | bucket={} | matched_block={} | ip={} | method={}",
+                admit.bucket,
+                admit.matched_block,
+                audit_ip,
+                request.method()
+            );
 
-                if is_public {
-                    // Build scoped anonymous AuthenticatedUser
-                    let public_prefixes = snapshot.public_prefixes_for_bucket(&bucket_lower);
-                    let anon_user = build_anonymous_user(&bucket_lower, public_prefixes);
-
-                    info!(
-                        "AUDIT | action=public_read | user=$anonymous | bucket={} | key={} | ip={} | method={}",
-                        bucket_str, key_str, audit_ip, method
-                    );
-
-                    request.extensions_mut().insert(anon_user);
-
-                    return Ok(next.run(request).await);
-                }
-            }
+            request.extensions_mut().insert(anon_user);
+            return Ok(next.run(request).await);
         }
     }
+    let query_string = request.uri().query().unwrap_or("");
     let is_presigned = has_presigned_query_params(query_string);
     let params = if is_presigned {
         SigV4Params::from_query(&request).inspect_err(|_| {
@@ -724,10 +692,7 @@ pub async fn sigv4_auth_middleware(
             // Cap replay cache size to prevent memory exhaustion under attack.
             // Evict expired entries first; only if still over cap, evict oldest half.
             let replay_window = std::time::Duration::from_secs(
-                std::env::var("DGP_REPLAY_WINDOW_SECS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(2),
+                crate::config::env_parse_with_default("DGP_REPLAY_WINDOW_SECS", 2),
             );
 
             const MAX_REPLAY_ENTRIES: usize = 500_000;
@@ -899,7 +864,12 @@ fn build_canonical_query_string(query: &str, exclude_keys: &[&str]) -> String {
 }
 
 /// Percent-decode a URI component (e.g. `%2F` → `/`).
-fn percent_decode(input: &str) -> String {
+///
+/// Lossy on invalid UTF-8 sequences (substitutes `U+FFFD`). This function
+/// is the canonical decoder used across the request path — SigV4 query
+/// parsing, admission middleware, and the admin trace endpoint all call
+/// it so their decoding semantics are identical by construction.
+pub fn percent_decode(input: &str) -> String {
     let mut result = Vec::with_capacity(input.len());
     let bytes = input.as_bytes();
     let mut i = 0;

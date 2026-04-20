@@ -155,30 +155,25 @@ pub async fn login(
     req_headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> impl IntoResponse {
-    // Extract client IP for rate limiting
-    let client_ip = rate_limiter::extract_client_ip(&req_headers)
-        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-
-    // Check rate limit before processing
-    if state.rate_limiter.is_limited(&client_ip) {
-        let count = state.rate_limiter.failure_count(&client_ip);
-        tracing::warn!(
-            "SECURITY | event=admin_brute_force_blocked | ip={} | attempts={}",
-            client_ip,
-            count
-        );
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            HeaderMap::new(),
-            Json(LoginResponse { ok: false }),
-        )
-            .into_response();
-    }
-    // Progressive delay: slow down responses under brute force
-    let delay = state.rate_limiter.progressive_delay(&client_ip);
-    if !delay.is_zero() {
-        tokio::time::sleep(delay).await;
-    }
+    // Brute-force protection: the guard handles IP extraction, lockout
+    // check, progressive delay, and lockout-transition logging.
+    let guard = match crate::rate_limiter::RateLimitGuard::enter(
+        &state.rate_limiter,
+        &req_headers,
+        "admin",
+    )
+    .await
+    {
+        Ok(g) => g,
+        Err(_blocked) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                HeaderMap::new(),
+                Json(LoginResponse { ok: false }),
+            )
+                .into_response();
+        }
+    };
 
     let hash = state.password_hash.read().clone();
     let valid = match bcrypt::verify(&body.password, &hash) {
@@ -195,20 +190,8 @@ pub async fn login(
     };
 
     if !valid {
-        let locked = state.rate_limiter.record_failure(&client_ip);
-        let count = state.rate_limiter.failure_count(&client_ip);
-        if locked {
-            tracing::warn!(
-                "SECURITY | event=admin_brute_force_lockout | ip={} | attempts={}",
-                client_ip,
-                count
-            );
-        }
-        tracing::warn!(
-            "Failed login attempt from {} (locked={})",
-            client_ip,
-            locked
-        );
+        guard.record_failure();
+        tracing::warn!("Failed login attempt from {}", guard.ip());
         audit_log("login_failed", "", "bootstrap", &req_headers);
         return (
             StatusCode::UNAUTHORIZED,
@@ -219,7 +202,7 @@ pub async fn login(
     }
 
     // Successful login — reset rate limiter for this IP
-    state.rate_limiter.record_success(&client_ip);
+    guard.record_success();
     let token = state.sessions.create_session(
         rate_limiter::extract_client_ip(&req_headers),
         AuthMethod::Bootstrap,
@@ -375,25 +358,10 @@ pub async fn login_as(
     req_headers: HeaderMap,
     Json(body): Json<LoginAsRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    // Extract client IP for rate limiting
-    let client_ip = rate_limiter::extract_client_ip(&req_headers)
-        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-
-    // Check rate limit before processing
-    if state.rate_limiter.is_limited(&client_ip) {
-        let count = state.rate_limiter.failure_count(&client_ip);
-        tracing::warn!(
-            "SECURITY | event=login_as_brute_force_blocked | ip={} | attempts={}",
-            client_ip,
-            count
-        );
-        return Err(StatusCode::TOO_MANY_REQUESTS);
-    }
-    // Progressive delay under brute force
-    let delay = state.rate_limiter.progressive_delay(&client_ip);
-    if !delay.is_zero() {
-        tokio::time::sleep(delay).await;
-    }
+    let guard =
+        crate::rate_limiter::RateLimitGuard::enter(&state.rate_limiter, &req_headers, "login_as")
+            .await
+            .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
 
     let iam_state = state.iam_state.load();
     let user = match &**iam_state {
@@ -404,10 +372,10 @@ pub async fn login_as(
     let user = match user {
         Some(u) => u,
         None => {
-            state.rate_limiter.record_failure(&client_ip);
+            guard.record_failure();
             tracing::warn!(
                 "Failed login-as attempt from {} (unknown access key '{}')",
-                client_ip,
+                guard.ip(),
                 body.access_key_id
             );
             audit_log("login_failed", "", &body.access_key_id, &req_headers);
@@ -424,10 +392,10 @@ pub async fn login_as(
     let stored_hash = Sha256::digest(user.secret_access_key.as_bytes());
     let provided_hash = Sha256::digest(body.secret_access_key.as_bytes());
     if stored_hash.ct_ne(&provided_hash).into() {
-        state.rate_limiter.record_failure(&client_ip);
+        guard.record_failure();
         tracing::warn!(
             "Failed login-as attempt from {} (secret mismatch for '{}')",
-            client_ip,
+            guard.ip(),
             body.access_key_id
         );
         audit_log("login_failed", "", &body.access_key_id, &req_headers);
@@ -439,7 +407,7 @@ pub async fn login_as(
     }
 
     // Successful login — reset rate limiter
-    state.rate_limiter.record_success(&client_ip);
+    guard.record_success();
 
     let token = state.sessions.create_session(
         rate_limiter::extract_client_ip(&req_headers),

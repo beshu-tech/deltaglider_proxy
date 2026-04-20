@@ -127,19 +127,30 @@ pub async fn oauth_callback(
         params.error,
     );
 
-    // Rate limit OAuth callbacks to prevent abuse.
-    // Use the raw Option for session binding (not unwrap_or) — the session validation
-    // must see the same value. If no IP is available, the session won't be IP-bound.
-    let client_ip_for_rate_limit = rate_limiter::extract_client_ip(&req_headers)
-        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    // Rate limit OAuth callbacks to prevent abuse. The guard handles the
+    // UNSPECIFIED fallback, lockout log, and progressive delay.
+    //
+    // Session binding needs the ORIGINAL `Option<IpAddr>` (not the
+    // fallback) — a session created with UNSPECIFIED would incorrectly
+    // bind to "any" address. Keep a separate `extract_client_ip` call
+    // that preserves the `None` signal for session creation.
+    let guard = match crate::rate_limiter::RateLimitGuard::enter(
+        &state.rate_limiter,
+        &req_headers,
+        "oauth_callback",
+    )
+    .await
+    {
+        Ok(g) => g,
+        Err(_) => {
+            return error_page(
+                "Too Many Requests",
+                "Too many authentication attempts. Please wait and try again.",
+            )
+            .into_response();
+        }
+    };
     let client_ip_for_session = rate_limiter::extract_client_ip(&req_headers);
-    if state.rate_limiter.is_limited(&client_ip_for_rate_limit) {
-        return error_page(
-            "Too Many Requests",
-            "Too many authentication attempts. Please wait and try again.",
-        )
-        .into_response();
-    }
 
     // Check for provider error response
     if let Some(err) = &params.error {
@@ -178,7 +189,7 @@ pub async fn oauth_callback(
     let pending = match ext_auth.consume_pending(state_token) {
         Ok(p) => p,
         Err(_) => {
-            state.rate_limiter.record_failure(&client_ip_for_rate_limit);
+            guard.record_failure();
             return error_page(
                 "Authentication Failed",
                 "Invalid or expired authentication state. Please try again.",
@@ -344,7 +355,7 @@ pub async fn oauth_callback(
     trigger_config_sync(&state);
 
     // Successful OAuth login — reset rate limiter for this IP
-    state.rate_limiter.record_success(&client_ip_for_rate_limit);
+    guard.record_success();
 
     // Create session — use raw Option<IpAddr> so session validation sees the same value
     let token = state.sessions.create_session(
@@ -594,6 +605,34 @@ pub async fn update_mapping(
     Path(id): Path<i64>,
     Json(body): Json<UpdateMappingRuleRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
+    // Validate match_type if provided
+    if let Some(ref mt) = body.match_type {
+        let valid_types = [
+            "email_exact",
+            "email_domain",
+            "email_glob",
+            "email_regex",
+            "claim_value",
+        ];
+        if !valid_types.contains(&mt.as_str()) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+
+    // Validate regex if match_type is (or becomes) email_regex
+    let is_regex_type = body
+        .match_type
+        .as_deref()
+        .map(|t| t == "email_regex")
+        .unwrap_or(false);
+    if is_regex_type {
+        if let Some(ref val) = body.match_value {
+            if regex::Regex::new(val).is_err() {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+    }
+
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let db = db.lock().await;
     let rule = db.update_group_mapping_rule(id, &body).map_err(|e| {

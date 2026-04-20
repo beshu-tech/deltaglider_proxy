@@ -30,6 +30,15 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             "/_/api/admin/config",
             get(admin::get_config).put(admin::update_config),
         )
+        // Document-level config operations (Phase 1 — GitOps + Copy-as-YAML)
+        .route("/_/api/admin/config/export", get(admin::export_config))
+        .route("/_/api/admin/config/defaults", get(admin::config_defaults))
+        .route(
+            "/_/api/admin/config/validate",
+            post(admin::validate_config_doc),
+        )
+        .route("/_/api/admin/config/apply", post(admin::apply_config_doc))
+        .route("/_/api/admin/config/trace", post(admin::trace_config))
         .route("/_/api/admin/password", put(admin::change_password))
         .route("/_/api/admin/session", get(admin::check_session))
         .route("/_/api/admin/test-s3", post(admin::test_s3_connection))
@@ -192,9 +201,7 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             // because the UI is served from the same origin. allow_origin(Any) would
             // enable CSRF attacks against session-cookie-authenticated admin endpoints.
             // Only enable permissive CORS when DGP_CORS_PERMISSIVE=true (dev mode).
-            let permissive = std::env::var("DGP_CORS_PERMISSIVE")
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(false);
+            let permissive = deltaglider_proxy::config::env_bool("DGP_CORS_PERMISSIVE", false);
             if permissive {
                 CorsLayer::new()
                     .allow_origin(Any)

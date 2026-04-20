@@ -41,6 +41,11 @@ pub struct TestServer {
     bucket: String,
     /// Auth credentials for the test server (None = open access).
     auth_creds: Option<(String, String)>,
+    /// Absolute path of the config file the server was spawned with (via
+    /// `DGP_CONFIG`). Exposed so tests can verify that admin-API config
+    /// mutations persist to this specific file rather than to a
+    /// CWD-relative default.
+    config_path: std::path::PathBuf,
 }
 
 impl TestServer {
@@ -157,6 +162,7 @@ impl TestServer {
             _data_dir: data_dir,
             bucket: bucket.to_string(),
             auth_creds,
+            config_path,
         };
         server.wait_ready().await;
         server.ensure_bucket().await;
@@ -243,6 +249,14 @@ impl TestServer {
     }
 
     /// Get the data directory path (filesystem backend only)
+    /// Path of the config file the server was spawned with. Tests can read
+    /// this to verify that admin-API config mutations persist to the
+    /// correct file (regression coverage for the `backends.rs`
+    /// `DEFAULT_CONFIG_FILENAME` hardcoding bug).
+    pub fn config_path(&self) -> &std::path::Path {
+        &self.config_path
+    }
+
     pub fn data_dir(&self) -> Option<&std::path::Path> {
         self._data_dir.as_ref().map(|d| d.path())
     }

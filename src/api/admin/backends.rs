@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::config::{BackendConfig, NamedBackendConfig};
 
-use super::{trigger_config_sync, AdminState};
+use super::AdminState;
 
 #[derive(Serialize)]
 pub struct BackendListResponse {
@@ -163,10 +163,21 @@ pub async fn create_backend(
         );
     }
 
-    if let Err(e) = cfg.persist_to_file(crate::config::DEFAULT_CONFIG_FILENAME) {
-        tracing::warn!("Failed to persist config: {}", e);
+    // Persist to the active config file resolved at startup from `--config`
+    // or the search-path walk. Hardcoding `DEFAULT_CONFIG_FILENAME` here
+    // used to silently redirect admin-API writes to a stale location when
+    // the operator had launched with `--config /etc/dgp/config.yaml`,
+    // producing a latent "my backend disappears on restart" bug.
+    //
+    // Note: we do NOT call `trigger_config_sync` here. That helper uploads
+    // the SQLCipher IAM database to S3 — a backend mutation changes the
+    // TOML/YAML config file, not the IAM DB, so the sync would be a no-op
+    // network round-trip. Handlers that DO mutate the IAM DB (users,
+    // groups, external_auth, password) are the correct callers.
+    let persist_path = super::config::active_config_path(&state);
+    if let Err(e) = cfg.persist_to_file(&persist_path) {
+        tracing::warn!("Failed to persist config to {}: {}", persist_path, e);
     }
-    trigger_config_sync(&state);
 
     (
         axum::http::StatusCode::CREATED,
@@ -254,10 +265,21 @@ pub async fn delete_backend(
         );
     }
 
-    if let Err(e) = cfg.persist_to_file(crate::config::DEFAULT_CONFIG_FILENAME) {
-        tracing::warn!("Failed to persist config: {}", e);
+    // Persist to the active config file resolved at startup from `--config`
+    // or the search-path walk. Hardcoding `DEFAULT_CONFIG_FILENAME` here
+    // used to silently redirect admin-API writes to a stale location when
+    // the operator had launched with `--config /etc/dgp/config.yaml`,
+    // producing a latent "my backend disappears on restart" bug.
+    //
+    // Note: we do NOT call `trigger_config_sync` here. That helper uploads
+    // the SQLCipher IAM database to S3 — a backend mutation changes the
+    // TOML/YAML config file, not the IAM DB, so the sync would be a no-op
+    // network round-trip. Handlers that DO mutate the IAM DB (users,
+    // groups, external_auth, password) are the correct callers.
+    let persist_path = super::config::active_config_path(&state);
+    if let Err(e) = cfg.persist_to_file(&persist_path) {
+        tracing::warn!("Failed to persist config to {}: {}", persist_path, e);
     }
-    trigger_config_sync(&state);
 
     (
         axum::http::StatusCode::OK,

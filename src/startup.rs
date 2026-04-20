@@ -207,10 +207,8 @@ pub fn init_replay_cache() -> deltaglider_proxy::api::auth::ReplayCache {
     // Cleanup cutoff must match the replay detection window (DGP_CLOCK_SKEW_SECONDS,
     // default 300s). Using a shorter cutoff would evict entries while they're still
     // within the valid clock-skew window, allowing replayed requests to succeed.
-    let replay_window_secs: u64 = std::env::var("DGP_CLOCK_SKEW_SECONDS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(300);
+    let replay_window_secs: u64 =
+        deltaglider_proxy::config::env_parse_with_default("DGP_CLOCK_SKEW_SECONDS", 300);
     spawn_periodic(Duration::from_secs(60), {
         let cache = replay_cache.clone();
         move || {
@@ -297,6 +295,7 @@ pub fn build_s3_router(
     config: &Config,
     config_db_mismatch: bool,
     public_prefix_snapshot: &deltaglider_proxy::bucket_policy::SharedPublicPrefixSnapshot,
+    admission_chain: &deltaglider_proxy::admission::SharedAdmissionChain,
 ) -> Router {
     // S3 API paths:
     //   GET / - list buckets
@@ -350,8 +349,15 @@ pub fn build_s3_router(
         .layer(middleware::from_fn(authorization_middleware))
         // SigV4 authentication (looks up user, verifies signature)
         .layer(middleware::from_fn(sigv4_auth_middleware))
+        // Admission chain — pre-auth gating. Layered AFTER SigV4 in builder
+        // order so it runs BEFORE SigV4 at request time (axum applies
+        // layers in reverse).
+        .layer(middleware::from_fn(
+            deltaglider_proxy::admission::admission_middleware,
+        ))
         .layer(axum::Extension(iam_state.clone()))
-        .layer(axum::Extension(public_prefix_snapshot.clone()));
+        .layer(axum::Extension(public_prefix_snapshot.clone()))
+        .layer(axum::Extension(admission_chain.clone()));
 
     // If config DB mismatch, inject guard that blocks all S3 API requests
     if config_db_mismatch {
@@ -375,20 +381,18 @@ pub fn build_s3_router(
         // Returns HTTP 504 Gateway Timeout (appropriate for a proxy).
         .layer(tower_http::timeout::TimeoutLayer::with_status_code(
             axum::http::StatusCode::GATEWAY_TIMEOUT,
-            std::time::Duration::from_secs(
-                std::env::var("DGP_REQUEST_TIMEOUT_SECS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(300u64),
-            ),
+            std::time::Duration::from_secs(deltaglider_proxy::config::env_parse_with_default(
+                "DGP_REQUEST_TIMEOUT_SECS",
+                300u64,
+            )),
         ))
         // Limit total concurrent in-flight requests to prevent resource exhaustion.
         // Default: 1024. Override via DGP_MAX_CONCURRENT_REQUESTS.
         .layer(tower::limit::ConcurrencyLimitLayer::new(
-            std::env::var("DGP_MAX_CONCURRENT_REQUESTS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1024usize),
+            deltaglider_proxy::config::env_parse_with_default(
+                "DGP_MAX_CONCURRENT_REQUESTS",
+                1024usize,
+            ),
         ))
         // CORS must be outermost to handle OPTIONS preflight before auth
         .layer(CorsLayer::permissive())
@@ -627,7 +631,10 @@ pub async fn init_tls(
     config: &Config,
 ) -> Result<Option<axum_server::tls_rustls::RustlsConfig>, Box<dyn std::error::Error>> {
     if config.tls_enabled() {
-        let tls_cfg = config.tls.as_ref().unwrap();
+        let tls_cfg = config
+            .tls
+            .as_ref()
+            .expect("tls_enabled() implies tls config is Some");
         let rc = deltaglider_proxy::tls::build_rustls_config(tls_cfg).await?;
         if tls_cfg.cert_path.is_some() {
             info!("  TLS: enabled (user-provided certificate)");

@@ -229,3 +229,36 @@ jobs:
         run: cd demo/s3-browser/ui && npx tsc --noEmit || true  # warn-only (recharts types missing)
       - name: npm audit
         run: cd demo/s3-browser/ui && npm audit --audit-level=high || true  # warn-only
+
+  config-schema:
+    name: Config JSON Schema
+    runs-on: k3s
+    timeout-minutes: 10
+    container:
+      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Build demo UI (required by rust-embed)
+        run: cd demo/s3-browser/ui && npm ci && npm run build
+      - name: Generate canonical JSON Schema
+        run: |
+          mkdir -p schema
+          cargo run --locked --quiet -- config schema --out schema/deltaglider.schema.json
+          echo "--- schema head ---"
+          head -40 schema/deltaglider.schema.json
+      - name: Verify schema accepts migrated example
+        run: |
+          cargo run --locked --quiet -- config migrate deltaglider_proxy.toml.example \
+            --out /tmp/migrated.yaml
+          # Round-trip check: loading the migrated YAML must succeed.
+          cargo run --locked --quiet -- config migrate /tmp/migrated.yaml \
+            --out /tmp/roundtrip.yaml
+          diff /tmp/migrated.yaml /tmp/roundtrip.yaml
+      - name: Upload schema artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deltaglider-config-schema
+          path: schema/deltaglider.schema.json

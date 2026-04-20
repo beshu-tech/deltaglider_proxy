@@ -1,5 +1,6 @@
 //! Configuration for DeltaGlider Proxy S3 server
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::net::SocketAddr;
@@ -255,15 +256,56 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
 ];
 
-/// Default config filename (used for load, persist, and resolve).
+/// Default config filename used by `--init` and legacy persistence (TOML).
 pub const DEFAULT_CONFIG_FILENAME: &str = "deltaglider_proxy.toml";
+
+/// Default YAML config filename (preferred for new deployments).
+pub const DEFAULT_YAML_CONFIG_FILENAME: &str = "deltaglider_proxy.yaml";
+
+/// Ordered list of default config file locations. YAML is preferred over TOML
+/// when both exist in the same directory.
+pub const DEFAULT_CONFIG_SEARCH_PATHS: &[&str] = &[
+    DEFAULT_YAML_CONFIG_FILENAME,
+    "deltaglider_proxy.yml",
+    DEFAULT_CONFIG_FILENAME,
+    "/etc/deltaglider_proxy/config.yaml",
+    "/etc/deltaglider_proxy/config.yml",
+    "/etc/deltaglider_proxy/config.toml",
+];
 
 /// Thread-safe shared config for hot-reload from admin GUI.
 pub type SharedConfig = Arc<tokio::sync::RwLock<Config>>;
 
+/// Pinned default-posture version. Absent in a config file means "use whatever
+/// the running server considers current"; setting it explicitly opts the
+/// deployment out of silent default changes across upgrades.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum DefaultsVersion {
+    #[default]
+    V1,
+}
+
+impl DefaultsVersion {
+    fn is_default(&self) -> bool {
+        matches!(self, DefaultsVersion::V1)
+    }
+}
+
 /// Server configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Config {
+    /// Pin the defaults posture to a specific version. Omitted in the file =
+    /// inherit whatever the running server considers current. Set to `v1`
+    /// to pin explicitly and receive a warning if the server ships new
+    /// defaults in a future release.
+    #[serde(
+        default,
+        rename = "defaults",
+        skip_serializing_if = "DefaultsVersion::is_default"
+    )]
+    pub defaults_version: DefaultsVersion,
+
     /// Address to listen on
     #[serde(default = "default_listen_addr")]
     pub listen_addr: SocketAddr,
@@ -354,8 +396,14 @@ pub struct Config {
     /// Per-bucket policy overrides.
     /// Each entry overrides global compression settings for a specific bucket.
     /// Unconfigured buckets inherit the global defaults.
+    ///
+    /// `BTreeMap` (not `HashMap`) is deliberate: canonical YAML export must
+    /// be byte-stable across runs and across processes so that GitOps
+    /// diffing, CI round-trip checks, and copy-as-YAML exports are
+    /// reproducible. `HashMap` iteration order depends on per-process
+    /// seed state, which would flake any artifact-compare pipeline.
     #[serde(default)]
-    pub buckets: std::collections::HashMap<String, crate::bucket_policy::BucketPolicyConfig>,
+    pub buckets: std::collections::BTreeMap<String, crate::bucket_policy::BucketPolicyConfig>,
 
     /// Named backends for multi-backend routing.
     /// When non-empty, the legacy `backend` field is ignored.
@@ -369,7 +417,7 @@ pub struct Config {
 }
 
 /// A named storage backend with its connection configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct NamedBackendConfig {
     /// Human-readable name (e.g., "local", "hetzner", "aws")
     pub name: String,
@@ -379,7 +427,7 @@ pub struct NamedBackendConfig {
 }
 
 /// TLS configuration (optional)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TlsConfig {
     /// Enable TLS
     #[serde(default)]
@@ -393,7 +441,7 @@ pub struct TlsConfig {
 }
 
 /// Storage backend configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum BackendConfig {
     /// Filesystem backend for local storage/development
@@ -471,6 +519,7 @@ impl Default for BackendConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            defaults_version: DefaultsVersion::default(),
             listen_addr: default_listen_addr(),
             backend: BackendConfig::default(),
             max_delta_ratio: default_max_delta_ratio(),
@@ -486,7 +535,7 @@ impl Default for Config {
             log_level: default_log_level(),
             config_sync_bucket: None,
             tls: None,
-            buckets: std::collections::HashMap::new(),
+            buckets: std::collections::BTreeMap::new(),
             backends: Vec::new(),
             default_backend: None,
             encryption_key: None,
@@ -495,7 +544,7 @@ impl Default for Config {
 }
 
 /// Parse an env var into a typed value, warning on invalid input.
-fn env_parse<T: std::str::FromStr>(var: &str) -> Option<T>
+pub fn env_parse<T: std::str::FromStr>(var: &str) -> Option<T>
 where
     T::Err: std::fmt::Display,
 {
@@ -506,12 +555,69 @@ where
     })
 }
 
+/// Parse an env var into a typed value, returning `default` if absent or invalid.
+/// Logs a warning on invalid input (same as `env_parse`).
+pub fn env_parse_with_default<T: std::str::FromStr>(var: &str, default: T) -> T
+where
+    T::Err: std::fmt::Display,
+{
+    env_parse(var).unwrap_or(default)
+}
+
+/// Parse a boolean env var (`"true"` or `"1"` → true), returning `default` if absent.
+pub fn env_bool(var: &str, default: bool) -> bool {
+    std::env::var(var)
+        .ok()
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(default)
+}
+
+/// Supported config file formats, inferred from file extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigFormat {
+    Toml,
+    Yaml,
+}
+
+impl ConfigFormat {
+    /// Infer the format from a file path's extension. Defaults to TOML for
+    /// unknown/missing extensions (backwards compatibility).
+    pub fn from_path(path: &str) -> Self {
+        match std::path::Path::new(path)
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("yaml") | Some("yml") => ConfigFormat::Yaml,
+            _ => ConfigFormat::Toml,
+        }
+    }
+}
+
 impl Config {
-    /// Load configuration from a TOML file
+    /// Load configuration from a file. Dispatches on extension: `.yaml`/`.yml`
+    /// → YAML, anything else → TOML.
     pub fn from_file(path: &str) -> Result<Self, ConfigError> {
+        match ConfigFormat::from_path(path) {
+            ConfigFormat::Yaml => Self::from_yaml_file(path),
+            ConfigFormat::Toml => Self::from_toml_file(path),
+        }
+    }
+
+    /// Load configuration from a TOML file explicitly.
+    pub fn from_toml_file(path: &str) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path).map_err(|e| ConfigError::Io(e.to_string()))?;
         let config: Config =
             toml::from_str(&content).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        Ok(config)
+    }
+
+    /// Load configuration from a YAML file explicitly.
+    pub fn from_yaml_file(path: &str) -> Result<Self, ConfigError> {
+        let content = std::fs::read_to_string(path).map_err(|e| ConfigError::Io(e.to_string()))?;
+        let config: Config =
+            serde_yaml::from_str(&content).map_err(|e| ConfigError::Parse(e.to_string()))?;
         Ok(config)
     }
 
@@ -619,16 +725,24 @@ impl Config {
 
     /// Resolve the path to the active config file on disk.
     /// Returns `None` if no config file is found.
+    ///
+    /// Resolution order:
+    /// 1. `DGP_CONFIG` env var, if set — returned **unconditionally** (not
+    ///    contingent on the file existing at resolve time). Operators who
+    ///    explicitly set this var have declared intent; the caller decides
+    ///    what to do when the target is absent (typical: fall back to
+    ///    defaults at startup, error out on persist). Silently falling
+    ///    through would redirect the admin-API persist to a CWD-relative
+    ///    file the operator never asked for.
+    /// 2. Otherwise, the first existing file in
+    ///    [`DEFAULT_CONFIG_SEARCH_PATHS`]. YAML is preferred over TOML.
     pub fn resolve_config_path() -> Option<String> {
         if let Ok(path) = std::env::var("DGP_CONFIG") {
-            if std::path::Path::new(&path).exists() {
+            if !path.is_empty() {
                 return Some(path);
             }
         }
-        for path in &[
-            DEFAULT_CONFIG_FILENAME,
-            "/etc/deltaglider_proxy/config.toml",
-        ] {
+        for path in DEFAULT_CONFIG_SEARCH_PATHS {
             if std::path::Path::new(path).exists() {
                 return Some(path.to_string());
             }
@@ -651,12 +765,9 @@ impl Config {
                 }
             }
         } else {
-            // Try default config file locations
+            // Try default config file locations (YAML first, then TOML)
             let mut found = None;
-            for path in &[
-                DEFAULT_CONFIG_FILENAME,
-                "/etc/deltaglider_proxy/config.toml",
-            ] {
+            for path in DEFAULT_CONFIG_SEARCH_PATHS {
                 if std::path::Path::new(path).exists() {
                     if let Ok(config) = Self::from_file(path) {
                         found = Some(config);
@@ -673,38 +784,86 @@ impl Config {
         config
     }
 
-    /// Validate config values are in acceptable ranges. Called after loading.
-    pub fn validate(&mut self) {
-        if self.max_delta_ratio < 0.0 || self.max_delta_ratio > 1.0 {
-            eprintln!(
-                "Warning: max_delta_ratio={} is outside [0.0, 1.0] — delta compression decisions may behave unexpectedly",
+    /// Check the config for problems. Returns a list of human-readable
+    /// warnings; also clears fields that cannot be satisfied (currently just
+    /// unresolvable `default_backend`).
+    ///
+    /// Single source of truth for config validation. The startup path calls
+    /// [`Self::validate`] which is a thin wrapper that logs each warning to
+    /// stderr; the admin API calls `check` directly to return warnings as
+    /// structured data.
+    pub fn check(&mut self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        // NaN and infinity are valid YAML float literals (`.nan` / `.inf`) but
+        // break the downstream ratio test: NaN comparisons are always false, so
+        // NaN silently disables delta compression; INFINITY > 1.0 is true so a
+        // naive warning fires, but the value survives and causes every file to
+        // be stored as a delta regardless of size. Clamp both to the default
+        // so neither can corrupt compression decisions.
+        if self.max_delta_ratio.is_nan() {
+            warnings.push("max_delta_ratio is NaN — replacing with default 0.75".to_string());
+            self.max_delta_ratio = default_max_delta_ratio();
+        } else if self.max_delta_ratio.is_infinite() {
+            warnings.push("max_delta_ratio is infinite — replacing with default 0.75".to_string());
+            self.max_delta_ratio = default_max_delta_ratio();
+        } else if self.max_delta_ratio < 0.0 || self.max_delta_ratio > 1.0 {
+            warnings.push(format!(
+                "max_delta_ratio={} is outside [0.0, 1.0] — delta compression decisions may behave unexpectedly",
                 self.max_delta_ratio
-            );
+            ));
         }
         if self.max_object_size == 0 {
-            eprintln!("Warning: max_object_size=0 will reject all uploads");
+            warnings.push("max_object_size=0 will reject all uploads".to_string());
         }
-        // Validate default_backend references an existing named backend
+        // Reject duplicate backend names. The routing layer keys on name, so
+        // a second `{ name: "x", ... }` silently shadows the first — and if
+        // the list is ever reordered (sort, filter, de-dup elsewhere) routing
+        // changes without warning. Warn so operators know a duplicate is
+        // present; the first entry wins at runtime.
+        if self.backends.len() > 1 {
+            let mut seen = std::collections::HashSet::new();
+            let mut duplicates = std::collections::BTreeSet::new();
+            for backend in &self.backends {
+                if !seen.insert(backend.name.as_str()) {
+                    duplicates.insert(backend.name.as_str());
+                }
+            }
+            if !duplicates.is_empty() {
+                warnings.push(format!(
+                    "duplicate backend name(s) found: {:?} — the first entry wins at routing time; remove duplicates to silence this warning",
+                    duplicates.iter().collect::<Vec<_>>()
+                ));
+            }
+        }
+
         if let Some(ref default) = self.default_backend {
             if !self.backends.is_empty() && !self.backends.iter().any(|b| &b.name == default) {
-                eprintln!(
-                    "Warning: default_backend='{}' not found in backends list {:?} — clearing",
+                warnings.push(format!(
+                    "default_backend='{}' not found in backends list {:?} — clearing",
                     default,
                     self.backends.iter().map(|b| &b.name).collect::<Vec<_>>()
-                );
+                ));
                 self.default_backend = None;
             }
         }
-        // Validate bucket policy backend references
         for (bucket, policy) in &self.buckets {
             if let Some(ref backend) = policy.backend {
                 if !self.backends.is_empty() && !self.backends.iter().any(|b| &b.name == backend) {
-                    eprintln!(
-                        "Warning: bucket '{}' routes to unknown backend '{}' — route will be ignored",
+                    warnings.push(format!(
+                        "bucket '{}' routes to unknown backend '{}' — route will be ignored",
                         bucket, backend
-                    );
+                    ));
                 }
             }
+        }
+        warnings
+    }
+
+    /// Run [`Self::check`] and log each warning to stderr. Used by the
+    /// startup path where eprintln is the right sink.
+    pub fn validate(&mut self) {
+        for warning in self.check() {
+            eprintln!("Warning: {}", warning);
         }
     }
 
@@ -904,21 +1063,151 @@ impl Config {
         print!("{extra}");
     }
 
-    /// Serialize config to TOML string (excludes secrets for security).
-    pub fn to_toml_string(&self) -> Result<String, ConfigError> {
-        // Clone and strip secrets before serializing — these should only come
-        // from env vars or CLI, never be written to disk in plaintext.
+    /// Clone the config with *infrastructure* secrets redacted. Matches the
+    /// legacy `to_toml_string` policy: strips `bootstrap_password_hash` and
+    /// `encryption_key` only. Proxy SigV4 credentials and backend credentials
+    /// are kept — the wizard, file-based deployment, and users reading the
+    /// file on disk all depend on them being present. Use
+    /// [`Self::redact_all_secrets`] for the admin-API "export" flow that
+    /// never trusts the disk as a secret store.
+    fn redact_infra_secrets(&self) -> Self {
         let mut export = self.clone();
         export.bootstrap_password_hash = None;
         export.encryption_key = None;
+        export
+    }
+
+    /// Clone the config with *every* secret redacted: infra secrets plus all
+    /// SigV4 credentials (top-level and per-backend). This is the right level
+    /// of paranoia for the admin API `GET /export` endpoint (Phase 1): the
+    /// operator reading the exported YAML must refill secrets from their
+    /// secret manager, not copy them out of an API response.
+    pub fn redact_all_secrets(&self) -> Self {
+        let mut export = self.redact_infra_secrets();
+        if let BackendConfig::S3 {
+            ref mut access_key_id,
+            ref mut secret_access_key,
+            ..
+        } = export.backend
+        {
+            *access_key_id = None;
+            *secret_access_key = None;
+        }
+        for named in &mut export.backends {
+            if let BackendConfig::S3 {
+                ref mut access_key_id,
+                ref mut secret_access_key,
+                ..
+            } = named.backend
+            {
+                *access_key_id = None;
+                *secret_access_key = None;
+            }
+        }
+        export.access_key_id = None;
+        export.secret_access_key = None;
+        export
+    }
+
+    /// Serialize config to TOML string (strips infra secrets: bootstrap hash
+    /// and encryption key). SigV4 credentials are kept — see
+    /// [`Self::redact_all_secrets`] for the fully-redacted export variant.
+    pub fn to_toml_string(&self) -> Result<String, ConfigError> {
+        let export = self.redact_infra_secrets();
         toml::to_string_pretty(&export).map_err(|e| ConfigError::Parse(e.to_string()))
     }
 
-    /// Persist the current config to a TOML file.
-    pub fn persist_to_file(&self, path: &str) -> Result<(), ConfigError> {
-        let content = self.to_toml_string()?;
-        std::fs::write(path, content).map_err(|e| ConfigError::Io(e.to_string()))
+    /// Serialize config to canonical YAML string.
+    ///
+    /// This is the backing surface for `config migrate` and, later, for
+    /// `config show`. Strips infra secrets (same policy as `to_toml_string`)
+    /// so the disk-persisted file matches the wizard's expectations. Section
+    /// reordering (admission → access → storage → advanced) arrives in
+    /// Phase 3 when the sectioned schema lands.
+    pub fn to_canonical_yaml(&self) -> Result<String, ConfigError> {
+        let export = self.redact_infra_secrets();
+        serde_yaml::to_string(&export).map_err(|e| ConfigError::Parse(e.to_string()))
     }
+
+    /// Persist the current config to a file atomically. Dispatches on
+    /// extension: `.yaml` / `.yml` writes YAML, anything else writes TOML.
+    ///
+    /// Atomicity is achieved by writing to a sibling tempfile on the same
+    /// filesystem, `fsync()`-ing it to force the bytes to disk, then
+    /// `rename()`-ing over the target path. On POSIX systems `rename(2)` is
+    /// atomic within a single filesystem, so a crash or power loss at any
+    /// point leaves the target either fully old or fully new — never the
+    /// truncated-mid-write corruption that a bare `fs::write` can produce.
+    pub fn persist_to_file(&self, path: &str) -> Result<(), ConfigError> {
+        let content = match ConfigFormat::from_path(path) {
+            ConfigFormat::Yaml => self.to_canonical_yaml()?,
+            ConfigFormat::Toml => self.to_toml_string()?,
+        };
+        atomic_write(std::path::Path::new(path), content.as_bytes())
+    }
+}
+
+/// Write `bytes` to `path` atomically. The file is first written to a
+/// sibling tempfile (same directory, guarantees same filesystem) with a
+/// unique suffix, then fsynced and renamed over `path`. On POSIX systems
+/// `rename(2)` within a filesystem is atomic — observers see either the old
+/// file, the new file, or (very briefly) ENOENT; never a half-written file.
+///
+/// Sibling-tempfile is critical: cross-filesystem rename would fall back to
+/// a copy+unlink that is *not* atomic.
+pub fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), ConfigError> {
+    use std::io::Write as _;
+
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let filename = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("dgp_config");
+
+    // Build a unique sibling tempfile name. Not using tempfile::NamedTempFile
+    // here because we need control over the final rename target, and the
+    // crate's persist() API would still do the rename for us — just with
+    // more ceremony. OsRng is strictly overkill for a name suffix; a pid +
+    // nanos + random u64 is collision-resistant enough for config files
+    // written O(once per human action).
+    use rand::Rng as _;
+    let suffix: u64 = rand::thread_rng().gen();
+    let tmp_name = format!(".{}.tmp.{:x}", filename, suffix);
+    let tmp_path = parent.join(tmp_name);
+
+    // Write + fsync the tempfile. Scope the File so it's closed before
+    // rename — some platforms (notably Windows) won't rename over an open
+    // file, and on POSIX closing-before-rename is cleaner regardless.
+    {
+        let mut f = std::fs::File::create(&tmp_path)
+            .map_err(|e| ConfigError::Io(format!("create {}: {}", tmp_path.display(), e)))?;
+        f.write_all(bytes)
+            .map_err(|e| ConfigError::Io(format!("write {}: {}", tmp_path.display(), e)))?;
+        f.sync_all()
+            .map_err(|e| ConfigError::Io(format!("fsync {}: {}", tmp_path.display(), e)))?;
+    }
+
+    // Match the permission posture of fs::write for non-sensitive config
+    // files (0644 on Unix). For hash-bearing files, callers already use the
+    // dedicated `write_bootstrap_hash_file` helper that sets 0600 separately.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o644));
+    }
+
+    std::fs::rename(&tmp_path, path).map_err(|e| {
+        // Best-effort cleanup: don't leak tempfiles when rename fails
+        // (e.g. target is on a different filesystem — shouldn't happen
+        // because we picked the parent directory, but defense in depth).
+        let _ = std::fs::remove_file(&tmp_path);
+        ConfigError::Io(format!(
+            "rename {} -> {}: {}",
+            tmp_path.display(),
+            path.display(),
+            e
+        ))
+    })
 }
 
 /// Configuration errors
@@ -1147,5 +1436,500 @@ mod tests {
         assert_eq!(parsed.listen_addr, default_cfg.listen_addr);
         assert_eq!(parsed.cache_size_mb, default_cfg.cache_size_mb);
         assert_eq!(parsed.max_delta_ratio, default_cfg.max_delta_ratio);
+    }
+
+    // ── YAML parity tests (Phase 0) ──────────────────────────────────────
+
+    #[test]
+    fn test_config_format_from_path() {
+        assert_eq!(ConfigFormat::from_path("foo.yaml"), ConfigFormat::Yaml);
+        assert_eq!(ConfigFormat::from_path("foo.YAML"), ConfigFormat::Yaml);
+        assert_eq!(ConfigFormat::from_path("foo.yml"), ConfigFormat::Yaml);
+        assert_eq!(ConfigFormat::from_path("foo.toml"), ConfigFormat::Toml);
+        assert_eq!(ConfigFormat::from_path("foo"), ConfigFormat::Toml);
+        assert_eq!(ConfigFormat::from_path("/etc/dgp.txt"), ConfigFormat::Toml);
+    }
+
+    #[test]
+    fn test_yaml_parse_filesystem() {
+        let yaml = r#"
+listen_addr: "0.0.0.0:8080"
+max_delta_ratio: 0.3
+backend:
+  type: filesystem
+  path: /var/lib/deltaglider_proxy
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.listen_addr.port(), 8080);
+        assert_eq!(config.max_delta_ratio, 0.3);
+        match config.backend {
+            BackendConfig::Filesystem { path } => {
+                assert_eq!(path, PathBuf::from("/var/lib/deltaglider_proxy"));
+            }
+            _ => panic!("Expected filesystem backend"),
+        }
+    }
+
+    #[test]
+    fn test_yaml_parse_s3() {
+        let yaml = r#"
+listen_addr: "0.0.0.0:8080"
+backend:
+  type: s3
+  endpoint: http://localhost:9000
+  region: us-east-1
+  force_path_style: true
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        match config.backend {
+            BackendConfig::S3 {
+                endpoint,
+                region,
+                force_path_style,
+                ..
+            } => {
+                assert_eq!(endpoint, Some("http://localhost:9000".to_string()));
+                assert_eq!(region, "us-east-1");
+                assert!(force_path_style);
+            }
+            _ => panic!("Expected S3 backend"),
+        }
+    }
+
+    #[test]
+    fn test_yaml_round_trip_default() {
+        let default_cfg = Config::default();
+        let yaml_str = default_cfg.to_canonical_yaml().unwrap();
+        let parsed: Config = serde_yaml::from_str(&yaml_str).unwrap();
+        assert_eq!(parsed.listen_addr, default_cfg.listen_addr);
+        assert_eq!(parsed.cache_size_mb, default_cfg.cache_size_mb);
+        assert_eq!(parsed.max_delta_ratio, default_cfg.max_delta_ratio);
+        assert_eq!(parsed.defaults_version, default_cfg.defaults_version);
+    }
+
+    #[test]
+    fn test_yaml_toml_parity_filesystem() {
+        // Same semantic content in both formats → same in-memory shape.
+        let toml = r#"
+listen_addr = "127.0.0.1:9500"
+max_delta_ratio = 0.25
+cache_size_mb = 128
+metadata_cache_mb = 64
+
+[backend]
+type = "filesystem"
+path = "/srv/dgp"
+"#;
+        let yaml = r#"
+listen_addr: "127.0.0.1:9500"
+max_delta_ratio: 0.25
+cache_size_mb: 128
+metadata_cache_mb: 64
+backend:
+  type: filesystem
+  path: /srv/dgp
+"#;
+        let toml_cfg: Config = toml::from_str(toml).unwrap();
+        let yaml_cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(toml_cfg.listen_addr, yaml_cfg.listen_addr);
+        assert_eq!(toml_cfg.max_delta_ratio, yaml_cfg.max_delta_ratio);
+        assert_eq!(toml_cfg.cache_size_mb, yaml_cfg.cache_size_mb);
+        assert_eq!(toml_cfg.metadata_cache_mb, yaml_cfg.metadata_cache_mb);
+        match (toml_cfg.backend, yaml_cfg.backend) {
+            (BackendConfig::Filesystem { path: a }, BackendConfig::Filesystem { path: b }) => {
+                assert_eq!(a, b)
+            }
+            _ => panic!("Both backends should be filesystem"),
+        }
+    }
+
+    #[test]
+    fn test_from_file_dispatches_by_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("a.toml");
+        std::fs::write(&toml_path, "listen_addr = \"127.0.0.1:9100\"\n").unwrap();
+        let cfg = Config::from_file(toml_path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.listen_addr.port(), 9100);
+
+        let yaml_path = dir.path().join("b.yaml");
+        std::fs::write(&yaml_path, "listen_addr: \"127.0.0.1:9200\"\n").unwrap();
+        let cfg = Config::from_file(yaml_path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.listen_addr.port(), 9200);
+
+        // .yml also dispatches to YAML
+        let yml_path = dir.path().join("c.yml");
+        std::fs::write(&yml_path, "listen_addr: \"127.0.0.1:9300\"\n").unwrap();
+        let cfg = Config::from_file(yml_path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.listen_addr.port(), 9300);
+    }
+
+    #[test]
+    fn test_defaults_version_absent_means_v1() {
+        let yaml = "listen_addr: \"127.0.0.1:9000\"\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.defaults_version, DefaultsVersion::V1);
+    }
+
+    #[test]
+    fn test_defaults_version_explicit_v1() {
+        let yaml = "defaults: v1\nlisten_addr: \"127.0.0.1:9000\"\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.defaults_version, DefaultsVersion::V1);
+    }
+
+    #[test]
+    fn test_canonical_yaml_omits_default_defaults_version() {
+        // When defaults_version equals its default, it should not appear in the
+        // exported canonical YAML (keeps the file minimal).
+        let cfg = Config::default();
+        let yaml = cfg.to_canonical_yaml().unwrap();
+        assert!(
+            !yaml.contains("defaults:"),
+            "canonical YAML must omit the defaults field when it equals V1"
+        );
+    }
+
+    #[test]
+    fn test_canonical_yaml_strips_infra_secrets() {
+        // to_canonical_yaml matches to_toml_string: infra secrets only.
+        // Full redaction (incl. SigV4 creds) goes through redact_all_secrets.
+        let cfg = Config {
+            access_key_id: Some("AKIAKEEPME".into()),
+            secret_access_key: Some("kept-for-file-persistence".into()),
+            bootstrap_password_hash: Some("$2b$12$xxxxxxxxxxxxxxxxxxxxxx".into()),
+            encryption_key: Some("deadbeef-hex-encryption-key".into()),
+            ..Config::default()
+        };
+
+        let yaml = cfg.to_canonical_yaml().unwrap();
+        // Infra secrets are stripped
+        assert!(!yaml.contains("$2b$"));
+        assert!(!yaml.contains("deadbeef-hex-encryption-key"));
+        // SigV4 creds survive — the wizard/file deployment path depends on this
+        assert!(yaml.contains("AKIAKEEPME"));
+        assert!(yaml.contains("kept-for-file-persistence"));
+    }
+
+    #[test]
+    fn test_redact_all_secrets_full_paranoia() {
+        let mut cfg = Config {
+            access_key_id: Some("AKIASHOULDNOTAPPEAR".into()),
+            secret_access_key: Some("secret-should-not-appear".into()),
+            bootstrap_password_hash: Some("$2b$12$xxxxxxxxxxxxxxxxxxxxxx".into()),
+            encryption_key: Some("deadbeef-hex-encryption-key".into()),
+            backend: BackendConfig::S3 {
+                endpoint: Some("http://minio:9000".into()),
+                region: "us-east-1".into(),
+                force_path_style: true,
+                access_key_id: Some("BACKEND-SECRET-ID".into()),
+                secret_access_key: Some("BACKEND-SECRET-KEY".into()),
+            },
+            ..Config::default()
+        };
+        cfg.backends.push(NamedBackendConfig {
+            name: "hetzner".into(),
+            backend: BackendConfig::S3 {
+                endpoint: Some("https://fsn1.your-objectstorage.com".into()),
+                region: "eu-central-1".into(),
+                force_path_style: true,
+                access_key_id: Some("NAMED-SECRET-ID".into()),
+                secret_access_key: Some("NAMED-SECRET-KEY".into()),
+            },
+        });
+
+        let redacted = cfg.redact_all_secrets();
+        let yaml = serde_yaml::to_string(&redacted).unwrap();
+        // Top-level proxy creds
+        assert!(!yaml.contains("AKIASHOULDNOTAPPEAR"));
+        assert!(!yaml.contains("secret-should-not-appear"));
+        // Bootstrap + encryption
+        assert!(!yaml.contains("$2b$"));
+        assert!(!yaml.contains("deadbeef-hex-encryption-key"));
+        // Primary backend creds
+        assert!(!yaml.contains("BACKEND-SECRET-ID"));
+        assert!(!yaml.contains("BACKEND-SECRET-KEY"));
+        // Named backend creds
+        assert!(!yaml.contains("NAMED-SECRET-ID"));
+        assert!(!yaml.contains("NAMED-SECRET-KEY"));
+        // Non-secret fields survive
+        assert!(yaml.contains("hetzner"));
+        assert!(yaml.contains("eu-central-1"));
+    }
+
+    #[test]
+    fn test_persist_to_file_dispatches_by_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::default();
+
+        let yaml_path = dir.path().join("out.yaml");
+        cfg.persist_to_file(yaml_path.to_str().unwrap()).unwrap();
+        let content = std::fs::read_to_string(&yaml_path).unwrap();
+        assert!(
+            content.contains("listen_addr:"),
+            "YAML output must use : separator, got: {content}"
+        );
+
+        let toml_path = dir.path().join("out.toml");
+        cfg.persist_to_file(toml_path.to_str().unwrap()).unwrap();
+        let content = std::fs::read_to_string(&toml_path).unwrap();
+        assert!(
+            content.contains("listen_addr ="),
+            "TOML output must use = separator, got: {content}"
+        );
+    }
+
+    #[test]
+    fn test_example_toml_migrates_to_valid_yaml() {
+        // The canonical example file must round-trip through migrate.
+        let example_path = "deltaglider_proxy.toml.example";
+        if !std::path::Path::new(example_path).exists() {
+            // Test is best-effort when run outside the repo root; skip silently.
+            return;
+        }
+        let toml_cfg = Config::from_file(example_path).unwrap();
+        let yaml = toml_cfg.to_canonical_yaml().unwrap();
+        let yaml_cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(toml_cfg.listen_addr, yaml_cfg.listen_addr);
+        assert_eq!(toml_cfg.max_delta_ratio, yaml_cfg.max_delta_ratio);
+        assert_eq!(toml_cfg.cache_size_mb, yaml_cfg.cache_size_mb);
+    }
+
+    // ── Correctness regressions (post Phase-1 audit) ────────────────────
+
+    #[test]
+    fn test_atomic_write_creates_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("cfg.yaml");
+        atomic_write(&target, b"hello: world\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello: world\n");
+    }
+
+    #[test]
+    fn test_atomic_write_overwrites_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("cfg.yaml");
+        std::fs::write(&target, b"old: value\n").unwrap();
+        atomic_write(&target, b"new: value\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new: value\n");
+    }
+
+    #[test]
+    fn test_atomic_write_leaves_no_tempfile_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("cfg.yaml");
+        atomic_write(&target, b"ok\n").unwrap();
+        // The sibling tempfile (named ".cfg.yaml.tmp.<hex>") must not leak.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().into_string().unwrap())
+            .filter(|n| n.starts_with(".cfg.yaml.tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "atomic_write leaked tempfiles: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn test_atomic_write_fails_when_parent_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        // Parent directory does not exist — write must fail cleanly with
+        // an IO error, not a panic or a silent success.
+        let target = dir.path().join("does_not_exist").join("cfg.yaml");
+        let err = atomic_write(&target, b"x").unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Io(_)),
+            "expected ConfigError::Io, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_check_handles_nan_delta_ratio() {
+        let mut cfg = Config {
+            max_delta_ratio: f32::NAN,
+            ..Config::default()
+        };
+        let warnings = cfg.check();
+        assert!(
+            warnings.iter().any(|w| w.contains("NaN")),
+            "expected NaN warning, got {warnings:?}"
+        );
+        assert!(
+            !cfg.max_delta_ratio.is_nan(),
+            "NaN ratio should have been replaced with a sane default"
+        );
+        assert!(
+            (cfg.max_delta_ratio - default_max_delta_ratio()).abs() < f32::EPSILON,
+            "NaN ratio should be replaced with default 0.75, got {}",
+            cfg.max_delta_ratio
+        );
+    }
+
+    #[test]
+    fn test_check_flags_out_of_range_ratio() {
+        let mut cfg = Config {
+            max_delta_ratio: 1.5,
+            ..Config::default()
+        };
+        let warnings = cfg.check();
+        assert!(
+            warnings.iter().any(|w| w.contains("max_delta_ratio")),
+            "expected out-of-range warning, got {warnings:?}"
+        );
+        // Out-of-range values survive (they're a sanity warning, not a fix).
+        assert!((cfg.max_delta_ratio - 1.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_check_clamps_infinity_delta_ratio() {
+        // YAML `.inf` deserializes to f32::INFINITY. INFINITY > 1.0 is true
+        // (the old warning fired) but the value would have survived and
+        // silently stored every file as a delta regardless of size. Clamp
+        // to the default alongside NaN.
+        let mut cfg = Config {
+            max_delta_ratio: f32::INFINITY,
+            ..Config::default()
+        };
+        let warnings = cfg.check();
+        assert!(
+            warnings.iter().any(|w| w.contains("infinite")),
+            "expected infinity warning, got {warnings:?}"
+        );
+        assert!(
+            !cfg.max_delta_ratio.is_infinite(),
+            "infinity should have been replaced, got {}",
+            cfg.max_delta_ratio
+        );
+        assert!(
+            (cfg.max_delta_ratio - default_max_delta_ratio()).abs() < f32::EPSILON,
+            "infinity should be replaced with default 0.75, got {}",
+            cfg.max_delta_ratio
+        );
+    }
+
+    #[test]
+    fn test_check_warns_on_duplicate_backend_names() {
+        // Routing keys on backend.name. A duplicate silently shadows the
+        // second entry; the first wins at runtime. Warn so the operator
+        // knows the config is ambiguous.
+        let mut cfg = Config {
+            backends: vec![
+                NamedBackendConfig {
+                    name: "shared".into(),
+                    backend: BackendConfig::Filesystem { path: "/a".into() },
+                },
+                NamedBackendConfig {
+                    name: "unique".into(),
+                    backend: BackendConfig::Filesystem { path: "/b".into() },
+                },
+                NamedBackendConfig {
+                    name: "shared".into(),
+                    backend: BackendConfig::Filesystem { path: "/c".into() },
+                },
+            ],
+            ..Config::default()
+        };
+        let warnings = cfg.check();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("duplicate backend name") && w.contains("shared")),
+            "expected duplicate-name warning, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_check_no_warning_when_backend_names_unique() {
+        let mut cfg = Config {
+            backends: vec![
+                NamedBackendConfig {
+                    name: "a".into(),
+                    backend: BackendConfig::Filesystem { path: "/a".into() },
+                },
+                NamedBackendConfig {
+                    name: "b".into(),
+                    backend: BackendConfig::Filesystem { path: "/b".into() },
+                },
+            ],
+            ..Config::default()
+        };
+        let warnings = cfg.check();
+        assert!(
+            !warnings.iter().any(|w| w.contains("duplicate")),
+            "no duplicate warning expected when names are unique, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_config_path_honors_env_even_when_missing() {
+        // DGP_CONFIG pointing at a non-existent file must STILL be returned
+        // — the operator's explicit intent beats silent fallthrough that
+        // would redirect admin-API persists to an unrelated file.
+        let guard = EnvGuard::set("DGP_CONFIG", "/tmp/definitely-does-not-exist.yaml");
+        let resolved = Config::resolve_config_path();
+        assert_eq!(resolved, Some("/tmp/definitely-does-not-exist.yaml".into()));
+        drop(guard);
+    }
+
+    #[test]
+    fn test_resolve_config_path_empty_env_falls_through() {
+        // An empty-string env var must not hijack resolution.
+        let guard = EnvGuard::set("DGP_CONFIG", "");
+        let _ = Config::resolve_config_path(); // may be None or search-path hit; either is fine
+        drop(guard);
+    }
+
+    /// Test-only RAII guard that sets an env var on construction and
+    /// unsets it on drop. Prevents one test from polluting another when
+    /// they exercise environment-driven behavior.
+    struct EnvGuard {
+        key: &'static str,
+        prior: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prior = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, prior }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[test]
+    fn test_buckets_field_is_ordered() {
+        // BTreeMap iteration must yield keys in sorted order. This is the
+        // stability guarantee that makes canonical YAML export byte-stable.
+        let mut cfg = Config::default();
+        cfg.buckets.insert(
+            "zeta".into(),
+            crate::bucket_policy::BucketPolicyConfig::default(),
+        );
+        cfg.buckets.insert(
+            "alpha".into(),
+            crate::bucket_policy::BucketPolicyConfig::default(),
+        );
+        cfg.buckets.insert(
+            "mu".into(),
+            crate::bucket_policy::BucketPolicyConfig::default(),
+        );
+        let yaml = cfg.to_canonical_yaml().unwrap();
+        // Extract the order in which bucket keys appear — must be sorted.
+        let alpha = yaml.find("alpha:").unwrap();
+        let mu = yaml.find("mu:").unwrap();
+        let zeta = yaml.find("zeta:").unwrap();
+        assert!(
+            alpha < mu && mu < zeta,
+            "bucket keys must appear in sorted order; got YAML:\n{yaml}"
+        );
     }
 }

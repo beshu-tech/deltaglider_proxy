@@ -51,20 +51,28 @@ type: project
 - CLAUDE.md RateLimiter description said "5 attempts / 15-min / 30-min lockout" but code defaults are 100/5min/10min -- resolved, docs updated (2026-04-09)
 - RateLimiter::new() doc comment said "default: 5" contradicting default_auth() which uses 100 -- resolved, doc comment updated (2026-04-09)
 
-**Open issues (2026-04-09 hygiene review):**
-- Scattered `std::env::var("DGP_...").ok().and_then(|v| v.parse().ok()).unwrap_or(default)` pattern across ~15 call sites instead of using centralized `env_parse<T>()` from config.rs. Fix: make `env_parse` public, add `env_parse_with_default`. ~10 files affected.
+**Resolved issues (2026-04-09 deep hygiene review, pass 2):**
+- 2x duplicated copy-source header parsing (URL-decode + split + path traversal check) in object_helpers.rs:155-174 and 348-366 -- resolved, extracted `parse_copy_source()` + `check_copy_source_access()` helpers (2026-04-09)
+- 2x duplicated Content-MD5 validation in object_helpers.rs:73-86 (put_object_inner) and 313-326 (upload_part) -- resolved, extracted `validate_content_md5()` helper (2026-04-09)
+
+**Resolved issues (2026-04-19 hygiene review):**
+- Scattered `std::env::var("DGP_...").ok().and_then(|v| v.parse().ok()).unwrap_or(default)` pattern across ~15 call sites -- resolved, made `env_parse` public, added `env_parse_with_default<T>()` and `env_bool()` in config.rs; migrated 10 call sites in rate_limiter.rs, session.rs, multipart.rs, codec.rs, auth.rs, startup.rs, demo.rs, admin/config.rs (2026-04-19)
+- 2x duplicated metadata-to-map conversion in s3.rs `metadata_to_headers` and types.rs `all_amz_metadata` -- resolved, extracted `to_bare_metadata_map()` on FileMetadata as single source of truth; both callers now delegate to it (2026-04-19)
+- 2x duplicated `BackendConfig` -> `BackendInfoResponse` conversion in config.rs:331-364 and backends.rs:69-101 -- resolved, `From<&NamedBackendConfig>` impl added earlier (was listed as open but already resolved)
+
+**Open issues (2026-04-19 hygiene review):**
 - `update_config` handler in api/admin/config.rs is ~275 lines handling 8+ concerns. Well-commented but high cognitive load. Fix: extract helpers for backend/auth/policy sub-sections.
-- 2x duplicated `BackendConfig` -> `BackendInfoResponse` conversion in config.rs:331-364 and backends.rs:69-101. Fix: add `From<&NamedBackendConfig>` impl.
 - 2x duplicated engine rebuild pattern in backends.rs (lines 167-185 and 258-275) instead of using `rebuild_engine()` from config.rs. Fix: make helper pub(super).
 - backendTab in SettingsPage.tsx duplicates saveSection inline (lines 359-397 vs 422-442).
 - `update_auth_provider` in config_db/auth_providers.rs uses 11 individual UPDATE statements per field. Works but verbose. Document-only.
+- 3 remaining env var sites not yet migrated to centralized helpers: main.rs:217 (trust_proxy_explicit with tri-state logic), api/admin/auth.rs:77 (secure_cookies with auto-detect fallback), config_db/mod.rs:32 (DGP_CONFIG for db path). All have nuanced logic beyond simple parse-with-default.
 
 **Documented-only (high impact, high risk -- extract on next auth feature touch):**
 - `sigv4_auth_middleware` in api/auth.rs:404-765 is 362 lines -- the longest function in the codebase. Handles rate limiting, CORS, HEAD probe bypass, public prefix bypass, presigned URL detection, SigV4 parsing, user lookup across 3 auth modes, signature verification, replay detection with cache eviction, and user injection. Well-commented but high cognitive load. Natural seams: `check_rate_limit()`, `check_public_prefix_bypass()`, `lookup_user_and_secret()`, `check_replay()`.
 
 **Remaining structural observations:**
-- `session.rs` parses `DGP_SESSION_TTL_HOURS` independently from config's `env_parse()` helper. Low impact.
-- s3.rs is 1551 lines. Dense but well-structured with clear internal helper grouping. S3ListedObject::from_s3_object centralizes object conversion.
+- EncryptingBackend in encrypting.rs has 15 pass-through delegation methods (92 lines) mirroring the Box impl macro in traits.rs. A macro could unify but the encrypt/decrypt custom methods make it awkward. Acceptable for 2 consumers; revisit if a 3rd wrapper type is added.
+- s3.rs is 1466 lines (reduced from 1551 after metadata_to_headers dedup). Dense but well-structured with clear internal helper grouping. S3ListedObject::from_s3_object centralizes object conversion.
 - Client IP extraction exists in two forms: `rate_limiter::extract_client_ip()` and `audit::extract_client_info()`. Different purposes, reasonable to keep separate.
 - `paginate_sorted` in engine/mod.rs has only one caller. Clear function, may gain more callers.
 - `admin/config.rs` is 1122 lines with 5 handlers -- splitting would add files without proportional benefit.
@@ -98,6 +106,10 @@ type: project
 - `mutate` in useS3Browser.ts is a semantic alias for `refresh` -- stable API naming, not dead code
 - `secure_cookies()` reads env vars per-call (2 calls total, login/logout only) -- documented in config.rs, acceptable
 - PublicPrefixSnapshot is the single production path for public prefix checks; BucketPolicyRegistry handles validation/normalization only
+- `parse_copy_source()` + `check_copy_source_access()` centralize copy-source header parsing and IAM validation (CopyObject + UploadPartCopy)
+- `validate_content_md5()` is the single source of truth for Content-MD5 header validation (PUT + UploadPart)
+- `env_parse_with_default()` / `env_bool()` in config.rs are the canonical DGP_* env var parsers with invalid-value warnings
+- `to_bare_metadata_map()` on FileMetadata is the single source of truth for metadata-to-map conversion (used by S3 backend and LIST metadata extension)
 
 **Why:** Understanding structural debt helps prioritize refactoring with maximum testability impact.
 **How to apply:** Use this as a reference when planning refactoring work on admin API or auth middleware.

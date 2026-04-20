@@ -6,7 +6,7 @@ use startup::*;
 
 use arc_swap::ArcSwap;
 use axum::middleware;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use deltaglider_proxy::api::admin::AdminState;
 use deltaglider_proxy::api::handlers::{debug_headers_enabled, AppState};
 use deltaglider_proxy::config::Config;
@@ -18,7 +18,7 @@ use deltaglider_proxy::usage_scanner::UsageScanner;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tracing::{info, warn};
+use tracing::info;
 
 /// Version string including build timestamp for --version output
 fn version_long() -> &'static str {
@@ -40,7 +40,7 @@ fn version_long() -> &'static str {
 #[command(author, about, long_about = None)]
 struct Cli {
     /// Path to configuration file
-    #[arg(short, long, value_name = "FILE")]
+    #[arg(short, long, value_name = "FILE", global = true)]
     config: Option<String>,
 
     /// Listen address (overrides config)
@@ -67,10 +67,59 @@ struct Cli {
     /// Print an example TOML config with all options, then exit
     #[arg(long)]
     show_toml: bool,
+
+    /// Optional subcommand. When present, the server is not started — the
+    /// subcommand runs to completion and the process exits.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Top-level subcommands. Grows in later phases (admission, apply, …).
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Configuration-file tooling (migrate, later: apply/show/defaults/lint).
+    Config {
+        #[command(subcommand)]
+        action: ConfigCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCommand {
+    /// Convert a TOML (or YAML) config file to canonical YAML on stdout.
+    Migrate {
+        /// Input config file (TOML or YAML).
+        #[arg(value_name = "INPUT")]
+        input: String,
+        /// Write output to a file instead of stdout.
+        #[arg(long, value_name = "OUTPUT")]
+        out: Option<String>,
+    },
+    /// Emit the JSON Schema for the canonical Config shape (for CI / YAML LSP).
+    Schema {
+        /// Write schema to a file instead of stdout.
+        #[arg(long, value_name = "OUTPUT")]
+        out: Option<String>,
+    },
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+
+    // Subcommand dispatch (runs synchronously, exits before tokio runtime).
+    if let Some(ref cmd) = cli.command {
+        let code = match cmd {
+            Command::Config { action } => match action {
+                ConfigCommand::Migrate { input, out } => {
+                    deltaglider_proxy::cli::config::migrate(input, out.as_deref())
+                }
+                ConfigCommand::Schema { out } => {
+                    deltaglider_proxy::cli::config::schema(out.as_deref())
+                }
+            },
+        };
+        std::process::exit(code);
+    }
 
     // Interactive config wizard (runs synchronously, exits before tokio runtime)
     if cli.init {
@@ -218,13 +267,11 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let trust_proxy = trust_proxy_explicit
         .as_deref()
         .map(|v| v == "true" || v == "1")
-        .unwrap_or(true); // default true — see rate_limiter::trust_proxy_headers()
+        .unwrap_or(false); // default false — secure-by-default, see rate_limiter::trust_proxy_headers()
     if trust_proxy {
-        if trust_proxy_explicit.is_none() {
-            warn!("  Proxy headers: trusted (default) — X-Forwarded-For/X-Real-IP headers are used for rate limiting and IAM conditions. If this proxy is exposed directly to the internet (no reverse proxy), clients can spoof IPs. Set DGP_TRUST_PROXY_HEADERS=false to disable, or =true to silence this warning.");
-        } else {
-            info!("  Proxy headers: trusted (DGP_TRUST_PROXY_HEADERS=true) — X-Forwarded-For/X-Real-IP used for rate limiting and aws:SourceIp");
-        }
+        info!("  Proxy headers: trusted (DGP_TRUST_PROXY_HEADERS=true) — X-Forwarded-For/X-Real-IP used for rate limiting and aws:SourceIp");
+    } else if trust_proxy_explicit.is_none() {
+        info!("  Proxy headers: untrusted (default) — set DGP_TRUST_PROXY_HEADERS=true if behind a reverse proxy (nginx, Caddy, ALB) to enable IP-based rate limiting and aws:SourceIp IAM conditions");
     } else {
         info!("  Proxy headers: untrusted (DGP_TRUST_PROXY_HEADERS=false) — rate limiting requires ConnectInfo (not yet implemented); aws:SourceIp conditions will not match");
     }
@@ -260,6 +307,14 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             deltaglider_proxy::bucket_policy::PublicPrefixSnapshot::from_config(&config.buckets),
         )));
 
+    // --- Admission chain (lock-free, hot-swappable) ---
+    // Derived from bucket config today; `build_shared_chain` wraps the
+    // resulting chain in the same `Arc<ArcSwap<_>>` shape as the public-
+    // prefix snapshot so hot-reload sites can reuse their existing swap
+    // pattern.
+    let admission_chain: deltaglider_proxy::admission::SharedAdmissionChain =
+        deltaglider_proxy::admission::build_shared_chain(&config.buckets);
+
     // --- S3 router ---
     let app = build_s3_router(
         &state,
@@ -270,6 +325,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         &config,
         config_db_mismatch,
         &public_prefix_snapshot,
+        &admission_chain,
     );
 
     // --- External auth (OAuth/OIDC) ---
@@ -318,10 +374,17 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Resolve the authoritative config-file path at startup and freeze it in
+    // AdminState. `--config` wins over `resolve_config_path()` which walks
+    // the env var + default search paths. If neither is set, the field stays
+    // None and any future persist falls back to the canonical default.
+    let config_file_path = cli.config.clone().or_else(Config::resolve_config_path);
+
     let admin_state = Arc::new(AdminState {
         password_hash: parking_lot::RwLock::new(admin_password_hash),
         sessions: session_store,
         config: shared_config,
+        config_file_path,
         log_reload: log_reload_handle,
         s3_state: state.clone(),
         iam_state,
@@ -332,6 +395,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         config_db_mismatch,
         external_auth,
         public_prefix_snapshot,
+        admission_chain,
     });
 
     // --- TLS ---
