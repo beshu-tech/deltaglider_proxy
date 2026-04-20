@@ -390,18 +390,24 @@ async fn test_config_apply_hot_reloads_ratio() {
         .await
         .unwrap();
 
-    // Flip max_delta_ratio to 0.3. Replace the line in the exported doc.
-    let modified = exported
-        .lines()
-        .map(|line| {
-            if line.starts_with("max_delta_ratio:") {
-                "max_delta_ratio: 0.3".to_string()
-            } else {
-                line.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Flip max_delta_ratio to 0.3. The canonical exporter nests it under
+    // `advanced:` in the Phase 3 sectioned shape, so we parse→mutate
+    // →reserialize via serde_yaml::Value rather than doing fragile
+    // line-prefix matching.
+    let mut doc: serde_yaml::Value = serde_yaml::from_str(&exported).unwrap();
+    let map = doc.as_mapping_mut().unwrap();
+    let advanced_key = serde_yaml::Value::String("advanced".into());
+    let advanced = map
+        .entry(advanced_key)
+        .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    advanced
+        .as_mapping_mut()
+        .unwrap()
+        .insert(
+            "max_delta_ratio".into(),
+            serde_yaml::Value::Number(serde_yaml::Number::from(0.3)),
+        );
+    let modified = serde_yaml::to_string(&doc).unwrap();
 
     let resp = admin
         .post(format!("{}/_/api/admin/config/apply", server.endpoint()))
@@ -627,18 +633,22 @@ async fn test_apply_rejects_invalid_log_level_before_swap() {
         .await
         .unwrap();
 
-    // Replace log_level with garbage that EnvFilter rejects.
-    let modified = exported
-        .lines()
-        .map(|line| {
-            if line.starts_with("log_level:") {
-                "log_level: \"!!!not-a-valid-filter\"".to_string()
-            } else {
-                line.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Inject an EnvFilter-rejecting log_level. The canonical exporter
+    // elides `log_level:` when it equals default, so we parse the exported
+    // YAML as a serde_yaml::Value, splice log_level into the advanced
+    // section (creating it if absent), and reserialize. This survives
+    // whether `advanced:` already exists (merged) or not (created).
+    let mut doc: serde_yaml::Value = serde_yaml::from_str(&exported).unwrap();
+    let map = doc.as_mapping_mut().unwrap();
+    let advanced_key = serde_yaml::Value::String("advanced".into());
+    let advanced = map
+        .entry(advanced_key)
+        .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    advanced
+        .as_mapping_mut()
+        .unwrap()
+        .insert("log_level".into(), "!!!not-a-valid-filter".into());
+    let modified = serde_yaml::to_string(&doc).unwrap();
 
     let resp = admin
         .post(format!("{}/_/api/admin/config/apply", server.endpoint()))
@@ -756,17 +766,20 @@ async fn test_apply_warns_on_asymmetric_sigv4_credentials() {
         .unwrap();
 
     // Set only access_key_id; leave secret_access_key absent (= redacted None).
-    let modified = exported
-        .lines()
-        .map(|line| {
-            if line.starts_with("access_key_id:") {
-                "access_key_id: \"NEWKEY\"".to_string()
-            } else {
-                line.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    // The canonical exporter nests SigV4 creds under `access:` (Phase 3+
+    // sectioned shape), so we parse→mutate→reserialize instead of
+    // line-prefix matching.
+    let mut doc: serde_yaml::Value = serde_yaml::from_str(&exported).unwrap();
+    let map = doc.as_mapping_mut().unwrap();
+    let access_key = serde_yaml::Value::String("access".into());
+    let access = map
+        .entry(access_key)
+        .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    let access_map = access.as_mapping_mut().unwrap();
+    access_map.insert("access_key_id".into(), "NEWKEY".into());
+    // Drop the redacted secret key sibling if any test framework left it.
+    access_map.remove(serde_yaml::Value::String("secret_access_key".into()));
+    let modified = serde_yaml::to_string(&doc).unwrap();
 
     let resp = admin
         .post(format!("{}/_/api/admin/config/apply", server.endpoint()))

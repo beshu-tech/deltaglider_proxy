@@ -513,7 +513,11 @@ path = "/tmp/dgp"
         assert!(yaml.contains("9001"));
         assert!(yaml.contains("0.4"));
 
-        let reparsed: Config = serde_yaml::from_str(&yaml).unwrap();
+        // Round-trip through the dual-shape YAML deserializer, not
+        // `serde_yaml::from_str::<Config>` directly — the canonical emitter
+        // is sectioned, only `Config::from_yaml_str` knows how to collapse
+        // sections back to the flat shape.
+        let reparsed = Config::from_yaml_str(&yaml).unwrap();
         assert_eq!(reparsed.listen_addr.port(), 9001);
         assert!((reparsed.max_delta_ratio - 0.4).abs() < f32::EPSILON);
     }

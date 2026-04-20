@@ -287,7 +287,7 @@ pub enum DefaultsVersion {
 }
 
 impl DefaultsVersion {
-    fn is_default(&self) -> bool {
+    pub(crate) fn is_default(&self) -> bool {
         matches!(self, DefaultsVersion::V1)
     }
 }
@@ -595,6 +595,56 @@ impl ConfigFormat {
     }
 }
 
+/// Classify a parsed YAML document as *sectioned* (Phase 3 canonical shape)
+/// vs. *flat* (legacy). True iff the top-level mapping contains at least one
+/// of the four section keys and no legacy top-level keys. This detection is
+/// intentionally cautious: a document that mixes both shapes
+/// (`listen_addr:` at the root AND a `storage:` section) is treated as flat
+/// and the sectioned key becomes an unknown-field error — no silent merging
+/// of two competing shapes.
+fn looks_sectioned(doc: &serde_yaml::Value) -> bool {
+    let Some(map) = doc.as_mapping() else {
+        return false;
+    };
+    const SECTION_KEYS: &[&str] = &["admission", "access", "storage", "advanced"];
+    // Any flat-shape-only key at the root rules out sectioned classification.
+    // `defaults` is permitted at the root in both shapes (it's the
+    // document-level version pin, not a section).
+    const FLAT_ONLY_KEYS: &[&str] = &[
+        "listen_addr",
+        "backend",
+        "backends",
+        "default_backend",
+        "max_delta_ratio",
+        "max_object_size",
+        "cache_size_mb",
+        "metadata_cache_mb",
+        "authentication",
+        "access_key_id",
+        "secret_access_key",
+        "bootstrap_password_hash",
+        "admin_password_hash", // legacy alias
+        "codec_concurrency",
+        "blocking_threads",
+        "log_level",
+        "config_sync_bucket",
+        "encryption_key",
+        "tls",
+        "buckets",
+    ];
+
+    let has_section = map
+        .keys()
+        .filter_map(|k| k.as_str())
+        .any(|k| SECTION_KEYS.contains(&k));
+    let has_flat = map
+        .keys()
+        .filter_map(|k| k.as_str())
+        .any(|k| FLAT_ONLY_KEYS.contains(&k));
+
+    has_section && !has_flat
+}
+
 impl Config {
     /// Load configuration from a file. Dispatches on extension: `.yaml`/`.yml`
     /// → YAML, anything else → TOML.
@@ -614,11 +664,50 @@ impl Config {
     }
 
     /// Load configuration from a YAML file explicitly.
+    ///
+    /// Accepts two on-disk shapes transparently:
+    ///   * **Sectioned** (Phase 3+ canonical) — top-level `admission:` /
+    ///     `access:` / `storage:` / `advanced:` keys. Parsed via
+    ///     [`crate::config_sections::SectionedConfig`] then collapsed into the
+    ///     flat in-memory `Config`.
+    ///   * **Flat** (legacy) — fields like `listen_addr:`, `backend:`,
+    ///     `buckets:` directly at the document root. Still works verbatim.
+    ///
+    /// Shape detection is explicit (key-presence check, not a silent untagged-
+    /// enum fallthrough) so that when a sectioned document has a typo inside
+    /// e.g. `storage:`, the error message names the section — not a cryptic
+    /// "unknown variant" coming from the flat-shape attempt.
     pub fn from_yaml_file(path: &str) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path).map_err(|e| ConfigError::Io(e.to_string()))?;
-        let config: Config =
-            serde_yaml::from_str(&content).map_err(|e| ConfigError::Parse(e.to_string()))?;
-        Ok(config)
+        Self::from_yaml_str(&content)
+    }
+
+    /// Parse a YAML string into a `Config`. See [`Self::from_yaml_file`]
+    /// for the dual-shape contract.
+    pub fn from_yaml_str(content: &str) -> Result<Self, ConfigError> {
+        // Accept empty documents as "use defaults entirely" — matters for
+        // wizard-generated files and for round-trips where the canonical
+        // exporter elides every section.
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return Ok(Config::default());
+        }
+
+        // First pass: peek at the top-level keys to classify shape. This is
+        // O(document size) but only runs on config load (startup / explicit
+        // apply), never per-request.
+        let doc: serde_yaml::Value =
+            serde_yaml::from_str(content).map_err(|e| ConfigError::Parse(e.to_string()))?;
+
+        if looks_sectioned(&doc) {
+            let sectioned: crate::config_sections::SectionedConfig =
+                serde_yaml::from_value(doc).map_err(|e| ConfigError::Parse(e.to_string()))?;
+            Ok(sectioned.into_flat())
+        } else {
+            let flat: Config =
+                serde_yaml::from_value(doc).map_err(|e| ConfigError::Parse(e.to_string()))?;
+            Ok(flat)
+        }
     }
 
     /// Load configuration from environment variables
@@ -1119,14 +1208,21 @@ impl Config {
 
     /// Serialize config to canonical YAML string.
     ///
-    /// This is the backing surface for `config migrate` and, later, for
-    /// `config show`. Strips infra secrets (same policy as `to_toml_string`)
-    /// so the disk-persisted file matches the wizard's expectations. Section
-    /// reordering (admission → access → storage → advanced) arrives in
-    /// Phase 3 when the sectioned schema lands.
+    /// Emits the Phase 3 **sectioned** shape: top-level `admission:` /
+    /// `access:` / `storage:` / `advanced:` groups, with each group omitted
+    /// when it equals its default (minimal-diff GitOps-friendly output).
+    /// Strips infra secrets (same policy as `to_toml_string`) so that
+    /// `config migrate`, `config show`, and the admin `/export` endpoint
+    /// never leak the bootstrap hash or the AES master key into disk
+    /// artifacts.
+    ///
+    /// The dual-shape deserializer accepts the legacy flat YAML too, but
+    /// we only ever *emit* sectioned — legacy readers eventually disappear,
+    /// the canonical artifact must be forward-shaped.
     pub fn to_canonical_yaml(&self) -> Result<String, ConfigError> {
         let export = self.redact_infra_secrets();
-        serde_yaml::to_string(&export).map_err(|e| ConfigError::Parse(e.to_string()))
+        let sectioned = crate::config_sections::SectionedConfig::from_flat(&export);
+        serde_yaml::to_string(&sectioned).map_err(|e| ConfigError::Parse(e.to_string()))
     }
 
     /// Persist the current config to a file atomically. Dispatches on
@@ -1659,7 +1755,14 @@ backend:
     #[test]
     fn test_persist_to_file_dispatches_by_extension() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = Config::default();
+        // Deliberately non-default listen_addr so the sectioned canonical
+        // YAML exporter surfaces an `advanced:` block — a default Config
+        // round-trips to an (intentionally) empty YAML document, which
+        // would make this dispatcher test vacuous.
+        let cfg = Config {
+            listen_addr: "127.0.0.1:9099".parse().unwrap(),
+            ..Config::default()
+        };
 
         let yaml_path = dir.path().join("out.yaml");
         cfg.persist_to_file(yaml_path.to_str().unwrap()).unwrap();
@@ -1667,6 +1770,10 @@ backend:
         assert!(
             content.contains("listen_addr:"),
             "YAML output must use : separator, got: {content}"
+        );
+        assert!(
+            content.contains("advanced:"),
+            "sectioned YAML must group listen_addr under `advanced:`, got: {content}"
         );
 
         let toml_path = dir.path().join("out.toml");
@@ -1688,7 +1795,10 @@ backend:
         }
         let toml_cfg = Config::from_file(example_path).unwrap();
         let yaml = toml_cfg.to_canonical_yaml().unwrap();
-        let yaml_cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        // Round-trip goes through the dual-shape deserializer: the canonical
+        // exporter emits sectioned YAML, and only `from_yaml_str` knows how
+        // to collapse it back into the flat in-memory Config.
+        let yaml_cfg = Config::from_yaml_str(&yaml).unwrap();
         assert_eq!(toml_cfg.listen_addr, yaml_cfg.listen_addr);
         assert_eq!(toml_cfg.max_delta_ratio, yaml_cfg.max_delta_ratio);
         assert_eq!(toml_cfg.cache_size_mb, yaml_cfg.cache_size_mb);
@@ -1931,5 +2041,118 @@ backend:
             alpha < mu && mu < zeta,
             "bucket keys must appear in sorted order; got YAML:\n{yaml}"
         );
+    }
+
+    // ── Phase 3a: dual-shape deserialize ────────────────────────────────
+
+    #[test]
+    fn test_from_yaml_str_accepts_flat_shape() {
+        // Legacy shape: keys at the document root. Still works.
+        let yaml = r#"
+listen_addr: "127.0.0.1:9123"
+max_delta_ratio: 0.3
+cache_size_mb: 256
+"#;
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        assert_eq!(cfg.listen_addr.port(), 9123);
+        assert!((cfg.max_delta_ratio - 0.3).abs() < f32::EPSILON);
+        assert_eq!(cfg.cache_size_mb, 256);
+    }
+
+    #[test]
+    fn test_from_yaml_str_accepts_sectioned_shape() {
+        // Phase 3 canonical shape: four top-level sections.
+        let yaml = r#"
+advanced:
+  listen_addr: "127.0.0.1:9124"
+  max_delta_ratio: 0.2
+  cache_size_mb: 512
+access:
+  access_key_id: "AKIA"
+  secret_access_key: "s3cret"
+"#;
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        assert_eq!(cfg.listen_addr.port(), 9124);
+        assert!((cfg.max_delta_ratio - 0.2).abs() < f32::EPSILON);
+        assert_eq!(cfg.cache_size_mb, 512);
+        assert_eq!(cfg.access_key_id.as_deref(), Some("AKIA"));
+        assert_eq!(cfg.secret_access_key.as_deref(), Some("s3cret"));
+    }
+
+    #[test]
+    fn test_from_yaml_str_empty_document_yields_default() {
+        let cfg = Config::from_yaml_str("").unwrap();
+        assert_eq!(cfg, Config::default());
+        let cfg2 = Config::from_yaml_str("   \n\t\n").unwrap();
+        assert_eq!(cfg2, Config::default());
+    }
+
+    #[test]
+    fn test_from_yaml_str_bare_defaults_key_is_flat_compatible() {
+        // `defaults: v1` is valid at the root of BOTH shapes — looks_sectioned
+        // returns false (no section keys, no flat-only keys), and the flat
+        // deserializer handles it.
+        let yaml = "defaults: v1\n";
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        assert_eq!(cfg.defaults_version, DefaultsVersion::V1);
+    }
+
+    #[test]
+    fn test_from_yaml_str_sectioned_roundtrips_canonical_output() {
+        // The canonical exporter emits sectioned YAML. That YAML, fed back
+        // through `from_yaml_str`, must reconstruct the same Config. This is
+        // the GitOps invariant: export → apply is a no-op.
+        let original = Config {
+            listen_addr: "10.0.0.1:9000".parse().unwrap(),
+            max_delta_ratio: 0.15,
+            cache_size_mb: 333,
+            access_key_id: Some("AKIAROUND".into()),
+            secret_access_key: Some("roundtrip".into()),
+            ..Config::default()
+        };
+        let yaml = original.to_canonical_yaml().unwrap();
+        // Must be sectioned.
+        assert!(
+            yaml.contains("advanced:") || yaml.contains("access:"),
+            "canonical YAML must be sectioned, got:\n{yaml}"
+        );
+        let roundtripped = Config::from_yaml_str(&yaml).unwrap();
+        assert_eq!(original.listen_addr, roundtripped.listen_addr);
+        assert_eq!(original.max_delta_ratio, roundtripped.max_delta_ratio);
+        assert_eq!(original.cache_size_mb, roundtripped.cache_size_mb);
+        assert_eq!(original.access_key_id, roundtripped.access_key_id);
+        assert_eq!(original.secret_access_key, roundtripped.secret_access_key);
+    }
+
+    #[test]
+    fn test_from_yaml_str_mixed_shape_is_rejected_as_flat() {
+        // A doc with BOTH a flat key (`listen_addr:`) AND a section key
+        // (`storage:`) is classified as flat, causing the sectioned key to
+        // become an unknown field under strict deserialization (or to be
+        // silently ignored otherwise). Either way, we must not silently
+        // merge two competing shapes — the operator sees an error or a
+        // non-effect they can reason about.
+        let yaml = r#"
+listen_addr: "127.0.0.1:9125"
+storage:
+  default_backend: "hetzner"
+"#;
+        // The flat deserializer will see `storage` and — because Config
+        // doesn't have that field — it either errors or ignores. Both are
+        // acceptable outcomes of the "no silent merge" invariant. What we
+        // assert is: listen_addr got read (flat shape was chosen).
+        match Config::from_yaml_str(yaml) {
+            Ok(cfg) => {
+                assert_eq!(
+                    cfg.listen_addr.port(),
+                    9125,
+                    "flat shape must have been selected"
+                );
+            }
+            Err(_) => {
+                // Strict parse error is also acceptable — we prefer loud
+                // over silent-merge.
+            }
+        }
     }
 }

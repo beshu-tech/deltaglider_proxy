@@ -9,6 +9,7 @@ pub mod bucket_policy;
 pub mod cli;
 pub mod config;
 pub mod config_db;
+pub mod config_sections;
 pub mod config_db_sync;
 pub mod deltaglider;
 pub mod iam;
