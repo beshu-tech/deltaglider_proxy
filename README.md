@@ -112,49 +112,58 @@ Admin GUI at `http://localhost:9000/_/` — same port, zero setup.
 
 ## Configuration
 
-TOML config file or environment variables (`DGP_*` prefix). Everything has sensible defaults.
+YAML config file or environment variables (`DGP_*` prefix). Everything has sensible defaults — a five-line config is runnable:
 
-```toml
-listen_addr = "0.0.0.0:9000"
-
-# Bootstrap credentials (before IAM users exist)
-access_key_id = "admin"
-secret_access_key = "changeme"
-
-# Default backend
-[backend]
-type = "s3"
-endpoint = "https://s3.example.com"
-region = "us-east-1"
-
-# Multi-backend routing
-default_backend = "primary"
-
-[[backends]]
-name = "primary"
-type = "s3"
-endpoint = "https://s3.us-east-1.amazonaws.com"
-region = "us-east-1"
-
-[[backends]]
-name = "europe"
-type = "s3"
-endpoint = "https://hel1.your-objectstorage.com"
-region = "hel1"
-
-# Per-bucket policies
-[buckets.releases]
-backend = "europe"
-compression = true
-public_prefixes = ["builds/", "artifacts/"]
-
-[buckets.archive]
-backend = "primary"
-alias = "prod-archive-2024"
-compression = false
+```yaml
+storage:
+  s3: https://s3.example.com
+  access_key_id: admin
+  secret_access_key: changeme
 ```
 
-Full reference: [deltaglider_proxy.toml.example](deltaglider_proxy.toml.example)
+Full reference with the four-section layout (admission / access / storage / advanced):
+
+```yaml
+storage:
+  default_backend: primary
+  backends:
+    - name: primary
+      type: s3
+      endpoint: https://s3.us-east-1.amazonaws.com
+      region: us-east-1
+    - name: europe
+      type: s3
+      endpoint: https://hel1.your-objectstorage.com
+      region: hel1
+  buckets:
+    releases:
+      backend: europe
+      compression: true
+      public_prefixes: ["builds/", "artifacts/"]
+    archive:
+      backend: primary
+      alias: prod-archive-2024
+      compression: false
+
+access:
+  access_key_id: admin
+  secret_access_key: changeme
+
+admission:
+  blocks:
+    - name: deny-bad-ips
+      match:
+        source_ip_list: ["203.0.113.0/24"]
+      action: deny
+```
+
+**Offline validation** — run before committing to CI:
+
+```sh
+deltaglider_proxy config lint deltaglider_proxy.yaml
+```
+
+**Examples**: [deltaglider_proxy.example.yaml](deltaglider_proxy.example.yaml) (new canonical) or the legacy [deltaglider_proxy.toml.example](deltaglider_proxy.toml.example) (deprecated — emits a warning on load; use `deltaglider_proxy config migrate old.toml --out new.yaml` to convert).
 
 ## S3 Compatibility
 

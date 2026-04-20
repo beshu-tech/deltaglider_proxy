@@ -726,11 +726,41 @@ impl Config {
     }
 
     /// Load configuration from a TOML file explicitly.
+    ///
+    /// **Deprecated**: TOML is being phased out in favor of YAML. Every
+    /// successful load emits a `tracing::warn!` pointing at the
+    /// migration tool. The flag `DGP_SILENCE_TOML_DEPRECATION=1`
+    /// silences the warning for environments that cannot upgrade
+    /// immediately (e.g. vendored config in a container image).
+    ///
+    /// Removal timeline: TOML support stays through the next two minor
+    /// releases (grace period for migration), then the loader returns
+    /// `ConfigError::Parse("TOML is no longer supported; use YAML")`
+    /// unconditionally. `deltaglider_proxy config migrate` converts in
+    /// one shot.
     pub fn from_toml_file(path: &str) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path).map_err(|e| ConfigError::Io(e.to_string()))?;
         let mut config: Config =
             toml::from_str(&content).map_err(|e| ConfigError::Parse(e.to_string()))?;
         config.normalize_shorthands()?;
+
+        // Phase 6 deprecation warn. Fires exactly once per load (no
+        // per-request overhead — config loads only at startup and on
+        // explicit apply). Silencable via env var for operators who
+        // know about the deprecation and cannot upgrade yet.
+        if std::env::var("DGP_SILENCE_TOML_DEPRECATION").unwrap_or_default() != "1" {
+            tracing::warn!(
+                target: "deltaglider_proxy::config",
+                path = %path,
+                "[config] TOML config format is deprecated. Convert to YAML with \
+                 `deltaglider_proxy config migrate {} --out deltaglider_proxy.yaml` \
+                 and point the server at the new file. TOML support will be removed \
+                 in a future minor release. Set DGP_SILENCE_TOML_DEPRECATION=1 to \
+                 suppress this warning.",
+                path
+            );
+        }
+
         Ok(config)
     }
 

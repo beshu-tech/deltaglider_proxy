@@ -1,5 +1,20 @@
 
 
+# ─────────────────────────────────────────────────────────────────────
+# ⚠️  DEPRECATED: TOML config is going away.
+# ─────────────────────────────────────────────────────────────────────
+# This file still loads, but the server emits a migration warning on
+# every startup. The canonical format is YAML with the four-section
+# layout (admission / access / storage / advanced) — see
+# `deltaglider_proxy.example.yaml` for the new shape, and run
+# `deltaglider_proxy config migrate deltaglider_proxy.toml` to convert
+# automatically.
+#
+# Silence the startup warning with `DGP_SILENCE_TOML_DEPRECATION=1`
+# while you migrate. TOML support is slated for removal in a future
+# minor release.
+# ─────────────────────────────────────────────────────────────────────
+
 # DeltaGlider Proxy Configuration
 # Copy this file to deltaglider_proxy.toml and adjust settings as needed.
 

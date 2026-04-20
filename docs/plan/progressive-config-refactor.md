@@ -255,16 +255,32 @@ User decisions locked in via AskUserQuestion:
 > - **3b.2.c**: PENDING. RateLimit action variant wired to the
 >   existing `RateLimiter` keyed by IP / principal / IP+bucket. The
 >   five-block default chain from the plan's scope.
-> - **3c**: PENDING. `access.iam_mode: Gui | Declarative` + reconciler
->   (`src/iam/reconciler.rs`) that sync-diffs DB ↔ YAML on apply.
+> - **3b.2.b**: ✅ DONE (commits `2c4cf8c` / `1213932`). Evaluator
+>   dispatches operator-authored blocks: new `Match::Predicates`
+>   variant with method/source-IP/bucket/path-glob/authenticated/
+>   config-flag predicates; new `Action::Deny` and
+>   `Action::Reject { status, message }` variants. Middleware
+>   returns 403 (S3 XML) for Deny and custom status+body for
+>   Reject, short-circuiting SigV4. ConnectInfo wired at startup;
+>   IPv4-mapped IPv6 normalized on extraction. Block names
+>   charset-restricted to prevent XML injection.
+> - **3c.1 + 3c.2**: ✅ DONE (commit `4d03c75`). `IamMode::Gui |
+>   Declarative` enum threaded through `Config.iam_mode`; admin
+>   API IAM mutation routes (users/groups/ext-auth providers/
+>   mapping rules/migrate) return 403 when mode is Declarative.
+>   Read endpoints stay accessible.
+> - **3c.3**: PENDING. The reconciler: on every apply when
+>   `iam_mode == Declarative`, sync-diff the IAM DB against the
+>   YAML's `access.users` / `access.groups` / `access.providers`
+>   arrays (insert missing, update divergent, delete extras). Also:
+>   on startup when DB is empty, seed from YAML arrays (applies in
+>   Gui mode too). Needs: safety cap ("refuse if diff would delete
+>   > N users unless `--force`"); a YAML-facing User/Group shape
+>   decoupled from DB internals (no `id: i64`, no `iam_policies`
+>   computed field); the `src/iam/reconciler.rs` module the plan
+>   originally named.
 > - **3d**: PENDING. Group presets (`{ preset: admin | read-only | ... }`)
 >   expanding to built-in IAM policy documents.
->
-> **Remaining opening moves for Phase 3b.2.b:**
-> 1. Extend runtime `Match` / `Action` enums in `src/admission/mod.rs` with the variants needed to honor operator-authored blocks. Keep arms explicit (no wildcard) so the compiler forces evaluator updates.
-> 2. Teach the evaluator (`src/admission/evaluator.rs`) to dispatch every new variant; extend `RequestInfo` with `source_ip: IpAddr` and `config_flag_is_set: impl Fn(&str) -> Option<bool>`.
-> 3. Axum middleware: plumb `ConnectInfo<SocketAddr>` through; return `403 Forbidden` for `Deny` and the operator's status+body for `Reject` directly from the middleware, short-circuiting SigV4.
-> 4. `/api/admin/config/trace` surfaces the new block + decision shapes.
 >
 > **Helpful artifact already in the repo**: `examples/scrape_full_config.rs`
 > emits a close approximation of the Phase 3 target YAML. As of 3a it

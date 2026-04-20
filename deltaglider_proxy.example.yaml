@@ -1,0 +1,107 @@
+# ─────────────────────────────────────────────────────────────────────
+# DeltaGlider Proxy — canonical YAML configuration (Phase 3+)
+# ─────────────────────────────────────────────────────────────────────
+# Copy this file to `deltaglider_proxy.yaml` and edit as needed.
+# Run `deltaglider_proxy config lint deltaglider_proxy.yaml` before
+# committing to CI.
+#
+# The layout is four optional top-level sections:
+#
+#   admission: ...   # pre-auth request gating (deny / reject / allow)
+#   access:    ...   # SigV4 credentials + iam_mode selector
+#   storage:   ...   # backend(s) + per-bucket overrides
+#   advanced:  ...   # listener, caches, TLS, log level, infra secrets
+#
+# Every section is optional — a bare `storage: { filesystem: /var/dgp }`
+# is a complete, runnable config.
+#
+# Canonical export (`deltaglider_proxy config migrate` or the admin API
+# `/config/export`) always emits this shape and omits default-valued
+# sections.
+
+
+# ── storage — single-backend shorthand (T1 five-line deployment) ────
+#
+# `s3:` OR `filesystem:` triggers the respective backend. Companion
+# fields (region, access_key_id, secret_access_key, force_path_style)
+# apply only to `s3:`.
+storage:
+  filesystem: /var/lib/deltaglider
+  # s3: https://s3.amazonaws.com
+  # region: eu-central-1
+  # access_key_id: AKIA...
+  # secret_access_key: ...
+
+  # Per-bucket overrides. `public: true` is a shorthand for "the
+  # entire bucket is anonymously readable" (compiles to
+  # public_prefixes: [""] which the runtime already consumes).
+  # buckets:
+  #   docs-site:
+  #     public: true
+  #   releases:
+  #     public_prefixes: ["builds/", "stable/"]
+  #     quota_bytes: 10737418240   # 10 GiB
+  #     compression: true
+  #     max_delta_ratio: 0.5
+
+
+# ── access — SigV4 credentials + IAM source-of-truth mode ──────────
+#
+# access:
+#   # Legacy (Phase 2) single admin key pair. In Gui mode the
+#   # encrypted IAM DB is authoritative; this pair is still used
+#   # by the admin GUI login flow and by scripted CI tools.
+#   access_key_id: AKIA...
+#   secret_access_key: ...
+#
+#   # iam_mode: gui (default) — admin GUI/API writes the DB.
+#   # iam_mode: declarative  — YAML is authoritative; admin API
+#   #                          IAM mutation routes return 403.
+#   iam_mode: gui
+
+
+# ── admission — operator-authored pre-auth request gating ──────────
+#
+# Each block has a `name`, a `match` predicate, and an `action`.
+# Blocks fire in order; the first match wins. Operator blocks
+# evaluate BEFORE synthesised public-prefix blocks, so a deny for
+# a known-bad IP range short-circuits anonymous-allow for the same
+# request.
+#
+# admission:
+#   blocks:
+#     - name: deny-known-bad-ips
+#       match:
+#         source_ip_list:
+#           - "203.0.113.5"
+#           - "198.51.100.0/24"
+#       action: deny
+#
+#     - name: maintenance-mode
+#       match: {}                 # empty = fires on every request
+#       action:
+#         type: reject
+#         status: 503
+#         message: "We'll be right back — planned maintenance."
+#
+#     - name: allow-public-zips
+#       match:
+#         method: [GET, HEAD]
+#         bucket: releases
+#         path_glob: "*.zip"
+#       action: allow-anonymous
+
+
+# ── advanced — process-level tunables ──────────────────────────────
+#
+# advanced:
+#   listen_addr: "0.0.0.0:9000"
+#   log_level: "deltaglider_proxy=info"
+#   max_delta_ratio: 0.75           # default
+#   cache_size_mb: 2048             # production recommended ≥1 GiB
+#   metadata_cache_mb: 50
+#
+#   # TLS — both S3 and admin GUI served over HTTPS on the same port.
+#   # tls:
+#   #   cert_path: /etc/ssl/certs/deltaglider.crt
+#   #   key_path: /etc/ssl/private/deltaglider.key
