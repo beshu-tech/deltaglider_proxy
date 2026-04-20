@@ -302,6 +302,7 @@ pub fn run_init_inner(
         backends: Vec::new(),
         default_backend: None,
         encryption_key: None,
+        admission_blocks: Vec::new(),
     };
 
     // Show summary

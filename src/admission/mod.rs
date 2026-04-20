@@ -48,9 +48,11 @@ use serde::{Deserialize, Serialize};
 
 pub mod evaluator;
 pub mod middleware;
+pub mod spec;
 
 pub use evaluator::{evaluate, RequestInfo};
 pub use middleware::{admission_middleware, AdmissionAllowAnonymous};
+pub use spec::{AdmissionBlockSpec, AdmissionSpec, MatchSpec};
 
 /// Ordered list of admission blocks plus the snapshot needed to evaluate
 /// public-prefix matches. The order matters — the evaluator returns on the

@@ -414,6 +414,21 @@ pub struct Config {
     /// Must reference a name in `backends`. Defaults to the first entry.
     #[serde(default)]
     pub default_backend: Option<String>,
+
+    /// Operator-authored admission blocks (Phase 3b.2.a).
+    ///
+    /// Parsed from `admission.blocks:` in the sectioned YAML. The
+    /// evaluator continues to use synthesised public-prefix blocks from
+    /// `buckets:` in Phase 3b.2.a; Phase 3b.2.b will merge these
+    /// operator-authored blocks into the chain. Carrying them in the
+    /// flat `Config` guarantees round-trip preservation via
+    /// `from_yaml_str` → `to_canonical_yaml`.
+    ///
+    /// **NOT in the flat TOML schema.** Legacy flat-shape YAML
+    /// (listen_addr: at root, etc.) does not accept this field —
+    /// admission blocks are sectioned-shape only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub admission_blocks: Vec<crate::admission::AdmissionBlockSpec>,
 }
 
 /// A named storage backend with its connection configuration.
@@ -539,6 +554,7 @@ impl Default for Config {
             backends: Vec::new(),
             default_backend: None,
             encryption_key: None,
+            admission_blocks: Vec::new(),
         }
     }
 }
@@ -2439,6 +2455,104 @@ storage:
         assert!(
             msg.contains("shorthand") || msg.contains("backend"),
             "error must explain the shorthand/backend conflict, got: {msg}"
+        );
+    }
+
+    // ── Phase 3b.2.a: operator-authored admission blocks ─────────────
+
+    #[test]
+    fn test_admission_blocks_deserialize_and_roundtrip() {
+        let yaml = r#"
+admission:
+  blocks:
+    - name: deny-bad-ips
+      match:
+        source_ip_list: ["203.0.113.5", "198.51.100.0/24"]
+      action: deny
+    - name: maint
+      match:
+        config_flag: "maintenance_mode"
+      action:
+        type: reject
+        status: 503
+        message: "back soon"
+"#;
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        assert_eq!(cfg.admission_blocks.len(), 2);
+        assert_eq!(cfg.admission_blocks[0].name, "deny-bad-ips");
+        assert_eq!(cfg.admission_blocks[1].name, "maint");
+
+        // Round-trip through canonical YAML must preserve everything.
+        let exported = cfg.to_canonical_yaml().unwrap();
+        assert!(exported.contains("admission:"));
+        assert!(exported.contains("deny-bad-ips"));
+        assert!(exported.contains("maint"));
+        let cfg2 = Config::from_yaml_str(&exported).unwrap();
+        assert_eq!(cfg.admission_blocks, cfg2.admission_blocks);
+    }
+
+    #[test]
+    fn test_admission_duplicate_block_names_rejected_at_load() {
+        let yaml = r#"
+admission:
+  blocks:
+    - name: same
+      match: {}
+      action: continue
+    - name: same
+      match: {}
+      action: deny
+"#;
+        let err = Config::from_yaml_str(yaml)
+            .expect_err("duplicate admission block names must be rejected");
+        assert!(format!("{err}").contains("duplicate"));
+    }
+
+    #[test]
+    fn test_admission_invalid_reject_status_rejected_at_load() {
+        let yaml = r#"
+admission:
+  blocks:
+    - name: bad
+      match: {}
+      action:
+        type: reject
+        status: 200
+"#;
+        let err = Config::from_yaml_str(yaml)
+            .expect_err("reject with 2xx status must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("4xx") || msg.contains("5xx"),
+            "error must point at the status range, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_admission_unknown_field_in_match_rejected() {
+        // `deny_unknown_fields` on MatchSpec catches field typos.
+        let yaml = r#"
+admission:
+  blocks:
+    - name: typo
+      match:
+        source_ips: ["1.2.3.4"]
+      action: deny
+"#;
+        let err = Config::from_yaml_str(yaml)
+            .expect_err("typo in match field must be rejected");
+        assert!(format!("{err}").contains("source_ips"));
+    }
+
+    #[test]
+    fn test_admission_empty_omitted_on_default_export() {
+        // A Config with no operator-authored blocks must not emit an
+        // `admission:` section — keeps default-config YAML minimal.
+        let cfg = Config::default();
+        let exported = cfg.to_canonical_yaml().unwrap();
+        assert!(
+            !exported.contains("admission:"),
+            "empty admission must be omitted, got:\n{exported}"
         );
     }
 }

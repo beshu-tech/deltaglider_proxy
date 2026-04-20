@@ -87,22 +87,28 @@ pub struct SectionedConfig {
     pub advanced: AdvancedSection,
 }
 
-/// Phase 3a ships an empty placeholder — the admission chain is derived
-/// entirely from bucket public_prefixes. Phase 3b introduces actual block
-/// authoring via this type.
+/// Admission chain authoring surface. Phase 3b.2.a populates this with
+/// the operator-facing wire format for admission blocks; the evaluator
+/// still relies on synthesised public-prefix blocks for the live
+/// request path (Phase 3b.2.b wires operator-authored blocks through).
 ///
-/// The shape is deliberately unit-struct-like for now (no fields the
-/// operator can set). We keep it as a distinct type so Phase 3b can
-/// add fields without breaking serde back-compat on configs already
-/// written against Phase 3a.
+/// An empty [`AdmissionSection`] (no `blocks:` field) round-trips as a
+/// default — the admission chain remains exclusively synthesised from
+/// bucket public_prefixes, as in Phase 2.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(deny_unknown_fields)]
 pub struct AdmissionSection {
-    /// Phase 3b: populate with `Vec<AdmissionBlockSpec>`. Today we
-    /// deliberately omit any field so operator docs authored now
-    /// can't accidentally encode non-portable YAML.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reserved: Option<serde_json::Value>,
+    /// Operator-authored admission blocks. Evaluated in order before
+    /// the synthesised public-prefix blocks; first match wins (RRR
+    /// semantics).
+    ///
+    /// In Phase 3b.2.a these blocks deserialize cleanly and round-trip
+    /// through `/export` / `/apply`, but are **not** yet dispatched by
+    /// the evaluator. A warning is logged at chain-build time so
+    /// operators know the gap. Phase 3b.2.b removes the stub and wires
+    /// them through for real.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<crate::admission::AdmissionBlockSpec>,
 }
 
 /// Authentication sources and IAM state. Phase 3a only holds the legacy
@@ -435,7 +441,15 @@ impl SectionedConfig {
     pub fn from_flat(flat: &crate::config::Config) -> Self {
         Self {
             defaults_version: flat.defaults_version,
-            admission: None, // Phase 3a: not yet operator-editable.
+            // Only emit `admission:` when the operator actually
+            // authored blocks — keeps default-config exports empty.
+            admission: if flat.admission_blocks.is_empty() {
+                None
+            } else {
+                Some(AdmissionSection {
+                    blocks: flat.admission_blocks.clone(),
+                })
+            },
             access: AccessSection {
                 authentication: flat.authentication.clone(),
                 access_key_id: flat.access_key_id.clone(),
@@ -501,6 +515,16 @@ impl SectionedConfig {
     /// `Config::normalize_shorthands`.
     pub fn into_flat(mut self) -> Result<crate::config::Config, String> {
         self.storage.normalize()?;
+        // Validate operator-authored admission blocks semantically
+        // (duplicate names, invalid Reject status, conflicting
+        // source_ip forms). Structural errors already surfaced via
+        // serde; this runs the cross-field checks.
+        if let Some(section) = self.admission.as_ref() {
+            let spec = crate::admission::AdmissionSpec {
+                blocks: section.blocks.clone(),
+            };
+            spec.validate()?;
+        }
         Ok(self.into_flat_unchecked())
     }
 
@@ -539,6 +563,10 @@ impl SectionedConfig {
             buckets: self.storage.buckets,
             backends: self.storage.backends,
             default_backend: self.storage.default_backend,
+            admission_blocks: self
+                .admission
+                .map(|s| s.blocks)
+                .unwrap_or_default(),
         }
     }
 }

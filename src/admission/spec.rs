@@ -1,0 +1,537 @@
+//! Operator-authored admission block wire format (Phase 3b.2.a).
+//!
+//! This module is the **YAML-facing** layer for the admission chain.
+//! It defines the serde shapes an operator writes in their config file
+//! (or POSTs to `/api/admin/config/apply`), and nothing else. It does
+//! NOT run the evaluator — that lives in [`crate::admission::evaluator`]
+//! against the existing in-memory enums in [`crate::admission`].
+//!
+//! # Why separate from the runtime enums?
+//!
+//! The runtime [`crate::admission::Match`] and [`crate::admission::Action`]
+//! are narrow: Phase 2 shipped them with exactly the variants the
+//! evaluator emits today (`PublicPrefixGrant`, `AllowAnonymous`,
+//! `Continue`). Growing them requires updating the evaluator, the
+//! middleware, and the trace endpoint in lock-step — one concern per
+//! commit.
+//!
+//! Phase 3b.2.a opens the YAML door so GitOps authors can START writing
+//! block specs that survive `/apply` → `/export` round-trip. Phase 3b.2.b
+//! will teach the evaluator to honor them. Until then, operator-
+//! authored blocks DESERIALIZE cleanly but do NOT fire — the chain
+//! builder ignores them with an INFO log so the operator sees the gap.
+//!
+//! # Wire format
+//!
+//! ```yaml
+//! admission:
+//!   blocks:
+//!     - name: "deny-known-bad-ips"
+//!       match:
+//!         source_ip_list: ["203.0.113.5", "198.51.100.0/24"]
+//!       action: deny
+//!
+//!     - name: "maintenance-mode"
+//!       match:
+//!         config_flag: "maintenance_mode"
+//!       action:
+//!         type: reject
+//!         status: 503
+//!         message: "we'll be right back"
+//!
+//!     - name: "allow-releases"
+//!       match:
+//!         method: [GET, HEAD]
+//!         bucket: "releases"
+//!         path_glob: "*.zip"
+//!       action: allow-anonymous
+//! ```
+//!
+//! # Invariants
+//!
+//! * **`deny_unknown_fields`** on every struct so typos surface loudly.
+//! * IP/CIDR strings are validated at parse time (typo in a denylist
+//!   should fail on load, not silently match nothing forever).
+//! * Status codes in `Reject` must be 4xx or 5xx. `200-OK-reject`
+//!   blocks are almost certainly operator error.
+//! * Block names are unique across the chain — order still matters,
+//!   but identical names in trace output would be useless.
+
+use ipnet::IpNet;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
+
+/// Wire format for an operator-authored admission block.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AdmissionBlockSpec {
+    /// Human-readable identifier used by trace output and logs. Must be
+    /// unique across the chain — two blocks with the same name are
+    /// indistinguishable in diagnostics.
+    pub name: String,
+
+    /// Predicate that fires the block. An empty `match: {}` fires on
+    /// every request, which is rarely what an operator wants — usually
+    /// meant for the chain's terminal fallback; other positions should
+    /// narrow the predicate.
+    ///
+    /// Renamed to `match:` on the wire — `match_` is a Rust-only tweak
+    /// to dodge the keyword collision.
+    #[serde(default, rename = "match")]
+    pub match_: MatchSpec,
+
+    /// What the block does when its predicate matches.
+    pub action: ActionSpec,
+}
+
+/// Predicates an operator can combine on a single block. All fields are
+/// AND'd together — a block with `method: [GET]` AND `bucket: "releases"`
+/// fires only for GETs on the `releases` bucket. To express OR, use
+/// separate blocks with the same action.
+///
+/// Field names here mirror the plan doc exactly. Stable names let the
+/// operator's YAML survive future additions; new predicates become new
+/// optional fields.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct MatchSpec {
+    /// HTTP methods the request must use. `None` = any method. Case-
+    /// insensitive comparison at evaluation time; we uppercase on parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<Vec<String>>,
+
+    /// Exact source IP. Mutually exclusive with the list / CIDR forms
+    /// — setting more than one is a parse-time error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ip: Option<IpAddr>,
+
+    /// Source IP list. Accepts both bare IPs (`203.0.113.5`) and CIDRs
+    /// (`198.51.100.0/24`). Bare IPs are promoted to `/32` or `/128`
+    /// during parse, so the evaluator only deals with a uniform
+    /// `Vec<IpNet>` at runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ip_list: Option<Vec<SourceIpEntry>>,
+
+    /// Bucket the request targets. Lowercased on parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
+
+    /// Glob-style pattern matched against the **full object key** (i.e.
+    /// everything after the bucket name). `"*.zip"`, `"releases/**"`,
+    /// `"docs/readme.md"`. Not set = match any key (including bucket-
+    /// level LIST requests, where the key is empty).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_glob: Option<String>,
+
+    /// Fire only when the request is / is not authenticated. `None` =
+    /// either. Useful for "apply rate limit only to anonymous
+    /// traffic".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticated: Option<bool>,
+
+    /// Fire only while a named config flag is true. Today the only
+    /// recognised flag is `"maintenance_mode"` (reads from
+    /// `Config::maintenance_mode` when Phase 3b.2.b introduces it).
+    /// Unrecognised flags always evaluate false with a warning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_flag: Option<String>,
+}
+
+/// Source-IP entry accepting bare IPs and CIDRs. Parsed via a serde
+/// dance (string → either `IpAddr` or `IpNet`) so the operator's YAML
+/// reads naturally: `- 203.0.113.5` and `- 198.51.100.0/24` both work.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceIpEntry(pub IpNet);
+
+impl Serialize for SourceIpEntry {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        // Emit bare IPs without the /32 suffix to stay readable.
+        let s_string = match self.0 {
+            IpNet::V4(n) if n.prefix_len() == 32 => n.addr().to_string(),
+            IpNet::V6(n) if n.prefix_len() == 128 => n.addr().to_string(),
+            other => other.to_string(),
+        };
+        s.serialize_str(&s_string)
+    }
+}
+
+impl<'de> Deserialize<'de> for SourceIpEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(d)?;
+        // Try CIDR first; fall back to bare IP (promoted to /32 or /128).
+        if let Ok(net) = raw.parse::<IpNet>() {
+            return Ok(SourceIpEntry(net));
+        }
+        if let Ok(addr) = raw.parse::<IpAddr>() {
+            let net = match addr {
+                IpAddr::V4(v4) => IpNet::V4(ipnet::Ipv4Net::new(v4, 32).expect("32 is valid")),
+                IpAddr::V6(v6) => IpNet::V6(ipnet::Ipv6Net::new(v6, 128).expect("128 is valid")),
+            };
+            return Ok(SourceIpEntry(net));
+        }
+        Err(serde::de::Error::custom(format!(
+            "invalid IP or CIDR: `{}` (expected e.g. `203.0.113.5` or `198.51.100.0/24`)",
+            raw
+        )))
+    }
+}
+
+impl schemars::JsonSchema for SourceIpEntry {
+    fn schema_name() -> String {
+        "SourceIpEntry".to_string()
+    }
+    fn json_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        // Reads as a string in the schema — the parse-time validation
+        // is a serde concern, not a schema concern.
+        <String as schemars::JsonSchema>::json_schema(gen)
+    }
+}
+
+/// Action variants operators author. Mirrors the runtime
+/// [`crate::admission::Action`] but with operator-provided configuration
+/// (status code, message, etc.). The chain builder translates this
+/// into the runtime form; variants the evaluator can't yet dispatch
+/// are logged at INFO and skipped (Phase 3b.2.b turns that off).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case", untagged)]
+pub enum ActionSpec {
+    /// Short form: `action: allow-anonymous` / `action: deny` /
+    /// `action: continue`. Kebab-case for YAML ergonomics.
+    Simple(SimpleAction),
+
+    /// Long form for actions that carry configuration, tagged by
+    /// `type:`. Example:
+    ///
+    /// ```yaml
+    /// action:
+    ///   type: reject
+    ///   status: 503
+    ///   message: "we'll be right back"
+    /// ```
+    Tagged(TaggedAction),
+}
+
+/// Simple actions that carry no configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum SimpleAction {
+    /// Pre-admit the request as anonymous (skip SigV4).
+    AllowAnonymous,
+    /// Short-circuit with 403 Forbidden.
+    Deny,
+    /// Fall through to authentication (operator can use this as an
+    /// explicit terminal for diagnostic visibility).
+    Continue,
+}
+
+/// Actions that need a `type: X` tag because they carry fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case", tag = "type", deny_unknown_fields)]
+pub enum TaggedAction {
+    /// Return a custom HTTP status + body. Status must be 4xx or 5xx
+    /// (validated at parse time). Intended for maintenance pages
+    /// and rate-exceed errors.
+    Reject {
+        /// HTTP status code. Validated as 4xx/5xx.
+        status: u16,
+        /// Optional response body. `None` = empty body; caller can
+        /// rely on the status code alone.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+}
+
+/// Top-level admission section shape: an ordered list of blocks.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AdmissionSpec {
+    /// Blocks evaluated in order. First matching block's action wins
+    /// (RRR semantics).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<AdmissionBlockSpec>,
+}
+
+impl AdmissionSpec {
+    /// Validate the full spec after deserialization. Called by the
+    /// config loader so that semantic errors (duplicate block names,
+    /// invalid Reject status, conflicting source IP forms) surface
+    /// with precise file-position information via
+    /// [`ConfigError::Parse`] rather than much later from the evaluator.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut seen_names = std::collections::HashSet::new();
+        for block in &self.blocks {
+            if !seen_names.insert(block.name.as_str()) {
+                return Err(format!(
+                    "duplicate admission block name `{}` — block names must be unique \
+                     across the chain",
+                    block.name
+                ));
+            }
+            block.match_.validate()?;
+            block.action.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl MatchSpec {
+    /// Cross-field validation. `source_ip` is mutually exclusive with
+    /// `source_ip_list` — operator must pick one form.
+    fn validate(&self) -> Result<(), String> {
+        if self.source_ip.is_some() && self.source_ip_list.is_some() {
+            return Err(
+                "match: `source_ip` and `source_ip_list` are mutually exclusive — use \
+                 `source_ip_list` for multi-entry denylists and `source_ip` for a single IP"
+                    .to_string(),
+            );
+        }
+        // Normalised method vec: uppercase and check for known methods.
+        if let Some(methods) = &self.method {
+            if methods.is_empty() {
+                return Err(
+                    "match: `method: []` means no methods — either omit the field to \
+                     match any method, or list at least one"
+                        .to_string(),
+                );
+            }
+            for m in methods {
+                let upper = m.to_ascii_uppercase();
+                if !matches!(
+                    upper.as_str(),
+                    "GET" | "HEAD" | "PUT" | "POST" | "DELETE" | "PATCH" | "OPTIONS"
+                ) {
+                    return Err(format!(
+                        "match: unknown HTTP method `{}` — expected GET/HEAD/PUT/POST/DELETE/PATCH/OPTIONS",
+                        m
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ActionSpec {
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            ActionSpec::Simple(_) => Ok(()),
+            ActionSpec::Tagged(TaggedAction::Reject { status, message: _ }) => {
+                if !(400..600).contains(status) {
+                    return Err(format!(
+                        "action: reject status `{}` must be 4xx or 5xx — Reject is for \
+                         client/server errors, not successes or redirects",
+                        status
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deserialize_deny_simple_action() {
+        let yaml = r#"
+name: deny-bad-ips
+match:
+  source_ip_list: ["203.0.113.5", "198.51.100.0/24"]
+action: deny
+"#;
+        let block: AdmissionBlockSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(block.name, "deny-bad-ips");
+        assert!(matches!(
+            block.action,
+            ActionSpec::Simple(SimpleAction::Deny)
+        ));
+        let ips = block.match_.source_ip_list.as_ref().unwrap();
+        assert_eq!(ips.len(), 2);
+        // Bare IP promoted to /32.
+        assert_eq!(ips[0].0.to_string(), "203.0.113.5/32");
+        // CIDR preserved.
+        assert_eq!(ips[1].0.to_string(), "198.51.100.0/24");
+    }
+
+    #[test]
+    fn deserialize_reject_tagged_action() {
+        let yaml = r#"
+name: maint
+match: {}
+action:
+  type: reject
+  status: 503
+  message: "try again"
+"#;
+        let block: AdmissionBlockSpec = serde_yaml::from_str(yaml).unwrap();
+        match &block.action {
+            ActionSpec::Tagged(TaggedAction::Reject { status, message }) => {
+                assert_eq!(*status, 503);
+                assert_eq!(message.as_deref(), Some("try again"));
+            }
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reject_2xx_status_is_error() {
+        let yaml = r#"
+name: bad
+match: {}
+action:
+  type: reject
+  status: 200
+"#;
+        let block: AdmissionBlockSpec = serde_yaml::from_str(yaml).unwrap();
+        let err = block.action.validate().unwrap_err();
+        assert!(err.contains("4xx") || err.contains("5xx"));
+    }
+
+    #[test]
+    fn reject_without_message_deserializes() {
+        let yaml = r#"
+name: bare
+match: {}
+action:
+  type: reject
+  status: 429
+"#;
+        let block: AdmissionBlockSpec = serde_yaml::from_str(yaml).unwrap();
+        match &block.action {
+            ActionSpec::Tagged(TaggedAction::Reject { status, message }) => {
+                assert_eq!(*status, 429);
+                assert!(message.is_none());
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn match_conflicting_source_ip_forms_is_error() {
+        let m = MatchSpec {
+            source_ip: Some("203.0.113.5".parse().unwrap()),
+            source_ip_list: Some(vec![]),
+            ..Default::default()
+        };
+        let err = m.validate().unwrap_err();
+        assert!(err.contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn match_empty_method_list_is_error() {
+        let m = MatchSpec {
+            method: Some(vec![]),
+            ..Default::default()
+        };
+        let err = m.validate().unwrap_err();
+        assert!(err.contains("no methods"));
+    }
+
+    #[test]
+    fn match_unknown_method_is_error() {
+        let m = MatchSpec {
+            method: Some(vec!["CONNECT".into()]),
+            ..Default::default()
+        };
+        let err = m.validate().unwrap_err();
+        assert!(err.contains("CONNECT"));
+    }
+
+    #[test]
+    fn source_ip_entry_ipv6_parses() {
+        let entry: SourceIpEntry = serde_yaml::from_str("\"2001:db8::1\"").unwrap();
+        assert_eq!(entry.0.to_string(), "2001:db8::1/128");
+    }
+
+    #[test]
+    fn source_ip_entry_invalid_is_error() {
+        let err: Result<SourceIpEntry, _> = serde_yaml::from_str("\"not-an-ip\"");
+        let e = err.unwrap_err();
+        assert!(format!("{e}").contains("invalid IP or CIDR"));
+    }
+
+    #[test]
+    fn admission_spec_duplicate_block_names_is_error() {
+        let spec = AdmissionSpec {
+            blocks: vec![
+                AdmissionBlockSpec {
+                    name: "same".into(),
+                    match_: MatchSpec::default(),
+                    action: ActionSpec::Simple(SimpleAction::Continue),
+                },
+                AdmissionBlockSpec {
+                    name: "same".into(),
+                    match_: MatchSpec::default(),
+                    action: ActionSpec::Simple(SimpleAction::Deny),
+                },
+            ],
+        };
+        let err = spec.validate().unwrap_err();
+        assert!(err.contains("duplicate"));
+    }
+
+    #[test]
+    fn admission_spec_roundtrips_through_yaml() {
+        let spec = AdmissionSpec {
+            blocks: vec![
+                AdmissionBlockSpec {
+                    name: "deny-bad".into(),
+                    match_: MatchSpec {
+                        source_ip_list: Some(vec![SourceIpEntry(
+                            "203.0.113.0/24".parse().unwrap(),
+                        )]),
+                        ..Default::default()
+                    },
+                    action: ActionSpec::Simple(SimpleAction::Deny),
+                },
+                AdmissionBlockSpec {
+                    name: "maint".into(),
+                    match_: MatchSpec {
+                        config_flag: Some("maintenance_mode".into()),
+                        ..Default::default()
+                    },
+                    action: ActionSpec::Tagged(TaggedAction::Reject {
+                        status: 503,
+                        message: Some("back soon".into()),
+                    }),
+                },
+            ],
+        };
+        let yaml = serde_yaml::to_string(&spec).unwrap();
+        let back: AdmissionSpec = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(spec, back, "spec must round-trip losslessly, emitted:\n{yaml}");
+    }
+
+    #[test]
+    fn match_with_bucket_and_path_glob() {
+        let yaml = r#"
+name: allow-releases
+match:
+  method: [GET, HEAD]
+  bucket: releases
+  path_glob: "*.zip"
+action: allow-anonymous
+"#;
+        let block: AdmissionBlockSpec = serde_yaml::from_str(yaml).unwrap();
+        let m = &block.match_;
+        assert_eq!(m.method.as_deref(), Some(&["GET".to_string(), "HEAD".to_string()][..]));
+        assert_eq!(m.bucket.as_deref(), Some("releases"));
+        assert_eq!(m.path_glob.as_deref(), Some("*.zip"));
+    }
+
+    #[test]
+    fn unknown_field_in_match_is_error() {
+        // deny_unknown_fields catches typos like `source_ips` (plural).
+        let yaml = r#"
+name: oops
+match:
+  source_ips: ["203.0.113.5"]
+action: deny
+"#;
+        let err: Result<AdmissionBlockSpec, _> = serde_yaml::from_str(yaml);
+        assert!(err.is_err(), "typo in match field must fail parse");
+    }
+}
