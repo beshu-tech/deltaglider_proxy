@@ -256,58 +256,11 @@ impl S3Backend {
 
     // === Metadata conversion helpers ===
 
-    /// Convert FileMetadata to S3 metadata headers (dg-* format)
+    /// Convert FileMetadata to S3 metadata headers (bare dg-* keys).
+    /// The S3 SDK auto-prepends `x-amz-meta-` when using `.metadata()`.
+    /// Delegates to `FileMetadata::to_bare_metadata_map()` (single source of truth).
     fn metadata_to_headers(&self, metadata: &FileMetadata) -> HashMap<String, String> {
-        use crate::types::meta_keys as mk;
-        let mut headers = HashMap::new();
-
-        headers.insert(mk::TOOL.to_string(), metadata.tool.clone());
-        headers.insert(
-            mk::ORIGINAL_NAME.to_string(),
-            metadata.original_name.clone(),
-        );
-        headers.insert(mk::FILE_SHA256.to_string(), metadata.file_sha256.clone());
-        headers.insert(mk::FILE_SIZE.to_string(), metadata.file_size.to_string());
-        headers.insert(mk::MD5.to_string(), metadata.md5.clone());
-        if let Some(ref ct) = metadata.content_type {
-            headers.insert("content-type".to_string(), ct.clone());
-        }
-        headers.insert(
-            mk::CREATED_AT.to_string(),
-            metadata
-                .created_at
-                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
-                .to_string(),
-        );
-
-        match &metadata.storage_info {
-            StorageInfo::Reference { source_name } => {
-                headers.insert(mk::NOTE.to_string(), "reference".to_string());
-                headers.insert(mk::SOURCE_NAME.to_string(), source_name.clone());
-            }
-            StorageInfo::Delta {
-                ref_path,
-                ref_sha256,
-                delta_size,
-                delta_cmd,
-            } => {
-                headers.insert(mk::NOTE.to_string(), "delta".to_string());
-                // Write as dg-ref-path (new canonical name)
-                headers.insert(mk::REF_PATH.to_string(), ref_path.clone());
-                headers.insert(mk::REF_SHA256.to_string(), ref_sha256.clone());
-                headers.insert(mk::DELTA_SIZE.to_string(), delta_size.to_string());
-                headers.insert(mk::DELTA_CMD.to_string(), delta_cmd.clone());
-            }
-            StorageInfo::Passthrough => {
-                headers.insert(mk::NOTE.to_string(), "passthrough".to_string());
-            }
-        }
-
-        for (key, value) in &metadata.user_metadata {
-            headers.insert(format!("user-{}", key), value.clone());
-        }
-
-        headers
+        metadata.to_bare_metadata_map()
     }
 
     /// Convert S3 metadata headers to FileMetadata
