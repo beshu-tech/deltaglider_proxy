@@ -961,3 +961,137 @@ async fn test_update_config_accepts_case_insensitive_backend_type() {
         "uppercase 'S3' must be accepted, got warnings: {warnings:?}"
     );
 }
+
+// ═══════════════════════════════════════════════════
+// Phase 3a — sectioned YAML dogfood
+// ═══════════════════════════════════════════════════
+
+/// End-to-end GitOps dogfood: the server's own canonical YAML export,
+/// when POSTed back to /apply, is a no-op. The exporter is sectioned
+/// (Phase 3), and the apply handler routes through the dual-shape
+/// deserializer — this test verifies both sides stay in sync.
+#[tokio::test]
+async fn test_export_apply_roundtrip_is_noop_sectioned_shape() {
+    let server = TestServer::builder()
+        .auth("DOGFOOD", "DOGSECRET")
+        .max_delta_ratio(0.42)
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    // Export the live config.
+    let exported = admin
+        .get(format!("{}/_/api/admin/config/export", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    // Must be the sectioned shape — has at least one section key at
+    // the top, no flat top-level config field.
+    let doc: serde_yaml::Value = serde_yaml::from_str(&exported).unwrap();
+    let map = doc.as_mapping().expect("root must be a mapping");
+    let root_keys: std::collections::BTreeSet<&str> = map
+        .keys()
+        .filter_map(|k| k.as_str())
+        .collect();
+    let section_keys: std::collections::BTreeSet<&str> =
+        ["admission", "access", "storage", "advanced"]
+            .into_iter()
+            .collect();
+    assert!(
+        !root_keys.is_disjoint(&section_keys),
+        "exported YAML must include at least one section key (admission/access/storage/advanced); got keys: {root_keys:?}"
+    );
+    assert!(
+        !root_keys.contains("listen_addr"),
+        "exported YAML must not have flat `listen_addr:` at the root — it should be under `advanced:`. Got keys: {root_keys:?}"
+    );
+
+    // Apply the exported YAML back. This must be a clean no-op on
+    // in-memory state.
+    let resp = admin
+        .post(format!("{}/_/api/admin/config/apply", server.endpoint()))
+        .json(&json!({ "yaml": exported }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "sectioned-shape apply must succeed, body: {text}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["applied"], true);
+
+    // Verify runtime state is unchanged.
+    let cfg: serde_json::Value = admin
+        .get(format!("{}/_/api/admin/config", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        (cfg["max_delta_ratio"].as_f64().unwrap() - 0.42).abs() < 1e-6,
+        "max_delta_ratio must survive export→apply round-trip, got {}",
+        cfg["max_delta_ratio"]
+    );
+}
+
+/// The apply handler also accepts the legacy **flat** shape. Covers the
+/// transition window where an operator has a pre-Phase-3 YAML file
+/// checked into GitOps and hasn't re-exported it yet.
+#[tokio::test]
+async fn test_apply_accepts_legacy_flat_shape() {
+    let server = TestServer::builder()
+        .auth("LEGACY", "LEGACYSECRET")
+        .max_delta_ratio(0.75)
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    // Build a flat-shape YAML (pre-Phase-3) with a non-default delta ratio.
+    // Minimally reproduces what an existing operator's checked-in file
+    // looks like: root-level keys, no section wrappers.
+    let flat_yaml = r#"
+listen_addr: "127.0.0.1:19000"
+max_delta_ratio: 0.2
+access_key_id: "LEGACY"
+secret_access_key: "LEGACYSECRET"
+"#;
+
+    let resp = admin
+        .post(format!("{}/_/api/admin/config/apply", server.endpoint()))
+        .json(&json!({ "yaml": flat_yaml }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "flat-shape apply must succeed, body: {text}"
+    );
+
+    // Verify the flat shape took effect.
+    let cfg: serde_json::Value = admin
+        .get(format!("{}/_/api/admin/config", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        (cfg["max_delta_ratio"].as_f64().unwrap() - 0.2).abs() < 1e-6,
+        "max_delta_ratio must come through from flat-shape apply, got {}",
+        cfg["max_delta_ratio"]
+    );
+}
