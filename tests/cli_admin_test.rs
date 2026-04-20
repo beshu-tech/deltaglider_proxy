@@ -222,14 +222,17 @@ async fn test_admission_trace_matches_public_prefix_after_apply() {
             .await
             .unwrap()
     };
-    // 2. Patch `buckets` to add a public-prefixed entry. Doing this via
-    //    YAML-parse-and-reserialize (rather than string append) because
-    //    the exported doc may already carry a `buckets:` key — a
-    //    duplicate top-level key would fail to parse.
+    // 2. Patch `storage.buckets` to add a public-prefixed entry. The
+    //    exported doc is Phase 3+ sectioned shape, so buckets live
+    //    under `storage:`. Mixing sectioned + flat at the root is now
+    //    a hard error (was silent merge in earlier drafts).
     let mut doc: serde_yaml::Value = serde_yaml::from_str(&exported).unwrap();
-    let buckets = doc
-        .as_mapping_mut()
-        .unwrap()
+    let root = doc.as_mapping_mut().unwrap();
+    let storage = root
+        .entry(serde_yaml::Value::String("storage".into()))
+        .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    let storage_map = storage.as_mapping_mut().expect("storage must be a mapping");
+    let buckets = storage_map
         .entry(serde_yaml::Value::String("buckets".into()))
         .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
     let buckets_map = buckets.as_mapping_mut().expect("buckets must be a mapping");

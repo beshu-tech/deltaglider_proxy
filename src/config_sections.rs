@@ -56,6 +56,7 @@ use std::net::SocketAddr;
 /// Top-level `defaults` is kept at the root (not a section) because it's
 /// metadata about the whole document, not any one concern.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
 pub struct SectionedConfig {
     /// Pinned defaults posture — omitted when the server-current default.
     #[serde(
@@ -95,6 +96,7 @@ pub struct SectionedConfig {
 /// add fields without breaking serde back-compat on configs already
 /// written against Phase 3a.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AdmissionSection {
     /// Phase 3b: populate with `Vec<AdmissionBlockSpec>`. Today we
     /// deliberately omit any field so operator docs authored now
@@ -107,6 +109,7 @@ pub struct AdmissionSection {
 /// SigV4 credential pair + authentication mode — the IAM DB stays
 /// authoritative for users/groups/OIDC providers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AccessSection {
     /// Explicit auth-mode selector: `"none"` for open access; absent
     /// means "auto-detect from credentials".
@@ -123,6 +126,7 @@ pub struct AccessSection {
 
 /// Backends + per-bucket overrides.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
 pub struct StorageSection {
     /// Default (legacy) single backend. Compatible with existing
     /// one-backend deployments.
@@ -147,6 +151,7 @@ pub struct StorageSection {
 /// infrastructure-only secrets (`bootstrap_password_hash`,
 /// `encryption_key`, `config_sync_bucket`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AdvancedSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_addr: Option<SocketAddr>,

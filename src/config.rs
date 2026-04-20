@@ -595,21 +595,43 @@ impl ConfigFormat {
     }
 }
 
-/// Classify a parsed YAML document as *sectioned* (Phase 3 canonical shape)
-/// vs. *flat* (legacy). True iff the top-level mapping contains at least one
-/// of the four section keys and no legacy top-level keys. This detection is
-/// intentionally cautious: a document that mixes both shapes
-/// (`listen_addr:` at the root AND a `storage:` section) is treated as flat
-/// and the sectioned key becomes an unknown-field error — no silent merging
-/// of two competing shapes.
-fn looks_sectioned(doc: &serde_yaml::Value) -> bool {
+/// Classification of a parsed YAML document's top-level shape.
+///
+/// The [`ConfigShape::Mixed`] variant is a hard error: silently picking
+/// one shape over the other would drop half of what the operator wrote.
+/// We surface the conflicting keys in the error message so they can tell
+/// at a glance which half was accidental.
+enum ConfigShape {
+    Sectioned,
+    Flat,
+    /// The doc mixes root-level flat keys (`listen_addr:`, `backend:`,
+    /// …) and at least one Phase 3+ section header (`admission:`,
+    /// `access:`, `storage:`, `advanced:`). Operator error — reject.
+    Mixed {
+        flat_keys: Vec<String>,
+        section_keys: Vec<String>,
+    },
+}
+
+/// Classify a parsed YAML document as sectioned (Phase 3+ canonical shape)
+/// vs. flat (legacy) vs. mixed (reject).
+///
+/// The classifier treats `defaults:` as shape-neutral — it is a
+/// document-level version pin permitted at the root in both shapes.
+/// A doc with *only* `defaults:` (or nothing at all) is classified as
+/// flat by default, which is correct because the flat deserializer is
+/// the superset.
+fn classify_shape(doc: &serde_yaml::Value) -> ConfigShape {
     let Some(map) = doc.as_mapping() else {
-        return false;
+        // Sequences, scalars, and null end up here. The flat deserializer
+        // will produce a precise error with the path, so just route that
+        // way.
+        return ConfigShape::Flat;
     };
     const SECTION_KEYS: &[&str] = &["admission", "access", "storage", "advanced"];
-    // Any flat-shape-only key at the root rules out sectioned classification.
-    // `defaults` is permitted at the root in both shapes (it's the
-    // document-level version pin, not a section).
+    // Any flat-shape-only key at the root disqualifies "sectioned".
+    // Must include every public on-disk key of `Config`; additions need
+    // to show up here too or mixed-shape detection silently misses them.
     const FLAT_ONLY_KEYS: &[&str] = &[
         "listen_addr",
         "backend",
@@ -623,7 +645,7 @@ fn looks_sectioned(doc: &serde_yaml::Value) -> bool {
         "access_key_id",
         "secret_access_key",
         "bootstrap_password_hash",
-        "admin_password_hash", // legacy alias
+        "admin_password_hash", // legacy alias for bootstrap_password_hash
         "codec_concurrency",
         "blocking_threads",
         "log_level",
@@ -633,16 +655,27 @@ fn looks_sectioned(doc: &serde_yaml::Value) -> bool {
         "buckets",
     ];
 
-    let has_section = map
-        .keys()
-        .filter_map(|k| k.as_str())
-        .any(|k| SECTION_KEYS.contains(&k));
-    let has_flat = map
-        .keys()
-        .filter_map(|k| k.as_str())
-        .any(|k| FLAT_ONLY_KEYS.contains(&k));
+    let mut flat_keys = Vec::new();
+    let mut section_keys = Vec::new();
+    for key in map.keys().filter_map(|k| k.as_str()) {
+        if SECTION_KEYS.contains(&key) {
+            section_keys.push(key.to_string());
+        } else if FLAT_ONLY_KEYS.contains(&key) {
+            flat_keys.push(key.to_string());
+        }
+        // Unknown keys (e.g. `storge:`) are ignored here — they'll be
+        // caught by `deny_unknown_fields` on whichever shape we
+        // eventually dispatch to.
+    }
 
-    has_section && !has_flat
+    match (flat_keys.is_empty(), section_keys.is_empty()) {
+        (true, false) => ConfigShape::Sectioned,
+        (false, true) | (true, true) => ConfigShape::Flat,
+        (false, false) => ConfigShape::Mixed {
+            flat_keys,
+            section_keys,
+        },
+    }
 }
 
 impl Config {
@@ -699,14 +732,27 @@ impl Config {
         let doc: serde_yaml::Value =
             serde_yaml::from_str(content).map_err(|e| ConfigError::Parse(e.to_string()))?;
 
-        if looks_sectioned(&doc) {
-            let sectioned: crate::config_sections::SectionedConfig =
-                serde_yaml::from_value(doc).map_err(|e| ConfigError::Parse(e.to_string()))?;
-            Ok(sectioned.into_flat())
-        } else {
-            let flat: Config =
-                serde_yaml::from_value(doc).map_err(|e| ConfigError::Parse(e.to_string()))?;
-            Ok(flat)
+        match classify_shape(&doc) {
+            ConfigShape::Sectioned => {
+                let sectioned: crate::config_sections::SectionedConfig =
+                    serde_yaml::from_value(doc).map_err(|e| ConfigError::Parse(e.to_string()))?;
+                Ok(sectioned.into_flat())
+            }
+            ConfigShape::Flat => {
+                let flat: Config =
+                    serde_yaml::from_value(doc).map_err(|e| ConfigError::Parse(e.to_string()))?;
+                Ok(flat)
+            }
+            ConfigShape::Mixed {
+                flat_keys,
+                section_keys,
+            } => Err(ConfigError::Parse(format!(
+                "config YAML mixes legacy flat keys ({}) with Phase 3+ section headers ({}); \
+                 pick one shape. The canonical export (`deltaglider_proxy config migrate` / \
+                 the admin API `/config/export`) always emits the sectioned shape.",
+                flat_keys.join(", "),
+                section_keys.join(", "),
+            ))),
         }
     }
 
@@ -2125,34 +2171,82 @@ access:
     }
 
     #[test]
-    fn test_from_yaml_str_mixed_shape_is_rejected_as_flat() {
+    fn test_from_yaml_str_mixed_shape_is_hard_error() {
         // A doc with BOTH a flat key (`listen_addr:`) AND a section key
-        // (`storage:`) is classified as flat, causing the sectioned key to
-        // become an unknown field under strict deserialization (or to be
-        // silently ignored otherwise). Either way, we must not silently
-        // merge two competing shapes — the operator sees an error or a
-        // non-effect they can reason about.
+        // (`storage:`) must be rejected — picking either shape would drop
+        // half of what the operator wrote.
         let yaml = r#"
 listen_addr: "127.0.0.1:9125"
 storage:
   default_backend: "hetzner"
 "#;
-        // The flat deserializer will see `storage` and — because Config
-        // doesn't have that field — it either errors or ignores. Both are
-        // acceptable outcomes of the "no silent merge" invariant. What we
-        // assert is: listen_addr got read (flat shape was chosen).
-        match Config::from_yaml_str(yaml) {
-            Ok(cfg) => {
-                assert_eq!(
-                    cfg.listen_addr.port(),
-                    9125,
-                    "flat shape must have been selected"
-                );
-            }
-            Err(_) => {
-                // Strict parse error is also acceptable — we prefer loud
-                // over silent-merge.
-            }
-        }
+        let err = Config::from_yaml_str(yaml)
+            .expect_err("mixed flat+sectioned must be rejected, not silently merged");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("listen_addr") && msg.contains("storage"),
+            "error must name BOTH the flat and the section key that collided, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_from_yaml_str_typo_inside_section_is_hard_error() {
+        // Typo inside a section — `default_backnd` instead of
+        // `default_backend` — must be rejected loudly, not silently
+        // defaulted. This is the Phase 3a promise that motivates
+        // `#[serde(deny_unknown_fields)]` on every section type.
+        let yaml = r#"
+storage:
+  default_backnd: "hetzner"
+"#;
+        let err = Config::from_yaml_str(yaml)
+            .expect_err("unknown field inside `storage:` must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("default_backnd"),
+            "error must name the offending field, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_from_yaml_str_unknown_section_is_hard_error() {
+        // Typo at the root: `storge:` instead of `storage:`. Because the
+        // doc lacks any known section OR flat key, it classifies as flat,
+        // and `Config` has a permissive serde… but we DO want the root-
+        // level section-key typo to surface in practice. Right now this
+        // is accepted silently (the classifier routes to flat and flat
+        // lacks deny_unknown_fields). We document the current behavior
+        // so a future tightening of `Config` to `deny_unknown_fields`
+        // has a test anchor.
+        let yaml = r#"
+storge:
+  default_backend: "hetzner"
+"#;
+        // Currently: classified as flat, silently accepted as default.
+        // This is NOT ideal but matches pre-Phase-3a behavior for any
+        // unknown top-level key. Tightening requires a one-release
+        // deprecation window to avoid breaking operators who've been
+        // relying on silently-ignored fields.
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        assert_eq!(
+            cfg, Config::default(),
+            "unknown root key currently silently ignored (pre-existing Config behavior)"
+        );
+    }
+
+    #[test]
+    fn test_defaults_version_current_is_v1() {
+        // Pinning test: if a future release changes the default
+        // DefaultsVersion to V2, an export that omitted `defaults:`
+        // (because it equalled the old default) will re-import at the
+        // new default, which is a silent version drift. Bumping this
+        // assertion on purpose forces the release engineer to think
+        // about migration.
+        assert_eq!(DefaultsVersion::default(), DefaultsVersion::V1);
+        assert!(
+            DefaultsVersion::V1.is_default(),
+            "DefaultsVersion::V1 must be the current default; a future V2 must update this \
+             assertion AND provide a migration path for YAML files that omitted `defaults:`"
+        );
     }
 }
