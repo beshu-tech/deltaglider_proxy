@@ -1,5 +1,32 @@
 # Progressive Config Refactor — Implementation Plan
 
+> **📍 Progress snapshot (2026-04-20)**
+>
+> This document is the original planning artifact. Per-phase `**STATUS**`
+> callouts below record what's actually shipped vs. planned, as of the
+> commits on `main` up to `e9d23b2` ("Configuration overhaul: YAML +
+> document-level admin API + admission chain").
+>
+> | Phase | Status | What's next |
+> |---|---|---|
+> | 0 — Foundations                    | ✅ **Done**        | — |
+> | 1 — Admin API upgrades             | ✅ **Done**        | `?section=` / `?resolve=` query params on `/export` deferred to Phase 3 |
+> | 2 — Admission chain                | 🟡 **Partial**     | Scope narrowed: only `AllowAnonymous` / `Continue` + `PublicPrefixGrant` shipped; `Deny` / `RateLimit` / `Reject` variants and the 5-block default chain are carried into Phase 3 |
+> | 3 — Progressive-disclosure schema  | ❌ **Not started** | **The critical next target** — unblocks Phases 4, 5, 6 |
+> | 4 — CLI                            | 🟡 **20% done**    | Only `config migrate` + `config schema` shipped; `init` / `lint` / `show` / `defaults` / `explain` / `apply` / `admission trace` pending |
+> | 5 — GUI redesign                   | ❌ **Not started** | Blocked on Phase 3 |
+> | 6 — Deprecation sweep              | ❌ **Not started** | Blocked on Phase 3/4/5 |
+>
+> **Bonus work that shipped alongside** (not in the original plan but
+> landed in the same `e9d23b2` commit): a hygiene pass (admin/config.rs
+> split into submodules, `apply_config_transition` helper,
+> `RateLimitGuard`), seven targeted correctness fixes from adversarial
+> audits (NaN/Infinity clamp, IPv4-mapped-IPv6 normalisation, atomic
+> persist, duplicate-backend detection, log_level pre-validation, etc.),
+> and `examples/scrape_full_config.rs` — a read-only tool that dumps a
+> live server's config into the Phase 3 target YAML shape + a companion
+> `.env`. See "Bonus: unplanned work that shipped" at the bottom.
+
 ## Context
 
 DeltaGlider Proxy has accumulated ~35 configurable features across global / backend / bucket scopes with inconsistent override semantics, all in a flat TOML file plus a SQLCipher-backed IAM DB. First-time users face a wall of knobs; GitOps users have no declarative end-to-end story; GUI users can't easily export their working setup for version control. Prior design discussion converged on:
@@ -22,6 +49,19 @@ User decisions locked in via AskUserQuestion:
 ## Phases (ship-independent, each mergeable on its own)
 
 ### Phase 0 — Foundations (1–2 weeks)
+
+> **✅ STATUS: Done**
+>
+> All acceptance criteria met:
+> - `serde_yaml` + `schemars` in `Cargo.toml`; `JsonSchema` derives on `Config`, `BackendConfig`, `NamedBackendConfig`, `TlsConfig`, `BucketPolicyConfig`, `DefaultsVersion`.
+> - `Config::from_file` dispatches on extension (`src/config.rs::ConfigFormat::from_path`). `.yaml`/`.yml` → YAML, else → TOML.
+> - `Config::to_canonical_yaml()` emits serde-stable shape via `redact_infra_secrets().to_string()`.
+> - `persist_to_file()` is atomic (write-to-tempfile + fsync + rename) — this exceeded the plan's scope and closed a pre-existing "crash during config save corrupts file" hole.
+> - `DefaultsVersion::V1` enum pinned via `#[serde(rename = "defaults", skip_serializing_if = "DefaultsVersion::is_default")]`.
+> - `deltaglider_proxy config migrate <in> [--out <path>]` shipped in `src/cli/config.rs`.
+> - CI `config-schema` job (`.github/workflows/ci.yml`) generates `schema/deltaglider.schema.json`, round-trips `deltaglider_proxy.toml.example` through migrate twice to prove idempotence, and uploads the schema as a workflow artifact.
+>
+> **Scope divergence**: added a bonus `deltaglider_proxy config schema [--out <path>]` subcommand (writes the JSON Schema to disk) — useful for CI and YAML-LSP integrations; not in the original plan.
 
 **Goal:** YAML support exists in parallel with TOML. Nothing user-facing changes yet; internal mechanics are in place.
 
@@ -56,6 +96,22 @@ User decisions locked in via AskUserQuestion:
 
 ### Phase 1 — Admin API upgrades (1 week)
 
+> **✅ STATUS: Done (with two deferrals)**
+>
+> All four endpoints shipped, session-gated, all registered in `src/demo.rs`:
+> - `GET /_/api/admin/config/export` — canonical YAML with every secret redacted via `Config::redact_all_secrets()` → `to_canonical_yaml()`. (See `src/api/admin/config/document_level.rs::export_config`.)
+> - `GET /_/api/admin/config/defaults` — schemars JSON Schema of `Config`, including per-field defaults and docstrings.
+> - `POST /_/api/admin/config/validate` — parse + structural validation via `parse_and_validate_yaml()` (shared with `/apply`).
+> - `POST /_/api/admin/config/apply` — atomic full-document apply: parse → merge runtime secrets forward (`preserve_runtime_secrets`) → bootstrap-hash defense-in-depth reject → rebuild engine → hot-reload log/IAM → rebuild snapshots → persist. Returns `{applied, persisted, requires_restart, warnings, persisted_path}`. HTTP 500 (not 200+warning) on persist failure so GitOps pipelines can't mistake a half-applied state for a clean success.
+>
+> Seven integration tests cover the acceptance criteria in `tests/admin_config_test.rs`: export→apply→export byte-stability, redacted-secret round-trip preserving auth, persist-failure rollback, bootstrap-hash defense, empty-YAML rejection, invalid-log-filter rejection, asymmetric-creds warning.
+>
+> **Deferred to Phase 3** (by design — needs the sectioned Config shape):
+> - `/export?section=admission|access|storage|advanced` query param. Today `/export` returns the whole document.
+> - `/export?resolve=true` (expanding presets). Presets don't exist yet.
+>
+> **Scope divergence**: the plan called for a new `src/config/validator.rs` module. We kept validation centralised in `Config::check()` (which returns `Vec<String>` warnings) rather than creating a separate module — this is the single source of truth now, used from both `check()`-for-startup and `parse_and_validate_yaml()`-for-apply.
+
 **Goal:** Server-side endpoints for document-level config operations exist, even before the GUI uses them.
 
 **Scope**
@@ -78,6 +134,32 @@ User decisions locked in via AskUserQuestion:
 ---
 
 ### Phase 2 — Admission chain (2–3 weeks, largest single chunk)
+
+> **🟡 STATUS: Partial — scope deliberately narrowed, carries into Phase 3**
+>
+> **What shipped:**
+> - `src/admission/` module with `AdmissionChain`, `AdmissionBlock`, `Match`, `Action`, `Decision` types + an `evaluator` sub-module + a `middleware` sub-module.
+> - `SharedAdmissionChain = Arc<ArcSwap<AdmissionChain>>` on `AdminState`; rebuilt alongside the `PublicPrefixSnapshot` whenever bucket policies change.
+> - `admission_middleware` inserted in `src/startup.rs` BEFORE `sigv4_auth_middleware`. On a match with `AllowAnonymous`, it plants an `AdmissionAllowAnonymous` marker in request extensions; SigV4 checks the marker and skips signature verification, minting the `$anonymous` principal.
+> - `sigv4_auth_middleware` refactored: the old inline public-prefix lookup is gone; SigV4 now only consumes the extension marker. The pre-existing `tests/public_prefix_test.rs` suite (12 tests) passes unchanged — behaviour-preserving refactor.
+> - `POST /_/api/admin/config/trace` handler in `src/api/admin/config/trace.rs`. Same evaluator backs live traffic and trace: trace cannot lie.
+> - Integration tests in `tests/admission_test.rs`: three acceptance scenarios from the plan (anonymous GET on public bucket → allow; anonymous GET on private bucket → continue-to-deny; authenticated PUT never rides a public-prefix grant) + trace-vs-live parity on bucket/key parsing.
+>
+> **What was deliberately cut from Phase 2 scope** (deferred to Phase 3):
+>
+> | Plan item | Why cut | Lands in |
+> |---|---|---|
+> | `Match` variants: `source_ip` / `source_cidr` / `source_ip_list`, `path_glob`, `method`, `authenticated`, `config_flag` | No operator-facing YAML to populate them yet — only sense once `Config::admission:` exists. | Phase 3 |
+> | `Action` variants: `Deny`, `RateLimit`, `Reject` | `RateLimit` in particular requires a new sliding-window primitive; the existing `RateLimiter` is an auth-failure counter, not a request-rate limiter. Shipping these as empty shells would be vaporware. | Phase 3 |
+> | 5-block default chain (`deny-known-bad-ips`, `allow-anonymous-public-buckets`, `rate-limit-anonymous`, `rate-limit-authenticated`, `continue`) | Shipped only the public-prefix block (derived from `buckets.*.public_prefixes`); the other four blocks either depend on variants above or on operator-facing config. | Phase 3 |
+> | `Config::admission: Option<AdmissionChain>` field | Today the chain is entirely derived from `config.buckets[*].public_prefixes` — adding a field now is pure ceremony. It lands when operators can author blocks directly. | Phase 3 |
+> | Trace endpoint returning `{admission, identity, iam, parameters, routing}` for all five layers | Only admission is a first-class concept today. | Phase 2.5+ (when those layers exist) |
+> | Deprecation INFO on legacy `DGP_RATE_LIMIT_*` / `[buckets.*] public_prefixes` | No replacement exists yet for operators to migrate to. | Phase 6 |
+>
+> **Shipped extras (not in original plan but emerged from implementation):**
+> - A SigV4 extension-marker protocol between the admission and SigV4 middlewares so admission has no reverse dependency on `crate::api::auth::AuthenticatedUser`. Clean module seam.
+> - `Decision` as a distinct type (plan bundled decision into `Action`). Makes trace output serde-friendly.
+> - The `percent_decode` function in `api/auth.rs` was made `pub` and reused by admission middleware + trace handler — closes a 3-copy duplication the plan didn't foresee.
 
 **Goal:** Admission becomes a first-class feature with its own data model, evaluator, and trace tool. Existing public-prefix and rate-limiter behavior is reimplemented ON TOP of it, identically, from the operator's perspective.
 
@@ -116,6 +198,25 @@ User decisions locked in via AskUserQuestion:
 ---
 
 ### Phase 3 — Progressive-disclosure YAML schema (2 weeks)
+
+> **❌ STATUS: Not started — this is the critical next target**
+>
+> Phase 3 blocks the remaining Phases 4 / 5 / 6. It's the largest
+> structural change but the rest of the programme cannot materially
+> advance without it.
+>
+> **Opening moves, in order:**
+> 1. Reshape `Config` to expose `pub admission: Option<AdmissionChain>`, `pub access: AccessConfig`, `pub storage: StorageConfig`, `pub advanced: AdvancedConfig`. Use `#[serde(flatten)]` to keep the wire format (and therefore all existing Phase 0/1/2 tests) stable during the transition.
+> 2. Extend the admission module to carry the variants Phase 2 deferred (`Deny`, `RateLimit`, `Reject`, plus the `Match` fields for IP/path/method). Write the 5-block default chain.
+> 3. Add `src/config/sections/` with the new section types. Shorthand deserialisers for `storage` (single-backend inference + `public: true` → synthesised admission block).
+> 4. Implement `access.iam_mode: Gui | Declarative` + the reconciler (`src/iam/reconciler.rs`) that sync-diffs DB ↔ YAML on apply.
+> 5. Flesh out the admin-API: `/export?section=...` + `/export?resolve=true` (presets expanded) become implementable.
+>
+> **Helpful artifact already in the repo**: `examples/scrape_full_config.rs`
+> emits a close approximation of the Phase 3 target YAML. It's not
+> wire-stable yet (the current `Config` struct doesn't parse it) but it
+> provides a living reference of the shape to aim for. Treat it as the
+> executable spec for this phase.
 
 **Goal:** The 4-section YAML layout with shorthands, presets, and auto-implies is the canonical format. TOML still loads (deprecated).
 
@@ -156,6 +257,21 @@ User decisions locked in via AskUserQuestion:
 
 ### Phase 4 — CLI (1 week)
 
+> **🟡 STATUS: 20% done**
+>
+> Shipped (Phase 0 scaffolding):
+> - `deltaglider_proxy config migrate <in> [--out <path>]` — converts TOML to canonical YAML, idempotent on YAML input.
+> - `deltaglider_proxy config schema [--out <path>]` — emits the JSON Schema.
+>
+> Pending (blocked on Phase 3 for most):
+> - `config init [--example NAME]` — needs the `examples/*.dgp.yaml` library which lands alongside the sectioned schema.
+> - `config lint <file>` — needs the sectioned validator.
+> - `config show [--for bucket/NAME|user/NAME] [--resolve]` — needs `/export?section=` from Phase 3.
+> - `config defaults [--version v1]` — wrapper over the existing `/defaults` endpoint; could ship today but naturally pairs with the richer schema from Phase 3.
+> - `config explain bucket <name>` / `explain user <name>` — needs preset expansion (Phase 3).
+> - `admission trace --request '<method> <path> from <ip> as <principal>'` — wrapper over `/trace`; could ship today but the request grammar benefits from Phase 3's operator-facing admission vocabulary.
+> - `config apply <file>` — wrapper over `/apply`; could ship today. Small independent win.
+
 **Goal:** All tooling is usable from the terminal. Every CLI command has an equivalent admin-API endpoint from Phase 1/2.
 
 **Scope**
@@ -184,6 +300,14 @@ Add subcommands to `src/main.rs:36` (existing `Cli` struct) — reshape current 
 ---
 
 ### Phase 5 — GUI redesign (3–4 weeks, parallelizable with Phase 2/4)
+
+> **❌ STATUS: Not started**
+>
+> Blocked on Phase 3 — the four-tab layout mirrors the four Config
+> sections, so there's nothing to render until those sections exist.
+> Some ancillary pieces (`TracePage`, `CopyAsYamlButton`) could be
+> prototyped against the Phase 1 endpoints that already ship, but doing
+> so before Phase 3 risks churn when the sectioned shape lands.
 
 **Goal:** The admin GUI mirrors the 4-section mental model, every page offers a "Copy as YAML" button, and a first-run wizard bridges zero-to-working.
 
@@ -216,6 +340,12 @@ Add subcommands to `src/main.rs:36` (existing `Cli` struct) — reshape current 
 ---
 
 ### Phase 6 — Deprecation sweep & preset library expansion (1 week, done last)
+
+> **❌ STATUS: Not started**
+>
+> Blocked on Phase 3/4/5: there's no canonical YAML shape to promote as
+> the replacement for TOML yet, and the `examples/*.dgp.yaml` library
+> lands in Phase 4 alongside `config lint`.
 
 **Goal:** TOML becomes explicitly deprecated. The preset library is broad enough to cover the common cases.
 
@@ -303,3 +433,52 @@ Phase 5 (GUI) can start against Phase 1's endpoints and iterate as Phase 2/3 lan
 - Presets as live-inheritable templates (deliberately rejected; presets are copy-paste examples).
 - `dgpctl` as a separate distributable binary (per user decision, subcommands on existing binary).
 - Terraform provider / Pulumi SDK for declarative config — downstream of YAML schema stabilization.
+
+---
+
+## Bonus: unplanned work that shipped (2026-04-20)
+
+Three bodies of work landed alongside Phases 0/1/2 that weren't in the
+original plan. Each is captured here so future readers don't spend time
+wondering whether they were the plan's intent.
+
+### Hygiene pass
+
+The plan called for a Phase 3 restructure of `Config` and `admin/config.rs`;
+we did an interim hygiene pass that shrank the surface area before that
+bigger change lands:
+
+- **Split `src/api/admin/config.rs` (1908 lines) into `src/api/admin/config/`** with cohesive submodules: `mod.rs` (shared helpers + `test_s3_connection`), `field_level.rs` (`get_config`, `update_config`, `apply_backend_patch`), `document_level.rs` (Phase 1 export/validate/apply + secret preservation), `password.rs` (`change_password`, `recover_db`), `trace.rs` (admission trace handler). Each submodule owns the request/response types for the handlers it contains.
+- **New `apply_config_transition` helper** as the single source of truth for runtime side effects on config change (engine rebuild, log reload, IAM swap, snapshot rebuild, restart detection). Both the field-level PATCH (`update_config`) and document-level APPLY (`apply_config_doc`) now compose responses from it — ending the behaviour drift the plan's risk section warned about.
+- **New `RateLimitGuard` RAII wrapper** in `src/rate_limiter.rs`. Replaces the "extract IP → is_limited → progressive-delay → record success/failure + SECURITY log" pattern at four call sites (admin login, login_as, oauth callback, recover_db).
+
+### Correctness fixes (adversarial audits)
+
+Three rounds of hostile audits surfaced real bugs, now fixed:
+
+- **Atomic config persistence.** `persist_to_file` used `std::fs::write` (truncate-then-write); a crash mid-save truncated the file. Now write-to-tempfile + fsync + rename.
+- **Backend-create persist-path bug** (data loss): `src/api/admin/backends.rs` hardcoded `DEFAULT_CONFIG_FILENAME` instead of `active_config_path`, silently redirecting backend CRUD writes to the wrong file when the server was launched with `--config /some/other/path`. Regression test in place.
+- **IPv4-mapped IPv6 rate-limit bypass**: `::ffff:1.2.3.4` and `1.2.3.4` hashed to different buckets. An attacker could double their brute-force budget by alternating representations. Fixed with a normalise-on-extraction pass.
+- **`log_level` PATCH poisoning**: the PATCH path wrote the new string into `cfg.log_level` BEFORE parsing it as an `EnvFilter`. Invalid strings persisted to disk. Fixed: parse first, mutate second (mirroring the APPLY path).
+- **NaN / Infinity in `max_delta_ratio`**: NaN comparisons always false (old `< 0.0 || > 1.0` check missed it); Infinity passed the warning branch but survived as a value — every file would be stored as a delta regardless of size. Both now clamped to default.
+- **Duplicate backend names**: `Config::check()` now warns on duplicates (routing silently shadowed the second entry before).
+- **Defense-in-depth on `bootstrap_password_hash`**: `apply_config_doc` rejects YAML that tries to change the hash; legitimate path is `PUT /_/api/admin/password` which verifies the current password.
+- **Empty `backend_path` rejection + case-insensitive `backend_type`**: small UX fixes in the PATCH handler.
+
+### `examples/scrape_full_config.rs`
+
+A read-only utility that opens the SQLCipher IAM DB with the bootstrap
+hash, reads users/groups/providers/mapping rules, and combines with the
+on-disk TOML or YAML config to emit:
+
+- A new-style sectioned YAML on stdout (admission/access/storage/advanced) with every secret replaced by `!secret NAME`.
+- A companion `.env` file (mode 0600, 1:1 with the YAML placeholders) to be fed into SOPS / Vault / CI secret providers.
+
+The 1:1 YAML↔.env pairing is enforced at emission time via a
+`SecretsDump::record()` call placed next to every `!secret NAME` emission,
+so you can't leak a secret or reference a missing one.
+
+**Why it matters for Phase 3**: this tool is effectively a living spec
+of the target YAML shape. When you start Phase 3, running it against
+the current prod deployment gives you the exact document the new
+`Config` struct needs to accept.
