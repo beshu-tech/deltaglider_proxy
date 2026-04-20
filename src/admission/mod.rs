@@ -6,29 +6,27 @@
 //! (admission → identity → IAM → parameters → routing) in the configuration
 //! architecture.
 //!
-//! # What Phase 2 ships
+//! # Runtime shape (Phase 3b.2.b)
 //!
-//! This phase is intentionally narrow. The admission chain today is
-//! synthesised entirely from existing bucket policy data — specifically the
-//! per-bucket `public_prefixes` list. It replaces the inline
-//! public-prefix-bypass logic that used to live in the SigV4 middleware,
-//! but makes no new behaviour observable to operators beyond the trace
-//! endpoint.
+//! - Synthesised blocks from bucket `public_prefixes` — the Phase 2
+//!   baseline — still run, now AFTER operator-authored blocks.
+//! - Operator-authored blocks (parsed from `admission.blocks:` in
+//!   sectioned YAML) compile to [`Match::Predicates`] +
+//!   [`Action::AllowAnonymous`] / [`Action::Deny`] / [`Action::Reject`] /
+//!   [`Action::Continue`]. The middleware returns `403` (S3-style XML)
+//!   for Deny and the operator's status+body for Reject — both
+//!   short-circuiting SigV4.
 //!
-//! # What's deferred
+//! # Still deferred
 //!
-//! The enums here deliberately ship with ONLY the variants the evaluator
-//! currently emits — [`Action::AllowAnonymous`] and [`Action::Continue`],
-//! and a single [`Match::PublicPrefixGrant`] predicate. Future admission
-//! features (IP denylist, maintenance mode, sliding-window rate limiting,
-//! explicit deny, custom reject status) will add variants in later phases.
-//! When they do, new variants are additive: [`Action`]'s `#[serde(tag =
-//! "action")]` rename-all-kebab-case layout means a YAML
-//! `action: allow-anonymous` survives intact across the enum growing.
-//!
-//! Callers that `match` on these enums should include a wildcard arm —
-//! today that's unreachable, tomorrow it's the path the new variants land
-//! on before the evaluator learns about them.
+//! - `RateLimit` action variant — Phase 3b.2.c, hooking the existing
+//!   `RateLimiter`.
+//! - `config_flag` predicate dispatch — today always evaluates false
+//!   with a compile-time warn; Phase 3b.2.c adds a flag registry
+//!   starting with `maintenance_mode`.
+//! - The 5-block default chain from the plan's original Phase 2 scope
+//!   (`deny-known-bad-ips`, `rate-limit-*`, etc.) — lands in 3b.2.c
+//!   once the remaining variants exist.
 //!
 //! # Design invariants
 //!
@@ -185,9 +183,7 @@ pub enum Decision {
     },
     /// The request is denied — middleware returns 403 without calling
     /// SigV4. `matched` names the block for logs/trace output.
-    Deny {
-        matched: String,
-    },
+    Deny { matched: String },
     /// The request is rejected with a custom HTTP status + optional
     /// body. Middleware returns this directly.
     Reject {
@@ -300,15 +296,15 @@ impl AdmissionChain {
 /// form. Returns an error when a glob or config_flag is malformed —
 /// those are reported but don't kill the whole chain (see
 /// [`AdmissionChain::from_config_parts`]).
-fn compile_block(
-    spec: &crate::admission::AdmissionBlockSpec,
-) -> Result<AdmissionBlock, String> {
+fn compile_block(spec: &crate::admission::AdmissionBlockSpec) -> Result<AdmissionBlock, String> {
     use crate::admission::spec as specmod;
 
     let predicates = Predicates {
-        methods: spec.match_.method.as_ref().map(|ms| {
-            ms.iter().map(|m| m.to_ascii_uppercase()).collect()
-        }),
+        methods: spec
+            .match_
+            .method
+            .as_ref()
+            .map(|ms| ms.iter().map(|m| m.to_ascii_uppercase()).collect()),
         source_networks: {
             // The spec supports EITHER `source_ip` (single) OR
             // `source_ip_list` (many). Validation already ran at
@@ -324,10 +320,15 @@ fn compile_block(
                          config load)",
                         spec.name
                     );
-                    Some(spec.match_.source_ip_list.as_ref().unwrap()
-                        .iter()
-                        .map(|e| e.net)
-                        .collect())
+                    Some(
+                        spec.match_
+                            .source_ip_list
+                            .as_ref()
+                            .unwrap()
+                            .iter()
+                            .map(|e| e.net)
+                            .collect(),
+                    )
                 }
                 (Some(addr), None) => {
                     let net = match addr {
@@ -340,9 +341,7 @@ fn compile_block(
                     };
                     Some(vec![net])
                 }
-                (None, Some(list)) => {
-                    Some(list.iter().map(|e| e.net).collect())
-                }
+                (None, Some(list)) => Some(list.iter().map(|e| e.net).collect()),
                 (None, None) => None,
             }
         },

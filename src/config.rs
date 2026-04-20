@@ -760,8 +760,9 @@ impl Config {
                     serde_yaml::from_value(doc).map_err(|e| ConfigError::Parse(e.to_string()))?;
                 sectioned.into_flat().map_err(ConfigError::Parse)?
             }
-            ConfigShape::Flat => serde_yaml::from_value(doc)
-                .map_err(|e| ConfigError::Parse(e.to_string()))?,
+            ConfigShape::Flat => {
+                serde_yaml::from_value(doc).map_err(|e| ConfigError::Parse(e.to_string()))?
+            }
             ConfigShape::Mixed {
                 flat_keys,
                 section_keys,
@@ -2286,7 +2287,8 @@ storge:
         // relying on silently-ignored fields.
         let cfg = Config::from_yaml_str(yaml).unwrap();
         assert_eq!(
-            cfg, Config::default(),
+            cfg,
+            Config::default(),
             "unknown root key currently silently ignored (pre-existing Config behavior)"
         );
     }
@@ -2468,8 +2470,8 @@ storage:
     type: filesystem
     path: /explicit
 "#;
-        let err = Config::from_yaml_str(yaml)
-            .expect_err("shorthand + explicit backend must be rejected");
+        let err =
+            Config::from_yaml_str(yaml).expect_err("shorthand + explicit backend must be rejected");
         let msg = format!("{err}");
         assert!(
             msg.contains("shorthand") || msg.contains("backend"),
@@ -2538,8 +2540,7 @@ admission:
         type: reject
         status: 200
 "#;
-        let err = Config::from_yaml_str(yaml)
-            .expect_err("reject with 2xx status must be rejected");
+        let err = Config::from_yaml_str(yaml).expect_err("reject with 2xx status must be rejected");
         let msg = format!("{err}");
         assert!(
             msg.contains("4xx") || msg.contains("5xx"),
@@ -2558,8 +2559,7 @@ admission:
         source_ips: ["1.2.3.4"]
       action: deny
 "#;
-        let err = Config::from_yaml_str(yaml)
-            .expect_err("typo in match field must be rejected");
+        let err = Config::from_yaml_str(yaml).expect_err("typo in match field must be rejected");
         assert!(format!("{err}").contains("source_ips"));
     }
 

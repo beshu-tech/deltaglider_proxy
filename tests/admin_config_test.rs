@@ -493,13 +493,10 @@ async fn test_config_apply_hot_reloads_ratio() {
     let advanced = map
         .entry(advanced_key)
         .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
-    advanced
-        .as_mapping_mut()
-        .unwrap()
-        .insert(
-            "max_delta_ratio".into(),
-            serde_yaml::Value::Number(serde_yaml::Number::from(0.3)),
-        );
+    advanced.as_mapping_mut().unwrap().insert(
+        "max_delta_ratio".into(),
+        serde_yaml::Value::Number(serde_yaml::Number::from(0.3)),
+    );
     let modified = serde_yaml::to_string(&doc).unwrap();
 
     let resp = admin
@@ -1086,10 +1083,8 @@ async fn test_export_apply_roundtrip_is_noop_sectioned_shape() {
     // the top, no flat top-level config field.
     let doc: serde_yaml::Value = serde_yaml::from_str(&exported).unwrap();
     let map = doc.as_mapping().expect("root must be a mapping");
-    let root_keys: std::collections::BTreeSet<&str> = map
-        .keys()
-        .filter_map(|k| k.as_str())
-        .collect();
+    let root_keys: std::collections::BTreeSet<&str> =
+        map.keys().filter_map(|k| k.as_str()).collect();
     let section_keys: std::collections::BTreeSet<&str> =
         ["admission", "access", "storage", "advanced"]
             .into_iter()

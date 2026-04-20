@@ -406,9 +406,7 @@ mod tests {
 
     #[test]
     fn evaluator_rejects_with_custom_status() {
-        use crate::admission::spec::{
-            ActionSpec, AdmissionBlockSpec, MatchSpec, TaggedAction,
-        };
+        use crate::admission::spec::{ActionSpec, AdmissionBlockSpec, MatchSpec, TaggedAction};
         let block = AdmissionBlockSpec {
             name: "maint".into(),
             match_: MatchSpec::default(),
@@ -438,9 +436,7 @@ mod tests {
 
     #[test]
     fn evaluator_path_glob_matches_and_passes_through() {
-        use crate::admission::spec::{
-            ActionSpec, AdmissionBlockSpec, MatchSpec, SimpleAction,
-        };
+        use crate::admission::spec::{ActionSpec, AdmissionBlockSpec, MatchSpec, SimpleAction};
         let block = AdmissionBlockSpec {
             name: "allow-zips".into(),
             match_: MatchSpec {
@@ -478,7 +474,10 @@ mod tests {
             authenticated: false,
             source_ip: None,
         };
-        assert_eq!(evaluate(&chain, &req2), Decision::Continue { matched: None });
+        assert_eq!(
+            evaluate(&chain, &req2),
+            Decision::Continue { matched: None }
+        );
     }
 
     #[test]
@@ -547,9 +546,7 @@ mod tests {
     fn evaluator_config_flag_predicate_always_false_in_3b2b() {
         // Phase 3b.2.b carries the field but no flag registry exists.
         // The predicate evaluates false, so the block never fires.
-        use crate::admission::spec::{
-            ActionSpec, AdmissionBlockSpec, MatchSpec, TaggedAction,
-        };
+        use crate::admission::spec::{ActionSpec, AdmissionBlockSpec, MatchSpec, TaggedAction};
         let block = AdmissionBlockSpec {
             name: "maint".into(),
             match_: MatchSpec {

@@ -97,7 +97,11 @@ pub async fn admission_middleware(mut request: Request<Body>, next: Next) -> Res
                 &format!("admission-deny:{}", matched),
             );
         }
-        Decision::Reject { matched, status, message } => {
+        Decision::Reject {
+            matched,
+            status,
+            message,
+        } => {
             let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             tracing::warn!(
                 target: "deltaglider_proxy::admission",
@@ -171,13 +175,22 @@ fn extract_request_info(request: &Request<Body>) -> OwnedRequestInfo {
     let authenticated =
         request.headers().contains_key("authorization") || has_presigned_query_params(query_string);
 
-    // Extract source IP via the same trust-proxy-headers helper the rate
-    // limiter uses. Also try axum ConnectInfo when wired.
+    // Extract source IP. Primary source is axum `ConnectInfo` (wired in
+    // `main.rs` via `into_make_service_with_connect_info`). Fallback is
+    // the rate limiter's X-Forwarded-For / X-Real-IP parser, gated on
+    // `DGP_TRUST_PROXY_HEADERS`.
+    //
+    // Both paths pass the IP through `normalize_ip` which collapses
+    // IPv4-mapped IPv6 (`::ffff:a.b.c.d`) to the plain IPv4 form.
+    // Without this, a dual-stack kernel returning a mapped V6 address
+    // for an IPv4 client would cause an operator's `203.0.113.0/24`
+    // deny rule to miss the client entirely.
     let source_ip = request
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         .map(|ci| ci.0.ip())
-        .or_else(|| crate::rate_limiter::extract_client_ip(request.headers()));
+        .or_else(|| crate::rate_limiter::extract_client_ip(request.headers()))
+        .map(crate::rate_limiter::normalize_ip);
 
     OwnedRequestInfo {
         method: method.to_string(),
@@ -293,5 +306,33 @@ mod tests {
         assert_eq!(info.key, None);
         assert_eq!(info.list_prefix, Some("p/"));
         assert!(info.authenticated);
+    }
+
+    #[test]
+    fn extract_request_info_normalizes_ipv4_mapped_ipv6() {
+        // Adversarial review C2: an IPv4 client arriving over an IPv6
+        // socket on a dual-stack kernel presents as `::ffff:a.b.c.d`.
+        // `IpNet::contains` treats that differently from a bare V4 IP,
+        // so an operator's `203.0.113.0/24` deny rule would miss it.
+        // The middleware calls `rate_limiter::normalize_ip` to collapse
+        // the mapped form before handing the IP to the evaluator.
+        //
+        // This test is light (verifies the helper is wired, not the
+        // full middleware plumbing) — full end-to-end coverage lives
+        // in `tests/admission_test.rs` once integration scaffolding
+        // learns to inject ConnectInfo.
+        use std::net::{IpAddr, Ipv6Addr};
+        let mapped = IpAddr::V6(Ipv6Addr::from([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 203, 0, 113, 5,
+        ]));
+        let normalized = crate::rate_limiter::normalize_ip(mapped);
+        // After normalize, it's a V4 IPv4 address matching the CIDR.
+        match normalized {
+            IpAddr::V4(v4) => assert_eq!(v4.to_string(), "203.0.113.5"),
+            IpAddr::V6(_) => panic!("mapped V6 must collapse to V4, got {normalized:?}"),
+        }
+        // And `IpNet::contains` now hits.
+        let net: ipnet::IpNet = "203.0.113.0/24".parse().unwrap();
+        assert!(net.contains(&normalized));
     }
 }

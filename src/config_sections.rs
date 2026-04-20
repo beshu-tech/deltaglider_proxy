@@ -183,7 +183,6 @@ pub struct StorageSection {
     // These never appear in the canonical export — they are operator-
     // authoring conveniences only. [`normalize`] empties them after
     // expanding into [`backend`].
-
     /// Shorthand: S3 endpoint URL. Expanding this sets `backend` to a
     /// `BackendConfig::S3` with this endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -243,7 +242,10 @@ impl StorageSection {
                 validate_s3_endpoint(self.s3.as_deref().expect("has_s3 asserted above"))?;
                 self.backend = BackendConfig::S3 {
                     endpoint: self.s3.take(),
-                    region: self.region.take().unwrap_or_else(|| "us-east-1".to_string()),
+                    region: self
+                        .region
+                        .take()
+                        .unwrap_or_else(|| "us-east-1".to_string()),
                     force_path_style: self.force_path_style.take().unwrap_or(true),
                     access_key_id: self.access_key_id.take(),
                     secret_access_key: self.secret_access_key.take(),
@@ -252,9 +254,7 @@ impl StorageSection {
             (false, true, false) => {
                 // Filesystem shorthand, no explicit backend. Validate
                 // path then expand.
-                validate_filesystem_path(
-                    self.filesystem.as_ref().expect("has_fs asserted above"),
-                )?;
+                validate_filesystem_path(self.filesystem.as_ref().expect("has_fs asserted above"))?;
                 self.backend = BackendConfig::Filesystem {
                     path: self.filesystem.take().expect("has_fs asserted above"),
                 };
@@ -328,9 +328,11 @@ fn validate_s3_endpoint(url: &str) -> Result<(), String> {
 /// `..` escapes that usually indicate a template-variable mixup.
 fn validate_filesystem_path(path: &std::path::Path) -> Result<(), String> {
     if path.as_os_str().is_empty() {
-        return Err("storage: `filesystem:` path is empty — this usually means an \
+        return Err(
+            "storage: `filesystem:` path is empty — this usually means an \
                     environment variable substitution left a hole"
-            .to_string());
+                .to_string(),
+        );
     }
     // Block `..` anywhere in the path. An operator with a legitimate
     // symlink-escape use-case can pre-resolve in their deployment
@@ -545,7 +547,10 @@ impl SectionedConfig {
                 .advanced
                 .max_object_size
                 .unwrap_or(defaults.max_object_size),
-            cache_size_mb: self.advanced.cache_size_mb.unwrap_or(defaults.cache_size_mb),
+            cache_size_mb: self
+                .advanced
+                .cache_size_mb
+                .unwrap_or(defaults.cache_size_mb),
             metadata_cache_mb: self
                 .advanced
                 .metadata_cache_mb
@@ -563,10 +568,7 @@ impl SectionedConfig {
             buckets: self.storage.buckets,
             backends: self.storage.backends,
             default_backend: self.storage.default_backend,
-            admission_blocks: self
-                .admission
-                .map(|s| s.blocks)
-                .unwrap_or_default(),
+            admission_blocks: self.admission.map(|s| s.blocks).unwrap_or_default(),
         }
     }
 }
@@ -788,8 +790,10 @@ mod tests {
         let err = storage
             .normalize()
             .expect_err("region without s3: must be rejected");
-        assert!(err.contains("region") || err.contains("companion"),
-            "error must name the orphaned field, got: {err}");
+        assert!(
+            err.contains("region") || err.contains("companion"),
+            "error must name the orphaned field, got: {err}"
+        );
     }
 
     #[test]
@@ -819,7 +823,10 @@ mod tests {
         let err = storage
             .normalize()
             .expect_err("empty s3 endpoint must be rejected");
-        assert!(err.contains("empty"), "error must name the problem, got: {err}");
+        assert!(
+            err.contains("empty"),
+            "error must name the problem, got: {err}"
+        );
     }
 
     #[test]
@@ -858,7 +865,10 @@ mod tests {
         let err = storage
             .normalize()
             .expect_err("pathologically long URL must be rejected");
-        assert!(err.contains("chars"), "error must mention length, got: {err}");
+        assert!(
+            err.contains("chars"),
+            "error must mention length, got: {err}"
+        );
     }
 
     #[test]
@@ -870,7 +880,10 @@ mod tests {
         let err = storage
             .normalize()
             .expect_err("empty filesystem path must be rejected");
-        assert!(err.contains("empty"), "error must name the problem, got: {err}");
+        assert!(
+            err.contains("empty"),
+            "error must name the problem, got: {err}"
+        );
     }
 
     #[test]
@@ -882,7 +895,10 @@ mod tests {
         let err = storage
             .normalize()
             .expect_err("path with `..` components must be rejected");
-        assert!(err.contains(".."), "error must name the problem, got: {err}");
+        assert!(
+            err.contains(".."),
+            "error must name the problem, got: {err}"
+        );
     }
 
     #[test]

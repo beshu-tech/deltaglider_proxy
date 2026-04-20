@@ -242,7 +242,7 @@ pub fn extract_client_ip(headers: &axum::http::HeaderMap) -> Option<IpAddr> {
 /// buckets in the DashMap. Normalising to V4 closes the bypass.
 ///
 /// Non-mapped IPv6 addresses pass through unchanged.
-fn normalize_ip(ip: IpAddr) -> IpAddr {
+pub(crate) fn normalize_ip(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
             Some(v4) => IpAddr::V4(v4),

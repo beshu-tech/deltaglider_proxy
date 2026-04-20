@@ -150,8 +150,8 @@ fn parse_and_validate_yaml(yaml: &str) -> Result<(crate::config::Config, Vec<Str
     // (admission/access/storage/advanced). Export round-trips re-emit
     // sectioned — if we used plain `serde_yaml::from_str::<Config>` here
     // the roundtrip would break.
-    let mut cfg =
-        crate::config::Config::from_yaml_str(yaml).map_err(|e| format!("YAML parse error: {}", e))?;
+    let mut cfg = crate::config::Config::from_yaml_str(yaml)
+        .map_err(|e| format!("YAML parse error: {}", e))?;
     // Validate the log filter up front so it can't silently enter runtime
     // state and then fail at the next process restart. An invalid filter is
     // a non-recoverable structural error for this doc, not a warning.

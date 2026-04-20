@@ -290,6 +290,40 @@ impl AdmissionSpec {
     pub fn validate(&self) -> Result<(), String> {
         let mut seen_names = std::collections::HashSet::new();
         for block in &self.blocks {
+            // Restrict block-name charset. Block names appear in
+            // tracing::warn audit logs AND in the S3-style XML
+            // AccessDenied body (`admission-deny:{name}`) the
+            // middleware returns on `Deny`. XML injection via a
+            // crafted name (e.g. `foo</Message><Fake>x`) is a real
+            // risk — operators are trusted, but any admin-API abuse
+            // chains into client response manipulation. Restrict to
+            // a safe charset at parse time and reject the rest.
+            if block.name.is_empty() {
+                return Err(
+                    "admission block name must not be empty — names surface in audit \
+                     logs and client error bodies and need a non-empty identifier"
+                        .to_string(),
+                );
+            }
+            if block.name.len() > 128 {
+                return Err(format!(
+                    "admission block name `{}` exceeds 128 characters — keep names short \
+                     for log readability",
+                    block.name
+                ));
+            }
+            if !block
+                .name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.'))
+            {
+                return Err(format!(
+                    "admission block name `{}` contains disallowed characters — allowed: \
+                     ASCII alphanumerics and `-_:.`",
+                    block.name
+                ));
+            }
+
             if !seen_names.insert(block.name.as_str()) {
                 return Err(format!(
                     "duplicate admission block name `{}` — block names must be unique \
@@ -483,6 +517,61 @@ action:
     }
 
     #[test]
+    fn admission_spec_block_name_rejects_xml_hostile_chars() {
+        // Adversarial review H2: block names flow into the S3-style
+        // XML `<Message>admission-deny:{name}</Message>` response
+        // body. A crafted name with `<` or `>` would enable response-
+        // splitting style payloads. Charset is restricted at parse.
+        let spec = AdmissionSpec {
+            blocks: vec![AdmissionBlockSpec {
+                name: "hostile</Message><Fake>".into(),
+                match_: MatchSpec::default(),
+                action: ActionSpec::Simple(SimpleAction::Deny),
+            }],
+        };
+        let err = spec.validate().unwrap_err();
+        assert!(err.contains("disallowed"));
+    }
+
+    #[test]
+    fn admission_spec_block_name_rejects_empty() {
+        let spec = AdmissionSpec {
+            blocks: vec![AdmissionBlockSpec {
+                name: "".into(),
+                match_: MatchSpec::default(),
+                action: ActionSpec::Simple(SimpleAction::Deny),
+            }],
+        };
+        let err = spec.validate().unwrap_err();
+        assert!(err.contains("empty"));
+    }
+
+    #[test]
+    fn admission_spec_block_name_rejects_overlong() {
+        let spec = AdmissionSpec {
+            blocks: vec![AdmissionBlockSpec {
+                name: "a".repeat(200),
+                match_: MatchSpec::default(),
+                action: ActionSpec::Simple(SimpleAction::Deny),
+            }],
+        };
+        let err = spec.validate().unwrap_err();
+        assert!(err.contains("128"));
+    }
+
+    #[test]
+    fn admission_spec_block_name_accepts_safe_charset() {
+        let spec = AdmissionSpec {
+            blocks: vec![AdmissionBlockSpec {
+                name: "ok-name_v2:sub.0".into(),
+                match_: MatchSpec::default(),
+                action: ActionSpec::Simple(SimpleAction::Deny),
+            }],
+        };
+        spec.validate().unwrap();
+    }
+
+    #[test]
     fn admission_spec_duplicate_block_names_is_error() {
         let spec = AdmissionSpec {
             blocks: vec![
@@ -531,7 +620,10 @@ action:
         };
         let yaml = serde_yaml::to_string(&spec).unwrap();
         let back: AdmissionSpec = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(spec, back, "spec must round-trip losslessly, emitted:\n{yaml}");
+        assert_eq!(
+            spec, back,
+            "spec must round-trip losslessly, emitted:\n{yaml}"
+        );
     }
 
     #[test]
@@ -546,7 +638,10 @@ action: allow-anonymous
 "#;
         let block: AdmissionBlockSpec = serde_yaml::from_str(yaml).unwrap();
         let m = &block.match_;
-        assert_eq!(m.method.as_deref(), Some(&["GET".to_string(), "HEAD".to_string()][..]));
+        assert_eq!(
+            m.method.as_deref(),
+            Some(&["GET".to_string(), "HEAD".to_string()][..])
+        );
         assert_eq!(m.bucket.as_deref(), Some("releases"));
         assert_eq!(m.path_glob.as_deref(), Some("*.zip"));
     }

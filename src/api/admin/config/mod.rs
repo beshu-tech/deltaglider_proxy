@@ -98,13 +98,12 @@ pub(super) fn rebuild_bucket_derived_snapshots(
         .public_prefix_snapshot
         .store(std::sync::Arc::new(new_prefix_snapshot));
 
-    // Rebuild emits the Phase 3b.2.a "inert blocks" warn every time
-    // the config changes. That's intentional — operators who edit
-    // their admission blocks hot-reload hundreds of times in a
-    // GUI/GitOps session, and each edit gets the visibility reminder
-    // that the rules aren't yet enforced.
-    let new_chain =
-        crate::admission::AdmissionChain::from_config_parts(buckets, operator_blocks);
+    // Compile operator-authored blocks into runtime form and merge
+    // with synthesised public-prefix blocks. `from_config_parts`
+    // handles ordering (operator blocks first) and logs per-block
+    // warnings for unknown config_flag predicates. Phase 3b.2.b
+    // upgraded this from a silent-no-op to live dispatch.
+    let new_chain = crate::admission::AdmissionChain::from_config_parts(buckets, operator_blocks);
     state.admission_chain.store(std::sync::Arc::new(new_chain));
 }
 
@@ -242,14 +241,8 @@ pub(super) async fn apply_config_transition(
     //    Rebuild iff the bucket policy set OR the operator-authored
     //    admission blocks changed; changing other fields doesn't affect
     //    these.
-    if old_cfg.buckets != new_cfg.buckets
-        || old_cfg.admission_blocks != new_cfg.admission_blocks
-    {
-        rebuild_bucket_derived_snapshots(
-            state,
-            &new_cfg.buckets,
-            &new_cfg.admission_blocks,
-        );
+    if old_cfg.buckets != new_cfg.buckets || old_cfg.admission_blocks != new_cfg.admission_blocks {
+        rebuild_bucket_derived_snapshots(state, &new_cfg.buckets, &new_cfg.admission_blocks);
     }
 
     // 5. Restart-required fields. The values are applied to the config
