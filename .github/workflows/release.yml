@@ -252,6 +252,21 @@ jobs:
           outputs: type=image,name=${{ env.DOCKERHUB_REPO }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,scope=${{ matrix.platform }},mode=max
+          # Disable provenance / SBOM attestations. With them enabled,
+          # build-push-action publishes both the canonical image AND an
+          # attestation sidecar — and the merge step below picks up the
+          # sidecar digest via the filename-based glob, feeding it back
+          # into `imagetools create` which then INCLUDES every child
+          # manifest of the attestation index into the final tag's
+          # OCI index. Result: the published `:0.8.1` index grows one
+          # extra `architecture: unknown` + 4–5 stale `amd64` entries
+          # per pipeline run, and amd64 hosts resolve to a stale
+          # binary. Upstream SBOM/provenance for releases is generated
+          # separately by the Create Release job via cargo sbom +
+          # attest-build-provenance, so disabling it here is a no-op
+          # on our release attestation story.
+          provenance: false
+          sbom: false
 
       - name: Export digest
         run: |
