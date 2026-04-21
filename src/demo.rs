@@ -130,7 +130,23 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             post(admin::validate_config_doc),
         )
         .route("/_/api/admin/config/apply", post(admin::apply_config_doc))
-        .route("/_/api/admin/config/trace", post(admin::trace_config))
+        // Trace accepts both POST (full body) and GET (query params — for
+        // bookmarkable debug URLs per §3.2 of the admin UI revamp plan).
+        .route(
+            "/_/api/admin/config/trace",
+            post(admin::trace_config).get(admin::trace_config_get),
+        )
+        // Section-level config operations (Wave 1 of the admin UI revamp).
+        // Gives the UI a per-section scope between the field-level PATCH
+        // (too granular) and the document-level APPLY (too coarse).
+        .route(
+            "/_/api/admin/config/section/:name",
+            get(admin::get_section).put(admin::put_section),
+        )
+        .route(
+            "/_/api/admin/config/section/:name/validate",
+            post(admin::validate_section),
+        )
         .route("/_/api/admin/password", put(admin::change_password))
         .route("/_/api/admin/session", get(admin::check_session))
         .route("/_/api/admin/test-s3", post(admin::test_s3_connection))

@@ -15,7 +15,7 @@
 //! `preserve_sigv4_pair` helpers live here too — they are private details
 //! of this flow and have no callers outside it.
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
@@ -75,50 +75,152 @@ pub struct ConfigApplyResponse {
     pub persisted_path: Option<String>,
 }
 
-/// `GET /api/admin/config/export` — full runtime config as canonical YAML,
-/// with every secret redacted.
+/// Query params shared by `/config/export` and `/config/defaults`.
+#[derive(Deserialize, Default)]
+pub struct SectionFilterQuery {
+    /// Scope the response to one named section: `admission`, `access`,
+    /// `storage`, or `advanced`. Absent = whole document.
+    #[serde(default)]
+    section: Option<String>,
+}
+
+/// `GET /api/admin/config/export[?section=<name>]` — canonical YAML of
+/// the current runtime config, with every secret redacted.
 ///
-/// This is the "Copy as YAML" surface. Operators paste the body into their
-/// GitOps repo and refill secrets from their secret manager. Not a
-/// drop-in-runnable config (backend creds are stripped too).
+/// Default (no `section=`) returns the full document — the legacy
+/// "Copy as YAML" surface. With `?section=admission|access|storage|
+/// advanced`, the response is scoped to just that section (rendered as
+/// a top-level `<section>:` YAML document). Lets the UI's per-section
+/// Copy-as-YAML button (§3.3 of the revamp plan) hit one endpoint
+/// parameterized by section instead of each section hand-assembling
+/// its own YAML client-side.
 ///
-/// Phase 3 will add an optional `?section=admission|access|storage|advanced`
-/// param once the sectioned schema exists. Phase 3 will also add
-/// `?resolve=true` once group presets are a thing. Omitted for now by design.
-pub async fn export_config(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
+/// Unknown section names return 404 (not 400) so deep-linkable URLs
+/// produce the same shape as a mis-routed GET.
+pub async fn export_config(
+    State(state): State<Arc<AdminState>>,
+    Query(query): Query<SectionFilterQuery>,
+) -> impl IntoResponse {
     let cfg = state.config.read().await;
     let redacted = cfg.redact_all_secrets();
-    match redacted.to_canonical_yaml() {
-        Ok(yaml) => (
+    drop(cfg);
+
+    let Some(section_name) = query.section.as_deref() else {
+        // Full document path — unchanged from the pre-Wave-1 behavior.
+        return match redacted.to_canonical_yaml() {
+            Ok(yaml) => (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/yaml")],
+                yaml,
+            )
+                .into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to serialize config to YAML: {}", e),
+            )
+                .into_response(),
+        };
+    };
+
+    // Section-scoped export. We reuse the SectionedConfig projection
+    // the full export does, then pick out just the requested slice.
+    // Each section serializes as `<name>:\n  ...` — valid standalone
+    // YAML that can be edited and posted back via section PUT.
+    let sectioned = crate::config_sections::SectionedConfig::from_flat(&redacted);
+    let mut map = serde_yaml::Mapping::new();
+    let value = match section_name {
+        "admission" => serde_yaml::to_value(sectioned.admission.unwrap_or_default()),
+        "access" => serde_yaml::to_value(sectioned.access),
+        "storage" => serde_yaml::to_value(sectioned.storage),
+        "advanced" => serde_yaml::to_value(sectioned.advanced),
+        other => {
+            return (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "unknown section '{}'; valid names: admission, access, storage, advanced",
+                    other
+                ),
+            )
+                .into_response();
+        }
+    };
+    let yaml_value = match value {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to serialize section: {}", e),
+            )
+                .into_response();
+        }
+    };
+    map.insert(
+        serde_yaml::Value::String(section_name.to_string()),
+        yaml_value,
+    );
+    match serde_yaml::to_string(&serde_yaml::Value::Mapping(map)) {
+        Ok(s) => (
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "application/yaml")],
-            yaml,
+            s,
         )
             .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to serialize config to YAML: {}", e),
+            format!("failed to serialize section to YAML: {}", e),
         )
             .into_response(),
     }
 }
 
-/// `GET /api/admin/config/defaults` — JSON Schema for the Config type,
-/// including every default value and the doc-comment description for each
-/// field.
+/// `GET /api/admin/config/defaults[?section=<name>]` — JSON Schema for
+/// the Config type, optionally scoped to one section.
 ///
-/// Backs YAML LSP autocompletion, `dgpctl defaults` (Phase 4), and the
-/// admin GUI's "show default" affordance. Produced directly from the
-/// `schemars` derives added in Phase 0 — the schema tracks the struct
-/// automatically as fields change.
-pub async fn config_defaults() -> impl IntoResponse {
-    let schema = schemars::schema_for!(crate::config::Config);
-    (
-        StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "application/schema+json")],
-        Json(schema),
-    )
-        .into_response()
+/// Default (no `section=`) returns the full Config schema (the legacy
+/// behaviour). With `?section=admission|access|storage|advanced`, the
+/// response is the JSON Schema for just that section's type — exactly
+/// what `monaco-yaml` needs when the UI's Monaco editor is bound to
+/// one section's scope. Wave 2 of the admin UI plan reads this for
+/// per-section YAML linting.
+pub async fn config_defaults(Query(query): Query<SectionFilterQuery>) -> impl IntoResponse {
+    let schema = match query.section.as_deref() {
+        None => serde_json::to_value(schemars::schema_for!(crate::config::Config)),
+        Some("admission") => serde_json::to_value(schemars::schema_for!(
+            crate::config_sections::AdmissionSection
+        )),
+        Some("access") => {
+            serde_json::to_value(schemars::schema_for!(crate::config_sections::AccessSection))
+        }
+        Some("storage") => serde_json::to_value(schemars::schema_for!(
+            crate::config_sections::StorageSection
+        )),
+        Some("advanced") => serde_json::to_value(schemars::schema_for!(
+            crate::config_sections::AdvancedSection
+        )),
+        Some(other) => {
+            return (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "unknown section '{}'; valid names: admission, access, storage, advanced",
+                    other
+                ),
+            )
+                .into_response();
+        }
+    };
+    match schema {
+        Ok(v) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/schema+json")],
+            Json(v),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to serialize schema: {}", e),
+        )
+            .into_response(),
+    }
 }
 
 /// Parse a YAML config document and collect validation warnings.

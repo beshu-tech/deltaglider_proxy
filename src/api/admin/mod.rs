@@ -32,10 +32,11 @@ pub use auth::{
 pub use backends::{create_backend, delete_backend, list_backends};
 pub use backup::{export_backup, import_backup};
 pub use config::{
-    apply_config_doc, change_password, config_defaults, export_config, get_config, recover_db,
-    test_s3_connection, trace_config, update_config, validate_config_doc, BackendInfoResponse,
-    ConfigApplyResponse, ConfigDocumentRequest, ConfigResponse, ConfigUpdateRequest,
-    ConfigUpdateResponse, ConfigValidateResponse, PasswordChangeRequest, PasswordChangeResponse,
+    apply_config_doc, change_password, config_defaults, export_config, get_config, get_section,
+    put_section, recover_db, test_s3_connection, trace_config, trace_config_get, update_config,
+    validate_config_doc, validate_section, BackendInfoResponse, ConfigApplyResponse,
+    ConfigDocumentRequest, ConfigResponse, ConfigUpdateRequest, ConfigUpdateResponse,
+    ConfigValidateResponse, PasswordChangeRequest, PasswordChangeResponse, SectionApplyResponse,
     TestS3Request, TestS3Response, TraceRequest, TraceResolved, TraceResponse,
 };
 pub use groups::{

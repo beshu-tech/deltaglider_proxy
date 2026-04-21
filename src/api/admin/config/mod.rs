@@ -19,6 +19,7 @@
 pub mod document_level;
 pub mod field_level;
 pub mod password;
+pub mod section_level;
 pub mod trace;
 
 pub use document_level::{
@@ -30,7 +31,8 @@ pub use field_level::{
     ConfigUpdateResponse,
 };
 pub use password::{change_password, recover_db, PasswordChangeRequest, PasswordChangeResponse};
-pub use trace::{trace_config, TraceRequest, TraceResolved, TraceResponse};
+pub use section_level::{get_section, put_section, validate_section, SectionApplyResponse};
+pub use trace::{trace_config, trace_config_get, TraceRequest, TraceResolved, TraceResponse};
 
 use axum::extract::State;
 use axum::response::IntoResponse;

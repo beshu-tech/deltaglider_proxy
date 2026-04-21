@@ -7,7 +7,7 @@
 //! layer identity / IAM / parameters / routing decisions on top of the
 //! same handler shape.
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -141,4 +141,56 @@ impl From<crate::admission::middleware::OwnedRequestInfo> for OwnedRequestInfoVi
             },
         }
     }
+}
+
+/// Query-param shape for the GET trace variant.
+///
+/// The GET form exists so operators can bookmark + paste trace URLs.
+/// Method / path defaults produce a harmless no-op (a GET / as
+/// anonymous with no source IP) when the query is missing — useful
+/// for "open the trace page to see the current chain" UX without
+/// forcing the operator to fill every field.
+#[derive(Deserialize, Default)]
+pub struct TraceQuery {
+    #[serde(default = "default_method")]
+    method: String,
+    #[serde(default = "default_path")]
+    path: String,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    authenticated: bool,
+    #[serde(default)]
+    source_ip: Option<std::net::IpAddr>,
+}
+
+fn default_method() -> String {
+    "GET".to_string()
+}
+
+fn default_path() -> String {
+    "/".to_string()
+}
+
+/// `GET /api/admin/config/trace` — query-param variant for bookmarkable
+/// trace URLs. Reuses the POST handler's evaluator path exactly —
+/// there is no "GET semantics vs POST semantics" split.
+///
+/// Accepts the same five fields as POST, URL-encoded:
+/// `?method=&path=&query=&authenticated=&source_ip=`. Every field has
+/// a sensible default so partial URLs still produce a response (the
+/// UI's Trace page can deep-link to just `?source_ip=203.0.113.5` to
+/// test one IP against the default GET `/`).
+pub async fn trace_config_get(
+    State(state): State<Arc<AdminState>>,
+    Query(query): Query<TraceQuery>,
+) -> impl IntoResponse {
+    let body = TraceRequest {
+        method: query.method,
+        path: query.path,
+        query: query.query,
+        authenticated: query.authenticated,
+        source_ip: query.source_ip,
+    };
+    trace_config(State(state), Json(body)).await.into_response()
 }

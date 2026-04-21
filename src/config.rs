@@ -1065,6 +1065,23 @@ impl Config {
         config
     }
 
+    /// Load config from an explicit path, with env var overrides applied on
+    /// top and `validate()` run at the end.
+    ///
+    /// This is the `--config <path>` entry point. Without this helper, callers
+    /// that specify a config path (via the CLI flag) had to remember to call
+    /// [`Self::apply_env_overrides`] themselves — and the main startup path
+    /// didn't, meaning `DGP_*` vars were ignored when `--config` was used
+    /// but respected when it wasn't. The asymmetry surprised operators; this
+    /// helper folds the behaviour of [`Self::load`] onto a caller-provided
+    /// path so the two paths agree.
+    pub fn load_from_path(path: &str) -> Result<Self, ConfigError> {
+        let mut config = Self::from_file(path)?;
+        config.apply_env_overrides();
+        config.validate();
+        Ok(config)
+    }
+
     /// Check the config for problems. Returns a list of human-readable
     /// warnings; also clears fields that cannot be satisfied (currently just
     /// unresolvable `default_backend`).

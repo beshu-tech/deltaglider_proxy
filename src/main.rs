@@ -307,8 +307,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // for the full async initialization. We cannot build the runtime with the
     // right blocking thread count unless we read the config first.
     // Do NOT remove this "redundant" config load — it gates runtime construction.
+    //
+    // `load_from_path` folds the same env-override + validate pipeline as
+    // `Config::load()` onto the CLI-provided path, so `DGP_*` vars override
+    // the file identically whether or not `--config` is specified. (The old
+    // `from_file(path).unwrap_or_else(load)` path quietly dropped env
+    // overrides when the file parsed, which broke `DGP_BOOTSTRAP_PASSWORD`
+    // specifically — documented in the revamp plan's risks table.)
     let pre_config = if let Some(ref path) = cli.config {
-        deltaglider_proxy::config::Config::from_file(path)
+        deltaglider_proxy::config::Config::load_from_path(path)
             .unwrap_or_else(|_| deltaglider_proxy::config::Config::load())
     } else {
         deltaglider_proxy::config::Config::load()
@@ -335,8 +342,11 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let log_reload_handle = init_tracing(&cli);
 
     // --- Configuration ---
+    // Use `load_from_path` for explicit --config so env overrides still apply
+    // (parity with the implicit search path taken by `Config::load()`). See
+    // the pre_config block in `main()` for the same fix.
     let mut config = if let Some(ref path) = cli.config {
-        Config::from_file(path)?
+        Config::load_from_path(path)?
     } else {
         Config::load()
     };
