@@ -232,6 +232,32 @@ ship independently without blocking operators today.
   auto-refresh, and an "In-memory ring — not a compliance
   substitute" banner so operators don't mistake it for durable
   storage.
+- **IAM Backup import preserves `external_identities`** (post-
+  manual-review hardening). `POST /api/admin/backup` used to
+  silently drop every OIDC identity binding; restoring a backup
+  would orphan `user_id ↔ external_sub ↔ provider_id` links and
+  returning OIDC users got re-provisioned as new accounts. Import
+  now remaps `user_id` + `provider_id` through the existing ID
+  maps and falls back to `groups.member_ids` / autoincrement
+  heuristics for legacy backups that lack a `bu.id` field. New
+  optional `BackupUser.id` field in exports. Idempotent: repeat
+  imports skip existing `(provider_id, external_sub)` pairs.
+  `ImportResult` gains `external_identities_created` +
+  `external_identities_skipped` counters.
+- **GUI polish** (post-manual-review round):
+  * Groups create form closes and navigates to the Edit view after
+    a successful create. Previously the form stayed open with
+    stale fields; "+ New" appeared broken until a page reload.
+  * ExtAuth mapping-rule "+ Add Rule" flushes pending edits on
+    other rules BEFORE create + reload. Previously the reload
+    overwrote the in-memory rules array, silently clobbering
+    unsaved typing in sibling rows.
+  * New mapping rules start with an empty `match_value` and a
+    placeholder hint. Previously pre-filled with `*@example.com`
+    as a literal default (forcing select-all + delete before typing).
+  * Users list label reflects group inheritance: `N groups
+    (inherited)` or `N rules · M groups` instead of a misleading
+    "No access" for users who have group-inherited permissions.
 
 ### Bug fixes / correctness
 

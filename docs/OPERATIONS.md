@@ -359,8 +359,13 @@ The admin UI exposes this as **IAM Backup** (distinct from the YAML Import/Expor
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| `GET` | `/_/api/admin/backup` | Export the full encrypted config DB (IAM users + groups + OAuth + mappings) — always allowed |
+| `GET` | `/_/api/admin/backup` | Export the full encrypted config DB (IAM users + groups + OAuth + mappings + external identities) — always allowed |
 | `POST` | `/_/api/admin/backup` | Import a backup — gated by `iam_mode` (403 when declarative) |
+
+Response from `POST` carries per-resource counters:
+`{users_created, users_skipped, groups_created, groups_skipped, memberships_created, external_identities_created, external_identities_skipped}`.
+
+`external_identities` are remapped through the imported user + provider ID maps. Records whose user or provider didn't make it through (e.g. conflicts on access key, skipped for existing rows) are dropped with a WARN log. Legacy backups generated before v0.8.0 that lack a per-user `id` field still round-trip correctly via fallback heuristics (sibling `groups.member_ids` and SQLite autoincrement assumption).
 
 ### Usage / diagnostics
 
@@ -368,7 +373,18 @@ The admin UI exposes this as **IAM Backup** (distinct from the YAML Import/Expor
 |--------|------|---------|
 | `POST` | `/_/api/admin/usage/scan` | Trigger a prefix-size scan |
 | `GET` | `/_/api/admin/usage` | Read the cached usage tree |
+| `GET` | `/_/api/admin/audit[?limit=N]` | Snapshot the in-memory audit ring, newest first (bounded; default 500 entries, override `DGP_AUDIT_RING_SIZE`). The server still emits every entry via `tracing::info!` — this endpoint is a GUI convenience, not a compliance substitute. |
 | `GET`/`PUT`/`DELETE` | `/_/api/admin/session/s3-credentials` | Server-side S3 credential storage for the admin GUI's browse panel |
+
+### Admin GUI keyboard shortcuts (reachable via `?` in the admin pane)
+
+| Key | Action |
+|-----|--------|
+| `⌘K` / `Ctrl+K` | Open the command palette (fuzzy nav over every admin page + shell actions) |
+| `⌘S` / `Ctrl+S` | Apply the current dirty section (no-op + browser default on clean pages) |
+| `?` | Open the shortcuts reference modal |
+| `Esc` | Close the palette / any open modal |
+| `↑` / `↓` + `Enter` | Navigate + run inside the palette |
 
 ### OAuth redirect flow (public — no session required)
 

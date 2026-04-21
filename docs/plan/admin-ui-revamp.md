@@ -1,6 +1,6 @@
 # Admin UI Revamp — Design Plan
 
-**Status:** Waves 1-8 shipped in v0.8.0 and its immediate follow-ons. Waves 9-10 (Diagnostics dashboard + Trace UI, polish pass) still pending.
+**Status:** All 10 waves shipped in v0.8.0 + a follow-on Wave 11 (in-process audit log viewer) + a post-manual-review UX hardening pass (external_identities round-trip fix + GUI polish). §9.1 Dashboard redesign was deferred — the existing MetricsPage stays functional and the rewrite can ship independently.
 
 **Stakeholders:** admin UI users (three personas — solo operator,
 GitOps team, GUI-first enterprise), the Rust backend team (this
@@ -23,8 +23,11 @@ plan proposes new admin API endpoints), the YAML config authors.
 | 6 — Storage section | ✅ Shipped | `BucketsPanel` with tri-state Anonymous read (None / Specific prefixes / Entire bucket → `public: true` shorthand). Test-connection button on backends. AntD 6 radio/checkbox shrink-on-click defeated in theme.css. |
 | 7 — Advanced section | ✅ Shipped | Five dedicated sub-panels (Listener & TLS, Caches, Limits, Logging, Config DB sync). `🔁` restart-required badging, env-var chips on env-owned fields, fabricated TOML hints removed (pre-Phase-3 artefact). |
 | 8 — First-run wizard | ✅ Shipped | Five-screen guided onboarding at `/_/admin/setup`: backend pick → backend config (with live Test Connection for S3) → admin credentials → optional public bucket → review + apply. Routes to Dashboard on success. |
-| 9 — Trace + Dashboard | ⏳ Pending | `POST/GET /config/trace` endpoints exist (Phase 2 + Wave 1); a Trace page and Diagnostics dashboard rendering against them are the wave's UI work. |
-| 10 — Polish | ⏳ Pending | A11y, keyboard shortcuts, i18n wrappers, mobile responsive pass. |
+| 9 — Trace + Dashboard | ✅ Shipped (partial) | `TracePanel` at `/_/admin/diagnostics/trace` ships the reason-path UX (decision tag, matched-block breadcrumb, resolved-request breakdown, example chips, Copy-as-JSON). §9.1 Dashboard redesign deferred — `MetricsPage` remains. |
+| 10 — Polish | ✅ Shipped | `⌘K` command palette with recents / group headings; `?` shortcuts modal (platform-aware — ⌘ on Mac, Ctrl elsewhere); `⌘S` dispatches to the current section's Apply handler; mobile drawer below 900px; i18n `t(key)` scaffold; a11y combobox ARIA + `aria-activedescendant`. See Wave 10.1 for the last items. |
+| 10.1 — Finish §10 | ✅ Shipped | `⌘S` + mobile drawer + i18n scaffold + command-palette recents / group headings + platform-conditional shortcut rows + Cmd+Shift+Y deferred (no Form/YAML toggle UI to bind to). |
+| 11 — Audit log viewer | ✅ Shipped | `AuditLogPanel` at `/_/admin/diagnostics/audit` backed by an in-memory ring (`src/audit.rs`, default 500 entries, `DGP_AUDIT_RING_SIZE`). `GET /api/admin/audit?limit=N` endpoint. Colour-coded Action tags, free-text filter, 3s auto-refresh, "not a compliance substitute" banner. |
+| Post-review — UX hardening | ✅ Shipped | `POST /api/admin/backup` now restores `external_identities` (was silently dropped). `GroupsPanel` resets form on create success. `AuthenticationPanel` flushes pending rule edits before "+ Add Rule" reload. Mapping-rule default starts empty, not `*@example.com`. Users list shows `N groups (inherited)` instead of misleading "No access". |
 
 ### Scope revisions made during delivery
 
