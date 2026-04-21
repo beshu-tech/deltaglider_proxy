@@ -229,7 +229,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                 <Alert type="info" showIcon message={
                   <span style={{ fontFamily: "var(--font-ui)", fontSize: 12 }}>
                     Set <code style={{ fontFamily: "var(--font-mono)" }}>DGP_BOOTSTRAP_PASSWORD_HASH</code> in your environment
-                    or <code style={{ fontFamily: "var(--font-mono)" }}>bootstrap_password_hash</code> in your TOML config, then restart.
+                    or <code style={{ fontFamily: "var(--font-mono)" }}>advanced.bootstrap_password_hash</code> in your YAML config, then restart.
                   </span>
                 } />
               </>

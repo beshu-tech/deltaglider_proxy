@@ -70,7 +70,9 @@ export default function SettingsPage({ onSessionExpired, embeddedTab }: Props) {
   const [testS3Result, setTestS3Result] = useState<TestS3Response | null>(null);
   const [showAdvancedSecurity, setShowAdvancedSecurity] = useState(false);
 
-  // Taint detection: fields that differ from TOML file on disk
+  // Taint detection: fields whose runtime value differs from the
+  // on-disk config file (YAML, or legacy TOML — whichever extension
+  // the server was started with).
   const [taintedFields, setTaintedFields] = useState<Set<string>>(new Set());
 
   /** Render an amber "modified" indicator next to a field label when tainted. */
@@ -130,7 +132,9 @@ export default function SettingsPage({ onSessionExpired, embeddedTab }: Props) {
       if (beSecretAccessKey) payload.backend_secret_access_key = beSecretAccessKey;
       const result = await updateAdminConfig(payload);
       setSaveResult({ warnings: result.warnings, requires_restart: result.requires_restart });
-      // Re-fetch config to update taint status (save persists to TOML, so taint should clear)
+      // Re-fetch config to update taint status — save persists to the
+      // on-disk config file (YAML or legacy TOML, matching the
+      // extension the server was started with), so taint should clear.
       const refreshed = await getAdminConfig();
       if (refreshed) setTaintedFields(new Set(refreshed.tainted_fields || []));
       setOriginalBackendType(backendType);
@@ -347,7 +351,30 @@ export default function SettingsPage({ onSessionExpired, embeddedTab }: Props) {
   /* -- Tab: Proxy --------------------------------------------------------- */
 
   /* -- Helper: read-only display field ------------------------------------ */
-  const readOnlyField = (label: string, value: string | number | boolean | undefined, description?: string, badge?: string, configHint?: { toml: string; env: string }) => (
+  //
+  // `configSource` describes WHERE this field can be set. The three
+  // accurate shapes:
+  //   * `{ env: "DGP_X=..." }`              -- env-var-only (the server
+  //                                            reads env directly; no
+  //                                            YAML key exists).
+  //   * `{ yaml: "advanced.x", env: "DGP_X=..." }`
+  //                                         -- YAML field with env
+  //                                            override. Render both.
+  //   * undefined                           -- derived / informational;
+  //                                            no source surface.
+  //
+  // Historically this helper carried a fabricated `toml: ...` line for
+  // fields that were env-only; the label claimed `foo = 300` in
+  // deltaglider_proxy.toml was a valid setting when the server never
+  // read it from the file at all. Fixed by switching to accurate
+  // source discrimination.
+  const readOnlyField = (
+    label: string,
+    value: string | number | boolean | undefined,
+    description?: string,
+    badge?: string,
+    configSource?: { yaml?: string; env: string }
+  ) => (
     <div style={{ marginTop: 16 }}>
       <span style={labelStyle}>
         {label}
@@ -355,10 +382,22 @@ export default function SettingsPage({ onSessionExpired, embeddedTab }: Props) {
       </span>
       <Input value={String(value ?? '—')} readOnly style={{ ...inputRadius, fontFamily: "var(--font-mono)", fontSize: 13, opacity: 0.7 }} />
       {description && <Text type="secondary" style={{ fontSize: 12, fontFamily: "var(--font-ui)" }}>{description}</Text>}
-      {configHint && (
+      {configSource && (
         <div style={{ marginTop: 4, padding: '6px 10px', background: colors.BG_ELEVATED, border: `1px solid ${colors.BORDER}`, borderRadius: 6, fontSize: 11, fontFamily: 'var(--font-mono)', lineHeight: 1.6, color: colors.TEXT_MUTED }}>
-          <span style={{ color: colors.TEXT_SECONDARY }}>TOML:</span> {configHint.toml}<br />
-          <span style={{ color: colors.TEXT_SECONDARY }}>ENV:</span>&nbsp; {configHint.env}
+          {configSource.yaml && (
+            <>
+              <span style={{ color: colors.TEXT_SECONDARY }}>YAML:</span> {configSource.yaml}<br />
+            </>
+          )}
+          <span style={{ color: colors.TEXT_SECONDARY }}>ENV:</span>&nbsp; {configSource.env}
+          {!configSource.yaml && (
+            <>
+              <br />
+              <span style={{ fontStyle: 'italic', fontSize: 10 }}>
+                environment-variable only — no YAML/config-file field.
+              </span>
+            </>
+          )}
         </div>
       )}
     </div>
@@ -371,9 +410,9 @@ export default function SettingsPage({ onSessionExpired, embeddedTab }: Props) {
     <div style={tabPane}><Space direction="vertical" size={0} style={{ width: '100%' }}>
       <div style={cardStyle}>
         <SectionHeader icon={<SafetyOutlined />} title="Request Limits" description="Protect the server from overload and abuse. All require restart to change." />
-        {readOnlyField('Request Timeout (seconds)', config?.request_timeout_secs, 'Maximum time for any single request. Returns HTTP 504 Gateway Timeout when exceeded.', 'restart required', { toml: 'request_timeout_secs = 300', env: 'DGP_REQUEST_TIMEOUT_SECS=300' })}
-        {readOnlyField('Max Concurrent Requests', config?.max_concurrent_requests, 'Maximum in-flight HTTP requests. Additional requests queue until a slot opens.', 'restart required', { toml: 'max_concurrent_requests = 1024', env: 'DGP_MAX_CONCURRENT_REQUESTS=1024' })}
-        {readOnlyField('Max Multipart Uploads', config?.max_multipart_uploads, 'Maximum concurrent multipart uploads. Each holds part data in memory.', 'restart required', { toml: 'max_multipart_uploads = 1000', env: 'DGP_MAX_MULTIPART_UPLOADS=1000' })}
+        {readOnlyField('Request Timeout (seconds)', config?.request_timeout_secs, 'Maximum time for any single request. Returns HTTP 504 Gateway Timeout when exceeded.', 'restart required', { env: 'DGP_REQUEST_TIMEOUT_SECS=300' })}
+        {readOnlyField('Max Concurrent Requests', config?.max_concurrent_requests, 'Maximum in-flight HTTP requests. Additional requests queue until a slot opens.', 'restart required', { env: 'DGP_MAX_CONCURRENT_REQUESTS=1024' })}
+        {readOnlyField('Max Multipart Uploads', config?.max_multipart_uploads, 'Maximum concurrent multipart uploads. Each holds part data in memory.', 'restart required', { env: 'DGP_MAX_MULTIPART_UPLOADS=1000' })}
       </div>
     </Space></div>
   );
@@ -409,19 +448,19 @@ export default function SettingsPage({ onSessionExpired, embeddedTab }: Props) {
         <>
           <div style={cardStyle}>
             <SectionHeader icon={<SafetyOutlined />} title="Session & Headers" />
-            {readOnlyField('Trust Proxy Headers', config?.trust_proxy_headers ? 'Enabled' : 'Disabled', 'Trust X-Forwarded-For/X-Real-IP for rate limiting and IAM conditions. Disable if exposed directly to the internet.', 'restart required', { toml: 'trust_proxy_headers = true', env: 'DGP_TRUST_PROXY_HEADERS=true' })}
-            {readOnlyField('Session TTL (hours)', config?.session_ttl_hours, 'Admin session expiry. Lower = more secure, higher = less frequent re-login.', 'restart required', { toml: 'session_ttl_hours = 4', env: 'DGP_SESSION_TTL_HOURS=4' })}
-            {readOnlyField('Clock Skew Tolerance (seconds)', config?.clock_skew_seconds, 'Maximum allowed time difference between client and server clocks for SigV4 signatures. 300 = 5 minutes, matches AWS S3.', 'restart required', { toml: 'clock_skew_seconds = 300', env: 'DGP_CLOCK_SKEW_SECONDS=300' })}
-            {readOnlyField('Secure Cookies', config?.secure_cookies ? 'Enabled' : 'Disabled', 'Require HTTPS for admin session cookies. Disable only for local development.', 'restart required', { toml: 'secure_cookies = true', env: 'DGP_SECURE_COOKIES=true' })}
-            {readOnlyField('Debug Headers', config?.debug_headers ? 'Enabled' : 'Disabled', 'Expose x-amz-storage-type and x-deltaglider-cache headers. Disable in production.', 'restart required', { toml: 'debug_headers = false', env: 'DGP_DEBUG_HEADERS=false' })}
+            {readOnlyField('Trust Proxy Headers', config?.trust_proxy_headers ? 'Enabled' : 'Disabled', 'Trust X-Forwarded-For/X-Real-IP for rate limiting and IAM conditions. Disable if exposed directly to the internet.', 'restart required', { env: 'DGP_TRUST_PROXY_HEADERS=true' })}
+            {readOnlyField('Session TTL (hours)', config?.session_ttl_hours, 'Admin session expiry. Lower = more secure, higher = less frequent re-login.', 'restart required', { env: 'DGP_SESSION_TTL_HOURS=4' })}
+            {readOnlyField('Clock Skew Tolerance (seconds)', config?.clock_skew_seconds, 'Maximum allowed time difference between client and server clocks for SigV4 signatures. 300 = 5 minutes, matches AWS S3.', 'restart required', { env: 'DGP_CLOCK_SKEW_SECONDS=300' })}
+            {readOnlyField('Secure Cookies', config?.secure_cookies ? 'Enabled' : 'Disabled', 'Require HTTPS for admin session cookies. Disable only for local development.', 'restart required', { env: 'DGP_SECURE_COOKIES=true' })}
+            {readOnlyField('Debug Headers', config?.debug_headers ? 'Enabled' : 'Disabled', 'Expose x-amz-storage-type and x-deltaglider-cache headers. Disable in production.', 'restart required', { env: 'DGP_DEBUG_HEADERS=false' })}
           </div>
 
           <div style={cardStyle}>
             <SectionHeader icon={<LockOutlined />} title="Rate Limiting" description="Brute-force protection for authentication endpoints" />
-            {readOnlyField('Max Attempts', config?.rate_limit_max_attempts, 'Failed auth attempts before IP lockout.', 'restart required', { toml: 'rate_limit_max_attempts = 100', env: 'DGP_RATE_LIMIT_MAX_ATTEMPTS=100' })}
-            {readOnlyField('Window (seconds)', config?.rate_limit_window_secs, 'Rolling time window for counting failures.', 'restart required', { toml: 'rate_limit_window_secs = 300', env: 'DGP_RATE_LIMIT_WINDOW_SECS=300' })}
-            {readOnlyField('Lockout Duration (seconds)', config?.rate_limit_lockout_secs, 'How long a locked-out IP is blocked.', 'restart required', { toml: 'rate_limit_lockout_secs = 600', env: 'DGP_RATE_LIMIT_LOCKOUT_SECS=600' })}
-            {readOnlyField('Replay Window (seconds)', config?.replay_window_secs, 'Duplicate SigV4 signature rejection window. Lower = fewer false positives.', 'restart required', { toml: 'replay_window_secs = 2', env: 'DGP_REPLAY_WINDOW_SECS=2' })}
+            {readOnlyField('Max Attempts', config?.rate_limit_max_attempts, 'Failed auth attempts before IP lockout.', 'restart required', { env: 'DGP_RATE_LIMIT_MAX_ATTEMPTS=100' })}
+            {readOnlyField('Window (seconds)', config?.rate_limit_window_secs, 'Rolling time window for counting failures.', 'restart required', { env: 'DGP_RATE_LIMIT_WINDOW_SECS=300' })}
+            {readOnlyField('Lockout Duration (seconds)', config?.rate_limit_lockout_secs, 'How long a locked-out IP is blocked.', 'restart required', { env: 'DGP_RATE_LIMIT_LOCKOUT_SECS=600' })}
+            {readOnlyField('Replay Window (seconds)', config?.replay_window_secs, 'Duplicate SigV4 signature rejection window. Lower = fewer false positives.', 'restart required', { env: 'DGP_REPLAY_WINDOW_SECS=2' })}
           </div>
         </>
       )}
