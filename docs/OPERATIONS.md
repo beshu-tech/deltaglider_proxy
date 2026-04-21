@@ -32,17 +32,35 @@ Point S3 clients at DeltaGlider Proxy (`:9002` in the example), not at MinIO.
 
 ## Configuration
 
+YAML is the canonical format as of v0.8.0. TOML still loads but emits a deprecation warning on every startup (suppress with `DGP_SILENCE_TOML_DEPRECATION=1`). See [CONFIGURATION.md](CONFIGURATION.md) for the full field reference and [HOWTO_MIGRATE_TO_YAML.md](HOWTO_MIGRATE_TO_YAML.md) for the migration path.
+
 DeltaGlider Proxy loads configuration in this order:
 
-1. `DGP_CONFIG` (explicit TOML path)
-2. `./deltaglider_proxy.toml`
-3. `/etc/deltaglider_proxy/config.toml`
-4. Environment variables (see `deltaglider_proxy.toml.example`)
+1. `DGP_CONFIG` (explicit file path — returned unconditionally when set)
+2. `./deltaglider_proxy.yaml`
+3. `./deltaglider_proxy.yml`
+4. `./deltaglider_proxy.toml` (deprecated)
+5. `/etc/deltaglider_proxy/config.yaml`
+6. `/etc/deltaglider_proxy/config.yml`
+7. `/etc/deltaglider_proxy/config.toml` (deprecated)
 
-CLI flags override anything loaded from the file/env:
+Environment variables (`DGP_*` prefix) override file contents regardless of format. CLI flags override everything:
 
 ```bash
-./target/release/deltaglider_proxy --config deltaglider_proxy.toml --listen 0.0.0.0:9000
+./target/release/deltaglider_proxy --config deltaglider_proxy.yaml --listen 0.0.0.0:9000
+```
+
+**TOML → YAML migration:**
+
+```bash
+deltaglider_proxy config migrate deltaglider_proxy.toml --out deltaglider_proxy.yaml
+```
+
+**Offline validation** (wire into CI):
+
+```bash
+deltaglider_proxy config lint deltaglider_proxy.yaml
+# Exit codes: 0 = valid; 3 = I/O; 4 = parse; 6 = validation.
 ```
 
 ## Admin GUI
@@ -167,14 +185,13 @@ The usage scanner (`/_/api/admin/usage`) computes prefix sizes asynchronously in
 
 ### Rate limiting
 
-Authentication endpoints are protected by a per-IP rate limiter:
+Authentication endpoints are protected by a per-IP rate limiter. See [RATE_LIMITING.md](RATE_LIMITING.md) for the full model (progressive delay, tiered lockout, IP extraction).
 
-- **5 failed attempts** per **15-minute** rolling window per IP address.
-- After exceeding the limit, the IP is **locked out for 30 minutes**.
+- **100 failed attempts** per **5-minute** rolling window per IP (configurable via `DGP_RATE_LIMIT_MAX_ATTEMPTS` / `DGP_RATE_LIMIT_WINDOW_SECS`).
+- After exceeding the limit, the IP is **locked out for 10 minutes** (configurable via `DGP_RATE_LIMIT_LOCKOUT_SECS`).
+- Progressive delay (100ms → 5s cap) kicks in before lockout.
 - Expired entries are periodically cleaned up to prevent memory growth.
-- Applies to admin login endpoints (`/_/api/admin/login`, `/_/api/admin/login-as`).
-
-No configuration env var — the limits are hardcoded as security defaults.
+- Applies to admin login endpoints (`/_/api/admin/login`, `/_/api/admin/login-as`, `/_/api/admin/oauth/callback`).
 
 ### Session hardening
 
@@ -228,7 +245,7 @@ The auto-generated bootstrap password is displayed in plaintext **only when stde
 
 ### Multipart upload limits
 
-Concurrent multipart uploads are limited to prevent resource exhaustion. Default: 100 concurrent uploads. Override with `DGP_MAX_MULTIPART_UPLOADS` env var.
+Concurrent multipart uploads are limited to prevent resource exhaustion. Default: 1000 concurrent uploads. Override with `DGP_MAX_MULTIPART_UPLOADS` env var.
 
 ## Security-related environment variables
 
@@ -236,7 +253,154 @@ Concurrent multipart uploads are limited to prevent resource exhaustion. Default
 |----------|---------|-------------|
 | `DGP_SESSION_TTL_HOURS` | `4` | Admin session lifetime in hours |
 | `DGP_CLOCK_SKEW_SECONDS` | `300` | SigV4 clock skew tolerance in seconds |
-| `DGP_MAX_MULTIPART_UPLOADS` | `100` | Max concurrent multipart uploads |
+| `DGP_REPLAY_WINDOW_SECS` | `2` | SigV4 replay detection window |
+| `DGP_MAX_MULTIPART_UPLOADS` | `1000` | Max concurrent multipart uploads |
 | `DGP_DEBUG_HEADERS` | `false` | Expose debug/fingerprinting headers |
-| `DGP_METADATA_CACHE_MB` | `50` | Metadata cache size in MB |
+| `DGP_SECURE_COOKIES` | `true` | Require HTTPS for session cookies |
+| `DGP_TRUST_PROXY_HEADERS` | `false` | Trust `X-Forwarded-For` / `X-Real-IP` (set `true` only behind a reverse proxy) |
+
+See [CONFIGURATION.md](CONFIGURATION.md#environment-variable-registry) for the exhaustive list.
+
+---
+
+## Admin API endpoints
+
+The admin GUI and GitOps integrations talk to `/_/api/admin/*`. All mutation routes require a session cookie (issued by `POST /_/api/admin/login`). Session cookies are IP-bound (rejected from a different source IP) with a default 4-hour TTL.
+
+### Authentication & session
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/_/api/admin/login` | Bootstrap password → session cookie |
+| `POST` | `/_/api/admin/login-as` | Log in as an IAM user (access_key_id + secret_access_key) |
+| `POST` | `/_/api/admin/logout` | End the current session |
+| `GET` | `/_/api/admin/session` | `{valid: true/false}` |
+| `GET` | `/_/api/whoami` | `{mode, version, user, external_providers}` |
+| `POST` | `/_/api/admin/recover-db` | Reset the config DB when the bootstrap hash doesn't match (public, rate-limited) |
+| `PUT` | `/_/api/admin/password` | Change the bootstrap password (re-encrypts the DB atomically) |
+
+### Config — field-level (legacy GUI forms)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/_/api/admin/config` | Runtime config as JSON (legacy flat shape) |
+| `PUT` | `/_/api/admin/config` | Partial JSON update |
+
+### Config — section-level (Wave 1 of the admin UI revamp)
+
+All three section endpoints route through the same `apply_config_transition` helper as field-level PATCH + document-level APPLY, so hot-reload semantics are identical.
+
+| Method | Path | Body | Purpose |
+|--------|------|------|---------|
+| `GET` | `/_/api/admin/config/section/:name[?format=yaml]` | — | Section slice as JSON (default) or YAML |
+| `PUT` | `/_/api/admin/config/section/:name` | JSON Merge Patch (RFC 7396) | Partial section update |
+| `POST` | `/_/api/admin/config/section/:name/validate` | same as PUT | Dry-run: returns `{ok, warnings[], diff, requires_restart}` |
+
+`:name` is one of `admission` / `access` / `storage` / `advanced`. Unknown names return 404.
+
+RFC 7396 merge-patch semantics: keys not present in the body are preserved from the current runtime state; `null` deletes a key; objects merge recursively. Secrets are preserved across round-trips (a GET → edit → PUT cycle never clears credentials even though GET redacts them).
+
+### Config — document-level (GitOps)
+
+| Method | Path | Body | Purpose |
+|--------|------|------|---------|
+| `GET` | `/_/api/admin/config/export[?section=<name>]` | — | Canonical YAML (secrets redacted) |
+| `GET` | `/_/api/admin/config/defaults[?section=<name>]` | — | JSON Schema (for YAML LSP + Monaco) |
+| `POST` | `/_/api/admin/config/validate` | `{yaml: <doc>}` | Dry-run full-document apply |
+| `POST` | `/_/api/admin/config/apply` | `{yaml: <doc>}` | Atomic full-document apply + persist |
+| `POST` | `/_/api/admin/config/trace` | `{method, path, query?, authenticated, source_ip?}` | Evaluate a synthetic request against the admission chain |
+| `GET` | `/_/api/admin/config/trace?method=&path=&...` | — | Query-param variant (bookmarkable trace URLs) |
+
+Full-document apply returns `{applied, persisted, requires_restart, warnings, persisted_path}`. Persist failure returns HTTP 500 (not 200+warning) so GitOps pipelines can't mistake a half-applied state for a clean success.
+
+Use the CLI wrapper:
+
+```bash
+export DGP_BOOTSTRAP_PASSWORD=...
+deltaglider_proxy config apply deltaglider_proxy.yaml --server https://proxy.example.com
+```
+
+### Backends
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/_/api/admin/backends` | List named backends |
+| `POST` | `/_/api/admin/backends` | Create; validates S3 creds upfront |
+| `DELETE` | `/_/api/admin/backends/:name` | Remove (safety: can't delete the default or in-use backends) |
+| `POST` | `/_/api/admin/test-s3` | Test an arbitrary S3 connection without persisting |
+
+### IAM users / groups / OAuth — gated by `iam_mode`
+
+Mutations (`POST`/`PUT`/`DELETE`) on the routes below return `403 { "error": "iam_declarative" }` when `access.iam_mode: declarative`. Read routes (`GET`) stay accessible for diagnostics.
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET`/`POST` | `/_/api/admin/users` | List / create IAM users |
+| `PUT`/`DELETE` | `/_/api/admin/users/:id` | Update / delete user |
+| `POST` | `/_/api/admin/users/:id/rotate-keys` | Rotate an IAM user's access keys |
+| `GET`/`POST` | `/_/api/admin/groups` | List / create groups |
+| `PUT`/`DELETE` | `/_/api/admin/groups/:id` | Update / delete group |
+| `POST` | `/_/api/admin/groups/:id/members` | Add a user to a group |
+| `DELETE` | `/_/api/admin/groups/:id/members/:user_id` | Remove a user from a group |
+| `GET` | `/_/api/admin/policies` | List canned policy templates (public — no session required) |
+| `GET`/`POST` | `/_/api/admin/ext-auth/providers` | List / create OAuth/OIDC providers |
+| `PUT`/`DELETE` | `/_/api/admin/ext-auth/providers/:id` | Update / delete a provider |
+| `POST` | `/_/api/admin/ext-auth/providers/:id/test` | Test an OAuth provider (probes the well-known endpoint) |
+| `GET`/`POST` | `/_/api/admin/ext-auth/mappings` | List / create group mapping rules |
+| `PUT`/`DELETE` | `/_/api/admin/ext-auth/mappings/:id` | Update / delete a mapping rule |
+| `POST` | `/_/api/admin/ext-auth/mappings/preview` | Preview which groups a given identity would be assigned |
+| `GET` | `/_/api/admin/ext-auth/identities` | List external identities (read-only; not gated by `iam_mode`) |
+| `POST` | `/_/api/admin/ext-auth/sync-memberships` | Re-evaluate mapping rules and sync group memberships |
+| `POST` | `/_/api/admin/migrate` | Migrate legacy bootstrap creds into an IAM user |
+
+### IAM backup (encrypted DB export / import)
+
+The admin UI exposes this as **IAM Backup** (distinct from the YAML Import/Export modal — different scope: encrypted DB vs. operator YAML).
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/_/api/admin/backup` | Export the full encrypted config DB (IAM users + groups + OAuth + mappings) — always allowed |
+| `POST` | `/_/api/admin/backup` | Import a backup — gated by `iam_mode` (403 when declarative) |
+
+### Usage / diagnostics
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/_/api/admin/usage/scan` | Trigger a prefix-size scan |
+| `GET` | `/_/api/admin/usage` | Read the cached usage tree |
+| `GET`/`PUT`/`DELETE` | `/_/api/admin/session/s3-credentials` | Server-side S3 credential storage for the admin GUI's browse panel |
+
+### OAuth redirect flow (public — no session required)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/_/api/admin/oauth/authorize/:provider` | Kick off the OAuth flow (PKCE, state, nonce) |
+| `GET` | `/_/api/admin/oauth/callback` | Provider callback → issue session cookie |
+
+### Operational
+
+Unauthenticated (needed for load balancer probes, Prometheus scrapers):
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/_/health` | `{status, peak_rss_bytes, cache_*}` — no version (anti-fingerprinting) |
+| `GET` | `/_/metrics` | Prometheus text format |
+
+Session-protected (reveals per-bucket storage sizes):
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/_/stats` | Aggregate storage stats (10s server-side cache) |
+
+---
+
+## IAM backup, export/import, and multi-instance sync
+
+Three distinct mechanisms, often confused:
+
+1. **IAM Backup** (`GET/POST /_/api/admin/backup`) — exports/imports the **full encrypted SQLCipher DB** (users, groups, OAuth providers, mapping rules). The GUI calls this from the **IAM Backup** sidebar entry.
+2. **YAML Import/Export** (GUI `YamlImportExportModal` → `/_/api/admin/config/export` + `/config/apply`) — the full YAML *config document* (admission chain, backends, bucket policies, advanced knobs). Does **not** include IAM state.
+3. **S3-synced IAM DB** (`DGP_CONFIG_SYNC_BUCKET`) — multi-instance replication of the encrypted DB. Uploads after every mutation; readers poll S3 every 5 minutes and download on ETag change. Configurable via `advanced.config_sync_bucket` in YAML or the env var.
+
+These are orthogonal: IAM Backup is manual point-in-time export; S3 sync is automatic live replication; YAML Import/Export manages non-IAM config.
 
