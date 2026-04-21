@@ -29,7 +29,7 @@ import AdminSidebar from './AdminSidebar';
 import AdmissionPanel from './AdmissionPanel';
 import CredentialsModePanel from './CredentialsModePanel';
 import BucketsPanel from './BucketsPanel';
-import RightRailActions from './RightRailActions';
+import CopySectionYamlButton from './CopySectionYamlButton';
 import SetupWizard from './SetupWizard';
 import {
   ListenerTlsPanel,
@@ -622,6 +622,13 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
         onBack={onBack}
         extra={
           <Space size={4}>
+            {/* Section-scoped Copy YAML — only renders on Configuration
+                pages. Lives in the header now (not the old right-rail
+                column) so Configuration pages reclaim the full content
+                width for their forms. Responsive cascade intact; the
+                button's label is hidden below 768px via the
+                `hide-mobile` class. */}
+            <CopySectionYamlButton section={sectionForPath(adminPath)} />
             <Button
               size="small"
               type="text"
@@ -764,24 +771,22 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
           </div>
         </div>
 
-        {/* Content + right-rail actions (§3.3).
-            UX architecture: the rail speaks for the CURRENT section
-            only (section YAML copy/paste + Apply/Discard). Full-
-            document YAML I/O lives in the shell header (Export YAML
-            / Import YAML at the top). This gives exactly one place
-            per scope — no duplicates. Diagnostics pages have no
-            section and therefore no rail. */}
+        {/* Content pane — single column, full width available.
+            Section-scoped Copy YAML lives in the shell header
+            (CopySectionYamlButton), so Configuration forms reclaim
+            the horizontal space the earlier right-rail was eating
+            on viewports under ~1400px. Full-document Export/Import
+            YAML also in the header. Apply/Discard for dirty state
+            renders inline inside each section panel as an alert
+            banner — that pattern predates the rail and survived
+            the rewrite. */}
         <div
           style={{
             flex: 1,
             overflow: 'auto',
-            display: 'flex',
-            gap: 16,
-            padding: 16,
           }}
         >
-          <div style={{ flex: 1, minWidth: 0 }}>{renderContent()}</div>
-          <RightRailActions section={sectionForPath(adminPath)} />
+          {renderContent()}
         </div>
       </div>
     </div>
@@ -790,8 +795,9 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
 
 /**
  * Resolve which section a Configuration admin path edits — used by
- * RightRailActions to pick the target for Copy YAML. Returns
- * undefined for Diagnostics pages (no section scope).
+ * the header's CopySectionYamlButton to pick the target section.
+ * Returns undefined for Diagnostics pages and the first-run wizard
+ * (no section scope).
  */
 function sectionForPath(path: string): SectionName | undefined {
   if (path.startsWith('configuration/admission')) return 'admission';
