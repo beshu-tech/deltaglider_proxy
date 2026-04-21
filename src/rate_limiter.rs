@@ -384,9 +384,30 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
 
+    /// Serialise every test that mutates the `DGP_TRUST_PROXY_HEADERS`
+    /// env var. Cargo runs tests in parallel within a crate, and env
+    /// vars are process-global, so without this lock two sibling
+    /// tests can clobber each other's `set_var` / `remove_var` calls.
+    /// (Race cause: the XFF-ignores-by-default test reads `false`
+    /// expected, but sees `true` because the v4-mapped test hasn't
+    /// `remove_var`'d yet.)
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        // `poisoned` intentionally swallowed — the test's env_var
+        // mutation is idempotent on cleanup, so a poisoned lock just
+        // means a previous test panicked. We still want to serialise.
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn test_extract_client_ip_ignores_xff_by_default() {
-        // DGP_TRUST_PROXY_HEADERS defaults to false (secure-by-default)
+        let _g = env_lock();
+        // Defensive: ensure the var is not set when we enter (a prior
+        // test may have left it set if it panicked before cleanup).
+        std::env::remove_var("DGP_TRUST_PROXY_HEADERS");
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
         let ip = extract_client_ip(&headers);
@@ -483,6 +504,7 @@ mod tests {
 
     #[test]
     fn test_extract_client_ip_collapses_v4_mapped_from_xff() {
+        let _g = env_lock();
         std::env::set_var("DGP_TRUST_PROXY_HEADERS", "true");
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("x-forwarded-for", "::ffff:1.2.3.4".parse().unwrap());
