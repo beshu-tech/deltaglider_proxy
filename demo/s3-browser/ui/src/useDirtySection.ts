@@ -23,7 +23,7 @@
  * state is local to a component, which doesn't help cross-panel
  * signalling). The hook's cleanup removes the section on unmount.
  */
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { SectionName } from './adminApi';
 
 // Module singleton. Section panels mount concurrently in the new nav;
@@ -84,6 +84,12 @@ export function useDirtySection<T>(
 ): UseDirtySectionResult<T> {
   const [value, setValueState] = useState<T>(initial);
   const snapshotRef = useRef<T>(initial);
+  // `value` referenced inside `markApplied` must come from a ref so
+  // the callback identity doesn't change on every render (which
+  // would cascade through `useCallback` consumers and cause infinite
+  // refresh loops when the callback ends up in a `useEffect`'s deps).
+  const valueRef = useRef<T>(value);
+  valueRef.current = value;
 
   const isDirty = !shallowEq(value, snapshotRef.current);
 
@@ -104,16 +110,19 @@ export function useDirtySection<T>(
     };
   }, [section, isDirty]);
 
-  const setValue = (next: T) => setValueState(next);
-  const discard = () => setValueState(snapshotRef.current);
-  const markApplied = () => {
-    snapshotRef.current = value;
-    setValueState(value); // trigger isDirty recompute
-  };
-  const resetWith = (next: T) => {
+  // All callbacks are `useCallback`'d with stable deps so panels
+  // that put them in `useCallback` / `useEffect` dependency arrays
+  // don't re-run on every parent render.
+  const setValue = useCallback((next: T) => setValueState(next), []);
+  const discard = useCallback(() => setValueState(snapshotRef.current), []);
+  const markApplied = useCallback(() => {
+    snapshotRef.current = valueRef.current;
+    setValueState(valueRef.current); // trigger isDirty recompute
+  }, []);
+  const resetWith = useCallback((next: T) => {
     snapshotRef.current = next;
     setValueState(next);
-  };
+  }, []);
 
   return { value, isDirty, setValue, discard, markApplied, resetWith };
 }

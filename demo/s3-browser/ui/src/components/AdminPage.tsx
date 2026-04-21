@@ -27,6 +27,7 @@ import BackendsPanel from './BackendsPanel';
 import MetricsPage from './MetricsPage';
 import OAuthProviderList from './OAuthProviderList';
 import AdminSidebar from './AdminSidebar';
+import AdmissionPanel from './AdmissionPanel';
 import RightRailActions from './RightRailActions';
 import { useNavigation } from '../NavigationContext';
 import TabHeader from './TabHeader';
@@ -345,16 +346,18 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
       );
     }
 
-    // Configuration — Admission
+    // Configuration — Admission (Wave 4)
     if (adminPath === 'configuration/admission') {
       return (
         <>
           {header}
-          <Alert
-            type="info"
-            showIcon
-            message="Admission block editor — coming in Wave 4."
-            description="Edit your admission blocks via the YAML Import/Export modal in the header, or POST to /_/api/admin/config/section/admission."
+          <AdmissionPanel
+            onSessionExpired={onSessionExpired}
+            onNavigateToBucket={(_bucket) =>
+              // Wave 6 will deep-link into a specific bucket editor;
+              // until then we land on the Buckets sub-tab.
+              navigateAdmin('configuration/storage/buckets')
+            }
           />
         </>
       );
@@ -563,10 +566,15 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
 
       {/* Body: sidebar + content (§3.1 four-group IA) */}
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
-        {/* Four-group sidebar (AdminSidebar) with a Backup footer
-            stacked beneath it. Backup stays accessible from anywhere
-            in the admin UI — moving it out of the top-level nav
-            freed up room without hiding the feature. */}
+        {/* Four-group sidebar (AdminSidebar) with an IAM Backup
+            footer. Explicitly labelled "IAM Backup" — this is a
+            JSON dump of IAM users/groups/OAuth-providers/mapping-
+            rules, not the config YAML. Mislabelling it "Backup" in
+            Wave 3 made operators mistake it for a YAML export and
+            go looking for a third Export/Import channel. It is
+            genuinely its own data domain — encrypted SQLCipher
+            contents vs. the config YAML document — and deserves
+            its own surface rather than being hidden. */}
         <div
           style={{
             display: 'flex',
@@ -578,7 +586,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
           <div style={{ flex: 1, minHeight: 0 }}>
             <AdminSidebar activePath={adminPath} onNavigate={navigateAdmin} />
           </div>
-          {/* Backup footer */}
+          {/* IAM Backup footer — JSON dump of users/groups/OAuth, not YAML */}
           <div
             style={{
               background: colors.BG_CARD,
@@ -597,8 +605,9 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
                 padding: '0 0 6px',
                 fontFamily: 'var(--font-ui)',
               }}
+              title="JSON dump of IAM state (users, groups, OAuth providers, mapping rules). Not the config YAML — that's in the header."
             >
-              Backup
+              IAM Backup
             </div>
             <div style={{ display: 'flex', gap: 4 }}>
               <Button
@@ -661,14 +670,13 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
           </div>
         </div>
 
-        {/* Content + right-rail actions (§3.3). The rail only
-            appears on Configuration pages — Diagnostics entries
-            don't have an edit surface to Apply / Discard. Pages
-            that own form state wire up Apply / Discard / Paste
-            callbacks themselves once they migrate to the section
-            API; until then the rail shows only the Export / Import
-            full-config buttons so operators can reach those from
-            any page. */}
+        {/* Content + right-rail actions (§3.3).
+            UX architecture: the rail speaks for the CURRENT section
+            only (section YAML copy/paste + Apply/Discard). Full-
+            document YAML I/O lives in the shell header (Export YAML
+            / Import YAML at the top). This gives exactly one place
+            per scope — no duplicates. Diagnostics pages have no
+            section and therefore no rail. */}
         <div
           style={{
             flex: 1,
@@ -679,11 +687,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
           }}
         >
           <div style={{ flex: 1, minWidth: 0 }}>{renderContent()}</div>
-          <RightRailActions
-            section={sectionForPath(adminPath)}
-            onExportAll={() => setYamlModalMode('export')}
-            onImportAll={() => setYamlModalMode('import')}
-          />
+          <RightRailActions section={sectionForPath(adminPath)} />
         </div>
       </div>
     </div>

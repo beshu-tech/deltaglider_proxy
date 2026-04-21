@@ -1,39 +1,36 @@
 /**
- * RightRailActions — Wave 3 foundation.
+ * RightRailActions — persistent right-rail on Configuration pages.
  *
- * The persistent right-rail visible on every configuration page
- * (§3.3 of the admin UI revamp plan). Three stacked button groups:
+ * Scope discipline: the rail is the voice of the **active section**.
+ * Full-document YAML I/O lives in the shell header (Admin Settings
+ * top bar); this rail never duplicates that. Two stacked groups:
  *
  *   1. Apply / Discard — drive the dirty-state flow for the active
  *      section. Only enabled when `dirty` is true.
  *   2. Copy YAML / Paste YAML — section-scoped round trip. Copy
  *      fetches `getSectionYaml(section)` and pushes it to the
- *      clipboard; Paste opens an input modal (parent-owned) that
- *      calls `validateSection` then `putSection` on commit.
- *   3. Export all / Import all — full-document flows (parent opens
- *      the existing YamlImportExportModal).
+ *      clipboard. Paste opens a parent-owned modal which validates
+ *      the body against this section's schema before applying.
  *
  * ## Parent responsibilities
  *
  * This component is a dumb view over state the parent owns. It only
- * wires up button callbacks and decides which groups to render — the
- * actual Apply / Discard / Paste handlers live in the section panel
- * (which knows its form state) and the Export / Import handlers on
- * AdminPage (which owns the modal).
+ * wires up button callbacks and decides which groups to render —
+ * the actual Apply / Discard / Paste handlers live in the section
+ * panel (which knows its form state).
  *
  * When the page doesn't have an associated section (Diagnostics
- * pages), omit `section`, `dirty`, `onApply`, and `onDiscard` — the
- * first group disappears and the rail becomes just the YAML controls.
+ * pages), omit `section` — the rail doesn't render at all. The
+ * header Export / Import YAML buttons stay the only YAML surface
+ * for diagnostic pages.
  */
 import { useState } from 'react';
-import { Button, message, Tooltip, Space } from 'antd';
+import { Button, message, Tooltip } from 'antd';
 import {
   CheckCircleOutlined,
   UndoOutlined,
   CopyOutlined,
-  FileTextOutlined,
   ImportOutlined,
-  DownloadOutlined,
 } from '@ant-design/icons';
 import type { SectionName } from '../adminApi';
 import { getSectionYaml } from '../adminApi';
@@ -42,8 +39,9 @@ import { useColors } from '../ThemeContext';
 interface Props {
   /**
    * The active section (for the per-section Copy YAML button). When
-   * omitted, the Copy/Paste group disappears entirely — useful on
-   * Diagnostics pages that have no section scope.
+   * omitted, the rail does not render — Diagnostics pages have no
+   * section scope and use the header Export / Import YAML buttons
+   * for any YAML I/O.
    */
   section?: SectionName;
   /** True when the active section has unsaved edits. */
@@ -52,12 +50,12 @@ interface Props {
   onApply?: () => void;
   /** Invoked on Discard. Parent reverts form state to its snapshot. */
   onDiscard?: () => void;
-  /** Invoked on Paste YAML. Parent opens a section-scoped paste dialog. */
+  /**
+   * Invoked on Paste YAML. Parent opens a section-scoped paste
+   * dialog. Omitted when the section panel doesn't support paste
+   * (typically because the section editor isn't dirty-tracked yet).
+   */
   onPasteYaml?: () => void;
-  /** Invoked on Export all. Parent opens YamlImportExportModal in export mode. */
-  onExportAll?: () => void;
-  /** Invoked on Import all. Parent opens YamlImportExportModal in import mode. */
-  onImportAll?: () => void;
   /** True while Apply is in flight — disables both Apply and Discard. */
   applying?: boolean;
 }
@@ -68,15 +66,15 @@ export default function RightRailActions({
   onApply,
   onDiscard,
   onPasteYaml,
-  onExportAll,
-  onImportAll,
   applying,
 }: Props) {
   const { BG_CARD, BORDER, TEXT_MUTED } = useColors();
   const [copying, setCopying] = useState(false);
 
-  const hasSectionActions = section !== undefined;
-  const hasDirtyActions = hasSectionActions && onApply && onDiscard;
+  // Rail only renders when the page belongs to a section. Diagnostics
+  // pages (no section) show no rail — the header owns global YAML I/O.
+  if (!section) return null;
+  const hasDirtyActions = onApply && onDiscard;
 
   const handleCopyYaml = async () => {
     if (!section) return;
@@ -194,97 +192,44 @@ export default function RightRailActions({
         </>
       )}
 
-      {hasSectionActions && (
-        <>
-          <div
-            style={{
-              fontSize: 10,
-              fontWeight: 600,
-              letterSpacing: 0.5,
-              textTransform: 'uppercase',
-              color: TEXT_MUTED,
-              marginBottom: 4,
-              fontFamily: 'var(--font-ui)',
-            }}
+      <div
+        style={{
+          fontSize: 10,
+          fontWeight: 600,
+          letterSpacing: 0.5,
+          textTransform: 'uppercase',
+          color: TEXT_MUTED,
+          marginBottom: 4,
+          fontFamily: 'var(--font-ui)',
+        }}
+      >
+        {section} YAML
+      </div>
+      <div style={groupStyle}>
+        <Tooltip
+          title={`Copy the ${section} section as canonical YAML. Secrets are redacted.`}
+          placement="left"
+        >
+          <Button
+            icon={<CopyOutlined />}
+            loading={copying}
+            onClick={handleCopyYaml}
+            block
           >
-            {section} YAML
-          </div>
-          <div style={groupStyle}>
-            <Tooltip
-              title={`Copy the ${section} section as canonical YAML. Secrets are redacted.`}
-              placement="left"
-            >
-              <Button
-                icon={<CopyOutlined />}
-                loading={copying}
-                onClick={handleCopyYaml}
-                block
-              >
-                Copy YAML
-              </Button>
-            </Tooltip>
-            {onPasteYaml && (
-              <Tooltip
-                title="Paste a YAML fragment and apply it to this section. Validate runs first; no state change on failure."
-                placement="left"
-              >
-                <Button icon={<ImportOutlined />} onClick={onPasteYaml} block>
-                  Paste YAML
-                </Button>
-              </Tooltip>
-            )}
-          </div>
-          <div style={dividerStyle} />
-        </>
-      )}
-
-      {(onExportAll || onImportAll) && (
-        <>
-          <div
-            style={{
-              fontSize: 10,
-              fontWeight: 600,
-              letterSpacing: 0.5,
-              textTransform: 'uppercase',
-              color: TEXT_MUTED,
-              marginBottom: 4,
-              fontFamily: 'var(--font-ui)',
-            }}
+            Copy YAML
+          </Button>
+        </Tooltip>
+        {onPasteYaml && (
+          <Tooltip
+            title="Paste a YAML fragment and apply it to this section. Validate runs first; no state change on failure."
+            placement="left"
           >
-            Full config
-          </div>
-          <Space direction="vertical" size={6} style={{ width: '100%' }}>
-            {onExportAll && (
-              <Tooltip
-                title="Copy the entire runtime config as canonical YAML."
-                placement="left"
-              >
-                <Button
-                  icon={<DownloadOutlined />}
-                  onClick={onExportAll}
-                  block
-                >
-                  Export all
-                </Button>
-              </Tooltip>
-            )}
-            {onImportAll && (
-              <Tooltip
-                title="Paste a full YAML document — validate, then apply + persist."
-                placement="left"
-              >
-                <Button
-                  icon={<FileTextOutlined />}
-                  onClick={onImportAll}
-                  block
-                >
-                  Import all
-                </Button>
-              </Tooltip>
-            )}
-          </Space>
-        </>
-      )}
+            <Button icon={<ImportOutlined />} onClick={onPasteYaml} block>
+              Paste YAML
+            </Button>
+          </Tooltip>
+        )}
+      </div>
     </aside>
   );
 }
