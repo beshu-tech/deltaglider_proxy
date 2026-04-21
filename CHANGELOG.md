@@ -79,10 +79,14 @@ and the first waves of the **admin UI revamp**
   - `deltaglider_proxy config defaults` — dump every default
     with its doc comment.
 
-### Admin UI revamp (waves 1–3)
+### Admin UI revamp (waves 1–7)
 
-Three of ten waves from the plan land in this release; waves 4–10
-come next.
+Seven of ten waves from the plan have landed as of this release;
+waves 8–10 (first-run wizard, diagnostics dashboard, polish pass)
+are still pending. Waves 1–3 shipped at tag time; waves 4–7 landed
+immediately after during live-browser verification and are
+rolled into the v0.8.0 entry so the `main` history is
+self-describing.
 
 - **Section-level API client helpers in `adminApi.ts`**:
   `getSection`, `putSection`, `validateSection`, `getSectionYaml`,
@@ -106,11 +110,48 @@ come next.
   (`/_/admin/users`, `/_/admin/backends`) keep working via
   `LEGACY_TO_NEW` in AdminPage.tsx.
 - **Right-rail actions** (`RightRailActions`) visible on every
-  Configuration page: Apply / Discard (gated on `dirty`), Copy
-  YAML / Paste YAML (section-scoped), Export all / Import all
-  (full-document modal from v0.7.x).
+  Configuration page: Apply / Discard (gated on `dirty`) and
+  Copy YAML (section-scoped). In practice the rail was
+  simplified during Wave 3's adversarial review to copy-only —
+  section-scoped paste and full-document Import/Export run from
+  the `YamlImportExportModal` reached through the header actions.
 - **YAML Import/Export modal** (`YamlImportExportModal`) reached
-  from every admin page via the header actions.
+  from every admin page via the header actions. **IAM Backup**
+  was renamed in the sidebar (was "Backup") to distinguish it
+  from the YAML Import/Export surface: IAM Backup ships the full
+  encrypted SQLCipher DB (users, groups, OAuth, mappings); YAML
+  Import/Export ships the operator config document.
+- **Admission block editor** (Wave 4, `AdmissionPanel`) — drag-
+  to-reorder list of operator-authored blocks with Form ⇄ YAML
+  toggle per row, inline validation matching the server rules
+  (name charset, reserved `public-prefix:*` prefix, mutually
+  exclusive `source_ip` / `source_ip_list`, 4xx/5xx `reject`
+  status), and synthesized `public-prefix:*` blocks surfaced
+  read-only below.
+- **Access → Credentials & mode panel** (Wave 5) — the first
+  screen on the Access section: iam_mode radio (gui /
+  declarative with the Phase 3c.3 gap disclosed inline),
+  authentication-mode dropdown, bootstrap SigV4 key pair with
+  rotate-in-place, and a Change password link.
+- **Storage → Buckets panel** (Wave 6) — per-bucket editor with
+  tri-state Anonymous read access (None / Specific prefixes /
+  Entire bucket). Selecting "Entire bucket" writes the compact
+  `public: true` shorthand; "Specific prefixes" writes an
+  explicit `public_prefixes` list. The GUI toggle maps 1:1 to
+  the YAML.
+- **Advanced panel sub-sections** (Wave 7) — the Advanced
+  section is split into five dedicated sub-panels (Listener &
+  TLS, Caches, Limits, Logging, Config DB sync), each with
+  grouped forms, `🔁` restart-required badging, and monospace
+  `from DGP_X_Y` chips on env-var-owned fields.
+- **IAM source-of-truth banner** (`IamSourceBanner`) — surfaced
+  on every Access sub-panel: explains in plain English whether
+  the listed users/groups/providers are DB-managed (iam_mode:
+  gui) or read-only because YAML owns the state (iam_mode:
+  declarative).
+- **AntD 6 shrink fix** — `theme.css` overrides the AntD 6
+  radio/checkbox "shrink on click" default that was breaking
+  Wave 4's match-action radio groups.
 
 ### Bug fixes / correctness
 
@@ -125,12 +166,36 @@ come next.
   sectioned), so typos inside a sectioned doc report section-
   scoped errors rather than "unknown variant" from a fallback
   parse.
+- **Section PUT is RFC 7396 merge-patch** (post-tag regression
+  fix from live-browser verification). The first cut of
+  `PUT /api/admin/config/section/:name` replaced the whole
+  section — a PUT with `{max_delta_ratio: 0.42}` silently reset
+  `cache_size_mb`, `listen_addr`, and `log_level` to their
+  compile-time defaults. Now: present keys apply in place;
+  absent keys preserve the current value; explicit `null`
+  reverts to the default; array fields (e.g.
+  `admission.blocks`) stay atomic. Three regression tests lock
+  this in.
+- **`advanced.log_level` from YAML applied at startup** (post-
+  tag fix). `init_tracing` previously read only from RUST_LOG
+  and DGP_LOG_LEVEL env vars, silently ignoring the YAML value;
+  runtime always ran at `debug` default unless env was set.
+  Now: RUST_LOG > DGP_LOG_LEVEL > config.log_level > --verbose
+  > default. Env-driven deployments (Docker + K8s) keep their
+  semantics exactly.
+- **Legacy admin URLs canonicalise in the browser bar** (post-
+  tag fix). Bookmarked v0.7.x URLs like `/_/admin/users`
+  resolved correctly but left the address bar on the legacy
+  form, spreading the old shape through copy/paste. A
+  `useEffect` in `AdminPage` now swaps in the canonical
+  hierarchical URL via `navigate(..., replace=true)` without
+  adding a history entry.
 
 ### Dependencies
 
 Frontend: `monaco-editor`, `monaco-yaml`, `react-hook-form`, `zod`,
 `@hookform/resolvers`, `@dnd-kit/core` + `sortable` + `utilities`
-(§4.2–§4.4). Backend: `serde_yml`, `schemars`.
+(§4.2–§4.4). Backend: `serde_yaml`, `schemars`, `ipnet`, `globset`.
 
 ### Breaking changes
 
