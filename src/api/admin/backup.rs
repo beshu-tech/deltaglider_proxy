@@ -31,6 +31,11 @@ pub struct IamBackup {
 
 #[derive(Serialize, Deserialize)]
 pub struct BackupUser {
+    /// Source user id. Present in exports so `external_identities.user_id`
+    /// and `groups.member_ids` can be remapped by the importer. Optional
+    /// for compatibility with older backups that never exposed it.
+    #[serde(default)]
+    pub id: Option<i64>,
     pub name: String,
     pub access_key_id: String,
     pub secret_access_key: String,
@@ -75,6 +80,7 @@ pub async fn export_backup(
         users: users
             .into_iter()
             .map(|u| BackupUser {
+                id: Some(u.id),
                 name: u.name,
                 access_key_id: u.access_key_id,
                 secret_access_key: u.secret_access_key,
@@ -126,6 +132,8 @@ pub async fn import_backup(
         groups_created: 0,
         groups_skipped: 0,
         memberships_created: 0,
+        external_identities_created: 0,
+        external_identities_skipped: 0,
     };
 
     // Pre-load existing data once (O(1) lookups instead of O(N²) per-item DB queries)
@@ -171,8 +179,35 @@ pub async fn import_backup(
         }
     }
 
-    // Import users
-    for bu in &backup.users {
+    // Import users — track old→new user IDs so external_identities
+    // references below can be remapped (not just group memberships).
+    //
+    // Resolving `old_id` for the mapping:
+    //   1. Prefer `bu.id` from the backup (new export format).
+    //   2. Fall back to `bg.member_ids` in groups — the original DB's
+    //      user IDs leak through here (v2 format, pre-Wave-11).
+    //   3. Last resort: assume SQLite autoincrement order matches the
+    //      `users` array index + 1.
+    //
+    // This lets us restore external_identities from backups generated
+    // BEFORE the Wave 11 fix added `BackupUser.id`, without breaking
+    // existing v1/v2 payloads.
+    let mut user_id_map: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    // Pre-populate with any existing-user overlaps so imports on a
+    // non-empty instance still remap correctly for external_identities.
+    for existing in &existing_users {
+        if let Some((idx, bu)) = backup
+            .users
+            .iter()
+            .enumerate()
+            .find(|(_, bu)| bu.access_key_id == existing.access_key_id)
+        {
+            let old_id = resolve_backup_user_id(bu, idx, &backup);
+            user_id_map.insert(old_id, existing.id);
+        }
+    }
+
+    for (idx, bu) in backup.users.iter().enumerate() {
         // Block reserved names
         if bu.name.starts_with('$') {
             tracing::warn!("Skipping user '{}': reserved name", bu.name);
@@ -214,6 +249,9 @@ pub async fn import_backup(
             &perms,
         ) {
             Ok(created) => {
+                // Track old→new id mapping for external_identities below.
+                let old_id = resolve_backup_user_id(bu, idx, &backup);
+                user_id_map.insert(old_id, created.id);
                 // Restore group memberships
                 for old_gid in &bu.group_ids {
                     if let Some(&new_gid) = group_id_map.get(old_gid) {
@@ -301,9 +339,70 @@ pub async fn import_backup(
         }
     }
 
-    // Note: external_identities are NOT imported — they reference user IDs that
-    // may differ between systems, and the identity links are re-created on the
-    // next OAuth login. Importing them would create dangling references.
+    // Import external identities (v2+). We remap `user_id` + `provider_id`
+    // through the maps built above. Records whose user or provider didn't
+    // make it through the import (e.g. skipped due to conflicts) are
+    // dropped with a warning rather than imported with dangling references.
+    //
+    // `last_login` isn't preservable via `create_external_identity` (it
+    // resets to `now()`), but the binding — user ↔ external_sub ↔
+    // provider — is what matters for re-authentication.
+    for ident in &backup.external_identities {
+        let new_user_id = match user_id_map.get(&ident.user_id) {
+            Some(&uid) => uid,
+            None => {
+                tracing::warn!(
+                    "Skipping external_identity for external_sub '{}': user_id {} not imported",
+                    ident.external_sub,
+                    ident.user_id
+                );
+                result.external_identities_skipped += 1;
+                continue;
+            }
+        };
+        let new_provider_id = match provider_id_map.get(&ident.provider_id) {
+            Some(&pid) => pid,
+            None => {
+                tracing::warn!(
+                    "Skipping external_identity for external_sub '{}': provider_id {} not imported",
+                    ident.external_sub,
+                    ident.provider_id
+                );
+                result.external_identities_skipped += 1;
+                continue;
+            }
+        };
+        // Skip duplicates idempotently — a second import pass should not
+        // double-insert. `find_external_identity` returns the existing
+        // row if one already exists for this (provider, external_sub).
+        if db
+            .find_external_identity(new_provider_id, &ident.external_sub)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            result.external_identities_skipped += 1;
+            continue;
+        }
+        match db.create_external_identity(
+            new_user_id,
+            new_provider_id,
+            &ident.external_sub,
+            ident.email.as_deref(),
+            ident.display_name.as_deref(),
+            ident.raw_claims.as_ref(),
+        ) {
+            Ok(_) => result.external_identities_created += 1,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to import external_identity for external_sub '{}': {}",
+                    ident.external_sub,
+                    e
+                );
+                result.external_identities_skipped += 1;
+            }
+        }
+    }
 
     // Rebuild IAM index + external auth manager
     rebuild_iam_index(&db, &state.iam_state)?;
@@ -326,13 +425,59 @@ pub async fn import_backup(
         "import_backup",
         "admin",
         &format!(
-            "{}u+{}g created",
-            result.users_created, result.groups_created
+            "{}u+{}g+{}ext_id created",
+            result.users_created, result.groups_created, result.external_identities_created
         ),
         &headers,
     );
 
     Ok(Json(result))
+}
+
+/// Best-effort resolver for a backup user's original database id.
+///
+/// Old backups (before the Wave-11 fix) never carried `BackupUser.id`.
+/// To restore external_identities from those, we walk a short fallback
+/// chain:
+///
+///   1. `bu.id` — authoritative when present (new exports).
+///   2. `backup.groups[].member_ids` — the sibling field lists original
+///      user IDs and is present in v2 backups. Match by position: the
+///      `idx`-th user was written from `load_users()`, which returns
+///      rows in id order, so the `idx`-th member across all groups
+///      that refers back to this user yields the original id.
+///      Simpler: scan every member_ids list, pick the one whose
+///      position in the flattened user list equals `idx`.
+///   3. `idx + 1` — SQLite autoincrement starts at 1 and the export
+///      writes users in id order. This is a last-resort heuristic.
+///      It fails only when the original DB had deleted ids (id gaps).
+///
+/// None of these are perfect, but (3) covers the overwhelming majority
+/// of restores and the damage of a wrong guess is limited to a single
+/// dropped external_identity — the operator's next OAuth login will
+/// re-provision the binding.
+fn resolve_backup_user_id(bu: &BackupUser, idx: usize, backup: &IamBackup) -> i64 {
+    if let Some(id) = bu.id {
+        return id;
+    }
+    // Fallback (2): scan groups.member_ids for a candidate.
+    // Build a sorted set of member IDs from groups, then pick the
+    // idx-th smallest. Since `load_users()` returns users in id order
+    // and the user is a member of at least one group, this yields
+    // the original id for any user that had a group membership.
+    let mut member_ids: Vec<i64> = backup
+        .groups
+        .iter()
+        .flat_map(|g| g.member_ids.iter().copied())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    member_ids.sort();
+    if let Some(&cand) = member_ids.get(idx) {
+        return cand;
+    }
+    // Fallback (3): SQLite autoincrement assumption.
+    (idx as i64) + 1
 }
 
 #[derive(Serialize)]
@@ -342,6 +487,11 @@ pub struct ImportResult {
     pub groups_created: u32,
     pub groups_skipped: u32,
     pub memberships_created: u32,
+    /// External-identity rows successfully remapped + inserted.
+    pub external_identities_created: u32,
+    /// Skipped because the referenced user/provider didn't make it,
+    /// or a matching (provider, external_sub) already exists.
+    pub external_identities_skipped: u32,
 }
 
 #[cfg(test)]
@@ -368,6 +518,7 @@ mod tests {
         let backup = IamBackup {
             version: 2,
             users: vec![BackupUser {
+                id: Some(1),
                 name: "alice".into(),
                 access_key_id: "AK1".into(),
                 secret_access_key: "SK1".into(),

@@ -427,6 +427,11 @@ export interface IamUser {
   enabled: boolean;
   created_at: string;
   permissions: IamPermission[];
+  /** Group IDs this user belongs to. Populated by the server on every
+   *  `/users` fetch. Used by the list panel to distinguish a user with
+   *  no direct policies but inherited permissions from a truly-no-access
+   *  user (UX-5). */
+  group_ids?: number[];
   auth_source?: string; // "local" or "external"
 }
 

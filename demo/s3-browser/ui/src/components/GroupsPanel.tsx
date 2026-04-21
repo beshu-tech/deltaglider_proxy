@@ -91,7 +91,21 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
     setCreating(true);
   };
 
-  const handleSaved = () => { loadData(); };
+  /**
+   * Wave 11 post-manual-review fix (UX-1):
+   * After a successful create, flip out of "creating" mode so the form
+   * doesn't keep its stale fields visible. If the caller supplies the
+   * new group's id, select it so the operator immediately lands on the
+   * Edit view for the thing they just made. That pattern matches the
+   * UsersPanel post-create flow.
+   */
+  const handleSaved = (createdId?: number) => {
+    loadData();
+    if (creating) {
+      setCreating(false);
+      if (createdId !== undefined) setSelectedId(createdId);
+    }
+  };
 
   const handleDeleted = () => {
     setSelectedId(null);
@@ -252,7 +266,9 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
 interface GroupFormProps {
   group: IamGroup | null;
   users: IamUser[];
-  onSaved: () => void;
+  /** Invoked on successful save. The `createdId` is supplied only on
+   *  create (not edit) so the parent can select the new row. */
+  onSaved: (createdId?: number) => void;
   onDeleted?: () => void;
   onCancel?: () => void;
   onSavingChange?: (saving: boolean) => void;
@@ -322,6 +338,8 @@ function GroupForm({ group, users, onSaved, onDeleted, onCancel, onSavingChange 
         for (const uid of memberIds) {
           await addGroupMember(created.id, uid);
         }
+        onSaved(created.id);
+        return;
       }
       onSaved();
     } catch (e) {

@@ -344,9 +344,30 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
           onClick={async () => {
             if (groups.length === 0) { message.warning('Create a group first'); return; }
             try {
+              // Flush any pending local edits before creating + reloading.
+              // Otherwise `loadData()` overwrites in-memory `rules` with
+              // the server snapshot and silently drops the operator's
+              // unsaved edits on the previous rows.
+              if (rulesDirty) {
+                for (const rule of rules) {
+                  await updateMappingRule(rule.id, {
+                    match_type: rule.match_type,
+                    match_field: rule.match_field,
+                    match_value: rule.match_value,
+                    group_id: rule.group_id,
+                    provider_id: rule.provider_id,
+                    priority: rule.priority,
+                  });
+                }
+                setRulesDirty(false);
+              }
               await createMappingRule({
+                // New rules start empty — the placeholder shows the
+                // syntax hint. Writing a default literal would force
+                // the operator to always select-all + delete before
+                // typing their own value.
                 match_type: 'email_glob',
-                match_value: '*@example.com',
+                match_value: '',
                 group_id: groups[0].id,
               });
               await loadData();

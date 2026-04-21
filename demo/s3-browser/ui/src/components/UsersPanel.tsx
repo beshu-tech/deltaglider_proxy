@@ -11,14 +11,28 @@ import IamSourceBanner from './IamSourceBanner';
 const { Text } = Typography;
 
 function permissionSummary(user: IamUser): string | null {
+  const groupCount = user.group_ids?.length ?? 0;
   if (user.permissions.length === 0) {
     // SSO users with no direct rules get permissions from groups — don't show
     // a confusing label; the SSO badge and detail panel are enough context.
-    return user.auth_source === 'external' ? null : 'No access';
+    if (user.auth_source === 'external') return null;
+    // Wave 11 post-manual-review fix (UX-5): a user with group memberships
+    // but no direct rules effectively HAS access (inherited); labelling
+    // that "No access" was misleading new admins. Surface the inheritance
+    // instead. The editor's "EFFECTIVE PERMISSIONS (X DIRECT + Y INHERITED)"
+    // breakdown gives the full story on drill-down.
+    if (groupCount > 0) {
+      return `${groupCount} group${groupCount !== 1 ? 's' : ''} (inherited)`;
+    }
+    return 'No access';
   }
   const hasAll = user.permissions.some(p => p.actions.includes('*') && p.resources.includes('*'));
   if (hasAll) return 'Full admin';
-  return `${user.permissions.length} rule${user.permissions.length !== 1 ? 's' : ''}`;
+  const rulePart = `${user.permissions.length} rule${user.permissions.length !== 1 ? 's' : ''}`;
+  if (groupCount > 0) {
+    return `${rulePart} · ${groupCount} group${groupCount !== 1 ? 's' : ''}`;
+  }
+  return rulePart;
 }
 
 interface UsersPanelProps {
