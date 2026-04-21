@@ -1,5 +1,6 @@
 //! Admin GUI API handlers (separate from S3 SigV4 auth).
 
+mod audit;
 mod auth;
 pub(crate) mod backends;
 mod backup;
@@ -24,6 +25,7 @@ use crate::session::SessionStore;
 use crate::usage_scanner::UsageScanner;
 
 // Re-export everything so external code doesn't need import changes.
+pub use audit::get_audit;
 pub use auth::{
     check_session, clear_s3_session_creds, get_s3_session_creds, login, login_as, logout,
     require_not_declarative, require_session, set_s3_session_creds, whoami, LoginAsRequest,

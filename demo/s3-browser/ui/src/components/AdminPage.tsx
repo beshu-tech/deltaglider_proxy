@@ -33,6 +33,7 @@ import BucketsPanel from './BucketsPanel';
 import CopySectionYamlButton from './CopySectionYamlButton';
 import SetupWizard from './SetupWizard';
 import TracePanel from './TracePanel';
+import AuditLogPanel from './AuditLogPanel';
 import CommandPalette, {
   FileTextOutlined as PaletteFileTextOutlined,
   ImportOutlined as PaletteImportOutlined,
@@ -152,6 +153,11 @@ const PAGE_HEADERS: Record<string, { icon: React.ReactNode; title: string; descr
     icon: <ExperimentOutlined />,
     title: 'Admission trace',
     description: 'Evaluate a synthetic request against the current admission chain. See which block fires and why.',
+  },
+  'diagnostics/audit': {
+    icon: <FileTextOutlined />,
+    title: 'Audit log',
+    description: 'Recent authentication + mutation events from this process (in-memory ring, default 500 entries). Stdout remains authoritative for long-term audit.',
   },
   'configuration/admission': {
     icon: <SecurityScanOutlined />,
@@ -515,6 +521,14 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
         <>
           {header}
           <TracePanel onSessionExpired={onSessionExpired} />
+        </>
+      );
+    }
+    if (adminPath === 'diagnostics/audit') {
+      return (
+        <>
+          {header}
+          <AuditLogPanel onSessionExpired={onSessionExpired} />
         </>
       );
     }

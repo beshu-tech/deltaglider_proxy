@@ -44,6 +44,7 @@ import { useEffect, useState } from 'react';
 import {
   DashboardOutlined,
   ExperimentOutlined,
+  FileTextOutlined,
   SecurityScanOutlined,
   TeamOutlined,
   SafetyOutlined,
@@ -98,6 +99,13 @@ export const ADMIN_IA: Array<{ group: string; entries: SidebarEntry[] }> = [
         path: 'diagnostics/trace',
         label: 'Trace',
         icon: <ExperimentOutlined />,
+      },
+      {
+        // Wave 11: in-memory audit log viewer. Read-only; backs
+        // onto the server-side ring buffer in src/audit.rs.
+        path: 'diagnostics/audit',
+        label: 'Audit log',
+        icon: <FileTextOutlined />,
       },
     ],
   },

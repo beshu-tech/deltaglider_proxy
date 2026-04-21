@@ -166,6 +166,12 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         // Usage scanner
         .route("/_/api/admin/usage/scan", post(admin::scan_usage))
         .route("/_/api/admin/usage", get(admin::get_usage))
+        // Audit log viewer — recent ring of structured audit entries.
+        // Read-only; no corresponding mutation route. Session-gated
+        // via the surrounding `require_session` layer. Not IAM-gated
+        // (all admins see the same log so there's no per-identity
+        // filtering to do at this layer).
+        .route("/_/api/admin/audit", get(admin::get_audit))
         // Merge the IAM-gated subrouter in; it already carries its own
         // `require_not_declarative` layer. Both subrouters share the
         // outer `require_session`.
