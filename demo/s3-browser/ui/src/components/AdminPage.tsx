@@ -30,6 +30,7 @@ import AdmissionPanel from './AdmissionPanel';
 import CredentialsModePanel from './CredentialsModePanel';
 import BucketsPanel from './BucketsPanel';
 import RightRailActions from './RightRailActions';
+import SetupWizard from './SetupWizard';
 import {
   ListenerTlsPanel,
   CachesPanel,
@@ -95,8 +96,12 @@ function resolveAdminPath(subPath: string): string {
     const remaining = path.slice(firstSegment.length);
     return LEGACY_TO_NEW[firstSegment] + remaining;
   }
-  // Already a new-scheme path
-  if (path.startsWith('diagnostics/') || path.startsWith('configuration/')) {
+  // Already a new-scheme path (including the standalone `setup` route).
+  if (
+    path.startsWith('diagnostics/') ||
+    path.startsWith('configuration/') ||
+    path === 'setup'
+  ) {
     return path;
   }
   return 'diagnostics/dashboard';
@@ -331,6 +336,18 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
     const header = meta ? (
       <TabHeader icon={meta.icon} title={meta.title} description={meta.description} />
     ) : null;
+
+    // First-run wizard (Wave 8). Reachable explicitly via
+    // /_/admin/setup. Surface-wise it is its own full-page flow
+    // with its own hero — no TabHeader needed.
+    if (adminPath === 'setup') {
+      return (
+        <SetupWizard
+          onComplete={() => navigateAdmin('diagnostics/dashboard')}
+          onCancel={() => navigateAdmin('diagnostics/dashboard')}
+        />
+      );
+    }
 
     // Diagnostics
     if (adminPath === 'diagnostics/dashboard') {
