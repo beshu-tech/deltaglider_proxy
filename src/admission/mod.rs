@@ -83,11 +83,11 @@ pub struct AdmissionBlock {
 
 /// Predicate side of an admission block. Two variants today:
 ///
-/// - [`Match::PublicPrefixGrant`] — synthesised from bucket policies
-///   (Phase 2 behavior, unchanged).
+/// - [`Match::PublicPrefixGrant`] — synthesised from the per-bucket
+///   `public_prefixes` field (`BucketPolicyConfig::public_prefixes`).
 /// - [`Match::Predicates`] — operator-authored compound predicate, the
-///   AND of every `Some(_)` field. Phase 3b.2.b compiles
-///   [`crate::admission::MatchSpec`] into this at chain-build time.
+///   AND of every `Some(_)` field. Compiled from
+///   [`crate::admission::MatchSpec`] at chain-build time.
 ///
 /// The evaluator dispatches both via explicit arms — no wildcard,
 /// because adding variants should force reviewers to look at every
@@ -125,21 +125,22 @@ pub struct Predicates {
     /// Fire only on authenticated / unauthenticated requests. `None`
     /// = either.
     pub authenticated: Option<bool>,
-    /// Reserved for a future `config_flag` predicate — Phase 3b.2.b
-    /// carries the name but always evaluates false until a flag
-    /// registry exists. Warn is logged at build time.
+    /// Named config-flag predicate. The name is preserved through
+    /// load + chain build, but the evaluator currently returns false
+    /// for every flag (the flag registry lands with the Phase 3b.2.c
+    /// rate-limit work). A `tracing::warn!` fires per block at
+    /// build time so operators see the gap.
     pub config_flag: Option<String>,
 }
 
 /// Decision side of an admission block.
 ///
-/// - [`Action::AllowAnonymous`] / [`Action::Continue`] — Phase 2
-///   behaviour, unchanged.
-/// - [`Action::Deny`] — new in Phase 3b.2.b. Short-circuits the
-///   middleware with 403 Forbidden, no SigV4 verification.
-/// - [`Action::Reject`] — new in Phase 3b.2.b. Short-circuits with a
-///   custom 4xx/5xx status and optional body. Intended for
-///   maintenance pages and rate-exceed responses.
+/// - [`Action::AllowAnonymous`] — pre-admit as `$anonymous`, skip SigV4.
+/// - [`Action::Continue`] — fall through to SigV4 (default terminal).
+/// - [`Action::Deny`] — short-circuit with 403 Forbidden; no SigV4.
+/// - [`Action::Reject`] — short-circuit with a custom 4xx/5xx status
+///   and optional body. Intended for maintenance pages and rate-
+///   exceed responses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "action")]
 pub enum Action {
@@ -204,14 +205,19 @@ impl AdmissionChain {
     /// trace output and audit logs don't depend on `BTreeMap` insertion
     /// order — they already are, since the field is `BTreeMap`, but the
     /// sort makes the property explicit.
-    pub fn from_bucket_config(
+    ///
+    /// Test-only helper: production code goes through
+    /// [`build_shared_chain_from_parts`] to include operator-authored
+    /// admission blocks.
+    #[cfg(test)]
+    pub(crate) fn from_bucket_config(
         buckets: &std::collections::BTreeMap<String, crate::bucket_policy::BucketPolicyConfig>,
     ) -> Self {
         Self::from_config_parts(buckets, &[])
     }
 
     /// Build a chain from live bucket policies AND operator-authored
-    /// admission blocks (Phase 3b.2.b live dispatch).
+    /// admission blocks. Both contribute to live dispatch.
     ///
     /// Order semantics:
     ///
@@ -372,9 +378,12 @@ fn compile_block(spec: &crate::admission::AdmissionBlockSpec) -> Result<Admissio
         }
     };
 
-    // Warn on unknown config_flag — validates Phase 3b.2.b's remaining
-    // schema gap (adversarial review M1). Phase 3b.2.c will maintain
-    // a real flag registry.
+    // Warn on unknown config_flag names. The `maintenance_mode` flag
+    // is the only name parsed without a warning today; dispatching it
+    // against live server state lands with Phase 3b.2.c's flag
+    // registry (until then, every config_flag predicate evaluates
+    // false at request time — see `match_predicates` in the
+    // evaluator).
     if let Some(flag) = &predicates.config_flag {
         if flag != "maintenance_mode" {
             tracing::warn!(
@@ -401,21 +410,9 @@ fn compile_block(spec: &crate::admission::AdmissionBlockSpec) -> Result<Admissio
 /// the whole chain via `store()` on config change.
 pub type SharedAdmissionChain = std::sync::Arc<arc_swap::ArcSwap<AdmissionChain>>;
 
-/// Build a [`SharedAdmissionChain`] from a bucket-config map. Convenience
-/// wrapper used at startup and on every hot-reload site.
-///
-/// Deprecated in favor of [`build_shared_chain_from_parts`], which
-/// accepts operator-authored blocks too. Kept for any callers that
-/// predate Phase 3b.2.a.
-pub fn build_shared_chain(
-    buckets: &std::collections::BTreeMap<String, crate::bucket_policy::BucketPolicyConfig>,
-) -> SharedAdmissionChain {
-    build_shared_chain_from_parts(buckets, &[])
-}
-
-/// Build a [`SharedAdmissionChain`] from bucket policies AND
-/// operator-authored admission blocks. See [`AdmissionChain::from_config_parts`]
-/// for the Phase 3b.2.a behavior (warn-and-ignore until 3b.2.b lands).
+/// Build a [`SharedAdmissionChain`] from bucket policies + operator-
+/// authored admission blocks. See [`AdmissionChain::from_config_parts`]
+/// for chain-build behavior (ordering, compile errors, warnings).
 pub fn build_shared_chain_from_parts(
     buckets: &std::collections::BTreeMap<String, crate::bucket_policy::BucketPolicyConfig>,
     operator_blocks: &[crate::admission::AdmissionBlockSpec],

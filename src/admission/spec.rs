@@ -1,25 +1,21 @@
-//! Operator-authored admission block wire format (Phase 3b.2.a).
+//! Operator-authored admission block wire format.
 //!
 //! This module is the **YAML-facing** layer for the admission chain.
 //! It defines the serde shapes an operator writes in their config file
-//! (or POSTs to `/api/admin/config/apply`), and nothing else. It does
-//! NOT run the evaluator — that lives in [`crate::admission::evaluator`]
-//! against the existing in-memory enums in [`crate::admission`].
+//! (or POSTs to `/api/admin/config/apply`). The runtime enums
+//! ([`crate::admission::Match`] / [`crate::admission::Action`]) and
+//! the evaluator ([`crate::admission::evaluator`]) live separately —
+//! [`crate::admission::AdmissionChain::from_config_parts`] compiles
+//! [`AdmissionBlockSpec`] values into the runtime form on every chain
+//! build.
 //!
 //! # Why separate from the runtime enums?
 //!
-//! The runtime [`crate::admission::Match`] and [`crate::admission::Action`]
-//! are narrow: Phase 2 shipped them with exactly the variants the
-//! evaluator emits today (`PublicPrefixGrant`, `AllowAnonymous`,
-//! `Continue`). Growing them requires updating the evaluator, the
-//! middleware, and the trace endpoint in lock-step — one concern per
-//! commit.
-//!
-//! Phase 3b.2.a opens the YAML door so GitOps authors can START writing
-//! block specs that survive `/apply` → `/export` round-trip. Phase 3b.2.b
-//! will teach the evaluator to honor them. Until then, operator-
-//! authored blocks DESERIALIZE cleanly but do NOT fire — the chain
-//! builder ignores them with an INFO log so the operator sees the gap.
+//! The runtime enums are narrow by design: each new predicate or action
+//! requires updating the evaluator, the middleware, and the trace
+//! endpoint in lock-step. Keeping the serde shape in its own module
+//! lets the wire format grow optional fields without forcing a
+//! coordinated runtime change.
 //!
 //! # Wire format
 //!
@@ -130,10 +126,12 @@ pub struct MatchSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authenticated: Option<bool>,
 
-    /// Fire only while a named config flag is true. Today the only
-    /// recognised flag is `"maintenance_mode"` (reads from
-    /// `Config::maintenance_mode` when Phase 3b.2.b introduces it).
-    /// Unrecognised flags always evaluate false with a warning.
+    /// Fire only while a named config flag is true. The flag registry
+    /// is not yet live (the `maintenance_mode` flag is recognised by
+    /// the compile step but always evaluates false at runtime — a
+    /// warning fires at chain-build time so operators see the gap).
+    /// Unrecognised flag names fire a separate per-block warning.
+    /// Full dispatch lands with the Phase 3b.2.c rate-limit work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_flag: Option<String>,
 }
@@ -150,8 +148,8 @@ pub struct MatchSpec {
 #[derive(Debug, Clone)]
 pub struct SourceIpEntry {
     /// Parsed network (bare IPs promoted to /32 or /128 for uniform
-    /// evaluator dispatch). Public so Phase 3b.2.b's evaluator can
-    /// match against it directly.
+    /// evaluator dispatch). Public so the evaluator can match
+    /// against it directly without re-parsing.
     pub net: IpNet,
     /// Operator's authored string, re-emitted verbatim on serialize.
     /// Preserves `/32` vs bare, case in IPv6, etc.
@@ -219,9 +217,9 @@ impl schemars::JsonSchema for SourceIpEntry {
 
 /// Action variants operators author. Mirrors the runtime
 /// [`crate::admission::Action`] but with operator-provided configuration
-/// (status code, message, etc.). The chain builder translates this
-/// into the runtime form; variants the evaluator can't yet dispatch
-/// are logged at INFO and skipped (Phase 3b.2.b turns that off).
+/// (status code, message). The chain builder translates this into
+/// the runtime form via
+/// [`crate::admission::AdmissionChain::from_config_parts`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case", untagged)]
 pub enum ActionSpec {

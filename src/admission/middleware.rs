@@ -1,7 +1,7 @@
 //! Axum middleware that evaluates the admission chain and annotates the
 //! request with the decision for downstream layers.
 //!
-//! Runs **before** SigV4. Phase 3b.2.b expanded responsibilities:
+//! Runs **before** SigV4. Four decision paths:
 //!
 //! - `AllowAnonymous` decisions insert [`AdmissionAllowAnonymous`] into
 //!   request extensions so SigV4 can skip verification and continue as
@@ -152,70 +152,105 @@ fn s3_style_error(status: StatusCode, code: &str, message: &str) -> Response {
 /// wired through. Admission's policy on missing IP is documented on
 /// [`RequestInfo::source_ip`]: fail-closed.
 fn extract_request_info(request: &Request<Body>) -> OwnedRequestInfo {
-    let method = request.method().as_str();
-    let raw_path = request.uri().path();
-    let trimmed = raw_path.trim_start_matches('/');
-    let (bucket_str, key_str) = match trimmed.split_once('/') {
-        Some((b, k)) => (b.to_string(), percent_decode(k)),
-        None => (trimmed.to_string(), String::new()),
-    };
-    let bucket_lower = bucket_str.to_ascii_lowercase();
     let query_string = request.uri().query().unwrap_or("");
-    let list_prefix = query_string
-        .split('&')
-        .find_map(|pair| {
-            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-            if k == "prefix" {
-                Some(percent_decode(v))
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
     let authenticated =
         request.headers().contains_key("authorization") || has_presigned_query_params(query_string);
 
     // Extract source IP. Primary source is axum `ConnectInfo` (wired in
     // `main.rs` via `into_make_service_with_connect_info`). Fallback is
     // the rate limiter's X-Forwarded-For / X-Real-IP parser, gated on
-    // `DGP_TRUST_PROXY_HEADERS`.
-    //
-    // Both paths pass the IP through `normalize_ip` which collapses
-    // IPv4-mapped IPv6 (`::ffff:a.b.c.d`) to the plain IPv4 form.
-    // Without this, a dual-stack kernel returning a mapped V6 address
-    // for an IPv4 client would cause an operator's `203.0.113.0/24`
-    // deny rule to miss the client entirely.
+    // `DGP_TRUST_PROXY_HEADERS`. Both paths pass the IP through
+    // `normalize_ip`; see `OwnedRequestInfo::from_raw` for the
+    // IPv4-mapped-IPv6 rationale.
     let source_ip = request
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         .map(|ci| ci.0.ip())
-        .or_else(|| crate::rate_limiter::extract_client_ip(request.headers()))
-        .map(crate::rate_limiter::normalize_ip);
+        .or_else(|| crate::rate_limiter::extract_client_ip(request.headers()));
 
-    OwnedRequestInfo {
-        method: method.to_string(),
-        bucket: bucket_lower,
-        key: key_str,
-        list_prefix,
+    OwnedRequestInfo::from_raw(
+        request.method().as_str(),
+        request.uri().path(),
+        query_string,
         authenticated,
         source_ip,
-    }
+    )
 }
 
 /// Owned version of `RequestInfo` that carries its own strings so the
 /// middleware can compute them from the request and still hand a borrow-
 /// compatible `RequestInfo` to the evaluator.
-struct OwnedRequestInfo {
-    method: String,
-    bucket: String,
-    key: String,
-    list_prefix: String,
-    authenticated: bool,
-    source_ip: Option<std::net::IpAddr>,
+///
+/// Built via [`OwnedRequestInfo::from_raw`] — shared between the live
+/// HTTP path (`extract_request_info`) and the admin `/config/trace`
+/// endpoint's synthetic-request builder. Keeping one parsing entry
+/// point guarantees the trace handler and the middleware agree on
+/// bucket/key extraction, case folding, percent decoding, and IP
+/// normalisation.
+pub(crate) struct OwnedRequestInfo {
+    pub(crate) method: String,
+    pub(crate) bucket: String,
+    pub(crate) key: String,
+    pub(crate) list_prefix: String,
+    pub(crate) authenticated: bool,
+    pub(crate) source_ip: Option<std::net::IpAddr>,
 }
 
 impl OwnedRequestInfo {
-    fn as_ref(&self) -> RequestInfo<'_> {
+    /// Build an `OwnedRequestInfo` from already-extracted raw inputs.
+    ///
+    /// - `method` — uppercased via `to_ascii_uppercase`.
+    /// - `path` — leading `/` trimmed; `bucket/key` split on the
+    ///   first remaining `/`; bucket lowercased; key percent-decoded.
+    /// - `query` — accepts both `?prefix=…` and bare `prefix=…`;
+    ///   `prefix` value is percent-decoded.
+    /// - `authenticated` — caller's responsibility to determine
+    ///   (Authorization header or presigned query param for the
+    ///   HTTP path; explicit body field for trace).
+    /// - `source_ip` — passed through `rate_limiter::normalize_ip`
+    ///   which collapses IPv4-mapped IPv6 (`::ffff:a.b.c.d`) to the
+    ///   plain V4 form. Without this a dual-stack kernel returning
+    ///   a mapped V6 address for an IPv4 client would cause an
+    ///   operator's `203.0.113.0/24` deny rule to miss.
+    pub(crate) fn from_raw(
+        method: &str,
+        path: &str,
+        query: &str,
+        authenticated: bool,
+        source_ip: Option<std::net::IpAddr>,
+    ) -> Self {
+        let trimmed_path = path.trim_start_matches('/');
+        let (bucket_raw, key_raw) = match trimmed_path.split_once('/') {
+            Some((b, k)) => (b.to_string(), percent_decode(k)),
+            None => (trimmed_path.to_string(), String::new()),
+        };
+
+        // Tolerate a leading `?` on the query, matching the trace
+        // endpoint's operator-convenience behavior.
+        let query_trimmed = query.strip_prefix('?').unwrap_or(query);
+        let list_prefix = query_trimmed
+            .split('&')
+            .find_map(|pair| {
+                let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+                if k == "prefix" {
+                    Some(percent_decode(v))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+
+        OwnedRequestInfo {
+            method: method.to_ascii_uppercase(),
+            bucket: bucket_raw.to_ascii_lowercase(),
+            key: key_raw,
+            list_prefix,
+            authenticated,
+            source_ip: source_ip.map(crate::rate_limiter::normalize_ip),
+        }
+    }
+
+    pub(crate) fn as_ref(&self) -> RequestInfo<'_> {
         RequestInfo {
             method: &self.method,
             bucket: &self.bucket,

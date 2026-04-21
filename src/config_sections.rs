@@ -32,15 +32,24 @@
 //! untagged-enum approach is the minimal amount of serde machinery that
 //! gets us BOTH shapes on read with a single in-memory target.
 //!
-//! # What's not here (Phase 3a scope bound)
+//! # Features layered on the section types
 //!
-//! - Shorthand deserializers (`storage: { s3: URL, ... }`) — Phase 3b.
-//! - `bucket: { public: true }` admission synthesis — Phase 3b.
-//! - `access.iam_mode` + reconciler — Phase 3c.
-//! - Group presets expanding to IAM JSON — Phase 3d.
+//! - Phase 3b.1: shorthand deserializers (`storage: { s3: URL, ... }` /
+//!   `{ filesystem: PATH, ... }`) + per-bucket `public: true` that
+//!   compiles to `public_prefixes: [""]`. See
+//!   [`StorageSection::normalize`] / [`crate::bucket_policy::BucketPolicyConfig::normalize`].
+//! - Phase 3b.2.a/b: operator-authored admission blocks
+//!   ([`AdmissionSection::blocks`]) with deny/reject/allow-anonymous
+//!   actions. The evaluator dispatches these live; see
+//!   [`crate::admission`].
+//! - Phase 3c.1/3c.2: `access.iam_mode: gui | declarative` toggle
+//!   gating admin-API IAM mutation routes; see [`IamMode`] and
+//!   [`crate::api::admin::auth::require_not_declarative`].
 //!
-//! The section types here intentionally mirror the current flat field layout
-//! one-for-one. They become the insertion point for the above features.
+//! Still pending:
+//! - Phase 3c.3: the reconciler (sync-diff DB ↔ YAML on apply when
+//!   mode is declarative).
+//! - Phase 3d: group presets expanding to IAM policy documents.
 
 use crate::bucket_policy::BucketPolicyConfig;
 use crate::config::{BackendConfig, DefaultsVersion, NamedBackendConfig, TlsConfig};
@@ -66,15 +75,16 @@ pub struct SectionedConfig {
     )]
     pub defaults_version: DefaultsVersion,
 
-    /// Admission-chain blocks. Phase 3a: always empty — the chain is
-    /// synthesized from `storage.buckets[*].public_prefixes`. Phase 3b
-    /// populates this with operator-authored blocks.
+    /// Admission-chain blocks. Operator-authored rules (deny / reject /
+    /// allow-anonymous) that fire BEFORE the synthesized public-prefix
+    /// blocks derived from `storage.buckets[*].public_prefixes`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admission: Option<AdmissionSection>,
 
-    /// Who can authenticate: SigV4 credentials, OAuth providers (DB-backed
-    /// in Phase 3a so this is just the legacy credential pair), IAM users
-    /// (Phase 3c).
+    /// Who can authenticate. Carries the legacy SigV4 credential pair,
+    /// the authentication-mode selector, and `iam_mode: gui | declarative`
+    /// (Phase 3c). OAuth providers and IAM users stay in the encrypted
+    /// DB until the Phase 3c.3 reconciler makes YAML authoritative.
     #[serde(default, skip_serializing_if = "is_access_default")]
     pub access: AccessSection,
 
@@ -87,26 +97,24 @@ pub struct SectionedConfig {
     pub advanced: AdvancedSection,
 }
 
-/// Admission chain authoring surface. Phase 3b.2.a populates this with
-/// the operator-facing wire format for admission blocks; the evaluator
-/// still relies on synthesised public-prefix blocks for the live
-/// request path (Phase 3b.2.b wires operator-authored blocks through).
+/// Admission chain authoring surface. Holds the operator-facing wire
+/// format for admission blocks; the evaluator dispatches these live
+/// (Phase 3b.2.b) AHEAD of the synthesised public-prefix blocks
+/// derived from `storage.buckets[*].public_prefixes`.
 ///
 /// An empty [`AdmissionSection`] (no `blocks:` field) round-trips as a
-/// default — the admission chain remains exclusively synthesised from
-/// bucket public_prefixes, as in Phase 2.
+/// default — the admission chain is then exclusively synthesised from
+/// bucket public_prefixes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(deny_unknown_fields)]
 pub struct AdmissionSection {
     /// Operator-authored admission blocks. Evaluated in order before
     /// the synthesised public-prefix blocks; first match wins (RRR
-    /// semantics).
-    ///
-    /// In Phase 3b.2.a these blocks deserialize cleanly and round-trip
-    /// through `/export` / `/apply`, but are **not** yet dispatched by
-    /// the evaluator. A warning is logged at chain-build time so
-    /// operators know the gap. Phase 3b.2.b removes the stub and wires
-    /// them through for real.
+    /// semantics). Supported actions: `allow-anonymous`, `deny`,
+    /// `reject { type: reject, status, message }`, `continue`.
+    /// See [`crate::admission::AdmissionBlockSpec`] for the full
+    /// match-predicate schema (method / source_ip_list / bucket /
+    /// path_glob / authenticated / config_flag).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocks: Vec<crate::admission::AdmissionBlockSpec>,
 }

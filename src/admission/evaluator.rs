@@ -129,8 +129,10 @@ fn match_predicates(p: &Predicates, req: &RequestInfo<'_>) -> bool {
         }
     }
     if p.config_flag.is_some() {
-        // Phase 3b.2.b carries the field but no flag registry exists
-        // yet — always evaluates false. See compile_block's warn.
+        // No flag registry exists yet — every config_flag predicate
+        // fails closed. The chain builder emits a `tracing::warn!`
+        // per block so operators see the gap. Live dispatch lands
+        // with the Phase 3b.2.c rate-limit work.
         return false;
     }
     true
@@ -543,8 +545,8 @@ mod tests {
     }
 
     #[test]
-    fn evaluator_config_flag_predicate_always_false_in_3b2b() {
-        // Phase 3b.2.b carries the field but no flag registry exists.
+    fn evaluator_config_flag_predicate_fails_closed_without_flag_registry() {
+        // No flag registry exists yet (lands with Phase 3b.2.c).
         // The predicate evaluates false, so the block never fires.
         use crate::admission::spec::{ActionSpec, AdmissionBlockSpec, MatchSpec, TaggedAction};
         let block = AdmissionBlockSpec {

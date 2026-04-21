@@ -415,18 +415,19 @@ pub struct Config {
     #[serde(default)]
     pub default_backend: Option<String>,
 
-    /// Operator-authored admission blocks (Phase 3b.2.a).
+    /// Operator-authored admission blocks.
     ///
-    /// Parsed from `admission.blocks:` in the sectioned YAML. The
-    /// evaluator continues to use synthesised public-prefix blocks from
-    /// `buckets:` in Phase 3b.2.a; Phase 3b.2.b will merge these
-    /// operator-authored blocks into the chain. Carrying them in the
-    /// flat `Config` guarantees round-trip preservation via
-    /// `from_yaml_str` → `to_canonical_yaml`.
+    /// Parsed from `admission.blocks:` in the sectioned YAML OR from
+    /// `admission_blocks:` at the root of a flat-shape YAML (both
+    /// shapes round-trip through `from_yaml_str` → `to_canonical_yaml`).
+    /// TOML loading carries the field as well, though
+    /// `admission_blocks:` typing is limited in TOML and operators
+    /// should prefer YAML for admission authoring.
     ///
-    /// **NOT in the flat TOML schema.** Legacy flat-shape YAML
-    /// (listen_addr: at root, etc.) does not accept this field —
-    /// admission blocks are sectioned-shape only.
+    /// The admission chain builder ([`crate::admission::AdmissionChain::from_config_parts`])
+    /// compiles these into runtime [`crate::admission::Match::Predicates`]
+    /// blocks that fire BEFORE the synthesised public-prefix blocks
+    /// derived from `buckets:`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub admission_blocks: Vec<crate::admission::AdmissionBlockSpec>,
 
@@ -827,18 +828,22 @@ impl Config {
     }
 
     /// Expand all shorthand forms in the loaded config into their
-    /// canonical representations. Called exactly once per load, after
-    /// deserialization, before the config is handed to any consumer.
+    /// canonical representations and run semantic validation that
+    /// can't live in the serde layer. Called exactly once per load,
+    /// after deserialization, before the config is handed to any
+    /// consumer.
     ///
-    /// Phase 3b.1 normalises per-bucket `public: true` into
-    /// `public_prefixes: [""]`. Phase 3b.2.a runs semantic validation
-    /// on operator-authored admission blocks (duplicate names, bad
-    /// Reject status, conflicting source_ip forms). Future shorthands
-    /// (group presets, etc.) plug in here.
+    /// Today this covers:
+    /// - per-bucket `public: true` → `public_prefixes: [""]`
+    ///   (the `BucketPolicyConfig::normalize` call).
+    /// - operator-authored admission-block validation (duplicate
+    ///   names, bad Reject status, conflicting `source_ip` forms,
+    ///   disallowed name charset).
     ///
     /// Returns an error when a shorthand conflicts with its canonical
-    /// form (e.g. `public: true` AND non-empty `public_prefixes:`). The
-    /// operator must resolve the ambiguity before the config is loadable.
+    /// form (e.g. `public: true` AND non-empty `public_prefixes:`)
+    /// or when a semantic check fails. Future shorthands (group
+    /// presets) plug in here.
     fn normalize_shorthands(&mut self) -> Result<(), ConfigError> {
         for (name, policy) in self.buckets.iter_mut() {
             policy

@@ -14,8 +14,6 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::api::auth::percent_decode;
-
 use super::super::AdminState;
 
 /// Synthetic request for the trace endpoint. Mirrors the fields the live
@@ -77,48 +75,33 @@ pub async fn trace_config(
 ) -> impl IntoResponse {
     let chain = state.admission_chain.load_full();
 
-    // Parse path the same way the middleware does: strip leading slash,
-    // split on the first '/'.
-    let trimmed = body.path.trim_start_matches('/');
-    let (bucket_raw, key_raw) = match trimmed.split_once('/') {
-        Some((b, k)) => (b.to_string(), k.to_string()),
-        None => (trimmed.to_string(), String::new()),
-    };
-    let bucket = bucket_raw.to_ascii_lowercase();
-    let key = if key_raw.is_empty() {
-        None
-    } else {
-        Some(percent_decode(&key_raw))
-    };
-
-    // Extract `?prefix=...` from the optional query string, tolerating both
-    // `?prefix=x` and `prefix=x`. Missing prefix = empty = bucket-level LIST.
-    let query = body.query.as_deref().unwrap_or("");
-    let query_trimmed = query.strip_prefix('?').unwrap_or(query);
-    let list_prefix = query_trimmed.split('&').find_map(|pair| {
-        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        if k == "prefix" {
-            Some(percent_decode(v))
-        } else {
-            None
-        }
-    });
-
-    // Method: uppercase for match-friendliness. HTTP method names are ASCII
-    // and case-insensitive on the wire (`GET` vs `get`); the evaluator
-    // compares against canonical uppercase so we normalise here.
-    let method = body.method.to_ascii_uppercase();
-
-    let req_info = crate::admission::RequestInfo {
-        method: &method,
-        bucket: &bucket,
-        key: key.as_deref(),
-        list_prefix: list_prefix.as_deref(),
-        authenticated: body.authenticated,
-        source_ip: body.source_ip,
-    };
+    // Route through the same parser the live middleware uses so trace
+    // output tracks real traffic exactly. `from_raw` handles path
+    // trimming, bucket lowercasing, key percent-decoding, query
+    // `?prefix=` extraction, method uppercasing, and IP normalisation.
+    let owned = crate::admission::middleware::OwnedRequestInfo::from_raw(
+        &body.method,
+        &body.path,
+        body.query.as_deref().unwrap_or(""),
+        body.authenticated,
+        body.source_ip,
+    );
+    let req_info = owned.as_ref();
 
     let decision = crate::admission::evaluate(&chain, &req_info);
+    // `req_info` borrows from `owned` — drop the borrow by scoping
+    // it, then move parsed fields out of `owned` for the response.
+    let _ = req_info;
+
+    // `TraceResolved` echoes the parsed inputs back so operators can
+    // verify the parser agreed with their mental model.
+    let OwnedRequestInfoView {
+        method,
+        bucket,
+        key,
+        list_prefix,
+        ..
+    } = OwnedRequestInfoView::from(owned);
 
     (
         StatusCode::OK,
@@ -133,4 +116,29 @@ pub async fn trace_config(
             admission: decision,
         }),
     )
+}
+
+/// Local view over `OwnedRequestInfo` that collapses the empty-string
+/// sentinels (`key: ""`, `list_prefix: ""`) back to `Option::None` so
+/// they serialize as `null` in the response body.
+struct OwnedRequestInfoView {
+    method: String,
+    bucket: String,
+    key: Option<String>,
+    list_prefix: Option<String>,
+}
+
+impl From<crate::admission::middleware::OwnedRequestInfo> for OwnedRequestInfoView {
+    fn from(o: crate::admission::middleware::OwnedRequestInfo) -> Self {
+        Self {
+            method: o.method,
+            bucket: o.bucket,
+            key: if o.key.is_empty() { None } else { Some(o.key) },
+            list_prefix: if o.list_prefix.is_empty() {
+                None
+            } else {
+                Some(o.list_prefix)
+            },
+        }
+    }
 }

@@ -29,21 +29,6 @@ pub use auth::{
     require_not_declarative, require_session, set_s3_session_creds, whoami, LoginAsRequest,
     LoginResponse, SessionResponse, WhoamiQuery, WhoamiResponse,
 };
-
-/// Phase 3c.2 guard: returns `true` when `access.iam_mode` is
-/// `Declarative`, meaning the caller should refuse the IAM mutation
-/// with a 403 response.
-///
-/// The `require_not_declarative` middleware in [`auth`] enforces this
-/// across every route declared on the `iam_protected` subrouter in
-/// `demo.rs`, so handlers rarely need to call this directly. It
-/// remains exposed for places the layering doesn't reach (e.g.
-/// `migrate_legacy`, which mutates IAM state from the same session
-/// handler that POSTs config).
-pub async fn iam_mode_is_declarative(state: &std::sync::Arc<AdminState>) -> bool {
-    let cfg = state.config.read().await;
-    matches!(cfg.iam_mode, crate::config_sections::IamMode::Declarative)
-}
 pub use backends::{create_backend, delete_backend, list_backends};
 pub use backup::{export_backup, import_backup};
 pub use config::{

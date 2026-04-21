@@ -88,18 +88,36 @@ pub fn migrate_to_string(input: &str) -> Result<String, ConfigError> {
 /// automatically. Used by CI to publish `schema/deltaglider.schema.json` and
 /// by YAML LSP / editor autocomplete.
 pub fn schema(output: Option<&str>) -> i32 {
+    emit_schema_json(output, "schema")
+}
+
+/// Produce the JSON Schema as a String (used by tests and callers that want
+/// the schema without spawning the process).
+pub fn schema_string() -> Result<String, ConfigError> {
+    let schema = schemars::schema_for!(Config);
+    serde_json::to_string_pretty(&schema).map_err(|e| ConfigError::Parse(e.to_string()))
+}
+
+/// Shared emitter for `config schema` and `config defaults`. Both
+/// subcommands serialize `schemars::schema_for!(Config)` and write
+/// the bytes to stdout or a file; the `label` parameter disambiguates
+/// the operator-facing stderr message ("wrote schema to ..." vs
+/// "wrote defaults to ..."). Splitting by label rather than cloning
+/// the whole function body keeps future schema-specific enhancements
+/// (e.g. `--resolve`, `--version`) trivial to add.
+fn emit_schema_json(output: Option<&str>, label: &str) -> i32 {
     let schema = schemars::schema_for!(Config);
     let pretty = match serde_json::to_string_pretty(&schema) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("error: failed to serialize schema: {e}");
+            eprintln!("error: failed to serialize {label}: {e}");
             return EXIT_PARSE;
         }
     };
     match output {
         Some(path) => match std::fs::write(path, &pretty) {
             Ok(()) => {
-                eprintln!("wrote schema to {path}");
+                eprintln!("wrote {label} to {path}");
                 EXIT_OK
             }
             Err(e) => {
@@ -117,13 +135,6 @@ pub fn schema(output: Option<&str>) -> i32 {
             EXIT_OK
         }
     }
-}
-
-/// Produce the JSON Schema as a String (used by tests and callers that want
-/// the schema without spawning the process).
-pub fn schema_string() -> Result<String, ConfigError> {
-    let schema = schemars::schema_for!(Config);
-    serde_json::to_string_pretty(&schema).map_err(|e| ConfigError::Parse(e.to_string()))
 }
 
 /// `config lint <file>`
@@ -236,36 +247,8 @@ pub fn lint(file: &str) -> i32 {
 pub fn defaults(output: Option<&str>) -> i32 {
     // Reuse the schemars output — it carries `default` values per
     // field plus the doc-comment description. This is what YAML LSPs
-    // consume.
-    let schema = schemars::schema_for!(Config);
-    let pretty = match serde_json::to_string_pretty(&schema) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: failed to serialize defaults: {e}");
-            return EXIT_PARSE;
-        }
-    };
-    match output {
-        Some(path) => match std::fs::write(path, &pretty) {
-            Ok(()) => {
-                eprintln!("wrote defaults to {path}");
-                EXIT_OK
-            }
-            Err(e) => {
-                eprintln!("error: failed to write {path}: {e}");
-                EXIT_IO
-            }
-        },
-        None => {
-            let stdout = std::io::stdout();
-            let mut lock = stdout.lock();
-            if let Err(e) = lock.write_all(pretty.as_bytes()) {
-                eprintln!("error: failed to write to stdout: {e}");
-                return EXIT_IO;
-            }
-            EXIT_OK
-        }
-    }
+    // consume. See `emit_schema_json` for the shared emitter.
+    emit_schema_json(output, "defaults")
 }
 
 // ═════════════════════════════════════════════════════════════════════════
