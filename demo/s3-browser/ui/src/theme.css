@@ -352,6 +352,30 @@ body {
   display: block;
 }
 
+/* ───── Ant Design 6 radio / checkbox shrink fix ─────
+ *
+ * AntD 6 renders `.ant-radio` and `.ant-checkbox` as square indicator
+ * spans with a declared `width: calc(var(--ant-radio-radio-size) * 1px)`
+ * (= 16px by default). Their parent `.ant-radio-wrapper` /
+ * `.ant-checkbox-wrapper` is `display: inline-flex`. As flex items,
+ * the default `flex-shrink: 1` + `min-width: auto` lets the browser
+ * shrink the indicator below its declared width when the sibling
+ * `<span class="ant-radio-label">` claims most of the row — the
+ * indicator collapses to an oval (e.g. 11 × 16) instead of a circle.
+ *
+ * AntD doesn't set flex-shrink itself because their own spec never
+ * imagined a vertical Radio.Group where each row's label text pushes
+ * the indicator. We observed this the moment we used
+ * `Radio.Group style={{ display: 'flex', flexDirection: 'column' }}`
+ * + multi-line labels.
+ *
+ * Fix: `flex-shrink: 0` on both. The declared width wins.
+ */
+.ant-radio,
+.ant-checkbox {
+  flex-shrink: 0;
+}
+
 /* ───── Ant Design input focus override ───── */
 .ant-input:focus,
 .ant-input-focused,

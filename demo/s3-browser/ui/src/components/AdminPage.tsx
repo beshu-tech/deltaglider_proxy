@@ -29,6 +29,7 @@ import OAuthProviderList from './OAuthProviderList';
 import AdminSidebar from './AdminSidebar';
 import AdmissionPanel from './AdmissionPanel';
 import CredentialsModePanel from './CredentialsModePanel';
+import BucketsPanel from './BucketsPanel';
 import RightRailActions from './RightRailActions';
 import {
   AccessOverview,
@@ -444,16 +445,24 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
       );
     }
 
-    // Configuration — Storage
-    if (
-      adminPath === 'configuration/storage/backends' ||
-      adminPath === 'configuration/storage/buckets'
-    ) {
-      // Wave 6 splits these; today they share a panel.
+    // Configuration — Storage (Wave 6). Backends keeps the legacy
+    // BackendsPanel (which covers default compression + backend
+    // list + the legacy bucket-policy editor). Buckets routes to
+    // the dedicated BucketsPanel with the None/Entire/Prefixes
+    // tri-state UX from §7.5.
+    if (adminPath === 'configuration/storage/backends') {
       return (
         <>
           {header}
           <BackendsPanel onSessionExpired={onSessionExpired} />
+        </>
+      );
+    }
+    if (adminPath === 'configuration/storage/buckets') {
+      return (
+        <>
+          {header}
+          <BucketsPanel onSessionExpired={onSessionExpired} />
         </>
       );
     }
