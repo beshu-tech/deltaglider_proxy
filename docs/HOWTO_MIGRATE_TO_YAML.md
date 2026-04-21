@@ -34,9 +34,21 @@ If you only have a running server (no TOML file), fetch the current
 config over the admin API:
 
 ```sh
+# Full document (every section):
 curl -b session-cookie \
     http://localhost:9000/_/api/admin/config/export > deltaglider_proxy.yaml
+
+# One section at a time (e.g. just Storage):
+curl -b session-cookie \
+    'http://localhost:9000/_/api/admin/config/export?section=storage' > storage.yaml
 ```
+
+Both paths redact every secret — the output is safe to commit to a
+GitOps repo. You re-inject credentials via env vars at deploy time.
+
+Alternatively, use the admin GUI's **Export all YAML** action in the
+right-rail on any Configuration page (Admission / Access / Storage /
+Advanced → **Export all**).
 
 The rest of this guide explains **why** the format changed, **what**
 each section means, and how the `S3-synced IAM database` fits into
@@ -402,6 +414,7 @@ After migration, confirm:
 ## Related documentation
 
 - [CONFIGURATION.md](CONFIGURATION.md) — full field reference
+- [OPERATIONS.md](OPERATIONS.md#admin-api-endpoints) — admin API endpoint catalog (GitOps surfaces, section-level merge-patch, trace)
 - [AUTHENTICATION.md](AUTHENTICATION.md) — SigV4 + bootstrap + IAM modes
 - [HOWTO_SECURITY_BASICS.md](HOWTO_SECURITY_BASICS.md) — recommended secure defaults
 - [docs/plan/progressive-config-refactor.md](plan/progressive-config-refactor.md) — design rationale
