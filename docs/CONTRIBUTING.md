@@ -83,7 +83,9 @@ src/
 │   ├── keygen.rs        # Secure access key generation
 │   └── external_auth/   # OAuth/OIDC providers (Google, generic OIDC)
 ├── config_db/           # Encrypted SQLCipher database (users, groups, providers)
-├── config.rs            # TOML + env config, SharedConfig
+├── config.rs            # Flat Config struct + ENV_VAR_REGISTRY (YAML canonical; TOML deprecated but still loads)
+├── config_sections.rs   # Sectioned YAML wire shape (admission/access/storage/advanced) + shorthand expanders
+├── admission/           # Pre-auth admission chain (operator-authored + synthesized blocks)
 ├── bucket_policy.rs     # Per-bucket policies + PublicPrefixSnapshot
 ├── startup.rs           # Server startup, router assembly, middleware stack
 ├── session.rs           # Admin session store (OsRng tokens, IP binding)
