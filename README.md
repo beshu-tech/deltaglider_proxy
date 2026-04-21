@@ -94,8 +94,13 @@ Everything managed from a web UI served on the same port as the S3 API — no ex
 
 ## Quick Start
 
+The proxy refuses to start without credentials (preventing accidentally open deployments). Supply them or explicitly opt into open access:
+
 ```bash
-docker run -p 9000:9000 beshultd/deltaglider_proxy
+docker run -p 9000:9000 \
+  -e DGP_ACCESS_KEY_ID=admin \
+  -e DGP_SECRET_ACCESS_KEY=changeme \
+  beshultd/deltaglider_proxy
 ```
 
 Then point any S3 client at `http://localhost:9000`:
@@ -108,22 +113,36 @@ aws s3 cp v2.zip s3://builds/releases/v2.zip   # stored as delta
 aws s3 cp s3://builds/releases/v2.zip ./v2.zip  # full file back, byte-identical
 ```
 
-Admin GUI at `http://localhost:9000/_/` — same port, zero setup.
+Admin GUI at `http://localhost:9000/_/` — same port, zero setup. On first run, the bootstrap password is auto-generated and printed to stderr; override with `DGP_BOOTSTRAP_PASSWORD_HASH` or the `--set-bootstrap-password` flag.
 
 ## Configuration
 
-YAML config file or environment variables (`DGP_*` prefix). Everything has sensible defaults — a five-line config is runnable:
+YAML config file (canonical) or environment variables (`DGP_*` prefix). A five-line config is runnable:
 
 ```yaml
+# deltaglider_proxy.yaml
 storage:
   s3: https://s3.example.com
   access_key_id: admin
   secret_access_key: changeme
 ```
 
-Full reference with the four-section layout (admission / access / storage / advanced):
+The canonical format has four optional top-level sections — `admission`, `access`, `storage`, `advanced` — each independently optional. Fields equal to their defaults are omitted from exports to keep GitOps diffs small.
 
 ```yaml
+admission:
+  blocks:
+    - name: deny-bad-ips
+      match:
+        source_ip_list: ["203.0.113.0/24"]
+      action: deny
+
+access:
+  access_key_id: admin
+  secret_access_key: changeme
+  # iam_mode: gui          # (default) encrypted IAM DB is source of truth
+  # iam_mode: declarative  # YAML owns IAM; admin-API mutations return 403
+
 storage:
   default_backend: primary
   backends:
@@ -140,21 +159,16 @@ storage:
       backend: europe
       compression: true
       public_prefixes: ["builds/", "artifacts/"]
+    docs-site:
+      public: true                  # shorthand for public_prefixes: [""]
     archive:
       backend: primary
       alias: prod-archive-2024
       compression: false
 
-access:
-  access_key_id: admin
-  secret_access_key: changeme
-
-admission:
-  blocks:
-    - name: deny-bad-ips
-      match:
-        source_ip_list: ["203.0.113.0/24"]
-      action: deny
+advanced:
+  cache_size_mb: 2048
+  log_level: deltaglider_proxy=info,tower_http=warn
 ```
 
 **Offline validation** — run before committing to CI:
@@ -163,7 +177,17 @@ admission:
 deltaglider_proxy config lint deltaglider_proxy.yaml
 ```
 
-**Examples**: [deltaglider_proxy.example.yaml](deltaglider_proxy.example.yaml) (new canonical) or the legacy [deltaglider_proxy.toml.example](deltaglider_proxy.toml.example) (deprecated — emits a warning on load; use `deltaglider_proxy config migrate old.toml --out new.yaml` to convert).
+**Migration from TOML**: TOML still loads but emits a deprecation warning on every startup. Convert with:
+
+```sh
+deltaglider_proxy config migrate deltaglider_proxy.toml --out deltaglider_proxy.yaml
+```
+
+Silence the warning mid-migration with `DGP_SILENCE_TOML_DEPRECATION=1`. See [HOWTO_MIGRATE_TO_YAML.md](docs/HOWTO_MIGRATE_TO_YAML.md).
+
+**Examples**: [deltaglider_proxy.example.yaml](deltaglider_proxy.example.yaml) (canonical). The legacy [deltaglider_proxy.toml.example](deltaglider_proxy.toml.example) is kept for reference only.
+
+**Admin API for GitOps** — full-document apply, per-section PATCH (RFC 7396 merge-patch), JSON Schema export, and an admission-chain trace endpoint. See [OPERATIONS.md](docs/OPERATIONS.md#admin-api-endpoints).
 
 ## S3 Compatibility
 
@@ -205,11 +229,15 @@ docker run -p 9000:9000 beshultd/deltaglider_proxy
 ## Documentation
 
 - [Configuration reference](docs/CONFIGURATION.md)
+- [Migrating from TOML to YAML](docs/HOWTO_MIGRATE_TO_YAML.md)
 - [Authentication & IAM](docs/AUTHENTICATION.md)
 - [Delta reconstruction](docs/DELTA_RECONSTRUCTION.md)
 - [Operations guide](docs/OPERATIONS.md)
 - [Storage format internals](docs/STORAGE_FORMAT.md)
 - [Metrics & monitoring](docs/METRICS.md)
+- [Rate limiting](docs/RATE_LIMITING.md)
+- [Security basics](docs/HOWTO_SECURITY_BASICS.md)
+- [IAM conditions](docs/HOWTO_IAM_CONDITIONS.md)
 - [Contributing](docs/CONTRIBUTING.md)
 
 ## License
