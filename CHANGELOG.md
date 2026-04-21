@@ -1,5 +1,151 @@
 # Changelog
 
+## v0.8.0
+
+A major release. Two overlapping threads land together: the
+**progressive-disclosure YAML config** (phases 0–3 of
+[docs/plan/progressive-config-refactor.md](docs/plan/progressive-config-refactor.md))
+and the first waves of the **admin UI revamp**
+([docs/plan/admin-ui-revamp.md](docs/plan/admin-ui-revamp.md)).
+
+### Configuration (progressive-disclosure YAML — phases 0–3)
+
+- **YAML is now canonical.** `deltaglider_proxy.yaml` (four-section
+  `admission / access / storage / advanced` layout) is preferred
+  over `deltaglider_proxy.toml`. Both still load; TOML is
+  deprecated with a `tracing::warn!` on every load (silence with
+  `DGP_SILENCE_TOML_DEPRECATION=1`). See
+  [docs/HOWTO_MIGRATE_TO_YAML.md](docs/HOWTO_MIGRATE_TO_YAML.md).
+- **Dual-shape loader.** Sectioned YAML (`admission:`/`access:`/
+  `storage:`/`advanced:`) is transparent to the in-memory
+  `Config` struct — the flat shape still loads unchanged.
+- **Storage shorthand** — a single-backend deployment can write:
+  ```yaml
+  storage:
+    s3: https://example.com
+  ```
+  which expands to a full `backend: { type: S3, ... }` at load
+  time. Filesystem shorthand (`storage: { filesystem: /path }`)
+  likewise. Long-form YAML stays valid; shorthand is operator
+  convenience only.
+- **Per-bucket `public: true`** shorthand expands to
+  `public_prefixes: [""]`, and the canonical exporter collapses
+  back when unambiguous. GUI "Public read" toggle maps 1:1 to the
+  YAML.
+- **Admission chain (operator-authored).** New
+  `admission.blocks[]` wire format with `match` predicates
+  (method / source_ip / source_ip_list / bucket / path_glob /
+  authenticated / config_flag) and `action` variants
+  (`allow-anonymous`, `deny`, `reject { status, message }`,
+  `continue`). Evaluator dispatches live before the synthesized
+  public-prefix blocks; reserved `public-prefix:*` name prefix;
+  glob compile-check at parse time; 4096-entry cap on
+  `source_ip_list`.
+- **`access.iam_mode: gui | declarative`.** New lifecycle knob:
+  `gui` (default) keeps the encrypted IAM DB as source of truth;
+  `declarative` gates admin-API IAM mutation routes (the
+  `require_not_declarative` middleware) behind 403 responses. A
+  warn-level audit log line fires on every mode transition. The
+  reconciler that sync-diffs DB to YAML in declarative mode is
+  still Phase 3c.3; today declarative mode is a read-only
+  lockout.
+- **New admin endpoints** for GitOps + GUI round-trips:
+  - `GET /api/admin/config/export[?section=<name>]` —
+    canonical-YAML export with every secret redacted; scope-filter
+    to one section when `section=` is present.
+  - `POST /api/admin/config/validate` — dry-run a full YAML doc.
+  - `POST /api/admin/config/apply` — atomic full-document apply,
+    with runtime-secret preservation for redacted round-trips.
+  - `POST /api/admin/config/trace` — evaluate a synthetic request
+    against the live admission chain.
+  - `GET /api/admin/config/defaults[?section=<name>]` — JSON
+    Schema (via `schemars`) for the Config type, optionally scoped
+    to one section for Monaco's per-editor schema.
+- **Section-level admin API (Wave 1 of the UI revamp):**
+  - `GET /api/admin/config/section/:name[?format=yaml]`
+  - `PUT /api/admin/config/section/:name` — partial update,
+    routes through the same `apply_config_transition` helper as
+    field-level PATCH and document-level APPLY.
+  - `POST /api/admin/config/section/:name/validate` — dry-run
+    with a diff body (`{section: {field.path: {before, after}}}`)
+    for the plan → diff → apply dialog.
+  - `GET /api/admin/config/trace` — query-param variant for
+    bookmarkable trace URLs.
+- **CLI subcommands:**
+  - `deltaglider_proxy config migrate <toml>` — TOML → YAML
+    converter (emits canonical sectioned form).
+  - `deltaglider_proxy config lint <yaml>` — offline schema +
+    reference-resolution + dangerous-default warnings.
+  - `deltaglider_proxy config defaults` — dump every default
+    with its doc comment.
+
+### Admin UI revamp (waves 1–3)
+
+Three of ten waves from the plan land in this release; waves 4–10
+come next.
+
+- **Section-level API client helpers in `adminApi.ts`**:
+  `getSection`, `putSection`, `validateSection`, `getSectionYaml`,
+  `exportSectionYaml`, `getSectionSchema`, `getFullConfigSchema`.
+- **New foundation components** ready for use in waves 4–7:
+  - `FormField` — standardised label / YAML-path / help /
+    default-placeholder / override-indicator / owner-badge wrapper.
+  - `ApplyDialog` — the plan → diff → apply modal (§5.3).
+  - `MonacoYamlEditor` — lazy-loaded Monaco + monaco-yaml with
+    scoped JSON Schema and mobile fallback (§4.3, §10.4).
+- **New hook `useDirtySection`** — per-panel dirty state backed
+  by a module-level Set, with `useDirtyGlobalIndicators` for the
+  `● ` tab-title prefix and `beforeunload` guard.
+- **New sidebar** (`AdminSidebar`) — four-group IA
+  (Diagnostics + Configuration). Nested sub-entries for Access /
+  Storage / Advanced; amber dot on sections with unsaved edits.
+- **URL scheme** — every admin page is a bookmarkable
+  hierarchical URL:
+  `/_/admin/diagnostics/dashboard`,
+  `/_/admin/configuration/access/users`, etc. Legacy flat URLs
+  (`/_/admin/users`, `/_/admin/backends`) keep working via
+  `LEGACY_TO_NEW` in AdminPage.tsx.
+- **Right-rail actions** (`RightRailActions`) visible on every
+  Configuration page: Apply / Discard (gated on `dirty`), Copy
+  YAML / Paste YAML (section-scoped), Export all / Import all
+  (full-document modal from v0.7.x).
+- **YAML Import/Export modal** (`YamlImportExportModal`) reached
+  from every admin page via the header actions.
+
+### Bug fixes / correctness
+
+- **`DGP_BOOTSTRAP_PASSWORD` env override.** `--config <path>`
+  now applies env var overrides (including
+  `DGP_BOOTSTRAP_PASSWORD_HASH`) on top of the file, matching the
+  behaviour of implicit search-path loading. Previously the flag
+  made env vars silently ignored.
+- **Admission validator** rejects reserved `public-prefix:*`
+  names up front.
+- **Shape classifier** explicit check-by-key-presence (flat vs.
+  sectioned), so typos inside a sectioned doc report section-
+  scoped errors rather than "unknown variant" from a fallback
+  parse.
+
+### Dependencies
+
+Frontend: `monaco-editor`, `monaco-yaml`, `react-hook-form`, `zod`,
+`@hookform/resolvers`, `@dnd-kit/core` + `sortable` + `utilities`
+(§4.2–§4.4). Backend: `serde_yml`, `schemars`.
+
+### Breaking changes
+
+None. TOML config is deprecated but still loads; field-level
+`PATCH /api/admin/config` remains the stable GUI surface; every
+existing integration test passes.
+
+### Migration
+
+Run `deltaglider_proxy config migrate deltaglider_proxy.toml
+--out deltaglider_proxy.yaml`, point the server at the YAML, and
+delete the TOML when ready. No config rewrites needed on the
+YAML side for existing deployments — the sectioned shape is
+semantically a superset of the flat shape.
+
 ## v0.7.2
 
 ### UI Polish & Usability
