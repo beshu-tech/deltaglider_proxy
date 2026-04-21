@@ -235,6 +235,180 @@ async fn section_put_invalid_body_returns_400_and_no_change() {
     assert!((cfg["max_delta_ratio"].as_f64().unwrap() - 0.75).abs() < 1e-3);
 }
 
+// ═══════════════════════════════════════════════════
+// Section PUT is a JSON Merge Patch, not a whole-section replace
+// (regression caught during live browser testing against v0.8.0 —
+// a single-field PUT was silently zeroing every other field in the
+// section to its compile-time default).
+// ═══════════════════════════════════════════════════
+
+#[tokio::test]
+async fn section_put_is_merge_not_replace() {
+    // Seed a section with two overridden fields (cache_size_mb +
+    // max_delta_ratio) plus the server's other defaults populated.
+    let server = TestServer::builder()
+        .auth("MERGEKEY", "MERGESECRETVALUE")
+        .max_delta_ratio(0.65)
+        .yaml_config()
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    // Pre-seed cache_size_mb via the field-level PATCH so we have
+    // two non-default fields in `advanced`. TestServer doesn't take
+    // cache_size_mb directly.
+    let resp = admin
+        .put(format!("{}/_/api/admin/config", server.endpoint()))
+        .json(&json!({ "cache_size_mb": 512 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Now section-PUT only `max_delta_ratio`. Under merge semantics
+    // cache_size_mb must survive untouched — under replace semantics
+    // it would have reset to the 100 MB default.
+    let resp = admin
+        .put(format!(
+            "{}/_/api/admin/config/section/advanced",
+            server.endpoint()
+        ))
+        .json(&json!({ "max_delta_ratio": 0.33 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Verify cache_size_mb still equals 512 (merge) and
+    // max_delta_ratio now equals 0.33 (the edit).
+    let cfg: serde_json::Value = admin
+        .get(format!("{}/_/api/admin/config", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        cfg["cache_size_mb"].as_u64().unwrap(),
+        512,
+        "cache_size_mb must survive a PUT that doesn't include it"
+    );
+    assert!(
+        (cfg["max_delta_ratio"].as_f64().unwrap() - 0.33).abs() < 1e-3,
+        "max_delta_ratio must reflect the PUT"
+    );
+}
+
+#[tokio::test]
+async fn section_put_null_resets_field_to_default() {
+    // RFC 7396 spec: `null` in the body explicitly clears the field,
+    // letting it fall back to its default. Locks this in as a
+    // contract — operators use `null` to revert without having to
+    // know the default value.
+    let server = TestServer::builder()
+        .auth("NULLKEY", "NULLSECRETVALUE")
+        .max_delta_ratio(0.33)
+        .yaml_config()
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    // Confirm the override is live.
+    let cfg: serde_json::Value = admin
+        .get(format!("{}/_/api/admin/config", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!((cfg["max_delta_ratio"].as_f64().unwrap() - 0.33).abs() < 1e-3);
+
+    // PUT `max_delta_ratio: null`. Under merge semantics this means
+    // "remove the override; use the default".
+    let resp = admin
+        .put(format!(
+            "{}/_/api/admin/config/section/advanced",
+            server.endpoint()
+        ))
+        .json(&json!({ "max_delta_ratio": null }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // max_delta_ratio now at the default (0.75).
+    let cfg: serde_json::Value = admin
+        .get(format!("{}/_/api/admin/config", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        (cfg["max_delta_ratio"].as_f64().unwrap() - 0.75).abs() < 1e-3,
+        "max_delta_ratio must fall back to 0.75 default when body sets it to null"
+    );
+}
+
+#[tokio::test]
+async fn section_put_storage_preserves_other_buckets() {
+    // Merge semantic for map-valued fields (storage.buckets):
+    // updating one bucket entry must not wipe the others.
+    let server = TestServer::builder()
+        .auth("BUCKKEY", "BUCKSECRETVALUE")
+        .yaml_config()
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    // Seed two buckets through the field-level PATCH.
+    admin
+        .put(format!("{}/_/api/admin/config", server.endpoint()))
+        .json(&json!({
+            "bucket_policies": {
+                "alpha": { "compression": false },
+                "beta":  { "compression": true }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // Section-PUT a change to only `alpha`.
+    admin
+        .put(format!(
+            "{}/_/api/admin/config/section/storage",
+            server.endpoint()
+        ))
+        .json(&json!({
+            "buckets": {
+                "alpha": { "compression": true, "quota_bytes": 1024 }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // `beta` must still be there.
+    let cfg: serde_json::Value = admin
+        .get(format!("{}/_/api/admin/config", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let policies = &cfg["bucket_policies"];
+    assert!(
+        policies["beta"].is_object(),
+        "beta must survive a merge-patch PUT that only touches alpha"
+    );
+    assert_eq!(policies["alpha"]["quota_bytes"].as_u64().unwrap(), 1024);
+}
+
 #[tokio::test]
 async fn section_put_admission_blocks_replace_entire_list() {
     let server = TestServer::builder()

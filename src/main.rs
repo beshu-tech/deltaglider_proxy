@@ -353,6 +353,35 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref addr) = cli.listen {
         config.listen_addr = addr.parse()?;
     }
+
+    // Apply `advanced.log_level` from the config file to the already-
+    // initialised tracing filter — caught during browser testing of
+    // v0.8.0 where `advanced.log_level: info` was silently ignored
+    // because `init_tracing` only reads env vars. Priority:
+    //   RUST_LOG > DGP_LOG_LEVEL > config.log_level > --verbose > default.
+    // The first two were already honoured by `init_tracing`; we only
+    // reload from `config.log_level` if neither env var was set (so
+    // env-driven deployments keep their semantics) and the config
+    // value differs from what init_tracing chose.
+    if std::env::var("RUST_LOG").is_err() && std::env::var("DGP_LOG_LEVEL").is_err() {
+        match config.log_level.parse::<tracing_subscriber::EnvFilter>() {
+            Ok(filter) => {
+                if let Err(e) = log_reload_handle.reload(filter) {
+                    eprintln!(
+                        "Warning: could not apply log_level={:?} from config: {}",
+                        config.log_level, e
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: ignoring invalid log_level={:?} from config: {}",
+                    config.log_level, e
+                );
+            }
+        }
+    }
+
     log_startup_banner(&config);
 
     // --- Metrics ---

@@ -184,6 +184,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
 
   // Derive canonical admin path (§3.2). Legacy flat URLs (`users`,
   // `backends`, etc.) are mapped to the new hierarchy.
+  const rawSubPath = (subPath || '').replace(/^\/+/, '').replace(/\/+$/, '');
   const adminPath = resolveAdminPath(subPath || '');
   const navigateAdmin = useCallback(
     (path: string) => {
@@ -191,6 +192,24 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
     },
     [navigate]
   );
+
+  // Canonicalise the URL bar on legacy-flat hits. When the operator
+  // lands on `/_/admin/users` (a bookmarked v0.7.x URL), the content
+  // already renders the Users panel because `resolveAdminPath` mapped
+  // it — but the URL in the bar still reads `/_/admin/users`. Operators
+  // pasting the URL elsewhere would still spread the legacy form.
+  // `replaceState` silently upgrades the URL to the canonical
+  // hierarchical form without adding a history entry. Browser back/
+  // forward still works correctly.
+  useEffect(() => {
+    // Only canonicalise when the resolved path actually differs from
+    // the raw sub-path (legacy hit). Skip on the landing page
+    // (empty sub-path -> diagnostics/dashboard) — that's a fresh
+    // navigation, not a legacy bookmark.
+    if (rawSubPath && rawSubPath !== adminPath) {
+      navigate(`admin/${adminPath}`, /* replace */ true);
+    }
+  }, [rawSubPath, adminPath, navigate]);
 
   const [authed, setAuthed] = useState(false);
   const [checkingSession, setCheckingSession] = useState(true);

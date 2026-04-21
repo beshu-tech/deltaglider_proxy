@@ -42,9 +42,7 @@ use std::sync::Arc;
 
 use super::super::{audit_log, AdminState};
 use super::{active_config_path, apply_config_transition};
-use crate::config_sections::{
-    AccessSection, AdmissionSection, AdvancedSection, SectionedConfig, StorageSection,
-};
+use crate::config_sections::{AdmissionSection, SectionedConfig};
 
 /// Names of the four sections the API understands. Kept as a small enum
 /// rather than a string for exhaustiveness — the match in
@@ -523,10 +521,38 @@ async fn apply_section(
         .into_response()
 }
 
-/// Replace one named section on a `SectionedConfig` from a JSON body.
+/// Apply a JSON-Merge-Patch (RFC 7396) body on top of one section of
+/// a `SectionedConfig`.
 ///
-/// The body's schema must match the target section's type — anything
-/// else is rejected with a serde error. The match is exhaustive on
+/// ## Why merge, not replace
+///
+/// A naïve "replace the whole section" semantic is a serious foot-gun
+/// for the UI's section PUT: the operator edits one field in the
+/// admin form (say, `advanced.max_delta_ratio`), the client sends
+/// `{max_delta_ratio: 0.42}`, and the server silently resets every
+/// OTHER advanced field to its compile-time default because they
+/// were absent from the body. We observed this live in local browser
+/// testing against v0.8.0 — one edit zeroed `cache_size_mb`,
+/// `listen_addr`, and `log_level`.
+///
+/// RFC 7396 JSON Merge Patch is the right semantic for partial
+/// updates:
+///   * Keys present in body -> apply (replace-in-place at that key).
+///   * Keys absent from body -> keep the old value.
+///   * Keys set to `null` in body -> delete / fall back to default.
+///
+/// List-valued fields like `admission.blocks` are atomic leaves
+/// (present-or-absent, no per-index merge); sending `{blocks: []}`
+/// clears the chain. Map-valued fields like `storage.buckets` are
+/// merged entry-by-entry (per-bucket null deletes that bucket,
+/// other buckets stay untouched).
+///
+/// ## Implementation
+///
+/// We project the current section to JSON, apply the merge patch,
+/// then deserialize back into the section's strong type. Structural
+/// errors (unknown fields, bad types) surface through serde the same
+/// way they would with replace semantics. The match is exhaustive on
 /// [`SectionName`] so adding a section forces a local update here.
 fn replace_section(
     sectioned: &mut SectionedConfig,
@@ -535,7 +561,11 @@ fn replace_section(
 ) -> Result<(), String> {
     match section {
         SectionName::Admission => {
-            let parsed: AdmissionSection = serde_json::from_value(body.clone())
+            let current = sectioned.admission.clone().unwrap_or_default();
+            let mut merged = serde_json::to_value(&current)
+                .map_err(|e| format!("internal: failed to project admission section: {}", e))?;
+            apply_merge_patch(&mut merged, body);
+            let parsed: AdmissionSection = serde_json::from_value(merged)
                 .map_err(|e| format!("invalid admission section body: {}", e))?;
             sectioned.admission = if parsed.blocks.is_empty() {
                 None
@@ -544,22 +574,63 @@ fn replace_section(
             };
         }
         SectionName::Access => {
-            let parsed: AccessSection = serde_json::from_value(body.clone())
+            let mut merged = serde_json::to_value(&sectioned.access)
+                .map_err(|e| format!("internal: failed to project access section: {}", e))?;
+            apply_merge_patch(&mut merged, body);
+            sectioned.access = serde_json::from_value(merged)
                 .map_err(|e| format!("invalid access section body: {}", e))?;
-            sectioned.access = parsed;
         }
         SectionName::Storage => {
-            let parsed: StorageSection = serde_json::from_value(body.clone())
+            let mut merged = serde_json::to_value(&sectioned.storage)
+                .map_err(|e| format!("internal: failed to project storage section: {}", e))?;
+            apply_merge_patch(&mut merged, body);
+            sectioned.storage = serde_json::from_value(merged)
                 .map_err(|e| format!("invalid storage section body: {}", e))?;
-            sectioned.storage = parsed;
         }
         SectionName::Advanced => {
-            let parsed: AdvancedSection = serde_json::from_value(body.clone())
+            let mut merged = serde_json::to_value(&sectioned.advanced)
+                .map_err(|e| format!("internal: failed to project advanced section: {}", e))?;
+            apply_merge_patch(&mut merged, body);
+            sectioned.advanced = serde_json::from_value(merged)
                 .map_err(|e| format!("invalid advanced section body: {}", e))?;
-            sectioned.advanced = parsed;
         }
     }
     Ok(())
+}
+
+/// Apply a JSON Merge Patch (RFC 7396) in-place to `target`.
+///
+/// The algorithm is short enough to inline rather than pull in an
+/// external crate:
+///
+///   * If `patch` is an object and `target` is an object, recurse
+///     into each patch key:
+///       - patch[k] == null -> remove k from target
+///       - patch[k] == anything else -> recursively merge into target[k]
+///       - if target[k] is absent, target[k] = patch[k].clone()
+///   * Otherwise `patch` replaces `target` wholesale.
+///
+/// This is the standard spec; arrays are replaced atomically.
+fn apply_merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
+    match (target, patch) {
+        (serde_json::Value::Object(target_map), serde_json::Value::Object(patch_map)) => {
+            for (k, v) in patch_map {
+                if v.is_null() {
+                    target_map.remove(k);
+                } else {
+                    match target_map.get_mut(k) {
+                        Some(existing) => apply_merge_patch(existing, v),
+                        None => {
+                            target_map.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+        }
+        (target_slot, _) => {
+            *target_slot = patch.clone();
+        }
+    }
 }
 
 /// Compute the per-field diff for one section.
