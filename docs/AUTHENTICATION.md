@@ -6,7 +6,14 @@ DeltaGlider Proxy supports multiple authentication methods: **SigV4** (standard 
 
 ### Bootstrap Mode (default on fresh install)
 
-A single S3 credential pair configured via TOML or environment variables. All clients share the same credentials. Admin GUI access requires the **bootstrap password**.
+A single S3 credential pair configured via YAML or environment variables. All clients share the same credentials. Admin GUI access requires the **bootstrap password**.
+
+```yaml
+# deltaglider_proxy.yaml
+access:
+  access_key_id: myaccesskey
+  secret_access_key: mysecretkey
+```
 
 ```bash
 export DGP_ACCESS_KEY_ID=myaccesskey
@@ -18,6 +25,22 @@ export DGP_SECRET_ACCESS_KEY=mysecretkey
 Per-user credentials stored in an encrypted SQLCipher database (`deltaglider_config.db`). Each user has their own access key, secret key, and permission rules. Admin GUI access is permission-based — IAM admins don't need the bootstrap password.
 
 IAM mode activates automatically when the first IAM user is created via the admin GUI or via OAuth auto-provisioning. The bootstrap credentials are migrated as a "legacy-admin" user.
+
+### IAM Source of Truth (`access.iam_mode`)
+
+Orthogonal to the bootstrap/IAM/OAuth selection above, the `access.iam_mode` YAML selector controls **where IAM state lives**:
+
+- `gui` *(default)* — the encrypted SQLCipher DB is authoritative. Admin GUI + admin API mutate the DB directly. YAML `access:` carries only the legacy SigV4 pair + `authentication` selector.
+- `declarative` — YAML is authoritative. Admin API IAM mutation routes (`POST/PUT/PATCH/DELETE` on `/users`, `/groups`, `/ext-auth/*`, `/migrate`, backup import) return `403 { "error": "iam_declarative" }`. Read routes stay accessible.
+
+```yaml
+access:
+  iam_mode: declarative
+```
+
+Mode transitions are audit-logged at `warn` level on the `deltaglider_proxy::config` target.
+
+> **Caveat**: the reconciler that sync-diffs the DB to the YAML on every apply is still **Phase 3c.3 (pending)**. Declarative mode today is a pure lockout — YAML `access.users` arrays are not yet consumed. Seed IAM via a one-time `iam_mode: gui` admin session, then flip. See [HOWTO_MIGRATE_TO_YAML.md](HOWTO_MIGRATE_TO_YAML.md#the-new-role-of-the-s3-synced-iam-database).
 
 ### OAuth/OIDC Mode
 
@@ -31,25 +54,51 @@ On first login, the proxy **auto-provisions** an IAM user from the identity prov
 - **Email regex** — full regex pattern matching
 - **Claim value** — match on any JWT claim (department, role, etc.)
 
-Configured via the admin GUI under **Authentication > Mapping Rules**.
+Configured via the admin GUI under **Access → External authentication → Mapping Rules**. OAuth providers and mapping rules live in the encrypted DB — they are not expressible in YAML today (would be part of Phase 3c.3 declarative reconciler).
 
 ### Public Prefixes (anonymous read access)
 
 Specific bucket/prefix paths can be configured for unauthenticated read-only access. Anonymous users can GET, HEAD, and LIST objects under public prefixes — but cannot PUT, DELETE, or access anything outside the configured prefixes.
 
-```toml
-[buckets.releases]
-public_prefixes = ["builds/", "artifacts/"]
+```yaml
+storage:
+  buckets:
+    releases:
+      public_prefixes: ["builds/", "artifacts/"]
+    docs-site:
+      public: true        # shorthand for public_prefixes: [""]
 ```
 
 See [Public Prefixes](#public-prefixes) below for details.
+
+### Operator-Authored Admission Blocks
+
+Pre-auth request gating is authored in `admission.blocks[]`. Blocks are evaluated top-to-bottom and fire before the synthesized public-prefix blocks derived from `storage.buckets[*].public_prefixes`.
+
+```yaml
+admission:
+  blocks:
+    - name: deny-known-bad-ips
+      match:
+        source_ip_list: ["203.0.113.5", "198.51.100.0/24"]
+      action: deny
+    - name: maintenance-mode
+      match: {}
+      action:
+        type: reject
+        status: 503
+        message: "We'll be right back."
+```
+
+See [CONFIGURATION.md](CONFIGURATION.md#admission-chain) for the full operator wire format.
 
 ### Open Access (development only)
 
 The proxy **refuses to start** without authentication credentials. To explicitly run without authentication:
 
-```toml
-authentication = "none"
+```yaml
+access:
+  authentication: none
 ```
 
 > **Security**: Open access exposes all S3 data without credentials. Never use in production.
@@ -64,11 +113,11 @@ A single infrastructure secret that serves three purposes:
 
 ### Lifecycle
 
-- **Auto-generated** on first run if not set (printed to stderr, hash saved to `.deltaglider_bootstrap_hash`)
-- **Set explicitly** via `DGP_BOOTSTRAP_PASSWORD_HASH` env var or `bootstrap_password_hash` in TOML
-- **Reset** via `--set-bootstrap-password` CLI flag
+- **Auto-generated** on first run if not set. The plaintext is printed to stderr only when stderr is a TTY; in containers/CI only the bcrypt hash is logged. Hash saved to `.deltaglider_bootstrap_hash`.
+- **Set explicitly** via `DGP_BOOTSTRAP_PASSWORD_HASH` env var (accepts bcrypt or base64-encoded bcrypt — base64 avoids `$` escaping in Docker/shell). YAML: `advanced.bootstrap_password_hash`. Legacy alias: `DGP_ADMIN_PASSWORD_HASH`.
+- **Reset** via `--set-bootstrap-password` CLI flag (reads the new plaintext from stdin).
 
-> **Warning**: Resetting the bootstrap password invalidates the encrypted IAM database. All IAM users, OAuth providers, and group mappings will be lost.
+> **Warning**: Resetting the bootstrap password invalidates the encrypted IAM database. All IAM users, OAuth providers, and group mappings will be lost. The proper rotation path is `PUT /_/api/admin/password` (verifies the current password and re-encrypts the DB atomically).
 
 ## IAM Permissions (ABAC)
 
@@ -176,12 +225,16 @@ Public prefixes allow unauthenticated read-only access to specific bucket/prefix
 
 ### Configuration
 
-```toml
-[buckets.releases]
-public_prefixes = ["builds/", "docs/"]
+```yaml
+storage:
+  buckets:
+    releases:
+      public_prefixes: ["builds/", "docs/"]
+    docs-site:
+      public: true        # entire bucket — shorthand
 ```
 
-Or via the admin GUI → **Backends** → per-bucket policy card → **Public Prefixes**.
+Or via the admin GUI → **Storage → Buckets** → edit bucket → **Anonymous read access** (tri-state: None / Specific prefixes / Entire bucket).
 
 ### Behavior
 
