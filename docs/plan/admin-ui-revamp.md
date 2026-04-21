@@ -1,7 +1,6 @@
 # Admin UI Revamp — Design Plan
 
-**Status:** DRAFT for review. No code change yet. Implementation
-is scoped into 10 waves below, ~6 weeks of focused work.
+**Status:** Waves 1-7 shipped in v0.8.0 and its immediate follow-ons. Waves 8-10 (first-run wizard, Diagnostics dashboard + Trace UI, polish pass) still pending.
 
 **Stakeholders:** admin UI users (three personas — solo operator,
 GitOps team, GUI-first enterprise), the Rust backend team (this
@@ -11,6 +10,28 @@ plan proposes new admin API endpoints), the YAML config authors.
 - [progressive-config-refactor.md](progressive-config-refactor.md) — the config refactor this UI revamp builds on
 - [HOWTO_MIGRATE_TO_YAML.md](../HOWTO_MIGRATE_TO_YAML.md) — operator-facing migration story
 - Commit range `aeb128f^..HEAD` — all Phase 3 code that ships the YAML substrate
+
+## Progress snapshot (as of v0.8.0 + follow-ons)
+
+| Wave | Status | Notes |
+|------|--------|-------|
+| 1 — Backend prep | ✅ Shipped | `GET/PUT/POST` on `/config/section/:name`, `?section=` on `/export` and `/defaults`, `GET /config/trace` query-param variant, `DGP_BOOTSTRAP_PASSWORD_HASH` env-vs-`--config` fix, RFC 7396 merge-patch on section PUT (fixed post-tag during live-browser verification). |
+| 2 — Foundation components | ✅ Shipped | `FormField`, `ApplyDialog`, `MonacoYamlEditor` (lazy-loaded), `useDirtySection` hook, react-hook-form + Zod scaffolding. |
+| 3 — Sidebar restructure | ✅ Shipped | 4-group IA (Diagnostics + Configuration); hierarchical URLs; legacy URL canonicalisation on mount; `RightRailActions` (Apply / Discard / Copy YAML / Export all / Import all — see scope revision below). |
+| 4 — Admission section | ✅ Shipped | `AdmissionPanel` with drag-reorder, per-block Form ⇄ YAML toggle, inline validation matching server rules, synthesized `public-prefix:*` blocks surfaced read-only. |
+| 5 — Access section | ✅ Shipped | Credentials & mode sub-panel; `IamSourceBanner` on every Access sub-page explaining iam_mode authority. Users / Groups / External auth kept their existing layouts, now decorated with the banner. |
+| 6 — Storage section | ✅ Shipped | `BucketsPanel` with tri-state Anonymous read (None / Specific prefixes / Entire bucket → `public: true` shorthand). Test-connection button on backends. AntD 6 radio/checkbox shrink-on-click defeated in theme.css. |
+| 7 — Advanced section | ✅ Shipped | Five dedicated sub-panels (Listener & TLS, Caches, Limits, Logging, Config DB sync). `🔁` restart-required badging, env-var chips on env-owned fields, fabricated TOML hints removed (pre-Phase-3 artefact). |
+| 8 — First-run wizard | ⏳ Pending | — |
+| 9 — Trace + Dashboard | ⏳ Pending | `POST/GET /config/trace` endpoints exist (Phase 2 + Wave 1); a Trace page and Diagnostics dashboard rendering against them are the wave's UI work. |
+| 10 — Polish | ⏳ Pending | A11y, keyboard shortcuts, i18n wrappers, mobile responsive pass. |
+
+### Scope revisions made during delivery
+
+- **Right-rail simplification.** The plan proposed Copy YAML / Paste YAML (section-scoped) in the rail. In practice the rail ships **copy-only**; section-scoped paste lives in the `YamlImportExportModal` reached from the page header. Reason: two paste surfaces + per-section Monaco editors on-demand made "paste" functionally redundant and visually noisy.
+- **IAM Backup vs. YAML Import/Export.** The sidebar entry for the encrypted-DB backup was renamed from "Backup" to **IAM Backup** so operators don't confuse it with the YAML Import/Export modal. They are structurally different: IAM Backup ships the full encrypted SQLCipher DB (users, groups, OAuth, mappings); YAML Import/Export ships the operator config document. Both live in the GUI; the sidebar naming now makes that explicit.
+- **Section overview pages.** Added during live verification: every `/_/admin/configuration/<section>/` root URL now renders a lightweight overview with sub-entries + the IamSourceBanner where relevant (instead of hard-redirecting to the first sub-page), so deep-linking to a section root is a useful landing page.
+- **Fabricated TOML hints removed.** The pre-Phase-3 Limits / Security / Advanced-compression forms showed copyable `TOML:` and `ENV:` example strings below every field. Many of those TOML spellings were wrong for the sectioned YAML layout; all were removed. Env-only fields now show the monospace `from DGP_X_Y` chip described in Principle 2.2 instead.
 
 ---
 
