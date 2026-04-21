@@ -239,6 +239,122 @@ export async function applyConfigYaml(yaml: string): Promise<ConfigApplyResponse
   return safeJson(res);
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// Section-level config API (Wave 1 of the admin UI revamp).
+// ═══════════════════════════════════════════════════════════════════
+
+/** Four top-level sections of the YAML config, matching the sidebar groups. */
+export type SectionName = 'admission' | 'access' | 'storage' | 'advanced';
+
+/**
+ * Response from section PUT / validate. Mirrors `SectionApplyResponse`
+ * on the backend. The `diff` field drives the plan-diff-apply dialog
+ * (§5.3 of the admin UI revamp plan).
+ */
+export interface SectionApplyResponse {
+  ok: boolean;
+  warnings?: string[];
+  requires_restart?: boolean;
+  persisted_path?: string;
+  error?: string;
+  /**
+   * `{ section: { "field.path": { before, after } } }`. Only present
+   * when validation succeeded far enough to compute a diff — malformed
+   * bodies return `ok: false` without a diff.
+   */
+  diff?: Record<string, Record<string, { before: unknown; after: unknown }>>;
+}
+
+/**
+ * Fetch one top-level section of the runtime config. Returns the
+ * parsed JSON body — the shape is the section's type
+ * (`AdmissionSection` / `AccessSection` / `StorageSection` /
+ * `AdvancedSection` on the backend). Secrets are redacted.
+ *
+ * Empty-default sections return `{}`; the UI treats absent keys as
+ * defaults and lets `FormField`'s placeholder carry the default
+ * value.
+ */
+export async function getSection<T = unknown>(section: SectionName): Promise<T> {
+  const res = await adminFetch(`/api/admin/config/section/${section}`);
+  if (!res.ok) throw new Error(`Section fetch failed (${section}): ${res.status}`);
+  return safeJson(res);
+}
+
+/**
+ * Fetch one section as canonical YAML text (the `?format=yaml`
+ * variant). Backs the per-section Copy-as-YAML button.
+ */
+export async function getSectionYaml(section: SectionName): Promise<string> {
+  const res = await adminFetch(`/api/admin/config/section/${section}?format=yaml`);
+  if (!res.ok) throw new Error(`Section YAML fetch failed (${section}): ${res.status}`);
+  return res.text();
+}
+
+/**
+ * Apply a section body. On success: the section slice is swapped
+ * in-memory, side effects (engine rebuild, log reload, IAM state,
+ * snapshot rebuilds) fire, and the on-disk config file is
+ * rewritten. Response carries a diff for the Apply dialog.
+ */
+export async function putSection<T = unknown>(
+  section: SectionName,
+  body: T
+): Promise<SectionApplyResponse> {
+  const res = await adminFetch(`/api/admin/config/section/${section}`, 'PUT', body);
+  return safeJson(res);
+}
+
+/**
+ * Dry-run a section body. No runtime mutation, no persist. Returns
+ * `{ ok, warnings, requires_restart, diff }` for the plan step of
+ * the plan-diff-apply dialog.
+ */
+export async function validateSection<T = unknown>(
+  section: SectionName,
+  body: T
+): Promise<SectionApplyResponse> {
+  const res = await adminFetch(
+    `/api/admin/config/section/${section}/validate`,
+    'POST',
+    body
+  );
+  return safeJson(res);
+}
+
+/**
+ * Fetch the scoped JSON Schema for one section — feeds monaco-yaml
+ * when the editor is bound to a single section's YAML.
+ */
+export async function getSectionSchema(section: SectionName): Promise<unknown> {
+  const res = await adminFetch(`/api/admin/config/defaults?section=${section}`);
+  if (!res.ok) throw new Error(`Schema fetch failed (${section}): ${res.status}`);
+  return safeJson(res);
+}
+
+/**
+ * Fetch the full Config JSON Schema (no scope filter). Used by the
+ * whole-document Monaco editor and by any UI that needs to read
+ * defaults / descriptions for multiple sections at once.
+ */
+export async function getFullConfigSchema(): Promise<unknown> {
+  const res = await adminFetch('/api/admin/config/defaults');
+  if (!res.ok) throw new Error(`Schema fetch failed: ${res.status}`);
+  return safeJson(res);
+}
+
+/**
+ * Export one section as canonical YAML (via `/config/export?section=`).
+ * Equivalent to `getSectionYaml` but routed through the document-level
+ * export — useful when the UI wants to feed a section into the same
+ * modal as a full-document export.
+ */
+export async function exportSectionYaml(section: SectionName): Promise<string> {
+  const res = await adminFetch(`/api/admin/config/export?section=${section}`);
+  if (!res.ok) throw new Error(`Section export failed (${section}): ${res.status}`);
+  return res.text();
+}
+
 export interface PasswordChangeResponse {
   ok: boolean;
   error?: string;
