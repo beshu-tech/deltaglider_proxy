@@ -72,6 +72,14 @@ pub struct ConfigResponse {
     // Multi-backend
     backends: Vec<BackendInfoResponse>,
     default_backend: Option<String>,
+    // Operator-authored admission blocks (Phase 3b.2). The UI uses
+    // this for the new Admission tab; empty vec when no blocks are
+    // authored.
+    admission_blocks: Vec<crate::admission::AdmissionBlockSpec>,
+    // IAM source-of-truth mode (Phase 3c.1). `"gui"` or `"declarative"`.
+    // The UI uses this to render a banner when declarative mode is
+    // active (IAM edits blocked) and to drive a toggle.
+    iam_mode: crate::config_sections::IamMode,
     // Fields that differ from the TOML config file on disk
     tainted_fields: Vec<String>,
 }
@@ -143,6 +151,16 @@ pub struct ConfigUpdateRequest {
     // `Config::buckets`, keeping canonical JSON responses deterministic).
     pub bucket_policies:
         Option<std::collections::BTreeMap<String, crate::bucket_policy::BucketPolicyConfig>>,
+    // Operator-authored admission blocks (Phase 3b.2). Replaces the
+    // full list on PATCH when present. `AdmissionSpec::validate` runs
+    // before assignment — invalid blocks surface as warnings and the
+    // PATCH rejects (the legacy "always 200 with warnings" contract
+    // still covers validation errors via the `warnings` field).
+    pub admission_blocks: Option<Vec<crate::admission::AdmissionBlockSpec>>,
+    // IAM source-of-truth selector (Phase 3c.1). Accepts `"gui"` or
+    // `"declarative"`; the middleware that gates IAM mutation routes
+    // picks up the new value on the next request.
+    pub iam_mode: Option<crate::config_sections::IamMode>,
 }
 
 #[derive(Serialize)]
@@ -365,6 +383,14 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
         backend_has_credentials,
         backends: backends_info,
         default_backend: cfg.default_backend.clone(),
+        // Admission chain (Phase 3b.2) — forwarded verbatim so the UI
+        // can render an editor. Collapse the `[""]` sentinel on the
+        // bucket-policy side is handled elsewhere; admission blocks
+        // are operator-authored and round-trip without transformation.
+        admission_blocks: cfg.admission_blocks.clone(),
+        // IAM source-of-truth selector (Phase 3c.1). Included so the
+        // UI can drive the `iam_mode: declarative` banner + toggle.
+        iam_mode: cfg.iam_mode,
         tainted_fields,
     })
 }
@@ -470,6 +496,35 @@ pub async fn update_config(
             }
         }
         cfg.buckets = new_buckets;
+    }
+
+    // Operator-authored admission blocks. PATCH replaces the full
+    // list — identical semantics to `bucket_policies` above. Validation
+    // runs through `AdmissionSpec::validate` so duplicate names, bad
+    // reject statuses, unsafe `source_ip_list` sizes, and bad globs
+    // are caught here and surfaced as warnings (same 200-with-warnings
+    // contract the rest of this handler uses).
+    if let Some(ref blocks) = body.admission_blocks {
+        let spec = crate::admission::AdmissionSpec {
+            blocks: blocks.clone(),
+        };
+        match spec.validate() {
+            Ok(()) => cfg.admission_blocks = blocks.clone(),
+            Err(e) => {
+                warnings.push(format!("admission_blocks: {}", e));
+                // Don't touch runtime state on validation failure —
+                // the operator's next GET must still show the old
+                // (valid) chain.
+            }
+        }
+    }
+
+    // IAM source-of-truth selector. Changing this triggers the
+    // `require_not_declarative` middleware to flip its gate on every
+    // subsequent IAM mutation request — `apply_config_transition`
+    // also emits a warn-level audit log line on the transition.
+    if let Some(new_mode) = body.iam_mode {
+        cfg.iam_mode = new_mode;
     }
 
     // ── Run transition side effects ──────────────────────────────────────

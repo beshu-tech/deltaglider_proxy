@@ -94,9 +94,49 @@ export interface AdminConfig {
   default_backend: string | null;
   // Logging
   log_level: string;
+  // Operator-authored admission blocks (Phase 3b.2). The new
+  // Admission tab in the admin UI reads/writes this. Round-tripped
+  // verbatim — no client-side transformation.
+  admission_blocks: AdmissionBlock[];
+  // IAM source-of-truth mode (Phase 3c.1). `"gui"` (DB authoritative)
+  // or `"declarative"` (YAML authoritative; IAM mutation routes 403).
+  iam_mode: IamMode;
   // Taint detection
   tainted_fields: string[];
 }
+
+export type IamMode = 'gui' | 'declarative';
+
+/**
+ * Operator-authored admission block. Structure mirrors the backend
+ * `AdmissionBlockSpec` — round-tripped verbatim through PATCH /config.
+ *
+ * Validation (duplicate names, bad Reject status, source_ip_list cap,
+ * path_glob syntax, reserved `public-prefix:*` name prefix) runs
+ * server-side at PATCH time; clients should display any resulting
+ * `warnings` strings to the operator.
+ */
+export interface AdmissionBlock {
+  name: string;
+  match: AdmissionMatch;
+  action: AdmissionAction;
+}
+
+export interface AdmissionMatch {
+  method?: string[];
+  source_ip?: string;
+  source_ip_list?: string[];
+  bucket?: string;
+  path_glob?: string;
+  authenticated?: boolean;
+  config_flag?: string;
+}
+
+export type AdmissionAction =
+  | 'allow-anonymous'
+  | 'deny'
+  | 'continue'
+  | { type: 'reject'; status: number; message?: string };
 
 export interface BackendInfo {
   name: string;
@@ -148,6 +188,54 @@ async function safeJson<T>(res: Response): Promise<T> {
 export async function updateAdminConfig(updates: Record<string, unknown>): Promise<ConfigUpdateResponse> {
   const res = await adminFetch('/api/admin/config', 'PUT', updates);
   if (!res.ok) throw new Error(`Config update failed: ${res.status}`);
+  return safeJson(res);
+}
+
+/**
+ * Fetch the current runtime config as canonical YAML (four-section
+ * shape, secrets redacted). Backs the "Copy as YAML" / "Export"
+ * button flows. Returns the raw YAML string — the UI renders it
+ * syntax-highlighted in a modal.
+ */
+export async function exportConfigYaml(): Promise<string> {
+  const res = await adminFetch('/api/admin/config/export');
+  if (!res.ok) throw new Error(`Config export failed: ${res.status}`);
+  return res.text();
+}
+
+export interface ConfigValidateResponse {
+  ok: boolean;
+  warnings: string[];
+  error?: string;
+}
+
+/**
+ * Dry-run a YAML document against the live server's validator. No
+ * runtime state is mutated. The "Import YAML" flow uses this before
+ * showing a confirm-apply dialog.
+ */
+export async function validateConfigYaml(yaml: string): Promise<ConfigValidateResponse> {
+  const res = await adminFetch('/api/admin/config/validate', 'POST', { yaml });
+  return safeJson(res);
+}
+
+export interface ConfigApplyResponse {
+  applied: boolean;
+  persisted: boolean;
+  requires_restart: boolean;
+  warnings: string[];
+  error?: string;
+  persisted_path?: string;
+}
+
+/**
+ * Apply a full YAML config document. The server runs validation,
+ * merges runtime secrets forward, atomically swaps the in-memory
+ * config, and persists to disk. Admin GUI's "Import from YAML" and
+ * "Paste YAML" flows both terminate here.
+ */
+export async function applyConfigYaml(yaml: string): Promise<ConfigApplyResponse> {
+  const res = await adminFetch('/api/admin/config/apply', 'POST', { yaml });
   return safeJson(res);
 }
 

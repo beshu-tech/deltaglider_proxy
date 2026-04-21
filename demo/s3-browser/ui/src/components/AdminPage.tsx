@@ -25,6 +25,8 @@ import MetricsPage from './MetricsPage';
 import OAuthProviderList from './OAuthProviderList';
 import { useNavigation } from '../NavigationContext';
 import TabHeader from './TabHeader';
+import { YamlImportExportModal } from './YamlImportExportModal';
+import { FileTextOutlined, ImportOutlined } from '@ant-design/icons';
 
 const { Text } = Typography;
 
@@ -69,6 +71,10 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
   const [loginLoading, setLoginLoading] = useState(false);
   const [pendingGroupId, setPendingGroupId] = useState<number | null>(null);
   const [loginError, setLoginError] = useState('');
+  // YAML import/export modal state. Mode flips between 'import'
+  // (paste YAML → validate → apply) and 'export' (fetch current
+  // canonical YAML → copy to clipboard).
+  const [yamlModalMode, setYamlModalMode] = useState<'import' | 'export' | null>(null);
 
   // Check existing session on mount, or auto-login for IAM admins
   useEffect(() => {
@@ -247,7 +253,46 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
       flex: 1,
       background: colors.BG_BASE,
     }}>
-      <FullScreenHeader title="Admin Settings" onBack={onBack} />
+      <FullScreenHeader
+        title="Admin Settings"
+        onBack={onBack}
+        extra={
+          <Space size={4}>
+            <Button
+              size="small"
+              type="text"
+              icon={<FileTextOutlined />}
+              onClick={() => setYamlModalMode('export')}
+              title="Copy the current config as canonical YAML (secrets redacted). Works with dgpctl apply on the other side."
+              style={{ color: colors.TEXT_MUTED, fontFamily: 'var(--font-ui)' }}
+            >
+              <span className="hide-mobile" style={{ marginLeft: 4 }}>Export YAML</span>
+            </Button>
+            <Button
+              size="small"
+              type="text"
+              icon={<ImportOutlined />}
+              onClick={() => setYamlModalMode('import')}
+              title="Paste a YAML config document — validate, then apply + persist."
+              style={{ color: colors.TEXT_MUTED, fontFamily: 'var(--font-ui)' }}
+            >
+              <span className="hide-mobile" style={{ marginLeft: 4 }}>Import YAML</span>
+            </Button>
+          </Space>
+        }
+      />
+      <YamlImportExportModal
+        open={yamlModalMode !== null}
+        mode={yamlModalMode ?? 'export'}
+        onClose={() => setYamlModalMode(null)}
+        onApplied={() => {
+          // Soft refresh — reload the page so every panel re-fetches
+          // from the updated /config endpoint. The alternative (piping
+          // refresh signals to every tab's child component) is too
+          // fragile for a surface this cross-cutting.
+          window.location.reload();
+        }}
+      />
 
       {/* Body: sidebar tabs + content */}
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
