@@ -27,8 +27,9 @@ DeltaGlider Proxy sits between your S3 clients and one or more storage backends 
 
 ### Getting Started
 
-- [Operations](OPERATIONS.md) — running, configuring, deploying, admin GUI features
-- [Configuration Reference](CONFIGURATION.md) — all settings (TOML + env vars), backend routing, bucket policies
+- [Operations](OPERATIONS.md) — running, configuring, deploying, admin GUI features, admin API endpoint catalog
+- [Configuration Reference](CONFIGURATION.md) — all settings (canonical YAML + env vars + TOML equivalents), backend routing, bucket policies, admission chain
+- [Migrate TOML → YAML](HOWTO_MIGRATE_TO_YAML.md) — canonical format since v0.8.0
 
 ### Authentication & Access Control
 
