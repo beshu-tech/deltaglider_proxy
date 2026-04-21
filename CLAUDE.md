@@ -35,6 +35,7 @@ CI runs: `fmt` → `clippy -D warnings` → `test` (with MinIO) → RustSec audi
 
 ```
 HTTP request
+  → admission/middleware.rs  Pre-auth admission chain (deny / reject / allow-anonymous)
   → api/handlers/       S3-compatible handlers split by domain:
       object.rs            GET/PUT/HEAD/DELETE (range, conditional, Content-MD5, ACL stubs)
       bucket.rs            Bucket CRUD and ListObjectsV2 (start-after, encoding-type, fetch-owner, base64 tokens)
@@ -51,14 +52,22 @@ HTTP request
   → storage/s3.rs           AWS S3/MinIO impl (S3 user metadata headers, S3Op enum)
   → demo.rs                 Embedded UI + admin API router, mounted under /_/
   → session.rs              In-memory session store (OsRng tokens, 4h default TTL)
+  → admission/              Admission chain (pre-auth gating):
+      spec.rs                Operator-authored YAML wire format (AdmissionBlockSpec, MatchSpec, ActionSpec)
+      evaluator.rs           Decision evaluator (first-match-wins over compiled chain)
+      middleware.rs          Request-info extraction, marker injection for AllowAnonymous
+      mod.rs                 Runtime Match/Action/Decision types, chain builder
+  → config.rs               Flat in-memory Config struct + ENV_VAR_REGISTRY
+  → config_sections.rs      Sectioned YAML wire shape (admission/access/storage/advanced) + shorthand expanders
   → iam/                    IAM module:
       mod.rs                 IamState enum, auth mode detection
       types.rs               IamUser, AuthenticatedUser, Permission types
       permissions.rs         ABAC evaluation, is_admin, action matching
       middleware.rs          Per-request auth middleware
       keygen.rs              Secure key generation
-  → config_db.rs            Encrypted SQLCipher database for IAM users
+  → config_db/              Encrypted SQLCipher database for IAM users
   → config_db_sync.rs       Multi-instance IAM sync via S3 (DGP_CONFIG_SYNC_BUCKET)
+  → cli/config.rs           `config migrate|lint|schema|defaults|apply` + `admission trace`
 ```
 
 **Key data flow:**
@@ -73,41 +82,53 @@ HTTP request
 - `FileMetadata` (in `types.rs`) — per-object metadata with DG-specific tags; `fallback()` constructor for unmanaged objects
 - `Engine::validated_key()` — shared parse+validate+deltaspace_id helper used by all public engine methods
 - `IamState` (in `iam/mod.rs`) — enum: `Disabled`, `Legacy(AuthConfig)`, or `Iam(IamIndex)` for multi-user auth
-- `ConfigDb` (in `config_db.rs`) — encrypted SQLCipher database for IAM users, stored as `deltaglider_config.db`
+- `IamMode` (in `config_sections.rs`) — `Gui` (default) = encrypted IAM DB is source of truth; `Declarative` = YAML owns IAM state and admin-API IAM mutations return 403. Phase 3c.3 reconciler (sync-diff DB ↔ YAML on apply) is still pending — declarative mode is currently a lockout.
+- `ConfigDb` (in `config_db/mod.rs`) — encrypted SQLCipher database for IAM users, groups, OAuth providers, and mapping rules. Stored as `deltaglider_config.db`. Independent of the YAML config file; `access: {}` in YAML with no legacy SigV4 creds is **correct** when IAM users exist in the DB.
+- `SectionedConfig` (in `config_sections.rs`) — serde boundary only: the on-disk sectioned YAML shape (`admission` / `access` / `storage` / `advanced`). Collapsed into/from the flat `Config` struct via `into_flat` / `from_flat`. Canonical YAML export always uses the sectioned shape; the flat shape still loads for backwards compat. Hard error on "mixed" shapes (a doc that combines flat-root + section-header keys).
+- `AdmissionBlockSpec` (in `admission/spec.rs`) — operator-authored wire format for admission blocks: `name`, `match` (method / source_ip / source_ip_list CIDR / bucket / path_glob / authenticated / config_flag), `action` (allow-anonymous / deny / reject { status, message } / continue). `source_ip_list` capped at 4096 entries; names restricted to `[A-Za-z0-9_:.-]` (max 128 chars) with the `public-prefix:` prefix reserved for synthesized blocks.
 - `MetadataCache` (in `metadata_cache.rs`) — 50MB moka-based in-memory cache for `FileMetadata`. Populated on PUT, HEAD, and LIST+metadata=true. Consulted on HEAD, GET, and LIST (even without metadata=true, for file_size correction). Invalidated on DELETE (exact key) and prefix delete (all matching keys). 10-minute TTL. Configurable size via `DGP_METADATA_CACHE_MB` (default: 50).
 - `RateLimiter` (in `rate_limiter.rs`) — per-IP token bucket rate limiter for auth endpoints. 100 attempts per 5-minute window, 10-minute lockout after exhaustion (configurable via `DGP_RATE_LIMIT_*` env vars). Expired entries cleaned up periodically.
 - `UsageScanner` (in `usage_scanner.rs`) — background prefix size scanner with 5-minute cached results, 1000-entry LRU, and 100K-object scan cap per prefix.
 - `S3Op` (in `storage/s3.rs`) — enum for S3 operation context in error classification
 - `SessionStore` (in `session.rs`) — in-memory session store with OsRng token generation, configurable TTL (`DGP_SESSION_TTL_HOURS`, default 4h), IP binding, max 10 concurrent sessions with oldest-eviction.
-- `env_parse()` / `env_parse_opt()` (in `config.rs`) — DRY helpers for environment variable parsing
-- `PublicPrefixSnapshot` (in `bucket_policy.rs`) — pre-built index of public prefix config for the SigV4 auth middleware. Stored in `Arc<ArcSwap<...>>` for lock-free reads, rebuilt on config hot-reload. When a request targets a public prefix without auth credentials, an anonymous `$anonymous` `AuthenticatedUser` is constructed with scoped read+list permissions (including `s3:prefix` conditions for LIST scoping).
+- `env_parse()` / `env_bool()` / `env_parse_with_default()` (in `config.rs`) — DRY helpers for environment variable parsing
+- `PublicPrefixSnapshot` (in `bucket_policy.rs`) — pre-built index of public prefix config for the SigV4 auth middleware. Stored in `Arc<ArcSwap<...>>` for lock-free reads, rebuilt on config hot-reload. When a request targets a public prefix without auth credentials, an anonymous `$anonymous` `AuthenticatedUser` is constructed with scoped read+list permissions (including `s3:prefix` conditions for LIST scoping). Synthesized admission blocks with name prefix `public-prefix:` are derived from bucket `public_prefixes` entries.
 
-**Config:** TOML file (`deltaglider_proxy.toml`) with env var overrides (`DGP_*` prefix). See `deltaglider_proxy.toml.example`. Per-bucket policies support `public_prefixes` for unauthenticated read-only access.
+**Config:** Canonical format is **YAML** (`deltaglider_proxy.yaml`) with four optional top-level sections — `admission`, `access`, `storage`, `advanced`. Legacy TOML (`deltaglider_proxy.toml`) still loads but emits a deprecation warning on every startup; `DGP_SILENCE_TOML_DEPRECATION=1` suppresses it. Convert via `deltaglider_proxy config migrate <toml> --out <yaml>`. Env var overrides (`DGP_*` prefix) apply on top of whichever file is loaded. See `deltaglider_proxy.example.yaml` (canonical) and `deltaglider_proxy.toml.example` (deprecated, kept for reference). Per-bucket policies support `public_prefixes` (and the `public: true` shorthand) for unauthenticated read-only access. Config file-search order: `DGP_CONFIG` env > `./deltaglider_proxy.yaml` > `.yml` > `.toml` > `/etc/deltaglider_proxy/config.{yaml,yml,toml}`.
 
 ## Authentication & IAM
 
 The proxy **refuses to start** without authentication credentials unless `authentication = "none"` is explicitly set (dev only). Two auth modes at runtime, determined by whether IAM users exist in the config DB:
 
-- **Bootstrap mode**: Single credential pair from TOML/env vars (`DGP_ACCESS_KEY_ID` + `DGP_SECRET_ACCESS_KEY`). Admin GUI requires the bootstrap password. This is the default on fresh installs.
+- **Bootstrap mode**: Single credential pair from YAML/TOML/env vars (`DGP_ACCESS_KEY_ID` + `DGP_SECRET_ACCESS_KEY`). Admin GUI requires the bootstrap password. This is the default on fresh installs.
 - **IAM mode**: Per-user credentials from encrypted SQLCipher DB (`deltaglider_config.db`). Admin GUI access is permission-based (no password needed for IAM admins).
 - **Open access** (dev only): Set `authentication = "none"` or `DGP_AUTHENTICATION=none`. No SigV4 verification.
+
+Orthogonal to bootstrap/IAM mode, the **`access.iam_mode` YAML selector** (Phase 3c) controls *where IAM state lives*:
+
+- `gui` (default) — encrypted SQLCipher DB is the source of truth. Admin GUI + admin API mutate the DB directly.
+- `declarative` — YAML is authoritative. Admin API IAM mutation routes (`POST/PUT/PATCH/DELETE` on `/users`, `/groups`, `/ext-auth/*`, `/migrate`, backup import) return `403 { "error": "iam_declarative" }`. Read endpoints stay accessible for diagnostics. The reconciler that sync-diffs DB to YAML is Phase 3c.3 (pending) — declarative mode today is a pure lockout; seed IAM via a one-time GUI session, then flip. Mode transitions are audit-logged (warn-level).
 
 The **bootstrap password** is a single infrastructure secret that:
 1. Encrypts the SQLCipher config DB
 2. Signs admin GUI session cookies
 3. Gates admin GUI access in bootstrap mode (before IAM users exist)
 
-Auto-generated on first run (printed to stderr). Reset via `--set-bootstrap-password` CLI flag (warning: invalidates encrypted IAM database).
+Auto-generated on first run (printed to stderr when stderr is a TTY; hidden in containers/CI — only the bcrypt hash is logged). Reset via `--set-bootstrap-password` CLI flag (warning: invalidates encrypted IAM database).
 
-IAM users have ABAC permissions: `{ actions: ["read", "write", "delete", "list", "admin"], resources: ["bucket/*"] }`. Admin = wildcard actions AND wildcard resources.
+IAM users have ABAC permissions: `{ actions: ["read", "write", "delete", "list", "admin"], resources: ["bucket/*"] }`. Admin = wildcard actions AND wildcard resources. The IAM DB is independent of the YAML config file — `access: {}` in YAML with no legacy creds is correct when users/groups/OAuth providers live in the DB. Multi-instance sync via S3 (`DGP_CONFIG_SYNC_BUCKET` / `config_sync_bucket`) uploads the encrypted DB after every mutation; readers poll S3 every 5 minutes and download on ETag change.
 
-Key files: `src/iam/` (types, permissions, middleware, keygen), `src/config_db.rs` (SQLCipher CRUD), `src/api/admin/` (auth, users CRUD, config, groups, backup, scanner).
+Key files: `src/iam/` (types, permissions, middleware, keygen), `src/config_db/` (SQLCipher CRUD), `src/config_db_sync.rs` (S3 sync), `src/api/admin/` (auth, users CRUD, config, groups, backup, scanner), `src/api/admin/config/section_level.rs` (section-level admin API with RFC 7396 merge-patch semantics).
 
 ## Frontend (demo/s3-browser/ui)
 
 React 18 + TypeScript + Ant Design 6 + Recharts. Path-based routing (`/_/browse`, `/_/upload`, `/_/metrics`, `/_/docs/configuration`, `/_/admin/users`). Custom `usePathRouter` hook (no react-router dependency). `NavigationContext` provides `navigate()` and `subPath` to child components. Embedded in the Rust binary via `rust-embed` and served under `/_/` on the same port as the S3 API (e.g., `http://localhost:9000/_/`). The `/_/` prefix is safe because `_` is not a valid S3 bucket name character. Single-port architecture: no separate UI port.
 
-Key components: `MetricsPage` (Prometheus dashboard + analytics with Monitoring/Analytics tab toggle), `AnalyticsSection` (cost savings dashboard with per-bucket charts), `ObjectTable` (sortable, double-click preview, bulk selection), `BulkActionBar` (Copy/Move/ZIP/Delete for selected objects), `DestinationPickerModal` (bucket+prefix picker for copy/move), `InspectorPanel` (object details drawer with download, share duration selector, storage stats, metadata), `FilePreview` (double-click preview for text/images), `AdminPage` (full-screen settings with user management, tabs), `UsersPanel` (master-detail IAM user CRUD with ABAC permissions, effective permissions view), `UserForm`, `AuthenticationPanel` (OAuth/OIDC providers, group mapping rules), `BackendsPanel` (storage backends + compression + per-bucket policies), `SimpleSelect`/`SimpleAutoComplete` (custom dropdowns — Ant Design popups are broken in this layout), `OAuthProviderList` (shared OAuth buttons), `TabHeader` (centered tab headers), `DocsPage` (embedded markdown docs with search, Mermaid diagrams, lightbox), `DocsLanding` (landing page with screenshots and feature cards), `FullScreenHeader` (shared header for Admin/Docs with branding and theme toggle). Admin API at `/_/api/admin/*` (login, login-as, whoami, users CRUD, groups, config, auth providers, mapping rules, backup). Whoami returns user identity from session (name, access_key_id, is_admin, version). S3 operations in `s3client.ts` (includes copyObject, listAllKeys, getObjectBytes). Metrics at `/_/metrics`, stats at `/_/stats` (metadata=true for accurate delta sizes), health at `/_/health` (no version — security). Error pages respect user theme (dark/light via localStorage + CSS prefers-color-scheme). **Ant Design tooltips are globally disabled** via CSS (`display: none !important` on `.ant-tooltip, .ant-popover`) — use native `title` attributes instead.
+The admin UI revamp (waves 1-6 shipped; see `docs/plan/admin-ui-revamp.md`) restructures the admin settings into a 4-group IA (Diagnostics + Configuration: Admission / Access / Storage / Advanced) with hierarchical URLs (`/_/admin/configuration/access/credentials`, `/_/admin/configuration/storage/buckets`, etc.). Legacy flat URLs (`/_/admin/users`, `/_/admin/backends`) keep working via `LEGACY_TO_NEW` in `AdminPage.tsx`.
+
+Key components: `MetricsPage` (Prometheus dashboard + analytics with Monitoring/Analytics tab toggle), `AnalyticsSection` (cost savings dashboard with per-bucket charts), `ObjectTable` (sortable, double-click preview, bulk selection), `BulkActionBar` (Copy/Move/ZIP/Delete for selected objects), `DestinationPickerModal` (bucket+prefix picker for copy/move), `InspectorPanel` (object details drawer with download, share duration selector, storage stats, metadata), `FilePreview` (double-click preview for text/images), `AdminPage` (full-screen settings container with hierarchical routing), `AdminSidebar` (4-group IA; amber dot for sections with unsaved edits), `RightRailActions` (Apply/Discard/Copy YAML/Paste YAML/Export all/Import all), `FormField` (label + YAML-path breadcrumb + help + default-placeholder + override-indicator + owner-badge wrapper), `ApplyDialog` (plan→diff→apply modal), `MonacoYamlEditor` (lazy-loaded Monaco + monaco-yaml with scoped JSON Schema), `IamSourceBanner` (explains DB vs YAML ownership for Access pages), `UsersPanel` (master-detail IAM user CRUD with ABAC permissions, effective permissions view), `UserForm`, `AuthenticationPanel` (OAuth/OIDC providers, group mapping rules), `BackendsPanel` (storage backends), `BucketsPanel` (per-bucket policies with tri-state public read toggle: None / Specific prefixes / Entire bucket), `AdmissionPanel` (operator-authored block editor with drag-reorder + per-block form & YAML views), `SimpleSelect`/`SimpleAutoComplete` (custom dropdowns — Ant Design popups are broken in this layout), `OAuthProviderList` (shared OAuth buttons), `TabHeader` (centered tab headers), `DocsPage` (embedded markdown docs with search, Mermaid diagrams, lightbox), `DocsLanding` (landing page with screenshots and feature cards), `FullScreenHeader` (shared header for Admin/Docs with branding and theme toggle), `YamlImportExportModal` (full-document YAML round-trip). `useDirtySection` hook backs per-panel dirty state; `useDirtyGlobalIndicators` drives the `● ` tab-title prefix and beforeunload guard.
+
+Admin API at `/_/api/admin/*` (login, login-as, whoami, users CRUD, groups, config, auth providers, mapping rules, backup, config/section/:name, config/export, config/apply, config/validate, config/trace, config/defaults). Whoami returns user identity from session (name, access_key_id, is_admin, version). S3 operations in `s3client.ts` (includes copyObject, listAllKeys, getObjectBytes). Metrics at `/_/metrics`, stats at `/_/stats` (metadata=true for accurate delta sizes), health at `/_/health` (no version — security). Error pages respect user theme (dark/light via localStorage + CSS prefers-color-scheme). **Ant Design tooltips are globally disabled** via CSS (`display: none !important` on `.ant-tooltip, .ant-popover`) — use native `title` attributes instead. The AntD 6 radio/checkbox "shrink on click" default is disabled in `theme.css`.
 
 ## Testing
 
