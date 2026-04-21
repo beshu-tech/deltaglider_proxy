@@ -231,12 +231,14 @@ impl AdmissionChain {
     /// override a deny can move their allow block further down or
     /// express the intent directly.
     ///
-    /// Blocks whose compilation fails (bad glob, unknown config_flag)
-    /// are SKIPPED with a `tracing::warn!` naming the block; the rest
-    /// of the chain still loads. Rationale: a single typo in one block
-    /// should not break the entire chain and take the server down —
-    /// validation already runs at config load time, so getting here
-    /// with a compile error is a rare edge case.
+    /// `compile_block` is defence-in-depth: `AdmissionSpec::validate`
+    /// runs at load time and rejects the full config with a
+    /// `ConfigError::Parse` for bad globs, IP lists, reject statuses,
+    /// name collisions, etc. — so `compile_block` erroring here
+    /// indicates a bypassed validation path. The block is skipped
+    /// with a `tracing::warn!` rather than crashing the server;
+    /// losing one synthesised chain entry beats taking the server
+    /// down over an unreachable code path.
     pub fn from_config_parts(
         buckets: &std::collections::BTreeMap<String, crate::bucket_policy::BucketPolicyConfig>,
         operator_blocks: &[crate::admission::AdmissionBlockSpec],

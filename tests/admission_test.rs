@@ -364,7 +364,11 @@ async fn apply_admission_yaml(
 
 #[tokio::test]
 async fn test_operator_deny_block_produces_deny_decision() {
-    let server = TestServer::builder().auth("DENYK1", "DENYS1").build().await;
+    let server = TestServer::builder()
+        .yaml_config()
+        .auth("DENYK1", "DENYS1")
+        .build()
+        .await;
     let admin = admin_http_client(&server.endpoint()).await;
 
     apply_admission_yaml(
@@ -420,7 +424,11 @@ admission:
 
 #[tokio::test]
 async fn test_operator_reject_block_produces_reject_with_status() {
-    let server = TestServer::builder().auth("REJK1", "REJS1").build().await;
+    let server = TestServer::builder()
+        .yaml_config()
+        .auth("REJK1", "REJS1")
+        .build()
+        .await;
     let admin = admin_http_client(&server.endpoint()).await;
 
     apply_admission_yaml(
@@ -469,7 +477,11 @@ async fn test_operator_deny_short_circuits_live_s3_path() {
     // Because the test server won't have that env set, this test
     // exercises the path_glob + authenticated predicates instead — they
     // don't need source_ip to fire.
-    let server = TestServer::builder().auth("DENYLK", "DENYLS").build().await;
+    let server = TestServer::builder()
+        .yaml_config()
+        .auth("DENYLK", "DENYLS")
+        .build()
+        .await;
     let admin = admin_http_client(&server.endpoint()).await;
 
     apply_admission_yaml(
@@ -514,7 +526,11 @@ admission:
 
 #[tokio::test]
 async fn test_operator_reject_short_circuits_live_s3_path() {
-    let server = TestServer::builder().auth("REJLK", "REJLS").build().await;
+    let server = TestServer::builder()
+        .yaml_config()
+        .auth("REJLK", "REJLS")
+        .build()
+        .await;
     let admin = admin_http_client(&server.endpoint()).await;
 
     apply_admission_yaml(
@@ -546,7 +562,11 @@ admission:
 
 #[tokio::test]
 async fn test_operator_path_glob_predicate_via_trace() {
-    let server = TestServer::builder().auth("PGK1", "PGS1").build().await;
+    let server = TestServer::builder()
+        .yaml_config()
+        .auth("PGK1", "PGS1")
+        .build()
+        .await;
     let admin = admin_http_client(&server.endpoint()).await;
 
     apply_admission_yaml(
@@ -603,7 +623,11 @@ async fn test_admission_blocks_roundtrip_through_export_apply() {
     // GitOps dogfood for Phase 3b.2.b: apply a block, export the
     // canonical YAML, re-apply it, trace once more — behavior
     // unchanged on the second apply.
-    let server = TestServer::builder().auth("RTK1", "RTS1").build().await;
+    let server = TestServer::builder()
+        .yaml_config()
+        .auth("RTK1", "RTS1")
+        .build()
+        .await;
     let admin = admin_http_client(&server.endpoint()).await;
 
     let original_yaml = r#"
@@ -664,4 +688,143 @@ admission:
         .unwrap();
     assert_eq!(trace["admission"]["decision"], "deny");
     assert_eq!(trace["admission"]["matched"], "deny-bad");
+}
+
+/// M4 from deep correctness review (sub-case b): bucket `public: true`
+/// AND an operator-authored admission block referencing that same
+/// bucket. Operator block should fire BEFORE the synthesised
+/// public-prefix block; both should coexist in the chain without
+/// name collision (the operator block cannot be named
+/// `public-prefix:...` — H3 guards that).
+#[tokio::test]
+async fn test_operator_block_coexists_with_bucket_public_shorthand() {
+    let server = TestServer::builder()
+        .yaml_config()
+        .auth("COEXK", "COEXS")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    // Fetch current config and merge: add a public bucket AND an
+    // operator deny block for a subset of its IPs.
+    let exported: String = admin
+        .get(format!("{}/_/api/admin/config/export", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let mut doc: serde_yaml::Value = serde_yaml::from_str(&exported)
+        .unwrap_or(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    let root = doc.as_mapping_mut().unwrap();
+
+    // storage.buckets.docs = { public: true }
+    let storage = root
+        .entry(serde_yaml::Value::String("storage".into()))
+        .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()))
+        .as_mapping_mut()
+        .unwrap();
+    let buckets = storage
+        .entry(serde_yaml::Value::String("buckets".into()))
+        .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()))
+        .as_mapping_mut()
+        .unwrap();
+    let mut bucket_policy = serde_yaml::Mapping::new();
+    bucket_policy.insert("public".into(), true.into());
+    buckets.insert("docs".into(), serde_yaml::Value::Mapping(bucket_policy));
+
+    // admission.blocks[0] = deny range 203.0.113.0/24 targeting `docs`
+    let admission_yaml = serde_yaml::from_str::<serde_yaml::Value>(
+        r#"
+blocks:
+  - name: deny-bad-ips-from-docs
+    match:
+      bucket: docs
+      source_ip_list: ["203.0.113.0/24"]
+    action: deny
+"#,
+    )
+    .unwrap();
+    root.insert("admission".into(), admission_yaml);
+
+    let merged = serde_yaml::to_string(&doc).unwrap();
+    let resp = admin
+        .post(format!("{}/_/api/admin/config/apply", server.endpoint()))
+        .json(&json!({ "yaml": merged }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert_eq!(status, StatusCode::OK, "apply failed: {body}");
+
+    // Blocked IP: operator deny wins.
+    let trace: serde_json::Value = admin
+        .post(format!("{}/_/api/admin/config/trace", server.endpoint()))
+        .json(&json!({
+            "method": "GET",
+            "path": "/docs/readme.md",
+            "authenticated": false,
+            "source_ip": "203.0.113.5"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(trace["admission"]["decision"], "deny");
+    assert_eq!(trace["admission"]["matched"], "deny-bad-ips-from-docs");
+
+    // Unblocked IP: synthesised public-prefix block admits.
+    let trace: serde_json::Value = admin
+        .post(format!("{}/_/api/admin/config/trace", server.endpoint()))
+        .json(&json!({
+            "method": "GET",
+            "path": "/docs/readme.md",
+            "authenticated": false,
+            "source_ip": "198.51.100.7"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(trace["admission"]["decision"], "allow-anonymous");
+    assert_eq!(trace["admission"]["matched"], "public-prefix:docs");
+}
+
+/// M4 from deep correctness review (sub-case c): a mixed-shape YAML
+/// (flat root key `listen_addr:` alongside sectioned `storage:`)
+/// POSTed to `/apply` should produce a 400 with a named classifier
+/// error — not a silent accept.
+#[tokio::test]
+async fn test_apply_rejects_mixed_flat_plus_sectioned_yaml() {
+    let server = TestServer::builder().auth("MIXEDK", "MIXEDS").build().await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    let mixed = r#"
+listen_addr: "127.0.0.1:9000"
+storage:
+  filesystem: /var/dgp
+"#;
+    let resp = admin
+        .post(format!("{}/_/api/admin/config/apply", server.endpoint()))
+        .json(&json!({ "yaml": mixed }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "mixed flat+sectioned YAML must be rejected via /apply"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let err = body["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("listen_addr") && err.contains("storage"),
+        "error must name both conflicting keys, got: {err}"
+    );
 }

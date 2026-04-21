@@ -245,6 +245,25 @@ pub(super) async fn apply_config_transition(
         rebuild_bucket_derived_snapshots(state, &new_cfg.buckets, &new_cfg.admission_blocks);
     }
 
+    // 4b. IAM-mode transitions. Declarative ↔ gui flips are security-
+    //     meaningful — the declarative-mode "escape hatch" is a pair of
+    //     `/apply` calls (flip to gui, mutate, flip back) and auditors
+    //     need to see it distinctly from other config changes. Emits a
+    //     warn-level log line with the direction so SIEM / log-review
+    //     workflows can alert on it.
+    if old_cfg.iam_mode != new_cfg.iam_mode {
+        tracing::warn!(
+            target: "deltaglider_proxy::config",
+            from = ?old_cfg.iam_mode,
+            to = ?new_cfg.iam_mode,
+            "[config] access.iam_mode changed: {:?} → {:?}. In declarative mode the admin-\
+             API IAM mutation routes return 403; a flip to `gui` restores them. Review the \
+             subsequent apply_config audit log entries to see what mutations followed.",
+            old_cfg.iam_mode,
+            new_cfg.iam_mode
+        );
+    }
+
     // 5. Restart-required fields. The values are applied to the config
     //    in memory (the caller has already swapped them), but the server
     //    must restart for them to take effect at the HTTP layer.

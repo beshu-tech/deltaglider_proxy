@@ -321,6 +321,19 @@ impl AdmissionSpec {
                     block.name
                 ));
             }
+            // Reserve the `public-prefix:` prefix for synthesized blocks
+            // derived from `storage.buckets[*].public_prefixes`. An
+            // operator authoring `name: public-prefix:releases` would
+            // collide with the synthesized block for that bucket and
+            // make audit logs / trace output ambiguous.
+            if block.name.starts_with("public-prefix:") {
+                return Err(format!(
+                    "admission block name `{}` is reserved — the `public-prefix:` prefix is \
+                     used for blocks synthesized from `storage.buckets[*].public_prefixes`. \
+                     Pick a different name.",
+                    block.name
+                ));
+            }
 
             if !seen_names.insert(block.name.as_str()) {
                 return Err(format!(
@@ -336,6 +349,14 @@ impl AdmissionSpec {
     }
 }
 
+/// Maximum entries allowed in a single `source_ip_list`. The
+/// evaluator does a linear scan per request, so an unbounded list is
+/// a DoS knob. 4096 is ~2 orders of magnitude above any legitimate
+/// IP denylist; operators who need more have likely outgrown
+/// admission-chain-based IP gating and should front the proxy with
+/// a dedicated WAF / IP-blocklist layer.
+const MAX_SOURCE_IP_LIST: usize = 4096;
+
 impl MatchSpec {
     /// Cross-field validation. `source_ip` is mutually exclusive with
     /// `source_ip_list` — operator must pick one form.
@@ -346,6 +367,17 @@ impl MatchSpec {
                  `source_ip_list` for multi-entry denylists and `source_ip` for a single IP"
                     .to_string(),
             );
+        }
+        if let Some(list) = &self.source_ip_list {
+            if list.len() > MAX_SOURCE_IP_LIST {
+                return Err(format!(
+                    "match: `source_ip_list` has {} entries — cap is {}. The evaluator scans \
+                     the list per request; lists that large belong in a dedicated WAF / \
+                     IP-blocklist layer in front of the proxy.",
+                    list.len(),
+                    MAX_SOURCE_IP_LIST
+                ));
+            }
         }
         // Normalised method vec: uppercase and check for known methods.
         if let Some(methods) = &self.method {
@@ -367,6 +399,16 @@ impl MatchSpec {
                         m
                     ));
                 }
+            }
+        }
+        // Compile-check the glob at parse time so syntactically-bad
+        // patterns surface during `config lint` / `/apply` rather than
+        // much later during chain build (where the block would be
+        // silently skipped with only a `tracing::warn!`, breaking
+        // operator-intended ordering).
+        if let Some(glob) = &self.path_glob {
+            if let Err(e) = globset::Glob::new(glob) {
+                return Err(format!("match: invalid path_glob `{}`: {}", glob, e));
             }
         }
         Ok(())
@@ -499,6 +541,65 @@ action:
         };
         let err = m.validate().unwrap_err();
         assert!(err.contains("CONNECT"));
+    }
+
+    #[test]
+    fn match_invalid_glob_is_error_at_parse_time() {
+        // H1 from deep correctness review: syntactically-bad globs must
+        // fail at validate() (lint / load / apply time), not silently
+        // skip at chain-build time where operator-intended ordering is
+        // already compromised.
+        let m = MatchSpec {
+            path_glob: Some("[invalid".into()),
+            ..Default::default()
+        };
+        let err = m.validate().unwrap_err();
+        assert!(
+            err.contains("path_glob") && err.contains("invalid"),
+            "error must name field + input, got: {err}"
+        );
+    }
+
+    #[test]
+    fn match_source_ip_list_overlimit_is_error() {
+        // M3 from deep correctness review: an unbounded source_ip_list
+        // is a DoS knob (evaluator does a linear scan per request).
+        // Cap is 4096.
+        let list: Vec<SourceIpEntry> = (0..5000)
+            .map(|i| {
+                let octet = (i % 256) as u8;
+                SourceIpEntry::from_net(format!("203.0.113.{octet}/32").parse().unwrap())
+            })
+            .collect();
+        let m = MatchSpec {
+            source_ip_list: Some(list),
+            ..Default::default()
+        };
+        let err = m.validate().unwrap_err();
+        assert!(
+            err.contains("source_ip_list") && err.contains("4096"),
+            "error must name the field + the cap, got: {err}"
+        );
+    }
+
+    #[test]
+    fn admission_spec_reserved_public_prefix_name_is_error() {
+        // H3 from deep correctness review: `public-prefix:*` is reserved
+        // for synthesized blocks from `storage.buckets[*].public_prefixes`.
+        // An operator authoring that prefix creates a name collision in
+        // the runtime chain.
+        let spec = AdmissionSpec {
+            blocks: vec![AdmissionBlockSpec {
+                name: "public-prefix:releases".into(),
+                match_: MatchSpec::default(),
+                action: ActionSpec::Simple(SimpleAction::Deny),
+            }],
+        };
+        let err = spec.validate().unwrap_err();
+        assert!(
+            err.contains("reserved"),
+            "error must explain the reservation, got: {err}"
+        );
     }
 
     #[test]

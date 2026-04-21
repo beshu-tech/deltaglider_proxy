@@ -167,12 +167,19 @@ pub fn lint(file: &str) -> i32 {
         }
     };
 
-    // Dispatch by extension (matches Config::from_file). We call
-    // from_yaml_str / from_toml_str directly rather than from_file
-    // so we can surface a distinction between shape errors (exit 4)
-    // and semantic errors (exit 6) — which is information the server
-    // API doesn't split out but operators editing CI-checked files
-    // benefit from.
+    // Dispatch by extension. Both YAML and TOML paths MUST run
+    // `normalize_shorthands` so lint catches the same semantic
+    // violations (duplicate admission block names, bad Reject
+    // status, `public: true` conflicts) that the server would reject
+    // at `/apply` time. `Config::from_yaml_str` runs it internally;
+    // for TOML we deserialize raw then call a helper that re-runs
+    // the same validation pipeline.
+    //
+    // The TOML path still goes through here (not `Config::from_toml_file`)
+    // because lint MUST NOT read its input as a filesystem path a
+    // second time — we've already slurped `content` into memory, so
+    // re-reading from disk would both waste syscalls and open a
+    // TOCTOU window where the file changes mid-lint.
     let cfg = match std::path::Path::new(file)
         .extension()
         .and_then(|s| s.to_str())
@@ -180,7 +187,7 @@ pub fn lint(file: &str) -> i32 {
         .as_deref()
     {
         Some("yaml") | Some("yml") => Config::from_yaml_str(&content),
-        _ => toml::from_str::<Config>(&content).map_err(|e| ConfigError::Parse(e.to_string())),
+        _ => Config::from_toml_str(&content),
     };
     let mut cfg = match cfg {
         Ok(c) => c,

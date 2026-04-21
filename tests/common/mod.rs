@@ -123,11 +123,18 @@ impl TestServer {
         data_dir: Option<TempDir>,
         auth_creds: Option<(String, String)>,
         encryption_key: Option<String>,
+        yaml_config: bool,
     ) -> Self {
         let port = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
 
-        // Build full config with listen_addr prepended
-        let full_config = format!("listen_addr = \"127.0.0.1:{}\"\n{}", port, config_body);
+        // Build full config with listen_addr prepended. Syntax depends
+        // on the target format: TOML uses `key = "value"`, YAML uses
+        // `key: "value"`.
+        let full_config = if yaml_config {
+            format!("listen_addr: \"127.0.0.1:{}\"\n{}", port, config_body)
+        } else {
+            format!("listen_addr = \"127.0.0.1:{}\"\n{}", port, config_body)
+        };
 
         // Write config to a temp file inside a per-instance directory.
         // config_db_path() derives the DB path from the config file's parent,
@@ -143,7 +150,11 @@ impl TestServer {
                 path
             }
         };
-        let config_path = config_dir.join("test.toml");
+        let config_path = if yaml_config {
+            config_dir.join("test.yaml")
+        } else {
+            config_dir.join("test.toml")
+        };
         std::fs::write(&config_path, &full_config).expect("Failed to write test config");
 
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"));
@@ -279,6 +290,12 @@ pub struct TestServerBuilder {
     bucket_policies: Vec<(String, String)>,
     /// AES-256 encryption key (64-char hex). When set, DGP_ENCRYPTION_KEY env var is passed.
     encryption_key: Option<String>,
+    /// When true, the test config is written as `test.yaml` (canonical
+    /// sectioned shape) instead of the legacy `test.toml`. Required
+    /// for any test that applies YAML-only fields
+    /// (`admission.blocks`, `access.iam_mode: declarative`) — TOML
+    /// persistence refuses those via H4.
+    yaml_config: bool,
 }
 
 impl Default for TestServerBuilder {
@@ -292,6 +309,7 @@ impl Default for TestServerBuilder {
             auth_creds: None,
             bucket_policies: Vec::new(),
             encryption_key: None,
+            yaml_config: false,
         }
     }
 }
@@ -299,6 +317,16 @@ impl Default for TestServerBuilder {
 impl TestServerBuilder {
     pub fn bucket(mut self, bucket: &str) -> Self {
         self.bucket = bucket.to_string();
+        self
+    }
+
+    /// Write the server's config as YAML (`test.yaml`) instead of
+    /// TOML. Required for tests that apply YAML-only fields —
+    /// operator-authored admission blocks or `iam_mode: declarative`
+    /// — via the admin API, because `persist_to_file` refuses to
+    /// serialise those to TOML.
+    pub fn yaml_config(mut self) -> Self {
+        self.yaml_config = true;
         self
     }
 
@@ -341,16 +369,35 @@ impl TestServerBuilder {
         self
     }
 
-    /// Build the TOML config string and spawn the test server.
+    /// Build the config string and spawn the test server. Format
+    /// depends on the `yaml_config` flag (TOML by default).
     pub async fn build(self) -> TestServer {
         let (config, data_dir) = self.build_config();
         let auth = self.auth_creds.clone();
-        TestServer::spawn_with_config(&config, &self.bucket, data_dir, auth, self.encryption_key)
-            .await
+        let yaml = self.yaml_config;
+        TestServer::spawn_with_config(
+            &config,
+            &self.bucket,
+            data_dir,
+            auth,
+            self.encryption_key,
+            yaml,
+        )
+        .await
     }
 
-    /// Assemble a TOML config string (and optional TempDir for filesystem backend).
+    /// Assemble a config string in the selected format (TOML by
+    /// default, YAML when `yaml_config` is set) and, for filesystem-
+    /// backend tests, a TempDir holding the backing storage path.
     fn build_config(&self) -> (String, Option<TempDir>) {
+        if self.yaml_config {
+            self.build_yaml_config()
+        } else {
+            self.build_toml_config()
+        }
+    }
+
+    fn build_toml_config(&self) -> (String, Option<TempDir>) {
         let mut config = String::new();
 
         // Set a known bootstrap password hash so tests can log into the admin API
@@ -405,6 +452,85 @@ impl TestServerBuilder {
             let data_dir = TempDir::new().expect("Failed to create temp dir");
             config.push_str(&format!(
                 "\n[backend]\ntype = \"filesystem\"\npath = \"{}\"\n",
+                data_dir.path().display()
+            ));
+            (config, Some(data_dir))
+        }
+    }
+
+    /// Minimal YAML version of `build_toml_config`. Used by tests that
+    /// apply YAML-only fields (admission blocks, iam_mode:declarative)
+    /// — persist_to_file refuses to write those to a TOML target.
+    ///
+    /// Emits the flat shape (TOML-equivalent field layout at the root)
+    /// because the admission-mode tests don't need the sectioned
+    /// exporter round-trip in their initial config. The server's own
+    /// apply path will re-emit sectioned YAML on persist.
+    fn build_yaml_config(&self) -> (String, Option<TempDir>) {
+        let mut config = String::new();
+
+        let bootstrap_hash = bcrypt::hash(TEST_BOOTSTRAP_PASSWORD, 4).expect("bcrypt hash failed");
+        config.push_str(&format!(
+            "bootstrap_password_hash: \"{}\"\n",
+            bootstrap_hash
+        ));
+
+        if let Some(ratio) = self.max_delta_ratio {
+            config.push_str(&format!("max_delta_ratio: {}\n", ratio));
+        }
+        if let Some(size) = self.max_object_size {
+            config.push_str(&format!("max_object_size: {}\n", size));
+        }
+        if let Some(n) = self.codec_concurrency {
+            config.push_str(&format!("codec_concurrency: {}\n", n));
+        }
+        if let Some((ref key_id, ref secret)) = self.auth_creds {
+            config.push_str(&format!(
+                "access_key_id: \"{}\"\nsecret_access_key: \"{}\"\n",
+                key_id, secret
+            ));
+        } else {
+            config.push_str("authentication: \"none\"\n");
+        }
+
+        if !self.bucket_policies.is_empty() {
+            config.push_str("buckets:\n");
+            for (bucket, body) in &self.bucket_policies {
+                config.push_str(&format!("  {}:\n", bucket));
+                // Each line of the TOML body becomes a YAML line with
+                // 4-space indent + `:` separator instead of `=`. Tests
+                // that use bucket_policies pass TOML-like `key = value`
+                // bodies; we translate trivially.
+                for line in body.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if let Some((k, v)) = trimmed.split_once(" = ") {
+                        config.push_str(&format!("    {}: {}\n", k, v));
+                    }
+                }
+            }
+        }
+
+        if let Some(ref endpoint) = self.s3_endpoint {
+            config.push_str(&format!(
+                concat!(
+                    "backend:\n",
+                    "  type: s3\n",
+                    "  endpoint: \"{}\"\n",
+                    "  region: \"us-east-1\"\n",
+                    "  force_path_style: true\n",
+                    "  access_key_id: \"{}\"\n",
+                    "  secret_access_key: \"{}\"\n",
+                ),
+                endpoint, MINIO_ACCESS_KEY, MINIO_SECRET_KEY,
+            ));
+            (config, None)
+        } else {
+            let data_dir = TempDir::new().expect("Failed to create temp dir");
+            config.push_str(&format!(
+                "backend:\n  type: filesystem\n  path: \"{}\"\n",
                 data_dir.path().display()
             ));
             (config, Some(data_dir))

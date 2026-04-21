@@ -86,12 +86,12 @@ pub async fn trace_config(
         body.authenticated,
         body.source_ip,
     );
-    let req_info = owned.as_ref();
-
-    let decision = crate::admission::evaluate(&chain, &req_info);
-    // `req_info` borrows from `owned` — drop the borrow by scoping
-    // it, then move parsed fields out of `owned` for the response.
-    let _ = req_info;
+    // `RequestInfo` borrows from `owned`; confining it to a block
+    // ends the borrow before we move out of `owned` below.
+    let decision = {
+        let req_info = owned.as_ref();
+        crate::admission::evaluate(&chain, &req_info)
+    };
 
     // `TraceResolved` echoes the parsed inputs back so operators can
     // verify the parser agreed with their mental model.

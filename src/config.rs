@@ -595,12 +595,34 @@ where
     env_parse(var).unwrap_or(default)
 }
 
-/// Parse a boolean env var (`"true"` or `"1"` → true), returning `default` if absent.
+/// Parse a boolean env var, returning `default` if absent or
+/// unrecognised. Accepts (case-insensitive, trimmed): `true`, `1`,
+/// `yes`, `on` as true; `false`, `0`, `no`, `off` as false.
+///
+/// Unrecognised values log a warning and fall back to `default` so
+/// operator typos don't silently flip behaviour in either direction.
 pub fn env_bool(var: &str, default: bool) -> bool {
-    std::env::var(var)
-        .ok()
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(default)
+    let Ok(raw) = std::env::var(var) else {
+        return default;
+    };
+    let trimmed = raw.trim();
+    match trimmed.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => true,
+        "false" | "0" | "no" | "off" => false,
+        other => {
+            tracing::warn!(
+                target: "deltaglider_proxy::config",
+                var = %var,
+                value = %other,
+                "env var `{}={}` is not a recognised boolean (expected true/1/yes/on or \
+                 false/0/no/off); falling back to default={}",
+                var,
+                other,
+                default
+            );
+            default
+        }
+    }
 }
 
 /// Supported config file formats, inferred from file extension.
@@ -726,6 +748,23 @@ impl Config {
         }
     }
 
+    /// Parse TOML content into a validated `Config`.
+    ///
+    /// Runs the same `normalize_shorthands` pipeline as the YAML
+    /// loader, so callers (including `config lint`) see identical
+    /// semantic validation regardless of input format.
+    ///
+    /// Unlike [`Self::from_toml_file`], this does NOT emit the TOML
+    /// deprecation warning — the warning is the `from_toml_file`
+    /// caller's signal ("loaded TOML from disk"), not "parsed TOML
+    /// bytes" which also fires from lint / tests / in-process use.
+    pub fn from_toml_str(content: &str) -> Result<Self, ConfigError> {
+        let mut config: Config =
+            toml::from_str(content).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        config.normalize_shorthands()?;
+        Ok(config)
+    }
+
     /// Load configuration from a TOML file explicitly.
     ///
     /// **Deprecated**: TOML is being phased out in favor of YAML. Every
@@ -741,15 +780,13 @@ impl Config {
     /// one shot.
     pub fn from_toml_file(path: &str) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path).map_err(|e| ConfigError::Io(e.to_string()))?;
-        let mut config: Config =
-            toml::from_str(&content).map_err(|e| ConfigError::Parse(e.to_string()))?;
-        config.normalize_shorthands()?;
+        let config = Self::from_toml_str(&content)?;
 
         // Phase 6 deprecation warn. Fires exactly once per load (no
         // per-request overhead — config loads only at startup and on
         // explicit apply). Silencable via env var for operators who
         // know about the deprecation and cannot upgrade yet.
-        if std::env::var("DGP_SILENCE_TOML_DEPRECATION").unwrap_or_default() != "1" {
+        if !env_bool("DGP_SILENCE_TOML_DEPRECATION", false) {
             tracing::warn!(
                 target: "deltaglider_proxy::config",
                 path = %path,
@@ -1389,12 +1426,51 @@ impl Config {
     /// atomic within a single filesystem, so a crash or power loss at any
     /// point leaves the target either fully old or fully new — never the
     /// truncated-mid-write corruption that a bare `fs::write` can produce.
+    ///
+    /// Returns `ConfigError::Parse` when the target is a TOML file but
+    /// the config holds YAML-only fields. Rationale: operator-authored
+    /// admission blocks (especially the tagged `Reject { type, status,
+    /// message }` action) and `iam_mode: declarative` don't round-trip
+    /// cleanly through TOML's `toml::to_string_pretty`, and a silent
+    /// half-persist (in-memory state updated, on-disk file missing the
+    /// new fields) is the worst failure mode possible — next restart
+    /// silently reverts.
     pub fn persist_to_file(&self, path: &str) -> Result<(), ConfigError> {
-        let content = match ConfigFormat::from_path(path) {
+        let format = ConfigFormat::from_path(path);
+        if matches!(format, ConfigFormat::Toml) {
+            self.check_toml_persistable(path)?;
+        }
+        let content = match format {
             ConfigFormat::Yaml => self.to_canonical_yaml()?,
             ConfigFormat::Toml => self.to_toml_string()?,
         };
         atomic_write(std::path::Path::new(path), content.as_bytes())
+    }
+
+    /// Refuse to persist to TOML when the config holds fields that are
+    /// YAML-only (admission blocks with tagged actions, declarative IAM
+    /// mode). Called from `persist_to_file` before serialisation so
+    /// the operator sees an actionable error instead of a silent
+    /// half-persist.
+    fn check_toml_persistable(&self, path: &str) -> Result<(), ConfigError> {
+        let mut blockers: Vec<&'static str> = Vec::new();
+        if !self.admission_blocks.is_empty() {
+            blockers.push("admission.blocks");
+        }
+        if self.iam_mode != crate::config_sections::IamMode::default() {
+            blockers.push("access.iam_mode");
+        }
+        if blockers.is_empty() {
+            return Ok(());
+        }
+        Err(ConfigError::Parse(format!(
+            "cannot persist runtime config to `{path}` (TOML): the in-memory config holds \
+             YAML-only fields ({}). Convert the target file to YAML first — run \
+             `deltaglider_proxy config migrate {path} --out {path_yaml}` — and point the \
+             server at the new file, then re-apply.",
+            blockers.join(", "),
+            path_yaml = std::path::Path::new(path).with_extension("yaml").display()
+        )))
     }
 }
 
@@ -1938,6 +2014,73 @@ backend:
             content.contains("listen_addr ="),
             "TOML output must use = separator, got: {content}"
         );
+    }
+
+    #[test]
+    fn test_persist_to_toml_rejects_admission_blocks() {
+        // H4 from deep correctness review: refuse to persist sectioned-
+        // only fields (admission blocks / iam_mode: declarative) to a
+        // TOML target. Silent half-persist is the worst possible
+        // failure mode — the in-memory runtime has the new state but
+        // the on-disk file reverts on next restart.
+        use crate::admission::spec::{ActionSpec, AdmissionBlockSpec, MatchSpec, SimpleAction};
+        let cfg = Config {
+            admission_blocks: vec![AdmissionBlockSpec {
+                name: "deny-bad".into(),
+                match_: MatchSpec::default(),
+                action: ActionSpec::Simple(SimpleAction::Deny),
+            }],
+            ..Config::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("out.toml");
+        let err = cfg
+            .persist_to_file(toml_path.to_str().unwrap())
+            .expect_err("persist to TOML with admission blocks must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("admission.blocks") && msg.contains("YAML"),
+            "error must name the offending field + point at YAML, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_persist_to_toml_rejects_declarative_iam_mode() {
+        let cfg = Config {
+            iam_mode: crate::config_sections::IamMode::Declarative,
+            ..Config::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("out.toml");
+        let err = cfg
+            .persist_to_file(toml_path.to_str().unwrap())
+            .expect_err("persist to TOML with iam_mode: declarative must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("access.iam_mode") && msg.contains("YAML"),
+            "error must name the offending field + point at YAML, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_persist_to_yaml_accepts_admission_blocks() {
+        // Symmetric: the same config persists fine to a YAML target.
+        use crate::admission::spec::{ActionSpec, AdmissionBlockSpec, MatchSpec, SimpleAction};
+        let cfg = Config {
+            admission_blocks: vec![AdmissionBlockSpec {
+                name: "deny-bad".into(),
+                match_: MatchSpec::default(),
+                action: ActionSpec::Simple(SimpleAction::Deny),
+            }],
+            iam_mode: crate::config_sections::IamMode::Declarative,
+            ..Config::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let yaml_path = dir.path().join("out.yaml");
+        cfg.persist_to_file(yaml_path.to_str().unwrap()).unwrap();
+        let content = std::fs::read_to_string(&yaml_path).unwrap();
+        assert!(content.contains("deny-bad"));
+        assert!(content.contains("iam_mode: declarative"));
     }
 
     #[test]

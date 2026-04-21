@@ -61,7 +61,11 @@ async fn set_iam_mode(admin: &reqwest::Client, endpoint: &str, mode: &str) {
 
 #[tokio::test]
 async fn test_declarative_mode_returns_403_on_user_create() {
-    let server = TestServer::builder().auth("IAMMK1", "IAMMS1").build().await;
+    let server = TestServer::builder()
+        .yaml_config()
+        .auth("IAMMK1", "IAMMS1")
+        .build()
+        .await;
     let admin = admin_http_client(&server.endpoint()).await;
 
     // Flip to declarative.
@@ -88,7 +92,11 @@ async fn test_declarative_mode_returns_403_on_user_create() {
 
 #[tokio::test]
 async fn test_declarative_mode_allows_user_list() {
-    let server = TestServer::builder().auth("IAMMK2", "IAMMS2").build().await;
+    let server = TestServer::builder()
+        .yaml_config()
+        .auth("IAMMK2", "IAMMS2")
+        .build()
+        .await;
     let admin = admin_http_client(&server.endpoint()).await;
 
     set_iam_mode(&admin, &server.endpoint(), "declarative").await;
@@ -108,7 +116,11 @@ async fn test_declarative_mode_allows_user_list() {
 
 #[tokio::test]
 async fn test_declarative_mode_blocks_group_mutations() {
-    let server = TestServer::builder().auth("IAMMK3", "IAMMS3").build().await;
+    let server = TestServer::builder()
+        .yaml_config()
+        .auth("IAMMK3", "IAMMS3")
+        .build()
+        .await;
     let admin = admin_http_client(&server.endpoint()).await;
 
     set_iam_mode(&admin, &server.endpoint(), "declarative").await;
@@ -133,7 +145,11 @@ async fn test_declarative_mode_blocks_group_mutations() {
 
 #[tokio::test]
 async fn test_declarative_mode_blocks_ext_auth_provider_mutations() {
-    let server = TestServer::builder().auth("IAMMK4", "IAMMS4").build().await;
+    let server = TestServer::builder()
+        .yaml_config()
+        .auth("IAMMK4", "IAMMS4")
+        .build()
+        .await;
     let admin = admin_http_client(&server.endpoint()).await;
 
     set_iam_mode(&admin, &server.endpoint(), "declarative").await;
@@ -159,7 +175,11 @@ async fn test_declarative_mode_blocks_ext_auth_provider_mutations() {
 
 #[tokio::test]
 async fn test_declarative_mode_does_not_block_config_routes() {
-    let server = TestServer::builder().auth("IAMMK5", "IAMMS5").build().await;
+    let server = TestServer::builder()
+        .yaml_config()
+        .auth("IAMMK5", "IAMMS5")
+        .build()
+        .await;
     let admin = admin_http_client(&server.endpoint()).await;
 
     set_iam_mode(&admin, &server.endpoint(), "declarative").await;
@@ -180,7 +200,11 @@ async fn test_declarative_mode_does_not_block_config_routes() {
 
 #[tokio::test]
 async fn test_declarative_to_gui_toggle_hot_restores_crud() {
-    let server = TestServer::builder().auth("IAMMK6", "IAMMS6").build().await;
+    let server = TestServer::builder()
+        .yaml_config()
+        .auth("IAMMK6", "IAMMS6")
+        .build()
+        .await;
     let admin = admin_http_client(&server.endpoint()).await;
 
     // Start in gui: create works (201 Created per REST conventions).
@@ -211,4 +235,70 @@ async fn test_declarative_to_gui_toggle_hot_restores_crud() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+/// M4 from deep correctness review: exercise the "declarative → gui →
+/// declarative" flip sequence end-to-end. Catches any regression
+/// where session state (bootstrap-password hash verification, rate
+/// limiter, admission chain) drifts during mode transitions.
+#[tokio::test]
+async fn test_mode_flip_cycle_preserves_session_and_chain() {
+    let server = TestServer::builder()
+        .yaml_config()
+        .auth("FLIP", "FLIPSECRET")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    // Initial: gui mode, write allowed.
+    let resp = admin
+        .post(format!("{}/_/api/admin/users", server.endpoint()))
+        .json(&json!({ "name": "alice-before" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Flip to declarative; the SAME session must still authenticate for
+    // reads (middleware reads session before iam_mode gate runs).
+    set_iam_mode(&admin, &server.endpoint(), "declarative").await;
+    let resp = admin
+        .get(format!("{}/_/api/admin/users", server.endpoint()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "existing session must survive a gui→declarative flip for reads"
+    );
+
+    // Flip back to gui; writes restored.
+    set_iam_mode(&admin, &server.endpoint(), "gui").await;
+    let resp = admin
+        .post(format!("{}/_/api/admin/users", server.endpoint()))
+        .json(&json!({ "name": "alice-after" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Flip AGAIN (declarative); write blocked.
+    set_iam_mode(&admin, &server.endpoint(), "declarative").await;
+    let resp = admin
+        .post(format!("{}/_/api/admin/users", server.endpoint()))
+        .json(&json!({ "name": "should-be-blocked" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Config PUT is still allowed even after multiple flips.
+    let resp = admin
+        .put(format!("{}/_/api/admin/config", server.endpoint()))
+        .json(&json!({ "max_delta_ratio": 0.33 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
