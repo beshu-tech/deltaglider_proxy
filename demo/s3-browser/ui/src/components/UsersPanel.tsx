@@ -1,11 +1,12 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Button, Typography, Spin, Alert, Input } from 'antd';
 import { PlusOutlined, SearchOutlined, TeamOutlined, DeleteOutlined } from '@ant-design/icons';
-import type { IamUser } from '../adminApi';
-import { getUsers, deleteUser } from '../adminApi';
+import type { IamMode, IamUser } from '../adminApi';
+import { getAdminConfig, getUsers, deleteUser } from '../adminApi';
 import { useColors } from '../ThemeContext';
 import UserForm from './UserForm';
 import CredentialsBanner from './CredentialsBanner';
+import IamSourceBanner from './IamSourceBanner';
 
 const { Text } = Typography;
 
@@ -35,6 +36,20 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
   const [creating, setCreating] = useState(false);
   const [search, setSearch] = useState('');
   const [newCreds, setNewCreds] = useState<{ ak: string; sk: string } | null>(null);
+  const [iamMode, setIamMode] = useState<IamMode | undefined>(undefined);
+
+  // Fetch the current IAM mode once so the banner can explain where
+  // user state lives (DB in `gui` mode vs YAML in `declarative`).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const cfg = await getAdminConfig();
+      if (!cancelled && cfg) setIamMode(cfg.iam_mode);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const loadUsers = useCallback(async () => {
     setLoading(true);
@@ -93,7 +108,15 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
   };
 
   return (
-    <div style={{ display: 'flex', height: '100%', overflow: 'hidden' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
+      {/* "Where does this data live?" banner — IAM state is DB-backed
+          in GUI mode, YAML-authoritative in Declarative mode. Shows
+          on every IAM panel so operators never wonder why Copy YAML
+          on Access shows `access: {}` after adding a user. */}
+      <div style={{ padding: '12px 16px 0' }}>
+        <IamSourceBanner iamMode={iamMode} resource="users" />
+      </div>
+      <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
       {/* Left: User List */}
       <div style={{
         width: 300,
@@ -266,6 +289,7 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
             </div>
           </div>
         )}
+      </div>
       </div>
     </div>
   );

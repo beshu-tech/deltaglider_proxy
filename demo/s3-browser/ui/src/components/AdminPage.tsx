@@ -29,6 +29,11 @@ import OAuthProviderList from './OAuthProviderList';
 import AdminSidebar from './AdminSidebar';
 import AdmissionPanel from './AdmissionPanel';
 import RightRailActions from './RightRailActions';
+import {
+  AccessOverview,
+  StorageOverview,
+  AdvancedOverview,
+} from './sectionOverviews';
 import { useNavigation } from '../NavigationContext';
 import TabHeader from './TabHeader';
 import { YamlImportExportModal } from './YamlImportExportModal';
@@ -360,6 +365,35 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
             }
           />
         </>
+      );
+    }
+
+    // Configuration — group parents: render the rich overview page
+    // (hero + stat tiles + sub-section cards) instead of falling
+    // through to a Dashboard. Admission has no sub-entries so it's
+    // a leaf page handled above.
+    if (adminPath === 'configuration/access') {
+      return (
+        <AccessOverview
+          onNavigateAdmin={navigateAdmin}
+          onSessionExpired={onSessionExpired}
+        />
+      );
+    }
+    if (adminPath === 'configuration/storage') {
+      return (
+        <StorageOverview
+          onNavigateAdmin={navigateAdmin}
+          onSessionExpired={onSessionExpired}
+        />
+      );
+    }
+    if (adminPath === 'configuration/advanced') {
+      return (
+        <AdvancedOverview
+          onNavigateAdmin={navigateAdmin}
+          onSessionExpired={onSessionExpired}
+        />
       );
     }
 

@@ -1,12 +1,13 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Button, Typography, Spin, Alert, Input, Divider, Checkbox } from 'antd';
 import { PlusOutlined, SearchOutlined, FolderOutlined, DeleteOutlined } from '@ant-design/icons';
-import type { IamGroup, IamUser } from '../adminApi';
-import { getGroups, createGroup, updateGroup, deleteGroup, addGroupMember, removeGroupMember, getUsers } from '../adminApi';
+import type { IamGroup, IamMode, IamUser } from '../adminApi';
+import { getAdminConfig, getGroups, createGroup, updateGroup, deleteGroup, addGroupMember, removeGroupMember, getUsers } from '../adminApi';
 import { useCardStyles } from './shared-styles';
 import { useColors } from '../ThemeContext';
 import PermissionEditor, { permissionsToRows, rowsToPermissions } from './PermissionEditor';
 import type { PermissionRow } from './PermissionEditor';
+import IamSourceBanner from './IamSourceBanner';
 
 const { Text, Title } = Typography;
 
@@ -33,6 +34,19 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
   const [selectedId, setSelectedId] = useState<number | null>(initialGroupId ?? null);
   const [creating, setCreating] = useState(false);
   const [search, setSearch] = useState('');
+  const [iamMode, setIamMode] = useState<IamMode | undefined>(undefined);
+
+  // Load IAM mode once for the source-of-truth banner.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const cfg = await getAdminConfig();
+      if (!cancelled && cfg) setIamMode(cfg.iam_mode);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -86,7 +100,12 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
   };
 
   return (
-    <div style={{ display: 'flex', height: '100%', overflow: 'hidden' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
+      {/* IAM source-of-truth banner — same explainer as UsersPanel. */}
+      <div style={{ padding: '12px 16px 0' }}>
+        <IamSourceBanner iamMode={iamMode} resource="groups" />
+      </div>
+      <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
       {/* Left: Group List */}
       <div style={{
         width: 300,
@@ -222,6 +241,7 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
             </div>
           </div>
         )}
+      </div>
       </div>
     </div>
   );

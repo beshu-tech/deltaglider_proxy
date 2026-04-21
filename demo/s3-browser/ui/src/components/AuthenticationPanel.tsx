@@ -3,12 +3,13 @@ import { Button, Typography, Input, Alert, Switch, Divider, Spin, message } from
 import SimpleSelect from './SimpleSelect';
 import { PlusOutlined, DeleteOutlined, SearchOutlined, CopyOutlined, SafetyOutlined, CheckCircleOutlined, CloseCircleOutlined, SyncOutlined } from '@ant-design/icons';
 import {
-  getAuthProviders, createAuthProvider, updateAuthProvider, deleteAuthProvider, testAuthProvider,
+  getAdminConfig, getAuthProviders, createAuthProvider, updateAuthProvider, deleteAuthProvider, testAuthProvider,
   getMappingRules, createMappingRule, updateMappingRule, deleteMappingRule,
   previewMapping, getExternalIdentities, syncMemberships, getGroups,
-  type AuthProvider, type MappingRule, type ExternalIdentity, type IamGroup, type ProviderTestResult,
+  type AuthProvider, type IamMode, type MappingRule, type ExternalIdentity, type IamGroup, type ProviderTestResult,
 } from '../adminApi';
 import { useColors } from '../ThemeContext';
+import IamSourceBanner from './IamSourceBanner';
 
 const { Text } = Typography;
 
@@ -24,6 +25,19 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
   const [groups, setGroups] = useState<IamGroup[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [iamMode, setIamMode] = useState<IamMode | undefined>(undefined);
+
+  // Load IAM mode once for the source-of-truth banner.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const cfg = await getAdminConfig();
+      if (!cancelled && cfg) setIamMode(cfg.iam_mode);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Provider form state
   const [selectedProvider, setSelectedProvider] = useState<AuthProvider | null>(null);
@@ -194,6 +208,9 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
 
   return (
     <div style={{ padding: 'clamp(16px, 3vw, 24px)', maxWidth: 960, margin: '0 auto' }}>
+      {/* IAM source-of-truth banner — OAuth providers + mapping rules
+          live in the encrypted IAM DB, not YAML, in GUI mode. */}
+      <IamSourceBanner iamMode={iamMode} resource="OAuth providers + mapping rules" />
       {/* Identity Providers */}
       <div style={section}>Identity Providers</div>
       <div style={{ display: 'flex', gap: 16, marginBottom: 24 }}>
