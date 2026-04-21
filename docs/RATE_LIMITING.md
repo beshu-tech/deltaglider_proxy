@@ -33,9 +33,11 @@ Failed auth attempts add an artificial delay to responses, making brute force ex
 
 ### IP extraction
 
-Rate limiting requires a client IP. The proxy extracts it from `X-Forwarded-For` or `X-Real-IP` headers when `DGP_TRUST_PROXY_HEADERS=true` (the default). Behind a reverse proxy (nginx, Caddy, Coolify, ALB), this is the correct setting.
+Rate limiting requires a client IP. The proxy extracts it from `X-Forwarded-For` or `X-Real-IP` headers **only when `DGP_TRUST_PROXY_HEADERS=true`**. The default is `false` (secure-by-default: direct-to-internet deployments are protected against IP spoofing out of the box).
 
-For direct-to-internet deployments, set `DGP_TRUST_PROXY_HEADERS=false` to prevent IP spoofing — but note that without `ConnectInfo` support (not yet implemented), rate limiting will be disabled since no IP can be determined. SigV4 signature verification still applies regardless.
+Set `DGP_TRUST_PROXY_HEADERS=true` when the proxy sits behind a trusted reverse proxy (nginx, Caddy, Coolify, ALB) that injects these headers.
+
+For direct-to-internet deployments (no reverse proxy), the rate limiter falls through with no IP — rate limiting is effectively a no-op for those requests, though SigV4 signature verification and the SigV4 replay cache still apply. The admission chain's `source_ip_list` predicates use axum `ConnectInfo` (wired at startup) so they still work in the direct-to-internet case, but the rate limiter doesn't yet consume `ConnectInfo`.
 
 ## Codec Semaphore
 
@@ -102,7 +104,7 @@ During LIST operations that require per-object metadata, the proxy issues HEAD r
 | `DGP_RATE_LIMIT_MAX_ATTEMPTS` | 100 | Auth failures before lockout |
 | `DGP_RATE_LIMIT_WINDOW_SECS` | 300 | Rolling window for failure counting |
 | `DGP_RATE_LIMIT_LOCKOUT_SECS` | 600 | Lockout duration after max failures |
-| `DGP_TRUST_PROXY_HEADERS` | true | Trust X-Forwarded-For for IP extraction |
+| `DGP_TRUST_PROXY_HEADERS` | false | Trust X-Forwarded-For for IP extraction (set `true` only behind a reverse proxy) |
 | `DGP_CODEC_CONCURRENCY` | cpus*4 (min 16) | Max concurrent xdelta3 processes |
 | `DGP_MAX_CONCURRENT_REQUESTS` | 1024 | Max in-flight HTTP requests |
 | `DGP_REQUEST_TIMEOUT_SECS` | 300 | Per-request timeout |
