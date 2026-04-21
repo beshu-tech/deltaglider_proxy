@@ -13,6 +13,9 @@ import {
   DownloadOutlined,
   UploadOutlined,
   SafetyOutlined,
+  ExperimentOutlined,
+  SecurityScanOutlined,
+  SettingOutlined,
 } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import FullScreenHeader from './FullScreenHeader';
@@ -23,28 +26,145 @@ import AuthenticationPanel from './AuthenticationPanel';
 import BackendsPanel from './BackendsPanel';
 import MetricsPage from './MetricsPage';
 import OAuthProviderList from './OAuthProviderList';
+import AdminSidebar from './AdminSidebar';
+import RightRailActions from './RightRailActions';
 import { useNavigation } from '../NavigationContext';
 import TabHeader from './TabHeader';
 import { YamlImportExportModal } from './YamlImportExportModal';
 import { FileTextOutlined, ImportOutlined } from '@ant-design/icons';
+import { useDirtyGlobalIndicators } from '../useDirtySection';
+import type { SectionName } from '../adminApi';
 
 const { Text } = Typography;
 
-const VALID_TABS = new Set(['users', 'groups', 'auth', 'metrics', 'backends', 'backend', 'limits', 'security', 'logging']);
-// Redirect old compression tab URLs to backends
-const TAB_REDIRECTS: Record<string, string> = { compression: 'backends' };
+/**
+ * Map legacy flat subPaths to the new 4-group IA subPaths (§3.1).
+ *
+ * Every bookmarkable URL before Wave 3 was `/_/admin/<tab>` where
+ * `<tab>` is one of the TABS list below. We keep those URLs working —
+ * operators may have pasted them in tickets / Slack — by normalising
+ * to the new hierarchical form on read. The sidebar navigates using
+ * the new form exclusively, so the legacy URLs only matter on the
+ * first page load / refresh.
+ */
+const LEGACY_TO_NEW: Record<string, string> = {
+  // Diagnostics — metrics keeps its own top-level route; dashboard
+  // is a new page that lives only under the new scheme.
+  'metrics': 'diagnostics/dashboard',
+  // Access sub-sections
+  'users': 'configuration/access/users',
+  'groups': 'configuration/access/groups',
+  'auth': 'configuration/access/ext-auth',
+  // Storage sub-sections — legacy 'backends' covered both backends +
+  // bucket policies on one page; keep pointing there until Wave 6
+  // splits them.
+  'backends': 'configuration/storage/backends',
+  'backend': 'configuration/storage/backends',
+  'compression': 'configuration/storage/backends',
+  // Advanced sub-sections
+  'limits': 'configuration/advanced/limits',
+  'security': 'configuration/advanced/listener',
+  'logging': 'configuration/advanced/logging',
+};
 
-const TABS: Array<{ key: string; label: string; icon: React.ReactNode; title: string; description: string }> = [
-  { key: 'users', label: 'Users', icon: <TeamOutlined />, title: 'User Management', description: 'Create and manage IAM users with fine-grained S3 permissions. Each user gets their own access key and secret for SigV4 authentication.' },
-  { key: 'groups', label: 'Groups', icon: <FolderOutlined />, title: 'Groups', description: 'Organize users into groups with shared permission policies. Users inherit all permissions from their groups.' },
-  { key: 'auth', label: 'Authentication', icon: <SafetyOutlined />, title: 'External Authentication', description: 'Configure OAuth/OIDC providers for single sign-on. Map employee emails to groups for automatic permission assignment.' },
-  { key: 'metrics', label: 'Metrics', icon: <DashboardOutlined />, title: 'Metrics & Monitoring', description: 'Live Prometheus metrics for request traffic, cache performance, delta compression ratios, and storage savings.' },
-  { key: 'backends', label: 'Storage', icon: <CloudServerOutlined />, title: 'Storage & Compression', description: 'Configure storage backends, delta compression defaults, per-bucket routing and policies.' },
-  { key: 'backend', label: 'Connection', icon: <DatabaseOutlined />, title: 'Primary Backend', description: 'Configure the default storage backend connection. This is used when no named backends are configured or as fallback.' },
-  { key: 'limits', label: 'Limits', icon: <CloudOutlined />, title: 'Request Limits', description: 'Protect the server from overload with request timeouts, concurrency limits, and multipart upload caps.' },
-  { key: 'security', label: 'Security', icon: <LockOutlined />, title: 'Security & Sessions', description: 'Configure SigV4 clock skew tolerance, replay detection, rate limiting, session TTL, and cookie security.' },
-  { key: 'logging', label: 'Logging', icon: <DatabaseOutlined />, title: 'Logging', description: 'Control log verbosity at runtime. Changes take effect immediately without restart.' },
-];
+/**
+ * Resolve an incoming `subPath` (anything the browser presents) to a
+ * canonical path in the new 4-group scheme. Falls back to the default
+ * landing page when the path is empty or unknown.
+ */
+function resolveAdminPath(subPath: string): string {
+  const path = subPath.replace(/^\/+/, '').replace(/\/+$/, '');
+  if (!path) return 'diagnostics/dashboard';
+  // Legacy flat paths (first segment only)
+  const firstSegment = path.split('/')[0];
+  if (LEGACY_TO_NEW[firstSegment]) {
+    const remaining = path.slice(firstSegment.length);
+    return LEGACY_TO_NEW[firstSegment] + remaining;
+  }
+  // Already a new-scheme path
+  if (path.startsWith('diagnostics/') || path.startsWith('configuration/')) {
+    return path;
+  }
+  return 'diagnostics/dashboard';
+}
+
+/**
+ * Header metadata for the current admin page, indexed by the new
+ * canonical path. Used by `renderAdminContent` to render a
+ * `TabHeader` above the page content.
+ */
+const PAGE_HEADERS: Record<string, { icon: React.ReactNode; title: string; description: string }> = {
+  'diagnostics/dashboard': {
+    icon: <DashboardOutlined />,
+    title: 'Dashboard',
+    description: 'Health, metrics, and admission-chain preview. Landing page for the admin UI.',
+  },
+  'diagnostics/trace': {
+    icon: <ExperimentOutlined />,
+    title: 'Admission trace',
+    description: 'Evaluate a synthetic request against the current admission chain. See which block fires and why.',
+  },
+  'configuration/admission': {
+    icon: <SecurityScanOutlined />,
+    title: 'Admission',
+    description: 'Pre-auth request gating. Blocks are evaluated top to bottom; first match wins. Synthesized blocks from bucket public_prefixes fire after operator-authored ones.',
+  },
+  'configuration/access/credentials': {
+    icon: <LockOutlined />,
+    title: 'Credentials & mode',
+    description: 'IAM mode (GUI vs. declarative), authentication mode, legacy SigV4 bootstrap credentials, admin password.',
+  },
+  'configuration/access/users': {
+    icon: <TeamOutlined />,
+    title: 'Users',
+    description: 'IAM users with fine-grained S3 permissions. In declarative IAM mode, this panel is read-only — edit your YAML instead.',
+  },
+  'configuration/access/groups': {
+    icon: <FolderOutlined />,
+    title: 'Groups',
+    description: 'Organize users into groups with shared permission policies.',
+  },
+  'configuration/access/ext-auth': {
+    icon: <SafetyOutlined />,
+    title: 'External authentication',
+    description: 'OAuth/OIDC providers and group mapping rules for SSO.',
+  },
+  'configuration/storage/backends': {
+    icon: <CloudServerOutlined />,
+    title: 'Backends',
+    description: 'Storage backends, default backend selection, and per-bucket routing.',
+  },
+  'configuration/storage/buckets': {
+    icon: <CloudOutlined />,
+    title: 'Buckets',
+    description: 'Per-bucket policies: compression overrides, delta ratio, public prefixes, quotas, aliases.',
+  },
+  'configuration/advanced/listener': {
+    icon: <CloudServerOutlined />,
+    title: 'Listener & TLS',
+    description: 'HTTP listen address, TLS cert and key paths.',
+  },
+  'configuration/advanced/caches': {
+    icon: <DatabaseOutlined />,
+    title: 'Caches',
+    description: 'Reference cache, metadata cache, codec concurrency, blocking-thread pool size.',
+  },
+  'configuration/advanced/limits': {
+    icon: <CloudOutlined />,
+    title: 'Limits',
+    description: 'Request timeouts, concurrency caps, multipart-upload limits. Most are env-var driven.',
+  },
+  'configuration/advanced/logging': {
+    icon: <DatabaseOutlined />,
+    title: 'Logging',
+    description: 'tracing-subscriber EnvFilter string. Changes take effect immediately without restart.',
+  },
+  'configuration/advanced/sync': {
+    icon: <SettingOutlined />,
+    title: 'Config DB sync',
+    description: 'S3 bucket for encrypted IAM DB replication across proxy instances.',
+  },
+};
 
 interface AdminPageProps {
   onBack: () => void;
@@ -55,13 +175,22 @@ interface AdminPageProps {
 export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPageProps) {
   const colors = useColors();
   const { navigate } = useNavigation();
+  // Hook up the `● ` tab-title prefix + beforeunload guard for any
+  // section with unsaved edits. Mounting at AdminPage is the single
+  // sensible home; moving higher would fire the guard on non-admin
+  // pages, moving lower would miss the case where the operator
+  // navigates away from a dirty section.
+  useDirtyGlobalIndicators();
 
-  // Derive active tab from URL sub-path, with redirects for renamed tabs
-  const rawTab = subPath || '';
-  const activeTab = VALID_TABS.has(rawTab) ? rawTab : TAB_REDIRECTS[rawTab] || 'users';
-  const setActiveTab = useCallback((tab: string) => {
-    navigate(`admin/${tab}`);
-  }, [navigate]);
+  // Derive canonical admin path (§3.2). Legacy flat URLs (`users`,
+  // `backends`, etc.) are mapped to the new hierarchy.
+  const adminPath = resolveAdminPath(subPath || '');
+  const navigateAdmin = useCallback(
+    (path: string) => {
+      navigate(`admin/${path}`);
+    },
+    [navigate]
+  );
 
   const [authed, setAuthed] = useState(false);
   const [checkingSession, setCheckingSession] = useState(true);
@@ -143,37 +272,156 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
     return () => clearInterval(id);
   }, [authed, onSessionExpired]);
 
-  const navigateToGroup = useCallback((groupId: number) => {
-    setPendingGroupId(groupId);
-    setActiveTab('groups');
-  }, [setActiveTab]);
+  const navigateToGroup = useCallback(
+    (groupId: number) => {
+      setPendingGroupId(groupId);
+      navigateAdmin('configuration/access/groups');
+    },
+    [navigateAdmin]
+  );
 
+  /**
+   * Render the content pane for the current admin path.
+   *
+   * Wave 3's scope is the *sidebar* + *URL structure* — the content
+   * pane still delegates to the existing panels (UsersPanel,
+   * AuthenticationPanel, BackendsPanel, SettingsPage). Waves 4-7 will
+   * replace these one at a time with section-editor components that
+   * speak the section-level config API.
+   *
+   * Unknown paths fall through to the dashboard (diagnostics/
+   * dashboard) rather than erroring — a fresh install or a dropped
+   * URL segment should land somewhere sensible.
+   */
   const renderContent = () => {
-    const tab = TABS.find(t => t.key === activeTab);
-    const header = tab ? <TabHeader icon={tab.icon} title={tab.title} description={tab.description} /> : null;
+    const meta = PAGE_HEADERS[adminPath];
+    const header = meta ? (
+      <TabHeader icon={meta.icon} title={meta.title} description={meta.description} />
+    ) : null;
 
-    if (activeTab === 'users') {
-      return <>{header}<UsersPanel onSessionExpired={onSessionExpired} onNavigateToGroup={navigateToGroup} /></>;
+    // Diagnostics
+    if (adminPath === 'diagnostics/dashboard') {
+      // Wave 9 will replace the `Dashboard` page with a proper
+      // metrics + admission preview surface. Until then we reuse the
+      // existing MetricsPage which is what operators already landed
+      // on when clicking the `metrics` tab.
+      return (
+        <>
+          {header}
+          <MetricsPage onBack={onBack} embedded />
+        </>
+      );
     }
-    if (activeTab === 'groups') {
-      return <>{header}<GroupsPanel onSessionExpired={onSessionExpired} initialGroupId={pendingGroupId} onGroupSelected={() => setPendingGroupId(null)} /></>;
+    if (adminPath === 'diagnostics/trace') {
+      return (
+        <>
+          {header}
+          <Alert
+            type="info"
+            showIcon
+            message="Admission trace editor — coming in Wave 9."
+            description="For now, use POST /_/api/admin/config/trace from the terminal or curl."
+          />
+        </>
+      );
     }
-    if (activeTab === 'auth') {
-      return <>{header}<AuthenticationPanel onSessionExpired={onSessionExpired} /></>;
+
+    // Configuration — Admission
+    if (adminPath === 'configuration/admission') {
+      return (
+        <>
+          {header}
+          <Alert
+            type="info"
+            showIcon
+            message="Admission block editor — coming in Wave 4."
+            description="Edit your admission blocks via the YAML Import/Export modal in the header, or POST to /_/api/admin/config/section/admission."
+          />
+        </>
+      );
     }
-    if (activeTab === 'backends') {
-      return <>{header}<BackendsPanel onSessionExpired={onSessionExpired} /></>;
+
+    // Configuration — Access
+    if (adminPath === 'configuration/access/credentials') {
+      // Credentials / mode live inside SettingsPage today under the
+      // `security` tab; keep routing there until Wave 5.
+      return (
+        <>
+          {header}
+          <SettingsPage onSessionExpired={onSessionExpired} embeddedTab="security" />
+        </>
+      );
     }
-    if (activeTab === 'metrics') {
-      return <>{header}<MetricsPage onBack={onBack} embedded /></>;
+    if (adminPath === 'configuration/access/users') {
+      return (
+        <>
+          {header}
+          <UsersPanel
+            onSessionExpired={onSessionExpired}
+            onNavigateToGroup={navigateToGroup}
+          />
+        </>
+      );
     }
+    if (adminPath === 'configuration/access/groups') {
+      return (
+        <>
+          {header}
+          <GroupsPanel
+            onSessionExpired={onSessionExpired}
+            initialGroupId={pendingGroupId}
+            onGroupSelected={() => setPendingGroupId(null)}
+          />
+        </>
+      );
+    }
+    if (adminPath === 'configuration/access/ext-auth') {
+      return (
+        <>
+          {header}
+          <AuthenticationPanel onSessionExpired={onSessionExpired} />
+        </>
+      );
+    }
+
+    // Configuration — Storage
+    if (
+      adminPath === 'configuration/storage/backends' ||
+      adminPath === 'configuration/storage/buckets'
+    ) {
+      // Wave 6 splits these; today they share a panel.
+      return (
+        <>
+          {header}
+          <BackendsPanel onSessionExpired={onSessionExpired} />
+        </>
+      );
+    }
+
+    // Configuration — Advanced (5 sub-sections that all live inside
+    // SettingsPage today — map each to the right embedded tab until
+    // Wave 7 pulls them out into dedicated panels).
+    const advancedMap: Record<string, string> = {
+      'configuration/advanced/listener': 'security',
+      'configuration/advanced/caches': 'backend',
+      'configuration/advanced/limits': 'limits',
+      'configuration/advanced/logging': 'logging',
+      'configuration/advanced/sync': 'security',
+    };
+    const embeddedTab = advancedMap[adminPath];
+    if (embeddedTab) {
+      return (
+        <>
+          {header}
+          <SettingsPage onSessionExpired={onSessionExpired} embeddedTab={embeddedTab} />
+        </>
+      );
+    }
+
+    // Unknown path — land on dashboard
     return (
       <>
-        {header}
-        <SettingsPage
-          onSessionExpired={onSessionExpired}
-          embeddedTab={activeTab}
-        />
+        <MetricsPage onBack={onBack} embedded />
       </>
     );
   };
@@ -294,58 +542,55 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
         }}
       />
 
-      {/* Body: sidebar tabs + content */}
+      {/* Body: sidebar + content (§3.1 four-group IA) */}
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
-        {/* Vertical tab sidebar */}
-        <nav style={{
-          width: 200,
-          borderRight: `1px solid ${colors.BORDER}`,
-          background: colors.BG_CARD,
-          padding: '12px 0',
-          flexShrink: 0,
-        }}>
-          {TABS.map(tab => {
-            const isActive = tab.key === activeTab;
-            return (
-              <button
-                key={tab.key}
-                onClick={() => setActiveTab(tab.key)}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 10,
-                  width: '100%',
-                  padding: '10px 20px',
-                  border: 'none',
-                  background: isActive ? colors.ACCENT_BLUE + '18' : 'transparent',
-                  borderLeft: isActive ? `3px solid ${colors.ACCENT_BLUE}` : '3px solid transparent',
-                  color: isActive ? colors.ACCENT_BLUE : colors.TEXT_SECONDARY,
-                  fontSize: 14,
-                  fontWeight: isActive ? 600 : 400,
-                  cursor: 'pointer',
-                  fontFamily: 'var(--font-ui)',
-                  textAlign: 'left',
-                  transition: 'all 0.15s ease',
-                }}
-              >
-                {tab.icon}
-                {tab.label}
-              </button>
-            );
-          })}
-          {/* Backup/Restore */}
-          <div style={{ borderTop: `1px solid ${colors.BORDER}`, margin: '8px 12px 0', padding: '10px 0 0' }}>
-            <div style={{ fontSize: 10, fontWeight: 600, letterSpacing: 0.5, textTransform: 'uppercase', color: colors.TEXT_MUTED, padding: '0 8px 6px', fontFamily: 'var(--font-ui)' }}>
+        {/* Four-group sidebar (AdminSidebar) with a Backup footer
+            stacked beneath it. Backup stays accessible from anywhere
+            in the admin UI — moving it out of the top-level nav
+            freed up room without hiding the feature. */}
+        <div
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            flexShrink: 0,
+            borderRight: `1px solid ${colors.BORDER}`,
+          }}
+        >
+          <div style={{ flex: 1, minHeight: 0 }}>
+            <AdminSidebar activePath={adminPath} onNavigate={navigateAdmin} />
+          </div>
+          {/* Backup footer */}
+          <div
+            style={{
+              background: colors.BG_CARD,
+              padding: '10px 12px 12px',
+              borderTop: `1px solid ${colors.BORDER}`,
+              width: 220,
+            }}
+          >
+            <div
+              style={{
+                fontSize: 10,
+                fontWeight: 600,
+                letterSpacing: 0.5,
+                textTransform: 'uppercase',
+                color: colors.TEXT_MUTED,
+                padding: '0 0 6px',
+                fontFamily: 'var(--font-ui)',
+              }}
+            >
               Backup
             </div>
-            <div style={{ display: 'flex', gap: 4, padding: '0 8px' }}>
+            <div style={{ display: 'flex', gap: 4 }}>
               <Button
                 size="small"
                 icon={<DownloadOutlined />}
                 onClick={async () => {
                   try {
                     const data = await exportBackup();
-                    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+                    const blob = new Blob([JSON.stringify(data, null, 2)], {
+                      type: 'application/json',
+                    });
                     const url = URL.createObjectURL(blob);
                     const a = document.createElement('a');
                     a.href = url;
@@ -354,7 +599,9 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
                     URL.revokeObjectURL(url);
                     message.success('IAM backup exported');
                   } catch (e) {
-                    message.error('Export failed: ' + (e instanceof Error ? e.message : 'unknown'));
+                    message.error(
+                      'Export failed: ' + (e instanceof Error ? e.message : 'unknown')
+                    );
                   }
                 }}
                 style={{ flex: 1, fontSize: 11 }}
@@ -375,11 +622,14 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
                       const text = await file.text();
                       const data = JSON.parse(text);
                       const result = await importBackup(data);
-                      message.success(`Imported: ${result.users_created} users, ${result.groups_created} groups (${result.users_skipped} skipped)`);
-                      // Reload current tab
+                      message.success(
+                        `Imported: ${result.users_created} users, ${result.groups_created} groups (${result.users_skipped} skipped)`
+                      );
                       window.location.reload();
                     } catch (e) {
-                      message.error('Import failed: ' + (e instanceof Error ? e.message : 'invalid JSON'));
+                      message.error(
+                        'Import failed: ' + (e instanceof Error ? e.message : 'invalid JSON')
+                      );
                     }
                   };
                   input.click();
@@ -390,13 +640,46 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
               </Button>
             </div>
           </div>
-        </nav>
+        </div>
 
-        {/* Tab content */}
-        <div style={{ flex: 1, overflow: 'auto' }}>
-          {renderContent()}
+        {/* Content + right-rail actions (§3.3). The rail only
+            appears on Configuration pages — Diagnostics entries
+            don't have an edit surface to Apply / Discard. Pages
+            that own form state wire up Apply / Discard / Paste
+            callbacks themselves once they migrate to the section
+            API; until then the rail shows only the Export / Import
+            full-config buttons so operators can reach those from
+            any page. */}
+        <div
+          style={{
+            flex: 1,
+            overflow: 'auto',
+            display: 'flex',
+            gap: 16,
+            padding: 16,
+          }}
+        >
+          <div style={{ flex: 1, minWidth: 0 }}>{renderContent()}</div>
+          <RightRailActions
+            section={sectionForPath(adminPath)}
+            onExportAll={() => setYamlModalMode('export')}
+            onImportAll={() => setYamlModalMode('import')}
+          />
         </div>
       </div>
     </div>
   );
+}
+
+/**
+ * Resolve which section a Configuration admin path edits — used by
+ * RightRailActions to pick the target for Copy YAML. Returns
+ * undefined for Diagnostics pages (no section scope).
+ */
+function sectionForPath(path: string): SectionName | undefined {
+  if (path.startsWith('configuration/admission')) return 'admission';
+  if (path.startsWith('configuration/access')) return 'access';
+  if (path.startsWith('configuration/storage')) return 'storage';
+  if (path.startsWith('configuration/advanced')) return 'advanced';
+  return undefined;
 }
