@@ -71,6 +71,10 @@ and the first waves of the **admin UI revamp**
     for the plan → diff → apply dialog.
   - `GET /api/admin/config/trace` — query-param variant for
     bookmarkable trace URLs.
+  - `GET /api/admin/audit?limit=N` — recent entries from the
+    in-memory audit ring (newest first; limit clamped to
+    `[1, 500]`). Backs the Diagnostics → Audit log viewer
+    (Wave 11).
 - **CLI subcommands:**
   - `deltaglider_proxy config migrate <toml>` — TOML → YAML
     converter (emits canonical sectioned form).
@@ -79,14 +83,19 @@ and the first waves of the **admin UI revamp**
   - `deltaglider_proxy config defaults` — dump every default
     with its doc comment.
 
-### Admin UI revamp (waves 1–8)
+### Admin UI revamp (waves 1–11)
 
-Eight of ten waves from the plan have landed as of this release;
-waves 9–10 (Diagnostics dashboard + Trace UI, polish pass) are
-still pending. Waves 1–3 shipped at tag time; waves 4–8 landed
-immediately after during live-browser verification and are
+All ten waves from
+[docs/plan/admin-ui-revamp.md](docs/plan/admin-ui-revamp.md) plus
+a follow-on Wave 11 (audit log viewer) have landed as of this
+release. Waves 1–3 shipped at tag time; waves 4–8 landed during
+live-browser verification; waves 9 (Trace diagnostics), 10
+(command palette + shortcuts help), 10.1 (finish §10 polish
+items), and 11 (audit log viewer) shipped post-tag and are
 rolled into the v0.8.0 entry so the `main` history is
-self-describing.
+self-describing. §9.1's Dashboard redesign was deferred — the
+existing MetricsPage remained functional so the rewrite can
+ship independently without blocking operators today.
 
 - **Section-level API client helpers in `adminApi.ts`**:
   `getSection`, `putSection`, `validateSection`, `getSectionYaml`,
@@ -158,6 +167,71 @@ self-describing.
 - **AntD 6 shrink fix** — `theme.css` overrides the AntD 6
   radio/checkbox "shrink on click" default that was breaking
   Wave 4's match-action radio groups.
+- **Admission trace panel** (Wave 9, `TracePanel`) — the
+  `/_/admin/diagnostics/trace` placeholder is replaced by a real
+  admission-chain debugger. Synthetic-request form (method /
+  path / query / source IP / authenticated toggle), one-click
+  example chips, and a result pane built around the Istio /
+  Kiali "reason path" pattern: decision tag, matched-block name,
+  resolved-request breakdown (method / bucket / key /
+  list_prefix / authenticated), and Copy-as-JSON + Clear
+  actions. Calls `POST /api/admin/config/trace` under the hood;
+  no dirty state (pure read). A "How to read the output" info
+  alert demystifies the panes for first-time users.
+- **Command palette** (Wave 10, `CommandPalette`) — `⌘K` /
+  `Ctrl+K` opens a fuzzy-filter palette over every entry in the
+  four-group IA plus shell-scope actions (Export YAML, Import
+  YAML, Setup wizard, Keyboard shortcuts, Back to Browser).
+  Hand-rolled scorer (substring + subsequence, <50-line
+  function); combobox ARIA with `aria-controls` /
+  `aria-activedescendant`; group headings ("Recent" / "Navigate"
+  / "Actions") rendered non-interactively so Arrow keys skip
+  over them. Recent-items MRU (last 5) persists to localStorage
+  and surfaces under the "Recent" heading on empty query.
+- **Shortcuts reference modal** (Wave 10, `ShortcutsHelp`) —
+  `?` opens a platform-aware shortcut list. Mac users see only
+  `⌘` rows; Windows / Linux users see only `Ctrl` rows — no
+  duplicate "same as ⌘K on non-Apple" noise rows. Detection via
+  `navigator.userAgentData.platform` with `navigator.platform`
+  + UA-string fallbacks (`platform.ts`). The listener itself
+  still accepts BOTH modifiers so a Mac user on a PC keyboard
+  still works.
+- **`⌘S` / `Ctrl+S` → Apply dirty section** (Wave 10.1, §10.3).
+  `useDirtySection.ts` gains `registerApplyHandler(section, fn)`
+  + `useApplyHandler(section, fn, enabled)`; handlers are
+  stacked per section so the most-recently-mounted panel wins
+  when siblings share a section (Wave 5 master-detail).
+  `AdminPage` dispatches `⌘S` via `requestApplyCurrent(
+  sectionForPath(adminPath))`; falls through to the browser
+  default when no handler is registered (Diagnostics pages, no
+  dirty state). Wired into Admission, Credentials & mode, and
+  all five Advanced sub-panels.
+- **Mobile drawer** (Wave 10.1, §10.4) — below 900px the
+  persistent sidebar collapses to an AntD Drawer that slides in
+  from the left. Hamburger trigger lives in the header. Drawer
+  auto-closes on navigation. `useIsNarrow` hook tracks the
+  breakpoint live (rotate / devtools-toggle works without
+  reload).
+- **i18n scaffold** (Wave 10.1, §10.2, `i18n.ts`) — pass-through
+  `t(key, fallback)` helper and matching `useT()` hook. Today
+  returns `fallback ?? key` — no translation tables yet.
+  Purpose: when we add a locale, we swap one file's internals
+  and every existing call site continues to work.
+- **Audit log viewer** (Wave 11, `AuditLogPanel`) — the admin UI
+  now surfaces the server's audit trail at
+  `/_/admin/diagnostics/audit`. Backed by a new in-memory ring
+  in `src/audit.rs` (bounded `VecDeque<AuditEntry>`; default 500
+  entries; override via `DGP_AUDIT_RING_SIZE`). Every
+  `audit_log()` call pushes a sanitised copy onto the ring, so
+  stdout / JSON log shippers see nothing change — the ring is
+  supplementary. New `GET /api/admin/audit?limit=N` endpoint
+  (session-gated; not IAM-gated — all admins see the same log).
+  Panel renders a monospace table with colour-coded Action tags
+  (red = `login_failed` / `delete`, green = `login`, etc.),
+  free-text filter across every column, optional 3-second
+  auto-refresh, and an "In-memory ring — not a compliance
+  substitute" banner so operators don't mistake it for durable
+  storage.
 
 ### Bug fixes / correctness
 
