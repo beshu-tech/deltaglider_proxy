@@ -31,6 +31,7 @@ import CredentialsModePanel from './CredentialsModePanel';
 import BucketsPanel from './BucketsPanel';
 import CopySectionYamlButton from './CopySectionYamlButton';
 import SetupWizard from './SetupWizard';
+import TracePanel from './TracePanel';
 import {
   ListenerTlsPanel,
   CachesPanel,
@@ -366,12 +367,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
       return (
         <>
           {header}
-          <Alert
-            type="info"
-            showIcon
-            message="Admission trace editor — coming in Wave 9."
-            description="For now, use POST /_/api/admin/config/trace from the terminal or curl."
-          />
+          <TracePanel onSessionExpired={onSessionExpired} />
         </>
       );
     }
