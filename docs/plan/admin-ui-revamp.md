@@ -1,6 +1,6 @@
 # Admin UI Revamp — Design Plan
 
-**Status:** Waves 1-7 shipped in v0.8.0 and its immediate follow-ons. Waves 8-10 (first-run wizard, Diagnostics dashboard + Trace UI, polish pass) still pending.
+**Status:** Waves 1-8 shipped in v0.8.0 and its immediate follow-ons. Waves 9-10 (Diagnostics dashboard + Trace UI, polish pass) still pending.
 
 **Stakeholders:** admin UI users (three personas — solo operator,
 GitOps team, GUI-first enterprise), the Rust backend team (this
@@ -22,7 +22,7 @@ plan proposes new admin API endpoints), the YAML config authors.
 | 5 — Access section | ✅ Shipped | Credentials & mode sub-panel; `IamSourceBanner` on every Access sub-page explaining iam_mode authority. Users / Groups / External auth kept their existing layouts, now decorated with the banner. |
 | 6 — Storage section | ✅ Shipped | `BucketsPanel` with tri-state Anonymous read (None / Specific prefixes / Entire bucket → `public: true` shorthand). Test-connection button on backends. AntD 6 radio/checkbox shrink-on-click defeated in theme.css. |
 | 7 — Advanced section | ✅ Shipped | Five dedicated sub-panels (Listener & TLS, Caches, Limits, Logging, Config DB sync). `🔁` restart-required badging, env-var chips on env-owned fields, fabricated TOML hints removed (pre-Phase-3 artefact). |
-| 8 — First-run wizard | ⏳ Pending | — |
+| 8 — First-run wizard | ✅ Shipped | Five-screen guided onboarding at `/_/admin/setup`: backend pick → backend config (with live Test Connection for S3) → admin credentials → optional public bucket → review + apply. Routes to Dashboard on success. |
 | 9 — Trace + Dashboard | ⏳ Pending | `POST/GET /config/trace` endpoints exist (Phase 2 + Wave 1); a Trace page and Diagnostics dashboard rendering against them are the wave's UI work. |
 | 10 — Polish | ⏳ Pending | A11y, keyboard shortcuts, i18n wrappers, mobile responsive pass. |
 

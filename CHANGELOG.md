@@ -79,11 +79,11 @@ and the first waves of the **admin UI revamp**
   - `deltaglider_proxy config defaults` — dump every default
     with its doc comment.
 
-### Admin UI revamp (waves 1–7)
+### Admin UI revamp (waves 1–8)
 
-Seven of ten waves from the plan have landed as of this release;
-waves 8–10 (first-run wizard, diagnostics dashboard, polish pass)
-are still pending. Waves 1–3 shipped at tag time; waves 4–7 landed
+Eight of ten waves from the plan have landed as of this release;
+waves 9–10 (Diagnostics dashboard + Trace UI, polish pass) are
+still pending. Waves 1–3 shipped at tag time; waves 4–8 landed
 immediately after during live-browser verification and are
 rolled into the v0.8.0 entry so the `main` history is
 self-describing.
@@ -144,6 +144,12 @@ self-describing.
   TLS, Caches, Limits, Logging, Config DB sync), each with
   grouped forms, `🔁` restart-required badging, and monospace
   `from DGP_X_Y` chips on env-var-owned fields.
+- **First-run setup wizard** (Wave 8) — five-screen guided
+  onboarding at `/_/admin/setup`: backend pick → backend config
+  (with live Test Connection for S3) → admin credentials →
+  optional public bucket → review + apply. Routes to the
+  Dashboard on success. Zero-to-working in under three minutes
+  on a fresh install.
 - **IAM source-of-truth banner** (`IamSourceBanner`) — surfaced
   on every Access sub-panel: explains in plain English whether
   the listed users/groups/providers are DB-managed (iam_mode:

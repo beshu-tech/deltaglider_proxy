@@ -12,7 +12,7 @@
 > | 2 — Admission chain                | ✅ **Done** | `Deny` / `Reject` dispatch shipped in Phase 3b.2.b; `RateLimit` action variant + 5-block default chain carried into Phase 3b.2.c (deferred with a known gap) |
 > | 3 — Progressive-disclosure schema  | 🟡 **Partial (3a, 3b.1, 3b.2.a, 3b.2.b, 3c.1, 3c.2 done)** | **3b.2.c** (rate-limit action) and **3c.3** (declarative reconciler) and **3d** (group presets) still pending |
 > | 4 — CLI                            | 🟡 **Most of it done** | `config migrate` / `schema` / `lint` / `defaults` / `apply` + `admission trace` shipped. `config init` / `config show` / `config explain` still pending |
-> | 5 — GUI redesign                   | 🟡 **Waves 1-7 of 10 done** | Tracked separately in [admin-ui-revamp.md](admin-ui-revamp.md); waves 8-10 (first-run wizard / diagnostics dashboard / polish) pending |
+> | 5 — GUI redesign                   | 🟡 **Waves 1-8 of 10 done** | Tracked separately in [admin-ui-revamp.md](admin-ui-revamp.md); waves 9-10 (diagnostics dashboard / polish) pending |
 > | 6 — Deprecation sweep              | ✅ **Done** | TOML emits deprecation warn; YAML example + README + HOWTO shipped; removal still scheduled ≥2 minors post-Phase-6 |
 >
 > **Bonus work that shipped alongside** (not in the original plan but
@@ -402,18 +402,18 @@ Add subcommands to `src/main.rs:36` (existing `Cli` struct) — reshape current 
 
 ### Phase 5 — GUI redesign (3–4 weeks, parallelizable with Phase 2/4)
 
-> **🟡 STATUS: Waves 1-7 of 10 shipped**
+> **🟡 STATUS: Waves 1-8 of 10 shipped**
 >
 > The GUI redesign is tracked in its own companion plan,
 > [admin-ui-revamp.md](admin-ui-revamp.md), which subsumed this phase.
-> Waves 1-7 landed across v0.8.0 and its immediate follow-ons:
+> Waves 1-8 landed across v0.8.0 and its immediate follow-ons:
 > section-level API (Wave 1), foundation components (Wave 2), sidebar
 > + URL scheme + right-rail (Wave 3), Admission editor (Wave 4),
 > Access Credentials & mode panel (Wave 5), Buckets panel with
 > tri-state public toggle (Wave 6), Advanced's five sub-panels
-> (Wave 7). Waves 8 (first-run wizard), 9 (Diagnostics dashboard +
-> Trace UI), and 10 (A11y / keyboard / mobile polish) are still
-> pending.
+> (Wave 7), first-run setup wizard at `/_/admin/setup` (Wave 8).
+> Waves 9 (Diagnostics dashboard + Trace UI) and 10 (A11y / keyboard
+> / mobile polish) are still pending.
 
 **Goal:** The admin GUI mirrors the 4-section mental model, every page offers a "Copy as YAML" button, and a first-run wizard bridges zero-to-working.
 
