@@ -23,10 +23,11 @@ graph LR
 
 **Why:** Without this, anyone who can reach your proxy can read, write, and delete all data. SigV4 is the standard S3 authentication mechanism — all S3 clients and SDKs support it natively.
 
-```toml
-# deltaglider_proxy.toml
-access_key_id = "my-proxy-key"
-secret_access_key = "my-super-secret-key-change-me"
+```yaml
+# deltaglider_proxy.yaml
+access:
+  access_key_id: my-proxy-key
+  secret_access_key: my-super-secret-key-change-me
 ```
 
 ```bash
@@ -71,15 +72,18 @@ aws configure
 # Base64: JDJiJDEy...
 ```
 
-```toml
-# deltaglider_proxy.toml
-bootstrap_password_hash = "JDJiJDEyJENYbDVPRm84bDg2..."
+```yaml
+# deltaglider_proxy.yaml
+advanced:
+  bootstrap_password_hash: "JDJiJDEyJENYbDVPRm84bDg2..."
 ```
 
 ```bash
 # For Docker (avoids $ escaping issues), use base64 form
 DGP_BOOTSTRAP_PASSWORD_HASH=JDJiJDEyJENYbDVPRm84bDg2...
 ```
+
+> Note: infra secrets (bootstrap hash, encryption key) are stripped from canonical exports (`/config/export`, `config migrate`) — they never round-trip through the YAML artifact. Inject them via env var at deploy time.
 
 **Why base64?** Bcrypt hashes contain `$` characters which Docker, docker-compose, and shell scripts interpret as variable references. The base64 form avoids this entirely.
 
