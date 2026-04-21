@@ -78,26 +78,30 @@ All settings via environment variables:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DGP_LISTEN_ADDR` | `0.0.0.0:9000` | S3 API listen address |
-| `DGP_MAX_DELTA_RATIO` | `0.5` | Max delta/original ratio (lower = more aggressive) |
+| `DGP_MAX_DELTA_RATIO` | `0.75` | Max delta/original ratio (lower = more aggressive) |
 | `DGP_MAX_OBJECT_SIZE` | `104857600` | Max object size for delta (100 MB) |
-| `DGP_CACHE_MB` | `100` | Reference cache size in MB |
-| `DGP_ACCESS_KEY_ID` | *(unset)* | Proxy SigV4 access key (unset = open access) |
+| `DGP_CACHE_MB` | `100` | Reference cache size in MB (recommend ≥1024 for production) |
+| `DGP_ACCESS_KEY_ID` | *(unset)* | Proxy SigV4 access key (**required** — proxy refuses to start without creds unless `DGP_AUTHENTICATION=none`) |
 | `DGP_SECRET_ACCESS_KEY` | *(unset)* | Proxy SigV4 secret key |
+| `DGP_AUTHENTICATION` | *(auto-detect)* | Set to `none` for open-access dev mode |
 | `DGP_DATA_DIR` | `./data` | Filesystem backend data directory |
 | `DGP_S3_ENDPOINT` | *(unset)* | S3 backend endpoint URL |
 | `DGP_S3_REGION` | `us-east-1` | S3 backend region |
 | `DGP_BE_AWS_ACCESS_KEY_ID` | *(unset)* | Backend S3 credentials |
 | `DGP_BE_AWS_SECRET_ACCESS_KEY` | *(unset)* | Backend S3 credentials |
-| `DGP_BOOTSTRAP_PASSWORD_HASH` | *(auto-generated)* | Bootstrap password bcrypt hash (for DB encryption + admin access) |
-| `DGP_LOG_LEVEL` | `debug` | Log filter (changeable at runtime via admin GUI) |
+| `DGP_BOOTSTRAP_PASSWORD_HASH` | *(auto-generated)* | Bootstrap password bcrypt hash (encrypts IAM DB, signs session cookies, gates admin GUI). Base64-encoded form avoids `$` escaping in Docker. |
+| `DGP_LOG_LEVEL` | `deltaglider_proxy=debug` | Log filter (changeable at runtime via admin GUI) |
+| `DGP_CONFIG_SYNC_BUCKET` | *(unset)* | S3 bucket for encrypted-DB multi-instance sync |
 | `DGP_TLS_ENABLED` | `false` | Enable HTTPS |
 
-Or mount a TOML config file:
+Or mount a YAML config file:
 
 ```bash
-docker run -v ./my-config.toml:/etc/deltaglider_proxy.toml \
-  beshultd/deltaglider_proxy -c /etc/deltaglider_proxy.toml
+docker run -v ./my-config.yaml:/etc/deltaglider_proxy.yaml \
+  beshultd/deltaglider_proxy -c /etc/deltaglider_proxy.yaml
 ```
+
+(TOML config still loads but emits a deprecation warning on every startup; run `deltaglider_proxy config migrate <file>.toml --out <file>.yaml` to convert.)
 
 ## Built-in Admin GUI
 
@@ -144,8 +148,8 @@ The Docker image includes a built-in healthcheck on port 9000 (15s interval).
 | Tag | Description |
 |-----|-------------|
 | `latest` | Latest stable release |
-| `0.2.0` | Specific version |
-| `0.2` | Latest patch in 0.2.x |
+| `0.8.0` | Specific version |
+| `0.8` | Latest patch in 0.8.x |
 | `0` | Latest minor in 0.x.x |
 
 ## Source & License
