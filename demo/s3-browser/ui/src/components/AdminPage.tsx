@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { Typography, Button, Input, Alert, Space, Spin, message } from 'antd';
 import { checkSession, adminLogin, whoami, loginAs, exportBackup, importBackup, type ExternalProviderInfo } from '../adminApi';
 import { getCredentials } from '../s3client';
@@ -32,6 +32,14 @@ import BucketsPanel from './BucketsPanel';
 import CopySectionYamlButton from './CopySectionYamlButton';
 import SetupWizard from './SetupWizard';
 import TracePanel from './TracePanel';
+import CommandPalette, {
+  FileTextOutlined as PaletteFileTextOutlined,
+  ImportOutlined as PaletteImportOutlined,
+  RocketOutlined,
+  LogoutOutlined,
+  QuestionCircleOutlined,
+} from './CommandPalette';
+import ShortcutsHelp from './ShortcutsHelp';
 import {
   ListenerTlsPanel,
   CachesPanel,
@@ -202,6 +210,12 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
   // navigates away from a dirty section.
   useDirtyGlobalIndicators();
 
+  // Command palette (⌘K / Ctrl+K) + Shortcuts help (?) — Wave 10
+  // polish. Global keydown listener only mounts while AdminPage is
+  // up so the shortcuts don't interfere with other views.
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
+
   // Derive canonical admin path (§3.2). Legacy flat URLs (`users`,
   // `backends`, etc.) are mapped to the new hierarchy.
   const rawSubPath = (subPath || '').replace(/^\/+/, '').replace(/\/+$/, '');
@@ -243,6 +257,90 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
   // (paste YAML → validate → apply) and 'export' (fetch current
   // canonical YAML → copy to clipboard).
   const [yamlModalMode, setYamlModalMode] = useState<'import' | 'export' | null>(null);
+
+  // Global keyboard shortcuts: ⌘K / Ctrl+K opens command palette,
+  // `?` opens shortcuts help. Only active AFTER admin auth — no
+  // reason to hijack ⌘K on the bootstrap login screen where the
+  // palette items would be unusable. We ignore `?` when focus is
+  // inside an input / textarea / contenteditable so the literal
+  // character still lands in text fields naturally. Modifier match
+  // is strict (no shift / alt) to avoid hijacking ⌘⇧K (Chrome's
+  // "clear console") and similar DevTools-adjacent combos.
+  useEffect(() => {
+    if (!authed) return;
+    const onKey = (e: KeyboardEvent) => {
+      const inText =
+        e.target instanceof HTMLInputElement ||
+        e.target instanceof HTMLTextAreaElement ||
+        (e.target instanceof HTMLElement && e.target.isContentEditable);
+      const isBareCmdCtrl =
+        (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey;
+      if (isBareCmdCtrl && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setPaletteOpen(true);
+        return;
+      }
+      if (e.key === '?' && !inText) {
+        e.preventDefault();
+        setHelpOpen(true);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [authed]);
+
+  // Memoised palette extra-actions. The underlying handlers
+  // (`setYamlModalMode`, `setHelpOpen`, `navigateAdmin`, `onBack`)
+  // are stable, so the only real dep is `navigateAdmin`. A fresh
+  // array each render would invalidate the palette's useMemo chain
+  // (commands → filtered) on every keystroke in the search input —
+  // unnecessary work, especially on lower-powered devices.
+  const paletteExtraActions = useMemo(
+    () => [
+      {
+        id: 'action:export-yaml',
+        label: 'Export YAML',
+        hint: 'Copy the current config as canonical YAML',
+        keywords: 'export yaml download config copy',
+        icon: <PaletteFileTextOutlined />,
+        onRun: () => setYamlModalMode('export'),
+      },
+      {
+        id: 'action:import-yaml',
+        label: 'Import YAML',
+        hint: 'Paste a YAML config document — validate, then apply',
+        keywords: 'import yaml upload config paste apply',
+        icon: <PaletteImportOutlined />,
+        onRun: () => setYamlModalMode('import'),
+      },
+      {
+        id: 'action:setup-wizard',
+        label: 'Setup wizard',
+        hint: 'Walk through the 5-step onboarding for a fresh deployment',
+        keywords: 'setup wizard onboarding first-run init',
+        icon: <RocketOutlined />,
+        onRun: () => navigateAdmin('setup'),
+      },
+      {
+        id: 'action:shortcuts-help',
+        label: 'Keyboard shortcuts',
+        hint: 'Show the full list of admin UI shortcuts',
+        keywords: 'help shortcuts keyboard bindings',
+        icon: <QuestionCircleOutlined />,
+        shortcut: '?',
+        onRun: () => setHelpOpen(true),
+      },
+      {
+        id: 'action:back-to-browser',
+        label: 'Back to Browser',
+        hint: 'Leave admin and return to the S3 object browser',
+        keywords: 'back browser exit close admin',
+        icon: <LogoutOutlined />,
+        onRun: () => onBack(),
+      },
+    ],
+    [navigateAdmin, onBack]
+  );
 
   // Check existing session on mount, or auto-login for IAM admins
   useEffect(() => {
@@ -660,6 +758,19 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
           window.location.reload();
         }}
       />
+
+      {/* ⌘K command palette — fuzzy navigation over every admin page,
+          plus a handful of shell-level quick actions (Export YAML,
+          Import YAML, Setup wizard, Back to Browser). Mounts here so
+          the extra actions can close over the same setters already
+          wired into the header buttons (no prop drilling). */}
+      <CommandPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        onNavigateAdmin={navigateAdmin}
+        extraActions={paletteExtraActions}
+      />
+      <ShortcutsHelp open={helpOpen} onClose={() => setHelpOpen(false)} />
 
       {/* Body: sidebar + content (§3.1 four-group IA) */}
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
