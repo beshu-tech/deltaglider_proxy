@@ -19,7 +19,6 @@ import {
 } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import FullScreenHeader from './FullScreenHeader';
-import SettingsPage from './SettingsPage';
 import UsersPanel from './UsersPanel';
 import GroupsPanel from './GroupsPanel';
 import AuthenticationPanel from './AuthenticationPanel';
@@ -31,6 +30,13 @@ import AdmissionPanel from './AdmissionPanel';
 import CredentialsModePanel from './CredentialsModePanel';
 import BucketsPanel from './BucketsPanel';
 import RightRailActions from './RightRailActions';
+import {
+  ListenerTlsPanel,
+  CachesPanel,
+  LimitsPanel,
+  LoggingPanel,
+  ConfigDbSyncPanel,
+} from './advancedPanels';
 import {
   AccessOverview,
   StorageOverview,
@@ -467,22 +473,46 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
       );
     }
 
-    // Configuration — Advanced (5 sub-sections that all live inside
-    // SettingsPage today — map each to the right embedded tab until
-    // Wave 7 pulls them out into dedicated panels).
-    const advancedMap: Record<string, string> = {
-      'configuration/advanced/listener': 'security',
-      'configuration/advanced/caches': 'backend',
-      'configuration/advanced/limits': 'limits',
-      'configuration/advanced/logging': 'logging',
-      'configuration/advanced/sync': 'security',
-    };
-    const embeddedTab = advancedMap[adminPath];
-    if (embeddedTab) {
+    // Configuration — Advanced (Wave 7). Five dedicated sub-panels,
+    // each edits a different slice of `advanced.*` through the
+    // section API (or for Limits, read-only env-var display).
+    if (adminPath === 'configuration/advanced/listener') {
       return (
         <>
           {header}
-          <SettingsPage onSessionExpired={onSessionExpired} embeddedTab={embeddedTab} />
+          <ListenerTlsPanel onSessionExpired={onSessionExpired} />
+        </>
+      );
+    }
+    if (adminPath === 'configuration/advanced/caches') {
+      return (
+        <>
+          {header}
+          <CachesPanel onSessionExpired={onSessionExpired} />
+        </>
+      );
+    }
+    if (adminPath === 'configuration/advanced/limits') {
+      return (
+        <>
+          {header}
+          <LimitsPanel onSessionExpired={onSessionExpired} />
+        </>
+      );
+    }
+    if (adminPath === 'configuration/advanced/logging') {
+      return (
+        <>
+          {header}
+          <LoggingPanel onSessionExpired={onSessionExpired} />
+        </>
+      );
+    }
+    if (adminPath === 'configuration/advanced/sync') {
+      return (
+        <>
+          {header}
+          <ConfigDbSyncPanel onSessionExpired={onSessionExpired} />
         </>
       );
     }

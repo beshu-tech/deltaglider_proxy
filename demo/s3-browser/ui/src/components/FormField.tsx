@@ -39,8 +39,13 @@ import { Tag } from 'antd';
 import { useColors } from '../ThemeContext';
 
 export interface FormFieldProps {
-  /** Plain-English field name. E.g. "Reference-cache size (MB)". */
-  label: string;
+  /**
+   * Plain-English field name. E.g. "Reference-cache size (MB)".
+   * Accepts ReactNode so callers can embed inline chips (e.g. a
+   * "Restart required" badge) next to the text — the underlying
+   * `<span>` renders whatever's passed.
+   */
+  label: ReactNode;
   /** Full YAML path. E.g. `advanced.cache_size_mb`. */
   yamlPath?: string;
   /** One-sentence help shown below the input. */
