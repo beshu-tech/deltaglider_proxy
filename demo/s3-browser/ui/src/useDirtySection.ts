@@ -73,6 +73,81 @@ export function getDirtySections(): Set<SectionName> {
   return new Set(dirtyCounts.keys());
 }
 
+// ---------------------------------------------------------------
+// ⌘S apply-dispatcher (Wave 10.1 §10.3)
+// ---------------------------------------------------------------
+// Each section panel registers a `requestApply` callback; the
+// AdminPage keydown listener calls `requestApplyCurrent(section)`
+// when the operator presses ⌘S. One section can have multiple
+// sibling panels (e.g. access/{credentials,users,groups,ext-auth})
+// — we dispatch to the *most-recently-mounted* handler for that
+// section, which is the one the operator is actively looking at
+// (Wave 5's master-detail pattern means only one sibling is
+// visible at a time).
+type ApplyHandler = () => void;
+const applyHandlers = new Map<SectionName, ApplyHandler[]>();
+
+/**
+ * Register an apply handler for a section. Returns a cleanup fn
+ * that the caller must invoke on unmount.
+ *
+ * Handlers are kept in a stack so the most-recently-mounted panel
+ * wins on ⌘S. This matches the master-detail UX (only one sibling
+ * visible) without requiring each panel to track whether it's
+ * "active."
+ */
+export function registerApplyHandler(
+  section: SectionName,
+  handler: ApplyHandler
+): () => void {
+  const stack = applyHandlers.get(section) ?? [];
+  stack.push(handler);
+  applyHandlers.set(section, stack);
+  return () => {
+    const s = applyHandlers.get(section);
+    if (!s) return;
+    const idx = s.indexOf(handler);
+    if (idx >= 0) s.splice(idx, 1);
+    if (s.length === 0) applyHandlers.delete(section);
+  };
+}
+
+/**
+ * Dispatch ⌘S to the topmost apply handler for a section. Returns
+ * true if a handler ran (so the caller can `preventDefault` the
+ * browser's "save page" dialog). Returns false when no handler is
+ * registered (e.g. on Diagnostics pages) so the browser default
+ * can proceed.
+ */
+export function requestApplyCurrent(section: SectionName | null): boolean {
+  if (!section) return false;
+  const stack = applyHandlers.get(section);
+  if (!stack || stack.length === 0) return false;
+  const fn = stack[stack.length - 1];
+  fn();
+  return true;
+}
+
+/**
+ * React-hook sugar: register `handler` for a section, ref-stable
+ * across renders so the dispatcher always reaches the latest
+ * closure. Skipped when `enabled` is false — callers pass their
+ * `isDirty` flag so a disabled Apply button can't be triggered
+ * by ⌘S either.
+ */
+export function useApplyHandler(
+  section: SectionName,
+  handler: ApplyHandler,
+  enabled: boolean
+): void {
+  const handlerRef = useRef(handler);
+  handlerRef.current = handler;
+  useEffect(() => {
+    if (!enabled) return;
+    return registerApplyHandler(section, () => handlerRef.current());
+  }, [section, enabled]);
+}
+
 export interface UseDirtySectionResult<T> {
   /** Current (editable) form state. */
   value: T;

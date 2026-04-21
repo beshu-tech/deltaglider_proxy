@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { Typography, Button, Input, Alert, Space, Spin, message } from 'antd';
+import { Typography, Button, Input, Alert, Space, Spin, Drawer, message } from 'antd';
 import { checkSession, adminLogin, whoami, loginAs, exportBackup, importBackup, type ExternalProviderInfo } from '../adminApi';
 import { getCredentials } from '../s3client';
 import {
@@ -16,6 +16,7 @@ import {
   ExperimentOutlined,
   SecurityScanOutlined,
   SettingOutlined,
+  MenuOutlined,
 } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import FullScreenHeader from './FullScreenHeader';
@@ -56,7 +57,7 @@ import { useNavigation } from '../NavigationContext';
 import TabHeader from './TabHeader';
 import { YamlImportExportModal } from './YamlImportExportModal';
 import { FileTextOutlined, ImportOutlined } from '@ant-design/icons';
-import { useDirtyGlobalIndicators } from '../useDirtySection';
+import { useDirtyGlobalIndicators, requestApplyCurrent } from '../useDirtySection';
 import type { SectionName } from '../adminApi';
 
 const { Text } = Typography;
@@ -90,6 +91,26 @@ const LEGACY_TO_NEW: Record<string, string> = {
   'security': 'configuration/advanced/listener',
   'logging': 'configuration/advanced/logging',
 };
+
+/**
+ * Viewport-narrow detection hook (Wave 10.1 §10.4). Returns true
+ * when the window is below `breakpoint` pixels wide — used to
+ * swap the persistent sidebar for an AntD Drawer. Listens to
+ * `resize` so toggling dev-tools / rotating the device is picked
+ * up live without a full reload. 900px matches the plan's promise
+ * ("sidebar collapses to drawer at <900px").
+ */
+function useIsNarrow(breakpoint: number = 900): boolean {
+  const [narrow, setNarrow] = useState(() =>
+    typeof window !== 'undefined' ? window.innerWidth < breakpoint : false
+  );
+  useEffect(() => {
+    const onResize = () => setNarrow(window.innerWidth < breakpoint);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, [breakpoint]);
+  return narrow;
+}
 
 /**
  * Resolve an incoming `subPath` (anything the browser presents) to a
@@ -216,6 +237,13 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
 
+  // Mobile drawer (Wave 10.1 §10.4). Below 900px the persistent
+  // 220px sidebar is replaced with an AntD Drawer that slides in
+  // from the left. Hamburger trigger lives in the header extra
+  // slot. Auto-closes on navigation (see navigateAdmin below).
+  const isNarrow = useIsNarrow(900);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+
   // Derive canonical admin path (§3.2). Legacy flat URLs (`users`,
   // `backends`, etc.) are mapped to the new hierarchy.
   const rawSubPath = (subPath || '').replace(/^\/+/, '').replace(/\/+$/, '');
@@ -223,6 +251,9 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
   const navigateAdmin = useCallback(
     (path: string) => {
       navigate(`admin/${path}`);
+      // Close the mobile drawer (if open) on navigation. Harmless
+      // no-op on wide viewports where the drawer is never shown.
+      setMobileNavOpen(false);
     },
     [navigate]
   );
@@ -258,14 +289,20 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
   // canonical YAML → copy to clipboard).
   const [yamlModalMode, setYamlModalMode] = useState<'import' | 'export' | null>(null);
 
-  // Global keyboard shortcuts: ⌘K / Ctrl+K opens command palette,
-  // `?` opens shortcuts help. Only active AFTER admin auth — no
-  // reason to hijack ⌘K on the bootstrap login screen where the
-  // palette items would be unusable. We ignore `?` when focus is
-  // inside an input / textarea / contenteditable so the literal
-  // character still lands in text fields naturally. Modifier match
-  // is strict (no shift / alt) to avoid hijacking ⌘⇧K (Chrome's
-  // "clear console") and similar DevTools-adjacent combos.
+  // Global keyboard shortcuts (Wave 10 / 10.1 §10.3):
+  //
+  //   ⌘K / Ctrl+K — open the command palette (quick nav).
+  //   ⌘S / Ctrl+S — Apply the current dirty section (if any). Does
+  //                 NOT preventDefault when no dirty section handler
+  //                 is registered, so the browser's native "save
+  //                 page" fires normally on Diagnostics pages.
+  //   ?           — open the shortcuts reference. Ignored when focus
+  //                 is in an input / textarea / contenteditable so
+  //                 the literal character still lands in text fields.
+  //
+  // Only active AFTER admin auth — no reason to hijack ⌘K on the
+  // bootstrap login screen. Modifier match is strict (no shift / alt)
+  // so we don't hijack ⌘⇧K (Chrome's "clear console") or ⌘⌥K.
   useEffect(() => {
     if (!authed) return;
     const onKey = (e: KeyboardEvent) => {
@@ -280,6 +317,18 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
         setPaletteOpen(true);
         return;
       }
+      if (isBareCmdCtrl && e.key.toLowerCase() === 's') {
+        // Dispatch to the currently-visible section's Apply handler.
+        // If nothing is registered (e.g. Diagnostics pages, clean
+        // Configuration pages), let the browser's default fire — we
+        // don't want to silently eat ⌘S when there's no contextual
+        // meaning.
+        const section = sectionForPath(adminPath);
+        if (section && requestApplyCurrent(section)) {
+          e.preventDefault();
+        }
+        return;
+      }
       if (e.key === '?' && !inText) {
         e.preventDefault();
         setHelpOpen(true);
@@ -287,7 +336,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [authed]);
+  }, [authed, adminPath]);
 
   // Memoised palette extra-actions. The underlying handlers
   // (`setYamlModalMode`, `setHelpOpen`, `navigateAdmin`, `onBack`)
@@ -716,6 +765,18 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
         onBack={onBack}
         extra={
           <Space size={4}>
+            {/* Mobile hamburger — visible only below 900px where
+                the persistent sidebar collapses to a drawer. */}
+            {isNarrow && (
+              <Button
+                size="small"
+                type="text"
+                icon={<MenuOutlined />}
+                onClick={() => setMobileNavOpen(true)}
+                aria-label="Open navigation"
+                style={{ color: colors.TEXT_MUTED }}
+              />
+            )}
             {/* Section-scoped Copy YAML — only renders on Configuration
                 pages. Lives in the header now (not the old right-rail
                 column) so Configuration pages reclaim the full content
@@ -774,6 +835,29 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
 
       {/* Body: sidebar + content (§3.1 four-group IA) */}
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
+        {/* Mobile drawer (Wave 10.1 §10.4) — same sidebar contents,
+            slide-in from the left. Only rendered below 900px. The
+            persistent sidebar (next block) hides on narrow viewports. */}
+        {isNarrow && (
+          <Drawer
+            title={null}
+            placement="left"
+            open={mobileNavOpen}
+            onClose={() => setMobileNavOpen(false)}
+            closable={false}
+            width={260}
+            styles={{
+              body: { padding: 0, background: colors.BG_CARD },
+              header: { display: 'none' },
+            }}
+          >
+            <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+              <div style={{ flex: 1, minHeight: 0 }}>
+                <AdminSidebar activePath={adminPath} onNavigate={navigateAdmin} />
+              </div>
+            </div>
+          </Drawer>
+        )}
         {/* Four-group sidebar (AdminSidebar) with an IAM Backup
             footer. Explicitly labelled "IAM Backup" — this is a
             JSON dump of IAM users/groups/OAuth-providers/mapping-
@@ -782,10 +866,13 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
             go looking for a third Export/Import channel. It is
             genuinely its own data domain — encrypted SQLCipher
             contents vs. the config YAML document — and deserves
-            its own surface rather than being hidden. */}
+            its own surface rather than being hidden.
+
+            Hidden on narrow viewports (<900px) — replaced with the
+            Drawer above. */}
         <div
           style={{
-            display: 'flex',
+            display: isNarrow ? 'none' : 'flex',
             flexDirection: 'column',
             flexShrink: 0,
             borderRight: `1px solid ${colors.BORDER}`,

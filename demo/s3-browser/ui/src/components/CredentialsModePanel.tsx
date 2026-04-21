@@ -55,7 +55,7 @@ import {
 } from '../adminApi';
 import { useColors } from '../ThemeContext';
 import { useCardStyles } from './shared-styles';
-import { useDirtySection } from '../useDirtySection';
+import { useDirtySection, useApplyHandler } from '../useDirtySection';
 import SectionHeader from './SectionHeader';
 import FormField from './FormField';
 import ApplyDialog from './ApplyDialog';
@@ -255,6 +255,10 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
       setApplying(false);
     }
   };
+
+  // ⌘S wiring: when this panel is mounted and dirty, ⌘S opens the
+  // Apply dialog (same action as clicking the Apply button).
+  useApplyHandler('access', runApply, isDirty);
 
   if (error) {
     return <Alert type="error" showIcon message="Failed to load" description={error} />;

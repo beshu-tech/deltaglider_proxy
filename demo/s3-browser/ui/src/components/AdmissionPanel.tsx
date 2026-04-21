@@ -38,7 +38,7 @@ import {
   validateSection,
 } from '../adminApi';
 import { useColors } from '../ThemeContext';
-import { useDirtySection } from '../useDirtySection';
+import { useDirtySection, useApplyHandler } from '../useDirtySection';
 import AdmissionBlockList from './AdmissionBlockList';
 import AdmissionBlockEditorModal from './AdmissionBlockEditorModal';
 import SynthesizedBlocksPreview from './SynthesizedBlocksPreview';
@@ -248,6 +248,10 @@ export default function AdmissionPanel({
       setApplying(false);
     }
   };
+
+  // ⌘S wiring: when dirty, ⌘S triggers the same flow as clicking
+  // Apply — opens the validate → ApplyDialog sequence.
+  useApplyHandler('admission', runApply, isDirty);
 
   const otherNames = blocks
     .filter((_, i) => i !== editingIndex)

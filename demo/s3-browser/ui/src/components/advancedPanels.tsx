@@ -50,7 +50,7 @@ import {
 } from '../adminApi';
 import { useColors } from '../ThemeContext';
 import { useCardStyles } from './shared-styles';
-import { useDirtySection } from '../useDirtySection';
+import { useDirtySection, useApplyHandler } from '../useDirtySection';
 import SectionHeader from './SectionHeader';
 import FormField from './FormField';
 import ApplyDialog from './ApplyDialog';
@@ -218,6 +218,12 @@ function useAdvancedSubset<T extends Partial<AdvancedSectionBody>>(
       setApplying(false);
     }
   };
+
+  // ⌘S wiring: any Advanced sub-panel inherits ⌘S-to-Apply for free.
+  // Each panel mounts its own useAdvancedSubset — only the visible
+  // panel's handler sits on top of the register stack, which is
+  // exactly what requestApplyCurrent dispatches to.
+  useApplyHandler('advanced', runApply, isDirty);
 
   return {
     value,

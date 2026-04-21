@@ -1,13 +1,21 @@
 /**
- * ShortcutsHelp — Wave 10, §10.3 of the admin UI revamp plan.
+ * ShortcutsHelp — Wave 10 / 10.1, §10.3 of the admin UI revamp plan.
  *
- * Modal summarising the keyboard shortcuts the admin UI
- * respects. Triggered by `?` (when the focus is NOT inside an
- * input / textarea / editable element — we don't want a literal
- * "?" in a password field to open a help modal).
+ * Modal summarising the keyboard shortcuts the admin UI respects.
+ * Triggered by `?` (when the focus is NOT inside an input /
+ * textarea / editable element — we don't want a literal "?" in a
+ * password field to open a help modal).
+ *
+ * Platform-aware (Wave 10.1): renders `⌘` on Apple and `Ctrl` on
+ * everything else. A Mac user never sees the "Ctrl" duplicate;
+ * a Windows user never sees the ⌘ glyph. Detection is a one-shot
+ * at render time (see `platform.ts`). The keydown listener itself
+ * in AdminPage still accepts BOTH modifiers — someone on a Mac
+ * with a PC keyboard can still press Ctrl+K and everything works.
  */
 import { Modal, Typography } from 'antd';
 import { useColors } from '../ThemeContext';
+import { metaKeyLabel } from '../platform';
 
 const { Text } = Typography;
 
@@ -16,14 +24,23 @@ interface Shortcut {
   description: string;
 }
 
-const SHORTCUTS: Shortcut[] = [
-  { keys: ['⌘', 'K'], description: 'Open command palette (quick nav)' },
-  { keys: ['Ctrl', 'K'], description: 'Same as ⌘K on non-Apple systems' },
-  { keys: ['?'], description: 'Open this shortcuts reference' },
-  { keys: ['Esc'], description: 'Close the palette / active modal' },
-  { keys: ['↑', '↓'], description: 'Move cursor up/down in the command palette' },
-  { keys: ['Enter'], description: 'Run the highlighted command' },
-];
+/**
+ * Build the shortcut list for the current platform. Pulling this
+ * through `metaKeyLabel()` at render time means the list is
+ * trivially correct on both Mac and Windows/Linux — no duplicate
+ * "same as X on non-Apple" noise rows.
+ */
+function buildShortcuts(): Shortcut[] {
+  const mod = metaKeyLabel(); // "⌘" on Apple, "Ctrl" elsewhere
+  return [
+    { keys: [mod, 'K'], description: 'Open command palette (quick nav)' },
+    { keys: [mod, 'S'], description: 'Apply the current dirty section (if any)' },
+    { keys: ['?'], description: 'Open this shortcuts reference' },
+    { keys: ['Esc'], description: 'Close the palette / active modal' },
+    { keys: ['↑', '↓'], description: 'Move cursor up/down in the command palette' },
+    { keys: ['Enter'], description: 'Run the highlighted command' },
+  ];
+}
 
 interface Props {
   open: boolean;
@@ -32,6 +49,9 @@ interface Props {
 
 export default function ShortcutsHelp({ open, onClose }: Props) {
   const colors = useColors();
+  // Computed at render time so we don't freeze the list at module
+  // load — cheap, and keeps the detection logic owned by platform.ts.
+  const shortcuts = buildShortcuts();
   return (
     <Modal
       open={open}
@@ -50,7 +70,7 @@ export default function ShortcutsHelp({ open, onClose }: Props) {
         }}
       >
         <tbody>
-          {SHORTCUTS.map((s) => (
+          {shortcuts.map((s) => (
             <tr key={s.keys.join('+') + s.description} style={{ borderBottom: `1px solid ${colors.BORDER}` }}>
               <td style={{ padding: '10px 12px 10px 0', width: 160 }}>
                 <KeyCombo keys={s.keys} />

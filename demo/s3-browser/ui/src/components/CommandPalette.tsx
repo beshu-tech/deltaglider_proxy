@@ -105,6 +105,39 @@ function scoreMatch(needle: string, haystack: string): number {
   return i === n.length ? 100 + (50 - h.length) : 0;
 }
 
+// ─── Recent-items store ────────────────────────────────────────
+//
+// MRU list of command IDs, persisted in localStorage. Shown as a
+// "Recent" section at the top of the palette when the query is
+// empty. Bounded at MAX_RECENTS so the list can't grow without
+// limit. Every palette run pushes to the front.
+const RECENTS_KEY = 'dgp.admin.palette.recents';
+const MAX_RECENTS = 5;
+
+function loadRecents(): string[] {
+  try {
+    const raw = localStorage.getItem(RECENTS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed)
+      ? parsed.filter((x): x is string => typeof x === 'string').slice(0, MAX_RECENTS)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function pushRecent(id: string): string[] {
+  const prev = loadRecents();
+  const next = [id, ...prev.filter((x) => x !== id)].slice(0, MAX_RECENTS);
+  try {
+    localStorage.setItem(RECENTS_KEY, JSON.stringify(next));
+  } catch {
+    /* quota exceeded / private mode — best-effort, silently skip */
+  }
+  return next;
+}
+
 export default function CommandPalette({
   open,
   onClose,
@@ -114,25 +147,91 @@ export default function CommandPalette({
   const colors = useColors();
   const [query, setQuery] = useState('');
   const [cursor, setCursor] = useState(0);
+  const [recentIds, setRecentIds] = useState<string[]>(() => loadRecents());
   const inputRef = useRef<import('antd').InputRef>(null);
 
-  const commands = useMemo(
-    () => [...buildNavCommands(onNavigateAdmin), ...(extraActions ?? [])],
-    [onNavigateAdmin, extraActions]
+  // Nav and action commands kept separate so the empty-query view
+  // can render them under their own headings ("Navigate" / "Actions").
+  // Flat filtered mode (non-empty query) merges them.
+  const navCommands = useMemo(
+    () => buildNavCommands(onNavigateAdmin),
+    [onNavigateAdmin]
   );
-  const filtered = useMemo(() => {
-    const scored = commands
-      .map((c) => ({
-        c,
-        score: Math.max(
-          scoreMatch(query, c.label),
-          scoreMatch(query, c.keywords ?? '')
-        ),
-      }))
-      .filter((x) => x.score > 0)
-      .sort((a, b) => b.score - a.score);
-    return scored.map((x) => x.c);
-  }, [commands, query]);
+  const actionCommands = useMemo(() => extraActions ?? [], [extraActions]);
+  const allCommands = useMemo(
+    () => [...navCommands, ...actionCommands],
+    [navCommands, actionCommands]
+  );
+
+  /**
+   * Grouped view model.
+   *
+   * - `query === ''` → sectioned layout with Recent / Navigate /
+   *   Actions. Recent is populated only when the operator has
+   *   actually used the palette before AND the recent id still
+   *   resolves to a known command (so a stale localStorage entry
+   *   doesn't crash us after a command is removed).
+   * - `query !== ''` → flat scored list, empty-state message when
+   *   nothing matches.
+   *
+   * The flat `rows` array below drives both rendering and keyboard
+   * cursor movement. Headings are in the same array but tagged as
+   * non-interactive so Arrow keys skip over them.
+   */
+  type Row =
+    | { kind: 'heading'; id: string; label: string }
+    | { kind: 'item'; id: string; command: CommandAction };
+
+  const rows: Row[] = useMemo(() => {
+    if (query.trim() !== '') {
+      const scored = allCommands
+        .map((c) => ({
+          c,
+          score: Math.max(
+            scoreMatch(query, c.label),
+            scoreMatch(query, c.keywords ?? '')
+          ),
+        }))
+        .filter((x) => x.score > 0)
+        .sort((a, b) => b.score - a.score);
+      return scored.map((x) => ({
+        kind: 'item' as const,
+        id: x.c.id,
+        command: x.c,
+      }));
+    }
+    // Empty query: sectioned layout.
+    const out: Row[] = [];
+    const byId = new Map(allCommands.map((c) => [c.id, c]));
+    const resolvedRecents = recentIds
+      .map((id) => byId.get(id))
+      .filter((c): c is CommandAction => Boolean(c));
+    if (resolvedRecents.length > 0) {
+      out.push({ kind: 'heading', id: 'h:recent', label: 'Recent' });
+      for (const c of resolvedRecents) {
+        out.push({ kind: 'item', id: `recent:${c.id}`, command: c });
+      }
+    }
+    if (navCommands.length > 0) {
+      out.push({ kind: 'heading', id: 'h:nav', label: 'Navigate' });
+      for (const c of navCommands) {
+        out.push({ kind: 'item', id: c.id, command: c });
+      }
+    }
+    if (actionCommands.length > 0) {
+      out.push({ kind: 'heading', id: 'h:actions', label: 'Actions' });
+      for (const c of actionCommands) {
+        out.push({ kind: 'item', id: c.id, command: c });
+      }
+    }
+    return out;
+  }, [query, allCommands, navCommands, actionCommands, recentIds]);
+
+  /** Subset used by Arrow-key navigation — headings are skipped. */
+  const items = useMemo(
+    () => rows.filter((r): r is Extract<Row, { kind: 'item' }> => r.kind === 'item'),
+    [rows]
+  );
 
   // Reset query + cursor whenever the modal opens.
   useEffect(() => {
@@ -146,25 +245,34 @@ export default function CommandPalette({
     return () => window.clearTimeout(t);
   }, [open]);
 
-  // Clamp cursor inside the filtered list.
+  // Clamp cursor inside the item list.
   useEffect(() => {
-    if (cursor >= filtered.length) setCursor(Math.max(0, filtered.length - 1));
-  }, [filtered.length, cursor]);
+    if (cursor >= items.length) setCursor(Math.max(0, items.length - 1));
+  }, [items.length, cursor]);
+
+  /**
+   * Remember `command.id` as Recent and forward the run. Called on
+   * both Enter and mouse-click so every successful activation
+   * contributes to the MRU list.
+   */
+  const runAndRemember = (command: CommandAction) => {
+    const next = pushRecent(command.id);
+    setRecentIds(next);
+    command.onRun();
+    onClose();
+  };
 
   const onKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'ArrowDown') {
       e.preventDefault();
-      setCursor((c) => Math.min(c + 1, filtered.length - 1));
+      setCursor((c) => Math.min(c + 1, items.length - 1));
     } else if (e.key === 'ArrowUp') {
       e.preventDefault();
       setCursor((c) => Math.max(c - 1, 0));
     } else if (e.key === 'Enter') {
       e.preventDefault();
-      const pick = filtered[cursor];
-      if (pick) {
-        pick.onRun();
-        onClose();
-      }
+      const pick = items[cursor];
+      if (pick) runAndRemember(pick.command);
     } else if (e.key === 'Escape') {
       onClose();
     }
@@ -209,7 +317,7 @@ export default function CommandPalette({
           aria-expanded
           aria-controls="command-palette-listbox"
           aria-activedescendant={
-            filtered[cursor] ? `cmd-${filtered[cursor].id}` : undefined
+            items[cursor] ? `cmd-${items[cursor].id}` : undefined
           }
           aria-autocomplete="list"
         />
@@ -224,7 +332,7 @@ export default function CommandPalette({
           padding: 6,
         }}
       >
-        {filtered.length === 0 ? (
+        {items.length === 0 ? (
           <div
             style={{
               padding: 40,
@@ -236,18 +344,29 @@ export default function CommandPalette({
             No matches. Try a shorter query.
           </div>
         ) : (
-          filtered.map((c, i) => (
-            <CommandRow
-              key={c.id}
-              command={c}
-              active={i === cursor}
-              onHover={() => setCursor(i)}
-              onClick={() => {
-                c.onRun();
-                onClose();
-              }}
-            />
-          ))
+          (() => {
+            // Walk the row list once, emitting heading separators and
+            // command rows. We track the item-index independently so
+            // keyboard cursor selection stays correct even with
+            // headings interleaved.
+            let itemIdx = -1;
+            return rows.map((row) => {
+              if (row.kind === 'heading') {
+                return <SectionHeading key={row.id} label={row.label} />;
+              }
+              itemIdx += 1;
+              const i = itemIdx;
+              return (
+                <CommandRow
+                  key={row.id}
+                  command={row.command}
+                  active={i === cursor}
+                  onHover={() => setCursor(i)}
+                  onClick={() => runAndRemember(row.command)}
+                />
+              );
+            });
+          })()
         )}
       </div>
       <div
@@ -266,10 +385,35 @@ export default function CommandPalette({
           <kbd>Esc</kbd> close
         </span>
         <span>
-          {filtered.length} result{filtered.length === 1 ? '' : 's'}
+          {items.length} result{items.length === 1 ? '' : 's'}
         </span>
       </div>
     </Modal>
+  );
+}
+
+/**
+ * Section heading rendered between groups in the empty-query view.
+ * Non-interactive — Arrow keys skip over it. Styled as all-caps
+ * micro-text to match the sidebar group labels.
+ */
+function SectionHeading({ label }: { label: string }) {
+  const { TEXT_MUTED } = useColors();
+  return (
+    <div
+      role="presentation"
+      style={{
+        fontSize: 10,
+        fontWeight: 700,
+        letterSpacing: 0.8,
+        textTransform: 'uppercase',
+        color: TEXT_MUTED,
+        padding: '10px 12px 4px',
+        fontFamily: 'var(--font-ui)',
+      }}
+    >
+      {label}
+    </div>
   );
 }
 
