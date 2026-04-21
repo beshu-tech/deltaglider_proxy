@@ -28,6 +28,7 @@ import MetricsPage from './MetricsPage';
 import OAuthProviderList from './OAuthProviderList';
 import AdminSidebar from './AdminSidebar';
 import AdmissionPanel from './AdmissionPanel';
+import CredentialsModePanel from './CredentialsModePanel';
 import RightRailActions from './RightRailActions';
 import {
   AccessOverview,
@@ -397,14 +398,17 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
       );
     }
 
-    // Configuration — Access
+    // Configuration — Access (Wave 5): dedicated Credentials & mode
+    // panel. The IAM mode radio is the central decision; bootstrap
+    // SigV4 credentials + admin password change are siblings. The
+    // legacy SettingsPage `security` tab conflated Access +
+    // rate-limit + session-TTL into one page; the latter two move
+    // to Advanced (Wave 7).
     if (adminPath === 'configuration/access/credentials') {
-      // Credentials / mode live inside SettingsPage today under the
-      // `security` tab; keep routing there until Wave 5.
       return (
         <>
           {header}
-          <SettingsPage onSessionExpired={onSessionExpired} embeddedTab="security" />
+          <CredentialsModePanel onSessionExpired={onSessionExpired} />
         </>
       );
     }
