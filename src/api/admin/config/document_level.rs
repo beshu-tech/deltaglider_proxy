@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use super::super::{audit_log, AdminState};
-use super::{active_config_path, apply_config_transition};
+use super::{active_config_path, apply_config_transition, unknown_section_error, SectionName};
 
 //
 // These endpoints serve the GitOps persona and the GUI "Copy as YAML" flow.
@@ -126,23 +126,15 @@ pub async fn export_config(
     // the full export does, then pick out just the requested slice.
     // Each section serializes as `<name>:\n  ...` — valid standalone
     // YAML that can be edited and posted back via section PUT.
+    let Some(section) = SectionName::parse(section_name) else {
+        return (StatusCode::NOT_FOUND, unknown_section_error(section_name)).into_response();
+    };
     let sectioned = crate::config_sections::SectionedConfig::from_flat(&redacted);
-    let mut map = serde_yaml::Mapping::new();
-    let value = match section_name {
-        "admission" => serde_yaml::to_value(sectioned.admission.unwrap_or_default()),
-        "access" => serde_yaml::to_value(sectioned.access),
-        "storage" => serde_yaml::to_value(sectioned.storage),
-        "advanced" => serde_yaml::to_value(sectioned.advanced),
-        other => {
-            return (
-                StatusCode::NOT_FOUND,
-                format!(
-                    "unknown section '{}'; valid names: admission, access, storage, advanced",
-                    other
-                ),
-            )
-                .into_response();
-        }
+    let value = match section {
+        SectionName::Admission => serde_yaml::to_value(sectioned.admission.unwrap_or_default()),
+        SectionName::Access => serde_yaml::to_value(sectioned.access),
+        SectionName::Storage => serde_yaml::to_value(sectioned.storage),
+        SectionName::Advanced => serde_yaml::to_value(sectioned.advanced),
     };
     let yaml_value = match value {
         Ok(v) => v,
@@ -154,8 +146,9 @@ pub async fn export_config(
                 .into_response();
         }
     };
+    let mut map = serde_yaml::Mapping::new();
     map.insert(
-        serde_yaml::Value::String(section_name.to_string()),
+        serde_yaml::Value::String(section.as_str().to_string()),
         yaml_value,
     );
     match serde_yaml::to_string(&serde_yaml::Value::Mapping(map)) {
@@ -185,28 +178,23 @@ pub async fn export_config(
 pub async fn config_defaults(Query(query): Query<SectionFilterQuery>) -> impl IntoResponse {
     let schema = match query.section.as_deref() {
         None => serde_json::to_value(schemars::schema_for!(crate::config::Config)),
-        Some("admission") => serde_json::to_value(schemars::schema_for!(
-            crate::config_sections::AdmissionSection
-        )),
-        Some("access") => {
-            serde_json::to_value(schemars::schema_for!(crate::config_sections::AccessSection))
-        }
-        Some("storage") => serde_json::to_value(schemars::schema_for!(
-            crate::config_sections::StorageSection
-        )),
-        Some("advanced") => serde_json::to_value(schemars::schema_for!(
-            crate::config_sections::AdvancedSection
-        )),
-        Some(other) => {
-            return (
-                StatusCode::NOT_FOUND,
-                format!(
-                    "unknown section '{}'; valid names: admission, access, storage, advanced",
-                    other
-                ),
-            )
-                .into_response();
-        }
+        Some(name) => match SectionName::parse(name) {
+            Some(SectionName::Admission) => serde_json::to_value(schemars::schema_for!(
+                crate::config_sections::AdmissionSection
+            )),
+            Some(SectionName::Access) => {
+                serde_json::to_value(schemars::schema_for!(crate::config_sections::AccessSection))
+            }
+            Some(SectionName::Storage) => serde_json::to_value(schemars::schema_for!(
+                crate::config_sections::StorageSection
+            )),
+            Some(SectionName::Advanced) => serde_json::to_value(schemars::schema_for!(
+                crate::config_sections::AdvancedSection
+            )),
+            None => {
+                return (StatusCode::NOT_FOUND, unknown_section_error(name)).into_response();
+            }
+        },
     };
     match schema {
         Ok(v) => (

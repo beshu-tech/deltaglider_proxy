@@ -36,7 +36,7 @@
  * ## Back-compat
  *
  * The old flat routes (`admin/users`, `admin/backends`, etc.) still
- * navigate through the same AdminPage — `tabPathFromLegacy` in
+ * navigate through the same AdminPage — `resolveAdminPath` in
  * AdminPage.tsx maps them to the new sub-paths. Bookmarked old URLs
  * keep working.
  */

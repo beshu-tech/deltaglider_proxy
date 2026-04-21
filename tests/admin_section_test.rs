@@ -829,3 +829,220 @@ async fn trace_get_with_missing_query_uses_defaults() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["resolved"]["method"].as_str().unwrap(), "GET");
 }
+
+// ═══════════════════════════════════════════════════
+// Adversarial review fixes — secret preservation paths
+// (coverage gap Y6 flagged; R2 bootstrap guard; Y1 shorthand)
+// ═══════════════════════════════════════════════════
+
+#[tokio::test]
+async fn section_put_advanced_rejects_bootstrap_password_hash_change() {
+    // R2: defense-in-depth. Even though the unconditional overwrite
+    // after merge-patch would normally zero any attacker-supplied
+    // hash, the explicit 403 guard must fire first so the security
+    // contract isn't "just happens to be safe because of ordering".
+    let server = TestServer::builder()
+        .auth("R2KEY", "R2SECRETVALUE")
+        .yaml_config()
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    let fake_hash = "$2b$12$aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let resp = admin
+        .put(format!(
+            "{}/_/api/admin/config/section/advanced",
+            server.endpoint()
+        ))
+        .json(&json!({ "bootstrap_password_hash": fake_hash }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], false);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("bootstrap_password_hash"),
+        "error must name the rejected field, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn section_put_admission_is_merge_patch_regression_guard() {
+    // Regression guard for the replace-vs-merge bug found in live
+    // browser testing of v0.8.0. Although the admission section
+    // currently has only one field (`blocks[]`), any future
+    // extension of `AdmissionSection` with extra fields must preserve
+    // them across a {blocks: [...]} PUT.
+    let server = TestServer::builder()
+        .auth("MPKEY", "MPSECRETVALUE")
+        .yaml_config()
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    // Seed one block.
+    let _ = admin
+        .put(format!(
+            "{}/_/api/admin/config/section/admission",
+            server.endpoint()
+        ))
+        .json(&json!({
+            "blocks": [{
+                "name": "seed-block",
+                "match": {},
+                "action": "continue"
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // GET the section, then PUT the exact body back (no edit). The
+    // merge-patch path means we're asserting the round-trip is
+    // idempotent on the server side.
+    let get_resp = admin
+        .get(format!(
+            "{}/_/api/admin/config/section/admission",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = get_resp.json().await.unwrap();
+    let resp = admin
+        .put(format!(
+            "{}/_/api/admin/config/section/admission",
+            server.endpoint()
+        ))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Section is still one block.
+    let after: serde_json::Value = admin
+        .get(format!(
+            "{}/_/api/admin/config/section/admission",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after["blocks"].as_array().unwrap().len(), 1);
+    assert_eq!(after["blocks"][0]["name"], "seed-block");
+}
+
+#[tokio::test]
+async fn section_put_storage_public_shorthand_expands_on_apply() {
+    // Y1: `public: true` on a bucket should expand to
+    // `public_prefixes: [""]` after section PUT, not just after
+    // from_yaml_str. Without the `normalize_shorthands()` call in
+    // `apply_section` the bucket would keep `public: true` in memory
+    // while `PublicPrefixSnapshot` misses the prefix.
+    let server = TestServer::builder()
+        .auth("Y1KEY", "Y1SECRETVALUE")
+        .yaml_config()
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    let resp = admin
+        .put(format!(
+            "{}/_/api/admin/config/section/storage",
+            server.endpoint()
+        ))
+        .json(&json!({
+            "buckets": {
+                "shortcut": { "public": true }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Field-level GET shows the expanded form (matches the server's
+    // canonical representation after normalize_shorthands).
+    let cfg: serde_json::Value = admin
+        .get(format!("{}/_/api/admin/config", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let shortcut = &cfg["bucket_policies"]["shortcut"];
+    let prefixes = shortcut["public_prefixes"].as_array();
+    assert!(
+        prefixes.is_some(),
+        "normalize_shorthands must expand `public: true` to `public_prefixes`; got: {shortcut}"
+    );
+    assert!(
+        prefixes.unwrap().iter().any(|v| v.as_str() == Some("")),
+        "public_prefixes must contain the empty-string entry; got: {prefixes:?}"
+    );
+}
+
+#[tokio::test]
+async fn section_put_storage_buckets_are_merged_not_replaced() {
+    // Reinforces section_put_storage_preserves_other_buckets: the
+    // merge-patch semantic on map-valued fields means sending one
+    // bucket entry must not silently drop sibling entries.
+    // (Named-backend removal warning is harder to test without full
+    // multi-backend builder support — covered by the document-level
+    // tests in admin_config_test.rs via preserve_runtime_secrets.)
+    let server = TestServer::builder()
+        .auth("BKTKEY", "BKTSECRETVALUE")
+        .yaml_config()
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    // Seed two buckets.
+    admin
+        .put(format!("{}/_/api/admin/config", server.endpoint()))
+        .json(&json!({
+            "bucket_policies": {
+                "alpha": { "compression": true },
+                "beta":  { "compression": false }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // Section-PUT a third bucket; alpha + beta must survive.
+    admin
+        .put(format!(
+            "{}/_/api/admin/config/section/storage",
+            server.endpoint()
+        ))
+        .json(&json!({
+            "buckets": {
+                "gamma": { "quota_bytes": 2048 }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    let cfg: serde_json::Value = admin
+        .get(format!("{}/_/api/admin/config", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let policies = &cfg["bucket_policies"];
+    assert!(policies["alpha"].is_object(), "alpha must survive");
+    assert!(policies["beta"].is_object(), "beta must survive");
+    assert_eq!(policies["gamma"]["quota_bytes"].as_u64().unwrap(), 2048);
+}

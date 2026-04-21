@@ -41,41 +41,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use super::super::{audit_log, AdminState};
-use super::{active_config_path, apply_config_transition};
+use super::{active_config_path, apply_config_transition, unknown_section_error, SectionName};
 use crate::config_sections::{AdmissionSection, SectionedConfig};
-
-/// Names of the four sections the API understands. Kept as a small enum
-/// rather than a string for exhaustiveness — the match in
-/// [`replace_section`] must cover every case; adding a fifth section
-/// breaks this file noisily until every branch is updated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SectionName {
-    Admission,
-    Access,
-    Storage,
-    Advanced,
-}
-
-impl SectionName {
-    fn parse(s: &str) -> Option<Self> {
-        match s {
-            "admission" => Some(Self::Admission),
-            "access" => Some(Self::Access),
-            "storage" => Some(Self::Storage),
-            "advanced" => Some(Self::Advanced),
-            _ => None,
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Admission => "admission",
-            Self::Access => "access",
-            Self::Storage => "storage",
-            Self::Advanced => "advanced",
-        }
-    }
-}
 
 /// Query params for the section GET endpoint.
 #[derive(Deserialize, Default)]
@@ -107,7 +74,6 @@ pub struct SectionApplyResponse {
     /// required set (see [`apply_config_transition`]). The UI surfaces this
     /// as a banner in the Apply dialog so operators don't ship a
     /// restart-requiring change during a busy window without noticing.
-    #[serde(default)]
     pub requires_restart: bool,
     /// Only set on PUT success — path the persisted YAML was written to.
     /// Absent for dry-run (validate) responses.
@@ -150,10 +116,7 @@ pub async fn get_section(
                 warnings: vec![],
                 requires_restart: false,
                 persisted_path: None,
-                error: Some(format!(
-                    "unknown section '{}'; valid names: admission, access, storage, advanced",
-                    name
-                )),
+                error: Some(unknown_section_error(&name)),
                 diff: None,
             }),
         )
@@ -304,10 +267,7 @@ async fn apply_section(
                 warnings: vec![],
                 requires_restart: false,
                 persisted_path: None,
-                error: Some(format!(
-                    "unknown section '{}'; valid names: admission, access, storage, advanced",
-                    name
-                )),
+                error: Some(unknown_section_error(&name)),
                 diff: None,
             }),
         )
@@ -325,7 +285,7 @@ async fn apply_section(
     // current config (we merge them back after); the operator's body
     // is treated as "the new non-secret state of this section".
     let mut sectioned = SectionedConfig::from_flat(&old_cfg);
-    if let Err(err) = replace_section(&mut sectioned, section, &body) {
+    if let Err(err) = merge_patch_section(&mut sectioned, section, &body) {
         return (
             StatusCode::BAD_REQUEST,
             Json(SectionApplyResponse {
@@ -362,6 +322,36 @@ async fn apply_section(
         }
     };
 
+    // Defense-in-depth: refuse explicit bootstrap_password_hash
+    // changes through the section API, mirroring the document-level
+    // `apply_config_doc` guard (cfg.rs `document_level.rs:463-476`).
+    // The legitimate path is `PUT /api/admin/password`, which
+    // verifies the current password and re-encrypts the config DB
+    // atomically. Accepting an arbitrary hash here would let an
+    // admin-session holder lock future admins out of the GUI.
+    //
+    // MUST run BEFORE the unconditional `new_cfg.bootstrap_password_hash
+    // = old_cfg...` overwrite below — otherwise an attacker-supplied
+    // hash would be silently clobbered by the overwrite and the
+    // security model's contract would depend on an implementation
+    // detail (the ordering) rather than an explicit check.
+    if new_cfg.bootstrap_password_hash != old_cfg.bootstrap_password_hash {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(SectionApplyResponse {
+                ok: false,
+                warnings: vec![],
+                requires_restart: false,
+                persisted_path: None,
+                error: Some(
+                    "bootstrap_password_hash cannot be changed via /config/section; use PUT /api/admin/password (verifies the current password and re-encrypts the config DB atomically)".to_string(),
+                ),
+                diff: None,
+            }),
+        )
+            .into_response();
+    }
+
     // Preserve runtime secrets across the section edit. The GET
     // surfaces (export, section GET) redact every secret; a naïve
     // round-trip (GET → edit → PUT) would therefore post None for
@@ -371,7 +361,10 @@ async fn apply_section(
     //
     // Infra secrets (bootstrap hash, encryption key) are always
     // preserved — a PUT to any section that touches the `advanced`
-    // slice would otherwise zero them.
+    // slice would otherwise zero them. (The explicit equality guard
+    // above means we only reach this line when hashes already
+    // matched, so this is a defensive no-op for that field — kept
+    // for symmetry with encryption_key and to document intent.)
     new_cfg.bootstrap_password_hash = old_cfg.bootstrap_password_hash.clone();
     new_cfg.encryption_key = old_cfg.encryption_key.clone();
     // Top-level SigV4 creds (the legacy bootstrap key pair living on
@@ -384,14 +377,71 @@ async fn apply_section(
         new_cfg.access_key_id = old_cfg.access_key_id.clone();
         new_cfg.secret_access_key = old_cfg.secret_access_key.clone();
     }
-    // Backend creds: identical logic for each backend. The sectioned
-    // `storage` replacement drops these via redaction; restore from
-    // old when missing.
+    // Backend creds: preserve per entry. The sectioned `storage`
+    // replacement drops these via redaction; restore from old when
+    // missing.
     preserve_backend_secrets(&mut new_cfg.backend, &old_cfg.backend);
     for new_named in &mut new_cfg.backends {
         if let Some(old_named) = old_cfg.backends.iter().find(|n| n.name == new_named.name) {
             preserve_backend_secrets(&mut new_named.backend, &old_named.backend);
         }
+    }
+
+    // R1: warn about named backends the operator's body dropped.
+    // `preserve_backend_secrets` only runs on backends present in
+    // `new_cfg.backends` — a backend that disappeared takes its
+    // creds with it silently. Mirror the document-level apply's
+    // "backend removed or renamed" warning so GitOps-style round-
+    // trips don't lose credential state without surfacing it.
+    let removed_warnings: Vec<String> = {
+        let new_names: std::collections::HashSet<&str> =
+            new_cfg.backends.iter().map(|n| n.name.as_str()).collect();
+        old_cfg
+            .backends
+            .iter()
+            .filter_map(|old_named| {
+                if new_names.contains(old_named.name.as_str()) {
+                    return None;
+                }
+                let had_creds = matches!(
+                    &old_named.backend,
+                    crate::config::BackendConfig::S3 {
+                        access_key_id: Some(_),
+                        secret_access_key: Some(_),
+                        ..
+                    },
+                );
+                if had_creds {
+                    Some(format!(
+                        "backend '{}' removed (or renamed) — its credentials are gone from runtime",
+                        old_named.name
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+
+    // Y1: normalise shorthand forms (bucket `public: true`, storage
+    // `s3:`/`filesystem:` — anything `Config::normalize_shorthands`
+    // covers). The YAML loader runs this right after from_yaml_str;
+    // the section PUT needs the same pass so a `public: true`
+    // shorthand actually expands to `public_prefixes: [""]` before
+    // `rebuild_bucket_derived_snapshots` walks the buckets.
+    if let Err(e) = new_cfg.normalize_shorthands() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(SectionApplyResponse {
+                ok: false,
+                warnings: removed_warnings,
+                requires_restart: false,
+                persisted_path: None,
+                error: Some(format!("{}", e)),
+                diff: None,
+            }),
+        )
+            .into_response();
     }
 
     // Validate semantically via `Config::check` (runs the same
@@ -423,7 +473,11 @@ async fn apply_section(
             StatusCode::OK,
             Json(SectionApplyResponse {
                 ok: true,
-                warnings: warnings_from_check,
+                warnings: removed_warnings
+                    .clone()
+                    .into_iter()
+                    .chain(warnings_from_check)
+                    .collect(),
                 requires_restart,
                 persisted_path: None,
                 error: None,
@@ -444,7 +498,10 @@ async fn apply_section(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     Json(SectionApplyResponse {
                         ok: false,
-                        warnings: warnings_from_check,
+                        warnings: removed_warnings
+                            .into_iter()
+                            .chain(warnings_from_check)
+                            .collect(),
                         requires_restart: false,
                         persisted_path: None,
                         error: Some(format!(
@@ -475,10 +532,14 @@ async fn apply_section(
     *cfg = new_cfg;
 
     let persist_path = active_config_path(&state);
-    let (persisted, persisted_path, status, persist_warning) = match cfg.persist_to_file(&persist_path) {
-        Ok(()) => (true, Some(persist_path.clone()), StatusCode::OK, None),
+    // The `persisted: bool` is folded into `status` + `persist_warning`
+    // below — we don't expose it separately on `SectionApplyResponse` the
+    // way the document-level `ConfigApplyResponse` does. Callers infer
+    // the persist outcome from the HTTP status (200 vs. 500) and the
+    // warning text if any.
+    let (persisted_path, status, persist_warning) = match cfg.persist_to_file(&persist_path) {
+        Ok(()) => (Some(persist_path.clone()), StatusCode::OK, None),
         Err(e) => (
-            false,
             None,
             StatusCode::INTERNAL_SERVER_ERROR,
             Some(format!(
@@ -490,8 +551,6 @@ async fn apply_section(
         ),
     };
 
-    let _ = persisted; // feedback to client via warnings + status
-
     if let Some(h) = headers {
         audit_log(
             &format!("apply_config_section:{}", section.as_str()),
@@ -501,8 +560,9 @@ async fn apply_section(
         );
     }
 
-    let warnings: Vec<String> = warnings_from_check
+    let warnings: Vec<String> = removed_warnings
         .into_iter()
+        .chain(warnings_from_check)
         .chain(transition_warnings)
         .chain(persist_warning)
         .collect();
@@ -549,53 +609,68 @@ async fn apply_section(
 ///
 /// ## Implementation
 ///
-/// We project the current section to JSON, apply the merge patch,
-/// then deserialize back into the section's strong type. Structural
-/// errors (unknown fields, bad types) surface through serde the same
-/// way they would with replace semantics. The match is exhaustive on
-/// [`SectionName`] so adding a section forces a local update here.
-fn replace_section(
+/// Each arm projects the current section to JSON via
+/// [`merge_into_typed`], applies the merge patch, and deserializes
+/// back. Structural errors (unknown fields, bad types) surface
+/// through serde the same way they would with replace semantics.
+/// The match is exhaustive on [`SectionName`] so adding a fifth
+/// section breaks this file noisily until every branch is updated.
+fn merge_patch_section(
     sectioned: &mut SectionedConfig,
     section: SectionName,
     body: &serde_json::Value,
 ) -> Result<(), String> {
     match section {
         SectionName::Admission => {
+            // Admission's `Option<AdmissionSection>` lives in the
+            // sectioned shape, but at merge time we project the inner
+            // `AdmissionSection` (default when `None`). After merge,
+            // collapse back to `None` when blocks are empty so the
+            // emitted YAML stays minimal.
             let current = sectioned.admission.clone().unwrap_or_default();
-            let mut merged = serde_json::to_value(&current)
-                .map_err(|e| format!("internal: failed to project admission section: {}", e))?;
-            apply_merge_patch(&mut merged, body);
-            let parsed: AdmissionSection = serde_json::from_value(merged)
-                .map_err(|e| format!("invalid admission section body: {}", e))?;
-            sectioned.admission = if parsed.blocks.is_empty() {
+            let merged: AdmissionSection = merge_into_typed(&current, body, "admission")?;
+            sectioned.admission = if merged.blocks.is_empty() {
                 None
             } else {
-                Some(parsed)
+                Some(merged)
             };
         }
         SectionName::Access => {
-            let mut merged = serde_json::to_value(&sectioned.access)
-                .map_err(|e| format!("internal: failed to project access section: {}", e))?;
-            apply_merge_patch(&mut merged, body);
-            sectioned.access = serde_json::from_value(merged)
-                .map_err(|e| format!("invalid access section body: {}", e))?;
+            sectioned.access = merge_into_typed(&sectioned.access, body, "access")?;
         }
         SectionName::Storage => {
-            let mut merged = serde_json::to_value(&sectioned.storage)
-                .map_err(|e| format!("internal: failed to project storage section: {}", e))?;
-            apply_merge_patch(&mut merged, body);
-            sectioned.storage = serde_json::from_value(merged)
-                .map_err(|e| format!("invalid storage section body: {}", e))?;
+            sectioned.storage = merge_into_typed(&sectioned.storage, body, "storage")?;
         }
         SectionName::Advanced => {
-            let mut merged = serde_json::to_value(&sectioned.advanced)
-                .map_err(|e| format!("internal: failed to project advanced section: {}", e))?;
-            apply_merge_patch(&mut merged, body);
-            sectioned.advanced = serde_json::from_value(merged)
-                .map_err(|e| format!("invalid advanced section body: {}", e))?;
+            sectioned.advanced = merge_into_typed(&sectioned.advanced, body, "advanced")?;
         }
     }
     Ok(())
+}
+
+/// Merge a JSON patch onto a typed section value and re-deserialize.
+///
+/// `current` is projected to JSON, the patch is applied in-place per
+/// RFC 7396, and the result is parsed back into `T`. Error messages
+/// are scoped by `label` (`"admission"`, `"access"`, …) so the
+/// serde diagnostic the operator sees names the right section.
+///
+/// The generic bound is `Serialize + DeserializeOwned` and nothing
+/// else; every section type in [`crate::config_sections`] satisfies
+/// it. Keeps the four arms of [`merge_patch_section`] free of copy-
+/// paste — mutating a section now means adding one line, not five.
+fn merge_into_typed<T>(
+    current: &T,
+    patch: &serde_json::Value,
+    label: &'static str,
+) -> Result<T, String>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    let mut merged = serde_json::to_value(current)
+        .map_err(|e| format!("internal: failed to project {} section: {}", label, e))?;
+    apply_merge_patch(&mut merged, patch);
+    serde_json::from_value(merged).map_err(|e| format!("invalid {} section body: {}", label, e))
 }
 
 /// Apply a JSON Merge Patch (RFC 7396) in-place to `target`.
@@ -650,6 +725,14 @@ fn compute_section_diff(
     old_cfg: &crate::config::Config,
     new_cfg: &crate::config::Config,
 ) -> serde_json::Value {
+    // Redact BOTH sides. If only one side is redacted the diff
+    // spuriously "changes" a preserved credential to a placeholder
+    // (or vice versa) and the client surfaces it in the Apply
+    // dialog — operators would see "password changed" on a plain
+    // `advanced.max_delta_ratio` edit. Redacting both means secrets
+    // either compare-equal (preserved) or both appear as the same
+    // redaction placeholder; real secret rotations still surface
+    // because the runtime vs. incoming plaintext differs.
     let old_sectioned = SectionedConfig::from_flat(&old_cfg.redact_all_secrets());
     let new_sectioned = SectionedConfig::from_flat(&new_cfg.redact_all_secrets());
 
@@ -722,20 +805,15 @@ fn preserve_backend_secrets(
 /// Non-mutating predicate: would applying `new` on top of `old` require
 /// a server restart to take effect?
 ///
-/// Mirrors the restart-required set inside [`apply_config_transition`]:
-/// `listen_addr` (HTTP socket re-bind) and `cache_size_mb` (moka cache
-/// max capacity is set once at engine construction). Keeping this
-/// function separate is what lets the dry-run `/validate` path skip
-/// the transition entirely — running [`apply_config_transition`] in
-/// dry-run would mutate `ArcSwap`-backed state (admission_chain,
-/// engine, iam_state) that request-serving code reads lock-free,
-/// briefly flipping the runtime to the proposed config before we roll
-/// back.
-///
-/// Sync with [`apply_config_transition`] when the restart-required
-/// list grows.
+/// Delegates to [`super::requires_restart_warnings`] so the section-
+/// level dry-run and the runtime [`apply_config_transition`] cannot
+/// drift on what counts as restart-required. Keeping this wrapper
+/// named `restart_required_between` preserves the local call sites'
+/// predicate shape (`bool`, not `Vec<String>`) — the dry-run doesn't
+/// care about the per-field warning text, only whether ANY field
+/// needs a restart.
 fn restart_required_between(old: &crate::config::Config, new: &crate::config::Config) -> bool {
-    old.listen_addr != new.listen_addr || old.cache_size_mb != new.cache_size_mb
+    !super::requires_restart_warnings(old, new).is_empty()
 }
 
 /// Recursively diff two JSON values. Leaves surface as

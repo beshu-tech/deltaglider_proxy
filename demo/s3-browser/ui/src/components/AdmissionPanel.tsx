@@ -23,11 +23,12 @@
  *      `ApplyDialog`, on confirm call `putSection`.
  *   4. Discard: revert the dirty state to the last-applied snapshot.
  */
-import { useCallback, useEffect, useState } from 'react';
-import { Button, Alert, Typography, Space, message } from 'antd';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Button, Alert, Typography, Space, Modal, message } from 'antd';
 import {
   PlusOutlined,
   InfoCircleOutlined,
+  ExclamationCircleOutlined,
 } from '@ant-design/icons';
 import type { AdmissionBlock, AdminConfig, SectionApplyResponse } from '../adminApi';
 import {
@@ -80,10 +81,19 @@ export default function AdmissionPanel({
   const [editingBlock, setEditingBlock] = useState<AdmissionBlock | null>(null);
 
   // Apply-dialog state.
+  //
+  // `pendingApplyBlocks` captures the exact body that went to
+  // `/validate` so `confirmApply` PUTs the same blocks the operator
+  // saw in the diff, even if they kept interacting with the list
+  // underneath the modal. Otherwise the diff shown and the body
+  // persisted could diverge — adversarial review F5.
   const [applyOpen, setApplyOpen] = useState(false);
   const [applyResponse, setApplyResponse] = useState<SectionApplyResponse | null>(
     null
   );
+  const [pendingApplyBlocks, setPendingApplyBlocks] = useState<
+    AdmissionBlock[] | null
+  >(null);
   const [applying, setApplying] = useState(false);
 
   const refresh = useCallback(async () => {
@@ -140,11 +150,33 @@ export default function AdmissionPanel({
     closeEditor();
   };
 
+  // Dedupe Modal.confirm: a rapid double-click on Delete must NOT
+  // queue two stacked modals — both would call `setBlocks` in order,
+  // dropping block `i` AND the block now at `i` (originally `i+1`).
+  // We guard with a ref that tracks whether ANY delete confirm is
+  // open; Modal.confirm's `afterClose` callback resets it.
+  const deleteInFlightRef = useRef(false);
   const handleDelete = (i: number) => {
-    if (!window.confirm(`Remove block "${blocks[i].name}"?`)) return;
-    const next = blocks.slice();
-    next.splice(i, 1);
-    setBlocks(next);
+    if (deleteInFlightRef.current) return;
+    deleteInFlightRef.current = true;
+    const name = blocks[i].name;
+    Modal.confirm({
+      title: `Remove block "${name}"?`,
+      icon: <ExclamationCircleOutlined />,
+      content:
+        'The block is removed from the local form state only — nothing persists until you click Apply.',
+      okText: 'Remove',
+      okButtonProps: { danger: true },
+      cancelText: 'Cancel',
+      onOk: () => {
+        const next = blocks.slice();
+        next.splice(i, 1);
+        setBlocks(next);
+      },
+      afterClose: () => {
+        deleteInFlightRef.current = false;
+      },
+    });
   };
 
   /**
@@ -153,10 +185,18 @@ export default function AdmissionPanel({
    * the form state as-is so the operator can fix and retry.
    */
   const runApply = async () => {
-    const body = { blocks };
+    // Snapshot the blocks at the moment the operator clicks Apply.
+    // If they subsequently reorder/edit while the dialog is open,
+    // the dialog's diff + PUT both use this snapshot — the
+    // alternative (closure-read of `blocks` at confirm time) would
+    // let the operator see diff A and persist body B.
+    const snapshot = blocks.slice();
     try {
-      const resp = await validateSection<AdmissionSectionBody>('admission', body);
+      const resp = await validateSection<AdmissionSectionBody>('admission', {
+        blocks: snapshot,
+      });
       setApplyResponse(resp);
+      setPendingApplyBlocks(snapshot);
       setApplyOpen(true);
     } catch (e) {
       message.error(
@@ -165,11 +205,22 @@ export default function AdmissionPanel({
     }
   };
 
+  const cancelApply = () => {
+    setApplyOpen(false);
+    setPendingApplyBlocks(null);
+  };
+
   const confirmApply = async () => {
+    if (!pendingApplyBlocks) return;
     setApplying(true);
     try {
-      const resp = await putSection<AdmissionSectionBody>('admission', { blocks });
+      const resp = await putSection<AdmissionSectionBody>('admission', {
+        blocks: pendingApplyBlocks,
+      });
       if (!resp.ok) {
+        // Server-side validation error (4xx). Surface the error but
+        // keep the dialog open so the operator sees the reason next
+        // to the diff they were about to confirm.
         message.error(resp.error || 'Apply failed');
         return;
       }
@@ -180,12 +231,19 @@ export default function AdmissionPanel({
       );
       markApplied();
       setApplyOpen(false);
+      setPendingApplyBlocks(null);
       // Re-fetch to pick up server-side normalisation.
       void refresh();
     } catch (e) {
+      // Network / 5xx error. Close the dialog and force a refresh —
+      // the server may have partially applied; the stale diff the
+      // dialog was showing is no longer trustworthy (F11).
       message.error(
         `Apply failed: ${e instanceof Error ? e.message : 'unknown'}`
       );
+      setApplyOpen(false);
+      setPendingApplyBlocks(null);
+      void refresh();
     } finally {
       setApplying(false);
     }
@@ -303,7 +361,7 @@ export default function AdmissionPanel({
         section="admission"
         response={applyResponse}
         onApply={confirmApply}
-        onCancel={() => setApplyOpen(false)}
+        onCancel={cancelApply}
         loading={applying}
       />
     </div>

@@ -45,6 +45,7 @@ import {
 } from 'antd';
 import type { AdmissionBlock } from '../adminApi';
 import {
+  actionKind,
   admissionBlockSchema,
   METHODS,
   type AdmissionBlockForm,
@@ -66,15 +67,6 @@ interface Props {
   otherNames: string[];
   onCancel: () => void;
   onSave: (block: AdmissionBlock) => void;
-}
-
-/** Convert the server's action union to the form's
- *  flat representation (string "allow-anonymous" vs object). */
-function actionKind(
-  action: AdmissionBlock['action']
-): 'allow-anonymous' | 'deny' | 'reject' | 'continue' {
-  if (typeof action === 'string') return action;
-  return 'reject';
 }
 
 /** Default empty-block form state. */
@@ -114,6 +106,7 @@ export default function AdmissionBlockEditorModal({
     handleSubmit,
     watch,
     setValue,
+    setError,
     reset,
     formState: { errors, isSubmitting },
   } = useForm<AdmissionBlockForm>({
@@ -129,7 +122,7 @@ export default function AdmissionBlockEditorModal({
 
   // Watch the action to render the conditional Reject sub-form.
   const currentAction = watch('action');
-  const kind = typeof currentAction === 'string' ? currentAction : 'reject';
+  const kind = actionKind(currentAction);
 
   // Watch IP form so the two options are mutually exclusive — picking
   // one clears the other.
@@ -138,14 +131,17 @@ export default function AdmissionBlockEditorModal({
 
   const onSubmit = (data: AdmissionBlockForm) => {
     // Duplicate-name check (case-insensitive, excluding the block
-    // we're currently editing).
+    // we're currently editing). Surface as an RHF field error so
+    // the operator sees it inline under the Name input rather than
+    // as an intrusive native dialog.
     const others = otherNames
       .filter((n) => !initial || n !== initial.name)
       .map((n) => n.toLowerCase());
     if (others.includes(data.name.toLowerCase())) {
-      // Push the error back through react-hook-form so the user sees
-      // it inline rather than as a toast.
-      alert(`A block named "${data.name}" already exists.`);
+      setError('name', {
+        type: 'manual',
+        message: `A block named "${data.name}" already exists.`,
+      });
       return;
     }
     // Strip empty-array / empty-string / undefined fields from `match`
@@ -511,8 +507,3 @@ export default function AdmissionBlockEditorModal({
     </Modal>
   );
 }
-
-// Marker: imports `actionKind` from above (unused in this file but
-// exported for callers that render the block list — keep next to
-// the type so future maintainers don't duplicate the branching).
-export { actionKind };

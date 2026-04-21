@@ -881,7 +881,15 @@ impl Config {
     /// form (e.g. `public: true` AND non-empty `public_prefixes:`)
     /// or when a semantic check fails. Future shorthands (group
     /// presets) plug in here.
-    fn normalize_shorthands(&mut self) -> Result<(), ConfigError> {
+    ///
+    /// `pub(crate)` because the section-level admin API
+    /// (`src/api/admin/config/section_level.rs::apply_section`)
+    /// needs to re-run shorthand normalisation after merge-patching
+    /// a section and collapsing it back through
+    /// [`crate::config_sections::SectionedConfig::into_flat`]. The
+    /// YAML loader runs this automatically; the section PUT has to
+    /// call it explicitly.
+    pub(crate) fn normalize_shorthands(&mut self) -> Result<(), ConfigError> {
         for (name, policy) in self.buckets.iter_mut() {
             policy
                 .normalize()

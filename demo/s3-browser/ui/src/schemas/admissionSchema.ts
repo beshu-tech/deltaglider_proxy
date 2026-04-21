@@ -126,16 +126,22 @@ export const admissionBlockSchema = z.object({
 export type AdmissionBlockForm = z.infer<typeof admissionBlockSchema>;
 
 /**
- * Client-side duplicate-name check, mirroring the server's
- * [`AdmissionSpec::validate`] duplicate-name rule. Returns the
- * duplicate name on error, `null` on success.
+ * Narrow an `AdmissionBlock['action']` to its discriminant kind.
+ *
+ * Simple-string actions (`allow-anonymous`, `deny`, `continue`)
+ * stay strings; the only structured variant is Reject. Centralised
+ * here (rather than in each component that renders an action badge
+ * / radio) so UIs and schemas agree on the kind set. Accepts
+ * `unknown` to tolerate round-tripped payloads whose shape is
+ * assumed but not proved — returns the narrow kind when the input
+ * matches, falls through to `reject` otherwise (the only object-
+ * shaped variant).
  */
-export function findDuplicateName(blocks: AdmissionBlockForm[]): string | null {
-  const seen = new Set<string>();
-  for (const b of blocks) {
-    const k = b.name.toLowerCase();
-    if (seen.has(k)) return b.name;
-    seen.add(k);
+export function actionKind(
+  action: unknown
+): 'allow-anonymous' | 'deny' | 'reject' | 'continue' {
+  if (action === 'allow-anonymous' || action === 'deny' || action === 'continue') {
+    return action;
   }
-  return null;
+  return 'reject';
 }

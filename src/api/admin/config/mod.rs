@@ -15,12 +15,65 @@
 //! `test_s3_connection` (used by the GUI to probe a candidate backend
 //! before saving it) lives alongside the shared helpers here — it's
 //! small, stateless, and doesn't obviously belong under any submodule.
+//!
+//! [`SectionName`] and [`unknown_section_error`] live here too so the
+//! three submodules that accept a `section` parameter
+//! (`section_level`, `document_level::export_config`,
+//! `document_level::config_defaults`) agree on the wire-level name
+//! spelling and 404 message.
 
 pub mod document_level;
 pub mod field_level;
 pub mod password;
 pub mod section_level;
 pub mod trace;
+
+/// Names of the four sections the admin API understands. Canonical
+/// home for the enum + its string-wire spelling — any consumer that
+/// accepts a `section` parameter must parse through here, never a
+/// local string-match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SectionName {
+    Admission,
+    Access,
+    Storage,
+    Advanced,
+}
+
+impl SectionName {
+    /// Parse a section name off the wire. Returns `None` on unknown
+    /// input — caller turns that into a 404 via
+    /// [`unknown_section_error`].
+    pub(super) fn parse(s: &str) -> Option<Self> {
+        match s {
+            "admission" => Some(Self::Admission),
+            "access" => Some(Self::Access),
+            "storage" => Some(Self::Storage),
+            "advanced" => Some(Self::Advanced),
+            _ => None,
+        }
+    }
+
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Admission => "admission",
+            Self::Access => "access",
+            Self::Storage => "storage",
+            Self::Advanced => "advanced",
+        }
+    }
+}
+
+/// Standard 404 body for section-scoped endpoints. Single source of
+/// truth for the error text — four handlers share the same 404
+/// trigger, and the message lists the valid section names exactly
+/// once.
+pub(super) fn unknown_section_error(name: &str) -> String {
+    format!(
+        "unknown section '{}'; valid names: admission, access, storage, advanced",
+        name
+    )
+}
 
 pub use document_level::{
     apply_config_doc, config_defaults, export_config, validate_config_doc, ConfigApplyResponse,
@@ -268,23 +321,46 @@ pub(super) async fn apply_config_transition(
 
     // 5. Restart-required fields. The values are applied to the config
     //    in memory (the caller has already swapped them), but the server
-    //    must restart for them to take effect at the HTTP layer.
-    if old_cfg.listen_addr != new_cfg.listen_addr {
+    //    must restart for them to take effect at the HTTP layer. The
+    //    set of restart-required fields is the SINGLE source of truth
+    //    here in `requires_restart_warnings` — the section-level
+    //    dry-run (`/config/section/:name/validate`) delegates to it
+    //    too so the two code paths can't drift.
+    for w in requires_restart_warnings(old_cfg, new_cfg) {
         requires_restart = true;
-        warnings.push(format!(
-            "listen_addr changed to {} — restart required",
-            new_cfg.listen_addr
-        ));
-    }
-    if old_cfg.cache_size_mb != new_cfg.cache_size_mb {
-        requires_restart = true;
-        warnings.push(format!(
-            "cache_size_mb changed to {} — restart required",
-            new_cfg.cache_size_mb
-        ));
+        warnings.push(w);
     }
 
     Ok((warnings, requires_restart))
+}
+
+/// Return one warning per restart-required field that changed between
+/// `old` and `new`. Empty vec = no restart required.
+///
+/// Single source of truth for the restart-required fieldset:
+/// [`apply_config_transition`] uses this to emit warnings + set its
+/// `requires_restart` flag, and
+/// [`super::section_level::restart_required_between`] uses the same
+/// predicate for its stateless dry-run. Adding a fifth restart-
+/// required field means editing exactly this function.
+pub(super) fn requires_restart_warnings(
+    old: &crate::config::Config,
+    new: &crate::config::Config,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if old.listen_addr != new.listen_addr {
+        out.push(format!(
+            "listen_addr changed to {} — restart required",
+            new.listen_addr
+        ));
+    }
+    if old.cache_size_mb != new.cache_size_mb {
+        out.push(format!(
+            "cache_size_mb changed to {} — restart required",
+            new.cache_size_mb
+        ));
+    }
+    out
 }
 
 /// Resolve the path the admin API should persist config changes to.

@@ -41,7 +41,7 @@ import {
   DeleteOutlined,
 } from '@ant-design/icons';
 import type { AdmissionBlock } from '../adminApi';
-import { actionKind } from './AdmissionBlockEditorModal';
+import { actionKind } from '../schemas/admissionSchema';
 import { useColors } from '../ThemeContext';
 
 const { Text } = Typography;
