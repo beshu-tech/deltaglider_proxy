@@ -1,21 +1,19 @@
 # Progressive Config Refactor — Implementation Plan
 
-> **📍 Progress snapshot (2026-04-20)**
+> **📍 Progress snapshot (as of v0.8.0 + follow-ons on `main`)**
 >
 > This document is the original planning artifact. Per-phase `**STATUS**`
-> callouts below record what's actually shipped vs. planned, as of the
-> commits on `main` up to `e9d23b2` ("Configuration overhaul: YAML +
-> document-level admin API + admission chain").
+> callouts below record what's actually shipped vs. planned.
 >
 > | Phase | Status | What's next |
 > |---|---|---|
-> | 0 — Foundations                    | ✅ **Done**        | — |
-> | 1 — Admin API upgrades             | ✅ **Done**        | `?section=` / `?resolve=` query params on `/export` deferred to Phase 3 |
-> | 2 — Admission chain                | 🟡 **Partial**     | Scope narrowed: only `AllowAnonymous` / `Continue` + `PublicPrefixGrant` shipped; `Deny` / `RateLimit` / `Reject` variants and the 5-block default chain are carried into Phase 3 |
-> | 3 — Progressive-disclosure schema  | ❌ **Not started** | **The critical next target** — unblocks Phases 4, 5, 6 |
-> | 4 — CLI                            | 🟡 **20% done**    | Only `config migrate` + `config schema` shipped; `init` / `lint` / `show` / `defaults` / `explain` / `apply` / `admission trace` pending |
-> | 5 — GUI redesign                   | ❌ **Not started** | Blocked on Phase 3 |
-> | 6 — Deprecation sweep              | ❌ **Not started** | Blocked on Phase 3/4/5 |
+> | 0 — Foundations                    | ✅ **Done** | — |
+> | 1 — Admin API upgrades             | ✅ **Done** | — (`?section=` / `?resolve=` shipped with Phase 3a) |
+> | 2 — Admission chain                | ✅ **Done** | `Deny` / `Reject` dispatch shipped in Phase 3b.2.b; `RateLimit` action variant + 5-block default chain carried into Phase 3b.2.c (deferred with a known gap) |
+> | 3 — Progressive-disclosure schema  | 🟡 **Partial (3a, 3b.1, 3b.2.a, 3b.2.b, 3c.1, 3c.2 done)** | **3b.2.c** (rate-limit action) and **3c.3** (declarative reconciler) and **3d** (group presets) still pending |
+> | 4 — CLI                            | 🟡 **Most of it done** | `config migrate` / `schema` / `lint` / `defaults` / `apply` + `admission trace` shipped. `config init` / `config show` / `config explain` still pending |
+> | 5 — GUI redesign                   | 🟡 **Waves 1-7 of 10 done** | Tracked separately in [admin-ui-revamp.md](admin-ui-revamp.md); waves 8-10 (first-run wizard / diagnostics dashboard / polish) pending |
+> | 6 — Deprecation sweep              | ✅ **Done** | TOML emits deprecation warn; YAML example + README + HOWTO shipped; removal still scheduled ≥2 minors post-Phase-6 |
 >
 > **Bonus work that shipped alongside** (not in the original plan but
 > landed in the same `e9d23b2` commit): a hygiene pass (admin/config.rs
@@ -26,6 +24,13 @@
 > and `examples/scrape_full_config.rs` — a read-only tool that dumps a
 > live server's config into the Phase 3 target YAML shape + a companion
 > `.env`. See "Bonus: unplanned work that shipped" at the bottom.
+>
+> **Additional post-v0.8.0-tag fixes** caught during live-browser
+> verification: section-level PUT became RFC 7396 JSON Merge Patch
+> (was replace, zeroing unrelated fields); `advanced.log_level` from
+> YAML now applied at startup (not just via admin API); legacy admin
+> URLs (`/_/admin/users`) canonicalise to the new hierarchical form
+> in the browser address bar without adding history entries.
 
 ## Context
 
@@ -135,7 +140,17 @@ User decisions locked in via AskUserQuestion:
 
 ### Phase 2 — Admission chain (2–3 weeks, largest single chunk)
 
-> **🟡 STATUS: Partial — scope deliberately narrowed, carries into Phase 3**
+> **✅ STATUS: Done (via Phase 2 + 3b.2.b)**
+>
+> The base admission evaluator shipped in Phase 2 with
+> `AllowAnonymous` / `Continue` + `PublicPrefixGrant`. Phase 3b.2.b
+> completed the runtime story by adding `Deny` and
+> `Reject { status, message }` dispatch wired through the
+> middleware, plus operator-authored `Match::Predicates` (method /
+> source_ip / source_ip_list CIDR / bucket / path_glob /
+> authenticated / config_flag). The `RateLimit` action variant and
+> the canonical five-block default chain remain **deferred** to
+> Phase 3b.2.c.
 >
 > **What shipped:**
 > - `src/admission/` module with `AdmissionChain`, `AdmissionBlock`, `Match`, `Action`, `Decision` types + an `evaluator` sub-module + a `middleware` sub-module.
@@ -199,10 +214,27 @@ User decisions locked in via AskUserQuestion:
 
 ### Phase 3 — Progressive-disclosure YAML schema (2 weeks)
 
-> **🟡 STATUS: Phase 3a DONE, Phase 3b/c/d still pending**
+> **🟡 STATUS: Phase 3a + 3b.1 + 3b.2.a + 3b.2.b + 3c.1 + 3c.2 DONE; 3b.2.c + 3c.3 + 3d still pending**
 >
 > Phase 3a (sectioned YAML serde boundary) landed in commits
-> `aeb128f` / `6d75ce6` / `b1f2f06`.
+> `aeb128f` / `6d75ce6` / `b1f2f06`. Subsequent sub-phases stacked on
+> top and all shipped in v0.8.0 (with 3c.1/3c.2 gated behind
+> `iam_mode: gui` as the default so existing deployments are unaffected).
+> The three outstanding sub-phases are:
+>
+> - **3b.2.c** — `RateLimit` action variant wired to the existing
+>   per-IP rate limiter, keyed by scope (IP / principal / IP+bucket),
+>   plus the canonical five-block default chain
+>   (`deny-known-bad-ips`, `allow-anonymous-public-buckets`,
+>   `rate-limit-anonymous`, `rate-limit-authenticated`, `continue`).
+> - **3c.3** — the declarative-mode reconciler: on every apply when
+>   `iam_mode: Declarative`, sync-diff the IAM DB against the YAML
+>   `access.users` / `.groups` / `.providers` arrays (insert missing,
+>   update divergent, delete extras). Needs a YAML-facing User/Group
+>   shape decoupled from DB internals and a safety cap ("refuse if
+>   diff would delete >N users unless `--force`").
+> - **3d** — group presets (`{ preset: admin | read-only | ... }`)
+>   expanding to built-in IAM policy documents.
 >
 > **What Phase 3a delivered:**
 > - New module `src/config_sections.rs` with `SectionedConfig` +
@@ -326,20 +358,20 @@ User decisions locked in via AskUserQuestion:
 
 ### Phase 4 — CLI (1 week)
 
-> **🟡 STATUS: 20% done**
+> **🟡 STATUS: Most of it shipped (6 of 8 subcommands live)**
 >
-> Shipped (Phase 0 scaffolding):
+> Shipped:
 > - `deltaglider_proxy config migrate <in> [--out <path>]` — converts TOML to canonical YAML, idempotent on YAML input.
 > - `deltaglider_proxy config schema [--out <path>]` — emits the JSON Schema.
+> - `deltaglider_proxy config lint <file>` — offline schema + semantic validation. Same pipeline the admin API `/config/validate` runs.
+> - `deltaglider_proxy config defaults [--out <path>]` — emits defaults + docstrings as JSON Schema.
+> - `deltaglider_proxy config apply <file> [--server URL] [--timeout SECS]` — pushes a YAML document to a running server via the admin API. Reads the bootstrap password from `DGP_BOOTSTRAP_PASSWORD` env (never argv, to avoid `ps` leakage).
+> - `deltaglider_proxy admission trace --method … --path … [--authenticated] [--query …]` — dry-runs a synthetic request against the admission chain. Same evaluator backs live + trace.
 >
-> Pending (blocked on Phase 3 for most):
-> - `config init [--example NAME]` — needs the `examples/*.dgp.yaml` library which lands alongside the sectioned schema.
-> - `config lint <file>` — needs the sectioned validator.
-> - `config show [--for bucket/NAME|user/NAME] [--resolve]` — needs `/export?section=` from Phase 3.
-> - `config defaults [--version v1]` — wrapper over the existing `/defaults` endpoint; could ship today but naturally pairs with the richer schema from Phase 3.
-> - `config explain bucket <name>` / `explain user <name>` — needs preset expansion (Phase 3).
-> - `admission trace --request '<method> <path> from <ip> as <principal>'` — wrapper over `/trace`; could ship today but the request grammar benefits from Phase 3's operator-facing admission vocabulary.
-> - `config apply <file>` — wrapper over `/apply`; could ship today. Small independent win.
+> Still pending:
+> - `config init [--example NAME]` — needs the `examples/*.dgp.yaml` library. Would pair with Wave 8 (first-run wizard) from the admin UI revamp.
+> - `config show [--for bucket/NAME|user/NAME] [--resolve]` — needs `resolve` to expand presets (Phase 3d).
+> - `config explain bucket <name>` / `explain user <name>` — blocked on Phase 3d preset expansion.
 
 **Goal:** All tooling is usable from the terminal. Every CLI command has an equivalent admin-API endpoint from Phase 1/2.
 
@@ -370,13 +402,18 @@ Add subcommands to `src/main.rs:36` (existing `Cli` struct) — reshape current 
 
 ### Phase 5 — GUI redesign (3–4 weeks, parallelizable with Phase 2/4)
 
-> **❌ STATUS: Not started**
+> **🟡 STATUS: Waves 1-7 of 10 shipped**
 >
-> Blocked on Phase 3 — the four-tab layout mirrors the four Config
-> sections, so there's nothing to render until those sections exist.
-> Some ancillary pieces (`TracePage`, `CopyAsYamlButton`) could be
-> prototyped against the Phase 1 endpoints that already ship, but doing
-> so before Phase 3 risks churn when the sectioned shape lands.
+> The GUI redesign is tracked in its own companion plan,
+> [admin-ui-revamp.md](admin-ui-revamp.md), which subsumed this phase.
+> Waves 1-7 landed across v0.8.0 and its immediate follow-ons:
+> section-level API (Wave 1), foundation components (Wave 2), sidebar
+> + URL scheme + right-rail (Wave 3), Admission editor (Wave 4),
+> Access Credentials & mode panel (Wave 5), Buckets panel with
+> tri-state public toggle (Wave 6), Advanced's five sub-panels
+> (Wave 7). Waves 8 (first-run wizard), 9 (Diagnostics dashboard +
+> Trace UI), and 10 (A11y / keyboard / mobile polish) are still
+> pending.
 
 **Goal:** The admin GUI mirrors the 4-section mental model, every page offers a "Copy as YAML" button, and a first-run wizard bridges zero-to-working.
 
@@ -410,11 +447,29 @@ Add subcommands to `src/main.rs:36` (existing `Cli` struct) — reshape current 
 
 ### Phase 6 — Deprecation sweep & preset library expansion (1 week, done last)
 
-> **❌ STATUS: Not started**
+> **✅ STATUS: Done for the deprecation-warn half; preset library still pending**
 >
-> Blocked on Phase 3/4/5: there's no canonical YAML shape to promote as
-> the replacement for TOML yet, and the `examples/*.dgp.yaml` library
-> lands in Phase 4 alongside `config lint`.
+> Shipped:
+> - TOML loader emits a `tracing::warn!` on every load pointing at
+>   `deltaglider_proxy config migrate`. Silencable via
+>   `DGP_SILENCE_TOML_DEPRECATION=1` for operators mid-rollout.
+> - `deltaglider_proxy.example.yaml` added as the canonical example;
+>   `deltaglider_proxy.toml.example` carries a deprecation banner at
+>   the top and is kept for reference only.
+> - README, CLAUDE.md, and CONFIGURATION.md rewritten around the
+>   YAML-first story; [HOWTO_MIGRATE_TO_YAML.md](../HOWTO_MIGRATE_TO_YAML.md)
+>   walks operators through the conversion.
+> - `Config::persist_to_file` refuses to write YAML-only fields
+>   (operator-authored admission blocks, `iam_mode: declarative`)
+>   to a TOML target — guards against the half-persist failure mode.
+>
+> Pending:
+> - Full `examples/*.dgp.yaml` preset library (~10 curated files).
+>   Needs Phase 3d (group presets) before the Acme kitchen-sink
+>   example is expressible.
+> - TOML removal deadline. Carry TOML support for ≥2 more minor
+>   versions before the loader returns `ConfigError::Parse("TOML is
+>   no longer supported; use YAML")` unconditionally.
 
 **Goal:** TOML becomes explicitly deprecated. The preset library is broad enough to cover the common cases.
 
