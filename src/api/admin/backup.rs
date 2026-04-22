@@ -49,6 +49,17 @@ use crate::iam::{normalize_permissions, validate_permissions, Permission};
 use super::users::rebuild_iam_index;
 use super::{audit_log, trigger_config_sync, AdminState};
 
+/// Hex-encoded SHA-256 of a byte slice. Used in three places in this
+/// module (manifest write on export, manifest verify on import) so
+/// it lives at module scope instead of as a closure repeated at each
+/// call site.
+fn sha_hex(b: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b);
+    hex::encode(h.finalize())
+}
+
 /// Full IAM backup: users (with credentials) + groups + memberships + external auth.
 #[derive(Serialize, Deserialize)]
 pub struct IamBackup {
@@ -338,12 +349,6 @@ async fn export_zip(
     let yaml_bytes = yaml.into_bytes();
 
     // ── Manifest (hashes + sizes of each file) ─────────────────
-    use sha2::{Digest, Sha256};
-    let sha_hex = |b: &[u8]| {
-        let mut h = Sha256::new();
-        h.update(b);
-        hex::encode(h.finalize())
-    };
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let manifest = BackupManifest {
         version: 1,
@@ -540,12 +545,6 @@ async fn import_zip_full_backup(
     //    Files present in the zip but not listed in the manifest
     //    are ignored (forward-compat: older servers shouldn't
     //    choke on newer zips adding non-sensitive metadata).
-    use sha2::{Digest, Sha256};
-    let sha_hex = |b: &[u8]| {
-        let mut h = Sha256::new();
-        h.update(b);
-        hex::encode(h.finalize())
-    };
     if let Some(entries) = manifest.get("files").and_then(|v| v.as_array()) {
         for entry in entries {
             let name = entry.get("name").and_then(|v| v.as_str()).ok_or_else(|| {

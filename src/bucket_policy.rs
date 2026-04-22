@@ -181,6 +181,28 @@ impl BucketPolicyRegistry {
                         .public_prefixes
                         .into_iter()
                         .filter_map(|mut p| {
+                            // Capture the original (as-authored) form before
+                            // we mutate `p` so warnings point at what the
+                            // operator actually wrote, not the stripped form.
+                            let original = p.clone();
+
+                            // Reject bare-slash variants explicitly. `"/"`,
+                            // `"//"`, `"///"` etc. would strip to empty
+                            // string and silently become "entire bucket
+                            // public" — almost certainly a typo rather than
+                            // intent. Operators who want whole-bucket public
+                            // should use `public: true` or an explicit
+                            // empty string, both of which fire a clear
+                            // warning.
+                            if !p.is_empty() && p.chars().all(|c| c == '/') {
+                                tracing::warn!(
+                                    "Bucket '{}': rejecting public_prefix {:?} — bare slashes are ambiguous. \
+                                     Use `public: true` (or an explicit empty string) for whole-bucket exposure.",
+                                    k, original
+                                );
+                                return None;
+                            }
+
                             // Strip leading slash
                             if p.starts_with('/') {
                                 p = p[1..].to_string();
@@ -188,12 +210,15 @@ impl BucketPolicyRegistry {
                             // Reject dangerous patterns
                             if p.contains("..") || p.contains('\0') || p.contains("//") {
                                 tracing::warn!(
-                                    "Bucket '{}': rejecting invalid public_prefix '{}' (contains .., null, or //)",
-                                    k, p
+                                    "Bucket '{}': rejecting invalid public_prefix {:?} (contains .., null, or //)",
+                                    k, original
                                 );
                                 return None;
                             }
-                            // Warn about entire-bucket exposure
+                            // Warn about entire-bucket exposure (only hits
+                            // when the operator literally wrote the empty
+                            // string — bare-slash variants are rejected
+                            // above).
                             if p.is_empty() {
                                 tracing::warn!(
                                     "Bucket '{}': public_prefix is empty string — the ENTIRE bucket is publicly readable!",
@@ -342,6 +367,16 @@ impl PublicPrefixSnapshot {
                     .public_prefixes
                     .iter()
                     .filter_map(|p| {
+                        // Reject bare-slash variants to match the
+                        // BucketPolicyRegistry::new path. Keeping these
+                        // two filters in sync matters: the registry
+                        // reaches IAM authz, the snapshot reaches the
+                        // anonymous-admission path; a drift would let
+                        // `"/"` be public in one surface but not the
+                        // other.
+                        if !p.is_empty() && p.chars().all(|c| c == '/') {
+                            return None;
+                        }
                         let p = p.strip_prefix('/').unwrap_or(p);
                         if p.contains("..") || p.contains('\0') || p.contains("//") {
                             None
@@ -865,5 +900,101 @@ mod tests {
         let after_first = policy.clone();
         policy.normalize().unwrap();
         assert_eq!(policy, after_first);
+    }
+
+    #[test]
+    fn bare_slash_public_prefix_is_rejected_not_silently_promoted() {
+        // Regression: `public_prefixes: ["/"]` used to strip to `""`
+        // and silently become "entire bucket public" (with only a
+        // warn-level log). That's too close to typo territory — an
+        // operator writing `"/"` probably meant "root of the bucket",
+        // not "the whole bucket". Rejecting bare slashes forces the
+        // operator to use `public: true` or an explicit empty string
+        // if that's what they really want.
+        let mut cfg = HashMap::new();
+        cfg.insert(
+            "b".to_string(),
+            BucketPolicyConfig {
+                public_prefixes: vec!["/".to_string()],
+                ..Default::default()
+            },
+        );
+        let registry = BucketPolicyRegistry::new(cfg, 0.75);
+        let policy = registry
+            .policies()
+            .get("b")
+            .expect("bucket must be present");
+        assert!(
+            policy.public_prefixes.is_empty(),
+            "bare-slash prefix must be dropped, not promoted to entire-bucket-public; got {:?}",
+            policy.public_prefixes
+        );
+    }
+
+    #[test]
+    fn bare_double_and_triple_slash_public_prefixes_rejected() {
+        // `"//"` already passes through the `contains("//")` filter,
+        // but add an explicit test so regressions on the bare-slash
+        // rejection branch are caught.
+        for variant in ["//", "///", "////"] {
+            let mut cfg = HashMap::new();
+            cfg.insert(
+                "b".to_string(),
+                BucketPolicyConfig {
+                    public_prefixes: vec![variant.to_string()],
+                    ..Default::default()
+                },
+            );
+            let registry = BucketPolicyRegistry::new(cfg, 0.75);
+            let policy = registry
+                .policies()
+                .get("b")
+                .expect("bucket must be present");
+            assert!(
+                policy.public_prefixes.is_empty(),
+                "variant {:?} must be rejected",
+                variant
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_empty_string_entire_bucket_public_still_works() {
+        // `public_prefixes: [""]` is the canonical "entire bucket"
+        // form (what `public: true` expands to). It must survive the
+        // bare-slash rejection logic.
+        let mut cfg = HashMap::new();
+        cfg.insert(
+            "b".to_string(),
+            BucketPolicyConfig {
+                public_prefixes: vec!["".to_string()],
+                ..Default::default()
+            },
+        );
+        let registry = BucketPolicyRegistry::new(cfg, 0.75);
+        let policy = registry
+            .policies()
+            .get("b")
+            .expect("bucket must be present");
+        assert_eq!(policy.public_prefixes, vec!["".to_string()]);
+    }
+
+    #[test]
+    fn snapshot_rejects_bare_slash_in_parallel_with_registry() {
+        // Snapshot and registry must stay in lockstep; a drift would
+        // let "/" be public in one surface but not the other.
+        let mut cfg = HashMap::new();
+        cfg.insert(
+            "b".to_string(),
+            BucketPolicyConfig {
+                public_prefixes: vec!["/".to_string()],
+                ..Default::default()
+            },
+        );
+        let snap = PublicPrefixSnapshot::from_config(&cfg);
+        assert!(
+            snap.public_prefixes_for_bucket("b").is_empty(),
+            "snapshot must also reject bare slash"
+        );
     }
 }

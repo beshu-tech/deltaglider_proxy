@@ -207,6 +207,18 @@ async fn anonymous_list_false_parent_denied() {
         StatusCode::FORBIDDEN,
         "false-parent prefix must not bypass public-prefix scope"
     );
+    // Belt-and-braces: even if a regression turned this 403 into a
+    // 200-with-empty-body, verify the response doesn't leak any key.
+    let body = resp.text().await.unwrap_or_default();
+    let (keys, _) = parse_list_xml(&body);
+    assert!(
+        keys.is_empty(),
+        "false-parent denial must not leak any key (got {keys:?})"
+    );
+    assert!(
+        body.contains("AccessDenied") || body.is_empty(),
+        "403 body should carry AccessDenied XML; got: {body}"
+    );
 }
 
 /// Security: unrelated prefix in the same bucket — classic deny.
@@ -223,6 +235,13 @@ async fn anonymous_list_unrelated_prefix_denied() {
         .await
         .expect("HTTP send");
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = resp.text().await.unwrap_or_default();
+    let (keys, _) = parse_list_xml(&body);
+    assert!(
+        keys.is_empty(),
+        "unrelated-prefix denial must not leak any key"
+    );
+    assert!(!body.contains("private/secret.txt"));
 }
 
 /// Security: no prefix at all ("list the whole bucket") against a
@@ -242,6 +261,13 @@ async fn anonymous_list_bucket_root_denied_when_only_partial_public() {
         resp.status(),
         StatusCode::FORBIDDEN,
         "bucket-root LIST with partial public prefix must be denied (would leak non-public keys)"
+    );
+    let body = resp.text().await.unwrap_or_default();
+    let (keys, _) = parse_list_xml(&body);
+    assert!(
+        keys.is_empty() && !body.contains("private/secret.txt"),
+        "bucket-root denial must not leak any key (got body of {} bytes, keys={keys:?})",
+        body.len()
     );
 }
 
@@ -279,10 +305,7 @@ async fn anonymous_list_multiple_public_prefixes() {
     let server = TestServer::builder()
         .bucket("multibk")
         .auth("admin", "admin-secret-1234567890")
-        .bucket_policy(
-            "multibk",
-            "public_prefixes = [\"releases/\", \"docs/\"]",
-        )
+        .bucket_policy("multibk", "public_prefixes = [\"releases/\", \"docs/\"]")
         .build()
         .await;
 
@@ -336,6 +359,10 @@ async fn anonymous_list_multiple_public_prefixes() {
         .await
         .unwrap();
     assert_eq!(r_false.status(), StatusCode::FORBIDDEN);
+    let body = r_false.text().await.unwrap_or_default();
+    let (keys, _) = parse_list_xml(&body);
+    assert!(keys.is_empty(), "multi-prefix false-parent must not leak");
+    assert!(!body.contains("private/secret.txt"));
 }
 
 /// An authenticated admin still lists the full bucket regardless of

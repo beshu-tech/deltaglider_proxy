@@ -956,6 +956,9 @@ function SyncStatusPill({
 
   return (
     <span
+      role="status"
+      aria-live="polite"
+      aria-label={`Config DB sync: ${label}`}
       style={{
         display: 'inline-flex',
         alignItems: 'center',

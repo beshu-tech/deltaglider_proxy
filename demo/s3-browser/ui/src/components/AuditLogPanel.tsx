@@ -55,8 +55,8 @@ function actionColour(action: string): string {
 
 /**
  * Compact time-ago in the same row as the absolute timestamp.
- * Example: "2m ago". No localisation today (§10.2 i18n scaffold
- * exists but this panel is English-only for now).
+ * Example: "2m ago". English-only; if/when we ship localisation,
+ * this helper is the obvious swap point.
  */
 function relativeTime(iso: string, now: Date): string {
   const t = new Date(iso).getTime();

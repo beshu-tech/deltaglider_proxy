@@ -54,7 +54,7 @@ impl<'a> RequestInfo<'a> {
 /// sites are responsible for the ordering they want to express.
 pub fn evaluate(chain: &AdmissionChain, req: &RequestInfo<'_>) -> Decision {
     for block in chain.blocks() {
-        if matches(chain, &block.match_, req) {
+        if matches(chain, &block.match_, &block.action, req) {
             return match &block.action {
                 Action::AllowAnonymous => Decision::AllowAnonymous {
                     matched: block.name.clone(),
@@ -78,11 +78,14 @@ pub fn evaluate(chain: &AdmissionChain, req: &RequestInfo<'_>) -> Decision {
 
 /// Predicate dispatch. New `Match` variants must add a branch here; the
 /// wildcard is omitted intentionally so the compiler forces an update
-/// when variants grow.
-fn matches(chain: &AdmissionChain, m: &Match, req: &RequestInfo<'_>) -> bool {
+/// when variants grow. The block's `action` is threaded through so
+/// `match_predicates` can apply action-specific defaults (e.g. default
+/// `authenticated=false` for `allow-anonymous` blocks that didn't
+/// explicitly say so — see [`match_predicates`]).
+fn matches(chain: &AdmissionChain, m: &Match, action: &Action, req: &RequestInfo<'_>) -> bool {
     match m {
         Match::PublicPrefixGrant { bucket } => match_public_prefix_grant(chain, bucket, req),
-        Match::Predicates(p) => match_predicates(p, req),
+        Match::Predicates(p) => match_predicates(p, action, req),
     }
 }
 
@@ -90,7 +93,16 @@ fn matches(chain: &AdmissionChain, m: &Match, req: &RequestInfo<'_>) -> bool {
 /// request (operator-authored terminal fallback). Unset fields are
 /// treated as "don't care" — the symmetry with serde's Option makes the
 /// YAML and the runtime semantics agree without a translation layer.
-fn match_predicates(p: &Predicates, req: &RequestInfo<'_>) -> bool {
+///
+/// Action-specific default: `AllowAnonymous` blocks without an explicit
+/// `authenticated` predicate default to `authenticated == false`. An
+/// operator authoring `allow-anonymous` is giving a carve-out for
+/// unsigned requests; letting it match signed requests would silently
+/// discard the caller's credentials and downgrade them to the narrower
+/// `$anonymous` principal (which often has no permissions, resulting
+/// in an unexpected 403). Signed callers should always flow through
+/// SigV4 verification — they *chose* to sign.
+fn match_predicates(p: &Predicates, action: &Action, req: &RequestInfo<'_>) -> bool {
     if let Some(methods) = &p.methods {
         let m_upper = req.method.to_ascii_uppercase();
         if !methods.iter().any(|m| m == &m_upper) {
@@ -123,9 +135,20 @@ fn match_predicates(p: &Predicates, req: &RequestInfo<'_>) -> bool {
             return false;
         }
     }
-    if let Some(auth_required) = p.authenticated {
-        if auth_required != req.authenticated {
-            return false;
+    // `authenticated` predicate. If the operator set it explicitly,
+    // compare as-is. Otherwise, for `allow-anonymous` blocks, default
+    // to "unauthenticated only" — signed callers should flow through
+    // SigV4, not get their principal silently replaced.
+    match p.authenticated {
+        Some(required) => {
+            if required != req.authenticated {
+                return false;
+            }
+        }
+        None => {
+            if matches!(action, Action::AllowAnonymous) && req.authenticated {
+                return false;
+            }
         }
     }
     if p.config_flag.is_some() {
@@ -570,5 +593,92 @@ mod tests {
             source_ip: None,
         };
         assert_eq!(evaluate(&chain, &req), Decision::Continue { matched: None });
+    }
+
+    #[test]
+    fn evaluator_allow_anonymous_does_not_downgrade_signed_request() {
+        // Regression guard for the "allow-anonymous block silently
+        // strips credentials" bug. An operator who writes
+        //   { path_glob: "*.zip", bucket: "x", action: allow-anonymous }
+        // expects the rule to carve out unsigned access; they do NOT
+        // expect a signed admin's request to get pre-admitted as
+        // `$anonymous` (which, on a bucket with no public_prefixes,
+        // lands them in a scoped principal with zero permissions →
+        // surprise 403). The fix: when `authenticated` is unset and
+        // the action is `AllowAnonymous`, default to matching only
+        // unauthenticated requests.
+        use crate::admission::spec::{ActionSpec, AdmissionBlockSpec, MatchSpec, SimpleAction};
+        let block = AdmissionBlockSpec {
+            name: "allow-zips".into(),
+            match_: MatchSpec {
+                path_glob: Some("*.zip".into()),
+                bucket: Some("releases".into()),
+                method: Some(vec!["GET".into(), "HEAD".into()]),
+                ..Default::default()
+            },
+            action: ActionSpec::Simple(SimpleAction::AllowAnonymous),
+        };
+        let chain = chain_from_spec(vec![block]);
+
+        // Unauthenticated GET: the block fires as intended.
+        let anon = RequestInfo {
+            method: "GET",
+            bucket: "releases",
+            key: Some("v1.zip"),
+            list_prefix: None,
+            authenticated: false,
+            source_ip: None,
+        };
+        assert_eq!(
+            evaluate(&chain, &anon),
+            Decision::AllowAnonymous {
+                matched: "allow-zips".into(),
+            }
+        );
+
+        // Same URL but now SIGNED: must NOT downgrade. The signed
+        // caller flows through to SigV4 via Continue.
+        let signed = RequestInfo {
+            method: "GET",
+            bucket: "releases",
+            key: Some("v1.zip"),
+            list_prefix: None,
+            authenticated: true,
+            source_ip: None,
+        };
+        assert_eq!(
+            evaluate(&chain, &signed),
+            Decision::Continue { matched: None },
+            "signed request must not be pre-admitted as anonymous"
+        );
+    }
+
+    #[test]
+    fn evaluator_allow_anonymous_explicit_authenticated_true_still_matches_signed() {
+        // Operator asserted `authenticated: true` explicitly. This is
+        // an unusual shape but we honour it — the explicit predicate
+        // overrides the action-specific default.
+        use crate::admission::spec::{ActionSpec, AdmissionBlockSpec, MatchSpec, SimpleAction};
+        let block = AdmissionBlockSpec {
+            name: "signed-anon".into(),
+            match_: MatchSpec {
+                authenticated: Some(true),
+                ..Default::default()
+            },
+            action: ActionSpec::Simple(SimpleAction::AllowAnonymous),
+        };
+        let chain = chain_from_spec(vec![block]);
+        let signed = RequestInfo {
+            method: "GET",
+            bucket: "any",
+            key: Some("any"),
+            list_prefix: None,
+            authenticated: true,
+            source_ip: None,
+        };
+        assert!(matches!(
+            evaluate(&chain, &signed),
+            Decision::AllowAnonymous { .. }
+        ));
     }
 }

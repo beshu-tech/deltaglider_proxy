@@ -62,6 +62,8 @@ export default function IamSourceBanner({ iamMode, resource }: Props) {
 
   return (
     <div
+      role="note"
+      aria-label={title}
       style={{
         display: 'flex',
         gap: 16,

@@ -130,7 +130,7 @@ The admin UI revamp (all 10 planned waves + Wave 11 audit viewer shipped in v0.8
 
 **Keyboard shortcuts** (waves 10 + 10.1) mounted on AdminPage: `⌘K` / `Ctrl+K` opens the `CommandPalette` (fuzzy nav over every entry in `ADMIN_IA` + shell-scope actions, recents MRU, group headings for Recent/Navigate/Actions); `⌘S` / `Ctrl+S` dispatches Apply to the currently-visible dirty section via `requestApplyCurrent()` (falls through to the browser default when no section handler is registered); `?` opens `ShortcutsHelp` (platform-aware — ⌘ on Apple / Ctrl elsewhere via `platform.ts::metaKeyLabel()`). Strict modifier match on the palette binding avoids hijacking ⌘⇧K. Listeners are gated on `authed` so the bootstrap login screen isn't affected.
 
-**Mobile drawer** (wave 10.1 §10.4) — below 900px (`useIsNarrow(900)` in AdminPage) the persistent sidebar collapses to an AntD `Drawer` slid from the left; a hamburger in the header opens it; navigation auto-closes it. **i18n scaffold** (`src/i18n.ts`) exposes `t(key, fallback)` + `useT()` as a pass-through today — single swap point when a locale ships.
+**Mobile drawer** (wave 10.1 §10.4) — below 900px (`useIsNarrow(900)` in AdminPage) the persistent sidebar collapses to an AntD `Drawer` slid from the left; a hamburger in the header opens it; navigation auto-closes it.
 
 **Audit log** (Wave 11) — `src/audit.rs` maintains an in-memory `VecDeque<AuditEntry>` ring (default 500 entries, `DGP_AUDIT_RING_SIZE`) that mirrors every `audit_log()` call. `AuditEntry` is serde-serialisable with ISO-8601 UTC timestamp. `GET /api/admin/audit?limit=N` (session-gated, not IAM-gated) powers `AuditLogPanel` at `/_/admin/diagnostics/audit`. Stdout / JSON log shippers see nothing change — the ring is supplementary.
 
