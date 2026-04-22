@@ -304,7 +304,7 @@ export default function DocsPage({ docId, onBack }: Props) {
           padding: 'clamp(20px, 4vw, 40px)',
         }}
       >
-        <div style={{ display: 'flex', gap: 32, maxWidth: 1100, margin: '0 auto' }}>
+        <div style={{ display: 'flex', gap: 40, maxWidth: 1200, margin: '0 auto' }}>
           {/* Landing page for overview, markdown for everything else */}
           {selectedId === 'readme' || !selectedDoc ? (
             <div style={{ flex: 1, minWidth: 0 }}>
