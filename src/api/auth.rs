@@ -55,41 +55,49 @@ fn build_anonymous_user(bucket: &str, public_prefixes: &[String]) -> Authenticat
         iam_policies.push(permission_to_iam_policy(&read_perm));
         permissions.push(read_perm);
 
-        // List permission: scoped via s3:prefix condition.
+        // List permission — three shapes:
         //
-        // AWS S3 parity: the CLI form `aws s3 ls s3://b/ror/libs` sends
-        // ListObjectsV2 with `prefix=ror/libs` (no trailing slash) —
-        // the CLI treats the slash as a convenience, not a protocol
-        // requirement. To stay compatible, the StringLike condition
-        // must match BOTH the bare parent prefix (`ror/libs`) and
-        // anything under it (`ror/libs/...`).
+        // 1. `public_prefixes: [""]` (entire bucket public, `public: true`
+        //    shorthand). The middleware doesn't set an `s3:prefix`
+        //    context key when the LIST request omits a prefix, so a
+        //    StringLike condition evaluates as "key missing" and denies.
+        //    We emit an unconditional list Allow in that case —
+        //    everything in the bucket is public by definition.
         //
-        // We also need to *not* match a false parent like
-        // `ror/libsomething` — that's covered because StringLike is
-        // anchored glob-matching, not substring. `ror/libs` matches
-        // only the exact string `ror/libs`, and `ror/libs/*` matches
-        // only strings starting with `ror/libs/`.
+        // 2. `public_prefixes: ["x/"]` (slash-terminated, the canonical
+        //    form). Emit `StringLike: { s3:prefix: ["x", "x/*"] }` so
+        //    both `aws s3 ls s3://b/x` (no slash) and `aws s3 ls
+        //    s3://b/x/` work. False-parent strings like `x-other` are
+        //    denied because StringLike is anchored glob matching.
         //
-        // When the public prefix ends with `/` (the normal case), we
-        // emit the two-element array. When it doesn't end with `/`
-        // (or is empty for a fully-public bucket), the union collapses
-        // to the single `"{prefix}*"` form the old code used.
-        let s3_prefix_patterns: Vec<String> =
-            if prefix.ends_with('/') && !prefix.is_empty() {
-                // `ror/libs/` → [`ror/libs`, `ror/libs/*`]
+        // 3. `public_prefixes: ["x"]` (non-slash-terminated, loose form).
+        //    Preserve the old single-pattern behaviour — the operator
+        //    explicitly asked for a loose prefix and splitting would
+        //    change semantics.
+        let list_perm = if prefix.is_empty() {
+            Permission {
+                id: 0,
+                effect: "Allow".into(),
+                actions: vec!["list".into()],
+                resources: vec![format!("{}/*", bucket)],
+                conditions: None,
+            }
+        } else {
+            let s3_prefix_patterns: Vec<String> = if prefix.ends_with('/') {
                 let bare = prefix.trim_end_matches('/').to_string();
                 vec![bare, format!("{prefix}*")]
             } else {
                 vec![format!("{prefix}*")]
             };
-        let list_perm = Permission {
-            id: 0,
-            effect: "Allow".into(),
-            actions: vec!["list".into()],
-            resources: vec![format!("{}/*", bucket)],
-            conditions: Some(serde_json::json!({
-                "StringLike": { "s3:prefix": s3_prefix_patterns }
-            })),
+            Permission {
+                id: 0,
+                effect: "Allow".into(),
+                actions: vec!["list".into()],
+                resources: vec![format!("{}/*", bucket)],
+                conditions: Some(serde_json::json!({
+                    "StringLike": { "s3:prefix": s3_prefix_patterns }
+                })),
+            }
         };
         iam_policies.push(permission_to_iam_policy(&list_perm));
         permissions.push(list_perm);
@@ -1111,6 +1119,23 @@ mod tests {
         )
     }
 
+    /// Variant that mimics an incoming request with NO `prefix=` query
+    /// parameter — the IAM middleware (iam/middleware.rs) does not set
+    /// an `s3:prefix` context key in that case. For full-bucket-public
+    /// configs this must still allow LIST.
+    fn allow_anon_list_no_prefix(public_prefix: &str) -> bool {
+        use iam_rs::Context;
+        let user = build_anonymous_user("beshu", &[public_prefix.to_string()]);
+        let ctx = Context::new(); // no s3:prefix
+        crate::iam::permissions::evaluate_iam(
+            &user.iam_policies,
+            crate::iam::types::S3Action::List,
+            "beshu",
+            "",
+            &ctx,
+        )
+    }
+
     #[test]
     fn anonymous_list_allows_exact_parent_prefix() {
         // `aws s3 ls s3://beshu/ror/libs` — CLI-convenience form.
@@ -1162,8 +1187,38 @@ mod tests {
     #[test]
     fn anonymous_list_handles_empty_prefix_entire_bucket_public() {
         // `public: true` expands to `public_prefixes: [""]`. The
-        // StringLike value is `"*"` → matches anything.
+        // generated permission has NO condition, so every LIST is
+        // allowed regardless of the request's s3:prefix value.
         assert!(allow_anon_list("", "anything/at/all"));
         assert!(allow_anon_list("", ""));
+    }
+
+    #[test]
+    fn anonymous_list_fully_public_bucket_with_no_prefix_query() {
+        // Real AWS S3 shape: client sends `GET /bucket/?list-type=2`
+        // with no `prefix=` query param. The IAM middleware doesn't
+        // set an `s3:prefix` context key. A StringLike condition
+        // would evaluate as "key missing" → false → deny. The
+        // empty-prefix public config therefore emits an unconditional
+        // list Allow (see build_anonymous_user). Regression guard for
+        // the public_prefixes: [""] + no-prefix-query case.
+        assert!(
+            allow_anon_list_no_prefix(""),
+            "anonymous LIST with no prefix query param must succeed \
+             when the entire bucket is public"
+        );
+    }
+
+    #[test]
+    fn anonymous_list_partial_public_without_prefix_query_denied() {
+        // Opposite case: only a specific prefix is public, and the
+        // client asks for a LIST with no prefix (= whole bucket).
+        // Must deny, otherwise we'd leak keys outside the public
+        // subtree.
+        assert!(
+            !allow_anon_list_no_prefix("ror/libs/"),
+            "bucket-root LIST with no prefix query must be denied \
+             when only a sub-prefix is public"
+        );
     }
 }
