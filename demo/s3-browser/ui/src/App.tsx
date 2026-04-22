@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Layout, Spin, Empty, Grid } from 'antd';
 import useS3Browser from './useS3Browser';
 import TopBar from './components/TopBar';
@@ -78,6 +78,17 @@ function usePathRouter() {
     setState(parsePath());
   }, []);
 
+  // Stable "go back to browser" callback. Previously inlined into
+  // AdminPage / MetricsPage props as `() => navigate('browse')`, which
+  // allocated a fresh arrow every App render and propagated as
+  // `onBack` / `onSessionExpired` to ~10 admin panels. Each panel's
+  // `loadData` `useCallback` lists `onSessionExpired` in its deps,
+  // so a fresh prop → fresh callback → `useEffect([loadData])` fires
+  // → re-fetches → setState → re-render wave. This one-line fix
+  // eliminates the most visible cause of excessive re-renders when
+  // navigating between admin sub-pages.
+  const navigateToBrowse = useCallback(() => navigate('browse'), [navigate]);
+
   useEffect(() => {
     const onPopState = () => {
       if (skipNext.current) { skipNext.current = false; return; }
@@ -87,14 +98,14 @@ function usePathRouter() {
     return () => window.removeEventListener('popstate', onPopState);
   }, []);
 
-  return { view: state.view, subPath: state.subPath, navigate };
+  return { view: state.view, subPath: state.subPath, navigate, navigateToBrowse };
 }
 
 
 export default function App() {
   const colors = useColors();
 
-  const { view, subPath, navigate } = usePathRouter();
+  const { view, subPath, navigate, navigateToBrowse } = usePathRouter();
   const [siderOpen, setSiderOpen] = useState(false);
   const [needsConnect, setNeedsConnect] = useState(true); // start true, resolved in useEffect
   const [sessionLoading, setSessionLoading] = useState(true);
@@ -211,26 +222,26 @@ export default function App() {
     if (view === 'admin') {
       return (
         <AdminPage
-          onBack={() => navigate('browse')}
-          onSessionExpired={() => navigate('browse')}
+          onBack={navigateToBrowse}
+          onSessionExpired={navigateToBrowse}
           subPath={subPath}
         />
       );
     }
 
     if (view === 'metrics') {
-      return <MetricsPage onBack={() => navigate('browse')} />;
+      return <MetricsPage onBack={navigateToBrowse} />;
     }
 
     if (view === 'docs') {
-      return <DocsPage onBack={() => navigate('browse')} docId={subPath || undefined} />;
+      return <DocsPage onBack={navigateToBrowse} docId={subPath || undefined} />;
     }
 
     if (view === 'upload') {
       return (
         <UploadPage
           prefix={s3.prefix}
-          onBack={() => navigate('browse')}
+          onBack={navigateToBrowse}
           onDone={() => s3.mutate()}
         />
       );
@@ -293,8 +304,17 @@ export default function App() {
     );
   };
 
+  // Stable context value so consumers of `useNavigation()` (AdminPage,
+  // Sidebar, TopBar) don't re-render on every App render. Previously
+  // the inline `value={{ navigate, subPath }}` allocated a fresh
+  // object each time, which React treats as a changed context → every
+  // consumer re-renders, cascading into every admin panel's
+  // data-fetch effect. `navigate` is already `useCallback`'d;
+  // `subPath` is derived state that only changes on actual navigation.
+  const navValue = useMemo(() => ({ navigate, subPath }), [navigate, subPath]);
+
   return (
-    <NavigationContext.Provider value={{ navigate, subPath }}>
+    <NavigationContext.Provider value={navValue}>
     <Layout style={{ minHeight: '100vh', background: colors.BG_BASE }}>
       {/* Skip to content link */}
       <a href="#main-content" className="sr-only sr-only-focusable">

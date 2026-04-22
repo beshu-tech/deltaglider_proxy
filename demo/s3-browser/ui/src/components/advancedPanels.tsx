@@ -65,6 +65,41 @@ interface PanelProps {
   onSessionExpired?: () => void;
 }
 
+// ───────────────────────────────────────────────────────────
+// Per-panel initial value objects — hoisted to module scope so
+// they get allocated once, not once per panel render. Each panel
+// passes its INITIAL into `useAdvancedSubset(initial, ...)` →
+// `useDirtySection(section, initial)` → `useState(initial)`.
+// useState only honors the first value, so a fresh literal each
+// render was silently discarded, but it was misleading (suggested
+// state depended on `initial` while actually being frozen at
+// mount). It also needlessly allocated 4 small objects per render
+// across the 4 panels that use this pattern.
+// ───────────────────────────────────────────────────────────
+
+const LISTENER_INITIAL: Pick<AdvancedSectionBody, 'listen_addr' | 'tls'> = {
+  listen_addr: undefined,
+  tls: undefined,
+};
+
+const CACHES_INITIAL: Pick<
+  AdvancedSectionBody,
+  'cache_size_mb' | 'metadata_cache_mb' | 'codec_concurrency' | 'blocking_threads'
+> = {
+  cache_size_mb: undefined,
+  metadata_cache_mb: undefined,
+  codec_concurrency: undefined,
+  blocking_threads: undefined,
+};
+
+const LOG_INITIAL: Pick<AdvancedSectionBody, 'log_level'> = {
+  log_level: undefined,
+};
+
+const SYNC_INITIAL: Pick<AdvancedSectionBody, 'config_sync_bucket'> = {
+  config_sync_bucket: undefined,
+};
+
 /** The AdvancedSection wire shape — every field is optional (the
  *  server omits defaults on GET). */
 interface AdvancedSectionBody {
@@ -314,10 +349,6 @@ function PanelShell(props: { children: React.ReactNode }) {
 
 export function ListenerTlsPanel({ onSessionExpired }: PanelProps) {
   const { cardStyle, inputRadius } = useCardStyles();
-  const LISTENER_INITIAL: Pick<AdvancedSectionBody, 'listen_addr' | 'tls'> = {
-    listen_addr: undefined,
-    tls: undefined,
-  };
   const subset = useAdvancedSubset(LISTENER_INITIAL, onSessionExpired);
   const { value, setValue, isDirty, discard, loading, error } = subset;
 
@@ -437,15 +468,6 @@ export function ListenerTlsPanel({ onSessionExpired }: PanelProps) {
 
 export function CachesPanel({ onSessionExpired }: PanelProps) {
   const { cardStyle, inputRadius } = useCardStyles();
-  const CACHES_INITIAL: Pick<
-    AdvancedSectionBody,
-    'cache_size_mb' | 'metadata_cache_mb' | 'codec_concurrency' | 'blocking_threads'
-  > = {
-    cache_size_mb: undefined,
-    metadata_cache_mb: undefined,
-    codec_concurrency: undefined,
-    blocking_threads: undefined,
-  };
   const subset = useAdvancedSubset(CACHES_INITIAL, onSessionExpired);
   const { value, setValue, isDirty, discard, loading, error } = subset;
   if (error) return <Alert type="error" showIcon message="Failed to load" description={error} />;
@@ -714,7 +736,6 @@ function findMatchingPreset(logLevel: string): string | null {
 
 export function LoggingPanel({ onSessionExpired }: PanelProps) {
   const { cardStyle, inputRadius } = useCardStyles();
-  const LOG_INITIAL: Pick<AdvancedSectionBody, 'log_level'> = { log_level: undefined };
   const subset = useAdvancedSubset(LOG_INITIAL, onSessionExpired);
   const { value, setValue, isDirty, discard, loading, error } = subset;
   const [custom, setCustom] = useState(false);
@@ -805,9 +826,6 @@ export function LoggingPanel({ onSessionExpired }: PanelProps) {
 
 export function ConfigDbSyncPanel({ onSessionExpired }: PanelProps) {
   const { cardStyle, inputRadius } = useCardStyles();
-  const SYNC_INITIAL: Pick<AdvancedSectionBody, 'config_sync_bucket'> = {
-    config_sync_bucket: undefined,
-  };
   const subset = useAdvancedSubset(SYNC_INITIAL, onSessionExpired);
   const { value, setValue, isDirty, discard, loading, error } = subset;
   if (error) return <Alert type="error" showIcon message="Failed to load" description={error} />;

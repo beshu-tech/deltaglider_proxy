@@ -838,14 +838,25 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
           plus a handful of shell-level quick actions (Export YAML,
           Import YAML, Setup wizard, Back to Browser). Mounts here so
           the extra actions can close over the same setters already
-          wired into the header buttons (no prop drilling). */}
-      <CommandPalette
-        open={paletteOpen}
-        onClose={() => setPaletteOpen(false)}
-        onNavigateAdmin={navigateAdmin}
-        extraActions={paletteExtraActions}
-      />
-      <ShortcutsHelp open={helpOpen} onClose={() => setHelpOpen(false)} />
+          wired into the header buttons (no prop drilling).
+
+          Gated on `paletteOpen` so the ~20-line `useMemo` chain
+          inside (navCommands/actionCommands/allCommands/rows/items)
+          doesn't re-evaluate on every AdminPage render while the
+          palette is closed. Tradeoff: we skip the AntD close-fade
+          animation — on Esc the modal snaps shut. Acceptable,
+          imperceptible in practice. */}
+      {paletteOpen && (
+        <CommandPalette
+          open={paletteOpen}
+          onClose={() => setPaletteOpen(false)}
+          onNavigateAdmin={navigateAdmin}
+          extraActions={paletteExtraActions}
+        />
+      )}
+      {helpOpen && (
+        <ShortcutsHelp open={helpOpen} onClose={() => setHelpOpen(false)} />
+      )}
 
       {/* Body: sidebar + content (§3.1 four-group IA) */}
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>

@@ -222,9 +222,31 @@ interface Props {
 export default function AdminSidebar({ activePath, onNavigate }: Props) {
   const { BG_CARD, BORDER, ACCENT_BLUE, TEXT_SECONDARY, TEXT_MUTED } = useColors();
   // Re-render whenever the dirty set changes (§5.2 amber dots).
-  const [dirty, setDirty] = useState<Set<SectionName>>(getDirtySections());
+  //
+  // Structural dedupe: `getDirtySections()` returns a brand-new Set
+  // every call, so a naive `setDirty(getDirtySections())` would
+  // trigger a sidebar re-render on EVERY panel mount/unmount —
+  // even when the membership hasn't changed. This matters because
+  // the sidebar renders ~17 entries with icons + amber dots; a
+  // re-render of it during navigation is visible in React
+  // Profiler and scales poorly as the IA grows.
+  //
+  // We compare the sorted-section-list by value and only call
+  // setDirty when it actually differs. A Set-of-≤4 elements
+  // serialises cheaply.
+  const [dirty, setDirty] = useState<Set<SectionName>>(getDirtySections);
   useEffect(() => {
-    const unsub = subscribeToDirtyState(() => setDirty(getDirtySections()));
+    const serialise = (s: Set<SectionName>) =>
+      Array.from(s).sort().join('|');
+    let last = serialise(getDirtySections());
+    const unsub = subscribeToDirtyState(() => {
+      const next = getDirtySections();
+      const key = serialise(next);
+      if (key !== last) {
+        last = key;
+        setDirty(next);
+      }
+    });
     return unsub;
   }, []);
 
