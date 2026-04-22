@@ -846,63 +846,142 @@ export function ConfigDbSyncPanel({ onSessionExpired }: PanelProps) {
         confirmApply={subset.confirmApply}
       />
       <div style={cardStyle}>
-        <SectionHeader
-          icon={<SyncOutlined />}
-          title="Config DB sync"
-          description="Replicate the encrypted IAM database to an S3 bucket so multiple proxy instances share users, groups, OAuth providers, and mapping rules."
-        />
-        <Alert
-          type="info"
-          showIcon
-          style={{ marginTop: 12 }}
-          message="Multi-instance setups only"
-          description="Single-instance deployments can leave this disabled. The sync uses periodic full replacement — operators running N>1 instances should point all of them at the same bucket."
-        />
-        <div style={{ marginTop: 16 }}>
-          <FormField
-            label={
-              <>
-                Sync bucket
-                <RestartChip reason="The ConfigDbSync background task starts at process boot and is not rebuilt on hot-reload." />
-              </>
-            }
-            yamlPath="advanced.config_sync_bucket"
-            helpText="S3 bucket name (on the default backend). Leave empty to disable sync."
-            examples={['dgp-iam-state', 'prod-dgp-config']}
-            onExampleClick={(v) =>
-              setValue({ ...value, config_sync_bucket: String(v) })
-            }
-          >
-            <Input
-              value={value.config_sync_bucket ?? ''}
-              onChange={(e) =>
-                setValue({
-                  ...value,
-                  config_sync_bucket: e.target.value || undefined,
-                })
-              }
-              placeholder="(disabled)"
-              style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }}
-            />
-          </FormField>
-          {enabled && (
-            <Alert
-              type="success"
-              showIcon
-              style={{ marginTop: 8 }}
-              message={
-                <span style={{ fontSize: 13 }}>
-                  After restart, this instance will sync IAM state with bucket{' '}
-                  <code style={{ fontFamily: 'var(--font-mono)' }}>
-                    {value.config_sync_bucket}
-                  </code>
-                  .
-                </span>
-              }
-            />
-          )}
+        {/* Header + status pill on the same baseline. The pill
+            (Disabled / Active / Pending restart) replaces the old
+            "Multi-instance setups only" info banner — that banner
+            restated the panel description without adding information.
+            Who-this-is-for is covered by the lead sentence; state
+            lives next to the title where the operator's eye lands
+            first. */}
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'flex-start',
+            justifyContent: 'space-between',
+            gap: 16,
+            marginBottom: 16,
+          }}
+        >
+          <SectionHeader
+            icon={<SyncOutlined />}
+            title="Config DB sync"
+            description="For multi-instance deployments. Replicates the encrypted IAM database through an S3 bucket so every proxy instance shares the same users, groups, OAuth providers, and mapping rules."
+          />
+          <SyncStatusPill
+            enabled={enabled}
+            dirty={isDirty}
+            bucket={value.config_sync_bucket}
+          />
         </div>
+
+        <FormField
+          label={
+            <>
+              Sync bucket
+              <RestartChip reason="The ConfigDbSync background task starts at process boot and is not rebuilt on hot-reload." />
+            </>
+          }
+          yamlPath="advanced.config_sync_bucket"
+          helpText="S3 bucket name on the default backend. All instances must point at the same bucket. Sync uses periodic full replacement — the newest ETag wins."
+          examples={['dgp-iam-state', 'prod-dgp-config']}
+          onExampleClick={(v) =>
+            setValue({ ...value, config_sync_bucket: String(v) })
+          }
+        >
+          <Input
+            value={value.config_sync_bucket ?? ''}
+            onChange={(e) =>
+              setValue({
+                ...value,
+                config_sync_bucket: e.target.value || undefined,
+              })
+            }
+            placeholder="Leave empty to disable"
+            style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }}
+          />
+        </FormField>
       </div>
     </PanelShell>
+  );
+}
+
+/**
+ * Inline pill showing what `config_sync_bucket` currently resolves
+ * to from the operator's perspective. Three states in this panel:
+ *
+ *   - Disabled: the field is empty, sync is off.
+ *   - Pending restart: the field has a bucket, but the operator has
+ *     unsaved edits — the running background task hasn't picked up
+ *     the new bucket yet.
+ *   - Active: the field matches the running config.
+ *
+ * The "active after restart vs active now" distinction mirrors the
+ * RestartChip semantics on the field — hot-reload doesn't rebuild
+ * this background task. The pill uses the same colour language as
+ * the rest of the admin UI: teal = good/default, amber = needs
+ * attention, neutral muted = off.
+ */
+function SyncStatusPill({
+  enabled,
+  dirty,
+  bucket,
+}: {
+  enabled: boolean;
+  dirty: boolean;
+  bucket?: string;
+}) {
+  const { ACCENT_BLUE, ACCENT_AMBER, TEXT_MUTED, BORDER } = useColors();
+
+  let dotColor: string;
+  let bg: string;
+  let border: string;
+  let label: string;
+
+  if (dirty && enabled) {
+    dotColor = ACCENT_AMBER;
+    bg = 'rgba(251, 191, 36, 0.08)';
+    border = 'rgba(251, 191, 36, 0.28)';
+    label = 'Pending restart';
+  } else if (enabled) {
+    dotColor = ACCENT_BLUE;
+    bg = 'rgba(45, 212, 191, 0.08)';
+    border = 'rgba(45, 212, 191, 0.28)';
+    label = `Active · ${bucket}`;
+  } else {
+    dotColor = TEXT_MUTED;
+    bg = 'transparent';
+    border = BORDER;
+    label = 'Disabled';
+  }
+
+  return (
+    <span
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 8,
+        padding: '6px 12px',
+        background: bg,
+        border: `1px solid ${border}`,
+        borderRadius: 999,
+        fontSize: 12,
+        fontFamily: 'var(--font-ui)',
+        whiteSpace: 'nowrap',
+        flexShrink: 0,
+        marginTop: 4,
+      }}
+    >
+      <span
+        aria-hidden
+        style={{
+          width: 8,
+          height: 8,
+          borderRadius: '50%',
+          background: dotColor,
+          boxShadow: enabled && !dirty ? `0 0 6px ${dotColor}80` : 'none',
+        }}
+      />
+      {label}
+    </span>
   );
 }
