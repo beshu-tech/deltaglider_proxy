@@ -226,7 +226,7 @@ fn engine_affecting_fields_changed(
 /// `state.config.read()` sees the *old* config with the *new* engine
 /// serving requests. Any refactor that moves the await points must
 /// preserve "both happen under one write lock" as the atomicity barrier.
-pub(super) async fn apply_config_transition(
+pub(crate) async fn apply_config_transition(
     state: &Arc<AdminState>,
     old_cfg: &crate::config::Config,
     new_cfg: &crate::config::Config,
@@ -374,7 +374,7 @@ pub(super) fn requires_restart_warnings(
 /// 2. `DEFAULT_YAML_CONFIG_FILENAME` in CWD when the server was started
 ///    without any config file at all. New deployments persist as YAML by
 ///    default.
-pub(super) fn active_config_path(state: &AdminState) -> String {
+pub(crate) fn active_config_path(state: &AdminState) -> String {
     state
         .config_file_path
         .clone()

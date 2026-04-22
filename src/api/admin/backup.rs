@@ -262,12 +262,21 @@ async fn export_zip(
     // a concurrent apply can't tear the YAML + secrets harvest apart.
     let cfg = state.config.read().await;
 
-    // ── canonical YAML (same as GET /config/export?format=yaml) ───
-    //    NOTE: the redactor inside `to_canonical_yaml` also clears
-    //    storage backend secrets + access_key_id/secret_access_key,
-    //    which is intentional. We harvest the real values into
-    //    `secrets.json` next, so a zip-import can restore them.
-    let yaml = cfg.to_canonical_yaml().map_err(|e| {
+    // ── canonical YAML — FULLY redacted (X-ray HIGH #1 fix) ────────
+    //    `to_canonical_yaml()` by itself only strips infra secrets
+    //    (bootstrap hash + encryption key), NOT the SigV4/S3 creds —
+    //    so the zip's config.yaml used to leak plaintext S3 access
+    //    keys AND the legacy SigV4 bootstrap pair. The doc at the
+    //    top of this module and the manifest UI both promise
+    //    "config.yaml redacted" and "secrets.json is the keystore";
+    //    we have to honour that so operators who git-commit the
+    //    config.yaml entry (standard practice) don't silently leak
+    //    credentials through a public repo.
+    //
+    //    The real secret values go into `secrets.json` below, so
+    //    a zip-import can still round-trip functionality.
+    let redacted = cfg.redact_all_secrets();
+    let yaml = redacted.to_canonical_yaml().map_err(|e| {
         tracing::error!("Full-backup: YAML serialise failed: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
@@ -437,16 +446,29 @@ pub async fn import_backup(
     import_backup_iam(state, headers, backup).await
 }
 
+/// Per-entry cap for zip unpack. 8 MiB is generous for the three
+/// config artefacts we ship (YAML + two JSONs); anything larger
+/// almost certainly means a malicious or corrupted archive.
+/// See x-ray MED #1 — unbounded `Vec::with_capacity(f.size())`
+/// was an easy OOM vector for a single crafted entry.
+const MAX_ENTRY_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Unpack a Full Backup zip and apply all four parts atomically.
-/// Order: apply config.yaml first (so storage/buckets/admission are
-/// in place), then IAM, then secrets (which overlays creds the YAML
-/// left redacted as `null`).
+///
+/// Two-phase flow (x-ray MED #3: validate first, side-effect second):
+///   Phase A — unpack + parse every part + verify manifest sha256.
+///             No state change. Any failure returns before we've
+///             touched the DB or config.
+///   Phase B — apply in order: config.yaml (via apply_config_doc),
+///             then secrets.json (storage creds + bootstrap hash),
+///             then iam.json. Secrets land before IAM so the
+///             post-IAM S3-sync push uses the restored storage creds.
 async fn import_zip_full_backup(
     state: Arc<AdminState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<ImportResult>, StatusCode> {
-    // ── Unpack the zip into memory ─────────────────────────────
+    // ── Phase A.1: unpack, bounded per-entry ───────────────────
     let reader = Cursor::new(body.as_ref());
     let mut archive = zip::ZipArchive::new(reader).map_err(|e| {
         tracing::warn!("Full-backup import: not a valid zip: {}", e);
@@ -459,31 +481,141 @@ async fn import_zip_full_backup(
             StatusCode::BAD_REQUEST
         })?;
         let name = f.name().to_string();
-        let mut buf = Vec::with_capacity(f.size() as usize);
-        std::io::Read::read_to_end(&mut f, &mut buf).map_err(|e| {
+        // `size()` is the header-declared uncompressed length; we
+        // clamp capacity to MAX_ENTRY_BYTES to foil a zip that lies
+        // about size to force a huge upfront allocation.
+        let declared = f.size();
+        if declared > MAX_ENTRY_BYTES {
+            tracing::warn!(
+                "Full-backup import: entry {} declares {} bytes > cap {}",
+                name,
+                declared,
+                MAX_ENTRY_BYTES
+            );
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let cap = std::cmp::min(declared, MAX_ENTRY_BYTES) as usize;
+        let mut buf = Vec::with_capacity(cap);
+        // Wrap the decompressing reader in `take` so a zip that
+        // underdeclares `size` (decompression bomb) is cut off at
+        // the cap instead of filling memory unbounded.
+        let mut bounded = std::io::Read::take(&mut f, MAX_ENTRY_BYTES + 1);
+        std::io::Read::read_to_end(&mut bounded, &mut buf).map_err(|e| {
             tracing::warn!("Full-backup import: read {} failed: {}", name, e);
             StatusCode::BAD_REQUEST
         })?;
+        if buf.len() as u64 > MAX_ENTRY_BYTES {
+            tracing::warn!(
+                "Full-backup import: entry {} exceeded cap {} during decompression",
+                name,
+                MAX_ENTRY_BYTES
+            );
+            return Err(StatusCode::BAD_REQUEST);
+        }
         files.insert(name, buf);
     }
 
-    // ── Manifest version check ─────────────────────────────────
-    if let Some(m_bytes) = files.get("manifest.json") {
-        let manifest: serde_json::Value = serde_json::from_slice(m_bytes).map_err(|e| {
-            tracing::warn!("Full-backup import: manifest.json malformed: {}", e);
-            StatusCode::BAD_REQUEST
-        })?;
-        let ver = manifest
-            .get("version")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        if ver != 1 {
-            tracing::warn!("Full-backup import: unsupported manifest version {}", ver);
-            return Err(StatusCode::BAD_REQUEST);
+    // ── Phase A.2: manifest is required (LOW #1) ───────────────
+    let m_bytes = files.get("manifest.json").ok_or_else(|| {
+        tracing::warn!("Full-backup import: manifest.json missing (required)");
+        StatusCode::BAD_REQUEST
+    })?;
+    let manifest: serde_json::Value = serde_json::from_slice(m_bytes).map_err(|e| {
+        tracing::warn!("Full-backup import: manifest.json malformed: {}", e);
+        StatusCode::BAD_REQUEST
+    })?;
+    let ver = manifest
+        .get("version")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if ver != 1 {
+        tracing::warn!("Full-backup import: unsupported manifest version {}", ver);
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // ── Phase A.3: verify manifest sha256 entries (LOW #2) ─────
+    //    For each entry the manifest claims, recompute sha256 on
+    //    the unpacked bytes and refuse mismatches. Missing files
+    //    listed in the manifest are a corruption signal — fail.
+    //    Files present in the zip but not listed in the manifest
+    //    are ignored (forward-compat: older servers shouldn't
+    //    choke on newer zips adding non-sensitive metadata).
+    use sha2::{Digest, Sha256};
+    let sha_hex = |b: &[u8]| {
+        let mut h = Sha256::new();
+        h.update(b);
+        hex::encode(h.finalize())
+    };
+    if let Some(entries) = manifest.get("files").and_then(|v| v.as_array()) {
+        for entry in entries {
+            let name = entry.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
+                tracing::warn!("Full-backup import: manifest entry missing name");
+                StatusCode::BAD_REQUEST
+            })?;
+            let expected_sha = entry
+                .get("sha256")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    tracing::warn!("Full-backup import: manifest entry {} missing sha256", name);
+                    StatusCode::BAD_REQUEST
+                })?;
+            let bytes = files.get(name).ok_or_else(|| {
+                tracing::warn!(
+                    "Full-backup import: manifest lists {} but zip has no such entry",
+                    name
+                );
+                StatusCode::BAD_REQUEST
+            })?;
+            let actual_sha = sha_hex(bytes);
+            if actual_sha != expected_sha {
+                tracing::warn!(
+                    "Full-backup import: sha256 mismatch on {} (expected {}, got {})",
+                    name,
+                    expected_sha,
+                    actual_sha
+                );
+                return Err(StatusCode::BAD_REQUEST);
+            }
         }
     }
 
-    // ── 1. Apply config.yaml via the existing document-apply
+    // ── Phase A.4: pre-parse every part (MED #3) ───────────────
+    //    Build owned typed values for everything that might be
+    //    applied, so Phase B only hits side-effect paths once the
+    //    archive is fully understood. A malformed iam.json used to
+    //    surface AFTER config + secrets had been applied, leaving
+    //    the server in a partially-restored state.
+    let yaml_str: Option<String> = if let Some(yaml_bytes) = files.get("config.yaml") {
+        let s = std::str::from_utf8(yaml_bytes)
+            .map_err(|_| {
+                tracing::warn!("Full-backup import: config.yaml is not UTF-8");
+                StatusCode::BAD_REQUEST
+            })?
+            .to_string();
+        // Actual YAML shape is validated by apply_config_doc itself
+        // (validate → apply → persist). Empty-string means "no-op".
+        Some(s)
+    } else {
+        None
+    };
+    let secrets: Option<BackupSecrets> = if let Some(sec_bytes) = files.get("secrets.json") {
+        Some(serde_json::from_slice(sec_bytes).map_err(|e| {
+            tracing::warn!("Full-backup import: secrets.json malformed: {}", e);
+            StatusCode::BAD_REQUEST
+        })?)
+    } else {
+        None
+    };
+    let iam_backup: Option<IamBackup> = if let Some(iam_bytes) = files.get("iam.json") {
+        Some(serde_json::from_slice(iam_bytes).map_err(|e| {
+            tracing::warn!("Full-backup import: iam.json malformed: {}", e);
+            StatusCode::BAD_REQUEST
+        })?)
+    } else {
+        None
+    };
+
+    // ── Phase B.1: apply config.yaml via the existing document-apply
     //       endpoint (same path /_/api/admin/config/apply uses).
     //       For simplicity we POST to our own endpoint rather than
     //       refactoring the helper out of its handler — that lets
@@ -491,18 +623,12 @@ async fn import_zip_full_backup(
     //       persist pipeline a human would trigger via the GUI.
     //       TODO(v0.9): extract a pub(crate) helper so this can be
     //       called directly without the HTTP round-trip. ──
-    if let Some(yaml_bytes) = files.get("config.yaml") {
-        let yaml_str = std::str::from_utf8(yaml_bytes).map_err(|_| {
-            tracing::warn!("Full-backup import: config.yaml is not UTF-8");
-            StatusCode::BAD_REQUEST
-        })?;
+    if let Some(yaml_str) = yaml_str {
         // Skip application if the YAML is empty/whitespace-only.
         // Exporters always emit at least `storage:` so this only
         // fires on deliberate-empty zips.
         if !yaml_str.trim().is_empty() {
-            let req = crate::api::admin::ConfigDocumentRequest {
-                yaml: yaml_str.to_string(),
-            };
+            let req = crate::api::admin::ConfigDocumentRequest { yaml: yaml_str };
             let State(state_for_apply) = State(state.clone());
             let resp = crate::api::admin::apply_config_doc(
                 State(state_for_apply),
@@ -519,26 +645,18 @@ async fn import_zip_full_backup(
         }
     }
 
-    // ── 2. Apply secrets.json BEFORE iam import. Storage creds
-    //       need to be in place before a subsequent import of a
-    //       v0.8.3+ iam.json fires an S3 sync push. Bootstrap
+    // ── Phase B.2: apply secrets.json BEFORE iam import. Storage
+    //       creds need to be in place before a subsequent import of
+    //       a v0.8.3+ iam.json fires an S3 sync push. Bootstrap
     //       hash must land before any admin session is re-issued. ──
-    if let Some(sec_bytes) = files.get("secrets.json") {
-        let secrets: BackupSecrets = serde_json::from_slice(sec_bytes).map_err(|e| {
-            tracing::warn!("Full-backup import: secrets.json malformed: {}", e);
-            StatusCode::BAD_REQUEST
-        })?;
-        apply_secrets(&state, &secrets).await.inspect_err(|&e| {
+    if let Some(secrets) = secrets.as_ref() {
+        apply_secrets(&state, secrets).await.inspect_err(|&e| {
             tracing::error!("Full-backup import: apply secrets.json failed: {}", e);
         })?;
     }
 
-    // ── 3. Apply iam.json (same flow as legacy JSON import) ────
-    let iam_result = if let Some(iam_bytes) = files.get("iam.json") {
-        let backup: IamBackup = serde_json::from_slice(iam_bytes).map_err(|e| {
-            tracing::warn!("Full-backup import: iam.json malformed: {}", e);
-            StatusCode::BAD_REQUEST
-        })?;
+    // ── Phase B.3: apply iam.json (same flow as legacy JSON import) ──
+    let iam_result = if let Some(backup) = iam_backup {
         import_backup_iam(state.clone(), headers.clone(), backup).await?
     } else {
         // Zip with no iam.json is valid — maybe operator only
@@ -560,17 +678,48 @@ async fn import_zip_full_backup(
 }
 
 /// Apply the plaintext secrets harvested in `secrets.json` onto the
-/// running Config by direct RwLock-guarded mutation. We intentionally
-/// SKIP `apply_config_transition` here because none of the fields
-/// secrets.json touches are "engine-affecting" (they're pure
-/// credential slots that the engine/IAM pick up on the next
-/// operation). OAuth client_secrets go straight to the config_db.
+/// running Config.
 ///
-/// The caller must already have applied `config.yaml` via the
-/// canonical config-apply path so this runs against the final
-/// post-merge config shape.
+/// X-ray fixes (HIGH #2, HIGH #3, MED #2):
+///
+/// * **bootstrap_password_hash**: refused when the running instance
+///   already has a *different* hash — a hash alone cannot rekey the
+///   SQLCipher DB (that needs the plaintext password via
+///   `/api/admin/change-password`). Initial seeding (no existing hash,
+///   or identical hash) is permitted.
+/// * **Engine rebuild**: after mutating storage creds under the write
+///   lock, call `apply_config_transition` so the S3 client picks up
+///   the new credentials on the next request. Without this, the
+///   running engine would keep using the old (possibly-wrong) creds
+///   until the next restart.
+/// * **Persist to disk**: write the merged config back to the active
+///   config file so the change survives a restart.
 async fn apply_secrets(state: &Arc<AdminState>, secrets: &BackupSecrets) -> Result<(), StatusCode> {
-    {
+    // Snapshot pre-mutation config for apply_config_transition.
+    let old_cfg = state.config.read().await.clone();
+
+    // Guardrail: refuse hash rotation on a running instance. The only
+    // supported path to change the bootstrap password is
+    // /api/admin/change-password which rekeys SQLCipher with the
+    // plaintext. Initial seeding (hash match, or no existing hash)
+    // is fine — that covers first-restore into a fresh instance.
+    if let Some(new_hash) = &secrets.bootstrap_password_hash {
+        if let Some(existing) = &old_cfg.bootstrap_password_hash {
+            if existing != new_hash {
+                tracing::error!(
+                    "Full-backup import: secrets.json carries a bootstrap_password_hash \
+                     that differs from the running instance. Rotating it here would \
+                     desync the SQLCipher DB key. Use /api/admin/change-password \
+                     with the plaintext password instead."
+                );
+                return Err(StatusCode::CONFLICT);
+            }
+        }
+    }
+
+    // Mutate Config fields under the write lock. Snapshot the post-
+    // mutation Config for apply_config_transition after releasing.
+    let new_cfg = {
         let mut cfg = state.config.write().await;
         if let Some(h) = &secrets.bootstrap_password_hash {
             cfg.bootstrap_password_hash = Some(h.clone());
@@ -598,7 +747,32 @@ async fn apply_secrets(state: &Arc<AdminState>, secrets: &BackupSecrets) -> Resu
                 }
             }
         }
-    } // release write lock before touching config_db
+        cfg.clone()
+    }; // release write lock before touching config_db
+
+    // Rebuild the S3 engine so the new storage creds take effect
+    // immediately. A mismatch between Config and the running engine
+    // would cause every subsequent S3 op to use stale credentials
+    // until restart.
+    if let Err(e) =
+        crate::api::admin::config::apply_config_transition(state, &old_cfg, &new_cfg).await
+    {
+        tracing::error!("Full-backup import: apply_config_transition failed: {}", e);
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // Persist the merged config so storage/access creds survive a
+    // restart. Without this, the operator would see the restore "work"
+    // until the next process restart, then silently revert.
+    let path = crate::api::admin::config::active_config_path(state);
+    if let Err(e) = new_cfg.persist_to_file(&path) {
+        tracing::error!(
+            "Full-backup import: persist merged config to {} failed: {}",
+            path,
+            e
+        );
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     // OAuth client_secret per provider, by name (robust to id
     // reshuffles across restores). Requires the provider row to

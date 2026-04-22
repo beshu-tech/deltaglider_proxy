@@ -40,7 +40,7 @@
  * AdminPage.tsx maps them to the new sub-paths. Bookmarked old URLs
  * keep working.
  */
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   DashboardOutlined,
   ExperimentOutlined,
@@ -235,19 +235,25 @@ export default function AdminSidebar({ activePath, onNavigate }: Props) {
   // setDirty when it actually differs. A Set-of-≤4 elements
   // serialises cheaply.
   const [dirty, setDirty] = useState<Set<SectionName>>(getDirtySections);
+  // Seed `last` from the SAME value `useState` captured (via `dirty`)
+  // rather than a fresh post-mount read of `getDirtySections()`. If
+  // the dirty set mutates between mount-time `useState` and post-
+  // commit `useEffect`, those two snapshots diverge and we'd either
+  // emit a spurious re-render or silently miss the first legitimate
+  // update. (X-ray LOW #3.)
+  const serialise = (s: Set<SectionName>) => Array.from(s).sort().join('|');
+  const lastKeyRef = useRef<string>(serialise(dirty));
   useEffect(() => {
-    const serialise = (s: Set<SectionName>) =>
-      Array.from(s).sort().join('|');
-    let last = serialise(getDirtySections());
     const unsub = subscribeToDirtyState(() => {
       const next = getDirtySections();
       const key = serialise(next);
-      if (key !== last) {
-        last = key;
+      if (key !== lastKeyRef.current) {
+        lastKeyRef.current = key;
         setDirty(next);
       }
     });
     return unsub;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const renderEntry = (entry: SidebarEntry, depth: number) => {
