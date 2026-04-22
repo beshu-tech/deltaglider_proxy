@@ -177,6 +177,25 @@ pub async fn authorization_middleware(
             "IAM denied: user='{}' action={:?} bucket='{}' key='{}'",
             user.name, action, bucket, key
         );
+        // Audit-log every IAM denial.
+        //
+        // Previously this was `debug!`-only, which made runtime
+        // debugging of 403s a black box — operators had to flip the
+        // tracing filter to debug and replay the request. With the
+        // in-memory audit ring (Wave 11), denials now show up
+        // immediately in `/_/admin/diagnostics/audit` with the
+        // exact resolved (action, bucket, key) the check evaluated.
+        //
+        // `target` carries the S3 action + bucket/key so the admin
+        // GUI's filter box can find specific denials fast.
+        crate::audit::audit_log(
+            "access_denied",
+            &user.name,
+            &format!("{:?}", action),
+            request.headers(),
+            bucket,
+            key,
+        );
         // Drain up to 64KB of the request body before returning 403 so the client
         // receives a clean error response instead of "connection reset". Without this,
         // axum drops the unread body and closes the connection mid-upload, breaking
