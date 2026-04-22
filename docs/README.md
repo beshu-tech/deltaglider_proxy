@@ -1,51 +1,33 @@
-# Overview
+# DeltaGlider Proxy docs
 
-*Unified S3 gateway with multi-backend routing, delegated authentication, fine-grained access control, transparent delta compression, and a built-in management GUI.*
+This tree splits into two audiences, enforced by CI so it can't drift:
 
-DeltaGlider Proxy sits between your S3 clients and one or more storage backends — AWS S3, Hetzner, Backblaze, MinIO, or local filesystem. Clients see a single, standard S3 endpoint. The proxy handles authentication (SigV4, OAuth/OIDC, or public access), routes each bucket to the right backend, and silently delta-compresses versioned binaries to cut storage 60-95%.
+- **[product/](product/)** — operator-facing, bundled into the running binary at `/_/docs/`. Install, configure, secure, run, debug. If you operate an instance, this is what you read.
+- **[dev/](dev/)** — contributor-facing, **never** bundled. Build from source, release workflow, CI infrastructure, historical design docs.
 
-![Object Browser](/_/screenshots/filebrowser.jpg)
-*S3 file browser with bucket navigation, preview, bulk operations, and compression indicators*
+`screenshots/` is shared — the same images ship in the binary (via `demo/s3-browser/ui/public/screenshots/`) and render on GitHub.
 
-## Key Features
+## Product docs index
 
-- **Multi-backend routing** — aggregate AWS S3, Hetzner, Backblaze, MinIO, and filesystem behind one endpoint. Route each bucket to a different backend with optional aliasing.
-- **Delegated authentication** — OAuth/OIDC single sign-on (Google, Okta, Azure AD), SigV4 per-user IAM, or public prefix access. Group mapping rules auto-assign permissions from identity provider claims.
-- **Fine-grained access control** — ABAC permission rules with Allow/Deny, action verbs, resource patterns, and conditions (IP ranges, prefix restrictions). IAM groups for shared policies.
-- **Public prefixes** — publish specific folders for anonymous download without exposing the rest of the bucket.
-- **Transparent delta compression** — versioned binaries stored as xdelta3 diffs, reconstructed on GET. SHA-256 verified, byte-identical.
-- **Built-in admin GUI** — file browser, user/group management, OAuth config, backend routing, monitoring dashboard, storage analytics, embedded docs.
-- **Single binary, single port** — S3 API on `/`, admin GUI and APIs under `/_/`. No extra containers.
+See [product/README.md](product/README.md) — that file is also the landing page inside the running binary. Grouped by operator journey:
 
-![IAM user management](/_/screenshots/iam.jpg)
-*IAM user management with ABAC permissions, groups, and key rotation*
+1. **Start here** — quickstart, setting up a bucket
+2. **Deploy to production** — deployment, security checklist, upgrade guide
+3. **Authentication & access** — OAuth, SigV4, IAM, rate limiting
+4. **Day 2 operations** — monitoring, troubleshooting, FAQ
+5. **Reference** — config fields, admin API, metrics, internals
 
-![Storage analytics](/_/screenshots/analytics.jpg)
-*Per-bucket savings breakdown with cost estimation*
+## Dev docs
 
-## Documentation
+- [contributing.md](dev/contributing.md) — build, test, project structure
+- [releasing.md](dev/releasing.md) — release process, git tagging, Docker pipeline
+- [ci-infra.md](dev/ci-infra.md) — k3s runner setup, actions-runner-controller
+- [historical/](dev/historical/) — design docs that shaped the current implementation; kept for archaeology, not maintained
 
-### Getting Started
+## CI enforcement
 
-- [Operations](OPERATIONS.md) — running, configuring, deploying, admin GUI features, admin API endpoint catalog
-- [Configuration Reference](CONFIGURATION.md) — all settings (canonical YAML + env vars + TOML equivalents), backend routing, bucket policies, admission chain
-- [Migrate TOML → YAML](HOWTO_MIGRATE_TO_YAML.md) — canonical format since v0.8.0
+Three blocking checks in [.github/workflows/ci.yml](../.github/workflows/ci.yml) keep this tree honest:
 
-### Authentication & Access Control
-
-- [Authentication](AUTHENTICATION.md) — SigV4, OAuth/OIDC, public prefixes, bootstrap vs IAM mode
-- [Security Basics](HOWTO_SECURITY_BASICS.md) — step-by-step hardening from open access to production
-- [IAM Conditions](HOWTO_IAM_CONDITIONS.md) — IP restrictions, prefix scoping, group policies
-- [Rate Limiting](RATE_LIMITING.md) — throttling, progressive delay, lockout
-
-### Internals
-
-- [Delta Reconstruction](DELTA_RECONSTRUCTION.md) — how GET reconstructs files from reference + delta
-- [Storage Format](STORAGE_FORMAT.md) — on-disk layout, metadata schema, config database
-- [Metrics](METRICS.md) — Prometheus metrics reference and Grafana setup
-
-### Developer
-
-- [Contributing](CONTRIBUTING.md) — build, test, project structure
-- [Releasing](RELEASING.md) — release process, tagging, Docker builds
-- [CI Infrastructure](CI_INFRA.md) — build pipeline and runners
+1. **`scripts/check-docs-registry.sh`** — every `.md` under `docs/product/` must be imported in [demo/s3-browser/ui/src/docs-imports.ts](../demo/s3-browser/ui/src/docs-imports.ts). Anything under `docs/dev/` that sneaks into the registry fails CI.
+2. **`scripts/check-docs-yaml-examples.sh`** — every fenced `yaml` block marked `# validate` must pass `deltaglider_proxy config lint`. Prevents example drift.
+3. **lychee** — every inter-doc link resolves; no broken references.

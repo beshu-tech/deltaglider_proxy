@@ -40,7 +40,7 @@ access:
 
 Mode transitions are audit-logged at `warn` level on the `deltaglider_proxy::config` target.
 
-> **Caveat**: the reconciler that sync-diffs the DB to the YAML on every apply is still **Phase 3c.3 (pending)**. Declarative mode today is a pure lockout — YAML `access.users` arrays are not yet consumed. Seed IAM via a one-time `iam_mode: gui` admin session, then flip. See [HOWTO_MIGRATE_TO_YAML.md](HOWTO_MIGRATE_TO_YAML.md#the-new-role-of-the-s3-synced-iam-database).
+> **Caveat**: the reconciler that sync-diffs the DB to the YAML on every apply is still **Phase 3c.3 (pending)**. Declarative mode today is a pure lockout — YAML `access.users` arrays are not yet consumed. Seed IAM via a one-time `iam_mode: gui` admin session, then flip. See [the upgrade guide](../21-upgrade-guide.md#the-s3-synced-iam-database).
 
 ### OAuth/OIDC Mode
 
@@ -90,7 +90,7 @@ admission:
         message: "We'll be right back."
 ```
 
-See [CONFIGURATION.md](CONFIGURATION.md#admission-chain) for the full operator wire format.
+See [configuration.md](configuration.md#admission-chain) for the full operator wire format.
 
 ### Open Access (development only)
 
@@ -165,7 +165,7 @@ AWS IAM-style condition blocks:
 - `aws:SourceIp` — restrict by client IP (CIDR notation)
 - `s3:prefix` — restrict LIST operations to specific prefixes
 
-See [IAM Conditions](HOWTO_IAM_CONDITIONS.md) for full reference.
+See [IAM conditions](../auth/32-iam-conditions.md) for full reference.
 
 A user is considered an **admin** when they have both wildcard actions (`*`) AND wildcard resources (`*`).
 

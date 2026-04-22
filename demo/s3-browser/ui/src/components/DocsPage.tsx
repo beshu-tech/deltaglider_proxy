@@ -181,7 +181,8 @@ export default function DocsPage({ docId, onBack }: Props) {
     return false;
   }, [setSelectedId]);
 
-  // Group docs by category
+  // Group docs by category, sort within each group by the `order`
+  // field (stable across title edits).
   const grouped = useMemo(() => {
     const map = new Map<string, DocEntry[]>();
     for (const g of DOC_GROUPS) map.set(g, []);
@@ -189,6 +190,7 @@ export default function DocsPage({ docId, onBack }: Props) {
       const list = map.get(d.group);
       if (list) list.push(d);
     }
+    for (const [, docs] of map) docs.sort((a, b) => a.order - b.order);
     return map;
   }, []);
 

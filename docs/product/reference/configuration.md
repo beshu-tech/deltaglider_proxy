@@ -8,7 +8,7 @@ As of v0.8.0, YAML is the canonical format. TOML still loads (emits a deprecatio
 deltaglider_proxy config migrate deltaglider_proxy.toml --out deltaglider_proxy.yaml
 ```
 
-See [HOWTO_MIGRATE_TO_YAML.md](HOWTO_MIGRATE_TO_YAML.md) for the full migration path.
+See the [upgrade guide](../21-upgrade-guide.md) for the full TOML → YAML migration path.
 
 ## Table of Contents
 
@@ -449,7 +449,7 @@ access:
 
 Mode transitions are audit-logged at `warn` level on the `deltaglider_proxy::config` target.
 
-> **Caveat**: The reconciler that sync-diffs the IAM DB to the YAML on every apply is **Phase 3c.3 (pending)**. Today, declarative mode is a pure lockout — YAML `access.users` arrays are **not yet consumed**. Operators adopting declarative should seed the DB via a one-time `iam_mode: gui` session (admin GUI or admin API), then flip the switch. See [HOWTO_MIGRATE_TO_YAML.md](HOWTO_MIGRATE_TO_YAML.md#the-new-role-of-the-s3-synced-iam-database).
+> **Caveat**: The reconciler that sync-diffs the IAM DB to the YAML on every apply is **Phase 3c.3 (pending)**. Today, declarative mode is a pure lockout — YAML `access.users` arrays are **not yet consumed**. Operators adopting declarative should seed the DB via a one-time `iam_mode: gui` session (admin GUI or admin API), then flip the switch. See [the upgrade guide](../21-upgrade-guide.md#the-s3-synced-iam-database).
 
 OAuth providers and mapping rules are configured via the admin GUI (stored in the encrypted DB) — the YAML `access:` section is **not** a place to declare them today.
 
@@ -565,7 +565,7 @@ Require HTTPS for admin session cookies (`Secure` flag).
 
 ### Rate Limiting
 
-Per-IP brute-force protection for auth endpoints. See [RATE_LIMITING.md](RATE_LIMITING.md) for the full model.
+Per-IP brute-force protection for auth endpoints. See [rate limiting](../auth/33-rate-limiting.md) for the full model.
 
 | Setting | Env var | Default |
 |---------|---------|---------|

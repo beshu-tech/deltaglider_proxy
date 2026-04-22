@@ -6,7 +6,7 @@ A step-by-step guide to using IAM policy conditions for fine-grained access cont
 
 ## Prerequisites
 
-- DeltaGlider Proxy with authentication enabled (see [Security Basics](HOWTO_SECURITY_BASICS.md))
+- DeltaGlider Proxy with authentication enabled (see [Security checklist](../20-production-security-checklist.md))
 - At least one IAM user created via the admin GUI
 - Basic understanding of AWS IAM concepts (Allow/Deny, actions, resources)
 

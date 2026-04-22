@@ -183,11 +183,11 @@ deltaglider_proxy config lint deltaglider_proxy.yaml
 deltaglider_proxy config migrate deltaglider_proxy.toml --out deltaglider_proxy.yaml
 ```
 
-Silence the warning mid-migration with `DGP_SILENCE_TOML_DEPRECATION=1`. See [HOWTO_MIGRATE_TO_YAML.md](docs/HOWTO_MIGRATE_TO_YAML.md).
+Silence the warning mid-migration with `DGP_SILENCE_TOML_DEPRECATION=1`. See the [upgrade guide](docs/product/21-upgrade-guide.md).
 
 **Examples**: [deltaglider_proxy.example.yaml](deltaglider_proxy.example.yaml) (canonical). The legacy [deltaglider_proxy.toml.example](deltaglider_proxy.toml.example) is kept for reference only.
 
-**Admin API for GitOps** — full-document apply, per-section PATCH (RFC 7396 merge-patch), JSON Schema export, and an admission-chain trace endpoint. See [OPERATIONS.md](docs/OPERATIONS.md#admin-api-endpoints).
+**Admin API for GitOps** — full-document apply, per-section PATCH (RFC 7396 merge-patch), JSON Schema export, and an admission-chain trace endpoint. See the [admin API reference](docs/product/reference/admin-api.md).
 
 ## S3 Compatibility
 
@@ -228,17 +228,33 @@ docker run -p 9000:9000 beshultd/deltaglider_proxy
 
 ## Documentation
 
-- [Configuration reference](docs/CONFIGURATION.md)
-- [Migrating from TOML to YAML](docs/HOWTO_MIGRATE_TO_YAML.md)
-- [Authentication & IAM](docs/AUTHENTICATION.md)
-- [Delta reconstruction](docs/DELTA_RECONSTRUCTION.md)
-- [Operations guide](docs/OPERATIONS.md)
-- [Storage format internals](docs/STORAGE_FORMAT.md)
-- [Metrics & monitoring](docs/METRICS.md)
-- [Rate limiting](docs/RATE_LIMITING.md)
-- [Security basics](docs/HOWTO_SECURITY_BASICS.md)
-- [IAM conditions](docs/HOWTO_IAM_CONDITIONS.md)
-- [Contributing](docs/CONTRIBUTING.md)
+Operator-facing docs are also bundled into the running binary at `/_/docs/`. Source files:
+
+**Getting started:**
+- [Quickstart](docs/product/01-quickstart.md) — install, first run, first upload.
+- [Setting up a bucket](docs/product/10-first-bucket.md) — backend routing, aliases, public prefixes.
+
+**Production:**
+- [Production deployment](docs/product/20-production-deployment.md) — TLS, cache sizing, backups, multi-instance sync.
+- [Security checklist](docs/product/20-production-security-checklist.md) — SigV4, IAM, rate limiting.
+- [Upgrade guide](docs/product/21-upgrade-guide.md) — upgrade workflow and TOML → YAML migration.
+
+**Authentication:**
+- [OAuth / OIDC setup](docs/product/auth/30-oauth-setup.md)
+- [SigV4 and IAM users](docs/product/auth/31-sigv4-and-iam.md)
+- [IAM conditions](docs/product/auth/32-iam-conditions.md)
+- [Rate limiting](docs/product/auth/33-rate-limiting.md)
+
+**Day 2:**
+- [Monitoring and alerts](docs/product/40-monitoring-and-alerts.md)
+- [Troubleshooting](docs/product/41-troubleshooting.md)
+- [FAQ](docs/product/42-faq.md)
+
+**Reference:**
+- [Configuration](docs/product/reference/configuration.md) · [Admin API](docs/product/reference/admin-api.md) · [Authentication](docs/product/reference/authentication.md) · [Metrics](docs/product/reference/metrics.md) · [How delta works](docs/product/reference/how-delta-works.md)
+
+**Contributor-only** (not in the binary):
+- [Contributing](docs/dev/contributing.md) · [Releasing](docs/dev/releasing.md) · [CI infrastructure](docs/dev/ci-infra.md) · [Historical design docs](docs/dev/historical/)
 
 ## License
 

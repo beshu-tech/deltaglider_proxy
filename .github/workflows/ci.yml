@@ -241,6 +241,48 @@ jobs:
       - name: npm audit
         run: cd demo/s3-browser/ui && npm audit --audit-level=high || true  # warn-only
 
+  docs:
+    name: Docs bundling + link check + YAML examples
+    runs-on: k3s
+    timeout-minutes: 10
+    container:
+      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # ── Blocking: every .md under docs/product/ is registered in
+      #    demo/s3-browser/ui/src/docs-imports.ts, and no dev docs
+      #    (docs/dev/**) sneak into the product bundle. ──
+      - name: Docs registry allow-list
+        run: ./scripts/check-docs-registry.sh
+      # ── Blocking: every `# validate`-tagged fenced YAML block in
+      #    docs/product/**/*.md parses + validates under the real
+      #    schema. Prevents example drift. Needs a built binary. ──
+      - name: Build deltaglider_proxy (for config lint)
+        env:
+          RUSTC_WRAPPER: ""
+        run: cd demo/s3-browser/ui && npm ci && npm run build && cd ../../.. && cargo build --locked --release --bin deltaglider_proxy
+      - name: Validate docs YAML examples
+        env:
+          DELTAGLIDER_PROXY_BIN: ./target/release/deltaglider_proxy
+        run: ./scripts/check-docs-yaml-examples.sh
+      # ── Blocking: inter-doc links resolve. Uses lychee against
+      #    docs/product/**. External-link 429/timeout is warned,
+      #    not failed. ──
+      - name: Link check (lychee)
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: >-
+            --no-progress
+            --accept 200,204,301,302,429
+            --timeout 20
+            --max-retries 2
+            --exclude-mail
+            'docs/product/**/*.md'
+          fail: true
+
   config-schema:
     name: Config JSON Schema
     runs-on: k3s

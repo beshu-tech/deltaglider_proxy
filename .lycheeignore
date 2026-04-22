@@ -1,0 +1,11 @@
+# Hosts we don't want to pester on every CI run (rate limiting, flaky
+# status codes). Each line is a regex matched against the full URL.
+
+# GitHub throttles the link-checker by IP. Pin to public repo URLs
+# and accept that; the release URL is stable.
+^https://github\.com/.*/releases$
+
+# Example/placeholder hosts used in docs — intentionally non-resolving.
+^https?://dgp\.example\.com
+^https?://your-objectstorage\.com
+^https?://s3\.example\.com
