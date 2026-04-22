@@ -55,14 +55,40 @@ fn build_anonymous_user(bucket: &str, public_prefixes: &[String]) -> Authenticat
         iam_policies.push(permission_to_iam_policy(&read_perm));
         permissions.push(read_perm);
 
-        // List permission: scoped via s3:prefix condition
+        // List permission: scoped via s3:prefix condition.
+        //
+        // AWS S3 parity: the CLI form `aws s3 ls s3://b/ror/libs` sends
+        // ListObjectsV2 with `prefix=ror/libs` (no trailing slash) —
+        // the CLI treats the slash as a convenience, not a protocol
+        // requirement. To stay compatible, the StringLike condition
+        // must match BOTH the bare parent prefix (`ror/libs`) and
+        // anything under it (`ror/libs/...`).
+        //
+        // We also need to *not* match a false parent like
+        // `ror/libsomething` — that's covered because StringLike is
+        // anchored glob-matching, not substring. `ror/libs` matches
+        // only the exact string `ror/libs`, and `ror/libs/*` matches
+        // only strings starting with `ror/libs/`.
+        //
+        // When the public prefix ends with `/` (the normal case), we
+        // emit the two-element array. When it doesn't end with `/`
+        // (or is empty for a fully-public bucket), the union collapses
+        // to the single `"{prefix}*"` form the old code used.
+        let s3_prefix_patterns: Vec<String> =
+            if prefix.ends_with('/') && !prefix.is_empty() {
+                // `ror/libs/` → [`ror/libs`, `ror/libs/*`]
+                let bare = prefix.trim_end_matches('/').to_string();
+                vec![bare, format!("{prefix}*")]
+            } else {
+                vec![format!("{prefix}*")]
+            };
         let list_perm = Permission {
             id: 0,
             effect: "Allow".into(),
             actions: vec!["list".into()],
             resources: vec![format!("{}/*", bucket)],
             conditions: Some(serde_json::json!({
-                "StringLike": { "s3:prefix": format!("{}*", prefix) }
+                "StringLike": { "s3:prefix": s3_prefix_patterns }
             })),
         };
         iam_policies.push(permission_to_iam_policy(&list_perm));
@@ -1059,5 +1085,85 @@ mod tests {
         let result2 = hmac_sha256(b"key", b"data");
         assert_eq!(result1, result2);
         assert_eq!(result1.len(), 32);
+    }
+
+    // ── AWS-parity regression tests for anonymous LIST authz ──
+    //
+    // `aws s3 ls s3://bucket/ror/libs` (no trailing slash) sends
+    // ListObjectsV2 with prefix="ror/libs". Before the fix, this
+    // returned AccessDenied because the anonymous user's StringLike
+    // condition was `ror/libs/*`, which doesn't match the bare
+    // `ror/libs` string. After the fix the condition is a 2-element
+    // array — the bare parent + the trailing-slash glob — so both
+    // forms are allowed. A false parent like `ror/libsomething` must
+    // STILL deny; these tests lock that in.
+
+    fn allow_anon_list(public_prefix: &str, requested_prefix: &str) -> bool {
+        use iam_rs::Context;
+        let user = build_anonymous_user("beshu", &[public_prefix.to_string()]);
+        let ctx = Context::new().with_string("s3:prefix", requested_prefix);
+        crate::iam::permissions::evaluate_iam(
+            &user.iam_policies,
+            crate::iam::types::S3Action::List,
+            "beshu",
+            "",
+            &ctx,
+        )
+    }
+
+    #[test]
+    fn anonymous_list_allows_exact_parent_prefix() {
+        // `aws s3 ls s3://beshu/ror/libs` — CLI-convenience form.
+        assert!(
+            allow_anon_list("ror/libs/", "ror/libs"),
+            "expected Allow for prefix=ror/libs against public=ror/libs/"
+        );
+    }
+
+    #[test]
+    fn anonymous_list_allows_trailing_slash_form() {
+        // `aws s3 ls s3://beshu/ror/libs/`
+        assert!(allow_anon_list("ror/libs/", "ror/libs/"));
+    }
+
+    #[test]
+    fn anonymous_list_allows_deeper_prefix() {
+        // `aws s3 ls s3://beshu/ror/libs/org/`
+        assert!(allow_anon_list("ror/libs/", "ror/libs/org/"));
+    }
+
+    #[test]
+    fn anonymous_list_denies_false_parent_sibling() {
+        // `ror/libsomething` must NOT sneak under `ror/libs/`.
+        // StringLike is anchored so `ror/libs` matches only the exact
+        // string and `ror/libs/*` matches only strings starting with
+        // `ror/libs/`. `ror/libsomething` fails both.
+        assert!(
+            !allow_anon_list("ror/libs/", "ror/libsomething"),
+            "false-parent prefix `ror/libsomething` must be denied against public=ror/libs/"
+        );
+    }
+
+    #[test]
+    fn anonymous_list_denies_unrelated_prefix() {
+        assert!(!allow_anon_list("ror/libs/", "secret/"));
+    }
+
+    #[test]
+    fn anonymous_list_honors_non_slash_terminated_public_prefix() {
+        // Operator configured `public_prefixes: ["archive"]` without a
+        // trailing slash. The condition stays `archive*` — the loose-
+        // prefix behaviour the existing code had. Documented tradeoff;
+        // the fix for slash-terminated prefixes doesn't change this.
+        assert!(allow_anon_list("archive", "archive/foo"));
+        assert!(allow_anon_list("archive", "archiver/foo"));
+    }
+
+    #[test]
+    fn anonymous_list_handles_empty_prefix_entire_bucket_public() {
+        // `public: true` expands to `public_prefixes: [""]`. The
+        // StringLike value is `"*"` → matches anything.
+        assert!(allow_anon_list("", "anything/at/all"));
+        assert!(allow_anon_list("", ""));
     }
 }
