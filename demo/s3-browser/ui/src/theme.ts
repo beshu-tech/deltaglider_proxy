@@ -1,6 +1,6 @@
 import { theme } from 'antd';
 
-export const DG_BRAND = {
+const DG_BRAND = {
   colorPrimary: '#2dd4bf',
   fontFamily: "'Outfit', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
 };

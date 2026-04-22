@@ -41,7 +41,7 @@ export const METHODS = [
 const RESERVED_NAME_PREFIX = 'public-prefix:';
 const NAME_PATTERN = /^[A-Za-z0-9_:.-]+$/;
 
-export const admissionMatchSchema = z
+const admissionMatchSchema = z
   .object({
     method: z.array(z.enum(METHODS)).optional(),
     source_ip: z
@@ -83,7 +83,7 @@ export const admissionMatchSchema = z
     }
   );
 
-export const admissionRejectSchema = z.object({
+const admissionRejectSchema = z.object({
   type: z.literal('reject'),
   status: z
     .number()
@@ -98,7 +98,7 @@ export const admissionRejectSchema = z.object({
  * (`allow-anonymous`, `deny`, `continue`) stay strings; reject is
  * the only structured variant.
  */
-export const admissionActionSchema = z.union([
+const admissionActionSchema = z.union([
   z.literal('allow-anonymous'),
   z.literal('deny'),
   z.literal('continue'),

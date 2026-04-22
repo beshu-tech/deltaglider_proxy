@@ -4,7 +4,7 @@
 
 import { adminFetch } from './adminApi';
 
-export interface SessionS3Credentials {
+interface SessionS3Credentials {
   endpoint: string;
   region: string;
   bucket: string;

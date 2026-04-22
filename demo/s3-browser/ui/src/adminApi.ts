@@ -165,7 +165,7 @@ export async function checkSession(): Promise<boolean> {
   }
 }
 
-export interface ConfigUpdateResponse {
+interface ConfigUpdateResponse {
   success: boolean;
   warnings: string[];
   requires_restart: boolean;
@@ -203,7 +203,7 @@ export async function exportConfigYaml(): Promise<string> {
   return res.text();
 }
 
-export interface ConfigValidateResponse {
+interface ConfigValidateResponse {
   ok: boolean;
   warnings: string[];
   error?: string;
@@ -322,45 +322,12 @@ export async function validateSection<T = unknown>(
   return safeJson(res);
 }
 
-/**
- * Fetch the scoped JSON Schema for one section — feeds monaco-yaml
- * when the editor is bound to a single section's YAML.
- */
-export async function getSectionSchema(section: SectionName): Promise<unknown> {
-  const res = await adminFetch(`/api/admin/config/defaults?section=${section}`);
-  if (!res.ok) throw new Error(`Schema fetch failed (${section}): ${res.status}`);
-  return safeJson(res);
-}
-
-/**
- * Fetch the full Config JSON Schema (no scope filter). Used by the
- * whole-document Monaco editor and by any UI that needs to read
- * defaults / descriptions for multiple sections at once.
- */
-export async function getFullConfigSchema(): Promise<unknown> {
-  const res = await adminFetch('/api/admin/config/defaults');
-  if (!res.ok) throw new Error(`Schema fetch failed: ${res.status}`);
-  return safeJson(res);
-}
-
-/**
- * Export one section as canonical YAML (via `/config/export?section=`).
- * Equivalent to `getSectionYaml` but routed through the document-level
- * export — useful when the UI wants to feed a section into the same
- * modal as a full-document export.
- */
-export async function exportSectionYaml(section: SectionName): Promise<string> {
-  const res = await adminFetch(`/api/admin/config/export?section=${section}`);
-  if (!res.ok) throw new Error(`Section export failed (${section}): ${res.status}`);
-  return res.text();
-}
-
-export interface PasswordChangeResponse {
+interface PasswordChangeResponse {
   ok: boolean;
   error?: string;
 }
 
-export interface TestS3Request {
+interface TestS3Request {
   endpoint?: string;
   region?: string;
   force_path_style?: boolean;
@@ -503,13 +470,13 @@ export interface IamGroup {
   created_at: string;
 }
 
-export interface CreateGroupRequest {
+interface CreateGroupRequest {
   name: string;
   description?: string;
   permissions: IamPermission[];
 }
 
-export interface UpdateGroupRequest {
+interface UpdateGroupRequest {
   name?: string;
   description?: string;
   permissions?: IamPermission[];
@@ -580,12 +547,12 @@ export async function whoami(): Promise<WhoamiResponse> {
 
 // === Usage Scanner ===
 
-export interface ChildUsage {
+interface ChildUsage {
   size: number;
   objects: number;
 }
 
-export interface UsageEntry {
+interface UsageEntry {
   prefix: string;
   bucket: string;
   total_size: number;
@@ -635,7 +602,7 @@ export async function exportBackup(): Promise<{ blob: Blob; filename: string }> 
   return { blob, filename };
 }
 
-export interface ImportBackupResult {
+interface ImportBackupResult {
   users_created: number;
   users_skipped: number;
   groups_created: number;
@@ -683,7 +650,7 @@ export async function loginAs(accessKeyId: string, secretAccessKey: string): Pro
 
 // === Multi-Backend Management ===
 
-export interface BackendListResponse {
+interface BackendListResponse {
   backends: BackendInfo[];
   default_backend: string | null;
 }
@@ -718,7 +685,7 @@ export async function deleteBackend(name: string): Promise<{ success: boolean; e
 
 // === Config DB Recovery ===
 
-export interface RecoverDbResponse {
+interface RecoverDbResponse {
   success: boolean;
   correct_hash?: string;
   correct_hash_base64?: string;
@@ -750,7 +717,7 @@ export interface AuthProvider {
   updated_at: string;
 }
 
-export interface CreateAuthProviderRequest {
+interface CreateAuthProviderRequest {
   name: string;
   provider_type: string;
   enabled?: boolean;
@@ -763,7 +730,7 @@ export interface CreateAuthProviderRequest {
   extra_config?: Record<string, unknown>;
 }
 
-export interface UpdateAuthProviderRequest {
+interface UpdateAuthProviderRequest {
   name?: string;
   provider_type?: string;
   enabled?: boolean;
@@ -828,7 +795,7 @@ export interface MappingRule {
   created_at: string;
 }
 
-export interface CreateMappingRuleRequest {
+interface CreateMappingRuleRequest {
   provider_id?: number | null;
   priority?: number;
   match_type: string;
@@ -837,7 +804,7 @@ export interface CreateMappingRuleRequest {
   group_id: number;
 }
 
-export interface UpdateMappingRuleRequest {
+interface UpdateMappingRuleRequest {
   provider_id?: number | null;
   priority?: number;
   match_type?: string;
@@ -872,7 +839,7 @@ export async function deleteMappingRule(id: number): Promise<void> {
   if (!res.ok) throw new Error(`Failed to delete mapping: ${res.status}`);
 }
 
-export interface MappingPreviewResponse {
+interface MappingPreviewResponse {
   group_ids: number[];
   group_names: string[];
 }
@@ -903,7 +870,7 @@ export async function getExternalIdentities(): Promise<ExternalIdentity[]> {
   return safeJson(res);
 }
 
-export interface SyncResult {
+interface SyncResult {
   users_updated: number;
   memberships_changed: number;
 }
@@ -934,7 +901,7 @@ export interface AuditEntry {
   path: string;
 }
 
-export interface AuditResponse {
+interface AuditResponse {
   entries: AuditEntry[];
   limit: number;
 }

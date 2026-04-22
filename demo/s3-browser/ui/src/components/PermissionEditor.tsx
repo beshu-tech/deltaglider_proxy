@@ -7,7 +7,7 @@ import { useColors } from '../ThemeContext';
 
 const { Text } = Typography;
 
-export const ACTION_OPTIONS = [
+const ACTION_OPTIONS = [
   { label: 'Read (GET/HEAD)', value: 'read' },
   { label: 'Write (PUT)', value: 'write' },
   { label: 'Delete (DELETE)', value: 'delete' },

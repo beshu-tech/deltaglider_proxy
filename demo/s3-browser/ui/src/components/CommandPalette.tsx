@@ -32,7 +32,7 @@ import { ADMIN_IA } from './AdminSidebar';
 
 const { Text } = Typography;
 
-export interface CommandAction {
+interface CommandAction {
   id: string;
   label: string;
   hint?: string;

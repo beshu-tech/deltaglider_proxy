@@ -18,7 +18,7 @@
  * Linux, ChromeOS, Android) gets the Ctrl form.
  */
 
-export function isApplePlatform(): boolean {
+function isApplePlatform(): boolean {
   if (typeof navigator === 'undefined') return false;
   // Preferred modern API.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any

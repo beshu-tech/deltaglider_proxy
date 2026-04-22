@@ -96,7 +96,7 @@ const applyHandlers = new Map<SectionName, ApplyHandler[]>();
  * visible) without requiring each panel to track whether it's
  * "active."
  */
-export function registerApplyHandler(
+function registerApplyHandler(
   section: SectionName,
   handler: ApplyHandler
 ): () => void {
@@ -148,7 +148,7 @@ export function useApplyHandler(
   }, [section, enabled]);
 }
 
-export interface UseDirtySectionResult<T> {
+interface UseDirtySectionResult<T> {
   /** Current (editable) form state. */
   value: T;
   /** True when `value` differs from the last applied snapshot. */

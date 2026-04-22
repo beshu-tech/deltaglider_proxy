@@ -39,26 +39,3 @@ export function useCardStyles() {
   }, [BG_CARD, BORDER, TEXT_MUTED]);
 }
 
-/** Glass-card container style for full-page forms (login, connect). */
-export const glassCardFormStyle: React.CSSProperties = {
-  borderRadius: 14,
-  padding: 'clamp(28px, 4vw, 40px)',
-  width: '100%',
-  maxWidth: 440,
-};
-
-/** Standard large input style. */
-export function useLargeInputStyle() {
-  const { BORDER } = useColors();
-  return useMemo(
-    () => ({
-      background: 'var(--input-bg)',
-      borderColor: BORDER,
-      borderRadius: 10,
-      height: 44,
-      fontFamily: 'var(--font-mono)' as const,
-      fontSize: 13,
-    }),
-    [BORDER],
-  );
-}

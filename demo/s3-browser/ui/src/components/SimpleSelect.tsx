@@ -10,7 +10,7 @@ import { useColors } from '../ThemeContext';
  * overflow:hidden, and z-index stacking contexts.
  */
 
-export interface SimpleSelectOption {
+interface SimpleSelectOption {
   value: string;
   label: string;
   sublabel?: string;

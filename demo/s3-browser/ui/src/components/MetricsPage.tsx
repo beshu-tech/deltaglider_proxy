@@ -39,7 +39,8 @@ function parsePrometheus(text: string): Map<string, ParsedMetric> {
       if (current) current.type = rest.slice(sp + 1);
     } else if (line && !line.startsWith('#')) {
       const braceIdx = line.indexOf('{');
-      let name: string, labels: Record<string, string> = {}, valueStr: string;
+      let name: string, valueStr: string;
+      const labels: Record<string, string> = {};
       if (braceIdx >= 0) {
         name = line.slice(0, braceIdx);
         const closeIdx = line.indexOf('}', braceIdx);

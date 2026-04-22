@@ -403,7 +403,7 @@ function BucketCard({
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
         <SimpleAutoComplete
           value={row.name}
-          onChange={(v) => onChange({ name: v.toLowerCase().replace(/[^a-z0-9.\-]/g, '') })}
+          onChange={(v) => onChange({ name: v.toLowerCase().replace(/[^a-z0-9.-]/g, '') })}
           options={availableBuckets}
           placeholder="Bucket name"
           style={{ flex: 1 }}

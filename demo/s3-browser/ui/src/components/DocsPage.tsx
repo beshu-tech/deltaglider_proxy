@@ -103,7 +103,7 @@ function extractHeadings(markdown: string): TocItem[] {
   for (const line of markdown.split('\n')) {
     const m = line.match(/^(#{2,3})\s+(.+)/);
     if (m) {
-      const text = m[2].replace(/[`*_\[\]]/g, '');
+      const text = m[2].replace(/[`*_[\]]/g, '');
       const id = text.toLowerCase().replace(/[^\w]+/g, '-').replace(/(^-|-$)/g, '');
       items.push({ id, text, level: m[1].length });
     }

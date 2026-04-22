@@ -153,7 +153,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
           base64: result.correct_hash_base64 || '',
         };
         setRecoveredHash(recovered);
-        try { sessionStorage.setItem('dg-recovered-hash', JSON.stringify(recovered)); } catch {}
+        try { sessionStorage.setItem('dg-recovered-hash', JSON.stringify(recovered)); } catch { /* Safari private mode — fine to skip */ }
       } else {
         setRecoveryError(result.error || 'Password does not match');
       }

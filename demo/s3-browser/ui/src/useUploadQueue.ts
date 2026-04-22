@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { uploadObject } from './s3client';
 
-export interface UploadItem {
+interface UploadItem {
   id: string;
   file: File;
   status: 'pending' | 'uploading' | 'done' | 'error';
@@ -9,7 +9,7 @@ export interface UploadItem {
   error?: string;
 }
 
-export interface UploadStats {
+interface UploadStats {
   uploaded: number;
   originalSize: number;
   storedSize: number;

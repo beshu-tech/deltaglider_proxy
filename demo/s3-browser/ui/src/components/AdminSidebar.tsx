@@ -253,7 +253,7 @@ export default function AdminSidebar({ activePath, onNavigate }: Props) {
       }
     });
     return unsub;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+     
   }, []);
 
   const renderEntry = (entry: SidebarEntry, depth: number) => {

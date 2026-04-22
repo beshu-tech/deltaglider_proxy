@@ -233,7 +233,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                 try {
                   await updateAdminConfig({ max_delta_ratio: on ? 0.75 : 0 });
                   await refresh();
-                } catch {}
+                } catch { /* non-blocking: user sees the toggle revert */ }
               }}
             />
             <div>
@@ -388,7 +388,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                 )}
                 <SimpleAutoComplete
                   value={bp.name}
-                  onChange={(v) => updatePolicy(idx, { name: v.toLowerCase().replace(/[^a-z0-9.\-]/g, '') })}
+                  onChange={(v) => updatePolicy(idx, { name: v.toLowerCase().replace(/[^a-z0-9.-]/g, '') })}
                   options={availableBuckets.filter(b => !bucketPolicies.some((p, i) => i !== idx && p.name === b))}
                   placeholder="Bucket name"
                   style={{ flex: 1 }}

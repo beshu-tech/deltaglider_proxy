@@ -50,7 +50,7 @@ const lightColors = {
   STORAGE_TYPE_DEFAULT: { bg: '#d1fae5', border: '#34d399', text: '#059669' },
 };
 
-export type ColorTokens = typeof darkColors;
+type ColorTokens = typeof darkColors;
 
 interface ThemeContextValue {
   isDark: boolean;

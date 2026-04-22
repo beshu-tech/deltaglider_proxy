@@ -38,7 +38,7 @@ import type { CSSProperties, ReactNode } from 'react';
 import { Tag } from 'antd';
 import { useColors } from '../ThemeContext';
 
-export interface FormFieldProps {
+interface FormFieldProps {
   /**
    * Plain-English field name. E.g. "Reference-cache size (MB)".
    * Accepts ReactNode so callers can embed inline chips (e.g. a

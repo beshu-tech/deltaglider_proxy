@@ -56,16 +56,7 @@ export function setBucket(name: string) {
   localStorage.setItem('dg-bucket', name);
 }
 
-export function getRegion(): string {
-  return activeRegion;
-}
-
-export function setRegion(region: string) {
-  activeRegion = region;
-  cachedClient = null;
-}
-
-export function getEndpoint(): string {
+function getEndpoint(): string {
   return activeEndpoint || detectDefaultEndpoint();
 }
 
@@ -272,58 +263,7 @@ export async function deleteObjects(keys: string[]): Promise<void> {
   }
 }
 
-/** Progress callback for prefix size computation. */
-export interface PrefixSizeProgress {
-  totalSize: number;
-  totalFiles: number;
-  done: boolean;
-}
-
 /**
- * Recursively compute the total size and file count under a prefix.
- * Calls onProgress after each page so the UI can show incremental results.
- * Supports cancellation via AbortSignal.
- */
-export async function computePrefixSize(
-  pfx: string,
-  onProgress: (progress: PrefixSizeProgress) => void,
-  signal?: AbortSignal,
-): Promise<PrefixSizeProgress> {
-  const client = getClient();
-  let totalSize = 0;
-  let totalFiles = 0;
-  let continuationToken: string | undefined;
-
-  for (;;) {
-    if (signal?.aborted) {
-      return { totalSize, totalFiles, done: false };
-    }
-    const resp = await client.send(
-      new ListObjectsV2Command({
-        Bucket: activeBucket,
-        Prefix: pfx,
-        ContinuationToken: continuationToken,
-      }),
-    );
-    for (const o of resp.Contents || []) {
-      totalSize += o.Size || 0;
-      totalFiles += 1;
-    }
-    // Check abort before calling onProgress to avoid stale updates
-    if (signal?.aborted) {
-      return { totalSize, totalFiles, done: false };
-    }
-    onProgress({ totalSize, totalFiles, done: false });
-    if (!resp.IsTruncated) break;
-    continuationToken = resp.NextContinuationToken;
-    if (!continuationToken) break;
-  }
-
-  const result = { totalSize, totalFiles, done: true };
-  onProgress(result);
-  return result;
-}
-
 /** Server-side recursive delete: DELETE /{bucket}/{prefix}/ */
 export async function deletePrefix(pfx: string): Promise<void> {
   const client = getClient();
@@ -360,7 +300,7 @@ export function getObjectUrl(key: string): string {
 
 // ── Connection testing ──
 
-export interface TestConnectionResult {
+interface TestConnectionResult {
   ok: boolean;
   buckets?: string[];
   error?: string;

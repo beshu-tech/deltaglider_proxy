@@ -225,8 +225,19 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Install dependencies
         run: cd demo/s3-browser/ui && npm ci
+      # ── Blocking: ESLint with react-hooks/rules-of-hooks at error.
+      #    A regression of error #310 (hooks after early returns) is
+      #    caught here, before it ever ships. Warnings are still
+      #    visible in logs but don't fail CI — warn budget is being
+      #    managed down separately (see lint:strict). ──
+      - name: ESLint (rules-of-hooks, no-unused-vars, ...)
+        run: cd demo/s3-browser/ui && npm run lint
+      # ── Blocking: TypeScript. `recharts` types no longer break this. ──
       - name: TypeScript type check
-        run: cd demo/s3-browser/ui && npx tsc --noEmit || true  # warn-only (recharts types missing)
+        run: cd demo/s3-browser/ui && npm run typecheck
+      # ── Blocking: Knip detects unused files, deps, and exports. ──
+      - name: Knip (dead code / unused deps)
+        run: cd demo/s3-browser/ui && npm run knip
       - name: npm audit
         run: cd demo/s3-browser/ui && npm audit --audit-level=high || true  # warn-only
 
