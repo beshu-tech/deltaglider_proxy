@@ -19,7 +19,7 @@ Standard IAM permissions answer: **"Can user X do action Y on resource Z?"**
 Conditions add context: **"...but only if the request comes from this IP range"** or **"...but only if the prefix matches this pattern."**
 
 ```mermaid
-graph TD
+flowchart TD
     R["<b>Permission Rule</b><br/><br/>Effect: Allow<br/>Actions: read, list<br/>Resources: my-bucket/*<br/><br/><b>Conditions:</b>"]
     R --> C1["aws:SourceIp = 10.0.0.0/8"]
     R --> C2["s3:prefix NOT LIKE 'internal/*'"]
@@ -50,16 +50,15 @@ Conditions:
 **How it works:**
 
 ```mermaid
-graph TD
-    subgraph R1["Request from 10.0.1.50 (build server)"]
-        A1["aws:SourceIp = 10.0.1.50"] --> B1{"10.0.1.50 matches<br/>10.0.0.0/8?"}
-        B1 -- "Yes" --> C1["Access granted ✅"]
-    end
+flowchart TD
+    A1["Request from 10.0.1.50<br/>(build server)"] --> B1{"10.0.1.50 matches<br/>10.0.0.0/8?"}
+    B1 -- "Yes" --> C1["Access granted ✅"]
 
-    subgraph R2["Request from 203.0.113.42 (attacker)"]
-        A2["aws:SourceIp = 203.0.113.42"] --> B2{"203.0.113.42 matches<br/>10.0.0.0/8?"}
-        B2 -- "No" --> C2["Access denied ❌<br/>even with valid credentials"]
-    end
+    A2["Request from 203.0.113.42<br/>(attacker)"] --> B2{"203.0.113.42 matches<br/>10.0.0.0/8?"}
+    B2 -- "No" --> C2["Access denied ❌<br/>even with valid credentials"]
+
+    style C1 fill:#1a3a2a,stroke:#2dd4bf
+    style C2 fill:#3a1a1a,stroke:#fb7185
 ```
 
 ### Multiple IP ranges
@@ -112,19 +111,18 @@ Conditions:
 **How it works:**
 
 ```mermaid
-graph TD
-    subgraph L1["LIST shared-bucket?prefix=user-alice/docs/"]
-        A1["s3:prefix = 'user-alice/docs/'"] --> B1{"Allow rule:<br/>resource matches<br/>shared-bucket/user-alice/*?"}
-        B1 -- "Yes ✅" --> C1{"Deny condition:<br/>'user-alice/docs/' NOT LIKE<br/>'user-alice/*'?"}
-        C1 -- "No — condition not met" --> D1["Deny does NOT apply<br/>Result: ALLOWED ✅"]
-    end
+flowchart TD
+    A1["LIST s3:prefix=user-alice/docs/"] --> B1{"Allow rule matches<br/>shared-bucket/user-alice/*?"}
+    B1 -- "Yes ✅" --> C1{"Deny condition:<br/>prefix NOT LIKE user-alice/*?"}
+    C1 -- "No — condition not met" --> D1["Deny does NOT apply<br/>Result: ALLOWED ✅"]
 
-    subgraph L2["LIST shared-bucket?prefix=user-bob/"]
-        A2["s3:prefix = 'user-bob/'"] --> B2{"Allow rule:<br/>resource matches<br/>shared-bucket/user-alice/*?"}
-        B2 -- "No ❌" --> C2{"Deny rule:<br/>resource matches<br/>shared-bucket/*?"}
-        C2 -- "Yes" --> D2{"Deny condition:<br/>'user-bob/' NOT LIKE<br/>'user-alice/*'?"}
-        D2 -- "Yes — condition met" --> E2["Result: DENIED ❌"]
-    end
+    A2["LIST s3:prefix=user-bob/"] --> B2{"Allow rule matches<br/>shared-bucket/user-alice/*?"}
+    B2 -- "No ❌" --> C2{"Deny rule matches<br/>shared-bucket/*?"}
+    C2 -- "Yes" --> D2{"Deny condition:<br/>prefix NOT LIKE user-alice/*?"}
+    D2 -- "Yes — condition met" --> E2["Result: DENIED ❌"]
+
+    style D1 fill:#1a3a2a,stroke:#2dd4bf
+    style E2 fill:#3a1a1a,stroke:#fb7185
 ```
 
 ### Deny listing of hidden files
@@ -149,17 +147,17 @@ Conditions within a single rule are ANDed (all must match). Multiple rules are e
 ### Example: Geo-restricted read-only access
 
 ```mermaid
-graph TD
-    subgraph Rules
-        R1["<b>Rule 1: Allow</b><br/>Actions: read, list<br/>Resources: public-bucket/*<br/>Condition: aws:SourceIp = 198.51.100.0/24 (office)"]
-        R2["<b>Rule 2: Deny</b><br/>Actions: write, delete<br/>Resources: *<br/>(no conditions — always applies)"]
-    end
+flowchart TD
+    R1["<b>Rule 1: Allow</b><br/>Actions: read, list<br/>Resources: public-bucket/*<br/>Condition: aws:SourceIp = 198.51.100.0/24 (office)"]
+    R2["<b>Rule 2: Deny</b><br/>Actions: write, delete<br/>Resources: * (always applies)"]
 
-    subgraph Evaluation
-        E1["PUT from office IP"] --> E1a{"Rule 1 covers 'write'?"} -- "No" --> E1b{"Rule 2 covers 'write'?"} -- "Yes — Deny" --> E1c["DENIED ❌"]
-        E2["GET from office IP"] --> E2a{"Rule 1 covers 'read'?"} -- "Yes" --> E2b{"IP matches?"} -- "Yes" --> E2c["ALLOWED ✅"]
-        E3["GET from home IP"] --> E3a{"Rule 1 covers 'read'?"} -- "Yes" --> E3b{"IP matches?"} -- "No" --> E3c["Implicit deny<br/>DENIED ❌"]
-    end
+    E1["PUT from office IP"] --> E1a{"Rule 1 covers write?"} -- "No" --> E1b{"Rule 2 covers write?"} -- "Yes — Deny" --> E1c["DENIED ❌"]
+    E2["GET from office IP"] --> E2a{"Rule 1 covers read?"} -- "Yes" --> E2b{"IP matches?"} -- "Yes" --> E2c["ALLOWED ✅"]
+    E3["GET from home IP"] --> E3a{"Rule 1 covers read?"} -- "Yes" --> E3b{"IP matches?"} -- "No" --> E3c["Implicit deny<br/>DENIED ❌"]
+
+    style E2c fill:#1a3a2a,stroke:#2dd4bf
+    style E1c fill:#3a1a1a,stroke:#fb7185
+    style E3c fill:#3a1a1a,stroke:#fb7185
 ```
 
 ---
@@ -188,7 +186,7 @@ Conditions:
 **How group permissions work:**
 
 ```mermaid
-graph TD
+flowchart TD
     U["<b>User: ci-user-1</b><br/>Permissions: (none)"]
     G["<b>Group: ci-builders</b><br/>Allow read, write<br/>on builds-bucket/*<br/>if IP in 10.0.0.0/8"]
     U --> M["<b>Effective Permissions</b><br/>User ∪ Group"]

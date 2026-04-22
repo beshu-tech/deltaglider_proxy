@@ -37,13 +37,51 @@ function Mermaid({ chart, caption }: { chart: string; caption?: string }) {
     return () => { cancelled = true; };
   }, [chart]);
 
-  // After SVG is in the DOM, measure actual content and fix viewBox
+  // After SVG is in the DOM, try to tighten the viewBox to fit the
+  // drawn content — Mermaid's default is often 2-3× too tall, which
+  // wastes vertical space.
+  //
+  // CAVEAT (fixed 2026-04-22): `getBBox()` on a Mermaid subgraph
+  // root element returns a bounding box tens-of-thousands of pixels
+  // wide — an internal Mermaid quirk where each subgraph's `<g>`
+  // has invisible label-layout elements far outside its visible
+  // extent. Rewriting the SVG's `viewBox` + `width` with that number
+  // produced ~17,000-px wide SVGs that rendered as two tiny squares
+  // at opposite edges of the container.
+  //
+  // The safe path: trust Mermaid's initial values. They're derived
+  // from the actual layout and set `style="max-width: 100%"`, which
+  // already handles responsive sizing. We only rewrite when the
+  // measured bbox is strictly smaller than the initial viewBox
+  // (the tightening case we wanted) AND stays within a sane ratio.
   useEffect(() => {
     if (!svg || !ref.current) return;
     const svgEl = ref.current.querySelector('svg');
     if (!svgEl) return;
+
+    // Preserve the initial viewBox as the authoritative size from
+    // Mermaid. We compare against this to detect getBBox-blowout.
+    const initialViewBox = svgEl.getAttribute('viewBox');
+    if (!initialViewBox) return;
+    const parts = initialViewBox.split(/\s+/).map(Number);
+    if (parts.length !== 4 || parts.some((n) => !Number.isFinite(n))) return;
+    const [, , initW, initH] = parts;
+
     try {
       const bb = svgEl.getBBox();
+      // Guard against the subgraph-bbox blowout. If either dimension
+      // is >1.5× the initial viewBox, the bbox is bogus — leave the
+      // initial values in place.
+      if (
+        !Number.isFinite(bb.width) ||
+        !Number.isFinite(bb.height) ||
+        bb.width <= 0 ||
+        bb.height <= 0 ||
+        bb.width > initW * 1.5 ||
+        bb.height > initH * 1.5
+      ) {
+        return;
+      }
       const pad = 16;
       const w = Math.ceil(bb.width + pad * 2);
       const h = Math.ceil(bb.height + pad * 2);
@@ -53,7 +91,7 @@ function Mermaid({ chart, caption }: { chart: string; caption?: string }) {
       svgEl.style.maxWidth = '100%';
       svgEl.style.height = 'auto';
     } catch {
-      // getBBox can fail if SVG is not visible
+      // getBBox can fail if SVG is not visible — fine, keep Mermaid's defaults.
     }
   }, [svg]);
   return (

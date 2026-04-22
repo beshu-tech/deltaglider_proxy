@@ -9,7 +9,7 @@ A step-by-step guide to taking your proxy from open access to production-ready s
 A fresh DeltaGlider Proxy installation **refuses to start** without authentication credentials. To run in open access mode for local development, you must explicitly set `authentication = "none"` in the config or `DGP_AUTHENTICATION=none` as an environment variable. This is never acceptable in production. This guide walks you through each security layer.
 
 ```mermaid
-graph LR
+flowchart LR
     A["INTERNET"] --> B["Reverse Proxy<br/>TLS + headers"]
     B --> C["DeltaGlider Proxy<br/>auth, IAM, rate limiting"]
     C --> D["S3 Backend"]
