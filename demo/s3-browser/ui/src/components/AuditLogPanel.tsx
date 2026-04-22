@@ -130,7 +130,21 @@ export default function AuditLogPanel({ onSessionExpired }: Props) {
   }, [entries, filter]);
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+    <div
+      style={{
+        // Responsive-pad wrapper (same as AdmissionPanel et al.) so
+        // the audit viewer doesn't render flush against the sidebar.
+        // Width 1100: the 6-column table (time / action / user / ip /
+        // bucket / target) needs more breathing room than the 960
+        // form panels, otherwise Target/Path clips on common paths.
+        maxWidth: 1100,
+        margin: '0 auto',
+        padding: 'clamp(16px, 3vw, 24px)',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 16,
+      }}
+    >
       <Alert
         type="info"
         showIcon
