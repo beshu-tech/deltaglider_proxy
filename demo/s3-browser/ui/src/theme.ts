@@ -2,7 +2,7 @@ import { theme } from 'antd';
 
 const DG_BRAND = {
   colorPrimary: '#2dd4bf',
-  fontFamily: "'Outfit', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+  fontFamily: "'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
 };
 
 export const darkTheme = {
