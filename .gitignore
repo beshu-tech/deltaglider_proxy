@@ -40,3 +40,8 @@ Thumbs.db
 deltaglider_config.db
 deltaglider_config.db.bak
 deltaglider_config.db.recovery
+
+# Full-backup zips — contain plaintext secrets (bootstrap password
+# hash, OAuth client_secrets, S3 access/secret keys). Never commit.
+dgp-full-backup-*.zip
+dgp-backup-*.zip
