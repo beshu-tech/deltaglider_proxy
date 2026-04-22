@@ -7,6 +7,9 @@ export default defineConfig({
   define: {
     __BUILD_TIME__: JSON.stringify(new Date().toISOString()),
   },
+  build: {
+    sourcemap: true,
+  },
   server: {
     proxy: {
       '/_/api': 'http://localhost:9000',

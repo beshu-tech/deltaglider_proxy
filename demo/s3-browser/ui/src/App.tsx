@@ -201,6 +201,19 @@ export default function App() {
 
   const isEmpty = s3.objects.length === 0 && s3.folders.length === 0;
 
+  // Stable context value so consumers of `useNavigation()` (AdminPage,
+  // Sidebar, TopBar) don't re-render on every App render. Previously
+  // the inline `value={{ navigate, subPath }}` allocated a fresh
+  // object each time, which React treats as a changed context → every
+  // consumer re-renders, cascading into every admin panel's
+  // data-fetch effect. `navigate` is already `useCallback`'d;
+  // `subPath` is derived state that only changes on actual navigation.
+  //
+  // MUST be declared before any early return below — otherwise the
+  // hook count differs between "loading" and "ready" renders and
+  // React throws #310 (rendered more hooks than previous render).
+  const navValue = useMemo(() => ({ navigate, subPath }), [navigate, subPath]);
+
   if (sessionLoading) {
     return (
       <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh' }}>
@@ -303,15 +316,6 @@ export default function App() {
       </>
     );
   };
-
-  // Stable context value so consumers of `useNavigation()` (AdminPage,
-  // Sidebar, TopBar) don't re-render on every App render. Previously
-  // the inline `value={{ navigate, subPath }}` allocated a fresh
-  // object each time, which React treats as a changed context → every
-  // consumer re-renders, cascading into every admin panel's
-  // data-fetch effect. `navigate` is already `useCallback`'d;
-  // `subPath` is derived state that only changes on actual navigation.
-  const navValue = useMemo(() => ({ navigate, subPath }), [navigate, subPath]);
 
   return (
     <NavigationContext.Provider value={navValue}>
