@@ -28,4 +28,9 @@ ignore = [
     # astral-tokio-tar 0.5.6: PAX extension validation. Dev-only dep
     # (testcontainers), severity 1.7 (low). Waiting for testcontainers upgrade.
     "RUSTSEC-2026-0066",
+
+    # rand 0.8.5 / 0.9.2 (unsound): custom-logger + `rand::rng()` interaction.
+    # We never set a custom global logger, so the unsoundness can't be
+    # triggered. Waiting for rand 0.9.3+.
+    "RUSTSEC-2026-0097",
 ]

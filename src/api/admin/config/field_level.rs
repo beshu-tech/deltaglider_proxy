@@ -215,10 +215,8 @@ fn compute_tainted_fields(runtime: &crate::config::Config) -> Vec<String> {
         (
             crate::config::BackendConfig::Filesystem { path: rp },
             crate::config::BackendConfig::Filesystem { path: dp },
-        ) => {
-            if rp != dp {
-                tainted.push("backend_path".to_string());
-            }
+        ) if rp != dp => {
+            tainted.push("backend_path".to_string());
         }
         (
             crate::config::BackendConfig::S3 {
