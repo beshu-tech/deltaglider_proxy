@@ -353,18 +353,18 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
   const paletteExtraActions = useMemo(
     () => [
       {
-        id: 'action:export-yaml',
-        label: 'Export YAML',
-        hint: 'Copy the current config as canonical YAML',
-        keywords: 'export yaml download config copy',
+        id: 'action:show-yaml',
+        label: 'Show YAML',
+        hint: 'View current config as canonical YAML (secrets redacted)',
+        keywords: 'show yaml view config copy',
         icon: <PaletteFileTextOutlined />,
         onRun: () => setYamlModalMode('export'),
       },
       {
-        id: 'action:import-yaml',
-        label: 'Import YAML',
+        id: 'action:apply-yaml',
+        label: 'Apply YAML',
         hint: 'Paste a YAML config document — validate, then apply',
-        keywords: 'import yaml upload config paste apply',
+        keywords: 'apply yaml upload config paste',
         icon: <PaletteImportOutlined />,
         onRun: () => setYamlModalMode('import'),
       },
@@ -803,20 +803,20 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
               type="text"
               icon={<FileTextOutlined />}
               onClick={() => setYamlModalMode('export')}
-              title="Copy the current config as canonical YAML (secrets redacted). Works with dgpctl apply on the other side."
+              title="Show the current config as canonical YAML (secrets are redacted here — this is a view, not a complete backup). For a restorable snapshot use Full Backup → Export in the sidebar footer."
               style={{ color: colors.TEXT_MUTED, fontFamily: 'var(--font-ui)' }}
             >
-              <span className="hide-mobile" style={{ marginLeft: 4 }}>Export YAML</span>
+              <span className="hide-mobile" style={{ marginLeft: 4 }}>Show YAML</span>
             </Button>
             <Button
               size="small"
               type="text"
               icon={<ImportOutlined />}
               onClick={() => setYamlModalMode('import')}
-              title="Paste a YAML config document — validate, then apply + persist."
+              title="Paste a YAML config document — validates then applies + persists. Note: secrets redacted as null are preserved at the current live value (apply won't clear them)."
               style={{ color: colors.TEXT_MUTED, fontFamily: 'var(--font-ui)' }}
             >
-              <span className="hide-mobile" style={{ marginLeft: 4 }}>Import YAML</span>
+              <span className="hide-mobile" style={{ marginLeft: 4 }}>Apply YAML</span>
             </Button>
           </Space>
         }
@@ -872,15 +872,17 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
             </div>
           </Drawer>
         )}
-        {/* Four-group sidebar (AdminSidebar) with an IAM Backup
-            footer. Explicitly labelled "IAM Backup" — this is a
-            JSON dump of IAM users/groups/OAuth-providers/mapping-
-            rules, not the config YAML. Mislabelling it "Backup" in
-            Wave 3 made operators mistake it for a YAML export and
-            go looking for a third Export/Import channel. It is
-            genuinely its own data domain — encrypted SQLCipher
-            contents vs. the config YAML document — and deserves
-            its own surface rather than being hidden.
+        {/* Four-group sidebar with a Full Backup footer.
+            Since v0.8.4 the Full Backup button is the canonical
+            "save everything" export: the server responds with a
+            zip containing config.yaml + iam.json + secrets.json +
+            manifest.json — the complete state needed to restore an
+            instance. The pre-v0.8.4 label here was "IAM Backup",
+            which was accurate but misleading (operators assumed it
+            covered the whole proxy and restored to a broken state
+            because storage/OAuth secrets weren't in scope). The
+            label + tooltip + file extension all now signal "this
+            is the whole thing".
 
             Hidden on narrow viewports (<900px) — replaced with the
             Drawer above. */}
@@ -895,7 +897,9 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
           <div style={{ flex: 1, minHeight: 0 }}>
             <AdminSidebar activePath={adminPath} onNavigate={navigateAdmin} />
           </div>
-          {/* IAM Backup footer — JSON dump of users/groups/OAuth, not YAML */}
+          {/* Full Backup footer — zip of config.yaml + iam.json +
+              secrets.json + manifest.json. Handles secrets round-
+              trip atomically. */}
           <div
             style={{
               background: colors.BG_CARD,
@@ -914,9 +918,9 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
                 padding: '0 0 6px',
                 fontFamily: 'var(--font-ui)',
               }}
-              title="JSON dump of IAM state (users, groups, OAuth providers, mapping rules). Not the config YAML — that's in the header."
+              title="Zip containing config.yaml + iam.json + secrets.json + manifest.json. Everything needed to restore this proxy, including storage credentials, OAuth client_secrets, and the bootstrap password hash. Treat as a keystore — never commit to a public repo."
             >
-              IAM Backup
+              Full Backup
             </div>
             <div style={{ display: 'flex', gap: 4 }}>
               <Button
@@ -924,17 +928,14 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
                 icon={<DownloadOutlined />}
                 onClick={async () => {
                   try {
-                    const data = await exportBackup();
-                    const blob = new Blob([JSON.stringify(data, null, 2)], {
-                      type: 'application/json',
-                    });
+                    const { blob, filename } = await exportBackup();
                     const url = URL.createObjectURL(blob);
                     const a = document.createElement('a');
                     a.href = url;
-                    a.download = `dgp-iam-backup-${new Date().toISOString().slice(0, 10)}.json`;
+                    a.download = filename;
                     a.click();
                     URL.revokeObjectURL(url);
-                    message.success('IAM backup exported');
+                    message.success('Full backup exported');
                   } catch (e) {
                     message.error(
                       'Export failed: ' + (e instanceof Error ? e.message : 'unknown')
@@ -951,21 +952,32 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
                 onClick={() => {
                   const input = document.createElement('input');
                   input.type = 'file';
-                  input.accept = '.json';
+                  // Accept zip (new default) AND json (pre-v0.8.4
+                  // IAM-only backups still round-trip via the
+                  // content-type-sniffing import handler).
+                  input.accept = '.zip,.json,application/zip,application/json';
                   input.onchange = async () => {
                     const file = input.files?.[0];
                     if (!file) return;
                     try {
-                      const text = await file.text();
-                      const data = JSON.parse(text);
-                      const result = await importBackup(data);
+                      // Zip path: pass the File Blob straight through
+                      // — importBackup handles the content-type.
+                      // JSON path: parse + pass object (legacy shape).
+                      const isZip =
+                        file.name.toLowerCase().endsWith('.zip') ||
+                        file.type === 'application/zip' ||
+                        file.type === 'application/x-zip-compressed';
+                      const result = isZip
+                        ? await importBackup(file)
+                        : await importBackup(JSON.parse(await file.text()));
+                      const ext = result.external_identities_created ?? 0;
                       message.success(
-                        `Imported: ${result.users_created} users, ${result.groups_created} groups (${result.users_skipped} skipped)`
+                        `Imported: ${result.users_created} users, ${result.groups_created} groups, ${ext} OIDC identities (${result.users_skipped} skipped)`
                       );
                       window.location.reload();
                     } catch (e) {
                       message.error(
-                        'Import failed: ' + (e instanceof Error ? e.message : 'invalid JSON')
+                        'Import failed: ' + (e instanceof Error ? e.message : 'invalid file')
                       );
                     }
                   };

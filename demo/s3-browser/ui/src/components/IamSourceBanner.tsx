@@ -78,10 +78,11 @@ export default function IamSourceBanner({ iamMode, resource }: Props) {
         <>
           In <code style={{ fontFamily: 'var(--font-mono)' }}>access.iam_mode: gui</code>
           {' '}(the default), {resource} live in the encrypted IAM
-          database on disk — <b>not</b> in the YAML config. Copy YAML
+          database on disk — <b>not</b> in the YAML config. Show YAML
           on the Access page will NOT include them. Use{' '}
-          <b>IAM Backup → Export</b> (bottom-left of the sidebar) to
-          snapshot the DB to JSON, or switch to{' '}
+          <b>Full Backup → Export</b> (bottom-left of the sidebar) to
+          snapshot the full instance state (zip with config + IAM +
+          secrets), or switch to{' '}
           <code style={{ fontFamily: 'var(--font-mono)' }}>declarative</code>
           {' '}mode if you want YAML to be authoritative.
         </>

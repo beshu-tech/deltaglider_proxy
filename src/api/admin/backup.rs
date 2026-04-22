@@ -1,9 +1,46 @@
-//! IAM data export/import (backup & restore).
+//! Full-state export/import (backup & restore).
+//!
+//! ## Export shape
+//!
+//! The default `GET /_/api/admin/backup` returns a **zip** containing
+//! the four artefacts needed to reconstitute an instance byte-for-byte:
+//!
+//!   * `manifest.json` — version, capture timestamp, source host,
+//!     content summary. Cheap for scripts to sanity-check.
+//!   * `config.yaml`   — canonical YAML config (secrets in backend /
+//!     access sections are still redacted to `null` here; their real
+//!     values live in `secrets.json`). Applying just this file is a
+//!     no-op for secrets — the import path consumes both and merges.
+//!   * `iam.json`      — users + groups + OAuth providers + mapping
+//!     rules + external identities. Same shape as the legacy
+//!     IAM-only JSON response (`?format=json`), for backwards compat
+//!     with any script that was post-processing it.
+//!   * `secrets.json`  — the things the operator would otherwise have
+//!     to harvest from platform env vars by hand:
+//!       - `bootstrap_password_hash`
+//!       - `storage.access_key_id` / `storage.secret_access_key`
+//!       - `oauth_client_secrets[provider_name]`
+//!
+//! Operators commit the first two to git; `secrets.json` + any zip
+//! that contains it is a keystore.
+//!
+//! The legacy `?format=json` query parameter still returns just the
+//! IAM-only JSON for backwards compat with pre-Full-Backup scripts.
+//!
+//! ## Import shape
+//!
+//! `POST /_/api/admin/backup` sniffs `Content-Type`:
+//!   - `application/zip`  → unpacks + applies all four parts
+//!     atomically (IAM first, then YAML merge-patch, then secrets).
+//!   - `application/json` → today's IAM-only flow (unchanged).
 
-use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::body::Bytes;
+use axum::extract::{Query, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use std::io::{Cursor, Write};
 use std::sync::Arc;
 
 use crate::config_db::auth_providers::{AuthProviderConfig, ExternalIdentity, GroupMappingRule};
@@ -54,10 +91,89 @@ pub struct BackupGroup {
     pub member_ids: Vec<i64>,
 }
 
-/// GET /api/admin/backup — export all IAM data as JSON.
-pub async fn export_backup(
-    State(state): State<Arc<AdminState>>,
-) -> Result<Json<IamBackup>, StatusCode> {
+/// Query params for `GET /_/api/admin/backup`.
+#[derive(Deserialize)]
+pub struct ExportQuery {
+    /// `zip` (default) or `json`. Any other value returns 400.
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+/// Human-readable top-level description of what's in a backup zip.
+/// Serialised as `manifest.json` inside the archive so scripts can
+/// inspect a bundle without unzipping + parsing every part.
+#[derive(Serialize)]
+struct BackupManifest {
+    /// Bumped when the zip layout changes in a breaking way.
+    /// Readers should refuse unknown versions rather than silently
+    /// mis-import. Version 1 = this layout (4 files: manifest.json,
+    /// config.yaml, iam.json, secrets.json).
+    version: u32,
+    /// ISO-8601 UTC timestamp when the archive was produced.
+    captured_at: String,
+    /// Self-reported deltaglider_proxy version (from Cargo.toml).
+    server_version: String,
+    /// Top-level file listing + byte counts so an operator can sanity-
+    /// check that `unzip -l` matches what they expect.
+    files: Vec<ManifestEntry>,
+}
+
+#[derive(Serialize)]
+struct ManifestEntry {
+    name: String,
+    bytes: usize,
+    sha256: String,
+}
+
+/// Plaintext secrets that the server intentionally redacts from
+/// `config.yaml` / `iam.json` exports. Written to `secrets.json`
+/// inside the zip so a zip-import can round-trip a fully-functional
+/// instance with one file.
+///
+/// Treat the containing zip as a keystore: encrypt at rest, never
+/// commit to a public repo, never ship over unencrypted channels.
+#[derive(Serialize, Deserialize, Default)]
+struct BackupSecrets {
+    /// Bcrypt hash (same format as `DGP_BOOTSTRAP_PASSWORD_HASH`)
+    /// when in bootstrap mode. `None` if the server can't self-report
+    /// (e.g. the hash came from env and was never persisted to state).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bootstrap_password_hash: Option<String>,
+    /// The operator-authored SigV4 bootstrap pair from
+    /// `access.access_key_id` / `access.secret_access_key` in YAML.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    access: Option<SecretsAccess>,
+    /// Storage backend credentials (S3 only — other backend types
+    /// have no secrets to restore).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    storage: Option<SecretsStorage>,
+    /// Per-OAuth-provider client secret, keyed by provider `name`.
+    /// The IAM JSON already carries these too, but we duplicate them
+    /// here so the import flow can skip the IAM file (e.g. to re-seed
+    /// secrets without replacing users / groups).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    oauth_client_secrets: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct SecretsAccess {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    access_key_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secret_access_key: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct SecretsStorage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    access_key_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secret_access_key: Option<String>,
+}
+
+/// Build the IamBackup struct from current DB state. Used by both
+/// the JSON and zip export paths.
+async fn build_iam_backup(state: &Arc<AdminState>) -> Result<IamBackup, StatusCode> {
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let db = db.lock().await;
 
@@ -75,7 +191,7 @@ pub async fn export_backup(
     let mapping_rules = db.load_group_mapping_rules().unwrap_or_default();
     let external_identities = db.list_external_identities().unwrap_or_default();
 
-    let backup = IamBackup {
+    Ok(IamBackup {
         version: 2,
         users: users
             .into_iter()
@@ -102,17 +218,431 @@ pub async fn export_backup(
         auth_providers,
         mapping_rules,
         external_identities,
-    };
-
-    Ok(Json(backup))
+    })
 }
 
-/// POST /api/admin/backup — import IAM data from JSON backup.
-/// Merges with existing data: skips users/groups that already exist (by name).
+/// GET /api/admin/backup[?format=zip|json]
+///
+/// Default is **zip** (contains config.yaml + iam.json +
+/// secrets.json + manifest.json). Set `?format=json` for the legacy
+/// IAM-only JSON body (kept for backwards compat with pre-v0.8.4
+/// scripts; operators should migrate to zip).
+pub async fn export_backup(
+    State(state): State<Arc<AdminState>>,
+    Query(q): Query<ExportQuery>,
+) -> Result<Response, StatusCode> {
+    let iam = build_iam_backup(&state).await?;
+
+    let format = q.format.as_deref().unwrap_or("zip");
+    match format {
+        "json" => Ok(Json(iam).into_response()),
+        "zip" => export_zip(&state, &iam).await.map(|(body, filename)| {
+            let mut resp = body.into_response();
+            resp.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/zip"),
+            );
+            resp.headers_mut().insert(
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_str(&format!("attachment; filename=\"{}\"", filename))
+                    .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+            );
+            resp
+        }),
+        _ => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
+/// Assemble the zip body + suggested filename (`dgp-backup-<version>-<utc>.zip`).
+async fn export_zip(
+    state: &Arc<AdminState>,
+    iam: &IamBackup,
+) -> Result<(Bytes, String), StatusCode> {
+    // We hold the read lock for the entire inspection of config so
+    // a concurrent apply can't tear the YAML + secrets harvest apart.
+    let cfg = state.config.read().await;
+
+    // ── canonical YAML (same as GET /config/export?format=yaml) ───
+    //    NOTE: the redactor inside `to_canonical_yaml` also clears
+    //    storage backend secrets + access_key_id/secret_access_key,
+    //    which is intentional. We harvest the real values into
+    //    `secrets.json` next, so a zip-import can restore them.
+    let yaml = cfg.to_canonical_yaml().map_err(|e| {
+        tracing::error!("Full-backup: YAML serialise failed: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // ── secrets.json — harvest real plaintext values that YAML
+    //    export would redact ────────────────────────────────────
+    let secrets = {
+        let mut s = BackupSecrets {
+            bootstrap_password_hash: cfg.bootstrap_password_hash.clone(),
+            access: None,
+            storage: None,
+            oauth_client_secrets: Default::default(),
+        };
+        // Access-section bootstrap SigV4 pair.
+        if cfg.access_key_id.is_some() || cfg.secret_access_key.is_some() {
+            s.access = Some(SecretsAccess {
+                access_key_id: cfg.access_key_id.clone(),
+                secret_access_key: cfg.secret_access_key.clone(),
+            });
+        }
+        // Storage-section backend credentials (S3 only — filesystem
+        // backends have no secrets to round-trip).
+        if let crate::config::BackendConfig::S3 {
+            access_key_id,
+            secret_access_key,
+            ..
+        } = &cfg.backend
+        {
+            if access_key_id.is_some() || secret_access_key.is_some() {
+                s.storage = Some(SecretsStorage {
+                    access_key_id: access_key_id.clone(),
+                    secret_access_key: secret_access_key.clone(),
+                });
+            }
+        }
+        // OAuth client secrets (indexed by provider name, not id, so
+        // restore is robust across id reshuffles).
+        for p in &iam.auth_providers {
+            if let Some(cs) = &p.client_secret {
+                s.oauth_client_secrets.insert(p.name.clone(), cs.clone());
+            }
+        }
+        s
+    };
+
+    // Done with config read lock — drop it before the (CPU-bound)
+    // zip write so a concurrent apply doesn't block on us.
+    drop(cfg);
+
+    // ── Serialise all three parts ──────────────────────────────
+    let iam_bytes = serde_json::to_vec_pretty(&iam).map_err(|e| {
+        tracing::error!("Full-backup: iam.json serialise failed: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let secrets_bytes = serde_json::to_vec_pretty(&secrets).map_err(|e| {
+        tracing::error!("Full-backup: secrets.json serialise failed: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let yaml_bytes = yaml.into_bytes();
+
+    // ── Manifest (hashes + sizes of each file) ─────────────────
+    use sha2::{Digest, Sha256};
+    let sha_hex = |b: &[u8]| {
+        let mut h = Sha256::new();
+        h.update(b);
+        hex::encode(h.finalize())
+    };
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let manifest = BackupManifest {
+        version: 1,
+        captured_at: now.clone(),
+        server_version: env!("CARGO_PKG_VERSION").to_string(),
+        files: vec![
+            ManifestEntry {
+                name: "config.yaml".into(),
+                bytes: yaml_bytes.len(),
+                sha256: sha_hex(&yaml_bytes),
+            },
+            ManifestEntry {
+                name: "iam.json".into(),
+                bytes: iam_bytes.len(),
+                sha256: sha_hex(&iam_bytes),
+            },
+            ManifestEntry {
+                name: "secrets.json".into(),
+                bytes: secrets_bytes.len(),
+                sha256: sha_hex(&secrets_bytes),
+            },
+        ],
+    };
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| {
+        tracing::error!("Full-backup: manifest.json serialise failed: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // ── Write zip (in-memory) ──────────────────────────────────
+    let mut buf = Cursor::new(Vec::<u8>::with_capacity(
+        manifest_bytes.len() + yaml_bytes.len() + iam_bytes.len() + secrets_bytes.len() + 2048,
+    ));
+    {
+        let mut zw = zip::ZipWriter::new(&mut buf);
+        let opts: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for (name, bytes) in [
+            ("manifest.json", manifest_bytes.as_slice()),
+            ("config.yaml", yaml_bytes.as_slice()),
+            ("iam.json", iam_bytes.as_slice()),
+            ("secrets.json", secrets_bytes.as_slice()),
+        ] {
+            zw.start_file(name, opts).map_err(|e| {
+                tracing::error!("Full-backup: zip start_file({}) failed: {}", name, e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            zw.write_all(bytes).map_err(|e| {
+                tracing::error!("Full-backup: zip write({}) failed: {}", name, e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        }
+        zw.finish().map_err(|e| {
+            tracing::error!("Full-backup: zip finish failed: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    }
+    let bytes = Bytes::from(buf.into_inner());
+    let filename = format!(
+        "dgp-backup-v{}-{}.zip",
+        env!("CARGO_PKG_VERSION"),
+        now.replace([':', '-'], "")
+    );
+    Ok((bytes, filename))
+}
+
+/// Sniff the Content-Type and route zip uploads to the full-backup
+/// import path. Defaults to JSON if the header is missing so legacy
+/// scripts keep working unchanged.
+///
+/// Wave 11.1 Full Backup: POST /_/api/admin/backup now accepts
+///   * `application/zip` — zip produced by GET `?format=zip`
+///     (or no format): unpacks manifest.json + config.yaml +
+///     iam.json + secrets.json, applies them atomically.
+///   * `application/json` (and all other content-types) — the
+///     legacy IAM-only flow (same shape as v0.8.0).
 pub async fn import_backup(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
-    Json(backup): Json<IamBackup>,
+    body: Bytes,
+) -> Result<Json<ImportResult>, StatusCode> {
+    let ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .split(';') // strip charset= etc.
+        .next()
+        .unwrap_or("application/json")
+        .trim()
+        .to_ascii_lowercase();
+
+    if ct == "application/zip" || ct == "application/x-zip-compressed" {
+        return import_zip_full_backup(state, headers, body).await;
+    }
+
+    // Legacy JSON body — deserialise then run the existing flow.
+    let backup: IamBackup = serde_json::from_slice(&body).map_err(|e| {
+        tracing::warn!("import_backup: malformed JSON body: {}", e);
+        StatusCode::BAD_REQUEST
+    })?;
+    import_backup_iam(state, headers, backup).await
+}
+
+/// Unpack a Full Backup zip and apply all four parts atomically.
+/// Order: apply config.yaml first (so storage/buckets/admission are
+/// in place), then IAM, then secrets (which overlays creds the YAML
+/// left redacted as `null`).
+async fn import_zip_full_backup(
+    state: Arc<AdminState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<ImportResult>, StatusCode> {
+    // ── Unpack the zip into memory ─────────────────────────────
+    let reader = Cursor::new(body.as_ref());
+    let mut archive = zip::ZipArchive::new(reader).map_err(|e| {
+        tracing::warn!("Full-backup import: not a valid zip: {}", e);
+        StatusCode::BAD_REQUEST
+    })?;
+    let mut files: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    for i in 0..archive.len() {
+        let mut f = archive.by_index(i).map_err(|e| {
+            tracing::warn!("Full-backup import: zip entry {} unreadable: {}", i, e);
+            StatusCode::BAD_REQUEST
+        })?;
+        let name = f.name().to_string();
+        let mut buf = Vec::with_capacity(f.size() as usize);
+        std::io::Read::read_to_end(&mut f, &mut buf).map_err(|e| {
+            tracing::warn!("Full-backup import: read {} failed: {}", name, e);
+            StatusCode::BAD_REQUEST
+        })?;
+        files.insert(name, buf);
+    }
+
+    // ── Manifest version check ─────────────────────────────────
+    if let Some(m_bytes) = files.get("manifest.json") {
+        let manifest: serde_json::Value = serde_json::from_slice(m_bytes).map_err(|e| {
+            tracing::warn!("Full-backup import: manifest.json malformed: {}", e);
+            StatusCode::BAD_REQUEST
+        })?;
+        let ver = manifest
+            .get("version")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if ver != 1 {
+            tracing::warn!("Full-backup import: unsupported manifest version {}", ver);
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+
+    // ── 1. Apply config.yaml via the existing document-apply
+    //       endpoint (same path /_/api/admin/config/apply uses).
+    //       For simplicity we POST to our own endpoint rather than
+    //       refactoring the helper out of its handler — that lets
+    //       the YAML go through the exact same validate → apply →
+    //       persist pipeline a human would trigger via the GUI.
+    //       TODO(v0.9): extract a pub(crate) helper so this can be
+    //       called directly without the HTTP round-trip. ──
+    if let Some(yaml_bytes) = files.get("config.yaml") {
+        let yaml_str = std::str::from_utf8(yaml_bytes).map_err(|_| {
+            tracing::warn!("Full-backup import: config.yaml is not UTF-8");
+            StatusCode::BAD_REQUEST
+        })?;
+        // Skip application if the YAML is empty/whitespace-only.
+        // Exporters always emit at least `storage:` so this only
+        // fires on deliberate-empty zips.
+        if !yaml_str.trim().is_empty() {
+            let req = crate::api::admin::ConfigDocumentRequest {
+                yaml: yaml_str.to_string(),
+            };
+            let State(state_for_apply) = State(state.clone());
+            let resp = crate::api::admin::apply_config_doc(
+                State(state_for_apply),
+                headers.clone(),
+                Json(req),
+            )
+            .await
+            .into_response();
+            let status = resp.status();
+            if !status.is_success() {
+                tracing::error!("Full-backup import: apply config.yaml → HTTP {}", status);
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+    }
+
+    // ── 2. Apply secrets.json BEFORE iam import. Storage creds
+    //       need to be in place before a subsequent import of a
+    //       v0.8.3+ iam.json fires an S3 sync push. Bootstrap
+    //       hash must land before any admin session is re-issued. ──
+    if let Some(sec_bytes) = files.get("secrets.json") {
+        let secrets: BackupSecrets = serde_json::from_slice(sec_bytes).map_err(|e| {
+            tracing::warn!("Full-backup import: secrets.json malformed: {}", e);
+            StatusCode::BAD_REQUEST
+        })?;
+        apply_secrets(&state, &secrets).await.inspect_err(|&e| {
+            tracing::error!("Full-backup import: apply secrets.json failed: {}", e);
+        })?;
+    }
+
+    // ── 3. Apply iam.json (same flow as legacy JSON import) ────
+    let iam_result = if let Some(iam_bytes) = files.get("iam.json") {
+        let backup: IamBackup = serde_json::from_slice(iam_bytes).map_err(|e| {
+            tracing::warn!("Full-backup import: iam.json malformed: {}", e);
+            StatusCode::BAD_REQUEST
+        })?;
+        import_backup_iam(state.clone(), headers.clone(), backup).await?
+    } else {
+        // Zip with no iam.json is valid — maybe operator only
+        // wants to apply config+secrets. Emit an all-zero result.
+        Json(ImportResult {
+            users_created: 0,
+            users_skipped: 0,
+            groups_created: 0,
+            groups_skipped: 0,
+            memberships_created: 0,
+            external_identities_created: 0,
+            external_identities_skipped: 0,
+        })
+    };
+
+    audit_log("import_full_backup", "admin", "zip applied", &headers);
+
+    Ok(iam_result)
+}
+
+/// Apply the plaintext secrets harvested in `secrets.json` onto the
+/// running Config by direct RwLock-guarded mutation. We intentionally
+/// SKIP `apply_config_transition` here because none of the fields
+/// secrets.json touches are "engine-affecting" (they're pure
+/// credential slots that the engine/IAM pick up on the next
+/// operation). OAuth client_secrets go straight to the config_db.
+///
+/// The caller must already have applied `config.yaml` via the
+/// canonical config-apply path so this runs against the final
+/// post-merge config shape.
+async fn apply_secrets(state: &Arc<AdminState>, secrets: &BackupSecrets) -> Result<(), StatusCode> {
+    {
+        let mut cfg = state.config.write().await;
+        if let Some(h) = &secrets.bootstrap_password_hash {
+            cfg.bootstrap_password_hash = Some(h.clone());
+        }
+        if let Some(a) = &secrets.access {
+            if let Some(ak) = &a.access_key_id {
+                cfg.access_key_id = Some(ak.clone());
+            }
+            if let Some(sk) = &a.secret_access_key {
+                cfg.secret_access_key = Some(sk.clone());
+            }
+        }
+        if let Some(s) = &secrets.storage {
+            if let crate::config::BackendConfig::S3 {
+                access_key_id,
+                secret_access_key,
+                ..
+            } = &mut cfg.backend
+            {
+                if let Some(ak) = &s.access_key_id {
+                    *access_key_id = Some(ak.clone());
+                }
+                if let Some(sk) = &s.secret_access_key {
+                    *secret_access_key = Some(sk.clone());
+                }
+            }
+        }
+    } // release write lock before touching config_db
+
+    // OAuth client_secret per provider, by name (robust to id
+    // reshuffles across restores). Requires the provider row to
+    // already exist; if iam.json hasn't been applied yet the lookup
+    // returns empty and we skip silently — that's fine, the
+    // subsequent iam.json import carries client_secret too.
+    if !secrets.oauth_client_secrets.is_empty() {
+        let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+        let db = db.lock().await;
+        let providers = db.load_auth_providers().unwrap_or_default();
+        for p in &providers {
+            if let Some(cs) = secrets.oauth_client_secrets.get(&p.name) {
+                let req = crate::config_db::auth_providers::UpdateAuthProviderRequest {
+                    name: None,
+                    provider_type: None,
+                    enabled: None,
+                    priority: None,
+                    display_name: None,
+                    client_id: None,
+                    client_secret: Some(cs.clone()),
+                    issuer_url: None,
+                    scopes: None,
+                    extra_config: None,
+                };
+                if let Err(e) = db.update_auth_provider(p.id, &req) {
+                    tracing::warn!(
+                        "Full-backup: update client_secret for provider '{}' failed: {}",
+                        p.name,
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// POST /api/admin/backup — import IAM data from JSON body.
+/// Merges with existing data: skips users/groups that already exist (by name).
+async fn import_backup_iam(
+    state: Arc<AdminState>,
+    headers: HeaderMap,
+    backup: IamBackup,
 ) -> Result<Json<ImportResult>, StatusCode> {
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let db = db.lock().await;

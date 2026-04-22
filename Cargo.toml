@@ -56,6 +56,12 @@ aes-gcm = "0.10"
 # XML for S3 responses
 quick-xml = { version = "0.36", features = ["serialize"] }
 
+# ZIP archive (Full Backup). Pure-Rust deflate via flate2 (no system
+# zlib). Used by the backup export/import handlers to bundle
+# config.yaml + iam.json + secrets.json + manifest.json into a single
+# atomic artifact.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
 # Utilities
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 thiserror = "2"
