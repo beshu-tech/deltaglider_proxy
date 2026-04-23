@@ -194,14 +194,27 @@ impl TestServer {
             .expect("health check client");
 
         for _ in 0..150 {
+            // Check the child process FIRST. If an earlier stray
+            // server is holding our port, our child will fail to bind
+            // and exit non-zero — we must detect that before the
+            // health check, otherwise we'd observe the stray server's
+            // /health and incorrectly report ready, then the test
+            // fires requests at a server whose auth config it doesn't
+            // know (classic cause of "AccessDenied" with no obvious
+            // explanation).
+            if let Ok(Some(status)) = self.process.try_wait() {
+                panic!(
+                    "Test proxy on port {} exited before becoming ready: {status}. \
+                     Usually means another process was already listening on this \
+                     port — check with `lsof -i :{}`.",
+                    self.port, self.port
+                );
+            }
+
             if let Ok(resp) = client.get(&health_url).send().await {
                 if resp.status().is_success() {
                     return;
                 }
-            }
-
-            if let Ok(Some(status)) = self.process.try_wait() {
-                panic!("Server exited before becoming ready: {}", status);
             }
 
             sleep(Duration::from_millis(100)).await;
