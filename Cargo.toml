@@ -109,3 +109,9 @@ reqwest = { version = "0.12", features = ["json", "cookies"] }
 testcontainers = "0.26"
 testcontainers-modules = { version = "0.14", features = ["minio"] }
 walkdir = "2"
+# Already transitive via aws-sdk-s3; named here so storage/s3.rs unit
+# tests can construct `SdkError::service_error(...)` values directly
+# for the error-classification test battery. Pinned to a version range
+# compatible with whatever aws-sdk-s3 1.x resolves.
+aws-smithy-runtime-api = "1"
+aws-smithy-types = "1"

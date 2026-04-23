@@ -1521,3 +1521,186 @@ impl StorageBackend for S3Backend {
         Ok(())
     }
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Unit tests for error classification.
+//
+// Rationale: `classify_s3_error` and `classify_get_error` are pure
+// functions on `&SdkError<T>` — every call site in this file funnels
+// errors through them. A wrong classification silently turns a
+// retryable-transient into a propagated 500, or mislabels a
+// legitimate AccessDenied as BucketNotFound. Before this module, the
+// only coverage was integration tests against MinIO, which doesn't
+// reproduce the Hetzner/Ceph 403-for-missing-bucket quirk that the
+// code explicitly handles.
+//
+// We construct `SdkError` values directly instead of pulling in
+// `aws-smithy-mocks` — the dep isn't in the tree, the helpers we
+// need (`SdkError::service_error`, `Response::new`) are already
+// in-tree via existing transitive dependencies, and constructing a
+// ServiceError for a classifier test is ~3 lines, not a mock server.
+// ────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aws_sdk_s3::operation::get_object::GetObjectError;
+    use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+    use aws_smithy_runtime_api::http::StatusCode;
+    use aws_smithy_types::body::SdkBody;
+
+    /// Build a minimal `HttpResponse` with the given status code and an
+    /// optional `x-amz-request-id` header. The SDK uses both to populate
+    /// the structured diagnostic fields we assert on.
+    fn http_response(status: u16, request_id: Option<&str>) -> HttpResponse {
+        let sc = StatusCode::try_from(status).expect("valid status");
+        let mut resp = HttpResponse::new(sc, SdkBody::empty());
+        if let Some(rid) = request_id {
+            resp.headers_mut()
+                .insert("x-amz-request-id", rid.to_string());
+        }
+        resp
+    }
+
+    /// Construct a real `SdkError::ServiceError` wrapping a
+    /// `GetObjectError::NoSuchKey`. Used for the classify_get_error
+    /// happy path.
+    fn no_such_key_error(status: u16) -> SdkError<GetObjectError> {
+        let inner =
+            GetObjectError::NoSuchKey(aws_sdk_s3::types::error::NoSuchKey::builder().build());
+        SdkError::service_error(inner, http_response(status, Some("req-1")))
+    }
+
+    /// Classify GetObject NoSuchKey (S3's canonical "key doesn't exist")
+    /// as `StorageError::NotFound(key)`. Without this mapping, callers
+    /// would see a generic S3 error string and fail to map it to a 404
+    /// on the client.
+    #[test]
+    fn classify_get_error_maps_no_such_key_to_not_found() {
+        let err = no_such_key_error(404);
+        let classified = S3Backend::classify_get_error("my-bucket", "missing.bin", &err);
+        match classified {
+            StorageError::NotFound(key) => assert_eq!(key, "missing.bin"),
+            other => panic!("expected NotFound, got {:?}", other),
+        }
+    }
+
+    /// An object-level 403 must stay `S3(...)` — never get rewritten to
+    /// BucketNotFound. The Hetzner/Ceph quirk only applies to bucket-
+    /// level operations; a GetObject 403 is a legitimate AccessDenied
+    /// and callers need to surface it as such.
+    #[test]
+    fn classify_get_error_keeps_object_level_403_as_s3_error() {
+        // Build a ServiceError wrapping a generic (non-NoSuchKey) variant
+        // with a 403 status; the caller treats this as GetObject context.
+        let inner = GetObjectError::generic(
+            aws_smithy_types::error::ErrorMetadata::builder()
+                .code("AccessDenied")
+                .build(),
+        );
+        let err = SdkError::service_error(inner, http_response(403, Some("req-2")));
+        let classified = S3Backend::classify_get_error("my-bucket", "locked.bin", &err);
+        // MUST NOT be BucketNotFound — GetObject is object-level.
+        match classified {
+            StorageError::BucketNotFound(_) => {
+                panic!("403 on GetObject must not be misclassified as BucketNotFound")
+            }
+            StorageError::NotFound(_) => {
+                panic!("403 AccessDenied must not be misclassified as NotFound")
+            }
+            StorageError::S3(msg) => {
+                assert!(
+                    msg.contains("403"),
+                    "status should appear in message: {msg}"
+                );
+                assert!(
+                    msg.contains("get_object"),
+                    "op should appear in message: {msg}"
+                );
+            }
+            other => panic!("expected S3, got {:?}", other),
+        }
+    }
+
+    /// A 403 from a bucket-level operation (ListObjects) MUST be
+    /// rewritten to BucketNotFound. S3-compatible providers (MinIO,
+    /// Ceph) return 403 instead of 404 for non-existent buckets, to
+    /// prevent enumeration. Without this mapping, `GET /nosuch-bucket/`
+    /// would propagate as a 500 S3 error instead of the correct 404.
+    #[test]
+    fn classify_s3_error_rewrites_bucket_level_403_to_bucket_not_found() {
+        let inner = aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error::generic(
+            aws_smithy_types::error::ErrorMetadata::builder()
+                .code("AccessDenied")
+                .build(),
+        );
+        let err: SdkError<_> = SdkError::service_error(inner, http_response(403, Some("req-3")));
+        let classified = S3Backend::classify_s3_error("ghost-bucket", &err, S3Op::ListObjects);
+        match classified {
+            StorageError::BucketNotFound(bucket) => assert_eq!(bucket, "ghost-bucket"),
+            other => panic!(
+                "expected BucketNotFound for bucket-level 403, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// An explicit `NoSuchBucket` error string always maps to
+    /// BucketNotFound, regardless of status or operation. This catches
+    /// S3-compatible providers that do return the canonical error code
+    /// in the body even if they pick a non-404 status.
+    #[test]
+    fn classify_s3_error_recognizes_explicit_no_such_bucket() {
+        let inner = aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error::generic(
+            aws_smithy_types::error::ErrorMetadata::builder()
+                .code("NoSuchBucket")
+                .build(),
+        );
+        let err: SdkError<_> = SdkError::service_error(inner, http_response(404, Some("req-4")));
+        let classified = S3Backend::classify_s3_error("bucket", &err, S3Op::ListObjects);
+        match classified {
+            StorageError::BucketNotFound(bucket) => assert_eq!(bucket, "bucket"),
+            other => panic!("expected BucketNotFound, got {:?}", other),
+        }
+    }
+
+    /// A 500 from a bucket-level op is NOT a bucket-not-found signal.
+    /// Should stay S3 with status visible so the caller can see the
+    /// upstream failure.
+    #[test]
+    fn classify_s3_error_preserves_bucket_level_500() {
+        let inner = aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error::generic(
+            aws_smithy_types::error::ErrorMetadata::builder()
+                .code("InternalError")
+                .build(),
+        );
+        let err: SdkError<_> = SdkError::service_error(inner, http_response(500, Some("req-5")));
+        let classified = S3Backend::classify_s3_error("bucket", &err, S3Op::ListObjects);
+        match classified {
+            StorageError::S3(msg) => {
+                assert!(msg.contains("500"), "status must be in message: {msg}");
+                assert!(!msg.is_empty(), "S3 error message must not be empty");
+            }
+            other => panic!("expected S3, got {:?}", other),
+        }
+    }
+
+    /// `S3Op::is_bucket_level` is the table driving the 403 rewrite.
+    /// Guard that truth-table explicitly — if someone adds a new op
+    /// variant and forgets to decide its level, this test will still
+    /// document the current contract.
+    #[test]
+    fn s3_op_is_bucket_level_truth_table() {
+        // Bucket-level: 403 from these MUST rewrite to BucketNotFound.
+        assert!(S3Op::ListObjects.is_bucket_level());
+        assert!(S3Op::CreateBucket.is_bucket_level());
+
+        // Object-level: 403 from these must NOT rewrite. An AccessDenied
+        // on GetObject / HeadObject / DeleteObject / PutObject is a
+        // legitimate permission denial and the caller must see it as-is.
+        assert!(!S3Op::GetObject.is_bucket_level());
+        assert!(!S3Op::PutObject.is_bucket_level());
+        assert!(!S3Op::HeadObject.is_bucket_level());
+        assert!(!S3Op::DeleteObject.is_bucket_level());
+        assert!(!S3Op::Other("delete_bucket").is_bucket_level());
+    }
+}
