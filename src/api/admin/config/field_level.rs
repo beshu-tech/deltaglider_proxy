@@ -82,6 +82,11 @@ pub struct ConfigResponse {
     iam_mode: crate::config_sections::IamMode,
     // Fields that differ from the TOML config file on disk
     tainted_fields: Vec<String>,
+    // Encryption-at-rest status. Exposes a boolean ONLY — the key
+    // itself is an infra secret and never leaves the server. Drives
+    // the encryption panel's status indicator and the per-bucket
+    // "encrypted at rest" badge in BucketsPanel.
+    encryption_enabled: bool,
 }
 
 /// Sanitized backend info (no secrets) for the admin API.
@@ -390,6 +395,10 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
         // UI can drive the `iam_mode: declarative` banner + toggle.
         iam_mode: cfg.iam_mode,
         tainted_fields,
+        // Expose presence of the key as a boolean ONLY. Never leaks
+        // the key material itself — that stays in the infra-secret
+        // bucket and is redacted from every public surface.
+        encryption_enabled: cfg.encryption_key.is_some(),
     })
 }
 

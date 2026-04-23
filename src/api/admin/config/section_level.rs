@@ -757,6 +757,26 @@ fn apply_merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) 
 /// name so reorders surface as a single pair of before/after lists
 /// rather than N spurious per-index changes. (Other sections are
 /// scalar-heavy so per-field is enough.)
+/// Map a secret's plaintext to a deterministic, non-reversible
+/// placeholder suitable for the Apply-dialog diff. Preserved secrets
+/// compare equal (same fingerprint); rotations show a readable
+/// swap (`fp:abc12345…` → `fp:def67890…`) without leaking material.
+///
+/// Used for `encryption_key` specifically. The SigV4 pair and backend
+/// creds are handled by `redact_all_secrets`, which nulls them — they
+/// don't rotate through this endpoint (SigV4 has its own preservation
+/// logic, backend creds are per-item).
+///
+/// 8-hex-char truncation is enough to distinguish rotations
+/// practically; the full SHA-256 is needlessly long in the UI.
+fn fingerprint_secret(plaintext: Option<&str>) -> Option<String> {
+    plaintext.map(|pt| {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(pt.as_bytes());
+        format!("fp:{}", hex::encode(&digest[..4]))
+    })
+}
+
 fn compute_section_diff(
     section: SectionName,
     old_cfg: &crate::config::Config,
@@ -768,10 +788,24 @@ fn compute_section_diff(
     // dialog — operators would see "password changed" on a plain
     // `advanced.max_delta_ratio` edit. Redacting both means secrets
     // either compare-equal (preserved) or both appear as the same
-    // redaction placeholder; real secret rotations still surface
-    // because the runtime vs. incoming plaintext differs.
-    let old_sectioned = SectionedConfig::from_flat(&old_cfg.redact_all_secrets());
-    let new_sectioned = SectionedConfig::from_flat(&new_cfg.redact_all_secrets());
+    // redaction placeholder.
+    //
+    // Rotatable secrets (encryption_key) need special handling:
+    // `redact_all_secrets` nulls BOTH sides, which hides real
+    // rotations from the diff view. Fingerprint them instead —
+    // each plaintext maps to a deterministic-but-non-reversible
+    // placeholder, so unchanged keys compare equal and rotations
+    // surface a readable `"fp:abc123… → fp:def456…"` swap without
+    // leaking material.
+    let mut old_redacted = old_cfg.redact_all_secrets();
+    let mut new_redacted = new_cfg.redact_all_secrets();
+    // Restore encryption_key as a fingerprint so rotations show in
+    // the diff. The original plaintexts were nulled above; we
+    // re-derive the fingerprints from the ORIGINAL configs.
+    old_redacted.encryption_key = fingerprint_secret(old_cfg.encryption_key.as_deref());
+    new_redacted.encryption_key = fingerprint_secret(new_cfg.encryption_key.as_deref());
+    let old_sectioned = SectionedConfig::from_flat(&old_redacted);
+    let new_sectioned = SectionedConfig::from_flat(&new_redacted);
 
     let (old_json, new_json) = match section {
         SectionName::Admission => (

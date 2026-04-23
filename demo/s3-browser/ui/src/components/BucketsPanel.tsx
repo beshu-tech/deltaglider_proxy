@@ -142,6 +142,10 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [backends, setBackends] = useState<BackendInfo[]>([]);
   const [availableBuckets, setAvailableBuckets] = useState<string[]>([]);
+  // Global encryption-at-rest status — not per-bucket (the key is a
+  // single infra secret), but we show an "Encrypted at rest" badge
+  // on every bucket row for visual parity with compression.
+  const [encryptionEnabled, setEncryptionEnabled] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -162,6 +166,7 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
       setRows(nextRows);
       setBackends(bs);
       setAvailableBuckets(realBuckets.map((b) => b.name));
+      setEncryptionEnabled(cfg.encryption_enabled ?? false);
       setDirty(false);
       setError(null);
     } catch (e) {
@@ -318,6 +323,7 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
               key={idx}
               row={row}
               backends={backends}
+              encryptionEnabled={encryptionEnabled}
               availableBuckets={availableBuckets.filter(
                 (b) => !rows.some((r, i) => i !== idx && r.name === b)
               )}
@@ -370,6 +376,10 @@ interface CardProps {
   row: BucketPolicyRow;
   backends: BackendInfo[];
   availableBuckets: string[];
+  // Global encryption-at-rest status. Not per-bucket, but rendered
+  // on every row as a compact badge (parity with the compression
+  // indicator in the same row).
+  encryptionEnabled: boolean;
   onChange: (patch: Partial<BucketPolicyRow>) => void;
   onDelete: () => void;
   inputRadius: { borderRadius: number };
@@ -379,6 +389,7 @@ function BucketCard({
   row,
   backends,
   availableBuckets,
+  encryptionEnabled,
   onChange,
   onDelete,
   inputRadius,
@@ -474,6 +485,47 @@ function BucketCard({
               />
             </>
           )}
+          {/* Encryption-at-rest badge. Global status, shown here for
+             visual parity with the compression toggle. Click-through
+             to the dedicated Encryption panel would be nice; leaving
+             it as a read-only indicator to keep the interaction
+             surface minimal. */}
+          <span
+            title={
+              encryptionEnabled
+                ? 'Objects are encrypted at rest with AES-256-GCM (global setting)'
+                : 'Encryption at rest is disabled globally — objects on disk are plaintext'
+            }
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 4,
+              marginLeft: 12,
+              fontSize: 10,
+              fontWeight: 600,
+              letterSpacing: 0.4,
+              textTransform: 'uppercase',
+              padding: '2px 8px',
+              borderRadius: 10,
+              background: encryptionEnabled
+                ? `${colors.ACCENT_GREEN}22`
+                : `${colors.TEXT_MUTED}22`,
+              color: encryptionEnabled ? colors.ACCENT_GREEN : colors.TEXT_MUTED,
+              cursor: 'help',
+            }}
+          >
+            <span
+              style={{
+                width: 6,
+                height: 6,
+                borderRadius: '50%',
+                background: encryptionEnabled
+                  ? colors.ACCENT_GREEN
+                  : colors.TEXT_MUTED,
+              }}
+            />
+            {encryptionEnabled ? 'Encrypted at rest' : 'Not encrypted'}
+          </span>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
           <Text style={{ fontSize: 11, color: colors.TEXT_MUTED }}>Alias:</Text>

@@ -103,6 +103,10 @@ export interface AdminConfig {
   iam_mode: IamMode;
   // Taint detection
   tainted_fields: string[];
+  // Encryption-at-rest status (no key material — just presence).
+  // Drives the EncryptionPanel status badge and the per-bucket
+  // "Encrypted at rest" indicator in BucketsPanel.
+  encryption_enabled: boolean;
 }
 
 export type IamMode = 'gui' | 'declarative';

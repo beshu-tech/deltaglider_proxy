@@ -30,6 +30,7 @@ import AdminSidebar from './AdminSidebar';
 import AdmissionPanel from './AdmissionPanel';
 import CredentialsModePanel from './CredentialsModePanel';
 import BucketsPanel from './BucketsPanel';
+import EncryptionPanel from './EncryptionPanel';
 import CopySectionYamlButton from './CopySectionYamlButton';
 import SetupWizard from './SetupWizard';
 import TracePanel from './TracePanel';
@@ -193,6 +194,11 @@ const PAGE_HEADERS: Record<string, { icon: React.ReactNode; title: string; descr
     icon: <CloudOutlined />,
     title: 'Buckets',
     description: 'Per-bucket policies: compression overrides, delta ratio, public prefixes, quotas, aliases.',
+  },
+  'configuration/storage/encryption': {
+    icon: <CloudOutlined />,
+    title: 'Encryption at rest',
+    description: 'AES-256-GCM applied to every object before it hits the storage backend. Global switch; see Buckets for per-bucket visibility.',
   },
   'configuration/advanced/listener': {
     icon: <CloudServerOutlined />,
@@ -638,6 +644,14 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
         <>
           {header}
           <BucketsPanel onSessionExpired={onSessionExpired} />
+        </>
+      );
+    }
+    if (adminPath === 'configuration/storage/encryption') {
+      return (
+        <>
+          {header}
+          <EncryptionPanel onSessionExpired={onSessionExpired} />
         </>
       );
     }
