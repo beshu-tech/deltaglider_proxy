@@ -84,6 +84,9 @@ pub use field_level::{
     ConfigUpdateResponse,
 };
 pub use password::{change_password, recover_db, PasswordChangeRequest, PasswordChangeResponse};
+// `sync_now` + `SyncNowResponse` are defined inline further down in
+// this module (alongside `test_s3_connection`); re-export them here
+// for parent modules that pull the whole `config` surface up.
 pub use section_level::{get_section, put_section, validate_section, SectionApplyResponse};
 pub use trace::{trace_config, trace_config_get, TraceRequest, TraceResolved, TraceResponse};
 
@@ -498,5 +501,86 @@ pub async fn test_s3_connection(
             error: Some("Connection timed out after 10 seconds".to_string()),
             error_kind: Some("timeout".to_string()),
         }),
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// POST /api/admin/config/sync-now
+// ────────────────────────────────────────────────────────────────────
+//
+// Operator-triggered config DB S3 sync.
+//
+// The background task runs every 5 minutes (see startup.rs::
+// spawn_config_sync_poll). This endpoint lets an operator force an
+// immediate check-and-pull without waiting for the next tick, which
+// is useful when:
+//
+//   - A recent out-of-band mutation (e.g. from a different replica or
+//     a restore) needs to propagate faster than 5 min.
+//   - Integration tests need a deterministic barrier (same spirit as
+//     the iam/version counter — poll instead of sleep).
+//
+// Only pulls (downloads newer state), never pushes. The push side is
+// triggered automatically by every IAM mutation via
+// `trigger_config_sync`.
+
+#[derive(Serialize)]
+pub struct SyncNowResponse {
+    /// True if this call actually downloaded + applied a newer copy.
+    /// False means local copy is current (ETag unchanged) or sync is
+    /// disabled on this instance.
+    downloaded: bool,
+    /// Human-readable status. Always present; drives the GUI toast.
+    status: String,
+}
+
+/// POST /api/admin/config/sync-now — force an immediate pull from the
+/// config-sync S3 bucket and reopen the IAM database if newer.
+///
+/// Returns 404 when `config_sync_bucket` is not configured (this
+/// instance isn't part of a sync group). 200 on any outcome when
+/// sync IS configured — the response body says whether a download
+/// actually happened.
+pub async fn sync_now(
+    State(state): State<Arc<AdminState>>,
+) -> Result<Json<SyncNowResponse>, axum::http::StatusCode> {
+    let sync = state
+        .config_sync
+        .as_ref()
+        .ok_or(axum::http::StatusCode::NOT_FOUND)?;
+
+    match sync.poll_and_sync().await {
+        Ok(true) => {
+            // New state downloaded — reopen the DB and rebuild IAM, exactly
+            // as the periodic poll does. Kept consistent by funnelling
+            // through the same helper (`reopen_and_rebuild_iam` in the
+            // config_db_sync module).
+            //
+            // Clone the password hash OUT of the RwLock before crossing
+            // `.await`: parking_lot guards are not Send, and holding one
+            // across an await would block the task's Send contract even
+            // though logically we only need the string value.
+            let password_hash = state.password_hash.read().clone();
+            crate::config_db_sync::reopen_and_rebuild_iam(
+                &state.config_db,
+                &password_hash,
+                &state.iam_state,
+                &state.external_auth,
+                "sync-now endpoint",
+            )
+            .await;
+            Ok(Json(SyncNowResponse {
+                downloaded: true,
+                status: "Downloaded newer config DB and reloaded IAM".to_string(),
+            }))
+        }
+        Ok(false) => Ok(Json(SyncNowResponse {
+            downloaded: false,
+            status: "Local copy is current (ETag unchanged)".to_string(),
+        })),
+        Err(e) => {
+            tracing::warn!("sync-now failed: {e}");
+            Err(axum::http::StatusCode::BAD_GATEWAY)
+        }
     }
 }

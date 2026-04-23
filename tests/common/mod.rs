@@ -296,6 +296,15 @@ pub struct TestServerBuilder {
     /// (`admission.blocks`, `access.iam_mode: declarative`) — TOML
     /// persistence refuses those via H4.
     yaml_config: bool,
+    /// S3 bucket for config DB sync (multi-replica HA mode). When set,
+    /// `config_sync_bucket` is written to the config; server's startup
+    /// downloads if newer, and every IAM mutation re-uploads.
+    config_sync_bucket: Option<String>,
+    /// Override the bootstrap password. Default: [`TEST_BOOTSTRAP_PASSWORD`].
+    /// Used by HA-sync tests that want server A and server B to have
+    /// DIFFERENT passwords (to verify the wrong-passphrase-rejection
+    /// path).
+    bootstrap_password: Option<String>,
 }
 
 impl Default for TestServerBuilder {
@@ -310,6 +319,8 @@ impl Default for TestServerBuilder {
             bucket_policies: Vec::new(),
             encryption_key: None,
             yaml_config: false,
+            config_sync_bucket: None,
+            bootstrap_password: None,
         }
     }
 }
@@ -369,6 +380,33 @@ impl TestServerBuilder {
         self
     }
 
+    /// Set the S3 bucket for config DB HA sync. When set, the server
+    /// syncs its encrypted IAM database to/from this bucket on startup
+    /// + every IAM mutation + every 5-minute poll tick.
+    ///
+    /// Tests that want to observe propagation between two replicas
+    /// point both at the same sync_bucket (with the same bootstrap
+    /// password). Tests that want to observe rejection of a wrong-
+    /// password replica point at the same sync_bucket with DIFFERENT
+    /// bootstrap passwords via [`bootstrap_password`].
+    ///
+    /// Requires an S3 backend (`s3_endpoint`); the proxy refuses to
+    /// start with a filesystem backend + sync_bucket.
+    pub fn config_sync_bucket(mut self, bucket: &str) -> Self {
+        self.config_sync_bucket = Some(bucket.to_string());
+        self
+    }
+
+    /// Override the bootstrap password for this server. Default is
+    /// [`TEST_BOOTSTRAP_PASSWORD`] (`testpass`) shared by every
+    /// TestServer — giving HA-sync tests a way to spawn a replica
+    /// with a DIFFERENT password to exercise the wrong-passphrase
+    /// rejection path in `download_if_newer`.
+    pub fn bootstrap_password(mut self, password: &str) -> Self {
+        self.bootstrap_password = Some(password.to_string());
+        self
+    }
+
     /// Build the config string and spawn the test server. Format
     /// depends on the `yaml_config` flag (TOML by default).
     pub async fn build(self) -> TestServer {
@@ -400,8 +438,15 @@ impl TestServerBuilder {
     fn build_toml_config(&self) -> (String, Option<TempDir>) {
         let mut config = String::new();
 
-        // Set a known bootstrap password hash so tests can log into the admin API
-        let bootstrap_hash = bcrypt::hash(TEST_BOOTSTRAP_PASSWORD, 4).expect("bcrypt hash failed");
+        // Set a known bootstrap password hash so tests can log into
+        // the admin API. HA-sync tests can override via
+        // `bootstrap_password()` to spawn a replica with a different
+        // password (wrong-passphrase rejection test).
+        let password_plaintext = self
+            .bootstrap_password
+            .as_deref()
+            .unwrap_or(TEST_BOOTSTRAP_PASSWORD);
+        let bootstrap_hash = bcrypt::hash(password_plaintext, 4).expect("bcrypt hash failed");
         config.push_str(&format!(
             "bootstrap_password_hash = \"{}\"\n",
             bootstrap_hash
@@ -416,6 +461,9 @@ impl TestServerBuilder {
         }
         if let Some(n) = self.codec_concurrency {
             config.push_str(&format!("codec_concurrency = {}\n", n));
+        }
+        if let Some(ref sync_bucket) = self.config_sync_bucket {
+            config.push_str(&format!("config_sync_bucket = \"{}\"\n", sync_bucket));
         }
         if let Some((ref key_id, ref secret)) = self.auth_creds {
             config.push_str(&format!(
@@ -469,7 +517,11 @@ impl TestServerBuilder {
     fn build_yaml_config(&self) -> (String, Option<TempDir>) {
         let mut config = String::new();
 
-        let bootstrap_hash = bcrypt::hash(TEST_BOOTSTRAP_PASSWORD, 4).expect("bcrypt hash failed");
+        let password_plaintext = self
+            .bootstrap_password
+            .as_deref()
+            .unwrap_or(TEST_BOOTSTRAP_PASSWORD);
+        let bootstrap_hash = bcrypt::hash(password_plaintext, 4).expect("bcrypt hash failed");
         config.push_str(&format!(
             "bootstrap_password_hash: \"{}\"\n",
             bootstrap_hash
@@ -483,6 +535,9 @@ impl TestServerBuilder {
         }
         if let Some(n) = self.codec_concurrency {
             config.push_str(&format!("codec_concurrency: {}\n", n));
+        }
+        if let Some(ref sync_bucket) = self.config_sync_bucket {
+            config.push_str(&format!("config_sync_bucket: \"{}\"\n", sync_bucket));
         }
         if let Some((ref key_id, ref secret)) = self.auth_creds {
             config.push_str(&format!(
@@ -545,8 +600,15 @@ impl Drop for TestServer {
 }
 
 /// Create a reqwest client that is logged in to the admin API.
-/// Uses the known TEST_BOOTSTRAP_PASSWORD to authenticate.
+/// Uses the known [`TEST_BOOTSTRAP_PASSWORD`] to authenticate.
 pub async fn admin_http_client(endpoint: &str) -> reqwest::Client {
+    admin_http_client_with_password(endpoint, TEST_BOOTSTRAP_PASSWORD).await
+}
+
+/// Like [`admin_http_client`] but with an explicit bootstrap password.
+/// Used by HA-sync tests that spawn a replica with a non-default
+/// password via [`TestServerBuilder::bootstrap_password`].
+pub async fn admin_http_client_with_password(endpoint: &str, password: &str) -> reqwest::Client {
     let jar = std::sync::Arc::new(reqwest::cookie::Jar::default());
     let client = reqwest::Client::builder()
         .cookie_provider(jar)
@@ -555,7 +617,7 @@ pub async fn admin_http_client(endpoint: &str) -> reqwest::Client {
 
     let resp = client
         .post(format!("{}/_/api/admin/login", endpoint))
-        .json(&serde_json::json!({"password": TEST_BOOTSTRAP_PASSWORD}))
+        .json(&serde_json::json!({ "password": password }))
         .send()
         .await
         .expect("Admin login request failed");

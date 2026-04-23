@@ -537,53 +537,11 @@ pub async fn init_config_sync(
     Some(sync)
 }
 
-/// Reopen the config DB after an S3 download and rebuild the IAM index.
-pub async fn reopen_and_rebuild_iam(
-    config_db: &Option<Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::ConfigDb>>>,
-    admin_password_hash: &str,
-    iam_state: &SharedIamState,
-    external_auth: &Option<Arc<deltaglider_proxy::iam::external_auth::ExternalAuthManager>>,
-    context: &str,
-) {
-    if let Some(ref db_arc) = config_db {
-        let mut db = db_arc.lock().await;
-        if let Err(e) = db.reopen(admin_password_hash) {
-            warn!(
-                "Config DB S3 sync ({}): failed to reopen after download: {}",
-                context, e
-            );
-        } else {
-            // Rebuild IAM index from the new DB
-            let users = db.load_users().unwrap_or_default();
-            let groups = db.load_groups().unwrap_or_default();
-            let count = users.len();
-            let group_count = groups.len();
-            let state = deltaglider_proxy::iam::IamIndex::build_iam_state(users, groups);
-            if matches!(&state, IamState::Iam(_)) {
-                info!(
-                    "IAM index rebuilt from S3-synced DB ({} users, {} groups) [{}]",
-                    count, group_count, context
-                );
-            }
-            iam_state.store(Arc::new(state));
-
-            // Rebuild ExternalAuthManager from the new DB
-            if let Some(ref ext_auth) = external_auth {
-                let providers = db.load_auth_providers().unwrap_or_default();
-                if !providers.is_empty() {
-                    ext_auth.rebuild(&providers);
-                    drop(db); // Release lock before async discovery
-                    ext_auth.discover_all().await;
-                    info!(
-                        "External auth providers rebuilt from S3-synced DB ({} providers) [{}]",
-                        ext_auth.provider_names().len(),
-                        context
-                    );
-                }
-            }
-        }
-    }
-}
+// `reopen_and_rebuild_iam` moved to `deltaglider_proxy::config_db_sync`
+// so it can be shared by the admin `POST /api/admin/config/sync-now`
+// endpoint (which lives in the library, not the binary). Re-exported
+// here as the same symbol so call sites in this file keep working.
+pub use deltaglider_proxy::config_db_sync::reopen_and_rebuild_iam;
 
 /// Spawn periodic config DB S3 sync poll (every 5 minutes).
 pub fn spawn_config_sync_poll(

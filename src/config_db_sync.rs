@@ -14,11 +14,13 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tokio::sync::{Mutex, RwLock};
+use tracing::{debug, info, warn};
 
 use crate::config::BackendConfig;
 use crate::config_db::ConfigDb;
+use crate::iam::external_auth::ExternalAuthManager;
+use crate::iam::{IamIndex, IamState, SharedIamState};
 
 /// S3 key for the config database file.
 const S3_CONFIG_KEY: &str = ".deltaglider/config.db";
@@ -278,5 +280,73 @@ impl ConfigDbSync {
         }
 
         Ok(data)
+    }
+}
+
+/// Reopen the config DB file after an S3-sync download has replaced it
+/// on disk, and rebuild the in-memory IAM index from the new content.
+///
+/// Moved into `config_db_sync` so it can be shared by:
+///   - startup sync (`init_config_sync`)
+///   - the periodic poll task (`spawn_config_sync_poll`)
+///   - the operator-triggered `POST /api/admin/config/sync-now` endpoint
+///
+/// Previously lived in `src/startup.rs`, which is a binary-only module
+/// (not re-exported by `lib.rs`), so the admin handler couldn't reach
+/// it. Keeping this function in the library side preserves the "one
+/// path for config-sync state application" invariant — any future
+/// trigger mounts on top without re-implementing IAM index + external
+/// auth rebuild.
+///
+/// Gracefully no-ops when `config_db` is `None` (legacy/open-access
+/// mode, no IAM DB to reopen).
+pub async fn reopen_and_rebuild_iam(
+    config_db: &Option<Arc<Mutex<ConfigDb>>>,
+    admin_password_hash: &str,
+    iam_state: &SharedIamState,
+    external_auth: &Option<Arc<ExternalAuthManager>>,
+    context: &str,
+) {
+    let Some(db_arc) = config_db else {
+        return;
+    };
+    let mut db = db_arc.lock().await;
+    if let Err(e) = db.reopen(admin_password_hash) {
+        warn!(
+            "Config DB S3 sync ({}): failed to reopen after download: {}",
+            context, e
+        );
+        return;
+    }
+
+    // Rebuild IAM index from the new DB
+    let users = db.load_users().unwrap_or_default();
+    let groups = db.load_groups().unwrap_or_default();
+    let count = users.len();
+    let group_count = groups.len();
+    let state = IamIndex::build_iam_state(users, groups);
+    if matches!(&state, IamState::Iam(_)) {
+        info!(
+            "IAM index rebuilt from S3-synced DB ({} users, {} groups) [{}]",
+            count, group_count, context
+        );
+    }
+    iam_state.store(Arc::new(state));
+
+    // Rebuild ExternalAuthManager from the new DB. Release the DB
+    // lock before the async discovery round — it can take seconds
+    // against real OIDC providers.
+    if let Some(ref ext_auth) = external_auth {
+        let providers = db.load_auth_providers().unwrap_or_default();
+        if !providers.is_empty() {
+            ext_auth.rebuild(&providers);
+            drop(db);
+            ext_auth.discover_all().await;
+            info!(
+                "External auth providers rebuilt from S3-synced DB ({} providers) [{}]",
+                ext_auth.provider_names().len(),
+                context
+            );
+        }
     }
 }

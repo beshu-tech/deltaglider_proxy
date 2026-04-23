@@ -150,6 +150,10 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         .route("/_/api/admin/password", put(admin::change_password))
         .route("/_/api/admin/session", get(admin::check_session))
         .route("/_/api/admin/test-s3", post(admin::test_s3_connection))
+        // Operator-triggered config-sync pull. Useful for multi-replica
+        // deployments that want immediate propagation instead of
+        // waiting for the 5-minute poll tick.
+        .route("/_/api/admin/config/sync-now", post(admin::sync_now))
         // Multi-backend management
         .route(
             "/_/api/admin/backends",
