@@ -1,5 +1,110 @@
 # Changelog
 
+## v0.8.10
+
+A QA-focused release. No user-facing behaviour changes in the S3 API
+or delta codec. Two new admin endpoints, targeted new coverage for
+hot paths, and a sharper test suite overall.
+
+### New admin affordances
+
+- **`POST /api/admin/config/sync-now`** — operator-triggered pull
+  from the config-sync S3 bucket. Previously only reachable by
+  waiting up to 5 minutes for the periodic poll. Useful for
+  multi-replica deployments wanting immediate IAM propagation after
+  an out-of-band mutation. Returns 404 when `config_sync_bucket` is
+  unset, 200 with `{downloaded, status}` otherwise.
+- **`GET /api/admin/iam/version`** — monotonic counter bumped on
+  every IAM index rebuild (user/group CRUD, OAuth provider change,
+  mapping-rule edit). Public on purpose — exposes only an opaque
+  number. Powers the `wait_for_iam_rebuild` test barrier and is
+  generally useful for scripting "wait for propagation."
+
+### Shared helper moved into the library
+
+`reopen_and_rebuild_iam` relocated from `src/startup.rs` (binary)
+to `src/config_db_sync.rs` (library) so the admin `sync-now`
+handler can reach it without duplicating DB-reopen + IAM-rebuild
+logic. Behaviour unchanged; callers (startup, periodic poller,
+sync-now) funnel through one path.
+
+### Test posture overhaul (internal)
+
+Not user-visible but worth recording because it affects CI + dev
+loop durability:
+
+- **Deterministic IAM rebuild barrier** (`wait_for_iam_rebuild`)
+  replaces two `tokio::time::sleep(1s)` calls in
+  `auth_integration_test.rs`. Auth suite went from ~3.5s to ~1.5s
+  and is no longer flake-prone on slow CI runners.
+- **6 new unit tests** for `classify_s3_error` / `classify_get_error`
+  in `storage/s3.rs` — zero unit tests before, now covers the
+  Hetzner/Ceph 403-for-missing-bucket quirk, object-level 403
+  preservation, and NoSuchKey → NotFound mapping.
+- **7 `test_create_bucket_*` integration tests replaced by 3 unit
+  tests** in `handlers/bucket.rs` + property-based coverage via
+  `proptest` (new dev-dep). ~1500 random cases per run, 0.08s.
+- **9 S3-backend duplicate tests deleted** from
+  `tests/s3_backend_test.rs` (verified trait behaviour already
+  covered by the filesystem-backed suites). Kept 2: SDK-plumbing
+  smoke + real delta+S3 interaction.
+- **6 of 10 public-prefix LIST integration tests removed** — unit
+  tests in `api/auth.rs` and `admission/evaluator.rs` already cover
+  the policy-match shape. Kept: no-slash AWS-CLI bug regression,
+  false-parent denial, partial-public root denial, admin sees all.
+- **2 new integration tests for metadata-cache invalidation** in
+  `tests/optimization_test.rs` — covers PUT-overwrite and batch-
+  delete paths that the docstring pinned but no test exercised.
+- **4 new HA config-sync tests** (`tests/config_sync_ha_test.rs`)
+  exercising the real sync code path: startup pull, sync-now
+  propagation, ETag no-op, wrong-passphrase rejection.
+- **3 new same-key concurrency tests** (`tests/concurrency_test.rs`)
+  for double-`CompleteMultipartUpload`, cross-upload-ID isolation,
+  and PUT-vs-DELETE state consistency.
+- **3 new SigV4 security tests** (`tests/auth_integration_test.rs`)
+  covering signed-header tampering, presigned-URL rejection after
+  user disable, and unsigned-extra-header tolerance (spec
+  compliance).
+- **5 new unit tests for `src/startup.rs`** (was 0/650 LOC).
+- **Coverage reporting in CI.** New `coverage` job runs
+  `cargo-llvm-cov --lib` and publishes a summary table +
+  lcov.info artifact. `continue-on-error: true` — signal, not a
+  gate.
+- **TestServer hardening.** `wait_ready` now checks
+  `process.try_wait()` BEFORE the health probe, so a stray proxy
+  holding the test port fails loudly (`lsof -i :<port>`) instead
+  of silently intercepting requests.
+
+### Internal hygiene
+
+- **Shared `useSectionEditor` hook** in the admin UI collapses
+  ~450 LOC of triplicated apply-flow boilerplate across
+  AdmissionPanel, CredentialsModePanel, and the Advanced sub-
+  panels into one ~220 LOC hook. Future section panels plug in
+  rather than re-carrying the §F5 snapshot-at-validate fix etc.
+- **`with_config_db()` wrapper** in `src/api/admin/mod.rs` shrinks
+  the "get DB from state → lock → run op → log-and-500" admin
+  handler boilerplate from 5–8 lines to 3. Migrated 8 handlers
+  in `external_auth.rs`.
+- **6 duplicate `default_*` fns** in `config_sections.rs`
+  eliminated by making the `config.rs` versions `pub(crate)`.
+  Round-trip test continues to guard against drift.
+
+### Documentation
+
+- **`CLAUDE.md` refreshed** against recent architecture drift.
+  Two new sections: "Testability principles" (7 bullets with
+  prior-art citations) and "When proposing architecture" (4
+  anti-patterns to avoid).
+
+### Metrics
+
+- **Test count**: 467 → 487 unit/property/binary tests. Integration
+  tests net −12 (22 deleted as redundant, 10 added for genuine
+  gaps).
+- **CI time**: neutral — slower startup-unit-test overhead (~0.5s)
+  offset by ~2s saved in auth + bucket-name tests.
+
 ## v0.8.0
 
 A major release. Two overlapping threads land together: the
