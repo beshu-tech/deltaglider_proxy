@@ -510,3 +510,64 @@ async fn test_chunked_truncation_detected() {
         }
     }
 }
+
+// ═══════════════════════════════════════════════════
+// Admin API: malformed encryption_key must be rejected at the section
+// level BEFORE it gets written to the config file.
+// ═══════════════════════════════════════════════════
+
+/// A PUT to /api/admin/config/section/advanced with a malformed
+/// encryption_key must return 4xx with a clear error. Without this
+/// validation the bogus key would land in the YAML on disk and the
+/// engine would fail only on the next startup.
+#[tokio::test]
+async fn test_invalid_encryption_key_rejected_by_section_put() {
+    let server = encrypted_builder().build().await;
+    let http = common::admin_http_client(&server.endpoint()).await;
+
+    // Try to rotate to an obviously malformed key (not 64 hex chars).
+    let resp = http
+        .put(format!(
+            "{}/_/api/admin/config/section/advanced",
+            server.endpoint()
+        ))
+        .json(&serde_json::json!({ "encryption_key": "not-a-hex-key" }))
+        .send()
+        .await
+        .expect("section PUT");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("JSON body");
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "malformed hex key must yield 400, got {} with body {}",
+        status,
+        body
+    );
+    let err = body
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(
+        err.contains("invalid encryption_key"),
+        "error body should explain the rejection, got {:?}",
+        body
+    );
+
+    // Explicit good-path check: a well-formed hex key is accepted.
+    let good_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let resp = http
+        .put(format!(
+            "{}/_/api/admin/config/section/advanced",
+            server.endpoint()
+        ))
+        .json(&serde_json::json!({ "encryption_key": good_key }))
+        .send()
+        .await
+        .expect("section PUT (good key)");
+    assert!(
+        resp.status().is_success(),
+        "well-formed key should be accepted, got {}",
+        resp.status()
+    );
+}

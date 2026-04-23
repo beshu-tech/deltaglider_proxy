@@ -284,6 +284,21 @@ impl DynEngine {
                 key: Some(key),
             })));
             tracing::info!("Encryption at rest: ENABLED (AES-256-GCM)");
+            // If the key came from config FILE (not env), nudge the
+            // operator to keep an off-box copy. Losing an encrypted
+            // config file with no backup means all encrypted objects
+            // are unrecoverable — the in-band backup mechanism is no
+            // defense because it's encrypted with the same key.
+            //
+            // The check is env-var-presence, which maps to "did
+            // Config::from_env override the file value?" at load time.
+            if std::env::var("DGP_ENCRYPTION_KEY").is_err() {
+                tracing::warn!(
+                    "Encryption key was loaded from config file (not DGP_ENCRYPTION_KEY \
+                     env var). Keep an off-box backup of the key; if the config file is \
+                     lost, all encrypted objects become unrecoverable."
+                );
+            }
             Box::new(crate::storage::EncryptingBackend::new(storage, enc_config))
         } else {
             storage

@@ -359,14 +359,51 @@ async fn apply_section(
     // "preserve when None on the incoming side" semantics so section
     // round-trips don't silently clear authentication state.
     //
-    // Infra secrets (bootstrap hash, encryption key) are always
-    // preserved — a PUT to any section that touches the `advanced`
-    // slice would otherwise zero them. (The explicit equality guard
-    // above means we only reach this line when hashes already
-    // matched, so this is a defensive no-op for that field — kept
-    // for symmetry with encryption_key and to document intent.)
+    // Infra secrets — preservation rules differ:
+    //
+    // bootstrap_password_hash: ALWAYS preserved via this path. It
+    // has its own dedicated rotation endpoint (PUT /api/admin/password)
+    // that verifies the current password and re-encrypts the config
+    // DB atomically. The explicit equality guard above ensures we
+    // only reach this line when incoming == old, so this is
+    // effectively a defensive no-op for that field.
     new_cfg.bootstrap_password_hash = old_cfg.bootstrap_password_hash.clone();
-    new_cfg.encryption_key = old_cfg.encryption_key.clone();
+    //
+    // encryption_key: preserve when incoming is None (GET/edit/PUT
+    // round-trips post None because GET redacts the field). RESPECT
+    // a non-None incoming value so operators can rotate the key via
+    // the admin UI. Setting it to Some("...") is the explicit-
+    // rotation path; setting it to Some("") would disable encryption
+    // (the engine treats Some("") as "no key" via from_hex
+    // rejection — a malformed key path) — the admin UI should send
+    // None or omit the field entirely to leave encryption alone, and
+    // a dedicated DELETE/"disable" affordance for turning it off.
+    if new_cfg.encryption_key.is_none() {
+        new_cfg.encryption_key = old_cfg.encryption_key.clone();
+    }
+    // Validate any NEW encryption_key the operator is trying to set.
+    // `EncryptionKey::from_hex` is the single source of truth for key
+    // shape (64 hex chars, 32 bytes); fail fast here with a 4xx so the
+    // admin UI can surface a clear error, rather than accepting the
+    // bogus value, writing it to the config file, and only rejecting
+    // on the next engine rebuild. Safe to call even if the key was
+    // preserved from `old_cfg` — well-formed keys roundtrip cleanly.
+    if let Some(ref hex_key) = new_cfg.encryption_key {
+        if let Err(msg) = crate::storage::EncryptionKey::from_hex(hex_key) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(SectionApplyResponse {
+                    ok: false,
+                    warnings: vec![],
+                    requires_restart: false,
+                    persisted_path: None,
+                    error: Some(format!("invalid encryption_key: {}", msg)),
+                    diff: None,
+                }),
+            )
+                .into_response();
+        }
+    }
     // Top-level SigV4 creds (the legacy bootstrap key pair living on
     // `Config` directly) are preserved when the incoming value is
     // None. Explicit rotation — setting a new value — still works;
