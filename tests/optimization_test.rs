@@ -837,3 +837,186 @@ async fn test_zero_byte_object() {
     let cl = headers.get("content-length").unwrap().to_str().unwrap();
     assert_eq!(cl, "0", "Content-Length should be 0 for empty object");
 }
+
+// ─── C9: Metadata cache invalidation through the real request path ───
+//
+// QA review finding #4: the MetadataCache docstring pins the invariant
+// that DELETE and overwrite invalidate cached entries, but no test
+// exercised the invariant through a real HTTP request pipeline. A stale
+// cache entry would silently return the old size on HEAD/LIST even after
+// the backing object has been replaced or removed — a subtle
+// data-integrity bug that unit tests on the cache module alone could not
+// catch (they test the cache in isolation; these test that the engine
+// remembers to invalidate on mutation).
+
+/// Overwriting an object must invalidate the cached size. Without the
+/// invalidation, a subsequent HEAD or LIST would return the OLD size
+/// (served from cache) while GET returns the NEW bytes — a classic
+/// silent data-integrity bug.
+#[tokio::test]
+async fn test_cache_invalidation_on_overwrite_returns_fresh_size() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+
+    // Passthrough payload — a PDF won't run through the delta codec, so
+    // the LIST/HEAD size we observe is the raw object size and not
+    // muddied by delta accounting.
+    let small = b"first version".to_vec();
+    let large = vec![0xAB; 50_000];
+
+    put_object(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        "cache/overwritten.pdf",
+        small.clone(),
+        "application/pdf",
+    )
+    .await;
+
+    // First HEAD primes the cache with `small.len()`.
+    let h1 = head_headers(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        "cache/overwritten.pdf",
+    )
+    .await;
+    let size1: usize = h1
+        .get("content-length")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(size1, small.len(), "initial HEAD size");
+
+    // Overwrite with a different size.
+    put_object(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        "cache/overwritten.pdf",
+        large.clone(),
+        "application/pdf",
+    )
+    .await;
+
+    // HEAD must report the new size — not the cached `small.len()`.
+    let h2 = head_headers(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        "cache/overwritten.pdf",
+    )
+    .await;
+    let size2: usize = h2
+        .get("content-length")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        size2,
+        large.len(),
+        "HEAD after overwrite must report new size ({}), not stale cached {}",
+        large.len(),
+        small.len(),
+    );
+
+    // GET confirms the bytes — belt-and-braces that HEAD and GET agree.
+    let got = get_bytes(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        "cache/overwritten.pdf",
+    )
+    .await;
+    assert_eq!(
+        got.len(),
+        large.len(),
+        "GET after overwrite returns new bytes"
+    );
+}
+
+/// Batch-delete (`POST /{bucket}?delete`) must invalidate every deleted
+/// key's cache entry. If invalidation is skipped, LIST still shows the
+/// keys (they're gone from the backend) AND HEAD hits the cache first
+/// and returns 200 OK with a fabricated size — while GET fails with
+/// 404. That kind of split-brain is exactly the documented invariant
+/// this test guards.
+#[tokio::test]
+async fn test_cache_invalidation_on_batch_delete() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+
+    // Seed 5 passthrough objects.
+    for i in 0..5 {
+        put_object(
+            &http,
+            &server.endpoint(),
+            server.bucket(),
+            &format!("batch/item_{i}.pdf"),
+            format!("data-{i}").into_bytes(),
+            "application/pdf",
+        )
+        .await;
+    }
+
+    // Prime the metadata cache for all 5 keys via HEAD.
+    for i in 0..5 {
+        head_headers(
+            &http,
+            &server.endpoint(),
+            server.bucket(),
+            &format!("batch/item_{i}.pdf"),
+        )
+        .await;
+    }
+
+    // Delete 3 of the 5 via POST?delete (S3 batch-delete).
+    let delete_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Delete>
+  <Object><Key>batch/item_0.pdf</Key></Object>
+  <Object><Key>batch/item_2.pdf</Key></Object>
+  <Object><Key>batch/item_4.pdf</Key></Object>
+</Delete>"#;
+    let delete_url = format!("{}/{}/?delete", server.endpoint(), server.bucket());
+    let resp = http
+        .post(&delete_url)
+        .header("content-type", "application/xml")
+        .body(delete_xml)
+        .send()
+        .await
+        .expect("batch DELETE send");
+    assert!(
+        resp.status().is_success(),
+        "batch DELETE failed: {}",
+        resp.status()
+    );
+
+    // Deleted keys: HEAD must 404. A stale cache would return 200 here.
+    let endpoint = server.endpoint();
+    let bucket = server.bucket();
+    for i in [0, 2, 4] {
+        let url = format!("{endpoint}/{bucket}/batch/item_{i}.pdf");
+        let status = http.head(&url).send().await.unwrap().status();
+        assert_eq!(
+            status.as_u16(),
+            404,
+            "HEAD after batch DELETE must 404 for key batch/item_{i}.pdf, got {status}"
+        );
+    }
+
+    // Surviving keys: HEAD must still 200.
+    for i in [1, 3] {
+        let url = format!("{endpoint}/{bucket}/batch/item_{i}.pdf");
+        let status = http.head(&url).send().await.unwrap().status();
+        assert_eq!(
+            status.as_u16(),
+            200,
+            "surviving key batch/item_{i}.pdf must still HEAD 200"
+        );
+    }
+}

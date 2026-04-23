@@ -7,6 +7,24 @@
 //! shape; these tests verify the whole request path — admission →
 //! anonymous principal mint → IAM evaluate → backend LIST → XML
 //! response filtering — through a spawned proxy and real HTTP.
+//!
+//! ## QA trim (2026-04-23)
+//!
+//! This file originally held 10 HTTP-layer tests; the unit tests in
+//! `src/api/auth.rs` + `src/admission/evaluator.rs` already cover
+//! the policy shape exhaustively, so the cases here are deliberately
+//! narrow:
+//!
+//!   1. No-slash parent — the ACTUAL reported bug + its fix.
+//!   2. False-parent denial — security invariant (no substring leak).
+//!   3. Partial-public root denial — security invariant (no scope bleed).
+//!   4. Admin still sees everything — "the fix didn't break normal path".
+//!
+//! The removed cases (trailing-slash, deep-prefix, entire-bucket,
+//! delimiter variants, multi-prefix, unrelated-prefix) were all
+//! variations on the same pattern-match logic already covered by
+//! unit tests. Adding them back at this layer only earns its cost
+//! on a genuinely new request-pipeline seam.
 
 mod common;
 
@@ -123,69 +141,6 @@ async fn anonymous_list_no_slash_parent_allowed() {
     );
 }
 
-/// Trailing-slash form — must also work (regression guard).
-#[tokio::test]
-async fn anonymous_list_trailing_slash_allowed() {
-    let (server, anon) = server_with_public_prefix("testbk", "ror/libs/").await;
-
-    let resp = anon
-        .get(format!(
-            "{}/testbk/?list-type=2&prefix=ror/libs/",
-            server.endpoint()
-        ))
-        .send()
-        .await
-        .expect("HTTP send");
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = resp.text().await.unwrap();
-    let (keys, _) = parse_list_xml(&body);
-    assert!(keys.iter().any(|k| k == "ror/libs/alpha.txt"));
-    assert!(keys.iter().any(|k| k == "ror/libs/sub/beta.txt"));
-}
-
-/// Delimiter form (what `aws s3 ls` actually sends) — delimiter
-/// collapses children into CommonPrefixes. Must work both with and
-/// without trailing slash on the prefix.
-#[tokio::test]
-async fn anonymous_list_delimiter_no_slash_parent() {
-    let (server, anon) = server_with_public_prefix("testbk", "ror/libs/").await;
-
-    let resp = anon
-        .get(format!(
-            "{}/testbk/?list-type=2&prefix=ror/libs&delimiter=/",
-            server.endpoint()
-        ))
-        .send()
-        .await
-        .expect("HTTP send");
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "delimiter LIST with no-slash parent must succeed"
-    );
-}
-
-/// Deeper no-slash form (`prefix=ror/libs/sub`) also works — the
-/// public prefix is a genuine ancestor, so the narrow-match logic
-/// must not care how many path segments deep the request is.
-#[tokio::test]
-async fn anonymous_list_deep_no_slash_allowed() {
-    let (server, anon) = server_with_public_prefix("testbk", "ror/libs/").await;
-
-    let resp = anon
-        .get(format!(
-            "{}/testbk/?list-type=2&prefix=ror/libs/sub",
-            server.endpoint()
-        ))
-        .send()
-        .await
-        .expect("HTTP send");
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = resp.text().await.unwrap();
-    let (keys, _) = parse_list_xml(&body);
-    assert!(keys.iter().any(|k| k == "ror/libs/sub/beta.txt"));
-}
-
 /// Security: `ror/libsomething` is a false parent — the public prefix
 /// `ror/libs/` does NOT authorise it. Must be denied even though it
 /// starts with the same characters as the public prefix up to the
@@ -221,29 +176,6 @@ async fn anonymous_list_false_parent_denied() {
     );
 }
 
-/// Security: unrelated prefix in the same bucket — classic deny.
-#[tokio::test]
-async fn anonymous_list_unrelated_prefix_denied() {
-    let (server, anon) = server_with_public_prefix("testbk", "ror/libs/").await;
-
-    let resp = anon
-        .get(format!(
-            "{}/testbk/?list-type=2&prefix=private/",
-            server.endpoint()
-        ))
-        .send()
-        .await
-        .expect("HTTP send");
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    let body = resp.text().await.unwrap_or_default();
-    let (keys, _) = parse_list_xml(&body);
-    assert!(
-        keys.is_empty(),
-        "unrelated-prefix denial must not leak any key"
-    );
-    assert!(!body.contains("private/secret.txt"));
-}
-
 /// Security: no prefix at all ("list the whole bucket") against a
 /// bucket with only a partial public prefix — must deny. The anon
 /// principal doesn't have permission to see what's outside the
@@ -269,100 +201,6 @@ async fn anonymous_list_bucket_root_denied_when_only_partial_public() {
         "bucket-root denial must not leak any key (got body of {} bytes, keys={keys:?})",
         body.len()
     );
-}
-
-/// Entire bucket public (`public: true` shorthand → `public_prefixes: [""]`).
-/// Every anonymous LIST form must succeed — with a prefix, without,
-/// delimiter or not.
-#[tokio::test]
-async fn anonymous_list_entire_bucket_public() {
-    let (server, anon) = server_with_public_prefix("testbk", "").await;
-
-    // Empty prefix
-    let r1 = anon
-        .get(format!("{}/testbk/?list-type=2", server.endpoint()))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r1.status(), StatusCode::OK);
-    // Specific prefix
-    let r2 = anon
-        .get(format!(
-            "{}/testbk/?list-type=2&prefix=private/",
-            server.endpoint()
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r2.status(), StatusCode::OK);
-}
-
-/// Multiple public prefixes in the same bucket — each one must be
-/// independently listable by its no-slash parent form, and a false
-/// parent for one doesn't silently bleed into the other.
-#[tokio::test]
-async fn anonymous_list_multiple_public_prefixes() {
-    let server = TestServer::builder()
-        .bucket("multibk")
-        .auth("admin", "admin-secret-1234567890")
-        .bucket_policy("multibk", "public_prefixes = [\"releases/\", \"docs/\"]")
-        .build()
-        .await;
-
-    let signed = aws_sdk_s3::Client::from_conf(
-        aws_sdk_s3::Config::builder()
-            .credentials_provider(aws_sdk_s3::config::Credentials::new(
-                "admin",
-                "admin-secret-1234567890",
-                None,
-                None,
-                "test",
-            ))
-            .region(aws_sdk_s3::config::Region::new("us-east-1"))
-            .endpoint_url(server.endpoint())
-            .force_path_style(true)
-            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-            .build(),
-    );
-    for key in ["releases/v1.zip", "docs/readme.md", "private/secret.txt"] {
-        signed
-            .put_object()
-            .bucket("multibk")
-            .key(key)
-            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"x"))
-            .send()
-            .await
-            .unwrap();
-    }
-
-    let anon = reqwest::Client::new();
-
-    // Each public-prefix parent form succeeds independently.
-    for prefix in ["releases", "docs"] {
-        let r = anon
-            .get(format!(
-                "{}/multibk/?list-type=2&prefix={prefix}",
-                server.endpoint()
-            ))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(r.status(), StatusCode::OK, "prefix={prefix}");
-    }
-    // False parent in multi-prefix buckets still denies.
-    let r_false = anon
-        .get(format!(
-            "{}/multibk/?list-type=2&prefix=releasesleaks",
-            server.endpoint()
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r_false.status(), StatusCode::FORBIDDEN);
-    let body = r_false.text().await.unwrap_or_default();
-    let (keys, _) = parse_list_xml(&body);
-    assert!(keys.is_empty(), "multi-prefix false-parent must not leak");
-    assert!(!body.contains("private/secret.txt"));
 }
 
 /// An authenticated admin still lists the full bucket regardless of

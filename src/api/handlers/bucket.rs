@@ -496,3 +496,107 @@ pub async fn list_buckets(
 
     Ok(xml_response(xml))
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Unit tests for bucket-name validation.
+//
+// Replaces 7 integration tests in tests/s3_compat_test.rs
+// (`test_create_bucket_*`) that each spawned a full TestServer just
+// to verify this pure function. A parametric unit test covers the
+// same ground in <1ms with no network, no process spawn, no HTTP/XML
+// round-trip.
+//
+// `validate_bucket_name` here is stricter than `validate_bucket` in
+// `extractors.rs` — it adds the IP-format rejection that S3 requires
+// at bucket creation time. The general-purpose extractor validator
+// runs on every request path and doesn't enforce IP-format because
+// pre-existing buckets named like IPs might legitimately exist in
+// upstream storage.
+// ────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::{is_ip_format, validate_bucket_name};
+    use crate::api::errors::S3Error;
+
+    /// Every name the spec considers valid must return Ok. Values
+    /// chosen to exercise the edge of each rule (min-length, hyphens,
+    /// digits-only, dots, mixed).
+    #[test]
+    fn validate_bucket_name_accepts_valid() {
+        for name in [
+            "abc",
+            "my-bucket",
+            "test123",
+            "a-b-c",
+            "abc-def-123",
+            "a.b.c",
+        ] {
+            assert!(
+                validate_bucket_name(name).is_ok(),
+                "name {name:?} should be accepted but was rejected"
+            );
+        }
+    }
+
+    /// Parametric table of every invalid-shape case the integration
+    /// tests used to cover, one line per case. Each returns
+    /// `InvalidBucketName`. The tuple: (name, reason-label) — the
+    /// label is never asserted on, it's there so a failure message
+    /// points at WHICH case broke.
+    #[test]
+    fn validate_bucket_name_rejects_invalid_shapes() {
+        let cases: &[(&str, &str)] = &[
+            // Length
+            ("ab", "2-char is below the 3-char minimum"),
+            // 64 × 'a' — just over the 63-char ceiling.
+            (
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "64-char is above the 63-char maximum",
+            ),
+            // Character-set
+            ("MyBucket", "uppercase ASCII is forbidden"),
+            ("my_bucket", "underscore is forbidden"),
+            ("my bucket", "whitespace is forbidden"),
+            ("my+bucket", "+ is forbidden"),
+            // Shape (starts / ends)
+            ("-my-bucket", "must start with alphanumeric"),
+            ("my-bucket-", "must end with alphanumeric"),
+            (".my-bucket", "must start with alphanumeric (dot)"),
+            // Repeated delimiters
+            ("my..bucket", "consecutive dots are forbidden"),
+            // IP-format (this rule exists ONLY here, not in the extractor)
+            ("192.168.1.1", "four dotted digit-groups is IP-format"),
+            ("10.0.0.1", "four dotted digit-groups is IP-format"),
+        ];
+
+        for (name, why) in cases {
+            let got = validate_bucket_name(name);
+            assert!(
+                matches!(got, Err(S3Error::InvalidBucketName(_))),
+                "expected InvalidBucketName for {name:?} ({why}), got {got:?}"
+            );
+        }
+    }
+
+    /// Truth table for `is_ip_format`. Keeps the helper honest as
+    /// the bucket-naming rules evolve (e.g. if AWS ever allows
+    /// IPv6-like names, the rule would need to change here).
+    #[test]
+    fn is_ip_format_truth_table() {
+        // Yes: exactly four groups of 1-3 ASCII digits, dot-separated.
+        assert!(is_ip_format("1.2.3.4"));
+        assert!(is_ip_format("192.168.1.1"));
+        assert!(is_ip_format("255.255.255.255"));
+
+        // No: wrong shape.
+        assert!(!is_ip_format("1.2.3"), "three parts is not IP-format");
+        assert!(!is_ip_format("1.2.3.4.5"), "five parts is not IP-format");
+        assert!(!is_ip_format("a.b.c.d"), "letters are not IP-format");
+        assert!(
+            !is_ip_format("1234.5.6.7"),
+            "group > 3 digits is not IP-format"
+        );
+        assert!(!is_ip_format(".1.2.3"), "leading dot → empty first group");
+        assert!(!is_ip_format("1..2.3"), "middle empty group");
+    }
+}

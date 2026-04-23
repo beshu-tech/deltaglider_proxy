@@ -1678,152 +1678,19 @@ async fn test_presigned_url_with_response_overrides() {
 // ============================================================================
 // 2.3 CreateBucket naming validation
 // ============================================================================
-
-#[tokio::test]
-async fn test_create_bucket_valid_names() {
-    let server = TestServer::filesystem().await;
-    let http = reqwest::Client::new();
-
-    // Valid bucket names
-    let valid_names = ["abc", "my-bucket", "test123", "a-b-c", "abc-def-123"];
-    for name in &valid_names {
-        let url = format!("{}/{}", server.endpoint(), name);
-        let resp = http.put(&url).send().await.unwrap();
-        assert!(
-            resp.status().is_success(),
-            "Bucket name '{}' should be valid, got status {}",
-            name,
-            resp.status()
-        );
-    }
-}
-
-#[tokio::test]
-async fn test_create_bucket_too_short() {
-    let server = TestServer::filesystem().await;
-    let http = reqwest::Client::new();
-
-    let url = format!("{}/ab", server.endpoint());
-    let resp = http.put(&url).send().await.unwrap();
-    assert_eq!(
-        resp.status(),
-        400,
-        "2-char bucket name should be rejected with 400, got {}",
-        resp.status()
-    );
-    let body = resp.text().await.unwrap();
-    assert!(
-        body.contains("InvalidBucketName"),
-        "Error should be InvalidBucketName, got: {}",
-        body
-    );
-}
-
-#[tokio::test]
-async fn test_create_bucket_too_long() {
-    let server = TestServer::filesystem().await;
-    let http = reqwest::Client::new();
-
-    let long_name = "a".repeat(64);
-    let url = format!("{}/{}", server.endpoint(), long_name);
-    let resp = http.put(&url).send().await.unwrap();
-    assert_eq!(
-        resp.status(),
-        400,
-        "64-char bucket name should be rejected with 400, got {}",
-        resp.status()
-    );
-    let body = resp.text().await.unwrap();
-    assert!(
-        body.contains("InvalidBucketName"),
-        "Error should be InvalidBucketName, got: {}",
-        body
-    );
-}
-
-#[tokio::test]
-async fn test_create_bucket_uppercase_rejected() {
-    let server = TestServer::filesystem().await;
-    let http = reqwest::Client::new();
-
-    let url = format!("{}/MyBucket", server.endpoint());
-    let resp = http.put(&url).send().await.unwrap();
-    assert_eq!(
-        resp.status(),
-        400,
-        "Uppercase bucket name should be rejected with 400, got {}",
-        resp.status()
-    );
-    let body = resp.text().await.unwrap();
-    assert!(
-        body.contains("InvalidBucketName"),
-        "Error should be InvalidBucketName, got: {}",
-        body
-    );
-}
-
-#[tokio::test]
-async fn test_create_bucket_underscore_rejected() {
-    let server = TestServer::filesystem().await;
-    let http = reqwest::Client::new();
-
-    let url = format!("{}/my_bucket", server.endpoint());
-    let resp = http.put(&url).send().await.unwrap();
-    assert_eq!(
-        resp.status(),
-        400,
-        "Underscore in bucket name should be rejected with 400, got {}",
-        resp.status()
-    );
-    let body = resp.text().await.unwrap();
-    assert!(
-        body.contains("InvalidBucketName"),
-        "Error should be InvalidBucketName, got: {}",
-        body
-    );
-}
-
-#[tokio::test]
-async fn test_create_bucket_ip_format_rejected() {
-    let server = TestServer::filesystem().await;
-    let http = reqwest::Client::new();
-
-    let url = format!("{}/192.168.1.1", server.endpoint());
-    let resp = http.put(&url).send().await.unwrap();
-    assert_eq!(
-        resp.status(),
-        400,
-        "IP-format bucket name should be rejected with 400, got {}",
-        resp.status()
-    );
-    let body = resp.text().await.unwrap();
-    assert!(
-        body.contains("InvalidBucketName"),
-        "Error should be InvalidBucketName, got: {}",
-        body
-    );
-}
-
-#[tokio::test]
-async fn test_create_bucket_hyphen_start_rejected() {
-    let server = TestServer::filesystem().await;
-    let http = reqwest::Client::new();
-
-    let url = format!("{}/{}", server.endpoint(), "-my-bucket");
-    let resp = http.put(&url).send().await.unwrap();
-    assert_eq!(
-        resp.status(),
-        400,
-        "Bucket name starting with hyphen should be rejected with 400, got {}",
-        resp.status()
-    );
-    let body = resp.text().await.unwrap();
-    assert!(
-        body.contains("InvalidBucketName"),
-        "Error should be InvalidBucketName, got: {}",
-        body
-    );
-}
+//
+// The 7 test_create_bucket_* cases that used to live here were
+// superseded by the parametric unit test in
+// `src/api/handlers/bucket.rs::tests::validate_bucket_name_*`. The
+// integration round-trip (HTTP PUT → handler → XML error body) added
+// no unique signal over the pure-function check; every one spawned a
+// full TestServer to exercise a string validator. Moved to unit
+// tests to reclaim ~1.5s of CI per run and keep the bucket-naming
+// truth table in one place.
+//
+// If the CreateBucket HTTP surface ever grows real behaviour
+// (location constraints, bucket policy, ACLs), bring integration
+// tests back — but keep the pure-validator coverage where it is.
 
 // ============================================================================
 // 2.4 ListBuckets real creation dates

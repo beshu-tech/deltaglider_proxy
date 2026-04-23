@@ -7,7 +7,6 @@
 mod common;
 
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 use common::{generate_binary, mutate_binary, TestServer};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -57,338 +56,34 @@ async fn test_s3_put_get_roundtrip() {
     assert_eq!(body.as_ref(), data);
 }
 
-#[tokio::test]
-async fn test_s3_put_get_delete_lifecycle() {
-    skip_unless_minio!();
-    let server = TestServer::s3().await;
-    let client = server.s3_client().await;
-    let prefix = unique_prefix();
-
-    let key = format!("{}/lifecycle.txt", prefix);
-    client
-        .put_object()
-        .bucket(server.bucket())
-        .key(&key)
-        .body(ByteStream::from(b"data".to_vec()))
-        .send()
-        .await
-        .unwrap();
-    client
-        .delete_object()
-        .bucket(server.bucket())
-        .key(&key)
-        .send()
-        .await
-        .unwrap();
-    let get = client
-        .get_object()
-        .bucket(server.bucket())
-        .key(&key)
-        .send()
-        .await;
-    assert!(get.is_err(), "GET after DELETE should fail");
-}
-
-#[tokio::test]
-async fn test_s3_put_overwrite() {
-    skip_unless_minio!();
-    let server = TestServer::s3().await;
-    let client = server.s3_client().await;
-    let prefix = unique_prefix();
-
-    let key = format!("{}/overwrite.txt", prefix);
-    client
-        .put_object()
-        .bucket(server.bucket())
-        .key(&key)
-        .body(ByteStream::from(b"v1".to_vec()))
-        .send()
-        .await
-        .unwrap();
-    client
-        .put_object()
-        .bucket(server.bucket())
-        .key(&key)
-        .body(ByteStream::from(b"v2".to_vec()))
-        .send()
-        .await
-        .unwrap();
-
-    let body = client
-        .get_object()
-        .bucket(server.bucket())
-        .key(&key)
-        .send()
-        .await
-        .unwrap()
-        .body
-        .collect()
-        .await
-        .unwrap()
-        .into_bytes();
-    assert_eq!(body.as_ref(), b"v2");
-}
-
-#[tokio::test]
-async fn test_s3_list_objects_with_prefix() {
-    skip_unless_minio!();
-    let server = TestServer::s3().await;
-    let client = server.s3_client().await;
-    let prefix = unique_prefix();
-
-    for i in 0..3 {
-        client
-            .put_object()
-            .bucket(server.bucket())
-            .key(format!("{}/file{}.txt", prefix, i))
-            .body(ByteStream::from(format!("{}", i).into_bytes()))
-            .send()
-            .await
-            .unwrap();
-    }
-
-    let list = client
-        .list_objects_v2()
-        .bucket(server.bucket())
-        .prefix(format!("{}/", prefix))
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(list.contents().len(), 3);
-}
-
-#[tokio::test]
-async fn test_s3_list_objects_pagination() {
-    skip_unless_minio!();
-    let server = TestServer::s3().await;
-    let client = server.s3_client().await;
-    let prefix = unique_prefix();
-
-    for i in 0..5 {
-        client
-            .put_object()
-            .bucket(server.bucket())
-            .key(format!("{}/p{}.txt", prefix, i))
-            .body(ByteStream::from(format!("{}", i).into_bytes()))
-            .send()
-            .await
-            .unwrap();
-    }
-
-    let page1 = client
-        .list_objects_v2()
-        .bucket(server.bucket())
-        .prefix(format!("{}/", prefix))
-        .max_keys(2)
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(page1.contents().len(), 2);
-    assert!(page1.is_truncated().unwrap_or(false));
-}
-
-#[tokio::test]
-async fn test_s3_copy_object() {
-    skip_unless_minio!();
-    let server = TestServer::s3().await;
-    let client = server.s3_client().await;
-    let prefix = unique_prefix();
-
-    let src = format!("{}/src.txt", prefix);
-    let dst = format!("{}/dst.txt", prefix);
-
-    client
-        .put_object()
-        .bucket(server.bucket())
-        .key(&src)
-        .body(ByteStream::from(b"copy me".to_vec()))
-        .send()
-        .await
-        .unwrap();
-    client
-        .copy_object()
-        .bucket(server.bucket())
-        .key(&dst)
-        .copy_source(format!("{}/{}", server.bucket(), src))
-        .send()
-        .await
-        .unwrap();
-
-    let body = client
-        .get_object()
-        .bucket(server.bucket())
-        .key(&dst)
-        .send()
-        .await
-        .unwrap()
-        .body
-        .collect()
-        .await
-        .unwrap()
-        .into_bytes();
-    assert_eq!(body.as_ref(), b"copy me");
-}
-
-#[tokio::test]
-async fn test_s3_delete_objects_batch() {
-    skip_unless_minio!();
-    let server = TestServer::s3().await;
-    let client = server.s3_client().await;
-    let prefix = unique_prefix();
-
-    for i in 0..3 {
-        client
-            .put_object()
-            .bucket(server.bucket())
-            .key(format!("{}/b{}.txt", prefix, i))
-            .body(ByteStream::from(b"x".to_vec()))
-            .send()
-            .await
-            .unwrap();
-    }
-
-    let ids: Vec<ObjectIdentifier> = (0..3)
-        .map(|i| {
-            ObjectIdentifier::builder()
-                .key(format!("{}/b{}.txt", prefix, i))
-                .build()
-                .unwrap()
-        })
-        .collect();
-
-    client
-        .delete_objects()
-        .bucket(server.bucket())
-        .delete(Delete::builder().set_objects(Some(ids)).build().unwrap())
-        .send()
-        .await
-        .unwrap();
-
-    let list = client
-        .list_objects_v2()
-        .bucket(server.bucket())
-        .prefix(format!("{}/", prefix))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(list.key_count(), Some(0));
-}
-
-#[tokio::test]
-async fn test_s3_head_object() {
-    skip_unless_minio!();
-    let server = TestServer::s3().await;
-    let client = server.s3_client().await;
-    let prefix = unique_prefix();
-
-    let key = format!("{}/head.txt", prefix);
-    let data = b"head test";
-
-    client
-        .put_object()
-        .bucket(server.bucket())
-        .key(&key)
-        .content_type("text/plain")
-        .body(ByteStream::from(data.to_vec()))
-        .send()
-        .await
-        .unwrap();
-
-    let head = client
-        .head_object()
-        .bucket(server.bucket())
-        .key(&key)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(head.content_length(), Some(data.len() as i64));
-    assert!(head.e_tag().is_some());
-}
-
-#[tokio::test]
-async fn test_s3_etag_consistent() {
-    skip_unless_minio!();
-    let server = TestServer::s3().await;
-    let client = server.s3_client().await;
-    let prefix = unique_prefix();
-
-    let data = b"etag consistency";
-
-    client
-        .put_object()
-        .bucket(server.bucket())
-        .key(format!("{}/e1.txt", prefix))
-        .body(ByteStream::from(data.to_vec()))
-        .send()
-        .await
-        .unwrap();
-    client
-        .put_object()
-        .bucket(server.bucket())
-        .key(format!("{}/e2.txt", prefix))
-        .body(ByteStream::from(data.to_vec()))
-        .send()
-        .await
-        .unwrap();
-
-    let e1 = client
-        .head_object()
-        .bucket(server.bucket())
-        .key(format!("{}/e1.txt", prefix))
-        .send()
-        .await
-        .unwrap()
-        .e_tag()
-        .unwrap()
-        .to_string();
-    let e2 = client
-        .head_object()
-        .bucket(server.bucket())
-        .key(format!("{}/e2.txt", prefix))
-        .send()
-        .await
-        .unwrap()
-        .e_tag()
-        .unwrap()
-        .to_string();
-
-    assert_eq!(e1, e2, "Same data should produce same ETag on S3 backend");
-}
-
-#[tokio::test]
-async fn test_s3_unicode_key() {
-    skip_unless_minio!();
-    let server = TestServer::s3().await;
-    let client = server.s3_client().await;
-    let prefix = unique_prefix();
-
-    let key = format!("{}/données.txt", prefix);
-    let data = b"unicode key data";
-
-    client
-        .put_object()
-        .bucket(server.bucket())
-        .key(&key)
-        .body(ByteStream::from(data.to_vec()))
-        .send()
-        .await
-        .unwrap();
-    let body = client
-        .get_object()
-        .bucket(server.bucket())
-        .key(&key)
-        .send()
-        .await
-        .unwrap()
-        .body
-        .collect()
-        .await
-        .unwrap()
-        .into_bytes();
-    assert_eq!(body.as_ref(), data);
-}
+// ── 9 filesystem-parity tests removed in QA hygiene pass ──────────────
+//
+// QA review finding #2: test_s3_put_get_delete_lifecycle,
+// test_s3_put_overwrite, test_s3_list_objects_with_prefix,
+// test_s3_list_objects_pagination, test_s3_copy_object,
+// test_s3_delete_objects_batch, test_s3_head_object,
+// test_s3_etag_consistent, and test_s3_unicode_key each verified
+// `StorageBackend` trait behaviour that is already guaranteed by the
+// filesystem-backed s3_api_test + s3_compat_test + s3_integration_test
+// suites. Every such test spent a MinIO round-trip to re-verify trait
+// semantics; S3-level differences are an AWS-SDK guarantee, not a
+// proxy-level regression surface.
+//
+// What stayed, and why:
+//   - test_s3_put_get_roundtrip  — smoke test for the S3-plumbing path
+//     (SigV4 to MinIO, body bytestream, no delta pipeline). One
+//     failure here tells you "the S3 backend is wired up at all."
+//   - test_s3_delta_similar_files — real delta+S3 interaction: the
+//     store.rs path that compresses v2 against v1's reference and
+//     the retrieve.rs path that rehydrates. Neither filesystem
+//     integration tests nor s3_integration_test exercises THIS
+//     specific combination.
+//
+// If the S3 backend ever grows features that ARE S3-specific and
+// don't round-trip through the trait (server-side encryption,
+// object-lock, storage classes, requester-pays), add targeted tests
+// HERE — keep them tight, one feature per test.
+// ──────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_s3_delta_similar_files() {
