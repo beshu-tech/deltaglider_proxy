@@ -6,6 +6,14 @@ RUN npm ci
 COPY demo/s3-browser/ui/ ./
 # docs/ is referenced by src/docs-imports.ts via relative path (../../../../docs/)
 COPY docs/ /app/docs/
+# Cargo.toml is the single source of truth for the version string.
+# vite.config.ts reads it at build time to embed __BUILD_VERSION__ into
+# the bundle (see `resolveBuildVersion()` there). Copying it here also
+# doubles as a cache key: a version bump invalidates this layer and
+# forces `npm run build` to run — which re-evaluates `new Date()` in
+# the vite define, so __BUILD_TIME__ stays honest across version bumps
+# instead of freezing at the first-ever-built timestamp.
+COPY Cargo.toml /app/Cargo.toml
 RUN npm run build
 
 # ── Build stage: cargo-chef plan (captures dependency graph) ──

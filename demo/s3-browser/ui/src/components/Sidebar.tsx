@@ -329,7 +329,16 @@ export default function Sidebar({
           </div>
           <div style={{ fontSize: 11, fontWeight: 600, letterSpacing: 3, color: ACCENT_BLUE, textTransform: 'uppercase', marginTop: 5, fontFamily: "var(--font-mono)", display: 'flex', alignItems: 'baseline', gap: 8 }}>
             Proxy
-            {proxyVersion && <span style={{ fontSize: 10, fontWeight: 400, letterSpacing: 0.5, color: TEXT_MUTED }}>v{proxyVersion}</span>}
+            {/* Prefer the server-reported version (whoami) since it
+                reflects the actual running Rust binary; fall back to
+                the build-time constant (read from Cargo.toml by Vite)
+                so the sidebar still shows SOMETHING before whoami
+                resolves — or if the API has diverged in a way that
+                drops the field. The two should always agree in a
+                healthy deployment. */}
+            <span style={{ fontSize: 10, fontWeight: 400, letterSpacing: 0.5, color: TEXT_MUTED }}>
+              v{proxyVersion || __BUILD_VERSION__}
+            </span>
           </div>
           <div style={{ fontSize: 10, color: TEXT_FAINT, marginTop: 14, fontFamily: "var(--font-mono)", letterSpacing: 0.3 }}>
             {formatBuildTime()}
