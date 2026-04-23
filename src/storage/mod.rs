@@ -11,7 +11,7 @@ pub(crate) mod xattr_meta;
 pub use encrypting::{EncryptingBackend, EncryptionConfig, EncryptionKey};
 pub use filesystem::FilesystemBackend;
 pub use routing::RoutingBackend;
-pub use s3::S3Backend;
+pub use s3::{NativeEncryptionConfig, S3Backend};
 pub use traits::{DelegatedListResult, StorageBackend, StorageError};
 
 /// ENOSPC raw error code on Linux and macOS.

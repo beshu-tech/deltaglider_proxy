@@ -333,6 +333,12 @@ pub struct TestServerBuilder {
     bucket_policies: Vec<(String, String)>,
     /// AES-256 encryption key (64-char hex). When set, DGP_ENCRYPTION_KEY env var is passed.
     encryption_key: Option<String>,
+    /// Native SSE mode tag for the singleton backend (Step 4). When
+    /// set, emits `[backend_encryption] mode = "<value>"` into the
+    /// generated config; the S3Backend then applies SSE headers per
+    /// PutObject. `"sse-s3"` is tested against MinIO; `"sse-kms"`
+    /// would need an ARN and is out of scope for the test harness.
+    native_sse_mode: Option<String>,
     /// When true, the test config is written as `test.yaml` (canonical
     /// sectioned shape) instead of the legacy `test.toml`. Required
     /// for any test that applies YAML-only fields
@@ -361,6 +367,7 @@ impl Default for TestServerBuilder {
             auth_creds: None,
             bucket_policies: Vec::new(),
             encryption_key: None,
+            native_sse_mode: None,
             yaml_config: false,
             config_sync_bucket: None,
             bootstrap_password: None,
@@ -420,6 +427,15 @@ impl TestServerBuilder {
     /// Set AES-256 encryption key (64-char hex string).
     pub fn encryption_key(mut self, hex_key: &str) -> Self {
         self.encryption_key = Some(hex_key.to_string());
+        self
+    }
+
+    /// Enable S3 native SSE-S3 (AES256, AWS-managed keys) on the
+    /// singleton backend. Requires `s3_endpoint()` — the encryption
+    /// happens inside the S3 backend via `x-amz-server-side-encryption`
+    /// headers.
+    pub fn sse_s3(mut self) -> Self {
+        self.native_sse_mode = Some("sse-s3".to_string());
         self
     }
 
@@ -538,10 +554,14 @@ impl TestServerBuilder {
                 ),
                 endpoint, MINIO_ACCESS_KEY, MINIO_SECRET_KEY,
             ));
-            // Per-backend encryption on the singleton: emit only when the
-            // test asked for it. The env var DGP_ENCRYPTION_KEY (set by
-            // spawn_with_config) then fills in the `key` at runtime.
-            if self.encryption_key.is_some() {
+            // Per-backend encryption on the singleton: emit only when
+            // the test asked for it. Precedence: native SSE mode
+            // overrides proxy-AES (the two are mutually exclusive).
+            // The env var DGP_ENCRYPTION_KEY (set by spawn_with_config)
+            // fills in the `key` for aes256-gcm-proxy mode.
+            if let Some(ref mode) = self.native_sse_mode {
+                config.push_str(&format!("\n[backend_encryption]\nmode = \"{}\"\n", mode));
+            } else if self.encryption_key.is_some() {
                 config.push_str("\n[backend_encryption]\nmode = \"aes256-gcm-proxy\"\n");
             }
             (config, None)
@@ -551,6 +571,8 @@ impl TestServerBuilder {
                 "\n[backend]\ntype = \"filesystem\"\npath = \"{}\"\n",
                 data_dir.path().display()
             ));
+            // Filesystem backends can't use native SSE (Config::check
+            // rejects that combination). Only proxy-AES is legal here.
             if self.encryption_key.is_some() {
                 config.push_str("\n[backend_encryption]\nmode = \"aes256-gcm-proxy\"\n");
             }
@@ -633,7 +655,9 @@ impl TestServerBuilder {
                 ),
                 endpoint, MINIO_ACCESS_KEY, MINIO_SECRET_KEY,
             ));
-            if self.encryption_key.is_some() {
+            if let Some(ref mode) = self.native_sse_mode {
+                config.push_str(&format!("backend_encryption:\n  mode: {}\n", mode));
+            } else if self.encryption_key.is_some() {
                 config.push_str("backend_encryption:\n  mode: aes256-gcm-proxy\n");
             }
             (config, None)

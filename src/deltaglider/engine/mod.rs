@@ -247,19 +247,23 @@ impl DynEngine {
         // backup/restore round-trip, the wrapper refuses to serve
         // DGE1-prefixed ciphertext as plaintext).
         //
-        // When a backend's mode is Aes256GcmProxy, its wrapper holds the
-        // key — writes encrypt, reads decrypt. When mode is SseKms / SseS3
-        // / None, the wrapper's key is None and writes are passthrough.
-        // Native SSE modes (SseKms/SseS3) are plumbed through to
-        // `S3Backend::new` in Step 4 — THIS step only delivers the
-        // per-backend AES-256-GCM proxy path plus the mode:none safety
-        // net. SseKms / SseS3 currently fall through to the None
-        // (plaintext-passthrough) wrapper with no native encryption
-        // applied; Config::check warns when those modes appear.
+        // Two orthogonal encryption layers live here:
+        //   - Proxy-side AES-256-GCM via `EncryptingBackend` when the
+        //     mode is Aes256GcmProxy. The wrapper encrypts bytes before
+        //     they reach `S3Backend::put_object`.
+        //   - S3-native SSE (SseKms / SseS3) when mode is one of
+        //     those. The proxy passes `NativeEncryptionConfig` into
+        //     `S3Backend::new`, which adds `x-amz-server-side-encryption`
+        //     headers to every PutObject; AWS encrypts on write and
+        //     decrypts transparently on read for callers with KMS perms.
+        //
+        // The two layers are mutually exclusive on a given backend: you
+        // get ONE of {proxy AES-GCM, SSE-KMS, SSE-S3, none}. The
+        // encryption config enum enforces this by construction.
         let storage: Box<dyn StorageBackend> = if config.backends.is_empty() {
             // Singleton backend path. Synthetic name "default" matches
             // what `apply_backend_encryption_env` uses for this entry.
-            let raw = build_raw_backend(&config.backend).await?;
+            let raw = build_raw_backend(&config.backend, &config.backend_encryption).await?;
             wrap_backend_with_encryption(
                 "default",
                 raw,
@@ -268,12 +272,13 @@ impl DynEngine {
             )?
         } else {
             // Multi-backend routing. Each named entry is constructed
-            // raw, wrapped with its own encryption config, then handed
-            // to the router.
+            // raw (with native-SSE config already baked in), wrapped
+            // with its own proxy-AES config if any, then handed to
+            // the router.
             let mut backends = std::collections::HashMap::new();
             let mut kid_collisions = KeyIdCollisionCheck::new();
             for named in &config.backends {
-                let raw = build_raw_backend(&named.backend).await?;
+                let raw = build_raw_backend(&named.backend, &named.encryption).await?;
                 let wrapped = wrap_backend_with_encryption(
                     &named.name,
                     raw,
@@ -304,16 +309,47 @@ impl DynEngine {
     }
 }
 
-/// Build ONE storage backend from a `BackendConfig` variant, without
-/// any encryption wrapping. Keeps the I/O-construction step decoupled
-/// from the wrapping policy, so the wrapping loop is a pure function
-/// of resolved encryption.
-async fn build_raw_backend(cfg: &BackendConfig) -> Result<Box<dyn StorageBackend>, StorageError> {
+/// Translate the on-wire `BackendEncryptionConfig` into the
+/// S3-specific `NativeEncryptionConfig` for the raw backend
+/// constructor. Returns `None` variant for every non-native mode
+/// (proxy-AES or mode:none): those are handled by the
+/// `EncryptingBackend` wrapper layer above.
+fn native_encryption_for(
+    enc: &crate::config::BackendEncryptionConfig,
+) -> crate::storage::NativeEncryptionConfig {
+    use crate::config::BackendEncryptionConfig as E;
+    use crate::storage::NativeEncryptionConfig as N;
+    match enc {
+        E::None | E::Aes256GcmProxy { .. } => N::None,
+        E::SseS3 { .. } => N::SseS3,
+        E::SseKms {
+            kms_key_id,
+            bucket_key_enabled,
+            ..
+        } => N::SseKms {
+            kms_key_id: kms_key_id.clone(),
+            bucket_key_enabled: *bucket_key_enabled,
+        },
+    }
+}
+
+/// Build ONE storage backend from a `BackendConfig` variant + its
+/// encryption config. Native SSE modes are baked into the S3 client
+/// here; proxy-AES encryption is layered on top by
+/// `wrap_backend_with_encryption`. Filesystem backends ignore native
+/// modes (rejected at `Config::check` time).
+async fn build_raw_backend(
+    cfg: &BackendConfig,
+    enc: &crate::config::BackendEncryptionConfig,
+) -> Result<Box<dyn StorageBackend>, StorageError> {
     match cfg {
         BackendConfig::Filesystem { path } => {
             Ok(Box::new(FilesystemBackend::new(path.clone()).await?))
         }
-        BackendConfig::S3 { .. } => Ok(Box::new(S3Backend::new(cfg).await?)),
+        BackendConfig::S3 { .. } => {
+            let native = native_encryption_for(enc);
+            Ok(Box::new(S3Backend::new(cfg, native).await?))
+        }
     }
 }
 
@@ -422,11 +458,16 @@ fn wrap_backend_with_encryption(
             (None, None)
         }
         E::SseKms { .. } | E::SseS3 { .. } => {
-            tracing::warn!(
-                "backend '{}' requests native SSE mode '{}' but the S3Backend plumbing \
-                 for native modes is not enabled in this build — writes are currently \
-                 plaintext on this backend. This is a transient state during the \
-                 per-backend encryption rollout.",
+            // Native S3-side encryption — the S3Backend constructor
+            // already received the matching `NativeEncryptionConfig`
+            // via `build_raw_backend`, and every PutObject gets
+            // `x-amz-server-side-encryption` headers. The proxy
+            // wrapper here holds no key and does not encrypt; it's
+            // in the stack only for the sniffer defense and to
+            // pass-through the `dg-encrypted-native` marker that
+            // S3Backend stamps.
+            tracing::info!(
+                "backend '{}' encryption: ENABLED (native {})",
                 backend_name,
                 enc.mode_tag()
             );
@@ -1430,12 +1471,12 @@ mod tests {
     }
 
     #[test]
-    fn test_wrap_backend_sse_modes_fall_through_in_step2() {
-        // Step 2 does NOT plumb native SSE through S3Backend yet —
-        // Step 4 does. Until then, native-mode backends wrap with
-        // no key (writes plaintext) and emit a WARN log. Verify the
-        // wrap doesn't error and the returned backend is still an
-        // `EncryptingBackend` (just with no key).
+    fn test_wrap_backend_sse_modes_wrap_for_sniffer_defense() {
+        // Step 4: SSE-KMS and SSE-S3 delegate encryption to AWS (see
+        // `native_encryption_for` + `S3Backend::new`). The proxy
+        // wrapper is STILL constructed for those modes — it holds no
+        // proxy key, but it keeps the sniffer defense in the read
+        // path for the xattr-strip scenario.
         let mut coll = KeyIdCollisionCheck::new();
         let wrapped = wrap_backend_with_encryption(
             "s3-kms",
@@ -1460,6 +1501,53 @@ mod tests {
             &mut coll,
         );
         assert!(wrapped2.is_ok());
+    }
+
+    #[test]
+    fn test_native_encryption_for_maps_modes_correctly() {
+        use crate::config::BackendEncryptionConfig as E;
+        use crate::storage::NativeEncryptionConfig as N;
+
+        // Non-native modes produce N::None; the S3Backend gets no
+        // SSE headers, and `EncryptingBackend` handles encryption
+        // at the wrapper layer (or nothing, for mode:none).
+        assert!(matches!(native_encryption_for(&E::None), N::None));
+        assert!(matches!(
+            native_encryption_for(&E::Aes256GcmProxy {
+                key: Some("hex".into()),
+                key_id: None,
+                legacy_key: None,
+                legacy_key_id: None,
+            }),
+            N::None
+        ));
+
+        // SseS3 → N::SseS3 — AES256 headers, no KMS.
+        assert!(matches!(
+            native_encryption_for(&E::SseS3 {
+                legacy_key: None,
+                legacy_key_id: None,
+            }),
+            N::SseS3
+        ));
+
+        // SseKms → N::SseKms with the ARN and bucket_key_enabled
+        // threaded through verbatim.
+        match native_encryption_for(&E::SseKms {
+            kms_key_id: "arn:aws:kms:us-east-1:111:key/abc".into(),
+            bucket_key_enabled: false,
+            legacy_key: None,
+            legacy_key_id: None,
+        }) {
+            N::SseKms {
+                kms_key_id,
+                bucket_key_enabled,
+            } => {
+                assert_eq!(kms_key_id, "arn:aws:kms:us-east-1:111:key/abc");
+                assert!(!bucket_key_enabled);
+            }
+            other => panic!("expected SseKms, got {other:?}"),
+        }
     }
 
     #[test]

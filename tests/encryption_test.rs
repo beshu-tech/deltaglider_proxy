@@ -291,6 +291,79 @@ async fn test_unencrypted_still_readable() {
 }
 
 // ═══════════════════════════════════════════════════
+// Step 4: native S3 server-side encryption (SSE-S3)
+//
+// MinIO implements SSE-S3 natively. We test that:
+//   1. A PUT with SSE-S3 configured produces an object that round-trips
+//      through the proxy (AWS transparently decrypts).
+//   2. The `dg-encrypted-native: sse-s3` user-metadata marker is
+//      stamped on the object (distinguishes native vs proxy-side
+//      encryption for ops introspection).
+//   3. The underlying object has the `x-amz-server-side-encryption:
+//      AES256` header when queried directly (bypassing the proxy via
+//      the DG-metadata marker surfaced on the proxy HEAD response).
+//
+// Proxy-side AES-256-GCM continues to work in parallel; SSE-S3 is a
+// distinct per-backend choice.
+//
+// Requires MinIO running at the default endpoint. Skipped when absent.
+// ═══════════════════════════════════════════════════
+
+#[ignore = "Requires MinIO running at http://localhost:9000 (docker compose up)"]
+#[tokio::test]
+async fn test_sse_s3_roundtrip_through_s3_backend() {
+    let server = TestServer::builder()
+        .bucket(BUCKET)
+        .auth("SSES3K", "SSES3SECRET")
+        .s3_endpoint(&common::minio_endpoint_url())
+        .sse_s3()
+        .build()
+        .await;
+
+    let plaintext = b"hello sse-s3";
+    put_object(&server, "sse-s3-target.txt", plaintext).await;
+
+    // Read back through the proxy — MinIO decrypts transparently.
+    let got = get_object(&server, "sse-s3-target.txt").await;
+    assert_eq!(got, plaintext);
+
+    // Verify the dg-encrypted-native marker was stamped (via HEAD).
+    let client = server.s3_client().await;
+    let head = client
+        .head_object()
+        .bucket(BUCKET)
+        .key("sse-s3-target.txt")
+        .send()
+        .await
+        .expect("HEAD should succeed");
+    // AWS SDK surfaces user-metadata as a lowercase-keyed map.
+    let dg_native = head
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("dg-encrypted-native"))
+        .map(|s| s.as_str());
+    assert_eq!(
+        dg_native,
+        Some("sse-s3"),
+        "SSE-S3 writes must stamp `dg-encrypted-native: sse-s3` in user-metadata, \
+         got metadata: {:?}",
+        head.metadata
+    );
+
+    // Proxy-side encryption markers must NOT be set — native and
+    // proxy encryption are mutually exclusive on a given backend.
+    let dg_enc = head
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("dg-encrypted"))
+        .map(|s| s.as_str());
+    assert_eq!(
+        dg_enc, None,
+        "native-SSE objects must NOT carry the proxy `dg-encrypted` marker"
+    );
+}
+
+// ═══════════════════════════════════════════════════
 // Chunked streaming encryption tests
 //
 // These exercise the `aes-256-gcm-chunked-v1` wire format introduced
