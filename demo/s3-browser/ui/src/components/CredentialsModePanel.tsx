@@ -29,7 +29,6 @@
  * plumbing applies. Dirty state + ApplyDialog + AdminPage's
  * sidebar-dot coordination all free from `useDirtySection`.
  */
-import { useCallback, useEffect, useState } from 'react';
 import {
   Alert,
   Button,
@@ -38,7 +37,6 @@ import {
   Radio,
   Space,
   Typography,
-  message,
 } from 'antd';
 import {
   ExclamationCircleOutlined,
@@ -47,15 +45,10 @@ import {
   SafetyOutlined,
   TeamOutlined,
 } from '@ant-design/icons';
-import type { IamMode, SectionApplyResponse } from '../adminApi';
-import {
-  getSection,
-  putSection,
-  validateSection,
-} from '../adminApi';
+import type { IamMode } from '../adminApi';
 import { useColors } from '../ThemeContext';
 import { useCardStyles } from './shared-styles';
-import { useDirtySection, useApplyHandler } from '../useDirtySection';
+import { useSectionEditor } from '../useSectionEditor';
 import SectionHeader from './SectionHeader';
 import FormField from './FormField';
 import ApplyDialog from './ApplyDialog';
@@ -90,51 +83,25 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
   const { cardStyle, inputRadius } = useCardStyles();
   const colors = useColors();
 
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
   const {
     value: form,
-    isDirty,
     setValue: setForm,
     discard,
-    markApplied,
-    resetWith,
-  } = useDirtySection<AccessSectionBody>('access', EMPTY_ACCESS);
-
-  // Apply-dialog state. Same pattern as AdmissionPanel — snapshot
-  // the body at validate time (§F5 fix) so the diff and the
-  // subsequent PUT refer to the same payload even if the operator
-  // keeps interacting with the form underneath the modal.
-  const [applyOpen, setApplyOpen] = useState(false);
-  const [applyResponse, setApplyResponse] = useState<SectionApplyResponse | null>(null);
-  const [pendingBody, setPendingBody] = useState<AccessSectionBody | null>(null);
-  const [applying, setApplying] = useState(false);
-
-  const refresh = useCallback(async () => {
-    try {
-      setLoading(true);
-      const body = await getSection<AccessSectionBody>('access');
-      // Merge missing fields from EMPTY_ACCESS so the form controllers
-      // always see a known shape. The server returns e.g. `{}` on a
-      // fresh install when every access field is at its default.
-      resetWith({ ...EMPTY_ACCESS, ...body });
-      setError(null);
-    } catch (e) {
-      if (e instanceof Error && e.message.includes('401')) {
-        onSessionExpired?.();
-        return;
-      }
-      setError(
-        `Failed to load access section: ${e instanceof Error ? e.message : 'unknown'}`
-      );
-    } finally {
-      setLoading(false);
-    }
-  }, [resetWith, onSessionExpired]);
-
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
+    isDirty,
+    loading,
+    error,
+    applyOpen,
+    applyResponse,
+    applying,
+    runApply,
+    cancelApply,
+    confirmApply,
+  } = useSectionEditor<AccessSectionBody>({
+    section: 'access',
+    initial: EMPTY_ACCESS,
+    onSessionExpired,
+    noun: 'access',
+  });
 
   // Derive the auth-mode radio from the `authentication` string. The
   // server stores it as `Option<String>` — absent / `null` means
@@ -196,69 +163,6 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
 
   const setAccessKey = (v: string) => setForm({ ...form, access_key_id: v || undefined });
   const setSecretKey = (v: string) => setForm({ ...form, secret_access_key: v || undefined });
-
-  // ── Apply flow ─────────────────────────────────────────
-
-  const runApply = async () => {
-    // Snapshot the body at validate time. The apply dialog's diff
-    // and the subsequent PUT both refer to THIS object, even if the
-    // operator keeps typing underneath the modal (§F5).
-    const snapshot: AccessSectionBody = {
-      iam_mode: form.iam_mode,
-      authentication: form.authentication,
-      access_key_id: form.access_key_id,
-      secret_access_key: form.secret_access_key,
-    };
-    try {
-      const resp = await validateSection<AccessSectionBody>('access', snapshot);
-      setApplyResponse(resp);
-      setPendingBody(snapshot);
-      setApplyOpen(true);
-    } catch (e) {
-      message.error(
-        `Validate failed: ${e instanceof Error ? e.message : 'unknown'}`
-      );
-    }
-  };
-
-  const cancelApply = () => {
-    setApplyOpen(false);
-    setPendingBody(null);
-  };
-
-  const confirmApply = async () => {
-    if (!pendingBody) return;
-    setApplying(true);
-    try {
-      const resp = await putSection<AccessSectionBody>('access', pendingBody);
-      if (!resp.ok) {
-        message.error(resp.error || 'Apply failed');
-        return;
-      }
-      message.success(
-        resp.persisted_path
-          ? `Applied + persisted to ${resp.persisted_path}`
-          : 'Applied'
-      );
-      markApplied();
-      setApplyOpen(false);
-      setPendingBody(null);
-      void refresh();
-    } catch (e) {
-      message.error(
-        `Apply failed: ${e instanceof Error ? e.message : 'unknown'}`
-      );
-      setApplyOpen(false);
-      setPendingBody(null);
-      void refresh();
-    } finally {
-      setApplying(false);
-    }
-  };
-
-  // ⌘S wiring: when this panel is mounted and dirty, ⌘S opens the
-  // Apply dialog (same action as clicking the Apply button).
-  useApplyHandler('access', runApply, isDirty);
 
   if (error) {
     return <Alert type="error" showIcon message="Failed to load" description={error} />;

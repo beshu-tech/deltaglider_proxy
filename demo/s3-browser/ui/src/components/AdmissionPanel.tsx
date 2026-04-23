@@ -23,22 +23,17 @@
  *      `ApplyDialog`, on confirm call `putSection`.
  *   4. Discard: revert the dirty state to the last-applied snapshot.
  */
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { Button, Alert, Typography, Space, Modal, message } from 'antd';
+import { useEffect, useRef, useState } from 'react';
+import { Button, Alert, Typography, Space, Modal } from 'antd';
 import {
   PlusOutlined,
   InfoCircleOutlined,
   ExclamationCircleOutlined,
 } from '@ant-design/icons';
-import type { AdmissionBlock, AdminConfig, SectionApplyResponse } from '../adminApi';
-import {
-  getAdminConfig,
-  getSection,
-  putSection,
-  validateSection,
-} from '../adminApi';
+import type { AdmissionBlock, AdminConfig } from '../adminApi';
+import { getAdminConfig } from '../adminApi';
 import { useColors } from '../ThemeContext';
-import { useDirtySection, useApplyHandler } from '../useDirtySection';
+import { useSectionEditor } from '../useSectionEditor';
 import AdmissionBlockList from './AdmissionBlockList';
 import AdmissionBlockEditorModal from './AdmissionBlockEditorModal';
 import SynthesizedBlocksPreview from './SynthesizedBlocksPreview';
@@ -63,65 +58,56 @@ export default function AdmissionPanel({
 }: Props) {
   const { BORDER, TEXT_MUTED } = useColors();
 
-  const [loading, setLoading] = useState(true);
   const [config, setConfig] = useState<AdminConfig | null>(null);
+
+  // The shared editor handles the admission section (blocks[]).
+  // Local state is `AdmissionBlock[]`; wire shape is
+  // `{ blocks: AdmissionBlock[] }` — converted via pick/toPayload.
   const {
     value: blocks,
-    isDirty,
     setValue: setBlocks,
     discard,
-    markApplied,
-    resetWith,
-  } = useDirtySection<AdmissionBlock[]>('admission', []);
+    isDirty,
+    loading,
+    applyOpen,
+    applyResponse,
+    applying,
+    runApply,
+    cancelApply,
+    confirmApply,
+  } = useSectionEditor<AdmissionSectionBody, AdmissionBlock[]>({
+    section: 'admission',
+    initial: [],
+    onSessionExpired,
+    pick: (body) => body?.blocks ?? [],
+    toPayload: (v) => ({ blocks: v }),
+    noun: 'admission blocks',
+  });
+
+  // We still need the bucket-policies for the synthesised-blocks
+  // preview — fetch them alongside, independently of the section editor.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const cfg = await getAdminConfig();
+        if (!cancelled) setConfig(cfg);
+      } catch (e) {
+        if (e instanceof Error && e.message.includes('401')) {
+          onSessionExpired?.();
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [onSessionExpired]);
 
   // Modal state: when the operator clicks Add or Edit, we set
   // `editing` to the index (or -1 for Add) and `editingBlock` to
   // the block data (or null for Add).
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
   const [editingBlock, setEditingBlock] = useState<AdmissionBlock | null>(null);
-
-  // Apply-dialog state.
-  //
-  // `pendingApplyBlocks` captures the exact body that went to
-  // `/validate` so `confirmApply` PUTs the same blocks the operator
-  // saw in the diff, even if they kept interacting with the list
-  // underneath the modal. Otherwise the diff shown and the body
-  // persisted could diverge — adversarial review F5.
-  const [applyOpen, setApplyOpen] = useState(false);
-  const [applyResponse, setApplyResponse] = useState<SectionApplyResponse | null>(
-    null
-  );
-  const [pendingApplyBlocks, setPendingApplyBlocks] = useState<
-    AdmissionBlock[] | null
-  >(null);
-  const [applying, setApplying] = useState(false);
-
-  const refresh = useCallback(async () => {
-    try {
-      setLoading(true);
-      const [sectionBody, cfg] = await Promise.all([
-        getSection<AdmissionSectionBody>('admission'),
-        getAdminConfig(),
-      ]);
-      const fetched = sectionBody?.blocks ?? [];
-      resetWith(fetched);
-      setConfig(cfg);
-    } catch (e) {
-      if (e instanceof Error && e.message.includes('401')) {
-        onSessionExpired?.();
-        return;
-      }
-      message.error(
-        `Failed to load admission blocks: ${e instanceof Error ? e.message : 'unknown'}`
-      );
-    } finally {
-      setLoading(false);
-    }
-  }, [resetWith, onSessionExpired]);
-
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
 
   const openAdd = () => {
     setEditingIndex(-1);
@@ -178,80 +164,6 @@ export default function AdmissionPanel({
       },
     });
   };
-
-  /**
-   * Apply: call validate first to get the diff + warnings, then show
-   * the ApplyDialog. On confirm, call putSection. On failure, leave
-   * the form state as-is so the operator can fix and retry.
-   */
-  const runApply = async () => {
-    // Snapshot the blocks at the moment the operator clicks Apply.
-    // If they subsequently reorder/edit while the dialog is open,
-    // the dialog's diff + PUT both use this snapshot — the
-    // alternative (closure-read of `blocks` at confirm time) would
-    // let the operator see diff A and persist body B.
-    const snapshot = blocks.slice();
-    try {
-      const resp = await validateSection<AdmissionSectionBody>('admission', {
-        blocks: snapshot,
-      });
-      setApplyResponse(resp);
-      setPendingApplyBlocks(snapshot);
-      setApplyOpen(true);
-    } catch (e) {
-      message.error(
-        `Validate failed: ${e instanceof Error ? e.message : 'unknown'}`
-      );
-    }
-  };
-
-  const cancelApply = () => {
-    setApplyOpen(false);
-    setPendingApplyBlocks(null);
-  };
-
-  const confirmApply = async () => {
-    if (!pendingApplyBlocks) return;
-    setApplying(true);
-    try {
-      const resp = await putSection<AdmissionSectionBody>('admission', {
-        blocks: pendingApplyBlocks,
-      });
-      if (!resp.ok) {
-        // Server-side validation error (4xx). Surface the error but
-        // keep the dialog open so the operator sees the reason next
-        // to the diff they were about to confirm.
-        message.error(resp.error || 'Apply failed');
-        return;
-      }
-      message.success(
-        resp.persisted_path
-          ? `Applied + persisted to ${resp.persisted_path}`
-          : 'Applied'
-      );
-      markApplied();
-      setApplyOpen(false);
-      setPendingApplyBlocks(null);
-      // Re-fetch to pick up server-side normalisation.
-      void refresh();
-    } catch (e) {
-      // Network / 5xx error. Close the dialog and force a refresh —
-      // the server may have partially applied; the stale diff the
-      // dialog was showing is no longer trustworthy (F11).
-      message.error(
-        `Apply failed: ${e instanceof Error ? e.message : 'unknown'}`
-      );
-      setApplyOpen(false);
-      setPendingApplyBlocks(null);
-      void refresh();
-    } finally {
-      setApplying(false);
-    }
-  };
-
-  // ⌘S wiring: when dirty, ⌘S triggers the same flow as clicking
-  // Apply — opens the validate → ApplyDialog sequence.
-  useApplyHandler('admission', runApply, isDirty);
 
   const otherNames = blocks
     .filter((_, i) => i !== editingIndex)

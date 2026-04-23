@@ -425,12 +425,8 @@ pub async fn oauth_callback(
 pub async fn list_providers(
     State(state): State<Arc<AdminState>>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
-    let db = db.lock().await;
-    let mut providers = db.load_auth_providers().map_err(|e| {
-        tracing::error!("Failed to load auth providers: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let mut providers =
+        super::with_config_db(&state, "load auth providers", |db| db.load_auth_providers()).await?;
 
     // Mask client secrets
     for p in &mut providers {
@@ -448,17 +444,12 @@ pub async fn create_provider(
     req_headers: HeaderMap,
     Json(body): Json<CreateAuthProviderRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
-    let db = db.lock().await;
-    let provider = db.create_auth_provider(&body).map_err(|e| {
-        tracing::error!("Failed to create auth provider: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let provider = super::with_config_db(&state, "create auth provider", |db| {
+        db.create_auth_provider(&body)
+    })
+    .await?;
 
     audit_log("create_auth_provider", "", &body.name, &req_headers);
-
-    // Rebuild external auth manager
-    drop(db);
     rebuild_external_auth(&state).await;
     trigger_config_sync(&state);
 
@@ -472,16 +463,12 @@ pub async fn update_provider(
     req_headers: HeaderMap,
     Json(body): Json<UpdateAuthProviderRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
-    let db = db.lock().await;
-    let updated = db.update_auth_provider(id, &body).map_err(|e| {
-        tracing::error!("Failed to update auth provider {}: {}", id, e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let updated = super::with_config_db(&state, "update auth provider", |db| {
+        db.update_auth_provider(id, &body)
+    })
+    .await?;
 
     audit_log("update_auth_provider", "", &updated.name, &req_headers);
-
-    drop(db);
     rebuild_external_auth(&state).await;
     trigger_config_sync(&state);
 
@@ -494,16 +481,12 @@ pub async fn delete_provider(
     Path(id): Path<i64>,
     req_headers: HeaderMap,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
-    let db = db.lock().await;
-    db.delete_auth_provider(id).map_err(|e| {
-        tracing::error!("Failed to delete auth provider {}: {}", id, e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    super::with_config_db(&state, "delete auth provider", |db| {
+        db.delete_auth_provider(id)
+    })
+    .await?;
 
     audit_log("delete_auth_provider", "", &id.to_string(), &req_headers);
-
-    drop(db);
     rebuild_external_auth(&state).await;
     trigger_config_sync(&state);
 
@@ -554,12 +537,10 @@ pub async fn test_provider(
 pub async fn list_mappings(
     State(state): State<Arc<AdminState>>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
-    let db = db.lock().await;
-    let rules = db.load_group_mapping_rules().map_err(|e| {
-        tracing::error!("Failed to load mapping rules: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let rules = super::with_config_db(&state, "load mapping rules", |db| {
+        db.load_group_mapping_rules()
+    })
+    .await?;
     Ok(Json(rules))
 }
 
@@ -633,14 +614,11 @@ pub async fn update_mapping(
         }
     }
 
-    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
-    let db = db.lock().await;
-    let rule = db.update_group_mapping_rule(id, &body).map_err(|e| {
-        tracing::error!("Failed to update mapping rule {}: {}", id, e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let rule = super::with_config_db(&state, "update mapping rule", |db| {
+        db.update_group_mapping_rule(id, &body)
+    })
+    .await?;
 
-    drop(db);
     trigger_config_sync(&state);
 
     Ok(Json(rule))
@@ -651,14 +629,11 @@ pub async fn delete_mapping(
     State(state): State<Arc<AdminState>>,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
-    let db = db.lock().await;
-    db.delete_group_mapping_rule(id).map_err(|e| {
-        tracing::error!("Failed to delete mapping rule {}: {}", id, e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    super::with_config_db(&state, "delete mapping rule", |db| {
+        db.delete_group_mapping_rule(id)
+    })
+    .await?;
 
-    drop(db);
     trigger_config_sync(&state);
 
     Ok(StatusCode::NO_CONTENT)
@@ -709,12 +684,10 @@ pub async fn preview_mapping(
 pub async fn list_identities(
     State(state): State<Arc<AdminState>>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
-    let db = db.lock().await;
-    let identities = db.list_external_identities().map_err(|e| {
-        tracing::error!("Failed to load external identities: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let identities = super::with_config_db(&state, "load external identities", |db| {
+        db.list_external_identities()
+    })
+    .await?;
     Ok(Json(identities))
 }
 

@@ -22,7 +22,7 @@
  * through the `requires_restart` flag on the section PUT response —
  * ApplyDialog renders it as a blue banner.
  */
-import { useCallback, useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   Alert,
   Button,
@@ -32,7 +32,6 @@ import {
   Space,
   Switch,
   Typography,
-  message,
 } from 'antd';
 import {
   CloudServerOutlined,
@@ -42,15 +41,11 @@ import {
   SyncOutlined,
 } from '@ant-design/icons';
 import type { AdminConfig, SectionApplyResponse } from '../adminApi';
-import {
-  getAdminConfig,
-  getSection,
-  putSection,
-  validateSection,
-} from '../adminApi';
+import { getAdminConfig } from '../adminApi';
 import { useColors } from '../ThemeContext';
 import { useCardStyles } from './shared-styles';
-import { useDirtySection, useApplyHandler } from '../useDirtySection';
+import { useSectionEditor } from '../useSectionEditor';
+import type { UseSectionEditorResult } from '../useSectionEditor';
 import SectionHeader from './SectionHeader';
 import FormField from './FormField';
 import ApplyDialog from './ApplyDialog';
@@ -145,135 +140,37 @@ function RestartChip({ reason }: { reason: string }) {
 }
 
 /**
- * Hook: fetch + track dirty state for the `advanced` section,
- * scoped to a subset of fields. Each sub-panel passes a `pick`
- * function that selects the fields it cares about; the hook
- * returns the full subset state + the usual dirty-state machinery.
+ * Advanced sub-panel wrapper around the shared `useSectionEditor`.
  *
- * PUT sends ONLY the fields the panel owns (RFC 7396 merge patch
- * preserves everything else), so sibling Advanced panels can't
- * clobber each other.
+ * Each sub-panel passes its `initial` (the union of fields it owns).
+ * We produce the `pick` filter from `initial`'s keys so the fetch
+ * path narrows the server body to this panel's scope. PUT sends
+ * ONLY the subset (RFC 7396 merge-patch), so sibling Advanced
+ * panels can't clobber each other.
  */
 function useAdvancedSubset<T extends Partial<AdvancedSectionBody>>(
   initial: T,
   onSessionExpired?: () => void
-) {
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const { value, isDirty, setValue, discard, markApplied, resetWith } =
-    useDirtySection<T>('advanced', initial);
-
-  // Apply-dialog state.
-  const [applyOpen, setApplyOpen] = useState(false);
-  const [applyResponse, setApplyResponse] = useState<SectionApplyResponse | null>(null);
-  const [pendingBody, setPendingBody] = useState<T | null>(null);
-  const [applying, setApplying] = useState(false);
-
-  const refresh = useCallback(async () => {
-    try {
-      setLoading(true);
-      const body = await getSection<AdvancedSectionBody>('advanced');
-      // Pick just the subset this panel owns. Unknown keys stay
-      // absent from our state but the server keeps them when we
-      // PUT our subset back (merge-patch).
-      const subset: Partial<T> = {};
-      for (const k of Object.keys(initial) as Array<keyof T>) {
+): UseSectionEditorResult<T> {
+  const keys = Object.keys(initial) as Array<keyof T>;
+  return useSectionEditor<AdvancedSectionBody, T>({
+    section: 'advanced',
+    initial,
+    onSessionExpired,
+    pick: (body) => {
+      // Start from `initial` so absent server fields get the form's
+      // default, then overlay whatever values the server sent for
+      // our scope.
+      const out: T = { ...initial };
+      for (const k of keys) {
         const v = (body as Record<string, unknown>)[k as string];
         if (v !== undefined) {
-          (subset as Record<string, unknown>)[k as string] = v;
+          (out as Record<string, unknown>)[k as string] = v;
         }
       }
-      resetWith({ ...initial, ...subset });
-      setError(null);
-    } catch (e) {
-      if (e instanceof Error && e.message.includes('401')) {
-        onSessionExpired?.();
-        return;
-      }
-      setError(
-        `Failed to load advanced section: ${e instanceof Error ? e.message : 'unknown'}`
-      );
-    } finally {
-      setLoading(false);
-    }
-    // Only run on mount / prop change; `initial` + `resetWith` are
-    // expected to be stable.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [onSessionExpired]);
-
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
-
-  /** Kick the plan -> diff -> apply dialog. Snapshots the body at
-   *  validate time so a later edit under the dialog can't drift. */
-  const runApply = async () => {
-    const snapshot = { ...value };
-    try {
-      const resp = await validateSection<T>('advanced', snapshot);
-      setApplyResponse(resp);
-      setPendingBody(snapshot);
-      setApplyOpen(true);
-    } catch (e) {
-      message.error(
-        `Validate failed: ${e instanceof Error ? e.message : 'unknown'}`
-      );
-    }
-  };
-
-  const cancelApply = () => {
-    setApplyOpen(false);
-    setPendingBody(null);
-  };
-
-  const confirmApply = async () => {
-    if (!pendingBody) return;
-    setApplying(true);
-    try {
-      const resp = await putSection<T>('advanced', pendingBody);
-      if (!resp.ok) {
-        message.error(resp.error || 'Apply failed');
-        return;
-      }
-      message.success(
-        resp.persisted_path
-          ? `Applied + persisted to ${resp.persisted_path}`
-          : 'Applied'
-      );
-      markApplied();
-      setApplyOpen(false);
-      setPendingBody(null);
-      void refresh();
-    } catch (e) {
-      message.error(`Apply failed: ${e instanceof Error ? e.message : 'unknown'}`);
-      setApplyOpen(false);
-      setPendingBody(null);
-      void refresh();
-    } finally {
-      setApplying(false);
-    }
-  };
-
-  // ⌘S wiring: any Advanced sub-panel inherits ⌘S-to-Apply for free.
-  // Each panel mounts its own useAdvancedSubset — only the visible
-  // panel's handler sits on top of the register stack, which is
-  // exactly what requestApplyCurrent dispatches to.
-  useApplyHandler('advanced', runApply, isDirty);
-
-  return {
-    value,
-    isDirty,
-    setValue,
-    discard,
-    loading,
-    error,
-    applyOpen,
-    applyResponse,
-    applying,
-    runApply,
-    cancelApply,
-    confirmApply,
-  };
+      return out;
+    },
+  });
 }
 
 /** Render the dirty-state banner + ApplyDialog pair. Every Advanced

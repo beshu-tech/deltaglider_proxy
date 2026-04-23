@@ -468,6 +468,23 @@ const MAX_ENTRY_BYTES: u64 = 8 * 1024 * 1024;
 ///             then secrets.json (storage creds + bootstrap hash),
 ///             then iam.json. Secrets land before IAM so the
 ///             post-IAM S3-sync push uses the restored storage creds.
+///
+/// ## Maintenance note (hygiene review, 2026-04-23)
+///
+/// This function is ~220 LOC covering six phases with clear seams
+/// (unpack → manifest → parse parts → validate IAM → merge secrets
+/// → apply). It was NOT split as a pure refactor because disaster-
+/// recovery paths are sensitive and the risk/reward didn't earn a
+/// reshape. The next person who touches this (e.g. adding a v3
+/// manifest field, supporting partial restore, or shipping encrypted
+/// backups) should split it as part of that change — the natural
+/// boundaries are:
+///
+///   - `extract_and_verify_manifest(archive) -> HashMap<path, bytes>`
+///   - `parse_backup_parts(files) -> ParsedBackup`
+///   - `apply_imported_backup(state, parsed)` (Phase B)
+///
+/// Leave `import_zip_full_backup` as the thin orchestrator.
 async fn import_zip_full_backup(
     state: Arc<AdminState>,
     headers: HeaderMap,

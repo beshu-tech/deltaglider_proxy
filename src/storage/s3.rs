@@ -4,6 +4,25 @@
 //! for compatibility with the original DeltaGlider CLI (beshultd/deltaglider).
 //!
 //! Each API bucket maps 1:1 to a real S3 bucket on the backend.
+//!
+//! ## Maintenance note (hygiene review, 2026-04-23)
+//!
+//! At ~1500 LOC this file mixes four concerns:
+//!   1. S3Backend struct + constructor
+//!   2. Error classification (S3Op, classify_get_error, body-stream helpers)
+//!   3. Listing + pagination (S3ListedObject, list_objects_full)
+//!   4. StorageBackend trait impl (the big impl block)
+//!
+//! It was NOT split as a pure refactor because the S3 path is hot
+//! (every PUT/GET/LIST when the S3 backend is active) and a pure
+//! file-reorg carries regression risk disproportionate to the
+//! readability win. The next person adding a substantial S3 feature
+//! (server-side encryption, requester-pays, checksum headers) should
+//! split first, along natural boundaries:
+//!   - storage/s3/mod.rs            — struct + trait impl
+//!   - storage/s3/errors.rs         — S3Op + classify_get_error + stream
+//!   - storage/s3/listing.rs        — S3ListedObject + pagination
+//!   - storage/s3/metadata_io.rs    — header/metadata serialisation
 
 use super::traits::{DelegatedListResult, StorageBackend, StorageError};
 use crate::config::BackendConfig;

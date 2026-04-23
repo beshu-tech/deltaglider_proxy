@@ -504,24 +504,31 @@ pub enum BackendConfig {
     },
 }
 
-// Default value functions for serde
-fn default_listen_addr() -> SocketAddr {
+// Default value functions for serde.
+//
+// `pub(crate)` so `config_sections.rs` can reuse them — the sectioned
+// shape needs the same defaults to decide whether to emit an explicit
+// value or omit the field (serde's `skip_serializing_if`). Keeping a
+// single source of truth prevents drift between the flat and sectioned
+// shapes, which the `round_trips_default_config` test would otherwise
+// have to catch after the fact.
+pub(crate) fn default_listen_addr() -> SocketAddr {
     "0.0.0.0:9000".parse().unwrap()
 }
 
-fn default_max_delta_ratio() -> f32 {
+pub(crate) fn default_max_delta_ratio() -> f32 {
     0.75
 }
 
-fn default_max_object_size() -> u64 {
+pub(crate) fn default_max_object_size() -> u64 {
     100 * 1024 * 1024 // 100MB
 }
 
-fn default_cache_size_mb() -> usize {
+pub(crate) fn default_cache_size_mb() -> usize {
     100
 }
 
-fn default_metadata_cache_mb() -> usize {
+pub(crate) fn default_metadata_cache_mb() -> usize {
     50
 }
 
@@ -533,7 +540,7 @@ fn default_force_path_style() -> bool {
     true
 }
 
-fn default_log_level() -> String {
+pub(crate) fn default_log_level() -> String {
     "deltaglider_proxy=debug,tower_http=debug".to_string()
 }
 

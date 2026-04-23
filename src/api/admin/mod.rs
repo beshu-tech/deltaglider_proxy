@@ -113,6 +113,56 @@ pub(crate) fn trigger_config_sync(state: &Arc<AdminState>) {
     }
 }
 
+/// Run a synchronous operation against the locked config DB.
+///
+/// Wraps the boilerplate that otherwise repeats in every admin IAM
+/// handler: "pull the Option<Arc<Mutex<ConfigDb>>> out of the state
+/// or return 404, lock it, run the op, on error log and return 500."
+///
+/// Post-mutation hooks (`rebuild_external_auth`, `rebuild_iam_index`,
+/// `trigger_config_sync`, `audit_log`) stay explicit at the handler
+/// level — they're called AFTER the lock is released and the order
+/// between them matters, so hiding them behind this helper would
+/// trade one kind of boilerplate for another. The important gain
+/// here is a uniform "no DB" / "DB error" contract.
+///
+/// `op_label` is the noun that appears in the error log if the
+/// closure returns `Err` — e.g. `"load auth providers"` produces
+/// `Failed to load auth providers: <err>`.
+///
+/// # Example
+///
+/// ```ignore
+/// pub async fn list_providers(
+///     State(state): State<Arc<AdminState>>,
+/// ) -> Result<impl IntoResponse, StatusCode> {
+///     let providers = with_config_db(&state, "load auth providers", |db| {
+///         db.load_auth_providers()
+///     })
+///     .await?;
+///     Ok(Json(providers))
+/// }
+/// ```
+pub(crate) async fn with_config_db<T, F, E>(
+    state: &Arc<AdminState>,
+    op_label: &str,
+    f: F,
+) -> Result<T, axum::http::StatusCode>
+where
+    F: FnOnce(&ConfigDb) -> Result<T, E>,
+    E: std::fmt::Display,
+{
+    let db = state
+        .config_db
+        .as_ref()
+        .ok_or(axum::http::StatusCode::NOT_FOUND)?;
+    let db = db.lock().await;
+    f(&db).map_err(|e| {
+        tracing::error!("Failed to {op_label}: {e}");
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
 /// Admin audit log helper — delegates to `crate::audit::audit_log` with empty bucket/path.
 /// Exists to avoid passing `"", ""` at every admin API call site.
 pub(crate) fn audit_log(

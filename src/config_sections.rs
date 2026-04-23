@@ -52,7 +52,11 @@
 //! - Phase 3d: group presets expanding to IAM policy documents.
 
 use crate::bucket_policy::BucketPolicyConfig;
-use crate::config::{BackendConfig, DefaultsVersion, NamedBackendConfig, TlsConfig};
+use crate::config::{
+    default_cache_size_mb, default_listen_addr, default_log_level, default_max_delta_ratio,
+    default_max_object_size, default_metadata_cache_mb, BackendConfig, DefaultsVersion,
+    NamedBackendConfig, TlsConfig,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -538,17 +542,23 @@ impl SectionedConfig {
                 // Emit only non-default values to keep the exported YAML
                 // minimal. Round-trip correctness is the invariant — the
                 // defaults round back through `Config::default()`.
-                listen_addr: some_if_nondefault(flat.listen_addr, default_listen()),
-                max_delta_ratio: some_if_nondefault(flat.max_delta_ratio, default_ratio()),
-                max_object_size: some_if_nondefault(flat.max_object_size, default_max_object()),
-                cache_size_mb: some_if_nondefault(flat.cache_size_mb, default_cache_mb()),
+                listen_addr: some_if_nondefault(flat.listen_addr, default_listen_addr()),
+                max_delta_ratio: some_if_nondefault(
+                    flat.max_delta_ratio,
+                    default_max_delta_ratio(),
+                ),
+                max_object_size: some_if_nondefault(
+                    flat.max_object_size,
+                    default_max_object_size(),
+                ),
+                cache_size_mb: some_if_nondefault(flat.cache_size_mb, default_cache_size_mb()),
                 metadata_cache_mb: some_if_nondefault(
                     flat.metadata_cache_mb,
                     default_metadata_cache_mb(),
                 ),
                 codec_concurrency: flat.codec_concurrency,
                 blocking_threads: flat.blocking_threads,
-                log_level: some_if_nondefault_str(&flat.log_level, default_log()),
+                log_level: some_if_nondefault_str(&flat.log_level, default_log_level()),
                 config_sync_bucket: flat.config_sync_bucket.clone(),
                 tls: flat.tls.clone(),
                 bootstrap_password_hash: flat.bootstrap_password_hash.clone(),
@@ -644,29 +654,6 @@ fn some_if_nondefault_str(value: &str, default: String) -> Option<String> {
     } else {
         Some(value.to_string())
     }
-}
-
-// These duplicate the private `fn default_*` helpers in config.rs. Not DRY,
-// but the alternative is making those `pub(crate)` and importing them —
-// which inverts the dependency direction (sections should know about
-// Config, not the other way around). Four-line duplicates are acceptable.
-fn default_listen() -> SocketAddr {
-    "0.0.0.0:9000".parse().expect("hardcoded literal")
-}
-fn default_ratio() -> f32 {
-    0.75
-}
-fn default_max_object() -> u64 {
-    100 * 1024 * 1024
-}
-fn default_cache_mb() -> usize {
-    100
-}
-fn default_metadata_cache_mb() -> usize {
-    50
-}
-fn default_log() -> String {
-    "deltaglider_proxy=debug,tower_http=debug".to_string()
 }
 
 #[cfg(test)]
