@@ -308,12 +308,14 @@ fn preserve_runtime_secrets(
 ) -> Vec<String> {
     let mut warnings = Vec::new();
 
-    // Top-level infra secrets.
+    // Top-level infra secrets. The bootstrap hash is the only
+    // top-level infra secret left after the per-backend encryption
+    // refactor — per-backend keys live on `backend_encryption` (the
+    // singleton) and on each `backends[i].encryption`, and are
+    // preserved by the per-backend secret-preservation path in
+    // Step 6 (TODO).
     if incoming.bootstrap_password_hash.is_none() {
         incoming.bootstrap_password_hash = current.bootstrap_password_hash.clone();
-    }
-    if incoming.encryption_key.is_none() {
-        incoming.encryption_key = current.encryption_key.clone();
     }
 
     // Top-level SigV4 creds. Both-or-neither semantics: if the operator sets

@@ -310,9 +310,27 @@ pub struct Config {
     #[serde(default = "default_listen_addr")]
     pub listen_addr: SocketAddr,
 
-    /// Storage backend configuration
+    /// Storage backend configuration (legacy singleton path).
+    ///
+    /// When `backends` (the multi-backend list) is non-empty this field
+    /// is ignored — the engine uses the list. When the list is empty,
+    /// this singleton is wrapped and registered as the sole backend
+    /// under the synthetic name `"default"`.
     #[serde(default)]
     pub backend: BackendConfig,
+
+    /// Per-backend encryption-at-rest config for the legacy singleton
+    /// `backend` field above. Ignored when `backends` (the list) is
+    /// non-empty — in that case each entry's own `encryption` field
+    /// applies.
+    ///
+    /// Lives at the flat root (not nested under `backend`) because
+    /// `BackendConfig` is a tagged enum (`type: s3|filesystem`) and
+    /// `#[serde(flatten)]` doesn't compose cleanly with enum tags; so
+    /// encryption rides as a sibling instead. The sectioned YAML shape
+    /// surfaces it under `storage.backend_encryption`.
+    #[serde(default, skip_serializing_if = "is_default_encryption")]
+    pub backend_encryption: BackendEncryptionConfig,
 
     /// Maximum delta ratio (store as delta only if ratio < this value)
     #[serde(default = "default_max_delta_ratio")]
@@ -382,12 +400,6 @@ pub struct Config {
     #[serde(default)]
     pub config_sync_bucket: Option<String>,
 
-    /// AES-256 master key for encryption at rest (64-char hex string = 256 bits).
-    /// When set, all new writes are AES-256-GCM encrypted. Existing unencrypted
-    /// objects remain readable (detected via metadata). Env: `DGP_ENCRYPTION_KEY`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encryption_key: Option<String>,
-
     /// TLS configuration (optional).
     /// When enabled, both the S3 port and the demo UI port serve HTTPS.
     #[serde(default)]
@@ -445,6 +457,209 @@ pub struct Config {
     pub iam_mode: crate::config_sections::IamMode,
 }
 
+/// Per-backend encryption-at-rest configuration.
+///
+/// Replaces the former global `advanced.encryption_key` single-key model.
+/// Each named backend declares its OWN mode; the engine wraps each
+/// backend independently (see `src/deltaglider/engine/mod.rs` backend
+/// registry construction). Four modes:
+///
+/// - `None` — objects stored plaintext.
+/// - `Aes256GcmProxy` — proxy-side AES-256-GCM (the wrapper encrypts
+///   before bytes hit the backend). `key` is the 256-bit hex; `key_id`
+///   is stamped on each written object so reads can detect "this object
+///   was encrypted with a different key" and emit a specific error
+///   instead of an opaque AEAD failure. `legacy_key`/`legacy_key_id`
+///   support the decrypt-only shim during mode transitions.
+/// - `SseKms` — delegate to S3 native SSE-KMS. Bytes are encrypted by
+///   AWS before landing on disk; proxy doesn't wrap.
+/// - `SseS3` — delegate to S3 native AES256 (no KMS involvement).
+///
+/// Name mixing in the default key_id derivation (see
+/// `resolve_encryption` in engine/mod.rs) is load-bearing: two
+/// backends with identical `key` bytes but different names produce
+/// DIFFERENT ids, so objects are NOT accidentally portable between
+/// them. Operators who want portability set an explicit identical
+/// `key_id` on both.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(tag = "mode", rename_all = "kebab-case")]
+pub enum BackendEncryptionConfig {
+    /// Objects stored plaintext on this backend.
+    #[default]
+    None,
+
+    /// Proxy-side AES-256-GCM. `key` is hex-encoded 256 bits.
+    /// `key_id` is stamped on each object's `dg-encryption-key-id`
+    /// metadata; derived automatically from `SHA-256(backend_name || key)`
+    /// when absent. `legacy_key`/`legacy_key_id` provide a decrypt-only
+    /// shim during mode transitions (see engine/mod.rs resolver).
+    Aes256GcmProxy {
+        /// 64-char hex key. Infra secret; stripped by redactors.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+        /// Optional stable id. Max 64 chars, `[A-Za-z0-9_.-]` only
+        /// (S3 user-metadata header-safe).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key_id: Option<String>,
+        /// Decrypt-only shim: preserve the ability to READ objects
+        /// that were written with a previous key. Unused in `Aes256GcmProxy`
+        /// mode (use `key` to rotate); reserved for transitions TO
+        /// native modes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        legacy_key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        legacy_key_id: Option<String>,
+    },
+
+    /// S3 native SSE-KMS. Proxy does not wrap; AWS encrypts on write.
+    /// Stamps `dg-encrypted-native: sse-kms` in user metadata so the
+    /// read-side sanity check (xattr-strip defense) knows this object
+    /// was not proxy-encrypted.
+    SseKms {
+        /// KMS key ARN or alias. Required.
+        kms_key_id: String,
+        /// Enable S3 bucket keys (reduces KMS cost on bursty traffic).
+        #[serde(default = "default_true")]
+        bucket_key_enabled: bool,
+        /// Decrypt-only shim: keep reading objects written with the
+        /// old proxy-mode key after migrating to SSE-KMS.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        legacy_key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        legacy_key_id: Option<String>,
+    },
+
+    /// S3 native SSE-S3 (AES-256, AWS-managed keys). No KMS.
+    SseS3 {
+        /// Decrypt-only shim — see `SseKms::legacy_key`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        legacy_key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        legacy_key_id: Option<String>,
+    },
+}
+
+/// Default function for `bucket_key_enabled` serde attribute.
+pub(crate) fn default_true() -> bool {
+    true
+}
+
+/// `skip_serializing_if` helper: backends with encryption `None` omit
+/// the field entirely in canonical YAML.
+pub(crate) fn is_default_encryption(e: &BackendEncryptionConfig) -> bool {
+    matches!(e, BackendEncryptionConfig::None)
+}
+
+impl BackendEncryptionConfig {
+    /// Short machine-readable tag for the mode, used by admin API
+    /// summaries and diff renderers. Matches the YAML `mode:` tag.
+    pub fn mode_tag(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Aes256GcmProxy { .. } => "aes256-gcm-proxy",
+            Self::SseKms { .. } => "sse-kms",
+            Self::SseS3 { .. } => "sse-s3",
+        }
+    }
+
+    /// Strip every secret key material (used by redactors). Preserves
+    /// mode + non-secret identifiers (`key_id`, `kms_key_id`) so the
+    /// redacted surface still conveys "this backend is encrypted with
+    /// mode X" to operators reading the exported YAML.
+    pub fn redact_secrets(&mut self) {
+        match self {
+            Self::None => {}
+            Self::Aes256GcmProxy {
+                key, legacy_key, ..
+            } => {
+                *key = None;
+                *legacy_key = None;
+            }
+            Self::SseKms {
+                legacy_key,
+                kms_key_id: _,
+                ..
+            } => {
+                // kms_key_id is an ARN — NOT secret. Operators need to
+                // see it to know WHICH KMS key.
+                *legacy_key = None;
+            }
+            Self::SseS3 { legacy_key, .. } => {
+                *legacy_key = None;
+            }
+        }
+    }
+}
+
+/// Check whether a `key_id` string matches the documented charset
+/// `[A-Za-z0-9_.-]{1,64}`. Pure function, unit-tested below.
+///
+/// Stored into S3 as `x-amz-meta-dg-encryption-key-id` — header values
+/// must be printable ASCII and ideally header-safe. Restrict to the
+/// intersection of "printable" and "survives all tools" (DNS label
+/// shape basically).
+pub(crate) fn is_valid_key_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
+/// Normalise a backend name into an env-var-safe suffix: uppercase,
+/// `-`/`.` → `_`. So `"eu-archive"` → `"EU_ARCHIVE"` → env var
+/// `DGP_BACKEND_EU_ARCHIVE_ENCRYPTION_KEY`.
+///
+/// The synthetic name `"default"` (used by the singleton backend
+/// path) gets the un-prefixed env-var names `DGP_ENCRYPTION_KEY` /
+/// `DGP_SSE_KMS_KEY_ID` so single-backend deployments keep the short
+/// names operators are used to.
+fn env_suffix_for_backend_name(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            '-' | '.' => '_',
+            c => c.to_ascii_uppercase(),
+        })
+        .collect()
+}
+
+/// Apply env-var overrides to a single backend's encryption config.
+/// Only touches the SECRET fields (`key`, `kms_key_id`) — the mode
+/// itself stays authoritative in YAML. Called once per backend
+/// (including the synthetic "default" for the singleton path).
+pub(crate) fn apply_backend_encryption_env(backend_name: &str, enc: &mut BackendEncryptionConfig) {
+    let (key_env, kms_env): (String, String) = if backend_name == "default" {
+        (
+            "DGP_ENCRYPTION_KEY".to_string(),
+            "DGP_SSE_KMS_KEY_ID".to_string(),
+        )
+    } else {
+        let suf = env_suffix_for_backend_name(backend_name);
+        (
+            format!("DGP_BACKEND_{}_ENCRYPTION_KEY", suf),
+            format!("DGP_BACKEND_{}_SSE_KMS_KEY_ID", suf),
+        )
+    };
+
+    match enc {
+        BackendEncryptionConfig::Aes256GcmProxy { key, .. } => {
+            if let Ok(env_key) = std::env::var(&key_env) {
+                if !env_key.is_empty() {
+                    *key = Some(env_key);
+                }
+            }
+        }
+        BackendEncryptionConfig::SseKms { kms_key_id, .. } => {
+            if let Ok(env_arn) = std::env::var(&kms_env) {
+                if !env_arn.is_empty() {
+                    *kms_key_id = env_arn;
+                }
+            }
+        }
+        // None and SseS3 carry no secrets; env vars are silently ignored.
+        BackendEncryptionConfig::None | BackendEncryptionConfig::SseS3 { .. } => {}
+    }
+}
+
 /// A named storage backend with its connection configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct NamedBackendConfig {
@@ -453,6 +668,11 @@ pub struct NamedBackendConfig {
     /// The actual backend configuration
     #[serde(flatten)]
     pub backend: BackendConfig,
+    /// Per-backend encryption-at-rest configuration. Defaults to
+    /// `mode: none` — plaintext. Omitted from canonical YAML when
+    /// default.
+    #[serde(default, skip_serializing_if = "is_default_encryption")]
+    pub encryption: BackendEncryptionConfig,
 }
 
 /// TLS configuration (optional)
@@ -574,7 +794,7 @@ impl Default for Config {
             buckets: std::collections::BTreeMap::new(),
             backends: Vec::new(),
             default_backend: None,
-            encryption_key: None,
+            backend_encryption: BackendEncryptionConfig::None,
             admission_blocks: Vec::new(),
             iam_mode: crate::config_sections::IamMode::default(),
         }
@@ -710,7 +930,7 @@ fn classify_shape(doc: &serde_yaml::Value) -> ConfigShape {
         "blocking_threads",
         "log_level",
         "config_sync_bucket",
-        "encryption_key",
+        "backend_encryption",
         "tls",
         "buckets",
         // Phase 3b.2.a: operator-authored admission blocks at the flat
@@ -1000,12 +1220,27 @@ impl Config {
             self.config_sync_bucket = Some(bucket);
         }
 
-        // Encryption at rest
-        if let Ok(key) = std::env::var("DGP_ENCRYPTION_KEY") {
-            if !key.is_empty() {
-                self.encryption_key = Some(key);
-            }
+        // Per-backend encryption overrides.
+        //
+        // Names are normalised: uppercase, `-`/`.` → `_`. So a backend
+        // named "eu-archive" reads from `DGP_BACKEND_EU_ARCHIVE_ENCRYPTION_KEY`.
+        //
+        // For each backend, we apply overrides based on the CURRENT
+        // encryption mode in YAML:
+        //   * Aes256GcmProxy mode → `..._ENCRYPTION_KEY` sets the key.
+        //   * SseKms mode → `..._SSE_KMS_KEY_ID` sets the kms_key_id.
+        //   * Other modes → no override (None/SseS3 don't carry secrets).
+        //
+        // The env var changes only the secret/id fields, never the
+        // mode itself — that stays authoritative in YAML. Keeps env-
+        // based secret injection orthogonal to structural config.
+        for named in self.backends.iter_mut() {
+            apply_backend_encryption_env(&named.name, &mut named.encryption);
         }
+        // Singleton backend path: uses the unadorned `DGP_ENCRYPTION_KEY`
+        // / `DGP_SSE_KMS_KEY_ID` so single-backend deployments keep a
+        // short env-var name. The synthetic backend name is "default".
+        apply_backend_encryption_env("default", &mut self.backend_encryption);
 
         // TLS configuration
         if let Ok(enabled) = std::env::var("DGP_TLS_ENABLED") {
@@ -1169,6 +1404,109 @@ impl Config {
                 }
             }
         }
+
+        // Per-backend encryption validation. Each named backend + the
+        // legacy singleton gets checked against:
+        //   * native modes (SseKms / SseS3) on filesystem backends → error.
+        //   * Aes256GcmProxy with no key configured (after env-var
+        //     resolution) → warning (key must come from env at runtime;
+        //     this is informational so operators notice a missing
+        //     DGP_*_ENCRYPTION_KEY before a read fails).
+        //   * key_id charset: must match `[A-Za-z0-9_.-]{1,64}`.
+        //   * collisions: two backends declaring the same `key_id`
+        //     but different `key` bytes → error.
+        let mut explicit_key_ids: std::collections::BTreeMap<
+            String,
+            Vec<(String, Option<String>)>,
+        > = std::collections::BTreeMap::new();
+        let mut validate_entry = |label: &str,
+                                  backend: &BackendConfig,
+                                  enc: &BackendEncryptionConfig,
+                                  warnings: &mut Vec<String>| {
+            if matches!(backend, BackendConfig::Filesystem { .. })
+                && matches!(
+                    enc,
+                    BackendEncryptionConfig::SseKms { .. } | BackendEncryptionConfig::SseS3 { .. }
+                )
+            {
+                warnings.push(format!(
+                    "backend '{}' uses a native S3 encryption mode ({}) on a filesystem \
+                     backend — native modes require S3. Change mode to 'aes256-gcm-proxy' \
+                     or 'none'.",
+                    label,
+                    enc.mode_tag()
+                ));
+            }
+            if let BackendEncryptionConfig::Aes256GcmProxy {
+                key,
+                key_id,
+                legacy_key: _,
+                legacy_key_id: _,
+            } = enc
+            {
+                if key.is_none() {
+                    warnings.push(format!(
+                        "backend '{}' uses aes256-gcm-proxy but no key is configured in \
+                         YAML — set it via env var ({}).",
+                        label,
+                        if label == "default" {
+                            "DGP_ENCRYPTION_KEY".to_string()
+                        } else {
+                            format!(
+                                "DGP_BACKEND_{}_ENCRYPTION_KEY",
+                                env_suffix_for_backend_name(label)
+                            )
+                        }
+                    ));
+                }
+                if let Some(kid) = key_id {
+                    if !is_valid_key_id(kid) {
+                        warnings.push(format!(
+                            "backend '{}' has encryption.key_id='{}' — must match \
+                             [A-Za-z0-9_.-]{{1,64}} (S3 user-metadata header-safe).",
+                            label, kid
+                        ));
+                    }
+                    if let Some(k) = key {
+                        explicit_key_ids
+                            .entry(kid.clone())
+                            .or_default()
+                            .push((label.to_string(), Some(k.clone())));
+                    }
+                }
+            }
+        };
+        validate_entry(
+            "default",
+            &self.backend,
+            &self.backend_encryption,
+            &mut warnings,
+        );
+        for named in &self.backends {
+            validate_entry(
+                &named.name,
+                &named.backend,
+                &named.encryption,
+                &mut warnings,
+            );
+        }
+        // Cross-backend: same explicit key_id but different keys.
+        for (kid, entries) in &explicit_key_ids {
+            if entries.len() > 1 {
+                let distinct_keys: std::collections::BTreeSet<&Option<String>> =
+                    entries.iter().map(|(_, k)| k).collect();
+                if distinct_keys.len() > 1 {
+                    let names: Vec<String> = entries.iter().map(|(n, _)| n.clone()).collect();
+                    warnings.push(format!(
+                        "backends {:?} share key_id='{}' but declare DIFFERENT keys. \
+                         Either make the keys identical (intentional cross-backend portability) \
+                         or give each backend a distinct key_id.",
+                        names, kid
+                    ));
+                }
+            }
+        }
+
         warnings
     }
 
@@ -1378,15 +1716,19 @@ impl Config {
 
     /// Clone the config with *infrastructure* secrets redacted. Matches the
     /// legacy `to_toml_string` policy: strips `bootstrap_password_hash` and
-    /// `encryption_key` only. Proxy SigV4 credentials and backend credentials
-    /// are kept — the wizard, file-based deployment, and users reading the
-    /// file on disk all depend on them being present. Use
-    /// [`Self::redact_all_secrets`] for the admin-API "export" flow that
-    /// never trusts the disk as a secret store.
+    /// every per-backend encryption key (both the singleton `backend_encryption`
+    /// and each `backends[i].encryption`). Proxy SigV4 credentials and
+    /// backend credentials are kept — the wizard, file-based deployment,
+    /// and users reading the file on disk all depend on them being
+    /// present. Use [`Self::redact_all_secrets`] for the admin-API
+    /// "export" flow that never trusts the disk as a secret store.
     fn redact_infra_secrets(&self) -> Self {
         let mut export = self.clone();
         export.bootstrap_password_hash = None;
-        export.encryption_key = None;
+        export.backend_encryption.redact_secrets();
+        for named in &mut export.backends {
+            named.encryption.redact_secrets();
+        }
         export
     }
 
@@ -1956,14 +2298,27 @@ backend:
             access_key_id: Some("AKIAKEEPME".into()),
             secret_access_key: Some("kept-for-file-persistence".into()),
             bootstrap_password_hash: Some("$2b$12$xxxxxxxxxxxxxxxxxxxxxx".into()),
-            encryption_key: Some("deadbeef-hex-encryption-key".into()),
+            backend_encryption: BackendEncryptionConfig::Aes256GcmProxy {
+                key: Some("deadbeef-hex-encryption-key".into()),
+                key_id: Some("singleton-kid".into()),
+                legacy_key: None,
+                legacy_key_id: None,
+            },
             ..Config::default()
         };
 
         let yaml = cfg.to_canonical_yaml().unwrap();
         // Infra secrets are stripped
         assert!(!yaml.contains("$2b$"));
-        assert!(!yaml.contains("deadbeef-hex-encryption-key"));
+        assert!(
+            !yaml.contains("deadbeef-hex-encryption-key"),
+            "singleton encryption key must be redacted from canonical YAML, got:\n{yaml}"
+        );
+        // Non-secret id survives so operators can still see encryption is on.
+        assert!(
+            yaml.contains("singleton-kid"),
+            "key_id is not a secret; must survive redaction"
+        );
         // SigV4 creds survive — the wizard/file deployment path depends on this
         assert!(yaml.contains("AKIAKEEPME"));
         assert!(yaml.contains("kept-for-file-persistence"));
@@ -1975,7 +2330,12 @@ backend:
             access_key_id: Some("AKIASHOULDNOTAPPEAR".into()),
             secret_access_key: Some("secret-should-not-appear".into()),
             bootstrap_password_hash: Some("$2b$12$xxxxxxxxxxxxxxxxxxxxxx".into()),
-            encryption_key: Some("deadbeef-hex-encryption-key".into()),
+            backend_encryption: BackendEncryptionConfig::Aes256GcmProxy {
+                key: Some("deadbeef-hex-encryption-key".into()),
+                key_id: None,
+                legacy_key: Some("legacy-deadbeef-should-also-redact".into()),
+                legacy_key_id: Some("legacy-kid".into()),
+            },
             backend: BackendConfig::S3 {
                 endpoint: Some("http://minio:9000".into()),
                 region: "us-east-1".into(),
@@ -1994,6 +2354,12 @@ backend:
                 access_key_id: Some("NAMED-SECRET-ID".into()),
                 secret_access_key: Some("NAMED-SECRET-KEY".into()),
             },
+            encryption: BackendEncryptionConfig::Aes256GcmProxy {
+                key: Some("NAMED-ENCRYPTION-KEY-SHOULD-REDACT".into()),
+                key_id: Some("hetzner-kid".into()),
+                legacy_key: None,
+                legacy_key_id: None,
+            },
         });
 
         let redacted = cfg.redact_all_secrets();
@@ -2001,18 +2367,342 @@ backend:
         // Top-level proxy creds
         assert!(!yaml.contains("AKIASHOULDNOTAPPEAR"));
         assert!(!yaml.contains("secret-should-not-appear"));
-        // Bootstrap + encryption
+        // Bootstrap + encryption (primary + legacy on singleton, primary on named)
         assert!(!yaml.contains("$2b$"));
         assert!(!yaml.contains("deadbeef-hex-encryption-key"));
+        assert!(
+            !yaml.contains("legacy-deadbeef-should-also-redact"),
+            "legacy_key (the decrypt-only-shim slot) must also redact"
+        );
+        assert!(
+            !yaml.contains("NAMED-ENCRYPTION-KEY-SHOULD-REDACT"),
+            "per-named-backend encryption keys must redact"
+        );
         // Primary backend creds
         assert!(!yaml.contains("BACKEND-SECRET-ID"));
         assert!(!yaml.contains("BACKEND-SECRET-KEY"));
         // Named backend creds
         assert!(!yaml.contains("NAMED-SECRET-ID"));
         assert!(!yaml.contains("NAMED-SECRET-KEY"));
-        // Non-secret fields survive
+        // Non-secret fields survive: backend names, regions, non-secret key_ids.
         assert!(yaml.contains("hetzner"));
         assert!(yaml.contains("eu-central-1"));
+        assert!(
+            yaml.contains("hetzner-kid"),
+            "key_id (not a secret) must survive — operators need to see which backend \
+             is encrypted under which id"
+        );
+        assert!(
+            yaml.contains("legacy-kid"),
+            "legacy_key_id (not a secret, just an id) must survive"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Per-backend encryption — new config shape
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_backend_encryption_yaml_roundtrip_none() {
+        // Default variant: should not serialize at all (skip_serializing_if).
+        let cfg = BackendEncryptionConfig::None;
+        assert!(is_default_encryption(&cfg));
+    }
+
+    #[test]
+    fn test_backend_encryption_yaml_roundtrip_aes() {
+        let yaml = r#"
+mode: aes256-gcm-proxy
+key: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+key_id: eu-2026-04
+"#;
+        let parsed: BackendEncryptionConfig = serde_yaml::from_str(yaml).unwrap();
+        match &parsed {
+            BackendEncryptionConfig::Aes256GcmProxy { key, key_id, .. } => {
+                assert!(key.as_deref().unwrap().starts_with("0123"));
+                assert_eq!(key_id.as_deref(), Some("eu-2026-04"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        // Round-trip
+        let emitted = serde_yaml::to_string(&parsed).unwrap();
+        assert!(emitted.contains("mode: aes256-gcm-proxy"));
+        assert!(emitted.contains("key_id: eu-2026-04"));
+    }
+
+    #[test]
+    fn test_backend_encryption_yaml_roundtrip_sse_kms() {
+        let yaml = r#"
+mode: sse-kms
+kms_key_id: arn:aws:kms:us-east-1:123456789012:key/abcd
+bucket_key_enabled: false
+"#;
+        let parsed: BackendEncryptionConfig = serde_yaml::from_str(yaml).unwrap();
+        match &parsed {
+            BackendEncryptionConfig::SseKms {
+                kms_key_id,
+                bucket_key_enabled,
+                ..
+            } => {
+                assert!(kms_key_id.contains("key/abcd"));
+                assert!(!bucket_key_enabled);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_backend_encryption_yaml_default_bucket_key_enabled_true() {
+        let yaml = r#"
+mode: sse-kms
+kms_key_id: arn:aws:kms:us-east-1:1:key/x
+"#;
+        let parsed: BackendEncryptionConfig = serde_yaml::from_str(yaml).unwrap();
+        match parsed {
+            BackendEncryptionConfig::SseKms {
+                bucket_key_enabled, ..
+            } => assert!(bucket_key_enabled),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_named_backend_with_encryption_roundtrips_through_config() {
+        let yaml = r#"
+backends:
+  - name: eu
+    type: filesystem
+    path: /tmp/eu
+    encryption:
+      mode: aes256-gcm-proxy
+      key: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      key_id: eu-kid
+  - name: us
+    type: filesystem
+    path: /tmp/us
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.backends.len(), 2);
+        assert!(matches!(
+            cfg.backends[0].encryption,
+            BackendEncryptionConfig::Aes256GcmProxy { .. }
+        ));
+        assert!(matches!(
+            cfg.backends[1].encryption,
+            BackendEncryptionConfig::None
+        ));
+    }
+
+    #[test]
+    fn test_global_encryption_key_field_no_longer_accepted() {
+        // Regression: the old `encryption_key:` at the config root must
+        // be rejected. No legacy — nobody shipped with it — so a YAML
+        // still carrying it is an outdated doc that should fail loudly.
+        let yaml = r#"
+encryption_key: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+"#;
+        // Flat-root Config with serde's default (no deny_unknown_fields):
+        // silently ignored. That's fine — the flat shape is legacy-reading
+        // surface, and after this refactor it just drops the field.
+        // The point is the field is NOT present on the parsed struct.
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap_or_default();
+        // No top-level encryption_key field exists anymore; the only
+        // encryption surfaces are `backend_encryption` (singleton) and
+        // `backends[*].encryption` (list).
+        assert!(matches!(
+            cfg.backend_encryption,
+            BackendEncryptionConfig::None
+        ));
+    }
+
+    #[test]
+    fn test_is_valid_key_id_charset() {
+        assert!(is_valid_key_id("eu-2026-04"));
+        assert!(is_valid_key_id("a"));
+        assert!(is_valid_key_id("a.b_c-d"));
+        assert!(is_valid_key_id(&"x".repeat(64)));
+        // Empty
+        assert!(!is_valid_key_id(""));
+        // Too long
+        assert!(!is_valid_key_id(&"x".repeat(65)));
+        // Forbidden chars
+        assert!(!is_valid_key_id("has space"));
+        assert!(!is_valid_key_id("has/slash"));
+        assert!(!is_valid_key_id("has:colon"));
+        assert!(!is_valid_key_id("héllo")); // non-ASCII
+    }
+
+    #[test]
+    fn test_env_suffix_normalises_name() {
+        assert_eq!(env_suffix_for_backend_name("eu-archive"), "EU_ARCHIVE");
+        assert_eq!(env_suffix_for_backend_name("default"), "DEFAULT");
+        assert_eq!(env_suffix_for_backend_name("a.b-c"), "A_B_C");
+    }
+
+    #[test]
+    fn test_check_rejects_sse_kms_on_filesystem() {
+        let mut cfg = Config {
+            backends: vec![NamedBackendConfig {
+                name: "local".into(),
+                backend: BackendConfig::Filesystem {
+                    path: "/tmp/x".into(),
+                },
+                encryption: BackendEncryptionConfig::SseKms {
+                    kms_key_id: "arn:aws:kms:...".into(),
+                    bucket_key_enabled: true,
+                    legacy_key: None,
+                    legacy_key_id: None,
+                },
+            }],
+            ..Config::default()
+        };
+        let warnings = cfg.check();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("local") && w.contains("sse-kms")),
+            "sse-kms on filesystem must warn, got {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_check_warns_aes_without_key() {
+        // Make sure the env-var fallback doesn't accidentally satisfy
+        // the check (our tests may run with DGP_ENCRYPTION_KEY set from
+        // prior tests — scope the fixture to a unique name).
+        let mut cfg = Config {
+            backends: vec![NamedBackendConfig {
+                name: "unconfigured-xyz-42".into(),
+                backend: BackendConfig::Filesystem {
+                    path: "/tmp/x".into(),
+                },
+                encryption: BackendEncryptionConfig::Aes256GcmProxy {
+                    key: None,
+                    key_id: None,
+                    legacy_key: None,
+                    legacy_key_id: None,
+                },
+            }],
+            ..Config::default()
+        };
+        let warnings = cfg.check();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("unconfigured-xyz-42") && w.contains("DGP_BACKEND_")),
+            "aes mode with no key must produce env-var hint, got {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_check_detects_key_id_collision_with_different_keys() {
+        let mut cfg = Config {
+            backends: vec![
+                NamedBackendConfig {
+                    name: "a".into(),
+                    backend: BackendConfig::Filesystem {
+                        path: "/tmp/a".into(),
+                    },
+                    encryption: BackendEncryptionConfig::Aes256GcmProxy {
+                        key: Some("K1".into()),
+                        key_id: Some("shared".into()),
+                        legacy_key: None,
+                        legacy_key_id: None,
+                    },
+                },
+                NamedBackendConfig {
+                    name: "b".into(),
+                    backend: BackendConfig::Filesystem {
+                        path: "/tmp/b".into(),
+                    },
+                    encryption: BackendEncryptionConfig::Aes256GcmProxy {
+                        key: Some("K2".into()),
+                        key_id: Some("shared".into()),
+                        legacy_key: None,
+                        legacy_key_id: None,
+                    },
+                },
+            ],
+            ..Config::default()
+        };
+        let warnings = cfg.check();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("shared") && w.contains("DIFFERENT")),
+            "shared key_id + different keys must warn, got {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_check_allows_shared_key_id_with_same_key() {
+        // Same kid + same key = intentional cross-backend portability.
+        // This is the documented escape hatch; MUST NOT warn.
+        let mut cfg = Config {
+            backends: vec![
+                NamedBackendConfig {
+                    name: "primary".into(),
+                    backend: BackendConfig::Filesystem {
+                        path: "/tmp/a".into(),
+                    },
+                    encryption: BackendEncryptionConfig::Aes256GcmProxy {
+                        key: Some("SAME".into()),
+                        key_id: Some("portable".into()),
+                        legacy_key: None,
+                        legacy_key_id: None,
+                    },
+                },
+                NamedBackendConfig {
+                    name: "replica".into(),
+                    backend: BackendConfig::Filesystem {
+                        path: "/tmp/b".into(),
+                    },
+                    encryption: BackendEncryptionConfig::Aes256GcmProxy {
+                        key: Some("SAME".into()),
+                        key_id: Some("portable".into()),
+                        legacy_key: None,
+                        legacy_key_id: None,
+                    },
+                },
+            ],
+            ..Config::default()
+        };
+        let warnings = cfg.check();
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.contains("portable") && w.contains("DIFFERENT")),
+            "identical key_id + identical key must NOT warn, got {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_check_rejects_invalid_key_id_charset() {
+        let mut cfg = Config {
+            backends: vec![NamedBackendConfig {
+                name: "bad".into(),
+                backend: BackendConfig::Filesystem {
+                    path: "/tmp/x".into(),
+                },
+                encryption: BackendEncryptionConfig::Aes256GcmProxy {
+                    key: Some("K".into()),
+                    key_id: Some("has space!".into()),
+                    legacy_key: None,
+                    legacy_key_id: None,
+                },
+            }],
+            ..Config::default()
+        };
+        let warnings = cfg.check();
+        assert!(
+            warnings.iter().any(|w| w.contains("has space!")),
+            "invalid key_id charset must warn, got {:?}",
+            warnings
+        );
     }
 
     #[test]
@@ -2258,14 +2948,17 @@ backend:
                 NamedBackendConfig {
                     name: "shared".into(),
                     backend: BackendConfig::Filesystem { path: "/a".into() },
+                    encryption: BackendEncryptionConfig::None,
                 },
                 NamedBackendConfig {
                     name: "unique".into(),
                     backend: BackendConfig::Filesystem { path: "/b".into() },
+                    encryption: BackendEncryptionConfig::None,
                 },
                 NamedBackendConfig {
                     name: "shared".into(),
                     backend: BackendConfig::Filesystem { path: "/c".into() },
+                    encryption: BackendEncryptionConfig::None,
                 },
             ],
             ..Config::default()
@@ -2286,10 +2979,12 @@ backend:
                 NamedBackendConfig {
                     name: "a".into(),
                     backend: BackendConfig::Filesystem { path: "/a".into() },
+                    encryption: BackendEncryptionConfig::None,
                 },
                 NamedBackendConfig {
                     name: "b".into(),
                     backend: BackendConfig::Filesystem { path: "/b".into() },
+                    encryption: BackendEncryptionConfig::None,
                 },
             ],
             ..Config::default()

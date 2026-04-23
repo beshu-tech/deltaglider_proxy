@@ -138,6 +138,12 @@ pub async fn create_backend(
     cfg.backends.push(NamedBackendConfig {
         name: name.clone(),
         backend: backend_config,
+        // STEP-1: per-backend encryption config. `CreateBackendRequest`
+        // will gain an optional `encryption` field in Step 6 (per the
+        // plan); until then new backends default to plaintext (mode:
+        // none) — operators configure encryption after creation via
+        // the Backends panel or a section-level PATCH.
+        encryption: crate::config::BackendEncryptionConfig::None,
     });
 
     if body.set_default == Some(true) || cfg.default_backend.is_none() {

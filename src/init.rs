@@ -301,7 +301,7 @@ pub fn run_init_inner(
         buckets: std::collections::BTreeMap::new(),
         backends: Vec::new(),
         default_backend: None,
-        encryption_key: None,
+        backend_encryption: crate::config::BackendEncryptionConfig::None,
         admission_blocks: Vec::new(),
         iam_mode: crate::config_sections::IamMode::default(),
     };

@@ -226,6 +226,40 @@ pub struct DeltaGliderEngine<S: StorageBackend> {
     bucket_policies: crate::bucket_policy::BucketPolicyRegistry,
 }
 
+/// STEP-1 SHIM: pick the first Aes256GcmProxy key from the per-backend
+/// encryption configs. Used by the current global-wrap engine wiring
+/// during the transition to per-backend wrapping. Scans the singleton
+/// `backend_encryption` first, then `backends[*].encryption` in
+/// declaration order, returning the first proxy-mode key found.
+///
+/// Returns `None` when no proxy-mode key is configured; in that case
+/// the outer wrapper is constructed with `key: None` (the "always
+/// wrap + PassThrough" safety-net configuration).
+///
+/// This helper is deleted in Step 2 when the wrapper moves inside
+/// `RoutingBackend` and each backend gets its own independent key.
+fn extract_first_proxy_key(
+    singleton: &crate::config::BackendEncryptionConfig,
+    backends: &[crate::config::NamedBackendConfig],
+) -> Option<String> {
+    fn pick(enc: &crate::config::BackendEncryptionConfig) -> Option<String> {
+        if let crate::config::BackendEncryptionConfig::Aes256GcmProxy { key, .. } = enc {
+            key.clone()
+        } else {
+            None
+        }
+    }
+    if let Some(k) = pick(singleton) {
+        return Some(k);
+    }
+    for n in backends {
+        if let Some(k) = pick(&n.encryption) {
+            return Some(k);
+        }
+    }
+    None
+}
+
 /// Type alias for engine with dynamic backend dispatch
 pub type DynEngine = DeltaGliderEngine<Box<dyn StorageBackend>>;
 
@@ -288,12 +322,24 @@ impl DynEngine {
         // but nothing checks the marker because the unwrapped backend
         // streams bytes verbatim.
         //
-        // When no key is configured, writes are a no-op passthrough
-        // (encrypt_if_enabled returns `data.to_vec()` without marking
-        // the metadata). Overhead is one HashMap lookup on the
-        // encryption marker per read/write — negligible.
+        // STEP-1 SHIM: per-backend encryption config now lives on each
+        // NamedBackendConfig + the singleton `Config.backend_encryption`,
+        // but the outer-wrap architecture is still global. This shim
+        // picks the FIRST Aes256GcmProxy key it finds across
+        // `{backend_encryption} ∪ backends[*].encryption` and uses it
+        // as the single-key for the outer wrapper. That matches today's
+        // effective behaviour for any config with zero-or-one proxy-
+        // encrypted backend. Per-backend wrapping lands in Step 2 and
+        // this shim is then deleted.
+        //
+        // If any NATIVE (SSE-KMS/SSE-S3) modes are configured, they are
+        // silently ignored at this step — the S3Backend plumbing for
+        // those lands in Step 4. A warning surfaces via Config::check
+        // warnings at load time.
+        let effective_proxy_key: Option<String> =
+            extract_first_proxy_key(&config.backend_encryption, &config.backends);
         let enc_config = Arc::new(ArcSwap::new(Arc::new(crate::storage::EncryptionConfig {
-            key: match config.encryption_key.as_ref() {
+            key: match effective_proxy_key.as_deref() {
                 Some(hex_key) => Some(
                     crate::storage::EncryptionKey::from_hex(hex_key)
                         .map_err(StorageError::Encryption)?,
@@ -301,7 +347,7 @@ impl DynEngine {
                 None => None,
             },
         })));
-        if config.encryption_key.is_some() {
+        if effective_proxy_key.is_some() {
             tracing::info!("Encryption at rest: ENABLED (AES-256-GCM)");
             // If the key came from config FILE (not env), nudge the
             // operator to keep an off-box copy. Losing an encrypted

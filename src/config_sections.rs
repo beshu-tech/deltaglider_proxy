@@ -221,6 +221,12 @@ pub struct StorageSection {
     #[serde(default, skip_serializing_if = "is_backend_default")]
     pub backend: BackendConfig,
 
+    /// Per-backend encryption config for the singleton `backend` above.
+    /// Ignored when `backends` (the list) is non-empty — in that case
+    /// each named entry's own `encryption` field applies.
+    #[serde(default, skip_serializing_if = "crate::config::is_default_encryption")]
+    pub backend_encryption: crate::config::BackendEncryptionConfig,
+
     /// Named backends for multi-backend routing. When non-empty, the
     /// legacy `backend` field is ignored at runtime.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -406,8 +412,11 @@ fn validate_filesystem_path(path: &std::path::Path) -> Result<(), String> {
 }
 
 /// Process-level tunables: listener, TLS, log level, caches, and the
-/// infrastructure-only secrets (`bootstrap_password_hash`,
-/// `encryption_key`, `config_sync_bucket`).
+/// infrastructure-only secret (`bootstrap_password_hash`,
+/// `config_sync_bucket`).
+///
+/// Per-backend encryption lives under `storage.backends[*].encryption`
+/// (and `storage.backend_encryption` for the singleton path), NOT here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(deny_unknown_fields)]
 pub struct AdvancedSection {
@@ -445,10 +454,6 @@ pub struct AdvancedSection {
     /// by the same redactor that powers `to_canonical_yaml`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bootstrap_password_hash: Option<String>,
-
-    /// Hex-encoded 256-bit AES key for encryption at rest. Infra secret.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encryption_key: Option<String>,
 }
 
 // ══ skip_serializing_if helpers — any non-default value surfaces. ══════
@@ -516,6 +521,7 @@ impl SectionedConfig {
             },
             storage: StorageSection {
                 backend: flat.backend.clone(),
+                backend_encryption: flat.backend_encryption.clone(),
                 backends: flat.backends.clone(),
                 default_backend: flat.default_backend.clone(),
                 // Prefer the compact shorthand form (`public: true`) when
@@ -562,7 +568,6 @@ impl SectionedConfig {
                 config_sync_bucket: flat.config_sync_bucket.clone(),
                 tls: flat.tls.clone(),
                 bootstrap_password_hash: flat.bootstrap_password_hash.clone(),
-                encryption_key: flat.encryption_key.clone(),
             },
         }
     }
@@ -627,9 +632,9 @@ impl SectionedConfig {
             blocking_threads: self.advanced.blocking_threads,
             log_level: self.advanced.log_level.unwrap_or(defaults.log_level),
             config_sync_bucket: self.advanced.config_sync_bucket,
-            encryption_key: self.advanced.encryption_key,
             tls: self.advanced.tls,
             buckets: self.storage.buckets,
+            backend_encryption: self.storage.backend_encryption,
             backends: self.storage.backends,
             default_backend: self.storage.default_backend,
             admission_blocks: self.admission.map(|s| s.blocks).unwrap_or_default(),

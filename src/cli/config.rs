@@ -683,15 +683,32 @@ path = "/tmp/dgp"
 access_key_id = "AKIAKEEPME"
 secret_access_key = "runtime-key-kept-for-file-use"
 bootstrap_password_hash = "$2b$12$xxxxxxxxxxxxxxxxxxxxxx"
-encryption_key = "deadbeef-hex-key"
+
+[backend_encryption]
+mode = "aes256-gcm-proxy"
+key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+key_id = "migrated-kid"
 "#,
         )
         .unwrap();
 
         let yaml = migrate_to_string(toml_path.to_str().unwrap()).unwrap();
-        // Infra secrets stripped
+        // Infra secrets stripped — bootstrap hash and encryption key
+        // must NOT appear in the migrated YAML.
         assert!(!yaml.contains("$2b$"));
-        assert!(!yaml.contains("deadbeef-hex-key"));
+        assert!(
+            !yaml.contains("0123456789abcdef"),
+            "encryption key must be redacted on migration, got:\n{yaml}"
+        );
+        // Non-secret identifiers survive.
+        assert!(
+            yaml.contains("migrated-kid"),
+            "key_id (not a secret) must survive migration"
+        );
+        assert!(
+            yaml.contains("aes256-gcm-proxy"),
+            "encryption mode must survive migration"
+        );
         // SigV4 runtime creds survive — migration output must remain a
         // drop-in YAML equivalent of the input TOML.
         assert!(yaml.contains("AKIAKEEPME"));

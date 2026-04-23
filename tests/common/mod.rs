@@ -538,6 +538,12 @@ impl TestServerBuilder {
                 ),
                 endpoint, MINIO_ACCESS_KEY, MINIO_SECRET_KEY,
             ));
+            // Per-backend encryption on the singleton: emit only when the
+            // test asked for it. The env var DGP_ENCRYPTION_KEY (set by
+            // spawn_with_config) then fills in the `key` at runtime.
+            if self.encryption_key.is_some() {
+                config.push_str("\n[backend_encryption]\nmode = \"aes256-gcm-proxy\"\n");
+            }
             (config, None)
         } else {
             let data_dir = TempDir::new().expect("Failed to create temp dir");
@@ -545,6 +551,9 @@ impl TestServerBuilder {
                 "\n[backend]\ntype = \"filesystem\"\npath = \"{}\"\n",
                 data_dir.path().display()
             ));
+            if self.encryption_key.is_some() {
+                config.push_str("\n[backend_encryption]\nmode = \"aes256-gcm-proxy\"\n");
+            }
             (config, Some(data_dir))
         }
     }
@@ -624,6 +633,9 @@ impl TestServerBuilder {
                 ),
                 endpoint, MINIO_ACCESS_KEY, MINIO_SECRET_KEY,
             ));
+            if self.encryption_key.is_some() {
+                config.push_str("backend_encryption:\n  mode: aes256-gcm-proxy\n");
+            }
             (config, None)
         } else {
             let data_dir = TempDir::new().expect("Failed to create temp dir");
@@ -631,6 +643,9 @@ impl TestServerBuilder {
                 "backend:\n  type: filesystem\n  path: \"{}\"\n",
                 data_dir.path().display()
             ));
+            if self.encryption_key.is_some() {
+                config.push_str("backend_encryption:\n  mode: aes256-gcm-proxy\n");
+            }
             (config, Some(data_dir))
         }
     }

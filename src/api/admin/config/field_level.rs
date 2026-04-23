@@ -398,7 +398,20 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
         // Expose presence of the key as a boolean ONLY. Never leaks
         // the key material itself — that stays in the infra-secret
         // bucket and is redacted from every public surface.
-        encryption_enabled: cfg.encryption_key.is_some(),
+        //
+        // STEP-1 SHIM: "any backend has a non-None encryption mode"
+        // stands in for the former single-key boolean. Step 6 replaces
+        // this with per-backend summaries and Step 8 deletes the flag
+        // entirely.
+        encryption_enabled: matches!(
+            cfg.backend_encryption,
+            crate::config::BackendEncryptionConfig::Aes256GcmProxy { .. }
+                | crate::config::BackendEncryptionConfig::SseKms { .. }
+                | crate::config::BackendEncryptionConfig::SseS3 { .. }
+        ) || cfg
+            .backends
+            .iter()
+            .any(|b| !matches!(b.encryption, crate::config::BackendEncryptionConfig::None)),
     })
 }
 

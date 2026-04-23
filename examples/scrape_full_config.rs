@@ -21,7 +21,7 @@
 //! way you treat `terraform.tfvars` or a Kubernetes Secret manifest: feed
 //! it through SOPS / Vault / CI-secret-provider, then discard.
 
-use deltaglider_proxy::config::{BackendConfig, Config};
+use deltaglider_proxy::config::{BackendConfig, BackendEncryptionConfig, Config};
 use deltaglider_proxy::config_db::ConfigDb;
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -430,9 +430,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref bucket) = cfg.config_sync_bucket {
         out.push_str(&format!("  config_sync_bucket: {}\n", bucket));
     }
-    if let Some(ref key) = cfg.encryption_key {
-        out.push_str("  encryption_key: !secret DGP_ENCRYPTION_KEY\n");
-        secrets.record("DGP_ENCRYPTION_KEY", key);
+    // Per-backend encryption lives on `backend_encryption` (singleton)
+    // and `backends[*].encryption` (list). Each Aes256GcmProxy-mode
+    // entry gets its key recorded under the matching env-var name and
+    // emitted as a !secret reference in the summary.
+    if let BackendEncryptionConfig::Aes256GcmProxy { key: Some(k), .. } = &cfg.backend_encryption {
+        out.push_str("  backend_encryption.key: !secret DGP_ENCRYPTION_KEY\n");
+        secrets.record("DGP_ENCRYPTION_KEY", k);
+    }
+    for named in &cfg.backends {
+        if let BackendEncryptionConfig::Aes256GcmProxy { key: Some(k), .. } = &named.encryption {
+            let env_name = format!(
+                "DGP_BACKEND_{}_ENCRYPTION_KEY",
+                named
+                    .name
+                    .chars()
+                    .map(|c| match c {
+                        '-' | '.' => '_',
+                        c => c.to_ascii_uppercase(),
+                    })
+                    .collect::<String>()
+            );
+            out.push_str(&format!(
+                "  backends.{}.encryption.key: !secret {}\n",
+                named.name, env_name
+            ));
+            secrets.record(&env_name, k);
+        }
     }
     // Prefer the value that came through the env var (what the running
     // server is actually keyed with). Fall back to the file if the env

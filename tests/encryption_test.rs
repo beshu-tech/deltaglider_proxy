@@ -638,6 +638,13 @@ async fn test_chunked_truncation_detected() {
 /// no-op. The fix inspects the RAW body for an explicit `null` to
 /// distinguish "don't change" (field absent) from "explicitly clear"
 /// (field present and null).
+///
+/// STEP-1 of the per-backend refactor removed the top-level
+/// `advanced.encryption_key` field; the three-state disable semantic
+/// moves to per-backend in Step 6. Until then this test targets a
+/// field that no longer exists — ignored with a pointer to the
+/// replacement (§9.6 of the plan: `test_explicit_null_clears_per_backend_encryption_key`).
+#[ignore = "replaced by per-backend disable test in Step 6 (plan §9.6)"]
 #[tokio::test]
 async fn test_section_put_explicit_null_disables_encryption() {
     let server = encrypted_builder().build().await;
@@ -712,6 +719,11 @@ async fn test_section_put_explicit_null_disables_encryption() {
 /// PRESERVE the existing key, not clear it. Counterpoint to the
 /// explicit-null disable test — the three-state logic has to get both
 /// cases right.
+///
+/// STEP-1: see sibling test for `#[ignore]` rationale — this surface
+/// moves to per-backend in Step 6 (plan §9.6
+/// `test_preserve_backend_encryption_key_on_section_put_without_key_field`).
+#[ignore = "replaced by per-backend preserve test in Step 6 (plan §9.6)"]
 #[tokio::test]
 async fn test_section_put_absent_field_preserves_encryption_key() {
     let server = encrypted_builder().build().await;
@@ -762,6 +774,13 @@ async fn test_section_put_absent_field_preserves_encryption_key() {
 /// encryption_key must return 4xx with a clear error. Without this
 /// validation the bogus key would land in the YAML on disk and the
 /// engine would fail only on the next startup.
+///
+/// STEP-1: the malformed-hex validation moves per-backend in Step 6
+/// (plan §9.6 — applies to every backend's `encryption.key` and the
+/// singleton `backend_encryption.key`). Config::check already covers
+/// the startup-time rejection path via the `from_hex` call in the new
+/// `validate_entry` walker (see unit tests in config.rs).
+#[ignore = "replaced by per-backend hex-validation test in Step 6 (plan §9.6)"]
 #[tokio::test]
 async fn test_invalid_encryption_key_rejected_by_section_put() {
     let server = encrypted_builder().build().await;

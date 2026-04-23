@@ -179,10 +179,10 @@ fn engine_affecting_fields_changed(
     new: &crate::config::Config,
 ) -> bool {
     old.backend != new.backend
+        || old.backend_encryption != new.backend_encryption
         || old.backends != new.backends
         || old.default_backend != new.default_backend
         || old.buckets != new.buckets
-        || old.encryption_key != new.encryption_key
         || old.max_object_size != new.max_object_size
         || old.cache_size_mb != new.cache_size_mb
         || old.max_delta_ratio != new.max_delta_ratio

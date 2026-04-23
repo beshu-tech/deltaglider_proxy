@@ -368,60 +368,15 @@ async fn apply_section(
     // only reach this line when incoming == old, so this is
     // effectively a defensive no-op for that field.
     new_cfg.bootstrap_password_hash = old_cfg.bootstrap_password_hash.clone();
-    //
-    // encryption_key: three-state semantics. Because merge-patch and
-    // Option<String> both map "null" and "field absent" to None after
-    // deserialization, we must inspect the raw body to distinguish:
-    //
-    //   * field absent in body  -> PRESERVE old key (GET/edit/PUT
-    //     round-trips post no encryption_key at all, because GET
-    //     redacts it; this is the "don't change" case).
-    //
-    //   * field present and null -> EXPLICIT DISABLE (the "Disable
-    //     encryption" affordance in EncryptionPanel — sends a literal
-    //     `{"encryption_key": null}` that the operator explicitly
-    //     typed/clicked). Clears the key. Subsequent writes go to
-    //     plaintext; historical encrypted reads error via the always-
-    //     wrapped EncryptingBackend (see B1 in engine/mod.rs).
-    //
-    //   * field present and a string -> ROTATE to that value (the
-    //     "Rotate key" / "Enable encryption" paths; validated below).
-    //
-    // Without this the UI's Disable button is a no-op: `encryption_key:
-    // null` deserializes to None, the preservation guard restores the
-    // old value, and the operator thinks encryption is off when it
-    // isn't.
-    let body_has_explicit_null_encryption_key = body
-        .as_object()
-        .and_then(|m| m.get("encryption_key"))
-        .map(|v| v.is_null())
-        .unwrap_or(false);
-    if new_cfg.encryption_key.is_none() && !body_has_explicit_null_encryption_key {
-        new_cfg.encryption_key = old_cfg.encryption_key.clone();
-    }
-    // Validate any NEW encryption_key the operator is trying to set.
-    // `EncryptionKey::from_hex` is the single source of truth for key
-    // shape (64 hex chars, 32 bytes); fail fast here with a 4xx so the
-    // admin UI can surface a clear error, rather than accepting the
-    // bogus value, writing it to the config file, and only rejecting
-    // on the next engine rebuild. Safe to call even if the key was
-    // preserved from `old_cfg` — well-formed keys roundtrip cleanly.
-    if let Some(ref hex_key) = new_cfg.encryption_key {
-        if let Err(msg) = crate::storage::EncryptionKey::from_hex(hex_key) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(SectionApplyResponse {
-                    ok: false,
-                    warnings: vec![],
-                    requires_restart: false,
-                    persisted_path: None,
-                    error: Some(format!("invalid encryption_key: {}", msg)),
-                    diff: None,
-                }),
-            )
-                .into_response();
-        }
-    }
+
+    // STEP-1: the former global `encryption_key` field has been
+    // removed; per-backend encryption preservation (three-state
+    // semantics + hex validation + key_rotated diff) moves to
+    // Step 6 and runs inside `preserve_backend_secrets` for every
+    // entry in `new_cfg.backends` plus the singleton
+    // `new_cfg.backend_encryption`. For now, Step 1 accepts the
+    // new shape verbatim — validation reports from Config::check
+    // surface in the dry-run warnings and the Apply dialog.
     // Top-level SigV4 creds (the legacy bootstrap key pair living on
     // `Config` directly) are preserved when the incoming value is
     // None. Explicit rotation — setting a new value — still works;
@@ -787,6 +742,13 @@ fn apply_merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) 
 ///
 /// 8-hex-char truncation is enough to distinguish rotations
 /// practically; the full SHA-256 is needlessly long in the UI.
+///
+/// STEP-1: temporarily unused since `encryption_key` has been removed
+/// from the flat `Config`. Step 6 rewires this to walk per-backend
+/// rotations (`storage.backends[i].encryption.key`,
+/// `storage.backend_encryption.key`). Keeping the helper here avoids
+/// a delete-and-resurrect churn in the upcoming commit.
+#[allow(dead_code)]
 fn fingerprint_secret(plaintext: Option<&str>) -> Option<String> {
     plaintext.map(|pt| {
         use sha2::{Digest, Sha256};
@@ -815,13 +777,16 @@ fn compute_section_diff(
     // placeholder, so unchanged keys compare equal and rotations
     // surface a readable `"fp:abc123… → fp:def456…"` swap without
     // leaking material.
-    let mut old_redacted = old_cfg.redact_all_secrets();
-    let mut new_redacted = new_cfg.redact_all_secrets();
-    // Restore encryption_key as a fingerprint so rotations show in
-    // the diff. The original plaintexts were nulled above; we
-    // re-derive the fingerprints from the ORIGINAL configs.
-    old_redacted.encryption_key = fingerprint_secret(old_cfg.encryption_key.as_deref());
-    new_redacted.encryption_key = fingerprint_secret(new_cfg.encryption_key.as_deref());
+    let old_redacted = old_cfg.redact_all_secrets();
+    let new_redacted = new_cfg.redact_all_secrets();
+    // STEP-1: the fingerprint-restoration that made key rotations
+    // visible in the diff used to target `advanced.encryption_key`.
+    // That field no longer exists. Per-backend rotation fingerprints
+    // move to Step 6, driven by a per-backend walker over
+    // `storage.backends[i].encryption` and `storage.backend_encryption`.
+    // Until then, rotations surface only as non-redacted-field
+    // changes (mode, key_id, kms_key_id) — which is fine for Step 1
+    // because the UI still uses the pre-refactor EncryptionPanel.
     let old_sectioned = SectionedConfig::from_flat(&old_redacted);
     let new_sectioned = SectionedConfig::from_flat(&new_redacted);
 
