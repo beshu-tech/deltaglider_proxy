@@ -1151,3 +1151,217 @@ async fn test_list_buckets_requires_auth() {
         "GET / (ListBuckets) without auth should be rejected"
     );
 }
+
+// ============================================================================
+// QA finding #10: SigV4 tampering edge cases
+// ============================================================================
+//
+// The tests above cover the "obvious negative" cases: wrong secret,
+// unknown key, missing header, malformed header, clock skew, replay.
+// These three tests hit three more-subtle security invariants:
+//
+//   1. Signed-header tampering — changing a header that was covered
+//      by the signature must invalidate it.
+//   2. Presigned-URL post-disable rejection — generating a presigned
+//      URL for a user who is then disabled must invalidate the URL
+//      for its remaining validity window.
+//   3. Unsigned-header tolerance (spec compliance) — the verifier
+//      must NOT reject requests that include extra headers not in
+//      the `SignedHeaders` list. AWS clients rely on this.
+
+/// Tampering with a signed header AFTER signing must produce 403.
+///
+/// The test crafts a valid signed GET, then modifies the
+/// `x-amz-content-sha256` header (which IS in the signed set) to a
+/// different value before sending. Since the signature was computed
+/// over the original header value, the server's recomputation must
+/// differ → signature mismatch → reject.
+///
+/// This catches the class of bugs where the verifier would short-
+/// circuit comparison on e.g. known headers, trust the client-
+/// provided canonical headers instead of rebuilding from the raw
+/// request, etc.
+#[tokio::test]
+async fn test_signed_header_tampering_rejected() {
+    let server = TestServer::builder()
+        .auth("tamper-key", "tamper-secret-1234567890")
+        .build()
+        .await;
+
+    // Compute a valid GET signature over the normal headers.
+    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let req = build_signed_get(
+        &server.endpoint(),
+        "/",
+        "tamper-key",
+        "tamper-secret-1234567890",
+        &timestamp,
+    );
+
+    // REPLACE the signed `x-amz-content-sha256` with a different
+    // value. `.header()` appends — we need to go through `headers_mut`
+    // to actually overwrite the original. The signature was computed
+    // over "UNSIGNED-PAYLOAD"; replace it with the SHA-256 of empty.
+    // The server's canonical-request rebuild must use the NEW value,
+    // get a different signature hash, and reject.
+    let mut built = req.build().expect("build tampered request");
+    let new_sha = sha256_hex(b"");
+    built
+        .headers_mut()
+        .insert("x-amz-content-sha256", new_sha.parse().unwrap());
+    let tampered = reqwest::Client::new()
+        .execute(built)
+        .await
+        .expect("tampered send");
+
+    assert_eq!(
+        tampered.status(),
+        StatusCode::FORBIDDEN,
+        "tampered signed header must produce 403, got {}",
+        tampered.status()
+    );
+}
+
+/// A presigned URL issued BEFORE a user was disabled must not work
+/// AFTER the disable. This is the "stolen URL" scenario: an attacker
+/// obtains a valid presigned URL from logs/memory, then the admin
+/// disables the user — the admin expects ALL the user's outstanding
+/// URLs to fail.
+///
+/// Without this guard, a disabled user's URLs remain valid for the
+/// remainder of the presign window (up to 7 days in AWS-S3-compatible
+/// defaults), which contradicts "disable = no access."
+#[tokio::test]
+async fn test_presigned_url_rejected_after_user_disabled() {
+    let server = TestServer::builder()
+        .auth("bootstrap", "bootstrap-secret-1234567890")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    // Create a user with full access.
+    let user = create_user(
+        &admin,
+        &server,
+        "presigned_disable_target",
+        vec![json!({"effect": "Allow", "actions": ["*"], "resources": ["*"]})],
+    )
+    .await;
+
+    // Generate a presigned GET URL using the user's creds. We don't
+    // even need an object — a presigned LIST (HEAD bucket) has the
+    // same auth flow and is simpler to target.
+    let s3 = server
+        .s3_client_with_creds(&user.access_key_id, &user.secret_access_key)
+        .await;
+
+    // Seed + presign GET of a known key.
+    s3.put_object()
+        .bucket(server.bucket())
+        .key("pre/disabled-target.txt")
+        .body(ByteStream::from(b"whatever".to_vec()))
+        .send()
+        .await
+        .expect("seed PUT");
+    let presigned = s3
+        .get_object()
+        .bucket(server.bucket())
+        .key("pre/disabled-target.txt")
+        .presigned(
+            PresigningConfig::builder()
+                .expires_in(Duration::from_secs(300))
+                .build()
+                .unwrap(),
+        )
+        .await
+        .expect("presign");
+    let url = presigned.uri().to_string();
+
+    // Verify URL works BEFORE disabling (sanity: the URL itself is valid).
+    let http = reqwest::Client::new();
+    let ok = http.get(&url).send().await.expect("pre-disable GET");
+    assert_eq!(
+        ok.status(),
+        StatusCode::OK,
+        "pre-disable presigned GET must succeed, got {}",
+        ok.status()
+    );
+
+    // Disable the user.
+    let before_version = get_iam_version(&admin, &server.endpoint()).await;
+    let resp = admin
+        .put(format!(
+            "{}/_/api/admin/users/{}",
+            server.endpoint(),
+            user.id
+        ))
+        .json(&json!({
+            "name": "presigned_disable_target",
+            "enabled": false,
+            "permissions": [{"effect": "Allow", "actions": ["*"], "resources": ["*"]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "disable user");
+    wait_for_iam_rebuild(&admin, &server.endpoint(), before_version).await;
+
+    // Now the SAME presigned URL must fail. The signature is still
+    // valid cryptographically — the rejection must come from the
+    // auth layer's user-enabled check.
+    let denied = http.get(&url).send().await.expect("post-disable GET");
+    assert_eq!(
+        denied.status(),
+        StatusCode::FORBIDDEN,
+        "post-disable presigned GET must return 403, got {}",
+        denied.status()
+    );
+}
+
+/// Per the SigV4 spec, extra HTTP headers not listed in
+/// `SignedHeaders` are IGNORED by the verifier — they can be added
+/// safely (for tracing, routing, etc.) without breaking the
+/// signature. The proxy MUST NOT reject such requests, or standard
+/// AWS clients sending `user-agent`, `accept-encoding`, etc. would
+/// break.
+///
+/// This is a positive-path spec-compliance test, not a negative one.
+/// It protects against a regression where the verifier rebuilds the
+/// canonical request from ALL incoming headers (wrong) instead of
+/// just the headers named in `SignedHeaders` (correct).
+#[tokio::test]
+async fn test_unsigned_extra_header_is_tolerated() {
+    let server = TestServer::builder()
+        .auth("spec-key", "spec-secret-1234567890")
+        .build()
+        .await;
+
+    // Sign a GET / as ListBuckets. The helper only signs the three
+    // canonical headers (host, x-amz-content-sha256, x-amz-date).
+    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let req = build_signed_get(
+        &server.endpoint(),
+        "/",
+        "spec-key",
+        "spec-secret-1234567890",
+        &timestamp,
+    );
+
+    // Add an arbitrary custom header NOT in SignedHeaders. Also add
+    // `accept-encoding` (which every real browser/curl would send)
+    // to cover the common client path.
+    let resp = req
+        .header("x-amz-custom-tracing", "trace-id-1234")
+        .header("accept-encoding", "gzip, deflate")
+        .send()
+        .await
+        .expect("unsigned-extra-header send");
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "extra-unsigned-header request must pass, got {} — \
+         SigV4 verifier should ignore headers outside the SignedHeaders set",
+        resp.status()
+    );
+}
