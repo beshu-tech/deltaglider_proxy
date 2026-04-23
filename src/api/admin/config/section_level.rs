@@ -369,16 +369,34 @@ async fn apply_section(
     // effectively a defensive no-op for that field.
     new_cfg.bootstrap_password_hash = old_cfg.bootstrap_password_hash.clone();
     //
-    // encryption_key: preserve when incoming is None (GET/edit/PUT
-    // round-trips post None because GET redacts the field). RESPECT
-    // a non-None incoming value so operators can rotate the key via
-    // the admin UI. Setting it to Some("...") is the explicit-
-    // rotation path; setting it to Some("") would disable encryption
-    // (the engine treats Some("") as "no key" via from_hex
-    // rejection — a malformed key path) — the admin UI should send
-    // None or omit the field entirely to leave encryption alone, and
-    // a dedicated DELETE/"disable" affordance for turning it off.
-    if new_cfg.encryption_key.is_none() {
+    // encryption_key: three-state semantics. Because merge-patch and
+    // Option<String> both map "null" and "field absent" to None after
+    // deserialization, we must inspect the raw body to distinguish:
+    //
+    //   * field absent in body  -> PRESERVE old key (GET/edit/PUT
+    //     round-trips post no encryption_key at all, because GET
+    //     redacts it; this is the "don't change" case).
+    //
+    //   * field present and null -> EXPLICIT DISABLE (the "Disable
+    //     encryption" affordance in EncryptionPanel — sends a literal
+    //     `{"encryption_key": null}` that the operator explicitly
+    //     typed/clicked). Clears the key. Subsequent writes go to
+    //     plaintext; historical encrypted reads error via the always-
+    //     wrapped EncryptingBackend (see B1 in engine/mod.rs).
+    //
+    //   * field present and a string -> ROTATE to that value (the
+    //     "Rotate key" / "Enable encryption" paths; validated below).
+    //
+    // Without this the UI's Disable button is a no-op: `encryption_key:
+    // null` deserializes to None, the preservation guard restores the
+    // old value, and the operator thinks encryption is off when it
+    // isn't.
+    let body_has_explicit_null_encryption_key = body
+        .as_object()
+        .and_then(|m| m.get("encryption_key"))
+        .map(|v| v.is_null())
+        .unwrap_or(false);
+    if new_cfg.encryption_key.is_none() && !body_has_explicit_null_encryption_key {
         new_cfg.encryption_key = old_cfg.encryption_key.clone();
     }
     // Validate any NEW encryption_key the operator is trying to set.

@@ -270,7 +270,7 @@ DGP_ENCRYPTION_KEY=$(openssl rand -hex 32)
 - **Only new writes are encrypted.** Enabling encryption does not retroactively encrypt existing objects.
 - **Existing encrypted objects remain readable** if you turn encryption off — only new writes become plaintext again.
 
-**Large objects:** The codec chunks plaintext into 64-KiB windows, so multi-GiB passthrough uploads and downloads stream end-to-end without buffering the entire object. Range reads trim at chunk boundaries (≤64 KiB overhead per end).
+**Large objects:** Downloads stream end-to-end with ~130 KiB peak RAM regardless of object size, and range GETs fetch only the target chunks (O(1) traffic). Uploads still buffer the ciphertext in memory (~1× plaintext size) before handing off to the backend; the proxy's `max_object_size` default of 100 MiB keeps that bounded. Bumping `max_object_size` for large encrypted uploads means budgeting RAM to match.
 
 **What's encrypted vs. what isn't:**
 

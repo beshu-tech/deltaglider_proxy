@@ -284,6 +284,36 @@ impl TestServer {
     pub fn data_dir(&self) -> Option<&std::path::Path> {
         self._data_dir.as_ref().map(|d| d.path())
     }
+
+    /// Kill the current proxy process and spawn a new one against the SAME
+    /// config file, data dir, and port — but WITHOUT `DGP_ENCRYPTION_KEY`
+    /// set. Used by the B1 regression test: an operator who disables
+    /// encryption must NOT get silent ciphertext-as-plaintext reads on
+    /// historical encrypted objects; the storage wrapper is always in
+    /// place and errors when the marker says encrypted but no key is
+    /// configured.
+    ///
+    /// Preserves `auth_creds` and `bucket`; only the env-var side of the
+    /// config changes. Falls through the same readiness probe as the
+    /// initial spawn.
+    pub async fn respawn_without_encryption_key(&mut self) {
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+        // Short sleep so the kernel releases the port before we rebind.
+        // Without this the new child hits EADDRINUSE and wait_ready
+        // panics with a stale-port diagnostic.
+        sleep(Duration::from_millis(200)).await;
+
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"));
+        cmd.env("DGP_CONFIG", &self.config_path)
+            .env("RUST_LOG", "deltaglider_proxy=warn")
+            .env("DGP_DEBUG_HEADERS", "true")
+            .env("DGP_TRUST_PROXY_HEADERS", "true")
+            // Explicitly NOT setting DGP_ENCRYPTION_KEY.
+            .env_remove("DGP_ENCRYPTION_KEY");
+        self.process = cmd.spawn().expect("Failed to respawn server");
+        self.wait_ready().await;
+    }
 }
 
 /// Builder for constructing `TestServer` instances with arbitrary config knobs.

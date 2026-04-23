@@ -14,10 +14,14 @@
 //! ```
 //! Overhead: 28 bytes per object.
 //!
-//! **`aes-256-gcm-chunked-v1`** (chunked, streaming) — used ONLY for
-//! `put_passthrough_chunked`. Passthrough objects are user uploads with no
-//! size ceiling — a 5 GiB upload must not OOM the process, so we encrypt
-//! in 64-KiB plaintext windows and decrypt chunk-by-chunk on read.
+//! **`aes-256-gcm-chunked-v1`** (chunked, streaming reads) — used ONLY for
+//! `put_passthrough_chunked`. The format exists so the read path can
+//! decrypt chunk-by-chunk with bounded peak memory and do O(1) range reads
+//! on large objects. The WRITE path is not fully streaming in this
+//! release — the wrapper buffers all encrypted frames before handing them
+//! to the inner backend's chunked PUT. Peak write memory ≈ ciphertext size.
+//! The engine's `max_object_size` ceiling (default 100 MiB) keeps this
+//! bounded; if operators raise it, they should budget RAM accordingly.
 //!
 //! ```text
 //! [4-byte magic "DGE1"] [12-byte base_iv]
@@ -348,7 +352,9 @@ where
 }
 
 /// Produce a plaintext stream from an encrypted chunked-format
-/// ciphertext stream.
+/// ciphertext stream — full-file path. The stream MUST begin with the
+/// `[magic][base_iv]` header; use [`chunked_decrypt_stream_from_chunk`]
+/// for the range-read path where the header was fetched separately.
 ///
 /// `expected_final_index` MUST be the zero-based index of the final
 /// chunk (derived from `ceil(plaintext_size / CHUNK_PLAINTEXT_SIZE) - 1`;
@@ -421,9 +427,20 @@ where
 
             // If we've already emitted the final chunk, we're done —
             // any trailing bytes from the inner stream are a framing
-            // violation and should be logged but not errored (keeps
-            // the caller's stream clean).
+            // violation. We don't error (keeps the caller's stream
+            // clean — the plaintext was already delivered intact) but
+            // we do log at debug level so oddities on disk surface in
+            // traces. A shipped file with trailing garbage likely
+            // indicates a broken backup/restore path; operators who
+            // care can grep the logs.
             if st.emitted_final {
+                if !st.buf.is_empty() {
+                    tracing::debug!(
+                        "chunked-encryption decoder: {} trailing bytes after final frame — \
+                         discarding (possible backup/restore mishandling)",
+                        st.buf.len()
+                    );
+                }
                 return None;
             }
 
@@ -524,6 +541,144 @@ where
     }))
 }
 
+/// Range-read decoder builder. Differs from
+/// [`chunked_decrypt_stream`] in that the caller has already fetched
+/// the 16-byte header (magic + base_iv) via a separate small range
+/// request and hands the parsed `base_iv` + starting `chunk_index` in
+/// directly. The `inner` stream must start at the beginning of
+/// `starting_chunk_index`'s frame (i.e. at `wire_offset_of_chunk`),
+/// not at wire offset 0.
+///
+/// This is what makes "read last 100 bytes of a 10 GiB file" cost O(1)
+/// network traffic instead of O(N): we fetch exactly the target chunks
+/// plus the separate tiny header fetch, and the decoder starts with
+/// its chunk_index aligned to the range.
+fn chunked_decrypt_stream_from_chunk<S>(
+    inner: S,
+    key: EncryptionKey,
+    base_iv: [u8; IV_LEN],
+    starting_chunk_index: u32,
+    expected_final_index: u32,
+    skip_bytes: u64,
+    take_bytes: Option<u64>,
+) -> BoxStream<'static, Result<Bytes, StorageError>>
+where
+    S: futures::Stream<Item = Result<Bytes, StorageError>> + Unpin + Send + 'static,
+{
+    let state = DecryptState {
+        inner,
+        key,
+        buf: Vec::with_capacity(CHUNK_FRAME_WIRE_LEN + 64),
+        // Caller already consumed the header — skip phase 1 entirely.
+        header_done: true,
+        base_iv,
+        chunk_index: starting_chunk_index,
+        expected_final_index,
+        emitted_final: false,
+        skip_bytes,
+        take_bytes,
+    };
+
+    Box::pin(futures::stream::unfold(state, |mut st| async move {
+        use futures::StreamExt;
+        loop {
+            if matches!(st.take_bytes, Some(0)) {
+                return None;
+            }
+            if st.emitted_final {
+                return None;
+            }
+
+            while st.buf.len() < CHUNK_FRAME_LEN_FIELD {
+                match st.inner.next().await {
+                    Some(Ok(more)) => st.buf.extend_from_slice(&more),
+                    Some(Err(e)) => return Some((Err(e), st)),
+                    None => {
+                        return Some((
+                            Err(StorageError::Encryption(format!(
+                                "stream truncated before chunk {} (expected final index {})",
+                                st.chunk_index, st.expected_final_index
+                            ))),
+                            st,
+                        ));
+                    }
+                }
+            }
+
+            let declared =
+                u32::from_le_bytes(st.buf[..CHUNK_FRAME_LEN_FIELD].try_into().unwrap()) as usize;
+            if declared > CHUNK_MAX_WIRE_CIPHERTEXT {
+                return Some((
+                    Err(StorageError::Encryption(format!(
+                        "frame length {} exceeds ceiling {} — rejecting (possible DOS)",
+                        declared, CHUNK_MAX_WIRE_CIPHERTEXT,
+                    ))),
+                    st,
+                ));
+            }
+            let frame_wire_len = CHUNK_FRAME_LEN_FIELD + declared;
+            while st.buf.len() < frame_wire_len {
+                match st.inner.next().await {
+                    Some(Ok(more)) => st.buf.extend_from_slice(&more),
+                    Some(Err(e)) => return Some((Err(e), st)),
+                    None => {
+                        return Some((
+                            Err(StorageError::Encryption(
+                                "stream truncated mid-frame-body".into(),
+                            )),
+                            st,
+                        ));
+                    }
+                }
+            }
+
+            let is_final = st.chunk_index == st.expected_final_index;
+            let ct = &st.buf[CHUNK_FRAME_LEN_FIELD..frame_wire_len];
+            let pt = match decrypt_chunk(&st.key, &st.base_iv, st.chunk_index, is_final, ct) {
+                Ok(p) => p,
+                Err(e) => return Some((Err(e), st)),
+            };
+            st.buf.drain(..frame_wire_len);
+            st.chunk_index = match st.chunk_index.checked_add(1) {
+                Some(v) => v,
+                None => {
+                    return Some((
+                        Err(StorageError::Encryption(
+                            "chunk index overflow during decode".into(),
+                        )),
+                        st,
+                    ));
+                }
+            };
+            if is_final {
+                st.emitted_final = true;
+            }
+
+            let mut start = 0usize;
+            if st.skip_bytes > 0 {
+                let skip = std::cmp::min(st.skip_bytes as usize, pt.len());
+                start += skip;
+                st.skip_bytes -= skip as u64;
+            }
+            let remainder = &pt[start..];
+
+            let to_emit: Bytes = if let Some(take) = st.take_bytes {
+                let take_now = std::cmp::min(take as usize, remainder.len());
+                let slice = Bytes::copy_from_slice(&remainder[..take_now]);
+                st.take_bytes = Some(take - take_now as u64);
+                slice
+            } else {
+                Bytes::copy_from_slice(remainder)
+            };
+
+            if to_emit.is_empty() {
+                continue;
+            }
+            return Some((Ok(to_emit), st));
+        }
+    }))
+}
+
 /// Compute the index of the final chunk given a plaintext byte
 /// count. Zero-byte objects still have one chunk (index 0 with empty
 /// plaintext) — the write path guarantees this.
@@ -534,6 +689,101 @@ fn final_chunk_index_for_plaintext_size(plaintext_size: u64) -> u32 {
     let sz = CHUNK_PLAINTEXT_SIZE as u64;
     let last = (plaintext_size - 1) / sz;
     last as u32
+}
+
+/// Wrap an unencrypted-passthrough stream so the first 4 bytes are
+/// inspected for the chunked-encryption `DGE1` magic. If present, we
+/// emit a hard error instead of serving ciphertext. Guards against the
+/// operational failure mode where a backup/restore round-trip strips
+/// xattrs — the body on disk is still ciphertext, the metadata no
+/// longer carries the encryption marker, and without this check the
+/// wrapper would happily serve ciphertext as plaintext.
+///
+/// Cost: reads the first emitted `Bytes` of the stream (whatever size
+/// that is — usually ≥4 KiB), inspects up to 4 bytes, then re-emits
+/// the original Bytes unchanged. Zero extra network/disk round-trips.
+fn sniff_dge1_magic<S>(inner: S) -> BoxStream<'static, Result<Bytes, StorageError>>
+where
+    S: futures::Stream<Item = Result<Bytes, StorageError>> + Unpin + Send + 'static,
+{
+    enum State<S> {
+        Initial(S),
+        Passthrough(S),
+        Done,
+    }
+    Box::pin(futures::stream::unfold(
+        State::Initial(inner),
+        |st| async move {
+            use futures::StreamExt;
+            match st {
+                State::Initial(mut inner) => match inner.next().await {
+                    Some(Ok(first)) => {
+                        if first.len() >= 4 && first[..4] == CHUNK_MAGIC {
+                            let err = Err(StorageError::Encryption(
+                                "object body begins with chunked-encryption magic but \
+                                 metadata has no dg-encrypted marker — xattrs may have \
+                                 been stripped during backup/restore. Refusing to serve \
+                                 ciphertext as plaintext."
+                                    .into(),
+                            ));
+                            return Some((err, State::Done));
+                        }
+                        Some((Ok(first), State::Passthrough(inner)))
+                    }
+                    Some(Err(e)) => Some((Err(e), State::Done)),
+                    None => None,
+                },
+                State::Passthrough(mut inner) => inner
+                    .next()
+                    .await
+                    .map(|item| (item, State::Passthrough(inner))),
+                State::Done => None,
+            }
+        },
+    ))
+}
+
+/// Fetch the 16-byte `[magic][base_iv]` header via a short range request
+/// and return the parsed `base_iv`. Errors on bad magic or truncation
+/// — the caller should propagate those unchanged.
+///
+/// Small enough that the overhead of an extra backend call is
+/// negligible vs. the gain of bounded-cost range reads on large
+/// objects. Used only by the range-read path; the full-file stream
+/// decoder parses the header from its own byte stream in phase 1.
+async fn fetch_chunked_header<B: StorageBackend + ?Sized>(
+    inner: &B,
+    bucket: &str,
+    prefix: &str,
+    filename: &str,
+) -> Result<[u8; IV_LEN], StorageError> {
+    use futures::StreamExt;
+    let (mut stream, _) = inner
+        .get_passthrough_stream_range(bucket, prefix, filename, 0, CHUNK_HEADER_LEN as u64 - 1)
+        .await?;
+    let mut buf: Vec<u8> = Vec::with_capacity(CHUNK_HEADER_LEN);
+    while buf.len() < CHUNK_HEADER_LEN {
+        match stream.next().await {
+            Some(Ok(b)) => buf.extend_from_slice(&b),
+            Some(Err(e)) => return Err(e),
+            None => {
+                return Err(StorageError::Encryption(format!(
+                    "stream ended before encryption header (got {} of {} bytes)",
+                    buf.len(),
+                    CHUNK_HEADER_LEN
+                )));
+            }
+        }
+    }
+    if buf[..4] != CHUNK_MAGIC {
+        return Err(StorageError::Encryption(format!(
+            "bad chunked-encryption magic: {:02x?}",
+            &buf[..4]
+        )));
+    }
+    let mut base_iv = [0u8; IV_LEN];
+    base_iv.copy_from_slice(&buf[4..CHUNK_HEADER_LEN]);
+    Ok(base_iv)
 }
 
 /// Transparent encryption wrapper around any `StorageBackend`.
@@ -807,11 +1057,38 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         prefix: &str,
         filename: &str,
     ) -> Result<Vec<u8>, StorageError> {
-        let data = self.inner.get_passthrough(bucket, prefix, filename).await?;
         let meta = self
             .inner
             .get_passthrough_metadata(bucket, prefix, filename)
             .await?;
+
+        // Chunked path: decrypt_if_needed's single-shot decrypt would
+        // treat the first 12 bytes of the `DGE1`-prefixed wire format
+        // as an IV and AEAD-reject the rest — a silent caller footgun.
+        // Instead, fetch the stream and run it through the chunked
+        // decoder, collecting into a contiguous Vec<u8>. This matches
+        // the semantics every `get_passthrough` caller expects (one
+        // blob, plaintext) without requiring them to know about the
+        // two wire formats.
+        //
+        // Every current caller of `get_passthrough` is a unit/test
+        // helper or a fallback path that won't see chunked objects in
+        // production — but fixing this closes the footgun before any
+        // future caller trips over it.
+        if is_chunked_encrypted(&meta) {
+            let stream = self
+                .get_passthrough_stream(bucket, prefix, filename)
+                .await?;
+            use futures::TryStreamExt;
+            let parts: Vec<Bytes> = stream.try_collect().await?;
+            let mut buf = Vec::with_capacity(parts.iter().map(|b| b.len()).sum());
+            for p in parts {
+                buf.extend_from_slice(&p);
+            }
+            return Ok(buf);
+        }
+
+        let data = self.inner.get_passthrough(bucket, prefix, filename).await?;
         self.decrypt_if_needed(data, &meta)
     }
 
@@ -855,10 +1132,20 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
             })));
         }
 
-        // Not encrypted — straight passthrough.
-        self.inner
+        // Not encrypted per metadata — stream straight through, but
+        // peek the first 4 bytes of the body as a belt-and-suspenders
+        // check against the "xattr got stripped during backup/restore
+        // and the on-disk body is still ciphertext" scenario. If we
+        // see the chunked-format `DGE1` magic on an object that
+        // metadata claims is plaintext, refuse rather than serving
+        // ciphertext to the client. The odds of plaintext happening
+        // to start with those 4 bytes are 1/2^32 and in practice zero
+        // for any realistic file type.
+        let stream = self
+            .inner
             .get_passthrough_stream(bucket, prefix, filename)
-            .await
+            .await?;
+        Ok(Box::pin(sniff_dge1_magic(stream)))
     }
 
     async fn get_passthrough_stream_range(
@@ -875,25 +1162,24 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
             .await?;
 
         // Chunked path: fetch only the wire bytes covering the target
-        // chunks (O(1) offset math — every non-final chunk is
-        // `CHUNK_FRAME_WIRE_LEN` bytes). The decoder needs the
-        // 16-byte header (for base_iv) AND the correct absolute
-        // chunk_index to reconstruct AAD. We fetch them in a single
-        // widened range request: from wire offset 0 (header) through
-        // the end of the last covered chunk. For a typical "read 100
-        // KiB from middle of a 5 GiB object" this pulls ~80 KiB
-        // instead of 5 GiB.
+        // chunks, using O(1) offset math — every non-final chunk is
+        // exactly `CHUNK_FRAME_WIRE_LEN` bytes. We issue TWO backend
+        // reads:
         //
-        // The decoder's `skip_bytes` is the chunk-local offset within
-        // `first_chunk` + the sum of preceding chunks' plaintext that
-        // we want to throw away (the leading full chunks before the
-        // range target). Equivalently: `start - first_chunk * PT_SZ`.
+        //   1. Header fetch: wire bytes `[0, CHUNK_HEADER_LEN)` — 16
+        //      bytes for the magic + base_iv. Tiny, always needed.
+        //   2. Body fetch: wire bytes from `wire_offset_of_chunk(
+        //      first_chunk)` through the end of `last_chunk`. For
+        //      non-final `last_chunk` this is a bounded window; for
+        //      `last_chunk == final_idx` we ask for EOF (the final
+        //      chunk may be shorter than a full frame).
         //
-        // Simpler alternative: ask the inner for the full-file stream
-        // up to end_of_last_chunk. That would work but for very large
-        // objects with ranges near the start, reads a lot of data we
-        // immediately throw away. The widened range is cheap: pulls
-        // at most the prefix + requested window.
+        // The alternative — fetching from wire-offset 0 through
+        // last_chunk and relying on the decoder to discard the
+        // leading chunks — is O(N) for reads near the end of large
+        // objects (before this fix: "last 100 bytes of a 10 GiB file"
+        // pulled all 10 GiB). The two-fetch approach trades one extra
+        // tiny request for bounded cost on every range shape.
         if is_chunked_encrypted(&meta) {
             let Some(key) = self.current_key() else {
                 return Err(StorageError::Encryption(
@@ -904,21 +1190,37 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
             // Clamp `end` (inclusive) to the actual plaintext size.
             let effective_end = std::cmp::min(end, meta.file_size.saturating_sub(1));
             if effective_end < start {
-                return Ok((Box::pin(futures::stream::empty()), 0));
+                // Out-of-range for this object. HTTP handlers clamp
+                // via resolve_range before reaching us (returning 416
+                // upstream), so this is unreachable in the serving
+                // path today. Future callers that reach here get a
+                // hard error rather than the pre-B3 `(empty, 0)`
+                // signal, which overlapped with the default-impl's
+                // "full stream, not range" contract and mis-routed
+                // callers into buffered fallbacks.
+                return Err(StorageError::Other(format!(
+                    "range out of bounds: start={} effective_end={} file_size={}",
+                    start, effective_end, meta.file_size
+                )));
             }
+            let (first_chunk, _) = chunk_index_for_plaintext_offset(start);
             let (last_chunk, _) = chunk_index_for_plaintext_offset(effective_end);
 
-            // Widened wire range: from offset 0 (includes header +
-            // leading chunks we'll skip) through end of last_chunk.
-            // The leading chunks we'll throw away via `skip_bytes` at
-            // the plaintext layer after decryption.
-            let wire_start = 0u64;
+            // Fetch #1: just the header. Size is tiny
+            // (CHUNK_HEADER_LEN = 16 bytes).
+            let base_iv = fetch_chunked_header(&self.inner, bucket, prefix, filename).await?;
+
+            // Fetch #2: body covering `first_chunk..=last_chunk`.
+            let wire_start = wire_offset_of_chunk(first_chunk);
             let wire_end = if last_chunk < final_idx {
                 wire_offset_of_chunk(last_chunk) + CHUNK_FRAME_WIRE_LEN as u64 - 1
             } else {
-                // The request's last chunk IS the object's final chunk
-                // (which may be shorter than CHUNK_FRAME_WIRE_LEN).
-                // Ask for everything to EOF.
+                // Last chunk IS the object's final chunk; it may be
+                // shorter than a full frame, so ask for EOF. The
+                // `u64::MAX - 1` sentinel works across both backends:
+                // S3 interprets it per RFC 7233 (clamp to resource
+                // length), filesystem `File::take` limits on actual
+                // EOF.
                 u64::MAX - 1
             };
             let (ct_stream, _) = self
@@ -926,14 +1228,24 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
                 .get_passthrough_stream_range(bucket, prefix, filename, wire_start, wire_end)
                 .await?;
 
-            // Plaintext bytes we emit BEFORE reaching the range start,
-            // then discard: (`first_chunk` × PT_SZ) + head_skip within
-            // that chunk = just `start` itself.
-            let skip_bytes = start;
+            // Skip any plaintext bytes before `start` within the
+            // first fetched chunk. E.g. for start=70000 and chunk
+            // size 65536, first_chunk=1 (starts at plaintext 65536)
+            // and we skip 70000 - 65536 = 4464 bytes of its
+            // plaintext. The preceding full chunks (index 0) are
+            // never fetched or decrypted.
+            let skip_bytes = start - (first_chunk as u64) * (CHUNK_PLAINTEXT_SIZE as u64);
             let plaintext_len = effective_end - start + 1;
 
-            let plain =
-                chunked_decrypt_stream(ct_stream, key, final_idx, skip_bytes, Some(plaintext_len));
+            let plain = chunked_decrypt_stream_from_chunk(
+                ct_stream,
+                key,
+                base_iv,
+                first_chunk,
+                final_idx,
+                skip_bytes,
+                Some(plaintext_len),
+            );
             return Ok((plain, plaintext_len));
         }
 
@@ -1391,5 +1703,439 @@ mod tests {
         mark_chunked_encrypted(&mut m2);
         assert!(is_encrypted(&m2));
         assert!(is_chunked_encrypted(&m2));
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // B3 regression: range reads on chunked-encrypted objects must
+    // fetch only the header + the target chunks, NOT the whole file.
+    //
+    // Before the fix, `wire_start = 0` pulled the header + every chunk
+    // from 0 up to the target, then the decoder threw the leading
+    // chunks away. For a request like "last 100 bytes of a 10 GiB
+    // object" that meant pulling and decrypting all 10 GiB to emit
+    // 100 plaintext bytes.
+    //
+    // We can't easily prove this with an integration test (mocking
+    // network I/O is heavy-weight). Instead we use a tiny counting
+    // backend that records the `(start, end)` ranges that the
+    // encrypting wrapper asks for from its inner layer. The math
+    // guarantees hold: the body fetch must start at or after
+    // `wire_offset_of_chunk(first_chunk)`, and the separate header
+    // fetch must cover `[0, CHUNK_HEADER_LEN)`.
+    // ─────────────────────────────────────────────────────────────────
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use chrono::Utc;
+    use futures::stream::BoxStream;
+    use std::sync::Mutex;
+
+    /// A spy backend that records every `get_passthrough_stream_range`
+    /// call so tests can assert on WHERE the wrapper reads from. Holds
+    /// one passthrough object in memory; everything else no-ops or
+    /// errors.
+    struct CountingBackend {
+        bytes: Vec<u8>,
+        metadata: Mutex<Option<FileMetadata>>,
+        ranges_requested: Mutex<Vec<(u64, u64)>>,
+    }
+
+    impl CountingBackend {
+        fn new() -> Self {
+            Self {
+                bytes: Vec::new(),
+                metadata: Mutex::new(None),
+                ranges_requested: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn set_contents(&mut self, bytes: Vec<u8>, meta: FileMetadata) {
+            self.bytes = bytes;
+            *self.metadata.lock().unwrap() = Some(meta);
+        }
+    }
+
+    fn cb_err() -> StorageError {
+        StorageError::Other("CountingBackend: not implemented for this test".into())
+    }
+
+    #[async_trait]
+    impl StorageBackend for CountingBackend {
+        async fn get_passthrough_stream_range(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            start: u64,
+            end: u64,
+        ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), StorageError> {
+            self.ranges_requested.lock().unwrap().push((start, end));
+            let end_clamped = std::cmp::min(end, self.bytes.len() as u64 - 1);
+            let slice = self.bytes[start as usize..=end_clamped as usize].to_vec();
+            let len = slice.len() as u64;
+            Ok((
+                Box::pin(futures::stream::once(async move { Ok(Bytes::from(slice)) })),
+                len,
+            ))
+        }
+
+        /// Full-stream read. Serves the whole byte vec as a single
+        /// Bytes so the chunked decoder's phase-1 header parse hits
+        /// the same code path it would over a real network stream.
+        async fn get_passthrough_stream(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<BoxStream<'static, Result<Bytes, StorageError>>, StorageError> {
+            let b = Bytes::from(self.bytes.clone());
+            Ok(Box::pin(futures::stream::once(async move { Ok(b) })))
+        }
+
+        async fn get_passthrough_metadata(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<FileMetadata, StorageError> {
+            self.metadata.lock().unwrap().clone().ok_or_else(cb_err)
+        }
+
+        // All other trait methods: not needed for these tests.
+        async fn create_bucket(&self, _: &str) -> Result<(), StorageError> {
+            Err(cb_err())
+        }
+        async fn delete_bucket(&self, _: &str) -> Result<(), StorageError> {
+            Err(cb_err())
+        }
+        async fn list_buckets(&self) -> Result<Vec<String>, StorageError> {
+            Err(cb_err())
+        }
+        async fn list_buckets_with_dates(
+            &self,
+        ) -> Result<Vec<(String, chrono::DateTime<chrono::Utc>)>, StorageError> {
+            Err(cb_err())
+        }
+        async fn head_bucket(&self, _: &str) -> Result<bool, StorageError> {
+            Err(cb_err())
+        }
+        async fn has_reference(&self, _: &str, _: &str) -> bool {
+            false
+        }
+        async fn put_reference(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[u8],
+            _: &FileMetadata,
+        ) -> Result<(), StorageError> {
+            Err(cb_err())
+        }
+        async fn get_reference(&self, _: &str, _: &str) -> Result<Vec<u8>, StorageError> {
+            Err(cb_err())
+        }
+        async fn get_reference_metadata(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<FileMetadata, StorageError> {
+            Err(cb_err())
+        }
+        async fn put_reference_metadata(
+            &self,
+            _: &str,
+            _: &str,
+            _: &FileMetadata,
+        ) -> Result<(), StorageError> {
+            Err(cb_err())
+        }
+        async fn delete_reference(&self, _: &str, _: &str) -> Result<(), StorageError> {
+            Err(cb_err())
+        }
+        async fn put_delta(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &[u8],
+            _: &FileMetadata,
+        ) -> Result<(), StorageError> {
+            Err(cb_err())
+        }
+        async fn get_delta(&self, _: &str, _: &str, _: &str) -> Result<Vec<u8>, StorageError> {
+            Err(cb_err())
+        }
+        async fn get_delta_metadata(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<FileMetadata, StorageError> {
+            Err(cb_err())
+        }
+        async fn delete_delta(&self, _: &str, _: &str, _: &str) -> Result<(), StorageError> {
+            Err(cb_err())
+        }
+        async fn put_passthrough(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &[u8],
+            _: &FileMetadata,
+        ) -> Result<(), StorageError> {
+            Err(cb_err())
+        }
+        async fn get_passthrough(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<u8>, StorageError> {
+            Err(cb_err())
+        }
+        async fn delete_passthrough(&self, _: &str, _: &str, _: &str) -> Result<(), StorageError> {
+            Err(cb_err())
+        }
+        async fn scan_deltaspace(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<FileMetadata>, StorageError> {
+            Err(cb_err())
+        }
+        async fn list_deltaspaces(&self, _: &str) -> Result<Vec<String>, StorageError> {
+            Err(cb_err())
+        }
+        async fn total_size(&self, _: Option<&str>) -> Result<u64, StorageError> {
+            Err(cb_err())
+        }
+        async fn put_directory_marker(&self, _: &str, _: &str) -> Result<(), StorageError> {
+            Err(cb_err())
+        }
+        async fn bulk_list_objects(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<(String, FileMetadata)>, StorageError> {
+            Err(cb_err())
+        }
+        async fn enrich_list_metadata(
+            &self,
+            _: &str,
+            o: Vec<(String, FileMetadata)>,
+        ) -> Result<Vec<(String, FileMetadata)>, StorageError> {
+            Ok(o)
+        }
+    }
+
+    /// Shared helper: encrypt a plaintext blob into a chunked-format
+    /// wire stream, return the bytes + the final_chunk_index.
+    fn encode_chunked(key: &EncryptionKey, plaintext: &[u8]) -> (Vec<u8>, [u8; IV_LEN], u32) {
+        let base_iv: [u8; IV_LEN] = [7u8; IV_LEN]; // fixed for determinism
+        let mut out = Vec::new();
+        out.extend_from_slice(&CHUNK_MAGIC);
+        out.extend_from_slice(&base_iv);
+        if plaintext.is_empty() {
+            let frame = encrypt_chunk(key, &base_iv, 0, true, &[]).unwrap();
+            out.extend_from_slice(&frame);
+            return (out, base_iv, 0);
+        }
+        let final_idx = final_chunk_index_for_plaintext_size(plaintext.len() as u64);
+        for (idx, pt_chunk) in plaintext.chunks(CHUNK_PLAINTEXT_SIZE).enumerate() {
+            let is_final = idx as u32 == final_idx;
+            let frame = encrypt_chunk(key, &base_iv, idx as u32, is_final, pt_chunk).unwrap();
+            out.extend_from_slice(&frame);
+        }
+        (out, base_iv, final_idx)
+    }
+
+    /// Construct a CountingBackend pre-loaded with a chunked-encrypted
+    /// object, wrap it in an EncryptingBackend, and return the wrapper
+    /// plus the plaintext for assertion.
+    async fn setup_wrapper_with_chunked_object(
+        key: EncryptionKey,
+        plaintext_size: usize,
+    ) -> (EncryptingBackend<CountingBackend>, Vec<u8>) {
+        let plaintext: Vec<u8> = (0..plaintext_size).map(|i| (i & 0xff) as u8).collect();
+        let (ciphertext, _base_iv, _final_idx) = encode_chunked(&key, &plaintext);
+
+        let mut meta = FileMetadata::fallback(
+            "test.bin".into(),
+            plaintext_size as u64,
+            "md5".into(),
+            Utc::now(),
+            None,
+            crate::types::StorageInfo::Passthrough,
+        );
+        mark_chunked_encrypted(&mut meta);
+
+        let mut backend = CountingBackend::new();
+        backend.set_contents(ciphertext, meta);
+
+        let enc_config = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig { key: Some(key) })));
+        let wrapper = EncryptingBackend::new(backend, enc_config);
+        (wrapper, plaintext)
+    }
+
+    #[tokio::test]
+    async fn test_range_read_fetches_only_target_chunks() {
+        // 10 × 64 KiB plaintext = 640 KiB, chunks 0..=9. Request bytes
+        // covering ONLY chunks 7-8. The wrapper must:
+        //   1. Fetch the 16-byte header via a short range [0, 15].
+        //   2. Fetch the body covering chunks 7-8 via a widened range
+        //      starting at `wire_offset_of_chunk(7)`, NOT at 0.
+        // Regression: before the fix, wire_start was hardcoded to 0
+        // and the whole file up to last_chunk was pulled.
+        let key = test_key();
+        let plaintext_size = 10 * CHUNK_PLAINTEXT_SIZE;
+        let (wrapper, plaintext) = setup_wrapper_with_chunked_object(key, plaintext_size).await;
+
+        // Bytes covering chunks 7 (pt offset 458752..524287) and 8.
+        let start = 7 * CHUNK_PLAINTEXT_SIZE as u64 + 100;
+        let end = 8 * CHUNK_PLAINTEXT_SIZE as u64 + 500;
+        let (stream, content_length) = wrapper
+            .get_passthrough_stream_range("b", "p", "test.bin", start, end)
+            .await
+            .unwrap();
+        assert_eq!(content_length, end - start + 1);
+
+        use futures::TryStreamExt;
+        let got: Vec<Bytes> = stream.try_collect().await.unwrap();
+        let got: Vec<u8> = got.into_iter().flatten().collect();
+        assert_eq!(got, &plaintext[start as usize..=end as usize]);
+
+        // Now the assertion that justifies this test: the wrapper must
+        // have made exactly TWO range requests to the inner backend —
+        // one tiny one for the header, and one covering chunks 7-8.
+        // It must NOT have fetched from wire offset 0 for the body
+        // (that would mean pulling chunks 0-6 and throwing them away,
+        // the pre-fix behaviour).
+        let ranges = wrapper.inner.ranges_requested.lock().unwrap().clone();
+        assert_eq!(
+            ranges.len(),
+            2,
+            "expected exactly 2 inner range requests (header + body), got {}: {:?}",
+            ranges.len(),
+            ranges
+        );
+        assert_eq!(
+            ranges[0],
+            (0, CHUNK_HEADER_LEN as u64 - 1),
+            "first request must be the 16-byte header fetch"
+        );
+        let body_wire_start = ranges[1].0;
+        let expected_body_start = wire_offset_of_chunk(7);
+        assert_eq!(
+            body_wire_start, expected_body_start,
+            "body fetch must start at wire_offset_of_chunk(first_chunk) = {}, \
+             got {} — if this is 0, the wrapper is back to pulling from the \
+             file start and the B3 perf fix is broken",
+            expected_body_start, body_wire_start
+        );
+        // Body range must not extend past last_chunk's frame end (chunk
+        // 8 is non-final since final is 9).
+        let expected_body_end = wire_offset_of_chunk(8) + CHUNK_FRAME_WIRE_LEN as u64 - 1;
+        assert_eq!(ranges[1].1, expected_body_end);
+    }
+
+    /// B4 regression: `get_passthrough` must return plaintext for BOTH
+    /// wire formats. Before the fix, chunked-encrypted objects fell
+    /// through to the single-shot `decrypt()` which parsed the 12-byte
+    /// segment after the `DGE1` magic as an IV and AEAD-rejected —
+    /// breaking any caller who called `get_passthrough` on a chunked
+    /// object (latent footgun; no current production caller exercised
+    /// the path).
+    #[tokio::test]
+    async fn test_get_passthrough_handles_chunked_objects() {
+        let key = test_key();
+        // Cross chunk boundaries — otherwise single-shot might
+        // coincidentally look valid.
+        let plaintext_size = 3 * CHUNK_PLAINTEXT_SIZE + 123;
+        let (wrapper, plaintext) = setup_wrapper_with_chunked_object(key, plaintext_size).await;
+
+        let got = wrapper.get_passthrough("b", "p", "test.bin").await.unwrap();
+        assert_eq!(got, plaintext);
+    }
+
+    /// B9 regression: if xattrs are stripped during backup/restore,
+    /// an on-disk chunked-encrypted body loses its `dg-encrypted`
+    /// metadata marker. Without defense-in-depth, the wrapper would
+    /// serve raw ciphertext as plaintext. The magic-sniff on the
+    /// stream's first emission catches it and errors instead.
+    #[tokio::test]
+    async fn test_stripped_xattr_with_dge1_body_refuses_to_serve() {
+        let key = test_key();
+        let plaintext: Vec<u8> = (0..4096u32).map(|i| i as u8).collect();
+        let (ciphertext, _iv, _final) = encode_chunked(&key, &plaintext);
+
+        // Metadata says plaintext (no encryption marker) — simulates
+        // the post-xattr-strip state.
+        let meta = FileMetadata::fallback(
+            "test.bin".into(),
+            plaintext.len() as u64,
+            "md5".into(),
+            Utc::now(),
+            None,
+            crate::types::StorageInfo::Passthrough,
+        );
+
+        let mut backend = CountingBackend::new();
+        backend.set_contents(ciphertext, meta);
+
+        let enc_config = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig { key: None })));
+        let wrapper = EncryptingBackend::new(backend, enc_config);
+
+        let stream = wrapper
+            .get_passthrough_stream("b", "p", "test.bin")
+            .await
+            .expect("stream open should succeed — the error surfaces on first pull");
+
+        use futures::TryStreamExt;
+        let res: Result<Vec<Bytes>, _> = stream.try_collect().await;
+        let err = res.expect_err(
+            "stream must error when body begins with DGE1 but metadata has no marker — \
+             otherwise we'd serve ciphertext as plaintext after an xattr strip",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("xattrs") || msg.contains("dg-encrypted"),
+            "error must explain the xattr-strip scenario, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_range_read_last_bytes_of_large_object_bounded_fetch() {
+        // The scenario that motivates B3: "last 100 bytes of a large
+        // object" must NOT pull the whole file. Here large=64×64KiB=4
+        // MiB; the principle is identical for 10 GiB.
+        let key = test_key();
+        let plaintext_size = 64 * CHUNK_PLAINTEXT_SIZE;
+        let (wrapper, plaintext) = setup_wrapper_with_chunked_object(key, plaintext_size).await;
+
+        let start = (plaintext_size - 100) as u64;
+        let end = (plaintext_size - 1) as u64;
+        let (stream, content_length) = wrapper
+            .get_passthrough_stream_range("b", "p", "test.bin", start, end)
+            .await
+            .unwrap();
+        assert_eq!(content_length, 100);
+
+        use futures::TryStreamExt;
+        let got: Vec<Bytes> = stream.try_collect().await.unwrap();
+        let got: Vec<u8> = got.into_iter().flatten().collect();
+        assert_eq!(got, &plaintext[start as usize..=end as usize]);
+
+        let ranges = wrapper.inner.ranges_requested.lock().unwrap().clone();
+        assert_eq!(ranges.len(), 2, "expected header + body = 2 requests");
+        let body_start = ranges[1].0;
+        let last_chunk = final_chunk_index_for_plaintext_size(plaintext_size as u64);
+        let expected = wire_offset_of_chunk(last_chunk);
+        assert_eq!(
+            body_start, expected,
+            "must seek to the last chunk's boundary, not file start. \
+             expected {}, got {}",
+            expected, body_start
+        );
     }
 }

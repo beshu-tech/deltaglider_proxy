@@ -101,11 +101,15 @@ Reads succeed for classes 1 + 3. Class 2 fails opaquely. There is no built-in wa
 
 One key encrypts all buckets, all prefixes, all object classes. Per-bucket or per-prefix encryption policies are out of scope for this release (they depend on the multi-key tracking story above).
 
-### Passthrough memory bounds
+### Passthrough memory bounds — what the chunked format actually gives you
 
-Chunked encryption keeps the encode/decode path streaming. Peak in-flight memory is ~130 KiB (one plaintext + one ciphertext chunk). This is independent of object size — a 10 GiB passthrough upload does not buffer 10 GiB.
+Encrypted GET (downloads) is genuinely streaming: the decoder holds ~130 KiB in-flight regardless of object size. Range GETs fetch only the target chunks plus a 16-byte header probe — reading the last 100 bytes of a large object is O(1) network traffic, not O(object size).
 
-Deltas and references still buffer (xdelta3 is a batch algorithm, bounded by `DGP_MAX_OBJECT_SIZE`, default 100 MiB).
+Encrypted PUT (uploads) is **not** streaming end-to-end in this release. The wrapper accumulates every encrypted frame into a `Vec<Bytes>` before handing it to the inner backend's chunked write. Peak write memory ≈ ciphertext size ≈ plaintext size + 0.03% framing overhead. Combined with the multipart handler buffering all parts in memory, a 100 MiB encrypted upload peaks around 200–300 MiB of RSS.
+
+The proxy rejects passthrough objects larger than `max_object_size` (default 100 MiB) up front — so you can't accidentally OOM on a multi-GiB encrypted upload without explicitly raising that ceiling. If you raise it, plan for the memory.
+
+Deltas and references use the single-shot `aes-256-gcm-v1` format (no framing), also bounded by `max_object_size`.
 
 ## Related
 

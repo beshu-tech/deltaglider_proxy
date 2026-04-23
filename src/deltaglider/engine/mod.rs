@@ -276,13 +276,32 @@ impl DynEngine {
             )?)
         };
 
-        // Wrap with encryption layer if an encryption key is configured
-        let storage: Box<dyn StorageBackend> = if let Some(ref hex_key) = config.encryption_key {
-            let key = crate::storage::EncryptionKey::from_hex(hex_key)
-                .map_err(StorageError::Encryption)?;
-            let enc_config = Arc::new(ArcSwap::new(Arc::new(crate::storage::EncryptionConfig {
-                key: Some(key),
-            })));
+        // ALWAYS wrap with EncryptingBackend, whether or not a key is
+        // configured. The wrapper's read path checks the `dg-encrypted`
+        // metadata marker and, when set, either decrypts (if a key is
+        // configured) or returns a hard error ("object is encrypted but
+        // no key is configured"). Without this wrapper, an operator who
+        // disables encryption would cause ALL reads of previously-
+        // encrypted objects to silently return raw ciphertext as
+        // plaintext — the file body starts with "DGE1" magic bytes
+        // followed by binary garbage, the marker is still in the xattr,
+        // but nothing checks the marker because the unwrapped backend
+        // streams bytes verbatim.
+        //
+        // When no key is configured, writes are a no-op passthrough
+        // (encrypt_if_enabled returns `data.to_vec()` without marking
+        // the metadata). Overhead is one HashMap lookup on the
+        // encryption marker per read/write — negligible.
+        let enc_config = Arc::new(ArcSwap::new(Arc::new(crate::storage::EncryptionConfig {
+            key: match config.encryption_key.as_ref() {
+                Some(hex_key) => Some(
+                    crate::storage::EncryptionKey::from_hex(hex_key)
+                        .map_err(StorageError::Encryption)?,
+                ),
+                None => None,
+            },
+        })));
+        if config.encryption_key.is_some() {
             tracing::info!("Encryption at rest: ENABLED (AES-256-GCM)");
             // If the key came from config FILE (not env), nudge the
             // operator to keep an off-box copy. Losing an encrypted
@@ -299,10 +318,9 @@ impl DynEngine {
                      lost, all encrypted objects become unrecoverable."
                 );
             }
-            Box::new(crate::storage::EncryptingBackend::new(storage, enc_config))
-        } else {
-            storage
-        };
+        }
+        let storage: Box<dyn StorageBackend> =
+            Box::new(crate::storage::EncryptingBackend::new(storage, enc_config));
 
         Ok(Self::new_with_backend(Arc::new(storage), config, metrics))
     }

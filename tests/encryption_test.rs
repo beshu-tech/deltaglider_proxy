@@ -163,6 +163,119 @@ async fn test_data_encrypted_on_disk() {
 // Backward compatibility: unencrypted objects still readable
 // ═══════════════════════════════════════════════════
 
+/// B1 regression: the encryption wrapper must always be in the storage
+/// stack, even when no key is configured. Without this, an operator who
+/// removes the key (or forgets to set the env var after a restart) would
+/// get historical encrypted-on-disk bytes streamed to clients AS IF they
+/// were plaintext — a silent data-corruption bug that looks like
+/// "DGE1...random bytes..." on the client side with no error.
+///
+/// The fix is in `src/deltaglider/engine/mod.rs`: the EncryptingBackend
+/// is always wrapped, and when the key is None its read path returns
+/// `StorageError::Encryption("object is encrypted but no key is
+/// configured")` on any object whose metadata carries the
+/// `dg-encrypted` marker. The S3 handler surfaces that as 500 — the
+/// client never sees raw ciphertext.
+#[tokio::test]
+async fn test_disable_key_then_read_encrypted_object_errors_not_corrupts() {
+    let mut server = encrypted_builder().build().await;
+
+    // Write two objects while encryption is ENABLED:
+    //   - a single-shot encrypted one (small object → put_passthrough)
+    //   - a chunked-encrypted one (multipart → put_passthrough_chunked)
+    let small_plaintext = b"classified single-shot payload";
+    put_object(&server, "secret-small.txt", small_plaintext).await;
+
+    let big_plaintext: Vec<u8> = (0..200_000u32).map(|i| (i & 0xff) as u8).collect();
+    let parts = vec![
+        big_plaintext[..100_000].to_vec(),
+        big_plaintext[100_000..].to_vec(),
+    ];
+    multipart_put(&server, "secret-big.bin", &parts).await;
+
+    // Sanity: the encrypted-read path works right now.
+    assert_eq!(
+        get_object(&server, "secret-small.txt").await,
+        small_plaintext
+    );
+    assert_eq!(get_object(&server, "secret-big.bin").await, big_plaintext);
+
+    // Act: restart the proxy against the SAME data dir WITHOUT the key.
+    // Simulates the operator who disables encryption (or loses the key
+    // through a deploy mistake) with historical encrypted objects
+    // still on disk.
+    server.respawn_without_encryption_key().await;
+
+    // Assert: both reads must FAIL. Specifically, they must NOT return
+    // raw ciphertext — that's the silent-corruption mode the fix
+    // exists to prevent.
+    let client = server.s3_client().await;
+
+    let small_resp = client
+        .get_object()
+        .bucket(BUCKET)
+        .key("secret-small.txt")
+        .send()
+        .await;
+    // Two acceptable outcomes: SDK surfaces the 500 as an error, OR the
+    // server closes the stream mid-body. The unacceptable outcome is a
+    // clean 200 with ciphertext bytes in the body.
+    match small_resp {
+        Err(_) => { /* expected */ }
+        Ok(resp) => {
+            let body_result = resp.body.collect().await;
+            match body_result {
+                Err(_) => { /* expected */ }
+                Ok(agg) => {
+                    let body = agg.to_vec();
+                    assert_ne!(
+                        body, small_plaintext,
+                        "SILENT CORRUPTION: encrypted object without key returned PLAINTEXT — \
+                         wrapper is not in the stack on disable"
+                    );
+                    // Also check we didn't just serve raw ciphertext
+                    // (which would look like garbage but still be a
+                    // successful 200). A successful body of any shape
+                    // here is a bug.
+                    panic!(
+                        "expected error, got {} bytes of body (first 16: {:02x?}) \
+                         — disable path must hard-fail reads of historical \
+                         encrypted objects, not serve ciphertext",
+                        body.len(),
+                        &body.iter().take(16).copied().collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+    }
+
+    let big_resp = client
+        .get_object()
+        .bucket(BUCKET)
+        .key("secret-big.bin")
+        .send()
+        .await;
+    match big_resp {
+        Err(_) => { /* expected */ }
+        Ok(resp) => {
+            let body_result = resp.body.collect().await;
+            match body_result {
+                Err(_) => { /* expected */ }
+                Ok(agg) => {
+                    let body = agg.to_vec();
+                    assert_ne!(body, big_plaintext, "SILENT CORRUPTION on chunked path");
+                    panic!(
+                        "chunked-encrypted object without key returned {} bytes \
+                         (first 8: {:02x?}) — must hard-fail, not stream ciphertext",
+                        body.len(),
+                        &body.iter().take(8).copied().collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_unencrypted_still_readable() {
     // Start WITHOUT encryption, write an object
@@ -515,6 +628,135 @@ async fn test_chunked_truncation_detected() {
 // Admin API: malformed encryption_key must be rejected at the section
 // level BEFORE it gets written to the config file.
 // ═══════════════════════════════════════════════════
+
+/// B2 regression: the admin-UI "Disable encryption" button sends
+/// `{"encryption_key": null}`. RFC 7396 merge-patch collapses that to
+/// "field absent" in the merged target, which deserializes to None in
+/// the flat Config. Without explicit-null detection, the preservation
+/// guard ("if incoming is None, preserve old value") misfires and
+/// restores the old key — turning the disable button into a silent
+/// no-op. The fix inspects the RAW body for an explicit `null` to
+/// distinguish "don't change" (field absent) from "explicitly clear"
+/// (field present and null).
+#[tokio::test]
+async fn test_section_put_explicit_null_disables_encryption() {
+    let server = encrypted_builder().build().await;
+    let http = common::admin_http_client(&server.endpoint()).await;
+
+    // Precondition: encryption is currently ON. The field_level GET
+    // carries `encryption_enabled: true` which the UI trusts for
+    // status display.
+    let cfg_before: serde_json::Value = http
+        .get(format!("{}/_/api/admin/config", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        cfg_before
+            .get("encryption_enabled")
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "precondition: encryption must be enabled before the disable test"
+    );
+
+    // Act: POST the exact body the EncryptionPanel's startDisable flow
+    // sends — `{"encryption_key": null}`. Note that this is distinct
+    // from `{}` (which is "no change") even though both would
+    // deserialize to `encryption_key = None` naïvely.
+    let resp = http
+        .put(format!(
+            "{}/_/api/admin/config/section/advanced",
+            server.endpoint()
+        ))
+        .json(&serde_json::json!({ "encryption_key": null }))
+        .send()
+        .await
+        .expect("disable PUT");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("JSON body");
+    assert!(
+        status.is_success(),
+        "disable PUT should succeed, got {} body {}",
+        status,
+        body
+    );
+
+    // Assert: encryption is now OFF. The field_level GET's
+    // encryption_enabled boolean is the authoritative runtime
+    // indicator — it's derived from the engine's live config, so it
+    // only flips if the hot-reload actually swapped the key out.
+    let cfg_after: serde_json::Value = http
+        .get(format!("{}/_/api/admin/config", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        cfg_after
+            .get("encryption_enabled")
+            .and_then(|v| v.as_bool()),
+        Some(false),
+        "explicit null MUST disable encryption — if this assertion \
+         fires the preservation guard is still restoring the old key. \
+         Full config: {cfg_after:#}"
+    );
+}
+
+/// B2 companion: omitting the `encryption_key` field entirely (as
+/// happens during a GET → edit-unrelated-field → PUT round-trip) must
+/// PRESERVE the existing key, not clear it. Counterpoint to the
+/// explicit-null disable test — the three-state logic has to get both
+/// cases right.
+#[tokio::test]
+async fn test_section_put_absent_field_preserves_encryption_key() {
+    let server = encrypted_builder().build().await;
+    let http = common::admin_http_client(&server.endpoint()).await;
+
+    // Send an `advanced`-section PUT with NO encryption_key field at
+    // all. Edit an unrelated field (`max_delta_ratio`) so the diff
+    // isn't empty — that mirrors the operator workflow "touch a knob
+    // somewhere else in Advanced, Apply" without realizing there's an
+    // encryption_key on the server.
+    let resp = http
+        .put(format!(
+            "{}/_/api/admin/config/section/advanced",
+            server.endpoint()
+        ))
+        .json(&serde_json::json!({ "max_delta_ratio": 0.6 }))
+        .send()
+        .await
+        .expect("absent-field PUT");
+    assert!(
+        resp.status().is_success(),
+        "absent-field PUT should succeed, got {}",
+        resp.status()
+    );
+
+    // Assert: encryption is STILL on. Absent != null; the preservation
+    // guard must still fire for this shape.
+    let cfg_after: serde_json::Value = http
+        .get(format!("{}/_/api/admin/config", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        cfg_after
+            .get("encryption_enabled")
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "absent encryption_key field MUST preserve existing key — \
+         otherwise every unrelated Advanced edit silently kills \
+         encryption. Full config: {cfg_after:#}"
+    );
+}
 
 /// A PUT to /api/admin/config/section/advanced with a malformed
 /// encryption_key must return 4xx with a clear error. Without this
