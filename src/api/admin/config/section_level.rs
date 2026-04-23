@@ -397,6 +397,40 @@ async fn apply_section(
         }
     }
 
+    // Step 6: per-backend encryption key preservation. Three-state
+    // semantics PER FIELD PER ENTRY:
+    //   * key field absent in body  → preserve old key (default
+    //     GET→edit→PUT round-trip safety).
+    //   * key field present and null → explicit clear (operator
+    //     clicked "Disable encryption" on this backend).
+    //   * key field present and string → validate hex + rotate.
+    //
+    // Same three-state logic applies to `legacy_key` on each mode.
+    //
+    // We walk the RAW body JSON to distinguish absent from null;
+    // after merge-patch the two both deserialise to None. The
+    // sectioned body shape places this at
+    // `storage.backend_encryption.key` and
+    // `storage.backends[i].encryption.key` (matched by backend
+    // name, not by list index — operators may reorder the list).
+    let body_probe = BackendEncryptionKeyProbe::from_section(section, &body);
+    preserve_backend_encryption_secrets(
+        "default",
+        &mut new_cfg.backend_encryption,
+        &old_cfg.backend_encryption,
+        body_probe.for_singleton(),
+    );
+    for new_named in &mut new_cfg.backends {
+        if let Some(old_named) = old_cfg.backends.iter().find(|n| n.name == new_named.name) {
+            preserve_backend_encryption_secrets(
+                &new_named.name,
+                &mut new_named.encryption,
+                &old_named.encryption,
+                body_probe.for_named(&new_named.name),
+            );
+        }
+    }
+
     // R1: warn about named backends the operator's body dropped.
     // `preserve_backend_secrets` only runs on backends present in
     // `new_cfg.backends` — a backend that disappeared takes its
@@ -735,20 +769,13 @@ fn apply_merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) 
 /// compare equal (same fingerprint); rotations show a readable
 /// swap (`fp:abc12345…` → `fp:def67890…`) without leaking material.
 ///
-/// Used for `encryption_key` specifically. The SigV4 pair and backend
-/// creds are handled by `redact_all_secrets`, which nulls them — they
-/// don't rotate through this endpoint (SigV4 has its own preservation
-/// logic, backend creds are per-item).
+/// Used for per-backend encryption `key` and `legacy_key` on the
+/// storage section diff (see `inject_encryption_fingerprints`). The
+/// SigV4 pair and backend creds are handled by `redact_all_secrets`
+/// which nulls them — they don't rotate through this endpoint.
 ///
 /// 8-hex-char truncation is enough to distinguish rotations
 /// practically; the full SHA-256 is needlessly long in the UI.
-///
-/// STEP-1: temporarily unused since `encryption_key` has been removed
-/// from the flat `Config`. Step 6 rewires this to walk per-backend
-/// rotations (`storage.backends[i].encryption.key`,
-/// `storage.backend_encryption.key`). Keeping the helper here avoids
-/// a delete-and-resurrect churn in the upcoming commit.
-#[allow(dead_code)]
 fn fingerprint_secret(plaintext: Option<&str>) -> Option<String> {
     plaintext.map(|pt| {
         use sha2::{Digest, Sha256};
@@ -770,27 +797,22 @@ fn compute_section_diff(
     // either compare-equal (preserved) or both appear as the same
     // redaction placeholder.
     //
-    // Rotatable secrets (encryption_key) need special handling:
-    // `redact_all_secrets` nulls BOTH sides, which hides real
-    // rotations from the diff view. Fingerprint them instead —
-    // each plaintext maps to a deterministic-but-non-reversible
-    // placeholder, so unchanged keys compare equal and rotations
-    // surface a readable `"fp:abc123… → fp:def456…"` swap without
-    // leaking material.
+    // Per-backend encryption keys (primary + legacy shim) need
+    // special handling: `redact_all_secrets` nulls them on BOTH
+    // sides, which hides real rotations. We fingerprint them
+    // instead — each plaintext maps to a deterministic-but-non-
+    // reversible `fp:xxxxxxxx` placeholder so:
+    //   * unchanged keys compare equal (no spurious diff).
+    //   * rotations surface as a readable `fp:a→fp:b` swap.
+    //   * neither side leaks key material (one-way hash truncated
+    //     to 8 hex chars, matching the pre-refactor behaviour).
     let old_redacted = old_cfg.redact_all_secrets();
     let new_redacted = new_cfg.redact_all_secrets();
-    // STEP-1: the fingerprint-restoration that made key rotations
-    // visible in the diff used to target `advanced.encryption_key`.
-    // That field no longer exists. Per-backend rotation fingerprints
-    // move to Step 6, driven by a per-backend walker over
-    // `storage.backends[i].encryption` and `storage.backend_encryption`.
-    // Until then, rotations surface only as non-redacted-field
-    // changes (mode, key_id, kms_key_id) — which is fine for Step 1
-    // because the UI still uses the pre-refactor EncryptionPanel.
+
     let old_sectioned = SectionedConfig::from_flat(&old_redacted);
     let new_sectioned = SectionedConfig::from_flat(&new_redacted);
 
-    let (old_json, new_json) = match section {
+    let (mut old_json, mut new_json) = match section {
         SectionName::Admission => (
             serde_json::to_value(old_sectioned.admission.unwrap_or_default()).unwrap_or_default(),
             serde_json::to_value(new_sectioned.admission.unwrap_or_default()).unwrap_or_default(),
@@ -809,6 +831,21 @@ fn compute_section_diff(
         ),
     };
 
+    // Storage section gets the per-backend encryption fingerprint
+    // injection. Other sections have no encryption fields.
+    if matches!(section, SectionName::Storage) {
+        inject_encryption_fingerprints(
+            &mut old_json,
+            &old_cfg.backend_encryption,
+            &old_cfg.backends,
+        );
+        inject_encryption_fingerprints(
+            &mut new_json,
+            &new_cfg.backend_encryption,
+            &new_cfg.backends,
+        );
+    }
+
     let mut diff = serde_json::Map::new();
     shallow_diff("", &old_json, &new_json, &mut diff);
 
@@ -818,6 +855,69 @@ fn compute_section_diff(
         serde_json::Value::Object(diff),
     );
     serde_json::Value::Object(out)
+}
+
+/// Replace the nulled-by-redaction `key` / `legacy_key` fields in a
+/// `storage`-section JSON value with fingerprints derived from the
+/// real keys on the Config. Preserves the non-secret id fields
+/// (key_id, kms_key_id) as-is.
+fn inject_encryption_fingerprints(
+    storage_json: &mut serde_json::Value,
+    singleton_enc: &crate::config::BackendEncryptionConfig,
+    named_backends: &[crate::config::NamedBackendConfig],
+) {
+    let obj = match storage_json.as_object_mut() {
+        Some(m) => m,
+        None => return,
+    };
+    // Singleton.
+    if let Some(be) = obj.get_mut("backend_encryption") {
+        apply_fingerprints_to_enc_json(be, singleton_enc);
+    }
+    // List.
+    if let Some(arr) = obj.get_mut("backends").and_then(|v| v.as_array_mut()) {
+        for entry in arr {
+            let name = entry
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if let Some(n) = name {
+                if let Some(enc_json) = entry.get_mut("encryption") {
+                    if let Some(named) = named_backends.iter().find(|nb| nb.name == n) {
+                        apply_fingerprints_to_enc_json(enc_json, &named.encryption);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Overwrite `key` / `legacy_key` fields on a single encryption JSON
+/// object with fingerprints derived from the source config variant.
+/// No-op when the source config has no key material (fingerprint
+/// stays as the redacted null).
+fn apply_fingerprints_to_enc_json(
+    enc_json: &mut serde_json::Value,
+    enc: &crate::config::BackendEncryptionConfig,
+) {
+    use crate::config::BackendEncryptionConfig as E;
+    let obj = match enc_json.as_object_mut() {
+        Some(m) => m,
+        None => return,
+    };
+    let (primary, legacy): (Option<&str>, Option<&str>) = match enc {
+        E::None => (None, None),
+        E::Aes256GcmProxy {
+            key, legacy_key, ..
+        } => (key.as_deref(), legacy_key.as_deref()),
+        E::SseKms { legacy_key, .. } | E::SseS3 { legacy_key, .. } => (None, legacy_key.as_deref()),
+    };
+    if let Some(fp) = fingerprint_secret(primary) {
+        obj.insert("key".to_string(), serde_json::Value::String(fp));
+    }
+    if let Some(fp) = fingerprint_secret(legacy) {
+        obj.insert("legacy_key".to_string(), serde_json::Value::String(fp));
+    }
 }
 
 /// Preserve backend creds across a section round-trip.
@@ -854,6 +954,162 @@ fn preserve_backend_secrets(
             *new_sk = old_sk.clone();
         }
     }
+}
+
+/// What the operator said about each encryption key field for one
+/// backend. Derived from the raw PUT body's JSON shape so the
+/// merge-patch "absent vs null" distinction survives into the
+/// preservation pass.
+///
+/// Both flags are independent — a PATCH that sets `key: null` and
+/// leaves `legacy_key` absent clears the primary but preserves the
+/// old shim. Vice versa for restoring a shim without rotating the
+/// primary.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct BackendKeyPresence {
+    pub key_is_explicit_null: bool,
+    pub legacy_key_is_explicit_null: bool,
+}
+
+/// Inspects a section-PUT body and reports, per backend-encryption
+/// entry, whether each of `key` / `legacy_key` is present-as-null in
+/// the raw JSON. After merge-patch these both collapse to None on
+/// the flat `Config`; the probe recovers the distinction so
+/// preservation can correctly distinguish "preserve" from
+/// "explicitly clear".
+pub(crate) struct BackendEncryptionKeyProbe<'a> {
+    singleton: BackendKeyPresence,
+    /// Per-backend-name probe results. `HashMap` keyed by backend
+    /// name — matches the way preserve_backend_encryption_secrets
+    /// walks the list.
+    named: std::collections::HashMap<String, BackendKeyPresence>,
+    _phantom: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> BackendEncryptionKeyProbe<'a> {
+    /// Probe the raw section body. Only the `Storage` section carries
+    /// encryption fields; others return empty probes (no-op preservation
+    /// rules).
+    pub(crate) fn from_section(section: SectionName, body: &'a serde_json::Value) -> Self {
+        let mut singleton = BackendKeyPresence::default();
+        let mut named: std::collections::HashMap<String, BackendKeyPresence> =
+            std::collections::HashMap::new();
+        if matches!(section, SectionName::Storage) {
+            if let Some(obj) = body.as_object() {
+                // Singleton: storage.backend_encryption
+                if let Some(be) = obj.get("backend_encryption") {
+                    singleton = probe_enc_body(be);
+                }
+                // List: storage.backends[] — each with a `name` and
+                // optional `encryption` object.
+                if let Some(arr) = obj.get("backends").and_then(|v| v.as_array()) {
+                    for entry in arr {
+                        if let Some(name) = entry
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                        {
+                            if let Some(enc) = entry.get("encryption") {
+                                named.insert(name, probe_enc_body(enc));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Self {
+            singleton,
+            named,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    pub(crate) fn for_singleton(&self) -> BackendKeyPresence {
+        self.singleton
+    }
+
+    pub(crate) fn for_named(&self, name: &str) -> BackendKeyPresence {
+        self.named.get(name).copied().unwrap_or_default()
+    }
+}
+
+/// Probe a single `encryption: {...}` object for explicit-null key
+/// fields. Missing object → both flags false (preservation default).
+fn probe_enc_body(enc: &serde_json::Value) -> BackendKeyPresence {
+    let obj = match enc.as_object() {
+        Some(m) => m,
+        None => return BackendKeyPresence::default(),
+    };
+    BackendKeyPresence {
+        key_is_explicit_null: obj.get("key").map(|v| v.is_null()).unwrap_or(false),
+        legacy_key_is_explicit_null: obj.get("legacy_key").map(|v| v.is_null()).unwrap_or(false),
+    }
+}
+
+/// Preserve encryption key material on a single backend entry
+/// across a section PUT.
+///
+/// Semantics for each of `key` / `legacy_key`:
+///   * body absent, new==None → restore from old (preserve).
+///   * body null, new==None → leave None (explicit clear).
+///   * new==Some → operator rotated; validate hex, keep as-is.
+///
+/// No-op on variants that don't carry the field (e.g. SseS3 has no
+/// primary `key`).
+fn preserve_backend_encryption_secrets(
+    backend_name: &str,
+    new: &mut crate::config::BackendEncryptionConfig,
+    old: &crate::config::BackendEncryptionConfig,
+    probe: BackendKeyPresence,
+) {
+    use crate::config::BackendEncryptionConfig as E;
+    // Primary key preservation — only relevant on Aes256GcmProxy.
+    if let E::Aes256GcmProxy {
+        key: ref mut new_key,
+        ..
+    } = new
+    {
+        if new_key.is_none() && !probe.key_is_explicit_null {
+            if let E::Aes256GcmProxy {
+                key: Some(ref old_key),
+                ..
+            } = old
+            {
+                *new_key = Some(old_key.clone());
+            }
+        }
+    }
+    // Legacy shim key preservation — relevant on all three non-None
+    // variants. We fetch the old legacy_key by pattern matching on
+    // whichever variant the old config had.
+    let old_legacy: Option<String> = match old {
+        E::Aes256GcmProxy { legacy_key, .. }
+        | E::SseKms { legacy_key, .. }
+        | E::SseS3 { legacy_key, .. } => legacy_key.clone(),
+        E::None => None,
+    };
+    let new_legacy: Option<&mut Option<String>> = match new {
+        E::Aes256GcmProxy {
+            ref mut legacy_key, ..
+        }
+        | E::SseKms {
+            ref mut legacy_key, ..
+        }
+        | E::SseS3 {
+            ref mut legacy_key, ..
+        } => Some(legacy_key),
+        E::None => None,
+    };
+    if let Some(lk) = new_legacy {
+        if lk.is_none() && !probe.legacy_key_is_explicit_null {
+            *lk = old_legacy;
+        }
+    }
+    // Backend_name is currently unused in this helper but is a stable
+    // signature point for future extensions (per-backend warning
+    // text, metrics, etc.). `#[allow(unused_variables)]` would be
+    // louder than just touching it.
+    let _ = backend_name;
 }
 
 /// Non-mutating predicate: would applying `new` on top of `old` require

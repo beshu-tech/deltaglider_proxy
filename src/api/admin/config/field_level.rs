@@ -89,6 +89,113 @@ pub struct ConfigResponse {
     encryption_enabled: bool,
 }
 
+/// Per-backend encryption status summary. Exposed in
+/// `BackendInfoResponse.encryption` so admin UI can render the
+/// encryption badge per backend without peeking at secrets. Every
+/// field here is non-secret:
+///
+///   * `mode` — string tag (`none`/`aes256-gcm-proxy`/`sse-kms`/`sse-s3`).
+///   * `has_key` — does the backend carry key material? (For
+///     aes256-gcm-proxy: true when `key` is set. For native modes:
+///     true when AWS handles encryption — always true for sse-kms
+///     since `kms_key_id` is required; always true for sse-s3.)
+///   * `key_id` — non-secret id. For aes256-gcm-proxy this is the
+///     operator's explicit id or the derived SHA-256-based one.
+///   * `kms_key_id` — KMS ARN or alias. Non-secret; operators need
+///     to see WHICH KMS key a backend uses.
+///   * `shim_active` — decrypt-only shim flag. True when
+///     `legacy_key` is configured (the backend can still decrypt
+///     objects stamped with the pre-transition key).
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct BackendEncryptionSummary {
+    pub mode: String,
+    pub has_key: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kms_key_id: Option<String>,
+    pub shim_active: bool,
+}
+
+impl BackendEncryptionSummary {
+    /// Build a summary from a config variant + backend name.
+    /// Non-secret-only extraction — `key`/`legacy_key` are NOT
+    /// surfaced here. The backend name is needed to derive the
+    /// `key_id` when the operator left it implicit (same derivation
+    /// the engine wrapper uses: `SHA-256(name || 0x00 || key)`).
+    pub fn from_config(backend_name: &str, enc: &crate::config::BackendEncryptionConfig) -> Self {
+        use crate::config::BackendEncryptionConfig as E;
+        match enc {
+            E::None => Self {
+                mode: "none".into(),
+                has_key: false,
+                key_id: None,
+                kms_key_id: None,
+                shim_active: false,
+            },
+            E::Aes256GcmProxy {
+                key,
+                key_id,
+                legacy_key,
+                ..
+            } => {
+                // Surface the same id the engine stamps on written
+                // objects. Explicit wins; otherwise derive from the
+                // name + key (same logic as the engine's
+                // `derive_key_id`).
+                let resolved_kid: Option<String> = match key_id {
+                    Some(explicit) => Some(explicit.clone()),
+                    None => key
+                        .as_deref()
+                        .and_then(|hex| derive_key_id_for_summary(backend_name, hex)),
+                };
+                Self {
+                    mode: "aes256-gcm-proxy".into(),
+                    has_key: key.is_some(),
+                    key_id: resolved_kid,
+                    kms_key_id: None,
+                    shim_active: legacy_key.is_some(),
+                }
+            }
+            E::SseKms {
+                kms_key_id,
+                legacy_key,
+                ..
+            } => Self {
+                mode: "sse-kms".into(),
+                has_key: true,
+                key_id: None,
+                kms_key_id: Some(kms_key_id.clone()),
+                shim_active: legacy_key.is_some(),
+            },
+            E::SseS3 { legacy_key, .. } => Self {
+                mode: "sse-s3".into(),
+                has_key: true,
+                key_id: None,
+                kms_key_id: None,
+                shim_active: legacy_key.is_some(),
+            },
+        }
+    }
+}
+
+/// Mirror of the engine's `derive_key_id` for the summary path.
+/// Decodes hex → 32 bytes, then SHA-256(name ‖ 0x00 ‖ key) truncated
+/// to 16 hex chars. Returns None on malformed hex (the engine would
+/// reject that at startup; the summary just elides the id).
+fn derive_key_id_for_summary(backend_name: &str, hex_key: &str) -> Option<String> {
+    use sha2::Digest;
+    let bytes = hex::decode(hex_key).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(backend_name.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(&bytes);
+    Some(hex::encode(&hasher.finalize()[..8]))
+}
+
 /// Sanitized backend info (no secrets) for the admin API.
 #[derive(Serialize, Clone)]
 pub struct BackendInfoResponse {
@@ -99,10 +206,13 @@ pub struct BackendInfoResponse {
     pub region: Option<String>,
     pub force_path_style: Option<bool>,
     pub has_credentials: bool,
+    /// Per-backend encryption status. Step 6.
+    pub encryption: BackendEncryptionSummary,
 }
 
 impl From<&crate::config::NamedBackendConfig> for BackendInfoResponse {
     fn from(named: &crate::config::NamedBackendConfig) -> Self {
+        let encryption = BackendEncryptionSummary::from_config(&named.name, &named.encryption);
         match &named.backend {
             crate::config::BackendConfig::Filesystem { path } => Self {
                 name: named.name.clone(),
@@ -112,6 +222,7 @@ impl From<&crate::config::NamedBackendConfig> for BackendInfoResponse {
                 region: None,
                 force_path_style: None,
                 has_credentials: false,
+                encryption,
             },
             crate::config::BackendConfig::S3 {
                 endpoint,
@@ -127,6 +238,7 @@ impl From<&crate::config::NamedBackendConfig> for BackendInfoResponse {
                 region: Some(region.clone()),
                 force_path_style: Some(*force_path_style),
                 has_credentials: access_key_id.is_some(),
+                encryption,
             },
         }
     }
@@ -344,8 +456,25 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
 
     let tainted_fields = compute_tainted_fields(&cfg);
 
-    let backends_info: Vec<BackendInfoResponse> =
-        cfg.backends.iter().map(BackendInfoResponse::from).collect();
+    // Assemble the per-backend response list. When the operator is on
+    // the legacy singleton path (no `backends:` in YAML), synthesise
+    // a "default" entry that reflects `cfg.backend` + `cfg.backend_encryption`
+    // so the UI's per-backend rendering works uniformly across both
+    // configurations. Step 7 consumes this.
+    let backends_info: Vec<BackendInfoResponse> = if cfg.backends.is_empty() {
+        // Singleton path. Build a synthesised NamedBackendConfig so
+        // the `From<&NamedBackendConfig>` impl does the heavy lifting;
+        // this keeps the non-secret projection logic in ONE place.
+        vec![BackendInfoResponse::from(
+            &crate::config::NamedBackendConfig {
+                name: "default".into(),
+                backend: cfg.backend.clone(),
+                encryption: cfg.backend_encryption.clone(),
+            },
+        )]
+    } else {
+        cfg.backends.iter().map(BackendInfoResponse::from).collect()
+    };
 
     Json(ConfigResponse {
         listen_addr: cfg.listen_addr.to_string(),
