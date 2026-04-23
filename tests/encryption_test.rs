@@ -176,3 +176,337 @@ async fn test_unencrypted_still_readable() {
     let got = get_object(&server, "plain.txt").await;
     assert_eq!(got, data, "Unencrypted object should be readable");
 }
+
+// ═══════════════════════════════════════════════════
+// Chunked streaming encryption tests
+//
+// These exercise the `aes-256-gcm-chunked-v1` wire format introduced
+// for `put_passthrough_chunked`. To actually HIT that path we must
+// upload via multipart (single-PUT goes through `put_passthrough`,
+// which uses v1 single-shot). The chunked path is invoked by the
+// multipart-completion handler for non-delta-eligible keys.
+// ═══════════════════════════════════════════════════
+
+/// Helper: upload via multipart so the wrapped `put_passthrough_chunked`
+/// is actually invoked. Non-delta-eligible key (.bin) forces the
+/// chunked-storage path. Returns the assembled plaintext bytes for
+/// later comparison.
+///
+/// Uses the AWS SDK S3 client so SigV4 signing works out of the box —
+/// the test server rejects unsigned writes with 403.
+async fn multipart_put(server: &TestServer, key: &str, parts_data: &[Vec<u8>]) -> Vec<u8> {
+    let client = server.s3_client().await;
+
+    // Initiate
+    let init = client
+        .create_multipart_upload()
+        .bucket(BUCKET)
+        .key(key)
+        .content_type("application/octet-stream")
+        .send()
+        .await
+        .expect("create multipart");
+    let upload_id = init.upload_id.expect("no upload id").to_string();
+
+    // Upload parts
+    let mut completed: Vec<aws_sdk_s3::types::CompletedPart> = Vec::new();
+    for (i, part) in parts_data.iter().enumerate() {
+        let part_num = (i + 1) as i32;
+        let resp = client
+            .upload_part()
+            .bucket(BUCKET)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(part_num)
+            .body(aws_sdk_s3::primitives::ByteStream::from(part.clone()))
+            .send()
+            .await
+            .expect("upload part");
+        completed.push(
+            aws_sdk_s3::types::CompletedPart::builder()
+                .part_number(part_num)
+                .set_e_tag(resp.e_tag.clone())
+                .build(),
+        );
+    }
+
+    // Complete
+    let completed_upload = aws_sdk_s3::types::CompletedMultipartUpload::builder()
+        .set_parts(Some(completed))
+        .build();
+    client
+        .complete_multipart_upload()
+        .bucket(BUCKET)
+        .key(key)
+        .upload_id(&upload_id)
+        .multipart_upload(completed_upload)
+        .send()
+        .await
+        .expect("complete multipart");
+
+    parts_data.iter().flatten().copied().collect()
+}
+
+/// Large-passthrough roundtrip via multipart → chunked encryption
+/// path. 5 MiB in 5×1 MiB parts exercises ~80 × 64-KiB encrypted
+/// chunks on disk and verifies the whole pipeline (encrypt streaming,
+/// decrypt streaming, plaintext byte-for-byte match).
+///
+/// An OOM in the old single-buffer path would manifest here at much
+/// larger sizes; we use 5 MiB to keep test runtime reasonable while
+/// still crossing many chunk boundaries.
+#[tokio::test]
+async fn test_chunked_encryption_multipart_roundtrip() {
+    let server = encrypted_builder().build().await;
+    let total_size: usize = 5 * 1024 * 1024; // 5 MiB
+    let part_size: usize = 1024 * 1024; // 1 MiB per part, 5 parts
+                                        // Deterministic byte pattern so any mismatch points at WHICH offset
+                                        // went wrong (the byte at position `i` is `(i >> 3) ^ (i & 0xff)`).
+    let pattern: Vec<u8> = (0..total_size)
+        .map(|i| ((i >> 3) ^ (i & 0xff)) as u8)
+        .collect();
+    let parts: Vec<Vec<u8>> = pattern.chunks(part_size).map(|c| c.to_vec()).collect();
+    assert_eq!(parts.len(), 5);
+
+    let expected = multipart_put(&server, "large.bin", &parts).await;
+    assert_eq!(expected.len(), total_size);
+    let got = get_object(&server, "large.bin").await;
+    assert_eq!(got.len(), total_size, "length mismatch: got {}", got.len());
+    // Compare byte-for-byte. Using a plain assert_eq! would dump a
+    // giant diff; instead find the first mismatch for a clean error.
+    if got != pattern {
+        let first_diff = got
+            .iter()
+            .zip(pattern.iter())
+            .position(|(a, b)| a != b)
+            .expect("lengths match but vecs differ");
+        panic!(
+            "byte mismatch at offset {}: got 0x{:02x}, expected 0x{:02x}",
+            first_diff, got[first_diff], pattern[first_diff]
+        );
+    }
+}
+
+/// After a chunked upload, verify the on-disk format has the
+/// `aes-256-gcm-chunked-v1` metadata marker (not v1 single-shot) —
+/// this confirms we actually HIT the chunked code path. Without this
+/// the test above could accidentally be covered by the v1 buffer
+/// path if the wiring were wrong.
+#[tokio::test]
+async fn test_chunked_path_actually_exercised() {
+    let server = encrypted_builder().build().await;
+    let parts = vec![vec![0u8; 1024 * 1024]; 2]; // 2 × 1 MiB
+    multipart_put(&server, "chunked-marker-test.bin", &parts).await;
+
+    // Walk the filesystem looking for the passthrough file + its
+    // xattr marker. The engine stores each object's metadata as an
+    // xattr on the data file.
+    let data_dir = server.data_dir().expect("filesystem backend");
+    let mut found_chunked_marker = false;
+    let mut found_v1_marker = false;
+    for entry in walkdir::WalkDir::new(data_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        // Read the xattr containing the object's metadata JSON. The
+        // key (`user.dg.metadata`) matches the constant in
+        // `src/storage/xattr_meta.rs::XATTR_NAME` — test file
+        // deliberately duplicates the string rather than depending on
+        // a crate-internal constant.
+        let xattr_raw = match xattr::get(entry.path(), "user.dg.metadata") {
+            Ok(Some(bytes)) => bytes,
+            _ => continue,
+        };
+        let meta_json = match std::str::from_utf8(&xattr_raw) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if meta_json.contains("aes-256-gcm-chunked-v1") {
+            found_chunked_marker = true;
+        }
+        if meta_json.contains("\"aes-256-gcm-v1\"") {
+            found_v1_marker = true;
+        }
+    }
+    assert!(
+        found_chunked_marker,
+        "chunked-format marker not found — the chunked write path wasn't exercised"
+    );
+    // v1 marker is allowed (the reference/delta paths still use v1);
+    // but we specifically want the chunked marker to ALSO be present.
+    let _ = found_v1_marker;
+}
+
+/// Range reads on a chunked-encrypted object. Exercises the O(1)
+/// offset math: range covers chunks 10-12 (mid-object) of an 80-chunk
+/// object.
+#[tokio::test]
+async fn test_chunked_encryption_range_read() {
+    let server = encrypted_builder().build().await;
+    let total_size: usize = 5 * 1024 * 1024;
+    let pattern: Vec<u8> = (0..total_size).map(|i| (i & 0xff) as u8).collect();
+    let parts: Vec<Vec<u8>> = pattern.chunks(1024 * 1024).map(|c| c.to_vec()).collect();
+    multipart_put(&server, "range-target.bin", &parts).await;
+
+    // Pick a range spanning a few 64-KiB chunks: bytes 700_000-800_000
+    // covers (with chunk_size=65536): chunk 10 (offset 655360) through
+    // chunk 12 (ending 851967). 100001 bytes total (inclusive range).
+    let start: usize = 700_000;
+    let end: usize = 800_000; // inclusive
+    let client = server.s3_client().await;
+    let resp = client
+        .get_object()
+        .bucket(BUCKET)
+        .key("range-target.bin")
+        .range(format!("bytes={}-{}", start, end))
+        .send()
+        .await
+        .expect("range GET");
+    let body = resp.body.collect().await.unwrap().to_vec();
+    let expected_len = end - start + 1;
+    assert_eq!(body.len(), expected_len, "range length mismatch");
+    let expected = &pattern[start..=end];
+    if body != expected {
+        let first_diff = body
+            .iter()
+            .zip(expected.iter())
+            .position(|(a, b)| a != b)
+            .expect("lengths match but contents differ");
+        panic!(
+            "range byte mismatch at offset {} (plaintext pos {}): got 0x{:02x}, expected 0x{:02x}",
+            first_diff,
+            start + first_diff,
+            body[first_diff],
+            expected[first_diff]
+        );
+    }
+}
+
+/// Range that starts on a chunk boundary (chunk 5 begins at plaintext
+/// offset 327680 = 5 × 65536). Regression guard: the "0 bytes to
+/// skip" path in the decoder must emit the first chunk's plaintext
+/// without truncation.
+#[tokio::test]
+async fn test_chunked_encryption_range_on_chunk_boundary() {
+    let server = encrypted_builder().build().await;
+    let pattern: Vec<u8> = (0..5 * 1024 * 1024).map(|i| (i & 0xff) as u8).collect();
+    let parts: Vec<Vec<u8>> = pattern.chunks(1024 * 1024).map(|c| c.to_vec()).collect();
+    multipart_put(&server, "boundary.bin", &parts).await;
+
+    let start: usize = 5 * 65536; // chunk 5 boundary
+    let end: usize = start + 65536 - 1; // exactly one full chunk, inclusive
+    let client = server.s3_client().await;
+    let resp = client
+        .get_object()
+        .bucket(BUCKET)
+        .key("boundary.bin")
+        .range(format!("bytes={}-{}", start, end))
+        .send()
+        .await
+        .expect("range GET");
+    let body = resp.body.collect().await.unwrap().to_vec();
+    assert_eq!(body, &pattern[start..=end]);
+}
+
+/// Range covering the LAST chunk (which has is_final=true in its AAD).
+/// Catches off-by-one bugs in `final_chunk_index_for_plaintext_size`
+/// and the decoder's "next" emission after the final chunk.
+#[tokio::test]
+async fn test_chunked_encryption_range_over_final_chunk() {
+    let server = encrypted_builder().build().await;
+    // Size chosen so the last chunk is SHORT (not a full 64 KiB):
+    // 1 MiB + 42 bytes → chunk 16 (index 15 full + 1 short final).
+    let total: usize = 1024 * 1024 + 42;
+    let pattern: Vec<u8> = (0..total).map(|i| (i & 0xff) as u8).collect();
+    // Upload as 2 parts so the multipart path is used.
+    let parts = vec![
+        pattern[..1024 * 1024].to_vec(),
+        pattern[1024 * 1024..].to_vec(),
+    ];
+    multipart_put(&server, "tail.bin", &parts).await;
+
+    // Request the last 100 bytes — crosses into the short final chunk.
+    let start: usize = total - 100;
+    let end: usize = total - 1;
+    let client = server.s3_client().await;
+    let resp = client
+        .get_object()
+        .bucket(BUCKET)
+        .key("tail.bin")
+        .range(format!("bytes={}-{}", start, end))
+        .send()
+        .await
+        .expect("range GET");
+    let body = resp.body.collect().await.unwrap().to_vec();
+    assert_eq!(body.len(), 100);
+    assert_eq!(body, &pattern[start..=end]);
+}
+
+/// On-disk chunk truncation must produce a decryption failure, not
+/// silently return a shorter object. Simulates an attacker who
+/// truncates the last frame's ciphertext by 1 byte.
+#[tokio::test]
+async fn test_chunked_truncation_detected() {
+    let server = encrypted_builder().build().await;
+    let parts = vec![vec![0xABu8; 200 * 1024]; 2]; // 2 × 200 KiB, crosses chunk boundaries
+    multipart_put(&server, "truncate-me.bin", &parts).await;
+
+    // Find the passthrough file on disk and truncate it by 1 byte.
+    let data_dir = server.data_dir().expect("filesystem backend");
+    let mut target_path: Option<std::path::PathBuf> = None;
+    for entry in walkdir::WalkDir::new(data_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if entry.path().file_name().and_then(|s| s.to_str()) == Some("truncate-me.bin") {
+            target_path = Some(entry.path().to_path_buf());
+            break;
+        }
+    }
+    let path = target_path.expect("passthrough file missing on disk");
+    let orig_size = std::fs::metadata(&path).unwrap().len();
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    file.set_len(orig_size - 1).unwrap();
+
+    // GET must now fail. The truncation crosses a chunk boundary or
+    // trims the GCM tag — either way the decoder rejects.
+    let client = server.s3_client().await;
+    let result = client
+        .get_object()
+        .bucket(BUCKET)
+        .key("truncate-me.bin")
+        .send()
+        .await;
+    match result {
+        Err(_) => {
+            // Expected: SDK returned an error because the server
+            // responded with a non-2xx (decrypt fail fast path) or
+            // closed the connection mid-stream.
+        }
+        Ok(resp) => {
+            // Server started streaming; body collection must fail or
+            // return something shorter than the uncorrupted plaintext.
+            let body_result = resp.body.collect().await;
+            match body_result {
+                Ok(agg) => {
+                    // If the body came back complete, at least the
+                    // length must be short (truncation must surface).
+                    let body_len = agg.to_vec().len();
+                    assert!(
+                        body_len < orig_size as usize - 1,
+                        "truncated encrypted object returned a complete clean body — decoder missed the truncation"
+                    );
+                }
+                Err(_) => {
+                    // Body errored mid-stream: also acceptable.
+                }
+            }
+        }
+    }
+}

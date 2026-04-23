@@ -313,6 +313,229 @@ pub fn wire_offset_of_chunk(chunk_index: u32) -> u64 {
     CHUNK_HEADER_LEN as u64 + (chunk_index as u64) * (CHUNK_FRAME_WIRE_LEN as u64)
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Streaming decoder
+// ─────────────────────────────────────────────────────────────────────
+
+/// State machine for the chunked wire-format decoder.
+///
+/// Carried through `futures::stream::unfold` so we don't need a
+/// manual `pin_project` dependency. See `chunked_decrypt_stream`
+/// below for the public builder.
+struct DecryptState<S>
+where
+    S: futures::Stream<Item = Result<Bytes, StorageError>> + Unpin,
+{
+    inner: S,
+    key: EncryptionKey,
+    // Rolling buffer of ciphertext bytes not yet consumed.
+    buf: Vec<u8>,
+    header_done: bool,
+    base_iv: [u8; IV_LEN],
+    // Zero-indexed count of frames we've already emitted.
+    chunk_index: u32,
+    // Hint: if the caller knows the total number of plaintext bytes
+    // (from FileMetadata.file_size), we can derive which frame is
+    // final. Required for correctness — the AAD binds is_final, so
+    // the decoder MUST know it matches what the encoder stamped.
+    expected_final_index: u32,
+    // Set once we've successfully decrypted the is_final=true frame.
+    emitted_final: bool,
+    // Plaintext bytes to skip at the very start (range trim at head).
+    skip_bytes: u64,
+    // Plaintext bytes still to emit; None = emit until end.
+    take_bytes: Option<u64>,
+}
+
+/// Produce a plaintext stream from an encrypted chunked-format
+/// ciphertext stream.
+///
+/// `expected_final_index` MUST be the zero-based index of the final
+/// chunk (derived from `ceil(plaintext_size / CHUNK_PLAINTEXT_SIZE) - 1`;
+/// a zero-byte object has `expected_final_index = 0`). Required because
+/// the AEAD AAD binds the final flag — the decoder needs to know which
+/// frame to mark final on reconstruction, or GCM auth will reject.
+///
+/// `skip_bytes` and `take_bytes` trim the head/tail of the plaintext
+/// for range reads.
+fn chunked_decrypt_stream<S>(
+    inner: S,
+    key: EncryptionKey,
+    expected_final_index: u32,
+    skip_bytes: u64,
+    take_bytes: Option<u64>,
+) -> BoxStream<'static, Result<Bytes, StorageError>>
+where
+    S: futures::Stream<Item = Result<Bytes, StorageError>> + Unpin + Send + 'static,
+{
+    let state = DecryptState {
+        inner,
+        key,
+        buf: Vec::with_capacity(CHUNK_FRAME_WIRE_LEN + 64),
+        header_done: false,
+        base_iv: [0u8; IV_LEN],
+        chunk_index: 0,
+        expected_final_index,
+        emitted_final: false,
+        skip_bytes,
+        take_bytes,
+    };
+
+    Box::pin(futures::stream::unfold(state, |mut st| async move {
+        use futures::StreamExt;
+        loop {
+            // Early termination by caller bound.
+            if matches!(st.take_bytes, Some(0)) {
+                return None;
+            }
+
+            // Phase 1: header ([magic][base_iv]).
+            if !st.header_done {
+                while st.buf.len() < CHUNK_HEADER_LEN {
+                    match st.inner.next().await {
+                        Some(Ok(more)) => st.buf.extend_from_slice(&more),
+                        Some(Err(e)) => return Some((Err(e), st)),
+                        None => {
+                            return Some((
+                                Err(StorageError::Encryption(
+                                    "stream ended before encryption header".into(),
+                                )),
+                                st,
+                            ));
+                        }
+                    }
+                }
+                if st.buf[..4] != CHUNK_MAGIC {
+                    return Some((
+                        Err(StorageError::Encryption(format!(
+                            "bad chunked-encryption magic: {:02x?}",
+                            &st.buf[..4]
+                        ))),
+                        st,
+                    ));
+                }
+                st.base_iv.copy_from_slice(&st.buf[4..CHUNK_HEADER_LEN]);
+                st.buf.drain(..CHUNK_HEADER_LEN);
+                st.header_done = true;
+            }
+
+            // If we've already emitted the final chunk, we're done —
+            // any trailing bytes from the inner stream are a framing
+            // violation and should be logged but not errored (keeps
+            // the caller's stream clean).
+            if st.emitted_final {
+                return None;
+            }
+
+            // Phase 2: frame [4 B len] [ct+tag].
+            while st.buf.len() < CHUNK_FRAME_LEN_FIELD {
+                match st.inner.next().await {
+                    Some(Ok(more)) => st.buf.extend_from_slice(&more),
+                    Some(Err(e)) => return Some((Err(e), st)),
+                    None => {
+                        // Upstream ended with empty buffer. That's a
+                        // truncation: we haven't yet emitted the final
+                        // frame.
+                        return Some((
+                            Err(StorageError::Encryption(format!(
+                                "stream truncated before chunk {} (expected final index {})",
+                                st.chunk_index, st.expected_final_index
+                            ))),
+                            st,
+                        ));
+                    }
+                }
+            }
+
+            let declared =
+                u32::from_le_bytes(st.buf[..CHUNK_FRAME_LEN_FIELD].try_into().unwrap()) as usize;
+            if declared > CHUNK_MAX_WIRE_CIPHERTEXT {
+                return Some((
+                    Err(StorageError::Encryption(format!(
+                        "frame length {} exceeds ceiling {} — rejecting (possible DOS)",
+                        declared, CHUNK_MAX_WIRE_CIPHERTEXT,
+                    ))),
+                    st,
+                ));
+            }
+            let frame_wire_len = CHUNK_FRAME_LEN_FIELD + declared;
+            while st.buf.len() < frame_wire_len {
+                match st.inner.next().await {
+                    Some(Ok(more)) => st.buf.extend_from_slice(&more),
+                    Some(Err(e)) => return Some((Err(e), st)),
+                    None => {
+                        return Some((
+                            Err(StorageError::Encryption(
+                                "stream truncated mid-frame-body".into(),
+                            )),
+                            st,
+                        ));
+                    }
+                }
+            }
+
+            let is_final = st.chunk_index == st.expected_final_index;
+            let ct = &st.buf[CHUNK_FRAME_LEN_FIELD..frame_wire_len];
+            let pt = match decrypt_chunk(&st.key, &st.base_iv, st.chunk_index, is_final, ct) {
+                Ok(p) => p,
+                Err(e) => return Some((Err(e), st)),
+            };
+            st.buf.drain(..frame_wire_len);
+            st.chunk_index = match st.chunk_index.checked_add(1) {
+                Some(v) => v,
+                None => {
+                    return Some((
+                        Err(StorageError::Encryption(
+                            "chunk index overflow during decode".into(),
+                        )),
+                        st,
+                    ));
+                }
+            };
+            if is_final {
+                st.emitted_final = true;
+            }
+
+            // Apply skip_bytes from the head of this frame's plaintext.
+            let mut start = 0usize;
+            if st.skip_bytes > 0 {
+                let skip = std::cmp::min(st.skip_bytes as usize, pt.len());
+                start += skip;
+                st.skip_bytes -= skip as u64;
+            }
+            let remainder = &pt[start..];
+
+            // Apply take_bytes ceiling.
+            let to_emit: Bytes = if let Some(take) = st.take_bytes {
+                let take_now = std::cmp::min(take as usize, remainder.len());
+                let slice = Bytes::copy_from_slice(&remainder[..take_now]);
+                st.take_bytes = Some(take - take_now as u64);
+                slice
+            } else {
+                Bytes::copy_from_slice(remainder)
+            };
+
+            if to_emit.is_empty() {
+                // Don't emit an empty Bytes — loop to next frame.
+                continue;
+            }
+            return Some((Ok(to_emit), st));
+        }
+    }))
+}
+
+/// Compute the index of the final chunk given a plaintext byte
+/// count. Zero-byte objects still have one chunk (index 0 with empty
+/// plaintext) — the write path guarantees this.
+fn final_chunk_index_for_plaintext_size(plaintext_size: u64) -> u32 {
+    if plaintext_size == 0 {
+        return 0;
+    }
+    let sz = CHUNK_PLAINTEXT_SIZE as u64;
+    let last = (plaintext_size - 1) / sz;
+    last as u32
+}
+
 /// Transparent encryption wrapper around any `StorageBackend`.
 pub struct EncryptingBackend<B: StorageBackend> {
     inner: B,
@@ -409,8 +632,15 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
             .await
     }
 
-    // put_passthrough_chunked: concatenates chunks, encrypts whole blob, delegates to put_passthrough.
-    // When encryption is off, delegates to inner's chunked impl directly.
+    // put_passthrough_chunked: re-slices incoming chunks into 64 KiB
+    // plaintext windows, encrypts each into a framed ciphertext chunk,
+    // and forwards a new `Vec<Bytes>` (header + all frames) to the
+    // inner backend's chunked PUT. No whole-object buffer in memory —
+    // the peak allocation is one 64 KiB plaintext window + one frame
+    // (~130 KiB) at a time.
+    //
+    // When encryption is off, delegates to inner's chunked impl
+    // directly — no copying.
     async fn put_passthrough_chunked(
         &self,
         bucket: &str,
@@ -419,22 +649,134 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         chunks: &[Bytes],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        if self.current_key().is_some() {
-            let total: usize = chunks.iter().map(|c| c.len()).sum();
-            let mut buf = Vec::with_capacity(total);
-            for c in chunks {
-                buf.extend_from_slice(c);
-            }
-            let mut meta = metadata.clone();
-            let enc = self.encrypt_if_enabled(&buf, &mut meta)?;
-            self.inner
-                .put_passthrough(bucket, prefix, filename, &enc, &meta)
-                .await
-        } else {
-            self.inner
+        let Some(key) = self.current_key() else {
+            return self
+                .inner
                 .put_passthrough_chunked(bucket, prefix, filename, chunks, metadata)
-                .await
+                .await;
+        };
+
+        // Random per-object base IV. Each chunk's nonce is derived from
+        // this + the chunk index.
+        let mut base_iv = [0u8; IV_LEN];
+        rand::rngs::OsRng.fill_bytes(&mut base_iv);
+
+        // Emit the wire-format header first: [magic][base_iv].
+        let mut header = Vec::with_capacity(CHUNK_HEADER_LEN);
+        header.extend_from_slice(&CHUNK_MAGIC);
+        header.extend_from_slice(&base_iv);
+        let mut out_frames: Vec<Bytes> = Vec::with_capacity(chunks.len() + 4);
+        out_frames.push(Bytes::from(header));
+
+        // Re-slice incoming chunks into exactly CHUNK_PLAINTEXT_SIZE
+        // windows. Multipart uploads typically arrive in 5 MiB (or
+        // bigger) chunks, so one incoming Bytes gets split into ~80
+        // plaintext windows. Small final remainder is sent as the
+        // last chunk with is_final=true.
+        let mut pt_window: Vec<u8> = Vec::with_capacity(CHUNK_PLAINTEXT_SIZE);
+        let mut chunk_index: u32 = 0;
+
+        // Two-phase iteration: collect full windows, then flush the
+        // tail as the final chunk. We need to know when we're on the
+        // LAST non-empty window to stamp is_final=true correctly; so
+        // we accumulate all full windows first, then emit them with
+        // is_final=false if any tail remains, else the last one gets
+        // is_final=true.
+        let mut pending_frames: Vec<Vec<u8>> = Vec::new();
+
+        for incoming in chunks {
+            let mut remaining: &[u8] = incoming.as_ref();
+            while !remaining.is_empty() {
+                let space = CHUNK_PLAINTEXT_SIZE - pt_window.len();
+                let take = std::cmp::min(space, remaining.len());
+                pt_window.extend_from_slice(&remaining[..take]);
+                remaining = &remaining[take..];
+                if pt_window.len() == CHUNK_PLAINTEXT_SIZE {
+                    // Emit this window; don't know yet if it's final.
+                    pending_frames.push(pt_window.clone());
+                    pt_window.clear();
+                    // Soft cap: if we've buffered many pending frames
+                    // that we know for sure aren't final, flush them
+                    // (the earlier chunk can't be final). This keeps
+                    // pending_frames memory bounded at ~1 frame (~65K)
+                    // instead of growing with object size.
+                    if pending_frames.len() > 1 {
+                        let frame_idx = chunk_index;
+                        let pt = pending_frames.remove(0);
+                        let frame = encrypt_chunk(&key, &base_iv, frame_idx, false, &pt)?;
+                        out_frames.push(Bytes::from(frame));
+                        chunk_index = chunk_index.checked_add(1).ok_or_else(|| {
+                            StorageError::Encryption(
+                                "chunk index overflow (> 2^32 chunks — object too large)".into(),
+                            )
+                        })?;
+                    }
+                }
+            }
         }
+
+        // End of input. `pending_frames` holds 0 or 1 full 64-KiB
+        // window; `pt_window` holds 0..CHUNK_PLAINTEXT_SIZE bytes of
+        // tail.
+        //
+        // Cases:
+        //   (a) Both empty and chunk_index == 0: object is zero-bytes.
+        //       Emit one frame with empty plaintext, is_final=true.
+        //   (b) Both empty and chunk_index > 0: the last emitted frame
+        //       was the true tail but we stamped it is_final=false
+        //       (the 2-frame pipeline stamps only after confirming a
+        //       follower exists). Fix by: we always keep at least one
+        //       frame queued; the invariant is that `pending_frames`
+        //       has the true final frame when input ends, plus maybe
+        //       a non-empty `pt_window`.
+        //   (c) pending_frames has 1 frame and pt_window is empty: the
+        //       pending frame IS the final frame (full 64 KiB).
+        //   (d) pending_frames has 1 frame and pt_window is non-empty:
+        //       the pending frame is non-final, pt_window is final.
+        //   (e) pending_frames is empty and pt_window is non-empty:
+        //       pt_window is the ONLY and final frame (object smaller
+        //       than 64 KiB).
+
+        if pending_frames.is_empty() && pt_window.is_empty() && chunk_index == 0 {
+            // Zero-byte object (case a).
+            let frame = encrypt_chunk(&key, &base_iv, 0, true, &[])?;
+            out_frames.push(Bytes::from(frame));
+        } else if pending_frames.len() == 1 && pt_window.is_empty() {
+            // Case (c): the queued frame is final.
+            let pt = pending_frames.remove(0);
+            let frame = encrypt_chunk(&key, &base_iv, chunk_index, true, &pt)?;
+            out_frames.push(Bytes::from(frame));
+        } else if pending_frames.len() == 1 && !pt_window.is_empty() {
+            // Case (d): queued frame is non-final, pt_window is final.
+            let pt = pending_frames.remove(0);
+            let frame = encrypt_chunk(&key, &base_iv, chunk_index, false, &pt)?;
+            out_frames.push(Bytes::from(frame));
+            chunk_index = chunk_index.checked_add(1).ok_or_else(|| {
+                StorageError::Encryption(
+                    "chunk index overflow (> 2^32 chunks — object too large)".into(),
+                )
+            })?;
+            let tail = encrypt_chunk(&key, &base_iv, chunk_index, true, &pt_window)?;
+            out_frames.push(Bytes::from(tail));
+        } else if pending_frames.is_empty() && !pt_window.is_empty() {
+            // Case (e): sub-64KiB object.
+            let frame = encrypt_chunk(&key, &base_iv, chunk_index, true, &pt_window)?;
+            out_frames.push(Bytes::from(frame));
+        } else {
+            // Case (b): unreachable given the drain-on-2-frames
+            // invariant above. If we ever hit it, the safe play is
+            // to fail loudly rather than produce a stream without a
+            // final-flag-set chunk (which would fail decrypt).
+            return Err(StorageError::Encryption(
+                "internal: chunking invariant violated (no final frame)".into(),
+            ));
+        }
+
+        let mut meta = metadata.clone();
+        mark_chunked_encrypted(&mut meta);
+        self.inner
+            .put_passthrough_chunked(bucket, prefix, filename, &out_frames, &meta)
+            .await
     }
 
     // ── Decrypt on read ──
@@ -483,17 +825,40 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
             .inner
             .get_passthrough_metadata(bucket, prefix, filename)
             .await?;
+
+        // Chunked path: stream end-to-end, decrypt frame-by-frame, no
+        // whole-object buffer. This is the whole point of the chunked
+        // format — a 5 GiB download stays at ~130 KiB peak memory in
+        // the decoder.
+        if is_chunked_encrypted(&meta) {
+            let Some(key) = self.current_key() else {
+                return Err(StorageError::Encryption(
+                    "object is encrypted but no key is configured".into(),
+                ));
+            };
+            let ct_stream = self
+                .inner
+                .get_passthrough_stream(bucket, prefix, filename)
+                .await?;
+            let final_idx = final_chunk_index_for_plaintext_size(meta.file_size);
+            return Ok(chunked_decrypt_stream(ct_stream, key, final_idx, 0, None));
+        }
+
+        // v1 single-shot path (bounded by max_object_size). Buffer the
+        // encrypted blob into memory, decrypt whole, wrap as a
+        // single-emission stream. Same as before — unchanged.
         if is_encrypted(&meta) {
             let data = self.inner.get_passthrough(bucket, prefix, filename).await?;
             let plain = self.decrypt_if_needed(data, &meta)?;
-            Ok(Box::pin(futures::stream::once(async {
+            return Ok(Box::pin(futures::stream::once(async {
                 Ok(Bytes::from(plain))
-            })))
-        } else {
-            self.inner
-                .get_passthrough_stream(bucket, prefix, filename)
-                .await
+            })));
         }
+
+        // Not encrypted — straight passthrough.
+        self.inner
+            .get_passthrough_stream(bucket, prefix, filename)
+            .await
     }
 
     async fn get_passthrough_stream_range(
@@ -508,19 +873,86 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
             .inner
             .get_passthrough_metadata(bucket, prefix, filename)
             .await?;
+
+        // Chunked path: fetch only the wire bytes covering the target
+        // chunks (O(1) offset math — every non-final chunk is
+        // `CHUNK_FRAME_WIRE_LEN` bytes). The decoder needs the
+        // 16-byte header (for base_iv) AND the correct absolute
+        // chunk_index to reconstruct AAD. We fetch them in a single
+        // widened range request: from wire offset 0 (header) through
+        // the end of the last covered chunk. For a typical "read 100
+        // KiB from middle of a 5 GiB object" this pulls ~80 KiB
+        // instead of 5 GiB.
+        //
+        // The decoder's `skip_bytes` is the chunk-local offset within
+        // `first_chunk` + the sum of preceding chunks' plaintext that
+        // we want to throw away (the leading full chunks before the
+        // range target). Equivalently: `start - first_chunk * PT_SZ`.
+        //
+        // Simpler alternative: ask the inner for the full-file stream
+        // up to end_of_last_chunk. That would work but for very large
+        // objects with ranges near the start, reads a lot of data we
+        // immediately throw away. The widened range is cheap: pulls
+        // at most the prefix + requested window.
+        if is_chunked_encrypted(&meta) {
+            let Some(key) = self.current_key() else {
+                return Err(StorageError::Encryption(
+                    "object is encrypted but no key is configured".into(),
+                ));
+            };
+            let final_idx = final_chunk_index_for_plaintext_size(meta.file_size);
+            // Clamp `end` (inclusive) to the actual plaintext size.
+            let effective_end = std::cmp::min(end, meta.file_size.saturating_sub(1));
+            if effective_end < start {
+                return Ok((Box::pin(futures::stream::empty()), 0));
+            }
+            let (last_chunk, _) = chunk_index_for_plaintext_offset(effective_end);
+
+            // Widened wire range: from offset 0 (includes header +
+            // leading chunks we'll skip) through end of last_chunk.
+            // The leading chunks we'll throw away via `skip_bytes` at
+            // the plaintext layer after decryption.
+            let wire_start = 0u64;
+            let wire_end = if last_chunk < final_idx {
+                wire_offset_of_chunk(last_chunk) + CHUNK_FRAME_WIRE_LEN as u64 - 1
+            } else {
+                // The request's last chunk IS the object's final chunk
+                // (which may be shorter than CHUNK_FRAME_WIRE_LEN).
+                // Ask for everything to EOF.
+                u64::MAX - 1
+            };
+            let (ct_stream, _) = self
+                .inner
+                .get_passthrough_stream_range(bucket, prefix, filename, wire_start, wire_end)
+                .await?;
+
+            // Plaintext bytes we emit BEFORE reaching the range start,
+            // then discard: (`first_chunk` × PT_SZ) + head_skip within
+            // that chunk = just `start` itself.
+            let skip_bytes = start;
+            let plaintext_len = effective_end - start + 1;
+
+            let plain =
+                chunked_decrypt_stream(ct_stream, key, final_idx, skip_bytes, Some(plaintext_len));
+            return Ok((plain, plaintext_len));
+        }
+
+        // v1 single-shot path (bounded by max_object_size). Same as
+        // before — buffer-and-slice.
         if is_encrypted(&meta) {
             let data = self.inner.get_passthrough(bucket, prefix, filename).await?;
             let plain = self.decrypt_if_needed(data, &meta)?;
             let s = start as usize;
-            let e = std::cmp::min(end as usize, plain.len());
+            let e = std::cmp::min(end as usize + 1, plain.len());
             let slice = Bytes::from(plain[s..e].to_vec());
             let len = slice.len() as u64;
-            Ok((Box::pin(futures::stream::once(async { Ok(slice) })), len))
-        } else {
-            self.inner
-                .get_passthrough_stream_range(bucket, prefix, filename, start, end)
-                .await
+            return Ok((Box::pin(futures::stream::once(async { Ok(slice) })), len));
         }
+
+        // Not encrypted — delegate.
+        self.inner
+            .get_passthrough_stream_range(bucket, prefix, filename, start, end)
+            .await
     }
 
     // ── Pass-through (no encryption) ──
