@@ -648,3 +648,116 @@ pub async fn shutdown_signal() {
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Unit tests for pure-function startup helpers.
+//
+// `src/startup.rs` (~650 LOC) had zero unit tests at the time of the
+// QA audit. Most of the file is glue that spawns tasks / opens files /
+// binds listeners — hard to unit-test — but a handful of helpers are
+// genuinely pure-input → pure-output and deserve regression coverage.
+// The ones covered below are called from main.rs on every boot; a bug
+// here is a boot-path regression that nothing else would catch.
+// ─────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deltaglider_proxy::config::Config;
+
+    /// A Config with a full SigV4 credential pair must produce
+    /// `IamState::Legacy`. This is the default path for deployments
+    /// that haven't created IAM users yet — the bootstrap admin key
+    /// becomes the legacy credential.
+    #[test]
+    fn init_iam_state_with_legacy_creds_returns_legacy() {
+        let cfg = Config {
+            access_key_id: Some("AKIAEXAMPLEBOOTSTRAP".to_string()),
+            secret_access_key: Some("bootstrapSecretKey1234567890".to_string()),
+            ..Config::default()
+        };
+
+        let state = init_iam_state(&cfg);
+        let loaded = state.load_full();
+        match loaded.as_ref() {
+            IamState::Legacy(auth) => {
+                assert_eq!(auth.access_key_id, "AKIAEXAMPLEBOOTSTRAP");
+                assert_eq!(auth.secret_access_key, "bootstrapSecretKey1234567890");
+            }
+            other => panic!("expected Legacy, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    /// No creds + no IAM users = open access. The proxy will refuse
+    /// to start later (`authentication = "none"` must be explicit),
+    /// but `init_iam_state` itself returns Disabled — the refusal
+    /// happens in a separate boot-safety check.
+    #[test]
+    fn init_iam_state_without_creds_returns_disabled() {
+        let cfg = Config::default(); // access_key_id=None, secret_access_key=None
+
+        let state = init_iam_state(&cfg);
+        let loaded = state.load_full();
+        assert!(
+            matches!(loaded.as_ref(), IamState::Disabled),
+            "expected Disabled, got {:?}",
+            std::mem::discriminant(loaded.as_ref())
+        );
+    }
+
+    /// Partial credentials (only access_key_id set, or only secret
+    /// set) must NOT be treated as valid. Both are required or the
+    /// proxy should treat auth as absent. A silent "half-configured"
+    /// state would leak the set half via SigV4 auth mismatches.
+    #[test]
+    fn init_iam_state_with_only_access_key_id_returns_disabled() {
+        let cfg = Config {
+            access_key_id: Some("AKIAHALFSET".to_string()),
+            // secret_access_key stays None
+            ..Config::default()
+        };
+
+        let state = init_iam_state(&cfg);
+        let loaded = state.load_full();
+        assert!(
+            matches!(loaded.as_ref(), IamState::Disabled),
+            "half-configured creds must yield Disabled"
+        );
+    }
+
+    #[test]
+    fn init_iam_state_with_only_secret_returns_disabled() {
+        let cfg = Config {
+            secret_access_key: Some("dangling-secret".to_string()),
+            // access_key_id stays None
+            ..Config::default()
+        };
+
+        let state = init_iam_state(&cfg);
+        let loaded = state.load_full();
+        assert!(
+            matches!(loaded.as_ref(), IamState::Disabled),
+            "half-configured creds (secret only) must yield Disabled"
+        );
+    }
+
+    /// Metrics labeling: `build_info` must carry the right
+    /// backend_type label so Prometheus dashboards can filter by
+    /// deployment shape. Filesystem vs S3 is the first-order split.
+    #[test]
+    fn init_metrics_build_info_labels_filesystem_backend() {
+        let cfg = Config::default(); // Default backend is Filesystem
+
+        let metrics = init_metrics(&cfg);
+        // We can't easily read back the label value through prometheus's
+        // API without parsing the exposition format, but we can verify
+        // the process_start_time_seconds got a non-zero value (set by
+        // init_metrics) — that's a cheap sanity check that the
+        // function actually ran its initialisation.
+        let start_time = metrics.process_start_time_seconds.get();
+        assert!(
+            start_time > 0.0,
+            "process_start_time_seconds should be initialised to a positive UNIX timestamp, \
+             got {start_time}"
+        );
+    }
+}
