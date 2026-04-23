@@ -226,40 +226,6 @@ pub struct DeltaGliderEngine<S: StorageBackend> {
     bucket_policies: crate::bucket_policy::BucketPolicyRegistry,
 }
 
-/// STEP-1 SHIM: pick the first Aes256GcmProxy key from the per-backend
-/// encryption configs. Used by the current global-wrap engine wiring
-/// during the transition to per-backend wrapping. Scans the singleton
-/// `backend_encryption` first, then `backends[*].encryption` in
-/// declaration order, returning the first proxy-mode key found.
-///
-/// Returns `None` when no proxy-mode key is configured; in that case
-/// the outer wrapper is constructed with `key: None` (the "always
-/// wrap + PassThrough" safety-net configuration).
-///
-/// This helper is deleted in Step 2 when the wrapper moves inside
-/// `RoutingBackend` and each backend gets its own independent key.
-fn extract_first_proxy_key(
-    singleton: &crate::config::BackendEncryptionConfig,
-    backends: &[crate::config::NamedBackendConfig],
-) -> Option<String> {
-    fn pick(enc: &crate::config::BackendEncryptionConfig) -> Option<String> {
-        if let crate::config::BackendEncryptionConfig::Aes256GcmProxy { key, .. } = enc {
-            key.clone()
-        } else {
-            None
-        }
-    }
-    if let Some(k) = pick(singleton) {
-        return Some(k);
-    }
-    for n in backends {
-        if let Some(k) = pick(&n.encryption) {
-            return Some(k);
-        }
-    }
-    None
-}
-
 /// Type alias for engine with dynamic backend dispatch
 pub type DynEngine = DeltaGliderEngine<Box<dyn StorageBackend>>;
 
@@ -271,32 +237,56 @@ impl DynEngine {
     /// routes calls to the correct underlying backend per bucket. Otherwise,
     /// uses the legacy single-backend path from `config.backend`.
     pub async fn new(config: &Config, metrics: Option<Arc<Metrics>>) -> Result<Self, StorageError> {
+        // Per-backend encryption wrapping.
+        //
+        // Every backend ends up wrapped by `EncryptingBackend`, whether
+        // or not it has a key configured. The wrapper's read path checks
+        // the `dg-encrypted` metadata marker + sniffs for the DGE1 magic
+        // on "not-encrypted" responses, so even a mode:none backend gets
+        // the xattr-strip defense (if the xattr is lost during a
+        // backup/restore round-trip, the wrapper refuses to serve
+        // DGE1-prefixed ciphertext as plaintext).
+        //
+        // When a backend's mode is Aes256GcmProxy, its wrapper holds the
+        // key — writes encrypt, reads decrypt. When mode is SseKms / SseS3
+        // / None, the wrapper's key is None and writes are passthrough.
+        // Native SSE modes (SseKms/SseS3) are plumbed through to
+        // `S3Backend::new` in Step 4 — THIS step only delivers the
+        // per-backend AES-256-GCM proxy path plus the mode:none safety
+        // net. SseKms / SseS3 currently fall through to the None
+        // (plaintext-passthrough) wrapper with no native encryption
+        // applied; Config::check warns when those modes appear.
         let storage: Box<dyn StorageBackend> = if config.backends.is_empty() {
-            // Legacy single-backend path
-            match &config.backend {
-                BackendConfig::Filesystem { path } => {
-                    Box::new(FilesystemBackend::new(path.clone()).await?)
-                }
-                BackendConfig::S3 { .. } => Box::new(S3Backend::new(&config.backend).await?),
-            }
+            // Singleton backend path. Synthetic name "default" matches
+            // what `apply_backend_encryption_env` uses for this entry.
+            let raw = build_raw_backend(&config.backend).await?;
+            wrap_backend_with_encryption(
+                "default",
+                raw,
+                &config.backend_encryption,
+                &mut KeyIdCollisionCheck::new(),
+            )?
         } else {
-            // Multi-backend: construct each backend, wrap in RoutingBackend
+            // Multi-backend routing. Each named entry is constructed
+            // raw, wrapped with its own encryption config, then handed
+            // to the router.
             let mut backends = std::collections::HashMap::new();
+            let mut kid_collisions = KeyIdCollisionCheck::new();
             for named in &config.backends {
-                let backend: Box<dyn StorageBackend> = match &named.backend {
-                    BackendConfig::Filesystem { path } => {
-                        Box::new(FilesystemBackend::new(path.clone()).await?)
-                    }
-                    BackendConfig::S3 { .. } => Box::new(S3Backend::new(&named.backend).await?),
-                };
-                backends.insert(named.name.clone(), Arc::new(backend));
+                let raw = build_raw_backend(&named.backend).await?;
+                let wrapped = wrap_backend_with_encryption(
+                    &named.name,
+                    raw,
+                    &named.encryption,
+                    &mut kid_collisions,
+                )?;
+                backends.insert(named.name.clone(), Arc::new(wrapped));
             }
             let default_name = config
                 .default_backend
                 .clone()
                 .unwrap_or_else(|| config.backends[0].name.clone());
 
-            // Build routing table from bucket policies
             let registry = crate::bucket_policy::BucketPolicyRegistry::new(
                 config.buckets.clone(),
                 config.max_delta_ratio,
@@ -310,66 +300,159 @@ impl DynEngine {
             )?)
         };
 
-        // ALWAYS wrap with EncryptingBackend, whether or not a key is
-        // configured. The wrapper's read path checks the `dg-encrypted`
-        // metadata marker and, when set, either decrypts (if a key is
-        // configured) or returns a hard error ("object is encrypted but
-        // no key is configured"). Without this wrapper, an operator who
-        // disables encryption would cause ALL reads of previously-
-        // encrypted objects to silently return raw ciphertext as
-        // plaintext — the file body starts with "DGE1" magic bytes
-        // followed by binary garbage, the marker is still in the xattr,
-        // but nothing checks the marker because the unwrapped backend
-        // streams bytes verbatim.
-        //
-        // STEP-1 SHIM: per-backend encryption config now lives on each
-        // NamedBackendConfig + the singleton `Config.backend_encryption`,
-        // but the outer-wrap architecture is still global. This shim
-        // picks the FIRST Aes256GcmProxy key it finds across
-        // `{backend_encryption} ∪ backends[*].encryption` and uses it
-        // as the single-key for the outer wrapper. That matches today's
-        // effective behaviour for any config with zero-or-one proxy-
-        // encrypted backend. Per-backend wrapping lands in Step 2 and
-        // this shim is then deleted.
-        //
-        // If any NATIVE (SSE-KMS/SSE-S3) modes are configured, they are
-        // silently ignored at this step — the S3Backend plumbing for
-        // those lands in Step 4. A warning surfaces via Config::check
-        // warnings at load time.
-        let effective_proxy_key: Option<String> =
-            extract_first_proxy_key(&config.backend_encryption, &config.backends);
-        let enc_config = Arc::new(ArcSwap::new(Arc::new(crate::storage::EncryptionConfig {
-            key: match effective_proxy_key.as_deref() {
-                Some(hex_key) => Some(
-                    crate::storage::EncryptionKey::from_hex(hex_key)
-                        .map_err(StorageError::Encryption)?,
-                ),
-                None => None,
-            },
-        })));
-        if effective_proxy_key.is_some() {
-            tracing::info!("Encryption at rest: ENABLED (AES-256-GCM)");
-            // If the key came from config FILE (not env), nudge the
-            // operator to keep an off-box copy. Losing an encrypted
-            // config file with no backup means all encrypted objects
-            // are unrecoverable — the in-band backup mechanism is no
-            // defense because it's encrypted with the same key.
-            //
-            // The check is env-var-presence, which maps to "did
-            // Config::from_env override the file value?" at load time.
-            if std::env::var("DGP_ENCRYPTION_KEY").is_err() {
-                tracing::warn!(
-                    "Encryption key was loaded from config file (not DGP_ENCRYPTION_KEY \
-                     env var). Keep an off-box backup of the key; if the config file is \
-                     lost, all encrypted objects become unrecoverable."
-                );
-            }
-        }
-        let storage: Box<dyn StorageBackend> =
-            Box::new(crate::storage::EncryptingBackend::new(storage, enc_config));
-
         Ok(Self::new_with_backend(Arc::new(storage), config, metrics))
     }
+}
+
+/// Build ONE storage backend from a `BackendConfig` variant, without
+/// any encryption wrapping. Keeps the I/O-construction step decoupled
+/// from the wrapping policy, so the wrapping loop is a pure function
+/// of resolved encryption.
+async fn build_raw_backend(cfg: &BackendConfig) -> Result<Box<dyn StorageBackend>, StorageError> {
+    match cfg {
+        BackendConfig::Filesystem { path } => {
+            Ok(Box::new(FilesystemBackend::new(path.clone()).await?))
+        }
+        BackendConfig::S3 { .. } => Ok(Box::new(S3Backend::new(cfg).await?)),
+    }
+}
+
+/// Tracks explicit `key_id` → `key` pairs seen during construction so
+/// we can fail-fast on "two backends claim the same key_id but carry
+/// different key material" — the same invariant `Config::check`
+/// warns about, re-enforced at engine-construction time (the warnings
+/// path is advisory; this is load-bearing for the read-side key_id
+/// mismatch check in [`crate::storage::encrypting`]).
+struct KeyIdCollisionCheck {
+    seen: std::collections::BTreeMap<String, Vec<u8>>,
+}
+
+impl KeyIdCollisionCheck {
+    fn new() -> Self {
+        Self {
+            seen: std::collections::BTreeMap::new(),
+        }
+    }
+    fn record(
+        &mut self,
+        backend_name: &str,
+        key_id: &str,
+        key_bytes: &[u8],
+    ) -> Result<(), StorageError> {
+        if let Some(prev) = self.seen.get(key_id) {
+            if prev != key_bytes {
+                return Err(StorageError::Encryption(format!(
+                    "backend '{}' declares key_id='{}' but a prior backend uses the SAME \
+                     key_id with DIFFERENT key bytes — the read-side key_id mismatch check \
+                     would then fire on every cross-backend read. Give each backend a \
+                     distinct key_id, or set both to the same key (documented portability \
+                     escape hatch).",
+                    backend_name, key_id
+                )));
+            }
+        } else {
+            self.seen.insert(key_id.to_string(), key_bytes.to_vec());
+        }
+        Ok(())
+    }
+}
+
+/// Wrap one raw backend with its encryption config. Always wraps
+/// (even for mode:none, which produces a no-op wrapper that still
+/// fires the xattr-strip sniffer on reads — see B9 from the earlier
+/// audit).
+///
+/// Currently dispatches only the `None` and `Aes256GcmProxy` modes:
+/// native SseKms / SseS3 fall through to the "wrap with no key"
+/// path. Step 4 plumbs those through `S3Backend::new` and this
+/// function grows to dispatch them properly. Until then,
+/// `Config::check` warns so operators don't silently run unencrypted.
+fn wrap_backend_with_encryption(
+    backend_name: &str,
+    inner: Box<dyn StorageBackend>,
+    enc: &crate::config::BackendEncryptionConfig,
+    collisions: &mut KeyIdCollisionCheck,
+) -> Result<Box<dyn StorageBackend>, StorageError> {
+    use crate::config::BackendEncryptionConfig as E;
+    let key: Option<crate::storage::EncryptionKey> = match enc {
+        E::Aes256GcmProxy {
+            key: Some(hex),
+            key_id,
+            ..
+        } => {
+            let parsed =
+                crate::storage::EncryptionKey::from_hex(hex).map_err(StorageError::Encryption)?;
+            // If the operator pinned an explicit key_id, record it for
+            // collision detection against other backends.
+            if let Some(kid) = key_id {
+                collisions.record(backend_name, kid, &parsed.0)?;
+            }
+            tracing::info!(
+                "backend '{}' encryption: ENABLED (AES-256-GCM proxy)",
+                backend_name
+            );
+            // If the key came from the YAML file (not the env var),
+            // nudge the operator to keep an off-box copy. Losing the
+            // config file + no backup = unrecoverable ciphertext.
+            let env_name = if backend_name == "default" {
+                "DGP_ENCRYPTION_KEY".to_string()
+            } else {
+                format!(
+                    "DGP_BACKEND_{}_ENCRYPTION_KEY",
+                    backend_name
+                        .chars()
+                        .map(|c| match c {
+                            '-' | '.' => '_',
+                            c => c.to_ascii_uppercase(),
+                        })
+                        .collect::<String>()
+                )
+            };
+            if std::env::var(&env_name).is_err() {
+                tracing::warn!(
+                    "backend '{}' encryption key was loaded from config file (not {}). \
+                     Keep an off-box backup of the key; if the config file is lost, all \
+                     encrypted objects on this backend become unrecoverable.",
+                    backend_name,
+                    env_name
+                );
+            }
+            Some(parsed)
+        }
+        E::Aes256GcmProxy { key: None, .. } => {
+            tracing::warn!(
+                "backend '{}' has encryption mode aes256-gcm-proxy but no key is \
+                 configured — writes will NOT be encrypted on this backend. Check YAML \
+                 or env var.",
+                backend_name
+            );
+            None
+        }
+        E::SseKms { .. } | E::SseS3 { .. } => {
+            // Step 4 lands the native-SSE plumbing in S3Backend::new.
+            // Until then, native-mode backends wrap with no key so
+            // the sniffer still fires on reads but writes go plaintext
+            // (unless the operator already has AWS-side bucket
+            // encryption configured out-of-band).
+            tracing::warn!(
+                "backend '{}' requests native SSE mode '{}' but the S3Backend plumbing \
+                 for native modes is not enabled in this build — writes are currently \
+                 plaintext on this backend. This is a transient state during the \
+                 per-backend encryption rollout.",
+                backend_name,
+                enc.mode_tag()
+            );
+            None
+        }
+        E::None => None,
+    };
+
+    let enc_config = Arc::new(ArcSwap::new(Arc::new(crate::storage::EncryptionConfig {
+        key,
+    })));
+    Ok(Box::new(crate::storage::EncryptingBackend::new(
+        inner, enc_config,
+    )))
 }
 
 impl<S: StorageBackend> DeltaGliderEngine<S> {
@@ -982,6 +1065,369 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ──────────────────────────────────────────────────────────────
+    // Step 2: per-backend wrapping + key_id collision detection
+    // ──────────────────────────────────────────────────────────────
+
+    /// Fake inner backend that records nothing — used only to check
+    /// that `wrap_backend_with_encryption` constructs without error
+    /// for every mode. Actual put/get semantics are covered by the
+    /// CountingBackend tests in `storage::encrypting::tests`.
+    struct NullInner;
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for NullInner {
+        async fn create_bucket(&self, _: &str) -> Result<(), crate::storage::StorageError> {
+            Ok(())
+        }
+        async fn delete_bucket(&self, _: &str) -> Result<(), crate::storage::StorageError> {
+            Ok(())
+        }
+        async fn list_buckets(&self) -> Result<Vec<String>, crate::storage::StorageError> {
+            Ok(vec![])
+        }
+        async fn list_buckets_with_dates(
+            &self,
+        ) -> Result<Vec<(String, chrono::DateTime<chrono::Utc>)>, crate::storage::StorageError>
+        {
+            Ok(vec![])
+        }
+        async fn head_bucket(&self, _: &str) -> Result<bool, crate::storage::StorageError> {
+            Ok(true)
+        }
+        async fn has_reference(&self, _: &str, _: &str) -> bool {
+            false
+        }
+        async fn put_reference(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[u8],
+            _: &crate::types::FileMetadata,
+        ) -> Result<(), crate::storage::StorageError> {
+            Ok(())
+        }
+        async fn get_reference(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<u8>, crate::storage::StorageError> {
+            Ok(vec![])
+        }
+        async fn get_reference_metadata(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<crate::types::FileMetadata, crate::storage::StorageError> {
+            Err(crate::storage::StorageError::Other("null".into()))
+        }
+        async fn put_reference_metadata(
+            &self,
+            _: &str,
+            _: &str,
+            _: &crate::types::FileMetadata,
+        ) -> Result<(), crate::storage::StorageError> {
+            Ok(())
+        }
+        async fn delete_reference(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<(), crate::storage::StorageError> {
+            Ok(())
+        }
+        async fn put_delta(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &[u8],
+            _: &crate::types::FileMetadata,
+        ) -> Result<(), crate::storage::StorageError> {
+            Ok(())
+        }
+        async fn get_delta(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<u8>, crate::storage::StorageError> {
+            Ok(vec![])
+        }
+        async fn get_delta_metadata(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<crate::types::FileMetadata, crate::storage::StorageError> {
+            Err(crate::storage::StorageError::Other("null".into()))
+        }
+        async fn delete_delta(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<(), crate::storage::StorageError> {
+            Ok(())
+        }
+        async fn put_passthrough(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &[u8],
+            _: &crate::types::FileMetadata,
+        ) -> Result<(), crate::storage::StorageError> {
+            Ok(())
+        }
+        async fn get_passthrough(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<u8>, crate::storage::StorageError> {
+            Ok(vec![])
+        }
+        async fn get_passthrough_metadata(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<crate::types::FileMetadata, crate::storage::StorageError> {
+            Err(crate::storage::StorageError::Other("null".into()))
+        }
+        async fn delete_passthrough(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<(), crate::storage::StorageError> {
+            Ok(())
+        }
+        async fn scan_deltaspace(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<crate::types::FileMetadata>, crate::storage::StorageError> {
+            Ok(vec![])
+        }
+        async fn list_deltaspaces(
+            &self,
+            _: &str,
+        ) -> Result<Vec<String>, crate::storage::StorageError> {
+            Ok(vec![])
+        }
+        async fn total_size(&self, _: Option<&str>) -> Result<u64, crate::storage::StorageError> {
+            Ok(0)
+        }
+        async fn put_directory_marker(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<(), crate::storage::StorageError> {
+            Ok(())
+        }
+        async fn bulk_list_objects(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<(String, crate::types::FileMetadata)>, crate::storage::StorageError>
+        {
+            Ok(vec![])
+        }
+        async fn enrich_list_metadata(
+            &self,
+            _: &str,
+            o: Vec<(String, crate::types::FileMetadata)>,
+        ) -> Result<Vec<(String, crate::types::FileMetadata)>, crate::storage::StorageError>
+        {
+            Ok(o)
+        }
+    }
+
+    const HEX32_KEY_A: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const HEX32_KEY_B: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+    #[test]
+    fn test_wrap_backend_with_none_mode_wraps_anyway() {
+        // Even mode:none gets wrapped — the sniffer defense
+        // (xattr-strip case, B9 from the earlier audit) needs the
+        // wrapper in the pipeline to fire. This test just verifies
+        // construction succeeds; the sniffer behaviour itself is
+        // covered in `storage::encrypting::tests::test_stripped_xattr_*`.
+        let inner: Box<dyn StorageBackend> = Box::new(NullInner);
+        let mut coll = KeyIdCollisionCheck::new();
+        let wrapped = wrap_backend_with_encryption(
+            "some-backend",
+            inner,
+            &crate::config::BackendEncryptionConfig::None,
+            &mut coll,
+        );
+        assert!(wrapped.is_ok());
+    }
+
+    #[test]
+    fn test_wrap_backend_with_aes_mode_accepts_hex_key() {
+        let inner: Box<dyn StorageBackend> = Box::new(NullInner);
+        let mut coll = KeyIdCollisionCheck::new();
+        let wrapped = wrap_backend_with_encryption(
+            "enc-backend",
+            inner,
+            &crate::config::BackendEncryptionConfig::Aes256GcmProxy {
+                key: Some(HEX32_KEY_A.into()),
+                key_id: Some("abc".into()),
+                legacy_key: None,
+                legacy_key_id: None,
+            },
+            &mut coll,
+        );
+        assert!(
+            wrapped.is_ok(),
+            "well-formed hex key + id must wrap cleanly"
+        );
+    }
+
+    #[test]
+    fn test_wrap_backend_with_aes_mode_rejects_malformed_hex() {
+        let inner: Box<dyn StorageBackend> = Box::new(NullInner);
+        let mut coll = KeyIdCollisionCheck::new();
+        let result = wrap_backend_with_encryption(
+            "bad",
+            inner,
+            &crate::config::BackendEncryptionConfig::Aes256GcmProxy {
+                key: Some("not-hex!".into()),
+                key_id: None,
+                legacy_key: None,
+                legacy_key_id: None,
+            },
+            &mut coll,
+        );
+        // Box<dyn StorageBackend> doesn't impl Debug, so we can't use
+        // `.unwrap_err()`; destructure by hand.
+        let err = match result {
+            Ok(_) => panic!("malformed hex must error"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("hex") || msg.contains("32 bytes"),
+            "malformed hex must produce a hex-shaped error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_key_id_collision_detected_at_construction() {
+        // Two backends with the SAME explicit key_id but DIFFERENT
+        // keys must fail at construction time. The read-side check
+        // in EncryptingBackend.decrypt_if_needed would then fire on
+        // every cross-backend read; surfacing it at startup beats
+        // silent per-read failures in production.
+        let mut coll = KeyIdCollisionCheck::new();
+        let first = wrap_backend_with_encryption(
+            "a",
+            Box::new(NullInner),
+            &crate::config::BackendEncryptionConfig::Aes256GcmProxy {
+                key: Some(HEX32_KEY_A.into()),
+                key_id: Some("shared-id".into()),
+                legacy_key: None,
+                legacy_key_id: None,
+            },
+            &mut coll,
+        );
+        assert!(first.is_ok());
+        let second = wrap_backend_with_encryption(
+            "b",
+            Box::new(NullInner),
+            &crate::config::BackendEncryptionConfig::Aes256GcmProxy {
+                key: Some(HEX32_KEY_B.into()),
+                key_id: Some("shared-id".into()),
+                legacy_key: None,
+                legacy_key_id: None,
+            },
+            &mut coll,
+        );
+        let err = match second {
+            Ok(_) => panic!("collision must error"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("shared-id") && msg.contains("DIFFERENT"),
+            "expected collision error citing key_id + 'DIFFERENT', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_key_id_collision_allowed_with_same_key() {
+        // The documented escape hatch: two backends with the same
+        // key_id AND the same key bytes are legal — used by operators
+        // who want cross-backend portability (e.g. two aliases for
+        // the same physical bucket). This must NOT error.
+        let mut coll = KeyIdCollisionCheck::new();
+        let first = wrap_backend_with_encryption(
+            "primary",
+            Box::new(NullInner),
+            &crate::config::BackendEncryptionConfig::Aes256GcmProxy {
+                key: Some(HEX32_KEY_A.into()),
+                key_id: Some("portable".into()),
+                legacy_key: None,
+                legacy_key_id: None,
+            },
+            &mut coll,
+        );
+        assert!(first.is_ok());
+        let second = wrap_backend_with_encryption(
+            "replica",
+            Box::new(NullInner),
+            &crate::config::BackendEncryptionConfig::Aes256GcmProxy {
+                key: Some(HEX32_KEY_A.into()),
+                key_id: Some("portable".into()),
+                legacy_key: None,
+                legacy_key_id: None,
+            },
+            &mut coll,
+        );
+        match second {
+            Ok(_) => { /* expected */ }
+            Err(e) => {
+                panic!("same id + same key must be allowed (portability escape hatch), got: {e}")
+            }
+        }
+    }
+
+    #[test]
+    fn test_wrap_backend_sse_modes_fall_through_in_step2() {
+        // Step 2 does NOT plumb native SSE through S3Backend yet —
+        // Step 4 does. Until then, native-mode backends wrap with
+        // no key (writes plaintext) and emit a WARN log. Verify the
+        // wrap doesn't error and the returned backend is still an
+        // `EncryptingBackend` (just with no key).
+        let mut coll = KeyIdCollisionCheck::new();
+        let wrapped = wrap_backend_with_encryption(
+            "s3-kms",
+            Box::new(NullInner),
+            &crate::config::BackendEncryptionConfig::SseKms {
+                kms_key_id: "arn:aws:kms:us-east-1:1:key/x".into(),
+                bucket_key_enabled: true,
+                legacy_key: None,
+                legacy_key_id: None,
+            },
+            &mut coll,
+        );
+        assert!(wrapped.is_ok());
+
+        let wrapped2 = wrap_backend_with_encryption(
+            "s3-aes",
+            Box::new(NullInner),
+            &crate::config::BackendEncryptionConfig::SseS3 {
+                legacy_key: None,
+                legacy_key_id: None,
+            },
+            &mut coll,
+        );
+        assert!(wrapped2.is_ok());
+    }
 
     #[test]
     fn test_local_prefix_could_match() {
