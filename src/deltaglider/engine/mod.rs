@@ -398,11 +398,17 @@ impl KeyIdCollisionCheck {
 /// fires the xattr-strip sniffer on reads — see B9 from the earlier
 /// audit).
 ///
-/// Currently dispatches only the `None` and `Aes256GcmProxy` modes:
-/// native SseKms / SseS3 fall through to the "wrap with no key"
-/// path. Step 4 plumbs those through `S3Backend::new` and this
-/// function grows to dispatch them properly. Until then,
-/// `Config::check` warns so operators don't silently run unencrypted.
+/// Resolves:
+///   * `Aes256GcmProxy` → proxy key + key_id, write_mode Encrypt.
+///   * `SseKms` / `SseS3` → primary key None, write_mode PassThrough.
+///     Inner S3Backend does the encryption (Step 4); wrapper stays
+///     in the stack for read-side sniffer defense + legacy shim.
+///   * `None` → no key, write_mode Encrypt (vacuous; encrypt_if_enabled
+///     short-circuits when key is None).
+///   * `legacy_key` / `legacy_key_id` (Step 5) → populated on the
+///     wrapper config when the YAML carries them. Used by the
+///     shim-aware read path to decrypt proxy-AES objects while the
+///     backend is running in native or no-key mode.
 fn wrap_backend_with_encryption(
     backend_name: &str,
     inner: Box<dyn StorageBackend>,
@@ -410,8 +416,12 @@ fn wrap_backend_with_encryption(
     collisions: &mut KeyIdCollisionCheck,
 ) -> Result<Box<dyn StorageBackend>, StorageError> {
     use crate::config::BackendEncryptionConfig as E;
-    let (key, resolved_key_id): (Option<crate::storage::EncryptionKey>, Option<String>) = match enc
-    {
+    // Resolve primary (key, key_id) + pick the write_mode.
+    let (primary_key, primary_kid, write_mode): (
+        Option<crate::storage::EncryptionKey>,
+        Option<String>,
+        crate::storage::WriteMode,
+    ) = match enc {
         E::Aes256GcmProxy {
             key: Some(hex),
             key_id,
@@ -426,10 +436,6 @@ fn wrap_backend_with_encryption(
                 Some(explicit) => explicit.clone(),
                 None => derive_key_id(backend_name, &parsed.0),
             };
-            // Record for collision detection. Works for derived ids
-            // too — an explicit id on a later backend that happens to
-            // match a prior derived id (extremely unlikely — SHA-256
-            // of distinct inputs) would surface here.
             collisions.record(backend_name, &kid, &parsed.0)?;
             tracing::info!(
                 "backend '{}' encryption: ENABLED (AES-256-GCM proxy, key_id={})",
@@ -446,7 +452,7 @@ fn wrap_backend_with_encryption(
                     env_name
                 );
             }
-            (Some(parsed), Some(kid))
+            (Some(parsed), Some(kid), crate::storage::WriteMode::Encrypt)
         }
         E::Aes256GcmProxy { key: None, .. } => {
             tracing::warn!(
@@ -455,34 +461,98 @@ fn wrap_backend_with_encryption(
                  or env var.",
                 backend_name
             );
-            (None, None)
+            (None, None, crate::storage::WriteMode::Encrypt)
         }
         E::SseKms { .. } | E::SseS3 { .. } => {
             // Native S3-side encryption — the S3Backend constructor
             // already received the matching `NativeEncryptionConfig`
-            // via `build_raw_backend`, and every PutObject gets
-            // `x-amz-server-side-encryption` headers. The proxy
-            // wrapper here holds no key and does not encrypt; it's
-            // in the stack only for the sniffer defense and to
-            // pass-through the `dg-encrypted-native` marker that
-            // S3Backend stamps.
+            // via `build_raw_backend`. The wrapper's primary key is
+            // None and writes ALWAYS skip encryption (PassThrough).
+            // The inner backend handles encryption at its layer.
             tracing::info!(
                 "backend '{}' encryption: ENABLED (native {})",
                 backend_name,
                 enc.mode_tag()
             );
-            (None, None)
+            (None, None, crate::storage::WriteMode::PassThrough)
         }
-        E::None => (None, None),
+        E::None => (None, None, crate::storage::WriteMode::Encrypt),
     };
 
+    // Resolve the decrypt-only shim from the legacy_* fields (Step 5).
+    // Both halves must be present; otherwise the shim silently
+    // ignores itself (matches the "needs both id + key to fire"
+    // invariant in `pick_decrypt_key`).
+    let (legacy_key_opt, legacy_kid_opt) = resolve_legacy_shim(backend_name, enc)?;
+    if let (Some(_), Some(ref kid)) = (&legacy_key_opt, &legacy_kid_opt) {
+        tracing::info!(
+            "backend '{}' decrypt-only shim active (legacy key_id='{}') — reads of \
+             objects stamped with that id will decrypt with legacy_key; new writes \
+             use the current mode. Remove legacy_key / legacy_key_id from the \
+             backend's encryption config once all historical objects have been \
+             re-written or deleted.",
+            backend_name,
+            kid
+        );
+    }
+
     let enc_config = Arc::new(ArcSwap::new(Arc::new(crate::storage::EncryptionConfig {
-        key,
-        key_id: resolved_key_id,
+        key: primary_key,
+        key_id: primary_kid,
+        write_mode,
+        legacy_key: legacy_key_opt,
+        legacy_key_id: legacy_kid_opt,
     })));
     Ok(Box::new(crate::storage::EncryptingBackend::new(
         inner, enc_config,
     )))
+}
+
+/// Pull the legacy_key / legacy_key_id pair out of the per-backend
+/// encryption config, parse the hex key, and derive the id if the
+/// operator left it implicit. Returns a pair of Options — BOTH
+/// present means "shim active"; either one alone is silently
+/// ignored (matches the wrapper's bilateral check).
+///
+/// Unlike the primary key path, the legacy key_id uses a reserved
+/// backend-name suffix `{backend_name}::legacy` so an operator who
+/// derives both from the same key material (rotation-shaped transition)
+/// still gets distinct primary and legacy ids.
+fn resolve_legacy_shim(
+    backend_name: &str,
+    enc: &crate::config::BackendEncryptionConfig,
+) -> Result<(Option<crate::storage::EncryptionKey>, Option<String>), StorageError> {
+    use crate::config::BackendEncryptionConfig as E;
+    let (legacy_hex, legacy_kid): (Option<&str>, Option<&str>) = match enc {
+        E::None => (None, None),
+        E::Aes256GcmProxy {
+            legacy_key,
+            legacy_key_id,
+            ..
+        }
+        | E::SseKms {
+            legacy_key,
+            legacy_key_id,
+            ..
+        }
+        | E::SseS3 {
+            legacy_key,
+            legacy_key_id,
+            ..
+        } => (legacy_key.as_deref(), legacy_key_id.as_deref()),
+    };
+
+    let Some(hex) = legacy_hex else {
+        return Ok((None, None));
+    };
+    let parsed = crate::storage::EncryptionKey::from_hex(hex).map_err(|e| {
+        StorageError::Encryption(format!("backend '{}' legacy_key: {}", backend_name, e))
+    })?;
+    let kid = match legacy_kid {
+        Some(explicit) => explicit.to_string(),
+        None => derive_key_id(&format!("{backend_name}::legacy"), &parsed.0),
+    };
+    Ok((Some(parsed), Some(kid)))
 }
 
 /// Derive the per-object `key_id` from the backend name + the 32 key
@@ -1548,6 +1618,104 @@ mod tests {
             }
             other => panic!("expected SseKms, got {other:?}"),
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Step 5: decrypt-only shim resolution
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_resolve_legacy_shim_absent_is_none_none() {
+        // A mode with no legacy_* fields set returns (None, None).
+        // The wrapper treats (None, None) as "no shim" — the
+        // one-sided case (legacy_key without legacy_key_id or vice
+        // versa) is silently ignored here, matching the bilateral
+        // check in `pick_decrypt_key`.
+        let (k, kid) = resolve_legacy_shim(
+            "b",
+            &crate::config::BackendEncryptionConfig::Aes256GcmProxy {
+                key: Some(HEX32_KEY_A.into()),
+                key_id: None,
+                legacy_key: None,
+                legacy_key_id: None,
+            },
+        )
+        .unwrap();
+        assert!(k.is_none());
+        assert!(kid.is_none());
+    }
+
+    #[test]
+    fn test_resolve_legacy_shim_explicit_kid_wins() {
+        // Operator pinned both legacy_key AND legacy_key_id; the
+        // resolver uses the explicit id verbatim.
+        let (k, kid) = resolve_legacy_shim(
+            "b",
+            &crate::config::BackendEncryptionConfig::SseKms {
+                kms_key_id: "arn".into(),
+                bucket_key_enabled: true,
+                legacy_key: Some(HEX32_KEY_B.into()),
+                legacy_key_id: Some("explicit-legacy".into()),
+            },
+        )
+        .unwrap();
+        assert!(k.is_some());
+        assert_eq!(kid.as_deref(), Some("explicit-legacy"));
+    }
+
+    #[test]
+    fn test_resolve_legacy_shim_derives_distinct_from_primary() {
+        // legacy_key set without legacy_key_id — resolver derives
+        // from `{name}::legacy` + key bytes. This MUST differ from
+        // the primary's derived id so the mismatch check doesn't
+        // accidentally let primary-stamped objects match the
+        // legacy slot (or vice versa).
+        let key_bytes = crate::storage::EncryptionKey::from_hex(HEX32_KEY_A)
+            .unwrap()
+            .0;
+        let primary_id = derive_key_id("b", &key_bytes);
+        let (_, legacy_id) = resolve_legacy_shim(
+            "b",
+            &crate::config::BackendEncryptionConfig::SseS3 {
+                legacy_key: Some(HEX32_KEY_A.into()),
+                legacy_key_id: None,
+            },
+        )
+        .unwrap();
+        assert!(legacy_id.is_some());
+        assert_ne!(
+            legacy_id.as_deref(),
+            Some(primary_id.as_str()),
+            "legacy-shim derivation MUST differ from primary derivation, \
+             even when the key material is identical — name suffix `::legacy` \
+             keeps them distinct"
+        );
+    }
+
+    #[test]
+    fn test_resolve_legacy_shim_rejects_bad_hex() {
+        // Bad hex in legacy_key surfaces at construction time with
+        // the backend name in the error message.
+        let result = resolve_legacy_shim(
+            "my-backend",
+            &crate::config::BackendEncryptionConfig::Aes256GcmProxy {
+                key: None,
+                key_id: None,
+                legacy_key: Some("not-hex".into()),
+                legacy_key_id: None,
+            },
+        );
+        // EncryptionKey doesn't impl Debug (to prevent key leakage
+        // via panic messages), so we destructure by hand.
+        let err = match result {
+            Ok(_) => panic!("bad legacy_key hex must error"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("my-backend") && (msg.contains("hex") || msg.contains("32 bytes")),
+            "bad legacy_key hex must cite backend name + hex/length, got: {msg}"
+        );
     }
 
     #[test]

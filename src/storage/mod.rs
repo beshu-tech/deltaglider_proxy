@@ -8,7 +8,7 @@ mod traits;
 #[cfg(unix)]
 pub(crate) mod xattr_meta;
 
-pub use encrypting::{EncryptingBackend, EncryptionConfig, EncryptionKey};
+pub use encrypting::{EncryptingBackend, EncryptionConfig, EncryptionKey, WriteMode};
 pub use filesystem::FilesystemBackend;
 pub use routing::RoutingBackend;
 pub use s3::{NativeEncryptionConfig, S3Backend};

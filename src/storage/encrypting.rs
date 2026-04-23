@@ -118,6 +118,23 @@ impl Drop for EncryptionKey {
     }
 }
 
+/// Controls what the wrapper does on writes. Reads always decrypt
+/// tagged objects regardless of this flag.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WriteMode {
+    /// Default: encrypt writes when `key` is Some, pass through
+    /// when None.
+    #[default]
+    Encrypt,
+    /// Writes always skip encryption — even when a `key` is present.
+    /// Used by the decrypt-only shim during a proxy-AES → native-SSE
+    /// mode transition: the wrapper keeps the legacy proxy key so
+    /// old objects still decrypt on read, but new writes go through
+    /// unencrypted (the inner `S3Backend` is already configured with
+    /// native SSE and encrypts server-side on its own).
+    PassThrough,
+}
+
 /// Hot-reloadable encryption configuration.
 ///
 /// `key` is the AES-256 master key used to encrypt/decrypt object
@@ -126,9 +143,13 @@ impl Drop for EncryptionKey {
 /// `dg-encryption-key-id` metadata field so read paths can detect
 /// cross-backend key mismatch (see [`ENCRYPTION_KEY_ID_KEY`]).
 ///
-/// Both fields are `Option` so the wrapper can short-circuit the
-/// encrypt path on mode-none backends (where `key` is None) while
-/// still firing the sniffer defense on reads.
+/// `legacy_key` + `legacy_key_id` hold the PREVIOUS key after a mode
+/// transition. When a read's `dg-encryption-key-id` matches the
+/// legacy id, the wrapper decrypts with `legacy_key` instead of
+/// `key`. This is the decrypt-only-shim affordance during
+/// proxy-AES → native-SSE migrations: operators keep reading old
+/// objects without having to rewrite them all up front.
+#[derive(Default)]
 pub struct EncryptionConfig {
     pub key: Option<EncryptionKey>,
     /// Stable id paired with `key`. Required when `key` is Some so
@@ -136,6 +157,17 @@ pub struct EncryptionConfig {
     /// automatically from `SHA-256(backend_name || key)` when the
     /// YAML doesn't pin one explicitly.
     pub key_id: Option<String>,
+    /// Write-path policy. `Encrypt` (default) follows the key:
+    /// encrypt when Some, passthrough when None. `PassThrough`
+    /// forces passthrough regardless of key presence — used by the
+    /// decrypt-only shim.
+    pub write_mode: WriteMode,
+    /// Decrypt-only-shim: the PREVIOUS key after a mode transition.
+    /// Consulted on reads when the object's stamped id doesn't match
+    /// `key_id` but DOES match `legacy_key_id`.
+    pub legacy_key: Option<EncryptionKey>,
+    /// Id paired with `legacy_key`. Same shape rules as `key_id`.
+    pub legacy_key_id: Option<String>,
 }
 
 /// Encrypt plaintext → `[12-byte IV] [ciphertext + 16-byte GCM tag]`.
@@ -853,11 +885,22 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         self.config.load().key_id.clone()
     }
 
+    fn current_write_mode(&self) -> WriteMode {
+        self.config.load().write_mode
+    }
+
     fn encrypt_if_enabled(
         &self,
         data: &[u8],
         metadata: &mut FileMetadata,
     ) -> Result<Vec<u8>, StorageError> {
+        // WriteMode::PassThrough short-circuits encryption even when
+        // a `key` is present — the decrypt-only-shim case for
+        // proxy-AES → native-SSE transitions. The inner S3Backend is
+        // already doing native encryption at its layer.
+        if self.current_write_mode() == WriteMode::PassThrough {
+            return Ok(data.to_vec());
+        }
         if let Some(key) = self.current_key() {
             let encrypted = encrypt(&key, data)?;
             mark_encrypted(metadata, self.current_key_id().as_deref());
@@ -867,25 +910,78 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         }
     }
 
+    /// Pick the (key, key_id) pair that should decrypt this object.
+    /// Returns `(key, Some(key_id))` for the matching current or
+    /// legacy key, or the current key with no-id-match for legacy
+    /// (pre-Step-3) objects. Returns an error on mismatch AND no
+    /// legacy fallback — same semantics as `check_key_id_match`
+    /// plus the shim overlay.
+    fn pick_decrypt_key(&self, object_kid: Option<&str>) -> Result<EncryptionKey, StorageError> {
+        // Snapshot under a single ArcSwap load so a concurrent
+        // hot-reload can't split the decision.
+        let cfg = self.config.load();
+        let primary_key = cfg.key.clone();
+        let primary_kid = cfg.key_id.clone();
+        let legacy = match (cfg.legacy_key.clone(), cfg.legacy_key_id.clone()) {
+            (Some(k), Some(kid)) => Some((k, kid)),
+            _ => None,
+        };
+        drop(cfg); // release the guard early
+
+        match object_kid {
+            Some(obj_id) => {
+                // Prefer primary when ids match.
+                if let Some(pid) = primary_kid.as_deref() {
+                    if pid == obj_id {
+                        return primary_key.ok_or_else(|| {
+                            StorageError::Encryption(
+                                "object is encrypted but no key is configured".into(),
+                            )
+                        });
+                    }
+                }
+                // Fall back to legacy if present and matching.
+                if let Some((lk, lid)) = legacy {
+                    if lid == obj_id {
+                        return Ok(lk);
+                    }
+                }
+                // Neither primary nor legacy matches — the operator
+                // either rotated without the shim or routed the
+                // bucket to the wrong backend. Emit the specific
+                // error that cites the object's id AND both
+                // candidate ids the wrapper knows about.
+                let cfg_id = primary_kid.as_deref().unwrap_or("<unset>");
+                Err(StorageError::Encryption(format!(
+                    "object was encrypted with key id '{obj_id}', but this backend is \
+                     configured with key id '{cfg_id}' (no legacy-shim match either). This \
+                     usually means: (a) the key was rotated without `legacy_key` set — \
+                     restore the old key alongside the new one to read historical objects; \
+                     (b) this bucket is routed to the wrong backend; (c) two backends \
+                     share physical storage with different keys. Refusing to run AEAD — \
+                     the underlying auth failure would be opaque."
+                )))
+            }
+            None => {
+                // Legacy object (no stamp). Primary key wins. If
+                // primary has no key, we return the same error as
+                // pre-shim behaviour — the caller surfaces "no key
+                // configured" when needed.
+                primary_key.ok_or_else(|| {
+                    StorageError::Encryption("object is encrypted but no key is configured".into())
+                })
+            }
+        }
+    }
+
     fn decrypt_if_needed(
         &self,
         data: Vec<u8>,
         metadata: &FileMetadata,
     ) -> Result<Vec<u8>, StorageError> {
         if is_encrypted(metadata) {
-            if let Some(key) = self.current_key() {
-                // Key-id mismatch short-circuit. Two-sided conditional:
-                // we only fire when BOTH the object and the wrapper
-                // have a stamped/configured id. Pre-Step-3 objects
-                // (no stamp) fall through to AEAD as before — they
-                // stay readable as long as the key material matches.
-                check_key_id_match(stamped_key_id(metadata), self.current_key_id().as_deref())?;
-                decrypt(&key, &data)
-            } else {
-                Err(StorageError::Encryption(
-                    "object is encrypted but no key is configured".into(),
-                ))
-            }
+            let key = self.pick_decrypt_key(stamped_key_id(metadata))?;
+            decrypt(&key, &data)
         } else {
             Ok(data)
         }
@@ -1196,17 +1292,11 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         // format — a 5 GiB download stays at ~130 KiB peak memory in
         // the decoder.
         if is_chunked_encrypted(&meta) {
-            let Some(key) = self.current_key() else {
-                return Err(StorageError::Encryption(
-                    "object is encrypted but no key is configured".into(),
-                ));
-            };
-            // Key-id mismatch check BEFORE issuing the backend read —
-            // the error surfaces at stream-open time, matching the v1
-            // path's eager rejection. Without this the mismatch would
-            // only fire at first AEAD chunk decrypt, after the client
-            // already has a 200 response and a streaming body open.
-            check_key_id_match(stamped_key_id(&meta), self.current_key_id().as_deref())?;
+            // Shim-aware key selection: primary first, legacy if set
+            // and the object's stamped id matches it. Emits the
+            // specific "rotated without legacy_key" error on full
+            // mismatch so the operator knows what the fix is.
+            let key = self.pick_decrypt_key(stamped_key_id(&meta))?;
             let ct_stream = self
                 .inner
                 .get_passthrough_stream(bucket, prefix, filename)
@@ -1275,15 +1365,10 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         // pulled all 10 GiB). The two-fetch approach trades one extra
         // tiny request for bounded cost on every range shape.
         if is_chunked_encrypted(&meta) {
-            let Some(key) = self.current_key() else {
-                return Err(StorageError::Encryption(
-                    "object is encrypted but no key is configured".into(),
-                ));
-            };
-            // Key-id mismatch check at range-request open, same as the
-            // full-stream path above. Surfaces the specific error
-            // before the two backend range reads (header + body) fire.
-            check_key_id_match(stamped_key_id(&meta), self.current_key_id().as_deref())?;
+            // Shim-aware key selection; same behaviour as the full-
+            // stream path. Surfaces the specific error before any
+            // backend range reads fire.
+            let key = self.pick_decrypt_key(stamped_key_id(&meta))?;
             let final_idx = final_chunk_index_for_plaintext_size(meta.file_size);
             // Clamp `end` (inclusive) to the actual plaintext size.
             let effective_end = std::cmp::min(end, meta.file_size.saturating_sub(1));
@@ -2167,6 +2252,7 @@ mod tests {
         let enc_config = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
             key: Some(key),
             key_id: None,
+            ..Default::default()
         })));
         let wrapper = EncryptingBackend::new(backend, enc_config);
         (wrapper, plaintext)
@@ -2280,6 +2366,7 @@ mod tests {
         let enc_config = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
             key: None,
             key_id: None,
+            ..Default::default()
         })));
         let wrapper = EncryptingBackend::new(backend, enc_config);
 
@@ -2371,6 +2458,7 @@ mod tests {
         let enc_config = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
             key: Some(key),
             key_id: wrapper_key_id,
+            ..Default::default()
         })));
         let wrapper = EncryptingBackend::new(backend, enc_config);
         (wrapper, plaintext)
@@ -2463,6 +2551,251 @@ mod tests {
         assert_eq!(
             got, plaintext,
             "legacy objects must decrypt when the key itself still matches"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Step 5: decrypt-only shim + WriteMode::PassThrough
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Inputs for the shim-wrapper fixture. Struct keeps the param
+    /// count under clippy's `too_many_arguments` threshold while
+    /// still being readable at call sites (field names document
+    /// intent better than positional args).
+    struct ShimSetup {
+        primary_key: Option<EncryptionKey>,
+        primary_kid: Option<String>,
+        write_mode: WriteMode,
+        legacy_key: Option<EncryptionKey>,
+        legacy_kid: Option<String>,
+        stamped_key: EncryptionKey,
+        stamped_kid: Option<&'static str>,
+        plaintext_size: usize,
+    }
+
+    /// Build a wrapper with a two-key config (primary + legacy shim)
+    /// around a CountingBackend pre-loaded with a chunked-encrypted
+    /// object encrypted under `stamped_key` + `stamped_kid`.
+    async fn setup_shim_wrapper(s: ShimSetup) -> (EncryptingBackend<CountingBackend>, Vec<u8>) {
+        let plaintext: Vec<u8> = (0..s.plaintext_size).map(|i| (i & 0xff) as u8).collect();
+        let (ciphertext, _iv, _final_idx) = encode_chunked(&s.stamped_key, &plaintext);
+        let mut meta = FileMetadata::fallback(
+            "test.bin".into(),
+            s.plaintext_size as u64,
+            "md5".into(),
+            Utc::now(),
+            None,
+            crate::types::StorageInfo::Passthrough,
+        );
+        mark_chunked_encrypted(&mut meta, s.stamped_kid);
+        let mut backend = CountingBackend::new();
+        backend.set_contents(ciphertext, meta);
+        let cfg = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
+            key: s.primary_key,
+            key_id: s.primary_kid,
+            write_mode: s.write_mode,
+            legacy_key: s.legacy_key,
+            legacy_key_id: s.legacy_kid,
+        })));
+        (EncryptingBackend::new(backend, cfg), plaintext)
+    }
+
+    #[tokio::test]
+    async fn test_shim_decrypts_legacy_stamped_objects() {
+        // Scenario: operator migrated from aes256-gcm-proxy (key=K1,
+        // id=id-K1) to sse-kms (on S3 side), keeping K1/id-K1 as the
+        // legacy shim. A historical object is stamped with id-K1;
+        // the wrapper has NO primary key (native mode), write_mode
+        // PassThrough. Read must succeed by matching against the
+        // legacy shim.
+        let k1 = test_key();
+        let k1_for_stamp = test_key(); // same bytes, independent allocation
+        let (wrapper, plaintext) = setup_shim_wrapper(ShimSetup {
+            primary_key: None, // native mode primary
+            primary_kid: None,
+            write_mode: WriteMode::PassThrough,
+            legacy_key: Some(k1),
+            legacy_kid: Some("id-K1".to_string()),
+            stamped_key: k1_for_stamp,
+            stamped_kid: Some("id-K1"),
+            plaintext_size: 4096,
+        })
+        .await;
+        let got = wrapper.get_passthrough("b", "p", "test.bin").await.unwrap();
+        assert_eq!(got, plaintext);
+    }
+
+    #[tokio::test]
+    async fn test_shim_primary_key_takes_precedence() {
+        // Wrapper has BOTH primary and legacy keys configured. An
+        // object stamped with the primary's id decrypts under the
+        // primary; the legacy is never consulted. Guards against
+        // ambiguous routing where both happen to have the same id
+        // (the collision-detect path elsewhere prevents this, but
+        // this test pins the tie-break in the wrapper itself).
+        let k_primary = test_key();
+        let k_primary_stamp = test_key();
+        let k_legacy = other_key();
+        let (wrapper, plaintext) = setup_shim_wrapper(ShimSetup {
+            primary_key: Some(k_primary),
+            primary_kid: Some("id-primary".to_string()),
+            write_mode: WriteMode::Encrypt,
+            legacy_key: Some(k_legacy),
+            legacy_kid: Some("id-legacy".to_string()),
+            stamped_key: k_primary_stamp,
+            stamped_kid: Some("id-primary"),
+            plaintext_size: 4096,
+        })
+        .await;
+        let got = wrapper.get_passthrough("b", "p", "test.bin").await.unwrap();
+        assert_eq!(got, plaintext);
+    }
+
+    #[tokio::test]
+    async fn test_shim_legacy_id_only_fires_when_object_matches() {
+        // Object stamped with an id that matches NEITHER primary nor
+        // legacy. Must error with the specific "rotated without
+        // legacy_key" message so the operator knows what's missing.
+        let k_primary = test_key();
+        let k_orphan_stamp = other_key(); // stamped with DIFFERENT key material
+        let (wrapper, _plaintext) = setup_shim_wrapper(ShimSetup {
+            primary_key: Some(k_primary),
+            primary_kid: Some("id-primary".to_string()),
+            write_mode: WriteMode::Encrypt,
+            legacy_key: None, // NO legacy — expected to fail hard
+            legacy_kid: None,
+            stamped_key: k_orphan_stamp,
+            stamped_kid: Some("id-orphan"),
+            plaintext_size: 4096,
+        })
+        .await;
+        let err = match wrapper.get_passthrough("b", "p", "test.bin").await {
+            Ok(_) => panic!("must error when object id matches nothing"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("id-orphan") && msg.contains("id-primary"),
+            "error must cite BOTH ids so the operator can diagnose, got: {msg}"
+        );
+        assert!(
+            msg.contains("legacy_key"),
+            "error must mention legacy_key as the recovery path, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_write_mode_passthrough_skips_encryption() {
+        // Direct unit test on `encrypt_if_enabled` via a wrapper.
+        // WriteMode::PassThrough must return the plaintext verbatim
+        // and NOT stamp the `dg-encrypted` marker — even when a
+        // primary key is configured. This is the native-SSE
+        // transition invariant: writes go through the proxy wrapper
+        // unchanged while old objects still decrypt via the shim.
+        let key = test_key();
+        let cfg = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
+            key: Some(key),
+            key_id: Some("current".into()),
+            write_mode: WriteMode::PassThrough,
+            ..Default::default()
+        })));
+        let wrapper: EncryptingBackend<CountingBackend> =
+            EncryptingBackend::new(CountingBackend::new(), cfg);
+
+        let mut meta = FileMetadata::fallback(
+            "x".into(),
+            10,
+            "md5".into(),
+            Utc::now(),
+            None,
+            crate::types::StorageInfo::Passthrough,
+        );
+        let plaintext = b"no encrypt for me";
+        let out = wrapper.encrypt_if_enabled(plaintext, &mut meta).unwrap();
+        assert_eq!(out, plaintext, "PassThrough must return plaintext verbatim");
+        assert!(
+            !is_encrypted(&meta),
+            "PassThrough must NOT stamp dg-encrypted marker"
+        );
+        assert!(
+            stamped_key_id(&meta).is_none(),
+            "PassThrough must NOT stamp dg-encryption-key-id"
+        );
+    }
+
+    #[test]
+    fn test_write_mode_encrypt_still_works_normally() {
+        // The Encrypt default continues to encrypt + stamp markers.
+        // Regression guard that the Default impl on WriteMode is
+        // Encrypt (not PassThrough), which the struct-update
+        // `..Default::default()` calls in this module rely on.
+        let key = test_key();
+        let cfg = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
+            key: Some(key),
+            key_id: Some("id".into()),
+            ..Default::default()
+        })));
+        assert_eq!(cfg.load().write_mode, WriteMode::Encrypt);
+        let wrapper: EncryptingBackend<CountingBackend> =
+            EncryptingBackend::new(CountingBackend::new(), cfg);
+
+        let mut meta = FileMetadata::fallback(
+            "x".into(),
+            10,
+            "md5".into(),
+            Utc::now(),
+            None,
+            crate::types::StorageInfo::Passthrough,
+        );
+        let out = wrapper.encrypt_if_enabled(b"secret", &mut meta).unwrap();
+        assert_ne!(out, b"secret", "Encrypt must actually encrypt");
+        assert!(is_encrypted(&meta), "Encrypt must stamp dg-encrypted");
+        assert_eq!(
+            stamped_key_id(&meta),
+            Some("id"),
+            "Encrypt must stamp the key_id"
+        );
+    }
+
+    #[test]
+    fn test_pick_decrypt_key_legacy_object_uses_primary() {
+        // Pre-Step-3 objects have no stamp. `pick_decrypt_key`
+        // returns the primary key (legacy shim is ignored when the
+        // object has no id to match).
+        let k_primary = test_key();
+        let cfg = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
+            key: Some(k_primary),
+            key_id: Some("primary-id".into()),
+            legacy_key: Some(other_key()),
+            legacy_key_id: Some("legacy-id".into()),
+            ..Default::default()
+        })));
+        let wrapper: EncryptingBackend<CountingBackend> =
+            EncryptingBackend::new(CountingBackend::new(), cfg);
+        // `None` = the object had no `dg-encryption-key-id` stamp.
+        let picked = wrapper.pick_decrypt_key(None).unwrap();
+        // Assert it's the PRIMARY key by re-encrypting with it and
+        // decrypting a round-trip.
+        let ct = encrypt(&picked, b"hello").unwrap();
+        assert_eq!(decrypt(&test_key(), &ct).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn test_pick_decrypt_key_no_primary_no_legacy_errors() {
+        // Wrapper has no key at all. `pick_decrypt_key` called for
+        // an encrypted object must error with the "no key configured"
+        // message — same as the pre-shim behaviour.
+        let cfg = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig::default())));
+        let wrapper: EncryptingBackend<CountingBackend> =
+            EncryptingBackend::new(CountingBackend::new(), cfg);
+        let err = match wrapper.pick_decrypt_key(Some("some-id")) {
+            Ok(_) => panic!("must error when wrapper has no keys"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("some-id") && msg.contains("no legacy-shim match"),
+            "error must cite the object id and the missing-legacy hint, got: {msg}"
         );
     }
 }
