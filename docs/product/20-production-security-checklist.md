@@ -244,6 +244,45 @@ DGP_SECURE_COOKIES=true
 
 ---
 
+## Step 6: Enable Encryption at Rest (optional)
+
+**What:** Encrypt stored object bodies with AES-256-GCM. Delta compression happens first, so compression gains are preserved.
+
+**Why:** If someone walks off with the disks — or your S3 backend is breached at the storage layer — the ciphertext is useless without the key. Metadata (object names, sizes, compression ratios) stays unencrypted.
+
+1. Open the admin GUI → **Admin Settings** → **Storage** → **Encryption**
+2. Click **Generate New Key** (uses `crypto.getRandomValues` — the key never round-trips through the server)
+3. Copy the 64-char hex key to your secret manager / password vault
+4. Check **I have stored this key safely**
+5. Click **Apply and Persist**
+
+Alternatively, set via env var (recommended — keeps the key out of the YAML artifact):
+
+```bash
+DGP_ENCRYPTION_KEY=$(openssl rand -hex 32)
+```
+
+> [!WARNING] If you lose the key, encrypted objects are unrecoverable.
+> DeltaGlider does not escrow keys. There is no recovery path. Store the key somewhere outside the proxy host — a secrets manager, an operator password vault, a sealed envelope.
+
+**Caveats:**
+- **Rotation is not supported in this release.** Changing the key makes objects written under the old key unreadable until the old key is restored. The admin panel warns about this before Apply.
+- **Only new writes are encrypted.** Enabling encryption does not retroactively encrypt existing objects.
+- **Existing encrypted objects remain readable** if you turn encryption off — only new writes become plaintext again.
+
+**Large objects:** The codec chunks plaintext into 64-KiB windows, so multi-GiB passthrough uploads and downloads stream end-to-end without buffering the entire object. Range reads trim at chunk boundaries (≤64 KiB overhead per end).
+
+**What's encrypted vs. what isn't:**
+
+| Layer | Encrypted? |
+|---|---|
+| Object body (passthrough) | Yes — chunked AES-256-GCM |
+| Delta body + reference body | Yes — single-shot AES-256-GCM |
+| Object name / size / metadata | No (stored in backend's native metadata) |
+| Transport (network) | Configure TLS at reverse proxy (Step 5) |
+
+---
+
 ## Verification Checklist
 
 After completing all steps, verify:
@@ -279,4 +318,5 @@ curl -s https://files.example.com/_/health
 | Rate limit | `DGP_RATE_LIMIT_LOCKOUT_SECS` | 600 | 1800-3600 |
 | Proxy | `DGP_TRUST_PROXY_HEADERS` | true | true (behind proxy) |
 | Cookies | `DGP_SECURE_COOKIES` | true | true |
+| At-rest | `DGP_ENCRYPTION_KEY` | None (plaintext) | 64-char hex (optional) |
 | Debug | `DGP_DEBUG_HEADERS` | false | false |

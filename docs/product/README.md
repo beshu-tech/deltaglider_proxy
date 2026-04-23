@@ -45,6 +45,7 @@ These docs are operator-facing — everything you need to install, secure, run, 
 - [Authentication reference](reference/authentication.md) — conceptual model, error codes, claim shapes.
 - [Metrics reference](reference/metrics.md) — every Prometheus metric and label.
 - [How delta works](reference/how-delta-works.md) — on-disk layout, PUT/GET flow, integrity guarantees.
+- [Encryption at rest](reference/encryption-at-rest.md) — AES-256-GCM for stored objects, chunked streaming wire format, operational caveats.
 
 ## One-paragraph summary
 

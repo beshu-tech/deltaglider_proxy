@@ -698,6 +698,8 @@ Optional AES-256-GCM encryption for all new writes. Existing unencrypted objects
 
 Setting `encryption_key` to an empty string is equivalent to unset.
 
+Large passthrough uploads are encrypted in 64-KiB chunks (end-to-end streaming — no whole-object buffering); deltas and references stay single-shot. Rotation is not supported in this release — changing the key makes objects written under the old key unreadable until the old key is restored. See [encryption at rest](encryption-at-rest.md) for the full wire format and operational caveats.
+
 ---
 
 ## CLI Subcommands
