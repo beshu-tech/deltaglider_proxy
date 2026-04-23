@@ -453,6 +453,95 @@ async fn test_chunked_path_actually_exercised() {
     let _ = found_v1_marker;
 }
 
+/// Step 3 regression: every encrypted write stamps
+/// `dg-encryption-key-id` on the object's xattr metadata. Without
+/// this stamp the key-id mismatch check on reads can't fire, and the
+/// ops value of "tell the operator WHICH key the object was written
+/// with" disappears into an opaque AEAD failure.
+///
+/// Test covers BOTH single-shot writes (put_passthrough) and the
+/// chunked write path (put_passthrough_chunked via multipart) to catch
+/// regressions in either mark_encrypted / mark_chunked_encrypted.
+#[tokio::test]
+async fn test_write_stamps_key_id_metadata() {
+    let server = encrypted_builder().build().await;
+
+    // Single-shot: a small object goes through put_passthrough.
+    put_object(&server, "small.txt", b"tiny").await;
+
+    // Chunked: a multipart upload goes through put_passthrough_chunked.
+    let parts = vec![vec![0u8; 256 * 1024]; 2];
+    multipart_put(&server, "chunked.bin", &parts).await;
+
+    let data_dir = server.data_dir().expect("filesystem backend");
+    let mut small_kid: Option<String> = None;
+    let mut chunked_kid: Option<String> = None;
+    for entry in walkdir::WalkDir::new(data_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let xattr_raw = match xattr::get(entry.path(), "user.dg.metadata") {
+            Ok(Some(bytes)) => bytes,
+            _ => continue,
+        };
+        let meta_json = match std::str::from_utf8(&xattr_raw) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // Proper JSON probe — the xattr JSON includes user_metadata
+        // as a map, and serde_json gives us a clean lookup.
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(meta_json) {
+            let kid = parsed
+                .get("user_metadata")
+                .and_then(|um| um.get("dg-encryption-key-id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if let Some(kid) = kid {
+                let fname = entry
+                    .path()
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                // Both files get the SAME kid (singleton "default"
+                // backend → same wrapper → same id).
+                if fname == "small.txt" {
+                    small_kid = Some(kid);
+                } else if fname == "chunked.bin" {
+                    chunked_kid = Some(kid);
+                }
+            }
+        }
+    }
+
+    assert!(
+        small_kid.is_some(),
+        "single-shot write must stamp dg-encryption-key-id metadata"
+    );
+    assert!(
+        chunked_kid.is_some(),
+        "chunked write must stamp dg-encryption-key-id metadata"
+    );
+    assert_eq!(
+        small_kid, chunked_kid,
+        "two writes through the same backend wrapper must produce the SAME key_id — \
+         derived from SHA-256(backend_name || key)"
+    );
+    let kid = small_kid.unwrap();
+    // Derived ids are 16 hex chars (8 bytes of SHA-256).
+    assert_eq!(
+        kid.len(),
+        16,
+        "derived key_id must be 16 hex chars, got: {kid}"
+    );
+    assert!(
+        kid.chars().all(|c| c.is_ascii_hexdigit()),
+        "derived key_id must be hex, got: {kid}"
+    );
+}
+
 /// Range reads on a chunked-encrypted object. Exercises the O(1)
 /// offset math: range covers chunks 10-12 (mid-object) of an 80-chunk
 /// object.

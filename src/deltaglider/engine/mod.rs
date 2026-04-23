@@ -374,7 +374,8 @@ fn wrap_backend_with_encryption(
     collisions: &mut KeyIdCollisionCheck,
 ) -> Result<Box<dyn StorageBackend>, StorageError> {
     use crate::config::BackendEncryptionConfig as E;
-    let key: Option<crate::storage::EncryptionKey> = match enc {
+    let (key, resolved_key_id): (Option<crate::storage::EncryptionKey>, Option<String>) = match enc
+    {
         E::Aes256GcmProxy {
             key: Some(hex),
             key_id,
@@ -382,32 +383,24 @@ fn wrap_backend_with_encryption(
         } => {
             let parsed =
                 crate::storage::EncryptionKey::from_hex(hex).map_err(StorageError::Encryption)?;
-            // If the operator pinned an explicit key_id, record it for
-            // collision detection against other backends.
-            if let Some(kid) = key_id {
-                collisions.record(backend_name, kid, &parsed.0)?;
-            }
-            tracing::info!(
-                "backend '{}' encryption: ENABLED (AES-256-GCM proxy)",
-                backend_name
-            );
-            // If the key came from the YAML file (not the env var),
-            // nudge the operator to keep an off-box copy. Losing the
-            // config file + no backup = unrecoverable ciphertext.
-            let env_name = if backend_name == "default" {
-                "DGP_ENCRYPTION_KEY".to_string()
-            } else {
-                format!(
-                    "DGP_BACKEND_{}_ENCRYPTION_KEY",
-                    backend_name
-                        .chars()
-                        .map(|c| match c {
-                            '-' | '.' => '_',
-                            c => c.to_ascii_uppercase(),
-                        })
-                        .collect::<String>()
-                )
+            // Resolve the id: explicit wins over derived. Derivation
+            // mixes the backend name in so same-key/different-name
+            // backends get distinct ids (see derive_key_id comment).
+            let kid = match key_id {
+                Some(explicit) => explicit.clone(),
+                None => derive_key_id(backend_name, &parsed.0),
             };
+            // Record for collision detection. Works for derived ids
+            // too — an explicit id on a later backend that happens to
+            // match a prior derived id (extremely unlikely — SHA-256
+            // of distinct inputs) would surface here.
+            collisions.record(backend_name, &kid, &parsed.0)?;
+            tracing::info!(
+                "backend '{}' encryption: ENABLED (AES-256-GCM proxy, key_id={})",
+                backend_name,
+                kid
+            );
+            let env_name = env_name_for_backend(backend_name);
             if std::env::var(&env_name).is_err() {
                 tracing::warn!(
                     "backend '{}' encryption key was loaded from config file (not {}). \
@@ -417,7 +410,7 @@ fn wrap_backend_with_encryption(
                     env_name
                 );
             }
-            Some(parsed)
+            (Some(parsed), Some(kid))
         }
         E::Aes256GcmProxy { key: None, .. } => {
             tracing::warn!(
@@ -426,14 +419,9 @@ fn wrap_backend_with_encryption(
                  or env var.",
                 backend_name
             );
-            None
+            (None, None)
         }
         E::SseKms { .. } | E::SseS3 { .. } => {
-            // Step 4 lands the native-SSE plumbing in S3Backend::new.
-            // Until then, native-mode backends wrap with no key so
-            // the sniffer still fires on reads but writes go plaintext
-            // (unless the operator already has AWS-side bucket
-            // encryption configured out-of-band).
             tracing::warn!(
                 "backend '{}' requests native SSE mode '{}' but the S3Backend plumbing \
                  for native modes is not enabled in this build — writes are currently \
@@ -442,17 +430,62 @@ fn wrap_backend_with_encryption(
                 backend_name,
                 enc.mode_tag()
             );
-            None
+            (None, None)
         }
-        E::None => None,
+        E::None => (None, None),
     };
 
     let enc_config = Arc::new(ArcSwap::new(Arc::new(crate::storage::EncryptionConfig {
         key,
+        key_id: resolved_key_id,
     })));
     Ok(Box::new(crate::storage::EncryptingBackend::new(
         inner, enc_config,
     )))
+}
+
+/// Derive the per-object `key_id` from the backend name + the 32 key
+/// bytes. Name is hashed in first, followed by a 0x00 separator, then
+/// the key bytes. Truncated to 16 hex chars of SHA-256.
+///
+/// Name mixing disambiguates "two backends with the same key material"
+/// so objects don't accidentally decrypt across backends — the read
+/// path's `check_key_id_match` would reject with a specific error
+/// rather than the underlying AEAD having any chance to succeed on
+/// ciphertext that "happened to" come from a different backend.
+///
+/// Operators who WANT cross-backend portability pin an explicit
+/// matching `key_id` on both — that's the documented escape hatch,
+/// exercised by `test_key_id_collision_allowed_with_same_key`.
+fn derive_key_id(backend_name: &str, key_bytes: &[u8; 32]) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(backend_name.as_bytes());
+    hasher.update(b"\0"); // separator: "ab"+"c" ≠ "a"+"bc"
+    hasher.update(key_bytes);
+    hex::encode(&hasher.finalize()[..8])
+}
+
+/// Canonical env var name for a backend's encryption key. Matches the
+/// `apply_backend_encryption_env` pairing so an operator who sets
+/// `DGP_BACKEND_EU_ARCHIVE_ENCRYPTION_KEY` has that key land on
+/// backend `eu-archive` and the "key loaded from file" log points
+/// back at the SAME env var name.
+fn env_name_for_backend(backend_name: &str) -> String {
+    if backend_name == "default" {
+        "DGP_ENCRYPTION_KEY".to_string()
+    } else {
+        format!(
+            "DGP_BACKEND_{}_ENCRYPTION_KEY",
+            backend_name
+                .chars()
+                .map(|c| match c {
+                    '-' | '.' => '_',
+                    c => c.to_ascii_uppercase(),
+                })
+                .collect::<String>()
+        )
+    }
 }
 
 impl<S: StorageBackend> DeltaGliderEngine<S> {

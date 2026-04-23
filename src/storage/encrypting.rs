@@ -61,6 +61,15 @@ use std::sync::Arc;
 pub const ENCRYPTION_MARKER_KEY: &str = "dg-encrypted";
 pub const ENCRYPTION_MARKER_VALUE: &str = "aes-256-gcm-v1";
 pub const CHUNK_MARKER_VALUE: &str = "aes-256-gcm-chunked-v1";
+/// Metadata field stamping the per-object key_id of the key that
+/// encrypted it. Lets reads detect "this object was encrypted with a
+/// key I don't currently have configured" and emit a SPECIFIC error
+/// (cites both ids) instead of the opaque AEAD auth failure.
+///
+/// Legacy objects without this field fall through unchanged — the
+/// mismatch check only fires when BOTH sides have a key_id, so the
+/// upgrade path for pre-key-id objects is a no-op.
+pub const ENCRYPTION_KEY_ID_KEY: &str = "dg-encryption-key-id";
 const IV_LEN: usize = 12;
 const GCM_TAG_LEN: usize = 16;
 
@@ -110,8 +119,23 @@ impl Drop for EncryptionKey {
 }
 
 /// Hot-reloadable encryption configuration.
+///
+/// `key` is the AES-256 master key used to encrypt/decrypt object
+/// bodies on this backend. `key_id` is a stable, non-secret
+/// identifier stamped on each written object as the
+/// `dg-encryption-key-id` metadata field so read paths can detect
+/// cross-backend key mismatch (see [`ENCRYPTION_KEY_ID_KEY`]).
+///
+/// Both fields are `Option` so the wrapper can short-circuit the
+/// encrypt path on mode-none backends (where `key` is None) while
+/// still firing the sniffer defense on reads.
 pub struct EncryptionConfig {
     pub key: Option<EncryptionKey>,
+    /// Stable id paired with `key`. Required when `key` is Some so
+    /// reads can detect mismatch; the engine resolver derives it
+    /// automatically from `SHA-256(backend_name || key)` when the
+    /// YAML doesn't pin one explicitly.
+    pub key_id: Option<String>,
 }
 
 /// Encrypt plaintext → `[12-byte IV] [ciphertext + 16-byte GCM tag]`.
@@ -163,24 +187,44 @@ pub fn is_chunked_encrypted(metadata: &FileMetadata) -> bool {
         .unwrap_or(false)
 }
 
-pub fn mark_encrypted(metadata: &mut FileMetadata) {
+/// Stamp the single-shot-format marker on the write path. When
+/// `key_id` is `Some`, also stamps `dg-encryption-key-id` so reads
+/// can cross-check against the wrapper's configured key_id. Legacy
+/// objects written without a key_id stay readable (the read check
+/// is a two-sided conditional — both sides need an id to fire).
+pub fn mark_encrypted(metadata: &mut FileMetadata, key_id: Option<&str>) {
     metadata.user_metadata.insert(
         ENCRYPTION_MARKER_KEY.to_string(),
         ENCRYPTION_MARKER_VALUE.to_string(),
     );
-    // TODO(key-rotation): once we ship multi-key support, also stamp a
-    // `dg-encryption-key-id: <hex>` so reads can dispatch to the right
-    // key. Until then, the current key is assumed for every encrypted
-    // object. See docs/dev/historical/ for the rotation design sketch.
+    if let Some(kid) = key_id {
+        metadata
+            .user_metadata
+            .insert(ENCRYPTION_KEY_ID_KEY.to_string(), kid.to_string());
+    }
 }
 
-/// Stamp the chunked-format marker. Called when writing via the streaming
-/// chunked path; distinguishes the wire format on read.
-pub fn mark_chunked_encrypted(metadata: &mut FileMetadata) {
+/// Stamp the chunked-format marker on the write path. Same key_id
+/// semantics as [`mark_encrypted`].
+pub fn mark_chunked_encrypted(metadata: &mut FileMetadata, key_id: Option<&str>) {
     metadata.user_metadata.insert(
         ENCRYPTION_MARKER_KEY.to_string(),
         CHUNK_MARKER_VALUE.to_string(),
     );
+    if let Some(kid) = key_id {
+        metadata
+            .user_metadata
+            .insert(ENCRYPTION_KEY_ID_KEY.to_string(), kid.to_string());
+    }
+}
+
+/// Read the object's stamped key_id, if any. Returns None for legacy
+/// objects that pre-date the Step 3 stamp.
+pub fn stamped_key_id(metadata: &FileMetadata) -> Option<&str> {
+    metadata
+        .user_metadata
+        .get(ENCRYPTION_KEY_ID_KEY)
+        .map(|s| s.as_str())
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -801,6 +845,14 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         self.config.load().key.clone()
     }
 
+    /// Snapshot the wrapper's configured key_id. Called on writes
+    /// (to stamp) and reads (to compare). Captured before the encrypt/
+    /// decrypt call so a concurrent hot-reload flip between key-check
+    /// and AEAD-op doesn't produce spurious "mismatch" errors.
+    fn current_key_id(&self) -> Option<String> {
+        self.config.load().key_id.clone()
+    }
+
     fn encrypt_if_enabled(
         &self,
         data: &[u8],
@@ -808,7 +860,7 @@ impl<B: StorageBackend> EncryptingBackend<B> {
     ) -> Result<Vec<u8>, StorageError> {
         if let Some(key) = self.current_key() {
             let encrypted = encrypt(&key, data)?;
-            mark_encrypted(metadata);
+            mark_encrypted(metadata, self.current_key_id().as_deref());
             Ok(encrypted)
         } else {
             Ok(data.to_vec())
@@ -822,6 +874,12 @@ impl<B: StorageBackend> EncryptingBackend<B> {
     ) -> Result<Vec<u8>, StorageError> {
         if is_encrypted(metadata) {
             if let Some(key) = self.current_key() {
+                // Key-id mismatch short-circuit. Two-sided conditional:
+                // we only fire when BOTH the object and the wrapper
+                // have a stamped/configured id. Pre-Step-3 objects
+                // (no stamp) fall through to AEAD as before — they
+                // stay readable as long as the key material matches.
+                check_key_id_match(stamped_key_id(metadata), self.current_key_id().as_deref())?;
                 decrypt(&key, &data)
             } else {
                 Err(StorageError::Encryption(
@@ -831,6 +889,36 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         } else {
             Ok(data)
         }
+    }
+}
+
+/// Short-circuit check: if the object carries a stamped `dg-encryption-
+/// key-id` AND the wrapper is configured with a `key_id`, they must
+/// match. Returns a SPECIFIC error on mismatch — the AEAD auth failure
+/// that would otherwise surface gives an opaque "decryption failed"
+/// message that doesn't tell operators whether they rotated the key,
+/// routed a bucket to the wrong backend, or accidentally pointed two
+/// backends at the same physical bucket with different keys.
+///
+/// Returns `Ok(())` in three legal cases:
+///   * both ids present and equal (happy path).
+///   * object has no id (legacy / pre-Step-3 object).
+///   * wrapper has no id (mode:none wrapper reading an encrypted
+///     object; the outer `no key configured` error still fires).
+pub fn check_key_id_match(
+    object_kid: Option<&str>,
+    configured_kid: Option<&str>,
+) -> Result<(), StorageError> {
+    match (object_kid, configured_kid) {
+        (Some(obj), Some(cfg)) if obj != cfg => Err(StorageError::Encryption(format!(
+            "object was encrypted with key id '{obj}', but this backend is configured \
+             with key id '{cfg}'. This usually means: (a) the key was rotated (unsupported \
+             in this release — restore the old key alongside the new one to read historical \
+             objects); (b) this bucket is routed to the wrong backend; (c) two backends \
+             share physical storage with different keys. Refusing to run AEAD — the \
+             underlying auth failure would be opaque."
+        ))),
+        _ => Ok(()),
     }
 }
 
@@ -1023,7 +1111,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         }
 
         let mut meta = metadata.clone();
-        mark_chunked_encrypted(&mut meta);
+        mark_chunked_encrypted(&mut meta, self.current_key_id().as_deref());
         self.inner
             .put_passthrough_chunked(bucket, prefix, filename, &out_frames, &meta)
             .await
@@ -1113,6 +1201,12 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
                     "object is encrypted but no key is configured".into(),
                 ));
             };
+            // Key-id mismatch check BEFORE issuing the backend read —
+            // the error surfaces at stream-open time, matching the v1
+            // path's eager rejection. Without this the mismatch would
+            // only fire at first AEAD chunk decrypt, after the client
+            // already has a 200 response and a streaming body open.
+            check_key_id_match(stamped_key_id(&meta), self.current_key_id().as_deref())?;
             let ct_stream = self
                 .inner
                 .get_passthrough_stream(bucket, prefix, filename)
@@ -1186,6 +1280,10 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
                     "object is encrypted but no key is configured".into(),
                 ));
             };
+            // Key-id mismatch check at range-request open, same as the
+            // full-stream path above. Surfaces the specific error
+            // before the two backend range reads (header + body) fire.
+            check_key_id_match(stamped_key_id(&meta), self.current_key_id().as_deref())?;
             let final_idx = final_chunk_index_for_plaintext_size(meta.file_size);
             // Clamp `end` (inclusive) to the actual plaintext size.
             let effective_end = std::cmp::min(end, meta.file_size.saturating_sub(1));
@@ -1439,7 +1537,7 @@ mod tests {
             crate::types::StorageInfo::Passthrough,
         );
         assert!(!is_encrypted(&m));
-        mark_encrypted(&mut m);
+        mark_encrypted(&mut m, None);
         assert!(is_encrypted(&m));
     }
 
@@ -1688,7 +1786,7 @@ mod tests {
         assert!(!is_encrypted(&m));
         assert!(!is_chunked_encrypted(&m));
 
-        mark_encrypted(&mut m);
+        mark_encrypted(&mut m, None);
         assert!(is_encrypted(&m));
         assert!(!is_chunked_encrypted(&m));
 
@@ -1700,9 +1798,102 @@ mod tests {
             None,
             crate::types::StorageInfo::Passthrough,
         );
-        mark_chunked_encrypted(&mut m2);
+        mark_chunked_encrypted(&mut m2, None);
         assert!(is_encrypted(&m2));
         assert!(is_chunked_encrypted(&m2));
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Step 3: key_id stamping + mismatch detection
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_mark_encrypted_stamps_key_id_when_present() {
+        let mut m = FileMetadata::fallback(
+            "x".into(),
+            10,
+            "md5".into(),
+            chrono::Utc::now(),
+            None,
+            crate::types::StorageInfo::Passthrough,
+        );
+        mark_encrypted(&mut m, Some("my-kid"));
+        assert_eq!(stamped_key_id(&m), Some("my-kid"));
+        // Marker and key_id are distinct fields.
+        assert!(is_encrypted(&m));
+    }
+
+    #[test]
+    fn test_mark_encrypted_no_key_id_leaves_field_absent() {
+        let mut m = FileMetadata::fallback(
+            "x".into(),
+            10,
+            "md5".into(),
+            chrono::Utc::now(),
+            None,
+            crate::types::StorageInfo::Passthrough,
+        );
+        mark_encrypted(&mut m, None);
+        assert_eq!(stamped_key_id(&m), None);
+    }
+
+    #[test]
+    fn test_mark_chunked_encrypted_stamps_key_id() {
+        let mut m = FileMetadata::fallback(
+            "x".into(),
+            10,
+            "md5".into(),
+            chrono::Utc::now(),
+            None,
+            crate::types::StorageInfo::Passthrough,
+        );
+        mark_chunked_encrypted(&mut m, Some("chunked-kid"));
+        assert_eq!(stamped_key_id(&m), Some("chunked-kid"));
+        assert!(is_chunked_encrypted(&m));
+    }
+
+    #[test]
+    fn test_check_key_id_match_happy_path() {
+        assert!(check_key_id_match(Some("same"), Some("same")).is_ok());
+    }
+
+    #[test]
+    fn test_check_key_id_match_object_has_no_id_is_legacy_ok() {
+        // Legacy objects written before Step 3 have no stamp. The
+        // wrapper can still decrypt them — the check must NOT fire
+        // when only one side has an id.
+        assert!(check_key_id_match(None, Some("configured")).is_ok());
+    }
+
+    #[test]
+    fn test_check_key_id_match_configured_has_no_id_is_ok() {
+        // Symmetric. A mode:none-but-somehow-reading-an-encrypted-
+        // object path — the OUTER "no key configured" error is the
+        // right surface here, not a key_id mismatch.
+        assert!(check_key_id_match(Some("obj"), None).is_ok());
+    }
+
+    #[test]
+    fn test_check_key_id_match_both_absent_is_ok() {
+        assert!(check_key_id_match(None, None).is_ok());
+    }
+
+    #[test]
+    fn test_check_key_id_match_mismatch_errors_with_specifics() {
+        let err = check_key_id_match(Some("obj-id"), Some("cfg-id")).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("obj-id") && msg.contains("cfg-id"),
+            "error must cite BOTH ids so the operator can reason about \
+             the rotation/routing/split-storage cause, got: {msg}"
+        );
+        // And the hint is present.
+        assert!(
+            msg.contains("rotated")
+                || msg.contains("wrong backend")
+                || msg.contains("different keys"),
+            "error should explain the typical causes, got: {msg}"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -1968,12 +2159,15 @@ mod tests {
             None,
             crate::types::StorageInfo::Passthrough,
         );
-        mark_chunked_encrypted(&mut meta);
+        mark_chunked_encrypted(&mut meta, None);
 
         let mut backend = CountingBackend::new();
         backend.set_contents(ciphertext, meta);
 
-        let enc_config = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig { key: Some(key) })));
+        let enc_config = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
+            key: Some(key),
+            key_id: None,
+        })));
         let wrapper = EncryptingBackend::new(backend, enc_config);
         (wrapper, plaintext)
     }
@@ -2083,7 +2277,10 @@ mod tests {
         let mut backend = CountingBackend::new();
         backend.set_contents(ciphertext, meta);
 
-        let enc_config = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig { key: None })));
+        let enc_config = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
+            key: None,
+            key_id: None,
+        })));
         let wrapper = EncryptingBackend::new(backend, enc_config);
 
         let stream = wrapper
@@ -2136,6 +2333,136 @@ mod tests {
             "must seek to the last chunk's boundary, not file start. \
              expected {}, got {}",
             expected, body_start
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Step 3: key_id end-to-end — round-trip, mismatch, legacy object
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Reconstruct a chunked-encrypted object in memory, wrap with a
+    /// given (key, key_id) pair, and return the wrapper + expected
+    /// plaintext. Differs from `setup_wrapper_with_chunked_object`:
+    /// this variant writes the `dg-encryption-key-id` metadata stamp
+    /// directly so we can exercise the READ path's mismatch check
+    /// without needing a write cycle.
+    async fn setup_wrapper_with_stamped_object(
+        key: EncryptionKey,
+        stamped_kid: Option<&str>,
+        plaintext_size: usize,
+        wrapper_key_id: Option<String>,
+    ) -> (EncryptingBackend<CountingBackend>, Vec<u8>) {
+        let plaintext: Vec<u8> = (0..plaintext_size).map(|i| (i & 0xff) as u8).collect();
+        let (ciphertext, _base_iv, _final_idx) = encode_chunked(&key, &plaintext);
+
+        let mut meta = FileMetadata::fallback(
+            "test.bin".into(),
+            plaintext_size as u64,
+            "md5".into(),
+            Utc::now(),
+            None,
+            crate::types::StorageInfo::Passthrough,
+        );
+        mark_chunked_encrypted(&mut meta, stamped_kid);
+
+        let mut backend = CountingBackend::new();
+        backend.set_contents(ciphertext, meta);
+
+        let enc_config = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
+            key: Some(key),
+            key_id: wrapper_key_id,
+        })));
+        let wrapper = EncryptingBackend::new(backend, enc_config);
+        (wrapper, plaintext)
+    }
+
+    #[tokio::test]
+    async fn test_read_succeeds_when_key_ids_match() {
+        let key = test_key();
+        let (wrapper, plaintext) = setup_wrapper_with_stamped_object(
+            key,
+            Some("matching-id"),
+            4096,
+            Some("matching-id".to_string()),
+        )
+        .await;
+        let got = wrapper.get_passthrough("b", "p", "test.bin").await.unwrap();
+        assert_eq!(got, plaintext);
+    }
+
+    #[tokio::test]
+    async fn test_read_fails_with_specific_error_when_key_ids_mismatch() {
+        // Object says "written with key_id A"; wrapper says "I have
+        // key_id B". The AEAD would fail with an opaque message —
+        // the specific error must fire FIRST.
+        let key = test_key();
+        let (wrapper, _plaintext) = setup_wrapper_with_stamped_object(
+            key,
+            Some("object-a"),
+            4096,
+            Some("wrapper-b".to_string()),
+        )
+        .await;
+
+        let res = wrapper.get_passthrough("b", "p", "test.bin").await;
+        let err = match res {
+            Ok(_) => panic!("must error on key_id mismatch"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("object-a") && msg.contains("wrapper-b"),
+            "must cite both key ids, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_fails_via_streaming_range_when_key_ids_mismatch() {
+        // Same mismatch, this time through get_passthrough_stream_range.
+        // The check fires at stream-open time — BEFORE any AEAD
+        // attempt — so the error surfaces as a failed open, not a
+        // mid-stream fail.
+        let key = test_key();
+        let (wrapper, _plaintext) = setup_wrapper_with_stamped_object(
+            key,
+            Some("object-c"),
+            4096,
+            Some("wrapper-d".to_string()),
+        )
+        .await;
+
+        let res = wrapper
+            .get_passthrough_stream_range("b", "p", "test.bin", 0, 99)
+            .await;
+        let err = match res {
+            Ok(_) => panic!("range-read must error on key_id mismatch"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("object-c") && msg.contains("wrapper-d"),
+            "range-read mismatch must also cite both ids, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_object_without_key_id_still_decrypts() {
+        // Object written before Step 3 has no `dg-encryption-key-id`
+        // stamp. The wrapper has a key_id today. The check is
+        // conditional — one-sided absence is legal — so decrypt
+        // succeeds as long as the key material matches.
+        let key = test_key();
+        let (wrapper, plaintext) = setup_wrapper_with_stamped_object(
+            key,
+            None, // pre-Step-3 object
+            4096,
+            Some("current-wrapper-id".to_string()),
+        )
+        .await;
+        let got = wrapper.get_passthrough("b", "p", "test.bin").await.unwrap();
+        assert_eq!(
+            got, plaintext,
+            "legacy objects must decrypt when the key itself still matches"
         );
     }
 }
