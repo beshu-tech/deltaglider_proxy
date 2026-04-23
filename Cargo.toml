@@ -115,3 +115,9 @@ walkdir = "2"
 # compatible with whatever aws-sdk-s3 1.x resolves.
 aws-smithy-runtime-api = "1"
 aws-smithy-types = "1"
+# Property-based testing. Used where the function under test has a
+# clean acceptance rule (bucket-name validation, SigV4 parsing) —
+# generates hundreds of random inputs per run and shrinks failures
+# to the minimal reproducer. Deterministic via the PROPTEST_CASES
+# env var; default case count is 256.
+proptest = "1"

@@ -599,4 +599,160 @@ mod tests {
         assert!(!is_ip_format(".1.2.3"), "leading dot → empty first group");
         assert!(!is_ip_format("1..2.3"), "middle empty group");
     }
+
+    // ────────────────────────────────────────────────────────────────
+    // Property-based tests (proptest).
+    //
+    // The enumerated cases above document specific invariants; these
+    // generalize from "we checked these 27 cases" to "we checked 256
+    // random cases per property, per run". Proptest shrinks failing
+    // inputs to a minimal reproducer — instead of "property failed on
+    // some 73-character input", you get "property failed on 'A'".
+    //
+    // Default 256 cases/property. Bump via `PROPTEST_CASES=N` in the
+    // environment. Seed is deterministic per-property (`Config::
+    // default` + body-hash), so reruns of the same code path are
+    // reproducible.
+    // ────────────────────────────────────────────────────────────────
+
+    use proptest::prelude::*;
+
+    /// Independent "this name satisfies every rule" predicate. Kept
+    /// separate from the validator so the tests below can assert
+    /// equivalence between the two without being circular.
+    fn is_syntactically_valid(name: &str) -> bool {
+        let len = name.chars().count();
+        if !(3..=63).contains(&len) {
+            return false;
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+        {
+            return false;
+        }
+        if name.contains("..") {
+            return false;
+        }
+        let first = name.chars().next().unwrap();
+        let last = name.chars().last().unwrap();
+        if !first.is_ascii_alphanumeric() || !last.is_ascii_alphanumeric() {
+            return false;
+        }
+        if is_ip_format(name) {
+            return false;
+        }
+        true
+    }
+
+    proptest! {
+        /// Universality: for ANY ASCII string the validator's Ok/Err
+        /// output must agree with the independent predicate above.
+        /// If the two disagree for any input, either the validator
+        /// drifted from the spec or the predicate is wrong — either
+        /// way, we want to know.
+        #[test]
+        fn prop_validator_matches_spec(s in "\\PC*") {
+            let validator_result = validate_bucket_name(&s).is_ok();
+            let spec_result = is_syntactically_valid(&s);
+            prop_assert_eq!(
+                validator_result,
+                spec_result,
+                "drift between validator and spec for input {:?}",
+                s
+            );
+        }
+
+        /// Generator: build a structurally-valid name (chars in the
+        /// allowed set, 3–63 chars, starts + ends alphanumeric, no
+        /// double-dots). Filter out IP-format strings because those
+        /// are a legitimate rejection case even though every other
+        /// rule passes. Every accepted name must be Ok.
+        #[test]
+        fn prop_well_formed_names_are_accepted(
+            name in "[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]"
+                .prop_filter("no consecutive dots", |s| !s.contains(".."))
+                .prop_filter("not IP-format", |s| !is_ip_format(s))
+        ) {
+            prop_assert!(
+                validate_bucket_name(&name).is_ok(),
+                "well-formed name {:?} should be accepted",
+                name
+            );
+        }
+
+        /// Negative generator #1: contains at least one forbidden
+        /// character (uppercase, underscore, whitespace, symbol).
+        /// The forbidden chars make the whole name invalid regardless
+        /// of its length or shape.
+        #[test]
+        fn prop_names_with_forbidden_chars_are_rejected(
+            prefix in "[a-z0-9]{1,10}",
+            bad in "[A-Z_ +!@#$%^&*]",
+            suffix in "[a-z0-9]{1,10}",
+        ) {
+            let name = format!("{prefix}{bad}{suffix}");
+            prop_assert!(
+                validate_bucket_name(&name).is_err(),
+                "name with forbidden char {:?} should be rejected: {:?}",
+                bad,
+                name
+            );
+        }
+
+        /// Negative generator #2: length outside 3..=63. Character
+        /// set is intentionally clean so the ONLY reason for
+        /// rejection is length.
+        #[test]
+        fn prop_names_outside_length_range_are_rejected(
+            // 0, 1, 2 char names (too short), 64..128 char names (too long).
+            // proptest OneOf-style via two strategies.
+            name in prop_oneof![
+                "[a-z0-9]{0,2}",
+                "[a-z0-9]{64,128}",
+            ]
+        ) {
+            prop_assert!(
+                validate_bucket_name(&name).is_err(),
+                "length-{} name {:?} should be rejected",
+                name.len(),
+                name
+            );
+        }
+
+        /// IP-format detector round-trip: given 4 groups of 1-3
+        /// digits joined by `.`, is_ip_format must return true.
+        /// Given any strictly different shape, false.
+        #[test]
+        fn prop_ip_format_four_digit_groups(
+            a in "[0-9]{1,3}",
+            b in "[0-9]{1,3}",
+            c in "[0-9]{1,3}",
+            d in "[0-9]{1,3}",
+        ) {
+            let s = format!("{a}.{b}.{c}.{d}");
+            prop_assert!(
+                is_ip_format(&s),
+                "expected IP-format true for {:?}",
+                s
+            );
+        }
+
+        /// is_ip_format is false for any string without EXACTLY four
+        /// dots. The generator produces strings with 0, 1, 2, 3, 5, or
+        /// 6 dot-separated digit groups — never 4.
+        #[test]
+        fn prop_ip_format_false_for_non_four_parts(
+            parts in prop::collection::vec("[0-9]{1,3}", 1..=3)
+                .prop_union(prop::collection::vec("[0-9]{1,3}", 5..=6))
+        ) {
+            let s = parts.join(".");
+            prop_assert!(
+                !is_ip_format(&s),
+                "expected IP-format false for {}-part input {:?}",
+                parts.len(),
+                s
+            );
+        }
+    }
 }
