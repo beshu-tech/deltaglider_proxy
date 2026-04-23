@@ -20,6 +20,7 @@ pub mod types;
 
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::warn;
 
@@ -28,6 +29,39 @@ pub use keygen::{generate_access_key_id, generate_secret_access_key};
 pub use middleware::authorization_middleware;
 pub use permissions::{normalize_permissions, validate_permissions};
 pub use types::*;
+
+/// Monotonic IAM-index version counter.
+///
+/// Incremented on every successful [`api::admin::users::rebuild_iam_index`]
+/// call (which happens after any IAM mutation: user/group CRUD, OAuth
+/// provider changes, mapping-rule edits). Exposed via
+/// `GET /_/api/admin/iam/version` so integration tests can wait for a
+/// deterministic rebuild barrier instead of blind `sleep(1s)` — the
+/// latter is both slow AND flake-prone under CI load.
+///
+/// One counter per process is correct because each TestServer spawns its
+/// own proxy process; there is no cross-process IAM state to reconcile.
+///
+/// Wraps at 2^64 which is ~600 years at 1M rebuilds/sec — safe enough.
+static IAM_VERSION: AtomicU64 = AtomicU64::new(0);
+
+/// Increment the IAM version counter and return the new value.
+///
+/// Called from `rebuild_iam_index` AFTER the new `IamState` is stored,
+/// so observers polling the version see the bump only after the state
+/// is visible to subsequent authentications.
+pub fn bump_iam_version() -> u64 {
+    // SeqCst is overkill for correctness here (we only need monotonic
+    // observability, Release+Acquire would do), but the counter ticks
+    // infrequently (once per IAM mutation, not per request) so the
+    // extra synchronisation cost is irrelevant.
+    IAM_VERSION.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// Read the current IAM version counter.
+pub fn current_iam_version() -> u64 {
+    IAM_VERSION.load(Ordering::SeqCst)
+}
 
 /// Runtime IAM state — supports legacy single-credential mode and multi-user IAM.
 pub enum IamState {

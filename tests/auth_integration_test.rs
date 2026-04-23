@@ -9,7 +9,7 @@ mod common;
 
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
-use common::{admin_http_client, TestServer};
+use common::{admin_http_client, get_iam_version, wait_for_iam_rebuild, TestServer};
 use hmac::{Hmac, Mac};
 use reqwest::StatusCode;
 use serde_json::json;
@@ -779,6 +779,8 @@ async fn test_user_lifecycle_crud() {
     );
 
     // 4. Update permissions: grant write
+    // Snapshot the IAM version BEFORE the mutation so we can barrier on it.
+    let before_version = get_iam_version(&admin, &server.endpoint()).await;
     let resp = admin
         .put(format!(
             "{}/_/api/admin/users/{}",
@@ -798,22 +800,30 @@ async fn test_user_lifecycle_crud() {
         resp.status()
     );
 
-    // 5. Verify user can now write (permissions updated via hot-swap)
-    // Wait for IAM index rebuild + recreate client to avoid stale SigV4 context
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // 5. Verify user can now write (permissions updated via hot-swap).
+    // Wait for IAM index rebuild deterministically — polls iam/version
+    // until it advances past the baseline (typically <50ms on any
+    // runner). Recreates the S3 client to drop stale SigV4 context.
+    wait_for_iam_rebuild(&admin, &server.endpoint(), before_version).await;
     let s3 = server
         .s3_client_with_creds(&user.access_key_id, &user.secret_access_key)
         .await;
+    // Use a unique body + key for the post-update PUT so its SigV4
+    // signature cannot collide with step-3's failed write attempt
+    // (SigV4 timestamps have 1s resolution; the replay window is 2s,
+    // and the barrier often returns within a few ms). Previously the
+    // `sleep(1s)` accidentally also served as a replay-window wait.
     let put_result = s3
         .put_object()
         .bucket(server.bucket())
-        .key("lifecycle/test.txt")
-        .body(ByteStream::from(b"test".to_vec()))
+        .key("lifecycle/after_update.txt")
+        .body(ByteStream::from(b"after update".to_vec()))
         .send()
         .await;
     assert!(
         put_result.is_ok(),
-        "user should be able to write after permission update"
+        "user should be able to write after permission update: {:?}",
+        put_result.err()
     );
 
     // 6. Disable the user
@@ -1051,7 +1061,9 @@ async fn test_group_creation_and_permission_inheritance() {
     let result = s3.list_objects_v2().bucket(server.bucket()).send().await;
     assert!(result.is_err(), "user with no permissions should be denied");
 
-    // Create a group with read+list permissions AND add the user as a member in one call
+    // Create a group with read+list permissions AND add the user as a
+    // member in one call. Snapshot the version first so we can barrier.
+    let before_version = get_iam_version(&admin, &server.endpoint()).await;
     let resp = admin
         .post(format!("{}/_/api/admin/groups", server.endpoint()))
         .json(&json!({
@@ -1069,8 +1081,10 @@ async fn test_group_creation_and_permission_inheritance() {
         resp.status()
     );
 
-    // Wait for IAM index rebuild after group membership change
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Wait for IAM index rebuild deterministically — poll iam/version
+    // instead of sleeping. The group-create + member-add mutation bumps
+    // the counter once the new IamIndex is stored.
+    wait_for_iam_rebuild(&admin, &server.endpoint(), before_version).await;
 
     // Re-create S3 client to ensure fresh SigV4 signing context
     let s3 = server

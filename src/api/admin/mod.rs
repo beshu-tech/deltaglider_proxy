@@ -47,8 +47,8 @@ pub use groups::{
 };
 pub use scanner::{get_usage, migrate_legacy, scan_usage, ScanUsageRequest, UsageQuery};
 pub use users::{
-    create_user, delete_user, get_canned_policies, list_users, rotate_user_keys, update_user,
-    CreateUserRequest, RotateKeysRequest, UpdateUserRequest,
+    create_user, delete_user, get_canned_policies, iam_version, list_users, rotate_user_keys,
+    update_user, CreateUserRequest, RotateKeysRequest, UpdateUserRequest,
 };
 
 /// Type alias for the tracing reload handle.

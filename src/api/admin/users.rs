@@ -64,6 +64,7 @@ pub(super) fn rebuild_iam_index(
     if users.is_empty() {
         tracing::info!("No IAM users in database — disabling auth (open access)");
         iam_state.store(Arc::new(IamState::Disabled));
+        iam::bump_iam_version();
         return Ok(());
     }
 
@@ -111,18 +112,35 @@ pub(super) fn rebuild_iam_index(
     let count = users.len();
     let group_count = groups.len();
     let state = IamIndex::build_iam_state(users, groups);
-    tracing::debug!(
-        "IAM index rebuilt with {} users and {} groups",
-        count,
-        group_count
-    );
     iam_state.store(Arc::new(state));
+    // Bump AFTER the store so observers see the new state when they
+    // see a new version — lets integration tests poll `iam/version`
+    // instead of `sleep(1s)` as a rebuild barrier.
+    let version = iam::bump_iam_version();
+    tracing::debug!(
+        "IAM index rebuilt with {} users and {} groups (version {})",
+        count,
+        group_count,
+        version
+    );
     Ok(())
 }
 
 /// GET /api/admin/policies — return predefined policy templates.
 pub async fn get_canned_policies() -> impl IntoResponse {
     Json(iam::canned_policies())
+}
+
+/// GET /api/admin/iam/version — monotonic counter bumped on every
+/// `rebuild_iam_index` call.
+///
+/// Exists so integration tests can poll for a deterministic rebuild
+/// barrier instead of `sleep(1s)`. The counter is process-local (one
+/// per proxy process), which matches the one-process-per-TestServer
+/// model. Unauthenticated: the counter leaks no state (just a number)
+/// and auth-gating would add pointless friction for CI.
+pub async fn iam_version() -> impl IntoResponse {
+    Json(serde_json::json!({ "version": iam::current_iam_version() }))
 }
 
 /// GET /api/admin/users — list all users (secrets masked).

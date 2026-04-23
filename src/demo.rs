@@ -190,6 +190,10 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         .route("/_/api/admin/login", post(admin::login))
         .route("/_/api/admin/login-as", post(admin::login_as))
         .route("/_/api/admin/policies", get(admin::get_canned_policies))
+        // Monotonic rebuild counter. Public by design — exposes an opaque
+        // number and is consumed by integration tests + internal tooling
+        // to barrier on IAM mutations without a blind `sleep(1s)`.
+        .route("/_/api/admin/iam/version", get(admin::iam_version))
         .route("/_/api/whoami", get(admin::whoami))
         // OAuth flow (public — browser redirects back here)
         .route(

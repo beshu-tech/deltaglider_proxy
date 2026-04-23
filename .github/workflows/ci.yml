@@ -85,6 +85,70 @@ jobs:
           RUST_BACKTRACE: "1"
         run: cargo test --lib --locked
 
+  coverage:
+    name: Unit Coverage (non-blocking)
+    runs-on: k3s
+    timeout-minutes: 20
+    # Signal, not a gate. A flaky coverage tool must not block merges.
+    # When a regression is real, the PR author sees the summary in
+    # the job log; when it's noise (a new file without tests added
+    # alongside, a cfg-gated branch, etc.) we want to avoid burning
+    # review time on it.
+    continue-on-error: true
+    container:
+      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install cargo-llvm-cov
+        # binstall is fast (~5s) and the builder image may not ship it.
+        # `--locked` pins to the lockfile-compatible version; no version
+        # drift between runs.
+        run: |
+          if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
+            cargo install --locked cargo-llvm-cov
+          fi
+      - name: Build demo UI (required by rust-embed)
+        run: cd demo/s3-browser/ui && npm ci && npm run build
+      - name: Run lib tests under llvm-cov
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          cargo llvm-cov --locked --lib --no-report
+      - name: Emit summary table (top 20 worst-covered files)
+        run: |
+          cargo llvm-cov report --summary-only > /tmp/cov-summary.txt
+          echo "## Unit-test coverage summary" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat /tmp/cov-summary.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Worst-covered files (line %)" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          # Column 10 is line-coverage %, column 1 is filename. Strip
+          # the trailing % so `sort -n` orders numerically. Drop the
+          # TOTAL and separator rows.
+          cargo llvm-cov report \
+            | awk 'NR>2 && $1 !~ /^TOTAL/ && $1 !~ /^-/ {gsub(/%/, "", $10); printf "%6s  %s\n", $10, $1}' \
+            | sort -n \
+            | head -20 \
+            >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+      - name: Upload lcov artifact
+        # LCOV file lets consumers (Codecov, Coveralls, local tooling)
+        # drill into individual file / line coverage. Optional — future
+        # PR-comment bots plug into this without touching the job.
+        if: always()
+        run: cargo llvm-cov report --lcov --output-path /tmp/lcov.info || true
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: lcov-coverage
+          path: /tmp/lcov.info
+          if-no-files-found: ignore
+
   test-integration:
     name: Integration Tests
     runs-on: k3s
