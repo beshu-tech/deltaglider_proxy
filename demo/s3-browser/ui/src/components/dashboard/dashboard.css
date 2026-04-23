@@ -1,0 +1,41 @@
+/* DashboardGrid: density-based span collapse.
+ *
+ * Panels declare their comfortable span via `data-colspan`. When the
+ * parent grid is in compact density, each span collapses to roughly
+ * half (capped at 6) so 12-col rows become 6-col rows. This keeps
+ * the grid's row story intact — same rows, narrower columns, without
+ * media queries scattered through every panel.
+ *
+ * Below ~900px the parent admin shell is already in Drawer mode;
+ * the grid stays but every panel goes to `span 12` (full width).
+ */
+
+[data-density="compact"] > [data-colspan="12"] { grid-column: span 12; }
+[data-density="compact"] > [data-colspan="8"]  { grid-column: span 6; }
+[data-density="compact"] > [data-colspan="6"]  { grid-column: span 6; }
+[data-density="compact"] > [data-colspan="4"]  { grid-column: span 3; }
+[data-density="compact"] > [data-colspan="3"]  { grid-column: span 3; }
+
+/* Below 900px — everything stacks. The outer container is already
+ * set to `maxWidth: min(100%, 2400px)` and to the viewport at this
+ * size, so this just flattens the grid. */
+@media (max-width: 900px) {
+  [data-density] > [data-colspan] {
+    grid-column: span 12 !important;
+  }
+  [data-density] > [data-rowspan] {
+    /* Let tall panels (rowSpan 3) auto-size instead of eating 3 grid
+     * rows on mobile — they'd each be 3× tall for no reason. */
+    grid-row: span 1 !important;
+  }
+}
+
+/* Panel body gets edge-to-edge charts — compensate for the 14px
+ * padding we set on PanelBody for chart-only panels by letting
+ * consumers apply `.panel-chart-edge` on a wrapper. */
+.panel-chart-edge {
+  margin: -14px;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+}

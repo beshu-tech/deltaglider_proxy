@@ -505,16 +505,11 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
 
     // Diagnostics
     if (adminPath === 'diagnostics/dashboard') {
-      // Wave 9 will replace the `Dashboard` page with a proper
-      // metrics + admission preview surface. Until then we reuse the
-      // existing MetricsPage which is what operators already landed
-      // on when clicking the `metrics` tab.
-      return (
-        <>
-          {header}
-          <MetricsPage onBack={onBack} embedded />
-        </>
-      );
+      // Skip the outer section header — MetricsPage's toolbar
+      // already carries title + live indicator + tab switcher +
+      // refresh controls. Rendering both would duplicate the
+      // page-level identity and steal vertical real estate.
+      return <MetricsPage onBack={onBack} embedded />;
     }
     if (adminPath === 'diagnostics/trace') {
       return (
