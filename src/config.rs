@@ -455,6 +455,24 @@ pub struct Config {
         skip_serializing_if = "crate::config_sections::IamMode::is_default"
     )]
     pub iam_mode: crate::config_sections::IamMode,
+
+    // ── Phase 3c.3: declarative-mode IAM fields ──
+    //
+    // Consumed by the reconciler inside `apply_config_transition`
+    // when `iam_mode == Declarative`. In `Gui` mode these are
+    // tolerated but not applied (the DB is source of truth).
+    /// IAM users as declared in YAML (Phase 3c.3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub iam_users: Vec<crate::iam::DeclarativeUser>,
+    /// IAM groups as declared in YAML (Phase 3c.3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub iam_groups: Vec<crate::iam::DeclarativeGroup>,
+    /// External auth providers declared in YAML (Phase 3c.3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auth_providers: Vec<crate::iam::DeclarativeAuthProvider>,
+    /// OAuth group-mapping rules declared in YAML (Phase 3c.3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_mapping_rules: Vec<crate::iam::DeclarativeMappingRule>,
 }
 
 /// Per-backend encryption-at-rest configuration.
@@ -883,6 +901,10 @@ impl Default for Config {
             backend_encryption: BackendEncryptionConfig::default(),
             admission_blocks: Vec::new(),
             iam_mode: crate::config_sections::IamMode::default(),
+            iam_users: Vec::new(),
+            iam_groups: Vec::new(),
+            auth_providers: Vec::new(),
+            group_mapping_rules: Vec::new(),
         }
     }
 }
@@ -1871,6 +1893,18 @@ impl Config {
         export.backend_encryption.redact_secrets();
         for named in &mut export.backends {
             named.encryption.redact_secrets();
+        }
+        // Phase 3c.3: strip declarative-IAM secrets — per-user
+        // secret_access_key and per-provider client_secret. These are
+        // infra secrets that belong in env vars or a secret manager,
+        // not in a downloadable YAML artifact. Persist-variant
+        // preserves them (so a round-trip through PATCH → persist
+        // doesn't lose the operator's in-memory values).
+        for u in &mut export.iam_users {
+            u.secret_access_key.clear();
+        }
+        for p in &mut export.auth_providers {
+            p.client_secret = None;
         }
         export
     }

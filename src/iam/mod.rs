@@ -12,6 +12,7 @@
 //! - `keygen` — Cryptographic key generation
 //! - `index` — `IamIndex` for O(1) user lookup and `IamState` enum
 
+pub mod declarative;
 pub mod external_auth;
 pub mod keygen;
 pub mod middleware;
@@ -25,6 +26,11 @@ use std::sync::Arc;
 use tracing::warn;
 
 // Re-export everything at crate::iam level for backward compatibility
+pub use declarative::{
+    diff_iam, reconcile_declarative_iam, snapshot_from_access, CurrentIam, DeclarativeAuthProvider,
+    DeclarativeGroup, DeclarativeIam, DeclarativeMappingRule, DeclarativeUser, IamDiff,
+    ReconcileStats,
+};
 pub use keygen::{generate_access_key_id, generate_secret_access_key};
 pub use middleware::authorization_middleware;
 pub use permissions::{normalize_permissions, validate_permissions};

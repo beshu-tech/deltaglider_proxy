@@ -1,6 +1,7 @@
 //! IAM type definitions: users, groups, permissions, actions, and authenticated identity.
 
 use iam_rs::IAMPolicy;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::permissions;
@@ -66,7 +67,11 @@ fn default_allow() -> String {
 }
 
 /// A permission rule with Allow/Deny effect and optional conditions.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `PartialEq` is included so declarative-IAM diff logic can compare
+/// permissions structurally; `JsonSchema` surfaces this type in the
+/// auto-generated schema exposed by the admin API.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Permission {
     #[serde(default)]
     pub id: i64,

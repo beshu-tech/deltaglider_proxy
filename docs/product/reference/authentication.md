@@ -40,7 +40,7 @@ access:
 
 Mode transitions are audit-logged at `warn` level on the `deltaglider_proxy::config` target.
 
-> **Caveat**: the reconciler that sync-diffs the DB to the YAML on every apply is still **Phase 3c.3 (pending)**. Declarative mode today is a pure lockout — YAML `access.users` arrays are not yet consumed. Seed IAM via a one-time `iam_mode: gui` admin session, then flip. See [the upgrade guide](../21-upgrade-guide.md#the-s3-synced-iam-database).
+In declarative mode, `access.iam_users`, `access.iam_groups`, `access.auth_providers`, and `access.group_mapping_rules` in the YAML ARE authoritative. The reconciler runs on every `/config/apply` (or section-PUT on `access`), diffs YAML against the encrypted DB, and applies creates/updates/deletes atomically in a single transaction. User/group IDs are preserved across updates so OAuth `external_identities` stay valid through access-key rotations. See [`declarative-iam.md`](declarative-iam.md) for the wire shape, adversarial edges, and the two setup workflows (export-from-DB vs author-from-scratch).
 
 ### OAuth/OIDC Mode
 
@@ -54,7 +54,7 @@ On first login, the proxy **auto-provisions** an IAM user from the identity prov
 - **Email regex** — full regex pattern matching
 - **Claim value** — match on any JWT claim (department, role, etc.)
 
-Configured via the admin GUI under **Access → External authentication → Mapping Rules**. OAuth providers and mapping rules live in the encrypted DB — they are not expressible in YAML today (would be part of Phase 3c.3 declarative reconciler).
+Configured via the admin GUI under **Access → External authentication → Mapping Rules** (in `iam_mode: gui`) or via `access.auth_providers` + `access.group_mapping_rules` in YAML (in `iam_mode: declarative` — see [`declarative-iam.md`](declarative-iam.md)).
 
 ### Public Prefixes (anonymous read access)
 

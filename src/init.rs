@@ -304,6 +304,10 @@ pub fn run_init_inner(
         backend_encryption: crate::config::BackendEncryptionConfig::default(),
         admission_blocks: Vec::new(),
         iam_mode: crate::config_sections::IamMode::default(),
+        iam_users: Vec::new(),
+        iam_groups: Vec::new(),
+        auth_providers: Vec::new(),
+        group_mapping_rules: Vec::new(),
     };
 
     // Show summary

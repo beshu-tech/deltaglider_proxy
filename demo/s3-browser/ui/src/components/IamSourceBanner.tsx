@@ -57,7 +57,7 @@ export default function IamSourceBanner({ iamMode, resource }: Props) {
     : `${capitalise(resource)} live in the encrypted database`;
 
   const summary = isDeclarative
-    ? `Edits here are disabled. Change ${resource} by updating your YAML and applying the document.`
+    ? `Admin-API ${resource} mutations return 403. Change ${resource} by editing access.iam_* in YAML and applying — the reconciler diffs YAML against the DB and applies creates/updates/deletes atomically.`
     : `YAML exports do not include ${resource}. Take a Full Backup when you need everything in one file.`;
 
   return (

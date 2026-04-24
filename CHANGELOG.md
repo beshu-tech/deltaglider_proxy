@@ -1,5 +1,62 @@
 # Changelog
 
+## Unreleased
+
+### Declarative IAM reconciler (Phase 3c.3)
+
+`iam_mode: declarative` now actually reconciles. Previously it was a
+pure lockout (admin-API IAM mutations returned 403, but nothing synced
+YAML → DB). The reconciler runs on every `/config/apply` or
+section-PUT on `access` when the target mode is Declarative:
+
+- **Pure diff first, side effects second.** `diff_iam` validates the
+  YAML (unique names, valid group refs, valid permissions, no
+  access-key collisions, no reserved `$`-prefixed names) and computes
+  creates / updates / deletes. Any validation failure returns an
+  error with ZERO DB writes.
+- **Atomic apply.** `apply_iam_reconcile` runs all mutations in a
+  single SQLite transaction. Partial failures roll the whole
+  reconcile back; state never observed mid-apply.
+- **ID preservation.** Users and groups are matched by NAME, not by
+  DB id. Rotating an access key in YAML is an UPDATE that preserves
+  the row id — so `external_identities` linked to that user stay
+  valid. `external_identities` themselves are NOT reconciled (they
+  are runtime OAuth byproducts) but ARE cascade-deleted when a
+  YAML-authoritative delete removes the user or provider they
+  reference.
+- **Empty-YAML gate.** A `gui → declarative` flip with empty
+  `iam_users` / `iam_groups` is refused — it would wipe the DB.
+  Declarative → declarative with empty YAML is allowed
+  (operator deliberately clearing all IAM).
+- **Audit trail.** Every mutation emits an `iam_reconcile_*` audit
+  entry (`_user_create` / `_update` / `_delete`, same for groups
+  and providers, plus `_mapping_rules_replaced`).
+
+Wire shape: `access.iam_users` / `iam_groups` / `auth_providers` /
+`group_mapping_rules` on `AccessSection`. Users reference groups by
+NAME; mapping rules reference providers and groups by NAME. IDs are
+ephemeral and must not appear in YAML.
+
+See `docs/product/reference/declarative-iam.md` for the full
+walkthrough (including both workflows — importing an existing
+populated DB, or authoring fresh IAM from YAML — and the complete
+adversarial-edge table).
+
+### Backends panel: legacy singleton now surfaces correctly
+
+`GET /api/admin/backends` used to return an empty list when the
+config used the legacy `storage.backend` singleton (vs the named
+`storage.backends` list), so the admin UI showed "No named backends.
+Using legacy single-backend mode." while the proxy was actively
+serving. `GET /api/admin/config` already synthesised a `"default"`
+entry to keep the UI functional elsewhere; `/backends` now does the
+same.
+
+Synthesised entries carry `is_synthesized: true` in the response so
+the UI can disable destructive actions (they don't correspond to a
+real `cfg.backends[]` row; `DELETE` would 404). The Backends panel
+renders them with a "LEGACY SINGLETON" badge and no Delete button.
+
 ## v0.8.10
 
 A QA-focused release. No user-facing behaviour changes in the S3 API

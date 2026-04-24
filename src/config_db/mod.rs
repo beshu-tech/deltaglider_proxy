@@ -21,6 +21,7 @@ pub struct ConfigDb {
 const SCHEMA_VERSION: i32 = 5;
 
 pub(crate) mod auth_providers;
+mod declarative;
 mod groups;
 mod users;
 
@@ -286,7 +287,7 @@ impl ConfigDb {
     /// Insert permission rows for a user.
     /// Accepts a `conn` parameter so it can operate within a transaction.
     /// Insert permission rows into a table. Used for both user and group permissions.
-    fn insert_permission_rows(
+    pub(crate) fn insert_permission_rows(
         conn: &Connection,
         table: &str,
         fk_column: &str,
@@ -381,6 +382,10 @@ pub enum ConfigDbError {
     WrongPassphrase(String),
     NotFound(String),
     Io(std::io::Error),
+    /// Structural / invariant violations detected by reconcile helpers.
+    /// Used for "validation should have caught this" defence-in-depth
+    /// cases inside the transaction.
+    Other(String),
 }
 
 impl std::fmt::Display for ConfigDbError {
@@ -390,6 +395,7 @@ impl std::fmt::Display for ConfigDbError {
             Self::WrongPassphrase(msg) => write!(f, "{}", msg),
             Self::NotFound(what) => write!(f, "Not found: {}", what),
             Self::Io(e) => write!(f, "I/O error: {}", e),
+            Self::Other(msg) => write!(f, "{}", msg),
         }
     }
 }

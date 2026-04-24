@@ -57,6 +57,27 @@ pub(super) fn rebuild_iam_index(
     db: &ConfigDb,
     iam_state: &SharedIamState,
 ) -> Result<(), StatusCode> {
+    rebuild_iam_index_inner(db, iam_state, false)
+}
+
+/// Internal: `rebuild_iam_index` with a `skip_legacy_migration` knob.
+/// When true, the legacy-admin auto-migration branch is skipped — this
+/// is the declarative-mode contract: YAML owns the DB, so the wrapper
+/// must not auto-author a `legacy-admin` user that YAML didn't declare.
+/// Callers outside the declarative reconcile path keep the legacy
+/// behaviour via the public [`rebuild_iam_index`] entry point.
+pub(super) fn rebuild_iam_index_declarative(
+    db: &ConfigDb,
+    iam_state: &SharedIamState,
+) -> Result<(), StatusCode> {
+    rebuild_iam_index_inner(db, iam_state, true)
+}
+
+fn rebuild_iam_index_inner(
+    db: &ConfigDb,
+    iam_state: &SharedIamState,
+    skip_legacy_migration: bool,
+) -> Result<(), StatusCode> {
     let mut users = db.load_users().map_err(|e| {
         tracing::error!("Failed to load users from config DB: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
@@ -70,35 +91,42 @@ pub(super) fn rebuild_iam_index(
 
     // Migrate legacy credentials on first IAM user creation so existing
     // S3 clients continue working after the switch to IAM mode.
-    let current = iam_state.load();
-    if let IamState::Legacy(ref legacy) = **current {
-        let already_migrated = users
-            .iter()
-            .any(|u| u.access_key_id == legacy.access_key_id);
-        if !already_migrated {
-            let admin_perms = vec![Permission {
-                id: 0,
-                effect: "Allow".into(),
-                actions: vec!["*".into()],
-                resources: vec!["*".into()],
-                conditions: None,
-            }];
-            match db.create_user(
-                "legacy-admin",
-                &legacy.access_key_id,
-                &legacy.secret_access_key,
-                true,
-                &admin_perms,
-            ) {
-                Ok(migrated) => {
-                    tracing::info!(
-                        "Migrated legacy credentials to IAM user 'legacy-admin' ({})",
-                        migrated.access_key_id
-                    );
-                    users.push(migrated);
-                }
-                Err(e) => {
-                    tracing::error!("Failed to migrate legacy credentials: {}", e);
+    //
+    // Phase 3c.3: when called from the declarative reconciler,
+    // `skip_legacy_migration` is true — YAML is authoritative, so
+    // auto-creating a `legacy-admin` row the YAML didn't declare
+    // would be a silent side-effect that breaks idempotency.
+    if !skip_legacy_migration {
+        let current = iam_state.load();
+        if let IamState::Legacy(ref legacy) = **current {
+            let already_migrated = users
+                .iter()
+                .any(|u| u.access_key_id == legacy.access_key_id);
+            if !already_migrated {
+                let admin_perms = vec![Permission {
+                    id: 0,
+                    effect: "Allow".into(),
+                    actions: vec!["*".into()],
+                    resources: vec!["*".into()],
+                    conditions: None,
+                }];
+                match db.create_user(
+                    "legacy-admin",
+                    &legacy.access_key_id,
+                    &legacy.secret_access_key,
+                    true,
+                    &admin_perms,
+                ) {
+                    Ok(migrated) => {
+                        tracing::info!(
+                            "Migrated legacy credentials to IAM user 'legacy-admin' ({})",
+                            migrated.access_key_id
+                        );
+                        users.push(migrated);
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to migrate legacy credentials: {}", e);
+                    }
                 }
             }
         }

@@ -159,6 +159,26 @@ pub struct AccessSection {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_access_key: Option<String>,
+
+    // ── Phase 3c.3: declarative-mode IAM state ──
+    //
+    // These four fields are consulted BY THE RECONCILER only when
+    // `iam_mode == Declarative`. In `Gui` mode they are tolerated
+    // (validation still runs) but never applied — the DB remains
+    // source of truth.
+    /// IAM users as declared in YAML. References groups by NAME.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub iam_users: Vec<crate::iam::DeclarativeUser>,
+    /// IAM groups as declared in YAML.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub iam_groups: Vec<crate::iam::DeclarativeGroup>,
+    /// External auth providers (OIDC/OAuth) as declared in YAML.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auth_providers: Vec<crate::iam::DeclarativeAuthProvider>,
+    /// OAuth group-mapping rules as declared in YAML. References
+    /// providers + groups by NAME.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_mapping_rules: Vec<crate::iam::DeclarativeMappingRule>,
 }
 
 /// Source-of-truth selector for IAM state. See
@@ -518,6 +538,10 @@ impl SectionedConfig {
                 authentication: flat.authentication.clone(),
                 access_key_id: flat.access_key_id.clone(),
                 secret_access_key: flat.secret_access_key.clone(),
+                iam_users: flat.iam_users.clone(),
+                iam_groups: flat.iam_groups.clone(),
+                auth_providers: flat.auth_providers.clone(),
+                group_mapping_rules: flat.group_mapping_rules.clone(),
             },
             storage: StorageSection {
                 backend: flat.backend.clone(),
@@ -627,6 +651,10 @@ impl SectionedConfig {
             access_key_id: self.access.access_key_id,
             secret_access_key: self.access.secret_access_key,
             iam_mode: self.access.iam_mode,
+            iam_users: self.access.iam_users,
+            iam_groups: self.access.iam_groups,
+            auth_providers: self.access.auth_providers,
+            group_mapping_rules: self.access.group_mapping_rules,
             bootstrap_password_hash: self.advanced.bootstrap_password_hash,
             codec_concurrency: self.advanced.codec_concurrency,
             blocking_threads: self.advanced.blocking_threads,
