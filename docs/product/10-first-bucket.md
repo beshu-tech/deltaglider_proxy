@@ -176,8 +176,15 @@ ls /var/lib/deltaglider_proxy/data/deltaspaces/my-bucket/
 
 If something doesn't behave as expected, check [Troubleshooting](41-troubleshooting.md) — especially the "object goes to the wrong backend" and "public prefix returns 403" sections.
 
+## Next steps
+
+- **Encrypt the backend.** Each backend carries an `encryption` block with four modes (`none`, `aes256-gcm-proxy`, `sse-kms`, `sse-s3`). Configure it in Admin → Storage → Backends, or add an `encryption: { mode: aes256-gcm-proxy, key: "${DGP_ENCRYPTION_KEY}" }` block to your YAML. See [reference/encryption-at-rest.md](reference/encryption-at-rest.md) for the decision tree and worked examples.
+- **Add IAM users.** The admin GUI at `/_/admin/users` — or via YAML + OAuth mapping rules. See [auth/31-sigv4-and-iam.md](auth/31-sigv4-and-iam.md).
+- **Harden for production.** [20-production-security-checklist.md](20-production-security-checklist.md) covers SigV4, bootstrap password, rate limiting, TLS, and encryption at rest as a linear step-by-step.
+
 ## Related
 
 - [reference/configuration.md](reference/configuration.md) — the complete `storage.buckets` field reference.
 - [auth/32-iam-conditions.md](auth/32-iam-conditions.md) — scope IAM users to specific buckets or prefixes.
 - [reference/how-delta-works.md](reference/how-delta-works.md) — what "compression" actually does internally.
+- [reference/encryption-at-rest.md](reference/encryption-at-rest.md) — per-backend encryption modes, wire format, rotation recipes.

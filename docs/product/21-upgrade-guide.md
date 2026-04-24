@@ -168,6 +168,45 @@ When upgrading across instances with `DGP_CONFIG_SYNC_BUCKET` set, the *newer* b
 - **Admission chain order.** Admission blocks are order-significant. The migrator preserves order; review `admission:` carefully.
 - **`iam_mode: declarative`.** New in v0.8.0. YAML becomes authoritative; admin-API IAM mutations return 403. Only set this *after* seeding the IAM DB via a GUI session or a Full Backup import.
 
+### v0.9: per-backend encryption (breaking)
+
+v0.9 replaced the single global `advanced.encryption_key` field with per-backend encryption blocks. If you're upgrading from a pre-0.9 pre-release, the old field is no longer recognized — any YAML still carrying it silently drops the key.
+
+**What changed:**
+
+| Before (pre-v0.9) | After (v0.9) |
+|---|---|
+| `advanced.encryption_key: <hex>` | `storage.backend_encryption: { mode: aes256-gcm-proxy, key: <hex> }` (singleton) or `storage.backends[*].encryption: { ... }` (list) |
+| `DGP_ENCRYPTION_KEY` env var | Same name for singleton path; `DGP_BACKEND_<NAME>_ENCRYPTION_KEY` for named backends |
+| Global `encryption_enabled` in `GET /config` | Per-backend `encryption` summary on each `BackendInfoResponse` |
+| Dedicated `EncryptionPanel` page | Subsection inside each backend card on the `BackendsPanel` |
+
+**Mechanical conversion** — single-backend deployment, pre-v0.9 YAML:
+
+```yaml
+# OLD (pre-0.9)
+advanced:
+  encryption_key: 0123456789abcdef...
+```
+
+becomes:
+
+```yaml
+# NEW (v0.9+)
+storage:
+  backend_encryption:
+    mode: aes256-gcm-proxy
+    key: "${DGP_ENCRYPTION_KEY}"   # move the hex to the env
+```
+
+With `DGP_ENCRYPTION_KEY` in the environment unchanged.
+
+**On-disk objects are unaffected.** v0.9 reads pre-v0.9 encrypted objects without ceremony — the wire format didn't change, only the config location. The `dg-encryption-key-id` stamp is new as of v0.9 but OPTIONAL — historical objects without the stamp still decrypt as long as the key material matches.
+
+**If you had no encryption configured pre-0.9:** nothing to do. Your backends default to `encryption: none`.
+
+**If you want to move from proxy-AES to SSE-KMS as part of the upgrade:** do the upgrade first (keep your existing key), then configure the decrypt-only shim to migrate. See [reference/encryption-at-rest.md §Rotation recipes](reference/encryption-at-rest.md#rotation-recipes) recipe (C).
+
 ## Verification checklist (after any upgrade or migration)
 
 - [ ] `/_/health` returns HTTP 200.

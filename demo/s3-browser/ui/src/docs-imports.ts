@@ -31,6 +31,7 @@ import REF_ADMIN_API from '../../../../docs/product/reference/admin-api.md?raw';
 import REF_AUTHENTICATION from '../../../../docs/product/reference/authentication.md?raw';
 import REF_METRICS from '../../../../docs/product/reference/metrics.md?raw';
 import REF_DELTA from '../../../../docs/product/reference/how-delta-works.md?raw';
+import REF_ENCRYPTION from '../../../../docs/product/reference/encryption-at-rest.md?raw';
 
 /** Extract the first `# heading` from markdown content */
 function extractTitle(content: string): string {
@@ -116,6 +117,7 @@ const PRODUCT_DOCS: ProductDoc[] = [
   { path: 'reference/authentication', content: REF_AUTHENTICATION, group: 'Reference', order: 20 },
   { path: 'reference/metrics', content: REF_METRICS, group: 'Reference', order: 30 },
   { path: 'reference/how-delta-works', content: REF_DELTA, group: 'Reference', order: 40 },
+  { path: 'reference/encryption-at-rest', content: REF_ENCRYPTION, group: 'Reference', order: 50 },
 ];
 
 /**

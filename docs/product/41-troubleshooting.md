@@ -128,6 +128,41 @@ If everything is `passthrough`, usually:
 3. **`max_delta_ratio`** too strict. Default 0.75. Lowering it (0.5, 0.3) rejects more deltas; raising it (0.9) accepts more. The default is a reasonable balance.
 4. **First upload in a deltaspace** is always the `reference` — no delta yet. Only the second and subsequent uploads in the same prefix generate deltas.
 
+## Encryption-at-rest — symptoms and fixes
+
+The full catalogue lives in [reference/encryption-at-rest.md §Troubleshooting](reference/encryption-at-rest.md#troubleshooting). High-frequency symptoms:
+
+### Reads return 500 with "object is encrypted but no key is configured"
+
+The object's metadata has `dg-encrypted` set but the backend currently has no key (mode was flipped to `none`, or proxy-AES mode is missing the `key`). Restore the key — via `DGP_*_ENCRYPTION_KEY` env var, YAML, or the admin GUI's Backends panel.
+
+### Reads return 500 with "object was encrypted with key id 'X', but this backend is configured with key id 'Y'"
+
+Rotation without a shim, OR a bucket routed to the wrong backend, OR two backends sharing storage with different keys. Add `legacy_key: <old-hex>` + `legacy_key_id: <X>` to the backend's encryption block to let historical reads go through (shim-assisted rotation). See [reference/encryption-at-rest.md §Rotation recipes](reference/encryption-at-rest.md#rotation-recipes).
+
+### Reads return 500 with "xattrs may have been stripped during backup/restore"
+
+The object body starts with `DGE1` but has no `dg-encrypted` metadata marker — classic sign of a backup tool that preserved contents but not extended attributes. Re-run the backup with xattr support (older `rsync` needs `-X`), or rebuild the metadata from a known-good source.
+
+### Startup fails: "backends X and Y share key_id but declare DIFFERENT keys"
+
+Two backends pinned the same explicit `key_id` but the `key` values differ. This is almost always a copy-paste error. Make the ids distinct, OR make the keys identical (the documented "portability" escape hatch for two aliases of the same physical bucket).
+
+### Startup warning: "backend 'X' encryption key was loaded from config file (not DGP_*_ENCRYPTION_KEY)"
+
+The key is in YAML rather than in an env var. Not an error, but the canonical export strips infra secrets — if you persist the YAML back from the admin API and treat it as the source of truth, the key will be gone on the round-trip. Move the key to an env var for operational hygiene.
+
+### Writes to an SSE-KMS backend fail with "KMS key is disabled" or 403
+
+The AWS KMS key is disabled, deleted, or the proxy's IAM role lacks `kms:GenerateDataKey` on it. Check the KMS key status in the AWS console, and confirm the proxy's role/credentials have:
+
+- `s3:PutObject` + `s3:GetObject` on the bucket.
+- `kms:Encrypt`, `kms:Decrypt`, `kms:GenerateDataKey`, `kms:DescribeKey` on the KMS key (or via a KMS grant).
+
+### Disabled encryption on a backend — historical objects now fail to read
+
+Expected if you removed the key entirely. The decrypt path errors explicitly (it won't serve ciphertext as plaintext). If you need the objects back, restore the key. If not, delete them. Note that `mode: none` with `legacy_key: <hex>` + `legacy_key_id: <id>` is a valid shape — this lets you disable new-write encryption while keeping historical reads working.
+
 ## Need more detail?
 
 - Set `RUST_LOG=deltaglider_proxy=trace` for maximum verbosity.

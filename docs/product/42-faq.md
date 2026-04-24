@@ -79,6 +79,65 @@ Use `POST /_/api/admin/recover-db` (public, rate-limited) with your correct pass
 
 **Prevention:** always take a Full Backup after any password change. The zip carries both the hash and the encrypted DB, so a fresh instance can be reconstituted.
 
+## Encryption at rest
+
+### Which backend encryption mode should I pick?
+
+Short decision tree:
+
+- **Filesystem backend** → `aes256-gcm-proxy` (or `none` for non-sensitive data). Native SSE modes are S3-only.
+- **S3 with AWS KMS available + you want per-key audit logs** → `sse-kms`. Each decrypt hits CloudTrail.
+- **S3 without KMS** → `sse-s3` if AWS-managed AES256 is enough, `aes256-gcm-proxy` if you don't trust the provider.
+- **Public-CDN buckets** → `none`. Encryption is pure overhead here.
+
+See [reference/encryption-at-rest.md](reference/encryption-at-rest.md) for the full matrix including the threat model per mode.
+
+### Does enabling encryption re-encrypt my existing objects?
+
+No. The marker-based dispatch means old plaintext objects continue to be served as plaintext; only new writes go through the encrypt path. If you want to encrypt historical objects, copy them through the proxy to themselves (that's a rewrite, which routes through the new encrypt path).
+
+### Can I use different keys for different buckets?
+
+Not directly — encryption is **backend-scoped**, and buckets inherit their backend's encryption. To get per-bucket isolation, create additional backends with different keys and route buckets to them via `storage.buckets[name].backend`.
+
+### What happens if I lose my proxy-AES key?
+
+The encrypted objects on that backend are unrecoverable. There is no recovery path. DeltaGlider does not escrow keys; the admin GUI shows a red banner on every key-touching action saying exactly this.
+
+This is why you should **store the key off-box** (secrets manager, password vault, sealed envelope) before enabling encryption, and why the GUI gates the Apply button behind a "I have stored this key safely" checkbox.
+
+### How do I rotate a proxy-AES key?
+
+Not automatic. Two recipes, documented in [reference/encryption-at-rest.md §Rotation recipes](reference/encryption-at-rest.md#rotation-recipes):
+
+- **Shim-assisted (minimum downtime)** — keep the old key as `legacy_key`, put the new key in `key`. Reads try the new key first and fall back to the shim; new writes use the new key.
+- **Data migration (no runtime shim)** — create a new backend with the new key, copy through the proxy, retire the old backend.
+
+### Does compression still work with encryption enabled?
+
+Yes. xdelta3 delta compression runs BEFORE encryption. The delta bytes are then encrypted and written to disk. Compression ratios are preserved exactly — the ciphertext is just the encrypted wrapping of what the delta codec already produced.
+
+### Does encryption apply to object metadata too?
+
+No. Under any mode — including SSE-KMS — object names, sizes, content-type, and `x-amz-meta-*` user metadata are plaintext. This is a combination of AWS constraint (SSE only encrypts the body) and DG constraint (the `dg-encrypted` marker that tells us HOW to decrypt lives in user metadata — it can't itself be encrypted).
+
+If metadata confidentiality matters for your threat model, put the secret in the object body, not in metadata.
+
+### Does encryption add latency?
+
+- **`aes256-gcm-proxy`**: yes, small. ~30-100ms on a 100 MiB upload on modern AES-NI hardware. Reads are streaming-decrypted with similar per-byte cost.
+- **`sse-kms`**: AWS handles the crypto; latency impact is dominated by KMS API calls (one per write unless `bucket_key_enabled: true`).
+- **`sse-s3`**: negligible. AWS handles AES256 inline.
+- **`none`**: none.
+
+### I see `dg-encrypted-native: sse-kms` in my object metadata — is that leaking something?
+
+No. It's a machine marker telling the proxy "this was encrypted by AWS, don't try to decrypt it yourself." It reveals nothing sensitive — the fact that a backend uses SSE-KMS is already visible from the backend config and from any AWS-side listing. Non-secret.
+
+### Does it work if I write objects with the Python DeltaGlider CLI while the backend is encrypted?
+
+No. The Python CLI writes plaintext to the underlying S3 bucket and bypasses the proxy entirely. For an encrypted backend, standardize on the proxy as the write path — point the CLI at the proxy's endpoint, not at raw S3.
+
 ## Backup + multi-instance
 
 ### What does "Full Backup" include?
