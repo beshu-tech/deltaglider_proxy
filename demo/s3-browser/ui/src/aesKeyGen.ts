@@ -1,6 +1,5 @@
-// Shared client-side AES-256 key generator. Used by the Step 7
-// per-backend encryption subsection in BackendsPanel (and by the
-// soon-to-be-deprecated EncryptionPanel while it's still around).
+// Shared client-side AES-256 key generator. Used by the per-backend
+// encryption subsection in BackendsPanel.
 //
 // Generates 32 bytes of CSPRNG output via `crypto.getRandomValues` —
 // the browser's Web Crypto API. The key never round-trips through
@@ -8,10 +7,9 @@
 // first, then clicks Apply which persists the key via the section
 // PUT.
 //
-// A pure function, not a hook — but exported from a dedicated file
-// so callers have a single import point + the rationale comment
-// lives next to the function rather than scattered at each call
-// site.
+// A pure function, not a hook. The file used to be named
+// `useGenerateAesKey.ts` but that invited `react-hooks/rules-of-hooks`
+// false positives and misled readers about the type of the export.
 
 /**
  * Return a fresh 32-byte (256-bit) AES key as 64 lowercase hex chars.

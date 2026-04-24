@@ -174,21 +174,15 @@ impl BackendEncryptionSummary {
     }
 }
 
-/// Mirror of the engine's `derive_key_id` for the summary path.
-/// Decodes hex → 32 bytes, then SHA-256(name ‖ 0x00 ‖ key) truncated
-/// to 16 hex chars. Returns None on malformed hex (the engine would
-/// reject that at startup; the summary just elides the id).
+/// Decode hex → 32 bytes and call the engine's `derive_key_id` so
+/// the summary ALWAYS matches the id stamped on disk by the
+/// EncryptingBackend wrapper. Returns None on malformed hex (the
+/// engine would reject that at startup; the summary just elides
+/// the id).
 fn derive_key_id_for_summary(backend_name: &str, hex_key: &str) -> Option<String> {
-    use sha2::Digest;
     let bytes = hex::decode(hex_key).ok()?;
-    if bytes.len() != 32 {
-        return None;
-    }
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(backend_name.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(&bytes);
-    Some(hex::encode(&hasher.finalize()[..8]))
+    let arr: [u8; 32] = bytes.try_into().ok()?;
+    Some(crate::deltaglider::derive_key_id(backend_name, &arr))
 }
 
 /// Sanitized backend info (no secrets) for the admin API.

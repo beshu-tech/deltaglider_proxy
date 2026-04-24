@@ -490,26 +490,10 @@ async fn test_chunked_path_actually_exercised() {
     let data_dir = server.data_dir().expect("filesystem backend");
     let mut found_chunked_marker = false;
     let mut found_v1_marker = false;
-    for entry in walkdir::WalkDir::new(data_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        // Read the xattr containing the object's metadata JSON. The
-        // key (`user.dg.metadata`) matches the constant in
-        // `src/storage/xattr_meta.rs::XATTR_NAME` — test file
-        // deliberately duplicates the string rather than depending on
-        // a crate-internal constant.
-        let xattr_raw = match xattr::get(entry.path(), "user.dg.metadata") {
-            Ok(Some(bytes)) => bytes,
-            _ => continue,
-        };
-        let meta_json = match std::str::from_utf8(&xattr_raw) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
+    for (_, meta) in common::read_xattr_metadata(data_dir) {
+        // Match against the serialised JSON form to catch the
+        // marker no matter which field carries it.
+        let meta_json = meta.to_string();
         if meta_json.contains("aes-256-gcm-chunked-v1") {
             found_chunked_marker = true;
         }
@@ -549,42 +533,20 @@ async fn test_write_stamps_key_id_metadata() {
     let data_dir = server.data_dir().expect("filesystem backend");
     let mut small_kid: Option<String> = None;
     let mut chunked_kid: Option<String> = None;
-    for entry in walkdir::WalkDir::new(data_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let xattr_raw = match xattr::get(entry.path(), "user.dg.metadata") {
-            Ok(Some(bytes)) => bytes,
-            _ => continue,
-        };
-        let meta_json = match std::str::from_utf8(&xattr_raw) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        // Proper JSON probe — the xattr JSON includes user_metadata
-        // as a map, and serde_json gives us a clean lookup.
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(meta_json) {
-            let kid = parsed
-                .get("user_metadata")
-                .and_then(|um| um.get("dg-encryption-key-id"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            if let Some(kid) = kid {
-                let fname = entry
-                    .path()
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("");
-                // Both files get the SAME kid (singleton "default"
-                // backend → same wrapper → same id).
-                if fname == "small.txt" {
-                    small_kid = Some(kid);
-                } else if fname == "chunked.bin" {
-                    chunked_kid = Some(kid);
-                }
+    for (path, parsed) in common::read_xattr_metadata(data_dir) {
+        let kid = parsed
+            .get("user_metadata")
+            .and_then(|um| um.get("dg-encryption-key-id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        if let Some(kid) = kid {
+            let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            // Both files get the SAME kid (singleton "default"
+            // backend → same wrapper → same id).
+            if fname == "small.txt" {
+                small_kid = Some(kid);
+            } else if fname == "chunked.bin" {
+                chunked_kid = Some(kid);
             }
         }
     }
@@ -597,21 +559,14 @@ async fn test_write_stamps_key_id_metadata() {
         chunked_kid.is_some(),
         "chunked write must stamp dg-encryption-key-id metadata"
     );
+    // The observable cross-path invariant: single-shot and chunked
+    // writes go through the same EncryptingBackend wrapper, so they
+    // must stamp the SAME key_id. Format invariants (16 hex chars,
+    // lowercase, etc.) are covered by unit tests on `derive_key_id`
+    // — the integration test deliberately doesn't re-cover them.
     assert_eq!(
         small_kid, chunked_kid,
-        "two writes through the same backend wrapper must produce the SAME key_id — \
-         derived from SHA-256(backend_name || key)"
-    );
-    let kid = small_kid.unwrap();
-    // Derived ids are 16 hex chars (8 bytes of SHA-256).
-    assert_eq!(
-        kid.len(),
-        16,
-        "derived key_id must be 16 hex chars, got: {kid}"
-    );
-    assert!(
-        kid.chars().all(|c| c.is_ascii_hexdigit()),
-        "derived key_id must be hex, got: {kid}"
+        "two writes through the same backend wrapper must produce the SAME key_id"
     );
 }
 

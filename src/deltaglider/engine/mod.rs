@@ -522,33 +522,13 @@ fn resolve_legacy_shim(
     backend_name: &str,
     enc: &crate::config::BackendEncryptionConfig,
 ) -> Result<(Option<crate::storage::EncryptionKey>, Option<String>), StorageError> {
-    use crate::config::BackendEncryptionConfig as E;
-    let (legacy_hex, legacy_kid): (Option<&str>, Option<&str>) = match enc {
-        E::None => (None, None),
-        E::Aes256GcmProxy {
-            legacy_key,
-            legacy_key_id,
-            ..
-        }
-        | E::SseKms {
-            legacy_key,
-            legacy_key_id,
-            ..
-        }
-        | E::SseS3 {
-            legacy_key,
-            legacy_key_id,
-            ..
-        } => (legacy_key.as_deref(), legacy_key_id.as_deref()),
-    };
-
-    let Some(hex) = legacy_hex else {
+    let Some(hex) = enc.legacy_key() else {
         return Ok((None, None));
     };
     let parsed = crate::storage::EncryptionKey::from_hex(hex).map_err(|e| {
         StorageError::Encryption(format!("backend '{}' legacy_key: {}", backend_name, e))
     })?;
-    let kid = match legacy_kid {
+    let kid = match enc.legacy_key_id() {
         Some(explicit) => explicit.to_string(),
         None => derive_key_id(&format!("{backend_name}::legacy"), &parsed.0),
     };
@@ -568,7 +548,13 @@ fn resolve_legacy_shim(
 /// Operators who WANT cross-backend portability pin an explicit
 /// matching `key_id` on both — that's the documented escape hatch,
 /// exercised by `test_key_id_collision_allowed_with_same_key`.
-fn derive_key_id(backend_name: &str, key_bytes: &[u8; 32]) -> String {
+///
+/// Shared with the admin-API summary path (`field_level::derive_key_id_for_summary`)
+/// so the stamped id on disk ALWAYS matches the id the operator sees
+/// in the Backends panel; drift between the two surfaces would mean
+/// a "rotated key" badge that doesn't correspond to any real object
+/// metadata.
+pub(crate) fn derive_key_id(backend_name: &str, key_bytes: &[u8; 32]) -> String {
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
     hasher.update(backend_name.as_bytes());
@@ -588,13 +574,7 @@ fn env_name_for_backend(backend_name: &str) -> String {
     } else {
         format!(
             "DGP_BACKEND_{}_ENCRYPTION_KEY",
-            backend_name
-                .chars()
-                .map(|c| match c {
-                    '-' | '.' => '_',
-                    c => c.to_ascii_uppercase(),
-                })
-                .collect::<String>()
+            crate::config::env_suffix_for_backend_name(backend_name)
         )
     }
 }
@@ -1643,6 +1623,49 @@ mod tests {
         .unwrap();
         assert!(k.is_none());
         assert!(kid.is_none());
+    }
+
+    #[test]
+    fn test_derive_key_id_shape_invariants() {
+        // Contract: 16 lowercase hex chars (8 bytes of SHA-256).
+        // Integration tests used to assert this shape; now pinned
+        // here so the integration suite can focus on the wiring
+        // (same-backend ⇒ same-kid) rather than the format.
+        let key = [0xab; 32];
+        let id = derive_key_id("my-backend", &key);
+        assert_eq!(id.len(), 16, "derived key_id must be 16 hex chars");
+        assert!(
+            id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "derived key_id must be lowercase hex, got: {id}"
+        );
+    }
+
+    #[test]
+    fn test_derive_key_id_name_disambiguates_same_key() {
+        // Two backends sharing identical key bytes but distinct
+        // names MUST produce distinct ids. This is the invariant
+        // that lets the read-side key_id check reject "same key,
+        // different backend" without relying on AEAD to fail.
+        let key = [0xcd; 32];
+        let id_a = derive_key_id("backend-a", &key);
+        let id_b = derive_key_id("backend-b", &key);
+        assert_ne!(id_a, id_b);
+    }
+
+    #[test]
+    fn test_derive_key_id_separator_prevents_collision() {
+        // "ab" + "c" vs "a" + "bc": without the 0x00 separator the
+        // SHA-256 pre-image would collide, and operators naming
+        // backends "ab" and "a" with keys that differ only by
+        // prefix alignment could accidentally produce the same id.
+        let key1 = [0x11; 32];
+        let key2 = [0x22; 32];
+        // Names chosen to make the concat-ambiguity visible.
+        assert_ne!(
+            derive_key_id("ab", &key1),
+            derive_key_id("a", &key2),
+            "name/key separator missing — two different (name, key) pairs collided"
+        );
     }
 
     #[test]

@@ -35,7 +35,7 @@
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -95,6 +95,30 @@ pub struct SectionApplyResponse {
     pub diff: Option<serde_json::Value>,
 }
 
+/// Build an early-return rejection response for the section endpoints.
+/// Encodes the "always-pair a status code with a SectionApplyResponse
+/// carrying an error message" pattern that repeated ~8× across
+/// `get_section` + `apply_section` — the boilerplate now lives here
+/// so handler bodies focus on what changed between failure cases.
+///
+/// `warnings` and `diff` default to empty/None, which fits most reject
+/// sites; the handful of sites that want to carry validation warnings
+/// or a precomputed diff through still build the response inline.
+fn reject(status: StatusCode, error: impl Into<String>) -> Response {
+    (
+        status,
+        Json(SectionApplyResponse {
+            ok: false,
+            warnings: vec![],
+            requires_restart: false,
+            persisted_path: None,
+            error: Some(error.into()),
+            diff: None,
+        }),
+    )
+        .into_response()
+}
+
 /// `GET /api/admin/config/section/:name` — serialize the named slice of
 /// the runtime config.
 ///
@@ -109,18 +133,7 @@ pub async fn get_section(
     Query(query): Query<SectionGetQuery>,
 ) -> impl IntoResponse {
     let Some(section) = SectionName::parse(&name) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(SectionApplyResponse {
-                ok: false,
-                warnings: vec![],
-                requires_restart: false,
-                persisted_path: None,
-                error: Some(unknown_section_error(&name)),
-                diff: None,
-            }),
-        )
-            .into_response();
+        return reject(StatusCode::NOT_FOUND, unknown_section_error(&name));
     };
 
     let cfg = state.config.read().await;
@@ -260,18 +273,7 @@ async fn apply_section(
     headers: Option<HeaderMap>,
 ) -> axum::response::Response {
     let Some(section) = SectionName::parse(&name) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(SectionApplyResponse {
-                ok: false,
-                warnings: vec![],
-                requires_restart: false,
-                persisted_path: None,
-                error: Some(unknown_section_error(&name)),
-                diff: None,
-            }),
-        )
-            .into_response();
+        return reject(StatusCode::NOT_FOUND, unknown_section_error(&name));
     };
 
     // Take the write lock once for the whole transition — the same
@@ -286,18 +288,7 @@ async fn apply_section(
     // is treated as "the new non-secret state of this section".
     let mut sectioned = SectionedConfig::from_flat(&old_cfg);
     if let Err(err) = merge_patch_section(&mut sectioned, section, &body) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(SectionApplyResponse {
-                ok: false,
-                warnings: vec![],
-                requires_restart: false,
-                persisted_path: None,
-                error: Some(err),
-                diff: None,
-            }),
-        )
-            .into_response();
+        return reject(StatusCode::BAD_REQUEST, err);
     }
 
     // Collapse back to flat. This runs the same `storage.normalize()`
@@ -306,20 +297,7 @@ async fn apply_section(
     // view would show.
     let mut new_cfg = match sectioned.into_flat() {
         Ok(c) => c,
-        Err(err) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(SectionApplyResponse {
-                    ok: false,
-                    warnings: vec![],
-                    requires_restart: false,
-                    persisted_path: None,
-                    error: Some(err),
-                    diff: None,
-                }),
-            )
-                .into_response();
-        }
+        Err(err) => return reject(StatusCode::BAD_REQUEST, err),
     };
 
     // Defense-in-depth: refuse explicit bootstrap_password_hash
@@ -336,20 +314,10 @@ async fn apply_section(
     // security model's contract would depend on an implementation
     // detail (the ordering) rather than an explicit check.
     if new_cfg.bootstrap_password_hash != old_cfg.bootstrap_password_hash {
-        return (
+        return reject(
             StatusCode::FORBIDDEN,
-            Json(SectionApplyResponse {
-                ok: false,
-                warnings: vec![],
-                requires_restart: false,
-                persisted_path: None,
-                error: Some(
-                    "bootstrap_password_hash cannot be changed via /config/section; use PUT /api/admin/password (verifies the current password and re-encrypts the config DB atomically)".to_string(),
-                ),
-                diff: None,
-            }),
-        )
-            .into_response();
+            "bootstrap_password_hash cannot be changed via /config/section; use PUT /api/admin/password (verifies the current password and re-encrypts the config DB atomically)",
+        );
     }
 
     // Preserve runtime secrets across the section edit. The GET
@@ -415,19 +383,14 @@ async fn apply_section(
     // name, not by list index — operators may reorder the list).
     let body_probe = BackendEncryptionKeyProbe::from_section(section, &body);
     preserve_backend_encryption_secrets(
-        "default",
         &mut new_cfg.backend_encryption,
         &old_cfg.backend_encryption,
         body_probe.for_singleton(),
     );
     for new_named in &mut new_cfg.backends {
         if let Some(old_named) = old_cfg.backends.iter().find(|n| n.name == new_named.name) {
-            preserve_backend_encryption_secrets(
-                &new_named.name,
-                &mut new_named.encryption,
-                &old_named.encryption,
-                body_probe.for_named(&new_named.name),
-            );
+            let probe = body_probe.for_named(&new_named.name);
+            preserve_backend_encryption_secrets(&mut new_named.encryption, &old_named.encryption, probe);
         }
     }
 
@@ -900,22 +863,14 @@ fn apply_fingerprints_to_enc_json(
     enc_json: &mut serde_json::Value,
     enc: &crate::config::BackendEncryptionConfig,
 ) {
-    use crate::config::BackendEncryptionConfig as E;
     let obj = match enc_json.as_object_mut() {
         Some(m) => m,
         None => return,
     };
-    let (primary, legacy): (Option<&str>, Option<&str>) = match enc {
-        E::None => (None, None),
-        E::Aes256GcmProxy {
-            key, legacy_key, ..
-        } => (key.as_deref(), legacy_key.as_deref()),
-        E::SseKms { legacy_key, .. } | E::SseS3 { legacy_key, .. } => (None, legacy_key.as_deref()),
-    };
-    if let Some(fp) = fingerprint_secret(primary) {
+    if let Some(fp) = fingerprint_secret(enc.primary_key()) {
         obj.insert("key".to_string(), serde_json::Value::String(fp));
     }
-    if let Some(fp) = fingerprint_secret(legacy) {
+    if let Some(fp) = fingerprint_secret(enc.legacy_key()) {
         obj.insert("legacy_key".to_string(), serde_json::Value::String(fp));
     }
 }
@@ -977,20 +932,19 @@ pub(crate) struct BackendKeyPresence {
 /// the flat `Config`; the probe recovers the distinction so
 /// preservation can correctly distinguish "preserve" from
 /// "explicitly clear".
-pub(crate) struct BackendEncryptionKeyProbe<'a> {
+pub(crate) struct BackendEncryptionKeyProbe {
     singleton: BackendKeyPresence,
     /// Per-backend-name probe results. `HashMap` keyed by backend
     /// name — matches the way preserve_backend_encryption_secrets
     /// walks the list.
     named: std::collections::HashMap<String, BackendKeyPresence>,
-    _phantom: std::marker::PhantomData<&'a ()>,
 }
 
-impl<'a> BackendEncryptionKeyProbe<'a> {
+impl BackendEncryptionKeyProbe {
     /// Probe the raw section body. Only the `Storage` section carries
     /// encryption fields; others return empty probes (no-op preservation
     /// rules).
-    pub(crate) fn from_section(section: SectionName, body: &'a serde_json::Value) -> Self {
+    pub(crate) fn from_section(section: SectionName, body: &serde_json::Value) -> Self {
         let mut singleton = BackendKeyPresence::default();
         let mut named: std::collections::HashMap<String, BackendKeyPresence> =
             std::collections::HashMap::new();
@@ -1017,11 +971,7 @@ impl<'a> BackendEncryptionKeyProbe<'a> {
                 }
             }
         }
-        Self {
-            singleton,
-            named,
-            _phantom: std::marker::PhantomData,
-        }
+        Self { singleton, named }
     }
 
     pub(crate) fn for_singleton(&self) -> BackendKeyPresence {
@@ -1057,7 +1007,6 @@ fn probe_enc_body(enc: &serde_json::Value) -> BackendKeyPresence {
 /// No-op on variants that don't carry the field (e.g. SseS3 has no
 /// primary `key`).
 fn preserve_backend_encryption_secrets(
-    backend_name: &str,
     new: &mut crate::config::BackendEncryptionConfig,
     old: &crate::config::BackendEncryptionConfig,
     probe: BackendKeyPresence,
@@ -1070,46 +1019,20 @@ fn preserve_backend_encryption_secrets(
     } = new
     {
         if new_key.is_none() && !probe.key_is_explicit_null {
-            if let E::Aes256GcmProxy {
-                key: Some(ref old_key),
-                ..
-            } = old
-            {
-                *new_key = Some(old_key.clone());
+            if let Some(old_key) = old.primary_key() {
+                *new_key = Some(old_key.to_string());
             }
         }
     }
     // Legacy shim key preservation — relevant on all three non-None
-    // variants. We fetch the old legacy_key by pattern matching on
-    // whichever variant the old config had.
-    let old_legacy: Option<String> = match old {
-        E::Aes256GcmProxy { legacy_key, .. }
-        | E::SseKms { legacy_key, .. }
-        | E::SseS3 { legacy_key, .. } => legacy_key.clone(),
-        E::None => None,
-    };
-    let new_legacy: Option<&mut Option<String>> = match new {
-        E::Aes256GcmProxy {
-            ref mut legacy_key, ..
-        }
-        | E::SseKms {
-            ref mut legacy_key, ..
-        }
-        | E::SseS3 {
-            ref mut legacy_key, ..
-        } => Some(legacy_key),
-        E::None => None,
-    };
-    if let Some(lk) = new_legacy {
-        if lk.is_none() && !probe.legacy_key_is_explicit_null {
-            *lk = old_legacy;
+    // variants. Accessors hide the "same slot on three variants"
+    // shape so we don't enumerate arms here.
+    let old_legacy = old.legacy_key().map(str::to_string);
+    if let Some(new_legacy) = new.legacy_key_mut() {
+        if new_legacy.is_none() && !probe.legacy_key_is_explicit_null {
+            *new_legacy = old_legacy;
         }
     }
-    // Backend_name is currently unused in this helper but is a stable
-    // signature point for future extensions (per-backend warning
-    // text, metrics, etc.). `#[allow(unused_variables)]` would be
-    // louder than just touching it.
-    let _ = backend_name;
 }
 
 /// Non-mutating predicate: would applying `new` on top of `old` require

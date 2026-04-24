@@ -3,11 +3,10 @@
  * each card on BackendsPanel.
  *
  * Wraps four mode choices ({none, aes256-gcm-proxy, sse-kms, sse-s3})
- * + the proxy-AES key-generation flow (lifted from the deprecated
- * EncryptionPanel via `useGenerateAesKey`). On Apply, constructs a
- * targeted `storage` section PUT that replaces ONLY this backend's
- * `encryption` block and leaves every sibling backend and every
- * non-encryption field on this backend untouched.
+ * + the proxy-AES key-generation flow (via `aesKeyGen`). On Apply,
+ * constructs a targeted `storage` section PUT that replaces ONLY
+ * this backend's `encryption` block and leaves every sibling backend
+ * and every non-encryption field on this backend untouched.
  *
  * Layer isolation: the editor knows nothing about other backends.
  * The parent BackendsPanel hands it the current summary + a save
@@ -29,7 +28,7 @@ import type { BackendEncryptionSummary, BackendEncryptionMode } from '../adminAp
 import SimpleSelect from './SimpleSelect';
 import { useColors } from '../ThemeContext';
 import { useCardStyles } from './shared-styles';
-import { generateAesKeyHex } from '../useGenerateAesKey';
+import { generateAesKeyHex } from '../aesKeyGen';
 
 const { Text } = Typography;
 

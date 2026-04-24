@@ -379,11 +379,10 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
               {testResult?.name === b.name && (
                 <Alert type={testResult.ok ? 'success' : 'error'} message={testResult.message} showIcon style={{ marginTop: 8, borderRadius: 6 }} />
               )}
-              {/* Step 7: per-backend encryption subsection. Shows the
-                 current mode, exposes a mode-change picker, and wraps
-                 the proxy-AES key-generation flow lifted from the
-                 EncryptionPanel. Apply sends a targeted storage
-                 section PUT; siblings are preserved by merge-patch. */}
+              {/* Per-backend encryption subsection: shows the current
+                 mode, exposes a mode-change picker, and wraps the
+                 proxy-AES key-generation flow. Apply sends a targeted
+                 storage section PUT; siblings preserved by merge-patch. */}
               <BackendEncryptionEditor
                 backendName={b.name}
                 current={b.encryption}

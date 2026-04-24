@@ -589,6 +589,53 @@ impl BackendEncryptionConfig {
             }
         }
     }
+
+    /// Accessor for the primary `key` hex (only present on
+    /// `Aes256GcmProxy`). Returns `None` on every other variant —
+    /// that's the variants where "primary key" is semantically
+    /// meaningless (None) or delegated to AWS (SseKms/SseS3).
+    pub fn primary_key(&self) -> Option<&str> {
+        match self {
+            Self::Aes256GcmProxy { key, .. } => key.as_deref(),
+            Self::None | Self::SseKms { .. } | Self::SseS3 { .. } => None,
+        }
+    }
+    /// Accessor for the shim `legacy_key` hex. Present on every
+    /// non-None variant (shim can decrypt historical objects after a
+    /// mode flip; SseKms/SseS3 use it to decrypt proxy-encrypted
+    /// historical objects after the backend was re-keyed). Returns
+    /// `None` on `Self::None`.
+    pub fn legacy_key(&self) -> Option<&str> {
+        match self {
+            Self::None => None,
+            Self::Aes256GcmProxy { legacy_key, .. }
+            | Self::SseKms { legacy_key, .. }
+            | Self::SseS3 { legacy_key, .. } => legacy_key.as_deref(),
+        }
+    }
+    /// Accessor for the shim `legacy_key_id`. Matches `legacy_key` on
+    /// variant coverage — the pair is always present or absent
+    /// together.
+    pub fn legacy_key_id(&self) -> Option<&str> {
+        match self {
+            Self::None => None,
+            Self::Aes256GcmProxy { legacy_key_id, .. }
+            | Self::SseKms { legacy_key_id, .. }
+            | Self::SseS3 { legacy_key_id, .. } => legacy_key_id.as_deref(),
+        }
+    }
+    /// Mutable accessor for the `legacy_key` slot — used by
+    /// `preserve_backend_encryption_secrets` to re-populate the old
+    /// key when the operator's edit omitted it. Returns `None` on
+    /// `Self::None` where the slot doesn't exist.
+    pub fn legacy_key_mut(&mut self) -> Option<&mut Option<String>> {
+        match self {
+            Self::None => None,
+            Self::Aes256GcmProxy { legacy_key, .. }
+            | Self::SseKms { legacy_key, .. }
+            | Self::SseS3 { legacy_key, .. } => Some(legacy_key),
+        }
+    }
 }
 
 /// Check whether a `key_id` string matches the documented charset
@@ -613,7 +660,12 @@ pub(crate) fn is_valid_key_id(s: &str) -> bool {
 /// path) gets the un-prefixed env-var names `DGP_ENCRYPTION_KEY` /
 /// `DGP_SSE_KMS_KEY_ID` so single-backend deployments keep the short
 /// names operators are used to.
-fn env_suffix_for_backend_name(name: &str) -> String {
+///
+/// Shared with `engine::env_name_for_backend` (the
+/// `DGP_BACKEND_<NAME>_ENCRYPTION_KEY` formatter) so the char-mapping
+/// rules live in one place. Drift risk: an operator's env var no
+/// longer matches the named backend if the two functions diverge.
+pub(crate) fn env_suffix_for_backend_name(name: &str) -> String {
     name.chars()
         .map(|c| match c {
             '-' | '.' => '_',

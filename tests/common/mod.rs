@@ -299,10 +299,30 @@ impl TestServer {
     pub async fn respawn_without_encryption_key(&mut self) {
         let _ = self.process.kill();
         let _ = self.process.wait();
-        // Short sleep so the kernel releases the port before we rebind.
-        // Without this the new child hits EADDRINUSE and wait_ready
-        // panics with a stale-port diagnostic.
-        sleep(Duration::from_millis(200)).await;
+        // Poll until the kernel has actually released the listening
+        // socket before we spawn the new child. A hard 200 ms sleep
+        // was racy on slow hosts (EADDRINUSE) and over-long on fast
+        // ones. Bounded to ~2s — if we can't bind in that window
+        // something is genuinely stuck and a loud panic is better
+        // than silently waiting forever.
+        let addr = format!("127.0.0.1:{}", self.port);
+        let mut rebind_ok = false;
+        for _ in 0..40 {
+            match std::net::TcpListener::bind(&addr) {
+                Ok(listener) => {
+                    drop(listener);
+                    rebind_ok = true;
+                    break;
+                }
+                Err(_) => sleep(Duration::from_millis(50)).await,
+            }
+        }
+        assert!(
+            rebind_ok,
+            "port {} did not free within ~2s after killing the old child; \
+             another process may be holding it (try `lsof -i :{}`)",
+            self.port, self.port
+        );
 
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"));
         cmd.env("DGP_CONFIG", &self.config_path)
@@ -1009,4 +1029,39 @@ macro_rules! skip_unless_docker {
             return;
         }
     };
+}
+
+/// Walk a filesystem-backend data directory and return every file's
+/// `user.dg.metadata` xattr parsed as JSON. The key matches
+/// `src/storage/xattr_meta.rs::XATTR_NAME` — tests depend on the
+/// concrete name rather than the constant so they also catch the
+/// case where the constant is accidentally renamed without a test
+/// update.
+///
+/// Files without a `user.dg.metadata` xattr are skipped silently
+/// (directories, partial writes, CAS-style staged blobs, etc.).
+/// Shared with the encryption integration suite so we don't have N
+/// copies of the same walkdir + xattr::get + serde_json::parse
+/// ladder.
+#[cfg(unix)]
+pub fn read_xattr_metadata(
+    data_dir: &std::path::Path,
+) -> Vec<(std::path::PathBuf, serde_json::Value)> {
+    let mut out = Vec::new();
+    for entry in walkdir::WalkDir::new(data_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let bytes = match xattr::get(entry.path(), "user.dg.metadata") {
+            Ok(Some(b)) => b,
+            _ => continue,
+        };
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            out.push((entry.path().to_path_buf(), v));
+        }
+    }
+    out
 }

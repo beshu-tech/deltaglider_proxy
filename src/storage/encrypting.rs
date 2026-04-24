@@ -88,9 +88,9 @@ const CHUNK_HEADER_LEN: usize = 4 /*magic*/ + 12 /*base_iv*/;
 pub const CHUNK_FRAME_WIRE_LEN: usize = CHUNK_FRAME_LEN_FIELD + CHUNK_PLAINTEXT_SIZE + GCM_TAG_LEN;
 /// Cap on the length-prefix to foil DOS-via-crafted-length allocations.
 /// A legitimate chunk can never exceed 64 KiB + tag + a tiny buffer.
-/// Consumed by the streaming decoder in Step 2 of this implementation
-/// (plumbed via the rewritten `get_passthrough_stream`).
-#[allow(dead_code)]
+/// Enforced by the streaming chunk decoders
+/// (`chunked_decrypt_stream` + `chunked_decrypt_stream_from_chunk`)
+/// before they allocate the per-chunk buffer.
 pub(crate) const CHUNK_MAX_WIRE_CIPHERTEXT: usize = CHUNK_PLAINTEXT_SIZE + GCM_TAG_LEN + 1024;
 
 /// AES-256 encryption key (32 bytes). Zeroized on drop.
@@ -462,7 +462,59 @@ where
         skip_bytes,
         take_bytes,
     };
+    decrypt_stream_from_state(state)
+}
 
+/// Range-read decoder builder. Differs from
+/// [`chunked_decrypt_stream`] in that the caller has already fetched
+/// the 16-byte header (magic + base_iv) via a separate small range
+/// request and hands the parsed `base_iv` + starting `chunk_index` in
+/// directly. The `inner` stream must start at the beginning of
+/// `starting_chunk_index`'s frame (i.e. at `wire_offset_of_chunk`),
+/// not at wire offset 0.
+///
+/// This is what makes "read last 100 bytes of a 10 GiB file" cost O(1)
+/// network traffic instead of O(N): we fetch exactly the target chunks
+/// plus the separate tiny header fetch, and the decoder starts with
+/// its chunk_index aligned to the range.
+fn chunked_decrypt_stream_from_chunk<S>(
+    inner: S,
+    key: EncryptionKey,
+    base_iv: [u8; IV_LEN],
+    starting_chunk_index: u32,
+    expected_final_index: u32,
+    skip_bytes: u64,
+    take_bytes: Option<u64>,
+) -> BoxStream<'static, Result<Bytes, StorageError>>
+where
+    S: futures::Stream<Item = Result<Bytes, StorageError>> + Unpin + Send + 'static,
+{
+    let state = DecryptState {
+        inner,
+        key,
+        buf: Vec::with_capacity(CHUNK_FRAME_WIRE_LEN + 64),
+        // Caller already consumed the header — skip phase 1 entirely.
+        header_done: true,
+        base_iv,
+        chunk_index: starting_chunk_index,
+        expected_final_index,
+        emitted_final: false,
+        skip_bytes,
+        take_bytes,
+    };
+    decrypt_stream_from_state(state)
+}
+
+/// Shared unfold body for the two chunked-decrypt entry points above.
+/// The only difference between "full stream" and "range stream" is the
+/// initial `DecryptState` — the iteration logic (phase-1 header parse,
+/// phase-2 frame parse, decrypt, skip/take plaintext trim) is
+/// bit-for-bit identical. Keeping one copy of this AEAD-critical loop
+/// avoids the "fix a bug in one, forget the other" risk.
+fn decrypt_stream_from_state<S>(state: DecryptState<S>) -> BoxStream<'static, Result<Bytes, StorageError>>
+where
+    S: futures::Stream<Item = Result<Bytes, StorageError>> + Unpin + Send + 'static,
+{
     Box::pin(futures::stream::unfold(state, |mut st| async move {
         use futures::StreamExt;
         loop {
@@ -471,7 +523,9 @@ where
                 return None;
             }
 
-            // Phase 1: header ([magic][base_iv]).
+            // Phase 1: header ([magic][base_iv]). Skipped when the
+            // caller (range decoder) already consumed the header out
+            // of band — they pre-set `header_done = true`.
             if !st.header_done {
                 while st.buf.len() < CHUNK_HEADER_LEN {
                     match st.inner.next().await {
@@ -610,144 +664,6 @@ where
 
             if to_emit.is_empty() {
                 // Don't emit an empty Bytes — loop to next frame.
-                continue;
-            }
-            return Some((Ok(to_emit), st));
-        }
-    }))
-}
-
-/// Range-read decoder builder. Differs from
-/// [`chunked_decrypt_stream`] in that the caller has already fetched
-/// the 16-byte header (magic + base_iv) via a separate small range
-/// request and hands the parsed `base_iv` + starting `chunk_index` in
-/// directly. The `inner` stream must start at the beginning of
-/// `starting_chunk_index`'s frame (i.e. at `wire_offset_of_chunk`),
-/// not at wire offset 0.
-///
-/// This is what makes "read last 100 bytes of a 10 GiB file" cost O(1)
-/// network traffic instead of O(N): we fetch exactly the target chunks
-/// plus the separate tiny header fetch, and the decoder starts with
-/// its chunk_index aligned to the range.
-fn chunked_decrypt_stream_from_chunk<S>(
-    inner: S,
-    key: EncryptionKey,
-    base_iv: [u8; IV_LEN],
-    starting_chunk_index: u32,
-    expected_final_index: u32,
-    skip_bytes: u64,
-    take_bytes: Option<u64>,
-) -> BoxStream<'static, Result<Bytes, StorageError>>
-where
-    S: futures::Stream<Item = Result<Bytes, StorageError>> + Unpin + Send + 'static,
-{
-    let state = DecryptState {
-        inner,
-        key,
-        buf: Vec::with_capacity(CHUNK_FRAME_WIRE_LEN + 64),
-        // Caller already consumed the header — skip phase 1 entirely.
-        header_done: true,
-        base_iv,
-        chunk_index: starting_chunk_index,
-        expected_final_index,
-        emitted_final: false,
-        skip_bytes,
-        take_bytes,
-    };
-
-    Box::pin(futures::stream::unfold(state, |mut st| async move {
-        use futures::StreamExt;
-        loop {
-            if matches!(st.take_bytes, Some(0)) {
-                return None;
-            }
-            if st.emitted_final {
-                return None;
-            }
-
-            while st.buf.len() < CHUNK_FRAME_LEN_FIELD {
-                match st.inner.next().await {
-                    Some(Ok(more)) => st.buf.extend_from_slice(&more),
-                    Some(Err(e)) => return Some((Err(e), st)),
-                    None => {
-                        return Some((
-                            Err(StorageError::Encryption(format!(
-                                "stream truncated before chunk {} (expected final index {})",
-                                st.chunk_index, st.expected_final_index
-                            ))),
-                            st,
-                        ));
-                    }
-                }
-            }
-
-            let declared =
-                u32::from_le_bytes(st.buf[..CHUNK_FRAME_LEN_FIELD].try_into().unwrap()) as usize;
-            if declared > CHUNK_MAX_WIRE_CIPHERTEXT {
-                return Some((
-                    Err(StorageError::Encryption(format!(
-                        "frame length {} exceeds ceiling {} — rejecting (possible DOS)",
-                        declared, CHUNK_MAX_WIRE_CIPHERTEXT,
-                    ))),
-                    st,
-                ));
-            }
-            let frame_wire_len = CHUNK_FRAME_LEN_FIELD + declared;
-            while st.buf.len() < frame_wire_len {
-                match st.inner.next().await {
-                    Some(Ok(more)) => st.buf.extend_from_slice(&more),
-                    Some(Err(e)) => return Some((Err(e), st)),
-                    None => {
-                        return Some((
-                            Err(StorageError::Encryption(
-                                "stream truncated mid-frame-body".into(),
-                            )),
-                            st,
-                        ));
-                    }
-                }
-            }
-
-            let is_final = st.chunk_index == st.expected_final_index;
-            let ct = &st.buf[CHUNK_FRAME_LEN_FIELD..frame_wire_len];
-            let pt = match decrypt_chunk(&st.key, &st.base_iv, st.chunk_index, is_final, ct) {
-                Ok(p) => p,
-                Err(e) => return Some((Err(e), st)),
-            };
-            st.buf.drain(..frame_wire_len);
-            st.chunk_index = match st.chunk_index.checked_add(1) {
-                Some(v) => v,
-                None => {
-                    return Some((
-                        Err(StorageError::Encryption(
-                            "chunk index overflow during decode".into(),
-                        )),
-                        st,
-                    ));
-                }
-            };
-            if is_final {
-                st.emitted_final = true;
-            }
-
-            let mut start = 0usize;
-            if st.skip_bytes > 0 {
-                let skip = std::cmp::min(st.skip_bytes as usize, pt.len());
-                start += skip;
-                st.skip_bytes -= skip as u64;
-            }
-            let remainder = &pt[start..];
-
-            let to_emit: Bytes = if let Some(take) = st.take_bytes {
-                let take_now = std::cmp::min(take as usize, remainder.len());
-                let slice = Bytes::copy_from_slice(&remainder[..take_now]);
-                st.take_bytes = Some(take - take_now as u64);
-                slice
-            } else {
-                Bytes::copy_from_slice(remainder)
-            };
-
-            if to_emit.is_empty() {
                 continue;
             }
             return Some((Ok(to_emit), st));
@@ -2228,34 +2144,23 @@ mod tests {
 
     /// Construct a CountingBackend pre-loaded with a chunked-encrypted
     /// object, wrap it in an EncryptingBackend, and return the wrapper
-    /// plus the plaintext for assertion.
+    /// plus the plaintext for assertion. Degenerate case of
+    /// [`setup_shim_wrapper`] — no key_id on either side, no shim.
     async fn setup_wrapper_with_chunked_object(
         key: EncryptionKey,
         plaintext_size: usize,
     ) -> (EncryptingBackend<CountingBackend>, Vec<u8>) {
-        let plaintext: Vec<u8> = (0..plaintext_size).map(|i| (i & 0xff) as u8).collect();
-        let (ciphertext, _base_iv, _final_idx) = encode_chunked(&key, &plaintext);
-
-        let mut meta = FileMetadata::fallback(
-            "test.bin".into(),
-            plaintext_size as u64,
-            "md5".into(),
-            Utc::now(),
-            None,
-            crate::types::StorageInfo::Passthrough,
-        );
-        mark_chunked_encrypted(&mut meta, None);
-
-        let mut backend = CountingBackend::new();
-        backend.set_contents(ciphertext, meta);
-
-        let enc_config = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
-            key: Some(key),
-            key_id: None,
-            ..Default::default()
-        })));
-        let wrapper = EncryptingBackend::new(backend, enc_config);
-        (wrapper, plaintext)
+        setup_shim_wrapper(ShimSetup {
+            primary_key: Some(key.clone()),
+            primary_kid: None,
+            write_mode: WriteMode::default(),
+            legacy_key: None,
+            legacy_kid: None,
+            stamped_key: key,
+            stamped_kid: None,
+            plaintext_size,
+        })
+        .await
     }
 
     #[tokio::test]
@@ -2432,36 +2337,25 @@ mod tests {
     /// plaintext. Differs from `setup_wrapper_with_chunked_object`:
     /// this variant writes the `dg-encryption-key-id` metadata stamp
     /// directly so we can exercise the READ path's mismatch check
-    /// without needing a write cycle.
+    /// without needing a write cycle. Degenerate case of
+    /// [`setup_shim_wrapper`] — no legacy shim, primary-only.
     async fn setup_wrapper_with_stamped_object(
         key: EncryptionKey,
-        stamped_kid: Option<&str>,
+        stamped_kid: Option<&'static str>,
         plaintext_size: usize,
         wrapper_key_id: Option<String>,
     ) -> (EncryptingBackend<CountingBackend>, Vec<u8>) {
-        let plaintext: Vec<u8> = (0..plaintext_size).map(|i| (i & 0xff) as u8).collect();
-        let (ciphertext, _base_iv, _final_idx) = encode_chunked(&key, &plaintext);
-
-        let mut meta = FileMetadata::fallback(
-            "test.bin".into(),
-            plaintext_size as u64,
-            "md5".into(),
-            Utc::now(),
-            None,
-            crate::types::StorageInfo::Passthrough,
-        );
-        mark_chunked_encrypted(&mut meta, stamped_kid);
-
-        let mut backend = CountingBackend::new();
-        backend.set_contents(ciphertext, meta);
-
-        let enc_config = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
-            key: Some(key),
-            key_id: wrapper_key_id,
-            ..Default::default()
-        })));
-        let wrapper = EncryptingBackend::new(backend, enc_config);
-        (wrapper, plaintext)
+        setup_shim_wrapper(ShimSetup {
+            primary_key: Some(key.clone()),
+            primary_kid: wrapper_key_id,
+            write_mode: WriteMode::default(),
+            legacy_key: None,
+            legacy_kid: None,
+            stamped_key: key,
+            stamped_kid,
+            plaintext_size,
+        })
+        .await
     }
 
     #[tokio::test]
