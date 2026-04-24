@@ -268,17 +268,49 @@ jobs:
           provenance: false
           sbom: false
 
+      # CRITICAL: write the digest marker into a RUN-SCOPED directory
+      # (never `/tmp/digests` — on persistent self-hosted runners that
+      # path accumulates markers from every prior release, and the
+      # later `Upload digest` step glob-uploads all of them into one
+      # artifact. The manifest-merge job then composes ALL historical
+      # digests into the OCI index and DockerHub hands clients one of
+      # the stale amd64 images at pull time. This is exactly the
+      # "v0.8.10 tag serves April 8 binary" regression.)
+      #
+      # We also upload by EXACT path, not by glob, so a runner
+      # mis-configuration that pre-populates the run-scoped dir can't
+      # silently re-introduce the bug.
       - name: Export digest
+        id: export
         run: |
-          mkdir -p /tmp/digests
+          set -euo pipefail
+          digest_dir="${RUNNER_TEMP}/dgp-digest"
+          rm -rf "$digest_dir"
+          mkdir -p "$digest_dir"
           digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
+          if [ -z "$digest" ]; then
+            echo "::error::build step produced no digest output — refusing to upload an empty marker"
+            exit 1
+          fi
+          marker="$digest_dir/${digest#sha256:}"
+          touch "$marker"
+          echo "digest_path=$marker" >> "$GITHUB_OUTPUT"
+          echo "digest_dir=$digest_dir" >> "$GITHUB_OUTPUT"
+          # Sanity: EXACTLY one file must exist in the run-scoped dir.
+          count=$(find "$digest_dir" -maxdepth 1 -type f | wc -l)
+          if [ "$count" -ne 1 ]; then
+            echo "::error::expected exactly 1 digest marker, found $count in $digest_dir"
+            ls -la "$digest_dir"
+            exit 1
+          fi
 
       - name: Upload digest
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: docker-digest-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
-          path: /tmp/digests/*
+          # EXACT path — not a glob — so we upload only the digest we
+          # just produced. Belt-and-braces with the rm -rf above.
+          path: ${{ steps.export.outputs.digest_path }}
           if-no-files-found: error
           retention-days: 1
 
@@ -317,6 +349,35 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=raw,value=latest
+
+      # Defense-in-depth: verify we have EXACTLY the digests we expect
+      # before composing the manifest. The docker-build matrix produces
+      # one file per platform (linux/amd64, linux/arm64) → 2 files. If
+      # the upload step regressed or a runner had leftover markers,
+      # this catches it here instead of silently publishing a stale
+      # multi-arch index. (See the v0.8.10 post-mortem: 9 stale
+      # markers shipped alongside 1 fresh one, and the April 8 amd64
+      # won the arbitration at pull time.)
+      - name: Verify digest file count
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          count=$(find . -maxdepth 1 -type f | wc -l)
+          echo "Found $count digest marker(s):"
+          ls -la
+          expected=2  # amd64 + arm64
+          if [ "$count" -ne "$expected" ]; then
+            echo "::error::expected $expected digest markers (one per platform), found $count"
+            echo "::error::this usually means stale markers leaked from a previous run via a persistent runner"
+            exit 1
+          fi
+          # Sanity: each filename must be exactly 64 hex chars (a sha256 without prefix).
+          for f in *; do
+            if ! printf '%s' "$f" | grep -qE '^[0-9a-f]{64}$'; then
+              echo "::error::unexpected file in digest artifact: $f"
+              exit 1
+            fi
+          done
 
       - name: Create and push manifest
         working-directory: /tmp/digests
