@@ -67,6 +67,12 @@ pub struct ObjectQuery {
     pub acl: Option<String>,
     /// Tagging operations (GET/PUT/DELETE with ?tagging)
     pub tagging: Option<String>,
+    /// ListParts: page size cap (L1 pagination fix).
+    #[serde(rename = "max-parts")]
+    pub max_parts: Option<u32>,
+    /// ListParts: return parts with number strictly greater than this.
+    #[serde(rename = "part-number-marker")]
+    pub part_number_marker: Option<u32>,
     /// Response header overrides for presigned URLs
     #[serde(rename = "response-content-type")]
     pub response_content_type: Option<String>,

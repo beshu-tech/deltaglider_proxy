@@ -14,7 +14,7 @@ pub enum S3Error {
     #[error("NoSuchBucket: The specified bucket does not exist.")]
     NoSuchBucket(String),
 
-    #[error("BucketNotEmpty: The bucket you tried to delete is not empty.")]
+    #[error("BucketNotEmpty: The bucket you tried to delete is not empty: {0}")]
     BucketNotEmpty(String),
 
     #[error("BucketAlreadyExists: The requested bucket name is not available.")]

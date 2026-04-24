@@ -46,12 +46,19 @@ pub async fn put_object_or_copy(
         return Ok(StatusCode::OK.into_response());
     }
 
-    // PUT /{bucket}/{key}?tagging — accept and ignore (tagging stub)
+    // PUT /{bucket}/{key}?tagging — return 501 NotImplemented.
+    //
+    // M4 correctness fix: pre-fix, we returned 200 OK and silently
+    // discarded the tag set. Clients that relied on tags for
+    // lifecycle policies, compliance labels, or ABAC access control
+    // would read back an empty tag set on the next GET and think
+    // something wiped them. 501 is the honest answer: "we don't
+    // support this; don't rely on it."
     if query.tagging.is_some() {
-        info!("PUT object tagging (stub): {}/{}", bucket, key);
-        // Verify the object exists first; S3 returns 404 for tagging on non-existent objects
-        state.engine.load().head(&bucket, &key).await?;
-        return Ok(StatusCode::OK.into_response());
+        info!("PUT object tagging: unsupported (returning 501)");
+        return Err(S3Error::NotImplemented(
+            "Object tagging is not supported by this proxy".to_string(),
+        ));
     }
 
     let decoded_body = decode_body(&headers, body)?;
@@ -72,7 +79,8 @@ pub async fn put_object_or_copy(
             *part_num,
             upload_id,
             decoded_body,
-        );
+        )
+        .await;
     }
 
     // Copy vs direct put
@@ -109,14 +117,18 @@ pub async fn get_object(
     Query(query): Query<ObjectQuery>,
     req_headers: HeaderMap,
 ) -> Result<Response, S3Error> {
-    // GET /{bucket}/{key}?tagging — return empty tagging response
+    // GET /{bucket}/{key}?tagging — return 501 NotImplemented.
+    //
+    // M4 correctness fix: pre-fix, we returned a hardcoded empty
+    // <TagSet/> pretending every object had no tags. That was both
+    // dishonest (we can't know) and unsafe for clients using tags as
+    // access control. 501 signals "not supported; find another way."
     if query.tagging.is_some() {
-        info!("GET object tagging (stub): {}/{}", bucket, key);
-        // Verify the object exists first; S3 returns 404 for tagging on non-existent objects
-        state.engine.load().head(&bucket, &key).await?;
-        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
-<Tagging><TagSet/></Tagging>"#;
-        return Ok(xml_response(xml));
+        info!("GET object tagging: unsupported (returning 501)");
+        let _ = state.engine.load().head(&bucket, &key).await; // drain error
+        return Err(S3Error::NotImplemented(
+            "Object tagging is not supported by this proxy".to_string(),
+        ));
     }
 
     // GET /{bucket}/{key}?acl — return canned ACL response
@@ -127,17 +139,28 @@ pub async fn get_object(
         return get_acl_response();
     }
 
-    // ListParts
+    // ListParts (L1 fix: paginate instead of claiming is_truncated=false).
     if let Some(upload_id) = &query.upload_id {
         info!("ListParts {}/{} uploadId={}", bucket, key, upload_id);
-        let parts = state.multipart.list_parts(upload_id, &bucket, &key)?;
+        let marker = query.part_number_marker.unwrap_or(0);
+        // S3 default + cap: 1000 parts per page.
+        let max_parts = query.max_parts.unwrap_or(1000).clamp(1, 1000);
+        let (parts, is_truncated, next_marker) = state.multipart.list_parts_paginated(
+            upload_id,
+            &bucket,
+            &key,
+            marker,
+            max_parts,
+        )?;
         let result = ListPartsResult {
             bucket: bucket.clone(),
             key: key.clone(),
             upload_id: upload_id.clone(),
             parts,
-            max_parts: 1000,
-            is_truncated: false,
+            max_parts,
+            is_truncated,
+            part_number_marker: marker,
+            next_part_number_marker: next_marker,
         };
         let xml = result.to_xml();
         return Ok(xml_response(xml));
@@ -315,12 +338,14 @@ pub async fn delete_object(
     auth_user: Option<axum::Extension<AuthenticatedUser>>,
     headers: HeaderMap,
 ) -> Result<Response, S3Error> {
-    // DELETE /{bucket}/{key}?tagging — no-op (tagging stub)
+    // DELETE /{bucket}/{key}?tagging — return 501 NotImplemented.
+    // M4 correctness fix: consistent with GET/PUT tagging — we don't
+    // store tags, so pretending to delete them was misleading.
     if query.tagging.is_some() {
-        info!("DELETE object tagging (stub): {}/{}", bucket, key);
-        // Verify the object exists first; S3 returns 404 for tagging on non-existent objects
-        state.engine.load().head(&bucket, &key).await?;
-        return Ok(StatusCode::NO_CONTENT.into_response());
+        info!("DELETE object tagging: unsupported (returning 501)");
+        return Err(S3Error::NotImplemented(
+            "Object tagging is not supported by this proxy".to_string(),
+        ));
     }
 
     // AbortMultipartUpload

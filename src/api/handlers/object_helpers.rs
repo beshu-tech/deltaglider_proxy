@@ -277,6 +277,16 @@ pub(super) async fn copy_object_inner(
         });
     }
 
+    // M2 security fix: honour `x-amz-copy-source-if-*` preconditions
+    // before touching the source. Pre-fix, these headers were silently
+    // ignored — a client saying "copy only if source is still vX" got
+    // an unconditional copy regardless. Evaluated against the HEAD
+    // metadata so we don't pay the retrieve cost when the precondition
+    // is going to fail anyway.
+    if let Some(err) = check_copy_source_conditionals(headers, &source_meta_head) {
+        return Err(err);
+    }
+
     // Retrieve source object
     let (data, source_meta) = engine.retrieve(&source_bucket, &source_key).await?;
 
@@ -288,25 +298,40 @@ pub(super) async fn copy_object_inner(
         });
     }
 
-    // Handle x-amz-metadata-directive: COPY (default) or REPLACE
+    // Handle x-amz-metadata-directive: COPY (default) or REPLACE.
+    //
+    // M3 security fix: reject any value that's not one of the two
+    // documented enum values (case-insensitive). Pre-fix, a typo like
+    // "REPLAC" silently fell through to COPY and preserved the source
+    // metadata the client was clearly trying to replace. That's a
+    // correctness footgun — the Copy succeeded with metadata the
+    // client explicitly chose NOT to write.
     let metadata_directive = headers
         .get("x-amz-metadata-directive")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("COPY");
 
-    let (dest_content_type, dest_user_metadata) =
-        if metadata_directive.eq_ignore_ascii_case("REPLACE") {
-            // REPLACE: use metadata from the copy request headers
-            let ct = extract_content_type(headers);
-            let um = extract_user_metadata(headers);
-            (ct, um)
-        } else {
-            // COPY (default): preserve source metadata
-            (
-                source_meta.content_type.clone(),
-                source_meta.user_metadata.clone(),
-            )
-        };
+    let directive_is_copy = metadata_directive.eq_ignore_ascii_case("COPY");
+    let directive_is_replace = metadata_directive.eq_ignore_ascii_case("REPLACE");
+    if !directive_is_copy && !directive_is_replace {
+        return Err(S3Error::InvalidArgument(format!(
+            "x-amz-metadata-directive must be COPY or REPLACE, got '{}'",
+            metadata_directive
+        )));
+    }
+
+    let (dest_content_type, dest_user_metadata) = if directive_is_replace {
+        // REPLACE: use metadata from the copy request headers
+        let ct = extract_content_type(headers);
+        let um = extract_user_metadata(headers);
+        (ct, um)
+    } else {
+        // COPY: preserve source metadata
+        (
+            source_meta.content_type.clone(),
+            source_meta.user_metadata.clone(),
+        )
+    };
 
     // Quota check on destination bucket before storing
     check_quota(state, bucket, data.len() as u64)?;
@@ -372,7 +397,7 @@ pub(super) fn decode_body(headers: &HeaderMap, body: Bytes) -> Result<Bytes, S3E
 }
 
 /// Handle a multipart upload part (PUT with ?partNumber&uploadId).
-pub(super) fn upload_part(
+pub(super) async fn upload_part(
     state: &Arc<AppState>,
     bucket: &str,
     key: &str,
@@ -385,6 +410,13 @@ pub(super) fn upload_part(
         "UploadPart {}/{} part={} uploadId={}",
         bucket, key, part_num, upload_id
     );
+
+    // M1 security fix: refuse part uploads when the target bucket
+    // doesn't exist. Pre-fix, UploadPart accepted bytes into a
+    // MultipartStore entry whose bucket had been deleted since
+    // Initiate — orphan memory until the idle-TTL sweeper, and a
+    // silent contract violation vs. S3 (which 404s immediately).
+    ensure_bucket_exists(state, bucket).await?;
 
     validate_content_md5(headers, &body)?;
 
@@ -415,8 +447,23 @@ pub(super) async fn upload_part_copy(
         bucket, key, part_num, upload_id, source_bucket, source_key
     );
 
+    // M1 security fix: refuse when either the destination OR source
+    // bucket doesn't exist. retrieve() below catches source-miss
+    // indirectly but via a noisier path; the explicit check gives a
+    // clean NoSuchBucket error and closes the orphan-state window.
+    ensure_bucket_exists(state, &source_bucket).await?;
+    ensure_bucket_exists(state, bucket).await?;
+
     // Retrieve source object data
     let engine = state.engine.load();
+
+    // M2 security fix: honour `x-amz-copy-source-if-*` preconditions
+    // for UploadPartCopy the same way CopyObject does.
+    let source_meta_head = engine.head(&source_bucket, &source_key).await?;
+    if let Some(err) = check_copy_source_conditionals(headers, &source_meta_head) {
+        return Err(err);
+    }
+
     let (data, _source_meta) = engine.retrieve(&source_bucket, &source_key).await?;
 
     // Optionally apply x-amz-copy-source-range: bytes=X-Y
@@ -475,6 +522,86 @@ fn parse_http_date(s: &str) -> Option<DateTime<Utc>> {
                 .ok()
                 .map(|ndt| ndt.and_utc())
         })
+}
+
+/// Check `x-amz-copy-source-if-*` preconditions against source metadata
+/// for a CopyObject / UploadPartCopy request.
+///
+/// Per S3 spec, a failing copy-source precondition returns 412
+/// PreconditionFailed — even for the `if-none-match` / `if-modified-
+/// since` variants that would normally be 304 on a GET. That's because
+/// a "copy was not performed" is not a cacheable state; the client must
+/// actively retry.
+///
+/// Evaluation order follows AWS docs:
+/// 1. `x-amz-copy-source-if-match` (positive ETag) → 412 if no match.
+/// 2. `x-amz-copy-source-if-none-match` (negative ETag) → 412 if matches.
+/// 3. `x-amz-copy-source-if-modified-since` → 412 if source is older.
+/// 4. `x-amz-copy-source-if-unmodified-since` → 412 if source is newer.
+///
+/// Returns Some(PreconditionFailed) on first violation, None if all pass.
+/// Implemented as a pure function so it's unit-testable without an HTTP stack.
+pub(super) fn check_copy_source_conditionals(
+    req_headers: &HeaderMap,
+    source_metadata: &FileMetadata,
+) -> Option<S3Error> {
+    let etag = source_metadata.etag();
+    let etag_bare = etag.trim_matches('"');
+    let last_modified = source_metadata.created_at;
+
+    // 1. if-match — ETag MUST match, else 412.
+    if let Some(v) = req_headers
+        .get("x-amz-copy-source-if-match")
+        .and_then(|v| v.to_str().ok())
+    {
+        let matches = v.split(',').any(|t| {
+            let t = t.trim();
+            t == "*" || t == etag || t.trim_matches('"') == etag_bare
+        });
+        if !matches {
+            return Some(S3Error::PreconditionFailed);
+        }
+    }
+
+    // 2. if-none-match — ETag MUST NOT match, else 412 (NOT 304 on copy).
+    if let Some(v) = req_headers
+        .get("x-amz-copy-source-if-none-match")
+        .and_then(|v| v.to_str().ok())
+    {
+        let matches = v.split(',').any(|t| {
+            let t = t.trim();
+            t == "*" || t == etag || t.trim_matches('"') == etag_bare
+        });
+        if matches {
+            return Some(S3Error::PreconditionFailed);
+        }
+    }
+
+    // 3. if-modified-since — source MUST be newer, else 412.
+    if let Some(v) = req_headers
+        .get("x-amz-copy-source-if-modified-since")
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(date) = parse_http_date(v) {
+            if last_modified <= date {
+                return Some(S3Error::PreconditionFailed);
+            }
+        }
+    }
+
+    // 4. if-unmodified-since — source MUST be older or same, else 412.
+    if let Some(v) = req_headers
+        .get("x-amz-copy-source-if-unmodified-since")
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(date) = parse_http_date(v) {
+            if last_modified > date {
+                return Some(S3Error::PreconditionFailed);
+            }
+        }
+    }
+
+    None
 }
 
 /// Check conditional request headers against object metadata.

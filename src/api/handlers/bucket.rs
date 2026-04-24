@@ -52,6 +52,15 @@ pub struct BucketGetQuery {
     pub versioning: Option<String>,
     /// ListMultipartUploads query parameter
     pub uploads: Option<String>,
+    /// ListMultipartUploads pagination: cap on page size (default 1000).
+    #[serde(rename = "max-uploads")]
+    pub max_uploads: Option<u32>,
+    /// ListMultipartUploads pagination: skip uploads whose (key, upload-id)
+    /// is ≤ (key-marker, upload-id-marker).
+    #[serde(rename = "key-marker")]
+    pub key_marker: Option<String>,
+    #[serde(rename = "upload-id-marker")]
+    pub upload_id_marker: Option<String>,
     /// ACL operations (GET/PUT with ?acl)
     pub acl: Option<String>,
     /// Tagging operations (GET/PUT with ?tagging)
@@ -76,16 +85,16 @@ pub async fn bucket_get_handler(
     // The `auth_user` is still used by logging/audit elsewhere, but the
     // filtering decision lives in `list_scope`, set by the IAM middleware.
     let _ = &auth_user;
-    // Check for tagging request
+    // GET /{bucket}?tagging — return 501 NotImplemented.
+    // M4 correctness fix (consistent with object tagging): we don't
+    // store bucket tags, so returning a hardcoded empty TagSet
+    // silently lied to clients relying on tags for downstream policy.
     if query.tagging.is_some() {
-        info!("GET bucket tagging (stub): {}", bucket);
-        let exists = state.engine.load().head_bucket(&bucket).await?;
-        if !exists {
-            return Err(no_such_bucket_error(&bucket));
-        }
-        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
-<Tagging><TagSet/></Tagging>"#;
-        return Ok(xml_response(xml));
+        info!("GET bucket tagging: unsupported (returning 501)");
+        let _ = state.engine.load().head_bucket(&bucket).await; // drain error
+        return Err(S3Error::NotImplemented(
+            "Bucket tagging is not supported by this proxy".to_string(),
+        ));
     }
 
     // Check for ACL request
@@ -115,7 +124,15 @@ pub async fn bucket_get_handler(
     if query.uploads.is_some() {
         info!("LIST multipart uploads: {}", bucket);
         let prefix = query.prefix.as_deref();
-        return list_multipart_uploads(&state, &bucket, prefix).await;
+        return list_multipart_uploads(
+            &state,
+            &bucket,
+            prefix,
+            query.key_marker.as_deref().unwrap_or(""),
+            query.upload_id_marker.as_deref().unwrap_or(""),
+            query.max_uploads.unwrap_or(1000),
+        )
+        .await;
     }
 
     // Default: ListObjects (v1 or v2)
@@ -313,20 +330,33 @@ async fn get_bucket_versioning(_bucket: &str) -> Result<Response, S3Error> {
     Ok(xml_response(xml))
 }
 
-/// ListMultipartUploads handler
+/// ListMultipartUploads handler (L1 correctness fix: honours
+/// max-uploads, key-marker, upload-id-marker query params instead of
+/// hardcoding is_truncated=false).
+///
 /// GET /{bucket}?uploads
 async fn list_multipart_uploads(
     state: &Arc<AppState>,
     bucket: &str,
     prefix: Option<&str>,
+    key_marker: &str,
+    upload_id_marker: &str,
+    max_uploads: u32,
 ) -> Result<Response, S3Error> {
-    let uploads = state.multipart.list_uploads(Some(bucket), prefix);
+    let capped = max_uploads.clamp(1, 1000);
+    let (uploads, is_truncated, next_key, next_upload_id) = state
+        .multipart
+        .list_uploads_paginated(Some(bucket), prefix, key_marker, upload_id_marker, capped);
     let result = ListMultipartUploadsResult {
         bucket: bucket.to_string(),
         uploads,
         prefix: prefix.unwrap_or("").to_string(),
-        max_uploads: 1000,
-        is_truncated: false,
+        max_uploads: capped,
+        is_truncated,
+        key_marker: key_marker.to_string(),
+        upload_id_marker: upload_id_marker.to_string(),
+        next_key_marker: next_key,
+        next_upload_id_marker: next_upload_id,
     };
     let xml = result.to_xml();
     Ok(xml_response(xml))
@@ -353,15 +383,15 @@ pub async fn create_bucket(
         return Ok(StatusCode::OK.into_response());
     }
 
-    // PUT /{bucket}?tagging — accept and ignore (tagging stub)
+    // PUT /{bucket}?tagging — return 501 NotImplemented.
+    // M4 correctness fix: we don't persist bucket tags, so returning
+    // 200 OK while discarding the tag set misled clients that read
+    // the tags back expecting them to be there.
     if query.tagging.is_some() {
-        info!("PUT bucket tagging (stub): {}", bucket);
-        // Verify the bucket exists first; S3 returns 404 for tagging on non-existent buckets
-        let exists = state.engine.load().head_bucket(&bucket).await?;
-        if !exists {
-            return Err(no_such_bucket_error(&bucket));
-        }
-        return Ok(StatusCode::OK.into_response());
+        info!("PUT bucket tagging: unsupported (returning 501)");
+        return Err(S3Error::NotImplemented(
+            "Bucket tagging is not supported by this proxy".to_string(),
+        ));
     }
 
     // PUT /{bucket}?versioning — accept and ignore (versioning stub)
@@ -475,6 +505,20 @@ pub async fn delete_bucket(
         .await?;
     if !page.objects.is_empty() {
         return Err(S3Error::BucketNotEmpty(bucket.to_string()));
+    }
+
+    // H2 security fix: also refuse if there are active multipart uploads
+    // targeting this bucket. Pre-fix, DeleteBucket returned 204 while
+    // MultipartStore still held uploads for the now-deleted bucket —
+    // UploadPart kept accepting bytes, ListMultipartUploads reported
+    // uploads on a ghost bucket, and CompleteMultipartUpload would 404
+    // via ensure_bucket_exists but leave the MPU state stuck.
+    let mpu_count = state.multipart.count_uploads_for_bucket(&bucket);
+    if mpu_count > 0 {
+        return Err(S3Error::BucketNotEmpty(format!(
+            "{} ({} multipart upload(s) in progress; abort them first)",
+            bucket, mpu_count
+        )));
     }
 
     // Delete the real bucket on the storage backend

@@ -571,6 +571,11 @@ pub struct ListPartsResult {
     pub parts: Vec<PartInfo>,
     pub max_parts: u32,
     pub is_truncated: bool,
+    /// The starting marker the caller supplied (echoed back per S3 spec).
+    pub part_number_marker: u32,
+    /// Highest part number returned in this page. When `is_truncated`,
+    /// callers pass this as `part-number-marker` to get the next page.
+    pub next_part_number_marker: u32,
 }
 
 impl ListPartsResult {
@@ -588,6 +593,14 @@ impl ListPartsResult {
         xml.push_str(&format!(
             "  <UploadId>{}</UploadId>\n",
             escape_xml(&self.upload_id)
+        ));
+        xml.push_str(&format!(
+            "  <PartNumberMarker>{}</PartNumberMarker>\n",
+            self.part_number_marker
+        ));
+        xml.push_str(&format!(
+            "  <NextPartNumberMarker>{}</NextPartNumberMarker>\n",
+            self.next_part_number_marker
         ));
         xml.push_str(&format!("  <MaxParts>{}</MaxParts>\n", self.max_parts));
         xml.push_str(&format!(
@@ -631,6 +644,13 @@ pub struct ListMultipartUploadsResult {
     pub prefix: String,
     pub max_uploads: u32,
     pub is_truncated: bool,
+    /// Echo of the client-supplied markers (empty if none). Per S3 spec
+    /// we always emit these elements, empty or populated.
+    pub key_marker: String,
+    pub upload_id_marker: String,
+    /// Next-page markers: present when `is_truncated`.
+    pub next_key_marker: String,
+    pub next_upload_id_marker: String,
 }
 
 impl ListMultipartUploadsResult {
@@ -646,8 +666,36 @@ impl ListMultipartUploadsResult {
             "  <Bucket>{}</Bucket>\n",
             escape_xml(&self.bucket)
         ));
-        xml.push_str("  <KeyMarker/>\n");
-        xml.push_str("  <UploadIdMarker/>\n");
+        if self.key_marker.is_empty() {
+            xml.push_str("  <KeyMarker/>\n");
+        } else {
+            xml.push_str(&format!(
+                "  <KeyMarker>{}</KeyMarker>\n",
+                escape_xml(&self.key_marker)
+            ));
+        }
+        if self.upload_id_marker.is_empty() {
+            xml.push_str("  <UploadIdMarker/>\n");
+        } else {
+            xml.push_str(&format!(
+                "  <UploadIdMarker>{}</UploadIdMarker>\n",
+                escape_xml(&self.upload_id_marker)
+            ));
+        }
+        if self.is_truncated {
+            if !self.next_key_marker.is_empty() {
+                xml.push_str(&format!(
+                    "  <NextKeyMarker>{}</NextKeyMarker>\n",
+                    escape_xml(&self.next_key_marker)
+                ));
+            }
+            if !self.next_upload_id_marker.is_empty() {
+                xml.push_str(&format!(
+                    "  <NextUploadIdMarker>{}</NextUploadIdMarker>\n",
+                    escape_xml(&self.next_upload_id_marker)
+                ));
+            }
+        }
         if !self.prefix.is_empty() {
             xml.push_str(&format!(
                 "  <Prefix>{}</Prefix>\n",

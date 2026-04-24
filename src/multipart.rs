@@ -588,6 +588,18 @@ impl MultipartStore {
         Ok(())
     }
 
+    /// Return the number of in-flight uploads targeting `bucket`.
+    /// Used by DeleteBucket (H2) to refuse deletion when MPU state
+    /// would be orphaned. Counts uploads in Open AND Completing state
+    /// because both would become unreachable after the bucket is gone.
+    pub fn count_uploads_for_bucket(&self, bucket: &str) -> usize {
+        self.uploads
+            .read()
+            .values()
+            .filter(|u| u.bucket == bucket)
+            .count()
+    }
+
     /// List parts for an upload. Validates bucket+key match.
     pub fn list_parts(
         &self,
@@ -595,6 +607,25 @@ impl MultipartStore {
         bucket: &str,
         key: &str,
     ) -> Result<Vec<PartInfo>, S3Error> {
+        let (parts, _, _) = self.list_parts_paginated(upload_id, bucket, key, 0, 10000)?;
+        Ok(parts)
+    }
+
+    /// Paginated variant of [`Self::list_parts`] (L1 correctness fix).
+    /// Returns `(page, is_truncated, next_part_number_marker)`.
+    ///
+    /// - `part_number_marker`: return parts with part_number strictly
+    ///   greater than this value (0 = from beginning, per S3 spec).
+    /// - `max_parts`: cap on returned count; clamp at 10_000 (S3 hard
+    ///   limit on parts per upload).
+    pub fn list_parts_paginated(
+        &self,
+        upload_id: &str,
+        bucket: &str,
+        key: &str,
+        part_number_marker: u32,
+        max_parts: u32,
+    ) -> Result<(Vec<PartInfo>, bool, u32), S3Error> {
         let uploads = self.uploads.read();
         let upload = uploads
             .get(upload_id)
@@ -604,9 +635,12 @@ impl MultipartStore {
             return Err(S3Error::NoSuchUpload(upload_id.to_string()));
         }
 
-        let mut parts: Vec<PartInfo> = upload
+        let cap = max_parts.clamp(1, 10_000) as usize;
+
+        let mut all: Vec<PartInfo> = upload
             .parts
             .iter()
+            .filter(|(&num, _)| num > part_number_marker)
             .map(|(&num, pd)| PartInfo {
                 part_number: num,
                 etag: format!("\"{}\"", pd.md5_hex),
@@ -614,14 +648,43 @@ impl MultipartStore {
                 last_modified: pd.uploaded_at,
             })
             .collect();
-        parts.sort_by_key(|p| p.part_number);
-        Ok(parts)
+        all.sort_by_key(|p| p.part_number);
+
+        let is_truncated = all.len() > cap;
+        if is_truncated {
+            all.truncate(cap);
+        }
+        let next_marker = all.last().map(|p| p.part_number).unwrap_or(0);
+        Ok((all, is_truncated, next_marker))
     }
 
     /// List uploads, optionally filtered by bucket and prefix.
+    /// Back-compat helper — internally delegates to the paginated variant
+    /// with a generous cap. New callers should prefer `list_uploads_paginated`.
     pub fn list_uploads(&self, bucket: Option<&str>, prefix: Option<&str>) -> Vec<UploadInfo> {
+        let (uploads, _, _, _) =
+            self.list_uploads_paginated(bucket, prefix, "", "", self.max_uploads as u32);
+        uploads
+    }
+
+    /// Paginated ListMultipartUploads (L1 correctness fix).
+    /// Returns `(page, is_truncated, next_key_marker, next_upload_id_marker)`.
+    ///
+    /// - `key_marker` + `upload_id_marker`: tuple-cursor — skip any
+    ///   upload whose (key, upload_id) is ≤ (key_marker, upload_id_marker)
+    ///   lexicographically. Matches AWS S3 semantics.
+    /// - `max_uploads`: cap on returned count, clamped to 1..=1000.
+    pub fn list_uploads_paginated(
+        &self,
+        bucket: Option<&str>,
+        prefix: Option<&str>,
+        key_marker: &str,
+        upload_id_marker: &str,
+        max_uploads: u32,
+    ) -> (Vec<UploadInfo>, bool, String, String) {
         let uploads = self.uploads.read();
-        let mut result: Vec<UploadInfo> = uploads
+        let cap = max_uploads.clamp(1, 1000) as usize;
+        let mut filtered: Vec<UploadInfo> = uploads
             .values()
             .filter(|u| {
                 if let Some(b) = bucket {
@@ -634,6 +697,14 @@ impl MultipartStore {
                         return false;
                     }
                 }
+                // Tuple-cursor skip.
+                if !key_marker.is_empty() || !upload_id_marker.is_empty() {
+                    let cmp = (u.key.as_str(), u.upload_id.as_str())
+                        .cmp(&(key_marker, upload_id_marker));
+                    if cmp != std::cmp::Ordering::Greater {
+                        return false;
+                    }
+                }
                 true
             })
             .map(|u| UploadInfo {
@@ -642,8 +713,17 @@ impl MultipartStore {
                 initiated: u.created_at,
             })
             .collect();
-        result.sort_by(|a, b| a.key.cmp(&b.key).then(a.upload_id.cmp(&b.upload_id)));
-        result
+        filtered.sort_by(|a, b| a.key.cmp(&b.key).then(a.upload_id.cmp(&b.upload_id)));
+
+        let is_truncated = filtered.len() > cap;
+        if is_truncated {
+            filtered.truncate(cap);
+        }
+        let (next_key, next_upload_id) = filtered
+            .last()
+            .map(|u| (u.key.clone(), u.upload_id.clone()))
+            .unwrap_or_default();
+        (filtered, is_truncated, next_key, next_upload_id)
     }
 
     /// Remove uploads that have been idle longer than the configured idle
