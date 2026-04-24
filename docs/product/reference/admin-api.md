@@ -131,6 +131,17 @@ Legacy JSON-only import path is still supported for pre-v0.8.4 scripts.
 | `GET` | `/_/api/admin/audit[?limit=N]` | Snapshot of the in-memory audit ring, newest first. Bounded (default 500, override `DGP_AUDIT_RING_SIZE`). Stdout `tracing::info!` is still the long-term audit source. |
 | `GET` / `PUT` / `DELETE` | `/_/api/admin/session/s3-credentials` | Per-session S3 credential store for the browse panel |
 
+## Resource limits (env vars)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DGP_MAX_OBJECT_SIZE` | `100 MiB` | Largest single object (and, per upload, largest multipart upload). |
+| `DGP_MAX_MULTIPART_UPLOADS` | `1000` | Maximum concurrent multipart uploads across the proxy. |
+| `DGP_MAX_TOTAL_MULTIPART_BYTES` | `max_object_size × max_uploads / 4` | Global in-flight byte cap across all multipart uploads. Protects against the C3 DoS pattern where many uploads accumulate without completing. Reject with `SlowDown` when exceeded. |
+| `DGP_MULTIPART_IDLE_TTL_HOURS` | `24` | Idle-TTL for incomplete multipart uploads. The periodic sweeper drops uploads with no UploadPart activity for this long (excluding uploads currently being completed). |
+| `DGP_AUDIT_RING_SIZE` | `500` | In-memory audit ring capacity. |
+| `DGP_SESSION_TTL_HOURS` | `4` | Admin session cookie lifetime. |
+
 ## Admin GUI keyboard shortcuts
 
 Reachable via `?` in any admin page.

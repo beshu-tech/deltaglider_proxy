@@ -2,6 +2,91 @@
 
 ## Unreleased
 
+### Security hardening — adversarial review findings (C1–C4 + E1/E2/E4)
+
+A static adversarial review surfaced four critical vulnerabilities and
+four edge-case hazards. Every confirmed finding is fixed with
+regression tests. No breaking changes for well-behaved clients;
+behavioural tightening on attack paths.
+
+**Critical — C1: IAM LIST bypass**
+A user with policy `{ resources: ["bucket/alice/*"] }` calling
+`GET /bucket?list-type=2&prefix=` previously received every key in
+the bucket, because the middleware's `can_see_bucket` fallback
+admitted the request and the handler returned unfiltered engine
+output. Fix: new `ListScope` request extension marks LIST
+authorisations as `Unrestricted` or `Filtered { user }`. When
+Filtered, the handler post-filters each key and CommonPrefix
+through `user.can(Read|List, bucket, key)`. Unscoped admins pay no
+filter cost. A `x-amz-meta-dg-list-filtered: true` response header
+signals filtered pages. 10 unit + 5 integration tests pin the matrix.
+
+**Critical — C2: implicit bucket creation via PUT**
+`PUT /new-bucket/key` on the filesystem backend previously
+succeeded, silently creating the bucket directory as a side effect
+of `ensure_dir` → `create_dir_all`. Bypassed `s3:CreateBucket`
+equivalence and diverged from the S3 backend contract. Fix: handler
+precheck `ensure_bucket_exists` on PUT / COPY (both ends) / Create
++ Complete multipart; backend-level `require_bucket_exists` refuses
+writes when the bucket root is missing. 9 tests (5 unit + 4
+integration) including filesystem-level "no directory was created"
+assertions.
+
+**Critical — C3: multipart in-memory DoS**
+`upload_part` previously accepted arbitrarily many parts of
+arbitrary size, capped only at Complete-time. Attacker opens
+`DGP_MAX_MULTIPART_UPLOADS` (default 1000) uploads and fills each
+— process OOMs. Three-layer mitigation: per-upload size cap
+(cumulative rejects over `max_object_size`), global in-flight byte
+counter (configurable via `DGP_MAX_TOTAL_MULTIPART_BYTES`,
+defaulting to `max_object_size * max_uploads / 4`), and idle-TTL
+sweeper (configurable via `DGP_MULTIPART_IDLE_TTL_HOURS`, default
+24h). Sweeper preserves `Completing` uploads regardless of age.
+
+**Critical — C4: multipart complete/abort race**
+Pre-fix, `complete()` set a `completed: bool` under a write lock
+then released; the handler then awaited `engine.store*`. During
+that await, `abort()` happily removed the upload and returned 204
+even though the object was about to land. Fix: replace with a
+2-state `MultipartState::{Open, Completing}` enum; abort returns
+`InvalidRequest` when state is Completing; handler now calls
+`finish_upload` on store success or `rollback_upload` on failure.
+8 unit tests cover every legal and illegal transition.
+
+**Hygiene — E1: recursive DELETE no longer materialises full listing**
+`DELETE /bucket/prefix/` (trailing slash) previously called
+`list_objects(..., u32::MAX, ...)`, materialising the full prefix
+in memory before deleting anything. Fix: paginate in 1000-key
+windows. Memory stays O(page_size) regardless of prefix depth.
+Integration test seeds 1100 objects to exercise the second page.
+
+**Hygiene — E2: conformance marker for `get_passthrough_stream_range`**
+The trait's default impl buffers the full object — correct as a
+fallback, disastrous as the hot path for a ranged GET. Added a
+source-walk conformance test that fails if any in-tree
+`impl StorageBackend for X` block omits the override. Prevents a
+new backend (future B2, GCS, etc.) from silently inheriting the
+default.
+
+**Hygiene — E4: sanitise internal error text to S3 clients**
+Backend errors like `StorageError::Other` (with filesystem paths or
+MinIO debug strings) and `EngineError::ChecksumMismatch` (with
+computed + expected SHA hashes) used to get stringified into error
+XML. Fix: new `sanitise_for_client` helper returns a generic
+"Internal server error" to the client while logging full detail to
+`tracing::error!` under a `dgp::sanitised_error` target.
+
+Env-var knobs added:
+- `DGP_MAX_TOTAL_MULTIPART_BYTES` (bytes, defaults to
+  `max_object_size * max_uploads / 4`)
+- `DGP_MULTIPART_IDLE_TTL_HOURS` (hours, default 24)
+
+**Tests**: 613 lib tests + 19 new integration tests green. Clippy
+clean.
+
+**Deferred to a follow-up PR**: E3 (SigV4 chunk-signature
+verification) ships under a feature flag.
+
 ### Declarative IAM — quality pass + convenience endpoints
 
 Follow-up to the initial 3c.3 shipment (see below). Two reviews

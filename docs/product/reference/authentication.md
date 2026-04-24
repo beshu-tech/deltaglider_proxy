@@ -169,6 +169,20 @@ See [IAM conditions](../auth/32-iam-conditions.md) for full reference.
 
 A user is considered an **admin** when they have both wildcard actions (`*`) AND wildcard resources (`*`).
 
+### ListBucket scope filtering
+
+When a user with **prefix-scoped** permissions (e.g. `{ resources: ["bucket/alice/*"] }`) calls `GET /bucket?list-type=2&prefix=` with an empty prefix or a prefix wider than their policy covers, the proxy admits the request (so the user can discover their own keys) but **post-filters each returned key and CommonPrefix** through their per-key policy. Only keys the user has `read` OR `list` permission on are returned.
+
+Operators and SDKs can tell a filtered page from an unrestricted one via the `x-amz-meta-dg-list-filtered: true` response header.
+
+Pagination stays honest: `is_truncated` and the continuation token reflect the engine-level cursor (not the filtered count). The client's `max_keys` acts as a server-side inspection cap — the returned page may be smaller. This matches AWS's documented behaviour when denies apply within allows.
+
+**Unscoped users pay no filter cost** — if the policy covers the full bucket/prefix, the handler returns the engine page unchanged.
+
+### Workflow bypass prevention
+
+The proxy refuses to implicitly create a bucket as a side effect of a PUT. Even on the filesystem backend (where the underlying FS would happily create a parent directory), writes to a non-existent bucket return `404 NoSuchBucket` — matching the S3 backend's contract and preventing bypass of bucket-creation authorization.
+
 ## IAM Groups
 
 Users can be organized into **groups** with shared permission rules. Group permissions are merged with the user's direct permissions at evaluation time.
