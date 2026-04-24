@@ -124,6 +124,10 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         )
         // Document-level config operations (Phase 1 — GitOps + Copy-as-YAML)
         .route("/_/api/admin/config/export", get(admin::export_config))
+        .route(
+            "/_/api/admin/config/declarative-iam-export",
+            get(admin::export_declarative_iam),
+        )
         .route("/_/api/admin/config/defaults", get(admin::config_defaults))
         .route(
             "/_/api/admin/config/validate",

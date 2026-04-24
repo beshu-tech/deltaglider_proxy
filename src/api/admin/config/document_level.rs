@@ -644,3 +644,90 @@ pub async fn apply_config_doc(
         }),
     )
 }
+
+/// `GET /api/admin/config/declarative-iam-export` — project the
+/// current encrypted IAM DB (users, groups, auth providers, mapping
+/// rules) into a YAML fragment ready to paste into the `access:`
+/// section of a declarative-mode config.
+///
+/// Always returns `application/yaml` with a top-level `access:` key
+/// containing `iam_users`, `iam_groups`, `auth_providers`, and
+/// `group_mapping_rules` populated from the DB. Includes
+/// `iam_mode: declarative` so the emitted fragment is self-describing.
+///
+/// **Secrets redacted**: user `secret_access_key` emits as `""`,
+/// provider `client_secret` emits as `null`. Operator wires both
+/// via env vars / secret manager before applying.
+///
+/// **Roundtripability contract**: applying the unredacted form of
+/// this output on a live instance that sourced it is an idempotent
+/// no-op (ReconcileStats::is_noop() ⇒ true), because the diff sees
+/// same-name entries with matching fields.
+///
+/// Returns 404 when no config DB is initialised (bootstrap-disabled
+/// deployments have nothing to export).
+pub async fn export_declarative_iam(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
+    let Some(db_arc) = state.config_db.as_ref() else {
+        return (
+            StatusCode::NOT_FOUND,
+            "config DB not initialised — nothing to export".to_string(),
+        )
+            .into_response();
+    };
+    let db = db_arc.lock().await;
+    let snapshot = match crate::iam::export_as_declarative(&db) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("export_as_declarative: {}", e),
+            )
+                .into_response();
+        }
+    };
+    drop(db);
+
+    // Emit a minimal YAML with `access.iam_mode: declarative` + the
+    // 4 IAM slices. Matches the shape `declarative-iam.md` documents.
+    let mut access_map = serde_yaml::Mapping::new();
+    access_map.insert(
+        serde_yaml::Value::String("iam_mode".into()),
+        serde_yaml::Value::String("declarative".into()),
+    );
+    access_map.insert(
+        serde_yaml::Value::String("iam_users".into()),
+        serde_yaml::to_value(&snapshot.users).unwrap_or(serde_yaml::Value::Null),
+    );
+    access_map.insert(
+        serde_yaml::Value::String("iam_groups".into()),
+        serde_yaml::to_value(&snapshot.groups).unwrap_or(serde_yaml::Value::Null),
+    );
+    access_map.insert(
+        serde_yaml::Value::String("auth_providers".into()),
+        serde_yaml::to_value(&snapshot.auth_providers).unwrap_or(serde_yaml::Value::Null),
+    );
+    access_map.insert(
+        serde_yaml::Value::String("group_mapping_rules".into()),
+        serde_yaml::to_value(&snapshot.mapping_rules).unwrap_or(serde_yaml::Value::Null),
+    );
+
+    let mut root = serde_yaml::Mapping::new();
+    root.insert(
+        serde_yaml::Value::String("access".into()),
+        serde_yaml::Value::Mapping(access_map),
+    );
+
+    match serde_yaml::to_string(&serde_yaml::Value::Mapping(root)) {
+        Ok(yaml) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/yaml")],
+            yaml,
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("serialize declarative IAM to YAML: {}", e),
+        )
+            .into_response(),
+    }
+}

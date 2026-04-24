@@ -2,6 +2,88 @@
 
 ## Unreleased
 
+### Declarative IAM — quality pass + convenience endpoints
+
+Follow-up to the initial 3c.3 shipment (see below). Two reviews
+(clean-code hygiene + correctness x-ray) surfaced 10 findings; the
+real ones are fixed with regression tests, and two long-promised
+operator-convenience endpoints land here:
+
+**Correctness fixes**
+
+- **Critical — mapping_rules wipe on idempotent re-apply**
+  (`src/config_db/declarative.rs`). The old `Vec` + ambiguous helper
+  couldn't distinguish "YAML matches non-empty DB, keep" from "YAML
+  empty, wipe DB". Replaced with an explicit `MappingRulesAction::
+  {Keep, ClearAll, ReplaceWith(Vec)}` enum set by `diff_iam`. Before
+  the fix, every GitOps reconcile loop on a non-empty rule set
+  silently wiped the table — next OAuth login had no mappings.
+  Regression tests pin the tri-state matrix.
+
+- **High — `permissions_equal` now normalises case before compare**.
+  YAML authored with `effect: "allow"` used to mark every user as
+  changed on every apply (DB stores canonical `"Allow"`). The diff
+  now normalises both sides first.
+
+- **High — misleading docs on `${env:NAME}` syntax**. The docs
+  claimed env-var substitution worked; no implementation exists.
+  Docs amended to reflect reality ("plaintext or materialise from
+  secret manager at deploy time"); env-substitution stays on the
+  roadmap for a later phase.
+
+- **Medium — access-key swap validation**. A YAML that swaps
+  access_keys between two surviving DB users now surfaces as a
+  clean validation error ("user 'alice' collides on access_key_id
+  with existing DB user 'bob'") instead of an ugly mid-transaction
+  SQLite UNIQUE failure.
+
+- **Medium — short-circuit step 4c on unrelated PATCHes**.
+  `apply_config_transition` used to run the full reconcile +
+  `rebuild_iam_index` + `trigger_config_sync` on every PATCH in
+  declarative mode, even ones that only touched `log_level` or
+  `cache_size_mb`. Now short-circuits when the IAM fields are
+  unchanged from the previous config.
+
+- **Low — no-op reconcile no longer triggers S3 sync upload** or
+  surfaces a spurious "reconciled:" warning. Idempotent GitOps
+  loops now leave the sync bucket alone.
+
+**Hygiene**
+
+- `ReconcileStats::audit_entries() + summary_line()` collapse a
+  10-block audit-log loop + two independent format strings into
+  single helpers.
+- `replace_group_permissions` + `replace_user_permissions` are
+  now 3-line delegates to a shared `replace_permissions(tx, table,
+  fk, owner_id, perms)`.
+- Vestigial `mapping_rules_need_clearing` helper (the bug's
+  surface) is gone.
+
+**Operator convenience**
+
+- **Reconciler preview on `/validate`**. `POST /_/api/admin/config/
+  section/access/validate` with a declarative-mode body now
+  returns a preview warning line: `"declarative IAM preview:
+  users(+1/~2/-0) groups(+0/~1/-0) providers(+0/~0/-0)
+  mapping_rules=keep"`. The admin-UI's ApplyDialog surfaces it
+  under Warnings. Runs the same `diff_iam` the live apply does
+  — preview can't drift from reality. Also previews the
+  empty-YAML gate refusal so operators catch the problem at
+  dry-run time.
+
+- **Export-as-declarative endpoint**. `GET /_/api/admin/config/
+  declarative-iam-export` returns a self-contained `access:`
+  YAML fragment with `iam_mode: declarative` + populated
+  `iam_users` / `iam_groups` / `auth_providers` /
+  `group_mapping_rules` projected from the current DB. Secrets
+  redacted (operator wires via env). Roundtrip contract:
+  exported YAML (with secrets re-injected) → PUT is an
+  idempotent no-op. Makes Workflow A ("import existing DB into
+  GitOps") a one-button operation instead of hand-assembly.
+
+580 unit tests + 10 declarative integration tests + all encryption
+integration tests green. Clippy `-D warnings` clean. Rustfmt clean.
+
 ### Declarative IAM reconciler (Phase 3c.3)
 
 `iam_mode: declarative` now actually reconciles. Previously it was a

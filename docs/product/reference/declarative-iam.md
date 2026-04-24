@@ -23,20 +23,50 @@ The flip from `gui` to `declarative` is guarded. If the incoming YAML has no `ia
 
 ### Workflow A: already-populated DB + GitOps
 
-1. Export current state from the running instance:
-   ```bash
-   curl -b cookies https://dgp.example.com/_/api/admin/config/export > live.yaml
-   ```
-   (Secrets are redacted to `null` in exports. You'll wire them in via env vars — see "Secrets" below.)
-2. Copy the `access.iam_users` + `access.iam_groups` + `access.auth_providers` + `access.group_mapping_rules` sections into your GitOps YAML.
-3. Set `access.iam_mode: declarative`.
-4. Apply the YAML. The reconciler diffs: every user/group in YAML already exists in the DB under the same name, so the diff is empty. No churn.
+Use `GET /_/api/admin/config/declarative-iam-export` — a dedicated endpoint that projects the current DB into a ready-to-paste `access:` fragment with `iam_mode: declarative` already set:
+
+```bash
+curl -b cookies https://dgp.example.com/_/api/admin/config/declarative-iam-export > iam.yaml
+```
+
+The response is a self-contained YAML:
+
+```yaml
+access:
+  iam_mode: declarative
+  iam_users:
+    - name: alice
+      access_key_id: AKIAALICE0001
+      secret_access_key: ""        # redacted — wire via env
+      enabled: true
+      groups: [admins]
+      permissions: []
+  iam_groups:
+    - name: admins
+      ...
+  auth_providers: ...
+  group_mapping_rules: ...
+```
+
+Paste it into your GitOps YAML, wire secrets via env vars, then apply. **Roundtrip contract**: pasting the output with secrets re-injected back into a live PUT is an idempotent no-op — the reconciler reports `is_noop` and doesn't bump the audit ring (integration-tested as `export_declarative_iam_round_trips_as_noop`).
 
 ### Workflow B: fresh IAM state from YAML
 
 1. Author your full IAM state in YAML directly.
 2. Set `access.iam_mode: declarative`.
 3. Apply. The reconciler creates every user, group, provider, and mapping rule.
+
+### Preview before applying
+
+`POST /_/api/admin/config/section/access/validate` (dry-run, same body shape as PUT) returns the response with a preview line in `warnings` showing what the live apply would do:
+
+```
+declarative IAM preview: users(+1/~2/-0) groups(+0/~1/-0) providers(+0/~0/-0) mapping_rules=keep
+```
+
+The admin-UI's ApplyDialog surfaces this under Warnings — you see exactly how many users will be created, updated, and deleted before you click Apply. An idempotent validate reports `declarative IAM preview: no IAM changes (idempotent apply)`. The preview runs the same `diff_iam` the live apply does, so it can't lie about what will happen.
+
+A flip to declarative with empty IAM yields a warning saying the live apply would REFUSE (see "The empty-YAML gate" below) — catching this at dry-run time avoids an apply that returns 422.
 
 ## Wire shape
 

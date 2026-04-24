@@ -480,6 +480,71 @@ async fn apply_section(
     // can see the flip) is not worth catching engine errors earlier
     // than they happen in PUT anyway.
     if matches!(mode, ApplyMode::DryRun) {
+        // Declarative-IAM preview: when the target mode would be
+        // Declarative AND the IAM fields have changed, compute the
+        // would-be reconcile diff (validation-only, zero DB writes)
+        // and surface the summary line in warnings so the Apply
+        // dialog shows what the live apply would actually do. This
+        // is the same `diff_iam` the live apply uses, so the preview
+        // can't lie.
+        let mut preview_warnings: Vec<String> = Vec::new();
+        if matches!(
+            new_cfg.iam_mode,
+            crate::config_sections::IamMode::Declarative
+        ) {
+            let old_iam_unchanged = matches!(
+                old_cfg.iam_mode,
+                crate::config_sections::IamMode::Declarative
+            ) && old_cfg.iam_users == new_cfg.iam_users
+                && old_cfg.iam_groups == new_cfg.iam_groups
+                && old_cfg.auth_providers == new_cfg.auth_providers
+                && old_cfg.group_mapping_rules == new_cfg.group_mapping_rules;
+
+            if !old_iam_unchanged {
+                let yaml_snapshot = crate::iam::snapshot_from_access(
+                    &new_cfg.iam_users,
+                    &new_cfg.iam_groups,
+                    &new_cfg.auth_providers,
+                    &new_cfg.group_mapping_rules,
+                );
+                // Empty-gate preview: the live apply would refuse
+                // this, so surface it at dry-run time too.
+                if matches!(old_cfg.iam_mode, crate::config_sections::IamMode::Gui)
+                    && yaml_snapshot.is_empty()
+                {
+                    preview_warnings.push(
+                        "declarative IAM preview: flip to declarative mode with empty iam_users / \
+                         iam_groups would be REFUSED by the live apply (would wipe the DB). \
+                         Add IAM content to the YAML first."
+                            .to_string(),
+                    );
+                } else if let Some(db_arc) = state.config_db.as_ref() {
+                    let db = db_arc.lock().await;
+                    match crate::iam::preview_declarative_iam(&db, &yaml_snapshot) {
+                        Ok(iam_diff) if iam_diff.is_empty() => {
+                            preview_warnings.push(
+                                "declarative IAM preview: no IAM changes (idempotent apply)"
+                                    .to_string(),
+                            );
+                        }
+                        Ok(iam_diff) => {
+                            preview_warnings.push(format!(
+                                "declarative IAM preview: {}",
+                                iam_diff.summary_line()
+                            ));
+                        }
+                        Err(e) => {
+                            preview_warnings.push(format!(
+                                "declarative IAM preview REJECTED at validation (live apply \
+                                 would return this error verbatim): {}",
+                                e
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         return (
             StatusCode::OK,
             Json(SectionApplyResponse {
@@ -488,6 +553,7 @@ async fn apply_section(
                     .clone()
                     .into_iter()
                     .chain(warnings_from_check)
+                    .chain(preview_warnings)
                     .collect(),
                 requires_restart,
                 persisted_path: None,

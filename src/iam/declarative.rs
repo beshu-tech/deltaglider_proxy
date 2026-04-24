@@ -232,6 +232,174 @@ impl IamDiff {
             && self.users_to_delete.is_empty()
             && self.mapping_rules.is_noop()
     }
+
+    /// Human-readable one-liner summarising what this diff would do
+    /// if applied. Format mirrors `ReconcileStats::summary_line()` so
+    /// the validate-dry-run preview and the live apply-response
+    /// summary render in the same shape. Called by the section
+    /// `/validate` endpoint to preview a declarative-IAM apply
+    /// without touching the DB.
+    ///
+    /// Callers can check [`Self::is_empty`] first to skip rendering
+    /// the line entirely on no-op diffs.
+    pub fn summary_line(&self) -> String {
+        let mapping_rules = match &self.mapping_rules {
+            MappingRulesAction::Keep => "keep".to_string(),
+            MappingRulesAction::ClearAll => "clear".to_string(),
+            MappingRulesAction::ReplaceWith(rules) => format!("replace({})", rules.len()),
+        };
+        format!(
+            "users(+{}/~{}/-{}) groups(+{}/~{}/-{}) providers(+{}/~{}/-{}) mapping_rules={}",
+            self.users_to_create.len(),
+            self.users_to_update.len(),
+            self.users_to_delete.len(),
+            self.groups_to_create.len(),
+            self.groups_to_update.len(),
+            self.groups_to_delete.len(),
+            self.providers_to_create.len(),
+            self.providers_to_update.len(),
+            self.providers_to_delete.len(),
+            mapping_rules,
+        )
+    }
+}
+
+/// Project the current DB IAM state into a [`DeclarativeIam`]
+/// ready to drop into `access.*` fields of a YAML config. Secrets
+/// are redacted — operator materialises them from env vars at
+/// deploy time.
+///
+/// The resulting snapshot is exactly what `diff_iam(&snapshot, &db)`
+/// would see as "already-matching" — i.e., pasting this output into
+/// a declarative-mode YAML and applying is a strict no-op (per
+/// `ReconcileStats::is_noop()`). This is the roundtripability
+/// contract the "Export from DB" button on the Access panel
+/// depends on.
+///
+/// Usage (from an admin endpoint):
+/// ```ignore
+/// let db = config_db.lock().await;
+/// let snapshot = export_as_declarative(&db)?;
+/// let yaml = serde_yaml::to_string(&snapshot)?;
+/// ```
+pub fn export_as_declarative(db: &ConfigDb) -> Result<DeclarativeIam, String> {
+    let db_users = db.load_users().map_err(|e| format!("load users: {e}"))?;
+    let db_groups = db.load_groups().map_err(|e| format!("load groups: {e}"))?;
+    let db_providers = db
+        .load_auth_providers()
+        .map_err(|e| format!("load auth_providers: {e}"))?;
+    let db_rules = db
+        .load_group_mapping_rules()
+        .map_err(|e| format!("load mapping_rules: {e}"))?;
+
+    // Build group_id→name + provider_id→name lookups for rule export.
+    let group_id_to_name: HashMap<i64, String> =
+        db_groups.iter().map(|g| (g.id, g.name.clone())).collect();
+    let provider_id_to_name: HashMap<i64, String> = db_providers
+        .iter()
+        .map(|p| (p.id, p.name.clone()))
+        .collect();
+
+    let users = db_users
+        .iter()
+        .map(|u| {
+            // Resolve group memberships from id → name. Skip unknown
+            // ids (shouldn't happen in a consistent DB but defensive).
+            let groups = u
+                .group_ids
+                .iter()
+                .filter_map(|gid| group_id_to_name.get(gid).cloned())
+                .collect();
+            DeclarativeUser {
+                name: u.name.clone(),
+                access_key_id: u.access_key_id.clone(),
+                // Secret redacted — operator wires via env. Same
+                // redaction policy the canonical YAML exporter uses.
+                secret_access_key: String::new(),
+                enabled: u.enabled,
+                groups,
+                permissions: u.permissions.clone(),
+            }
+        })
+        .collect();
+
+    let groups = db_groups
+        .iter()
+        .map(|g| DeclarativeGroup {
+            name: g.name.clone(),
+            description: g.description.clone(),
+            permissions: g.permissions.clone(),
+        })
+        .collect();
+
+    let auth_providers = db_providers
+        .iter()
+        .map(|p| DeclarativeAuthProvider {
+            name: p.name.clone(),
+            provider_type: p.provider_type.clone(),
+            enabled: p.enabled,
+            priority: p.priority,
+            display_name: p.display_name.clone(),
+            client_id: p.client_id.clone(),
+            // client_secret redacted (infra secret).
+            client_secret: None,
+            issuer_url: p.issuer_url.clone(),
+            scopes: p.scopes.clone(),
+            extra_config: p.extra_config.clone(),
+        })
+        .collect();
+
+    let mapping_rules = db_rules
+        .iter()
+        .map(|r| DeclarativeMappingRule {
+            // Resolve provider_id → name (None when the rule applies
+            // to all providers, i.e. DB provider_id IS NULL).
+            provider: r
+                .provider_id
+                .and_then(|pid| provider_id_to_name.get(&pid).cloned()),
+            priority: r.priority,
+            match_type: r.match_type.clone(),
+            match_field: r.match_field.clone(),
+            match_value: r.match_value.clone(),
+            group: group_id_to_name
+                .get(&r.group_id)
+                .cloned()
+                .unwrap_or_else(|| "<unknown-group>".to_string()),
+        })
+        .collect();
+
+    Ok(DeclarativeIam {
+        users,
+        groups,
+        auth_providers,
+        mapping_rules,
+    })
+}
+
+/// Pure preview: would-be reconcile diff against the current DB
+/// without applying anything. Used by the section `/validate`
+/// dry-run path so the Apply dialog can show the operator what the
+/// reconciler will do BEFORE they commit.
+///
+/// Returns `Ok(IamDiff)` on success (diff may or may not be empty;
+/// call `diff.is_empty()` to check) or `Err(String)` on validation
+/// failure. The error is the same shape the live apply would emit.
+///
+/// This is the observable-contract side of the validate/apply pair:
+/// both surfaces funnel through `diff_iam`, so the dry-run can't
+/// lie about what the live apply will actually do.
+pub fn preview_declarative_iam(db: &ConfigDb, yaml: &DeclarativeIam) -> Result<IamDiff, String> {
+    let current = CurrentIam {
+        users: db.load_users().map_err(|e| format!("load users: {e}"))?,
+        groups: db.load_groups().map_err(|e| format!("load groups: {e}"))?,
+        auth_providers: db
+            .load_auth_providers()
+            .map_err(|e| format!("load auth_providers: {e}"))?,
+        mapping_rules: db
+            .load_group_mapping_rules()
+            .map_err(|e| format!("load mapping_rules: {e}"))?,
+    };
+    diff_iam(yaml, &current)
 }
 
 // ───── Validation ──────────────────────────────────────────────────────
