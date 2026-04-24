@@ -18,6 +18,7 @@ pub mod metadata_cache;
 pub mod metrics;
 pub mod multipart;
 pub mod rate_limiter;
+pub mod replication;
 pub mod session;
 pub mod storage;
 pub mod tls;
