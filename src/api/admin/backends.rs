@@ -143,7 +143,7 @@ pub async fn create_backend(
         // plan); until then new backends default to plaintext (mode:
         // none) — operators configure encryption after creation via
         // the Backends panel or a section-level PATCH.
-        encryption: crate::config::BackendEncryptionConfig::None,
+        encryption: crate::config::BackendEncryptionConfig::default(),
     });
 
     if body.set_default == Some(true) || cfg.default_backend.is_none() {

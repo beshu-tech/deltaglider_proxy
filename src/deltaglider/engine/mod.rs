@@ -320,7 +320,7 @@ fn native_encryption_for(
     use crate::config::BackendEncryptionConfig as E;
     use crate::storage::NativeEncryptionConfig as N;
     match enc {
-        E::None | E::Aes256GcmProxy { .. } => N::None,
+        E::None { .. } | E::Aes256GcmProxy { .. } => N::None,
         E::SseS3 { .. } => N::SseS3,
         E::SseKms {
             kms_key_id,
@@ -476,7 +476,11 @@ fn wrap_backend_with_encryption(
             );
             (None, None, crate::storage::WriteMode::PassThrough)
         }
-        E::None => (None, None, crate::storage::WriteMode::Encrypt),
+        // mode: none — no primary key. WriteMode::Encrypt with key=None
+        // is passthrough by construction (see WriteMode doc comment).
+        // Leaving it Encrypt keeps the degenerate case indistinguishable
+        // from "no encryption configured at all".
+        E::None { .. } => (None, None, crate::storage::WriteMode::Encrypt),
     };
 
     // Resolve the decrypt-only shim from the legacy_* fields (Step 5).
@@ -1385,7 +1389,7 @@ mod tests {
         let wrapped = wrap_backend_with_encryption(
             "some-backend",
             inner,
-            &crate::config::BackendEncryptionConfig::None,
+            &crate::config::BackendEncryptionConfig::default(),
             &mut coll,
         );
         assert!(wrapped.is_ok());
@@ -1561,7 +1565,7 @@ mod tests {
         // Non-native modes produce N::None; the S3Backend gets no
         // SSE headers, and `EncryptingBackend` handles encryption
         // at the wrapper layer (or nothing, for mode:none).
-        assert!(matches!(native_encryption_for(&E::None), N::None));
+        assert!(matches!(native_encryption_for(&E::default()), N::None));
         assert!(matches!(
             native_encryption_for(&E::Aes256GcmProxy {
                 key: Some("hex".into()),
@@ -1684,6 +1688,36 @@ mod tests {
         .unwrap();
         assert!(k.is_some());
         assert_eq!(kid.as_deref(), Some("explicit-legacy"));
+    }
+
+    #[test]
+    fn test_resolve_legacy_shim_works_on_mode_none() {
+        // Regression for correctness x-ray C2: before the fix,
+        // BackendEncryptionConfig::None was a unit variant with no
+        // legacy_key field. Serde would silently drop legacy_key +
+        // legacy_key_id from `{mode: none, legacy_key: ..., legacy_key_id: ...}`,
+        // and recipe (D) in the docs (disable encryption but keep
+        // reading historical objects) was dead-on-arrival.
+        //
+        // The fix promoted `None` to a struct variant with the same
+        // legacy_* fields as the other modes. This test pins the
+        // end-to-end shape — parsing + shim resolution — to make
+        // sure a future refactor doesn't regress recipe (D).
+        let yaml = r#"
+mode: none
+legacy_key: "0101010101010101010101010101010101010101010101010101010101010101"
+legacy_key_id: "old-kid"
+"#;
+        let enc: crate::config::BackendEncryptionConfig =
+            serde_yaml::from_str(yaml).expect("mode:none with legacy_key must parse");
+        assert_eq!(enc.legacy_key().map(str::to_string), Some("0101010101010101010101010101010101010101010101010101010101010101".to_string()));
+        assert_eq!(enc.legacy_key_id(), Some("old-kid"));
+        let (key, kid) = resolve_legacy_shim("b", &enc).unwrap();
+        assert!(
+            key.is_some(),
+            "mode:none + legacy_key must activate the decrypt-only shim"
+        );
+        assert_eq!(kid.as_deref(), Some("old-kid"));
     }
 
     #[test]

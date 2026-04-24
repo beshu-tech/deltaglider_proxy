@@ -1013,6 +1013,7 @@ fn preserve_backend_encryption_secrets(
 ) {
     use crate::config::BackendEncryptionConfig as E;
     // Primary key preservation — only relevant on Aes256GcmProxy.
+    // Same-mode, absent-in-body ⇒ preserve old primary.
     if let E::Aes256GcmProxy {
         key: ref mut new_key,
         ..
@@ -1024,9 +1025,39 @@ fn preserve_backend_encryption_secrets(
             }
         }
     }
-    // Legacy shim key preservation — relevant on all three non-None
-    // variants. Accessors hide the "same slot on three variants"
-    // shape so we don't enumerate arms here.
+
+    // Mode-flip auto-promotion (correctness x-ray C3):
+    // When the operator changes mode AWAY from Aes256GcmProxy (the
+    // only mode with a primary key), auto-promote the old primary
+    // key + derived id into the new config's legacy_key slot IFF
+    // the operator didn't explicitly set legacy_key on the new
+    // config. This preserves historical-read capability — without
+    // this, a mode flip through the admin UI (which redacts the
+    // primary key on GET) silently orphans every historical object:
+    // the next read returns "object encrypted, no key configured".
+    //
+    // The operator can still OVERRIDE this by explicitly passing
+    // `legacy_key: null` in the body — that's the "discard old keys"
+    // escape hatch, encoded via `probe.legacy_key_is_explicit_null`.
+    let mode_changed_from_proxy = matches!(old, E::Aes256GcmProxy { .. })
+        && !matches!(new, E::Aes256GcmProxy { .. });
+    if mode_changed_from_proxy && !probe.legacy_key_is_explicit_null {
+        // Only auto-populate if the new legacy_key slot is empty
+        // AND the old primary had a key (redact-round-trips sometimes
+        // have primary_key() == None; that's a no-op).
+        if let (Some(old_primary), Some(new_legacy_slot)) =
+            (old.primary_key(), new.legacy_key_mut())
+        {
+            if new_legacy_slot.is_none() {
+                *new_legacy_slot = Some(old_primary.to_string());
+            }
+        }
+    }
+
+    // Legacy shim key preservation — same-slot absent-in-body.
+    // Runs AFTER the auto-promotion so explicit operator intent
+    // (a fresh legacy_key in the body) always wins over the
+    // promoted value.
     let old_legacy = old.legacy_key().map(str::to_string);
     if let Some(new_legacy) = new.legacy_key_mut() {
         if new_legacy.is_none() && !probe.legacy_key_is_explicit_null {
@@ -1083,5 +1114,118 @@ fn shallow_diff(
                 out.insert(prefix.to_string(), serde_json::Value::Object(pair));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::BackendEncryptionConfig as E;
+
+    const HEX32: &str = "0101010101010101010101010101010101010101010101010101010101010101";
+    const HEX32_B: &str = "0202020202020202020202020202020202020202020202020202020202020202";
+
+    fn proxy(key: Option<&str>, legacy: Option<&str>) -> E {
+        E::Aes256GcmProxy {
+            key: key.map(str::to_string),
+            key_id: None,
+            legacy_key: legacy.map(str::to_string),
+            legacy_key_id: None,
+        }
+    }
+
+    fn kms(legacy: Option<&str>) -> E {
+        E::SseKms {
+            kms_key_id: "arn:aws:kms:us-east-1:123:key/abc".into(),
+            bucket_key_enabled: true,
+            legacy_key: legacy.map(str::to_string),
+            legacy_key_id: None,
+        }
+    }
+
+    #[test]
+    fn preserve_mode_flip_proxy_to_kms_auto_promotes_primary_to_legacy() {
+        // Regression for correctness x-ray C3: operator edits the
+        // storage section with the UI, which redacts the primary key
+        // on GET. Body says `{mode: sse-kms, kms_key_id: ...}` — no
+        // legacy_key. Before the fix, the old primary key silently
+        // disappeared and every historical object on the backend
+        // became unreadable.
+        let old = proxy(Some(HEX32), None);
+        let mut new = kms(None);
+        let probe = BackendKeyPresence::default();
+        preserve_backend_encryption_secrets(&mut new, &old, probe);
+        assert_eq!(
+            new.legacy_key(),
+            Some(HEX32),
+            "mode flip Aes256GcmProxy → SseKms must promote old primary into new legacy_key slot"
+        );
+    }
+
+    #[test]
+    fn preserve_mode_flip_explicit_null_legacy_key_disables_promotion() {
+        // Escape hatch: operator explicitly passes `legacy_key: null`
+        // in the body to say "discard old keys, don't preserve".
+        // Must NOT auto-promote.
+        let old = proxy(Some(HEX32), None);
+        let mut new = kms(None);
+        let probe = BackendKeyPresence {
+            key_is_explicit_null: false,
+            legacy_key_is_explicit_null: true,
+        };
+        preserve_backend_encryption_secrets(&mut new, &old, probe);
+        assert_eq!(
+            new.legacy_key(),
+            None,
+            "explicit `legacy_key: null` in body must disable auto-promotion"
+        );
+    }
+
+    #[test]
+    fn preserve_mode_flip_explicit_legacy_key_in_body_wins_over_promotion() {
+        // Operator explicitly sets a DIFFERENT legacy_key in the
+        // body. Must preserve the explicit value — not overwrite
+        // it with the old primary.
+        let old = proxy(Some(HEX32), None);
+        let mut new = kms(Some(HEX32_B));
+        let probe = BackendKeyPresence::default();
+        preserve_backend_encryption_secrets(&mut new, &old, probe);
+        assert_eq!(
+            new.legacy_key(),
+            Some(HEX32_B),
+            "explicit legacy_key in body must override auto-promotion"
+        );
+    }
+
+    #[test]
+    fn preserve_mode_flip_proxy_to_none_auto_promotes() {
+        // Recipe (D) via the UI: operator flips to mode:none but
+        // forgets to paste legacy_key. Auto-promotion preserves
+        // historical-read capability.
+        let old = proxy(Some(HEX32), None);
+        let mut new = E::None {
+            legacy_key: None,
+            legacy_key_id: None,
+        };
+        let probe = BackendKeyPresence::default();
+        preserve_backend_encryption_secrets(&mut new, &old, probe);
+        assert_eq!(new.legacy_key(), Some(HEX32));
+    }
+
+    #[test]
+    fn preserve_same_mode_doesnt_promote_anywhere() {
+        // Same-mode edit (Aes256GcmProxy → Aes256GcmProxy with a
+        // rotated key): no promotion, legacy_key just preserves
+        // from old → new via the same-slot preservation path.
+        let old = proxy(Some(HEX32), Some(HEX32_B));
+        let mut new = proxy(None, None); // redacted round-trip
+        let probe = BackendKeyPresence::default();
+        preserve_backend_encryption_secrets(&mut new, &old, probe);
+        assert_eq!(new.primary_key(), Some(HEX32), "same-mode preserves primary");
+        assert_eq!(
+            new.legacy_key(),
+            Some(HEX32_B),
+            "same-mode preserves legacy_key"
+        );
     }
 }

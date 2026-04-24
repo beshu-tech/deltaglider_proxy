@@ -555,20 +555,29 @@ where
                 st.header_done = true;
             }
 
-            // If we've already emitted the final chunk, we're done —
-            // any trailing bytes from the inner stream are a framing
-            // violation. We don't error (keeps the caller's stream
-            // clean — the plaintext was already delivered intact) but
-            // we do log at debug level so oddities on disk surface in
-            // traces. A shipped file with trailing garbage likely
-            // indicates a broken backup/restore path; operators who
-            // care can grep the logs.
+            // If we've already emitted the final chunk, we're done.
+            // Any trailing bytes from the inner stream are a framing
+            // violation — the final chunk's AAD authenticated "this
+            // is the end", so trailing bytes mean the file was modified
+            // post-write (backup/restore dropped xattrs + left trailing
+            // data, concatenation attack, disk corruption that missed
+            // the GCM tag but mangled tail bytes).
+            //
+            // H7: bumped from a silent debug-log to WARN so the oddity
+            // isn't swallowed by production log filtering. We continue
+            // to return None rather than an Err because the plaintext
+            // has already been streamed to the client and we can't
+            // unring that bell — but operators need to see the warn
+            // to catch a backup/restore regression before it spreads.
             if st.emitted_final {
                 if !st.buf.is_empty() {
-                    tracing::debug!(
+                    tracing::warn!(
                         "chunked-encryption decoder: {} trailing bytes after final frame — \
-                         discarding (possible backup/restore mishandling)",
-                        st.buf.len()
+                         the plaintext has already been emitted (the AAD-authenticated final \
+                         flag fires at the right place). Check for a broken backup/restore \
+                         path or post-write tampering. First 16 bytes (hex): {}",
+                        st.buf.len(),
+                        hex::encode(&st.buf[..st.buf.len().min(16)])
                     );
                 }
                 return None;
@@ -862,11 +871,29 @@ impl<B: StorageBackend> EncryptingBackend<B> {
                         return Ok(lk);
                     }
                 }
-                // Neither primary nor legacy matches — the operator
-                // either rotated without the shim or routed the
-                // bucket to the wrong backend. Emit the specific
-                // error that cites the object's id AND both
-                // candidate ids the wrapper knows about.
+                // Neither primary nor legacy matches. Split the
+                // error text by root cause — an "actually no key
+                // at all" state looks like "<unset>" vs X on the
+                // current backend and is a completely different
+                // operational fix (restore the key; or configure the
+                // backend's encryption mode correctly) from a
+                // "rotated-without-shim" mismatch.
+                //
+                // H6: the old error text cited "rotated without
+                // `legacy_key`" in all three sub-cases, which misled
+                // operators whose actual problem was "the backend
+                // was wrongly flipped to mode: none + no shim".
+                let cfg_has_primary = primary_kid.is_some() || primary_key.is_some();
+                if !cfg_has_primary {
+                    return Err(StorageError::Encryption(format!(
+                        "object was encrypted with key id '{obj_id}', but this backend has \
+                         NO encryption key configured. The object can't be decrypted until \
+                         the key is restored. Set `encryption.key` in YAML or the \
+                         DGP_*_ENCRYPTION_KEY env var on this backend. If the object shouldn't \
+                         be here (e.g. bucket routed to the wrong backend), fix routing \
+                         instead."
+                    )));
+                }
                 let cfg_id = primary_kid.as_deref().unwrap_or("<unset>");
                 Err(StorageError::Encryption(format!(
                     "object was encrypted with key id '{obj_id}', but this backend is \
@@ -2677,8 +2704,11 @@ mod tests {
     #[test]
     fn test_pick_decrypt_key_no_primary_no_legacy_errors() {
         // Wrapper has no key at all. `pick_decrypt_key` called for
-        // an encrypted object must error with the "no key configured"
-        // message — same as the pre-shim behaviour.
+        // an encrypted object must error with the specific "no
+        // encryption key configured" message (H6 fix). The earlier
+        // text said "no legacy-shim match either", which misled
+        // operators whose actual problem was a completely missing
+        // key, not a mis-rotation.
         let cfg = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig::default())));
         let wrapper: EncryptingBackend<CountingBackend> =
             EncryptingBackend::new(CountingBackend::new(), cfg);
@@ -2688,8 +2718,40 @@ mod tests {
         };
         let msg = format!("{err}");
         assert!(
-            msg.contains("some-id") && msg.contains("no legacy-shim match"),
-            "error must cite the object id and the missing-legacy hint, got: {msg}"
+            msg.contains("some-id") && msg.contains("NO encryption key"),
+            "error must cite the object id and the specific 'no key at all' hint, got: {msg}"
+        );
+        // Must NOT cite the rotation-shaped hint — this isn't that case.
+        assert!(
+            !msg.contains("rotated"),
+            "no-key-at-all case must not quote the rotation hint (H6): {msg}"
+        );
+    }
+
+    #[test]
+    fn test_pick_decrypt_key_primary_set_but_wrong_id_errors_with_rotation_hint() {
+        // Wrapper HAS a primary key, but it doesn't match the object's
+        // stamped id. Error must cite the rotation-shaped hint (not
+        // the "no key at all" H6 variant).
+        let cfg = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
+            key: Some(test_key()),
+            key_id: Some("configured-id".into()),
+            ..Default::default()
+        })));
+        let wrapper: EncryptingBackend<CountingBackend> =
+            EncryptingBackend::new(CountingBackend::new(), cfg);
+        let err = match wrapper.pick_decrypt_key(Some("object-id-X")) {
+            Ok(_) => panic!("must error on id mismatch"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("object-id-X") && msg.contains("configured-id"),
+            "mismatch error must cite both ids, got: {msg}"
+        );
+        assert!(
+            msg.contains("rotated") || msg.contains("legacy-shim"),
+            "mismatch error must point to the rotation/routing remedies, got: {msg}"
         );
     }
 }

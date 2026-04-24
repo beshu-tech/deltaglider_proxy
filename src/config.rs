@@ -481,12 +481,24 @@ pub struct Config {
 /// DIFFERENT ids, so objects are NOT accidentally portable between
 /// them. Operators who want portability set an explicit identical
 /// `key_id` on both.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "mode", rename_all = "kebab-case")]
 pub enum BackendEncryptionConfig {
     /// Objects stored plaintext on this backend.
-    #[default]
-    None,
+    ///
+    /// `legacy_key`/`legacy_key_id` keep decrypting historical objects
+    /// after an operator disables encryption on a backend that used to
+    /// be `aes256-gcm-proxy`. Without this shim, any object written
+    /// under the old mode becomes unreadable the moment `mode: none`
+    /// takes effect — the wrapper's read path would see `dg-encrypted`
+    /// metadata and no key to decrypt with, returning 500. Documented
+    /// as recipe (D) in `reference/encryption-at-rest.md`.
+    None {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        legacy_key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        legacy_key_id: Option<String>,
+    },
 
     /// Proxy-side AES-256-GCM. `key` is hex-encoded 256 bits.
     /// `key_id` is stamped on each object's `dg-encryption-key-id`
@@ -544,10 +556,28 @@ pub(crate) fn default_true() -> bool {
     true
 }
 
-/// `skip_serializing_if` helper: backends with encryption `None` omit
-/// the field entirely in canonical YAML.
+/// `skip_serializing_if` helper: backends with encryption `None` (and
+/// no legacy shim) omit the field entirely in canonical YAML. A
+/// `None { legacy_key: Some(...) }` DOES serialise so the shim stays
+/// visible to operators and survives a round-trip through the
+/// canonical exporter.
 pub(crate) fn is_default_encryption(e: &BackendEncryptionConfig) -> bool {
-    matches!(e, BackendEncryptionConfig::None)
+    matches!(
+        e,
+        BackendEncryptionConfig::None {
+            legacy_key: None,
+            legacy_key_id: None,
+        }
+    )
+}
+
+impl Default for BackendEncryptionConfig {
+    fn default() -> Self {
+        Self::None {
+            legacy_key: None,
+            legacy_key_id: None,
+        }
+    }
 }
 
 impl BackendEncryptionConfig {
@@ -555,7 +585,7 @@ impl BackendEncryptionConfig {
     /// summaries and diff renderers. Matches the YAML `mode:` tag.
     pub fn mode_tag(&self) -> &'static str {
         match self {
-            Self::None => "none",
+            Self::None { .. } => "none",
             Self::Aes256GcmProxy { .. } => "aes256-gcm-proxy",
             Self::SseKms { .. } => "sse-kms",
             Self::SseS3 { .. } => "sse-s3",
@@ -568,7 +598,9 @@ impl BackendEncryptionConfig {
     /// mode X" to operators reading the exported YAML.
     pub fn redact_secrets(&mut self) {
         match self {
-            Self::None => {}
+            Self::None { legacy_key, .. } => {
+                *legacy_key = None;
+            }
             Self::Aes256GcmProxy {
                 key, legacy_key, ..
             } => {
@@ -597,18 +629,17 @@ impl BackendEncryptionConfig {
     pub fn primary_key(&self) -> Option<&str> {
         match self {
             Self::Aes256GcmProxy { key, .. } => key.as_deref(),
-            Self::None | Self::SseKms { .. } | Self::SseS3 { .. } => None,
+            Self::None { .. } | Self::SseKms { .. } | Self::SseS3 { .. } => None,
         }
     }
     /// Accessor for the shim `legacy_key` hex. Present on every
-    /// non-None variant (shim can decrypt historical objects after a
-    /// mode flip; SseKms/SseS3 use it to decrypt proxy-encrypted
-    /// historical objects after the backend was re-keyed). Returns
-    /// `None` on `Self::None`.
+    /// variant (the shim decrypts historical objects after any mode
+    /// change, including "encryption disabled" — recipe (D) in the
+    /// reference docs).
     pub fn legacy_key(&self) -> Option<&str> {
         match self {
-            Self::None => None,
-            Self::Aes256GcmProxy { legacy_key, .. }
+            Self::None { legacy_key, .. }
+            | Self::Aes256GcmProxy { legacy_key, .. }
             | Self::SseKms { legacy_key, .. }
             | Self::SseS3 { legacy_key, .. } => legacy_key.as_deref(),
         }
@@ -618,20 +649,21 @@ impl BackendEncryptionConfig {
     /// together.
     pub fn legacy_key_id(&self) -> Option<&str> {
         match self {
-            Self::None => None,
-            Self::Aes256GcmProxy { legacy_key_id, .. }
+            Self::None { legacy_key_id, .. }
+            | Self::Aes256GcmProxy { legacy_key_id, .. }
             | Self::SseKms { legacy_key_id, .. }
             | Self::SseS3 { legacy_key_id, .. } => legacy_key_id.as_deref(),
         }
     }
     /// Mutable accessor for the `legacy_key` slot — used by
     /// `preserve_backend_encryption_secrets` to re-populate the old
-    /// key when the operator's edit omitted it. Returns `None` on
-    /// `Self::None` where the slot doesn't exist.
+    /// key when the operator's edit omitted it. Available on every
+    /// variant since `legacy_key` is a valid shim carrier on all of
+    /// them (including `None`, per recipe (D)).
     pub fn legacy_key_mut(&mut self) -> Option<&mut Option<String>> {
         match self {
-            Self::None => None,
-            Self::Aes256GcmProxy { legacy_key, .. }
+            Self::None { legacy_key, .. }
+            | Self::Aes256GcmProxy { legacy_key, .. }
             | Self::SseKms { legacy_key, .. }
             | Self::SseS3 { legacy_key, .. } => Some(legacy_key),
         }
@@ -707,8 +739,10 @@ pub(crate) fn apply_backend_encryption_env(backend_name: &str, enc: &mut Backend
                 }
             }
         }
-        // None and SseS3 carry no secrets; env vars are silently ignored.
-        BackendEncryptionConfig::None | BackendEncryptionConfig::SseS3 { .. } => {}
+        // None and SseS3 carry no secrets beyond the legacy shim;
+        // env vars for primary-key material are silently ignored
+        // (the shim key stays in YAML/config and is not env-overridden).
+        BackendEncryptionConfig::None { .. } | BackendEncryptionConfig::SseS3 { .. } => {}
     }
 }
 
@@ -846,7 +880,7 @@ impl Default for Config {
             buckets: std::collections::BTreeMap::new(),
             backends: Vec::new(),
             default_backend: None,
-            backend_encryption: BackendEncryptionConfig::None,
+            backend_encryption: BackendEncryptionConfig::default(),
             admission_blocks: Vec::new(),
             iam_mode: crate::config_sections::IamMode::default(),
         }
@@ -1559,6 +1593,44 @@ impl Config {
             }
         }
 
+        // Env-var suffix collision check (correctness x-ray C4):
+        // Two backends whose names normalise to the same env suffix
+        // would both read the SAME env var
+        // (`DGP_BACKEND_<SUFFIX>_ENCRYPTION_KEY`). When both land with
+        // the same key material but different derived key_ids (because
+        // the raw backend NAME feeds into `derive_key_id`, not the
+        // suffix), objects written by one cannot be read by the other.
+        // Detectable at config load time; warn loudly so operators
+        // rename one.
+        if self.backends.len() > 1 {
+            let mut suffix_owners: std::collections::BTreeMap<String, Vec<String>> =
+                std::collections::BTreeMap::new();
+            for backend in &self.backends {
+                // Skip names that already normalize to the bare
+                // "DEFAULT" suffix — that collides with the singleton
+                // `DGP_ENCRYPTION_KEY` path, which is an independent
+                // surface; the operator probably meant a DIFFERENT
+                // collision warning which would confuse the signal.
+                let suffix = env_suffix_for_backend_name(&backend.name);
+                suffix_owners
+                    .entry(suffix)
+                    .or_default()
+                    .push(backend.name.clone());
+            }
+            for (suffix, names) in &suffix_owners {
+                if names.len() > 1 {
+                    warnings.push(format!(
+                        "backends {:?} normalize to the same env-var suffix '{}' — \
+                         all would read DGP_BACKEND_{}_ENCRYPTION_KEY, but each has a \
+                         distinct derived key_id. Rename one of them to avoid silent \
+                         cross-backend key sharing (Aes256GcmProxy cross-decrypt will fail \
+                         with 'key id mismatch').",
+                        names, suffix, suffix
+                    ));
+                }
+            }
+        }
+
         warnings
     }
 
@@ -1767,16 +1839,35 @@ impl Config {
     }
 
     /// Clone the config with *infrastructure* secrets redacted. Matches the
-    /// legacy `to_toml_string` policy: strips `bootstrap_password_hash` and
-    /// every per-backend encryption key (both the singleton `backend_encryption`
-    /// and each `backends[i].encryption`). Proxy SigV4 credentials and
-    /// backend credentials are kept — the wizard, file-based deployment,
-    /// and users reading the file on disk all depend on them being
-    /// present. Use [`Self::redact_all_secrets`] for the admin-API
-    /// "export" flow that never trusts the disk as a secret store.
-    fn redact_infra_secrets(&self) -> Self {
+    /// Persistence variant: strips `bootstrap_password_hash` (it has its
+    /// own dedicated rotation endpoint + sits in the encrypted IAM DB,
+    /// never on the YAML on disk). Encryption keys STAY in the persisted
+    /// YAML — if the operator put them there explicitly, persisting the
+    /// in-memory config back to disk must preserve that choice (else a
+    /// round-trip through `PATCH → persist → restart` silently strips
+    /// the YAML key and the next boot falls back to env lookup; if no
+    /// env var is set, historical-encrypted reads start erroring and
+    /// new writes land plaintext while stamped as proxy-AES).
+    ///
+    /// Proxy SigV4 credentials and backend credentials are kept — the
+    /// wizard, file-based deployment, and users reading the file on
+    /// disk all depend on them being present.
+    ///
+    /// Use [`Self::redact_for_export`] for the admin-API `GET /export`
+    /// flow that never trusts a downloadable file as a secret store.
+    fn redact_for_persist(&self) -> Self {
         let mut export = self.clone();
         export.bootstrap_password_hash = None;
+        export
+    }
+
+    /// Export variant: strips infra secrets AND every per-backend
+    /// encryption key (singleton + named list). Intended for the admin
+    /// API download endpoint where operators read the YAML out of band.
+    /// A persisted file pulled from the box might make it into GitOps
+    /// or a bug report; we don't want encryption keys to follow it.
+    fn redact_for_export(&self) -> Self {
+        let mut export = self.redact_for_persist();
         export.backend_encryption.redact_secrets();
         for named in &mut export.backends {
             named.encryption.redact_secrets();
@@ -1790,7 +1881,7 @@ impl Config {
     /// operator reading the exported YAML must refill secrets from their
     /// secret manager, not copy them out of an API response.
     pub fn redact_all_secrets(&self) -> Self {
-        let mut export = self.redact_infra_secrets();
+        let mut export = self.redact_for_export();
         if let BackendConfig::S3 {
             ref mut access_key_id,
             ref mut secret_access_key,
@@ -1816,11 +1907,17 @@ impl Config {
         export
     }
 
-    /// Serialize config to TOML string (strips infra secrets: bootstrap hash
-    /// and encryption key). SigV4 credentials are kept — see
-    /// [`Self::redact_all_secrets`] for the fully-redacted export variant.
+    /// Serialize config to TOML string (strips infra secrets: bootstrap
+    /// hash and per-backend encryption keys). SigV4 credentials are kept —
+    /// see [`Self::redact_all_secrets`] for the fully-redacted export
+    /// variant.
+    ///
+    /// **Used for `GET /config/export` and `config migrate`** where the
+    /// emitted YAML/TOML is a downloadable artifact. The persist path
+    /// deliberately does NOT go through this function — see
+    /// [`Self::persist_to_file`] for the rationale.
     pub fn to_toml_string(&self) -> Result<String, ConfigError> {
-        let export = self.redact_infra_secrets();
+        let export = self.redact_for_export();
         toml::to_string_pretty(&export).map_err(|e| ConfigError::Parse(e.to_string()))
     }
 
@@ -1838,7 +1935,29 @@ impl Config {
     /// we only ever *emit* sectioned — legacy readers eventually disappear,
     /// the canonical artifact must be forward-shaped.
     pub fn to_canonical_yaml(&self) -> Result<String, ConfigError> {
-        let export = self.redact_infra_secrets();
+        let export = self.redact_for_export();
+        let sectioned = crate::config_sections::SectionedConfig::from_flat(&export);
+        serde_yaml::to_string(&sectioned).map_err(|e| ConfigError::Parse(e.to_string()))
+    }
+
+    /// Persist-variant serializers: preserve per-backend encryption keys
+    /// that the operator configured in YAML. Strips only the bootstrap
+    /// password hash (which sits in the encrypted IAM DB, not on disk).
+    ///
+    /// Rationale: if the admin API (or any code path that mutates the
+    /// in-memory `Config`) round-trips through the export serializer,
+    /// YAML-configured encryption keys silently vanish from disk. On
+    /// next restart the engine falls back to env lookup; if no env var
+    /// is set, historical-encrypted reads error and new writes land
+    /// plaintext. The operator's in-memory state is correct but their
+    /// on-disk source of truth disagrees.
+    fn to_toml_string_for_persist(&self) -> Result<String, ConfigError> {
+        let export = self.redact_for_persist();
+        toml::to_string_pretty(&export).map_err(|e| ConfigError::Parse(e.to_string()))
+    }
+
+    fn to_canonical_yaml_for_persist(&self) -> Result<String, ConfigError> {
+        let export = self.redact_for_persist();
         let sectioned = crate::config_sections::SectionedConfig::from_flat(&export);
         serde_yaml::to_string(&sectioned).map_err(|e| ConfigError::Parse(e.to_string()))
     }
@@ -1852,6 +1971,11 @@ impl Config {
     /// atomic within a single filesystem, so a crash or power loss at any
     /// point leaves the target either fully old or fully new — never the
     /// truncated-mid-write corruption that a bare `fs::write` can produce.
+    ///
+    /// Uses the `_for_persist` serializers which preserve per-backend
+    /// encryption keys. If the operator put keys in YAML, they stay
+    /// there across admin-API mutations (which is an invariant the
+    /// docs advertise — see `docs/product/reference/encryption-at-rest.md`).
     ///
     /// Returns `ConfigError::Parse` when the target is a TOML file but
     /// the config holds YAML-only fields. Rationale: operator-authored
@@ -1867,8 +1991,8 @@ impl Config {
             self.check_toml_persistable(path)?;
         }
         let content = match format {
-            ConfigFormat::Yaml => self.to_canonical_yaml()?,
-            ConfigFormat::Toml => self.to_toml_string()?,
+            ConfigFormat::Yaml => self.to_canonical_yaml_for_persist()?,
+            ConfigFormat::Toml => self.to_toml_string_for_persist()?,
         };
         atomic_write(std::path::Path::new(path), content.as_bytes())
     }
@@ -2457,7 +2581,7 @@ backend:
     #[test]
     fn test_backend_encryption_yaml_roundtrip_none() {
         // Default variant: should not serialize at all (skip_serializing_if).
-        let cfg = BackendEncryptionConfig::None;
+        let cfg = BackendEncryptionConfig::default();
         assert!(is_default_encryption(&cfg));
     }
 
@@ -2541,7 +2665,7 @@ backends:
         ));
         assert!(matches!(
             cfg.backends[1].encryption,
-            BackendEncryptionConfig::None
+            BackendEncryptionConfig::None { .. }
         ));
     }
 
@@ -2563,7 +2687,7 @@ encryption_key: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
         // `backends[*].encryption` (list).
         assert!(matches!(
             cfg.backend_encryption,
-            BackendEncryptionConfig::None
+            BackendEncryptionConfig::None { .. }
         ));
     }
 
@@ -3000,17 +3124,17 @@ encryption_key: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
                 NamedBackendConfig {
                     name: "shared".into(),
                     backend: BackendConfig::Filesystem { path: "/a".into() },
-                    encryption: BackendEncryptionConfig::None,
+                    encryption: BackendEncryptionConfig::default(),
                 },
                 NamedBackendConfig {
                     name: "unique".into(),
                     backend: BackendConfig::Filesystem { path: "/b".into() },
-                    encryption: BackendEncryptionConfig::None,
+                    encryption: BackendEncryptionConfig::default(),
                 },
                 NamedBackendConfig {
                     name: "shared".into(),
                     backend: BackendConfig::Filesystem { path: "/c".into() },
-                    encryption: BackendEncryptionConfig::None,
+                    encryption: BackendEncryptionConfig::default(),
                 },
             ],
             ..Config::default()
@@ -3031,12 +3155,12 @@ encryption_key: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
                 NamedBackendConfig {
                     name: "a".into(),
                     backend: BackendConfig::Filesystem { path: "/a".into() },
-                    encryption: BackendEncryptionConfig::None,
+                    encryption: BackendEncryptionConfig::default(),
                 },
                 NamedBackendConfig {
                     name: "b".into(),
                     backend: BackendConfig::Filesystem { path: "/b".into() },
-                    encryption: BackendEncryptionConfig::None,
+                    encryption: BackendEncryptionConfig::default(),
                 },
             ],
             ..Config::default()
@@ -3671,5 +3795,131 @@ admission_blocks:
         let cfg = Config::from_yaml_str(yaml).unwrap();
         assert_eq!(cfg.admission_blocks.len(), 1);
         assert_eq!(cfg.admission_blocks[0].name, "deny-bad");
+    }
+
+    #[test]
+    fn test_check_warns_on_env_suffix_collision() {
+        // Correctness x-ray C4: "eu-archive" and "eu.archive" both
+        // normalize to EU_ARCHIVE, so both would read the SAME env
+        // var DGP_BACKEND_EU_ARCHIVE_ENCRYPTION_KEY. With the same
+        // key material but distinct derived key_ids (the raw name
+        // feeds into derive_key_id), objects written by one backend
+        // can't be read by the other. check() now warns loudly.
+        let mut cfg = Config {
+            backends: vec![
+                NamedBackendConfig {
+                    name: "eu-archive".into(),
+                    backend: BackendConfig::Filesystem {
+                        path: "/a".into(),
+                    },
+                    encryption: BackendEncryptionConfig::default(),
+                },
+                NamedBackendConfig {
+                    name: "eu.archive".into(),
+                    backend: BackendConfig::Filesystem {
+                        path: "/b".into(),
+                    },
+                    encryption: BackendEncryptionConfig::default(),
+                },
+            ],
+            ..Config::default()
+        };
+        let warnings = cfg.check();
+        assert!(
+            warnings.iter().any(|w| w.contains("env-var suffix") && w.contains("EU_ARCHIVE")),
+            "expected env-suffix collision warning, got {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_check_no_env_suffix_warning_for_distinct_names() {
+        let mut cfg = Config {
+            backends: vec![
+                NamedBackendConfig {
+                    name: "one".into(),
+                    backend: BackendConfig::Filesystem { path: "/a".into() },
+                    encryption: BackendEncryptionConfig::default(),
+                },
+                NamedBackendConfig {
+                    name: "two".into(),
+                    backend: BackendConfig::Filesystem { path: "/b".into() },
+                    encryption: BackendEncryptionConfig::default(),
+                },
+            ],
+            ..Config::default()
+        };
+        let warnings = cfg.check();
+        assert!(
+            !warnings.iter().any(|w| w.contains("env-var suffix")),
+            "distinct names must not trip env-suffix collision, got {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_persist_to_file_preserves_yaml_stored_encryption_keys() {
+        // Regression for xray-finding C1: before the fix,
+        // `persist_to_file` → `to_canonical_yaml` → `redact_infra_secrets`
+        // would strip per-backend encryption keys from the on-disk
+        // YAML on every admin write. Operator-configured keys
+        // silently disappeared on the next `PATCH … /config/section`
+        // round-trip, and the next server restart fell back to env
+        // lookup; if no env var was set, historical encrypted reads
+        // started erroring and new writes landed plaintext.
+        //
+        // The persist path now uses the _for_persist serializers
+        // which only strip the bootstrap password hash.
+        let dir = tempfile::tempdir().unwrap();
+        let yaml_path = dir.path().join("out.yaml");
+        let cfg = Config {
+            listen_addr: "127.0.0.1:9099".parse().unwrap(),
+            backends: vec![NamedBackendConfig {
+                name: "b".into(),
+                backend: BackendConfig::Filesystem {
+                    path: "/tmp/x".into(),
+                },
+                encryption: BackendEncryptionConfig::Aes256GcmProxy {
+                    // 64-char hex key — realistic shape.
+                    key: Some(
+                        "0101010101010101010101010101010101010101010101010101010101010101".into(),
+                    ),
+                    key_id: Some("test-kid".into()),
+                    legacy_key: Some(
+                        "0202020202020202020202020202020202020202020202020202020202020202".into(),
+                    ),
+                    legacy_key_id: Some("test-legacy-kid".into()),
+                },
+            }],
+            ..Config::default()
+        };
+
+        cfg.persist_to_file(yaml_path.to_str().unwrap()).unwrap();
+
+        let persisted = std::fs::read_to_string(&yaml_path).unwrap();
+        assert!(
+            persisted.contains("0101010101010101010101010101010101010101010101010101010101010101"),
+            "persisted YAML must preserve the primary encryption key, got:\n{}",
+            persisted
+        );
+        assert!(
+            persisted.contains("0202020202020202020202020202020202020202020202020202020202020202"),
+            "persisted YAML must preserve the legacy encryption key, got:\n{}",
+            persisted
+        );
+
+        // Export serialization (the downloadable artifact) MUST continue
+        // to redact.
+        let exported = cfg.to_canonical_yaml().unwrap();
+        assert!(
+            !exported.contains("0101010101010101010101010101010101010101010101010101010101010101"),
+            "exported YAML must redact the primary encryption key, got:\n{}",
+            exported
+        );
+        assert!(
+            !exported.contains("0202020202020202020202020202020202020202020202020202020202020202"),
+            "exported YAML must redact the legacy encryption key, got:\n{}",
+            exported
+        );
     }
 }

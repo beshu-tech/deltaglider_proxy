@@ -121,12 +121,12 @@ impl BackendEncryptionSummary {
     pub fn from_config(backend_name: &str, enc: &crate::config::BackendEncryptionConfig) -> Self {
         use crate::config::BackendEncryptionConfig as E;
         match enc {
-            E::None => Self {
+            E::None { legacy_key, .. } => Self {
                 mode: "none".into(),
                 has_key: false,
                 key_id: None,
                 kms_key_id: None,
-                shim_active: false,
+                shim_active: legacy_key.is_some(),
             },
             E::Aes256GcmProxy {
                 key,
