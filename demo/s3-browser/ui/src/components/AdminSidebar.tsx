@@ -168,21 +168,9 @@ export const ADMIN_IA: Array<{ group: string; entries: SidebarEntry[] }> = [
             icon: <CloudOutlined />,
             section: 'storage',
           },
-          {
-            // Encryption-at-rest config. Global (not per-bucket), but
-            // lives under Storage because it's a storage-layer
-            // concern and colocation lets operators see the full
-            // data-path security picture in one place.
-            path: 'configuration/storage/encryption',
-            label: 'Encryption',
-            icon: <LockOutlined />,
-            // The wire field is `advanced.encryption_key` but the UI
-            // is grouped by operator mental model, not YAML layout.
-            // The `section` here is used for the sidebar's dirty-dot
-            // coordination; keep it as 'advanced' since that's what
-            // the section-PUT targets.
-            section: 'advanced',
-          },
+          // Encryption-at-rest config — per-backend as of v0.9. Lives
+          // inside the Backends panel (one subsection per backend
+          // card); no longer a top-level sidebar entry.
         ],
       },
       {

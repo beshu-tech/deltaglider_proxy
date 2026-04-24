@@ -83,7 +83,7 @@ advanced:
 DGP_BOOTSTRAP_PASSWORD_HASH=JDJiJDEyJENYbDVPRm84bDg2...
 ```
 
-> Note: infra secrets (bootstrap hash, encryption key) are stripped from canonical exports (`/config/export`, `config migrate`) — they never round-trip through the YAML artifact. Inject them via env var at deploy time.
+> Note: infra secrets (bootstrap hash, every per-backend encryption key + any `legacy_key` shim) are stripped from canonical exports (`/config/export`, `config migrate`) — they never round-trip through the YAML artifact. Inject them via env var at deploy time. Non-secret identifiers (`key_id`, `kms_key_id`) DO survive redaction so operators can see which backend uses which key material.
 
 **Why base64?** Bcrypt hashes contain `$` characters which Docker, docker-compose, and shell scripts interpret as variable references. The base64 form avoids this entirely.
 
@@ -246,40 +246,50 @@ DGP_SECURE_COOKIES=true
 
 ## Step 6: Enable Encryption at Rest (optional)
 
-**What:** Encrypt stored object bodies with AES-256-GCM. Delta compression happens first, so compression gains are preserved.
+**What:** Pick an encryption mode per storage backend. Four choices: `none` (plaintext), `aes256-gcm-proxy` (proxy-side AES-256-GCM), `sse-kms` (AWS KMS), `sse-s3` (AWS-managed AES256).
 
 **Why:** If someone walks off with the disks — or your S3 backend is breached at the storage layer — the ciphertext is useless without the key. Metadata (object names, sizes, compression ratios) stays unencrypted.
 
-1. Open the admin GUI → **Admin Settings** → **Storage** → **Encryption**
-2. Click **Generate New Key** (uses `crypto.getRandomValues` — the key never round-trips through the server)
-3. Copy the 64-char hex key to your secret manager / password vault
-4. Check **I have stored this key safely**
-5. Click **Apply and Persist**
+Configure per-backend in the admin GUI:
 
-Alternatively, set via env var (recommended — keeps the key out of the YAML artifact):
+1. Admin → **Configuration** → **Storage** → **Backends**
+2. On each backend card, pick an encryption mode from the dropdown:
+   - **None** — plaintext. Appropriate for public-CDN buckets.
+   - **AES-256-GCM (proxy-side)** — the proxy encrypts before the backend sees anything. Generate a 256-bit key in-browser; copy it to a secret manager; check "I have stored this key safely"; Apply.
+   - **SSE-KMS** — paste the KMS ARN. AWS encrypts on write and decrypts on read for callers with KMS permission. The proxy never handles key material.
+   - **SSE-S3** — AWS-managed AES256. No ARN; AWS picks the key.
+3. Apply. The change takes effect on the next write to that backend.
+
+Alternatively, via env var (recommended for proxy-AES — keeps the key out of the YAML artifact):
 
 ```bash
+# For a named backend:
+DGP_BACKEND_EU_ARCHIVE_ENCRYPTION_KEY=$(openssl rand -hex 32)
+# For the singleton-backend deployment (no `backends:` list):
 DGP_ENCRYPTION_KEY=$(openssl rand -hex 32)
 ```
 
-> [!WARNING] If you lose the key, encrypted objects are unrecoverable.
-> DeltaGlider does not escrow keys. There is no recovery path. Store the key somewhere outside the proxy host — a secrets manager, an operator password vault, a sealed envelope.
+> [!WARNING] If you lose a proxy-AES key, encrypted objects on that backend are unrecoverable.
+> DeltaGlider does not escrow keys. There is no recovery path. Store each key somewhere outside the proxy host — a secrets manager, an operator password vault, a sealed envelope. SSE-KMS / SSE-S3 keys are AWS-managed; the risk surface is your IAM and KMS story.
 
 **Caveats:**
-- **Rotation is not supported in this release.** Changing the key makes objects written under the old key unreadable until the old key is restored. The admin panel warns about this before Apply.
-- **Only new writes are encrypted.** Enabling encryption does not retroactively encrypt existing objects.
-- **Existing encrypted objects remain readable** if you turn encryption off — only new writes become plaintext again.
+- **Rotation within one mode is not automated.** Rotating a proxy-AES key via the admin GUI requires either a `legacy_key` shim (to keep reading old objects) or a full copy-through-the-proxy migration to a new backend.
+- **Only new writes are encrypted.** Switching a backend's mode does not retroactively encrypt existing objects.
+- **Mode transitions (proxy-AES → SSE-KMS) use a decrypt-only shim.** The admin panel shows an info banner; clear `legacy_key` once historical objects are gone.
+- **Per-bucket encryption is not supported.** Encryption is a backend-scoped choice; buckets inherit the encryption of the backend they route to. Operators who need bucket-level isolation create additional backends.
 
-**Large objects:** Downloads stream end-to-end with ~130 KiB peak RAM regardless of object size, and range GETs fetch only the target chunks (O(1) traffic). Uploads still buffer the ciphertext in memory (~1× plaintext size) before handing off to the backend; the proxy's `max_object_size` default of 100 MiB keeps that bounded. Bumping `max_object_size` for large encrypted uploads means budgeting RAM to match.
+**Large objects (proxy-AES only):** Downloads stream end-to-end with ~130 KiB peak RAM regardless of object size; range GETs fetch only the target chunks (O(1) traffic). Uploads buffer the ciphertext in memory (~1× plaintext size) before handing off to the backend; the proxy's `max_object_size` default of 100 MiB keeps that bounded. Bumping `max_object_size` for large encrypted uploads means budgeting RAM to match. SSE-KMS / SSE-S3 have no such overhead.
 
-**What's encrypted vs. what isn't:**
+**What's encrypted vs. what isn't** (mode-dependent body encryption; metadata is always plaintext):
 
-| Layer | Encrypted? |
-|---|---|
-| Object body (passthrough) | Yes — chunked AES-256-GCM |
-| Delta body + reference body | Yes — single-shot AES-256-GCM |
-| Object name / size / metadata | No (stored in backend's native metadata) |
-| Transport (network) | Configure TLS at reverse proxy (Step 5) |
+| Layer | `none` | `aes256-gcm-proxy` | `sse-kms` / `sse-s3` |
+|---|---|---|---|
+| Object body (passthrough) | No | Yes — chunked AES-256-GCM | Yes — AWS-side |
+| Delta body + reference body | No | Yes — single-shot AES-256-GCM | Yes — AWS-side |
+| Object name / size / metadata | No | No | No |
+| Transport (network) | Configure TLS at reverse proxy (Step 5) | same | same |
+
+For the per-mode wire format, key-id mismatch detection, and the decrypt-only shim mechanics, see the [encryption reference](reference/encryption-at-rest.md).
 
 ---
 

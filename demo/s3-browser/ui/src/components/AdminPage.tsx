@@ -30,7 +30,6 @@ import AdminSidebar from './AdminSidebar';
 import AdmissionPanel from './AdmissionPanel';
 import CredentialsModePanel from './CredentialsModePanel';
 import BucketsPanel from './BucketsPanel';
-import EncryptionPanel from './EncryptionPanel';
 import CopySectionYamlButton from './CopySectionYamlButton';
 import SetupWizard from './SetupWizard';
 import TracePanel from './TracePanel';
@@ -88,6 +87,10 @@ const LEGACY_TO_NEW: Record<string, string> = {
   'backends': 'configuration/storage/backends',
   'backend': 'configuration/storage/backends',
   'compression': 'configuration/storage/backends',
+  // Encryption moved per-backend in v0.9 — the dedicated panel is
+  // gone; every backend card on the Backends page owns its own
+  // encryption editor. Redirect bookmarks of the old URL.
+  'encryption': 'configuration/storage/backends',
   // Advanced sub-sections
   'limits': 'configuration/advanced/limits',
   'security': 'configuration/advanced/listener',
@@ -122,6 +125,11 @@ function useIsNarrow(breakpoint: number = 900): boolean {
 function resolveAdminPath(subPath: string): string {
   const path = subPath.replace(/^\/+/, '').replace(/\/+$/, '');
   if (!path) return 'diagnostics/dashboard';
+  // v0.9: the dedicated encryption page was deleted when encryption
+  // moved per-backend. Redirect the full-depth bookmark to Backends.
+  if (path === 'configuration/storage/encryption') {
+    return 'configuration/storage/backends';
+  }
   // Legacy flat paths (first segment only)
   const firstSegment = path.split('/')[0];
   if (LEGACY_TO_NEW[firstSegment]) {
@@ -194,11 +202,6 @@ const PAGE_HEADERS: Record<string, { icon: React.ReactNode; title: string; descr
     icon: <CloudOutlined />,
     title: 'Buckets',
     description: 'Per-bucket policies: compression overrides, delta ratio, public prefixes, quotas, aliases.',
-  },
-  'configuration/storage/encryption': {
-    icon: <CloudOutlined />,
-    title: 'Encryption at rest',
-    description: 'AES-256-GCM applied to every object before it hits the storage backend. Global switch; see Buckets for per-bucket visibility.',
   },
   'configuration/advanced/listener': {
     icon: <CloudServerOutlined />,
@@ -647,14 +650,9 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
         </>
       );
     }
-    if (adminPath === 'configuration/storage/encryption') {
-      return (
-        <>
-          {header}
-          <EncryptionPanel onSessionExpired={onSessionExpired} />
-        </>
-      );
-    }
+    // Encryption config lives on each backend card in BackendsPanel
+    // as of v0.9 — per-backend-scoped via `BackendEncryptionEditor`.
+    // No top-level "encryption" route.
 
     // Configuration — Advanced (Wave 7). Five dedicated sub-panels,
     // each edits a different slice of `advanced.*` through the

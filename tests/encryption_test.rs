@@ -798,7 +798,9 @@ async fn test_chunked_truncation_detected() {
 // ═══════════════════════════════════════════════════
 
 /// Snapshot of the singleton backend's encryption summary straight
-/// from `GET /api/admin/config` — the UI-authoritative view.
+/// from `GET /api/admin/config` — the UI-authoritative view. The
+/// server synthesises a "default" entry in `backends` for the
+/// legacy singleton path so this works uniformly across YAML shapes.
 async fn get_singleton_encryption_summary(
     http: &reqwest::Client,
     endpoint: &str,
@@ -811,9 +813,6 @@ async fn get_singleton_encryption_summary(
         .json()
         .await
         .unwrap();
-    // The "default" singleton appears in the backends list when
-    // config has no explicit backends; its encryption summary is
-    // what the EncryptionPanel (or BackendsPanel in Step 7) reads.
     cfg.get("backends")
         .and_then(|arr| arr.as_array())
         .and_then(|arr| {
@@ -821,27 +820,19 @@ async fn get_singleton_encryption_summary(
                 .find(|b| b.get("name").and_then(|v| v.as_str()) == Some("default"))
                 .cloned()
         })
-        .or_else(|| {
-            // Fallback: legacy shape where the singleton config is
-            // surfaced as the top-level `encryption_enabled` boolean.
-            // Used by Step 7 to derive `has_key` when no per-backend
-            // summary has landed yet.
-            Some(serde_json::json!({
-                "encryption": {
-                    "mode": if cfg
-                        .get("encryption_enabled")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false)
-                    { "aes256-gcm-proxy" } else { "none" },
-                    "has_key": cfg
-                        .get("encryption_enabled")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
-                    "shim_active": false,
-                }
-            }))
-        })
         .unwrap_or_default()
+}
+
+/// Convenience: extract the `encryption.mode` string from a backend
+/// entry returned by `get_singleton_encryption_summary`. Returns
+/// `"none"` when the entry or field is absent.
+fn backend_mode(entry: &serde_json::Value) -> String {
+    entry
+        .get("encryption")
+        .and_then(|e| e.get("mode"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("none")
+        .to_string()
 }
 
 /// B2 regression, per-backend shape: the admin-UI "Disable
@@ -858,20 +849,11 @@ async fn test_section_put_explicit_null_clears_per_backend_encryption_key() {
     let http = common::admin_http_client(&server.endpoint()).await;
 
     // Precondition: singleton is encrypted (proxy mode with a key).
-    let cfg_before: serde_json::Value = http
-        .get(format!("{}/_/api/admin/config", server.endpoint()))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let entry_before = get_singleton_encryption_summary(&http, &server.endpoint()).await;
     assert_eq!(
-        cfg_before
-            .get("encryption_enabled")
-            .and_then(|v| v.as_bool()),
-        Some(true),
-        "precondition: encryption must be enabled on the singleton"
+        backend_mode(&entry_before),
+        "aes256-gcm-proxy",
+        "precondition: singleton must be in aes256-gcm-proxy mode; got entry: {entry_before:#}"
     );
 
     // Act: PATCH the storage section with backend_encryption mode:
@@ -896,20 +878,11 @@ async fn test_section_put_explicit_null_clears_per_backend_encryption_key() {
     );
 
     // Assert: encryption is now OFF.
-    let cfg_after: serde_json::Value = http
-        .get(format!("{}/_/api/admin/config", server.endpoint()))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let entry_after = get_singleton_encryption_summary(&http, &server.endpoint()).await;
     assert_eq!(
-        cfg_after
-            .get("encryption_enabled")
-            .and_then(|v| v.as_bool()),
-        Some(false),
-        "mode:none PUT MUST clear encryption. Full config: {cfg_after:#}"
+        backend_mode(&entry_after),
+        "none",
+        "mode:none PUT MUST clear encryption. Entry: {entry_after:#}"
     );
 }
 
@@ -944,21 +917,12 @@ async fn test_section_put_absent_field_preserves_per_backend_encryption_key() {
     );
 
     // Assert: encryption is STILL on.
-    let cfg_after: serde_json::Value = http
-        .get(format!("{}/_/api/admin/config", server.endpoint()))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let entry_after = get_singleton_encryption_summary(&http, &server.endpoint()).await;
     assert_eq!(
-        cfg_after
-            .get("encryption_enabled")
-            .and_then(|v| v.as_bool()),
-        Some(true),
+        backend_mode(&entry_after),
+        "aes256-gcm-proxy",
         "absent backend_encryption field MUST preserve existing key. \
-         Full config: {cfg_after:#}"
+         Entry: {entry_after:#}"
     );
 }
 

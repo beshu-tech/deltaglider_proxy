@@ -686,19 +686,53 @@ When `public_prefixes` (or `public: true`) is set, anonymous users can GET, HEAD
 
 ## Encryption at Rest
 
-Optional AES-256-GCM encryption for all new writes. Existing unencrypted objects remain readable (detected via metadata).
+Per-backend encryption with four modes: `none`, `aes256-gcm-proxy`, `sse-kms`, `sse-s3`. Each backend carries its own `encryption` block — operators can mix (e.g. SSE-KMS for the production backend, plaintext for a public-CDN backend) without sharing a single blast-radius key.
 
-| | |
+**YAML** — named-backends path:
+
+```yaml
+storage:
+  backends:
+    - name: archive
+      s3: { ... }
+      encryption:
+        mode: aes256-gcm-proxy
+        key: "${DGP_BACKEND_ARCHIVE_ENCRYPTION_KEY}"
+        key_id: archive-2026-04   # optional; derived from SHA-256(name + key) when absent
+    - name: kms-prod
+      s3: { ... }
+      encryption:
+        mode: sse-kms
+        kms_key_id: arn:aws:kms:us-east-1:123456789012:key/abc-def
+        bucket_key_enabled: true
+```
+
+**YAML** — singleton-backend path (`backends:` empty):
+
+```yaml
+storage:
+  backend: { ... }
+  backend_encryption:
+    mode: aes256-gcm-proxy
+    key: "${DGP_ENCRYPTION_KEY}"
+```
+
+**Env vars** (infra secrets — these are the recommended key source; every `key` / `kms_key_id` field in YAML is stripped by canonical exports):
+
+| Env var | Binds to |
 |---|---|
-| **Env var** | `DGP_ENCRYPTION_KEY` |
-| **YAML** | `advanced.encryption_key` (treated as an **infra secret** — stripped by canonical exports) |
-| **TOML** | `encryption_key` |
-| **Default** | None (unencrypted) |
-| **Format** | 64-char hex string (256 bits) |
+| `DGP_ENCRYPTION_KEY` | `backend_encryption.key` (singleton path) |
+| `DGP_BACKEND_<NAME>_ENCRYPTION_KEY` | `backends[name=<NAME>].encryption.key` |
+| `DGP_SSE_KMS_KEY_ID` | `backend_encryption.kms_key_id` (singleton SSE-KMS) |
+| `DGP_BACKEND_<NAME>_SSE_KMS_KEY_ID` | named SSE-KMS override |
 
-Setting `encryption_key` to an empty string is equivalent to unset.
+Name normalisation: `<NAME>` is uppercased; `-` and `.` become `_` (so `eu-archive` → `DGP_BACKEND_EU_ARCHIVE_ENCRYPTION_KEY`).
 
-Large passthrough uploads are encrypted in 64-KiB chunks (end-to-end streaming — no whole-object buffering); deltas and references stay single-shot. Rotation is not supported in this release — changing the key makes objects written under the old key unreadable until the old key is restored. See [encryption at rest](encryption-at-rest.md) for the full wire format and operational caveats.
+**Defaults:** absent `encryption` block → `mode: none` (plaintext).
+
+**Formats:** `key` / `legacy_key` are 64-char lowercase hex (256 bits). `kms_key_id` is a KMS ARN or alias. `key_id` (optional) must match `[A-Za-z0-9_.-]{1,64}` (S3 user-metadata header-safe).
+
+Rotation within a single mode is not automated — use the `legacy_key` / `legacy_key_id` shim fields (decrypt-only, for proxy→native transitions) or copy objects to a new backend. See [encryption at rest](encryption-at-rest.md) for the full wire format, key-id mismatch mechanics, and the shim lifecycle.
 
 ---
 
@@ -886,7 +920,8 @@ Exhaustive list of every `DGP_*` variable the server reads. The unit test `test_
 | `DGP_TLS_CERT` | auto self-signed | PEM cert path |
 | `DGP_TLS_KEY` | auto self-signed | PEM key path |
 | `DGP_CONFIG_SYNC_BUCKET` | — | S3 bucket for encrypted-DB multi-instance sync |
-| `DGP_ENCRYPTION_KEY` | — | 64-char hex AES-256 key (encryption at rest) |
+| `DGP_ENCRYPTION_KEY` | — | Singleton-backend AES-256 key (64-char hex). Named backends use `DGP_BACKEND_<NAME>_ENCRYPTION_KEY`. |
+| `DGP_SSE_KMS_KEY_ID` | — | Singleton-backend SSE-KMS ARN/alias. Named backends use `DGP_BACKEND_<NAME>_SSE_KMS_KEY_ID`. |
 | `DGP_SILENCE_TOML_DEPRECATION` | false | Suppress the TOML-is-deprecated startup warning |
 
 ### Consumed only by tests / build

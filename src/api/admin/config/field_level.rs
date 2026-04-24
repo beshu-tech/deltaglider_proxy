@@ -82,11 +82,6 @@ pub struct ConfigResponse {
     iam_mode: crate::config_sections::IamMode,
     // Fields that differ from the TOML config file on disk
     tainted_fields: Vec<String>,
-    // Encryption-at-rest status. Exposes a boolean ONLY — the key
-    // itself is an infra secret and never leaves the server. Drives
-    // the encryption panel's status indicator and the per-bucket
-    // "encrypted at rest" badge in BucketsPanel.
-    encryption_enabled: bool,
 }
 
 /// Per-backend encryption status summary. Exposed in
@@ -524,23 +519,12 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
         // UI can drive the `iam_mode: declarative` banner + toggle.
         iam_mode: cfg.iam_mode,
         tainted_fields,
-        // Expose presence of the key as a boolean ONLY. Never leaks
-        // the key material itself — that stays in the infra-secret
-        // bucket and is redacted from every public surface.
-        //
-        // STEP-1 SHIM: "any backend has a non-None encryption mode"
-        // stands in for the former single-key boolean. Step 6 replaces
-        // this with per-backend summaries and Step 8 deletes the flag
-        // entirely.
-        encryption_enabled: matches!(
-            cfg.backend_encryption,
-            crate::config::BackendEncryptionConfig::Aes256GcmProxy { .. }
-                | crate::config::BackendEncryptionConfig::SseKms { .. }
-                | crate::config::BackendEncryptionConfig::SseS3 { .. }
-        ) || cfg
-            .backends
-            .iter()
-            .any(|b| !matches!(b.encryption, crate::config::BackendEncryptionConfig::None)),
+        // Encryption status is now per-backend. Each `BackendInfoResponse`
+        // in `backends` carries an `encryption: BackendEncryptionSummary`
+        // non-secret summary. The former top-level `encryption_enabled`
+        // boolean was removed in v0.9 alongside the per-backend
+        // refactor — the UI drives the BackendsPanel and BucketsPanel
+        // badges from the per-entry summaries instead.
     })
 }
 
