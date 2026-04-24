@@ -349,6 +349,85 @@ pub(crate) fn has_any_on_bucket(permissions: &[Permission], bucket: &str) -> boo
     false
 }
 
+/// Check if the user has an Allow that grants *unrestricted* access to the
+/// full bucket OR to the exact requested prefix — i.e. the listed resource
+/// space is fully covered. Used by the authorization middleware to decide
+/// between `ListScope::Unrestricted` and `ListScope::Filtered`:
+///
+/// - Returns `true` when at least one Allow covers `bucket` / `bucket/*`
+///   OR covers `bucket/<prefix>*` with `prefix` being a non-empty prefix
+///   that's narrower than or equal to the user's policy pattern.
+/// - Returns `false` when only narrower Allows match (e.g. policy grants
+///   `bucket/alice/*` but the request has no prefix or a wider one).
+///
+/// Deny rules are IGNORED at this stage — this predicate is about
+/// "how broad is the Allow space," not "what's denied inside it."
+/// The per-key filter on the handler side still evaluates denies per key.
+pub(crate) fn has_unrestricted_allow_for_bucket_prefix(
+    permissions: &[Permission],
+    bucket: &str,
+    prefix: &str,
+) -> bool {
+    let requested_path = if prefix.is_empty() {
+        bucket.to_string()
+    } else {
+        format!("{}/{}", bucket, prefix)
+    };
+
+    for perm in permissions {
+        if perm.effect != "Allow" {
+            continue;
+        }
+        for res in &perm.resources {
+            // Full wildcard Allow.
+            if res == "*" {
+                return true;
+            }
+            // Policy grants the entire bucket (or bucket-level).
+            if res == bucket {
+                return true;
+            }
+            if res == &format!("{}/*", bucket) {
+                return true;
+            }
+            // Policy exactly matches the requested bucket+prefix OR is a
+            // wider pattern that covers it (e.g. "bucket/alice*" covers
+            // "bucket/alice/file.txt").
+            if let Some(stripped) = res.strip_suffix('*') {
+                if requested_path.starts_with(stripped) {
+                    return true;
+                }
+            }
+            if res == &requested_path {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Pure predicate: can this user see this key in a LIST response?
+///
+/// Used by the bucket handler to post-filter the engine's list output
+/// when the middleware set `ListScope::Filtered`. The rule: a user may
+/// see a key if they have Read OR List permission on it — List alone
+/// is enough because it's the same verb that gated the request itself,
+/// and Read is a strict superset in intent (if you can read it, you
+/// can also see it in the listing).
+///
+/// Kept as a free function (not a method) because:
+/// - It's a lookup used on a hot loop over potentially thousands of
+///   keys; `AuthenticatedUser::can` re-evaluates the full policy graph
+///   each call, and inlining here lets LLVM consolidate the two checks.
+/// - It's unit-testable as a pure function without an HTTP stack.
+pub fn user_can_see_listed_key(
+    user: &super::AuthenticatedUser,
+    bucket: &str,
+    key: &str,
+) -> bool {
+    user.can(S3Action::Read, bucket, key) || user.can(S3Action::List, bucket, key)
+}
+
 /// Check if a permission set grants full admin access:
 /// actions must contain "*" or "admin", AND resources must contain "*".
 /// Respects Deny overrides.
@@ -815,6 +894,152 @@ mod tests {
             conditions: None,
         }];
         assert!(has_any_on_bucket(&perms, "any-bucket"));
+    }
+
+    // === has_unrestricted_allow_for_bucket_prefix — C1 security fix ===
+
+    #[test]
+    fn test_unrestricted_wildcard_is_unrestricted() {
+        let perms = vec![Permission {
+            id: 0,
+            effect: "Allow".into(),
+            actions: vec!["read".into()],
+            resources: vec!["*".into()],
+            conditions: None,
+        }];
+        assert!(has_unrestricted_allow_for_bucket_prefix(&perms, "anything", ""));
+        assert!(has_unrestricted_allow_for_bucket_prefix(&perms, "anything", "pfx"));
+    }
+
+    #[test]
+    fn test_unrestricted_full_bucket_slash_star() {
+        let perms = vec![Permission {
+            id: 0,
+            effect: "Allow".into(),
+            actions: vec!["read".into()],
+            resources: vec!["prod/*".into()],
+            conditions: None,
+        }];
+        assert!(has_unrestricted_allow_for_bucket_prefix(&perms, "prod", ""));
+        assert!(has_unrestricted_allow_for_bucket_prefix(&perms, "prod", "alice/"));
+        assert!(!has_unrestricted_allow_for_bucket_prefix(&perms, "other", ""));
+    }
+
+    #[test]
+    fn test_prefix_scoped_is_not_unrestricted_for_empty_prefix() {
+        // Classic C1 attack: policy grants "prod/alice/*", user calls LIST
+        // with empty prefix. Must NOT be treated as unrestricted.
+        let perms = vec![Permission {
+            id: 0,
+            effect: "Allow".into(),
+            actions: vec!["read".into()],
+            resources: vec!["prod/alice/*".into()],
+            conditions: None,
+        }];
+        assert!(!has_unrestricted_allow_for_bucket_prefix(&perms, "prod", ""));
+    }
+
+    #[test]
+    fn test_prefix_scoped_is_unrestricted_for_matching_prefix() {
+        // Same policy but narrower LIST — requesting the exact prefix
+        // the policy allows. User SHOULD get unrestricted within that scope.
+        let perms = vec![Permission {
+            id: 0,
+            effect: "Allow".into(),
+            actions: vec!["read".into()],
+            resources: vec!["prod/alice/*".into()],
+            conditions: None,
+        }];
+        assert!(has_unrestricted_allow_for_bucket_prefix(
+            &perms,
+            "prod",
+            "alice/"
+        ));
+        assert!(has_unrestricted_allow_for_bucket_prefix(
+            &perms,
+            "prod",
+            "alice/sub"
+        ));
+    }
+
+    #[test]
+    fn test_prefix_scoped_is_not_unrestricted_for_sibling_prefix() {
+        // Policy grants alice's tree, user asks about bob's — must NOT
+        // short-circuit as unrestricted.
+        let perms = vec![Permission {
+            id: 0,
+            effect: "Allow".into(),
+            actions: vec!["read".into()],
+            resources: vec!["prod/alice/*".into()],
+            conditions: None,
+        }];
+        assert!(!has_unrestricted_allow_for_bucket_prefix(
+            &perms,
+            "prod",
+            "bob/"
+        ));
+    }
+
+    #[test]
+    fn test_deny_rule_does_not_claim_unrestricted() {
+        // Bare Deny by itself never grants unrestricted access.
+        let perms = vec![Permission {
+            id: 0,
+            effect: "Deny".into(),
+            actions: vec!["read".into()],
+            resources: vec!["*".into()],
+            conditions: None,
+        }];
+        assert!(!has_unrestricted_allow_for_bucket_prefix(&perms, "x", ""));
+    }
+
+    // === user_can_see_listed_key integration with AuthenticatedUser ===
+
+    fn make_user(name: &str, resources: Vec<&str>, actions: Vec<&str>) -> super::super::AuthenticatedUser {
+        let permissions = vec![Permission {
+            id: 0,
+            effect: "Allow".into(),
+            actions: actions.iter().map(|s| s.to_string()).collect(),
+            resources: resources.iter().map(|s| s.to_string()).collect(),
+            conditions: None,
+        }];
+        let iam_policies = permissions.iter().map(permission_to_iam_policy).collect();
+        super::super::AuthenticatedUser {
+            name: name.to_string(),
+            access_key_id: "AKIA".into(),
+            permissions,
+            iam_policies,
+        }
+    }
+
+    #[test]
+    fn test_user_can_see_listed_key_unrestricted_user() {
+        let user = make_user("alice", vec!["prod/*"], vec!["read", "list"]);
+        assert!(user_can_see_listed_key(&user, "prod", "alice/file.txt"));
+        assert!(user_can_see_listed_key(&user, "prod", "anything/else.bin"));
+    }
+
+    #[test]
+    fn test_user_can_see_listed_key_prefix_scoped() {
+        let user = make_user("alice", vec!["prod/alice/*"], vec!["read"]);
+        assert!(user_can_see_listed_key(&user, "prod", "alice/file.txt"));
+        assert!(!user_can_see_listed_key(&user, "prod", "bob/file.txt"));
+        assert!(!user_can_see_listed_key(&user, "prod", "secret.bin"));
+    }
+
+    #[test]
+    fn test_user_can_see_listed_key_list_only() {
+        // List-only permission should let the user see keys in listings
+        // (they can't Read them, but they can discover them).
+        let user = make_user("alice", vec!["prod/public/*"], vec!["list"]);
+        assert!(user_can_see_listed_key(&user, "prod", "public/x.txt"));
+        assert!(!user_can_see_listed_key(&user, "prod", "private/x.txt"));
+    }
+
+    #[test]
+    fn test_user_cannot_see_keys_in_different_bucket() {
+        let user = make_user("alice", vec!["prod/*"], vec!["read", "list"]);
+        assert!(!user_can_see_listed_key(&user, "staging", "anything"));
     }
 
     // === Property-based tests ===

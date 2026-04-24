@@ -196,6 +196,41 @@ impl AuthenticatedUser {
     }
 }
 
+/// Post-authorization signal to the ListObjects handler indicating
+/// whether the caller's permission covered the entire bucket/prefix
+/// (= `Unrestricted`) or only a subset (= `Filtered`).
+///
+/// Inserted into request extensions by the authorization middleware for
+/// LIST requests. The handler uses it to decide whether to filter the
+/// engine's returned keys by per-key permission.
+///
+/// Why this lives here, not in the handler: the middleware is where
+/// full policy context is already resolved (`s3:prefix`, deny chain,
+/// `can_see_bucket` fallback). Recomputing that in the handler would
+/// duplicate logic and risk drift. The handler just reads the signal.
+///
+/// Background: pre-C1-security-fix, a user with a prefix-scoped
+/// permission like `bucket/alice/*` was allowed to call
+/// `GET /bucket?prefix=` (empty) via the `can_see_bucket` fallback,
+/// and the handler returned every key in the bucket — including keys
+/// outside alice/. `ListScope::Filtered` closes that bypass by forcing
+/// the handler to filter the response through `user.can(Read|List, bucket, key)`.
+#[derive(Debug, Clone)]
+pub enum ListScope {
+    /// The caller's policy authorises every key under the requested
+    /// prefix. No per-key filtering needed.
+    Unrestricted,
+    /// The caller was admitted via `can_see_bucket` fallback (or has
+    /// prefix-scoped permissions that don't cover the requested prefix
+    /// in full). The handler MUST filter returned keys by
+    /// `user.can(Read|List, bucket, key)`.
+    Filtered {
+        /// The authenticated user, captured at authorization time so
+        /// the filter uses the exact same policy set.
+        user: Box<AuthenticatedUser>,
+    },
+}
+
 impl IamUser {
     /// Returns true if this user has full admin permissions:
     /// actions must contain "*" or "admin", AND resources must contain "*".

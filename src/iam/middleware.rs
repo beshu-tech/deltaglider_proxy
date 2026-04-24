@@ -7,7 +7,7 @@ use axum::response::{IntoResponse, Response};
 use iam_rs::Context;
 use tracing::debug;
 
-use super::types::{AuthenticatedUser, S3Action};
+use super::types::{AuthenticatedUser, ListScope, S3Action};
 
 /// Map an HTTP method + path to an S3 action.
 fn classify_action(method: &axum::http::Method, path: &str) -> S3Action {
@@ -62,7 +62,7 @@ fn parse_bucket_key(path: &str) -> (&str, &str) {
 /// In legacy mode or open access, no `AuthenticatedUser` is present and
 /// the request passes through unchecked.
 pub async fn authorization_middleware(
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Result<Response, Response> {
     // OPTIONS (CORS preflight) always passes through without auth
@@ -139,37 +139,74 @@ pub async fn authorization_middleware(
         );
     }
 
-    // ListObjects (GET /bucket) — three-way evaluation:
+    // ListObjects (GET /bucket) — four-way evaluation with post-auth scope marker:
     //
-    // 1. If an Allow rule matches (possibly via trailing-slash alt-path in evaluate_iam),
-    //    the request is allowed. This handles `"resources": ["bucket/*"]` matching bucket-level LIST.
+    // 1. If an Allow covers the full requested bucket/prefix AND policies grant
+    //    unrestricted Read/List on that space, the request is allowed AND
+    //    marked `ListScope::Unrestricted` — no per-key filtering needed.
     //
-    // 2. If an explicit Deny matches (including condition-based Deny like `s3:prefix ".*"`),
-    //    the request is blocked immediately — Deny always wins.
+    // 2. If an explicit Deny matches (including condition-based Deny like
+    //    `s3:prefix ".*"`), the request is blocked immediately — Deny always wins.
     //
-    // 3. If neither Allow nor Deny matched (implicit deny from no matching rules),
-    //    fall back to bucket visibility: allow LIST if the user has ANY permission
-    //    that references this bucket. This ensures users with prefix-scoped permissions
-    //    (e.g. `"bucket/myprefix/*"`) can still LIST the bucket to discover their objects.
+    // 3. If no Allow covers the prefix outright but the user has *any*
+    //    permission referencing this bucket (e.g. `bucket/alice/*`), the
+    //    request is ADMITTED but marked `ListScope::Filtered`. The handler
+    //    MUST then filter returned keys by per-key permission. This closes
+    //    the C1 IAM LIST bypass (previously unfiltered list leaked every key).
     //
-    // This matches AWS behaviour where a user with s3:GetObject on bucket/* can
-    // ListBucket even without an explicit s3:ListBucket statement.
-    let allowed = if action == S3Action::List && key.is_empty() {
+    // 4. Anonymous users get no fallback: only public-prefix policies apply,
+    //    so if iam-rs didn't match Allow at step 1, they're denied.
+    //
+    // The "any permission on bucket" fallback is preserved because it matches
+    // AWS: a user with s3:GetObject on bucket/* can still ListBucket even
+    // without an explicit s3:ListBucket statement. What's NEW in this fix is
+    // that the handler must FILTER, not return everything wholesale.
+    let (allowed, list_scope) = if action == S3Action::List && key.is_empty() {
+        // Extract the requested prefix (may be empty).
+        let requested_prefix = extract_prefix_from_query(request.uri().query());
+
         if user.can_with_context(action, bucket, key, &context) {
-            true
+            // Policies matched with the prefix-aware context. Decide whether
+            // the coverage is unrestricted (user can see every key in the
+            // prefix space) or prefix-scoped (handler must filter).
+            let unrestricted = super::permissions::has_unrestricted_allow_for_bucket_prefix(
+                &user.permissions,
+                bucket,
+                &requested_prefix,
+            );
+            let scope = if unrestricted {
+                Some(ListScope::Unrestricted)
+            } else {
+                // iam-rs said yes but the policy is narrower than the
+                // requested prefix (e.g. condition-based) → filter anyway.
+                // Defence in depth: if we can't prove coverage is
+                // unrestricted, assume it isn't.
+                Some(ListScope::Filtered {
+                    user: Box::new(user.clone()),
+                })
+            };
+            (true, scope)
         } else if user.is_explicitly_denied(action, bucket, key, &context) {
             // An explicit Deny matched (possibly via condition) — blocked
-            false
+            (false, None)
         } else if user.name == "$anonymous" {
             // Anonymous users must NOT use the can_see_bucket fallback —
             // it would allow unscoped LIST, leaking keys outside public prefixes.
-            false
+            (false, None)
+        } else if user.can_see_bucket(bucket) {
+            // No explicit Allow on the prefix, but the user has SOME
+            // permission on this bucket. Admit with filtering enforced.
+            (
+                true,
+                Some(ListScope::Filtered {
+                    user: Box::new(user.clone()),
+                }),
+            )
         } else {
-            // No explicit deny — fall back to bucket visibility
-            user.can_see_bucket(bucket)
+            (false, None)
         }
     } else {
-        user.can_with_context(action, bucket, key, &context)
+        (user.can_with_context(action, bucket, key, &context), None)
     };
 
     if !allowed {
@@ -211,7 +248,30 @@ pub async fn authorization_middleware(
         user.name, action, bucket, key
     );
 
+    // Hand the ListScope marker to the LIST handler so it knows whether to
+    // filter keys. Only inserted for LIST bucket-level; other actions read
+    // the AuthenticatedUser directly and don't need this marker.
+    if let Some(scope) = list_scope {
+        request.extensions_mut().insert(scope);
+    }
+
     Ok(next.run(request).await)
+}
+
+/// Extract the URL-decoded `prefix` query parameter, if present.
+/// Returns an empty string when no prefix is given.
+fn extract_prefix_from_query(query: Option<&str>) -> String {
+    let Some(q) = query else {
+        return String::new();
+    };
+    for param in q.split('&') {
+        if let Some(value) = param.strip_prefix("prefix=") {
+            return urlencoding::decode(value)
+                .unwrap_or_default()
+                .into_owned();
+        }
+    }
+    String::new()
 }
 
 #[cfg(test)]

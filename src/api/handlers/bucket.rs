@@ -6,7 +6,7 @@ use crate::api::extractors::ValidatedBucket;
 use crate::api::xml::{
     BucketInfo, ListBucketResult, ListBucketsResult, ListMultipartUploadsResult, S3Object,
 };
-use crate::iam::AuthenticatedUser;
+use crate::iam::{user_can_see_listed_key, AuthenticatedUser, ListScope};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -71,7 +71,11 @@ pub async fn bucket_get_handler(
     ValidatedBucket(bucket): ValidatedBucket,
     Query(query): Query<BucketGetQuery>,
     auth_user: Option<axum::Extension<AuthenticatedUser>>,
+    list_scope: Option<axum::Extension<ListScope>>,
 ) -> Result<Response, S3Error> {
+    // The `auth_user` is still used by logging/audit elsewhere, but the
+    // filtering decision lives in `list_scope`, set by the IAM middleware.
+    let _ = &auth_user;
     // Check for tagging request
     if query.tagging.is_some() {
         info!("GET bucket tagging (stub): {}", bucket);
@@ -171,8 +175,41 @@ pub async fn bucket_get_handler(
         )
         .await?;
 
-    let s3_objects: Vec<S3Object> = page
-        .objects
+    // C1 security fix: when the middleware flagged this LIST as
+    // `ListScope::Filtered` (the caller had prefix-scoped permissions that
+    // don't cover the full requested prefix), we MUST post-filter each key
+    // and common-prefix against the user's actual per-key permissions.
+    // Pre-fix, unfiltered keys leaked out of scope — any key in `bucket`
+    // was visible once the `can_see_bucket` fallback admitted the request.
+    //
+    // Design note: we filter AFTER the engine pages. This means the client's
+    // `max_keys` acts as a server-side inspection cap, not a guaranteed
+    // returned count — the resulting page may have fewer objects than
+    // requested. `is_truncated` + the engine's `next_continuation_token`
+    // remain honest (reflect engine-level cursor, not filter count). This
+    // matches AWS's documented behaviour for policies that mix allows with
+    // prefix-scoped denies.
+    let (filtered_objects, filtered_common_prefixes, was_filtered) = match &list_scope {
+        Some(axum::Extension(ListScope::Filtered { user })) => {
+            let objects: Vec<_> = page
+                .objects
+                .into_iter()
+                .filter(|(k, _)| user_can_see_listed_key(user, &bucket, k))
+                .collect();
+            // For CommonPrefixes, treat the prefix itself as a key under
+            // the bucket; if the user can see nothing under that prefix
+            // (no permission referencing it), drop it.
+            let common_prefixes: Vec<_> = page
+                .common_prefixes
+                .into_iter()
+                .filter(|p| user_can_see_listed_key(user, &bucket, p))
+                .collect();
+            (objects, common_prefixes, true)
+        }
+        _ => (page.objects, page.common_prefixes, false),
+    };
+
+    let s3_objects: Vec<S3Object> = filtered_objects
         .into_iter()
         .map(|(key, meta)| {
             let user_metadata = if include_metadata {
@@ -203,7 +240,7 @@ pub async fn bucket_get_handler(
             delimiter,
             max_keys,
             s3_objects,
-            page.common_prefixes,
+            filtered_common_prefixes,
             query.continuation_token,
             next_token,
             page.is_truncated,
@@ -219,7 +256,7 @@ pub async fn bucket_get_handler(
             delimiter.clone(),
             max_keys,
             s3_objects,
-            page.common_prefixes,
+            filtered_common_prefixes,
             query.marker,
             next_token,
             page.is_truncated,
@@ -228,7 +265,16 @@ pub async fn bucket_get_handler(
         .to_xml()
     };
 
-    Ok(xml_response(xml))
+    let mut resp = xml_response(xml).into_response();
+    if was_filtered {
+        // Informational header so operators/SDKs can tell a filtered page
+        // from an unrestricted one. Not load-bearing for correctness.
+        resp.headers_mut().insert(
+            "x-amz-meta-dg-list-filtered",
+            axum::http::HeaderValue::from_static("true"),
+        );
+    }
+    Ok(resp)
 }
 
 /// Canned ACL response (full control for owner "dgp").

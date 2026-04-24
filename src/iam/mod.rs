@@ -33,7 +33,7 @@ pub use declarative::{
 };
 pub use keygen::{generate_access_key_id, generate_secret_access_key};
 pub use middleware::authorization_middleware;
-pub use permissions::{normalize_permissions, validate_permissions};
+pub use permissions::{normalize_permissions, user_can_see_listed_key, validate_permissions};
 pub use types::*;
 
 /// Monotonic IAM-index version counter.
