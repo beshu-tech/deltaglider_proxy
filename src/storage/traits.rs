@@ -198,7 +198,18 @@ pub trait StorageBackend: Send + Sync {
 
     /// Stream a byte range of a passthrough file without buffering the entire object.
     /// Default falls back to the full stream (caller will handle slicing).
-    /// Backends that support native range reads (S3, filesystem) override this.
+    ///
+    /// E2 security/hygiene invariant: EVERY production backend MUST
+    /// override this method with a native range read. The default is
+    /// present only so unit-test spies don't need to implement it; it
+    /// defeats the memory bound ranged GETs are supposed to provide by
+    /// fetching the whole object first. A grep-based conformance test
+    /// in `traits.rs::tests::every_backend_overrides_range` guards the
+    /// invariant for in-tree backends.
+    ///
+    /// Backends that support native range reads (S3, filesystem, and
+    /// the EncryptingBackend wrapper which peels chunks selectively)
+    /// override this.
     /// Returns `(stream, content_length)` where `content_length` is the number of
     /// bytes in the range (0 signals "full stream, not a range").
     async fn get_passthrough_stream_range(
@@ -541,3 +552,96 @@ macro_rules! impl_storage_backend_for_box {
 }
 
 impl_storage_backend_for_box!();
+
+#[cfg(test)]
+mod tests {
+    //! E2 conformance: the default `get_passthrough_stream_range` impl
+    //! on the trait is a correctness fallback (buffers the full object)
+    //! and MUST be overridden by every production backend that wants
+    //! the memory bound a ranged GET is supposed to provide.
+    //!
+    //! The grep-based test below walks the `src/storage/` tree, picks
+    //! every `impl StorageBackend for <ConcreteType>` block, and asserts
+    //! it contains a `get_passthrough_stream_range` definition.
+    //!
+    //! False positives are possible (a test-only spy is also a concrete
+    //! impl) but a missing override is guaranteed to fail — which is
+    //! the direction we care about.
+
+    use std::path::PathBuf;
+
+    #[test]
+    fn every_backend_overrides_range() {
+        // Collect all .rs files under src/storage/.
+        fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        walk(&p, out);
+                    } else if p.extension().map(|e| e == "rs").unwrap_or(false) {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("storage");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        assert!(!files.is_empty(), "expected storage files at {:?}", root);
+
+        // For each `impl StorageBackend for X {` block, extract it and
+        // assert it contains a `get_passthrough_stream_range` definition.
+        // This is a lightweight lexer — good enough for the in-tree check.
+        for path in &files {
+            let text = std::fs::read_to_string(path).expect("read src file");
+            let marker = "impl StorageBackend for ";
+            let mut offset = 0;
+            while let Some(idx) = text[offset..].find(marker) {
+                let start = offset + idx;
+                // Find the opening `{` of the impl block.
+                let brace_start = match text[start..].find('{') {
+                    Some(b) => start + b,
+                    None => break,
+                };
+                // Walk to matching close-brace.
+                let mut depth = 1;
+                let mut i = brace_start + 1;
+                let bytes = text.as_bytes();
+                while i < bytes.len() && depth > 0 {
+                    match bytes[i] as char {
+                        '{' => depth += 1,
+                        '}' => depth -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let block = &text[brace_start..i];
+                // Header gives us the concrete type name (for assertion msg).
+                let header_end = brace_start;
+                let header = text[start..header_end]
+                    .trim_end()
+                    .strip_prefix(marker)
+                    .unwrap_or("")
+                    .trim();
+
+                assert!(
+                    block.contains("fn get_passthrough_stream_range"),
+                    "{}:{} impl StorageBackend for {} is missing a \
+                     `get_passthrough_stream_range` override. The default \
+                     fallback buffers the entire object and defeats the \
+                     memory bound a ranged GET promises. See the doc comment \
+                     on `StorageBackend::get_passthrough_stream_range` for \
+                     the E2 invariant.",
+                    path.display(),
+                    text[..start].lines().count() + 1,
+                    header,
+                );
+
+                offset = i;
+            }
+        }
+    }
+}
