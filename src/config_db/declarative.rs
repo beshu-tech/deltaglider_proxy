@@ -28,7 +28,9 @@
 use rusqlite::params;
 use std::collections::HashMap;
 
-use crate::iam::{normalize_permissions, CurrentIam, IamDiff, Permission, ReconcileStats};
+use crate::iam::{
+    normalize_permissions, CurrentIam, IamDiff, MappingRulesAction, Permission, ReconcileStats,
+};
 
 use super::{ConfigDb, ConfigDbError};
 
@@ -52,13 +54,19 @@ impl ConfigDb {
 
         let mut stats = ReconcileStats::default();
 
-        // ── 1. Delete mapping rules wholesale when we're replacing them.
-        //      Rules are wipe-and-rebuild; if diff says replace, clear
-        //      the table first. If the diff is empty (idempotent case),
-        //      skip entirely.
-        if !diff.mapping_rules_to_replace.is_empty() || mapping_rules_need_clearing(diff, current) {
-            tx.execute("DELETE FROM group_mapping_rules", [])?;
-            // We'll re-insert after groups + providers finalize.
+        // ── 1. Delete mapping rules wholesale IFF the diff says we
+        //      must (ClearAll or ReplaceWith). `Keep` is the idempotent
+        //      no-op path — never touches the table. This is the
+        //      post-C1 shape: the old `Vec + helper` form couldn't
+        //      distinguish "YAML matches non-empty DB, keep" from
+        //      "YAML empty, wipe" and silently wiped on every
+        //      idempotent re-apply.
+        match &diff.mapping_rules {
+            MappingRulesAction::Keep => {}
+            MappingRulesAction::ClearAll | MappingRulesAction::ReplaceWith(_) => {
+                tx.execute("DELETE FROM group_mapping_rules", [])?;
+                // We'll re-insert in step 8 iff ReplaceWith.
+            }
         }
 
         // ── 2. Delete users. Cascades permissions, group_members,
@@ -202,9 +210,11 @@ impl ConfigDb {
             stats.users_updated.push(u.name.clone());
         }
 
-        // ── 8. Re-insert mapping rules if diff says so.
-        if !diff.mapping_rules_to_replace.is_empty() {
-            for r in &diff.mapping_rules_to_replace {
+        // ── 8. Re-insert mapping rules if diff says ReplaceWith.
+        //      ClearAll has already done its DELETE in step 1; Keep
+        //      is a no-op.
+        if let MappingRulesAction::ReplaceWith(ref rules) = diff.mapping_rules {
+            for r in rules {
                 let provider_id: Option<i64> = match &r.provider {
                     Some(name) => Some(*provider_name_to_id.get(name).ok_or_else(|| {
                         // Defensive — validation caught this already,
@@ -238,7 +248,13 @@ impl ConfigDb {
                     ],
                 )?;
             }
-            stats.mapping_rules_replaced = diff.mapping_rules_to_replace.len();
+            stats.mapping_rules_replaced = rules.len();
+        } else if matches!(diff.mapping_rules, MappingRulesAction::ClearAll) {
+            // Track the clear for audit accuracy — stats previously
+            // showed 0 even when rules were wiped. We don't know the
+            // old count cheaply (it's in `current.mapping_rules` but
+            // re-reading after DELETE would be silly); use its len.
+            stats.mapping_rules_replaced = current.mapping_rules.len();
         }
 
         tx.commit()?;
@@ -272,25 +288,29 @@ impl ConfigDb {
     }
 }
 
-/// The wipe-and-rebuild step for mapping rules needs to fire when
-/// the diff nominates replacement OR when rules need to disappear
-/// entirely (YAML has zero rules but DB has some). `diff_iam` only
-/// populates `mapping_rules_to_replace` when the two sets differ; if
-/// YAML has zero rules and DB has N, the populated vector is empty
-/// (the empty Vec) — but we still need the DELETE. Detect that here.
-fn mapping_rules_need_clearing(diff: &IamDiff, current: &CurrentIam) -> bool {
-    diff.mapping_rules_to_replace.is_empty() && !current.mapping_rules.is_empty() && {
-        // Could be idempotent (both empty) — only clear when DB has rules.
-        // diff_iam's mapping_rules_equal() handles idempotency; if it
-        // detected equality, `mapping_rules_to_replace` stays empty AND
-        // the current.mapping_rules snapshot matches yaml's empty intent
-        // — but that's only true when yaml IS empty. Since we can't see
-        // yaml from here, we rely on the invariant that
-        // `mapping_rules_to_replace.is_empty() && current.is_empty()`
-        // means "idempotent no-op". This arm of the `&&` catches the
-        // "yaml empty, db non-empty" case.
-        true
-    }
+/// Replace permission rows for a given owner (user or group). The
+/// table + FK column varies with the owner type; everything else is
+/// identical. Reuses the generic `insert_permission_rows` helper so
+/// the column shape (conditions_json vs conditions, effect defaulting)
+/// stays in one place.
+///
+/// Two callers (`replace_group_permissions`, `replace_user_permissions`
+/// below) are thin delegates to this — hygiene #4 collapsed the two
+/// parallel 10-line functions that used to clone each other.
+fn replace_permissions(
+    tx: &rusqlite::Transaction,
+    table: &str,
+    fk_col: &str,
+    owner_id: i64,
+    perms: &[Permission],
+) -> Result<(), ConfigDbError> {
+    tx.execute(
+        &format!("DELETE FROM {} WHERE {} = ?1", table, fk_col),
+        params![owner_id],
+    )?;
+    let mut perms = perms.to_vec();
+    normalize_permissions(&mut perms);
+    ConfigDb::insert_permission_rows(tx, table, fk_col, owner_id, &perms)
 }
 
 fn replace_group_permissions(
@@ -298,17 +318,7 @@ fn replace_group_permissions(
     group_id: i64,
     perms: &[Permission],
 ) -> Result<(), ConfigDbError> {
-    tx.execute(
-        "DELETE FROM group_permissions WHERE group_id = ?1",
-        params![group_id],
-    )?;
-    let mut perms = perms.to_vec();
-    normalize_permissions(&mut perms);
-    // Reuse the existing generic inserter so the column shape
-    // (conditions_json vs conditions, effect defaulting, etc.) stays
-    // in one place — avoids the exact drift that broke this path in
-    // integration tests.
-    ConfigDb::insert_permission_rows(tx, "group_permissions", "group_id", group_id, &perms)
+    replace_permissions(tx, "group_permissions", "group_id", group_id, perms)
 }
 
 fn replace_user_permissions(
@@ -316,13 +326,7 @@ fn replace_user_permissions(
     user_id: i64,
     perms: &[Permission],
 ) -> Result<(), ConfigDbError> {
-    tx.execute(
-        "DELETE FROM permissions WHERE user_id = ?1",
-        params![user_id],
-    )?;
-    let mut perms = perms.to_vec();
-    normalize_permissions(&mut perms);
-    ConfigDb::insert_permission_rows(tx, "permissions", "user_id", user_id, &perms)
+    replace_permissions(tx, "permissions", "user_id", user_id, perms)
 }
 
 fn replace_user_group_memberships(

@@ -324,11 +324,15 @@ pub(crate) async fn apply_config_transition(
 
     // 4c. Phase 3c.3 — Declarative IAM reconciler.
     //
-    //     Runs iff the TARGET mode is Declarative. Covers three
-    //     transition cases:
+    //     Runs iff the TARGET mode is Declarative AND the IAM fields
+    //     actually differ from old_cfg (correctness-xray M2: previously
+    //     the reconcile fired on every PATCH touching anything in the
+    //     access section — log_level fiddling would trigger the full
+    //     diff + sync cycle for no reason).
+    //
+    //     Covers three transition cases:
     //       - Gui      → Declarative : empty-YAML gate (below), reconcile otherwise.
-    //       - Declarative → Declarative : always reconcile (YAML may
-    //         have a newly-authored user that wasn't there before).
+    //       - Declarative → Declarative : reconcile when IAM fields changed.
     //       - Declarative → Gui / Gui → Gui : no-op (DB owned by GUI).
     //
     //     Validation + diff happens BEFORE any DB write (via diff_iam);
@@ -346,138 +350,105 @@ pub(crate) async fn apply_config_transition(
             &new_cfg.group_mapping_rules,
         );
 
-        // Empty-gate: only on the gui→declarative flip. A flip to
-        // declarative with empty YAML would delete every DB user in
-        // one go; make the operator opt in by specifying IAM in YAML.
-        if matches!(old_cfg.iam_mode, crate::config_sections::IamMode::Gui)
-            && yaml_snapshot.is_empty()
-        {
-            return Err(
-                "Refusing to flip to iam_mode: declarative with empty IAM in YAML — \
-                 this would wipe the existing users/groups in the encrypted config DB. \
-                 Add access.iam_users / access.iam_groups to the YAML first, or keep \
-                 iam_mode: gui to preserve the DB as source of truth."
-                    .to_string(),
+        // Short-circuit when the target mode is unchanged AND the IAM
+        // fields are identical to the old snapshot. This matters
+        // because apply_config_transition runs on any PATCH — most
+        // of which (log_level, cache_size_mb, …) don't touch IAM.
+        // Without this guard we'd pay reconcile overhead + a config-
+        // sync upload on every unrelated admin click.
+        let old_iam_unchanged = matches!(
+            old_cfg.iam_mode,
+            crate::config_sections::IamMode::Declarative
+        ) && old_cfg.iam_users == new_cfg.iam_users
+            && old_cfg.iam_groups == new_cfg.iam_groups
+            && old_cfg.auth_providers == new_cfg.auth_providers
+            && old_cfg.group_mapping_rules == new_cfg.group_mapping_rules;
+
+        if !old_iam_unchanged {
+            // Empty-gate: only on the gui→declarative flip. A flip to
+            // declarative with empty YAML would delete every DB user in
+            // one go; make the operator opt in by specifying IAM in YAML.
+            if matches!(old_cfg.iam_mode, crate::config_sections::IamMode::Gui)
+                && yaml_snapshot.is_empty()
+            {
+                return Err(
+                    "Refusing to flip to iam_mode: declarative with empty IAM in YAML — \
+                     this would wipe the existing users/groups in the encrypted config DB. \
+                     Add access.iam_users / access.iam_groups to the YAML first, or keep \
+                     iam_mode: gui to preserve the DB as source of truth."
+                        .to_string(),
+                );
+            }
+
+            // The reconciler requires a config DB. On instances without
+            // one (bootstrap-disabled deployments), declarative mode is
+            // meaningless — surface the error at apply time rather than
+            // silently succeed.
+            let Some(db_arc) = state.config_db.as_ref() else {
+                return Err("iam_mode: declarative requires an encrypted config DB; \
+                     this instance has none initialised (check DGP_BOOTSTRAP_PASSWORD_HASH \
+                     and that the DB was successfully opened at startup)."
+                    .to_string());
+            };
+            let db = db_arc.lock().await;
+            let stats = crate::iam::reconcile_declarative_iam(&db, &yaml_snapshot)
+                .map_err(|e| format!("declarative IAM reconcile failed (no state changed): {e}"))?;
+
+            // Rebuild the in-memory IAM index from the now-committed DB.
+            // `rebuild_iam_index_declarative` bumps `IAM_VERSION` so
+            // integration-test barriers fire correctly. The `_declarative`
+            // variant skips the legacy-admin auto-migration branch: in
+            // declarative mode YAML is authoritative, so auto-creating
+            // a row YAML didn't declare would be a silent side-effect
+            // that breaks idempotency.
+            super::users::rebuild_iam_index_declarative(&db, &state.iam_state)
+                .map_err(|e| format!("rebuild_iam_index after reconcile: {e:?}"))?;
+            drop(db);
+
+            // Config sync upload only when the reconcile actually changed
+            // state (correctness-xray L1). Idempotent re-applies produce
+            // stats.is_noop() == true; skipping avoids spurious ETag bumps
+            // + peer-replica churn on GitOps reconcile loops.
+            if !stats.is_noop() {
+                super::trigger_config_sync(state);
+            }
+
+            // Emit one audit entry per mutation via the `audit_entries()`
+            // helper (hygiene #1: replaces a 10-block copy-paste loop).
+            let empty = axum::http::HeaderMap::new();
+            for (action, names) in stats.audit_entries() {
+                for name in names {
+                    super::audit_log(action, "declarative", name, &empty);
+                }
+            }
+            if stats.mapping_rules_replaced > 0 {
+                super::audit_log(
+                    "iam_reconcile_mapping_rules_replaced",
+                    "declarative",
+                    &format!("{} rules", stats.mapping_rules_replaced),
+                    &empty,
+                );
+            }
+
+            tracing::info!(
+                target: "deltaglider_proxy::config",
+                "[declarative-iam] reconciled: {}",
+                stats.summary_line()
             );
-        }
 
-        // The reconciler requires a config DB. On instances without
-        // one (bootstrap-disabled deployments), declarative mode is
-        // meaningless — surface the error at apply time rather than
-        // silently succeed.
-        let Some(db_arc) = state.config_db.as_ref() else {
-            return Err("iam_mode: declarative requires an encrypted config DB; \
-                 this instance has none initialised (check DGP_BOOTSTRAP_PASSWORD_HASH \
-                 and that the DB was successfully opened at startup)."
-                .to_string());
-        };
-        let db = db_arc.lock().await;
-        let stats = crate::iam::reconcile_declarative_iam(&db, &yaml_snapshot)
-            .map_err(|e| format!("declarative IAM reconcile failed (no state changed): {e}"))?;
-
-        // Rebuild the in-memory IAM index from the now-committed DB.
-        // `rebuild_iam_index_declarative` bumps `IAM_VERSION` so
-        // integration-test barriers fire correctly. The `_declarative`
-        // variant skips the legacy-admin auto-migration branch: in
-        // declarative mode YAML is authoritative, so auto-creating
-        // a row YAML didn't declare would be a silent side-effect
-        // that breaks idempotency.
-        super::users::rebuild_iam_index_declarative(&db, &state.iam_state)
-            .map_err(|e| format!("rebuild_iam_index after reconcile: {e:?}"))?;
-        drop(db);
-
-        // Trigger the S3-sync upload so a multi-replica deployment
-        // propagates the reconciled DB.
-        super::trigger_config_sync(state);
-
-        // Emit an audit entry per mutation so the ring captures what
-        // changed in this reconcile. Use empty HeaderMap — the
-        // reconciler is a server-side pipeline step, not a direct
-        // HTTP call, so there's no real client IP/UA to record.
-        let empty = axum::http::HeaderMap::new();
-        for name in &stats.groups_created {
-            super::audit_log("iam_reconcile_group_create", "declarative", name, &empty);
-        }
-        for name in &stats.groups_updated {
-            super::audit_log("iam_reconcile_group_update", "declarative", name, &empty);
-        }
-        for name in &stats.groups_deleted {
-            super::audit_log("iam_reconcile_group_delete", "declarative", name, &empty);
-        }
-        for name in &stats.providers_created {
-            super::audit_log("iam_reconcile_provider_create", "declarative", name, &empty);
-        }
-        for name in &stats.providers_updated {
-            super::audit_log("iam_reconcile_provider_update", "declarative", name, &empty);
-        }
-        for name in &stats.providers_deleted {
-            super::audit_log("iam_reconcile_provider_delete", "declarative", name, &empty);
-        }
-        for name in &stats.users_created {
-            super::audit_log("iam_reconcile_user_create", "declarative", name, &empty);
-        }
-        for name in &stats.users_updated {
-            super::audit_log("iam_reconcile_user_update", "declarative", name, &empty);
-        }
-        for name in &stats.users_deleted {
-            super::audit_log("iam_reconcile_user_delete", "declarative", name, &empty);
-        }
-        if stats.mapping_rules_replaced > 0 {
-            super::audit_log(
-                "iam_reconcile_mapping_rules_replaced",
-                "declarative",
-                &format!("{} rules", stats.mapping_rules_replaced),
-                &empty,
-            );
-        }
-
-        tracing::info!(
-            target: "deltaglider_proxy::config",
-            "[declarative-iam] reconciled: users(+{}/~{}/-{}) groups(+{}/~{}/-{}) \
-             providers(+{}/~{}/-{}) mapping_rules={}",
-            stats.users_created.len(),
-            stats.users_updated.len(),
-            stats.users_deleted.len(),
-            stats.groups_created.len(),
-            stats.groups_updated.len(),
-            stats.groups_deleted.len(),
-            stats.providers_created.len(),
-            stats.providers_updated.len(),
-            stats.providers_deleted.len(),
-            stats.mapping_rules_replaced,
-        );
-
-        // Surface stats as warnings so the apply response carries a
-        // user-visible summary even when the reconcile was
-        // successful. The admin UI's Apply dialog renders warnings
-        // below the diff.
-        let total_changes = stats.users_created.len()
-            + stats.users_updated.len()
-            + stats.users_deleted.len()
-            + stats.groups_created.len()
-            + stats.groups_updated.len()
-            + stats.groups_deleted.len()
-            + stats.providers_created.len()
-            + stats.providers_updated.len()
-            + stats.providers_deleted.len();
-        if total_changes > 0 || stats.mapping_rules_replaced > 0 {
-            warnings.push(format!(
-                "declarative IAM reconciled: {} users (+{}/~{}/-{}), {} groups (+{}/~{}/-{}), \
-                 {} providers (+{}/~{}/-{}), {} mapping rules replaced",
-                stats.users_total,
-                stats.users_created.len(),
-                stats.users_updated.len(),
-                stats.users_deleted.len(),
-                stats.groups_total,
-                stats.groups_created.len(),
-                stats.groups_updated.len(),
-                stats.groups_deleted.len(),
-                stats.providers_total,
-                stats.providers_created.len(),
-                stats.providers_updated.len(),
-                stats.providers_deleted.len(),
-                stats.mapping_rules_replaced,
-            ));
+            // Surface stats as an apply-response warning when anything
+            // actually changed; idempotent apply stays silent
+            // (operators rely on "no warning line" = "true no-op").
+            if !stats.is_noop() {
+                warnings.push(format!(
+                    "declarative IAM reconciled: {} users total, {} groups total, \
+                     {} providers total — {}",
+                    stats.users_total,
+                    stats.groups_total,
+                    stats.providers_total,
+                    stats.summary_line(),
+                ));
+            }
         }
     }
 

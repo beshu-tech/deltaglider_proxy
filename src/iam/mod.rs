@@ -29,7 +29,7 @@ use tracing::warn;
 pub use declarative::{
     diff_iam, reconcile_declarative_iam, snapshot_from_access, CurrentIam, DeclarativeAuthProvider,
     DeclarativeGroup, DeclarativeIam, DeclarativeMappingRule, DeclarativeUser, IamDiff,
-    ReconcileStats,
+    MappingRulesAction, ReconcileStats,
 };
 pub use keygen::{generate_access_key_id, generate_secret_access_key};
 pub use middleware::authorization_middleware;

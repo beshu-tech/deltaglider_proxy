@@ -133,9 +133,11 @@ The canonical exporter redacts every secret on the way out — so a YAML pulled 
 - `iam_users[*].secret_access_key` → `""`
 - `auth_providers[*].client_secret` → `null`
 
-Wire secrets in via the standard env-substitution syntax (`${env:DGP_USER_ALICE_SECRET}`). The persist-variant serializer keeps whatever YAML carries on disk across admin-API round-trips (admin clicks that persist the file don't strip the secrets the operator put in).
+**Today**: secrets in the YAML file must be **plaintext** (or you need to keep the file out of git and materialise it from a secret manager into the container's filesystem at deploy time). An env-var / `${env:...}` substitution syntax is on the roadmap but not implemented yet — any placeholder-looking string in `secret_access_key` or `client_secret` is stored verbatim as the secret.
 
-**Infra hygiene**: keep secrets in env vars or a secret manager. The only thing in the YAML should be `${env:NAME}` references.
+**Persistence**: the persist-variant serializer keeps whatever YAML carries on disk across admin-API round-trips (admin clicks that persist the file don't strip the secrets the operator put in).
+
+**Infra hygiene**: if you must put plaintext secrets in the YAML, restrict filesystem permissions (`chmod 0600`, owned by the proxy user), keep the file out of git, and treat the container image it lands in as sensitive.
 
 ## The empty-YAML gate
 

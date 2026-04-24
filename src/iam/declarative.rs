@@ -9,7 +9,7 @@
 //!   3. Computes a pure [`IamDiff`] via [`diff_iam`] — validation
 //!      errors surface here before any DB writes.
 //!   4. Applies the diff inside a single SQLite transaction via
-//!      `ConfigDb::reconcile` — atomic; partial failures roll back.
+//!      `ConfigDb::apply_iam_reconcile` — atomic; partial failures roll back.
 //!
 //! External identities (runtime OAuth byproducts) are intentionally
 //! NOT reconciled — they stay DB-only. They ARE cascade-deleted when
@@ -184,10 +184,39 @@ pub struct IamDiff {
     pub users_to_update: Vec<(i64, DeclarativeUser)>,
     pub users_to_delete: Vec<(i64, String)>,
 
-    /// Wipe-and-rebuild for mapping rules (no stable per-row identity
-    /// beyond the tuple of fields — changing any field is effectively
-    /// a delete+insert, so we replace the whole set).
-    pub mapping_rules_to_replace: Vec<DeclarativeMappingRule>,
+    /// Mapping rules are wipe-and-rebuild (no stable per-row identity;
+    /// any field change is a delete+insert). The enum captures the
+    /// three non-overlapping states so the reconcile can't conflate
+    /// "idempotent no-op" with "YAML is empty, wipe the DB" — the
+    /// previous `Vec<…> + ambiguous helper` shape did exactly that
+    /// (correctness x-ray C1: any re-apply of a non-empty rule set
+    /// silently dropped the table).
+    pub mapping_rules: MappingRulesAction,
+}
+
+/// What the reconciler should do with `group_mapping_rules`. Built
+/// by [`diff_iam`] from the equality compare (`mapping_rules_equal`)
+/// between YAML and DB. One of three states:
+///
+/// * `Keep` — YAML matches DB exactly, no-op. Never touches the table.
+/// * `ClearAll` — YAML has zero rules, DB has some. Delete-all, no
+///   re-insert. (Setting `yaml: []` in declarative mode means "remove
+///   all mapping rules.")
+/// * `ReplaceWith(rules)` — YAML has rules different from DB. Wipe
+///   and re-insert from `rules`.
+#[derive(Debug, PartialEq, Default)]
+pub enum MappingRulesAction {
+    #[default]
+    Keep,
+    ClearAll,
+    ReplaceWith(Vec<DeclarativeMappingRule>),
+}
+
+impl MappingRulesAction {
+    /// True when the action performs NO table writes (state equal).
+    pub fn is_noop(&self) -> bool {
+        matches!(self, Self::Keep)
+    }
 }
 
 impl IamDiff {
@@ -201,7 +230,7 @@ impl IamDiff {
             && self.users_to_create.is_empty()
             && self.users_to_update.is_empty()
             && self.users_to_delete.is_empty()
-            && self.mapping_rules_to_replace.is_empty()
+            && self.mapping_rules.is_noop()
     }
 }
 
@@ -283,22 +312,37 @@ fn validate(yaml: &DeclarativeIam, db: &CurrentIam) -> Result<(), String> {
         validate_permissions(&perms).map_err(|e| format!("group '{}': {e}", g.name))?;
     }
 
-    // Cross-check: YAML user access_key_id must not collide with an
-    // EXISTING DB user (by name) who is NOT being deleted. "by name"
-    // pairing in the diff would normally leave such a collision to
-    // a UNIQUE-constraint failure mid-transaction; catching it here
-    // gives a clean error at validation time with zero DB writes.
-    let yaml_user_names: HashSet<&str> = yaml.users.iter().map(|u| u.name.as_str()).collect();
-    for db_user in &db.users {
-        if yaml_user_names.contains(db_user.name.as_str()) {
-            continue; // this DB user will be updated in place, no collision possible
-        }
-        // DB user is slated for DELETE. Does any YAML user reuse its access_key_id?
-        for yu in &yaml.users {
-            if yu.access_key_id == db_user.access_key_id && yu.name != db_user.name {
+    // Cross-check: YAML user access_key_id must not collide with
+    // ANY existing DB user (except the DB user with the same name,
+    // which is the update-in-place case). Catches two scenarios:
+    //
+    //   1. YAML user "new-alice" has an access_key that matches a
+    //      different DB user "old-alice" who's slated for DELETE
+    //      (diff-by-name pairs them by name → "old-alice" delete +
+    //      "new-alice" create — mid-transaction UNIQUE violation).
+    //
+    //   2. M1: YAML swaps access_keys between two surviving DB
+    //      users (both UPDATE in place). First UPDATE would
+    //      violate UNIQUE(access_key_id) because the second user
+    //      still holds the target key.
+    //
+    // Doing this post-validation lets operators get a clean error
+    // with both conflicting names rather than "apply reconcile:
+    // SQLite error: UNIQUE constraint failed: users.access_key_id".
+    for yu in &yaml.users {
+        for db_user in &db.users {
+            if yu.name == db_user.name {
+                // Same user by name → UPDATE in place. The access_key
+                // can change freely (the old value is gone the moment
+                // the UPDATE hits). No collision possible against THIS
+                // db_user; loop to check against OTHER db_users.
+                continue;
+            }
+            if yu.access_key_id == db_user.access_key_id {
                 return Err(format!(
-                    "user '{}' in YAML would conflict on access_key_id with existing DB user '{}' \
-                     (which YAML would delete); rename one of them or remove the old user first",
+                    "user '{}' in YAML collides on access_key_id with existing DB user '{}'. \
+                     SQLite UNIQUE(access_key_id) would reject the reconcile mid-transaction; \
+                     fix by renaming one of the users or assigning distinct access keys.",
                     yu.name, db_user.name
                 ));
             }
@@ -392,18 +436,26 @@ pub fn diff_iam(yaml: &DeclarativeIam, db: &CurrentIam) -> Result<IamDiff, Strin
         }
     }
 
-    // ── Mapping rules: wipe-and-rebuild ──
+    // ── Mapping rules: wipe-and-rebuild, modelled as a tri-state ──
     //
-    // Rules have no operator-authored stable identity (no name).
-    // Comparing YAML-set to DB-set by field-tuple would give us a
-    // "smart diff" but buys nothing: if any field changes it's
-    // effectively delete+insert. Replace-all is simpler and
-    // identical in observable effect. Skip the replace when the two
-    // sets already match field-for-field — preserves idempotency of
-    // the diff.
-    if !mapping_rules_equal(&yaml.mapping_rules, &db.mapping_rules, db) {
-        diff.mapping_rules_to_replace = yaml.mapping_rules.clone();
-    }
+    // Three non-overlapping cases:
+    //   1. YAML matches DB exactly → Keep (no table writes).
+    //   2. YAML empty, DB non-empty → ClearAll (delete, no re-insert).
+    //   3. YAML differs from DB (including YAML non-empty, DB empty)
+    //      → ReplaceWith (delete + re-insert from YAML).
+    //
+    // The enum form avoids the correctness-x-ray C1 bug where a
+    // `Vec` + "fire clear if the vec is empty but DB has rules"
+    // helper wiped mapping rules on every idempotent re-apply of a
+    // non-empty rule set (helper couldn't distinguish "YAML matches
+    // non-empty DB, stay put" from "YAML is empty, wipe DB").
+    diff.mapping_rules = if mapping_rules_equal(&yaml.mapping_rules, &db.mapping_rules, db) {
+        MappingRulesAction::Keep
+    } else if yaml.mapping_rules.is_empty() {
+        MappingRulesAction::ClearAll
+    } else {
+        MappingRulesAction::ReplaceWith(yaml.mapping_rules.clone())
+    };
 
     Ok(diff)
 }
@@ -466,8 +518,18 @@ fn permissions_equal(a: &[Permission], b: &[Permission]) -> bool {
     // Compare by JSON canonicalisation — tolerates field-order
     // differences in `conditions` (serde_json::Value equality
     // handles that natively) and ignores the `id` field (ephemeral).
+    //
+    // H1 regression: normalize BOTH sides before comparing.
+    // `replace_{user,group}_permissions` normalizes on insert (so the
+    // DB holds canonical `"Allow"`/`"Deny"`), but YAML that uses the
+    // AWS-IAM-style lowercase `"allow"` stays uncanonicalized on the
+    // diff side. Without pre-normalization the diff would report
+    // "changed" every apply → perpetual audit churn + non-idempotent
+    // reconcile even when operator intent is stable.
     let norm = |ps: &[Permission]| -> Vec<serde_json::Value> {
-        let mut out: Vec<serde_json::Value> = ps
+        let mut canon = ps.to_vec();
+        normalize_permissions(&mut canon);
+        let mut out: Vec<serde_json::Value> = canon
             .iter()
             .map(|p| {
                 // Strip `id` so DB-loaded permissions with autogen
@@ -567,6 +629,67 @@ pub struct ReconcileStats {
     pub providers_updated: Vec<String>,
     pub providers_deleted: Vec<String>,
     pub mapping_rules_replaced: usize,
+}
+
+impl ReconcileStats {
+    /// Per-entity audit entries the caller should emit. Each tuple is
+    /// `(audit_action, &names)` — the caller walks the list and calls
+    /// `audit_log(action, "declarative", name, …)`. Centralising the
+    /// tag→name-list mapping here means `apply_config_transition`
+    /// doesn't have a 10-block copy-paste and a future stat field
+    /// (e.g. `external_identities_culled`) only needs a new entry
+    /// here.
+    pub fn audit_entries(&self) -> Vec<(&'static str, &Vec<String>)> {
+        vec![
+            ("iam_reconcile_group_create", &self.groups_created),
+            ("iam_reconcile_group_update", &self.groups_updated),
+            ("iam_reconcile_group_delete", &self.groups_deleted),
+            ("iam_reconcile_provider_create", &self.providers_created),
+            ("iam_reconcile_provider_update", &self.providers_updated),
+            ("iam_reconcile_provider_delete", &self.providers_deleted),
+            ("iam_reconcile_user_create", &self.users_created),
+            ("iam_reconcile_user_update", &self.users_updated),
+            ("iam_reconcile_user_delete", &self.users_deleted),
+        ]
+    }
+
+    /// Total count of name-level changes. Excludes `mapping_rules_replaced`
+    /// because mapping rules are a replace-semantic count, not a per-name list.
+    pub fn total_named_changes(&self) -> usize {
+        self.users_created.len()
+            + self.users_updated.len()
+            + self.users_deleted.len()
+            + self.groups_created.len()
+            + self.groups_updated.len()
+            + self.groups_deleted.len()
+            + self.providers_created.len()
+            + self.providers_updated.len()
+            + self.providers_deleted.len()
+    }
+
+    /// True when the reconcile made zero changes (pure idempotent apply).
+    pub fn is_noop(&self) -> bool {
+        self.total_named_changes() == 0 && self.mapping_rules_replaced == 0
+    }
+
+    /// Human-readable one-liner for the log / apply-response warning.
+    /// Centralises the format so the tracing::info! and the warning
+    /// string can't drift.
+    pub fn summary_line(&self) -> String {
+        format!(
+            "users(+{}/~{}/-{}) groups(+{}/~{}/-{}) providers(+{}/~{}/-{}) mapping_rules={}",
+            self.users_created.len(),
+            self.users_updated.len(),
+            self.users_deleted.len(),
+            self.groups_created.len(),
+            self.groups_updated.len(),
+            self.groups_deleted.len(),
+            self.providers_created.len(),
+            self.providers_updated.len(),
+            self.providers_deleted.len(),
+            self.mapping_rules_replaced,
+        )
+    }
 }
 
 /// Build the `DeclarativeIam` snapshot from `AccessSection` fields.
@@ -930,5 +1053,185 @@ mod tests {
         let diff = diff_iam(&yaml, &current).unwrap();
         assert_eq!(diff.users_to_update.len(), 1);
         assert_eq!(diff.users_to_update[0].0, 1);
+    }
+
+    // ───── C1 regression: mapping_rules tri-state ─────────────────────
+
+    fn db_rule(id: i64, provider_id: Option<i64>, group_id: i64, value: &str) -> GroupMappingRule {
+        GroupMappingRule {
+            id,
+            provider_id,
+            priority: 10,
+            match_type: "email_domain".into(),
+            match_field: "email".into(),
+            match_value: value.into(),
+            group_id,
+            created_at: String::new(),
+        }
+    }
+
+    fn yaml_rule(provider: Option<&str>, group: &str, value: &str) -> DeclarativeMappingRule {
+        DeclarativeMappingRule {
+            provider: provider.map(str::to_string),
+            priority: 10,
+            match_type: "email_domain".into(),
+            match_field: "email".into(),
+            match_value: value.into(),
+            group: group.into(),
+        }
+    }
+
+    #[test]
+    fn mapping_rules_idempotent_reapply_keeps_diff_noop() {
+        // C1 regression: re-applying identical YAML with non-empty
+        // mapping rules must NOT trigger a wipe. Before the enum fix,
+        // `mapping_rules_to_replace` stayed empty on equality (correct)
+        // and a helper then concluded "wipe DB because vec is empty
+        // AND DB has rules" (WRONG — wiped every idempotent re-apply).
+        let yaml = DeclarativeIam {
+            groups: vec![yg("admins")],
+            mapping_rules: vec![yaml_rule(None, "admins", "corp.example")],
+            ..Default::default()
+        };
+        let current = CurrentIam {
+            groups: vec![db_group(7, "admins")],
+            mapping_rules: vec![db_rule(1, None, 7, "corp.example")],
+            ..empty_db()
+        };
+        let diff = diff_iam(&yaml, &current).unwrap();
+        assert_eq!(
+            diff.mapping_rules,
+            MappingRulesAction::Keep,
+            "idempotent reapply must NOT clear or replace mapping rules"
+        );
+        assert!(diff.is_empty(), "idempotent diff must report is_empty()");
+    }
+
+    #[test]
+    fn mapping_rules_yaml_empty_db_has_some_clears_all() {
+        let yaml = DeclarativeIam {
+            groups: vec![yg("admins")],
+            mapping_rules: vec![], // explicit empty
+            ..Default::default()
+        };
+        let current = CurrentIam {
+            groups: vec![db_group(7, "admins")],
+            mapping_rules: vec![db_rule(1, None, 7, "old.example")],
+            ..empty_db()
+        };
+        let diff = diff_iam(&yaml, &current).unwrap();
+        assert_eq!(
+            diff.mapping_rules,
+            MappingRulesAction::ClearAll,
+            "YAML empty + DB non-empty must explicitly ClearAll"
+        );
+    }
+
+    #[test]
+    fn mapping_rules_yaml_differs_from_db_replaces() {
+        let yaml = DeclarativeIam {
+            groups: vec![yg("admins")],
+            mapping_rules: vec![yaml_rule(None, "admins", "new.example")],
+            ..Default::default()
+        };
+        let current = CurrentIam {
+            groups: vec![db_group(7, "admins")],
+            mapping_rules: vec![db_rule(1, None, 7, "old.example")],
+            ..empty_db()
+        };
+        let diff = diff_iam(&yaml, &current).unwrap();
+        match &diff.mapping_rules {
+            MappingRulesAction::ReplaceWith(rules) => {
+                assert_eq!(rules.len(), 1);
+                assert_eq!(rules[0].match_value, "new.example");
+            }
+            other => panic!("expected ReplaceWith, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mapping_rules_both_empty_is_keep_not_clear() {
+        // Sanity: YAML empty AND DB empty must be Keep (idempotent),
+        // not ClearAll (which would still DELETE over an empty table).
+        let yaml = DeclarativeIam {
+            mapping_rules: vec![],
+            ..Default::default()
+        };
+        let current = empty_db();
+        let diff = diff_iam(&yaml, &current).unwrap();
+        assert_eq!(diff.mapping_rules, MappingRulesAction::Keep);
+    }
+
+    // ───── H1 regression: case-insensitive perm effect ─────────────────
+
+    #[test]
+    fn diff_user_permissions_lowercase_effect_is_idempotent() {
+        // H1 regression: YAML authored with `effect: "allow"` must
+        // not mark the user as changed on every apply. The DB
+        // normalizes on insert, so `permissions_equal` has to
+        // normalize both sides before comparing.
+        let lowercase_perm = Permission {
+            id: 0,
+            effect: "allow".into(),
+            actions: vec!["read".into()],
+            resources: vec!["*".into()],
+            conditions: None,
+        };
+        let canonical_perm = Permission {
+            effect: "Allow".into(),
+            ..lowercase_perm.clone()
+        };
+        let yaml = DeclarativeIam {
+            users: vec![DeclarativeUser {
+                permissions: vec![lowercase_perm],
+                ..yu("alice", "K1")
+            }],
+            ..Default::default()
+        };
+        let current = CurrentIam {
+            users: vec![IamUser {
+                permissions: vec![canonical_perm],
+                ..db_user(1, "alice", "K1")
+            }],
+            ..empty_db()
+        };
+        let diff = diff_iam(&yaml, &current).unwrap();
+        assert!(
+            diff.users_to_update.is_empty(),
+            "`allow` vs `Allow` is not a semantic change; diff must be empty. \
+             Got users_to_update = {:?}",
+            diff.users_to_update
+        );
+    }
+
+    // ───── M1 regression: access-key swap between surviving users ─────
+
+    #[test]
+    fn diff_rejects_access_key_swap_between_surviving_users() {
+        // M1: YAML swaps access_keys between two users who both exist
+        // in DB. Under diff-by-name, both are UPDATE candidates; the
+        // first UPDATE would then violate UNIQUE(access_key_id) with
+        // the other user's still-held key. Validation must catch it
+        // BEFORE the transaction so the operator gets a clear error.
+        let yaml = DeclarativeIam {
+            users: vec![
+                yu("alice", "K_BOB"), // alice grabs bob's key
+                yu("bob", "K_ALICE"), // bob grabs alice's key
+            ],
+            ..Default::default()
+        };
+        let current = CurrentIam {
+            users: vec![db_user(1, "alice", "K_ALICE"), db_user(2, "bob", "K_BOB")],
+            ..empty_db()
+        };
+        let err = diff_iam(&yaml, &current).unwrap_err();
+        assert!(
+            err.contains("collides") || err.contains("conflict") || err.contains("UNIQUE"),
+            "swap must be caught at validation, got: {err}"
+        );
+        assert!(
+            err.contains("alice") && err.contains("bob"),
+            "error must cite both conflicting user names, got: {err}"
+        );
     }
 }
