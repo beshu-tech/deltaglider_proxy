@@ -131,6 +131,20 @@ Legacy JSON-only import path is still supported for pre-v0.8.4 scripts.
 | `GET` | `/_/api/admin/audit[?limit=N]` | Snapshot of the in-memory audit ring, newest first. Bounded (default 500, override `DGP_AUDIT_RING_SIZE`). Stdout `tracing::info!` is still the long-term audit source. |
 | `GET` / `PUT` / `DELETE` | `/_/api/admin/session/s3-credentials` | Per-session S3 credential store for the browse panel |
 
+## Replication
+
+Lazy bucket replication via the engine. Rules are YAML-authoritative
+under `storage.replication.rules[]`; runtime state lives in the
+config DB. See [replication.md](replication.md) for the full shape.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/_/api/admin/replication` | Rules + current state overview |
+| `POST` | `/_/api/admin/replication/rules/:name/run-now` | Synchronous run. 409 on a paused rule. |
+| `POST` | `/_/api/admin/replication/rules/:name/pause` / `/resume` | Operator pause controls (persisted across restarts). |
+| `GET` | `/_/api/admin/replication/rules/:name/history?limit=N` | Recent run records, newest first. |
+| `GET` | `/_/api/admin/replication/rules/:name/failures?limit=N` | Recent per-object failures, newest first. |
+
 ## Resource limits (env vars)
 
 | Variable | Default | Purpose |

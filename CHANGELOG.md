@@ -2,6 +2,77 @@
 
 ## Unreleased
 
+### Lazy bucket replication (v1: run-now via admin API)
+
+First cut of scheduled source→destination replication. Built around
+the invariant that all copies route through `engine.retrieve` →
+`engine.store`, so replication is transparent to per-backend
+encryption and delta compression. Operators author rules in YAML
+(`storage.replication.rules[]`); runtime state (progress, history,
+failures) lives in the config DB.
+
+Scope of this commit stream:
+
+- **Config shape**: new `ReplicationConfig` / `ReplicationRule` /
+  `ReplicationEndpoint` / `ConflictPolicy` types with full YAML
+  round-trip. Static validation (rule-name regex, humantime
+  interval parsing, minimum intervals, batch-size bounds, glob
+  compilation) + multi-hop cycle detection in `Config::check`.
+- **Pure planner**: `rewrite_key` + `should_replicate` + `plan_batch`
+  in `src/replication/planner.rs` — I/O-free, heavily unit-tested
+  (15 tests covering the conflict matrix, glob filtering, DG-internal
+  skip, directory-marker skip).
+- **Persistent state** (`ConfigDb` schema v6): new
+  `replication_state` / `replication_run_history` /
+  `replication_failures` tables. Boot-time `reconcile_on_boot`
+  sweeps zombie `status='running'` rows from a prior crashed
+  process. Rules removed from YAML CASCADE-delete their history.
+- **Worker**: `src/replication/worker.rs::run_rule` — executes one
+  pass of a single rule. Takes `Arc<Mutex<ConfigDb>>` and
+  reacquires the lock at each sync boundary so the handler future
+  stays `Send` (rusqlite's `Connection` is `!Sync`).
+- **Admin API** (session-gated, not IAM-gated):
+    - `GET  /_/api/admin/replication` — overview of all rules + state
+    - `POST /_/api/admin/replication/rules/:name/run-now` — trigger
+      a synchronous run; returns 409 Conflict on a paused rule
+    - `POST /_/api/admin/replication/rules/:name/pause` + `/resume`
+    - `GET  /_/api/admin/replication/rules/:name/history?limit=N`
+    - `GET  /_/api/admin/replication/rules/:name/failures?limit=N`
+
+YAML shape:
+
+```yaml
+storage:
+  replication:
+    enabled: true
+    tick_interval: "30s"
+    max_failures_retained: 100
+    rules:
+      - name: prod-to-backup
+        enabled: true
+        source: { bucket: prod-artifacts, prefix: "" }
+        destination: { bucket: backup-artifacts, prefix: "" }
+        interval: "15m"
+        batch_size: 100
+        replicate_deletes: false        # default
+        conflict: newer-wins            # newer-wins | source-wins | skip-if-dest-exists
+        include_globs: []
+        exclude_globs: [".dg/*"]
+```
+
+**Scope deferred to a later commit stream:**
+- Background scheduler loop (today, only `run-now` triggers the
+  worker). Periodic ticks, continuation-token resumption of long
+  runs, graceful shutdown are planned but not yet wired.
+- Delete replication (`replicate_deletes: true` is validated but
+  not implemented by the worker).
+- Multi-hop copies or the admin UI panel.
+
+Dependency added: `humantime = "2"`.
+
+Tests: 15 unit (planner) + 8 unit (state_store) + 2 unit (worker)
++ 2 integration (end-to-end via spawned proxy). Clippy clean.
+
 ### Second-wave correctness fixes (H1/H2 + M1–M4 + L1)
 
 Seven additional findings from a follow-up review of the multipart,
