@@ -163,6 +163,21 @@ impl FilesystemBackend {
         Ok(())
     }
 
+    /// Reject a write if the bucket root does NOT already exist. Prevents
+    /// implicit bucket creation via PUT — the classic C2 security bug where
+    /// `ensure_dir` + `create_dir_all` silently created `/<root>/<bucket>`
+    /// as a side effect of any PUT. Callers: every `put_*` entry point.
+    ///
+    /// Handler-level `ensure_bucket_exists` (in `api::handlers::object_helpers`)
+    /// catches the common case with a clean HTTP error; this guard is belt-
+    /// and-braces for any future internal caller that forgets the precheck.
+    async fn require_bucket_exists(&self, bucket: &str) -> Result<(), StorageError> {
+        if !is_dir(&self.bucket_dir(bucket)).await {
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+        Ok(())
+    }
+
     /// Calculate total size of a directory recursively
     async fn dir_size(&self, path: &Path) -> Result<u64, StorageError> {
         let mut total = 0;
@@ -451,6 +466,7 @@ impl StorageBackend for FilesystemBackend {
         data: &[u8],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
+        self.require_bucket_exists(bucket).await?;
         self.put_object_file(
             &self.reference_path(bucket, prefix),
             data,
@@ -469,6 +485,7 @@ impl StorageBackend for FilesystemBackend {
         prefix: &str,
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
+        self.require_bucket_exists(bucket).await?;
         xattr_meta::write_metadata(&self.reference_path(bucket, prefix), metadata).await
     }
 
@@ -531,6 +548,7 @@ impl StorageBackend for FilesystemBackend {
         data: &[u8],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
+        self.require_bucket_exists(bucket).await?;
         self.put_object_file(
             &self.delta_path(bucket, prefix, filename),
             data,
@@ -603,6 +621,7 @@ impl StorageBackend for FilesystemBackend {
         data: &[u8],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
+        self.require_bucket_exists(bucket).await?;
         self.put_object_file(
             &self.passthrough_path(bucket, prefix, filename),
             data,
@@ -660,6 +679,7 @@ impl StorageBackend for FilesystemBackend {
         chunks: &[Bytes],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
+        self.require_bucket_exists(bucket).await?;
         let data_path = self.passthrough_path(bucket, prefix, filename);
 
         self.ensure_dir(&data_path).await?;
@@ -1062,5 +1082,153 @@ impl StorageBackend for FilesystemBackend {
             is_truncated: page.is_truncated,
             next_continuation_token: page.next_continuation_token,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the filesystem backend guards that don't need a
+    //! running proxy. Integration tests live in
+    //! `tests/bucket_existence_test.rs`.
+    use super::*;
+    use crate::types::FileMetadata;
+
+    /// Build a minimal FileMetadata for testing the put_* paths. The
+    /// content is never read because put_* should fail before touching it.
+    fn dummy_metadata(filename: &str) -> FileMetadata {
+        FileMetadata::new_passthrough(
+            filename.to_string(),
+            "0".repeat(64),     // sha256 hex
+            "0".repeat(32),     // md5 hex
+            0,
+            None,
+        )
+    }
+
+    /// Direct StorageBackend test: put_passthrough to a missing bucket
+    /// must fail with BucketNotFound, NOT silently create a bucket root.
+    #[tokio::test]
+    async fn test_require_bucket_exists_rejects_put_passthrough() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .expect("new backend");
+
+        // Attempt to write without ever calling create_bucket.
+        let err = backend
+            .put_passthrough(
+                "missing-bucket",
+                "prefix",
+                "file.bin",
+                b"payload",
+                &dummy_metadata("file.bin"),
+            )
+            .await
+            .expect_err("must refuse");
+
+        match err {
+            StorageError::BucketNotFound(b) => assert_eq!(b, "missing-bucket"),
+            other => panic!("expected BucketNotFound, got {:?}", other),
+        }
+
+        // The bucket directory must NOT have been created.
+        assert!(
+            !tmp.path().join("missing-bucket").exists(),
+            "put_passthrough must not create the bucket root on failure"
+        );
+    }
+
+    /// Same guard covers put_delta.
+    #[tokio::test]
+    async fn test_require_bucket_exists_rejects_put_delta() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .expect("new backend");
+
+        let err = backend
+            .put_delta(
+                "ghost",
+                "ns",
+                "f.delta",
+                b"x",
+                &dummy_metadata("f.delta"),
+            )
+            .await
+            .expect_err("must refuse");
+
+        assert!(matches!(err, StorageError::BucketNotFound(_)));
+        assert!(!tmp.path().join("ghost").exists());
+    }
+
+    /// Same guard covers put_reference.
+    #[tokio::test]
+    async fn test_require_bucket_exists_rejects_put_reference() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .expect("new backend");
+
+        let err = backend
+            .put_reference("ghost", "ns", b"ref", &dummy_metadata("reference.bin"))
+            .await
+            .expect_err("must refuse");
+
+        assert!(matches!(err, StorageError::BucketNotFound(_)));
+        assert!(!tmp.path().join("ghost").exists());
+    }
+
+    /// Same guard covers put_passthrough_chunked.
+    #[tokio::test]
+    async fn test_require_bucket_exists_rejects_put_passthrough_chunked() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .expect("new backend");
+
+        let chunks = vec![Bytes::from_static(b"hello"), Bytes::from_static(b"world")];
+        let err = backend
+            .put_passthrough_chunked(
+                "ghost",
+                "ns",
+                "chunky.bin",
+                &chunks,
+                &dummy_metadata("chunky.bin"),
+            )
+            .await
+            .expect_err("must refuse");
+
+        assert!(matches!(err, StorageError::BucketNotFound(_)));
+        assert!(!tmp.path().join("ghost").exists());
+    }
+
+    /// After create_bucket, put_passthrough should succeed.
+    #[tokio::test]
+    async fn test_put_after_create_bucket_succeeds() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .expect("new backend");
+
+        backend.create_bucket("real-bucket").await.expect("create");
+
+        backend
+            .put_passthrough(
+                "real-bucket",
+                "",
+                "file.bin",
+                b"payload",
+                &dummy_metadata("file.bin"),
+            )
+            .await
+            .expect("put after create should succeed");
+
+        // File is under deltaspaces/ inside the bucket dir.
+        assert!(tmp
+            .path()
+            .join("real-bucket")
+            .join("deltaspaces")
+            .join("file.bin")
+            .exists());
     }
 }

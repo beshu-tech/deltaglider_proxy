@@ -125,6 +125,39 @@ pub(super) fn check_quota(
 }
 
 // ---------------------------------------------------------------------------
+// Bucket existence precheck (shared by PUT, COPY, multipart Complete)
+// ---------------------------------------------------------------------------
+
+/// Verify that `bucket` exists on the storage backend BEFORE any write path
+/// is allowed to proceed. This closes a silent-bucket-creation bug on the
+/// filesystem backend (C2 from security audit): `ensure_dir` at
+/// `src/storage/filesystem.rs::ensure_dir` calls `create_dir_all(parent)`,
+/// which quietly creates the bucket root directory as a side effect of the
+/// first PUT. That bypasses `s3:CreateBucket`-equivalent authorization and
+/// diverges from the S3 backend (which rejects with `NoSuchBucket`).
+///
+/// This precheck + the belt-and-braces guard in `FilesystemBackend::put_*`
+/// (which refuses to write when the bucket root is missing) together
+/// produce a consistent cross-backend contract: writes to a non-existent
+/// bucket always return `NoSuchBucket`, never implicitly create.
+pub(super) async fn ensure_bucket_exists(
+    state: &Arc<AppState>,
+    bucket: &str,
+) -> Result<(), S3Error> {
+    let engine = state.engine.load();
+    match engine.head_bucket(bucket).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(S3Error::NoSuchBucket(bucket.to_string())),
+        Err(e) => {
+            // Map engine errors through the existing conversion so e.g. a
+            // missing underlying backend still surfaces as a meaningful
+            // error instead of a mysterious 500.
+            Err(S3Error::from(e))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PUT / COPY internals
 // ---------------------------------------------------------------------------
 
@@ -141,6 +174,10 @@ pub(super) async fn put_object_inner(
     info!("PUT {}/{} ({} bytes)", bucket, key, body.len());
 
     validate_content_md5(headers, body)?;
+
+    // Bucket must exist before any write path touches the backend. See
+    // `ensure_bucket_exists` for the full rationale (C2 security fix).
+    ensure_bucket_exists(state, bucket).await?;
 
     // S3 directory marker: zero-byte object with trailing slash (e.g. "folder/")
     // Used by Cyberduck, AWS Console, etc. to create "folders".
@@ -215,6 +252,15 @@ pub(super) async fn copy_object_inner(
         "COPY {}/{} -> {}/{}",
         source_bucket, source_key, bucket, key
     );
+
+    // Both source and destination buckets must exist. The source check
+    // converts the head miss below into `NoSuchBucket` via the engine's
+    // error mapping; the destination check is explicit here because we
+    // haven't touched it yet and `ensure_dir` on the filesystem backend
+    // would silently create it (C2 security fix). See
+    // `ensure_bucket_exists` doc comment for background.
+    ensure_bucket_exists(state, &source_bucket).await?;
+    ensure_bucket_exists(state, bucket).await?;
 
     // Load engine once for the entire copy operation to ensure consistency.
     let engine = state.engine.load();
