@@ -343,9 +343,12 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
           <SectionHeader
             icon={<DatabaseOutlined />}
             title="Storage Backends"
-            description={backends.length === 0
-              ? 'No named backends. Using legacy single-backend mode.'
-              : `${backends.length} backend${backends.length !== 1 ? 's' : ''} configured.`
+            description={
+              backends.length === 0
+                ? 'No backend configured.'
+                : backends.every((b) => b.is_synthesized)
+                  ? 'Running on the legacy singleton backend (shown below). Add a named backend to migrate to the multi-backend shape; the singleton stays active until you clear `storage.backend` in YAML.'
+                  : `${backends.length} backend${backends.length !== 1 ? 's' : ''} configured.`
             }
           />
 
@@ -365,6 +368,14 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                   {b.name === defaultBackend && (
                     <span style={{ fontSize: 10, color: colors.ACCENT_BLUE, marginLeft: 8, fontWeight: 600 }}>DEFAULT</span>
                   )}
+                  {b.is_synthesized && (
+                    <span
+                      style={{ fontSize: 10, color: colors.ACCENT_AMBER, marginLeft: 8, fontWeight: 600 }}
+                      title="Virtual projection of the legacy singleton `storage.backend` in YAML. Not a real named backend; cannot be deleted. Add a named backend to migrate."
+                    >
+                      LEGACY SINGLETON
+                    </span>
+                  )}
                   <div style={{ fontSize: 12, color: colors.TEXT_MUTED, fontFamily: 'var(--font-mono)' }}>
                     {b.backend_type === 'filesystem'
                       ? `filesystem: ${b.path}`
@@ -374,7 +385,9 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                 {b.backend_type === 's3' && (
                   <Button size="small" icon={<ApiOutlined />} loading={testingBackend === b.name} onClick={() => handleTestConnection(b)} title="Test connection" />
                 )}
-                <Button size="small" icon={<DeleteOutlined />} danger onClick={() => handleDelete(b.name)} title="Remove backend" />
+                {!b.is_synthesized && (
+                  <Button size="small" icon={<DeleteOutlined />} danger onClick={() => handleDelete(b.name)} title="Remove backend" />
+                )}
               </div>
               {testResult?.name === b.name && (
                 <Alert type={testResult.ok ? 'success' : 'error'} message={testResult.message} showIcon style={{ marginTop: 8, borderRadius: 6 }} />

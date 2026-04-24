@@ -197,6 +197,17 @@ pub struct BackendInfoResponse {
     pub has_credentials: bool,
     /// Per-backend encryption status. Step 6.
     pub encryption: BackendEncryptionSummary,
+    /// `true` when this entry was synthesised from the legacy
+    /// singleton `cfg.backend` (the "no named backends — using legacy
+    /// single-backend mode" config shape). The UI renders these as
+    /// non-deletable: they don't exist in `cfg.backends[]` so a DELETE
+    /// would 404, and the only way to "remove" the singleton is to
+    /// add a named backend alongside it.
+    ///
+    /// Always `false` for entries that come from `cfg.backends[]`.
+    /// Omitted when `false` to keep the payload compact.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_synthesized: bool,
 }
 
 impl From<&crate::config::NamedBackendConfig> for BackendInfoResponse {
@@ -212,6 +223,7 @@ impl From<&crate::config::NamedBackendConfig> for BackendInfoResponse {
                 force_path_style: None,
                 has_credentials: false,
                 encryption,
+                is_synthesized: false,
             },
             crate::config::BackendConfig::S3 {
                 endpoint,
@@ -228,8 +240,27 @@ impl From<&crate::config::NamedBackendConfig> for BackendInfoResponse {
                 force_path_style: Some(*force_path_style),
                 has_credentials: access_key_id.is_some(),
                 encryption,
+                is_synthesized: false,
             },
         }
+    }
+}
+
+impl BackendInfoResponse {
+    /// Build the synthesised `"default"` entry that represents
+    /// `cfg.backend` when `cfg.backends[]` is empty. Used by the
+    /// admin API so both `GET /config` and `GET /backends` surface
+    /// the operator's working backend regardless of which YAML shape
+    /// was used (legacy singleton `backend:` vs named-list `backends:`).
+    pub(crate) fn synthesized_default(cfg: &crate::config::Config) -> Self {
+        let named = crate::config::NamedBackendConfig {
+            name: "default".into(),
+            backend: cfg.backend.clone(),
+            encryption: cfg.backend_encryption.clone(),
+        };
+        let mut out: Self = (&named).into();
+        out.is_synthesized = true;
+        out
     }
 }
 
@@ -451,16 +482,10 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
     // so the UI's per-backend rendering works uniformly across both
     // configurations. Step 7 consumes this.
     let backends_info: Vec<BackendInfoResponse> = if cfg.backends.is_empty() {
-        // Singleton path. Build a synthesised NamedBackendConfig so
-        // the `From<&NamedBackendConfig>` impl does the heavy lifting;
-        // this keeps the non-secret projection logic in ONE place.
-        vec![BackendInfoResponse::from(
-            &crate::config::NamedBackendConfig {
-                name: "default".into(),
-                backend: cfg.backend.clone(),
-                encryption: cfg.backend_encryption.clone(),
-            },
-        )]
+        // Singleton path — synthesise a "default" entry via the
+        // shared helper so the Backends panel and `GET /config`
+        // surface the operator's working backend uniformly.
+        vec![BackendInfoResponse::synthesized_default(&cfg)]
     } else {
         cfg.backends.iter().map(BackendInfoResponse::from).collect()
     };
@@ -821,4 +846,67 @@ fn apply_backend_patch(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{BackendConfig, Config};
+
+    #[test]
+    fn synthesized_default_flags_and_projects_singleton() {
+        // Regression for the Backends-panel "No named backends"
+        // inconsistency: when the operator runs with the legacy
+        // singleton `storage.backend` and NO named list, the admin
+        // API must still surface the backend so the UI can show
+        // what's actually serving traffic.
+        let cfg = Config {
+            backend: BackendConfig::S3 {
+                endpoint: Some("https://fsn1.your-objectstorage.com".into()),
+                region: "fsn1".into(),
+                force_path_style: true,
+                access_key_id: Some("AKIA_OP".into()),
+                secret_access_key: Some("sk-op".into()),
+            },
+            backends: Vec::new(),
+            ..Config::default()
+        };
+
+        let info = BackendInfoResponse::synthesized_default(&cfg);
+        assert_eq!(info.name, "default");
+        assert_eq!(info.backend_type, "s3");
+        assert_eq!(
+            info.endpoint.as_deref(),
+            Some("https://fsn1.your-objectstorage.com")
+        );
+        assert_eq!(info.region.as_deref(), Some("fsn1"));
+        assert!(
+            info.has_credentials,
+            "credentials on the singleton must surface as has_credentials=true"
+        );
+        assert!(info.is_synthesized, "synthesized flag must be true");
+    }
+
+    #[test]
+    fn real_named_backend_has_is_synthesized_false() {
+        // Sanity: entries coming from `cfg.backends[]` via the
+        // existing `From` impl must carry the flag FALSE (not
+        // omitted-because-None, actually false). This pins the
+        // default so a future refactor doesn't accidentally flip
+        // every backend to synthesized: true.
+        let named = crate::config::NamedBackendConfig {
+            name: "hetzner".into(),
+            backend: BackendConfig::S3 {
+                endpoint: Some("https://example".into()),
+                region: "fsn1".into(),
+                force_path_style: true,
+                access_key_id: None,
+                secret_access_key: None,
+            },
+            encryption: crate::config::BackendEncryptionConfig::default(),
+        };
+        let info: BackendInfoResponse = (&named).into();
+        assert_eq!(info.name, "hetzner");
+        assert!(!info.is_synthesized);
+    }
 }

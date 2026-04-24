@@ -185,6 +185,21 @@ export interface BackendInfo {
    * across both YAML shapes.
    */
   encryption: BackendEncryptionSummary;
+  /**
+   * True when this entry was synthesised from the legacy singleton
+   * `cfg.backend`. The server surfaces it so the Backends panel
+   * doesn't claim "no named backends" while the proxy is actively
+   * serving from the singleton. UI must:
+   *   - disable Delete (no DB row to remove; the server returns 409
+   *     on a DELETE of a synthesised name).
+   *   - disable Encryption-mode changes that rely on a named target
+   *     (mode transitions on the singleton still work, but the
+   *     cleanest path is to migrate off the singleton first — add
+   *     a named backend alongside, then clear `storage.backend`).
+   *   - render a badge so operators understand what they're seeing.
+   * Omitted in the response when false.
+   */
+  is_synthesized?: boolean;
 }
 
 export async function getAdminConfig(): Promise<AdminConfig | null> {

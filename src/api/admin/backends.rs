@@ -73,13 +73,30 @@ fn build_backend_config(req: &CreateBackendRequest) -> Result<BackendConfig, Str
 }
 
 /// GET /api/admin/backends — list all named backends.
+///
+/// When `cfg.backends` is empty but `cfg.backend` holds a configured
+/// singleton, we synthesise a `"default"` entry (`is_synthesized:
+/// true`) so the admin UI's Backends panel reflects the operator's
+/// working backend regardless of whether their YAML uses the legacy
+/// singleton `backend:` shape or the named-list `backends:` shape.
+///
+/// Without this synthesis the panel shows "no named backends" while
+/// the proxy is happily serving from the configured singleton — an
+/// inconsistency operators have reported as a phantom "where did my
+/// backend go?" moment. The same synthesis also lives in
+/// `GET /config`'s `backends[]` projection; both endpoints now agree.
 pub async fn list_backends(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
     let cfg = state.config.read().await;
-    let backends = cfg
-        .backends
-        .iter()
-        .map(super::config::BackendInfoResponse::from)
-        .collect();
+    let backends: Vec<super::config::BackendInfoResponse> = if cfg.backends.is_empty() {
+        vec![super::config::BackendInfoResponse::synthesized_default(
+            &cfg,
+        )]
+    } else {
+        cfg.backends
+            .iter()
+            .map(super::config::BackendInfoResponse::from)
+            .collect()
+    };
 
     Json(BackendListResponse {
         backends,
@@ -201,6 +218,27 @@ pub async fn delete_backend(
     Path(name): Path<String>,
 ) -> impl IntoResponse {
     let mut cfg = state.config.write().await;
+
+    // Guard: the synthesised "default" entry surfaced by list_backends
+    // when `cfg.backends` is empty is NOT a real named backend — it's
+    // a virtual projection of `cfg.backend`. A DELETE on it would
+    // otherwise fall into the generic "not found" branch below with
+    // a misleading error; surface the specific shape issue instead.
+    if name == "default" && cfg.backends.iter().all(|b| b.name != name) {
+        return (
+            axum::http::StatusCode::CONFLICT,
+            Json(BackendMutationResponse {
+                success: false,
+                error: Some(
+                    "Cannot delete the synthesised 'default' backend — it represents the legacy \
+                     singleton `cfg.backend`. To move off the singleton, add a named backend \
+                     alongside it, then clear the singleton via section PUT on `storage`."
+                        .into(),
+                ),
+                requires_restart: false,
+            }),
+        );
+    }
 
     // Check if backend exists
     if !cfg.backends.iter().any(|b| b.name == name) {
