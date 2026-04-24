@@ -336,31 +336,56 @@ pub async fn delete_object(
         info!("DELETE recursive {}/{}*", bucket, key);
         let engine = state.engine.load();
 
-        // List all objects under the prefix
-        let page = engine
-            .list_objects(&bucket, &key, None, u32::MAX, None, false)
-            .await?;
+        // E1 fix: iterate pages of 1000 keys at a time instead of materialising
+        // the full listing with u32::MAX. A prefix with millions of keys used
+        // to balloon memory by ~300 B × key-count before a single delete ran.
+        // Page-level progress means interrupting mid-run leaves partial
+        // deletes — same semantics as AWS console's recursive delete.
+        const DELETE_PAGE_SIZE: u32 = 1000;
 
         let mut deleted = 0u32;
         let mut denied = 0u32;
-        for (obj_key, _meta) in &page.objects {
-            // Per-object IAM check (respects Deny rules on sub-prefixes)
-            if let Some(axum::Extension(ref user)) = auth_user {
-                if !user.can(S3Action::Delete, &bucket, obj_key) {
-                    denied += 1;
-                    continue;
-                }
-            }
-            match engine.delete(&bucket, obj_key).await {
-                Ok(()) => deleted += 1,
-                Err(e) => {
-                    let s3_err = S3Error::from(e);
-                    if matches!(s3_err, S3Error::NoSuchKey(_)) {
-                        deleted += 1; // Already gone
-                    } else {
-                        warn!("Failed to delete {}/{}: {}", bucket, obj_key, s3_err);
+        let mut next_token: Option<String> = None;
+
+        loop {
+            let page = engine
+                .list_objects(&bucket, &key, None, DELETE_PAGE_SIZE, next_token.as_deref(), false)
+                .await?;
+
+            for (obj_key, _meta) in &page.objects {
+                // Per-object IAM check (respects Deny rules on sub-prefixes)
+                if let Some(axum::Extension(ref user)) = auth_user {
+                    if !user.can(S3Action::Delete, &bucket, obj_key) {
+                        denied += 1;
+                        continue;
                     }
                 }
+                match engine.delete(&bucket, obj_key).await {
+                    Ok(()) => deleted += 1,
+                    Err(e) => {
+                        let s3_err = S3Error::from(e);
+                        if matches!(s3_err, S3Error::NoSuchKey(_)) {
+                            deleted += 1; // Already gone
+                        } else {
+                            warn!("Failed to delete {}/{}: {}", bucket, obj_key, s3_err);
+                        }
+                    }
+                }
+            }
+
+            if !page.is_truncated {
+                break;
+            }
+            // continuation_token is the ENGINE-LEVEL token. Feed it straight
+            // back without re-encoding (that's only for client-visible tokens).
+            next_token = page.next_continuation_token;
+            if next_token.is_none() {
+                // Defensive: truncated=true but no token → don't infinite-loop.
+                warn!(
+                    "Recursive delete: is_truncated=true but no continuation token at {}/{}*",
+                    bucket, key
+                );
+                break;
             }
         }
 
