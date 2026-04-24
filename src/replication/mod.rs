@@ -15,5 +15,9 @@
 //! store will follow in subsequent commits per the rollout plan.
 
 pub mod planner;
+pub mod state_store;
 
 pub use planner::{plan_batch, rewrite_key, should_replicate, BatchPlan, Decision};
+pub use state_store::{
+    current_unix_seconds, FailureRecord, ReplicationState, RunRecord, RunTotals,
+};

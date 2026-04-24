@@ -11,14 +11,19 @@ use tracing::{debug, info};
 
 /// Encrypted configuration database (SQLCipher).
 pub struct ConfigDb {
-    conn: Connection,
+    /// Raw SQLCipher connection. `pub(crate)` so sibling modules
+    /// (e.g. `crate::replication::state_store`) can add IN-TREE
+    /// extension methods via `impl ConfigDb` blocks without each
+    /// reaching for a dedicated getter. External crates cannot
+    /// depend on this — if that changes, gate behind an accessor.
+    pub(crate) conn: Connection,
     local_path: PathBuf,
     /// ETag from last S3 download (for change detection during polling)
     s3_etag: Option<String>,
 }
 
 /// Schema version — bump when adding migrations.
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 6;
 
 pub(crate) mod auth_providers;
 mod declarative;
@@ -224,6 +229,58 @@ impl ConfigDb {
             )?;
             info!(
                 "Migrated config DB schema from v{} to v5 (added external auth tables)",
+                version
+            );
+        }
+
+        if version < 6 {
+            // v6: Replication runtime state. Rules themselves live in
+            // YAML; only progress/history/failures land here.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS replication_state (
+                    rule_name               TEXT PRIMARY KEY,
+                    last_run_at             INTEGER,
+                    next_due_at             INTEGER NOT NULL,
+                    last_status             TEXT NOT NULL,
+                    objects_copied_lifetime INTEGER NOT NULL DEFAULT 0,
+                    bytes_copied_lifetime   INTEGER NOT NULL DEFAULT 0,
+                    paused                  INTEGER NOT NULL DEFAULT 0,
+                    continuation_token      TEXT,
+                    leader_instance_id      TEXT,
+                    leader_expires_at       INTEGER
+                );
+
+                CREATE TABLE IF NOT EXISTS replication_run_history (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    rule_name       TEXT NOT NULL,
+                    started_at      INTEGER NOT NULL,
+                    finished_at     INTEGER,
+                    objects_scanned INTEGER NOT NULL DEFAULT 0,
+                    objects_copied  INTEGER NOT NULL DEFAULT 0,
+                    objects_skipped INTEGER NOT NULL DEFAULT 0,
+                    objects_deleted INTEGER NOT NULL DEFAULT 0,
+                    bytes_copied    INTEGER NOT NULL DEFAULT 0,
+                    errors          INTEGER NOT NULL DEFAULT 0,
+                    status          TEXT NOT NULL,
+                    FOREIGN KEY (rule_name) REFERENCES replication_state(rule_name) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_run_history_rule
+                    ON replication_run_history(rule_name, started_at DESC);
+
+                CREATE TABLE IF NOT EXISTS replication_failures (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    rule_name     TEXT NOT NULL,
+                    occurred_at   INTEGER NOT NULL,
+                    source_key    TEXT NOT NULL,
+                    dest_key      TEXT NOT NULL,
+                    error_message TEXT NOT NULL,
+                    FOREIGN KEY (rule_name) REFERENCES replication_state(rule_name) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_failures_rule
+                    ON replication_failures(rule_name, occurred_at DESC);",
+            )?;
+            info!(
+                "Migrated config DB schema from v{} to v6 (added replication state tables)",
                 version
             );
         }
