@@ -201,7 +201,12 @@ impl From<EngineError> for crate::api::S3Error {
             EngineError::InvalidArgument(msg) => crate::api::S3Error::InvalidArgument(msg),
             EngineError::Overloaded(msg) => crate::api::S3Error::SlowDown(msg),
             EngineError::Storage(e) => e.into(),
-            other => crate::api::S3Error::InternalError(other.to_string()),
+            // E4: route opaque engine errors (ChecksumMismatch, codec
+            // failures, etc.) through the sanitiser so computed/expected
+            // hashes and xdelta3 stderr don't escape to the client.
+            other => {
+                crate::api::S3Error::InternalError(crate::api::errors::sanitise_for_client(&other))
+            }
         }
     }
 }

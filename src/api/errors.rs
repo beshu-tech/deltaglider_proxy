@@ -209,9 +209,31 @@ impl From<crate::storage::StorageError> for S3Error {
             crate::storage::StorageError::DiskFull => S3Error::InternalError(
                 "Insufficient storage space. The server's disk is full.".to_string(),
             ),
-            other => S3Error::InternalError(other.to_string()),
+            other => S3Error::InternalError(sanitise_for_client(&other)),
         }
     }
+}
+
+/// Translate backend error text into something safe to send to an S3
+/// client. The full error is preserved for `tracing::error!` + the
+/// audit ring; only the response body gets the sanitised version.
+///
+/// Motivated by E4 in the adversarial audit: backend `StorageError::Other`,
+/// `EngineError::ChecksumMismatch`, and friends stringified into
+/// response bodies could reveal computed/expected hashes, absolute
+/// filesystem paths, or backend implementation details (MinIO debug
+/// strings, S3 request IDs, xdelta3 stderr). None of that belongs in
+/// a client's hands — they can't act on it, and it helps attackers
+/// fingerprint the stack.
+///
+/// The return value is deliberately generic. Operators read the real
+/// error in logs; clients see "Internal server error."
+pub fn sanitise_for_client(err: &dyn std::fmt::Display) -> String {
+    // Log the full detail exactly once per sanitisation. If the caller
+    // also logs, we'll have duplicate lines — acceptable for a rare
+    // error path.
+    tracing::error!(target: "dgp::sanitised_error", "{}", err);
+    "Internal server error. See server logs for details.".to_string()
 }
 
 #[cfg(test)]
@@ -259,5 +281,48 @@ mod tests {
         assert_eq!(err.status_code(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(err.status_code().as_u16(), 503);
         assert_eq!(err.code(), "SlowDown");
+    }
+
+    /// E4 security fix: `sanitise_for_client` must return a generic string,
+    /// NOT leak the underlying error text into the response body.
+    #[test]
+    fn sanitise_for_client_returns_generic_string() {
+        let leaky = "/var/lib/dgp/secrets/backup.db contains hash abc123def456";
+        let sanitised = sanitise_for_client(&leaky);
+        assert!(
+            !sanitised.contains("abc123def456"),
+            "sanitised output must not contain hashes: {}",
+            sanitised
+        );
+        assert!(
+            !sanitised.contains("/var/lib/dgp"),
+            "sanitised output must not contain filesystem paths: {}",
+            sanitised
+        );
+        assert!(
+            sanitised.starts_with("Internal server error"),
+            "sanitised output should signal internal error: {}",
+            sanitised
+        );
+    }
+
+    /// Verify the StorageError::Other conversion uses the sanitiser —
+    /// not the raw err.to_string().
+    #[test]
+    fn storage_error_other_is_sanitised_in_s3_internal_error() {
+        use crate::storage::StorageError;
+
+        let leaky = StorageError::Other(
+            "/secret/path.db MD5 mismatch: expected 0xDEAD got 0xBEEF".to_string(),
+        );
+        let s3: S3Error = leaky.into();
+        match s3 {
+            S3Error::InternalError(msg) => {
+                assert!(!msg.contains("0xDEAD"));
+                assert!(!msg.contains("/secret/path.db"));
+                assert!(msg.starts_with("Internal server error"));
+            }
+            other => panic!("expected InternalError, got {:?}", other),
+        }
     }
 }

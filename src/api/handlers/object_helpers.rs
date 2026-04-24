@@ -190,7 +190,7 @@ pub(super) async fn put_object_inner(
             .storage()
             .put_directory_marker(bucket, key)
             .await
-            .map_err(|e| S3Error::InternalError(e.to_string()))?;
+            .map_err(|e| S3Error::InternalError(crate::api::errors::sanitise_for_client(&e)))?;
         // MD5 of empty content: d41d8cd98f00b204e9800998ecf8427e
         return Ok((
             StatusCode::OK,

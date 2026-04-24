@@ -201,7 +201,9 @@ pub async fn get_object(
                     .map_err(|e| std::io::Error::other(e.to_string()))
                     .try_collect()
                     .await
-                    .map_err(|e| S3Error::InternalError(e.to_string()))?;
+                    .map_err(|e| {
+                        S3Error::InternalError(crate::api::errors::sanitise_for_client(&e))
+                    })?;
                 let total_len: usize = chunks.iter().map(|b| b.len()).sum();
                 let mut data = Vec::with_capacity(total_len);
                 for chunk in &chunks {

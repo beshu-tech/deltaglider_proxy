@@ -3,7 +3,7 @@
 pub mod admin;
 pub mod auth;
 mod aws_chunked;
-mod errors;
+pub(crate) mod errors;
 mod extractors;
 pub mod handlers;
 mod xml;
