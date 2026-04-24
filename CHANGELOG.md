@@ -2,6 +2,73 @@
 
 ## Unreleased
 
+### Second-wave correctness fixes (H1/H2 + M1–M4 + L1)
+
+Seven additional findings from a follow-up review of the multipart,
+copy, tagging, and pagination surfaces.
+
+**H1 — Multipart ETag was inconsistent across Complete vs HEAD/LIST**
+CompleteMultipartUpload returned `"md5(concat)-N"` but the persisted
+FileMetadata carried a fresh full-body MD5. Clients caching the
+Complete ETag as an If-Match precondition hit 412 on the next write.
+Fix: new `FileMetadata.multipart_etag: Option<String>` threaded
+through `engine.store_with_multipart_etag` / `store_passthrough_
+chunked_with_multipart_etag`; `etag()` returns the override when set.
+Persisted on both backends (xattr round-trip, S3 user-metadata
+`dg-multipart-etag`).
+
+**H2 — DeleteBucket ignored active multipart uploads**
+DeleteBucket returned 204 with MPU state still alive for that bucket.
+After the delete, ListMultipartUploads reported ghost uploads and
+UploadPart (M1 below) silently accepted bytes into the orphan state.
+Fix: `MultipartStore.count_uploads_for_bucket` gate in the handler;
+409 BucketNotEmpty with MPU wording in the error message.
+
+**M1 — UploadPart / UploadPartCopy didn't check bucket existence**
+The C2 wave added `ensure_bucket_exists` to Initiate and Complete but
+missed the in-between part upload paths. Attacker could Initiate, have
+the bucket deleted, and keep feeding parts. Fix: both UploadPart and
+UploadPartCopy now call `ensure_bucket_exists` (UploadPartCopy also
+checks the source bucket).
+
+**M2 — CopyObject ignored x-amz-copy-source-if-\* preconditions**
+Pre-fix, the four copy-source headers were read from the request but
+never evaluated — clients saying "copy only if source is still vX"
+got unconditional copies. New pure
+`check_copy_source_conditionals(headers, source_metadata)` evaluates
+`if-match` / `if-none-match` / `if-modified-since` /
+`if-unmodified-since` per AWS spec (all violations return 412, even
+the none-match/modified-since variants that would normally be 304
+on GET). Wired into both `copy_object_inner` and `upload_part_copy`.
+
+**M3 — invalid x-amz-metadata-directive silently became COPY**
+Any value other than case-insensitive `REPLACE` fell through to
+`COPY`. A typo like `REPLAC` succeeded with source metadata
+preserved — the opposite of the client's intent. Now rejected with
+`InvalidArgument` citing the bad value.
+
+**M4 — tagging stubs returned fake 200 while discarding tag state**
+Object and bucket PUT/GET/DELETE ?tagging used to return 200/empty
+`<TagSet/>`, silently dropping tags the client attached. Clients
+using tags for lifecycle, compliance labels, or ABAC would read them
+back empty and assume something wiped them. All five handlers now
+return 501 NotImplemented — honest "not supported."
+
+**L1 — ListParts / ListMultipartUploads pagination lied**
+`max_parts` and `max_uploads` were hardcoded to 1000 with
+`is_truncated=false` and empty markers, regardless of input. An
+upload with >1000 parts silently dropped the tail. Fix: full
+pagination support — `ObjectQuery` + `BucketGetQuery` accept
+`max-parts`/`part-number-marker` and
+`max-uploads`/`key-marker`/`upload-id-marker`. New paginated helpers
+`MultipartStore.list_parts_paginated` + `list_uploads_paginated`
+implement tuple-cursor semantics matching AWS.
+
+**Tests**: 5 unit (types) + 2 integration (multipart_etag_test) for
+H1, plus 10 integration tests in `tests/s3_correctness_test.rs`
+covering H2/M1/M2/M3/M4/L1. 618 lib tests + all integration green.
+Clippy clean.
+
 ### Security hardening — adversarial review findings (C1–C4 + E1/E2/E4)
 
 A static adversarial review surfaced four critical vulnerabilities and
