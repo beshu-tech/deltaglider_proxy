@@ -3809,16 +3809,12 @@ admission_blocks:
             backends: vec![
                 NamedBackendConfig {
                     name: "eu-archive".into(),
-                    backend: BackendConfig::Filesystem {
-                        path: "/a".into(),
-                    },
+                    backend: BackendConfig::Filesystem { path: "/a".into() },
                     encryption: BackendEncryptionConfig::default(),
                 },
                 NamedBackendConfig {
                     name: "eu.archive".into(),
-                    backend: BackendConfig::Filesystem {
-                        path: "/b".into(),
-                    },
+                    backend: BackendConfig::Filesystem { path: "/b".into() },
                     encryption: BackendEncryptionConfig::default(),
                 },
             ],
@@ -3826,7 +3822,9 @@ admission_blocks:
         };
         let warnings = cfg.check();
         assert!(
-            warnings.iter().any(|w| w.contains("env-var suffix") && w.contains("EU_ARCHIVE")),
+            warnings
+                .iter()
+                .any(|w| w.contains("env-var suffix") && w.contains("EU_ARCHIVE")),
             "expected env-suffix collision warning, got {:?}",
             warnings
         );

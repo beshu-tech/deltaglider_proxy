@@ -1639,7 +1639,8 @@ mod tests {
         let id = derive_key_id("my-backend", &key);
         assert_eq!(id.len(), 16, "derived key_id must be 16 hex chars");
         assert!(
-            id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            id.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "derived key_id must be lowercase hex, got: {id}"
         );
     }
@@ -1710,7 +1711,10 @@ legacy_key_id: "old-kid"
 "#;
         let enc: crate::config::BackendEncryptionConfig =
             serde_yaml::from_str(yaml).expect("mode:none with legacy_key must parse");
-        assert_eq!(enc.legacy_key().map(str::to_string), Some("0101010101010101010101010101010101010101010101010101010101010101".to_string()));
+        assert_eq!(
+            enc.legacy_key().map(str::to_string),
+            Some("0101010101010101010101010101010101010101010101010101010101010101".to_string())
+        );
         assert_eq!(enc.legacy_key_id(), Some("old-kid"));
         let (key, kid) = resolve_legacy_shim("b", &enc).unwrap();
         assert!(

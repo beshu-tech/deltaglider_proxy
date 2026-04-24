@@ -511,7 +511,9 @@ where
 /// phase-2 frame parse, decrypt, skip/take plaintext trim) is
 /// bit-for-bit identical. Keeping one copy of this AEAD-critical loop
 /// avoids the "fix a bug in one, forget the other" risk.
-fn decrypt_stream_from_state<S>(state: DecryptState<S>) -> BoxStream<'static, Result<Bytes, StorageError>>
+fn decrypt_stream_from_state<S>(
+    state: DecryptState<S>,
+) -> BoxStream<'static, Result<Bytes, StorageError>>
 where
     S: futures::Stream<Item = Result<Bytes, StorageError>> + Unpin + Send + 'static,
 {
@@ -759,9 +761,26 @@ async fn fetch_chunked_header<B: StorageBackend + ?Sized>(
     filename: &str,
 ) -> Result<[u8; IV_LEN], StorageError> {
     use futures::StreamExt;
-    let (mut stream, _) = inner
+    let (mut stream, content_length) = inner
         .get_passthrough_stream_range(bucket, prefix, filename, 0, CHUNK_HEADER_LEN as u64 - 1)
         .await?;
+    // H5: the default `get_passthrough_stream_range` impl (for backends
+    // that don't override — custom third-party backends) returns the
+    // FULL stream with `content_length = 0`. The range-read path would
+    // then invoke the backend TWICE for what should be a bounded
+    // request — once here (header) + once for the body — each fetching
+    // the entire object. Detect the signal and refuse: the encrypted
+    // range-read path REQUIRES a native-range-capable backend to
+    // avoid unbounded memory use on large objects. S3 + filesystem
+    // both override the default and work correctly.
+    if content_length == 0 {
+        return Err(StorageError::Other(
+            "chunked-encrypted range reads require a backend with native range support; \
+             this backend falls through to the default trait impl. Implement \
+             `get_passthrough_stream_range` on your StorageBackend to fix."
+                .into(),
+        ));
+    }
     let mut buf: Vec<u8> = Vec::with_capacity(CHUNK_HEADER_LEN);
     while buf.len() < CHUNK_HEADER_LEN {
         match stream.next().await {

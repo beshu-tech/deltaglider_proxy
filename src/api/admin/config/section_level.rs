@@ -390,7 +390,11 @@ async fn apply_section(
     for new_named in &mut new_cfg.backends {
         if let Some(old_named) = old_cfg.backends.iter().find(|n| n.name == new_named.name) {
             let probe = body_probe.for_named(&new_named.name);
-            preserve_backend_encryption_secrets(&mut new_named.encryption, &old_named.encryption, probe);
+            preserve_backend_encryption_secrets(
+                &mut new_named.encryption,
+                &old_named.encryption,
+                probe,
+            );
         }
     }
 
@@ -1012,6 +1016,24 @@ fn preserve_backend_encryption_secrets(
     probe: BackendKeyPresence,
 ) {
     use crate::config::BackendEncryptionConfig as E;
+    // H8: validate hex during preservation. If the old config landed
+    // in memory with malformed hex (e.g. a pre-existing pathological
+    // state from a prior load that only warned, not errored), DON'T
+    // propagate that into the new config — the subsequent
+    // `rebuild_engine → wrap_backend_with_encryption →
+    // EncryptionKey::from_hex` would 5xx on a PATCH that touched an
+    // unrelated field. Silently skip preservation for unparseable
+    // old keys; the engine's warn-level "no key configured" diagnostic
+    // will surface the underlying issue.
+    let old_primary_ok = old
+        .primary_key()
+        .filter(|k| crate::storage::EncryptionKey::from_hex(k).is_ok())
+        .map(str::to_string);
+    let old_legacy_ok = old
+        .legacy_key()
+        .filter(|k| crate::storage::EncryptionKey::from_hex(k).is_ok())
+        .map(str::to_string);
+
     // Primary key preservation — only relevant on Aes256GcmProxy.
     // Same-mode, absent-in-body ⇒ preserve old primary.
     if let E::Aes256GcmProxy {
@@ -1020,8 +1042,8 @@ fn preserve_backend_encryption_secrets(
     } = new
     {
         if new_key.is_none() && !probe.key_is_explicit_null {
-            if let Some(old_key) = old.primary_key() {
-                *new_key = Some(old_key.to_string());
+            if let Some(old_key) = &old_primary_ok {
+                *new_key = Some(old_key.clone());
             }
         }
     }
@@ -1039,17 +1061,17 @@ fn preserve_backend_encryption_secrets(
     // The operator can still OVERRIDE this by explicitly passing
     // `legacy_key: null` in the body — that's the "discard old keys"
     // escape hatch, encoded via `probe.legacy_key_is_explicit_null`.
-    let mode_changed_from_proxy = matches!(old, E::Aes256GcmProxy { .. })
-        && !matches!(new, E::Aes256GcmProxy { .. });
+    let mode_changed_from_proxy =
+        matches!(old, E::Aes256GcmProxy { .. }) && !matches!(new, E::Aes256GcmProxy { .. });
     if mode_changed_from_proxy && !probe.legacy_key_is_explicit_null {
-        // Only auto-populate if the new legacy_key slot is empty
-        // AND the old primary had a key (redact-round-trips sometimes
-        // have primary_key() == None; that's a no-op).
-        if let (Some(old_primary), Some(new_legacy_slot)) =
-            (old.primary_key(), new.legacy_key_mut())
+        // Only auto-populate if the new legacy_key slot is empty AND
+        // the old primary has a VALIDATED key (`old_primary_ok`). A
+        // redact-round-trip yields None → no-op; a pre-existing
+        // malformed hex yields None via the H8 validation → no-op.
+        if let (Some(old_primary), Some(new_legacy_slot)) = (&old_primary_ok, new.legacy_key_mut())
         {
             if new_legacy_slot.is_none() {
-                *new_legacy_slot = Some(old_primary.to_string());
+                *new_legacy_slot = Some(old_primary.clone());
             }
         }
     }
@@ -1057,11 +1079,11 @@ fn preserve_backend_encryption_secrets(
     // Legacy shim key preservation — same-slot absent-in-body.
     // Runs AFTER the auto-promotion so explicit operator intent
     // (a fresh legacy_key in the body) always wins over the
-    // promoted value.
-    let old_legacy = old.legacy_key().map(str::to_string);
+    // promoted value. Uses the H8-validated variable so malformed
+    // hex doesn't propagate.
     if let Some(new_legacy) = new.legacy_key_mut() {
         if new_legacy.is_none() && !probe.legacy_key_is_explicit_null {
-            *new_legacy = old_legacy;
+            *new_legacy = old_legacy_ok;
         }
     }
 }
@@ -1221,7 +1243,11 @@ mod tests {
         let mut new = proxy(None, None); // redacted round-trip
         let probe = BackendKeyPresence::default();
         preserve_backend_encryption_secrets(&mut new, &old, probe);
-        assert_eq!(new.primary_key(), Some(HEX32), "same-mode preserves primary");
+        assert_eq!(
+            new.primary_key(),
+            Some(HEX32),
+            "same-mode preserves primary"
+        );
         assert_eq!(
             new.legacy_key(),
             Some(HEX32_B),

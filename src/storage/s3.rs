@@ -1588,6 +1588,15 @@ impl StorageBackend for S3Backend {
             .content_type("application/x-directory")
             .content_length(0)
             .body(ByteStream::from(vec![]));
+        // H9: stamp the dg-encrypted-native marker symmetrically with
+        // put_object_with_metadata. The marker isn't secret — it just
+        // tells the read path "native-encrypted, don't try to proxy-
+        // decrypt". Without it, a future read-side sniffer that
+        // distinguishes "plaintext" from "native-encrypted" via the
+        // marker would misclassify directory markers.
+        if let Some(marker) = self.native_encryption.marker() {
+            request = request.metadata("dg-encrypted-native", marker);
+        }
         request = apply_native_encryption(request, &self.native_encryption);
         request
             .send()
