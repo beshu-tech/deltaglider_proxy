@@ -2,13 +2,14 @@ import { useState, useEffect } from 'react';
 import { Button, Input, Radio, Switch, Typography, Space, Alert, Spin, InputNumber } from 'antd';
 import { PlusOutlined, DeleteOutlined, DatabaseOutlined, CloudOutlined, CheckCircleOutlined, ApiOutlined, FolderOutlined } from '@ant-design/icons';
 import type { BackendInfo, CreateBackendRequest, AdminConfig } from '../adminApi';
-import { getBackends, createBackend, deleteBackend, testS3Connection, getAdminConfig, updateAdminConfig } from '../adminApi';
+import { getBackends, createBackend, deleteBackend, testS3Connection, getAdminConfig, updateAdminConfig, putSection } from '../adminApi';
 import { listBuckets } from '../s3client';
 import { useColors } from '../ThemeContext';
 import { useCardStyles } from './shared-styles';
 import SectionHeader from './SectionHeader';
 import SimpleSelect from './SimpleSelect';
 import SimpleAutoComplete from './SimpleAutoComplete';
+import BackendEncryptionEditor, { type BackendEncryptionPatch } from './BackendEncryptionEditor';
 
 const { Text } = Typography;
 
@@ -207,6 +208,93 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
     setFormAccessKey(''); setFormSecretKey(''); setFormSetDefault(false);
   };
 
+  /**
+   * Apply a per-backend encryption change.
+   *
+   * Composes a `storage` section-PUT body that mutates ONLY the
+   * target backend's `encryption` block and leaves every sibling
+   * backend + every non-encryption field untouched. The server's
+   * RFC 7396 merge-patch semantics guarantee siblings are preserved
+   * — we just need to send the correct shape for the path we want
+   * to replace.
+   *
+   * Path:
+   *   * Singleton (synthetic "default" backend surfaced by the
+   *     server when `backends` is empty) → `{ backend_encryption:
+   *     <patch> }`.
+   *   * Named entry (any other name) → `{ backends: [{name, encryption}] }`.
+   *     Note the server replaces `backends` as a whole array on a
+   *     section PUT; for per-entry edits we send the FULL list with
+   *     only the target entry's `encryption` swapped.
+   */
+  const handleEncryptionApply = async (
+    backendName: string,
+    patch: BackendEncryptionPatch,
+  ): Promise<void> => {
+    // Translate the patch into the wire shape. null-clears for
+    // `legacy_key` pass through; absent fields rely on the server's
+    // three-state preservation to keep the previous value.
+    const encBody: Record<string, unknown> = { mode: patch.mode };
+    if (patch.key !== undefined) encBody.key = patch.key;
+    if (patch.key_id !== undefined) encBody.key_id = patch.key_id;
+    if (patch.kms_key_id !== undefined) encBody.kms_key_id = patch.kms_key_id;
+    if (patch.bucket_key_enabled !== undefined) encBody.bucket_key_enabled = patch.bucket_key_enabled;
+    if (patch.legacy_key !== undefined) encBody.legacy_key = patch.legacy_key;
+    if (patch.legacy_key_id !== undefined) encBody.legacy_key_id = patch.legacy_key_id;
+
+    // Build the section-PUT payload. The singleton ("default") path
+    // and the named-entries path have different shapes on disk.
+    let body: Record<string, unknown>;
+    if (backendName === 'default' && backends.length === 1 && backends[0].name === 'default') {
+      // Legacy singleton path — synthesise the singleton
+      // `backend_encryption` block. The server handles the
+      // preservation for us.
+      body = { backend_encryption: encBody };
+    } else {
+      // Named-backend path: replace the whole list with the edited
+      // encryption entry. The server's `preserve_backend_secrets`
+      // keeps non-encryption fields intact (e.g. S3 creds); the
+      // `preserve_backend_encryption_secrets` walker preserves
+      // sibling fields inside the encryption block itself.
+      const list = backends.map((b) => {
+        const backendShape: Record<string, unknown> = {
+          name: b.name,
+          type: b.backend_type,
+        };
+        if (b.path) backendShape.path = b.path;
+        if (b.endpoint) backendShape.endpoint = b.endpoint;
+        if (b.region) backendShape.region = b.region;
+        if (b.force_path_style !== null) backendShape.force_path_style = b.force_path_style;
+        if (b.name === backendName) {
+          backendShape.encryption = encBody;
+        }
+        return backendShape;
+      });
+      body = { backends: list };
+    }
+
+    try {
+      const result = await putSection('storage', body);
+      if (!result.ok) {
+        setSaveResult({
+          ok: false,
+          message: result.error || 'Failed to apply encryption change',
+        });
+        throw new Error(result.error || 'Apply failed');
+      }
+      setSaveResult({
+        ok: true,
+        message: `Encryption updated on backend '${backendName}'`,
+      });
+      await refresh();
+    } catch (e) {
+      if (e instanceof Error && !saveResult?.message) {
+        setSaveResult({ ok: false, message: e.message });
+      }
+      throw e;
+    }
+  };
+
   const globalCompressionOn = (config?.max_delta_ratio ?? 0.75) > 0;
 
   if (loading) {
@@ -291,6 +379,16 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
               {testResult?.name === b.name && (
                 <Alert type={testResult.ok ? 'success' : 'error'} message={testResult.message} showIcon style={{ marginTop: 8, borderRadius: 6 }} />
               )}
+              {/* Step 7: per-backend encryption subsection. Shows the
+                 current mode, exposes a mode-change picker, and wraps
+                 the proxy-AES key-generation flow lifted from the
+                 EncryptionPanel. Apply sends a targeted storage
+                 section PUT; siblings are preserved by merge-patch. */}
+              <BackendEncryptionEditor
+                backendName={b.name}
+                current={b.encryption}
+                onApply={(patch) => handleEncryptionApply(b.name, patch)}
+              />
             </div>
           ))}
 

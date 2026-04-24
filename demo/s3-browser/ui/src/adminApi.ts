@@ -142,6 +142,38 @@ export type AdmissionAction =
   | 'continue'
   | { type: 'reject'; status: number; message?: string };
 
+/**
+ * Per-backend encryption status. Non-secret-only — the raw key never
+ * leaves the server. Step 7 reads this to render the encryption
+ * subsection in BackendsPanel and the per-bucket badge in BucketsPanel.
+ *
+ * `mode` values match the YAML wire tag:
+ *   - `"none"` — plaintext.
+ *   - `"aes256-gcm-proxy"` — proxy-side AES-256-GCM. `has_key` true
+ *     iff the key material is actually loaded; `key_id` is the stable
+ *     identifier stamped on every written object.
+ *   - `"sse-kms"` — AWS KMS. `kms_key_id` is the ARN / alias.
+ *   - `"sse-s3"` — AWS-managed AES256.
+ *
+ * `shim_active` is true when a `legacy_key` is configured — the
+ * decrypt-only shim during a proxy→native mode transition. UI
+ * surfaces this as an info banner reminding the operator to clear
+ * `legacy_key` once all historical objects are gone.
+ */
+export type BackendEncryptionMode =
+  | 'none'
+  | 'aes256-gcm-proxy'
+  | 'sse-kms'
+  | 'sse-s3';
+
+export interface BackendEncryptionSummary {
+  mode: BackendEncryptionMode;
+  has_key: boolean;
+  key_id?: string;
+  kms_key_id?: string;
+  shim_active: boolean;
+}
+
 export interface BackendInfo {
   name: string;
   backend_type: string;
@@ -150,6 +182,13 @@ export interface BackendInfo {
   region: string | null;
   force_path_style: boolean | null;
   has_credentials: boolean;
+  /**
+   * Per-backend encryption status (Step 6/7 per-backend refactor).
+   * Always present — the server synthesises a "default" entry for
+   * the legacy singleton backend path so this field is uniform
+   * across both YAML shapes.
+   */
+  encryption: BackendEncryptionSummary;
 }
 
 export async function getAdminConfig(): Promise<AdminConfig | null> {
