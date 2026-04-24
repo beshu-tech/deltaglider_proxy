@@ -1,2 +1,3 @@
 - [Admin UI migration](project_admin_overlay_migration.md) — AdminPage embeds SettingsPage for config tabs; SettingsPage is NOT dead code
 - [Architecture analysis](project_architecture_analysis.md) — Codebase hygiene findings: delete_prefix unused, s3.rs is 1646 lines, eprintln usage is intentional
+- [Encryption hygiene review](project_encryption_hygiene.md) — per-backend encryption feature: no `ResolvedEncryption` type (only 2 similar types), real DRY wins are on legacy_key extraction + derive_key_id + chunked decoder loops

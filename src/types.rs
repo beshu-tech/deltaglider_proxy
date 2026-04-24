@@ -193,6 +193,17 @@ pub struct FileMetadata {
     /// MD5 hash for S3 ETag compatibility
     pub md5: String,
 
+    /// S3 multipart ETag override: `"md5(concat(part_md5_raw))-N"`. When
+    /// set, `etag()` returns this value verbatim instead of deriving
+    /// from `md5`. Present ONLY for objects created via
+    /// CompleteMultipartUpload so HEAD/GET/LIST report the same ETag
+    /// the Complete response advertised (H1 correctness fix: pre-fix,
+    /// the handler returned `"xxx-N"` but the persisted metadata
+    /// carried a full-body MD5, producing two ETags for the same
+    /// object).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multipart_etag: Option<String>,
+
     /// Creation timestamp (UTC ISO8601)
     pub created_at: DateTime<Utc>,
 
@@ -277,6 +288,7 @@ impl FileMetadata {
             file_sha256: sha256,
             file_size: size,
             md5,
+            multipart_etag: None,
             created_at: Utc::now(),
             content_type,
             user_metadata: HashMap::new(),
@@ -306,6 +318,7 @@ impl FileMetadata {
             file_sha256: sha256,
             file_size,
             md5,
+            multipart_etag: None,
             created_at: Utc::now(),
             content_type,
             user_metadata: HashMap::new(),
@@ -332,6 +345,7 @@ impl FileMetadata {
             file_sha256: sha256,
             file_size: size,
             md5,
+            multipart_etag: None,
             created_at: Utc::now(),
             content_type,
             user_metadata: HashMap::new(),
@@ -356,6 +370,7 @@ impl FileMetadata {
             file_sha256: String::new(),
             file_size: size,
             md5,
+            multipart_etag: None,
             created_at,
             content_type,
             user_metadata: HashMap::new(),
@@ -371,6 +386,7 @@ impl FileMetadata {
             file_sha256: String::new(),
             file_size: 0,
             md5: "d41d8cd98f00b204e9800998ecf8427e".to_string(),
+            multipart_etag: None,
             created_at: Utc::now(),
             content_type: Some("application/x-directory".to_string()),
             user_metadata: HashMap::new(),
@@ -391,6 +407,11 @@ impl FileMetadata {
         map.insert(mk::FILE_SHA256.to_string(), self.file_sha256.clone());
         map.insert(mk::FILE_SIZE.to_string(), self.file_size.to_string());
         map.insert(mk::MD5.to_string(), self.md5.clone());
+        if let Some(ref mp_etag) = self.multipart_etag {
+            // H1 fix: persist the multipart ETag so HEAD/GET/LIST return
+            // the same ETag the CompleteMultipartUpload response gave.
+            map.insert("dg-multipart-etag".to_string(), mp_etag.clone());
+        }
         if let Some(ref ct) = self.content_type {
             map.insert("content-type".to_string(), ct.clone());
         }
@@ -448,6 +469,19 @@ impl FileMetadata {
 
     /// Get ETag value (quoted MD5)
     pub fn etag(&self) -> String {
+        // H1 fix: CompleteMultipartUpload returns `"md5(concat)-N"`
+        // as the ETag. When present, honour it verbatim so HEAD/GET/LIST
+        // agree with the Complete response. Otherwise fall back to
+        // full-body MD5 (the S3 contract for single-PUT objects).
+        if let Some(override_etag) = self.multipart_etag.as_ref() {
+            // The multipart_etag is already wrapped in the canonical
+            // quoted form by the handler, but defend against direct
+            // assignments by normalising.
+            if override_etag.starts_with('"') && override_etag.ends_with('"') {
+                return override_etag.clone();
+            }
+            return format!("\"{}\"", override_etag);
+        }
         format!("\"{}\"", self.md5)
     }
 
@@ -681,5 +715,88 @@ mod tests {
         assert_eq!(meta.original_name, "test.bin");
         assert!(meta.file_sha256.is_empty());
         assert!(matches!(meta.storage_info, StorageInfo::Passthrough));
+    }
+
+    // === H1 fix: multipart ETag persistence ===
+
+    /// Without a multipart_etag, `etag()` returns the MD5-based ETag
+    /// (single-PUT behaviour).
+    #[test]
+    fn test_etag_returns_md5_when_no_multipart_override() {
+        let meta = FileMetadata::new_passthrough(
+            "file.bin".to_string(),
+            "sha".to_string(),
+            "deadbeef".to_string(),
+            100,
+            None,
+        );
+        assert_eq!(meta.etag(), "\"deadbeef\"");
+    }
+
+    /// With a multipart_etag set, `etag()` returns it verbatim (already
+    /// quoted).
+    #[test]
+    fn test_etag_honours_multipart_override_quoted() {
+        let mut meta = FileMetadata::new_passthrough(
+            "file.bin".to_string(),
+            "sha".to_string(),
+            "deadbeef".to_string(),
+            100,
+            None,
+        );
+        meta.multipart_etag = Some("\"cafe-2\"".to_string());
+        assert_eq!(meta.etag(), "\"cafe-2\"");
+    }
+
+    /// Defence: if the override is unquoted by mistake, etag() still
+    /// wraps it in quotes for S3 compatibility.
+    #[test]
+    fn test_etag_wraps_unquoted_multipart_override() {
+        let mut meta = FileMetadata::new_passthrough(
+            "file.bin".to_string(),
+            "sha".to_string(),
+            "deadbeef".to_string(),
+            100,
+            None,
+        );
+        meta.multipart_etag = Some("abc-3".to_string());
+        assert_eq!(meta.etag(), "\"abc-3\"");
+    }
+
+    /// Serde round-trip: persisted xattr must preserve multipart_etag.
+    #[test]
+    fn test_metadata_serde_preserves_multipart_etag() {
+        let mut meta = FileMetadata::new_passthrough(
+            "file.bin".to_string(),
+            "sha".to_string(),
+            "deadbeef".to_string(),
+            100,
+            None,
+        );
+        meta.multipart_etag = Some("\"xyz-5\"".to_string());
+
+        let json = serde_json::to_string(&meta).unwrap();
+        let round: FileMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(round.multipart_etag, Some("\"xyz-5\"".to_string()));
+        assert_eq!(round.etag(), "\"xyz-5\"");
+    }
+
+    /// Serde omits the field when None (keeps existing xattr payloads
+    /// backwards-compatible — they don't grow spuriously).
+    #[test]
+    fn test_metadata_serde_omits_none_multipart_etag() {
+        let meta = FileMetadata::new_passthrough(
+            "file.bin".to_string(),
+            "sha".to_string(),
+            "deadbeef".to_string(),
+            100,
+            None,
+        );
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(
+            !json.contains("multipart_etag"),
+            "multipart_etag=None should be omitted from serialization, got: {}",
+            json
+        );
     }
 }

@@ -447,12 +447,14 @@ impl S3Backend {
             })
             .collect();
 
+        let multipart_etag = get_value(&["dg-multipart-etag"]);
         Ok(FileMetadata {
             tool,
             original_name,
             file_sha256,
             file_size,
             md5,
+            multipart_etag,
             created_at,
             content_type: headers.get("content-type").cloned(),
             user_metadata,

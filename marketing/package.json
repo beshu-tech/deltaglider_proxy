@@ -1,0 +1,29 @@
+{
+  "name": "deltaglider-marketing",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "prebuild": "node scripts/copy-screenshots.mjs",
+    "build": "vite-react-ssg build && node scripts/gen-sitemap.mjs && node scripts/check-seo.mjs",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5",
+    "react-router-dom": "^6.30.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.2.4",
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "tailwindcss": "^4.2.4",
+    "typescript": "^5.8.0",
+    "vite": "^7.3.2",
+    "vite-react-ssg": "^0.9.1-beta.1"
+  }
+}

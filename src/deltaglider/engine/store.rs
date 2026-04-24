@@ -17,6 +17,45 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         content_type: Option<String>,
         user_metadata: std::collections::HashMap<String, String>,
     ) -> Result<StoreResult, EngineError> {
+        self.store_inner(bucket, key, data, content_type, user_metadata, None)
+            .await
+    }
+
+    /// Multipart-aware variant of [`Self::store`]. The `multipart_etag` is
+    /// persisted alongside the object so HEAD/GET/LIST return it verbatim
+    /// (H1 correctness fix). All other semantics are identical.
+    #[instrument(skip(self, data, user_metadata, multipart_etag))]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn store_with_multipart_etag(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: &[u8],
+        content_type: Option<String>,
+        user_metadata: std::collections::HashMap<String, String>,
+        multipart_etag: String,
+    ) -> Result<StoreResult, EngineError> {
+        self.store_inner(
+            bucket,
+            key,
+            data,
+            content_type,
+            user_metadata,
+            Some(multipart_etag),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn store_inner(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: &[u8],
+        content_type: Option<String>,
+        user_metadata: std::collections::HashMap<String, String>,
+        multipart_etag: Option<String>,
+    ) -> Result<StoreResult, EngineError> {
         // Invalidate stale metadata on overwrite (before the write, so concurrent
         // readers don't see outdated metadata during the write window).
         self.metadata_cache.invalidate(bucket, key);
@@ -66,6 +105,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 md5,
                 content_type,
                 user_metadata,
+                multipart_etag: multipart_etag.clone(),
             };
             let result = self.store_passthrough(ctx).await?;
             // Write succeeded — now safe to clean up old delta variant
@@ -97,6 +137,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             md5,
             content_type,
             user_metadata,
+            multipart_etag,
         };
 
         // Check if deltaspace already has a reference (existing deltaspace)
@@ -235,6 +276,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             ctx.content_type,
         );
         metadata.user_metadata = ctx.user_metadata;
+        metadata.multipart_etag = ctx.multipart_etag;
 
         // Write delta first, then clean up old passthrough variant
         self.storage
@@ -310,6 +352,56 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
     ) -> Result<StoreResult, EngineError> {
+        self.store_passthrough_chunked_inner(
+            bucket,
+            key,
+            chunks,
+            total_size,
+            content_type,
+            user_metadata,
+            None,
+        )
+        .await
+    }
+
+    /// Multipart-aware variant of [`Self::store_passthrough_chunked`]. The
+    /// `multipart_etag` is persisted on metadata so HEAD/GET/LIST return
+    /// it verbatim (H1 correctness fix).
+    #[instrument(skip(self, chunks, user_metadata, multipart_etag))]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn store_passthrough_chunked_with_multipart_etag(
+        &self,
+        bucket: &str,
+        key: &str,
+        chunks: &[Bytes],
+        total_size: u64,
+        content_type: Option<String>,
+        user_metadata: HashMap<String, String>,
+        multipart_etag: String,
+    ) -> Result<StoreResult, EngineError> {
+        self.store_passthrough_chunked_inner(
+            bucket,
+            key,
+            chunks,
+            total_size,
+            content_type,
+            user_metadata,
+            Some(multipart_etag),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn store_passthrough_chunked_inner(
+        &self,
+        bucket: &str,
+        key: &str,
+        chunks: &[Bytes],
+        total_size: u64,
+        content_type: Option<String>,
+        user_metadata: HashMap<String, String>,
+        multipart_etag: Option<String>,
+    ) -> Result<StoreResult, EngineError> {
         if total_size > self.max_object_size {
             return Err(EngineError::TooLarge {
                 size: total_size,
@@ -351,6 +443,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             content_type,
         );
         metadata.user_metadata = user_metadata;
+        metadata.multipart_etag = multipart_etag;
 
         self.storage
             .put_passthrough_chunked(bucket, &deltaspace_id, &obj_key.filename, chunks, &metadata)
@@ -385,6 +478,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             ctx.content_type,
         );
         metadata.user_metadata = ctx.user_metadata;
+        metadata.multipart_etag = ctx.multipart_etag;
 
         self.storage
             .put_passthrough(

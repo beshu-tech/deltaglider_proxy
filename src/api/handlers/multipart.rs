@@ -114,6 +114,14 @@ async fn complete_multipart_upload(
     // `finish_upload` (on success) or `rollback_upload` (on error) —
     // otherwise the upload stays stuck in `Completing` and rejects
     // both abort and further UploadPart calls until the sweeper GC's it.
+    //
+    // H1 correctness fix: the multipart ETag (`"md5(concat)-N"`) is
+    // threaded into engine.store* via the *_with_multipart_etag variants
+    // so the persisted FileMetadata.multipart_etag field holds it. That
+    // makes HEAD/GET/LIST on the completed object return the SAME ETag
+    // that this Complete response advertises — pre-fix, later reads saw
+    // a plain full-body MD5 and clients encountered two different ETags
+    // for the same object.
     let engine = state.engine.load();
     let (multipart_etag, store_result) = if !engine.is_delta_eligible(key) {
         let completed = state
@@ -121,13 +129,14 @@ async fn complete_multipart_upload(
             .complete_parts(upload_id, bucket, key, &requested_parts)?;
         let etag = completed.etag.clone();
         match engine
-            .store_passthrough_chunked(
+            .store_passthrough_chunked_with_multipart_etag(
                 bucket,
                 key,
                 &completed.parts,
                 completed.total_size,
                 completed.content_type,
                 completed.user_metadata,
+                etag.clone(),
             )
             .await
         {
@@ -147,12 +156,13 @@ async fn complete_multipart_upload(
             .complete(upload_id, bucket, key, &requested_parts)?;
         let etag = completed.etag.clone();
         match engine
-            .store(
+            .store_with_multipart_etag(
                 bucket,
                 key,
                 &completed.data,
                 completed.content_type,
                 completed.user_metadata,
+                etag.clone(),
             )
             .await
         {

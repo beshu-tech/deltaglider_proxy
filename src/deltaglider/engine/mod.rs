@@ -36,6 +36,12 @@ struct StoreContext<'a> {
     md5: String,
     content_type: Option<String>,
     user_metadata: HashMap<String, String>,
+    /// When `Some`, the persisted `FileMetadata.multipart_etag` is
+    /// stamped with this value so subsequent HEAD/GET/LIST return the
+    /// same ETag the CompleteMultipartUpload response advertised
+    /// (H1 correctness fix). Normal single-PUT writes pass `None` and
+    /// get the standard full-body-MD5 ETag.
+    multipart_etag: Option<String>,
 }
 
 /// Apply continuation-token filtering and max-keys truncation to a sorted list.
