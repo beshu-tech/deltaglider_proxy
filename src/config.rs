@@ -427,6 +427,12 @@ pub struct Config {
     #[serde(default)]
     pub default_backend: Option<String>,
 
+    /// Lazy bucket replication configuration (v1: scheduled one-way copy
+    /// via the engine). See [`crate::config_sections::ReplicationConfig`]
+    /// for the full shape; rules are validated in `Config::check`.
+    #[serde(default)]
+    pub replication: crate::config_sections::ReplicationConfig,
+
     /// Operator-authored admission blocks.
     ///
     /// Parsed from `admission.blocks:` in the sectioned YAML OR from
@@ -899,6 +905,7 @@ impl Default for Config {
             backends: Vec::new(),
             default_backend: None,
             backend_encryption: BackendEncryptionConfig::default(),
+            replication: crate::config_sections::ReplicationConfig::default(),
             admission_blocks: Vec::new(),
             iam_mode: crate::config_sections::IamMode::default(),
             iam_users: Vec::new(),
@@ -1652,6 +1659,11 @@ impl Config {
                 }
             }
         }
+
+        // Replication rules — static validation + cycle detection.
+        // Catches operator errors at config load time so the worker
+        // never has to deal with malformed rules at runtime.
+        warnings.extend(crate::config_sections::validate_replication(&self.replication));
 
         warnings
     }

@@ -302,6 +302,7 @@ pub fn run_init_inner(
         backends: Vec::new(),
         default_backend: None,
         backend_encryption: crate::config::BackendEncryptionConfig::default(),
+        replication: crate::config_sections::ReplicationConfig::default(),
         admission_blocks: Vec::new(),
         iam_mode: crate::config_sections::IamMode::default(),
         iam_users: Vec::new(),

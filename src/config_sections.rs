@@ -294,6 +294,155 @@ pub struct StorageSection {
     /// virtual-hosted-style.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub force_path_style: Option<bool>,
+
+    /// Lazy bucket replication configuration. A single periodic worker
+    /// walks each due rule and copies objects source → destination
+    /// through the engine (so encryption + delta compression stay
+    /// transparent to the operator). See
+    /// `docs/product/reference/replication.md` and the YAML schema at
+    /// `deltaglider_proxy.example.yaml`.
+    #[serde(default, skip_serializing_if = "is_default_replication")]
+    pub replication: ReplicationConfig,
+}
+
+/// Skip emitting `replication:` from canonical YAML exports when it's
+/// the default (disabled-by-default semantics: empty rules list with
+/// default scheduler controls).
+pub(crate) fn is_default_replication(r: &ReplicationConfig) -> bool {
+    r == &ReplicationConfig::default()
+}
+
+/// Global replication controls + the rules list.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ReplicationConfig {
+    /// Master kill-switch for the replication worker. Defaults to `true`;
+    /// when false, the worker never ticks even if rules exist.
+    #[serde(default = "default_replication_enabled")]
+    pub enabled: bool,
+
+    /// How often the scheduler wakes up to check for due rules. Parsed
+    /// via humantime. Defaults to `30s`. Minimum enforced at config
+    /// load time (`5s`) to prevent scheduler-thrash.
+    #[serde(default = "default_tick_interval")]
+    pub tick_interval: String,
+
+    /// Per-rule failure ring bound. When a rule accumulates more than
+    /// this number of per-object failures, the oldest are dropped.
+    #[serde(default = "default_max_failures")]
+    pub max_failures_retained: u32,
+
+    /// Replication rules. Each rule describes a source → destination
+    /// copy with its own interval and filters. Empty by default.
+    #[serde(default)]
+    pub rules: Vec<ReplicationRule>,
+}
+
+impl Default for ReplicationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_replication_enabled(),
+            tick_interval: default_tick_interval(),
+            max_failures_retained: default_max_failures(),
+            rules: Vec::new(),
+        }
+    }
+}
+
+fn default_replication_enabled() -> bool {
+    true
+}
+
+fn default_tick_interval() -> String {
+    "30s".to_string()
+}
+
+fn default_max_failures() -> u32 {
+    100
+}
+
+/// A single replication rule: copy objects from `source` to `destination`
+/// on `interval`. The cross-encryption/cross-backend/cross-compression
+/// transparency comes from routing the copy through
+/// `engine.retrieve` → `engine.store`, not through raw storage layer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ReplicationRule {
+    /// Rule name. Unique within the config, ASCII `[A-Za-z0-9_.-]{1,64}`.
+    /// Used as the key in the `replication_state` DB table.
+    pub name: String,
+
+    /// Per-rule toggle. `false` keeps the rule declared but inert — the
+    /// scheduler skips it. Operator-facing pause/resume (via the admin
+    /// API) is stored in the DB separately and takes precedence.
+    #[serde(default = "default_rule_enabled")]
+    pub enabled: bool,
+
+    pub source: ReplicationEndpoint,
+    pub destination: ReplicationEndpoint,
+
+    /// How often this rule runs. Humantime-parsed (`"15m"`, `"1h"`, ...).
+    /// Minimum enforced at config load time (`30s`).
+    pub interval: String,
+
+    /// Objects per scheduler yield. The worker copies this many objects
+    /// then yields to the tokio scheduler so other due rules can
+    /// interleave on the same worker task. Defaults to 100.
+    #[serde(default = "default_batch_size")]
+    pub batch_size: u32,
+
+    /// When `true`, keys present on destination but NOT on source are
+    /// deleted after the forward-copy pass. Opt-in by design — default
+    /// `false` — because "did my delete replicate" is a footgun.
+    #[serde(default)]
+    pub replicate_deletes: bool,
+
+    /// Policy for handling objects that exist on both sides.
+    #[serde(default)]
+    pub conflict: ConflictPolicy,
+
+    /// Optional globset: if non-empty, ONLY keys matching at least one
+    /// of these patterns are replicated. Applied in addition to
+    /// `exclude_globs`.
+    #[serde(default)]
+    pub include_globs: Vec<String>,
+
+    /// Optional globset: keys matching any of these patterns are
+    /// skipped. Default excludes DG internals (`.dg/*`).
+    #[serde(default = "default_exclude_globs")]
+    pub exclude_globs: Vec<String>,
+}
+
+fn default_rule_enabled() -> bool {
+    true
+}
+
+fn default_batch_size() -> u32 {
+    100
+}
+
+fn default_exclude_globs() -> Vec<String> {
+    vec![".dg/*".to_string()]
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ReplicationEndpoint {
+    pub bucket: String,
+    #[serde(default)]
+    pub prefix: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConflictPolicy {
+    /// Copy only if source is strictly newer than destination (default).
+    /// Ties fall through to source-wins (can't distinguish clocks across
+    /// storage tiers).
+    #[default]
+    NewerWins,
+    /// Always copy, overwriting destination.
+    SourceWins,
+    /// Never copy when destination exists. Useful for "seed once"
+    /// replication rules.
+    SkipIfDestExists,
 }
 
 impl StorageSection {
@@ -557,6 +706,7 @@ impl SectionedConfig {
                     .iter()
                     .map(|(name, policy)| (name.clone(), policy.collapse_to_shorthand()))
                     .collect(),
+                replication: flat.replication.clone(),
                 // Shorthand fields never appear in the canonical export —
                 // the expanded `backend:` carries the information instead.
                 // Future `collapse_backend_to_shorthand()` could emit
@@ -665,6 +815,7 @@ impl SectionedConfig {
             backend_encryption: self.storage.backend_encryption,
             backends: self.storage.backends,
             default_backend: self.storage.default_backend,
+            replication: self.storage.replication,
             admission_blocks: self.admission.map(|s| s.blocks).unwrap_or_default(),
             // iam_mode already populated above from self.access.iam_mode.
         }
@@ -687,6 +838,195 @@ fn some_if_nondefault_str(value: &str, default: String) -> Option<String> {
     } else {
         Some(value.to_string())
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Replication config validation — pure, unit-testable, no I/O.
+// ────────────────────────────────────────────────────────────────────────
+
+/// Rule-name regex: `[A-Za-z0-9_.-]{1,64}`. ASCII-only, no whitespace,
+/// no slashes. Matches the SQLite column used as primary key in
+/// `replication_state`.
+fn is_valid_replication_rule_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
+/// Minimum legal `interval` per rule. Anything tighter would thrash
+/// the scheduler and the destination backend's rate limits.
+const MIN_RULE_INTERVAL_SECS: u64 = 30;
+
+/// Minimum legal global `tick_interval`. The scheduler wakes up every
+/// tick; too-frequent ticks burn CPU for no benefit.
+const MIN_TICK_INTERVAL_SECS: u64 = 5;
+
+/// Maximum batch size per rule. Above this and the worker's yield
+/// becomes coarse enough that other due rules get starved.
+const MAX_BATCH_SIZE: u32 = 10_000;
+
+/// Validate the replication config and return human-readable warnings
+/// (empty = all-good). NOT hard errors — the existing `Config::check`
+/// contract is warnings-only; the worker refuses to act on rules that
+/// this validator flagged.
+pub fn validate_replication(cfg: &ReplicationConfig) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    // tick_interval parses as humantime.
+    match humantime::parse_duration(&cfg.tick_interval) {
+        Ok(d) => {
+            let secs: u64 = d.as_secs();
+            if secs < MIN_TICK_INTERVAL_SECS {
+                warnings.push(format!(
+                    "replication.tick_interval={} is below the minimum {}s",
+                    cfg.tick_interval, MIN_TICK_INTERVAL_SECS
+                ));
+            }
+        }
+        Err(e) => {
+            warnings.push(format!(
+                "replication.tick_interval={} is not a valid humantime duration: {}",
+                cfg.tick_interval, e
+            ));
+        }
+    }
+
+    // Per-rule checks.
+    let mut seen_names = std::collections::HashSet::new();
+    for rule in &cfg.rules {
+        if !is_valid_replication_rule_name(&rule.name) {
+            warnings.push(format!(
+                "replication rule name '{}' is invalid (must match [A-Za-z0-9_.-]{{1,64}})",
+                rule.name
+            ));
+            continue;
+        }
+        if !seen_names.insert(rule.name.clone()) {
+            warnings.push(format!(
+                "replication rule name '{}' is duplicated — the first entry wins",
+                rule.name
+            ));
+            continue;
+        }
+
+        // Interval parses + meets minimum.
+        match humantime::parse_duration(&rule.interval) {
+            Ok(d) => {
+                let secs: u64 = d.as_secs();
+                if secs < MIN_RULE_INTERVAL_SECS {
+                    warnings.push(format!(
+                        "replication rule '{}' interval={} below minimum {}s",
+                        rule.name, rule.interval, MIN_RULE_INTERVAL_SECS
+                    ));
+                }
+            }
+            Err(e) => {
+                warnings.push(format!(
+                    "replication rule '{}' interval={} invalid: {}",
+                    rule.name, rule.interval, e
+                ));
+            }
+        }
+
+        if rule.batch_size == 0 || rule.batch_size > MAX_BATCH_SIZE {
+            warnings.push(format!(
+                "replication rule '{}' batch_size={} outside [1, {}]",
+                rule.name, rule.batch_size, MAX_BATCH_SIZE
+            ));
+        }
+
+        // Self-loop: source and destination reference the same
+        // bucket+prefix. Degenerate — the rule would copy objects
+        // back to themselves, pointlessly re-incrementing counters.
+        if rule.source.bucket == rule.destination.bucket
+            && rule.source.prefix == rule.destination.prefix
+        {
+            warnings.push(format!(
+                "replication rule '{}' is a self-loop \
+                 (source == destination); it will be skipped at runtime",
+                rule.name
+            ));
+        }
+
+        // Globs compile.
+        for glob in rule.include_globs.iter().chain(rule.exclude_globs.iter()) {
+            if globset::Glob::new(glob).is_err() {
+                warnings.push(format!(
+                    "replication rule '{}' glob pattern {:?} is invalid",
+                    rule.name, glob
+                ));
+            }
+        }
+    }
+
+    // Cycle detection across rules. A 2-hop cycle (A→B, B→A with
+    // overlapping prefixes) would cause pathological write-amplification
+    // because each tick finds objects to copy back.
+    warnings.extend(detect_replication_cycles(&cfg.rules));
+
+    warnings
+}
+
+/// Pure cycle detection: report all rules that form a cycle with another.
+/// A cycle exists when there's a chain of rules whose source+prefix
+/// graph returns to the starting bucket+prefix.
+///
+/// Exposed `pub(crate)` so unit tests can pin the behaviour.
+pub(crate) fn detect_replication_cycles(rules: &[ReplicationRule]) -> Vec<String> {
+    use std::collections::{HashMap, HashSet};
+
+    /// `(bucket, prefix)` identifies a node in the replication graph.
+    type Node = (String, String);
+
+    // Edge list: source node -> list of (dest node, rule_name).
+    let mut edges: HashMap<Node, Vec<(Node, String)>> = HashMap::new();
+    for rule in rules {
+        let src: Node = (rule.source.bucket.clone(), rule.source.prefix.clone());
+        let dst: Node = (
+            rule.destination.bucket.clone(),
+            rule.destination.prefix.clone(),
+        );
+        edges.entry(src).or_default().push((dst, rule.name.clone()));
+    }
+
+    let mut warnings = Vec::new();
+    let mut seen_cycles: HashSet<String> = HashSet::new();
+
+    // For each node, run a bounded DFS looking for a return.
+    for start in edges.keys() {
+        let mut stack: Vec<(Node, Vec<String>)> = vec![(start.clone(), Vec::new())];
+        let mut visited: HashSet<Node> = HashSet::new();
+        while let Some((node, path)) = stack.pop() {
+            if !visited.insert(node.clone()) {
+                continue;
+            }
+            if let Some(targets) = edges.get(&node) {
+                for (next, rule_name) in targets {
+                    let mut next_path = path.clone();
+                    next_path.push(rule_name.clone());
+                    if next == start {
+                        // Cycle found! Deduplicate by the sorted rule-names
+                        // set so the warnings list stays clean.
+                        let mut sorted = next_path.clone();
+                        sorted.sort();
+                        let key = sorted.join("|");
+                        if seen_cycles.insert(key) {
+                            warnings.push(format!(
+                                "replication rules form a cycle: {}",
+                                next_path.join(" -> ")
+                            ));
+                        }
+                        continue;
+                    }
+                    stack.push((next.clone(), next_path));
+                }
+            }
+        }
+    }
+
+    warnings
 }
 
 #[cfg(test)]
@@ -986,5 +1326,164 @@ mod tests {
             .normalize()
             .expect_err("relative path with `..` must be rejected");
         assert!(err.contains(".."));
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Replication validation + cycle detection tests
+    // ────────────────────────────────────────────────────────────────
+
+    fn rule(name: &str, src: (&str, &str), dst: (&str, &str), interval: &str) -> ReplicationRule {
+        ReplicationRule {
+            name: name.to_string(),
+            enabled: true,
+            source: ReplicationEndpoint {
+                bucket: src.0.to_string(),
+                prefix: src.1.to_string(),
+            },
+            destination: ReplicationEndpoint {
+                bucket: dst.0.to_string(),
+                prefix: dst.1.to_string(),
+            },
+            interval: interval.to_string(),
+            batch_size: 100,
+            replicate_deletes: false,
+            conflict: ConflictPolicy::NewerWins,
+            include_globs: Vec::new(),
+            exclude_globs: vec![".dg/*".to_string()],
+        }
+    }
+
+    #[test]
+    fn replication_validation_accepts_default() {
+        let warnings = validate_replication(&ReplicationConfig::default());
+        assert!(warnings.is_empty(), "default should be valid: {:?}", warnings);
+    }
+
+    #[test]
+    fn replication_validation_rejects_bad_rule_name() {
+        let cfg = ReplicationConfig {
+            rules: vec![rule("has spaces!", ("a", ""), ("b", ""), "1h")],
+            ..Default::default()
+        };
+        let warnings = validate_replication(&cfg);
+        assert!(
+            warnings.iter().any(|w| w.contains("invalid")
+                && w.contains("has spaces!")),
+            "{:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn replication_validation_flags_duplicate_rule_name() {
+        let cfg = ReplicationConfig {
+            rules: vec![
+                rule("r1", ("a", ""), ("b", ""), "1h"),
+                rule("r1", ("c", ""), ("d", ""), "1h"),
+            ],
+            ..Default::default()
+        };
+        let warnings = validate_replication(&cfg);
+        assert!(warnings.iter().any(|w| w.contains("duplicated")));
+    }
+
+    #[test]
+    fn replication_validation_rejects_too_short_interval() {
+        let cfg = ReplicationConfig {
+            rules: vec![rule("r1", ("a", ""), ("b", ""), "5s")],
+            ..Default::default()
+        };
+        let warnings = validate_replication(&cfg);
+        assert!(warnings.iter().any(|w| w.contains("below minimum")));
+    }
+
+    #[test]
+    fn replication_validation_rejects_bad_interval() {
+        let cfg = ReplicationConfig {
+            rules: vec![rule("r1", ("a", ""), ("b", ""), "not-a-duration")],
+            ..Default::default()
+        };
+        let warnings = validate_replication(&cfg);
+        assert!(warnings.iter().any(|w| w.contains("invalid")));
+    }
+
+    #[test]
+    fn replication_validation_flags_self_loop() {
+        let cfg = ReplicationConfig {
+            rules: vec![rule("loop", ("a", "pfx"), ("a", "pfx"), "1h")],
+            ..Default::default()
+        };
+        let warnings = validate_replication(&cfg);
+        assert!(warnings.iter().any(|w| w.contains("self-loop")));
+    }
+
+    #[test]
+    fn replication_validation_detects_two_hop_cycle() {
+        let cfg = ReplicationConfig {
+            rules: vec![
+                rule("a-to-b", ("bkt_a", ""), ("bkt_b", ""), "1h"),
+                rule("b-to-a", ("bkt_b", ""), ("bkt_a", ""), "1h"),
+            ],
+            ..Default::default()
+        };
+        let warnings = validate_replication(&cfg);
+        let cycle_warns: Vec<_> = warnings
+            .iter()
+            .filter(|w| w.contains("cycle"))
+            .collect();
+        assert!(!cycle_warns.is_empty(), "expected cycle warning: {:?}", warnings);
+    }
+
+    #[test]
+    fn replication_validation_non_cycle_fan_out_is_ok() {
+        let cfg = ReplicationConfig {
+            rules: vec![
+                rule("a-to-b", ("a", ""), ("b", ""), "1h"),
+                rule("a-to-c", ("a", ""), ("c", ""), "1h"),
+                rule("a-to-d", ("a", ""), ("d", ""), "1h"),
+            ],
+            ..Default::default()
+        };
+        let warnings = validate_replication(&cfg);
+        assert!(
+            warnings.iter().all(|w| !w.contains("cycle")),
+            "fan-out is not a cycle: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn replication_validation_rejects_bad_glob() {
+        let mut cfg = ReplicationConfig {
+            rules: vec![rule("r", ("a", ""), ("b", ""), "1h")],
+            ..Default::default()
+        };
+        cfg.rules[0].include_globs = vec!["[badbracket".to_string()];
+        let warnings = validate_replication(&cfg);
+        assert!(warnings.iter().any(|w| w.contains("glob")));
+    }
+
+    #[test]
+    fn replication_validation_flags_batch_size_zero() {
+        let mut cfg = ReplicationConfig {
+            rules: vec![rule("r", ("a", ""), ("b", ""), "1h")],
+            ..Default::default()
+        };
+        cfg.rules[0].batch_size = 0;
+        let warnings = validate_replication(&cfg);
+        assert!(warnings.iter().any(|w| w.contains("batch_size")));
+    }
+
+    #[test]
+    fn replication_roundtrip_serde() {
+        let cfg = ReplicationConfig {
+            enabled: true,
+            tick_interval: "30s".to_string(),
+            max_failures_retained: 100,
+            rules: vec![rule("r", ("a", ""), ("b", ""), "1h")],
+        };
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        let back: ReplicationConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(cfg, back);
     }
 }

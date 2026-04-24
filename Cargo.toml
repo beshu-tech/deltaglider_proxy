@@ -22,6 +22,8 @@ schemars = "0.8"
 ipnet = { version = "2.11", features = ["serde"] }
 # Glob patterns for admission block path_glob matcher.
 globset = "0.4"
+# Human-friendly duration parsing ("15m", "1h", "30s") — used by replication config.
+humantime = "2"
 
 # AWS S3 SDK (for backend storage) — direct client config, no aws-config/STS bloat
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }
