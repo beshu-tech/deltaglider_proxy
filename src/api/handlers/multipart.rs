@@ -108,13 +108,19 @@ async fn complete_multipart_upload(
 
     // Bifurcate: non-delta-eligible files use the chunked path to avoid
     // assembling all parts into a single contiguous buffer (~2x memory savings).
+    //
+    // C4 security fix: `complete()` / `complete_parts()` now flip the
+    // upload to `Completing` atomically. We MUST call either
+    // `finish_upload` (on success) or `rollback_upload` (on error) —
+    // otherwise the upload stays stuck in `Completing` and rejects
+    // both abort and further UploadPart calls until the sweeper GC's it.
     let engine = state.engine.load();
     let (multipart_etag, store_result) = if !engine.is_delta_eligible(key) {
         let completed = state
             .multipart
             .complete_parts(upload_id, bucket, key, &requested_parts)?;
         let etag = completed.etag.clone();
-        let result = engine
+        match engine
             .store_passthrough_chunked(
                 bucket,
                 key,
@@ -123,14 +129,24 @@ async fn complete_multipart_upload(
                 completed.content_type,
                 completed.user_metadata,
             )
-            .await?;
-        (etag, result)
+            .await
+        {
+            Ok(result) => (etag, result),
+            Err(e) => {
+                // Engine failure: return upload to Open so the client
+                // can retry CompleteMultipartUpload without reuploading
+                // parts. Matches S3's behaviour on InternalError during
+                // complete.
+                state.multipart.rollback_upload(upload_id);
+                return Err(e.into());
+            }
+        }
     } else {
         let completed = state
             .multipart
             .complete(upload_id, bucket, key, &requested_parts)?;
         let etag = completed.etag.clone();
-        let result = engine
+        match engine
             .store(
                 bucket,
                 key,
@@ -138,13 +154,18 @@ async fn complete_multipart_upload(
                 completed.content_type,
                 completed.user_metadata,
             )
-            .await?;
-        (etag, result)
+            .await
+        {
+            Ok(result) => (etag, result),
+            Err(e) => {
+                state.multipart.rollback_upload(upload_id);
+                return Err(e.into());
+            }
+        }
     };
 
-    // Store succeeded — now safe to remove the upload from the map.
-    // (If store had failed, the upload would still be retryable.)
-    state.multipart.remove_upload(upload_id);
+    // Store succeeded — upload is terminal; remove from the map.
+    state.multipart.finish_upload(upload_id);
 
     debug!(
         "CompleteMultipartUpload {}/{} stored as {}",

@@ -21,6 +21,41 @@ struct PartData {
     uploaded_at: DateTime<Utc>,
 }
 
+/// Lifecycle state of a multipart upload. Replaces the old
+/// `completed: bool` flag to close a race between `complete()` and
+/// `abort()` where the handler could return 204 "aborted" AFTER
+/// complete had already validated parts and the subsequent
+/// `engine.store*` was about to publish the object (C4 security fix).
+///
+/// The state machine:
+///
+/// ```text
+///                   upload_part ↻       abort
+///                      │                 │
+///                      ▼                 ▼
+///   [create] ─▶ Open ─▶─ begin_complete ─▶─ Completing
+///                │                            │
+///                │                            ├── finish_upload ──▶ (removed)
+///                │                            └── rollback_upload ──▶ Open
+///                │
+///                └── abort ──▶ (removed)
+/// ```
+///
+/// Invariants enforced by callers:
+/// - `upload_part` rejects unless state is `Open`.
+/// - `abort` rejects when state is `Completing` (409 Conflict).
+/// - `begin_complete` only returns parts if state was `Open`; atomically
+///   flips to `Completing` under the write lock.
+/// - `finish_upload` / `rollback_upload` terminate `Completing` state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MultipartState {
+    /// Accepting UploadPart calls. Abort is allowed.
+    Open,
+    /// `begin_complete` has validated and handed off parts; `engine.store*`
+    /// is in flight. New UploadParts and aborts are refused.
+    Completing,
+}
+
 /// State for an in-progress multipart upload
 struct MultipartUpload {
     upload_id: String,
@@ -30,12 +65,11 @@ struct MultipartUpload {
     content_type: Option<String>,
     user_metadata: HashMap<String, String>,
     parts: HashMap<u32, PartData>,
-    /// Set to true after successful complete(). Prevents double-completion
-    /// while allowing the upload to stay in the map until store() succeeds.
-    completed: bool,
+    state: MultipartState,
 }
 
 /// Result of assembling a completed multipart upload
+#[derive(Debug)]
 pub struct CompletedUpload {
     pub data: Bytes,
     pub etag: String,
@@ -116,7 +150,7 @@ impl MultipartStore {
             content_type,
             user_metadata,
             parts: HashMap::new(),
-            completed: false,
+            state: MultipartState::Open,
         };
 
         uploads.insert(upload_id.clone(), upload);
@@ -153,6 +187,16 @@ impl MultipartStore {
             return Err(S3Error::NoSuchUpload(upload_id.to_string()));
         }
 
+        // C4 security fix: parts can only be uploaded while the upload is
+        // Open. Once CompleteMultipartUpload has started (state=Completing),
+        // accepting new parts would race with the in-flight `engine.store*`.
+        if upload.state != MultipartState::Open {
+            return Err(S3Error::InvalidRequest(
+                "Upload is in the process of being completed; no more parts can be added"
+                    .to_string(),
+            ));
+        }
+
         // Overwrite semantics: re-uploading same part_number replaces previous data
         upload.parts.insert(
             part_number,
@@ -177,8 +221,14 @@ impl MultipartStore {
             .map(|p| p.data.len() as u64)
     }
 
-    /// Assemble parts into a single object and remove the upload atomically.
-    /// Takes ownership under write lock (fast), then assembles without holding it.
+    /// Begin completion: validate parts, atomically transition to
+    /// `Completing`, and return the assembled buffer. After this call
+    /// the upload is reserved — new UploadParts AND abort are refused
+    /// (409) until the caller invokes `finish_upload` or
+    /// `rollback_upload`. This closes the C4 complete/abort race.
+    ///
+    /// On validation failure the state is NOT changed (upload stays
+    /// `Open` so the client can retry with corrected part metadata).
     pub fn complete(
         &self,
         upload_id: &str,
@@ -186,16 +236,16 @@ impl MultipartStore {
         key: &str,
         requested_parts: &[(u32, String)], // (part_number, etag)
     ) -> Result<CompletedUpload, S3Error> {
-        // Write lock: mark as completed to prevent double-completion race.
-        // Do NOT remove the upload — it stays in the map so the client can
-        // retry CompleteMultipartUpload if the subsequent store() fails.
-        // The handler calls remove_upload() only after store() succeeds.
         let mut uploads = self.uploads.write();
 
-        // Check if already completed (double-completion race)
+        // Refuse if the upload is already Completing — only one complete
+        // may be in flight at a time. Double-complete returns 404 to
+        // preserve the prior contract.
         if let Some(u) = uploads.get(upload_id) {
-            if u.completed {
-                return Err(S3Error::NoSuchUpload(upload_id.to_string()));
+            if u.state == MultipartState::Completing {
+                return Err(S3Error::InvalidRequest(
+                    "Upload is already being completed".to_string(),
+                ));
             }
         }
 
@@ -214,18 +264,19 @@ impl MultipartStore {
             user_metadata: upload.user_metadata.clone(),
         };
 
-        // Mark completed (prevents double-completion) but keep in map
+        // Flip to Completing under the same write lock that performed the
+        // validation — atomic with respect to `abort` and `upload_part`.
         if let Some(u) = uploads.get_mut(upload_id) {
-            u.completed = true;
+            u.state = MultipartState::Completing;
         }
 
         Ok(result)
     }
 
-    /// Return ordered part data without assembling into a contiguous buffer.
-    /// Like `complete()`, but returns individual part buffers instead of
-    /// assembling into one contiguous buffer. Used for non-delta-eligible files
-    /// to avoid ~2x memory usage.
+    /// Begin-complete variant that returns the individual part buffers
+    /// instead of a single contiguous buffer — avoids the ~2x memory
+    /// spike for non-delta-eligible files. Same state-machine semantics
+    /// as `complete()`.
     pub fn complete_parts(
         &self,
         upload_id: &str,
@@ -236,8 +287,10 @@ impl MultipartStore {
         let mut uploads = self.uploads.write();
 
         if let Some(u) = uploads.get(upload_id) {
-            if u.completed {
-                return Err(S3Error::NoSuchUpload(upload_id.to_string()));
+            if u.state == MultipartState::Completing {
+                return Err(S3Error::InvalidRequest(
+                    "Upload is already being completed".to_string(),
+                ));
             }
         }
 
@@ -253,10 +306,30 @@ impl MultipartStore {
         };
 
         if let Some(u) = uploads.get_mut(upload_id) {
-            u.completed = true;
+            u.state = MultipartState::Completing;
         }
 
         Ok(result)
+    }
+
+    /// Roll the upload back to `Open` after a failed engine.store*.
+    /// The client is expected to retry CompleteMultipartUpload with the
+    /// same part set — this matches S3's behaviour when the backing
+    /// store rejects a complete.
+    ///
+    /// Idempotent: if the upload was already removed (e.g. via a
+    /// concurrent abort after rollback), does nothing.
+    pub fn rollback_upload(&self, upload_id: &str) {
+        if let Some(u) = self.uploads.write().get_mut(upload_id) {
+            u.state = MultipartState::Open;
+        }
+    }
+
+    /// Finalise a completed upload after `engine.store*` succeeds.
+    /// Removes the upload from the map. This is the terminal state.
+    /// Semantically equivalent to the previous `remove_upload`.
+    pub fn finish_upload(&self, upload_id: &str) {
+        self.uploads.write().remove(upload_id);
     }
 
     /// Shared validation for `complete()` and `complete_parts()`.
@@ -337,14 +410,13 @@ impl MultipartStore {
         ))
     }
 
-    /// Remove a completed upload from the map.
-    /// Called AFTER engine.store() succeeds to finalize the completion.
-    /// This prevents data loss if store fails — the upload remains retryable.
-    pub fn remove_upload(&self, upload_id: &str) {
-        self.uploads.write().remove(upload_id);
-    }
-
     /// Abort a multipart upload. Validates bucket+key match.
+    ///
+    /// C4 security fix: refuse when the upload is already in
+    /// `Completing` state. Accepting the abort at that point would
+    /// race with the in-flight `engine.store*` and return a 204
+    /// "aborted" even though the object actually lands. Clients
+    /// should wait for the CompleteMultipartUpload response instead.
     pub fn abort(&self, upload_id: &str, bucket: &str, key: &str) -> Result<(), S3Error> {
         let mut uploads = self.uploads.write();
         let upload = uploads
@@ -353,6 +425,12 @@ impl MultipartStore {
 
         if upload.bucket != bucket || upload.key != key {
             return Err(S3Error::NoSuchUpload(upload_id.to_string()));
+        }
+
+        if upload.state == MultipartState::Completing {
+            return Err(S3Error::InvalidRequest(
+                "Cannot abort: upload is currently being completed".to_string(),
+            ));
         }
 
         uploads.remove(upload_id);
@@ -680,5 +758,191 @@ mod tests {
         // 4th upload should fail
         let result = store.create("bucket", "key3.bin", None, HashMap::new());
         assert!(result.is_err());
+    }
+
+    // === C4 security fix: state-machine tests ===
+
+    fn seed_upload(store: &MultipartStore) -> String {
+        let upload_id = store
+            .create("bucket", "key.bin", None, HashMap::new())
+            .unwrap();
+        let data = Bytes::from(vec![0u8; 100]);
+        store
+            .upload_part(&upload_id, "bucket", "key.bin", 1, data)
+            .unwrap();
+        upload_id
+    }
+
+    #[test]
+    fn test_complete_flips_state_to_completing() {
+        let store = MultipartStore::new(100 * 1024 * 1024);
+        let upload_id = seed_upload(&store);
+        let etag = {
+            let u = store.uploads.read();
+            let p = u.get(&upload_id).unwrap().parts.get(&1).unwrap();
+            format!("\"{}\"", p.md5_hex)
+        };
+
+        // Before complete → Open.
+        assert_eq!(
+            store.uploads.read().get(&upload_id).unwrap().state,
+            MultipartState::Open
+        );
+
+        store
+            .complete(&upload_id, "bucket", "key.bin", &[(1, etag)])
+            .unwrap();
+
+        // After complete, upload stays in map but as Completing.
+        assert_eq!(
+            store.uploads.read().get(&upload_id).unwrap().state,
+            MultipartState::Completing
+        );
+    }
+
+    #[test]
+    fn test_abort_refused_when_completing() {
+        let store = MultipartStore::new(100 * 1024 * 1024);
+        let upload_id = seed_upload(&store);
+        let etag = {
+            let u = store.uploads.read();
+            let p = u.get(&upload_id).unwrap().parts.get(&1).unwrap();
+            format!("\"{}\"", p.md5_hex)
+        };
+
+        store
+            .complete(&upload_id, "bucket", "key.bin", &[(1, etag)])
+            .unwrap();
+
+        let err = store.abort(&upload_id, "bucket", "key.bin").unwrap_err();
+        assert!(matches!(err, S3Error::InvalidRequest(_)));
+        // Upload still in map, still Completing.
+        assert_eq!(
+            store.uploads.read().get(&upload_id).unwrap().state,
+            MultipartState::Completing
+        );
+    }
+
+    #[test]
+    fn test_upload_part_refused_when_completing() {
+        let store = MultipartStore::new(100 * 1024 * 1024);
+        let upload_id = seed_upload(&store);
+        let etag = {
+            let u = store.uploads.read();
+            let p = u.get(&upload_id).unwrap().parts.get(&1).unwrap();
+            format!("\"{}\"", p.md5_hex)
+        };
+        store
+            .complete(&upload_id, "bucket", "key.bin", &[(1, etag)])
+            .unwrap();
+
+        let err = store
+            .upload_part(
+                &upload_id,
+                "bucket",
+                "key.bin",
+                2,
+                Bytes::from(vec![0u8; 50]),
+            )
+            .unwrap_err();
+        assert!(matches!(err, S3Error::InvalidRequest(_)));
+    }
+
+    #[test]
+    fn test_rollback_upload_returns_to_open() {
+        let store = MultipartStore::new(100 * 1024 * 1024);
+        let upload_id = seed_upload(&store);
+        let etag = {
+            let u = store.uploads.read();
+            let p = u.get(&upload_id).unwrap().parts.get(&1).unwrap();
+            format!("\"{}\"", p.md5_hex)
+        };
+        store
+            .complete(&upload_id, "bucket", "key.bin", &[(1, etag)])
+            .unwrap();
+
+        // Simulate engine.store* failure → rollback.
+        store.rollback_upload(&upload_id);
+
+        assert_eq!(
+            store.uploads.read().get(&upload_id).unwrap().state,
+            MultipartState::Open
+        );
+
+        // Client can now retry Complete or abort.
+        store.abort(&upload_id, "bucket", "key.bin").unwrap();
+    }
+
+    #[test]
+    fn test_finish_upload_removes_entry() {
+        let store = MultipartStore::new(100 * 1024 * 1024);
+        let upload_id = seed_upload(&store);
+        let etag = {
+            let u = store.uploads.read();
+            let p = u.get(&upload_id).unwrap().parts.get(&1).unwrap();
+            format!("\"{}\"", p.md5_hex)
+        };
+        store
+            .complete(&upload_id, "bucket", "key.bin", &[(1, etag)])
+            .unwrap();
+
+        store.finish_upload(&upload_id);
+
+        assert!(store.uploads.read().get(&upload_id).is_none());
+    }
+
+    #[test]
+    fn test_double_complete_returns_conflict() {
+        let store = MultipartStore::new(100 * 1024 * 1024);
+        let upload_id = seed_upload(&store);
+        let etag = {
+            let u = store.uploads.read();
+            let p = u.get(&upload_id).unwrap().parts.get(&1).unwrap();
+            format!("\"{}\"", p.md5_hex)
+        };
+
+        store
+            .complete(&upload_id, "bucket", "key.bin", &[(1, etag.clone())])
+            .unwrap();
+        let err = store
+            .complete(&upload_id, "bucket", "key.bin", &[(1, etag)])
+            .unwrap_err();
+        assert!(
+            matches!(err, S3Error::InvalidRequest(_)),
+            "double-complete should return InvalidRequest while in Completing, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validation_failure_does_not_change_state() {
+        // If complete() fails validation (wrong etag), state must stay Open
+        // so the client can retry with correct metadata.
+        let store = MultipartStore::new(100 * 1024 * 1024);
+        let upload_id = seed_upload(&store);
+
+        let err = store
+            .complete(
+                &upload_id,
+                "bucket",
+                "key.bin",
+                &[(1, "\"wrong-etag\"".to_string())],
+            )
+            .unwrap_err();
+        assert!(matches!(err, S3Error::InvalidPart(_)));
+        assert_eq!(
+            store.uploads.read().get(&upload_id).unwrap().state,
+            MultipartState::Open,
+            "validation failure must leave upload Open for retry"
+        );
+    }
+
+    #[test]
+    fn test_abort_while_open_drops_upload() {
+        // Baseline: abort on an Open upload still works normally.
+        let store = MultipartStore::new(100 * 1024 * 1024);
+        let upload_id = seed_upload(&store);
+        store.abort(&upload_id, "bucket", "key.bin").unwrap();
+        assert!(store.uploads.read().get(&upload_id).is_none());
     }
 }
