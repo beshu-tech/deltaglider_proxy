@@ -62,6 +62,10 @@ struct MultipartUpload {
     bucket: String,
     key: String,
     created_at: DateTime<Utc>,
+    /// Latest UploadPart or Create timestamp — drives the idle-TTL sweeper
+    /// that reclaims memory from attackers who open uploads and walk away
+    /// (C3 DoS fix).
+    last_activity: DateTime<Utc>,
     content_type: Option<String>,
     user_metadata: HashMap<String, String>,
     parts: HashMap<u32, PartData>,
@@ -100,20 +104,88 @@ fn default_max_uploads() -> usize {
     crate::config::env_parse_with_default("DGP_MAX_MULTIPART_UPLOADS", 1000)
 }
 
+/// Default global cap on total in-flight multipart bytes across all uploads.
+/// Overridable via `DGP_MAX_TOTAL_MULTIPART_BYTES` env var. Protects against
+/// the C3 DoS where an attacker opens many uploads and sends many large
+/// parts without completing — pre-fix the only cap was `max_object_size`
+/// per upload at complete-time, leaving `max_object_size * max_uploads`
+/// bytes of RAM reachable.
+///
+/// Default formula: `max_object_size * (max_uploads / 4)`. The /4 is a
+/// safety margin so legitimate multi-uploader workloads still fit while
+/// attackers hit the ceiling before they can saturate memory.
+fn default_max_total_multipart_bytes(max_object_size: u64, max_uploads: usize) -> u64 {
+    // Allow operator override (absolute bytes).
+    if let Ok(v) = std::env::var("DGP_MAX_TOTAL_MULTIPART_BYTES") {
+        if let Ok(n) = v.parse::<u64>() {
+            return n;
+        }
+    }
+    // Default: max_object_size * (max_uploads / 4), clamped to at least
+    // max_object_size (one full upload must always fit).
+    max_object_size.saturating_mul((max_uploads.max(4) / 4) as u64)
+}
+
+/// TTL before an idle (no recent UploadPart activity) multipart upload is
+/// garbage-collected. Overridable via `DGP_MULTIPART_IDLE_TTL_HOURS`.
+/// Default 24h — matches AWS's default abort-incomplete-multipart-upload
+/// lifecycle recommendation.
+fn default_multipart_idle_ttl_hours() -> i64 {
+    crate::config::env_parse_with_default("DGP_MULTIPART_IDLE_TTL_HOURS", 24)
+}
+
 /// Thread-safe in-memory store for multipart upload state
 pub struct MultipartStore {
     uploads: RwLock<HashMap<String, MultipartUpload>>,
     max_object_size: u64,
     max_uploads: usize,
+    /// Global in-flight bytes across all uploads. Kept consistent with
+    /// the sum of `MultipartUpload.parts[*].size` — updated under the
+    /// same write lock that mutates the parts map. Checked before each
+    /// UploadPart accepts bytes (C3 DoS fix).
+    in_flight_bytes: std::sync::atomic::AtomicU64,
+    max_total_multipart_bytes: u64,
+    idle_ttl: Duration,
 }
 
 impl MultipartStore {
     pub fn new(max_object_size: u64) -> Self {
+        let max_uploads = default_max_uploads();
+        let max_total_multipart_bytes =
+            default_max_total_multipart_bytes(max_object_size, max_uploads);
+        let idle_ttl_hours = default_multipart_idle_ttl_hours();
         Self {
             uploads: RwLock::new(HashMap::new()),
             max_object_size,
-            max_uploads: default_max_uploads(),
+            max_uploads,
+            in_flight_bytes: std::sync::atomic::AtomicU64::new(0),
+            max_total_multipart_bytes,
+            idle_ttl: Duration::hours(idle_ttl_hours),
         }
+    }
+
+    /// Test-only constructor with custom caps. Not part of the stable API.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        max_object_size: u64,
+        max_total_multipart_bytes: u64,
+        idle_ttl: Duration,
+    ) -> Self {
+        Self {
+            uploads: RwLock::new(HashMap::new()),
+            max_object_size,
+            max_uploads: 1000,
+            in_flight_bytes: std::sync::atomic::AtomicU64::new(0),
+            max_total_multipart_bytes,
+            idle_ttl,
+        }
+    }
+
+    /// Snapshot the global in-flight byte counter. Test-only observability.
+    #[cfg(test)]
+    pub(crate) fn in_flight_bytes(&self) -> u64 {
+        self.in_flight_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Create a new multipart upload, returns the upload ID.
@@ -147,6 +219,7 @@ impl MultipartStore {
             bucket: bucket.to_string(),
             key: key.to_string(),
             created_at: now,
+            last_activity: now,
             content_type,
             user_metadata,
             parts: HashMap::new(),
@@ -197,6 +270,54 @@ impl MultipartStore {
             ));
         }
 
+        // C3 DoS fix: enforce size caps BEFORE buffering the part. Two
+        // gates, checked in order:
+        //
+        // 1. Per-upload cap (max_object_size) — prevents one upload from
+        //    assembling more bytes than a single object is allowed to be.
+        //    Overwrite semantics: recompute cumulative from existing parts
+        //    MINUS the old size of `part_number` (if any) PLUS the new
+        //    size. Without the subtraction, re-uploading a part would
+        //    double-count.
+        //
+        // 2. Global cap (max_total_multipart_bytes) — prevents many
+        //    uploads from collectively exhausting heap. Rejects with
+        //    SlowDown so AWS SDKs back off and retry.
+        let old_part_size = upload
+            .parts
+            .get(&part_number)
+            .map(|p| p.size)
+            .unwrap_or(0);
+        let cumulative_after = upload
+            .parts
+            .values()
+            .map(|p| p.size)
+            .sum::<u64>()
+            .saturating_sub(old_part_size)
+            .saturating_add(size);
+
+        if cumulative_after > self.max_object_size {
+            return Err(S3Error::EntityTooLarge {
+                size: cumulative_after,
+                max: self.max_object_size,
+            });
+        }
+
+        // Compute the global delta we'd contribute (signed on overwrite).
+        let delta: i64 = size as i64 - old_part_size as i64;
+        if delta > 0 {
+            let new_total = self
+                .in_flight_bytes
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(delta as u64);
+            if new_total > self.max_total_multipart_bytes {
+                return Err(S3Error::SlowDown(format!(
+                    "Multipart in-flight bytes cap reached ({} / {} bytes)",
+                    new_total, self.max_total_multipart_bytes
+                )));
+            }
+        }
+
         // Overwrite semantics: re-uploading same part_number replaces previous data
         upload.parts.insert(
             part_number,
@@ -208,6 +329,17 @@ impl MultipartStore {
                 uploaded_at: Utc::now(),
             },
         );
+        upload.last_activity = Utc::now();
+
+        // Update global counter AFTER the insert so concurrent readers see
+        // a consistent view (counter ≥ actual bytes in map at any moment).
+        if delta >= 0 {
+            self.in_flight_bytes
+                .fetch_add(delta as u64, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.in_flight_bytes
+                .fetch_sub((-delta) as u64, std::sync::atomic::Ordering::Relaxed);
+        }
 
         Ok(etag)
     }
@@ -328,8 +460,23 @@ impl MultipartStore {
     /// Finalise a completed upload after `engine.store*` succeeds.
     /// Removes the upload from the map. This is the terminal state.
     /// Semantically equivalent to the previous `remove_upload`.
+    ///
+    /// Also releases the upload's bytes from the global in-flight counter
+    /// so new uploads can reclaim headroom (C3 DoS fix).
     pub fn finish_upload(&self, upload_id: &str) {
-        self.uploads.write().remove(upload_id);
+        if let Some(u) = self.uploads.write().remove(upload_id) {
+            self.release_bytes(&u);
+        }
+    }
+
+    /// Return the sum of all part sizes for this upload — used by the
+    /// in-flight counter on release paths.
+    fn release_bytes(&self, upload: &MultipartUpload) {
+        let freed: u64 = upload.parts.values().map(|p| p.size).sum();
+        if freed > 0 {
+            self.in_flight_bytes
+                .fetch_sub(freed, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Shared validation for `complete()` and `complete_parts()`.
@@ -433,7 +580,11 @@ impl MultipartStore {
             ));
         }
 
-        uploads.remove(upload_id);
+        // Release this upload's bytes from the global counter (C3 DoS fix).
+        if let Some(removed) = uploads.remove(upload_id) {
+            drop(uploads); // release write lock before touching atomic
+            self.release_bytes(&removed);
+        }
         Ok(())
     }
 
@@ -495,10 +646,61 @@ impl MultipartStore {
         result
     }
 
-    /// Remove uploads older than max_age.
+    /// Remove uploads that have been idle longer than the configured idle
+    /// TTL OR have exceeded `max_age` (whichever is stricter). The idle
+    /// TTL is measured from `last_activity` (last UploadPart or Create).
+    ///
+    /// C3 DoS fix: sweeps uploads opened by an attacker who never
+    /// completes. Also decrements the global in-flight byte counter so
+    /// legitimate callers can reclaim headroom. Called periodically from
+    /// `main.rs` (default every hour with max_age=1h).
     pub fn cleanup_expired(&self, max_age: std::time::Duration) {
-        let cutoff = Utc::now() - Duration::from_std(max_age).unwrap_or(Duration::hours(1));
-        self.uploads.write().retain(|_, u| u.created_at > cutoff);
+        let now = Utc::now();
+        let max_age_cutoff = now - Duration::from_std(max_age).unwrap_or(Duration::hours(1));
+        let idle_cutoff = now - self.idle_ttl;
+        // Take stricter of the two cutoffs (newer / later = stricter).
+        let cutoff = if idle_cutoff > max_age_cutoff {
+            idle_cutoff
+        } else {
+            max_age_cutoff
+        };
+
+        // Collect + remove under write lock, then release bytes without it.
+        let expired: Vec<MultipartUpload> = {
+            let mut uploads = self.uploads.write();
+            let mut expired = Vec::new();
+            uploads.retain(|_, u| {
+                // Preserve uploads in Completing state regardless of age:
+                // their engine.store* is in flight, and removing them here
+                // would desync with the handler's finish_upload/rollback.
+                // The handler always terminates, so this hold is bounded.
+                if u.state == MultipartState::Completing {
+                    return true;
+                }
+                if u.last_activity <= cutoff {
+                    // swap-remove via retain-false, capture the value
+                    expired.push(MultipartUpload {
+                        upload_id: u.upload_id.clone(),
+                        bucket: u.bucket.clone(),
+                        key: u.key.clone(),
+                        created_at: u.created_at,
+                        last_activity: u.last_activity,
+                        content_type: u.content_type.clone(),
+                        user_metadata: u.user_metadata.clone(),
+                        parts: std::mem::take(&mut u.parts),
+                        state: u.state,
+                    });
+                    false
+                } else {
+                    true
+                }
+            });
+            expired
+        };
+
+        for u in expired {
+            self.release_bytes(&u);
+        }
     }
 }
 
@@ -944,5 +1146,199 @@ mod tests {
         let upload_id = seed_upload(&store);
         store.abort(&upload_id, "bucket", "key.bin").unwrap();
         assert!(store.uploads.read().get(&upload_id).is_none());
+    }
+
+    // === C3 DoS fix: size-cap + global-counter + TTL sweeper tests ===
+
+    #[test]
+    fn test_upload_part_rejects_when_cumulative_exceeds_max_object_size() {
+        // max_object_size = 1 KiB. Upload 700 B + 200 B → OK, 300 B → rejected.
+        let store = MultipartStore::new(1024);
+        let upload_id = store
+            .create("bucket", "key", None, HashMap::new())
+            .unwrap();
+        store
+            .upload_part(
+                &upload_id,
+                "bucket",
+                "key",
+                1,
+                Bytes::from(vec![0u8; 700]),
+            )
+            .unwrap();
+        store
+            .upload_part(
+                &upload_id,
+                "bucket",
+                "key",
+                2,
+                Bytes::from(vec![0u8; 200]),
+            )
+            .unwrap();
+        let err = store
+            .upload_part(
+                &upload_id,
+                "bucket",
+                "key",
+                3,
+                Bytes::from(vec![0u8; 300]),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, S3Error::EntityTooLarge { size, max } if size == 1200 && max == 1024),
+            "got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_upload_part_overwrite_adjusts_cumulative_correctly() {
+        // Overwrite a 1000 B part with 200 B — cumulative goes DOWN, not up.
+        let store = MultipartStore::new(1500);
+        let upload_id = store
+            .create("bucket", "key", None, HashMap::new())
+            .unwrap();
+        store
+            .upload_part(
+                &upload_id,
+                "bucket",
+                "key",
+                1,
+                Bytes::from(vec![0u8; 1000]),
+            )
+            .unwrap();
+        // Add 400 more via a second part — total 1400, under cap.
+        store
+            .upload_part(
+                &upload_id,
+                "bucket",
+                "key",
+                2,
+                Bytes::from(vec![0u8; 400]),
+            )
+            .unwrap();
+        // Now overwrite part 1 with 200 B. New cumulative = 200 + 400 = 600.
+        store
+            .upload_part(
+                &upload_id,
+                "bucket",
+                "key",
+                1,
+                Bytes::from(vec![0u8; 200]),
+            )
+            .unwrap();
+        // Counter should reflect the overwrite.
+        assert_eq!(store.in_flight_bytes(), 600);
+    }
+
+    #[test]
+    fn test_upload_part_respects_global_byte_cap() {
+        // Tight global cap: 2 KiB total across all uploads.
+        let store =
+            MultipartStore::new_for_test(10 * 1024, 2 * 1024, Duration::hours(24));
+        let id_a = store.create("b", "a", None, HashMap::new()).unwrap();
+        let id_b = store.create("b", "b", None, HashMap::new()).unwrap();
+
+        // Fill upload A to 1 KiB.
+        store
+            .upload_part(&id_a, "b", "a", 1, Bytes::from(vec![0u8; 1024]))
+            .unwrap();
+        // Fill upload B to 1 KiB (total now 2 KiB = cap).
+        store
+            .upload_part(&id_b, "b", "b", 1, Bytes::from(vec![0u8; 1024]))
+            .unwrap();
+        // Next byte anywhere → SlowDown.
+        let err = store
+            .upload_part(&id_a, "b", "a", 2, Bytes::from(vec![0u8; 1]))
+            .unwrap_err();
+        assert!(matches!(err, S3Error::SlowDown(_)), "got {:?}", err);
+    }
+
+    #[test]
+    fn test_abort_releases_in_flight_bytes() {
+        let store =
+            MultipartStore::new_for_test(10 * 1024, 2 * 1024, Duration::hours(24));
+        let id = store.create("b", "a", None, HashMap::new()).unwrap();
+        store
+            .upload_part(&id, "b", "a", 1, Bytes::from(vec![0u8; 1024]))
+            .unwrap();
+        assert_eq!(store.in_flight_bytes(), 1024);
+
+        store.abort(&id, "b", "a").unwrap();
+        assert_eq!(
+            store.in_flight_bytes(),
+            0,
+            "abort must release bytes to the global counter"
+        );
+    }
+
+    #[test]
+    fn test_finish_upload_releases_in_flight_bytes() {
+        let store =
+            MultipartStore::new_for_test(10 * 1024, 10 * 1024, Duration::hours(24));
+        let id = store.create("b", "k", None, HashMap::new()).unwrap();
+        let data = Bytes::from(vec![0u8; 500]);
+        let etag = store.upload_part(&id, "b", "k", 1, data).unwrap();
+        assert_eq!(store.in_flight_bytes(), 500);
+
+        store.complete(&id, "b", "k", &[(1, etag)]).unwrap();
+        // Still in map (Completing) — counter unchanged.
+        assert_eq!(store.in_flight_bytes(), 500);
+
+        store.finish_upload(&id);
+        assert_eq!(store.in_flight_bytes(), 0);
+    }
+
+    #[test]
+    fn test_cleanup_expired_idle_ttl_sweeps_and_releases_bytes() {
+        // Tiny idle TTL so we can trip it synchronously.
+        let store = MultipartStore::new_for_test(
+            10 * 1024,
+            10 * 1024,
+            Duration::milliseconds(1),
+        );
+        let id = store.create("b", "k", None, HashMap::new()).unwrap();
+        store
+            .upload_part(&id, "b", "k", 1, Bytes::from(vec![0u8; 700]))
+            .unwrap();
+        assert_eq!(store.in_flight_bytes(), 700);
+
+        // Sleep past the idle TTL.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        store.cleanup_expired(std::time::Duration::from_secs(3600));
+
+        assert!(
+            store.uploads.read().get(&id).is_none(),
+            "idle upload should have been swept"
+        );
+        assert_eq!(
+            store.in_flight_bytes(),
+            0,
+            "sweep must release bytes to the global counter"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_expired_preserves_completing_upload() {
+        // An upload in Completing state must NOT be swept — the handler's
+        // engine.store* is in flight and the sweeper would desync the map.
+        let store = MultipartStore::new_for_test(
+            10 * 1024,
+            10 * 1024,
+            Duration::milliseconds(1),
+        );
+        let id = store.create("b", "k", None, HashMap::new()).unwrap();
+        let etag = store
+            .upload_part(&id, "b", "k", 1, Bytes::from(vec![0u8; 100]))
+            .unwrap();
+        store.complete(&id, "b", "k", &[(1, etag)]).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        store.cleanup_expired(std::time::Duration::from_secs(3600));
+
+        assert!(
+            store.uploads.read().get(&id).is_some(),
+            "Completing uploads must be preserved"
+        );
     }
 }
