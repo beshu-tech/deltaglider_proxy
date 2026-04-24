@@ -374,6 +374,11 @@ pub struct TestServerBuilder {
     /// DIFFERENT passwords (to verify the wrong-passphrase-rejection
     /// path).
     bootstrap_password: Option<String>,
+    /// Raw YAML fragment to append INSIDE the `storage:` section of the
+    /// generated config (canonical YAML shape; requires `yaml_config`
+    /// to be true — set automatically when this is used). Intended for
+    /// tests that exercise YAML-only features like replication rules.
+    extra_storage_yaml: Option<String>,
 }
 
 impl Default for TestServerBuilder {
@@ -391,6 +396,7 @@ impl Default for TestServerBuilder {
             yaml_config: false,
             config_sync_bucket: None,
             bootstrap_password: None,
+            extra_storage_yaml: None,
         }
     }
 }
@@ -483,6 +489,15 @@ impl TestServerBuilder {
     /// rejection path in `download_if_newer`.
     pub fn bootstrap_password(mut self, password: &str) -> Self {
         self.bootstrap_password = Some(password.to_string());
+        self
+    }
+
+    /// Append a raw YAML fragment INSIDE the `storage:` section. Used
+    /// by replication tests to seed rules without going through the
+    /// section-apply dance. Implies `yaml_config()`.
+    pub fn extra_yaml_storage_section(mut self, yaml: &str) -> Self {
+        self.extra_storage_yaml = Some(yaml.to_string());
+        self.yaml_config = true;
         self
     }
 
@@ -680,6 +695,9 @@ impl TestServerBuilder {
             } else if self.encryption_key.is_some() {
                 config.push_str("backend_encryption:\n  mode: aes256-gcm-proxy\n");
             }
+            if let Some(ref yaml) = self.extra_storage_yaml {
+                config.push_str(yaml);
+            }
             (config, None)
         } else {
             let data_dir = TempDir::new().expect("Failed to create temp dir");
@@ -689,6 +707,12 @@ impl TestServerBuilder {
             ));
             if self.encryption_key.is_some() {
                 config.push_str("backend_encryption:\n  mode: aes256-gcm-proxy\n");
+            }
+            // Append any extra storage-level YAML (replication rules
+            // etc). Emitted at root because the generated config is
+            // the flat shape where `replication:` is a root key.
+            if let Some(ref yaml) = self.extra_storage_yaml {
+                config.push_str(yaml);
             }
             (config, Some(data_dir))
         }

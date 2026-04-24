@@ -7,6 +7,7 @@ mod backup;
 mod config;
 pub mod external_auth;
 mod groups;
+pub(crate) mod replication;
 mod scanner;
 pub(crate) mod users;
 
@@ -45,6 +46,11 @@ pub use config::{
 pub use groups::{
     add_group_member, create_group, delete_group, list_groups, remove_group_member, update_group,
     AddGroupMemberRequest, CreateGroupRequest, UpdateGroupRequest,
+};
+pub use replication::{
+    failures as replication_failures, history as replication_history,
+    list_rules as replication_list_rules, pause as replication_pause,
+    resume as replication_resume, run_now as replication_run_now,
 };
 pub use scanner::{get_usage, migrate_legacy, scan_usage, ScanUsageRequest, UsageQuery};
 pub use users::{

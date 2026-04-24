@@ -180,6 +180,33 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         // (all admins see the same log so there's no per-identity
         // filtering to do at this layer).
         .route("/_/api/admin/audit", get(admin::get_audit))
+        // Replication: overview + per-rule controls. Session-gated,
+        // not IAM-gated (admins manage replication the same way they
+        // manage other storage config).
+        .route(
+            "/_/api/admin/replication",
+            get(admin::replication_list_rules),
+        )
+        .route(
+            "/_/api/admin/replication/rules/:name/run-now",
+            post(admin::replication_run_now),
+        )
+        .route(
+            "/_/api/admin/replication/rules/:name/pause",
+            post(admin::replication_pause),
+        )
+        .route(
+            "/_/api/admin/replication/rules/:name/resume",
+            post(admin::replication_resume),
+        )
+        .route(
+            "/_/api/admin/replication/rules/:name/history",
+            get(admin::replication_history),
+        )
+        .route(
+            "/_/api/admin/replication/rules/:name/failures",
+            get(admin::replication_failures),
+        )
         // Merge the IAM-gated subrouter in; it already carries its own
         // `require_not_declarative` layer. Both subrouters share the
         // outer `require_session`.

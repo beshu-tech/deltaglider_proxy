@@ -16,8 +16,10 @@
 
 pub mod planner;
 pub mod state_store;
+pub mod worker;
 
 pub use planner::{plan_batch, rewrite_key, should_replicate, BatchPlan, Decision};
 pub use state_store::{
     current_unix_seconds, FailureRecord, ReplicationState, RunRecord, RunTotals,
 };
+pub use worker::{run_rule, RunOutcome};
