@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use std::sync::Arc;
-use tracing::{info, instrument, warn};
+use tracing::{info, instrument};
 
 /// Return NoSuchBucket for non-existent buckets.
 /// Bucket enumeration prevention is handled at the auth middleware layer —
@@ -398,30 +398,41 @@ pub async fn create_bucket(
     // to prevent path traversal via unvalidated bucket names
     validate_bucket_name(&bucket)?;
 
-    // PUT /{bucket}?acl — accept and ignore (ACL stub)
+    // PUT /{bucket}?acl — return 501 NotImplemented.
+    //
+    // M4 fix: we don't persist ACLs (the proxy uses IAM permissions
+    // instead). Pre-fix this returned 200 OK while silently discarding
+    // the ACL XML, leading clients to believe their grants had been
+    // applied. NoSuchBucket precedence is preserved by the bucket-
+    // existence check (404 wins over 501).
     if query.acl.is_some() {
-        info!("PUT bucket ACL (stub): {}", bucket);
-        return Ok(StatusCode::OK.into_response());
+        info!("PUT bucket ACL: unsupported (returning 501)");
+        require_bucket_exists(&state, &bucket).await?;
+        return Err(S3Error::NotImplemented(
+            "Bucket ACLs are not supported by this proxy; use IAM policies instead".to_string(),
+        ));
     }
 
     // PUT /{bucket}?tagging — return 501 NotImplemented.
-    // M4 correctness fix: we don't persist bucket tags, so returning
-    // 200 OK while discarding the tag set misled clients that read
-    // the tags back expecting them to be there.
+    // L1 fix: 404 wins over 501 when the bucket doesn't exist.
     if query.tagging.is_some() {
         info!("PUT bucket tagging: unsupported (returning 501)");
+        require_bucket_exists(&state, &bucket).await?;
         return Err(S3Error::NotImplemented(
             "Bucket tagging is not supported by this proxy".to_string(),
         ));
     }
 
-    // PUT /{bucket}?versioning — accept and ignore (versioning stub)
+    // PUT /{bucket}?versioning — return 501 NotImplemented.
+    // M4 fix: pre-fix this accepted Suspended/Enabled XML and returned
+    // 200 OK while ignoring it. Clients that thought versioning was
+    // active would lose history on overwrite. 404 wins over 501.
     if query.versioning.is_some() {
-        warn!(
-            "PUT bucket versioning (stub): {} — versioning is not supported, ignoring",
-            bucket
-        );
-        return Ok(StatusCode::OK.into_response());
+        info!("PUT bucket versioning: unsupported (returning 501)");
+        require_bucket_exists(&state, &bucket).await?;
+        return Err(S3Error::NotImplemented(
+            "Bucket versioning is not supported by this proxy".to_string(),
+        ));
     }
 
     info!("CREATE bucket {}", bucket);

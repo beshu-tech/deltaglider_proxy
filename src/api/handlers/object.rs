@@ -35,27 +35,36 @@ pub async fn put_object_or_copy(
     ValidatedPath { bucket, key }: ValidatedPath,
     Query(query): Query<ObjectQuery>,
     auth_user: Option<axum::Extension<AuthenticatedUser>>,
+    // H1: SigV4-verified `x-amz-content-sha256` header value, stashed
+    // by the auth middleware after successful signature verification.
+    // Used by put_object_inner / upload_part to confirm the body's
+    // actual SHA-256 matches what the client signed.
+    signed_payload_hash: Option<axum::Extension<crate::api::auth::SignedPayloadHash>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, S3Error> {
     let auth_user = auth_user.map(|axum::Extension(u)| u);
+    let signed_payload_hash = signed_payload_hash.map(|axum::Extension(h)| h);
 
-    // PUT /{bucket}/{key}?acl — accept and ignore (ACL stub)
+    // PUT /{bucket}/{key}?acl — return 501 NotImplemented.
+    //
+    // M4 fix: pre-fix this returned 200 OK while silently discarding
+    // the ACL XML. Clients believed grants had been applied. We use
+    // IAM policies instead; ACLs are unsupported. NoSuchKey takes
+    // precedence over 501 (matches AWS).
     if query.acl.is_some() {
-        info!("PUT object ACL (stub): {}/{}", bucket, key);
-        return Ok(StatusCode::OK.into_response());
+        info!("PUT object ACL: unsupported (returning 501)");
+        state.engine.load().head(&bucket, &key).await?;
+        return Err(S3Error::NotImplemented(
+            "Object ACLs are not supported by this proxy; use IAM policies instead".to_string(),
+        ));
     }
 
     // PUT /{bucket}/{key}?tagging — return 501 NotImplemented.
-    //
-    // M4 correctness fix: pre-fix, we returned 200 OK and silently
-    // discarded the tag set. Clients that relied on tags for
-    // lifecycle policies, compliance labels, or ABAC access control
-    // would read back an empty tag set on the next GET and think
-    // something wiped them. 501 is the honest answer: "we don't
-    // support this; don't rely on it."
+    // L1 fix: NoSuchKey precedence over 501.
     if query.tagging.is_some() {
         info!("PUT object tagging: unsupported (returning 501)");
+        state.engine.load().head(&bucket, &key).await?;
         return Err(S3Error::NotImplemented(
             "Object tagging is not supported by this proxy".to_string(),
         ));
@@ -79,6 +88,7 @@ pub async fn put_object_or_copy(
             *part_num,
             upload_id,
             decoded_body,
+            signed_payload_hash.as_ref(),
         )
         .await;
     }
@@ -88,7 +98,15 @@ pub async fn put_object_or_copy(
     let result = if is_copy {
         copy_object_inner(&state, &bucket, &key, &headers, &auth_user).await
     } else {
-        put_object_inner(&state, &bucket, &key, &headers, &decoded_body).await
+        put_object_inner(
+            &state,
+            &bucket,
+            &key,
+            &headers,
+            &decoded_body,
+            signed_payload_hash.as_ref(),
+        )
+        .await
     };
 
     if result.is_ok() {
@@ -340,10 +358,12 @@ pub async fn delete_object(
     headers: HeaderMap,
 ) -> Result<Response, S3Error> {
     // DELETE /{bucket}/{key}?tagging — return 501 NotImplemented.
-    // M4 correctness fix: consistent with GET/PUT tagging — we don't
-    // store tags, so pretending to delete them was misleading.
+    // L1 fix: 404 NoSuchKey wins over 501 NotImplemented when the
+    // object doesn't exist. Pre-fix DELETE returned 501 even for
+    // missing keys; AWS returns 404 first.
     if query.tagging.is_some() {
         info!("DELETE object tagging: unsupported (returning 501)");
+        state.engine.load().head(&bucket, &key).await?;
         return Err(S3Error::NotImplemented(
             "Object tagging is not supported by this proxy".to_string(),
         ));

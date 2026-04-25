@@ -1365,3 +1365,222 @@ async fn test_unsigned_extra_header_is_tolerated() {
         resp.status()
     );
 }
+
+// ============================================================================
+// H1 fix: SigV4 must verify the actual body's SHA-256 matches the signed
+// `x-amz-content-sha256` header value.
+// ============================================================================
+
+/// Build a valid signed PUT for `body_to_sign`, then send a DIFFERENT
+/// body. Pre-fix the proxy stored the wrong body silently — the
+/// signature was valid because it's computed over the canonical
+/// request which only sees the header value, not the body.
+#[tokio::test]
+async fn test_sigv4_payload_hash_mismatch_rejected() {
+    let server = TestServer::builder()
+        .auth("hash-key", "hash-secret-1234567890")
+        .build()
+        .await;
+
+    let signed_body: &[u8] = b"the body the client signed";
+    let actual_body: &[u8] = b"a different body the attacker sent";
+
+    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let date = &timestamp[..8];
+    let region = "us-east-1";
+    let service = "s3";
+    let credential_scope = format!("{}/{}/{}/aws4_request", date, region, service);
+
+    let endpoint = server.endpoint();
+    let host = endpoint
+        .strip_prefix("http://")
+        .or_else(|| endpoint.strip_prefix("https://"))
+        .unwrap_or(&endpoint);
+
+    let payload_hash = sha256_hex(signed_body);
+    let path = format!("/{}/{}", server.bucket(), "h1-mismatch.bin");
+
+    let canonical_headers = format!(
+        "host:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n",
+        host, payload_hash, timestamp
+    );
+    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+
+    let canonical_request = format!(
+        "PUT\n{}\n\n{}\n{}\n{}",
+        path, canonical_headers, signed_headers, payload_hash
+    );
+    let canonical_request_hash = sha256_hex(canonical_request.as_bytes());
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{}\n{}\n{}",
+        timestamp, credential_scope, canonical_request_hash
+    );
+    let signing_key = derive_signing_key("hash-secret-1234567890", date, region, service);
+    let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+
+    let auth_header = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
+        "hash-key", credential_scope, signed_headers, signature
+    );
+
+    let resp = reqwest::Client::new()
+        .put(format!("{}{}", endpoint, path))
+        .header("authorization", auth_header)
+        .header("x-amz-date", timestamp)
+        .header("x-amz-content-sha256", &payload_hash)
+        .header("host", host)
+        .body(actual_body.to_vec())
+        .send()
+        .await
+        .expect("send mismatched body");
+
+    // Pre-fix: 200 (silently stores actual_body).
+    // Post-fix: 400 BadDigest.
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "H1 REGRESSION: PUT with body mismatching signed hash must reject with 400, got {}",
+        resp.status()
+    );
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("BadDigest"),
+        "expected BadDigest error code, got body: {}",
+        body
+    );
+}
+
+/// UNSIGNED-PAYLOAD must continue to accept arbitrary body content
+/// — the client explicitly opted out of body-hash signing.
+#[tokio::test]
+async fn test_sigv4_unsigned_payload_accepts_any_body() {
+    let server = TestServer::builder()
+        .auth("unsigned-key", "unsigned-secret-1234567890")
+        .build()
+        .await;
+
+    let body: &[u8] = b"anything goes";
+
+    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let date = &timestamp[..8];
+    let region = "us-east-1";
+    let service = "s3";
+    let credential_scope = format!("{}/{}/{}/aws4_request", date, region, service);
+
+    let endpoint = server.endpoint();
+    let host = endpoint
+        .strip_prefix("http://")
+        .or_else(|| endpoint.strip_prefix("https://"))
+        .unwrap_or(&endpoint);
+
+    let payload_hash = "UNSIGNED-PAYLOAD";
+    let path = format!("/{}/{}", server.bucket(), "h1-unsigned.bin");
+
+    let canonical_headers = format!(
+        "host:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n",
+        host, payload_hash, timestamp
+    );
+    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+
+    let canonical_request = format!(
+        "PUT\n{}\n\n{}\n{}\n{}",
+        path, canonical_headers, signed_headers, payload_hash
+    );
+    let canonical_request_hash = sha256_hex(canonical_request.as_bytes());
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{}\n{}\n{}",
+        timestamp, credential_scope, canonical_request_hash
+    );
+    let signing_key = derive_signing_key("unsigned-secret-1234567890", date, region, service);
+    let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+
+    let auth_header = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
+        "unsigned-key", credential_scope, signed_headers, signature
+    );
+
+    let resp = reqwest::Client::new()
+        .put(format!("{}{}", endpoint, path))
+        .header("authorization", auth_header)
+        .header("x-amz-date", timestamp)
+        .header("x-amz-content-sha256", payload_hash)
+        .header("host", host)
+        .body(body.to_vec())
+        .send()
+        .await
+        .expect("send unsigned-payload");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "UNSIGNED-PAYLOAD must continue to work, got {}",
+        resp.status()
+    );
+}
+
+/// A correctly-signed PUT (body actually matches the signed hash)
+/// must succeed — sanity check that the H1 enforcement doesn't
+/// break the happy path.
+#[tokio::test]
+async fn test_sigv4_payload_hash_match_succeeds() {
+    let server = TestServer::builder()
+        .auth("hash-ok-key", "hash-ok-secret-1234567890")
+        .build()
+        .await;
+
+    let body: &[u8] = b"correctly-signed body";
+
+    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let date = &timestamp[..8];
+    let region = "us-east-1";
+    let service = "s3";
+    let credential_scope = format!("{}/{}/{}/aws4_request", date, region, service);
+
+    let endpoint = server.endpoint();
+    let host = endpoint
+        .strip_prefix("http://")
+        .or_else(|| endpoint.strip_prefix("https://"))
+        .unwrap_or(&endpoint);
+
+    let payload_hash = sha256_hex(body);
+    let path = format!("/{}/{}", server.bucket(), "h1-match.bin");
+
+    let canonical_headers = format!(
+        "host:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n",
+        host, payload_hash, timestamp
+    );
+    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+
+    let canonical_request = format!(
+        "PUT\n{}\n\n{}\n{}\n{}",
+        path, canonical_headers, signed_headers, payload_hash
+    );
+    let canonical_request_hash = sha256_hex(canonical_request.as_bytes());
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{}\n{}\n{}",
+        timestamp, credential_scope, canonical_request_hash
+    );
+    let signing_key = derive_signing_key("hash-ok-secret-1234567890", date, region, service);
+    let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+
+    let auth_header = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
+        "hash-ok-key", credential_scope, signed_headers, signature
+    );
+
+    let resp = reqwest::Client::new()
+        .put(format!("{}{}", endpoint, path))
+        .header("authorization", auth_header)
+        .header("x-amz-date", timestamp)
+        .header("x-amz-content-sha256", &payload_hash)
+        .header("host", host)
+        .body(body.to_vec())
+        .send()
+        .await
+        .expect("send signed body");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "correctly-signed PUT must succeed, got {}",
+        resp.status()
+    );
+}

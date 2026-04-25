@@ -136,6 +136,26 @@ pub async fn run_now(
         .cloned()
         .ok_or_else(|| (StatusCode::NOT_FOUND, "rule not found".to_string()))?;
 
+    // M2 fix: respect both the global kill-switch (`replication.enabled`)
+    // and the per-rule `enabled` flag. Pre-fix, an admin-triggered
+    // `run-now` would copy objects even with `enabled=false` — making
+    // the flag misleading documentation rather than an actual gate.
+    if !repl.enabled {
+        return Err((
+            StatusCode::CONFLICT,
+            "replication is globally disabled (storage.replication.enabled = false)".to_string(),
+        ));
+    }
+    if !rule.enabled {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "rule '{}' is disabled (set enabled: true in YAML to run it)",
+                rule.name
+            ),
+        ));
+    }
+
     let db_arc = state
         .config_db
         .as_ref()
@@ -190,10 +210,23 @@ pub async fn run_now(
     }))
 }
 
+/// Check whether a rule with the given name exists in the live config.
+/// M1 fix: previously pause/resume called `replication_ensure_state`
+/// before this check, leaving an orphan DB row for ghost rules even
+/// though the response was 404. This snapshot-and-find is now the
+/// FIRST thing pause/resume do.
+async fn rule_in_config(state: &AdminState, name: &str) -> bool {
+    let cfg = state.config.read().await;
+    cfg.replication.rules.iter().any(|r| r.name == name)
+}
+
 pub async fn pause(
     Path(name): Path<String>,
     State(state): State<Arc<AdminState>>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    if !rule_in_config(&state, &name).await {
+        return Err((StatusCode::NOT_FOUND, "rule not found".to_string()));
+    }
     let db = state
         .config_db
         .as_ref()
@@ -206,12 +239,8 @@ pub async fn pause(
         .lock()
         .await;
     let _ = db.replication_ensure_state(&name, replication::current_unix_seconds());
-    let existed = db
-        .replication_set_paused(&name, true)
+    db.replication_set_paused(&name, true)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)))?;
-    if !existed {
-        return Err((StatusCode::NOT_FOUND, "rule not found".to_string()));
-    }
     crate::audit::audit_log(
         "replication_pause",
         "admin",
@@ -227,6 +256,9 @@ pub async fn resume(
     Path(name): Path<String>,
     State(state): State<Arc<AdminState>>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    if !rule_in_config(&state, &name).await {
+        return Err((StatusCode::NOT_FOUND, "rule not found".to_string()));
+    }
     let db = state
         .config_db
         .as_ref()
@@ -239,12 +271,8 @@ pub async fn resume(
         .lock()
         .await;
     let _ = db.replication_ensure_state(&name, replication::current_unix_seconds());
-    let existed = db
-        .replication_set_paused(&name, false)
+    db.replication_set_paused(&name, false)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)))?;
-    if !existed {
-        return Err((StatusCode::NOT_FOUND, "rule not found".to_string()));
-    }
     crate::audit::audit_log(
         "replication_resume",
         "admin",

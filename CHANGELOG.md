@@ -2,6 +2,81 @@
 
 ## Unreleased
 
+### Fourth-wave correctness fixes (SigV4 integrity + replication provenance + stubs)
+
+Eight findings from the latest review. Two highs are silent
+correctness/security failures; the rest tighten honesty in stub
+handlers and replication-control endpoints.
+
+**H1 — SigV4 didn't verify the signed payload hash against the body**
+A credentialed client could sign hash A and ship body B; the
+signature was computed over the canonical-request which only sees
+the header value. SigV4's integrity contract requires the receiver
+to verify the body downstream — we documented that as a future
+guarantee but never implemented it. Fix: the auth middleware
+stashes the signed `x-amz-content-sha256` value in a
+`SignedPayloadHash` request extension; `put_object_inner` and
+`upload_part` recompute the body's SHA-256 and constant-time-compare.
+Mismatch → 400 BadDigest. UNSIGNED-PAYLOAD and STREAMING-* sentinels
+are recognised and skip verification (they have their own contracts;
+see aws_chunked.rs for the streaming variant we don't yet validate
+end-to-end). Three integration tests cover signed-mismatch reject,
+unsigned-payload pass-through, and the signed-match happy path.
+
+**H2 — replication delete pass deleted unrelated destination objects**
+Pre-fix, `replicate_deletes=true` listed every key under
+`destination.prefix`, mapped each back to source via prefix-rewrite,
+and deleted on source-NoSuchKey. With no provenance marker, an
+operator-placed object or a sibling rule's data could be wiped.
+Fix: every replicated object carries a `dg-replication-rule = <name>`
+user-metadata key. The delete pass only considers candidates whose
+metadata carries THIS rule's marker; HEAD-fallback is used when the
+listing didn't surface user-metadata; HEAD failure preserves
+(false-delete is much worse than a leftover). Integration test seeds
+both replicated AND manual objects on destination, runs replication,
+then deletes a source key; verifies the replicated key gets deleted
+on the next run while the manual one survives.
+
+**M1 — pause/resume created ghost rule rows**
+Both handlers called `replication_ensure_state` BEFORE looking up
+the rule in config, so a request for a non-existent rule inserted
+a state row even though the response was 404. Fix: new
+`rule_in_config()` helper runs first; ensure_state only fires
+when the rule actually exists. Test verifies that 404 on a ghost
+rule leaves the overview clean (no orphan row).
+
+**M2 — run-now bypassed enabled flags**
+`replication.enabled=false` and `rule.enabled=false` were honoured
+by the (future) scheduler but admin-triggered run-now ignored
+both. Fix: explicit gates that 409 with a descriptive message.
+Two tests cover the global and per-rule cases.
+
+**M4 — ACL/versioning PUT stubs returned fake 200**
+`PUT /bucket?acl`, `PUT /bucket?versioning`, and `PUT /bucket/key?acl`
+returned 200 OK while silently discarding the request body. Clients
+believed grants/versioning had been applied. Fix: all three return
+501 NotImplemented (preceded by a bucket/object existence check so
+404 wins when the target is missing). Five integration tests cover
+both 501-on-existing and 404-on-missing.
+
+**L1 — tagging PUT/DELETE returned 501 even on missing target**
+The previous wave fixed GET ?tagging precedence; PUT/DELETE were
+still 501-first. Fix: each calls head/head_bucket before returning
+501 so NoSuchKey/NoSuchBucket wins. Three tests cover PUT-on-missing,
+DELETE-on-missing, and DELETE-on-existing-object (still 501).
+
+**M3 verified intact** — bucket-subresource existence checks (?location,
+?versioning, ?uploads) added in the previous wave still in place.
+
+**L2 verified intact** — `size_is_known = file_size > 0 || !md5.is_empty()`
+discriminator in `build_object_headers` correctly emits
+`Content-Length: 0` for known-zero managed objects.
+
+Tests: 7 new integration in `replication_test.rs` and `s3_correctness_test.rs`,
+3 new auth integration tests in `auth_integration_test.rs`. Full
+suite: 659 lib + 28 s3_correctness + 8 replication + 28 auth +
+existing suites green. Clippy clean.
+
 ### Third-wave correctness fixes (replication + S3 conditionals + headers)
 
 Nine findings from a follow-up review of the replication v1 commits

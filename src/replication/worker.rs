@@ -34,6 +34,17 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+/// User-metadata key stamped on objects created by replication so the
+/// delete pass (H2 fix) can tell its own copies apart from objects
+/// written by other rules or operators sharing the same destination
+/// prefix. Value is the rule name.
+///
+/// Why a user-metadata key (not a system-managed marker): user-metadata
+/// round-trips through both backends without any DG-specific plumbing,
+/// survives encryption (per-backend SSE doesn't encrypt user-metadata),
+/// and is visible to operators auditing what wrote a given object.
+const REPLICATION_RULE_METADATA_KEY: &str = "dg-replication-rule";
+
 /// Outcome of a single run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunOutcome {
@@ -291,6 +302,9 @@ async fn run_delete_pass(
     let mut cursor: Option<String> = None;
 
     'pages: for page_idx in 0..MAX_PAGES_PER_RUN {
+        // metadata=true so user_metadata (carrying our provenance
+        // marker, H2 fix) is populated in the listing — saves a
+        // per-object HEAD round-trip.
         let page = match engine
             .list_objects(
                 &rule.destination.bucket,
@@ -298,7 +312,7 @@ async fn run_delete_pass(
                 None,
                 cap,
                 cursor.as_deref(),
-                false,
+                true,
             )
             .await
         {
@@ -325,19 +339,62 @@ async fn run_delete_pass(
             }
         };
 
-        for (dest_key, _meta) in &page.objects {
+        for (dest_key, listed_meta) in &page.objects {
+            // H2 fix: only consider deleting objects this rule wrote.
+            // Each replicated copy carries `dg-replication-rule = <rule.name>`
+            // in user_metadata (stamped by `copy_one`). If the listed
+            // metadata is missing (LIST without metadata=true) or the
+            // marker doesn't match, skip — never delete unrelated
+            // objects, even if their key-after-prefix-rewrite happens
+            // to be missing on source.
+            //
+            // The list call below already passes `metadata=true` so
+            // user_metadata is populated. Defence in depth: if it's
+            // empty, we HEAD to confirm before any delete.
+            let has_marker_in_listing = listed_meta
+                .user_metadata
+                .get(REPLICATION_RULE_METADATA_KEY)
+                .map(|v| v == &rule.name)
+                .unwrap_or(false);
+
+            let owned_by_this_rule = if has_marker_in_listing {
+                true
+            } else {
+                // Listing didn't carry user-metadata (some backends
+                // omit it). HEAD the object to be sure.
+                match engine.head(&rule.destination.bucket, dest_key).await {
+                    Ok(meta) => meta
+                        .user_metadata
+                        .get(REPLICATION_RULE_METADATA_KEY)
+                        .map(|v| v == &rule.name)
+                        .unwrap_or(false),
+                    // HEAD failed — preserve. Better to leak a
+                    // candidate than false-delete a foreign object.
+                    Err(_) => false,
+                }
+            };
+
+            if !owned_by_this_rule {
+                debug!(
+                    "replication rule '{}' delete-pass skip (no provenance marker): {:?}",
+                    rule.name, dest_key
+                );
+                continue;
+            }
+
             // Translate dest key back to its source counterpart.
             let src_key = match dest_to_source_key(rule, dest_key) {
                 Some(k) => k,
                 None => {
-                    // Key sits outside the rule's source-prefix space
-                    // (e.g. a sibling rule writes here too). Don't
-                    // touch it.
+                    // Key sits outside the rule's destination-prefix
+                    // (paranoid case: marker matched but prefix doesn't).
                     continue;
                 }
             };
 
-            // HEAD source. NotFound → delete destination.
+            // HEAD source. NotFound → delete destination (we wrote it,
+            // it's still under our prefix, source no longer has the
+            // key — this is a legitimate deletion to replicate).
             // Other errors → leave alone, log as failure.
             match engine.head(&rule.source.bucket, &src_key).await {
                 Ok(_) => {
@@ -443,8 +500,18 @@ async fn copy_one(
         })?;
 
     let content_type = meta.content_type.clone();
-    let user_metadata = meta.user_metadata.clone();
+    let mut user_metadata = meta.user_metadata.clone();
     let bytes = data.len();
+
+    // H2 fix: stamp our rule name so the delete pass can tell this
+    // object apart from anything written by another rule or by an
+    // operator sharing the destination prefix. Without this marker,
+    // `replicate_deletes=true` would happily delete unrelated objects
+    // whose source-counterpart key happens to be missing.
+    user_metadata.insert(
+        REPLICATION_RULE_METADATA_KEY.to_string(),
+        rule.name.clone(),
+    );
 
     // H3 fix: when the source carries a multipart_etag, route through
     // store_with_multipart_etag so the destination HEAD reports the

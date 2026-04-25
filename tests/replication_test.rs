@@ -317,7 +317,8 @@ async fn test_replication_replicate_deletes_removes_orphans() {
     }
 
     // Seed both source and destination with 3 objects.
-    for key in ["a.txt", "b.txt", "c.txt"] {
+    // Seed source with 4 keys (a/b/c/d).
+    for key in ["a.txt", "b.txt", "c.txt", "d.txt"] {
         client
             .put_object()
             .bucket("del-src")
@@ -326,28 +327,24 @@ async fn test_replication_replicate_deletes_removes_orphans() {
             .send()
             .await
             .unwrap();
-        client
-            .put_object()
-            .bucket("del-dst")
-            .key(key)
-            .body(ByteStream::from(b"x".to_vec()))
-            .send()
-            .await
-            .unwrap();
     }
-    // Add an extra orphan on destination only.
+    // H2 fix verification: an unrelated object on the destination
+    // bucket (not written by replication) MUST NOT be deleted. Pre-fix
+    // any dest key whose name didn't appear on source got nuked.
     client
         .put_object()
         .bucket("del-dst")
-        .key("orphan.txt")
-        .body(ByteStream::from(b"orphan".to_vec()))
+        .key("manual.txt")
+        .body(ByteStream::from(b"hand-placed by an operator".to_vec()))
         .send()
         .await
         .unwrap();
 
-    // Trigger replication. Forward pass copies nothing new (all in sync),
-    // delete pass should drop "orphan.txt".
     let admin = admin_http_client(&server.endpoint()).await;
+
+    // First run: forward-copy 4 keys onto dst (with provenance markers).
+    // Delete pass: nothing to delete (each replicated key still on src).
+    // `manual.txt` is preserved because it has no provenance marker.
     let resp = admin
         .post(format!(
             "{}/_/api/admin/replication/rules/delete-rule/run-now",
@@ -358,19 +355,66 @@ async fn test_replication_replicate_deletes_removes_orphans() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
 
-    // Verify the orphan is gone.
-    let head_orphan = client
+    for key in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+        client
+            .head_object()
+            .bucket("del-dst")
+            .key(key)
+            .send()
+            .await
+            .expect("replicated key on dst");
+    }
+    client
         .head_object()
         .bucket("del-dst")
-        .key("orphan.txt")
+        .key("manual.txt")
+        .send()
+        .await
+        .expect("H2: manual.txt (no provenance marker) must survive first run");
+
+    // Now delete d.txt from source. Next replication run should delete
+    // d.txt from destination (it carries the provenance marker), but
+    // leave manual.txt alone.
+    client
+        .delete_object()
+        .bucket("del-src")
+        .key("d.txt")
+        .send()
+        .await
+        .unwrap();
+
+    let resp = admin
+        .post(format!(
+            "{}/_/api/admin/replication/rules/delete-rule/run-now",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // d.txt should be GONE from dst (replicated delete).
+    let head_d = client
+        .head_object()
+        .bucket("del-dst")
+        .key("d.txt")
         .send()
         .await;
     assert!(
-        head_orphan.is_err(),
-        "H2 REGRESSION: orphan.txt should have been deleted from destination"
+        head_d.is_err(),
+        "replicated d.txt must be deleted from destination after source delete"
     );
 
-    // Verify the legit keys are still there.
+    // manual.txt MUST still be there — no provenance marker, not ours.
+    client
+        .head_object()
+        .bucket("del-dst")
+        .key("manual.txt")
+        .send()
+        .await
+        .expect("H2 REGRESSION: manual.txt without provenance marker was deleted");
+
+    // Other replicated keys should still be there.
     for key in ["a.txt", "b.txt", "c.txt"] {
         client
             .head_object()
@@ -378,8 +422,135 @@ async fn test_replication_replicate_deletes_removes_orphans() {
             .key(key)
             .send()
             .await
-            .expect("legit dest key remains");
+            .expect("legit replicated key remains");
     }
+}
+
+/// M1 fix: pause/resume on a non-existent rule must 404 WITHOUT
+/// creating a ghost DB row. Pre-fix the handler called
+/// replication_ensure_state before checking config, leaving an
+/// orphan row even though the response was 404.
+#[tokio::test]
+async fn test_pause_resume_ghost_rule_returns_404_without_inserting_row() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(RULE_YAML)
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    // Pause + resume on a non-existent rule.
+    for action in ["pause", "resume"] {
+        let resp = admin
+            .post(format!(
+                "{}/_/api/admin/replication/rules/ghost-rule/{}",
+                server.endpoint(),
+                action
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            404,
+            "M1: {} on a non-existent rule must 404",
+            action
+        );
+    }
+
+    // Verify the overview doesn't list the ghost rule (no orphan row).
+    let resp = admin
+        .get(format!("{}/_/api/admin/replication", server.endpoint()))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    let names: Vec<&str> = body["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap_or(""))
+        .collect();
+    assert!(
+        !names.contains(&"ghost-rule"),
+        "M1 REGRESSION: ghost-rule appeared in overview after 404, names={:?}",
+        names
+    );
+}
+
+/// M2 fix: run-now respects `rule.enabled` and global `replication.enabled`.
+#[tokio::test]
+async fn test_run_now_rejects_disabled_rule() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(
+            "
+replication:
+  enabled: true
+  rules:
+    - name: disabled-rule
+      enabled: false
+      source: { bucket: x, prefix: \"\" }
+      destination: { bucket: y, prefix: \"\" }
+      interval: \"1h\"
+",
+        )
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    let resp = admin
+        .post(format!(
+            "{}/_/api/admin/replication/rules/disabled-rule/run-now",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        409,
+        "M2: run-now on disabled rule must 409"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("disabled"), "got: {}", body);
+}
+
+#[tokio::test]
+async fn test_run_now_rejects_globally_disabled_replication() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(
+            "
+replication:
+  enabled: false
+  rules:
+    - name: orphan
+      enabled: true
+      source: { bucket: x, prefix: \"\" }
+      destination: { bucket: y, prefix: \"\" }
+      interval: \"1h\"
+",
+        )
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    let resp = admin
+        .post(format!(
+            "{}/_/api/admin/replication/rules/orphan/run-now",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        409,
+        "M2: run-now must reject when replication is globally disabled"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("globally disabled"), "got: {}", body);
 }
 
 /// H3 fix regression: source's multipart ETag must propagate through

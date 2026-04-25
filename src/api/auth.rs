@@ -35,6 +35,41 @@ type HmacSha256 = Hmac<Sha256>;
 /// Shared replay cache type: signature string -> timestamp of first use.
 pub type ReplayCache = Arc<DashMap<String, Instant>>;
 
+/// Request extension carrying the SigV4-signed payload hash from
+/// `x-amz-content-sha256`. Inserted by the SigV4 middleware after
+/// signature verification succeeds. Downstream handlers (specifically
+/// the PUT path) compare this against the actual body's SHA-256 to
+/// close the H1 SigV4 integrity gap.
+///
+/// Sentinel values that disable verification:
+/// - `UNSIGNED-PAYLOAD`: client opted out of body-hash signing.
+/// - `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` and the other STREAMING-*
+///   variants: the chunked-payload protocol authenticates each chunk
+///   separately. We don't validate the chunk-signature chain (see
+///   `aws_chunked.rs`), so we don't claim end-to-end integrity for
+///   those — the value is still recorded for observability but
+///   `is_verifiable_hex()` returns false.
+#[derive(Debug, Clone)]
+pub struct SignedPayloadHash(pub String);
+
+impl SignedPayloadHash {
+    /// Returns the inner header value lowercase-trimmed (header
+    /// values are sometimes uppercase from older SDKs).
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    /// Whether this value is a verifiable 64-char hex SHA-256 the
+    /// body can be compared to. Returns false for UNSIGNED-PAYLOAD,
+    /// STREAMING variants, and anything that's not 64 hex chars.
+    pub fn is_verifiable_hex(&self) -> bool {
+        let v = self.0.as_str();
+        v.len() == 64
+            && v.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b) || (b'A'..=b'F').contains(&b))
+    }
+}
+
 /// Build an anonymous `AuthenticatedUser` with read+list permissions scoped
 /// to the given public prefixes. Used for unauthenticated public access.
 fn build_anonymous_user(bucket: &str, public_prefixes: &[String]) -> AuthenticatedUser {
@@ -778,6 +813,16 @@ pub async fn sigv4_auth_middleware(
         debug!("SigV4: authenticated user '{}'", user.name);
         request.extensions_mut().insert(user);
     }
+
+    // H1 SigV4 fix: stash the verified `x-amz-content-sha256` so the
+    // PUT handler can compare it against the actual body's SHA-256.
+    // Without this, a credentialed client could sign hash A and ship
+    // body B — middleware would still accept the signature (it's
+    // computed over the canonical-request, which only sees the header
+    // value, not the body bytes) and the proxy would store body B.
+    request
+        .extensions_mut()
+        .insert(SignedPayloadHash(params.payload_hash.clone()));
 
     Ok(next.run(request).await)
 }

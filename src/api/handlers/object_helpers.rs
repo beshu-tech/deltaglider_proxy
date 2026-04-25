@@ -163,17 +163,50 @@ pub(super) async fn ensure_bucket_exists(
 
 /// PUT object handler (internal)
 /// Called by put_object_or_copy after validation
-#[instrument(skip(state, body))]
+#[instrument(skip(state, body, signed_payload_hash))]
 pub(super) async fn put_object_inner(
     state: &Arc<AppState>,
     bucket: &str,
     key: &str,
     headers: &HeaderMap,
     body: &Bytes,
+    signed_payload_hash: Option<&crate::api::auth::SignedPayloadHash>,
 ) -> Result<Response, S3Error> {
     info!("PUT {}/{} ({} bytes)", bucket, key, body.len());
 
     validate_content_md5(headers, body)?;
+
+    // H1 SigV4 fix: when the SigV4 middleware successfully verified a
+    // signature over a 64-char hex `x-amz-content-sha256`, the actual
+    // body's SHA-256 must match that value. Without this check, a
+    // credentialed client could sign hash A and ship body B — the
+    // signature is computed over the canonical request which only
+    // sees the header value, not the body bytes. SigV4's integrity
+    // contract requires the receiver to verify the body downstream.
+    //
+    // Sentinel values that disable verification (we record the value
+    // but don't enforce a hash match): UNSIGNED-PAYLOAD (client
+    // explicitly opted out) and STREAMING-* variants (per-chunk
+    // signature scheme; see aws_chunked.rs for chunk-chain handling).
+    if let Some(claimed) = signed_payload_hash {
+        if claimed.is_verifiable_hex() {
+            use sha2::{Digest, Sha256};
+            let actual = hex::encode(Sha256::digest(body.as_ref()));
+            let matches: bool =
+                subtle::ConstantTimeEq::ct_eq(actual.as_bytes(), claimed.as_str().as_bytes())
+                    .into();
+            if !matches {
+                warn!(
+                    "PUT {}/{}: SigV4 payload hash mismatch (claimed {}…, actual {}…)",
+                    bucket,
+                    key,
+                    &claimed.as_str()[..8.min(claimed.as_str().len())],
+                    &actual[..8],
+                );
+                return Err(S3Error::BadDigest);
+            }
+        }
+    }
 
     // Bucket must exist before any write path touches the backend. See
     // `ensure_bucket_exists` for the full rationale (C2 security fix).
@@ -407,6 +440,7 @@ pub(super) fn decode_body(headers: &HeaderMap, body: Bytes) -> Result<Bytes, S3E
 }
 
 /// Handle a multipart upload part (PUT with ?partNumber&uploadId).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn upload_part(
     state: &Arc<AppState>,
     bucket: &str,
@@ -415,6 +449,7 @@ pub(super) async fn upload_part(
     part_num: u32,
     upload_id: &str,
     body: Bytes,
+    signed_payload_hash: Option<&crate::api::auth::SignedPayloadHash>,
 ) -> Result<Response, S3Error> {
     info!(
         "UploadPart {}/{} part={} uploadId={}",
@@ -429,6 +464,25 @@ pub(super) async fn upload_part(
     ensure_bucket_exists(state, bucket).await?;
 
     validate_content_md5(headers, &body)?;
+
+    // H1 SigV4 fix: same body-hash verification as put_object_inner —
+    // each part's bytes must match the SHA-256 the client signed.
+    if let Some(claimed) = signed_payload_hash {
+        if claimed.is_verifiable_hex() {
+            use sha2::{Digest, Sha256};
+            let actual = hex::encode(Sha256::digest(body.as_ref()));
+            let matches: bool =
+                subtle::ConstantTimeEq::ct_eq(actual.as_bytes(), claimed.as_str().as_bytes())
+                    .into();
+            if !matches {
+                warn!(
+                    "UploadPart {}/{} part={}: SigV4 payload hash mismatch",
+                    bucket, key, part_num
+                );
+                return Err(S3Error::BadDigest);
+            }
+        }
+    }
 
     let etag = state
         .multipart

@@ -550,6 +550,170 @@ async fn test_zero_byte_managed_object_emits_content_length_zero() {
 }
 
 // ────────────────────────────────────────────────────────────────────────
+// M4 — ACL/versioning PUT stubs return 501 instead of fake 200
+// ────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_put_bucket_acl_returns_501_not_fake_200() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+    let resp = http
+        .put(format!("{}/{}?acl", server.endpoint(), server.bucket()))
+        .body("<AccessControlPolicy/>")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 501);
+    assert!(resp.text().await.unwrap().contains("NotImplemented"));
+}
+
+#[tokio::test]
+async fn test_put_bucket_acl_on_missing_bucket_404_wins() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+    let resp = http
+        .put(format!("{}/no-such-bucket?acl", server.endpoint()))
+        .body("<AccessControlPolicy/>")
+        .send()
+        .await
+        .unwrap();
+    // 404 NoSuchBucket wins over 501.
+    assert_eq!(resp.status().as_u16(), 404);
+}
+
+#[tokio::test]
+async fn test_put_bucket_versioning_returns_501() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+    let resp = http
+        .put(format!(
+            "{}/{}?versioning",
+            server.endpoint(),
+            server.bucket()
+        ))
+        .body("<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 501);
+}
+
+#[tokio::test]
+async fn test_put_object_acl_returns_501() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+    // Seed the object so we exercise the 501 path, not 404.
+    http.put(format!("{}/{}/o.bin", server.endpoint(), server.bucket()))
+        .body(b"x".to_vec())
+        .send()
+        .await
+        .unwrap();
+
+    let resp = http
+        .put(format!(
+            "{}/{}/o.bin?acl",
+            server.endpoint(),
+            server.bucket()
+        ))
+        .body("<AccessControlPolicy/>")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 501);
+}
+
+#[tokio::test]
+async fn test_put_object_acl_on_missing_object_404_wins() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+    let resp = http
+        .put(format!(
+            "{}/{}/missing.bin?acl",
+            server.endpoint(),
+            server.bucket()
+        ))
+        .body("<AccessControlPolicy/>")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// L1 — tagging PUT/DELETE precedence (404 wins over 501 for missing target)
+// ────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_put_tagging_on_missing_object_returns_404() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+    let resp = http
+        .put(format!(
+            "{}/{}/missing.bin?tagging",
+            server.endpoint(),
+            server.bucket()
+        ))
+        .body(
+            r#"<?xml version="1.0"?><Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag></TagSet></Tagging>"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+}
+
+#[tokio::test]
+async fn test_put_tagging_on_missing_bucket_returns_404() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+    let resp = http
+        .put(format!("{}/ghost-bucket?tagging", server.endpoint()))
+        .body("<Tagging><TagSet/></Tagging>")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+}
+
+#[tokio::test]
+async fn test_delete_tagging_on_missing_object_returns_404() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+    let resp = http
+        .delete(format!(
+            "{}/{}/missing.bin?tagging",
+            server.endpoint(),
+            server.bucket()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+}
+
+#[tokio::test]
+async fn test_delete_tagging_on_existing_object_returns_501() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+    http.put(format!("{}/{}/seed.bin", server.endpoint(), server.bucket()))
+        .body(b"x".to_vec())
+        .send()
+        .await
+        .unwrap();
+
+    let resp = http
+        .delete(format!(
+            "{}/{}/seed.bin?tagging",
+            server.endpoint(),
+            server.bucket()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 501);
+}
+
+// ────────────────────────────────────────────────────────────────────────
 // L2 — copy-source conditional precedence
 // ────────────────────────────────────────────────────────────────────────
 
