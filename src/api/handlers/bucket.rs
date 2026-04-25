@@ -23,6 +23,18 @@ fn no_such_bucket_error(bucket: &str) -> S3Error {
     S3Error::NoSuchBucket(bucket.to_string())
 }
 
+/// Resolve `head_bucket` and turn `false` into a `NoSuchBucket` error.
+/// Shared by every bucket subresource that should answer 404 for
+/// ghost buckets (GetBucketLocation / GetBucketVersioning /
+/// ListMultipartUploads / etc.).
+async fn require_bucket_exists(state: &Arc<AppState>, bucket: &str) -> Result<(), S3Error> {
+    let exists = state.engine.load().head_bucket(bucket).await?;
+    if !exists {
+        return Err(no_such_bucket_error(bucket));
+    }
+    Ok(())
+}
+
 /// Query parameters for bucket-level GET operations
 #[derive(Debug, serde::Deserialize, Default)]
 pub struct BucketGetQuery {
@@ -91,7 +103,8 @@ pub async fn bucket_get_handler(
     // silently lied to clients relying on tags for downstream policy.
     if query.tagging.is_some() {
         info!("GET bucket tagging: unsupported (returning 501)");
-        let _ = state.engine.load().head_bucket(&bucket).await; // drain error
+        // M4 fix: 404 wins over 501 when the bucket doesn't exist.
+        require_bucket_exists(&state, &bucket).await?;
         return Err(S3Error::NotImplemented(
             "Bucket tagging is not supported by this proxy".to_string(),
         ));
@@ -109,20 +122,28 @@ pub async fn bucket_get_handler(
     }
 
     // Check for GetBucketLocation
+    //
+    // M3 fix: gate every bucket subresource on bucket existence so the
+    // proxy doesn't answer for ghosts. Pre-fix, GetBucketLocation /
+    // GetBucketVersioning / ListMultipartUploads happily returned 200
+    // for buckets that didn't exist.
     if query.location.is_some() {
         info!("GET bucket location: {}", bucket);
+        require_bucket_exists(&state, &bucket).await?;
         return get_bucket_location(&bucket).await;
     }
 
     // Check for GetBucketVersioning
     if query.versioning.is_some() {
         info!("GET bucket versioning: {}", bucket);
+        require_bucket_exists(&state, &bucket).await?;
         return get_bucket_versioning(&bucket).await;
     }
 
     // Check for ListMultipartUploads
     if query.uploads.is_some() {
         info!("LIST multipart uploads: {}", bucket);
+        require_bucket_exists(&state, &bucket).await?;
         let prefix = query.prefix.as_deref();
         return list_multipart_uploads(
             &state,

@@ -119,13 +119,14 @@ pub async fn get_object(
 ) -> Result<Response, S3Error> {
     // GET /{bucket}/{key}?tagging — return 501 NotImplemented.
     //
-    // M4 correctness fix: pre-fix, we returned a hardcoded empty
-    // <TagSet/> pretending every object had no tags. That was both
-    // dishonest (we can't know) and unsafe for clients using tags as
-    // access control. 501 signals "not supported; find another way."
+    // M4 fix: 404 wins over 501 when the object doesn't exist. AWS
+    // returns NoSuchKey for tagging on a missing object; we should
+    // surface that BEFORE the "we don't support this" 501 so clients
+    // can distinguish "object missing" from "feature missing."
     if query.tagging.is_some() {
         info!("GET object tagging: unsupported (returning 501)");
-        let _ = state.engine.load().head(&bucket, &key).await; // drain error
+        // Propagate NoSuchKey/NoSuchBucket; only swallow non-404 errors.
+        state.engine.load().head(&bucket, &key).await?;
         return Err(S3Error::NotImplemented(
             "Object tagging is not supported by this proxy".to_string(),
         ));

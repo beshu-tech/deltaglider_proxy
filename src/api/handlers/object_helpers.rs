@@ -179,6 +179,16 @@ pub(super) async fn put_object_inner(
     // `ensure_bucket_exists` for the full rationale (C2 security fix).
     ensure_bucket_exists(state, bucket).await?;
 
+    // M2 fix: honour PUT conditional headers (If-Match,
+    // If-None-Match, If-Modified-Since, If-Unmodified-Since) against
+    // the EXISTING object at this key. Pre-fix, a PUT with a failing
+    // If-Match silently overwrote anyway, breaking compare-and-swap
+    // patterns clients use for safe overwrites and the
+    // `If-None-Match: *` idempotent-create primitive.
+    if let Some(err) = evaluate_put_conditionals(state, bucket, key, headers).await {
+        return Err(err);
+    }
+
     // S3 directory marker: zero-byte object with trailing slash (e.g. "folder/")
     // Used by Cyberduck, AWS Console, etc. to create "folders".
     // Bypass delta engine and store directly on the backend.
@@ -533,14 +543,30 @@ fn parse_http_date(s: &str) -> Option<DateTime<Utc>> {
 /// a "copy was not performed" is not a cacheable state; the client must
 /// actively retry.
 ///
-/// Evaluation order follows AWS docs:
-/// 1. `x-amz-copy-source-if-match` (positive ETag) → 412 if no match.
-/// 2. `x-amz-copy-source-if-none-match` (negative ETag) → 412 if matches.
-/// 3. `x-amz-copy-source-if-modified-since` → 412 if source is older.
-/// 4. `x-amz-copy-source-if-unmodified-since` → 412 if source is newer.
+/// Evaluation follows AWS S3 CopyObject paired-header rules:
 ///
-/// Returns Some(PreconditionFailed) on first violation, None if all pass.
-/// Implemented as a pure function so it's unit-testable without an HTTP stack.
+/// - `if-match` + `if-unmodified-since`: AWS evaluates `if-match`
+///   FIRST. If it passes, the request proceeds and
+///   `if-unmodified-since` is IGNORED (the positive ETag is more
+///   specific than a date guard). If `if-match` fails, the request
+///   is rejected with 412 regardless of the date.
+/// - `if-none-match` + `if-modified-since`: same precedence —
+///   `if-none-match` wins. If it passes, ignore the date. If it
+///   fails (ETag matches), 412.
+/// - Solo headers behave as documented.
+/// - The positive/negative pairs (`if-match` + `if-none-match` on
+///   the same request) are AWS-undefined; we evaluate `if-match`
+///   first (deny on failure), then `if-none-match` (deny on
+///   failure), which matches what most S3-clones do.
+///
+/// L2 fix: pre-fix, the function evaluated all four headers
+/// linearly with first-failure-wins, which broke combinations AWS
+/// accepts (e.g. `if-match` passing alongside an
+/// `if-unmodified-since` that "fails" — AWS treats the if-match
+/// pass as the answer).
+///
+/// Returns Some(PreconditionFailed) on a real violation, None when
+/// the request should proceed.
 pub(super) fn check_copy_source_conditionals(
     req_headers: &HeaderMap,
     source_metadata: &FileMetadata,
@@ -549,59 +575,174 @@ pub(super) fn check_copy_source_conditionals(
     let etag_bare = etag.trim_matches('"');
     let last_modified = source_metadata.created_at;
 
-    // 1. if-match — ETag MUST match, else 412.
-    if let Some(v) = req_headers
+    let if_match = req_headers
         .get("x-amz-copy-source-if-match")
-        .and_then(|v| v.to_str().ok())
-    {
-        let matches = v.split(',').any(|t| {
-            let t = t.trim();
-            t == "*" || t == etag || t.trim_matches('"') == etag_bare
-        });
-        if !matches {
-            return Some(S3Error::PreconditionFailed);
-        }
-    }
-
-    // 2. if-none-match — ETag MUST NOT match, else 412 (NOT 304 on copy).
-    if let Some(v) = req_headers
+        .and_then(|v| v.to_str().ok());
+    let if_none_match = req_headers
         .get("x-amz-copy-source-if-none-match")
-        .and_then(|v| v.to_str().ok())
-    {
-        let matches = v.split(',').any(|t| {
+        .and_then(|v| v.to_str().ok());
+    let if_modified_since = req_headers
+        .get("x-amz-copy-source-if-modified-since")
+        .and_then(|v| v.to_str().ok());
+    let if_unmodified_since = req_headers
+        .get("x-amz-copy-source-if-unmodified-since")
+        .and_then(|v| v.to_str().ok());
+
+    let etag_matches = |spec: &str| -> bool {
+        spec.split(',').any(|t| {
             let t = t.trim();
             t == "*" || t == etag || t.trim_matches('"') == etag_bare
-        });
-        if matches {
+        })
+    };
+
+    // ── if-match + if-unmodified-since pair ──
+    // AWS: if-match wins. Pass → ignore date. Fail → 412.
+    if let Some(spec) = if_match {
+        if etag_matches(spec) {
+            // Suppress if-unmodified-since per AWS docs.
+        } else {
             return Some(S3Error::PreconditionFailed);
         }
-    }
-
-    // 3. if-modified-since — source MUST be newer, else 412.
-    if let Some(v) = req_headers
-        .get("x-amz-copy-source-if-modified-since")
-        .and_then(|v| v.to_str().ok())
-    {
-        if let Some(date) = parse_http_date(v) {
-            if last_modified <= date {
-                return Some(S3Error::PreconditionFailed);
-            }
-        }
-    }
-
-    // 4. if-unmodified-since — source MUST be older or same, else 412.
-    if let Some(v) = req_headers
-        .get("x-amz-copy-source-if-unmodified-since")
-        .and_then(|v| v.to_str().ok())
-    {
-        if let Some(date) = parse_http_date(v) {
+    } else if let Some(date_str) = if_unmodified_since {
+        if let Some(date) = parse_http_date(date_str) {
             if last_modified > date {
                 return Some(S3Error::PreconditionFailed);
             }
         }
     }
 
+    // ── if-none-match + if-modified-since pair ──
+    // AWS: if-none-match wins. Match → 412. Mismatch → ignore date.
+    if let Some(spec) = if_none_match {
+        if etag_matches(spec) {
+            return Some(S3Error::PreconditionFailed);
+        }
+        // Otherwise the negative-ETag check passed → ignore date.
+    } else if let Some(date_str) = if_modified_since {
+        if let Some(date) = parse_http_date(date_str) {
+            if last_modified <= date {
+                return Some(S3Error::PreconditionFailed);
+            }
+        }
+    }
+
     None
+}
+
+/// Evaluate PUT-side conditional headers against the EXISTING object
+/// (if any) at `bucket/key`. Returns `Some(S3Error)` on a precondition
+/// failure (the caller short-circuits with 412), `None` to proceed.
+///
+/// Semantics per AWS S3 PutObject (M2 fix):
+///
+/// - `If-Match: <etag>` — proceed only if the existing object's
+///   ETag matches. 412 if missing or mismatch.
+/// - `If-Match: *` — proceed only if an object exists at this key.
+///   412 if missing.
+/// - `If-None-Match: *` — proceed only if NO object exists. The
+///   canonical idempotent-create primitive. 412 if exists.
+/// - `If-None-Match: <etag>` — proceed only if existing ETag does
+///   NOT match. 412 if it does match.
+/// - `If-Unmodified-Since` — proceed only if existing was modified
+///   ≤ the given date. 412 otherwise. Uses the same date parser as
+///   the GET path.
+/// - `If-Modified-Since` — proceed only if existing was modified
+///   > the given date. 412 otherwise. Symmetric.
+///
+/// Evaluation order matches AWS HTTP-conditional-header semantics:
+/// If-Match → If-Unmodified-Since → If-None-Match → If-Modified-Since.
+/// First failing check wins.
+async fn evaluate_put_conditionals(
+    state: &Arc<AppState>,
+    bucket: &str,
+    key: &str,
+    req_headers: &HeaderMap,
+) -> Option<S3Error> {
+    // Cheap exit: if no conditional header is present, skip the HEAD.
+    if !has_any_put_conditional(req_headers) {
+        return None;
+    }
+
+    let engine = state.engine.load();
+    // NotFound or backend error → treat as missing for conditional purposes.
+    let existing = engine.head(bucket, key).await.ok();
+
+    // 1. If-Match
+    if let Some(if_match) = req_headers.get("if-match").and_then(|v| v.to_str().ok()) {
+        let if_match = if_match.trim();
+        match &existing {
+            None => return Some(S3Error::PreconditionFailed),
+            Some(meta) => {
+                let etag = meta.etag();
+                let etag_bare = etag.trim_matches('"');
+                let matches = if_match.split(',').any(|t| {
+                    let t = t.trim();
+                    t == "*" || t == etag || t.trim_matches('"') == etag_bare
+                });
+                if !matches {
+                    return Some(S3Error::PreconditionFailed);
+                }
+            }
+        }
+    }
+
+    // 2. If-Unmodified-Since
+    if let Some(v) = req_headers
+        .get("if-unmodified-since")
+        .and_then(|v| v.to_str().ok())
+    {
+        if let (Some(meta), Some(date)) = (existing.as_ref(), parse_http_date(v)) {
+            if meta.created_at > date {
+                return Some(S3Error::PreconditionFailed);
+            }
+        }
+    }
+
+    // 3. If-None-Match
+    if let Some(if_none) = req_headers
+        .get("if-none-match")
+        .and_then(|v| v.to_str().ok())
+    {
+        let if_none = if_none.trim();
+        match &existing {
+            None => {
+                // Either form passes when nothing exists.
+            }
+            Some(meta) => {
+                let etag = meta.etag();
+                let etag_bare = etag.trim_matches('"');
+                let matches = if_none.split(',').any(|t| {
+                    let t = t.trim();
+                    t == "*" || t == etag || t.trim_matches('"') == etag_bare
+                });
+                if matches {
+                    // PUT semantics: 412, NOT 304 (304 is a GET concept).
+                    return Some(S3Error::PreconditionFailed);
+                }
+            }
+        }
+    }
+
+    // 4. If-Modified-Since
+    if let Some(v) = req_headers
+        .get("if-modified-since")
+        .and_then(|v| v.to_str().ok())
+    {
+        if let (Some(meta), Some(date)) = (existing.as_ref(), parse_http_date(v)) {
+            if meta.created_at <= date {
+                return Some(S3Error::PreconditionFailed);
+            }
+        }
+    }
+
+    None
+}
+
+fn has_any_put_conditional(headers: &HeaderMap) -> bool {
+    headers.contains_key("if-match")
+        || headers.contains_key("if-none-match")
+        || headers.contains_key("if-modified-since")
+        || headers.contains_key("if-unmodified-since")
 }
 
 /// Check conditional request headers against object metadata.

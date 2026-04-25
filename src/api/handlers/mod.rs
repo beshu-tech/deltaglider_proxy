@@ -126,10 +126,21 @@ fn build_object_headers(metadata: &FileMetadata) -> HeaderMap {
     );
     headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
     headers.insert("ETag", header_value(&metadata.etag()));
-    // Only set Content-Length when we actually know the file size.
-    // When file_size is 0 and the body is streamed, omitting Content-Length
-    // lets HTTP chunked transfer encoding work correctly.
-    if metadata.file_size > 0 {
+    // L1 fix: Content-Length should be emitted whenever the size is
+    // KNOWN, including the legitimate zero-byte case. Pre-fix the
+    // helper only emitted it when `file_size > 0`, conflating
+    // "unknown streaming size" with "known zero" and breaking clients
+    // that rely on `Content-Length: 0` to terminate empty responses.
+    //
+    // Discriminator: managed objects (new_passthrough / new_delta /
+    // new_reference) always populate a real `md5` — the canonical
+    // empty-content MD5 (`d41d8cd98f00b204e9800998ecf8427e`) for an
+    // empty body. Fallback metadata for unmanaged objects may carry
+    // an empty md5 string AND `file_size = 0`; that's the only case
+    // where we should keep omitting Content-Length so HTTP chunked
+    // transfer works for the streamed body.
+    let size_is_known = metadata.file_size > 0 || !metadata.md5.is_empty();
+    if size_is_known {
         headers.insert(
             "Content-Length",
             header_value(itoa_buf.format(metadata.file_size)),
@@ -270,22 +281,44 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
-    /// Regression: When file_size is 0 (unknown, e.g. metadata-less fallback path),
-    /// Content-Length must be omitted so HTTP chunked transfer works correctly.
+    /// Regression: When file_size is 0 AND md5 is empty (unknown,
+    /// e.g. metadata-less fallback path), Content-Length must be
+    /// omitted so HTTP chunked transfer works correctly.
     /// A `Content-Length: 0` header with a non-empty streaming body breaks clients.
     #[test]
-    fn zero_file_size_omits_content_length() {
+    fn zero_file_size_omits_content_length_when_unknown() {
         let meta = FileMetadata::new_passthrough(
             "test.bin".to_string(),
             String::new(),
             String::new(),
-            0, // unknown size
+            0, // unknown size + empty md5 → unknown
             None,
         );
         let headers = build_object_headers(&meta);
         assert!(
             headers.get("Content-Length").is_none(),
-            "Content-Length must be omitted when file_size is 0"
+            "Content-Length must be omitted when file_size is 0 AND md5 is empty (unmanaged streaming case)"
+        );
+    }
+
+    /// L1 fix: a known zero-byte managed object (real md5 set) MUST
+    /// emit `Content-Length: 0` so HEAD/GET responses are well-formed.
+    /// Pre-fix, the helper conflated "unknown size" with "zero size"
+    /// and never emitted Content-Length for empty-but-known objects.
+    #[test]
+    fn known_zero_byte_managed_object_sets_content_length_zero() {
+        let meta = FileMetadata::new_passthrough(
+            "empty.bin".to_string(),
+            "0".repeat(64),                              // known sha256
+            "d41d8cd98f00b204e9800998ecf8427e".into(),   // canonical empty-MD5
+            0,
+            None,
+        );
+        let headers = build_object_headers(&meta);
+        assert_eq!(
+            headers.get("Content-Length").map(|v| v.to_str().unwrap()),
+            Some("0"),
+            "Content-Length: 0 must be emitted for a known zero-byte managed object"
         );
     }
 

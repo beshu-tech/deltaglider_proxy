@@ -2,6 +2,101 @@
 
 ## Unreleased
 
+### Third-wave correctness fixes (replication + S3 conditionals + headers)
+
+Nine findings from a follow-up review of the replication v1 commits
+plus a couple of latent bugs in PUT / bucket subresource paths.
+
+**H1 — replication only copied the first page**
+`run_rule` listed one page with `batch_size`, copied it, finished
+`succeeded`, and never resumed. A bucket with 50k keys and
+`batch_size=100` was 99.8% unreplicated while the dashboard reported
+success. Fix: full pagination loop. Per-page `continuation_token`
+persisted via `replication_set_continuation_token` so a crash mid-
+run resumes from the last batch. Cleared on a clean complete pass.
+Bound `MAX_PAGES_PER_RUN = 10_000` defends against pagination
+loops in pathological backends. Integration test seeds 17 objects
+with `batch_size=5` (≥4 pages).
+
+**H2 — replicate_deletes was config-only, no implementation**
+The flag was validated, documented, and ignored. Fix: new
+`run_delete_pass` runs after the forward copy when
+`rule.replicate_deletes`. Paginates the destination prefix, HEADs
+each key on source, deletes destination on `NoSuchKey` source.
+Other source-HEAD errors preserve the destination key (false-
+delete is worse than a leftover). Skips the delete pass when the
+forward pass hit a fatal error (otherwise a transient list
+failure could trigger a destination-wide wipe). Integration test
+seeds an orphan and verifies it's deleted while legitimate keys
+survive.
+
+**H3 — replication lost multipart-ETag identity**
+`copy_one` always called plain `engine.store`, so a destination
+HEAD returned a fresh full-body MD5 instead of the source's
+`"abc-N"` multipart format. Fix: when source's
+`FileMetadata.multipart_etag` is `Some`, route through
+`engine.store_with_multipart_etag` (the H1 helper from the prior
+wave). Integration test creates a real multipart upload on
+source, replicates, and asserts source/destination ETags match.
+
+**M1 — replication status="succeeded" with partial failures**
+Pre-fix the status only flipped to `failed` when EVERY copy
+errored, so dashboards reading `last_status` got a silent partial
+failure. Fix: status is `failed` whenever ANY object copy or
+delete errored (or a fatal list/planner error happened); else
+`succeeded`. The per-object failure ring still captures the full
+error list; the status string is now just an honest summary.
+
+**M2 — PUT Object ignored conditional headers**
+`If-Match` / `If-None-Match` / `If-Modified-Since` /
+`If-Unmodified-Since` were silently dropped, breaking
+compare-and-swap and the canonical `If-None-Match: *` idempotent-
+create primitive. Fix: new `evaluate_put_conditionals` runs
+BEFORE `engine.store` and 412s on any precondition failure. AWS
+PUT semantics: all four return 412 (no 304 — that's GET-only).
+Two integration tests cover idempotent-create + CAS.
+
+**M3 — bucket subresources answered for ghost buckets**
+`GET ?location` / `GET ?versioning` / `GET ?uploads` returned 200
+for buckets that didn't exist. Fix: new `require_bucket_exists`
+helper at the top of each subresource branch. Three integration
+tests pin the 404 contract.
+
+**M4 — tagging stubs returned 501 even for missing resources**
+The 501-NotImplemented stubs at GET `?tagging` (object + bucket)
+swallowed the head-fail with `let _ = ...; // drain error` and
+returned 501 unconditionally. AWS returns 404 first in this case.
+Fix: propagate the head error so 404 NoSuchKey/NoSuchBucket wins.
+Two integration tests pin the precedence.
+
+**L1 — zero-byte managed objects omitted Content-Length: 0**
+`build_object_headers` only emitted Content-Length when
+`file_size > 0`, conflating "unknown streaming size" with "known
+zero". Clients waiting for the response body got hung up on the
+missing terminator for empty managed objects. Fix: new
+discriminator `size_is_known = file_size > 0 || !md5.is_empty()`.
+Managed objects always carry the canonical empty-MD5
+(`d41d8cd98f00b204e9800998ecf8427e`) for empty content, so the
+known-zero branch now emits `Content-Length: 0` while the
+unknown-streaming branch (empty md5 + file_size = 0) still
+omits it for chunked-transfer compatibility.
+
+**L2 — copy-source conditional combos drifted from AWS spec**
+AWS S3 CopyObject pairs `if-match` ↔ `if-unmodified-since` and
+`if-none-match` ↔ `if-modified-since` with **positive-header
+precedence**: when if-match passes, the date check is ignored
+entirely. Pre-fix, our linear evaluator rejected requests AWS
+would have accepted. Fix: explicit pair-aware evaluator —
+if-match present → if-unmodified-since suppressed; if-none-match
+present → if-modified-since suppressed. Solo-header behaviour
+unchanged. Integration test verifies the if-match-passes-with-
+stale-if-unmodified-since combination.
+
+Tests (3 unit + 11 integration new): all under
+`src/replication/worker.rs`, `tests/replication_test.rs`,
+`tests/s3_correctness_test.rs`. Full suite:
+659 lib tests + all integration green. Clippy clean.
+
 ### Lazy bucket replication (v1: run-now via admin API)
 
 First cut of scheduled source→destination replication. Built around

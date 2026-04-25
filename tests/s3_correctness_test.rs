@@ -362,6 +362,247 @@ async fn test_list_parts_honours_max_parts_and_marker() {
         .ok();
 }
 
+// ────────────────────────────────────────────────────────────────────────
+// M2 — PUT Object honours conditional headers
+// ────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_put_if_none_match_star_idempotent_create() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+    let url = format!("{}/{}/idempotent.txt", server.endpoint(), server.bucket());
+
+    // First PUT with If-None-Match: * succeeds (object doesn't exist).
+    let resp = http
+        .put(&url)
+        .header("If-None-Match", "*")
+        .body(b"first".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // Second PUT with If-None-Match: * → 412 (object now exists).
+    let resp = http
+        .put(&url)
+        .header("If-None-Match", "*")
+        .body(b"second".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 412, "M2: idempotent-create must reject second PUT");
+
+    // Sanity: original content unchanged.
+    let body = http.get(&url).send().await.unwrap().bytes().await.unwrap();
+    assert_eq!(&body[..], b"first");
+}
+
+#[tokio::test]
+async fn test_put_if_match_compare_and_swap() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+    let url = format!("{}/{}/cas.txt", server.endpoint(), server.bucket());
+
+    // Seed.
+    http.put(&url).body(b"v1".to_vec()).send().await.unwrap();
+    let etag_v1 = http
+        .head(&url)
+        .send()
+        .await
+        .unwrap()
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Wrong If-Match → 412.
+    let resp = http
+        .put(&url)
+        .header("If-Match", "\"definitely-not-the-etag\"")
+        .body(b"hijack".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 412);
+
+    // Correct If-Match → 200.
+    let resp = http
+        .put(&url)
+        .header("If-Match", &etag_v1)
+        .body(b"v2".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // Verify v2 landed.
+    let body = http.get(&url).send().await.unwrap().bytes().await.unwrap();
+    assert_eq!(&body[..], b"v2");
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// M3 — bucket subresources check bucket existence
+// ────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_get_bucket_location_on_missing_bucket_returns_404() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+    let resp = http
+        .get(format!("{}/ghost-bucket?location", server.endpoint()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("NoSuchBucket"), "got: {}", body);
+}
+
+#[tokio::test]
+async fn test_get_bucket_versioning_on_missing_bucket_returns_404() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+    let resp = http
+        .get(format!("{}/ghost-bucket?versioning", server.endpoint()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+}
+
+#[tokio::test]
+async fn test_list_multipart_uploads_on_missing_bucket_returns_404() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+    let resp = http
+        .get(format!("{}/ghost-bucket?uploads", server.endpoint()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// M4 — tagging precedence: 404 wins over 501 when target is missing
+// ────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_tagging_on_missing_object_returns_404_not_501() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+    let url = format!(
+        "{}/{}/does-not-exist?tagging",
+        server.endpoint(),
+        server.bucket()
+    );
+    let resp = http.get(&url).send().await.unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        404,
+        "M4: missing-object should win over 501 NotImplemented"
+    );
+}
+
+#[tokio::test]
+async fn test_tagging_on_missing_bucket_returns_404_not_501() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+    let resp = http
+        .get(format!("{}/ghost-bucket?tagging", server.endpoint()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        404,
+        "M4: missing-bucket should win over 501 NotImplemented"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// L1 — zero-byte managed objects emit Content-Length: 0
+// ────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_zero_byte_managed_object_emits_content_length_zero() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+    let url = format!("{}/{}/empty.bin", server.endpoint(), server.bucket());
+
+    // PUT a zero-byte object.
+    let resp = http.put(&url).body(b"".to_vec()).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // HEAD must report Content-Length: 0.
+    let resp = http.head(&url).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let cl = resp
+        .headers()
+        .get("content-length")
+        .map(|v| v.to_str().unwrap().to_string());
+    assert_eq!(
+        cl,
+        Some("0".to_string()),
+        "L1: HEAD on a known zero-byte object must return Content-Length: 0"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// L2 — copy-source conditional precedence
+// ────────────────────────────────────────────────────────────────────────
+
+/// AWS rule: if-match passing exempts if-unmodified-since from
+/// evaluation. Pre-fix our linear evaluator would have rejected this
+/// request when if-unmodified-since said "no" even though if-match
+/// said "yes".
+#[tokio::test]
+async fn test_copy_source_if_match_pass_overrides_if_unmodified_since() {
+    let server = TestServer::filesystem().await;
+    let client = server.s3_client().await;
+
+    client
+        .put_object()
+        .bucket(server.bucket())
+        .key("src.bin")
+        .body(ByteStream::from(b"hello".to_vec()))
+        .send()
+        .await
+        .unwrap();
+    let head = client
+        .head_object()
+        .bucket(server.bucket())
+        .key("src.bin")
+        .send()
+        .await
+        .unwrap();
+    let etag = head.e_tag().unwrap().to_string();
+
+    // Use a date in the past so if-unmodified-since alone would fail.
+    let past = "Mon, 01 Jan 1990 00:00:00 GMT";
+
+    // if-match passes (correct ETag) → AWS short-circuit ignores
+    // the if-unmodified-since failure → copy succeeds.
+    let res = client
+        .copy_object()
+        .bucket(server.bucket())
+        .key("dst.bin")
+        .copy_source(format!("{}/{}", server.bucket(), "src.bin"))
+        .copy_source_if_match(etag)
+        .copy_source_if_unmodified_since(aws_smithy_types::DateTime::from_str(
+            past,
+            aws_smithy_types::date_time::Format::HttpDate,
+        ).unwrap())
+        .send()
+        .await;
+    assert!(
+        res.is_ok(),
+        "L2: if-match passing must override if-unmodified-since failing, got {:?}",
+        res.err()
+    );
+}
+
 #[tokio::test]
 async fn test_list_multipart_uploads_honours_max_uploads_and_markers() {
     let server = TestServer::filesystem().await;
