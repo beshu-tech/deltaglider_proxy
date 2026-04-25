@@ -4,12 +4,10 @@ import {
   HeadObjectCommand,
   PutObjectCommand,
   DeleteObjectCommand,
-  DeleteObjectsCommand,
   GetObjectCommand,
   ListBucketsCommand,
   CreateBucketCommand,
   DeleteBucketCommand,
-  CopyObjectCommand,
 } from '@aws-sdk/client-s3';
 import type { ListObjectsV2CommandOutput } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
@@ -120,27 +118,6 @@ function getClient(): S3Client {
 
 const MAX_LIST_PAGES = 10; // ~10,000 objects max
 
-/** List ALL object keys under a prefix recursively (no delimiter). For bulk operations. */
-export async function listAllKeys(prefix: string): Promise<string[]> {
-  const client = getClient();
-  const keys: string[] = [];
-  let token: string | undefined;
-  for (let page = 0; page < MAX_LIST_PAGES; page++) {
-    const resp = await client.send(new ListObjectsV2Command({
-      Bucket: activeBucket,
-      Prefix: prefix || undefined,
-      ContinuationToken: token,
-    }));
-    for (const o of resp.Contents || []) {
-      if (o.Key) keys.push(o.Key);
-    }
-    if (!resp.IsTruncated) break;
-    token = resp.NextContinuationToken;
-    if (!token) break;
-  }
-  return keys;
-}
-
 export async function listObjects(prefix = ''): Promise<ListResult> {
   const client = getClient();
   const allObjects: S3Object[] = [];
@@ -248,30 +225,6 @@ export async function deleteObject(key: string): Promise<void> {
   await client.send(new DeleteObjectCommand({ Bucket: activeBucket, Key: key }));
 }
 
-export async function deleteObjects(keys: string[]): Promise<void> {
-  if (keys.length === 0) return;
-  const client = getClient();
-  // S3 batch delete: up to 1000 objects per request
-  for (let i = 0; i < keys.length; i += 1000) {
-    const batch = keys.slice(i, i + 1000);
-    await client.send(
-      new DeleteObjectsCommand({
-        Bucket: activeBucket,
-        Delete: { Objects: batch.map((Key) => ({ Key })), Quiet: true },
-      })
-    );
-  }
-}
-
-/**
-/** Server-side recursive delete: DELETE /{bucket}/{prefix}/ */
-export async function deletePrefix(pfx: string): Promise<void> {
-  const client = getClient();
-  // Ensure trailing slash — signals recursive delete to the proxy
-  const key = pfx.endsWith('/') ? pfx : pfx + '/';
-  await client.send(new DeleteObjectCommand({ Bucket: activeBucket, Key: key }));
-}
-
 export async function downloadObject(key: string): Promise<Blob> {
   const client = getClient();
   const resp = await client.send(new GetObjectCommand({ Bucket: activeBucket, Key: key }));
@@ -349,26 +302,3 @@ export async function deleteBucket(name: string): Promise<void> {
   await client.send(new DeleteBucketCommand({ Bucket: name }));
 }
 
-/** Copy a single object within or across buckets. */
-export async function copyObject(
-  sourceBucket: string, sourceKey: string,
-  destBucket: string, destKey: string,
-): Promise<void> {
-  const client = getClient();
-  await client.send(new CopyObjectCommand({
-    Bucket: destBucket,
-    Key: destKey,
-    CopySource: `${sourceBucket}/${encodeURIComponent(sourceKey).replace(/%2F/g, '/')}`,
-  }));
-}
-
-/** Download an object as raw bytes. */
-export async function getObjectBytes(key: string): Promise<{ data: Uint8Array; name: string }> {
-  const client = getClient();
-  const resp = await client.send(new GetObjectCommand({ Bucket: activeBucket, Key: key }));
-  const body = resp.Body;
-  if (!body) throw new Error('Empty response body');
-  const bytes = await body.transformToByteArray();
-  const name = key.split('/').pop() || key;
-  return { data: bytes, name };
-}

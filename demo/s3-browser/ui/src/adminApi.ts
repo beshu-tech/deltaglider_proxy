@@ -257,7 +257,7 @@ export async function exportConfigYaml(): Promise<string> {
   return res.text();
 }
 
-export interface ConfigValidateResponse {
+interface ConfigValidateResponse {
   ok: boolean;
   warnings: string[];
   error?: string;
@@ -524,13 +524,13 @@ export interface IamGroup {
   created_at: string;
 }
 
-export interface CreateGroupRequest {
+interface CreateGroupRequest {
   name: string;
   description?: string;
   permissions: IamPermission[];
 }
 
-export interface UpdateGroupRequest {
+interface UpdateGroupRequest {
   name?: string;
   description?: string;
   permissions?: IamPermission[];
@@ -704,7 +704,7 @@ export async function loginAs(accessKeyId: string, secretAccessKey: string): Pro
 
 // === Multi-Backend Management ===
 
-export interface BackendListResponse {
+interface BackendListResponse {
   backends: BackendInfo[];
   default_backend: string | null;
 }
@@ -988,32 +988,32 @@ export async function fetchAudit(limit = 100): Promise<AuditResponse> {
 //   directly with `<a href download>` — server streams the archive.
 // =============================================================================
 
-export interface BulkCopyItem {
+interface BulkCopyItem {
   source_key: string;
   /** Suffix appended to dest_prefix to form the destination key. */
   relative: string;
 }
 
-export interface BulkCopyRequest {
+interface BulkCopyRequest {
   source_bucket: string;
   dest_bucket: string;
   dest_prefix: string;
   items: BulkCopyItem[];
 }
 
-export interface BulkCopyFailure {
+interface BulkCopyFailure {
   source_key: string;
   dest_key: string;
   error: string;
 }
 
-export interface BulkCopyResponse {
+interface BulkCopyResponse {
   succeeded: number;
   failed: number;
   failures: BulkCopyFailure[];
 }
 
-export interface BulkMoveResponse extends BulkCopyResponse {
+interface BulkMoveResponse extends BulkCopyResponse {
   deleted: number;
 }
 
@@ -1029,12 +1029,12 @@ export async function bulkMoveObjects(req: BulkCopyRequest): Promise<BulkMoveRes
   return safeJson(res);
 }
 
-export interface BulkDeleteRequest {
+interface BulkDeleteRequest {
   bucket: string;
   keys: string[];
 }
 
-export interface BulkDeleteResponse {
+interface BulkDeleteResponse {
   deleted: number;
   failed: number;
   failures: { key: string; error: string }[];
@@ -1046,7 +1046,7 @@ export async function bulkDeleteObjects(req: BulkDeleteRequest): Promise<BulkDel
   return safeJson(res);
 }
 
-export interface ListAllResponse {
+interface ListAllResponse {
   keys: string[];
   truncated: boolean;
 }
