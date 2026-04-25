@@ -51,6 +51,12 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
   useEffect(() => {
     if (!open || !object) return;
 
+    // Cancellation guard: if the user switches files (or closes) while a
+    // download / presign is in flight, the in-flight result must NOT commit
+    // into the new file's drawer state. Without this, A's content used to
+    // land inside B's modal after rapid switching.
+    let cancelled = false;
+
     setLoading(true);
     setError('');
     setTextContent('');
@@ -60,6 +66,7 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
       downloadObject(object.key)
         .then(blob => blob.text())
         .then(raw => {
+          if (cancelled) return;
           const ext = object.key.split('.').pop()?.toLowerCase() ?? '';
           if (ext === 'json') {
             try { setTextContent(JSON.stringify(JSON.parse(raw), null, 2)); }
@@ -68,16 +75,18 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
             setTextContent(raw);
           }
         })
-        .catch(e => setError(e instanceof Error ? e.message : 'Failed to load file'))
-        .finally(() => setLoading(false));
+        .catch(e => { if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load file'); })
+        .finally(() => { if (!cancelled) setLoading(false); });
     } else if (mode === 'image') {
       getPresignedUrl(object.key)
-        .then(url => setImageUrl(url))
-        .catch(e => setError(e instanceof Error ? e.message : 'Failed to load image'))
-        .finally(() => setLoading(false));
+        .then(url => { if (!cancelled) setImageUrl(url); })
+        .catch(e => { if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load image'); })
+        .finally(() => { if (!cancelled) setLoading(false); });
     } else {
       setLoading(false);
     }
+
+    return () => { cancelled = true; };
   }, [open, object, mode, tooLarge]);
 
   const handleDownload = async () => {

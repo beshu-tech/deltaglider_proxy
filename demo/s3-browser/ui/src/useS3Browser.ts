@@ -58,10 +58,13 @@ export default function useS3Browser() {
     setRefreshTrigger((k) => k + 1);
   }, []);
 
-  const loadingRef = useRef(false);
+  // Sequence token for load(). Each call increments loadSeq; only the *latest*
+  // load is allowed to commit results. This replaces the previous single-flight
+  // guard, which silently dropped concurrent loads (e.g. fast prefix/bucket
+  // changes), letting the older request commit stale data into state.
+  const loadSeq = useRef(0);
 
   const load = useCallback(() => {
-    if (loadingRef.current) return; // skip if a request is already in-flight
     if (!hasCredentials()) {
       setConnected(false);
       setLoading(false);
@@ -75,7 +78,7 @@ export default function useS3Browser() {
     if (!getBucket()) {
       return;
     }
-    loadingRef.current = true;
+    const seq = ++loadSeq.current;
 
     // On initial load or prefix/bucket change, show full loading spinner.
     // On background refresh, show subtle refreshing indicator.
@@ -87,6 +90,7 @@ export default function useS3Browser() {
 
     listObjects(prefix)
       .then(({ objects: objs, folders: dirs, isTruncated: trunc }) => {
+        if (seq !== loadSeq.current) return; // stale response — newer load in flight
         setObjects(objs);
         setFolders(dirs);
         setIsTruncated(trunc);
@@ -95,12 +99,13 @@ export default function useS3Browser() {
         selection.reconcile(objs, dirs);
       })
       .catch((err) => {
+        if (seq !== loadSeq.current) return; // stale error — drop silently
         // Keep stale data on error instead of clearing
         setError(err instanceof Error ? err.message : 'Failed to load objects');
         setConnected(false);
       })
       .finally(() => {
-        loadingRef.current = false;
+        if (seq !== loadSeq.current) return; // stale settle — newer load owns the spinners
         isInitialLoad.current = false;
         setLoading(false);
         setRefreshing(false);
@@ -117,6 +122,11 @@ export default function useS3Browser() {
     return () => clearInterval(id);
   }, [refresh]);
 
+  // Track the latest enrich generation. If keys is replaced (prefix/bucket change)
+  // before in-flight HEADs settle, we still want to safely write per-key results
+  // — but cache writes themselves are idempotent and keyed, so we only need to
+  // preserve the per-result error flag. The previous bug hardcoded error:false
+  // on every result, masking HEAD failures so ObjectTable never showed warnings.
   const enrichKeys = useCallback((keys: string[]) => {
     const cache = headCacheRef.current;
     const toFetch = keys.filter((k) => !(k in cache) && !headInflight.current.has(k));
@@ -125,14 +135,16 @@ export default function useS3Browser() {
     Promise.all(
       toFetch.map((key) =>
         headObject(key)
-          .then(({ storageType, storedSize }) => ({ key, storageType, storedSize, error: false }))
-          .catch(() => ({ key, storageType: undefined, storedSize: undefined, error: true }))
+          .then(({ storageType, storedSize }) => ({ key, storageType, storedSize, error: false as const }))
+          .catch(() => ({ key, storageType: undefined, storedSize: undefined, error: true as const }))
       )
     ).then((results) => {
       setHeadCache((prev) => {
         const next = { ...prev };
         for (const r of results) {
-          next[r.key] = { storageType: r.storageType, storedSize: r.storedSize, error: false };
+          next[r.key] = r.error
+            ? { error: true }
+            : { storageType: r.storageType, storedSize: r.storedSize, error: false };
           headInflight.current.delete(r.key);
         }
         // Evict oldest entries if cache exceeds max size
@@ -214,34 +226,103 @@ export default function useS3Browser() {
     return Array.from(keySet);
   }, [selection.selectedKeys]);
 
+  /**
+   * Resolve the selection into [absolute-source-key, relative-dest-suffix] pairs.
+   *
+   * Semantics:
+   * - When the user selects a folder `foo/`, that prefix is the "common prefix"
+   *   for everything underneath it: `foo/a.txt` becomes relative-suffix `a.txt`
+   *   and `foo/bar/a.txt` becomes `bar/a.txt`. Destination keys are then
+   *   `destPrefix + relative-suffix`, preserving the folder structure.
+   * - When the user selects a single object directly, the relative-suffix is
+   *   just its basename (matches the previous flat behavior for direct picks).
+   * - If two different sources resolve to the same destination key, throw
+   *   loudly BEFORE any copy starts. The previous code would silently overwrite
+   *   when two siblings shared a basename across nested folders.
+   */
+  const resolveSelectionWithRelativeKeys = useCallback(async (): Promise<Array<{ source: string; relative: string }>> => {
+    // dedupe by absolute source key while keeping the FIRST relative suffix we
+    // saw — later overlapping folder selections shouldn't shorten a prefix that
+    // an earlier folder already established.
+    const seen = new Map<string, string>();
+    for (const k of selection.selectedKeys) {
+      if (k.startsWith('folder:')) {
+        const pfx = k.slice('folder:'.length);
+        if (!pfx) continue; // Reject empty prefix to avoid listing entire bucket
+        const nested = await listAllKeys(pfx);
+        for (const nk of nested) {
+          if (seen.has(nk)) continue;
+          // Strip the selected folder prefix; if for some reason the listing
+          // doesn't start with `pfx` (shouldn't happen, but be defensive),
+          // fall back to the basename so we at least don't blow up.
+          const relative = nk.startsWith(pfx) ? nk.slice(pfx.length) : (nk.split('/').pop() || nk);
+          if (relative) seen.set(nk, relative);
+        }
+      } else {
+        if (seen.has(k)) continue;
+        const filename = k.split('/').pop() || k;
+        seen.set(k, filename);
+      }
+    }
+    return Array.from(seen, ([source, relative]) => ({ source, relative }));
+  }, [selection.selectedKeys]);
+
   const bulkCopy = useCallback(async (destBucket: string, destPrefix: string) => {
-    const keys = await resolveSelectedKeys();
+    const items = await resolveSelectionWithRelativeKeys();
     const sourceBucket = getBucket();
+
+    // Build the dest-key plan. Surface collisions BEFORE the first copy so we
+    // never silently overwrite a sibling. (The original code mapped every
+    // source to `destPrefix + basename`, flattening folders and clobbering on
+    // shared basenames across nested directories.)
+    const plan: Array<{ source: string; destKey: string }> = [];
+    const destKeyCounts = new Map<string, number>();
+    for (const { source, relative } of items) {
+      const destKey = destPrefix ? `${destPrefix}${relative}` : relative;
+      plan.push({ source, destKey });
+      destKeyCounts.set(destKey, (destKeyCounts.get(destKey) || 0) + 1);
+    }
+    const collisions = Array.from(destKeyCounts.entries()).filter(([, n]) => n > 1).map(([k]) => k);
+    if (collisions.length > 0) {
+      throw new Error(`Copy aborted: ${collisions.length} destination key(s) would overwrite each other (e.g. "${collisions[0]}"). Pick a different destination or narrow the selection.`);
+    }
+
     let succeeded = 0, failed = 0;
-    for (const key of keys) {
-      const filename = key.split('/').pop() || key;
-      const destKey = destPrefix ? `${destPrefix}${filename}` : filename;
+    for (const { source, destKey } of plan) {
       try {
-        await copyObject(sourceBucket, key, destBucket, destKey);
+        await copyObject(sourceBucket, source, destBucket, destKey);
         succeeded++;
       } catch { failed++; }
     }
     refresh();
     return { succeeded, failed };
-  }, [resolveSelectedKeys, refresh]);
+  }, [resolveSelectionWithRelativeKeys, refresh]);
 
   const bulkMove = useCallback(async (destBucket: string, destPrefix: string) => {
-    const keys = await resolveSelectedKeys();
+    const items = await resolveSelectionWithRelativeKeys();
     const sourceBucket = getBucket();
+
+    // Same collision-detection as bulkCopy: surface BEFORE we start so we don't
+    // half-move + half-overwrite (which previously could silently lose data).
+    const plan: Array<{ source: string; destKey: string }> = [];
+    const destKeyCounts = new Map<string, number>();
+    for (const { source, relative } of items) {
+      const destKey = destPrefix ? `${destPrefix}${relative}` : relative;
+      plan.push({ source, destKey });
+      destKeyCounts.set(destKey, (destKeyCounts.get(destKey) || 0) + 1);
+    }
+    const collisions = Array.from(destKeyCounts.entries()).filter(([, n]) => n > 1).map(([k]) => k);
+    if (collisions.length > 0) {
+      throw new Error(`Move aborted: ${collisions.length} destination key(s) would overwrite each other (e.g. "${collisions[0]}"). Pick a different destination or narrow the selection.`);
+    }
+
     // Copy all first
     const copied: string[] = [];
     let failed = 0;
-    for (const key of keys) {
-      const filename = key.split('/').pop() || key;
-      const destKey = destPrefix ? `${destPrefix}${filename}` : filename;
+    for (const { source, destKey } of plan) {
       try {
-        await copyObject(sourceBucket, key, destBucket, destKey);
-        copied.push(key);
+        await copyObject(sourceBucket, source, destBucket, destKey);
+        copied.push(source);
       } catch { failed++; }
     }
     // Only delete sources if ALL copies succeeded — partial moves risk data loss.
@@ -251,8 +332,8 @@ export default function useS3Browser() {
     }
     selection.clearSelection();
     refresh();
-    return { succeeded: failed === 0 ? copied.length : 0, failed: failed > 0 ? keys.length : 0 };
-  }, [resolveSelectedKeys, selection.clearSelection, refresh]);
+    return { succeeded: failed === 0 ? copied.length : 0, failed: failed > 0 ? plan.length : 0 };
+  }, [resolveSelectionWithRelativeKeys, selection.clearSelection, refresh]);
 
   const downloadZip = useCallback(async () => {
     const MAX_ZIP_BYTES = 500 * 1024 * 1024; // 500MB safety limit

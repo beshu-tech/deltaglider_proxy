@@ -225,8 +225,11 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
     const bucket = getBucket();
     if (!bucket || bucket === lastBucketRef.current) return;
     lastBucketRef.current = bucket;
+    // Cancellation guard: if the user switches buckets (or unmounts the panel)
+    // before getAdminConfig settles, drop the stale result.
+    let cancelled = false;
     getAdminConfig().then(cfg => {
-      if (!cfg) return;
+      if (cancelled || !cfg) return;
       const bp = cfg.bucket_policies?.[bucket] || cfg.bucket_policies?.[bucket.toLowerCase()];
       const globalCompression = (cfg.max_delta_ratio ?? 0.75) > 0;
       setBucketPolicy({
@@ -234,10 +237,15 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
         publicPrefixes: bp?.public_prefixes ?? [],
       });
     }).catch(() => {});
+    return () => { cancelled = true; };
   }, [object?.key]);
 
   useEffect(() => {
     if (!object) { setHeadData(null); return; }
+    // Cancellation guard: rapid object switching previously let an older
+    // headObject() resolve into the newer object's drawer, showing stale
+    // metadata for the wrong file. Capture a flag, only commit when alive.
+    let cancelled = false;
     // Seed from table's headCache so Storage Stats renders instantly
     const cached = headCache?.[object.key];
     if (cached) {
@@ -247,9 +255,10 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
     }
     setHeadLoading(true);
     headObject(object.key)
-      .then(setHeadData)
-      .catch(() => setHeadData((prev) => prev ?? { headers: {} }))
-      .finally(() => setHeadLoading(false));
+      .then((data) => { if (!cancelled) setHeadData(data); })
+      .catch(() => { if (!cancelled) setHeadData((prev) => prev ?? { headers: {} }); })
+      .finally(() => { if (!cancelled) setHeadLoading(false); });
+    return () => { cancelled = true; };
   }, [object?.key]);
 
   if (!object) return null;
