@@ -457,10 +457,12 @@ fn build_s3s_router(
             match self.iam_state.load().as_ref() {
                 IamState::Disabled => {
                     // The legacy Axum path ignores signatures in open-dev mode.
-                    // The integration harness signs with test/test, so keep that
-                    // compatibility for the experimental adapter while still letting
-                    // s3s decode signed/chunked SDK requests.
-                    Ok(SecretKey::from("test"))
+                    // In open mode, accept the common "same access key + secret"
+                    // dummy pattern used by SDK clients (test/test, anonymous/
+                    // anonymous). This lets s3s decode signed/chunked SDK
+                    // requests without making local-dev users discover a magic
+                    // hardcoded secret.
+                    Ok(SecretKey::from(access_key.to_string()))
                 }
                 IamState::Legacy(auth) if access_key == auth.access_key_id => {
                     Ok(SecretKey::from(auth.secret_access_key.clone()))

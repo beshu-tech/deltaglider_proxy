@@ -29,6 +29,30 @@ fn header_string(resp: &reqwest::Response, name: &str) -> String {
 }
 
 #[tokio::test]
+async fn s3s_open_mode_accepts_anonymous_dummy_credentials() {
+    let server = TestServer::builder()
+        .bucket("open-mode-bucket")
+        .s3s_adapter()
+        .build()
+        .await;
+    let client = server.s3_client_with_creds("anonymous", "anonymous").await;
+
+    let buckets = client
+        .list_buckets()
+        .send()
+        .await
+        .expect("open mode should accept anonymous/anonymous dummy SDK credentials");
+
+    assert!(
+        buckets
+            .buckets()
+            .iter()
+            .any(|bucket| bucket.name() == Some(server.bucket())),
+        "test bucket should be visible in open mode"
+    );
+}
+
+#[tokio::test]
 async fn range_and_conditionals_match_legacy_adapter() {
     let (legacy, s3s) = parity_servers().await;
     let http = reqwest::Client::new();
