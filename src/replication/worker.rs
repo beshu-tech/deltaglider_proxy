@@ -485,12 +485,11 @@ async fn copy_one(
     // HEAD first so we can error cleanly if the source disappeared
     // mid-run (retrieve would also error, but this gives a crisper
     // cause on the failure row).
-    let _src_meta = engine
-        .head(&rule.source.bucket, src_key)
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+    let _src_meta = engine.head(&rule.source.bucket, src_key).await.map_err(
+        |e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("source head failed: {}", e).into()
-        })?;
+        },
+    )?;
 
     let (data, meta) = engine
         .retrieve(&rule.source.bucket, src_key)
@@ -508,10 +507,7 @@ async fn copy_one(
     // operator sharing the destination prefix. Without this marker,
     // `replicate_deletes=true` would happily delete unrelated objects
     // whose source-counterpart key happens to be missing.
-    user_metadata.insert(
-        REPLICATION_RULE_METADATA_KEY.to_string(),
-        rule.name.clone(),
-    );
+    user_metadata.insert(REPLICATION_RULE_METADATA_KEY.to_string(), rule.name.clone());
 
     // H3 fix: when the source carries a multipart_etag, route through
     // store_with_multipart_etag so the destination HEAD reports the

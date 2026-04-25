@@ -65,8 +65,9 @@ impl SignedPayloadHash {
     pub fn is_verifiable_hex(&self) -> bool {
         let v = self.0.as_str();
         v.len() == 64
-            && v.bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b) || (b'A'..=b'F').contains(&b))
+            && v.bytes().all(|b| {
+                b.is_ascii_digit() || (b'a'..=b'f').contains(&b) || (b'A'..=b'F').contains(&b)
+            })
     }
 }
 

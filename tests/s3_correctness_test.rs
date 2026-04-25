@@ -204,10 +204,7 @@ async fn test_invalid_metadata_directive_rejected() {
     let copy_url = format!("{}/{}/dst.bin", server.endpoint(), server.bucket());
     let resp = http
         .put(&copy_url)
-        .header(
-            "x-amz-copy-source",
-            format!("/{}/src.bin", server.bucket()),
-        )
+        .header("x-amz-copy-source", format!("/{}/src.bin", server.bucket()))
         .header("x-amz-metadata-directive", "REPLAC") // typo
         .send()
         .await
@@ -236,11 +233,7 @@ async fn test_object_tagging_get_returns_501() {
 
     // Seed the object first so the handler reaches the tagging branch.
     let put_url = format!("{}/{}/t.bin", server.endpoint(), server.bucket());
-    http.put(&put_url)
-        .body(b"x".to_vec())
-        .send()
-        .await
-        .unwrap();
+    http.put(&put_url).body(b"x".to_vec()).send().await.unwrap();
 
     let get_url = format!("{}/{}/t.bin?tagging", server.endpoint(), server.bucket());
     let resp = http.get(&get_url).send().await.unwrap();
@@ -254,11 +247,7 @@ async fn test_object_tagging_put_returns_501() {
     let server = TestServer::filesystem().await;
     let http = reqwest::Client::new();
     let put_url = format!("{}/{}/u.bin", server.endpoint(), server.bucket());
-    http.put(&put_url)
-        .body(b"x".to_vec())
-        .send()
-        .await
-        .unwrap();
+    http.put(&put_url).body(b"x".to_vec()).send().await.unwrap();
 
     let tag_url = format!("{}/{}/u.bin?tagging", server.endpoint(), server.bucket());
     let body = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -390,7 +379,11 @@ async fn test_put_if_none_match_star_idempotent_create() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status().as_u16(), 412, "M2: idempotent-create must reject second PUT");
+    assert_eq!(
+        resp.status().as_u16(),
+        412,
+        "M2: idempotent-create must reject second PUT"
+    );
 
     // Sanity: original content unchanged.
     let body = http.get(&url).send().await.unwrap().bytes().await.unwrap();
@@ -712,11 +705,15 @@ async fn test_delete_tagging_on_missing_object_returns_404() {
 async fn test_delete_tagging_on_existing_object_returns_501() {
     let server = TestServer::filesystem().await;
     let http = reqwest::Client::new();
-    http.put(format!("{}/{}/seed.bin", server.endpoint(), server.bucket()))
-        .body(b"x".to_vec())
-        .send()
-        .await
-        .unwrap();
+    http.put(format!(
+        "{}/{}/seed.bin",
+        server.endpoint(),
+        server.bucket()
+    ))
+    .body(b"x".to_vec())
+    .send()
+    .await
+    .unwrap();
 
     let resp = http
         .delete(format!(
@@ -771,10 +768,13 @@ async fn test_copy_source_if_match_pass_overrides_if_unmodified_since() {
         .key("dst.bin")
         .copy_source(format!("{}/{}", server.bucket(), "src.bin"))
         .copy_source_if_match(etag)
-        .copy_source_if_unmodified_since(aws_smithy_types::DateTime::from_str(
-            past,
-            aws_smithy_types::date_time::Format::HttpDate,
-        ).unwrap())
+        .copy_source_if_unmodified_since(
+            aws_smithy_types::DateTime::from_str(
+                past,
+                aws_smithy_types::date_time::Format::HttpDate,
+            )
+            .unwrap(),
+        )
         .send()
         .await;
     assert!(
@@ -814,7 +814,10 @@ async fn test_list_multipart_uploads_honours_max_uploads_and_markers() {
     assert!(page1.is_truncated().unwrap_or(false));
     assert_eq!(page1.uploads().len(), 2);
     let next_key = page1.next_key_marker().unwrap_or_default().to_string();
-    let next_id = page1.next_upload_id_marker().unwrap_or_default().to_string();
+    let next_id = page1
+        .next_upload_id_marker()
+        .unwrap_or_default()
+        .to_string();
     assert!(!next_key.is_empty(), "next key marker should be populated");
 
     // Second page with marker.

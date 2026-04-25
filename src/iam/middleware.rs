@@ -266,9 +266,7 @@ fn extract_prefix_from_query(query: Option<&str>) -> String {
     };
     for param in q.split('&') {
         if let Some(value) = param.strip_prefix("prefix=") {
-            return urlencoding::decode(value)
-                .unwrap_or_default()
-                .into_owned();
+            return urlencoding::decode(value).unwrap_or_default().into_owned();
         }
     }
     String::new()

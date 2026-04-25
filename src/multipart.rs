@@ -283,11 +283,7 @@ impl MultipartStore {
         // 2. Global cap (max_total_multipart_bytes) — prevents many
         //    uploads from collectively exhausting heap. Rejects with
         //    SlowDown so AWS SDKs back off and retry.
-        let old_part_size = upload
-            .parts
-            .get(&part_number)
-            .map(|p| p.size)
-            .unwrap_or(0);
+        let old_part_size = upload.parts.get(&part_number).map(|p| p.size).unwrap_or(0);
         let cumulative_after = upload
             .parts
             .values()
@@ -699,8 +695,8 @@ impl MultipartStore {
                 }
                 // Tuple-cursor skip.
                 if !key_marker.is_empty() || !upload_id_marker.is_empty() {
-                    let cmp = (u.key.as_str(), u.upload_id.as_str())
-                        .cmp(&(key_marker, upload_id_marker));
+                    let cmp =
+                        (u.key.as_str(), u.upload_id.as_str()).cmp(&(key_marker, upload_id_marker));
                     if cmp != std::cmp::Ordering::Greater {
                         return false;
                     }
@@ -1234,35 +1230,15 @@ mod tests {
     fn test_upload_part_rejects_when_cumulative_exceeds_max_object_size() {
         // max_object_size = 1 KiB. Upload 700 B + 200 B → OK, 300 B → rejected.
         let store = MultipartStore::new(1024);
-        let upload_id = store
-            .create("bucket", "key", None, HashMap::new())
+        let upload_id = store.create("bucket", "key", None, HashMap::new()).unwrap();
+        store
+            .upload_part(&upload_id, "bucket", "key", 1, Bytes::from(vec![0u8; 700]))
             .unwrap();
         store
-            .upload_part(
-                &upload_id,
-                "bucket",
-                "key",
-                1,
-                Bytes::from(vec![0u8; 700]),
-            )
-            .unwrap();
-        store
-            .upload_part(
-                &upload_id,
-                "bucket",
-                "key",
-                2,
-                Bytes::from(vec![0u8; 200]),
-            )
+            .upload_part(&upload_id, "bucket", "key", 2, Bytes::from(vec![0u8; 200]))
             .unwrap();
         let err = store
-            .upload_part(
-                &upload_id,
-                "bucket",
-                "key",
-                3,
-                Bytes::from(vec![0u8; 300]),
-            )
+            .upload_part(&upload_id, "bucket", "key", 3, Bytes::from(vec![0u8; 300]))
             .unwrap_err();
         assert!(
             matches!(err, S3Error::EntityTooLarge { size, max } if size == 1200 && max == 1024),
@@ -1275,37 +1251,17 @@ mod tests {
     fn test_upload_part_overwrite_adjusts_cumulative_correctly() {
         // Overwrite a 1000 B part with 200 B — cumulative goes DOWN, not up.
         let store = MultipartStore::new(1500);
-        let upload_id = store
-            .create("bucket", "key", None, HashMap::new())
-            .unwrap();
+        let upload_id = store.create("bucket", "key", None, HashMap::new()).unwrap();
         store
-            .upload_part(
-                &upload_id,
-                "bucket",
-                "key",
-                1,
-                Bytes::from(vec![0u8; 1000]),
-            )
+            .upload_part(&upload_id, "bucket", "key", 1, Bytes::from(vec![0u8; 1000]))
             .unwrap();
         // Add 400 more via a second part — total 1400, under cap.
         store
-            .upload_part(
-                &upload_id,
-                "bucket",
-                "key",
-                2,
-                Bytes::from(vec![0u8; 400]),
-            )
+            .upload_part(&upload_id, "bucket", "key", 2, Bytes::from(vec![0u8; 400]))
             .unwrap();
         // Now overwrite part 1 with 200 B. New cumulative = 200 + 400 = 600.
         store
-            .upload_part(
-                &upload_id,
-                "bucket",
-                "key",
-                1,
-                Bytes::from(vec![0u8; 200]),
-            )
+            .upload_part(&upload_id, "bucket", "key", 1, Bytes::from(vec![0u8; 200]))
             .unwrap();
         // Counter should reflect the overwrite.
         assert_eq!(store.in_flight_bytes(), 600);
@@ -1314,8 +1270,7 @@ mod tests {
     #[test]
     fn test_upload_part_respects_global_byte_cap() {
         // Tight global cap: 2 KiB total across all uploads.
-        let store =
-            MultipartStore::new_for_test(10 * 1024, 2 * 1024, Duration::hours(24));
+        let store = MultipartStore::new_for_test(10 * 1024, 2 * 1024, Duration::hours(24));
         let id_a = store.create("b", "a", None, HashMap::new()).unwrap();
         let id_b = store.create("b", "b", None, HashMap::new()).unwrap();
 
@@ -1336,8 +1291,7 @@ mod tests {
 
     #[test]
     fn test_abort_releases_in_flight_bytes() {
-        let store =
-            MultipartStore::new_for_test(10 * 1024, 2 * 1024, Duration::hours(24));
+        let store = MultipartStore::new_for_test(10 * 1024, 2 * 1024, Duration::hours(24));
         let id = store.create("b", "a", None, HashMap::new()).unwrap();
         store
             .upload_part(&id, "b", "a", 1, Bytes::from(vec![0u8; 1024]))
@@ -1354,8 +1308,7 @@ mod tests {
 
     #[test]
     fn test_finish_upload_releases_in_flight_bytes() {
-        let store =
-            MultipartStore::new_for_test(10 * 1024, 10 * 1024, Duration::hours(24));
+        let store = MultipartStore::new_for_test(10 * 1024, 10 * 1024, Duration::hours(24));
         let id = store.create("b", "k", None, HashMap::new()).unwrap();
         let data = Bytes::from(vec![0u8; 500]);
         let etag = store.upload_part(&id, "b", "k", 1, data).unwrap();
@@ -1372,11 +1325,7 @@ mod tests {
     #[test]
     fn test_cleanup_expired_idle_ttl_sweeps_and_releases_bytes() {
         // Tiny idle TTL so we can trip it synchronously.
-        let store = MultipartStore::new_for_test(
-            10 * 1024,
-            10 * 1024,
-            Duration::milliseconds(1),
-        );
+        let store = MultipartStore::new_for_test(10 * 1024, 10 * 1024, Duration::milliseconds(1));
         let id = store.create("b", "k", None, HashMap::new()).unwrap();
         store
             .upload_part(&id, "b", "k", 1, Bytes::from(vec![0u8; 700]))
@@ -1402,11 +1351,7 @@ mod tests {
     fn test_cleanup_expired_preserves_completing_upload() {
         // An upload in Completing state must NOT be swept — the handler's
         // engine.store* is in flight and the sweeper would desync the map.
-        let store = MultipartStore::new_for_test(
-            10 * 1024,
-            10 * 1024,
-            Duration::milliseconds(1),
-        );
+        let store = MultipartStore::new_for_test(10 * 1024, 10 * 1024, Duration::milliseconds(1));
         let id = store.create("b", "k", None, HashMap::new()).unwrap();
         let etag = store
             .upload_part(&id, "b", "k", 1, Bytes::from(vec![0u8; 100]))

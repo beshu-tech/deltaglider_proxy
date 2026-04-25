@@ -1356,7 +1356,11 @@ mod tests {
     #[test]
     fn replication_validation_accepts_default() {
         let warnings = validate_replication(&ReplicationConfig::default());
-        assert!(warnings.is_empty(), "default should be valid: {:?}", warnings);
+        assert!(
+            warnings.is_empty(),
+            "default should be valid: {:?}",
+            warnings
+        );
     }
 
     #[test]
@@ -1367,8 +1371,9 @@ mod tests {
         };
         let warnings = validate_replication(&cfg);
         assert!(
-            warnings.iter().any(|w| w.contains("invalid")
-                && w.contains("has spaces!")),
+            warnings
+                .iter()
+                .any(|w| w.contains("invalid") && w.contains("has spaces!")),
             "{:?}",
             warnings
         );
@@ -1427,11 +1432,12 @@ mod tests {
             ..Default::default()
         };
         let warnings = validate_replication(&cfg);
-        let cycle_warns: Vec<_> = warnings
-            .iter()
-            .filter(|w| w.contains("cycle"))
-            .collect();
-        assert!(!cycle_warns.is_empty(), "expected cycle warning: {:?}", warnings);
+        let cycle_warns: Vec<_> = warnings.iter().filter(|w| w.contains("cycle")).collect();
+        assert!(
+            !cycle_warns.is_empty(),
+            "expected cycle warning: {:?}",
+            warnings
+        );
     }
 
     #[test]

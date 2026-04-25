@@ -78,11 +78,7 @@ pub fn current_unix_seconds() -> i64 {
 impl ConfigDb {
     /// Upsert the initial state row for a rule. Idempotent: existing
     /// rows (including `paused` flag + lifetime counters) are preserved.
-    pub fn replication_ensure_state(
-        &self,
-        rule_name: &str,
-        now: i64,
-    ) -> Result<(), ConfigDbError> {
+    pub fn replication_ensure_state(&self, rule_name: &str, now: i64) -> Result<(), ConfigDbError> {
         self.conn.execute(
             "INSERT OR IGNORE INTO replication_state
                 (rule_name, next_due_at, last_status)
@@ -99,7 +95,9 @@ impl ConfigDb {
         &self,
         known_rule_names: &[String],
     ) -> Result<usize, ConfigDbError> {
-        let mut stmt = self.conn.prepare("SELECT rule_name FROM replication_state")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT rule_name FROM replication_state")?;
         let rows: Vec<String> = stmt
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;

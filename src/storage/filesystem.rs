@@ -1098,8 +1098,8 @@ mod tests {
     fn dummy_metadata(filename: &str) -> FileMetadata {
         FileMetadata::new_passthrough(
             filename.to_string(),
-            "0".repeat(64),     // sha256 hex
-            "0".repeat(32),     // md5 hex
+            "0".repeat(64), // sha256 hex
+            "0".repeat(32), // md5 hex
             0,
             None,
         )
@@ -1147,13 +1147,7 @@ mod tests {
             .expect("new backend");
 
         let err = backend
-            .put_delta(
-                "ghost",
-                "ns",
-                "f.delta",
-                b"x",
-                &dummy_metadata("f.delta"),
-            )
+            .put_delta("ghost", "ns", "f.delta", b"x", &dummy_metadata("f.delta"))
             .await
             .expect_err("must refuse");
 

@@ -129,7 +129,12 @@ async fn test_bulk_move_atomic_delete() {
             .send()
             .await
             .unwrap();
-        assert_eq!(head.status().as_u16(), 404, "source {} should be deleted", src);
+        assert_eq!(
+            head.status().as_u16(),
+            404,
+            "source {} should be deleted",
+            src
+        );
     }
     for dst in ["moved/mv1.txt", "moved/mv2.txt"] {
         let head = http

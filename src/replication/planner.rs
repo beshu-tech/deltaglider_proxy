@@ -140,12 +140,10 @@ fn build_globset(patterns: &[String]) -> Result<GlobSet, PlanError> {
             }
         }
     }
-    builder
-        .build()
-        .map_err(|e| PlanError::InvalidGlob {
-            pattern: "<set>".to_string(),
-            reason: e.to_string(),
-        })
+    builder.build().map_err(|e| PlanError::InvalidGlob {
+        pattern: "<set>".to_string(),
+        reason: e.to_string(),
+    })
 }
 
 /// Pure predicate: should we copy `source_key` from `src_meta` to
@@ -260,9 +258,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config_sections::{
-        ConflictPolicy, ReplicationEndpoint, ReplicationRule,
-    };
+    use crate::config_sections::{ConflictPolicy, ReplicationEndpoint, ReplicationRule};
     use chrono::{TimeZone, Utc};
 
     fn make_meta(name: &str, size: u64, ts: chrono::DateTime<Utc>) -> FileMetadata {

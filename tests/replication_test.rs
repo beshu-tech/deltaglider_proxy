@@ -803,7 +803,12 @@ async fn test_replication_delete_pass_skips_sibling_rule_keys() {
     }
 
     // Sanity: all four keys present on dst.
-    for key in ["a-only-1.bin", "a-only-2.bin", "b-only-1.bin", "b-only-2.bin"] {
+    for key in [
+        "a-only-1.bin",
+        "a-only-2.bin",
+        "b-only-1.bin",
+        "b-only-2.bin",
+    ] {
         s3.head_object()
             .bucket("shared-dst")
             .key(key)

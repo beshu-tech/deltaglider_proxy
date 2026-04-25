@@ -1480,27 +1480,11 @@ async fn test_get_object_acl_returns_full_control() {
     );
 }
 
-#[tokio::test]
-async fn test_put_object_acl_accepted() {
-    let (server, http) = test_setup().await;
-    let url = format!("{}/{}/acl-put-test.txt", server.endpoint(), server.bucket());
-    http.put(&url).body("hello").send().await.unwrap();
-
-    let acl_url = format!("{}?acl", url);
-    let resp = http
-        .put(&acl_url)
-        .header("content-type", "application/xml")
-        .body("<AccessControlPolicy/>")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        200,
-        "PUT object ACL should return 200, got {}",
-        resp.status()
-    );
-}
+// test_put_object_acl_accepted — REMOVED. Asserted the pre-Wave-4-M4
+// permissive 200-with-XML-discarded behaviour. The honest 501 path is
+// covered by `test_put_object_acl_returns_501` +
+// `test_put_object_acl_on_missing_object_404_wins` in
+// tests/s3_correctness_test.rs.
 
 #[tokio::test]
 async fn test_get_bucket_acl_returns_full_control() {
@@ -1522,24 +1506,11 @@ async fn test_get_bucket_acl_returns_full_control() {
     );
 }
 
-#[tokio::test]
-async fn test_put_bucket_acl_accepted() {
-    let (server, http) = test_setup().await;
-    let url = format!("{}/{}?acl", server.endpoint(), server.bucket());
-    let resp = http
-        .put(&url)
-        .header("content-type", "application/xml")
-        .body("<AccessControlPolicy/>")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        200,
-        "PUT bucket ACL should return 200, got {}",
-        resp.status()
-    );
-}
+// test_put_bucket_acl_accepted — REMOVED. Same Wave-4 M4 staleness as
+// the object-ACL counterpart above; honest behaviour is verified in
+// `test_put_bucket_acl_returns_501_not_fake_200` +
+// `test_put_bucket_acl_on_missing_bucket_404_wins`
+// (tests/s3_correctness_test.rs).
 
 // ============================================================================
 // 2.2 Response override query parameters
@@ -2300,150 +2271,22 @@ async fn test_upload_part_copy_with_range() {
 }
 
 // ============================================================================
-// Tagging Stubs
+// Tagging / versioning stubs
+//
+// The five "*_accepted" / "*_empty" / "test_delete_object_tagging" tests
+// that previously lived here asserted the pre-Wave-4-M4 permissive
+// behaviour (200 with the XML silently discarded, 204 on DELETE).
+// Wave-4 M4 (commit e8fccf8) flipped these endpoints to honest 501 +
+// 404-wins precedence; the corresponding regression coverage is in
+// tests/s3_correctness_test.rs:
+//   - test_object_tagging_get_returns_501
+//   - test_object_tagging_put_returns_501
+//   - test_bucket_tagging_returns_501
+//   - test_delete_tagging_on_existing_object_returns_501
+//   - test_put_bucket_versioning_returns_501
+//   - test_get_bucket_versioning_on_missing_bucket_returns_404
+// plus the 404-wins-over-501 trio for missing-bucket / missing-object.
 // ============================================================================
-
-#[tokio::test]
-async fn test_get_object_tagging_empty() {
-    let (server, http) = test_setup().await;
-    let endpoint = server.endpoint();
-    let bucket = server.bucket();
-
-    put_object(
-        &http,
-        &endpoint,
-        bucket,
-        "tagged.txt",
-        b"data".to_vec(),
-        "text/plain",
-    )
-    .await;
-
-    let resp = http
-        .get(format!("{}/{}/tagged.txt?tagging", endpoint, bucket))
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        resp.status().is_success(),
-        "GET ?tagging should succeed, got {}",
-        resp.status()
-    );
-    let body = resp.text().await.unwrap();
-    assert!(
-        body.contains("<Tagging>") && body.contains("<TagSet/>"),
-        "Should return empty TagSet XML: {}",
-        body
-    );
-}
-
-#[tokio::test]
-async fn test_put_object_tagging_accepted() {
-    let (server, http) = test_setup().await;
-    let endpoint = server.endpoint();
-    let bucket = server.bucket();
-
-    put_object(
-        &http,
-        &endpoint,
-        bucket,
-        "tag-put.txt",
-        b"data".to_vec(),
-        "text/plain",
-    )
-    .await;
-
-    let tagging_xml =
-        r#"<Tagging><TagSet><Tag><Key>env</Key><Value>test</Value></Tag></TagSet></Tagging>"#;
-    let resp = http
-        .put(format!("{}/{}/tag-put.txt?tagging", endpoint, bucket))
-        .header("content-type", "application/xml")
-        .body(tagging_xml)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status().as_u16(),
-        200,
-        "PUT ?tagging should return 200, got {}",
-        resp.status()
-    );
-}
-
-#[tokio::test]
-async fn test_delete_object_tagging() {
-    let (server, http) = test_setup().await;
-    let endpoint = server.endpoint();
-    let bucket = server.bucket();
-
-    put_object(
-        &http,
-        &endpoint,
-        bucket,
-        "tag-del.txt",
-        b"data".to_vec(),
-        "text/plain",
-    )
-    .await;
-
-    let resp = http
-        .delete(format!("{}/{}/tag-del.txt?tagging", endpoint, bucket))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status().as_u16(),
-        204,
-        "DELETE ?tagging should return 204, got {}",
-        resp.status()
-    );
-}
-
-#[tokio::test]
-async fn test_get_bucket_tagging_empty() {
-    let (server, http) = test_setup().await;
-    let endpoint = server.endpoint();
-    let bucket = server.bucket();
-
-    let resp = http
-        .get(format!("{}/{}?tagging", endpoint, bucket))
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        resp.status().is_success(),
-        "GET bucket ?tagging should succeed, got {}",
-        resp.status()
-    );
-    let body = resp.text().await.unwrap();
-    assert!(
-        body.contains("<Tagging>") && body.contains("<TagSet/>"),
-        "Should return empty TagSet XML: {}",
-        body
-    );
-}
-
-#[tokio::test]
-async fn test_put_bucket_versioning_accepted() {
-    let (server, http) = test_setup().await;
-    let endpoint = server.endpoint();
-    let bucket = server.bucket();
-
-    let versioning_xml = r#"<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>"#;
-    let resp = http
-        .put(format!("{}/{}?versioning", endpoint, bucket))
-        .header("content-type", "application/xml")
-        .body(versioning_xml)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status().as_u16(),
-        200,
-        "PUT ?versioning should return 200, got {}",
-        resp.status()
-    );
-}
 
 // ============================================================================
 // Usage Scanner API

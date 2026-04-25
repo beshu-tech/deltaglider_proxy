@@ -1663,7 +1663,9 @@ impl Config {
         // Replication rules — static validation + cycle detection.
         // Catches operator errors at config load time so the worker
         // never has to deal with malformed rules at runtime.
-        warnings.extend(crate::config_sections::validate_replication(&self.replication));
+        warnings.extend(crate::config_sections::validate_replication(
+            &self.replication,
+        ));
 
         warnings
     }

@@ -59,7 +59,11 @@ impl ScopeHarness {
         }
     }
 
-    async fn create_user(&self, name: &str, permissions: Vec<serde_json::Value>) -> (String, String) {
+    async fn create_user(
+        &self,
+        name: &str,
+        permissions: Vec<serde_json::Value>,
+    ) -> (String, String) {
         let admin_client = admin_http_client(&self.server.endpoint()).await;
         let body: serde_json::Value = admin_client
             .post(format!("{}/_/api/admin/users", self.server.endpoint()))

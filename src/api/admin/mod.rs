@@ -49,13 +49,13 @@ pub use groups::{
     AddGroupMemberRequest, CreateGroupRequest, UpdateGroupRequest,
 };
 pub use objects::{
-    bulk_delete as bulk_delete_objects, copy_objects, download_zip,
-    list_all as list_all_objects, move_objects,
+    bulk_delete as bulk_delete_objects, copy_objects, download_zip, list_all as list_all_objects,
+    move_objects,
 };
 pub use replication::{
     failures as replication_failures, history as replication_history,
-    list_rules as replication_list_rules, pause as replication_pause,
-    resume as replication_resume, run_now as replication_run_now,
+    list_rules as replication_list_rules, pause as replication_pause, resume as replication_resume,
+    run_now as replication_run_now,
 };
 pub use scanner::{get_usage, migrate_legacy, scan_usage, ScanUsageRequest, UsageQuery};
 pub use users::{

@@ -309,8 +309,8 @@ mod tests {
     fn known_zero_byte_managed_object_sets_content_length_zero() {
         let meta = FileMetadata::new_passthrough(
             "empty.bin".to_string(),
-            "0".repeat(64),                              // known sha256
-            "d41d8cd98f00b204e9800998ecf8427e".into(),   // canonical empty-MD5
+            "0".repeat(64),                            // known sha256
+            "d41d8cd98f00b204e9800998ecf8427e".into(), // canonical empty-MD5
             0,
             None,
         );

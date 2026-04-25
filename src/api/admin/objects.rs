@@ -140,7 +140,9 @@ fn detect_collisions(items: &[CopyItem], dest_prefix: &str) -> Vec<String> {
     use std::collections::HashMap;
     let mut counts: HashMap<String, usize> = HashMap::new();
     for it in items {
-        *counts.entry(dest_key(dest_prefix, &it.relative)).or_insert(0) += 1;
+        *counts
+            .entry(dest_key(dest_prefix, &it.relative))
+            .or_insert(0) += 1;
     }
     counts
         .into_iter()
@@ -191,17 +193,21 @@ pub async fn copy_objects(
     Ok(Json(res))
 }
 
-async fn run_copy_loop(
-    s3: &Arc<AppState>,
-    req: &CopyRequest,
-) -> CopyResponse {
+async fn run_copy_loop(s3: &Arc<AppState>, req: &CopyRequest) -> CopyResponse {
     let engine = s3.engine.load();
     let mut succeeded = 0usize;
     let mut failed = 0usize;
     let mut failures: Vec<CopyFailure> = Vec::new();
     for it in &req.items {
         let dk = dest_key(&req.dest_prefix, &it.relative);
-        let result = copy_one(&engine, &req.source_bucket, &it.source_key, &req.dest_bucket, &dk).await;
+        let result = copy_one(
+            &engine,
+            &req.source_bucket,
+            &it.source_key,
+            &req.dest_bucket,
+            &dk,
+        )
+        .await;
         match result {
             Ok(()) => succeeded += 1,
             Err(e) => {
@@ -303,10 +309,14 @@ pub async fn move_objects(
         source_bucket: req.source_bucket.clone(),
         dest_bucket: req.dest_bucket.clone(),
         dest_prefix: req.dest_prefix.clone(),
-        items: req.items.iter().map(|i| CopyItem {
-            source_key: i.source_key.clone(),
-            relative: i.relative.clone(),
-        }).collect(),
+        items: req
+            .items
+            .iter()
+            .map(|i| CopyItem {
+                source_key: i.source_key.clone(),
+                relative: i.relative.clone(),
+            })
+            .collect(),
     };
     let copy_result = run_copy_loop(&s3, &copy_req).await;
 
@@ -334,8 +344,12 @@ pub async fn move_objects(
 
     info!(
         "bulk move: src={} dst={}/{} succeeded={} failed={} deleted={}",
-        req.source_bucket, req.dest_bucket, req.dest_prefix,
-        copy_result.succeeded, copy_result.failed, deleted
+        req.source_bucket,
+        req.dest_bucket,
+        req.dest_prefix,
+        copy_result.succeeded,
+        copy_result.failed,
+        deleted
     );
     Ok(Json(MoveResponse {
         succeeded: copy_result.succeeded,
@@ -423,7 +437,8 @@ pub async fn download_zip(
         .filter_map(|item| {
             // Each entry is `bucket/key`, split on the FIRST '/' so
             // keys with embedded slashes round-trip correctly.
-            item.split_once('/').map(|(b, k)| (b.to_string(), k.to_string()))
+            item.split_once('/')
+                .map(|(b, k)| (b.to_string(), k.to_string()))
         })
         .collect();
     if parsed.is_empty() {
@@ -463,10 +478,7 @@ pub async fn download_zip(
                 if bytes_total > MAX_ZIP_BYTES {
                     return Err((
                         StatusCode::PAYLOAD_TOO_LARGE,
-                        format!(
-                            "ZIP would exceed {} bytes; pick fewer files",
-                            MAX_ZIP_BYTES
-                        ),
+                        format!("ZIP would exceed {} bytes; pick fewer files", MAX_ZIP_BYTES),
                     ));
                 }
                 entries.push((zip_name, data));
@@ -488,8 +500,7 @@ pub async fn download_zip(
         use zip::write::SimpleFileOptions;
         use zip::ZipWriter;
         let mut zw = ZipWriter::new(&mut buf);
-        let opts = SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
         for (name, data) in &entries {
             if let Err(e) = std::io::Write::write_all(
                 &mut {
@@ -572,7 +583,14 @@ pub async fn list_all(
     let cap = 1000u32;
     loop {
         let page = engine
-            .list_objects(&q.bucket, &q.prefix, None, cap, continuation.as_deref(), false)
+            .list_objects(
+                &q.bucket,
+                &q.prefix,
+                None,
+                cap,
+                continuation.as_deref(),
+                false,
+            )
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)))?;
         for (k, _) in &page.objects {

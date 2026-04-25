@@ -28,7 +28,12 @@ async fn test_put_object_to_nonexistent_bucket_returns_nosuchbucket() {
     let ghost = "ghost-bucket-does-not-exist";
     let url = format!("{}/{}/anyfile.txt", server.endpoint(), ghost);
 
-    let resp = client.put(&url).body(b"hello".to_vec()).send().await.unwrap();
+    let resp = client
+        .put(&url)
+        .body(b"hello".to_vec())
+        .send()
+        .await
+        .unwrap();
 
     assert_eq!(
         resp.status().as_u16(),
@@ -106,11 +111,7 @@ async fn test_copy_to_nonexistent_destination_bucket_returns_nosuchbucket() {
     let client = reqwest::Client::new();
 
     // First PUT a source object into the real bucket.
-    let src_url = format!(
-        "{}/{}/source.bin",
-        server.endpoint(),
-        server.bucket()
-    );
+    let src_url = format!("{}/{}/source.bin", server.endpoint(), server.bucket());
     client
         .put(&src_url)
         .body(b"source payload".to_vec())
@@ -121,10 +122,7 @@ async fn test_copy_to_nonexistent_destination_bucket_returns_nosuchbucket() {
         .expect("seed source object");
 
     // Copy to a ghost destination.
-    let ghost_dest_url = format!(
-        "{}/ghost-dest-bucket/copied.bin",
-        server.endpoint()
-    );
+    let ghost_dest_url = format!("{}/ghost-dest-bucket/copied.bin", server.endpoint());
     let resp = client
         .put(&ghost_dest_url)
         .header(
@@ -161,11 +159,7 @@ async fn test_copy_from_nonexistent_source_bucket_returns_nosuchbucket() {
     let client = reqwest::Client::new();
 
     // PUT into the real bucket — destination is fine.
-    let dst_url = format!(
-        "{}/{}/dst.bin",
-        server.endpoint(),
-        server.bucket()
-    );
+    let dst_url = format!("{}/{}/dst.bin", server.endpoint(), server.bucket());
     let resp = client
         .put(&dst_url)
         .header(
@@ -226,12 +220,7 @@ async fn test_complete_multipart_after_bucket_deletion_returns_nosuchbucket() {
 
     use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
     let completed = CompletedMultipartUpload::builder()
-        .parts(
-            CompletedPart::builder()
-                .part_number(1)
-                .e_tag(&etag)
-                .build(),
-        )
+        .parts(CompletedPart::builder().part_number(1).e_tag(&etag).build())
         .build();
 
     let res = s3

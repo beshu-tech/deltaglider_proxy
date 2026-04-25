@@ -86,14 +86,8 @@ pub async fn list_rules(
                 .unwrap_or_else(|| "idle".to_string()),
             last_run_at: st.as_ref().and_then(|s| s.last_run_at),
             next_due_at: st.as_ref().map(|s| s.next_due_at).unwrap_or(0),
-            objects_copied_lifetime: st
-                .as_ref()
-                .map(|s| s.objects_copied_lifetime)
-                .unwrap_or(0),
-            bytes_copied_lifetime: st
-                .as_ref()
-                .map(|s| s.bytes_copied_lifetime)
-                .unwrap_or(0),
+            objects_copied_lifetime: st.as_ref().map(|s| s.objects_copied_lifetime).unwrap_or(0),
+            bytes_copied_lifetime: st.as_ref().map(|s| s.bytes_copied_lifetime).unwrap_or(0),
         });
     }
 

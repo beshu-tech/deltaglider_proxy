@@ -365,9 +365,13 @@ async fn list_multipart_uploads(
     max_uploads: u32,
 ) -> Result<Response, S3Error> {
     let capped = max_uploads.clamp(1, 1000);
-    let (uploads, is_truncated, next_key, next_upload_id) = state
-        .multipart
-        .list_uploads_paginated(Some(bucket), prefix, key_marker, upload_id_marker, capped);
+    let (uploads, is_truncated, next_key, next_upload_id) = state.multipart.list_uploads_paginated(
+        Some(bucket),
+        prefix,
+        key_marker,
+        upload_id_marker,
+        capped,
+    );
     let result = ListMultipartUploadsResult {
         bucket: bucket.to_string(),
         uploads,

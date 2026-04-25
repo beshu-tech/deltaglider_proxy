@@ -164,13 +164,9 @@ pub async fn get_object(
         let marker = query.part_number_marker.unwrap_or(0);
         // S3 default + cap: 1000 parts per page.
         let max_parts = query.max_parts.unwrap_or(1000).clamp(1, 1000);
-        let (parts, is_truncated, next_marker) = state.multipart.list_parts_paginated(
-            upload_id,
-            &bucket,
-            &key,
-            marker,
-            max_parts,
-        )?;
+        let (parts, is_truncated, next_marker) = state
+            .multipart
+            .list_parts_paginated(upload_id, &bucket, &key, marker, max_parts)?;
         let result = ListPartsResult {
             bucket: bucket.clone(),
             key: key.clone(),
@@ -397,7 +393,14 @@ pub async fn delete_object(
 
         loop {
             let page = engine
-                .list_objects(&bucket, &key, None, DELETE_PAGE_SIZE, next_token.as_deref(), false)
+                .list_objects(
+                    &bucket,
+                    &key,
+                    None,
+                    DELETE_PAGE_SIZE,
+                    next_token.as_deref(),
+                    false,
+                )
                 .await?;
 
             for (obj_key, _meta) in &page.objects {

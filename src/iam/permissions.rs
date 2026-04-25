@@ -420,11 +420,7 @@ pub(crate) fn has_unrestricted_allow_for_bucket_prefix(
 ///   keys; `AuthenticatedUser::can` re-evaluates the full policy graph
 ///   each call, and inlining here lets LLVM consolidate the two checks.
 /// - It's unit-testable as a pure function without an HTTP stack.
-pub fn user_can_see_listed_key(
-    user: &super::AuthenticatedUser,
-    bucket: &str,
-    key: &str,
-) -> bool {
+pub fn user_can_see_listed_key(user: &super::AuthenticatedUser, bucket: &str, key: &str) -> bool {
     user.can(S3Action::Read, bucket, key) || user.can(S3Action::List, bucket, key)
 }
 
@@ -907,8 +903,12 @@ mod tests {
             resources: vec!["*".into()],
             conditions: None,
         }];
-        assert!(has_unrestricted_allow_for_bucket_prefix(&perms, "anything", ""));
-        assert!(has_unrestricted_allow_for_bucket_prefix(&perms, "anything", "pfx"));
+        assert!(has_unrestricted_allow_for_bucket_prefix(
+            &perms, "anything", ""
+        ));
+        assert!(has_unrestricted_allow_for_bucket_prefix(
+            &perms, "anything", "pfx"
+        ));
     }
 
     #[test]
@@ -921,8 +921,12 @@ mod tests {
             conditions: None,
         }];
         assert!(has_unrestricted_allow_for_bucket_prefix(&perms, "prod", ""));
-        assert!(has_unrestricted_allow_for_bucket_prefix(&perms, "prod", "alice/"));
-        assert!(!has_unrestricted_allow_for_bucket_prefix(&perms, "other", ""));
+        assert!(has_unrestricted_allow_for_bucket_prefix(
+            &perms, "prod", "alice/"
+        ));
+        assert!(!has_unrestricted_allow_for_bucket_prefix(
+            &perms, "other", ""
+        ));
     }
 
     #[test]
@@ -936,7 +940,9 @@ mod tests {
             resources: vec!["prod/alice/*".into()],
             conditions: None,
         }];
-        assert!(!has_unrestricted_allow_for_bucket_prefix(&perms, "prod", ""));
+        assert!(!has_unrestricted_allow_for_bucket_prefix(
+            &perms, "prod", ""
+        ));
     }
 
     #[test]
@@ -951,9 +957,7 @@ mod tests {
             conditions: None,
         }];
         assert!(has_unrestricted_allow_for_bucket_prefix(
-            &perms,
-            "prod",
-            "alice/"
+            &perms, "prod", "alice/"
         ));
         assert!(has_unrestricted_allow_for_bucket_prefix(
             &perms,
@@ -974,9 +978,7 @@ mod tests {
             conditions: None,
         }];
         assert!(!has_unrestricted_allow_for_bucket_prefix(
-            &perms,
-            "prod",
-            "bob/"
+            &perms, "prod", "bob/"
         ));
     }
 
@@ -995,7 +997,11 @@ mod tests {
 
     // === user_can_see_listed_key integration with AuthenticatedUser ===
 
-    fn make_user(name: &str, resources: Vec<&str>, actions: Vec<&str>) -> super::super::AuthenticatedUser {
+    fn make_user(
+        name: &str,
+        resources: Vec<&str>,
+        actions: Vec<&str>,
+    ) -> super::super::AuthenticatedUser {
         let permissions = vec![Permission {
             id: 0,
             effect: "Allow".into(),
