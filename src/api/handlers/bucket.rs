@@ -8,7 +8,7 @@ use crate::api::xml::{
 };
 use crate::iam::{user_can_see_listed_key, AuthenticatedUser, ListScope};
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -91,6 +91,7 @@ pub async fn bucket_get_handler(
     State(state): State<Arc<AppState>>,
     ValidatedBucket(bucket): ValidatedBucket,
     Query(query): Query<BucketGetQuery>,
+    uri: Uri,
     auth_user: Option<axum::Extension<AuthenticatedUser>>,
     list_scope: Option<axum::Extension<ListScope>>,
 ) -> Result<Response, S3Error> {
@@ -157,6 +158,7 @@ pub async fn bucket_get_handler(
     }
 
     // Default: ListObjects (v1 or v2)
+    reject_duplicate_list_query_params(uri.query())?;
     let is_v2 = query.list_type == Some(2);
     let prefix = query.prefix.unwrap_or_default();
     let delimiter = query.delimiter.clone();
@@ -313,6 +315,59 @@ pub async fn bucket_get_handler(
         );
     }
     Ok(resp)
+}
+
+/// Reject duplicate query keys whose values affect authorization, listing
+/// scope, or pagination. Without this, IAM middleware can evaluate the first
+/// `prefix=` while serde extraction uses another value for the actual list.
+fn reject_duplicate_list_query_params(query: Option<&str>) -> Result<(), S3Error> {
+    let Some(query) = query else {
+        return Ok(());
+    };
+    let sensitive = [
+        "prefix",
+        "delimiter",
+        "max-keys",
+        "continuation-token",
+        "start-after",
+        "marker",
+        "encoding-type",
+        "fetch-owner",
+    ];
+    let mut seen = std::collections::HashSet::new();
+    for pair in query.split('&').filter(|s| !s.is_empty()) {
+        let raw_key = pair.split_once('=').map(|(k, _)| k).unwrap_or(pair);
+        let key = crate::api::auth::percent_decode(raw_key);
+        if sensitive.iter().any(|s| s.eq_ignore_ascii_case(&key)) && !seen.insert(key.clone()) {
+            return Err(S3Error::InvalidArgument(format!(
+                "duplicate query parameter '{}' is not allowed",
+                key
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod query_validation_tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_prefix_query_is_rejected() {
+        assert!(reject_duplicate_list_query_params(Some("list-type=2&prefix=a")).is_ok());
+        assert!(matches!(
+            reject_duplicate_list_query_params(Some("list-type=2&prefix=a&prefix=b")),
+            Err(S3Error::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn duplicate_percent_encoded_sensitive_key_is_rejected() {
+        assert!(matches!(
+            reject_duplicate_list_query_params(Some("prefix=a&pre%66ix=b")),
+            Err(S3Error::InvalidArgument(_))
+        ));
+    }
 }
 
 /// Canned ACL response (full control for owner "dgp").

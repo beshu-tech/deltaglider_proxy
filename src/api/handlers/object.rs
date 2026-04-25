@@ -500,6 +500,7 @@ pub async fn delete_objects(
         warn!("Failed to parse DeleteObjects XML: {}", e);
         S3Error::MalformedXML
     })?;
+    validate_delete_objects_count(delete_req.objects.len())?;
 
     info!(
         "DELETE multiple objects in {} ({} objects)",
@@ -572,4 +573,27 @@ pub async fn delete_objects(
     let xml = result.to_xml(quiet);
 
     Ok(xml_response(xml))
+}
+
+fn validate_delete_objects_count(count: usize) -> Result<(), S3Error> {
+    if count > 1000 {
+        return Err(S3Error::InvalidArgument(
+            "DeleteObjects supports at most 1000 keys per request".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delete_objects_rejects_more_than_1000_keys() {
+        assert!(validate_delete_objects_count(1000).is_ok());
+        assert!(matches!(
+            validate_delete_objects_count(1001),
+            Err(S3Error::InvalidArgument(_))
+        ));
+    }
 }

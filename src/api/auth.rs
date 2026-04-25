@@ -69,6 +69,15 @@ impl SignedPayloadHash {
                 b.is_ascii_digit() || (b'a'..=b'f').contains(&b) || (b'A'..=b'F').contains(&b)
             })
     }
+
+    /// Signed AWS streaming modes require per-chunk signature validation.
+    /// The proxy can decode AWS chunked framing but does not verify the
+    /// chunk-signature chain, so accepting these modes would advertise
+    /// integrity we do not enforce.
+    pub fn requires_chunk_signature_verification(&self) -> bool {
+        let v = self.0.as_str();
+        v.starts_with("STREAMING-AWS4-HMAC-") || v.starts_with("STREAMING-AWS4-ECDSA-")
+    }
 }
 
 /// Build an anonymous `AuthenticatedUser` with read+list permissions scoped
@@ -1056,6 +1065,21 @@ mod tests {
     fn test_parse_auth_header_invalid() {
         assert!(parse_auth_header("Basic dXNlcjpwYXNz").is_none());
         assert!(parse_auth_header("").is_none());
+    }
+
+    #[test]
+    fn signed_payload_hash_classification() {
+        let hex = SignedPayloadHash("a".repeat(64));
+        assert!(hex.is_verifiable_hex());
+        assert!(!hex.requires_chunk_signature_verification());
+
+        let unsigned = SignedPayloadHash("UNSIGNED-PAYLOAD".into());
+        assert!(!unsigned.is_verifiable_hex());
+        assert!(!unsigned.requires_chunk_signature_verification());
+
+        let signed_stream = SignedPayloadHash("STREAMING-AWS4-HMAC-SHA256-PAYLOAD".into());
+        assert!(!signed_stream.is_verifiable_hex());
+        assert!(signed_stream.requires_chunk_signature_verification());
     }
 
     #[test]

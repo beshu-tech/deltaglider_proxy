@@ -189,12 +189,17 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     > {
         let (obj_key, deltaspace_id) = Self::validated_key(bucket, key)?;
 
-        // Check metadata cache first
-        let metadata = if let Some(cached) = self.metadata_cache.get(bucket, key) {
-            Some(cached)
+        // Check metadata cache first. Track cache provenance so a stale
+        // strategy (e.g. passthrough cached before a concurrent rewrite to
+        // delta) can be invalidated and retried like `retrieve_stream()`.
+        let (metadata, from_cache) = if let Some(cached) = self.metadata_cache.get(bucket, key) {
+            (Some(cached), true)
         } else {
-            self.resolve_metadata_with_migration(bucket, &deltaspace_id, &obj_key)
-                .await?
+            (
+                self.resolve_metadata_with_migration(bucket, &deltaspace_id, &obj_key)
+                    .await?,
+                false,
+            )
         };
 
         let metadata = match metadata {
@@ -212,10 +217,50 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         match &metadata.storage_info {
             StorageInfo::Passthrough => {
                 let stored_name = &metadata.original_name;
-                let (stream, content_length) = self
+                let range_result = self
                     .storage
                     .get_passthrough_stream_range(bucket, &deltaspace_id, stored_name, start, end)
-                    .await?;
+                    .await;
+                let (stream, content_length) = match range_result {
+                    Ok(v) => v,
+                    Err(StorageError::NotFound(_)) if from_cache => {
+                        warn!(
+                            "Stale range metadata cache for {}/{}, retrying with fresh metadata",
+                            bucket, key
+                        );
+                        self.metadata_cache.invalidate(bucket, key);
+                        let fresh = self
+                            .resolve_metadata_with_migration(bucket, &deltaspace_id, &obj_key)
+                            .await?;
+                        let Some(fresh_meta) = fresh else {
+                            return Ok(None);
+                        };
+                        self.metadata_cache.insert(bucket, key, fresh_meta.clone());
+                        match &fresh_meta.storage_info {
+                            StorageInfo::Passthrough => {
+                                let (stream, content_length) = self
+                                    .storage
+                                    .get_passthrough_stream_range(
+                                        bucket,
+                                        &deltaspace_id,
+                                        &fresh_meta.original_name,
+                                        start,
+                                        end,
+                                    )
+                                    .await?;
+                                return if content_length == 0 {
+                                    Ok(None)
+                                } else {
+                                    Ok(Some((stream, content_length, fresh_meta)))
+                                };
+                            }
+                            StorageInfo::Reference { .. } | StorageInfo::Delta { .. } => {
+                                return Ok(None);
+                            }
+                        }
+                    }
+                    Err(e) => return Err(e.into()),
+                };
 
                 if content_length == 0 {
                     // Backend returned full stream (default impl), signal caller

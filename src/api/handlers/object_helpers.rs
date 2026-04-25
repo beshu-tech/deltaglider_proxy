@@ -55,6 +55,11 @@ pub(super) fn parse_copy_source(headers: &HeaderMap) -> Result<(String, String),
     let decoded = urlencoding::decode(raw)
         .map_err(|_| S3Error::InvalidArgument("Invalid copy source encoding".to_string()))?;
     let trimmed = decoded.trim_start_matches('/');
+    if trimmed.contains('?') {
+        return Err(S3Error::InvalidArgument(
+            "Copy source versionId/query parameters are not supported".to_string(),
+        ));
+    }
 
     let (bucket, key) = trimmed
         .split_once('/')
@@ -189,6 +194,11 @@ pub(super) async fn put_object_inner(
     // explicitly opted out) and STREAMING-* variants (per-chunk
     // signature scheme; see aws_chunked.rs for chunk-chain handling).
     if let Some(claimed) = signed_payload_hash {
+        if claimed.requires_chunk_signature_verification() {
+            return Err(S3Error::NotImplemented(
+                "Signed AWS streaming payloads are not supported; use UNSIGNED-PAYLOAD or non-streaming SHA-256 payloads".to_string(),
+            ));
+        }
         if claimed.is_verifiable_hex() {
             use sha2::{Digest, Sha256};
             let actual = hex::encode(Sha256::digest(body.as_ref()));
@@ -468,6 +478,11 @@ pub(super) async fn upload_part(
     // H1 SigV4 fix: same body-hash verification as put_object_inner —
     // each part's bytes must match the SHA-256 the client signed.
     if let Some(claimed) = signed_payload_hash {
+        if claimed.requires_chunk_signature_verification() {
+            return Err(S3Error::NotImplemented(
+                "Signed AWS streaming payloads are not supported; use UNSIGNED-PAYLOAD or non-streaming SHA-256 payloads".to_string(),
+            ));
+        }
         if claimed.is_verifiable_hex() {
             use sha2::{Digest, Sha256};
             let actual = hex::encode(Sha256::digest(body.as_ref()));
@@ -797,6 +812,33 @@ fn has_any_put_conditional(headers: &HeaderMap) -> bool {
         || headers.contains_key("if-none-match")
         || headers.contains_key("if-modified-since")
         || headers.contains_key("if-unmodified-since")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers_with_copy_source(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-copy-source", value.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn copy_source_rejects_version_id_query() {
+        let headers = headers_with_copy_source("bucket/key.txt%3FversionId%3Dabc");
+        assert!(matches!(
+            parse_copy_source(&headers),
+            Err(S3Error::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn copy_source_preserves_key_slashes() {
+        let headers = headers_with_copy_source("bucket/a//b.txt");
+        let (_, key) = parse_copy_source(&headers).unwrap();
+        assert_eq!(key, "a//b.txt");
+    }
 }
 
 /// Check conditional request headers against object metadata.

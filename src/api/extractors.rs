@@ -107,8 +107,10 @@ where
 
 /// Validated bucket and key extractor
 ///
-/// Validates the bucket name and normalizes the key by removing leading
-/// slashes. Any bucket name is accepted (multi-bucket support).
+/// Validates the bucket name and key. S3 object keys are identity-bearing:
+/// `a//b` and `a/b` are distinct keys and SigV4 signs the exact request
+/// path, so this extractor must not collapse or otherwise normalize path
+/// separators.
 ///
 /// # Example
 /// ```text
@@ -116,7 +118,7 @@ where
 ///     State(state): State<Arc<AppState>>,
 ///     ValidatedPath { bucket, key }: ValidatedPath,
 /// ) -> Result<Response, S3Error> {
-///     // bucket is validated, key is normalized (no leading slashes)
+///     // bucket is validated, key is preserved
 /// }
 /// ```
 #[derive(Debug, Clone)]
@@ -140,25 +142,10 @@ where
 
         validate_bucket(&bucket)?;
 
-        // Normalize key: remove leading slashes and collapse consecutive slashes.
-        // Double slashes create ghost "/" folders in LIST responses and are never
-        // intentional in S3 key paths (caused by buggy path concatenation).
+        // Preserve key identity. The router has already split `/bucket/*key`;
+        // the captured `key` should not have a leading slash, but trim only
+        // that routing artifact defensively. Do NOT collapse `//`.
         let key = key.trim_start_matches('/').to_string();
-        let key = if key.contains("//") {
-            let normalized = key
-                .split('/')
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<_>>()
-                .join("/");
-            tracing::debug!(
-                "Normalized double-slash in key: '{}' → '{}'",
-                key,
-                normalized
-            );
-            normalized
-        } else {
-            key
-        };
 
         // Reject keys containing path traversal segments
         if key.split('/').any(|seg| seg == ".." || seg == ".") {
@@ -168,5 +155,18 @@ where
         }
 
         Ok(ValidatedPath { bucket, key })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn key_validation_preserves_double_slashes() {
+        let key = "a//b";
+        assert!(
+            !key.split('/').any(|seg| seg == ".." || seg == "."),
+            "double-slash creates an empty segment, not traversal"
+        );
+        assert_eq!(key.trim_start_matches('/'), "a//b");
     }
 }

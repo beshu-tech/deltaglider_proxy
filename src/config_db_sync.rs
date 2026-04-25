@@ -166,6 +166,14 @@ impl ConfigDbSync {
             .await
             .map_err(|e| format!("Failed to download config DB from S3: {}", e))?;
 
+        let get_etag = get_result.e_tag().map(|s| s.to_string());
+        if get_etag != remote_etag {
+            return Err(format!(
+                "Config DB changed during download (HEAD etag={:?}, GET etag={:?}); retry later",
+                remote_etag, get_etag
+            ));
+        }
+
         let body = get_result
             .body
             .collect()
