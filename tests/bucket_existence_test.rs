@@ -150,3 +150,114 @@ async fn test_copy_to_nonexistent_destination_bucket_returns_nosuchbucket() {
         "Copy must not implicitly create destination bucket"
     );
 }
+
+/// Copy with a SOURCE bucket that doesn't exist must return
+/// NoSuchBucket (the source-bucket precheck in `copy_object_inner`).
+/// The destination bucket is the real one. Pre-fix the source-side
+/// `ensure_bucket_exists` was omitted in some COPY arms.
+#[tokio::test]
+async fn test_copy_from_nonexistent_source_bucket_returns_nosuchbucket() {
+    let server = TestServer::filesystem().await;
+    let client = reqwest::Client::new();
+
+    // PUT into the real bucket — destination is fine.
+    let dst_url = format!(
+        "{}/{}/dst.bin",
+        server.endpoint(),
+        server.bucket()
+    );
+    let resp = client
+        .put(&dst_url)
+        .header(
+            "x-amz-copy-source",
+            "/ghost-source-bucket/anything.bin".to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("<Code>NoSuchBucket</Code>"),
+        "Copy from missing source bucket should return NoSuchBucket, got: {}",
+        body
+    );
+}
+
+/// CompleteMultipartUpload when the bucket got deleted between
+/// Initiate and Complete must return NoSuchBucket. Pre-fix the
+/// engine.store path could silently re-create the filesystem dir
+/// (C2 root-cause); the handler-level `ensure_bucket_exists` should
+/// short-circuit cleanly.
+#[tokio::test]
+async fn test_complete_multipart_after_bucket_deletion_returns_nosuchbucket() {
+    let server = TestServer::filesystem().await;
+    let s3 = server.s3_client().await;
+    let bucket = server.bucket().to_string();
+
+    // Initiate on a real bucket.
+    let create = s3
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key("late.bin")
+        .send()
+        .await
+        .expect("initiate");
+    let upload_id = create.upload_id().unwrap().to_string();
+
+    // Upload one valid 5 MiB part so we can attempt complete.
+    use aws_sdk_s3::primitives::ByteStream;
+    let part = s3
+        .upload_part()
+        .bucket(&bucket)
+        .key("late.bin")
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(ByteStream::from(vec![0u8; 5 * 1024 * 1024]))
+        .send()
+        .await
+        .expect("upload part");
+    let etag = part.e_tag().unwrap().to_string();
+
+    // Race condition simulation: remove the bucket directory under
+    // the proxy's feet.
+    let data_dir = server.data_dir().expect("fs data dir");
+    let _ = std::fs::remove_dir_all(data_dir.join(&bucket));
+
+    use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+    let completed = CompletedMultipartUpload::builder()
+        .parts(
+            CompletedPart::builder()
+                .part_number(1)
+                .e_tag(&etag)
+                .build(),
+        )
+        .build();
+
+    let res = s3
+        .complete_multipart_upload()
+        .bucket(&bucket)
+        .key("late.bin")
+        .upload_id(&upload_id)
+        .multipart_upload(completed)
+        .send()
+        .await;
+
+    assert!(
+        res.is_err(),
+        "CompleteMultipartUpload on missing bucket must fail (no implicit recreate)"
+    );
+    let err_msg = format!("{:?}", res.unwrap_err());
+    assert!(
+        err_msg.contains("NoSuchBucket") || err_msg.contains("404"),
+        "C2 REGRESSION: CompleteMultipartUpload silently recreated bucket; got {}",
+        err_msg
+    );
+
+    // The bucket directory must not have been recreated as a side
+    // effect of the complete attempt.
+    assert!(
+        !data_dir.join(&bucket).exists(),
+        "C2 REGRESSION: bucket directory recreated by failed CompleteMultipartUpload"
+    );
+}

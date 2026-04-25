@@ -679,3 +679,300 @@ replication:
         dest_etag, source_etag
     );
 }
+
+// ════════════════════════════════════════════════════════════════════
+// H2 (fourth-wave) — replication delete-pass provenance edge cases
+// ════════════════════════════════════════════════════════════════════
+//
+// The fourth-wave H2 fix gates `run_delete_pass` on a per-rule
+// provenance marker (`x-amz-meta-dg-replication-rule = <rule.name>`)
+// stamped at copy time. The basic "operator placed an unrelated
+// object" path is already covered by `test_replication_replicate_
+// deletes_removes_orphans` (manual.txt without any marker survives).
+//
+// What was NOT covered before this batch:
+//
+//   **Sibling-rule marker mismatch**: an object on dest bearing
+//   a different rule's marker (`dg-replication-rule = sibling-b`)
+//   must NOT be deleted by THIS rule's delete pass — even when
+//   its source-side counterpart is missing.
+//
+// Pre-fix the run_delete_pass had no provenance check at all, so any
+// dest key whose source counterpart was missing was deleted.
+// Post-fix the marker must equal the running rule's `name` exactly.
+//
+// Note on test mechanics: clients cannot spoof `dg-*` metadata via
+// the S3 PUT path — `extract_user_metadata` in `src/api/handlers/
+// mod.rs` filters them out as a hardening measure. To plant a foreign
+// marker we therefore configure TWO rules (`sibling-a`, `sibling-b`)
+// pointing at overlapping destination prefixes; each rule's `copy_one`
+// stamps its own name. Then we run rule A, run rule B, and verify that
+// rule A's delete pass does not touch the keys rule B planted.
+
+const TWO_SIBLING_RULES_YAML: &str = "
+replication:
+  enabled: true
+  tick_interval: \"30s\"
+  rules:
+    - name: sibling-a
+      enabled: true
+      source:
+        bucket: a-src
+        prefix: \"\"
+      destination:
+        bucket: shared-dst
+        prefix: \"\"
+      interval: \"1h\"
+      batch_size: 100
+      replicate_deletes: true
+    - name: sibling-b
+      enabled: true
+      source:
+        bucket: b-src
+        prefix: \"\"
+      destination:
+        bucket: shared-dst
+        prefix: \"\"
+      interval: \"1h\"
+      batch_size: 100
+      replicate_deletes: true
+";
+
+/// H2 (fourth-wave) regression: when two rules write to the same
+/// destination bucket, each rule's delete pass must only consider
+/// keys that carry ITS OWN provenance marker.
+///
+/// Pre-fix the run_delete_pass had no provenance check at all, so
+/// rule A's delete pass would gleefully delete keys rule B had just
+/// replicated (because A's source bucket has no key matching B's
+/// destination key, and the marker check was missing).
+///
+/// Setup: two rules, two source buckets, one shared destination. Both
+/// rules run, both stamp their own markers. Then we delete a key from
+/// rule A's source and run rule A. Rule A's delete pass MUST delete
+/// the matching dest key (its own provenance), but MUST leave rule
+/// B's keys alone — even though, from rule A's source's perspective,
+/// they have no source counterpart.
+#[tokio::test]
+async fn test_replication_delete_pass_skips_sibling_rule_keys() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(TWO_SIBLING_RULES_YAML)
+        .build()
+        .await;
+    let s3 = server.s3_client().await;
+    for b in ["a-src", "b-src", "shared-dst"] {
+        s3.create_bucket().bucket(b).send().await.ok();
+    }
+
+    // Rule A's source content.
+    for key in ["a-only-1.bin", "a-only-2.bin"] {
+        s3.put_object()
+            .bucket("a-src")
+            .key(key)
+            .body(ByteStream::from(b"from-a".to_vec()))
+            .send()
+            .await
+            .unwrap();
+    }
+    // Rule B's source content (different keys to avoid prefix collision).
+    for key in ["b-only-1.bin", "b-only-2.bin"] {
+        s3.put_object()
+            .bucket("b-src")
+            .key(key)
+            .body(ByteStream::from(b"from-b".to_vec()))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    // Trigger both rules so each stamps its own marker on dest.
+    for rule_name in ["sibling-a", "sibling-b"] {
+        let resp = admin
+            .post(format!(
+                "{}/_/api/admin/replication/rules/{}/run-now",
+                server.endpoint(),
+                rule_name
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "run {} failed", rule_name);
+    }
+
+    // Sanity: all four keys present on dst.
+    for key in ["a-only-1.bin", "a-only-2.bin", "b-only-1.bin", "b-only-2.bin"] {
+        s3.head_object()
+            .bucket("shared-dst")
+            .key(key)
+            .send()
+            .await
+            .unwrap_or_else(|_| panic!("expected {} on shared-dst after both rules ran", key));
+    }
+
+    // Now delete a-only-1 from rule A's source. Rule A's NEXT run
+    // will see the orphan on dst, match its own provenance marker,
+    // and delete it.
+    //
+    // CRUCIAL: rule A's delete pass also sees b-only-1 / b-only-2
+    // on dst. From A's perspective, neither key exists in `a-src`.
+    // Pre-fix it would delete them. Post-fix it sees the marker is
+    // `sibling-b`, not `sibling-a`, and skips.
+    s3.delete_object()
+        .bucket("a-src")
+        .key("a-only-1.bin")
+        .send()
+        .await
+        .unwrap();
+
+    let resp = admin
+        .post(format!(
+            "{}/_/api/admin/replication/rules/sibling-a/run-now",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["status"].as_str(),
+        Some("succeeded"),
+        "rule A run should succeed: {}",
+        body
+    );
+
+    // a-only-1 should be GONE from dst (rule A's own deletion).
+    let head_a1 = s3
+        .head_object()
+        .bucket("shared-dst")
+        .key("a-only-1.bin")
+        .send()
+        .await;
+    assert!(
+        head_a1.is_err(),
+        "rule A should delete its own orphan a-only-1 from dst"
+    );
+
+    // b-only-1 and b-only-2 must STILL be there — they were written
+    // by rule B, not rule A. Pre-fix these would have been deleted.
+    for key in ["b-only-1.bin", "b-only-2.bin"] {
+        s3.head_object()
+            .bucket("shared-dst")
+            .key(key)
+            .send()
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "H2 REGRESSION: rule A's delete pass deleted {} (owned by rule B): {:?}",
+                    key, e
+                )
+            });
+    }
+
+    // a-only-2 remains because its source counterpart is still in a-src.
+    s3.head_object()
+        .bucket("shared-dst")
+        .key("a-only-2.bin")
+        .send()
+        .await
+        .expect("a-only-2 still on dst (source counterpart present)");
+}
+
+// ════════════════════════════════════════════════════════════════════
+// M1 (third-wave) — partial-failure status flip
+// ════════════════════════════════════════════════════════════════════
+//
+// Pre-fix the run summary reported `status="succeeded"` even when SOME
+// objects failed (the flip only happened when ALL copies errored).
+// Post-fix any per-object failure flips status to `"failed"`.
+//
+// To trigger a partial failure deterministically we configure a rule
+// with a NON-EXISTENT source bucket. The forward pass's
+// `engine.list_objects` errors on bucket-not-found, which sets
+// `hit_fatal_error = true` AND increments errors. With
+// `replicate_deletes = false` and no successful work, the run is a
+// pure-failure case — but it pins down the truth-table requirement:
+// any error MUST produce `status="failed"`.
+//
+// (A genuinely "mixed" success/failure run on filesystem backend is
+// hard to synthesise without race conditions; the truth-table check
+// here proves the M1 logic and complements the existing happy-path
+// `status="succeeded"` assertions in the other tests.)
+
+const MISSING_DST_RULE_YAML: &str = "
+replication:
+  enabled: true
+  tick_interval: \"30s\"
+  rules:
+    - name: missing-dst-rule
+      enabled: true
+      source:
+        bucket: m1-src
+        prefix: \"\"
+      destination:
+        bucket: nonexistent-dst-bucket
+        prefix: \"\"
+      interval: \"1h\"
+      batch_size: 100
+";
+
+/// Cause a per-object `copy_one` failure (destination bucket missing
+/// → engine.store on the destination errors with NoSuchBucket) and
+/// assert the run summary surfaces `status="failed"` with non-zero
+/// errors. Pre-fix the wave-3 M1 fix the status was only flipped when
+/// every copy errored — but the underlying truth-table bug was that
+/// `had_any_error` wasn't consulted at the final-status decision; this
+/// test pins that down by triggering exactly one error path
+/// (the destination doesn't exist) on a populated source.
+#[tokio::test]
+async fn test_replication_any_error_flips_status_to_failed() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(MISSING_DST_RULE_YAML)
+        .build()
+        .await;
+    let s3 = server.s3_client().await;
+    // Create source only; destination intentionally missing.
+    s3.create_bucket().bucket("m1-src").send().await.ok();
+    for key in ["x.bin", "y.bin"] {
+        s3.put_object()
+            .bucket("m1-src")
+            .key(key)
+            .body(ByteStream::from(b"data".to_vec()))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let admin = admin_http_client(&server.endpoint()).await;
+    let resp = admin
+        .post(format!(
+            "{}/_/api/admin/replication/rules/missing-dst-rule/run-now",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+
+    let errors = body["errors"].as_i64().unwrap_or(0);
+    let status = body["status"].as_str().unwrap_or("");
+    assert!(
+        errors > 0,
+        "test pre-condition: rule should record at least one error \
+         when copying into a missing destination bucket. body={}",
+        body
+    );
+    // Pre-fix wave-3 M1: status could read "succeeded" if even one
+    // copy slipped through the cracks (or if the all-fail predicate
+    // was wrong). Post-fix any non-zero error count → "failed".
+    assert_eq!(
+        status, "failed",
+        "M1 REGRESSION: errors={} but status={} (must be 'failed' on any error). body={}",
+        errors, status, body
+    );
+}

@@ -547,6 +547,23 @@ async fn test_zero_byte_managed_object_emits_content_length_zero() {
         Some("0".to_string()),
         "L1: HEAD on a known zero-byte object must return Content-Length: 0"
     );
+
+    // GET must ALSO report Content-Length: 0 (strengthened: pre-fix
+    // the size_is_known discriminator was set by md5/file_size
+    // independently — only HEAD was tested originally).
+    let resp = http.get(&url).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let cl = resp
+        .headers()
+        .get("content-length")
+        .map(|v| v.to_str().unwrap().to_string());
+    assert_eq!(
+        cl,
+        Some("0".to_string()),
+        "L1: GET on a known zero-byte object must return Content-Length: 0"
+    );
+    let body = resp.bytes().await.unwrap();
+    assert!(body.is_empty(), "GET body should be empty, got {:?}", body);
 }
 
 // ────────────────────────────────────────────────────────────────────────
