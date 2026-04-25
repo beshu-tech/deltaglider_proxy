@@ -207,6 +207,19 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             "/_/api/admin/replication/rules/:name/failures",
             get(admin::replication_failures),
         )
+        // Server-side bulk object operations. Replaces what the
+        // browser used to do via @aws-sdk/client-s3. Same session
+        // gating as the rest of the admin surface; the engine is
+        // already permission-checked because the proxy IAM layer
+        // validates each retrieve/store call.
+        .route("/_/api/admin/objects/copy", post(admin::copy_objects))
+        .route("/_/api/admin/objects/move", post(admin::move_objects))
+        .route(
+            "/_/api/admin/objects/delete",
+            post(admin::bulk_delete_objects),
+        )
+        .route("/_/api/admin/objects/zip", get(admin::download_zip))
+        .route("/_/api/admin/objects/list", get(admin::list_all_objects))
         // Merge the IAM-gated subrouter in; it already carries its own
         // `require_not_declarative` layer. Both subrouters share the
         // outer `require_session`.

@@ -7,6 +7,7 @@ mod backup;
 mod config;
 pub mod external_auth;
 mod groups;
+pub(crate) mod objects;
 pub(crate) mod replication;
 mod scanner;
 pub(crate) mod users;
@@ -46,6 +47,10 @@ pub use config::{
 pub use groups::{
     add_group_member, create_group, delete_group, list_groups, remove_group_member, update_group,
     AddGroupMemberRequest, CreateGroupRequest, UpdateGroupRequest,
+};
+pub use objects::{
+    bulk_delete as bulk_delete_objects, copy_objects, download_zip,
+    list_all as list_all_objects, move_objects,
 };
 pub use replication::{
     failures as replication_failures, history as replication_history,

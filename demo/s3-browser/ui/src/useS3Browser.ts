@@ -1,5 +1,12 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { listObjects, listAllKeys, deleteObjects, deletePrefix, uploadObject, getBucket, setBucket, headObject, hasCredentials, copyObject, getObjectBytes } from './s3client';
+import { listObjects, uploadObject, getBucket, setBucket, headObject, hasCredentials } from './s3client';
+import {
+  bulkCopyObjects,
+  bulkDeleteObjects,
+  bulkMoveObjects,
+  bulkZipDownloadUrl,
+  listAllUnderPrefix,
+} from './adminApi';
 import useSelection from './useSelection';
 import type { S3Object } from './types';
 
@@ -187,19 +194,26 @@ export default function useS3Browser() {
     if (selection.selectedKeys.size === 0) return;
     setDeleting(true);
     try {
-      const objectKeys: string[] = [];
-      const folderPrefixes: string[] = [];
+      // Server-side bulk delete: collect every absolute key, expand
+      // folder selections via the same admin /list endpoint we use
+      // for copy/move, then a single batched POST. Replaces what used
+      // to be `s3client.deleteObjects` (SDK 1000-key batches) plus a
+      // per-folder `deletePrefix` call.
+      const bucket = getBucket();
+      const allKeys = new Set<string>();
       for (const k of selection.selectedKeys) {
         if (k.startsWith('folder:')) {
-          folderPrefixes.push(k.slice('folder:'.length));
+          const pfx = k.slice('folder:'.length);
+          if (!pfx) continue;
+          const { keys } = await listAllUnderPrefix(bucket, pfx);
+          for (const nk of keys) allKeys.add(nk);
         } else {
-          objectKeys.push(k);
+          allKeys.add(k);
         }
       }
-      await Promise.all([
-        objectKeys.length > 0 ? deleteObjects(objectKeys) : Promise.resolve(),
-        ...folderPrefixes.map((pfx) => deletePrefix(pfx)),
-      ]);
+      if (allKeys.size > 0) {
+        await bulkDeleteObjects({ bucket, keys: Array.from(allKeys) });
+      }
       selection.clearSelection();
       refresh();
     } catch (e) {
@@ -213,11 +227,14 @@ export default function useS3Browser() {
   /** Resolve selected keys, expanding folders recursively. Deduplicates overlapping folders. */
   const resolveSelectedKeys = useCallback(async (): Promise<string[]> => {
     const keySet = new Set<string>();
+    const currentBucket = getBucket();
     for (const k of selection.selectedKeys) {
       if (k.startsWith('folder:')) {
         const pfx = k.slice('folder:'.length);
         if (!pfx) continue; // Reject empty prefix to avoid listing entire bucket
-        const nested = await listAllKeys(pfx);
+        // Server-side recursion (replaces the previous AWS-SDK
+        // listObjectsV2 loop the browser used to run).
+        const { keys: nested } = await listAllUnderPrefix(currentBucket, pfx);
         for (const nk of nested) keySet.add(nk);
       } else {
         keySet.add(k);
@@ -245,11 +262,12 @@ export default function useS3Browser() {
     // saw — later overlapping folder selections shouldn't shorten a prefix that
     // an earlier folder already established.
     const seen = new Map<string, string>();
+    const currentBucket = getBucket();
     for (const k of selection.selectedKeys) {
       if (k.startsWith('folder:')) {
         const pfx = k.slice('folder:'.length);
         if (!pfx) continue; // Reject empty prefix to avoid listing entire bucket
-        const nested = await listAllKeys(pfx);
+        const { keys: nested } = await listAllUnderPrefix(currentBucket, pfx);
         for (const nk of nested) {
           if (seen.has(nk)) continue;
           // Strip the selected folder prefix; if for some reason the listing
@@ -268,105 +286,58 @@ export default function useS3Browser() {
   }, [selection.selectedKeys]);
 
   const bulkCopy = useCallback(async (destBucket: string, destPrefix: string) => {
+    // Phase B: server-side orchestration. The proxy's engine handles
+    // the per-key retrieve+store loop, collision detection, and atomic
+    // bookkeeping. Pre-migration the browser ran this loop itself via
+    // @aws-sdk/client-s3, with no atomicity and ~250 KB of SDK code
+    // shipped down the wire.
     const items = await resolveSelectionWithRelativeKeys();
+    if (items.length === 0) return { succeeded: 0, failed: 0 };
     const sourceBucket = getBucket();
-
-    // Build the dest-key plan. Surface collisions BEFORE the first copy so we
-    // never silently overwrite a sibling. (The original code mapped every
-    // source to `destPrefix + basename`, flattening folders and clobbering on
-    // shared basenames across nested directories.)
-    const plan: Array<{ source: string; destKey: string }> = [];
-    const destKeyCounts = new Map<string, number>();
-    for (const { source, relative } of items) {
-      const destKey = destPrefix ? `${destPrefix}${relative}` : relative;
-      plan.push({ source, destKey });
-      destKeyCounts.set(destKey, (destKeyCounts.get(destKey) || 0) + 1);
-    }
-    const collisions = Array.from(destKeyCounts.entries()).filter(([, n]) => n > 1).map(([k]) => k);
-    if (collisions.length > 0) {
-      throw new Error(`Copy aborted: ${collisions.length} destination key(s) would overwrite each other (e.g. "${collisions[0]}"). Pick a different destination or narrow the selection.`);
-    }
-
-    let succeeded = 0, failed = 0;
-    for (const { source, destKey } of plan) {
-      try {
-        await copyObject(sourceBucket, source, destBucket, destKey);
-        succeeded++;
-      } catch { failed++; }
-    }
+    const result = await bulkCopyObjects({
+      source_bucket: sourceBucket,
+      dest_bucket: destBucket,
+      dest_prefix: destPrefix,
+      items: items.map(({ source, relative }) => ({ source_key: source, relative })),
+    });
     refresh();
-    return { succeeded, failed };
+    return { succeeded: result.succeeded, failed: result.failed };
   }, [resolveSelectionWithRelativeKeys, refresh]);
 
   const bulkMove = useCallback(async (destBucket: string, destPrefix: string) => {
+    // Server-side move with the same atomicity rule as before:
+    // sources are deleted ONLY when every copy succeeded. Difference
+    // is now the policy is enforced inside one engine call instead of
+    // a client-side loop that could be interrupted mid-flight.
     const items = await resolveSelectionWithRelativeKeys();
+    if (items.length === 0) return { succeeded: 0, failed: 0 };
     const sourceBucket = getBucket();
-
-    // Same collision-detection as bulkCopy: surface BEFORE we start so we don't
-    // half-move + half-overwrite (which previously could silently lose data).
-    const plan: Array<{ source: string; destKey: string }> = [];
-    const destKeyCounts = new Map<string, number>();
-    for (const { source, relative } of items) {
-      const destKey = destPrefix ? `${destPrefix}${relative}` : relative;
-      plan.push({ source, destKey });
-      destKeyCounts.set(destKey, (destKeyCounts.get(destKey) || 0) + 1);
-    }
-    const collisions = Array.from(destKeyCounts.entries()).filter(([, n]) => n > 1).map(([k]) => k);
-    if (collisions.length > 0) {
-      throw new Error(`Move aborted: ${collisions.length} destination key(s) would overwrite each other (e.g. "${collisions[0]}"). Pick a different destination or narrow the selection.`);
-    }
-
-    // Copy all first
-    const copied: string[] = [];
-    let failed = 0;
-    for (const { source, destKey } of plan) {
-      try {
-        await copyObject(sourceBucket, source, destBucket, destKey);
-        copied.push(source);
-      } catch { failed++; }
-    }
-    // Only delete sources if ALL copies succeeded — partial moves risk data loss.
-    // If any copy failed, keep all source files intact and report the failure.
-    if (failed === 0 && copied.length > 0) {
-      await deleteObjects(copied).catch(() => { failed = copied.length; });
-    }
+    const result = await bulkMoveObjects({
+      source_bucket: sourceBucket,
+      dest_bucket: destBucket,
+      dest_prefix: destPrefix,
+      items: items.map(({ source, relative }) => ({ source_key: source, relative })),
+    });
     selection.clearSelection();
     refresh();
-    return { succeeded: failed === 0 ? copied.length : 0, failed: failed > 0 ? plan.length : 0 };
+    return { succeeded: result.succeeded, failed: result.failed };
   }, [resolveSelectionWithRelativeKeys, selection.clearSelection, refresh]);
 
   const downloadZip = useCallback(async () => {
-    const MAX_ZIP_BYTES = 500 * 1024 * 1024; // 500MB safety limit
-    const { zipSync } = await import('fflate');
+    // Phase B: archive assembly moves to the proxy. The browser just
+    // resolves the selection and triggers a same-origin download. No
+    // SDK GETs in JS, no in-memory zip buffer, no 500 MB cap on JS
+    // heap.
     const keys = await resolveSelectedKeys();
     if (keys.length === 0) return;
-
-    const files: Record<string, Uint8Array> = {};
-    let totalBytes = 0;
-    for (const key of keys) {
-      try {
-        const { data, name } = await getObjectBytes(key);
-        totalBytes += data.byteLength;
-        if (totalBytes > MAX_ZIP_BYTES) {
-          throw new Error(`ZIP would exceed ${Math.round(MAX_ZIP_BYTES / 1024 / 1024)}MB limit. Select fewer or smaller files.`);
-        }
-        // Deduplicate filenames (from different prefixes)
-        const uniqueName = files[name] ? `${key.replace(/\//g, '_')}` : name;
-        files[uniqueName] = data;
-      } catch (e) {
-        if (e instanceof Error && e.message.includes('limit')) throw e;
-        // Skip individual file failures
-      }
-    }
-
-    const zipped = zipSync(files);
-    const blob = new Blob([new Uint8Array(zipped)], { type: 'application/zip' });
-    const url = URL.createObjectURL(blob);
+    const bucket = getBucket();
+    const url = bulkZipDownloadUrl(keys.map((k) => `${bucket}/${k}`));
     const a = document.createElement('a');
     a.href = url;
     a.download = `deltaglider-${new Date().toISOString().slice(0, 10)}.zip`;
+    document.body.appendChild(a);
     a.click();
-    URL.revokeObjectURL(url);
+    document.body.removeChild(a);
   }, [resolveSelectedKeys]);
 
   const uploadFiles = useCallback(async (files: FileList) => {

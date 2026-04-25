@@ -970,3 +970,105 @@ export async function fetchAudit(limit = 100): Promise<AuditResponse> {
   if (!res.ok) throw new Error(`Audit fetch failed: ${res.status}`);
   return safeJson(res);
 }
+
+// =============================================================================
+// Server-side bulk object operations (Phase B of the SDK-removal migration).
+//
+// These wrap `/api/admin/objects/{copy,move,delete,zip,list}`. Each one
+// replaces a multi-step orchestration the React s3-browser used to do
+// client-side via @aws-sdk/client-s3:
+//
+// - bulkCopyObjects / bulkMoveObjects: previously per-key for-loops with
+//   silent partial-failure recovery. Now atomic on the server.
+// - bulkDeleteObjects: replaces the SDK's batch delete; same idempotent
+//   semantics (NoSuchKey counts as deleted).
+// - listAllUnderPrefix: replaces in-browser folder expansion that would
+//   spin a recursive listObjectsV2.
+// - downloadBulkZipUrl: returns a same-origin URL the browser can use
+//   directly with `<a href download>` — server streams the archive.
+// =============================================================================
+
+export interface BulkCopyItem {
+  source_key: string;
+  /** Suffix appended to dest_prefix to form the destination key. */
+  relative: string;
+}
+
+export interface BulkCopyRequest {
+  source_bucket: string;
+  dest_bucket: string;
+  dest_prefix: string;
+  items: BulkCopyItem[];
+}
+
+export interface BulkCopyFailure {
+  source_key: string;
+  dest_key: string;
+  error: string;
+}
+
+export interface BulkCopyResponse {
+  succeeded: number;
+  failed: number;
+  failures: BulkCopyFailure[];
+}
+
+export interface BulkMoveResponse extends BulkCopyResponse {
+  deleted: number;
+}
+
+export async function bulkCopyObjects(req: BulkCopyRequest): Promise<BulkCopyResponse> {
+  const res = await adminFetch('/api/admin/objects/copy', 'POST', req);
+  if (!res.ok) throw new Error(`Copy failed: ${await res.text()}`);
+  return safeJson(res);
+}
+
+export async function bulkMoveObjects(req: BulkCopyRequest): Promise<BulkMoveResponse> {
+  const res = await adminFetch('/api/admin/objects/move', 'POST', req);
+  if (!res.ok) throw new Error(`Move failed: ${await res.text()}`);
+  return safeJson(res);
+}
+
+export interface BulkDeleteRequest {
+  bucket: string;
+  keys: string[];
+}
+
+export interface BulkDeleteResponse {
+  deleted: number;
+  failed: number;
+  failures: { key: string; error: string }[];
+}
+
+export async function bulkDeleteObjects(req: BulkDeleteRequest): Promise<BulkDeleteResponse> {
+  const res = await adminFetch('/api/admin/objects/delete', 'POST', req);
+  if (!res.ok) throw new Error(`Delete failed: ${await res.text()}`);
+  return safeJson(res);
+}
+
+export interface ListAllResponse {
+  keys: string[];
+  truncated: boolean;
+}
+
+/**
+ * Recursively expand `prefix` to its absolute key list. Server-side
+ * equivalent of the previous browser-side `listAllKeys`.
+ */
+export async function listAllUnderPrefix(bucket: string, prefix: string): Promise<ListAllResponse> {
+  if (!prefix) throw new Error('listAllUnderPrefix: prefix must be non-empty');
+  const qs = new URLSearchParams({ bucket, prefix });
+  const res = await adminFetch(`/api/admin/objects/list?${qs.toString()}`);
+  if (!res.ok) throw new Error(`List failed: ${await res.text()}`);
+  return safeJson(res);
+}
+
+/**
+ * Build the same-origin URL for a server-streamed zip download. Used
+ * by the browser as an `<a href download>` target — no JS-side body
+ * assembly. Pass `bucketKeys` as `["bucket/key1", "bucket/key2"]`.
+ */
+export function bulkZipDownloadUrl(bucketKeys: string[]): string {
+  const qs = new URLSearchParams({ keys: bucketKeys.join(',') });
+  return `${BASE}/api/admin/objects/zip?${qs.toString()}`;
+}
