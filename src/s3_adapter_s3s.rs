@@ -195,7 +195,7 @@ impl s3s::S3 for DeltaGliderS3Service {
         let list_scope = req.extensions.get::<ListScope>().cloned();
         let include_metadata = query_flag(&req.uri, "metadata", "true");
         let input = req.input;
-        let max_keys = input.max_keys.unwrap_or(1000).max(1).min(1000) as u32;
+        let max_keys = input.max_keys.unwrap_or(1000).clamp(1, 1000) as u32;
         let mut page = self
             .state
             .engine
