@@ -46,6 +46,8 @@ pub struct TestServer {
     /// mutations persist to this specific file rather than to a
     /// CWD-relative default.
     config_path: std::path::PathBuf,
+    /// Extra environment variables used when respawning this server.
+    extra_env: Vec<(String, String)>,
 }
 
 impl TestServer {
@@ -124,6 +126,7 @@ impl TestServer {
         auth_creds: Option<(String, String)>,
         encryption_key: Option<String>,
         yaml_config: bool,
+        extra_env: Vec<(String, String)>,
     ) -> Self {
         let port = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
 
@@ -165,6 +168,9 @@ impl TestServer {
         if let Some(ref key) = encryption_key {
             cmd.env("DGP_ENCRYPTION_KEY", key);
         }
+        for (key, value) in &extra_env {
+            cmd.env(key, value);
+        }
         let process = cmd.spawn().expect("Failed to start server");
 
         let mut server = Self {
@@ -174,6 +180,7 @@ impl TestServer {
             bucket: bucket.to_string(),
             auth_creds,
             config_path,
+            extra_env,
         };
         server.wait_ready().await;
         server.ensure_bucket().await;
@@ -331,6 +338,9 @@ impl TestServer {
             .env("DGP_TRUST_PROXY_HEADERS", "true")
             // Explicitly NOT setting DGP_ENCRYPTION_KEY.
             .env_remove("DGP_ENCRYPTION_KEY");
+        for (key, value) in &self.extra_env {
+            cmd.env(key, value);
+        }
         self.process = cmd.spawn().expect("Failed to respawn server");
         self.wait_ready().await;
     }
@@ -379,6 +389,8 @@ pub struct TestServerBuilder {
     /// to be true — set automatically when this is used). Intended for
     /// tests that exercise YAML-only features like replication rules.
     extra_storage_yaml: Option<String>,
+    /// Extra process environment variables for this test proxy.
+    extra_env: Vec<(String, String)>,
 }
 
 impl Default for TestServerBuilder {
@@ -397,6 +409,7 @@ impl Default for TestServerBuilder {
             config_sync_bucket: None,
             bootstrap_password: None,
             extra_storage_yaml: None,
+            extra_env: Vec::new(),
         }
     }
 }
@@ -440,6 +453,17 @@ impl TestServerBuilder {
     pub fn auth(mut self, access_key_id: &str, secret_access_key: &str) -> Self {
         self.auth_creds = Some((access_key_id.to_string(), secret_access_key.to_string()));
         self
+    }
+
+    /// Add an environment variable to the spawned proxy process.
+    pub fn env(mut self, key: &str, value: &str) -> Self {
+        self.extra_env.push((key.to_string(), value.to_string()));
+        self
+    }
+
+    /// Opt into the experimental `s3s` adapter runtime path.
+    pub fn s3s_adapter(self) -> Self {
+        self.env("DGP_S3_ADAPTER", "s3s")
     }
 
     /// Add a per-bucket TOML policy section. Example:
@@ -507,6 +531,7 @@ impl TestServerBuilder {
         let (config, data_dir) = self.build_config();
         let auth = self.auth_creds.clone();
         let yaml = self.yaml_config;
+        let extra_env = self.extra_env.clone();
         TestServer::spawn_with_config(
             &config,
             &self.bucket,
@@ -514,6 +539,7 @@ impl TestServerBuilder {
             auth,
             self.encryption_key,
             yaml,
+            extra_env,
         )
         .await
     }

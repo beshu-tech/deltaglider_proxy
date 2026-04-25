@@ -218,6 +218,72 @@ jobs:
         if: always()
         run: docker rm -f minio-ci 2>/dev/null || true
 
+  test-s3s-adapter:
+    name: s3s Adapter Tests
+    runs-on: k3s
+    timeout-minutes: 20
+    container:
+      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Build demo UI (required by rust-embed)
+        run: cd demo/s3-browser/ui && npm ci && npm run build
+      - name: Clean up stale config DB files
+        run: |
+          rm -f deltaglider_config.db deltaglider_config.db.bak .deltaglider_bootstrap_hash
+          rm -f /tmp/deltaglider_config.db /tmp/deltaglider_config.db.bak /tmp/.deltaglider_bootstrap_hash
+      - name: Build s3s adapter path
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          cargo check --locked --features s3s-adapter
+          cargo test --lib s3_adapter_s3s --locked --features s3s-adapter
+      - name: s3s adapter parity tests
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          cargo test --locked --features s3s-adapter \
+            --test s3s_adapter_parity_test \
+            -- --nocapture --test-threads=1
+      - name: S3 compatibility corpus on s3s
+        env:
+          RUST_BACKTRACE: "1"
+          DGP_S3_ADAPTER: s3s
+        run: |
+          cargo test --locked --features s3s-adapter \
+            --test s3_compat_test \
+            -- --nocapture --test-threads=1
+      - name: Auth, admission, and public prefix on s3s
+        env:
+          RUST_BACKTRACE: "1"
+          DGP_S3_ADAPTER: s3s
+        run: |
+          cargo test --locked --features s3s-adapter \
+            --test admission_test \
+            --test iam_authorization_test \
+            --test iam_list_scope_test \
+            --test public_prefix_list_test \
+            --test public_prefix_test \
+            -- --nocapture --test-threads=1
+      - name: High-risk S3 semantics on s3s
+        env:
+          RUST_BACKTRACE: "1"
+          DGP_S3_ADAPTER: s3s
+        run: |
+          cargo test --locked --features s3s-adapter \
+            --test aws_chunked_upload_test \
+            --test concurrency_test \
+            --test metadata_validation_test \
+            --test multipart_etag_test \
+            --test recursive_delete_test \
+            --test s3_correctness_test \
+            --test storage_resilience_test \
+            --test unmanaged_objects_test \
+            -- --nocapture --test-threads=1
+
   test-delta:
     name: Delta & Optimization Tests
     runs-on: k3s

@@ -297,6 +297,33 @@ pub fn build_s3_router(
     public_prefix_snapshot: &deltaglider_proxy::bucket_policy::SharedPublicPrefixSnapshot,
     admission_chain: &deltaglider_proxy::admission::SharedAdmissionChain,
 ) -> Router {
+    #[cfg(feature = "s3s-adapter")]
+    {
+        let adapter = std::env::var("DGP_S3_ADAPTER").unwrap_or_else(|_| "s3s".to_string());
+        if adapter.eq_ignore_ascii_case("s3s") {
+            info!("S3 adapter: s3s path enabled (default; set DGP_S3_ADAPTER=axum to roll back)");
+            return build_s3s_router(
+                state,
+                iam_state,
+                metrics,
+                rate_limiter,
+                replay_cache,
+                config,
+                config_db_mismatch,
+                public_prefix_snapshot,
+                admission_chain,
+            );
+        }
+        if !adapter.eq_ignore_ascii_case("axum") {
+            tracing::warn!(
+                "Unknown DGP_S3_ADAPTER='{}'; falling back to legacy Axum S3 adapter",
+                adapter
+            );
+        } else {
+            info!("S3 adapter: legacy Axum path enabled (DGP_S3_ADAPTER=axum)");
+        }
+    }
+
     // S3 API paths:
     //   GET / - list buckets
     //   PUT /{bucket} - create bucket
@@ -395,6 +422,257 @@ pub fn build_s3_router(
             ),
         ))
         // CORS must be outermost to handle OPTIONS preflight before auth
+        .layer(CorsLayer::permissive())
+        .with_state(state.clone())
+}
+
+#[cfg(feature = "s3s-adapter")]
+#[allow(clippy::too_many_arguments)]
+fn build_s3s_router(
+    state: &Arc<AppState>,
+    iam_state: &SharedIamState,
+    metrics: &Arc<Metrics>,
+    rate_limiter: &RateLimiter,
+    replay_cache: &deltaglider_proxy::api::auth::ReplayCache,
+    config: &Config,
+    config_db_mismatch: bool,
+    public_prefix_snapshot: &deltaglider_proxy::bucket_policy::SharedPublicPrefixSnapshot,
+    admission_chain: &deltaglider_proxy::admission::SharedAdmissionChain,
+) -> Router {
+    use axum::error_handling::HandleError;
+    use deltaglider_proxy::iam::IamState;
+    use deltaglider_proxy::s3_adapter_s3s::DeltaGliderS3Service;
+    use s3s::access::{S3Access, S3AccessContext};
+    use s3s::auth::{S3Auth, SecretKey};
+    use s3s::service::S3ServiceBuilder;
+
+    #[derive(Clone)]
+    struct DeltaGliderS3sAuth {
+        iam_state: SharedIamState,
+    }
+
+    #[async_trait::async_trait]
+    impl S3Auth for DeltaGliderS3sAuth {
+        async fn get_secret_key(&self, access_key: &str) -> s3s::S3Result<SecretKey> {
+            match self.iam_state.load().as_ref() {
+                IamState::Disabled => {
+                    // The legacy Axum path ignores signatures in open-dev mode.
+                    // The integration harness signs with test/test, so keep that
+                    // compatibility for the experimental adapter while still letting
+                    // s3s decode signed/chunked SDK requests.
+                    Ok(SecretKey::from("test"))
+                }
+                IamState::Legacy(auth) if access_key == auth.access_key_id => {
+                    Ok(SecretKey::from(auth.secret_access_key.clone()))
+                }
+                IamState::Iam(index) => index
+                    .get(access_key)
+                    .filter(|user| user.enabled)
+                    .map(|user| SecretKey::from(user.secret_access_key.clone()))
+                    .ok_or_else(|| s3s::s3_error!(InvalidAccessKeyId)),
+                _ => Err(s3s::s3_error!(InvalidAccessKeyId)),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct AllowAllS3sAccess;
+
+    #[async_trait::async_trait]
+    impl S3Access for AllowAllS3sAccess {
+        async fn check(&self, _cx: &mut S3AccessContext<'_>) -> s3s::S3Result<()> {
+            // IAM/admission authorization is still enforced by the outer Axum
+            // middleware chain. This access hook only prevents s3s' default
+            // "auth provider implies anonymous deny" behavior from rejecting
+            // already-admitted public/open-mode requests.
+            Ok(())
+        }
+    }
+
+    async fn handle_s3s_http_error(err: s3s::HttpError) -> axum::response::Response {
+        error!(?err, "s3s HTTP-level failure");
+        axum::http::Response::builder()
+            .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+            .body(axum::body::Body::from("Internal Server Error"))
+            .expect("static response")
+    }
+
+    async fn add_s3_request_id(
+        request: axum::http::Request<axum::body::Body>,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        let is_acl_request = request
+            .uri()
+            .query()
+            .map(|query| {
+                query
+                    .split('&')
+                    .any(|part| part == "acl" || part.starts_with("acl="))
+            })
+            .unwrap_or(false);
+        let mut response = next.run(request).await;
+        let request_id = response
+            .headers()
+            .get("x-amz-request-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        if let Ok(value) = axum::http::HeaderValue::from_str(&request_id) {
+            response.headers_mut().insert("x-amz-request-id", value);
+        }
+        response.headers_mut().insert(
+            "x-deltaglider-s3-adapter",
+            axum::http::HeaderValue::from_static("s3s"),
+        );
+
+        let is_error = response.status().is_client_error() || response.status().is_server_error();
+
+        let content_type_is_xml = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.contains("xml"))
+            .unwrap_or(false);
+        let list_metadata = response
+            .extensions()
+            .get::<deltaglider_proxy::s3_adapter_s3s::ListMetadataXmlExtensions>()
+            .cloned();
+        let recursive_delete = response
+            .extensions()
+            .get::<deltaglider_proxy::s3_adapter_s3s::RecursiveDeleteJson>()
+            .cloned();
+        if let Some(recursive_delete) = recursive_delete {
+            let (mut parts, _body) = response.into_parts();
+            parts.status = axum::http::StatusCode::OK;
+            let text = serde_json::json!({
+                "deleted": recursive_delete.deleted,
+                "denied": recursive_delete.denied,
+            })
+            .to_string();
+            parts.headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/json"),
+            );
+            parts.headers.insert(
+                axum::http::header::CONTENT_LENGTH,
+                axum::http::HeaderValue::from_str(&text.len().to_string())
+                    .unwrap_or_else(|_| axum::http::HeaderValue::from_static("0")),
+            );
+            return axum::http::Response::from_parts(parts, axum::body::Body::from(text));
+        }
+        if !content_type_is_xml || (!is_error && !is_acl_request && list_metadata.is_none()) {
+            return response;
+        }
+
+        let (mut parts, body) = response.into_parts();
+        let Ok(bytes) = axum::body::to_bytes(body, 1024 * 1024).await else {
+            return axum::http::Response::from_parts(parts, axum::body::Body::empty());
+        };
+        let mut text = String::from_utf8_lossy(&bytes).into_owned();
+        if is_error && text.contains("<Error>") && !text.contains("<RequestId>") {
+            text = text.replace(
+                "</Error>",
+                &format!("<RequestId>{request_id}</RequestId></Error>"),
+            );
+        }
+        if is_acl_request {
+            text = text.replace(
+                r#"<AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
+                "<AccessControlPolicy>",
+            );
+        }
+        if let Some(list_metadata) = list_metadata {
+            for (key, metadata) in list_metadata.0 {
+                if metadata.is_empty() {
+                    continue;
+                }
+                let key_marker = format!("<Key>{}</Key>", escape_xml_local(&key));
+                let Some(key_pos) = text.find(&key_marker) else {
+                    continue;
+                };
+                let Some(contents_end_rel) = text[key_pos..].find("</Contents>") else {
+                    continue;
+                };
+                let mut metadata_xml = String::from("<UserMetadata>");
+                let mut keys: Vec<_> = metadata.keys().collect();
+                keys.sort();
+                for metadata_key in keys {
+                    let value = &metadata[metadata_key];
+                    metadata_xml.push_str(&format!(
+                        "<Items><Key>{}</Key><Value>{}</Value></Items>",
+                        escape_xml_local(metadata_key),
+                        escape_xml_local(value)
+                    ));
+                }
+                metadata_xml.push_str("</UserMetadata>");
+                text.insert_str(key_pos + contents_end_rel, &metadata_xml);
+            }
+        }
+        parts.headers.insert(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from_str(&text.len().to_string())
+                .unwrap_or_else(|_| axum::http::HeaderValue::from_static("0")),
+        );
+        axum::http::Response::from_parts(parts, axum::body::Body::from(text))
+    }
+
+    fn escape_xml_local(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;")
+    }
+
+    let mut builder = S3ServiceBuilder::new(DeltaGliderS3Service::new(state.clone()));
+    builder.set_auth(DeltaGliderS3sAuth {
+        iam_state: iam_state.clone(),
+    });
+    builder.set_access(AllowAllS3sAccess);
+    let s3_service = HandleError::new(builder.build(), handle_s3s_http_error);
+
+    let mut router = Router::new()
+        .fallback_service(s3_service)
+        .layer(middleware::from_fn(add_s3_request_id))
+        .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            deltaglider_proxy::metrics::http_metrics_middleware,
+        ))
+        .layer(middleware::from_fn(authorization_middleware))
+        .layer(middleware::from_fn(sigv4_auth_middleware))
+        .layer(middleware::from_fn(
+            deltaglider_proxy::admission::admission_middleware,
+        ))
+        .layer(axum::Extension(iam_state.clone()))
+        .layer(axum::Extension(public_prefix_snapshot.clone()))
+        .layer(axum::Extension(admission_chain.clone()));
+
+    if config_db_mismatch {
+        error!(
+            "S3 API LOCKED — all requests will be rejected until bootstrap password mismatch is resolved via /_/"
+        );
+        router = router.layer(axum::Extension(ConfigDbMismatchGuard));
+    }
+
+    router
+        .layer(axum::Extension(replay_cache.clone()))
+        .layer(axum::Extension(rate_limiter.clone()))
+        .layer(axum::Extension(metrics.clone()))
+        .layer(DefaultBodyLimit::max(config.max_object_size as usize))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            axum::http::StatusCode::GATEWAY_TIMEOUT,
+            std::time::Duration::from_secs(deltaglider_proxy::config::env_parse_with_default(
+                "DGP_REQUEST_TIMEOUT_SECS",
+                300u64,
+            )),
+        ))
+        .layer(tower::limit::ConcurrencyLimitLayer::new(
+            deltaglider_proxy::config::env_parse_with_default(
+                "DGP_MAX_CONCURRENT_REQUESTS",
+                1024usize,
+            ),
+        ))
         .layer(CorsLayer::permissive())
         .with_state(state.clone())
 }

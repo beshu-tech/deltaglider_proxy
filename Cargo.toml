@@ -104,6 +104,7 @@ prometheus = { version = "0.13", default-features = false, features = ["process"
 rusqlite = { version = "0.39.0", features = ["bundled-sqlcipher"] }
 iam-rs = "0.0.23"
 tower = { version = "0.5", features = ["limit"] }
+s3s = { version = "0.13.0", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -123,3 +124,6 @@ aws-smithy-types = "1"
 # to the minimal reproducer. Deterministic via the PROPTEST_CASES
 # env var; default case count is 256.
 proptest = "1"
+
+[features]
+s3s-adapter = ["dep:s3s"]
