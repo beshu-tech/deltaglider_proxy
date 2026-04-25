@@ -21,8 +21,7 @@ import { Typography, Spin, Progress } from 'antd';
 import { useColors } from '../ThemeContext';
 import { formatBytes } from '../utils';
 import AnalyticsSection from './AnalyticsSection';
-import { getAdminConfig } from '../adminApi';
-import type { AdminConfig } from '../adminApi';
+import { useAdminConfig } from '../queries/config';
 import {
   AreaChart, Area, BarChart, Bar, Cell,
   XAxis, YAxis, Tooltip as RTooltip, ResponsiveContainer,
@@ -173,11 +172,10 @@ export default function MetricsPage({ onBack, embedded }: Props) {
     const saved = localStorage.getItem('dg-metrics-view');
     return saved === 'analytics' ? 'analytics' : 'monitoring';
   });
-  const [adminConfig, setAdminConfig] = useState<AdminConfig | null>(null);
-
-  useEffect(() => {
-    getAdminConfig().then(setAdminConfig).catch(() => {});
-  }, []);
+  // Admin config is shared across panels; the cached read deduplicates
+  // with whoever else mounted recently (CredentialsModePanel, etc.).
+  const { data: adminConfigData } = useAdminConfig();
+  const adminConfig = adminConfigData ?? null;
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const prevRef = useRef<{ hits: number; misses: number; http: number; latencySum: number; latencyCount: number } | null>(null);
 

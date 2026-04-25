@@ -1,4 +1,6 @@
 import { useState, useEffect } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
+import { qk } from '../queries/keys';
 import { Button, Input, Radio, Switch, Typography, Space, Alert, Spin, InputNumber } from 'antd';
 import { PlusOutlined, DeleteOutlined, DatabaseOutlined, CloudOutlined, CheckCircleOutlined, ApiOutlined, FolderOutlined } from '@ant-design/icons';
 import type { BackendInfo, CreateBackendRequest, AdminConfig } from '../adminApi';
@@ -20,6 +22,9 @@ interface Props {
 export default function BackendsPanel({ onSessionExpired }: Props) {
   const colors = useColors();
   const { cardStyle, labelStyle, inputRadius } = useCardStyles();
+  // Query client lets mutations close the loop with `invalidateQueries`
+  // instead of the local `refresh()` having to coordinate with siblings.
+  const qc = useQueryClient();
 
   const [backends, setBackends] = useState<BackendInfo[]>([]);
   const [defaultBackend, setDefaultBackend] = useState<string | null>(null);
@@ -75,6 +80,11 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
         );
       }
       setError(null);
+      // Invalidate the shared cache so any other panel reading
+      // backends/config (e.g. CredentialsModePanel, BucketsPanel)
+      // will refetch the freshly-saved state on its next mount.
+      qc.invalidateQueries({ queryKey: qk.backends.list() });
+      qc.invalidateQueries({ queryKey: qk.config() });
     } catch (e) {
       if (e instanceof Error && e.message.includes('401')) {
         onSessionExpired?.();
@@ -86,6 +96,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
     }
   };
 
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { refresh(); }, []);
 
   const handleSavePolicies = async () => {

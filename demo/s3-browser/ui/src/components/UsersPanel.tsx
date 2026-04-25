@@ -1,9 +1,12 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState } from 'react';
 import { Button, Typography, Spin, Alert, Input } from 'antd';
 import { PlusOutlined, SearchOutlined, TeamOutlined, DeleteOutlined } from '@ant-design/icons';
-import type { IamMode, IamUser } from '../adminApi';
-import { getAdminConfig, getUsers, deleteUser } from '../adminApi';
+import { useQueryClient } from '@tanstack/react-query';
+import type { IamUser } from '../adminApi';
 import { useColors } from '../ThemeContext';
+import { useUsers, useDeleteUser } from '../queries/users';
+import { useAdminConfig } from '../queries/config';
+import { qk } from '../queries/keys';
 import UserForm from './UserForm';
 import CredentialsBanner from './CredentialsBanner';
 import IamSourceBanner from './IamSourceBanner';
@@ -43,45 +46,34 @@ interface UsersPanelProps {
 
 export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigateToGroup }: UsersPanelProps) {
   const colors = useColors();
-  const [users, setUsers] = useState<IamUser[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
+  const qc = useQueryClient();
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [creating, setCreating] = useState(false);
   const [search, setSearch] = useState('');
   const [newCreds, setNewCreds] = useState<{ ak: string; sk: string } | null>(null);
-  const [iamMode, setIamMode] = useState<IamMode | undefined>(undefined);
 
-  // Fetch the current IAM mode once so the banner can explain where
-  // user state lives (DB in `gui` mode vs YAML in `declarative`).
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      const cfg = await getAdminConfig();
-      if (!cancelled && cfg) setIamMode(cfg.iam_mode);
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  // IAM mode banner: tells the operator where user state lives (DB in
+  // `gui` mode vs YAML in `declarative`). Snapshot once via TanStack
+  // Query — refetch is automatic if the mode flips elsewhere in the app.
+  const { data: cfg } = useAdminConfig();
+  const iamMode = cfg?.iam_mode;
 
-  const loadUsers = useCallback(async () => {
-    setLoading(true);
-    setError('');
-    try {
-      const data = await getUsers();
-      setUsers(data);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : 'Failed to load users';
-      if (msg.includes('401')) onSessionExpired?.();
-      else setError(msg);
-    } finally {
-      setLoading(false);
-    }
-  }, [onSessionExpired]);
+  // Users list. Query handles loading/error/refetch automatically;
+  // mutations on this resource invalidate this key (see queries/users.ts)
+  // so we never have to manually call a refresh callback.
+  const usersQuery = useUsers();
+  const users = usersQuery.data ?? [];
+  const loading = usersQuery.isLoading;
+  const rawError = usersQuery.error;
+  const error = rawError ? (rawError instanceof Error ? rawError.message : 'Failed to load users') : '';
 
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => { loadUsers(); }, []);  // Load once on mount; mutations call loadUsers() explicitly
+  // Bubble up 401 to the parent so the login screen can take over.
+  // Useful side-effect of being called once when the error transitions.
+  if (rawError && rawError instanceof Error && rawError.message.includes('401')) {
+    onSessionExpired?.();
+  }
+
+  const deleteMutation = useDeleteUser();
 
   const selectedUser = users.find(u => u.id === selectedId) ?? null;
   const filtered = search
@@ -101,14 +93,13 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
   };
 
   const handleSaved = () => {
-    loadUsers();
+    qc.invalidateQueries({ queryKey: qk.users.list() });
   };
 
   const handleCreated = async (ak: string, sk: string) => {
-    // Reload users, select the new one, show credentials banner
-    const data = await getUsers().catch(() => []);
-    setUsers(data);
-    const newUser = data.find(u => u.access_key_id === ak);
+    // Refetch synchronously to capture the new user's ID, then select it.
+    const result = await qc.fetchQuery({ queryKey: qk.users.list(), queryFn: () => import('../adminApi').then(m => m.getUsers()) });
+    const newUser = result.find(u => u.access_key_id === ak);
     if (newUser) setSelectedId(newUser.id);
     setCreating(false);
     setNewCreds({ ak, sk });
@@ -118,7 +109,7 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
     setSelectedId(null);
     setCreating(false);
     setNewCreds(null);
-    loadUsers();
+    qc.invalidateQueries({ queryKey: qk.users.list() });
   };
 
   return (
@@ -221,15 +212,13 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
                     danger
                     size="small"
                     icon={<DeleteOutlined />}
-                    onClick={async (e) => {
+                    onClick={(e) => {
                       e.stopPropagation();
                       if (!window.confirm(`Delete "${user.name}"? This cannot be undone.`)) return;
-                      try {
-                        await deleteUser(user.id);
-                        handleDeleted();
-                      } catch (err) {
-                        console.error('Delete user failed:', err);
-                      }
+                      deleteMutation.mutate(user.id, {
+                        onSuccess: handleDeleted,
+                        onError: (err) => console.error('Delete user failed:', err),
+                      });
                     }}
                     style={{ opacity: 0.5, padding: '2px 4px', minWidth: 0, flexShrink: 0 }}
                     onMouseEnter={e => { e.currentTarget.style.opacity = '1'; }}

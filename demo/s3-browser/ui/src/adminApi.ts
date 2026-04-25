@@ -257,7 +257,7 @@ export async function exportConfigYaml(): Promise<string> {
   return res.text();
 }
 
-interface ConfigValidateResponse {
+export interface ConfigValidateResponse {
   ok: boolean;
   warnings: string[];
   error?: string;
@@ -524,13 +524,13 @@ export interface IamGroup {
   created_at: string;
 }
 
-interface CreateGroupRequest {
+export interface CreateGroupRequest {
   name: string;
   description?: string;
   permissions: IamPermission[];
 }
 
-interface UpdateGroupRequest {
+export interface UpdateGroupRequest {
   name?: string;
   description?: string;
   permissions?: IamPermission[];
@@ -704,7 +704,7 @@ export async function loginAs(accessKeyId: string, secretAccessKey: string): Pro
 
 // === Multi-Backend Management ===
 
-interface BackendListResponse {
+export interface BackendListResponse {
   backends: BackendInfo[];
   default_backend: string | null;
 }
