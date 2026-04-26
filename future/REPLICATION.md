@@ -1,5 +1,13 @@
 # Eventually-Consistent Background Replication
 
+> **Status:** superseded by shipped lazy bucket replication.
+> Current operator docs live in
+> [`docs/product/reference/replication.md`](../docs/product/reference/replication.md).
+> The shipped design is rule-based source → destination object
+> replication through the DeltaGlider engine, with scheduler controls,
+> run-now, pause/resume, history, failures, and provenance-guarded
+> delete replication. This planning note is kept for archaeology only.
+
 ## Value Proposition
 
 Async copy of every write to a secondary backend. Primary = local filesystem (fast writes), secondary = cheap cloud (durability). Not real-time cross-region replication — an eventually-consistent background sync.

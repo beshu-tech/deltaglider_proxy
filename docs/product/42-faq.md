@@ -51,9 +51,11 @@ Not today. Compression is **per-bucket**. If you want some prefixes to skip delt
 
 ### What file types actually benefit from delta compression?
 
-Versioned binaries where most of the content doesn't change between versions: zipped releases, database dumps, game-build artefacts, tar archives. DeltaGlider has been seeing 60–95% savings on these in practice.
+Binary-similar workloads where most bytes repeat across stored versions: backup archives, software catalogs, AI model variants, media/texture variants, zipped releases, database dumps, game-build artefacts, tar archives. DeltaGlider has been seeing 60–95% savings on high-similarity workloads in practice.
 
-What doesn't benefit: already-compressed formats (JPEG, MP4, Zstd, gzip), unique-per-upload binaries (photos, user uploads). For these, the proxy auto-falls-back to passthrough via `max_delta_ratio` — no manual intervention needed.
+The extension list is only a starting point. You can add or remove delta candidates for your workload; the real predictor is internal structure and binary similarity across versions.
+
+What doesn't benefit: already-compressed formats with little cross-version similarity (JPEG, MP4, Zstd, gzip), unique-per-upload binaries (photos, user uploads). For these, the proxy auto-falls-back to passthrough via `max_delta_ratio` — no manual intervention needed.
 
 ### Does compression slow things down?
 
@@ -95,6 +97,12 @@ See [reference/encryption-at-rest.md](reference/encryption-at-rest.md) for the f
 ### Does enabling encryption re-encrypt my existing objects?
 
 No. The marker-based dispatch means old plaintext objects continue to be served as plaintext; only new writes go through the encrypt path. If you want to encrypt historical objects, copy them through the proxy to themselves (that's a rewrite, which routes through the new encrypt path).
+
+### Can I use cheap or untrusted S3-compatible storage safely?
+
+Yes, when the threat model is "the backend must not see plaintext object bodies." Use `aes256-gcm-proxy` on that backend. DeltaGlider encrypts object bodies before they reach the provider; the key stays in your trusted runtime environment. Compression still runs before encryption, so storage savings are preserved.
+
+Object names, sizes, and user metadata remain visible to the backend. If metadata confidentiality matters, put secrets in the object body, not in names or metadata.
 
 ### Can I use different keys for different buckets?
 
@@ -163,8 +171,6 @@ You want both.
 ### Can I manage IAM entirely in YAML (GitOps)?
 
 Yes, with `access.iam_mode: declarative`. YAML becomes authoritative; admin-API IAM mutations return `403 { "error": "iam_declarative" }`. The expected flow: edit YAML, `POST /_/api/admin/config/apply`, reconcile DB ↔ YAML happens automatically.
-
-Caveat: the reconciler is Phase 3c.3 and currently not implemented. Today, `declarative` mode is a pure lockout — the admin API refuses IAM writes, but there's no automatic sync of YAML → DB. Usable if you seed the DB once via the GUI and then flip to declarative for subsequent GitOps-only changes.
 
 ## Limits
 

@@ -3,18 +3,18 @@ interface ProofItem {
 }
 
 const ITEMS: readonly ProofItem[] = [
-  { label: 'Encryption at rest' },
-  { label: 'SigV4 drop-in' },
-  { label: 'ABAC IAM' },
-  { label: 'Prometheus metrics' },
-  { label: 'Single binary' },
-  { label: 'Open source' },
+  { label: 'Transparent S3 proxy' },
+  { label: 'xdelta3 dedupe' },
+  { label: 'ABAC IAM + OAuth' },
+  { label: 'Soft bucket quotas' },
+  { label: 'Object replication' },
+  { label: 'Prometheus dashboards' },
 ];
 
 export function ProofStrip(): JSX.Element {
   return (
-    <section className="border-y border-ink-200 bg-white/60 py-6 dark:border-ink-700 dark:bg-ink-900/40">
-      <div className="mx-auto max-w-5xl px-6 flex flex-wrap items-center justify-center gap-x-8 gap-y-2 text-sm font-semibold text-ink-700 dark:text-ink-300">
+    <section className="border-y border-ink-200 bg-white/70 py-6 dark:border-ink-700 dark:bg-ink-900/60">
+      <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-center gap-x-8 gap-y-2 px-6 text-sm font-semibold text-ink-700 dark:text-ink-300">
         {ITEMS.map((item, idx) => (
           <span
             key={item.label}

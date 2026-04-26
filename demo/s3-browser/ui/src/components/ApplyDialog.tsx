@@ -34,6 +34,8 @@ interface Props {
   onCancel: () => void;
   /** True while the parent's PUT is in flight — disables buttons. */
   loading?: boolean;
+  /** Optional human-readable summary rendered above the raw diff. */
+  summary?: React.ReactNode;
 }
 
 export default function ApplyDialog({
@@ -43,6 +45,7 @@ export default function ApplyDialog({
   onApply,
   onCancel,
   loading,
+  summary,
 }: Props) {
   const { TEXT_PRIMARY: TEXT, TEXT_MUTED, BORDER, BG_CARD } = useColors();
 
@@ -109,6 +112,12 @@ export default function ApplyDialog({
           }
           style={{ marginBottom: 12 }}
         />
+      )}
+
+      {summary && (
+        <div style={{ marginBottom: 12 }}>
+          {summary}
+        </div>
       )}
 
       {/* Diff — the star of the dialog. Empty diff = no-op apply, which

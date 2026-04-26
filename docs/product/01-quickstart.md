@@ -91,8 +91,8 @@ The object lands on disk under `./data/demo/`. The proxy automatically decides w
 ## One-page feature summary
 
 - **S3-compatible API** — standard SigV4. `aws-cli`, boto3, Terraform, rclone all work unchanged.
-- **Transparent delta compression** — versioned binaries stored as xdelta3 diffs against a reference; reconstructed on GET, byte-identical, SHA-256 verified.
+- **Transparent delta compression** — repeated binary workloads stored as xdelta3 diffs against a reference; reconstructed on GET, byte-identical, SHA-256 verified.
 - **Multi-backend routing** — aggregate AWS S3, Hetzner, Backblaze, MinIO, and local filesystem behind one endpoint.
 - **Authentication** — SigV4 bootstrap, per-user IAM with ABAC permissions, or OAuth/OIDC.
-- **Admin UI** at `/_/` on the same port — file browser, user management, backend config, Prometheus dashboard, analytics.
+- **Admin UI** at `/_/` on the same port — file browser, user management, bucket policy, soft quotas, replication, backend config, Prometheus dashboard, analytics.
 - **Single binary, single port** — no sidecars. The UI and API share port 9000.

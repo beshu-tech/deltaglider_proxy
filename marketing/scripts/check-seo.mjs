@@ -9,8 +9,12 @@ const distDir = join(dirname(here), 'dist');
 const PAGES = [
   { path: 'index.html', label: '/' },
   { path: 'regulated/index.html', label: '/regulated/' },
-  { path: 'versioning/index.html', label: '/versioning/' },
+  { path: 'artifact-storage/index.html', label: '/artifact-storage/' },
   { path: 'minio-migration/index.html', label: '/minio-migration/' },
+  { path: 's3-saas-control-plane/index.html', label: '/s3-saas-control-plane/' },
+  { path: 'about/index.html', label: '/about/' },
+  { path: 'privacy/index.html', label: '/privacy/' },
+  { path: 'terms/index.html', label: '/terms/' },
 ];
 
 const REQUIRED = [
@@ -54,7 +58,8 @@ for (const page of PAGES) {
     console.log(`✓ ${page.label}: SEO checks passed`);
   }
 
-  const ssgCanary = />Cloud storage up to|>Up to 95%|>Your data never|>If you liked MinIO|>Three different problems/;
+  const ssgCanary =
+    />Smaller object storage|>Not S3 object versioning|>Use cheap storage without trusting|>Self-hosted S3 without losing|>Use cheaper S3 storage|>Business impact|>DeltaGlider Proxy is built by Beshu Tech|>Privacy Policy|>Terms of Service/;
   if (!ssgCanary.test(html)) {
     console.error(
       `✗ ${page.label}: page content not found in raw HTML — SSG may not have pre-rendered`,

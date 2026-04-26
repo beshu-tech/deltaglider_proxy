@@ -17,6 +17,7 @@ import {
   SecurityScanOutlined,
   SettingOutlined,
   MenuOutlined,
+  SyncOutlined,
 } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import FullScreenHeader from './FullScreenHeader';
@@ -30,6 +31,7 @@ import AdminSidebar from './AdminSidebar';
 import AdmissionPanel from './AdmissionPanel';
 import CredentialsModePanel from './CredentialsModePanel';
 import BucketsPanel from './BucketsPanel';
+import ReplicationPanel from './ReplicationPanel';
 import CopySectionYamlButton from './CopySectionYamlButton';
 import SetupWizard from './SetupWizard';
 import TracePanel from './TracePanel';
@@ -81,9 +83,10 @@ const LEGACY_TO_NEW: Record<string, string> = {
   'users': 'configuration/access/users',
   'groups': 'configuration/access/groups',
   'auth': 'configuration/access/ext-auth',
-  // Storage sub-sections — legacy 'backends' covered both backends +
-  // bucket policies on one page; keep pointing there until Wave 6
-  // splits them.
+  // Storage sub-sections — legacy 'backends' covered backend infra
+  // and bucket policy on one page. Today Backends is infra-only;
+  // Buckets owns policy. Keep old bookmarks on Backends because
+  // that's where the route originally landed.
   'backends': 'configuration/storage/backends',
   'backend': 'configuration/storage/backends',
   'compression': 'configuration/storage/backends',
@@ -196,12 +199,17 @@ const PAGE_HEADERS: Record<string, { icon: React.ReactNode; title: string; descr
   'configuration/storage/backends': {
     icon: <CloudServerOutlined />,
     title: 'Backends',
-    description: 'Storage backends, default backend selection, and per-bucket routing.',
+    description: 'Storage backends, default backend selection, connection tests, and encryption-at-rest.',
   },
   'configuration/storage/buckets': {
     icon: <CloudOutlined />,
     title: 'Buckets',
     description: 'Per-bucket policies: compression overrides, delta ratio, public prefixes, quotas, aliases.',
+  },
+  'configuration/storage/replication': {
+    icon: <SyncOutlined />,
+    title: 'Object replication',
+    description: 'Object data replication between buckets and prefixes. Rules are storage config; runtime state lives in the encrypted config DB.',
   },
   'configuration/advanced/listener': {
     icon: <CloudServerOutlined />,
@@ -226,7 +234,7 @@ const PAGE_HEADERS: Record<string, { icon: React.ReactNode; title: string; descr
   'configuration/advanced/sync': {
     icon: <SettingOutlined />,
     title: 'Config DB sync',
-    description: 'S3 bucket for encrypted IAM DB replication across proxy instances.',
+    description: 'S3 bucket for encrypted IAM/config database HA across proxy instances. This is not object replication.',
   },
 };
 
@@ -630,10 +638,8 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
     }
 
     // Configuration — Storage (Wave 6). Backends keeps the legacy
-    // BackendsPanel (which covers default compression + backend
-    // list + the legacy bucket-policy editor). Buckets routes to
-    // the dedicated BucketsPanel with the None/Entire/Prefixes
-    // tri-state UX from §7.5.
+  // Backends owns storage infrastructure. Buckets owns per-bucket
+  // policy. Object replication owns source → destination movement.
     if (adminPath === 'configuration/storage/backends') {
       return (
         <>
@@ -647,6 +653,14 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
         <>
           {header}
           <BucketsPanel onSessionExpired={onSessionExpired} />
+        </>
+      );
+    }
+    if (adminPath === 'configuration/storage/replication') {
+      return (
+        <>
+          {header}
+          <ReplicationPanel onSessionExpired={onSessionExpired} />
         </>
       );
     }

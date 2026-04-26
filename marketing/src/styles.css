@@ -22,9 +22,9 @@
   --color-ink-700: #334155;
   --color-ink-800: #1e293b;
   --color-ink-900: #0f172a;
+  --color-ink-950: #020617;
 
   --font-sans: 'Manrope', ui-sans-serif, system-ui, sans-serif;
-  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
 }
 
 html {
@@ -35,18 +35,101 @@ html {
 body {
   font-family: var(--font-sans);
   color: var(--color-ink-900);
-  background: var(--color-ink-50);
+  background:
+    radial-gradient(circle at 12% 8%, rgb(20 184 166 / 0.12), transparent 28rem),
+    radial-gradient(circle at 88% 22%, rgb(45 212 191 / 0.1), transparent 30rem),
+    var(--color-ink-50);
   font-feature-settings: 'cv02', 'cv11';
 }
 
 @media (prefers-color-scheme: dark) {
   body {
     color: var(--color-ink-100);
-    background: var(--color-ink-900);
+    background:
+      radial-gradient(circle at 12% 8%, rgb(20 184 166 / 0.12), transparent 28rem),
+      radial-gradient(circle at 88% 22%, rgb(45 212 191 / 0.08), transparent 30rem),
+      var(--color-ink-900);
   }
 }
 
 code,
 pre {
-  font-family: var(--font-mono);
+  font-family: var(--font-sans);
+  font-weight: 700;
+}
+
+.soft-gradient-bg {
+  position: relative;
+  overflow: hidden;
+}
+
+.soft-gradient-bg::before {
+  position: fixed;
+  inset: -20% -10%;
+  z-index: -1;
+  content: '';
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 20% 20%, rgb(20 184 166 / 0.12), transparent 22rem),
+    radial-gradient(circle at 78% 10%, rgb(94 234 212 / 0.1), transparent 24rem),
+    radial-gradient(circle at 58% 82%, rgb(15 118 110 / 0.08), transparent 26rem);
+  filter: saturate(1.08);
+  animation: gradient-drift 22s ease-in-out infinite alternate;
+}
+
+.cyber-fishnet-hero::before,
+.cyber-fishnet-hero::after {
+  position: absolute;
+  inset: 0;
+  content: '';
+  pointer-events: none;
+}
+
+.cyber-fishnet-hero::before {
+  z-index: 1;
+  background:
+    linear-gradient(63deg, rgb(15 118 110 / 0.3) 1px, transparent 1.5px),
+    linear-gradient(117deg, rgb(20 184 166 / 0.25) 1px, transparent 1.5px);
+  background-position:
+    0 0,
+    0 0;
+  background-size: 34px 34px;
+  mask-image: radial-gradient(ellipse at 54% 42%, black 0%, rgb(0 0 0 / 0.84) 52%, transparent 86%);
+  opacity: 0.95;
+  transform: skewY(-2deg) scale(1.12);
+}
+
+.cyber-fishnet-hero::after {
+  z-index: 2;
+  background:
+    radial-gradient(circle at 72% 28%, rgb(45 212 191 / 0.22), transparent 18rem),
+    radial-gradient(circle at 38% 62%, rgb(15 118 110 / 0.12), transparent 24rem);
+  opacity: 0.75;
+  animation: gradient-drift 18s ease-in-out infinite alternate;
+}
+
+@media (prefers-color-scheme: dark) {
+  .cyber-fishnet-hero::before {
+    background:
+      linear-gradient(63deg, rgb(94 234 212 / 0.22) 1px, transparent 1.5px),
+      linear-gradient(117deg, rgb(20 184 166 / 0.18) 1px, transparent 1.5px);
+    opacity: 0.78;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .soft-gradient-bg::before,
+  .cyber-fishnet-hero::after {
+    animation: none;
+  }
+}
+
+@keyframes gradient-drift {
+  from {
+    transform: translate3d(-1.5%, -1%, 0) scale(1);
+  }
+
+  to {
+    transform: translate3d(1.5%, 1%, 0) scale(1.04);
+  }
 }

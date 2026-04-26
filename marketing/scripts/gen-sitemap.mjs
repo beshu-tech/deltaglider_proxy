@@ -8,7 +8,16 @@ const root = join(here, '..');
 const distDir = join(root, 'dist');
 
 const SITE_URL = 'https://beshu-tech.github.io/deltaglider_proxy';
-const PATHS = ['/', '/regulated/', '/versioning/', '/minio-migration/'];
+const PATHS = [
+  '/',
+  '/regulated/',
+  '/artifact-storage/',
+  '/minio-migration/',
+  '/s3-saas-control-plane/',
+  '/about/',
+  '/privacy/',
+  '/terms/',
+];
 const today = new Date().toISOString().slice(0, 10);
 
 const urls = PATHS.map(

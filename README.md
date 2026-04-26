@@ -1,12 +1,12 @@
 # DeltaGlider Proxy
 
-**A unified S3 gateway that aggregates multiple storage backends behind a single endpoint — with delegated authentication, fine-grained access control, transparent delta compression, and a full management GUI. One binary. One port. Zero client changes.**
+**A unified S3-compatible gateway that reduces storage growth for repeated binaries, routes buckets across multiple backends, and adds an enterprise control plane — IAM, OAuth, bucket policy, quotas, replication, encryption, metrics, audit, and a full management GUI. One binary. One port. Existing S3 workflows.**
 
 ---
 
 ## Why DeltaGlider
 
-Organizations run storage across multiple providers — AWS S3, Hetzner Object Storage, Backblaze B2, MinIO, local NFS. Each has its own credentials, endpoints, and access policies. Teams share credentials in Slack. There's no audit trail. No prefix-level access control. No way to publish a folder without exposing the whole bucket.
+Organizations run storage across multiple providers — AWS S3, lower-cost S3-compatible SaaS, Hetzner Object Storage, Backblaze B2, MinIO, local NFS. Each has its own credentials, endpoints, and access policies. Teams share credentials in Slack. There's no audit trail. No prefix-level access control. No way to publish a folder without exposing the whole bucket.
 
 DeltaGlider Proxy solves this by sitting in front of all your backends and presenting a single, authenticated S3 endpoint:
 
@@ -22,7 +22,7 @@ DeltaGlider Proxy solves this by sitting in front of all your backends and prese
                                           └──────────────────────┘
 ```
 
-Clients see standard S3. They don't know which backend stores their bucket. They don't know their binaries are delta-compressed to a fraction of their original size. They authenticate once — with corporate SSO if you want — and the proxy handles the rest.
+Clients see standard S3. They don't know which backend stores their bucket. They don't know repeated binaries are stored as compact deltas or encrypted before an untrusted backend sees them. They authenticate once — with corporate SSO if you want — and the proxy handles the rest.
 
 ![DeltaGlider UI — file browser with delta compression stats](docs/screenshots/filebrowser.jpg)
 
@@ -52,11 +52,11 @@ Clients see standard S3. They don't know which backend stores their bucket. They
 - **Public prefixes** — Publish specific folders (e.g. release artifacts) for anonymous download without exposing the rest of the bucket. Scoped read-only — no writes, no listing beyond the published prefix.
 
 ### Transparent Delta Compression
-- **60-95% storage reduction** on versioned binaries (release artifacts, firmware, ML checkpoints, Docker layers)
+- **60-95% storage reduction** on repeated binary workloads when internal structure is similar across versions (backup archives, software catalogs, media/texture variants, AI model variants, release artifacts, firmware, ML checkpoints)
 - Clients PUT and GET normally — the proxy intercepts, computes xdelta3 diffs against a per-prefix baseline, and stores the delta when smaller
 - SHA-256 verified on every reconstructed GET — byte-identical to the original, guaranteed
 - Per-bucket compression policies — enable/disable per bucket, custom ratio thresholds
-- Intelligent file routing — archives get delta-compressed, images/video/already-compressed formats pass through untouched
+- Intelligent file routing — configurable delta candidates are compressed when worthwhile; images/video/already-compressed formats pass through untouched
 
 ```
 PUT releases/v2.zip ──▶ DeltaGlider ──▶ stored as 1.4MB delta (was 82MB)
@@ -70,6 +70,8 @@ Everything managed from a web UI served on the same port as the S3 API — no ex
 - **User management** — Create IAM users, assign ABAC permissions, rotate keys, organize into groups
 - **OAuth configuration** — Add identity providers, configure group mapping rules, test SSO flows
 - **Backend management** — Add/remove storage backends, configure per-bucket routing, aliasing, compression policies, and public prefixes
+- **Bucket controls** — Configure soft quotas, read-only bucket freeze, public prefixes, aliases, and compression policy
+- **Object replication** — Configure source → destination replication rules, run-now, pause/resume, history/failures, and delete replication
 - **Monitoring dashboard** — Live Prometheus metrics: request rates, latencies, cache hit rates, status codes, auth events
 - **Storage analytics** — Per-bucket savings breakdown, estimated monthly cost savings, compression opportunity detection
 - **Embedded documentation** — Full-text searchable reference docs with architecture diagrams
@@ -83,6 +85,7 @@ Everything managed from a web UI served on the same port as the S3 API — no ex
 ![Advanced security settings — rate limiting, session hardening, anti-fingerprinting](docs/screenshots/advanced_security.jpg)
 - **Mandatory authentication** — proxy refuses to start without credentials (no accidental open deployments)
 - **Encrypted config database** — IAM users and OAuth config stored in SQLCipher-encrypted database, synced across instances via S3
+- **Proxy-side encryption** — AES-256-GCM before data reaches the backend; useful for cheap or untrusted S3-compatible storage where keys must stay in your environment
 - **Per-IP rate limiting** — progressive delay and lockout on auth endpoints (brute-force resistant)
 - **Session hardening** — IP binding, configurable TTL, max concurrent sessions, SameSite/Secure cookies
 - **SigV4 replay detection** — constant-time signature comparison, clock skew validation
@@ -159,6 +162,7 @@ storage:
       backend: europe
       compression: true
       public_prefixes: ["builds/", "artifacts/"]
+      quota_bytes: 10737418240
     docs-site:
       public: true                  # shorthand for public_prefixes: [""]
     archive:

@@ -1,16 +1,14 @@
 import { useState, useEffect } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { qk } from '../queries/keys';
-import { Button, Input, Radio, Switch, Typography, Space, Alert, Spin, InputNumber } from 'antd';
+import { Button, Input, Radio, Switch, Typography, Space, Alert, Spin } from 'antd';
 import { PlusOutlined, DeleteOutlined, DatabaseOutlined, CloudOutlined, CheckCircleOutlined, ApiOutlined, FolderOutlined } from '@ant-design/icons';
 import type { BackendInfo, CreateBackendRequest, AdminConfig } from '../adminApi';
 import { getBackends, createBackend, deleteBackend, testS3Connection, getAdminConfig, updateAdminConfig, putSection } from '../adminApi';
-import { listBuckets } from '../s3client';
 import { useColors } from '../ThemeContext';
+import { useNavigation } from '../NavigationContext';
 import { useCardStyles } from './shared-styles';
 import SectionHeader from './SectionHeader';
-import SimpleSelect from './SimpleSelect';
-import SimpleAutoComplete from './SimpleAutoComplete';
 import BackendEncryptionEditor, { type BackendEncryptionPatch } from './BackendEncryptionEditor';
 
 const { Text } = Typography;
@@ -25,18 +23,13 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
   // Query client lets mutations close the loop with `invalidateQueries`
   // instead of the local `refresh()` having to coordinate with siblings.
   const qc = useQueryClient();
+  const { navigate } = useNavigation();
 
   const [backends, setBackends] = useState<BackendInfo[]>([]);
   const [defaultBackend, setDefaultBackend] = useState<string | null>(null);
   const [config, setConfig] = useState<AdminConfig | null>(null);
-  const [availableBuckets, setAvailableBuckets] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-
-  // Per-bucket policies (local edit state)
-  const [bucketPolicies, setBucketPolicies] = useState<Array<{ name: string; compression: boolean; max_delta_ratio: number | null; backend: string; alias: string; public_prefixes: string[]; quota_bytes: number | null }>>([]);
-  const [policyDirty, setPolicyDirty] = useState(false);
-  const [policySaving, setPolicySaving] = useState(false);
 
   // New backend form
   const [showForm, setShowForm] = useState(false);
@@ -57,28 +50,13 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
 
   const refresh = async () => {
     try {
-      const [data, cfg, buckets] = await Promise.all([
+      const [data, cfg] = await Promise.all([
         getBackends(),
         getAdminConfig(),
-        listBuckets().catch(() => []),
       ]);
       setBackends(data.backends);
       setDefaultBackend(data.default_backend);
       setConfig(cfg);
-      setAvailableBuckets(buckets.map((b: { name: string }) => b.name));
-      if (cfg?.bucket_policies) {
-        setBucketPolicies(
-          Object.entries(cfg.bucket_policies).map(([name, p]) => ({
-            name,
-            compression: p.compression ?? true,
-            max_delta_ratio: p.max_delta_ratio ?? null,
-            backend: p.backend ?? '',
-            alias: p.alias ?? '',
-            public_prefixes: p.public_prefixes ?? [],
-            quota_bytes: p.quota_bytes ?? null,
-          }))
-        );
-      }
       setError(null);
       // Invalidate the shared cache so any other panel reading
       // backends/config (e.g. CredentialsModePanel, BucketsPanel)
@@ -98,47 +76,6 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { refresh(); }, []);
-
-  const handleSavePolicies = async () => {
-    setPolicySaving(true);
-    try {
-      const bp: Record<string, { compression?: boolean; max_delta_ratio?: number; backend?: string; alias?: string; public_prefixes?: string[] }> = {};
-      for (const p of bucketPolicies) {
-        if (!p.name) continue;
-        // Preserve the `[""]` sentinel (entire-bucket-public shorthand
-        // that the backend normalises to/from `public: true`). Only
-        // strip genuinely-empty-by-accident rows by checking whether
-        // the user left ANY prefix non-empty or stuck with the lone
-        // empty-string sentinel.
-        const prefixes = p.public_prefixes;
-        const isEntireBucket = prefixes.length === 1 && prefixes[0] === '';
-        const filtered = isEntireBucket ? [''] : prefixes.filter(s => s.length > 0);
-
-        bp[p.name] = {
-          compression: p.compression,
-          ...(p.max_delta_ratio != null ? { max_delta_ratio: p.max_delta_ratio } : {}),
-          ...(p.backend ? { backend: p.backend } : {}),
-          ...(p.alias ? { alias: p.alias } : {}),
-          ...(filtered.length > 0 ? { public_prefixes: filtered } : {}),
-          ...(p.quota_bytes != null ? { quota_bytes: p.quota_bytes } : {}),
-        };
-      }
-      await updateAdminConfig({ bucket_policies: bp });
-      setPolicyDirty(false);
-      setSaveResult({ ok: true, message: 'Bucket policies saved' });
-    } catch (e) {
-      setSaveResult({ ok: false, message: e instanceof Error ? e.message : 'Save failed' });
-    } finally {
-      setPolicySaving(false);
-    }
-  };
-
-  const updatePolicy = (idx: number, patch: Partial<typeof bucketPolicies[number]>) => {
-    const next = [...bucketPolicies];
-    next[idx] = { ...next[idx], ...patch };
-    setBucketPolicies(next);
-    setPolicyDirty(true);
-  };
 
   const handleCreate = async () => {
     setSaving(true);
@@ -307,6 +244,12 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
   };
 
   const globalCompressionOn = (config?.max_delta_ratio ?? 0.75) > 0;
+  const bucketPolicyEntries = Object.entries(config?.bucket_policies || {});
+  const routedPolicies = bucketPolicyEntries.filter(([, policy]) => Boolean(policy.backend));
+  const publicPolicies = bucketPolicyEntries.filter(
+    ([, policy]) => policy.public === true || (policy.public_prefixes && policy.public_prefixes.length > 0)
+  );
+  const quotaPolicies = bucketPolicyEntries.filter(([, policy]) => policy.quota_bytes != null);
 
   if (loading) {
     return <div style={{ display: 'flex', justifyContent: 'center', padding: 64 }}><Spin /></div>;
@@ -480,133 +423,45 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
           </div>
         )}
 
-        {/* Per-Bucket Policies */}
+        {/* Bucket policy summary — Buckets owns the editor. */}
         <div style={cardStyle}>
           <SectionHeader
             icon={<FolderOutlined />}
-            title="Per-Bucket Policies"
-            description="Override compression, backend routing, or aliasing for specific buckets."
+            title="Bucket policy routing"
+            description="Per-bucket routing, compression, aliases, quotas, and public read live in the Buckets page."
           />
-
-          {bucketPolicies.map((bp, idx) => (
-            <div key={idx} style={{
-              marginTop: idx === 0 ? 12 : 8, padding: '10px 12px',
-              border: `1px solid ${bp.compression ? colors.BORDER : colors.ACCENT_AMBER + '66'}`,
-              borderRadius: 8,
-              background: bp.compression ? colors.BG_ELEVATED : colors.ACCENT_AMBER + '0a',
-            }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-                {backends.length > 0 && (
-                  <SimpleSelect
-                    value={bp.backend}
-                    onChange={(v) => updatePolicy(idx, { backend: v })}
-                    placeholder="Backend"
-                    allowClear
-                    size="small"
-                    style={{ width: 170 }}
-                    options={backends.map(b => ({ value: b.name, label: b.name, sublabel: b.backend_type }))}
-                  />
-                )}
-                <SimpleAutoComplete
-                  value={bp.name}
-                  onChange={(v) => updatePolicy(idx, { name: v.toLowerCase().replace(/[^a-z0-9.-]/g, '') })}
-                  options={availableBuckets.filter(b => !bucketPolicies.some((p, i) => i !== idx && p.name === b))}
-                  placeholder="Bucket name"
-                  style={{ flex: 1 }}
-                />
-                <Button size="small" danger icon={<DeleteOutlined />} onClick={() => { setBucketPolicies(bucketPolicies.filter((_, i) => i !== idx)); setPolicyDirty(true); }} />
+          <div style={{ marginTop: 12, display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 8 }}>
+            {[
+              ['Policies', bucketPolicyEntries.length, 'custom bucket rows'],
+              ['Routed', routedPolicies.length, 'non-default backend'],
+              ['Public', publicPolicies.length, 'anonymous read'],
+              ['Quotas', quotaPolicies.length, 'quota limits'],
+            ].map(([label, value, hint]) => (
+              <div
+                key={label}
+                style={{
+                  border: `1px solid ${colors.BORDER}`,
+                  borderRadius: 8,
+                  padding: '10px 12px',
+                  background: colors.BG_ELEVATED,
+                }}
+              >
+                <div style={{ fontSize: 18, fontWeight: 700, color: colors.TEXT_PRIMARY }}>{value}</div>
+                <div style={{ fontSize: 11, fontWeight: 700, color: colors.TEXT_MUTED, textTransform: 'uppercase', letterSpacing: 0.6 }}>{label}</div>
+                <div style={{ fontSize: 11, color: colors.TEXT_MUTED, marginTop: 2 }}>{hint}</div>
               </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <Switch checked={bp.compression} onChange={(v) => updatePolicy(idx, { compression: v })} size="small" />
-                  <Text style={{ fontSize: 12, fontFamily: 'var(--font-ui)', color: bp.compression ? colors.TEXT_PRIMARY : colors.ACCENT_AMBER }}>
-                    {bp.compression ? 'Compression' : 'No compression'}
-                  </Text>
-                </div>
-                {bp.compression && (
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                    <Text style={{ fontSize: 11, color: colors.TEXT_MUTED }}>Threshold:</Text>
-                    <InputNumber value={bp.max_delta_ratio ?? undefined} onChange={(v) => updatePolicy(idx, { max_delta_ratio: v ?? null })} min={0} max={1} step={0.05} placeholder="global" style={{ width: 80, ...inputRadius }} size="small" />
-                  </div>
-                )}
-                <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                  <Text style={{ fontSize: 11, color: colors.TEXT_MUTED }}>Alias:</Text>
-                  <Input value={bp.alias} onChange={(e) => updatePolicy(idx, { alias: e.target.value })} placeholder="same as bucket" style={{ width: 130, ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 11 }} size="small" />
-                </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                  <Text style={{ fontSize: 11, color: bp.quota_bytes != null ? colors.ACCENT_AMBER : colors.TEXT_MUTED }}>Quota:</Text>
-                  <InputNumber
-                    value={bp.quota_bytes != null ? Math.round(bp.quota_bytes / (1024 * 1024 * 1024)) : undefined}
-                    onChange={(v) => updatePolicy(idx, { quota_bytes: v != null ? v * 1024 * 1024 * 1024 : null })}
-                    min={0}
-                    placeholder="unlimited"
-                    style={{ width: 90, ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 11 }}
-                    size="small"
-                    addonAfter="GB"
-                  />
-                </div>
-              </div>
-              {/* Public Prefixes */}
-              <div style={{ marginTop: 8, paddingTop: 8, borderTop: `1px solid ${colors.BORDER}` }}>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
-                  <Text style={{ fontSize: 11, fontWeight: 600, color: bp.public_prefixes.length > 0 ? colors.ACCENT_AMBER : colors.TEXT_MUTED, fontFamily: 'var(--font-ui)' }}>
-                    Public Prefixes {bp.public_prefixes.length > 0 && `(${bp.public_prefixes.length})`}
-                  </Text>
-                  <Button type="text" size="small" icon={<PlusOutlined />} onClick={() => {
-                    updatePolicy(idx, { public_prefixes: [...bp.public_prefixes, ''] });
-                  }} style={{ fontSize: 10, color: colors.TEXT_MUTED, padding: '0 4px' }}>Add</Button>
-                </div>
-                {bp.public_prefixes.map((prefix, pi) => (
-                  <div key={pi} style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 3 }}>
-                    <Input
-                      value={prefix}
-                      onChange={(e) => {
-                        const next = [...bp.public_prefixes];
-                        next[pi] = e.target.value;
-                        updatePolicy(idx, { public_prefixes: next });
-                      }}
-                      onBlur={(e) => {
-                        // Auto-append trailing '/' if missing (UX nudge)
-                        const v = e.target.value;
-                        if (v && !v.endsWith('/')) {
-                          const next = [...bp.public_prefixes];
-                          next[pi] = v + '/';
-                          updatePolicy(idx, { public_prefixes: next });
-                        }
-                      }}
-                      placeholder="e.g. builds/"
-                      style={{ flex: 1, ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 11 }}
-                      size="small"
-                    />
-                    <Button type="text" size="small" danger onClick={() => {
-                      const next = bp.public_prefixes.filter((_, i) => i !== pi);
-                      updatePolicy(idx, { public_prefixes: next });
-                    }} style={{ padding: '0 4px', minWidth: 0 }}>×</Button>
-                  </div>
-                ))}
-                {bp.public_prefixes.length > 0 && (
-                  <Text style={{ fontSize: 10, color: colors.ACCENT_AMBER, fontFamily: 'var(--font-ui)', display: 'block', marginTop: 2 }}>
-                    Objects under these prefixes are publicly accessible without authentication.
-                  </Text>
-                )}
-              </div>
-            </div>
-          ))}
-
+            ))}
+          </div>
           <Button
-            icon={<PlusOutlined />}
-            onClick={() => { setBucketPolicies([...bucketPolicies, { name: '', compression: true, max_delta_ratio: null, backend: '', alias: '', public_prefixes: [], quota_bytes: null }]); setPolicyDirty(true); }}
-            style={{ marginTop: 12, borderRadius: 8, fontFamily: 'var(--font-ui)', fontWeight: 600 }}
-            block type="dashed"
+            type="primary"
+            ghost
+            icon={<FolderOutlined />}
+            onClick={() => navigate('admin/configuration/storage/buckets')}
+            style={{ marginTop: 12, borderRadius: 8, fontWeight: 600 }}
+            block
           >
-            Add Bucket Policy
+            Open bucket policies
           </Button>
-
-          {policyDirty && (
-            <Button type="primary" onClick={handleSavePolicies} loading={policySaving} style={{ marginTop: 12, borderRadius: 8, fontWeight: 600 }} block>
-              Save Bucket Policies
-            </Button>
-          )}
         </div>
 
       </Space>

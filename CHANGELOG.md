@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Marketing site + release docs refresh
+
+- Added a GitHub Pages marketing minisite under `marketing/` with SSG,
+  sitemap/robots generation, SEO smoke checks, strict screenshot validation,
+  and a dedicated `marketing-pages` workflow.
+- Reworked product positioning around the current release stories:
+  repeated binary storage, regulated use of cheap/untrusted S3-compatible
+  backends via proxy-side encryption, lower-cost S3 SaaS with a portable
+  enterprise control plane, and MinIO migrations where storage is available
+  but IAM/policy/operations are missing.
+- Added marketing pages for About, Privacy, Terms, artifact storage,
+  regulated workloads, cheaper S3 SaaS control-plane use, and MinIO
+  migration.
+- Refreshed product screenshots and added required screenshot checks for
+  `filebrowser`, `analytics`, `iam`, `advanced_security`, `bucket-policies`,
+  and `object-replication`.
+- Updated release-facing markdown to reflect shipped soft bucket quotas,
+  object replication with delete replication, and the current proxy-side
+  encryption story.
+
 ### Fourth-wave correctness fixes (SigV4 integrity + replication provenance + stubs)
 
 Eight findings from the latest review. Two highs are silent
@@ -230,13 +250,14 @@ storage:
         exclude_globs: [".dg/*"]
 ```
 
-**Scope deferred to a later commit stream:**
-- Background scheduler loop (today, only `run-now` triggers the
-  worker). Periodic ticks, continuation-token resumption of long
-  runs, graceful shutdown are planned but not yet wired.
-- Delete replication (`replicate_deletes: true` is validated but
-  not implemented by the worker).
-- Multi-hop copies or the admin UI panel.
+**Scope that landed in follow-up commit streams:**
+- Background scheduler loop, periodic ticks, continuation-token
+  resumption of long runs, and graceful shutdown.
+- Delete replication (`replicate_deletes: true`) with provenance
+  markers so only objects written by the same rule are delete
+  candidates.
+- Admin UI panel for object replication. Multi-hop copies remain out
+  of scope.
 
 Dependency added: `humantime = "2"`.
 

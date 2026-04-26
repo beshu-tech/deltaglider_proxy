@@ -1,5 +1,12 @@
 # Per-Bucket Storage Quota
 
+> **Status:** shipped. This planning note is kept for archaeology only.
+> Current operator docs live in
+> [`docs/product/10-first-bucket.md`](../docs/product/10-first-bucket.md#soft-quota-write-limit)
+> and [`docs/product/reference/configuration.md`](../docs/product/reference/configuration.md).
+> The shipped feature is a **soft** per-bucket write limit backed by
+> the cached usage scanner; `quota_bytes: 0` freezes a bucket.
+
 ## Value Proposition
 
 Limit storage consumption per bucket. Leverages the existing `UsageScanner` which already computes per-bucket sizes with a cached tree structure (5-minute TTL, 1000-entry LRU).
@@ -25,9 +32,7 @@ Limit storage consumption per bucket. Leverages the existing `UsageScanner` whic
 
 ## What's Needed
 
-1. `quota_bytes` field on `BucketPolicyConfig` (serde, TOML)
-2. One check in PUT handler: `if quota && usage + body.len() > quota → QuotaExceeded`
-3. Admin GUI: input field + progress bar on bucket policy card
+Shipped; see the status note above.
 
 ## Delta Compression Interaction
 

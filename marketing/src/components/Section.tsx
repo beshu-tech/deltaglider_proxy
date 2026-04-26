@@ -16,7 +16,7 @@ export function Section({
   children,
 }: SectionProps): JSX.Element {
   return (
-    <section id={id} className="mx-auto max-w-5xl px-6 py-14 sm:py-20">
+    <section id={id} className="mx-auto max-w-6xl px-6 py-14 sm:py-20">
       {eyebrow && (
         <div className="text-xs font-bold uppercase tracking-widest text-brand-600 dark:text-brand-300">
           {eyebrow}

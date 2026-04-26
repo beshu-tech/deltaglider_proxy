@@ -406,7 +406,8 @@ pub struct ReplicationRule {
     pub include_globs: Vec<String>,
 
     /// Optional globset: keys matching any of these patterns are
-    /// skipped. Default excludes DG internals (`.dg/*`).
+    /// skipped. Defaults exclude DeltaGlider-managed config-sync prefix
+    /// (`.deltaglider/**`).
     #[serde(default = "default_exclude_globs")]
     pub exclude_globs: Vec<String>,
 }
@@ -420,7 +421,7 @@ fn default_batch_size() -> u32 {
 }
 
 fn default_exclude_globs() -> Vec<String> {
-    vec![".dg/*".to_string()]
+    vec![".deltaglider/**".to_string()]
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -1349,7 +1350,7 @@ mod tests {
             replicate_deletes: false,
             conflict: ConflictPolicy::NewerWins,
             include_globs: Vec::new(),
-            exclude_globs: vec![".dg/*".to_string()],
+            exclude_globs: default_exclude_globs(),
         }
     }
 

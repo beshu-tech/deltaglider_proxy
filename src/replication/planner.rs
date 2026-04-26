@@ -30,7 +30,7 @@ pub enum SkipReason {
     DestExists,
     /// Object excluded by glob patterns.
     Excluded,
-    /// Key is a DeltaGlider internal (reference.bin, .dg/ marker, etc.).
+    /// Key is a DeltaGlider-managed internal (`.deltaglider/`).
     DgInternal,
     /// Directory marker (zero-byte key ending in `/`). We don't
     /// replicate these — the dest recreates them on-demand.
@@ -166,8 +166,10 @@ pub fn should_replicate(
         };
     }
 
-    // DeltaGlider internals: never leak across replication.
-    if source_key.starts_with(".dg/") || source_key.contains("/.dg/") {
+    // DeltaGlider config-sync internals: never leak across replication.
+    // Storage-layer delta artifacts (`reference.bin`, `*.delta`) are
+    // filtered before planner input by the engine listing.
+    if source_key.starts_with(".deltaglider/") || source_key.contains("/.deltaglider/") {
         return Decision::Skip {
             reason: SkipReason::DgInternal,
         };
@@ -386,17 +388,19 @@ mod tests {
     }
 
     #[test]
-    fn should_replicate_excludes_dg_internals() {
+    fn should_replicate_excludes_deltaglider_config_sync_prefix() {
         let rule = default_rule();
         let (inc, exc) = compile_rule_globs(&rule).unwrap();
         let src = make_meta("x", 1, Utc.timestamp_opt(0, 0).unwrap());
-        let d = should_replicate(".dg/reference.bin", &src, None, rule.conflict, &inc, &exc);
-        assert!(matches!(
-            d,
-            Decision::Skip {
-                reason: SkipReason::DgInternal
-            }
-        ));
+        for key in [".deltaglider/config.db", "nested/.deltaglider/config.db"] {
+            let d = should_replicate(key, &src, None, rule.conflict, &inc, &exc);
+            assert!(matches!(
+                d,
+                Decision::Skip {
+                    reason: SkipReason::DgInternal
+                }
+            ));
+        }
     }
 
     #[test]

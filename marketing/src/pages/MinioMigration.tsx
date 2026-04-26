@@ -1,7 +1,7 @@
 import { FeatureCard } from '../components/FeatureCard';
 import { Hero } from '../components/Hero';
 import { MailtoCTA } from '../components/MailtoCTA';
-import { RoadmapRibbon } from '../components/RoadmapRibbon';
+import { ScreenshotFrame } from '../components/ScreenshotFrame';
 import { SEO } from '../components/SEO';
 import { Section } from '../components/Section';
 import { minioMigrationMeta } from '../seo/pages';
@@ -9,14 +9,29 @@ import { REPO_URL } from '../seo/schema';
 
 const SUBJECT = 'MinIO migration';
 
+const SCENARIOS = [
+  {
+    title: 'Storage exists. Control is missing.',
+    body: 'You can find younger OSS object stores that move bytes. The hard part is getting IAM, policy, quotas, replication, and operator workflows in one place.',
+  },
+  {
+    title: 'IAM semantics are sticky',
+    body: 'Applications already rely on per-user keys, groups, prefixes, and conditional access. Rebuilding that around a storage-only server slows the migration.',
+  },
+  {
+    title: 'Operations need guardrails',
+    body: 'Cutovers need soft quotas, bucket freeze, sync state, replication history, and a UI operators can understand under pressure.',
+  },
+];
+
 export function MinioMigration(): JSX.Element {
   return (
     <>
       <SEO meta={minioMigrationMeta} />
       <Hero
         eyebrow="Use case · MinIO migration"
-        headline="If you liked MinIO's ABAC and hated its licensing drama — this is your off-ramp."
-        subhead="MinIO's license and feature changes left teams with production workloads and no clean path forward. Most alternatives drop the IAM sophistication. We didn't."
+        headline="Self-hosted S3 without losing the control plane."
+        subhead="MinIO refugees can find storage engines. What is usually missing is the enterprise control plane: IAM, OAuth, ABAC, bucket policy, quotas, replication, sync, and an operator UI."
         cta={
           <>
             <MailtoCTA
@@ -26,90 +41,139 @@ export function MinioMigration(): JSX.Element {
           </>
         }
         illustration={
-          <img
+          <ScreenshotFrame
             src="screenshots/iam.jpg"
             alt="DeltaGlider Proxy IAM user management"
-            loading="eager"
-            className="block w-full h-auto"
+            priority
           />
         }
       />
       <Section
-        eyebrow="The problem"
-        title="You built workflows around MinIO's IAM. Now you can't move."
-        intro="Most S3-compatible servers have a bucket-policy mindset. You need per-user keys, groups, OIDC sign-in, conditional policies — the things you actually use in production."
+        eyebrow="The gap"
+        title="Storage alone is not enough."
+        intro="The replacement must preserve the operational contract around S3, not only store objects."
       >
-        <></>
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          {[
+            'Per-user S3 access keys',
+            'Groups with inherited permissions',
+            'ABAC policies in AWS IAM grammar',
+            'OAuth/OIDC login and claim mapping',
+            'Public read-only prefixes',
+            'Soft per-bucket quotas and bucket freeze',
+            'Bucket routing aliases',
+            'Object replication rules',
+            'Encrypted multi-instance config DB sync',
+          ].map((item) => (
+            <div
+              key={item}
+              className="rounded-xl border border-ink-200 bg-white px-4 py-3 text-sm font-semibold text-ink-800 dark:border-ink-700 dark:bg-ink-800/50 dark:text-ink-100"
+            >
+              <span className="mr-2 text-brand-600 dark:text-brand-300">✓</span>
+              {item}
+            </div>
+          ))}
+        </div>
       </Section>
       <Section
-        eyebrow="What ships today"
-        title="The MinIO IAM features you actually relied on."
+        eyebrow="Real-world scenarios"
+        title="Why MinIO migrations get stuck."
+        intro="The data path is only one part of the product. The control plane is what keeps production usable."
+      >
+        <div className="grid gap-5 md:grid-cols-3">
+          {SCENARIOS.map((scenario) => (
+            <FeatureCard
+              key={scenario.title}
+              title={scenario.title}
+              body={scenario.body}
+            />
+          ))}
+        </div>
+      </Section>
+      <Section
+        eyebrow="IAM"
+        title="Enterprise access control for applications and teams."
       >
         <div className="grid gap-5 md:grid-cols-2">
           <FeatureCard
-            title="Per-user S3 credentials, groups, ABAC"
+            title="Per-user credentials"
             body={
               <>
-                Per-user access key + secret pairs. Groups with inherited
-                permissions. ABAC policies in AWS IAM grammar (parsed by{' '}
-                <code className="text-sm">iam-rs</code>) including IP-range and
-                prefix conditions. Same mental model as MinIO's policy engine,
-                same mental model as AWS.
+                Give applications their own S3 keys. Use groups, inherited
+                permissions, prefix conditions, and source-IP conditions.
               </>
             }
             sourceLabel="src/iam/permissions.rs"
             sourceHref={`${REPO_URL}/blob/main/src/iam/permissions.rs`}
           />
           <FeatureCard
-            title="Encrypted SQLCipher config DB"
+            title="Encrypted config DB"
             body={
               <>
-                Users, groups, OAuth providers, and policies live in an encrypted
-                SQLCipher database. You bring the passphrase. The DB syncs across
-                instances via S3 (encrypted blob, ETag-based) so you can run
-                multiple proxies behind a load balancer.
+                Users, groups, OAuth providers, and policies live in SQLCipher.
+                Sync the encrypted DB across multiple proxy instances.
               </>
             }
             sourceLabel="src/config_db_sync.rs"
             sourceHref={`${REPO_URL}/blob/main/src/config_db_sync.rs`}
           />
           <FeatureCard
-            title="OAuth / OIDC with group mapping"
+            title="OAuth and OIDC"
             body={
               <>
-                Plug in Google, GitHub, your corporate OIDC provider. Map
-                provider claims onto DeltaGlider Proxy groups. Admin GUI walks
-                you through the mapping rules — no YAML editing required.
+                Connect a provider and map claims to DeltaGlider groups from
+                the admin UI.
               </>
             }
           />
           <FeatureCard
-            title="Single binary, S3 on the wire"
+            title="No client rewrite"
             body={
               <>
-                Drop in alongside your existing infrastructure. No client
-                changes, no SDK swaps, no rewrites. The proxy speaks SigV4 and
-                serves a path-style or virtual-host-style S3 endpoint.
+                Keep existing SDKs and tools. The proxy speaks S3 with SigV4,
+                so storage migration does not become an application migration.
               </>
             }
           />
         </div>
       </Section>
       <Section
-        eyebrow="On the way"
-        title="What's next on the migration roadmap."
+        eyebrow="Bucket policy"
+        title="Bucket controls stay in the control plane."
+        intro="Configure compression, aliases, public prefixes, soft quotas, and read-only freeze per bucket."
       >
-        <RoadmapRibbon
-          title="Per-bucket quotas"
-          body="Set a hard byte limit per bucket; the proxy refuses PUTs once the budget is hit. The underlying usage scanner is already in production for analytics; the quota check itself is small. Designed; not yet shipped."
-          href={`${REPO_URL}/blob/main/future/QUOTA.md`}
-          hrefLabel="future/QUOTA.md"
+        <ScreenshotFrame
+          src="screenshots/bucket-policies.jpg"
+          alt="DeltaGlider Proxy per-bucket policy editor"
+          caption="Bucket policy covers compression, aliases, public prefixes, soft quotas, and frozen buckets."
         />
       </Section>
       <Section
+        eyebrow="Quotas"
+        title="Soft write limits per bucket."
+        intro="Use soft quotas to control growth. Set quota to zero to freeze a bucket during migration."
+      >
+        <div className="grid gap-5 md:grid-cols-3">
+          <FeatureCard
+            title="Soft cap"
+            body="Set `quota_bytes` on a bucket. Writes above scanned usage are rejected."
+            sourceLabel="docs/product/10-first-bucket.md"
+            sourceHref={`${REPO_URL}/blob/main/docs/product/10-first-bucket.md`}
+          />
+          <FeatureCard
+            title="Freeze mode"
+            body="Set `quota_bytes: 0` to block writes while reads continue."
+          />
+          <FeatureCard
+            title="Operator-visible"
+            body="Quota is managed next to bucket policy, aliases, and public prefixes."
+          />
+        </div>
+      </Section>
+      <Section
         eyebrow="Next step"
-        title="Send us your IAM export and we'll tell you what's portable."
-        intro="If you've got a MinIO IAM export and want a sanity check on what'll port cleanly versus what needs a rewrite, send it over."
+        title="Map the control plane before moving bytes."
+        intro="Share the IAM, bucket policy, quota, replication, and operator workflows you use today. We will map what ports cleanly and what needs adjustment."
       >
         <MailtoCTA subject={SUBJECT} label="Email us" />
       </Section>

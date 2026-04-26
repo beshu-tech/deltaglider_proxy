@@ -31,21 +31,22 @@ const OG_LANDING = `${SITE_URL}/screenshots/filebrowser.jpg`;
 const OG_REGULATED = `${SITE_URL}/screenshots/advanced_security.jpg`;
 const OG_VERSIONING = `${SITE_URL}/screenshots/analytics.jpg`;
 const OG_MINIO = `${SITE_URL}/screenshots/iam.jpg`;
+const OG_S3_SAAS = `${SITE_URL}/screenshots/bucket-policies.jpg`;
 
 export const landingMeta: PageMeta = {
   path: '/',
-  title: 'DeltaGlider Proxy — S3-compatible storage up to 10× cheaper',
+  title: 'DeltaGlider Proxy — smaller S3-compatible object storage',
   description:
-    'An S3-compatible proxy that makes cloud storage up to 10× cheaper through transparent delta compression. Drop-in SigV4, ABAC IAM, AES-256-GCM encryption at rest. Open source.',
+    'An S3-compatible proxy that stores repeated binaries as compact deltas. Includes IAM, OAuth, soft quotas, replication, encryption, metrics, and audit controls.',
   ogImage: OG_LANDING,
   jsonLd: [organization(), website(), softwareApplication()],
 };
 
 export const regulatedMeta: PageMeta = {
   path: '/regulated/',
-  title: 'Regulated workloads — encryption at rest, keys you own',
+  title: 'Regulated workloads — S3-compatible storage with local control',
   description:
-    'DeltaGlider Proxy for compliance-first teams: AES-256-GCM encryption at rest with a key that never leaves your environment, ABAC IAM, encrypted multi-instance config sync.',
+    'DeltaGlider Proxy lets regulated teams use cheaper or untrusted S3-compatible storage by encrypting before the backend while keys stay in the trusted environment.',
   ogImage: OG_REGULATED,
   jsonLd: [
     organization(),
@@ -57,7 +58,7 @@ export const regulatedMeta: PageMeta = {
       {
         question: 'Where does the encryption key live?',
         answer:
-          'The encryption key is supplied at process start via the DGP_ENCRYPTION_KEY environment variable. The key is held in memory only; it is never written to the storage backend, never sent to AWS KMS, and is zeroized on shutdown.',
+          'The encryption key is supplied at process start via the DGP_ENCRYPTION_KEY environment variable. The key is held in the trusted runtime only; it is never written to the storage backend, never sent to AWS KMS, and is zeroized on shutdown.',
       },
       {
         question: 'What encryption algorithm is used at rest?',
@@ -65,9 +66,9 @@ export const regulatedMeta: PageMeta = {
           'AES-256-GCM with a per-object 12-byte random IV and 16-byte authentication tag. Encryption is implemented in src/storage/encrypting.rs.',
       },
       {
-        question: 'Can DeltaGlider Proxy replicate data across clouds?',
+        question: 'Can DeltaGlider Proxy replicate data across backends?',
         answer:
-          'Eventually-consistent cross-backend replication is designed and tracked in future/REPLICATION.md. It is not yet shipped; encryption at rest and multi-instance config sync are shipped today.',
+          'Yes. Object replication rules copy objects between configured buckets or prefixes, keep runtime state and failures in the encrypted config database, and can optionally replicate deletes for objects previously written by the rule.',
       },
       {
         question: 'How do you enforce per-user access?',
@@ -79,22 +80,27 @@ export const regulatedMeta: PageMeta = {
 };
 
 export const versioningMeta: PageMeta = {
-  path: '/versioning/',
-  title: 'Artifact versioning — up to 95% less S3 spend on binaries',
+  path: '/artifact-storage/',
+  title: 'Artifact storage — reduce storage for binary-similar versions',
   description:
-    'DeltaGlider Proxy for CI/CD teams: transparent xdelta3 compression on versioned artifacts (JAR, tar, zip, ISO, SQL dumps). Drop-in S3 API, live savings analytics, no client changes.',
+    'DeltaGlider Proxy stores binary-similar backups, software catalogs, media assets, and AI model variants as compact deltas behind an S3-compatible API.',
   ogImage: OG_VERSIONING,
   jsonLd: [
     organization(),
     breadcrumb([
       { name: 'Home', path: '/' },
-      { name: 'Artifact versioning', path: '/versioning/' },
+      { name: 'Artifact storage', path: '/artifact-storage/' },
     ]),
     faqPage([
       {
+        question: 'Is this S3 object versioning?',
+        answer:
+          'No. DeltaGlider Proxy does not expose S3 version IDs or restore old object versions today. This page is about reducing storage for repeated artifact releases with transparent delta compression.',
+      },
+      {
         question: 'Which file types benefit from delta compression?',
         answer:
-          'Versioned archives and binaries whose successive versions share most of their bytes: .zip, .tar, .tgz, .tar.gz, .tar.bz2, .jar, .war, .ear, .sql, .dump, .bak, .backup, .rar, .7z, .dmg, .iso.',
+          'The default delta candidates include archives and binary dumps such as .zip, .tar, .jar, .sql, .dump, .dmg, and .iso. The list is configurable. Actual benefit depends on internal file structure and binary similarity across versions, which is common in backup archives, software catalogs, media asset variants, and AI model variants.',
       },
       {
         question: 'What about images, video, or already-compressed content?',
@@ -117,9 +123,9 @@ export const versioningMeta: PageMeta = {
 
 export const minioMigrationMeta: PageMeta = {
   path: '/minio-migration/',
-  title: 'MinIO migration — drop-in S3 proxy with ABAC IAM',
+  title: 'MinIO migration — self-hosted S3 with an enterprise control plane',
   description:
-    'For teams leaving MinIO: a single-binary S3-compatible proxy with ABAC IAM, OAuth/OIDC group mapping, encrypted config database. No license drama, no rewrites.',
+    'For MinIO refugees: self-hosted S3-compatible storage with the enterprise control plane younger OSS object stores often lack: IAM, OAuth, quotas, policy, replication, and operator UI.',
   ogImage: OG_MINIO,
   jsonLd: [
     organization(),
@@ -131,7 +137,7 @@ export const minioMigrationMeta: PageMeta = {
       {
         question: 'Is DeltaGlider Proxy a drop-in replacement for MinIO?',
         answer:
-          'For the S3 protocol and IAM shape, yes. DeltaGlider Proxy speaks SigV4, supports per-user access keys, groups, and ABAC policies in AWS IAM grammar. Existing clients do not need changes.',
+          'For common S3 workflows and the IAM/control-plane shape, yes. DeltaGlider Proxy speaks SigV4 and supports per-user access keys, groups, ABAC policies, OAuth/OIDC mapping, bucket policy, quotas, and replication controls.',
       },
       {
         question: 'What ABAC features are supported?',
@@ -148,6 +154,83 @@ export const minioMigrationMeta: PageMeta = {
         answer:
           'Yes. OAuth and OIDC providers are configurable via the admin GUI, with group-mapping rules that translate provider claims into DeltaGlider Proxy groups.',
       },
+      {
+        question: 'Are per-bucket quotas implemented?',
+        answer:
+          'Yes. Bucket policies support quota_bytes as a soft write limit backed by the usage scanner. Setting quota_bytes to 0 freezes a bucket for read-only migration windows.',
+      },
+    ]),
+  ],
+};
+
+export const s3SaasMeta: PageMeta = {
+  path: '/s3-saas-control-plane/',
+  title: 'Cheaper S3 SaaS — enterprise control plane for lower-cost storage',
+  description:
+    'Use lower-cost S3-compatible storage without giving up enterprise controls. DeltaGlider adds local-key encryption, IAM, OAuth, bucket policy, quotas, replication, audit, and operator UI.',
+  ogImage: OG_S3_SAAS,
+  jsonLd: [
+    organization(),
+    breadcrumb([
+      { name: 'Home', path: '/' },
+      { name: 'Cheaper S3 SaaS', path: '/s3-saas-control-plane/' },
+    ]),
+    faqPage([
+      {
+        question: 'Why not just use a cheaper S3-compatible provider directly?',
+        answer:
+          'Many lower-cost S3-compatible providers are good at basic object storage but do not provide the enterprise control plane teams expect from AWS S3. DeltaGlider adds local-key encryption, IAM, OAuth/OIDC mapping, bucket policy, soft quotas, replication, metrics, audit, and operator UI in front of the backend.',
+      },
+      {
+        question: 'Does DeltaGlider replace the storage backend?',
+        answer:
+          'No. DeltaGlider is a proxy and control-plane layer. Applications speak S3 to DeltaGlider, and DeltaGlider stores data in the backend you choose.',
+      },
+    ]),
+  ],
+};
+
+export const aboutMeta: PageMeta = {
+  path: '/about/',
+  title: 'About DeltaGlider Proxy — built by Beshu Tech',
+  description:
+    'DeltaGlider Proxy is an open-source S3-compatible storage proxy from Beshu Tech, with commercial support and services available separately.',
+  ogImage: OG_LANDING,
+  jsonLd: [
+    organization(),
+    breadcrumb([
+      { name: 'Home', path: '/' },
+      { name: 'About', path: '/about/' },
+    ]),
+  ],
+};
+
+export const privacyMeta: PageMeta = {
+  path: '/privacy/',
+  title: 'Privacy Policy — DeltaGlider Proxy',
+  description:
+    'Privacy policy for the DeltaGlider Proxy marketing site and business contact channels.',
+  ogImage: OG_LANDING,
+  jsonLd: [
+    organization(),
+    breadcrumb([
+      { name: 'Home', path: '/' },
+      { name: 'Privacy Policy', path: '/privacy/' },
+    ]),
+  ],
+};
+
+export const termsMeta: PageMeta = {
+  path: '/terms/',
+  title: 'Terms of Service — DeltaGlider Proxy',
+  description:
+    'Terms for use of the DeltaGlider Proxy marketing site. Software use is governed by the repository license unless a separate agreement applies.',
+  ogImage: OG_LANDING,
+  jsonLd: [
+    organization(),
+    breadcrumb([
+      { name: 'Home', path: '/' },
+      { name: 'Terms of Service', path: '/terms/' },
     ]),
   ],
 };
@@ -157,4 +240,8 @@ export const allPages: readonly PageMeta[] = [
   regulatedMeta,
   versioningMeta,
   minioMigrationMeta,
+  s3SaasMeta,
+  aboutMeta,
+  privacyMeta,
+  termsMeta,
 ];

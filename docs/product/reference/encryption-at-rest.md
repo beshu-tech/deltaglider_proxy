@@ -8,7 +8,7 @@ This page is operational-depth reference for the encryption-at-rest feature: whi
 
 - Encryption is **per-backend**, not global. Each backend in `storage.backends[]` (or the singleton `storage.backend`) carries its own `encryption` block.
 - Four mutually-exclusive modes: `none`, `aes256-gcm-proxy`, `sse-kms`, `sse-s3`. Pick one per backend.
-- **Use `aes256-gcm-proxy`** when you want the proxy to hold the key (filesystem backends, or S3 backends where you don't trust the provider). Compression gains are preserved — xdelta3 runs before AES-GCM.
+- **Use `aes256-gcm-proxy`** when you want the proxy to hold the key (filesystem backends, or S3-compatible backends where you don't trust the provider with plaintext). Compression gains are preserved — xdelta3 runs before AES-GCM.
 - **Use `sse-kms`** when you want AWS to manage the key via KMS. Your KMS IAM policy is the security boundary; the proxy never sees key material.
 - **Use `sse-s3`** when you want AWS-managed at-rest encryption with no KMS cost/complexity.
 - **Use `none`** for public-CDN buckets or workloads where plaintext on disk is acceptable.
@@ -73,7 +73,8 @@ Is the backend an S3 bucket?
     │   └── Use `sse-s3`. AWS handles keys entirely. No per-request
     │       KMS API cost; no CloudTrail per decrypt.
     └── Do you distrust the S3 provider (third-party, compliance)?
-        └── Use `aes256-gcm-proxy`. The provider never sees plaintext.
+        └── Use `aes256-gcm-proxy`. The provider never sees plaintext
+            object bodies; the key stays in your trusted runtime.
             Cost: proxy CPU + memory for the encrypt/decrypt path.
 ```
 
@@ -538,7 +539,7 @@ No. Encryption is backend-scoped; every bucket routed to a backend uses that bac
 
 ### Does compression still work with encryption?
 
-Yes. xdelta3 runs FIRST on delta-eligible files (archives, db dumps, versioned binaries), then the encrypting wrapper encrypts the delta bytes. Compression ratios are preserved exactly; the ciphertext is just the encrypted wrapping of what the delta codec already produced.
+Yes. xdelta3 runs FIRST on delta-eligible repeated binary workloads (backup archives, software catalogs, AI model variants, archives, db dumps), then the encrypting wrapper encrypts the delta bytes. Compression ratios are preserved exactly; the ciphertext is just the encrypted wrapping of what the delta codec already produced.
 
 ### How much does proxy-AES cost in CPU?
 

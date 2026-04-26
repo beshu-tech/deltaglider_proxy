@@ -5,7 +5,9 @@ This tree splits into two audiences, enforced by CI so it can't drift:
 - **[product/](product/)** — operator-facing, bundled into the running binary at `/_/docs/`. Install, configure, secure, run, debug. If you operate an instance, this is what you read.
 - **[dev/](dev/)** — contributor-facing, **never** bundled. Build from source, release workflow, CI infrastructure, historical design docs.
 
-`screenshots/` is shared — the same images ship in the binary (via `demo/s3-browser/ui/public/screenshots/`) and render on GitHub.
+`screenshots/` is shared — the same images ship in the binary (via `demo/s3-browser/ui/public/screenshots/`) and render on GitHub. The marketing site also copies from this directory at build time and fails if the required product screenshots are missing or smaller than 900×700:
+`filebrowser.jpg`, `analytics.jpg`, `iam.jpg`, `advanced_security.jpg`,
+`bucket-policies.jpg`, and `object-replication.jpg`.
 
 ## Product docs index
 

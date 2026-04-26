@@ -138,7 +138,7 @@ List operations on public prefixes return *only* the public subtree — the rest
 
 ## Soft quota (write limit)
 
-Hard cap on writes into a bucket:
+Soft write limit for a bucket:
 
 ```yaml
 # validate
@@ -148,7 +148,7 @@ storage:
       quota_bytes: 5368709120   # 5 GB
 ```
 
-PUT requests that would exceed the quota are rejected with 403. Quota is **soft** — it reads from the 5-minute-cached usage scanner, so a burst of concurrent writes can overshoot by up to 5 minutes of throughput. For a hard cap, enforce at the reverse proxy.
+PUT requests that would exceed the quota are rejected with 403. Quota is **soft** — it reads from the 5-minute-cached usage scanner, so a burst of concurrent writes can overshoot by up to 5 minutes of throughput. For a strict hard cap, enforce at the reverse proxy or storage-provider layer.
 
 `quota_bytes: 0` freezes the bucket — all writes blocked. Useful for read-only migrations.
 

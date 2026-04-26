@@ -1,7 +1,7 @@
 import { FeatureCard } from '../components/FeatureCard';
 import { Hero } from '../components/Hero';
 import { MailtoCTA } from '../components/MailtoCTA';
-import { RoadmapRibbon } from '../components/RoadmapRibbon';
+import { ScreenshotFrame } from '../components/ScreenshotFrame';
 import { SEO } from '../components/SEO';
 import { Section } from '../components/Section';
 import { regulatedMeta } from '../seo/pages';
@@ -9,14 +9,40 @@ import { REPO_URL } from '../seo/schema';
 
 const SUBJECT = 'Regulated workloads inquiry';
 
+const CONTROLS = [
+  'AES-256-GCM proxy-side encryption at rest',
+  'Key supplied from your environment',
+  'Encrypted SQLCipher IAM/config database',
+  'ABAC permissions with source-IP and prefix conditions',
+  'Public read-only prefixes for controlled publishing',
+  'Soft bucket quotas and bucket freeze',
+  'Object replication through the engine',
+  'Audit ring and Prometheus metrics',
+];
+
+const SCENARIOS = [
+  {
+    title: 'Untrusted low-cost SaaS',
+    body: 'A regulated team wants ultra-cheap S3-compatible storage, but cannot trust the provider with plaintext. DeltaGlider encrypts before the backend; the key stays on trusted premises.',
+  },
+  {
+    title: 'Partner downloads',
+    body: 'A release bucket needs public read-only access for a few prefixes, while everything else remains private behind IAM.',
+  },
+  {
+    title: 'Secondary copy requirements',
+    body: 'A regulated workload needs a cloud copy or offsite prefix. Replication runs through the proxy, so encryption and compression behavior stay consistent.',
+  },
+];
+
 export function Regulated(): JSX.Element {
   return (
     <>
       <SEO meta={regulatedMeta} />
       <Hero
         eyebrow="Use case · regulated workloads"
-        headline="Your data never leaves your key. Your key never leaves your premises."
-        subhead="Compliance teams reject public-cloud S3 because customer-managed keys end up inside AWS KMS. DeltaGlider Proxy encrypts every object with a key that lives in your environment — and only your environment."
+        headline="Use cheap storage without trusting the storage provider."
+        subhead="DeltaGlider encrypts objects before they reach the backend. The cryptographic key stays in your trusted environment, while compression can further reduce the storage bill."
         cta={
           <>
             <MailtoCTA
@@ -26,61 +52,81 @@ export function Regulated(): JSX.Element {
           </>
         }
         illustration={
-          <img
+          <ScreenshotFrame
             src="screenshots/advanced_security.jpg"
             alt="DeltaGlider Proxy advanced security settings"
-            loading="eager"
-            className="block w-full h-auto"
+            priority
           />
         }
       />
       <Section
-        eyebrow="The problem"
-        title="On-prem is expensive. Public S3 is non-negotiable for legal."
-        intro="So you're stuck running storage you'd rather not own, paying egress for replication, and explaining to auditors why your KMS provider sees every encryption decision."
+        eyebrow="Controls"
+        title="Controls built into the proxy."
+        intro="The storage provider sees ciphertext. Your runtime keeps the key, policy, and operational controls."
       >
-        <></>
+        <div className="grid gap-3 sm:grid-cols-2">
+          {CONTROLS.map((control) => (
+            <div
+              key={control}
+              className="rounded-xl border border-ink-200 bg-white px-4 py-3 text-sm font-semibold text-ink-800 dark:border-ink-700 dark:bg-ink-800/50 dark:text-ink-100"
+            >
+              <span className="mr-2 text-brand-600 dark:text-brand-300">✓</span>
+              {control}
+            </div>
+          ))}
+        </div>
       </Section>
       <Section
-        eyebrow="What ships today"
-        title="Three things you need before legal will sign."
+        eyebrow="Real-world scenarios"
+        title="Common compliance patterns."
+        intro="The proxy is useful when storage policy needs to stay close to your runtime, not hidden inside one vendor account."
+      >
+        <div className="grid gap-5 md:grid-cols-3">
+          {SCENARIOS.map((scenario) => (
+            <FeatureCard
+              key={scenario.title}
+              title={scenario.title}
+              body={scenario.body}
+            />
+          ))}
+        </div>
+      </Section>
+      <Section
+        eyebrow="Evidence"
+        title="Security features with code behind them."
       >
         <div className="grid gap-5 md:grid-cols-3">
           <FeatureCard
-            title="AES-256-GCM, key from your environment"
+            title="Proxy-side encryption"
             body={
               <>
-                The encryption key is supplied at process start via{' '}
-                <code className="text-sm">DGP_ENCRYPTION_KEY</code>. It is held
-                in memory only — never written to the storage backend, never
-                sent to AWS KMS, zeroized on shutdown. Per-object 12-byte random
-                IV plus 16-byte auth tag.
+                Objects are encrypted with AES-256-GCM before they reach the
+                backend. The key is supplied via{' '}
+                <code className="text-sm">DGP_ENCRYPTION_KEY</code> and never
+                leaves your trusted runtime environment.
               </>
             }
             sourceLabel="src/storage/encrypting.rs"
             sourceHref={`${REPO_URL}/blob/main/src/storage/encrypting.rs`}
           />
           <FeatureCard
-            title="Encrypted IAM database"
+            title="Encrypted config database"
             body={
               <>
-                Users, groups, ABAC policies, and OAuth providers live in an
-                encrypted SQLCipher database. The passphrase is yours. The
-                database can be synced across multiple proxy instances via S3 as
-                an encrypted blob, with ETag-based polling for hot reload.
+                Users, groups, policies, and OAuth providers live in SQLCipher.
+                The encrypted DB can sync across proxy instances through S3.
               </>
             }
             sourceLabel="src/config_db_sync.rs"
             sourceHref={`${REPO_URL}/blob/main/src/config_db_sync.rs`}
           />
           <FeatureCard
-            title="ABAC, AWS-grammar policies"
+            title="ABAC access control"
             body={
               <>
                 Per-user S3 credentials, groups, prefix-scoped resources, and
-                conditions on IP ranges and prefix patterns. Parsed by{' '}
-                <code className="text-sm">iam-rs</code>: same policy grammar as
-                AWS IAM, so your existing review process still applies.
+                conditions on IP ranges and prefixes using AWS-style policy
+                grammar.
               </>
             }
             sourceLabel="src/iam/permissions.rs"
@@ -89,20 +135,20 @@ export function Regulated(): JSX.Element {
         </div>
       </Section>
       <Section
-        eyebrow="On the way"
-        title="What's next on the regulated roadmap."
+        eyebrow="Object replication"
+        title="Copy data through the same control plane."
+        intro="Replication rules copy objects between buckets or backends while preserving proxy-side encryption and compression behavior."
       >
-        <RoadmapRibbon
-          title="Cross-backend replication"
-          body="Eventually-consistent replication to a secondary backend (primary fast/local, secondary durable/cloud). Per-bucket configuration, in-process queue, crash-safe via SQLite-persisted state. Designed; not yet shipped."
-          href={`${REPO_URL}/blob/main/future/REPLICATION.md`}
-          hrefLabel="future/REPLICATION.md"
+        <ScreenshotFrame
+          src="screenshots/object-replication.jpg"
+          alt="DeltaGlider Proxy object replication configuration"
+          caption="Pause rules, run now, review history and failures, and replicate deletes when needed."
         />
       </Section>
       <Section
         eyebrow="Next step"
-        title="Tell us about your compliance perimeter."
-        intro="If you have data classification rules, residency constraints, or KMS posture we should design around, send a short note. We answer."
+        title="Map your storage controls."
+        intro="Send the requirements that matter: keys, identity, quotas, replication, audit, and deployment constraints."
       >
         <MailtoCTA subject={SUBJECT} label="Email us" />
       </Section>

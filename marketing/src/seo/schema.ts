@@ -93,7 +93,7 @@ export function softwareApplication(
     '@type': 'SoftwareApplication',
     name: PRODUCT_NAME,
     description:
-      'An S3-compatible proxy that makes cloud storage up to 10× cheaper through transparent delta compression, with drop-in SigV4 authentication, ABAC IAM, and AES-256-GCM encryption at rest.',
+      'An S3-compatible proxy that reduces storage growth with transparent delta compression, IAM, OAuth, quotas, object replication, metrics, audit, and encryption at rest.',
     applicationCategory: 'DeveloperApplication',
     operatingSystem: 'Linux, macOS',
     url: `${SITE_URL}/`,

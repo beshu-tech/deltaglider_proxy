@@ -274,7 +274,7 @@ export function StorageOverview({ onNavigateAdmin, onSessionExpired }: OverviewP
     {
       title: 'Backends',
       blurb:
-        'Default storage backend (filesystem or S3-compatible) plus named backends for multi-target routing. Per-bucket policies can route individual buckets to a named backend.',
+        'Default storage backend (filesystem or S3-compatible), named backend targets, connection tests, and encryption-at-rest.',
       icon: <DatabaseOutlined />,
       path: 'configuration/storage/backends',
       summary: `${backendType === 's3' ? 'S3' : 'Filesystem'} default · ${namedBackendCount} named`,
@@ -290,12 +290,20 @@ export function StorageOverview({ onNavigateAdmin, onSessionExpired }: OverviewP
           ? 'No overrides'
           : `${buckets.length} bucket${buckets.length === 1 ? '' : 's'} with policies`,
     },
+    {
+      title: 'Object replication',
+      blurb:
+        'One-way scheduled object copy between buckets or prefixes. Rules go through the engine, so encryption and delta compression stay transparent.',
+      icon: <SyncOutlined />,
+      path: 'configuration/storage/replication',
+      summary: 'Rules, run history, failures',
+    },
   ];
 
   return (
     <SectionOverview
       title="Storage"
-      description="Where data physically lives, and how this proxy treats it. Backend(s) + per-bucket overrides (compression, public read, quota, routing)."
+      description="Where data physically lives, how buckets are treated, and how objects move between storage locations."
       icon={<CloudServerOutlined />}
       yamlPath="storage.*"
       stats={stats}
@@ -388,7 +396,7 @@ export function AdvancedOverview({ onNavigateAdmin, onSessionExpired }: Overview
     {
       title: 'Config DB sync',
       blurb:
-        'Replicate the encrypted IAM database to an S3 bucket so multiple proxy instances share users / groups / OAuth providers.',
+        'Replicate the encrypted IAM/config database to S3 so proxy instances share users, groups, and OAuth providers. Separate from object replication.',
       icon: <SyncOutlined />,
       path: 'configuration/advanced/sync',
       summary: configSyncEnabled ? `Bucket: ${config.config_sync_bucket}` : 'Disabled',

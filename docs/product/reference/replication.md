@@ -16,12 +16,16 @@ Replication lives at the engine seam: source GET plaintext →
 destination PUT plaintext. Each side decides independently whether
 to delta-compress and which encryption mode to apply.
 
+![Object replication settings](/_/screenshots/object-replication.jpg)
+
 ## v1 scope
 
-- One-way, scheduled, bucket-level (operator-triggered via admin API
-  in this commit; the periodic scheduler lands in a follow-up).
+- One-way, scheduled, bucket/prefix-level replication. Operators can
+  also trigger a rule immediately through the admin API or GUI.
 - At-least-once semantics. Conflict policies: `newer-wins` (default),
   `source-wins`, `skip-if-dest-exists`.
+- Optional delete replication for destination objects previously
+  written by the same rule.
 - Optional include / exclude glob filters per rule.
 - Static validation at config load: rule-name regex, humantime
   interval parsing, self-loop rejection, multi-hop cycle detection.
@@ -49,7 +53,7 @@ storage:
         replicate_deletes: false
         conflict: newer-wins
         include_globs: []
-        exclude_globs: [".dg/*"]
+        exclude_globs: [".deltaglider/**"]
 ```
 
 Rule-name grammar: `[A-Za-z0-9_.-]{1,64}`. Name is also the primary
@@ -91,10 +95,25 @@ operator-level storage config). Response shapes are JSON.
 | `source-wins` | Always copy, overwriting destination. |
 | `skip-if-dest-exists` | Never copy when destination exists. Useful for seed-once rules. |
 
+## Delete replication
+
+When `replicate_deletes: true`, a run also checks the rule's
+previously-written destination objects. If the corresponding source
+object no longer exists, the worker deletes the destination copy.
+
+The guardrail is provenance: delete replication only targets objects
+that carry this rule's replication marker. Manually-created destination
+objects and objects written by a different rule are preserved.
+
 ## What doesn't replicate
 
 - Directory markers (`folder/`) — destination recreates them on-demand.
-- DG internals (`.dg/*`, reference.bin).
+- DeltaGlider-managed config-sync prefix (`.deltaglider/**`). This
+  protects `.deltaglider/config.db` when the same bucket is also used
+  for user data.
+- Storage-layer delta artifacts (`reference.bin`, `*.delta`) are not
+  normally visible to replication because the engine listing filters
+  them before planning.
 - Anything matched by `exclude_globs`.
 - When `include_globs` is non-empty, only keys that match at least one
   pattern replicate.
@@ -161,6 +180,3 @@ means:
 
 - Periodic scheduler loop (today only `run-now` triggers).
 - Continuation-token resumption for long runs that straddle ticks.
-- Delete replication (`replicate_deletes: true` is validated but
-  not yet implemented by the worker).
-- Admin UI panel.

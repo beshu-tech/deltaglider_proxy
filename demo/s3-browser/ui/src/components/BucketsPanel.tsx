@@ -18,9 +18,8 @@
  * explicit; the backend's `public: true` shorthand handles the
  * entire-bucket case losslessly.
  *
- * Uses the field-level PATCH API to persist. The section API is
- * overkill here because bucket_policies is the only field this
- * panel writes.
+ * Uses the section-level storage Apply flow so dirty-state indicators,
+ * beforeunload, and Cmd/Ctrl+S behave like the rest of Configuration.
  */
 import { useCallback, useEffect, useState } from 'react';
 import {
@@ -41,8 +40,8 @@ import {
   ExclamationCircleOutlined,
   PlusOutlined,
 } from '@ant-design/icons';
-import type { AdminConfig, BackendInfo } from '../adminApi';
-import { getAdminConfig, getBackends, updateAdminConfig } from '../adminApi';
+import type { AdminConfig, BackendInfo, SectionApplyResponse } from '../adminApi';
+import { getAdminConfig, getBackends, putSection, validateSection } from '../adminApi';
 import { resolveBackendFor, describeEncryption } from '../encryptionUi';
 import { listBuckets } from '../s3client';
 import { useColors } from '../ThemeContext';
@@ -50,6 +49,8 @@ import { useCardStyles } from './shared-styles';
 import SectionHeader from './SectionHeader';
 import SimpleSelect from './SimpleSelect';
 import SimpleAutoComplete from './SimpleAutoComplete';
+import ApplyDialog from './ApplyDialog';
+import { useApplyHandler, useDirtySection } from '../useDirtySection';
 
 const { Text } = Typography;
 
@@ -136,9 +137,18 @@ function rowToPolicy(row: BucketPolicyRow): {
 export default function BucketsPanel({ onSessionExpired }: Props) {
   const { cardStyle, inputRadius } = useCardStyles();
 
-  const [rows, setRows] = useState<BucketPolicyRow[]>([]);
-  const [dirty, setDirty] = useState(false);
-  const [saving, setSaving] = useState(false);
+  const {
+    value: rows,
+    setValue: setRows,
+    isDirty: dirty,
+    discard,
+    markApplied,
+    resetWith,
+  } = useDirtySection<BucketPolicyRow[]>('storage', []);
+  const [applyOpen, setApplyOpen] = useState(false);
+  const [applyResponse, setApplyResponse] = useState<SectionApplyResponse | null>(null);
+  const [pendingBody, setPendingBody] = useState<{ buckets: AdminConfig['bucket_policies'] } | null>(null);
+  const [applying, setApplying] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [backends, setBackends] = useState<BackendInfo[]>([]);
@@ -161,7 +171,7 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
         policyToRow(name, p)
       );
       nextRows.sort((a, b) => a.name.localeCompare(b.name));
-      setRows(nextRows);
+      resetWith(nextRows);
       // Prefer the /api/admin/config response's `backends` array —
       // it synthesises a "default" entry on the singleton-backend
       // path, so the per-bucket encryption badge works uniformly
@@ -171,7 +181,6 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
       setBackends(cfg.backends && cfg.backends.length > 0 ? cfg.backends : bs);
       setDefaultBackend(cfg.default_backend ?? null);
       setAvailableBuckets(realBuckets.map((b) => b.name));
-      setDirty(false);
       setError(null);
     } catch (e) {
       if (e instanceof Error && e.message.includes('401')) {
@@ -184,24 +193,21 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
     } finally {
       setLoading(false);
     }
-  }, [onSessionExpired]);
+  }, [onSessionExpired, resetWith]);
 
   useEffect(() => {
     void refresh();
   }, [refresh]);
 
   const updateRow = (idx: number, patch: Partial<BucketPolicyRow>) => {
-    setRows((r) => {
-      const next = r.slice();
-      next[idx] = { ...next[idx], ...patch };
-      return next;
-    });
-    setDirty(true);
+    const next = rows.slice();
+    next[idx] = { ...next[idx], ...patch };
+    setRows(next);
   };
 
   const addRow = () => {
-    setRows((r) => [
-      ...r,
+    setRows([
+      ...rows,
       {
         name: '',
         compression: true,
@@ -213,7 +219,6 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
         quota_bytes: null,
       },
     ]);
-    setDirty(true);
   };
 
   const deleteRow = (idx: number) => {
@@ -232,13 +237,12 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
       okButtonProps: { danger: true },
       cancelText: 'Cancel',
       onOk: () => {
-        setRows((r) => r.filter((_, i) => i !== idx));
-        setDirty(true);
+        setRows(rows.filter((_, i) => i !== idx));
       },
     });
   };
 
-  const save = async () => {
+  const buildPayload = useCallback((): { buckets: AdminConfig['bucket_policies'] } | null => {
     // Validate — bucket names must be non-empty + lowercase +
     // [a-z0-9.\-] (what the backend accepts). Empty names are
     // genuinely-unfilled rows (just dropped); duplicates surface
@@ -248,26 +252,60 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
     const dupes = names.filter((n, i) => names.indexOf(n) !== i);
     if (dupes.length > 0) {
       message.error(`Duplicate bucket name: ${dupes[0]}`);
-      return;
+      return null;
     }
-    setSaving(true);
+    const bp: AdminConfig['bucket_policies'] = {};
+    for (const row of cleaned) {
+      bp[row.name] = rowToPolicy(row);
+    }
+    return { buckets: bp };
+  }, [rows]);
+
+  const runApply = useCallback(async () => {
+    const body = buildPayload();
+    if (!body) return;
     try {
-      const bp: AdminConfig['bucket_policies'] = {};
-      for (const row of cleaned) {
-        bp[row.name] = rowToPolicy(row);
+      const resp = await validateSection('storage', body);
+      setApplyResponse(resp);
+      setPendingBody(body);
+      setApplyOpen(true);
+    } catch (e) {
+      message.error(`Validate failed: ${e instanceof Error ? e.message : 'unknown'}`);
+    }
+  }, [buildPayload]);
+
+  const confirmApply = useCallback(async () => {
+    if (!pendingBody) return;
+    setApplying(true);
+    try {
+      const resp = await putSection('storage', pendingBody);
+      if (!resp.ok) {
+        message.error(resp.error || 'Apply failed');
+        return;
       }
-      await updateAdminConfig({ bucket_policies: bp });
-      message.success('Bucket policies saved');
-      setDirty(false);
+      message.success(
+        resp.persisted_path ? `Applied + persisted to ${resp.persisted_path}` : 'Applied'
+      );
+      markApplied();
+      setApplyOpen(false);
+      setPendingBody(null);
       await refresh();
     } catch (e) {
-      message.error(
-        `Save failed: ${e instanceof Error ? e.message : 'unknown'}`
-      );
+      message.error(`Apply failed: ${e instanceof Error ? e.message : 'unknown'}`);
+      setApplyOpen(false);
+      setPendingBody(null);
+      await refresh();
     } finally {
-      setSaving(false);
+      setApplying(false);
     }
-  };
+  }, [markApplied, pendingBody, refresh]);
+
+  const cancelApply = useCallback(() => {
+    setApplyOpen(false);
+    setPendingBody(null);
+  }, []);
+
+  useApplyHandler('storage', runApply, dirty);
 
   if (error) {
     return <Alert type="error" showIcon message="Failed to load" description={error} />;
@@ -289,19 +327,19 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
           type="warning"
           showIcon
           message="Unsaved changes"
-          description="Bucket policies persist on save; until then this is a local form state."
+          description="Bucket policies are storage config. Review the section diff before applying."
           action={
             <Space>
-              <Button size="small" onClick={() => void refresh()} disabled={saving}>
+              <Button size="small" onClick={discard} disabled={applying}>
                 Discard
               </Button>
               <Button
                 type="primary"
                 size="small"
-                onClick={save}
-                loading={saving}
+                onClick={runApply}
+                loading={applying}
               >
-                Save
+                Review apply
               </Button>
             </Space>
           }
@@ -351,16 +389,25 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
         {dirty && (
           <Button
             type="primary"
-            onClick={save}
-            loading={saving}
+            onClick={runApply}
+            loading={applying}
             style={{ marginTop: 16, borderRadius: 8, fontWeight: 600 }}
             block
           >
-            Save {rows.filter((r) => r.name.trim()).length} bucket polic
+            Review {rows.filter((r) => r.name.trim()).length} bucket polic
             {rows.filter((r) => r.name.trim()).length === 1 ? 'y' : 'ies'}
           </Button>
         )}
       </div>
+
+      <ApplyDialog
+        open={applyOpen}
+        section="storage"
+        response={applyResponse}
+        onApply={confirmApply}
+        onCancel={cancelApply}
+        loading={applying}
+      />
 
       {/* Informational footer about secret bucket policy mechanics */}
       <Text type="secondary" style={{ fontSize: 11, lineHeight: 1.6 }}>

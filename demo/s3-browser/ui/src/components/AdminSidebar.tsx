@@ -21,6 +21,7 @@
  *   /_/admin/configuration/access/ext-auth
  *   /_/admin/configuration/storage/backends
  *   /_/admin/configuration/storage/buckets
+ *   /_/admin/configuration/storage/replication
  *   /_/admin/configuration/advanced/listener
  *   /_/admin/configuration/advanced/caches
  *   /_/admin/configuration/advanced/limits
@@ -166,6 +167,12 @@ export const ADMIN_IA: Array<{ group: string; entries: SidebarEntry[] }> = [
             path: 'configuration/storage/buckets',
             label: 'Buckets',
             icon: <CloudOutlined />,
+            section: 'storage',
+          },
+          {
+            path: 'configuration/storage/replication',
+            label: 'Object replication',
+            icon: <SyncOutlined />,
             section: 'storage',
           },
           // Encryption-at-rest config — per-backend as of v0.9. Lives
