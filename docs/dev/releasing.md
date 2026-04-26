@@ -31,24 +31,37 @@ Before tagging, update these files to reflect the new version's changes:
 | File | What to update |
 |------|----------------|
 | `CHANGELOG.md` | Add a new `## vX.Y.Z` section at the top with all changes |
-| `docs/METRICS.md` | Any new/changed Prometheus metrics |
-| `docs/OPERATIONS.md` | New operational features, config options, observability |
+| `Cargo.toml` / `Cargo.lock` | After a successful release, bump `package.version` on `main` to the released version so local builds report the current release |
+| `docs/product/reference/metrics.md` | Any new/changed Prometheus metrics |
+| `docs/product/40-monitoring-and-alerts.md` | New operational features, config options, observability |
 | `README.md` | Feature highlights, architecture changes |
 | `CLAUDE.md` | New types, modules, routing, key implementation details |
-| `docs/AUTHENTICATION.md` | Auth changes (if any) |
-| `docs/STORAGE_FORMAT.md` | Storage layout changes (if any) |
+| `docs/product/reference/authentication.md` | Auth changes (if any) |
+| `docs/product/reference/how-delta-works.md` / `docs/product/reference/encryption-at-rest.md` | Storage layout or encryption changes |
 
 Commit the doc updates:
 
 ```bash
-git add CHANGELOG.md docs/ README.md CLAUDE.md
+git add Cargo.toml Cargo.lock CHANGELOG.md docs/ README.md CLAUDE.md
 git commit -m "Update docs for vX.Y.Z release"
 git push origin main
 ```
 
 ### 3. Tag and push
 
-The tag triggers the entire release pipeline. **Do not update `Cargo.toml` manually** — CI stamps the version from the git tag automatically.
+The tag triggers the entire release pipeline. Release CI stamps `Cargo.toml`
+from the git tag inside every build job, so the binaries and Docker images
+report the tag version even if the checked-in `Cargo.toml` still has the
+previous version.
+
+Recommended flow:
+
+1. Tag the commit you want to release.
+2. Let the release workflow finish.
+3. After success, update `Cargo.toml` on `main` to the released version and
+   commit that bookkeeping change. This keeps local source builds and `main`
+   aligned with the latest published release without making the release
+   pipeline depend on a manual version bump.
 
 ```bash
 git tag vX.Y.Z
@@ -116,7 +129,7 @@ You do NOT need to do any of this manually:
 
 | Step | Automated by |
 |------|--------------|
-| Version stamping in `Cargo.toml` | `release.yml` — extracts from git tag, `sed` into Cargo.toml |
+| Version stamping in `Cargo.toml` for release artifacts | `release.yml` — extracts from git tag, `sed` into Cargo.toml inside CI |
 | UI build (`npm ci && npm run build`) | `release.yml` — runs in each build job |
 | Binary compilation (4 targets) | `release.yml` — Linux x86/ARM, macOS Intel/ARM |
 | Binary stripping | `release.yml` — `strip` on each binary |
@@ -135,7 +148,10 @@ We use [semver](https://semver.org/):
 - **MINOR** (`0.X.0`): New features, new metrics, new config options, significant bug fixes
 - **PATCH** (`0.0.X`): Bug fixes, documentation, performance improvements
 
-The version in `Cargo.toml` on `main` stays at the LAST released version. CI stamps the NEW version from the git tag at build time. This means `main` always reflects the latest release, and unreleased work doesn't carry a premature version.
+Release artifacts get their version from the git tag, not from the committed
+`Cargo.toml`. Still, after a successful release, bump `Cargo.toml` on `main`
+to the released version as bookkeeping. That keeps local source builds honest
+while preserving the tag-driven release pipeline.
 
 ## Troubleshooting
 
