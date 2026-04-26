@@ -1,0 +1,96 @@
+name: Tag on Release Merge
+
+# Watches for the merge of a PR titled `chore(release): vX.Y.Z` (the
+# kind opened by `prepare-release.yml`) and tags the merge commit with
+# the matching `vX.Y.Z` tag. Pushing the tag triggers `release.yml`,
+# which produces the artifacts.
+#
+# Why a separate workflow? Keeps `release.yml` narrowly scoped to
+# "tag → artifacts" (the same contract operators use when tagging by
+# hand). The PR review-gate becomes the human checkpoint; tagging is
+# mechanical and instant after merge.
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  tag:
+    name: Tag merge commit
+    # Only run on MERGED release PRs — not just closed-without-merge,
+    # not unrelated PRs. The title-prefix check is the strict guard.
+    if: |
+      github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.title, 'chore(release): v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Tagging needs the merge commit (HEAD on main after merge).
+          # fetch-depth: 0 keeps it cheap and unambiguous.
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: main
+
+      - name: Extract version from PR title
+        id: version
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          # Title shape: `chore(release): vX.Y.Z`
+          # The version portion must be a strict semver to defend
+          # against a typo'd title silently producing a malformed tag.
+          if [[ ! "$PR_TITLE" =~ ^chore\(release\):\ v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "::error::PR title '$PR_TITLE' does not match 'chore(release): vX.Y.Z' — refusing to tag"
+            exit 1
+          fi
+          VERSION="${BASH_REMATCH[1]}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Tagging as v$VERSION"
+
+      - name: Cross-check Cargo.toml matches PR title
+        env:
+          EXPECTED: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          ACTUAL="$(grep -E '^version = ' Cargo.toml | head -1 | sed -E 's/^version = "([^"]+)".*/\1/')"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::Cargo.toml says $ACTUAL but PR title says v$EXPECTED — refusing to tag (the prepare-release PR was edited inconsistently)"
+            exit 1
+          fi
+
+      - name: Refuse if tag already exists
+        env:
+          NEW_TAG: v${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/${NEW_TAG}" >/dev/null 2>&1; then
+            echo "::error::tag ${NEW_TAG} already exists on origin — refusing to overwrite"
+            echo "If this is a re-run after a failed release, delete the tag manually first:"
+            echo "  git push origin :refs/tags/${NEW_TAG}"
+            exit 1
+          fi
+
+      - name: Configure git identity
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Tag and push
+        env:
+          NEW_TAG: v${{ steps.version.outputs.version }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          set -euo pipefail
+          # Tag the actual merge commit (not whatever HEAD looks like
+          # — defensive in case main moved between merge and this job).
+          git tag -a "$NEW_TAG" -m "$NEW_TAG" "$MERGE_SHA"
+          git push origin "$NEW_TAG"
+          echo "Pushed $NEW_TAG → release.yml will build artifacts"

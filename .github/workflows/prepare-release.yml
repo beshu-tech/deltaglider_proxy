@@ -1,0 +1,140 @@
+name: Prepare Release
+
+# Operator-driven release preparation. Bump Cargo.toml + Cargo.lock + the
+# CHANGELOG, then open a PR titled `chore(release): vX.Y.Z`. When the PR
+# merges, `tag-on-merge.yml` picks it up and pushes the tag, which fires
+# `release.yml` for the actual artifact build.
+#
+# This decouples release bookkeeping (version bump, CHANGELOG roll) from
+# the artifact pipeline. The PR is the human-readable record of what's
+# about to ship.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Bump kind: patch | minor | major | explicit X.Y.Z"
+        required: true
+        default: "patch"
+        type: string
+
+permissions: {}
+
+jobs:
+  prepare:
+    name: Prepare release PR
+    runs-on: k3s
+    container:
+      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # We need full history so the bump branch can be pushed without
+          # conflicts and the diff in the PR is clean.
+          fetch-depth: 0
+          # Use a token that can push (default GITHUB_TOKEN works because
+          # we set `contents: write` on this job).
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate input
+        id: input
+        run: |
+          set -euo pipefail
+          BUMP='${{ inputs.bump }}'
+          # Tight allow-list: matches the same regex the script uses,
+          # but we re-validate at the workflow boundary so a bad value
+          # doesn't reach a shell at all.
+          if [[ ! "$BUMP" =~ ^(patch|minor|major|[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "::error::bump must be 'patch', 'minor', 'major', or a semver string like '1.2.3' (got: $BUMP)"
+            exit 1
+          fi
+          echo "bump=$BUMP" >> "$GITHUB_OUTPUT"
+
+      - name: Configure git identity
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Run release-prep script
+        id: prep
+        run: |
+          set -euo pipefail
+          OUT="$(scripts/release-prep.sh '${{ steps.input.outputs.bump }}')"
+          # The script's last line is `NEW_VERSION=X.Y.Z` — extract it.
+          NEW_VERSION="$(echo "$OUT" | tail -1 | sed -E 's/^NEW_VERSION=//')"
+          if [[ ! "$NEW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::release-prep didn't emit a parseable NEW_VERSION (got: $NEW_VERSION)"
+            exit 1
+          fi
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Sanity — diff is non-empty
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "::error::release-prep produced no changes — refusing to open an empty PR"
+            exit 1
+          fi
+          echo "Changed files:"
+          git diff --name-only
+
+      - name: Commit, push branch, open PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW_VERSION: ${{ steps.prep.outputs.version }}
+        run: |
+          set -euo pipefail
+          BRANCH="release/v${NEW_VERSION}"
+
+          # Refuse to overwrite an existing branch — that means a previous
+          # prepare run is still open as a PR.
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "::error::branch $BRANCH already exists on origin — close or merge the existing release PR first"
+            exit 1
+          fi
+
+          git checkout -b "$BRANCH"
+          git add Cargo.toml Cargo.lock CHANGELOG.md
+          git commit -m "chore(release): v${NEW_VERSION}
+
+          Bump version, roll CHANGELOG. Merging this PR fires
+          tag-on-merge.yml, which tags the merge commit and triggers
+          release.yml for the artifact build.
+
+          Prepared by .github/workflows/prepare-release.yml."
+
+          git push origin "$BRANCH"
+
+          # PR body summarises what landed and points the reviewer at
+          # the CHANGELOG section to edit if needed before merge.
+          gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "chore(release): v${NEW_VERSION}" \
+            --body "Automated release preparation.
+
+          ## What this PR does
+
+          - Bumps \`Cargo.toml\` and \`Cargo.lock\` to **v${NEW_VERSION}**
+          - Renames \`## Unreleased\` in \`CHANGELOG.md\` to \`## v${NEW_VERSION} — $(date -u +%Y-%m-%d)\`
+          - Inserts a fresh empty \`## Unreleased\` block above it
+
+          ## Reviewer checklist
+
+          - [ ] CHANGELOG section under \`## v${NEW_VERSION}\` reads correctly (edit on this branch if needed)
+          - [ ] Version bump matches semver intent (patch / minor / major)
+          - [ ] CI is green on this PR
+
+          ## What happens on merge
+
+          \`tag-on-merge.yml\` reads the version from the PR title, tags the
+          merge commit \`v${NEW_VERSION}\`, and pushes it. That fires
+          \`release.yml\` (CI gate → 4-target builds → multi-arch Docker →
+          GitHub Release with SBOM and attestation)."

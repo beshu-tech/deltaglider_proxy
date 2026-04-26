@@ -2,129 +2,137 @@
 
 *Release process, tagging, and Docker builds*
 
-How to cut a new release. The entire build/publish pipeline is automated by
-[`.github/workflows/release.yml`](../../.github/workflows/release.yml) — your
-job is to prepare the code, tag it, and verify.
+How to cut a new release. Three workflows handle the full lifecycle so the
+operator's job is "click Run, review the PR, merge."
+
+```text
+┌──────────────────────────┐  workflow_dispatch
+│ prepare-release.yml      │ ───────────────────► PR titled
+│   bump Cargo.toml        │                      `chore(release): vX.Y.Z`
+│   roll CHANGELOG         │
+│   open PR                │
+└──────────────────────────┘
+                                 reviewer merges PR
+                                 ▼
+┌──────────────────────────┐
+│ tag-on-merge.yml         │
+│   read PR title          │ ───────────────────► tag `vX.Y.Z` pushed
+│   tag merge commit       │
+│   push tag               │
+└──────────────────────────┘
+                                 tag push fires
+                                 ▼
+┌──────────────────────────┐
+│ release.yml              │
+│   CI gate                │
+│   stamp Cargo.toml       │
+│   4-target binaries      │
+│   multi-arch Docker      │
+│   GitHub Release         │ ───────────────────► artifacts on
+│   SBOM + attestation     │                      DockerHub & GH Releases
+│   sync DOCKERHUB.md      │
+└──────────────────────────┘
+```
 
 ## Prerequisites
 
-- Push access to `main` branch
-- All CI checks passing on `main` (fmt, clippy, tests, audit)
-- DockerHub secrets configured in GitHub repo settings (`DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`)
+- Push access to `main` branch (only required to merge the prepare-release PR).
+- All CI checks passing on `main` before kicking off a release.
+- DockerHub secrets configured in GitHub repo settings (`DOCKERHUB_USERNAME`,
+  `DOCKERHUB_TOKEN`). The token needs Read & Write scope on the repo so the
+  description-sync step can PATCH `DOCKERHUB.md` into the hub UI.
 
-## Step-by-step
+## Quick path (recommended)
 
-### 1. Prepare the release on `main`
+### 1. Run `Prepare Release`
 
-Ensure all changes are merged and CI is green:
+GitHub → Actions → **Prepare Release** → Run workflow.
 
-```bash
-git checkout main
-git pull origin main
+Pick a `bump`:
+- `patch` — bug fixes only
+- `minor` — new features, new metrics, new config options
+- `major` — breaking S3 API or storage-format changes
+- explicit `X.Y.Z` — when you want a specific version (e.g. `1.0.0`)
 
-# Verify CI passed on latest commit
-gh run list --limit 1
-```
+The workflow runs [`scripts/release-prep.sh`](../../scripts/release-prep.sh)
+which:
+- Bumps `Cargo.toml` and refreshes `Cargo.lock`.
+- Renames `## Unreleased` in `CHANGELOG.md` to `## vX.Y.Z — YYYY-MM-DD` and
+  inserts a fresh empty `## Unreleased` block above it.
+- Opens a PR titled `chore(release): vX.Y.Z`.
 
-### 2. Update documentation
+### 2. Review the PR
 
-Before tagging, update these files to reflect the new version's changes:
+This is the human checkpoint. Read the diff, edit the CHANGELOG section under
+`## vX.Y.Z` if the auto-rolled content needs polish — e.g. promote a buried
+fix into the headline, drop noise, add a "Breaking changes" section.
 
-| File | What to update |
-|------|----------------|
-| `CHANGELOG.md` | Add a new `## vX.Y.Z` section at the top with all changes |
-| `Cargo.toml` / `Cargo.lock` | After a successful release, bump `package.version` on `main` to the released version so local builds report the current release |
-| `docs/product/reference/metrics.md` | Any new/changed Prometheus metrics |
-| `docs/product/40-monitoring-and-alerts.md` | New operational features, config options, observability |
-| `README.md` | Feature highlights, architecture changes |
-| `CLAUDE.md` | New types, modules, routing, key implementation details |
-| `docs/product/reference/authentication.md` | Auth changes (if any) |
-| `docs/product/reference/how-delta-works.md` / `docs/product/reference/encryption-at-rest.md` | Storage layout or encryption changes |
+If you need to update other doc files for this release (`docs/product/...`,
+`README.md`, `CLAUDE.md`), push the edits onto the same `release/vX.Y.Z`
+branch — they ship as part of the release commit.
 
-Commit the doc updates:
+CI runs against the PR. Wait for green before merging.
 
-```bash
-git add Cargo.toml Cargo.lock CHANGELOG.md docs/ README.md CLAUDE.md
-git commit -m "Update docs for vX.Y.Z release"
-git push origin main
-```
+### 3. Merge
 
-### 3. Tag and push
+Standard merge into `main`. `tag-on-merge.yml` picks it up:
+- Parses `vX.Y.Z` from the PR title.
+- Cross-checks against `Cargo.toml` (refuses if they disagree — defends
+  against a hand-edited PR that drifted).
+- Tags the merge commit with `vX.Y.Z`.
+- Pushes the tag.
 
-The tag triggers the entire release pipeline defined in
-[`.github/workflows/release.yml`](../../.github/workflows/release.yml). Release
-CI stamps `Cargo.toml` from the git tag inside every build job, so the binaries
-and Docker images report the tag version even if the checked-in `Cargo.toml`
-still has the previous version.
+### 4. `release.yml` runs
 
-Recommended flow:
+The tag push fires the existing release pipeline (5 stages, ~50–70 min
+total). Monitor with `gh run list --limit 1` and `gh run watch`.
 
-1. Tag the commit you want to release.
-2. Let the release workflow finish.
-3. After success, update `Cargo.toml` on `main` to the released version and
-   commit that bookkeeping change. This keeps local source builds and `main`
-   aligned with the latest published release without making the release
-   pipeline depend on a manual version bump.
+When done:
+- GitHub Release exists with binaries + checksums + SBOM.
+- DockerHub has `:X.Y.Z`, `:X.Y`, `:X`, `:latest`.
+- DockerHub repo description matches `DOCKERHUB.md` in the tagged commit.
+- Build provenance attestation published.
 
-```bash
-git tag vX.Y.Z
-git push origin vX.Y.Z
-```
-
-### 4. Monitor the pipeline
-
-The release workflow runs 5 stages sequentially:
-
-```
-CI Gate (fmt + clippy + tests + audit)
-  → Validate Release (stamp version, build UI, cargo check)
-    → Build Binaries (4 targets in parallel) + Docker Build (2 platforms)
-      → Create Release (checksums, SBOM, attestation, GitHub Release)
-```
-
-Monitor progress:
+### 5. Verify
 
 ```bash
-# Watch the run
-gh run list --limit 1
-gh run view <run-id>
-
-# Check specific job
-gh run view --job=<job-id>
-```
-
-**Expected timings:**
-- CI Gate: ~5 min
-- Validate: ~7 min
-- Builds: ~6 min (parallel)
-- Docker: ~30-55 min (multi-arch cross-compilation)
-- Create Release: ~5 min (SBOM + attestation)
-- **Total: ~50-70 min**
-
-### 5. Verify the release
-
-After the pipeline completes:
-
-```bash
-# GitHub Release exists with binaries + checksums + SBOM
 gh release view vX.Y.Z
-
-# Docker image is on DockerHub
 docker manifest inspect beshultd/deltaglider_proxy:X.Y.Z
-
-# Docker tags are correct
-# vX.Y.Z → tags: X.Y.Z, X.Y, X, latest
 docker pull beshultd/deltaglider_proxy:X.Y.Z
-docker pull beshultd/deltaglider_proxy:latest
 ```
 
-### 6. Update DockerHub description (manual)
+Smoke-test the new image (`docker run --rm -p 9000:9000 ...`, hit `/_/health`).
 
-The DockerHub repo description is not auto-updated. If `DOCKERHUB.md` changed:
+## Manual fallback
 
-1. Go to https://hub.docker.com/r/beshultd/deltaglider_proxy
-2. Click "Manage Repository" → "Description"
-3. Paste the contents of `DOCKERHUB.md`
+If for any reason the automated flow can't run (workflow disabled, CI broken
+in a way that blocks `prepare-release` itself), you can do everything by hand:
+
+1. On `main`, run the script locally:
+
+   ```bash
+   scripts/release-prep.sh patch   # or minor / major / X.Y.Z
+   git checkout -b release/vX.Y.Z
+   git add Cargo.toml Cargo.lock CHANGELOG.md
+   git commit -m "chore(release): vX.Y.Z"
+   git push origin release/vX.Y.Z
+   gh pr create --base main --title "chore(release): vX.Y.Z" \
+       --body "manual fallback prepare"
+   ```
+
+2. Merge the PR. `tag-on-merge.yml` still runs, so the rest is automated
+   from there.
+
+3. If `tag-on-merge.yml` is also broken, tag the merge commit by hand:
+
+   ```bash
+   git checkout main
+   git pull
+   git tag vX.Y.Z
+   git push origin vX.Y.Z
+   ```
+
+   The tag push fires `release.yml` exactly the same way.
 
 ## What the pipeline does automatically
 
@@ -132,6 +140,10 @@ You do NOT need to do any of this manually:
 
 | Step | Automated by |
 |------|--------------|
+| Version bump in `Cargo.toml`/`Cargo.lock` on `main` | [`.github/workflows/prepare-release.yml`](../../.github/workflows/prepare-release.yml) via [`scripts/release-prep.sh`](../../scripts/release-prep.sh) |
+| `## Unreleased` → `## vX.Y.Z — date` rewrite in CHANGELOG | [`scripts/release-prep.sh`](../../scripts/release-prep.sh) |
+| Open release PR with diff for review | [`.github/workflows/prepare-release.yml`](../../.github/workflows/prepare-release.yml) |
+| Tag the merge commit and push the tag | [`.github/workflows/tag-on-merge.yml`](../../.github/workflows/tag-on-merge.yml) |
 | Version stamping in `Cargo.toml` for release artifacts | [`.github/workflows/release.yml`](../../.github/workflows/release.yml) — extracts from git tag, `sed` into Cargo.toml inside CI |
 | UI build (`npm ci && npm run build`) | [`.github/workflows/release.yml`](../../.github/workflows/release.yml) — runs in each build job |
 | Binary compilation (4 targets) | [`.github/workflows/release.yml`](../../.github/workflows/release.yml) — Linux x86/ARM, macOS Intel/ARM |
@@ -142,31 +154,62 @@ You do NOT need to do any of this manually:
 | SBOM generation | [`.github/workflows/release.yml`](../../.github/workflows/release.yml) — `cargo sbom` (SPDX JSON) |
 | Build provenance attestation | [`.github/workflows/release.yml`](../../.github/workflows/release.yml) — GitHub attestation action |
 | GitHub Release creation | [`.github/workflows/release.yml`](../../.github/workflows/release.yml) — with auto-generated release notes |
+| DockerHub repo description | [`.github/workflows/release.yml`](../../.github/workflows/release.yml) — PATCH `DOCKERHUB.md` via the v2 API |
 
 ## Version numbering
 
 We use [semver](https://semver.org/):
 
-- **MAJOR** (`X.0.0`): Breaking S3 API changes, storage format changes requiring migration
-- **MINOR** (`0.X.0`): New features, new metrics, new config options, significant bug fixes
-- **PATCH** (`0.0.X`): Bug fixes, documentation, performance improvements
+- **MAJOR** (`X.0.0`): Breaking S3 API changes, storage format changes
+  requiring migration.
+- **MINOR** (`0.X.0`): New features, new metrics, new config options,
+  significant bug fixes.
+- **PATCH** (`0.0.X`): Bug fixes, documentation, performance improvements.
 
-Release artifacts get their version from the git tag, not from the committed
-`Cargo.toml`. Still, after a successful release, bump `Cargo.toml` on `main`
-to the released version as bookkeeping. That keeps local source builds honest
-while preserving the tag-driven release pipeline.
+`Cargo.toml` on `main` and the latest tag stay in sync because the bump lands
+in the prepare-release PR BEFORE the tag is created. That eliminates the old
+"sync version after release" bookkeeping commit.
 
 ## Troubleshooting
 
-### CI Gate fails
+### Prepare-release PR opens but CHANGELOG section is empty / wrong
 
-Fix the issue on `main`, push, then delete and re-create the tag:
+You forgot to land any `## Unreleased` entries between releases. The script
+moves whatever is under `## Unreleased` into the dated section verbatim, so an
+empty Unreleased gives an empty release section. Fix it on the PR branch
+(edit CHANGELOG, push) before merging — CI re-runs and the PR keeps working.
+
+### `tag-on-merge.yml` skipped after merge
+
+The PR title has to match `chore(release): vX.Y.Z` exactly. If you renamed
+the PR mid-review, the regex check fails and tagging is skipped (silently —
+intentional, to avoid auto-tagging unrelated PRs). Tag manually:
 
 ```bash
-# Fix the issue
-git push origin main
+git checkout main && git pull
+git tag vX.Y.Z
+git push origin vX.Y.Z
+```
 
-# Move the tag
+### `tag-on-merge.yml` refuses with "Cargo.toml says X but PR title says Y"
+
+Someone edited `Cargo.toml` on the PR branch without keeping the title in
+sync, OR rebased the branch onto a `Cargo.toml` change that hadn't accounted
+for the bump. Fix the inconsistency on the merged commit:
+
+```bash
+git checkout main && git pull
+# Hand-edit Cargo.toml to the right version, regenerate Cargo.lock
+git commit -am "chore(release): align Cargo.toml to vX.Y.Z"
+git tag vX.Y.Z && git push origin vX.Y.Z
+```
+
+### CI Gate (inside `release.yml`) fails
+
+Fix the issue on `main`, push, then move the tag forward:
+
+```bash
+git push origin main
 git tag -d vX.Y.Z
 git push origin :refs/tags/vX.Y.Z
 git tag vX.Y.Z
@@ -175,25 +218,37 @@ git push origin vX.Y.Z
 
 ### Docker build times out
 
-The multi-arch Docker build (especially ARM64 via QEMU) can take 30-55 minutes. This is normal. If it fails:
+The multi-arch Docker build can take 30–55 minutes. This is normal. If it
+fails:
 
-1. Check the job logs for OOM or disk space issues
-2. Re-run the failed job from the GitHub Actions UI
+1. Check the job logs for OOM or disk space issues.
+2. Re-run the failed job from the GitHub Actions UI.
 
 ### Attestation hangs
 
-The `attest-build-provenance` step contacts Sigstore's infrastructure. If it hangs on a self-hosted runner, it may be a network issue. The Docker images and binaries are already published at this point — the release is usable even if attestation fails.
+The `attest-build-provenance` step contacts Sigstore's infrastructure. If it
+hangs on a self-hosted runner, it may be a network issue. The Docker images
+and binaries are already published at this point — the release is usable even
+if attestation fails.
+
+### DockerHub description sync fails
+
+Doesn't fail the release (`continue-on-error: true`). Causes:
+
+- `DOCKERHUB_TOKEN` doesn't have Read & Write scope on the repo. Rotate the
+  token in the secrets store.
+- DockerHub auth API is down. The release is fine; sync the description by
+  hand: hub.docker.com → repo → "Manage repository" → paste `DOCKERHUB.md`.
 
 ### Wrong version tagged
 
 ```bash
 # Delete remote tag
 git push origin :refs/tags/vX.Y.Z
-
 # Delete local tag
 git tag -d vX.Y.Z
-
-# Create correct tag
+# Re-trigger via prepare-release.yml with the correct version,
+# OR tag manually at the right commit:
 git tag vX.Y.Z <correct-commit-sha>
 git push origin vX.Y.Z
 ```

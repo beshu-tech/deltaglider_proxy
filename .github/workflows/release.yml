@@ -447,6 +447,66 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Sync DockerHub repository description
+        # `DOCKERHUB.md` is the source of truth for the repo's "Full
+        # description" on hub.docker.com. Pre-automation, an operator
+        # had to log into the hub UI and paste the file by hand — easy
+        # to forget, easy to drift. This step uploads the file via the
+        # DockerHub v2 API so the description matches what we shipped.
+        #
+        # Auth: same DOCKERHUB_USERNAME + DOCKERHUB_TOKEN secrets used
+        # by the image push. The token must have "Read & Write" scope
+        # on the repository.
+        #
+        # `continue-on-error: true` because a description sync failure
+        # must not fail the release — the artifacts are already
+        # published at this point.
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          REPO: ${{ env.DOCKERHUB_REPO }}
+        run: |
+          set -euo pipefail
+          if [ ! -f DOCKERHUB.md ]; then
+            echo "DOCKERHUB.md missing — skipping description sync"
+            exit 0
+          fi
+
+          # Get a JWT for the v2 API. The image-push login uses the
+          # registry endpoint; for repo-management calls we need
+          # hub.docker.com's `users/login` endpoint.
+          JWT="$(curl -fsS \
+            -H "Content-Type: application/json" \
+            -X POST \
+            -d "{\"username\": \"${DOCKERHUB_USERNAME}\", \"password\": \"${DOCKERHUB_TOKEN}\"}" \
+            https://hub.docker.com/v2/users/login/ \
+            | jq -r .token)"
+
+          if [ -z "$JWT" ] || [ "$JWT" = "null" ]; then
+            echo "::warning::DockerHub login returned no token — description not synced"
+            exit 0
+          fi
+
+          # PATCH the repository's full_description field. The body is
+          # JSON-encoded markdown; we feed the file through `jq` so
+          # newlines / quotes / backslashes are escaped correctly.
+          BODY="$(jq -Rs '{full_description: .}' < DOCKERHUB.md)"
+          HTTP_CODE="$(curl -sS -o /tmp/dh-resp -w '%{http_code}' \
+            -H "Authorization: JWT ${JWT}" \
+            -H "Content-Type: application/json" \
+            -X PATCH \
+            -d "$BODY" \
+            "https://hub.docker.com/v2/repositories/${REPO}/")"
+
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "DockerHub description synced (HTTP $HTTP_CODE)"
+          else
+            echo "::warning::DockerHub description sync returned HTTP $HTTP_CODE"
+            cat /tmp/dh-resp
+          fi
+
       - name: Attest build provenance
         uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
         timeout-minutes: 10
