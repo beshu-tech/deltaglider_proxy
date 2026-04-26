@@ -2,7 +2,9 @@
 
 *Release process, tagging, and Docker builds*
 
-How to cut a new release. The entire build/publish pipeline is automated — your job is to prepare the code, tag it, and verify.
+How to cut a new release. The entire build/publish pipeline is automated by
+[`.github/workflows/release.yml`](../../.github/workflows/release.yml) — your
+job is to prepare the code, tag it, and verify.
 
 ## Prerequisites
 
@@ -49,10 +51,11 @@ git push origin main
 
 ### 3. Tag and push
 
-The tag triggers the entire release pipeline. Release CI stamps `Cargo.toml`
-from the git tag inside every build job, so the binaries and Docker images
-report the tag version even if the checked-in `Cargo.toml` still has the
-previous version.
+The tag triggers the entire release pipeline defined in
+[`.github/workflows/release.yml`](../../.github/workflows/release.yml). Release
+CI stamps `Cargo.toml` from the git tag inside every build job, so the binaries
+and Docker images report the tag version even if the checked-in `Cargo.toml`
+still has the previous version.
 
 Recommended flow:
 
@@ -129,16 +132,16 @@ You do NOT need to do any of this manually:
 
 | Step | Automated by |
 |------|--------------|
-| Version stamping in `Cargo.toml` for release artifacts | `release.yml` — extracts from git tag, `sed` into Cargo.toml inside CI |
-| UI build (`npm ci && npm run build`) | `release.yml` — runs in each build job |
-| Binary compilation (4 targets) | `release.yml` — Linux x86/ARM, macOS Intel/ARM |
-| Binary stripping | `release.yml` — `strip` on each binary |
-| Docker multi-arch build + push | `release.yml` — buildx with QEMU for ARM64 |
-| Docker tags (semver cascade) | `release.yml` — `X.Y.Z`, `X.Y`, `X`, `latest` |
-| SHA256 checksums | `release.yml` — `sha256sum` on all archives |
-| SBOM generation | `release.yml` — `cargo sbom` (SPDX JSON) |
-| Build provenance attestation | `release.yml` — GitHub attestation action |
-| GitHub Release creation | `release.yml` — with auto-generated release notes |
+| Version stamping in `Cargo.toml` for release artifacts | [`.github/workflows/release.yml`](../../.github/workflows/release.yml) — extracts from git tag, `sed` into Cargo.toml inside CI |
+| UI build (`npm ci && npm run build`) | [`.github/workflows/release.yml`](../../.github/workflows/release.yml) — runs in each build job |
+| Binary compilation (4 targets) | [`.github/workflows/release.yml`](../../.github/workflows/release.yml) — Linux x86/ARM, macOS Intel/ARM |
+| Binary stripping | [`.github/workflows/release.yml`](../../.github/workflows/release.yml) — `strip` on each binary |
+| Docker multi-arch build + push | [`.github/workflows/release.yml`](../../.github/workflows/release.yml) — native `amd64`/`arm64` builds plus manifest merge |
+| Docker tags (semver cascade) | [`.github/workflows/release.yml`](../../.github/workflows/release.yml) — `X.Y.Z`, `X.Y`, `X`, `latest` |
+| SHA256 checksums | [`.github/workflows/release.yml`](../../.github/workflows/release.yml) — `sha256sum` on all archives |
+| SBOM generation | [`.github/workflows/release.yml`](../../.github/workflows/release.yml) — `cargo sbom` (SPDX JSON) |
+| Build provenance attestation | [`.github/workflows/release.yml`](../../.github/workflows/release.yml) — GitHub attestation action |
+| GitHub Release creation | [`.github/workflows/release.yml`](../../.github/workflows/release.yml) — with auto-generated release notes |
 
 ## Version numbering
 
