@@ -1,3 +1,2 @@
-- [Admin UI migration](project_admin_overlay_migration.md) — AdminPage embeds SettingsPage for config tabs; SettingsPage is NOT dead code
-- [Architecture analysis](project_architecture_analysis.md) — Codebase hygiene findings: delete_prefix unused, s3.rs is 1646 lines, eprintln usage is intentional
-- [Encryption hygiene review](project_encryption_hygiene.md) — per-backend encryption feature: no `ResolvedEncryption` type (only 2 similar types), real DRY wins are on legacy_key extraction + derive_key_id + chunked decoder loops
+- [Demo UI hygiene review Apr 2026](frontend_hygiene_2026_04.md) — Top 5 demo-browser UI issues; superseded by marketing review for the marketing subtree
+- [Marketing site hygiene Apr 2026](frontend_hygiene_2026_04.md) — Header nav DRY, page-path triple list, About inlines ChecklistGrid, Landing 537 LOC, dark hero duplication
