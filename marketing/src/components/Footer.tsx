@@ -1,5 +1,5 @@
 import { Link } from 'react-router-dom';
-import { CONTACT_EMAIL, ORG_NAME, REPO_URL } from '../seo/schema';
+import { CONTACT_EMAIL, DOCS_PATH, ORG_NAME, REPO_URL } from '../seo/schema';
 
 export function Footer(): JSX.Element {
   return (
@@ -70,6 +70,11 @@ export function Footer(): JSX.Element {
             <div>
               <div className="font-extrabold text-white">Product</div>
               <ul className="mt-3 space-y-2 text-sm font-semibold text-ink-200">
+                <li>
+                  <Link to={DOCS_PATH} className="hover:text-brand-200">
+                    Product docs
+                  </Link>
+                </li>
                 <li>
                   <a
                     href={REPO_URL}

@@ -1,4 +1,4 @@
-//! Lazy bucket replication: scheduled source→destination copies
+//! Lazy bucket replication: run-now source→destination copies
 //! routed through the engine so encryption / delta compression stay
 //! transparent.
 //!
@@ -11,8 +11,8 @@
 //! - `worker` — async copy loop. Calls engine.retrieve on source,
 //!   engine.store on destination. Added later.
 //!
-//! This file today just re-exports the planner; the worker + state
-//! store will follow in subsequent commits per the rollout plan.
+//! The periodic scheduler is still deferred; interval/next_due state is
+//! stored so automatic ticks can be added without changing the rule shape.
 
 pub mod planner;
 pub mod state_store;

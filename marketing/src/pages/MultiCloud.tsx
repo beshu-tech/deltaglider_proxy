@@ -28,7 +28,7 @@ const BACKENDS = [
 const CONTROL_ROWS = [
   ['Bucket aliasing', 'Expose one stable bucket name while routing to different real backend buckets.'],
   ['Unified Access Control', 'Users, groups, S3 keys, OAuth/OIDC mapping, and ABAC stay in one control plane.'],
-  ['Cross-cloud replication', 'Copy objects between buckets or backends with schedule, run history, failures, and optional delete replication.'],
+  ['Cross-cloud replication', 'Copy objects between buckets or backends through run-now rules with history, failures, and optional delete replication.'],
   ['Encryption at rest', 'Encrypt before leaving your premises, then store ciphertext in a cheaper cloud backend.'],
   ['Lifecycle-style retention', 'Keep recent files locally and replicate older data in cheaper cloud storage.'],
   ['Operational evidence', 'Prometheus metrics, audit entries, replication state, and admin UI visibility stay consistent.'],

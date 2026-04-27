@@ -22,7 +22,6 @@ export default function useS3Browser() {
   const [isTruncated, setIsTruncated] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [connected, setConnected] = useState(hasCredentials());
-  const [bucket, setBucketState] = useState(getBucket());
   const [searchQuery, setSearchQuery] = useState('');
   const [showHidden, setShowHiddenState] = useState(() => localStorage.getItem('dg-show-hidden') === 'true');
   const setShowHidden = useCallback((v: boolean) => {
@@ -49,6 +48,7 @@ export default function useS3Browser() {
   const filteredFolders = query ? visibleFolders.filter((f) => f.toLowerCase().includes(query)) : visibleFolders;
 
   const selection = useSelection(filteredObjects, filteredFolders);
+  const { clearSelection, reconcile, selectedKeys } = selection;
 
   /** Clear objects, folders, head cache, and mark as initial load. */
   const resetBrowseState = useCallback(() => {
@@ -58,8 +58,8 @@ export default function useS3Browser() {
     setError(null);
     headInflight.current.clear();
     isInitialLoad.current = true;
-    selection.clearSelection();
-  }, [selection.clearSelection]);
+    clearSelection();
+  }, [clearSelection]);
 
   const refresh = useCallback(() => {
     setRefreshTrigger((k) => k + 1);
@@ -103,7 +103,7 @@ export default function useS3Browser() {
         setIsTruncated(trunc);
         setConnected(true);
         setError(null);
-        selection.reconcile(objs, dirs);
+        reconcile(objs, dirs);
       })
       .catch((err) => {
         if (seq !== loadSeq.current) return; // stale error — drop silently
@@ -117,7 +117,7 @@ export default function useS3Browser() {
         setLoading(false);
         setRefreshing(false);
       });
-  }, [prefix, bucket, selection.reconcile]);
+  }, [prefix, reconcile]);
 
   useEffect(load, [load, refreshTrigger]);
 
@@ -177,7 +177,6 @@ export default function useS3Browser() {
 
   const changeBucket = useCallback((newBucket: string) => {
     setBucket(newBucket);       // Update the s3client's active bucket FIRST
-    setBucketState(newBucket);  // Then update React state
     resetBrowseState();
     setPrefix('');
     setRefreshTrigger((k) => k + 1);
@@ -191,7 +190,7 @@ export default function useS3Browser() {
   }, [resetBrowseState]);
 
   const bulkDelete = useCallback(async () => {
-    if (selection.selectedKeys.size === 0) return;
+    if (selectedKeys.size === 0) return;
     setDeleting(true);
     try {
       // Server-side bulk delete: collect every absolute key, expand
@@ -201,7 +200,7 @@ export default function useS3Browser() {
       // per-folder `deletePrefix` call.
       const bucket = getBucket();
       const allKeys = new Set<string>();
-      for (const k of selection.selectedKeys) {
+      for (const k of selectedKeys) {
         if (k.startsWith('folder:')) {
           const pfx = k.slice('folder:'.length);
           if (!pfx) continue;
@@ -214,21 +213,21 @@ export default function useS3Browser() {
       if (allKeys.size > 0) {
         await bulkDeleteObjects({ bucket, keys: Array.from(allKeys) });
       }
-      selection.clearSelection();
+      clearSelection();
       refresh();
     } catch (e) {
       console.error('Bulk delete failed:', e);
     } finally {
       setDeleting(false);
     }
-  }, [selection.selectedKeys, selection.clearSelection, refresh]);
+  }, [clearSelection, refresh, selectedKeys]);
 
   /** Get all object keys from the selection, expanding folders recursively. */
   /** Resolve selected keys, expanding folders recursively. Deduplicates overlapping folders. */
   const resolveSelectedKeys = useCallback(async (): Promise<string[]> => {
     const keySet = new Set<string>();
     const currentBucket = getBucket();
-    for (const k of selection.selectedKeys) {
+    for (const k of selectedKeys) {
       if (k.startsWith('folder:')) {
         const pfx = k.slice('folder:'.length);
         if (!pfx) continue; // Reject empty prefix to avoid listing entire bucket
@@ -241,7 +240,7 @@ export default function useS3Browser() {
       }
     }
     return Array.from(keySet);
-  }, [selection.selectedKeys]);
+  }, [selectedKeys]);
 
   /**
    * Resolve the selection into [absolute-source-key, relative-dest-suffix] pairs.
@@ -263,7 +262,7 @@ export default function useS3Browser() {
     // an earlier folder already established.
     const seen = new Map<string, string>();
     const currentBucket = getBucket();
-    for (const k of selection.selectedKeys) {
+    for (const k of selectedKeys) {
       if (k.startsWith('folder:')) {
         const pfx = k.slice('folder:'.length);
         if (!pfx) continue; // Reject empty prefix to avoid listing entire bucket
@@ -283,7 +282,7 @@ export default function useS3Browser() {
       }
     }
     return Array.from(seen, ([source, relative]) => ({ source, relative }));
-  }, [selection.selectedKeys]);
+  }, [selectedKeys]);
 
   const bulkCopy = useCallback(async (destBucket: string, destPrefix: string) => {
     // Phase B: server-side orchestration. The proxy's engine handles
@@ -318,10 +317,10 @@ export default function useS3Browser() {
       dest_prefix: destPrefix,
       items: items.map(({ source, relative }) => ({ source_key: source, relative })),
     });
-    selection.clearSelection();
+    clearSelection();
     refresh();
     return { succeeded: result.succeeded, failed: result.failed };
-  }, [resolveSelectionWithRelativeKeys, selection.clearSelection, refresh]);
+  }, [clearSelection, refresh, resolveSelectionWithRelativeKeys]);
 
   const downloadZip = useCallback(async () => {
     // Phase B: archive assembly moves to the proxy. The browser just

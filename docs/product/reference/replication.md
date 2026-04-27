@@ -1,7 +1,9 @@
 # Lazy bucket replication (v1)
 
-*Scheduled source → destination object copy, transparent to
-per-backend encryption and delta compression.*
+*Engine-routed source → destination object copy, transparent to
+per-backend encryption and delta compression. v1 ships run-now,
+pause/resume, state, history, and delete replication; the periodic
+background scheduler is still deferred.*
 
 ## Why it lives in the proxy
 
@@ -20,8 +22,11 @@ to delta-compress and which encryption mode to apply.
 
 ## v1 scope
 
-- One-way, scheduled, bucket/prefix-level replication. Operators can
-  also trigger a rule immediately through the admin API or GUI.
+- One-way, bucket/prefix-level replication through the DeltaGlider
+  engine. Operators trigger a rule through the admin API or GUI.
+- Rules carry `interval` and `next_due_at` state so the model is ready
+  for the background scheduler, but current shipped execution is
+  explicit run-now.
 - At-least-once semantics. Conflict policies: `newer-wins` (default),
   `source-wins`, `skip-if-dest-exists`.
 - Optional delete replication for destination objects previously
@@ -48,7 +53,7 @@ storage:
         destination:
           bucket: backup-artifacts
           prefix: ""                 # optional remap
-        interval: "15m"              # humantime (min 30s)
+        interval: "15m"              # humantime (min 30s; used for next_due_at)
         batch_size: 100              # objects per scheduler yield
         replicate_deletes: false
         conflict: newer-wins
@@ -178,5 +183,6 @@ means:
 
 ## Deferred
 
-- Periodic scheduler loop (today only `run-now` triggers).
 - Continuation-token resumption for long runs that straddle ticks.
+- Periodic scheduler loop that wakes on `tick_interval` and runs due
+  rules automatically.

@@ -66,7 +66,7 @@ const FEATURE_ROWS = [
   {
     category: 'Replication',
     s3: 'Amazon S3 replication rules between buckets/regions/accounts',
-    dgp: 'Object replication rules with schedule, run-now, history, failures, delete replication',
+    dgp: 'Object replication rules with run-now, pause/resume, history, failures, delete replication',
     fit: 'Good',
     note: 'Proxy-managed',
   },

@@ -1,5 +1,6 @@
 import { useRef, useState, useEffect } from 'react';
 import { Layout, Space, Button, Input, theme } from 'antd';
+import type { InputRef } from 'antd';
 import { MenuOutlined, SearchOutlined, CloseOutlined, ReloadOutlined, SunOutlined, MoonOutlined, EyeOutlined, EyeInvisibleOutlined } from '@ant-design/icons';
 import Breadcrumb from './Breadcrumb';
 import { useColors, useTheme } from '../ThemeContext';
@@ -28,7 +29,7 @@ function SearchInput({
   size,
   style,
 }: {
-  inputRef: React.Ref<HTMLInputElement>;
+  inputRef: React.Ref<InputRef>;
   placeholder: string;
   value: string;
   onChange: (value: string) => void;
@@ -39,7 +40,7 @@ function SearchInput({
   const { TEXT_MUTED, BORDER, TEXT_PRIMARY } = useColors();
   return (
     <Input
-      ref={inputRef as React.Ref<any>}
+      ref={inputRef}
       placeholder={placeholder}
       aria-label="Filter objects and folders"
       value={value}
@@ -75,7 +76,7 @@ export default function TopBar({ prefix, onNavigate, isMobile, onMenuClick, onRe
   const { ACCENT_BLUE, TEXT_MUTED, BORDER } = useColors();
   const { isDark, toggleTheme } = useTheme();
   const [searchOpen, setSearchOpen] = useState(false);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<InputRef>(null);
 
   useEffect(() => {
     if (searchOpen) {

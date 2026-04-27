@@ -37,7 +37,7 @@ access:
   iam_users:
     - name: alice
       access_key_id: AKIAALICE0001
-      secret_access_key: ""        # redacted — wire via env
+      secret_access_key: ""        # redacted — materialise before apply
       enabled: true
       groups: [admins]
       permissions: []
@@ -91,14 +91,14 @@ access:
   iam_users:
     - name: alice
       access_key_id: AKIAALICE0001
-      secret_access_key: "${env:DGP_USER_ALICE_SECRET}"
+      secret_access_key: "replace-with-secret-before-apply"
       enabled: true
       groups: ["admins"]        # by NAME, not DB id
       permissions: []           # direct perms on top of group-inherited
 
     - name: bob
       access_key_id: AKIABOB000001
-      secret_access_key: "${env:DGP_USER_BOB_SECRET}"
+      secret_access_key: "replace-with-secret-before-apply"
       enabled: true
       groups: ["readers"]
       permissions:
@@ -113,7 +113,7 @@ access:
       priority: 10
       display_name: "Google Workspace"
       client_id: "11111.apps.googleusercontent.com"
-      client_secret: "${env:DGP_OAUTH_GOOGLE_SECRET}"
+      client_secret: "replace-with-secret-before-apply"
       issuer_url: "https://accounts.google.com"
       scopes: "openid email profile"
 

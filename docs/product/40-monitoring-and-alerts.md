@@ -12,6 +12,7 @@ The full metrics catalog lives at [reference/metrics.md](reference/metrics.md). 
 # validate
 scrape_configs:
   - job_name: deltaglider
+    metrics_path: /_/metrics
     scrape_interval: 15s
     static_configs:
       - targets: ["dgp.example.com:9000"]
@@ -22,6 +23,7 @@ For multiple instances behind a load balancer, use service discovery or list eac
 ```yaml
 scrape_configs:
   - job_name: deltaglider
+    metrics_path: /_/metrics
     scrape_interval: 15s
     static_configs:
       - targets:
@@ -30,7 +32,7 @@ scrape_configs:
           - "dgp-3:9000"
 ```
 
-The `/metrics` endpoint is exempt from SigV4 auth, so Prometheus doesn't need credentials.
+The `/_/metrics` endpoint is exempt from SigV4 auth, so Prometheus doesn't need credentials. Bare `/metrics` is part of the S3-compatible namespace and must not be used for Prometheus scraping.
 
 ### Docker Compose starter (Prometheus + Grafana)
 

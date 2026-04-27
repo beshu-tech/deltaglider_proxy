@@ -8,6 +8,7 @@ import type { S3Object } from '../types';
 import { useColors } from '../ThemeContext';
 import { getPreviewMode } from './FilePreview';
 import { getAdminConfig } from '../adminApi';
+import { useOnClickOutside } from '../useDocumentEvent';
 
 interface BucketPolicyInfo {
   compressionEnabled: boolean;
@@ -89,15 +90,7 @@ function ShareDurationButton({
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
-  // Close on outside click
-  useEffect(() => {
-    if (!open) return;
-    const handler = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener('mousedown', handler);
-    return () => document.removeEventListener('mousedown', handler);
-  }, [open]);
+  useOnClickOutside([ref], () => setOpen(false), open);
 
   return (
     <div ref={ref} style={{ display: 'flex', width: '100%' }}>
@@ -218,6 +211,8 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
   const blobRef = useRef<{ blob: Blob; name: string } | null>(null);
   const [shareDuration, setShareDuration] = useState<number | null>(null);
   const [bucketPolicy, setBucketPolicy] = useState<BucketPolicyInfo | null>(null);
+  const objectKey = object?.key;
+  const cachedHead = objectKey ? headCache?.[objectKey] : undefined;
 
   // Fetch bucket policy (compression + public prefixes) once per bucket
   const lastBucketRef = useRef<string>('');
@@ -238,28 +233,27 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
       });
     }).catch(() => {});
     return () => { cancelled = true; };
-  }, [object?.key]);
+  }, [objectKey]);
 
   useEffect(() => {
-    if (!object) { setHeadData(null); return; }
+    if (!objectKey) { setHeadData(null); return; }
     // Cancellation guard: rapid object switching previously let an older
     // headObject() resolve into the newer object's drawer, showing stale
     // metadata for the wrong file. Capture a flag, only commit when alive.
     let cancelled = false;
     // Seed from table's headCache so Storage Stats renders instantly
-    const cached = headCache?.[object.key];
-    if (cached) {
-      setHeadData({ headers: {}, storageType: cached.storageType, storedSize: cached.storedSize });
+    if (cachedHead) {
+      setHeadData({ headers: {}, storageType: cachedHead.storageType, storedSize: cachedHead.storedSize });
     } else {
       setHeadData(null);
     }
     setHeadLoading(true);
-    headObject(object.key)
+    headObject(objectKey)
       .then((data) => { if (!cancelled) setHeadData(data); })
       .catch(() => { if (!cancelled) setHeadData((prev) => prev ?? { headers: {} }); })
       .finally(() => { if (!cancelled) setHeadLoading(false); });
     return () => { cancelled = true; };
-  }, [object?.key]);
+  }, [cachedHead, objectKey]);
 
   if (!object) return null;
 

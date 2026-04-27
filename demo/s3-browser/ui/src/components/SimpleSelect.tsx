@@ -1,5 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { useColors } from '../ThemeContext';
+import { useEscapeKey, useOnClickOutside } from '../useDocumentEvent';
+import { useFixedOverlayPosition } from '../useFixedOverlayPosition';
 
 /**
  * Self-contained dropdown select. No Ant Design popup layer, no rc-component/trigger,
@@ -33,43 +35,19 @@ export default function SimpleSelect({ value, onChange, options, placeholder, al
   const triggerRef = useRef<HTMLDivElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  const [pos, setPos] = useState({ top: 0, left: 0, width: 0 });
+  const pos = useFixedOverlayPosition(triggerRef, open);
 
   const selected = options.find(o => o.value === value);
   const isSmall = size === 'small';
   const h = isSmall ? 28 : 34;
 
-  // Position dropdown using fixed coordinates from getBoundingClientRect
   useEffect(() => {
-    if (open && triggerRef.current) {
-      const r = triggerRef.current.getBoundingClientRect();
-      setPos({ top: r.bottom + 2, left: r.left, width: r.width });
-      setTimeout(() => inputRef.current?.focus(), 0);
-    }
+    if (open) setTimeout(() => inputRef.current?.focus(), 0);
   }, [open]);
 
-  // Close on outside click
-  useEffect(() => {
-    if (!open) return;
-    const handler = (e: MouseEvent) => {
-      if (triggerRef.current?.contains(e.target as Node)) return;
-      if (dropdownRef.current?.contains(e.target as Node)) return;
-      setOpen(false);
-      setSearch('');
-    };
-    document.addEventListener('mousedown', handler);
-    return () => document.removeEventListener('mousedown', handler);
-  }, [open]);
-
-  // Close on Escape
-  useEffect(() => {
-    if (!open) return;
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') { setOpen(false); setSearch(''); }
-    };
-    document.addEventListener('keydown', handler);
-    return () => document.removeEventListener('keydown', handler);
-  }, [open]);
+  const close = () => { setOpen(false); setSearch(''); };
+  useOnClickOutside([triggerRef, dropdownRef], close, open);
+  useEscapeKey(close, open);
 
   const filtered = options.filter(o =>
     o.label.toLowerCase().includes(search.toLowerCase()) ||

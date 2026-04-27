@@ -58,7 +58,7 @@ The proxy is a single stateful binary. Upgrades are "backup, swap, verify."
 
 Patch and minor upgrades inside the `0.8.x` line are drop-in. The config file format, IAM DB schema, and S3 wire format are stable across `0.8.*`.
 
-**Across minors:** schema migrations run automatically on first start. The config DB is on schema v5 as of v0.8.0; any binary `0.8.0+` migrates forward on boot. **Forward migrations are one-way** — once the DB is on v5, an older binary won't read it.
+**Across minors:** schema migrations run automatically on first start. The config DB is on schema v6 in current builds (v6 adds replication runtime-state tables); any binary `0.8.0+` migrates forward on boot. **Forward migrations are one-way** — once the DB is upgraded, an older binary may not read it.
 
 **Across majors (future 0.x → 1.0):** pre-release — expect breaking changes. Always follow the release notes for that version, and always export a Full Backup before trying it.
 
@@ -166,7 +166,7 @@ When upgrading across instances with `DGP_CONFIG_SYNC_BUCKET` set, the *newer* b
 - **`force_path_style`.** MinIO needs `true`; AWS S3 needs `false`. The migrator preserves whatever the TOML had.
 - **Implicit defaults.** Fields absent from YAML take their default. Don't port fields that were already default in TOML — it clutters the canonical shape.
 - **Admission chain order.** Admission blocks are order-significant. The migrator preserves order; review `admission:` carefully.
-- **`iam_mode: declarative`.** New in v0.8.0. YAML becomes authoritative; admin-API IAM mutations return 403. Only set this *after* seeding the IAM DB via a GUI session or a Full Backup import.
+- **`iam_mode: declarative`.** YAML becomes authoritative for IAM users, groups, OAuth providers, and mapping rules. Admin-API IAM mutations return 403; `/config/apply` reconciles the encrypted DB to YAML atomically. Seed from an existing DB with `GET /_/api/admin/config/declarative-iam-export`, or author IAM directly in YAML.
 
 ### v0.9: per-backend encryption (breaking)
 

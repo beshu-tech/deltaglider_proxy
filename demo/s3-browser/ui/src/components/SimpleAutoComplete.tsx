@@ -1,5 +1,7 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef } from 'react';
 import { useColors } from '../ThemeContext';
+import { useOnClickOutside } from '../useDocumentEvent';
+import { useFixedOverlayPosition } from '../useFixedOverlayPosition';
 
 /**
  * Self-contained autocomplete input. Type to filter, click to select,
@@ -21,28 +23,12 @@ export default function SimpleAutoComplete({ value, onChange, options, placehold
   const wrapRef = useRef<HTMLDivElement>(null);
   const dropRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  const [pos, setPos] = useState({ top: 0, left: 0, width: 0 });
 
   const filtered = options.filter(o => o.toLowerCase().includes(value.toLowerCase()));
   const showDrop = open && focused && filtered.length > 0;
+  const pos = useFixedOverlayPosition(wrapRef, showDrop);
 
-  useEffect(() => {
-    if (showDrop && wrapRef.current) {
-      const r = wrapRef.current.getBoundingClientRect();
-      setPos({ top: r.bottom + 2, left: r.left, width: r.width });
-    }
-  }, [showDrop, value]);
-
-  useEffect(() => {
-    if (!showDrop) return;
-    const handler = (e: MouseEvent) => {
-      if (wrapRef.current?.contains(e.target as Node)) return;
-      if (dropRef.current?.contains(e.target as Node)) return;
-      setOpen(false);
-    };
-    document.addEventListener('mousedown', handler);
-    return () => document.removeEventListener('mousedown', handler);
-  }, [showDrop]);
+  useOnClickOutside([wrapRef, dropRef], () => setOpen(false), showDrop);
 
   return (
     <>

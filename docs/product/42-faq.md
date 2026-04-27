@@ -57,6 +57,83 @@ The extension list is only a starting point. You can add or remove delta candida
 
 What doesn't benefit: already-compressed formats with little cross-version similarity (JPEG, MP4, Zstd, gzip), unique-per-upload binaries (photos, user uploads). For these, the proxy auto-falls-back to passthrough via `max_delta_ratio` — no manual intervention needed.
 
+### Can compressed archives still delta well?
+
+Yes, but the right mental model is precise:
+
+```text
+Given:
+  A ~= B              # original payloads are similar
+  C(A), C(B)          # both compressed the same way
+
+Delta-friendly means:
+  xdelta3(C(A), C(B)) << C(B)
+```
+
+The question is not "is this file compressed?" The question is whether small
+payload changes produce small compressed-byte changes when the same compressor
+configuration is used.
+
+Formats that often work well are compressed containers with stable local
+structure:
+
+- `.zip`, `.jar`, `.war`, `.ear`
+- `.apk`, `.ipa`
+- `.docx`, `.xlsx`, `.pptx`, `.odt`, `.epub`
+- other formats where members or blocks are compressed independently
+
+These can delta well because unchanged members often remain unchanged byte
+regions inside the container. A JAR with 500 class files where 20 change can
+still share most of its compressed bytes with the previous build.
+
+Formats that often do **not** delta well are whole-stream compressed archives:
+
+- `.tar.gz`
+- `.tar.xz`
+- `.tar.zst`
+- single `.gz`, `.xz`, `.zst`, `.br` streams
+- solid `.7z` / `.rar` archives
+
+In these formats, one small change near the beginning can perturb the
+compressor state and shift bytes throughout the rest of the stream.
+
+There is one more subtlety: `xdelta3` itself can detect some externally
+compressed formats such as gzip/xz. By default it may decompress them, compute a
+tiny delta over the uncompressed payload, and recompress on decode. That is
+useful for patch distribution, but not safe for transparent S3 object storage:
+the recompressed file may contain the same extracted data while having different
+bytes and a different checksum.
+
+DeltaGlider therefore uses byte-exact xdelta mode. The invariant is:
+
+```text
+GET object bytes == PUT object bytes
+```
+
+If a format only deltas well after semantic decompress/recompress, DeltaGlider
+will treat it as a poor byte-exact delta candidate and fall back according to
+`max_delta_ratio`.
+
+The practical test for your workload is:
+
+```bash
+xdelta3 -D -e -s old-artifact new-artifact delta.vcdiff
+ratio=$(stat -c%s delta.vcdiff) / $(stat -c%s new-artifact)
+```
+
+As a rule of thumb:
+
+| `delta / original` | Meaning |
+|---:|---|
+| `<= 0.20` | Excellent |
+| `0.20-0.50` | Good |
+| `0.50-0.80` | Marginal |
+| `> 0.80` | Usually passthrough |
+
+So: ZIP/JAR are often good, not because they are magical, but because their
+compressed byte layout often stays locally similar across versions. Whole-stream
+compressed tarballs often are not.
+
 ### Does compression slow things down?
 
 **PUT**: yes, slightly. xdelta3 encode takes CPU. Typical overhead is 10–50ms per uploaded object. Tune `DGP_CODEC_CONCURRENCY` if you have lots of concurrent PUTs.

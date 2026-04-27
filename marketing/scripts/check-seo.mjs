@@ -2,21 +2,10 @@
 import { readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { PAGES } from './page-manifest.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const distDir = join(dirname(here), 'dist');
-
-const PAGES = [
-  { path: 'index.html', label: '/' },
-  { path: 'regulated/index.html', label: '/regulated/' },
-  { path: 'artifact-storage/index.html', label: '/artifact-storage/' },
-  { path: 'minio-migration/index.html', label: '/minio-migration/' },
-  { path: 's3-to-hetzner-wasabi/index.html', label: '/s3-to-hetzner-wasabi/' },
-  { path: 'multi-cloud-control-plane/index.html', label: '/multi-cloud-control-plane/' },
-  { path: 'about/index.html', label: '/about/' },
-  { path: 'privacy/index.html', label: '/privacy/' },
-  { path: 'terms/index.html', label: '/terms/' },
-];
 
 const REQUIRED = [
   { name: 'title', re: /<title[^>]*>[^<]+<\/title>/ },
@@ -37,7 +26,7 @@ const REQUIRED = [
 
 let failures = 0;
 for (const page of PAGES) {
-  const filePath = join(distDir, page.path);
+  const filePath = join(distDir, page.file);
   let html;
   try {
     html = await readFile(filePath, 'utf8');
@@ -59,11 +48,9 @@ for (const page of PAGES) {
     console.log(`✓ ${page.label}: SEO checks passed`);
   }
 
-  const ssgCanary =
-    />Smaller object storage|>Not S3 object versioning|>Use cheap storage without trusting|>Self-hosted S3 without losing|>Use cheaper S3 storage|>Move Amazon S3 data to Hetzner or Wasabi|>One S3 security layer|>Business impact|>DeltaGlider Proxy is built by Beshu Tech|>Privacy Policy|>Terms of Service/;
-  if (!ssgCanary.test(html)) {
+  if (!html.includes(page.canary)) {
     console.error(
-      `✗ ${page.label}: page content not found in raw HTML — SSG may not have pre-rendered`,
+      `✗ ${page.label}: expected content "${page.canary}" not found in raw HTML — SSG may not have pre-rendered the right page`,
     );
     failures += 1;
   }

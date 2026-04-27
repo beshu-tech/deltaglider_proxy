@@ -1,7 +1,9 @@
 import type { RouteRecord } from 'vite-react-ssg';
 import { Navigate } from 'react-router-dom';
 import { Layout } from './components/Layout';
+import { DOCS } from './docs-imports';
 import { About } from './pages/About';
+import { Docs } from './pages/Docs';
 import { Landing } from './pages/Landing';
 import { MinioMigration } from './pages/MinioMigration';
 import { MultiCloud } from './pages/MultiCloud';
@@ -51,6 +53,16 @@ export const routes: RouteRecord[] = [
         Component: MultiCloud,
         entry: 'src/pages/MultiCloud.tsx',
       },
+      {
+        path: 'docs',
+        Component: Docs,
+        entry: 'src/pages/Docs.tsx',
+      },
+      ...DOCS.map((doc): RouteRecord => ({
+        path: `docs/${doc.id}`,
+        element: <Docs initialDocId={doc.id} />,
+        entry: 'src/pages/Docs.tsx',
+      })),
       {
         path: 'about',
         Component: About,

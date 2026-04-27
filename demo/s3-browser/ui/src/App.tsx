@@ -114,8 +114,13 @@ export default function App() {
   const [identity, setIdentity] = useState<WhoamiResponse | null>(null);
 
   const [hasAdminSession, setHasAdminSession] = useState(false);
+  const s3 = useS3Browser();
+  const folderSize = useComputeSize();
+  const reconnectS3 = s3.reconnect;
+  const changeS3Bucket = s3.changeBucket;
+  const cancelFolderSizes = folderSize.cancelAll;
 
-    // Restore credentials from server-side session on mount.
+  // Restore credentials from server-side session on mount.
   // Also check for admin session (OAuth sets a session cookie even if S3 creds
   // don't have permissions — the user IS authenticated, just may lack S3 access).
   useEffect(() => {
@@ -133,27 +138,23 @@ export default function App() {
   // and fetch identity. Runs AFTER React commits the needsConnect state.
   useEffect(() => {
     if (!needsConnect && !sessionLoading) {
-      s3.reconnect();
+      reconnectS3();
       whoami().then(setIdentity);
     } else if (needsConnect) {
       setIdentity(null);
       setHasAdminSession(false);
     }
-  }, [needsConnect, sessionLoading]);
+  }, [needsConnect, reconnectS3, sessionLoading]);
 
   const screens = useBreakpoint();
   const isMobile = !screens.md;
   const mainRef = useRef<HTMLElement>(null);
 
-  const s3 = useS3Browser();
-  const folderSize = useComputeSize();
-
   // Clear folder size computations and preview when prefix or bucket changes
   useEffect(() => {
-    folderSize.cancelAll();
+    cancelFolderSizes();
     setPreviewObject(null);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [s3.prefix]);
+  }, [cancelFolderSizes, s3.prefix]);
 
   // Dynamic page title on view change
   useEffect(() => {
@@ -194,10 +195,10 @@ export default function App() {
     navigate('browse');
   };
 
-  const handleBucketChange = (newBucket: string) => {
-    s3.changeBucket(newBucket);
+  const handleBucketChange = useCallback((newBucket: string) => {
+    changeS3Bucket(newBucket);
     navigate('browse');
-  };
+  }, [changeS3Bucket, navigate]);
 
   const isEmpty = s3.objects.length === 0 && s3.folders.length === 0;
   const isRootBucketEmpty = s3.prefix === '' && !s3.searchQuery && isEmpty && !s3.loading;

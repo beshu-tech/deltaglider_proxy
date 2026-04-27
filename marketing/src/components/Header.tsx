@@ -1,5 +1,176 @@
+import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { REPO_URL } from '../seo/schema';
+import { DOCS_PATH, REPO_URL } from '../seo/schema';
+
+const THEME_STORAGE_KEY = 'dgp-marketing-theme';
+
+type Theme = 'light' | 'dark';
+
+const USE_CASES = [
+  {
+    to: '/regulated/',
+    label: 'Regulated workloads',
+    summary: 'Use cheaper object storage without handing it plaintext or key custody.',
+  },
+  {
+    to: '/artifact-storage/',
+    label: 'Artifact storage',
+    summary: 'Compress repeated builds, backups, dumps, models, and package catalogs.',
+  },
+  {
+    to: '/s3-to-hetzner-wasabi/',
+    label: 'AWS migration',
+    summary: 'Move hot S3 API workloads to lower-cost backends and keep the controls.',
+  },
+  {
+    to: '/multi-cloud-control-plane/',
+    label: 'Multi-cloud control plane',
+    summary: 'One policy, identity, encryption, audit, and replication layer over many stores.',
+  },
+  {
+    to: '/minio-migration/',
+    label: 'MinIO migration',
+    summary: 'Keep self-hosted S3 and bring back IAM, OAuth, quotas, replication, and UI.',
+  },
+] as const;
+
+function getCurrentTheme(): Theme {
+  if (typeof document === 'undefined') return 'light';
+  return document.documentElement.dataset['theme'] === 'dark' ? 'dark' : 'light';
+}
+
+function applyTheme(theme: Theme): void {
+  document.documentElement.dataset['theme'] = theme;
+  window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+}
+
+function SunOutlinedIcon(): JSX.Element {
+  return (
+    <svg viewBox="64 64 896 896" width="1em" height="1em" fill="currentColor" aria-hidden>
+      <path d="M512 704a192 192 0 1 0 0-384 192 192 0 0 0 0 384Zm0-64a128 128 0 1 1 0-256 128 128 0 0 1 0 256ZM480 96h64v128h-64V96Zm0 704h64v128h-64V800ZM224 480v64H96v-64h128Zm704 0v64H800v-64h128ZM241.7 196.7l90.5 90.5-45.3 45.3-90.5-90.5 45.3-45.3Zm495 495 90.5 90.5-45.3 45.3-90.5-90.5 45.3-45.3Zm45.2-495 45.3 45.3-90.5 90.5-45.3-45.3 90.5-90.5Zm-495 495 45.3 45.3-90.5 90.5-45.3-45.3 90.5-90.5Z" />
+    </svg>
+  );
+}
+
+function MoonOutlinedIcon(): JSX.Element {
+  return (
+    <svg viewBox="64 64 896 896" width="1em" height="1em" fill="currentColor" aria-hidden>
+      <path d="M848 729.7A408 408 0 0 1 294.3 176a32 32 0 0 1 37.5 41.8A344 344 0 0 0 806.2 692.2a32 32 0 0 1 41.8 37.5ZM512 896a384 384 0 0 0 267.9-109.1 408 408 0 0 1-542.8-542.8A384 384 0 0 0 512 896Z" />
+    </svg>
+  );
+}
+
+function ThemeToggle(): JSX.Element {
+  const [theme, setTheme] = useState<Theme>('light');
+
+  useEffect(() => {
+    setTheme(getCurrentTheme());
+  }, []);
+
+  const nextTheme = theme === 'dark' ? 'light' : 'dark';
+
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        applyTheme(nextTheme);
+        setTheme(nextTheme);
+      }}
+      className="inline-flex h-8 w-8 items-center justify-center rounded-md text-ink-500 transition hover:bg-ink-100 hover:text-brand-700 dark:text-ink-300 dark:hover:bg-ink-800 dark:hover:text-brand-300"
+      aria-label={`Switch to ${nextTheme} theme`}
+      title={`Switch to ${nextTheme} theme`}
+    >
+      {theme === 'dark' ? <MoonOutlinedIcon /> : <SunOutlinedIcon />}
+    </button>
+  );
+}
+
+function UseCasesMegaMenu(): JSX.Element {
+  const [open, setOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (menuRef.current?.contains(target)) return;
+      setOpen(false);
+    };
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false);
+    };
+
+    document.addEventListener('pointerdown', onPointerDown);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [open]);
+
+  return (
+    <div ref={menuRef} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        className="rounded-lg px-3 py-2 text-ink-700 transition hover:bg-ink-100 hover:text-brand-700 dark:text-ink-200 dark:hover:bg-ink-800 dark:hover:text-brand-300"
+        aria-expanded={open}
+        aria-haspopup="menu"
+      >
+        Use cases
+      </button>
+      {open && (
+      <div
+        className="absolute right-0 top-full mt-4 w-[min(760px,calc(100vw-3rem))] overflow-hidden rounded-3xl border border-brand-300/20 bg-ink-950 p-3 text-white shadow-2xl shadow-ink-950/30"
+        role="menu"
+      >
+        <div className="border-b border-white/10 px-4 pb-3 pt-2">
+          <div className="text-[11px] font-black uppercase tracking-[0.24em] text-brand-300">
+            Use cases
+          </div>
+          <p className="mt-1 max-w-xl text-sm font-semibold leading-6 text-ink-300">
+            Start with the storage problem. Each path maps to a concrete deployment shape.
+          </p>
+        </div>
+        <div className="grid gap-1 py-3 sm:grid-cols-2">
+          {USE_CASES.map((item) => (
+            <Link
+              key={item.to}
+              to={item.to}
+              onClick={() => setOpen(false)}
+              className="group/item rounded-2xl border border-transparent p-4 transition hover:border-brand-300/40 hover:bg-white/[0.06]"
+              role="menuitem"
+            >
+              <div className="font-extrabold text-white group-hover/item:text-brand-200">
+                {item.label}
+              </div>
+              <p className="mt-2 text-sm font-semibold leading-6 text-ink-300">
+                {item.summary}
+              </p>
+            </Link>
+          ))}
+        </div>
+        <div className="rounded-2xl border border-brand-300/40 bg-gradient-to-r from-brand-300 to-cyan-200 p-4 text-ink-950">
+          <Link
+            to={DOCS_PATH}
+            onClick={() => setOpen(false)}
+            className="inline-flex items-center gap-2 text-sm font-black text-ink-950 hover:text-brand-950"
+            role="menuitem"
+          >
+            Open the product docs <span aria-hidden>→</span>
+          </Link>
+          <p className="mt-1 text-sm font-bold leading-6 text-ink-800">
+            Setup, config, IAM, encryption, metrics, replication, and operations. Same docs as the product UI.
+          </p>
+        </div>
+      </div>
+      )}
+    </div>
+  );
+}
 
 export function Header(): JSX.Element {
   return (
@@ -12,36 +183,14 @@ export function Header(): JSX.Element {
           DeltaGlider <span className="text-brand-500">Proxy</span>
         </Link>
         <nav className="hidden items-center gap-5 text-sm font-semibold md:flex">
+          <UseCasesMegaMenu />
           <Link
-            to="/regulated/"
-            className="text-ink-700 hover:text-brand-600 dark:text-ink-200 dark:hover:text-brand-300"
+            to={DOCS_PATH}
+            className="rounded-lg bg-ink-950 px-4 py-2 font-extrabold text-white shadow-lg shadow-ink-950/10 transition hover:bg-brand-700 dark:bg-brand-300 dark:text-ink-950 dark:hover:bg-brand-200"
           >
-            Regulated
+            Docs
           </Link>
-          <Link
-            to="/artifact-storage/"
-            className="text-ink-700 hover:text-brand-600 dark:text-ink-200 dark:hover:text-brand-300"
-          >
-            Artifact storage
-          </Link>
-          <Link
-            to="/s3-to-hetzner-wasabi/"
-            className="text-ink-700 hover:text-brand-600 dark:text-ink-200 dark:hover:text-brand-300"
-          >
-            AWS migration
-          </Link>
-          <Link
-            to="/multi-cloud-control-plane/"
-            className="text-ink-700 hover:text-brand-600 dark:text-ink-200 dark:hover:text-brand-300"
-          >
-            Multi-cloud
-          </Link>
-          <Link
-            to="/minio-migration/"
-            className="text-ink-700 hover:text-brand-600 dark:text-ink-200 dark:hover:text-brand-300"
-          >
-            MinIO migration
-          </Link>
+          <ThemeToggle />
           <a
             href={REPO_URL}
             target="_blank"
@@ -55,37 +204,28 @@ export function Header(): JSX.Element {
           <summary className="list-none rounded-md border border-ink-300 bg-white px-3 py-1.5 text-sm font-bold text-ink-800 dark:border-ink-600 dark:bg-ink-800 dark:text-ink-100">
             Menu
           </summary>
-          <div className="absolute right-0 mt-3 w-56 rounded-xl border border-ink-200 bg-white p-2 shadow-xl dark:border-ink-700 dark:bg-ink-900">
+          <div className="absolute right-0 mt-3 w-80 rounded-xl border border-ink-200 bg-white p-2 shadow-xl dark:border-ink-700 dark:bg-ink-900">
+            <div className="px-3 pb-1 pt-2 text-[11px] font-extrabold uppercase tracking-widest text-ink-400">
+              Use cases
+            </div>
+            {USE_CASES.map((item) => (
+              <Link
+                key={item.to}
+                to={item.to}
+                className="block rounded-lg px-3 py-2 text-sm font-semibold text-ink-700 hover:bg-ink-100 dark:text-ink-200 dark:hover:bg-ink-800"
+              >
+                {item.label}
+              </Link>
+            ))}
             <Link
-              to="/regulated/"
-              className="block rounded-lg px-3 py-2 text-sm font-semibold text-ink-700 hover:bg-ink-100 dark:text-ink-200 dark:hover:bg-ink-800"
+              to={DOCS_PATH}
+              className="mt-2 block rounded-lg bg-ink-950 px-3 py-2 text-sm font-extrabold text-white hover:bg-brand-700 dark:bg-brand-300 dark:text-ink-950 dark:hover:bg-brand-200"
             >
-              Regulated workloads
+              Docs
             </Link>
-            <Link
-              to="/artifact-storage/"
-              className="block rounded-lg px-3 py-2 text-sm font-semibold text-ink-700 hover:bg-ink-100 dark:text-ink-200 dark:hover:bg-ink-800"
-            >
-              Artifact storage
-            </Link>
-            <Link
-              to="/s3-to-hetzner-wasabi/"
-              className="block rounded-lg px-3 py-2 text-sm font-semibold text-ink-700 hover:bg-ink-100 dark:text-ink-200 dark:hover:bg-ink-800"
-            >
-              AWS migration
-            </Link>
-            <Link
-              to="/multi-cloud-control-plane/"
-              className="block rounded-lg px-3 py-2 text-sm font-semibold text-ink-700 hover:bg-ink-100 dark:text-ink-200 dark:hover:bg-ink-800"
-            >
-              Multi-cloud
-            </Link>
-            <Link
-              to="/minio-migration/"
-              className="block rounded-lg px-3 py-2 text-sm font-semibold text-ink-700 hover:bg-ink-100 dark:text-ink-200 dark:hover:bg-ink-800"
-            >
-              MinIO migration
-            </Link>
+            <div className="px-3 py-2">
+              <ThemeToggle />
+            </div>
             <a
               href={REPO_URL}
               target="_blank"

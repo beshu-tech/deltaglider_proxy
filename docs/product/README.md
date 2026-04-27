@@ -37,7 +37,7 @@ These docs are operator-facing — everything you need to install, secure, run, 
 - [Monitoring and alerts](40-monitoring-and-alerts.md) — Prometheus scrape, Grafana panels, alerting rules.
 - [Troubleshooting](41-troubleshooting.md) — common symptoms → fixes.
 - [FAQ](42-faq.md) — quick answers to common questions.
-- [Lazy bucket replication](reference/replication.md) — scheduled source → destination object replication through the engine.
+- [Lazy bucket replication](reference/replication.md) — run-now source → destination object replication through the engine, with scheduler state ready for automatic ticks.
 
 ### Reference
 
@@ -45,10 +45,30 @@ These docs are operator-facing — everything you need to install, secure, run, 
 - [Admin API reference](reference/admin-api.md) — every `/_/api/admin/*` endpoint.
 - [Authentication reference](reference/authentication.md) — conceptual model, error codes, claim shapes.
 - [Metrics reference](reference/metrics.md) — every Prometheus metric and label.
-- [Replication reference](reference/replication.md) — rule shape, scheduler controls, delete replication, runtime state.
+- [Replication reference](reference/replication.md) — rule shape, run-now controls, delete replication, runtime state.
 - [How delta works](reference/how-delta-works.md) — on-disk layout, PUT/GET flow, integrity guarantees.
 - [Encryption at rest](reference/encryption-at-rest.md) — AES-256-GCM for stored objects, chunked streaming wire format, operational caveats.
 
-## One-paragraph summary
+## Operator summary
 
-Single-process Rust binary. S3 API on `/`, admin UI + admin APIs on `/_/`. Same port. Embedded UI (rust-embed), embedded docs (the page you're reading). Storage backend can be filesystem, AWS S3, or any S3-compatible provider (Hetzner, Backblaze, Wasabi, R2, MinIO, lower-cost S3 SaaS). Transparent xdelta3 compression with byte-identical reconstruction, SHA-256 verified. Optional proxy-side AES-256-GCM encryption keeps keys in your environment before bytes land in cheap or untrusted storage. SigV4 for S3 clients (aws-cli, boto3, Terraform, rclone), OAuth/OIDC for admin UI. Per-user ABAC permissions with IP and prefix conditions. Soft bucket quotas, bucket freeze, object replication with delete replication, Prometheus metrics, in-memory audit ring, encrypted IAM DB with optional multi-instance sync.
+**Shape**
+
+- Single-process Rust binary.
+- S3 API on `/`; admin UI and admin APIs on `/_/`.
+- Same-port deployment with embedded UI (`rust-embed`) and embedded product docs.
+- Backend can be filesystem, AWS S3, or any S3-compatible provider: Hetzner, Backblaze, Wasabi, R2, MinIO, or lower-cost S3 SaaS.
+
+**Storage path**
+
+- Transparent xdelta3 compression for repeated binaries.
+- Byte-identical reconstruction on read.
+- SHA-256 verification for reconstructed objects.
+- Optional proxy-side AES-256-GCM encryption keeps keys in your environment before bytes land in cheap or untrusted storage.
+
+**Control plane**
+
+- SigV4 for S3 clients: `aws-cli`, `boto3`, Terraform, rclone.
+- OAuth/OIDC for admin UI access.
+- Per-user ABAC permissions with IP and prefix conditions.
+- Soft bucket quotas, bucket freeze, and object replication with delete replication.
+- Prometheus metrics, in-memory audit ring, encrypted IAM DB, and optional multi-instance config sync.

@@ -53,6 +53,7 @@ All three scopes route through the same `apply_config_transition` path, so hot-r
 | `POST` | `/_/api/admin/config/apply` | `{yaml: <doc>}` | Atomic full-document apply + persist |
 | `POST` | `/_/api/admin/config/trace` | synthetic request body | Evaluate against the admission chain |
 | `GET` | `/_/api/admin/config/trace?method=&path=&...` | — | Query-param variant (bookmarkable trace URLs) |
+| `POST` | `/_/api/admin/config/sync-now` | — | Force an immediate config-DB pull from the sync bucket |
 
 Full-document apply returns `{applied, persisted, requires_restart, warnings, persisted_path}`. **Persist failure returns HTTP 500**, not 200+warning — GitOps pipelines can't mistake a half-applied state for a clean success.
 
@@ -85,6 +86,7 @@ deltaglider_proxy config apply deltaglider_proxy.yaml --server https://dgp.examp
 | `PUT` / `DELETE` | `/_/api/admin/groups/:id` | Update / delete |
 | `POST` | `/_/api/admin/groups/:id/members` | Add user to group |
 | `DELETE` | `/_/api/admin/groups/:id/members/:user_id` | Remove user from group |
+| `GET` | `/_/api/admin/iam/version` | Monotonic IAM-index rebuild counter for deterministic diagnostics/tests |
 | `GET` | `/_/api/admin/policies` | List canned policy templates (public, no session) |
 
 ## External auth (OAuth / OIDC)

@@ -1,3 +1,4 @@
+import { ChecklistGrid } from '../components/ChecklistGrid';
 import { FeatureCard } from '../components/FeatureCard';
 import { Hero } from '../components/Hero';
 import { MailtoCTA } from '../components/MailtoCTA';
@@ -23,6 +24,18 @@ const SCENARIOS = [
     body: 'Cutovers need soft quotas, bucket freeze, sync state, replication history, and a UI operators can understand under pressure.',
   },
 ];
+
+const CONTROL_PLANE_GAPS = [
+  'Per-user S3 access keys',
+  'Groups with inherited permissions',
+  'ABAC policies in AWS IAM grammar',
+  'OAuth/OIDC login and claim mapping',
+  'Public read-only prefixes',
+  'Soft per-bucket quotas and bucket freeze',
+  'Bucket routing aliases',
+  'Object replication rules',
+  'Encrypted multi-instance config DB sync',
+] as const;
 
 export function MinioMigration(): JSX.Element {
   return (
@@ -54,27 +67,7 @@ export function MinioMigration(): JSX.Element {
         title="Storage alone is not enough."
         intro="The replacement must preserve the operational contract around S3, not only store objects."
       >
-        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-          {[
-            'Per-user S3 access keys',
-            'Groups with inherited permissions',
-            'ABAC policies in AWS IAM grammar',
-            'OAuth/OIDC login and claim mapping',
-            'Public read-only prefixes',
-            'Soft per-bucket quotas and bucket freeze',
-            'Bucket routing aliases',
-            'Object replication rules',
-            'Encrypted multi-instance config DB sync',
-          ].map((item) => (
-            <div
-              key={item}
-              className="rounded-xl border border-ink-200 bg-white px-4 py-3 text-sm font-semibold text-ink-800 dark:border-ink-700 dark:bg-ink-800/50 dark:text-ink-100"
-            >
-              <span className="mr-2 text-brand-600 dark:text-brand-300">✓</span>
-              {item}
-            </div>
-          ))}
-        </div>
+        <ChecklistGrid items={CONTROL_PLANE_GAPS} columns="three" />
         <div className="mt-6 rounded-2xl border border-brand-300/50 bg-brand-50 p-5 dark:border-brand-500/30 dark:bg-brand-950/40">
           <div className="text-xs font-extrabold uppercase tracking-[0.18em] text-brand-700 dark:text-brand-300">
             Garage + DeltaGlider

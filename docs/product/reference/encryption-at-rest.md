@@ -575,7 +575,3 @@ Turn on CloudTrail for the KMS key. Every `Decrypt` / `GenerateDataKey` call log
 - [Upgrade guide](../21-upgrade-guide.md) — migrating from pre-v0.9 global `advanced.encryption_key`.
 - [FAQ](../42-faq.md) — frequent encryption questions not covered above.
 - [Troubleshooting](../41-troubleshooting.md) — encryption-specific symptoms and fixes.
-
-- [Security checklist — Step 6](../20-production-security-checklist.md#step-6-enable-encryption-at-rest-optional) — the operational walkthrough.
-- [How delta works](how-delta-works.md) — why compression happens before encryption.
-- [Configuration reference](configuration.md) — the `storage.backends[*].encryption` schema.

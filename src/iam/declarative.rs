@@ -43,9 +43,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// One entry in `access.iam_users`. References groups by NAME.
 ///
-/// Secrets (`secret_access_key`) land in the same env-substitution
-/// pipeline the rest of the YAML uses (`${env:NAME}` or literal);
-/// the canonical exporter redacts them exactly like SigV4 creds.
+/// Secrets (`secret_access_key`) are deserialised literally; operators
+/// must materialise secret values before apply. The canonical exporter
+/// redacts them exactly like SigV4 creds.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DeclarativeUser {

@@ -36,9 +36,9 @@ const OG_MULTI_CLOUD = `${SITE_URL}/screenshots/object-replication.jpg`;
 
 export const landingMeta: PageMeta = {
   path: '/',
-  title: 'DeltaGlider Proxy — smaller S3-compatible object storage',
+  title: 'DeltaGlider Proxy — cut S3-compatible object storage growth',
   description:
-    'An S3-compatible proxy that stores repeated binaries as compact deltas. Includes IAM, OAuth, soft quotas, replication, encryption, metrics, and audit controls.',
+    'An S3-compatible proxy that stores repeated binaries as compact xdelta3 deltas while adding IAM, OAuth, quotas, replication, encryption, metrics, and audit controls.',
   ogImage: OG_LANDING,
   jsonLd: [organization(), website(), softwareApplication()],
 };

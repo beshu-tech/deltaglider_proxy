@@ -440,18 +440,16 @@ The `access.iam_mode` YAML selector controls where IAM state (users, groups, OAu
 | Mode | Meaning |
 |------|---------|
 | `gui` *(default)* | Encrypted SQLCipher DB is source of truth. Admin GUI + admin API mutate it. YAML `access.*` carries only the legacy SigV4 pair + `authentication` selector. |
-| `declarative` | YAML is authoritative. Admin API IAM mutation routes (`POST/PUT/PATCH/DELETE` on `/users`, `/groups`, `/ext-auth/*`, `/migrate`, backup import) return `403 { "error": "iam_declarative" }`. Read routes stay accessible. |
+| `declarative` | YAML `access.iam_users`, `iam_groups`, `auth_providers`, and `group_mapping_rules` are authoritative. Admin API IAM mutation routes (`POST/PUT/PATCH/DELETE` on `/users`, `/groups`, `/ext-auth/*`, `/migrate`, backup import) return `403 { "error": "iam_declarative" }`. Read routes stay accessible. |
 
 ```yaml
 access:
   iam_mode: declarative
 ```
 
-Mode transitions are audit-logged at `warn` level on the `deltaglider_proxy::config` target.
+Mode transitions are audit-logged at `warn` level on the `deltaglider_proxy::config` target. In declarative mode, every `/config/apply` or section-PUT on `access` runs a dry validation + diff, then reconciles the encrypted config DB to YAML in one SQLite transaction. Creates, updates, and deletes emit `iam_reconcile_*` audit entries.
 
-> **Caveat**: The reconciler that sync-diffs the IAM DB to the YAML on every apply is **Phase 3c.3 (pending)**. Today, declarative mode is a pure lockout — YAML `access.users` arrays are **not yet consumed**. Operators adopting declarative should seed the DB via a one-time `iam_mode: gui` session (admin GUI or admin API), then flip the switch. See [the upgrade guide](../21-upgrade-guide.md#the-s3-synced-iam-database).
-
-OAuth providers and mapping rules are configured via the admin GUI (stored in the encrypted DB) — the YAML `access:` section is **not** a place to declare them today.
+The initial `gui → declarative` flip is guarded: if YAML contains no users or groups while the DB is non-empty, apply fails instead of wiping IAM by accident. To seed GitOps YAML from an existing DB, use `GET /_/api/admin/config/declarative-iam-export`; see [Declarative IAM](declarative-iam.md) for the full workflow.
 
 ---
 

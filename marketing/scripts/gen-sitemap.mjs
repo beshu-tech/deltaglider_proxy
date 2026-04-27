@@ -2,31 +2,20 @@
 import { writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { PAGES, SITE_URL } from './page-manifest.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '..');
 const distDir = join(root, 'dist');
 
-const SITE_URL = 'https://deltaglider.com';
-const PATHS = [
-  '/',
-  '/regulated/',
-  '/artifact-storage/',
-  '/minio-migration/',
-  '/s3-to-hetzner-wasabi/',
-  '/multi-cloud-control-plane/',
-  '/about/',
-  '/privacy/',
-  '/terms/',
-];
 const today = new Date().toISOString().slice(0, 10);
 
-const urls = PATHS.map(
-  (p) => `  <url>
-    <loc>${SITE_URL}${p}</loc>
+const urls = PAGES.map(
+  (page) => `  <url>
+    <loc>${SITE_URL}${page.path}</loc>
     <lastmod>${today}</lastmod>
     <changefreq>monthly</changefreq>
-    <priority>${p === '/' ? '1.0' : '0.8'}</priority>
+    <priority>${page.path === '/' ? '1.0' : '0.8'}</priority>
   </url>`,
 ).join('\n');
 

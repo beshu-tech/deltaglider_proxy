@@ -1,5 +1,6 @@
 export const SITE_URL = 'https://deltaglider.com';
 export const REPO_URL = 'https://github.com/beshu-tech/deltaglider_proxy';
+export const DOCS_PATH = '/docs/';
 export const CONTACT_EMAIL = 'deltaglider@beshu.tech';
 export const ORG_NAME = 'Beshu Tech';
 export const PRODUCT_NAME = 'DeltaGlider Proxy';

@@ -295,10 +295,11 @@ pub struct StorageSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub force_path_style: Option<bool>,
 
-    /// Lazy bucket replication configuration. A single periodic worker
-    /// walks each due rule and copies objects source → destination
-    /// through the engine (so encryption + delta compression stay
-    /// transparent to the operator). See
+    /// Lazy bucket replication configuration. Current execution is
+    /// explicit run-now via the admin API / GUI; interval and due-state
+    /// fields are retained so a periodic worker can be added without
+    /// changing the rule shape. Copies go through the engine so
+    /// encryption + delta compression stay transparent. See
     /// `docs/product/reference/replication.md` and the YAML schema at
     /// `deltaglider_proxy.example.yaml`.
     #[serde(default, skip_serializing_if = "is_default_replication")]
@@ -306,8 +307,7 @@ pub struct StorageSection {
 }
 
 /// Skip emitting `replication:` from canonical YAML exports when it's
-/// the default (disabled-by-default semantics: empty rules list with
-/// default scheduler controls).
+/// the default (empty rules list with default replication controls).
 pub(crate) fn is_default_replication(r: &ReplicationConfig) -> bool {
     r == &ReplicationConfig::default()
 }
@@ -315,14 +315,14 @@ pub(crate) fn is_default_replication(r: &ReplicationConfig) -> bool {
 /// Global replication controls + the rules list.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ReplicationConfig {
-    /// Master kill-switch for the replication worker. Defaults to `true`;
-    /// when false, the worker never ticks even if rules exist.
+    /// Master kill-switch for replication. Defaults to `true`; when
+    /// false, run-now refuses to copy even if rules exist.
     #[serde(default = "default_replication_enabled")]
     pub enabled: bool,
 
-    /// How often the scheduler wakes up to check for due rules. Parsed
-    /// via humantime. Defaults to `30s`. Minimum enforced at config
-    /// load time (`5s`) to prevent scheduler-thrash.
+    /// Future scheduler wake interval. Parsed via humantime. Defaults
+    /// to `30s`. Minimum enforced at config load time (`5s`) to prevent
+    /// scheduler-thrash when automatic ticks are enabled.
     #[serde(default = "default_tick_interval")]
     pub tick_interval: String,
 

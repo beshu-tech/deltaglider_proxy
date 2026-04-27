@@ -87,7 +87,7 @@ export default function Sidebar({
         }
       })
       .catch(() => setBuckets([]));
-  }, [refreshTrigger]);
+  }, [onBucketChange, refreshTrigger]);
 
   const handleCreateBucket = async () => {
     const name = newBucketName.trim();

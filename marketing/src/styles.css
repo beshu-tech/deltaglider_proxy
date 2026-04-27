@@ -1,5 +1,7 @@
 @import 'tailwindcss';
 
+@custom-variant dark (&:where([data-theme='dark'], [data-theme='dark'] *));
+
 @theme {
   --color-brand-50: #ecfdf8;
   --color-brand-100: #ccfbef;
@@ -30,6 +32,11 @@
 html {
   scroll-behavior: smooth;
   -webkit-text-size-adjust: 100%;
+  color-scheme: light;
+}
+
+html[data-theme='dark'] {
+  color-scheme: dark;
 }
 
 body {
@@ -42,20 +49,312 @@ body {
   font-feature-settings: 'cv02', 'cv11';
 }
 
-@media (prefers-color-scheme: dark) {
-  body {
-    color: var(--color-ink-100);
-    background:
-      radial-gradient(circle at 12% 8%, rgb(20 184 166 / 0.12), transparent 28rem),
-      radial-gradient(circle at 88% 22%, rgb(45 212 191 / 0.08), transparent 30rem),
-      var(--color-ink-900);
-  }
+/* Site-wide radius reset: keep cards crisp and industrial instead of bubbly. */
+.rounded-md {
+  border-radius: 0.35rem;
+}
+
+.rounded-lg {
+  border-radius: 0.45rem;
+}
+
+.rounded-xl {
+  border-radius: 0.6rem;
+}
+
+.rounded-2xl,
+[class~='rounded-[1.5rem]'] {
+  border-radius: 0.8rem;
+}
+
+.rounded-3xl,
+[class~='rounded-[2rem]'] {
+  border-radius: 1rem;
+}
+
+h1,
+h2,
+h3 {
+  text-wrap: balance;
+}
+
+p {
+  text-wrap: pretty;
+}
+
+html[data-theme='dark'] body {
+  color: var(--color-ink-100);
+  background:
+    radial-gradient(circle at 12% 8%, rgb(20 184 166 / 0.12), transparent 28rem),
+    radial-gradient(circle at 88% 22%, rgb(45 212 191 / 0.08), transparent 30rem),
+    var(--color-ink-900);
 }
 
 code,
 pre {
   font-family: var(--font-sans);
   font-weight: 700;
+}
+
+.docs-markdown {
+  color: var(--color-ink-700);
+}
+
+.docs-markdown h1,
+.docs-markdown h2,
+.docs-markdown h3,
+.docs-markdown h4 {
+  color: var(--color-ink-950);
+  font-weight: 900;
+  letter-spacing: -0.03em;
+}
+
+.docs-markdown h1 {
+  font-size: clamp(2.25rem, 4vw, 3.5rem);
+  line-height: 0.95;
+  margin-bottom: 1.25rem;
+}
+
+.docs-markdown h2 {
+  border-top: 1px solid var(--color-ink-200);
+  font-size: 1.8rem;
+  line-height: 1.1;
+  margin-top: 2.5rem;
+  padding-top: 2rem;
+}
+
+.docs-markdown h3 {
+  font-size: 1.25rem;
+  margin-top: 2rem;
+}
+
+.docs-markdown p,
+.docs-markdown li {
+  font-size: 1rem;
+  line-height: 1.8;
+}
+
+.docs-markdown p {
+  margin-top: 1rem;
+}
+
+.docs-markdown ul,
+.docs-markdown ol {
+  margin-top: 1rem;
+  padding-left: 1.4rem;
+}
+
+.docs-markdown ul {
+  list-style: disc;
+}
+
+.docs-markdown ol {
+  list-style: decimal;
+}
+
+.docs-markdown a {
+  color: var(--color-brand-700);
+  font-weight: 800;
+  text-decoration: underline;
+  text-underline-offset: 0.18em;
+}
+
+/* Code styling is split deliberately:
+   - inline code gets a compact chromatic pill
+   - fenced code blocks own their full surface and must never inherit the pill */
+.docs-markdown :not(pre) > code {
+  border-radius: 0.45rem;
+  border: 1px solid rgb(20 184 166 / 0.28);
+  background: rgb(204 251 239 / 0.78);
+  color: var(--color-brand-900);
+  padding: 0.12rem 0.42rem;
+  font-size: 0.88em;
+  box-shadow: inset 0 -1px 0 rgb(15 118 110 / 0.12);
+}
+
+.docs-markdown pre {
+  position: relative;
+  margin-top: 1.25rem;
+  overflow-x: auto;
+  border: 1px solid rgb(45 212 191 / 0.28);
+  border-radius: 0.8rem;
+  background:
+    linear-gradient(180deg, rgb(15 23 42 / 0.96), rgb(2 6 23 / 0.98)),
+    radial-gradient(circle at 12% 0%, rgb(45 212 191 / 0.16), transparent 18rem);
+  box-shadow: 0 18px 44px rgb(2 6 23 / 0.22);
+  color: #dbeafe;
+  padding: 2.65rem 1rem 1rem;
+}
+
+.docs-markdown pre::before {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  height: 2rem;
+  border-bottom: 1px solid rgb(148 163 184 / 0.16);
+  background: rgb(15 23 42 / 0.7);
+  color: #94a3b8;
+  content: 'CODE';
+  display: flex;
+  align-items: center;
+  padding: 0 0.9rem;
+  font-family: var(--font-sans);
+  font-size: 0.68rem;
+  font-weight: 900;
+  letter-spacing: 0.18em;
+}
+
+.docs-markdown pre:has(code.language-yaml)::before,
+.docs-markdown pre:has(code.language-yml)::before {
+  color: #5eead4;
+  content: 'YAML';
+}
+
+.docs-markdown pre:has(code.language-json)::before {
+  color: #fbbf24;
+  content: 'JSON';
+}
+
+.docs-markdown pre:has(code.language-bash)::before,
+.docs-markdown pre:has(code.language-sh)::before {
+  color: #93c5fd;
+  content: 'SHELL';
+}
+
+.docs-markdown pre code {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  padding: 0;
+  font-size: 0.9rem;
+  line-height: 1.75;
+  tab-size: 2;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  box-shadow: none;
+}
+
+.docs-markdown .hljs {
+  background: transparent;
+  color: #dbeafe;
+}
+
+.docs-markdown .hljs-attr,
+.docs-markdown .hljs-attribute,
+.docs-markdown .language-yaml .hljs-attr,
+.docs-markdown .language-yml .hljs-attr {
+  color: #5eead4;
+}
+
+.docs-markdown .hljs-string,
+.docs-markdown .language-yaml .hljs-string,
+.docs-markdown .language-yml .hljs-string {
+  color: #fcd34d;
+}
+
+.docs-markdown .hljs-number,
+.docs-markdown .hljs-literal,
+.docs-markdown .hljs-variable {
+  color: #c084fc;
+}
+
+.docs-markdown .hljs-keyword,
+.docs-markdown .hljs-built_in,
+.docs-markdown .hljs-type {
+  color: #60a5fa;
+}
+
+.docs-markdown .hljs-comment,
+.docs-markdown .hljs-quote {
+  color: #94a3b8;
+  font-style: italic;
+}
+
+.docs-markdown .hljs-meta,
+.docs-markdown .hljs-section,
+.docs-markdown .hljs-title {
+  color: #fb7185;
+}
+
+.docs-markdown .hljs-punctuation,
+.docs-markdown .hljs-bullet,
+.docs-markdown .hljs-symbol {
+  color: #67e8f9;
+}
+
+.docs-markdown blockquote {
+  margin-top: 1.25rem;
+  border-left: 4px solid var(--color-brand-400);
+  border-radius: 0.75rem;
+  background: var(--color-brand-50);
+  padding: 1rem 1.25rem;
+  color: var(--color-ink-700);
+}
+
+.docs-markdown table {
+  margin-top: 1.25rem;
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+.docs-markdown th,
+.docs-markdown td {
+  border: 1px solid var(--color-ink-200);
+  padding: 0.65rem 0.75rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.docs-markdown th {
+  background: var(--color-ink-100);
+  color: var(--color-ink-900);
+}
+
+html[data-theme='dark'] .docs-markdown {
+  color: var(--color-ink-300);
+}
+
+html[data-theme='dark'] .docs-markdown h1,
+html[data-theme='dark'] .docs-markdown h2,
+html[data-theme='dark'] .docs-markdown h3,
+html[data-theme='dark'] .docs-markdown h4 {
+  color: var(--color-ink-50);
+}
+
+html[data-theme='dark'] .docs-markdown h2,
+html[data-theme='dark'] .docs-markdown th,
+html[data-theme='dark'] .docs-markdown td {
+  border-color: var(--color-ink-700);
+}
+
+html[data-theme='dark'] .docs-markdown a {
+  color: var(--color-brand-300);
+}
+
+html[data-theme='dark'] .docs-markdown :not(pre) > code {
+  border-color: rgb(45 212 191 / 0.3);
+  background: rgb(20 184 166 / 0.14);
+  color: #99f6e0;
+  box-shadow: inset 0 -1px 0 rgb(45 212 191 / 0.16);
+}
+
+html[data-theme='dark'] .docs-markdown pre code {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  box-shadow: none;
+}
+
+html[data-theme='dark'] .docs-markdown blockquote {
+  background: rgb(19 78 74 / 0.35);
+  color: var(--color-ink-200);
+}
+
+html[data-theme='dark'] .docs-markdown th {
+  background: var(--color-ink-800);
+  color: var(--color-ink-50);
 }
 
 .soft-gradient-bg {
@@ -108,13 +407,11 @@ pre {
   animation: gradient-drift 18s ease-in-out infinite alternate;
 }
 
-@media (prefers-color-scheme: dark) {
-  .cyber-fishnet-hero::before {
-    background:
-      linear-gradient(63deg, rgb(94 234 212 / 0.22) 1px, transparent 1.5px),
-      linear-gradient(117deg, rgb(20 184 166 / 0.18) 1px, transparent 1.5px);
-    opacity: 0.78;
-  }
+html[data-theme='dark'] .cyber-fishnet-hero::before {
+  background:
+    linear-gradient(63deg, rgb(94 234 212 / 0.22) 1px, transparent 1.5px),
+    linear-gradient(117deg, rgb(20 184 166 / 0.18) 1px, transparent 1.5px);
+  opacity: 0.78;
 }
 
 @media (prefers-reduced-motion: reduce) {

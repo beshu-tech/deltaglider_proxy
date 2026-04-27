@@ -1,3 +1,4 @@
+import { ChecklistGrid } from '../components/ChecklistGrid';
 import { FeatureCard } from '../components/FeatureCard';
 import { Hero } from '../components/Hero';
 import { MailtoCTA } from '../components/MailtoCTA';
@@ -41,7 +42,7 @@ export function Regulated(): JSX.Element {
       <SEO meta={regulatedMeta} />
       <Hero
         eyebrow="Use case · regulated workloads"
-        headline="Use cheap storage without trusting the storage provider."
+        headline="Encryption at rest: Using cheap providers that you don't trust."
         subhead="DeltaGlider encrypts objects before they reach the backend. The cryptographic key stays in your trusted environment, while compression can further reduce the storage bill."
         cta={
           <>
@@ -65,17 +66,7 @@ export function Regulated(): JSX.Element {
         title="Controls built into the proxy."
         intro="The storage provider sees ciphertext. Your runtime keeps the key, policy, and operational controls."
       >
-        <div className="grid gap-3 sm:grid-cols-2">
-          {CONTROLS.map((control) => (
-            <div
-              key={control}
-              className="rounded-xl border border-ink-200 bg-white px-4 py-3 text-sm font-semibold text-ink-800 dark:border-ink-700 dark:bg-ink-800/50 dark:text-ink-100"
-            >
-              <span className="mr-2 text-brand-600 dark:text-brand-300">✓</span>
-              {control}
-            </div>
-          ))}
-        </div>
+        <ChecklistGrid items={CONTROLS} />
       </Section>
       <Section
         eyebrow="Real-world scenarios"

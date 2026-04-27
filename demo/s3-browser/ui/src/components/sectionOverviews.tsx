@@ -293,7 +293,7 @@ export function StorageOverview({ onNavigateAdmin, onSessionExpired }: OverviewP
     {
       title: 'Object replication',
       blurb:
-        'One-way scheduled object copy between buckets or prefixes. Rules go through the engine, so encryption and delta compression stay transparent.',
+        'One-way run-now object copy between buckets or prefixes. Rules go through the engine, so encryption and delta compression stay transparent.',
       icon: <SyncOutlined />,
       path: 'configuration/storage/replication',
       summary: 'Rules, run history, failures',

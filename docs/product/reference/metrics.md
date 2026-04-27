@@ -53,7 +53,7 @@ curl -s http://localhost:9000/_/metrics | promtool check metrics
 | `post_object` | `POST /:bucket/*key` (multipart) |
 | `health` | `GET /health` |
 | `stats` | `GET /stats` |
-| `metrics` | `GET /metrics` |
+| `metrics` | `GET /_/metrics` |
 
 ### Histogram buckets
 
@@ -130,9 +130,9 @@ All label sets are bounded:
 
 No bucket names, no object keys in labels. No unbounded cardinality.
 
-## What's NOT in `/metrics`
+## What's NOT in `/_/metrics`
 
-`/stats` returns aggregate storage statistics (`total_objects`, `total_original_size`, `total_stored_size`, `savings_percentage`, `truncated`). These are intentionally excluded from `/metrics` because computing them requires scanning storage objects. The endpoint has a **10-second server-side cache** and **caps at 1,000 objects** (the `truncated` field signals more exist). Use `/stats` for admin dashboards; use `/metrics` for Prometheus.
+`/_/stats` returns aggregate storage statistics (`total_objects`, `total_original_size`, `total_stored_size`, `savings_percentage`, `truncated`). These are intentionally excluded from `/_/metrics` because computing them requires scanning storage objects. The endpoint has a **10-second server-side cache** and **caps at 1,000 objects** (the `truncated` field signals more exist). Use `/_/stats` for admin dashboards; use `/_/metrics` for Prometheus.
 
 ## Implementation details
 
