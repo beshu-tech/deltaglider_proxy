@@ -170,6 +170,7 @@ export function Landing(): JSX.Element {
           <ScreenshotFrame
             src="screenshots/filebrowser.jpg"
             alt="DeltaGlider Proxy file browser with bucket navigation and embedded admin entry points"
+            caption="Bucket browser for S3-compatible object storage: switch buckets, navigate prefixes, inspect objects, upload files, and jump into the admin control plane."
             priority
           />
         }

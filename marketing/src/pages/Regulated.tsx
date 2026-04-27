@@ -55,6 +55,7 @@ export function Regulated(): JSX.Element {
           <ScreenshotFrame
             src="screenshots/advanced_security.jpg"
             alt="DeltaGlider Proxy advanced security settings"
+            caption="Advanced security controls for regulated deployments: listener settings, TLS, cookie policy, rate limits, and other runtime guardrails."
             priority
           />
         }

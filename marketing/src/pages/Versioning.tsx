@@ -85,6 +85,7 @@ export function Versioning(): JSX.Element {
           <ScreenshotFrame
             src="screenshots/analytics.jpg"
             alt="DeltaGlider Proxy analytics dashboard showing per-bucket compression savings"
+            caption="Analytics dashboard for artifact storage: compare original bytes, stored bytes, savings percentage, cache behavior, and request health."
             priority
           />
         }

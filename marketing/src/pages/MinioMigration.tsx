@@ -44,6 +44,7 @@ export function MinioMigration(): JSX.Element {
           <ScreenshotFrame
             src="screenshots/iam.jpg"
             alt="DeltaGlider Proxy IAM user management"
+            caption="IAM control plane for MinIO migration: users, groups, S3 access keys, inherited permissions, and OAuth/OIDC mappings stay attached to the proxy."
             priority
           />
         }

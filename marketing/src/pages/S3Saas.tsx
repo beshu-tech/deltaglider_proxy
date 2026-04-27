@@ -56,6 +56,7 @@ export function S3Saas(): JSX.Element {
           <ScreenshotFrame
             src="screenshots/bucket-policies.jpg"
             alt="DeltaGlider Proxy bucket policy controls"
+            caption="Bucket policy controls for cheaper S3-compatible storage: compression, aliases, public prefixes, soft quotas, and bucket freeze."
             priority
           />
         }
