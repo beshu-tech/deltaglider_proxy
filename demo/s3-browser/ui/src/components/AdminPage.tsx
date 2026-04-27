@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { Typography, Button, Input, Alert, Space, Spin, Drawer, message } from 'antd';
+import { Typography, Button, Input, Alert, Space, Spin, Drawer, message, Dropdown } from 'antd';
+import type { MenuProps } from 'antd';
 import { checkSession, adminLogin, whoami, loginAs, exportBackup, importBackup, type ExternalProviderInfo } from '../adminApi';
 import { getCredentials } from '../s3client';
 import {
@@ -59,7 +60,7 @@ import {
 import { useNavigation } from '../NavigationContext';
 import TabHeader from './TabHeader';
 import { YamlImportExportModal } from './YamlImportExportModal';
-import { FileTextOutlined, ImportOutlined } from '@ant-design/icons';
+import { DownOutlined, FileTextOutlined, ImportOutlined } from '@ant-design/icons';
 import { useDirtyGlobalIndicators, requestApplyCurrent } from '../useDirtySection';
 import type { SectionName } from '../adminApi';
 
@@ -788,6 +789,21 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
     );
   }
 
+  const fullConfigItems: MenuProps['items'] = [
+    {
+      key: 'show-full-config-yaml',
+      icon: <FileTextOutlined />,
+      label: 'Show full config YAML',
+      onClick: () => setYamlModalMode('export'),
+    },
+    {
+      key: 'import-full-config-yaml',
+      icon: <ImportOutlined />,
+      label: 'Import full config YAML...',
+      onClick: () => setYamlModalMode('import'),
+    },
+  ];
+
   return (
     <div style={{
       display: 'flex',
@@ -819,26 +835,18 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
                 button's label is hidden below 768px via the
                 `hide-mobile` class. */}
             <CopySectionYamlButton section={sectionForPath(adminPath)} />
-            <Button
-              size="small"
-              type="text"
-              icon={<FileTextOutlined />}
-              onClick={() => setYamlModalMode('export')}
-              title="Show the current config as canonical YAML (secrets are redacted here — this is a view, not a complete backup). For a restorable snapshot use Full Backup → Export in the sidebar footer."
-              style={{ color: colors.TEXT_MUTED, fontFamily: 'var(--font-ui)' }}
-            >
-              <span className="hide-mobile" style={{ marginLeft: 4 }}>Show YAML</span>
-            </Button>
-            <Button
-              size="small"
-              type="text"
-              icon={<ImportOutlined />}
-              onClick={() => setYamlModalMode('import')}
-              title="Paste a YAML config document — validates then applies + persists. Note: secrets redacted as null are preserved at the current live value (apply won't clear them)."
-              style={{ color: colors.TEXT_MUTED, fontFamily: 'var(--font-ui)' }}
-            >
-              <span className="hide-mobile" style={{ marginLeft: 4 }}>Apply YAML</span>
-            </Button>
+            <Dropdown menu={{ items: fullConfigItems }} trigger={['click']} placement="bottomRight">
+              <Button
+                size="small"
+                type="text"
+                icon={<FileTextOutlined />}
+                title="Full-document YAML import/export. Section YAML is scoped to the current Configuration page."
+                style={{ color: colors.TEXT_MUTED, fontFamily: 'var(--font-ui)' }}
+              >
+                <span className="hide-mobile" style={{ marginLeft: 4 }}>Full config</span>
+                <DownOutlined className="hide-mobile" style={{ marginLeft: 4, fontSize: 10 }} />
+              </Button>
+            </Dropdown>
           </Space>
         }
       />

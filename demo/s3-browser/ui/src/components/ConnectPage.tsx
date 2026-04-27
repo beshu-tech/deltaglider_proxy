@@ -16,7 +16,7 @@ interface Props {
 }
 
 export default function ConnectPage({ onConnect, showError }: Props) {
-  const { BORDER, TEXT_MUTED, TEXT_FAINT, TEXT_PRIMARY, TEXT_SECONDARY, ACCENT_BLUE } = useColors();
+  const { BORDER, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY, ACCENT_BLUE } = useColors();
   const [accessKey, setAccessKey] = useState('');
   const [secretKey, setSecretKey] = useState('');
   const [adminPassword, setAdminPassword] = useState('');
@@ -172,6 +172,11 @@ export default function ConnectPage({ onConnect, showError }: Props) {
 
   const isBootstrap = authMode === 'bootstrap';
   const canSubmit = isBootstrap ? adminPassword.trim() : (accessKey.trim() && secretKey.trim());
+  const loginSubtitle = externalProviders.length > 0
+    ? 'Use your identity provider to continue.'
+    : isBootstrap
+      ? 'Enter the deployment bootstrap password.'
+      : 'Enter your S3 credentials.';
 
   const inputStyle = {
     background: 'var(--input-bg)',
@@ -180,6 +185,15 @@ export default function ConnectPage({ onConnect, showError }: Props) {
     height: 44,
     fontFamily: "var(--font-mono)" as const,
     fontSize: 13,
+  };
+  const loginInputStyle = {
+    ...inputStyle,
+    background: 'color-mix(in srgb, var(--input-bg) 82%, transparent)',
+    borderColor: 'color-mix(in srgb, var(--glass-border) 82%, var(--focus-ring) 18%)',
+    borderRadius: 16,
+    height: 52,
+    fontSize: 14,
+    boxShadow: 'inset 0 1px 0 rgba(255, 255, 255, 0.04)',
   };
 
   if (detecting) {
@@ -286,50 +300,25 @@ export default function ConnectPage({ onConnect, showError }: Props) {
   }
 
   return (
-    <div style={{
-      display: 'flex',
-      justifyContent: 'center',
-      alignItems: 'center',
-      minHeight: '100vh',
-      padding: 24,
-    }}>
-      <div
-        className="glass-card animate-fade-in"
-        style={{
-          borderRadius: 14,
-          padding: 'clamp(28px, 4vw, 40px)',
-          width: '100%',
-          maxWidth: 440,
-        }}
-      >
-        <Space direction="vertical" size="large" style={{ width: '100%' }}>
-          <div style={{ textAlign: 'center' }}>
-            <div style={{
-              width: 56,
-              height: 56,
-              borderRadius: 14,
-              background: `linear-gradient(135deg, ${ACCENT_BLUE}22, ${ACCENT_BLUE}08)`,
-              border: `1px solid ${ACCENT_BLUE}33`,
-              display: 'inline-flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              marginBottom: 16,
-            }}>
-              <ApiOutlined style={{ fontSize: 24, color: ACCENT_BLUE }} />
+    <main className="dg-login-shell">
+      <div className="dg-login-orb dg-login-orb-one" />
+      <div className="dg-login-orb dg-login-orb-two" />
+      <div className="dg-login-grid" />
+
+      <section className="dg-login-card animate-fade-in" aria-label="DeltaGlider Proxy sign in">
+        <Space direction="vertical" size={24} style={{ width: '100%' }}>
+          <div className="dg-login-brand-block">
+            <div className="dg-login-mark">
+              <ApiOutlined style={{ fontSize: 26, color: ACCENT_BLUE }} />
             </div>
-            <div style={{ fontSize: 18, fontWeight: 800, letterSpacing: 3, color: TEXT_PRIMARY, lineHeight: 1.2, fontFamily: "var(--font-ui)" }}>
-              DELTAGLIDER
-            </div>
-            <div style={{ fontSize: 12, fontWeight: 600, letterSpacing: 2.5, color: ACCENT_BLUE, textTransform: 'uppercase', marginTop: 3, fontFamily: "var(--font-mono)" }}>
-              Proxy
-            </div>
-            <Text style={{ color: TEXT_MUTED, fontSize: 13, display: 'block', marginTop: 12 }}>
-              {externalProviders.length > 0
-                ? 'Sign in to continue.'
-                : isBootstrap
-                  ? 'Enter the bootstrap password to sign in.'
-                  : 'Sign in with your S3 credentials.'}
-            </Text>
+            <div className="dg-login-brand">DeltaGlider</div>
+            <div className="dg-login-product">Proxy</div>
+          </div>
+
+          <div className="dg-login-title-block">
+            <div className="dg-login-panel-eyebrow">{isBootstrap ? 'Bootstrap access' : 'Identity access'}</div>
+            <h1 className="dg-login-panel-title">Sign in</h1>
+            <Text className="dg-login-panel-copy">{loginSubtitle}</Text>
           </div>
 
           {showError && !error && (
@@ -342,19 +331,20 @@ export default function ConnectPage({ onConnect, showError }: Props) {
             <OAuthProviderList
               providers={externalProviders}
               nextUrl={window.location.pathname}
-              height={48}
+              height={54}
               fontSize={15}
+              variant="hero"
             />
           )}
 
           {/* Credential form — collapsible when OAuth is available */}
           {externalProviders.length > 0 && !showAdvanced ? (
-            <div style={{ textAlign: 'center' }}>
+            <div className="dg-login-secondary-action">
               <Button
                 type="link"
                 size="small"
                 onClick={() => setShowAdvanced(true)}
-                style={{ color: TEXT_MUTED, fontSize: 12 }}
+                style={{ color: TEXT_MUTED, fontSize: 12, fontWeight: 700 }}
               >
                 Sign in with credentials instead
               </Button>
@@ -362,19 +352,17 @@ export default function ConnectPage({ onConnect, showError }: Props) {
           ) : (
             <>
               {externalProviders.length > 0 && (
-                <div style={{ display: 'flex', alignItems: 'center', gap: 12, margin: '4px 0' }}>
-                  <div style={{ flex: 1, height: 1, background: BORDER }} />
-                  <Text style={{ color: TEXT_MUTED, fontSize: 11 }}>or use credentials</Text>
-                  <div style={{ flex: 1, height: 1, background: BORDER }} />
+                <div className="dg-login-divider">
+                  <span />
+                  <Text style={{ color: TEXT_MUTED, fontSize: 11, fontWeight: 700 }}>or use credentials</Text>
+                  <span />
                 </div>
               )}
 
               {isBootstrap ? (
                 /* Bootstrap mode: password only */
                 <div>
-                  <label style={{ fontSize: 12, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)", marginBottom: 4, display: 'block' }}>
-                    Bootstrap Password
-                  </label>
+                  <label className="dg-login-label">Bootstrap Password</label>
                   <Input.Password
                     value={adminPassword}
                     onChange={(e) => setAdminPassword(e.target.value)}
@@ -382,43 +370,39 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                     placeholder="Bootstrap password"
                     size="large"
                     autoFocus={externalProviders.length === 0}
-                    style={inputStyle}
+                    style={loginInputStyle}
                   />
-                  <Text style={{ color: TEXT_FAINT, fontSize: 11, marginTop: 4, display: 'block' }}>
+                  <Text className="dg-login-hint">
                     The admin password configured at deployment
                   </Text>
                 </div>
               ) : (
                 /* IAM mode: access key + secret key */
-                <>
+                <div className="dg-login-fields">
                   <div>
-                    <label style={{ fontSize: 12, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)", marginBottom: 4, display: 'block' }}>
-                      Access Key ID
-                    </label>
+                    <label className="dg-login-label">Access Key ID</label>
                     <Input
                       value={accessKey}
                       onChange={(e) => setAccessKey(e.target.value)}
                       placeholder="Access Key ID"
                       size="large"
                       autoFocus={externalProviders.length === 0}
-                      style={inputStyle}
+                      style={loginInputStyle}
                     />
                   </div>
 
                   <div>
-                    <label style={{ fontSize: 12, fontWeight: 600, color: TEXT_MUTED, fontFamily: "var(--font-ui)", marginBottom: 4, display: 'block' }}>
-                      Secret Access Key
-                    </label>
+                    <label className="dg-login-label">Secret Access Key</label>
                     <Input.Password
                       value={secretKey}
                       onChange={(e) => setSecretKey(e.target.value)}
                       onPressEnter={handleConnect}
                       placeholder="Secret Access Key"
                       size="large"
-                      style={inputStyle}
+                      style={loginInputStyle}
                     />
                   </div>
-                </>
+                </div>
               )}
 
               <Button
@@ -428,22 +412,14 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                 loading={loading}
                 disabled={!canSubmit}
                 onClick={handleConnect}
-                style={{
-                  height: 48,
-                  borderRadius: 10,
-                  fontWeight: 700,
-                  fontFamily: "var(--font-ui)",
-                  fontSize: 15,
-                  letterSpacing: '0.02em',
-                  marginTop: 4,
-                }}
+                className="dg-login-submit"
               >
                 {isBootstrap ? 'Sign In' : 'Connect'}
               </Button>
             </>
           )}
         </Space>
-      </div>
-    </div>
+      </section>
+    </main>
   );
 }

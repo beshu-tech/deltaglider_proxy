@@ -13,8 +13,9 @@
  * hidden on Diagnostics, first-run setup, etc.
  */
 import { useEffect, useRef, useState } from 'react';
-import { Button, message, Tooltip } from 'antd';
-import { CopyOutlined } from '@ant-design/icons';
+import { Button, Dropdown, message } from 'antd';
+import type { MenuProps } from 'antd';
+import { CopyOutlined, DownOutlined } from '@ant-design/icons';
 import type { SectionName } from '../adminApi';
 import { getSectionYaml } from '../adminApi';
 import { useColors } from '../ThemeContext';
@@ -72,23 +73,33 @@ export default function CopySectionYamlButton({ section }: Props) {
     }
   };
 
+  const label = section.charAt(0).toUpperCase() + section.slice(1);
+  const items: MenuProps['items'] = [
+    {
+      key: 'copy-section-yaml',
+      icon: <CopyOutlined />,
+      label: `Copy ${label} section YAML`,
+      onClick: () => {
+        void handleCopy();
+      },
+    },
+  ];
+
   return (
-    <Tooltip
-      title={`Copy the ${section} section as canonical YAML. Secrets are redacted.`}
-      placement="bottom"
-    >
+    <Dropdown menu={{ items }} trigger={['click']} placement="bottomRight">
       <Button
         size="small"
         type="text"
         icon={<CopyOutlined />}
         loading={copying}
-        onClick={handleCopy}
+        title={`Section-scoped YAML tools for ${label}. This does not export the full config.`}
         style={{ color: TEXT_MUTED, fontFamily: 'var(--font-ui)' }}
       >
         <span className="hide-mobile" style={{ marginLeft: 4 }}>
-          Copy {section}
+          Section YAML
         </span>
+        <DownOutlined className="hide-mobile" style={{ marginLeft: 4, fontSize: 10 }} />
       </Button>
-    </Tooltip>
+    </Dropdown>
   );
 }
