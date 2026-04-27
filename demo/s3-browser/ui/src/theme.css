@@ -479,74 +479,89 @@ body {
 }
 
 .dg-login-card {
-  width: min(100%, 428px);
-  padding: clamp(28px, 5vw, 42px);
-  border: 1px solid var(--login-card-border);
-  border-radius: 30px;
+  position: relative;
+  width: min(100%, 520px);
+  padding: clamp(34px, 4.8vw, 48px);
+  border: 1px solid color-mix(in srgb, var(--login-card-border) 84%, transparent);
+  border-radius: 24px;
   background: var(--login-panel-bg);
   box-shadow: var(--login-shadow), inset 0 1px 0 rgba(255, 255, 255, 0.08);
   backdrop-filter: blur(22px) saturate(1.12);
   -webkit-backdrop-filter: blur(22px) saturate(1.12);
 }
 
-.dg-login-brand-block {
-  display: grid;
-  justify-items: center;
-  text-align: center;
-  gap: 10px;
+.dg-login-theme-toggle {
+  position: absolute !important;
+  top: 18px;
+  right: 18px;
+  color: color-mix(in srgb, var(--login-hero-text) 58%, transparent) !important;
+  border: 1px solid color-mix(in srgb, var(--login-card-border) 78%, transparent) !important;
+  background: color-mix(in srgb, var(--glass-bg) 48%, transparent) !important;
 }
 
-.dg-login-mark {
-  width: 64px;
-  height: 64px;
+.dg-login-theme-toggle:hover {
+  color: var(--focus-ring) !important;
+  border-color: color-mix(in srgb, var(--focus-ring) 38%, var(--login-card-border)) !important;
+  background: color-mix(in srgb, var(--glass-bg) 68%, var(--focus-ring) 8%) !important;
+}
+
+.dg-login-brand-block {
   display: grid;
-  place-items: center;
-  border: 1px solid color-mix(in srgb, var(--focus-ring) 34%, var(--login-card-border));
-  border-radius: 20px;
-  background:
-    linear-gradient(145deg, color-mix(in srgb, var(--focus-ring) 18%, transparent), transparent),
-    color-mix(in srgb, var(--glass-bg) 58%, transparent);
-  box-shadow: 0 18px 46px rgba(0, 0, 0, 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  justify-items: start;
+  text-align: left;
+  gap: 12px;
+  padding-bottom: 8px;
 }
 
 .dg-login-brand {
   color: var(--login-hero-text);
-  font: 800 24px/1 var(--font-ui);
-  letter-spacing: 0.18em;
+  font: 800 clamp(28px, 6vw, 40px)/0.9 var(--font-ui);
+  letter-spacing: 0.30em;
   text-transform: uppercase;
+  text-shadow: 0 0 18px color-mix(in srgb, var(--login-hero-text) 18%, transparent);
 }
 
 .dg-login-product {
   color: var(--focus-ring);
-  font: 800 11px/1 var(--font-mono);
-  letter-spacing: 0.42em;
+  font: 800 clamp(20px, 4vw, 28px)/0.9 var(--font-mono);
+  letter-spacing: 0.34em;
   text-transform: uppercase;
+  text-shadow: 0 0 18px color-mix(in srgb, var(--focus-ring) 30%, transparent);
 }
 
-.dg-login-title-block {
-  text-align: center;
+.dg-login-sso-list {
+  display: grid;
+  gap: 10px;
 }
 
-.dg-login-panel-eyebrow {
-  margin-bottom: 12px;
-  color: var(--focus-ring);
-  font: 800 10px/1 var(--font-mono);
-  letter-spacing: 0.20em;
-  text-transform: uppercase;
-}
-
-.dg-login-panel-title {
-  margin: 0;
+.dg-login-sso-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  width: 100%;
+  padding: 0 18px;
+  border: 1px solid color-mix(in srgb, var(--focus-ring) 24%, var(--login-card-border));
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--glass-bg) 66%, transparent);
   color: var(--login-hero-text);
-  font: 800 28px/1.1 var(--font-ui);
-  letter-spacing: -0.04em;
+  font-weight: 800;
+  font-family: var(--font-ui);
+  text-decoration: none;
+  cursor: pointer;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease, transform 0.15s ease;
 }
 
-.dg-login-panel-copy {
-  display: block;
-  margin-top: 10px;
-  color: color-mix(in srgb, var(--login-hero-text) 66%, transparent) !important;
-  font: 500 14px/1.55 var(--font-ui);
+.dg-login-sso-button:hover {
+  border-color: color-mix(in srgb, var(--focus-ring) 58%, var(--login-card-border));
+  background: color-mix(in srgb, var(--glass-bg) 78%, var(--focus-ring) 10%);
+  color: var(--login-hero-text);
+  transform: translateY(-1px);
+}
+
+.dg-login-sso-button .anticon {
+  color: var(--focus-ring);
 }
 
 .dg-login-secondary-action {
@@ -585,16 +600,28 @@ body {
 
 .dg-login-fields {
   display: grid;
-  gap: 16px;
+  gap: 18px;
 }
 
 .dg-login-submit {
   height: 54px !important;
-  margin-top: 2px;
+  margin-top: 8px;
+  border: 0 !important;
   border-radius: 16px !important;
+  background: linear-gradient(135deg, var(--focus-ring), color-mix(in srgb, var(--focus-ring) 72%, #60a5fa)) !important;
+  color: #06121a !important;
   font: 800 15px/1 var(--font-ui) !important;
-  letter-spacing: 0.04em !important;
-  box-shadow: 0 18px 38px color-mix(in srgb, var(--focus-ring) 24%, transparent) !important;
+  letter-spacing: 0.01em !important;
+  box-shadow:
+    0 18px 38px color-mix(in srgb, var(--focus-ring) 22%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.30) !important;
+}
+
+.dg-login-submit:disabled {
+  border: 1px solid color-mix(in srgb, var(--focus-ring) 22%, var(--login-card-border)) !important;
+  background: color-mix(in srgb, var(--glass-bg) 70%, transparent) !important;
+  color: color-mix(in srgb, var(--login-hero-text) 34%, transparent) !important;
+  box-shadow: none !important;
 }
 
 @media (max-width: 560px) {
@@ -610,6 +637,14 @@ body {
   .dg-login-card {
     border-radius: 24px;
     padding: 26px;
+  }
+
+  .dg-login-brand {
+    letter-spacing: 0.18em;
+  }
+
+  .dg-login-product {
+    letter-spacing: 0.24em;
   }
 }
 

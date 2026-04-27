@@ -1,12 +1,12 @@
 import { useState, useEffect } from 'react';
 import { Button, Input, Typography, Space, Alert, Spin, message } from 'antd';
-import { ApiOutlined, WarningOutlined, CheckCircleOutlined, CopyOutlined } from '@ant-design/icons';
+import { WarningOutlined, CheckCircleOutlined, CopyOutlined, SunOutlined, MoonOutlined } from '@ant-design/icons';
 import { testConnection, setEndpoint, setCredentials, setBucket, initFromSession } from '../s3client';
 import { adminLogin, loginAs, whoami, recoverDb } from '../adminApi';
 import type { ExternalProviderInfo } from '../adminApi';
 import OAuthProviderList from './OAuthProviderList';
 import { detectDefaultEndpoint } from '../utils';
-import { useColors } from '../ThemeContext';
+import { useColors, useTheme } from '../ThemeContext';
 
 const { Text } = Typography;
 
@@ -17,6 +17,7 @@ interface Props {
 
 export default function ConnectPage({ onConnect, showError }: Props) {
   const { BORDER, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY, ACCENT_BLUE } = useColors();
+  const { isDark, toggleTheme } = useTheme();
   const [accessKey, setAccessKey] = useState('');
   const [secretKey, setSecretKey] = useState('');
   const [adminPassword, setAdminPassword] = useState('');
@@ -172,11 +173,6 @@ export default function ConnectPage({ onConnect, showError }: Props) {
 
   const isBootstrap = authMode === 'bootstrap';
   const canSubmit = isBootstrap ? adminPassword.trim() : (accessKey.trim() && secretKey.trim());
-  const loginSubtitle = externalProviders.length > 0
-    ? 'Use your identity provider to continue.'
-    : isBootstrap
-      ? 'Enter the deployment bootstrap password.'
-      : 'Enter your S3 credentials.';
 
   const inputStyle = {
     background: 'var(--input-bg)',
@@ -305,20 +301,22 @@ export default function ConnectPage({ onConnect, showError }: Props) {
       <div className="dg-login-orb dg-login-orb-two" />
       <div className="dg-login-grid" />
 
-      <section className="dg-login-card animate-fade-in" aria-label="DeltaGlider Proxy sign in">
-        <Space direction="vertical" size={24} style={{ width: '100%' }}>
+      <section className="dg-login-card animate-fade-in" aria-label="DeltaGlider sign in">
+        <Button
+          type="text"
+          shape="circle"
+          size="small"
+          icon={isDark ? <MoonOutlined /> : <SunOutlined />}
+          title={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
+          aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
+          onClick={toggleTheme}
+          className="dg-login-theme-toggle"
+        />
+
+        <Space direction="vertical" size={22} style={{ width: '100%' }}>
           <div className="dg-login-brand-block">
-            <div className="dg-login-mark">
-              <ApiOutlined style={{ fontSize: 26, color: ACCENT_BLUE }} />
-            </div>
             <div className="dg-login-brand">DeltaGlider</div>
             <div className="dg-login-product">Proxy</div>
-          </div>
-
-          <div className="dg-login-title-block">
-            <div className="dg-login-panel-eyebrow">{isBootstrap ? 'Bootstrap access' : 'Identity access'}</div>
-            <h1 className="dg-login-panel-title">Sign in</h1>
-            <Text className="dg-login-panel-copy">{loginSubtitle}</Text>
           </div>
 
           {showError && !error && (
@@ -362,7 +360,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
               {isBootstrap ? (
                 /* Bootstrap mode: password only */
                 <div>
-                  <label className="dg-login-label">Bootstrap Password</label>
+                  <label className="dg-login-label">Bootstrap password</label>
                   <Input.Password
                     value={adminPassword}
                     onChange={(e) => setAdminPassword(e.target.value)}
@@ -373,14 +371,14 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                     style={loginInputStyle}
                   />
                   <Text className="dg-login-hint">
-                    The admin password configured at deployment
+                    Deployment-level access for first run and recovery
                   </Text>
                 </div>
               ) : (
                 /* IAM mode: access key + secret key */
                 <div className="dg-login-fields">
                   <div>
-                    <label className="dg-login-label">Access Key ID</label>
+                    <label className="dg-login-label">Access key ID</label>
                     <Input
                       value={accessKey}
                       onChange={(e) => setAccessKey(e.target.value)}
@@ -392,7 +390,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                   </div>
 
                   <div>
-                    <label className="dg-login-label">Secret Access Key</label>
+                    <label className="dg-login-label">Secret access key</label>
                     <Input.Password
                       value={secretKey}
                       onChange={(e) => setSecretKey(e.target.value)}
@@ -414,7 +412,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                 onClick={handleConnect}
                 className="dg-login-submit"
               >
-                {isBootstrap ? 'Sign In' : 'Connect'}
+                Sign in
               </Button>
             </>
           )}
