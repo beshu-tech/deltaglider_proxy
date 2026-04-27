@@ -11,7 +11,8 @@ const PAGES = [
   { path: 'regulated/index.html', label: '/regulated/' },
   { path: 'artifact-storage/index.html', label: '/artifact-storage/' },
   { path: 'minio-migration/index.html', label: '/minio-migration/' },
-  { path: 's3-saas-control-plane/index.html', label: '/s3-saas-control-plane/' },
+  { path: 's3-to-hetzner-wasabi/index.html', label: '/s3-to-hetzner-wasabi/' },
+  { path: 'multi-cloud-control-plane/index.html', label: '/multi-cloud-control-plane/' },
   { path: 'about/index.html', label: '/about/' },
   { path: 'privacy/index.html', label: '/privacy/' },
   { path: 'terms/index.html', label: '/terms/' },
@@ -59,7 +60,7 @@ for (const page of PAGES) {
   }
 
   const ssgCanary =
-    />Smaller object storage|>Not S3 object versioning|>Use cheap storage without trusting|>Self-hosted S3 without losing|>Use cheaper S3 storage|>Business impact|>DeltaGlider Proxy is built by Beshu Tech|>Privacy Policy|>Terms of Service/;
+    />Smaller object storage|>Not S3 object versioning|>Use cheap storage without trusting|>Self-hosted S3 without losing|>Use cheaper S3 storage|>Move Amazon S3 data to Hetzner or Wasabi|>One S3 security layer|>Business impact|>DeltaGlider Proxy is built by Beshu Tech|>Privacy Policy|>Terms of Service/;
   if (!ssgCanary.test(html)) {
     console.error(
       `✗ ${page.label}: page content not found in raw HTML — SSG may not have pre-rendered`,

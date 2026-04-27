@@ -98,6 +98,53 @@ async fn test_three_versions_all_retrievable() {
 }
 
 #[tokio::test]
+async fn test_xdelta_does_not_recompress_magic_compressed_payloads() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+
+    let mut base = b"\xFD7zXZ\x00".to_vec();
+    base.extend((0..512_000).map(|i| (i % 251) as u8));
+
+    let mut variant = base.clone();
+    variant.extend_from_slice(b"-variant-release");
+    for i in (8192..variant.len()).step_by(4096) {
+        variant[i] = variant[i].wrapping_add(7);
+    }
+
+    put_and_get_storage_type(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        "compressed-magic/base.zip",
+        base.clone(),
+        "application/zip",
+    )
+    .await;
+    let st = put_and_get_storage_type(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        "compressed-magic/v1.zip",
+        variant.clone(),
+        "application/zip",
+    )
+    .await;
+
+    assert_eq!(st, "delta", "variant should exercise delta reconstruction");
+    assert_eq!(
+        get_bytes(
+            &http,
+            &server.endpoint(),
+            server.bucket(),
+            "compressed-magic/v1.zip",
+        )
+        .await,
+        variant,
+        "delta reconstruction must preserve exact compressed bytes"
+    );
+}
+
+#[tokio::test]
 async fn test_txt_file_stored_passthrough() {
     let server = TestServer::filesystem().await;
     let http = reqwest::Client::new();

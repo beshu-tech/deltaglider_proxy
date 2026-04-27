@@ -5,6 +5,32 @@
 node_modules/
 dist/
 
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+.env.*
+!.env.example
+pip-wheel-metadata/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+site/
+*.egg
+
+# Benchmark output
+docs/benchmark/data/
+docs/benchmark/results/
+docs/benchmark/*.tgz
+
 # IDE
 .vscode/
 .idea/

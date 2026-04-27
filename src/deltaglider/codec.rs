@@ -308,7 +308,11 @@ impl DeltaCodec {
             .ok_or_else(|| make_error("temp file path is not valid UTF-8".to_string()))?;
 
         let result = Command::new("xdelta3")
-            .args([mode, "-s", source_path, "-c"])
+            // -D is critical for transparent object storage: xdelta3 otherwise
+            // auto-decompresses recognised compressed inputs (gzip/xz/etc.) and
+            // recompresses on decode, which preserves logical content but not
+            // byte identity. S3 clients require exact original bytes.
+            .args([mode, "-D", "-s", source_path, "-c"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -623,6 +627,29 @@ mod tests {
 
         let source = pseudo_random(42, 100_000);
         let target = pseudo_random(999, 100_000);
+
+        let delta = codec.encode(&source, &target).unwrap();
+        let reconstructed = codec.decode(&source, &delta).unwrap();
+        assert_eq!(reconstructed, target);
+    }
+
+    #[test]
+    fn test_xz_magic_bytes_roundtrip_preserves_exact_compressed_bytes() {
+        let codec = DeltaCodec::default();
+
+        // xdelta3 auto-detects common compressed formats by magic bytes and,
+        // unless -D is passed, transparently decompresses/recompresses them.
+        // That is useful for patches but invalid for S3 transparency because
+        // recompression changes bytes/checksums. These are not valid xz files,
+        // but they exercise the "compressed input" magic-byte path.
+        let mut source = b"\xFD7zXZ\x00".to_vec();
+        source.extend((0..4096).map(|i| (i % 251) as u8));
+
+        let mut target = source.clone();
+        target.extend_from_slice(b"-new-release-bytes");
+        for i in (128..target.len()).step_by(257) {
+            target[i] = target[i].wrapping_add(17);
+        }
 
         let delta = codec.encode(&source, &target).unwrap();
         let reconstructed = codec.decode(&source, &delta).unwrap();

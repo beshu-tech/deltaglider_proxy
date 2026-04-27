@@ -31,7 +31,8 @@ const OG_LANDING = `${SITE_URL}/screenshots/filebrowser.jpg`;
 const OG_REGULATED = `${SITE_URL}/screenshots/advanced_security.jpg`;
 const OG_VERSIONING = `${SITE_URL}/screenshots/analytics.jpg`;
 const OG_MINIO = `${SITE_URL}/screenshots/iam.jpg`;
-const OG_S3_SAAS = `${SITE_URL}/screenshots/bucket-policies.jpg`;
+const OG_S3_MIGRATION = `${SITE_URL}/screenshots/filebrowser.jpg`;
+const OG_MULTI_CLOUD = `${SITE_URL}/screenshots/object-replication.jpg`;
 
 export const landingMeta: PageMeta = {
   path: '/',
@@ -163,28 +164,60 @@ export const minioMigrationMeta: PageMeta = {
   ],
 };
 
-export const s3SaasMeta: PageMeta = {
-  path: '/s3-saas-control-plane/',
-  title: 'Cheaper S3 SaaS — enterprise control plane for lower-cost storage',
+export const s3MigrationMeta: PageMeta = {
+  path: '/s3-to-hetzner-wasabi/',
+  title: 'Amazon S3 to Hetzner or Wasabi — keep enterprise controls with DGP',
   description:
-    'Use lower-cost S3-compatible storage without giving up enterprise controls. DeltaGlider adds local-key encryption, IAM, OAuth, bucket policy, quotas, replication, audit, and operator UI.',
-  ogImage: OG_S3_SAAS,
+    'Compare Amazon S3 Standard against Hetzner or Wasabi plus DeltaGlider Proxy. Model lower storage fees, delta compression, and enterprise control-plane replacement.',
+  ogImage: OG_S3_MIGRATION,
   jsonLd: [
     organization(),
     breadcrumb([
       { name: 'Home', path: '/' },
-      { name: 'Cheaper S3 SaaS', path: '/s3-saas-control-plane/' },
+      { name: 'Amazon S3 to Hetzner or Wasabi', path: '/s3-to-hetzner-wasabi/' },
     ]),
     faqPage([
       {
-        question: 'Why not just use a cheaper S3-compatible provider directly?',
+        question: 'How does DeltaGlider reduce an Amazon S3 bill during migration?',
         answer:
-          'Many lower-cost S3-compatible providers are good at basic object storage but do not provide the enterprise control plane teams expect from AWS S3. DeltaGlider adds local-key encryption, IAM, OAuth/OIDC mapping, bucket policy, soft quotas, replication, metrics, audit, and operator UI in front of the backend.',
+          'DeltaGlider combines two levers: a lower-cost S3-compatible backend such as Hetzner Object Storage or Wasabi, and transparent delta compression for repeated binary artifacts.',
       },
       {
-        question: 'Does DeltaGlider replace the storage backend?',
+        question: 'Does DeltaGlider replace Amazon S3 enterprise controls?',
         answer:
-          'No. DeltaGlider is a proxy and control-plane layer. Applications speak S3 to DeltaGlider, and DeltaGlider stores data in the backend you choose.',
+          'For app-facing S3 workflows, DeltaGlider provides IAM users and groups, S3 access keys, OAuth/OIDC mapping, ABAC policies, bucket policy, public prefixes, quotas, replication, metrics, audit, and operator UI. It is not a full replacement for every AWS-native lifecycle or Object Lock feature.',
+      },
+      {
+        question: 'Are request, egress, and retrieval fees included in the calculator?',
+        answer:
+          'No. The calculator models storage capacity only so the storage-price and compression levers are visible. Real migration analysis should include request profile, egress, support plan, minimum storage duration, tax/VAT, and provider-specific limits.',
+      },
+    ]),
+  ],
+};
+
+export const multiCloudMeta: PageMeta = {
+  path: '/multi-cloud-control-plane/',
+  title: 'Multi-cloud S3 control plane — one security layer for many backends',
+  description:
+    'Use DeltaGlider as a unified S3-compatible security and operations layer across on-prem, Hetzner, Wasabi, and other object-storage backends.',
+  ogImage: OG_MULTI_CLOUD,
+  jsonLd: [
+    organization(),
+    breadcrumb([
+      { name: 'Home', path: '/' },
+      { name: 'Multi-cloud control plane', path: '/multi-cloud-control-plane/' },
+    ]),
+    faqPage([
+      {
+        question: 'Can DeltaGlider front multiple object-storage backends?',
+        answer:
+          'Yes. DeltaGlider supports named backends, per-bucket backend routing, aliases, IAM, OAuth/OIDC, ABAC, audit, metrics, encryption, and object replication rules.',
+      },
+      {
+        question: 'Can I keep recent data on-prem and archive older data to cloud storage?',
+        answer:
+          'DeltaGlider can support lifecycle-style placement patterns with bucket routing, encryption, and replication rules over date-partitioned prefixes. This is not a claim of full Amazon S3 Lifecycle parity.',
       },
     ]),
   ],
@@ -240,7 +273,8 @@ export const allPages: readonly PageMeta[] = [
   regulatedMeta,
   versioningMeta,
   minioMigrationMeta,
-  s3SaasMeta,
+  s3MigrationMeta,
+  multiCloudMeta,
   aboutMeta,
   privacyMeta,
   termsMeta,

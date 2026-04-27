@@ -1,13 +1,19 @@
 import type { RouteRecord } from 'vite-react-ssg';
+import { Navigate } from 'react-router-dom';
 import { Layout } from './components/Layout';
 import { About } from './pages/About';
 import { Landing } from './pages/Landing';
 import { MinioMigration } from './pages/MinioMigration';
+import { MultiCloud } from './pages/MultiCloud';
 import { Privacy } from './pages/Privacy';
 import { Regulated } from './pages/Regulated';
-import { S3Saas } from './pages/S3Saas';
+import { S3Migration } from './pages/S3Migration';
 import { Terms } from './pages/Terms';
 import { Versioning } from './pages/Versioning';
+
+function RedirectToS3Migration(): JSX.Element {
+  return <Navigate to="/s3-to-hetzner-wasabi/" replace />;
+}
 
 export const routes: RouteRecord[] = [
   {
@@ -33,8 +39,17 @@ export const routes: RouteRecord[] = [
       },
       {
         path: 's3-saas-control-plane',
-        Component: S3Saas,
-        entry: 'src/pages/S3Saas.tsx',
+        Component: RedirectToS3Migration,
+      },
+      {
+        path: 's3-to-hetzner-wasabi',
+        Component: S3Migration,
+        entry: 'src/pages/S3Migration.tsx',
+      },
+      {
+        path: 'multi-cloud-control-plane',
+        Component: MultiCloud,
+        entry: 'src/pages/MultiCloud.tsx',
       },
       {
         path: 'about',

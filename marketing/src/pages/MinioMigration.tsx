@@ -75,6 +75,26 @@ export function MinioMigration(): JSX.Element {
             </div>
           ))}
         </div>
+        <div className="mt-6 rounded-2xl border border-brand-300/50 bg-brand-50 p-5 dark:border-brand-500/30 dark:bg-brand-950/40">
+          <div className="text-xs font-extrabold uppercase tracking-[0.18em] text-brand-700 dark:text-brand-300">
+            Garage + DeltaGlider
+          </div>
+          <p className="mt-2 max-w-3xl text-sm leading-6 text-ink-700 dark:text-ink-200">
+            Garage is a strong open-source storage layer. Its own S3
+            compatibility reference is also a useful checklist for what belongs
+            in a separate control plane: identity, policy, quotas, audit,
+            replication operations, and operator workflows.
+          </p>
+          <a
+            href="https://garagehq.deuxfleurs.fr/documentation/reference-manual/s3-compatibility"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="mt-3 inline-flex items-center gap-1 text-sm font-bold text-brand-700 hover:text-brand-800 dark:text-brand-300 dark:hover:text-brand-200"
+          >
+            Garage S3 compatibility reference
+            <span aria-hidden>↗</span>
+          </a>
+        </div>
       </Section>
       <Section
         eyebrow="Real-world scenarios"

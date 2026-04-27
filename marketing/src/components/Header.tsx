@@ -25,10 +25,16 @@ export function Header(): JSX.Element {
             Artifact storage
           </Link>
           <Link
-            to="/s3-saas-control-plane/"
+            to="/s3-to-hetzner-wasabi/"
             className="text-ink-700 hover:text-brand-600 dark:text-ink-200 dark:hover:text-brand-300"
           >
-            Cheaper S3
+            AWS migration
+          </Link>
+          <Link
+            to="/multi-cloud-control-plane/"
+            className="text-ink-700 hover:text-brand-600 dark:text-ink-200 dark:hover:text-brand-300"
+          >
+            Multi-cloud
           </Link>
           <Link
             to="/minio-migration/"
@@ -63,10 +69,16 @@ export function Header(): JSX.Element {
               Artifact storage
             </Link>
             <Link
-              to="/s3-saas-control-plane/"
+              to="/s3-to-hetzner-wasabi/"
               className="block rounded-lg px-3 py-2 text-sm font-semibold text-ink-700 hover:bg-ink-100 dark:text-ink-200 dark:hover:bg-ink-800"
             >
-              Cheaper S3
+              AWS migration
+            </Link>
+            <Link
+              to="/multi-cloud-control-plane/"
+              className="block rounded-lg px-3 py-2 text-sm font-semibold text-ink-700 hover:bg-ink-100 dark:text-ink-200 dark:hover:bg-ink-800"
+            >
+              Multi-cloud
             </Link>
             <Link
               to="/minio-migration/"

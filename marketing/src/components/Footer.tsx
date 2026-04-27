@@ -51,8 +51,13 @@ export function Footer(): JSX.Element {
                   </Link>
                 </li>
                 <li>
-                  <Link to="/s3-saas-control-plane/" className="hover:text-brand-200">
-                    Cheaper S3 SaaS
+                  <Link to="/s3-to-hetzner-wasabi/" className="hover:text-brand-200">
+                    S3 to Hetzner / Wasabi
+                  </Link>
+                </li>
+                <li>
+                  <Link to="/multi-cloud-control-plane/" className="hover:text-brand-200">
+                    Multi-cloud control plane
                   </Link>
                 </li>
                 <li>
