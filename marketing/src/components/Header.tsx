@@ -1,38 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { USE_CASE_PATHS, siteNavIcon } from '../config/use-cases';
 import { DOCS_PATH, REPO_URL } from '../seo/schema';
+import { SiteIcon } from '../icons/SiteIcon';
+import { LUCIDE_LG, LUCIDE_MEGA, LUCIDE_MD, LUCIDE_SM } from '../icons/sizes';
 
 const THEME_STORAGE_KEY = 'dgp-marketing-theme';
 
 type Theme = 'light' | 'dark';
-
-const USE_CASES = [
-  {
-    to: '/regulated/',
-    label: 'Regulated workloads',
-    summary: 'Use cheaper object storage without handing it plaintext or key custody.',
-  },
-  {
-    to: '/artifact-storage/',
-    label: 'Artifact storage',
-    summary: 'Compress repeated builds, backups, dumps, models, and package catalogs.',
-  },
-  {
-    to: '/s3-to-hetzner-wasabi/',
-    label: 'AWS migration',
-    summary: 'Move hot S3 API workloads to lower-cost backends and keep the controls.',
-  },
-  {
-    to: '/multi-cloud-control-plane/',
-    label: 'Multi-cloud control plane',
-    summary: 'One policy, identity, encryption, audit, and replication layer over many stores.',
-  },
-  {
-    to: '/minio-migration/',
-    label: 'MinIO migration',
-    summary: 'Keep self-hosted S3 and bring back IAM, OAuth, quotas, replication, and UI.',
-  },
-] as const;
 
 function getCurrentTheme(): Theme {
   if (typeof document === 'undefined') return 'light';
@@ -85,6 +60,9 @@ function ThemeToggle(): JSX.Element {
   );
 }
 
+const megaIconClass =
+  'flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-white/10 bg-gradient-to-b from-white/[0.1] to-white/[0.03] text-brand-200 transition group-hover/item:border-brand-200/35 group-hover/item:from-white/[0.12] group-hover/item:text-white';
+
 function UseCasesMegaMenu(): JSX.Element {
   const [open, setOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -116,57 +94,71 @@ function UseCasesMegaMenu(): JSX.Element {
       <button
         type="button"
         onClick={() => setOpen((value) => !value)}
-        className="rounded-lg px-3 py-2 text-ink-700 transition hover:bg-ink-100 hover:text-brand-700 dark:text-ink-200 dark:hover:bg-ink-800 dark:hover:text-brand-300"
+        className="inline-flex items-center gap-2 rounded-lg px-3 py-2 text-ink-700 transition hover:bg-ink-100 hover:text-brand-700 dark:text-ink-200 dark:hover:bg-ink-800 dark:hover:text-brand-300"
         aria-expanded={open}
         aria-haspopup="menu"
+        aria-label="Use cases"
       >
-        Use cases
+        <SiteIcon icon={siteNavIcon.useCases} className={LUCIDE_MD} />
+        <span>Use cases</span>
       </button>
       {open && (
-      <div
-        className="absolute right-0 top-full mt-4 w-[min(760px,calc(100vw-3rem))] overflow-hidden rounded-3xl border border-brand-300/20 bg-ink-950 p-3 text-white shadow-2xl shadow-ink-950/30"
-        role="menu"
-      >
-        <div className="border-b border-white/10 px-4 pb-3 pt-2">
-          <div className="text-[11px] font-black uppercase tracking-[0.24em] text-brand-300">
-            Use cases
+        <div
+          className="absolute right-0 top-full z-20 mt-4 w-[min(760px,calc(100vw-3rem))] overflow-hidden rounded-3xl border border-brand-300/20 bg-ink-950 p-3 text-white shadow-2xl shadow-ink-950/30"
+          role="menu"
+        >
+          <div className="border-b border-white/10 px-4 pb-3 pt-2">
+            <div className="flex items-center gap-2 text-[11px] font-black uppercase tracking-[0.24em] text-brand-300">
+              <SiteIcon icon={siteNavIcon.useCases} className={LUCIDE_SM} />
+              Use cases
+            </div>
+            <p className="mt-1 max-w-xl text-sm font-semibold leading-6 text-ink-300">
+              Start with the storage problem. Each path maps to a concrete deployment shape.
+            </p>
           </div>
-          <p className="mt-1 max-w-xl text-sm font-semibold leading-6 text-ink-300">
-            Start with the storage problem. Each path maps to a concrete deployment shape.
-          </p>
-        </div>
-        <div className="grid gap-1 py-3 sm:grid-cols-2">
-          {USE_CASES.map((item) => (
+          <div className="grid gap-1 py-3 sm:grid-cols-2">
+            {USE_CASE_PATHS.map((item) => {
+              return (
+                <Link
+                  key={item.to}
+                  to={item.to}
+                  onClick={() => setOpen(false)}
+                  className="group/item flex gap-3 rounded-2xl border border-transparent p-3.5 text-left transition hover:border-brand-300/40 hover:bg-white/[0.06]"
+                  role="menuitem"
+                >
+                  <div className={megaIconClass} aria-hidden>
+                    <SiteIcon icon={item.icon} className={LUCIDE_MEGA} />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="font-extrabold text-white group-hover/item:text-brand-200">
+                      {item.navLabel}
+                    </div>
+                    <p className="mt-1.5 text-sm font-medium leading-6 text-ink-300">
+                      {item.summary}
+                    </p>
+                  </div>
+                </Link>
+              );
+            })}
+          </div>
+          <div className="rounded-2xl border border-brand-300/40 bg-gradient-to-r from-brand-300 to-cyan-200 p-4 text-ink-950">
             <Link
-              key={item.to}
-              to={item.to}
+              to={DOCS_PATH}
               onClick={() => setOpen(false)}
-              className="group/item rounded-2xl border border-transparent p-4 transition hover:border-brand-300/40 hover:bg-white/[0.06]"
+              className="inline-flex items-center gap-2.5 text-sm font-black text-ink-950 hover:text-brand-950"
               role="menuitem"
             >
-              <div className="font-extrabold text-white group-hover/item:text-brand-200">
-                {item.label}
-              </div>
-              <p className="mt-2 text-sm font-semibold leading-6 text-ink-300">
-                {item.summary}
-              </p>
+              <SiteIcon icon={siteNavIcon.docs} className={LUCIDE_LG} />
+              <span>
+                Open the product docs <span aria-hidden>→</span>
+              </span>
             </Link>
-          ))}
+            <p className="mt-1.5 pl-10 text-sm font-bold leading-6 text-ink-800/95 sm:pl-11">
+              Setup, config, IAM, encryption, metrics, replication, and operations. Same docs as the
+              product UI.
+            </p>
+          </div>
         </div>
-        <div className="rounded-2xl border border-brand-300/40 bg-gradient-to-r from-brand-300 to-cyan-200 p-4 text-ink-950">
-          <Link
-            to={DOCS_PATH}
-            onClick={() => setOpen(false)}
-            className="inline-flex items-center gap-2 text-sm font-black text-ink-950 hover:text-brand-950"
-            role="menuitem"
-          >
-            Open the product docs <span aria-hidden>→</span>
-          </Link>
-          <p className="mt-1 text-sm font-bold leading-6 text-ink-800">
-            Setup, config, IAM, encryption, metrics, replication, and operations. Same docs as the product UI.
-          </p>
-        </div>
-      </div>
       )}
     </div>
   );
@@ -178,7 +170,7 @@ export function Header(): JSX.Element {
       <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-4">
         <Link
           to="/"
-          className="font-extrabold text-lg tracking-tight text-ink-900 dark:text-ink-50 hover:text-brand-600 dark:hover:text-brand-300 transition-colors"
+          className="font-extrabold text-lg tracking-tight text-ink-900 dark:text-ink-50 transition-colors hover:text-brand-600 dark:hover:text-brand-300"
         >
           DeltaGlider <span className="text-brand-500">Proxy</span>
         </Link>
@@ -186,8 +178,9 @@ export function Header(): JSX.Element {
           <UseCasesMegaMenu />
           <Link
             to={DOCS_PATH}
-            className="rounded-lg bg-ink-950 px-4 py-2 font-extrabold text-white shadow-lg shadow-ink-950/10 transition hover:bg-brand-700 dark:bg-brand-300 dark:text-ink-950 dark:hover:bg-brand-200"
+            className="inline-flex items-center gap-2 rounded-lg bg-ink-950 px-3.5 py-2 pl-3 font-extrabold text-white shadow-lg shadow-ink-950/10 transition hover:bg-brand-700 dark:bg-brand-300 dark:text-ink-950 dark:hover:bg-brand-200"
           >
+            <SiteIcon icon={siteNavIcon.docs} className="h-4 w-4 min-h-4 min-w-4" />
             Docs
           </Link>
           <ThemeToggle />
@@ -195,8 +188,9 @@ export function Header(): JSX.Element {
             href={REPO_URL}
             target="_blank"
             rel="noopener noreferrer"
-            className="rounded-md border border-ink-300 bg-white px-3 py-1.5 text-ink-800 hover:border-brand-400 hover:text-brand-700 dark:border-ink-600 dark:bg-ink-800 dark:text-ink-100 dark:hover:border-brand-300 dark:hover:text-brand-300"
+            className="inline-flex items-center gap-2 rounded-md border border-ink-300 bg-white py-1.5 pl-2.5 pr-3 text-ink-800 transition hover:border-brand-400 hover:text-brand-700 dark:border-ink-600 dark:bg-ink-800 dark:text-ink-100 dark:hover:border-brand-300 dark:hover:text-brand-300"
           >
+            <SiteIcon icon={siteNavIcon.github} className="h-3.5 w-3.5" />
             GitHub
           </a>
         </nav>
@@ -204,35 +198,45 @@ export function Header(): JSX.Element {
           <summary className="list-none rounded-md border border-ink-300 bg-white px-3 py-1.5 text-sm font-bold text-ink-800 dark:border-ink-600 dark:bg-ink-800 dark:text-ink-100">
             Menu
           </summary>
-          <div className="absolute right-0 mt-3 w-80 rounded-xl border border-ink-200 bg-white p-2 shadow-xl dark:border-ink-700 dark:bg-ink-900">
-            <div className="px-3 pb-1 pt-2 text-[11px] font-extrabold uppercase tracking-widest text-ink-400">
+          <div className="absolute right-0 z-20 mt-3 w-[min(100vw-1.5rem,20rem)] max-h-[80vh] overflow-y-auto rounded-xl border border-ink-200 bg-white p-2 shadow-xl dark:border-ink-700 dark:bg-ink-900">
+            <div className="px-2 pb-1.5 pt-1 text-[10px] font-extrabold uppercase tracking-widest text-ink-400">
               Use cases
             </div>
-            {USE_CASES.map((item) => (
-              <Link
-                key={item.to}
-                to={item.to}
-                className="block rounded-lg px-3 py-2 text-sm font-semibold text-ink-700 hover:bg-ink-100 dark:text-ink-200 dark:hover:bg-ink-800"
-              >
-                {item.label}
-              </Link>
+            {USE_CASE_PATHS.map((item) => (
+                <Link
+                  key={item.to}
+                  to={item.to}
+                  className="flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm font-semibold text-ink-700 hover:bg-ink-100 dark:text-ink-200 dark:hover:bg-ink-800"
+                >
+                  <span
+                    className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-ink-100 text-ink-800 dark:bg-ink-800 dark:text-brand-200"
+                    aria-hidden
+                  >
+                    <SiteIcon icon={item.icon} className={LUCIDE_SM} />
+                  </span>
+                  {item.navLabel}
+                </Link>
             ))}
             <Link
               to={DOCS_PATH}
-              className="mt-2 block rounded-lg bg-ink-950 px-3 py-2 text-sm font-extrabold text-white hover:bg-brand-700 dark:bg-brand-300 dark:text-ink-950 dark:hover:bg-brand-200"
+              className="mt-1 flex items-center gap-2.5 rounded-lg bg-ink-950 px-2.5 py-2.5 text-sm font-extrabold text-white transition hover:bg-brand-700 dark:bg-brand-300 dark:text-ink-950 dark:hover:bg-brand-200"
             >
+              <SiteIcon icon={siteNavIcon.docs} className={LUCIDE_MD} />
               Docs
             </Link>
-            <div className="px-3 py-2">
+            <div className="border-t border-ink-200 px-2 py-2 dark:border-ink-700">
               <ThemeToggle />
             </div>
             <a
               href={REPO_URL}
               target="_blank"
               rel="noopener noreferrer"
-              className="block rounded-lg px-3 py-2 text-sm font-semibold text-brand-700 hover:bg-brand-50 dark:text-brand-300 dark:hover:bg-ink-800"
+              className="block rounded-lg px-2.5 py-2 text-sm font-semibold text-brand-700 transition hover:bg-brand-50 dark:text-brand-300 dark:hover:bg-ink-800"
             >
-              GitHub
+              <span className="inline-flex items-center gap-2">
+                <SiteIcon icon={siteNavIcon.github} className="h-3.5 w-3.5" />
+                GitHub
+              </span>
             </a>
           </div>
         </details>

@@ -8,7 +8,7 @@
 
 When binary-similar objects are stored over many versions — backup archives, software catalogs, game builds, texture packs, AI model variants, DB dumps, tar archives — most of each new object may be identical to the previous one. DeltaGlider Proxy stores those versions as xdelta3 deltas against a reference baseline, typically cutting storage 60–95% on high-similarity workloads without changing anything on the client side.
 
-Clients see a standard S3 API. Delta compression, reconstruction, integrity verification, optional proxy-side encryption, and backend routing are invisible to them.
+Clients see a standard S3 API. Delta compression, reconstruction, integrity verification, zero trust encryption at rest, and backend routing are invisible to them.
 
 ## What's here
 

@@ -1,4 +1,7 @@
 import { Link } from 'react-router-dom';
+import { USE_CASE_PATHS, siteNavIcon } from '../config/use-cases';
+import { SiteIcon } from '../icons/SiteIcon';
+import { LUCIDE_SM } from '../icons/sizes';
 import { CONTACT_EMAIL, DOCS_PATH, ORG_NAME, REPO_URL } from '../seo/schema';
 
 export function Footer(): JSX.Element {
@@ -39,39 +42,39 @@ export function Footer(): JSX.Element {
           <div className="grid gap-8 sm:grid-cols-3">
             <div>
               <div className="font-extrabold text-white">Use cases</div>
-              <ul className="mt-3 space-y-2 text-sm font-semibold text-ink-200">
-                <li>
-                  <Link to="/regulated/" className="hover:text-brand-200">
-                    Regulated workloads
-                  </Link>
-                </li>
-                <li>
-                  <Link to="/artifact-storage/" className="hover:text-brand-200">
-                    Artifact storage
-                  </Link>
-                </li>
-                <li>
-                  <Link to="/s3-to-hetzner-wasabi/" className="hover:text-brand-200">
-                    S3 to Hetzner / Wasabi
-                  </Link>
-                </li>
-                <li>
-                  <Link to="/multi-cloud-control-plane/" className="hover:text-brand-200">
-                    Multi-cloud control plane
-                  </Link>
-                </li>
-                <li>
-                  <Link to="/minio-migration/" className="hover:text-brand-200">
-                    MinIO migration
-                  </Link>
-                </li>
+              <ul className="mt-3 space-y-1.5 text-sm font-semibold text-ink-200">
+                {USE_CASE_PATHS.map((c) => (
+                  <li key={c.to}>
+                    <Link
+                      to={c.to}
+                      className="group inline-flex items-center gap-2.5 transition hover:text-brand-200"
+                    >
+                      <span
+                        className="text-brand-300/50 transition group-hover:text-brand-200"
+                        aria-hidden
+                      >
+                        <SiteIcon icon={c.icon} className={LUCIDE_SM} />
+                      </span>
+                      {c.navLabel}
+                    </Link>
+                  </li>
+                ))}
               </ul>
             </div>
             <div>
               <div className="font-extrabold text-white">Product</div>
-              <ul className="mt-3 space-y-2 text-sm font-semibold text-ink-200">
+              <ul className="mt-3 space-y-1.5 text-sm font-semibold text-ink-200">
                 <li>
-                  <Link to={DOCS_PATH} className="hover:text-brand-200">
+                  <Link
+                    to={DOCS_PATH}
+                    className="group inline-flex items-center gap-2.5 transition hover:text-brand-200"
+                  >
+                    <span
+                      className="text-brand-300/45 transition group-hover:text-brand-200"
+                      aria-hidden
+                    >
+                      <SiteIcon icon={siteNavIcon.docs} className={LUCIDE_SM} />
+                    </span>
                     Product docs
                   </Link>
                 </li>
@@ -80,8 +83,14 @@ export function Footer(): JSX.Element {
                     href={REPO_URL}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="hover:text-brand-200"
+                    className="group inline-flex items-center gap-2.5 transition hover:text-brand-200"
                   >
+                    <span
+                      className="text-brand-300/45 transition group-hover:text-brand-200"
+                      aria-hidden
+                    >
+                      <SiteIcon icon={siteNavIcon.github} className={LUCIDE_SM} />
+                    </span>
                     GitHub repository
                   </a>
                 </li>

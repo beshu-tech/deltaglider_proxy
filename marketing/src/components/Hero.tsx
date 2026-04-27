@@ -3,8 +3,11 @@ import type { ReactNode } from 'react';
 interface HeroProps {
   eyebrow?: string;
   headline: string;
-  subhead: string;
+  /** One paragraph or a richer block (e.g. bullets). Plain strings are wrapped in <p>. */
+  subhead: ReactNode;
   cta: ReactNode;
+  /** Placed under primary CTAs — e.g. a subtle “built with” note. */
+  afterCta?: ReactNode;
   illustration?: ReactNode;
 }
 
@@ -13,6 +16,7 @@ export function Hero({
   headline,
   subhead,
   cta,
+  afterCta,
   illustration,
 }: HeroProps): JSX.Element {
   const sentenceBoundary = headline.indexOf('. ');
@@ -31,21 +35,29 @@ export function Hero({
               {eyebrow}
             </div>
           )}
-          <h1 className="mt-3 max-w-4xl text-5xl font-extrabold tracking-tight text-ink-900 dark:text-ink-50 sm:text-6xl lg:text-7xl leading-[0.95]">
-            <span className="bg-gradient-to-r from-brand-700 via-brand-500 to-ink-900 bg-clip-text text-transparent dark:from-brand-200 dark:via-brand-300 dark:to-ink-50">
+          <h1 className="mt-3 max-w-4xl text-5xl font-extrabold tracking-tight text-ink-900 dark:text-ink-50 sm:text-6xl lg:text-7xl leading-[1.14] sm:leading-[1.12] lg:leading-[1.12]">
+            <span className="block bg-gradient-to-r from-brand-700 via-brand-500 to-ink-900 bg-clip-text text-transparent [padding-block:0.1em] dark:from-brand-200 dark:via-brand-300 dark:to-ink-50">
               {lead}
             </span>
             {rest && (
-              <>
-                <br />
-                <span>{rest}</span>
-              </>
+              <span className="mt-2 block text-ink-900 [padding-block:0.1em] dark:text-ink-50">
+                {rest}
+              </span>
             )}
           </h1>
-          <p className="mt-6 max-w-2xl text-lg text-ink-600 dark:text-ink-300 leading-relaxed sm:text-xl">
-            {subhead}
-          </p>
+          <div className="mt-6 max-w-2xl">
+            {typeof subhead === 'string' ? (
+              <p className="m-0 text-lg leading-relaxed text-ink-600 sm:text-xl dark:text-ink-300">
+                {subhead}
+              </p>
+            ) : (
+              subhead
+            )}
+          </div>
           <div className="mt-8 flex flex-wrap gap-3">{cta}</div>
+          {afterCta && (
+            <div className="mt-5 flex flex-wrap items-center gap-x-1">{afterCta}</div>
+          )}
         </div>
         {illustration && <div>{illustration}</div>}
       </div>

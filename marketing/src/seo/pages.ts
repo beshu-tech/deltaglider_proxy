@@ -36,9 +36,9 @@ const OG_MULTI_CLOUD = `${SITE_URL}/screenshots/object-replication.jpg`;
 
 export const landingMeta: PageMeta = {
   path: '/',
-  title: 'DeltaGlider Proxy — cut S3-compatible object storage growth',
+  title: 'DeltaGlider Proxy — unified S3 enterprise control plane',
   description:
-    'An S3-compatible proxy that stores repeated binaries as compact xdelta3 deltas while adding IAM, OAuth, quotas, replication, encryption, metrics, and audit controls.',
+    'S3-compatible proxy in front of your object store: xdelta3 deltas for repeated versioned binaries, with IAM, OAuth, quotas, replication, encryption, metrics, and audit in one product.',
   ogImage: OG_LANDING,
   jsonLd: [organization(), website(), softwareApplication()],
 };
@@ -168,7 +168,7 @@ export const s3MigrationMeta: PageMeta = {
   path: '/s3-to-hetzner-wasabi/',
   title: 'Amazon S3 to Hetzner or Wasabi — keep enterprise controls with DGP',
   description:
-    'Compare Amazon S3 Standard against Hetzner or Wasabi plus DeltaGlider Proxy. Model lower storage fees, delta compression, and enterprise control-plane replacement.',
+    'Compare Amazon S3 Standard to Hetzner or Wasabi with DeltaGlider: lower storage cost, delta compression, IAM, OAuth, encryption at rest, quotas, replication, and operator UI.',
   ogImage: OG_S3_MIGRATION,
   jsonLd: [
     organization(),
@@ -185,7 +185,7 @@ export const s3MigrationMeta: PageMeta = {
       {
         question: 'Does DeltaGlider replace Amazon S3 enterprise controls?',
         answer:
-          'For app-facing S3 workflows, DeltaGlider provides IAM users and groups, S3 access keys, OAuth/OIDC mapping, ABAC policies, bucket policy, public prefixes, quotas, replication, metrics, audit, and operator UI. It is not a full replacement for every AWS-native lifecycle or Object Lock feature.',
+          'For app-facing S3 workflows, DeltaGlider provides IAM users and groups, S3 access keys, OAuth/OIDC mapping, ABAC policies, bucket policy, public prefixes, proxy-side encryption at rest, quotas, replication, metrics, audit, and operator UI. It is not a full replacement for every AWS-native lifecycle or Object Lock feature.',
       },
       {
         question: 'Are request, egress, and retrieval fees included in the calculator?',

@@ -1,5 +1,8 @@
 import { useRef } from 'react';
 import { Link } from 'react-router-dom';
+import { getUseCaseByPath } from '../config/use-cases';
+import { SiteIcon } from '../icons/SiteIcon';
+import { LUCIDE_MEGA } from '../icons/sizes';
 
 const USE_CASE_GALLERY = [
   {
@@ -75,7 +78,7 @@ export function UseCaseCarousel(): JSX.Element {
               Use-case gallery
             </div>
             <h2 className="mt-2 max-w-3xl text-3xl font-black tracking-tight sm:text-4xl">
-              Four ways teams use DeltaGlider as the object-storage control plane.
+              How teams use DeltaGlider as the object-storage control plane
             </h2>
           </div>
           <div className="flex gap-2">
@@ -102,7 +105,9 @@ export function UseCaseCarousel(): JSX.Element {
           ref={scrollerRef}
           className="mt-7 flex snap-x gap-5 overflow-x-auto pb-5 [scrollbar-width:thin]"
         >
-          {USE_CASE_GALLERY.map((item, index) => (
+          {USE_CASE_GALLERY.map((item, index) => {
+            const pathDef = getUseCaseByPath(item.to);
+            return (
             <Link
               key={item.to}
               to={item.to}
@@ -116,8 +121,18 @@ export function UseCaseCarousel(): JSX.Element {
                   <div className="rounded-full bg-white/10 px-3 py-1 text-[11px] font-extrabold uppercase tracking-[0.18em] text-white/75">
                     {item.kicker}
                   </div>
-                  <div className="font-mono text-sm font-black text-white/35">
-                    0{index + 1}
+                  <div className="flex items-center gap-2.5">
+                    {pathDef && (
+                      <div
+                        className="inline-flex h-8 w-8 items-center justify-center rounded-xl border border-white/15 bg-black/20 text-white/90"
+                        aria-hidden
+                      >
+                        <SiteIcon icon={pathDef.icon} className={LUCIDE_MEGA} />
+                      </div>
+                    )}
+                    <div className="font-mono text-sm font-black text-white/35">
+                      0{index + 1}
+                    </div>
                   </div>
                 </div>
 
@@ -151,7 +166,8 @@ export function UseCaseCarousel(): JSX.Element {
                 </div>
               </div>
             </Link>
-          ))}
+            );
+          })}
         </div>
       </div>
     </section>

@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react';
 import { FeatureCard } from '../components/FeatureCard';
 import { MailtoCTA } from '../components/MailtoCTA';
+import { S3MigrationHeroSubhead } from '../components/S3MigrationHeroSubhead';
 import { SEO } from '../components/SEO';
 import { Section } from '../components/Section';
 import { s3MigrationMeta } from '../seo/pages';
@@ -103,8 +104,8 @@ const FEATURE_ROWS = [
 const MIGRATION_STEPS = [
   {
     n: '01',
-    title: 'Keep S3-compatible clients',
-    body: 'Applications, CI, backup tools, and SDKs keep using the S3 API. Point them at DeltaGlider instead of Amazon S3.',
+    title: 'Keep S3 clients',
+    body: 'Apps, CI, and SDKs still use S3. Point the endpoint to DeltaGlider instead of Amazon S3.',
   },
   {
     n: '02',
@@ -114,7 +115,7 @@ const MIGRATION_STEPS = [
   {
     n: '03',
     title: 'Replace the control plane',
-    body: 'IAM, OAuth, bucket policy, quotas, replication, metrics, audit, and operator workflows live in DGP.',
+    body: 'IAM, OAuth, policy, quotas, replication, metrics, audit, encryption at rest, and day-2 ops live in DeltaGlider.',
   },
   {
     n: '04',
@@ -196,17 +197,14 @@ export function S3Migration(): JSX.Element {
               Amazon S3 migration economics
             </div>
             <h1 className="mt-6 max-w-4xl text-5xl font-black tracking-tight sm:text-6xl lg:text-7xl">
-              Move Amazon S3 data to Hetzner or Wasabi.
+              Move AWS S3 data to Hetzner.
               <span className="block bg-gradient-to-r from-brand-200 via-cyan-200 to-amber-200 bg-clip-text text-transparent">
                 Keep the enterprise control plane.
               </span>
             </h1>
-            <p className="mt-6 max-w-2xl text-lg leading-relaxed text-ink-200 sm:text-xl">
-              DeltaGlider sits between existing S3-compatible clients and
-              lower-cost object storage. The migration thesis is simple:
-              cheaper backend bytes plus delta compression, without giving up
-              IAM, OAuth, quotas, replication, audit, metrics, and operator UI.
-            </p>
+            <div className="mt-6 max-w-2xl text-lg sm:text-xl">
+              <S3MigrationHeroSubhead />
+            </div>
             <div className="mt-8 flex flex-wrap gap-3">
               <MailtoCTA subject={SUBJECT} label="Model our AWS bill" />
               <a

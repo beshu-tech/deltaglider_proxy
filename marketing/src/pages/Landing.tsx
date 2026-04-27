@@ -1,72 +1,40 @@
-import { Link } from 'react-router-dom';
+import type { LucideIcon } from 'lucide-react';
+import { Layers, LayoutDashboard, Shield } from 'lucide-react';
 import { FeatureCard } from '../components/FeatureCard';
+import { DeploymentPathGrid } from '../components/DeploymentPathGrid';
 import { Hero } from '../components/Hero';
+import { RustBuiltWithMark } from '../components/RustBuiltWithMark';
 import { MailtoCTA } from '../components/MailtoCTA';
 import { ProofStrip } from '../components/ProofStrip';
 import { ScreenshotFrame } from '../components/ScreenshotFrame';
 import { SEO } from '../components/SEO';
 import { Section } from '../components/Section';
 import { UseCaseCarousel } from '../components/UseCaseCarousel';
+import { LandingHeroSubhead } from '../components/LandingHeroSubhead';
+import { SiteIcon } from '../icons/SiteIcon';
+import { LUCIDE_STROKE } from '../icons/sizes';
+import { USE_CASE_PATHS } from '../config/use-cases';
 import { landingMeta } from '../seo/pages';
 import { REPO_URL } from '../seo/schema';
 
-interface NicheCard {
-  to: string;
-  voice: string;
-  who: string;
-  payoff: string;
-}
-
-const NICHES: readonly NicheCard[] = [
+const OUTCOMES: readonly { icon: LucideIcon; label: string; body: string }[] = [
   {
-    to: '/regulated/',
-    voice: 'Security & compliance',
-    who: 'Regulated workloads',
-    payoff:
-      'Use cheap or untrusted storage safely: encrypt before the backend, keep keys on trusted premises, then add compression.',
+    icon: Layers,
+    label: 'Delta storage that stays invisible',
+    body:
+      'CI artifacts, builds, and versioned blobs repeat the same bytes. Where ratios win, persist compact xdelta3; GET still streams ordinary objects—no client changes.',
   },
   {
-    to: '/artifact-storage/',
-    voice: 'Storage efficiency',
-    who: 'Artifact storage',
-    payoff:
-      'Store backup archives, software catalogs, media asset variants, and AI model variants as deltas.',
+    icon: Shield,
+    label: 'Identity and exposure in your boundary',
+    body:
+      'IAM, OAuth/OIDC mapping, ABAC, scoped public reads, zero trust encryption at rest, and audit visibility—without handing keys to another SaaS control plane.',
   },
   {
-    to: '/s3-to-hetzner-wasabi/',
-    voice: 'Migration economics',
-    who: 'S3 to Hetzner / Wasabi',
-    payoff:
-      'Model storage-price reduction and compression while keeping enterprise S3 controls in DeltaGlider.',
-  },
-  {
-    to: '/multi-cloud-control-plane/',
-    voice: 'Multi-cloud control',
-    who: 'One S3 security layer',
-    payoff:
-      'Unify aliases, IAM, encryption, audit, and replication across on-prem, Hetzner, Wasabi, or another backend.',
-  },
-  {
-    to: '/minio-migration/',
-    voice: 'Enterprise control plane',
-    who: 'MinIO migration',
-    payoff:
-      'Keep self-hosted S3 plus the controls MinIO refugees miss: IAM, OAuth, policy, quotas, replication, and admin UI.',
-  },
-];
-
-const OUTCOMES = [
-  {
-    label: 'Lower storage growth',
-    body: 'Store repeated binaries as compact deltas while clients continue to use normal S3.',
-  },
-  {
-    label: 'Control access',
-    body: 'Manage users, groups, OAuth, ABAC permissions, public prefixes, and audit visibility from your own environment.',
-  },
-  {
-    label: 'Run it simply',
-    body: 'Configure backends, buckets, quotas, replication, TLS, caches, limits, and logs from one admin UI.',
+    icon: LayoutDashboard,
+    label: 'Operations as a single product surface',
+    body:
+      'Backends, bucket policy, soft quotas, replication, TLS, caches, rate limits, Prometheus metrics, and logs from one embedded admin UI—less glue, fewer runbooks.',
   },
 ];
 
@@ -155,9 +123,9 @@ export function Landing(): JSX.Element {
     <>
       <SEO meta={landingMeta} />
       <Hero
-        eyebrow="S3-compatible storage proxy"
-        headline="Cut object-storage growth. Keep S3 workflows."
-        subhead="DeltaGlider sits in front of S3-compatible backends, stores repeated binaries as xdelta3 deltas, and adds the controls operators expect: IAM, OAuth, quotas, replication, encryption, metrics, and audit."
+        eyebrow="Enterprise S3"
+        headline="Unified S3 enterprise control plane"
+        subhead={<LandingHeroSubhead />}
         cta={
           <>
             <MailtoCTA
@@ -174,6 +142,7 @@ export function Landing(): JSX.Element {
             </a>
           </>
         }
+        afterCta={<RustBuiltWithMark />}
         illustration={
           <ScreenshotFrame
             src="screenshots/filebrowser.jpg"
@@ -187,23 +156,43 @@ export function Landing(): JSX.Element {
       <ProofStrip />
       <Section
         eyebrow="Business impact"
-        title="Reduce cost, keep control, avoid rewrites."
-        intro="DeltaGlider is designed for teams with growing S3-compatible storage and existing clients they do not want to change."
+        title="Stop paying to store the same bytes on repeat."
+        intro={
+          <p className="m-0 text-ink-600 dark:text-ink-300">
+            DeltaGlider is an S3-compatible proxy: clients use ordinary SigV4 and your existing SDKs—no application changes. You aim it at MinIO, Amazon S3, or a
+            filesystem backend. Where uploads repeat the same logical artifact, it can store compact xdelta3 deltas instead of full copies; IAM, OAuth, quotas,
+            replication, metrics, audit, and the admin UI ship in one deployable service.
+          </p>
+        }
       >
-        <div className="grid gap-5 md:grid-cols-2 lg:grid-cols-5">
-          {OUTCOMES.map((item) => (
-            <div
-              key={item.label}
-              className="rounded-2xl border border-ink-200 bg-white p-6 dark:border-ink-700 dark:bg-ink-800/50"
-            >
-              <div className="text-xl font-extrabold text-ink-900 dark:text-ink-50">
-                {item.label}
-              </div>
-              <p className="mt-3 text-[15px] leading-relaxed text-ink-600 dark:text-ink-300">
-                {item.body}
-              </p>
-            </div>
-          ))}
+        <div
+          className="relative overflow-hidden rounded-3xl border border-ink-200/80 bg-gradient-to-b from-ink-50/95 via-white to-white p-6 shadow-sm shadow-ink-900/5 sm:p-8 dark:from-ink-900/55 dark:via-ink-950/30 dark:to-ink-950/20 dark:border-ink-600/50 dark:shadow-black/15"
+        >
+          <div
+            className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-brand-400/50 to-transparent dark:via-brand-500/30"
+            aria-hidden
+          />
+          <ul className="m-0 grid list-none grid-cols-1 gap-5 p-0 lg:grid-cols-3">
+            {OUTCOMES.map((item) => (
+              <li
+                key={item.label}
+                className="relative flex h-full flex-col rounded-2xl border border-ink-200/90 bg-white/90 p-6 dark:border-ink-600/60 dark:bg-ink-900/55"
+              >
+                <div
+                  className="mb-4 flex h-12 w-12 items-center justify-center rounded-2xl border border-brand-200/80 bg-gradient-to-br from-brand-50 to-white text-brand-700 shadow-sm dark:border-brand-800/60 dark:from-brand-950/80 dark:to-ink-900/80 dark:text-brand-200"
+                  aria-hidden
+                >
+                  <SiteIcon icon={item.icon} className="h-6 w-6" strokeWidth={LUCIDE_STROKE + 0.1} />
+                </div>
+                <h3 className="m-0 text-lg font-extrabold leading-snug text-ink-900 dark:text-ink-50 sm:text-xl">
+                  {item.label}
+                </h3>
+                <p className="mb-0 mt-3 text-[0.95rem] leading-relaxed text-ink-600 dark:text-ink-300 sm:text-[15px] sm:leading-relaxed">
+                  {item.body}
+                </p>
+              </li>
+            ))}
+          </ul>
         </div>
       </Section>
       <Section
@@ -304,30 +293,15 @@ export function Landing(): JSX.Element {
       </Section>
       <Section
         eyebrow="Use cases"
-        title="Common deployment paths."
-        intro="Start with the problem you have today."
+        title="Common deployment paths"
+        intro="Start with the problem you have today. Each path below opens a focused page on that scenario (the whole card is the link)."
       >
-        <div className="grid gap-5 md:grid-cols-2 lg:grid-cols-4">
-          {NICHES.map((niche) => (
-            <Link
-              key={niche.to}
-              to={niche.to}
-              className="group rounded-xl border border-ink-200 bg-white p-6 dark:border-ink-700 dark:bg-ink-800/40 hover:border-brand-400 hover:shadow-md transition-all"
-            >
-              <div className="text-xs font-bold uppercase tracking-widest text-brand-600 dark:text-brand-300">
-                {niche.voice}
-              </div>
-              <div className="mt-4 text-xl font-extrabold text-ink-900 dark:text-ink-50">
-                {niche.who}
-              </div>
-              <p className="mt-2 text-[15px] text-ink-600 dark:text-ink-300 leading-relaxed">
-                {niche.payoff}
-              </p>
-              <div className="mt-5 inline-flex items-center gap-1 text-sm font-semibold text-brand-700 group-hover:text-brand-800 dark:text-brand-300 dark:group-hover:text-brand-200">
-                Read the pitch <span aria-hidden>→</span>
-              </div>
-            </Link>
-          ))}
+        <div className="relative overflow-hidden rounded-2xl border border-ink-200/70 bg-gradient-to-b from-ink-50/90 via-white to-white p-5 shadow-sm shadow-ink-900/5 sm:p-7 dark:from-ink-900/60 dark:via-ink-950/40 dark:to-ink-950/20 dark:border-ink-600/50 dark:shadow-black/20">
+          <div
+            className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-brand-300/50 to-transparent dark:via-brand-500/20"
+            aria-hidden
+          />
+          <DeploymentPathGrid paths={USE_CASE_PATHS} />
         </div>
       </Section>
       <Section
