@@ -102,7 +102,7 @@ export default function TopBar({ prefix, onNavigate, isMobile, onMenuClick, onRe
       }}
     >
       {/* Left: hamburger on mobile, breadcrumb or search on desktop */}
-      <div style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 12, paddingLeft: isMobile ? 0 : 40 }}>
+      <div style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 12 }}>
         {isMobile && (
           <Button type="text" icon={<MenuOutlined />} onClick={onMenuClick} size="small" aria-label="Open navigation menu" />
         )}

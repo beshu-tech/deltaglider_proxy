@@ -200,6 +200,7 @@ export default function App() {
   };
 
   const isEmpty = s3.objects.length === 0 && s3.folders.length === 0;
+  const isRootBucketEmpty = s3.prefix === '' && !s3.searchQuery && isEmpty && !s3.loading;
 
   // Stable context value so consumers of `useNavigation()` (AdminPage,
   // Sidebar, TopBar) don't re-render on every App render. Previously
@@ -348,6 +349,7 @@ export default function App() {
             displayName={identity?.user?.name || undefined}
             canAdmin={identity?.mode === 'bootstrap' || identity?.mode === 'open' || identity?.user?.is_admin === true || hasAdminSession}
             proxyVersion={identity?.version}
+            showDemoData={isRootBucketEmpty}
           />
         )}
 

@@ -46,6 +46,7 @@ interface Props {
   displayName?: string;
   canAdmin?: boolean;
   proxyVersion?: string;
+  showDemoData?: boolean;
 }
 
 export default function Sidebar({
@@ -63,6 +64,7 @@ export default function Sidebar({
   displayName,
   canAdmin,
   proxyVersion,
+  showDemoData = false,
 }: Props) {
   const {
     BG_SIDEBAR, BORDER, TEXT_PRIMARY, TEXT_SECONDARY,
@@ -288,47 +290,55 @@ export default function Sidebar({
               <span>Documentation</span>
             </button>
             {onLogout && (
-              <div style={{ padding: '6px 0 2px' }}>
-                <div style={{ padding: '4px 6px' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 2 }}>
-                    <span style={{ fontSize: 10, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>Logged in as</span>
-                    <button
-                      className="btn-reset"
-                      title="Disconnect & clear credentials"
-                      style={{ color: TEXT_MUTED, fontSize: 14, padding: 4, flexShrink: 0, transition: 'color 0.15s' }}
-                      onMouseEnter={(e) => { e.currentTarget.style.color = ACCENT_RED; }}
-                      onMouseLeave={(e) => { e.currentTarget.style.color = TEXT_MUTED; }}
-                      aria-label="Disconnect"
-                      onClick={() => {
-                        if (window.confirm('Disconnect? This will clear your credentials and return to the login screen.')) {
-                          onLogout();
-                        }
-                      }}
-                    >
-                      <LogoutOutlined aria-hidden="true" />
-                    </button>
-                  </div>
-                  <div style={{ fontSize: 12, color: TEXT_SECONDARY, fontWeight: 600, fontFamily: "var(--font-mono)", wordBreak: 'break-all', lineHeight: 1.4 }}>
-                    {displayName || currentUser || 'user'}
-                  </div>
+              <div style={{ padding: '8px 6px 2px' }}>
+                <div style={{ fontSize: 10, color: TEXT_MUTED, fontFamily: "var(--font-ui)", marginBottom: 3 }}>
+                  Signed in as
                 </div>
+                <div style={{ fontSize: 12, color: TEXT_SECONDARY, fontWeight: 600, fontFamily: "var(--font-mono)", wordBreak: 'break-all', lineHeight: 1.4, marginBottom: 8 }}>
+                  {displayName || currentUser || 'user'}
+                </div>
+                <Button
+                  size="small"
+                  block
+                  type="text"
+                  icon={<LogoutOutlined />}
+                  title="Sign out and clear credentials"
+                  onClick={() => {
+                    if (window.confirm('Sign out? This will clear your credentials and return to the login screen.')) {
+                      onLogout();
+                    }
+                  }}
+                  style={{
+                    justifyContent: 'flex-start',
+                    color: TEXT_SECONDARY,
+                    border: `1px solid ${BORDER}`,
+                    borderRadius: 8,
+                    fontFamily: "var(--font-ui)",
+                  }}
+                  onMouseEnter={(e) => { e.currentTarget.style.color = ACCENT_RED; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.color = TEXT_SECONDARY; }}
+                >
+                  Sign out
+                </Button>
               </div>
             )}
           </nav>
         </div>
 
         {/* Demo data — less prominent utility */}
-        <div style={{ padding: '0 16px 4px' }}>
-          <DemoDataGenerator onDone={onMutate} />
-        </div>
+        {showDemoData && (
+          <div style={{ padding: '0 16px 4px' }}>
+            <DemoDataGenerator onDone={onMutate} />
+          </div>
+        )}
 
         {/* Branding */}
         <div style={{ padding: '28px 16px 32px', borderTop: `1px solid ${BORDER}` }}>
           <div style={{ fontSize: 16, fontWeight: 800, letterSpacing: 4, color: TEXT_PRIMARY, lineHeight: 1, fontFamily: "var(--font-ui)", textTransform: 'uppercase' }}>
             DeltaGlider
           </div>
-          <div style={{ fontSize: 11, fontWeight: 600, letterSpacing: 3, color: ACCENT_BLUE, textTransform: 'uppercase', marginTop: 5, fontFamily: "var(--font-mono)", display: 'flex', alignItems: 'baseline', gap: 8 }}>
-            Proxy
+          <div style={{ fontSize: 10, fontWeight: 600, letterSpacing: 1.1, color: ACCENT_BLUE, textTransform: 'uppercase', marginTop: 6, fontFamily: "var(--font-ui)", display: 'flex', alignItems: 'baseline', gap: 8 }}>
+            Object storage control plane
             {/* Prefer the server-reported version (whoami) since it
                 reflects the actual running Rust binary; fall back to
                 the build-time constant (read from Cargo.toml by Vite)
