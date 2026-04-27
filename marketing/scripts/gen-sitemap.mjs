@@ -7,7 +7,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '..');
 const distDir = join(root, 'dist');
 
-const SITE_URL = 'https://beshu-tech.github.io/deltaglider_proxy';
+const SITE_URL = 'https://deltaglider.com';
 const PATHS = [
   '/',
   '/regulated/',

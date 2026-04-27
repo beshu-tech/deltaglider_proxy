@@ -3,7 +3,7 @@ import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 import 'vite-react-ssg';
 
-const BASE = process.env['MARKETING_BASE'] ?? '/deltaglider_proxy/';
+const BASE = process.env['MARKETING_BASE'] ?? '/';
 
 export default defineConfig({
   base: BASE,
