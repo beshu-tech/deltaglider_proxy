@@ -40,6 +40,9 @@ docs/benchmark/*.tgz
 
 # Runtime data
 data/
+# Marketing ships pinned benchmark numbers (not secrets).
+!marketing/src/data/
+!marketing/src/data/**
 
 # Config (contains secrets/credentials)
 deltaglider_proxy.toml
