@@ -6,6 +6,7 @@ import {
   Legend,
   LinearScale,
   Tooltip,
+  type ChartData,
   type ChartOptions,
 } from 'chart.js';
 import { Bar } from 'react-chartjs-2';
@@ -72,8 +73,8 @@ const baseOptions: ChartOptions<'bar'> = {
 };
 
 export default function BenchmarkChartsBody(): JSX.Element {
-  const throughputData = {
-    labels: MODE_LABELS,
+  const throughputData: ChartData<'bar'> = {
+    labels: [...MODE_LABELS],
     datasets: [
       {
         label: 'PUT',
@@ -93,8 +94,8 @@ export default function BenchmarkChartsBody(): JSX.Element {
     ],
   };
 
-  const storageData = {
-    labels: MODE_LABELS,
+  const storageData: ChartData<'bar'> = {
+    labels: [...MODE_LABELS],
     datasets: [
       {
         label: 'Logical uploaded (client-visible)',
@@ -109,8 +110,8 @@ export default function BenchmarkChartsBody(): JSX.Element {
     ],
   };
 
-  const cpuData = {
-    labels: MODE_LABELS,
+  const cpuData: ChartData<'bar'> = {
+    labels: [...MODE_LABELS],
     datasets: [
       {
         label: 'Docker CPU % mean',
