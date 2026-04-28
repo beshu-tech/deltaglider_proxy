@@ -25,10 +25,18 @@ export function Footer(): JSX.Element {
                 href="https://beshu.tech"
                 target="_blank"
                 rel="noopener noreferrer"
-                className="mt-1 inline-flex text-lg font-extrabold text-white hover:text-brand-200"
+                className="mt-2 inline-flex items-center gap-3 rounded-xl border border-transparent px-1 py-1 text-white transition hover:border-brand-200/30 hover:bg-brand-200/5"
               >
-                Beshu Tech
-                <span aria-hidden className="ml-1">
+                <img
+                  src="https://beshu.tech/assets/images/image01.png"
+                  alt="Beshu logo"
+                  className="h-9 w-auto shrink-0"
+                  loading="lazy"
+                />
+                <span className="text-xl font-extrabold tracking-tight">
+                  Beshu Limited
+                </span>
+                <span aria-hidden>
                   →
                 </span>
               </a>

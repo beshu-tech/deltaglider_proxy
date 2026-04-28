@@ -107,7 +107,7 @@ docs/                    # Documentation
 - **DeltaSpace**: A group of objects under the same directory prefix that share a single baseline for delta compression. For example, all objects under `releases/` form one deltaspace.
 - **Reference file**: The internal baseline stored once per deltaspace. All deltas are computed against it (no chaining), so reconstruction is always O(1).
 - **StorageBackend**: A trait abstracting where bytes live — local filesystem or upstream S3. Adding a new backend means implementing this trait.
-- **File router**: Decides whether a file is delta-eligible based on its extension (`.zip`, `.tar.gz`, etc.) or should be stored as passthrough (`.jpg`, `.mp4`, etc.).
+- **File router**: Decides whether a file is delta-eligible based on its extension (`.zip`, `.jar`, `.tar`, etc.) or should be stored as passthrough (`.jpg`, `.mp4`, etc.).
 
 ## Submitting Changes
 

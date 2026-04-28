@@ -27,13 +27,22 @@ impl FileRouter {
     /// Create a new file router with default delta-eligible extensions
     pub fn new() -> Self {
         let extensions: &[&str] = &[
-            // Archives
-            "zip", "tar", "tgz", "tar.gz", "tar.bz2", "tar.xz", // Java/JVM packages
-            "jar", "war", "ear", // Other archive formats
-            "rar", "7z", // Disk images (often similar between versions)
-            "dmg", "iso", // Database dumps
-            "sql", "dump", // Backups
-            "bak", "backup",
+            // Containers that are often delta-friendly in byte-exact mode
+            "zip",
+            "tar",
+            // Java/JVM packages
+            "jar",
+            "war",
+            "ear",
+            // Disk images (often similar between versions)
+            "dmg",
+            "iso",
+            // Database dumps
+            "sql",
+            "dump",
+            // Backups
+            "bak",
+            "backup",
         ];
         Self {
             delta_suffixes: extensions.iter().map(|ext| format!(".{}", ext)).collect(),
@@ -70,7 +79,7 @@ mod tests {
         assert!(router.is_delta_eligible("app.zip"));
         assert!(router.is_delta_eligible("app.ZIP")); // case insensitive
         assert!(router.is_delta_eligible("app.jar"));
-        assert!(router.is_delta_eligible("backup.tar.gz"));
+        assert!(router.is_delta_eligible("backup.tar"));
         assert!(router.is_delta_eligible("data.sql"));
     }
 
@@ -83,6 +92,12 @@ mod tests {
         assert!(!router.is_delta_eligible("video.mp4"));
         assert!(!router.is_delta_eligible("document.pdf"));
         assert!(!router.is_delta_eligible("data.json"));
+        assert!(!router.is_delta_eligible("backup.tar.gz"));
+        assert!(!router.is_delta_eligible("release.tar.xz"));
+        assert!(!router.is_delta_eligible("archive.tgz"));
+        assert!(!router.is_delta_eligible("bundle.tar.bz2"));
+        assert!(!router.is_delta_eligible("backup.rar"));
+        assert!(!router.is_delta_eligible("snapshot.7z"));
     }
 
     #[test]

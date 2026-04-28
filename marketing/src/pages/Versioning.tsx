@@ -12,9 +12,6 @@ const SUBJECT = 'Artifact storage savings';
 const DELTA_TYPES = [
   '.zip',
   '.tar',
-  '.tgz',
-  '.tar.gz',
-  '.tar.bz2',
   '.jar',
   '.war',
   '.ear',
@@ -22,8 +19,6 @@ const DELTA_TYPES = [
   '.dump',
   '.bak',
   '.backup',
-  '.rar',
-  '.7z',
   '.dmg',
   '.iso',
 ];

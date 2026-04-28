@@ -42,8 +42,8 @@ export function Regulated(): JSX.Element {
       <SEO meta={regulatedMeta} />
       <Hero
         eyebrow="Use case · regulated workloads"
-        headline="Encryption at rest: Using cheap providers that you don't trust."
-        subhead="DeltaGlider encrypts objects before they reach the backend. The cryptographic key stays in your trusted environment, while compression can further reduce the storage bill."
+        headline="Encryption at rest"
+        subhead="Leverage cheap, untrusted cloud storage, while keeping keys on premises."
         cta={
           <>
             <MailtoCTA
