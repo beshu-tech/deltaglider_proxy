@@ -211,6 +211,8 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
   const blobRef = useRef<{ blob: Blob; name: string } | null>(null);
   const [shareDuration, setShareDuration] = useState<number | null>(null);
   const [bucketPolicy, setBucketPolicy] = useState<BucketPolicyInfo | null>(null);
+  /** True until policy for the active bucket is fetched (initial true avoids a wrong branch before useEffect). */
+  const [bucketPolicyLoading, setBucketPolicyLoading] = useState(true);
   const objectKey = object?.key;
   const cachedHead = objectKey ? headCache?.[objectKey] : undefined;
 
@@ -220,19 +222,30 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
     const bucket = getBucket();
     if (!bucket || bucket === lastBucketRef.current) return;
     lastBucketRef.current = bucket;
-    // Cancellation guard: if the user switches buckets (or unmounts the panel)
-    // before getAdminConfig settles, drop the stale result.
+    setBucketPolicy(null);
+    setBucketPolicyLoading(true);
+    const bucketFetched = bucket;
     let cancelled = false;
-    getAdminConfig().then(cfg => {
-      if (cancelled || !cfg) return;
-      const bp = cfg.bucket_policies?.[bucket] || cfg.bucket_policies?.[bucket.toLowerCase()];
-      const globalCompression = (cfg.max_delta_ratio ?? 0.75) > 0;
-      setBucketPolicy({
-        compressionEnabled: bp?.compression ?? globalCompression,
-        publicPrefixes: bp?.public_prefixes ?? [],
+    getAdminConfig()
+      .then((cfg) => {
+        if (cancelled || !cfg || getBucket() !== bucketFetched) return;
+        const bp = cfg.bucket_policies?.[bucketFetched] || cfg.bucket_policies?.[bucketFetched.toLowerCase()];
+        // Match `BucketPolicyRegistry::compression_enabled`: per-bucket `compression`
+        // only, then default `true`. Do not infer from `max_delta_ratio` — global
+        // ratio 0 is a *threshold* / passthrough decision, not the same as
+        // `compression: false` on the bucket.
+        setBucketPolicy({
+          compressionEnabled: bp?.compression ?? true,
+          publicPrefixes: bp?.public_prefixes ?? [],
+        });
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (!cancelled && getBucket() === bucketFetched) setBucketPolicyLoading(false);
       });
-    }).catch(() => {});
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [objectKey]);
 
   useEffect(() => {
@@ -280,7 +293,10 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
   const storageTypeLabel = storageType || 'Original';
   const storageTypeColor = STORAGE_TYPE_COLORS[storageType || 'passthrough'] || STORAGE_TYPE_DEFAULT;
   const compressionEnabled = bucketPolicy?.compressionEnabled ?? true;
-  const isPublic = bucketPolicy?.publicPrefixes.some(pp => pp === '' || object.key.startsWith(pp)) ?? false;
+  /** When policy is still loading, treat as not public so we don't flash the wrong badge. */
+  const isPublic =
+    !bucketPolicyLoading &&
+    (bucketPolicy?.publicPrefixes.some(pp => pp === '' || object.key.startsWith(pp)) ?? false);
 
   const handleDelete = async () => {
     try {
@@ -468,7 +484,19 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
             )}
 
             {/* STORAGE STATS */}
-            {compressionEnabled ? (
+            {bucketPolicyLoading ? (
+              <InspectorSection title="Storage Stats">
+                <div style={{
+                  background: BG_SIDEBAR, borderRadius: 10, padding: '24px 16px',
+                  display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8,
+                }}>
+                  <Spin indicator={<LoadingOutlined style={{ fontSize: 28, color: ACCENT_GREEN }} />} />
+                  <div style={{ fontSize: 11, color: TEXT_MUTED, fontFamily: 'var(--font-ui)' }}>
+                    Loading bucket policy…
+                  </div>
+                </div>
+              </InspectorSection>
+            ) : compressionEnabled ? (
               <InspectorSection title="Storage Stats">
                 {headLoading && Object.keys(headers).length === 0 ? (
                   /* Show spinner until HEAD completes with full metadata */

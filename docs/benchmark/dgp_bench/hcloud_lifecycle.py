@@ -47,7 +47,11 @@ def up(args) -> int:
 
 def status(args) -> int:
     hc = client()
-    for server in hc.servers.get_all(label_selector=f"app={APP},run={args.run_id}"):
+    if getattr(args, "all_benchmark_vms", False):
+        selector = f"app={APP}"
+    else:
+        selector = f"app={APP},run={args.run_id}"
+    for server in hc.servers.get_all(label_selector=selector):
         ips = []
         if server.public_net and server.public_net.ipv4:
             ips.append(server.public_net.ipv4.ip)
@@ -57,7 +61,11 @@ def status(args) -> int:
 
 def down(args) -> int:
     hc = client()
-    for server in hc.servers.get_all(label_selector=f"app={APP},run={args.run_id}"):
+    if getattr(args, "all_benchmark_vms", False):
+        selector = f"app={APP}"
+    else:
+        selector = f"app={APP},run={args.run_id}"
+    for server in hc.servers.get_all(label_selector=selector):
         if args.dry_run:
             print(f"would delete {server.id} {server.name}")
         else:

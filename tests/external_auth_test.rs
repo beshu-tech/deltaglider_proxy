@@ -563,9 +563,12 @@ async fn test_backup_includes_providers_and_rules() {
     )
     .await;
 
-    // Export backup
+    // Export backup (legacy JSON; default response is application/zip)
     let resp = admin
-        .get(format!("{}/_/api/admin/backup", server.endpoint()))
+        .get(format!(
+            "{}/_/api/admin/backup?format=json",
+            server.endpoint()
+        ))
         .send()
         .await
         .unwrap();

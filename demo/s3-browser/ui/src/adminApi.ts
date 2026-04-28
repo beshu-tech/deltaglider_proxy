@@ -66,7 +66,8 @@ export interface AdminConfig {
   bucket_policies: Record<
     string,
     {
-      compression?: boolean;
+      /** Omit / inherit; explicit override; JSON `null` on merge clears override (RFC 7396). */
+      compression?: boolean | null;
       max_delta_ratio?: number;
       backend?: string;
       alias?: string;

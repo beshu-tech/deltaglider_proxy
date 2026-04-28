@@ -3,8 +3,12 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import os
+from typing import Final
 
 APP = "dgp-compression-tax-bench"
+# Hetzner Cloud defaults — Helsinki (`hel1`) + type that provisions there (`cpx31` is often unavailable in EU).
+DEFAULT_HC_LOCATION = "hel1"
+DEFAULT_HC_SERVER_TYPE = "ccx33"
 DEFAULT_KERNEL_INDEX = "https://cdn.kernel.org/pub/linux/kernel/v6.x/"
 DEFAULT_ALPINE_RELEASE_BRANCH = "v3.19"
 DEFAULT_ALPINE_ARCH = "x86_64"
@@ -14,6 +18,37 @@ DEFAULT_MODES = {
     "compression": "bench-compression",
     "encryption": "bench-encryption",
     "compression_encryption": "bench-compression-encryption",
+}
+
+# Canonical benchmark mode sequence (charts, tables, markdown). Same keys as DEFAULT_MODES.
+MODE_ORDER: Final[tuple[str, ...]] = tuple(DEFAULT_MODES.keys())
+
+MODE_BAND_COLORS: Final[dict[str, str]] = {
+    "passthrough": "rgba(148, 163, 184, 0.15)",
+    "compression": "rgba(59, 130, 246, 0.18)",
+    "encryption": "rgba(239, 68, 68, 0.12)",
+    "compression_encryption": "rgba(168, 85, 247, 0.16)",
+}
+
+MODE_SHORT_LABELS: Final[dict[str, str]] = {
+    "passthrough": "Passthrough",
+    "compression": "Compression",
+    "encryption": "Encryption",
+    "compression_encryption": "Comp + encrypt",
+}
+
+REPORT_THROUGHPUT_HINTS: Final[dict[str, str]] = {
+    "passthrough": "Benchmark mode: compression off on this bucket (baseline). Not evaluating xdelta here — unrelated to whether .iso is eligible elsewhere.",
+    "compression": "Compression mode: xdelta on; plain backend; CPU-heavy PUTs. Default FileRouter treats .iso as delta-eligible.",
+    "encryption": "Proxy AES-256-GCM; ciphertext stored under encrypted backend root.",
+    "compression_encryption": "Both delta encoding and proxy encryption active.",
+}
+
+REPORT_STORAGE_HINTS: Final[dict[str, str]] = {
+    "passthrough": "Prom Δ usually 0 for this segment unless counters moved between snapshots.",
+    "compression": "Δ saved reflects bytes attributed to delta storage during this mode’s benchmark slice.",
+    "encryption": "Typically little/no Δ saved (no delta); implied stored ≈ logical.",
+    "compression_encryption": "Combined effect: delta savings where applicable + encrypted backend footprint.",
 }
 
 

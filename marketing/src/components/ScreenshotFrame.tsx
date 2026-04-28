@@ -5,6 +5,10 @@ interface ScreenshotFrameProps {
   alt: string;
   caption?: string;
   priority?: boolean;
+  /** Window chrome label (default: live product). */
+  frameTag?: string;
+  /** Caption eyebrow above body text (default: Product view). */
+  captionEyebrow?: string;
 }
 
 export function ScreenshotFrame({
@@ -12,6 +16,8 @@ export function ScreenshotFrame({
   alt,
   caption,
   priority,
+  frameTag = 'live product',
+  captionEyebrow = 'Product view',
 }: ScreenshotFrameProps): JSX.Element {
   const [isOpen, setIsOpen] = useState(false);
   const titleId = useId();
@@ -46,7 +52,7 @@ export function ScreenshotFrame({
           <span className="h-2.5 w-2.5 rounded-full bg-amber-300" />
           <span className="h-2.5 w-2.5 rounded-full bg-brand-300" />
           <span className="ml-3 truncate text-[11px] font-extrabold uppercase tracking-[0.2em] text-ink-400">
-            live product
+            {frameTag}
           </span>
         </div>
         <button
@@ -75,7 +81,7 @@ export function ScreenshotFrame({
             />
             <div className="min-w-0">
               <div className="text-[11px] font-extrabold uppercase tracking-[0.18em] text-brand-700 dark:text-brand-300">
-                Product view
+                {captionEyebrow}
               </div>
               <p className="mt-1 max-w-prose text-sm leading-6 text-ink-600 dark:text-ink-300">
                 {caption}

@@ -29,8 +29,8 @@ import {
   InputNumber,
   Modal,
   Radio,
+  Select,
   Space,
-  Switch,
   Typography,
   message,
 } from 'antd';
@@ -58,7 +58,8 @@ const { Text } = Typography;
  *  but normalises nulls to undefined for the form controllers. */
 interface BucketPolicyRow {
   name: string;
-  compression: boolean;
+  /** `null` = omit key / YAML null — inherit engine default (delta enabled). */
+  compression: boolean | null;
   max_delta_ratio: number | null;
   backend: string;
   alias: string;
@@ -96,7 +97,8 @@ function policyToRow(
   }
   return {
     name,
-    compression: p.compression ?? true,
+    compression:
+      p.compression === undefined || p.compression === null ? null : p.compression,
     max_delta_ratio: p.max_delta_ratio ?? null,
     backend: p.backend ?? '',
     alias: p.alias ?? '',
@@ -107,7 +109,8 @@ function policyToRow(
 }
 
 function rowToPolicy(row: BucketPolicyRow): {
-  compression?: boolean;
+  /** Omitted or explicit bool; JSON `null` clears inherit (RFC 7396 merge removes key). */
+  compression?: boolean | null;
   max_delta_ratio?: number;
   backend?: string;
   alias?: string;
@@ -118,9 +121,10 @@ function rowToPolicy(row: BucketPolicyRow): {
   // accepts. `entire` uses the empty-string sentinel `[""]` — the
   // backend's `BucketPolicyConfig::normalize` collapses it to
   // `public: true` on re-serialisation, lossless round-trip.
-  const out: ReturnType<typeof rowToPolicy> = {
-    compression: row.compression,
-  };
+  const out: ReturnType<typeof rowToPolicy> = {};
+  // Section storage merge is RFC 7396 per nested object: omitting `compression`
+  // leaves the previous value; JSON `null` removes the key → inherit default.
+  out.compression = row.compression === null ? null : row.compression;
   if (row.max_delta_ratio != null) out.max_delta_ratio = row.max_delta_ratio;
   if (row.backend) out.backend = row.backend;
   if (row.alias) out.alias = row.alias;
@@ -210,7 +214,7 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
       ...rows,
       {
         name: '',
-        compression: true,
+        compression: null,
         max_delta_ratio: null,
         backend: '',
         alias: '',
@@ -507,22 +511,30 @@ function BucketCard({
           marginBottom: 12,
         }}
       >
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          <Switch
-            checked={row.compression}
-            onChange={(v) => onChange({ compression: v })}
-            size="small"
-          />
-          <Text
-            style={{
-              fontSize: 12,
-              fontFamily: 'var(--font-ui)',
-              color: row.compression ? colors.TEXT_PRIMARY : colors.ACCENT_AMBER,
-            }}
-          >
-            {row.compression ? 'Compression' : 'No compression'}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <Text style={{ fontSize: 12, fontFamily: 'var(--font-ui)', color: colors.TEXT_MUTED }}>
+            Compression
           </Text>
-          {row.compression && (
+          <Select
+            size="small"
+            style={{ minWidth: 200, ...inputRadius }}
+            value={
+              row.compression === null ? 'inherit' : row.compression ? 'on' : 'off'
+            }
+            onChange={(v) => {
+              if (v === 'inherit') onChange({ compression: null });
+              else onChange({ compression: v === 'on' });
+            }}
+            options={[
+              {
+                value: 'inherit',
+                label: 'Default (on) — no override',
+              },
+              { value: 'on', label: 'On — explicit in YAML' },
+              { value: 'off', label: 'Off — explicit in YAML' },
+            ]}
+          />
+          {row.compression !== false && (
             <>
               <Text style={{ fontSize: 11, color: colors.TEXT_MUTED, marginLeft: 8 }}>
                 Ratio:

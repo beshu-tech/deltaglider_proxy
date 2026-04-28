@@ -125,10 +125,10 @@ export default function AnalyticsSection({ config }: Props) {
   const monthlySavings = (totalSavings / (1024 * 1024 * 1024)) * costRate;
   const totalObjects = bucketStats.reduce((s, b) => s + b.objectCount, 0);
 
-  const globalCompressionOn = (config?.max_delta_ratio ?? 0.75) > 0;
   const opportunities = bucketStats.filter(b => {
-    const policy = config?.bucket_policies?.[b.bucket];
-    const bucketCompressionOn = policy?.compression ?? globalCompressionOn;
+    const policy =
+      config?.bucket_policies?.[b.bucket] ?? config?.bucket_policies?.[b.bucket.toLowerCase()];
+    const bucketCompressionOn = policy?.compression ?? true;
     return !bucketCompressionOn && b.totalOriginal > 1024 * 1024;
   });
 

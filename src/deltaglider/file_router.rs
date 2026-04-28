@@ -70,6 +70,7 @@ mod tests {
         assert!(router.is_delta_eligible("app.ZIP")); // case insensitive
         assert!(router.is_delta_eligible("app.jar"));
         assert!(router.is_delta_eligible("backup.tar"));
+        assert!(router.is_delta_eligible("alpine.iso"));
         assert!(router.is_delta_eligible("data.sql"));
     }
 

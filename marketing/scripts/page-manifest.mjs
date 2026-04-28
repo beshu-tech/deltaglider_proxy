@@ -7,6 +7,7 @@ export const PAGES = [
   { path: '/minio-migration/', file: 'minio-migration/index.html', label: '/minio-migration/', canary: 'Self-hosted S3 without losing' },
   { path: '/s3-to-hetzner-wasabi/', file: 's3-to-hetzner-wasabi/index.html', label: '/s3-to-hetzner-wasabi/', canary: 'Move AWS S3 data to Hetzner' },
   { path: '/multi-cloud-control-plane/', file: 'multi-cloud-control-plane/index.html', label: '/multi-cloud-control-plane/', canary: 'One S3 security layer' },
+  { path: '/benchmark/', file: 'benchmark/index.html', label: '/benchmark/', canary: 'compression-tax benchmark' },
   { path: '/docs/', file: 'docs/index.html', label: '/docs/', canary: 'DeltaGlider Proxy' },
   { path: '/about/', file: 'about/index.html', label: '/about/', canary: 'DeltaGlider Proxy is built by Beshu Tech' },
   { path: '/privacy/', file: 'privacy/index.html', label: '/privacy/', canary: 'Privacy Policy' },

@@ -409,6 +409,61 @@ async fn section_put_storage_preserves_other_buckets() {
     assert_eq!(policies["alpha"]["quota_bytes"].as_u64().unwrap(), 1024);
 }
 
+/// RFC 7396: `compression: null` clears an explicit `compression: false` override so the
+/// bucket inherits default compression (`BucketPolicyRegistry::compression_enabled`).
+/// The Buckets panel relies on this for "Default (on)". After merge, GET JSON may still
+/// show `"compression": null` (serde `Option::None`) — that is inherit, not off.
+#[tokio::test]
+async fn section_put_storage_compression_null_clears_explicit_override() {
+    let server = TestServer::builder()
+        .auth("CLRKEY1", "CLRSECRET1")
+        .yaml_config()
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    admin
+        .put(format!("{}/_/api/admin/config", server.endpoint()))
+        .json(&json!({
+            "bucket_policies": {
+                "alpha": { "compression": false }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    admin
+        .put(format!(
+            "{}/_/api/admin/config/section/storage",
+            server.endpoint()
+        ))
+        .json(&json!({
+            "buckets": {
+                "alpha": { "compression": null }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let cfg: serde_json::Value = admin
+        .get(format!("{}/_/api/admin/config", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let v = &cfg["bucket_policies"]["alpha"]["compression"];
+    assert_ne!(
+        v.as_bool(),
+        Some(false),
+        "explicit compression:false must not survive after merge-patch sets compression:null (RFC 7396 clears the override). Still got: {v:?}"
+    );
+}
+
 #[tokio::test]
 async fn section_put_admission_blocks_replace_entire_list() {
     let server = TestServer::builder()

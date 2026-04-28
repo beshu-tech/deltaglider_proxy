@@ -3,6 +3,7 @@ import { Navigate } from 'react-router-dom';
 import { Layout } from './components/Layout';
 import { DOCS } from './docs-imports';
 import { About } from './pages/About';
+import { Benchmark } from './pages/Benchmark';
 import { Docs } from './pages/Docs';
 import { Landing } from './pages/Landing';
 import { MinioMigration } from './pages/MinioMigration';
@@ -52,6 +53,11 @@ export const routes: RouteRecord[] = [
         path: 'multi-cloud-control-plane',
         Component: MultiCloud,
         entry: 'src/pages/MultiCloud.tsx',
+      },
+      {
+        path: 'benchmark',
+        Component: Benchmark,
+        entry: 'src/pages/Benchmark.tsx',
       },
       {
         path: 'docs',

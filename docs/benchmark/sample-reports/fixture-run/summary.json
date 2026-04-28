@@ -1,0 +1,222 @@
+{
+  "run_id": "fixture-rerun-local",
+  "modes": {
+    "passthrough": {
+      "c1": {
+        "put": {
+          "ops": 1,
+          "ok": 1,
+          "failed": 0,
+          "bytes": 200000000,
+          "total_s": 2.5,
+          "mb_s": 80.0,
+          "p50_ms": 2400,
+          "p95_ms": 2500,
+          "p99_ms": 2600
+        },
+        "cold_get": {
+          "ops": 1,
+          "ok": 1,
+          "failed": 0,
+          "bytes": 200000000,
+          "total_s": 2.0,
+          "mb_s": 100.0,
+          "p50_ms": 2000,
+          "p95_ms": 2100,
+          "p99_ms": 2200
+        },
+        "warm_get": {
+          "ops": 1,
+          "ok": 1,
+          "failed": 0,
+          "bytes": 200000000,
+          "total_s": 1.0,
+          "mb_s": 200.0,
+          "p50_ms": 1000,
+          "p95_ms": 1100,
+          "p99_ms": 1200
+        }
+      }
+    },
+    "compression": {
+      "c1": {
+        "put": {
+          "ops": 1,
+          "ok": 1,
+          "failed": 0,
+          "bytes": 200000000,
+          "total_s": 5.0,
+          "mb_s": 40.0,
+          "p50_ms": 5000,
+          "p95_ms": 5200,
+          "p99_ms": 5400
+        },
+        "cold_get": {
+          "ops": 1,
+          "ok": 1,
+          "failed": 0,
+          "bytes": 200000000,
+          "total_s": 4.0,
+          "mb_s": 50.0,
+          "p50_ms": 4000,
+          "p95_ms": 4100,
+          "p99_ms": 4200
+        },
+        "warm_get": {
+          "ops": 1,
+          "ok": 1,
+          "failed": 0,
+          "bytes": 200000000,
+          "total_s": 2.5,
+          "mb_s": 80.0,
+          "p50_ms": 2500,
+          "p95_ms": 2600,
+          "p99_ms": 2700
+        }
+      }
+    },
+    "encryption": {
+      "c1": {
+        "put": {
+          "ops": 1,
+          "ok": 1,
+          "failed": 0,
+          "bytes": 200000000,
+          "total_s": 3.6363636363636362,
+          "mb_s": 55.0,
+          "p50_ms": 3600,
+          "p95_ms": 3700,
+          "p99_ms": 3800
+        },
+        "cold_get": {
+          "ops": 1,
+          "ok": 1,
+          "failed": 0,
+          "bytes": 200000000,
+          "total_s": 3.0,
+          "mb_s": 66.67,
+          "p50_ms": 3000,
+          "p95_ms": 3100,
+          "p99_ms": 3200
+        },
+        "warm_get": {
+          "ops": 1,
+          "ok": 1,
+          "failed": 0,
+          "bytes": 200000000,
+          "total_s": 2.0,
+          "mb_s": 100.0,
+          "p50_ms": 2000,
+          "p95_ms": 2100,
+          "p99_ms": 2200
+        }
+      }
+    },
+    "compression_encryption": {
+      "c1": {
+        "put": {
+          "ops": 1,
+          "ok": 1,
+          "failed": 0,
+          "bytes": 200000000,
+          "total_s": 5.714285714285714,
+          "mb_s": 35.0,
+          "p50_ms": 5700,
+          "p95_ms": 5800,
+          "p99_ms": 5900
+        },
+        "cold_get": {
+          "ops": 1,
+          "ok": 1,
+          "failed": 0,
+          "bytes": 200000000,
+          "total_s": 4.5,
+          "mb_s": 44.44,
+          "p50_ms": 4500,
+          "p95_ms": 4600,
+          "p99_ms": 4700
+        },
+        "warm_get": {
+          "ops": 1,
+          "ok": 1,
+          "failed": 0,
+          "bytes": 200000000,
+          "total_s": 3.0,
+          "mb_s": 66.67,
+          "p50_ms": 3000,
+          "p95_ms": 3100,
+          "p99_ms": 3200
+        }
+      }
+    }
+  },
+  "resources_rollup": {
+    "modes": {
+      "passthrough": {
+        "c1": {
+          "health": { "peak_rss_bytes": 98566144 },
+          "process_peak_rss_bytes_prom": 98566144,
+          "host_resources": {
+            "docker_stats": {
+              "cpu_percent": "8.50%",
+              "mem_usage": "420MiB / 16GiB"
+            },
+            "disk_backend_bytes_approx": {
+              "plain_du_sb": 205000000,
+              "encrypted_du_sb": 0
+            }
+          }
+        }
+      },
+      "compression": {
+        "c1": {
+          "health": { "peak_rss_bytes": 134217728 },
+          "process_peak_rss_bytes_prom": 134217728,
+          "host_resources": {
+            "docker_stats": {
+              "cpu_percent": "42.00%",
+              "mem_usage": "680MiB / 16GiB"
+            },
+            "disk_backend_bytes_approx": {
+              "plain_du_sb": 52000000,
+              "encrypted_du_sb": 0
+            }
+          }
+        }
+      },
+      "encryption": {
+        "c1": {
+          "health": { "peak_rss_bytes": 104857600 },
+          "process_peak_rss_bytes_prom": 104857600,
+          "host_resources": {
+            "docker_stats": {
+              "cpu_percent": "22.10%",
+              "mem_usage": "510MiB / 16GiB"
+            },
+            "disk_backend_bytes_approx": {
+              "plain_du_sb": 0,
+              "encrypted_du_sb": 200000000
+            }
+          }
+        }
+      },
+      "compression_encryption": {
+        "c1": {
+          "health": { "peak_rss_bytes": 142606336 },
+          "process_peak_rss_bytes_prom": 142606336,
+          "host_resources": {
+            "docker_stats": {
+              "cpu_percent": "55.00%",
+              "mem_usage": "750MiB / 16GiB"
+            },
+            "disk_backend_bytes_approx": {
+              "plain_du_sb": 48000000,
+              "encrypted_du_sb": 48000000
+            }
+          }
+        }
+      }
+    }
+  },
+  "resource_timeseries_path": "resource_timeseries.json"
+}

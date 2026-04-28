@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DeltaGlider benchmark — fixture-rerun-local</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.6/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg: #0b1220;
+      --panel: rgba(255,255,255,0.04);
+      --text: #e5e7eb;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --border: rgba(148,163,184,0.22);
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+    }
+    body {
+      margin: 0;
+      background: radial-gradient(1200px 600px at 20% -10%, rgba(56,189,248,0.14), transparent),
+                  radial-gradient(900px 500px at 90% 0%, rgba(99,102,241,0.12), transparent),
+                  var(--bg);
+      color: var(--text);
+      line-height: 1.55;
+    }
+    .wrap { max-width: 1160px; margin: 0 auto; padding: 36px 22px 80px; }
+    h1 { font-size: 2rem; letter-spacing: -0.03em; margin: 0 0 8px; }
+    .sub { color: var(--muted); margin: 0 0 26px; }
+    .grid { display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); margin: 22px 0 28px; }
+    .card {
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px 18px;
+      background: var(--panel);
+      backdrop-filter: blur(8px);
+    }
+    .card h3 { margin: 0 0 8px; font-size: 0.82rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+    .metric { font-size: 1.65rem; font-weight: 750; letter-spacing: -0.02em; }
+    canvas { width: 100% !important; height: 380px !important; }
+    .chart-wrap.chart-short canvas { height: 280px !important; }
+    .chart-wrap {
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 16px 18px 8px;
+      background: var(--panel);
+      margin: 18px 0 26px;
+    }
+    h2 { font-size: 1.25rem; margin: 32px 0 12px; letter-spacing: -0.02em; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+    th, td { border-bottom: 1px solid var(--border); padding: 10px 8px; text-align: left; }
+    th { color: var(--muted); font-weight: 650; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.06em; }
+    tr:last-child td { border-bottom: none; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.86em; }
+    .note { color: var(--muted); font-size: 0.9rem; }
+    pre {
+      background: rgba(2,6,23,0.55);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      overflow: auto;
+      font-size: 0.78rem;
+      max-height: 260px;
+    }
+    .pill {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      font-size: 0.78rem;
+      color: var(--muted);
+      margin-right: 8px;
+    }
+    .doc-panel {
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px 20px 14px;
+      background: rgba(2, 6, 23, 0.42);
+      margin: 0 0 18px;
+    }
+    .doc-panel h3 { margin-top: 0; font-size: 1.05rem; letter-spacing: -0.02em; }
+    .doc-panel ol { margin: 8px 0 0 1.15rem; padding: 0; }
+    .doc-panel li { margin: 10px 0; }
+    .doc-meta { margin: 14px 0 0; font-size: 0.88rem; color: var(--muted); }
+    .chart-title {
+      font-size: 0.95rem;
+      font-weight: 650;
+      letter-spacing: -0.02em;
+      margin: 18px 0 8px;
+      color: var(--text);
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <span class="pill">Production tax benchmark</span>
+    <span class="pill">fixture-rerun-local</span>
+    <h1>DeltaGlider compression / encryption report</h1>
+    <p class="sub">
+      Interactive summary from <code>summary.json</code>, <code>artifacts.json</code>, and per-mode Prometheus snapshots.
+      Storage savings use <strong>Δ deltaglider_delta_bytes_saved_total</strong> between each mode&rsquo;s <code>before_*.prom</code>
+      and <code>after_*.prom</code> (isolated to that mode&rsquo;s phase within one proxy process).
+    </p>
+
+    <div class="grid">
+      <div class="card">
+        <h3>Logical payload</h3>
+        <div class="metric">200.0 MB</div>
+        <div class="note">Sum of upstream artifact sizes (client-visible bytes).</div>
+      </div>
+      <div class="card">
+        <h3>PUT spread</h3>
+        <div class="metric">2.29x</div>
+        <div class="note">Best: <code>passthrough</code> 80.0 MB/s; worst: <code>compression encryption</code> 35.0 MB/s.</div>
+      </div>
+      <div class="card">
+        <h3>Delta savings (compression phase)</h3>
+        <div class="metric">75.00%</div>
+        <div class="note">Prometheus Δ during <code>compression</code> mode only.</div>
+      </div>
+    </div>
+
+    <p><strong>Artifacts (1):</strong> <code>alpine-virt-3.19.0-x86_64.iso</code></p>
+
+    <h2>Throughput by mode</h2>
+    <p class="note">MB/s from timed PUT/GET per mode. <strong>Hover</strong> the chart — tooltip lists each series value plus a one-line scenario gloss.</p>
+
+    <div class="chart-wrap">
+      <canvas id="throughput"></canvas>
+    </div>
+
+    <h2>Storage view (logical vs implied stored)</h2>
+    <p class="note">
+      <strong>Implied stored</strong> = logical bytes − Δ<code>deltaglider_delta_bytes_saved_total</code> for that mode.
+      Encryption modes still verify SHA-256 against logical bytes on GET; ciphertext size on disk is not exported here — use
+      <code>/_/stats?bucket=…</code> from an authenticated admin session if you need exact ciphertext footprint.
+      <strong>Hover</strong> the chart — tooltip includes what each bar stack represents for that mode.
+    </p>
+
+    <div class="chart-wrap">
+      <canvas id="storage"></canvas>
+    </div>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Mode</th>
+          <th>Logical GB</th>
+          <th>Δ saved GB (Prom)</th>
+          <th>Implied stored GB</th>
+          <th>Savings %</th>
+          <th>Δ encode events</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td><code>passthrough</code></td><td>200.0 MB</td><td>0.0 MB</td><td>200.0 MB</td><td>0.0</td><td>0</td></tr>
+<tr><td><code>compression</code></td><td>200.0 MB</td><td>150.0 MB</td><td>50.0 MB</td><td>75.0</td><td>12</td></tr>
+<tr><td><code>encryption</code></td><td>200.0 MB</td><td>0.0 MB</td><td>200.0 MB</td><td>0.0</td><td>0</td></tr>
+<tr><td><code>compression_encryption</code></td><td>200.0 MB</td><td>150.0 MB</td><td>50.0 MB</td><td>75.0</td><td>12</td></tr>
+      </tbody>
+    </table>
+
+    <h2>CPU / RAM / disk footprint</h2>
+    <p class="note">
+      Pulls together Grafana-adjacent signals: JSON from <code>/_/health</code>, scalar gauges scraped from Prometheus text,
+      and optional host JSON (<code>benchmark_resources_linux.sh</code>) for Docker stats + filesystem <code>du</code>.
+      See <a href="../grafana-parity.md"><code>docs/benchmark/grafana-parity.md</code></a> for the full mapping.
+    </p>
+    <table><thead><tr><th>Mode</th><th>RSS <code>/_/health</code></th><th>RSS prom</th><th>Docker CPU%</th><th>Docker mem</th><th><code>du</code> plain</th><th><code>du</code> encrypted</th></tr></thead><tbody><tr><td><code>passthrough</code></td><td>98.6 MB</td><td>98.6 MB</td><td>8.50%</td><td>420MiB / 16GiB</td><td>205.0 MB</td><td>0.0 KB</td></tr><tr><td><code>compression</code></td><td>134.2 MB</td><td>134.2 MB</td><td>42.00%</td><td>680MiB / 16GiB</td><td>52.0 MB</td><td>0.0 KB</td></tr><tr><td><code>encryption</code></td><td>104.9 MB</td><td>104.9 MB</td><td>22.10%</td><td>510MiB / 16GiB</td><td>0.0 KB</td><td>200.0 MB</td></tr><tr><td><code>compression_encryption</code></td><td>142.6 MB</td><td>142.6 MB</td><td>55.00%</td><td>750MiB / 16GiB</td><td>48.0 MB</td><td>48.0 MB</td></tr></tbody></table><p class="note">RSS from health/Prometheus is process-wide on the proxy. <code>du</code> totals include every bucket using that filesystem backend root.</p>
+
+    <h2>Resource footprint by test mode (side-by-side)</h2><div class="doc-panel"><p>Each category is a separate <strong>benchmark mode</strong> (passthrough = baseline; compression = delta on; encryption = proxy AES on ciphertext; comp + encrypt = both). Metrics are the <strong>end-of-mode</strong> values in <code>resources_rollup.json</code> — the same source as the footprint table — so you can compare baseline vs compression vs encryption on equal footing.</p><p class="doc-meta">The <strong>timeline graphs</strong> below plot one continuous run where <strong>all four modes execute in order</strong>; coloured bands show which mode window you are in.</p></div><p class="chart-title">Peak proxy RSS (MB)</p><div class="chart-wrap chart-short"><canvas id="resCmpRss"></canvas></div><p class="chart-title">Docker CPU % (proxy container)</p><div class="chart-wrap chart-short"><canvas id="resCmpCpu"></canvas></div><p class="chart-title">Backend disk (<code>du -sb</code>) — plain vs encrypted</p><div class="chart-wrap chart-short"><canvas id="resCmpDisk"></canvas></div>
+
+    <h2>CPU / RAM / disk timeseries (whole run — all modes in one run)</h2>
+    <div class="doc-panel"><h3>How to read the resource timeseries</h3><ol><li><strong>X axis — elapsed seconds.</strong> <code>t = 0</code> is when the benchmark harness started its timed loop (right after artifact prep). Not absolute clock time. The right edge is roughly total benchmark duration.</li><li><strong>Coloured shaded bands</strong> — each band is one full <strong>test mode</strong> window (passthrough → compression → encryption → compression+encryption). Left-to-right you see the entire suite in sequence — not a single mode in isolation.</li><li><strong>Vertical dashed lines</strong> — a timed phase began: <strong>PUT</strong>, <strong>cold GET</strong>, or <strong>warm GET</strong> for the labeled mode (passthrough → compression → encryption → compression+encryption). Alternate amber / blue for readability.</li><li><strong>Hover</strong> any plotted point — tooltip shows measured values; footer lists phase markers near that time and the most recent phase that started before this <code>t</code>.</li><li><strong>CPU</strong> — Docker-reported CPU% for the <code>dgp-bench</code> container.</li><li><strong>RAM</strong> — proxy process RSS (Prometheus/health) vs Docker cgroup memory (parsed from <code>MemUsage</code>).</li><li><strong>Disk</strong> — <code>du -sb</code> trees for plain vs encrypted backend roots; expect jumps when modes switch buckets.</li></ol><p class="doc-meta"><strong>Sampling interval:</strong> <code>2.0s</code> between resource snapshots (whole run).</p></div><p class="chart-title">CPU over time</p><div class="chart-wrap"><canvas id="resCpu"></canvas></div><p class="chart-title">RAM over time</p><div class="chart-wrap"><canvas id="resRam"></canvas></div><p class="chart-title">Disk footprint over time</p><div class="chart-wrap"><canvas id="resDisk"></canvas></div><h3>Phase schedule (same markers as vertical lines)</h3><table><thead><tr><th>Elapsed s</th><th>Mode</th><th>Phase</th><th>Label (same as chart hover)</th></tr></thead><tbody><tr><td>0.5</td><td><code>passthrough</code></td><td><code>put</code></td><td>passthrough · PUT</td></tr><tr><td>3.0</td><td><code>compression</code></td><td><code>put</code></td><td>compression · PUT</td></tr><tr><td>7.0</td><td><code>encryption</code></td><td><code>put</code></td><td>encryption · PUT</td></tr><tr><td>11.0</td><td><code>compression_encryption</code></td><td><code>put</code></td><td>compression encryption · PUT</td></tr></tbody></table><p class="note">Same timestamps as the <strong>amber/blue vertical lines</strong> on the graphs above.</p>
+
+    <h2>Conclusions</h2>
+    <p><strong>Compression reduced stored bytes.</strong> Approximately <strong>150.00 MB</strong> saved vs logical uploads (<strong>75.00%</strong> of logical bytes).</p>
+<p>PUT throughput drops from <strong>80.0 MB/s</strong> (passthrough) to <strong>40.0 MB/s</strong> (compression) — delta encode is CPU-heavy vs streaming writes.</p>
+<p>The encrypted backend bucket measured <strong>55.0 MB/s</strong> PUT vs passthrough — AES-GCM adds measurable CPU cost while preserving logical bytes on read.</p>
+
+    <h2>Artifact manifest (trimmed)</h2>
+    <pre>[
+  {
+    &quot;name&quot;: &quot;alpine-virt-3.19.0-x86_64.iso&quot;,
+    &quot;bytes&quot;: 200000000,
+    &quot;sha256_hex&quot;: &quot;0000000000000000000000000000000000000000000000000000000000000000&quot;
+  }
+]</pre>
+
+    <p class="note">
+      Generated locally — commit under <code>docs/benchmark/results/</code> if you want this pinned alongside the tarball.
+    </p>
+  </div>
+  <script>
+    const throughput = {"labels": ["passthrough", "compression", "encryption", "compression encryption"], "datasets": [{"label": "PUT", "data": [80.0, 40.0, 55.0, 35.0], "backgroundColor": "rgba(59, 130, 246, 0.65)"}, {"label": "Cold GET", "data": [100.0, 50.0, 66.67, 44.44], "backgroundColor": "rgba(16, 185, 129, 0.65)"}, {"label": "Warm GET", "data": [200.0, 80.0, 100.0, 66.67], "backgroundColor": "rgba(251, 146, 60, 0.75)"}]};
+    const storage = {"labels": ["Passthrough", "Compression", "Encryption", "Compression Encryption"], "datasets": [{"label": "Logical uploaded (client-visible)", "data": [0.2, 0.2, 0.2, 0.2], "backgroundColor": "rgba(148, 163, 184, 0.55)"}, {"label": "Implied stored on backend (logical \u2212 \u0394 saved)", "data": [0.2, 0.05, 0.2, 0.05], "backgroundColor": "rgba(59, 130, 246, 0.68)"}]};
+    const resourceSeries = {"labels": [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0], "cpu_pct": [8.5, 18.0, 42.0, 35.0, 22.1, 28.5, 55.0], "rss_mb": [98.566144, 110.10048, 125.82912, 120.58624, 104.8576, 109.051904, 142.606336], "docker_mem_mb": [420.0, 500.0, 680.0, 630.0, 510.0, 560.0, 750.0], "disk_plain_mb": [205.0, 180.0, 52.0, 52.0, 0.0, 0.0, 48.0], "disk_encrypted_mb": [0.0, 0.0, 0.0, 0.0, 200.0, 200.0, 48.0], "disk_total_mb": [205.0, 180.0, 52.0, 52.0, 200.0, 200.0, 96.0], "markers": [{"event": "phase_start", "elapsed_s": 0.5, "mode": "passthrough", "phase": "put", "concurrency": 1}, {"event": "phase_start", "elapsed_s": 3.0, "mode": "compression", "phase": "put", "concurrency": 1}, {"event": "phase_start", "elapsed_s": 7.0, "mode": "encryption", "phase": "put", "concurrency": 1}, {"event": "phase_start", "elapsed_s": 11.0, "mode": "compression_encryption", "phase": "put", "concurrency": 1}]};
+    const throughputHints = ["Baseline: no delta compression; plain backend; proxy AES off.", "Delta (xdelta3) enabled; plain backend; CPU-heavy PUT path.", "Proxy AES-256-GCM; ciphertext stored under encrypted backend root.", "Both delta encoding and proxy encryption active."];
+    const storageHints = ["Prom \u0394 usually 0 for this segment unless counters moved between snapshots.", "\u0394 saved reflects bytes attributed to delta storage during this mode\u2019s benchmark slice.", "Typically little/no \u0394 saved (no delta); implied stored \u2248 logical.", "Combined effect: delta savings where applicable + encrypted backend footprint."];
+    const phaseMarkersVisual = [{"elapsed_s": 0.5, "mode": "passthrough", "phase": "put", "concurrency": 1, "label": "passthrough \u00b7 PUT"}, {"elapsed_s": 3.0, "mode": "compression", "phase": "put", "concurrency": 1, "label": "compression \u00b7 PUT"}, {"elapsed_s": 7.0, "mode": "encryption", "phase": "put", "concurrency": 1, "label": "encryption \u00b7 PUT"}, {"elapsed_s": 11.0, "mode": "compression_encryption", "phase": "put", "concurrency": 1, "label": "compression encryption \u00b7 PUT"}];
+    const sampleInterval = 2.0;
+    const rollupCompare = {"labels": ["Passthrough", "Compression", "Encryption", "Comp + encrypt"], "rss_mb": [98.5661, 134.2177, 104.8576, 142.6063], "docker_cpu": [8.5, 42.0, 22.1, 55.0], "plain_mb": [205.0, 52.0, 0.0, 48.0], "encrypted_mb": [0.0, 0.0, 200.0, 48.0]};
+    const modeSpans = [];
+
+    Chart.defaults.color = '#cbd5e1';
+    Chart.defaults.borderColor = 'rgba(148,163,184,0.25)';
+    Chart.defaults.font.family = "ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial";
+
+    const tooltipBase = {
+      backgroundColor: 'rgba(15, 23, 42, 0.96)',
+      padding: 12,
+      borderColor: 'rgba(148, 163, 184, 0.38)',
+      borderWidth: 1,
+      titleSpacing: 6,
+      bodySpacing: 6,
+      footerSpacing: 8,
+      displayColors: true,
+    };
+
+    function buildLineXY(labels, ys) {
+      const out = [];
+      if (!labels || !ys) return out;
+      for (let i = 0; i < labels.length; i++) {
+        const y = ys[i];
+        if (y === null || y === undefined || Number.isNaN(Number(y))) continue;
+        out.push({ x: Number(labels[i]), y: Number(y) });
+      }
+      return out;
+    }
+
+    function phaseTooltipFooterLines(xVal) {
+      const iv = Number(sampleInterval) || 2;
+      const markers = phaseMarkersVisual || [];
+      const lines = [];
+      const near = markers.filter((m) => Math.abs(m.elapsed_s - xVal) <= iv * 1.35);
+      if (near.length) {
+        lines.push('Phase markers near this t:');
+        near
+          .slice()
+          .sort((a, b) => a.elapsed_s - b.elapsed_s)
+          .forEach((m) => lines.push('  • ' + m.label + ' @ t=' + String(m.elapsed_s) + 's'));
+      }
+      const past = markers.filter((m) => m.elapsed_s <= xVal + 1e-6);
+      past.sort((a, b) => b.elapsed_s - a.elapsed_s);
+      if (past.length) {
+        lines.push(
+          'Dominant phase at this t: ' + past[0].label + ' (started @ t=' + String(past[0].elapsed_s) + 's)'
+        );
+      }
+      return lines;
+    }
+
+    const benchModeBands = {
+      id: 'benchModeBands',
+      beforeDatasetsDraw(chart) {
+        const spans = chart.options.plugins?.benchModeBands?.spans;
+        if (!spans || !spans.length) return;
+        const { ctx, chartArea, scales } = chart;
+        const xScale = scales.x;
+        if (!xScale || xScale.type !== 'linear') return;
+        spans.forEach((span) => {
+          const x0 = xScale.getPixelForValue(span.t0);
+          const x1 = xScale.getPixelForValue(span.t1);
+          const left = Math.min(x0, x1);
+          const w = Math.abs(x1 - x0);
+          if (w < 0.5) return;
+          ctx.save();
+          ctx.fillStyle = span.color || 'rgba(148, 163, 184, 0.12)';
+          ctx.fillRect(left, chartArea.top, w, chartArea.bottom - chartArea.top);
+          ctx.fillStyle = 'rgba(226, 232, 240, 0.9)';
+          ctx.font = '600 11px system-ui,sans-serif';
+          const txt = span.label || span.mode || '';
+          const tx = Math.min(Math.max(left + 5, chartArea.left + 4), chartArea.right - 120);
+          ctx.fillText(txt, tx, chartArea.top + 14);
+          ctx.restore();
+        });
+      },
+    };
+    Chart.register(benchModeBands);
+
+    const benchPhaseLines = {
+      id: 'benchPhaseLines',
+      afterDatasetsDraw(chart) {
+        const markers = chart.options.plugins?.benchPhaseLines?.markers;
+        if (!markers || !markers.length) return;
+        const { ctx, chartArea, scales } = chart;
+        const xScale = scales.x;
+        if (!xScale || xScale.type !== 'linear') return;
+        ctx.save();
+        markers.forEach((m, i) => {
+          const px = xScale.getPixelForValue(m.elapsed_s);
+          if (px < chartArea.left || px > chartArea.right) return;
+          ctx.beginPath();
+          ctx.strokeStyle = i % 2 === 0 ? 'rgba(251, 191, 36, 0.82)' : 'rgba(96, 165, 250, 0.82)';
+          ctx.lineWidth = 1.5;
+          ctx.setLineDash([6, 5]);
+          ctx.moveTo(px, chartArea.top);
+          ctx.lineTo(px, chartArea.bottom);
+          ctx.stroke();
+        });
+        ctx.setLineDash([]);
+        ctx.restore();
+      },
+    };
+    Chart.register(benchPhaseLines);
+
+    const lineDatasetOpts = {
+      pointRadius: 0,
+      pointHoverRadius: 6,
+      pointHoverBorderWidth: 2,
+      tension: 0.22,
+      spanGaps: false,
+    };
+
+    const lineInteraction = {
+      mode: 'nearest',
+      intersect: false,
+      axis: 'x',
+    };
+
+    new Chart(document.getElementById('throughput'), {
+      type: 'bar',
+      data: throughput,
+      options: {
+        responsive: true,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          tooltip: {
+            ...tooltipBase,
+            callbacks: {
+              afterBody: (items) => {
+                if (!items || !items.length) return '';
+                const idx = items[0].dataIndex;
+                const g = throughputHints[idx];
+                return g ? '\n' + g : '';
+              },
+            },
+          },
+          legend: { position: 'bottom' },
+          title: { display: true, text: 'Throughput (MB/s)', color: '#e5e7eb', font: { size: 15 } },
+        },
+        scales: {
+          x: { stacked: false },
+          y: { beginAtZero: true, title: { display: true, text: 'MB/s' } },
+        },
+      },
+    });
+
+    new Chart(document.getElementById('storage'), {
+      type: 'bar',
+      data: storage,
+      options: {
+        responsive: true,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          tooltip: {
+            ...tooltipBase,
+            callbacks: {
+              afterBody: (items) => {
+                if (!items || !items.length) return '';
+                const idx = items[0].dataIndex;
+                const g = storageHints[idx];
+                return g ? '\n' + g : '';
+              },
+            },
+          },
+          legend: { position: 'bottom' },
+          title: { display: true, text: 'Storage (GB)', color: '#e5e7eb', font: { size: 15 } },
+        },
+        scales: {
+          x: { stacked: false },
+          y: { beginAtZero: true, title: { display: true, text: 'GB' } },
+        },
+      },
+    });
+
+    const rollupSnapHint = 'End-of-mode snapshot from resources_rollup (same source as footprint table above).';
+    if (rollupCompare.labels && rollupCompare.labels.length > 0) {
+      const rc = rollupCompare;
+      const cmpTT = {
+        ...tooltipBase,
+        callbacks: {
+          afterBody: () => '\n' + rollupSnapHint,
+        },
+      };
+      new Chart(document.getElementById('resCmpRss'), {
+        type: 'bar',
+        data: {
+          labels: rc.labels,
+          datasets: [{
+            label: 'Peak RSS (MB)',
+            data: rc.rss_mb,
+            backgroundColor: 'rgba(59, 130, 246, 0.72)',
+          }],
+        },
+        options: {
+          responsive: true,
+          interaction: { mode: 'index', intersect: false },
+          plugins: {
+            tooltip: cmpTT,
+            legend: { display: false },
+            title: { display: true, text: 'Peak proxy RSS — compare modes', color: '#e5e7eb', font: { size: 14 } },
+          },
+          scales: {
+            y: { beginAtZero: true, title: { display: true, text: 'MB' } },
+          },
+        },
+      });
+      new Chart(document.getElementById('resCmpCpu'), {
+        type: 'bar',
+        data: {
+          labels: rc.labels,
+          datasets: [{
+            label: 'Docker CPU %',
+            data: rc.docker_cpu,
+            backgroundColor: 'rgba(250, 204, 21, 0.72)',
+          }],
+        },
+        options: {
+          responsive: true,
+          interaction: { mode: 'index', intersect: false },
+          plugins: {
+            tooltip: cmpTT,
+            legend: { display: false },
+            title: { display: true, text: 'Docker CPU % — compare modes', color: '#e5e7eb', font: { size: 14 } },
+          },
+          scales: {
+            y: { beginAtZero: true, title: { display: true, text: 'CPU %' } },
+          },
+        },
+      });
+      new Chart(document.getElementById('resCmpDisk'), {
+        type: 'bar',
+        data: {
+          labels: rc.labels,
+          datasets: [
+            {
+              label: 'Plain backend (MB)',
+              data: rc.plain_mb,
+              backgroundColor: 'rgba(34, 197, 94, 0.65)',
+            },
+            {
+              label: 'Encrypted backend (MB)',
+              data: rc.encrypted_mb,
+              backgroundColor: 'rgba(239, 68, 68, 0.62)',
+            },
+          ],
+        },
+        options: {
+          responsive: true,
+          interaction: { mode: 'index', intersect: false },
+          plugins: {
+            tooltip: cmpTT,
+            legend: { position: 'bottom' },
+            title: { display: true, text: 'Backend du — compare modes', color: '#e5e7eb', font: { size: 14 } },
+          },
+          scales: {
+            x: { stacked: false },
+            y: { beginAtZero: true, title: { display: true, text: 'MB (du -sb)' } },
+          },
+        },
+      });
+    }
+
+    if (resourceSeries.labels && resourceSeries.labels.length > 0) {
+      const labels = resourceSeries.labels;
+      const mkFooter = (items) => {
+        if (!items || !items.length) return '';
+        const x = items[0].parsed.x;
+        const extra = phaseTooltipFooterLines(x);
+        return extra.length ? '\n' + extra.join('\n') : '';
+      };
+      const linePlugins = {
+        benchPhaseLines: { markers: phaseMarkersVisual },
+        benchModeBands: { spans: modeSpans },
+        tooltip: {
+          ...tooltipBase,
+          callbacks: {
+            footer: mkFooter,
+          },
+        },
+        legend: { position: 'bottom' },
+      };
+
+      new Chart(document.getElementById('resCpu'), {
+        type: 'line',
+        data: {
+          datasets: [
+            {
+              label: 'Docker CPU %',
+              data: buildLineXY(labels, resourceSeries.cpu_pct),
+              borderColor: 'rgba(250, 204, 21, 0.95)',
+              backgroundColor: 'rgba(250, 204, 21, 0.22)',
+              ...lineDatasetOpts,
+            },
+          ],
+        },
+        options: {
+          responsive: true,
+          parsing: false,
+          interaction: lineInteraction,
+          plugins: {
+            ...linePlugins,
+            title: { display: false },
+          },
+          scales: {
+            x: {
+              type: 'linear',
+              title: { display: true, text: 'Elapsed seconds (t=0 at benchmark loop start)' },
+              grid: { color: 'rgba(148,163,184,0.08)' },
+            },
+            y: {
+              beginAtZero: true,
+              title: { display: true, text: 'CPU %' },
+              grid: { color: 'rgba(148,163,184,0.08)' },
+            },
+          },
+        },
+      });
+
+      new Chart(document.getElementById('resRam'), {
+        type: 'line',
+        data: {
+          datasets: [
+            {
+              label: 'Proxy RSS (MB)',
+              data: buildLineXY(labels, resourceSeries.rss_mb),
+              borderColor: 'rgba(59, 130, 246, 0.95)',
+              backgroundColor: 'rgba(59, 130, 246, 0.22)',
+              ...lineDatasetOpts,
+            },
+            {
+              label: 'Docker used memory (MB)',
+              data: buildLineXY(labels, resourceSeries.docker_mem_mb),
+              borderColor: 'rgba(167, 139, 250, 0.95)',
+              backgroundColor: 'rgba(167, 139, 250, 0.18)',
+              ...lineDatasetOpts,
+            },
+          ],
+        },
+        options: {
+          responsive: true,
+          parsing: false,
+          interaction: lineInteraction,
+          plugins: {
+            ...linePlugins,
+            title: { display: false },
+          },
+          scales: {
+            x: {
+              type: 'linear',
+              title: { display: true, text: 'Elapsed seconds (t=0 at benchmark loop start)' },
+              grid: { color: 'rgba(148,163,184,0.08)' },
+            },
+            y: {
+              beginAtZero: true,
+              title: { display: true, text: 'MB (MiB-scale proxy RSS vs Docker usage)' },
+              grid: { color: 'rgba(148,163,184,0.08)' },
+            },
+          },
+        },
+      });
+
+      new Chart(document.getElementById('resDisk'), {
+        type: 'line',
+        data: {
+          datasets: [
+            {
+              label: 'Disk plain backend (MB)',
+              data: buildLineXY(labels, resourceSeries.disk_plain_mb),
+              borderColor: 'rgba(34, 197, 94, 0.95)',
+              backgroundColor: 'rgba(34, 197, 94, 0.18)',
+              ...lineDatasetOpts,
+            },
+            {
+              label: 'Disk encrypted backend (MB)',
+              data: buildLineXY(labels, resourceSeries.disk_encrypted_mb),
+              borderColor: 'rgba(239, 68, 68, 0.95)',
+              backgroundColor: 'rgba(239, 68, 68, 0.18)',
+              ...lineDatasetOpts,
+            },
+            {
+              label: 'Disk total (MB)',
+              data: buildLineXY(labels, resourceSeries.disk_total_mb),
+              borderColor: 'rgba(148, 163, 184, 0.95)',
+              backgroundColor: 'rgba(148, 163, 184, 0.15)',
+              ...lineDatasetOpts,
+            },
+          ],
+        },
+        options: {
+          responsive: true,
+          parsing: false,
+          interaction: lineInteraction,
+          plugins: {
+            ...linePlugins,
+            title: { display: false },
+          },
+          scales: {
+            x: {
+              type: 'linear',
+              title: { display: true, text: 'Elapsed seconds (t=0 at benchmark loop start)' },
+              grid: { color: 'rgba(148,163,184,0.08)' },
+            },
+            y: {
+              beginAtZero: true,
+              title: { display: true, text: 'MB (du -sb per backend root)' },
+              grid: { color: 'rgba(148,163,184,0.08)' },
+            },
+          },
+        },
+      });
+    }
+  </script>
+</body>
+</html>

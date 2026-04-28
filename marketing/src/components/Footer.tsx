@@ -87,6 +87,20 @@ export function Footer(): JSX.Element {
                   </Link>
                 </li>
                 <li>
+                  <Link
+                    to="/benchmark/"
+                    className="group inline-flex items-center gap-2.5 transition hover:text-brand-200"
+                  >
+                    <span
+                      className="text-brand-300/45 transition group-hover:text-brand-200"
+                      aria-hidden
+                    >
+                      ↗
+                    </span>
+                    Benchmark study
+                  </Link>
+                </li>
+                <li>
                   <a
                     href={REPO_URL}
                     target="_blank"

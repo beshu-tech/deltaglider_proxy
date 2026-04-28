@@ -1,0 +1,68 @@
+{
+  "modes": {
+    "passthrough": {
+      "c1": {
+        "health": { "peak_rss_bytes": 98566144 },
+        "process_peak_rss_bytes_prom": 98566144,
+        "host_resources": {
+          "docker_stats": {
+            "cpu_percent": "8.50%",
+            "mem_usage": "420MiB / 16GiB"
+          },
+          "disk_backend_bytes_approx": {
+            "plain_du_sb": 205000000,
+            "encrypted_du_sb": 0
+          }
+        }
+      }
+    },
+    "compression": {
+      "c1": {
+        "health": { "peak_rss_bytes": 134217728 },
+        "process_peak_rss_bytes_prom": 134217728,
+        "host_resources": {
+          "docker_stats": {
+            "cpu_percent": "42.00%",
+            "mem_usage": "680MiB / 16GiB"
+          },
+          "disk_backend_bytes_approx": {
+            "plain_du_sb": 52000000,
+            "encrypted_du_sb": 0
+          }
+        }
+      }
+    },
+    "encryption": {
+      "c1": {
+        "health": { "peak_rss_bytes": 104857600 },
+        "process_peak_rss_bytes_prom": 104857600,
+        "host_resources": {
+          "docker_stats": {
+            "cpu_percent": "22.10%",
+            "mem_usage": "510MiB / 16GiB"
+          },
+          "disk_backend_bytes_approx": {
+            "plain_du_sb": 0,
+            "encrypted_du_sb": 200000000
+          }
+        }
+      }
+    },
+    "compression_encryption": {
+      "c1": {
+        "health": { "peak_rss_bytes": 142606336 },
+        "process_peak_rss_bytes_prom": 142606336,
+        "host_resources": {
+          "docker_stats": {
+            "cpu_percent": "55.00%",
+            "mem_usage": "750MiB / 16GiB"
+          },
+          "disk_backend_bytes_approx": {
+            "plain_du_sb": 48000000,
+            "encrypted_du_sb": 48000000
+          }
+        }
+      }
+    }
+  }
+}

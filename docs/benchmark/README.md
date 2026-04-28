@@ -1,16 +1,24 @@
 # Compression tax benchmark
 
-This benchmark measures the operator-facing cost of enabling DeltaGlider
-compression and proxy-side encryption.
+This benchmark compares **passthrough** (baseline) against **compression**, **encryption**, and **both** on the **same** artifact set and bucket layout.
 
-It does **not** try to prove "compression is good" in the abstract. It answers:
+### What to measure (minimal)
 
-- How much slower are uploads when xdelta3 is enabled?
-- How much slower are cold and warm downloads?
-- How much overhead does proxy-side AES-256-GCM add?
-- How do those costs compare to the stored-byte reduction?
+| Question | Where it shows |
+|----------|----------------|
+| Upload slowdown vs baseline | Per-mode **PUT** wall MB/s (`mb_s_wall` in `summary.json`) |
+| Cold vs warm download slowdown | **cold_get** vs **warm_get** vs passthrough |
+| Extra CPU / RAM vs baseline | Resource rollup / timeseries (`/_/health` RSS, Docker CPU%, optional host JSON) |
+| “Whole ISO in RAM?” | Compare **peak RSS** to largest artifact size (sanity check, not SLO) |
 
-## Primary scenario
+**Out of scope unless you opt in:** concurrency sweeps (`--concurrency 1,4`), multi-trial statistics, load testing. Default **`run` concurrency is `1`**.
+
+**Prometheus Δ saved** is optional for this narrative—focus on **transfer time + resources** first.
+
+**Relative slowdown vs passthrough** (same phase: PUT, cold_get, or warm_get):  
+`100 * (1 - mode_mb_s_wall / passthrough_mb_s_wall)` — use `mb_s_wall` from `summary.json` → `modes` → `<mode>` → `c1` → `<phase>` (same for **report.md** after the run).
+
+### Primary scenario
 
 Use a CI artifact publishing workflow inside Hetzner Cloud:
 
@@ -58,7 +66,9 @@ alpine-virt-3.19.4-x86_64.iso
 Kernel `.tar.xz` should be treated as a negative-control profile, not the
 default publication profile.
 
-Recommended shape:
+**Enough for comparative answers** (what you actually need): a handful of similar ISOs on one prefix (e.g. **5 × ~60 MB**). Everything below is optional publication-scale bulk.
+
+Recommended shape (large runs / publication only):
 
 - 20-50 artifacts
 - 100-300 MB each
@@ -91,8 +101,15 @@ Most implementation lives in `docs/benchmark/dgp_bench/`:
 - `sigv4.py` — small S3 SigV4 client
 - `artifacts.py` — real artifact discovery/download
 - `runner.py` — PUT/cold GET/warm GET benchmark phases
-- `metrics.py` — `/metrics`, `/_/stats`, and restart snapshots
+- `metrics.py` — `/metrics`, `/health`, optional host JSON; paired snapshots
+- `prom_summary.py` — scalar rollup from Prometheus text
+- `resources_rollup.py` — per-mode aggregate from `after_*.json`
 - `reporting.py` — CSV/JSON/Markdown summaries
+- `trial_aggregate.py` — cross-trial distributions over run-level scalars (`aggregate.json`)
+- `bench_bundle.py` — load result dirs / `.tgz`, Prometheus deltas, rollup comparison payloads
+- `bench_summary.py` — shared summary shapes (phase names, failure counting, concurrency pick)
+- `bench_report_format.py` — HTML/format helpers without bundle I/O
+- `config.py` — also defines `MODE_ORDER`, chart/report hint strings (single sequence for charts + markdown)
 
 ## Hetzner Cloud lifecycle
 
@@ -102,14 +119,16 @@ Set an API token:
 export HCLOUD_TOKEN=...
 ```
 
+Defaults target **Helsinki (`hel1`)** with **`ccx33`** (older **`cpx31`** SKUs are often unavailable in EU locations). Override `--location` / `--client-type` if needed.
+
 Create the VMs:
 
 ```bash
 python docs/benchmark/bench_production_tax.py up \
   --run-id dgp-tax-001 \
-  --location fsn1 \
-  --client-type cpx31 \
-  --proxy-type cpx31 \
+  --location hel1 \
+  --client-type ccx33 \
+  --proxy-type ccx33 \
   --ssh-key-name your-hcloud-ssh-key
 ```
 
@@ -119,8 +138,8 @@ For smoke/debug work, create a single all-in-one VM instead:
 python docs/benchmark/bench_production_tax.py up \
   --run-id dgp-tax-smoke \
   --single-vm \
-  --location fsn1 \
-  --client-type cpx31 \
+  --location hel1 \
+  --client-type ccx33 \
   --ssh-key-name your-hcloud-ssh-key
 ```
 
@@ -149,6 +168,10 @@ four benchmark modes, and downloads a result bundle to
 `docs/benchmark/results/`. It is a correctness/debug workflow, not the
 publishable production benchmark.
 
+Add **`--no-proxy-restart`** to skip `docker restart` between PUT and cold GET: Prometheus counters stay aligned with PUT-phase work (better for Δ-validity and RSS timelines); cold reads are less aggressively “cold.”
+
+**Per-mode process isolation (RSS / Prom):** single-vm smoke **defaults** to **`--restart-between-modes-command`** (`docker restart …`) so each mode runs against a **fresh proxy process** after the previous mode’s CSVs and `before_*`/`after_*` snapshots are on disk — nothing is lost; **`resources_rollup` “peak RSS” bars become comparable per mode** (not one monotonic lifetime high-water mark). Opt out with **`--no-restart-between-modes`**. Plain `run` accepts **`--restart-between-modes-command`** / **`DGP_BENCH_RESTART_BETWEEN_MODES_COMMAND`** the same way.
+
 The single-VM smoke defaults to Alpine ISO artifacts to mirror the main
 benchmark profile. To run the kernel negative-control profile instead, set:
 
@@ -167,6 +190,14 @@ Destroy resources:
 ```bash
 python docs/benchmark/bench_production_tax.py down --run-id dgp-tax-001
 ```
+
+Delete **every** benchmark-tagged VM (any run-id):
+
+```bash
+python docs/benchmark/bench_production_tax.py down --all-benchmark-vms
+```
+
+Use `status --all-benchmark-vms` to list them first; combine with `--dry-run` on `down` when unsure.
 
 All created servers are labeled:
 
@@ -244,12 +275,28 @@ python docs/benchmark/bench_production_tax.py run \
   --alpine-branch v3.19 \
   --alpine-flavor virt \
   --alpine-arch x86_64 \
-  --concurrency 1,4 \
+  --concurrency 1 \
   --metrics-url https://dgp.example.com/_/metrics \
   --stats-url https://dgp.example.com/_/stats \
   --health-url https://dgp.example.com/_/health \
+  --resource-sample-interval 2 \
   --results /data/dgp-bench/results
 ```
+
+Use **`--concurrency 1,4`** only when you intentionally want two concurrency rows per mode (load-matrix style); default is **`1`**.
+
+**CPU / RAM / disk (Grafana-class signals)** — pair Prometheus + health with optional host JSON:
+
+- **`--health-url`** — each snapshot merges `GET /_/health` (peak RSS, cache fields).
+- **`--resource-command`** — shell that prints **one JSON object on stdout** (Linux:
+  `bash docs/benchmark/scripts/benchmark_resources_linux.sh`; env `DGP_BENCH_RESOURCE_COMMAND`
+  is equivalent). Override roots/container via `DGP_BENCH_DATA_ROOT`, `DGP_BENCH_DOCKER_NAME`.
+- **`--resource-sample-interval`** — seconds between resource samples for whole-run
+  CPU/RAM/Disk timeseries (`resource_timeseries.json`). Use `0` to disable.
+- **`--phase-gap-seconds`** — optional sleep after each PUT / cold GET / warm GET phase so idle dips show up between phases on resource charts (`DGP_BENCH_PHASE_GAP_SECONDS`; default `0`).
+
+See [grafana-parity.md](grafana-parity.md) for the mapping to typical Grafana panels (process RSS,
+delta histograms, node load/mem, `docker stats`, backend `du`).
 
 If you can safely clear cache/restart the proxy before cold GET phases, pass:
 
@@ -258,6 +305,26 @@ If you can safely clear cache/restart the proxy before cold GET phases, pass:
 ```
 
 Do not use a restart command against a shared production instance.
+
+### Multi-trial (`--trials N`)
+
+Use **`--trials N`** to repeat the benchmark with independent object prefixes (`<run-id>-t00i`). Each trial is stored under `results/<run-id>/trial_XXX/`; the parent gets **`aggregate.json`** / **`aggregate.md`** (mean / min / max / p05 / p50 / p95 over **trials** for each mode/phase scalar — distinct from within-run `p50_ms` / `p95_ms` in `summarize_ops`). The merged **`summary.json`** at the parent is derived from **`trial_001`** for HTML throughput charts and Prometheus paths; the HTML report adds a **cross-trial throughput** table when `aggregate.json` is present and `trial_count >= 2`.
+
+Optional **`--clean-command`** runs before trial 2..N (shell string). Env vars: **`DGP_BENCH_TRIALS`**, **`DGP_BENCH_CLEAN_COMMAND`**.
+
+If **`--clean-command`** exits non-zero, the run **aborts by default** (later trials would be confounded). Pass **`--allow-clean-failure`** or set **`DGP_BENCH_ALLOW_CLEAN_FAILURE=1`** only when you deliberately want to continue.
+
+Parent **`summary.json`** includes **`trial_count_expected`** / **`trial_count_completed`** (must match).
+
+Prometheus **`*.prom`** snapshots: if multiple `before_*` / `after_*` files exist under the same mode/concurrency, the HTML loader uses the **newest file by modification time**.
+
+On Linux, **`restart-command`** / **`clean-command`** can include dropping **filesystem cache** (often paired with proxy restart so cold GET is colder):
+
+```bash
+sync && sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+```
+
+Requires **root** (`sudo`). **Do not** run on shared/multi-tenant hosts without understanding blast radius (everything becomes colder). Page cache drops do **not** clear GPU RAM or necessarily mimic “fresh client”; they mainly reduce kernel buffer reuse for backend reads.
 
 ## Output
 
@@ -268,6 +335,8 @@ results/<run-id>/
   artifacts.json
   environment.json
   summary.json
+  resources_rollup.json
+  resource_timeseries.json
   report.md
   <mode>/c<concurrency>/
     put.csv
@@ -278,6 +347,8 @@ results/<run-id>/
     after_*.json
     after_*.prom
 ```
+
+With **`--trials` > 1**, the same layout appears under **`trial_001/` … `trial_NNN/`**, and the parent adds **`aggregate.json`**, **`aggregate.md`**, plus a top-level **`summary.json`** that references **`trial_001`** for chart-facing metrics.
 
 ### HTML chart report (optional)
 

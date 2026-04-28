@@ -1,0 +1,68 @@
+{
+  "schema": "dgp-bench-resource-timeseries/v1",
+  "sample_interval_s": 2.0,
+  "samples": [
+    {
+      "elapsed_s": 0.0,
+      "prom_summary": { "process_peak_rss_bytes": 98566144 },
+      "host_resources": {
+        "docker_stats": { "cpu_percent": "8.50%", "mem_usage": "420MiB / 16GiB" },
+        "disk_backend_bytes_approx": { "plain_du_sb": 205000000, "encrypted_du_sb": 0 }
+      }
+    },
+    {
+      "elapsed_s": 2.0,
+      "prom_summary": { "process_peak_rss_bytes": 110100480 },
+      "host_resources": {
+        "docker_stats": { "cpu_percent": "18.00%", "mem_usage": "500MiB / 16GiB" },
+        "disk_backend_bytes_approx": { "plain_du_sb": 180000000, "encrypted_du_sb": 0 }
+      }
+    },
+    {
+      "elapsed_s": 4.0,
+      "prom_summary": { "process_peak_rss_bytes": 125829120 },
+      "host_resources": {
+        "docker_stats": { "cpu_percent": "42.00%", "mem_usage": "680MiB / 16GiB" },
+        "disk_backend_bytes_approx": { "plain_du_sb": 52000000, "encrypted_du_sb": 0 }
+      }
+    },
+    {
+      "elapsed_s": 6.0,
+      "prom_summary": { "process_peak_rss_bytes": 120586240 },
+      "host_resources": {
+        "docker_stats": { "cpu_percent": "35.00%", "mem_usage": "630MiB / 16GiB" },
+        "disk_backend_bytes_approx": { "plain_du_sb": 52000000, "encrypted_du_sb": 0 }
+      }
+    },
+    {
+      "elapsed_s": 8.0,
+      "prom_summary": { "process_peak_rss_bytes": 104857600 },
+      "host_resources": {
+        "docker_stats": { "cpu_percent": "22.10%", "mem_usage": "510MiB / 16GiB" },
+        "disk_backend_bytes_approx": { "plain_du_sb": 0, "encrypted_du_sb": 200000000 }
+      }
+    },
+    {
+      "elapsed_s": 10.0,
+      "prom_summary": { "process_peak_rss_bytes": 109051904 },
+      "host_resources": {
+        "docker_stats": { "cpu_percent": "28.50%", "mem_usage": "560MiB / 16GiB" },
+        "disk_backend_bytes_approx": { "plain_du_sb": 0, "encrypted_du_sb": 200000000 }
+      }
+    },
+    {
+      "elapsed_s": 12.0,
+      "prom_summary": { "process_peak_rss_bytes": 142606336 },
+      "host_resources": {
+        "docker_stats": { "cpu_percent": "55.00%", "mem_usage": "750MiB / 16GiB" },
+        "disk_backend_bytes_approx": { "plain_du_sb": 48000000, "encrypted_du_sb": 48000000 }
+      }
+    }
+  ],
+  "markers": [
+    { "event": "phase_start", "elapsed_s": 0.5, "mode": "passthrough", "phase": "put", "concurrency": 1 },
+    { "event": "phase_start", "elapsed_s": 3.0, "mode": "compression", "phase": "put", "concurrency": 1 },
+    { "event": "phase_start", "elapsed_s": 7.0, "mode": "encryption", "phase": "put", "concurrency": 1 },
+    { "event": "phase_start", "elapsed_s": 11.0, "mode": "compression_encryption", "phase": "put", "concurrency": 1 }
+  ]
+}

@@ -33,6 +33,8 @@ const OG_VERSIONING = `${SITE_URL}/screenshots/analytics.jpg`;
 const OG_MINIO = `${SITE_URL}/screenshots/iam.jpg`;
 const OG_S3_MIGRATION = `${SITE_URL}/screenshots/filebrowser.jpg`;
 const OG_MULTI_CLOUD = `${SITE_URL}/screenshots/object-replication.jpg`;
+/** Social preview — matches benchmark hero (`filebrowser.jpg`); avoids analytics chart crop in OG tiles. */
+const OG_BENCHMARK = OG_LANDING;
 
 export const landingMeta: PageMeta = {
   path: '/',
@@ -223,6 +225,21 @@ export const multiCloudMeta: PageMeta = {
   ],
 };
 
+export const benchmarkMeta: PageMeta = {
+  path: '/benchmark/',
+  title: 'Compression-tax benchmark — methodology & reproducibility',
+  description:
+    'How we measure DeltaGlider passthrough vs compression vs encryption on real artifacts: questions, harness design, HTML report captures, and commands to rerun on Hetzner or your hardware.',
+  ogImage: OG_BENCHMARK,
+  jsonLd: [
+    organization(),
+    breadcrumb([
+      { name: 'Home', path: '/' },
+      { name: 'Benchmark', path: '/benchmark/' },
+    ]),
+  ],
+};
+
 export const aboutMeta: PageMeta = {
   path: '/about/',
   title: 'About DeltaGlider Proxy — built by Beshu Tech',
@@ -275,6 +292,7 @@ export const allPages: readonly PageMeta[] = [
   minioMigrationMeta,
   s3MigrationMeta,
   multiCloudMeta,
+  benchmarkMeta,
   aboutMeta,
   privacyMeta,
   termsMeta,

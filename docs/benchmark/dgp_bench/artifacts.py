@@ -13,6 +13,25 @@ from .config import DEFAULT_KERNEL_INDEX
 from .model import Artifact
 from .util import sha256_file
 
+# First semver triple in the artifact name (Alpine ISO / kernel tarballs).
+_SEMVER_IN_NAME = re.compile(r"(?:^|[^\d])(\d+)\.(\d+)\.(\d+)(?:[^\d]|$)")
+
+
+def sort_artifacts_baseline_first(artifacts: list[Artifact]) -> list[Artifact]:
+    """Oldest x.y.z first so per-prefix delta reference matches intended release order.
+
+    Parallel PUT races would otherwise let any artifact win the first-write race;
+    the runner uploads ``artifacts[0]`` alone before parallelizing the rest.
+    """
+
+    def key(a: Artifact) -> tuple:
+        m = _SEMVER_IN_NAME.search(a.name)
+        if m:
+            return (0, int(m.group(1)), int(m.group(2)), int(m.group(3)), a.name)
+        return (1, a.name)
+
+    return sorted(artifacts, key=key)
+
 
 def fetch_url(url: str, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -94,7 +113,8 @@ def prepare_artifacts(
     root.mkdir(parents=True, exist_ok=True)
     manifest_path = root / "manifest.json"
     if reuse and manifest_path.exists():
-        return [Artifact(**x) for x in json.loads(manifest_path.read_text())]
+        loaded = [Artifact(**x) for x in json.loads(manifest_path.read_text())]
+        return sort_artifacts_baseline_first(loaded)
 
     artifacts: list[Artifact] = []
     for name, url in list_artifacts(
@@ -118,5 +138,6 @@ def prepare_artifacts(
                 source_url=url,
             )
         )
+    artifacts = sort_artifacts_baseline_first(artifacts)
     manifest_path.write_text(json.dumps([asdict(a) for a in artifacts], indent=2) + "\n")
     return artifacts

@@ -1,5 +1,6 @@
 import type { LucideIcon } from 'lucide-react';
 import { Layers, LayoutDashboard, Shield } from 'lucide-react';
+import { Link } from 'react-router-dom';
 import { FeatureCard } from '../components/FeatureCard';
 import { DeploymentPathGrid } from '../components/DeploymentPathGrid';
 import { Hero } from '../components/Hero';
@@ -161,7 +162,15 @@ export function Landing(): JSX.Element {
           <p className="m-0 text-ink-600 dark:text-ink-300">
             DeltaGlider is an S3-compatible proxy: clients use ordinary SigV4 and your existing SDKs—no application changes. You aim it at MinIO, Amazon S3, or a
             filesystem backend. Where uploads repeat the same logical artifact, it can store compact xdelta3 deltas instead of full copies; IAM, OAuth, quotas,
-            replication, metrics, audit, and the admin UI ship in one deployable service.
+            replication, metrics, audit, and the admin UI ship in one deployable service. For reproducible wall-clock throughput, storage, and CPU tradeoffs on real
+            artifacts, see the{' '}
+            <Link
+              className="font-semibold text-brand-700 underline decoration-brand-400/40 underline-offset-2 transition hover:text-brand-600 hover:decoration-brand-500 dark:text-brand-300 dark:hover:text-brand-200"
+              to="/benchmark/"
+            >
+              compression-tax benchmark
+            </Link>
+            .
           </p>
         }
       >
@@ -341,7 +350,13 @@ export function Landing(): JSX.Element {
         title="Measure it on your data."
         intro="Run it beside an existing S3 endpoint and compare original bytes, stored bytes, latency, and cache behavior."
       >
-        <div className="flex flex-wrap gap-3">
+        <div className="flex flex-wrap items-center gap-3">
+          <Link
+            className="inline-flex items-center gap-2 rounded-lg border border-ink-300 bg-white px-5 py-3 font-semibold text-ink-800 transition hover:border-brand-400 hover:text-brand-700 dark:border-ink-600 dark:bg-ink-800 dark:text-ink-100 dark:hover:border-brand-300 dark:hover:text-brand-300"
+            to="/benchmark/"
+          >
+            Read the benchmark write-up
+          </Link>
           <MailtoCTA
             subject="DeltaGlider Proxy inquiry"
             label="Run a sizing pass"

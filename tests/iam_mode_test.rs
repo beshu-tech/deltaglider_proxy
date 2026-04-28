@@ -20,8 +20,44 @@ use common::{admin_http_client, TestServer};
 use reqwest::StatusCode;
 use serde_json::json;
 
+/// Gui→declarative flip requires non-empty YAML IAM; `declarative-iam-export`
+/// comes from the encrypted DB — bootstrap-only instances have **no** IAM rows,
+/// so create a minimal anchor user first.
+async fn ensure_db_has_iam_row_for_declarative_export(admin: &reqwest::Client, endpoint: &str) {
+    let resp = admin
+        .get(format!("{}/_/api/admin/users", endpoint))
+        .send()
+        .await
+        .unwrap();
+    let users: Vec<serde_json::Value> = resp.json().await.unwrap();
+    if !users.is_empty() {
+        return;
+    }
+    let resp = admin
+        .post(format!("{}/_/api/admin/users", endpoint))
+        .json(&json!({
+            "name": "declarative-flip-anchor",
+            "permissions": [{
+                "actions": ["read", "write", "delete", "list", "admin"],
+                "resources": ["*"]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "anchor IAM user for declarative flip"
+    );
+}
+
 /// Set the server's iam_mode via /apply. Merges into the existing
 /// export so other config (backend, credentials) is preserved.
+///
+/// Flipping to **declarative** requires non-empty `access.iam_users` (etc.) in the
+/// YAML so the server does not wipe the DB — use `declarative-iam-export`, which
+/// projects the live IAM DB into that shape.
 async fn set_iam_mode(admin: &reqwest::Client, endpoint: &str, mode: &str) {
     let exported: String = admin
         .get(format!("{}/_/api/admin/config/export", endpoint))
@@ -38,10 +74,37 @@ async fn set_iam_mode(admin: &reqwest::Client, endpoint: &str, mode: &str) {
     let access = root
         .entry(serde_yaml::Value::String("access".into()))
         .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
-    access
-        .as_mapping_mut()
-        .unwrap()
-        .insert("iam_mode".into(), mode.into());
+
+    if mode == "declarative" {
+        ensure_db_has_iam_row_for_declarative_export(admin, endpoint).await;
+        let decl_yaml: String = admin
+            .get(format!(
+                "{}/_/api/admin/config/declarative-iam-export",
+                endpoint
+            ))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let decl: serde_yaml::Value =
+            serde_yaml::from_str(&decl_yaml).expect("declarative-iam-export YAML");
+        let decl_access = decl
+            .get(serde_yaml::Value::String("access".into()))
+            .expect("declarative-iam-export must contain access:")
+            .as_mapping()
+            .expect("access must be a mapping");
+        let access_map = access.as_mapping_mut().unwrap();
+        for (k, v) in decl_access {
+            access_map.insert(k.clone(), v.clone());
+        }
+    } else {
+        access
+            .as_mapping_mut()
+            .unwrap()
+            .insert(serde_yaml::Value::String("iam_mode".into()), mode.into());
+    }
     let merged = serde_yaml::to_string(&doc).unwrap();
 
     let resp = admin

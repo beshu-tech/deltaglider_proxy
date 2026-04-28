@@ -40,9 +40,12 @@ async fn test_config_db_backup_export_import() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 201);
 
-    // Export backup
+    // Export backup (IAM JSON; default GET is zip)
     let resp = admin
-        .get(format!("{}/_/api/admin/backup", server.endpoint()))
+        .get(format!(
+            "{}/_/api/admin/backup?format=json",
+            server.endpoint()
+        ))
         .send()
         .await
         .unwrap();
