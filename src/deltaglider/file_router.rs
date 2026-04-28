@@ -28,21 +28,11 @@ impl FileRouter {
     pub fn new() -> Self {
         let extensions: &[&str] = &[
             // Containers that are often delta-friendly in byte-exact mode
-            "zip",
-            "tar",
-            // Java/JVM packages
-            "jar",
-            "war",
-            "ear",
-            // Disk images (often similar between versions)
-            "dmg",
-            "iso",
-            // Database dumps
-            "sql",
-            "dump",
-            // Backups
-            "bak",
-            "backup",
+            "zip", "tar", // Java/JVM packages
+            "jar", "war", "ear", // Disk images (often similar between versions)
+            "dmg", "iso", // Database dumps
+            "sql", "dump", // Backups
+            "bak", "backup",
         ];
         Self {
             delta_suffixes: extensions.iter().map(|ext| format!(".{}", ext)).collect(),
