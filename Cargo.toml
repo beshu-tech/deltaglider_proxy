@@ -109,8 +109,8 @@ s3s = { version = "0.13.0", optional = true }
 [dev-dependencies]
 tokio-test = "0.4"
 reqwest = { version = "0.12", features = ["json", "cookies"] }
-testcontainers = "0.26"
-testcontainers-modules = { version = "0.14", features = ["minio"] }
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["minio"] }
 walkdir = "2"
 # Already transitive via aws-sdk-s3; named here so storage/s3.rs unit
 # tests can construct `SdkError::service_error(...)` values directly
