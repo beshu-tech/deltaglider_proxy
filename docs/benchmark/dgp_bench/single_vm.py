@@ -126,7 +126,11 @@ curl -fsS http://127.0.0.1:9000/_/health >/dev/null
 
 python benchmark/bench_production_tax.py artifacts \\
   --artifact-count {args.artifact_count} \\
+  --artifact-source {args.artifact_source} \\
   --artifact-extension {args.artifact_extension} \\
+  --alpine-branch {args.alpine_branch} \\
+  --alpine-arch {args.alpine_arch} \\
+  --alpine-flavor {args.alpine_flavor} \\
   --data-dir /root/dgp-benchmark/data
 
 export DGP_BENCH_ACCESS_KEY={ACCESS_KEY}
@@ -138,7 +142,11 @@ python benchmark/bench_production_tax.py run \\
   --data-dir /root/dgp-benchmark/data \\
   --reuse-artifacts \\
   --artifact-count {args.artifact_count} \\
+  --artifact-source {args.artifact_source} \\
   --artifact-extension {args.artifact_extension} \\
+  --alpine-branch {args.alpine_branch} \\
+  --alpine-arch {args.alpine_arch} \\
+  --alpine-flavor {args.alpine_flavor} \\
   --concurrency {args.concurrency} \\
   --metrics-url http://127.0.0.1:9000/_/metrics \\
   --stats-url http://127.0.0.1:9000/_/stats \\

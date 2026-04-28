@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DeltaGlider benchmark — dgp-iso-full-20260428090752</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.6/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg: #0b1220;
+      --panel: rgba(255,255,255,0.04);
+      --text: #e5e7eb;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --border: rgba(148,163,184,0.22);
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+    }
+    body {
+      margin: 0;
+      background: radial-gradient(1200px 600px at 20% -10%, rgba(56,189,248,0.14), transparent),
+                  radial-gradient(900px 500px at 90% 0%, rgba(99,102,241,0.12), transparent),
+                  var(--bg);
+      color: var(--text);
+      line-height: 1.55;
+    }
+    .wrap { max-width: 1160px; margin: 0 auto; padding: 36px 22px 80px; }
+    h1 { font-size: 2rem; letter-spacing: -0.03em; margin: 0 0 8px; }
+    .sub { color: var(--muted); margin: 0 0 26px; }
+    .grid { display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); margin: 22px 0 28px; }
+    .card {
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px 18px;
+      background: var(--panel);
+      backdrop-filter: blur(8px);
+    }
+    .card h3 { margin: 0 0 8px; font-size: 0.82rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+    .metric { font-size: 1.65rem; font-weight: 750; letter-spacing: -0.02em; }
+    canvas { width: 100% !important; height: 380px !important; }
+    .chart-wrap {
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 16px 18px 8px;
+      background: var(--panel);
+      margin: 18px 0 26px;
+    }
+    h2 { font-size: 1.25rem; margin: 32px 0 12px; letter-spacing: -0.02em; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+    th, td { border-bottom: 1px solid var(--border); padding: 10px 8px; text-align: left; }
+    th { color: var(--muted); font-weight: 650; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.06em; }
+    tr:last-child td { border-bottom: none; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.86em; }
+    .note { color: var(--muted); font-size: 0.9rem; }
+    pre {
+      background: rgba(2,6,23,0.55);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      overflow: auto;
+      font-size: 0.78rem;
+      max-height: 260px;
+    }
+    .pill {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      font-size: 0.78rem;
+      color: var(--muted);
+      margin-right: 8px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <span class="pill">Production tax benchmark</span>
+    <span class="pill">dgp-iso-full-20260428090752</span>
+    <h1>DeltaGlider compression / encryption report</h1>
+    <p class="sub">
+      Interactive summary from <code>summary.json</code>, <code>artifacts.json</code>, and per-mode Prometheus snapshots.
+      Storage savings use <strong>Δ deltaglider_delta_bytes_saved_total</strong> between each mode&rsquo;s <code>before_*.prom</code>
+      and <code>after_*.prom</code> (isolated to that mode&rsquo;s phase within one proxy process).
+    </p>
+
+    <div class="grid">
+      <div class="card">
+        <h3>Logical payload</h3>
+        <div class="metric">0.317 GB</div>
+        <div class="note">Sum of upstream artifact sizes (client-visible bytes).</div>
+      </div>
+      <div class="card">
+        <h3>Best PUT</h3>
+        <div class="metric">125.6 MB/s</div>
+        <div class="note">Highest PUT throughput among modes (chart below).</div>
+      </div>
+      <div class="card">
+        <h3>Delta savings (compression phase)</h3>
+        <div class="metric">0.00%</div>
+        <div class="note">Prometheus Δ during <code>compression</code> mode only.</div>
+      </div>
+    </div>
+
+    <p><strong>Artifacts (5):</strong> <code>alpine-virt-3.19.5-x86_64.iso, alpine-virt-3.19.6-x86_64.iso, alpine-virt-3.19.7-x86_64.iso, alpine-virt-3.19.8-x86_64.iso, alpine-virt-3.19.9-x86_64.iso</code></p>
+
+    <div class="chart-wrap">
+      <canvas id="throughput"></canvas>
+    </div>
+
+    <h2>Throughput by mode</h2>
+    <p class="note">MB/s computed by the benchmark harness from timed PUT/GET operations.</p>
+
+    <div class="chart-wrap">
+      <canvas id="storage"></canvas>
+    </div>
+
+    <h2>Storage view (logical vs implied stored)</h2>
+    <p class="note">
+      <strong>Implied stored</strong> = logical bytes − Δ<code>deltaglider_delta_bytes_saved_total</code> for that mode.
+      Encryption modes still verify SHA-256 against logical bytes on GET; ciphertext size on disk is not exported here — use
+      <code>/_/stats?bucket=…</code> from an authenticated admin session if you need exact ciphertext footprint.
+    </p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Mode</th>
+          <th>Logical GB</th>
+          <th>Δ saved GB (Prom)</th>
+          <th>Implied stored GB</th>
+          <th>Savings %</th>
+          <th>Δ encode events</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td><code>passthrough</code></td><td>0.316670</td><td>0.00000000</td><td>0.316670</td><td>0.0000</td><td>0</td></tr>
+<tr><td><code>compression</code></td><td>0.316670</td><td>0.00000000</td><td>0.316670</td><td>0.0000</td><td>0</td></tr>
+<tr><td><code>encryption</code></td><td>0.316670</td><td>0.00000000</td><td>0.316670</td><td>0.0000</td><td>0</td></tr>
+<tr><td><code>compression_encryption</code></td><td>0.316670</td><td>0.00000000</td><td>0.316670</td><td>0.0000</td><td>0</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Conclusions</h2>
+    <p><strong>No delta storage win detected.</strong> Prometheus shows zero delta encode events and no increase in <code>deltaglider_delta_bytes_saved_total</code> during compression phases. Typical causes: ISO contents did not beat <code>max_delta_ratio</code> (passthrough fallback), or the running proxy build predates <code>.iso</code> eligibility in <code>FileRouter</code>.</p>
+<p>PUT throughput drops from <strong>125.6 MB/s</strong> (passthrough) to <strong>6.9 MB/s</strong> (compression) — delta encode is CPU-heavy vs streaming writes.</p>
+<p>The encrypted backend bucket measured <strong>104.3 MB/s</strong> PUT vs passthrough — AES-GCM adds measurable CPU cost while preserving logical bytes on read.</p>
+
+    <h2>Artifact manifest (trimmed)</h2>
+    <pre>[
+  {
+    &quot;name&quot;: &quot;alpine-virt-3.19.5-x86_64.iso&quot;,
+    &quot;path&quot;: &quot;/root/dgp-benchmark/data/alpine-virt-3.19.5-x86_64.iso&quot;,
+    &quot;bytes&quot;: 62914560,
+    &quot;sha256&quot;: &quot;6956655e6c988a12c27bd7d35e63e49e351600cc8a06bea4826bce5c35ac62e9&quot;,
+    &quot;source_url&quot;: &quot;https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/x86_64/alpine-virt-3.19.5-x86_64.iso&quot;
+  },
+  {
+    &quot;name&quot;: &quot;alpine-virt-3.19.6-x86_64.iso&quot;,
+    &quot;path&quot;: &quot;/root/dgp-benchmark/data/alpine-virt-3.19.6-x86_64.iso&quot;,
+    &quot;bytes&quot;: 62914560,
+    &quot;sha256&quot;: &quot;9e4b81355ff9f1184a57e8dc54f8c8ffcda6f8c9c6ed55d6882dc2af8e460a3a&quot;,
+    &quot;source_url&quot;: &quot;https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/x86_64/alpine-virt-3.19.6-x86_64.iso&quot;
+  },
+  {
+    &quot;name&quot;: &quot;alpine-virt-3.19.7-x86_64.iso&quot;,
+    &quot;path&quot;: &quot;/root/dgp-benchmark/data/alpine-virt-3.19.7-x86_64.iso&quot;,
+    &quot;bytes&quot;: 62914560,
+    &quot;sha256&quot;: &quot;ccaaac43fca667ed0347c7894cc5f993f528c61288bcdefd89cda127f9f7f914&quot;,
+    &quot;source_url&quot;: &quot;https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/x86_64/alpine-virt-3.19.7-x86_64.iso&quot;
+  },
+  {
+    &quot;name&quot;: &quot;alpine-virt-3.19.8-x86_64.iso&quot;,
+    &quot;path&quot;: &quot;/root/dgp-benchmark/data/alpine-virt-3.19.8-x86_64.iso&quot;,
+    &quot;bytes&quot;: 63963136,
+    &quot;sha256&quot;: &quot;d7470bf459c6a40649e1b3f59dce9ef4d333e6a3585bb200e9c37db9018ce42a&quot;,
+    &quot;source_url&quot;: &quot;https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/x86_64/alpine-virt-3.19.8-x86_64.iso&quot;
+  },
+  {
+    &quot;name&quot;: &quot;alpine-virt-3.19.9-x86_64.iso&quot;,
+    &quot;path&quot;: &quot;/root/dgp-benchmark/data/alpine-virt-3.19.9-x86_64.iso&quot;,
+    &quot;bytes&quot;: 63963136,
+    &quot;sha256&quot;: &quot;5389ca9c2ed206d9c1f7a92d213668de9c1c76493faf8cb1d7680a03cf9a0513&quot;,
+    &quot;source_url&quot;: &quot;https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/x86_64/alpine-virt-3.19.9-x86_64.iso&quot;
+  }
+]</pre>
+
+    <p class="note">
+      Generated locally — commit under <code>docs/benchmark/results/</code> if you want this pinned alongside the tarball.
+    </p>
+  </div>
+  <script>
+    const throughput = {"labels": ["passthrough", "compression", "encryption", "compression encryption"], "datasets": [{"label": "PUT", "data": [125.59, 6.94, 104.27, 6.91], "backgroundColor": "rgba(59, 130, 246, 0.65)"}, {"label": "Cold GET", "data": [94.47, 105.15, 281.76, 96.84], "backgroundColor": "rgba(16, 185, 129, 0.65)"}, {"label": "Warm GET", "data": [87.68, 102.14, 278.05, 98.62], "backgroundColor": "rgba(251, 146, 60, 0.75)"}]};
+    const storage = {"labels": ["Passthrough", "Compression", "Encryption", "Compression Encryption"], "datasets": [{"label": "Logical uploaded (client-visible)", "data": [0.31667, 0.31667, 0.31667, 0.31667], "backgroundColor": "rgba(148, 163, 184, 0.55)"}, {"label": "Implied stored on backend (logical \u2212 \u0394 saved)", "data": [0.31667, 0.31667, 0.31667, 0.31667], "backgroundColor": "rgba(59, 130, 246, 0.68)"}]};
+    Chart.defaults.color = '#cbd5e1';
+    Chart.defaults.borderColor = 'rgba(148,163,184,0.25)';
+    new Chart(document.getElementById('throughput'), {
+      type: 'bar',
+      data: throughput,
+      options: {
+        responsive: true,
+        plugins: {
+          legend: { position: 'bottom' },
+          title: { display: true, text: 'Throughput (MB/s)', color: '#e5e7eb', font: { size: 15 } },
+        },
+        scales: {
+          x: { stacked: false },
+          y: { beginAtZero: true, title: { display: true, text: 'MB/s' } },
+        },
+      },
+    });
+    new Chart(document.getElementById('storage'), {
+      type: 'bar',
+      data: storage,
+      options: {
+        responsive: true,
+        plugins: {
+          legend: { position: 'bottom' },
+          title: { display: true, text: 'Storage (GB)', color: '#e5e7eb', font: { size: 15 } },
+        },
+        scales: {
+          x: { stacked: false },
+          y: { beginAtZero: true },
+        },
+      },
+    });
+  </script>
+</body>
+</html>

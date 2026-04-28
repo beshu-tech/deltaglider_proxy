@@ -9,6 +9,7 @@ from .config import DEFAULT_MODES, add_artifact_args, slug_now
 from .hcloud_lifecycle import down, status, up
 from .runner import run_benchmark
 from .single_vm import smoke as single_vm_smoke
+from .html_report import generate_html_report
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -41,8 +42,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     smoke = sub.add_parser("single-vm-smoke")
     smoke.add_argument("--run-id", required=True)
-    smoke.add_argument("--artifact-count", type=int, default=2)
-    smoke.add_argument("--artifact-extension", default=".tar.gz")
+    smoke.add_argument("--artifact-count", type=int, default=5)
+    smoke.add_argument("--artifact-source", choices=["kernel", "alpine-iso"], default="alpine-iso")
+    smoke.add_argument("--artifact-extension", default=".iso")
+    smoke.add_argument("--alpine-branch", default="v3.19")
+    smoke.add_argument("--alpine-arch", default="x86_64")
+    smoke.add_argument("--alpine-flavor", default="virt")
     smoke.add_argument("--concurrency", default="1")
 
     run = sub.add_parser("run")
@@ -64,6 +69,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--restart-command", help="Optional shell command to clear cache/restart proxy before cold GET")
     run.add_argument("--restart-timeout", type=float, default=120)
     run.add_argument("--allow-failures", action="store_true")
+
+    html_rep = sub.add_parser("html-report")
+    html_rep.add_argument("--bundle", required=True, help="Extracted results directory or .tgz bundle")
+    html_rep.add_argument("--out", required=True, help="Output HTML path")
     return p
 
 
@@ -96,7 +105,16 @@ def main() -> int:
     if args.command == "doctor":
         return doctor(args)
     if args.command == "artifacts":
-        artifacts = prepare_artifacts(args.data_dir, args.artifact_count, args.artifact_extension, args.reuse_artifacts)
+        artifacts = prepare_artifacts(
+            data_dir=args.data_dir,
+            artifact_count=args.artifact_count,
+            artifact_extension=args.artifact_extension,
+            artifact_source=args.artifact_source,
+            alpine_branch=args.alpine_branch,
+            alpine_arch=args.alpine_arch,
+            alpine_flavor=args.alpine_flavor,
+            reuse=args.reuse_artifacts,
+        )
         print(f"prepared {len(artifacts)} artifacts, {sum(a.bytes for a in artifacts)/1e9:.2f} GB")
         return 0
     if args.command == "single-vm-smoke":
@@ -105,4 +123,8 @@ def main() -> int:
         if not args.access_key or not args.secret_key:
             raise SystemExit("--access-key/--secret-key or DGP_BENCH_ACCESS_KEY/DGP_BENCH_SECRET_KEY required")
         return run_benchmark(args)
+    if args.command == "html-report":
+        generate_html_report(args.bundle, args.out)
+        print(f"wrote {args.out}")
+        return 0
     raise AssertionError(args.command)

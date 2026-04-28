@@ -44,16 +44,19 @@ configure their policies/backends accordingly.
 
 The primary dataset is real public artifacts, not generated random data.
 
-Default runner behavior fetches recent Linux kernel source archives from
-`cdn.kernel.org`:
+Recommended primary track: contiguous Alpine `virt` ISO releases (small, public,
+version-adjacent):
 
 ```text
-linux-6.x.y.tar.xz
+alpine-virt-3.19.0-x86_64.iso
+alpine-virt-3.19.1-x86_64.iso
+alpine-virt-3.19.2-x86_64.iso
+alpine-virt-3.19.3-x86_64.iso
+alpine-virt-3.19.4-x86_64.iso
 ```
 
-`.xz` is measured empirically. Do not assume it is a bad input. xdelta3 can
-still perform well on compressed binary streams when the compressor output is
-deterministic and adjacent versions remain binary-similar.
+Kernel `.tar.xz` should be treated as a negative-control profile, not the
+default publication profile.
 
 Recommended shape:
 
@@ -131,8 +134,12 @@ Run the full single-VM smoke benchmark after the VM is ready:
 ```bash
 python docs/benchmark/bench_production_tax.py single-vm-smoke \
   --run-id dgp-tax-smoke \
-  --artifact-count 2 \
-  --artifact-extension .tar.gz \
+  --artifact-count 5 \
+  --artifact-source alpine-iso \
+  --artifact-extension .iso \
+  --alpine-branch v3.19 \
+  --alpine-flavor virt \
+  --alpine-arch x86_64 \
   --concurrency 1
 ```
 
@@ -142,10 +149,12 @@ four benchmark modes, and downloads a result bundle to
 `docs/benchmark/results/`. It is a correctness/debug workflow, not the
 publishable production benchmark.
 
-The single-VM smoke defaults to `.tar.gz` real kernel artifacts because that
-extension exercises the current delta-eligible path. The primary production
-benchmark can still use `.tar.xz` via `--artifact-extension .tar.xz` to measure
-that format empirically.
+The single-VM smoke defaults to Alpine ISO artifacts to mirror the main
+benchmark profile. To run the kernel negative-control profile instead, set:
+
+```bash
+--artifact-source kernel --artifact-extension .tar.xz
+```
 
 Inspect resources:
 
@@ -199,8 +208,12 @@ The runner assumes these default bucket names. Override with:
 
 ```bash
 python docs/benchmark/bench_production_tax.py artifacts \
-  --artifact-count 20 \
-  --artifact-extension .tar.xz \
+  --artifact-count 5 \
+  --artifact-source alpine-iso \
+  --artifact-extension .iso \
+  --alpine-branch v3.19 \
+  --alpine-flavor virt \
+  --alpine-arch x86_64 \
   --data-dir /data/dgp-bench/artifacts
 ```
 
@@ -225,8 +238,12 @@ python docs/benchmark/bench_production_tax.py run \
   --region us-east-1 \
   --data-dir /data/dgp-bench/artifacts \
   --reuse-artifacts \
-  --artifact-count 20 \
-  --artifact-extension .tar.xz \
+  --artifact-count 5 \
+  --artifact-source alpine-iso \
+  --artifact-extension .iso \
+  --alpine-branch v3.19 \
+  --alpine-flavor virt \
+  --alpine-arch x86_64 \
   --concurrency 1,4 \
   --metrics-url https://dgp.example.com/_/metrics \
   --stats-url https://dgp.example.com/_/stats \
@@ -261,6 +278,21 @@ results/<run-id>/
     after_*.json
     after_*.prom
 ```
+
+### HTML chart report (optional)
+
+After archiving `results/<run-id>/` into `<run-id>.tgz`, generate a standalone HTML page with Chart.js plots:
+
+```bash
+python docs/benchmark/bench_production_tax.py html-report \
+  --bundle docs/benchmark/results/<run-id>.tgz \
+  --out docs/benchmark/results/<run-id>/report.html
+```
+
+A checked-in example from the Alpine ISO contiguous patch run lives at
+[`sample-reports/dgp-iso-full-20260428090752.html`](sample-reports/dgp-iso-full-20260428090752.html).
+
+Storage savings use **Δ `deltaglider_delta_bytes_saved_total`** between each mode’s `before_*.prom` and `after_*.prom` snapshots (scoped to that mode’s benchmark phase). Logical payload size comes from `artifacts.json`.
 
 The report intentionally separates:
 

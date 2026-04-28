@@ -73,7 +73,16 @@ def run_benchmark(args) -> int:
     run_id = args.run_id or slug_now()
     result_dir = Path(args.results) / run_id
     result_dir.mkdir(parents=True, exist_ok=True)
-    artifacts = prepare_artifacts(args.data_dir, args.artifact_count, args.artifact_extension, args.reuse_artifacts)
+    artifacts = prepare_artifacts(
+        data_dir=args.data_dir,
+        artifact_count=args.artifact_count,
+        artifact_extension=args.artifact_extension,
+        artifact_source=args.artifact_source,
+        alpine_branch=args.alpine_branch,
+        alpine_arch=args.alpine_arch,
+        alpine_flavor=args.alpine_flavor,
+        reuse=args.reuse_artifacts,
+    )
     endpoint = Endpoint("proxy", args.proxy_endpoint, args.access_key, args.secret_key, args.region)
     client = SigV4Client(endpoint, timeout=args.timeout)
     mode_buckets = parse_mode_buckets(args.mode_bucket)

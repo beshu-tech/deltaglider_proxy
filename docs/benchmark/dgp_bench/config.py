@@ -6,6 +6,9 @@ import os
 
 APP = "dgp-compression-tax-bench"
 DEFAULT_KERNEL_INDEX = "https://cdn.kernel.org/pub/linux/kernel/v6.x/"
+DEFAULT_ALPINE_RELEASE_BRANCH = "v3.19"
+DEFAULT_ALPINE_ARCH = "x86_64"
+DEFAULT_ALPINE_FLAVOR = "virt"
 DEFAULT_MODES = {
     "passthrough": "bench-passthrough",
     "compression": "bench-compression",
@@ -37,9 +40,34 @@ def parse_mode_buckets(items: list[str] | None) -> dict[str, str]:
 
 
 def add_artifact_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--data-dir", default="data/kernel-artifacts")
+    p.add_argument("--data-dir", default="data/artifacts")
     p.add_argument("--artifact-count", type=int, default=20)
-    p.add_argument("--artifact-extension", default=".tar.xz", help="Kernel artifact extension, e.g. .tar.xz or .tar.gz")
+    p.add_argument(
+        "--artifact-source",
+        choices=["kernel", "alpine-iso"],
+        default="kernel",
+        help="Artifact source family to benchmark.",
+    )
+    p.add_argument(
+        "--artifact-extension",
+        default=".tar.xz",
+        help="Artifact extension filter, e.g. .tar.gz (kernel) or .iso (alpine-iso).",
+    )
+    p.add_argument(
+        "--alpine-branch",
+        default=DEFAULT_ALPINE_RELEASE_BRANCH,
+        help="Alpine release branch when using --artifact-source alpine-iso (for example v3.19).",
+    )
+    p.add_argument(
+        "--alpine-arch",
+        default=DEFAULT_ALPINE_ARCH,
+        help="Alpine architecture when using --artifact-source alpine-iso.",
+    )
+    p.add_argument(
+        "--alpine-flavor",
+        default=DEFAULT_ALPINE_FLAVOR,
+        help="Alpine image flavor when using --artifact-source alpine-iso (for example virt).",
+    )
     p.add_argument("--reuse-artifacts", action="store_true")
 
 
