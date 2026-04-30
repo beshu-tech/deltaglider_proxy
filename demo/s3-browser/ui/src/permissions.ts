@@ -1,6 +1,6 @@
 import type { IamPermission, WhoamiResponse } from './adminApi';
 
-export type UiAction = 'read' | 'write' | 'delete' | 'list' | 'admin';
+type UiAction = 'read' | 'write' | 'delete' | 'list' | 'admin';
 
 function actionMatches(permissionActions: string[], action: UiAction): boolean {
   const aliases: Record<UiAction, string[]> = {

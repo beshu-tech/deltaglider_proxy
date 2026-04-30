@@ -7,9 +7,8 @@
  * page — a heavy cost for a single button, and it broke
  * responsive layout on viewports under ~1400px.
  *
- * The admin shell now opens `SectionYamlModal` from the avatar menu's
- * Config group. The default button export remains for any future
- * header/inline trigger that wants the same modal behavior.
+ * The admin shell opens `SectionYamlModal` from the avatar menu's
+ * Settings group.
  */
 import { useEffect, useRef, useState } from 'react';
 import { Alert, Button, Input, Modal, Space, message } from 'antd';
@@ -147,38 +146,5 @@ export function SectionYamlModal({ section, open, onClose }: SectionYamlModalPro
         />
       </Space>
     </Modal>
-  );
-}
-
-interface Props {
-  /** The active section for this page. Undefined = button doesn't render. */
-  section?: SectionName;
-}
-
-export default function CopySectionYamlButton({ section }: Props) {
-  const colors = useColors();
-  const { TEXT_MUTED } = colors;
-  const [open, setOpen] = useState(false);
-
-  if (!section) return null;
-
-  const label = section.charAt(0).toUpperCase() + section.slice(1);
-
-  return (
-    <>
-      <Button
-        size="small"
-        type="text"
-        icon={<CopyOutlined />}
-        title={`Show ${label} section YAML. This does not export the full config.`}
-        onClick={() => setOpen(true)}
-        style={{ color: TEXT_MUTED, fontFamily: 'var(--font-ui)' }}
-      >
-        <span className="hide-mobile" style={{ marginLeft: 4 }}>
-          Section YAML
-        </span>
-      </Button>
-      <SectionYamlModal section={section} open={open} onClose={() => setOpen(false)} />
-    </>
   );
 }

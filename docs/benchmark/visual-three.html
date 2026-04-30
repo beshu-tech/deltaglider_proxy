@@ -140,9 +140,12 @@
   <header class="panel">
     <h1>Compression tax — wall throughput (pinned run)</h1>
     <p>
-      Bars = wall-clock <code>mb_s_wall</code> (<code>hetzner-20260428-140514Z</code>). Gold rule =
-      passthrough MB/s in that phase. Tax = <code>100 × (1 − mode/pt)</code>. Negative ⇒ faster than PT in this pin (encryption GET rows).
-      Built with <strong>D3</strong> — grouped-bar pattern from the <a href="https://observablehq.com/@d3/grouped-bar-chart" style="color:#5eead4">Observable grouped-bar</a> family.
+      Each chart compares four proxy setups on the <strong>same</strong> workload. The <strong>gray</strong> column is
+      <strong>passthrough</strong> (baseline): delta compression off, proxy AES off. Every other column is read as
+      “how much faster or slower is wall-clock throughput than that gray baseline for this phase?”
+      Numbers come from <code>mb_s_wall</code> (<code>hetzner-20260428-140514Z</code>). Gold dashed line = passthrough MB/s height.
+      Formula printed in the footer. Built with <strong>D3</strong> —
+      <a href="https://observablehq.com/@d3/grouped-bar-chart" style="color:#5eead4">grouped-bar pattern</a>.
     </p>
     <div class="view-tabs" role="tablist" aria-label="Chart scope">
       <button type="button" data-view="overview" class="active">Overview</button>
@@ -164,8 +167,10 @@
   </main>
 
   <footer class="legend">
-    <strong>Overview</strong> = three small-multiple panels (D3 band scales + shared aesthetic).
-    Single-phase tabs zoom one harness stage. <strong>Stored GiB</strong> = horizontal bar chart vs logical upload.
+    <strong>Passthrough</strong> = gray baseline bar (no delta, no proxy AES). Sub-captions use
+    “slower/faster than passthrough” = wall-clock MB/s vs that gray bar in the same phase.
+    Raw score: <code>100 × (1 − mode÷passthrough)</code> → positive ⇒ slower than passthrough, negative ⇒ faster (seen on some encryption GET rows in this pin).
+    <strong>Overview</strong> = three panels. <strong>Stored GiB</strong> = bytes on disk vs logical upload.
   </footer>
 
   <script>
@@ -192,11 +197,13 @@
     return 100 * (1 - modeMbps / ptMbps);
   }
 
+  /** Plain language vs gray passthrough baseline (same phase). */
   function fmtTax(pct) {
     if (!Number.isFinite(pct)) return "";
     const r = Math.round(pct);
-    const sign = r > 0 ? "+" : "";
-    return `${sign}${r}% vs PT`;
+    if (r === 0) return "Same as passthrough";
+    if (r > 0) return `${r}% slower than passthrough`;
+    return `${Math.abs(r)}% faster than passthrough`;
   }
 
   function fmtMbps(v) {
@@ -319,7 +326,7 @@
         d3.select(this).attr("opacity", 1);
       });
 
-    /** Stack relative to bar top; fallback below bar or top margin — avoids crowding the PT caption band. */
+    /** Stack relative to bar top; fallback below bar or top margin — avoids crowding the passthrough caption band. */
     function labelYs(yTop, barH) {
       const pad = 11;
       const gap = 15;
@@ -347,7 +354,7 @@
       .attr("stroke", "rgba(6,8,12,0.92)")
       .attr("stroke-width", "3px")
       .attr("stroke-linejoin", "round")
-      .text((d) => fmtMbps(d.mbps));
+      .text((d) => `${fmtMbps(d.mbps)} MB/s`);
 
     g.selectAll("text.sub")
       .data(data)
@@ -357,12 +364,29 @@
       .attr("x", (d) => x(d.mode) + x.bandwidth() / 2)
       .attr("y", (d) => labelYs(y(d.mbps), innerH - y(d.mbps)).sy)
       .attr("fill", "#e6edf5")
-      .style("font-size", compact ? "10px" : "11px")
+      .style("font-size", compact ? "9px" : "10px")
       .attr("paint-order", "stroke")
       .attr("stroke", "rgba(6,8,12,0.88)")
       .attr("stroke-width", "2.5px")
       .attr("stroke-linejoin", "round")
-      .text((d) => (d.isPt ? "baseline · MB/s" : `${fmtTax(d.tax)} · MB/s`));
+      .each(function (d) {
+        const el = d3.select(this);
+        el.selectAll("tspan").remove();
+        const msg = d.isPt ? "Passthrough baseline" : fmtTax(d.tax);
+        const cx = x(d.mode) + x.bandwidth() / 2;
+        const dy = compact ? 11 : 12;
+        let a = msg;
+        let b = "";
+        if (msg.length > 24) {
+          const cut = msg.lastIndexOf(" ", Math.floor(msg.length / 2) + 6);
+          if (cut > 8) {
+            a = msg.slice(0, cut);
+            b = msg.slice(cut + 1);
+          }
+        }
+        el.append("tspan").attr("x", cx).attr("dy", 0).text(a);
+        if (b) el.append("tspan").attr("x", cx).attr("dy", dy).text(b);
+      });
 
     svg
       .append("text")
@@ -375,7 +399,7 @@
       .attr("paint-order", "stroke")
       .attr("stroke", "rgba(6,8,12,0.92)")
       .attr("stroke-width", "4px")
-      .text(`Passthrough rule: ${fmtMbps(ptMbps)} MB/s`);
+      .text(`Passthrough baseline · ${fmtMbps(ptMbps)} MB/s`);
   }
 
   function chartStorage() {
