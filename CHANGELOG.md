@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.9.2 — 2026-04-30
+
 ## v0.9.1 — 2026-04-30
 
 ### Marketing site + release docs refresh
