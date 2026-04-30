@@ -330,8 +330,8 @@ export default function ConnectPage({ onConnect, showError }: Props) {
             <OAuthProviderList
               providers={externalProviders}
               nextUrl={window.location.pathname}
-              height={54}
-              fontSize={15}
+              height={50}
+              fontSize={14}
               variant="hero"
             />
           )}
