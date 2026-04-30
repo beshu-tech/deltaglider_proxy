@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.9.1 — 2026-04-30
+
 ### Marketing site + release docs refresh
 
 - Added a GitHub Pages marketing minisite under `marketing/` with SSG,
