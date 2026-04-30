@@ -565,6 +565,36 @@ mod tests {
     }
 
     #[test]
+    fn test_evaluate_iam_allows_multiple_list_prefix_conditions_including_root() {
+        let allow = Permission {
+            id: 1,
+            effect: "Allow".into(),
+            actions: vec!["list".into()],
+            resources: vec!["beshu".into()],
+            conditions: Some(serde_json::json!({
+                "StringLike": {
+                    "s3:prefix": ["", "ror/", "ror/builds/", "ror/e2e_reports/"]
+                }
+            })),
+        };
+        let policies = vec![permission_to_iam_policy(&allow)];
+
+        let root_ctx = Context::new().with_string("s3:prefix", "");
+        let ror_ctx = Context::new().with_string("s3:prefix", "ror/");
+        let denied_ctx = Context::new().with_string("s3:prefix", "private/");
+
+        assert!(evaluate_iam(&policies, S3Action::List, "beshu", "", &root_ctx));
+        assert!(evaluate_iam(&policies, S3Action::List, "beshu", "", &ror_ctx));
+        assert!(!evaluate_iam(
+            &policies,
+            S3Action::List,
+            "beshu",
+            "",
+            &denied_ctx
+        ));
+    }
+
+    #[test]
     fn test_evaluate_iam_condition_not_matched_skips_rule() {
         // Deny with condition that doesn't match — rule should be skipped
         let allow = Permission {

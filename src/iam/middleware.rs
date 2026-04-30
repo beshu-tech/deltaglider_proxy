@@ -107,6 +107,14 @@ pub async fn authorization_middleware(
 
     // s3:prefix — from query parameter on LIST requests
     if action == S3Action::List {
+        // AWS IAM evaluates root bucket LIST as `s3:prefix == ""` even when
+        // the client omits the `prefix` query parameter. Without this default,
+        // a condition like `StringLike: { "s3:prefix": "" }` can never match
+        // the common `GET /bucket?list-type=2&delimiter=/` root listing.
+        context.insert(
+            "s3:prefix".to_string(),
+            iam_rs::ContextValue::String(String::new()),
+        );
         if let Some(query_str) = request.uri().query() {
             for param in query_str.split('&') {
                 if let Some(value) = param.strip_prefix("prefix=") {

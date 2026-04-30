@@ -98,7 +98,10 @@ function setConditionValue(
     }
     return result;
   }
-  result[operator] = { ...(result[operator] || {}), [key]: value.trim() };
+  const parsedValue = value.includes(',')
+    ? value.split(',').map(v => v.trim())
+    : value.trim();
+  result[operator] = { ...(result[operator] || {}), [key]: parsedValue };
   return result;
 }
 
