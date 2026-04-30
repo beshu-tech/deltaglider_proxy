@@ -74,3 +74,6 @@ deltaglider_config.db.recovery
 # hash, OAuth client_secrets, S3 access/secret keys). Never commit.
 dgp-full-backup-*.zip
 dgp-backup-*.zip
+.local-backup-v0.9.1/
+# Unpacked admin backups (secrets.json, config DB)
+.local-dgp-backup*/

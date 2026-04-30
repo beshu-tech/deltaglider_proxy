@@ -4,6 +4,7 @@ import { uploadObject } from './s3client';
 interface UploadItem {
   id: string;
   file: File;
+  destination: string;
   status: 'pending' | 'uploading' | 'done' | 'error';
   originalSize: number;
   error?: string;
@@ -21,14 +22,16 @@ export default function useUploadQueue(destination: string) {
   const processingRef = useRef(false);
 
   const addFiles = useCallback((files: FileList | File[]) => {
+    const cleanDest = destination.replace(/^\/+/, '').replace(/\/+$/, '').replace(/\/{2,}/g, '/');
     const items: UploadItem[] = Array.from(files).map((file) => ({
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       file,
+      destination: cleanDest,
       status: 'pending' as const,
       originalSize: file.size,
     }));
     setQueue((prev) => [...prev, ...items]);
-  }, []);
+  }, [destination]);
 
   // Process one pending item at a time
   useEffect(() => {
@@ -42,9 +45,9 @@ export default function useUploadQueue(destination: string) {
       prev.map((item) => (item.id === pending.id ? { ...item, status: 'uploading' as const } : item))
     );
 
-    // Sanitize destination: strip leading/trailing slashes, collapse consecutive slashes
-    const cleanDest = destination.replace(/^\/+/, '').replace(/\/+$/, '').replace(/\/{2,}/g, '/');
-    const key = cleanDest ? `${cleanDest}/${pending.file.name}` : pending.file.name;
+    const relativePath = (pending.file as File & { webkitRelativePath?: string }).webkitRelativePath || pending.file.name;
+    const cleanRelativePath = relativePath.replace(/^\/+/, '').replace(/\/{2,}/g, '/');
+    const key = pending.destination ? `${pending.destination}/${cleanRelativePath}` : cleanRelativePath;
 
     uploadObject(key, pending.file)
       .then(() => {
@@ -71,7 +74,7 @@ export default function useUploadQueue(destination: string) {
       .finally(() => {
         processingRef.current = false;
       });
-  }, [queue, destination]);
+  }, [queue]);
 
   const clearCompleted = useCallback(() => {
     setQueue((prev) => prev.filter((item) => item.status !== 'done' && item.status !== 'error'));

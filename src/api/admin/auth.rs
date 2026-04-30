@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use subtle::ConstantTimeEq;
 
-use crate::iam::IamState;
+use crate::iam::{Group, IamIndex, IamState, IamUser};
 use crate::rate_limiter;
 use crate::session::{AuthMethod, S3SessionCredentials};
 
@@ -32,15 +32,12 @@ pub struct SessionResponse {
     valid: bool,
 }
 
-/// Query parameters for the whoami endpoint (no fields required).
-#[derive(Deserialize)]
-pub struct WhoamiQuery {}
-
 #[derive(Serialize)]
 pub struct WhoamiUserInfo {
     pub name: String,
     pub access_key_id: String,
     pub is_admin: bool,
+    pub permissions: Vec<crate::iam::Permission>,
 }
 
 #[derive(Serialize)]
@@ -266,7 +263,6 @@ pub async fn check_session(
 pub async fn whoami(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
-    axum::extract::Query(_params): axum::extract::Query<WhoamiQuery>,
 ) -> Json<WhoamiResponse> {
     let iam_state = state.iam_state.load();
     let mode = match &**iam_state {
@@ -320,21 +316,27 @@ async fn resolve_session_user(state: &AdminState, headers: &HeaderMap) -> Option
             name: "admin".into(),
             access_key_id: "bootstrap".into(),
             is_admin: true,
+            permissions: vec![crate::iam::Permission {
+                id: 0,
+                effect: "Allow".into(),
+                actions: vec!["*".into()],
+                resources: vec!["*".into()],
+                conditions: None,
+            }],
         }),
         crate::session::AuthMethod::IamLoginAs { access_key_id } => {
-            let db = state.config_db.as_ref()?.lock().await;
-            let user = db.get_user_by_access_key(&access_key_id).ok()??;
+            let user = resolve_effective_iam_user(state, &access_key_id).await?;
             let is_admin = crate::iam::permissions::is_admin(&user.permissions);
             Some(WhoamiUserInfo {
                 name: user.name,
                 access_key_id: user.access_key_id,
                 is_admin,
+                permissions: user.permissions,
             })
         }
         crate::session::AuthMethod::External { user_id, .. } => {
             let db = state.config_db.as_ref()?.lock().await;
             let user = db.get_user_by_id(user_id).ok()?;
-            let is_admin = crate::iam::permissions::is_admin(&user.permissions);
             // For external users, prefer external identity email > user name
             let display_name = db
                 .get_external_identities_for_user(user_id)
@@ -342,13 +344,42 @@ async fn resolve_session_user(state: &AdminState, headers: &HeaderMap) -> Option
                 .and_then(|ids| ids.into_iter().next())
                 .and_then(|ext| ext.email.or(ext.display_name))
                 .unwrap_or(user.name.clone());
+            drop(db);
+            let effective = resolve_effective_iam_user(state, &user.access_key_id)
+                .await
+                .unwrap_or(user);
+            let is_admin = crate::iam::permissions::is_admin(&effective.permissions);
             Some(WhoamiUserInfo {
                 name: display_name,
-                access_key_id: user.access_key_id,
+                access_key_id: effective.access_key_id,
                 is_admin,
+                permissions: effective.permissions,
             })
         }
     }
+}
+
+async fn resolve_effective_iam_user(state: &AdminState, access_key_id: &str) -> Option<IamUser> {
+    let iam_state = state.iam_state.load();
+    if let IamState::Iam(index) = &**iam_state {
+        if let Some(user) = index.get(access_key_id) {
+            return Some(user.clone());
+        }
+    }
+
+    let db = state.config_db.as_ref()?.lock().await;
+    let user = db.get_user_by_access_key(access_key_id).ok()??;
+    let groups = db.load_groups().ok()?;
+    resolve_effective_iam_user_from_parts(user, groups, access_key_id)
+}
+
+fn resolve_effective_iam_user_from_parts(
+    user: IamUser,
+    groups: Vec<Group>,
+    access_key_id: &str,
+) -> Option<IamUser> {
+    let index = IamIndex::from_users_and_groups(vec![user], groups);
+    index.get(access_key_id).cloned()
 }
 
 /// POST /api/admin/login-as — create admin session for an IAM user with admin permissions.
@@ -566,7 +597,7 @@ pub async fn clear_s3_session_creds(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::iam::{AuthConfig, SharedIamState};
+    use crate::iam::{AuthConfig, Permission, SharedIamState};
     use arc_swap::ArcSwap;
 
     /// Regression: SharedAuthConfig must reflect credential updates immediately.
@@ -620,5 +651,55 @@ mod tests {
 
         // No cookie header at all
         assert!(extract_session_token(&HeaderMap::new()).is_none());
+    }
+
+    #[test]
+    fn resolve_effective_iam_user_from_parts_merges_group_permissions() {
+        let user = IamUser {
+            id: 1,
+            name: "alice".into(),
+            access_key_id: "AKALICE".into(),
+            secret_access_key: "secret".into(),
+            enabled: true,
+            created_at: String::new(),
+            permissions: vec![Permission {
+                id: 0,
+                effect: "Allow".into(),
+                actions: vec!["read".into()],
+                resources: vec!["artifacts/alice/*".into()],
+                conditions: None,
+            }],
+            group_ids: vec![10],
+            auth_source: "local".into(),
+            iam_policies: vec![],
+        };
+        let groups = vec![Group {
+            id: 10,
+            name: "writers".into(),
+            description: String::new(),
+            permissions: vec![Permission {
+                id: 0,
+                effect: "Allow".into(),
+                actions: vec!["write".into()],
+                resources: vec!["artifacts/alice/*".into()],
+                conditions: None,
+            }],
+            member_ids: vec![1],
+            created_at: String::new(),
+        }];
+
+        let effective =
+            resolve_effective_iam_user_from_parts(user, groups, "AKALICE").expect("effective user");
+
+        assert_eq!(effective.permissions.len(), 2);
+        assert!(effective
+            .permissions
+            .iter()
+            .any(|p| p.actions == vec!["read"]));
+        assert!(effective
+            .permissions
+            .iter()
+            .any(|p| p.actions == vec!["write"]));
+        assert_eq!(effective.iam_policies.len(), 2);
     }
 }

@@ -1,6 +1,5 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
-import { Typography, Button, Input, Alert, Space, Spin, Drawer, message, Dropdown } from 'antd';
-import type { MenuProps } from 'antd';
+import { cloneElement, isValidElement, useState, useEffect, useCallback, useMemo } from 'react';
+import { Typography, Button, Input, Alert, Space, Spin, Drawer, message } from 'antd';
 import { checkSession, adminLogin, whoami, loginAs, exportBackup, importBackup, type ExternalProviderInfo } from '../adminApi';
 import { getCredentials } from '../s3client';
 import {
@@ -11,8 +10,6 @@ import {
   FolderOutlined,
   LockOutlined,
   DashboardOutlined,
-  DownloadOutlined,
-  UploadOutlined,
   SafetyOutlined,
   ExperimentOutlined,
   SecurityScanOutlined,
@@ -33,7 +30,6 @@ import AdmissionPanel from './AdmissionPanel';
 import CredentialsModePanel from './CredentialsModePanel';
 import BucketsPanel from './BucketsPanel';
 import ReplicationPanel from './ReplicationPanel';
-import CopySectionYamlButton from './CopySectionYamlButton';
 import SetupWizard from './SetupWizard';
 import TracePanel from './TracePanel';
 import AuditLogPanel from './AuditLogPanel';
@@ -60,9 +56,10 @@ import {
 import { useNavigation } from '../NavigationContext';
 import TabHeader from './TabHeader';
 import { YamlImportExportModal } from './YamlImportExportModal';
-import { DownOutlined, FileTextOutlined, ImportOutlined } from '@ant-design/icons';
+import { FileTextOutlined } from '@ant-design/icons';
 import { useDirtyGlobalIndicators, requestApplyCurrent } from '../useDirtySection';
 import type { SectionName } from '../adminApi';
+import type { AccountMenuConfigProps } from './AccountMenu';
 
 const { Text } = Typography;
 
@@ -243,9 +240,10 @@ interface AdminPageProps {
   onBack: () => void;
   onSessionExpired?: () => void;
   subPath?: string;
+  accountMenu?: React.ReactNode;
 }
 
-export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPageProps) {
+export default function AdminPage({ onBack, onSessionExpired, subPath, accountMenu }: AdminPageProps) {
   const colors = useColors();
   const { navigate } = useNavigation();
   // Hook up the `● ` tab-title prefix + beforeunload guard for any
@@ -272,6 +270,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
   // `backends`, etc.) are mapped to the new hierarchy.
   const rawSubPath = (subPath || '').replace(/^\/+/, '').replace(/\/+$/, '');
   const adminPath = resolveAdminPath(subPath || '');
+  const activeSection = sectionForPath(adminPath);
   const navigateAdmin = useCallback(
     (path: string) => {
       navigate(`admin/${path}`);
@@ -347,8 +346,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
         // Configuration pages), let the browser's default fire — we
         // don't want to silently eat ⌘S when there's no contextual
         // meaning.
-        const section = sectionForPath(adminPath);
-        if (section && requestApplyCurrent(section)) {
+        if (activeSection && requestApplyCurrent(activeSection)) {
           e.preventDefault();
         }
         return;
@@ -360,7 +358,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [authed, adminPath]);
+  }, [authed, activeSection]);
 
   // Memoised palette extra-actions. The underlying handlers
   // (`setYamlModalMode`, `setHelpOpen`, `navigateAdmin`, `onBack`)
@@ -421,15 +419,19 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
     setAccessDenied(false);
 
     (async () => {
+      const info = await whoami();
+      setExternalProviders(info.external_providers || []);
+
       const hasSession = await checkSession();
       if (hasSession) {
-        setAuthed(true);
+        if (info.user?.is_admin) {
+          setAuthed(true);
+        } else {
+          setAccessDenied(true);
+        }
         setCheckingSession(false);
         return;
       }
-
-      const info = await whoami();
-      setExternalProviders(info.external_providers || []);
 
       // In IAM mode, attempt auto-login with the current S3 credentials.
       // loginAs will succeed if the user is an IAM admin, or return 403 otherwise.
@@ -489,6 +491,57 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
     },
     [navigateAdmin]
   );
+
+  const handleExportFullBackup = useCallback(async () => {
+    try {
+      const { blob, filename } = await exportBackup();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+      message.success('Full backup exported');
+    } catch (e) {
+      message.error(
+        'Export failed: ' + (e instanceof Error ? e.message : 'unknown')
+      );
+    }
+  }, []);
+
+  const handleImportFullBackup = useCallback(() => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    // Accept zip (new default) AND json (pre-v0.8.4 IAM-only backups
+    // still round-trip via the content-type-sniffing import handler).
+    input.accept = '.zip,.json,application/zip,application/json';
+    input.onchange = async () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      try {
+        // Zip path: pass the File Blob straight through — importBackup
+        // handles the content-type. JSON path: parse + pass object
+        // (legacy shape).
+        const isZip =
+          file.name.toLowerCase().endsWith('.zip') ||
+          file.type === 'application/zip' ||
+          file.type === 'application/x-zip-compressed';
+        const result = isZip
+          ? await importBackup(file)
+          : await importBackup(JSON.parse(await file.text()));
+        const ext = result.external_identities_created ?? 0;
+        message.success(
+          `Imported: ${result.users_created} users, ${result.groups_created} groups, ${ext} OIDC identities (${result.users_skipped} skipped)`
+        );
+        window.location.reload();
+      } catch (e) {
+        message.error(
+          'Import failed: ' + (e instanceof Error ? e.message : 'invalid file')
+        );
+      }
+    };
+    input.click();
+  }, []);
 
   /**
    * Render the content pane for the current admin path.
@@ -789,20 +842,15 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
     );
   }
 
-  const fullConfigItems: MenuProps['items'] = [
-    {
-      key: 'show-full-config-yaml',
-      icon: <FileTextOutlined />,
-      label: 'Show full config YAML',
-      onClick: () => setYamlModalMode('export'),
-    },
-    {
-      key: 'import-full-config-yaml',
-      icon: <ImportOutlined />,
-      label: 'Import full config YAML...',
-      onClick: () => setYamlModalMode('import'),
-    },
-  ];
+  const adminAccountMenu = isValidElement<AccountMenuConfigProps>(accountMenu)
+    ? cloneElement(accountMenu, {
+        configSection: activeSection,
+        onShowFullConfigYaml: () => setYamlModalMode('export'),
+        onImportFullConfigYaml: () => setYamlModalMode('import'),
+        onExportFullBackup: handleExportFullBackup,
+        onImportFullBackup: handleImportFullBackup,
+      })
+    : accountMenu;
 
   return (
     <div style={{
@@ -815,40 +863,18 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
         title="Admin Settings"
         onBack={onBack}
         extra={
-          <Space size={4}>
-            {/* Mobile hamburger — visible only below 900px where
-                the persistent sidebar collapses to a drawer. */}
-            {isNarrow && (
-              <Button
-                size="small"
-                type="text"
-                icon={<MenuOutlined />}
-                onClick={() => setMobileNavOpen(true)}
-                aria-label="Open navigation"
-                style={{ color: colors.TEXT_MUTED }}
-              />
-            )}
-            {/* Section-scoped Copy YAML — only renders on Configuration
-                pages. Lives in the header now (not the old right-rail
-                column) so Configuration pages reclaim the full content
-                width for their forms. Responsive cascade intact; the
-                button's label is hidden below 768px via the
-                `hide-mobile` class. */}
-            <CopySectionYamlButton section={sectionForPath(adminPath)} />
-            <Dropdown menu={{ items: fullConfigItems }} trigger={['click']} placement="bottomRight">
-              <Button
-                size="small"
-                type="text"
-                icon={<FileTextOutlined />}
-                title="Full-document YAML import/export. Section YAML is scoped to the current Configuration page."
-                style={{ color: colors.TEXT_MUTED, fontFamily: 'var(--font-ui)' }}
-              >
-                <span className="hide-mobile" style={{ marginLeft: 4 }}>Full config</span>
-                <DownOutlined className="hide-mobile" style={{ marginLeft: 4, fontSize: 10 }} />
-              </Button>
-            </Dropdown>
-          </Space>
+          isNarrow ? (
+            <Button
+              size="small"
+              type="text"
+              icon={<MenuOutlined />}
+              onClick={() => setMobileNavOpen(true)}
+              aria-label="Open navigation"
+              style={{ color: colors.TEXT_MUTED }}
+            />
+          ) : null
         }
+        accountMenu={adminAccountMenu}
       />
       <YamlImportExportModal
         open={yamlModalMode !== null}
@@ -912,20 +938,9 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
             </div>
           </Drawer>
         )}
-        {/* Four-group sidebar with a Full Backup footer.
-            Since v0.8.4 the Full Backup button is the canonical
-            "save everything" export: the server responds with a
-            zip containing config.yaml + iam.json + secrets.json +
-            manifest.json — the complete state needed to restore an
-            instance. The pre-v0.8.4 label here was "IAM Backup",
-            which was accurate but misleading (operators assumed it
-            covered the whole proxy and restored to a broken state
-            because storage/OAuth secrets weren't in scope). The
-            label + tooltip + file extension all now signal "this
-            is the whole thing".
-
-            Hidden on narrow viewports (<900px) — replaced with the
-            Drawer above. */}
+        {/* Persistent sidebar. Hidden on narrow viewports (<900px) —
+            replaced with the Drawer above. Full Backup actions live
+            in the avatar menu with the other admin-wide actions. */}
         <div
           style={{
             display: isNarrow ? 'none' : 'flex',
@@ -937,109 +952,14 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
           <div style={{ flex: 1, minHeight: 0 }}>
             <AdminSidebar activePath={adminPath} onNavigate={navigateAdmin} />
           </div>
-          {/* Full Backup footer — zip of config.yaml + iam.json +
-              secrets.json + manifest.json. Handles secrets round-
-              trip atomically. */}
-          <div
-            style={{
-              background: colors.BG_CARD,
-              padding: '10px 12px 12px',
-              borderTop: `1px solid ${colors.BORDER}`,
-              width: 220,
-            }}
-          >
-            <div
-              style={{
-                fontSize: 10,
-                fontWeight: 600,
-                letterSpacing: 0.5,
-                textTransform: 'uppercase',
-                color: colors.TEXT_MUTED,
-                padding: '0 0 6px',
-                fontFamily: 'var(--font-ui)',
-              }}
-              title="Zip containing config.yaml + iam.json + secrets.json + manifest.json. Everything needed to restore this proxy, including storage credentials, OAuth client_secrets, and the bootstrap password hash. Treat as a keystore — never commit to a public repo."
-            >
-              Full Backup
-            </div>
-            <div style={{ display: 'flex', gap: 4 }}>
-              <Button
-                size="small"
-                icon={<DownloadOutlined />}
-                onClick={async () => {
-                  try {
-                    const { blob, filename } = await exportBackup();
-                    const url = URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = filename;
-                    a.click();
-                    URL.revokeObjectURL(url);
-                    message.success('Full backup exported');
-                  } catch (e) {
-                    message.error(
-                      'Export failed: ' + (e instanceof Error ? e.message : 'unknown')
-                    );
-                  }
-                }}
-                style={{ flex: 1, fontSize: 11 }}
-              >
-                Export
-              </Button>
-              <Button
-                size="small"
-                icon={<UploadOutlined />}
-                onClick={() => {
-                  const input = document.createElement('input');
-                  input.type = 'file';
-                  // Accept zip (new default) AND json (pre-v0.8.4
-                  // IAM-only backups still round-trip via the
-                  // content-type-sniffing import handler).
-                  input.accept = '.zip,.json,application/zip,application/json';
-                  input.onchange = async () => {
-                    const file = input.files?.[0];
-                    if (!file) return;
-                    try {
-                      // Zip path: pass the File Blob straight through
-                      // — importBackup handles the content-type.
-                      // JSON path: parse + pass object (legacy shape).
-                      const isZip =
-                        file.name.toLowerCase().endsWith('.zip') ||
-                        file.type === 'application/zip' ||
-                        file.type === 'application/x-zip-compressed';
-                      const result = isZip
-                        ? await importBackup(file)
-                        : await importBackup(JSON.parse(await file.text()));
-                      const ext = result.external_identities_created ?? 0;
-                      message.success(
-                        `Imported: ${result.users_created} users, ${result.groups_created} groups, ${ext} OIDC identities (${result.users_skipped} skipped)`
-                      );
-                      window.location.reload();
-                    } catch (e) {
-                      message.error(
-                        'Import failed: ' + (e instanceof Error ? e.message : 'invalid file')
-                      );
-                    }
-                  };
-                  input.click();
-                }}
-                style={{ flex: 1, fontSize: 11 }}
-              >
-                Import
-              </Button>
-            </div>
-          </div>
         </div>
 
         {/* Content pane — single column, full width available.
-            Section-scoped Copy YAML lives in the shell header
-            (CopySectionYamlButton), so Configuration forms reclaim
-            the horizontal space the earlier right-rail was eating
-            on viewports under ~1400px. Full-document Export/Import
-            YAML also in the header. Apply/Discard for dirty state
-            renders inline inside each section panel as an alert
-            banner — that pattern predates the rail and survived
-            the rewrite. */}
+            Config YAML actions now live in the avatar menu, so the
+            header stays focused on navigation/account state while
+            Configuration forms keep the space reclaimed from the old
+            right rail. Apply/Discard for dirty state renders inline
+            inside each section panel as an alert banner. */}
         <div
           style={{
             flex: 1,
@@ -1055,7 +975,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath }: AdminPa
 
 /**
  * Resolve which section a Configuration admin path edits — used by
- * the header's CopySectionYamlButton to pick the target section.
+ * the avatar menu's Config group to pick the section YAML target.
  * Returns undefined for Diagnostics pages and the first-run wizard
  * (no section scope).
  */

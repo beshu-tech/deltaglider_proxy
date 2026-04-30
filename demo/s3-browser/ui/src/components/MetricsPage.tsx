@@ -235,7 +235,7 @@ export default function MetricsPage({ onBack, embedded }: Props) {
     return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
   }, [cadence, fetchMetrics]);
 
-  if (loading) return <div style={{ display: 'flex', justifyContent: 'center', padding: 64 }}><Spin tip="Loading metrics..." /></div>;
+  if (loading) return <div style={{ display: 'flex', justifyContent: 'center', padding: 64 }}><Spin description="Loading metrics..." /></div>;
 
   const m = metricsMap;
 

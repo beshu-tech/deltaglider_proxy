@@ -10,6 +10,12 @@ import { getPreviewMode } from './FilePreview';
 import { getAdminConfig } from '../adminApi';
 import { useOnClickOutside } from '../useDocumentEvent';
 
+const SHARE_DURATIONS = [
+  { label: '1 hour', seconds: 3600 },
+  { label: '24 hours', seconds: 86400 },
+  { label: '7 days', seconds: 7 * 24 * 3600 - 1 },
+];
+
 interface BucketPolicyInfo {
   compressionEnabled: boolean;
   publicPrefixes: string[];
@@ -22,6 +28,8 @@ interface Props {
   onPreview?: (obj: S3Object) => void;
   isMobile?: boolean;
   headCache?: Record<string, { storageType?: string; storedSize?: number; error?: boolean }>;
+  canDelete?: boolean;
+  canRead?: boolean;
 }
 
 function getDgMetadata(headers: Record<string, string>): [string, string][] {
@@ -192,7 +200,7 @@ function ShareDurationButton({
   );
 }
 
-export default function InspectorPanel({ object, onClose, onDeleted, onPreview, isMobile, headCache }: Props) {
+export default function InspectorPanel({ object, onClose, onDeleted, onPreview, isMobile, headCache, canDelete = true, canRead = true }: Props) {
   const {
     BG_SIDEBAR, BORDER, TEXT_PRIMARY, TEXT_MUTED, TEXT_FAINT,
     ACCENT_BLUE, ACCENT_GREEN, ACCENT_RED, STORAGE_TYPE_COLORS, STORAGE_TYPE_DEFAULT,
@@ -333,12 +341,6 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
     setModalState(null);
   };
 
-  const SHARE_DURATIONS = [
-    { label: '1 hour', seconds: 3600 },
-    { label: '24 hours', seconds: 86400 },
-    { label: '7 days', seconds: 7 * 24 * 3600 - 1 },
-  ];
-
   const handleCopyLink = async (expiresInSeconds?: number) => {
     setModalState({ mode: 'share', phase: 'loading' });
     setShareDuration(expiresInSeconds ?? SHARE_DURATIONS[2].seconds);
@@ -421,7 +423,7 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
           {/* Content */}
           <div style={{ flex: 1, overflow: 'auto', padding: '16px 20px' }}>
             {/* Preview button (only for previewable files) */}
-            {onPreview && object && getPreviewMode(object.key) && (
+            {canRead && onPreview && object && getPreviewMode(object.key) && (
               <Button
                 block
                 size="large"
@@ -439,35 +441,37 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
             )}
 
             {/* Download & Share buttons */}
-            <div style={{ display: 'flex', gap: 8, marginBottom: 20 }}>
-              <Button
-                type="primary"
-                size="large"
-                icon={<DownloadOutlined />}
-                onClick={handleDownload}
-                style={{
-                  flex: 1,
-                  background: ACCENT_GREEN,
-                  borderColor: ACCENT_GREEN,
-                  fontWeight: 600,
-                  borderRadius: 10,
-                  fontFamily: "var(--font-ui)",
-                }}
-              >
-                Download
-              </Button>
-              <div style={{ flex: 1, position: 'relative' }}>
-                <ShareDurationButton
-                  durations={SHARE_DURATIONS}
-                  onSelect={(seconds) => handleCopyLink(seconds)}
-                  accentBlue={ACCENT_BLUE}
-                  border={BORDER}
-                  textMuted={TEXT_MUTED}
-                  textPrimary={TEXT_PRIMARY}
-                  bgSidebar={BG_SIDEBAR}
-                />
+            {canRead && (
+              <div style={{ display: 'flex', gap: 8, marginBottom: 20 }}>
+                <Button
+                  type="primary"
+                  size="large"
+                  icon={<DownloadOutlined />}
+                  onClick={handleDownload}
+                  style={{
+                    flex: 1,
+                    background: ACCENT_GREEN,
+                    borderColor: ACCENT_GREEN,
+                    fontWeight: 600,
+                    borderRadius: 10,
+                    fontFamily: "var(--font-ui)",
+                  }}
+                >
+                  Download
+                </Button>
+                <div style={{ flex: 1, position: 'relative' }}>
+                  <ShareDurationButton
+                    durations={SHARE_DURATIONS}
+                    onSelect={(seconds) => handleCopyLink(seconds)}
+                    accentBlue={ACCENT_BLUE}
+                    border={BORDER}
+                    textMuted={TEXT_MUTED}
+                    textPrimary={TEXT_PRIMARY}
+                    bgSidebar={BG_SIDEBAR}
+                  />
+                </div>
               </div>
-            </div>
+            )}
 
             {/* PUBLIC ACCESS BADGE */}
             {isPublic && (
@@ -627,24 +631,25 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
             </InspectorSection>
           </div>
 
-          {/* Delete button at bottom */}
-          <div style={{ padding: '16px 20px', borderTop: `1px solid ${BORDER}` }}>
-            <Button
-              block
-              icon={<DeleteOutlined />}
-              onClick={handleDelete}
-              style={{
-                background: 'transparent',
-                borderColor: BORDER,
-                color: ACCENT_RED,
-                borderRadius: 10,
-                fontFamily: "var(--font-ui)",
-                fontWeight: 600,
-              }}
-            >
-              Delete object
-            </Button>
-          </div>
+          {canDelete && (
+            <div style={{ padding: '16px 20px', borderTop: `1px solid ${BORDER}` }}>
+              <Button
+                block
+                icon={<DeleteOutlined />}
+                onClick={handleDelete}
+                style={{
+                  background: 'transparent',
+                  borderColor: BORDER,
+                  color: ACCENT_RED,
+                  borderRadius: 10,
+                  fontFamily: "var(--font-ui)",
+                  fontWeight: 600,
+                }}
+              >
+                Delete object
+              </Button>
+            </div>
+          )}
         </div>
       </Drawer>
 

@@ -1,2 +1,3 @@
-- [Demo UI hygiene review Apr 2026](frontend_hygiene_2026_04.md) — Top 5 demo-browser UI issues; superseded by marketing review for the marketing subtree
-- [Marketing site hygiene Apr 2026](frontend_hygiene_2026_04.md) — Header nav DRY, page-path triple list, About inlines ChecklistGrid, Landing 537 LOC, dark hero duplication
+# Codebase Hygiene Reviewer — Memory Index
+
+- [InspectorPanel length](inspector_panel_length.md) — InspectorPanel.tsx is 800 LOC with 4+ mixed concerns; candidate for extraction

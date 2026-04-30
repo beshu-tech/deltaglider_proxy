@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+  <title>Compression tax — wall throughput (pinned run)</title>
+  <style>
+    :root {
+      --bg: #06080c;
+      --panel: rgba(14, 17, 24, 0.94);
+      --text: #e8ecf4;
+      --muted: #8b95a8;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+      font-family: ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    #canvas-wrap {
+      position: fixed;
+      inset: 0;
+      top: 7.5rem;
+      bottom: 8.5rem;
+    }
+    #canvas-wrap.hidden { display: none; }
+    canvas { display: block; width: 100%; height: 100%; }
+    #labels-overlay {
+      position: fixed;
+      inset: 0;
+      top: 7.5rem;
+      bottom: 8.5rem;
+      pointer-events: none;
+      overflow: hidden;
+    }
+    #labels-overlay.hidden { display: none; }
+    header.panel {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 4;
+      padding: 0.55rem 1rem 0.4rem;
+      background: var(--panel);
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+      pointer-events: auto;
+    }
+    header.panel h1 {
+      margin: 0;
+      font-size: 0.82rem;
+      font-weight: 650;
+      letter-spacing: 0.02em;
+    }
+    header.panel p {
+      margin: 0.3rem 0 0;
+      font-size: 0.7rem;
+      color: var(--muted);
+      max-width: 56rem;
+      line-height: 1.42;
+    }
+    header.panel code {
+      font-family: "JetBrains Mono", ui-monospace, monospace;
+      font-size: 0.66rem;
+      color: #cbd5e1;
+    }
+    .view-tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.35rem;
+      margin-top: 0.45rem;
+      align-items: center;
+    }
+    .view-tabs span.hint {
+      font-size: 0.62rem;
+      color: var(--muted);
+      margin-left: 0.25rem;
+    }
+    .view-tabs button {
+      font: inherit;
+      font-size: 0.65rem;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      padding: 0.38rem 0.75rem;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.12);
+      background: rgba(255,255,255,0.04);
+      color: var(--muted);
+      cursor: pointer;
+      transition: background 0.12s, color 0.12s, border-color 0.12s;
+    }
+    .view-tabs button:hover {
+      color: var(--text);
+      border-color: rgba(94, 234, 212, 0.35);
+    }
+    .view-tabs button.active {
+      background: rgba(94, 234, 212, 0.18);
+      border-color: rgba(94, 234, 212, 0.45);
+      color: #ecfdf5;
+    }
+    footer.legend {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      z-index: 4;
+      padding: 0.45rem 1rem 0.55rem;
+      background: var(--panel);
+      border-top: 1px solid rgba(255,255,255,0.06);
+      font-size: 0.66rem;
+      color: var(--muted);
+      line-height: 1.45;
+      pointer-events: none;
+    }
+    footer.legend strong { color: #cbd5e1; font-weight: 600; }
+
+    #storage-panel {
+      position: fixed;
+      left: 1rem;
+      right: 1rem;
+      top: 8rem;
+      bottom: 6rem;
+      z-index: 2;
+      background: #0a0d12;
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 12px;
+      padding: 1rem 1.25rem 1.25rem;
+      display: none;
+      flex-direction: column;
+      gap: 1rem;
+      overflow: auto;
+    }
+    #storage-panel.visible { display: flex; }
+    #storage-panel h2 {
+      margin: 0;
+      font-size: 0.75rem;
+      font-weight: 650;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: #94a3b8;
+    }
+    .storage-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 0.75rem;
+      max-width: 48rem;
+    }
+    @media (max-width: 640px) {
+      .storage-grid { grid-template-columns: 1fr 1fr; }
+    }
+    .storage-cell {
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 10px;
+      padding: 0.65rem 0.7rem;
+    }
+    .storage-cell .mode {
+      font-family: "JetBrains Mono", ui-monospace, monospace;
+      font-size: 0.62rem;
+      color: #94a3b8;
+      margin-bottom: 0.35rem;
+    }
+    .storage-cell .gib {
+      font-family: "JetBrains Mono", ui-monospace, monospace;
+      font-size: 1.15rem;
+      font-weight: 700;
+      color: #f1f5f9;
+    }
+    .storage-cell .note {
+      font-size: 0.62rem;
+      color: var(--muted);
+      margin-top: 0.35rem;
+      line-height: 1.35;
+    }
+    .storage-bar-wrap {
+      height: 8px;
+      background: rgba(255,255,255,0.06);
+      border-radius: 4px;
+      margin-top: 0.5rem;
+      overflow: hidden;
+    }
+    .storage-bar-fill {
+      height: 100%;
+      border-radius: 4px;
+      background: linear-gradient(90deg, #14b8a6, #a78bfa);
+    }
+
+    .bar-label {
+      text-align: center;
+      color: #f1f5f9;
+      font-family: "JetBrains Mono", ui-monospace, monospace;
+      font-size: 10px;
+      line-height: 1.3;
+      text-shadow: 0 1px 3px #000;
+      white-space: nowrap;
+      pointer-events: none;
+      user-select: none;
+    }
+    .bar-label .mb { font-weight: 700; font-size: 11px; display: block; }
+    .bar-label .sub {
+      opacity: 0.9;
+      font-size: 9px;
+      color: #cbd5e1;
+      display: block;
+      margin-top: 1px;
+    }
+    .bar-label.pt .sub { color: #94a3b8; }
+    .phase-tag {
+      font-family: "JetBrains Mono", ui-monospace, monospace;
+      font-size: 10px;
+      color: #5eead4;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      white-space: nowrap;
+      margin-top: 0.35rem;
+    }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <header class="panel">
+    <h1>One run, four proxy modes — same artifacts, same phases</h1>
+    <p>
+      Bars = wall-clock <code>mb_s_wall</code> (pinned <code>hetzner-20260428-140514Z</code>).
+      Gold line = passthrough MB/s in that phase; gold edge = passthrough bar.
+      Tax label = <code>100 × (1 − mode/pt)</code> (negative ⇒ faster wall MB/s than PT in this pin).
+    </p>
+    <div class="view-tabs" role="tablist" aria-label="Camera view">
+      <button type="button" data-view="overview" class="active">Overview</button>
+      <button type="button" data-view="put">PUT</button>
+      <button type="button" data-view="cold_get">Cold GET</button>
+      <button type="button" data-view="warm_get">Warm GET</button>
+      <button type="button" data-view="storage">Stored GiB</button>
+      <span class="hint">Hover bars to highlight · no free-camera orbit</span>
+    </div>
+  </header>
+
+  <div id="canvas-wrap"></div>
+  <div id="labels-overlay"></div>
+
+  <div id="storage-panel" aria-hidden="true"></div>
+
+  <footer class="legend">
+    <strong>Throughput chart</strong> uses orthographic front projection — phases are separated on X so bars do not stack in depth.
+    <strong>Stored GiB</strong> is a separate tab (Prometheus implied, same run). Logical upload ≈ 0.317 GiB all modes.
+  </footer>
+
+  <script type="module">
+    const MODE_SHORT = ["passthrough", "compression", "encryption", "comp+encrypt"];
+    const PHASE_KEYS = ["put", "cold_get", "warm_get"];
+    const PHASE_LABEL = ["PUT (upload phase)", "Cold GET", "Warm GET"];
+    const MBPS = {
+      put: [105.57, 8.88, 94.32, 8.73],
+      cold_get: [97.05, 89.38, 299.9, 85.15],
+      warm_get: [90.13, 91.72, 280.56, 93.11],
+    };
+    const STORAGE_GIB = [0.316669952, 0.123753516, 0.316669952, 0.123753516];
+    const LOGICAL_GIB = 0.316669952;
+    const MODE_HEX = ["#94a3b8", "#14b8a6", "#a78bfa", "#f59e0b"];
+
+    const MODE_COLORS = [0x94a3b8, 0x14b8a6, 0xa78bfa, 0xf59e0b];
+    const PT_INDEX = 0;
+
+    import * as THREE from "three";
+    import { CSS2DRenderer, CSS2DObject } from "three/addons/renderers/CSS2DRenderer.js";
+
+    function taxPct(modeMbps, ptMbps) {
+      return 100 * (1 - modeMbps / ptMbps);
+    }
+
+    function fmtTax(pct) {
+      if (!Number.isFinite(pct)) return "";
+      const r = Math.round(pct);
+      if (r === 0) return "0% vs PT";
+      const sign = r > 0 ? "+" : "";
+      return `${sign}${r}% vs PT`;
+    }
+
+    function fmtMbps(v) {
+      return v >= 100 ? v.toFixed(1) : v.toFixed(2);
+    }
+
+    const wrap = document.getElementById("canvas-wrap");
+    const labelMount = document.getElementById("labels-overlay");
+    const storagePanel = document.getElementById("storage-panel");
+
+    /** Wide mode pitch + large inter-phase gap — avoids CSS2D label collisions in overview. */
+    const modeSpacing = 3.55;
+    const clusterGap = 9.25;
+    const phasePitch = 4 * modeSpacing + clusterGap;
+    /** Horizontal stagger for value labels (world units), paired with wide modeSpacing. */
+    const LABEL_DX = [-1.05, -0.38, 0.38, 1.05];
+    /** World X center of phase cluster p (0..2). */
+    function phaseCenterX(p) {
+      return (p - 1) * phasePitch;
+    }
+    function barX(p, m) {
+      return phaseCenterX(p) + (m - 1.5) * modeSpacing;
+    }
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(wrap.clientWidth, wrap.clientHeight);
+    renderer.setClearColor(0x06080c, 1);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    wrap.appendChild(renderer.domElement);
+
+    const labelRenderer = new CSS2DRenderer();
+    labelRenderer.setSize(wrap.clientWidth, wrap.clientHeight);
+    labelRenderer.domElement.style.position = "absolute";
+    labelRenderer.domElement.style.top = "0";
+    labelRenderer.domElement.style.left = "0";
+    labelRenderer.domElement.style.pointerEvents = "none";
+    labelMount.appendChild(labelRenderer.domElement);
+
+    const scene = new THREE.Scene();
+
+    const halfH = 7.65;
+    let halfW = halfH * (wrap.clientWidth / Math.max(1, wrap.clientHeight));
+    const camera = new THREE.OrthographicCamera(-halfW, halfW, halfH, -halfH, 0.1, 80);
+    camera.position.set(0, 5.4, 22);
+    camera.lookAt(0, 2.35, 0);
+
+    scene.add(new THREE.AmbientLight(0xccddee, 0.55));
+    const key = new THREE.DirectionalLight(0xffffff, 0.95);
+    key.position.set(0, 14, 18);
+    scene.add(key);
+
+    const chart = new THREE.Group();
+    scene.add(chart);
+
+    const rowMaxH = 4.5;
+    const barW = 0.95;
+    const barD = 0.28;
+
+    const barMeshes = [];
+    const baseEmissive = new Map();
+    /** One group per phase — visibility toggled per tab so single-phase ≠ overview. */
+    const phaseRoots = [];
+
+    for (let p = 0; p < 3; p++) {
+      const phaseRoot = new THREE.Group();
+      phaseRoot.name = `phase_${PHASE_KEYS[p]}`;
+      chart.add(phaseRoot);
+      phaseRoots.push(phaseRoot);
+
+      const phaseKey = PHASE_KEYS[p];
+      const row = MBPS[phaseKey];
+      const rowMax = Math.max(...row);
+      const ptMbps = row[PT_INDEX];
+      const z = 0;
+      const yPt = (ptMbps / rowMax) * rowMaxH;
+      const xL = barX(p, 0) - barW / 2;
+      const xR = barX(p, 3) + barW / 2;
+
+      const baselineGeom = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(xL - 0.15, yPt, z),
+        new THREE.Vector3(xR + 0.15, yPt, z),
+      ]);
+      phaseRoot.add(
+        new THREE.Line(
+          baselineGeom,
+          new THREE.LineBasicMaterial({ color: 0xfbbf24 })
+        )
+      );
+
+      const phaseTitle = document.createElement("div");
+      phaseTitle.className = "bar-label phase-tag";
+      phaseTitle.textContent = PHASE_LABEL[p];
+      const phaseLO = new CSS2DObject(phaseTitle);
+      /* Below floor — never collides with tall bars / value callouts above baseline. */
+      phaseLO.position.set(phaseCenterX(p), -1.28, z);
+      phaseRoot.add(phaseLO);
+
+      for (let m = 0; m < 4; m++) {
+        const mbps = row[m];
+        const h = (mbps / rowMax) * rowMaxH;
+        const x = barX(p, m);
+        const geo = new THREE.BoxGeometry(barW, h, barD);
+        const mat = new THREE.MeshStandardMaterial({
+          color: MODE_COLORS[m],
+          metalness: 0.2,
+          roughness: 0.55,
+          emissive: MODE_COLORS[m],
+          emissiveIntensity: m === PT_INDEX ? 0.07 : 0.02,
+        });
+        baseEmissive.set(mat, mat.emissiveIntensity);
+        const mesh = new THREE.Mesh(geo, mat);
+        mesh.position.set(x, h / 2, z);
+        mesh.userData = { phase: p, mode: m, targetH: h, mbps, ptMbps };
+
+        if (m === PT_INDEX) {
+          const edges = new THREE.EdgesGeometry(geo);
+          const line = new THREE.LineSegments(
+            edges,
+            new THREE.LineBasicMaterial({ color: 0xfbbf24 })
+          );
+          line.position.copy(mesh.position);
+          line.userData.followBar = mesh;
+          phaseRoot.add(line);
+          mesh.userData.outline = line;
+        }
+
+        phaseRoot.add(mesh);
+        barMeshes.push(mesh);
+
+        const t = taxPct(mbps, ptMbps);
+        const div = document.createElement("div");
+        div.className = "bar-label" + (m === PT_INDEX ? " pt" : "");
+        const sub =
+          m === PT_INDEX
+            ? `<span class="sub">baseline</span>`
+            : `<span class="sub">${fmtTax(t)}</span>`;
+        div.innerHTML = `<span class="mb">${fmtMbps(mbps)}</span><span class="sub"> MB/s</span><br/>${sub}`;
+        const lod = new CSS2DObject(div);
+        lod.position.set(x + LABEL_DX[m], h + 0.72, z);
+        lod.userData.followBar = mesh;
+        lod.userData.yOff = 0.72;
+        lod.userData.dx = LABEL_DX[m];
+        phaseRoot.add(lod);
+        mesh.userData.label = lod;
+      }
+    }
+
+    function syncOutlinesAndLabels() {
+      chart.traverse((o) => {
+        if (o.userData?.followBar && !(o instanceof CSS2DObject)) {
+          o.position.copy(o.userData.followBar.position);
+        }
+        if (o.userData?.followBar && o instanceof CSS2DObject) {
+          const b = o.userData.followBar;
+          const h = b.geometry.parameters.height;
+          const dx = o.userData.dx ?? 0;
+          o.position.set(b.position.x + dx, h + o.userData.yOff, b.position.z);
+        }
+      });
+    }
+
+    const clock = new THREE.Clock();
+    let growDone = false;
+    const growDur = 1.25;
+
+    function easeOutCubic(t) {
+      return 1 - Math.pow(1 - t, 3);
+    }
+
+    function animateGrow(elapsed) {
+      let allOne = true;
+      for (const mesh of barMeshes) {
+        const { phase, mode, targetH } = mesh.userData;
+        const delay = phase * 0.38 + mode * 0.06;
+        const t = Math.max(0, Math.min(1, (elapsed - delay) / growDur));
+        const e = easeOutCubic(t);
+        if (t < 1) allOne = false;
+        const hh = targetH * e;
+        mesh.geometry.dispose();
+        mesh.geometry = new THREE.BoxGeometry(barW, Math.max(0.02, hh), barD);
+        mesh.position.y = hh / 2;
+        if (mesh.userData.outline) {
+          mesh.userData.outline.geometry.dispose();
+          mesh.userData.outline.geometry = new THREE.EdgesGeometry(mesh.geometry);
+          mesh.userData.outline.position.copy(mesh.position);
+        }
+      }
+      syncOutlinesAndLabels();
+      return allOne;
+    }
+
+    /** Chart X shift so the visible phase cluster sits on camera center (world X≈0). */
+    const viewShift = {
+      overview: 0,
+      put: phasePitch,
+      cold_get: 0,
+      warm_get: -phasePitch,
+      storage: 0,
+    };
+
+    let activeView = "overview";
+
+    /** Orthographic zoom: larger value = tighter crop. Preserved across resize. */
+    const ZOOM_OVERVIEW = 0.4;
+    const ZOOM_SINGLE = 1.45;
+    let frameZoom = ZOOM_OVERVIEW;
+
+    function syncPhaseVisibility(view) {
+      if (view === "overview") {
+        phaseRoots.forEach((g) => {
+          g.visible = true;
+        });
+        return;
+      }
+      const idx =
+        view === "put" ? 0 : view === "cold_get" ? 1 : view === "warm_get" ? 2 : -1;
+      phaseRoots.forEach((g, pi) => {
+        g.visible = idx < 0 ? true : pi === idx;
+      });
+    }
+
+    function applyCameraFrame(view) {
+      const shift = viewShift[view] ?? 0;
+      frameZoom =
+        view === "overview" ? ZOOM_OVERVIEW : view === "storage" ? ZOOM_OVERVIEW : ZOOM_SINGLE;
+      chart.position.x = shift;
+      camera.zoom = frameZoom;
+      camera.updateProjectionMatrix();
+    }
+
+    function activateThroughputView(view) {
+      activeView = view;
+      syncPhaseVisibility(view);
+      applyCameraFrame(view);
+    }
+
+    document.querySelectorAll(".view-tabs button").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const view = btn.getAttribute("data-view");
+        if (!view) return;
+
+        document.querySelectorAll(".view-tabs button").forEach((b) => b.classList.toggle("active", b === btn));
+
+        const show3d = view !== "storage";
+        wrap.classList.toggle("hidden", !show3d);
+        labelMount.classList.toggle("hidden", !show3d);
+        storagePanel.classList.toggle("visible", view === "storage");
+        storagePanel.setAttribute("aria-hidden", view !== "storage");
+
+        if (show3d) activateThroughputView(view);
+      });
+    });
+
+    activateThroughputView("overview");
+
+    function applyOrthoFrustum() {
+      const w = wrap.clientWidth;
+      const h = Math.max(1, wrap.clientHeight);
+      halfW = halfH * (w / h);
+      camera.left = -halfW;
+      camera.right = halfW;
+      camera.top = halfH;
+      camera.bottom = -halfH;
+      camera.zoom = frameZoom;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+      labelRenderer.setSize(w, h);
+    }
+
+    window.addEventListener("resize", applyOrthoFrustum);
+
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+    let hovered = null;
+
+    function setHover(mesh) {
+      if (hovered === mesh) return;
+      if (hovered) {
+        const om = hovered.material;
+        om.emissiveIntensity = baseEmissive.get(om) ?? 0.02;
+      }
+      hovered = mesh;
+      if (mesh) {
+        const m = mesh.material;
+        m.emissiveIntensity = (baseEmissive.get(m) ?? 0.02) + 0.45;
+      }
+    }
+
+    renderer.domElement.style.cursor = "default";
+    renderer.domElement.addEventListener("pointermove", (e) => {
+      if (wrap.classList.contains("hidden")) return;
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(pointer, camera);
+      const visibleBars = barMeshes.filter((m) => {
+        let o = m;
+        while (o) {
+          if (o.visible === false) return false;
+          o = o.parent;
+        }
+        return true;
+      });
+      const hits = raycaster.intersectObjects(visibleBars, false);
+      setHover(hits.length ? hits[0].object : null);
+    });
+    renderer.domElement.addEventListener("pointerleave", () => setHover(null));
+
+    /* Storage panel HTML — solid, no transparent WebGL ghosts */
+    const maxSt = Math.max(...STORAGE_GIB);
+    storagePanel.innerHTML = `
+      <h2>Stored bytes (same run, Prometheus implied)</h2>
+      <p style="margin:0;font-size:0.72rem;color:#8b95a8;max-width:40rem;line-height:1.45">
+        Logical upload ≈ <strong style="color:#cbd5e1">${LOGICAL_GIB.toFixed(3)} GiB</strong> for every mode.
+        Compression modes store deltas — fewer GiB on disk for this artifact mix.
+      </p>
+      <div class="storage-grid">
+        ${MODE_SHORT.map((name, i) => {
+          const pct = Math.round((STORAGE_GIB[i] / LOGICAL_GIB) * 100);
+          const wPct = Math.round((STORAGE_GIB[i] / maxSt) * 100);
+          return `
+            <div class="storage-cell">
+              <div class="mode">${name}</div>
+              <div class="gib">${STORAGE_GIB[i].toFixed(3)} GiB</div>
+              <div class="note">${pct}% of logical upload footprint</div>
+              <div class="storage-bar-wrap"><div class="storage-bar-fill" style="width:${wPct}%;background:${MODE_HEX[i]}"></div></div>
+            </div>`;
+        }).join("")}
+      </div>
+    `;
+
+    applyOrthoFrustum();
+
+    function animate() {
+      requestAnimationFrame(animate);
+      const elapsed = clock.getElapsedTime();
+
+      if (!growDone) {
+        growDone = animateGrow(elapsed);
+        if (growDone) syncOutlinesAndLabels();
+      }
+
+      renderer.render(scene, camera);
+      labelRenderer.render(scene, camera);
+    }
+    animate();
+  </script>
+</body>
+</html>

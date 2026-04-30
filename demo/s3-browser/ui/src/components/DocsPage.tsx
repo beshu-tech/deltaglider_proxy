@@ -153,9 +153,10 @@ interface Props {
   /** Doc ID from URL path (e.g., 'configuration' from /_/docs/configuration) */
   docId?: string;
   onBack?: () => void;
+  accountMenu?: React.ReactNode;
 }
 
-export default function DocsPage({ docId, onBack }: Props) {
+export default function DocsPage({ docId, onBack, accountMenu }: Props) {
   const colors = useColors();
   const { navigate } = useNavigation();
 
@@ -234,7 +235,7 @@ export default function DocsPage({ docId, onBack }: Props) {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
-      {onBack && <FullScreenHeader title="Documentation" onBack={onBack} />}
+      {onBack && <FullScreenHeader title="Documentation" onBack={onBack} accountMenu={accountMenu} />}
 
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
       {/* Left sidebar: search + doc navigation */}

@@ -6,10 +6,10 @@ import DestinationPickerModal from './DestinationPickerModal';
 
 interface Props {
   selectedCount: number;
-  onDelete: () => void;
-  onCopy: (destBucket: string, destPrefix: string) => Promise<{ succeeded: number; failed: number }>;
-  onMove: (destBucket: string, destPrefix: string) => Promise<{ succeeded: number; failed: number }>;
-  onDownloadZip: () => Promise<void>;
+  onDelete?: () => void;
+  onCopy?: (destBucket: string, destPrefix: string) => Promise<{ succeeded: number; failed: number }>;
+  onMove?: (destBucket: string, destPrefix: string) => Promise<{ succeeded: number; failed: number }>;
+  onDownloadZip?: () => Promise<void>;
   deleting: boolean;
 }
 
@@ -23,6 +23,7 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
     setOperating(true);
     try {
       const fn = op === 'copy' ? onCopy : onMove;
+      if (!fn) return;
       const result = await fn(destBucket, destPrefix);
       if (result.failed > 0) {
         message.warning(`${result.succeeded} succeeded, ${result.failed} failed`);
@@ -40,6 +41,7 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
   const handleZip = async () => {
     setDownloading(true);
     try {
+      if (!onDownloadZip) return;
       await onDownloadZip();
     } catch (e) {
       message.error(e instanceof Error ? e.message : 'Download failed');
@@ -61,45 +63,53 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
         <span style={{ flex: 1, fontSize: 13, fontFamily: 'var(--font-ui)', color: colors.TEXT_SECONDARY }}>
           {selectedCount} selected
         </span>
-        <Button
-          size="small"
-          icon={<CopyOutlined />}
-          onClick={() => setModal('copy')}
-          disabled={busy}
-          aria-label={`Copy ${selectedCount} selected items`}
-        >
-          Copy
-        </Button>
-        <Button
-          size="small"
-          icon={<ScissorOutlined />}
-          onClick={() => setModal('move')}
-          disabled={busy}
-          aria-label={`Move ${selectedCount} selected items`}
-        >
-          Move
-        </Button>
-        <Button
-          size="small"
-          icon={<DownloadOutlined />}
-          onClick={handleZip}
-          loading={downloading}
-          disabled={busy}
-          aria-label={`Download ${selectedCount} selected items as ZIP`}
-        >
-          ZIP
-        </Button>
-        <Button
-          danger
-          size="small"
-          icon={<DeleteOutlined />}
-          onClick={onDelete}
-          loading={deleting}
-          disabled={busy}
-          aria-label={`Delete ${selectedCount} selected items`}
-        >
-          Delete
-        </Button>
+        {onCopy && (
+          <Button
+            size="small"
+            icon={<CopyOutlined />}
+            onClick={() => setModal('copy')}
+            disabled={busy}
+            aria-label={`Copy ${selectedCount} selected items`}
+          >
+            Copy
+          </Button>
+        )}
+        {onMove && (
+          <Button
+            size="small"
+            icon={<ScissorOutlined />}
+            onClick={() => setModal('move')}
+            disabled={busy}
+            aria-label={`Move ${selectedCount} selected items`}
+          >
+            Move
+          </Button>
+        )}
+        {onDownloadZip && (
+          <Button
+            size="small"
+            icon={<DownloadOutlined />}
+            onClick={handleZip}
+            loading={downloading}
+            disabled={busy}
+            aria-label={`Download ${selectedCount} selected items as ZIP`}
+          >
+            ZIP
+          </Button>
+        )}
+        {onDelete && (
+          <Button
+            danger
+            size="small"
+            icon={<DeleteOutlined />}
+            onClick={onDelete}
+            loading={deleting}
+            disabled={busy}
+            aria-label={`Delete ${selectedCount} selected items`}
+          >
+            Delete
+          </Button>
+        )}
       </div>
 
       <DestinationPickerModal

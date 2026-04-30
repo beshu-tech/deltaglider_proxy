@@ -196,6 +196,95 @@ impl FilesystemBackend {
         Ok(total)
     }
 
+    /// Return true when a deltaspace subtree contains at least one user-visible
+    /// data file. Empty physical directories are not S3 prefixes and must not
+    /// leak into delimiter listings as undeletable "folders".
+    fn dir_has_visible_data_recursive<'a>(
+        current_dir: &'a Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, StorageError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut entries = fs::read_dir(current_dir).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+                let ft = entry.file_type().await?;
+                if ft.is_dir() {
+                    if Self::dir_has_visible_data_recursive(&path).await? {
+                        return Ok(true);
+                    }
+                } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if !name.starts_with('.') && name != "reference.bin" {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        })
+    }
+
+    /// Remove hidden temp files, reference-only data, and empty directories
+    /// from an otherwise empty bucket subtree.
+    ///
+    /// Returns `true` only when the subtree contains no user-visible data.
+    /// Bucket deletion uses this before a non-recursive `remove_dir`, so a
+    /// concurrent object creation turns into `BucketNotEmpty` instead of being
+    /// erased by `remove_dir_all`.
+    fn prune_invisible_data_recursive<'a>(
+        current_dir: &'a Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, StorageError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            if !path_exists(current_dir).await {
+                return Ok(true);
+            }
+            if Self::dir_has_visible_data_recursive(current_dir).await? {
+                return Ok(false);
+            }
+
+            let mut has_visible_data = false;
+            let mut entries = match fs::read_dir(current_dir).await {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+                Err(e) => return Err(StorageError::from(e)),
+            };
+
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+                let ft = entry.file_type().await?;
+                if ft.is_dir() {
+                    if Self::prune_invisible_data_recursive(&path).await? {
+                        match fs::remove_dir(&path).await {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                                has_visible_data = true;
+                            }
+                            Err(e) => return Err(StorageError::from(e)),
+                        }
+                    } else {
+                        has_visible_data = true;
+                    }
+                } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with('.') || name == "reference.bin" {
+                        match fs::remove_file(&path).await {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => return Err(StorageError::from(e)),
+                        }
+                    } else {
+                        has_visible_data = true;
+                    }
+                } else {
+                    // Unknown filenames are treated as data to avoid deleting
+                    // something we cannot safely classify as internal.
+                    has_visible_data = true;
+                }
+            }
+
+            Ok(!has_visible_data)
+        })
+    }
+
     /// Recursively find all deltaspaces (directories containing deltaglider files)
     fn find_deltaspaces_recursive<'a>(
         base_dir: &'a Path,
@@ -354,6 +443,7 @@ impl FilesystemBackend {
     async fn delete_object_file(
         &self,
         data_path: &Path,
+        prune_root: &Path,
         label: &str,
         prefix: &str,
         filename: &str,
@@ -364,9 +454,56 @@ impl FilesystemBackend {
                 label, prefix, filename
             )));
         }
-        fs::remove_file(data_path).await?;
+        fs::remove_file(data_path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StorageError::NotFound(format!("{}: {}/{}", label, prefix, filename))
+            } else {
+                StorageError::from(e)
+            }
+        })?;
+        if let Some(parent) = data_path.parent() {
+            Self::prune_empty_dirs(parent, prune_root).await?;
+        }
         debug!("Deleted {} for {}/{}", label, prefix, filename);
         Ok(())
+    }
+
+    /// Remove empty directories left behind by filesystem-mode object deletes.
+    ///
+    /// This is intentionally bounded by the bucket's `deltaspaces` directory:
+    /// object deletion may clean empty prefix directories, but it must never
+    /// remove the bucket itself or climb outside the backend-owned tree.
+    fn prune_empty_dirs<'a>(
+        start_dir: &'a Path,
+        stop_dir: &'a Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), StorageError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let stop = stop_dir.to_path_buf();
+            let mut current = start_dir.to_path_buf();
+
+            loop {
+                if current == stop || !current.starts_with(&stop) {
+                    break;
+                }
+
+                match fs::remove_dir(&current).await {
+                    Ok(()) => {
+                        debug!("Pruned empty filesystem prefix dir: {:?}", current);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
+                    Err(e) => return Err(StorageError::from(e)),
+                }
+
+                let Some(parent) = current.parent() else {
+                    break;
+                };
+                current = parent.to_path_buf();
+            }
+
+            Ok(())
+        })
     }
 }
 
@@ -391,13 +528,29 @@ impl StorageBackend for FilesystemBackend {
         // Check if bucket has any content
         let deltaspaces_dir = bucket_dir.join("deltaspaces");
         if path_exists(&deltaspaces_dir).await {
-            let mut entries = fs::read_dir(&deltaspaces_dir).await?;
-            if entries.next_entry().await?.is_some() {
+            if !Self::prune_invisible_data_recursive(&deltaspaces_dir).await? {
                 return Err(StorageError::BucketNotEmpty(bucket.to_string()));
             }
+            match fs::remove_dir(&deltaspaces_dir).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                    return Err(StorageError::BucketNotEmpty(bucket.to_string()));
+                }
+                Err(e) => return Err(StorageError::from(e)),
+            }
         }
-        // Remove the bucket directory
-        fs::remove_dir_all(&bucket_dir).await?;
+
+        match fs::remove_dir(&bucket_dir).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StorageError::BucketNotFound(bucket.to_string()));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                return Err(StorageError::BucketNotEmpty(bucket.to_string()));
+            }
+            Err(e) => return Err(StorageError::from(e)),
+        }
         debug!("Deleted bucket directory: {:?}", bucket_dir);
         Ok(())
     }
@@ -514,6 +667,7 @@ impl StorageBackend for FilesystemBackend {
     async fn delete_reference(&self, bucket: &str, prefix: &str) -> Result<(), StorageError> {
         self.delete_object_file(
             &self.reference_path(bucket, prefix),
+            &self.deltaspace_dir(bucket, ""),
             "reference",
             prefix,
             "reference.bin",
@@ -587,6 +741,7 @@ impl StorageBackend for FilesystemBackend {
     ) -> Result<(), StorageError> {
         self.delete_object_file(
             &self.delta_path(bucket, prefix, filename),
+            &self.deltaspace_dir(bucket, ""),
             "delta",
             prefix,
             filename,
@@ -661,6 +816,7 @@ impl StorageBackend for FilesystemBackend {
     ) -> Result<(), StorageError> {
         self.delete_object_file(
             &self.passthrough_path(bucket, prefix, filename),
+            &self.deltaspace_dir(bucket, ""),
             "passthrough",
             prefix,
             filename,
@@ -959,6 +1115,10 @@ impl StorageBackend for FilesystemBackend {
                     continue;
                 }
 
+                if !Self::dir_has_visible_data_recursive(&entry.path()).await? {
+                    continue;
+                }
+
                 // Build user-visible common-prefix: dir_part + name + "/"
                 let cp = if dir_part.is_empty() {
                     format!("{}/", name)
@@ -1223,6 +1383,197 @@ mod tests {
             .join("real-bucket")
             .join("deltaspaces")
             .join("file.bin")
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn test_delete_delta_prunes_empty_nested_prefix_dirs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .expect("new backend");
+        backend.create_bucket("bucket").await.expect("create");
+
+        backend
+            .put_delta(
+                "bucket",
+                "a/b",
+                "file.bin",
+                b"delta",
+                &dummy_metadata("file.bin"),
+            )
+            .await
+            .expect("put delta");
+        backend
+            .delete_delta("bucket", "a/b", "file.bin")
+            .await
+            .expect("delete delta");
+
+        assert!(!tmp
+            .path()
+            .join("bucket")
+            .join("deltaspaces")
+            .join("a")
+            .exists());
+        assert!(tmp.path().join("bucket").join("deltaspaces").exists());
+    }
+
+    #[tokio::test]
+    async fn test_delete_reference_prunes_reference_only_prefix_dirs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .expect("new backend");
+        backend.create_bucket("bucket").await.expect("create");
+        let meta = FileMetadata::new_reference(
+            "reference.bin".into(),
+            "source.bin".into(),
+            "0".repeat(64),
+            "0".repeat(32),
+            3,
+            None,
+        );
+
+        backend
+            .put_reference("bucket", "only/ref", b"ref", &meta)
+            .await
+            .expect("put reference");
+        backend
+            .delete_reference("bucket", "only/ref")
+            .await
+            .expect("delete reference");
+
+        assert!(!tmp
+            .path()
+            .join("bucket")
+            .join("deltaspaces")
+            .join("only")
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn test_delegated_list_hides_empty_and_reference_only_prefixes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .expect("new backend");
+        backend.create_bucket("bucket").await.expect("create");
+        fs::create_dir_all(
+            tmp.path()
+                .join("bucket")
+                .join("deltaspaces")
+                .join("empty/child"),
+        )
+        .await
+        .expect("create empty prefix");
+        let meta = FileMetadata::new_reference(
+            "reference.bin".into(),
+            "source.bin".into(),
+            "0".repeat(64),
+            "0".repeat(32),
+            3,
+            None,
+        );
+        backend
+            .put_reference("bucket", "ghost", b"ref", &meta)
+            .await
+            .expect("put reference");
+
+        let listed = backend
+            .list_objects_delegated("bucket", "", "/", 100, None)
+            .await
+            .expect("list")
+            .expect("delegated");
+
+        assert!(listed.objects.is_empty());
+        assert!(listed.common_prefixes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_delete_bucket_removes_reference_only_and_empty_dirs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .expect("new backend");
+        backend.create_bucket("bucket").await.expect("create");
+        let meta = FileMetadata::new_reference(
+            "reference.bin".into(),
+            "source.bin".into(),
+            "0".repeat(64),
+            "0".repeat(32),
+            3,
+            None,
+        );
+        backend
+            .put_reference("bucket", "ghost", b"ref", &meta)
+            .await
+            .expect("put reference");
+        let hidden = tmp
+            .path()
+            .join("bucket")
+            .join("deltaspaces")
+            .join("ghost")
+            .join(".stale-write");
+        fs::write(hidden, b"tmp").await.expect("write hidden");
+        fs::create_dir_all(
+            tmp.path()
+                .join("bucket")
+                .join("deltaspaces")
+                .join("empty/child"),
+        )
+        .await
+        .expect("create empty prefix");
+
+        backend
+            .delete_bucket("bucket")
+            .await
+            .expect("delete bucket");
+        assert!(!tmp.path().join("bucket").exists());
+    }
+
+    #[tokio::test]
+    async fn test_delete_bucket_rejects_visible_data() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .expect("new backend");
+        backend.create_bucket("bucket").await.expect("create");
+        backend
+            .put_passthrough(
+                "bucket",
+                "visible",
+                "file.bin",
+                b"payload",
+                &dummy_metadata("file.bin"),
+            )
+            .await
+            .expect("put passthrough");
+        let meta = FileMetadata::new_reference(
+            "reference.bin".into(),
+            "source.bin".into(),
+            "0".repeat(64),
+            "0".repeat(32),
+            3,
+            None,
+        );
+        backend
+            .put_reference("bucket", "visible", b"ref", &meta)
+            .await
+            .expect("put reference");
+
+        let err = backend
+            .delete_bucket("bucket")
+            .await
+            .expect_err("non-empty bucket must be rejected");
+
+        assert!(matches!(err, StorageError::BucketNotEmpty(_)));
+        assert!(tmp.path().join("bucket").exists());
+        assert!(tmp
+            .path()
+            .join("bucket")
+            .join("deltaspaces")
+            .join("visible")
+            .join("reference.bin")
             .exists());
     }
 }

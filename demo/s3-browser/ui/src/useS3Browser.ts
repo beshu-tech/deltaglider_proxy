@@ -83,6 +83,9 @@ export default function useS3Browser() {
     // state that flashes before the real content appears.
     // DO NOT REMOVE: this prevents a race between reconnect() and Sidebar mount.
     if (!getBucket()) {
+      setLoading(false);
+      setRefreshing(false);
+      setConnected(true);
       return;
     }
     const seq = ++loadSeq.current;
@@ -343,7 +346,9 @@ export default function useS3Browser() {
     const currentPrefix = prefixRef.current;
     try {
       for (const file of Array.from(files)) {
-        const key = currentPrefix ? `${currentPrefix}${file.name}` : file.name;
+        const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
+        const cleanRelativePath = relativePath.replace(/^\/+/, '').replace(/\/{2,}/g, '/');
+        const key = currentPrefix ? `${currentPrefix}${cleanRelativePath}` : cleanRelativePath;
         await uploadObject(key, file);
       }
       setRefreshTrigger((k) => k + 1);

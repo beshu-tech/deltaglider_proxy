@@ -1,10 +1,14 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ExperimentOutlined, LoadingOutlined } from '@ant-design/icons';
 import { uploadObject } from '../s3client';
 import { useColors } from '../ThemeContext';
 
+const MENU_ICON_STYLE: React.CSSProperties = { fontSize: 14, width: 22, textAlign: 'center', display: 'inline-flex', justifyContent: 'center' };
+
 interface Props {
   onDone: () => void;
+  variant?: 'inline' | 'empty-state';
+  label?: string;
 }
 
 function generateBaseData(size: number): Uint8Array {
@@ -25,15 +29,23 @@ function mutateData(base: Uint8Array, version: number): Uint8Array {
   return copy;
 }
 
-export default function DemoDataGenerator({ onDone }: Props) {
+export default function DemoDataGenerator({ onDone, variant = 'inline', label = 'Demo Data' }: Props) {
   const [generating, setGenerating] = useState(false);
   const [progress, setProgress] = useState('');
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const generate = async () => {
     setGenerating(true);
     try {
       const base = generateBaseData(50_000);
       for (let v = 1; v <= 5; v++) {
+        if (!mountedRef.current) return;
         setProgress(`Uploading version ${v}/5...`);
         const data = mutateData(base, v);
         await uploadObject(
@@ -43,16 +55,19 @@ export default function DemoDataGenerator({ onDone }: Props) {
       }
       setProgress('Done!');
       onDone();
-      setTimeout(() => setProgress(''), 2000);
+      window.setTimeout(() => {
+        if (mountedRef.current) setProgress('');
+      }, 2000);
     } catch (e) {
-      setProgress('Error generating demo data');
+      if (mountedRef.current) setProgress('Error generating demo data');
       console.error(e);
     } finally {
-      setGenerating(false);
+      if (mountedRef.current) setGenerating(false);
     }
   };
 
-  const { TEXT_PRIMARY, TEXT_SECONDARY } = useColors();
+  const { TEXT_PRIMARY, TEXT_SECONDARY, ACCENT_BLUE } = useColors();
+  const isEmptyState = variant === 'empty-state';
 
   return (
     <div>
@@ -61,23 +76,27 @@ export default function DemoDataGenerator({ onDone }: Props) {
         onClick={generate}
         disabled={generating}
         style={{
-          gap: 8,
-          padding: '6px 6px',
-          color: TEXT_SECONDARY,
-          fontSize: 11,
-          width: '100%',
+          gap: isEmptyState ? 10 : 8,
+          padding: isEmptyState ? '4px 8px' : '6px 6px',
+          color: isEmptyState ? ACCENT_BLUE : TEXT_SECONDARY,
+          fontSize: isEmptyState ? 13 : 11,
+          fontWeight: isEmptyState ? 600 : 400,
+          width: isEmptyState ? 'auto' : '100%',
+          border: 'none',
+          borderRadius: isEmptyState ? 8 : undefined,
+          background: 'transparent',
           transition: 'color 0.15s',
           fontFamily: "var(--font-ui)",
-          opacity: generating ? 0.6 : 0.7,
+          opacity: generating ? 0.6 : (isEmptyState ? 1 : 0.7),
         }}
         onMouseEnter={(e) => { if (!generating) e.currentTarget.style.color = TEXT_PRIMARY; }}
-        onMouseLeave={(e) => { e.currentTarget.style.color = TEXT_SECONDARY; }}
+        onMouseLeave={(e) => { e.currentTarget.style.color = isEmptyState ? ACCENT_BLUE : TEXT_SECONDARY; }}
       >
         {generating
-          ? <LoadingOutlined aria-hidden="true" style={{ fontSize: 14, width: 22, textAlign: 'center', display: 'inline-flex', justifyContent: 'center' }} />
-          : <ExperimentOutlined aria-hidden="true" style={{ fontSize: 14, width: 22, textAlign: 'center', display: 'inline-flex', justifyContent: 'center' }} />
+          ? <LoadingOutlined aria-hidden="true" style={MENU_ICON_STYLE} />
+          : <ExperimentOutlined aria-hidden="true" style={MENU_ICON_STYLE} />
         }
-        <span>{progress || 'Demo Data'}</span>
+        <span>{progress || label}</span>
       </button>
     </div>
   );

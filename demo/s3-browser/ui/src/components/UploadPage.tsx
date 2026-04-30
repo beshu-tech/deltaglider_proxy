@@ -52,7 +52,7 @@ export default function UploadPage({ prefix, onBack, onDone }: Props) {
     const onDragLeave = (e: DragEvent) => {
       e.preventDefault();
       e.stopPropagation();
-      dragCount--;
+      dragCount = Math.max(0, dragCount - 1);
       if (dragCount === 0) setDragging(false);
     };
     const onDragOver = (e: DragEvent) => {
@@ -152,7 +152,10 @@ export default function UploadPage({ prefix, onBack, onDone }: Props) {
         title="Create folder"
         open={folderModalOpen}
         onOk={handleFolderConfirm}
-        onCancel={() => setFolderModalOpen(false)}
+        onCancel={() => {
+          setFolderModalOpen(false);
+          setFolderName('');
+        }}
         okText="Create"
       >
         <label htmlFor="new-folder-name" style={{ display: 'block', marginBottom: 8, fontSize: 13, color: TEXT_PRIMARY, fontFamily: "var(--font-ui)" }}>

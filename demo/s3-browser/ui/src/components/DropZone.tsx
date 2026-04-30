@@ -24,7 +24,7 @@ export default function DropZone({ onDrop, prefix }: Props) {
 
     const onDragLeave = (e: DragEvent) => {
       e.preventDefault();
-      dragCount--;
+      dragCount = Math.max(0, dragCount - 1);
       if (dragCount === 0) setDragging(false);
     };
 

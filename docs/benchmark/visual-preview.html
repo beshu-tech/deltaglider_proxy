@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Compression tax benchmark — visual preview</title>
+  <script>
+    (function () {
+      var t = localStorage.getItem("bench-preview-theme");
+      if (t === "dark" || (!t && matchMedia("(prefers-color-scheme: dark)").matches))
+        document.documentElement.dataset.theme = "dark";
+    })();
+  </script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: document.documentElement.dataset.theme === "dark" ? "dark" : "default",
+      securityLevel: "loose",
+      flowchart: { curve: "basis" },
+    });
+  </script>
+  <style>
+    :root {
+      --bg: #fafafa;
+      --fg: #111;
+      --card: #fff;
+      --border: #e5e5e5;
+    }
+    [data-theme="dark"] {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --card: #161b22;
+      --border: #30363d;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: ui-sans-serif, system-ui, sans-serif;
+      margin: 0;
+      padding: 1.5rem;
+      background: var(--bg);
+      color: var(--fg);
+      line-height: 1.5;
+      max-width: 960px;
+      margin-inline: auto;
+    }
+    h1 { font-size: 1.35rem; margin: 0 0 0.5rem; }
+    p.lead { opacity: 0.85; margin: 0 0 1.5rem; font-size: 0.95rem; }
+    section {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1rem 1.25rem 0.25rem;
+      margin-bottom: 1.25rem;
+    }
+    section h2 {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin: 0 0 0.75rem;
+      opacity: 0.7;
+    }
+    .mermaid { display: flex; justify-content: center; margin: 0.5rem 0 1rem; }
+    .toggle {
+      position: fixed;
+      top: 0.75rem;
+      right: 0.75rem;
+      font-size: 0.8rem;
+      padding: 0.35rem 0.65rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--card);
+      color: var(--fg);
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <button type="button" class="toggle" id="themeToggle" aria-label="Toggle theme">Theme</button>
+  <h1>Compression tax benchmark — visual drafts</h1>
+  <p class="lead">
+    Standalone preview for README-open ideas (four modes, cold/warm GET, relative slowdown, scope).
+    Serve this folder or open via <code>http://localhost</code> so Mermaid loads from CDN.
+  </p>
+
+  <section>
+    <h2>1 · Four modes, same dataset</h2>
+    <pre class="mermaid">
+flowchart LR
+  subgraph dataset["Same ISO set + prefix"]
+    A[Artifacts]
+  end
+  dataset --> P1[passthrough]
+  dataset --> P2[compression]
+  dataset --> P3[encryption]
+  dataset --> P4[compression + encryption]
+  P1 --> B1["Δ off · crypto off"]
+  P2 --> B2["xdelta3 · crypto off"]
+  P3 --> B3["Δ off · AES-GCM"]
+  P4 --> B4["xdelta3 · AES-GCM"]
+    </pre>
+  </section>
+
+  <section>
+    <h2>2 · What to measure (scorecard)</h2>
+    <pre class="mermaid">
+flowchart TB
+  subgraph put["PUT wall MB/s"]
+    Q1["Upload slowdown vs passthrough"]
+  end
+  subgraph get["GET"]
+    Q2["cold_get vs warm_get vs passthrough"]
+  end
+  subgraph res["Resources"]
+    Q3["CPU / RSS timeseries"]
+    Q4["Peak RSS vs largest artifact"]
+  end
+  put --> get
+  get --> res
+    </pre>
+  </section>
+
+  <section>
+    <h2>3 · Cold vs warm GET</h2>
+    <pre class="mermaid">
+flowchart LR
+  subgraph cold["Cold GET"]
+    C1[Client] -->|HTTPS| C2[Proxy]
+    C2 --> C3[Backend]
+    C2 -.-> C4["Metadata / reconstruct path cold"]
+  end
+  subgraph warm["Warm GET"]
+    W1[Client] -->|HTTPS| W2[Proxy]
+    W2 --> W3[Backend]
+    W2 -.-> W4["Hot caches / repeat path"]
+  end
+    </pre>
+  </section>
+
+  <section>
+    <h2>4 · Relative slowdown intuition</h2>
+    <pre class="mermaid">
+flowchart LR
+  subgraph bars["Wall MB/s — same phase"]
+    direction TB
+    PT["Passthrough bar — baseline 100%"]
+    MD["Mode bar — shorter = slower effective throughput"]
+  end
+  FORM["tax % = 100 × (1 − mode/passthrough)"] --> bars
+    </pre>
+  </section>
+
+  <section>
+    <h2>5 · Scope boundary</h2>
+    <pre class="mermaid">
+flowchart TB
+  IN["Default run: concurrency 1 · four modes · same backend"]
+  OPT["Opt-in: concurrency sweeps · multi-trial stats · load tests"]
+  IN --- OUT{{"Out of scope unless you opt in"}}
+  OPT --- OUT
+    </pre>
+  </section>
+
+  <script type="module">
+    document.getElementById("themeToggle").addEventListener("click", () => {
+      const dark = document.documentElement.dataset.theme === "dark";
+      localStorage.setItem("bench-preview-theme", dark ? "light" : "dark");
+      location.reload();
+    });
+  </script>
+</body>
+</html>

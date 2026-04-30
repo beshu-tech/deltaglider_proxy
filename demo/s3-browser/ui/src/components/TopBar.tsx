@@ -1,9 +1,9 @@
 import { useRef, useState, useEffect } from 'react';
 import { Layout, Space, Button, Input, theme } from 'antd';
 import type { InputRef } from 'antd';
-import { MenuOutlined, SearchOutlined, CloseOutlined, ReloadOutlined, SunOutlined, MoonOutlined, EyeOutlined, EyeInvisibleOutlined } from '@ant-design/icons';
+import { MenuOutlined, SearchOutlined, CloseOutlined, ReloadOutlined } from '@ant-design/icons';
 import Breadcrumb from './Breadcrumb';
-import { useColors, useTheme } from '../ThemeContext';
+import { useColors } from '../ThemeContext';
 
 const { Header } = Layout;
 
@@ -16,8 +16,8 @@ interface Props {
   searchQuery: string;
   onSearchChange: (query: string) => void;
   refreshing: boolean;
-  showHidden: boolean;
-  onToggleHidden: () => void;
+  canRefresh?: boolean;
+  accountMenu?: React.ReactNode;
 }
 
 function SearchInput({
@@ -71,10 +71,9 @@ function SearchInput({
   );
 }
 
-export default function TopBar({ prefix, onNavigate, isMobile, onMenuClick, onRefresh, searchQuery, onSearchChange, refreshing, showHidden, onToggleHidden }: Props) {
+export default function TopBar({ prefix, onNavigate, isMobile, onMenuClick, onRefresh, searchQuery, onSearchChange, refreshing, canRefresh = true, accountMenu }: Props) {
   const { token } = theme.useToken();
   const { ACCENT_BLUE, TEXT_MUTED, BORDER } = useColors();
-  const { isDark, toggleTheme } = useTheme();
   const [searchOpen, setSearchOpen] = useState(false);
   const inputRef = useRef<InputRef>(null);
 
@@ -146,35 +145,18 @@ export default function TopBar({ prefix, onNavigate, isMobile, onMenuClick, onRe
               onClick={() => setSearchOpen(!searchOpen)}
             />
         )}
-        <Button
-          type="text"
-          icon={showHidden ? <EyeOutlined /> : <EyeInvisibleOutlined />}
-          size="small"
-          title={showHidden ? 'Hide system files' : 'Show system files'}
-          onClick={onToggleHidden}
-          aria-label={showHidden ? 'Hide system files' : 'Show system files'}
-          style={{ color: showHidden ? ACCENT_BLUE : TEXT_MUTED, transition: 'color 0.15s' }}
-        />
-        {/* Divider between view toggles and utility actions */}
-        <div style={{ width: 1, height: 20, background: BORDER, margin: '0 4px', flexShrink: 0 }} />
-        <Button
-          type="text"
-          icon={<ReloadOutlined spin={refreshing} />}
-          size="small"
-          title="Refresh"
-          onClick={onRefresh}
-          aria-label="Refresh object list"
-          style={{ color: TEXT_MUTED, transition: 'color 0.15s' }}
-        />
-        <Button
-          type="text"
-          icon={isDark ? <MoonOutlined /> : <SunOutlined />}
-          size="small"
-          title={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
-          onClick={toggleTheme}
-          aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
-          style={{ color: TEXT_MUTED, transition: 'color 0.15s' }}
-        />
+        {canRefresh && (
+          <Button
+            type="text"
+            icon={<ReloadOutlined spin={refreshing} />}
+            size="small"
+            title="Refresh"
+            onClick={onRefresh}
+            aria-label="Refresh object list"
+            style={{ color: TEXT_MUTED, transition: 'color 0.15s' }}
+          />
+        )}
+        {accountMenu}
       </Space>
     </Header>
   );

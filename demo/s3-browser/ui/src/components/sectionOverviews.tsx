@@ -428,7 +428,7 @@ function LoadingShell() {
         justifyContent: 'center',
       }}
     >
-      <Spin tip="Loading..." />
+      <Spin description="Loading..." />
     </div>
   );
 }

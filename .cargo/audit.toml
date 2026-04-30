@@ -25,6 +25,10 @@ ignore = [
     # Upstream needs to migrate to rustls-pki-types PemObject.
     "RUSTSEC-2025-0134",
 
+    # core2 0.4.0: unmaintained + yanked; transitive rust-embed → include-flate → libflate.
+    # Build-time embedded UI assets only; no rust-embed release dropping libflate/core2 yet (2026-04).
+    "RUSTSEC-2026-0105",
+
     # rand 0.8.5 / 0.9.2 (unsound): custom-logger + `rand::rng()` interaction.
     # We never set a custom global logger, so the unsoundness can't be
     # triggered. Waiting for rand 0.9.3+.

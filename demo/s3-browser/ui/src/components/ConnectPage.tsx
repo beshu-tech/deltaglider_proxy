@@ -131,8 +131,9 @@ export default function ConnectPage({ onConnect, showError }: Props) {
         setBucket(result.buckets[0]);
       }
 
-      // Try to establish admin session (best-effort — only succeeds for admin users)
-      loginAs(accessKey, secretKey).catch(() => {});
+      // Try to establish admin session (best-effort — only succeeds for admin users).
+      // Await it so App's immediate whoami fetch doesn't race the session cookie.
+      await loginAs(accessKey, secretKey).catch(() => null);
 
       onConnect();
     } catch (e) {

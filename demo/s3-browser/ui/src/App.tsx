@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { Layout, Spin, Empty, Grid } from 'antd';
+import { Layout, Spin, Empty, Grid, Button, Space } from 'antd';
 import useS3Browser from './useS3Browser';
 import TopBar from './components/TopBar';
 import BulkActionBar from './components/BulkActionBar';
@@ -13,12 +13,15 @@ import UploadPage from './components/UploadPage';
 import ConnectPage from './components/ConnectPage';
 import MetricsPage from './components/MetricsPage';
 import DocsPage from './components/DocsPage';
+import AccountMenu from './components/AccountMenu';
+import DemoDataGenerator from './components/DemoDataGenerator';
 import { getBucket, hasCredentials, disconnect, initFromSession, getCredentials } from './s3client';
 import { adminLogout, whoami, checkSession } from './adminApi';
 import type { WhoamiResponse } from './adminApi';
 import { useColors } from './ThemeContext';
 import useComputeSize from './useComputeSize';
 import { NavigationContext } from './NavigationContext';
+import { canUse } from './permissions';
 
 const { Content } = Layout;
 const { useBreakpoint } = Grid;
@@ -112,6 +115,8 @@ export default function App() {
   const [firstLoadDone, setFirstLoadDone] = useState(false);
   const [previewObject, setPreviewObject] = useState<import('./types').S3Object | null>(null);
   const [identity, setIdentity] = useState<WhoamiResponse | null>(null);
+  const [bucketCount, setBucketCount] = useState<number | null>(null);
+  const [createBucketFocusSignal, setCreateBucketFocusSignal] = useState(0);
 
   const [hasAdminSession, setHasAdminSession] = useState(false);
   const s3 = useS3Browser();
@@ -138,8 +143,14 @@ export default function App() {
   // and fetch identity. Runs AFTER React commits the needsConnect state.
   useEffect(() => {
     if (!needsConnect && !sessionLoading) {
+      let cancelled = false;
       reconnectS3();
-      whoami().then(setIdentity);
+      whoami().then((nextIdentity) => {
+        if (!cancelled) setIdentity(nextIdentity);
+      });
+      return () => {
+        cancelled = true;
+      };
     } else if (needsConnect) {
       setIdentity(null);
       setHasAdminSession(false);
@@ -201,7 +212,58 @@ export default function App() {
   }, [changeS3Bucket, navigate]);
 
   const isEmpty = s3.objects.length === 0 && s3.folders.length === 0;
-  const isRootBucketEmpty = s3.prefix === '' && !s3.searchQuery && isEmpty && !s3.loading;
+  const hasBuckets = (bucketCount ?? 0) > 0;
+  const hasNoBuckets = bucketCount === 0;
+  const isRootBucketEmpty = hasBuckets && s3.prefix === '' && !s3.searchQuery && isEmpty && !s3.loading;
+  const activeBucket = getBucket();
+  const currentAccessKey = getCredentials().accessKeyId || undefined;
+  // A session can also belong to a non-admin external SSO user. Only
+  // show Settings after whoami resolves admin/open/bootstrap authority.
+  const canAdmin = identity?.mode === 'bootstrap' || identity?.mode === 'open' || identity?.user?.is_admin === true;
+  const canCreateBucket = canUse(identity, 'admin');
+  const canWriteActiveBucket = Boolean(activeBucket) && canUse(identity, 'write', activeBucket, s3.prefix);
+  const selectedKeys = Array.from(s3.selectedKeys);
+  const canReadSelected = Boolean(activeBucket) && selectedKeys.length > 0 && selectedKeys.every((selectedKey) =>
+    selectedKey.startsWith('folder:')
+      ? canUse(identity, 'read', activeBucket, selectedKey.slice('folder:'.length))
+      : canUse(identity, 'read', activeBucket, selectedKey)
+  );
+  const canDeleteSelected = Boolean(activeBucket) && selectedKeys.length > 0 && selectedKeys.every((selectedKey) =>
+    selectedKey.startsWith('folder:')
+      ? canUse(identity, 'delete', activeBucket, selectedKey.slice('folder:'.length))
+      : canUse(identity, 'delete', activeBucket, selectedKey)
+  );
+  const canReadSelectedObject = Boolean(activeBucket && s3.selected) && canUse(identity, 'read', activeBucket, s3.selected?.key ?? '');
+  const canDeleteSelectedObject = Boolean(activeBucket && s3.selected) && canUse(identity, 'delete', activeBucket, s3.selected?.key ?? '');
+  const canCopyFromActiveBucket = canReadSelected && canWriteActiveBucket;
+  const canMoveFromActiveBucket = canCopyFromActiveBucket && canDeleteSelected;
+  const canReadActiveBucket = !activeBucket || canUse(identity, 'read', activeBucket) || canUse(identity, 'list', activeBucket);
+  const accountMenu = (includeBrowserToggles = false) => (
+    <AccountMenu
+      identityLabel={identity?.user?.name || currentAccessKey || 'user'}
+      canAdmin={canAdmin}
+      onBrowserClick={() => navigate('browse')}
+      onSettingsClick={() => navigate('admin')}
+      onDocsClick={() => navigate('docs')}
+      onLogout={handleLogout}
+      showHidden={includeBrowserToggles ? s3.showHidden : undefined}
+      onToggleHidden={includeBrowserToggles ? () => s3.setShowHidden(!s3.showHidden) : undefined}
+      placement="down"
+      compact
+      avatarOnly
+    />
+  );
+  const requestCreateBucket = () => {
+    if (!canCreateBucket) return;
+    navigate('browse');
+    setSiderOpen(true);
+    setCreateBucketFocusSignal((n) => n + 1);
+  };
+  const openUpload = () => {
+    if (!canWriteActiveBucket) return;
+    navigate('upload');
+    setSiderOpen(false);
+  };
 
   // Stable context value so consumers of `useNavigation()` (AdminPage,
   // Sidebar, TopBar) don't re-render on every App render. Previously
@@ -219,7 +281,7 @@ export default function App() {
   if (sessionLoading) {
     return (
       <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh' }}>
-        <Spin size="large" tip="Restoring session..." />
+        <Spin size="large" description="Restoring session..." />
       </div>
     );
   }
@@ -227,7 +289,7 @@ export default function App() {
   if (needsConnect) {
     return (
       <ConnectPage
-        onConnect={() => { setNeedsConnect(false); s3.reconnect(); }}
+        onConnect={() => setNeedsConnect(false)}
         showError={hasCredentials()}
       />
     );
@@ -240,6 +302,7 @@ export default function App() {
           onBack={navigateToBrowse}
           onSessionExpired={navigateToBrowse}
           subPath={subPath}
+          accountMenu={accountMenu()}
         />
       );
     }
@@ -249,10 +312,18 @@ export default function App() {
     }
 
     if (view === 'docs') {
-      return <DocsPage onBack={navigateToBrowse} docId={subPath || undefined} />;
+      return <DocsPage onBack={navigateToBrowse} docId={subPath || undefined} accountMenu={accountMenu()} />;
     }
 
     if (view === 'upload') {
+      if (!canWriteActiveBucket) {
+        return (
+          <Empty
+            description="You do not have permission to upload to this bucket."
+            style={{ padding: '64px 0' }}
+          />
+        );
+      }
       return (
         <UploadPage
           prefix={s3.prefix}
@@ -267,10 +338,10 @@ export default function App() {
         {s3.selectedKeys.size > 0 && (
           <BulkActionBar
             selectedCount={s3.selectedKeys.size}
-            onDelete={s3.bulkDelete}
-            onCopy={s3.bulkCopy}
-            onMove={s3.bulkMove}
-            onDownloadZip={s3.downloadZip}
+            onDelete={canDeleteSelected ? s3.bulkDelete : undefined}
+            onCopy={canCopyFromActiveBucket ? s3.bulkCopy : undefined}
+            onMove={canMoveFromActiveBucket ? s3.bulkMove : undefined}
+            onDownloadZip={canReadSelected ? s3.downloadZip : undefined}
             deleting={s3.deleting}
           />
         )}
@@ -285,12 +356,32 @@ export default function App() {
               description={
                 s3.searchQuery
                   ? `No results for "${s3.searchQuery}"`
-                  : s3.prefix
-                    ? 'This folder is empty.'
-                    : 'No objects yet. Upload files or generate demo data.'
+                  : hasNoBuckets
+                    ? 'Create a bucket before uploading objects or generating demo data.'
+                    : s3.prefix
+                      ? 'This folder is empty.'
+                      : 'No objects yet. Upload files or generate demo data.'
               }
               style={{ padding: '64px 0' }}
-            />
+            >
+              {hasNoBuckets && canCreateBucket && (
+                <Button type="link" onClick={requestCreateBucket} style={{ paddingInline: 0 }}>
+                  Create a bucket
+                </Button>
+              )}
+              {isRootBucketEmpty && canWriteActiveBucket && (
+                <Space direction="vertical" size={4} align="center">
+                  <DemoDataGenerator
+                    onDone={s3.mutate}
+                    variant="empty-state"
+                    label={`Add demo data to ${activeBucket}`}
+                  />
+                  <Button type="link" onClick={openUpload} style={{ paddingInline: 0 }}>
+                    Upload from computer
+                  </Button>
+                </Space>
+              )}
+            </Empty>
           ) : (
             <ObjectTable
               objects={s3.objects}
@@ -330,27 +421,17 @@ export default function App() {
       <Layout style={{ flexDirection: 'row', flex: 1 }}>
         {!FULLSCREEN_VIEWS.has(view) && (
           <Sidebar
-            onUploadClick={() => { navigate('upload'); setSiderOpen(false); }}
-            onMutate={s3.mutate}
-            refreshTrigger={s3.refreshTrigger}
+            onUploadClick={openUpload}
             onBucketChange={handleBucketChange}
+            onBucketsChanged={setBucketCount}
+            createBucketFocusSignal={createBucketFocusSignal}
+            canCreateBucket={canCreateBucket}
+            canDeleteBucket={(bucket) => canUse(identity, 'admin', bucket)}
+            canUpload={canWriteActiveBucket}
             open={siderOpen}
             onClose={() => setSiderOpen(false)}
             isMobile={isMobile}
-            onSettingsClick={() => {
-              navigate('admin');
-              setSiderOpen(false);
-            }}
-            onDocsClick={() => {
-              navigate('docs');
-              setSiderOpen(false);
-            }}
-            onLogout={handleLogout}
-            currentUser={getCredentials().accessKeyId || undefined}
-            displayName={identity?.user?.name || undefined}
-            canAdmin={identity?.mode === 'bootstrap' || identity?.mode === 'open' || identity?.user?.is_admin === true || hasAdminSession}
             proxyVersion={identity?.version}
-            showDemoData={isRootBucketEmpty}
           />
         )}
 
@@ -362,11 +443,11 @@ export default function App() {
               isMobile={isMobile}
               onMenuClick={() => setSiderOpen(true)}
               onRefresh={s3.mutate}
+              canRefresh={canReadActiveBucket}
               searchQuery={s3.searchQuery}
               onSearchChange={s3.setSearchQuery}
               refreshing={s3.refreshing}
-              showHidden={s3.showHidden}
-              onToggleHidden={() => s3.setShowHidden(!s3.showHidden)}
+              accountMenu={accountMenu(true)}
             />
           )}
 
@@ -385,6 +466,8 @@ export default function App() {
         onPreview={setPreviewObject}
         isMobile={isMobile}
         headCache={s3.headCache}
+        canDelete={canDeleteSelectedObject}
+        canRead={canReadSelectedObject}
       />
 
       <FilePreview
@@ -392,7 +475,7 @@ export default function App() {
         object={previewObject}
         onClose={() => setPreviewObject(null)}
       />
-      {view === 'browser' && <DropZone onDrop={s3.uploadFiles} prefix={s3.prefix} />}
+      {view === 'browser' && canWriteActiveBucket && <DropZone onDrop={s3.uploadFiles} prefix={s3.prefix} />}
     </Layout>
     </NavigationContext.Provider>
   );

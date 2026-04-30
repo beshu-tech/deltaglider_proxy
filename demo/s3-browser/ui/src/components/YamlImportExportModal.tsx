@@ -58,6 +58,7 @@ export function YamlImportExportModal({ open, mode, onClose, onApplied }: YamlMo
   // Reset state whenever the modal opens or the mode changes.
   useEffect(() => {
     if (!open) return;
+    let cancelled = false;
     setError(null);
     setWarnings([]);
     setCopied(false);
@@ -67,16 +68,21 @@ export function YamlImportExportModal({ open, mode, onClose, onApplied }: YamlMo
       setLoading(true);
       exportConfigYaml()
         .then((text) => {
+          if (cancelled) return;
           setYaml(text);
           setLoading(false);
         })
         .catch((e) => {
+          if (cancelled) return;
           setError(e instanceof Error ? e.message : String(e));
           setLoading(false);
         });
     } else {
       setYaml('');
     }
+    return () => {
+      cancelled = true;
+    };
   }, [open, mode]);
 
   const handleCopy = useCallback(async () => {
