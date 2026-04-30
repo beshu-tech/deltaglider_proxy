@@ -583,8 +583,20 @@ mod tests {
         let ror_ctx = Context::new().with_string("s3:prefix", "ror/");
         let denied_ctx = Context::new().with_string("s3:prefix", "private/");
 
-        assert!(evaluate_iam(&policies, S3Action::List, "beshu", "", &root_ctx));
-        assert!(evaluate_iam(&policies, S3Action::List, "beshu", "", &ror_ctx));
+        assert!(evaluate_iam(
+            &policies,
+            S3Action::List,
+            "beshu",
+            "",
+            &root_ctx
+        ));
+        assert!(evaluate_iam(
+            &policies,
+            S3Action::List,
+            "beshu",
+            "",
+            &ror_ctx
+        ));
         assert!(!evaluate_iam(
             &policies,
             S3Action::List,

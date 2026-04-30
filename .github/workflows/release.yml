@@ -24,17 +24,96 @@ env:
 
 jobs:
   # ── Job 1: CI Gate ──────────────────────────────────────────────────
-  ci:
-    name: CI Gate
-    uses: ./.github/workflows/ci.yml
+  # Tags are usually pushed for the same merge commit that just triggered
+  # `CI` on main. Do not call the reusable CI workflow here, or the tag
+  # release burns the full fmt/clippy/test/docs suite a second time.
+  # Instead, wait for the existing CI run on the tagged commit to pass.
+  verify-ci:
+    name: Verify tagged commit passed CI
+    runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: read
-      packages: read
+    outputs:
+      tagged_sha: ${{ steps.resolve.outputs.tagged_sha }}
+      ci_run_url: ${{ steps.wait.outputs.ci_run_url }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag target
+        id: resolve
+        run: |
+          set -euo pipefail
+          tagged_sha="$(git rev-list -n 1 "refs/tags/${GITHUB_REF_NAME}")"
+          if [ -z "$tagged_sha" ]; then
+            echo "::error::failed to resolve ${GITHUB_REF_NAME} to a commit"
+            exit 1
+          fi
+          echo "Tagged commit: $tagged_sha"
+          echo "tagged_sha=$tagged_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for existing CI on tagged commit
+        id: wait
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAGGED_SHA: ${{ steps.resolve.outputs.tagged_sha }}
+        run: |
+          set -euo pipefail
+
+          url="${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${TAGGED_SHA}&per_page=20"
+          deadline=$((SECONDS + 2700)) # 45 minutes: longer than the current CI timeout budget.
+
+          while true; do
+            runs_json="$(curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$url")"
+
+            success_url="$(jq -r '
+              .workflow_runs
+              | map(select(.status == "completed" and .conclusion == "success"))
+              | sort_by(.created_at)
+              | last
+              | .html_url // empty
+            ' <<< "$runs_json")"
+
+            if [ -n "$success_url" ]; then
+              echo "CI already passed for ${TAGGED_SHA}: ${success_url}"
+              echo "ci_run_url=${success_url}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            active_count="$(jq '[.workflow_runs[] | select(.status != "completed")] | length' <<< "$runs_json")"
+            failed_count="$(jq '[.workflow_runs[] | select(.status == "completed" and (.conclusion | IN("failure", "cancelled", "timed_out", "action_required")))] | length' <<< "$runs_json")"
+            total_count="$(jq '.workflow_runs | length' <<< "$runs_json")"
+
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::timed out waiting for CI to pass on ${TAGGED_SHA}"
+              echo "::error::found ${total_count} CI run(s), ${active_count} active, ${failed_count} failed/cancelled/timed out, 0 successful"
+              exit 1
+            fi
+
+            if [ "$active_count" -eq 0 ] && [ "$failed_count" -gt 0 ]; then
+              echo "::error::CI has no successful run for ${TAGGED_SHA}; latest matching runs are failed/cancelled/timed out"
+              jq -r '.workflow_runs[] | "- \(.status) / \(.conclusion // "n/a"): \(.html_url)"' <<< "$runs_json"
+              exit 1
+            fi
+
+            if [ "$total_count" -eq 0 ]; then
+              echo "No CI run for ${TAGGED_SHA} yet; waiting..."
+            else
+              echo "Waiting for CI on ${TAGGED_SHA}: ${active_count} active, ${failed_count} failed/cancelled/timed out, 0 successful"
+            fi
+            sleep 30
+          done
 
   # ── Job 2: Validate ─────────────────────────────────────────────────
   validate:
     name: Validate Release
-    needs: ci
+    needs: verify-ci
     runs-on: k3s
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
@@ -88,11 +167,11 @@ jobs:
         run: cargo check
 
   # ── Job 3a: Build Linux x86_64 (self-hosted, builder image) ────────
-  # Depends on ci (not validate) — builds start as soon as CI passes.
+  # Depends on verify-ci (not validate) — builds start as soon as CI passes.
   # validate runs in parallel as a sanity check; finalize waits for both.
   build-linux-x86_64:
     name: Build x86_64-unknown-linux-gnu
-    needs: ci
+    needs: verify-ci
     runs-on: k3s
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
@@ -133,7 +212,7 @@ jobs:
   # ── Job 3b: Build non-x86_64 targets (GitHub-hosted runners) ───────
   build-other:
     name: Build ${{ matrix.target }}
-    needs: ci
+    needs: verify-ci
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -205,7 +284,7 @@ jobs:
   # This cuts ARM64 build time from ~40min (QEMU) to ~6min (native).
   docker-build:
     name: Docker ${{ matrix.platform }}
-    needs: ci
+    needs: verify-ci
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
