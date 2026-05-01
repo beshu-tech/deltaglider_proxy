@@ -30,8 +30,8 @@
 //! ## Import shape
 //!
 //! `POST /_/api/admin/backup` sniffs `Content-Type`:
-//!   - `application/zip`  → unpacks + applies all four parts
-//!     atomically (IAM first, then YAML merge-patch, then secrets).
+//!   - `application/zip`  → unpacks + applies parts according to
+//!     `?mode=full|iam-only|config-only` (`full` is the default).
 //!   - `application/json` → today's IAM-only flow (unchanged).
 
 use axum::body::Bytes;
@@ -40,14 +40,215 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::io::{Cursor, Write};
 use std::sync::Arc;
 
+use crate::config::{BackendConfig, Config};
 use crate::config_db::auth_providers::{AuthProviderConfig, ExternalIdentity, GroupMappingRule};
 use crate::iam::{normalize_permissions, validate_permissions, Permission};
 
 use super::users::rebuild_iam_index;
 use super::{audit_log, trigger_config_sync, AdminState};
+
+#[derive(Serialize)]
+struct ImportErrorBody {
+    error: String,
+    stage: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream_status: Option<u16>,
+}
+
+pub struct BackupImportError {
+    status: StatusCode,
+    stage: String,
+    context: Option<String>,
+    detail: Option<String>,
+    upstream_status: Option<u16>,
+}
+
+struct BackupSecretApplyError {
+    status: StatusCode,
+    detail: String,
+}
+
+impl BackupSecretApplyError {
+    fn new(status: StatusCode, detail: impl Into<String>) -> Self {
+        Self {
+            status,
+            detail: sanitize_error_detail(detail.into()),
+        }
+    }
+
+    fn conflict(detail: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, detail)
+    }
+}
+
+/// Query params for `POST /_/api/admin/backup`.
+#[derive(Deserialize, Default)]
+pub struct ImportQuery {
+    #[serde(default)]
+    mode: ImportMode,
+}
+
+/// Explicit restore scope for zip imports.
+///
+/// `full` remains the default and still means "restore config + secrets + IAM,
+/// including bootstrap password hash when compatible". `preserve-bootstrap`
+/// is the prod-to-local/test path: restore everything except the local admin
+/// password / SQLCipher key material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+enum ImportMode {
+    #[default]
+    Full,
+    /// Restore config + secrets + IAM, but keep local bootstrap_password_hash.
+    PreserveBootstrap,
+    /// Restore IAM/OAuth only; leave config and secrets untouched.
+    IamOnly,
+    ConfigOnly,
+}
+
+impl ImportMode {
+    fn restores_config(self) -> bool {
+        matches!(
+            self,
+            ImportMode::Full | ImportMode::PreserveBootstrap | ImportMode::ConfigOnly
+        )
+    }
+
+    fn restores_iam(self) -> bool {
+        matches!(
+            self,
+            ImportMode::Full | ImportMode::PreserveBootstrap | ImportMode::IamOnly
+        )
+    }
+
+    fn restores_bootstrap(self) -> bool {
+        matches!(self, ImportMode::Full | ImportMode::ConfigOnly)
+    }
+}
+
+impl BackupImportError {
+    fn new(
+        status: StatusCode,
+        stage: impl Into<String>,
+        context: impl Into<Option<String>>,
+        detail: impl Into<Option<String>>,
+    ) -> Self {
+        Self {
+            status,
+            stage: stage.into(),
+            context: context.into(),
+            detail: detail.into().map(sanitize_error_detail),
+            upstream_status: None,
+        }
+    }
+
+    fn with_upstream_status(mut self, upstream_status: StatusCode) -> Self {
+        self.upstream_status = Some(upstream_status.as_u16());
+        self
+    }
+
+    fn message(&self) -> String {
+        match (&self.context, &self.detail) {
+            (Some(context), Some(detail)) => format!("{}: {}: {}", self.stage, context, detail),
+            (Some(context), None) => format!("{}: {}", self.stage, context),
+            (None, Some(detail)) => format!("{}: {}", self.stage, detail),
+            (None, None) => self.stage.clone(),
+        }
+    }
+}
+
+impl From<StatusCode> for BackupImportError {
+    fn from(status: StatusCode) -> Self {
+        Self::new(
+            status,
+            "backup_import",
+            None,
+            Some(
+                status
+                    .canonical_reason()
+                    .unwrap_or("backup import failed")
+                    .to_string(),
+            ),
+        )
+    }
+}
+
+impl IntoResponse for BackupImportError {
+    fn into_response(self) -> Response {
+        let body = ImportErrorBody {
+            error: self.message(),
+            stage: self.stage,
+            context: self.context,
+            detail: self.detail,
+            upstream_status: self.upstream_status,
+        };
+        (self.status, Json(body)).into_response()
+    }
+}
+
+fn sanitize_error_detail(detail: impl AsRef<str>) -> String {
+    detail
+        .as_ref()
+        .chars()
+        .map(|c| {
+            if c.is_control() && !c.is_whitespace() {
+                ' '
+            } else {
+                c
+            }
+        })
+        .take(1000)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn import_fail(
+    status: StatusCode,
+    stage: &'static str,
+    context: impl Into<String>,
+    detail: impl Into<String>,
+) -> BackupImportError {
+    let context = context.into();
+    let detail = sanitize_error_detail(detail.into());
+    tracing::warn!(
+        stage,
+        context = %context,
+        status = status.as_u16(),
+        detail = %detail,
+        "backup import stage failed"
+    );
+    BackupImportError::new(status, stage, Some(context), Some(detail))
+}
+
+fn config_apply_error_detail(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body).trim().to_string();
+    if text.is_empty() {
+        return "config apply failed without a response body".to_string();
+    }
+
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.as_str())
+                .map(str::to_string)
+                .or_else(|| {
+                    v.get("message")
+                        .and_then(|e| e.as_str())
+                        .map(str::to_string)
+                })
+        })
+        .unwrap_or(text)
+}
 
 /// Hex-encoded SHA-256 of a byte slice. Used in three places in this
 /// module (manifest write on export, manifest verify on import) so
@@ -158,6 +359,10 @@ struct BackupSecrets {
     /// have no secrets to restore).
     #[serde(skip_serializing_if = "Option::is_none")]
     storage: Option<SecretsStorage>,
+    /// Named S3 backend credentials, keyed by backend name. Added after
+    /// multi-backend routing shipped; old backups only have `storage`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    storage_backends: BTreeMap<String, SecretsStorage>,
     /// Per-OAuth-provider client secret, keyed by provider `name`.
     /// The IAM JSON already carries these too, but we duplicate them
     /// here so the import flow can skip the IAM file (e.g. to re-seed
@@ -299,6 +504,7 @@ async fn export_zip(
             bootstrap_password_hash: cfg.bootstrap_password_hash.clone(),
             access: None,
             storage: None,
+            storage_backends: Default::default(),
             oauth_client_secrets: Default::default(),
         };
         // Access-section bootstrap SigV4 pair.
@@ -321,6 +527,24 @@ async fn export_zip(
                     access_key_id: access_key_id.clone(),
                     secret_access_key: secret_access_key.clone(),
                 });
+            }
+        }
+        for named in &cfg.backends {
+            if let crate::config::BackendConfig::S3 {
+                access_key_id,
+                secret_access_key,
+                ..
+            } = &named.backend
+            {
+                if access_key_id.is_some() || secret_access_key.is_some() {
+                    s.storage_backends.insert(
+                        named.name.clone(),
+                        SecretsStorage {
+                            access_key_id: access_key_id.clone(),
+                            secret_access_key: secret_access_key.clone(),
+                        },
+                    );
+                }
             }
         }
         // OAuth client secrets (indexed by provider name, not id, so
@@ -426,9 +650,10 @@ async fn export_zip(
 ///     legacy IAM-only flow (same shape as v0.8.0).
 pub async fn import_backup(
     State(state): State<Arc<AdminState>>,
+    Query(query): Query<ImportQuery>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<ImportResult>, StatusCode> {
+) -> Result<Json<ImportResult>, BackupImportError> {
     let ct = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -440,15 +665,41 @@ pub async fn import_backup(
         .to_ascii_lowercase();
 
     if ct == "application/zip" || ct == "application/x-zip-compressed" {
-        return import_zip_full_backup(state, headers, body).await;
+        return import_zip_full_backup(state, headers, body, query.mode).await;
+    }
+
+    if query.mode == ImportMode::ConfigOnly {
+        return Err(import_fail(
+            StatusCode::BAD_REQUEST,
+            "parse_legacy_json",
+            "mode=config-only",
+            "legacy JSON backups only contain IAM data; upload a zip backup for config restore",
+        ));
     }
 
     // Legacy JSON body — deserialise then run the existing flow.
     let backup: IamBackup = serde_json::from_slice(&body).map_err(|e| {
         tracing::warn!("import_backup: malformed JSON body: {}", e);
-        StatusCode::BAD_REQUEST
+        import_fail(
+            StatusCode::BAD_REQUEST,
+            "parse_legacy_json",
+            "request body",
+            format!("malformed IAM backup JSON: {e}"),
+        )
     })?;
-    import_backup_iam(state, headers, backup).await
+    import_backup_iam(state, headers, backup)
+        .await
+        .map_err(|status| {
+            import_fail(
+                status,
+                "restore_iam",
+                "legacy JSON backup",
+                status
+                    .canonical_reason()
+                    .unwrap_or("IAM backup import failed")
+                    .to_string(),
+            )
+        })
 }
 
 /// Per-entry cap for zip unpack. 8 MiB is generous for the three
@@ -457,6 +708,91 @@ pub async fn import_backup(
 /// See x-ray MED #1 — unbounded `Vec::with_capacity(f.size())`
 /// was an easy OOM vector for a single crafted entry.
 const MAX_ENTRY_BYTES: u64 = 8 * 1024 * 1024;
+
+fn hydrate_s3_backend_credentials(backend: &mut BackendConfig, secrets: &SecretsStorage) {
+    if let BackendConfig::S3 {
+        access_key_id,
+        secret_access_key,
+        ..
+    } = backend
+    {
+        if let Some(ak) = &secrets.access_key_id {
+            *access_key_id = Some(ak.clone());
+        }
+        if let Some(sk) = &secrets.secret_access_key {
+            *secret_access_key = Some(sk.clone());
+        }
+    }
+}
+
+fn hydrate_config_with_backup_secrets(cfg: &mut Config, secrets: &BackupSecrets) {
+    if let Some(a) = &secrets.access {
+        if let Some(ak) = &a.access_key_id {
+            cfg.access_key_id = Some(ak.clone());
+        }
+        if let Some(sk) = &a.secret_access_key {
+            cfg.secret_access_key = Some(sk.clone());
+        }
+    }
+
+    if let Some(s) = &secrets.storage {
+        hydrate_s3_backend_credentials(&mut cfg.backend, s);
+    }
+
+    for named in &mut cfg.backends {
+        if let Some(s) = secrets.storage_backends.get(&named.name) {
+            hydrate_s3_backend_credentials(&mut named.backend, s);
+        }
+    }
+
+    // Backward compatibility for v1 backups exported before named backend
+    // credentials were included in secrets.json: if there is exactly one named
+    // S3 backend and the legacy singleton storage secret exists, it is the only
+    // unambiguous credential source we can restore.
+    if secrets.storage_backends.is_empty() {
+        if let Some(s) = &secrets.storage {
+            let s3_named: Vec<usize> = cfg
+                .backends
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, b)| matches!(b.backend, BackendConfig::S3 { .. }).then_some(idx))
+                .collect();
+            if let [idx] = s3_named.as_slice() {
+                hydrate_s3_backend_credentials(&mut cfg.backends[*idx].backend, s);
+            }
+        }
+    }
+}
+
+fn config_yaml_hydrated_for_restore(
+    yaml_str: &str,
+    secrets: Option<&BackupSecrets>,
+) -> Result<String, String> {
+    let mut cfg = Config::from_yaml_str(yaml_str)
+        .map_err(|e| format!("config.yaml could not be parsed for secret hydration: {e}"))?;
+    if let Some(secrets) = secrets {
+        hydrate_config_with_backup_secrets(&mut cfg, secrets);
+    }
+    cfg.to_canonical_yaml()
+        .map_err(|e| format!("config.yaml could not be re-serialized after secret hydration: {e}"))
+}
+
+fn backup_secret_conflict_detail(current: &Config, secrets: &BackupSecrets) -> Option<String> {
+    let new_hash = secrets.bootstrap_password_hash.as_ref()?;
+    let existing = current.bootstrap_password_hash.as_ref()?;
+    if existing == new_hash {
+        return None;
+    }
+
+    Some(
+        "secrets.json bootstrap_password_hash differs from the running instance; \
+         full/config-only restore cannot replace it because that hash is tied to \
+         the encrypted config DB key. Use restore mode 'iam-only' to import IAM/admin \
+         data while preserving this instance's admin password and storage config, \
+         or change/rekey the local admin password before attempting a full restore."
+            .to_string(),
+    )
+}
 
 /// Unpack a Full Backup zip and apply all four parts atomically.
 ///
@@ -489,18 +825,32 @@ async fn import_zip_full_backup(
     state: Arc<AdminState>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<ImportResult>, StatusCode> {
+    mode: ImportMode,
+) -> Result<Json<ImportResult>, BackupImportError> {
+    tracing::info!(
+        bytes = body.len(),
+        mode = ?mode,
+        "Full-backup import: starting zip restore"
+    );
     // ── Phase A.1: unpack, bounded per-entry ───────────────────
     let reader = Cursor::new(body.as_ref());
     let mut archive = zip::ZipArchive::new(reader).map_err(|e| {
-        tracing::warn!("Full-backup import: not a valid zip: {}", e);
-        StatusCode::BAD_REQUEST
+        import_fail(
+            StatusCode::BAD_REQUEST,
+            "parse_zip",
+            "archive",
+            format!("not a valid zip: {e}"),
+        )
     })?;
     let mut files: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
     for i in 0..archive.len() {
         let mut f = archive.by_index(i).map_err(|e| {
-            tracing::warn!("Full-backup import: zip entry {} unreadable: {}", i, e);
-            StatusCode::BAD_REQUEST
+            import_fail(
+                StatusCode::BAD_REQUEST,
+                "parse_zip",
+                format!("entry index {i}"),
+                format!("zip entry unreadable: {e}"),
+            )
         })?;
         let name = f.name().to_string();
         // `size()` is the header-declared uncompressed length; we
@@ -508,13 +858,12 @@ async fn import_zip_full_backup(
         // about size to force a huge upfront allocation.
         let declared = f.size();
         if declared > MAX_ENTRY_BYTES {
-            tracing::warn!(
-                "Full-backup import: entry {} declares {} bytes > cap {}",
-                name,
-                declared,
-                MAX_ENTRY_BYTES
-            );
-            return Err(StatusCode::BAD_REQUEST);
+            return Err(import_fail(
+                StatusCode::BAD_REQUEST,
+                "parse_zip",
+                format!("entry {name}"),
+                format!("declared size {declared} exceeds cap {MAX_ENTRY_BYTES}"),
+            ));
         }
         let cap = std::cmp::min(declared, MAX_ENTRY_BYTES) as usize;
         let mut buf = Vec::with_capacity(cap);
@@ -523,37 +872,69 @@ async fn import_zip_full_backup(
         // the cap instead of filling memory unbounded.
         let mut bounded = std::io::Read::take(&mut f, MAX_ENTRY_BYTES + 1);
         std::io::Read::read_to_end(&mut bounded, &mut buf).map_err(|e| {
-            tracing::warn!("Full-backup import: read {} failed: {}", name, e);
-            StatusCode::BAD_REQUEST
+            import_fail(
+                StatusCode::BAD_REQUEST,
+                "parse_zip",
+                format!("entry {name}"),
+                format!("read failed: {e}"),
+            )
         })?;
         if buf.len() as u64 > MAX_ENTRY_BYTES {
-            tracing::warn!(
-                "Full-backup import: entry {} exceeded cap {} during decompression",
-                name,
-                MAX_ENTRY_BYTES
-            );
-            return Err(StatusCode::BAD_REQUEST);
+            return Err(import_fail(
+                StatusCode::BAD_REQUEST,
+                "parse_zip",
+                format!("entry {name}"),
+                format!("decompressed size exceeded cap {MAX_ENTRY_BYTES}"),
+            ));
         }
         files.insert(name, buf);
     }
+    tracing::info!(
+        entries = files.len(),
+        has_manifest = files.contains_key("manifest.json"),
+        has_config = files.contains_key("config.yaml"),
+        has_secrets = files.contains_key("secrets.json"),
+        has_iam = files.contains_key("iam.json"),
+        "Full-backup import: zip unpacked"
+    );
 
     // ── Phase A.2: manifest is required (LOW #1) ───────────────
     let m_bytes = files.get("manifest.json").ok_or_else(|| {
-        tracing::warn!("Full-backup import: manifest.json missing (required)");
-        StatusCode::BAD_REQUEST
+        import_fail(
+            StatusCode::BAD_REQUEST,
+            "parse_manifest",
+            "manifest.json",
+            "required file is missing",
+        )
     })?;
     let manifest: serde_json::Value = serde_json::from_slice(m_bytes).map_err(|e| {
-        tracing::warn!("Full-backup import: manifest.json malformed: {}", e);
-        StatusCode::BAD_REQUEST
+        import_fail(
+            StatusCode::BAD_REQUEST,
+            "parse_manifest",
+            "manifest.json",
+            format!("malformed JSON: {e}"),
+        )
     })?;
     let ver = manifest
         .get("version")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
     if ver != 1 {
-        tracing::warn!("Full-backup import: unsupported manifest version {}", ver);
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(import_fail(
+            StatusCode::BAD_REQUEST,
+            "parse_manifest",
+            "manifest.json",
+            format!("unsupported manifest version {ver}"),
+        ));
     }
+    tracing::info!(
+        version = ver,
+        manifest_entries = manifest
+            .get("files")
+            .and_then(|v| v.as_array())
+            .map_or(0, Vec::len),
+        "Full-backup import: manifest parsed"
+    );
 
     // ── Phase A.3: verify manifest sha256 entries (LOW #2) ─────
     //    For each entry the manifest claims, recompute sha256 on
@@ -565,35 +946,44 @@ async fn import_zip_full_backup(
     if let Some(entries) = manifest.get("files").and_then(|v| v.as_array()) {
         for entry in entries {
             let name = entry.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
-                tracing::warn!("Full-backup import: manifest entry missing name");
-                StatusCode::BAD_REQUEST
+                import_fail(
+                    StatusCode::BAD_REQUEST,
+                    "verify_manifest",
+                    "manifest entry",
+                    "entry missing name",
+                )
             })?;
             let expected_sha = entry
                 .get("sha256")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    tracing::warn!("Full-backup import: manifest entry {} missing sha256", name);
-                    StatusCode::BAD_REQUEST
+                    import_fail(
+                        StatusCode::BAD_REQUEST,
+                        "verify_manifest",
+                        format!("manifest entry {name}"),
+                        "entry missing sha256",
+                    )
                 })?;
             let bytes = files.get(name).ok_or_else(|| {
-                tracing::warn!(
-                    "Full-backup import: manifest lists {} but zip has no such entry",
-                    name
-                );
-                StatusCode::BAD_REQUEST
+                import_fail(
+                    StatusCode::BAD_REQUEST,
+                    "verify_manifest",
+                    format!("manifest entry {name}"),
+                    "manifest lists file but zip has no such entry",
+                )
             })?;
             let actual_sha = sha_hex(bytes);
             if actual_sha != expected_sha {
-                tracing::warn!(
-                    "Full-backup import: sha256 mismatch on {} (expected {}, got {})",
-                    name,
-                    expected_sha,
-                    actual_sha
-                );
-                return Err(StatusCode::BAD_REQUEST);
+                return Err(import_fail(
+                    StatusCode::BAD_REQUEST,
+                    "verify_manifest",
+                    format!("manifest entry {name}"),
+                    format!("sha256 mismatch (expected {expected_sha}, got {actual_sha})"),
+                ));
             }
         }
     }
+    tracing::info!("Full-backup import: manifest hashes verified");
 
     // ── Phase A.4: pre-parse every part (MED #3) ───────────────
     //    Build owned typed values for everything that might be
@@ -604,8 +994,12 @@ async fn import_zip_full_backup(
     let yaml_str: Option<String> = if let Some(yaml_bytes) = files.get("config.yaml") {
         let s = std::str::from_utf8(yaml_bytes)
             .map_err(|_| {
-                tracing::warn!("Full-backup import: config.yaml is not UTF-8");
-                StatusCode::BAD_REQUEST
+                import_fail(
+                    StatusCode::BAD_REQUEST,
+                    "parse_config_yaml",
+                    "config.yaml",
+                    "file is not UTF-8",
+                )
             })?
             .to_string();
         // Actual YAML shape is validated by apply_config_doc itself
@@ -616,20 +1010,59 @@ async fn import_zip_full_backup(
     };
     let secrets: Option<BackupSecrets> = if let Some(sec_bytes) = files.get("secrets.json") {
         Some(serde_json::from_slice(sec_bytes).map_err(|e| {
-            tracing::warn!("Full-backup import: secrets.json malformed: {}", e);
-            StatusCode::BAD_REQUEST
+            import_fail(
+                StatusCode::BAD_REQUEST,
+                "parse_secrets",
+                "secrets.json",
+                format!("malformed JSON: {e}"),
+            )
         })?)
     } else {
         None
     };
     let iam_backup: Option<IamBackup> = if let Some(iam_bytes) = files.get("iam.json") {
         Some(serde_json::from_slice(iam_bytes).map_err(|e| {
-            tracing::warn!("Full-backup import: iam.json malformed: {}", e);
-            StatusCode::BAD_REQUEST
+            import_fail(
+                StatusCode::BAD_REQUEST,
+                "parse_iam",
+                "iam.json",
+                format!("malformed JSON: {e}"),
+            )
         })?)
     } else {
         None
     };
+    tracing::info!(
+        has_config = yaml_str.as_ref().is_some_and(|s| !s.trim().is_empty()),
+        has_secrets = secrets.is_some(),
+        users = iam_backup.as_ref().map_or(0, |b| b.users.len()),
+        groups = iam_backup.as_ref().map_or(0, |b| b.groups.len()),
+        auth_providers = iam_backup.as_ref().map_or(0, |b| b.auth_providers.len()),
+        mapping_rules = iam_backup.as_ref().map_or(0, |b| b.mapping_rules.len()),
+        external_identities = iam_backup
+            .as_ref()
+            .map_or(0, |b| b.external_identities.len()),
+        "Full-backup import: backup parts parsed"
+    );
+
+    // Refuse known secret conflicts before applying config.yaml. The previous
+    // ordering applied config first and then failed on a bootstrap hash mismatch,
+    // leaving a local/dev instance pointed at prod storage even though the import
+    // returned 409.
+    if mode.restores_bootstrap() {
+        if let Some(secrets) = secrets.as_ref() {
+            let cfg = state.config.read().await;
+            if let Some(detail) = backup_secret_conflict_detail(&cfg, secrets) {
+                drop(cfg);
+                return Err(import_fail(
+                    StatusCode::CONFLICT,
+                    "validate_secrets",
+                    "secrets.json",
+                    detail,
+                ));
+            }
+        }
+    }
 
     // ── Phase B.1: apply config.yaml via the existing document-apply
     //       endpoint (same path /_/api/admin/config/apply uses).
@@ -639,44 +1072,135 @@ async fn import_zip_full_backup(
     //       persist pipeline a human would trigger via the GUI.
     //       TODO(v0.9): extract a pub(crate) helper so this can be
     //       called directly without the HTTP round-trip. ──
-    if let Some(yaml_str) = yaml_str {
-        // Skip application if the YAML is empty/whitespace-only.
-        // Exporters always emit at least `storage:` so this only
-        // fires on deliberate-empty zips.
-        if !yaml_str.trim().is_empty() {
-            let req = crate::api::admin::ConfigDocumentRequest { yaml: yaml_str };
-            let State(state_for_apply) = State(state.clone());
-            let resp = crate::api::admin::apply_config_doc(
-                State(state_for_apply),
-                headers.clone(),
-                Json(req),
-            )
-            .await
-            .into_response();
-            let status = resp.status();
-            if !status.is_success() {
-                tracing::error!("Full-backup import: apply config.yaml → HTTP {}", status);
-                return Err(StatusCode::BAD_REQUEST);
+    if mode.restores_config() {
+        if let Some(yaml_str) = yaml_str {
+            // Skip application if the YAML is empty/whitespace-only.
+            // Exporters always emit at least `storage:` so this only
+            // fires on deliberate-empty zips.
+            if !yaml_str.trim().is_empty() {
+                let yaml_str = config_yaml_hydrated_for_restore(&yaml_str, secrets.as_ref())
+                    .map_err(|e| {
+                        import_fail(
+                            StatusCode::BAD_REQUEST,
+                            "parse_config_yaml",
+                            "config.yaml",
+                            e,
+                        )
+                    })?;
+                tracing::info!(
+                    bytes = yaml_str.len(),
+                    "Full-backup import: applying config.yaml"
+                );
+                let req = crate::api::admin::ConfigDocumentRequest { yaml: yaml_str };
+                let State(state_for_apply) = State(state.clone());
+                let resp = crate::api::admin::apply_config_doc(
+                    State(state_for_apply),
+                    headers.clone(),
+                    Json(req),
+                )
+                .await
+                .into_response();
+                let status = resp.status();
+                if !status.is_success() {
+                    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                        .await
+                        .unwrap_or_default();
+                    let detail = config_apply_error_detail(&body);
+                    tracing::error!(
+                        "Full-backup import: apply config.yaml → HTTP {}: {}",
+                        status,
+                        detail
+                    );
+                    return Err(BackupImportError::new(
+                        status,
+                        "apply_config_yaml",
+                        Some("config.yaml".to_string()),
+                        Some(detail),
+                    )
+                    .with_upstream_status(status));
+                }
+                tracing::info!("Full-backup import: config.yaml applied");
             }
         }
+    } else {
+        tracing::info!("Full-backup import: skipping config.yaml for IAM-only restore");
     }
 
     // ── Phase B.2: apply secrets.json BEFORE iam import. Storage
     //       creds need to be in place before a subsequent import of
     //       a v0.8.3+ iam.json fires an S3 sync push. Bootstrap
     //       hash must land before any admin session is re-issued. ──
-    if let Some(secrets) = secrets.as_ref() {
-        apply_secrets(&state, secrets).await.inspect_err(|&e| {
-            tracing::error!("Full-backup import: apply secrets.json failed: {}", e);
-        })?;
+    if mode.restores_config() {
+        if let Some(secrets) = secrets.as_ref() {
+            tracing::info!(
+                has_bootstrap_hash = secrets.bootstrap_password_hash.is_some(),
+                has_access = secrets.access.is_some(),
+                has_storage = secrets.storage.is_some(),
+                named_storage_backends = secrets.storage_backends.len(),
+                oauth_client_secret_count = secrets.oauth_client_secrets.len(),
+                "Full-backup import: applying secrets.json"
+            );
+            apply_secrets(&state, secrets, mode.restores_bootstrap())
+                .await
+                .map_err(|err| {
+                    import_fail(err.status, "apply_secrets", "secrets.json", err.detail)
+                })?;
+            tracing::info!("Full-backup import: secrets.json applied");
+        }
+    } else {
+        tracing::info!("Full-backup import: skipping secrets.json for IAM-only restore");
     }
 
     // ── Phase B.3: apply iam.json (same flow as legacy JSON import) ──
-    let iam_result = if let Some(backup) = iam_backup {
-        import_backup_iam(state.clone(), headers.clone(), backup).await?
+    let iam_result = if mode.restores_iam() {
+        if let Some(backup) = iam_backup {
+            tracing::info!(
+                users = backup.users.len(),
+                groups = backup.groups.len(),
+                auth_providers = backup.auth_providers.len(),
+                mapping_rules = backup.mapping_rules.len(),
+                external_identities = backup.external_identities.len(),
+                "Full-backup import: applying iam.json"
+            );
+            let Json(result) = import_backup_iam(state.clone(), headers.clone(), backup)
+                .await
+                .map_err(|status| {
+                    import_fail(
+                        status,
+                        "restore_iam",
+                        "iam.json",
+                        status
+                            .canonical_reason()
+                            .unwrap_or("IAM backup import failed")
+                            .to_string(),
+                    )
+                })?;
+            tracing::info!(
+                users_created = result.users_created,
+                users_skipped = result.users_skipped,
+                groups_created = result.groups_created,
+                groups_skipped = result.groups_skipped,
+                memberships_created = result.memberships_created,
+                external_identities_created = result.external_identities_created,
+                external_identities_skipped = result.external_identities_skipped,
+                "Full-backup import: iam.json applied"
+            );
+            Json(result)
+        } else {
+            // Zip with no iam.json is valid — maybe operator only
+            // wants to apply config+secrets. Emit an all-zero result.
+            Json(ImportResult {
+                users_created: 0,
+                users_skipped: 0,
+                groups_created: 0,
+                groups_skipped: 0,
+                memberships_created: 0,
+                external_identities_created: 0,
+                external_identities_skipped: 0,
+            })
+        }
     } else {
-        // Zip with no iam.json is valid — maybe operator only
-        // wants to apply config+secrets. Emit an all-zero result.
+        tracing::info!("Full-backup import: skipping iam.json for config-only restore");
         Json(ImportResult {
             users_created: 0,
             users_skipped: 0,
@@ -688,7 +1212,12 @@ async fn import_zip_full_backup(
         })
     };
 
-    audit_log("import_full_backup", "admin", "zip applied", &headers);
+    audit_log(
+        "import_full_backup",
+        "admin",
+        &format!("zip applied ({mode:?})"),
+        &headers,
+    );
 
     Ok(iam_result)
 }
@@ -710,7 +1239,11 @@ async fn import_zip_full_backup(
 ///   until the next restart.
 /// * **Persist to disk**: write the merged config back to the active
 ///   config file so the change survives a restart.
-async fn apply_secrets(state: &Arc<AdminState>, secrets: &BackupSecrets) -> Result<(), StatusCode> {
+async fn apply_secrets(
+    state: &Arc<AdminState>,
+    secrets: &BackupSecrets,
+    restore_bootstrap_hash: bool,
+) -> Result<(), BackupSecretApplyError> {
     // Snapshot pre-mutation config for apply_config_transition.
     let old_cfg = state.config.read().await.clone();
 
@@ -719,17 +1252,10 @@ async fn apply_secrets(state: &Arc<AdminState>, secrets: &BackupSecrets) -> Resu
     // /api/admin/change-password which rekeys SQLCipher with the
     // plaintext. Initial seeding (hash match, or no existing hash)
     // is fine — that covers first-restore into a fresh instance.
-    if let Some(new_hash) = &secrets.bootstrap_password_hash {
-        if let Some(existing) = &old_cfg.bootstrap_password_hash {
-            if existing != new_hash {
-                tracing::error!(
-                    "Full-backup import: secrets.json carries a bootstrap_password_hash \
-                     that differs from the running instance. Rotating it here would \
-                     desync the SQLCipher DB key. Use /api/admin/change-password \
-                     with the plaintext password instead."
-                );
-                return Err(StatusCode::CONFLICT);
-            }
+    if restore_bootstrap_hash {
+        if let Some(detail) = backup_secret_conflict_detail(&old_cfg, secrets) {
+            tracing::error!("Full-backup import: {}", detail);
+            return Err(BackupSecretApplyError::conflict(detail));
         }
     }
 
@@ -737,8 +1263,10 @@ async fn apply_secrets(state: &Arc<AdminState>, secrets: &BackupSecrets) -> Resu
     // mutation Config for apply_config_transition after releasing.
     let new_cfg = {
         let mut cfg = state.config.write().await;
-        if let Some(h) = &secrets.bootstrap_password_hash {
-            cfg.bootstrap_password_hash = Some(h.clone());
+        if restore_bootstrap_hash {
+            if let Some(h) = &secrets.bootstrap_password_hash {
+                cfg.bootstrap_password_hash = Some(h.clone());
+            }
         }
         if let Some(a) = &secrets.access {
             if let Some(ak) = &a.access_key_id {
@@ -749,18 +1277,11 @@ async fn apply_secrets(state: &Arc<AdminState>, secrets: &BackupSecrets) -> Resu
             }
         }
         if let Some(s) = &secrets.storage {
-            if let crate::config::BackendConfig::S3 {
-                access_key_id,
-                secret_access_key,
-                ..
-            } = &mut cfg.backend
-            {
-                if let Some(ak) = &s.access_key_id {
-                    *access_key_id = Some(ak.clone());
-                }
-                if let Some(sk) = &s.secret_access_key {
-                    *secret_access_key = Some(sk.clone());
-                }
+            hydrate_s3_backend_credentials(&mut cfg.backend, s);
+        }
+        for named in &mut cfg.backends {
+            if let Some(s) = secrets.storage_backends.get(&named.name) {
+                hydrate_s3_backend_credentials(&mut named.backend, s);
             }
         }
         cfg.clone()
@@ -774,7 +1295,10 @@ async fn apply_secrets(state: &Arc<AdminState>, secrets: &BackupSecrets) -> Resu
         crate::api::admin::config::apply_config_transition(state, &old_cfg, &new_cfg).await
     {
         tracing::error!("Full-backup import: apply_config_transition failed: {}", e);
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        return Err(BackupSecretApplyError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to rebuild engine after applying backup secrets",
+        ));
     }
 
     // Persist the merged config so storage/access creds survive a
@@ -787,7 +1311,10 @@ async fn apply_secrets(state: &Arc<AdminState>, secrets: &BackupSecrets) -> Resu
             path,
             e
         );
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        return Err(BackupSecretApplyError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to persist merged config to {path}"),
+        ));
     }
 
     // OAuth client_secret per provider, by name (robust to id
@@ -796,7 +1323,12 @@ async fn apply_secrets(state: &Arc<AdminState>, secrets: &BackupSecrets) -> Resu
     // returns empty and we skip silently — that's fine, the
     // subsequent iam.json import carries client_secret too.
     if !secrets.oauth_client_secrets.is_empty() {
-        let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+        let db = state.config_db.as_ref().ok_or_else(|| {
+            BackupSecretApplyError::new(
+                StatusCode::NOT_FOUND,
+                "config DB is not available for OAuth client-secret restore",
+            )
+        })?;
         let db = db.lock().await;
         let providers = db.load_auth_providers().unwrap_or_default();
         for p in &providers {
@@ -1217,6 +1749,193 @@ pub struct ImportResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_apply_error_detail_prefers_json_error() {
+        let body = br#"{"applied":false,"error":"backend path is not writable"}"#;
+        assert_eq!(
+            config_apply_error_detail(body),
+            "backend path is not writable"
+        );
+    }
+
+    #[test]
+    fn config_apply_error_detail_falls_back_to_text() {
+        assert_eq!(config_apply_error_detail(b"plain failure"), "plain failure");
+    }
+
+    #[test]
+    fn import_mode_accepts_explicit_scopes() {
+        assert_eq!(
+            serde_urlencoded::from_str::<ImportQuery>("mode=iam-only")
+                .unwrap()
+                .mode,
+            ImportMode::IamOnly
+        );
+        assert_eq!(
+            serde_urlencoded::from_str::<ImportQuery>("mode=config-only")
+                .unwrap()
+                .mode,
+            ImportMode::ConfigOnly
+        );
+        assert_eq!(
+            serde_urlencoded::from_str::<ImportQuery>("mode=preserve-bootstrap")
+                .unwrap()
+                .mode,
+            ImportMode::PreserveBootstrap
+        );
+    }
+
+    #[test]
+    fn import_mode_scope_flags_match_product_contract() {
+        assert!(ImportMode::Full.restores_config());
+        assert!(ImportMode::Full.restores_iam());
+        assert!(ImportMode::Full.restores_bootstrap());
+
+        assert!(ImportMode::PreserveBootstrap.restores_config());
+        assert!(ImportMode::PreserveBootstrap.restores_iam());
+        assert!(!ImportMode::PreserveBootstrap.restores_bootstrap());
+
+        assert!(!ImportMode::IamOnly.restores_config());
+        assert!(ImportMode::IamOnly.restores_iam());
+        assert!(!ImportMode::IamOnly.restores_bootstrap());
+    }
+
+    #[test]
+    fn restore_hydrates_single_named_s3_backend_from_legacy_storage_secret() {
+        let yaml = r#"
+storage:
+  backends:
+    - name: local_fs
+      type: filesystem
+      path: ./data
+    - name: prod_s3
+      type: s3
+      endpoint: https://objects.example.test
+      region: eu-test-1
+      force_path_style: true
+  default_backend: prod_s3
+"#;
+        let secrets = BackupSecrets {
+            storage: Some(SecretsStorage {
+                access_key_id: Some("AKIA_BACKUP".into()),
+                secret_access_key: Some("SECRET_BACKUP".into()),
+            }),
+            ..BackupSecrets::default()
+        };
+
+        let hydrated = config_yaml_hydrated_for_restore(yaml, Some(&secrets)).unwrap();
+        let cfg = Config::from_yaml_str(&hydrated).unwrap();
+        let prod = cfg
+            .backends
+            .iter()
+            .find(|b| b.name == "prod_s3")
+            .expect("named backend should survive");
+        match &prod.backend {
+            BackendConfig::S3 {
+                access_key_id,
+                secret_access_key,
+                ..
+            } => {
+                assert_eq!(access_key_id.as_deref(), Some("AKIA_BACKUP"));
+                assert_eq!(secret_access_key.as_deref(), Some("SECRET_BACKUP"));
+            }
+            other => panic!("expected S3 backend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restore_hydrates_named_s3_backend_from_named_secret() {
+        let yaml = r#"
+storage:
+  backends:
+    - name: a
+      type: s3
+      endpoint: https://a.example.test
+      region: eu-test-1
+      force_path_style: true
+    - name: b
+      type: s3
+      endpoint: https://b.example.test
+      region: eu-test-1
+      force_path_style: true
+  default_backend: b
+"#;
+        let mut secrets = BackupSecrets::default();
+        secrets.storage = Some(SecretsStorage {
+            access_key_id: Some("LEGACY_SHOULD_NOT_GUESS".into()),
+            secret_access_key: Some("LEGACY_SHOULD_NOT_GUESS".into()),
+        });
+        secrets.storage_backends.insert(
+            "b".into(),
+            SecretsStorage {
+                access_key_id: Some("B_KEY".into()),
+                secret_access_key: Some("B_SECRET".into()),
+            },
+        );
+
+        let hydrated = config_yaml_hydrated_for_restore(yaml, Some(&secrets)).unwrap();
+        let cfg = Config::from_yaml_str(&hydrated).unwrap();
+        let a = cfg.backends.iter().find(|b| b.name == "a").unwrap();
+        let b = cfg.backends.iter().find(|b| b.name == "b").unwrap();
+        match &a.backend {
+            BackendConfig::S3 {
+                access_key_id,
+                secret_access_key,
+                ..
+            } => {
+                assert!(access_key_id.is_none());
+                assert!(secret_access_key.is_none());
+            }
+            other => panic!("expected S3 backend, got {other:?}"),
+        }
+        match &b.backend {
+            BackendConfig::S3 {
+                access_key_id,
+                secret_access_key,
+                ..
+            } => {
+                assert_eq!(access_key_id.as_deref(), Some("B_KEY"));
+                assert_eq!(secret_access_key.as_deref(), Some("B_SECRET"));
+            }
+            other => panic!("expected S3 backend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn backup_secret_conflict_names_bootstrap_hash_without_leaking_values() {
+        let current = Config {
+            bootstrap_password_hash: Some("$2b$12$current-local-hash".into()),
+            ..Config::default()
+        };
+        let secrets = BackupSecrets {
+            bootstrap_password_hash: Some("$2b$12$backup-prod-hash".into()),
+            ..BackupSecrets::default()
+        };
+
+        let detail = backup_secret_conflict_detail(&current, &secrets)
+            .expect("different bootstrap hash must be a conflict");
+        assert!(detail.contains("bootstrap_password_hash"));
+        assert!(detail.contains("iam-only"));
+        assert!(!detail.contains("current-local-hash"));
+        assert!(!detail.contains("backup-prod-hash"));
+    }
+
+    #[test]
+    fn backup_secret_conflict_allows_matching_or_missing_bootstrap_hash() {
+        let current = Config {
+            bootstrap_password_hash: Some("$2b$12$same-hash".into()),
+            ..Config::default()
+        };
+        let matching = BackupSecrets {
+            bootstrap_password_hash: Some("$2b$12$same-hash".into()),
+            ..BackupSecrets::default()
+        };
+        assert!(backup_secret_conflict_detail(&current, &matching).is_none());
+
+        let missing = BackupSecrets::default();
+        assert!(backup_secret_conflict_detail(&current, &missing).is_none());
+    }
 
     #[test]
     fn test_v1_backup_deserializes_without_external_fields() {

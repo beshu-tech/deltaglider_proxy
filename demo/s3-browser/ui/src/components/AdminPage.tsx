@@ -1,6 +1,6 @@
 import { cloneElement, isValidElement, useState, useEffect, useCallback, useMemo } from 'react';
-import { Typography, Button, Input, Alert, Space, Spin, Drawer, message } from 'antd';
-import { checkSession, adminLogin, whoami, loginAs, exportBackup, importBackup, type ExternalProviderInfo } from '../adminApi';
+import { Typography, Button, Input, Alert, Space, Spin, Drawer, message, Modal } from 'antd';
+import { checkSession, adminLogin, whoami, loginAs, exportBackup, importBackup, ImportBackupError, type ExternalProviderInfo, type ImportBackupMode } from '../adminApi';
 import { getCredentials } from '../s3client';
 import {
   CloudOutlined,
@@ -311,6 +311,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, accountMe
   // (paste YAML → validate → apply) and 'export' (fetch current
   // canonical YAML → copy to clipboard).
   const [yamlModalMode, setYamlModalMode] = useState<'import' | 'export' | null>(null);
+  const [restoreFile, setRestoreFile] = useState<File | null>(null);
 
   // Global keyboard shortcuts (Wave 10 / 10.1 §10.3):
   //
@@ -509,6 +510,39 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, accountMe
     }
   }, []);
 
+  const runBackupImport = useCallback(async (file: File, mode: ImportBackupMode) => {
+    try {
+      const isZip =
+        file.name.toLowerCase().endsWith('.zip') ||
+        file.type === 'application/zip' ||
+        file.type === 'application/x-zip-compressed';
+      const result = isZip
+        ? await importBackup(file, mode)
+        : await importBackup(JSON.parse(await file.text()), 'iam-only');
+      const ext = result.external_identities_created ?? 0;
+      message.success(
+        `Imported: ${result.users_created} users, ${result.groups_created} groups, ${ext} OIDC identities (${result.users_skipped} skipped)`
+      );
+      window.location.reload();
+    } catch (e) {
+      if (e instanceof ImportBackupError) {
+        console.error('Full backup restore failed', {
+          file: { name: file.name, type: file.type, size: file.size },
+          status: e.status,
+          response: e.response,
+        });
+        message.error(e.message, 8);
+      } else {
+        console.error('Full backup restore failed before request', e);
+        message.error(
+          'Import failed: ' + (e instanceof Error ? e.message : 'invalid file')
+        );
+      }
+    } finally {
+      setRestoreFile(null);
+    }
+  }, []);
+
   const handleImportFullBackup = useCallback(() => {
     const input = document.createElement('input');
     input.type = 'file';
@@ -518,30 +552,18 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, accountMe
     input.onchange = async () => {
       const file = input.files?.[0];
       if (!file) return;
-      try {
-        // Zip path: pass the File Blob straight through — importBackup
-        // handles the content-type. JSON path: parse + pass object
-        // (legacy shape).
-        const isZip =
-          file.name.toLowerCase().endsWith('.zip') ||
-          file.type === 'application/zip' ||
-          file.type === 'application/x-zip-compressed';
-        const result = isZip
-          ? await importBackup(file)
-          : await importBackup(JSON.parse(await file.text()));
-        const ext = result.external_identities_created ?? 0;
-        message.success(
-          `Imported: ${result.users_created} users, ${result.groups_created} groups, ${ext} OIDC identities (${result.users_skipped} skipped)`
-        );
-        window.location.reload();
-      } catch (e) {
-        message.error(
-          'Import failed: ' + (e instanceof Error ? e.message : 'invalid file')
-        );
+      const isZip =
+        file.name.toLowerCase().endsWith('.zip') ||
+        file.type === 'application/zip' ||
+        file.type === 'application/x-zip-compressed';
+      if (isZip) {
+        setRestoreFile(file);
+      } else {
+        runBackupImport(file, 'iam-only');
       }
     };
     input.click();
-  }, []);
+  }, [runBackupImport]);
 
   /**
    * Render the content pane for the current admin path.
@@ -888,6 +910,63 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, accountMe
           window.location.reload();
         }}
       />
+      <Modal
+        title="Restore Backup"
+        open={restoreFile !== null}
+        onCancel={() => setRestoreFile(null)}
+        footer={[
+          <Button key="cancel" onClick={() => setRestoreFile(null)}>
+            Cancel
+          </Button>,
+          <Button
+            key="config"
+            onClick={() => restoreFile && runBackupImport(restoreFile, 'config-only')}
+          >
+            Config Only
+          </Button>,
+          <Button
+            key="preserve-bootstrap"
+            type="primary"
+            onClick={() => restoreFile && runBackupImport(restoreFile, 'preserve-bootstrap')}
+          >
+            Everything Except Admin Password
+          </Button>,
+          <Button
+            key="full"
+            danger
+            onClick={() => restoreFile && runBackupImport(restoreFile, 'full')}
+          >
+            Full Restore
+          </Button>,
+          <Button
+            key="iam"
+            onClick={() => restoreFile && runBackupImport(restoreFile, 'iam-only')}
+          >
+            IAM Only
+          </Button>,
+        ]}
+      >
+        <Space direction="vertical" size={10}>
+          <Text>
+            Choose what to restore from <Text code>{restoreFile?.name}</Text>.
+          </Text>
+          <Alert
+            type="info"
+            showIcon
+            message="Everything Except Admin Password restores config, backends, bucket policies, users, groups, OIDC providers, and secrets, while keeping this instance's local admin password."
+          />
+          <Alert
+            type="info"
+            showIcon
+            message="IAM Only skips config and backend changes; use it only when you want users/groups/OIDC without restoring storage settings."
+          />
+          <Alert
+            type="warning"
+            showIcon
+            message="Full Restore also attempts to restore the backup bootstrap password hash and will fail if it differs from this instance's encrypted config DB key."
+          />
+        </Space>
+      </Modal>
 
       {/* ⌘K command palette — fuzzy navigation over every admin page,
           plus a handful of shell-level quick actions (Export YAML,
