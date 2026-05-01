@@ -209,6 +209,7 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
 
   const [headData, setHeadData] = useState<{ headers: Record<string, string>; storageType?: string; storedSize?: number } | null>(null);
   const [headLoading, setHeadLoading] = useState(false);
+  const [headReadable, setHeadReadable] = useState(false);
 
   // Modal state for download / share operations (must be declared before early return)
   const [modalState, setModalState] = useState<
@@ -257,11 +258,12 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
   }, [objectKey]);
 
   useEffect(() => {
-    if (!objectKey) { setHeadData(null); return; }
+    if (!objectKey) { setHeadData(null); setHeadReadable(false); return; }
     // Cancellation guard: rapid object switching previously let an older
     // headObject() resolve into the newer object's drawer, showing stale
     // metadata for the wrong file. Capture a flag, only commit when alive.
     let cancelled = false;
+    setHeadReadable(false);
     // Seed from table's headCache so Storage Stats renders instantly
     if (cachedHead) {
       setHeadData({ headers: {}, storageType: cachedHead.storageType, storedSize: cachedHead.storedSize });
@@ -270,8 +272,18 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
     }
     setHeadLoading(true);
     headObject(objectKey)
-      .then((data) => { if (!cancelled) setHeadData(data); })
-      .catch(() => { if (!cancelled) setHeadData((prev) => prev ?? { headers: {} }); })
+      .then((data) => {
+        if (!cancelled) {
+          setHeadData(data);
+          setHeadReadable(true);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setHeadReadable(false);
+          setHeadData((prev) => prev ?? { headers: {} });
+        }
+      })
       .finally(() => { if (!cancelled) setHeadLoading(false); });
     return () => { cancelled = true; };
   }, [cachedHead, objectKey]);
@@ -305,6 +317,10 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
   const isPublic =
     !bucketPolicyLoading &&
     (bucketPolicy?.publicPrefixes.some(pp => pp === '' || object.key.startsWith(pp)) ?? false);
+  // Non-admin IAM users connect with S3 credentials but may not have a GUI
+  // session, so /whoami cannot always provide permissions. A successful HEAD
+  // proves object-level read without exposing controls to list-only users.
+  const canReadObject = canRead || headReadable;
 
   const handleDelete = async () => {
     try {
@@ -423,7 +439,7 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
           {/* Content */}
           <div style={{ flex: 1, overflow: 'auto', padding: '16px 20px' }}>
             {/* Preview button (only for previewable files) */}
-            {canRead && onPreview && object && getPreviewMode(object.key) && (
+            {canReadObject && onPreview && object && getPreviewMode(object.key) && (
               <Button
                 block
                 size="large"
@@ -441,7 +457,7 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
             )}
 
             {/* Download & Share buttons */}
-            {canRead && (
+            {canReadObject && (
               <div style={{ display: 'flex', gap: 8, marginBottom: 20 }}>
                 <Button
                   type="primary"

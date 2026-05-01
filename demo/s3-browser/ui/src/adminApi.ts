@@ -600,6 +600,20 @@ export async function whoami(): Promise<WhoamiResponse> {
   }
 }
 
+export async function resolveIamIdentity(accessKeyId: string, secretAccessKey: string): Promise<WhoamiResponse | null> {
+  try {
+    const res = await adminFetch('/api/iam/identity', 'POST', {
+      access_key_id: accessKeyId,
+      secret_access_key: secretAccessKey,
+    });
+    if (!res.ok) return null;
+    return await safeJson(res);
+  } catch (err) {
+    console.warn('IAM identity resolve failed:', err);
+    return null;
+  }
+}
+
 // === Usage Scanner ===
 
 interface ChildUsage {

@@ -30,8 +30,8 @@ use crate::usage_scanner::UsageScanner;
 pub use audit::get_audit;
 pub use auth::{
     check_session, clear_s3_session_creds, get_s3_session_creds, login, login_as, logout,
-    require_not_declarative, require_session, set_s3_session_creds, whoami, LoginAsRequest,
-    LoginResponse, SessionResponse, WhoamiResponse,
+    require_not_declarative, require_session, resolve_iam_identity, set_s3_session_creds, whoami,
+    LoginAsRequest, LoginResponse, ResolveIamIdentityRequest, SessionResponse, WhoamiResponse,
 };
 pub use backends::{create_backend, delete_backend, list_backends};
 pub use backup::{export_backup, import_backup};

@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "lint": "eslint 'src/**/*.{ts,tsx}'",
     "lint:strict": "eslint 'src/**/*.{ts,tsx}' --max-warnings 0",
+    "test:permissions": "node scripts/permissions-regression-test.mjs",
     "typecheck": "tsc --noEmit",
     "knip": "knip"
   },

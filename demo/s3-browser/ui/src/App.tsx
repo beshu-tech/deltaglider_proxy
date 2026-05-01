@@ -16,7 +16,7 @@ import DocsPage from './components/DocsPage';
 import AccountMenu from './components/AccountMenu';
 import DemoDataGenerator from './components/DemoDataGenerator';
 import { getBucket, hasCredentials, disconnect, initFromSession, getCredentials } from './s3client';
-import { adminLogout, whoami, checkSession } from './adminApi';
+import { adminLogout, whoami, checkSession, resolveIamIdentity } from './adminApi';
 import type { WhoamiResponse } from './adminApi';
 import { useColors } from './ThemeContext';
 import useComputeSize from './useComputeSize';
@@ -145,9 +145,20 @@ export default function App() {
     if (!needsConnect && !sessionLoading) {
       let cancelled = false;
       reconnectS3();
-      whoami().then((nextIdentity) => {
+      (async () => {
+        const nextIdentity = await whoami();
+        if (nextIdentity.mode === 'iam' && !nextIdentity.user) {
+          const creds = getCredentials();
+          if (creds.accessKeyId && creds.secretAccessKey) {
+            const resolved = await resolveIamIdentity(creds.accessKeyId, creds.secretAccessKey);
+            if (resolved) {
+              if (!cancelled) setIdentity(resolved);
+              return;
+            }
+          }
+        }
         if (!cancelled) setIdentity(nextIdentity);
-      });
+      })();
       return () => {
         cancelled = true;
       };
@@ -237,7 +248,7 @@ export default function App() {
   const canDeleteSelectedObject = Boolean(activeBucket && s3.selected) && canUse(identity, 'delete', activeBucket, s3.selected?.key ?? '');
   const canCopyFromActiveBucket = canReadSelected && canWriteActiveBucket;
   const canMoveFromActiveBucket = canCopyFromActiveBucket && canDeleteSelected;
-  const canReadActiveBucket = !activeBucket || canUse(identity, 'read', activeBucket) || canUse(identity, 'list', activeBucket);
+  const canReadActiveBucket = !activeBucket || canUse(identity, 'read', activeBucket, s3.prefix) || canUse(identity, 'list', activeBucket, s3.prefix);
   const accountMenu = (includeBrowserToggles = false) => (
     <AccountMenu
       identityLabel={identity?.user?.name || currentAccessKey || 'user'}

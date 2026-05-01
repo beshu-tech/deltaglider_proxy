@@ -66,6 +66,12 @@ pub struct LoginAsRequest {
     secret_access_key: String,
 }
 
+#[derive(Deserialize)]
+pub struct ResolveIamIdentityRequest {
+    access_key_id: String,
+    secret_access_key: String,
+}
+
 /// Whether session cookies should include the `Secure` flag (HTTPS-only).
 /// Controlled by `DGP_SECURE_COOKIES`. When not set, auto-detects based on TLS:
 /// TLS enabled → Secure=true; TLS disabled → Secure=false.
@@ -305,6 +311,59 @@ pub async fn whoami(
         config_db_mismatch: state.config_db_mismatch,
         external_providers,
     })
+}
+
+/// POST /api/iam/identity — verify IAM S3 credentials and return the same
+/// effective user permissions the SigV4 request path uses.
+///
+/// This intentionally does NOT create an admin/session cookie. Non-admin S3
+/// users need their effective permissions so the browser can show prefix-scoped
+/// controls, but they must not gain access to the session-gated admin API.
+pub async fn resolve_iam_identity(
+    State(state): State<Arc<AdminState>>,
+    req_headers: HeaderMap,
+    Json(body): Json<ResolveIamIdentityRequest>,
+) -> Result<Json<WhoamiResponse>, StatusCode> {
+    let guard = crate::rate_limiter::RateLimitGuard::enter(
+        &state.rate_limiter,
+        &req_headers,
+        "resolve_iam_identity",
+    )
+    .await
+    .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
+
+    let iam_state = state.iam_state.load();
+    let Some(user) = (match &**iam_state {
+        IamState::Iam(index) => index.get(&body.access_key_id).cloned(),
+        _ => None,
+    }) else {
+        guard.record_failure();
+        return Err(StatusCode::FORBIDDEN);
+    };
+
+    use sha2::{Digest, Sha256};
+    let stored_hash = Sha256::digest(user.secret_access_key.as_bytes());
+    let provided_hash = Sha256::digest(body.secret_access_key.as_bytes());
+    if stored_hash.ct_ne(&provided_hash).into() || !user.enabled {
+        guard.record_failure();
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    guard.record_success();
+
+    let is_admin = crate::iam::permissions::is_admin(&user.permissions);
+    Ok(Json(WhoamiResponse {
+        mode: "iam".into(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        user: Some(WhoamiUserInfo {
+            name: user.name,
+            access_key_id: user.access_key_id,
+            is_admin,
+            permissions: user.permissions,
+        }),
+        config_db_mismatch: state.config_db_mismatch,
+        external_providers: vec![],
+    }))
 }
 
 /// Resolve user info from the session cookie (if present and valid).

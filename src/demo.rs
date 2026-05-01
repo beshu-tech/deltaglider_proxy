@@ -237,6 +237,7 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
     let public_admin = Router::new()
         .route("/_/api/admin/login", post(admin::login))
         .route("/_/api/admin/login-as", post(admin::login_as))
+        .route("/_/api/iam/identity", post(admin::resolve_iam_identity))
         .route("/_/api/admin/policies", get(admin::get_canned_policies))
         // Monotonic rebuild counter. Public by design — exposes an opaque
         // number and is consumed by integration tests + internal tooling
