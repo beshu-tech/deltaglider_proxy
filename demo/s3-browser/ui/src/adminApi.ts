@@ -669,7 +669,7 @@ interface ImportBackupResult {
 
 export type ImportBackupMode = 'full' | 'preserve-bootstrap' | 'iam-only' | 'config-only';
 
-export interface ImportBackupErrorBody {
+interface ImportBackupErrorBody {
   error?: string;
   stage?: string;
   context?: string;
