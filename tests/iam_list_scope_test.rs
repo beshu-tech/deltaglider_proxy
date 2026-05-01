@@ -382,3 +382,134 @@ async fn test_common_prefixes_filtered_in_scoped_list() {
         cps
     );
 }
+
+/// Screenshot regression: a user with Read on one deep prefix plus
+/// condition-scoped ListBucket must be able to navigate allowed
+/// CommonPrefixes without seeing unrelated siblings.
+#[tokio::test]
+async fn test_condition_scoped_beshu_reports_common_prefix_navigation() {
+    let h = ScopeHarness::setup().await;
+    let admin = h.admin_client().await;
+    let _ = admin.create_bucket().bucket("beshu").send().await;
+    for key in &[
+        "ror/e2e_reports/run-1/index.html",
+        "ror/e2e_reports/run-2/index.html",
+        "ror/builds/build-1/artifact.zip",
+        "ror/private/secret.txt",
+        "blocked/top.txt",
+    ] {
+        admin
+            .put_object()
+            .bucket("beshu")
+            .key(*key)
+            .body(ByteStream::from(b"d".to_vec()))
+            .send()
+            .await
+            .expect("seed");
+    }
+
+    let (key, secret) = h
+        .create_user(
+            "beshu-reports",
+            vec![
+                json!({
+                    "effect": "Allow",
+                    "actions": ["read"],
+                    "resources": ["beshu/ror/e2e_reports/*"],
+                }),
+                json!({
+                    "effect": "Allow",
+                    "actions": ["list"],
+                    "resources": ["beshu", "beshu/*"],
+                    "conditions": {
+                        "StringLike": {
+                            "s3:prefix": ["", "ror/", "ror/builds/", "ror/e2e_reports/"]
+                        }
+                    },
+                }),
+            ],
+        )
+        .await;
+    let reports_user = h.user_client(&key, &secret).await;
+
+    let root = reports_user
+        .list_objects_v2()
+        .bucket("beshu")
+        .delimiter("/")
+        .send()
+        .await
+        .expect("root list should be admitted");
+    let root_prefixes: Vec<String> = root
+        .common_prefixes()
+        .iter()
+        .filter_map(|c| c.prefix().map(str::to_string))
+        .collect();
+    assert_eq!(
+        root_prefixes,
+        vec!["ror/".to_string()],
+        "root should expose only navigable ror/: {:?}",
+        root_prefixes
+    );
+
+    let ror = reports_user
+        .list_objects_v2()
+        .bucket("beshu")
+        .prefix("ror/")
+        .delimiter("/")
+        .send()
+        .await
+        .expect("ror/ list should be admitted");
+    let ror_prefixes: Vec<String> = ror
+        .common_prefixes()
+        .iter()
+        .filter_map(|c| c.prefix().map(str::to_string))
+        .collect();
+    assert!(
+        ror_prefixes.contains(&"ror/e2e_reports/".to_string()),
+        "ror/ should expose e2e reports: {:?}",
+        ror_prefixes
+    );
+    assert!(
+        ror_prefixes.contains(&"ror/builds/".to_string()),
+        "ror/ should expose explicitly listable builds: {:?}",
+        ror_prefixes
+    );
+    assert!(
+        !ror_prefixes.contains(&"ror/private/".to_string()),
+        "ror/ leaked private prefix: {:?}",
+        ror_prefixes
+    );
+
+    let reports = reports_user
+        .list_objects_v2()
+        .bucket("beshu")
+        .prefix("ror/e2e_reports/")
+        .send()
+        .await
+        .expect("e2e reports list should be admitted");
+    let report_keys: Vec<String> = reports
+        .contents()
+        .iter()
+        .filter_map(|o| o.key().map(str::to_string))
+        .collect();
+    assert!(
+        report_keys
+            .iter()
+            .all(|k| k.starts_with("ror/e2e_reports/")),
+        "e2e reports listing leaked unrelated keys: {:?}",
+        report_keys
+    );
+    assert_eq!(report_keys.len(), 2, "expected both report keys");
+
+    let private = reports_user
+        .list_objects_v2()
+        .bucket("beshu")
+        .prefix("ror/private/")
+        .send()
+        .await
+        .expect("disallowed prefix is admitted only for filtered listing");
+    assert!(
+        private.contents().is_empty() && private.common_prefixes().is_empty(),
+        "private prefix should be filtered empty"
+    );
+}

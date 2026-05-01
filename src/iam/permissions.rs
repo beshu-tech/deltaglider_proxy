@@ -378,6 +378,12 @@ pub(crate) fn has_unrestricted_allow_for_bucket_prefix(
         if perm.effect != "Allow" {
             continue;
         }
+        if perm.conditions.is_some() {
+            // A condition-bearing allow can admit this specific LIST request,
+            // but it does not prove the whole requested prefix is visible.
+            // Keep those requests on the filtered path.
+            continue;
+        }
         for res in &perm.resources {
             // Full wildcard Allow.
             if res == "*" {
@@ -406,7 +412,53 @@ pub(crate) fn has_unrestricted_allow_for_bucket_prefix(
     false
 }
 
-/// Pure predicate: can this user see this key in a LIST response?
+fn can_list_prefix_with_context(
+    user: &super::AuthenticatedUser,
+    bucket: &str,
+    prefix: &str,
+) -> bool {
+    let context = Context::new().with_string("s3:prefix", prefix);
+    user.can_with_context(S3Action::List, bucket, "", &context)
+}
+
+fn resource_descends_from_prefix(resource: &str, bucket: &str, prefix: &str) -> bool {
+    if resource == "*" {
+        return true;
+    }
+    let prefix_path = format!("{}/{}", bucket, prefix);
+    let resource_base = resource.strip_suffix('*').unwrap_or(resource);
+    resource_base.starts_with(&prefix_path)
+}
+
+fn allow_references_common_prefix(
+    user: &super::AuthenticatedUser,
+    bucket: &str,
+    prefix: &str,
+) -> bool {
+    user.permissions.iter().any(|perm| {
+        if perm.effect != "Allow" {
+            return false;
+        }
+        if perm.conditions.is_some() {
+            // Non-prefix request context cannot be proven here. Prefix-list
+            // conditions are handled by can_list_prefix_with_context above.
+            return false;
+        }
+        let can_discover = perm.actions.iter().any(|a| {
+            matches!(
+                a.as_str(),
+                "*" | "read" | "list" | "s3:GetObject" | "s3:ListBucket" | "s3:*"
+            )
+        });
+        can_discover
+            && perm
+                .resources
+                .iter()
+                .any(|r| resource_descends_from_prefix(r, bucket, prefix))
+    })
+}
+
+/// Pure predicate: can this user see this object key in a LIST response?
 ///
 /// Used by the bucket handler to post-filter the engine's list output
 /// when the middleware set `ListScope::Filtered`. The rule: a user may
@@ -418,10 +470,33 @@ pub(crate) fn has_unrestricted_allow_for_bucket_prefix(
 /// Kept as a free function (not a method) because:
 /// - It's a lookup used on a hot loop over potentially thousands of
 ///   keys; `AuthenticatedUser::can` re-evaluates the full policy graph
-///   each call, and inlining here lets LLVM consolidate the two checks.
+///   each call, and inlining here lets LLVM consolidate the checks.
 /// - It's unit-testable as a pure function without an HTTP stack.
-pub fn user_can_see_listed_key(user: &super::AuthenticatedUser, bucket: &str, key: &str) -> bool {
-    user.can(S3Action::Read, bucket, key) || user.can(S3Action::List, bucket, key)
+pub fn user_can_see_listed_key(
+    user: &super::AuthenticatedUser,
+    bucket: &str,
+    key: &str,
+    requested_prefix: &str,
+) -> bool {
+    user.can(S3Action::Read, bucket, key)
+        || user.can(S3Action::List, bucket, key)
+        || can_list_prefix_with_context(user, bucket, requested_prefix)
+}
+
+/// Pure predicate: can this user see/navigate a returned CommonPrefix?
+///
+/// `s3:ListBucket` is evaluated on the bucket ARN with `s3:prefix` in
+/// request context, not on an object ARN such as `bucket/ror/`. This is
+/// the important distinction for prefix-scoped IAM browsing.
+pub fn user_can_see_common_prefix(
+    user: &super::AuthenticatedUser,
+    bucket: &str,
+    prefix: &str,
+) -> bool {
+    user.can(S3Action::Read, bucket, prefix)
+        || user.can(S3Action::List, bucket, prefix)
+        || can_list_prefix_with_context(user, bucket, prefix)
+        || allow_references_common_prefix(user, bucket, prefix)
 }
 
 /// Check if a permission set grants full admin access:
@@ -1037,6 +1112,27 @@ mod tests {
         assert!(!has_unrestricted_allow_for_bucket_prefix(&perms, "x", ""));
     }
 
+    #[test]
+    fn test_condition_scoped_list_is_not_unrestricted() {
+        let perms = vec![Permission {
+            id: 0,
+            effect: "Allow".into(),
+            actions: vec!["list".into()],
+            resources: vec!["prod".into()],
+            conditions: Some(serde_json::json!({
+                "StringLike": {
+                    "s3:prefix": ["", "alice/"]
+                }
+            })),
+        }];
+        assert!(!has_unrestricted_allow_for_bucket_prefix(
+            &perms, "prod", ""
+        ));
+        assert!(!has_unrestricted_allow_for_bucket_prefix(
+            &perms, "prod", "alice/"
+        ));
+    }
+
     // === user_can_see_listed_key integration with AuthenticatedUser ===
 
     fn make_user(
@@ -1060,19 +1156,47 @@ mod tests {
         }
     }
 
+    fn make_user_with_permissions(
+        name: &str,
+        permissions: Vec<Permission>,
+    ) -> super::super::AuthenticatedUser {
+        let iam_policies = permissions.iter().map(permission_to_iam_policy).collect();
+        super::super::AuthenticatedUser {
+            name: name.to_string(),
+            access_key_id: "AKIA".into(),
+            permissions,
+            iam_policies,
+        }
+    }
+
     #[test]
     fn test_user_can_see_listed_key_unrestricted_user() {
         let user = make_user("alice", vec!["prod/*"], vec!["read", "list"]);
-        assert!(user_can_see_listed_key(&user, "prod", "alice/file.txt"));
-        assert!(user_can_see_listed_key(&user, "prod", "anything/else.bin"));
+        assert!(user_can_see_listed_key(&user, "prod", "alice/file.txt", ""));
+        assert!(user_can_see_listed_key(
+            &user,
+            "prod",
+            "anything/else.bin",
+            ""
+        ));
     }
 
     #[test]
     fn test_user_can_see_listed_key_prefix_scoped() {
         let user = make_user("alice", vec!["prod/alice/*"], vec!["read"]);
-        assert!(user_can_see_listed_key(&user, "prod", "alice/file.txt"));
-        assert!(!user_can_see_listed_key(&user, "prod", "bob/file.txt"));
-        assert!(!user_can_see_listed_key(&user, "prod", "secret.bin"));
+        assert!(user_can_see_listed_key(
+            &user,
+            "prod",
+            "alice/file.txt",
+            "alice/"
+        ));
+        assert!(!user_can_see_listed_key(
+            &user,
+            "prod",
+            "bob/file.txt",
+            "bob/"
+        ));
+        assert!(!user_can_see_listed_key(&user, "prod", "secret.bin", ""));
     }
 
     #[test]
@@ -1080,14 +1204,59 @@ mod tests {
         // List-only permission should let the user see keys in listings
         // (they can't Read them, but they can discover them).
         let user = make_user("alice", vec!["prod/public/*"], vec!["list"]);
-        assert!(user_can_see_listed_key(&user, "prod", "public/x.txt"));
-        assert!(!user_can_see_listed_key(&user, "prod", "private/x.txt"));
+        assert!(user_can_see_listed_key(
+            &user,
+            "prod",
+            "public/x.txt",
+            "public/"
+        ));
+        assert!(!user_can_see_listed_key(
+            &user,
+            "prod",
+            "private/x.txt",
+            "private/"
+        ));
     }
 
     #[test]
     fn test_user_cannot_see_keys_in_different_bucket() {
         let user = make_user("alice", vec!["prod/*"], vec!["read", "list"]);
-        assert!(!user_can_see_listed_key(&user, "staging", "anything"));
+        assert!(!user_can_see_listed_key(&user, "staging", "anything", ""));
+    }
+
+    #[test]
+    fn test_common_prefix_uses_s3_prefix_condition_context() {
+        let user = make_user_with_permissions(
+            "alice",
+            vec![
+                Permission {
+                    id: 0,
+                    effect: "Allow".into(),
+                    actions: vec!["read".into()],
+                    resources: vec!["beshu/ror/e2e_reports/*".into()],
+                    conditions: None,
+                },
+                Permission {
+                    id: 1,
+                    effect: "Allow".into(),
+                    actions: vec!["list".into()],
+                    resources: vec!["beshu".into()],
+                    conditions: Some(serde_json::json!({
+                        "StringLike": {
+                            "s3:prefix": ["", "ror/", "ror/builds/", "ror/e2e_reports/"]
+                        }
+                    })),
+                },
+            ],
+        );
+
+        assert!(user_can_see_common_prefix(&user, "beshu", "ror/"));
+        assert!(user_can_see_common_prefix(
+            &user,
+            "beshu",
+            "ror/e2e_reports/"
+        ));
+        assert!(!user_can_see_common_prefix(&user, "beshu", "secret/"));
     }
 
     // === Property-based tests ===

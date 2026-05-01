@@ -6,7 +6,9 @@ use crate::api::extractors::ValidatedBucket;
 use crate::api::xml::{
     BucketInfo, ListBucketResult, ListBucketsResult, ListMultipartUploadsResult, S3Object,
 };
-use crate::iam::{user_can_see_listed_key, AuthenticatedUser, ListScope};
+use crate::iam::{
+    user_can_see_common_prefix, user_can_see_listed_key, AuthenticatedUser, ListScope,
+};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
@@ -234,7 +236,7 @@ pub async fn bucket_get_handler(
             let objects: Vec<_> = page
                 .objects
                 .into_iter()
-                .filter(|(k, _)| user_can_see_listed_key(user, &bucket, k))
+                .filter(|(k, _)| user_can_see_listed_key(user, &bucket, k, &prefix))
                 .collect();
             // For CommonPrefixes, treat the prefix itself as a key under
             // the bucket; if the user can see nothing under that prefix
@@ -242,7 +244,7 @@ pub async fn bucket_get_handler(
             let common_prefixes: Vec<_> = page
                 .common_prefixes
                 .into_iter()
-                .filter(|p| user_can_see_listed_key(user, &bucket, p))
+                .filter(|p| user_can_see_common_prefix(user, &bucket, p))
                 .collect();
             (objects, common_prefixes, true)
         }

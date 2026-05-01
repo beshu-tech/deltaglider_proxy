@@ -13,7 +13,9 @@
 
 use crate::api::handlers::{debug_headers_enabled, AppState};
 use crate::deltaglider::RetrieveResponse;
-use crate::iam::{user_can_see_listed_key, AuthenticatedUser, ListScope, S3Action};
+use crate::iam::{
+    user_can_see_common_prefix, user_can_see_listed_key, AuthenticatedUser, ListScope, S3Action,
+};
 use crate::storage::StorageError;
 use crate::types::FileMetadata;
 use futures::stream::BoxStream;
@@ -211,10 +213,12 @@ impl s3s::S3 for DeltaGliderS3Service {
             .await
             .map_err(engine_error_to_s3s)?;
         if let Some(ListScope::Filtered { user }) = list_scope {
-            page.objects
-                .retain(|(key, _)| user_can_see_listed_key(&user, &input.bucket, key));
+            let requested_prefix = input.prefix.as_deref().unwrap_or("");
+            page.objects.retain(|(key, _)| {
+                user_can_see_listed_key(&user, &input.bucket, key, requested_prefix)
+            });
             page.common_prefixes
-                .retain(|prefix| user_can_see_listed_key(&user, &input.bucket, prefix));
+                .retain(|prefix| user_can_see_common_prefix(&user, &input.bucket, prefix));
         }
         let metadata_ext = include_metadata.then(|| {
             ListMetadataXmlExtensions(
