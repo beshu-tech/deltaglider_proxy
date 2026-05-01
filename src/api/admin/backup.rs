@@ -1861,18 +1861,20 @@ storage:
       force_path_style: true
   default_backend: b
 "#;
-        let mut secrets = BackupSecrets::default();
-        secrets.storage = Some(SecretsStorage {
-            access_key_id: Some("LEGACY_SHOULD_NOT_GUESS".into()),
-            secret_access_key: Some("LEGACY_SHOULD_NOT_GUESS".into()),
-        });
-        secrets.storage_backends.insert(
-            "b".into(),
-            SecretsStorage {
-                access_key_id: Some("B_KEY".into()),
-                secret_access_key: Some("B_SECRET".into()),
-            },
-        );
+        let secrets = BackupSecrets {
+            storage: Some(SecretsStorage {
+                access_key_id: Some("LEGACY_SHOULD_NOT_GUESS".into()),
+                secret_access_key: Some("LEGACY_SHOULD_NOT_GUESS".into()),
+            }),
+            storage_backends: BTreeMap::from([(
+                "b".into(),
+                SecretsStorage {
+                    access_key_id: Some("B_KEY".into()),
+                    secret_access_key: Some("B_SECRET".into()),
+                },
+            )]),
+            ..Default::default()
+        };
 
         let hydrated = config_yaml_hydrated_for_restore(yaml, Some(&secrets)).unwrap();
         let cfg = Config::from_yaml_str(&hydrated).unwrap();
