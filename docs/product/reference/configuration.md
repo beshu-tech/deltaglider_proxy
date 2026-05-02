@@ -65,6 +65,14 @@ Every section is optional. Fields equal to their default are omitted from canoni
 
 The flat (pre-Phase-3) shape — root-level `listen_addr:`, `backend:`, etc. — still loads unchanged. Mixing the two shapes in one document is a hard parse error naming the conflicting keys.
 
+The same document is editable from the admin UI. The form keeps section ownership visible, shows YAML paths next to fields, and calls out restart-only environment overrides.
+
+![Access configuration form](/_/screenshots/config-access-form.jpg)
+
+![Storage backend configuration form](/_/screenshots/config-storage-form.jpg)
+
+![Advanced limits configuration form](/_/screenshots/config-limits-form.jpg)
+
 ---
 
 ## Shorthands

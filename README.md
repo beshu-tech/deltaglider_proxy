@@ -230,6 +230,36 @@ Multi-arch images (amd64 + arm64) published on every release:
 docker run -p 9000:9000 beshultd/deltaglider_proxy
 ```
 
+## Kubernetes / Helm
+
+The chart lives in [`charts/deltaglider-proxy`](charts/deltaglider-proxy):
+
+```bash
+helm upgrade --install dgp ./charts/deltaglider-proxy \
+  --namespace dgp \
+  --create-namespace
+```
+
+Port-forward:
+
+```bash
+kubectl -n dgp port-forward svc/dgp-deltaglider-proxy 9000:9000
+```
+
+Open the admin UI at `http://127.0.0.1:9000/_/`.
+
+The default development bootstrap password is `change-me-in-production`; do not expose that install outside localhost. For production, create a Kubernetes Secret outside Helm with stable `DGP_ACCESS_KEY_ID`, `DGP_SECRET_ACCESS_KEY`, `DGP_BOOTSTRAP_PASSWORD_HASH`, and any backend credentials, then install with:
+
+```bash
+helm upgrade --install dgp ./charts/deltaglider-proxy \
+  --namespace dgp \
+  --create-namespace \
+  --set auth.createSecret=false \
+  --set auth.existingSecret=deltaglider-secrets
+```
+
+The chart mounts config at `/data/deltaglider_proxy.yaml` so the encrypted IAM DB is created at `/data/deltaglider_config.db` on the PVC. Full guide: [Kubernetes / Helm deployment](docs/product/22-kubernetes-helm.md).
+
 ## Documentation
 
 Operator-facing docs are also bundled into the running binary at `/_/docs/`. Source files:
@@ -242,6 +272,7 @@ Operator-facing docs are also bundled into the running binary at `/_/docs/`. Sou
 - [Production deployment](docs/product/20-production-deployment.md) — TLS, cache sizing, backups, multi-instance sync.
 - [Security checklist](docs/product/20-production-security-checklist.md) — SigV4, IAM, rate limiting.
 - [Upgrade guide](docs/product/21-upgrade-guide.md) — upgrade workflow and TOML → YAML migration.
+- [Kubernetes / Helm deployment](docs/product/22-kubernetes-helm.md) — kind hello world, chart values, Secrets, PVC layout, Ingress, and probes.
 
 **Authentication:**
 - [OAuth / OIDC setup](docs/product/auth/30-oauth-setup.md)

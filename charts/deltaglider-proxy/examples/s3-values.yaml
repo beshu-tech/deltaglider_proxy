@@ -1,0 +1,38 @@
+# S3-backed deployment.
+# Prefer auth.existingSecret for all secrets in production.
+
+auth:
+  createSecret: false
+  existingSecret: deltaglider-secrets
+
+env:
+  - name: DGP_TRUST_PROXY_HEADERS
+    value: "true"
+
+config:
+  inline: |
+    storage:
+      s3: https://s3.eu-central-1.amazonaws.com
+      region: eu-central-1
+      force_path_style: false
+    access:
+      iam_mode: gui
+    advanced:
+      listen_addr: "0.0.0.0:9000"
+      cache_size_mb: 2048
+      log_level: "deltaglider_proxy=info,tower_http=warn"
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+  hosts:
+    - host: dgp.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: dgp-tls
+      hosts:
+        - dgp.example.com

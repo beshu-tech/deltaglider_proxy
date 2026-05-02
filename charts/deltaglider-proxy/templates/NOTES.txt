@@ -1,0 +1,28 @@
+DeltaGlider Proxy has been installed.
+
+Service:
+  {{ include "deltaglider-proxy.fullname" . }}:{{ .Values.service.port }}
+
+Admin UI and S3 endpoint share the same listener:
+  http://<host>/_/     Admin UI
+  http://<host>/       S3-compatible API
+
+{{- if .Values.ingress.enabled }}
+Ingress hosts:
+{{- range .Values.ingress.hosts }}
+  - {{ .host }}
+{{- end }}
+{{- else }}
+Port-forward locally:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "deltaglider-proxy.fullname" . }} 9000:{{ .Values.service.port }}
+  open http://127.0.0.1:9000/_/
+{{- end }}
+
+Important:
+  - Set a stable DGP_BOOTSTRAP_PASSWORD_HASH in auth.bootstrapPasswordHash
+    or auth.existingSecret before production use.
+  - The default values are filesystem-backed and store data under /data/storage.
+  - The rendered config is mounted at /data/deltaglider_proxy.yaml so the
+    encrypted IAM database can live beside it on the writable PVC.
+  - For S3 backends, provide DGP_BE_AWS_ACCESS_KEY_ID and
+    DGP_BE_AWS_SECRET_ACCESS_KEY via values or an existing Secret.

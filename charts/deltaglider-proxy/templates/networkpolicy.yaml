@@ -1,0 +1,40 @@
+{{- if .Values.networkPolicy.enabled -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "deltaglider-proxy.fullname" . }}
+  labels:
+    {{- include "deltaglider-proxy.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "deltaglider-proxy.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    {{- if .Values.networkPolicy.ingress.enabled }}
+    - Ingress
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.enabled }}
+    - Egress
+    {{- end }}
+  {{- if .Values.networkPolicy.ingress.enabled }}
+  ingress:
+    - from:
+        {{- if .Values.networkPolicy.ingress.from }}
+        {{- toYaml .Values.networkPolicy.ingress.from | nindent 8 }}
+        {{- else }}
+        - {}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 9000
+  {{- end }}
+  {{- if .Values.networkPolicy.egress.enabled }}
+  egress:
+    - to:
+        {{- if .Values.networkPolicy.egress.to }}
+        {{- toYaml .Values.networkPolicy.egress.to | nindent 8 }}
+        {{- else }}
+        - {}
+        {{- end }}
+  {{- end }}
+{{- end }}

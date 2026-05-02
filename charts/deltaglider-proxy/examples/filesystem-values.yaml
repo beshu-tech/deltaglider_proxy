@@ -1,0 +1,22 @@
+# Minimal filesystem-backed deployment.
+# Store stable credentials in a real Secret for production.
+
+auth:
+  accessKeyId: admin
+  secretAccessKey: replace-me
+  bootstrapPasswordHash: "REPLACE_WITH_DGP_BOOTSTRAP_PASSWORD_HASH"
+
+persistence:
+  enabled: true
+  size: 100Gi
+
+config:
+  inline: |
+    storage:
+      filesystem: /data/storage
+    access:
+      iam_mode: gui
+    advanced:
+      listen_addr: "0.0.0.0:9000"
+      cache_size_mb: 2048
+      log_level: "deltaglider_proxy=info,tower_http=warn"

@@ -185,7 +185,32 @@ See [the upgrade guide](21-upgrade-guide.md) for the full process. Short version
 
 ## Deployment platforms (short notes)
 
-**Kubernetes:** `health_check_path` is `/_/health`. Mount a PersistentVolume at `/data` (the container's CWD). Inject `DGP_BOOTSTRAP_PASSWORD_HASH` via a Secret.
+**Kubernetes:** use the Helm chart in `charts/deltaglider-proxy`. The chart mounts a PersistentVolume at `/data`, renders the YAML config to `/data/deltaglider_proxy.yaml` so the encrypted config DB can live beside it on writable storage, keeps `/tmp` writable for a read-only root filesystem, and probes `/_/health`. See [Kubernetes / Helm deployment](22-kubernetes-helm.md) for the complete values reference and tested OrbStack flow.
+
+```bash
+helm upgrade --install dgp ./charts/deltaglider-proxy \
+  --set auth.createSecret=false \
+  --set auth.existingSecret=deltaglider-secrets
+```
+
+The referenced Secret should carry stable runtime credentials:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: deltaglider-secrets
+type: Opaque
+stringData:
+  DGP_ACCESS_KEY_ID: admin
+  DGP_SECRET_ACCESS_KEY: replace-me
+  DGP_BOOTSTRAP_PASSWORD_HASH: "$2b$12$..."
+  # Required for S3 storage backends:
+  DGP_BE_AWS_ACCESS_KEY_ID: "..."
+  DGP_BE_AWS_SECRET_ACCESS_KEY: "..."
+```
+
+Route the whole host to port 9000; the UI (`/_/*`) and S3 API (`/`) share the same listener.
 
 **systemd:** run as `deltaglider_proxy.service` with `WorkingDirectory=/var/lib/deltaglider_proxy` and `EnvironmentFile=/etc/deltaglider_proxy/env`. The binary exits non-zero on unrecoverable errors, so `Restart=on-failure` is appropriate.
 

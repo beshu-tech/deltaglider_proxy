@@ -1,0 +1,18 @@
+apiVersion: v2
+name: deltaglider-proxy
+description: S3-compatible proxy with transparent delta compression and an embedded admin UI
+type: application
+version: 0.1.0
+appVersion: "0.9.6"
+home: https://github.com/beshu-tech/deltaglider_proxy
+sources:
+  - https://github.com/beshu-tech/deltaglider_proxy
+keywords:
+  - s3
+  - object-storage
+  - proxy
+  - delta-compression
+  - iam
+maintainers:
+  - name: Beshu Tech
+    url: https://beshu.tech

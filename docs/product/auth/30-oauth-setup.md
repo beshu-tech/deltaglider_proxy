@@ -60,6 +60,8 @@ Any provider with a `.well-known/openid-configuration` endpoint works. You'll ne
 
 Admin Settings → **Configuration** → **Access** → **External authentication** → **+ Add provider**.
 
+![OAuth provider and group mapping settings](/_/screenshots/oauth_group_mapping.jpg)
+
 | Field | Value |
 |---|---|
 | Name | lower-case ascii id — this shows up in the sign-in button (`Sign in with google`) |
@@ -103,6 +105,8 @@ Use the **Preview** button: type an email / claim set, and the UI shows which gr
 ## Step 4: First login
 
 On the login page, click the provider button. You're redirected to the provider's consent screen, then back to `/_/api/admin/oauth/callback`. On success:
+
+![OAuth login with Google Workspace](/_/screenshots/oauth_login.jpg)
 
 - A new row appears in **External identities** (Access → External authentication → Identities) linking the provider's subject ID to a DeltaGlider user.
 - Group memberships from matching rules are applied.

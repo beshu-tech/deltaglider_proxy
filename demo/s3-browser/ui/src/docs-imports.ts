@@ -19,6 +19,7 @@ import FIRST_BUCKET from '../../../../docs/product/10-first-bucket.md?raw';
 import PROD_DEPLOY from '../../../../docs/product/20-production-deployment.md?raw';
 import PROD_SECURITY from '../../../../docs/product/20-production-security-checklist.md?raw';
 import UPGRADE_GUIDE from '../../../../docs/product/21-upgrade-guide.md?raw';
+import KUBERNETES_HELM from '../../../../docs/product/22-kubernetes-helm.md?raw';
 import OAUTH_SETUP from '../../../../docs/product/auth/30-oauth-setup.md?raw';
 import SIGV4_IAM from '../../../../docs/product/auth/31-sigv4-and-iam.md?raw';
 import IAM_CONDITIONS from '../../../../docs/product/auth/32-iam-conditions.md?raw';
@@ -101,6 +102,7 @@ const PRODUCT_DOCS: ProductDoc[] = [
   { path: '20-production-deployment', content: PROD_DEPLOY, group: 'Deploy to production', order: 0 },
   { path: '20-production-security-checklist', content: PROD_SECURITY, group: 'Deploy to production', order: 10 },
   { path: '21-upgrade-guide', content: UPGRADE_GUIDE, group: 'Deploy to production', order: 20 },
+  { path: '22-kubernetes-helm', content: KUBERNETES_HELM, group: 'Deploy to production', order: 30 },
 
   // Authentication & access
   { path: 'auth/30-oauth-setup', content: OAUTH_SETUP, group: 'Authentication & access', order: 0 },

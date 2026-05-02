@@ -107,6 +107,17 @@ const PRODUCT_SURFACES = [
     },
   },
   {
+    title: 'Configure the control plane visually.',
+    eyebrow: 'Configuration',
+    body: 'Edit authentication mode, storage backends, bucket routing, limits, cache settings, and sync options from structured forms that preserve YAML ownership.',
+    points: ['Section-scoped forms', 'YAML path breadcrumbs', 'Restart and env override hints'],
+    screenshot: {
+      src: 'screenshots/config-access-form.jpg',
+      alt: 'DeltaGlider Proxy access configuration form',
+      caption: 'Configuration forms expose the same YAML model with field-level guidance and restart hints.',
+    },
+  },
+  {
     title: 'Control bucket behavior explicitly.',
     eyebrow: 'Bucket policy',
     body: 'Set compression policy, routing aliases, public read-only prefixes, soft quotas, and read-only freeze at the bucket level.',

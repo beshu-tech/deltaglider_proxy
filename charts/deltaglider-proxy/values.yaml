@@ -1,0 +1,174 @@
+# Default values for DeltaGlider Proxy.
+#
+# The defaults are deliberately small and filesystem-backed so the chart can
+# start in a development cluster. For production, set stable auth secrets,
+# persistent storage, and either S3 backend credentials or a real PVC.
+
+replicaCount: 1
+
+image:
+  repository: docker.io/beshultd/deltaglider_proxy
+  pullPolicy: IfNotPresent
+  tag: "" # defaults to .Chart.AppVersion
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+  automountServiceAccountToken: false
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 999
+  runAsGroup: 999
+  fsGroup: 999
+  fsGroupChangePolicy: OnRootMismatch
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 9000
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: deltaglider.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+resources: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+
+priorityClassName: ""
+runtimeClassName: ""
+
+terminationGracePeriodSeconds: 30
+
+updateStrategy:
+  type: RollingUpdate
+
+probes:
+  liveness:
+    enabled: true
+    initialDelaySeconds: 15
+    periodSeconds: 15
+    timeoutSeconds: 3
+    failureThreshold: 3
+  readiness:
+    enabled: true
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  startup:
+    enabled: true
+    initialDelaySeconds: 0
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 30
+
+persistence:
+  enabled: true
+  existingClaim: ""
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 20Gi
+  annotations: {}
+  mountPath: /data
+
+tmp:
+  sizeLimit: 2Gi
+
+config:
+  enabled: true
+  # File path. Keep this under /data so the encrypted config DB is created
+  # beside the config file on the writable PVC.
+  mountPath: /data/deltaglider_proxy.yaml
+  filename: deltaglider_proxy.yaml
+  # Rendered through Helm's tpl function, so values can be referenced if needed.
+  inline: |
+    storage:
+      filesystem: /data/storage
+    access:
+      iam_mode: gui
+    advanced:
+      listen_addr: "0.0.0.0:9000"
+      log_level: "deltaglider_proxy=info,tower_http=warn"
+
+auth:
+  # Keep true for the quickstart chart install. For production, prefer
+  # existingSecret so credentials stay stable across Helm renders.
+  createSecret: true
+  existingSecret: ""
+  accessKeyId: "admin"
+  secretAccessKey: "change-me-in-production"
+  # Bcrypt hash consumed by DGP_BOOTSTRAP_PASSWORD_HASH.
+  # Generate with:
+  #   deltaglider_proxy --set-bootstrap-password
+  # Default hash is for the development password: change-me-in-production
+  bootstrapPasswordHash: "JDJiJDEyJDRzb0o5TjNXMWRSQ0gzaGxvVkxjLi55Vy5GTVAwNTNZUHVzQkZ5M1VSS0xpWVEuL1dWOU0u"
+  # Additional secret-valued environment variables to include only when this
+  # chart creates the Secret. When auth.existingSecret is set, put these keys
+  # in that external Secret instead.
+  extraEnv: {}
+
+backendCredentials:
+  # S3 storage backends require explicit credentials. Set these when config.inline
+  # points at S3, or use existingSecret with the same keys.
+  accessKeyId: ""
+  secretAccessKey: ""
+
+env: []
+# Example:
+# env:
+#   - name: DGP_TRUST_PROXY_HEADERS
+#     value: "true"
+envFrom: []
+
+extraVolumes: []
+extraVolumeMounts: []
+
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: null
+
+networkPolicy:
+  enabled: false
+  ingress:
+    enabled: true
+    from: []
+  egress:
+    enabled: false
+    to: []
+
+extraObjects: []

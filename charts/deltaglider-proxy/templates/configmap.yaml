@@ -1,0 +1,11 @@
+{{- if .Values.config.enabled -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "deltaglider-proxy.configName" . }}
+  labels:
+    {{- include "deltaglider-proxy.labels" . | nindent 4 }}
+data:
+  {{ .Values.config.filename }}: |
+{{ tpl .Values.config.inline . | indent 4 }}
+{{- end }}

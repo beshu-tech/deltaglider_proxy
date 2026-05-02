@@ -24,6 +24,7 @@ These docs are operator-facing — everything you need to install, secure, run, 
 - [Production deployment](20-production-deployment.md) — TLS, reverse proxy, cache sizing, backups, multi-instance sync.
 - [Security checklist](20-production-security-checklist.md) — SigV4, bootstrap password, IAM users, rate limiting.
 - [Upgrade guide](21-upgrade-guide.md) — standard upgrade workflow and the TOML → YAML migration.
+- [Kubernetes / Helm deployment](22-kubernetes-helm.md) — chart values, Secrets, PVC layout, Ingress, probes, and local OrbStack validation.
 
 ### Authentication & access
 
