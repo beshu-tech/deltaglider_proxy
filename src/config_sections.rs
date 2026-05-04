@@ -320,11 +320,21 @@ pub struct ReplicationConfig {
     #[serde(default = "default_replication_enabled")]
     pub enabled: bool,
 
-    /// Future scheduler wake interval. Parsed via humantime. Defaults
-    /// to `30s`. Minimum enforced at config load time (`5s`) to prevent
-    /// scheduler-thrash when automatic ticks are enabled.
+    /// Scheduler wake interval. Parsed via humantime. Defaults to `30s`.
+    /// Minimum enforced at config load time (`5s`) to prevent scheduler
+    /// thrash.
     #[serde(default = "default_tick_interval")]
     pub tick_interval: String,
+
+    /// Per-rule lease TTL used by scheduler/run-now single-flight guard.
+    /// Defaults to `60s`; failed replicas can be replaced after this
+    /// expires.
+    #[serde(default = "default_lease_ttl")]
+    pub lease_ttl: String,
+
+    /// How often long-running rules renew their lease. Defaults to `20s`.
+    #[serde(default = "default_heartbeat_interval")]
+    pub heartbeat_interval: String,
 
     /// Per-rule failure ring bound. When a rule accumulates more than
     /// this number of per-object failures, the oldest are dropped.
@@ -342,6 +352,8 @@ impl Default for ReplicationConfig {
         Self {
             enabled: default_replication_enabled(),
             tick_interval: default_tick_interval(),
+            lease_ttl: default_lease_ttl(),
+            heartbeat_interval: default_heartbeat_interval(),
             max_failures_retained: default_max_failures(),
             rules: Vec::new(),
         }
@@ -354,6 +366,14 @@ fn default_replication_enabled() -> bool {
 
 fn default_tick_interval() -> String {
     "30s".to_string()
+}
+
+fn default_lease_ttl() -> String {
+    "60s".to_string()
+}
+
+fn default_heartbeat_interval() -> String {
+    "20s".to_string()
 }
 
 fn default_max_failures() -> u32 {
@@ -863,6 +883,8 @@ const MIN_RULE_INTERVAL_SECS: u64 = 30;
 /// Minimum legal global `tick_interval`. The scheduler wakes up every
 /// tick; too-frequent ticks burn CPU for no benefit.
 const MIN_TICK_INTERVAL_SECS: u64 = 5;
+const MIN_LEASE_TTL_SECS: u64 = 15;
+const MIN_HEARTBEAT_INTERVAL_SECS: u64 = 5;
 
 /// Maximum batch size per rule. Above this and the worker's yield
 /// becomes coarse enough that other due rules get starved.
@@ -894,9 +916,73 @@ pub fn validate_replication(cfg: &ReplicationConfig) -> Vec<String> {
         }
     }
 
+    let lease_ttl = match humantime::parse_duration(&cfg.lease_ttl) {
+        Ok(d) => {
+            let secs = d.as_secs();
+            if secs < MIN_LEASE_TTL_SECS {
+                warnings.push(format!(
+                    "replication.lease_ttl={} is below the minimum {}s",
+                    cfg.lease_ttl, MIN_LEASE_TTL_SECS
+                ));
+            }
+            Some(secs)
+        }
+        Err(e) => {
+            warnings.push(format!(
+                "replication.lease_ttl={} is not a valid humantime duration: {}",
+                cfg.lease_ttl, e
+            ));
+            None
+        }
+    };
+
+    let heartbeat = match humantime::parse_duration(&cfg.heartbeat_interval) {
+        Ok(d) => {
+            let secs = d.as_secs();
+            if secs < MIN_HEARTBEAT_INTERVAL_SECS {
+                warnings.push(format!(
+                    "replication.heartbeat_interval={} is below the minimum {}s",
+                    cfg.heartbeat_interval, MIN_HEARTBEAT_INTERVAL_SECS
+                ));
+            }
+            Some(secs)
+        }
+        Err(e) => {
+            warnings.push(format!(
+                "replication.heartbeat_interval={} is not a valid humantime duration: {}",
+                cfg.heartbeat_interval, e
+            ));
+            None
+        }
+    };
+
+    if let (Some(lease_ttl), Some(heartbeat)) = (lease_ttl, heartbeat) {
+        if heartbeat >= lease_ttl {
+            warnings.push(format!(
+                "replication.heartbeat_interval={} must be lower than replication.lease_ttl={}",
+                cfg.heartbeat_interval, cfg.lease_ttl
+            ));
+        }
+    }
+
     // Per-rule checks.
     let mut seen_names = std::collections::HashSet::new();
     for rule in &cfg.rules {
+        let source_norm = crate::replication::normalize_prefix(&rule.source.prefix);
+        if source_norm != rule.source.prefix {
+            warnings.push(format!(
+                "replication rule '{}' source.prefix {:?} will be normalized to {:?}",
+                rule.name, rule.source.prefix, source_norm
+            ));
+        }
+        let dest_norm = crate::replication::normalize_prefix(&rule.destination.prefix);
+        if dest_norm != rule.destination.prefix {
+            warnings.push(format!(
+                "replication rule '{}' destination.prefix {:?} will be normalized to {:?}",
+                rule.name, rule.destination.prefix, dest_norm
+            ));
+        }
+
         if !is_valid_replication_rule_name(&rule.name) {
             warnings.push(format!(
                 "replication rule name '{}' is invalid (must match [A-Za-z0-9_.-]{{1,64}})",
@@ -941,9 +1027,7 @@ pub fn validate_replication(cfg: &ReplicationConfig) -> Vec<String> {
         // Self-loop: source and destination reference the same
         // bucket+prefix. Degenerate — the rule would copy objects
         // back to themselves, pointlessly re-incrementing counters.
-        if rule.source.bucket == rule.destination.bucket
-            && rule.source.prefix == rule.destination.prefix
-        {
+        if rule.source.bucket == rule.destination.bucket && source_norm == dest_norm {
             warnings.push(format!(
                 "replication rule '{}' is a self-loop \
                  (source == destination); it will be skipped at runtime",
@@ -984,10 +1068,13 @@ pub(crate) fn detect_replication_cycles(rules: &[ReplicationRule]) -> Vec<String
     // Edge list: source node -> list of (dest node, rule_name).
     let mut edges: HashMap<Node, Vec<(Node, String)>> = HashMap::new();
     for rule in rules {
-        let src: Node = (rule.source.bucket.clone(), rule.source.prefix.clone());
+        let src: Node = (
+            rule.source.bucket.clone(),
+            crate::replication::normalize_prefix(&rule.source.prefix),
+        );
         let dst: Node = (
             rule.destination.bucket.clone(),
-            rule.destination.prefix.clone(),
+            crate::replication::normalize_prefix(&rule.destination.prefix),
         );
         edges.entry(src).or_default().push((dst, rule.name.clone()));
     }
@@ -1414,6 +1501,18 @@ mod tests {
     }
 
     #[test]
+    fn replication_validation_flags_bad_lease_timing() {
+        let cfg = ReplicationConfig {
+            lease_ttl: "10s".to_string(),
+            heartbeat_interval: "10s".to_string(),
+            ..Default::default()
+        };
+        let warnings = validate_replication(&cfg);
+        assert!(warnings.iter().any(|w| w.contains("lease_ttl")));
+        assert!(warnings.iter().any(|w| w.contains("heartbeat_interval")));
+    }
+
+    #[test]
     fn replication_validation_flags_self_loop() {
         let cfg = ReplicationConfig {
             rules: vec![rule("loop", ("a", "pfx"), ("a", "pfx"), "1h")],
@@ -1421,6 +1520,20 @@ mod tests {
         };
         let warnings = validate_replication(&cfg);
         assert!(warnings.iter().any(|w| w.contains("self-loop")));
+    }
+
+    #[test]
+    fn replication_validation_flags_self_loop_after_prefix_normalization() {
+        let cfg = ReplicationConfig {
+            rules: vec![rule("loop", ("a", "/pfx//"), ("a", "pfx/"), "1h")],
+            ..Default::default()
+        };
+        let warnings = validate_replication(&cfg);
+        assert!(
+            warnings.iter().any(|w| w.contains("self-loop")),
+            "expected normalized self-loop warning: {:?}",
+            warnings
+        );
     }
 
     #[test]
@@ -1437,6 +1550,23 @@ mod tests {
         assert!(
             !cycle_warns.is_empty(),
             "expected cycle warning: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn replication_cycle_detection_uses_normalized_prefixes() {
+        let cfg = ReplicationConfig {
+            rules: vec![
+                rule("a-to-b", ("bkt_a", "/pfx//"), ("bkt_b", "mirror"), "1h"),
+                rule("b-to-a", ("bkt_b", "mirror/"), ("bkt_a", "pfx/"), "1h"),
+            ],
+            ..Default::default()
+        };
+        let warnings = validate_replication(&cfg);
+        assert!(
+            warnings.iter().any(|w| w.contains("cycle")),
+            "expected normalized cycle warning: {:?}",
             warnings
         );
     }
@@ -1486,6 +1616,8 @@ mod tests {
         let cfg = ReplicationConfig {
             enabled: true,
             tick_interval: "30s".to_string(),
+            lease_ttl: "60s".to_string(),
+            heartbeat_interval: "20s".to_string(),
             max_failures_retained: 100,
             rules: vec![rule("r", ("a", ""), ("b", ""), "1h")],
         };

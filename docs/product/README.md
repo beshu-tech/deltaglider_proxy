@@ -38,7 +38,7 @@ These docs are operator-facing — everything you need to install, secure, run, 
 - [Monitoring and alerts](40-monitoring-and-alerts.md) — Prometheus scrape, Grafana panels, alerting rules.
 - [Troubleshooting](41-troubleshooting.md) — common symptoms → fixes.
 - [FAQ](42-faq.md) — quick answers to common questions.
-- [Lazy bucket replication](reference/replication.md) — run-now source → destination object replication through the engine, with scheduler state ready for automatic ticks.
+- [Lazy bucket replication](reference/replication.md) — scheduled and run-now source → destination object replication through the engine.
 
 ### Reference
 

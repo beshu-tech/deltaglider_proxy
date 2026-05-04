@@ -23,7 +23,7 @@ pub struct ConfigDb {
 }
 
 /// Schema version — bump when adding migrations.
-const SCHEMA_VERSION: i32 = 6;
+const SCHEMA_VERSION: i32 = 8;
 
 pub(crate) mod auth_providers;
 mod declarative;
@@ -253,6 +253,7 @@ impl ConfigDb {
                 CREATE TABLE IF NOT EXISTS replication_run_history (
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
                     rule_name       TEXT NOT NULL,
+                    triggered_by    TEXT NOT NULL DEFAULT 'unknown',
                     started_at      INTEGER NOT NULL,
                     finished_at     INTEGER,
                     objects_scanned INTEGER NOT NULL DEFAULT 0,
@@ -270,6 +271,7 @@ impl ConfigDb {
                 CREATE TABLE IF NOT EXISTS replication_failures (
                     id            INTEGER PRIMARY KEY AUTOINCREMENT,
                     rule_name     TEXT NOT NULL,
+                    run_id        INTEGER,
                     occurred_at   INTEGER NOT NULL,
                     source_key    TEXT NOT NULL,
                     dest_key      TEXT NOT NULL,
@@ -281,6 +283,52 @@ impl ConfigDb {
             )?;
             info!(
                 "Migrated config DB schema from v{} to v6 (added replication state tables)",
+                version
+            );
+        }
+
+        if version < 7 {
+            let has_triggered_by = {
+                let mut stmt = conn.prepare("PRAGMA table_info(replication_run_history)")?;
+                let columns = stmt
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                columns.iter().any(|c| c == "triggered_by")
+            };
+            if !has_triggered_by {
+                conn.execute(
+                    "ALTER TABLE replication_run_history
+                        ADD COLUMN triggered_by TEXT NOT NULL DEFAULT 'unknown'",
+                    [],
+                )?;
+            }
+            info!(
+                "Migrated config DB schema from v{} to v7 (added replication run trigger source)",
+                version
+            );
+        }
+
+        if version < 8 {
+            let has_run_id = {
+                let mut stmt = conn.prepare("PRAGMA table_info(replication_failures)")?;
+                let columns = stmt
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                columns.iter().any(|c| c == "run_id")
+            };
+            if !has_run_id {
+                conn.execute(
+                    "ALTER TABLE replication_failures ADD COLUMN run_id INTEGER",
+                    [],
+                )?;
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_failures_run
+                        ON replication_failures(rule_name, run_id, occurred_at DESC)",
+                    [],
+                )?;
+            }
+            info!(
+                "Migrated config DB schema from v{} to v8 (linked replication failures to runs)",
                 version
             );
         }

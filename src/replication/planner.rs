@@ -64,6 +64,11 @@ pub fn rewrite_key(
     dest_prefix: &str,
     source_key: &str,
 ) -> Result<String, PlanError> {
+    let source_prefix = normalize_prefix(source_prefix);
+    let dest_prefix = normalize_prefix(dest_prefix);
+    let source_prefix = source_prefix.as_str();
+    let dest_prefix = dest_prefix.as_str();
+
     if source_prefix.is_empty() && dest_prefix.is_empty() {
         return Ok(source_key.to_string());
     }
@@ -72,14 +77,32 @@ pub fn rewrite_key(
         return Ok(source_key.to_string());
     }
     if source_prefix.is_empty() {
-        return Ok(format!("{}{}", dest_prefix, source_key));
+        return Ok(format!(
+            "{}{}",
+            dest_prefix,
+            source_key.trim_start_matches('/')
+        ));
     }
     match source_key.strip_prefix(source_prefix) {
-        Some(tail) => Ok(format!("{}{}", dest_prefix, tail)),
+        Some(tail) => Ok(format!("{}{}", dest_prefix, tail.trim_start_matches('/'))),
         None => Err(PlanError::KeyOutsideSourcePrefix {
             key: source_key.to_string(),
             prefix: source_prefix.to_string(),
         }),
+    }
+}
+
+/// Canonical object-prefix form used by replication:
+/// - empty stays empty (whole bucket)
+/// - leading slashes are removed
+/// - duplicate internal slashes collapse
+/// - non-empty prefixes end in exactly one `/`
+pub fn normalize_prefix(prefix: &str) -> String {
+    let parts: Vec<&str> = prefix.split('/').filter(|part| !part.is_empty()).collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", parts.join("/"))
     }
 }
 
@@ -306,6 +329,20 @@ mod tests {
     fn rewrite_key_strips_source_prefix_and_prepends_dest() {
         let out = rewrite_key("releases/", "archive/2026/", "releases/v1.zip").unwrap();
         assert_eq!(out, "archive/2026/v1.zip");
+    }
+
+    #[test]
+    fn rewrite_key_normalizes_slashy_prefixes() {
+        let out = rewrite_key("/ror/builds//", "/lol//", "ror/builds//free/app.zip").unwrap();
+        assert_eq!(out, "lol/free/app.zip");
+    }
+
+    #[test]
+    fn normalize_prefix_removes_boundary_ambiguity() {
+        assert_eq!(normalize_prefix(""), "");
+        assert_eq!(normalize_prefix("/"), "");
+        assert_eq!(normalize_prefix("ror/builds"), "ror/builds/");
+        assert_eq!(normalize_prefix("/ror//builds//"), "ror/builds/");
     }
 
     #[test]

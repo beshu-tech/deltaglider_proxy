@@ -350,6 +350,14 @@ The chart uses the hardening expected by the Dockerfile:
 - `/tmp` provided by `emptyDir`
 - persistent `/data` volume for mutable state
 
+## Replicas and scheduled replication
+
+`replicaCount` defaults to `1`.
+
+Object replication is guarded by a per-rule database lease: scheduled runs and manual run-now both acquire the same lease, and long runs heartbeat it before copying more objects. Defaults are `lease_ttl: "60s"` and `heartbeat_interval: "20s"`, so a dead runner's lease becomes stealable after roughly a minute when every replica sees the same durable config DB state.
+
+Do not scale the chart above one replica if each pod has its own independent `/data/deltaglider_config.db`. In that shape, each pod is an independent control plane and scheduled replication is not coordinated across pods.
+
 ## Probes and Helm test
 
 The chart probes:

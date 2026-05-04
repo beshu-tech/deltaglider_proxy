@@ -25,8 +25,8 @@
 //! `reconcile_on_boot` flips the running row to `failed` but the token
 //! stays — next legitimate run resumes from the saved cursor.
 
-use super::planner::plan_batch;
-use super::state_store::{current_unix_seconds, RunTotals};
+use super::planner::{normalize_prefix, plan_batch};
+use super::state_store::{current_unix_seconds, FailureInsert, RunTotals};
 use crate::config_db::ConfigDb;
 use crate::config_sections::ReplicationRule;
 use crate::deltaglider::DynEngine;
@@ -44,6 +44,7 @@ use tracing::{debug, info, warn};
 /// survives encryption (per-backend SSE doesn't encrypt user-metadata),
 /// and is visible to operators auditing what wrote a given object.
 const REPLICATION_RULE_METADATA_KEY: &str = "dg-replication-rule";
+const COPY_MAX_ATTEMPTS: u32 = 3;
 
 /// Outcome of a single run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +52,13 @@ pub struct RunOutcome {
     /// Terminal status string (goes into `replication_run_history.status`).
     pub status: String,
     pub totals: RunTotals,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunLease {
+    pub owner: String,
+    pub ttl_secs: i64,
+    pub heartbeat_secs: i64,
 }
 
 /// Bound on the number of pages consumed in a single run, defending
@@ -63,6 +71,8 @@ pub async fn run_rule(
     engine: &Arc<DynEngine>,
     rule: &ReplicationRule,
     max_failures_retained: u32,
+    triggered_by: &str,
+    lease: Option<RunLease>,
 ) -> Result<(i64, RunOutcome), crate::config_db::ConfigDbError> {
     let started_at = current_unix_seconds();
 
@@ -73,7 +83,7 @@ pub async fn run_rule(
         db.replication_ensure_state(&rule.name, started_at)?;
         let state = db.replication_load_state(&rule.name)?;
         let resume_token = state.and_then(|s| s.continuation_token);
-        let id = db.replication_begin_run(&rule.name, started_at)?;
+        let id = db.replication_begin_run(&rule.name, started_at, triggered_by)?;
         (id, resume_token)
     };
 
@@ -91,13 +101,32 @@ pub async fn run_rule(
     let mut had_any_error = false;
     let mut hit_fatal_error = false;
     let cap = rule.batch_size.clamp(1, 10_000);
+    let source_prefix = normalize_prefix(&rule.source.prefix);
+    let lease_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let heartbeat_handle =
+        spawn_lease_heartbeat(db.clone(), &rule.name, lease.clone(), lease_alive.clone());
 
     // ── Forward-copy pass: paginate source until exhausted ──
     'pages: for page_idx in 0..MAX_PAGES_PER_RUN {
+        if !renew_run_lease(
+            &db,
+            rule,
+            lease.as_ref(),
+            &lease_alive,
+            run_id,
+            max_failures_retained,
+        )
+        .await?
+        {
+            totals.errors += 1;
+            hit_fatal_error = true;
+            break 'pages;
+        }
+
         let page = match engine
             .list_objects(
                 &rule.source.bucket,
-                &rule.source.prefix,
+                &source_prefix,
                 None,
                 cap,
                 continuation.as_deref(),
@@ -111,17 +140,16 @@ pub async fn run_rule(
                     "replication rule '{}' list page {} failed: {}",
                     rule.name, page_idx, e
                 );
-                {
-                    let db = db.lock().await;
-                    db.replication_record_failure(
-                        &rule.name,
-                        current_unix_seconds(),
-                        "",
-                        "",
-                        &format!("list source failed: {}", e),
-                        max_failures_retained,
-                    )?;
-                }
+                log_failure(
+                    &db,
+                    &rule.name,
+                    run_id,
+                    "",
+                    "",
+                    &format!("list source failed: {}", e),
+                    max_failures_retained,
+                )
+                .await?;
                 totals.errors += 1;
                 hit_fatal_error = true;
                 break 'pages;
@@ -151,17 +179,16 @@ pub async fn run_rule(
                     "replication rule '{}' page {} planner error: {}",
                     rule.name, page_idx, e
                 );
-                {
-                    let db = db.lock().await;
-                    db.replication_record_failure(
-                        &rule.name,
-                        current_unix_seconds(),
-                        "",
-                        "",
-                        &format!("planner error: {}", e),
-                        max_failures_retained,
-                    )?;
-                }
+                log_failure(
+                    &db,
+                    &rule.name,
+                    run_id,
+                    "",
+                    "",
+                    &format!("planner error: {}", e),
+                    max_failures_retained,
+                )
+                .await?;
                 totals.errors += 1;
                 hit_fatal_error = true;
                 break 'pages;
@@ -172,7 +199,21 @@ pub async fn run_rule(
 
         // Execute the copies for this page.
         for (src_key, dest_key) in &plan.to_copy {
-            match copy_one(engine, rule, src_key, dest_key).await {
+            if !renew_run_lease(
+                &db,
+                rule,
+                lease.as_ref(),
+                &lease_alive,
+                run_id,
+                max_failures_retained,
+            )
+            .await?
+            {
+                totals.errors += 1;
+                hit_fatal_error = true;
+                break 'pages;
+            }
+            match copy_one_with_retries(engine, rule, src_key, dest_key).await {
                 Ok(bytes_copied) => {
                     totals.objects_copied += 1;
                     totals.bytes_copied += bytes_copied as i64;
@@ -180,22 +221,25 @@ pub async fn run_rule(
                 Err(e) => {
                     totals.errors += 1;
                     had_any_error = true;
-                    {
-                        let db = db.lock().await;
-                        db.replication_record_failure(
-                            &rule.name,
-                            current_unix_seconds(),
-                            src_key,
-                            dest_key,
-                            &format!("{}", e),
-                            max_failures_retained,
-                        )?;
-                    }
+                    log_failure(
+                        &db,
+                        &rule.name,
+                        run_id,
+                        src_key,
+                        dest_key,
+                        &format!("{}", e),
+                        max_failures_retained,
+                    )
+                    .await?;
                     debug!(
                         "replication rule '{}' object failure src={:?} dst={:?}: {}",
                         rule.name, src_key, dest_key, e
                     );
                 }
+            }
+            {
+                let db = db.lock().await;
+                db.replication_update_run_progress(run_id, totals)?;
             }
         }
 
@@ -205,6 +249,7 @@ pub async fn run_rule(
         {
             let db = db.lock().await;
             db.replication_set_continuation_token(&rule.name, continuation.as_deref())?;
+            db.replication_update_run_progress(run_id, totals)?;
         }
 
         if !page.is_truncated || continuation.is_none() {
@@ -224,6 +269,7 @@ pub async fn run_rule(
             db.clone(),
             engine,
             rule,
+            run_id,
             &mut totals,
             &mut had_any_error,
             max_failures_retained,
@@ -277,7 +323,163 @@ pub async fn run_rule(
         totals.errors,
         totals.bytes_copied,
     );
+    if let Some(handle) = heartbeat_handle {
+        handle.abort();
+    }
     Ok((run_id, RunOutcome { status, totals }))
+}
+
+fn spawn_lease_heartbeat(
+    db: Arc<Mutex<ConfigDb>>,
+    rule_name: &str,
+    lease: Option<RunLease>,
+    lease_alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let lease = lease?;
+    let rule_name = rule_name.to_string();
+    let heartbeat_secs = lease.heartbeat_secs.max(1) as u64;
+    Some(tokio::spawn(async move {
+        let interval = std::time::Duration::from_secs(heartbeat_secs);
+        loop {
+            tokio::time::sleep(interval).await;
+            let renewed = {
+                let db = db.lock().await;
+                db.replication_renew_lease(
+                    &rule_name,
+                    &lease.owner,
+                    current_unix_seconds(),
+                    lease.ttl_secs,
+                )
+                .unwrap_or(false)
+            };
+            if !renewed {
+                lease_alive.store(false, std::sync::atomic::Ordering::Release);
+                warn!(
+                    "Replication lease heartbeat lost for rule '{}'; worker will stop before more work",
+                    rule_name
+                );
+                return;
+            }
+        }
+    }))
+}
+
+async fn renew_run_lease(
+    db: &Arc<Mutex<ConfigDb>>,
+    rule: &ReplicationRule,
+    lease: Option<&RunLease>,
+    lease_alive: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    run_id: i64,
+    max_failures_retained: u32,
+) -> Result<bool, crate::config_db::ConfigDbError> {
+    let Some(lease) = lease else {
+        return Ok(true);
+    };
+    if !lease_alive.load(std::sync::atomic::Ordering::Acquire) {
+        return record_lost_lease(db, &rule.name, run_id, max_failures_retained).await;
+    }
+    let now = current_unix_seconds();
+    let guard = db.lock().await;
+    if guard.replication_renew_lease(&rule.name, &lease.owner, now, lease.ttl_secs)? {
+        return Ok(true);
+    }
+    drop(guard);
+    record_lost_lease(db, &rule.name, run_id, max_failures_retained).await
+}
+
+async fn record_lost_lease(
+    db: &Arc<Mutex<ConfigDb>>,
+    rule_name: &str,
+    run_id: i64,
+    max_failures_retained: u32,
+) -> Result<bool, crate::config_db::ConfigDbError> {
+    log_failure(
+        db,
+        rule_name,
+        run_id,
+        "",
+        "",
+        "lost replication lease; stopping run before more work",
+        max_failures_retained,
+    )
+    .await?;
+    Ok(false)
+}
+
+async fn log_failure(
+    db: &Arc<Mutex<ConfigDb>>,
+    rule_name: &str,
+    run_id: i64,
+    source_key: &str,
+    dest_key: &str,
+    error_message: &str,
+    max_failures_retained: u32,
+) -> Result<(), crate::config_db::ConfigDbError> {
+    let db = db.lock().await;
+    db.replication_record_failure(
+        rule_name,
+        FailureInsert {
+            run_id: Some(run_id),
+            occurred_at: current_unix_seconds(),
+            source_key,
+            dest_key,
+            error_message,
+        },
+        max_failures_retained,
+    )
+}
+
+async fn copy_one_with_retries(
+    engine: &Arc<DynEngine>,
+    rule: &ReplicationRule,
+    src_key: &str,
+    dest_key: &str,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    let mut last_err: Option<String> = None;
+    for attempt in 1..=COPY_MAX_ATTEMPTS {
+        match copy_one(engine, rule, src_key, dest_key).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(err) => {
+                let msg = err.to_string();
+                if !is_transient_copy_error(&msg) || attempt == COPY_MAX_ATTEMPTS {
+                    return Err(if attempt > 1 {
+                        format!("{} (after {} attempts)", msg, attempt).into()
+                    } else {
+                        msg.into()
+                    });
+                }
+                warn!(
+                    "replication rule '{}' transient copy failure attempt {}/{} src={:?} dst={:?}: {}",
+                    rule.name, attempt, COPY_MAX_ATTEMPTS, src_key, dest_key, msg
+                );
+                last_err = Some(msg);
+                tokio::time::sleep(std::time::Duration::from_millis(250 * attempt as u64)).await;
+            }
+        }
+    }
+    Err(last_err
+        .unwrap_or_else(|| "copy failed without error detail".to_string())
+        .into())
+}
+
+fn is_transient_copy_error(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    [
+        "failed to read response body",
+        "streaming error",
+        "connection reset",
+        "connection closed",
+        "connection aborted",
+        "timed out",
+        "timeout",
+        "temporary failure",
+        "service unavailable",
+        "slowdown",
+        "internalerror",
+        "broken pipe",
+    ]
+    .iter()
+    .any(|needle| m.contains(needle))
 }
 
 /// Delete-replication pass: paginate the destination prefix; for each
@@ -294,12 +496,14 @@ async fn run_delete_pass(
     db: Arc<Mutex<ConfigDb>>,
     engine: &Arc<DynEngine>,
     rule: &ReplicationRule,
+    run_id: i64,
     totals: &mut RunTotals,
     had_any_error: &mut bool,
     max_failures_retained: u32,
 ) -> Result<(), crate::config_db::ConfigDbError> {
     let cap = rule.batch_size.clamp(1, 10_000);
     let mut cursor: Option<String> = None;
+    let destination_prefix = normalize_prefix(&rule.destination.prefix);
 
     'pages: for page_idx in 0..MAX_PAGES_PER_RUN {
         // metadata=true so user_metadata (carrying our provenance
@@ -308,7 +512,7 @@ async fn run_delete_pass(
         let page = match engine
             .list_objects(
                 &rule.destination.bucket,
-                &rule.destination.prefix,
+                &destination_prefix,
                 None,
                 cap,
                 cursor.as_deref(),
@@ -322,17 +526,16 @@ async fn run_delete_pass(
                     "replication rule '{}' delete-pass list page {} failed: {}",
                     rule.name, page_idx, e
                 );
-                {
-                    let db = db.lock().await;
-                    db.replication_record_failure(
-                        &rule.name,
-                        current_unix_seconds(),
-                        "",
-                        "",
-                        &format!("delete-pass list dest failed: {}", e),
-                        max_failures_retained,
-                    )?;
-                }
+                log_failure(
+                    &db,
+                    &rule.name,
+                    run_id,
+                    "",
+                    "",
+                    &format!("delete-pass list dest failed: {}", e),
+                    max_failures_retained,
+                )
+                .await?;
                 totals.errors += 1;
                 *had_any_error = true;
                 return Ok(());
@@ -411,15 +614,16 @@ async fn run_delete_pass(
                             Err(de) => {
                                 totals.errors += 1;
                                 *had_any_error = true;
-                                let db = db.lock().await;
-                                db.replication_record_failure(
+                                log_failure(
+                                    &db,
                                     &rule.name,
-                                    current_unix_seconds(),
+                                    run_id,
                                     &src_key,
                                     dest_key,
                                     &format!("destination delete failed: {}", de),
                                     max_failures_retained,
-                                )?;
+                                )
+                                .await?;
                             }
                         }
                     } else {
@@ -427,15 +631,16 @@ async fn run_delete_pass(
                         // would be much worse than a leftover copy.
                         totals.errors += 1;
                         *had_any_error = true;
-                        let db = db.lock().await;
-                        db.replication_record_failure(
+                        log_failure(
+                            &db,
                             &rule.name,
-                            current_unix_seconds(),
+                            run_id,
                             &src_key,
                             dest_key,
                             &format!("delete-pass head source failed: {}", s3_err),
                             max_failures_retained,
-                        )?;
+                        )
+                        .await?;
                     }
                 }
             }
@@ -457,8 +662,10 @@ async fn run_delete_pass(
 /// rule's destination prefix (which means it's outside this rule's
 /// jurisdiction; the delete pass leaves it alone).
 fn dest_to_source_key(rule: &ReplicationRule, dest_key: &str) -> Option<String> {
-    let dst_prefix = &rule.destination.prefix;
-    let src_prefix = &rule.source.prefix;
+    let dst_prefix = normalize_prefix(&rule.destination.prefix);
+    let src_prefix = normalize_prefix(&rule.source.prefix);
+    let dst_prefix = dst_prefix.as_str();
+    let src_prefix = src_prefix.as_str();
     if dst_prefix.is_empty() && src_prefix.is_empty() {
         return Some(dest_key.to_string());
     }
@@ -466,10 +673,14 @@ fn dest_to_source_key(rule: &ReplicationRule, dest_key: &str) -> Option<String> 
         return Some(dest_key.to_string());
     }
     if dst_prefix.is_empty() {
-        return Some(format!("{}{}", src_prefix, dest_key));
+        return Some(format!(
+            "{}{}",
+            src_prefix,
+            dest_key.trim_start_matches('/')
+        ));
     }
-    let tail = dest_key.strip_prefix(dst_prefix.as_str())?;
-    Some(format!("{}{}", src_prefix, tail))
+    let tail = dest_key.strip_prefix(dst_prefix)?;
+    Some(format!("{}{}", src_prefix, tail.trim_start_matches('/')))
 }
 
 /// Copy a single object: engine.retrieve from source, engine.store on
@@ -596,6 +807,28 @@ mod tests {
     }
 
     #[test]
+    fn running_progress_updates_history_before_finish() {
+        let db = ConfigDb::in_memory("testpass").unwrap();
+        db.replication_ensure_state("r", 100).unwrap();
+        let run_id = db.replication_begin_run("r", 100, "scheduler").unwrap();
+        let totals = RunTotals {
+            objects_scanned: 10,
+            objects_copied: 4,
+            objects_skipped: 6,
+            objects_deleted: 0,
+            bytes_copied: 1234,
+            errors: 2,
+        };
+        db.replication_update_run_progress(run_id, totals).unwrap();
+
+        let runs = db.replication_recent_runs("r", 1).unwrap();
+        assert_eq!(runs[0].status, "running");
+        assert_eq!(runs[0].objects_scanned, 10);
+        assert_eq!(runs[0].objects_copied, 4);
+        assert_eq!(runs[0].errors, 2);
+    }
+
+    #[test]
     fn dest_to_source_key_identity_when_prefixes_empty() {
         let rule = mk_rule();
         assert_eq!(
@@ -631,5 +864,20 @@ mod tests {
             dest_to_source_key(&rule, "v1.zip"),
             Some("releases/v1.zip".to_string())
         );
+    }
+
+    #[test]
+    fn transient_copy_error_classification_is_narrow() {
+        assert!(is_transient_copy_error(
+            "source retrieve failed: Storage error: S3 error: Failed to read response body: streaming error"
+        ));
+        assert!(is_transient_copy_error("connection reset by peer"));
+        assert!(is_transient_copy_error("503 SlowDown"));
+
+        assert!(!is_transient_copy_error(
+            "destination store failed: Storage error: Bucket not found: test-bucket"
+        ));
+        assert!(!is_transient_copy_error("AccessDenied"));
+        assert!(!is_transient_copy_error("NoSuchKey"));
     }
 }

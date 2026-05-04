@@ -71,6 +71,12 @@ kind delete cluster --name dgp-hello
 For production, provide stable secrets through `auth.existingSecret` or a
 sealed/external secret. Do not rely on the chart defaults.
 
+## Replicas and replication scheduler
+
+`replicaCount` defaults to `1`. Object replication rules are safe from duplicate execution through a per-rule database lease: automatic scheduler ticks and manual `Run now` compete for the same lease, and long runs heartbeat it before starting more work. Defaults are `lease_ttl: "60s"` and `heartbeat_interval: "20s"`.
+
+Use more than one replica only when every replica can see the same durable config DB state. If each pod has an independent `/data/deltaglider_config.db`, each pod is an independent control plane and scheduled replication is not coordinated across pods.
+
 ## Production secrets
 
 Create a Secret outside Helm and point `auth.existingSecret` at it. This keeps credentials out of Helm values and release history.

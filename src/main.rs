@@ -456,6 +456,15 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     });
     let shared_config = config.clone().into_shared();
     let (config_db, config_db_mismatch) = init_config_db(&admin_password_hash, &iam_state);
+    if !config_db_mismatch {
+        if let Some(db) = config_db.as_ref() {
+            deltaglider_proxy::replication::scheduler::spawn_scheduler(
+                shared_config.clone(),
+                db.clone(),
+                state.clone(),
+            );
+        }
+    }
 
     // --- Public prefix snapshot (lock-free, hot-swappable) ---
     let public_prefix_snapshot: deltaglider_proxy::bucket_policy::SharedPublicPrefixSnapshot =

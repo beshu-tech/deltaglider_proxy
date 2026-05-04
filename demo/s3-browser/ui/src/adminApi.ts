@@ -840,6 +840,8 @@ export interface ReplicationRuleConfig {
 export interface ReplicationConfig {
   enabled: boolean;
   tick_interval: string;
+  lease_ttl: string;
+  heartbeat_interval: string;
   max_failures_retained: number;
   rules: ReplicationRuleConfig[];
 }
@@ -883,6 +885,7 @@ interface ReplicationRunNowResponse {
 
 export interface ReplicationHistoryEntry {
   id: number;
+  triggered_by: 'scheduler' | 'run-now' | 'unknown' | string;
   started_at: number;
   finished_at: number | null;
   objects_scanned: number;
@@ -896,6 +899,7 @@ export interface ReplicationHistoryEntry {
 
 export interface ReplicationFailureEntry {
   id: number;
+  run_id: number | null;
   occurred_at: number;
   source_key: string;
   dest_key: string;

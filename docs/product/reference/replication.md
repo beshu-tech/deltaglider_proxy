@@ -1,9 +1,9 @@
 # Lazy bucket replication (v1)
 
 *Engine-routed source → destination object copy, transparent to
-per-backend encryption and delta compression. v1 ships run-now,
-pause/resume, state, history, and delete replication; the periodic
-background scheduler is still deferred.*
+per-backend encryption and delta compression. v1 ships automatic
+scheduled runs, run-now, pause/resume, state, history, and delete
+replication.*
 
 ## Why it lives in the proxy
 
@@ -23,10 +23,15 @@ to delta-compress and which encryption mode to apply.
 ## v1 scope
 
 - One-way, bucket/prefix-level replication through the DeltaGlider
-  engine. Operators trigger a rule through the admin API or GUI.
-- Rules carry `interval` and `next_due_at` state so the model is ready
-  for the background scheduler, but current shipped execution is
-  explicit run-now.
+  engine. The scheduler runs due rules automatically; operators can
+  also trigger a rule through the admin API or GUI.
+- Rules carry `interval` and persisted `next_due_at` state. Disabled
+  rules and paused rules are skipped by both the scheduler and run-now.
+- A per-rule DB lease prevents the scheduler and run-now from executing
+  the same rule at the same time. If a rule is already leased, run-now
+  returns `409 Conflict` and the scheduler skips that tick. Long runs
+  heartbeat the lease before starting new pages/objects; if the lease is
+  lost, the worker stops before doing more work and records a failure.
 - At-least-once semantics. Conflict policies: `newer-wins` (default),
   `source-wins`, `skip-if-dest-exists`.
 - Optional delete replication for destination objects previously
@@ -42,6 +47,8 @@ storage:
   replication:
     enabled: true                    # master kill-switch
     tick_interval: "30s"             # scheduler poll rate (min 5s)
+    lease_ttl: "60s"                 # failover window for a dead runner (min 15s)
+    heartbeat_interval: "20s"        # lease renewal cadence (min 5s; must be < lease_ttl)
     max_failures_retained: 100       # per-rule failure ring size
 
     rules:
@@ -75,7 +82,7 @@ operator-level storage config). Response shapes are JSON.
 | `POST` | `/_/api/admin/replication/rules/:name/run-now` | Trigger a synchronous run. Returns 409 Conflict on a paused rule. |
 | `POST` | `/_/api/admin/replication/rules/:name/pause` | Set paused=true. Persists across restarts. |
 | `POST` | `/_/api/admin/replication/rules/:name/resume` | Clear the paused flag. |
-| `GET` | `/_/api/admin/replication/rules/:name/history?limit=N` | Recent runs (default 20, max 100). |
+| `GET` | `/_/api/admin/replication/rules/:name/history?limit=N` | Recent runs (default 20, max 100), including `triggered_by` (`scheduler`, `run-now`, or `unknown` for legacy rows). |
 | `GET` | `/_/api/admin/replication/rules/:name/failures?limit=N` | Recent per-object failures. |
 
 ### Run-now response

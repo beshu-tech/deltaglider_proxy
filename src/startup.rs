@@ -694,6 +694,17 @@ pub fn init_config_db(
     let db_file = config_db_path();
     match deltaglider_proxy::config_db::ConfigDb::open_or_create(&db_file, admin_password_hash) {
         Ok(db) => {
+            match db.replication_reconcile_on_boot() {
+                Ok(count) if count > 0 => {
+                    warn!(
+                        "Reconciled {count} replication run(s) left running by a previous process"
+                    );
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    warn!("Failed to reconcile replication runtime state on boot: {err}");
+                }
+            }
             // If DB has existing users, switch to IAM mode
             if let Ok(users) = db.load_users() {
                 if !users.is_empty() {

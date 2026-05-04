@@ -79,6 +79,30 @@ replication:
       replicate_deletes: true
 ";
 
+const SCHEDULER_EMPTY_YAML: &str = "
+replication:
+  enabled: true
+  tick_interval: \"5s\"
+  rules: []
+";
+
+const PREFIX_NORMALIZATION_RULE_YAML: &str = "
+replication:
+  enabled: true
+  tick_interval: \"30s\"
+  rules:
+    - name: prefix-normalization-rule
+      enabled: true
+      source:
+        bucket: norm-src
+        prefix: \"source\"
+      destination:
+        bucket: norm-dst
+        prefix: \"dest\"
+      interval: \"1h\"
+      batch_size: 100
+";
+
 /// Spin up a proxy with two buckets and a replication rule wired
 /// up in the YAML. A single run-now copies all objects from source
 /// to destination.
@@ -163,7 +187,160 @@ async fn test_replication_run_now_copies_missing_objects() {
     let runs = hist["runs"].as_array().expect("history runs");
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0]["status"].as_str(), Some("succeeded"));
+    assert_eq!(runs[0]["triggered_by"].as_str(), Some("run-now"));
     assert_eq!(runs[0]["objects_copied"].as_i64(), Some(3));
+}
+
+/// Scheduler regression: a rule added via the storage section should run
+/// automatically when due, without calling the run-now endpoint.
+#[tokio::test]
+async fn test_replication_scheduler_copies_due_rule() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(SCHEDULER_EMPTY_YAML)
+        .build()
+        .await;
+
+    let client = server.s3_client().await;
+    for b in ["sched-src", "sched-dst"] {
+        client.create_bucket().bucket(b).send().await.ok();
+    }
+    client
+        .put_object()
+        .bucket("sched-src")
+        .key("hello.txt")
+        .body(ByteStream::from(b"hello from scheduler".to_vec()))
+        .send()
+        .await
+        .expect("seed scheduler source");
+
+    let admin = admin_http_client(&server.endpoint()).await;
+    let apply = admin
+        .put(format!(
+            "{}/_/api/admin/config/section/storage",
+            server.endpoint()
+        ))
+        .json(&serde_json::json!({
+            "replication": {
+                "enabled": true,
+                "tick_interval": "5s",
+                "rules": [{
+                    "name": "scheduler-rule",
+                    "enabled": true,
+                    "source": { "bucket": "sched-src", "prefix": "" },
+                    "destination": { "bucket": "sched-dst", "prefix": "" },
+                    "interval": "30s",
+                    "batch_size": 100
+                }]
+            }
+        }))
+        .send()
+        .await
+        .expect("apply storage replication section");
+    assert_eq!(apply.status().as_u16(), 200, "apply response: {:?}", apply);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if client
+            .head_object()
+            .bucket("sched-dst")
+            .key("hello.txt")
+            .send()
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "scheduled replication did not copy sched-dst/hello.txt before timeout"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+
+    let hist: Value = admin
+        .get(format!(
+            "{}/_/api/admin/replication/rules/scheduler-rule/history",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let runs = hist["runs"].as_array().expect("history runs");
+    assert_eq!(runs.len(), 1, "expected exactly one scheduler run: {hist}");
+    assert_eq!(runs[0]["status"].as_str(), Some("succeeded"));
+    assert_eq!(runs[0]["triggered_by"].as_str(), Some("scheduler"));
+    assert_eq!(runs[0]["objects_copied"].as_i64(), Some(1));
+}
+
+/// Prefix normalization regression: direct YAML may use `prefix: "source"`
+/// without a trailing slash. The worker must list `source/`, not raw
+/// `source`, otherwise a sibling key like `source-other/file.txt` is listed
+/// and then rejected by the normalized planner as outside the source prefix.
+#[tokio::test]
+async fn test_replication_normalizes_prefixes_at_worker_boundaries() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(PREFIX_NORMALIZATION_RULE_YAML)
+        .build()
+        .await;
+
+    let client = server.s3_client().await;
+    for b in ["norm-src", "norm-dst"] {
+        client.create_bucket().bucket(b).send().await.ok();
+    }
+
+    client
+        .put_object()
+        .bucket("norm-src")
+        .key("source/file.txt")
+        .body(ByteStream::from(b"copy me".to_vec()))
+        .send()
+        .await
+        .expect("seed normalized source key");
+    client
+        .put_object()
+        .bucket("norm-src")
+        .key("source-other/poison.txt")
+        .body(ByteStream::from(b"must not be listed".to_vec()))
+        .send()
+        .await
+        .expect("seed sibling prefix key");
+
+    let admin = admin_http_client(&server.endpoint()).await;
+    let resp = admin
+        .post(format!(
+            "{}/_/api/admin/replication/rules/prefix-normalization-rule/run-now",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .expect("run-now");
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["status"].as_str(), Some("succeeded"), "{body}");
+    assert_eq!(body["objects_copied"].as_i64(), Some(1), "{body}");
+
+    client
+        .head_object()
+        .bucket("norm-dst")
+        .key("dest/file.txt")
+        .send()
+        .await
+        .expect("normalized destination key exists");
+    assert!(
+        client
+            .head_object()
+            .bucket("norm-dst")
+            .key("dest-other/poison.txt")
+            .send()
+            .await
+            .is_err(),
+        "sibling prefix key must not be replicated"
+    );
 }
 
 /// A paused rule must return 409 on run-now until resumed.

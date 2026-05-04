@@ -161,11 +161,14 @@ pub async fn run_now(
         })?
         .clone();
 
-    // Short lock for the precheck only — run_rule acquires the lock
-    // itself at each sync boundary (see its doc comment).
+    let lease_owner = format!("run-now:{}", uuid::Uuid::new_v4());
+
+    // Short lock for the precheck + lease acquisition only — run_rule
+    // acquires the lock itself at each sync boundary (see its doc comment).
     {
         let db = db_arc.lock().await;
-        let _ = db.replication_ensure_state(&rule.name, replication::current_unix_seconds());
+        let now = replication::current_unix_seconds();
+        let _ = db.replication_ensure_state(&rule.name, now);
         if let Ok(Some(st)) = db.replication_load_state(&rule.name) {
             if st.paused {
                 return Err((
@@ -174,15 +177,46 @@ pub async fn run_now(
                 ));
             }
         }
+        let acquired = db
+            .replication_try_acquire_lease(
+                &rule.name,
+                &lease_owner,
+                now,
+                replication::scheduler::lease_ttl_secs(&repl),
+            )
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)))?;
+        if !acquired {
+            return Err((
+                StatusCode::CONFLICT,
+                "rule is already running; wait for the current run to finish".to_string(),
+            ));
+        }
     }
 
     info!("Replication run-now via admin API: rule='{}'", name);
 
     let engine = state.s3_state.engine.load().clone();
+    let run_result = replication::run_rule(
+        db_arc.clone(),
+        &engine,
+        &rule,
+        repl.max_failures_retained,
+        "run-now",
+        Some(replication::RunLease {
+            owner: lease_owner.clone(),
+            ttl_secs: replication::scheduler::lease_ttl_secs(&repl),
+            heartbeat_secs: replication::scheduler::heartbeat_secs(&repl),
+        }),
+    )
+    .await;
+
+    {
+        let db = db_arc.lock().await;
+        let _ = db.replication_release_lease(&rule.name, &lease_owner);
+    }
+
     let (run_id, outcome) =
-        replication::run_rule(db_arc, &engine, &rule, repl.max_failures_retained)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)))?;
+        run_result.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)))?;
 
     crate::audit::audit_log(
         "replication_run_now",
@@ -286,6 +320,7 @@ pub struct HistoryResponse {
 #[derive(Debug, Serialize)]
 pub struct HistoryEntry {
     pub id: i64,
+    pub triggered_by: String,
     pub started_at: i64,
     pub finished_at: Option<i64>,
     pub objects_scanned: i64,
@@ -322,6 +357,7 @@ pub async fn history(
             .into_iter()
             .map(|r| HistoryEntry {
                 id: r.id,
+                triggered_by: r.triggered_by,
                 started_at: r.started_at,
                 finished_at: r.finished_at,
                 objects_scanned: r.objects_scanned,
@@ -344,6 +380,7 @@ pub struct FailuresResponse {
 #[derive(Debug, Serialize)]
 pub struct FailureEntry {
     pub id: i64,
+    pub run_id: Option<i64>,
     pub occurred_at: i64,
     pub source_key: String,
     pub dest_key: String,
@@ -375,6 +412,7 @@ pub async fn failures(
             .into_iter()
             .map(|f| FailureEntry {
                 id: f.id,
+                run_id: f.run_id,
                 occurred_at: f.occurred_at,
                 source_key: f.source_key,
                 dest_key: f.dest_key,

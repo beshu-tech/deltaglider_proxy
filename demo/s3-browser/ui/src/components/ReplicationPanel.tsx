@@ -57,6 +57,8 @@ interface Props {
 const DEFAULT_REPLICATION: ReplicationConfig = {
   enabled: true,
   tick_interval: '30s',
+  lease_ttl: '60s',
+  heartbeat_interval: '20s',
   max_failures_retained: 100,
   rules: [],
 };
@@ -109,6 +111,11 @@ function lineList(value: string): string[] {
 
 function lines(value: string[]): string {
   return value.join('\n');
+}
+
+function normalizePrefix(value: string): string {
+  const parts = value.split('/').map((part) => part.trim()).filter(Boolean);
+  return parts.length === 0 ? '' : `${parts.join('/')}/`;
 }
 
 function fmtUnix(ts: number | null | undefined): string {
@@ -234,13 +241,18 @@ export default function ReplicationPanel({ onSessionExpired }: Props) {
   };
 
   const buildPayload = useCallback((): StorageSectionBody | null => {
-    const names = replication.rules.map((r) => r.name.trim()).filter(Boolean);
+    const normalizedRules = replication.rules.map((rule) => ({
+      ...rule,
+      source: { ...rule.source, prefix: normalizePrefix(rule.source.prefix) },
+      destination: { ...rule.destination, prefix: normalizePrefix(rule.destination.prefix) },
+    }));
+    const names = normalizedRules.map((r) => r.name.trim()).filter(Boolean);
     const duplicate = names.find((name, idx) => names.indexOf(name) !== idx);
     if (duplicate) {
       message.error(`Duplicate rule name: ${duplicate}`);
       return null;
     }
-    for (const rule of replication.rules) {
+    for (const rule of normalizedRules) {
       if (!rule.name.trim()) {
         message.error('Every replication rule needs a name.');
         return null;
@@ -250,7 +262,7 @@ export default function ReplicationPanel({ onSessionExpired }: Props) {
         return null;
       }
     }
-    return { replication };
+    return { replication: { ...replication, rules: normalizedRules } };
   }, [replication]);
 
   const runApply = useCallback(async () => {
@@ -361,33 +373,64 @@ export default function ReplicationPanel({ onSessionExpired }: Props) {
           title="Object replication"
           description="Copy object data between buckets or prefixes through the DeltaGlider engine, preserving encryption and compression transparency."
         />
-        <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginTop: 14 }}>
+        <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginTop: 14, alignItems: 'center' }}>
           <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <Switch checked={replication.enabled} onChange={(v) => updateConfig({ enabled: v })} />
-            <Text strong>Replication worker</Text>
+            <Text strong>Automatic scheduler</Text>
           </label>
-          <label>
-            <Text type="secondary" style={{ fontSize: 12 }}>Scheduler tick</Text>
-            <Input
-              value={replication.tick_interval}
-              onChange={(e) => updateConfig({ tick_interval: e.target.value })}
-              style={{ width: 110, marginLeft: 8, ...inputRadius }}
-            />
-          </label>
-          <label>
-            <Text type="secondary" style={{ fontSize: 12 }}>Failures retained</Text>
-            <InputNumber
-              value={replication.max_failures_retained}
-              onChange={(v) => updateConfig({ max_failures_retained: v ?? 100 })}
-              min={1}
-              max={10000}
-              style={{ width: 110, marginLeft: 8, ...inputRadius }}
-            />
-          </label>
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            Uses sane defaults: tick {replication.tick_interval}, failover {replication.lease_ttl}, heartbeat {replication.heartbeat_interval}.
+          </Text>
           <Button type="primary" onClick={runApply} disabled={!isDirty} loading={applying}>
             Review apply
           </Button>
         </div>
+        <AdvancedDisclosure title="Advanced scheduler settings">
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
+            <Field label="Scheduler tick">
+              <Input
+                value={replication.tick_interval}
+                onChange={(e) => updateConfig({ tick_interval: e.target.value })}
+                style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
+              />
+              <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 4 }}>
+                How often the scheduler checks for due rules. Default: <Text code>30s</Text>.
+              </Text>
+            </Field>
+            <Field label="Lease TTL">
+              <Input
+                value={replication.lease_ttl}
+                onChange={(e) => updateConfig({ lease_ttl: e.target.value })}
+                style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
+              />
+              <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 4 }}>
+                Dead-runner failover window. Default: <Text code>60s</Text>.
+              </Text>
+            </Field>
+            <Field label="Heartbeat">
+              <Input
+                value={replication.heartbeat_interval}
+                onChange={(e) => updateConfig({ heartbeat_interval: e.target.value })}
+                style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
+              />
+              <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 4 }}>
+                Lease renewal cadence. Default: <Text code>20s</Text>.
+              </Text>
+            </Field>
+            <Field label="Failures retained">
+              <InputNumber
+                value={replication.max_failures_retained}
+                onChange={(v) => updateConfig({ max_failures_retained: v ?? 100 })}
+                min={1}
+                max={10000}
+                style={{ width: '100%', ...inputRadius }}
+              />
+              <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 4 }}>
+                Per-rule failure history kept in the config DB. Default: <Text code>100</Text>.
+              </Text>
+            </Field>
+          </div>
+        </AdvancedDisclosure>
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: '320px minmax(0, 1fr)', gap: 16 }}>
@@ -523,7 +566,7 @@ function ReplicationApplySummary({ replication }: { replication: ReplicationConf
     >
       <Text strong>Replication plan</Text>
       <Text type="secondary" style={{ display: 'block', fontSize: 12, marginTop: 4 }}>
-        Worker {replication.enabled ? 'enabled' : 'disabled'} · tick {replication.tick_interval} · {replication.rules.length} rule{replication.rules.length === 1 ? '' : 's'}
+        Scheduler {replication.enabled ? 'enabled' : 'disabled'} · tick {replication.tick_interval} · lease {replication.lease_ttl} · heartbeat {replication.heartbeat_interval} · {replication.rules.length} rule{replication.rules.length === 1 ? '' : 's'}
       </Text>
       <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 8 }}>
         {replication.rules.length === 0 ? (
@@ -586,8 +629,6 @@ function RuleEditor({
   onChange: (patch: Partial<ReplicationRuleConfig>) => void;
   onRename: (nextName: string) => void;
 }) {
-  const colors = useColors();
-
   return (
     <div>
       <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'flex-start' }}>
@@ -625,9 +666,11 @@ function RuleEditor({
           <Input
             value={rule.source.prefix}
             onChange={(e) => onChange({ source: { ...rule.source, prefix: e.target.value } })}
-            placeholder="builds/"
+            onBlur={(e) => onChange({ source: { ...rule.source, prefix: normalizePrefix(e.target.value) } })}
+            placeholder="ror/builds"
             style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
           />
+          <PrefixHelp value={rule.source.prefix} />
         </Field>
         <Field label="Destination bucket">
           <SimpleAutoComplete
@@ -641,15 +684,16 @@ function RuleEditor({
           <Input
             value={rule.destination.prefix}
             onChange={(e) => onChange({ destination: { ...rule.destination, prefix: e.target.value } })}
-            placeholder="builds/"
+            onBlur={(e) => onChange({ destination: { ...rule.destination, prefix: normalizePrefix(e.target.value) } })}
+            placeholder="lol"
             style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
           />
+          <PrefixHelp value={rule.destination.prefix} />
         </Field>
       </div>
 
-      <div style={{ marginTop: 16, borderTop: `1px solid ${colors.BORDER}`, paddingTop: 16 }}>
-        <Text strong>Advanced rule behavior</Text>
-        <div style={{ marginTop: 12, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+      <AdvancedDisclosure title="Advanced rule behavior">
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
           <Field label="Interval">
             <Input
               value={rule.interval}
@@ -709,7 +753,7 @@ function RuleEditor({
             />
           </Field>
         </div>
-      </div>
+      </AdvancedDisclosure>
 
       <Text type="secondary" style={{ display: 'block', marginTop: 12, fontSize: 11 }}>
         Replication rules target bucket names. Bucket policies decide backend routing and encryption.
@@ -729,6 +773,47 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
+function AdvancedDisclosure({ title, children }: { title: string; children: React.ReactNode }) {
+  const { BORDER, TEXT_SECONDARY } = useColors();
+  return (
+    <details
+      style={{
+        marginTop: 16,
+        borderTop: `1px solid ${BORDER}`,
+        paddingTop: 12,
+      }}
+    >
+      <summary
+        style={{
+          cursor: 'pointer',
+          color: TEXT_SECONDARY,
+          fontSize: 12,
+          fontWeight: 700,
+          letterSpacing: 0.5,
+          textTransform: 'uppercase',
+          userSelect: 'none',
+        }}
+      >
+        {title}
+      </summary>
+      <div style={{ marginTop: 12 }}>
+        {children}
+      </div>
+    </details>
+  );
+}
+
+function PrefixHelp({ value }: { value: string }) {
+  const normalized = normalizePrefix(value);
+  return (
+    <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 4 }}>
+      {normalized
+        ? <>Canonical path: <Text code>{normalized}</Text></>
+        : 'Leave empty for the whole bucket. Slashes are normalized automatically.'}
+    </Text>
+  );
+}
+
 function RuntimeDetails({
   history,
   failures,
@@ -736,36 +821,124 @@ function RuntimeDetails({
   history: ReplicationHistoryEntry[];
   failures: ReplicationFailureEntry[];
 }) {
+  const latestRunId = history[0]?.id ?? null;
+  const latestRunFailures = latestRunId == null
+    ? []
+    : failures.filter((failure) => failure.run_id === latestRunId);
+  const olderFailures = latestRunId == null
+    ? failures
+    : failures.filter((failure) => failure.run_id !== latestRunId);
+
   return (
-    <div style={{ marginTop: 18, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+    <div style={{ marginTop: 18, display: 'flex', flexDirection: 'column', gap: 14 }}>
       <div>
         <Text strong>Recent runs</Text>
-        <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
           {history.length === 0 ? (
             <Text type="secondary" style={{ fontSize: 12 }}>No runs recorded.</Text>
           ) : history.map((run) => (
-            <div key={run.id} style={{ fontSize: 12 }}>
+            <div
+              key={run.id}
+              style={{
+                fontSize: 12,
+                border: '1px solid var(--border)',
+                borderRadius: 999,
+                padding: '6px 10px',
+                background: 'var(--input-bg)',
+                whiteSpace: 'nowrap',
+              }}
+            >
               <Tag color={run.status === 'failed' ? 'error' : 'success'}>{run.status}</Tag>
+              <Tag color="processing">{run.triggered_by}</Tag>
               {fmtUnix(run.started_at)} · copied {run.objects_copied}/{run.objects_scanned} · errors {run.errors}
             </div>
           ))}
         </div>
       </div>
+
       <div>
-        <Text strong>Recent failures</Text>
-        <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
-          {failures.length === 0 ? (
-            <Text type="secondary" style={{ fontSize: 12 }}>No failures recorded.</Text>
-          ) : failures.map((failure) => (
-            <div key={failure.id} style={{ fontSize: 12 }}>
+        <FailureSection
+          title={latestRunId == null ? 'Failures' : `Failures from latest run #${latestRunId}`}
+          failures={latestRunFailures}
+          emptyText={latestRunId == null ? 'No failures recorded.' : 'No failures recorded for the latest run.'}
+          prominent
+        />
+        {olderFailures.length > 0 && (
+          <div style={{ marginTop: 14 }}>
+            <FailureSection
+              title="Older failures"
+              failures={olderFailures}
+              emptyText="No older failures."
+            />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function FailureSection({
+  title,
+  failures,
+  emptyText,
+  prominent = false,
+}: {
+  title: string;
+  failures: ReplicationFailureEntry[];
+  emptyText: string;
+  prominent?: boolean;
+}) {
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' }}>
+        <Text strong>{title}</Text>
+        {failures.length > 0 && <Tag color="error">{failures.length} shown</Tag>}
+      </div>
+      {prominent && failures.length > 0 && (
+        <Alert
+          type="error"
+          showIcon
+          style={{ marginTop: 8 }}
+          message={failures[0].error_message}
+          description={
+            <span>
+              Latest failed copy: <Text code>{failures[0].source_key}</Text> →{' '}
+              <Text code>{failures[0].dest_key}</Text>
+            </span>
+          }
+        />
+      )}
+      <div style={{ marginTop: 8, display: 'grid', gridTemplateColumns: '1fr', gap: 8, maxHeight: 420, overflow: 'auto' }}>
+        {failures.length === 0 ? (
+          <Text type="secondary" style={{ fontSize: 12 }}>{emptyText}</Text>
+        ) : failures.map((failure) => (
+          <div
+            key={failure.id}
+            style={{
+              fontSize: 12,
+              border: '1px solid var(--border)',
+              borderRadius: 10,
+              padding: '8px 10px',
+              background: 'var(--input-bg)',
+              display: 'grid',
+              gridTemplateColumns: '180px minmax(0, 1fr) minmax(220px, 0.8fr)',
+              gap: 10,
+              alignItems: 'start',
+            }}
+          >
+            <div>
               <WarningOutlined style={{ color: '#d1617a', marginRight: 6 }} />
-              <Text code>{failure.source_key}</Text> → <Text code>{failure.dest_key}</Text>
-              <Text type="secondary" style={{ display: 'block', marginTop: 2 }}>
-                {failure.error_message}
-              </Text>
+              <Text type="secondary">{fmtUnix(failure.occurred_at)}</Text>
+              {failure.run_id != null && <Tag>run #{failure.run_id}</Tag>}
             </div>
-          ))}
-        </div>
+            <div style={{ wordBreak: 'break-word' }}>
+              <Text code>{failure.source_key || '(operation)'}</Text> → <Text code>{failure.dest_key || '(none)'}</Text>
+            </div>
+            <Text type="secondary" style={{ display: 'block' }}>
+              {failure.error_message}
+            </Text>
+          </div>
+        ))}
       </div>
     </div>
   );

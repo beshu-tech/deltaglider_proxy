@@ -35,6 +35,7 @@ pub struct ReplicationState {
 pub struct RunRecord {
     pub id: i64,
     pub rule_name: String,
+    pub triggered_by: String,
     pub started_at: i64,
     pub finished_at: Option<i64>,
     pub objects_scanned: i64,
@@ -51,10 +52,19 @@ pub struct RunRecord {
 pub struct FailureRecord {
     pub id: i64,
     pub rule_name: String,
+    pub run_id: Option<i64>,
     pub occurred_at: i64,
     pub source_key: String,
     pub dest_key: String,
     pub error_message: String,
+}
+
+pub struct FailureInsert<'a> {
+    pub run_id: Option<i64>,
+    pub occurred_at: i64,
+    pub source_key: &'a str,
+    pub dest_key: &'a str,
+    pub error_message: &'a str,
 }
 
 /// Totals emitted by the worker at run termination.
@@ -152,10 +162,11 @@ impl ConfigDb {
             )?;
             self.conn.execute(
                 "INSERT INTO replication_failures
-                    (rule_name, occurred_at, source_key, dest_key, error_message)
-                 VALUES (?, ?, '', '', ?)",
+                    (rule_name, run_id, occurred_at, source_key, dest_key, error_message)
+                 VALUES (?, ?, ?, '', '', ?)",
                 params![
                     rule_name,
+                    id,
                     now,
                     format!(
                         "proxy process died mid-run (was running since unix={})",
@@ -223,16 +234,89 @@ impl ConfigDb {
         Ok(n > 0)
     }
 
+    /// Try to acquire the per-rule run lease.
+    ///
+    /// This is the single-flight guard shared by the periodic scheduler
+    /// and the admin "run now" endpoint. The caller must already have
+    /// ensured the state row exists. Existing unexpired leases win; expired
+    /// leases are stolen by the new owner.
+    pub fn replication_try_acquire_lease(
+        &self,
+        rule_name: &str,
+        owner: &str,
+        now: i64,
+        ttl_secs: i64,
+    ) -> Result<bool, ConfigDbError> {
+        let expires_at = now.saturating_add(ttl_secs.max(1));
+        let n = self.conn.execute(
+            "UPDATE replication_state
+                SET leader_instance_id = ?,
+                    leader_expires_at  = ?
+              WHERE rule_name = ?
+                AND (
+                    leader_instance_id IS NULL
+                    OR leader_expires_at IS NULL
+                    OR leader_expires_at <= ?
+                )",
+            params![owner, expires_at, rule_name, now],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Release the per-rule run lease if this owner still holds it.
+    ///
+    /// Returns false if the lease had expired and another owner acquired it,
+    /// or if the rule row disappeared.
+    pub fn replication_release_lease(
+        &self,
+        rule_name: &str,
+        owner: &str,
+    ) -> Result<bool, ConfigDbError> {
+        let n = self.conn.execute(
+            "UPDATE replication_state
+                SET leader_instance_id = NULL,
+                    leader_expires_at  = NULL
+              WHERE rule_name = ?
+                AND leader_instance_id = ?",
+            params![rule_name, owner],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Extend the per-rule run lease if this owner still holds it.
+    ///
+    /// Returns false when another process has stolen/expired the lease or the
+    /// rule row disappeared. Callers should stop work before starting another
+    /// object/page when renewal fails.
+    pub fn replication_renew_lease(
+        &self,
+        rule_name: &str,
+        owner: &str,
+        now: i64,
+        ttl_secs: i64,
+    ) -> Result<bool, ConfigDbError> {
+        let expires_at = now.saturating_add(ttl_secs.max(1));
+        let n = self.conn.execute(
+            "UPDATE replication_state
+                SET leader_expires_at = ?
+              WHERE rule_name = ?
+                AND leader_instance_id = ?",
+            params![expires_at, rule_name, owner],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Begin a new run. Returns the newly-assigned history row id.
     pub fn replication_begin_run(
         &self,
         rule_name: &str,
         started_at: i64,
+        triggered_by: &str,
     ) -> Result<i64, ConfigDbError> {
         self.conn.execute(
-            "INSERT INTO replication_run_history (rule_name, started_at, status)
-             VALUES (?, ?, 'running')",
-            params![rule_name, started_at],
+            "INSERT INTO replication_run_history (rule_name, triggered_by, started_at, status)
+             VALUES (?, ?, ?, 'running')",
+            params![rule_name, triggered_by, started_at],
         )?;
         let id = self.conn.last_insert_rowid();
 
@@ -298,6 +382,38 @@ impl ConfigDb {
         Ok(())
     }
 
+    /// Update the in-progress counters for a running replication row.
+    ///
+    /// Used by long scheduler runs so the admin UI can show live
+    /// progress instead of `0/0` until the run finishes.
+    pub fn replication_update_run_progress(
+        &self,
+        run_id: i64,
+        totals: RunTotals,
+    ) -> Result<(), ConfigDbError> {
+        self.conn.execute(
+            "UPDATE replication_run_history
+                SET objects_scanned = ?,
+                    objects_copied  = ?,
+                    objects_skipped = ?,
+                    objects_deleted = ?,
+                    bytes_copied    = ?,
+                    errors          = ?
+              WHERE id = ?
+                AND status = 'running'",
+            params![
+                totals.objects_scanned,
+                totals.objects_copied,
+                totals.objects_skipped,
+                totals.objects_deleted,
+                totals.bytes_copied,
+                totals.errors,
+                run_id,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Persist the continuation token for a rule.
     pub fn replication_set_continuation_token(
         &self,
@@ -315,17 +431,21 @@ impl ConfigDb {
     pub fn replication_record_failure(
         &self,
         rule_name: &str,
-        occurred_at: i64,
-        source_key: &str,
-        dest_key: &str,
-        error_message: &str,
+        failure: FailureInsert<'_>,
         max_retained: u32,
     ) -> Result<(), ConfigDbError> {
         self.conn.execute(
             "INSERT INTO replication_failures
-                (rule_name, occurred_at, source_key, dest_key, error_message)
-             VALUES (?, ?, ?, ?, ?)",
-            params![rule_name, occurred_at, source_key, dest_key, error_message],
+                (rule_name, run_id, occurred_at, source_key, dest_key, error_message)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![
+                rule_name,
+                failure.run_id,
+                failure.occurred_at,
+                failure.source_key,
+                failure.dest_key,
+                failure.error_message
+            ],
         )?;
         self.conn.execute(
             "DELETE FROM replication_failures
@@ -348,7 +468,7 @@ impl ConfigDb {
         limit: u32,
     ) -> Result<Vec<FailureRecord>, ConfigDbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, rule_name, occurred_at, source_key, dest_key, error_message
+            "SELECT id, rule_name, run_id, occurred_at, source_key, dest_key, error_message
              FROM replication_failures
              WHERE rule_name = ?
              ORDER BY occurred_at DESC
@@ -359,10 +479,11 @@ impl ConfigDb {
                 Ok(FailureRecord {
                     id: r.get(0)?,
                     rule_name: r.get(1)?,
-                    occurred_at: r.get(2)?,
-                    source_key: r.get(3)?,
-                    dest_key: r.get(4)?,
-                    error_message: r.get(5)?,
+                    run_id: r.get(2)?,
+                    occurred_at: r.get(3)?,
+                    source_key: r.get(4)?,
+                    dest_key: r.get(5)?,
+                    error_message: r.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -376,7 +497,7 @@ impl ConfigDb {
         limit: u32,
     ) -> Result<Vec<RunRecord>, ConfigDbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, rule_name, started_at, finished_at,
+            "SELECT id, rule_name, triggered_by, started_at, finished_at,
                     objects_scanned, objects_copied, objects_skipped, objects_deleted,
                     bytes_copied, errors, status
              FROM replication_run_history
@@ -389,15 +510,16 @@ impl ConfigDb {
                 Ok(RunRecord {
                     id: r.get(0)?,
                     rule_name: r.get(1)?,
-                    started_at: r.get(2)?,
-                    finished_at: r.get(3)?,
-                    objects_scanned: r.get(4)?,
-                    objects_copied: r.get(5)?,
-                    objects_skipped: r.get(6)?,
-                    objects_deleted: r.get(7)?,
-                    bytes_copied: r.get(8)?,
-                    errors: r.get(9)?,
-                    status: r.get(10)?,
+                    triggered_by: r.get(2)?,
+                    started_at: r.get(3)?,
+                    finished_at: r.get(4)?,
+                    objects_scanned: r.get(5)?,
+                    objects_copied: r.get(6)?,
+                    objects_skipped: r.get(7)?,
+                    objects_deleted: r.get(8)?,
+                    bytes_copied: r.get(9)?,
+                    errors: r.get(10)?,
+                    status: r.get(11)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -441,10 +563,72 @@ mod tests {
     }
 
     #[test]
+    fn lease_acquire_rejects_second_owner_until_expiry() {
+        let db = db();
+        db.replication_ensure_state("r", 100).unwrap();
+
+        assert!(db
+            .replication_try_acquire_lease("r", "owner-a", 100, 30)
+            .unwrap());
+        assert!(!db
+            .replication_try_acquire_lease("r", "owner-b", 120, 30)
+            .unwrap());
+
+        let state = db.replication_load_state("r").unwrap().unwrap();
+        assert_eq!(state.leader_instance_id.as_deref(), Some("owner-a"));
+        assert_eq!(state.leader_expires_at, Some(130));
+
+        assert!(db
+            .replication_try_acquire_lease("r", "owner-b", 130, 30)
+            .unwrap());
+        let state = db.replication_load_state("r").unwrap().unwrap();
+        assert_eq!(state.leader_instance_id.as_deref(), Some("owner-b"));
+        assert_eq!(state.leader_expires_at, Some(160));
+    }
+
+    #[test]
+    fn lease_release_only_by_current_owner() {
+        let db = db();
+        db.replication_ensure_state("r", 100).unwrap();
+        assert!(db
+            .replication_try_acquire_lease("r", "owner-a", 100, 30)
+            .unwrap());
+
+        assert!(!db.replication_release_lease("r", "owner-b").unwrap());
+        assert!(db
+            .replication_load_state("r")
+            .unwrap()
+            .unwrap()
+            .leader_instance_id
+            .is_some());
+
+        assert!(db.replication_release_lease("r", "owner-a").unwrap());
+        let state = db.replication_load_state("r").unwrap().unwrap();
+        assert!(state.leader_instance_id.is_none());
+        assert!(state.leader_expires_at.is_none());
+    }
+
+    #[test]
+    fn lease_renew_only_by_current_owner() {
+        let db = db();
+        db.replication_ensure_state("r", 100).unwrap();
+        assert!(db
+            .replication_try_acquire_lease("r", "owner-a", 100, 30)
+            .unwrap());
+
+        assert!(!db.replication_renew_lease("r", "owner-b", 110, 30).unwrap());
+        assert!(db.replication_renew_lease("r", "owner-a", 110, 30).unwrap());
+
+        let state = db.replication_load_state("r").unwrap().unwrap();
+        assert_eq!(state.leader_instance_id.as_deref(), Some("owner-a"));
+        assert_eq!(state.leader_expires_at, Some(140));
+    }
+
+    #[test]
     fn begin_and_finish_run_update_both_tables() {
         let db = db();
         db.replication_ensure_state("r", 100).unwrap();
-        let id = db.replication_begin_run("r", 200).unwrap();
+        let id = db.replication_begin_run("r", 200, "run-now").unwrap();
         assert!(id > 0);
 
         let state_running = db.replication_load_state("r").unwrap().unwrap();
@@ -470,6 +654,7 @@ mod tests {
 
         let runs = db.replication_recent_runs("r", 10).unwrap();
         assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].triggered_by, "run-now");
         assert_eq!(runs[0].status, "succeeded");
         assert_eq!(runs[0].objects_copied, 7);
         assert_eq!(runs[0].bytes_copied, 1024);
@@ -480,11 +665,22 @@ mod tests {
         let db = db();
         db.replication_ensure_state("r", 100).unwrap();
         for i in 0..5 {
-            db.replication_record_failure("r", 100 + i, "src", "dst", &format!("err-{i}"), 3)
-                .unwrap();
+            db.replication_record_failure(
+                "r",
+                FailureInsert {
+                    run_id: Some(42),
+                    occurred_at: 100 + i,
+                    source_key: "src",
+                    dest_key: "dst",
+                    error_message: &format!("err-{i}"),
+                },
+                3,
+            )
+            .unwrap();
         }
         let recent = db.replication_recent_failures("r", 10).unwrap();
         assert_eq!(recent.len(), 3);
+        assert!(recent.iter().all(|f| f.run_id == Some(42)));
         let msgs: Vec<_> = recent.iter().map(|f| f.error_message.clone()).collect();
         assert_eq!(msgs, vec!["err-4", "err-3", "err-2"]);
     }
@@ -506,7 +702,7 @@ mod tests {
     fn reconcile_on_boot_flips_running_to_failed() {
         let db = db();
         db.replication_ensure_state("r", 100).unwrap();
-        db.replication_begin_run("r", 200).unwrap();
+        db.replication_begin_run("r", 200, "scheduler").unwrap();
 
         let count = db.replication_reconcile_on_boot().unwrap();
         assert_eq!(count, 1);
