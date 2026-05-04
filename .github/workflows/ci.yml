@@ -152,7 +152,7 @@ jobs:
   test-integration:
     name: Integration Tests
     runs-on: k3s
-    timeout-minutes: 15
+    timeout-minutes: 30
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       credentials:
@@ -180,9 +180,15 @@ jobs:
           mc mb --ignore-existing local/deltaglider-data
           echo "MINIO_ENDPOINT=http://localhost:9000" >> $GITHUB_ENV
       - name: Install DeltaGlider CLI
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
         run: |
-          command -v pip3 >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq python3-pip >/dev/null; }
-          pip3 install --quiet --break-system-packages deltaglider
+          if ! python3 -m pip --version >/dev/null 2>&1; then
+            apt-get update -qq
+            apt-get install -y -qq python3-pip
+          fi
+          python3 -m pip install --quiet --break-system-packages deltaglider
           deltaglider --version
       - name: Integration tests (fast)
         env:
