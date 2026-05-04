@@ -13,6 +13,7 @@ import type { ListObjectsV2CommandOutput } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import type { S3Object, ListResult, BucketInfo } from './types';
 import { detectDefaultEndpoint } from './utils';
+import { getBucketOrigins } from './adminApi';
 import {
   fetchSessionCredentials,
   storeSessionCredentials,
@@ -285,11 +286,27 @@ export async function testConnection(
 
 export async function listBuckets(): Promise<BucketInfo[]> {
   const client = getClient();
-  const resp = await client.send(new ListBucketsCommand({}));
-  return (resp.Buckets || []).map((b) => ({
-    name: b.Name || '',
-    creationDate: b.CreationDate?.toISOString() || '',
-  }));
+  const [resp, origins] = await Promise.all([
+    client.send(new ListBucketsCommand({})),
+    getBucketOrigins().catch(() => null),
+  ]);
+  const originByName = new Map((origins?.buckets || []).map((b) => [b.name, b]));
+  return (resp.Buckets || []).map((b) => {
+    const name = b.Name || '';
+    const origin = originByName.get(name);
+    return {
+      name,
+      creationDate: b.CreationDate?.toISOString() || origin?.creation_date || '',
+      backend: origin ? {
+        backendName: origin.backend_name || undefined,
+        backendType: origin.backend_type || undefined,
+        backendEndpoint: origin.backend_endpoint || undefined,
+        backendRegion: origin.backend_region || undefined,
+        backendPath: origin.backend_path || undefined,
+        realBucket: origin.real_bucket || undefined,
+      } : undefined,
+    };
+  });
 }
 
 export async function createBucket(name: string): Promise<void> {

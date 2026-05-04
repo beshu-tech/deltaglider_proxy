@@ -110,81 +110,91 @@ export default function SectionOverview({
       style={{
         display: 'flex',
         flexDirection: 'column',
-        gap: 24,
+        gap: 16,
         maxWidth: 1080,
         margin: '0 auto',
-        padding: 'clamp(16px, 3vw, 24px)',
+        padding: 'clamp(12px, 2vw, 18px)',
       }}
     >
       {/* Hero */}
       <header
         style={{
           display: 'flex',
-          alignItems: 'flex-start',
-          gap: 20,
-          padding: 'clamp(20px, 3vw, 28px)',
+          alignItems: 'center',
+          gap: 12,
+          padding: '12px 14px',
           background: `linear-gradient(135deg, ${BG_CARD}, ${BG_ELEVATED})`,
           border: `1px solid ${BORDER}`,
-          borderRadius: 14,
+          borderRadius: 12,
         }}
       >
         <div
           style={{
             flexShrink: 0,
-            width: 56,
-            height: 56,
-            borderRadius: 14,
+            width: 34,
+            height: 34,
+            borderRadius: 9,
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
             background: BG_ELEVATED,
             border: `1px solid ${BORDER}`,
             color: ACCENT_BLUE,
-            fontSize: 26,
+            fontSize: 16,
           }}
         >
           {icon}
         </div>
         <div style={{ flex: 1, minWidth: 0 }}>
-          <h2
+          <div
             style={{
-              margin: 0,
-              color: TEXT,
-              fontSize: 28,
-              fontFamily: 'var(--font-ui)',
-              fontWeight: 700,
-              letterSpacing: '-0.01em',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              flexWrap: 'wrap',
             }}
           >
-            {title}
-          </h2>
+            <h2
+              style={{
+                margin: 0,
+                color: TEXT,
+                fontSize: 20,
+                fontFamily: 'var(--font-ui)',
+                fontWeight: 700,
+                letterSpacing: '-0.01em',
+                lineHeight: 1.15,
+              }}
+            >
+              {title}
+            </h2>
+            <span
+              style={{
+                display: 'inline-block',
+                padding: '2px 8px',
+                fontSize: 10,
+                fontFamily: 'var(--font-mono)',
+                background: BG_ELEVATED,
+                border: `1px solid ${BORDER}`,
+                borderRadius: 20,
+                color: TEXT_MUTED,
+              }}
+              title="YAML path for this section"
+            >
+              {yamlPath}
+            </span>
+          </div>
           <p
             style={{
-              margin: '6px 0 10px',
+              margin: '3px 0 0',
               color: TEXT_SECONDARY,
-              fontSize: 14,
+              fontSize: 12,
               fontFamily: 'var(--font-ui)',
-              lineHeight: 1.5,
-              maxWidth: 640,
+              lineHeight: 1.35,
+              maxWidth: 780,
             }}
           >
             {description}
           </p>
-          <span
-            style={{
-              display: 'inline-block',
-              padding: '3px 10px',
-              fontSize: 11,
-              fontFamily: 'var(--font-mono)',
-              background: BG_ELEVATED,
-              border: `1px solid ${BORDER}`,
-              borderRadius: 20,
-              color: TEXT_MUTED,
-            }}
-            title="YAML path for this section"
-          >
-            {yamlPath}
-          </span>
         </div>
       </header>
 

@@ -35,7 +35,7 @@ pub use auth::{
     require_not_declarative, require_session, resolve_iam_identity, set_s3_session_creds, whoami,
     LoginAsRequest, LoginResponse, ResolveIamIdentityRequest, SessionResponse, WhoamiResponse,
 };
-pub use backends::{create_backend, delete_backend, list_backends};
+pub use backends::{create_backend, delete_backend, list_backends, list_bucket_origins};
 pub use backup::{export_backup, import_backup};
 pub use config::{
     apply_config_doc, change_password, config_defaults, export_config, export_declarative_iam,

@@ -6,6 +6,17 @@ use bytes::Bytes;
 use futures::stream::{self, BoxStream};
 use thiserror::Error;
 
+/// Bucket listing entry with optional routing-origin metadata.
+#[derive(Debug, Clone)]
+pub struct BucketListing {
+    pub name: String,
+    pub creation_date: chrono::DateTime<chrono::Utc>,
+    /// Configured backend name when known (for `RoutingBackend` listings).
+    pub backend_name: Option<String>,
+    /// Real bucket name on that backend, when it differs from the visible name.
+    pub real_bucket: Option<String>,
+}
+
 /// Errors that can occur during storage operations
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -70,6 +81,25 @@ pub trait StorageBackend: Send + Sync {
     ) -> Result<Vec<(String, chrono::DateTime<chrono::Utc>)>, StorageError> {
         let names = self.list_buckets().await?;
         Ok(names.into_iter().map(|n| (n, chrono::Utc::now())).collect())
+    }
+
+    /// List buckets with optional backend-origin metadata.
+    ///
+    /// Concrete single backends usually don't know their configured name, so
+    /// the default leaves origin fields empty. `RoutingBackend` overrides this
+    /// to preserve the backend that produced each bucket.
+    async fn list_bucket_origins(&self) -> Result<Vec<BucketListing>, StorageError> {
+        Ok(self
+            .list_buckets_with_dates()
+            .await?
+            .into_iter()
+            .map(|(name, creation_date)| BucketListing {
+                name,
+                creation_date,
+                backend_name: None,
+                real_bucket: None,
+            })
+            .collect())
     }
 
     /// Check if a bucket exists

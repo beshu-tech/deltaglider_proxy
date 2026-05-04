@@ -6,27 +6,27 @@ const { Text } = Typography;
 export default function SectionHeader({ icon, title, description }: { icon: React.ReactNode; title: React.ReactNode; description?: string }) {
   const { ACCENT_BLUE, TEXT_PRIMARY, TEXT_MUTED } = useColors();
   return (
-    <div style={{ marginBottom: 4 }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+    <div style={{ marginBottom: 2 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
         <div style={{
-          width: 28,
-          height: 28,
-          borderRadius: 7,
+          width: 24,
+          height: 24,
+          borderRadius: 6,
           background: `linear-gradient(135deg, ${ACCENT_BLUE}18, ${ACCENT_BLUE}08)`,
           border: `1px solid ${ACCENT_BLUE}22`,
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',
           flexShrink: 0,
-          fontSize: 14,
+          fontSize: 12,
           color: ACCENT_BLUE,
         }}>
           {icon}
         </div>
-        <Text strong style={{ fontFamily: "var(--font-ui)", fontSize: 15, color: TEXT_PRIMARY }}>{title}</Text>
+        <Text strong style={{ fontFamily: "var(--font-ui)", fontSize: 14, color: TEXT_PRIMARY, lineHeight: 1.2 }}>{title}</Text>
       </div>
       {description && (
-        <Text style={{ fontFamily: "var(--font-ui)", fontSize: 12, color: TEXT_MUTED, display: 'block', marginTop: 4, marginLeft: 38 }}>{description}</Text>
+        <Text style={{ fontFamily: "var(--font-ui)", fontSize: 12, color: TEXT_MUTED, display: 'block', marginTop: 2, marginLeft: 32, lineHeight: 1.35 }}>{description}</Text>
       )}
     </div>
   );

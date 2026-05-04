@@ -1091,6 +1091,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         Ok(self.storage.list_buckets_with_dates().await?)
     }
 
+    /// List buckets with optional backend-origin metadata.
+    pub async fn list_bucket_origins(
+        &self,
+    ) -> Result<Vec<crate::storage::BucketListing>, EngineError> {
+        Ok(self.storage.list_bucket_origins().await?)
+    }
+
     /// Check if a real bucket exists on the storage backend.
     pub async fn head_bucket(&self, bucket: &str) -> Result<bool, EngineError> {
         Ok(self.storage.head_bucket(bucket).await?)

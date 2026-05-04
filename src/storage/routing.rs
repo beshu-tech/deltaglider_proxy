@@ -15,7 +15,7 @@ use futures::stream::BoxStream;
 
 use crate::types::FileMetadata;
 
-use super::traits::{DelegatedListResult, StorageBackend, StorageError};
+use super::traits::{BucketListing, DelegatedListResult, StorageBackend, StorageError};
 
 /// Route entry: maps a virtual bucket to a backend and optional real bucket name.
 #[derive(Debug, Clone)]
@@ -246,6 +246,64 @@ impl StorageBackend for RoutingBackend {
 
         let mut result: Vec<_> = all_buckets.into_iter().collect();
         result.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(result)
+    }
+
+    /// Aggregate buckets across all backends while preserving the backend that
+    /// produced each visible bucket. This is used by the admin UI to display
+    /// compact provider badges without changing S3-compatible XML semantics.
+    async fn list_bucket_origins(&self) -> Result<Vec<BucketListing>, StorageError> {
+        let mut candidates: Vec<(String, u8, String, BucketListing)> = Vec::new();
+
+        for (backend_name, backend) in &self.backends {
+            match backend.list_buckets_with_dates().await {
+                Ok(buckets) => {
+                    for (real_bucket, creation_date) in buckets {
+                        let virtual_name =
+                            self.listed_bucket_virtual_name(backend_name, &real_bucket);
+                        let priority = if self.reverse_lookup(backend_name, &real_bucket).is_some()
+                        {
+                            0
+                        } else if backend_name == &self.default_backend {
+                            1
+                        } else {
+                            2
+                        };
+                        let real_bucket_alias =
+                            (real_bucket != virtual_name).then_some(real_bucket);
+                        candidates.push((
+                            virtual_name.clone(),
+                            priority,
+                            backend_name.clone(),
+                            BucketListing {
+                                name: virtual_name,
+                                creation_date,
+                                backend_name: Some(backend_name.clone()),
+                                real_bucket: real_bucket_alias,
+                            },
+                        ));
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to list bucket origins from backend '{}': {} — results may be incomplete",
+                        backend_name,
+                        e
+                    );
+                }
+            }
+        }
+
+        // Deduplicate by the same preference order used for request routing:
+        // explicit route, default backend, then stable backend-name order.
+        candidates.sort_by(|a, b| (&a.0, a.1, &a.2).cmp(&(&b.0, b.1, &b.2)));
+        let mut all_buckets: HashMap<String, BucketListing> = HashMap::new();
+        for (name, _, _, bucket) in candidates {
+            all_buckets.entry(name).or_insert(bucket);
+        }
+
+        let mut result: Vec<_> = all_buckets.into_values().collect();
+        result.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(result)
     }
 
@@ -816,5 +874,47 @@ mod tests {
             "create_bucket must not create a duplicate on the default backend"
         );
         assert_eq!(archive_probe.create_calls(), vec!["shared".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_bucket_origins_reports_routed_backend() {
+        let primary = Arc::new(
+            Box::new(TestBackend::with_buckets(&["shared", "local-only"]))
+                as Box<dyn StorageBackend>,
+        );
+        let archive = Arc::new(
+            Box::new(TestBackend::with_buckets(&["shared", "real-archive"]))
+                as Box<dyn StorageBackend>,
+        );
+        let mut backends = HashMap::new();
+        backends.insert("primary".to_string(), primary);
+        backends.insert("archive".to_string(), archive);
+        let mut routes = HashMap::new();
+        routes.insert(
+            "virtual-archive".to_string(),
+            ("archive".to_string(), Some("real-archive".to_string())),
+        );
+
+        let routing =
+            RoutingBackend::new(backends, routes, "primary".to_string()).expect("routing backend");
+        let origins = routing.list_bucket_origins().await.expect("origins");
+
+        let by_name: HashMap<_, _> = origins
+            .iter()
+            .map(|bucket| (bucket.name.as_str(), bucket))
+            .collect();
+        assert_eq!(
+            by_name["shared"].backend_name.as_deref(),
+            Some("primary"),
+            "unrouted duplicate bucket should match default-backend resolution"
+        );
+        assert_eq!(
+            by_name["virtual-archive"].backend_name.as_deref(),
+            Some("archive")
+        );
+        assert_eq!(
+            by_name["virtual-archive"].real_bucket.as_deref(),
+            Some("real-archive")
+        );
     }
 }

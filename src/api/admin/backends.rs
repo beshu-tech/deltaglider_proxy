@@ -1,6 +1,7 @@
 //! Admin API for managing named backends (multi-backend routing).
 
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -14,6 +15,23 @@ use super::AdminState;
 pub struct BackendListResponse {
     pub backends: Vec<super::config::BackendInfoResponse>,
     pub default_backend: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct BucketBackendOriginResponse {
+    pub name: String,
+    pub creation_date: String,
+    pub backend_name: Option<String>,
+    pub backend_type: Option<String>,
+    pub backend_endpoint: Option<String>,
+    pub backend_region: Option<String>,
+    pub backend_path: Option<String>,
+    pub real_bucket: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct BucketOriginListResponse {
+    pub buckets: Vec<BucketBackendOriginResponse>,
 }
 
 #[derive(Deserialize)]
@@ -102,6 +120,75 @@ pub async fn list_backends(State(state): State<Arc<AdminState>>) -> impl IntoRes
         backends,
         default_backend: cfg.default_backend.clone(),
     })
+}
+
+/// GET /api/admin/buckets — list buckets with resolved backend origin.
+///
+/// The S3-compatible ListBuckets XML stays conservative; this JSON endpoint is
+/// for the admin UI, which needs provider badges and tooltips. The browser still
+/// merges this onto the SigV4-filtered ListBuckets result so bucket visibility
+/// semantics do not change for non-admin IAM users.
+pub async fn list_bucket_origins(
+    State(state): State<Arc<AdminState>>,
+) -> Result<Json<BucketOriginListResponse>, (StatusCode, String)> {
+    let cfg = state.config.read().await;
+    let backend_infos: Vec<super::config::BackendInfoResponse> = if cfg.backends.is_empty() {
+        vec![super::config::BackendInfoResponse::synthesized_default(
+            &cfg,
+        )]
+    } else {
+        cfg.backends
+            .iter()
+            .map(super::config::BackendInfoResponse::from)
+            .collect()
+    };
+    let default_backend = cfg
+        .default_backend
+        .clone()
+        .or_else(|| backend_infos.first().map(|b| b.name.clone()));
+    drop(cfg);
+
+    let backend_by_name: std::collections::HashMap<_, _> = backend_infos
+        .iter()
+        .map(|backend| (backend.name.as_str(), backend))
+        .collect();
+    let bucket_list = state
+        .s3_state
+        .engine
+        .load()
+        .list_bucket_origins()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to list bucket origins: {e}"),
+            )
+        })?;
+
+    let buckets = bucket_list
+        .into_iter()
+        .map(|bucket| {
+            let backend_name = bucket
+                .backend_name
+                .clone()
+                .or_else(|| default_backend.clone());
+            let backend = backend_name
+                .as_deref()
+                .and_then(|name| backend_by_name.get(name).copied());
+            BucketBackendOriginResponse {
+                name: bucket.name,
+                creation_date: bucket.creation_date.to_rfc3339(),
+                backend_name,
+                backend_type: backend.map(|b| b.backend_type.clone()),
+                backend_endpoint: backend.and_then(|b| b.endpoint.clone()),
+                backend_region: backend.and_then(|b| b.region.clone()),
+                backend_path: backend.and_then(|b| b.path.clone()),
+                real_bucket: bucket.real_bucket,
+            }
+        })
+        .collect();
+
+    Ok(Json(BucketOriginListResponse { buckets }))
 }
 
 /// POST /api/admin/backends — add a new named backend.

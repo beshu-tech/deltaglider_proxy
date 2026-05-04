@@ -17,8 +17,10 @@ export default function TabHeader({ icon, title, description }: Props) {
   return (
     <div
       style={{
-        textAlign: 'center',
-        padding: '32px 24px 24px',
+        display: 'flex',
+        alignItems: 'center',
+        gap: 10,
+        padding: '12px 20px',
         borderBottom: `1px solid ${colors.BORDER}`,
         marginBottom: 0,
       }}
@@ -26,47 +28,53 @@ export default function TabHeader({ icon, title, description }: Props) {
       aria-level={2}
     >
       <div
+        aria-hidden="true"
         style={{
-          display: 'inline-flex',
+          display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',
-          width: 40,
-          height: 40,
-          borderRadius: 10,
+          width: 28,
+          height: 28,
+          borderRadius: 8,
           background: `${colors.ACCENT_BLUE}12`,
           border: `1px solid ${colors.ACCENT_BLUE}25`,
-          fontSize: 18,
+          fontSize: 14,
           color: colors.ACCENT_BLUE,
-          marginBottom: 12,
+          flexShrink: 0,
         }}
       >
         {icon}
       </div>
       <div
         style={{
-          fontSize: 20,
-          fontWeight: 700,
-          color: colors.TEXT_PRIMARY,
-          fontFamily: 'var(--font-ui)',
-          letterSpacing: '-0.01em',
-          lineHeight: 1.2,
+          minWidth: 0,
+          flex: 1,
         }}
       >
-        {title}
-      </div>
-      <div
-        style={{
-          fontSize: 13,
-          color: colors.TEXT_MUTED,
-          fontFamily: 'var(--font-ui)',
-          marginTop: 6,
-          maxWidth: 480,
-          marginLeft: 'auto',
-          marginRight: 'auto',
-          lineHeight: 1.5,
-        }}
-      >
-        {description}
+        <div
+          style={{
+            fontSize: 16,
+            fontWeight: 700,
+            color: colors.TEXT_PRIMARY,
+            fontFamily: 'var(--font-ui)',
+            letterSpacing: '-0.01em',
+            lineHeight: 1.15,
+          }}
+        >
+          {title}
+        </div>
+        <div
+          style={{
+            fontSize: 12,
+            color: colors.TEXT_MUTED,
+            fontFamily: 'var(--font-ui)',
+            marginTop: 2,
+            maxWidth: 760,
+            lineHeight: 1.35,
+          }}
+        >
+          {description}
+        </div>
       </div>
     </div>
   );

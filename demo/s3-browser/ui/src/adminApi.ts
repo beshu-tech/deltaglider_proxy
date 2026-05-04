@@ -771,6 +771,21 @@ interface BackendListResponse {
   default_backend: string | null;
 }
 
+interface BucketOriginResponse {
+  name: string;
+  creation_date: string;
+  backend_name?: string | null;
+  backend_type?: string | null;
+  backend_endpoint?: string | null;
+  backend_region?: string | null;
+  backend_path?: string | null;
+  real_bucket?: string | null;
+}
+
+interface BucketOriginListResponse {
+  buckets: BucketOriginResponse[];
+}
+
 export interface CreateBackendRequest {
   name: string;
   type: string;
@@ -786,6 +801,12 @@ export interface CreateBackendRequest {
 export async function getBackends(): Promise<BackendListResponse> {
   const res = await adminFetch('/api/admin/backends');
   if (!res.ok) throw new Error(`Failed to load backends: ${res.status}`);
+  return safeJson(res);
+}
+
+export async function getBucketOrigins(): Promise<BucketOriginListResponse> {
+  const res = await adminFetch('/api/admin/buckets');
+  if (!res.ok) throw new Error(`Failed to load bucket origins: ${res.status}`);
   return safeJson(res);
 }
 

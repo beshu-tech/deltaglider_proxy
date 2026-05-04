@@ -164,6 +164,7 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             get(admin::list_backends).post(admin::create_backend),
         )
         .route("/_/api/admin/backends/:name", delete(admin::delete_backend))
+        .route("/_/api/admin/buckets", get(admin::list_bucket_origins))
         // S3 session credentials (server-side credential storage)
         .route(
             "/_/api/admin/session/s3-credentials",

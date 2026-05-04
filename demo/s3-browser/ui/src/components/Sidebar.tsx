@@ -10,6 +10,7 @@ import {
 import { listBuckets, createBucket, deleteBucket, getBucket, setBucket } from '../s3client';
 import type { BucketInfo } from '../types';
 import { useColors } from '../ThemeContext';
+import BucketBackendBadge from './BucketBackendBadge';
 
 const { Sider } = Layout;
 const { Text } = Typography;
@@ -247,16 +248,21 @@ export default function Sidebar({
                   if (b.name !== activeBucket) e.currentTarget.style.background = 'transparent';
                 }}
               >
-                <span style={{
-                  fontFamily: "var(--font-mono)",
-                  fontSize: 13,
-                  fontWeight: b.name === activeBucket ? 600 : 400,
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  whiteSpace: 'nowrap',
-                  display: 'block',
-                }}>
-                  {b.name}
+                <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                  <span style={{
+                    fontFamily: "var(--font-mono)",
+                    fontSize: 13,
+                    fontWeight: b.name === activeBucket ? 600 : 400,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                    display: 'block',
+                    minWidth: 0,
+                    flex: 1,
+                  }}>
+                    {b.name}
+                  </span>
+                  <BucketBackendBadge origin={b.backend} />
                 </span>
               </button>
               {canDeleteBucket(b.name) && (

@@ -18,4 +18,14 @@ export interface ListResult {
 export interface BucketInfo {
   name: string;
   creationDate: string;
+  backend?: BucketBackendOrigin;
+}
+
+export interface BucketBackendOrigin {
+  backendName?: string;
+  backendType?: string;
+  backendEndpoint?: string;
+  backendRegion?: string;
+  backendPath?: string;
+  realBucket?: string;
 }
