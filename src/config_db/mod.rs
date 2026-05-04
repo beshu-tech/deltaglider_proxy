@@ -23,7 +23,7 @@ pub struct ConfigDb {
 }
 
 /// Schema version — bump when adding migrations.
-const SCHEMA_VERSION: i32 = 8;
+const SCHEMA_VERSION: i32 = 9;
 
 pub(crate) mod auth_providers;
 mod declarative;
@@ -329,6 +329,43 @@ impl ConfigDb {
             }
             info!(
                 "Migrated config DB schema from v{} to v8 (linked replication failures to runs)",
+                version
+            );
+        }
+
+        if version < 9 {
+            // v9: Durable event outbox. Dispatchers are intentionally not
+            // implemented here; this only persists object lifecycle facts
+            // after successful mutations so future notification workers can
+            // claim and deliver them without touching request handlers.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS event_outbox (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind            TEXT NOT NULL,
+                    bucket          TEXT NOT NULL,
+                    object_key      TEXT NOT NULL,
+                    source          TEXT NOT NULL,
+                    occurred_at     INTEGER NOT NULL,
+                    payload_json    TEXT NOT NULL DEFAULT '{}',
+                    status          TEXT NOT NULL DEFAULT 'pending',
+                    attempts        INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at INTEGER,
+                    claimed_by      TEXT,
+                    claimed_at      INTEGER,
+                    delivered_at    INTEGER,
+                    last_error      TEXT,
+                    created_at      INTEGER NOT NULL DEFAULT (unixepoch())
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_event_outbox_status_due
+                    ON event_outbox(status, next_attempt_at, occurred_at, id);
+                CREATE INDEX IF NOT EXISTS idx_event_outbox_recent
+                    ON event_outbox(occurred_at DESC, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_event_outbox_object
+                    ON event_outbox(bucket, object_key, occurred_at DESC);",
+            )?;
+            info!(
+                "Migrated config DB schema from v{} to v9 (added event outbox)",
                 version
             );
         }

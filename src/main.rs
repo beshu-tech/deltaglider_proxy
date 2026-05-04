@@ -432,18 +432,6 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         info!("  Proxy headers: untrusted (DGP_TRUST_PROXY_HEADERS=false) — rate limiting requires ConnectInfo (not yet implemented); aws:SourceIp conditions will not match");
     }
 
-    // --- App state ---
-    let usage_scanner = Arc::new(UsageScanner::new());
-    let state = Arc::new(AppState {
-        engine: ArcSwap::from_pointee(engine),
-        multipart,
-        metrics: metrics.clone(),
-        usage_scanner: usage_scanner.clone(),
-    });
-
-    // --- Background monitors ---
-    spawn_cache_monitor(&state, &metrics);
-
     // --- IAM ---
     let iam_state = init_iam_state(&config);
 
@@ -456,6 +444,20 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     });
     let shared_config = config.clone().into_shared();
     let (config_db, config_db_mismatch) = init_config_db(&admin_password_hash, &iam_state);
+
+    // --- App state ---
+    let usage_scanner = Arc::new(UsageScanner::new());
+    let state = Arc::new(AppState {
+        engine: ArcSwap::from_pointee(engine),
+        multipart,
+        metrics: metrics.clone(),
+        usage_scanner: usage_scanner.clone(),
+        config_db: config_db.clone(),
+    });
+
+    // --- Background monitors ---
+    spawn_cache_monitor(&state, &metrics);
+
     if !config_db_mismatch {
         if let Some(db) = config_db.as_ref() {
             deltaglider_proxy::replication::scheduler::spawn_scheduler(

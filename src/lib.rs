@@ -12,6 +12,7 @@ pub mod config_db;
 pub mod config_db_sync;
 pub mod config_sections;
 pub mod deltaglider;
+pub mod event_outbox;
 pub mod iam;
 pub mod init;
 pub mod metadata_cache;

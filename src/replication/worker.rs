@@ -30,6 +30,7 @@ use super::state_store::{current_unix_seconds, FailureInsert, RunTotals};
 use crate::config_db::ConfigDb;
 use crate::config_sections::ReplicationRule;
 use crate::deltaglider::DynEngine;
+use crate::event_outbox::{EventKind, EventSource, NewEvent};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -217,6 +218,29 @@ pub async fn run_rule(
                 Ok(bytes_copied) => {
                     totals.objects_copied += 1;
                     totals.bytes_copied += bytes_copied as i64;
+                    {
+                        let db = db.lock().await;
+                        if let Err(err) = db.event_outbox_insert(&NewEvent::new(
+                            EventKind::ReplicationObjectCopied,
+                            rule.destination.bucket.as_str(),
+                            dest_key.as_str(),
+                            EventSource::Replication,
+                            current_unix_seconds(),
+                            serde_json::json!({
+                                "rule_name": &rule.name,
+                                "source_bucket": &rule.source.bucket,
+                                "source_key": src_key.as_str(),
+                                "destination_bucket": &rule.destination.bucket,
+                                "destination_key": dest_key.as_str(),
+                                "content_length": bytes_copied,
+                            }),
+                        )) {
+                            warn!(
+                                "replication rule '{}' could not append event for {:?} -> {:?}: {}",
+                                rule.name, src_key, dest_key, err
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
                     totals.errors += 1;

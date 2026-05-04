@@ -13,6 +13,7 @@ mod object_helpers;
 mod status;
 
 use super::errors::S3Error;
+use crate::config_db::ConfigDb;
 use crate::deltaglider::DynEngine;
 use crate::metrics::Metrics;
 use crate::multipart::MultipartStore;
@@ -50,6 +51,7 @@ pub struct AppState {
     pub multipart: Arc<MultipartStore>,
     pub metrics: Arc<Metrics>,
     pub usage_scanner: Arc<crate::usage_scanner::UsageScanner>,
+    pub config_db: Option<Arc<tokio::sync::Mutex<ConfigDb>>>,
 }
 
 /// Query parameters for object-level operations (multipart upload)

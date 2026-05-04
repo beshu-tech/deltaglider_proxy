@@ -3,11 +3,12 @@
 use super::bucket::get_acl_response;
 use super::object_helpers::{
     apply_response_overrides, build_range_response, check_conditionals, copy_object_inner,
-    decode_body, parse_range_header, put_object_inner, resolve_range, upload_part,
-    upload_part_copy,
+    decode_body, enqueue_object_event, enqueue_object_events, parse_range_header, put_object_inner,
+    resolve_range, upload_part, upload_part_copy,
 };
 use super::{audit_log_s3, build_object_headers, xml_response, AppState, ObjectQuery, S3Error};
 use crate::deltaglider::RetrieveResponse;
+use crate::event_outbox::{current_unix_seconds, EventKind, EventSource, NewEvent};
 use crate::iam::{AuthenticatedUser, S3Action};
 use axum::body::{Body, Bytes};
 use axum::extract::{Query, State};
@@ -403,6 +404,7 @@ pub async fn delete_object(
                 )
                 .await?;
 
+            let mut page_deleted_events = Vec::new();
             for (obj_key, _meta) in &page.objects {
                 // Per-object IAM check (respects Deny rules on sub-prefixes)
                 if let Some(axum::Extension(ref user)) = auth_user {
@@ -412,7 +414,17 @@ pub async fn delete_object(
                     }
                 }
                 match engine.delete(&bucket, obj_key).await {
-                    Ok(()) => deleted += 1,
+                    Ok(()) => {
+                        deleted += 1;
+                        page_deleted_events.push(NewEvent::new(
+                            EventKind::ObjectDeleted,
+                            bucket.as_str(),
+                            obj_key.as_str(),
+                            EventSource::S3Api,
+                            current_unix_seconds(),
+                            serde_json::json!({ "delete_type": "recursive" }),
+                        ));
+                    }
                     Err(e) => {
                         let s3_err = S3Error::from(e);
                         if matches!(s3_err, S3Error::NoSuchKey(_)) {
@@ -423,6 +435,7 @@ pub async fn delete_object(
                     }
                 }
             }
+            enqueue_object_events(&state, &page_deleted_events).await;
 
             if !page.is_truncated {
                 break;
@@ -454,14 +467,31 @@ pub async fn delete_object(
 
     info!("DELETE {}/{}", bucket, key);
 
+    let mut deleted_existing = false;
     if let Err(err) = state.engine.load().delete(&bucket, &key).await {
         match S3Error::from(err) {
             S3Error::NoSuchKey(_) => {}
             other => return Err(other),
         }
+    } else {
+        deleted_existing = true;
     }
 
     debug!("Deleted {}/{}", bucket, key);
+    if deleted_existing {
+        enqueue_object_event(
+            &state,
+            NewEvent::new(
+                EventKind::ObjectDeleted,
+                bucket.as_str(),
+                key.as_str(),
+                EventSource::S3Api,
+                current_unix_seconds(),
+                serde_json::json!({ "delete_type": "single" }),
+            ),
+        )
+        .await;
+    }
 
     let user_name = auth_user
         .as_ref()
@@ -511,6 +541,7 @@ pub async fn delete_objects(
     let quiet = delete_req.quiet.unwrap_or(false);
     let mut deleted = Vec::new();
     let mut errors = Vec::new();
+    let mut deleted_events = Vec::new();
 
     for obj in delete_req.objects {
         let key = obj.key.trim_start_matches('/');
@@ -532,6 +563,14 @@ pub async fn delete_objects(
         match state.engine.load().delete(&bucket, key).await {
             Ok(()) => {
                 debug!("Deleted {}/{}", bucket, key);
+                deleted_events.push(NewEvent::new(
+                    EventKind::ObjectDeleted,
+                    bucket.as_str(),
+                    key,
+                    EventSource::S3Api,
+                    current_unix_seconds(),
+                    serde_json::json!({ "delete_type": "batch" }),
+                ));
                 deleted.push(DeletedObject {
                     key: obj.key.clone(),
                     version_id: obj.version_id.clone(),
@@ -557,6 +596,8 @@ pub async fn delete_objects(
             }
         }
     }
+
+    enqueue_object_events(&state, &deleted_events).await;
 
     // Audit log each successfully deleted object
     if !deleted.is_empty() {

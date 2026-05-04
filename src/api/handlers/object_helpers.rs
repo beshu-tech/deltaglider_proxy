@@ -5,6 +5,7 @@ use super::{
     base64_decode, build_object_headers, extract_content_type, extract_user_metadata, header_value,
     xml_response, AppState, ObjectQuery, S3Error,
 };
+use crate::event_outbox::{current_unix_seconds, EventKind, EventSource, NewEvent};
 use crate::iam::{AuthenticatedUser, S3Action};
 use crate::types::FileMetadata;
 use axum::body::Bytes;
@@ -15,6 +16,30 @@ use std::sync::Arc;
 use tracing::{debug, info, instrument, warn};
 
 use crate::api::aws_chunked::{decode_aws_chunked, get_decoded_content_length, is_aws_chunked};
+
+pub(super) async fn enqueue_object_event(state: &Arc<AppState>, event: NewEvent) {
+    enqueue_object_events(state, &[event]).await;
+}
+
+pub(super) async fn enqueue_object_events(state: &Arc<AppState>, events: &[NewEvent]) {
+    if events.is_empty() {
+        return;
+    }
+    let Some(config_db) = state.config_db.as_ref() else {
+        return;
+    };
+    let db = config_db.lock().await;
+    if let Err(err) = db.event_outbox_insert_many(events) {
+        warn!(
+            "failed to append {} object event(s), first kind={} bucket={} key={:?}: {}",
+            events.len(),
+            events[0].kind.as_str(),
+            events[0].bucket,
+            events[0].key,
+            err
+        );
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Content-MD5 validation (shared by PUT and UploadPart)
@@ -244,6 +269,21 @@ pub(super) async fn put_object_inner(
             .put_directory_marker(bucket, key)
             .await
             .map_err(|e| S3Error::InternalError(crate::api::errors::sanitise_for_client(&e)))?;
+        enqueue_object_event(
+            state,
+            NewEvent::new(
+                EventKind::ObjectCreated,
+                bucket,
+                key,
+                EventSource::S3Api,
+                current_unix_seconds(),
+                serde_json::json!({
+                    "content_length": 0,
+                    "storage_type": "directory",
+                }),
+            ),
+        )
+        .await;
         // MD5 of empty content: d41d8cd98f00b204e9800998ecf8427e
         return Ok((
             StatusCode::OK,
@@ -268,6 +308,22 @@ pub(super) async fn put_object_inner(
         .await?;
 
     let storage_type = result.metadata.storage_info.label();
+    enqueue_object_event(
+        state,
+        NewEvent::new(
+            EventKind::ObjectCreated,
+            bucket,
+            key,
+            EventSource::S3Api,
+            current_unix_seconds(),
+            serde_json::json!({
+                "content_length": body.len(),
+                "storage_type": storage_type,
+                "etag": result.metadata.etag(),
+            }),
+        ),
+    )
+    .await;
 
     debug!(
         "Stored {}/{} as {}, saved {} bytes",
@@ -393,6 +449,23 @@ pub(super) async fn copy_object_inner(
     let result = engine
         .store(bucket, key, &data, dest_content_type, dest_user_metadata)
         .await?;
+    enqueue_object_event(
+        state,
+        NewEvent::new(
+            EventKind::ObjectCopied,
+            bucket,
+            key,
+            EventSource::S3Api,
+            current_unix_seconds(),
+            serde_json::json!({
+                "source_bucket": &source_bucket,
+                "source_key": &source_key,
+                "content_length": data.len(),
+                "etag": result.metadata.etag(),
+            }),
+        ),
+    )
+    .await;
 
     debug!(
         "Copied {}/{} -> {}/{} ({} bytes)",
