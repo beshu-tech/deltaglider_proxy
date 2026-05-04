@@ -45,6 +45,7 @@ import { formatBytes } from '../utils';
 import ApplyDialog from './ApplyDialog';
 import SectionHeader from './SectionHeader';
 import SimpleAutoComplete from './SimpleAutoComplete';
+import SimpleSelect from './SimpleSelect';
 import { useCardStyles } from './shared-styles';
 
 const { Text } = Typography;
@@ -87,7 +88,7 @@ function normalizeLifecycle(input: Partial<LifecycleConfig> | undefined): Lifecy
     rules: (cfg.rules || []).map((rule) => ({
       ...emptyRule([]),
       ...rule,
-      action: 'delete',
+      action: normalizeAction(rule.action),
       prefix: rule.prefix || '',
       include_globs: rule.include_globs || [],
       exclude_globs: rule.exclude_globs || ['.deltaglider/**'],
@@ -110,6 +111,26 @@ function lines(value: string[]): string {
 function normalizePrefix(value: string): string {
   const parts = value.split('/').map((part) => part.trim()).filter(Boolean);
   return parts.length === 0 ? '' : `${parts.join('/')}/`;
+}
+
+function actionKind(action: LifecycleRuleConfig['action']): 'delete' | 'transition' {
+  return typeof action === 'object' && action?.type ? 'transition' : 'delete';
+}
+
+function normalizeAction(action: LifecycleRuleConfig['action']): LifecycleRuleConfig['action'] {
+  if (actionKind(action) === 'delete' || typeof action !== 'object') return 'delete';
+  return {
+    type: 'transition',
+    destination: {
+      bucket: action.destination?.bucket?.trim() || '',
+      prefix: normalizePrefix(action.destination?.prefix || ''),
+    },
+    delete_source_after_success: Boolean(action.delete_source_after_success),
+  };
+}
+
+function actionLabel(action: LifecycleRuleConfig['action'] | string | undefined): string {
+  return actionKind(action as LifecycleRuleConfig['action']) === 'transition' ? 'archive/move' : 'delete';
 }
 
 function fmtUnix(ts: number | null | undefined): string {
@@ -163,6 +184,10 @@ export default function LifecyclePanel({ onSessionExpired }: Props) {
     ? overview.find((r) => r.name === selectedRule.name)
     : null;
   const selectedPreview = selectedRuleName ? previews[selectedRuleName] : undefined;
+  const enabledRuleCount = lifecycle.rules.filter((rule) => rule.enabled).length;
+  const failedRuleCount = overview.filter((rule) => rule.last_status === 'failed').length;
+  const lifetimeAffected = overview.reduce((sum, rule) => sum + rule.objects_affected_lifetime, 0);
+  const lifetimeBytes = overview.reduce((sum, rule) => sum + rule.bytes_affected_lifetime, 0);
 
   const refresh = useCallback(async () => {
     try {
@@ -266,10 +291,24 @@ export default function LifecyclePanel({ onSessionExpired }: Props) {
     });
   };
 
+  const confirmRemoveRule = (name: string) => {
+    Modal.confirm({
+      title: `Remove lifecycle rule ${name}?`,
+      okText: 'Remove rule',
+      okButtonProps: { danger: true },
+      content: (
+        <Text type="secondary">
+          This only removes the YAML-backed rule draft. It does not delete objects.
+        </Text>
+      ),
+      onOk: () => removeRule(name),
+    });
+  };
+
   const buildPayload = useCallback((): StorageSectionBody | null => {
     const normalizedRules = lifecycle.rules.map((rule) => ({
       ...rule,
-      action: 'delete' as const,
+      action: normalizeAction(rule.action),
       name: rule.name.trim(),
       bucket: rule.bucket.trim(),
       prefix: normalizePrefix(rule.prefix),
@@ -298,6 +337,13 @@ export default function LifecyclePanel({ onSessionExpired }: Props) {
       if (!rule.expire_after) {
         message.error(`Rule ${rule.name}: expire_after is required.`);
         return null;
+      }
+      if (actionKind(rule.action) === 'transition') {
+        const action = rule.action as Exclude<LifecycleRuleConfig['action'], 'delete' | undefined>;
+        if (!action.destination.bucket.trim()) {
+          message.error(`Rule ${rule.name}: transition destination bucket is required.`);
+          return null;
+        }
       }
     }
     return {
@@ -351,8 +397,9 @@ export default function LifecyclePanel({ onSessionExpired }: Props) {
     try {
       const result = await previewLifecycleRule(name);
       setPreviews((prev) => ({ ...prev, [name]: result }));
+      const label = result.candidates.some((c) => c.action === 'transition') ? 'transition' : 'delete';
       message.success(
-        `Preview scanned ${result.objects_scanned}, would delete ${result.objects_expired} objects (${formatBytes(result.bytes_expired)}).`
+        `Preview scanned ${result.objects_scanned}, would ${label} ${result.objects_affected} objects (${formatBytes(result.bytes_affected)}).`
       );
     } catch (e) {
       message.error(e instanceof Error ? e.message : 'Preview failed');
@@ -362,24 +409,38 @@ export default function LifecyclePanel({ onSessionExpired }: Props) {
   };
 
   const confirmRunNow = (rule: LifecycleRuleConfig, preview: LifecycleRunOutcome) => {
+    const isTransition = actionKind(rule.action) === 'transition';
+    const transitionDeletesSource =
+      isTransition &&
+      typeof rule.action === 'object' &&
+      Boolean(rule.action.delete_source_after_success);
     Modal.confirm({
-      title: `Delete expired objects for ${rule.name}?`,
+      title: `${isTransition ? 'Transition' : 'Delete'} expired objects for ${rule.name}?`,
       icon: <WarningOutlined />,
-      okText: 'Run delete now',
-      okButtonProps: { danger: true },
+      okText: isTransition ? 'Run transition now' : 'Run delete now',
+      okButtonProps: { danger: !isTransition || transitionDeletesSource },
       content: (
         <div>
           <p>
             This executes the configured lifecycle rule against <Text code>{rule.bucket}/{rule.prefix || '*'}</Text>.
-            The latest preview found <Text strong>{preview.objects_expired}</Text> delete candidate{preview.objects_expired === 1 ? '' : 's'}
-            {' '}({formatBytes(preview.bytes_expired)}).
+            The latest preview found <Text strong>{preview.objects_affected}</Text> {isTransition ? 'transition' : 'delete'} candidate{preview.objects_affected === 1 ? '' : 's'}
+            {' '}({formatBytes(preview.bytes_affected)}).
           </p>
-          <Alert
-            type="warning"
-            showIcon
-            message="This is destructive"
-            description="Deletes go through the DeltaGlider engine and cannot be undone from this UI. Re-run Preview if the rule or bucket contents may have changed."
-          />
+          {transitionDeletesSource ? (
+            <Alert
+              type="warning"
+              showIcon
+              message="Source delete is enabled"
+              description="Lifecycle copies first and deletes the source only after the destination write verifies. Re-run Preview if the rule or bucket contents may have changed."
+            />
+          ) : (
+            <Alert
+              type={isTransition ? 'info' : 'warning'}
+              showIcon
+              message={isTransition ? 'Copy-first transition' : 'This is destructive'}
+              description={isTransition ? 'The source object is preserved because delete_source_after_success is off.' : 'Deletes go through the DeltaGlider engine and cannot be undone from this UI.'}
+            />
+          )}
         </div>
       ),
       onOk: async () => {
@@ -388,7 +449,7 @@ export default function LifecyclePanel({ onSessionExpired }: Props) {
           const result = await runLifecycleNow(rule.name);
           setPreviews((prev) => ({ ...prev, [rule.name]: result }));
           message.success(
-            `Lifecycle run ${result.status}: deleted ${result.objects_expired}, skipped ${result.objects_skipped}, errors ${result.errors}.`
+            `Lifecycle run ${result.status}: ${isTransition ? 'transitioned' : 'deleted'} ${result.objects_affected}, skipped ${result.objects_skipped}, errors ${result.errors}.`
           );
           await refresh();
         } catch (e) {
@@ -407,7 +468,8 @@ export default function LifecyclePanel({ onSessionExpired }: Props) {
     Boolean(selectedRule && selectedRuntime && selectedPreview) &&
     !isDirty &&
     lifecycle.enabled &&
-    Boolean(selectedRule?.enabled);
+    Boolean(selectedRule?.enabled) &&
+    selectedPreview!.objects_affected > 0;
   const runReason = !selectedRule
     ? 'Select a rule.'
     : !selectedRuntime
@@ -420,7 +482,9 @@ export default function LifecyclePanel({ onSessionExpired }: Props) {
             ? 'Global lifecycle is disabled.'
             : !selectedRule.enabled
               ? 'Rule is disabled.'
-              : 'Run this delete rule now.';
+              : selectedPreview.objects_affected === 0
+                ? 'Latest preview found no lifecycle candidates.'
+                : `Run this ${actionLabel(selectedRule.action)} rule now.`;
 
   if (error) {
     return <Alert type="error" showIcon message="Failed to load lifecycle" description={error} />;
@@ -490,6 +554,13 @@ export default function LifecyclePanel({ onSessionExpired }: Props) {
         </AdvancedDisclosure>
       </div>
 
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 10, marginBottom: 16 }}>
+        <Metric label="Rules" value={`${enabledRuleCount}/${lifecycle.rules.length} enabled`} />
+        <Metric label="Scheduler" value={lifecycle.enabled ? 'enabled' : 'disabled'} tone={lifecycle.enabled ? undefined : 'warning'} />
+        <Metric label="Failed rules" value={failedRuleCount} tone={failedRuleCount > 0 ? 'error' : undefined} />
+        <Metric label="Lifetime affected" value={`${lifetimeAffected} · ${formatBytes(lifetimeBytes)}`} />
+      </div>
+
       <div style={{ display: 'grid', gridTemplateColumns: 'minmax(260px, 320px) minmax(0, 1fr)', gap: 16 }}>
         <div style={cardStyle}>
           <SectionHeader
@@ -523,7 +594,7 @@ export default function LifecyclePanel({ onSessionExpired }: Props) {
                     {rule.bucket || 'bucket'} / {rule.prefix || 'all'} · older than {rule.expire_after || '—'}
                   </Text>
                   <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 2 }}>
-                    Lifetime deleted: {runtime?.objects_expired_lifetime || 0} objects · {formatBytes(runtime?.bytes_expired_lifetime || 0)}
+                    Lifetime affected: {runtime?.objects_affected_lifetime || 0} objects · {formatBytes(runtime?.bytes_affected_lifetime || 0)}
                   </Text>
                 </button>
               );
@@ -570,9 +641,9 @@ export default function LifecyclePanel({ onSessionExpired }: Props) {
                   loading={runLoading}
                   onClick={() => selectedRule && selectedPreview && confirmRunNow(selectedRule, selectedPreview)}
                 >
-                  Run delete now
+                  Run {actionKind(selectedRule.action) === 'transition' ? 'transition' : 'delete'} now
                 </Button>
-                <Button danger onClick={() => removeRule(selectedRule.name)}>
+                <Button danger onClick={() => confirmRemoveRule(selectedRule.name)}>
                   Remove rule
                 </Button>
               </div>
@@ -625,10 +696,18 @@ function LifecycleApplySummary({ lifecycle }: { lifecycle: LifecycleConfig }) {
         ) : lifecycle.rules.map((rule) => (
           <div key={rule.name} style={{ fontSize: 12, lineHeight: 1.6 }}>
             <Text code>{rule.name}</Text>{' '}
-            <Tag color={rule.enabled ? 'warning' : 'default'}>{rule.enabled ? 'delete enabled' : 'disabled'}</Tag>
+            <Tag color={rule.enabled ? 'warning' : 'default'}>
+              {rule.enabled ? `${actionLabel(rule.action)} enabled` : 'disabled'}
+            </Tag>
             <div>
               <Text strong>Scope:</Text> {rule.bucket}/{rule.prefix || '*'} · older than {rule.expire_after}
             </div>
+            {actionKind(rule.action) === 'transition' && typeof rule.action === 'object' && (
+              <div>
+                <Text strong>Destination:</Text> {rule.action.destination.bucket}/{rule.action.destination.prefix || '*'}
+                {rule.action.delete_source_after_success ? ' · deletes source after verified copy' : ' · keeps source'}
+              </div>
+            )}
             {(rule.include_globs.length > 0 || rule.exclude_globs.length > 0) && (
               <div>
                 Include: {rule.include_globs.length ? rule.include_globs.join(', ') : 'all'} · Exclude: {rule.exclude_globs.length ? rule.exclude_globs.join(', ') : 'none'}
@@ -671,6 +750,21 @@ function RuleEditor({
   onChange: (patch: Partial<LifecycleRuleConfig>) => void;
   onRename: (nextName: string) => void;
 }) {
+  const transitionAction =
+    actionKind(rule.action) === 'transition' && typeof rule.action === 'object'
+      ? rule.action
+      : null;
+  const updateTransition = (
+    patch: Partial<Exclude<LifecycleRuleConfig['action'], 'delete' | undefined>>
+  ) => {
+    const current = transitionAction || {
+      type: 'transition' as const,
+      destination: { bucket: '', prefix: 'archive/' },
+      delete_source_after_success: false,
+    };
+    onChange({ action: { ...current, ...patch } });
+  };
+
   return (
     <div>
       <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'flex-start' }}>
@@ -688,8 +782,8 @@ function RuleEditor({
       <Alert
         type="warning"
         showIcon
-        message="Delete-only lifecycle"
-        description="Keep new rules disabled until Preview shows exactly the candidate set you expect. Prefixes are normalized on blur and again before apply."
+        message="Lifecycle actions"
+        description="Delete removes expired candidates. Archive/move copies through the same DeltaGlider engine path as replication, then optionally deletes the source after the copy verifies."
         style={{ marginTop: 14 }}
       />
 
@@ -736,7 +830,67 @@ function RuleEditor({
             Humantime duration, e.g. <Text code>30d</Text>, <Text code>12h</Text>, <Text code>90d</Text>.
           </Text>
         </Field>
+        <Field label="Action">
+          <SimpleSelect
+            value={actionKind(rule.action)}
+            onChange={(value) => {
+              if (value === 'transition') {
+                onChange({
+                  action: {
+                    type: 'transition',
+                    destination: { bucket: '', prefix: 'archive/' },
+                    delete_source_after_success: false,
+                  },
+                });
+              } else {
+                onChange({ action: 'delete' });
+              }
+            }}
+            options={[
+              { value: 'delete', label: 'Delete', sublabel: 'Expire source objects' },
+              { value: 'transition', label: 'Archive / move', sublabel: 'Copy first, optional source delete' },
+            ]}
+            style={{ width: '100%', ...inputRadius }}
+          />
+        </Field>
       </div>
+
+      {transitionAction && (
+        <div style={{ marginTop: 12, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12 }}>
+          <Field label="Destination bucket">
+            <SimpleAutoComplete
+              value={transitionAction.destination?.bucket || ''}
+              onChange={(bucket) => updateTransition({
+                destination: { ...transitionAction.destination, bucket },
+              })}
+              options={buckets}
+              placeholder="archive-artifacts"
+            />
+          </Field>
+          <Field label="Destination prefix">
+            <Input
+              value={transitionAction.destination?.prefix || ''}
+              onChange={(e) => updateTransition({
+                destination: { ...transitionAction.destination, prefix: e.target.value },
+              })}
+              onBlur={(e) => updateTransition({
+                destination: { ...transitionAction.destination, prefix: normalizePrefix(e.target.value) },
+              })}
+              placeholder="archive/"
+              style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
+            />
+          </Field>
+          <Field label="Delete source after copy">
+            <Switch
+              checked={Boolean(transitionAction.delete_source_after_success)}
+              onChange={(checked) => updateTransition({ delete_source_after_success: checked })}
+            />
+            <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 4 }}>
+              Off archives by copying only. On makes it a move, but source delete only happens after verified copy success.
+            </Text>
+          </Field>
+        </div>
+      )}
 
       <AdvancedDisclosure title="Filters and batch size">
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12 }}>
@@ -806,9 +960,9 @@ function PreviewPanel({
       </div>
       <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
         <Metric label="Scanned" value={outcome.objects_scanned} />
-        <Metric label="Would delete / deleted" value={outcome.objects_expired} />
+        <Metric label="Would affect / affected" value={outcome.objects_affected} />
         <Metric label="Skipped" value={outcome.objects_skipped} />
-        <Metric label="Bytes" value={formatBytes(outcome.bytes_expired)} />
+        <Metric label="Bytes affected" value={formatBytes(outcome.bytes_affected)} />
         <Metric label="Errors" value={outcome.errors} tone={outcome.errors > 0 ? 'error' : undefined} />
       </div>
       <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 8 }}>
@@ -816,7 +970,7 @@ function PreviewPanel({
       </Text>
       <div style={{ marginTop: 10, display: 'grid', gridTemplateColumns: '1fr', gap: 8, maxHeight: 300, overflow: 'auto' }}>
         {outcome.candidates.length === 0 ? (
-          <Text type="secondary" style={{ fontSize: 12 }}>No delete candidates returned.</Text>
+          <Text type="secondary" style={{ fontSize: 12 }}>No lifecycle candidates returned.</Text>
         ) : outcome.candidates.map((obj) => (
           <div
             key={`${obj.bucket}/${obj.key}`}
@@ -832,7 +986,18 @@ function PreviewPanel({
               alignItems: 'center',
             }}
           >
-            <Text code style={{ wordBreak: 'break-word' }}>{obj.bucket}/{obj.key}</Text>
+            <div>
+              <Text code style={{ wordBreak: 'break-word' }}>{obj.bucket}/{obj.key}</Text>
+              <div style={{ marginTop: 4 }}>
+                <Tag color={obj.action === 'transition' ? 'processing' : 'warning'}>{obj.action}</Tag>
+                {obj.destination_bucket && obj.destination_key && (
+                  <Text type="secondary">
+                    → <Text code>{obj.destination_bucket}/{obj.destination_key}</Text>
+                    {obj.delete_source_after_success ? ' · delete source after copy' : ' · keep source'}
+                  </Text>
+                )}
+              </div>
+            </div>
             <Text type="secondary">{fmtDate(obj.created_at)}</Text>
             <Text>{formatBytes(obj.size)}</Text>
           </div>
@@ -897,7 +1062,7 @@ function RuntimeDetails({
             >
               <Tag color={run.status === 'failed' ? 'error' : 'success'}>{run.status}</Tag>
               <Tag color="processing">{run.triggered_by}</Tag>
-              {fmtUnix(run.started_at)} · deleted {run.objects_expired}/{run.objects_scanned} · errors {run.errors}
+              {fmtUnix(run.started_at)} · affected {run.objects_affected}/{run.objects_scanned} · errors {run.errors}
             </div>
           ))}
         </div>
@@ -989,7 +1154,7 @@ function Metric({
 }: {
   label: string;
   value: string | number;
-  tone?: 'error';
+  tone?: 'error' | 'warning';
 }) {
   return (
     <div
@@ -1002,7 +1167,7 @@ function Metric({
       }}
     >
       <Text type="secondary" style={{ display: 'block', fontSize: 11 }}>{label}</Text>
-      <Text strong type={tone === 'error' ? 'danger' : undefined}>{value}</Text>
+      <Text strong type={tone === 'error' ? 'danger' : tone}>{value}</Text>
     </div>
   );
 }

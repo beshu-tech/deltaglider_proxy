@@ -4,6 +4,7 @@
 //! `advanced.event_delivery.enabled=true` and `webhook_url` is set. Request
 //! handlers never call this module; they only append to `event_outbox`.
 
+use crate::background::parse_duration_or;
 use crate::config::SharedConfig;
 use crate::config_db::ConfigDb;
 use crate::config_sections::EventDeliveryConfig;
@@ -12,6 +13,7 @@ use crate::event_outbox::{
     STATUS_PENDING,
 };
 use async_trait::async_trait;
+use reqwest::header::{HeaderName, HeaderValue};
 use reqwest::Url;
 use serde::Serialize;
 use std::sync::Arc;
@@ -55,10 +57,10 @@ impl EventDeliveryClient for HttpWebhookDeliveryClient {
         config: &EventDeliveryConfig,
         event: &EventOutboxRecord,
     ) -> Result<(), String> {
-        let Some(url) = config.webhook_url.as_deref() else {
-            return Err("event delivery enabled without webhook_url".to_string());
-        };
-        let url = Url::parse(url).map_err(|e| format!("invalid webhook_url: {e}"))?;
+        let endpoints = config.webhook_endpoints();
+        if endpoints.is_empty() {
+            return Err("event delivery enabled without webhook endpoint".to_string());
+        }
         let payload = EventWebhookPayload {
             schema: "deltaglider.event.v1",
             event,
@@ -69,20 +71,33 @@ impl EventDeliveryClient for HttpWebhookDeliveryClient {
             MIN_TIMEOUT,
             "event_delivery.request_timeout",
         );
-        let response = self
-            .client
-            .post(url)
-            .timeout(timeout)
-            .header("user-agent", "deltaglider-proxy-event-outbox")
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            Err(format!("webhook returned HTTP {}", response.status()))
+        for endpoint in endpoints {
+            let url = Url::parse(endpoint).map_err(|e| format!("invalid webhook endpoint: {e}"))?;
+            let mut request = self
+                .client
+                .post(url)
+                .timeout(timeout)
+                .header("user-agent", "deltaglider-proxy-event-outbox");
+            for (name, value) in &config.webhook_headers {
+                let name = HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|e| format!("invalid webhook header name {name:?}: {e}"))?;
+                let value = HeaderValue::from_str(value)
+                    .map_err(|e| format!("invalid webhook header value for {name}: {e}"))?;
+                request = request.header(name, value);
+            }
+            let response = request
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|e| format!("{endpoint}: {e}"))?;
+            if !response.status().is_success() {
+                return Err(format!(
+                    "{endpoint}: webhook returned HTTP {}",
+                    response.status()
+                ));
+            }
         }
+        Ok(())
     }
 }
 
@@ -247,17 +262,6 @@ pub(crate) fn delivered_retention_secs(config: &EventDeliveryConfig) -> i64 {
     .as_secs() as i64
 }
 
-fn parse_duration_or(value: &str, default: Duration, minimum: Duration, label: &str) -> Duration {
-    match humantime::parse_duration(value) {
-        Ok(duration) if duration >= minimum => duration,
-        Ok(_) => minimum,
-        Err(err) => {
-            warn!("{}={} invalid: {}; using default", label, value, err);
-            default
-        }
-    }
-}
-
 fn truncate_error(error: &str) -> String {
     const MAX_ERROR_LEN: usize = 1000;
     if error.len() <= MAX_ERROR_LEN {
@@ -279,7 +283,11 @@ mod tests {
     use super::*;
     use crate::config_db::ConfigDb;
     use crate::event_outbox::{EventKind, EventSource, NewEvent};
-    use axum::{http::StatusCode, routing::post, Json, Router};
+    use axum::{
+        http::{HeaderMap, StatusCode},
+        routing::post,
+        Json, Router,
+    };
     use serde_json::{json, Value};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::time::{timeout, Duration};
@@ -309,6 +317,8 @@ mod tests {
         EventDeliveryConfig {
             enabled: true,
             webhook_url: Some("http://example.invalid/hook".to_string()),
+            webhook_urls: Vec::new(),
+            webhook_headers: Default::default(),
             tick_interval: "1s".to_string(),
             batch_size: 10,
             request_timeout: "1s".to_string(),
@@ -396,18 +406,40 @@ mod tests {
     #[tokio::test]
     async fn http_webhook_client_posts_event_payload() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
-        let app = Router::new().route(
-            "/hook",
-            post(move |Json(payload): Json<Value>| {
-                let tx = tx.clone();
-                async move {
-                    tx.send(payload).unwrap();
-                    StatusCode::NO_CONTENT
-                }
-            }),
-        );
+        let app = Router::new()
+            .route(
+                "/hook",
+                post({
+                    let tx = tx.clone();
+                    move |headers: HeaderMap, Json(payload): Json<Value>| {
+                        let tx = tx.clone();
+                        async move {
+                            tx.send(json!({
+                                "token": headers.get("x-dgp-token").and_then(|v| v.to_str().ok()),
+                                "payload": payload,
+                            }))
+                            .unwrap();
+                            StatusCode::NO_CONTENT
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/hook2",
+                post(move |headers: HeaderMap, Json(payload): Json<Value>| {
+                    let tx = tx.clone();
+                    async move {
+                        tx.send(json!({
+                            "token": headers.get("x-dgp-token").and_then(|v| v.to_str().ok()),
+                            "payload": payload,
+                        }))
+                        .unwrap();
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/hook", listener.local_addr().unwrap());
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -418,19 +450,31 @@ mod tests {
             db.event_outbox_insert(&event("webhook")).unwrap()
         };
         let mut config = cfg();
-        config.webhook_url = Some(url);
+        config.webhook_url = Some(format!("{base_url}/hook"));
+        config.webhook_urls = vec![format!("{base_url}/hook2")];
+        config
+            .webhook_headers
+            .insert("x-dgp-token".to_string(), "secret".to_string());
         let client = HttpWebhookDeliveryClient::default();
 
         dispatch_once(&db, &client, &config, "test-worker", 200).await;
 
-        let payload = timeout(Duration::from_secs(2), rx.recv())
+        let first = timeout(Duration::from_secs(2), rx.recv())
             .await
             .unwrap()
             .expect("webhook request");
-        assert_eq!(payload["schema"].as_str(), Some("deltaglider.event.v1"));
-        assert_eq!(payload["event"]["id"].as_i64(), Some(id));
-        assert_eq!(payload["event"]["kind"].as_str(), Some("ObjectCreated"));
-        assert_eq!(payload["event"]["key"].as_str(), Some("webhook"));
+        let second = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .expect("second webhook request");
+        for payload in [first, second] {
+            assert_eq!(payload["token"].as_str(), Some("secret"));
+            let payload = &payload["payload"];
+            assert_eq!(payload["schema"].as_str(), Some("deltaglider.event.v1"));
+            assert_eq!(payload["event"]["id"].as_i64(), Some(id));
+            assert_eq!(payload["event"]["kind"].as_str(), Some("ObjectCreated"));
+            assert_eq!(payload["event"]["key"].as_str(), Some("webhook"));
+        }
 
         let row = db
             .lock()

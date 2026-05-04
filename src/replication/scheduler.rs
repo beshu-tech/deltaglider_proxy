@@ -5,6 +5,7 @@
 //! config + config DB state, and runs them through the same worker path.
 
 use crate::api::handlers::AppState;
+use crate::background::parse_duration_or;
 use crate::config::SharedConfig;
 use crate::config_db::ConfigDb;
 use crate::config_sections::ReplicationConfig;
@@ -166,32 +167,6 @@ pub(crate) fn heartbeat_secs(replication: &ReplicationConfig) -> i64 {
         clamped
     } else {
         heartbeat
-    }
-}
-
-fn parse_duration_or(value: &str, default: Duration, minimum: Duration, label: &str) -> Duration {
-    match humantime::parse_duration(value) {
-        Ok(duration) if duration >= minimum => duration,
-        Ok(duration) => {
-            warn!(
-                "{}={} below minimum {}; using {}",
-                label,
-                humantime::format_duration(duration),
-                humantime::format_duration(minimum),
-                humantime::format_duration(minimum),
-            );
-            minimum
-        }
-        Err(err) => {
-            warn!(
-                "{}={} invalid: {}; using {}",
-                label,
-                value,
-                err,
-                humantime::format_duration(default),
-            );
-            default
-        }
     }
 }
 

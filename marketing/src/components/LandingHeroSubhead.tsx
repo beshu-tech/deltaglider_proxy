@@ -4,16 +4,16 @@ import { LUCIDE_STROKE } from '../icons/sizes';
 
 const ROWS: readonly { lead: string; rest: string }[] = [
   {
-    lead: 'Smaller on disk',
-    rest: 'Repeated and versioned binaries as xdelta3—apps still see plain S3 API semantics.',
+    lead: 'Control plane, not storage cluster',
+    rest: 'DeltaGlider sits in front of existing S3-compatible backends and filesystems.',
   },
   {
-    lead: 'Access & security',
-    rest: 'IAM, OAuth, ABAC, zero trust encryption at rest.',
+    lead: 'Proper, centralized admin UI',
+    rest: 'IAM, OAuth, routing, lifecycle, replication, events, audits, and config in one place.',
   },
   {
-    lead: 'How you run it',
-    rest: 'Quotas, replication, metrics, audit trail, and configuration through one admin surface.',
+    lead: 'Lower growth for repeated binaries',
+    rest: 'Fast local disk caching plus xdelta3 deltas where artifacts share most of their bytes.',
   },
 ];
 
@@ -22,9 +22,9 @@ export function LandingHeroSubhead(): JSX.Element {
     <div className="flex flex-col gap-6 text-ink-600 dark:text-ink-300 sm:gap-5">
       <p className="m-0 text-lg leading-relaxed sm:text-[1.125rem] sm:leading-8">
         <span className="font-semibold text-ink-900 dark:text-ink-100">
-          Identity, Policy, Ops, Security.
+          Not another object store.
         </span>{' '}
-        S3 in, S3 out.
+        The S3 control plane in front of the storage you already run.
       </p>
       <ul
         className="m-0 list-none space-y-3 p-0 sm:space-y-2.5"

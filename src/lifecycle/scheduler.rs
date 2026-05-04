@@ -1,6 +1,7 @@
 //! Conservative lifecycle scheduler.
 
 use crate::api::handlers::AppState;
+use crate::background::parse_duration_or;
 use crate::config::SharedConfig;
 use crate::config_db::ConfigDb;
 use crate::config_sections::LifecycleConfig;
@@ -122,14 +123,14 @@ async fn run_due_rules(
         {
             Ok(outcome) if outcome.errors == 0 => {
                 info!(
-                    "Lifecycle rule '{}' completed: expired={} scanned={}",
-                    rule.name, outcome.objects_expired, outcome.objects_scanned
+                    "Lifecycle rule '{}' completed: affected={} scanned={}",
+                    rule.name, outcome.objects_affected, outcome.objects_scanned
                 );
             }
             Ok(outcome) => {
                 warn!(
-                    "Lifecycle rule '{}' completed with {} errors (expired={}, scanned={})",
-                    rule.name, outcome.errors, outcome.objects_expired, outcome.objects_scanned
+                    "Lifecycle rule '{}' completed with {} errors (affected={}, scanned={})",
+                    rule.name, outcome.errors, outcome.objects_affected, outcome.objects_scanned
                 );
             }
             Err(err) => warn!("Lifecycle rule '{}' failed: {}", rule.name, err),
@@ -157,32 +158,6 @@ pub(crate) fn lease_ttl_secs() -> i64 {
 
 pub(crate) fn heartbeat_secs() -> i64 {
     DEFAULT_HEARTBEAT_SECS
-}
-
-fn parse_duration_or(value: &str, default: Duration, minimum: Duration, label: &str) -> Duration {
-    match humantime::parse_duration(value) {
-        Ok(duration) if duration >= minimum => duration,
-        Ok(duration) => {
-            warn!(
-                "{}={} below minimum {}; using {}",
-                label,
-                humantime::format_duration(duration),
-                humantime::format_duration(minimum),
-                humantime::format_duration(minimum),
-            );
-            minimum
-        }
-        Err(err) => {
-            warn!(
-                "{}={} invalid: {}; using {}",
-                label,
-                value,
-                err,
-                humantime::format_duration(default),
-            );
-            default
-        }
-    }
 }
 
 #[cfg(test)]

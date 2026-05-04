@@ -191,5 +191,3 @@ means:
 ## Deferred
 
 - Continuation-token resumption for long runs that straddle ticks.
-- Periodic scheduler loop that wakes on `tick_interval` and runs due
-  rules automatically.

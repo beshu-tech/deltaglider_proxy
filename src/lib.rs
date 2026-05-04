@@ -5,6 +5,7 @@
 pub mod admission;
 pub mod api;
 pub mod audit;
+pub(crate) mod background;
 pub mod bucket_policy;
 pub mod cli;
 pub mod config;
@@ -27,5 +28,6 @@ pub mod s3_adapter_s3s;
 pub mod session;
 pub mod storage;
 pub mod tls;
+pub(crate) mod transfer;
 pub mod types;
 pub mod usage_scanner;

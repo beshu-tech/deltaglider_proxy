@@ -31,6 +31,10 @@ use crate::config_db::ConfigDb;
 use crate::config_sections::ReplicationRule;
 use crate::deltaglider::DynEngine;
 use crate::event_outbox::{EventKind, EventSource, NewEvent};
+use crate::transfer::{
+    copy_object_with_retries, ObjectTransferRequest, TransferProvenance,
+    REPLICATION_RULE_METADATA_KEY,
+};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -44,9 +48,6 @@ use tracing::{debug, info, warn};
 /// round-trips through both backends without any DG-specific plumbing,
 /// survives encryption (per-backend SSE doesn't encrypt user-metadata),
 /// and is visible to operators auditing what wrote a given object.
-const REPLICATION_RULE_METADATA_KEY: &str = "dg-replication-rule";
-const COPY_MAX_ATTEMPTS: u32 = 3;
-
 /// Outcome of a single run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunOutcome {
@@ -214,8 +215,20 @@ pub async fn run_rule(
                 hit_fatal_error = true;
                 break 'pages;
             }
-            match copy_one_with_retries(engine, rule, src_key, dest_key).await {
-                Ok(bytes_copied) => {
+            let transfer = ObjectTransferRequest {
+                source_bucket: &rule.source.bucket,
+                source_key: src_key,
+                destination_bucket: &rule.destination.bucket,
+                destination_key: dest_key,
+                provenance: Some(TransferProvenance {
+                    metadata_key: REPLICATION_RULE_METADATA_KEY,
+                    metadata_value: &rule.name,
+                }),
+                operation: "replication",
+            };
+            match copy_object_with_retries(engine, transfer).await {
+                Ok(outcome) => {
+                    let bytes_copied = outcome.bytes_copied;
                     totals.objects_copied += 1;
                     totals.bytes_copied += bytes_copied as i64;
                     {
@@ -453,59 +466,6 @@ async fn log_failure(
     )
 }
 
-async fn copy_one_with_retries(
-    engine: &Arc<DynEngine>,
-    rule: &ReplicationRule,
-    src_key: &str,
-    dest_key: &str,
-) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    let mut last_err: Option<String> = None;
-    for attempt in 1..=COPY_MAX_ATTEMPTS {
-        match copy_one(engine, rule, src_key, dest_key).await {
-            Ok(bytes) => return Ok(bytes),
-            Err(err) => {
-                let msg = err.to_string();
-                if !is_transient_copy_error(&msg) || attempt == COPY_MAX_ATTEMPTS {
-                    return Err(if attempt > 1 {
-                        format!("{} (after {} attempts)", msg, attempt).into()
-                    } else {
-                        msg.into()
-                    });
-                }
-                warn!(
-                    "replication rule '{}' transient copy failure attempt {}/{} src={:?} dst={:?}: {}",
-                    rule.name, attempt, COPY_MAX_ATTEMPTS, src_key, dest_key, msg
-                );
-                last_err = Some(msg);
-                tokio::time::sleep(std::time::Duration::from_millis(250 * attempt as u64)).await;
-            }
-        }
-    }
-    Err(last_err
-        .unwrap_or_else(|| "copy failed without error detail".to_string())
-        .into())
-}
-
-fn is_transient_copy_error(message: &str) -> bool {
-    let m = message.to_ascii_lowercase();
-    [
-        "failed to read response body",
-        "streaming error",
-        "connection reset",
-        "connection closed",
-        "connection aborted",
-        "timed out",
-        "timeout",
-        "temporary failure",
-        "service unavailable",
-        "slowdown",
-        "internalerror",
-        "broken pipe",
-    ]
-    .iter()
-    .any(|needle| m.contains(needle))
-}
-
 /// Delete-replication pass: paginate the destination prefix; for each
 /// key that's NOT on source, delete it from destination.
 ///
@@ -707,80 +667,6 @@ fn dest_to_source_key(rule: &ReplicationRule, dest_key: &str) -> Option<String> 
     Some(format!("{}{}", src_prefix, tail.trim_start_matches('/')))
 }
 
-/// Copy a single object: engine.retrieve from source, engine.store on
-/// destination. Honours the source's `multipart_etag` (H3 fix) so the
-/// destination's HEAD returns the same ETag the original Complete
-/// response advertised. Returns bytes copied.
-async fn copy_one(
-    engine: &Arc<DynEngine>,
-    rule: &ReplicationRule,
-    src_key: &str,
-    dest_key: &str,
-) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    // HEAD first so we can error cleanly if the source disappeared
-    // mid-run (retrieve would also error, but this gives a crisper
-    // cause on the failure row).
-    let _src_meta = engine.head(&rule.source.bucket, src_key).await.map_err(
-        |e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("source head failed: {}", e).into()
-        },
-    )?;
-
-    let (data, meta) = engine
-        .retrieve(&rule.source.bucket, src_key)
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("source retrieve failed: {}", e).into()
-        })?;
-
-    let content_type = meta.content_type.clone();
-    let mut user_metadata = meta.user_metadata.clone();
-    let bytes = data.len();
-
-    // H2 fix: stamp our rule name so the delete pass can tell this
-    // object apart from anything written by another rule or by an
-    // operator sharing the destination prefix. Without this marker,
-    // `replicate_deletes=true` would happily delete unrelated objects
-    // whose source-counterpart key happens to be missing.
-    user_metadata.insert(REPLICATION_RULE_METADATA_KEY.to_string(), rule.name.clone());
-
-    // H3 fix: when the source carries a multipart_etag, route through
-    // store_with_multipart_etag so the destination HEAD reports the
-    // same ETag the source's CompleteMultipartUpload advertised. Pre-
-    // fix, replication silently rewrote the ETag to a full-body MD5,
-    // making source != dest from the client's view.
-    if let Some(mp_etag) = meta.multipart_etag.clone() {
-        engine
-            .store_with_multipart_etag(
-                &rule.destination.bucket,
-                dest_key,
-                &data,
-                content_type,
-                user_metadata,
-                mp_etag,
-            )
-            .await
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("destination store failed: {}", e).into()
-            })?;
-    } else {
-        engine
-            .store(
-                &rule.destination.bucket,
-                dest_key,
-                &data,
-                content_type,
-                user_metadata,
-            )
-            .await
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("destination store failed: {}", e).into()
-            })?;
-    }
-
-    Ok(bytes)
-}
-
 /// Compute when this rule should next be due. Falls back to a 1-hour
 /// recovery window if the rule's `interval` is unparseable (should
 /// never happen in practice — validated at Config::check time).
@@ -888,20 +774,5 @@ mod tests {
             dest_to_source_key(&rule, "v1.zip"),
             Some("releases/v1.zip".to_string())
         );
-    }
-
-    #[test]
-    fn transient_copy_error_classification_is_narrow() {
-        assert!(is_transient_copy_error(
-            "source retrieve failed: Storage error: S3 error: Failed to read response body: streaming error"
-        ));
-        assert!(is_transient_copy_error("connection reset by peer"));
-        assert!(is_transient_copy_error("503 SlowDown"));
-
-        assert!(!is_transient_copy_error(
-            "destination store failed: Storage error: Bucket not found: test-bucket"
-        ));
-        assert!(!is_transient_copy_error("AccessDenied"));
-        assert!(!is_transient_copy_error("NoSuchKey"));
     }
 }

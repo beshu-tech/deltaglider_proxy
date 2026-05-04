@@ -40,6 +40,18 @@ function fmtUnix(ts: number | null | undefined): string {
   });
 }
 
+function fmtRelative(ts: number | null | undefined): string {
+  if (!ts) return '—';
+  const seconds = Math.round((ts * 1000 - Date.now()) / 1000);
+  const abs = Math.abs(seconds);
+  const unit =
+    abs < 60 ? ['s', abs] :
+      abs < 3600 ? ['m', Math.round(abs / 60)] :
+        abs < 86400 ? ['h', Math.round(abs / 3600)] :
+          ['d', Math.round(abs / 86400)];
+  return seconds >= 0 ? `in ${unit[1]}${unit[0]}` : `${unit[1]}${unit[0]} ago`;
+}
+
 function statusColour(status: string): string {
   if (status === 'delivered') return 'success';
   if (status === 'failed') return 'error';
@@ -143,22 +155,29 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
       title: 'Status',
       dataIndex: 'status',
       key: 'status',
-      width: 128,
+      width: 138,
       sorter: true,
       sortOrder: sort === 'status' ? (order === 'asc' ? 'ascend' : 'descend') : null,
-      render: (value: EventOutboxStatus) => <Tag color={statusColour(value)}>{value}</Tag>,
+      render: (value: EventOutboxStatus, row) => (
+        <div title={`Attempts: ${row.attempts}${row.claimed_by ? ` · claimed by ${row.claimed_by}` : ''}`}>
+          <Tag color={statusColour(value)}>{value}</Tag>
+          <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 2 }}>
+            {row.attempts} attempt{row.attempts === 1 ? '' : 's'}
+          </Text>
+        </div>
+      ),
     },
     {
       title: 'Kind',
       dataIndex: 'kind',
       key: 'kind',
-      width: 190,
+      width: 168,
       sorter: true,
       sortOrder: sort === 'kind' ? (order === 'asc' ? 'ascend' : 'descend') : null,
       render: (_: string, row) => (
         <div title={`${row.kind} · ${row.source}`} style={{ minWidth: 0 }}>
-          <Text style={{ display: 'block', fontSize: 12 }}>{row.kind}</Text>
-          <Text type="secondary" style={{ display: 'block', fontSize: 11 }}>{row.source}</Text>
+          <Text style={{ display: 'block', fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.kind}</Text>
+          <Text type="secondary" style={{ display: 'block', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.source}</Text>
         </div>
       ),
     },
@@ -181,53 +200,46 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
       ),
     },
     {
-      title: 'Occurred',
+      title: 'Timing',
       dataIndex: 'occurred_at',
       key: 'occurred_at',
-      width: 190,
+      width: 210,
       sorter: true,
       defaultSortOrder: 'descend',
       sortOrder: sort === 'occurred_at' ? (order === 'asc' ? 'ascend' : 'descend') : null,
-      render: (value: number) => <span title={fmtUnix(value)}>{fmtUnix(value)}</span>,
-    },
-    {
-      title: 'Created',
-      dataIndex: 'created_at',
-      key: 'created_at',
-      width: 190,
-      sorter: true,
-      sortOrder: sort === 'created_at' ? (order === 'asc' ? 'ascend' : 'descend') : null,
-      render: (value: number) => <span title={fmtUnix(value)}>{fmtUnix(value)}</span>,
-    },
-    {
-      title: 'Attempts',
-      dataIndex: 'attempts',
-      key: 'attempts',
-      width: 110,
-      sorter: true,
-      sortOrder: sort === 'attempts' ? (order === 'asc' ? 'ascend' : 'descend') : null,
-      render: (value: number) => <Text>{value}</Text>,
+      render: (value: number, row) => (
+        <div title={`Occurred ${fmtUnix(value)} · queued ${fmtUnix(row.created_at)}`}>
+          <Text style={{ display: 'block', fontSize: 12 }}>{fmtRelative(value)}</Text>
+          <Text type="secondary" style={{ display: 'block', fontSize: 11 }}>
+            queued {fmtRelative(row.created_at)}
+          </Text>
+        </div>
+      ),
     },
     {
       title: 'Next Try',
       dataIndex: 'next_attempt_at',
       key: 'next_attempt_at',
-      width: 190,
+      width: 130,
       sorter: true,
       sortOrder: sort === 'next_attempt_at' ? (order === 'asc' ? 'ascend' : 'descend') : null,
-      render: (value: number | null) => <span title={fmtUnix(value)}>{fmtUnix(value)}</span>,
+      render: (value: number | null, row) => (
+        <span title={row.delivered_at ? `Delivered ${fmtUnix(row.delivered_at)}` : fmtUnix(value)}>
+          {row.delivered_at ? 'delivered' : fmtRelative(value)}
+        </span>
+      ),
     },
     {
       title: 'Error / Payload',
       key: 'last_error',
-      width: 360,
+      width: 380,
       render: (_: unknown, row) => {
         const text = row.last_error || JSON.stringify(row.payload);
         return (
           <Text
             type={row.last_error ? 'danger' : 'secondary'}
             title={text}
-            style={{ display: 'block', maxWidth: 330, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+            style={{ display: 'block', maxWidth: 350, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
           >
             {text}
           </Text>
@@ -321,7 +333,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
 
       <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
         <Input
-          placeholder="Filter current page..."
+          placeholder="Search loaded rows..."
           prefix={<SearchOutlined style={{ color: colors.TEXT_MUTED }} />}
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
@@ -364,10 +376,15 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
       </div>
 
       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-        <CountPill label="Pending" value={counts.pending} colour="warning" />
-        <CountPill label="In progress" value={counts.in_progress} colour="processing" />
-        <CountPill label="Failed" value={counts.failed} colour="error" />
-        <CountPill label="Delivered" value={counts.delivered} colour="success" />
+        <CountPill label="Pending" value={counts.pending} colour="warning" active={status === 'pending'} onClick={() => { setStatus('pending'); setPage(1); }} />
+        <CountPill label="In progress" value={counts.in_progress} colour="processing" active={status === 'in_progress'} onClick={() => { setStatus('in_progress'); setPage(1); }} />
+        <CountPill label="Failed" value={counts.failed} colour="error" active={status === 'failed'} onClick={() => { setStatus('failed'); setPage(1); }} />
+        <CountPill label="Delivered" value={counts.delivered} colour="success" active={status === 'delivered'} onClick={() => { setStatus('delivered'); setPage(1); }} />
+        {status !== 'all' && (
+          <Button size="small" onClick={() => { setStatus('all'); setPage(1); }}>
+            Clear status filter
+          </Button>
+        )}
       </div>
 
       <div style={{ border: `1px solid ${colors.BORDER}`, borderRadius: 8, overflow: 'hidden', background: colors.BG_CARD }}>
@@ -379,9 +396,15 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
           size="small"
           tableLayout="fixed"
           showSorterTooltip={false}
-          scroll={{ x: 1900 }}
+          scroll={{ x: 1510 }}
           onChange={onTableChange}
-          locale={{ emptyText: loading ? 'Loading...' : 'No outbox rows match this view.' }}
+          locale={{
+            emptyText: loading
+              ? 'Loading...'
+              : status === 'all' && !filter
+                ? 'No object events have been recorded yet.'
+                : 'No outbox rows match this view.',
+          }}
           pagination={{
             current: page,
             pageSize,
@@ -397,11 +420,36 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
   );
 }
 
-function CountPill({ label, value, colour }: { label: string; value: number; colour: string }) {
+function CountPill({
+  label,
+  value,
+  colour,
+  active,
+  onClick,
+}: {
+  label: string;
+  value: number;
+  colour: string;
+  active?: boolean;
+  onClick?: () => void;
+}) {
   return (
-    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, border: '1px solid var(--border)', borderRadius: 999, padding: '5px 9px', background: 'var(--card-bg)' }}>
+    <button
+      type="button"
+      onClick={onClick}
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 6,
+        border: `1px solid ${active ? 'var(--accent-blue)' : 'var(--border)'}`,
+        borderRadius: 999,
+        padding: '5px 9px',
+        background: active ? 'rgba(72, 160, 255, 0.12)' : 'var(--card-bg)',
+        cursor: 'pointer',
+      }}
+    >
       <Text type="secondary" style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.4 }}>{label}</Text>
       <Tag color={colour} style={{ marginInlineEnd: 0 }}>{value}</Tag>
-    </span>
+    </button>
   );
 }

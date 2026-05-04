@@ -1,6 +1,6 @@
 # DeltaGlider Proxy
 
-**A unified S3-compatible gateway that reduces storage growth for repeated binaries, routes buckets across multiple backends, and adds an enterprise control plane — IAM, OAuth, bucket policy, quotas, replication, encryption, metrics, audit, and a full management GUI. One binary. One port. Existing S3 workflows.**
+**Not another object store or storage cluster: DeltaGlider is the S3 control plane in front of the storage you already run. It routes buckets across existing backends and local filesystems, adds a proper, centralized admin UI for IAM, OAuth, lifecycle, replication, event outbox delivery, audits, caching, and encryption, and reduces storage growth for repeated binaries with xdelta3 deltas. One binary. One port. Existing S3 workflows.**
 
 ---
 
@@ -8,7 +8,7 @@
 
 Organizations run storage across multiple providers — AWS S3, lower-cost S3-compatible SaaS, Hetzner Object Storage, Backblaze B2, MinIO, local NFS. Each has its own credentials, endpoints, and access policies. Teams share credentials in Slack. There's no audit trail. No prefix-level access control. No way to publish a folder without exposing the whole bucket.
 
-DeltaGlider Proxy solves this by sitting in front of all your backends and presenting a single, authenticated S3 endpoint:
+DeltaGlider Proxy solves this by sitting in front of all your backends and presenting a single, authenticated S3 endpoint. It is not trying to be the distributed object store; it is the policy, routing, cache, lifecycle, replication, event, audit, encryption, and compression layer operators usually have to stitch together around one:
 
 ```
                                           ┌──────────────────────┐
@@ -71,7 +71,9 @@ Everything managed from a web UI served on the same port as the S3 API — no ex
 - **OAuth configuration** — Add identity providers, configure group mapping rules, test SSO flows
 - **Backend management** — Add/remove storage backends, configure per-bucket routing, aliasing, compression policies, and public prefixes
 - **Bucket controls** — Configure soft quotas, read-only bucket freeze, public prefixes, aliases, and compression policy
-- **Object replication** — Configure source → destination replication rules, run-now, pause/resume, history/failures, and delete replication
+- **Object lifecycle** — Preview and run delete-only expiration rules, with scheduler history/failures and engine-routed deletes
+- **Object replication** — Configure source → destination replication rules, scheduler cadence, run-now, pause/resume, history/failures, and delete replication
+- **Event outbox** — Durable object mutation events with background webhook delivery, fan-out endpoints, retry backoff, and failed-row requeue
 - **Monitoring dashboard** — Live Prometheus metrics: request rates, latencies, cache hit rates, status codes, auth events
 - **Storage analytics** — Per-bucket savings breakdown, estimated monthly cost savings, compression opportunity detection
 - **Embedded documentation** — Full-text searchable reference docs with architecture diagrams
@@ -205,8 +207,9 @@ Silence the warning mid-migration with `DGP_SILENCE_TOML_DEPRECATION=1`. See the
 | **Conditional** | If-Match, If-None-Match (304), If-Modified-Since, If-Unmodified-Since (412) |
 | **Range** | Range requests (206 Partial Content) |
 | **Validation** | Content-MD5 on PUT/UploadPart |
+| **Lifecycle** | Delete-only expiration rules via scheduler, preview, run-now, and history/failures |
 
-Not implemented: versioning, lifecycle policies, object lock.
+Not implemented: versioning, storage-class transitions, object lock.
 
 ## Architecture
 
@@ -286,7 +289,7 @@ Operator-facing docs are also bundled into the running binary at `/_/docs/`. Sou
 - [FAQ](docs/product/42-faq.md)
 
 **Reference:**
-- [Configuration](docs/product/reference/configuration.md) · [Admin API](docs/product/reference/admin-api.md) · [Authentication](docs/product/reference/authentication.md) · [Metrics](docs/product/reference/metrics.md) · [How delta works](docs/product/reference/how-delta-works.md)
+- [Configuration](docs/product/reference/configuration.md) · [Admin API](docs/product/reference/admin-api.md) · [Authentication](docs/product/reference/authentication.md) · [Metrics](docs/product/reference/metrics.md) · [How delta works](docs/product/reference/how-delta-works.md) · [Replication](docs/product/reference/replication.md) · [Lifecycle](docs/product/reference/lifecycle.md) · [Event outbox](docs/product/reference/event-outbox.md)
 
 **Contributor-only** (not in the binary):
 - [Contributing](docs/dev/contributing.md) · [Releasing](docs/dev/releasing.md) · [CI infrastructure](docs/dev/ci-infra.md) · [Historical design docs](docs/dev/historical/)

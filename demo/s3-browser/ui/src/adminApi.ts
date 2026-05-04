@@ -846,7 +846,16 @@ export interface ReplicationConfig {
   rules: ReplicationRuleConfig[];
 }
 
-export type LifecycleAction = 'delete';
+export type LifecycleAction =
+  | 'delete'
+  | {
+      type: 'transition' | 'archive';
+      destination: {
+        bucket: string;
+        prefix?: string;
+      };
+      delete_source_after_success?: boolean;
+    };
 
 export interface LifecycleRuleConfig {
   name: string;
@@ -976,8 +985,8 @@ export interface LifecycleRuleOverview {
   last_status: string;
   last_run_at: number | null;
   next_due_at: number;
-  objects_expired_lifetime: number;
-  bytes_expired_lifetime: number;
+  objects_affected_lifetime: number;
+  bytes_affected_lifetime: number;
 }
 
 interface LifecycleOverview {
@@ -989,6 +998,10 @@ interface LifecycleOverview {
 export interface LifecyclePreviewObject {
   bucket: string;
   key: string;
+  action: string;
+  destination_bucket?: string;
+  destination_key?: string;
+  delete_source_after_success: boolean;
   created_at: string;
   size: number;
 }
@@ -1003,9 +1016,9 @@ export interface LifecycleRunOutcome {
   rule_name: string;
   status: string;
   objects_scanned: number;
-  objects_expired: number;
+  objects_affected: number;
   objects_skipped: number;
-  bytes_expired: number;
+  bytes_affected: number;
   errors: number;
   candidates: LifecyclePreviewObject[];
   failures: LifecycleFailure[];
@@ -1017,9 +1030,9 @@ export interface LifecycleHistoryEntry {
   started_at: number;
   finished_at: number | null;
   objects_scanned: number;
-  objects_expired: number;
+  objects_affected: number;
   objects_skipped: number;
-  bytes_expired: number;
+  bytes_affected: number;
   errors: number;
   status: string;
 }

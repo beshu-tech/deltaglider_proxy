@@ -106,6 +106,7 @@ pub enum EventKind {
     ObjectCopied,
     ReplicationObjectCopied,
     LifecycleExpired,
+    LifecycleTransitioned,
 }
 
 impl EventKind {
@@ -116,6 +117,7 @@ impl EventKind {
             Self::ObjectCopied => "ObjectCopied",
             Self::ReplicationObjectCopied => "ReplicationObjectCopied",
             Self::LifecycleExpired => "LifecycleExpired",
+            Self::LifecycleTransitioned => "LifecycleTransitioned",
         }
     }
 }

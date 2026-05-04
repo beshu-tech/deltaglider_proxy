@@ -38,9 +38,9 @@ const OG_BENCHMARK = OG_LANDING;
 
 export const landingMeta: PageMeta = {
   path: '/',
-  title: 'DeltaGlider Proxy — unified S3 enterprise control plane',
+  title: 'DeltaGlider Proxy — S3 control plane for existing storage',
   description:
-    'S3-compatible proxy in front of your object store: xdelta3 deltas for repeated versioned binaries, with IAM, OAuth, quotas, replication, encryption, metrics, and audit in one product.',
+    'S3-compatible control plane in front of existing storage: admin UI, IAM, OAuth, routing, lifecycle, replication, events, audits, cache, encryption, and xdelta3 deltas.',
   ogImage: OG_LANDING,
   jsonLd: [organization(), website(), softwareApplication()],
 };

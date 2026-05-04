@@ -30,6 +30,7 @@ See the [upgrade guide](../21-upgrade-guide.md) for the full TOML → YAML migra
 - [Multi-Backend Routing](#multi-backend-routing)
 - [Bucket Policies](#bucket-policies)
 - [Lifecycle Rules](#lifecycle-rules)
+- [Event Delivery](#event-delivery)
 - [Encryption at Rest](#encryption-at-rest)
 - [CLI Subcommands](#cli-subcommands)
 - [Full Example](#full-example)
@@ -716,6 +717,43 @@ Use `POST /_/api/admin/lifecycle/rules/:name/preview` before enabling a rule. Se
 
 ---
 
+## Event Delivery
+
+Durable object mutation events are always appended to the encrypted config DB
+when it is available. HTTP delivery is disabled by default; enabling
+`advanced.event_delivery` starts a background dispatcher that POSTs each event
+to every configured webhook endpoint.
+
+```yaml
+advanced:
+  event_delivery:
+    enabled: true
+    webhook_url: "https://events.example.com/deltaglider"
+    webhook_urls:
+      - "https://audit.example.com/deltaglider"
+    webhook_headers:
+      authorization: "Bearer redacted-token"
+      x-dgp-env: "prod"
+    tick_interval: "10s"
+    batch_size: 50
+    request_timeout: "5s"
+    max_attempts: 8
+    retry_base: "5s"
+    retry_max: "5m"
+    stale_claim_after: "60s"
+    delivered_retention: "24h"
+    delivered_max_rows: 10000
+    prune_batch: 100
+```
+
+`webhook_url` is the single-endpoint shortcut. `webhook_urls` adds fan-out
+endpoints, and `webhook_headers` are attached to every delivery request. A row
+is marked delivered only after all endpoints return 2xx; failed rows back off
+and can be requeued from the admin API/UI. See [Event outbox](event-outbox.md)
+for payload and diagnostics details.
+
+---
+
 ## Encryption at Rest
 
 Per-backend encryption with four modes: `none`, `aes256-gcm-proxy`, `sse-kms`, `sse-s3`. Each backend carries its own `encryption` block — operators can mix (e.g. SSE-KMS for the production backend, plaintext for a public-CDN backend) without sharing a single blast-radius key.
@@ -849,6 +887,12 @@ advanced:
   metadata_cache_mb: 100
   codec_concurrency: 32
   config_sync_bucket: my-config-sync-bucket
+  event_delivery:
+    enabled: true
+    webhook_urls:
+      - "https://audit.example.com/deltaglider"
+    webhook_headers:
+      authorization: "Bearer redacted-token"
   tls:
     enabled: true
     cert_path: /etc/ssl/certs/proxy.pem

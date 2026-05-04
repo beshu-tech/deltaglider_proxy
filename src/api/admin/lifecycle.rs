@@ -29,8 +29,8 @@ pub struct LifecycleRuleOverview {
     pub last_status: String,
     pub last_run_at: Option<i64>,
     pub next_due_at: i64,
-    pub objects_expired_lifetime: i64,
-    pub bytes_expired_lifetime: i64,
+    pub objects_affected_lifetime: i64,
+    pub bytes_affected_lifetime: i64,
 }
 
 pub async fn list_rules(
@@ -57,7 +57,7 @@ pub async fn list_rules(
             enabled: rule.enabled,
             bucket: rule.bucket.clone(),
             prefix: rule.prefix.clone(),
-            action: "delete".to_string(),
+            action: rule.action.kind().to_string(),
             expire_after: rule.expire_after.clone(),
             include_globs: rule.include_globs.clone(),
             exclude_globs: rule.exclude_globs.clone(),
@@ -67,13 +67,13 @@ pub async fn list_rules(
                 .unwrap_or_else(|| "idle".to_string()),
             last_run_at: state_row.as_ref().and_then(|s| s.last_run_at),
             next_due_at: state_row.as_ref().map(|s| s.next_due_at).unwrap_or(0),
-            objects_expired_lifetime: state_row
+            objects_affected_lifetime: state_row
                 .as_ref()
-                .map(|s| s.objects_expired_lifetime)
+                .map(|s| s.objects_affected_lifetime)
                 .unwrap_or(0),
-            bytes_expired_lifetime: state_row
+            bytes_affected_lifetime: state_row
                 .as_ref()
-                .map(|s| s.bytes_expired_lifetime)
+                .map(|s| s.bytes_affected_lifetime)
                 .unwrap_or(0),
         });
     }
@@ -223,9 +223,9 @@ pub struct HistoryEntry {
     pub started_at: i64,
     pub finished_at: Option<i64>,
     pub objects_scanned: i64,
-    pub objects_expired: i64,
+    pub objects_affected: i64,
     pub objects_skipped: i64,
-    pub bytes_expired: i64,
+    pub bytes_affected: i64,
     pub errors: i64,
     pub status: String,
 }
@@ -259,9 +259,9 @@ pub async fn history(
                 started_at: run.started_at,
                 finished_at: run.finished_at,
                 objects_scanned: run.objects_scanned,
-                objects_expired: run.objects_expired,
+                objects_affected: run.objects_affected,
                 objects_skipped: run.objects_skipped,
-                bytes_expired: run.bytes_expired,
+                bytes_affected: run.bytes_affected,
                 errors: run.errors,
                 status: run.status,
             })

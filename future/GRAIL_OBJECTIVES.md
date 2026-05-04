@@ -8,21 +8,21 @@
 >
 > Not to mention **product stability, adequate performance, and sustainable production operations**.
 
-## Current Score: 3/13
+## Current Score: 8/13
 
 | Feature | Required | Status | Gap |
 |---------|----------|--------|-----|
 | OIDC login | Yes | **DONE** | - |
 | IAM integration | Yes | **DONE** (ABAC, groups, conditions) | - |
 | Stability / Performance | Yes | **DONE** (Rust, async, tested) | - |
-| Replica | Yes | NOT IMPLEMENTED | Critical |
-| SSE-S3 | Yes | NOT IMPLEMENTED | Critical |
+| Replica | Yes | **DONE** (scheduled source→destination object replication) | - |
+| SSE-S3 | Yes | **DONE** (backend-delegated SSE-S3 / SSE-KMS) | - |
 | SSE-C | Yes | NOT IMPLEMENTED | Critical |
 | Bucket Policy (resource-based) | Yes | PARTIAL (public prefixes only) | High |
-| Lifecycle Rules | Yes | NOT IMPLEMENTED | High |
+| Lifecycle Rules | Yes | PARTIAL (delete-only expiration) | Medium |
 | Object Locking / Immutability | Yes | NOT IMPLEMENTED | High |
-| Event Notification | Yes | NOT IMPLEMENTED | High |
-| Quota | Yes | NOT IMPLEMENTED | Medium |
+| Event Notification | Yes | PARTIAL (durable outbox + webhook delivery) | Medium |
+| Quota | Yes | PARTIAL (soft bucket quotas / freeze) | Medium |
 | LDAP login | Yes | NOT IMPLEMENTED | Medium |
 | STS (temp credentials) | Yes | NOT IMPLEMENTED | Medium |
 | Versioning | Implied | STUB ONLY | High |
@@ -42,13 +42,10 @@ The MinIO fork argument doesn't apply — DGP sits IN FRONT of MinIO. Complement
 
 | Phase | Features | Effort | Score |
 |-------|----------|--------|-------|
-| Current | OIDC, IAM, stability | - | 3/13 (23%) |
-| **NOW-1** | Quota | 2 days | 4/13 (31%) |
-| **NOW-2** | Transparent Encryption (SSE-Proxy) | 1 week | 6/13 (46%) |
-| **NOW-3** | Background Replication | 2 weeks | 7/13 (54%) |
-| Next | Lifecycle, Versioning | 1-2 weeks | 9/13 (69%) |
-| Next | Events (webhooks), Bucket Policy | 1-2 weeks | 11/13 (85%) |
-| Later | LDAP, STS, Object Lock | 2-3 weeks | 13/13 (100%) |
+| Current | OIDC, IAM, stability, quota, encryption, replication, lifecycle, event outbox | - | 8/13 (62%) |
+| Next | SSE-C, stronger bucket policy, versioning | 1-2 weeks | 10/13 (77%) |
+| Next | Full lifecycle/events parity, object lock passthrough | 1-2 weeks | 12/13 (92%) |
+| Later | LDAP, STS | 2-3 weeks | 13/13 (100%) |
 
 See individual feature files:
 - [ENCRYPTION.md](ENCRYPTION.md) — Transparent encryption at rest

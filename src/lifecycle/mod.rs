@@ -13,7 +13,8 @@ use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
 pub use planner::{
-    compile_rule_globs, plan_object, Decision, PlanError, SkipReason, MAX_PAGES_PER_RUN,
+    compile_rule_globs, plan_object, Decision, PlanError, PlannedLifecycleAction, SkipReason,
+    MAX_PAGES_PER_RUN,
 };
 pub use state_store::{
     LifecycleFailureRecord, LifecycleRunRecord, LifecycleRunTotals, LifecycleState,

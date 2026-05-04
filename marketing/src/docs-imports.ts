@@ -20,6 +20,8 @@ import REF_DELTA from '../../docs/product/reference/how-delta-works.md?raw';
 import REF_ENCRYPTION from '../../docs/product/reference/encryption-at-rest.md?raw';
 import REF_DECLARATIVE_IAM from '../../docs/product/reference/declarative-iam.md?raw';
 import REF_REPLICATION from '../../docs/product/reference/replication.md?raw';
+import REF_LIFECYCLE from '../../docs/product/reference/lifecycle.md?raw';
+import REF_EVENT_OUTBOX from '../../docs/product/reference/event-outbox.md?raw';
 
 export type DocGroup =
   | 'Start here'
@@ -83,6 +85,8 @@ const PRODUCT_DOCS: ProductDoc[] = [
   { path: 'reference/encryption-at-rest', content: REF_ENCRYPTION, group: 'Reference', order: 50 },
   { path: 'reference/declarative-iam', content: REF_DECLARATIVE_IAM, group: 'Reference', order: 60 },
   { path: 'reference/replication', content: REF_REPLICATION, group: 'Reference', order: 70 },
+  { path: 'reference/lifecycle', content: REF_LIFECYCLE, group: 'Reference', order: 80 },
+  { path: 'reference/event-outbox', content: REF_EVENT_OUTBOX, group: 'Reference', order: 90 },
 ];
 
 function extractTitle(content: string): string {

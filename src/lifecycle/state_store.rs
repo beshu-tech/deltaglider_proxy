@@ -12,8 +12,8 @@ pub struct LifecycleState {
     pub last_run_at: Option<i64>,
     pub next_due_at: i64,
     pub last_status: String,
-    pub objects_expired_lifetime: i64,
-    pub bytes_expired_lifetime: i64,
+    pub objects_affected_lifetime: i64,
+    pub bytes_affected_lifetime: i64,
     pub leader_instance_id: Option<String>,
     pub leader_expires_at: Option<i64>,
 }
@@ -26,9 +26,9 @@ pub struct LifecycleRunRecord {
     pub started_at: i64,
     pub finished_at: Option<i64>,
     pub objects_scanned: i64,
-    pub objects_expired: i64,
+    pub objects_affected: i64,
     pub objects_skipped: i64,
-    pub bytes_expired: i64,
+    pub bytes_affected: i64,
     pub errors: i64,
     pub status: String,
 }
@@ -55,9 +55,9 @@ pub struct LifecycleFailureInsert<'a> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LifecycleRunTotals {
     pub objects_scanned: i64,
-    pub objects_expired: i64,
+    pub objects_affected: i64,
     pub objects_skipped: i64,
-    pub bytes_expired: i64,
+    pub bytes_affected: i64,
     pub errors: i64,
 }
 
@@ -166,7 +166,7 @@ impl ConfigDb {
             .conn
             .query_row(
                 "SELECT rule_name, last_run_at, next_due_at, last_status,
-                        objects_expired_lifetime, bytes_expired_lifetime,
+                        objects_affected_lifetime, bytes_affected_lifetime,
                         leader_instance_id, leader_expires_at
                  FROM lifecycle_state WHERE rule_name = ?",
                 params![rule_name],
@@ -176,8 +176,8 @@ impl ConfigDb {
                         last_run_at: r.get(1)?,
                         next_due_at: r.get(2)?,
                         last_status: r.get(3)?,
-                        objects_expired_lifetime: r.get(4)?,
-                        bytes_expired_lifetime: r.get(5)?,
+                        objects_affected_lifetime: r.get(4)?,
+                        bytes_affected_lifetime: r.get(5)?,
                         leader_instance_id: r.get(6)?,
                         leader_expires_at: r.get(7)?,
                     })
@@ -280,18 +280,18 @@ impl ConfigDb {
             "UPDATE lifecycle_run_history
                 SET finished_at     = ?,
                     objects_scanned = ?,
-                    objects_expired = ?,
+                    objects_affected = ?,
                     objects_skipped = ?,
-                    bytes_expired   = ?,
+                    bytes_affected   = ?,
                     errors          = ?,
                     status          = ?
               WHERE id = ?",
             params![
                 finished_at,
                 totals.objects_scanned,
-                totals.objects_expired,
+                totals.objects_affected,
                 totals.objects_skipped,
-                totals.bytes_expired,
+                totals.bytes_affected,
                 totals.errors,
                 status,
                 run_id
@@ -302,15 +302,15 @@ impl ConfigDb {
                 SET last_run_at = ?,
                     last_status = ?,
                     next_due_at = ?,
-                    objects_expired_lifetime = objects_expired_lifetime + ?,
-                    bytes_expired_lifetime   = bytes_expired_lifetime + ?
+                    objects_affected_lifetime = objects_affected_lifetime + ?,
+                    bytes_affected_lifetime   = bytes_affected_lifetime + ?
               WHERE rule_name = ?",
             params![
                 finished_at,
                 status,
                 next_due_at,
-                totals.objects_expired,
-                totals.bytes_expired,
+                totals.objects_affected,
+                totals.bytes_affected,
                 rule_name
             ],
         )?;
@@ -385,8 +385,8 @@ impl ConfigDb {
     ) -> Result<Vec<LifecycleRunRecord>, ConfigDbError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, rule_name, triggered_by, started_at, finished_at,
-                    objects_scanned, objects_expired, objects_skipped,
-                    bytes_expired, errors, status
+                    objects_scanned, objects_affected, objects_skipped,
+                    bytes_affected, errors, status
              FROM lifecycle_run_history
              WHERE rule_name = ?
              ORDER BY started_at DESC, id DESC
@@ -401,9 +401,9 @@ impl ConfigDb {
                     started_at: r.get(3)?,
                     finished_at: r.get(4)?,
                     objects_scanned: r.get(5)?,
-                    objects_expired: r.get(6)?,
+                    objects_affected: r.get(6)?,
                     objects_skipped: r.get(7)?,
-                    bytes_expired: r.get(8)?,
+                    bytes_affected: r.get(8)?,
                     errors: r.get(9)?,
                     status: r.get(10)?,
                 })
@@ -483,9 +483,9 @@ mod tests {
             300,
             LifecycleRunTotals {
                 objects_scanned: 10,
-                objects_expired: 2,
+                objects_affected: 2,
                 objects_skipped: 8,
-                bytes_expired: 1234,
+                bytes_affected: 1234,
                 errors: 0,
             },
             900,
@@ -496,13 +496,13 @@ mod tests {
         assert_eq!(done.last_status, "succeeded");
         assert_eq!(done.last_run_at, Some(300));
         assert_eq!(done.next_due_at, 900);
-        assert_eq!(done.objects_expired_lifetime, 2);
-        assert_eq!(done.bytes_expired_lifetime, 1234);
+        assert_eq!(done.objects_affected_lifetime, 2);
+        assert_eq!(done.bytes_affected_lifetime, 1234);
 
         let runs = db.lifecycle_recent_runs("r", 10).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].triggered_by, "run-now");
-        assert_eq!(runs[0].objects_expired, 2);
+        assert_eq!(runs[0].objects_affected, 2);
     }
 
     #[test]

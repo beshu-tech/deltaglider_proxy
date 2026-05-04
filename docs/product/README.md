@@ -1,6 +1,6 @@
 # DeltaGlider Proxy
 
-*An S3-compatible proxy that stores repeated binaries as compact deltas, routes buckets across multiple storage backends, and adds a production control plane: IAM, OAuth, quotas, replication, encryption, metrics, and audit.*
+*An S3-compatible control plane in front of existing storage, not another object store or storage cluster. DeltaGlider routes buckets across backends and local filesystems, gives operators a proper, centralized admin UI for IAM, OAuth, lifecycle, replication, events, audits, caching, encryption, and policy, and stores repeated binaries as compact xdelta3 deltas when that saves space.*
 
 ![Object Browser](/_/screenshots/filebrowser.jpg)
 
@@ -8,7 +8,7 @@
 
 When binary-similar objects are stored over many versions — backup archives, software catalogs, game builds, texture packs, AI model variants, DB dumps, tar archives — most of each new object may be identical to the previous one. DeltaGlider Proxy stores those versions as xdelta3 deltas against a reference baseline, typically cutting storage 60–95% on high-similarity workloads without changing anything on the client side.
 
-Clients see a standard S3 API. Delta compression, reconstruction, integrity verification, zero trust encryption at rest, and backend routing are invisible to them.
+Clients see a standard S3 API. Delta compression, reconstruction, integrity verification, zero trust encryption at rest, fast local-disk caching, lifecycle, replication, event delivery, audits, and backend routing are invisible to them.
 
 ## What's here
 
@@ -39,6 +39,8 @@ These docs are operator-facing — everything you need to install, secure, run, 
 - [Troubleshooting](41-troubleshooting.md) — common symptoms → fixes.
 - [FAQ](42-faq.md) — quick answers to common questions.
 - [Lazy bucket replication](reference/replication.md) — scheduled and run-now source → destination object replication through the engine.
+- [Lifecycle rules](reference/lifecycle.md) — delete-only object expiration with preview, scheduler history, and failure diagnostics.
+- [Event outbox](reference/event-outbox.md) — durable object mutation journal plus webhook delivery, fan-out, retries, and requeue.
 
 ### Reference
 
@@ -47,6 +49,8 @@ These docs are operator-facing — everything you need to install, secure, run, 
 - [Authentication reference](reference/authentication.md) — conceptual model, error codes, claim shapes.
 - [Metrics reference](reference/metrics.md) — every Prometheus metric and label.
 - [Replication reference](reference/replication.md) — rule shape, run-now controls, delete replication, runtime state.
+- [Lifecycle rules](reference/lifecycle.md) — delete-only expiration config, preview/run-now API, scheduler state.
+- [Event outbox](reference/event-outbox.md) — delivery config, payload shape, admin diagnostics.
 - [How delta works](reference/how-delta-works.md) — on-disk layout, PUT/GET flow, integrity guarantees.
 - [Encryption at rest](reference/encryption-at-rest.md) — AES-256-GCM for stored objects, chunked streaming wire format, operational caveats.
 
@@ -71,5 +75,5 @@ These docs are operator-facing — everything you need to install, secure, run, 
 - SigV4 for S3 clients: `aws-cli`, `boto3`, Terraform, rclone.
 - OAuth/OIDC for admin UI access.
 - Per-user ABAC permissions with IP and prefix conditions.
-- Soft bucket quotas, bucket freeze, and object replication with delete replication.
-- Prometheus metrics, in-memory audit ring, encrypted IAM DB, and optional multi-instance config sync.
+- Soft bucket quotas, bucket freeze, object lifecycle expiration, and object replication with delete replication.
+- Prometheus metrics, in-memory audit ring, durable event outbox, encrypted IAM DB, and optional multi-instance config sync.

@@ -42,10 +42,11 @@ const OUTCOMES: readonly { icon: LucideIcon; label: string; body: string }[] = [
 const FEATURE_MAP = [
   {
     group: 'Storage',
-    summary: 'Reduce backend growth without changing the client contract.',
+    summary: 'Reduce backend growth and hide slower storage behind a local cache without changing the client contract.',
     items: [
       'S3-compatible API with SigV4',
       'xdelta3 delta storage for repeated binaries',
+      'Fast local-disk cache in front of object storage',
       'Filesystem, AWS S3, and MinIO-compatible backends',
       'AES-256-GCM proxy-side encryption',
     ],
@@ -64,11 +65,44 @@ const FEATURE_MAP = [
     group: 'Operations',
     summary: 'Run the proxy as production infrastructure.',
     items: [
+      'Proper, centralized admin UI',
       'Soft per-bucket quotas and bucket freeze',
+      'Lifecycle expiration and event outbox',
       'Object replication with delete replication',
       'Prometheus metrics and embedded dashboard',
       'In-memory audit ring and encrypted config DB sync',
     ],
+  },
+];
+
+const COMPARISON_ROWS: readonly { need: string; fit: string }[] = [
+  {
+    need: 'Full distributed object store with broad S3 API coverage',
+    fit: 'MinIO, SeaweedFS, Garage, or another full S3-compatible object store',
+  },
+  {
+    need: 'Polished, centralized S3 control plane over existing storage',
+    fit: 'DeltaGlider',
+  },
+  {
+    need: 'Lower storage growth for repeated binaries',
+    fit: 'DeltaGlider',
+  },
+  {
+    need: 'Proper, centralized admin UI for IAM, OAuth, routing, lifecycle, replication, events, and audits',
+    fit: 'DeltaGlider',
+  },
+  {
+    need: 'Fast local-disk cache in front of slower object storage',
+    fit: 'DeltaGlider',
+  },
+  {
+    need: 'AWS-compatible bucket sub-APIs like object lock, tagging, ACLs, and STS/IAM APIs',
+    fit: 'A fuller S3-compatible object store',
+  },
+  {
+    need: 'Multi-backend governance without changing clients',
+    fit: 'DeltaGlider',
   },
 ];
 
@@ -167,13 +201,49 @@ export function Landing(): JSX.Element {
       <UseCaseCarousel />
       <ProofStrip />
       <Section
+        eyebrow="Positioning"
+        title="Not a storage cluster. The control plane in front of yours."
+        intro="DeltaGlider sits in front of S3-compatible backends and local filesystems. It gives operators the UI, policy layer, caching, replication, lifecycle, encryption, and compression they usually have to stitch together themselves."
+      >
+        <div className="overflow-hidden rounded-3xl border border-ink-200 bg-white shadow-xl shadow-brand-950/5 dark:border-ink-700 dark:bg-ink-900/70">
+          <div className="grid grid-cols-[minmax(0,1.4fr)_minmax(10rem,0.8fr)] border-b border-ink-200 bg-ink-50/80 text-xs font-black uppercase tracking-widest text-ink-600 dark:border-ink-700 dark:bg-ink-950/40 dark:text-ink-300">
+            <div className="px-5 py-4 sm:px-6">If you need</div>
+            <div className="border-l border-ink-200 px-5 py-4 sm:px-6 dark:border-ink-700">Best fit</div>
+          </div>
+          <div className="divide-y divide-ink-200 dark:divide-ink-700">
+            {COMPARISON_ROWS.map((row) => {
+              const isDeltaGlider = row.fit === 'DeltaGlider';
+              return (
+                <div
+                  key={row.need}
+                  className="grid grid-cols-[minmax(0,1.4fr)_minmax(10rem,0.8fr)]"
+                >
+                  <div className="px-5 py-4 text-sm font-semibold leading-relaxed text-ink-800 sm:px-6 dark:text-ink-100">
+                    {row.need}
+                  </div>
+                  <div
+                    className={`border-l border-ink-200 px-5 py-4 text-sm font-black leading-relaxed sm:px-6 dark:border-ink-700 ${
+                      isDeltaGlider
+                        ? 'bg-brand-50 text-brand-800 dark:bg-brand-950/40 dark:text-brand-100'
+                        : 'text-ink-700 dark:text-ink-300'
+                    }`}
+                  >
+                    {row.fit}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </Section>
+      <Section
         eyebrow="Business impact"
         title="Stop paying to store the same bytes on repeat."
         intro={
           <p className="m-0 text-ink-600 dark:text-ink-300">
-            DeltaGlider is an S3-compatible proxy: clients use ordinary SigV4 and your existing SDKs—no application changes. You aim it at MinIO, Amazon S3, or a
+            DeltaGlider is an S3-compatible control plane: clients use ordinary SigV4 and your existing SDKs—no application changes. You aim it at MinIO, Amazon S3, or a
             filesystem backend. Where uploads repeat the same logical artifact, it can store compact xdelta3 deltas instead of full copies; IAM, OAuth, quotas,
-            replication, metrics, audit, and the admin UI ship in one deployable service. For reproducible wall-clock throughput, storage, and CPU tradeoffs on real
+            lifecycle, replication, event delivery, metrics, audit, and the proper, centralized admin UI ship in one deployable service. For reproducible wall-clock throughput, storage, and CPU tradeoffs on real
             artifacts, see the{' '}
             <Link
               className="font-semibold text-brand-700 underline decoration-brand-400/40 underline-offset-2 transition hover:text-brand-600 hover:decoration-brand-500 dark:text-brand-300 dark:hover:text-brand-200"
@@ -218,7 +288,7 @@ export function Landing(): JSX.Element {
       <Section
         eyebrow="Operations"
         title="Everything operators need in one place."
-        intro="Monitor usage, manage identity, configure bucket policy, set soft quotas, and run replication from the embedded admin UI."
+        intro="Monitor usage, manage IAM and OAuth, route buckets across backends, configure lifecycle and replication, inspect events and audits, and tune caches from the proper, centralized admin UI."
       >
         <div className="space-y-14">
           {PRODUCT_SURFACES.map((surface, index) => {

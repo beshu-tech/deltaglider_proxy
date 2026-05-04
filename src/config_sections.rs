@@ -58,7 +58,7 @@ use crate::config::{
     NamedBackendConfig, TlsConfig,
 };
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
@@ -392,7 +392,7 @@ fn default_max_failures() -> u32 {
     100
 }
 
-/// Global lifecycle controls + delete-only expiration rules.
+/// Global lifecycle controls + expiration/transition rules.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct LifecycleConfig {
     /// Master kill-switch. Defaults to false because lifecycle deletes data.
@@ -409,7 +409,7 @@ pub struct LifecycleConfig {
     #[serde(default = "default_lifecycle_max_failures")]
     pub max_failures_retained: u32,
 
-    /// Delete-only lifecycle rules. Empty by default.
+    /// Lifecycle rules. Empty by default.
     #[serde(default)]
     pub rules: Vec<LifecycleRule>,
 }
@@ -433,13 +433,115 @@ fn default_lifecycle_max_failures() -> u32 {
     100
 }
 
-/// v1 lifecycle action. Only delete is accepted; storage-class transitions
-/// are intentionally not modelled yet.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "kebab-case")]
+/// Lifecycle action. `delete` preserves the v1 shape; transition/archive uses
+/// a map so destination and source-delete semantics stay explicit.
+#[derive(Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 pub enum LifecycleAction {
     #[default]
     Delete,
+    Transition(LifecycleTransitionAction),
+}
+
+impl LifecycleAction {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Delete => "delete",
+            Self::Transition(_) => "transition",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct LifecycleTransitionAction {
+    pub destination: LifecycleDestination,
+    #[serde(default)]
+    pub delete_source_after_success: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct LifecycleDestination {
+    pub bucket: String,
+    #[serde(default)]
+    pub prefix: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LifecycleActionMap {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    destination: Option<LifecycleDestination>,
+    #[serde(default)]
+    delete_source_after_success: bool,
+}
+
+#[derive(Serialize)]
+struct LifecycleTransitionActionWire<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    destination: &'a LifecycleDestination,
+    delete_source_after_success: bool,
+}
+
+impl Serialize for LifecycleAction {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Delete => serializer.serialize_str("delete"),
+            Self::Transition(action) => LifecycleTransitionActionWire {
+                kind: "transition",
+                destination: &action.destination,
+                delete_source_after_success: action.delete_source_after_success,
+            }
+            .serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for LifecycleAction {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            String(String),
+            Map(LifecycleActionMap),
+        }
+
+        match Wire::deserialize(deserializer)? {
+            Wire::String(kind) => match kind.as_str() {
+                "delete" => Ok(Self::Delete),
+                "transition" | "archive" => Err(serde::de::Error::custom(
+                    "lifecycle transition action must include destination: { type: transition, destination: { bucket, prefix } }",
+                )),
+                other => Err(serde::de::Error::custom(format!(
+                    "unknown lifecycle action {other:?}"
+                ))),
+            },
+            Wire::Map(map) => match map.kind.as_str() {
+                "delete" => Ok(Self::Delete),
+                "transition" | "archive" => {
+                    let destination = map.destination.ok_or_else(|| {
+                        serde::de::Error::custom(
+                            "lifecycle transition action requires destination",
+                        )
+                    })?;
+                    Ok(Self::Transition(LifecycleTransitionAction {
+                        destination,
+                        delete_source_after_success: map.delete_source_after_success,
+                    }))
+                }
+                other => Err(serde::de::Error::custom(format!(
+                    "unknown lifecycle action {other:?}"
+                ))),
+            },
+        }
+    }
 }
 
 /// A single lifecycle expiration rule.
@@ -461,7 +563,7 @@ pub struct LifecycleRule {
     #[serde(default)]
     pub prefix: String,
 
-    /// Delete-only in v1.
+    /// Action to apply to expired candidates. Defaults to v1 `delete`.
     #[serde(default)]
     pub action: LifecycleAction,
 
@@ -494,18 +596,29 @@ fn default_lifecycle_batch_size() -> u32 {
 /// Disabled-by-default delivery for rows in the durable `event_outbox`.
 ///
 /// The request path only appends rows; when this config is active a background
-/// worker claims due rows and POSTs them to `webhook_url` with at-least-once
-/// semantics. Empty/default config preserves the persistence-only behavior.
+/// worker claims due rows and POSTs them to the configured webhook endpoint(s)
+/// with at-least-once semantics. Empty/default config preserves the
+/// persistence-only behavior.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct EventDeliveryConfig {
-    /// Master switch. Delivery is inactive unless this is true AND
-    /// `webhook_url` is present.
+    /// Master switch. Delivery is inactive unless this is true AND at least one
+    /// webhook endpoint is present.
     #[serde(default)]
     pub enabled: bool,
 
     /// HTTP endpoint that receives `{ schema, event }` JSON payloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook_url: Option<String>,
+
+    /// Additional HTTP endpoints that receive the same payload. Delivery marks
+    /// an event delivered only after every configured endpoint returns 2xx.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub webhook_urls: Vec<String>,
+
+    /// Static HTTP headers sent with every webhook request. Useful for routing
+    /// or bearer-token style authentication without changing payload shape.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub webhook_headers: BTreeMap<String, String>,
 
     /// Dispatcher wake interval. Defaults to `10s`.
     #[serde(default = "default_event_delivery_tick")]
@@ -552,11 +665,17 @@ pub struct EventDeliveryConfig {
 
 impl EventDeliveryConfig {
     pub fn is_active(&self) -> bool {
-        self.enabled
-            && self
-                .webhook_url
-                .as_deref()
-                .is_some_and(|s| !s.trim().is_empty())
+        self.enabled && !self.webhook_endpoints().is_empty()
+    }
+
+    pub fn webhook_endpoints(&self) -> Vec<&str> {
+        self.webhook_url
+            .as_deref()
+            .into_iter()
+            .chain(self.webhook_urls.iter().map(String::as_str))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect()
     }
 }
 
@@ -565,6 +684,8 @@ impl Default for EventDeliveryConfig {
         Self {
             enabled: false,
             webhook_url: None,
+            webhook_urls: Vec::new(),
+            webhook_headers: BTreeMap::new(),
             tick_interval: default_event_delivery_tick(),
             batch_size: default_event_delivery_batch_size(),
             request_timeout: default_event_delivery_timeout(),
@@ -1367,6 +1488,31 @@ pub fn validate_lifecycle(cfg: &LifecycleConfig) -> Vec<String> {
             ));
         }
 
+        if let LifecycleAction::Transition(action) = &rule.action {
+            if action.destination.bucket.trim().is_empty() {
+                warnings.push(format!(
+                    "lifecycle rule '{}' transition destination bucket is empty",
+                    rule.name
+                ));
+            }
+            let dest_prefix_norm = crate::replication::normalize_prefix(&action.destination.prefix);
+            if dest_prefix_norm != action.destination.prefix {
+                warnings.push(format!(
+                    "lifecycle rule '{}' transition destination prefix {:?} will be normalized to {:?}",
+                    rule.name, action.destination.prefix, dest_prefix_norm
+                ));
+            }
+            if action.delete_source_after_success
+                && action.destination.bucket == rule.bucket
+                && dest_prefix_norm == prefix_norm
+            {
+                warnings.push(format!(
+                    "lifecycle rule '{}' transition deletes source after copying to the same bucket/prefix",
+                    rule.name
+                ));
+            }
+        }
+
         match humantime::parse_duration(&rule.expire_after) {
             Ok(d) if d.as_secs() == 0 => warnings.push(format!(
                 "lifecycle rule '{}' expire_after={} would expire everything immediately",
@@ -1403,20 +1549,47 @@ pub fn validate_lifecycle(cfg: &LifecycleConfig) -> Vec<String> {
 /// the dispatcher still treats invalid/missing webhook config as inactive.
 pub fn validate_event_delivery(cfg: &EventDeliveryConfig) -> Vec<String> {
     let mut warnings = Vec::new();
-    if cfg.enabled && cfg.webhook_url.as_deref().unwrap_or("").trim().is_empty() {
+    if cfg.enabled && cfg.webhook_endpoints().is_empty() {
         warnings.push(
-            "event_delivery.enabled=true but event_delivery.webhook_url is empty; dispatcher will stay inactive"
+            "event_delivery.enabled=true but no webhook endpoint is configured; dispatcher will stay inactive"
                 .to_string(),
         );
     }
-    if let Some(url) = cfg.webhook_url.as_deref() {
+
+    for (label, url) in cfg
+        .webhook_url
+        .as_deref()
+        .map(|url| ("event_delivery.webhook_url", url))
+        .into_iter()
+        .chain(
+            cfg.webhook_urls
+                .iter()
+                .map(|url| ("event_delivery.webhook_urls", url.as_str())),
+        )
+    {
+        if url.trim().is_empty() {
+            continue;
+        }
         match reqwest::Url::parse(url) {
             Ok(parsed) if parsed.scheme() == "http" || parsed.scheme() == "https" => {}
             Ok(parsed) => warnings.push(format!(
-                "event_delivery.webhook_url uses unsupported scheme '{}'; expected http or https",
-                parsed.scheme()
+                "{label} uses unsupported scheme '{}'; expected http or https",
+                parsed.scheme(),
             )),
-            Err(e) => warnings.push(format!("event_delivery.webhook_url is invalid: {e}")),
+            Err(e) => warnings.push(format!("{label} is invalid: {e}")),
+        }
+    }
+
+    for (name, value) in &cfg.webhook_headers {
+        if reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
+            warnings.push(format!(
+                "event_delivery.webhook_headers has invalid header name {name:?}"
+            ));
+        }
+        if reqwest::header::HeaderValue::from_str(value).is_err() {
+            warnings.push(format!(
+                "event_delivery.webhook_headers[{name:?}] is not a valid HTTP header value"
+            ));
         }
     }
 

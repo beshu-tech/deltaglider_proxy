@@ -23,7 +23,7 @@ pub struct ConfigDb {
 }
 
 /// Schema version — bump when adding migrations.
-const SCHEMA_VERSION: i32 = 10;
+const SCHEMA_VERSION: i32 = 11;
 
 pub(crate) mod auth_providers;
 mod declarative;
@@ -40,6 +40,28 @@ pub fn config_db_path() -> PathBuf {
         .and_then(|p| std::path::Path::new(&p).parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
     db_dir.join("deltaglider_config.db")
+}
+
+fn rename_column_if_exists(
+    conn: &Connection,
+    table: &str,
+    old_column: &str,
+    new_column: &str,
+) -> Result<(), ConfigDbError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if columns.iter().any(|c| c == new_column) {
+        return Ok(());
+    }
+    if columns.iter().any(|c| c == old_column) {
+        conn.execute(
+            &format!("ALTER TABLE {table} RENAME COLUMN {old_column} TO {new_column}"),
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 impl ConfigDb {
@@ -381,8 +403,8 @@ impl ConfigDb {
                     last_run_at               INTEGER,
                     next_due_at               INTEGER NOT NULL,
                     last_status               TEXT NOT NULL,
-                    objects_expired_lifetime  INTEGER NOT NULL DEFAULT 0,
-                    bytes_expired_lifetime    INTEGER NOT NULL DEFAULT 0,
+                    objects_affected_lifetime INTEGER NOT NULL DEFAULT 0,
+                    bytes_affected_lifetime   INTEGER NOT NULL DEFAULT 0,
                     leader_instance_id        TEXT,
                     leader_expires_at         INTEGER
                 );
@@ -394,9 +416,9 @@ impl ConfigDb {
                     started_at      INTEGER NOT NULL,
                     finished_at     INTEGER,
                     objects_scanned INTEGER NOT NULL DEFAULT 0,
-                    objects_expired INTEGER NOT NULL DEFAULT 0,
+                    objects_affected INTEGER NOT NULL DEFAULT 0,
                     objects_skipped INTEGER NOT NULL DEFAULT 0,
-                    bytes_expired   INTEGER NOT NULL DEFAULT 0,
+                    bytes_affected   INTEGER NOT NULL DEFAULT 0,
                     errors          INTEGER NOT NULL DEFAULT 0,
                     status          TEXT NOT NULL,
                     FOREIGN KEY (rule_name) REFERENCES lifecycle_state(rule_name) ON DELETE CASCADE
@@ -422,6 +444,40 @@ impl ConfigDb {
             )?;
             info!(
                 "Migrated config DB schema from v{} to v10 (added lifecycle runtime tables)",
+                version
+            );
+        }
+
+        if version < 11 {
+            // v11: Lifecycle v2 can delete or transition/archive. The old
+            // v10 column names were delete-specific and never shipped, so
+            // rename them to action-neutral counters.
+            rename_column_if_exists(
+                conn,
+                "lifecycle_state",
+                "objects_expired_lifetime",
+                "objects_affected_lifetime",
+            )?;
+            rename_column_if_exists(
+                conn,
+                "lifecycle_state",
+                "bytes_expired_lifetime",
+                "bytes_affected_lifetime",
+            )?;
+            rename_column_if_exists(
+                conn,
+                "lifecycle_run_history",
+                "objects_expired",
+                "objects_affected",
+            )?;
+            rename_column_if_exists(
+                conn,
+                "lifecycle_run_history",
+                "bytes_expired",
+                "bytes_affected",
+            )?;
+            info!(
+                "Migrated config DB schema from v{} to v11 (renamed lifecycle counters)",
                 version
             );
         }

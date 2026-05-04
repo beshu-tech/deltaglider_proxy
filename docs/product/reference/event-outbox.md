@@ -1,9 +1,10 @@
 # Event outbox
 
 Durable object events are written to the encrypted config DB after successful
-S3 mutations. The outbox is append-first: PUT/COPY/DELETE and replication copy
-successes do not call external systems directly, so object operations do not
-wait on webhook latency or failures.
+S3 mutations. The outbox is append-first: PUT/COPY/DELETE, replication copy
+successes, and lifecycle delete/transition successes do not call external
+systems directly, so object operations do not wait on webhook latency or
+failures.
 
 ## Semantics
 
@@ -12,10 +13,13 @@ wait on webhook latency or failures.
 - Delivery is disabled by default. With no delivery config, the outbox is an
   operator-visible journal only.
 - When HTTP delivery is enabled, a background dispatcher claims due rows in
-  small batches, POSTs each row to the configured webhook, and marks it
-  delivered on any 2xx response.
+  small batches, POSTs each row to every configured webhook endpoint, and marks
+  it delivered only after all endpoints return 2xx.
 - Delivery is at-least-once. Webhook receivers must be idempotent, typically by
   deduplicating on `event.id`.
+- Multiple webhooks are fan-out, not independent subscriptions. If one endpoint
+  fails, the row is retried and endpoints that already accepted the event may
+  see it again.
 - Failed attempts use exponential backoff. After `max_attempts`, the row becomes
   permanently `failed` until an operator requeues it.
 - Requeue does not create a new event. It changes only `failed` rows back to
@@ -38,6 +42,11 @@ advanced:
   event_delivery:
     enabled: true
     webhook_url: "https://events.example.com/deltaglider"
+    webhook_urls:
+      - "https://audit.example.com/deltaglider"
+    webhook_headers:
+      authorization: "Bearer redacted-token"
+      x-dgp-env: "prod"
     tick_interval: "10s"
     batch_size: 50
     request_timeout: "5s"
@@ -58,10 +67,14 @@ advanced:
     enabled: false
 ```
 
-`enabled=true` without `webhook_url` is treated as inactive and surfaces a
-config warning.
+`enabled=true` without `webhook_url` or `webhook_urls` is treated as inactive
+and surfaces a config warning. `webhook_url` is kept as the single-endpoint
+shortcut; `webhook_urls` adds fan-out endpoints.
 
 ## Webhook Payload
+
+Event kinds are currently `ObjectCreated`, `ObjectDeleted`, `ObjectCopied`,
+`ReplicationObjectCopied`, `LifecycleExpired`, and `LifecycleTransitioned`.
 
 Each POST body is JSON:
 
