@@ -1305,7 +1305,7 @@ export interface EventOutboxRecord {
   created_at: number;
 }
 
-export interface EventOutboxCounts {
+interface EventOutboxCounts {
   pending: number;
   in_progress: number;
   delivered: number;
