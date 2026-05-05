@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.9.9 — 2026-05-05
+
 ## v0.9.8 — 2026-05-05
 
 ### Admin IAM and storage-path authoring
