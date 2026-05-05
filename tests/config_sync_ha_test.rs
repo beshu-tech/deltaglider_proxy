@@ -19,7 +19,7 @@
 //!      cheap HEAD that does no DB reopen.
 //!
 //! All tests require MinIO and share the storage bucket with the
-//! sync bucket. Each test uses a unique `DGP_CONFIG_SYNC_KEY` under
+//! sync bucket. Each test uses a unique `config_sync_object_key` under
 //! `.deltaglider/` (UUID-based) so parallel integration-test binaries
 //! do not clobber the same object in `deltaglider-test`.
 
@@ -75,7 +75,7 @@ async fn ha_startup_replica_pulls_state_from_s3() {
         .s3_endpoint(&minio_endpoint_url())
         .bucket(MINIO_BUCKET)
         .config_sync_bucket(MINIO_BUCKET)
-        .env("DGP_CONFIG_SYNC_KEY", &sync_key)
+        .config_sync_object_key(&sync_key)
         .build()
         .await;
     let admin_a = admin_http_client(&server_a.endpoint()).await;
@@ -121,7 +121,7 @@ async fn ha_startup_replica_pulls_state_from_s3() {
         .s3_endpoint(&minio_endpoint_url())
         .bucket(MINIO_BUCKET)
         .config_sync_bucket(MINIO_BUCKET)
-        .env("DGP_CONFIG_SYNC_KEY", &sync_key)
+        .config_sync_object_key(&sync_key)
         .build()
         .await;
     let admin_b = admin_http_client(&server_b.endpoint()).await;
@@ -157,7 +157,7 @@ async fn ha_sync_now_propagates_post_startup_mutation() {
         .s3_endpoint(&minio_endpoint_url())
         .bucket(MINIO_BUCKET)
         .config_sync_bucket(MINIO_BUCKET)
-        .env("DGP_CONFIG_SYNC_KEY", &sync_key)
+        .config_sync_object_key(&sync_key)
         .build()
         .await;
     let server_b = TestServer::builder()
@@ -165,7 +165,7 @@ async fn ha_sync_now_propagates_post_startup_mutation() {
         .s3_endpoint(&minio_endpoint_url())
         .bucket(MINIO_BUCKET)
         .config_sync_bucket(MINIO_BUCKET)
-        .env("DGP_CONFIG_SYNC_KEY", &sync_key)
+        .config_sync_object_key(&sync_key)
         .build()
         .await;
 
@@ -263,7 +263,7 @@ async fn ha_sync_now_is_noop_when_etag_unchanged() {
         .s3_endpoint(&minio_endpoint_url())
         .bucket(MINIO_BUCKET)
         .config_sync_bucket(MINIO_BUCKET)
-        .env("DGP_CONFIG_SYNC_KEY", &sync_key)
+        .config_sync_object_key(&sync_key)
         .build()
         .await;
     let admin_a = admin_http_client(&server_a.endpoint()).await;
@@ -302,7 +302,7 @@ async fn ha_sync_now_is_noop_when_etag_unchanged() {
         .s3_endpoint(&minio_endpoint_url())
         .bucket(MINIO_BUCKET)
         .config_sync_bucket(MINIO_BUCKET)
-        .env("DGP_CONFIG_SYNC_KEY", &sync_key)
+        .config_sync_object_key(&sync_key)
         .build()
         .await;
     let admin_b = admin_http_client(&server_b.endpoint()).await;
@@ -367,7 +367,7 @@ async fn ha_replica_with_wrong_password_preserves_local_state() {
         .s3_endpoint(&minio_endpoint_url())
         .bucket(MINIO_BUCKET)
         .config_sync_bucket(MINIO_BUCKET)
-        .env("DGP_CONFIG_SYNC_KEY", &sync_key)
+        .config_sync_object_key(&sync_key)
         .build()
         .await;
     let admin_a = admin_http_client(&server_a.endpoint()).await;
@@ -410,7 +410,7 @@ async fn ha_replica_with_wrong_password_preserves_local_state() {
         .bucket(MINIO_BUCKET)
         .config_sync_bucket(MINIO_BUCKET)
         .bootstrap_password(wrong_password)
-        .env("DGP_CONFIG_SYNC_KEY", &sync_key)
+        .config_sync_object_key(&sync_key)
         .build()
         .await;
 

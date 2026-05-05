@@ -297,6 +297,7 @@ pub fn run_init_inner(
         blocking_threads: None,
         log_level,
         config_sync_bucket: None,
+        config_sync_object_key: None,
         tls,
         buckets: std::collections::BTreeMap::new(),
         backends: Vec::new(),

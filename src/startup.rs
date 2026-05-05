@@ -797,8 +797,9 @@ pub async fn init_config_sync(
 
     let db_file = config_db_path();
 
-    let object_key = std::env::var("DGP_CONFIG_SYNC_KEY")
-        .ok()
+    let object_key = config
+        .config_sync_object_key
+        .clone()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| {
             deltaglider_proxy::config_db_sync::DEFAULT_CONFIG_SYNC_OBJECT_KEY.to_string()

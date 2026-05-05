@@ -171,7 +171,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_CONFIG_SYNC_KEY",
-        description: "S3 object key for the synced config DB (default: .deltaglider/config.db)",
+        description: "Overrides config_sync_object_key / advanced.config_sync_object_key (default object: .deltaglider/config.db)",
         example: ".deltaglider/config.db",
         category: "Config Sync",
     },
@@ -405,6 +405,11 @@ pub struct Config {
     /// When set, the encrypted config DB is synced to/from this S3 bucket.
     #[serde(default)]
     pub config_sync_bucket: Option<String>,
+
+    /// S3 object key for the synced config DB (default `.deltaglider/config.db`).
+    /// `DGP_CONFIG_SYNC_KEY` overrides this when set.
+    #[serde(default)]
+    pub config_sync_object_key: Option<String>,
 
     /// TLS configuration (optional).
     /// When enabled, both the S3 port and the demo UI port serve HTTPS.
@@ -917,6 +922,7 @@ impl Default for Config {
             blocking_threads: None,
             log_level: default_log_level(),
             config_sync_bucket: None,
+            config_sync_object_key: None,
             tls: None,
             buckets: std::collections::BTreeMap::new(),
             backends: Vec::new(),
@@ -1064,6 +1070,7 @@ fn classify_shape(doc: &serde_yaml::Value) -> ConfigShape {
         "blocking_threads",
         "log_level",
         "config_sync_bucket",
+        "config_sync_object_key",
         "backend_encryption",
         "tls",
         "buckets",
@@ -1353,6 +1360,11 @@ impl Config {
         // Config DB S3 sync
         if let Ok(bucket) = std::env::var("DGP_CONFIG_SYNC_BUCKET") {
             self.config_sync_bucket = Some(bucket);
+        }
+        if let Ok(key) = std::env::var("DGP_CONFIG_SYNC_KEY") {
+            if !key.trim().is_empty() {
+                self.config_sync_object_key = Some(key);
+            }
         }
 
         // Per-backend encryption overrides.
@@ -2269,6 +2281,8 @@ mod tests {
             "DGP_SECRET_ACCESS_KEY",
             "DGP_BOOTSTRAP_PASSWORD_HASH",
             "DGP_LOG_LEVEL",
+            "DGP_CONFIG_SYNC_BUCKET",
+            "DGP_CONFIG_SYNC_KEY",
             "DGP_TLS_ENABLED",
             "DGP_TLS_CERT",
             "DGP_TLS_KEY",
@@ -2288,8 +2302,6 @@ mod tests {
         // Vars not in from_env() are read at other call sites (startup, session, etc.).
         let used_outside_from_env: &[&str] = &[
             "DGP_CONFIG",                  // config::load()
-            "DGP_CONFIG_SYNC_BUCKET",      // startup::init_config_sync()
-            "DGP_CONFIG_SYNC_KEY",         // startup::init_config_sync()
             "DGP_DEBUG_HEADERS",           // api::handlers::debug_headers_enabled()
             "DGP_TRUST_PROXY_HEADERS",     // rate_limiter::trust_proxy_headers()
             "DGP_SESSION_TTL_HOURS",       // session::default_session_ttl()

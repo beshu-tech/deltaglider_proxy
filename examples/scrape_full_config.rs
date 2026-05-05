@@ -430,6 +430,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref bucket) = cfg.config_sync_bucket {
         out.push_str(&format!("  config_sync_bucket: {}\n", bucket));
     }
+    if let Some(ref key) = cfg.config_sync_object_key {
+        out.push_str(&format!("  config_sync_object_key: {:?}\n", key));
+    }
     // Per-backend encryption lives on `backend_encryption` (singleton)
     // and `backends[*].encryption` (list). Each Aes256GcmProxy-mode
     // entry gets its key recorded under the matching env-var name and

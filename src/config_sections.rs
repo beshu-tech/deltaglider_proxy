@@ -967,7 +967,7 @@ fn validate_filesystem_path(path: &std::path::Path) -> Result<(), String> {
 
 /// Process-level tunables: listener, TLS, log level, caches, and the
 /// infrastructure-only secret (`bootstrap_password_hash`,
-/// `config_sync_bucket`).
+/// `config_sync_bucket`, `config_sync_object_key`).
 ///
 /// Per-backend encryption lives under `storage.backends[*].encryption`
 /// (and `storage.backend_encryption` for the singleton path), NOT here.
@@ -1000,6 +1000,9 @@ pub struct AdvancedSection {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_sync_bucket: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_sync_object_key: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsConfig>,
@@ -1132,6 +1135,7 @@ impl SectionedConfig {
                 blocking_threads: flat.blocking_threads,
                 log_level: some_if_nondefault_str(&flat.log_level, default_log_level()),
                 config_sync_bucket: flat.config_sync_bucket.clone(),
+                config_sync_object_key: flat.config_sync_object_key.clone(),
                 tls: flat.tls.clone(),
                 bootstrap_password_hash: flat.bootstrap_password_hash.clone(),
                 event_delivery: flat.event_delivery.clone(),
@@ -1203,6 +1207,7 @@ impl SectionedConfig {
             blocking_threads: self.advanced.blocking_threads,
             log_level: self.advanced.log_level.unwrap_or(defaults.log_level),
             config_sync_bucket: self.advanced.config_sync_bucket,
+            config_sync_object_key: self.advanced.config_sync_object_key,
             tls: self.advanced.tls,
             event_delivery: self.advanced.event_delivery,
             buckets: self.storage.buckets,
