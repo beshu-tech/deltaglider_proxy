@@ -1,7 +1,8 @@
 //! S3 sync for the IAM config database.
 //!
 //! When `DGP_CONFIG_SYNC_BUCKET` is set, the encrypted config DB file is
-//! synchronized to/from S3 at `.deltaglider/config.db`. This enables
+//! synchronized to/from S3 (default key `.deltaglider/config.db`, override
+//! with `DGP_CONFIG_SYNC_KEY`). This enables
 //! multi-instance deployments to share IAM state.
 //!
 //! - On startup: download from S3 if the ETag differs from the local copy.
@@ -22,13 +23,14 @@ use crate::config_db::ConfigDb;
 use crate::iam::external_auth::ExternalAuthManager;
 use crate::iam::{IamIndex, IamState, SharedIamState};
 
-/// S3 key for the config database file.
-const S3_CONFIG_KEY: &str = ".deltaglider/config.db";
+/// Default S3 object key for the config database file (override with `DGP_CONFIG_SYNC_KEY`).
+pub const DEFAULT_CONFIG_SYNC_OBJECT_KEY: &str = ".deltaglider/config.db";
 
 /// Synchronizes the encrypted config DB file to/from S3.
 pub struct ConfigDbSync {
     s3_client: Client,
     bucket: String,
+    object_key: String,
     local_path: PathBuf,
     last_etag: Arc<RwLock<Option<String>>>,
     /// The local bootstrap password hash, used to validate downloaded DBs.
@@ -43,6 +45,7 @@ impl ConfigDbSync {
     pub async fn new(
         backend_config: &BackendConfig,
         sync_bucket: String,
+        object_key: String,
         local_path: PathBuf,
         bootstrap_password_hash: String,
     ) -> Result<Self, String> {
@@ -57,6 +60,7 @@ impl ConfigDbSync {
         Ok(Self {
             s3_client: client,
             bucket: sync_bucket,
+            object_key,
             local_path,
             last_etag: Arc::new(RwLock::new(None)),
             bootstrap_password_hash,
@@ -126,7 +130,7 @@ impl ConfigDbSync {
             .s3_client
             .head_object()
             .bucket(&self.bucket)
-            .key(S3_CONFIG_KEY)
+            .key(&self.object_key)
             .send()
             .await;
 
@@ -161,7 +165,7 @@ impl ConfigDbSync {
             .s3_client
             .get_object()
             .bucket(&self.bucket)
-            .key(S3_CONFIG_KEY)
+            .key(&self.object_key)
             .send()
             .await
             .map_err(|e| format!("Failed to download config DB from S3: {}", e))?;
@@ -238,7 +242,7 @@ impl ConfigDbSync {
             .s3_client
             .put_object()
             .bucket(&self.bucket)
-            .key(S3_CONFIG_KEY)
+            .key(&self.object_key)
             .body(ByteStream::from(data.clone()))
             .content_type("application/octet-stream")
             .send()
@@ -271,7 +275,7 @@ impl ConfigDbSync {
             .s3_client
             .get_object()
             .bucket(&self.bucket)
-            .key(S3_CONFIG_KEY)
+            .key(&self.object_key)
             .send()
             .await
             .map_err(|e| format!("Failed to download config DB from S3: {}", e))?;

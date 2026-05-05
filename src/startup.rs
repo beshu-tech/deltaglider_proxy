@@ -797,9 +797,17 @@ pub async fn init_config_sync(
 
     let db_file = config_db_path();
 
+    let object_key = std::env::var("DGP_CONFIG_SYNC_KEY")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            deltaglider_proxy::config_db_sync::DEFAULT_CONFIG_SYNC_OBJECT_KEY.to_string()
+        });
+
     let sync = match ConfigDbSync::new(
         &config.backend,
         sync_bucket.clone(),
+        object_key,
         db_file,
         admin_password_hash.to_string(),
     )

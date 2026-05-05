@@ -169,6 +169,12 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         example: "my-config-bucket",
         category: "Config Sync",
     },
+    EnvVarEntry {
+        name: "DGP_CONFIG_SYNC_KEY",
+        description: "S3 object key for the synced config DB (default: .deltaglider/config.db)",
+        example: ".deltaglider/config.db",
+        category: "Config Sync",
+    },
     // ── Security / Runtime ─────────────────────────────────
     EnvVarEntry {
         name: "DGP_DEBUG_HEADERS",
@@ -2283,6 +2289,7 @@ mod tests {
         let used_outside_from_env: &[&str] = &[
             "DGP_CONFIG",                  // config::load()
             "DGP_CONFIG_SYNC_BUCKET",      // startup::init_config_sync()
+            "DGP_CONFIG_SYNC_KEY",         // startup::init_config_sync()
             "DGP_DEBUG_HEADERS",           // api::handlers::debug_headers_enabled()
             "DGP_TRUST_PROXY_HEADERS",     // rate_limiter::trust_proxy_headers()
             "DGP_SESSION_TTL_HOURS",       // session::default_session_ttl()
