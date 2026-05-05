@@ -20,8 +20,18 @@ use tokio::time::sleep;
 static PORT_COUNTER: AtomicU16 = AtomicU16::new(19000);
 
 /// Known bootstrap password used by all test servers.
-/// The hash is bcrypt($2b$04$) of "testpass" with a low cost factor for speed.
 pub const TEST_BOOTSTRAP_PASSWORD: &str = "testpass";
+
+/// Deterministic bcrypt hash of [`TEST_BOOTSTRAP_PASSWORD`] (cost 4).
+///
+/// The running binary uses this string as **both** the admin-login verifier and
+/// the SQLCipher passphrase for `deltaglider_config.db`. A fresh
+/// `bcrypt::hash(...)` per `TestServer` spawn would produce different salts and
+/// therefore different encryption keys, breaking HA config-sync tests where
+/// replicas must decrypt the same uploaded DB. Custom passwords via
+/// [`TestServerBuilder::bootstrap_password`] still hash at spawn time.
+pub const TEST_BOOTSTRAP_PASSWORD_HASH: &str =
+    "$2b$04$s7/yy6Z363jZoQodArpuDeP00U.zE1QPi0bxM/o9BOZDs6tDbss5q";
 
 /// MinIO configuration constants
 pub const MINIO_BUCKET: &str = "deltaglider-test";
@@ -565,15 +575,12 @@ impl TestServerBuilder {
     fn build_toml_config(&self) -> (String, Option<TempDir>) {
         let mut config = String::new();
 
-        // Set a known bootstrap password hash so tests can log into
-        // the admin API. HA-sync tests can override via
-        // `bootstrap_password()` to spawn a replica with a different
-        // password (wrong-passphrase rejection test).
-        let password_plaintext = self
-            .bootstrap_password
-            .as_deref()
-            .unwrap_or(TEST_BOOTSTRAP_PASSWORD);
-        let bootstrap_hash = bcrypt::hash(password_plaintext, 4).expect("bcrypt hash failed");
+        // Bootstrap hash: shared constant for the default password so every
+        // replica uses the same SQLCipher key (see [`TEST_BOOTSTRAP_PASSWORD_HASH`]).
+        let bootstrap_hash = match self.bootstrap_password.as_deref() {
+            Some(pw) => bcrypt::hash(pw, 4).expect("bcrypt hash failed"),
+            None => TEST_BOOTSTRAP_PASSWORD_HASH.to_string(),
+        };
         config.push_str(&format!(
             "bootstrap_password_hash = \"{}\"\n",
             bootstrap_hash
@@ -659,11 +666,10 @@ impl TestServerBuilder {
     fn build_yaml_config(&self) -> (String, Option<TempDir>) {
         let mut config = String::new();
 
-        let password_plaintext = self
-            .bootstrap_password
-            .as_deref()
-            .unwrap_or(TEST_BOOTSTRAP_PASSWORD);
-        let bootstrap_hash = bcrypt::hash(password_plaintext, 4).expect("bcrypt hash failed");
+        let bootstrap_hash = match self.bootstrap_password.as_deref() {
+            Some(pw) => bcrypt::hash(pw, 4).expect("bcrypt hash failed"),
+            None => TEST_BOOTSTRAP_PASSWORD_HASH.to_string(),
+        };
         config.push_str(&format!(
             "bootstrap_password_hash: \"{}\"\n",
             bootstrap_hash
