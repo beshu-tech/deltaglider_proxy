@@ -25,11 +25,20 @@ pub const TEST_BOOTSTRAP_PASSWORD: &str = "testpass";
 /// Deterministic bcrypt hash of [`TEST_BOOTSTRAP_PASSWORD`] (cost 4).
 ///
 /// The running binary uses this string as **both** the admin-login verifier and
-/// the SQLCipher passphrase for `deltaglider_config.db`. A fresh
-/// `bcrypt::hash(...)` per `TestServer` spawn would produce different salts and
-/// therefore different encryption keys, breaking HA config-sync tests where
-/// replicas must decrypt the same uploaded DB. Custom passwords via
-/// [`TestServerBuilder::bootstrap_password`] still hash at spawn time.
+/// the **SQLCipher key material** for `deltaglider_config.db`: the config field
+/// value is passed through to open the DB (same literal as stored in
+/// `bootstrap_password_hash` / env `DGP_BOOTSTRAP_PASSWORD_HASH`). HA
+/// config-sync therefore requires every replica that shares one logical
+/// bootstrap password to emit the **byte-identical** hash string; otherwise
+/// each process derives a different encryption key and cross-replica
+/// downloads are undecryptable garbage.
+///
+/// A fresh `bcrypt::hash(...)` on every default [`TestServer`] build would
+/// produce different salts and different `bootstrap_password_hash` lines,
+/// breaking `config_sync_ha_test` and any multi-process scenario. Default
+/// builders embed this constant instead. Custom passwords via
+/// [`TestServerBuilder::bootstrap_password`] still call `bcrypt::hash` at
+/// config generation time (tests that deliberately mismatch peers use that).
 pub const TEST_BOOTSTRAP_PASSWORD_HASH: &str =
     "$2b$04$s7/yy6Z363jZoQodArpuDeP00U.zE1QPi0bxM/o9BOZDs6tDbss5q";
 
@@ -396,6 +405,8 @@ pub struct TestServerBuilder {
     /// `config_sync_bucket` is written to the config; server's startup
     /// downloads if newer, and every IAM mutation re-uploads.
     config_sync_bucket: Option<String>,
+    /// S3 object key for config DB sync (written as `config_sync_object_key`).
+    config_sync_object_key: Option<String>,
     /// Override the bootstrap password. Default: [`TEST_BOOTSTRAP_PASSWORD`].
     /// Used by HA-sync tests that want server A and server B to have
     /// DIFFERENT passwords (to verify the wrong-passphrase-rejection
@@ -424,6 +435,7 @@ impl Default for TestServerBuilder {
             native_sse_mode: None,
             yaml_config: false,
             config_sync_bucket: None,
+            config_sync_object_key: None,
             bootstrap_password: None,
             extra_storage_yaml: None,
             extra_env: Vec::new(),
@@ -523,6 +535,14 @@ impl TestServerBuilder {
         self
     }
 
+    /// Set the S3 object key for config DB sync (parallel to
+    /// [`Self::config_sync_bucket`]). Prefer this over `DGP_CONFIG_SYNC_KEY`
+    /// env so the spawned binary always reads the key from `DGP_CONFIG`.
+    pub fn config_sync_object_key(mut self, key: &str) -> Self {
+        self.config_sync_object_key = Some(key.to_string());
+        self
+    }
+
     /// Override the bootstrap password for this server. Default is
     /// [`TEST_BOOTSTRAP_PASSWORD`] (`testpass`) shared by every
     /// TestServer — giving HA-sync tests a way to spawn a replica
@@ -540,6 +560,14 @@ impl TestServerBuilder {
         self.extra_storage_yaml = Some(yaml.to_string());
         self.yaml_config = true;
         self
+    }
+
+    /// Returns the config document this builder would pass to the proxy
+    /// (no process spawn). Filesystem backends allocate a throwaway `TempDir`
+    /// for the `path =` value; callers that need a stable data directory must
+    /// use [`build`](Self::build).
+    pub fn generated_config_document(&self) -> String {
+        self.build_config().0
     }
 
     /// Build the config string and spawn the test server. Format
@@ -598,6 +626,12 @@ impl TestServerBuilder {
         }
         if let Some(ref sync_bucket) = self.config_sync_bucket {
             config.push_str(&format!("config_sync_bucket = \"{}\"\n", sync_bucket));
+        }
+        if let Some(ref sync_key) = self.config_sync_object_key {
+            config.push_str(&format!(
+                "config_sync_object_key = \"{}\"\n",
+                sync_key.replace('\\', "\\\\").replace('"', "\\\"")
+            ));
         }
         if let Some((ref key_id, ref secret)) = self.auth_creds {
             config.push_str(&format!(
@@ -686,6 +720,12 @@ impl TestServerBuilder {
         }
         if let Some(ref sync_bucket) = self.config_sync_bucket {
             config.push_str(&format!("config_sync_bucket: \"{}\"\n", sync_bucket));
+        }
+        if let Some(ref sync_key) = self.config_sync_object_key {
+            config.push_str(&format!(
+                "config_sync_object_key: \"{}\"\n",
+                sync_key.replace('\\', "\\\\").replace('"', "\\\"")
+            ));
         }
         if let Some((ref key_id, ref secret)) = self.auth_creds {
             config.push_str(&format!(
