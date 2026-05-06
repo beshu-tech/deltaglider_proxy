@@ -324,6 +324,7 @@ export default function App() {
           onSessionExpired={navigateToBrowse}
           subPath={subPath}
           accountMenu={accountMenu()}
+          canAdmin={canAdmin}
         />
       );
     }

@@ -254,9 +254,10 @@ interface AdminPageProps {
   onSessionExpired?: () => void;
   subPath?: string;
   accountMenu?: React.ReactNode;
+  canAdmin?: boolean;
 }
 
-export default function AdminPage({ onBack, onSessionExpired, subPath, accountMenu }: AdminPageProps) {
+export default function AdminPage({ onBack, onSessionExpired, subPath, accountMenu, canAdmin = false }: AdminPageProps) {
   const colors = useColors();
   const { navigate } = useNavigation();
   // Hook up the `● ` tab-title prefix + beforeunload guard for any
@@ -894,7 +895,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, accountMe
     );
   }
 
-  const adminAccountMenu = isValidElement<AccountMenuConfigProps>(accountMenu)
+  const adminAccountMenu = canAdmin && isValidElement<AccountMenuConfigProps>(accountMenu)
     ? cloneElement(accountMenu, {
         configSection: activeSection,
         onShowFullConfigYaml: () => setYamlModalMode('export'),

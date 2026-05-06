@@ -96,8 +96,9 @@ export default function AccountMenu({
   }, [configSection]);
 
   const close = () => setOpen(false);
-  const hasConfigActions = Boolean(configSection || onShowFullConfigYaml || onImportFullConfigYaml);
-  const hasBackupActions = Boolean(onExportFullBackup || onImportFullBackup);
+  const isAdmin = canAdmin === true;
+  const hasConfigActions = isAdmin && Boolean(configSection || onShowFullConfigYaml || onImportFullConfigYaml);
+  const hasBackupActions = isAdmin && Boolean(onExportFullBackup || onImportFullBackup);
   const configLabel = configSection
     ? `${configSection.charAt(0).toUpperCase()}${configSection.slice(1)} section YAML`
     : 'Section YAML';
@@ -134,7 +135,7 @@ export default function AccountMenu({
               <HomeOutlined aria-hidden style={iconStyle} />
               <span>Browser</span>
             </button>
-            {canAdmin === true && onSettingsClick && (
+            {isAdmin && onSettingsClick && (
               <button
                 type="button"
                 className="account-menu-item"
