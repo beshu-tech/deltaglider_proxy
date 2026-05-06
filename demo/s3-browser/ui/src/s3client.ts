@@ -302,11 +302,23 @@ export async function testConnection(
 
 // ── Bucket operations ──
 
-export async function listBuckets(): Promise<BucketInfo[]> {
+type ListBucketsOptions = {
+  /**
+   * When false, skips `GET /api/admin/buckets` merge (returns 403 for browser-lift sessions).
+   * @default true
+   */
+  includeOrigins?: boolean;
+};
+
+export async function listBuckets(opts?: ListBucketsOptions): Promise<BucketInfo[]> {
+  const includeOrigins = opts?.includeOrigins !== false;
   const client = getClient();
+  const originsPromise = includeOrigins
+    ? getBucketOrigins().catch(() => null)
+    : Promise.resolve(null);
   const [resp, origins] = await Promise.all([
     client.send(new ListBucketsCommand({})),
-    getBucketOrigins().catch(() => null),
+    originsPromise,
   ]);
   const originByName = new Map((origins?.buckets || []).map((b) => [b.name, b]));
   return (resp.Buckets || []).map((b) => {

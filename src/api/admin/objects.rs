@@ -13,21 +13,26 @@
 //!   browser memory (capped at 500 MB by `useS3Browser`).
 //!
 //! This module moves the orchestration into the proxy where the
-//! engine is already running. Endpoints are session-gated (admin UI
-//! only) and live under `/_/api/admin/objects/*`.
+//! engine is already running. Endpoints live under `/_/api/admin/objects/*`
+//! behind **`require_admin_gui_session`** (not browser-lift). They call
+//! `engine.retrieve` / `store` / `delete` directly — there is **no**
+//! per-object IAM evaluation inside these handlers; the admin-GUI
+//! session is the authorization boundary.
 //!
 //! Future iterations can stream zip output and add server-side
 //! progress reporting; for v1 we match the existing client semantics
 //! 1:1 so the migration is risk-free.
 
 use crate::api::handlers::AppState;
-use axum::extract::{Query, State};
+use axum::extract::{Extension, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
+
+use super::auth::AdminGuiGate;
 
 // ---------------------------------------------------------------------------
 // Request/response shapes
@@ -155,6 +160,7 @@ fn detect_collisions(items: &[CopyItem], dest_prefix: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 pub async fn copy_objects(
+    Extension(_gate): Extension<AdminGuiGate>,
     State(state): State<Arc<crate::api::admin::AdminState>>,
     Json(req): Json<CopyRequest>,
 ) -> Result<Json<CopyResponse>, (StatusCode, String)> {
@@ -275,6 +281,7 @@ async fn copy_one(
 // ---------------------------------------------------------------------------
 
 pub async fn move_objects(
+    Extension(_gate): Extension<AdminGuiGate>,
     State(state): State<Arc<crate::api::admin::AdminState>>,
     Json(req): Json<MoveRequest>,
 ) -> Result<Json<MoveResponse>, (StatusCode, String)> {
@@ -364,6 +371,7 @@ pub async fn move_objects(
 // ---------------------------------------------------------------------------
 
 pub async fn bulk_delete(
+    Extension(_gate): Extension<AdminGuiGate>,
     State(state): State<Arc<crate::api::admin::AdminState>>,
     Json(req): Json<DeleteRequest>,
 ) -> Result<Json<DeleteResponse>, (StatusCode, String)> {
@@ -427,6 +435,7 @@ pub async fn bulk_delete(
 // the migration is a drop-in replacement.
 
 pub async fn download_zip(
+    Extension(_gate): Extension<AdminGuiGate>,
     State(state): State<Arc<crate::api::admin::AdminState>>,
     Query(q): Query<ZipQuery>,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
@@ -567,6 +576,7 @@ pub struct ListAllResponse {
 }
 
 pub async fn list_all(
+    Extension(_gate): Extension<AdminGuiGate>,
     State(state): State<Arc<crate::api::admin::AdminState>>,
     Query(q): Query<ListAllQuery>,
 ) -> Result<Json<ListAllResponse>, (StatusCode, String)> {

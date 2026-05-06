@@ -30,6 +30,8 @@ interface Props {
   headCache?: Record<string, { storageType?: string; storedSize?: number; error?: boolean }>;
   canDelete?: boolean;
   canRead?: boolean;
+  /** When false, skip `GET /api/admin/config` (403 for browser-lift); public-prefix badge stays hidden. */
+  hasAdminSession?: boolean;
 }
 
 function getDgMetadata(headers: Record<string, string>): [string, string][] {
@@ -200,7 +202,17 @@ function ShareDurationButton({
   );
 }
 
-export default function InspectorPanel({ object, onClose, onDeleted, onPreview, isMobile, headCache, canDelete = true, canRead = true }: Props) {
+export default function InspectorPanel({
+  object,
+  onClose,
+  onDeleted,
+  onPreview,
+  isMobile,
+  headCache,
+  canDelete = true,
+  canRead = true,
+  hasAdminSession = true,
+}: Props) {
   const {
     BG_SIDEBAR, BORDER, TEXT_PRIMARY, TEXT_MUTED, TEXT_FAINT,
     ACCENT_BLUE, ACCENT_GREEN, ACCENT_RED, STORAGE_TYPE_COLORS, STORAGE_TYPE_DEFAULT,
@@ -225,13 +237,25 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
   const objectKey = object?.key;
   const cachedHead = objectKey ? headCache?.[objectKey] : undefined;
 
-  // Fetch bucket policy (compression + public prefixes) once per bucket
+  // Fetch bucket policy (compression + public prefixes) once per bucket — admin config is
+  // `require_admin_gui_session`; browser-lift sessions must not spam 403s.
   const lastBucketRef = useRef<string>('');
   useEffect(() => {
     const bucket = getBucket();
-    if (!bucket || bucket === lastBucketRef.current) return;
+    if (!bucket) {
+      setBucketPolicy(null);
+      setBucketPolicyLoading(false);
+      lastBucketRef.current = '';
+      return;
+    }
+    if (bucket === lastBucketRef.current) return;
     lastBucketRef.current = bucket;
     setBucketPolicy(null);
+    if (!hasAdminSession) {
+      setBucketPolicyLoading(false);
+      lastBucketRef.current = '';
+      return;
+    }
     setBucketPolicyLoading(true);
     const bucketFetched = bucket;
     let cancelled = false;
@@ -255,7 +279,7 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
     return () => {
       cancelled = true;
     };
-  }, [objectKey]);
+  }, [objectKey, hasAdminSession]);
 
   useEffect(() => {
     if (!objectKey) { setHeadData(null); setHeadReadable(false); return; }
@@ -313,8 +337,9 @@ export default function InspectorPanel({ object, onClose, onDeleted, onPreview, 
   const storageTypeLabel = storageType || 'Original';
   const storageTypeColor = STORAGE_TYPE_COLORS[storageType || 'passthrough'] || STORAGE_TYPE_DEFAULT;
   const compressionEnabled = bucketPolicy?.compressionEnabled ?? true;
-  /** When policy is still loading, treat as not public so we don't flash the wrong badge. */
+  /** When policy is still loading or unavailable (e.g. browser-lift), never show a false "public" badge. */
   const isPublic =
+    hasAdminSession &&
     !bucketPolicyLoading &&
     (bucketPolicy?.publicPrefixes.some(pp => pp === '' || object.key.startsWith(pp)) ?? false);
   // Non-admin IAM users connect with S3 credentials but may not have a GUI

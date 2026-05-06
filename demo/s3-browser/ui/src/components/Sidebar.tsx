@@ -38,6 +38,8 @@ interface Props {
   canDeleteBucket: (bucket: string) => boolean;
   canUpload: boolean;
   canAdmin: boolean;
+  /** When false, `listBuckets` skips admin bucket-origins (browser-lift). @default true */
+  includeBucketOrigins?: boolean;
   open: boolean;
   onClose: () => void;
   isMobile: boolean;
@@ -53,6 +55,7 @@ export default function Sidebar({
   canDeleteBucket,
   canUpload,
   canAdmin,
+  includeBucketOrigins = true,
   open,
   onClose,
   isMobile,
@@ -73,7 +76,7 @@ export default function Sidebar({
   const [messageApi, contextHolder] = message.useMessage();
 
   useEffect(() => {
-    listBuckets()
+    listBuckets({ includeOrigins: includeBucketOrigins })
       .then((list) => {
         setBuckets(list);
         onBucketsChanged?.(list.length);
@@ -90,7 +93,7 @@ export default function Sidebar({
         setBuckets([]);
         onBucketsChanged?.(0);
       });
-  }, [onBucketChange, onBucketsChanged]);
+  }, [onBucketChange, onBucketsChanged, includeBucketOrigins]);
 
   useEffect(() => {
     if (createBucketFocusSignal <= 0) return;
@@ -112,7 +115,7 @@ export default function Sidebar({
       setNewBucketName('');
       setCreateBucketOpen(false);
       messageApi.success(`Bucket "${name}" created`);
-      const updated = await listBuckets();
+      const updated = await listBuckets({ includeOrigins: includeBucketOrigins });
       setBuckets(updated);
       onBucketsChanged?.(updated.length);
       if (!getBucket()) {
@@ -145,7 +148,7 @@ export default function Sidebar({
     try {
       await deleteBucket(name);
       messageApi.success(`Bucket "${name}" deleted`);
-      const updated = await listBuckets();
+      const updated = await listBuckets({ includeOrigins: includeBucketOrigins });
       setBuckets(updated);
       onBucketsChanged?.(updated.length);
       if (getBucket() === name && updated.length > 0) {

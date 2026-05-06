@@ -7,7 +7,7 @@ import type { ColumnsType } from 'antd/es/table';
 import { useColors } from '../ThemeContext';
 import type { FolderSizeState } from '../useComputeSize';
 import { getPreviewMode } from './filePreviewMode';
-import { canRequestPrefixUsageScan } from '../permissions';
+import { canRequestPrefixUsageScan, isVirtualFolderPrefix } from '../permissions';
 
 const { Text } = Typography;
 
@@ -28,6 +28,7 @@ interface Props {
   onEnrichKeys: (keys: string[]) => void;
   folderSizes: Record<string, FolderSizeState>;
   virtualFolders: string[];
+  hasAdminSession: boolean;
   onComputeSize: (prefix: string) => void;
   onCancelSize: (prefix: string) => void;
   onAutoPopulateSizes?: (currentPrefix: string, folderPrefixes: string[]) => void;
@@ -53,6 +54,7 @@ export default function ObjectTable({
   onEnrichKeys,
   folderSizes,
   virtualFolders,
+  hasAdminSession,
   onComputeSize,
   onCancelSize,
   onAutoPopulateSizes,
@@ -183,14 +185,14 @@ export default function ObjectTable({
             >
               <FolderOutlined aria-hidden="true" style={{ color: ACCENT_BLUE, fontSize: 15 }} />
               {record.name}
-              {canRequestPrefixUsageScan(record.key.replace('folder:', ''), virtualFolders) ? null : (
+              {isVirtualFolderPrefix(record.key.replace('folder:', ''), virtualFolders) ? (
                 <sup
                   title="Virtual folder from your permissions. It will become a real folder after upload."
                   style={{ color: TEXT_MUTED, fontSize: 10, fontWeight: 600, lineHeight: 1, marginLeft: 2 }}
                 >
                   (i)
                 </sup>
-              )}
+              ) : null}
             </button>
           );
         }
@@ -216,15 +218,23 @@ export default function ObjectTable({
       render: (_: unknown, record: RowData) => {
         if (record._isFolder) {
           const folderPrefix = record.key.replace('folder:', '');
-          const canScanFolder = canRequestPrefixUsageScan(folderPrefix, virtualFolders);
+          const isVirtual = isVirtualFolderPrefix(folderPrefix, virtualFolders);
+          const canScanFolder = canRequestPrefixUsageScan(folderPrefix, virtualFolders, hasAdminSession);
           const sizeState = folderSizes[folderPrefix];
-          if (!canScanFolder) {
+          if (isVirtual) {
             return (
               <span
                 title="Virtual folder from your permissions. It will become a real folder after upload."
                 style={{ fontSize: 11, color: TEXT_MUTED }}
               >
                 Virtual
+              </span>
+            );
+          }
+          if (!canScanFolder) {
+            return (
+              <span style={{ fontSize: 12, color: TEXT_MUTED }} title="Folder size requires an admin session">
+                —
               </span>
             );
           }

@@ -32,8 +32,8 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
     // same resources are intentionally NOT gated — the GUI must still
     // be able to display DB state for diagnostics in declarative mode.
     //
-    // Both subrouters share `require_session` at the outermost layer
-    // so the authentication invariant still applies uniformly.
+    // `session_light` uses `require_session` (includes S3BrowserLift).
+    // `admin_gui_protected` uses `require_admin_gui_session` (full GUI only).
 
     let iam_gated = Router::new()
         // IAM user management — POST/PUT/DELETE are gated.
@@ -118,8 +118,24 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             admin::require_not_declarative,
         ));
 
-    let protected = Router::new()
+    // Any valid session (including S3BrowserLift — IAM browser users).
+    let session_light = Router::new()
         .route("/_/api/admin/logout", post(admin::logout))
+        .route("/_/api/admin/session", get(admin::check_session))
+        .route(
+            "/_/api/admin/session/s3-credentials",
+            get(admin::get_s3_session_creds)
+                .put(admin::set_s3_session_creds)
+                .delete(admin::clear_s3_session_creds),
+        )
+        .layer(middleware::from_fn_with_state(
+            admin_state.clone(),
+            admin::require_session,
+        ))
+        .with_state(admin_state.clone());
+
+    // Full admin GUI only (bootstrap / login-as / OAuth — not browser-lift).
+    let admin_gui_protected = Router::new()
         .route(
             "/_/api/admin/config",
             get(admin::get_config).put(admin::update_config),
@@ -154,7 +170,6 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             post(admin::validate_section),
         )
         .route("/_/api/admin/password", put(admin::change_password))
-        .route("/_/api/admin/session", get(admin::check_session))
         .route("/_/api/admin/test-s3", post(admin::test_s3_connection))
         // Operator-triggered config-sync pull. Useful for multi-replica
         // deployments that want immediate propagation instead of
@@ -167,13 +182,6 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         )
         .route("/_/api/admin/backends/:name", delete(admin::delete_backend))
         .route("/_/api/admin/buckets", get(admin::list_bucket_origins))
-        // S3 session credentials (server-side credential storage)
-        .route(
-            "/_/api/admin/session/s3-credentials",
-            get(admin::get_s3_session_creds)
-                .put(admin::set_s3_session_creds)
-                .delete(admin::clear_s3_session_creds),
-        )
         // Usage scanner
         .route("/_/api/admin/usage/scan", post(admin::scan_usage))
         .route("/_/api/admin/usage", get(admin::get_usage))
@@ -239,10 +247,10 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             get(admin::lifecycle_failures),
         )
         // Server-side bulk object operations. Replaces what the
-        // browser used to do via @aws-sdk/client-s3. Same session
-        // gating as the rest of the admin surface; the engine is
-        // already permission-checked because the proxy IAM layer
-        // validates each retrieve/store call.
+        // browser used to do via @aws-sdk/client-s3. Handlers call the
+        // engine directly (no per-key SigV4 / IAM re-check on each
+        // object). **`require_admin_gui_session` is the trust boundary:**
+        // only full GUI sessions may invoke these routes.
         .route("/_/api/admin/objects/copy", post(admin::copy_objects))
         .route("/_/api/admin/objects/move", post(admin::move_objects))
         .route(
@@ -252,12 +260,11 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         .route("/_/api/admin/objects/zip", get(admin::download_zip))
         .route("/_/api/admin/objects/list", get(admin::list_all_objects))
         // Merge the IAM-gated subrouter in; it already carries its own
-        // `require_not_declarative` layer. Both subrouters share the
-        // outer `require_session`.
+        // `require_not_declarative` layer.
         .merge(iam_gated)
         .layer(middleware::from_fn_with_state(
             admin_state.clone(),
-            admin::require_session,
+            admin::require_admin_gui_session,
         ))
         .with_state(admin_state.clone());
 
@@ -268,6 +275,14 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
     let public_admin = Router::new()
         .route("/_/api/admin/login", post(admin::login))
         .route("/_/api/admin/login-as", post(admin::login_as))
+        .route(
+            "/_/api/admin/session/browser-connect",
+            post(admin::browser_session_connect),
+        )
+        .route(
+            "/_/api/admin/session/open-browser-connect",
+            post(admin::open_browser_connect),
+        )
         .route("/_/api/iam/identity", post(admin::resolve_iam_identity))
         .route("/_/api/admin/policies", get(admin::get_canned_policies))
         // Monotonic rebuild counter. Public by design — exposes an opaque
@@ -310,7 +325,7 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         )
         .layer(middleware::from_fn_with_state(
             admin_state.clone(),
-            admin::require_session,
+            admin::require_admin_gui_session,
         ))
         .with_state(admin_state.clone());
 
@@ -320,7 +335,8 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         .route("/_/*path", get(static_or_fallback));
 
     Router::new()
-        .merge(protected)
+        .merge(session_light)
+        .merge(admin_gui_protected)
         .merge(public_admin)
         .merge(operational_routes)
         .merge(stats_route)

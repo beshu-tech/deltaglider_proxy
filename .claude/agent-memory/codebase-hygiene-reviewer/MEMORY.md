@@ -1,3 +1,2 @@
-# Codebase Hygiene Reviewer — Memory Index
-
-- [InspectorPanel length](inspector_panel_length.md) — InspectorPanel.tsx is 800 LOC with 4+ mixed concerns; candidate for extraction
+- [Replication module patterns](replication_patterns.md) — worker/scheduler/planner/state_store module structure and common idioms
+- [Routing backend semantics](routing_backend.md) — resolve vs resolve_existing, listed_bucket_virtual_name change

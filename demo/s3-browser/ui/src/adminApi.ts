@@ -209,14 +209,17 @@ export async function getAdminConfig(): Promise<AdminConfig | null> {
   return safeJson(res);
 }
 
-export async function checkSession(): Promise<boolean> {
+export async function checkSession(): Promise<{ valid: boolean; admin_gui: boolean }> {
   try {
     const res = await adminFetch('/api/admin/session');
-    if (!res.ok) return false;
-    const data = await safeJson<{ valid?: boolean }>(res);
-    return data.valid === true;
+    if (!res.ok) return { valid: false, admin_gui: false };
+    const data = await safeJson<{ valid?: boolean; admin_gui?: boolean }>(res);
+    return {
+      valid: data.valid === true,
+      admin_gui: data.admin_gui === true,
+    };
   } catch {
-    return false;
+    return { valid: false, admin_gui: false };
   }
 }
 
@@ -786,6 +789,54 @@ export async function loginAs(accessKeyId: string, secretAccessKey: string): Pro
   });
   if (res.ok) return { ok: true };
   return { ok: false, error: 'Admin access denied — invalid credentials or insufficient permissions' };
+}
+
+/** IAM non-admin: cookie + server-stored S3 creds (survives hard refresh). */
+export async function browserSessionConnect(req: {
+  access_key_id: string;
+  secret_access_key: string;
+  endpoint: string;
+  region?: string;
+  bucket?: string;
+}): Promise<{ ok: boolean; error?: string }> {
+  const res = await adminFetch('/api/admin/session/browser-connect', 'POST', {
+    access_key_id: req.access_key_id,
+    secret_access_key: req.secret_access_key,
+    endpoint: req.endpoint,
+    region: req.region,
+    bucket: req.bucket ?? '',
+  });
+  if (res.ok) return { ok: true };
+  let error = res.status === 429 ? 'Too many attempts' : 'Could not create browser session';
+  try {
+    const data = (await res.json()) as { error?: string };
+    if (data?.error) error = data.error;
+  } catch {
+    /* keep generic */
+  }
+  return { ok: false, error };
+}
+
+/** Open auth mode only: cookie + anonymous S3 creds for hard refresh. */
+export async function openBrowserConnect(req: {
+  endpoint: string;
+  region?: string;
+  bucket?: string;
+}): Promise<{ ok: boolean; error?: string }> {
+  const res = await adminFetch('/api/admin/session/open-browser-connect', 'POST', {
+    endpoint: req.endpoint,
+    region: req.region,
+    bucket: req.bucket ?? '',
+  });
+  if (res.ok) return { ok: true };
+  let error = res.status === 429 ? 'Too many attempts' : 'Could not start open browser session';
+  try {
+    const data = (await res.json()) as { error?: string };
+    if (data?.error) error = data.error;
+  } catch {
+    /* keep generic */
+  }
+  return { ok: false, error };
 }
 
 // === Multi-Backend Management ===
@@ -1421,9 +1472,11 @@ export async function requeueEventOutboxMany(ids: number[]): Promise<EventOutbox
 // =============================================================================
 // Server-side bulk object operations (Phase B of the SDK-removal migration).
 //
-// These wrap `/api/admin/objects/{copy,move,delete,zip,list}`. Each one
-// replaces a multi-step orchestration the React s3-browser used to do
-// client-side via @aws-sdk/client-s3:
+// Routes: `POST|GET /_/api/admin/objects/{copy,move,delete,zip,list}`.
+// **Trust model:** `require_admin_gui_session` only (full admin cookie — not
+// browser-lift). Handlers call the engine directly; there is no per-key IAM
+// inside these endpoints. See `deriveSessionCapabilities` / `canBulkOps` in
+// the UI — never call these without a full admin session.
 //
 // - bulkCopyObjects / bulkMoveObjects: previously per-key for-loops with
 //   silent partial-failure recovery. Now atomic on the server.
@@ -1431,7 +1484,7 @@ export async function requeueEventOutboxMany(ids: number[]): Promise<EventOutbox
 //   semantics (NoSuchKey counts as deleted).
 // - listAllUnderPrefix: replaces in-browser folder expansion that would
 //   spin a recursive listObjectsV2.
-// - downloadBulkZipUrl: returns a same-origin URL the browser can use
+// - bulkZipDownloadUrl: returns a same-origin URL the browser can use
 //   directly with `<a href download>` — server streams the archive.
 // =============================================================================
 
@@ -1464,12 +1517,14 @@ interface BulkMoveResponse extends BulkCopyResponse {
   deleted: number;
 }
 
+/** Admin GUI session required (`403 admin_session_required` for browser-lift). */
 export async function bulkCopyObjects(req: BulkCopyRequest): Promise<BulkCopyResponse> {
   const res = await adminFetch('/api/admin/objects/copy', 'POST', req);
   if (!res.ok) throw new Error(`Copy failed: ${await res.text()}`);
   return safeJson(res);
 }
 
+/** Admin GUI session required. */
 export async function bulkMoveObjects(req: BulkCopyRequest): Promise<BulkMoveResponse> {
   const res = await adminFetch('/api/admin/objects/move', 'POST', req);
   if (!res.ok) throw new Error(`Move failed: ${await res.text()}`);
@@ -1487,6 +1542,7 @@ interface BulkDeleteResponse {
   failures: { key: string; error: string }[];
 }
 
+/** Admin GUI session required. */
 export async function bulkDeleteObjects(req: BulkDeleteRequest): Promise<BulkDeleteResponse> {
   const res = await adminFetch('/api/admin/objects/delete', 'POST', req);
   if (!res.ok) throw new Error(`Delete failed: ${await res.text()}`);
@@ -1501,6 +1557,7 @@ interface ListAllResponse {
 /**
  * Recursively expand `prefix` to its absolute key list. Server-side
  * equivalent of the previous browser-side `listAllKeys`.
+ * Admin GUI session required.
  */
 export async function listAllUnderPrefix(bucket: string, prefix: string): Promise<ListAllResponse> {
   if (!prefix) throw new Error('listAllUnderPrefix: prefix must be non-empty');
@@ -1514,6 +1571,7 @@ export async function listAllUnderPrefix(bucket: string, prefix: string): Promis
  * Build the same-origin URL for a server-streamed zip download. Used
  * by the browser as an `<a href download>` target — no JS-side body
  * assembly. Pass `bucketKeys` as `["bucket/key1", "bucket/key2"]`.
+ * Admin GUI session required when the URL is fetched.
  */
 export function bulkZipDownloadUrl(bucketKeys: string[]): string {
   const qs = new URLSearchParams({ keys: bucketKeys.join(',') });

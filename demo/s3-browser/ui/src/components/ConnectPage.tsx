@@ -1,8 +1,8 @@
 import { useState, useEffect } from 'react';
 import { Button, Input, Typography, Space, Alert, Spin, message } from 'antd';
 import { WarningOutlined, CheckCircleOutlined, CopyOutlined, SunOutlined, MoonOutlined } from '@ant-design/icons';
-import { testConnection, setEndpoint, setCredentials, setBucket, initFromSession } from '../s3client';
-import { adminLogin, loginAs, whoami, recoverDb } from '../adminApi';
+import { testConnection, setEndpoint, setCredentials, setBucket, initFromSession, getBucket } from '../s3client';
+import { adminLogin, loginAs, whoami, recoverDb, browserSessionConnect, openBrowserConnect } from '../adminApi';
 import type { ExternalProviderInfo } from '../adminApi';
 import OAuthProviderList from './OAuthProviderList';
 import { detectDefaultEndpoint } from '../utils';
@@ -55,17 +55,28 @@ export default function ConnectPage({ onConnect, showError }: Props) {
         if (info.mode === 'open') {
           const endpoint = detectDefaultEndpoint().replace(/\/+$/, '');
           setEndpoint(endpoint);
-          setCredentials('anonymous', 'anonymous');
           const result = await testConnection(endpoint, 'anonymous', 'anonymous').catch(() => ({ ok: false } as const));
-          if (result.ok && 'buckets' in result && result.buckets && result.buckets.length > 0) {
-            setBucket(result.buckets[0]);
-            onConnect();
+          if (!result.ok) {
+            setDetecting(false);
+            setError('Open access mode but S3 backend is unreachable. Check server configuration.');
             return;
           }
-          // S3 backend unreachable in open mode — fall through to show connect page
-          // so user can see the error and retry
-          setDetecting(false);
-          setError('Open access mode but S3 backend is unreachable. Check server configuration.');
+          if (result.buckets && result.buckets.length > 0) {
+            setBucket(result.buckets[0]);
+          }
+          const ob = await openBrowserConnect({ endpoint, bucket: getBucket() });
+          if (!ob.ok) {
+            setDetecting(false);
+            setError(ob.error || 'Could not start open browser session');
+            return;
+          }
+          const restored = await initFromSession();
+          if (!restored) {
+            setDetecting(false);
+            setError('Open session created but credentials could not be restored.');
+            return;
+          }
+          onConnect();
           return;
         }
         setDetecting(false);
@@ -126,14 +137,36 @@ export default function ConnectPage({ onConnect, showError }: Props) {
       }
 
       setEndpoint(cleanEndpoint);
-      setCredentials(accessKey, secretKey);
       if (result.buckets && result.buckets.length > 0) {
         setBucket(result.buckets[0]);
       }
 
-      // Try to establish admin session (best-effort — only succeeds for admin users).
-      // Await it so App's immediate whoami fetch doesn't race the session cookie.
-      await loginAs(accessKey, secretKey).catch(() => null);
+      const trimmedAk = accessKey.trim();
+      const trimmedSk = secretKey.trim();
+
+      // Admin session must exist before PUT /session/s3-credentials (cookie-gated).
+      const loginAsRes = await loginAs(trimmedAk, trimmedSk);
+      if (loginAsRes.ok) {
+        setCredentials(trimmedAk, trimmedSk);
+      } else {
+        const bc = await browserSessionConnect({
+          access_key_id: trimmedAk,
+          secret_access_key: trimmedSk,
+          endpoint: cleanEndpoint,
+          bucket: getBucket(),
+        });
+        if (!bc.ok) {
+          setError(bc.error || 'Could not start browser session');
+          setLoading(false);
+          return;
+        }
+        const restored = await initFromSession();
+        if (!restored) {
+          setError('Session created but credentials could not be restored.');
+          setLoading(false);
+          return;
+        }
+      }
 
       onConnect();
     } catch (e) {

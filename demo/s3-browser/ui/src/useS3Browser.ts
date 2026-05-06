@@ -9,6 +9,7 @@ import {
 } from './adminApi';
 import useSelection from './useSelection';
 import { virtualWritableChildren } from './permissions';
+// Bulk actions → admin objects API; gate with `sessionCapabilities.canBulkOps` / `adminGui`.
 import type { S3Object } from './types';
 
 const MAX_HEAD_CACHE_SIZE = 5000;

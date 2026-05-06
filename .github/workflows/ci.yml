@@ -232,6 +232,7 @@ jobs:
         run: |
           cargo test --locked \
             --test admin_bulk_objects_test \
+            --test browser_session_connect_test \
             --test admin_config_test \
             --test admin_login_as_test \
             --test admin_section_test \

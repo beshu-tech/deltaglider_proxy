@@ -11,9 +11,11 @@ interface Props {
   onMove?: (destBucket: string, destPrefix: string) => Promise<{ succeeded: number; failed: number }>;
   onDownloadZip?: () => Promise<void>;
   deleting: boolean;
+  /** Shown when bulk handlers are omitted (e.g. browser-only session). */
+  hint?: string;
 }
 
-export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove, onDownloadZip, deleting }: Props) {
+export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove, onDownloadZip, deleting, hint }: Props) {
   const colors = useColors();
   const [modal, setModal] = useState<'copy' | 'move' | null>(null);
   const [operating, setOperating] = useState(false);
@@ -62,6 +64,11 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
       }}>
         <span style={{ flex: 1, fontSize: 13, fontFamily: 'var(--font-ui)', color: colors.TEXT_SECONDARY }}>
           {selectedCount} selected
+          {hint ? (
+            <span style={{ display: 'block', marginTop: 4, fontSize: 12, color: colors.TEXT_MUTED }}>
+              {hint}
+            </span>
+          ) : null}
         </span>
         {onCopy && (
           <Button

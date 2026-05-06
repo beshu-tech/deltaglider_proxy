@@ -323,6 +323,8 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, accountMe
   const [checkingSession, setCheckingSession] = useState(true);
   const [externalProviders, setExternalProviders] = useState<ExternalProviderInfo[]>([]);
   const [accessDenied, setAccessDenied] = useState(false);
+  /** Valid `dgp_session` but S3BrowserLift / open-lift only — not full admin GUI. */
+  const [s3BrowserSessionOnly, setS3BrowserSessionOnly] = useState(false);
   const [password, setPassword] = useState('');
   const [loginLoading, setLoginLoading] = useState(false);
   const [pendingGroupId, setPendingGroupId] = useState<number | null>(null);
@@ -438,13 +440,19 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, accountMe
   useEffect(() => {
     setCheckingSession(true);
     setAccessDenied(false);
+    setS3BrowserSessionOnly(false);
 
     (async () => {
       const info = await whoami();
       setExternalProviders(info.external_providers || []);
 
-      const hasSession = await checkSession();
-      if (hasSession) {
+      const session = await checkSession();
+      if (session.valid) {
+        if (!session.admin_gui) {
+          setS3BrowserSessionOnly(true);
+          setCheckingSession(false);
+          return;
+        }
         if (info.user?.is_admin) {
           setAuthed(true);
         } else {
@@ -497,8 +505,8 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, accountMe
   useEffect(() => {
     if (!authed) return;
     const id = setInterval(async () => {
-      const valid = await checkSession();
-      if (!valid) {
+      const session = await checkSession();
+      if (!session.valid) {
         onSessionExpired?.();
       }
     }, 5 * 60 * 1000);
@@ -843,6 +851,22 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, accountMe
       </>
     );
   };
+
+  // S3 browser cookie only (IAM browser-lift or open-mode lift)
+  if (!authed && !checkingSession && s3BrowserSessionOnly) {
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 1, background: colors.BG_BASE }}>
+        <div style={{ width: 420, padding: 40, textAlign: 'center' }}>
+          <LockOutlined style={{ fontSize: 32, color: colors.ACCENT_BLUE, marginBottom: 12 }} />
+          <div><Text strong style={{ fontSize: 18, fontFamily: 'var(--font-ui)' }}>S3 browser session</Text></div>
+          <Text type="secondary" style={{ fontSize: 13, display: 'block', marginTop: 8, marginBottom: 24 }}>
+            You are signed in for the file browser only. Open Admin with the bootstrap password or an IAM admin account (Sign in as admin from the connect screen).
+          </Text>
+          <Button type="primary" onClick={onBack} style={{ borderRadius: 10 }}>Back to Browser</Button>
+        </div>
+      </div>
+    );
+  }
 
   // Access denied (IAM user without admin permissions)
   if (!authed && !checkingSession && accessDenied) {

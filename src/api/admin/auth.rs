@@ -13,9 +13,28 @@ use subtle::ConstantTimeEq;
 
 use crate::iam::{Group, IamIndex, IamState, IamUser};
 use crate::rate_limiter;
-use crate::session::{AuthMethod, S3SessionCredentials};
+use crate::session::{AuthMethod, S3SessionCredentials, SessionKind};
 
 use super::{audit_log, AdminState};
+
+/// Marker type inserted by [`require_admin_gui_session`] into request extensions.
+/// Handlers that must never run under a browser-lift session take
+/// `Extension<AdminGuiGate>` so a mistaken route merge fails at compile time
+/// (extractor present) and is double-checked at runtime (missing extension → 500).
+#[derive(Clone, Copy, Debug)]
+pub struct AdminGuiGate;
+
+/// Constant-time secret check + `enabled` gate for IAM index users.
+/// Shared by `login-as`, `browser-session-connect`, and `POST /api/iam/identity`.
+pub(crate) fn iam_user_secret_valid(user: &IamUser, secret_access_key: &str) -> bool {
+    if !user.enabled {
+        return false;
+    }
+    use sha2::{Digest, Sha256};
+    let stored_hash = Sha256::digest(user.secret_access_key.as_bytes());
+    let provided_hash = Sha256::digest(secret_access_key.as_bytes());
+    stored_hash.ct_eq(&provided_hash).into()
+}
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
@@ -30,6 +49,9 @@ pub struct LoginResponse {
 #[derive(Serialize)]
 pub struct SessionResponse {
     valid: bool,
+    /// Full admin GUI session (config, usage scanner, etc.) — false for S3BrowserLift-only cookies.
+    #[serde(default)]
+    admin_gui: bool,
 }
 
 #[derive(Serialize)]
@@ -70,6 +92,28 @@ pub struct LoginAsRequest {
 pub struct ResolveIamIdentityRequest {
     access_key_id: String,
     secret_access_key: String,
+}
+
+/// Public IAM / legacy browser connect: session cookie + stored S3 creds (no full admin GUI).
+#[derive(Deserialize)]
+pub struct BrowserSessionConnectRequest {
+    access_key_id: String,
+    secret_access_key: String,
+    endpoint: String,
+    #[serde(default)]
+    region: Option<String>,
+    #[serde(default)]
+    bucket: String,
+}
+
+/// Open-auth mode: `POST /api/admin/session/open-browser-connect` body.
+#[derive(Deserialize)]
+pub struct OpenBrowserConnectRequest {
+    endpoint: String,
+    #[serde(default)]
+    region: Option<String>,
+    #[serde(default)]
+    bucket: String,
 }
 
 /// Whether session cookies should include the `Secure` flag (HTTPS-only).
@@ -209,6 +253,7 @@ pub async fn login(
     let token = state.sessions.create_session(
         rate_limiter::extract_client_ip(&req_headers),
         AuthMethod::Bootstrap,
+        SessionKind::AdminGui,
     );
 
     // Auto-populate S3 credentials from config so "login IS connect".
@@ -258,11 +303,18 @@ pub async fn check_session(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let client_ip = rate_limiter::extract_client_ip(&headers);
-    let valid = extract_session_token(&headers)
-        .map(|t| state.sessions.validate(&t, client_ip))
+    let token = extract_session_token(&headers);
+    let valid = token
+        .as_ref()
+        .map(|t| state.sessions.validate(t, client_ip))
+        .unwrap_or(false);
+    let admin_gui = token
+        .as_ref()
+        .filter(|_| valid)
+        .map(|t| state.sessions.allows_admin_gui(t, client_ip))
         .unwrap_or(false);
 
-    Json(SessionResponse { valid })
+    Json(SessionResponse { valid, admin_gui })
 }
 
 /// GET /api/whoami — returns current auth mode and (if session exists) the logged-in user.
@@ -316,9 +368,8 @@ pub async fn whoami(
 /// POST /api/iam/identity — verify IAM S3 credentials and return the same
 /// effective user permissions the SigV4 request path uses.
 ///
-/// This intentionally does NOT create an admin/session cookie. Non-admin S3
-/// users need their effective permissions so the browser can show prefix-scoped
-/// controls, but they must not gain access to the session-gated admin API.
+/// This does not create a session cookie (unlike [`browser_session_connect`],
+/// which mints a **S3BrowserLift** cookie for hard-refresh credential restore).
 pub async fn resolve_iam_identity(
     State(state): State<Arc<AdminState>>,
     req_headers: HeaderMap,
@@ -341,10 +392,7 @@ pub async fn resolve_iam_identity(
         return Err(StatusCode::FORBIDDEN);
     };
 
-    use sha2::{Digest, Sha256};
-    let stored_hash = Sha256::digest(user.secret_access_key.as_bytes());
-    let provided_hash = Sha256::digest(body.secret_access_key.as_bytes());
-    if stored_hash.ct_ne(&provided_hash).into() || !user.enabled {
+    if !iam_user_secret_valid(&user, &body.secret_access_key) {
         guard.record_failure();
         return Err(StatusCode::FORBIDDEN);
     }
@@ -371,6 +419,7 @@ async fn resolve_session_user(state: &AdminState, headers: &HeaderMap) -> Option
     let token = extract_session_token(headers)?;
     let auth_method = state.sessions.auth_method(&token)?;
     match auth_method {
+        crate::session::AuthMethod::OpenLift => None,
         crate::session::AuthMethod::Bootstrap => Some(WhoamiUserInfo {
             name: "admin".into(),
             access_key_id: "bootstrap".into(),
@@ -383,7 +432,8 @@ async fn resolve_session_user(state: &AdminState, headers: &HeaderMap) -> Option
                 conditions: None,
             }],
         }),
-        crate::session::AuthMethod::IamLoginAs { access_key_id } => {
+        crate::session::AuthMethod::IamLoginAs { access_key_id }
+        | crate::session::AuthMethod::IamBrowserLift { access_key_id } => {
             let user = resolve_effective_iam_user(state, &access_key_id).await?;
             let is_admin = crate::iam::permissions::is_admin(&user.permissions);
             Some(WhoamiUserInfo {
@@ -473,18 +523,10 @@ pub async fn login_as(
         }
     };
 
-    // Verify the secret key matches (critical — prevents auth bypass).
-    // Hash both sides to a fixed 32-byte digest before comparing, so that
-    // (a) comparison is constant-time, and (b) the length of the stored
-    // secret is not leaked via timing (ct_eq on unequal-length slices
-    // returns immediately).
-    use sha2::{Digest, Sha256};
-    let stored_hash = Sha256::digest(user.secret_access_key.as_bytes());
-    let provided_hash = Sha256::digest(body.secret_access_key.as_bytes());
-    if stored_hash.ct_ne(&provided_hash).into() {
+    if !iam_user_secret_valid(user, &body.secret_access_key) {
         guard.record_failure();
         tracing::warn!(
-            "Failed login-as attempt from {} (secret mismatch for '{}')",
+            "Failed login-as attempt from {} (secret mismatch or disabled '{}')",
             guard.ip(),
             body.access_key_id
         );
@@ -492,7 +534,7 @@ pub async fn login_as(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    if !user.enabled || !user.is_admin() {
+    if !user.is_admin() {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -504,6 +546,7 @@ pub async fn login_as(
         AuthMethod::IamLoginAs {
             access_key_id: body.access_key_id.clone(),
         },
+        SessionKind::AdminGui,
     );
 
     // Auto-populate S3 credentials from the IAM login so "login IS connect"
@@ -520,6 +563,192 @@ pub async fn login_as(
         user.name,
         user.access_key_id
     );
+
+    Ok((
+        StatusCode::OK,
+        [(
+            header::SET_COOKIE,
+            session_cookie(&token, state.sessions.ttl()),
+        )],
+        Json(LoginResponse { ok: true }),
+    ))
+}
+
+/// POST /api/admin/session/browser-connect — verify S3 credentials and create a
+/// **S3BrowserLift** session (cookie + stored S3 creds). Does not grant admin GUI APIs.
+///
+/// Used by the embedded browser for non-admin IAM users so hard refresh can restore creds.
+/// IAM admins should continue to use `login-as` + `PUT session/s3-credentials`.
+pub async fn browser_session_connect(
+    State(state): State<Arc<AdminState>>,
+    req_headers: HeaderMap,
+    Json(body): Json<BrowserSessionConnectRequest>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let guard = crate::rate_limiter::RateLimitGuard::enter(
+        &state.rate_limiter,
+        &req_headers,
+        "browser_session_connect",
+    )
+    .await
+    .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
+
+    let iam_state = state.iam_state.load();
+    let access_key_id = body.access_key_id.trim();
+    let secret_access_key = body.secret_access_key.as_str();
+
+    // IAM multi-user only: legacy/bootstrap use the password connect path; open mode is separate.
+    let IamState::Iam(index) = &**iam_state else {
+        guard.record_failure();
+        audit_log(
+            "browser_session_connect_denied",
+            "",
+            "non_iam_mode",
+            &req_headers,
+        );
+        return Err(StatusCode::FORBIDDEN);
+    };
+
+    let Some(user) = index.get(access_key_id) else {
+        guard.record_failure();
+        tracing::warn!(
+            "Failed browser-session-connect from {} (unknown access key '{}')",
+            guard.ip(),
+            access_key_id
+        );
+        audit_log("login_failed", "", access_key_id, &req_headers);
+        return Err(StatusCode::FORBIDDEN);
+    };
+
+    if !iam_user_secret_valid(user, secret_access_key) {
+        guard.record_failure();
+        tracing::warn!(
+            "Failed browser-session-connect from {} (secret mismatch or disabled '{}')",
+            guard.ip(),
+            access_key_id
+        );
+        audit_log("login_failed", "", access_key_id, &req_headers);
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    guard.record_success();
+    let ak = user.access_key_id.clone();
+    let ak_for_log = ak.clone();
+
+    let region = {
+        let cfg = state.config.read().await;
+        let from_backend = match &cfg.backend {
+            crate::config::BackendConfig::S3 { region, .. } => Some(region.clone()),
+            _ => None,
+        };
+        drop(cfg);
+        body.region
+            .filter(|r| !r.is_empty())
+            .or(from_backend)
+            .unwrap_or_else(|| "us-east-1".to_string())
+    };
+
+    let token = state.sessions.create_session(
+        rate_limiter::extract_client_ip(&req_headers),
+        AuthMethod::IamBrowserLift {
+            access_key_id: ak.clone(),
+        },
+        SessionKind::S3BrowserLift,
+    );
+
+    state.sessions.set_s3_creds(
+        &token,
+        S3SessionCredentials {
+            endpoint: body.endpoint,
+            region,
+            bucket: body.bucket,
+            access_key_id: ak,
+            secret_access_key: body.secret_access_key,
+        },
+    );
+
+    tracing::info!(
+        "S3 browser-lift session created for access key '{}' from {}",
+        ak_for_log,
+        guard.ip()
+    );
+
+    audit_log(
+        "browser_session_connect",
+        &user.name,
+        &ak_for_log,
+        &req_headers,
+    );
+
+    Ok((
+        StatusCode::OK,
+        [(
+            header::SET_COOKIE,
+            session_cookie(&token, state.sessions.ttl()),
+        )],
+        Json(LoginResponse { ok: true }),
+    ))
+}
+
+/// POST /api/admin/session/open-browser-connect — `authentication: none` only.
+/// Mints **S3BrowserLift** + anonymous S3 creds so open-mode UI survives hard refresh.
+pub async fn open_browser_connect(
+    State(state): State<Arc<AdminState>>,
+    req_headers: HeaderMap,
+    Json(body): Json<OpenBrowserConnectRequest>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let guard = crate::rate_limiter::RateLimitGuard::enter(
+        &state.rate_limiter,
+        &req_headers,
+        "open_browser_connect",
+    )
+    .await
+    .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
+
+    let iam_state = state.iam_state.load();
+    if !matches!(&**iam_state, IamState::Disabled) {
+        guard.record_failure();
+        audit_log(
+            "open_browser_connect_denied",
+            "",
+            "auth_required",
+            &req_headers,
+        );
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    guard.record_success();
+
+    let region = {
+        let cfg = state.config.read().await;
+        let from_backend = match &cfg.backend {
+            crate::config::BackendConfig::S3 { region, .. } => Some(region.clone()),
+            _ => None,
+        };
+        drop(cfg);
+        body.region
+            .filter(|r| !r.is_empty())
+            .or(from_backend)
+            .unwrap_or_else(|| "us-east-1".to_string())
+    };
+
+    let token = state.sessions.create_session(
+        rate_limiter::extract_client_ip(&req_headers),
+        AuthMethod::OpenLift,
+        SessionKind::S3BrowserLift,
+    );
+
+    state.sessions.set_s3_creds(
+        &token,
+        S3SessionCredentials {
+            endpoint: body.endpoint,
+            region,
+            bucket: body.bucket,
+            access_key_id: "anonymous".to_string(),
+            secret_access_key: "anonymous".to_string(),
+        },
+    );
+
+    audit_log("open_browser_connect", "open", "anonymous", &req_headers);
 
     Ok((
         StatusCode::OK,
@@ -552,6 +781,33 @@ pub async fn require_session(
             .into_response();
     }
 
+    next.run(request).await.into_response()
+}
+
+/// Middleware: valid **AdminGui** session only (rejects S3BrowserLift cookies).
+pub async fn require_admin_gui_session(
+    State(state): State<Arc<AdminState>>,
+    headers: HeaderMap,
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> impl IntoResponse {
+    let client_ip = rate_limiter::extract_client_ip(&headers);
+    let Some(token) = extract_session_token(&headers) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "unauthorized"})),
+        )
+            .into_response();
+    };
+    if !state.sessions.allows_admin_gui(&token, client_ip) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "admin_session_required"})),
+        )
+            .into_response();
+    }
+
+    request.extensions_mut().insert(AdminGuiGate);
     next.run(request).await.into_response()
 }
 

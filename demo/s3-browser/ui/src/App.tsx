@@ -13,11 +13,13 @@ import UploadPage from './components/UploadPage';
 import ConnectPage from './components/ConnectPage';
 import MetricsPage from './components/MetricsPage';
 import DocsPage from './components/DocsPage';
+import BrowserLiftBanner from './components/BrowserLiftBanner';
 import AccountMenu from './components/AccountMenu';
 import DemoDataGenerator from './components/DemoDataGenerator';
 import { getBucket, hasCredentials, disconnect, initFromSession, getCredentials } from './s3client';
 import { adminLogout, whoami, checkSession, resolveIamIdentity } from './adminApi';
 import type { WhoamiResponse } from './adminApi';
+import { deriveSessionCapabilities } from './sessionCapabilities';
 import { useColors } from './ThemeContext';
 import useComputeSize from './useComputeSize';
 import { NavigationContext } from './NavigationContext';
@@ -119,7 +121,12 @@ export default function App() {
   const [bucketCount, setBucketCount] = useState<number | null>(null);
   const [createBucketFocusSignal, setCreateBucketFocusSignal] = useState(0);
 
-  const [hasAdminSession, setHasAdminSession] = useState(false);
+  /** Any valid `dgp_session` cookie (admin GUI or S3 browser-lift). */
+  const [sessionValid, setSessionValid] = useState(false);
+  const [sessionCaps, setSessionCaps] = useState(() =>
+    deriveSessionCapabilities({ valid: false, admin_gui: false }),
+  );
+  const hasAdminSession = sessionCaps.adminGui;
   const activeBucket = getBucket();
   const writablePrefixes = useMemo(
     () => writablePrefixesForBucket(identity, activeBucket),
@@ -132,23 +139,46 @@ export default function App() {
   const changeS3Bucket = s3.changeBucket;
   const cancelFolderSizes = folderSize.cancelAll;
   const computeFolderSize = useCallback((folderPrefix: string) => {
-    if (!canRequestPrefixUsageScan(folderPrefix, s3.virtualFolders)) return;
+    if (!canRequestPrefixUsageScan(folderPrefix, s3.virtualFolders, hasAdminSession)) return;
     computeSize(folderPrefix);
-  }, [computeSize, s3.virtualFolders]);
+  }, [computeSize, s3.virtualFolders, hasAdminSession]);
 
-  // Restore credentials from server-side session on mount.
-  // Also check for admin session (OAuth sets a session cookie even if S3 creds
-  // don't have permissions — the user IS authenticated, just may lack S3 access).
+  const refreshSessionGate = useCallback(async () => {
+    const restored = await initFromSession().catch(() => false);
+    try {
+      const session = await checkSession();
+      setSessionValid(session.valid);
+      setSessionCaps(deriveSessionCapabilities(session));
+      setNeedsConnect(!(restored || session.valid));
+    } catch {
+      setSessionValid(false);
+      setSessionCaps(deriveSessionCapabilities({ valid: false, admin_gui: false }));
+      setNeedsConnect(!restored);
+    }
+  }, []);
+
+  const pollSession = useCallback(async () => {
+    try {
+      const session = await checkSession();
+      setSessionValid(session.valid);
+      setSessionCaps(deriveSessionCapabilities(session));
+    } catch {
+      /* keep last-known session snapshot on transient errors */
+    }
+  }, []);
+
+  // Restore credentials from server-side session on mount; same path after ConnectPage.
   useEffect(() => {
-    Promise.all([initFromSession(), checkSession()]).then(([restored, hasSession]) => {
-      setHasAdminSession(hasSession);
-      setNeedsConnect(!(restored || hasSession));
-    }).catch(() => {
-      setNeedsConnect(true);
-    }).finally(() => {
+    refreshSessionGate().catch(() => setNeedsConnect(true)).finally(() => {
       setSessionLoading(false);
     });
-  }, []);
+  }, [refreshSessionGate]);
+
+  useEffect(() => {
+    if (needsConnect || sessionLoading) return;
+    const id = window.setInterval(() => void pollSession(), 5 * 60 * 1000);
+    return () => clearInterval(id);
+  }, [needsConnect, sessionLoading, pollSession]);
 
   // When session is restored and we're connected, reload the S3 browser
   // and fetch identity. Runs AFTER React commits the needsConnect state.
@@ -175,7 +205,8 @@ export default function App() {
       };
     } else if (needsConnect) {
       setIdentity(null);
-      setHasAdminSession(false);
+      setSessionValid(false);
+      setSessionCaps(deriveSessionCapabilities({ valid: false, admin_gui: false }));
     }
   }, [needsConnect, reconnectS3, sessionLoading]);
 
@@ -207,16 +238,16 @@ export default function App() {
   }, [view]);
 
   // One-time stale-credential check after first load.
-  // If we have a valid admin session (e.g. from OAuth), don't bounce to ConnectPage
-  // even if S3 calls fail — the user is authenticated but may lack S3 permissions.
+  // If we have a valid session cookie (admin or browser-lift), don't bounce to ConnectPage
+  // when S3 calls fail — the user may lack S3 permissions or have a transient error.
   useEffect(() => {
     if (!s3.loading && !firstLoadDone) {
       setFirstLoadDone(true);
-      if (!s3.connected && !hasAdminSession) {
+      if (!s3.connected && !sessionValid) {
         setNeedsConnect(true);
       }
     }
-  }, [s3.loading, s3.connected, firstLoadDone, hasAdminSession]);
+  }, [s3.loading, s3.connected, firstLoadDone, sessionValid]);
 
   const handleLogout = () => {
     disconnect();
@@ -224,7 +255,8 @@ export default function App() {
     setFirstLoadDone(false);
     setNeedsConnect(true);
     setIdentity(null);
-    setHasAdminSession(false);
+    setSessionValid(false);
+    setSessionCaps(deriveSessionCapabilities({ valid: false, admin_gui: false }));
     navigate('browse');
   };
 
@@ -315,7 +347,7 @@ export default function App() {
   if (needsConnect) {
     return (
       <ConnectPage
-        onConnect={() => setNeedsConnect(false)}
+        onConnect={() => { void refreshSessionGate(); }}
         showError={hasCredentials()}
       />
     );
@@ -335,6 +367,17 @@ export default function App() {
     }
 
     if (view === 'metrics') {
+      if (!hasAdminSession) {
+        return (
+          <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 48 }}>
+            <Empty
+              description="Metrics and analytics require a full admin session (bootstrap password or IAM admin via login-as). Browser-only sessions cannot read /_/stats or admin config."
+            >
+              <Button type="primary" onClick={navigateToBrowse}>Back to Browser</Button>
+            </Empty>
+          </div>
+        );
+      }
       return <MetricsPage onBack={navigateToBrowse} />;
     }
 
@@ -365,11 +408,16 @@ export default function App() {
         {s3.selectedKeys.size > 0 && (
           <BulkActionBar
             selectedCount={s3.selectedKeys.size}
-            onDelete={canDeleteSelected ? s3.bulkDelete : undefined}
-            onCopy={canCopyFromActiveBucket ? s3.bulkCopy : undefined}
-            onMove={canMoveFromActiveBucket ? s3.bulkMove : undefined}
-            onDownloadZip={canReadSelected ? s3.downloadZip : undefined}
+            onDelete={canDeleteSelected && hasAdminSession ? s3.bulkDelete : undefined}
+            onCopy={canCopyFromActiveBucket && hasAdminSession ? s3.bulkCopy : undefined}
+            onMove={canMoveFromActiveBucket && hasAdminSession ? s3.bulkMove : undefined}
+            onDownloadZip={canReadSelected && hasAdminSession ? s3.downloadZip : undefined}
             deleting={s3.deleting}
+            hint={
+              hasAdminSession
+                ? undefined
+                : 'Bulk copy, move, ZIP, and delete use server-side admin APIs and need a full admin session (not a browser-only lift).'
+            }
           />
         )}
 
@@ -427,9 +475,10 @@ export default function App() {
               onEnrichKeys={s3.enrichKeys}
               folderSizes={folderSize.sizes}
               virtualFolders={s3.virtualFolders}
+              hasAdminSession={hasAdminSession}
               onComputeSize={computeFolderSize}
               onCancelSize={folderSize.cancel}
-              onAutoPopulateSizes={folderSize.autoPopulate}
+              onAutoPopulateSizes={hasAdminSession ? folderSize.autoPopulate : undefined}
               onPreview={setPreviewObject}
             />
           )}
@@ -457,6 +506,7 @@ export default function App() {
             canDeleteBucket={(bucket) => canUse(identity, 'admin', bucket)}
             canUpload={canUploadToActiveBucket}
             canAdmin={canAdmin}
+            includeBucketOrigins={sessionCaps.canLoadBucketOrigins}
             open={siderOpen}
             onClose={() => setSiderOpen(false)}
             isMobile={isMobile}
@@ -482,6 +532,7 @@ export default function App() {
 
           <main id="main-content" ref={mainRef} tabIndex={-1} style={{ outline: 'none', flex: 1, overflow: 'auto', display: 'flex', flexDirection: 'column' }}>
             <Content style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
+              <BrowserLiftBanner visible={view === 'browser' && sessionCaps.browserLiftOnly} />
               {renderContent()}
             </Content>
           </main>
@@ -497,6 +548,7 @@ export default function App() {
         headCache={s3.headCache}
         canDelete={canDeleteSelectedObject}
         canRead={canReadSelectedObject}
+        hasAdminSession={sessionCaps.canFetchFullAdminConfig}
       />
 
       <FilePreview

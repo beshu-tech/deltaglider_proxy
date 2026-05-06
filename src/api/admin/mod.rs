@@ -31,9 +31,11 @@ use crate::usage_scanner::UsageScanner;
 // Re-export everything so external code doesn't need import changes.
 pub use audit::get_audit;
 pub use auth::{
-    check_session, clear_s3_session_creds, get_s3_session_creds, login, login_as, logout,
-    require_not_declarative, require_session, resolve_iam_identity, set_s3_session_creds, whoami,
-    LoginAsRequest, LoginResponse, ResolveIamIdentityRequest, SessionResponse, WhoamiResponse,
+    browser_session_connect, check_session, clear_s3_session_creds, get_s3_session_creds, login,
+    login_as, logout, open_browser_connect, require_admin_gui_session, require_not_declarative,
+    require_session, resolve_iam_identity, set_s3_session_creds, whoami,
+    BrowserSessionConnectRequest, LoginAsRequest, LoginResponse, OpenBrowserConnectRequest,
+    ResolveIamIdentityRequest, SessionResponse, WhoamiResponse,
 };
 pub use backends::{create_backend, delete_backend, list_backends, list_bucket_origins};
 pub use backup::{export_backup, import_backup};

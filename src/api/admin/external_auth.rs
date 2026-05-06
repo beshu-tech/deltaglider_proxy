@@ -364,6 +364,7 @@ pub async fn oauth_callback(
             provider_name: pending.provider_name.clone(),
             user_id: user.id,
         },
+        crate::session::SessionKind::AdminGui,
     );
 
     // Auto-populate S3 credentials

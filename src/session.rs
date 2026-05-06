@@ -46,8 +46,21 @@ pub enum AuthMethod {
     Bootstrap,
     /// IAM user login via access key + secret.
     IamLoginAs { access_key_id: String },
+    /// IAM user browser connect (non-admin): cookie + stored S3 creds only.
+    IamBrowserLift { access_key_id: String },
+    /// Open-auth mode: anonymous S3 browser session (no IAM identity).
+    OpenLift,
     /// External provider login (OAuth/OIDC).
     External { provider_name: String, user_id: i64 },
+}
+
+/// Whether a session may call full admin GUI APIs (config, IAM, operator tools).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionKind {
+    /// Config, IAM, diagnostics, usage scanner, etc.
+    AdminGui,
+    /// S3 browser only: session check, logout, stored S3 credentials — no admin surface.
+    S3BrowserLift,
 }
 
 struct SessionInfo {
@@ -55,6 +68,7 @@ struct SessionInfo {
     ip: Option<IpAddr>,
     s3_creds: Option<S3SessionCredentials>,
     auth_method: AuthMethod,
+    kind: SessionKind,
 }
 
 /// Thread-safe in-memory session store.
@@ -82,10 +96,42 @@ impl SessionStore {
         self.ttl
     }
 
+    fn entry_valid(&self, info: &SessionInfo, ip: Option<IpAddr>) -> bool {
+        if info.created_at.elapsed() >= self.ttl {
+            return false;
+        }
+        if let Some(stored_ip) = info.ip {
+            match ip {
+                Some(caller_ip) if caller_ip == stored_ip => {}
+                Some(caller_ip) => {
+                    tracing::warn!(
+                        "Session IP mismatch: stored={}, caller={}",
+                        stored_ip,
+                        caller_ip
+                    );
+                    return false;
+                }
+                None => {
+                    tracing::warn!(
+                        "Session has IP binding ({}) but caller provided no IP",
+                        stored_ip
+                    );
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Create a new session and return the token (64-char hex string).
     /// Stores the client IP for later validation.
     /// If the maximum number of concurrent sessions is reached, the oldest session is evicted.
-    pub fn create_session(&self, ip: Option<IpAddr>, auth_method: AuthMethod) -> String {
+    pub fn create_session(
+        &self,
+        ip: Option<IpAddr>,
+        auth_method: AuthMethod,
+        kind: SessionKind,
+    ) -> String {
         let mut bytes = [0u8; 32];
         OsRng.fill(&mut bytes);
         let token = hex::encode(bytes);
@@ -116,6 +162,7 @@ impl SessionStore {
                 ip,
                 s3_creds: None,
                 auth_method,
+                kind,
             },
         );
 
@@ -127,35 +174,20 @@ impl SessionStore {
         let sessions = self.sessions.read();
         sessions
             .get(token)
-            .map(|info| {
-                if info.created_at.elapsed() >= self.ttl {
-                    return false;
-                }
-                // If the session was created with an IP, the caller must provide
-                // a matching IP. Missing IP (None) does not bypass the check.
-                if let Some(stored_ip) = info.ip {
-                    match ip {
-                        Some(caller_ip) if caller_ip == stored_ip => {}
-                        Some(caller_ip) => {
-                            tracing::warn!(
-                                "Session IP mismatch: stored={}, caller={}",
-                                stored_ip,
-                                caller_ip
-                            );
-                            return false;
-                        }
-                        None => {
-                            tracing::warn!(
-                                "Session has IP binding ({}) but caller provided no IP",
-                                stored_ip
-                            );
-                            return false;
-                        }
-                    }
-                }
-                true
-            })
+            .map(|info| self.entry_valid(info, ip))
             .unwrap_or(false)
+    }
+
+    /// Full admin GUI (config, IAM, operator APIs). `S3BrowserLift` sessions return false.
+    pub fn allows_admin_gui(&self, token: &str, ip: Option<IpAddr>) -> bool {
+        let sessions = self.sessions.read();
+        let Some(info) = sessions.get(token) else {
+            return false;
+        };
+        if !self.entry_valid(info, ip) {
+            return false;
+        }
+        info.kind == SessionKind::AdminGui
     }
 
     /// Remove a session (logout).
@@ -212,7 +244,7 @@ mod tests {
     #[test]
     fn test_create_and_validate() {
         let store = SessionStore::new();
-        let token = store.create_session(None, AuthMethod::Bootstrap);
+        let token = store.create_session(None, AuthMethod::Bootstrap, SessionKind::AdminGui);
         assert_eq!(token.len(), 64);
         assert!(store.validate(&token, None));
     }
@@ -226,7 +258,7 @@ mod tests {
     #[test]
     fn test_remove() {
         let store = SessionStore::new();
-        let token = store.create_session(None, AuthMethod::Bootstrap);
+        let token = store.create_session(None, AuthMethod::Bootstrap, SessionKind::AdminGui);
         assert!(store.validate(&token, None));
         store.remove(&token);
         assert!(!store.validate(&token, None));
@@ -238,7 +270,7 @@ mod tests {
         let ip1: IpAddr = "10.0.0.1".parse().unwrap();
         let ip2: IpAddr = "10.0.0.2".parse().unwrap();
 
-        let token = store.create_session(Some(ip1), AuthMethod::Bootstrap);
+        let token = store.create_session(Some(ip1), AuthMethod::Bootstrap, SessionKind::AdminGui);
 
         // Same IP works
         assert!(store.validate(&token, Some(ip1)));
@@ -253,7 +285,7 @@ mod tests {
         let store = SessionStore::new();
         let mut tokens = Vec::new();
         for _ in 0..MAX_SESSIONS {
-            tokens.push(store.create_session(None, AuthMethod::Bootstrap));
+            tokens.push(store.create_session(None, AuthMethod::Bootstrap, SessionKind::AdminGui));
         }
 
         // All sessions valid
@@ -262,7 +294,7 @@ mod tests {
         }
 
         // Add one more — oldest should be evicted
-        let new_token = store.create_session(None, AuthMethod::Bootstrap);
+        let new_token = store.create_session(None, AuthMethod::Bootstrap, SessionKind::AdminGui);
         assert!(store.validate(&new_token, None));
         assert!(!store.validate(&tokens[0], None)); // oldest evicted
         assert_eq!(store.sessions.read().len(), MAX_SESSIONS);
@@ -273,7 +305,7 @@ mod tests {
     #[test]
     fn test_auth_method_bootstrap() {
         let store = SessionStore::new();
-        let token = store.create_session(None, AuthMethod::Bootstrap);
+        let token = store.create_session(None, AuthMethod::Bootstrap, SessionKind::AdminGui);
         let method = store.auth_method(&token);
         assert!(matches!(method, Some(AuthMethod::Bootstrap)));
     }
@@ -286,6 +318,7 @@ mod tests {
             AuthMethod::IamLoginAs {
                 access_key_id: "AKTEST01".into(),
             },
+            SessionKind::AdminGui,
         );
         let method = store.auth_method(&token).unwrap();
         match method {
@@ -305,6 +338,7 @@ mod tests {
                 provider_name: "google".into(),
                 user_id: 42,
             },
+            SessionKind::AdminGui,
         );
         let method = store.auth_method(&token).unwrap();
         match method {
@@ -323,5 +357,20 @@ mod tests {
     fn test_auth_method_none_for_invalid_token() {
         let store = SessionStore::new();
         assert!(store.auth_method("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_allows_admin_gui_rejects_browser_lift() {
+        let store = SessionStore::new();
+        let admin_t = store.create_session(None, AuthMethod::Bootstrap, SessionKind::AdminGui);
+        let lift_t = store.create_session(
+            None,
+            AuthMethod::IamBrowserLift {
+                access_key_id: "AKX".into(),
+            },
+            SessionKind::S3BrowserLift,
+        );
+        assert!(store.allows_admin_gui(&admin_t, None));
+        assert!(!store.allows_admin_gui(&lift_t, None));
     }
 }

@@ -157,17 +157,24 @@ export function virtualWritableChildren(
   return Array.from(out).sort((a, b) => a.localeCompare(b));
 }
 
+/** Folder row implied only by IAM writable-prefix inference (no ListObjects entry). */
+export function isVirtualFolderPrefix(prefix: string, virtualPrefixes: Iterable<string>): boolean {
+  const normalizedPrefix = normalizeFolderPrefix(prefix);
+  if (!normalizedPrefix) return false;
+  const virtualSet = new Set(Array.from(virtualPrefixes, normalizeFolderPrefix));
+  return virtualSet.has(normalizedPrefix);
+}
+
 /**
- * Virtual folders come from IAM writable-prefix inference and are not scanable
- * by the backend usage scanner until at least one real object exists beneath them.
+ * Whether the UI may call the admin usage-scanner API for this prefix.
+ * Requires an admin GUI session; virtual prefixes are never scanned.
  */
 export function canRequestPrefixUsageScan(
   prefix: string,
   virtualPrefixes: Iterable<string>,
+  hasAdminSession: boolean,
 ): boolean {
-  const normalizedPrefix = normalizeFolderPrefix(prefix);
-  if (!normalizedPrefix) return false;
-  const virtualSet = new Set(Array.from(virtualPrefixes, normalizeFolderPrefix));
-  return !virtualSet.has(normalizedPrefix);
+  if (!hasAdminSession) return false;
+  return !isVirtualFolderPrefix(prefix, virtualPrefixes);
 }
 
