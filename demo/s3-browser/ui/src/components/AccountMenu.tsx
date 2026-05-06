@@ -233,7 +233,7 @@ export default function AccountMenu({
                   }}
                 >
                   <DownloadOutlined aria-hidden style={iconStyle} />
-                  <span>Download recovery backup</span>
+                  <span>Download backup</span>
                 </button>
               )}
               {onImportFullBackup && (
@@ -248,7 +248,7 @@ export default function AccountMenu({
                   }}
                 >
                   <UploadOutlined aria-hidden style={iconStyle} />
-                  <span>Restore recovery backup</span>
+                  <span>Restore backup</span>
                 </button>
               )}
             </div>
