@@ -55,6 +55,33 @@ function parsePath(): { view: View; subPath: string } {
   return { view, subPath };
 }
 
+
+function actionIncludesWrite(actions: string[] = []): boolean {
+  return actions.some((action) => {
+    const normalized = action.toLowerCase();
+    return normalized === '*' || normalized === 'write' || normalized === 's3:*' || normalized === 's3:putobject';
+  });
+}
+
+function firstWritablePrefix(identity: WhoamiResponse | null, bucket: string): string | null {
+  if (!identity || !bucket) return null;
+  if (identity.mode === 'open' || identity.mode === 'bootstrap' || identity.user?.is_admin) return '';
+
+  const permissions = identity.user?.permissions ?? [];
+  for (const permission of permissions) {
+    if ((permission.effect ?? 'Allow').toLowerCase() === 'deny') continue;
+    if (!actionIncludesWrite(permission.actions)) continue;
+    for (const resource of permission.resources ?? []) {
+      if (resource === bucket || resource === `${bucket}/*`) return '';
+      const prefixRoot = `${bucket}/`;
+      if (!resource.startsWith(prefixRoot) || !resource.endsWith('/*')) continue;
+      return `${resource.slice(prefixRoot.length, -1)}`;
+    }
+  }
+
+  return null;
+}
+
 function usePathRouter() {
   const [state, setState] = useState(parsePath);
   const skipNext = useRef(false);
@@ -232,7 +259,12 @@ export default function App() {
   // show Settings after whoami resolves admin/open/bootstrap authority.
   const canAdmin = identity?.mode === 'bootstrap' || identity?.mode === 'open' || identity?.user?.is_admin === true;
   const canCreateBucket = canUse(identity, 'admin');
-  const canWriteActiveBucket = Boolean(activeBucket) && canUse(identity, 'write', activeBucket, s3.prefix);
+  const canWriteActivePrefix = Boolean(activeBucket) && canUse(identity, 'write', activeBucket, s3.prefix);
+  const uploadFallbackPrefix = firstWritablePrefix(identity, activeBucket);
+  const uploadPrefix = canWriteActivePrefix
+    ? s3.prefix
+    : (uploadFallbackPrefix ?? s3.prefix);
+  const canUploadToActiveBucket = Boolean(activeBucket) && (canWriteActivePrefix || uploadFallbackPrefix !== null);
   const selectedKeys = Array.from(s3.selectedKeys);
   const canReadSelected = Boolean(activeBucket) && selectedKeys.length > 0 && selectedKeys.every((selectedKey) =>
     selectedKey.startsWith('folder:')
@@ -246,7 +278,7 @@ export default function App() {
   );
   const canReadSelectedObject = Boolean(activeBucket && s3.selected) && canUse(identity, 'read', activeBucket, s3.selected?.key ?? '');
   const canDeleteSelectedObject = Boolean(activeBucket && s3.selected) && canUse(identity, 'delete', activeBucket, s3.selected?.key ?? '');
-  const canCopyFromActiveBucket = canReadSelected && canWriteActiveBucket;
+  const canCopyFromActiveBucket = canReadSelected && canWriteActivePrefix;
   const canMoveFromActiveBucket = canCopyFromActiveBucket && canDeleteSelected;
   const canReadActiveBucket = !activeBucket || canUse(identity, 'read', activeBucket, s3.prefix) || canUse(identity, 'list', activeBucket, s3.prefix);
   const accountMenu = (includeBrowserToggles = false) => (
@@ -271,7 +303,7 @@ export default function App() {
     setCreateBucketFocusSignal((n) => n + 1);
   };
   const openUpload = () => {
-    if (!canWriteActiveBucket) return;
+    if (!canUploadToActiveBucket) return;
     navigate('upload');
     setSiderOpen(false);
   };
@@ -327,7 +359,7 @@ export default function App() {
     }
 
     if (view === 'upload') {
-      if (!canWriteActiveBucket) {
+      if (!canUploadToActiveBucket) {
         return (
           <Empty
             description="You do not have permission to upload to this bucket."
@@ -337,7 +369,7 @@ export default function App() {
       }
       return (
         <UploadPage
-          prefix={s3.prefix}
+          prefix={uploadPrefix}
           onBack={navigateToBrowse}
           onDone={() => s3.mutate()}
         />
@@ -380,7 +412,7 @@ export default function App() {
                   Create a bucket
                 </Button>
               )}
-              {isRootBucketEmpty && canWriteActiveBucket && (
+              {isRootBucketEmpty && canUploadToActiveBucket && (
                 <Space direction="vertical" size={4} align="center">
                   <DemoDataGenerator
                     onDone={s3.mutate}
@@ -438,7 +470,7 @@ export default function App() {
             createBucketFocusSignal={createBucketFocusSignal}
             canCreateBucket={canCreateBucket}
             canDeleteBucket={(bucket) => canUse(identity, 'admin', bucket)}
-            canUpload={canWriteActiveBucket}
+            canUpload={canUploadToActiveBucket}
             open={siderOpen}
             onClose={() => setSiderOpen(false)}
             isMobile={isMobile}
@@ -486,7 +518,7 @@ export default function App() {
         object={previewObject}
         onClose={() => setPreviewObject(null)}
       />
-      {view === 'browser' && canWriteActiveBucket && <DropZone onDrop={s3.uploadFiles} prefix={s3.prefix} />}
+      {view === 'browser' && canWriteActivePrefix && <DropZone onDrop={s3.uploadFiles} prefix={s3.prefix} />}
     </Layout>
     </NavigationContext.Provider>
   );
