@@ -523,6 +523,7 @@ impl FilesystemBackend {
         Ok(data)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn put_object_file(
         &self,
         bucket: &str,

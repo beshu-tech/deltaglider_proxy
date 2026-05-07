@@ -38,6 +38,38 @@ pub struct OAuthCallbackQuery {
     error_description: Option<String>,
 }
 
+/// Pure validator for the `?next=...` deep-link parameter on the
+/// OAuth authorize endpoint.
+///
+/// Pre-fix this validator only checked `starts_with("/_/")`,
+/// `!contains("://")`, `!contains("\\")`. Control bytes (CR, LF,
+/// NUL, the rest of 0x00–0x1F, plus space and the high half of
+/// 0x7F–0xFF) survived the filter, ended up stored in
+/// `PendingAuth.redirect_to`, and crashed the OAuth callback when
+/// `Response::builder().header(LOCATION, ...).body(...).unwrap()`
+/// rejected them as invalid header bytes (E-P0-1).
+///
+/// Post-fix every byte must be printable visible ASCII
+/// (0x21..=0x7E). Anything else → `None`. Open-redirect protection
+/// (`/_/` prefix, no scheme, no backslash) preserved.
+pub(crate) fn sanitize_next_param(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with("/_/") {
+        return None;
+    }
+    if trimmed.contains("://") || trimmed.contains("\\") {
+        return None;
+    }
+    // Only printable visible ASCII (no space — legitimate paths use
+    // `%20`; the URL parser has already percent-decoded any encoded
+    // bytes by the time we see them, so a literal space here would
+    // be an injection attempt).
+    if !trimmed.bytes().all(|b| (0x21..=0x7E).contains(&b)) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
 /// GET /api/admin/oauth/authorize/:provider — initiate OAuth flow.
 /// Returns 302 redirect to the provider's authorization endpoint.
 /// Accepts optional `?next=/path` for post-login deep linking.
@@ -56,16 +88,7 @@ pub async fn oauth_authorize(
         }
     };
 
-    // Validate and sanitize the `next` parameter — must be a local path starting with /_/
-    // to prevent open redirect attacks.
-    let next_url = params.next.and_then(|n| {
-        let trimmed = n.trim();
-        if trimmed.starts_with("/_/") && !trimmed.contains("://") && !trimmed.contains("\\") {
-            Some(trimmed.to_string())
-        } else {
-            None // Reject anything that's not a safe local path
-        }
-    });
+    let next_url = params.next.and_then(|n| sanitize_next_param(&n));
 
     // Build redirect URI from the request's Host header
     let redirect_uri = build_callback_uri(&req_headers);
@@ -417,13 +440,38 @@ pub async fn oauth_callback(
     );
 
     // Build the response manually to ensure Set-Cookie is included with the redirect.
-    Response::builder()
+    //
+    // Defence-in-depth: the `next` validator at top of the authorize
+    // handler already filters control bytes out of `redirect_to`, so
+    // `header(LOCATION, redirect_to)` should never reject the value.
+    // But if a future refactor weakens that validator, `.unwrap()`
+    // here would panic on attacker-controlled input (E-P0-1). Map a
+    // builder failure to "redirect to /_/browse with the cookie" so
+    // the request can never panic the task.
+    match Response::builder()
         .status(StatusCode::FOUND)
         .header(header::LOCATION, redirect_to)
-        .header(header::SET_COOKIE, cookie)
+        .header(header::SET_COOKIE, &cookie)
         .body(axum::body::Body::empty())
-        .unwrap()
-        .into_response()
+    {
+        Ok(resp) => resp.into_response(),
+        Err(e) => {
+            tracing::error!(
+                "OAuth callback: failed to build redirect response (redirect_to={:?}): {}",
+                redirect_to,
+                e
+            );
+            Response::builder()
+                .status(StatusCode::FOUND)
+                .header(header::LOCATION, "/_/browse")
+                .header(header::SET_COOKIE, cookie)
+                .body(axum::body::Body::empty())
+                .map(|r| r.into_response())
+                .unwrap_or_else(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "redirect failed").into_response()
+                })
+        }
+    }
 }
 
 // ── Provider CRUD (protected endpoints) ──
@@ -867,4 +915,65 @@ fn symmetric_diff_count(a: &[i64], b: &[i64]) -> usize {
     let in_a_not_b = a.iter().filter(|x| !b.contains(x)).count();
     let in_b_not_a = b.iter().filter(|x| !a.contains(x)).count();
     in_a_not_b + in_b_not_a
+}
+
+#[cfg(test)]
+mod sanitize_next_param_tests {
+    use super::sanitize_next_param;
+
+    #[test]
+    fn accepts_safe_local_paths() {
+        assert_eq!(
+            sanitize_next_param("/_/admin/configuration"),
+            Some("/_/admin/configuration".to_string())
+        );
+        assert_eq!(
+            sanitize_next_param("/_/browse?prefix=foo/bar"),
+            Some("/_/browse?prefix=foo/bar".to_string())
+        );
+        // Trim is applied.
+        assert_eq!(
+            sanitize_next_param("  /_/admin  "),
+            Some("/_/admin".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_open_redirect_attempts() {
+        // External URL.
+        assert_eq!(sanitize_next_param("https://evil.example.com/"), None);
+        // Protocol-relative URL.
+        assert_eq!(sanitize_next_param("//evil.example.com/"), None);
+        // Backslash-trick.
+        assert_eq!(sanitize_next_param("/_/\\evil.com"), None);
+        // Wrong prefix.
+        assert_eq!(sanitize_next_param("/admin/x"), None);
+        // Empty.
+        assert_eq!(sanitize_next_param(""), None);
+    }
+
+    /// E-P0-1 regression: control bytes survived the pre-fix
+    /// validator and crashed the OAuth callback when later passed
+    /// to `Response::builder().header(LOCATION, ...)`. They MUST
+    /// be rejected up-front.
+    #[test]
+    fn rejects_control_bytes() {
+        // CR / LF (the classic header-injection attempt).
+        assert_eq!(sanitize_next_param("/_/admin\r\nX-Evil: 1"), None);
+        // NUL byte.
+        assert_eq!(sanitize_next_param("/_/admin\0"), None);
+        // SOH (0x01) — the agent's specific repro example.
+        assert_eq!(sanitize_next_param("/_/admin\u{0001}x"), None);
+        // DEL (0x7F).
+        assert_eq!(sanitize_next_param("/_/admin\u{007F}"), None);
+        // Non-ASCII unicode (anything ≥ 0x80).
+        assert_eq!(sanitize_next_param("/_/админ"), None);
+    }
+
+    #[test]
+    fn rejects_literal_space_inside() {
+        // Legitimate paths use %20; a literal space here is an
+        // injection attempt or malformed input.
+        assert_eq!(sanitize_next_param("/_/admin path"), None);
+    }
 }
