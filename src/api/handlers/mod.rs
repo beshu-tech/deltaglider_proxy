@@ -7,6 +7,7 @@
 //! - `status` — Health check and aggregate stats
 
 mod bucket;
+mod form_post;
 mod multipart;
 mod object;
 mod object_helpers;
