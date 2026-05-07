@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.9.17 — 2026-05-07
+
 ## v0.9.16 — 2026-05-07
 
 ### Correctness x-ray fix programme
