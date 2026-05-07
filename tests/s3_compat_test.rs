@@ -16,10 +16,6 @@ use common::{
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-fn using_s3s_adapter() -> bool {
-    matches!(std::env::var("DGP_S3_ADAPTER"), Ok(v) if v.eq_ignore_ascii_case("s3s"))
-}
-
 // ============================================================================
 // 1.5 Per-Request UUID + Accept-Ranges
 // ============================================================================
@@ -2301,10 +2297,6 @@ fn derive_post_signing_key(secret: &str, date: &str, region: &str) -> [u8; 32] {
 
 #[tokio::test]
 async fn test_form_post_upload_succeeds_with_presigned_policy() {
-    if using_s3s_adapter() {
-        eprintln!("skipping form POST compatibility test on s3s adapter");
-        return;
-    }
     let server = TestServer::builder()
         .auth("POSTACCESSKEY", "POSTSECRETKEY123")
         .build()
@@ -2369,11 +2361,7 @@ async fn test_form_post_upload_succeeds_with_presigned_policy() {
 }
 
 #[tokio::test]
-async fn test_form_post_upload_rejects_unsupported_success_status() {
-    if using_s3s_adapter() {
-        eprintln!("skipping form POST compatibility test on s3s adapter");
-        return;
-    }
+async fn test_form_post_upload_rejects_invalid_signature() {
     let server = TestServer::builder()
         .auth("POSTACCESSKEY", "POSTSECRETKEY123")
         .build()
@@ -2403,8 +2391,7 @@ async fn test_form_post_upload_rejects_unsupported_success_status() {
         .text("x-amz-algorithm", "AWS4-HMAC-SHA256")
         .text("x-amz-credential", credential)
         .text("x-amz-date", amz_date)
-        .text("x-amz-signature", signature)
-        .text("success_action_status", "201")
+        .text("x-amz-signature", format!("{signature}00"))
         .part(
             "file",
             reqwest::multipart::Part::bytes(b"body".to_vec())
@@ -2420,13 +2407,13 @@ async fn test_form_post_upload_rejects_unsupported_success_status() {
         .unwrap();
     assert_eq!(
         resp.status().as_u16(),
-        501,
-        "Unsupported success_action_status should return 501"
+        403,
+        "Invalid POST policy signature should return 403"
     );
     let body = resp.text().await.unwrap();
     assert!(
-        body.contains("NotImplemented"),
-        "Unsupported form option should return NotImplemented XML, got: {}",
+        body.contains("SignatureDoesNotMatch"),
+        "Invalid POST signature should return SignatureDoesNotMatch XML, got: {}",
         body
     );
 }

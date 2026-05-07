@@ -634,6 +634,12 @@ fn build_s3s_router(
     let s3_service = HandleError::new(builder.build(), handle_s3s_http_error);
 
     let mut router = Router::new()
+        // s3s currently doesn't handle browser form POST uploads (`POST /bucket`
+        // multipart/form-data with SigV4 policy fields). Route bucket POST to the
+        // existing axum handler so both DeleteObjects and presigned form uploads
+        // share the same compatibility path as the legacy adapter.
+        .route("/:bucket", axum::routing::post(delete_objects))
+        .route("/:bucket/", axum::routing::post(delete_objects))
         .fallback_service(s3_service)
         .layer(middleware::from_fn(add_s3_request_id))
         .layer(TraceLayer::new_for_http())
