@@ -849,11 +849,126 @@ mod tests {
         let (_, key) = parse_copy_source(&headers).unwrap();
         assert_eq!(key, "a//b.txt");
     }
+
+    // ── H-P1-1: RFC 7232 §6 conditional precedence on GET/HEAD ──
+
+    fn dummy_metadata_for_conditional(etag_md5: &str, mtime: chrono::DateTime<chrono::Utc>) -> FileMetadata {
+        let mut m = FileMetadata::new_passthrough(
+            "test.bin".to_string(),
+            "0".repeat(64),
+            etag_md5.to_string(),
+            10,
+            None,
+        );
+        m.created_at = mtime;
+        m
+    }
+
+    fn headers_pair(name1: &str, val1: &str, name2: &str, val2: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::HeaderName::from_bytes(name1.as_bytes()).unwrap(),
+            val1.parse().unwrap(),
+        );
+        h.insert(
+            axum::http::HeaderName::from_bytes(name2.as_bytes()).unwrap(),
+            val2.parse().unwrap(),
+        );
+        h
+    }
+
+    /// `If-Match` matches → 200, even with a `If-Unmodified-Since` that
+    /// would have failed on its own. The header pair is RFC 7232's
+    /// canonical example of "If-Match wins".
+    #[test]
+    fn if_match_suppresses_unmodified_since() {
+        let now = chrono::Utc::now();
+        let meta = dummy_metadata_for_conditional("d41d8cd98f00b204e9800998ecf8427e", now);
+        let etag = meta.etag();
+
+        // Last-Modified is "now"; If-Unmodified-Since asks for something
+        // OLDER than now → would 412. But If-Match matches → suppress.
+        let one_year_ago = (now - chrono::Duration::days(365))
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+        let headers = headers_pair(
+            "if-match",
+            &etag,
+            "if-unmodified-since",
+            &one_year_ago,
+        );
+
+        assert!(
+            check_conditionals(&headers, &meta).is_none(),
+            "If-Match must suppress If-Unmodified-Since per RFC 7232 §6"
+        );
+    }
+
+    /// Same shape, sister case: `If-None-Match` mismatches → 200, even
+    /// with an `If-Modified-Since` that would have returned 304.
+    #[test]
+    fn if_none_match_suppresses_modified_since() {
+        let now = chrono::Utc::now();
+        let meta = dummy_metadata_for_conditional("d41d8cd98f00b204e9800998ecf8427e", now);
+
+        // `If-None-Match` doesn't match (different etag) → handler
+        // proceeds. But `If-Modified-Since: now+1day` would say "not
+        // modified" since `last_modified <= date`. Per RFC, the
+        // mismatched If-None-Match is the authority — suppress.
+        let in_a_day = (now + chrono::Duration::days(1))
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+        let headers = headers_pair(
+            "if-none-match",
+            "\"definitely-different-etag\"",
+            "if-modified-since",
+            &in_a_day,
+        );
+
+        assert!(
+            check_conditionals(&headers, &meta).is_none(),
+            "If-None-Match (mismatching) must suppress If-Modified-Since per RFC 7232 §6"
+        );
+    }
+
+    /// Without `If-Match`, `If-Unmodified-Since` IS consulted as
+    /// before. Sanity check that we didn't break the standalone path.
+    #[test]
+    fn if_unmodified_since_works_alone() {
+        let now = chrono::Utc::now();
+        let meta = dummy_metadata_for_conditional("d41d8cd98f00b204e9800998ecf8427e", now);
+
+        let one_year_ago = (now - chrono::Duration::days(365))
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+        let mut headers = HeaderMap::new();
+        headers.insert("if-unmodified-since", one_year_ago.parse().unwrap());
+
+        assert!(matches!(
+            check_conditionals(&headers, &meta),
+            Some(S3Error::PreconditionFailed)
+        ));
+    }
 }
 
 /// Check conditional request headers against object metadata.
 /// Returns Some(S3Error) if a conditional check fails, None if all pass.
-/// Evaluation order per S3/HTTP spec: If-Match -> If-Unmodified-Since -> If-None-Match -> If-Modified-Since.
+///
+/// Per RFC 7232 §6 evaluation order on GET/HEAD:
+///   1. `If-Match` — if present, it is the authority. `If-Unmodified-Since`
+///      is then **ignored** (whether the entity-tag matched or not).
+///   2. `If-Unmodified-Since` — only consulted if `If-Match` was absent.
+///   3. `If-None-Match` — if present, it is the authority. `If-Modified-Since`
+///      is then **ignored**.
+///   4. `If-Modified-Since` — only consulted if `If-None-Match` was absent.
+///
+/// H-P1-1: pre-fix this function evaluated all four headers as
+/// independent linear checks. A request like
+/// `If-Match: "<current>"` + `If-Unmodified-Since: <past-date>` would
+/// pass (1), then fail (2), returning a spurious 412 where AWS S3
+/// (and the s3s adapter implementation in this crate) correctly
+/// returns 200. Compare-and-swap clients that combine both headers
+/// for belt-and-braces semantics broke.
 pub(super) fn check_conditionals(
     req_headers: &HeaderMap,
     metadata: &FileMetadata,
@@ -861,8 +976,9 @@ pub(super) fn check_conditionals(
     let etag = metadata.etag();
     let last_modified = metadata.created_at;
 
-    // 1. If-Match: 412 if ETag doesn't match
-    if let Some(if_match) = req_headers.get("if-match").and_then(|v| v.to_str().ok()) {
+    // 1/2. If-Match suppresses If-Unmodified-Since per RFC 7232 §6.
+    let if_match = req_headers.get("if-match").and_then(|v| v.to_str().ok());
+    if let Some(if_match) = if_match {
         let matches = if_match.split(',').any(|t| {
             let t = t.trim();
             t == "*" || t == etag || t.trim_matches('"') == etag.trim_matches('"')
@@ -870,10 +986,7 @@ pub(super) fn check_conditionals(
         if !matches {
             return Some(S3Error::PreconditionFailed);
         }
-    }
-
-    // 2. If-Unmodified-Since: 412 if modified after the date
-    if let Some(if_unmod) = req_headers
+    } else if let Some(if_unmod) = req_headers
         .get("if-unmodified-since")
         .and_then(|v| v.to_str().ok())
     {
@@ -889,11 +1002,11 @@ pub(super) fn check_conditionals(
         .format("%a, %d %b %Y %H:%M:%S GMT")
         .to_string();
 
-    // 3. If-None-Match: 304 if ETag matches
-    if let Some(if_none_match) = req_headers
+    // 3/4. If-None-Match suppresses If-Modified-Since per RFC 7232 §6.
+    let if_none_match = req_headers
         .get("if-none-match")
-        .and_then(|v| v.to_str().ok())
-    {
+        .and_then(|v| v.to_str().ok());
+    if let Some(if_none_match) = if_none_match {
         let matches = if_none_match.split(',').any(|t| {
             let t = t.trim();
             t == "*" || t == etag || t.trim_matches('"') == etag.trim_matches('"')
@@ -904,10 +1017,7 @@ pub(super) fn check_conditionals(
                 last_modified: last_modified_str.clone(),
             });
         }
-    }
-
-    // 4. If-Modified-Since: 304 if not modified after date
-    if let Some(if_mod) = req_headers
+    } else if let Some(if_mod) = req_headers
         .get("if-modified-since")
         .and_then(|v| v.to_str().ok())
     {
