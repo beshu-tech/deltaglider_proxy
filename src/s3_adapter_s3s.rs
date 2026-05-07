@@ -431,20 +431,40 @@ impl s3s::S3 for DeltaGliderS3Service {
     ) -> s3s::S3Result<s3s::S3Response<s3s::dto::DeleteBucketOutput>> {
         let bucket = req.input.bucket;
         let engine = self.state.engine.load();
+
+        // Check object emptiness first: only visible objects are hard blockers.
+        // Mirror the axum handler in `src/api/handlers/bucket.rs::delete_bucket`
+        // — keep both adapters' contracts in sync.
         let page = engine
             .list_objects(&bucket, "", None, 1, None, false)
             .await
             .map_err(engine_error_to_s3s)?;
         let has_objects = !page.objects.is_empty();
+        let first_object = page.objects.first().map(|(key, _)| key.as_str());
+
         let mpu_count = self.state.multipart.count_uploads_for_bucket(&bucket);
-        if has_objects || mpu_count > 0 {
+        if has_objects {
+            let sample = first_object.unwrap_or("<unknown>");
             return Err(s3s::s3_error!(
                 BucketNotEmpty,
-                "Bucket delete blocked: objects_present={}, multipart_uploads={}",
-                has_objects,
+                "{} (blocked: visible object remains, example_key={}, multipart_uploads={}; action: delete user objects first)",
+                bucket,
+                sample,
                 mpu_count
             ));
         }
+
+        // For object-empty buckets, MPU state is internal residue: purge it
+        // deterministically so deletion is self-healing and frictionless.
+        if mpu_count > 0 {
+            let purged = self.state.multipart.purge_uploads_for_bucket(&bucket);
+            tracing::info!(
+                "DELETE bucket {} purged {} multipart upload residues before deletion",
+                bucket,
+                purged
+            );
+        }
+
         engine
             .delete_bucket(&bucket)
             .await
