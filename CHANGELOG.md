@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## v0.9.14 — 2026-05-07
+
+### Multipart complete memory bound fix
+
+- Fixed the CI-blocking `memory_test` regression by changing MPU relay policy to
+  threshold-triggered promotion instead of always-relay for passthrough uploads.
+- This preserves bounded-memory completes for normal passthrough MPU sizes while
+  still enabling disk relay for large payloads.
+- Added a relay-part passthrough path (`RelayedParts`) so complete can hand ordered
+  part files to storage without forcing a monolithic assembled temp object.
+- Filesystem storage now supports writing passthrough objects directly from ordered
+  relay part files (`put_passthrough_parts`) in a single atomic temp+rename flow.
+
 ## v0.9.13 — 2026-05-07
 
 ### Multipart passthrough relay and cleanup hardening

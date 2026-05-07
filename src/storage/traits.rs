@@ -4,7 +4,7 @@ use crate::types::FileMetadata;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{self, BoxStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 /// Bucket listing entry with optional routing-origin metadata.
@@ -209,6 +209,25 @@ pub trait StorageBackend: Send + Sync {
     ) -> Result<(), StorageError> {
         let data = tokio::fs::read(source_path).await?;
         self.put_passthrough(bucket, prefix, filename, &data, metadata)
+            .await
+    }
+
+    /// Store a passthrough file from ordered relay part paths.
+    /// Default implementation materializes an intermediate file in-memory.
+    async fn put_passthrough_parts(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        part_paths: &[PathBuf],
+        metadata: &FileMetadata,
+    ) -> Result<(), StorageError> {
+        let mut assembled = Vec::new();
+        for path in part_paths {
+            let part = tokio::fs::read(path).await?;
+            assembled.extend_from_slice(&part);
+        }
+        self.put_passthrough(bucket, prefix, filename, &assembled, metadata)
             .await
     }
 

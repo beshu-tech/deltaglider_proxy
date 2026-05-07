@@ -66,20 +66,14 @@ fn initiate_multipart_upload(
 
     let content_type = extract_content_type(headers);
     let user_metadata = extract_user_metadata(headers);
-    let engine = state.engine.load();
     let delta_limit = mpu_delta_reconstruct_max_bytes();
-    let is_delta_eligible = engine.is_delta_eligible(key);
     let upload_id = state.multipart.create_with_relay_policy(
         bucket,
         key,
         content_type,
         user_metadata,
-        if is_delta_eligible {
-            Some(delta_limit)
-        } else {
-            None
-        },
-        !is_delta_eligible,
+        Some(delta_limit),
+        false,
     )?;
 
     let xml = InitiateMultipartUploadResult {
@@ -176,20 +170,18 @@ async fn complete_multipart_upload(
                     )
                     .await
             }
-            crate::multipart::PassthroughPayload::RelayedFile(path) => {
-                let result = engine
-                    .store_passthrough_file_with_multipart_etag(
+            crate::multipart::PassthroughPayload::RelayedParts(paths) => {
+                engine
+                    .store_passthrough_relayed_parts_with_multipart_etag(
                         bucket,
                         key,
-                        &path,
+                        &paths,
                         completed.total_size,
                         completed.content_type,
                         completed.user_metadata,
                         etag.clone(),
                     )
-                    .await;
-                let _ = std::fs::remove_file(&path);
-                result
+                    .await
             }
         };
         match store_outcome {

@@ -836,6 +836,43 @@ impl StorageBackend for FilesystemBackend {
         Ok(())
     }
 
+    #[instrument(skip(self, part_paths, metadata))]
+    async fn put_passthrough_parts(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        part_paths: &[PathBuf],
+        metadata: &FileMetadata,
+    ) -> Result<(), StorageError> {
+        self.require_bucket_exists(bucket).await?;
+        let data_path = self.passthrough_path(bucket, prefix, filename);
+        self.ensure_dir(&data_path).await?;
+        let parent = data_path
+            .parent()
+            .ok_or_else(|| StorageError::Other("Cannot write to a path with no parent".into()))?
+            .to_path_buf();
+        let target = data_path.clone();
+        let parts: Vec<PathBuf> = part_paths.to_vec();
+        let meta_json = serde_json::to_vec(metadata)?;
+
+        tokio::task::spawn_blocking(move || {
+            let mut tmp = NamedTempFile::new_in(&parent).map_err(io_to_storage_error)?;
+            for path in &parts {
+                let mut src = std::fs::File::open(path).map_err(io_to_storage_error)?;
+                std::io::copy(&mut src, &mut tmp).map_err(io_to_storage_error)?;
+            }
+            xattr::set(tmp.path(), xattr_meta::XATTR_NAME, &meta_json)
+                .map_err(io_to_storage_error)?;
+            tmp.as_file().sync_all().map_err(io_to_storage_error)?;
+            tmp.persist(&target)
+                .map_err(|e| io_to_storage_error(e.error))?;
+            Ok(())
+        })
+        .await
+        .map_err(super::join_error)?
+    }
+
     #[instrument(skip(self))]
     async fn get_passthrough_metadata(
         &self,

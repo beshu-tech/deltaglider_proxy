@@ -654,12 +654,10 @@ impl s3s::S3 for DeltaGliderS3Service {
     ) -> s3s::S3Result<s3s::S3Response<s3s::dto::CreateMultipartUploadOutput>> {
         let input = req.input;
         ensure_bucket_exists_s3s(&self.state, &input.bucket).await?;
-        let engine = self.state.engine.load();
         let delta_limit = crate::config::env_parse_with_default(
             "DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES",
             64 * 1024 * 1024,
         );
-        let is_delta_eligible = engine.is_delta_eligible(&input.key);
         let upload_id = self
             .state
             .multipart
@@ -668,12 +666,8 @@ impl s3s::S3 for DeltaGliderS3Service {
                 &input.key,
                 input.content_type.clone(),
                 input.metadata.unwrap_or_default(),
-                if is_delta_eligible {
-                    Some(delta_limit)
-                } else {
-                    None
-                },
-                !is_delta_eligible,
+                Some(delta_limit),
+                false,
             )
             .map_err(engine_error_to_s3s)?;
         Ok(s3s::S3Response::new(
@@ -816,20 +810,18 @@ impl s3s::S3 for DeltaGliderS3Service {
                         )
                         .await
                 }
-                crate::multipart::PassthroughPayload::RelayedFile(path) => {
-                    let result = engine
-                        .store_passthrough_file_with_multipart_etag(
+                crate::multipart::PassthroughPayload::RelayedParts(paths) => {
+                    engine
+                        .store_passthrough_relayed_parts_with_multipart_etag(
                             &input.bucket,
                             &input.key,
-                            &path,
+                            &paths,
                             completed.total_size,
                             completed.content_type,
                             completed.user_metadata,
                             etag.clone(),
                         )
-                        .await;
-                    let _ = std::fs::remove_file(&path);
-                    result
+                        .await
                 }
             };
             match store_result {

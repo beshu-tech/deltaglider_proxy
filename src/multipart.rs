@@ -121,7 +121,7 @@ pub struct CompletedParts {
 
 pub enum PassthroughPayload {
     Chunks(Vec<Bytes>),
-    RelayedFile(PathBuf),
+    RelayedParts(Vec<PathBuf>),
 }
 
 pub struct CompletedPassthrough {
@@ -483,7 +483,7 @@ impl MultipartStore {
         }
 
         let (validated, upload) =
-            self.validate_parts(&uploads, upload_id, bucket, key, requested_parts)?;
+            self.validate_parts(&uploads, upload_id, bucket, key, requested_parts, true)?;
 
         let mut assembled = BytesMut::new();
         for part in &validated.part_data {
@@ -529,7 +529,7 @@ impl MultipartStore {
         }
 
         let (validated, upload) =
-            self.validate_parts(&uploads, upload_id, bucket, key, requested_parts)?;
+            self.validate_parts(&uploads, upload_id, bucket, key, requested_parts, true)?;
 
         let result = CompletedParts {
             parts: validated.part_data,
@@ -568,14 +568,24 @@ impl MultipartStore {
             }
         }
 
-        let (validated, upload) =
-            self.validate_parts(&uploads, upload_id, bucket, key, requested_parts)?;
+        let hydrate_part_data = uploads
+            .get(upload_id)
+            .map(|u| matches!(u.relay_strategy, RelayStrategy::InMemory { .. }))
+            .ok_or_else(|| S3Error::NoSuchUpload(upload_id.to_string()))?;
+        let (validated, upload) = self.validate_parts(
+            &uploads,
+            upload_id,
+            bucket,
+            key,
+            requested_parts,
+            hydrate_part_data,
+        )?;
 
         let payload = match &upload.relay_strategy {
             RelayStrategy::InMemory { .. } => PassthroughPayload::Chunks(validated.part_data),
-            RelayStrategy::Relayed { relay_dir } => {
-                let assembled_path = assemble_relayed_parts(relay_dir, requested_parts, upload)?;
-                PassthroughPayload::RelayedFile(assembled_path)
+            RelayStrategy::Relayed { relay_dir: _ } => {
+                let ordered_paths = ordered_relay_part_paths(requested_parts, upload)?;
+                PassthroughPayload::RelayedParts(ordered_paths)
             }
         };
 
@@ -632,7 +642,7 @@ impl MultipartStore {
         freed
     }
 
-    /// Shared validation for `complete()` and `complete_parts()`.
+    /// Shared validation for complete variants.
     ///
     /// Looks up the upload, validates part ordering and ETags, enforces size limits,
     /// and computes the S3-compatible multipart ETag. Returns validated part data
@@ -644,6 +654,7 @@ impl MultipartStore {
         bucket: &str,
         key: &str,
         requested_parts: &[(u32, String)],
+        hydrate_part_data: bool,
     ) -> Result<(ValidatedParts, &'a MultipartUpload), S3Error> {
         let upload = uploads
             .get(upload_id)
@@ -693,7 +704,9 @@ impl MultipartStore {
             }
 
             md5_concat.extend_from_slice(&part.md5_raw);
-            part_data.push(part.payload.load_bytes()?);
+            if hydrate_part_data {
+                part_data.push(part.payload.load_bytes()?);
+            }
         }
 
         // S3-compatible multipart ETag: MD5(concat of part MD5 raw bytes)-N
@@ -1013,45 +1026,25 @@ fn write_part_file(path: &Path, data: &Bytes) -> Result<(), S3Error> {
     Ok(())
 }
 
-fn assemble_relayed_parts(
-    relay_dir: &Path,
+fn ordered_relay_part_paths(
     requested_parts: &[(u32, String)],
     upload: &MultipartUpload,
-) -> Result<PathBuf, S3Error> {
-    fs::create_dir_all(relay_dir)
-        .map_err(|e| S3Error::InternalError(format!("Failed to prepare relay directory: {}", e)))?;
-    let assembled_path = relay_dir.join("assembled.bin");
-    let mut tmp = NamedTempFile::new_in(relay_dir).map_err(|e| {
-        S3Error::InternalError(format!("Failed to create assembled relay tmp file: {}", e))
-    })?;
+) -> Result<Vec<PathBuf>, S3Error> {
+    let mut paths = Vec::with_capacity(requested_parts.len());
     for (part_number, _) in requested_parts {
         let part = upload.parts.get(part_number).ok_or_else(|| {
             S3Error::InvalidPart(format!("Part {} has not been uploaded", part_number))
         })?;
         match &part.payload {
-            PartPayload::InMemory(bytes) => tmp.write_all(bytes).map_err(|e| {
-                S3Error::InternalError(format!("Failed to write relayed in-memory part: {}", e))
-            })?,
-            PartPayload::RelayedFile(path) => {
-                let mut src = fs::File::open(path).map_err(|e| {
-                    S3Error::InternalError(format!("Failed to open relayed part: {}", e))
-                })?;
-                std::io::copy(&mut src, &mut tmp).map_err(|e| {
-                    S3Error::InternalError(format!("Failed to assemble relayed parts: {}", e))
-                })?;
+            PartPayload::RelayedFile(path) => paths.push(path.clone()),
+            PartPayload::InMemory(_) => {
+                return Err(S3Error::InternalError(
+                    "Relay upload contains in-memory part unexpectedly".to_string(),
+                ))
             }
         }
     }
-    tmp.as_file().sync_all().map_err(|e| {
-        S3Error::InternalError(format!("Failed to sync assembled relay file: {}", e))
-    })?;
-    tmp.persist(&assembled_path).map_err(|e| {
-        S3Error::InternalError(format!(
-            "Failed to persist assembled relay file: {}",
-            e.error
-        ))
-    })?;
-    Ok(assembled_path)
+    Ok(paths)
 }
 
 fn cleanup_relay_dir_for_upload(upload: &MultipartUpload) {
@@ -1796,12 +1789,16 @@ mod tests {
             .unwrap();
         assert_eq!(completed.total_size, 10);
         match completed.payload {
-            PassthroughPayload::RelayedFile(path) => {
-                let data = std::fs::read(path).unwrap();
+            PassthroughPayload::RelayedParts(paths) => {
+                assert_eq!(paths.len(), 2);
+                let mut data = Vec::new();
+                for path in paths {
+                    data.extend_from_slice(&std::fs::read(path).unwrap());
+                }
                 assert_eq!(data, b"helloworld");
             }
             PassthroughPayload::Chunks(_) => {
-                panic!("expected relayed file payload for always-relay upload")
+                panic!("expected relayed part payload for always-relay upload")
             }
         }
     }
