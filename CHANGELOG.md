@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.9.16 — 2026-05-07
+
 ### Correctness x-ray fix programme
 
 A focused audit by five specialised investigators (concurrency, auth,
