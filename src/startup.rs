@@ -297,37 +297,31 @@ pub fn build_s3_router(
     public_prefix_snapshot: &deltaglider_proxy::bucket_policy::SharedPublicPrefixSnapshot,
     admission_chain: &deltaglider_proxy::admission::SharedAdmissionChain,
 ) -> Router {
-    // Move-A status (architectural review):
+    // Move-A status (architectural review, corrected):
     //
-    // The `s3s-adapter` feature is **experimental**, not the
-    // production path. Production Docker builds (Dockerfile)
-    // intentionally compile WITHOUT this feature, so production
-    // traffic always hits the axum router below. The s3s adapter
-    // exists in CI as a research path toward replacing axum with a
-    // protocol-conformance-driven implementation.
+    // **s3s is the destination, not a research branch.** The s3s
+    // adapter exists explicitly to replace the bespoke axum-handler
+    // S3 implementation with the upstream `s3s` crate's
+    // protocol-driven surface. The migration is in flight: every
+    // change to the axum handlers gets parity-tested against s3s
+    // (tests/s3s_adapter_parity_test.rs) so behavioural drift is
+    // caught early.
     //
-    // Pre-fix the default below was `"s3s"` — but only when the
-    // feature flag was on, which is never on in production. The
-    // confusion of "s3s is default everywhere" vs "axum is what
-    // ships" was exactly what the architectural review flagged. Now
-    // axum is the default in BOTH compilations. Operators who want
-    // to test s3s explicitly opt in with `DGP_S3_ADAPTER=s3s` AND
-    // a feature-flagged build.
+    // When the `s3s-adapter` feature is compiled in,
+    // `DGP_S3_ADAPTER` defaults to `s3s`. Operators can roll back
+    // to the legacy axum path with `DGP_S3_ADAPTER=axum` if a
+    // regression is found; that's the safety valve, not the
+    // intended path.
     //
-    // Removal plan (deferred): once we have a real protocol
-    // conformance fixture (Java AWS SDK + boto3 + s3-tests), pick
-    // the empirical winner. If axum stays: delete `s3_adapter_s3s.rs`
-    // (1823 LOC) + `build_s3s_router` (~400 LOC) + the
-    // `add_s3_request_id` XML rewrite middleware (~100 LOC) + the
-    // 5 conditional-evaluator parallels + the 2 ensure_bucket_exists
-    // parallels + the feature flag. Total ~2400 LOC reclaim.
+    // Production Dockerfile currently builds WITHOUT this feature,
+    // so production traffic still hits the axum legacy router.
+    // Getting s3s into the production image is the next concrete
+    // step (Move A). See `docs/dev/s3-adapter-decision.md`.
     #[cfg(feature = "s3s-adapter")]
     {
-        let adapter = std::env::var("DGP_S3_ADAPTER").unwrap_or_else(|_| "axum".to_string());
+        let adapter = std::env::var("DGP_S3_ADAPTER").unwrap_or_else(|_| "s3s".to_string());
         if adapter.eq_ignore_ascii_case("s3s") {
-            tracing::warn!(
-                "S3 adapter: s3s path ENABLED via DGP_S3_ADAPTER=s3s (experimental; not the production default)"
-            );
+            info!("S3 adapter: s3s path enabled (default; set DGP_S3_ADAPTER=axum to roll back)");
             return build_s3s_router(
                 state,
                 iam_state,
@@ -342,11 +336,11 @@ pub fn build_s3_router(
         }
         if !adapter.eq_ignore_ascii_case("axum") {
             tracing::warn!(
-                "Unknown DGP_S3_ADAPTER='{}'; using axum (the default)",
+                "Unknown DGP_S3_ADAPTER='{}'; falling back to legacy Axum S3 adapter",
                 adapter
             );
         } else {
-            info!("S3 adapter: axum path enabled (default)");
+            info!("S3 adapter: legacy Axum path enabled (DGP_S3_ADAPTER=axum)");
         }
     }
 
