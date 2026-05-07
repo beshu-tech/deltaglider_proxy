@@ -208,6 +208,20 @@ fn trust_proxy_headers() -> bool {
 /// `DGP_TRUST_PROXY_HEADERS=true` and have your proxy set these headers,
 /// or consider adding axum `ConnectInfo` support in the future.
 pub fn extract_client_ip(headers: &axum::http::HeaderMap) -> Option<IpAddr> {
+    extract_client_ip_with_peer(headers, None)
+}
+
+/// Extract client IP from trusted proxy headers or peer socket fallback.
+///
+/// Resolution order:
+/// 1. Trusted proxy headers (`X-Forwarded-For`, `X-Real-IP`) when
+///    `DGP_TRUST_PROXY_HEADERS=true`.
+/// 2. Direct peer socket IP from axum `ConnectInfo` (when provided).
+/// 3. `None` if neither source is available.
+pub fn extract_client_ip_with_peer(
+    headers: &axum::http::HeaderMap,
+    peer_ip: Option<IpAddr>,
+) -> Option<IpAddr> {
     if trust_proxy_headers() {
         // Check X-Forwarded-For header (first IP is the client)
         if let Some(xff) = headers.get("x-forwarded-for") {
@@ -230,7 +244,7 @@ pub fn extract_client_ip(headers: &axum::http::HeaderMap) -> Option<IpAddr> {
         }
     }
 
-    None
+    peer_ip.map(normalize_ip)
 }
 
 /// Collapse IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) back to their
@@ -309,10 +323,8 @@ pub struct RateLimitGuard<'a> {
 impl<'a> RateLimitGuard<'a> {
     /// Begin rate-limit-protected execution.
     ///
-    /// 1. Extract client IP from headers (with UNSPECIFIED fallback so the
-    ///    limiter still counts failures when proxy-header extraction is
-    ///    disabled — shared-UNSPECIFIED-bucket behavior matches what each
-    ///    hand-rolled site did before this abstraction).
+    /// 1. Extract client IP from trusted headers (when enabled) or peer socket
+    ///    IP (`ConnectInfo`) and then apply the historical UNSPECIFIED fallback.
     /// 2. Check lockout. On lockout: log a SECURITY event and return
     ///    `Err(Blocked { ip, failure_count })` — the caller must return
     ///    their 429 response without proceeding.
@@ -325,9 +337,11 @@ impl<'a> RateLimitGuard<'a> {
     pub async fn enter(
         rl: &'a RateLimiter,
         headers: &axum::http::HeaderMap,
+        peer_ip: Option<IpAddr>,
         event_prefix: &'static str,
     ) -> Result<Self, Blocked> {
-        let ip = extract_client_ip(headers).unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        let ip = extract_client_ip_with_peer(headers, peer_ip)
+            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
         if rl.is_limited(&ip) {
             let failure_count = rl.failure_count(&ip);
             tracing::warn!(
@@ -422,6 +436,15 @@ mod tests {
         let headers = axum::http::HeaderMap::new();
         let ip = extract_client_ip(&headers);
         assert_eq!(ip, None, "should return None when no proxy headers present");
+    }
+
+    #[test]
+    fn test_extract_client_ip_uses_peer_when_proxy_headers_untrusted() {
+        let _g = env_lock();
+        std::env::remove_var("DGP_TRUST_PROXY_HEADERS");
+        let headers = axum::http::HeaderMap::new();
+        let peer = Some(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)));
+        assert_eq!(extract_client_ip_with_peer(&headers, peer), peer);
     }
 
     #[test]

@@ -1,19 +1,23 @@
 import {
   S3Client,
   ListObjectsV2Command,
+  type ListObjectsV2CommandOutput,
   HeadObjectCommand,
-  PutObjectCommand,
+  type HeadObjectCommandOutput,
   DeleteObjectCommand,
   GetObjectCommand,
+  type GetObjectCommandOutput,
   ListBucketsCommand,
+  type ListBucketsCommandOutput,
   CreateBucketCommand,
   DeleteBucketCommand,
 } from '@aws-sdk/client-s3';
-import type { ListObjectsV2CommandOutput } from '@aws-sdk/client-s3';
+import { Upload } from '@aws-sdk/lib-storage';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import type { S3Object, ListResult, BucketInfo } from './types';
 import { detectDefaultEndpoint } from './utils';
-import { getBucketOrigins } from './adminApi';
+import { createBucketOnBackend, getBucketOrigins } from './adminApi';
+import { normalizeS3Error } from './errorHandling';
 import {
   fetchSessionCredentials,
   storeSessionCredentials,
@@ -117,23 +121,31 @@ function getClient(): S3Client {
   return cachedClient;
 }
 
+async function sendCommand<T>(command: object, context: string): Promise<T> {
+  try {
+    return await getClient().send(command as never) as T;
+  } catch (err) {
+    throw normalizeS3Error(err, context);
+  }
+}
+
 const MAX_LIST_PAGES = 10; // ~10,000 objects max
 
 export async function listObjects(prefix = ''): Promise<ListResult> {
-  const client = getClient();
   const allObjects: S3Object[] = [];
   const folderSet = new Set<string>();
   let continuationToken: string | undefined;
   let isTruncated = false;
 
   for (let page = 0; page < MAX_LIST_PAGES; page++) {
-    const resp: ListObjectsV2CommandOutput = await client.send(
+    const resp: ListObjectsV2CommandOutput = await sendCommand<ListObjectsV2CommandOutput>(
       new ListObjectsV2Command({
         Bucket: activeBucket,
         Prefix: prefix || undefined,
         Delimiter: '/',
         ContinuationToken: continuationToken,
-      })
+      }),
+      `List objects in bucket ${activeBucket}`
     );
 
     for (const cp of resp.CommonPrefixes || []) {
@@ -171,13 +183,14 @@ export async function listCommonPrefixes(bucket: string, prefix = ''): Promise<s
   const cleanBucket = bucket.trim();
   if (!cleanBucket) return [];
 
-  const resp = await getClient().send(
+  const resp = await sendCommand<ListObjectsV2CommandOutput>(
     new ListObjectsV2Command({
       Bucket: cleanBucket,
       Prefix: prefix || undefined,
       Delimiter: '/',
       MaxKeys: 100,
-    })
+    }),
+    `List prefixes in bucket ${cleanBucket}`
   );
 
   return (resp.CommonPrefixes || [])
@@ -191,9 +204,9 @@ export async function headObject(key: string): Promise<{
   storageType?: string;
   storedSize?: number;
 }> {
-  const client = getClient();
-  const headResp = await client.send(
-    new HeadObjectCommand({ Bucket: activeBucket, Key: key })
+  const headResp = await sendCommand<HeadObjectCommandOutput>(
+    new HeadObjectCommand({ Bucket: activeBucket, Key: key }),
+    `Read object metadata for ${key}`,
   );
   const headers: Record<string, string> = {};
 
@@ -227,26 +240,42 @@ export async function headObject(key: string): Promise<{
 }
 
 export async function uploadObject(key: string, data: Blob | ArrayBuffer): Promise<void> {
-  const client = getClient();
-  const body = data instanceof Blob ? new Uint8Array(await data.arrayBuffer()) : new Uint8Array(data);
-  await client.send(
-    new PutObjectCommand({
-      Bucket: activeBucket,
-      Key: key,
-      Body: body,
-      ContentType: 'application/octet-stream',
-    })
-  );
+  const body = data instanceof Blob ? data : new Uint8Array(data);
+  const contentType = data instanceof Blob && data.type ? data.type : 'application/octet-stream';
+  try {
+    // Managed upload uses multipart automatically for large payloads and
+    // retries failed parts individually (critical for long uploads through
+    // flaky gateways/proxies).
+    const upload = new Upload({
+      client: getClient(),
+      params: {
+        Bucket: activeBucket,
+        Key: key,
+        Body: body,
+        ContentType: contentType,
+      },
+      partSize: 16 * 1024 * 1024, // 16 MiB parts
+      queueSize: 4, // bounded browser/network concurrency
+      leavePartsOnError: false,
+    });
+    await upload.done();
+  } catch (err) {
+    throw normalizeS3Error(err, `Upload object ${key}`);
+  }
 }
 
 export async function deleteObject(key: string): Promise<void> {
-  const client = getClient();
-  await client.send(new DeleteObjectCommand({ Bucket: activeBucket, Key: key }));
+  await sendCommand(
+    new DeleteObjectCommand({ Bucket: activeBucket, Key: key }),
+    `Delete object ${key}`,
+  );
 }
 
 export async function downloadObject(key: string): Promise<Blob> {
-  const client = getClient();
-  const resp = await client.send(new GetObjectCommand({ Bucket: activeBucket, Key: key }));
+  const resp = await sendCommand<GetObjectCommandOutput>(
+    new GetObjectCommand({ Bucket: activeBucket, Key: key }),
+    `Download object ${key}`,
+  );
   if (!resp.Body) throw new Error('Empty response body');
   // resp.Body is a ReadableStream in the browser
   const stream = resp.Body as ReadableStream<Uint8Array>;
@@ -261,9 +290,13 @@ export async function downloadObject(key: string): Promise<Blob> {
 }
 
 export async function getPresignedUrl(key: string, expiresInSeconds = 7 * 24 * 3600 - 1): Promise<string> {
-  const client = getClient();
-  const command = new GetObjectCommand({ Bucket: activeBucket, Key: key });
-  return getSignedUrl(client, command, { expiresIn: expiresInSeconds });
+  try {
+    const client = getClient();
+    const command = new GetObjectCommand({ Bucket: activeBucket, Key: key });
+    return await getSignedUrl(client, command, { expiresIn: expiresInSeconds });
+  } catch (err) {
+    throw normalizeS3Error(err, `Create presigned URL for ${key}`);
+  }
 }
 
 export function getObjectUrl(key: string): string {
@@ -296,7 +329,7 @@ export async function testConnection(
     const buckets = (resp.Buckets || []).map((b) => b.Name || '').filter(Boolean);
     return { ok: true, buckets };
   } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    return { ok: false, error: normalizeS3Error(e, 'Test S3 connection').message };
   }
 }
 
@@ -312,12 +345,11 @@ type ListBucketsOptions = {
 
 export async function listBuckets(opts?: ListBucketsOptions): Promise<BucketInfo[]> {
   const includeOrigins = opts?.includeOrigins !== false;
-  const client = getClient();
   const originsPromise = includeOrigins
     ? getBucketOrigins().catch(() => null)
     : Promise.resolve(null);
   const [resp, origins] = await Promise.all([
-    client.send(new ListBucketsCommand({})),
+    sendCommand<ListBucketsCommandOutput>(new ListBucketsCommand({}), 'List buckets'),
     originsPromise,
   ]);
   const originByName = new Map((origins?.buckets || []).map((b) => [b.name, b]));
@@ -339,13 +371,18 @@ export async function listBuckets(opts?: ListBucketsOptions): Promise<BucketInfo
   });
 }
 
-export async function createBucket(name: string): Promise<void> {
-  const client = getClient();
-  await client.send(new CreateBucketCommand({ Bucket: name }));
+export async function createBucket(name: string, backendName?: string): Promise<void> {
+  if (backendName) {
+    await createBucketOnBackend(name, backendName);
+    return;
+  }
+  await sendCommand(new CreateBucketCommand({ Bucket: name }), `Create bucket ${name}`);
 }
 
 export async function deleteBucket(name: string): Promise<void> {
-  const client = getClient();
-  await client.send(new DeleteBucketCommand({ Bucket: name }));
+  await sendCommand(
+    new DeleteBucketCommand({ Bucket: name }),
+    `Delete bucket ${name}`,
+  );
 }
 

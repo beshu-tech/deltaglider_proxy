@@ -25,7 +25,7 @@ use dashmap::DashMap;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use tracing::{debug, info, warn};
 use zeroize::Zeroize;
@@ -34,6 +34,28 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Shared replay cache type: signature string -> timestamp of first use.
 pub type ReplayCache = Arc<DashMap<String, Instant>>;
+
+const MAX_REPLAY_ENTRIES: usize = 500_000;
+
+fn prune_replay_cache(cache: &ReplayCache, replay_window: Duration, max_entries: usize) {
+    // Pass 1: cheap TTL cleanup.
+    cache.retain(|_, instant| instant.elapsed() < replay_window);
+    let len_after_ttl = cache.len();
+    if len_after_ttl <= max_entries {
+        return;
+    }
+
+    // Pass 2: hard-cap oldest signatures first.
+    let mut by_oldest: Vec<(String, Instant)> = cache
+        .iter()
+        .map(|entry| (entry.key().clone(), *entry.value()))
+        .collect();
+    by_oldest.sort_by_key(|(_, seen_at)| *seen_at);
+    let to_remove = len_after_ttl - max_entries;
+    for (sig, _) in by_oldest.into_iter().take(to_remove) {
+        cache.remove(&sig);
+    }
+}
 
 /// Request extension carrying the SigV4-signed payload hash from
 /// `x-amz-content-sha256`. Inserted by the SigV4 middleware after
@@ -77,6 +99,38 @@ impl SignedPayloadHash {
     pub fn requires_chunk_signature_verification(&self) -> bool {
         let v = self.0.as_str();
         v.starts_with("STREAMING-AWS4-HMAC-") || v.starts_with("STREAMING-AWS4-ECDSA-")
+    }
+
+    /// H1 SigV4 integrity check: confirm the body's actual SHA-256 matches
+    /// the value the client signed in `x-amz-content-sha256`. The signature
+    /// covers the canonical request which only sees the header value, not
+    /// the body bytes — so a credentialed client could otherwise sign hash
+    /// A and ship body B unless the receiver verifies downstream.
+    ///
+    /// Sentinels that disable verification:
+    ///   * `UNSIGNED-PAYLOAD` — client opted out (returns Ok).
+    ///   * `STREAMING-*` variants — per-chunk signature scheme; we don't
+    ///     verify the chunk-signature chain, so accepting them here would
+    ///     advertise integrity we do not enforce. Returns `NotImplemented`.
+    ///
+    /// Comparison uses `subtle::ConstantTimeEq` to deny timing-side-channel
+    /// inference of the signed hash.
+    pub fn verify_against_body(&self, body: &[u8]) -> Result<(), super::S3Error> {
+        if self.requires_chunk_signature_verification() {
+            return Err(super::S3Error::NotImplemented(
+                "Signed AWS streaming payloads are not supported; use UNSIGNED-PAYLOAD or non-streaming SHA-256 payloads".to_string(),
+            ));
+        }
+        if !self.is_verifiable_hex() {
+            return Ok(());
+        }
+        let actual = hex::encode(Sha256::digest(body));
+        let matches: bool =
+            ConstantTimeEq::ct_eq(actual.as_bytes(), self.as_str().as_bytes()).into();
+        if !matches {
+            return Err(super::S3Error::BadDigest);
+        }
+        Ok(())
     }
 }
 
@@ -512,8 +566,12 @@ pub async fn sigv4_auth_middleware(
     let rate_limiter = request.extensions().get::<RateLimiter>().cloned();
     let replay_cache = request.extensions().get::<ReplayCache>().cloned();
 
-    // Extract client IP for rate limiting
-    let client_ip = rate_limiter::extract_client_ip(request.headers());
+    // Extract client IP for rate limiting/session security.
+    let peer_ip = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip());
+    let client_ip = rate_limiter::extract_client_ip_with_peer(request.headers(), peer_ip);
 
     // Extract audit fields from request headers before the closure captures them
     let (audit_ip, audit_ua) = crate::audit::extract_client_info(request.headers());
@@ -769,22 +827,17 @@ pub async fn sigv4_auth_middleware(
             // No replay detection for presigned URLs or idempotent methods
         } else {
             // Cap replay cache size to prevent memory exhaustion under attack.
-            // Evict expired entries first; only if still over cap, evict oldest half.
-            let replay_window = std::time::Duration::from_secs(
-                crate::config::env_parse_with_default("DGP_REPLAY_WINDOW_SECS", 2),
-            );
-
-            const MAX_REPLAY_ENTRIES: usize = 500_000;
+            // First drop expired entries, then enforce a hard oldest-first cap.
+            let replay_window = Duration::from_secs(crate::config::env_parse_with_default(
+                "DGP_REPLAY_WINDOW_SECS",
+                2,
+            ));
+            prune_replay_cache(cache, replay_window, MAX_REPLAY_ENTRIES);
             if cache.len() > MAX_REPLAY_ENTRIES {
-                // First pass: evict expired entries
-                cache.retain(|_, instant| instant.elapsed() < replay_window);
-                // If still over cap after eviction, log warning (genuine flood)
-                if cache.len() > MAX_REPLAY_ENTRIES {
-                    warn!(
-                    "SECURITY | Replay cache still at {} entries after eviction — possible flood attack",
+                warn!(
+                    "SECURITY | Replay cache still at {} entries after hard-cap eviction — possible flood attack",
                     cache.len()
                 );
-                }
             }
 
             let sig = &params.signature;
@@ -1041,6 +1094,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn test_parse_auth_header() {
@@ -1163,6 +1217,28 @@ mod tests {
         let result2 = hmac_sha256(b"key", b"data");
         assert_eq!(result1, result2);
         assert_eq!(result1.len(), 32);
+    }
+
+    #[test]
+    fn replay_cache_pruning_enforces_hard_cap() {
+        let cache: ReplayCache = Arc::new(DashMap::new());
+        for i in 0..10 {
+            cache.insert(format!("sig-{i}"), Instant::now());
+        }
+        prune_replay_cache(&cache, Duration::from_secs(60), 3);
+        assert!(cache.len() <= 3);
+    }
+
+    #[test]
+    fn replay_cache_pruning_removes_expired_entries_before_size_eviction() {
+        let cache: ReplayCache = Arc::new(DashMap::new());
+        cache.insert("expired".into(), Instant::now() - Duration::from_secs(20));
+        cache.insert("fresh-1".into(), Instant::now());
+        cache.insert("fresh-2".into(), Instant::now());
+        prune_replay_cache(&cache, Duration::from_secs(5), 10);
+        assert!(!cache.contains_key("expired"));
+        assert!(cache.contains_key("fresh-1"));
+        assert!(cache.contains_key("fresh-2"));
     }
 
     // ── AWS-parity regression tests for anonymous LIST authz ──

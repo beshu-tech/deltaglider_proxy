@@ -1,12 +1,13 @@
 //! Auth handlers: login, logout, login_as, whoami, check_session, require_session.
 
 use axum::{
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use subtle::ConstantTimeEq;
@@ -196,9 +197,17 @@ pub(super) fn extract_session_token(headers: &HeaderMap) -> Option<String> {
         })
 }
 
+fn request_client_ip(
+    headers: &HeaderMap,
+    connect_info: Option<&ConnectInfo<SocketAddr>>,
+) -> Option<IpAddr> {
+    rate_limiter::extract_client_ip_with_peer(headers, connect_info.map(|ci| ci.0.ip()))
+}
+
 /// POST /api/admin/login — verify password, set session cookie.
 pub async fn login(
     State(state): State<Arc<AdminState>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     req_headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> impl IntoResponse {
@@ -207,6 +216,7 @@ pub async fn login(
     let guard = match crate::rate_limiter::RateLimitGuard::enter(
         &state.rate_limiter,
         &req_headers,
+        connect_info.as_ref().map(|ci| ci.0.ip()),
         "admin",
     )
     .await
@@ -251,7 +261,7 @@ pub async fn login(
     // Successful login — reset rate limiter for this IP
     guard.record_success();
     let token = state.sessions.create_session(
-        rate_limiter::extract_client_ip(&req_headers),
+        request_client_ip(&req_headers, connect_info.as_ref()),
         AuthMethod::Bootstrap,
         SessionKind::AdminGui,
     );
@@ -319,9 +329,10 @@ pub async fn logout(State(state): State<Arc<AdminState>>, headers: HeaderMap) ->
 /// GET /api/admin/session — check if current session is valid.
 pub async fn check_session(
     State(state): State<Arc<AdminState>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let client_ip = rate_limiter::extract_client_ip(&headers);
+    let client_ip = request_client_ip(&headers, connect_info.as_ref());
     let token = extract_session_token(&headers);
     let valid = token
         .as_ref()
@@ -339,6 +350,7 @@ pub async fn check_session(
 /// GET /api/whoami — returns current auth mode and (if session exists) the logged-in user.
 pub async fn whoami(
     State(state): State<Arc<AdminState>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
 ) -> Json<WhoamiResponse> {
     let iam_state = state.iam_state.load();
@@ -349,7 +361,12 @@ pub async fn whoami(
     };
 
     // If caller has a valid session, resolve user identity.
-    let user = resolve_session_user(&state, &headers).await;
+    let user = resolve_session_user(
+        &state,
+        &headers,
+        request_client_ip(&headers, connect_info.as_ref()),
+    )
+    .await;
 
     // Include enabled external auth providers so the login page can show OAuth buttons.
     let external_providers = if let Some(ref ext_auth) = state.external_auth {
@@ -391,12 +408,14 @@ pub async fn whoami(
 /// which mints a **S3BrowserLift** cookie for hard-refresh credential restore).
 pub async fn resolve_iam_identity(
     State(state): State<Arc<AdminState>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     req_headers: HeaderMap,
     Json(body): Json<ResolveIamIdentityRequest>,
 ) -> Result<Json<WhoamiResponse>, StatusCode> {
     let guard = crate::rate_limiter::RateLimitGuard::enter(
         &state.rate_limiter,
         &req_headers,
+        connect_info.as_ref().map(|ci| ci.0.ip()),
         "resolve_iam_identity",
     )
     .await
@@ -434,9 +453,13 @@ pub async fn resolve_iam_identity(
 }
 
 /// Resolve user info from the session cookie (if present and valid).
-async fn resolve_session_user(state: &AdminState, headers: &HeaderMap) -> Option<WhoamiUserInfo> {
+async fn resolve_session_user(
+    state: &AdminState,
+    headers: &HeaderMap,
+    client_ip: Option<IpAddr>,
+) -> Option<WhoamiUserInfo> {
     let token = extract_session_token(headers)?;
-    let auth_method = state.sessions.auth_method(&token)?;
+    let auth_method = state.sessions.auth_method(&token, client_ip)?;
     match auth_method {
         crate::session::AuthMethod::OpenLift => None,
         crate::session::AuthMethod::Bootstrap => Some(WhoamiUserInfo {
@@ -514,13 +537,18 @@ fn resolve_effective_iam_user_from_parts(
 /// Requires both access_key_id AND secret_access_key for authentication.
 pub async fn login_as(
     State(state): State<Arc<AdminState>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     req_headers: HeaderMap,
     Json(body): Json<LoginAsRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let guard =
-        crate::rate_limiter::RateLimitGuard::enter(&state.rate_limiter, &req_headers, "login_as")
-            .await
-            .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
+    let guard = crate::rate_limiter::RateLimitGuard::enter(
+        &state.rate_limiter,
+        &req_headers,
+        connect_info.as_ref().map(|ci| ci.0.ip()),
+        "login_as",
+    )
+    .await
+    .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
 
     let iam_state = state.iam_state.load();
     let user = match &**iam_state {
@@ -561,7 +589,7 @@ pub async fn login_as(
     guard.record_success();
 
     let token = state.sessions.create_session(
-        rate_limiter::extract_client_ip(&req_headers),
+        request_client_ip(&req_headers, connect_info.as_ref()),
         AuthMethod::IamLoginAs {
             access_key_id: body.access_key_id.clone(),
         },
@@ -600,12 +628,14 @@ pub async fn login_as(
 /// IAM admins should continue to use `login-as` + `PUT session/s3-credentials`.
 pub async fn browser_session_connect(
     State(state): State<Arc<AdminState>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     req_headers: HeaderMap,
     Json(body): Json<BrowserSessionConnectRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let guard = crate::rate_limiter::RateLimitGuard::enter(
         &state.rate_limiter,
         &req_headers,
+        connect_info.as_ref().map(|ci| ci.0.ip()),
         "browser_session_connect",
     )
     .await
@@ -667,7 +697,7 @@ pub async fn browser_session_connect(
     };
 
     let token = state.sessions.create_session(
-        rate_limiter::extract_client_ip(&req_headers),
+        request_client_ip(&req_headers, connect_info.as_ref()),
         AuthMethod::IamBrowserLift {
             access_key_id: ak.clone(),
         },
@@ -712,12 +742,14 @@ pub async fn browser_session_connect(
 /// Mints **S3BrowserLift** + anonymous S3 creds so open-mode UI survives hard refresh.
 pub async fn open_browser_connect(
     State(state): State<Arc<AdminState>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     req_headers: HeaderMap,
     Json(body): Json<OpenBrowserConnectRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let guard = crate::rate_limiter::RateLimitGuard::enter(
         &state.rate_limiter,
         &req_headers,
+        connect_info.as_ref().map(|ci| ci.0.ip()),
         "open_browser_connect",
     )
     .await
@@ -751,7 +783,7 @@ pub async fn open_browser_connect(
     };
 
     let token = state.sessions.create_session(
-        rate_limiter::extract_client_ip(&req_headers),
+        request_client_ip(&req_headers, connect_info.as_ref()),
         AuthMethod::OpenLift,
         SessionKind::S3BrowserLift,
     );
@@ -787,7 +819,11 @@ pub async fn require_session(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> impl IntoResponse {
-    let client_ip = rate_limiter::extract_client_ip(&headers);
+    let peer_ip = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip());
+    let client_ip = rate_limiter::extract_client_ip_with_peer(&headers, peer_ip);
     let valid = extract_session_token(&headers)
         .map(|t| state.sessions.validate(&t, client_ip))
         .unwrap_or(false);
@@ -810,7 +846,11 @@ pub async fn require_admin_gui_session(
     mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> impl IntoResponse {
-    let client_ip = rate_limiter::extract_client_ip(&headers);
+    let peer_ip = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip());
+    let client_ip = rate_limiter::extract_client_ip_with_peer(&headers, peer_ip);
     let Some(token) = extract_session_token(&headers) else {
         return (
             StatusCode::UNAUTHORIZED,

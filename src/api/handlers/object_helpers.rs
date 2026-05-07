@@ -2,8 +2,8 @@
 //! PUT/COPY internals, multipart upload parts, and body decoding.
 
 use super::{
-    base64_decode, build_object_headers, extract_content_type, extract_user_metadata, header_value,
-    xml_response, AppState, ObjectQuery, S3Error,
+    base64_decode, build_object_headers, ensure_bucket_exists, extract_content_type,
+    extract_user_metadata, header_value, xml_response, AppState, ObjectQuery, S3Error,
 };
 use crate::event_outbox::{current_unix_seconds, EventKind, EventSource, NewEvent};
 use crate::iam::{AuthenticatedUser, S3Action};
@@ -155,39 +155,6 @@ pub(super) fn check_quota(
 }
 
 // ---------------------------------------------------------------------------
-// Bucket existence precheck (shared by PUT, COPY, multipart Complete)
-// ---------------------------------------------------------------------------
-
-/// Verify that `bucket` exists on the storage backend BEFORE any write path
-/// is allowed to proceed. This closes a silent-bucket-creation bug on the
-/// filesystem backend (C2 from security audit): `ensure_dir` at
-/// `src/storage/filesystem.rs::ensure_dir` calls `create_dir_all(parent)`,
-/// which quietly creates the bucket root directory as a side effect of the
-/// first PUT. That bypasses `s3:CreateBucket`-equivalent authorization and
-/// diverges from the S3 backend (which rejects with `NoSuchBucket`).
-///
-/// This precheck + the belt-and-braces guard in `FilesystemBackend::put_*`
-/// (which refuses to write when the bucket root is missing) together
-/// produce a consistent cross-backend contract: writes to a non-existent
-/// bucket always return `NoSuchBucket`, never implicitly create.
-pub(super) async fn ensure_bucket_exists(
-    state: &Arc<AppState>,
-    bucket: &str,
-) -> Result<(), S3Error> {
-    let engine = state.engine.load();
-    match engine.head_bucket(bucket).await {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(S3Error::NoSuchBucket(bucket.to_string())),
-        Err(e) => {
-            // Map engine errors through the existing conversion so e.g. a
-            // missing underlying backend still surfaces as a meaningful
-            // error instead of a mysterious 500.
-            Err(S3Error::from(e))
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // PUT / COPY internals
 // ---------------------------------------------------------------------------
 
@@ -206,40 +173,20 @@ pub(super) async fn put_object_inner(
 
     validate_content_md5(headers, body)?;
 
-    // H1 SigV4 fix: when the SigV4 middleware successfully verified a
-    // signature over a 64-char hex `x-amz-content-sha256`, the actual
-    // body's SHA-256 must match that value. Without this check, a
-    // credentialed client could sign hash A and ship body B — the
-    // signature is computed over the canonical request which only
-    // sees the header value, not the body bytes. SigV4's integrity
-    // contract requires the receiver to verify the body downstream.
-    //
-    // Sentinel values that disable verification (we record the value
-    // but don't enforce a hash match): UNSIGNED-PAYLOAD (client
-    // explicitly opted out) and STREAMING-* variants (per-chunk
-    // signature scheme; see aws_chunked.rs for chunk-chain handling).
+    // H1 SigV4 integrity check — see `SignedPayloadHash::verify_against_body`
+    // for the full rationale. We log a tagged warning before propagating
+    // BadDigest so log scrapers can fingerprint mismatch attempts.
     if let Some(claimed) = signed_payload_hash {
-        if claimed.requires_chunk_signature_verification() {
-            return Err(S3Error::NotImplemented(
-                "Signed AWS streaming payloads are not supported; use UNSIGNED-PAYLOAD or non-streaming SHA-256 payloads".to_string(),
-            ));
-        }
-        if claimed.is_verifiable_hex() {
-            use sha2::{Digest, Sha256};
-            let actual = hex::encode(Sha256::digest(body.as_ref()));
-            let matches: bool =
-                subtle::ConstantTimeEq::ct_eq(actual.as_bytes(), claimed.as_str().as_bytes())
-                    .into();
-            if !matches {
+        if let Err(e) = claimed.verify_against_body(body.as_ref()) {
+            if matches!(e, S3Error::BadDigest) {
                 warn!(
-                    "PUT {}/{}: SigV4 payload hash mismatch (claimed {}…, actual {}…)",
+                    "PUT {}/{}: SigV4 payload hash mismatch (claimed {}…)",
                     bucket,
                     key,
                     &claimed.as_str()[..8.min(claimed.as_str().len())],
-                    &actual[..8],
                 );
-                return Err(S3Error::BadDigest);
             }
+            return Err(e);
         }
     }
 
@@ -551,24 +498,14 @@ pub(super) async fn upload_part(
     // H1 SigV4 fix: same body-hash verification as put_object_inner —
     // each part's bytes must match the SHA-256 the client signed.
     if let Some(claimed) = signed_payload_hash {
-        if claimed.requires_chunk_signature_verification() {
-            return Err(S3Error::NotImplemented(
-                "Signed AWS streaming payloads are not supported; use UNSIGNED-PAYLOAD or non-streaming SHA-256 payloads".to_string(),
-            ));
-        }
-        if claimed.is_verifiable_hex() {
-            use sha2::{Digest, Sha256};
-            let actual = hex::encode(Sha256::digest(body.as_ref()));
-            let matches: bool =
-                subtle::ConstantTimeEq::ct_eq(actual.as_bytes(), claimed.as_str().as_bytes())
-                    .into();
-            if !matches {
+        if let Err(e) = claimed.verify_against_body(body.as_ref()) {
+            if matches!(e, S3Error::BadDigest) {
                 warn!(
                     "UploadPart {}/{} part={}: SigV4 payload hash mismatch",
                     bucket, key, part_num
                 );
-                return Err(S3Error::BadDigest);
             }
+            return Err(e);
         }
     }
 

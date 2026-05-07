@@ -31,7 +31,7 @@ pub async fn post_object(
         // silently create the bucket via `ensure_dir` — see C2 security fix.
         // Initiate is the right place: catching it here fails fast, before
         // any UploadPart consumes memory.
-        super::object_helpers::ensure_bucket_exists(&state, &bucket).await?;
+        super::ensure_bucket_exists(&state, &bucket).await?;
         initiate_multipart_upload(&state, &bucket, &key, &headers)
     } else if let Some(upload_id) = &query.upload_id {
         complete_multipart_upload(&state, &bucket, &key, upload_id, body).await
@@ -83,7 +83,7 @@ async fn complete_multipart_upload(
     // complete. Without this check the subsequent `engine.store*` would
     // silently recreate the bucket directory on the filesystem backend
     // (C2 security fix).
-    super::object_helpers::ensure_bucket_exists(state, bucket).await?;
+    super::ensure_bucket_exists(state, bucket).await?;
 
     let body_str = body_to_utf8(&body)?;
     let complete_req = CompleteMultipartUploadRequest::from_xml(body_str).map_err(|e| {

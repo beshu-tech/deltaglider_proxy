@@ -1274,22 +1274,18 @@ fn verify_signed_payload_hash_s3s(
     let Some(claimed) = signed else {
         return Ok(());
     };
-    if claimed.requires_chunk_signature_verification() {
-        return Err(s3s::s3_error!(
-            NotImplemented,
-            "Signed AWS streaming payloads are not supported; use UNSIGNED-PAYLOAD or non-streaming SHA-256 payloads"
-        ));
-    }
-    if claimed.is_verifiable_hex() {
-        use sha2::Digest as _;
-        let actual = hex::encode(sha2::Sha256::digest(body));
-        let matches: bool =
-            subtle::ConstantTimeEq::ct_eq(actual.as_bytes(), claimed.as_str().as_bytes()).into();
-        if !matches {
-            return Err(s3s::s3_error!(BadDigest));
+    // Delegate to the canonical verifier so axum + s3s can never desync
+    // on the H1 integrity contract. Translate the typed S3Error into
+    // s3s's error vocabulary; only BadDigest and NotImplemented are
+    // reachable per `verify_against_body`'s contract.
+    match claimed.verify_against_body(body) {
+        Ok(()) => Ok(()),
+        Err(crate::api::S3Error::NotImplemented(msg)) => {
+            Err(s3s::s3_error!(NotImplemented, "{}", msg))
         }
+        Err(crate::api::S3Error::BadDigest) => Err(s3s::s3_error!(BadDigest)),
+        Err(other) => Err(engine_error_to_s3s(other)),
     }
-    Ok(())
 }
 
 async fn evaluate_put_etag_conditionals_s3s(

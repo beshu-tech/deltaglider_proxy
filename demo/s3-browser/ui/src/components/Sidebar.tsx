@@ -11,6 +11,9 @@ import { listBuckets, createBucket, deleteBucket, getBucket, setBucket } from '.
 import type { BucketInfo } from '../types';
 import { useColors } from '../ThemeContext';
 import BucketBackendBadge from './BucketBackendBadge';
+import { getBackends } from '../adminApi';
+import type { BackendInfo } from '../adminApi';
+import SimpleSelect from './SimpleSelect';
 
 const { Sider } = Layout;
 const { Text } = Typography;
@@ -69,6 +72,8 @@ export default function Sidebar({
   const [newBucketName, setNewBucketName] = useState('');
   const [createBucketOpen, setCreateBucketOpen] = useState(false);
   const [creatingBucket, setCreatingBucket] = useState(false);
+  const [createBucketBackends, setCreateBucketBackends] = useState<BackendInfo[]>([]);
+  const [selectedBackend, setSelectedBackend] = useState<string | undefined>(undefined);
   const [deletingBucketName, setDeletingBucketName] = useState<string | null>(null);
   const newBucketInputRef = useRef<InputRef>(null);
   const deleteConfirmOpenRef = useRef(false);
@@ -106,14 +111,37 @@ export default function Sidebar({
     return () => window.clearTimeout(id);
   }, [createBucketOpen]);
 
+  useEffect(() => {
+    if (!createBucketOpen || !canAdmin) return;
+    let cancelled = false;
+    getBackends()
+      .then((resp) => {
+        if (cancelled) return;
+        const backends = resp.backends || [];
+        setCreateBucketBackends(backends);
+        const preferred = resp.default_backend || backends[0]?.name;
+        setSelectedBackend(preferred || undefined);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setCreateBucketBackends([]);
+        setSelectedBackend(undefined);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [createBucketOpen, canAdmin]);
+
   const handleCreateBucket = async () => {
     const name = newBucketName.trim();
     if (!name) return;
     setCreatingBucket(true);
     try {
-      await createBucket(name);
+      const explicitBackend = createBucketBackends.length > 1 ? selectedBackend : undefined;
+      await createBucket(name, explicitBackend);
       setNewBucketName('');
       setCreateBucketOpen(false);
+      setSelectedBackend(undefined);
       messageApi.success(`Bucket "${name}" created`);
       const updated = await listBuckets({ includeOrigins: includeBucketOrigins });
       setBuckets(updated);
@@ -368,11 +396,17 @@ export default function Sidebar({
       okText="Create"
       onOk={handleCreateBucket}
       confirmLoading={creatingBucket}
-      okButtonProps={{ disabled: !newBucketName.trim() || !canCreateBucket }}
+      okButtonProps={{
+        disabled:
+          !newBucketName.trim()
+          || !canCreateBucket
+          || (canAdmin && createBucketBackends.length > 1 && !selectedBackend),
+      }}
       onCancel={() => {
         if (creatingBucket) return;
         setCreateBucketOpen(false);
         setNewBucketName('');
+        setSelectedBackend(undefined);
       }}
       destroyOnHidden
     >
@@ -385,6 +419,22 @@ export default function Sidebar({
         onPressEnter={handleCreateBucket}
         style={{ fontFamily: "var(--font-mono)" }}
       />
+      {canAdmin && createBucketBackends.length > 1 && (
+        <div style={{ marginTop: 12 }}>
+          <SimpleSelect
+            value={selectedBackend}
+            onChange={(value) => setSelectedBackend(value || undefined)}
+            options={createBucketBackends.map((backend) => ({
+              value: backend.name,
+              label: backend.name,
+              sublabel: backend.backend_type,
+            }))}
+            placeholder="Choose backend"
+            style={{ width: '100%' }}
+            size="middle"
+          />
+        </div>
+      )}
     </Modal>
   );
 

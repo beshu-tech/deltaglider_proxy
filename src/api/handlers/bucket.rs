@@ -1,7 +1,7 @@
 //! Bucket-level S3 handlers: CREATE, DELETE, HEAD, LIST, and sub-operations
 //! (GetBucketLocation, GetBucketVersioning, ListMultipartUploads).
 
-use super::{audit_log_s3, xml_response, AppState, S3Error};
+use super::{audit_log_s3, ensure_bucket_exists, xml_response, AppState, S3Error};
 use crate::api::extractors::ValidatedBucket;
 use crate::api::xml::{
     BucketInfo, ListBucketResult, ListBucketsResult, ListMultipartUploadsResult, S3Object,
@@ -16,26 +16,6 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use std::sync::Arc;
 use tracing::{info, instrument};
-
-/// Return NoSuchBucket for non-existent buckets.
-/// Bucket enumeration prevention is handled at the auth middleware layer —
-/// unauthenticated requests to non-existent buckets are rejected before
-/// reaching handlers when auth is enabled.
-fn no_such_bucket_error(bucket: &str) -> S3Error {
-    S3Error::NoSuchBucket(bucket.to_string())
-}
-
-/// Resolve `head_bucket` and turn `false` into a `NoSuchBucket` error.
-/// Shared by every bucket subresource that should answer 404 for
-/// ghost buckets (GetBucketLocation / GetBucketVersioning /
-/// ListMultipartUploads / etc.).
-async fn require_bucket_exists(state: &Arc<AppState>, bucket: &str) -> Result<(), S3Error> {
-    let exists = state.engine.load().head_bucket(bucket).await?;
-    if !exists {
-        return Err(no_such_bucket_error(bucket));
-    }
-    Ok(())
-}
 
 /// Query parameters for bucket-level GET operations
 #[derive(Debug, serde::Deserialize, Default)]
@@ -107,7 +87,7 @@ pub async fn bucket_get_handler(
     if query.tagging.is_some() {
         info!("GET bucket tagging: unsupported (returning 501)");
         // M4 fix: 404 wins over 501 when the bucket doesn't exist.
-        require_bucket_exists(&state, &bucket).await?;
+        ensure_bucket_exists(&state, &bucket).await?;
         return Err(S3Error::NotImplemented(
             "Bucket tagging is not supported by this proxy".to_string(),
         ));
@@ -117,10 +97,7 @@ pub async fn bucket_get_handler(
     if query.acl.is_some() {
         info!("GET bucket ACL: {}", bucket);
         // Verify the bucket exists first; S3 returns 404 for ACL on non-existent buckets
-        let exists = state.engine.load().head_bucket(&bucket).await?;
-        if !exists {
-            return Err(no_such_bucket_error(&bucket));
-        }
+        ensure_bucket_exists(&state, &bucket).await?;
         return get_acl_response();
     }
 
@@ -132,21 +109,21 @@ pub async fn bucket_get_handler(
     // for buckets that didn't exist.
     if query.location.is_some() {
         info!("GET bucket location: {}", bucket);
-        require_bucket_exists(&state, &bucket).await?;
+        ensure_bucket_exists(&state, &bucket).await?;
         return get_bucket_location(&bucket).await;
     }
 
     // Check for GetBucketVersioning
     if query.versioning.is_some() {
         info!("GET bucket versioning: {}", bucket);
-        require_bucket_exists(&state, &bucket).await?;
+        ensure_bucket_exists(&state, &bucket).await?;
         return get_bucket_versioning(&bucket).await;
     }
 
     // Check for ListMultipartUploads
     if query.uploads.is_some() {
         info!("LIST multipart uploads: {}", bucket);
-        require_bucket_exists(&state, &bucket).await?;
+        ensure_bucket_exists(&state, &bucket).await?;
         let prefix = query.prefix.as_deref();
         return list_multipart_uploads(
             &state,
@@ -468,7 +445,7 @@ pub async fn create_bucket(
     // existence check (404 wins over 501).
     if query.acl.is_some() {
         info!("PUT bucket ACL: unsupported (returning 501)");
-        require_bucket_exists(&state, &bucket).await?;
+        ensure_bucket_exists(&state, &bucket).await?;
         return Err(S3Error::NotImplemented(
             "Bucket ACLs are not supported by this proxy; use IAM policies instead".to_string(),
         ));
@@ -478,7 +455,7 @@ pub async fn create_bucket(
     // L1 fix: 404 wins over 501 when the bucket doesn't exist.
     if query.tagging.is_some() {
         info!("PUT bucket tagging: unsupported (returning 501)");
-        require_bucket_exists(&state, &bucket).await?;
+        ensure_bucket_exists(&state, &bucket).await?;
         return Err(S3Error::NotImplemented(
             "Bucket tagging is not supported by this proxy".to_string(),
         ));
@@ -490,7 +467,7 @@ pub async fn create_bucket(
     // active would lose history on overwrite. 404 wins over 501.
     if query.versioning.is_some() {
         info!("PUT bucket versioning: unsupported (returning 501)");
-        require_bucket_exists(&state, &bucket).await?;
+        ensure_bucket_exists(&state, &bucket).await?;
         return Err(S3Error::NotImplemented(
             "Bucket versioning is not supported by this proxy".to_string(),
         ));
@@ -637,10 +614,7 @@ pub async fn head_bucket(
     info!("HEAD bucket {}", bucket);
 
     // Check if bucket exists on the storage backend
-    let exists = state.engine.load().head_bucket(&bucket).await?;
-    if !exists {
-        return Err(no_such_bucket_error(&bucket));
-    }
+    ensure_bucket_exists(&state, &bucket).await?;
 
     Ok((StatusCode::OK, [("x-amz-bucket-region", "us-east-1")]).into_response())
 }

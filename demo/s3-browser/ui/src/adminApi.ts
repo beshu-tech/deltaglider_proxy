@@ -1,4 +1,5 @@
 // Admin API client helpers
+import { throwApiError } from './errorHandling';
 
 const BASE = '/_';
 
@@ -231,6 +232,16 @@ interface ConfigUpdateResponse {
 
 /** Safely parse JSON from response, falling back to text for non-JSON content types. */
 async function safeJson<T>(res: Response): Promise<T> {
+  if (!res.ok) {
+    const path = (() => {
+      try {
+        return new URL(res.url).pathname;
+      } catch {
+        return 'request';
+      }
+    })();
+    await throwApiError(res, `API ${path}`);
+  }
   const ct = res.headers.get('content-type') || '';
   if (ct.includes('application/json')) {
     return res.json();
@@ -245,7 +256,6 @@ async function safeJson<T>(res: Response): Promise<T> {
 
 export async function updateAdminConfig(updates: Record<string, unknown>): Promise<ConfigUpdateResponse> {
   const res = await adminFetch('/api/admin/config', 'PUT', updates);
-  if (!res.ok) throw new Error(`Config update failed: ${res.status}`);
   return safeJson(res);
 }
 
@@ -257,7 +267,7 @@ export async function updateAdminConfig(updates: Record<string, unknown>): Promi
  */
 export async function exportConfigYaml(): Promise<string> {
   const res = await adminFetch('/api/admin/config/export');
-  if (!res.ok) throw new Error(`Config export failed: ${res.status}`);
+  if (!res.ok) await throwApiError(res, 'Config export');
   return res.text();
 }
 
@@ -335,7 +345,7 @@ export interface SectionApplyResponse {
  */
 export async function getSection<T = unknown>(section: SectionName): Promise<T> {
   const res = await adminFetch(`/api/admin/config/section/${section}`);
-  if (!res.ok) throw new Error(`Section fetch failed (${section}): ${res.status}`);
+  if (!res.ok) await throwApiError(res, `Section fetch (${section})`);
   return safeJson(res);
 }
 
@@ -345,7 +355,7 @@ export async function getSection<T = unknown>(section: SectionName): Promise<T> 
  */
 export async function getSectionYaml(section: SectionName): Promise<string> {
   const res = await adminFetch(`/api/admin/config/section/${section}?format=yaml`);
-  if (!res.ok) throw new Error(`Section YAML fetch failed (${section}): ${res.status}`);
+  if (!res.ok) await throwApiError(res, `Section YAML fetch (${section})`);
   return res.text();
 }
 
@@ -476,16 +486,11 @@ export interface UpdateUserRequest {
 
 export async function getUsers(): Promise<IamUser[]> {
   const res = await adminFetch('/api/admin/users');
-  if (!res.ok) throw new Error(`Failed to load users: ${res.status}`);
   return safeJson(res);
 }
 
 export async function createUser(req: CreateUserRequest): Promise<IamUser> {
   const res = await adminFetch('/api/admin/users', 'POST', req);
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(text || `Failed to create user: ${res.status}`);
-  }
   return safeJson(res);
 }
 
@@ -494,22 +499,17 @@ export async function cloneUser(
   req: { name?: string; copy_group_memberships?: boolean } = {},
 ): Promise<IamUser> {
   const res = await adminFetch(`/api/admin/users/${id}/clone`, 'POST', req);
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(text || `Failed to duplicate user: ${res.status}`);
-  }
   return safeJson(res);
 }
 
 export async function updateUser(id: number, req: UpdateUserRequest): Promise<IamUser> {
   const res = await adminFetch(`/api/admin/users/${id}`, 'PUT', req);
-  if (!res.ok) throw new Error(`Failed to update user: ${res.status}`);
   return safeJson(res);
 }
 
 export async function deleteUser(id: number): Promise<void> {
   const res = await adminFetch(`/api/admin/users/${id}`, 'DELETE');
-  if (!res.ok) throw new Error(`Failed to delete user: ${res.status}`);
+  if (!res.ok) await throwApiError(res, `Delete user ${id}`);
 }
 
 export async function rotateUserKeys(
@@ -525,7 +525,6 @@ export async function rotateUserKeys(
     'POST',
     Object.keys(body).length > 0 ? body : undefined,
   );
-  if (!res.ok) throw new Error(`Failed to rotate keys: ${res.status}`);
   return safeJson(res);
 }
 
@@ -554,16 +553,11 @@ interface UpdateGroupRequest {
 
 export async function getGroups(): Promise<IamGroup[]> {
   const res = await adminFetch('/api/admin/groups');
-  if (!res.ok) throw new Error(`Failed to load groups: ${res.status}`);
   return safeJson(res);
 }
 
 export async function createGroup(req: CreateGroupRequest): Promise<IamGroup> {
   const res = await adminFetch('/api/admin/groups', 'POST', req);
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(text || `Failed to create group: ${res.status}`);
-  }
   return safeJson(res);
 }
 
@@ -572,32 +566,27 @@ export async function cloneGroup(
   req: { name?: string; copy_members?: boolean } = {},
 ): Promise<IamGroup> {
   const res = await adminFetch(`/api/admin/groups/${id}/clone`, 'POST', req);
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(text || `Failed to duplicate group: ${res.status}`);
-  }
   return safeJson(res);
 }
 
 export async function updateGroup(id: number, req: UpdateGroupRequest): Promise<IamGroup> {
   const res = await adminFetch(`/api/admin/groups/${id}`, 'PUT', req);
-  if (!res.ok) throw new Error(`Failed to update group: ${res.status}`);
   return safeJson(res);
 }
 
 export async function deleteGroup(id: number): Promise<void> {
   const res = await adminFetch(`/api/admin/groups/${id}`, 'DELETE');
-  if (!res.ok) throw new Error(`Failed to delete group: ${res.status}`);
+  if (!res.ok) await throwApiError(res, `Delete group ${id}`);
 }
 
 export async function addGroupMember(groupId: number, userId: number): Promise<void> {
   const res = await adminFetch(`/api/admin/groups/${groupId}/members`, 'POST', { user_id: userId });
-  if (!res.ok) throw new Error(`Failed to add member: ${res.status}`);
+  if (!res.ok) await throwApiError(res, `Add member ${userId} to group ${groupId}`);
 }
 
 export async function removeGroupMember(groupId: number, userId: number): Promise<void> {
   const res = await adminFetch(`/api/admin/groups/${groupId}/members/${userId}`, 'DELETE');
-  if (!res.ok) throw new Error(`Failed to remove member: ${res.status}`);
+  if (!res.ok) await throwApiError(res, `Remove member ${userId} from group ${groupId}`);
 }
 
 // === Whoami / Login-as ===
@@ -661,7 +650,7 @@ interface UsageEntry {
 /** Trigger a background usage scan for a bucket/prefix. */
 export async function scanPrefixUsage(bucket: string, prefix: string): Promise<void> {
   const res = await adminFetch('/api/admin/usage/scan', 'POST', { bucket, prefix });
-  if (!res.ok) throw new Error(`Scan request failed: ${res.status}`);
+  if (!res.ok) await throwApiError(res, 'Prefix usage scan');
 }
 
 /** Get cached usage entry for a bucket/prefix, or null if not cached. */
@@ -669,7 +658,7 @@ export async function getPrefixUsage(bucket: string, prefix: string): Promise<Us
   const params = new URLSearchParams({ bucket, prefix });
   const res = await adminFetch(`/api/admin/usage?${params}`);
   if (res.status === 404) return null;
-  if (!res.ok) throw new Error(`Usage query failed: ${res.status}`);
+  if (!res.ok) await throwApiError(res, 'Usage query');
   return safeJson(res);
 }
 
@@ -687,7 +676,7 @@ export async function getPrefixUsage(bucket: string, prefix: string): Promise<Us
  */
 export async function exportBackup(): Promise<{ blob: Blob; filename: string }> {
   const res = await adminFetch('/api/admin/backup');
-  if (!res.ok) throw new Error(`Export failed: ${res.status}`);
+  if (!res.ok) await throwApiError(res, 'Export');
   // Parse the server-suggested filename from Content-Disposition
   // (server emits `attachment; filename="dgp-backup-vX.Y.Z-<utc>.zip"`).
   const cd = res.headers.get('content-disposition') ?? '';
@@ -875,13 +864,25 @@ export interface CreateBackendRequest {
 
 export async function getBackends(): Promise<BackendListResponse> {
   const res = await adminFetch('/api/admin/backends');
-  if (!res.ok) throw new Error(`Failed to load backends: ${res.status}`);
+  if (!res.ok) await throwApiError(res, 'Load backends');
   return safeJson(res);
 }
 
 export async function getBucketOrigins(): Promise<BucketOriginListResponse> {
   const res = await adminFetch('/api/admin/buckets');
-  if (!res.ok) throw new Error(`Failed to load bucket origins: ${res.status}`);
+  if (!res.ok) await throwApiError(res, 'Load bucket origins');
+  return safeJson(res);
+}
+
+export async function createBucketOnBackend(
+  name: string,
+  backendName: string,
+): Promise<{ success: boolean; bucket: string; backend_name: string }> {
+  const res = await adminFetch('/api/admin/buckets', 'POST', {
+    name,
+    backend_name: backendName,
+  });
+  if (!res.ok) await throwApiError(res, `Create bucket ${name}`);
   return safeJson(res);
 }
 
@@ -1035,35 +1036,35 @@ export interface ReplicationFailureEntry {
 
 export async function getReplicationOverview(): Promise<ReplicationOverview> {
   const res = await adminFetch('/api/admin/replication');
-  if (!res.ok) throw new Error(`Replication overview failed: ${res.status}`);
+  if (!res.ok) await throwApiError(res, 'Replication overview');
   return safeJson(res);
 }
 
 export async function runReplicationNow(rule: string): Promise<ReplicationRunNowResponse> {
   const res = await adminFetch(`/api/admin/replication/rules/${encodeURIComponent(rule)}/run-now`, 'POST');
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) await throwApiError(res, 'Replication run-now');
   return safeJson(res);
 }
 
 export async function pauseReplicationRule(rule: string): Promise<void> {
   const res = await adminFetch(`/api/admin/replication/rules/${encodeURIComponent(rule)}/pause`, 'POST');
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) await throwApiError(res, 'Replication pause');
 }
 
 export async function resumeReplicationRule(rule: string): Promise<void> {
   const res = await adminFetch(`/api/admin/replication/rules/${encodeURIComponent(rule)}/resume`, 'POST');
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) await throwApiError(res, 'Replication resume');
 }
 
 export async function getReplicationHistory(rule: string, limit = 20): Promise<{ runs: ReplicationHistoryEntry[] }> {
   const res = await adminFetch(`/api/admin/replication/rules/${encodeURIComponent(rule)}/history?limit=${encodeURIComponent(limit)}`);
-  if (!res.ok) throw new Error(`Replication history failed: ${res.status}`);
+  if (!res.ok) await throwApiError(res, 'Replication history');
   return safeJson(res);
 }
 
 export async function getReplicationFailures(rule: string, limit = 20): Promise<{ failures: ReplicationFailureEntry[] }> {
   const res = await adminFetch(`/api/admin/replication/rules/${encodeURIComponent(rule)}/failures?limit=${encodeURIComponent(limit)}`);
-  if (!res.ok) throw new Error(`Replication failures failed: ${res.status}`);
+  if (!res.ok) await throwApiError(res, 'Replication failures');
   return safeJson(res);
 }
 
@@ -1144,31 +1145,31 @@ export interface LifecycleFailureEntry {
 
 export async function getLifecycleOverview(): Promise<LifecycleOverview> {
   const res = await adminFetch('/api/admin/lifecycle');
-  if (!res.ok) throw new Error(`Lifecycle overview failed: ${res.status}`);
+  if (!res.ok) await throwApiError(res, 'Lifecycle overview');
   return safeJson(res);
 }
 
 export async function previewLifecycleRule(rule: string): Promise<LifecycleRunOutcome> {
   const res = await adminFetch(`/api/admin/lifecycle/rules/${encodeURIComponent(rule)}/preview`, 'POST');
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) await throwApiError(res, 'Lifecycle preview');
   return safeJson(res);
 }
 
 export async function runLifecycleNow(rule: string): Promise<LifecycleRunOutcome> {
   const res = await adminFetch(`/api/admin/lifecycle/rules/${encodeURIComponent(rule)}/run-now`, 'POST');
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) await throwApiError(res, 'Lifecycle run-now');
   return safeJson(res);
 }
 
 export async function getLifecycleHistory(rule: string, limit = 20): Promise<{ runs: LifecycleHistoryEntry[] }> {
   const res = await adminFetch(`/api/admin/lifecycle/rules/${encodeURIComponent(rule)}/history?limit=${encodeURIComponent(limit)}`);
-  if (!res.ok) throw new Error(`Lifecycle history failed: ${res.status}`);
+  if (!res.ok) await throwApiError(res, 'Lifecycle history');
   return safeJson(res);
 }
 
 export async function getLifecycleFailures(rule: string, limit = 20): Promise<{ failures: LifecycleFailureEntry[] }> {
   const res = await adminFetch(`/api/admin/lifecycle/rules/${encodeURIComponent(rule)}/failures?limit=${encodeURIComponent(limit)}`);
-  if (!res.ok) throw new Error(`Lifecycle failures failed: ${res.status}`);
+  if (!res.ok) await throwApiError(res, 'Lifecycle failures');
   return safeJson(res);
 }
 
@@ -1225,33 +1226,30 @@ export interface ProviderTestResult {
 
 export async function getAuthProviders(): Promise<AuthProvider[]> {
   const res = await adminFetch('/api/admin/ext-auth/providers');
-  if (!res.ok) throw new Error(`Failed to load providers: ${res.status}`);
+  if (!res.ok) await throwApiError(res, 'Load auth providers');
   return safeJson(res);
 }
 
 export async function createAuthProvider(req: CreateAuthProviderRequest): Promise<AuthProvider> {
   const res = await adminFetch('/api/admin/ext-auth/providers', 'POST', req);
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(text || `Failed to create provider: ${res.status}`);
-  }
+  if (!res.ok) await throwApiError(res, 'Create auth provider');
   return safeJson(res);
 }
 
 export async function updateAuthProvider(id: number, req: UpdateAuthProviderRequest): Promise<AuthProvider> {
   const res = await adminFetch(`/api/admin/ext-auth/providers/${id}`, 'PUT', req);
-  if (!res.ok) throw new Error(`Failed to update provider: ${res.status}`);
+  if (!res.ok) await throwApiError(res, 'Update auth provider');
   return safeJson(res);
 }
 
 export async function deleteAuthProvider(id: number): Promise<void> {
   const res = await adminFetch(`/api/admin/ext-auth/providers/${id}`, 'DELETE');
-  if (!res.ok) throw new Error(`Failed to delete provider: ${res.status}`);
+  if (!res.ok) await throwApiError(res, 'Delete auth provider');
 }
 
 export async function testAuthProvider(id: number): Promise<ProviderTestResult> {
   const res = await adminFetch(`/api/admin/ext-auth/providers/${id}/test`, 'POST');
-  if (!res.ok) throw new Error(`Test failed: ${res.status}`);
+  if (!res.ok) await throwApiError(res, 'Test auth provider');
   return safeJson(res);
 }
 
@@ -1288,28 +1286,25 @@ interface UpdateMappingRuleRequest {
 
 export async function getMappingRules(): Promise<MappingRule[]> {
   const res = await adminFetch('/api/admin/ext-auth/mappings');
-  if (!res.ok) throw new Error(`Failed to load mappings: ${res.status}`);
+  if (!res.ok) await throwApiError(res, 'Load group mappings');
   return safeJson(res);
 }
 
 export async function createMappingRule(req: CreateMappingRuleRequest): Promise<MappingRule> {
   const res = await adminFetch('/api/admin/ext-auth/mappings', 'POST', req);
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(text || `Failed to create mapping: ${res.status}`);
-  }
+  if (!res.ok) await throwApiError(res, 'Create group mapping');
   return safeJson(res);
 }
 
 export async function updateMappingRule(id: number, req: UpdateMappingRuleRequest): Promise<MappingRule> {
   const res = await adminFetch(`/api/admin/ext-auth/mappings/${id}`, 'PUT', req);
-  if (!res.ok) throw new Error(`Failed to update mapping: ${res.status}`);
+  if (!res.ok) await throwApiError(res, 'Update group mapping');
   return safeJson(res);
 }
 
 export async function deleteMappingRule(id: number): Promise<void> {
   const res = await adminFetch(`/api/admin/ext-auth/mappings/${id}`, 'DELETE');
-  if (!res.ok) throw new Error(`Failed to delete mapping: ${res.status}`);
+  if (!res.ok) await throwApiError(res, 'Delete group mapping');
 }
 
 interface MappingPreviewResponse {
@@ -1319,7 +1314,7 @@ interface MappingPreviewResponse {
 
 export async function previewMapping(email: string): Promise<MappingPreviewResponse> {
   const res = await adminFetch('/api/admin/ext-auth/mappings/preview', 'POST', { email });
-  if (!res.ok) throw new Error(`Preview failed: ${res.status}`);
+  if (!res.ok) await throwApiError(res, 'Mapping preview');
   return safeJson(res);
 }
 
@@ -1339,7 +1334,7 @@ export interface ExternalIdentity {
 
 export async function getExternalIdentities(): Promise<ExternalIdentity[]> {
   const res = await adminFetch('/api/admin/ext-auth/identities');
-  if (!res.ok) throw new Error(`Failed to load identities: ${res.status}`);
+  if (!res.ok) await throwApiError(res, 'Load external identities');
   return safeJson(res);
 }
 
@@ -1350,7 +1345,7 @@ interface SyncResult {
 
 export async function syncMemberships(): Promise<SyncResult> {
   const res = await adminFetch('/api/admin/ext-auth/sync-memberships', 'POST');
-  if (!res.ok) throw new Error(`Sync failed: ${res.status}`);
+  if (!res.ok) await throwApiError(res, 'Config sync now');
   return safeJson(res);
 }
 
@@ -1386,7 +1381,7 @@ interface AuditResponse {
  */
 export async function fetchAudit(limit = 100): Promise<AuditResponse> {
   const res = await adminFetch(`/api/admin/audit?limit=${encodeURIComponent(limit)}`);
-  if (!res.ok) throw new Error(`Audit fetch failed: ${res.status}`);
+  if (!res.ok) await throwApiError(res, 'Audit fetch');
   return safeJson(res);
 }
 
@@ -1453,19 +1448,19 @@ export async function fetchEventOutbox(
   });
   if (status && status !== 'all') qs.set('status', status);
   const res = await adminFetch(`/api/admin/event-outbox?${qs.toString()}`);
-  if (!res.ok) throw new Error(`Event outbox fetch failed: ${res.status}`);
+  if (!res.ok) await throwApiError(res, 'Event outbox fetch');
   return safeJson(res);
 }
 
 export async function requeueEventOutbox(id: number): Promise<EventOutboxRequeueResponse> {
   const res = await adminFetch(`/api/admin/event-outbox/${encodeURIComponent(id)}/requeue`, 'POST');
-  if (!res.ok) throw new Error(`Event outbox requeue failed: ${res.status}`);
+  if (!res.ok) await throwApiError(res, 'Event outbox requeue');
   return safeJson(res);
 }
 
 export async function requeueEventOutboxMany(ids: number[]): Promise<EventOutboxRequeueResponse> {
   const res = await adminFetch('/api/admin/event-outbox/requeue', 'POST', { ids });
-  if (!res.ok) throw new Error(`Event outbox bulk requeue failed: ${res.status}`);
+  if (!res.ok) await throwApiError(res, 'Event outbox bulk requeue');
   return safeJson(res);
 }
 
@@ -1520,14 +1515,14 @@ interface BulkMoveResponse extends BulkCopyResponse {
 /** Requires administrator sign-in in Settings (`403 admin_session_required` otherwise). */
 export async function bulkCopyObjects(req: BulkCopyRequest): Promise<BulkCopyResponse> {
   const res = await adminFetch('/api/admin/objects/copy', 'POST', req);
-  if (!res.ok) throw new Error(`Copy failed: ${await res.text()}`);
+  if (!res.ok) await throwApiError(res, 'Bulk copy');
   return safeJson(res);
 }
 
 /** Admin GUI session required. */
 export async function bulkMoveObjects(req: BulkCopyRequest): Promise<BulkMoveResponse> {
   const res = await adminFetch('/api/admin/objects/move', 'POST', req);
-  if (!res.ok) throw new Error(`Move failed: ${await res.text()}`);
+  if (!res.ok) await throwApiError(res, 'Bulk move');
   return safeJson(res);
 }
 
@@ -1545,7 +1540,7 @@ interface BulkDeleteResponse {
 /** Admin GUI session required. */
 export async function bulkDeleteObjects(req: BulkDeleteRequest): Promise<BulkDeleteResponse> {
   const res = await adminFetch('/api/admin/objects/delete', 'POST', req);
-  if (!res.ok) throw new Error(`Delete failed: ${await res.text()}`);
+  if (!res.ok) await throwApiError(res, 'Bulk delete');
   return safeJson(res);
 }
 
@@ -1563,7 +1558,7 @@ export async function listAllUnderPrefix(bucket: string, prefix: string): Promis
   if (!prefix) throw new Error('listAllUnderPrefix: prefix must be non-empty');
   const qs = new URLSearchParams({ bucket, prefix });
   const res = await adminFetch(`/api/admin/objects/list?${qs.toString()}`);
-  if (!res.ok) throw new Error(`List failed: ${await res.text()}`);
+  if (!res.ok) await throwApiError(res, 'List under prefix');
   return safeJson(res);
 }
 

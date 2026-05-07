@@ -1,7 +1,7 @@
 //! Admin API for managing named backends (multi-backend routing).
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::config::{BackendConfig, NamedBackendConfig};
 
-use super::AdminState;
+use super::{audit_log, AdminState};
 
 #[derive(Serialize)]
 pub struct BackendListResponse {
@@ -32,6 +32,19 @@ pub struct BucketBackendOriginResponse {
 #[derive(Serialize)]
 pub struct BucketOriginListResponse {
     pub buckets: Vec<BucketBackendOriginResponse>,
+}
+
+#[derive(Deserialize)]
+pub struct CreateBucketOnBackendRequest {
+    pub name: String,
+    pub backend_name: String,
+}
+
+#[derive(Serialize)]
+pub struct CreateBucketOnBackendResponse {
+    pub success: bool,
+    pub bucket: String,
+    pub backend_name: String,
 }
 
 #[derive(Deserialize)]
@@ -189,6 +202,116 @@ pub async fn list_bucket_origins(
         .collect();
 
     Ok(Json(BucketOriginListResponse { buckets }))
+}
+
+/// POST /api/admin/buckets — create a bucket pinned to a named backend.
+///
+/// This is intentionally admin-only and separate from the public S3
+/// `PUT /{bucket}` API. S3 has no portable "backend hint" concept; the admin
+/// UI needs an explicit control when multiple backends exist.
+pub async fn create_bucket_on_backend(
+    State(state): State<Arc<AdminState>>,
+    headers: HeaderMap,
+    Json(body): Json<CreateBucketOnBackendRequest>,
+) -> Result<Json<CreateBucketOnBackendResponse>, (StatusCode, String)> {
+    let bucket = body.name.trim().to_string();
+    if bucket.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Bucket name cannot be empty".into(),
+        ));
+    }
+    let backend_name = body.backend_name.trim().to_string();
+    if backend_name.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "backend_name cannot be empty".into(),
+        ));
+    }
+
+    let mut cfg = state.config.write().await;
+
+    let backend_exists = if cfg.backends.is_empty() {
+        backend_name == "default"
+    } else {
+        cfg.backends.iter().any(|b| b.name == backend_name)
+    };
+    if !backend_exists {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Unknown backend '{}'", backend_name),
+        ));
+    }
+
+    // Buckets are keyed by virtual bucket name, normalized lowercase.
+    let bucket_key = bucket.to_ascii_lowercase();
+    let old_policy = cfg.buckets.get(&bucket_key).cloned();
+    let mut policy = old_policy.clone().unwrap_or_default();
+    policy.backend = if cfg.backends.is_empty() {
+        None
+    } else {
+        Some(backend_name.clone())
+    };
+    cfg.buckets.insert(bucket_key.clone(), policy);
+
+    if let Err(e) = super::config::rebuild_engine(
+        &state,
+        &cfg,
+        &format!(
+            "Bucket '{}' routed to backend '{}', engine rebuilt",
+            bucket, backend_name
+        ),
+    )
+    .await
+    {
+        if let Some(previous) = old_policy {
+            cfg.buckets.insert(bucket_key, previous);
+        } else {
+            cfg.buckets.remove(&bucket_key);
+        }
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to rebuild engine: {e}"),
+        ));
+    }
+
+    if let Err(e) = state.s3_state.engine.load().create_bucket(&bucket).await {
+        // Roll back routing if create failed (e.g. already exists / backend error).
+        if let Some(previous) = old_policy {
+            cfg.buckets.insert(bucket_key.clone(), previous);
+        } else {
+            cfg.buckets.remove(&bucket_key);
+        }
+        let _ = super::config::rebuild_engine(
+            &state,
+            &cfg,
+            &format!(
+                "Bucket create failed for '{}', reverted backend routing",
+                bucket
+            ),
+        )
+        .await;
+        return Err((StatusCode::BAD_REQUEST, e.to_string()));
+    }
+
+    let persist_path = super::config::active_config_path(&state);
+    if let Err(e) = cfg.persist_to_file(&persist_path) {
+        tracing::warn!("Failed to persist config to {}: {}", persist_path, e);
+    }
+    drop(cfg);
+
+    audit_log(
+        "admin_create_bucket",
+        "admin",
+        &format!("{bucket}@{backend_name}"),
+        &headers,
+    );
+
+    Ok(Json(CreateBucketOnBackendResponse {
+        success: true,
+        bucket,
+        backend_name,
+    }))
 }
 
 /// POST /api/admin/backends — add a new named backend.

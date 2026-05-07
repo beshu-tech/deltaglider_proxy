@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## v0.9.12 — 2026-05-07
+
+### Upload reliability and UX
+
+- Browser uploads now use managed self-signed multipart upload (`@aws-sdk/lib-storage`)
+  with bounded concurrency and per-part retries, replacing single-request large PUTs.
+- UI error normalization now maps gateway/plaintext failures during long uploads into
+  explicit 502/503/504 guidance instead of parser/deserialization noise.
+
+### Multi-backend bucket creation
+
+- Added admin API support to create a bucket pinned to a selected backend
+  (`POST /_/api/admin/buckets`) and wired the browser create-bucket flow to use it.
+- Create-bucket backend selector in the sidebar now uses `SimpleSelect` (no Ant popup
+  dependency), matching the rest of the embedded UI dropdown policy.
+
 ## v0.9.10 — 2026-05-06
 
 ## v0.9.11 — 2026-05-06

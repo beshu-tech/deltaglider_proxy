@@ -181,7 +181,10 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             get(admin::list_backends).post(admin::create_backend),
         )
         .route("/_/api/admin/backends/:name", delete(admin::delete_backend))
-        .route("/_/api/admin/buckets", get(admin::list_bucket_origins))
+        .route(
+            "/_/api/admin/buckets",
+            get(admin::list_bucket_origins).post(admin::create_bucket_on_backend),
+        )
         // Usage scanner
         .route("/_/api/admin/usage/scan", post(admin::scan_usage))
         .route("/_/api/admin/usage", get(admin::get_usage))

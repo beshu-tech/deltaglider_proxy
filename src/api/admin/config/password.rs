@@ -7,11 +7,12 @@
 //! orthogonal to the rest of the config surface, and benefits from
 //! being reviewed as a single unit.
 
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use super::super::{audit_log, trigger_config_sync, validate_password, AdminState};
@@ -188,6 +189,7 @@ pub struct RecoverDbResponse {
 /// hash (and base64 version) if the candidate password successfully decrypts the DB.
 pub async fn recover_db(
     State(state): State<Arc<AdminState>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Json(body): Json<RecoverDbRequest>,
 ) -> impl IntoResponse {
@@ -212,6 +214,7 @@ pub async fn recover_db(
     let guard = match crate::rate_limiter::RateLimitGuard::enter(
         &state.rate_limiter,
         &headers,
+        connect_info.as_ref().map(|ci| ci.0.ip()),
         "recover_db",
     )
     .await

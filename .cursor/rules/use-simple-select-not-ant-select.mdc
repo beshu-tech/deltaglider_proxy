@@ -1,0 +1,17 @@
+---
+description: Use SimpleSelect for dropdowns in the embedded UI
+globs:
+  - demo/s3-browser/ui/src/**/*.tsx
+alwaysApply: true
+---
+
+# Dropdown rule: never use Ant `Select` in embedded UI
+
+Ant Design popup layers are unreliable in this app layout.
+For dropdown/select UX in `demo/s3-browser/ui/src`, always use:
+
+- `SimpleSelect` for select/dropdown choices
+- `SimpleAutoComplete` for searchable free-text suggestions
+
+Do **not** introduce or reintroduce Ant `Select` / `AutoComplete` components in this UI.
+

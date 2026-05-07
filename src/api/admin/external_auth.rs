@@ -1,12 +1,13 @@
 //! API handlers for external authentication: OAuth flow, provider CRUD, group mapping.
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Redirect, Response},
     Json,
 };
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::config_db::auth_providers::{
@@ -42,6 +43,7 @@ pub struct OAuthCallbackQuery {
 /// Accepts optional `?next=/path` for post-login deep linking.
 pub async fn oauth_authorize(
     State(state): State<Arc<AdminState>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     Path(provider_name): Path<String>,
     Query(params): Query<OAuthAuthorizeQuery>,
     req_headers: HeaderMap,
@@ -68,7 +70,8 @@ pub async fn oauth_authorize(
     // Build redirect URI from the request's Host header
     let redirect_uri = build_callback_uri(&req_headers);
 
-    let client_ip = rate_limiter::extract_client_ip(&req_headers);
+    let client_ip =
+        rate_limiter::extract_client_ip_with_peer(&req_headers, connect_info.map(|ci| ci.0.ip()));
 
     // If discovery isn't cached yet, run it on-demand before initiating auth.
     // This avoids the "provider not ready" error on first click after startup.
@@ -109,6 +112,7 @@ pub async fn oauth_authorize(
 /// creates a session, and redirects to the admin UI.
 pub async fn oauth_callback(
     State(state): State<Arc<AdminState>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     Query(params): Query<OAuthCallbackQuery>,
     req_headers: HeaderMap,
 ) -> Response {
@@ -137,6 +141,7 @@ pub async fn oauth_callback(
     let guard = match crate::rate_limiter::RateLimitGuard::enter(
         &state.rate_limiter,
         &req_headers,
+        connect_info.as_ref().map(|ci| ci.0.ip()),
         "oauth_callback",
     )
     .await
@@ -150,7 +155,8 @@ pub async fn oauth_callback(
             .into_response();
         }
     };
-    let client_ip_for_session = rate_limiter::extract_client_ip(&req_headers);
+    let client_ip_for_session =
+        rate_limiter::extract_client_ip_with_peer(&req_headers, connect_info.map(|ci| ci.0.ip()));
 
     // Check for provider error response
     if let Some(err) = &params.error {

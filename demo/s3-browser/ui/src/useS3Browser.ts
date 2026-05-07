@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { message } from 'antd';
 import { listObjects, uploadObject, getBucket, setBucket, headObject, hasCredentials } from './s3client';
 import {
   bulkCopyObjects,
@@ -7,6 +8,7 @@ import {
   bulkZipDownloadUrl,
   listAllUnderPrefix,
 } from './adminApi';
+import { normalizeUiError } from './errorHandling';
 import useSelection from './useSelection';
 import { virtualWritableChildren } from './permissions';
 // Bulk actions → admin objects API; gate with `sessionCapabilities.canBulkOps` / `adminGui`.
@@ -124,7 +126,7 @@ export default function useS3Browser(options: UseS3BrowserOptions = {}) {
       .catch((err) => {
         if (seq !== loadSeq.current) return; // stale error — drop silently
         // Keep stale data on error instead of clearing
-        setError(err instanceof Error ? err.message : 'Failed to load objects');
+        setError(normalizeUiError(err, 'Failed to load objects'));
         setConnected(false);
         setVirtualFolders([]);
       })
@@ -233,7 +235,9 @@ export default function useS3Browser(options: UseS3BrowserOptions = {}) {
       clearSelection();
       refresh();
     } catch (e) {
-      console.error('Bulk delete failed:', e);
+      const msg = normalizeUiError(e, 'Bulk delete failed');
+      setError(msg);
+      message.error(msg);
     } finally {
       setDeleting(false);
     }
@@ -367,7 +371,9 @@ export default function useS3Browser(options: UseS3BrowserOptions = {}) {
       }
       setRefreshTrigger((k) => k + 1);
     } catch (e) {
-      console.error('Upload failed:', e);
+      const msg = normalizeUiError(e, 'Upload failed');
+      setError(msg);
+      message.error(msg);
     }
   }, []);
 

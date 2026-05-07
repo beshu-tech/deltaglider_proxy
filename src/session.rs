@@ -214,10 +214,16 @@ impl SessionStore {
         })
     }
 
-    /// Get the auth method for a session.
-    pub fn auth_method(&self, token: &str) -> Option<AuthMethod> {
+    /// Get the auth method for a valid session token.
+    pub fn auth_method(&self, token: &str, ip: Option<IpAddr>) -> Option<AuthMethod> {
         let sessions = self.sessions.read();
-        sessions.get(token).map(|info| info.auth_method.clone())
+        sessions.get(token).and_then(|info| {
+            if self.entry_valid(info, ip) {
+                Some(info.auth_method.clone())
+            } else {
+                None
+            }
+        })
     }
 
     /// Clear S3 credentials from a session.
@@ -306,7 +312,7 @@ mod tests {
     fn test_auth_method_bootstrap() {
         let store = SessionStore::new();
         let token = store.create_session(None, AuthMethod::Bootstrap, SessionKind::AdminGui);
-        let method = store.auth_method(&token);
+        let method = store.auth_method(&token, None);
         assert!(matches!(method, Some(AuthMethod::Bootstrap)));
     }
 
@@ -320,7 +326,7 @@ mod tests {
             },
             SessionKind::AdminGui,
         );
-        let method = store.auth_method(&token).unwrap();
+        let method = store.auth_method(&token, None).unwrap();
         match method {
             AuthMethod::IamLoginAs { access_key_id } => {
                 assert_eq!(access_key_id, "AKTEST01");
@@ -340,7 +346,7 @@ mod tests {
             },
             SessionKind::AdminGui,
         );
-        let method = store.auth_method(&token).unwrap();
+        let method = store.auth_method(&token, None).unwrap();
         match method {
             AuthMethod::External {
                 provider_name,
@@ -356,7 +362,20 @@ mod tests {
     #[test]
     fn test_auth_method_none_for_invalid_token() {
         let store = SessionStore::new();
-        assert!(store.auth_method("nonexistent").is_none());
+        assert!(store.auth_method("nonexistent", None).is_none());
+    }
+
+    #[test]
+    fn test_auth_method_respects_ip_binding() {
+        let store = SessionStore::new();
+        let ip1: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip2: IpAddr = "10.0.0.2".parse().unwrap();
+        let token = store.create_session(Some(ip1), AuthMethod::Bootstrap, SessionKind::AdminGui);
+        assert!(matches!(
+            store.auth_method(&token, Some(ip1)),
+            Some(AuthMethod::Bootstrap)
+        ));
+        assert!(store.auth_method(&token, Some(ip2)).is_none());
     }
 
     #[test]
