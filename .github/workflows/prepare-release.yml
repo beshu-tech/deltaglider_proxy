@@ -20,6 +20,13 @@ on:
 
 permissions: {}
 
+defaults:
+  run:
+    # Self-hosted k3s runner's container image defaults to /bin/sh, not
+    # bash. Every `run:` step here uses bash-isms (`set -o pipefail`,
+    # `[[ ... =~ ... ]]`). Pin bash workflow-wide.
+    shell: bash
+
 jobs:
   prepare:
     name: Prepare release PR
