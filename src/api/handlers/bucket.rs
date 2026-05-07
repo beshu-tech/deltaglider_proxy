@@ -567,28 +567,32 @@ pub async fn delete_bucket(
 ) -> Result<Response, S3Error> {
     info!("DELETE bucket {}", bucket);
 
-    // Check if bucket is empty (S3 requires buckets to be empty before deletion).
-    // We compute both object and MPU blockers up front so the error is explicit
-    // and deterministic for UIs that want to offer actionable remediation.
+    // Check object emptiness first: only visible objects are hard blockers.
     let page = state
         .engine
         .load()
         .list_objects(&bucket, "", None, 1, None, false)
         .await?;
     let has_objects = !page.objects.is_empty();
+    let first_object = page.objects.first().map(|(key, _)| key.as_str());
 
-    // H2 security fix: also refuse if there are active multipart uploads
-    // targeting this bucket. Pre-fix, DeleteBucket returned 204 while
-    // MultipartStore still held uploads for the now-deleted bucket —
-    // UploadPart kept accepting bytes, ListMultipartUploads reported
-    // uploads on a ghost bucket, and CompleteMultipartUpload would 404
-    // via ensure_bucket_exists but leave the MPU state stuck.
     let mpu_count = state.multipart.count_uploads_for_bucket(&bucket);
-    if has_objects || mpu_count > 0 {
+    if has_objects {
+        let sample = first_object.unwrap_or("<unknown>");
         return Err(S3Error::BucketNotEmpty(format!(
-            "{} (delete blockers: objects_present={}, multipart_uploads={})",
-            bucket, has_objects, mpu_count
+            "{} (blocked: visible object remains, example_key={}, multipart_uploads={}; action: delete user objects first)",
+            bucket, sample, mpu_count
         )));
+    }
+
+    // For object-empty buckets, MPU state is internal residue: purge it
+    // deterministically so deletion is self-healing and frictionless.
+    if mpu_count > 0 {
+        let purged = state.multipart.purge_uploads_for_bucket(&bucket);
+        info!(
+            "DELETE bucket {} purged {} multipart upload residues before deletion",
+            bucket, purged
+        );
     }
 
     // Delete the real bucket on the storage backend

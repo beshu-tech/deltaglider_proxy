@@ -313,6 +313,41 @@ impl FilesystemBackend {
         })
     }
 
+    /// Remove internal/non-object residue from a bucket root after
+    /// `deltaspaces/` has been verified empty of visible objects.
+    ///
+    /// Any entry outside `deltaspaces/` is not part of the S3 object view for
+    /// the filesystem backend and can be cleaned as internal residue.
+    fn prune_bucket_root_residue<'a>(
+        bucket_dir: &'a Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), StorageError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut entries = match fs::read_dir(bucket_dir).await {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(StorageError::from(e)),
+            };
+
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name == "deltaspaces" {
+                    continue;
+                }
+
+                let file_type = entry.file_type().await?;
+                if file_type.is_dir() {
+                    fs::remove_dir_all(&path).await?;
+                } else {
+                    fs::remove_file(&path).await?;
+                }
+            }
+
+            Ok(())
+        })
+    }
+
     /// Recursively find all deltaspaces (directories containing deltaglider files)
     fn find_deltaspaces_recursive<'a>(
         base_dir: &'a Path,
@@ -553,7 +588,7 @@ impl StorageBackend for FilesystemBackend {
         if !path_exists(&bucket_dir).await {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
-        // Check if bucket has any content
+        // Check if bucket has any user-visible object content.
         let deltaspaces_dir = bucket_dir.join("deltaspaces");
         if path_exists(&deltaspaces_dir).await {
             if !Self::prune_invisible_data_recursive(&deltaspaces_dir).await? {
@@ -568,6 +603,10 @@ impl StorageBackend for FilesystemBackend {
                 Err(e) => return Err(StorageError::from(e)),
             }
         }
+
+        // If the bucket is object-empty but still "dirty", proactively clear
+        // internal residue so users are not blocked by backend housekeeping.
+        Self::prune_bucket_root_residue(&bucket_dir).await?;
 
         match fs::remove_dir(&bucket_dir).await {
             Ok(()) => {}
@@ -1613,6 +1652,32 @@ mod tests {
             .delete_bucket("bucket")
             .await
             .expect("delete bucket");
+        assert!(!tmp.path().join("bucket").exists());
+    }
+
+    #[tokio::test]
+    async fn test_delete_bucket_removes_root_internal_residue() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .expect("new backend");
+        backend.create_bucket("bucket").await.expect("create");
+
+        let bucket_dir = tmp.path().join("bucket");
+        fs::write(bucket_dir.join(".tmp-lock"), b"stale")
+            .await
+            .unwrap();
+        fs::create_dir_all(bucket_dir.join("tmp-work/subdir"))
+            .await
+            .expect("create tmp dir");
+        fs::write(bucket_dir.join("tmp-work/subdir/cache.bin"), b"stale")
+            .await
+            .expect("write tmp payload");
+
+        backend
+            .delete_bucket("bucket")
+            .await
+            .expect("delete bucket with root residue");
         assert!(!tmp.path().join("bucket").exists());
     }
 

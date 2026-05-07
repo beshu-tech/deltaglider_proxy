@@ -8,13 +8,12 @@ use aws_sdk_s3::primitives::ByteStream;
 use common::TestServer;
 
 // ────────────────────────────────────────────────────────────────────────
-// H2 — DeleteBucket rejects when multipart uploads exist
+// H2 — DeleteBucket handles multipart residue deterministically
 // ────────────────────────────────────────────────────────────────────────
 
-/// Pre-fix, DeleteBucket returned 204 while MultipartStore still held
-/// uploads for that bucket. Now it must reject with a clear error.
+/// Object-empty buckets should self-heal MPU residue and delete successfully.
 #[tokio::test]
-async fn test_delete_bucket_refuses_with_active_multipart_uploads() {
+async fn test_delete_bucket_purges_active_multipart_uploads_when_object_empty() {
     let server = TestServer::filesystem().await;
     let client = server.s3_client().await;
 
@@ -33,45 +32,65 @@ async fn test_delete_bucket_refuses_with_active_multipart_uploads() {
         .send()
         .await
         .expect("initiate mpu");
-    let upload_id = create.upload_id().unwrap().to_string();
+    let upload_id = create.upload_id().expect("upload id").to_string();
 
-    // DeleteBucket must now fail (409 BucketNotEmpty). The SDK-level
-    // error message is opaque, so check via raw HTTP that the XML
-    // body actually cites MPU.
-    let del = client.delete_bucket().bucket(bucket).send().await;
-    assert!(del.is_err(), "delete_bucket with active MPU must fail");
-
-    let http = reqwest::Client::new();
-    let raw = http
-        .delete(format!("{}/{}", server.endpoint(), bucket))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(raw.status().as_u16(), 409);
-    let body = raw.text().await.unwrap();
-    assert!(
-        body.contains("BucketNotEmpty")
-            && body.contains("objects_present=false")
-            && body.contains("multipart_uploads=1"),
-        "expected explicit MPU blocker details, got: {}",
-        body
-    );
-
-    // Abort the upload and retry — now delete succeeds.
-    client
-        .abort_multipart_upload()
-        .bucket(bucket)
-        .key("pending.bin")
-        .upload_id(&upload_id)
-        .send()
-        .await
-        .expect("abort");
+    // Delete must self-heal MPU residue and succeed.
     client
         .delete_bucket()
         .bucket(bucket)
         .send()
         .await
-        .expect("delete now ok");
+        .expect("delete must purge mpu residue");
+
+    // The upload state must be gone deterministically.
+    let uploads = client.list_multipart_uploads().bucket(bucket).send().await;
+    assert!(
+        uploads.is_err(),
+        "bucket should be deleted, list_multipart_uploads must fail"
+    );
+
+    let abort = client
+        .abort_multipart_upload()
+        .bucket(bucket)
+        .key("pending.bin")
+        .upload_id(&upload_id)
+        .send()
+        .await;
+    assert!(
+        abort.is_err(),
+        "purged upload id must no longer be abortable after delete"
+    );
+}
+
+#[tokio::test]
+async fn test_delete_bucket_succeeds_with_internal_residue_only() {
+    let server = TestServer::filesystem().await;
+    let client = server.s3_client().await;
+    let bucket = "h2-dirty-fs-bucket";
+
+    client
+        .create_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("create bucket");
+
+    let bucket_dir = server.data_dir().expect("fs data dir").join(bucket);
+    std::fs::create_dir_all(bucket_dir.join("tmp-residue/subdir")).expect("create residue dirs");
+    std::fs::write(bucket_dir.join("tmp-residue/subdir/work.bin"), b"junk")
+        .expect("write residue file");
+    std::fs::create_dir_all(bucket_dir.join("deltaspaces/ghost")).expect("create ghost deltaspace");
+    std::fs::write(bucket_dir.join("deltaspaces/ghost/reference.bin"), b"ref")
+        .expect("write reference residue");
+    std::fs::write(bucket_dir.join("deltaspaces/ghost/.stale"), b"tmp")
+        .expect("write hidden residue");
+
+    client
+        .delete_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("delete must self-heal internal residue");
 }
 
 #[tokio::test]
@@ -112,8 +131,10 @@ async fn test_delete_bucket_error_reports_object_and_mpu_blockers() {
     assert_eq!(raw.status().as_u16(), 409);
     let body = raw.text().await.unwrap();
     assert!(
-        body.contains("objects_present=true") && body.contains("multipart_uploads=1"),
-        "expected object+mpu blockers in body, got: {}",
+        body.contains("visible object remains")
+            && body.contains("multipart_uploads=1")
+            && body.contains("action: delete user objects first"),
+        "expected actionable object+mpu blocker text, got: {}",
         body
     );
 

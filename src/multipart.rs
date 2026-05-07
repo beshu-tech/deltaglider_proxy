@@ -767,6 +767,33 @@ impl MultipartStore {
             .count()
     }
 
+    /// Force-remove all uploads targeting `bucket`.
+    ///
+    /// Used by DeleteBucket when the bucket has no visible objects:
+    /// MPU state is internal residue and should not block deletion.
+    pub fn purge_uploads_for_bucket(&self, bucket: &str) -> usize {
+        let removed: Vec<MultipartUpload> = {
+            let mut uploads = self.uploads.write();
+            let mut removed = Vec::new();
+            uploads.retain(|_, u| {
+                if u.bucket == bucket {
+                    removed.push(take_upload_for_cleanup(u));
+                    return false;
+                }
+                true
+            });
+            removed
+        };
+
+        let removed_count = removed.len();
+        for upload in removed {
+            let _ = self.release_bytes(&upload);
+            cleanup_relay_dir_for_upload(&upload);
+        }
+
+        removed_count
+    }
+
     /// List parts for an upload. Validates bucket+key match.
     pub fn list_parts(
         &self,
