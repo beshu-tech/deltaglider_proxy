@@ -214,10 +214,40 @@ async fn test_delete_last_delta_cleans_reference() {
     )
     .await;
 
+    // Sanity: reference.bin must exist on the filesystem backend after the
+    // first PUT (the proxy creates it implicitly as the deltaspace baseline).
+    let data_dir = server
+        .data_dir()
+        .expect("filesystem server must expose data_dir");
+    let ref_path = data_dir
+        .join(server.bucket())
+        .join("deltaspaces")
+        .join("clean")
+        .join("reference.bin");
+    assert!(
+        ref_path.exists(),
+        "reference.bin should exist after first PUT, looked at {:?}",
+        ref_path,
+    );
+
     // Delete the file
     let url = format!("{}/{}/clean/app.zip", server.endpoint(), server.bucket());
     let resp = http.delete(&url).send().await.unwrap();
     assert!(resp.status().is_success() || resp.status().as_u16() == 204);
+
+    // The contract: deleting the LAST delta in a deltaspace MUST also
+    // delete the reference.bin baseline. Otherwise we leak storage and,
+    // worse, the next PUT under this prefix is forced to delta against a
+    // stale reference (the prod 0.01% efficiency disaster on
+    // s3://beshu/ror/builds/1.70.0-pre5/ — first upload was a Kibana
+    // ZIP, every subsequent ES plugin deltaed against it for 0% savings,
+    // and the orphan reference would have stayed had the last sibling
+    // been deleted in between).
+    assert!(
+        !ref_path.exists(),
+        "reference.bin must be removed after the last delta is deleted (storage leak), still found at {:?}",
+        ref_path,
+    );
 
     // PUT a new zip — should still work (new reference created)
     let new_data = generate_binary(50_000, 300);
@@ -238,6 +268,144 @@ async fn test_delete_last_delta_cleans_reference() {
     assert_eq!(
         get_bytes(&http, &server.endpoint(), server.bucket(), "clean/v2.zip").await,
         new_data
+    );
+}
+
+/// Same contract, exercised through the **batch DeleteObjects** path
+/// (POST `?delete` XML), which is what `aws s3 rm --recursive` and
+/// the embedded UI's "delete selected" use. The cleanup loop in
+/// `engine::delete()` runs once per object, so the LAST item in a
+/// batch is what triggers the reference removal — verify it does.
+#[tokio::test]
+async fn test_batch_delete_cleans_reference_on_last_delta() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+
+    // Two siblings under the same deltaspace.
+    let base = generate_binary(50_000, 1234);
+    let v1 = mutate_binary(&base, 0.01);
+    put_and_get_storage_type(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        "rmrf/base.zip",
+        base,
+        "application/zip",
+    )
+    .await;
+    put_and_get_storage_type(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        "rmrf/v1.zip",
+        v1,
+        "application/zip",
+    )
+    .await;
+
+    let data_dir = server
+        .data_dir()
+        .expect("filesystem server must expose data_dir");
+    let ref_path = data_dir
+        .join(server.bucket())
+        .join("deltaspaces")
+        .join("rmrf")
+        .join("reference.bin");
+    assert!(
+        ref_path.exists(),
+        "reference.bin should exist after the two PUTs"
+    );
+
+    // Batch DeleteObjects of BOTH siblings in one call. After this, the
+    // deltaspace has zero deltas → the reference must go.
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Delete>
+  <Object><Key>rmrf/base.zip</Key></Object>
+  <Object><Key>rmrf/v1.zip</Key></Object>
+  <Quiet>true</Quiet>
+</Delete>"#;
+    let url = format!("{}/{}/?delete", server.endpoint(), server.bucket());
+    // Content-MD5 is required for DeleteObjects in AWS, but our proxy
+    // accepts the XML without it (validate_content_md5 only checks if
+    // the header is present). Send without it for simplicity.
+    let resp = http
+        .post(&url)
+        .header("Content-Type", "application/xml")
+        .body(xml)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "DeleteObjects batch should succeed, got {}: {}",
+        resp.status(),
+        resp.text().await.unwrap_or_default()
+    );
+
+    assert!(
+        !ref_path.exists(),
+        "reference.bin must be removed after batch delete empties the deltaspace, still found at {:?}",
+        ref_path,
+    );
+}
+
+/// Recursive prefix delete (DELETE `/{bucket}/{prefix}/`) is a
+/// proxy-specific convenience; `aws s3 rm --recursive` actually issues
+/// per-object DELETEs, but the embedded UI's "delete folder" calls
+/// this. Same invariant: when the prefix is empty, no orphan
+/// `reference.bin` should remain.
+#[tokio::test]
+async fn test_recursive_delete_cleans_reference() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+
+    let base = generate_binary(50_000, 9000);
+    let v1 = mutate_binary(&base, 0.01);
+    put_and_get_storage_type(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        "purge/a.zip",
+        base,
+        "application/zip",
+    )
+    .await;
+    put_and_get_storage_type(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        "purge/b.zip",
+        v1,
+        "application/zip",
+    )
+    .await;
+
+    let data_dir = server
+        .data_dir()
+        .expect("filesystem server must expose data_dir");
+    let ref_path = data_dir
+        .join(server.bucket())
+        .join("deltaspaces")
+        .join("purge")
+        .join("reference.bin");
+    assert!(
+        ref_path.exists(),
+        "reference.bin should exist after the two PUTs"
+    );
+
+    // Recursive delete of the prefix.
+    let url = format!("{}/{}/purge/", server.endpoint(), server.bucket());
+    let resp = http.delete(&url).send().await.unwrap();
+    assert!(
+        resp.status().is_success(),
+        "recursive delete should succeed, got {}",
+        resp.status()
+    );
+
+    assert!(
+        !ref_path.exists(),
+        "reference.bin must be removed after recursive prefix delete, still found at {:?}",
+        ref_path,
     );
 }
 
