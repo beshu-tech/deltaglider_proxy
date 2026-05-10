@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.9.18 — 2026-05-10
+
 ### Added
 
 - **Delta efficiency diagnostics panel** at
