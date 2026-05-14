@@ -16,8 +16,12 @@ const title = 'Pricing — DeltaGlider';
 const description =
   'Open source GPL-3.0 forever. Production support from $10k/year, scaling with your stored footprint. Calculator (week 2) shows your annual savings live.';
 
-// Single source of truth for the static tier table below; the Week-2
-// calculator's brackets.ts will share the same numbers.
+// TODO(brackets): this `tiers` array is paired with the visible
+// HTML table further down (search "What you'd pay"). The Week-2
+// calculator will extract both into `src/lib/brackets.ts` as the
+// single source of truth — until then, edits to either MUST be
+// mirrored in the other. The descriptions are currently paraphrased
+// between the two; consolidate when the calculator lands.
 const tiers = [
   {
     sku: 'production-support-starter',
@@ -84,6 +88,10 @@ const tiers = [
     <section class="tiers">
       <h2>What you'd pay</h2>
 
+      {/* TODO(brackets): see the `tiers` array in this file's
+          frontmatter. Both this <table> and that array describe the
+          same priced tiers; the Week-2 calculator extracts both into
+          src/lib/brackets.ts. Mirror any edit. */}
       <table>
         <thead>
           <tr>

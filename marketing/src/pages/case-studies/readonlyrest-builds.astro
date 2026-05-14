@@ -6,6 +6,7 @@
 
 import BaseLayout from '../../layouts/BaseLayout.astro';
 import JsonLd from '../../components/JsonLd.astro';
+import CompressionResultsTable from '../../components/CompressionResultsTable.astro';
 import {
   webPageSchema,
   breadcrumbListSchema,
@@ -120,40 +121,7 @@ const dateModified = '2026-05-14';
     <section class="results">
       <h2>Per-version results so far (verified, SHA-256 round-tripped)</h2>
 
-      <table>
-        <thead>
-          <tr>
-            <th>Version</th>
-            <th>Source size</th>
-            <th>Stored size</th>
-            <th>Compression</th>
-            <th>Verdict</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td>1.69.0 (warm-path)</td>
-            <td>2,866 MB</td>
-            <td>32.4 MB</td>
-            <td>88.5×</td>
-            <td>Excellent</td>
-          </tr>
-          <tr>
-            <td>1.38.0 (warm-path, multi-shape)</td>
-            <td>13,795 MB</td>
-            <td>3,355 MB</td>
-            <td>4.1×</td>
-            <td>Fair</td>
-          </tr>
-          <tr>
-            <td>1.17.1 (cold from Glacier)</td>
-            <td>26.5 MB</td>
-            <td>6.87 MB</td>
-            <td>3.8×</td>
-            <td>Small dataset</td>
-          </tr>
-        </tbody>
-      </table>
+      <CompressionResultsTable detailed={true} includeTotalRow={false} />
 
       <p>
         The 1.38.0 result is publishable as-is because it tells the

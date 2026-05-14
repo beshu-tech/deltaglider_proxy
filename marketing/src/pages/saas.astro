@@ -7,6 +7,7 @@
 import BaseLayout from '../layouts/BaseLayout.astro';
 import JsonLd from '../components/JsonLd.astro';
 import MechanismExplanation from '../components/MechanismExplanation.astro';
+import CompressionResultsTable from '../components/CompressionResultsTable.astro';
 import { webPageSchema, breadcrumbListSchema } from '../lib/seo';
 
 const title = 'DeltaGlider for SaaS — cut S3 storage cost on versioned artifacts';
@@ -51,47 +52,7 @@ const description =
         results from the test runs are below.
       </p>
 
-      <table>
-        <thead>
-          <tr>
-            <th>Version</th>
-            <th>Source size</th>
-            <th>Stored size</th>
-            <th>Compression</th>
-            <th>Verdict</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td>1.69.0</td>
-            <td>2,866 MB</td>
-            <td>32.4 MB</td>
-            <td><strong>88.5×</strong></td>
-            <td>Excellent</td>
-          </tr>
-          <tr>
-            <td>1.38.0</td>
-            <td>13,795 MB</td>
-            <td>3,355 MB</td>
-            <td><strong>4.1×</strong></td>
-            <td>Fair (cross-major ES range)</td>
-          </tr>
-          <tr>
-            <td>1.17.1 (cold from Glacier)</td>
-            <td>26.5 MB</td>
-            <td>6.87 MB</td>
-            <td><strong>3.8×</strong></td>
-            <td>Small dataset, dominated by reference</td>
-          </tr>
-          <tr>
-            <td><strong>Full migration</strong></td>
-            <td><strong>1.71 TB</strong></td>
-            <td>TBD</td>
-            <td>TBD</td>
-            <td>In progress</td>
-          </tr>
-        </tbody>
-      </table>
+      <CompressionResultsTable detailed={false} />
 
       <p>
         Why is 1.38.0 only 4.1×? Because the legacy deltaspace mixes ES

@@ -1,0 +1,110 @@
+---
+// ScreenshotGallery.astro
+//
+// Visual proof of the admin UI surface, paired with the homepage's
+// operator-surface bullet list. Screenshots come from docs/screenshots/
+// via the copy-screenshots.mjs prebuild hook, which copies them into
+// public/screenshots/ at /screenshots/*.
+//
+// Each screenshot has descriptive alt text (accessibility + SEO).
+// Width/height attributes prevent CLS (Cumulative Layout Shift).
+// loading="lazy" defers below-the-fold image loads.
+
+interface Screenshot {
+  src: string;
+  alt: string;
+  caption: string;
+}
+
+const screenshots: Screenshot[] = [
+  {
+    src: '/screenshots/iam.jpg',
+    alt: 'DeltaGlider admin UI showing the IAM user management page with users, groups, and permission policies',
+    caption: 'Per-user IAM with ABAC permissions',
+  },
+  {
+    src: '/screenshots/object-replication.jpg',
+    alt: 'DeltaGlider admin UI showing replication rules between buckets, with run-now, pause, and delete-replication options',
+    caption: 'Replication rules between buckets and backends',
+  },
+  {
+    src: '/screenshots/advanced_security.jpg',
+    alt: 'DeltaGlider admin UI showing the advanced security configuration page with encryption settings',
+    caption: 'AES-256-GCM at-rest encryption, key in your runtime',
+  },
+  {
+    src: '/screenshots/analytics.jpg',
+    alt: 'DeltaGlider admin UI showing storage analytics with compression ratios and stored-footprint breakdown',
+    caption: 'Storage analytics — see your compression ratios live',
+  },
+  {
+    src: '/screenshots/bucket-policies.jpg',
+    alt: 'DeltaGlider admin UI showing per-bucket policy configuration including quotas and aliases',
+    caption: 'Per-bucket policy, quotas, and aliases',
+  },
+  {
+    src: '/screenshots/filebrowser.jpg',
+    alt: 'DeltaGlider admin UI showing the object browser with files in a bucket',
+    caption: 'Object browser with download, preview, and delete',
+  },
+];
+---
+
+<div class="screenshot-gallery">
+  {
+    screenshots.map((s) => (
+      <figure>
+        <img
+          src={s.src}
+          alt={s.alt}
+          width="1147"
+          height="1440"
+          loading="lazy"
+          decoding="async"
+        />
+        <figcaption>{s.caption}</figcaption>
+      </figure>
+    ))
+  }
+</div>
+
+<style>
+  .screenshot-gallery {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 1.5rem;
+    margin: 2rem 0;
+  }
+
+  @media (min-width: 600px) {
+    .screenshot-gallery {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+
+  @media (min-width: 1000px) {
+    .screenshot-gallery {
+      grid-template-columns: 1fr 1fr 1fr;
+    }
+  }
+
+  figure {
+    margin: 0;
+  }
+
+  figure img {
+    width: 100%;
+    height: auto;
+    display: block;
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    background: var(--bg-soft);
+  }
+
+  figcaption {
+    margin-top: 0.5rem;
+    font-size: 0.85rem;
+    color: var(--ink-soft);
+    line-height: 1.4;
+  }
+</style>

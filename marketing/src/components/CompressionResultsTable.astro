@@ -1,0 +1,107 @@
+---
+// CompressionResultsTable.astro
+//
+// Per-version compression results from the in-progress ReadonlyREST
+// builds migration. Verified, SHA-256 round-tripped, publishable today.
+//
+// Used on /saas and /case-studies/readonlyrest-builds — keeping them
+// in sync via this component prevents the copy-paste drift the
+// hygiene reviewer flagged.
+//
+// When the full migration completes (week 3-4 of the launch plan),
+// update the `rows` array below and the "Full migration" TBD row.
+
+interface Props {
+  /**
+   * Whether to include the parenthetical context labels
+   * ("warm-path", "cold from Glacier", etc.). Default true.
+   * Set false for compact rendering.
+   */
+  detailed?: boolean;
+  /** Whether to include the "Full migration" in-progress placeholder row. */
+  includeTotalRow?: boolean;
+}
+
+const { detailed = true, includeTotalRow = true } = Astro.props;
+
+interface Row {
+  version: string;
+  variant?: string;
+  sourceSize: string;
+  storedSize: string;
+  compression: string;
+  verdict: string;
+}
+
+const rows: Row[] = [
+  {
+    version: '1.69.0',
+    variant: 'warm-path',
+    sourceSize: '2,866 MB',
+    storedSize: '32.4 MB',
+    compression: '88.5×',
+    verdict: 'Excellent',
+  },
+  {
+    version: '1.38.0',
+    variant: 'warm-path, multi-shape',
+    sourceSize: '13,795 MB',
+    storedSize: '3,355 MB',
+    compression: '4.1×',
+    verdict: 'Fair (cross-major ES range)',
+  },
+  {
+    version: '1.17.1',
+    variant: 'cold from Glacier',
+    sourceSize: '26.5 MB',
+    storedSize: '6.87 MB',
+    compression: '3.8×',
+    verdict: 'Small dataset, dominated by reference',
+  },
+];
+---
+
+<table>
+  <thead>
+    <tr>
+      <th>Version</th>
+      <th>Source size</th>
+      <th>Stored size</th>
+      <th>Compression</th>
+      <th>Verdict</th>
+    </tr>
+  </thead>
+  <tbody>
+    {
+      rows.map((r) => (
+        <tr>
+          <td>
+            {r.version}
+            {detailed && r.variant ? ` (${r.variant})` : ''}
+          </td>
+          <td>{r.sourceSize}</td>
+          <td>{r.storedSize}</td>
+          <td>
+            <strong>{r.compression}</strong>
+          </td>
+          <td>{r.verdict}</td>
+        </tr>
+      ))
+    }
+    {
+      includeTotalRow && (
+        <tr>
+          <td>
+            <strong>Full migration</strong>
+          </td>
+          <td>
+            <strong>1.71 TB</strong>
+          </td>
+          <td>TBD</td>
+          <td>TBD</td>
+          <td>In progress</td>
+        </tr>
+      )
+    }
+  </tbody>
+</table>
