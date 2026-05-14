@@ -1,5 +1,24 @@
 # Transparent Encryption at Rest (SSE-Proxy)
 
+> **Status:** shipped. This planning note is kept for archaeology only.
+> The shipped design differs from the proposal below in load-bearing
+> ways — read the live docs, NOT this file, when you need ground truth.
+>
+> Current authoritative references:
+> - Operator docs: [`docs/product/reference/encryption-at-rest.md`](../docs/product/reference/encryption-at-rest.md)
+> - Production security checklist: [`docs/product/20-production-security-checklist.md`](../docs/product/20-production-security-checklist.md)
+> - Code: [`src/storage/encrypting.rs`](../src/storage/encrypting.rs) — module docs at the top of the file are the canonical contract.
+>
+> What ships today and is NOT in the proposal below:
+> - Per-backend keys (not derived from bootstrap password as proposed)
+> - Chunked-streaming AES-256-GCM format (`aes-256-gcm-chunked-v1`)
+> - Key rotation via `dg-encryption-key-id` field
+>
+> The original proposal below is preserved for context on how we
+> arrived at the current design.
+
+---
+
 ## Value Proposition
 
 Use cheap, untrusted cloud object storage (Hetzner, Backblaze, any S3) with DGP encrypting everything at rest. Only DGP holds the secret. DGP runs on-prem with arbitrary cache. Backend is a dumb encrypted blob store.
