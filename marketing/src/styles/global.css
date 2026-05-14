@@ -1,54 +1,122 @@
-/* global.css — anti-polish base styles per v5 plan §7.
+/* global.css — visual foundation for the marketing site.
  *
- * Design principles:
- * - Plain typography, readable line length, generous vertical rhythm
- * - One brand color (Beshu teal), one accent, system fonts (no web font)
- * - Mobile-first; desktop layout via min-width media queries
- * - No animations, no gradients, no decorative shadows
+ * Design rules (v5 plan §7):
+ * - Anti-polish but not naked. Engineering-team-project-page energy.
+ * - One brand color (teal), one accent (warm amber). No animations.
+ * - Sharp typography, generous vertical rhythm, mobile-first.
+ * - Inspiration: tailscale.com, supabase.com, oxide.computer.
  *
- * Color palette is anchored to Beshu teal. Pick the closest cousin
- * to readonlyrest.com when porting brand assets in week 1.
+ * Brand palette ported from the prior Beshu site for continuity.
  */
 
+/* === Self-hosted JetBrains Mono (OFL) === */
+
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/jetbrains-mono/JetBrainsMono-Regular.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('/fonts/jetbrains-mono/JetBrainsMono-Medium.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url('/fonts/jetbrains-mono/JetBrainsMono-SemiBold.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url('/fonts/jetbrains-mono/JetBrainsMono-Bold.woff2') format('woff2');
+}
+
+/* === Brand tokens === */
+
 :root {
-  /* Brand */
-  --beshu-teal: #1f8b8b;
-  --beshu-teal-dark: #166060;
-  --accent: #d4732a; /* warm complement to teal; used sparingly */
+  /* Brand teal — full Tailwind-style ramp (matches prior Beshu site).
+   * Primary: 600 (#0d9488). Hover: 700. Light tints for backgrounds. */
+  --teal-50:  #ecfdf8;
+  --teal-100: #ccfbef;
+  --teal-200: #99f6e0;
+  --teal-300: #5eead4;
+  --teal-400: #2dd4bf;
+  --teal-500: #14b8a6;
+  --teal-600: #0d9488;
+  --teal-700: #0f766e;
+  --teal-800: #115e59;
+  --teal-900: #134e4a;
 
-  /* Neutrals */
-  --ink: #14181c;
-  --ink-soft: #4a5159;
-  --ink-faint: #7a828b;
+  /* Ink — slate ramp for body copy + UI chrome. */
+  --ink-50:  #f8fafc;
+  --ink-100: #f1f5f9;
+  --ink-200: #e2e8f0;
+  --ink-300: #cbd5e1;
+  --ink-400: #94a3b8;
+  --ink-500: #64748b;
+  --ink-600: #475569;
+  --ink-700: #334155;
+  --ink-800: #1e293b;
+  --ink-900: #0f172a;
+
+  /* Warm accent — used sparingly. The lightning bolt logo on dark uses this. */
+  --accent: #d4732a;
+  --accent-soft: #fef3e7;
+
+  /* Semantic aliases */
+  --brand: var(--teal-600);
+  --brand-dark: var(--teal-700);
+  --brand-soft: var(--teal-50);
+  --ink: var(--ink-900);
+  --ink-strong: var(--ink-800);
+  --ink-soft: var(--ink-600);
+  --ink-faint: var(--ink-500);
+  --ink-mute: var(--ink-400);
   --bg: #ffffff;
-  --bg-soft: #f6f7f8;
-  --bg-card: #fbfbfc;
-  --rule: #e1e4e8;
+  --bg-soft: var(--ink-50);
+  --bg-card: #ffffff;
+  --bg-alt: var(--ink-100);
+  --rule: var(--ink-200);
+  --rule-strong: var(--ink-300);
 
-  /* Type scale */
-  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
-    "Helvetica Neue", Arial, sans-serif;
-  --font-mono: ui-monospace, SFMono-Regular, "Menlo", "Monaco",
-    "Consolas", "Liberation Mono", "Courier New", monospace;
+  /* Type */
+  --font-sans: 'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, 'Menlo', 'Monaco', monospace;
 
-  /* Sizes */
-  --measure: 68ch;     /* readable line length */
+  /* Layout */
+  --shell: 1100px;
+  --measure: 68ch;
   --measure-wide: 88ch;
-  --shell: 1100px;     /* page max-width on desktop */
+
+  /* Shadows — subtle, used on cards + buttons only */
+  --shadow-sm: 0 1px 2px 0 rgb(15 23 42 / 0.04);
+  --shadow-md: 0 4px 12px -2px rgb(15 23 42 / 0.06), 0 2px 4px -1px rgb(15 23 42 / 0.04);
+  --shadow-lg: 0 10px 30px -8px rgb(15 23 42 / 0.12), 0 4px 8px -2px rgb(15 23 42 / 0.06);
 }
 
-* {
-  box-sizing: border-box;
-}
+* { box-sizing: border-box; }
 
 html {
   font-family: var(--font-sans);
   font-size: 16px;
-  line-height: 1.55;
+  line-height: 1.6;
   color: var(--ink);
   background: var(--bg);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  scroll-behavior: smooth;
 }
 
 body {
@@ -56,6 +124,7 @@ body {
   min-height: 100vh;
   display: flex;
   flex-direction: column;
+  font-feature-settings: 'cv02', 'cv11';
 }
 
 main {
@@ -63,104 +132,152 @@ main {
   width: 100%;
 }
 
-/* Headings — restrained sizes; the v5 plan rejects "stat-bar"
- * hero typography. Headlines are claims, not decoration. */
+/* === Headings === */
+
 h1, h2, h3, h4 {
-  font-weight: 600;
-  line-height: 1.2;
-  letter-spacing: -0.01em;
-  margin-top: 2.5rem;
-  margin-bottom: 0.75rem;
+  font-weight: 700;
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+  margin-top: 3rem;
+  margin-bottom: 1rem;
   color: var(--ink);
 }
 
-h1 { font-size: clamp(1.75rem, 4vw, 2.4rem); }
-h2 { font-size: clamp(1.4rem, 3vw, 1.8rem); }
-h3 { font-size: 1.2rem; }
-h4 { font-size: 1.05rem; }
+h1 {
+  font-size: clamp(2rem, 4.5vw, 3rem);
+  letter-spacing: -0.025em;
+  margin-top: 0;
+}
+
+h2 {
+  font-size: clamp(1.5rem, 3vw, 2rem);
+}
+
+h3 {
+  font-size: 1.25rem;
+  font-weight: 600;
+}
+
+h4 {
+  font-size: 1.05rem;
+  font-weight: 600;
+}
 
 p {
   margin: 0.75rem 0;
   max-width: var(--measure);
+  color: var(--ink-strong);
 }
 
 a {
-  color: var(--beshu-teal);
+  color: var(--brand-dark);
   text-decoration: underline;
-  text-underline-offset: 0.15em;
+  text-underline-offset: 0.18em;
   text-decoration-thickness: 1px;
+  text-decoration-color: var(--teal-300);
 }
 
 a:hover {
-  color: var(--beshu-teal-dark);
+  color: var(--teal-800);
+  text-decoration-color: var(--brand);
 }
 
+/* Code */
 code, pre {
   font-family: var(--font-mono);
   font-size: 0.92em;
 }
 
 code {
-  background: var(--bg-soft);
-  padding: 0.1em 0.35em;
+  background: var(--bg-alt);
+  padding: 0.1em 0.4em;
   border-radius: 3px;
   border: 1px solid var(--rule);
+  color: var(--ink-strong);
+  font-size: 0.88em;
 }
 
 pre {
-  background: var(--bg-soft);
-  border: 1px solid var(--rule);
-  border-radius: 4px;
-  padding: 1rem;
+  background: var(--ink-900);
+  color: var(--ink-100);
+  border-radius: 6px;
+  padding: 1.25rem 1.5rem;
   overflow-x: auto;
-  line-height: 1.45;
+  line-height: 1.5;
+  font-size: 0.9rem;
+  box-shadow: var(--shadow-md);
+  margin: 1.5rem 0;
 }
 
 pre code {
   background: transparent;
   border: none;
   padding: 0;
+  color: inherit;
+  font-size: inherit;
 }
 
+/* Lists */
 ul, ol {
   max-width: var(--measure);
   padding-left: 1.5rem;
+  color: var(--ink-strong);
 }
 
 li {
-  margin: 0.3rem 0;
+  margin: 0.4rem 0;
 }
 
 blockquote {
   margin: 1.5rem 0;
-  padding: 0.5rem 0 0.5rem 1rem;
-  border-left: 3px solid var(--beshu-teal);
-  color: var(--ink-soft);
-  max-width: var(--measure);
+  padding: 1rem 1.25rem;
+  border-left: 3px solid var(--brand);
+  background: var(--brand-soft);
+  border-radius: 0 6px 6px 0;
+  color: var(--ink-strong);
+  max-width: var(--measure-wide);
 }
 
 blockquote p {
   margin: 0.4rem 0;
 }
 
+/* Tables */
 table {
   border-collapse: collapse;
-  margin: 1.5rem 0;
+  margin: 1.75rem 0;
   width: 100%;
   max-width: var(--measure-wide);
   font-size: 0.95rem;
+  background: var(--bg-card);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  overflow: hidden;
 }
 
 th, td {
   border-bottom: 1px solid var(--rule);
-  padding: 0.6rem 0.8rem;
+  padding: 0.75rem 1rem;
   text-align: left;
   vertical-align: top;
 }
 
-th {
+thead th {
+  background: var(--bg-soft);
   font-weight: 600;
-  color: var(--ink-soft);
+  color: var(--ink-strong);
+  font-size: 0.82rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  border-bottom: 1px solid var(--rule-strong);
+}
+
+tbody tr:last-child td {
+  border-bottom: none;
+}
+
+tbody tr:hover {
+  background: var(--bg-soft);
 }
 
 hr {
@@ -169,46 +286,73 @@ hr {
   margin: 3rem 0;
 }
 
-/* Layout helpers */
+/* === Layout helpers === */
 
 .shell {
   max-width: var(--shell);
   margin: 0 auto;
-  padding: 1.5rem;
+  padding: 0 1.25rem;
 }
 
 @media (min-width: 768px) {
   .shell {
-    padding: 2rem;
+    padding: 0 2rem;
   }
 }
 
-/* Header / nav */
+/* === Site chrome === */
 
 .site-header {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  background: rgba(255, 255, 255, 0.92);
+  backdrop-filter: saturate(150%) blur(8px);
+  -webkit-backdrop-filter: saturate(150%) blur(8px);
   border-bottom: 1px solid var(--rule);
-  background: var(--bg);
 }
 
 .site-nav {
   max-width: var(--shell);
   margin: 0 auto;
-  padding: 1rem 1.5rem;
+  padding: 0.85rem 1.25rem;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
-  flex-wrap: wrap;
+}
+
+@media (min-width: 768px) {
+  .site-nav {
+    padding: 0.85rem 2rem;
+  }
 }
 
 .brand {
-  color: var(--ink);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
   text-decoration: none;
-  font-size: 1.05rem;
+  color: var(--ink);
+  font-weight: 600;
+  font-size: 1.02rem;
 }
 
 .brand:hover {
-  color: var(--beshu-teal);
+  color: var(--brand-dark);
+  text-decoration: none;
+}
+
+.brand-mark {
+  width: 28px;
+  height: 28px;
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+.brand-mute {
+  color: var(--ink-faint);
+  font-weight: 500;
 }
 
 .site-nav-links {
@@ -217,130 +361,284 @@ hr {
   gap: 1.25rem;
   margin: 0;
   padding: 0;
+  font-size: 0.92rem;
   flex-wrap: wrap;
-  font-size: 0.95rem;
 }
 
 .site-nav-links a {
-  color: var(--ink-soft);
+  color: var(--ink-strong);
   text-decoration: none;
+  padding: 0.25rem 0;
+  border-bottom: 1px solid transparent;
 }
 
 .site-nav-links a:hover {
-  color: var(--beshu-teal);
-  text-decoration: underline;
+  color: var(--brand-dark);
+  border-bottom-color: var(--brand);
 }
 
-/* Footer */
+/* === Footer === */
 
 .site-footer {
-  border-top: 1px solid var(--rule);
-  margin-top: 4rem;
-  padding: 2rem 1.5rem;
+  margin-top: 5rem;
+  padding: 3rem 0 2rem 0;
+  background: var(--ink-900);
+  color: var(--ink-300);
   font-size: 0.9rem;
-  color: var(--ink-soft);
-  background: var(--bg-soft);
-}
-
-.footer-row {
-  max-width: var(--shell);
-  margin: 0.4rem auto;
-  display: flex;
-  gap: 1rem;
-  flex-wrap: wrap;
-  align-items: baseline;
-}
-
-.footer-sister {
-  color: var(--ink-faint);
-}
-
-.footer-managed {
-  color: var(--ink-faint);
-  font-style: italic;
-  margin-top: 1rem;
 }
 
 .site-footer a {
-  color: var(--ink-soft);
+  color: var(--ink-100);
+  text-decoration: none;
+  border-bottom: 1px dotted var(--ink-500);
 }
 
 .site-footer a:hover {
-  color: var(--beshu-teal);
+  color: var(--teal-300);
+  border-bottom-color: var(--teal-300);
 }
 
-/* Hero block — used by index.astro and product pages.
- * Vertical generosity, no decoration. */
+.footer-grid {
+  max-width: var(--shell);
+  margin: 0 auto;
+  padding: 0 1.25rem;
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 2rem;
+}
+
+@media (min-width: 768px) {
+  .footer-grid {
+    padding: 0 2rem;
+    grid-template-columns: 1.4fr 1fr 1fr 1fr;
+  }
+}
+
+.footer-brand-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+  color: var(--bg);
+  font-weight: 600;
+  font-size: 1.05rem;
+}
+
+.footer-tagline {
+  color: var(--ink-400);
+  font-size: 0.85rem;
+  line-height: 1.5;
+  max-width: 28ch;
+  margin: 0.5rem 0 0 0;
+}
+
+.footer-col-title {
+  font-weight: 600;
+  color: var(--ink-100);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin: 0 0 0.75rem 0;
+}
+
+.footer-col ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.footer-col li {
+  margin: 0.4rem 0;
+}
+
+.footer-bottom {
+  max-width: var(--shell);
+  margin: 2.5rem auto 0 auto;
+  padding: 1.5rem 1.25rem 0 1.25rem;
+  border-top: 1px solid var(--ink-800);
+  font-size: 0.8rem;
+  color: var(--ink-500);
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+@media (min-width: 768px) {
+  .footer-bottom {
+    padding: 1.5rem 2rem 0 2rem;
+  }
+}
+
+/* === Hero === */
 
 .hero {
-  padding: 3rem 0 2rem 0;
+  position: relative;
+  padding: 4.5rem 0 4rem 0;
+  background:
+    radial-gradient(60% 50% at 90% 0%, rgba(20, 184, 166, 0.08), transparent 70%),
+    radial-gradient(45% 40% at 0% 20%, rgba(45, 212, 191, 0.10), transparent 70%),
+    var(--bg);
+  border-bottom: 1px solid var(--rule);
+}
+
+.hero .shell {
+  position: relative;
 }
 
 .hero h1 {
-  margin-top: 0;
-  font-size: clamp(2rem, 5vw, 3rem);
-  max-width: 20ch;
+  max-width: 22ch;
+  font-size: clamp(2.25rem, 5.5vw, 3.5rem);
+  letter-spacing: -0.03em;
+  font-weight: 700;
+}
+
+.hero-eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.3rem 0.75rem;
+  background: var(--brand-soft);
+  border: 1px solid var(--teal-200);
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--brand-dark);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 1.5rem;
+}
+
+.hero-eyebrow-dot {
+  width: 6px;
+  height: 6px;
+  background: var(--brand);
+  border-radius: 50%;
 }
 
 .hero-lede {
-  font-size: 1.15rem;
+  font-size: clamp(1.05rem, 1.6vw, 1.2rem);
   color: var(--ink-soft);
-  max-width: var(--measure);
+  max-width: 58ch;
+  margin: 1rem 0 1.5rem 0;
+  line-height: 1.55;
+}
+
+.hero-credentials {
+  font-size: 0.95rem;
+  color: var(--ink-soft);
+  max-width: 65ch;
+}
+
+.hero-credentials strong {
+  color: var(--ink-strong);
 }
 
 .hero-ctas {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.75rem;
-  margin-top: 1.5rem;
+  gap: 0.6rem;
+  margin-top: 2rem;
 }
 
+/* === Buttons === */
+
 .btn {
-  display: inline-block;
-  padding: 0.6rem 1.1rem;
-  border-radius: 4px;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.65rem 1.15rem;
+  border-radius: 6px;
   text-decoration: none;
-  font-weight: 500;
+  font-weight: 600;
   font-size: 0.95rem;
   border: 1px solid var(--rule);
   background: var(--bg);
-  color: var(--ink);
+  color: var(--ink-strong);
+  box-shadow: var(--shadow-sm);
+  transition: transform 0.08s ease, box-shadow 0.12s ease, border-color 0.12s ease;
+  cursor: pointer;
+  line-height: 1.3;
 }
 
 .btn:hover {
-  border-color: var(--beshu-teal);
-  color: var(--beshu-teal);
+  border-color: var(--brand);
+  color: var(--brand-dark);
+  box-shadow: var(--shadow-md);
+  text-decoration: none;
+  transform: translateY(-1px);
 }
 
 .btn-primary {
-  background: var(--beshu-teal);
-  border-color: var(--beshu-teal);
+  background: var(--ink-900);
+  border-color: var(--ink-900);
   color: var(--bg);
+  box-shadow: 0 1px 2px 0 rgb(15 23 42 / 0.2);
 }
 
 .btn-primary:hover {
-  background: var(--beshu-teal-dark);
-  border-color: var(--beshu-teal-dark);
+  background: var(--ink-800);
+  border-color: var(--ink-800);
   color: var(--bg);
 }
 
-/* "About ReadonlyREST" chip used on testimonial cards.
- * Per v5 plan §3.1 — explicit product attribution on every card. */
+.btn-brand {
+  background: var(--brand);
+  border-color: var(--brand);
+  color: var(--bg);
+}
 
-.product-chip {
-  display: inline-block;
-  font-size: 0.75rem;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--ink-faint);
+.btn-brand:hover {
+  background: var(--brand-dark);
+  border-color: var(--brand-dark);
+  color: var(--bg);
+}
+
+/* === Sections === */
+
+section { scroll-margin-top: 5rem; }
+
+.section {
+  padding: 4rem 0;
+}
+
+.section-alt {
   background: var(--bg-soft);
-  border: 1px solid var(--rule);
-  border-radius: 999px;
-  padding: 0.15rem 0.6rem;
+  border-top: 1px solid var(--rule);
+  border-bottom: 1px solid var(--rule);
+}
+
+.section-tight {
+  padding: 2.5rem 0;
+}
+
+.section-eyebrow {
+  display: block;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--brand-dark);
+  font-weight: 700;
   margin-bottom: 0.6rem;
 }
 
-/* Reduced motion — respect user preference. */
+/* === Reused chip used by testimonial cards + elsewhere === */
+
+.product-chip {
+  display: inline-block;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+  color: var(--brand-dark);
+  background: var(--brand-soft);
+  border: 1px solid var(--teal-200);
+  border-radius: 999px;
+  padding: 0.15rem 0.65rem;
+  margin-bottom: 0.75rem;
+}
+
+/* === Reduced-motion === */
 
 @media (prefers-reduced-motion: reduce) {
   * {
@@ -348,4 +646,5 @@ hr {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
+  html { scroll-behavior: auto; }
 }

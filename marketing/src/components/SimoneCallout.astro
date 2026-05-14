@@ -1,43 +1,73 @@
 ---
-// SimoneCallout.astro
-//
-// "Built by / on the team's own production" callout for the homepage.
-// Per v5 plan §4.1 (soft Option B): different visual register from the
-// testimonial cards so the reader doesn't parse it as a fifth customer
-// testimonial. Names Simone as a real person with skin in the game
-// and routes to the case study.
+// SimoneCallout — homepage "Built by / on the team's own production"
+// callout per v5 plan §4.1. Visually different register from
+// testimonial cards so it can't be confused with customer testimony.
 ---
 
-<section class="simone-callout">
-  <p class="callout-leadin">— and on the team's own production:</p>
-  <p>
-    <strong>Simone Scarduzio</strong> (founder, Beshu Tech) is migrating
-    ReadonlyREST's 1.71 TB build catalog through DeltaGlider. The case
-    study includes the bugs we hit (TMPDIR hardcoded in upstream, Traefik
-    60s timeout, pipefail+head silent abort, EBS exhaustion) and how we
-    fixed them.
+<aside class="simone-callout" aria-label="Engineering team note">
+  <span class="callout-eyebrow">From the team's own production</span>
+  <p class="callout-body">
+    <strong>Simone Scarduzio</strong> (founder, Beshu Tech) is
+    migrating ReadonlyREST's <strong>1.71 TB</strong> build catalog
+    through DeltaGlider. The case study includes the bugs we hit
+    (TMPDIR hardcoded in upstream, Traefik 60s timeout, pipefail+head
+    silent abort, EBS exhaustion) and how we fixed them.
   </p>
-  <p>
-    → <a href="/case-studies/readonlyrest-builds">Read the migration log</a>
+  <p class="callout-cta">
+    <a href="/case-studies/readonlyrest-builds">Read the migration log →</a>
   </p>
-</section>
+</aside>
 
 <style>
   .simone-callout {
-    margin: 3rem 0;
-    padding: 1.5rem;
-    border-left: 3px solid var(--accent);
-    background: var(--bg-soft);
     max-width: var(--measure-wide);
+    margin: 2rem 0;
+    padding: 1.75rem 2rem;
+    background: var(--ink-900);
+    color: var(--ink-100);
+    border-radius: 8px;
+    border-left: 4px solid var(--accent);
+    position: relative;
+    box-shadow: var(--shadow-lg);
   }
 
-  .callout-leadin {
-    color: var(--ink-faint);
-    font-style: italic;
-    margin-top: 0;
+  .callout-eyebrow {
+    display: block;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--accent);
+    font-weight: 700;
+    margin-bottom: 0.6rem;
   }
 
-  .simone-callout p {
-    margin: 0.5rem 0;
+  .callout-body {
+    color: var(--ink-100);
+    font-size: 1.02rem;
+    line-height: 1.55;
+    margin: 0;
+    max-width: none;
+  }
+
+  .callout-body strong {
+    color: white;
+    font-weight: 600;
+  }
+
+  .callout-cta {
+    margin: 1rem 0 0 0;
+    max-width: none;
+  }
+
+  .callout-cta a {
+    color: var(--teal-300);
+    font-weight: 600;
+    text-decoration: none;
+    border-bottom: 1px solid transparent;
+  }
+
+  .callout-cta a:hover {
+    color: var(--teal-200);
+    border-bottom-color: var(--teal-300);
   }
 </style>

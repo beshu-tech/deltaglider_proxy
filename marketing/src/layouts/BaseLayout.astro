@@ -1,27 +1,20 @@
 ---
 // BaseLayout.astro — shell every page extends.
-// Per the v5 plan §7 visual brief: anti-polish, plain typography,
-// one brand color (Beshu teal), one accent, no animations.
+// Per the v5 plan §7 visual brief: anti-polish but designed. One brand
+// color (teal), one accent, real typography, real chrome.
 //
-// Sticks to system fonts (no web-font load), no JS by default,
-// no third-party tags. Pages add what they need on top.
+// Inline logo SVG matches the favicon (teal lightning bolt on navy
+// rounded square). Brand wordmark uses Manrope (Google Fonts, swap).
+// Mono / code blocks use self-hosted JetBrains Mono (OFL).
 
 import '../styles/global.css';
 import { SITE } from '../lib/seo';
 
 interface Props {
-  /** Document title — shown in browser tab + Open Graph. */
   title: string;
-  /** Meta description — shown in search results + social previews. */
   description: string;
-  /** Optional canonical URL override. Defaults to current page URL. */
   canonical?: string;
-  /** Optional Open Graph image path. Defaults to SITE.ogImage. */
   ogImage?: string;
-  /**
-   * Optional Open Graph type. Defaults to "website".
-   * Use "article" for case studies / engineering posts.
-   */
   ogType?: 'website' | 'article';
 }
 
@@ -42,6 +35,14 @@ const ogImageUrl = new URL(ogImage, Astro.site).toString();
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+
+    {/* Manrope — variable display sans. font-display:swap inherited. */}
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap"
+    />
 
     <title>{title}</title>
     <meta name="description" content={description} />
@@ -66,15 +67,25 @@ const ogImageUrl = new URL(ogImage, Astro.site).toString();
 
     <meta name="generator" content={Astro.generator} />
 
-    {/* JSON-LD structured data injection point. Pages opt in via the
-        named slot; multiple <JsonLd /> children are allowed. */}
     <slot name="json-ld" />
   </head>
   <body>
     <header class="site-header">
       <nav class="site-nav" aria-label="Primary">
-        <a href="/" class="brand">
-          <strong>Beshu</strong> · DeltaGlider
+        <a href="/" class="brand" aria-label="DeltaGlider home">
+          <svg
+            class="brand-mark"
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 64 64"
+            aria-hidden="true"
+          >
+            <rect width="64" height="64" rx="14" fill="#0f172a" />
+            <path d="M14 38 31 12h19L33 38h17L27 58l7-20H14Z" fill="#2dd4bf" />
+          </svg>
+          <span>
+            <span class="brand-mute">Beshu</span>
+            DeltaGlider
+          </span>
         </a>
         <ul class="site-nav-links">
           <li><a href="/saas">SaaS</a></li>
@@ -91,22 +102,64 @@ const ogImageUrl = new URL(ogImage, Astro.site).toString();
     </main>
 
     <footer class="site-footer" aria-label="Footer">
-      <div class="footer-row">
-        <span>Beshu Tech</span>
-        <span>GPL-3.0</span>
-        <a href="https://github.com/beshu-tech/deltaglider_proxy">GitHub</a>
-        <a href="/pricing">Pricing</a>
-        <a href="/trial">Trial</a>
-        <a href="mailto:contact@beshu.tech?subject=DeltaGlider%20-%20General%20inquiry">Contact</a>
+      <div class="footer-grid">
+        <div>
+          <div class="footer-brand-row">
+            <svg
+              class="brand-mark"
+              xmlns="http://www.w3.org/2000/svg"
+              viewBox="0 0 64 64"
+              aria-hidden="true"
+            >
+              <rect width="64" height="64" rx="14" fill="#0f172a" />
+              <path d="M14 38 31 12h19L33 38h17L27 58l7-20H14Z" fill="#2dd4bf" />
+            </svg>
+            <span>DeltaGlider</span>
+          </div>
+          <p class="footer-tagline">
+            Storage compression for S3, behind the same S3 API.
+            Open source (GPL-3.0).
+          </p>
+        </div>
+
+        <div class="footer-col">
+          <h4 class="footer-col-title">Product</h4>
+          <ul>
+            <li><a href="/saas">For SaaS</a></li>
+            <li><a href="/regulated">For regulated</a></li>
+            <li><a href="/pricing">Pricing</a></li>
+            <li><a href="/trial">30-day trial</a></li>
+            <li><a href="/case-studies">Case studies</a></li>
+          </ul>
+        </div>
+
+        <div class="footer-col">
+          <h4 class="footer-col-title">Resources</h4>
+          <ul>
+            <li><a href="https://github.com/beshu-tech/deltaglider_proxy">GitHub</a></li>
+            <li><a href="/docs/quickstart">Quickstart</a></li>
+            <li><a href="/docs/reference">Reference docs</a></li>
+            <li><a href="mailto:contact@beshu.tech?subject=DeltaGlider%20-%20General%20inquiry">Contact</a></li>
+          </ul>
+        </div>
+
+        <div class="footer-col">
+          <h4 class="footer-col-title">Beshu Tech</h4>
+          <ul>
+            <li><a href="https://beshu.tech">beshu.tech</a></li>
+            <li><a href="https://readonlyrest.com">ReadonlyREST</a></li>
+            <li><a href="https://anaphora.beshu.tech">Anaphora</a></li>
+          </ul>
+        </div>
       </div>
-      <div class="footer-row footer-sister">
-        Sister products:
-        <a href="https://readonlyrest.com">ReadonlyREST</a>
-        ·
-        <a href="https://anaphora.beshu.tech">Anaphora</a>
-      </div>
-      <div class="footer-row footer-managed">
-        Interested in a managed cloud offering? Let us know — we're evaluating for Q4 2026.
+
+      <div class="footer-bottom">
+        <span>© Beshu Limited · GPL-3.0 · London, UK</span>
+        <span>
+          Interested in a managed cloud offering?
+          <a href="mailto:contact@beshu.tech?subject=DeltaGlider%20-%20Managed%20cloud%20interest">Let us know</a>
+          — evaluating for Q4 2026.
+        </span>
       </div>
     </footer>
   </body>

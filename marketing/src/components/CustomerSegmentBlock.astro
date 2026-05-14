@@ -1,48 +1,69 @@
 ---
-// CustomerSegmentBlock.astro
-//
-// "Since 2017, hundreds of remarkable organisations trusted us..."
-// — verbatim copy from readonlyrest.com per v5 plan §3.2.
+// CustomerSegmentBlock — verbatim copy from readonlyrest.com per v5 §3.2.
 // Used on homepage and /regulated.
 ---
 
 <section class="customer-segments">
+  <span class="section-eyebrow">Beshu Tech, since 2017</span>
+  <h2>Trusted by remarkable organisations</h2>
   <p class="segment-lede">
-    Since 2017, hundreds of remarkable organisations trusted us.
-    Customers that make us <strong>extra proud</strong>:
+    Hundreds of organisations trust Beshu Tech. Customers that make us
+    <strong>extra proud</strong>:
   </p>
   <ul class="segment-list">
-    <li>📈 <strong>2× in the S&amp;P 500 top 5</strong></li>
-    <li>🧸 <strong>2× Charities protecting children</strong></li>
-    <li>⚛️ <strong>3× Nuclear research institutions</strong></li>
-    <li>🇪🇺 <strong>2× European Union institutions</strong></li>
-    <li>👮‍♀️ <strong>Various government institutions</strong></li>
+    <li><span class="segment-icon" aria-hidden="true">📈</span> <strong>2× in the S&amp;P 500 top 5</strong></li>
+    <li><span class="segment-icon" aria-hidden="true">🧸</span> <strong>2× charities protecting children</strong></li>
+    <li><span class="segment-icon" aria-hidden="true">⚛️</span> <strong>3× nuclear research institutions</strong></li>
+    <li><span class="segment-icon" aria-hidden="true">🇪🇺</span> <strong>2× European Union institutions</strong></li>
+    <li><span class="segment-icon" aria-hidden="true">👮‍♀️</span> <strong>Various government institutions</strong></li>
   </ul>
   <p class="segment-disclaimer">
     These customer references reflect Beshu Tech's customer base for
-    ReadonlyREST. They do not imply any endorsement, sponsorship, or
-    affiliation with DeltaGlider.
+    <a href="https://readonlyrest.com">ReadonlyREST</a>. They do not
+    imply any endorsement, sponsorship, or affiliation with
+    DeltaGlider.
   </p>
 </section>
 
 <style>
-  .customer-segments {
-    margin: 2.5rem 0;
-  }
-
   .segment-lede {
     font-size: 1.05rem;
+    color: var(--ink-strong);
+    max-width: var(--measure);
   }
 
   .segment-list {
     list-style: none;
     padding-left: 0;
-    margin: 1rem 0;
+    margin: 1.5rem 0;
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0.6rem;
+    max-width: 38rem;
+  }
+
+  @media (min-width: 600px) {
+    .segment-list {
+      grid-template-columns: 1fr 1fr;
+    }
   }
 
   .segment-list li {
-    margin: 0.4rem 0;
-    font-size: 1rem;
+    margin: 0;
+    padding: 0.7rem 1rem;
+    background: var(--bg-card);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    font-size: 0.98rem;
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    box-shadow: var(--shadow-sm);
+  }
+
+  .segment-icon {
+    font-size: 1.2rem;
+    line-height: 1;
   }
 
   .segment-disclaimer {
@@ -50,5 +71,6 @@
     color: var(--ink-faint);
     font-size: 0.85rem;
     max-width: var(--measure);
+    line-height: 1.55;
   }
 </style>

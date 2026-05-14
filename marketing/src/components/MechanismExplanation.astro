@@ -1,16 +1,13 @@
 ---
-// MechanismExplanation.astro
-//
-// "Why xdelta3 works on ZIP files" — the credibility paragraph per v5
-// plan §4.1. The 614× single-file reduction is the proof.
-// Promoted to its own section near the top of the homepage so a skeptical
-// reader can hit it before the testimonials.
+// "Why xdelta3 works on ZIP files" — credibility paragraph per v5 §4.1.
+// The 614× single-file reduction is the proof.
 ---
 
 <section class="mechanism">
+  <span class="section-eyebrow">The proof</span>
   <h2>Why xdelta3 works on ZIP files</h2>
 
-  <p>
+  <p class="mechanism-lede">
     Skeptical question: xdelta3 should fail on compressed input.
   </p>
 
@@ -22,19 +19,59 @@
     repeat.
   </p>
 
-  <p>
-    On real ReadonlyREST ES plugins: a 91 MB versioned ZIP encoded as
-    a <strong>148 KB</strong> delta against the previous version.
-    <strong>614× reduction on compressed input.</strong>
-  </p>
+  <div class="mechanism-stat">
+    <div class="stat-number">614×</div>
+    <div class="stat-label">
+      reduction on compressed input — a 91 MB versioned ZIP encoded as
+      a 148 KB delta against the previous version, on a real
+      ReadonlyREST ES plugin.
+    </div>
+  </div>
 
   <p>
-    <a href="/docs/reference/how-delta-works">Read the engineering note →</a>
+    → <a href="/docs/reference/how-delta-works">Read the engineering note</a>
   </p>
 </section>
 
 <style>
-  .mechanism {
-    margin: 3rem 0;
+  .mechanism-lede {
+    font-size: 1.05rem;
+    color: var(--ink-strong);
+  }
+
+  .mechanism-stat {
+    margin: 2rem 0;
+    padding: 1.5rem 1.75rem;
+    background: var(--brand-soft);
+    border: 1px solid var(--teal-200);
+    border-radius: 8px;
+    max-width: var(--measure-wide);
+    display: flex;
+    align-items: center;
+    gap: 1.5rem;
+  }
+
+  .stat-number {
+    font-family: var(--font-mono);
+    font-size: clamp(2.5rem, 5vw, 3.5rem);
+    font-weight: 700;
+    color: var(--brand-dark);
+    line-height: 1;
+    flex-shrink: 0;
+    letter-spacing: -0.04em;
+  }
+
+  .stat-label {
+    color: var(--ink-strong);
+    font-size: 0.98rem;
+    line-height: 1.5;
+  }
+
+  @media (max-width: 600px) {
+    .mechanism-stat {
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 0.75rem;
+    }
   }
 </style>

@@ -62,14 +62,14 @@
 .field-value {
   font-family: var(--font-mono);
   font-size: 0.95rem;
-  color: var(--beshu-teal);
+  color: var(--brand);
   font-weight: 600;
 }
 
 .field input[type="range"] {
   width: 100%;
   margin: 0;
-  accent-color: var(--beshu-teal);
+  accent-color: var(--brand);
 }
 
 .field input[type="number"] {
@@ -94,28 +94,30 @@
 /* === Region buttons === */
 
 .region-buttons {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
   gap: 0.4rem;
 }
 
 .region-buttons button {
-  flex: 1;
-  padding: 0.45rem 0;
+  padding: 0.5rem 0;
   background: var(--bg);
   border: 1px solid var(--rule);
-  border-radius: 3px;
+  border-radius: 4px;
   font-family: var(--font-mono);
   font-size: 0.9rem;
+  font-weight: 500;
   cursor: pointer;
+  min-width: 0;
 }
 
 .region-buttons button:hover {
-  border-color: var(--beshu-teal);
+  border-color: var(--brand);
 }
 
 .region-buttons .btn-active {
-  background: var(--beshu-teal);
-  border-color: var(--beshu-teal);
+  background: var(--brand);
+  border-color: var(--brand);
   color: var(--bg);
 }
 
@@ -140,8 +142,8 @@
 }
 
 .cost-shortcuts button:hover {
-  border-color: var(--beshu-teal);
-  color: var(--beshu-teal);
+  border-color: var(--brand);
+  color: var(--brand);
 }
 
 /* === Advanced toggle === */
@@ -158,7 +160,7 @@
 }
 
 .advanced-toggle:hover {
-  color: var(--beshu-teal);
+  color: var(--brand);
 }
 
 /* === Result card === */
@@ -176,7 +178,7 @@
 }
 
 .card-ok h3 strong {
-  color: var(--beshu-teal);
+  color: var(--brand);
 }
 
 .card-enterprise h3,
@@ -278,7 +280,7 @@
 }
 
 .formula summary:hover {
-  color: var(--beshu-teal);
+  color: var(--brand);
 }
 
 .formula-body {

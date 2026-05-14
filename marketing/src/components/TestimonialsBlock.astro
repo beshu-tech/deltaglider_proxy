@@ -1,10 +1,4 @@
 ---
-// TestimonialsBlock.astro
-//
-// The four ReadonlyREST testimonials, with the v5 plan §3.1 framing
-// line on top. Section heading is the long-and-explicit version so
-// no skimming reader can misread these as DeltaGlider endorsements.
-
 import TestimonialCard from './TestimonialCard.astro';
 
 const testimonials = [
@@ -40,6 +34,7 @@ const testimonials = [
 ---
 
 <section class="testimonials">
+  <span class="section-eyebrow">Testimonials</span>
   <h2>What Beshu Tech's customers say about our other products</h2>
 
   <p class="testimonials-framing">
@@ -56,27 +51,23 @@ const testimonials = [
 </section>
 
 <style>
-  .testimonials {
-    margin: 3rem 0;
-  }
-
   .testimonials-framing {
     max-width: var(--measure);
     color: var(--ink-soft);
     font-size: 1rem;
+    margin-bottom: 2rem;
   }
 
   .testimonials-grid {
     display: grid;
     grid-template-columns: 1fr;
-    gap: 1rem;
+    gap: 1.25rem;
     margin-top: 1.5rem;
   }
 
   @media (min-width: 768px) {
     .testimonials-grid {
       grid-template-columns: 1fr 1fr;
-      gap: 1.25rem;
     }
   }
 </style>
