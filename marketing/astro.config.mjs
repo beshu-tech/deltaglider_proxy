@@ -1,6 +1,7 @@
 // @ts-check
 import { defineConfig } from 'astro/config';
 import sitemap from '@astrojs/sitemap';
+import react from '@astrojs/react';
 
 // https://docs.astro.build/en/reference/configuration-reference/
 export default defineConfig({
@@ -27,6 +28,11 @@ export default defineConfig({
 
   // Integrations
   integrations: [
+    // React: used only by the pricing calculator island.
+    // Most pages are pure Astro (zero JS). The calculator hydrates
+    // client-side via client:visible — see /pricing.
+    react(),
+
     // /sitemap-index.xml + /sitemap-0.xml — referenced by /robots.txt.
     // Excludes the legacy-URL redirect stubs (no value in indexing
     // pages that meta-refresh to another URL).

@@ -1,47 +1,49 @@
 ---
 // /pricing — v5 plan §4.5.
-// Static for Week 1; the calculator React island ships Week 2.
-// The static tier table is the source of truth that the calculator
-// will reflect via brackets.ts (single SSOT, see v5 §5.6).
+// Calculator React island + static tier table, both fed by the single
+// source of truth in src/lib/brackets.ts.
+//
+// JSON-LD Offers are generated from SCHEMA_OFFER_BRACKETS (the priced
+// production-support tiers only) — Enterprise + Commercial-license
+// are excluded because they have no fixed price.
 
 import BaseLayout from '../layouts/BaseLayout.astro';
 import JsonLd from '../components/JsonLd.astro';
+import PricingCalculator from '../components/PricingCalculator';
 import {
   webPageSchema,
   breadcrumbListSchema,
   pricingProductSchema,
 } from '../lib/seo';
+import { BRACKETS, SCHEMA_OFFER_BRACKETS } from '../lib/brackets';
+import '../styles/calculator.css';
 
 const title = 'Pricing — DeltaGlider';
 const description =
-  'Open source GPL-3.0 forever. Production support from $10k/year, scaling with your stored footprint. Calculator (week 2) shows your annual savings live.';
+  'Open source GPL-3.0 forever. Production support from $10k/year, scaling with your stored footprint. Calculator shows your annual savings live.';
 
-// TODO(brackets): this `tiers` array is paired with the visible
-// HTML table further down (search "What you'd pay"). The Week-2
-// calculator will extract both into `src/lib/brackets.ts` as the
-// single source of truth — until then, edits to either MUST be
-// mirrored in the other. The descriptions are currently paraphrased
-// between the two; consolidate when the calculator lands.
-const tiers = [
-  {
-    sku: 'production-support-starter',
-    name: 'Production support — Starter',
-    price: '10000',
-    description: 'Up to 10 TB stored footprint. Eng Slack + 4h business-hours response SLA.',
-  },
-  {
-    sku: 'production-support-growth',
-    name: 'Production support — Growth',
-    price: '30000',
-    description: '10–50 TB stored footprint. Same SLA + quarterly review call.',
-  },
-  {
-    sku: 'production-support-scale',
-    name: 'Production support — Scale',
-    price: '60000',
-    description: '50–250 TB stored footprint. 1h response SLA, monthly review, named eng contact.',
-  },
-];
+// Schema generator wants {sku, name, price, description}. Adapt from
+// the rich Bracket shape — single source of truth lives in brackets.ts.
+const schemaTiers = SCHEMA_OFFER_BRACKETS.map((b) => ({
+  sku: `production-support-${b.id}`,
+  name: b.name,
+  price: String(b.priceUsd),
+  description: b.description,
+}));
+
+/**
+ * Special-case the trial-row description so the in-table link
+ * to /trial keeps working. brackets.ts holds plain text only.
+ */
+function renderDescription(id: string, description: string): string {
+  if (id === 'trial') {
+    return description.replace(
+      'See /trial',
+      'See <a href="/trial">/trial</a>',
+    );
+  }
+  return description;
+}
 ---
 
 <BaseLayout title={title} description={description}>
@@ -53,8 +55,9 @@ const tiers = [
         { name: 'Pricing', path: '/pricing' },
       ])}
     />
-    <JsonLd schema={pricingProductSchema(tiers)} />
+    <JsonLd schema={pricingProductSchema(schemaTiers)} />
   </Fragment>
+
   <section class="shell hero">
     <h1>What does DeltaGlider save you?</h1>
 
@@ -65,33 +68,13 @@ const tiers = [
   </section>
 
   <div class="shell">
-    <section id="calculator" class="calculator-placeholder">
-      <h2>Savings calculator</h2>
-      <div class="placeholder-card">
-        <p>
-          <strong>Coming next week.</strong> The dynamic savings
-          calculator is being built — it takes your current TB
-          footprint, regions, and storage cost, and tells you what
-          you'd save per year with DeltaGlider plus which production-
-          support bracket you'd land in.
-        </p>
-        <p>
-          In the meantime, the static tier table below is exact. If
-          you want a custom estimate before the calculator ships,
-          email
-          <a href="mailto:contact@beshu.tech?subject=DeltaGlider%20-%20Sizing%20estimate">contact@beshu.tech</a>
-          with your TB-on-AWS today and we'll do the math by hand.
-        </p>
-      </div>
+    <section id="calculator">
+      <PricingCalculator client:visible />
     </section>
 
     <section class="tiers">
       <h2>What you'd pay</h2>
 
-      {/* TODO(brackets): see the `tiers` array in this file's
-          frontmatter. Both this <table> and that array describe the
-          same priced tiers; the Week-2 calculator extracts both into
-          src/lib/brackets.ts. Mirror any edit. */}
       <table>
         <thead>
           <tr>
@@ -101,62 +84,17 @@ const tiers = [
           </tr>
         </thead>
         <tbody>
-          <tr>
-            <td><strong>Open Source</strong></td>
-            <td>Free, GPL-3.0</td>
-            <td>
-              Full product. No footprint cap. Self-host. Community
-              Slack + GitHub.
-            </td>
-          </tr>
-          <tr>
-            <td><strong>Production support trial</strong></td>
-            <td>Free, 30 days</td>
-            <td>
-              Direct engineering Slack, response SLA, one architecture
-              review call. See <a href="/trial">/trial</a>.
-            </td>
-          </tr>
-          <tr>
-            <td><strong>Production support — Starter</strong></td>
-            <td>$10k/year</td>
-            <td>
-              Up to 10 TB stored footprint. Eng Slack + 4h
-              business-hours response SLA.
-            </td>
-          </tr>
-          <tr>
-            <td><strong>Production support — Growth</strong></td>
-            <td>$30k/year</td>
-            <td>
-              10–50 TB stored footprint. Same SLA + quarterly review
-              call.
-            </td>
-          </tr>
-          <tr>
-            <td><strong>Production support — Scale</strong></td>
-            <td>$60k/year</td>
-            <td>
-              50–250 TB stored footprint. 1h response SLA, monthly
-              review, named eng contact.
-            </td>
-          </tr>
-          <tr>
-            <td><strong>Production support — Enterprise</strong></td>
-            <td>Talk to sales</td>
-            <td>
-              250 TB+, multi-region, custom SLA, dedicated channel.
-            </td>
-          </tr>
-          <tr>
-            <td><strong>Commercial license</strong></td>
-            <td>Talk to sales</td>
-            <td>
-              For embedding DeltaGlider in a proprietary product, or
-              removing the GPL-3.0 obligation. Pricing depends on use
-              case, not footprint.
-            </td>
-          </tr>
+          {
+            BRACKETS.map((b) => (
+              <tr>
+                <td>
+                  <strong>{b.name}</strong>
+                </td>
+                <td>{b.priceLabel}</td>
+                <td set:html={renderDescription(b.id, b.description)} />
+              </tr>
+            ))
+          }
         </tbody>
       </table>
     </section>
@@ -224,9 +162,10 @@ const tiers = [
         It's not just support — it's an SLA on critical infrastructure
         plus direct Slack access to the senior engineers who wrote the
         proxy. At your scale (typically 1–10 TB stored footprint = 100
-        TB+ of source artifacts), the savings calculator (Week 2) will
-        show annual savings in the $30–60k range. $10k lands in a
-        defensible range relative to the value delivered.
+        TB+ of source artifacts), the savings calculator above shows
+        annual savings in the $30–60k range for typical SaaS deployments.
+        $10k lands in a defensible range relative to the value
+        delivered.
       </p>
 
       <h3>What happens if I exceed my bracket?</h3>
@@ -290,21 +229,12 @@ const tiers = [
 </BaseLayout>
 
 <style>
-  .calculator-placeholder,
   .tiers,
   .meter,
   .commercial,
   .faq,
   .cta {
     margin: 3rem 0;
-  }
-
-  .placeholder-card {
-    background: var(--bg-soft);
-    border: 1px dashed var(--rule);
-    border-radius: 6px;
-    padding: 1.5rem;
-    max-width: var(--measure-wide);
   }
 
   .faq h3 {

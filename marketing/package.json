@@ -8,14 +8,22 @@
     "build": "astro build",
     "preview": "astro preview",
     "typecheck": "astro check",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "prebuild": "node scripts/copy-screenshots.mjs"
   },
   "dependencies": {
+    "@astrojs/react": "^5.0.5",
     "@astrojs/sitemap": "^3.7.2",
-    "astro": "^5.0.0"
+    "astro": "^5.0.0",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6"
   },
   "devDependencies": {
     "@astrojs/check": "^0.9.4",
-    "typescript": "~5.6.3"
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "typescript": "~5.6.3",
+    "vitest": "^4.1.6"
   }
 }

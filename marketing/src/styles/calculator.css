@@ -1,0 +1,296 @@
+/* calculator.css — styles for the PricingCalculator React island.
+ * Anti-polish: plain typography, no decorative animations, plain tables.
+ * Lives outside the .astro file because it's imported by the .tsx island
+ * and Astro's scoped-styles don't reach React children.
+ */
+
+.calc {
+  margin: 2rem 0;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--bg);
+  overflow: hidden;
+}
+
+.calc-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0;
+}
+
+@media (min-width: 900px) {
+  .calc-grid {
+    grid-template-columns: minmax(320px, 1fr) minmax(0, 1.4fr);
+  }
+}
+
+.calc-inputs {
+  padding: 1.5rem;
+  background: var(--bg-soft);
+  border-right: 1px solid var(--rule);
+}
+
+.calc-result {
+  padding: 1.5rem;
+}
+
+.calc-inputs h3,
+.calc-result h3 {
+  margin-top: 0;
+  font-size: 1rem;
+  color: var(--ink-soft);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 1rem;
+}
+
+/* === Fields === */
+
+.field {
+  margin-bottom: 1.25rem;
+}
+
+.field label {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-weight: 500;
+  font-size: 0.95rem;
+  margin-bottom: 0.4rem;
+}
+
+.field-value {
+  font-family: var(--font-mono);
+  font-size: 0.95rem;
+  color: var(--beshu-teal);
+  font-weight: 600;
+}
+
+.field input[type="range"] {
+  width: 100%;
+  margin: 0;
+  accent-color: var(--beshu-teal);
+}
+
+.field input[type="number"] {
+  width: 100%;
+  padding: 0.4rem 0.6rem;
+  font-family: var(--font-mono);
+  font-size: 0.95rem;
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  background: var(--bg);
+}
+
+.field-help {
+  margin-top: 0.4rem;
+  margin-bottom: 0;
+  font-size: 0.8rem;
+  color: var(--ink-faint);
+  line-height: 1.4;
+  max-width: none;
+}
+
+/* === Region buttons === */
+
+.region-buttons {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.region-buttons button {
+  flex: 1;
+  padding: 0.45rem 0;
+  background: var(--bg);
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.region-buttons button:hover {
+  border-color: var(--beshu-teal);
+}
+
+.region-buttons .btn-active {
+  background: var(--beshu-teal);
+  border-color: var(--beshu-teal);
+  color: var(--bg);
+}
+
+/* === Cost shortcuts === */
+
+.cost-shortcuts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin-top: 0.5rem;
+}
+
+.cost-shortcuts button {
+  padding: 0.2rem 0.5rem;
+  font-size: 0.75rem;
+  background: var(--bg);
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  cursor: pointer;
+  color: var(--ink-soft);
+}
+
+.cost-shortcuts button:hover {
+  border-color: var(--beshu-teal);
+  color: var(--beshu-teal);
+}
+
+/* === Advanced toggle === */
+
+.advanced-toggle {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--ink-soft);
+  cursor: pointer;
+  font-size: 0.85rem;
+  margin-top: 0.5rem;
+  font-family: var(--font-sans);
+}
+
+.advanced-toggle:hover {
+  color: var(--beshu-teal);
+}
+
+/* === Result card === */
+
+.card {
+  padding: 0;
+}
+
+.card h3 {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 1.25rem;
+  color: var(--ink);
+  margin-bottom: 0.75rem;
+}
+
+.card-ok h3 strong {
+  color: var(--beshu-teal);
+}
+
+.card-enterprise h3,
+.card-disqualify h3 {
+  color: var(--accent);
+}
+
+.card p {
+  margin: 0.5rem 0;
+  font-size: 0.95rem;
+  max-width: none;
+}
+
+/* === Warnings === */
+
+.warnings {
+  list-style: none;
+  padding-left: 0;
+  margin: 1rem 0;
+}
+
+.warning-chip {
+  background: #fff8e1;
+  border: 1px solid #f0c040;
+  border-radius: 4px;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.85rem;
+  color: var(--ink);
+  margin: 0.3rem 0;
+}
+
+/* === CTAs (inside the result card; reuse global .btn) === */
+
+.card-ctas {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 1.25rem 0;
+}
+
+.calc .btn-tertiary {
+  background: transparent;
+}
+
+/* === Breakdown table === */
+
+.breakdown {
+  margin: 1.5rem 0 0 0;
+  width: 100%;
+  font-size: 0.9rem;
+  font-family: var(--font-mono);
+  border-collapse: collapse;
+}
+
+.breakdown th,
+.breakdown td {
+  padding: 0.4rem 0.5rem;
+  border-bottom: 1px solid var(--rule);
+  text-align: right;
+}
+
+.breakdown thead th {
+  text-align: right;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ink-faint);
+  font-family: var(--font-sans);
+}
+
+.breakdown tbody th {
+  text-align: left;
+  font-weight: 400;
+  color: var(--ink-soft);
+  font-family: var(--font-sans);
+}
+
+.breakdown tr.subtotal th,
+.breakdown tr.subtotal td {
+  font-weight: 600;
+  border-top: 2px solid var(--rule);
+}
+
+/* === Formula details === */
+
+.formula {
+  margin-top: 1.5rem;
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  background: var(--bg-soft);
+}
+
+.formula summary {
+  padding: 0.6rem 1rem;
+  cursor: pointer;
+  font-size: 0.9rem;
+  color: var(--ink-soft);
+  font-weight: 500;
+}
+
+.formula summary:hover {
+  color: var(--beshu-teal);
+}
+
+.formula-body {
+  padding: 0 1rem 1rem 1rem;
+}
+
+.formula-body p {
+  font-size: 0.85rem;
+  color: var(--ink-soft);
+}
+
+.formula-body pre {
+  margin: 0.5rem 0;
+  font-size: 0.8rem;
+}
