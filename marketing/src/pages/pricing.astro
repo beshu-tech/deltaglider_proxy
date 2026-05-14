@@ -5,12 +5,52 @@
 // will reflect via brackets.ts (single SSOT, see v5 §5.6).
 
 import BaseLayout from '../layouts/BaseLayout.astro';
+import JsonLd from '../components/JsonLd.astro';
+import {
+  webPageSchema,
+  breadcrumbListSchema,
+  pricingProductSchema,
+} from '../lib/seo';
+
+const title = 'Pricing — DeltaGlider';
+const description =
+  'Open source GPL-3.0 forever. Production support from $10k/year, scaling with your stored footprint. Calculator (week 2) shows your annual savings live.';
+
+// Single source of truth for the static tier table below; the Week-2
+// calculator's brackets.ts will share the same numbers.
+const tiers = [
+  {
+    sku: 'production-support-starter',
+    name: 'Production support — Starter',
+    price: '10000',
+    description: 'Up to 10 TB stored footprint. Eng Slack + 4h business-hours response SLA.',
+  },
+  {
+    sku: 'production-support-growth',
+    name: 'Production support — Growth',
+    price: '30000',
+    description: '10–50 TB stored footprint. Same SLA + quarterly review call.',
+  },
+  {
+    sku: 'production-support-scale',
+    name: 'Production support — Scale',
+    price: '60000',
+    description: '50–250 TB stored footprint. 1h response SLA, monthly review, named eng contact.',
+  },
+];
 ---
 
-<BaseLayout
-  title="Pricing — DeltaGlider"
-  description="Open source GPL-3.0 forever. Production support from $10k/year, scaling with your stored footprint. Calculator (week 2) shows your annual savings live."
->
+<BaseLayout title={title} description={description}>
+  <Fragment slot="json-ld">
+    <JsonLd schema={webPageSchema({ path: '/pricing', title, description })} />
+    <JsonLd
+      schema={breadcrumbListSchema([
+        { name: 'DeltaGlider', path: '/' },
+        { name: 'Pricing', path: '/pricing' },
+      ])}
+    />
+    <JsonLd schema={pricingProductSchema(tiers)} />
+  </Fragment>
   <section class="shell hero">
     <h1>What does DeltaGlider save you?</h1>
 

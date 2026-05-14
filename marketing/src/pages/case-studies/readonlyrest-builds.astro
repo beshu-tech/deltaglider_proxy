@@ -5,12 +5,46 @@
 // engineering credibility lives. The bug log IS the proof.
 
 import BaseLayout from '../../layouts/BaseLayout.astro';
+import JsonLd from '../../components/JsonLd.astro';
+import {
+  webPageSchema,
+  breadcrumbListSchema,
+  articleSchema,
+} from '../../lib/seo';
+
+const path = '/case-studies/readonlyrest-builds';
+const title =
+  "Migrating ReadonlyREST's 1.71 TB build catalog off AWS S3 — in progress";
+const description =
+  'Engineering retrospective: 145 versions, 8 years of release history, ~103,088 objects. ~$9 in EC2 compute so far. Per-version compression results and the bug log.';
+
+// Article publication metadata. Updated when the migration completes.
+const datePublished = '2026-05-14';
+const dateModified = '2026-05-14';
 ---
 
-<BaseLayout
-  title="Migrating ReadonlyREST's 1.71 TB build catalog off AWS S3 — in progress"
-  description="Engineering retrospective: 145 versions, 8 years of release history, ~103,088 objects. ~$9 in EC2 compute so far. Per-version compression results and the bug log."
->
+<BaseLayout title={title} description={description} ogType="article">
+  <Fragment slot="json-ld">
+    <JsonLd schema={webPageSchema({ path, title, description, dateModified })} />
+    <JsonLd
+      schema={breadcrumbListSchema([
+        { name: 'DeltaGlider', path: '/' },
+        { name: 'Case studies', path: '/case-studies' },
+        { name: "ReadonlyREST builds migration", path },
+      ])}
+    />
+    <JsonLd
+      schema={articleSchema({
+        path,
+        headline: title,
+        description,
+        authorName: 'Simone Scarduzio',
+        authorUrl: 'https://beshu.tech',
+        datePublished,
+        dateModified,
+      })}
+    />
+  </Fragment>
   <section class="shell hero">
     <h1>Migrating ReadonlyREST's build catalog off AWS S3 — in progress</h1>
 

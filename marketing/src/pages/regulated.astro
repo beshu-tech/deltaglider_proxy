@@ -7,14 +7,27 @@
 // license + production support instead.
 
 import BaseLayout from '../layouts/BaseLayout.astro';
+import JsonLd from '../components/JsonLd.astro';
 import TestimonialsBlock from '../components/TestimonialsBlock.astro';
 import CustomerSegmentBlock from '../components/CustomerSegmentBlock.astro';
+import { webPageSchema, breadcrumbListSchema } from '../lib/seo';
+
+const title =
+  'DeltaGlider for regulated buyers — encrypt-before-the-backend on cheap S3-compatible storage';
+const description =
+  'AES-256-GCM encryption before objects hit the bucket. Your key stays in your runtime. The backend sees ciphertext. Built by Beshu Tech, in production at CERN, the European Parliament, and 2× of the S&P 500 top 5.';
 ---
 
-<BaseLayout
-  title="DeltaGlider for regulated buyers — encrypt-before-the-backend on cheap S3-compatible storage"
-  description="AES-256-GCM encryption before objects hit the bucket. Your key stays in your runtime. The backend sees ciphertext. Built by Beshu Tech, in production at CERN, the European Parliament, and 2× of the S&P 500 top 5."
->
+<BaseLayout title={title} description={description}>
+  <Fragment slot="json-ld">
+    <JsonLd schema={webPageSchema({ path: '/regulated', title, description })} />
+    <JsonLd
+      schema={breadcrumbListSchema([
+        { name: 'DeltaGlider', path: '/' },
+        { name: 'For regulated buyers', path: '/regulated' },
+      ])}
+    />
+  </Fragment>
   <section class="shell hero">
     <h1>Use cheap S3-compatible storage without giving the provider your data.</h1>
 

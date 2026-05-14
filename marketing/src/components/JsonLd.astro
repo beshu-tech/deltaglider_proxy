@@ -1,0 +1,21 @@
+---
+// JsonLd.astro — typesafe wrapper that emits a single
+// <script type="application/ld+json"> block.
+//
+// Why a component: every page can drop one or more <JsonLd schema={...} />
+// and Astro's static build inlines them. Type-safety lives in
+// src/lib/seo.ts where the schema generators live.
+
+interface Props {
+  /** A serialisable schema.org object — see src/lib/seo.ts for builders. */
+  schema: Record<string, unknown>;
+}
+
+const { schema } = Astro.props;
+// JSON.stringify with no indentation — minified is fine for crawlers
+// and shaves a few bytes off page weight. set:html bypasses Astro's
+// default HTML-escaping which would otherwise corrupt the JSON.
+const json = JSON.stringify(schema);
+---
+
+<script is:inline type="application/ld+json" set:html={json} />

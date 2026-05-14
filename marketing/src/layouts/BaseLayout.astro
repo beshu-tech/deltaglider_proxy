@@ -7,6 +7,7 @@
 // no third-party tags. Pages add what they need on top.
 
 import '../styles/global.css';
+import { SITE } from '../lib/seo';
 
 interface Props {
   /** Document title — shown in browser tab + Open Graph. */
@@ -15,10 +16,24 @@ interface Props {
   description: string;
   /** Optional canonical URL override. Defaults to current page URL. */
   canonical?: string;
+  /** Optional Open Graph image path. Defaults to SITE.ogImage. */
+  ogImage?: string;
+  /**
+   * Optional Open Graph type. Defaults to "website".
+   * Use "article" for case studies / engineering posts.
+   */
+  ogType?: 'website' | 'article';
 }
 
-const { title, description, canonical } = Astro.props;
+const {
+  title,
+  description,
+  canonical,
+  ogImage = SITE.ogImage,
+  ogType = 'website',
+} = Astro.props;
 const canonicalUrl = canonical ?? new URL(Astro.url.pathname, Astro.site).toString();
+const ogImageUrl = new URL(ogImage, Astro.site).toString();
 ---
 
 <!doctype html>
@@ -35,14 +50,25 @@ const canonicalUrl = canonical ?? new URL(Astro.url.pathname, Astro.site).toStri
     <meta property="og:title" content={title} />
     <meta property="og:description" content={description} />
     <meta property="og:url" content={canonicalUrl} />
-    <meta property="og:type" content="website" />
+    <meta property="og:type" content={ogType} />
     <meta property="og:site_name" content="DeltaGlider" />
+    <meta property="og:image" content={ogImageUrl} />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="DeltaGlider — Storage compression for S3, behind the same S3 API." />
+    <meta property="og:locale" content="en_GB" />
 
-    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:title" content={title} />
     <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={ogImageUrl} />
+    <meta name="twitter:image:alt" content="DeltaGlider — Storage compression for S3, behind the same S3 API." />
 
     <meta name="generator" content={Astro.generator} />
+
+    {/* JSON-LD structured data injection point. Pages opt in via the
+        named slot; multiple <JsonLd /> children are allowed. */}
+    <slot name="json-ld" />
   </head>
   <body>
     <header class="site-header">

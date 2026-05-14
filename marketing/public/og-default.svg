@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
+  <!-- og-default.svg — 1200x630 social preview.
+       Anti-polish: one brand color, plain typography, no decoration.
+       Replace with brand-team-designed art when ready. -->
+
+  <rect width="1200" height="630" fill="#1f8b8b"/>
+
+  <!-- Subtle thin top accent -->
+  <rect x="0" y="0" width="1200" height="6" fill="#d4732a"/>
+
+  <text
+    x="80"
+    y="280"
+    font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif"
+    font-size="92"
+    font-weight="600"
+    fill="#ffffff"
+    letter-spacing="-1"
+  >DeltaGlider</text>
+
+  <text
+    x="80"
+    y="370"
+    font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif"
+    font-size="40"
+    font-weight="400"
+    fill="#ffffff"
+    opacity="0.92"
+  >Storage compression for S3,</text>
+  <text
+    x="80"
+    y="420"
+    font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif"
+    font-size="40"
+    font-weight="400"
+    fill="#ffffff"
+    opacity="0.92"
+  >behind the same S3 API.</text>
+
+  <text
+    x="80"
+    y="555"
+    font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif"
+    font-size="26"
+    font-weight="500"
+    fill="#ffffff"
+    opacity="0.78"
+  >Beshu Tech · 10 senior engineers, since 2017</text>
+
+  <text
+    x="1120"
+    y="555"
+    text-anchor="end"
+    font-family="ui-monospace, SFMono-Regular, 'Menlo', 'Monaco', 'Consolas', monospace"
+    font-size="22"
+    font-weight="500"
+    fill="#ffffff"
+    opacity="0.72"
+  >GPL-3.0</text>
+</svg>

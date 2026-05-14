@@ -4,18 +4,29 @@
 // active voice, concrete over abstract, no marketing-ese.
 
 import BaseLayout from '../layouts/BaseLayout.astro';
+import JsonLd from '../components/JsonLd.astro';
 import TestimonialsBlock from '../components/TestimonialsBlock.astro';
 import CustomerSegmentBlock from '../components/CustomerSegmentBlock.astro';
 import SimoneCallout from '../components/SimoneCallout.astro';
 import MechanismExplanation from '../components/MechanismExplanation.astro';
 import WorkloadFitTable from '../components/WorkloadFitTable.astro';
 import ComparisonTable from '../components/ComparisonTable.astro';
+import {
+  organizationSchema,
+  webSiteSchema,
+  softwareApplicationSchema,
+} from '../lib/seo';
 ---
 
 <BaseLayout
   title="DeltaGlider — S3-compatible storage compression"
   description="Storage compression for S3, behind the same S3 API your apps already use. Open source, GPL-3.0. Built by Beshu Tech, 10 senior engineers since 2017."
 >
+  <Fragment slot="json-ld">
+    <JsonLd schema={organizationSchema()} />
+    <JsonLd schema={webSiteSchema()} />
+    <JsonLd schema={softwareApplicationSchema()} />
+  </Fragment>
   <section class="shell hero">
     <h1>Storage compression for S3, behind the same S3 API.</h1>
 

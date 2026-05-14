@@ -1,5 +1,6 @@
 // @ts-check
 import { defineConfig } from 'astro/config';
+import sitemap from '@astrojs/sitemap';
 
 // https://docs.astro.build/en/reference/configuration-reference/
 export default defineConfig({
@@ -23,4 +24,18 @@ export default defineConfig({
     '/s3-to-hetzner-wasabi': '/saas',
     '/multi-cloud-control-plane': '/regulated',
   },
+
+  // Integrations
+  integrations: [
+    // /sitemap-index.xml + /sitemap-0.xml — referenced by /robots.txt.
+    // Excludes the legacy-URL redirect stubs (no value in indexing
+    // pages that meta-refresh to another URL).
+    sitemap({
+      filter: (page) =>
+        !page.includes('/artifact-storage') &&
+        !page.includes('/minio-migration') &&
+        !page.includes('/s3-to-hetzner-wasabi') &&
+        !page.includes('/multi-cloud-control-plane'),
+    }),
+  ],
 });

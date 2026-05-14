@@ -6,12 +6,29 @@
 // relationship, not the software.
 
 import BaseLayout from '../layouts/BaseLayout.astro';
+import JsonLd from '../components/JsonLd.astro';
+import {
+  webPageSchema,
+  breadcrumbListSchema,
+  trialOfferSchema,
+} from '../lib/seo';
+
+const title = '30-day production support trial — DeltaGlider';
+const description =
+  "Try the relationship. Direct engineering Slack, response SLA, one architecture review call. The software stays free regardless — it's GPL-3.0.";
 ---
 
-<BaseLayout
-  title="30-day production support trial — DeltaGlider"
-  description="Try the relationship. Direct engineering Slack, response SLA, one architecture review call. The software stays free regardless — it's GPL-3.0."
->
+<BaseLayout title={title} description={description}>
+  <Fragment slot="json-ld">
+    <JsonLd schema={webPageSchema({ path: '/trial', title, description })} />
+    <JsonLd
+      schema={breadcrumbListSchema([
+        { name: 'DeltaGlider', path: '/' },
+        { name: 'Trial', path: '/trial' },
+      ])}
+    />
+    <JsonLd schema={trialOfferSchema({ durationDays: 30 })} />
+  </Fragment>
   <section class="shell hero">
     <h1>30-day production support trial.</h1>
 

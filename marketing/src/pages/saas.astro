@@ -5,13 +5,25 @@
 // (verified, publishable today); migration playbook.
 
 import BaseLayout from '../layouts/BaseLayout.astro';
+import JsonLd from '../components/JsonLd.astro';
 import MechanismExplanation from '../components/MechanismExplanation.astro';
+import { webPageSchema, breadcrumbListSchema } from '../lib/seo';
+
+const title = 'DeltaGlider for SaaS — cut S3 storage cost on versioned artifacts';
+const description =
+  'Your CI ships a new build every commit. Most share 99% of their bytes. DeltaGlider stores the 1%. Same S3 API, same SDKs, same workflow. Open source, GPL-3.0.';
 ---
 
-<BaseLayout
-  title="DeltaGlider for SaaS — cut S3 storage cost on versioned artifacts"
-  description="Your CI ships a new build every commit. Most share 99% of their bytes. DeltaGlider stores the 1%. Same S3 API, same SDKs, same workflow. Open source, GPL-3.0."
->
+<BaseLayout title={title} description={description}>
+  <Fragment slot="json-ld">
+    <JsonLd schema={webPageSchema({ path: '/saas', title, description })} />
+    <JsonLd
+      schema={breadcrumbListSchema([
+        { name: 'DeltaGlider', path: '/' },
+        { name: 'For SaaS', path: '/saas' },
+      ])}
+    />
+  </Fragment>
   <section class="shell hero">
     <h1>Stop paying AWS to store the same JAR a thousand times.</h1>
 
