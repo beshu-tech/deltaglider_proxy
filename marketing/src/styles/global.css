@@ -1,0 +1,351 @@
+/* global.css — anti-polish base styles per v5 plan §7.
+ *
+ * Design principles:
+ * - Plain typography, readable line length, generous vertical rhythm
+ * - One brand color (Beshu teal), one accent, system fonts (no web font)
+ * - Mobile-first; desktop layout via min-width media queries
+ * - No animations, no gradients, no decorative shadows
+ *
+ * Color palette is anchored to Beshu teal. Pick the closest cousin
+ * to readonlyrest.com when porting brand assets in week 1.
+ */
+
+:root {
+  /* Brand */
+  --beshu-teal: #1f8b8b;
+  --beshu-teal-dark: #166060;
+  --accent: #d4732a; /* warm complement to teal; used sparingly */
+
+  /* Neutrals */
+  --ink: #14181c;
+  --ink-soft: #4a5159;
+  --ink-faint: #7a828b;
+  --bg: #ffffff;
+  --bg-soft: #f6f7f8;
+  --bg-card: #fbfbfc;
+  --rule: #e1e4e8;
+
+  /* Type scale */
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "Menlo", "Monaco",
+    "Consolas", "Liberation Mono", "Courier New", monospace;
+
+  /* Sizes */
+  --measure: 68ch;     /* readable line length */
+  --measure-wide: 88ch;
+  --shell: 1100px;     /* page max-width on desktop */
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--ink);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+main {
+  flex: 1;
+  width: 100%;
+}
+
+/* Headings — restrained sizes; the v5 plan rejects "stat-bar"
+ * hero typography. Headlines are claims, not decoration. */
+h1, h2, h3, h4 {
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+  margin-top: 2.5rem;
+  margin-bottom: 0.75rem;
+  color: var(--ink);
+}
+
+h1 { font-size: clamp(1.75rem, 4vw, 2.4rem); }
+h2 { font-size: clamp(1.4rem, 3vw, 1.8rem); }
+h3 { font-size: 1.2rem; }
+h4 { font-size: 1.05rem; }
+
+p {
+  margin: 0.75rem 0;
+  max-width: var(--measure);
+}
+
+a {
+  color: var(--beshu-teal);
+  text-decoration: underline;
+  text-underline-offset: 0.15em;
+  text-decoration-thickness: 1px;
+}
+
+a:hover {
+  color: var(--beshu-teal-dark);
+}
+
+code, pre {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+}
+
+code {
+  background: var(--bg-soft);
+  padding: 0.1em 0.35em;
+  border-radius: 3px;
+  border: 1px solid var(--rule);
+}
+
+pre {
+  background: var(--bg-soft);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  padding: 1rem;
+  overflow-x: auto;
+  line-height: 1.45;
+}
+
+pre code {
+  background: transparent;
+  border: none;
+  padding: 0;
+}
+
+ul, ol {
+  max-width: var(--measure);
+  padding-left: 1.5rem;
+}
+
+li {
+  margin: 0.3rem 0;
+}
+
+blockquote {
+  margin: 1.5rem 0;
+  padding: 0.5rem 0 0.5rem 1rem;
+  border-left: 3px solid var(--beshu-teal);
+  color: var(--ink-soft);
+  max-width: var(--measure);
+}
+
+blockquote p {
+  margin: 0.4rem 0;
+}
+
+table {
+  border-collapse: collapse;
+  margin: 1.5rem 0;
+  width: 100%;
+  max-width: var(--measure-wide);
+  font-size: 0.95rem;
+}
+
+th, td {
+  border-bottom: 1px solid var(--rule);
+  padding: 0.6rem 0.8rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+th {
+  font-weight: 600;
+  color: var(--ink-soft);
+}
+
+hr {
+  border: none;
+  border-top: 1px solid var(--rule);
+  margin: 3rem 0;
+}
+
+/* Layout helpers */
+
+.shell {
+  max-width: var(--shell);
+  margin: 0 auto;
+  padding: 1.5rem;
+}
+
+@media (min-width: 768px) {
+  .shell {
+    padding: 2rem;
+  }
+}
+
+/* Header / nav */
+
+.site-header {
+  border-bottom: 1px solid var(--rule);
+  background: var(--bg);
+}
+
+.site-nav {
+  max-width: var(--shell);
+  margin: 0 auto;
+  padding: 1rem 1.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.brand {
+  color: var(--ink);
+  text-decoration: none;
+  font-size: 1.05rem;
+}
+
+.brand:hover {
+  color: var(--beshu-teal);
+}
+
+.site-nav-links {
+  list-style: none;
+  display: flex;
+  gap: 1.25rem;
+  margin: 0;
+  padding: 0;
+  flex-wrap: wrap;
+  font-size: 0.95rem;
+}
+
+.site-nav-links a {
+  color: var(--ink-soft);
+  text-decoration: none;
+}
+
+.site-nav-links a:hover {
+  color: var(--beshu-teal);
+  text-decoration: underline;
+}
+
+/* Footer */
+
+.site-footer {
+  border-top: 1px solid var(--rule);
+  margin-top: 4rem;
+  padding: 2rem 1.5rem;
+  font-size: 0.9rem;
+  color: var(--ink-soft);
+  background: var(--bg-soft);
+}
+
+.footer-row {
+  max-width: var(--shell);
+  margin: 0.4rem auto;
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  align-items: baseline;
+}
+
+.footer-sister {
+  color: var(--ink-faint);
+}
+
+.footer-managed {
+  color: var(--ink-faint);
+  font-style: italic;
+  margin-top: 1rem;
+}
+
+.site-footer a {
+  color: var(--ink-soft);
+}
+
+.site-footer a:hover {
+  color: var(--beshu-teal);
+}
+
+/* Hero block — used by index.astro and product pages.
+ * Vertical generosity, no decoration. */
+
+.hero {
+  padding: 3rem 0 2rem 0;
+}
+
+.hero h1 {
+  margin-top: 0;
+  font-size: clamp(2rem, 5vw, 3rem);
+  max-width: 20ch;
+}
+
+.hero-lede {
+  font-size: 1.15rem;
+  color: var(--ink-soft);
+  max-width: var(--measure);
+}
+
+.hero-ctas {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-top: 1.5rem;
+}
+
+.btn {
+  display: inline-block;
+  padding: 0.6rem 1.1rem;
+  border-radius: 4px;
+  text-decoration: none;
+  font-weight: 500;
+  font-size: 0.95rem;
+  border: 1px solid var(--rule);
+  background: var(--bg);
+  color: var(--ink);
+}
+
+.btn:hover {
+  border-color: var(--beshu-teal);
+  color: var(--beshu-teal);
+}
+
+.btn-primary {
+  background: var(--beshu-teal);
+  border-color: var(--beshu-teal);
+  color: var(--bg);
+}
+
+.btn-primary:hover {
+  background: var(--beshu-teal-dark);
+  border-color: var(--beshu-teal-dark);
+  color: var(--bg);
+}
+
+/* "About ReadonlyREST" chip used on testimonial cards.
+ * Per v5 plan §3.1 — explicit product attribution on every card. */
+
+.product-chip {
+  display: inline-block;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-faint);
+  background: var(--bg-soft);
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  padding: 0.15rem 0.6rem;
+  margin-bottom: 0.6rem;
+}
+
+/* Reduced motion — respect user preference. */
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

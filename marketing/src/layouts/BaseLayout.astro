@@ -1,0 +1,87 @@
+---
+// BaseLayout.astro — shell every page extends.
+// Per the v5 plan §7 visual brief: anti-polish, plain typography,
+// one brand color (Beshu teal), one accent, no animations.
+//
+// Sticks to system fonts (no web-font load), no JS by default,
+// no third-party tags. Pages add what they need on top.
+
+import '../styles/global.css';
+
+interface Props {
+  /** Document title — shown in browser tab + Open Graph. */
+  title: string;
+  /** Meta description — shown in search results + social previews. */
+  description: string;
+  /** Optional canonical URL override. Defaults to current page URL. */
+  canonical?: string;
+}
+
+const { title, description, canonical } = Astro.props;
+const canonicalUrl = canonical ?? new URL(Astro.url.pathname, Astro.site).toString();
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={canonicalUrl} />
+
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonicalUrl} />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="DeltaGlider" />
+
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+
+    <meta name="generator" content={Astro.generator} />
+  </head>
+  <body>
+    <header class="site-header">
+      <nav class="site-nav">
+        <a href="/" class="brand">
+          <strong>Beshu</strong> · DeltaGlider
+        </a>
+        <ul class="site-nav-links">
+          <li><a href="/saas">SaaS</a></li>
+          <li><a href="/regulated">Regulated</a></li>
+          <li><a href="/pricing">Pricing</a></li>
+          <li><a href="/trial">Trial</a></li>
+          <li><a href="https://github.com/beshu-tech/deltaglider_proxy">GitHub</a></li>
+        </ul>
+      </nav>
+    </header>
+
+    <main>
+      <slot />
+    </main>
+
+    <footer class="site-footer">
+      <div class="footer-row">
+        <span>Beshu Tech</span>
+        <span>GPL-3.0</span>
+        <a href="https://github.com/beshu-tech/deltaglider_proxy">GitHub</a>
+        <a href="/pricing">Pricing</a>
+        <a href="/trial">Trial</a>
+        <a href="mailto:contact@beshu.tech?subject=DeltaGlider%20-%20General%20inquiry">Contact</a>
+      </div>
+      <div class="footer-row footer-sister">
+        Sister products:
+        <a href="https://readonlyrest.com">ReadonlyREST</a>
+        ·
+        <a href="https://anaphora.beshu.tech">Anaphora</a>
+      </div>
+      <div class="footer-row footer-managed">
+        Interested in a managed cloud offering? Let us know — we're evaluating for Q4 2026.
+      </div>
+    </footer>
+  </body>
+</html>

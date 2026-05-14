@@ -1,0 +1,49 @@
+---
+// Scaffold-stub homepage.
+// Replaced by the full v5 §4.1 homepage copy in the next commit.
+// Lives here so the Astro build has at least one page to render
+// and we can verify the deploy chain end-to-end.
+
+import BaseLayout from '../layouts/BaseLayout.astro';
+---
+
+<BaseLayout
+  title="DeltaGlider — S3-compatible storage compression"
+  description="Storage compression for S3, behind the same S3 API your apps already use. Open source (GPL-3.0). Built by Beshu Tech."
+>
+  <section class="shell hero">
+    <h1>Storage compression for S3, behind the same S3 API.</h1>
+
+    <p class="hero-lede">
+      Versioned binaries — CI artifacts, plugin catalogs, builds,
+      backups, ML model lineages — stored as xdelta3 deltas on the
+      bucket. Apps unchanged. Stored bytes typically drop 10×–100×
+      on the right workload shape.
+    </p>
+
+    <p>
+      Open source (GPL-3.0). Built by <a href="https://beshu.tech">Beshu Tech</a> —
+      10 senior engineers, since 2017. Same team behind
+      <a href="https://readonlyrest.com">ReadonlyREST</a> (Elasticsearch
+      security) and Anaphora (dashboard-to-PDF reporting).
+    </p>
+
+    <div class="hero-ctas">
+      <a href="/pricing" class="btn btn-primary">See what it'd save you</a>
+      <a href="https://github.com/beshu-tech/deltaglider_proxy" class="btn">GitHub</a>
+      <a href="/trial" class="btn">30-day trial</a>
+    </div>
+  </section>
+
+  <section class="shell">
+    <p style="color: var(--ink-faint); font-size: 0.9rem; margin-top: 2rem;">
+      <em>
+        This is the scaffold homepage. Full copy from the v5 marketing plan
+        ships in the next commit. The point of this stub is to verify the
+        Astro build, GitHub Pages deploy, custom domain (deltaglider.com),
+        and link-graph all work end-to-end before investing in the long-
+        form copy.
+      </em>
+    </p>
+  </section>
+</BaseLayout>
