@@ -37,7 +37,7 @@ const ogImageUrl = new URL(ogImage, Astro.site).toString();
 ---
 
 <!doctype html>
-<html lang="en">
+<html lang="en-GB">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -72,7 +72,7 @@ const ogImageUrl = new URL(ogImage, Astro.site).toString();
   </head>
   <body>
     <header class="site-header">
-      <nav class="site-nav">
+      <nav class="site-nav" aria-label="Primary">
         <a href="/" class="brand">
           <strong>Beshu</strong> · DeltaGlider
         </a>
@@ -90,7 +90,7 @@ const ogImageUrl = new URL(ogImage, Astro.site).toString();
       <slot />
     </main>
 
-    <footer class="site-footer">
+    <footer class="site-footer" aria-label="Footer">
       <div class="footer-row">
         <span>Beshu Tech</span>
         <span>GPL-3.0</span>

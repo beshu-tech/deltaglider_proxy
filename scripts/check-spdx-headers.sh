@@ -15,9 +15,14 @@ set -euo pipefail
 EXPECTED='// SPDX-License-Identifier: GPL-3.0-only'
 
 # Find every tracked + untracked .rs file (excluding target/, .git/, node_modules/).
+#
+# Exact-match the first line — NOT a substring grep. A file with a
+# stray space, BOM, or other leading character must NOT pass; the SPDX
+# spec requires the header to be the first thing on the first line.
 missing=()
 while IFS= read -r f; do
-    if ! head -1 "$f" | grep -qF "$EXPECTED"; then
+    first_line=$(head -n 1 "$f")
+    if [ "$first_line" != "$EXPECTED" ]; then
         missing+=("$f")
     fi
 done < <(find . -name '*.rs' \

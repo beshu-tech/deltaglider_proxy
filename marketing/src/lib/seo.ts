@@ -103,7 +103,7 @@ export function webSiteSchema() {
     publisher: {
       '@id': `${BESHU.url}#organization`,
     },
-    inLanguage: 'en',
+    inLanguage: 'en-GB',
   };
 }
 
@@ -159,7 +159,7 @@ export function webPageSchema({ path, title, description, dateModified }: WebPag
     name: title,
     description,
     isPartOf: { '@id': `${SITE.url}#website` },
-    inLanguage: 'en',
+    inLanguage: 'en-GB',
     ...(dateModified ? { dateModified } : {}),
   };
 }
@@ -287,6 +287,6 @@ export function articleSchema(input: ArticleInput) {
     publisher: { '@id': `${BESHU.url}#organization` },
     datePublished: input.datePublished,
     dateModified: input.dateModified ?? input.datePublished,
-    inLanguage: 'en',
+    inLanguage: 'en-GB',
   };
 }

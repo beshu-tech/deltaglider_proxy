@@ -1,0 +1,153 @@
+---
+// /case-studies — index page for the case-studies section.
+// Created to make the BreadcrumbList /case-studies entry resolve to a real
+// URL (Google Search Console flags unresolvable breadcrumb items as
+// schema errors). Also sets us up to grow the section: Postgres-daily-
+// backup (Week 3-4) and Maven-mirror (Week 5-6) case studies land here.
+
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import JsonLd from '../../components/JsonLd.astro';
+import { webPageSchema, breadcrumbListSchema } from '../../lib/seo';
+
+const title = 'Case studies — DeltaGlider';
+const description =
+  'Engineering retrospectives from real DeltaGlider deployments. In-progress and complete migrations, with the bugs we hit and how we fixed them.';
+---
+
+<BaseLayout title={title} description={description}>
+  <Fragment slot="json-ld">
+    <JsonLd schema={webPageSchema({ path: '/case-studies', title, description })} />
+    <JsonLd
+      schema={breadcrumbListSchema([
+        { name: 'DeltaGlider', path: '/' },
+        { name: 'Case studies', path: '/case-studies' },
+      ])}
+    />
+  </Fragment>
+
+  <section class="shell hero">
+    <h1>Case studies</h1>
+
+    <p class="hero-lede">
+      Engineering retrospectives from real DeltaGlider deployments —
+      in-progress and complete migrations, with the bugs we hit and
+      how we fixed them.
+    </p>
+  </section>
+
+  <div class="shell">
+    <section class="study-list">
+      <article class="study">
+        <h2>
+          <a href="/case-studies/readonlyrest-builds">
+            Migrating ReadonlyREST's 1.71 TB build catalog off AWS S3
+          </a>
+        </h2>
+        <p class="study-meta">
+          <span class="study-status status-in-progress">In progress</span>
+          · 145 versions · 8 years of release history · ~$11 in compute so far
+        </p>
+        <p>
+          Beshu Tech is migrating its own ReadonlyREST build catalog
+          from AWS S3 (eu-west-1) to Hetzner Object Storage (hel1)
+          via DeltaGlider. The first three verified versions
+          compressed 88.5×, 4.1×, and 3.8×. Sample so far: a 2.8 GB
+          plugin reduced to 32 MB, bit-perfect on SHA-256 round-trip.
+        </p>
+        <p>
+          → <a href="/case-studies/readonlyrest-builds">Read the migration log</a>
+        </p>
+      </article>
+
+      <article class="study study-planned">
+        <h2>Postgres daily-backup deduplication</h2>
+        <p class="study-meta">
+          <span class="study-status status-planned">Planned</span>
+          · Weeks 3-4 of the launch plan
+        </p>
+        <p>
+          A synthesized scenario: daily Postgres dumps stored as
+          deltas against the previous day. Expected compression range
+          5-50× depending on workload churn. Reproducible end-to-end
+          with a single Docker compose.
+        </p>
+      </article>
+
+      <article class="study study-planned">
+        <h2>Maven artifact mirror</h2>
+        <p class="study-meta">
+          <span class="study-status status-planned">Planned</span>
+          · Weeks 5-6 of the launch plan
+        </p>
+        <p>
+          A Maven artifact mirror with thousands of JAR versions per
+          package. Most JARs share 90%+ bytes with adjacent versions
+          (signatures, manifests, embedded CSS). Expected compression
+          range 10-50×.
+        </p>
+      </article>
+    </section>
+  </div>
+</BaseLayout>
+
+<style>
+  .study-list {
+    margin: 3rem 0;
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 2rem;
+  }
+
+  .study {
+    border-left: 3px solid var(--beshu-teal);
+    padding: 0.5rem 0 0.5rem 1.5rem;
+    max-width: var(--measure-wide);
+  }
+
+  .study h2 {
+    margin-top: 0;
+    font-size: 1.3rem;
+  }
+
+  .study h2 a {
+    color: var(--ink);
+    text-decoration: none;
+  }
+
+  .study h2 a:hover {
+    color: var(--beshu-teal);
+    text-decoration: underline;
+  }
+
+  .study-meta {
+    color: var(--ink-soft);
+    font-size: 0.9rem;
+    margin: 0.25rem 0 0.75rem 0;
+  }
+
+  .study-status {
+    display: inline-block;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 0.1rem 0.5rem;
+    border-radius: 3px;
+    border: 1px solid var(--rule);
+  }
+
+  .status-in-progress {
+    background: var(--bg-card);
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+
+  .status-planned {
+    background: var(--bg-soft);
+    color: var(--ink-faint);
+  }
+
+  .study-planned {
+    border-left-color: var(--rule);
+    opacity: 0.75;
+  }
+</style>
