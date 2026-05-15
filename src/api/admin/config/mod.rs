@@ -588,7 +588,14 @@ pub(super) fn preserve_primary_backend_creds(
                 ..
             },
         ) => {
-            preserve_sigv4_pair(new_akid, new_sk, old_akid, old_sk, "primary backend", warnings);
+            preserve_sigv4_pair(
+                new_akid,
+                new_sk,
+                old_akid,
+                old_sk,
+                "primary backend",
+                warnings,
+            );
         }
         (
             BackendConfig::Filesystem { .. },
