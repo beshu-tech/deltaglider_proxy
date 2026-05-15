@@ -166,6 +166,17 @@ fn median_u64(values: &[u64]) -> u64 {
     *median
 }
 
+/// `numerator / denominator` as f64, or `None` when the denominator is
+/// missing or zero. Guards the `ratio_median` field against
+/// divide-by-zero on prefixes with a zero-byte reference.
+fn ratio_or_none(numerator: u64, denominator: Option<u64>) -> Option<f64> {
+    let d = denominator?;
+    if d == 0 {
+        return None;
+    }
+    Some(numerator as f64 / d as f64)
+}
+
 // ─── I/O layer: types ─────────────────────────────────────────────────
 
 /// Per-prefix efficiency report row, returned over the admin API.
@@ -237,7 +248,7 @@ impl Default for DeltaEfficiencyScanner {
 /// RAII guard mirroring `UsageScanner::ScanInProgressGuard` — clears
 /// the dedup entry on drop, including drop-on-panic. Without this, a
 /// panic in the scan future would leave the bucket permanently marked
-/// "in progress" until process restart (E-P1-2 class of bug).
+/// "in progress" until process restart.
 struct ScanInProgressGuard {
     scanner: Arc<DeltaEfficiencyScanner>,
     key: String,
@@ -510,13 +521,7 @@ fn build_report_for_prefix(
     } else {
         partition.total_original as i64 - stored_bytes as i64
     };
-    let ratio_median = partition.reference_bytes.and_then(|r| {
-        if r == 0 {
-            None
-        } else {
-            Some(median as f64 / r as f64)
-        }
-    });
+    let ratio_median = ratio_or_none(median, partition.reference_bytes);
 
     Some(DeltaspaceReport {
         bucket: bucket.to_string(),
@@ -777,6 +782,17 @@ mod tests {
         assert_eq!(median_u64(&[3, 1, 2]), 2);
         assert_eq!(median_u64(&[5]), 5);
         assert_eq!(median_u64(&[]), 0);
+    }
+
+    // ── ratio_or_none ──────────────────────────────────────────────
+
+    #[test]
+    fn ratio_or_none_handles_missing_and_zero_denominators() {
+        assert_eq!(ratio_or_none(100, None), None);
+        assert_eq!(ratio_or_none(100, Some(0)), None);
+        assert_eq!(ratio_or_none(0, Some(100)), Some(0.0));
+        assert_eq!(ratio_or_none(50, Some(100)), Some(0.5));
+        assert_eq!(ratio_or_none(150, Some(100)), Some(1.5));
     }
 
     // ── Efficiency::explanation ────────────────────────────────────

@@ -1436,6 +1436,8 @@ impl StorageBackend for S3Backend {
             .bounded_head_calls(bucket, delta_keys.iter().map(|k| k.as_str()))
             .await;
 
+        // `head_results` only contains the delta keys we HEAD'd above —
+        // non-delta entries fall through to the no-HEAD builder.
         let metadata_list: Vec<FileMetadata> = listed
             .into_iter()
             .map(|obj| {
