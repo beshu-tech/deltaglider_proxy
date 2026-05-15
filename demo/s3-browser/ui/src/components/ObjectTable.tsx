@@ -211,9 +211,16 @@ export default function ObjectTable({
       key: 'size',
       width: isMobile ? 80 : 100,
       sorter: (a, b) => {
-        const sa = a._isFolder ? -1 : a.size;
-        const sb = b._isFolder ? -1 : b.size;
-        return sa - sb;
+        // Use the scanned folder size when available so sorting matches
+        // what the user sees rendered. Folders without a scanned size
+        // sort to 0 (after small files, before larger ones) — better
+        // than the old `-1` constant that made every folder tie.
+        const rowSize = (r: RowData): number => {
+          if (!r._isFolder) return r.size;
+          const folderPrefix = r.key.replace('folder:', '');
+          return folderSizes[folderPrefix]?.progress?.totalSize ?? 0;
+        };
+        return rowSize(a) - rowSize(b);
       },
       render: (_: unknown, record: RowData) => {
         if (record._isFolder) {
