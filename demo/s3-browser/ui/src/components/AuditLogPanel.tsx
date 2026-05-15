@@ -156,7 +156,7 @@ export default function AuditLogPanel({ onSessionExpired }: Props) {
             audit entries from this process. The ring is bounded (default 500
             entries; set <code>DGP_AUDIT_RING_SIZE</code> to change). Stdout /
             your log pipeline remains authoritative for long-term audit —
-            this panel is a debugging convenience for incidents.
+            this panel surfaces recent activity for quick inspection.
           </>
         }
       />

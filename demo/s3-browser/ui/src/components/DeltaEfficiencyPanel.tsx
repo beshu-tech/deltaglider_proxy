@@ -182,9 +182,9 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
     <div style={{ padding: '16px 24px' }}>
       <Paragraph style={{ marginBottom: 12, color: colors.TEXT_SECONDARY }}>
         Scan a bucket and surface deltaspaces whose reference baseline is
-        a poor fit for its sibling files — the prod-incident shape where a
-        wrong reference produces deltas nearly the size of the originals.
-        Read-only diagnostic; the operator decides whether to re-upload.
+        a poor fit for its sibling files. A wrong reference produces deltas
+        nearly the size of the originals, wasting storage. Read-only
+        diagnostic — you decide whether to re-upload.
       </Paragraph>
 
       <Space wrap style={{ marginBottom: 16 }}>

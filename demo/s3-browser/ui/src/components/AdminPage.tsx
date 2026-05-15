@@ -178,7 +178,7 @@ const PAGE_HEADERS: Record<string, { icon: React.ReactNode; title: string; descr
   'diagnostics/delta-efficiency': {
     icon: <ThunderboltOutlined />,
     title: 'Delta efficiency',
-    description: "Scan a bucket's deltaspaces and surface prefixes where the chosen reference baseline is producing too-large deltas — the v0.9.17 1.70.0-pre5 incident shape. Read-only; the operator decides what to re-upload.",
+    description: "Scan a bucket's deltaspaces and surface prefixes where the reference baseline is producing larger deltas than expected. Read-only diagnostic; you decide what to re-upload.",
   },
   'diagnostics/event-outbox': {
     icon: <DatabaseOutlined />,
