@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.11.0 — 2026-05-16
+
 ### Added
 
 - **Bucket-wide scan endpoint with persistent on-disk cache**, backing
