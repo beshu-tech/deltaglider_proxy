@@ -88,10 +88,22 @@ xattr = "1"
 jsonwebtoken = "9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "cookies"] }
 serde_urlencoded = "0.7"
-regex = "1"
+# regex-lite: same API as `regex` but skips aho-corasick / regex-syntax /
+# regex-automata / unicode tables. Our only use is `Regex::new(...)` for
+# user-supplied email patterns in IAM group-mapping rules — a handful of
+# calls per login, where the perf difference is invisible. Trade: ~30s
+# faster release builds.
+regex-lite = "0.1"
 
 # Embedded demo UI
-rust-embed = { version = "8", features = ["compression"] }
+# NOTE: `compression` would bring in include-flate → zstd-sys (~66s of C
+# compile). The binary embeds the UI as-is and serves it; HTTP-level
+# compression is handled by the client/CDN, not by us. Saving 66s of
+# build time for ~2-3MB of extra binary is well worth it.
+# `include-exclude` lets `#[exclude = "*.map"]` strip sourcemaps from
+# the binary — they stay on disk for local debugging / Sentry upload
+# but don't bloat the shipped binary by ~22 MB.
+rust-embed = { version = "8", features = ["include-exclude"] }
 mime_guess = "2"
 
 # CLI

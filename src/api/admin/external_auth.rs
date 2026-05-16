@@ -622,7 +622,7 @@ pub async fn create_mapping(
     }
 
     // Validate regex if applicable
-    if body.match_type == "email_regex" && regex::Regex::new(&body.match_value).is_err() {
+    if body.match_type == "email_regex" && regex_lite::Regex::new(&body.match_value).is_err() {
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -665,7 +665,7 @@ pub async fn update_mapping(
         .unwrap_or(false);
     if is_regex_type {
         if let Some(ref val) = body.match_value {
-            if regex::Regex::new(val).is_err() {
+            if regex_lite::Regex::new(val).is_err() {
                 return Err(StatusCode::BAD_REQUEST);
             }
         }

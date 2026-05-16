@@ -1,0 +1,7 @@
+# Speed up linking. lld is ~3-5× faster than the default GNU `ld` for
+# release builds and noticeably faster for incremental dev builds.
+# Both rustc 1.76+ and ld.lld 14+ are needed; the project sets a 1.94
+# stable toolchain so this is always available.
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]

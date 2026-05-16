@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo, lazy, Suspense } from 'react';
 import { Layout, Spin, Empty, Grid, Button, Space } from 'antd';
 import useS3Browser from './useS3Browser';
 import TopBar from './components/TopBar';
@@ -7,12 +7,14 @@ import Sidebar from './components/Sidebar';
 import ObjectTable from './components/ObjectTable';
 import InspectorPanel from './components/InspectorPanel';
 import FilePreview from './components/FilePreview';
-import AdminPage from './components/AdminPage';
 import DropZone from './components/DropZone';
 import UploadPage from './components/UploadPage';
 import ConnectPage from './components/ConnectPage';
-import MetricsPage from './components/MetricsPage';
-import DocsPage from './components/DocsPage';
+// Heavy admin/docs/metrics pages are lazy-loaded so the file-browser
+// shell doesn't pay for Monaco / mermaid / recharts on first paint.
+const AdminPage = lazy(() => import('./components/AdminPage'));
+const MetricsPage = lazy(() => import('./components/MetricsPage'));
+const DocsPage = lazy(() => import('./components/DocsPage'));
 import FileBrowserSessionTip from './components/FileBrowserSessionTip';
 import AccountMenu from './components/AccountMenu';
 import DemoDataGenerator from './components/DemoDataGenerator';
@@ -368,16 +370,24 @@ export default function App() {
     );
   }
 
+  const lazyFallback = (
+    <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 48 }}>
+      <Spin size="large" />
+    </div>
+  );
+
   const renderContent = () => {
     if (view === 'admin') {
       return (
-        <AdminPage
-          onBack={navigateToBrowse}
-          onSessionExpired={navigateToBrowse}
-          subPath={subPath}
-          accountMenu={accountMenu()}
-          canAdmin={canAdmin}
-        />
+        <Suspense fallback={lazyFallback}>
+          <AdminPage
+            onBack={navigateToBrowse}
+            onSessionExpired={navigateToBrowse}
+            subPath={subPath}
+            accountMenu={accountMenu()}
+            canAdmin={canAdmin}
+          />
+        </Suspense>
       );
     }
 
@@ -393,11 +403,19 @@ export default function App() {
           </div>
         );
       }
-      return <MetricsPage onBack={navigateToBrowse} />;
+      return (
+        <Suspense fallback={lazyFallback}>
+          <MetricsPage onBack={navigateToBrowse} />
+        </Suspense>
+      );
     }
 
     if (view === 'docs') {
-      return <DocsPage onBack={navigateToBrowse} docId={subPath || undefined} accountMenu={accountMenu()} />;
+      return (
+        <Suspense fallback={lazyFallback}>
+          <DocsPage onBack={navigateToBrowse} docId={subPath || undefined} accountMenu={accountMenu()} />
+        </Suspense>
+      );
     }
 
     if (view === 'upload') {
