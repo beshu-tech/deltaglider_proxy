@@ -1791,31 +1791,12 @@ export interface BucketScanProgress {
 }
 
 /**
- * State tag returned by /scan/status?bucket=X. The server reports
- * `idle` for buckets it has never scanned and has no in-flight job.
+ * GET /scan/status (no bucket) — full map of cached per-bucket
+ * results. Intentionally not exported: callers only ever need
+ * `getAllBucketScans` which returns it directly.
  */
-export type BucketScanStatus =
-  | { state: 'idle'; bucket: string }
-  | ({ state: 'done' } & BucketScanResult)
-  | ({ state: 'running' } & BucketScanProgress);
-
-/** GET /scan/status (no bucket) — full map of cached per-bucket results. */
-export interface AllBucketScansResponse {
+interface AllBucketScansResponse {
   buckets: Record<string, BucketScanResult>;
-}
-
-/**
- * Current state for one bucket. Returns `state: 'idle'` if the server
- * has never seen this bucket scanned and there's no live job.
- */
-export async function getBucketScanStatus(
-  bucket: string,
-): Promise<BucketScanStatus> {
-  const res = await adminFetch(
-    `/api/admin/diagnostics/scan/status?bucket=${encodeURIComponent(bucket)}`,
-  );
-  if (!res.ok) await throwApiError(res, 'Bucket scan status');
-  return safeJson(res);
 }
 
 /** Map of every bucket the server has a cached scan for. */
@@ -1850,18 +1831,6 @@ export async function stopBucketScan(
     'POST',
   );
   if (!res.ok) await throwApiError(res, 'Bucket scan stop');
-  return safeJson(res);
-}
-
-/** Drop the persisted result so the UI reverts to "never scanned". */
-export async function forgetBucketScan(
-  bucket: string,
-): Promise<{ forgotten: boolean }> {
-  const res = await adminFetch(
-    `/api/admin/diagnostics/scan?bucket=${encodeURIComponent(bucket)}`,
-    'DELETE',
-  );
-  if (!res.ok) await throwApiError(res, 'Bucket scan forget');
   return safeJson(res);
 }
 
