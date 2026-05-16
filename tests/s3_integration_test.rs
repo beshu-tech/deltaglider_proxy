@@ -1,21 +1,24 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Self-contained S3 integration tests with ephemeral MinIO
+//! S3 integration tests against an external MinIO.
 //!
-//! Spins up an ephemeral MinIO container via testcontainers, runs comprehensive
-//! tests covering bucket CRUD, delta compression, metadata, file integrity,
-//! and cross-cutting scenarios, then tears down automatically.
+//! Comprehensive tests covering bucket CRUD, delta compression, metadata,
+//! file integrity, and cross-cutting scenarios.
 //!
-//! All tests share a single MinIO container via OnceCell for efficiency (~3s startup).
-//! Test data is isolated via unique prefixes.
+//! Test data is isolated via unique per-test prefixes / unique bucket
+//! names — multiple test binaries can hit the same MinIO concurrently.
 //!
-//! Requires Docker. Tests skip gracefully if Docker is unavailable.
+//! Expects MinIO at $MINIO_ENDPOINT (default: http://localhost:9000)
+//! with the `deltaglider-test` bucket pre-created. CI brings up MinIO
+//! via the standard service container; locally run
+//! `docker run -p 9000:9000 minio/minio server /data` and create the
+//! bucket once. Tests skip gracefully when MinIO is unreachable.
 
 mod common;
 
 use bytes::Bytes;
 use common::{
-    generate_binary, get_bytes, head_headers, list_objects_raw, mutate_binary,
+    generate_binary, get_bytes, head_headers, list_objects_raw, minio_endpoint_url, mutate_binary,
     put_and_get_storage_type, TestServer, MINIO_ACCESS_KEY, MINIO_SECRET_KEY,
 };
 use deltaglider_proxy::multipart::MultipartStore;
@@ -24,59 +27,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use testcontainers::core::IntoContainerPort;
-use testcontainers::runners::AsyncRunner;
-use testcontainers::ContainerAsync;
-use testcontainers_modules::minio::MinIO;
-use tokio::sync::OnceCell;
-
-/// Shared MinIO container for all tests in this file.
-/// Wrapped in `ContainerGuard` to ensure Docker cleanup even though statics don't drop.
-static MINIO_CONTAINER: OnceCell<ContainerGuard> = OnceCell::const_new();
 
 /// Counter for unique test prefixes
 static PREFIX_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Wrapper that registers an atexit handler to stop+remove the Docker container.
-/// `static` values are never dropped in Rust, so `ContainerAsync::Drop` never fires.
-/// This guard captures the container ID at creation and registers a synchronous
-/// `docker rm -f` via `std::process::atexit` to ensure cleanup.
-struct ContainerGuard {
-    inner: ContainerAsync<MinIO>,
-}
-
-impl ContainerGuard {
-    fn new(container: ContainerAsync<MinIO>) -> Self {
-        // Register a process-exit hook that force-removes this container.
-        // Uses `docker rm -f` which is synchronous and doesn't need the tokio runtime.
-        let id = container.id().to_string();
-        // Safety: atexit handler must be safe to call; std::process::Command is fine.
-        // We intentionally leak the String so the closure is 'static.
-        let id_leaked: &'static str = String::leak(id);
-        unsafe {
-            libc::atexit(cleanup_container_trampoline);
-        }
-        CONTAINER_ID_FOR_CLEANUP
-            .set(id_leaked)
-            .unwrap_or_else(|_| panic!("ContainerGuard created more than once"));
-
-        Self { inner: container }
-    }
-}
-
-/// The container ID to clean up at exit.
-static CONTAINER_ID_FOR_CLEANUP: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
-
-/// C-compatible atexit callback — force-removes the Docker container.
-extern "C" fn cleanup_container_trampoline() {
-    if let Some(id) = CONTAINER_ID_FOR_CLEANUP.get() {
-        let _ = std::process::Command::new("docker")
-            .args(["rm", "-f", id])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
-}
 
 /// The bucket name used for integration tests
 const TEST_BUCKET: &str = "integration-test";
@@ -91,21 +44,10 @@ fn unique_prefix() -> String {
     format!("itest-{}-{}", timestamp, counter)
 }
 
-/// Get or start the shared MinIO container, returning its S3 endpoint URL.
-async fn minio_endpoint() -> String {
-    let guard = MINIO_CONTAINER
-        .get_or_init(|| async {
-            let container = MinIO::default()
-                .start()
-                .await
-                .expect("Failed to start MinIO container");
-            ContainerGuard::new(container)
-        })
-        .await;
-
-    let host = guard.inner.get_host().await.unwrap();
-    let port = guard.inner.get_host_port_ipv4(9000.tcp()).await.unwrap();
-    format!("http://{}:{}", host, port)
+/// MinIO endpoint for the integration tests — same `MINIO_ENDPOINT`
+/// env (default localhost:9000) the rest of the suite uses.
+fn minio_endpoint() -> String {
+    minio_endpoint_url()
 }
 
 /// Create an S3 client pointed directly at the MinIO container (not through proxy)
@@ -137,7 +79,7 @@ async fn ensure_bucket(endpoint: &str) {
 
 /// Start a proxy server pointed at the ephemeral MinIO, return (TestServer, endpoint)
 async fn proxy_server() -> TestServer {
-    let endpoint = minio_endpoint().await;
+    let endpoint = minio_endpoint();
     ensure_bucket(&endpoint).await;
     TestServer::s3_with_endpoint(&endpoint, TEST_BUCKET).await
 }
@@ -148,8 +90,8 @@ async fn proxy_server() -> TestServer {
 
 #[tokio::test]
 async fn test_create_and_head_bucket() {
-    skip_unless_docker!();
-    let endpoint = minio_endpoint().await;
+    skip_unless_minio!();
+    let endpoint = minio_endpoint();
     let client = minio_direct_client(&endpoint).await;
     let bucket_name = format!("test-bucket-{}", unique_prefix());
 
@@ -169,8 +111,8 @@ async fn test_create_and_head_bucket() {
 
 #[tokio::test]
 async fn test_list_buckets_includes_created() {
-    skip_unless_docker!();
-    let endpoint = minio_endpoint().await;
+    skip_unless_minio!();
+    let endpoint = minio_endpoint();
     let client = minio_direct_client(&endpoint).await;
     let bucket_name = format!("list-test-{}", unique_prefix());
 
@@ -200,8 +142,8 @@ async fn test_list_buckets_includes_created() {
 
 #[tokio::test]
 async fn test_head_bucket_nonexistent() {
-    skip_unless_docker!();
-    let endpoint = minio_endpoint().await;
+    skip_unless_minio!();
+    let endpoint = minio_endpoint();
     let client = minio_direct_client(&endpoint).await;
 
     let result = client
@@ -214,8 +156,8 @@ async fn test_head_bucket_nonexistent() {
 
 #[tokio::test]
 async fn test_delete_empty_bucket() {
-    skip_unless_docker!();
-    let endpoint = minio_endpoint().await;
+    skip_unless_minio!();
+    let endpoint = minio_endpoint();
     let client = minio_direct_client(&endpoint).await;
     let bucket_name = format!("del-empty-{}", unique_prefix());
 
@@ -239,8 +181,8 @@ async fn test_delete_empty_bucket() {
 
 #[tokio::test]
 async fn test_delete_nonempty_bucket_fails() {
-    skip_unless_docker!();
-    let endpoint = minio_endpoint().await;
+    skip_unless_minio!();
+    let endpoint = minio_endpoint();
     let client = minio_direct_client(&endpoint).await;
     let bucket_name = format!("del-nonempty-{}", unique_prefix());
 
@@ -279,7 +221,7 @@ async fn test_delete_nonempty_bucket_fails() {
 
 #[tokio::test]
 async fn test_multi_version_delta_compression() {
-    skip_unless_docker!();
+    skip_unless_minio!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -368,7 +310,7 @@ async fn test_multi_version_delta_compression() {
 
 #[tokio::test]
 async fn test_two_deltaspaces_independent() {
-    skip_unless_docker!();
+    skip_unless_minio!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix_a = format!("{}/project-a", unique_prefix());
@@ -464,7 +406,7 @@ async fn test_two_deltaspaces_independent() {
 
 #[tokio::test]
 async fn test_delta_reconstruction_sha256() {
-    skip_unless_docker!();
+    skip_unless_minio!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -530,7 +472,7 @@ async fn test_delta_reconstruction_sha256() {
 
 #[tokio::test]
 async fn test_head_returns_dg_metadata_headers() {
-    skip_unless_docker!();
+    skip_unless_minio!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -614,7 +556,7 @@ async fn test_head_returns_dg_metadata_headers() {
 
 #[tokio::test]
 async fn test_metadata_for_all_storage_types() {
-    skip_unless_docker!();
+    skip_unless_minio!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -689,7 +631,7 @@ async fn test_metadata_for_all_storage_types() {
 
 #[tokio::test]
 async fn test_text_file_passthrough_roundtrip() {
-    skip_unless_docker!();
+    skip_unless_minio!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -719,7 +661,7 @@ async fn test_text_file_passthrough_roundtrip() {
 
 #[tokio::test]
 async fn test_multiple_text_files_roundtrip() {
-    skip_unless_docker!();
+    skip_unless_minio!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -793,7 +735,7 @@ async fn test_multiple_text_files_roundtrip() {
 
 #[tokio::test]
 async fn test_mixed_file_types_same_prefix() {
-    skip_unless_docker!();
+    skip_unless_minio!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -852,7 +794,7 @@ async fn test_mixed_file_types_same_prefix() {
 
 #[tokio::test]
 async fn test_full_lifecycle_with_delete() {
-    skip_unless_docker!();
+    skip_unless_minio!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let client = server.s3_client().await;
@@ -1063,7 +1005,7 @@ async fn complete_multipart_upload(
 
 #[tokio::test]
 async fn test_multipart_basic_roundtrip() {
-    skip_unless_docker!();
+    skip_unless_minio!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -1135,7 +1077,7 @@ async fn test_multipart_basic_roundtrip() {
 
 #[tokio::test]
 async fn test_multipart_single_part() {
-    skip_unless_docker!();
+    skip_unless_minio!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -1172,7 +1114,7 @@ async fn test_multipart_single_part() {
 
 #[tokio::test]
 async fn test_multipart_abort() {
-    skip_unless_docker!();
+    skip_unless_minio!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -1219,7 +1161,7 @@ async fn test_multipart_abort() {
 
 #[tokio::test]
 async fn test_multipart_list_parts() {
-    skip_unless_docker!();
+    skip_unless_minio!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -1276,7 +1218,7 @@ async fn test_multipart_list_parts() {
 
 #[tokio::test]
 async fn test_multipart_list_uploads() {
-    skip_unless_docker!();
+    skip_unless_minio!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -1340,7 +1282,7 @@ async fn test_multipart_list_uploads() {
 
 #[tokio::test]
 async fn test_multipart_delta_compression() {
-    skip_unless_docker!();
+    skip_unless_minio!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -1422,8 +1364,8 @@ async fn test_multipart_delta_compression() {
 
 #[tokio::test]
 async fn test_multipart_large_zip_forces_passthrough_on_s3_backend() {
-    skip_unless_docker!();
-    let endpoint = minio_endpoint().await;
+    skip_unless_minio!();
+    let endpoint = minio_endpoint();
     ensure_bucket(&endpoint).await;
     let server = TestServer::builder()
         .s3_endpoint(&endpoint)
@@ -1558,7 +1500,7 @@ fn test_completing_timeout_reclaims_stuck_upload() {
 
 #[tokio::test]
 async fn test_multipart_invalid_upload_id() {
-    skip_unless_docker!();
+    skip_unless_minio!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -1603,7 +1545,7 @@ async fn test_multipart_invalid_upload_id() {
 
 #[tokio::test]
 async fn test_multipart_aws_sdk_compat() {
-    skip_unless_docker!();
+    skip_unless_minio!();
     let server = proxy_server().await;
     let prefix = unique_prefix();
     let key = format!("{}/sdk-multipart.bin", prefix);
@@ -1740,7 +1682,7 @@ async fn ensure_bucket_via_proxy(client: &reqwest::Client, endpoint: &str, bucke
 
 #[tokio::test]
 async fn test_multi_bucket_create_and_list() {
-    skip_unless_docker!();
+    skip_unless_minio!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -1775,7 +1717,7 @@ async fn test_multi_bucket_create_and_list() {
 
 #[tokio::test]
 async fn test_multi_bucket_put_get_isolation() {
-    skip_unless_docker!();
+    skip_unless_minio!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -1829,7 +1771,7 @@ async fn test_multi_bucket_put_get_isolation() {
 
 #[tokio::test]
 async fn test_multi_bucket_list_objects_isolation() {
-    skip_unless_docker!();
+    skip_unless_minio!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -1901,7 +1843,7 @@ async fn test_multi_bucket_list_objects_isolation() {
 
 #[tokio::test]
 async fn test_multi_bucket_cross_bucket_copy() {
-    skip_unless_docker!();
+    skip_unless_minio!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -1951,7 +1893,7 @@ async fn test_multi_bucket_cross_bucket_copy() {
 
 #[tokio::test]
 async fn test_multi_bucket_delete_bucket() {
-    skip_unless_docker!();
+    skip_unless_minio!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -2005,7 +1947,7 @@ async fn test_multi_bucket_delete_bucket() {
 
 #[tokio::test]
 async fn test_list_objects_reports_original_sizes() {
-    skip_unless_docker!();
+    skip_unless_minio!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -2084,7 +2026,7 @@ async fn test_list_objects_reports_original_sizes() {
 
 #[tokio::test]
 async fn test_list_objects_delimiter_common_prefixes() {
-    skip_unless_docker!();
+    skip_unless_minio!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -2137,7 +2079,7 @@ async fn test_list_objects_delimiter_common_prefixes() {
 
 #[tokio::test]
 async fn test_list_objects_pagination() {
-    skip_unless_docker!();
+    skip_unless_minio!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -2223,10 +2165,10 @@ async fn test_list_objects_pagination() {
 
 #[tokio::test]
 async fn test_first_file_bad_delta_ratio_passthrough() {
-    skip_unless_docker!();
+    skip_unless_minio!();
     // Use a very low max_delta_ratio so the identity delta (first file against itself)
     // exceeds the threshold and triggers the passthrough fallback
-    let endpoint = minio_endpoint().await;
+    let endpoint = minio_endpoint();
     ensure_bucket(&endpoint).await;
     let server = TestServer::s3_with_endpoint_and_delta_ratio(&endpoint, TEST_BUCKET, 0.001).await;
     let http = reqwest::Client::new();

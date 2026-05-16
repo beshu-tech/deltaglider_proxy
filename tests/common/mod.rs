@@ -1113,29 +1113,6 @@ macro_rules! skip_unless_minio {
     };
 }
 
-/// Check if Docker is available by running `docker version`
-pub fn docker_available() -> bool {
-    Command::new("docker")
-        .arg("version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// Macro to skip a test if Docker is not available.
-/// Use at the start of any test that requires an ephemeral container.
-#[macro_export]
-macro_rules! skip_unless_docker {
-    () => {
-        if !common::docker_available() {
-            eprintln!("Docker not available, skipping test");
-            return;
-        }
-    };
-}
-
 /// Walk a filesystem-backend data directory and return every file's
 /// `user.dg.metadata` xattr parsed as JSON. The key matches
 /// `src/storage/xattr_meta.rs::XATTR_NAME` — tests depend on the
