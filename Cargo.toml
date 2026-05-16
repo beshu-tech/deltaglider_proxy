@@ -140,3 +140,16 @@ proptest = "1"
 
 [features]
 s3s-adapter = ["dep:s3s"]
+
+# Release profile: strip the final binary's symbols. dep crates already
+# build with `-C strip=debuginfo` (cargo's default for release deps);
+# the final binary still kept its symbol table — ~3-5 MB on a build
+# this size. Backtraces become numeric-only on a crash, which we're OK
+# with because crashes ship to logs via tracing, not via core dumps.
+#
+# We intentionally do NOT enable LTO here — it doubles release-link
+# time for ~5% extra perf, and faster compile times are the explicit
+# goal of this configuration. CI/release builds that care can override
+# via `RUSTFLAGS=-Clto=thin` or a separate profile.
+[profile.release]
+strip = "symbols"
