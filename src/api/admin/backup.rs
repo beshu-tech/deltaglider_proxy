@@ -65,6 +65,7 @@ struct ImportErrorBody {
     upstream_status: Option<u16>,
 }
 
+#[derive(Debug)]
 pub struct BackupImportError {
     status: StatusCode,
     stage: String,
@@ -72,6 +73,24 @@ pub struct BackupImportError {
     detail: Option<String>,
     upstream_status: Option<u16>,
 }
+
+impl std::fmt::Display for BackupImportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} [{}{}]: {}",
+            self.status,
+            self.stage,
+            self.context
+                .as_ref()
+                .map(|c| format!(" {c}"))
+                .unwrap_or_default(),
+            self.detail.as_deref().unwrap_or("(no detail)"),
+        )
+    }
+}
+
+impl std::error::Error for BackupImportError {}
 
 struct BackupSecretApplyError {
     status: StatusCode,
@@ -711,6 +730,130 @@ pub async fn import_backup(
 /// was an easy OOM vector for a single crafted entry.
 const MAX_ENTRY_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Aggregate cap for a zip backup. A malicious archive can sit inside
+/// the per-entry limit and still bloat us via N×7.99 MiB. 64 MiB is
+/// well above any realistic backup we'd produce.
+const MAX_BACKUP_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Cap on the number of entries we'll process in one archive — even
+/// at sub-cap sizes, a zip of 100k tiny entries can chew CPU.
+const MAX_BACKUP_ENTRIES: usize = 1024;
+
+/// Hard cap on the request body for the admin import endpoint —
+/// applied BEFORE we try to parse JSON or unpack the zip. Anything
+/// larger than the zip cap is a request-shape bug or an attack.
+pub const MAX_IMPORT_BODY_BYTES: usize = MAX_BACKUP_TOTAL_BYTES as usize;
+
+/// Unpack a backup zip with strict caps on entry count, per-entry
+/// uncompressed size, and aggregate uncompressed size. Pure-ish: no
+/// I/O or shared state, just bytes-in → files-out (or a structured
+/// error). Lives outside the handler so the cap policy is unit-
+/// testable without a full TestServer + AdminState.
+fn unzip_bounded(
+    body: &[u8],
+) -> Result<std::collections::HashMap<String, Vec<u8>>, BackupImportError> {
+    let reader = Cursor::new(body);
+    let mut archive = zip::ZipArchive::new(reader).map_err(|e| {
+        import_fail(
+            StatusCode::BAD_REQUEST,
+            "parse_zip",
+            "archive",
+            format!("not a valid zip: {e}"),
+        )
+    })?;
+
+    if archive.len() > MAX_BACKUP_ENTRIES {
+        return Err(import_fail(
+            StatusCode::BAD_REQUEST,
+            "parse_zip",
+            "archive",
+            format!(
+                "archive has {} entries (cap {MAX_BACKUP_ENTRIES}) — refusing",
+                archive.len()
+            ),
+        ));
+    }
+
+    let mut files: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    let mut total_bytes: u64 = 0;
+    for i in 0..archive.len() {
+        let mut f = archive.by_index(i).map_err(|e| {
+            import_fail(
+                StatusCode::BAD_REQUEST,
+                "parse_zip",
+                format!("entry index {i}"),
+                format!("zip entry unreadable: {e}"),
+            )
+        })?;
+        let name = f.name().to_string();
+
+        // Zip-slip: reject any entry whose name traverses out of the
+        // archive root. We don't write to disk — but a future caller
+        // who lifts this helper into a writer-shaped flow shouldn't
+        // get the trapdoor for free.
+        if name.contains("..")
+            || name.starts_with('/')
+            || name.contains('\\')
+            || name.contains('\0')
+        {
+            return Err(import_fail(
+                StatusCode::BAD_REQUEST,
+                "parse_zip",
+                format!("entry {name}"),
+                "zip-slip / unsafe entry name",
+            ));
+        }
+
+        // `size()` is header-declared uncompressed length; clamp
+        // capacity to foil a zip that lies about its size to force a
+        // huge upfront allocation.
+        let declared = f.size();
+        if declared > MAX_ENTRY_BYTES {
+            return Err(import_fail(
+                StatusCode::BAD_REQUEST,
+                "parse_zip",
+                format!("entry {name}"),
+                format!("declared size {declared} exceeds cap {MAX_ENTRY_BYTES}"),
+            ));
+        }
+        let cap = std::cmp::min(declared, MAX_ENTRY_BYTES) as usize;
+        let mut buf = Vec::with_capacity(cap);
+        // Bounded read — a zip that underdeclares `size` (decompression
+        // bomb) is cut off at the cap.
+        let mut bounded = std::io::Read::take(&mut f, MAX_ENTRY_BYTES + 1);
+        std::io::Read::read_to_end(&mut bounded, &mut buf).map_err(|e| {
+            import_fail(
+                StatusCode::BAD_REQUEST,
+                "parse_zip",
+                format!("entry {name}"),
+                format!("read failed: {e}"),
+            )
+        })?;
+        if buf.len() as u64 > MAX_ENTRY_BYTES {
+            return Err(import_fail(
+                StatusCode::BAD_REQUEST,
+                "parse_zip",
+                format!("entry {name}"),
+                format!("decompressed size exceeded cap {MAX_ENTRY_BYTES}"),
+            ));
+        }
+        total_bytes = total_bytes.saturating_add(buf.len() as u64);
+        if total_bytes > MAX_BACKUP_TOTAL_BYTES {
+            return Err(import_fail(
+                StatusCode::BAD_REQUEST,
+                "parse_zip",
+                "archive",
+                format!(
+                    "aggregate decompressed size {total_bytes} exceeds cap {MAX_BACKUP_TOTAL_BYTES}"
+                ),
+            ));
+        }
+        files.insert(name, buf);
+    }
+
+    Ok(files)
+}
+
 fn hydrate_s3_backend_credentials(backend: &mut BackendConfig, secrets: &SecretsStorage) {
     if let BackendConfig::S3 {
         access_key_id,
@@ -834,63 +977,8 @@ async fn import_zip_full_backup(
         mode = ?mode,
         "Full-backup import: starting zip restore"
     );
-    // ── Phase A.1: unpack, bounded per-entry ───────────────────
-    let reader = Cursor::new(body.as_ref());
-    let mut archive = zip::ZipArchive::new(reader).map_err(|e| {
-        import_fail(
-            StatusCode::BAD_REQUEST,
-            "parse_zip",
-            "archive",
-            format!("not a valid zip: {e}"),
-        )
-    })?;
-    let mut files: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
-    for i in 0..archive.len() {
-        let mut f = archive.by_index(i).map_err(|e| {
-            import_fail(
-                StatusCode::BAD_REQUEST,
-                "parse_zip",
-                format!("entry index {i}"),
-                format!("zip entry unreadable: {e}"),
-            )
-        })?;
-        let name = f.name().to_string();
-        // `size()` is the header-declared uncompressed length; we
-        // clamp capacity to MAX_ENTRY_BYTES to foil a zip that lies
-        // about size to force a huge upfront allocation.
-        let declared = f.size();
-        if declared > MAX_ENTRY_BYTES {
-            return Err(import_fail(
-                StatusCode::BAD_REQUEST,
-                "parse_zip",
-                format!("entry {name}"),
-                format!("declared size {declared} exceeds cap {MAX_ENTRY_BYTES}"),
-            ));
-        }
-        let cap = std::cmp::min(declared, MAX_ENTRY_BYTES) as usize;
-        let mut buf = Vec::with_capacity(cap);
-        // Wrap the decompressing reader in `take` so a zip that
-        // underdeclares `size` (decompression bomb) is cut off at
-        // the cap instead of filling memory unbounded.
-        let mut bounded = std::io::Read::take(&mut f, MAX_ENTRY_BYTES + 1);
-        std::io::Read::read_to_end(&mut bounded, &mut buf).map_err(|e| {
-            import_fail(
-                StatusCode::BAD_REQUEST,
-                "parse_zip",
-                format!("entry {name}"),
-                format!("read failed: {e}"),
-            )
-        })?;
-        if buf.len() as u64 > MAX_ENTRY_BYTES {
-            return Err(import_fail(
-                StatusCode::BAD_REQUEST,
-                "parse_zip",
-                format!("entry {name}"),
-                format!("decompressed size exceeded cap {MAX_ENTRY_BYTES}"),
-            ));
-        }
-        files.insert(name, buf);
-    }
+    // ── Phase A.1: unpack, bounded per-entry / aggregate / count
+    let files = unzip_bounded(body.as_ref())?;
     tracing::info!(
         entries = files.len(),
         has_manifest = files.contains_key("manifest.json"),
@@ -2029,5 +2117,113 @@ storage:
             restored.external_identities[0].email.as_deref(),
             Some("alice@company.com")
         );
+    }
+
+    // ── unzip_bounded — security caps tested without a TestServer ──
+
+    /// Build a deflate-compressed zip in memory containing the given
+    /// (name, content) entries. Used by tests to exercise the cap
+    /// policy without depending on any on-disk fixtures.
+    fn make_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (n, c) in entries {
+                w.start_file(*n, opts).unwrap();
+                std::io::Write::write_all(&mut w, c).unwrap();
+            }
+            w.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn unzip_bounded_accepts_a_normal_backup_zip() {
+        let zip = make_zip(&[
+            ("manifest.json", b"{\"version\":2}"),
+            ("config.yaml", b"foo: bar"),
+            ("iam.json", b"{}"),
+        ]);
+        let files = unzip_bounded(&zip).expect("normal zip must unpack");
+        assert_eq!(files.len(), 3);
+        assert!(files.contains_key("manifest.json"));
+    }
+
+    #[test]
+    fn unzip_bounded_rejects_entry_count_overflow() {
+        // Exceed MAX_BACKUP_ENTRIES with cheap empty entries.
+        let mut entries: Vec<(String, Vec<u8>)> = (0..(MAX_BACKUP_ENTRIES + 1))
+            .map(|i| (format!("f{i}.txt"), vec![]))
+            .collect();
+        let refs: Vec<(&str, &[u8])> = entries
+            .iter_mut()
+            .map(|(n, c)| (n.as_str(), c.as_slice()))
+            .collect();
+        let zip = make_zip(&refs);
+        let err = unzip_bounded(&zip).expect_err("must reject too many entries");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("entries") && msg.contains("refusing"),
+            "wrong error: {msg}"
+        );
+    }
+
+    #[test]
+    fn unzip_bounded_rejects_aggregate_overflow() {
+        // Stay under MAX_ENTRY_BYTES per-entry but blow MAX_BACKUP_TOTAL_BYTES.
+        // Use 12 entries × 6 MiB = 72 MiB > 64 MiB cap.
+        let big = vec![0xAB_u8; 6 * 1024 * 1024];
+        let mut entries: Vec<(String, &[u8])> =
+            (0..12).map(|i| (format!("blob{i}.bin"), big.as_slice())).collect();
+        let refs: Vec<(&str, &[u8])> = entries.iter_mut().map(|(n, c)| (n.as_str(), *c)).collect();
+        let zip = make_zip(&refs);
+        let err = unzip_bounded(&zip).expect_err("must reject aggregate overflow");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("aggregate decompressed size"),
+            "wrong error: {msg}"
+        );
+    }
+
+    #[test]
+    fn unzip_bounded_rejects_per_entry_overflow() {
+        let huge = vec![0xCC_u8; (MAX_ENTRY_BYTES + 1) as usize];
+        let zip = make_zip(&[("big.bin", huge.as_slice())]);
+        let err = unzip_bounded(&zip).expect_err("must reject oversized entry");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("declared size") || msg.contains("decompressed size"),
+            "wrong error: {msg}"
+        );
+    }
+
+    /// Zip-slip / unsafe-name rejection. We don't write to disk, but
+    /// rejecting at the unzip boundary keeps a future writer-shaped
+    /// caller safe and makes the policy testable.
+    #[test]
+    fn unzip_bounded_rejects_zip_slip_names() {
+        for bad_name in [
+            "../etc/passwd",
+            "/absolute/path.txt",
+            "subdir/../../etc/shadow",
+            "back\\slash.txt",
+        ] {
+            let zip = make_zip(&[(bad_name, b"x")]);
+            let err = unzip_bounded(&zip)
+                .expect_err(&format!("must reject zip-slip name: {bad_name}"));
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("zip-slip") || msg.contains("unsafe"),
+                "wrong error for {bad_name}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn unzip_bounded_rejects_non_zip_body() {
+        let err = unzip_bounded(b"not a zip at all").expect_err("must reject garbage");
+        assert!(format!("{err}").contains("not a valid zip"), "{err:?}");
     }
 }

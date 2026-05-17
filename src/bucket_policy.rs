@@ -227,13 +227,24 @@ impl BucketPolicyRegistry {
                                     k
                                 );
                             }
-                            // Warn about missing trailing slash (easy misconfiguration)
+                            // REJECT non-empty prefixes without a
+                            // trailing '/' — silently exposing
+                            // `builds-internal/` because the operator
+                            // wrote `builds` was a real attack path.
+                            // Empty string (whole-bucket-public) is
+                            // allowed; everything else must be
+                            // directory-shaped.
                             if !p.is_empty() && !p.ends_with('/') {
-                                tracing::warn!(
-                                    "Bucket '{}': public_prefix '{}' has no trailing '/'. \
-                                     This matches '{}anything' — add '{}/' if you meant a directory.",
-                                    k, p, p, p
+                                tracing::error!(
+                                    "Bucket '{}': REJECTING public_prefix {:?} — missing trailing '/'. \
+                                     Without the slash this would match '{}anything'. \
+                                     Use {:?} if you meant a directory.",
+                                    k,
+                                    original,
+                                    p,
+                                    format!("{p}/")
                                 );
+                                return None;
                             }
                             Some(p)
                         })
@@ -379,12 +390,12 @@ impl PublicPrefixSnapshot {
                         if !p.is_empty() && p.chars().all(|c| c == '/') {
                             return None;
                         }
-                        let p = p.strip_prefix('/').unwrap_or(p);
-                        if p.contains("..") || p.contains('\0') || p.contains("//") {
-                            None
-                        } else {
-                            Some(p.to_string())
-                        }
+                        let p = p.strip_prefix('/').unwrap_or(p).to_string();
+                        // Use the single shared validator so the
+                        // snapshot can't drift from the registry on
+                        // what counts as "directory-shaped".
+                        crate::security::validate_public_prefix(&p).ok()?;
+                        Some(p)
                     })
                     .collect();
                 (k.to_ascii_lowercase(), validated)
@@ -565,6 +576,49 @@ mod tests {
         policies.insert("test".into(), policy_with_public(vec!["builds/"]));
         let snap = snapshot_from(policies);
         assert!(snap.is_public_read("test", "builds/"));
+    }
+
+    /// Adversarial: operator typo `public_prefixes: ["builds"]`
+    /// (no trailing slash) MUST NOT expose `builds-internal/secret`.
+    /// The snapshot's validation drops the prefix entirely rather
+    /// than letting raw `starts_with` leak siblings.
+    #[test]
+    fn test_public_prefix_without_trailing_slash_is_rejected() {
+        let mut policies = HashMap::new();
+        policies.insert("test".into(), policy_with_public(vec!["builds"]));
+        let snap = snapshot_from(policies);
+        // The prefix is rejected during snapshot build → bucket has
+        // no public prefixes → no key is publicly readable.
+        assert!(
+            snap.public_prefixes_for_bucket("test").is_empty(),
+            "non-empty prefix without trailing '/' must be rejected"
+        );
+        assert!(!snap.is_public_read("test", "builds/foo.txt"));
+        assert!(!snap.is_public_read("test", "builds-internal/secret.zip"));
+        assert!(!snap.is_public_read("test", "buildszzz"));
+    }
+
+    /// Sibling test: with `["builds/"]` the legit case still works
+    /// AND the look-alike sibling is blocked.
+    #[test]
+    fn test_public_prefix_with_trailing_slash_blocks_siblings() {
+        let mut policies = HashMap::new();
+        policies.insert("test".into(), policy_with_public(vec!["builds/"]));
+        let snap = snapshot_from(policies);
+        assert!(snap.is_public_read("test", "builds/foo.txt"));
+        assert!(!snap.is_public_read("test", "builds-internal/secret.zip"));
+        assert!(!snap.is_public_read("test", "buildszzz"));
+    }
+
+    /// Empty-string prefix remains the documented "whole bucket
+    /// public" shorthand.
+    #[test]
+    fn test_public_prefix_empty_means_whole_bucket() {
+        let mut policies = HashMap::new();
+        policies.insert("test".into(), policy_with_public(vec![""]));
+        let snap = snapshot_from(policies);
+        assert!(snap.is_public_read("test", "anything"));
+        assert!(snap.is_public_read("test", "deep/nested/path.txt"));
     }
 
     #[test]

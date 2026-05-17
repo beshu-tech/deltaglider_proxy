@@ -71,10 +71,16 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             delete(admin::remove_group_member),
         )
         // IAM backup restore — export (GET) allowed; import (POST) gated.
+        // The import body is capped at MAX_IMPORT_BODY_BYTES so a 10 GB
+        // POST can't queue gigabytes of allocation before reaching the
+        // per-entry / aggregate caps inside the handler.
         .route(
             "/_/api/admin/backup",
             get(admin::export_backup).post(admin::import_backup),
         )
+        .layer(axum::extract::DefaultBodyLimit::max(
+            admin::MAX_IMPORT_BODY_BYTES,
+        ))
         // Legacy migration: mutates IAM state as its whole purpose.
         .route("/_/api/admin/migrate", post(admin::migrate_legacy))
         // External auth provider management.

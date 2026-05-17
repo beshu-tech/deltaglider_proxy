@@ -204,7 +204,8 @@ pub async fn recover_db(
                 correct_hash_base64: None,
                 error: Some("No config DB mismatch detected".into()),
             }),
-        );
+        )
+            .into_response();
     }
 
     // Brute-force protection. Unlike the previous hand-rolled pattern (which
@@ -231,7 +232,8 @@ pub async fn recover_db(
                     correct_hash_base64: None,
                     error: Some("Too many attempts — try again later".into()),
                 }),
-            );
+            )
+                .into_response();
         }
     };
 
@@ -264,7 +266,8 @@ pub async fn recover_db(
                                 .into(),
                         ),
                     }),
-                );
+                )
+                    .into_response();
             }
         }
     };
@@ -307,7 +310,8 @@ pub async fn recover_db(
                     "No config database found to recover (no .bak file and no S3 copy)".into(),
                 ),
             }),
-        );
+        )
+            .into_response();
     };
 
     // Try to open with the candidate hash
@@ -333,8 +337,15 @@ pub async fn recover_db(
 
             audit_log("recover_db_success", "admin", "", &headers);
 
+            // Response body contains the bcrypt hash that decrypts
+            // the SQLCipher DB. `no-store` keeps intermediaries
+            // and the browser's bfcache from retaining it.
             (
                 StatusCode::OK,
+                [
+                    ("cache-control", "no-store, no-cache, must-revalidate, private"),
+                    ("pragma", "no-cache"),
+                ],
                 Json(RecoverDbResponse {
                     success: true,
                     correct_hash: Some(candidate_hash),
@@ -342,6 +353,7 @@ pub async fn recover_db(
                     error: None,
                 }),
             )
+                .into_response()
         }
         Err(_) => {
             guard.record_failure();
@@ -355,6 +367,7 @@ pub async fn recover_db(
                     error: Some("Password does not match the encrypted database".into()),
                 }),
             )
+                .into_response()
         }
     }
 }

@@ -44,7 +44,7 @@ pub use auth::{
 pub use backends::{
     create_backend, create_bucket_on_backend, delete_backend, list_backends, list_bucket_origins,
 };
-pub use backup::{export_backup, import_backup};
+pub use backup::{export_backup, import_backup, MAX_IMPORT_BODY_BYTES};
 pub use bucket_scan::{
     delete_scan, get_scan_status, get_scan_stream, post_scan_start, post_scan_stop, BucketScanner,
 };

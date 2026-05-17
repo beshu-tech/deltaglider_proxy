@@ -140,9 +140,17 @@ pub async fn authorization_middleware(
         }
     }
 
-    // aws:SourceIp — from proxy headers (only when DGP_TRUST_PROXY_HEADERS=true)
-    // Uses the same trust check as rate_limiter to prevent IP spoofing.
-    if let Some(ip) = crate::rate_limiter::extract_client_ip(request.headers()) {
+    // aws:SourceIp — combine `X-Forwarded-For` (when
+    // `DGP_TRUST_PROXY_HEADERS=true`) with the direct TCP peer IP so
+    // policies like `Deny { aws:SourceIp NotIpAddress 10.0.0.0/8 }`
+    // actually fire on a direct-internet deployment where no reverse
+    // proxy is setting XFF. Without the peer fallback, the context
+    // value is `null` and `iam-rs` skips the condition silently.
+    let peer_ip = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip());
+    if let Some(ip) = crate::rate_limiter::extract_client_ip_with_peer(request.headers(), peer_ip) {
         context.insert(
             "aws:SourceIp".to_string(),
             iam_rs::ContextValue::String(ip.to_string()),
