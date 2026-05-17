@@ -14,4 +14,5 @@ pub mod config;
 pub mod engine_factory;
 pub mod filter;
 pub mod ls;
+pub mod rm;
 pub mod s3_url;

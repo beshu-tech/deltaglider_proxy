@@ -255,7 +255,11 @@ pub(crate) fn format_size(bytes: u64, human: bool) -> String {
 /// explicitly points us at a local endpoint. Heuristic: `http://`
 /// scheme OR a `localhost` / loopback host. Server-process equivalent
 /// stays config-driven; this is the documented CLI ergonomic.
-fn should_allow_local(endpoint: Option<&str>) -> bool {
+///
+/// Shared with every other S3-talking subcommand (`rm`, `cp`, `stats`,
+/// `verify`) so they all auto-detect dev / MinIO endpoints the same
+/// way.
+pub(crate) fn should_allow_local(endpoint: Option<&str>) -> bool {
     let Some(ep) = endpoint else {
         return false;
     };

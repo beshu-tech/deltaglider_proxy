@@ -95,6 +95,8 @@ enum Command {
     },
     /// List S3 buckets or objects (AWS-CLI-shaped output).
     Ls(deltaglider_proxy::cli::ls::LsArgs),
+    /// Remove S3 objects (single-key or recursive prefix-delete).
+    Rm(deltaglider_proxy::cli::rm::RmArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -246,6 +248,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // runtime so the proxy-startup path stays cold when the
             // binary is invoked purely as a CLI.
             Command::Ls(args) => run_cli_async(deltaglider_proxy::cli::ls::run(args.clone())),
+            Command::Rm(args) => run_cli_async(deltaglider_proxy::cli::rm::run(args.clone())),
         };
         std::process::exit(code);
     }
