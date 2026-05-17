@@ -58,8 +58,8 @@ pub use config::{
     TraceResolved, TraceResponse,
 };
 pub use delta_efficiency::{
-    get_delta_efficiency, post_delta_efficiency_scan, verify_delta_efficiency,
-    DeltaEfficiencyScanner,
+    classify_deltaspace, get_delta_efficiency, post_delta_efficiency_scan, verify_delta_efficiency,
+    DeltaEfficiencyScanner, Efficiency,
 };
 pub use event_outbox::{
     list as event_outbox_list, requeue_many as event_outbox_requeue_many,

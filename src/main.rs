@@ -99,6 +99,8 @@ enum Command {
     Rm(deltaglider_proxy::cli::rm::RmArgs),
     /// Copy files between local paths and S3 with transparent delta compression.
     Cp(deltaglider_proxy::cli::cp::CpArgs),
+    /// Bucket statistics: original/stored bytes, savings %, deltaspace health.
+    Stats(deltaglider_proxy::cli::stats::StatsArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -252,6 +254,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Command::Ls(args) => run_cli_async(deltaglider_proxy::cli::ls::run(args.clone())),
             Command::Rm(args) => run_cli_async(deltaglider_proxy::cli::rm::run(args.clone())),
             Command::Cp(args) => run_cli_async(deltaglider_proxy::cli::cp::run(args.clone())),
+            Command::Stats(args) => run_cli_async(deltaglider_proxy::cli::stats::run(args.clone())),
         };
         std::process::exit(code);
     }
