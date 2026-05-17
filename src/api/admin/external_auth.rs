@@ -139,6 +139,28 @@ pub async fn oauth_authorize(
 
     let next_url = params.next.and_then(|n| sanitize_next_param(&n));
 
+    // Rate-limit: the first hit triggers `discover().await` which
+    // makes an outbound HTTP fetch — pair this with the SSRF guards
+    // and a hostile caller can still drive a flood of outbound
+    // requests at any pace. Same bucket as the callback (per-IP).
+    let guard = match crate::rate_limiter::RateLimitGuard::enter(
+        &state.rate_limiter,
+        &req_headers,
+        connect_info.as_ref().map(|ci| ci.0.ip()),
+        "oauth_authorize",
+    )
+    .await
+    {
+        Ok(g) => g,
+        Err(_) => {
+            return error_page(
+                "Too Many Requests",
+                "Too many authentication attempts. Please wait and try again.",
+            )
+            .into_response();
+        }
+    };
+
     // Build redirect URI from the request's Host header
     let redirect_uri = build_callback_uri(&req_headers);
 
@@ -158,6 +180,8 @@ pub async fn oauth_authorize(
 
     match ext_auth.initiate_auth(&provider_name, &redirect_uri, client_ip, next_url) {
         Ok(auth_req) => {
+            // Reset the rate limiter — legitimate initiation succeeded.
+            guard.record_success();
             // Bind the OAuth `state` token to THIS browser via a
             // short-lived cookie. On callback we cross-check the
             // query-string state against this cookie value; a hostile

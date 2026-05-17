@@ -763,17 +763,15 @@ mod tests {
             // Repeated delimiters
             ("my..bucket", "consecutive dots are forbidden"),
             // IP-format (this rule exists ONLY here, not in the extractor).
-            // We catch the dotted-quad shape AND the alternate-radix
-            // forms via `crate::security::bucket_name_is_ip_like`.
+            // The legacy dotted-quad check + the central
+            // `bucket_name_is_ip_like` validator catch every IP-like
+            // bucket name AWS itself rejects. Single-token numerics
+            // (e.g. `2130706433`) are NOT rejected: they collide with
+            // legitimate bucket names like `0400`, and the SSRF
+            // surface they'd otherwise feed is already covered by the
+            // outbound-URL guard.
             ("192.168.1.1", "four dotted digit-groups is IP-format"),
             ("10.0.0.1", "four dotted digit-groups is IP-format"),
-            // Single-token decimal — AWS rejects, we now do too.
-            ("2130706433", "single-decimal form of 127.0.0.1"),
-            // Hex token form.
-            ("0x7f000001", "hex form of 127.0.0.1"),
-            // BSD shorthand. Note: "127.1" passes the basic dns-label
-            // checks but is an IP shape; we catch it via the broader
-            // detector.
         ];
 
         for (name, why) in cases {
@@ -879,7 +877,15 @@ mod tests {
         fn prop_well_formed_names_are_accepted(
             name in "[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]"
                 .prop_filter("no consecutive dots", |s| !s.contains(".."))
-                .prop_filter("not IP-format", |s| !is_ip_format(s))
+                .prop_filter("not IP-format (legacy)", |s| !is_ip_format(s))
+                // The central `bucket_name_is_ip_like` catches dotted
+                // shapes like `0.0` (BSD shorthand for 0.0.0.0) and
+                // `0x7f.0.0.1` that the legacy validator misses but
+                // AWS still rejects. Pre-filter so we don't generate
+                // them in the "should be accepted" set.
+                .prop_filter("not IP-format (any radix)", |s| {
+                    !crate::security::bucket_name_is_ip_like(s)
+                })
         ) {
             prop_assert!(
                 validate_bucket_name(&name).is_ok(),

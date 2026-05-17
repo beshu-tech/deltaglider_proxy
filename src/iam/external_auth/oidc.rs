@@ -220,7 +220,33 @@ impl OidcProvider {
             ExternalAuthError::TokenExchangeFailed("No id_token in response".into())
         })?;
 
-        // Validate the ID token
+        // Validate the ID token. If the `kid` isn't in the cached
+        // JWKS — the IdP rotated keys since we cached — force one
+        // discovery refresh and retry against the new JWKS. Without
+        // this, a routine IdP rotation bricks logins for the full
+        // discovery-cache window (1h).
+        let (jwks, _issuer) = match self.validate_id_token(&id_token_str, &jwks, &issuer, pending) {
+            Ok(c) => return Ok(ExternalIdentityInfo {
+                subject: c.sub,
+                email: c.email,
+                email_verified: c.email_verified.unwrap_or(false),
+                name: c.name,
+                groups: c.groups.unwrap_or_default(),
+                raw_claims: extract_raw_claims(&id_token_str),
+            }),
+            Err(ExternalAuthError::TokenValidationFailed(msg))
+                if msg.contains("not found in JWKS") =>
+            {
+                tracing::info!("OIDC: kid not in cached JWKS — forcing rediscovery");
+                self.discover().await?;
+                let cache = self.cache.read();
+                let disc = cache.as_ref().ok_or_else(|| {
+                    ExternalAuthError::DiscoveryFailed("Discovery missing after refresh".into())
+                })?;
+                (disc.jwks.clone(), disc.doc.issuer.clone())
+            }
+            Err(e) => return Err(e),
+        };
         let claims = self.validate_id_token(&id_token_str, &jwks, &issuer, pending)?;
 
         // Extract raw claims as JSON for flexible mapping

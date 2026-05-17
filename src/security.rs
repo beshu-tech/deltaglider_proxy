@@ -102,19 +102,24 @@ pub fn check_host(host: &str, kind: UrlKind) -> Result<(), UrlValidationError> {
 /// notation (dotted, single-decimal, hex, octal). AWS S3 rejects all
 /// IP-like bucket names; we need parity so an operator can't break
 /// downstream client SSRF heuristics by creating a `2130706433` bucket.
+/// Bucket-name policy: reject names that parse as an IP in any common
+/// notation. AWS S3 rejects all IP-like bucket names; we need parity
+/// so an operator can't break downstream client SSRF heuristics by
+/// creating a `127.1` or `0x7f.0.0.1` bucket.
+///
+/// **Note**: we do NOT flag single-token decimal/hex forms (e.g.
+/// `2130706433`, `0x7f000001`). They're technically an IP encoding,
+/// but they overlap heavily with legitimate numeric bucket names
+/// (`0400`, `123`, `000`) — and our outbound-URL guard already
+/// covers the SSRF surface these would otherwise feed.
 pub fn bucket_name_is_ip_like(name: &str) -> bool {
     if name.parse::<IpAddr>().is_ok() {
         return true;
     }
-    // Single-token decimal (e.g. "2130706433") or hex (e.g. "0x7f000001").
-    // Cap length so we don't false-positive on long all-digit bucket names
-    // that aren't valid u32 single-token IPs anyway.
-    if name.len() <= 10 && parse_ip_segment(name).is_some_and(|n| n <= 0xFFFF_FFFF) {
-        return true;
-    }
     // Permissive dotted parser: accepts radix-tagged segments
     // (0xNN / 0NN / decimal) — covers `0x7f.0.0.1`, `0177.0.0.1`,
-    // `127.1` (BSD shorthand), etc.
+    // `127.1` (BSD shorthand), etc. We require at least one '.' to
+    // avoid the single-token bucket-name collision.
     let parts: Vec<&str> = name.split('.').collect();
     if parts.len() == 2 || parts.len() == 4 {
         let parsed: Option<Vec<u64>> = parts
@@ -375,20 +380,14 @@ mod tests {
     }
 
     #[test]
-    fn bucket_name_ip_detector_catches_every_known_shape() {
+    fn bucket_name_ip_detector_catches_dotted_shapes() {
         for n in [
             "127.0.0.1",
             "0.0.0.0",
             "255.255.255.255",
-            "2130706433",   // decimal 127.0.0.1
-            "0x7f000001",   // hex 127.0.0.1
             "0177.0.0.1",   // octal first octet
             "127.1",        // BSD shorthand
-            "0.0.0.0.0",    // edge — won't parse, OK if we don't claim it
         ] {
-            // Some entries are intentionally ambiguous; we accept either
-            // verdict for `0.0.0.0.0` (it's not an IP shape).
-            if n == "0.0.0.0.0" { continue; }
             assert!(
                 bucket_name_is_ip_like(n),
                 "should be detected as IP-like: {n}"
@@ -398,7 +397,13 @@ mod tests {
             "my-bucket",
             "builds.deltaglider.io",
             "foo123",
-            "1234567890123456789", // long, not a u32
+            // Single-token numerics are NOT flagged — they collide
+            // with legitimate bucket names like "0400" / "123" / etc.
+            // The outbound-URL guard covers the corresponding SSRF.
+            "2130706433",
+            "0x7f000001",
+            "0400",
+            "1234567890123456789",
         ] {
             assert!(
                 !bucket_name_is_ip_like(n),
