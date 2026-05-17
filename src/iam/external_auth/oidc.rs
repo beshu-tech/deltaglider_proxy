@@ -10,6 +10,8 @@ use jsonwebtoken::{decode, DecodingKey, Validation};
 use parking_lot::RwLock;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+
+use crate::security::{jwt_alg_is_allowed, validate_outbound_url, UrlKind};
 use sha2::{Digest, Sha256};
 use std::time::Instant;
 
@@ -93,8 +95,14 @@ impl OidcProvider {
         scopes: String,
         extra_config: serde_json::Value,
     ) -> Self {
+        // Disable redirects: the OIDC discovery + JWKS targets are
+        // operator-supplied; a redirect from a legit-looking host to
+        // 169.254.169.254 is the SSRF pivot we want to block. Callers
+        // also enforce `validate_outbound_url(UrlKind::Oidc)` before
+        // even reaching the client.
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_default();
         Self {
@@ -167,16 +175,17 @@ impl OidcProvider {
         redirect_uri: &str,
         pending: &PendingAuth,
     ) -> Result<ExternalIdentityInfo, ExternalAuthError> {
-        let (token_endpoint, jwks, issuer) = {
+        // We pull `token_endpoint` and `jwks` from the cached discovery
+        // doc but NOT the issuer — `validate_id_token` pins against
+        // `self.issuer_url` (the operator-configured value), not the
+        // cached doc's claimed `issuer`. Pinning against the doc would
+        // mean a future cache poisoning could trivially rebind us.
+        let (token_endpoint, jwks) = {
             let cache = self.cache.read();
             let disc = cache
                 .as_ref()
                 .ok_or_else(|| ExternalAuthError::DiscoveryFailed("No cached discovery".into()))?;
-            (
-                disc.doc.token_endpoint.clone(),
-                disc.jwks.clone(),
-                disc.doc.issuer.clone(),
-            )
+            (disc.doc.token_endpoint.clone(), disc.jwks.clone())
         };
 
         // Build token exchange request
@@ -212,11 +221,29 @@ impl OidcProvider {
             ExternalAuthError::TokenExchangeFailed("No id_token in response".into())
         })?;
 
-        // Validate the ID token
-        let claims = self.validate_id_token(&id_token_str, &jwks, &issuer, pending)?;
-
-        // Extract raw claims as JSON for flexible mapping
-        let raw_claims = extract_raw_claims(&id_token_str);
+        // Validate the ID token. If the `kid` isn't in the cached
+        // JWKS — the IdP rotated keys since we cached — force one
+        // discovery refresh and retry against the new JWKS. Without
+        // this, a routine IdP rotation bricks logins for the full
+        // discovery-cache window (1h).
+        let claims = match self.validate_id_token(&id_token_str, &jwks, pending) {
+            Ok(c) => c,
+            Err(ExternalAuthError::TokenValidationFailed(msg))
+                if msg.contains("not found in JWKS") =>
+            {
+                tracing::info!("OIDC: kid not in cached JWKS — forcing rediscovery");
+                self.discover().await?;
+                let refreshed_jwks = {
+                    let cache = self.cache.read();
+                    let disc = cache.as_ref().ok_or_else(|| {
+                        ExternalAuthError::DiscoveryFailed("Discovery missing after refresh".into())
+                    })?;
+                    disc.jwks.clone()
+                };
+                self.validate_id_token(&id_token_str, &refreshed_jwks, pending)?
+            }
+            Err(e) => return Err(e),
+        };
 
         Ok(ExternalIdentityInfo {
             subject: claims.sub,
@@ -224,7 +251,7 @@ impl OidcProvider {
             email_verified: claims.email_verified.unwrap_or(false),
             name: claims.name,
             groups: claims.groups.unwrap_or_default(),
-            raw_claims,
+            raw_claims: extract_raw_claims(&id_token_str),
         })
     }
 
@@ -270,6 +297,8 @@ impl OidcProvider {
     }
 
     async fn fetch_discovery(&self) -> Result<OidcDiscovery, ExternalAuthError> {
+        validate_outbound_url(&self.issuer_url, UrlKind::Oidc)
+            .map_err(|e| ExternalAuthError::ConfigError(format!("issuer_url: {e}")))?;
         let url = format!(
             "{}/.well-known/openid-configuration",
             self.issuer_url.trim_end_matches('/')
@@ -289,15 +318,44 @@ impl OidcProvider {
             )));
         }
 
-        resp.json()
+        let doc: OidcDiscovery = resp
+            .json()
             .await
-            .map_err(|e| ExternalAuthError::DiscoveryFailed(e.to_string()))
+            .map_err(|e| ExternalAuthError::DiscoveryFailed(e.to_string()))?;
+
+        // RFC 8414 §3.3: the issuer in the discovery document MUST
+        // match the URL the operator configured — otherwise a hostile
+        // discovery doc can rebind us to any "issuer" it likes.
+        if !issuers_match(&doc.issuer, &self.issuer_url) {
+            return Err(ExternalAuthError::DiscoveryFailed(format!(
+                "discovery `issuer` ({}) doesn't match configured issuer_url ({})",
+                doc.issuer, self.issuer_url
+            )));
+        }
+
+        // The endpoints inside the doc are also operator-supplied (via
+        // the IdP), so re-validate them. A discovery endpoint that
+        // returns `token_endpoint: http://169.254.169.254/token` is
+        // the exact pivot we're blocking.
+        validate_outbound_url(&doc.token_endpoint, UrlKind::Oidc)
+            .map_err(|e| ExternalAuthError::DiscoveryFailed(format!("token_endpoint: {e}")))?;
+        validate_outbound_url(&doc.jwks_uri, UrlKind::Oidc)
+            .map_err(|e| ExternalAuthError::DiscoveryFailed(format!("jwks_uri: {e}")))?;
+        validate_outbound_url(&doc.authorization_endpoint, UrlKind::Oidc).map_err(|e| {
+            ExternalAuthError::DiscoveryFailed(format!("authorization_endpoint: {e}"))
+        })?;
+
+        Ok(doc)
     }
 
     async fn fetch_jwks(
         &self,
         jwks_uri: &str,
     ) -> Result<jsonwebtoken::jwk::JwkSet, ExternalAuthError> {
+        // Re-validate even though `fetch_discovery` already did — a
+        // future caller might pass a JWKS URI from elsewhere.
+        validate_outbound_url(jwks_uri, UrlKind::Oidc)
+            .map_err(|e| ExternalAuthError::DiscoveryFailed(format!("jwks_uri: {e}")))?;
         let resp = self
             .http
             .get(jwks_uri)
@@ -314,12 +372,23 @@ impl OidcProvider {
         &self,
         token: &str,
         jwks: &jsonwebtoken::jwk::JwkSet,
-        expected_issuer: &str,
         pending: &PendingAuth,
     ) -> Result<IdTokenClaims, ExternalAuthError> {
         // Decode header to find the key ID (kid)
         let header = jsonwebtoken::decode_header(token)
             .map_err(|e| ExternalAuthError::TokenValidationFailed(e.to_string()))?;
+
+        // Enforce the JWT algorithm allowlist BEFORE constructing the
+        // Validation. Rejects `none`, HS256/384/512 (key-confusion via
+        // an attacker-served `oct` JWK), and anything not on the
+        // reviewed list. Without this gate, an attacker who can serve
+        // a hostile JWKS turns a public-key into an HMAC secret.
+        if !jwt_alg_is_allowed(header.alg) {
+            return Err(ExternalAuthError::TokenValidationFailed(format!(
+                "Disallowed JWT algorithm: {:?}",
+                header.alg
+            )));
+        }
 
         let kid = header.kid.as_ref().ok_or_else(|| {
             ExternalAuthError::TokenValidationFailed("No kid in token header".into())
@@ -333,13 +402,17 @@ impl OidcProvider {
         let decoding_key = DecodingKey::from_jwk(jwk)
             .map_err(|e| ExternalAuthError::TokenValidationFailed(e.to_string()))?;
 
-        // Configure validation — use the algorithm from the token header.
-        // The JWKS key already constrains which algorithms are valid (via its `alg` field).
-        // Overriding validation.algorithms can cause InvalidAlgorithm errors when the
-        // jsonwebtoken crate cross-checks the key's algorithm against the validation list.
+        // Configure validation — alg is gated by `jwt_alg_is_allowed`
+        // above, so header.alg is a safe public-key algorithm at this
+        // point. The JWKS key's own `alg` field further constrains.
         let mut validation = Validation::new(header.alg);
         validation.set_audience(&[&self.client_id]);
-        validation.set_issuer(&[expected_issuer]);
+        // Pin issuer to the CONFIGURED issuer_url, not whatever the
+        // discovery doc claimed. `fetch_discovery` already enforces
+        // `issuers_match(doc.issuer, self.issuer_url)`, so the cached
+        // doc's value can never drift from this — but pinning here
+        // makes the property local to one place.
+        validation.set_issuer(&[self.issuer_url.as_str()]);
 
         let token_data = decode::<IdTokenClaims>(token, &decoding_key, &validation)
             .map_err(|e| ExternalAuthError::TokenValidationFailed(e.to_string()))?;
@@ -363,6 +436,13 @@ impl OidcProvider {
 
         Ok(token_data.claims)
     }
+}
+
+/// RFC 8414 §3.3 issuer compare. Allows operator to configure
+/// "https://idp.example.com" while the discovery doc returns
+/// "https://idp.example.com/" — but rejects any actual host change.
+fn issuers_match(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/') == b.trim_end_matches('/')
 }
 
 /// Extract raw claims from an ID token (decode the payload without verification).
@@ -453,5 +533,37 @@ mod tests {
         assert!(encoded
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    }
+
+    #[test]
+    fn issuers_match_handles_trailing_slash() {
+        assert!(issuers_match(
+            "https://idp.example.com",
+            "https://idp.example.com/"
+        ));
+        assert!(issuers_match(
+            "https://idp.example.com/",
+            "https://idp.example.com"
+        ));
+        assert!(issuers_match(
+            "https://idp.example.com/tenant",
+            "https://idp.example.com/tenant/"
+        ));
+
+        // Different host → never match.
+        assert!(!issuers_match(
+            "https://idp.example.com",
+            "https://attacker.com"
+        ));
+        // Different path → never match.
+        assert!(!issuers_match(
+            "https://idp.example.com/tenant-a",
+            "https://idp.example.com/tenant-b"
+        ));
+        // Scheme change → never match.
+        assert!(!issuers_match(
+            "http://idp.example.com",
+            "https://idp.example.com"
+        ));
     }
 }

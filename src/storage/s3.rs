@@ -229,6 +229,32 @@ impl S3Backend {
             );
 
         if let Some(ref ep) = endpoint {
+            // Reject operator-supplied endpoints that point at cloud
+            // instance-metadata services, RFC1918 / loopback / link-
+            // local ranges, or other internal hosts. Without this the
+            // S3 backend becomes an SSRF pivot: a compromised admin
+            // can swap the endpoint to http://169.254.169.254 and the
+            // proxy will faithfully relay PUT/GET against IMDS,
+            // turning admin-GUI access into cloud-account takeover.
+            //
+            // `BackendDev` keeps the door open for local MinIO so
+            // dev/CI deployments still work — opted into via the
+            // `DGP_BACKEND_ALLOW_LOCAL=true` env, which a hardened
+            // production env must NOT set.
+            let kind = if std::env::var("DGP_BACKEND_ALLOW_LOCAL")
+                .map(|v| v == "1" || v == "true")
+                .unwrap_or(false)
+            {
+                crate::security::UrlKind::BackendDev
+            } else {
+                crate::security::UrlKind::Backend
+            };
+            crate::security::validate_outbound_url(ep, kind).map_err(|e| {
+                StorageError::Other(format!(
+                    "Refusing to use S3 endpoint {ep:?}: {e}. \
+                     Set DGP_BACKEND_ALLOW_LOCAL=true to permit http:// + private IPs for dev/CI."
+                ))
+            })?;
             s3_config_builder = s3_config_builder.endpoint_url(ep);
         }
 
@@ -2047,5 +2073,114 @@ mod tests {
             // growing a new arm without a paired marker update.
             let _ = m.marker();
         }
+    }
+
+    /// Module-level lock for tests that toggle `DGP_BACKEND_ALLOW_LOCAL`,
+    /// to keep parallel `cargo test` workers from racing each other.
+    /// Held across `.await` because the env-var window must include the
+    /// async `build_client` call; the lock is uncontended in production
+    /// code, so the "MutexGuard across await" lint doesn't apply.
+    static SSRF_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Adversarial: operator-supplied `s3_endpoint` pointing at IMDS
+    /// or other private targets must be rejected by `build_client`.
+    /// Catches the cloud-takeover SSRF pivot before the SDK builds a
+    /// client around the hostile endpoint.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn build_client_rejects_imds_and_private_endpoints() {
+        // Ensure dev allowlist is off for this test (it would defeat
+        // the check).
+        let _g = SSRF_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("DGP_BACKEND_ALLOW_LOCAL").ok();
+        // SAFETY: tests serialised on `LOCK`; no other thread mutates this
+        // env var during the test window.
+        unsafe { std::env::remove_var("DGP_BACKEND_ALLOW_LOCAL") };
+
+        for bad in [
+            "http://169.254.169.254/",
+            "https://169.254.169.254/",
+            "http://10.0.0.1/",
+            "https://192.168.0.1/",
+            "https://[::1]/",
+            "https://localhost/",
+            "https://metadata.google.internal/",
+            "http://example.com/", // plain http rejected when not in dev mode
+        ] {
+            let cfg = BackendConfig::S3 {
+                endpoint: Some(bad.to_string()),
+                region: "us-east-1".to_string(),
+                force_path_style: true,
+                access_key_id: Some("AKIA".to_string()),
+                secret_access_key: Some("secret".to_string()),
+            };
+            let err = S3Backend::build_client(&cfg)
+                .await
+                .expect_err(&format!("must reject endpoint {bad}"));
+            assert!(
+                err.to_string().contains("Refusing to use S3 endpoint"),
+                "expected SSRF guard error for {bad}, got: {err}"
+            );
+        }
+
+        // Legitimate public endpoints pass.
+        for good in [
+            "https://s3.amazonaws.com/",
+            "https://s3.eu-central-1.amazonaws.com/",
+        ] {
+            let cfg = BackendConfig::S3 {
+                endpoint: Some(good.to_string()),
+                region: "us-east-1".to_string(),
+                force_path_style: true,
+                access_key_id: Some("AKIA".to_string()),
+                secret_access_key: Some("secret".to_string()),
+            };
+            S3Backend::build_client(&cfg)
+                .await
+                .unwrap_or_else(|e| panic!("legitimate endpoint {good} rejected: {e}"));
+        }
+
+        // Restore prior env state.
+        match prev {
+            Some(v) => unsafe { std::env::set_var("DGP_BACKEND_ALLOW_LOCAL", v) },
+            None => unsafe { std::env::remove_var("DGP_BACKEND_ALLOW_LOCAL") },
+        };
+    }
+
+    /// With `DGP_BACKEND_ALLOW_LOCAL=true`, http:// + private IPs are
+    /// permitted — needed for `cargo test` against local MinIO and
+    /// for CI runs where the backend is on the same Docker network.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn build_client_allows_dev_local_when_opted_in() {
+        let _g = SSRF_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("DGP_BACKEND_ALLOW_LOCAL").ok();
+        unsafe { std::env::set_var("DGP_BACKEND_ALLOW_LOCAL", "true") };
+
+        let cfg = BackendConfig::S3 {
+            endpoint: Some("http://localhost:9000".to_string()),
+            region: "us-east-1".to_string(),
+            force_path_style: true,
+            access_key_id: Some("minioadmin".to_string()),
+            secret_access_key: Some("minioadmin".to_string()),
+        };
+        S3Backend::build_client(&cfg)
+            .await
+            .expect("dev mode must accept localhost:9000");
+
+        // IMDS still rejected even in dev mode.
+        let cfg = BackendConfig::S3 {
+            endpoint: Some("http://169.254.169.254/".to_string()),
+            region: "us-east-1".to_string(),
+            force_path_style: true,
+            access_key_id: Some("a".to_string()),
+            secret_access_key: Some("b".to_string()),
+        };
+        assert!(S3Backend::build_client(&cfg).await.is_err());
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("DGP_BACKEND_ALLOW_LOCAL", v) },
+            None => unsafe { std::env::remove_var("DGP_BACKEND_ALLOW_LOCAL") },
+        };
     }
 }

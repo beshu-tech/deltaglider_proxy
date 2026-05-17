@@ -1790,17 +1790,10 @@ export interface BucketScanProgress {
   started_at: string;
 }
 
-/**
- * GET /scan/status (no bucket) — full map of cached per-bucket
- * results. Intentionally not exported: callers only ever need
- * `getAllBucketScans` which returns it directly.
- */
-interface AllBucketScansResponse {
-  buckets: Record<string, BucketScanResult>;
-}
-
 /** Map of every bucket the server has a cached scan for. */
-export async function getAllBucketScans(): Promise<AllBucketScansResponse> {
+export async function getAllBucketScans(): Promise<{
+  buckets: Record<string, BucketScanResult>;
+}> {
   const res = await adminFetch('/api/admin/diagnostics/scan/status');
   if (!res.ok) await throwApiError(res, 'Bucket scan status (all)');
   return safeJson(res);

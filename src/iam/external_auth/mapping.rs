@@ -98,7 +98,7 @@ fn matches_rule(rule: &GroupMappingRule, identity: &ExternalIdentityInfo) -> boo
                 .email
                 .as_deref()
                 .and_then(|e| {
-                    regex::Regex::new(&rule.match_value)
+                    regex_lite::Regex::new(&rule.match_value)
                         .ok()
                         .map(|re| re.is_match(e))
                 })

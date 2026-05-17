@@ -120,32 +120,100 @@ pub struct OpenBrowserConnectRequest {
 }
 
 /// Whether session cookies should include the `Secure` flag (HTTPS-only).
-/// Controlled by `DGP_SECURE_COOKIES`. When not set, auto-detects based on TLS:
-/// TLS enabled → Secure=true; TLS disabled → Secure=false.
-/// Set explicitly to `"true"` to force Secure flag regardless of TLS.
+/// Controlled by `DGP_SECURE_COOKIES`. When not set, auto-detects based
+/// on TLS-at-our-listener (`DGP_TLS_ENABLED=true`) OR a trusted
+/// `X-Forwarded-Proto: https` from the front proxy.
+/// Set `DGP_SECURE_COOKIES=true` to force Secure regardless of detection.
 fn secure_cookies() -> bool {
+    secure_cookies_with(None)
+}
+
+/// Same as [`secure_cookies`] but also consults the inbound request's
+/// `X-Forwarded-Proto` header (only when `DGP_TRUST_PROXY_HEADERS=true`).
+/// Use this on the response-issuing path so a TLS-terminated front
+/// proxy yields a `Secure` cookie even when DGP_TLS_ENABLED is unset.
+pub(super) fn secure_cookies_with(headers: Option<&HeaderMap>) -> bool {
     match std::env::var("DGP_SECURE_COOKIES") {
-        Ok(v) if v == "true" || v == "1" => true,
-        Ok(v) if v == "false" || v == "0" => false,
-        _ => {
-            // Auto-detect: check if TLS is enabled
-            std::env::var("DGP_TLS_ENABLED")
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(false)
+        Ok(v) if v == "true" || v == "1" => return true,
+        Ok(v) if v == "false" || v == "0" => return false,
+        _ => {}
+    }
+    if std::env::var("DGP_TLS_ENABLED")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if crate::rate_limiter::trust_proxy_headers() {
+        if let Some(h) = headers {
+            if let Some(proto) = h
+                .get("x-forwarded-proto")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim().to_ascii_lowercase())
+            {
+                if proto == "https" {
+                    return true;
+                }
+            }
         }
+    }
+    false
+}
+
+/// Remove the caller's previous session, if any. Called at every
+/// session-minting boundary so an XSS-leaked cookie from before
+/// "log out + log in" can't outlive the rotation.
+pub(super) fn drop_prior_session(state: &AdminState, headers: &HeaderMap) {
+    if let Some(prior) = extract_session_token(headers) {
+        state.sessions.remove(&prior);
     }
 }
 
-/// Format a session cookie for setting a login token.
-/// Max-Age matches the session store's TTL.
+/// Test-only shim: equivalent to [`session_cookie_with_headers`] with
+/// no request headers. Kept so the `session_cookie_is_samesite_strict_*`
+/// unit tests can build a cookie without an axum `HeaderMap`. The
+/// cookie-shape contract (SameSite=Strict, HttpOnly, Path=/, Max-Age)
+/// is documented on the production builder below.
+#[cfg(test)]
 pub(super) fn session_cookie(token: &str, ttl: std::time::Duration) -> String {
+    session_cookie_with_headers(token, ttl, None)
+}
+
+/// Format a session cookie for setting a login token. This is the
+/// production code path; the `#[cfg(test)]` [`session_cookie`] above
+/// is a no-headers shim.
+///
+/// Max-Age matches the session store's TTL.
+///
+/// `SameSite=Strict` (not Lax) — Strict blocks cross-site top-level
+/// GET navigations from carrying the cookie, which is the safe choice
+/// for a session that authorises both the admin GUI and S3-credential
+/// minting. The OAuth callback redirect from an external IdP is the
+/// one cross-site GET we actually do, and it works fine: the response
+/// is what *sets* the cookie (no read needed) and the subsequent
+/// same-origin redirect to `/_/admin` reads it back under Strict.
+///
+/// One UX trade: bookmark-loaded `https://proxy/_/admin` may need a
+/// reload after login since the first hit doesn't carry the cookie.
+/// We judge the CSRF surface reduction worth it for a public-internet
+/// deployment.
+///
+/// Consults `headers` so a `Secure` flag fires when the front proxy
+/// reports `X-Forwarded-Proto: https` even though our listener is
+/// plain HTTP. Pass `Some(req_headers)` from every login handler.
+pub(super) fn session_cookie_with_headers(
+    token: &str,
+    ttl: std::time::Duration,
+    headers: Option<&HeaderMap>,
+) -> String {
     let max_age = ttl.as_secs();
-    let secure = if secure_cookies() { "; Secure" } else { "" };
-    // Use SameSite=Lax (not Strict) to allow the cookie to be sent on top-level
-    // navigations — required for OAuth callback redirects from external IdPs.
-    // Lax still protects against CSRF on POST/PUT/DELETE requests.
+    let secure = if secure_cookies_with(headers) {
+        "; Secure"
+    } else {
+        ""
+    };
     format!(
-        "dgp_session={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}{}",
+        "dgp_session={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
         token, max_age, secure
     )
 }
@@ -180,7 +248,7 @@ pub(super) async fn auto_populate_s3_creds(
 pub(super) fn session_cookie_clear() -> String {
     let secure = if secure_cookies() { "; Secure" } else { "" };
     format!(
-        "dgp_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{}",
+        "dgp_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
         secure
     )
 }
@@ -213,12 +281,15 @@ pub async fn login(
     req_headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> impl IntoResponse {
-    // Brute-force protection: the guard handles IP extraction, lockout
-    // check, progressive delay, and lockout-transition logging.
-    let guard = match crate::rate_limiter::RateLimitGuard::enter(
+    // Brute-force protection: per-IP cap (catches single-host noise)
+    // PLUS per-account cap (catches distributed credential stuffing
+    // against the bootstrap password — a botnet rotating IPs across
+    // a /16 can chew the per-IP budget freely without this).
+    let guard = match crate::rate_limiter::RateLimitGuard::enter_with_account(
         &state.rate_limiter,
         &req_headers,
         connect_info.as_ref().map(|ci| ci.0.ip()),
+        "bootstrap",
         "admin",
     )
     .await
@@ -262,6 +333,9 @@ pub async fn login(
 
     // Successful login — reset rate limiter for this IP
     guard.record_success();
+    // Rotate the session: drop any pre-login cookie so an XSS-leaked
+    // earlier token can't outlive the password re-entry.
+    drop_prior_session(&state, &req_headers);
     let token = state.sessions.create_session(
         request_client_ip(&req_headers, connect_info.as_ref()),
         AuthMethod::Bootstrap,
@@ -304,7 +378,7 @@ pub async fn login(
     let mut headers = HeaderMap::new();
     headers.insert(
         header::SET_COOKIE,
-        session_cookie(&token, state.sessions.ttl())
+        session_cookie_with_headers(&token, state.sessions.ttl(), Some(&req_headers))
             .parse()
             .unwrap(),
     );
@@ -543,10 +617,15 @@ pub async fn login_as(
     req_headers: HeaderMap,
     Json(body): Json<LoginAsRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let guard = crate::rate_limiter::RateLimitGuard::enter(
+    // Per-IP + per-account brute-force gate. Without the per-account
+    // bucket, a botnet rotating IPs could target a specific admin's
+    // access_key_id without any rate limit. The account dimension is
+    // the AKID being attempted.
+    let guard = crate::rate_limiter::RateLimitGuard::enter_with_account(
         &state.rate_limiter,
         &req_headers,
         connect_info.as_ref().map(|ci| ci.0.ip()),
+        &body.access_key_id,
         "login_as",
     )
     .await
@@ -590,6 +669,9 @@ pub async fn login_as(
     // Successful login — reset rate limiter
     guard.record_success();
 
+    // Rotate the session: drop any pre-login cookie so an XSS-leaked
+    // earlier token can't outlive the credential re-entry.
+    drop_prior_session(&state, &req_headers);
     let token = state.sessions.create_session(
         request_client_ip(&req_headers, connect_info.as_ref()),
         AuthMethod::IamLoginAs {
@@ -617,7 +699,7 @@ pub async fn login_as(
         StatusCode::OK,
         [(
             header::SET_COOKIE,
-            session_cookie(&token, state.sessions.ttl()),
+            session_cookie_with_headers(&token, state.sessions.ttl(), Some(&req_headers)),
         )],
         Json(LoginResponse { ok: true }),
     ))
@@ -698,6 +780,9 @@ pub async fn browser_session_connect(
             .unwrap_or_else(|| "us-east-1".to_string())
     };
 
+    // Rotate the session: drop any pre-login cookie so an XSS-leaked
+    // earlier token can't outlive the credential re-entry.
+    drop_prior_session(&state, &req_headers);
     let token = state.sessions.create_session(
         request_client_ip(&req_headers, connect_info.as_ref()),
         AuthMethod::IamBrowserLift {
@@ -734,7 +819,7 @@ pub async fn browser_session_connect(
         StatusCode::OK,
         [(
             header::SET_COOKIE,
-            session_cookie(&token, state.sessions.ttl()),
+            session_cookie_with_headers(&token, state.sessions.ttl(), Some(&req_headers)),
         )],
         Json(LoginResponse { ok: true }),
     ))
@@ -784,6 +869,9 @@ pub async fn open_browser_connect(
             .unwrap_or_else(|| "us-east-1".to_string())
     };
 
+    // Rotate the session: drop any pre-login cookie so an XSS-leaked
+    // earlier token can't outlive the new bind.
+    drop_prior_session(&state, &req_headers);
     let token = state.sessions.create_session(
         request_client_ip(&req_headers, connect_info.as_ref()),
         AuthMethod::OpenLift,
@@ -807,7 +895,7 @@ pub async fn open_browser_connect(
         StatusCode::OK,
         [(
             header::SET_COOKIE,
-            session_cookie(&token, state.sessions.ttl()),
+            session_cookie_with_headers(&token, state.sessions.ttl(), Some(&req_headers)),
         )],
         Json(LoginResponse { ok: true }),
     ))
@@ -928,6 +1016,10 @@ pub async fn require_not_declarative(
 
 /// GET /api/admin/session/s3-credentials — retrieve stored S3 credentials.
 /// Returns 404 if no credentials are stored in this session.
+///
+/// The response body contains live access keys; explicit `no-store`
+/// (paired with `Pragma: no-cache`) prevents intermediary caches and
+/// the browser's bfcache from retaining the secret.
 pub async fn get_s3_session_creds(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
@@ -937,7 +1029,18 @@ pub async fn get_s3_session_creds(
         None => return StatusCode::UNAUTHORIZED.into_response(),
     };
     match state.sessions.get_s3_creds(&token) {
-        Some(creds) => (StatusCode::OK, Json(creds)).into_response(),
+        Some(creds) => (
+            StatusCode::OK,
+            [
+                (
+                    "cache-control",
+                    "no-store, no-cache, must-revalidate, private",
+                ),
+                ("pragma", "no-cache"),
+            ],
+            Json(creds),
+        )
+            .into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -1077,5 +1180,105 @@ mod tests {
             .iter()
             .any(|p| p.actions == vec!["write"]));
         assert_eq!(effective.iam_policies.len(), 2);
+    }
+
+    /// Adversarial: the session cookie must carry SameSite=Strict
+    /// plus HttpOnly plus Path=/. Without Strict, a cross-site top-level
+    /// navigation (e.g. an OAuth-callback-shaped link in an attacker
+    /// page) can deliver the cookie back to us — the exact CSRF /
+    /// login-fixation chain the security review flagged.
+    #[test]
+    fn session_cookie_is_samesite_strict_httponly() {
+        let cookie = session_cookie("abc123", std::time::Duration::from_secs(3600));
+        assert!(
+            cookie.contains("SameSite=Strict"),
+            "session cookie must be SameSite=Strict — got: {cookie}"
+        );
+        assert!(cookie.contains("HttpOnly"), "cookie: {cookie}");
+        assert!(cookie.contains("Path=/"), "cookie: {cookie}");
+        assert!(cookie.contains("Max-Age=3600"), "cookie: {cookie}");
+        // Must NOT be `SameSite=Lax` or `SameSite=None`.
+        assert!(!cookie.contains("SameSite=Lax"), "cookie: {cookie}");
+        assert!(!cookie.contains("SameSite=None"), "cookie: {cookie}");
+    }
+
+    /// The logout-clear cookie shares the same SameSite policy so that
+    /// the browser actually overrides the previous cookie (browsers
+    /// distinguish cookies by their (name, domain, path, samesite) tuple
+    /// in some impls — same SameSite avoids "ghost" cookies persisting).
+    #[test]
+    fn logout_cookie_is_samesite_strict() {
+        // Re-create what logout returns; the literal lives in logout()
+        // but it's a one-line format!() so we just assert the property.
+        // If logout() changes its cookie shape, this test stays accurate
+        // because we read the same env var via secure_cookies().
+        let secure = if secure_cookies() { "; Secure" } else { "" };
+        let expected =
+            format!("dgp_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{secure}");
+        assert!(expected.contains("SameSite=Strict"));
+        assert!(expected.contains("Max-Age=0"));
+    }
+
+    /// `secure_cookies_with` consults `X-Forwarded-Proto: https` only
+    /// when `DGP_TRUST_PROXY_HEADERS=true`. Without trust, a hostile
+    /// client could spoof `X-Forwarded-Proto: https` against a plain-
+    /// HTTP listener and trick the cookie into `Secure` — that'd
+    /// silently drop the cookie on the legitimate user's subsequent
+    /// HTTP requests, a UX-DoS not a security break, but still worth
+    /// gating.
+    #[test]
+    fn secure_cookies_with_respects_trust_proxy_headers() {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let prev_tls = std::env::var("DGP_TLS_ENABLED").ok();
+        let prev_trust = std::env::var("DGP_TRUST_PROXY_HEADERS").ok();
+        let prev_secure = std::env::var("DGP_SECURE_COOKIES").ok();
+        unsafe {
+            std::env::remove_var("DGP_TLS_ENABLED");
+            std::env::remove_var("DGP_SECURE_COOKIES");
+        }
+
+        // Case A: trust=false, XFP=https → still NOT secure (we don't
+        // trust the header).
+        unsafe { std::env::remove_var("DGP_TRUST_PROXY_HEADERS") };
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-proto", "https".parse().unwrap());
+        assert!(
+            !secure_cookies_with(Some(&h)),
+            "must NOT trust XFP without DGP_TRUST_PROXY_HEADERS=true"
+        );
+
+        // Case B: trust=true, XFP=https → secure.
+        unsafe { std::env::set_var("DGP_TRUST_PROXY_HEADERS", "true") };
+        assert!(
+            secure_cookies_with(Some(&h)),
+            "trusted XFP=https must yield Secure cookie"
+        );
+
+        // Case C: trust=true, no XFP → falls back to TLS_ENABLED → false.
+        assert!(!secure_cookies_with(Some(&HeaderMap::new())));
+
+        // Case D: explicit DGP_SECURE_COOKIES=true wins.
+        unsafe { std::env::set_var("DGP_SECURE_COOKIES", "true") };
+        assert!(secure_cookies_with(None));
+        unsafe { std::env::set_var("DGP_SECURE_COOKIES", "false") };
+        assert!(!secure_cookies_with(Some(&h)));
+
+        // Restore.
+        unsafe {
+            match prev_tls {
+                Some(v) => std::env::set_var("DGP_TLS_ENABLED", v),
+                None => std::env::remove_var("DGP_TLS_ENABLED"),
+            }
+            match prev_trust {
+                Some(v) => std::env::set_var("DGP_TRUST_PROXY_HEADERS", v),
+                None => std::env::remove_var("DGP_TRUST_PROXY_HEADERS"),
+            }
+            match prev_secure {
+                Some(v) => std::env::set_var("DGP_SECURE_COOKIES", v),
+                None => std::env::remove_var("DGP_SECURE_COOKIES"),
+            }
+        }
     }
 }

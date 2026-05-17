@@ -612,6 +612,106 @@ fn authenticate_form_post(
     Ok(Some(auth_user))
 }
 
+/// Replay-cache TTL for a form-POST signature: the policy's own
+/// expiration capped at [`MAX_FORM_POST_REPLAY_TTL_SECS`] so an
+/// attacker uploading a multi-day-expiry policy can't pin a cache
+/// slot indefinitely. Pure: no I/O, no global state.
+fn form_post_replay_ttl(
+    policy_b64: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> std::time::Duration {
+    use std::time::Duration;
+    // Decode → parse JSON → extract `expiration`. Any failure short-
+    // circuits to the floor TTL (sig is still cached, just for a
+    // short window).
+    let parsed = base64::engine::general_purpose::STANDARD
+        .decode(policy_b64.as_bytes())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|j| {
+            j.get("expiration")
+                .and_then(|e| e.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+        });
+    let max = Duration::from_secs(MAX_FORM_POST_REPLAY_TTL_SECS);
+    let floor = Duration::from_secs(5);
+    let raw = match parsed {
+        Some(exp) if exp > now => exp.signed_duration_since(now).to_std().unwrap_or(floor),
+        _ => floor,
+    };
+    raw.min(max).max(floor)
+}
+
+/// Cap on the form-POST replay-cache TTL — no single entry can pin a
+/// slot for more than 24 h regardless of the policy's claimed expiry.
+const MAX_FORM_POST_REPLAY_TTL_SECS: u64 = 24 * 60 * 60;
+
+/// Cap on the replay-cache total entries. A flood of unique-signature
+/// form-POSTs (an attacker minting fresh policies) must not be able
+/// to OOM the proxy.
+const MAX_FORM_POST_REPLAY_ENTRIES: usize = 50_000;
+
+/// Reject a captured presigned form-POST being replayed. Pure-ish:
+/// takes shared state, reads `parsed.fields_ci`, mutates the cache.
+fn enforce_form_post_replay(state: &Arc<AppState>, parsed: &ParsedFormPost) -> Result<(), S3Error> {
+    let cache = &state.form_post_replay;
+    let now = chrono::Utc::now();
+    let now_instant = std::time::Instant::now();
+
+    // Bounded prune: drop expired entries and, if still above cap,
+    // evict the oldest. Cheaper than a background sweeper task and
+    // bounded by `MAX_FORM_POST_REPLAY_ENTRIES`.
+    cache.retain(|_, exp_instant| *exp_instant > now_instant);
+    if cache.len() > MAX_FORM_POST_REPLAY_ENTRIES {
+        // Hard cap reached — drop one arbitrary entry per insert.
+        // DashMap doesn't expose `pop`; iterate + remove the first.
+        if let Some(entry) = cache.iter().next() {
+            let k = entry.key().clone();
+            drop(entry);
+            cache.remove(&k);
+        }
+        tracing::warn!(
+            "SECURITY | form_post_replay_cache hard-cap reached ({}) — possible flood",
+            cache.len()
+        );
+    }
+
+    let Some(sig) = lookup_form_field(&parsed.fields_ci, "x-amz-signature") else {
+        // Unsigned form-POST (authentication=none mode) skips the
+        // replay check — there's nothing to replay against. The
+        // un-auth path is gated elsewhere.
+        return Ok(());
+    };
+    let Some(policy_b64) = lookup_form_field(&parsed.fields_ci, "policy") else {
+        return Ok(());
+    };
+
+    let key = sig.to_ascii_lowercase();
+    let ttl = form_post_replay_ttl(policy_b64, now);
+    let new_expiry = now_instant + ttl;
+    let mut rejected = false;
+    cache
+        .entry(key.clone())
+        .and_modify(|existing| {
+            if *existing > now_instant {
+                rejected = true;
+            } else {
+                *existing = new_expiry;
+            }
+        })
+        .or_insert(new_expiry);
+
+    if rejected {
+        tracing::warn!(
+            "SECURITY | event=form_post_replay_blocked | sig_prefix={}",
+            &key[..key.len().min(8)]
+        );
+        return Err(S3Error::SignatureDoesNotMatch);
+    }
+    Ok(())
+}
+
 /// Run the full presigned-form-POST pipeline.
 ///
 /// Called from `object::delete_objects` when the dispatcher detects a
@@ -629,6 +729,16 @@ pub(super) async fn handle_form_post_upload(
     ensure_bucket_exists(state, bucket).await?;
     let parsed = parse_form_post_upload(headers, body).await?;
     let auth_user = authenticate_form_post(iam_state, bucket, &parsed)?;
+    // After authentication: gate the form-POST policy signature
+    // through the replay cache. Form-POSTs are presigned-style — the
+    // SigV4 path skips replay detection for presigned URLs because
+    // they're MEANT to be reused. Form-POST is the opposite: each
+    // submission should fire at most once (per uploader's intent),
+    // but the SigV4 middleware short-circuits past the replay cache
+    // for POSTs that carry a `policy` field. Without this guard, a
+    // captured form-POST is replayable for the entire policy
+    // expiration window (hours to days).
+    enforce_form_post_replay(state, &parsed)?;
     check_quota(state, bucket, parsed.file_data.len() as u64)?;
     let result = state
         .engine
@@ -781,5 +891,105 @@ mod tests {
                 other
             ),
         }
+    }
+
+    /// TTL is the policy's own remaining expiry, capped at 24h with
+    /// a 5-second floor. Pure function; no test infrastructure
+    /// needed.
+    #[test]
+    fn form_post_replay_ttl_follows_policy_expiry() {
+        use chrono::{Duration as Cd, Utc};
+        use std::time::Duration;
+
+        // Policy expiring in 30 min → TTL ≈ 30 min.
+        let now = Utc::now();
+        let policy = serde_json::json!({
+            "expiration": (now + Cd::minutes(30)).to_rfc3339(),
+        });
+        let policy_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            serde_json::to_vec(&policy).unwrap(),
+        );
+        let ttl = form_post_replay_ttl(&policy_b64, now);
+        assert!(ttl > Duration::from_secs(60 * 25));
+        assert!(ttl < Duration::from_secs(60 * 35));
+
+        // Policy expiring in 10 days → capped at 24 h.
+        let policy = serde_json::json!({
+            "expiration": (now + Cd::days(10)).to_rfc3339(),
+        });
+        let policy_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            serde_json::to_vec(&policy).unwrap(),
+        );
+        let ttl = form_post_replay_ttl(&policy_b64, now);
+        assert_eq!(ttl, Duration::from_secs(MAX_FORM_POST_REPLAY_TTL_SECS));
+
+        // Already-expired policy → floor (5s) — caller will still
+        // reject on the expiration check; this is the safe fallback.
+        let policy = serde_json::json!({
+            "expiration": (now - Cd::minutes(1)).to_rfc3339(),
+        });
+        let policy_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            serde_json::to_vec(&policy).unwrap(),
+        );
+        assert_eq!(
+            form_post_replay_ttl(&policy_b64, now),
+            Duration::from_secs(5)
+        );
+
+        // Garbage policy → floor.
+        assert_eq!(
+            form_post_replay_ttl("not-base64-at-all", now),
+            Duration::from_secs(5)
+        );
+        // Valid base64 but not JSON → floor.
+        let bogus = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"not json");
+        assert_eq!(form_post_replay_ttl(&bogus, now), Duration::from_secs(5));
+    }
+
+    /// Adversarial: a second insertion for the same signature within
+    /// the TTL window must observe the first entry as live so the
+    /// caller (`enforce_form_post_replay`) rejects the replay. Tests
+    /// the cache-shape contract directly — the full route-layer flow
+    /// is covered by integration tests.
+    #[test]
+    fn form_post_replay_cache_marks_signature_as_seen() {
+        let cache: std::sync::Arc<dashmap::DashMap<String, std::time::Instant>> =
+            std::sync::Arc::new(dashmap::DashMap::new());
+        let key = "deadbeef".to_string();
+        let now = std::time::Instant::now();
+        // Insert with 10-min TTL.
+        cache.insert(key.clone(), now + std::time::Duration::from_secs(600));
+        // Replay attempt: the slot is live → reject path is taken.
+        let live = cache
+            .get(&key)
+            .map(|v| *v > std::time::Instant::now())
+            .unwrap_or(false);
+        assert!(live, "cache must report the signature as still live");
+    }
+
+    /// Adversarial: a signature whose TTL has elapsed must be
+    /// purged on access so the slot can be reused — but a legitimate
+    /// retry doesn't "leak" indefinitely.
+    #[test]
+    fn form_post_replay_cache_expired_entries_are_drained() {
+        let cache: std::sync::Arc<dashmap::DashMap<String, std::time::Instant>> =
+            std::sync::Arc::new(dashmap::DashMap::new());
+        let key = "deadbeef".to_string();
+        let now = std::time::Instant::now();
+        // Insert with a NEGATIVE TTL (already expired).
+        cache.insert(
+            key.clone(),
+            now.checked_sub(std::time::Duration::from_secs(60))
+                .unwrap_or(now),
+        );
+        // Prune: same `retain` shape the enforcer uses.
+        cache.retain(|_, exp| *exp > std::time::Instant::now());
+        assert!(
+            !cache.contains_key(&key),
+            "expired entry must be evicted by the retain sweep"
+        );
     }
 }

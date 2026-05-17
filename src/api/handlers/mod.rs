@@ -55,6 +55,12 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     pub usage_scanner: Arc<crate::usage_scanner::UsageScanner>,
     pub config_db: Option<Arc<tokio::sync::Mutex<ConfigDb>>>,
+    /// Replay cache for form-POST policy signatures. Keyed on the
+    /// signature itself; value is the policy's expiration `Instant`
+    /// (NOT the insertion time — form-POST entries need per-entry
+    /// TTLs because policy expirations vary from minutes to days).
+    /// See `enforce_form_post_replay` in `handlers/form_post.rs`.
+    pub form_post_replay: Arc<dashmap::DashMap<String, std::time::Instant>>,
 }
 
 /// Query parameters for object-level operations (multipart upload)

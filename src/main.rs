@@ -76,7 +76,12 @@ struct Cli {
     command: Option<Command>,
 }
 
-/// Top-level subcommands. Grows in later phases (admission, apply, …).
+/// Top-level subcommands. The `config` and `admission` families
+/// operate on the proxy's own config / request pipeline. The S3
+/// commands (`cp`, `ls`, `rm`, `stats`, `verify`, `sync`, `migrate`,
+/// `purge`, `get-bucket-acl`, `put-bucket-acl`) talk directly to an
+/// S3 endpoint and apply the same delta-storage layout the proxy
+/// uses — same toolchain, no Python deltaglider dependency.
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Configuration-file tooling (migrate, schema, apply, ...).
@@ -89,6 +94,27 @@ enum Command {
         #[command(subcommand)]
         action: AdmissionCommand,
     },
+    /// List S3 buckets or objects (AWS-CLI-shaped output).
+    Ls(deltaglider_proxy::cli::ls::LsArgs),
+    /// Remove S3 objects (single-key or recursive prefix-delete).
+    Rm(deltaglider_proxy::cli::rm::RmArgs),
+    /// Copy files between local paths and S3 with transparent delta compression.
+    Cp(deltaglider_proxy::cli::cp::CpArgs),
+    /// Bucket statistics: original/stored bytes, savings %, deltaspace health.
+    Stats(deltaglider_proxy::cli::stats::StatsArgs),
+    /// Verify the integrity of a DeltaGlider-stored object (SHA256 round-trip).
+    Verify(deltaglider_proxy::cli::verify::VerifyArgs),
+    /// Get a bucket's ACL (AWS-CLI shape).
+    GetBucketAcl(deltaglider_proxy::cli::bucket_acl::GetArgs),
+    /// Update a bucket's ACL (canned-ACL or grant-* flags).
+    PutBucketAcl(deltaglider_proxy::cli::bucket_acl::PutArgs),
+    /// Migrate a deltaspace between buckets / accounts via the engine.
+    Migrate(deltaglider_proxy::cli::migrate::MigrateArgs),
+    /// Sync a directory between local and S3 (or between two S3 prefixes).
+    Sync(deltaglider_proxy::cli::sync::SyncArgs),
+    /// Purge expired Python-toolchain rehydration cache entries
+    /// (`.deltaglider/tmp/*` with past `dg-expires-at`).
+    Purge(deltaglider_proxy::cli::purge::PurgeArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -236,6 +262,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )
                 }
             },
+            // S3 subcommands are async — each owns its own tokio
+            // runtime so the proxy-startup path stays cold when the
+            // binary is invoked purely as a CLI.
+            Command::Ls(args) => run_cli_async(deltaglider_proxy::cli::ls::run(args.clone())),
+            Command::Rm(args) => run_cli_async(deltaglider_proxy::cli::rm::run(args.clone())),
+            Command::Cp(args) => run_cli_async(deltaglider_proxy::cli::cp::run(args.clone())),
+            Command::Stats(args) => run_cli_async(deltaglider_proxy::cli::stats::run(args.clone())),
+            Command::Verify(args) => {
+                run_cli_async(deltaglider_proxy::cli::verify::run(args.clone()))
+            }
+            Command::GetBucketAcl(args) => {
+                run_cli_async(deltaglider_proxy::cli::bucket_acl::get_run(args.clone()))
+            }
+            Command::PutBucketAcl(args) => {
+                run_cli_async(deltaglider_proxy::cli::bucket_acl::put_run(args.clone()))
+            }
+            Command::Migrate(args) => {
+                run_cli_async(deltaglider_proxy::cli::migrate::run(args.clone()))
+            }
+            Command::Sync(args) => run_cli_async(deltaglider_proxy::cli::sync::run(args.clone())),
+            Command::Purge(args) => run_cli_async(deltaglider_proxy::cli::purge::run(args.clone())),
         };
         std::process::exit(code);
     }
@@ -337,6 +384,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = runtime_builder.build()?;
 
     runtime.block_on(async_main(cli))
+}
+
+/// Run a single async CLI subcommand on its own small tokio runtime.
+/// The proxy's full runtime is heavyweight (blocking threads, the
+/// scheduler-monitor task, etc.); CLI commands need a one-off tokio
+/// runtime that exits with the process.
+fn run_cli_async<F: std::future::Future<Output = i32>>(fut: F) -> i32 {
+    match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt.block_on(fut),
+        Err(e) => {
+            eprintln!("error: failed to start tokio runtime: {e}");
+            deltaglider_proxy::cli::config::EXIT_IO
+        }
+    }
 }
 
 async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
@@ -526,6 +590,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         metrics: metrics.clone(),
         usage_scanner: usage_scanner.clone(),
         config_db: config_db.clone(),
+        form_post_replay: Arc::new(dashmap::DashMap::new()),
     });
 
     // --- Background monitors ---

@@ -758,7 +758,20 @@ pub async fn sigv4_auth_middleware(
     let (secret_key, authenticated_user) = match iam_state {
         IamState::Disabled => unreachable!(), // handled above
         IamState::Legacy(auth) => {
-            if params.access_key != auth.access_key_id {
+            // Constant-time compare via fixed-length hashes. ct_eq
+            // requires equal-length inputs; hashing first lets us
+            // feed two `[u8; 32]` arrays into ct_eq regardless of
+            // the AKID strings' lengths, so we don't leak length /
+            // existence via timing. The IAM map path is inherently
+            // leaky on existence (DashMap shards), but the bootstrap
+            // path is hot enough to be a measurable oracle without
+            // this guard.
+            use sha2::{Digest, Sha256};
+            use subtle::ConstantTimeEq;
+            let provided_hash = Sha256::digest(params.access_key.as_bytes());
+            let configured_hash = Sha256::digest(auth.access_key_id.as_bytes());
+            let matches: bool = provided_hash.ct_eq(&configured_hash).into();
+            if !matches {
                 debug!("SigV4: access key mismatch (legacy mode)");
                 record_auth_failure("invalid_access_key");
                 return Err(S3Error::AccessDenied.into_response());
@@ -844,17 +857,20 @@ pub async fn sigv4_auth_middleware(
     //
     // Skip replay detection for:
     // - Presigned URLs: designed to be reused (same signature for entire expiry window)
-    // - Idempotent methods (GET/HEAD): clients legitimately retry these, and sequential
-    //   HEAD probes (e.g. checksum auto-detection) can produce identical signatures when
-    //   they land in the same timestamp second. Rejecting these causes false 400s.
+    //
+    // GET/HEAD requests USED to skip the cache (clients legitimately
+    // retry; rapid HEAD probes can share a signature within the same
+    // second). That left a captured signed GET replayable for the
+    // full `DGP_CLOCK_SKEW_SECONDS` window (default 300s) — the
+    // security review flagged this as the largest GET-side exfil
+    // amplifier. Now GET/HEAD share the same replay cache as
+    // mutating methods; the 2-second default window still tolerates
+    // typical retry shapes and operators can stretch
+    // `DGP_REPLAY_WINDOW_SECS` if their clients cluster more tightly.
     let is_presigned = has_presigned_query_params(request.uri().query().unwrap_or(""));
-    let is_idempotent = matches!(
-        *request.method(),
-        axum::http::Method::GET | axum::http::Method::HEAD
-    );
     if let Some(ref cache) = replay_cache {
-        if is_presigned || is_idempotent {
-            // No replay detection for presigned URLs or idempotent methods
+        if is_presigned {
+            // No replay detection for presigned URLs
         } else {
             // Cap replay cache size to prevent memory exhaustion under attack.
             // First drop expired entries, then enforce a hard oldest-first cap.

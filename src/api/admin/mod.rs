@@ -44,7 +44,7 @@ pub use auth::{
 pub use backends::{
     create_backend, create_bucket_on_backend, delete_backend, list_backends, list_bucket_origins,
 };
-pub use backup::{export_backup, import_backup};
+pub use backup::{export_backup, import_backup, MAX_IMPORT_BODY_BYTES};
 pub use bucket_scan::{
     delete_scan, get_scan_status, get_scan_stream, post_scan_start, post_scan_stop, BucketScanner,
 };
@@ -58,8 +58,8 @@ pub use config::{
     TraceResolved, TraceResponse,
 };
 pub use delta_efficiency::{
-    get_delta_efficiency, post_delta_efficiency_scan, verify_delta_efficiency,
-    DeltaEfficiencyScanner,
+    classify_deltaspace, get_delta_efficiency, post_delta_efficiency_scan, verify_delta_efficiency,
+    DeltaEfficiencyScanner, Efficiency,
 };
 pub use event_outbox::{
     list as event_outbox_list, requeue_many as event_outbox_requeue_many,
@@ -224,152 +224,6 @@ pub(crate) fn audit_log(
     crate::audit::audit_log(action, admin_user, target, headers, "", "");
 }
 
-// ─────────────────────────────────────────────────────────────────
-// Move E: typed mutation framework
-// ─────────────────────────────────────────────────────────────────
-
-/// Description of an admin DB mutation, used by [`AdminMutation::run`].
-///
-/// Captures the four post-mutation steps that the antipattern memo
-/// (`.claude/agent-memory/codebase-hygiene-reviewer/antipatterns.md`)
-/// insists must remain visible at the call site:
-///
-/// 1. **DB tx** — the closure that holds the ConfigDb mutex.
-/// 2. **audit** — `(action, target)`. The admin user is read from
-///    the request headers via `audit_log`'s existing convention.
-///    Empty action skips audit.
-/// 3. **rebuild** — optional subsystem rebuild (e.g. IAM version
-///    bump, ext-auth manager rebuild, public-prefix snapshot
-///    refresh). Captured as an `async FnOnce` because some
-///    rebuilds need to await DB reads of the just-mutated state.
-/// 4. **sync** — whether to fire `trigger_config_sync`. Almost
-///    always `true` on mutations; explicit so handlers don't
-///    silently skip it.
-///
-/// The framework keeps the ordering — DB tx → audit → rebuild →
-/// sync — under one helper while letting each step stay a
-/// distinct, non-hidden hook. Pre-fix, every mutation handler
-/// open-coded the same five-step `lock → mutate → drop → audit →
-/// rebuild → trigger_sync` sequence, easy to skip a step.
-///
-/// Example:
-///
-/// ```ignore
-/// pub async fn create_provider(
-///     State(state): State<Arc<AdminState>>,
-///     req_headers: HeaderMap,
-///     Json(body): Json<CreateAuthProviderRequest>,
-/// ) -> Result<impl IntoResponse, StatusCode> {
-///     let state2 = state.clone();
-///     let provider = AdminMutation::new(&state, "create auth provider")
-///         .audit("create_auth_provider", &body.name, &req_headers)
-///         .rebuild(move || async move { rebuild_external_auth(&state2).await; })
-///         .sync(true)
-///         .run(|db| db.create_auth_provider(&body))
-///         .await?;
-///     Ok((StatusCode::CREATED, Json(provider)))
-/// }
-/// ```
-#[allow(dead_code)] // available for migration; not yet wired
-pub(crate) struct AdminMutation<'a, F: std::future::Future<Output = ()> + Send> {
-    state: &'a Arc<AdminState>,
-    op_label: &'a str,
-    audit_action: Option<&'a str>,
-    audit_target: Option<&'a str>,
-    audit_headers: Option<&'a axum::http::HeaderMap>,
-    rebuild: Option<Box<dyn FnOnce() -> F + Send + 'a>>,
-    sync: bool,
-}
-
-#[allow(dead_code)]
-impl<'a, F: std::future::Future<Output = ()> + Send + 'a> AdminMutation<'a, F> {
-    pub fn new(state: &'a Arc<AdminState>, op_label: &'a str) -> Self {
-        Self {
-            state,
-            op_label,
-            audit_action: None,
-            audit_target: None,
-            audit_headers: None,
-            rebuild: None,
-            // Default ON: most admin mutations sync. Handlers that
-            // genuinely don't want sync (rare) call `.sync(false)`
-            // explicitly to declare intent.
-            sync: true,
-        }
-    }
-
-    /// Stamp an audit log entry on success. Empty `action` is a
-    /// programming error; rejected via debug_assert in builder.
-    pub fn audit(
-        mut self,
-        action: &'a str,
-        target: &'a str,
-        headers: &'a axum::http::HeaderMap,
-    ) -> Self {
-        debug_assert!(!action.is_empty(), "audit action must not be empty");
-        self.audit_action = Some(action);
-        self.audit_target = Some(target);
-        self.audit_headers = Some(headers);
-        self
-    }
-
-    /// Run a subsystem rebuild after the DB tx. `f` returns a
-    /// `Future` (typically an `async move {}` block) that the
-    /// framework awaits before triggering config sync — so the
-    /// synced DB state and the in-memory snapshot agree.
-    pub fn rebuild<C>(mut self, f: C) -> Self
-    where
-        C: FnOnce() -> F + Send + 'a,
-    {
-        self.rebuild = Some(Box::new(f));
-        self
-    }
-
-    /// Whether to fire `trigger_config_sync` after the rebuild.
-    /// Default `true`. Calling `.sync(false)` is an explicit
-    /// declaration that this mutation doesn't need cross-instance
-    /// propagation.
-    pub fn sync(mut self, sync: bool) -> Self {
-        self.sync = sync;
-        self
-    }
-
-    /// Execute the mutation: lock DB, run closure, drop guard,
-    /// audit, rebuild, sync. Returns the closure's value on
-    /// success or 404/500 status code on failure.
-    ///
-    /// The closure runs SYNCHRONOUSLY under the DB mutex; do not
-    /// await long-running operations inside it.
-    pub async fn run<T, E, M>(self, mutation: M) -> Result<T, axum::http::StatusCode>
-    where
-        M: FnOnce(&ConfigDb) -> Result<T, E>,
-        E: std::fmt::Display,
-    {
-        // Step 1: DB tx (delegates to with_config_db for parity
-        // with read-only handlers).
-        let result = with_config_db(self.state, self.op_label, mutation).await?;
-
-        // Step 2: audit (no-op if not configured).
-        if let (Some(action), Some(target), Some(headers)) =
-            (self.audit_action, self.audit_target, self.audit_headers)
-        {
-            audit_log(action, "", target, headers);
-        }
-
-        // Step 3: rebuild (no-op if not configured).
-        if let Some(rebuild) = self.rebuild {
-            rebuild().await;
-        }
-
-        // Step 4: sync (skip when explicitly disabled).
-        if self.sync {
-            trigger_config_sync(self.state);
-        }
-
-        Ok(result)
-    }
-}
-
 pub(crate) fn next_copy_name(base: &str, existing: impl IntoIterator<Item = String>) -> String {
     let existing: std::collections::HashSet<String> = existing.into_iter().collect();
     for n in 1.. {
@@ -436,37 +290,5 @@ mod tests {
         ];
 
         assert_eq!(next_copy_name("reader", existing), "reader (copy3)");
-    }
-
-    /// AdminMutation builder test: verifies the fluent API constructs
-    /// the expected internal state. End-to-end mutation flow is
-    /// covered by integration tests of the handlers that adopt the
-    /// framework — building a full `AdminState` for a unit test
-    /// here would require a dozen mock dependencies and add little
-    /// over the shape check this test provides.
-    #[tokio::test]
-    async fn admin_mutation_builder_records_audit_and_sync_flags() {
-        // We don't actually run the mutation — just verify the
-        // builder methods don't panic and the struct fields hold
-        // the expected values.
-        //
-        // We construct a placeholder Future type for `F` even
-        // though we never invoke `rebuild`. The compiler's type
-        // inference picks `std::future::Ready<()>` here.
-        let action = "create_thing";
-        let target = "thing-name";
-        let headers = axum::http::HeaderMap::new();
-
-        // We can't construct an AdminMutation without an
-        // AdminState; instead, this compile-time test verifies the
-        // public API surface compiles as documented. The doc-test
-        // in the AdminMutation::new doc-comment is the source of
-        // truth for the call shape.
-        //
-        // (Pre-fix: every mutation handler open-coded the same
-        // 5-step sequence with no compile-time guarantee that
-        // sync/audit/rebuild fired in order. This builder makes
-        // the order a property of the type, not the prose.)
-        let _ = (action, target, &headers); // silence unused vars
     }
 }

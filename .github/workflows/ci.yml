@@ -256,6 +256,15 @@ jobs:
             --test admin_section_test \
             --test bucket_existence_test \
             --test cli_admin_test \
+            --test cli_s3_bucket_acl_test \
+            --test cli_s3_cp_test \
+            --test cli_s3_ls_test \
+            --test cli_s3_migrate_test \
+            --test cli_s3_purge_test \
+            --test cli_s3_rm_test \
+            --test cli_s3_stats_test \
+            --test cli_s3_sync_test \
+            --test cli_s3_verify_test \
             --test config_sync_ha_test \
             --test config_sync_test \
             --test encryption_test \

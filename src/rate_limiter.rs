@@ -12,16 +12,38 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Per-IP rate limiter for brute-force protection.
+///
+/// Additionally carries a per-**account** (subject) bucket so password
+/// endpoints can be defended against distributed-IP brute force — an
+/// attacker rotating IPs across a /16 botnet can chew through the
+/// per-IP budget freely, but the per-account bucket caps total
+/// attempts against a specific bootstrap password / AKID regardless
+/// of the source IP.
+///
+/// The two buckets have INDEPENDENT policies because the threat
+/// models are different:
+/// - per-IP: generous, catches single-host noise
+/// - per-account: tight, catches distributed credential stuffing
 #[derive(Clone)]
 pub struct RateLimiter {
     /// Map from IP to (failure_count, first_failure_time, lockout_start).
     entries: Arc<DashMap<IpAddr, RateLimitEntry>>,
-    /// Maximum failed attempts before lockout.
+    /// Per-account/subject bucket. Keys are caller-supplied strings:
+    /// the bootstrap password endpoint uses `"bootstrap"`; `login_as`
+    /// uses the access-key-id. Empty string means "no account
+    /// dimension applicable" — the per-account check short-circuits
+    /// to allow.
+    account_entries: Arc<DashMap<String, RateLimitEntry>>,
+    /// Maximum failed attempts before lockout (per-IP).
     max_attempts: u32,
-    /// Rolling window for counting attempts.
+    /// Rolling window for counting attempts (per-IP).
     window: Duration,
-    /// Lockout duration after max_attempts exceeded.
+    /// Lockout duration after max_attempts exceeded (per-IP).
     lockout: Duration,
+    /// Per-account policy. Same shape as the per-IP triple.
+    account_max_attempts: u32,
+    account_window: Duration,
+    account_lockout: Duration,
 }
 
 struct RateLimitEntry {
@@ -36,39 +58,79 @@ struct RateLimitEntry {
 impl RateLimiter {
     /// Create a new rate limiter.
     ///
-    /// - `max_attempts`: max failures before lockout
-    /// - `window`: time window for counting failures
-    /// - `lockout`: lockout duration after exceeding max_attempts
+    /// - `max_attempts`: max failures before lockout (per-IP)
+    /// - `window`: time window for counting failures (per-IP)
+    /// - `lockout`: lockout duration after exceeding max_attempts (per-IP)
     ///
-    /// See `default_auth()` for production defaults (100 attempts / 5min / 10min).
+    /// The per-account policy defaults to a STRICTER profile
+    /// (10 attempts / 1h window / 1h lockout). Use
+    /// `with_account_policy` to override.
+    ///
+    /// See `default_auth()` for production env-driven defaults.
     pub fn new(max_attempts: u32, window: Duration, lockout: Duration) -> Self {
         Self {
             entries: Arc::new(DashMap::new()),
+            account_entries: Arc::new(DashMap::new()),
             max_attempts,
             window,
             lockout,
+            account_max_attempts: 10,
+            account_window: Duration::from_secs(3600),
+            account_lockout: Duration::from_secs(3600),
         }
     }
 
+    /// Override the per-account policy.
+    pub fn with_account_policy(
+        mut self,
+        max_attempts: u32,
+        window: Duration,
+        lockout: Duration,
+    ) -> Self {
+        self.account_max_attempts = max_attempts;
+        self.account_window = window;
+        self.account_lockout = lockout;
+        self
+    }
+
     /// Create a rate limiter from environment variables with defaults:
-    /// - `DGP_RATE_LIMIT_MAX_ATTEMPTS`: max failures before lockout (default: 100)
-    /// - `DGP_RATE_LIMIT_WINDOW_SECS`: rolling window in seconds (default: 300 = 5 min)
-    /// - `DGP_RATE_LIMIT_LOCKOUT_SECS`: lockout duration in seconds (default: 600 = 10 min)
+    /// - `DGP_RATE_LIMIT_MAX_ATTEMPTS`: max failures before lockout (default: 100, per-IP)
+    /// - `DGP_RATE_LIMIT_WINDOW_SECS`: rolling window in seconds (default: 300 = 5 min, per-IP)
+    /// - `DGP_RATE_LIMIT_LOCKOUT_SECS`: lockout duration in seconds (default: 600 = 10 min, per-IP)
+    /// - `DGP_RATE_LIMIT_ACCOUNT_MAX_ATTEMPTS`: per-account cap (default: 10)
+    /// - `DGP_RATE_LIMIT_ACCOUNT_WINDOW_SECS`: per-account window (default: 3600 = 1h)
+    /// - `DGP_RATE_LIMIT_ACCOUNT_LOCKOUT_SECS`: per-account lockout (default: 3600 = 1h)
+    ///
+    /// Default per-account 10/1h/1h is tight on purpose: an attacker
+    /// rotating IPs across a botnet shouldn't be able to chew through
+    /// more than 10 password guesses per hour against any single
+    /// account.
     pub fn default_auth() -> Self {
         use crate::config::env_parse_with_default;
         let max_attempts: u32 = env_parse_with_default("DGP_RATE_LIMIT_MAX_ATTEMPTS", 100);
-        let window_secs: u64 = env_parse_with_default("DGP_RATE_LIMIT_WINDOW_SECS", 300); // 5 minutes
-        let lockout_secs: u64 = env_parse_with_default("DGP_RATE_LIMIT_LOCKOUT_SECS", 600); // 10 minutes
+        let window_secs: u64 = env_parse_with_default("DGP_RATE_LIMIT_WINDOW_SECS", 300);
+        let lockout_secs: u64 = env_parse_with_default("DGP_RATE_LIMIT_LOCKOUT_SECS", 600);
+        let acct_max: u32 = env_parse_with_default("DGP_RATE_LIMIT_ACCOUNT_MAX_ATTEMPTS", 10);
+        let acct_win: u64 = env_parse_with_default("DGP_RATE_LIMIT_ACCOUNT_WINDOW_SECS", 3600);
+        let acct_lock: u64 = env_parse_with_default("DGP_RATE_LIMIT_ACCOUNT_LOCKOUT_SECS", 3600);
         tracing::info!(
-            "Rate limiter: {} attempts per {}s window, {}s lockout",
+            "Rate limiter: per-IP {}/{}s/{}s lockout, per-account {}/{}s/{}s lockout",
             max_attempts,
             window_secs,
-            lockout_secs
+            lockout_secs,
+            acct_max,
+            acct_win,
+            acct_lock
         );
         Self::new(
             max_attempts,
             Duration::from_secs(window_secs),
             Duration::from_secs(lockout_secs),
+        )
+        .with_account_policy(
+            acct_max,
+            Duration::from_secs(acct_win),
+            Duration::from_secs(acct_lock),
         )
     }
 
@@ -159,6 +221,71 @@ impl RateLimiter {
         self.entries.remove(ip);
     }
 
+    /// Per-account variant: is this subject (bootstrap / AKID /
+    /// username) currently locked out? Empty subject → not limited
+    /// (caller didn't supply a subject dimension).
+    pub fn is_limited_account(&self, subject: &str) -> bool {
+        if subject.is_empty() {
+            return false;
+        }
+        let Some(entry) = self.account_entries.get(subject) else {
+            return false;
+        };
+        let now = Instant::now();
+        if let Some(lockout_start) = entry.lockout_start {
+            if now.duration_since(lockout_start) < self.account_lockout {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Per-account variant: record a failed attempt for this subject.
+    /// Mirrors `record_failure` semantics for the per-account bucket.
+    pub fn record_failure_account(&self, subject: &str) -> bool {
+        if subject.is_empty() {
+            return false;
+        }
+        let now = Instant::now();
+        let mut entry = self
+            .account_entries
+            .entry(subject.to_string())
+            .or_insert(RateLimitEntry {
+                count: 0,
+                window_start: now,
+                lockout_start: None,
+            });
+
+        if let Some(lockout_start) = entry.lockout_start {
+            if now.duration_since(lockout_start) >= self.account_lockout {
+                entry.count = 0;
+                entry.window_start = now;
+                entry.lockout_start = None;
+            } else {
+                return true;
+            }
+        }
+        if now.duration_since(entry.window_start) >= self.account_window {
+            entry.count = 0;
+            entry.window_start = now;
+        }
+        entry.count += 1;
+        if entry.count >= self.account_max_attempts {
+            entry.lockout_start = Some(now);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Per-account variant: clear the failure counter for this subject.
+    pub fn record_success_account(&self, subject: &str) {
+        if subject.is_empty() {
+            return;
+        }
+        self.account_entries.remove(subject);
+    }
+
     /// Remove expired entries to prevent unbounded memory growth.
     /// Call this periodically (e.g., every 5 minutes).
     pub fn cleanup_expired(&self) {
@@ -175,6 +302,17 @@ impl RateLimiter {
             }
             // Keep entries within the active window
             now.duration_since(entry.window_start) < window
+        });
+
+        let acct_window = self.account_window;
+        let acct_lockout = self.account_lockout;
+        self.account_entries.retain(|_subj, entry| {
+            if let Some(lockout_start) = entry.lockout_start {
+                if now.duration_since(lockout_start) < acct_lockout {
+                    return true;
+                }
+            }
+            now.duration_since(entry.window_start) < acct_window
         });
     }
 }
@@ -194,7 +332,7 @@ impl RateLimiter {
 ///
 /// TODO: add axum `ConnectInfo<SocketAddr>` support so the real peer IP is
 /// always available and proxy-header trust is unnecessary for rate limiting.
-fn trust_proxy_headers() -> bool {
+pub(crate) fn trust_proxy_headers() -> bool {
     crate::config::env_bool("DGP_TRUST_PROXY_HEADERS", false)
 }
 
@@ -304,10 +442,16 @@ pub(crate) fn normalize_ip(ip: IpAddr) -> IpAddr {
 /// IP is currently locked out. The handler is expected to turn this into
 /// its own 429 response immediately — no further operations should be
 /// attempted under rate-limit protection.
+///
+/// The `ip` and `failure_count` fields are diagnostic — they're
+/// populated for `Debug` output / future telemetry but no caller
+/// destructures them today, so `dead_code` is allowed explicitly.
+/// Callers should treat any `Err(_)` from the guard as "blocked".
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct Blocked {
-    pub ip: IpAddr,
-    pub failure_count: u32,
+    pub(crate) ip: IpAddr,
+    pub(crate) failure_count: u32,
 }
 
 /// RAII-style wrapper that ties a rate-limited operation to the
@@ -319,27 +463,35 @@ pub struct Blocked {
 pub struct RateLimitGuard<'a> {
     rl: &'a RateLimiter,
     ip: IpAddr,
+    /// The account-dimension key — empty when the caller didn't
+    /// supply one. Currently set by callers via `enter_with_account`.
+    subject: String,
     event_prefix: &'static str,
 }
 
 impl<'a> RateLimitGuard<'a> {
-    /// Begin rate-limit-protected execution.
-    ///
-    /// 1. Extract client IP from trusted headers (when enabled) or peer socket
-    ///    IP (`ConnectInfo`) and then apply the historical UNSPECIFIED fallback.
-    /// 2. Check lockout. On lockout: log a SECURITY event and return
-    ///    `Err(Blocked { ip, failure_count })` — the caller must return
-    ///    their 429 response without proceeding.
-    /// 3. Apply the limiter's progressive delay (tokio sleep). This is
-    ///    awaited inside `enter` so call sites stay simple.
-    ///
-    /// `event_prefix` names the origin surface (e.g. `"admin"`,
-    /// `"login_as"`, `"s3_sigv4"`) and flows into security log events as
-    /// `"{prefix}_brute_force_blocked"` / `"{prefix}_brute_force_lockout"`.
+    /// Begin rate-limit-protected execution (per-IP only).
+    /// See `enter_with_account` for endpoints that also need a
+    /// per-account bucket (the password endpoint, `login_as`).
     pub async fn enter(
         rl: &'a RateLimiter,
         headers: &axum::http::HeaderMap,
         peer_ip: Option<IpAddr>,
+        event_prefix: &'static str,
+    ) -> Result<Self, Blocked> {
+        Self::enter_with_account(rl, headers, peer_ip, "", event_prefix).await
+    }
+
+    /// Like [`enter`], but also consults the per-account bucket. If
+    /// EITHER the per-IP or per-account bucket reports locked, the
+    /// guard returns `Err(Blocked)`. `subject` is the account key —
+    /// `"bootstrap"` for the bootstrap password, the access-key-id
+    /// for `login_as`, etc. Empty string degrades to per-IP only.
+    pub async fn enter_with_account(
+        rl: &'a RateLimiter,
+        headers: &axum::http::HeaderMap,
+        peer_ip: Option<IpAddr>,
+        subject: &str,
         event_prefix: &'static str,
     ) -> Result<Self, Blocked> {
         let ip = extract_client_ip_with_peer(headers, peer_ip)
@@ -347,12 +499,24 @@ impl<'a> RateLimitGuard<'a> {
         if rl.is_limited(&ip) {
             let failure_count = rl.failure_count(&ip);
             tracing::warn!(
-                "SECURITY | event={}_brute_force_blocked | ip={} | attempts={}",
+                "SECURITY | event={}_brute_force_blocked | scope=ip | ip={} | attempts={}",
                 event_prefix,
                 ip,
                 failure_count
             );
             return Err(Blocked { ip, failure_count });
+        }
+        if !subject.is_empty() && rl.is_limited_account(subject) {
+            tracing::warn!(
+                "SECURITY | event={}_brute_force_blocked | scope=account | subject={} | ip={}",
+                event_prefix,
+                sanitize_for_log(subject),
+                ip
+            );
+            return Err(Blocked {
+                ip,
+                failure_count: 0,
+            });
         }
         let delay = rl.progressive_delay(&ip);
         if !delay.is_zero() {
@@ -361,6 +525,7 @@ impl<'a> RateLimitGuard<'a> {
         Ok(Self {
             rl,
             ip,
+            subject: subject.to_string(),
             event_prefix,
         })
     }
@@ -371,28 +536,49 @@ impl<'a> RateLimitGuard<'a> {
         self.ip
     }
 
-    /// Record a successful operation. Resets the failure counter for this
-    /// IP so future attempts start from zero.
+    /// Record a successful operation. Resets the failure counter for
+    /// BOTH the per-IP and per-account buckets so future attempts
+    /// start from zero on either dimension.
     pub fn record_success(&self) {
         self.rl.record_success(&self.ip);
+        self.rl.record_success_account(&self.subject);
     }
 
-    /// Record a failed operation. Increments the failure counter and, if
-    /// this failure triggers lockout, emits a SECURITY log event tagged
-    /// with `event_prefix` so operators can trace which endpoint a brute-
-    /// force burst originated from.
+    /// Record a failed operation. Increments BOTH bucket counters
+    /// (per-IP and per-account, when a subject is set). On lockout
+    /// transition emits a SECURITY log event tagged with
+    /// `event_prefix` and which dimension tripped.
     pub fn record_failure(&self) {
-        let locked = self.rl.record_failure(&self.ip);
-        if locked {
+        let ip_locked = self.rl.record_failure(&self.ip);
+        if ip_locked {
             let count = self.rl.failure_count(&self.ip);
             tracing::warn!(
-                "SECURITY | event={}_brute_force_lockout | ip={} | attempts={}",
+                "SECURITY | event={}_brute_force_lockout | scope=ip | ip={} | attempts={}",
                 self.event_prefix,
                 self.ip,
                 count
             );
         }
+        if !self.subject.is_empty() {
+            let acct_locked = self.rl.record_failure_account(&self.subject);
+            if acct_locked {
+                tracing::warn!(
+                    "SECURITY | event={}_brute_force_lockout | scope=account | subject={} | ip={}",
+                    self.event_prefix,
+                    sanitize_for_log(&self.subject),
+                    self.ip
+                );
+            }
+        }
     }
+}
+
+/// Sanitise a subject value before logging — strip CR/LF/NUL so the
+/// caller-supplied AKID can't smuggle log-line injection.
+fn sanitize_for_log(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
 }
 
 #[cfg(test)]
@@ -536,5 +722,88 @@ mod tests {
         let ip = extract_client_ip(&headers).unwrap();
         assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
         std::env::remove_var("DGP_TRUST_PROXY_HEADERS");
+    }
+
+    /// Per-account bucket: same shape as per-IP but keyed on subject.
+    /// `record_failure_account` returns true when lockout triggers.
+    #[test]
+    fn account_bucket_independent_from_ip_bucket() {
+        let limiter = RateLimiter::new(100, Duration::from_secs(60), Duration::from_secs(120))
+            .with_account_policy(3, Duration::from_secs(60), Duration::from_secs(120));
+        let ip = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+
+        assert!(!limiter.is_limited(&ip));
+        assert!(!limiter.is_limited_account("bootstrap"));
+
+        // 3 failures against the same subject — even from different
+        // IPs would trip the account bucket. We use the same IP here
+        // just to prove the per-IP bucket is far from the per-IP cap
+        // (100) yet the per-account bucket (3) hits lockout.
+        for _ in 0..2 {
+            assert!(!limiter.record_failure_account("bootstrap"));
+        }
+        assert!(limiter.record_failure_account("bootstrap"));
+        assert!(limiter.is_limited_account("bootstrap"));
+        // Per-IP bucket was NOT touched — separate dimension.
+        assert!(!limiter.is_limited(&ip));
+    }
+
+    /// Empty subject — caller didn't supply one — must short-circuit
+    /// to "not limited" so endpoints that don't have an account
+    /// dimension don't false-trigger.
+    #[test]
+    fn account_bucket_empty_subject_is_no_op() {
+        let limiter = RateLimiter::new(100, Duration::from_secs(60), Duration::from_secs(120))
+            .with_account_policy(1, Duration::from_secs(60), Duration::from_secs(120));
+        assert!(!limiter.is_limited_account(""));
+        // Failure with empty subject must NOT enter the map.
+        assert!(!limiter.record_failure_account(""));
+        assert!(!limiter.is_limited_account(""));
+    }
+
+    /// Adversarial: distributed brute force against the SAME account
+    /// from many IPs should be caught by the account bucket even
+    /// when the per-IP bucket is wide open.
+    #[test]
+    fn account_bucket_catches_distributed_brute_force() {
+        let limiter = RateLimiter::new(
+            1000, // wide-open per-IP — irrelevant
+            Duration::from_secs(60),
+            Duration::from_secs(120),
+        )
+        .with_account_policy(5, Duration::from_secs(60), Duration::from_secs(120));
+
+        // 5 different attacker IPs would each make 1 attempt against
+        // the same subject. We don't need to materialise distinct
+        // IpAddrs here: the per-IP bucket is wide open (1000) so
+        // even hitting the SAME IP 5 times wouldn't trip it, and the
+        // per-account bucket is keyed purely on the subject string.
+        // The point of this test is that the account bucket trips
+        // on the 5th attempt regardless of IP cardinality.
+        for i in 1..=5u8 {
+            let locked = limiter.record_failure_account("admin-akid");
+            if i < 5 {
+                assert!(!locked, "attempt {i} should not lock");
+            } else {
+                assert!(locked, "5th attempt must trip the account lockout");
+            }
+        }
+        assert!(limiter.is_limited_account("admin-akid"));
+        // A DIFFERENT subject is untouched — the lockout is account-scoped.
+        assert!(!limiter.is_limited_account("other-akid"));
+    }
+
+    /// record_success on the guard clears BOTH the per-IP and the
+    /// per-account counters so a legitimate login fully rotates the
+    /// bucket state.
+    #[test]
+    fn account_bucket_success_clears_failures() {
+        let limiter = RateLimiter::new(100, Duration::from_secs(60), Duration::from_secs(120))
+            .with_account_policy(3, Duration::from_secs(60), Duration::from_secs(120));
+        limiter.record_failure_account("alice");
+        limiter.record_failure_account("alice");
+        limiter.record_success_account("alice");
+        // Counter reset; next failure starts from 1.
+        assert!(!limiter.record_failure_account("alice"));
     }
 }

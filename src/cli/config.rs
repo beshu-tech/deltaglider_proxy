@@ -20,6 +20,12 @@ pub const EXIT_PARSE: i32 = 4;
 pub const EXIT_HTTP: i32 = 5;
 pub const EXIT_REJECTED: i32 = 6;
 pub const EXIT_AUTH: i32 = 7;
+/// S3 object / bucket not found (NoSuchKey / NoSuchBucket).
+pub const EXIT_NOT_FOUND: i32 = 8;
+/// `verify` hash mismatch — object content does not match metadata.
+pub const EXIT_INTEGRITY: i32 = 9;
+/// Recursive command finished with mixed success/failure across keys.
+pub const EXIT_PARTIAL: i32 = 10;
 
 /// `config migrate <input> [--out <output>]`
 ///

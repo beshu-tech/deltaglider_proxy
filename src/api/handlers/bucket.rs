@@ -79,9 +79,9 @@ pub async fn bucket_get_handler(
     auth_user: Option<axum::Extension<AuthenticatedUser>>,
     list_scope: Option<axum::Extension<ListScope>>,
 ) -> Result<Response, S3Error> {
-    // The `auth_user` is still used by logging/audit elsewhere, but the
-    // filtering decision lives in `list_scope`, set by the IAM middleware.
-    let _ = &auth_user;
+    // The `auth_user` is now consulted for the `metadata=true`
+    // anonymous-strip below; the per-object filtering decision still
+    // lives in `list_scope`, set by the IAM middleware.
     // GET /{bucket}?tagging — return 501 NotImplemented.
     // M4 correctness fix (consistent with object tagging): we don't
     // store bucket tags, so returning a hardcoded empty TagSet
@@ -177,8 +177,20 @@ pub async fn bucket_get_handler(
         if is_v2 { "2" } else { "1" }
     );
 
-    // MinIO extension: metadata=true enriches ListObjectsV2 with per-object user metadata
-    let include_metadata = is_v2 && query.metadata.unwrap_or(false);
+    // MinIO extension: metadata=true enriches ListObjectsV2 with
+    // per-object user metadata.
+    //
+    // SECURITY: We strip this for the synthesized `$anonymous` user
+    // hitting a public_prefix. `public_prefixes` is intended to
+    // publish artifacts; bucket owners often stash internal-looking
+    // strings (CI run IDs, internal usernames, signing-key hashes)
+    // as `x-amz-meta-*` and don't expect those to leak to the world.
+    // Anyone who legitimately wants metadata is authenticated.
+    let is_anonymous = auth_user
+        .as_ref()
+        .map(|u| u.access_key_id == "$anonymous")
+        .unwrap_or(false);
+    let include_metadata = is_v2 && query.metadata.unwrap_or(false) && !is_anonymous;
 
     // Engine handles prefix filtering, delimiter collapsing, and pagination as
     // a single atomic operation (they're coupled: CommonPrefixes count toward
@@ -537,8 +549,14 @@ fn validate_bucket_name(name: &str) -> Result<(), S3Error> {
         ));
     }
 
-    // Cannot be formatted as IP address (four groups of 1-3 digits separated by dots)
-    if is_ip_format(name) {
+    // Cannot be formatted as IP address. The local `is_ip_format`
+    // catches the standard dotted-quad shape; we ALSO defer to the
+    // central `bucket_name_is_ip_like` validator that catches the
+    // decimal-single-token (`2130706433`), hex (`0x7f000001`), octal
+    // (`0177.0.0.1`), and BSD-shorthand (`127.1`) forms which clients
+    // and SSRF allowlists sometimes treat as IPs even though our
+    // simple dotted parser doesn't.
+    if is_ip_format(name) || crate::security::bucket_name_is_ip_like(name) {
         return Err(S3Error::InvalidBucketName(
             "Bucket name must not be formatted as an IP address".to_string(),
         ));
@@ -547,7 +565,9 @@ fn validate_bucket_name(name: &str) -> Result<(), S3Error> {
     Ok(())
 }
 
-/// Check if a string looks like an IP address (e.g. 192.168.1.1)
+/// Check if a string looks like an IP address (e.g. 192.168.1.1).
+/// Retained for legacy callers and for the proptest; the broader
+/// detector lives in `crate::security::bucket_name_is_ip_like`.
 fn is_ip_format(s: &str) -> bool {
     let parts: Vec<&str> = s.split('.').collect();
     if parts.len() != 4 {
@@ -742,7 +762,14 @@ mod tests {
             (".my-bucket", "must start with alphanumeric (dot)"),
             // Repeated delimiters
             ("my..bucket", "consecutive dots are forbidden"),
-            // IP-format (this rule exists ONLY here, not in the extractor)
+            // IP-format (this rule exists ONLY here, not in the extractor).
+            // The legacy dotted-quad check + the central
+            // `bucket_name_is_ip_like` validator catch every IP-like
+            // bucket name AWS itself rejects. Single-token numerics
+            // (e.g. `2130706433`) are NOT rejected: they collide with
+            // legitimate bucket names like `0400`, and the SSRF
+            // surface they'd otherwise feed is already covered by the
+            // outbound-URL guard.
             ("192.168.1.1", "four dotted digit-groups is IP-format"),
             ("10.0.0.1", "four dotted digit-groups is IP-format"),
         ];
@@ -817,7 +844,7 @@ mod tests {
         if !first.is_ascii_alphanumeric() || !last.is_ascii_alphanumeric() {
             return false;
         }
-        if is_ip_format(name) {
+        if is_ip_format(name) || crate::security::bucket_name_is_ip_like(name) {
             return false;
         }
         true
@@ -850,7 +877,15 @@ mod tests {
         fn prop_well_formed_names_are_accepted(
             name in "[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]"
                 .prop_filter("no consecutive dots", |s| !s.contains(".."))
-                .prop_filter("not IP-format", |s| !is_ip_format(s))
+                .prop_filter("not IP-format (legacy)", |s| !is_ip_format(s))
+                // The central `bucket_name_is_ip_like` catches dotted
+                // shapes like `0.0` (BSD shorthand for 0.0.0.0) and
+                // `0x7f.0.0.1` that the legacy validator misses but
+                // AWS still rejects. Pre-filter so we don't generate
+                // them in the "should be accepted" set.
+                .prop_filter("not IP-format (any radix)", |s| {
+                    !crate::security::bucket_name_is_ip_like(s)
+                })
         ) {
             prop_assert!(
                 validate_bucket_name(&name).is_ok(),

@@ -43,6 +43,34 @@ export default defineConfig({
   },
   build: {
     sourcemap: true,
+    // Source maps stay on disk for local debugging / Sentry upload but
+    // are excluded from the Rust-embedded binary via the `#[exclude]`
+    // attribute on `DemoAssets` (see src/demo.rs).
+    //
+    // manualChunks: split heavy vendor libs out of the main shell so
+    // the file-browser entry only downloads what it needs on first
+    // paint. AntD, AWS SDK, markdown stack, and dnd-kit are all
+    // independently cacheable across page navigations.
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          'antd': ['antd', '@ant-design/icons'],
+          'aws-sdk': [
+            '@aws-sdk/client-s3',
+            '@aws-sdk/lib-storage',
+            '@aws-sdk/s3-request-presigner',
+          ],
+          'markdown': [
+            'react-markdown',
+            'remark-gfm',
+            'rehype-highlight',
+            'rehype-slug',
+          ],
+          'dnd': ['@dnd-kit/core', '@dnd-kit/sortable', '@dnd-kit/utilities'],
+          'forms': ['react-hook-form', '@hookform/resolvers', 'zod'],
+        },
+      },
+    },
   },
   server: {
     proxy: {

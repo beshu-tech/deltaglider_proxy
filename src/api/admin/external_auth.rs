@@ -5,7 +5,7 @@
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Redirect, Response},
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -72,6 +72,53 @@ pub(crate) fn sanitize_next_param(raw: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
+/// Name of the OAuth-state binding cookie.
+const OAUTH_STATE_COOKIE: &str = "dgp_oauth_state";
+
+/// Build the OAuth state-binding cookie. `SameSite=Lax` is required:
+/// the IdP→our-proxy redirect is a cross-site GET, and Strict would
+/// drop the cookie. `Path` is scoped to the OAuth endpoints so the
+/// cookie isn't sent on every admin API call. Short Max-Age (5 min)
+/// bounds the flow window.
+fn oauth_state_cookie(state_token: &str, req_headers: &HeaderMap) -> String {
+    let secure = if super::auth::secure_cookies_with(Some(req_headers)) {
+        "; Secure"
+    } else {
+        ""
+    };
+    format!(
+        "{}={}; HttpOnly; SameSite=Lax; Path=/_/api/admin/oauth; Max-Age=300{}",
+        OAUTH_STATE_COOKIE, state_token, secure
+    )
+}
+
+/// Build a cookie that clears the OAuth state cookie. Returned on
+/// the callback so the binding token doesn't linger past the flow.
+fn oauth_state_clear_cookie(req_headers: &HeaderMap) -> String {
+    let secure = if super::auth::secure_cookies_with(Some(req_headers)) {
+        "; Secure"
+    } else {
+        ""
+    };
+    format!(
+        "{}=; HttpOnly; SameSite=Lax; Path=/_/api/admin/oauth; Max-Age=0{}",
+        OAUTH_STATE_COOKIE, secure
+    )
+}
+
+/// Read the OAuth state-binding cookie from the request headers.
+/// Pure: no I/O, just `Cookie:` header parsing.
+fn extract_oauth_state_cookie(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .map(|s| s.trim())
+        .find_map(|c| c.strip_prefix(&format!("{OAUTH_STATE_COOKIE}=")))
+        .map(|v| v.to_string())
+}
+
 /// GET /api/admin/oauth/authorize/:provider — initiate OAuth flow.
 /// Returns 302 redirect to the provider's authorization endpoint.
 /// Accepts optional `?next=/path` for post-login deep linking.
@@ -92,6 +139,28 @@ pub async fn oauth_authorize(
 
     let next_url = params.next.and_then(|n| sanitize_next_param(&n));
 
+    // Rate-limit: the first hit triggers `discover().await` which
+    // makes an outbound HTTP fetch — pair this with the SSRF guards
+    // and a hostile caller can still drive a flood of outbound
+    // requests at any pace. Same bucket as the callback (per-IP).
+    let guard = match crate::rate_limiter::RateLimitGuard::enter(
+        &state.rate_limiter,
+        &req_headers,
+        connect_info.as_ref().map(|ci| ci.0.ip()),
+        "oauth_authorize",
+    )
+    .await
+    {
+        Ok(g) => g,
+        Err(_) => {
+            return error_page(
+                "Too Many Requests",
+                "Too many authentication attempts. Please wait and try again.",
+            )
+            .into_response();
+        }
+    };
+
     // Build redirect URI from the request's Host header
     let redirect_uri = build_callback_uri(&req_headers);
 
@@ -110,7 +179,30 @@ pub async fn oauth_authorize(
     }
 
     match ext_auth.initiate_auth(&provider_name, &redirect_uri, client_ip, next_url) {
-        Ok(auth_req) => Redirect::temporary(&auth_req.redirect_url).into_response(),
+        Ok(auth_req) => {
+            // Reset the rate limiter — legitimate initiation succeeded.
+            guard.record_success();
+            // Bind the OAuth `state` token to THIS browser via a
+            // short-lived cookie. On callback we cross-check the
+            // query-string state against this cookie value; a hostile
+            // page that learns a state token from logs / referrer /
+            // an opened-callback-link can no longer drive the
+            // victim's browser through the flow because they don't
+            // have the cookie.
+            //
+            // SameSite=Lax is mandatory: the IdP→our-proxy redirect
+            // is a cross-site GET, and Strict would drop the cookie.
+            // Short max-age (5 min) bounds the flow window.
+            let oauth_state_cookie = oauth_state_cookie(&auth_req.state, &req_headers);
+            (
+                StatusCode::TEMPORARY_REDIRECT,
+                [
+                    (axum::http::header::LOCATION, auth_req.redirect_url),
+                    (axum::http::header::SET_COOKIE, oauth_state_cookie),
+                ],
+            )
+                .into_response()
+        }
         Err(ExternalAuthError::ProviderNotFound(_)) => {
             (StatusCode::NOT_FOUND, "Provider not found").into_response()
         }
@@ -207,6 +299,39 @@ pub async fn oauth_callback(
             return error_page("Authentication Failed", "Missing state parameter").into_response();
         }
     };
+
+    // CSRF defence: the `state` in the query MUST match the cookie
+    // we dropped at `authorize`. A third party that learned the state
+    // (logs / referrer / a poisoned-callback-link) can't drive THIS
+    // browser through the flow because they don't have the cookie.
+    // Done BEFORE consuming the pending entry so a forged callback
+    // can't burn the legitimate user's state token.
+    let cookie_state = extract_oauth_state_cookie(&req_headers);
+    let state_binding_ok = cookie_state
+        .as_deref()
+        .map(|c| {
+            use subtle::ConstantTimeEq;
+            c.as_bytes().ct_eq(state_token.as_bytes()).into()
+        })
+        .unwrap_or(false);
+    if !state_binding_ok {
+        tracing::warn!(
+            "OAuth callback rejected: state cookie mismatch (cookie_present={})",
+            cookie_state.is_some()
+        );
+        guard.record_failure();
+        return (
+            [(
+                axum::http::header::SET_COOKIE,
+                oauth_state_clear_cookie(&req_headers),
+            )],
+            error_page(
+                "Authentication Failed",
+                "Authentication state cookie missing or mismatched. Please restart the sign-in flow.",
+            ),
+        )
+            .into_response();
+    }
 
     let ext_auth = match &state.external_auth {
         Some(ea) => ea,
@@ -388,6 +513,10 @@ pub async fn oauth_callback(
     // Successful OAuth login — reset rate limiter for this IP
     guard.record_success();
 
+    // Rotate the session: drop any pre-login cookie so an XSS-leaked
+    // earlier token can't outlive the OAuth flow.
+    super::auth::drop_prior_session(&state, &req_headers);
+
     // Create session — use raw Option<IpAddr> so session validation sees the same value
     let token = state.sessions.create_session(
         client_ip_for_session,
@@ -414,7 +543,9 @@ pub async fn oauth_callback(
         &req_headers,
     );
 
-    let cookie = super::auth::session_cookie(&token, state.sessions.ttl());
+    let cookie =
+        super::auth::session_cookie_with_headers(&token, state.sessions.ttl(), Some(&req_headers));
+    let clear_oauth_state = oauth_state_clear_cookie(&req_headers);
 
     // Determine redirect target:
     // 1. Use the `next` param from the original authorize request (stored in PendingAuth)
@@ -454,6 +585,7 @@ pub async fn oauth_callback(
         .status(StatusCode::FOUND)
         .header(header::LOCATION, redirect_to)
         .header(header::SET_COOKIE, &cookie)
+        .header(header::SET_COOKIE, &clear_oauth_state)
         .body(axum::body::Body::empty())
     {
         Ok(resp) => resp.into_response(),
@@ -622,7 +754,7 @@ pub async fn create_mapping(
     }
 
     // Validate regex if applicable
-    if body.match_type == "email_regex" && regex::Regex::new(&body.match_value).is_err() {
+    if body.match_type == "email_regex" && regex_lite::Regex::new(&body.match_value).is_err() {
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -665,7 +797,7 @@ pub async fn update_mapping(
         .unwrap_or(false);
     if is_regex_type {
         if let Some(ref val) = body.match_value {
-            if regex::Regex::new(val).is_err() {
+            if regex_lite::Regex::new(val).is_err() {
                 return Err(StatusCode::BAD_REQUEST);
             }
         }
@@ -920,8 +1052,12 @@ fn symmetric_diff_count(a: &[i64], b: &[i64]) -> usize {
 }
 
 #[cfg(test)]
-mod sanitize_next_param_tests {
-    use super::sanitize_next_param;
+mod tests {
+    use super::{
+        extract_oauth_state_cookie, oauth_state_clear_cookie, oauth_state_cookie,
+        sanitize_next_param,
+    };
+    use axum::http::HeaderMap;
 
     #[test]
     fn accepts_safe_local_paths() {
@@ -977,5 +1113,68 @@ mod sanitize_next_param_tests {
         // Legitimate paths use %20; a literal space here is an
         // injection attempt or malformed input.
         assert_eq!(sanitize_next_param("/_/admin path"), None);
+    }
+
+    /// Adversarial: the OAuth state-binding cookie must have the right
+    /// shape — SameSite=Lax (the IdP→our-proxy redirect IS cross-site
+    /// GET, so Strict would drop it), Path scoped to the OAuth
+    /// endpoints, HttpOnly, short Max-Age, and `Secure` when the
+    /// caller's headers indicate HTTPS via X-Forwarded-Proto.
+    #[test]
+    fn oauth_state_cookie_shape() {
+        let h = HeaderMap::new();
+        let c = oauth_state_cookie("STATE_TOKEN", &h);
+        assert!(c.contains("dgp_oauth_state=STATE_TOKEN"), "{c}");
+        assert!(c.contains("HttpOnly"), "{c}");
+        assert!(c.contains("SameSite=Lax"), "{c}");
+        assert!(c.contains("Path=/_/api/admin/oauth"), "{c}");
+        assert!(c.contains("Max-Age=300"), "{c}");
+    }
+
+    /// Adversarial: `extract_oauth_state_cookie` picks the state out
+    /// of a multi-cookie header without confusing the prefix.
+    #[test]
+    fn extract_oauth_state_cookie_picks_right_value() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::COOKIE,
+            "foo=bar; dgp_oauth_state=xyz123; dgp_session=zzz"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(extract_oauth_state_cookie(&h).as_deref(), Some("xyz123"));
+
+        // Missing cookie → None.
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::COOKIE,
+            "foo=bar; baz=qux".parse().unwrap(),
+        );
+        assert_eq!(extract_oauth_state_cookie(&h), None);
+
+        // No cookie header at all → None.
+        assert_eq!(extract_oauth_state_cookie(&HeaderMap::new()), None);
+
+        // Prefix-confusion regression: `dgp_oauth_state_bait=…`
+        // must NOT match `dgp_oauth_state=…`.
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::COOKIE,
+            "dgp_oauth_state_bait=ATTACKER".parse().unwrap(),
+        );
+        assert_eq!(extract_oauth_state_cookie(&h), None);
+    }
+
+    /// `oauth_state_clear_cookie` issues a cookie with the same
+    /// Path + SameSite + HttpOnly profile and Max-Age=0 so the
+    /// browser actually overrides + deletes the binding cookie.
+    #[test]
+    fn oauth_state_clear_cookie_shape() {
+        let h = HeaderMap::new();
+        let c = oauth_state_clear_cookie(&h);
+        assert!(c.contains("dgp_oauth_state="), "{c}");
+        assert!(c.contains("Max-Age=0"), "{c}");
+        assert!(c.contains("Path=/_/api/admin/oauth"), "{c}");
+        assert!(c.contains("SameSite=Lax"), "{c}");
     }
 }

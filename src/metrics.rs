@@ -494,13 +494,16 @@ pub async fn http_metrics_middleware(
 
     let status = response.status().as_u16().to_string();
 
+    // prometheus 0.14 widened `with_label_values` to a uniform-type
+    // slice: pass `&str` for every element, not a mix of `&String`
+    // (method/status are owned) and `&'static str` (operation).
     metrics
         .http_requests_total
-        .with_label_values(&[&method, &status, operation])
+        .with_label_values(&[method.as_str(), status.as_str(), operation])
         .inc();
     metrics
         .http_request_duration_seconds
-        .with_label_values(&[&method, operation])
+        .with_label_values(&[method.as_str(), operation])
         .observe(duration);
 
     // Record response size from Content-Length if available
