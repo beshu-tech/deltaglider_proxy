@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: ["main"]
   pull_request:
   workflow_dispatch:
   workflow_call:
@@ -170,6 +171,14 @@ jobs:
 
   test-integration:
     name: Integration Tests
+    # Always run on PRs (review gate), workflow_dispatch (operator opt-in),
+    # and workflow_call (downstream caller). On direct push to main the
+    # MinIO suite is skipped UNLESS the commit message contains
+    # `[ci-integration]` — opt-in keyword so noisy main-branch chores
+    # don't burn ~10 minutes of MinIO time when they don't need it.
+    if: >-
+      github.event_name != 'push' ||
+      contains(github.event.head_commit.message, '[ci-integration]')
     runs-on: k3s
     timeout-minutes: 50
     container:
