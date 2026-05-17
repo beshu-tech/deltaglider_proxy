@@ -16,12 +16,8 @@ use tower_http::cors::{Any, CorsLayer};
 
 use deltaglider_proxy::api::admin::{self, AdminState};
 
-// Source maps stay in dist/ for local dev and Sentry-style upload, but
-// we don't embed them — they would add ~22 MB to the binary for no
-// production benefit.
 #[derive(Embed)]
 #[folder = "demo/s3-browser/ui/dist"]
-#[exclude = "*.map"]
 struct DemoAssets;
 
 /// Build the UI + admin API router, mounted under `/_/`.
