@@ -349,7 +349,10 @@ pub async fn recover_db(
             (
                 StatusCode::OK,
                 [
-                    ("cache-control", "no-store, no-cache, must-revalidate, private"),
+                    (
+                        "cache-control",
+                        "no-store, no-cache, must-revalidate, private",
+                    ),
                     ("pragma", "no-cache"),
                 ],
                 Json(RecoverDbResponse {

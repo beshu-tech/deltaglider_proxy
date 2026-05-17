@@ -169,7 +169,20 @@ pub(super) fn drop_prior_session(state: &AdminState, headers: &HeaderMap) {
     }
 }
 
-/// Format a session cookie for setting a login token.
+/// Test-only shim: equivalent to [`session_cookie_with_headers`] with
+/// no request headers. Kept so the `session_cookie_is_samesite_strict_*`
+/// unit tests can build a cookie without an axum `HeaderMap`. The
+/// cookie-shape contract (SameSite=Strict, HttpOnly, Path=/, Max-Age)
+/// is documented on the production builder below.
+#[cfg(test)]
+pub(super) fn session_cookie(token: &str, ttl: std::time::Duration) -> String {
+    session_cookie_with_headers(token, ttl, None)
+}
+
+/// Format a session cookie for setting a login token. This is the
+/// production code path; the `#[cfg(test)]` [`session_cookie`] above
+/// is a no-headers shim.
+///
 /// Max-Age matches the session store's TTL.
 ///
 /// `SameSite=Strict` (not Lax) — Strict blocks cross-site top-level
@@ -184,15 +197,10 @@ pub(super) fn drop_prior_session(state: &AdminState, headers: &HeaderMap) {
 /// reload after login since the first hit doesn't carry the cookie.
 /// We judge the CSRF surface reduction worth it for a public-internet
 /// deployment.
-#[cfg(test)]
-pub(super) fn session_cookie(token: &str, ttl: std::time::Duration) -> String {
-    session_cookie_with_headers(token, ttl, None)
-}
-
-/// Like [`session_cookie`] but consults the request headers so a
-/// `Secure` flag fires when the front proxy reports
-/// `X-Forwarded-Proto: https` even though our listener is plain HTTP.
-/// Use this on the response-issuing path of every login handler.
+///
+/// Consults `headers` so a `Secure` flag fires when the front proxy
+/// reports `X-Forwarded-Proto: https` even though our listener is
+/// plain HTTP. Pass `Some(req_headers)` from every login handler.
 pub(super) fn session_cookie_with_headers(
     token: &str,
     ttl: std::time::Duration,
@@ -1024,7 +1032,10 @@ pub async fn get_s3_session_creds(
         Some(creds) => (
             StatusCode::OK,
             [
-                ("cache-control", "no-store, no-cache, must-revalidate, private"),
+                (
+                    "cache-control",
+                    "no-store, no-cache, must-revalidate, private",
+                ),
                 ("pragma", "no-cache"),
             ],
             Json(creds),

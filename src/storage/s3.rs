@@ -2164,7 +2164,9 @@ mod tests {
             access_key_id: Some("minioadmin".to_string()),
             secret_access_key: Some("minioadmin".to_string()),
         };
-        S3Backend::build_client(&cfg).await.expect("dev mode must accept localhost:9000");
+        S3Backend::build_client(&cfg)
+            .await
+            .expect("dev mode must accept localhost:9000");
 
         // IMDS still rejected even in dev mode.
         let cfg = BackendConfig::S3 {

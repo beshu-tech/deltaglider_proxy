@@ -613,9 +613,9 @@ fn authenticate_form_post(
 }
 
 /// Replay-cache TTL for a form-POST signature: the policy's own
-/// expiration capped at `MAX_FORM_POST_REPLAY_TTL` so an attacker
-/// uploading a multi-day-expiry policy can't pin a cache slot
-/// indefinitely. Pure: no I/O, no global state.
+/// expiration capped at [`MAX_FORM_POST_REPLAY_TTL_SECS`] so an
+/// attacker uploading a multi-day-expiry policy can't pin a cache
+/// slot indefinitely. Pure: no I/O, no global state.
 fn form_post_replay_ttl(
     policy_b64: &str,
     now: chrono::DateTime<chrono::Utc>,
@@ -637,10 +637,7 @@ fn form_post_replay_ttl(
     let max = Duration::from_secs(MAX_FORM_POST_REPLAY_TTL_SECS);
     let floor = Duration::from_secs(5);
     let raw = match parsed {
-        Some(exp) if exp > now => exp
-            .signed_duration_since(now)
-            .to_std()
-            .unwrap_or(floor),
+        Some(exp) if exp > now => exp.signed_duration_since(now).to_std().unwrap_or(floor),
         _ => floor,
     };
     raw.min(max).max(floor)
@@ -937,7 +934,10 @@ mod tests {
             &base64::engine::general_purpose::STANDARD,
             serde_json::to_vec(&policy).unwrap(),
         );
-        assert_eq!(form_post_replay_ttl(&policy_b64, now), Duration::from_secs(5));
+        assert_eq!(
+            form_post_replay_ttl(&policy_b64, now),
+            Duration::from_secs(5)
+        );
 
         // Garbage policy → floor.
         assert_eq!(
@@ -945,10 +945,7 @@ mod tests {
             Duration::from_secs(5)
         );
         // Valid base64 but not JSON → floor.
-        let bogus = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            b"not json",
-        );
+        let bogus = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"not json");
         assert_eq!(form_post_replay_ttl(&bogus, now), Duration::from_secs(5));
     }
 

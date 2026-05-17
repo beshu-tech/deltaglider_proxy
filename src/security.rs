@@ -74,16 +74,15 @@ pub fn validate_outbound_url(url: &str, kind: UrlKind) -> Result<(), UrlValidati
     check_host(host, kind)
 }
 
-/// Pure host check; exported for callers that already have the parsed
-/// host and don't want to round-trip through `Url::parse`.
-pub fn check_host(host: &str, kind: UrlKind) -> Result<(), UrlValidationError> {
+fn check_host(host: &str, kind: UrlKind) -> Result<(), UrlValidationError> {
     let normalised = host.trim_matches(['[', ']']).to_ascii_lowercase();
 
     if FORBIDDEN_HOSTNAMES.iter().any(|h| normalised == *h)
         || FORBIDDEN_SUFFIXES.iter().any(|s| normalised.ends_with(s))
     {
         // BackendDev permits `localhost` (and only that — not `metadata.*`).
-        let dev_ok = matches!(kind, UrlKind::BackendDev) && DEV_ALLOWED.iter().any(|h| normalised == *h);
+        let dev_ok =
+            matches!(kind, UrlKind::BackendDev) && DEV_ALLOWED.iter().any(|h| normalised == *h);
         if !dev_ok {
             return Err(UrlValidationError::ForbiddenHost(host.to_string()));
         }
@@ -99,13 +98,9 @@ pub fn check_host(host: &str, kind: UrlKind) -> Result<(), UrlValidationError> {
 }
 
 /// Bucket-name policy: reject names that parse as an IP in any common
-/// notation (dotted, single-decimal, hex, octal). AWS S3 rejects all
-/// IP-like bucket names; we need parity so an operator can't break
-/// downstream client SSRF heuristics by creating a `2130706433` bucket.
-/// Bucket-name policy: reject names that parse as an IP in any common
-/// notation. AWS S3 rejects all IP-like bucket names; we need parity
-/// so an operator can't break downstream client SSRF heuristics by
-/// creating a `127.1` or `0x7f.0.0.1` bucket.
+/// dotted notation. AWS S3 rejects all IP-like bucket names; we need
+/// parity so an operator can't break downstream client SSRF heuristics
+/// by creating a `127.1` or `0x7f.0.0.1` bucket.
 ///
 /// **Note**: we do NOT flag single-token decimal/hex forms (e.g.
 /// `2130706433`, `0x7f000001`). They're technically an IP encoding,
@@ -122,10 +117,7 @@ pub fn bucket_name_is_ip_like(name: &str) -> bool {
     // avoid the single-token bucket-name collision.
     let parts: Vec<&str> = name.split('.').collect();
     if parts.len() == 2 || parts.len() == 4 {
-        let parsed: Option<Vec<u64>> = parts
-            .iter()
-            .map(|seg| parse_ip_segment(seg))
-            .collect();
+        let parsed: Option<Vec<u64>> = parts.iter().map(|seg| parse_ip_segment(seg)).collect();
         if let Some(v) = parsed {
             if v.iter().all(|&n| n <= 0xFFFF_FFFF) {
                 return true;
@@ -188,11 +180,10 @@ fn ip_is_metadata_service(ip: IpAddr) -> bool {
         // AWS IMDSv1/IMDSv2, Azure IMDS, GCP metadata server (all same v4).
         IpAddr::V4(v4) => v4.octets() == [169, 254, 169, 254],
         // IPv4-mapped form.
-        IpAddr::V6(v6) => {
-            v6.to_ipv4_mapped()
-                .map(|m| m.octets() == [169, 254, 169, 254])
-                .unwrap_or(false)
-        }
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(|m| m.octets() == [169, 254, 169, 254])
+            .unwrap_or(false),
     }
 }
 
@@ -230,7 +221,10 @@ fn ipv6_is_private(ip: Ipv6Addr) -> bool {
 /// and any future algorithm we haven't reviewed.
 pub fn jwt_alg_is_allowed(alg: jsonwebtoken::Algorithm) -> bool {
     use jsonwebtoken::Algorithm::*;
-    matches!(alg, RS256 | RS384 | RS512 | ES256 | ES384 | PS256 | PS384 | PS512)
+    matches!(
+        alg,
+        RS256 | RS384 | RS512 | ES256 | ES384 | PS256 | PS384 | PS512
+    )
 }
 
 /// Public-prefix policy: a non-empty prefix MUST end in `/`. Empty
@@ -249,33 +243,6 @@ pub fn validate_public_prefix(prefix: &str) -> Result<(), &'static str> {
         return Err("non-empty public_prefix must end in '/'");
     }
     Ok(())
-}
-
-/// Lower-bound check on the `Origin` / `Sec-Fetch-Site` headers for
-/// state-changing admin requests. Returns true when the request is
-/// either same-origin or has explicitly opted in (an empty `Origin`
-/// header — e.g. a curl from CLI without a browser context).
-///
-/// The expected `self_origin` is the proxy's public origin, e.g.
-/// "https://dgp.example.com". Empty `self_origin` disables the check
-/// (configuration not provided).
-pub fn request_is_same_origin(
-    origin_header: Option<&str>,
-    sec_fetch_site: Option<&str>,
-    self_origin: &str,
-) -> bool {
-    if self_origin.is_empty() {
-        return true;
-    }
-    if let Some(o) = origin_header {
-        if !o.is_empty() {
-            return o.eq_ignore_ascii_case(self_origin);
-        }
-    }
-    match sec_fetch_site {
-        Some(v) => matches!(v, "same-origin" | "same-site" | "none"),
-        None => true,
-    }
 }
 
 #[cfg(test)]
@@ -385,8 +352,8 @@ mod tests {
             "127.0.0.1",
             "0.0.0.0",
             "255.255.255.255",
-            "0177.0.0.1",   // octal first octet
-            "127.1",        // BSD shorthand
+            "0177.0.0.1", // octal first octet
+            "127.1",      // BSD shorthand
         ] {
             assert!(
                 bucket_name_is_ip_like(n),
@@ -433,43 +400,5 @@ mod tests {
         assert!(validate_public_prefix("../etc").is_err());
         assert!(validate_public_prefix("foo//bar/").is_err());
         assert!(validate_public_prefix("foo\0bar/").is_err());
-    }
-
-    #[test]
-    fn same_origin_check_handles_browser_signals() {
-        // Disabled when no self-origin is configured.
-        assert!(request_is_same_origin(Some("https://evil.com"), None, ""));
-
-        // Matching Origin header.
-        assert!(request_is_same_origin(
-            Some("https://dgp.example.com"),
-            None,
-            "https://dgp.example.com"
-        ));
-        assert!(request_is_same_origin(
-            Some("HTTPS://DGP.EXAMPLE.COM"),
-            None,
-            "https://dgp.example.com"
-        ));
-
-        // Mismatched Origin.
-        assert!(!request_is_same_origin(
-            Some("https://evil.com"),
-            Some("cross-site"),
-            "https://dgp.example.com"
-        ));
-
-        // No Origin header — fall back to Sec-Fetch-Site.
-        assert!(request_is_same_origin(None, Some("same-origin"), "https://dgp.example.com"));
-        assert!(request_is_same_origin(None, Some("same-site"), "https://dgp.example.com"));
-        assert!(request_is_same_origin(None, Some("none"), "https://dgp.example.com"));
-        assert!(!request_is_same_origin(
-            None,
-            Some("cross-site"),
-            "https://dgp.example.com"
-        ));
-
-        // Neither header (non-browser caller, e.g. CLI). Allow.
-        assert!(request_is_same_origin(None, None, "https://dgp.example.com"));
     }
 }

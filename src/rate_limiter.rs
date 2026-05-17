@@ -442,10 +442,16 @@ pub(crate) fn normalize_ip(ip: IpAddr) -> IpAddr {
 /// IP is currently locked out. The handler is expected to turn this into
 /// its own 429 response immediately — no further operations should be
 /// attempted under rate-limit protection.
+///
+/// The `ip` and `failure_count` fields are diagnostic — they're
+/// populated for `Debug` output / future telemetry but no caller
+/// destructures them today, so `dead_code` is allowed explicitly.
+/// Callers should treat any `Err(_)` from the guard as "blocked".
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct Blocked {
-    pub ip: IpAddr,
-    pub failure_count: u32,
+    pub(crate) ip: IpAddr,
+    pub(crate) failure_count: u32,
 }
 
 /// RAII-style wrapper that ties a rate-limited operation to the
@@ -571,13 +577,7 @@ impl<'a> RateLimitGuard<'a> {
 /// caller-supplied AKID can't smuggle log-line injection.
 fn sanitize_for_log(s: &str) -> String {
     s.chars()
-        .map(|c| {
-            if c.is_control() {
-                '?'
-            } else {
-                c
-            }
-        })
+        .map(|c| if c.is_control() { '?' } else { c })
         .collect()
 }
 
@@ -773,11 +773,14 @@ mod tests {
         )
         .with_account_policy(5, Duration::from_secs(60), Duration::from_secs(120));
 
-        // 5 different attacker IPs, each making 1 attempt against
-        // the same subject. The account bucket trips on the 5th
-        // even though no single IP came close to its budget.
+        // 5 different attacker IPs would each make 1 attempt against
+        // the same subject. We don't need to materialise distinct
+        // IpAddrs here: the per-IP bucket is wide open (1000) so
+        // even hitting the SAME IP 5 times wouldn't trip it, and the
+        // per-account bucket is keyed purely on the subject string.
+        // The point of this test is that the account bucket trips
+        // on the 5th attempt regardless of IP cardinality.
         for i in 1..=5u8 {
-            let _ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, i));
             let locked = limiter.record_failure_account("admin-akid");
             if i < 5 {
                 assert!(!locked, "attempt {i} should not lock");

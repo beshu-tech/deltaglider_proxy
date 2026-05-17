@@ -175,16 +175,17 @@ impl OidcProvider {
         redirect_uri: &str,
         pending: &PendingAuth,
     ) -> Result<ExternalIdentityInfo, ExternalAuthError> {
-        let (token_endpoint, jwks, issuer) = {
+        // We pull `token_endpoint` and `jwks` from the cached discovery
+        // doc but NOT the issuer — `validate_id_token` pins against
+        // `self.issuer_url` (the operator-configured value), not the
+        // cached doc's claimed `issuer`. Pinning against the doc would
+        // mean a future cache poisoning could trivially rebind us.
+        let (token_endpoint, jwks) = {
             let cache = self.cache.read();
             let disc = cache
                 .as_ref()
                 .ok_or_else(|| ExternalAuthError::DiscoveryFailed("No cached discovery".into()))?;
-            (
-                disc.doc.token_endpoint.clone(),
-                disc.jwks.clone(),
-                disc.doc.issuer.clone(),
-            )
+            (disc.doc.token_endpoint.clone(), disc.jwks.clone())
         };
 
         // Build token exchange request
@@ -225,32 +226,24 @@ impl OidcProvider {
         // discovery refresh and retry against the new JWKS. Without
         // this, a routine IdP rotation bricks logins for the full
         // discovery-cache window (1h).
-        let (jwks, _issuer) = match self.validate_id_token(&id_token_str, &jwks, &issuer, pending) {
-            Ok(c) => return Ok(ExternalIdentityInfo {
-                subject: c.sub,
-                email: c.email,
-                email_verified: c.email_verified.unwrap_or(false),
-                name: c.name,
-                groups: c.groups.unwrap_or_default(),
-                raw_claims: extract_raw_claims(&id_token_str),
-            }),
+        let claims = match self.validate_id_token(&id_token_str, &jwks, pending) {
+            Ok(c) => c,
             Err(ExternalAuthError::TokenValidationFailed(msg))
                 if msg.contains("not found in JWKS") =>
             {
                 tracing::info!("OIDC: kid not in cached JWKS — forcing rediscovery");
                 self.discover().await?;
-                let cache = self.cache.read();
-                let disc = cache.as_ref().ok_or_else(|| {
-                    ExternalAuthError::DiscoveryFailed("Discovery missing after refresh".into())
-                })?;
-                (disc.jwks.clone(), disc.doc.issuer.clone())
+                let refreshed_jwks = {
+                    let cache = self.cache.read();
+                    let disc = cache.as_ref().ok_or_else(|| {
+                        ExternalAuthError::DiscoveryFailed("Discovery missing after refresh".into())
+                    })?;
+                    disc.jwks.clone()
+                };
+                self.validate_id_token(&id_token_str, &refreshed_jwks, pending)?
             }
             Err(e) => return Err(e),
         };
-        let claims = self.validate_id_token(&id_token_str, &jwks, &issuer, pending)?;
-
-        // Extract raw claims as JSON for flexible mapping
-        let raw_claims = extract_raw_claims(&id_token_str);
 
         Ok(ExternalIdentityInfo {
             subject: claims.sub,
@@ -258,7 +251,7 @@ impl OidcProvider {
             email_verified: claims.email_verified.unwrap_or(false),
             name: claims.name,
             groups: claims.groups.unwrap_or_default(),
-            raw_claims,
+            raw_claims: extract_raw_claims(&id_token_str),
         })
     }
 
@@ -379,7 +372,6 @@ impl OidcProvider {
         &self,
         token: &str,
         jwks: &jsonwebtoken::jwk::JwkSet,
-        expected_issuer: &str,
         pending: &PendingAuth,
     ) -> Result<IdTokenClaims, ExternalAuthError> {
         // Decode header to find the key ID (kid)
@@ -415,11 +407,11 @@ impl OidcProvider {
         // point. The JWKS key's own `alg` field further constrains.
         let mut validation = Validation::new(header.alg);
         validation.set_audience(&[&self.client_id]);
-        // Use the CONFIGURED issuer_url, not whatever the discovery
-        // doc claimed — pinning happens at fetch_discovery, but a
-        // belt-and-braces check here protects against a stale cache
-        // entry from before a future code change.
-        let _ = expected_issuer; // retained for legacy callers
+        // Pin issuer to the CONFIGURED issuer_url, not whatever the
+        // discovery doc claimed. `fetch_discovery` already enforces
+        // `issuers_match(doc.issuer, self.issuer_url)`, so the cached
+        // doc's value can never drift from this — but pinning here
+        // makes the property local to one place.
         validation.set_issuer(&[self.issuer_url.as_str()]);
 
         let token_data = decode::<IdTokenClaims>(token, &decoding_key, &validation)

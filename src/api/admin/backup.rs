@@ -2175,8 +2175,9 @@ storage:
         // Stay under MAX_ENTRY_BYTES per-entry but blow MAX_BACKUP_TOTAL_BYTES.
         // Use 12 entries × 6 MiB = 72 MiB > 64 MiB cap.
         let big = vec![0xAB_u8; 6 * 1024 * 1024];
-        let mut entries: Vec<(String, &[u8])> =
-            (0..12).map(|i| (format!("blob{i}.bin"), big.as_slice())).collect();
+        let mut entries: Vec<(String, &[u8])> = (0..12)
+            .map(|i| (format!("blob{i}.bin"), big.as_slice()))
+            .collect();
         let refs: Vec<(&str, &[u8])> = entries.iter_mut().map(|(n, c)| (n.as_str(), *c)).collect();
         let zip = make_zip(&refs);
         let err = unzip_bounded(&zip).expect_err("must reject aggregate overflow");
@@ -2211,8 +2212,8 @@ storage:
             "back\\slash.txt",
         ] {
             let zip = make_zip(&[(bad_name, b"x")]);
-            let err = unzip_bounded(&zip)
-                .expect_err(&format!("must reject zip-slip name: {bad_name}"));
+            let err =
+                unzip_bounded(&zip).expect_err(&format!("must reject zip-slip name: {bad_name}"));
             let msg = format!("{err}");
             assert!(
                 msg.contains("zip-slip") || msg.contains("unsafe"),

@@ -844,7 +844,7 @@ mod tests {
         if !first.is_ascii_alphanumeric() || !last.is_ascii_alphanumeric() {
             return false;
         }
-        if is_ip_format(name) {
+        if is_ip_format(name) || crate::security::bucket_name_is_ip_like(name) {
             return false;
         }
         true

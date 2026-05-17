@@ -543,11 +543,8 @@ pub async fn oauth_callback(
         &req_headers,
     );
 
-    let cookie = super::auth::session_cookie_with_headers(
-        &token,
-        state.sessions.ttl(),
-        Some(&req_headers),
-    );
+    let cookie =
+        super::auth::session_cookie_with_headers(&token, state.sessions.ttl(), Some(&req_headers));
     let clear_oauth_state = oauth_state_clear_cookie(&req_headers);
 
     // Determine redirect target:
@@ -1055,8 +1052,12 @@ fn symmetric_diff_count(a: &[i64], b: &[i64]) -> usize {
 }
 
 #[cfg(test)]
-mod sanitize_next_param_tests {
-    use super::sanitize_next_param;
+mod tests {
+    use super::{
+        extract_oauth_state_cookie, oauth_state_clear_cookie, oauth_state_cookie,
+        sanitize_next_param,
+    };
+    use axum::http::HeaderMap;
 
     #[test]
     fn accepts_safe_local_paths() {
@@ -1114,15 +1115,6 @@ mod sanitize_next_param_tests {
         assert_eq!(sanitize_next_param("/_/admin path"), None);
     }
 
-}
-
-#[cfg(test)]
-mod oauth_state_cookie_tests {
-    use super::{
-        extract_oauth_state_cookie, oauth_state_clear_cookie, oauth_state_cookie,
-    };
-    use axum::http::HeaderMap;
-
     /// Adversarial: the OAuth state-binding cookie must have the right
     /// shape — SameSite=Lax (the IdP→our-proxy redirect IS cross-site
     /// GET, so Strict would drop it), Path scoped to the OAuth
@@ -1146,7 +1138,9 @@ mod oauth_state_cookie_tests {
         let mut h = HeaderMap::new();
         h.insert(
             axum::http::header::COOKIE,
-            "foo=bar; dgp_oauth_state=xyz123; dgp_session=zzz".parse().unwrap(),
+            "foo=bar; dgp_oauth_state=xyz123; dgp_session=zzz"
+                .parse()
+                .unwrap(),
         );
         assert_eq!(extract_oauth_state_cookie(&h).as_deref(), Some("xyz123"));
 
