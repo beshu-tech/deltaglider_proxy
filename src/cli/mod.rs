@@ -17,6 +17,7 @@ pub mod engine_factory;
 pub mod filter;
 pub mod ls;
 pub mod migrate;
+pub mod purge;
 pub mod rm;
 pub mod s3_url;
 pub mod stats;

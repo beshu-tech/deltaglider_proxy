@@ -78,7 +78,8 @@ struct Cli {
 
 /// Top-level subcommands. The `config` and `admission` families
 /// operate on the proxy's own config / request pipeline. The S3
-/// commands (`cp`, `ls`, `rm`, `stats`, `verify`) talk directly to an
+/// commands (`cp`, `ls`, `rm`, `stats`, `verify`, `sync`, `migrate`,
+/// `purge`, `get-bucket-acl`, `put-bucket-acl`) talk directly to an
 /// S3 endpoint and apply the same delta-storage layout the proxy
 /// uses — same toolchain, no Python deltaglider dependency.
 #[derive(Subcommand, Debug)]
@@ -111,6 +112,9 @@ enum Command {
     Migrate(deltaglider_proxy::cli::migrate::MigrateArgs),
     /// Sync a directory between local and S3 (or between two S3 prefixes).
     Sync(deltaglider_proxy::cli::sync::SyncArgs),
+    /// Purge expired Python-toolchain rehydration cache entries
+    /// (`.deltaglider/tmp/*` with past `dg-expires-at`).
+    Purge(deltaglider_proxy::cli::purge::PurgeArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -278,6 +282,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 run_cli_async(deltaglider_proxy::cli::migrate::run(args.clone()))
             }
             Command::Sync(args) => run_cli_async(deltaglider_proxy::cli::sync::run(args.clone())),
+            Command::Purge(args) => run_cli_async(deltaglider_proxy::cli::purge::run(args.clone())),
         };
         std::process::exit(code);
     }
