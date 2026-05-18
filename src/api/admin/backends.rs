@@ -97,6 +97,7 @@ fn build_backend_config(req: &CreateBackendRequest) -> Result<BackendConfig, Str
                 force_path_style: req.force_path_style.unwrap_or(true),
                 access_key_id: req.access_key_id.clone(),
                 secret_access_key: req.secret_access_key.clone(),
+                allow_local: false,
             })
         }
         other => Err(format!(

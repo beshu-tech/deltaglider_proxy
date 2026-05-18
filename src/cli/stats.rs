@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! `deltaglider_proxy stats s3://bucket [--quick|--sampled|--detailed]
+//! `deltaglider_proxy s3 stats s3://bucket [--quick|--sampled|--detailed]
 //!  [--refresh] [--no-cache] [--json]`
 //!
 //! Bucket-scoped compression metrics. Three accuracy/runtime tiers:

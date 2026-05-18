@@ -867,6 +867,7 @@ impl StorageSection {
                     force_path_style: self.force_path_style.take().unwrap_or(true),
                     access_key_id: self.access_key_id.take(),
                     secret_access_key: self.secret_access_key.take(),
+                    allow_local: false,
                 };
             }
             (false, true, false) => {
@@ -1787,6 +1788,7 @@ mod tests {
                 access_key_id,
                 secret_access_key,
                 force_path_style,
+                ..
             } => {
                 assert_eq!(endpoint.as_deref(), Some("https://minio.example.com"));
                 assert_eq!(region, "eu-central-1");

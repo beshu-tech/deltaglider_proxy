@@ -38,23 +38,20 @@ pub enum BuildError {
 
 /// Build a one-shot engine pointed at the supplied S3 endpoint.
 pub async fn build_cli_engine(opts: CliEngineOpts) -> Result<DynEngine, BuildError> {
-    if opts.allow_local {
-        // SAFETY: `std::env::set_var` is unsafe in 2024 because it
-        // can race with concurrent readers. The CLI is the only
-        // thread that calls into the engine constructor, and the
-        // call happens before any tokio task has spawned a reader
-        // of `DGP_BACKEND_ALLOW_LOCAL`, so the race window is empty.
-        unsafe {
-            std::env::set_var("DGP_BACKEND_ALLOW_LOCAL", "true");
-        }
-    }
-
+    // `allow_local` flows through the typed `BackendConfig::S3` field
+    // instead of via the `DGP_BACKEND_ALLOW_LOCAL` env var. The legacy
+    // env path still works for backward compat (handled inside
+    // `S3Backend::build_client`), but new CLI invocations don't need
+    // to mutate process env — eliminates the `unsafe { set_var }`
+    // hazard at startup and makes the engine testable without env
+    // munging.
     let backend = BackendConfig::S3 {
         endpoint: opts.endpoint,
         region: opts.region,
         force_path_style: opts.force_path_style,
         access_key_id: Some(opts.access_key_id),
         secret_access_key: Some(opts.secret_access_key),
+        allow_local: opts.allow_local,
     };
     let cfg = Config {
         backend,
@@ -86,6 +83,7 @@ mod tests {
             force_path_style: false,
             access_key_id: Some("AK".into()),
             secret_access_key: Some("SK".into()),
+            allow_local: false,
         };
         let cfg = Config {
             backend,

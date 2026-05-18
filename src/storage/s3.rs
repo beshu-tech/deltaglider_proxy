@@ -176,27 +176,29 @@ impl S3Backend {
     /// Build an S3 client from a BackendConfig without creating an S3Backend.
     /// Useful for one-off operations like testing connectivity.
     pub async fn build_client(config: &BackendConfig) -> Result<Client, StorageError> {
-        let (endpoint, region, force_path_style, access_key_id, secret_access_key) = match config {
-            BackendConfig::S3 {
-                endpoint,
-                region,
-                force_path_style,
-                access_key_id,
-                secret_access_key,
-                ..
-            } => (
-                endpoint.clone(),
-                region.clone(),
-                *force_path_style,
-                access_key_id.clone(),
-                secret_access_key.clone(),
-            ),
-            _ => {
-                return Err(StorageError::Other(
-                    "S3Backend requires S3 configuration".to_string(),
-                ))
-            }
-        };
+        let (endpoint, region, force_path_style, access_key_id, secret_access_key, allow_local) =
+            match config {
+                BackendConfig::S3 {
+                    endpoint,
+                    region,
+                    force_path_style,
+                    access_key_id,
+                    secret_access_key,
+                    allow_local,
+                } => (
+                    endpoint.clone(),
+                    region.clone(),
+                    *force_path_style,
+                    access_key_id.clone(),
+                    secret_access_key.clone(),
+                    *allow_local,
+                ),
+                _ => {
+                    return Err(StorageError::Other(
+                        "S3Backend requires S3 configuration".to_string(),
+                    ))
+                }
+            };
 
         // Require explicit credentials — never fall back to the default AWS credential chain
         // (env vars, ~/.aws/credentials, instance metadata, etc.)
@@ -238,13 +240,16 @@ impl S3Backend {
             // turning admin-GUI access into cloud-account takeover.
             //
             // `BackendDev` keeps the door open for local MinIO so
-            // dev/CI deployments still work — opted into via the
-            // `DGP_BACKEND_ALLOW_LOCAL=true` env, which a hardened
-            // production env must NOT set.
-            let kind = if std::env::var("DGP_BACKEND_ALLOW_LOCAL")
+            // dev/CI deployments still work — opted into via either
+            // the typed `BackendConfig::S3.allow_local` field (the
+            // preferred path) or the legacy `DGP_BACKEND_ALLOW_LOCAL=true`
+            // env var (kept for backward-compat with existing
+            // deployments and the proxy's env-driven config layer).
+            // A hardened production env must keep both off.
+            let env_allow = std::env::var("DGP_BACKEND_ALLOW_LOCAL")
                 .map(|v| v == "1" || v == "true")
-                .unwrap_or(false)
-            {
+                .unwrap_or(false);
+            let kind = if allow_local || env_allow {
                 crate::security::UrlKind::BackendDev
             } else {
                 crate::security::UrlKind::Backend
@@ -252,7 +257,9 @@ impl S3Backend {
             crate::security::validate_outbound_url(ep, kind).map_err(|e| {
                 StorageError::Other(format!(
                     "Refusing to use S3 endpoint {ep:?}: {e}. \
-                     Set DGP_BACKEND_ALLOW_LOCAL=true to permit http:// + private IPs for dev/CI."
+                     Set `allow_local: true` in the backend config (or \
+                     DGP_BACKEND_ALLOW_LOCAL=true env) to permit http:// + \
+                     private IPs for dev/CI."
                 ))
             })?;
             s3_config_builder = s3_config_builder.endpoint_url(ep);
@@ -2113,6 +2120,7 @@ mod tests {
                 force_path_style: true,
                 access_key_id: Some("AKIA".to_string()),
                 secret_access_key: Some("secret".to_string()),
+                allow_local: false,
             };
             let err = S3Backend::build_client(&cfg)
                 .await
@@ -2134,6 +2142,7 @@ mod tests {
                 force_path_style: true,
                 access_key_id: Some("AKIA".to_string()),
                 secret_access_key: Some("secret".to_string()),
+                allow_local: false,
             };
             S3Backend::build_client(&cfg)
                 .await
@@ -2163,6 +2172,7 @@ mod tests {
             force_path_style: true,
             access_key_id: Some("minioadmin".to_string()),
             secret_access_key: Some("minioadmin".to_string()),
+            allow_local: false, // env grants permission; field path tested below
         };
         S3Backend::build_client(&cfg)
             .await
@@ -2175,8 +2185,65 @@ mod tests {
             force_path_style: true,
             access_key_id: Some("a".to_string()),
             secret_access_key: Some("b".to_string()),
+            allow_local: false,
         };
         assert!(S3Backend::build_client(&cfg).await.is_err());
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("DGP_BACKEND_ALLOW_LOCAL", v) },
+            None => unsafe { std::env::remove_var("DGP_BACKEND_ALLOW_LOCAL") },
+        };
+    }
+
+    /// `BackendConfig::S3.allow_local = true` is the preferred path for
+    /// opting into local endpoints — it grants permission WITHOUT touching
+    /// the process env. This is what the CLI uses (no more `unsafe set_var`).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn build_client_allows_dev_local_when_config_field_set() {
+        let _g = SSRF_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("DGP_BACKEND_ALLOW_LOCAL").ok();
+        // Explicitly ensure env is unset so we prove the field path works
+        // independently of the env fallback.
+        unsafe { std::env::remove_var("DGP_BACKEND_ALLOW_LOCAL") };
+
+        // localhost permitted by typed field (no env mutation).
+        let cfg = BackendConfig::S3 {
+            endpoint: Some("http://localhost:9000".to_string()),
+            region: "us-east-1".to_string(),
+            force_path_style: true,
+            access_key_id: Some("minioadmin".to_string()),
+            secret_access_key: Some("minioadmin".to_string()),
+            allow_local: true,
+        };
+        S3Backend::build_client(&cfg)
+            .await
+            .expect("typed field path must accept localhost:9000");
+
+        // IMDS still rejected even with allow_local: true (parity with env path).
+        let cfg = BackendConfig::S3 {
+            endpoint: Some("http://169.254.169.254/".to_string()),
+            region: "us-east-1".to_string(),
+            force_path_style: true,
+            access_key_id: Some("a".to_string()),
+            secret_access_key: Some("b".to_string()),
+            allow_local: true,
+        };
+        assert!(S3Backend::build_client(&cfg).await.is_err());
+
+        // Default `allow_local: false` rejects localhost.
+        let cfg = BackendConfig::S3 {
+            endpoint: Some("http://localhost:9000".to_string()),
+            region: "us-east-1".to_string(),
+            force_path_style: true,
+            access_key_id: Some("a".to_string()),
+            secret_access_key: Some("b".to_string()),
+            allow_local: false,
+        };
+        assert!(
+            S3Backend::build_client(&cfg).await.is_err(),
+            "with neither field nor env opt-in, localhost must be rejected"
+        );
 
         match prev {
             Some(v) => unsafe { std::env::set_var("DGP_BACKEND_ALLOW_LOCAL", v) },

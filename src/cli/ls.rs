@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! `deltaglider_proxy ls` — list buckets or objects with AWS-CLI-shaped
+//! `deltaglider_proxy s3 ls` — list buckets or objects with AWS-CLI-shaped
 //! output. The command shape mirrors `aws s3 ls`:
 //!
-//!     deltaglider_proxy ls                      # list buckets
-//!     deltaglider_proxy ls s3://bucket          # list top-level keys + common prefixes
-//!     deltaglider_proxy ls s3://bucket/pfx/ -r  # recursive
-//!     deltaglider_proxy ls s3://bucket -h --summarize
+//!     deltaglider_proxy s3 ls                      # list buckets
+//!     deltaglider_proxy s3 ls s3://bucket          # list top-level keys + common prefixes
+//!     deltaglider_proxy s3 ls s3://bucket/pfx/ -r  # recursive
+//!     deltaglider_proxy s3 ls s3://bucket -h --summarize
 //!
 //! No URL → bucket list. With URL → object list under that prefix.
 //! Non-recursive uses `/` as the delimiter; `CommonPrefixes` show as

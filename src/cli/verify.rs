@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! `deltaglider_proxy verify s3://bucket/key`
+//! `deltaglider_proxy s3 verify s3://bucket/key`
 //!
 //! Pull an object back through the engine (which handles delta
 //! reconstruction transparently), recompute SHA256 on the reassembled

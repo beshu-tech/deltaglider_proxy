@@ -332,14 +332,9 @@ async fn build_client(
         cli_exit::EXIT_AUTH
     })?;
 
-    if should_allow_local(endpoint.as_deref()) {
-        // SAFETY: see engine_factory.rs for the same one-shot CLI
-        // setup pattern. We're the only writer; readers haven't been
-        // spawned yet.
-        unsafe {
-            std::env::set_var("DGP_BACKEND_ALLOW_LOCAL", "true");
-        }
-    }
+    // `allow_local` flows through the typed `BackendConfig::S3` field
+    // instead of via `DGP_BACKEND_ALLOW_LOCAL` env mutation.
+    let allow_local = should_allow_local(endpoint.as_deref());
 
     let backend = BackendConfig::S3 {
         endpoint,
@@ -347,6 +342,7 @@ async fn build_client(
         force_path_style,
         access_key_id: Some(creds.access_key_id),
         secret_access_key: Some(creds.secret_access_key),
+        allow_local,
     };
     S3Backend::build_client(&backend).await.map_err(|e| {
         eprintln!("error: failed to initialise S3 client: {e}");

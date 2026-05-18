@@ -204,6 +204,7 @@ pub fn run_init_inner(
                     force_path_style,
                     access_key_id,
                     secret_access_key,
+                    allow_local: false,
                 };
             }
             _ => {

@@ -77,11 +77,18 @@ struct Cli {
 }
 
 /// Top-level subcommands. The `config` and `admission` families
-/// operate on the proxy's own config / request pipeline. The S3
-/// commands (`cp`, `ls`, `rm`, `stats`, `verify`, `sync`, `migrate`,
-/// `purge`, `get-bucket-acl`, `put-bucket-acl`) talk directly to an
-/// S3 endpoint and apply the same delta-storage layout the proxy
-/// uses — same toolchain, no Python deltaglider dependency.
+/// operate on the proxy's own config / request pipeline. The `s3`
+/// family hosts the AWS-CLI-shaped client commands (`cp`, `ls`, `rm`,
+/// `stats`, `verify`, `sync`, `migrate`, `purge`, `get-bucket-acl`,
+/// `put-bucket-acl`) that talk directly to an S3 endpoint and apply
+/// the same delta-storage layout the proxy uses — same toolchain, no
+/// Python deltaglider dependency.
+///
+/// All client verbs nest under `s3` to keep the top-level `--help`
+/// uncluttered and to leave room for future top-level proxy flags
+/// (`init`, `set-bootstrap-password`, etc.) without colliding.
+/// Operators preferring the Python-style invocation can alias
+/// `dg='deltaglider_proxy s3'`.
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Configuration-file tooling (migrate, schema, apply, ...).
@@ -94,6 +101,18 @@ enum Command {
         #[command(subcommand)]
         action: AdmissionCommand,
     },
+    /// AWS-CLI-shaped S3 client commands. See `s3 --help`.
+    S3 {
+        #[command(subcommand)]
+        action: S3Command,
+    },
+}
+
+/// AWS-CLI-shaped client verbs. Each runs in-process against a remote
+/// S3 endpoint without needing a running `deltaglider_proxy` server;
+/// metadata written here is bit-compatible with what the proxy emits.
+#[derive(Subcommand, Debug)]
+enum S3Command {
     /// List S3 buckets or objects (AWS-CLI-shaped output).
     Ls(deltaglider_proxy::cli::ls::LsArgs),
     /// Remove S3 objects (single-key or recursive prefix-delete).
@@ -265,24 +284,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // S3 subcommands are async — each owns its own tokio
             // runtime so the proxy-startup path stays cold when the
             // binary is invoked purely as a CLI.
-            Command::Ls(args) => run_cli_async(deltaglider_proxy::cli::ls::run(args.clone())),
-            Command::Rm(args) => run_cli_async(deltaglider_proxy::cli::rm::run(args.clone())),
-            Command::Cp(args) => run_cli_async(deltaglider_proxy::cli::cp::run(args.clone())),
-            Command::Stats(args) => run_cli_async(deltaglider_proxy::cli::stats::run(args.clone())),
-            Command::Verify(args) => {
-                run_cli_async(deltaglider_proxy::cli::verify::run(args.clone()))
-            }
-            Command::GetBucketAcl(args) => {
-                run_cli_async(deltaglider_proxy::cli::bucket_acl::get_run(args.clone()))
-            }
-            Command::PutBucketAcl(args) => {
-                run_cli_async(deltaglider_proxy::cli::bucket_acl::put_run(args.clone()))
-            }
-            Command::Migrate(args) => {
-                run_cli_async(deltaglider_proxy::cli::migrate::run(args.clone()))
-            }
-            Command::Sync(args) => run_cli_async(deltaglider_proxy::cli::sync::run(args.clone())),
-            Command::Purge(args) => run_cli_async(deltaglider_proxy::cli::purge::run(args.clone())),
+            Command::S3 { action } => match action {
+                S3Command::Ls(args) => run_cli_async(deltaglider_proxy::cli::ls::run(args.clone())),
+                S3Command::Rm(args) => run_cli_async(deltaglider_proxy::cli::rm::run(args.clone())),
+                S3Command::Cp(args) => run_cli_async(deltaglider_proxy::cli::cp::run(args.clone())),
+                S3Command::Stats(args) => {
+                    run_cli_async(deltaglider_proxy::cli::stats::run(args.clone()))
+                }
+                S3Command::Verify(args) => {
+                    run_cli_async(deltaglider_proxy::cli::verify::run(args.clone()))
+                }
+                S3Command::GetBucketAcl(args) => {
+                    run_cli_async(deltaglider_proxy::cli::bucket_acl::get_run(args.clone()))
+                }
+                S3Command::PutBucketAcl(args) => {
+                    run_cli_async(deltaglider_proxy::cli::bucket_acl::put_run(args.clone()))
+                }
+                S3Command::Migrate(args) => {
+                    run_cli_async(deltaglider_proxy::cli::migrate::run(args.clone()))
+                }
+                S3Command::Sync(args) => {
+                    run_cli_async(deltaglider_proxy::cli::sync::run(args.clone()))
+                }
+                S3Command::Purge(args) => {
+                    run_cli_async(deltaglider_proxy::cli::purge::run(args.clone()))
+                }
+            },
         };
         std::process::exit(code);
     }

@@ -873,7 +873,24 @@ pub enum BackendConfig {
         /// AWS secret access key (optional, can use env/instance credentials)
         #[serde(default)]
         secret_access_key: Option<String>,
+
+        /// Permit `http://` and private-IP / localhost endpoints when set.
+        /// Off by default: the SSRF guard at `src/storage/s3.rs` rejects
+        /// such endpoints to prevent admin-API abuse pivoting through the
+        /// S3 backend (e.g. swapping the endpoint to AWS IMDS).
+        /// Set to true for MinIO/dev/CI; production must keep false.
+        /// Backward-compat: when false, the legacy `DGP_BACKEND_ALLOW_LOCAL`
+        /// env var still grants permission (so existing deployments work
+        /// unchanged); explicitly setting `allow_local: true` in the config
+        /// is the preferred path going forward.
+        #[serde(default, skip_serializing_if = "is_false")]
+        allow_local: bool,
     },
+}
+
+#[inline]
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 // Default value functions for serde.
@@ -1326,6 +1343,9 @@ impl Config {
                     .unwrap_or(true),
                 access_key_id: std::env::var("DGP_BE_AWS_ACCESS_KEY_ID").ok(),
                 secret_access_key: std::env::var("DGP_BE_AWS_SECRET_ACCESS_KEY").ok(),
+                allow_local: std::env::var("DGP_BACKEND_ALLOW_LOCAL")
+                    .map(|v| v == "true" || v == "1")
+                    .unwrap_or(false),
             };
         } else if let Ok(dir) = std::env::var("DGP_DATA_DIR") {
             self.backend = BackendConfig::Filesystem {
@@ -2626,6 +2646,7 @@ backend:
                 force_path_style: true,
                 access_key_id: Some("BACKEND-SECRET-ID".into()),
                 secret_access_key: Some("BACKEND-SECRET-KEY".into()),
+                allow_local: false,
             },
             ..Config::default()
         };
@@ -2637,6 +2658,7 @@ backend:
                 force_path_style: true,
                 access_key_id: Some("NAMED-SECRET-ID".into()),
                 secret_access_key: Some("NAMED-SECRET-KEY".into()),
+                allow_local: false,
             },
             encryption: BackendEncryptionConfig::Aes256GcmProxy {
                 key: Some("NAMED-ENCRYPTION-KEY-SHOULD-REDACT".into()),

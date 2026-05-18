@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! `deltaglider_proxy rm s3://bucket/key [-r] [--include G]... [--exclude G]...`
+//! `deltaglider_proxy s3 rm s3://bucket/key [-r] [--include G]... [--exclude G]...`
 //!
 //! Single-key delete by default. With `-r` walks the prefix (paginated)
 //! and deletes every key that survives the `Filter`. Output mirrors

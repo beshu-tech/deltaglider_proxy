@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! `deltaglider_proxy migrate s3://src s3://dst [flags...]`
+//! `deltaglider_proxy s3 migrate s3://src s3://dst [flags...]`
 //!
 //! Bulk S3→S3 copy of an entire deltaspace through the engine. Each
 //! file is retrieved on the source side (engine reconstructs deltas

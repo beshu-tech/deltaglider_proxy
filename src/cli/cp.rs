@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! `deltaglider_proxy cp <SRC> <DST>` — AWS-CLI-shaped copy between
+//! `deltaglider_proxy s3 cp <SRC> <DST>` — AWS-CLI-shaped copy between
 //! local paths and S3 with transparent delta compression.
 //!
 //! Direction is derived from the URL shape of each argument:

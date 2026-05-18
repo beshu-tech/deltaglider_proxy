@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! `deltaglider_proxy sync <SRC> <DST> [flags...]`
+//! `deltaglider_proxy s3 sync <SRC> <DST> [flags...]`
 //!
 //! Bidirectional directory sync, AWS-CLI-shaped. Three directions:
 //!

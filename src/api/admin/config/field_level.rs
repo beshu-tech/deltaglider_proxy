@@ -792,6 +792,7 @@ fn apply_backend_patch(
                         .backend_secret_access_key
                         .clone()
                         .filter(|s| !s.is_empty()),
+                    allow_local: false,
                 };
                 warnings.push(
                     "Backend type changed. Data in the previous backend is not migrated."
@@ -821,6 +822,7 @@ fn apply_backend_patch(
             force_path_style,
             access_key_id,
             secret_access_key,
+            ..
         } => {
             if let Some(ref ep) = body.backend_endpoint {
                 *endpoint = if ep.is_empty() {
@@ -869,6 +871,7 @@ mod tests {
                 force_path_style: true,
                 access_key_id: Some("AKIA_OP".into()),
                 secret_access_key: Some("sk-op".into()),
+                allow_local: false,
             },
             backends: Vec::new(),
             ..Config::default()
@@ -904,6 +907,7 @@ mod tests {
                 force_path_style: true,
                 access_key_id: None,
                 secret_access_key: None,
+                allow_local: false,
             },
             encryption: crate::config::BackendEncryptionConfig::default(),
         };

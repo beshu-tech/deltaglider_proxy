@@ -733,6 +733,7 @@ pub async fn test_s3_connection(
             force_path_style,
             access_key_id,
             secret_access_key,
+            ..
         } => (
             endpoint.clone(),
             Some(region.clone()),
@@ -770,6 +771,7 @@ pub async fn test_s3_connection(
         force_path_style: merged_fps,
         access_key_id: merged_key,
         secret_access_key: merged_secret,
+        allow_local: false,
     };
 
     // Build a temporary client

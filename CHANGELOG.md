@@ -2,6 +2,63 @@
 
 ## Unreleased
 
+### Changed (BREAKING)
+
+- **CLI client verbs moved under `s3` subgroup.** The 10 AWS-CLI-shaped
+  client commands (`cp`, `ls`, `rm`, `sync`, `migrate`, `stats`, `verify`,
+  `purge`, `get-bucket-acl`, `put-bucket-acl`) are now nested under
+  `deltaglider_proxy s3 <verb>` instead of being top-level. Top-level
+  `deltaglider_proxy --help` is now uncluttered, listing only `config`,
+  `admission`, and `s3` as subcommand groups; future top-level proxy
+  flags (`init`, `set-bootstrap-password`, etc.) no longer collide.
+  Migration: replace `deltaglider_proxy cp ...` with `deltaglider_proxy
+  s3 cp ...` (likewise for the other nine verbs). Operators preferring
+  the Python-style invocation can alias `dg='deltaglider_proxy s3'`.
+  Library callers (`deltaglider_proxy::cli::cp::run` etc.) are
+  unchanged — only the CLI surface moved.
+
+### Fixed
+
+- **Eliminated `unsafe { std::env::set_var("DGP_BACKEND_ALLOW_LOCAL", ...) }`
+  from CLI startup paths.** The SSRF allow-local opt-in now flows
+  through the typed `BackendConfig::S3.allow_local` field instead of
+  via process-env mutation. The legacy `DGP_BACKEND_ALLOW_LOCAL` env
+  var is still honoured (backward-compat for existing deployments and
+  the proxy's env-driven config layer), so no operator action is
+  required. Eliminates a Rust-2024-`unsafe` block from three CLI
+  modules (`engine_factory.rs`, `bucket_acl.rs`, `purge.rs`) and makes
+  the engine constructible without mutating process state. New
+  `BackendConfig::S3.allow_local` (defaults to `false`, serde-skipped
+  when unset for clean YAML diffs) is the preferred path going
+  forward; legacy YAMLs parse unchanged. Added regression test
+  `build_client_allows_dev_local_when_config_field_set` pinning the
+  typed-field path independent of env.
+
+- **CI workflow `DGP_BACKEND_ALLOW_LOCAL=true` job-level env**
+  ([2fbcc5c](#) + [577edd7](#) + [e643ba3](#)) — wave-1 security
+  (`3ff9edc`) rejected `http://localhost:9000` MinIO endpoints by
+  default, breaking the `[ci-integration]`-gated Integration Tests
+  batch (hidden on main pushes by the gate). Set the opt-in at job
+  level in `ci.yml` and `test-all-nightly.yml`; threaded through
+  `interop_test.rs`'s `env_clear()` barrier; updated 4 cli_s3 test
+  fixtures that forgot to create the source bucket before seeding.
+- **`DGP_REPLAY_WINDOW_SECS=0` in CI** ([577edd7](#)) to disable the
+  wave-3 SigV4 replay cache for tests that legitimately re-issue
+  identical signed requests inside the 2s window. Production keeps
+  the cache on; the two auth tests validating the wave-3 replay
+  contract override the env back to `2` via `TestServerBuilder::env`.
+- **`DGP_USAGE_CACHE_TTL_SECS` made env-configurable** ([2c5ea89](#))
+  so quota tests can shorten the 5-minute scan-cache TTL. Production
+  default unchanged. Fixed two deterministic-race test failures in
+  `quota_test.rs` where the spawned scan finished BEFORE the seed PUT
+  body landed on disk, caching a "0 bytes" stale read for 5 minutes.
+- **CI builder image now ships `clang` + `lld`** ([95cdeac](#)) —
+  the compile-time-optimization PR added `linker = "clang"` +
+  `-fuse-ld=lld` to `.cargo/config.toml` but the GHCR builder image
+  only had `gcc`. Cascaded every build-gated job into `error: linker
+  'clang' not found`. Two-line `apt-get install` addition plus
+  verification step (`clang --version`, `ld.lld --version`).
+
 ## v0.11.0 — 2026-05-16
 
 ### Added
