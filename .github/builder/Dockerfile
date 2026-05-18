@@ -6,13 +6,17 @@ LABEL org.opencontainers.image.description="CI builder for DeltaGlider Proxy —
 ENV DEBIAN_FRONTEND=noninteractive
 
 # ── System packages ─────────────────────────────────────────────────
+# clang + lld are required by .cargo/config.toml which pins
+# `linker = "clang"` with `-fuse-ld=lld` for ~3-5× faster linking.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
+    clang \
     curl \
     git \
     jq \
     libssl-dev \
+    lld \
     pkg-config \
     wget \
     xdelta3 \
@@ -63,4 +67,6 @@ RUN echo "--- Builder image verification ---" \
   && mc --version \
   && docker --version \
   && git --version \
+  && clang --version \
+  && ld.lld --version \
   && echo "--- All tools OK ---"
