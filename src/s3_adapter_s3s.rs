@@ -192,6 +192,87 @@ impl s3s::S3 for DeltaGliderS3Service {
         Ok(resp)
     }
 
+    /// ListObjects (V1) — exists primarily for legacy SDKs and
+    /// hand-rolled SigV4 clients that don't add `?list-type=2`. Real
+    /// SDKs default to V2, so this code path is rarely hit, but
+    /// without it `GET /<bucket>` returns 501 on s3s (s3s correctly
+    /// dispatches to ListObjects when no `list-type` query is
+    /// present, and there was no impl).
+    ///
+    /// Implementation is a thin shim over `list_objects_v2`: V1's
+    /// `marker` becomes V2's `start-after`-equivalent (we pass it
+    /// through `continuation_token` for the engine which doesn't
+    /// distinguish, since deltaglider's storage layout uses opaque
+    /// next-token pagination). V1 output uses `marker` / `next-
+    /// marker` instead of `continuation-token` / `next-continuation-
+    /// token`; the engine's response shape matches V2 so we re-map.
+    async fn list_objects(
+        &self,
+        req: s3s::S3Request<s3s::dto::ListObjectsInput>,
+    ) -> s3s::S3Result<s3s::S3Response<s3s::dto::ListObjectsOutput>> {
+        let list_scope = req.extensions.get::<ListScope>().cloned();
+        let input = req.input;
+        let max_keys = input.max_keys.unwrap_or(1000).clamp(1, 1000) as u32;
+        let mut page = self
+            .state
+            .engine
+            .load()
+            .list_objects(
+                &input.bucket,
+                input.prefix.as_deref().unwrap_or(""),
+                input.delimiter.as_deref(),
+                max_keys,
+                input.marker.as_deref(),
+                false,
+            )
+            .await
+            .map_err(engine_error_to_s3s)?;
+        if let Some(ListScope::Filtered { user }) = list_scope {
+            let requested_prefix = input.prefix.as_deref().unwrap_or("");
+            page.objects.retain(|(key, _)| {
+                user_can_see_listed_key(&user, &input.bucket, key, requested_prefix)
+            });
+            page.common_prefixes
+                .retain(|prefix| user_can_see_common_prefix(&user, &input.bucket, prefix));
+        }
+        let next_marker = page.next_continuation_token.clone();
+        let is_truncated = page.next_continuation_token.is_some();
+        let contents: Vec<s3s::dto::Object> = page
+            .objects
+            .iter()
+            .map(|(key, meta)| s3s::dto::Object {
+                key: Some(key.clone()),
+                size: Some(meta.file_size as i64),
+                e_tag: parse_s3s_etag(&meta.etag()).ok(),
+                last_modified: Some(SystemTime::from(meta.created_at).into()),
+                storage_class: Some(s3s::dto::ObjectStorageClass::from_static(
+                    s3s::dto::ObjectStorageClass::STANDARD,
+                )),
+                ..Default::default()
+            })
+            .collect();
+        let common_prefixes: Vec<s3s::dto::CommonPrefix> = page
+            .common_prefixes
+            .iter()
+            .map(|p| s3s::dto::CommonPrefix {
+                prefix: Some(p.clone()),
+            })
+            .collect();
+        Ok(s3s::S3Response::new(s3s::dto::ListObjectsOutput {
+            name: Some(input.bucket.clone()),
+            prefix: input.prefix.clone(),
+            delimiter: input.delimiter.clone(),
+            marker: input.marker.clone(),
+            next_marker,
+            max_keys: Some(max_keys as i32),
+            is_truncated: Some(is_truncated),
+            contents: Some(contents),
+            common_prefixes: Some(common_prefixes),
+            encoding_type: input.encoding_type,
+            ..Default::default()
+        }))
+    }
+
     async fn list_objects_v2(
         &self,
         req: s3s::S3Request<s3s::dto::ListObjectsV2Input>,
@@ -585,6 +666,19 @@ impl s3s::S3 for DeltaGliderS3Service {
             collect_blob_limited(input.body, engine.max_object_size(), Some(&headers)).await?;
         verify_signed_payload_hash_s3s(signed_payload_hash.as_ref(), &data)?;
         validate_content_md5_s3s(input.content_md5.as_deref(), &data)?;
+        // Per-bucket storage quota enforcement (parity with axum's
+        // `put_object_inner` in `api/handlers/object_helpers.rs`). The
+        // s3s adapter shipped without this — letting a quota-bound
+        // bucket overrun silently when DGP_S3_ADAPTER=s3s. Same
+        // `check_quota` is reused from the axum path so the policy
+        // ("freeze when quota=0, soft-enforce after cached usage
+        // available") stays single-sourced.
+        crate::api::handlers::object_helpers::check_quota(
+            &self.state,
+            &input.bucket,
+            data.len() as u64,
+        )
+        .map_err(engine_error_to_s3s)?;
         evaluate_put_etag_conditionals_s3s(
             engine.as_ref(),
             &input.bucket,
@@ -645,6 +739,14 @@ impl s3s::S3 for DeltaGliderS3Service {
         if data.len() as u64 > engine.max_object_size() {
             return Err(s3s::s3_error!(EntityTooLarge));
         }
+        // Quota check on the destination bucket (parity with axum
+        // copy_object). Same single-source `check_quota` as put_object.
+        crate::api::handlers::object_helpers::check_quota(
+            &self.state,
+            &input.bucket,
+            data.len() as u64,
+        )
+        .map_err(engine_error_to_s3s)?;
         let directive = input
             .metadata_directive
             .as_ref()
@@ -817,6 +919,16 @@ impl s3s::S3 for DeltaGliderS3Service {
             .iter()
             .filter_map(|(num, _)| self.state.multipart.get_part_size(&input.upload_id, *num))
             .sum();
+        // Quota check before storing (parity with axum
+        // `multipart::handle_complete_multipart` line 127). Done here,
+        // not on UploadPart, because parts can be aborted before
+        // storage; only Complete commits bytes.
+        crate::api::handlers::object_helpers::check_quota(
+            &self.state,
+            &input.bucket,
+            total_parts_size,
+        )
+        .map_err(engine_error_to_s3s)?;
         let force_chunked_passthrough =
             !engine.is_delta_eligible(&input.key) || total_parts_size > delta_limit;
         let multipart_etag = if force_chunked_passthrough {
@@ -1038,8 +1150,31 @@ async fn collect_blob_limited(
     };
     let mut out = Vec::new();
     while let Some(chunk) = body.next().await {
-        let chunk =
-            chunk.map_err(|_| s3s::s3_error!(InternalError, "failed to read request body"))?;
+        let chunk = chunk.map_err(|e| {
+            // s3s wraps the request body in a hashing reader that
+            // verifies `x-amz-content-sha256` AS THE BODY STREAMS.
+            // On mismatch, the chunk read fails with
+            // `UploadStreamError::Sha256Mismatch` (Display string
+            // `"UploadStreamError: Sha256Mismatch"`). That IS the
+            // H1 integrity check the axum adapter performs after
+            // collecting the body — surface it as the same wire
+            // error (`BadDigest`, 400) instead of a generic 500
+            // InternalError. Match-on-Display is fragile because
+            // `UploadStreamError` is private to s3s, but the
+            // alternative (downcast) needs the type to be public.
+            // If the s3s crate ever exports the type or renames the
+            // variant, the test `test_sigv4_payload_hash_mismatch_rejected`
+            // catches the drift.
+            let msg = e.to_string();
+            if msg.contains("Sha256Mismatch") {
+                tracing::warn!(
+                    "request body sha256 doesn't match x-amz-content-sha256 header — rejecting as BadDigest"
+                );
+                return s3s::s3_error!(BadDigest);
+            }
+            tracing::error!(error = ?e, "collect_blob_limited: body chunk read failed");
+            s3s::s3_error!(InternalError, "failed to read request body: {e}")
+        })?;
         let next_len = out
             .len()
             .checked_add(chunk.len())

@@ -2,15 +2,15 @@
 
 ## Status
 
-**s3s is the migration destination.** axum is the legacy
-implementation being phased out. The migration is in flight;
-both adapters live in the codebase under a feature flag during
-the transition.
+**s3s is the production S3 protocol path.** axum is the legacy
+implementation being deleted. The production Dockerfile builds with
+`--features s3s-adapter`; operators can roll back to axum via
+`DGP_S3_ADAPTER=axum` env until the handlers are removed in step 5.
 
-The next concrete step is enabling `--features s3s-adapter` in
-the production Dockerfile so the production image runs s3s
-instead of axum. Today's prod still runs axum because the
-Dockerfile doesn't enable the feature.
+Both adapters still live in the codebase under the feature flag.
+The remaining migration work is dead-axum removal — the s3s adapter
+is feature-complete (all 343 integration tests + 952 unit tests
+pass on s3s).
 
 ## Why s3s
 
@@ -63,10 +63,10 @@ Production Dockerfile builds without the feature — for now.
 
 In rough order of dependency:
 
-1. **Get s3s into the production image.** Add
-   `--features s3s-adapter` to the Dockerfile build invocation.
-   This switches production traffic onto s3s while keeping the
-   axum rollback available via env var.
+1. ~~**Get s3s into the production image.**~~ ✅ **DONE.** The
+   production Dockerfile builds with `--features s3s-adapter`.
+   Production traffic uses s3s by default; axum is rollback-only
+   via `DGP_S3_ADAPTER=axum`.
 
 2. ~~**Fix the form-POST routing on s3s.**~~ ✅ **DONE.** A
    method+content-type-aware middleware (`intercept_form_post_for_s3s`

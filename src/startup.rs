@@ -741,8 +741,26 @@ fn build_s3s_router(
     // the intentional limit constant.
     let _ = max_body;
 
+    // `HEAD /` — connection-probe handler used by Cyberduck and other
+    // S3 clients. Not part of the S3 spec, so the s3s service returns
+    // 501 here. Use a middleware (not `.route`) so axum doesn't claim
+    // the `/` path slot — `.route("/", head(...))` returns 405 for
+    // GET `/` (ListBuckets) because axum matches path first, then
+    // checks method without falling through to the s3s fallback.
+    async fn intercept_head_root(
+        request: axum::http::Request<axum::body::Body>,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        let is_root = request.uri().path() == "/" || request.uri().path().is_empty();
+        if request.method() == axum::http::Method::HEAD && is_root {
+            return head_root().await;
+        }
+        next.run(request).await
+    }
+
     let mut router = Router::new()
         .fallback_service(s3_service)
+        .layer(middleware::from_fn(intercept_head_root))
         .layer(middleware::from_fn_with_state(
             form_post_state,
             intercept_form_post_for_s3s,

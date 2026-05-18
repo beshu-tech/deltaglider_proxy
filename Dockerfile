@@ -32,16 +32,21 @@ RUN apt-get -o Acquire::Retries=3 update && apt-get install -y --no-install-reco
     pkg-config xdelta3 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=planner /app/recipe.json recipe.json
-# Cook dependencies — this layer is cached until Cargo.toml/lock changes
+# Cook dependencies — this layer is cached until Cargo.toml/lock changes.
+# `--features s3s-adapter` is the production S3 protocol path; see
+# `docs/dev/s3-adapter-decision.md`. With this feature compiled in,
+# `DGP_S3_ADAPTER` defaults to `s3s`; operators can roll back to the
+# legacy axum router with `DGP_S3_ADAPTER=axum` as a safety valve
+# until the axum handlers are deleted.
 RUN mkdir -p demo/s3-browser/ui/dist \
-    && cargo chef cook --release --recipe-path recipe.json
+    && cargo chef cook --release --recipe-path recipe.json --features s3s-adapter
 
 # ── Build stage: Rust ──
 FROM rust-deps AS rust-build
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src/ src/
 COPY --from=ui-build /app/demo/s3-browser/ui/dist demo/s3-browser/ui/dist
-RUN cargo build --release
+RUN cargo build --release --features s3s-adapter
 
 # ── Runtime ──
 # Security notes:

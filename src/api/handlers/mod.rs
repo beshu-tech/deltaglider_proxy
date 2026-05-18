@@ -18,7 +18,10 @@ mod bucket;
 pub mod form_post;
 mod multipart;
 mod object;
-mod object_helpers;
+// `pub(crate)` so `s3_adapter_s3s` (sibling under the library crate)
+// can reuse `check_quota` — keeps quota enforcement in one place
+// across both S3 adapter paths.
+pub(crate) mod object_helpers;
 mod status;
 
 use super::errors::S3Error;

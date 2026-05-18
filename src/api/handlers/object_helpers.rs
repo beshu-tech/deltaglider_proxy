@@ -127,7 +127,7 @@ pub(super) fn check_copy_source_access(
 /// Uses cached usage data (soft quota). Returns Ok(()) if allowed.
 /// When quota_bytes=0, always rejects (freeze bucket). When no cache data
 /// is available, triggers a background scan and allows optimistically.
-pub(super) fn check_quota(
+pub(crate) fn check_quota(
     state: &Arc<AppState>,
     bucket: &str,
     incoming_bytes: u64,
