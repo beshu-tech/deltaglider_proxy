@@ -245,6 +245,14 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      # Wave-1 security (commit 3ff9edc) rejects http:// + private-IP S3
+      # endpoints by default to close SSRF surface. The MinIO under test
+      # serves on http://localhost:9000, so we explicitly opt in here.
+      # The CLI's `engine_factory` auto-sets this when it detects a
+      # MinIO/dev endpoint; the proxy's `S3Backend::build_client` does
+      # NOT, because the proxy is the thing being hardened.
+      DGP_BACKEND_ALLOW_LOCAL: "true"
     steps:
       - name: Scrub stale workspace (drop .claude leftovers from prior runs)
         shell: bash
