@@ -9,7 +9,13 @@
 //! - `status` — Health check and aggregate stats
 
 mod bucket;
-mod form_post;
+// `pub` (not `pub(crate)`) because the binary's `startup.rs` lives
+// outside this library crate and needs to dispatch to
+// `handle_form_post_upload` from its s3s router's interceptor
+// middleware. The function ITSELF is still locked down by being the
+// only public entry point on this module — `parse_form_post_upload`,
+// `authenticate_form_post`, etc. remain `fn` / `pub(super)`.
+pub mod form_post;
 mod multipart;
 mod object;
 mod object_helpers;

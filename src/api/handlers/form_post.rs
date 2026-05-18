@@ -56,7 +56,7 @@ struct ParsedFormPost {
 /// (`multipart/form-data` body). Cheap header sniff — the dispatcher in
 /// `object::delete_objects` calls this before deciding whether to run
 /// the DeleteObjects XML path or the form-upload path.
-pub(super) fn is_multipart_form_upload(headers: &HeaderMap) -> bool {
+pub fn is_multipart_form_upload(headers: &HeaderMap) -> bool {
     headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -719,7 +719,7 @@ fn enforce_form_post_replay(state: &Arc<AppState>, parsed: &ParsedFormPost) -> R
 /// bucket-existence + parse + auth + quota checks, hands the file body
 /// to `engine.store`, emits the object-created event, and returns a
 /// 204 No Content with the persisted object's ETag.
-pub(super) async fn handle_form_post_upload(
+pub async fn handle_form_post_upload(
     state: &Arc<AppState>,
     bucket: &str,
     iam_state: Option<&SharedIamState>,

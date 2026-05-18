@@ -68,18 +68,15 @@ In rough order of dependency:
    This switches production traffic onto s3s while keeping the
    axum rollback available via env var.
 
-2. **Fix the form-POST routing on s3s.** The s3s crate doesn't
-   recognise browser form-POST uploads (`POST /<bucket>` with
-   `multipart/form-data` body). A `2abe031` attempt to mount
-   `.route("/:bucket", post(delete_objects))` on the s3s router
-   broke parity tests catastrophically (CreateBucket returned
-   405 because the route slot claimed all methods). The right
-   fix is a method-aware middleware that intercepts only POST
-   requests with `Content-Type: multipart/form-data` and
-   dispatches to the form-POST handler, leaving other POSTs
-   (DeleteObjects-XML, CreateMultipartUpload) to the s3s
-   service. Until this lands, form-POST tests are gated on
-   `using_s3s_adapter() == false`.
+2. ~~**Fix the form-POST routing on s3s.**~~ ✅ **DONE.** A
+   method+content-type-aware middleware (`intercept_form_post_for_s3s`
+   in `startup.rs::build_s3s_router`) intercepts only `POST /<bucket>`
+   requests with `Content-Type: multipart/form-data` and dispatches
+   to the same `handle_form_post_upload` the axum adapter uses.
+   Other POSTs (DeleteObjects-XML, CreateMultipartUpload) fall
+   through to the s3s service unchanged. The `using_s3s_adapter()`
+   skip gate was removed from the 4 form-POST tests; they now run
+   on both adapters and pass on both.
 
 3. **Audit the `add_s3_request_id` XML-rewrite middleware**
    (`src/startup.rs::502+`). It exists to paper over three
@@ -102,7 +99,7 @@ In rough order of dependency:
 
 ## Open work in s3s itself (parity gaps)
 
-- Form-POST upload (see above).
+- ~~Form-POST upload~~ ✅ closed.
 - Three XML output drifts patched by `add_s3_request_id`.
 - Four `s3s_adapter_parity_test` tests pass today, but the
   test corpus is small. A full protocol-conformance fixture

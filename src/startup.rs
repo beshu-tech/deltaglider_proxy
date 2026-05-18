@@ -655,24 +655,98 @@ fn build_s3s_router(
     builder.set_access(AllowAllS3sAccess);
     let s3_service = HandleError::new(builder.build(), handle_s3s_http_error);
 
-    // Pre-fix `2abe031` registered `.route("/:bucket", post(delete_objects))`
-    // here to give s3s adapter a path through to the form-POST handler.
-    // That broke the s3s parity tests catastrophically: `.route(...)`
-    // claims the path slot for ALL methods, so non-POST requests
-    // (CreateBucket = `PUT /:bucket`) returned 405 instead of falling
-    // through to the s3s fallback. CI on `4ccd8ae` showed 4/4 parity
-    // tests failing.
-    //
-    // Form-POST upload support under s3s is deferred to a proper fix
-    // — likely a method-aware middleware that intercepts POST +
-    // `multipart/form-data` Content-Type and dispatches to
-    // `delete_objects` while letting other POSTs (like the
-    // `?delete` batch) reach the s3s service. The legacy axum
-    // adapter (DGP_S3_ADAPTER=axum) handles form-POST natively;
-    // s3s adapter form-POSTs return whatever s3s returns
-    // (typically not implemented).
+    // Form-POST upload interceptor (`POST /<bucket>` with
+    // `Content-Type: multipart/form-data`). The pre-fix `2abe031`
+    // attempt used `.route("/:bucket", post(...))` which broke the s3s
+    // parity tests catastrophically — `.route` claims the slot for ALL
+    // methods, so `PUT /:bucket` (CreateBucket) and other POSTs (?delete
+    // batch, CreateMultipartUpload) returned 405. The right shape is a
+    // method-AND-content-type-aware middleware that intercepts ONLY the
+    // browser form-POST shape and lets every other POST flow through to
+    // the s3s service.
+    let max_body = config.max_object_size as usize;
+    let form_post_state = state.clone();
+    async fn intercept_form_post_for_s3s(
+        axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+        request: axum::http::Request<axum::body::Body>,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        use deltaglider_proxy::api::handlers::form_post::{
+            handle_form_post_upload, is_multipart_form_upload,
+        };
+
+        // Pass-through guard 1: only POST is in scope.
+        if request.method() != axum::http::Method::POST {
+            return next.run(request).await;
+        }
+
+        // Pass-through guard 2: must be multipart/form-data. The
+        // s3s `?delete` batch is POST + XML, CreateMultipartUpload is
+        // POST + JSON-ish — both must fall through.
+        if !is_multipart_form_upload(request.headers()) {
+            return next.run(request).await;
+        }
+
+        // Pass-through guard 3: path shape `/:bucket` (single segment,
+        // no key suffix). Anything else (`/`, `/bucket/key`) is not a
+        // browser form-POST upload.
+        let raw_path = request.uri().path().trim_start_matches('/');
+        let trimmed = raw_path.trim_end_matches('/');
+        if trimmed.is_empty() || trimmed.contains('/') {
+            return next.run(request).await;
+        }
+        let bucket = trimmed.to_string();
+
+        // Pull iam_state from extensions (inserted as a layer below).
+        let iam_state = request
+            .extensions()
+            .get::<deltaglider_proxy::iam::SharedIamState>()
+            .cloned();
+
+        // Consume the body. The body limit is enforced by the
+        // `DefaultBodyLimit` layer above us in the stack; we pass
+        // `usize::MAX` here so the collect itself does not impose a
+        // second limit (and so we don't accidentally truncate a body
+        // that the outer layer already approved). Type-annotate the
+        // limit explicitly so `to_bytes` resolves `Body` <→ axum body.
+        let (parts, body) = request.into_parts();
+        let limit: usize = usize::MAX;
+        let body_bytes = match axum::body::to_bytes(body, limit).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("form-POST body collection failed: {e}");
+                return axum::http::StatusCode::BAD_REQUEST.into_response();
+            }
+        };
+
+        // Hand off to the same handler the axum adapter uses. Identical
+        // behaviour by construction.
+        match handle_form_post_upload(
+            &state,
+            &bucket,
+            iam_state.as_ref(),
+            &parts.headers,
+            body_bytes,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(s3_err) => s3_err.into_response(),
+        }
+    }
+    // `max_body` is captured for clarity even though `to_bytes` doesn't
+    // need it here (DefaultBodyLimit gates upstream); keep the binding
+    // documented to avoid future "unused variable" cleanups removing
+    // the intentional limit constant.
+    let _ = max_body;
+
     let mut router = Router::new()
         .fallback_service(s3_service)
+        .layer(middleware::from_fn_with_state(
+            form_post_state,
+            intercept_form_post_for_s3s,
+        ))
         .layer(middleware::from_fn(add_s3_request_id))
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(

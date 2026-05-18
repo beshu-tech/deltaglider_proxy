@@ -18,16 +18,6 @@ use common::{
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-/// Form-POST upload routing is currently legacy-axum-only. The s3s
-/// adapter doesn't have a form-POST hook; an attempt to add one in
-/// `2abe031` (a `.route("/:bucket", post(...))` registration) broke
-/// CreateBucket via 405 METHOD_NOT_ALLOWED in CI. Until a
-/// method-aware middleware lands, form-POST tests skip when the
-/// s3s adapter is selected.
-fn using_s3s_adapter() -> bool {
-    matches!(std::env::var("DGP_S3_ADAPTER"), Ok(v) if v.eq_ignore_ascii_case("s3s"))
-}
-
 // ============================================================================
 // 1.5 Per-Request UUID + Accept-Ranges
 // ============================================================================
@@ -2309,10 +2299,6 @@ fn derive_post_signing_key(secret: &str, date: &str, region: &str) -> [u8; 32] {
 
 #[tokio::test]
 async fn test_form_post_upload_succeeds_with_presigned_policy() {
-    if using_s3s_adapter() {
-        eprintln!("skipping form POST compatibility test on s3s adapter");
-        return;
-    }
     let server = TestServer::builder()
         .auth("POSTACCESSKEY", "POSTSECRETKEY123")
         .build()
@@ -2378,10 +2364,6 @@ async fn test_form_post_upload_succeeds_with_presigned_policy() {
 
 #[tokio::test]
 async fn test_form_post_upload_rejects_invalid_signature() {
-    if using_s3s_adapter() {
-        eprintln!("skipping form POST compatibility test on s3s adapter");
-        return;
-    }
     let server = TestServer::builder()
         .auth("POSTACCESSKEY", "POSTSECRETKEY123")
         .build()
@@ -2446,10 +2428,6 @@ async fn test_form_post_upload_rejects_invalid_signature() {
 /// regular PUT (header silently ignored).
 #[tokio::test]
 async fn test_form_post_upload_accepts_private_acl() {
-    if using_s3s_adapter() {
-        eprintln!("skipping form POST compatibility test on s3s adapter");
-        return;
-    }
     let server = TestServer::builder()
         .auth("POSTACCESSKEY", "POSTSECRETKEY123")
         .build()
@@ -2521,10 +2499,6 @@ async fn test_form_post_upload_accepts_private_acl() {
 /// accepting them would lie about the object's visibility.
 #[tokio::test]
 async fn test_form_post_upload_rejects_public_read_acl() {
-    if using_s3s_adapter() {
-        eprintln!("skipping form POST compatibility test on s3s adapter");
-        return;
-    }
     let server = TestServer::builder()
         .auth("POSTACCESSKEY", "POSTSECRETKEY123")
         .build()
