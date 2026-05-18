@@ -81,6 +81,8 @@ async fn migrate_dry_run_lists_without_copying() {
     let src_bucket = unique_bucket("src");
     let dst_bucket = unique_bucket("dst");
     let s3 = common::minio_client().await;
+    // Create BOTH buckets — cp doesn't auto-create the source bucket.
+    s3.create_bucket().bucket(&src_bucket).send().await.unwrap();
     s3.create_bucket().bucket(&dst_bucket).send().await.unwrap();
 
     // Seed src via cp.
@@ -131,6 +133,8 @@ async fn migrate_copies_with_preserve_prefix() {
     let src_bucket = unique_bucket("src");
     let dst_bucket = unique_bucket("dst");
     let s3 = common::minio_client().await;
+    // Create BOTH buckets — cp doesn't auto-create the source bucket.
+    s3.create_bucket().bucket(&src_bucket).send().await.unwrap();
     s3.create_bucket().bucket(&dst_bucket).send().await.unwrap();
 
     // Seed src.
