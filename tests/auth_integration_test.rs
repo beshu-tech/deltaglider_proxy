@@ -587,10 +587,14 @@ async fn test_no_auth_header_rejected_when_auth_enabled() {
 // 4. Replay attack detection
 // ============================================================================
 
-/// Sending the exact same signed PUT request twice within 5 seconds should trigger replay detection.
-/// Replay detection only applies to mutating methods (PUT/DELETE) — idempotent methods
-/// (GET/HEAD) are exempt because clients legitimately retry them and sequential probes
-/// (e.g. checksum auto-detection) can produce identical signatures.
+/// Sending the exact same signed PUT request twice within the replay window
+/// should trigger replay detection.
+///
+/// Security-wave-3 (commit 9f2e085) extended replay detection from
+/// mutating-only methods to all methods including GET/HEAD. The previous
+/// "GET/HEAD exempt" carve-out left captured signed GETs replayable for the
+/// full `DGP_CLOCK_SKEW_SECONDS` window (default 300s). The 2-second default
+/// `DGP_REPLAY_WINDOW_SECS` still tolerates typical retry shapes.
 #[tokio::test]
 async fn test_replay_attack_detected() {
     let server = TestServer::builder()
@@ -631,11 +635,21 @@ async fn test_replay_attack_detected() {
     );
 }
 
-/// Sending the same signed GET request twice should NOT trigger replay detection,
-/// because idempotent methods are exempt. This prevents false rejections of
-/// sequential HEAD probes (checksum auto-detection) and legitimate retries.
+/// Sending the same signed GET request twice within the replay window should
+/// trigger replay detection.
+///
+/// Security-wave-3 (commit 9f2e085) removed the previous GET/HEAD exemption.
+/// Rationale: a captured signed GET was replayable for the full
+/// `DGP_CLOCK_SKEW_SECONDS` window (default 300s) — the largest GET-side
+/// exfiltration amplifier in the SigV4 surface. Now GET/HEAD share the same
+/// replay cache as mutating methods. Clients that legitimately need to retry
+/// the same GET must regenerate the signature (typical SDKs do this anyway —
+/// the `x-amz-date` header changes on each retry attempt).
+///
+/// Operators with very-tight-loop retry clients can stretch the window via
+/// `DGP_REPLAY_WINDOW_SECS` (default 2s).
 #[tokio::test]
-async fn test_idempotent_requests_not_flagged_as_replay() {
+async fn test_idempotent_get_replay_within_window_rejected() {
     let server = TestServer::builder()
         .auth("testkey", "testsecret")
         .build()
@@ -644,7 +658,8 @@ async fn test_idempotent_requests_not_flagged_as_replay() {
     let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let path = format!("/{}", server.bucket());
 
-    // Send two identical GET requests with the same timestamp
+    // Send two identical GET requests with the same timestamp. Same canonical
+    // request → identical SigV4 signature → second one hits the replay cache.
     let resp1 = build_signed_get(&server.endpoint(), &path, "testkey", "testsecret", &now)
         .send()
         .await
@@ -654,15 +669,16 @@ async fn test_idempotent_requests_not_flagged_as_replay() {
         .await
         .unwrap();
 
-    // Both should succeed — GET is idempotent, no replay rejection
+    // The first request should succeed (valid credentials, current timestamp).
     assert!(
         resp1.status().is_success() || resp1.status() == StatusCode::NOT_FOUND,
         "first GET should not be rejected, got {}",
         resp1.status()
     );
+    // Second is the replay; expect 400 (InvalidArgument "Request replay detected").
     assert!(
-        resp2.status().is_success() || resp2.status() == StatusCode::NOT_FOUND,
-        "second GET should not be flagged as replay, got {}",
+        resp2.status() == StatusCode::BAD_REQUEST,
+        "second identical GET should be rejected as replay (400), got {}",
         resp2.status()
     );
 }
@@ -1096,7 +1112,19 @@ async fn test_group_creation_and_permission_inheritance() {
     // Verify user can now list (inherited from group).
     // This exercises the full flow: create group → add member → IAM rebuild →
     // group permissions merge → SigV4 auth → list allowed.
-    let result = s3.list_objects_v2().bucket(server.bucket()).send().await;
+    //
+    // `.max_keys(1)` differentiates the canonical request from the earlier
+    // "verify denied" `list_objects_v2()` call (line ~1063). Without it, both
+    // requests sign to the same SigV4 signature and the second one trips the
+    // GET replay cache (wave-3 security: 2s window). The bucket starts empty,
+    // so max_keys=1 doesn't change the observable result — still an empty
+    // listing — but makes the canonical request differ.
+    let result = s3
+        .list_objects_v2()
+        .bucket(server.bucket())
+        .max_keys(1)
+        .send()
+        .await;
     assert!(
         result.is_ok(),
         "user should be able to list after being added to group: {:?}",
