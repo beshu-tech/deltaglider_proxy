@@ -87,6 +87,12 @@ fn pair_for_compression() -> (Vec<u8>, Vec<u8>) {
 }
 
 async fn seed_delta_bucket(bucket: &str) {
+    // cp doesn't auto-create the destination bucket; create it ourselves
+    // before seeding. Idempotent: BucketAlreadyOwnedByYou is ignored so
+    // callers can use this on a pre-existing bucket too.
+    let s3 = common::minio_client().await;
+    let _ = s3.create_bucket().bucket(bucket).send().await;
+
     let tmp = tempfile::tempdir().unwrap();
     let v1 = tmp.path().join("v1.zip");
     let v2 = tmp.path().join("v2.zip");

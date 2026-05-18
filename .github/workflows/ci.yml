@@ -253,6 +253,14 @@ jobs:
       # MinIO/dev endpoint; the proxy's `S3Backend::build_client` does
       # NOT, because the proxy is the thing being hardened.
       DGP_BACKEND_ALLOW_LOCAL: "true"
+      # Wave-3 security (commit 9f2e085) caches GET/HEAD SigV4
+      # signatures and rejects duplicates inside a 2s window — the
+      # default. Tests legitimately re-issue the same signed request
+      # within a second (assertion-style verifications) and the AWS
+      # SDK signs at one-second timestamp granularity, so two HEADs
+      # in the same second collide. Disable replay detection in CI
+      # only; production keeps the default.
+      DGP_REPLAY_WINDOW_SECS: "0"
     steps:
       - name: Scrub stale workspace (drop .claude leftovers from prior runs)
         shell: bash

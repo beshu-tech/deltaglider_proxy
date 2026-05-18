@@ -208,6 +208,11 @@ impl TestProxyServer {
             // env_clear() above (parent env isn't propagated to the
             // spawned proxy). See src/storage/s3.rs:244 for the gate.
             .env("DGP_BACKEND_ALLOW_LOCAL", "true")
+            // Wave-3 GET/HEAD replay cache rejects duplicate SigV4
+            // signatures inside a 2s window. Interop tests legitimately
+            // re-issue the same signed read (assertion-style checks),
+            // so disable replay detection here. See src/api/auth.rs:855.
+            .env("DGP_REPLAY_WINDOW_SECS", "0")
             .env("RUST_LOG", "deltaglider_proxy=debug")
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_file))

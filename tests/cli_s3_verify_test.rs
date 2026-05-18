@@ -58,6 +58,9 @@ fn verify_args(url: String) -> VerifyArgs {
 async fn verify_ok_after_round_trip() {
     skip_unless_minio!();
     let bucket = unique_bucket("ok");
+    // cp doesn't auto-create the destination bucket.
+    let s3 = common::minio_client().await;
+    s3.create_bucket().bucket(&bucket).send().await.unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
     let local = tmp.path().join("payload.zip");
@@ -79,7 +82,6 @@ async fn verify_ok_after_round_trip() {
     assert_eq!(code, deltaglider_proxy::cli::config::EXIT_OK);
 
     // Cleanup.
-    let s3 = common::minio_client().await;
     s3.delete_object()
         .bucket(&bucket)
         .key("payload.zip")

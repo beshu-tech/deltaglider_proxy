@@ -597,8 +597,14 @@ async fn test_no_auth_header_rejected_when_auth_enabled() {
 /// `DGP_REPLAY_WINDOW_SECS` still tolerates typical retry shapes.
 #[tokio::test]
 async fn test_replay_attack_detected() {
+    // Pin the replay window to the production default. CI sets
+    // `DGP_REPLAY_WINDOW_SECS=0` globally so the bulk-of-tests don't
+    // trip on duplicate signatures from assertion-style probes; this
+    // test specifically validates the wave-3 contract, so it needs the
+    // cache enabled.
     let server = TestServer::builder()
         .auth("testkey", "testsecret")
+        .env("DGP_REPLAY_WINDOW_SECS", "2")
         .build()
         .await;
 
@@ -650,8 +656,11 @@ async fn test_replay_attack_detected() {
 /// `DGP_REPLAY_WINDOW_SECS` (default 2s).
 #[tokio::test]
 async fn test_idempotent_get_replay_within_window_rejected() {
+    // See test_replay_attack_detected: pin to production default
+    // because CI sets the global to 0 for the other integration tests.
     let server = TestServer::builder()
         .auth("testkey", "testsecret")
+        .env("DGP_REPLAY_WINDOW_SECS", "2")
         .build()
         .await;
 
@@ -1115,10 +1124,12 @@ async fn test_group_creation_and_permission_inheritance() {
     //
     // `.max_keys(1)` differentiates the canonical request from the earlier
     // "verify denied" `list_objects_v2()` call (line ~1063). Without it, both
-    // requests sign to the same SigV4 signature and the second one trips the
-    // GET replay cache (wave-3 security: 2s window). The bucket starts empty,
-    // so max_keys=1 doesn't change the observable result — still an empty
-    // listing — but makes the canonical request differ.
+    // requests sign to the same SigV4 signature and the second one would
+    // trip the GET replay cache when running locally with the default
+    // 2s window. CI sets DGP_REPLAY_WINDOW_SECS=0 globally so this
+    // workaround isn't strictly required there, but keeping it makes
+    // the test pass in either environment. The bucket starts empty, so
+    // max_keys=1 doesn't change the observable result.
     let result = s3
         .list_objects_v2()
         .bucket(server.bucket())
