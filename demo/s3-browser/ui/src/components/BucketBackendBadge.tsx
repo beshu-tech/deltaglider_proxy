@@ -1,43 +1,50 @@
 import type { BucketBackendOrigin } from '../types';
+import { useTheme } from '../ThemeContext';
 
 type ProviderKind = 'local' | 'hetzner' | 'aws' | 's3';
+
+interface ProviderPalette {
+  bg: string;
+  fg: string;
+  border: string;
+}
 
 interface ProviderBadge {
   kind: ProviderKind;
   label: string;
-  bg: string;
-  fg: string;
-  border: string;
+  squared: boolean;
+  light: ProviderPalette;
+  dark: ProviderPalette;
 }
 
 const BADGES: Record<ProviderKind, ProviderBadge> = {
   local: {
     kind: 'local',
     label: 'LOC',
-    bg: 'rgba(45, 212, 191, 0.12)',
-    fg: '#2dd4bf',
-    border: 'rgba(45, 212, 191, 0.34)',
+    squared: false,
+    light: { bg: '#ccfbf1', fg: '#115e59', border: '#5eead4' },
+    dark:  { bg: 'rgba(45, 212, 191, 0.18)', fg: '#5eead4', border: 'rgba(45, 212, 191, 0.45)' },
   },
   hetzner: {
     kind: 'hetzner',
     label: 'HZ',
-    bg: 'rgba(213, 43, 30, 0.13)',
-    fg: '#ff5a4f',
-    border: 'rgba(213, 43, 30, 0.38)',
+    squared: true,
+    light: { bg: '#fee2e2', fg: '#991b1b', border: '#fca5a5' },
+    dark:  { bg: 'rgba(248, 113, 113, 0.18)', fg: '#fca5a5', border: 'rgba(248, 113, 113, 0.50)' },
   },
   aws: {
     kind: 'aws',
     label: 'AWS',
-    bg: 'rgba(255, 153, 0, 0.14)',
-    fg: '#ffb020',
-    border: 'rgba(255, 153, 0, 0.38)',
+    squared: false,
+    light: { bg: '#fef3c7', fg: '#92400e', border: '#fcd34d' },
+    dark:  { bg: 'rgba(251, 191, 36, 0.18)', fg: '#fcd34d', border: 'rgba(251, 191, 36, 0.50)' },
   },
   s3: {
     kind: 's3',
     label: 'S3',
-    bg: 'rgba(148, 163, 184, 0.12)',
-    fg: '#94a3b8',
-    border: 'rgba(148, 163, 184, 0.32)',
+    squared: false,
+    light: { bg: '#e2e8f0', fg: '#334155', border: '#94a3b8' },
+    dark:  { bg: 'rgba(148, 163, 184, 0.18)', fg: '#cbd5e1', border: 'rgba(148, 163, 184, 0.45)' },
   },
 };
 
@@ -84,7 +91,9 @@ interface Props {
 }
 
 export default function BucketBackendBadge({ origin }: Props) {
+  const { isDark } = useTheme();
   const badge = BADGES[classifyBackend(origin)];
+  const palette = isDark ? badge.dark : badge.light;
   return (
     <span
       aria-label={`${badge.label} backend`}
@@ -93,16 +102,17 @@ export default function BucketBackendBadge({ origin }: Props) {
         display: 'inline-flex',
         alignItems: 'center',
         justifyContent: 'center',
-        width: badge.kind === 'aws' ? 28 : 24,
-        height: 16,
-        borderRadius: badge.kind === 'hetzner' ? 4 : 999,
-        border: `1px solid ${badge.border}`,
-        background: badge.bg,
-        color: badge.fg,
+        minWidth: 26,
+        height: 17,
+        padding: '0 6px',
+        borderRadius: badge.squared ? 4 : 999,
+        border: `1px solid ${palette.border}`,
+        background: palette.bg,
+        color: palette.fg,
         fontFamily: 'var(--font-mono)',
-        fontSize: badge.kind === 'aws' ? 8 : 9,
-        fontWeight: 800,
-        letterSpacing: badge.kind === 'aws' ? 0 : 0.4,
+        fontSize: 10,
+        fontWeight: 700,
+        letterSpacing: 0.3,
         lineHeight: 1,
         flexShrink: 0,
       }}
