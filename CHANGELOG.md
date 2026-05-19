@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Removed (BREAKING)
+
+- **Legacy axum-handler S3 adapter retired.** The `s3s` crate adapter
+  has been the production S3 protocol path for several releases; the
+  hand-rolled axum-handler implementation it was meant to replace is
+  now deleted (~3500 LOC of `src/api/handlers/{object,bucket,multipart}.rs`
+  plus the supporting XML response builders, the parity test suite,
+  and `src/api/xml.rs`). With it goes:
+    * the `s3s-adapter` Cargo feature flag (now an unconditional dep),
+    * the `DGP_S3_ADAPTER` env var (no more selector),
+    * the `test-s3s-adapter` CI job and the nightly `test-all-s3s-adapter`
+      job (every test they ran is in the regular matrix already),
+    * the `x-deltaglider-s3-adapter: s3s` diagnostic response header
+      (only useful when both adapters coexisted),
+    * `docs/dev/s3-adapter-decision.md` and `docs/plan/s3s-adapter-migration.md`
+      (superseded by this release).
+  Operators previously rolling back via `DGP_S3_ADAPTER=axum` have no
+  fallback path. If a behavior regression turns up, file a bug against
+  the s3s adapter directly — there is no longer a second implementation
+  to fall back on.
+
 ### Changed (BREAKING)
 
 - **CLI client verbs moved under `s3` subgroup.** The 10 AWS-CLI-shaped

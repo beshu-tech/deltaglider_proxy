@@ -2,13 +2,10 @@
 
 //! Server startup helpers — extracted from main.rs for file size.
 
-use axum::{extract::DefaultBodyLimit, middleware, routing::get, Router};
+use axum::{extract::DefaultBodyLimit, middleware, Router};
 
 use deltaglider_proxy::api::auth::sigv4_auth_middleware;
-use deltaglider_proxy::api::handlers::{
-    bucket_get_handler, create_bucket, delete_bucket, delete_object, delete_objects, get_object,
-    head_bucket, head_object, head_root, list_buckets, post_object, put_object_or_copy, AppState,
-};
+use deltaglider_proxy::api::handlers::{head_root, AppState};
 use deltaglider_proxy::config::{BackendConfig, Config};
 use deltaglider_proxy::config_db_sync::ConfigDbSync;
 use deltaglider_proxy::iam::authorization_middleware;
@@ -285,172 +282,28 @@ pub fn init_iam_state(config: &Config) -> SharedIamState {
 }
 
 /// Build the S3-compatible router with all routes and middleware layers.
+///
+/// Backed by the `s3s` crate, which translates wire-level S3 protocol
+/// onto our [`deltaglider_proxy::s3_adapter_s3s::DeltaGliderS3Service`].
+/// Until recently this function selected between `s3s` and a hand-
+/// rolled axum-handler implementation via `DGP_S3_ADAPTER`; the axum
+/// path has been retired and `s3s` is the only S3 implementation.
+///
+/// What's still axum, around the s3s service:
+///   1. Pre-auth ADMISSION middleware (operator gating).
+///   2. SigV4 + IAM AUTHORIZATION middleware (per-user permission
+///      checks before any storage hit).
+///   3. The HEAD-`/` and POST-multipart/form-data INTERCEPTORS — both
+///      shapes that `s3s` legitimately rejects (HEAD-`/` is not S3
+///      spec; form-POST is a browser-only PostObject path) but real
+///      clients need (Cyberduck connection probes, the SPA's upload
+///      page).
+///   4. Standard cross-cutting layers: TraceLayer, body limit,
+///      per-request timeout, concurrency cap, CORS.
 use deltaglider_proxy::api::ConfigDbMismatchGuard;
 
 #[allow(clippy::too_many_arguments)]
 pub fn build_s3_router(
-    state: &Arc<AppState>,
-    iam_state: &SharedIamState,
-    metrics: &Arc<Metrics>,
-    rate_limiter: &RateLimiter,
-    replay_cache: &deltaglider_proxy::api::auth::ReplayCache,
-    config: &Config,
-    config_db_mismatch: bool,
-    public_prefix_snapshot: &deltaglider_proxy::bucket_policy::SharedPublicPrefixSnapshot,
-    admission_chain: &deltaglider_proxy::admission::SharedAdmissionChain,
-) -> Router {
-    // Move-A status (architectural review, corrected):
-    //
-    // **s3s is the destination, not a research branch.** The s3s
-    // adapter exists explicitly to replace the bespoke axum-handler
-    // S3 implementation with the upstream `s3s` crate's
-    // protocol-driven surface. The migration is in flight: every
-    // change to the axum handlers gets parity-tested against s3s
-    // (tests/s3s_adapter_parity_test.rs) so behavioural drift is
-    // caught early.
-    //
-    // When the `s3s-adapter` feature is compiled in,
-    // `DGP_S3_ADAPTER` defaults to `s3s`. Operators can roll back
-    // to the legacy axum path with `DGP_S3_ADAPTER=axum` if a
-    // regression is found; that's the safety valve, not the
-    // intended path.
-    //
-    // Production Dockerfile currently builds WITHOUT this feature,
-    // so production traffic still hits the axum legacy router.
-    // Getting s3s into the production image is the next concrete
-    // step (Move A). See `docs/dev/s3-adapter-decision.md`.
-    #[cfg(feature = "s3s-adapter")]
-    {
-        let adapter = std::env::var("DGP_S3_ADAPTER").unwrap_or_else(|_| "s3s".to_string());
-        if adapter.eq_ignore_ascii_case("s3s") {
-            info!("S3 adapter: s3s path enabled (default; set DGP_S3_ADAPTER=axum to roll back)");
-            return build_s3s_router(
-                state,
-                iam_state,
-                metrics,
-                rate_limiter,
-                replay_cache,
-                config,
-                config_db_mismatch,
-                public_prefix_snapshot,
-                admission_chain,
-            );
-        }
-        if !adapter.eq_ignore_ascii_case("axum") {
-            tracing::warn!(
-                "Unknown DGP_S3_ADAPTER='{}'; falling back to legacy Axum S3 adapter",
-                adapter
-            );
-        } else {
-            info!("S3 adapter: legacy Axum path enabled (DGP_S3_ADAPTER=axum)");
-        }
-    }
-
-    // S3 API paths:
-    //   GET / - list buckets
-    //   PUT /{bucket} - create bucket
-    //   DELETE /{bucket} - delete bucket
-    //   HEAD /{bucket} - head bucket
-    //   GET /{bucket}?list-type=2 - list objects
-    //   POST /{bucket}?delete - delete multiple objects
-    //   PUT /{bucket}/{key...} - upload object (or copy with x-amz-copy-source)
-    //   GET /{bucket}/{key...} - download object
-    //   HEAD /{bucket}/{key...} - get object metadata
-    //   DELETE /{bucket}/{key...} - delete object
-    let mut router = Router::new()
-        // Health and stats are under /_/ (see demo.rs) — not on the S3 router
-        // Root: list buckets + HEAD probe for S3 client compatibility (Cyberduck, etc.)
-        .route("/", get(list_buckets).head(head_root))
-        // Object operations (wildcard routes first - more specific)
-        .route(
-            "/:bucket/*key",
-            get(get_object)
-                .put(put_object_or_copy)
-                .delete(delete_object)
-                .head(head_object)
-                .post(post_object),
-        )
-        // Bucket operations (without trailing slash)
-        .route(
-            "/:bucket",
-            get(bucket_get_handler)
-                .put(create_bucket)
-                .delete(delete_bucket)
-                .head(head_bucket)
-                .post(delete_objects),
-        )
-        // Bucket operations (with trailing slash)
-        .route(
-            "/:bucket/",
-            get(bucket_get_handler)
-                .put(create_bucket)
-                .delete(delete_bucket)
-                .head(head_bucket)
-                .post(delete_objects),
-        )
-        .layer(TraceLayer::new_for_http())
-        // HTTP metrics middleware (records request counts, durations, sizes)
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            deltaglider_proxy::metrics::http_metrics_middleware,
-        ))
-        // IAM authorization (checks permissions after auth, before handlers)
-        .layer(middleware::from_fn(authorization_middleware))
-        // SigV4 authentication (looks up user, verifies signature)
-        .layer(middleware::from_fn(sigv4_auth_middleware))
-        // Admission chain — pre-auth gating. Layered AFTER SigV4 in builder
-        // order so it runs BEFORE SigV4 at request time (axum applies
-        // layers in reverse).
-        .layer(middleware::from_fn(
-            deltaglider_proxy::admission::admission_middleware,
-        ))
-        .layer(axum::Extension(iam_state.clone()))
-        .layer(axum::Extension(public_prefix_snapshot.clone()))
-        .layer(axum::Extension(admission_chain.clone()));
-
-    // If config DB mismatch, inject guard that blocks all S3 API requests
-    if config_db_mismatch {
-        error!(
-            "S3 API LOCKED — all requests will be rejected until bootstrap password mismatch is resolved via /_/"
-        );
-        router = router.layer(axum::Extension(ConfigDbMismatchGuard));
-    }
-
-    router
-        // Replay attack detection cache for SigV4
-        .layer(axum::Extension(replay_cache.clone()))
-        // Rate limiter extension for auth middleware
-        .layer(axum::Extension(rate_limiter.clone()))
-        // Metrics extension for auth middleware to extract
-        .layer(axum::Extension(metrics.clone()))
-        // Increase body size limit to match max_object_size config (default 2MB is too small)
-        .layer(DefaultBodyLimit::max(config.max_object_size as usize))
-        // Per-request timeout: prevents slow clients from holding concurrency slots forever.
-        // Default: 300s. Override via DGP_REQUEST_TIMEOUT_SECS.
-        // Returns HTTP 504 Gateway Timeout (appropriate for a proxy).
-        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
-            axum::http::StatusCode::GATEWAY_TIMEOUT,
-            std::time::Duration::from_secs(deltaglider_proxy::config::env_parse_with_default(
-                "DGP_REQUEST_TIMEOUT_SECS",
-                300u64,
-            )),
-        ))
-        // Limit total concurrent in-flight requests to prevent resource exhaustion.
-        // Default: 1024. Override via DGP_MAX_CONCURRENT_REQUESTS.
-        .layer(tower::limit::ConcurrencyLimitLayer::new(
-            deltaglider_proxy::config::env_parse_with_default(
-                "DGP_MAX_CONCURRENT_REQUESTS",
-                1024usize,
-            ),
-        ))
-        // CORS must be outermost to handle OPTIONS preflight before auth
-        .layer(CorsLayer::permissive())
-        .with_state(state.clone())
-}
-
-#[cfg(feature = "s3s-adapter")]
-#[allow(clippy::too_many_arguments)]
-fn build_s3s_router(
     state: &Arc<AppState>,
     iam_state: &SharedIamState,
     metrics: &Arc<Metrics>,
@@ -544,10 +397,6 @@ fn build_s3s_router(
         if let Ok(value) = axum::http::HeaderValue::from_str(&request_id) {
             response.headers_mut().insert("x-amz-request-id", value);
         }
-        response.headers_mut().insert(
-            "x-deltaglider-s3-adapter",
-            axum::http::HeaderValue::from_static("s3s"),
-        );
 
         let is_error = response.status().is_client_error() || response.status().is_server_error();
 

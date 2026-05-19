@@ -1,6 +1,6 @@
-# Full `cargo test` matrix (default + s3s-adapter) against MinIO. Scheduled so PR
-# CI can stay a curated fast subset; this catches drift if a crate is dropped
-# from the main workflow by mistake.
+# Full `cargo test --all` against MinIO. Scheduled so PR CI can stay
+# a curated fast subset; this catches drift if a crate is dropped from
+# the main workflow by mistake.
 name: Test all (nightly)
 
 on:
@@ -74,45 +74,3 @@ jobs:
         if: always()
         run: docker rm -f minio-nightly 2>/dev/null || true
 
-  test-all-s3s-adapter:
-    name: cargo test --all (--features s3s-adapter)
-    runs-on: k3s
-    timeout-minutes: 120
-    container:
-      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    env:
-      # See ci.yml `test-integration` for rationale.
-      DGP_BACKEND_ALLOW_LOCAL: "true"
-      DGP_REPLAY_WINDOW_SECS: "0"
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Build demo UI (rust-embed)
-        run: cd demo/s3-browser/ui && npm ci && npm run build
-      - name: Clean stale config DB artifacts
-        run: |
-          rm -f deltaglider_config.db deltaglider_config.db.bak .deltaglider_bootstrap_hash
-          rm -f /tmp/deltaglider_config.db /tmp/deltaglider_config.db.bak /tmp/.deltaglider_bootstrap_hash
-      - name: Start MinIO
-        run: |
-          docker run -d --name minio-nightly-s3s --network container:$(hostname) \
-            -e MINIO_ROOT_USER=minioadmin \
-            -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio:latest server /data
-          for i in $(seq 1 30); do
-            mc alias set local http://localhost:9000 minioadmin minioadmin 2>/dev/null && break
-            sleep 1
-          done
-          mc mb --ignore-existing local/deltaglider-test
-          mc mb --ignore-existing local/deltaglider-data
-          echo "MINIO_ENDPOINT=http://localhost:9000" >> $GITHUB_ENV
-      - name: cargo test --all --locked (s3s)
-        env:
-          RUST_BACKTRACE: "1"
-          DGP_S3_ADAPTER: s3s
-        run: cargo test --all --locked --features s3s-adapter -- --nocapture --test-threads=1
-      - name: Stop MinIO
-        if: always()
-        run: docker rm -f minio-nightly-s3s 2>/dev/null || true

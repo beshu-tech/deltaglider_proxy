@@ -492,11 +492,6 @@ impl TestServerBuilder {
         self
     }
 
-    /// Opt into the experimental `s3s` adapter runtime path.
-    pub fn s3s_adapter(self) -> Self {
-        self.env("DGP_S3_ADAPTER", "s3s")
-    }
-
     /// Add a per-bucket TOML policy section. Example:
     /// `.bucket_policy("releases", r#"public_prefixes = ["builds/"]"#)`
     pub fn bucket_policy(mut self, bucket: &str, toml_body: &str) -> Self {

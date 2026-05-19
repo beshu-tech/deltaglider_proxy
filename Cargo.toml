@@ -116,7 +116,7 @@ prometheus = { version = "0.14", default-features = false, features = ["process"
 rusqlite = { version = "0.39.0", features = ["bundled-sqlcipher"] }
 iam-rs = "0.0.23"
 tower = { version = "0.5", features = ["limit"] }
-s3s = { version = "0.13.0", optional = true }
+s3s = "0.13.0"
 # Recursive directory walker for `cli::cp -r` (local→s3 path). Also
 # used by tests that walk the filesystem backend tree.
 walkdir = "2"
@@ -137,5 +137,3 @@ aws-smithy-types = "1"
 # env var; default case count is 256.
 proptest = "1"
 
-[features]
-s3s-adapter = ["dep:s3s"]

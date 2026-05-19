@@ -2,10 +2,21 @@
 
 //! S3 error types and XML responses
 
-use super::xml::escape_xml;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use thiserror::Error;
+
+/// Escape XML special characters for embedding user-controlled
+/// strings in S3 error responses. Lives here (rather than a separate
+/// `xml` module) because this is the only remaining consumer once
+/// the axum response builders moved into the s3s adapter.
+fn escape_xml(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
 
 /// S3 API errors
 #[derive(Debug, Error)]

@@ -1,26 +1,29 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! S3 API request handlers
+//! S3 API request handlers (shared state + helpers).
 //!
-//! Split into submodules by domain:
-//! - `object` — GET, HEAD, PUT, DELETE for individual objects
-//! - `bucket` — Bucket CRUD and listing
-//! - `multipart` — Multipart upload lifecycle
-//! - `status` — Health check and aggregate stats
+//! With the legacy axum-handler S3 path retired, the only S3
+//! implementation is `src/s3_adapter_s3s.rs` (the `s3s` crate
+//! adapter). This module now hosts only:
+//!
+//! - `AppState` — shared application state for both the s3s adapter
+//!   and the admin API.
+//! - `form_post` — the browser form-POST upload path. Lives outside
+//!   the s3s crate because s3s doesn't model the multipart/form-data
+//!   PostObject shape; the s3s router intercepts that one request
+//!   shape and hands it to `form_post::handle_form_post_upload`.
+//! - `object_helpers` — small shared helpers (the quota gate + the
+//!   per-object event-outbox enqueue), called from both
+//!   `s3_adapter_s3s` and `form_post`.
+//! - `status` — `/_/health` and `/_/stats` legacy endpoints.
+//! - `ensure_bucket_exists`, `debug_headers_enabled`, `audit_log_s3` —
+//!   small free helpers reused by the surviving handlers.
+//!
+//! Pre-consolidation, this module also hosted ~3500 LOC of axum-based
+//! S3 handlers (object, bucket, multipart). Those moved into the
+//! s3s adapter; the old files are gone.
 
-mod bucket;
-// `pub` (not `pub(crate)`) because the binary's `startup.rs` lives
-// outside this library crate and needs to dispatch to
-// `handle_form_post_upload` from its s3s router's interceptor
-// middleware. The function ITSELF is still locked down by being the
-// only public entry point on this module — `parse_form_post_upload`,
-// `authenticate_form_post`, etc. remain `fn` / `pub(super)`.
 pub mod form_post;
-mod multipart;
-mod object;
-// `pub(crate)` so `s3_adapter_s3s` (sibling under the library crate)
-// can reuse `check_quota` — keeps quota enforcement in one place
-// across both S3 adapter paths.
 pub(crate) mod object_helpers;
 mod status;
 
@@ -29,10 +32,8 @@ use crate::config_db::ConfigDb;
 use crate::deltaglider::DynEngine;
 use crate::metrics::Metrics;
 use crate::multipart::MultipartStore;
-use crate::types::{FileMetadata, StorageInfo};
 use arc_swap::ArcSwap;
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::http::HeaderMap;
 use std::sync::Arc;
 
 /// S3 audit log helper — delegates to the shared audit module.
@@ -46,12 +47,6 @@ pub(crate) fn audit_log_s3(
     crate::audit::audit_log(action, user, "", headers, bucket, path);
 }
 
-// Re-export all public handlers and types so callers don't change.
-pub use bucket::{
-    bucket_get_handler, create_bucket, delete_bucket, head_bucket, list_buckets, BucketGetQuery,
-};
-pub use multipart::post_object;
-pub use object::{delete_object, delete_objects, get_object, head_object, put_object_or_copy};
 pub use status::{get_stats, head_root, health_check, HealthResponse, StatsQuery, StatsResponse};
 
 // Re-export for use by metrics module
@@ -70,42 +65,6 @@ pub struct AppState {
     /// TTLs because policy expirations vary from minutes to days).
     /// See `enforce_form_post_replay` in `handlers/form_post.rs`.
     pub form_post_replay: Arc<dashmap::DashMap<String, std::time::Instant>>,
-}
-
-/// Query parameters for object-level operations (multipart upload)
-#[derive(Debug, serde::Deserialize, Default)]
-pub struct ObjectQuery {
-    /// CreateMultipartUpload (POST with ?uploads)
-    pub uploads: Option<String>,
-    /// UploadPart / CompleteMultipartUpload (with ?uploadId)
-    #[serde(rename = "uploadId")]
-    pub upload_id: Option<String>,
-    /// UploadPart (PUT with ?partNumber)
-    #[serde(rename = "partNumber")]
-    pub part_number: Option<u32>,
-    /// ACL operations (GET/PUT with ?acl)
-    pub acl: Option<String>,
-    /// Tagging operations (GET/PUT/DELETE with ?tagging)
-    pub tagging: Option<String>,
-    /// ListParts: page size cap (L1 pagination fix).
-    #[serde(rename = "max-parts")]
-    pub max_parts: Option<u32>,
-    /// ListParts: return parts with number strictly greater than this.
-    #[serde(rename = "part-number-marker")]
-    pub part_number_marker: Option<u32>,
-    /// Response header overrides for presigned URLs
-    #[serde(rename = "response-content-type")]
-    pub response_content_type: Option<String>,
-    #[serde(rename = "response-content-disposition")]
-    pub response_content_disposition: Option<String>,
-    #[serde(rename = "response-cache-control")]
-    pub response_cache_control: Option<String>,
-    #[serde(rename = "response-content-encoding")]
-    pub response_content_encoding: Option<String>,
-    #[serde(rename = "response-content-language")]
-    pub response_content_language: Option<String>,
-    #[serde(rename = "response-expires")]
-    pub response_expires: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -155,241 +114,4 @@ pub fn debug_headers_enabled() -> bool {
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false)
     })
-}
-
-/// Build response headers for an object including DeltaGlider custom metadata.
-fn build_object_headers(metadata: &FileMetadata) -> HeaderMap {
-    let stored_size = metadata.stored_size();
-    let content_type = metadata
-        .content_type
-        .clone()
-        .unwrap_or_else(|| "application/octet-stream".to_string());
-
-    // PERF: itoa::Buffer is stack-allocated (~40 bytes) and formats integers
-    // directly to a &str without heap allocation. The old code used
-    // `metadata.file_size.to_string()` which heap-allocates a String per call.
-    // This function is called on EVERY object response (GET, HEAD, LIST), so
-    // saving 3-4 heap allocs per request adds up. Do NOT replace with .to_string().
-    let mut itoa_buf = itoa::Buffer::new();
-
-    let mut headers = HeaderMap::new();
-    // S3 compatibility: per-request unique ID and range support advertisement
-    headers.insert(
-        "x-amz-request-id",
-        header_value(&uuid::Uuid::new_v4().to_string()),
-    );
-    headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
-    headers.insert("ETag", header_value(&metadata.etag()));
-    // L1 fix: Content-Length should be emitted whenever the size is
-    // KNOWN, including the legitimate zero-byte case. Pre-fix the
-    // helper only emitted it when `file_size > 0`, conflating
-    // "unknown streaming size" with "known zero" and breaking clients
-    // that rely on `Content-Length: 0` to terminate empty responses.
-    //
-    // Discriminator: managed objects (new_passthrough / new_delta /
-    // new_reference) always populate a real `md5` — the canonical
-    // empty-content MD5 (`d41d8cd98f00b204e9800998ecf8427e`) for an
-    // empty body. Fallback metadata for unmanaged objects may carry
-    // an empty md5 string AND `file_size = 0`; that's the only case
-    // where we should keep omitting Content-Length so HTTP chunked
-    // transfer works for the streamed body.
-    let size_is_known = metadata.file_size > 0 || !metadata.md5.is_empty();
-    if size_is_known {
-        headers.insert(
-            "Content-Length",
-            header_value(itoa_buf.format(metadata.file_size)),
-        );
-    }
-    headers.insert("Content-Type", header_value(&content_type));
-    headers.insert(
-        "Last-Modified",
-        header_value(
-            &metadata
-                .created_at
-                .format("%a, %d %b %Y %H:%M:%S GMT")
-                .to_string(),
-        ),
-    );
-    // Only emit fingerprinting headers when debug mode is enabled (DGP_DEBUG_HEADERS=true)
-    if debug_headers_enabled() {
-        headers.insert(
-            "x-amz-storage-type",
-            header_value(metadata.storage_info.label()),
-        );
-        headers.insert(
-            "x-deltaglider-stored-size",
-            header_value(itoa_buf.format(stored_size)),
-        );
-    }
-
-    // DeltaGlider custom metadata (x-amz-meta-dg-*)
-    use crate::types::meta_keys as mk;
-    headers.insert(mk::H_TOOL, header_value(&metadata.tool));
-    headers.insert(mk::H_ORIGINAL_NAME, header_value(&metadata.original_name));
-    headers.insert(mk::H_FILE_SHA256, header_value(&metadata.file_sha256));
-    headers.insert(
-        mk::H_FILE_SIZE,
-        header_value(itoa_buf.format(metadata.file_size)),
-    );
-
-    match &metadata.storage_info {
-        StorageInfo::Reference { source_name } => {
-            headers.insert(mk::H_NOTE, header_value("reference"));
-            headers.insert(mk::H_SOURCE_NAME, header_value(source_name));
-        }
-        StorageInfo::Delta {
-            ref_path,
-            ref_sha256,
-            delta_size,
-            delta_cmd,
-        } => {
-            headers.insert(mk::H_NOTE, header_value("delta"));
-            headers.insert(mk::H_REF_PATH, header_value(ref_path));
-            headers.insert(mk::H_REF_SHA256, header_value(ref_sha256));
-            headers.insert(mk::H_DELTA_SIZE, header_value(itoa_buf.format(*delta_size)));
-            headers.insert(mk::H_DELTA_CMD, header_value(delta_cmd));
-        }
-        StorageInfo::Passthrough => {
-            headers.insert(mk::H_NOTE, header_value("passthrough"));
-        }
-    }
-
-    // User-provided custom metadata (x-amz-meta-*)
-    // Skip any keys with the internal "dg-" prefix (case-insensitive) to prevent
-    // user-injected metadata from masquerading as DeltaGlider internal headers.
-    for (key, value) in &metadata.user_metadata {
-        if key.to_lowercase().starts_with("dg-") {
-            continue;
-        }
-        let header_name = format!("x-amz-meta-{}", key);
-        if let Ok(name) = axum::http::header::HeaderName::from_bytes(header_name.as_bytes()) {
-            headers.insert(name, header_value(value));
-        }
-    }
-
-    headers
-}
-
-/// Convert a string to an HTTP header value, falling back to empty on invalid bytes.
-fn header_value(s: &str) -> HeaderValue {
-    HeaderValue::from_bytes(s.as_bytes()).unwrap_or_else(|_| HeaderValue::from_static(""))
-}
-
-/// Build an XML response with correct Content-Type header.
-fn xml_response(xml: impl Into<String>) -> Response {
-    (
-        StatusCode::OK,
-        [("Content-Type", "application/xml")],
-        xml.into(),
-    )
-        .into_response()
-}
-
-/// Extract Content-Type header as an owned String.
-fn extract_content_type(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-}
-
-/// Parse request body as UTF-8, mapping errors to MalformedXML.
-///
-/// PERF: Returns a borrowed `&str` into the existing `Bytes` buffer — zero-copy.
-/// The old code used `String::from_utf8(body.to_vec())` which copied the entire
-/// request body into a new Vec, then into a String. For a 100KB XML delete request,
-/// that was 200KB of unnecessary allocation.
-/// Do NOT change the return type to `String` or call `body.to_vec()`.
-fn body_to_utf8(body: &axum::body::Bytes) -> Result<&str, S3Error> {
-    std::str::from_utf8(body).map_err(|_| S3Error::MalformedXML)
-}
-
-/// Extract user-provided x-amz-meta-* headers, excluding DeltaGlider internal metadata (dg-*).
-fn extract_user_metadata(headers: &HeaderMap) -> std::collections::HashMap<String, String> {
-    use crate::types::meta_keys as mk;
-    headers
-        .iter()
-        .filter_map(|(name, value)| {
-            let name_str = name.as_str();
-            if let Some(suffix) = name_str.strip_prefix(mk::AMZ_META_PREFIX) {
-                if !suffix.to_lowercase().starts_with("dg-") {
-                    if let Ok(v) = value.to_str() {
-                        return Some((suffix.to_string(), v.to_string()));
-                    }
-                }
-            }
-            None
-        })
-        .collect()
-}
-
-/// Decode base64 string to bytes (for Content-MD5 validation)
-fn base64_decode(input: &str) -> Option<Vec<u8>> {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD
-        .decode(input.trim())
-        .ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Regression: When file_size is 0 AND md5 is empty (unknown,
-    /// e.g. metadata-less fallback path), Content-Length must be
-    /// omitted so HTTP chunked transfer works correctly.
-    /// A `Content-Length: 0` header with a non-empty streaming body breaks clients.
-    #[test]
-    fn zero_file_size_omits_content_length_when_unknown() {
-        let meta = FileMetadata::new_passthrough(
-            "test.bin".to_string(),
-            String::new(),
-            String::new(),
-            0, // unknown size + empty md5 → unknown
-            None,
-        );
-        let headers = build_object_headers(&meta);
-        assert!(
-            headers.get("Content-Length").is_none(),
-            "Content-Length must be omitted when file_size is 0 AND md5 is empty (unmanaged streaming case)"
-        );
-    }
-
-    /// L1 fix: a known zero-byte managed object (real md5 set) MUST
-    /// emit `Content-Length: 0` so HEAD/GET responses are well-formed.
-    /// Pre-fix, the helper conflated "unknown size" with "zero size"
-    /// and never emitted Content-Length for empty-but-known objects.
-    #[test]
-    fn known_zero_byte_managed_object_sets_content_length_zero() {
-        let meta = FileMetadata::new_passthrough(
-            "empty.bin".to_string(),
-            "0".repeat(64),                            // known sha256
-            "d41d8cd98f00b204e9800998ecf8427e".into(), // canonical empty-MD5
-            0,
-            None,
-        );
-        let headers = build_object_headers(&meta);
-        assert_eq!(
-            headers.get("Content-Length").map(|v| v.to_str().unwrap()),
-            Some("0"),
-            "Content-Length: 0 must be emitted for a known zero-byte managed object"
-        );
-    }
-
-    /// When file_size is known and non-zero, Content-Length must be present.
-    #[test]
-    fn known_file_size_sets_content_length() {
-        let meta = FileMetadata::new_passthrough(
-            "test.bin".to_string(),
-            "abc123".to_string(),
-            "def456".to_string(),
-            42,
-            None,
-        );
-        let headers = build_object_headers(&meta);
-        assert_eq!(
-            headers.get("Content-Length").unwrap().to_str().unwrap(),
-            "42"
-        );
-    }
 }

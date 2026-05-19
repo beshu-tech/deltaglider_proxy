@@ -6,9 +6,30 @@
 //! and passes the result through `engine.store()` for delta compression.
 //! Uploads are ephemeral — lost on restart; clients handle this gracefully.
 
-use crate::api::{PartInfo, S3Error, UploadInfo};
+use crate::api::S3Error;
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Duration, Utc};
+
+/// Per-part listing entry used by ListParts. Previously defined in
+/// `src/api/xml.rs`; moved here when the axum XML response builders
+/// were retired with the legacy S3 adapter. The s3s adapter
+/// translates these into its own wire types.
+#[derive(Debug, Clone)]
+pub struct PartInfo {
+    pub part_number: u32,
+    pub etag: String,
+    pub size: u64,
+    pub last_modified: DateTime<Utc>,
+}
+
+/// Per-upload entry used by ListMultipartUploads. Same migration
+/// story as [`PartInfo`].
+#[derive(Debug, Clone)]
+pub struct UploadInfo {
+    pub key: String,
+    pub upload_id: String,
+    pub initiated: DateTime<Utc>,
+}
 use md5::{Digest, Md5};
 use parking_lot::RwLock;
 use rand::Rng;
