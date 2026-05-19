@@ -246,14 +246,18 @@ async fn fold_in_references(
     engine: &DynEngine,
     bucket: &str,
 ) -> Result<(), i32> {
-    let refs = engine
-        .list_deltaspace_references(bucket, "")
+    // limit=None: the CLI `s3 stats` command is the operator's "tell
+    // me the real number" path — same intent as the admin dashboard
+    // scan. The cap is for chip-style latency-sensitive consumers, not
+    // here.
+    let scan = engine
+        .list_deltaspace_references(bucket, "", None)
         .await
         .map_err(|e| {
             eprintln!("warning: failed to enumerate references for {bucket}: {e}");
             cli_exit::EXIT_HTTP
         })?;
-    for meta in &refs {
+    for meta in &scan.references {
         // The reference key shape is `<prefix>reference.bin` — we use
         // the prefix as the deltaspace id elsewhere; here we just need
         // the per-object savings contribution, so any key in the right

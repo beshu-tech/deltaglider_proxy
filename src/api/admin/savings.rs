@@ -13,27 +13,36 @@
 //! that gap once for every consumer.
 //!
 //! Cost model: walks `engine.list_objects(prefix)` paginated for the
-//! user-visible side, then `engine.list_deltaspace_references(prefix)`
-//! for the on-disk reference cost. Result is cached for 30 s per
-//! (bucket, prefix) so a casual click-through of a tree doesn't fire a
-//! full scan on every navigation. On large prefixes (>100 k objects)
-//! the response carries `truncated: true` and the totals are a lower
-//! bound — the operator-facing path for that is the bucket-wide scan
-//! in `bucket_scan.rs`.
+//! user-visible side, then `engine.list_deltaspace_references(prefix,
+//! limit=Some(REFERENCE_SCAN_LIMIT))` for the on-disk reference cost.
+//! Result is cached for 30 s per `(bucket, prefix)` via [`moka`]'s
+//! coalescing `try_get_with` — concurrent misses for the same key
+//! share one in-flight computation rather than each spawning a fresh
+//! paginated scan. On large prefixes (>100 k objects OR >1 k
+//! deltaspaces) the response carries `truncated: true` and the totals
+//! are a lower bound — the operator-facing path for that is the
+//! bucket-wide scan in `bucket_scan.rs`.
+//!
+//! HA caveat: the cache is per-instance. After a PUT routed to
+//! instance A, instance B can serve pre-PUT savings up to 30 s later.
+//! That window is intentional — the chip is a fingerprint, not an
+//! invoice. Operators wanting cross-instance freshness invoke
+//! `/_/api/admin/diagnostics/scan/start` which writes to a shared
+//! disk-cached `ScanResult`.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use chrono::{DateTime, Utc};
-use parking_lot::RwLock;
+use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 
 use crate::api::handlers::AppState;
-use crate::deltaglider::SavingsTotals;
+use crate::deltaglider::{SavingsTotals, REFERENCE_SCAN_LIMIT};
 
 /// Max objects we'll walk before bailing with `truncated: true`. The
 /// per-bucket scan in `bucket_scan.rs` is the path for huge prefixes.
@@ -47,6 +56,11 @@ const CACHE_TTL: Duration = Duration::from_secs(30);
 /// Page size for the user-visible LIST walk. Larger than the dashboard
 /// scan because we expect smaller scopes (prefix not whole bucket).
 const PAGE_SIZE: u32 = 1000;
+
+/// Maximum cached entries. Sized generously — each entry is small
+/// (~120 bytes) and the cost of a miss is the same paginated scan
+/// either way. Beyond this moka does true TinyLFU eviction.
+const CACHE_MAX_ENTRIES: u64 = 4096;
 
 #[derive(Deserialize)]
 pub struct SavingsQuery {
@@ -65,35 +79,41 @@ pub struct SavingsResponse {
     /// nothing under the prefix yet (avoids the UI showing "0%" for an
     /// empty browse).
     pub savings_percentage: Option<f64>,
-    /// True when the walk hit `MAX_LISTING_OBJECTS`; numbers are a
-    /// lower bound. The chip should show a `~` and the tooltip should
-    /// say "scope truncated".
+    /// True when the walk hit `MAX_LISTING_OBJECTS` OR the reference
+    /// scan hit `REFERENCE_SCAN_LIMIT`. The UI shows a `+` suffix and a
+    /// "scope truncated" tooltip; numbers are a strict lower bound.
     pub truncated: bool,
     /// UTC timestamp when this scan finished. The SPA renders a
     /// "Recomputed Xs ago" hint from it.
     pub computed_at: DateTime<Utc>,
 }
 
-/// Boxed cache entry. We key by `(bucket, prefix)`; with 30-second TTL
-/// plus a 1024-entry cap eviction is trivial (drop the oldest on insert
-/// when full).
-struct CacheEntry {
-    response: SavingsResponse,
-    inserted: Instant,
-}
-
-/// In-memory cache. The proxy only has one instance running per node,
-/// so a per-process Mutex is plenty (no need for a distributed cache —
-/// the underlying scans are cheap enough to redo on the rare cache
-/// miss across nodes).
+/// Cache + coalescing harness for per-prefix savings responses.
+///
+/// Implementation: `moka::future::Cache` provides three things in one
+/// data structure:
+///   1. TTL + TinyLFU eviction (replaces the hand-rolled
+///      `RwLock<HashMap>` + "drop oldest" comment that was actually
+///      drop-arbitrary).
+///   2. `try_get_with` coalescing: concurrent misses for the same key
+///      share ONE in-flight future. Closes the thundering-herd window
+///      where N tabs hitting a cold prefix all fire N paginated
+///      scans.
+///   3. Lock-free reads on cache hit.
+///
+/// The `Arc<SavingsResponse>` value is shared by clone — cheap because
+/// the inner struct is ~120 bytes and clone is just an Arc bump.
 pub struct SavingsCache {
-    inner: RwLock<std::collections::HashMap<String, CacheEntry>>,
+    inner: Cache<String, Arc<SavingsResponse>>,
 }
 
 impl SavingsCache {
     pub fn new() -> Self {
         Self {
-            inner: RwLock::new(std::collections::HashMap::with_capacity(64)),
+            inner: Cache::builder()
+                .max_capacity(CACHE_MAX_ENTRIES)
+                .time_to_live(CACHE_TTL)
+                .build(),
         }
     }
 
@@ -101,34 +121,47 @@ impl SavingsCache {
         format!("{}\x00{}", bucket, prefix)
     }
 
-    fn get(&self, bucket: &str, prefix: &str) -> Option<SavingsResponse> {
+    /// Get-or-compute with single-flight coalescing.
+    ///
+    /// If a value is cached and fresh, returns it. If not, runs `init`
+    /// — but if another caller is already running `init` for the same
+    /// key, both share that one future. Errors propagate to ALL
+    /// awaiters of that key (moka semantics): if the first caller's
+    /// compute fails, subsequent calls within the same await window
+    /// see the same error, and the cache stays empty.
+    pub async fn get_or_compute<F, Fut>(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        init: F,
+    ) -> Result<Arc<SavingsResponse>, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<SavingsResponse, String>>,
+    {
         let key = Self::cache_key(bucket, prefix);
-        let guard = self.inner.read();
-        let entry = guard.get(&key)?;
-        if entry.inserted.elapsed() > CACHE_TTL {
-            return None;
-        }
-        Some(entry.response.clone())
+        // moka's try_get_with takes `Future<Output = Result<V, E>>`
+        // and stores ONLY the success value; on error it returns the
+        // error wrapped in `Arc<E>` and does not cache. That's exactly
+        // the semantics we want: a transient backend failure should
+        // not poison the cache for 30 s.
+        self.inner
+            .try_get_with(key, async move {
+                let v = init().await?;
+                Ok::<_, String>(Arc::new(v))
+            })
+            .await
+            .map_err(|arc_err| (*arc_err).clone())
     }
 
-    fn put(&self, response: SavingsResponse) {
-        let key = Self::cache_key(&response.bucket, &response.prefix);
-        let mut guard = self.inner.write();
-        // 1024-entry cap; coarse "drop one" eviction is fine for our
-        // workload — the cache is per-process and the entries are
-        // small (a SavingsResponse is ~120 bytes).
-        if guard.len() >= 1024 && !guard.contains_key(&key) {
-            if let Some(first) = guard.keys().next().cloned() {
-                guard.remove(&first);
-            }
-        }
-        guard.insert(
-            key,
-            CacheEntry {
-                response,
-                inserted: Instant::now(),
-            },
-        );
+    /// Drop a single entry. Wired up if we ever add write-path
+    /// invalidation hooks; not exercised yet (the 30 s TTL is
+    /// considered acceptable lag for the savings display).
+    #[allow(dead_code)]
+    pub async fn invalidate(&self, bucket: &str, prefix: &str) {
+        self.inner
+            .invalidate(&Self::cache_key(bucket, prefix))
+            .await;
     }
 }
 
@@ -153,22 +186,29 @@ pub async fn get_savings(
             .into_response();
     }
 
-    if let Some(cached) = state.savings_cache.get(&q.bucket, &q.prefix) {
-        return (StatusCode::OK, Json(cached)).into_response();
-    }
+    let s3_state = state.s3_state.clone();
+    let bucket_for_compute = q.bucket.clone();
+    let prefix_for_compute = q.prefix.clone();
 
-    let response = match compute_savings(&state.s3_state, &q.bucket, &q.prefix).await {
-        Ok(r) => r,
-        Err(msg) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": msg})),
-            )
-                .into_response();
+    let result = state
+        .savings_cache
+        .get_or_compute(&q.bucket, &q.prefix, move || async move {
+            compute_savings(&s3_state, &bucket_for_compute, &prefix_for_compute).await
+        })
+        .await;
+
+    match result {
+        Ok(arc) => {
+            // moka returns `Arc<SavingsResponse>`. Serde will follow
+            // the Arc transparently via the inner Serialize impl.
+            (StatusCode::OK, Json((*arc).clone())).into_response()
         }
-    };
-    state.savings_cache.put(response.clone());
-    (StatusCode::OK, Json(response)).into_response()
+        Err(msg) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": msg})),
+        )
+            .into_response(),
+    }
 }
 
 /// The pure-ish compute path: pages through user-visible objects,
@@ -218,15 +258,24 @@ async fn compute_savings(
     }
 
     // Fold in references for this scope so `totals.stored_bytes`
-    // matches what's actually on disk. Failures for individual
-    // deltaspaces are logged inside the helper and skipped.
-    let refs = engine
-        .list_deltaspace_references(bucket, prefix)
+    // matches what's actually on disk. The latency-sensitive cap is
+    // applied here — a bucket with 50k deltaspaces would otherwise
+    // fire 50k HEADs against S3 on every cache miss. Operators who
+    // need exhaustive numbers hit the dashboard scan (limit=None)
+    // instead.
+    // Reference-walk cap. Default is the centralised constant; tests
+    // can override via `DGP_REFERENCE_SCAN_LIMIT` to exercise the
+    // truncated path without uploading thousands of deltaspaces.
+    let ref_limit =
+        crate::config::env_parse_with_default("DGP_REFERENCE_SCAN_LIMIT", REFERENCE_SCAN_LIMIT);
+    let ref_scan = engine
+        .list_deltaspace_references(bucket, prefix, Some(ref_limit))
         .await
         .map_err(|e| e.to_string())?;
-    for meta in &refs {
+    for meta in &ref_scan.references {
         totals.accumulate(meta);
     }
+    truncated = truncated || ref_scan.truncated;
 
     let savings_percentage = totals.savings_percentage();
     Ok(SavingsResponse {

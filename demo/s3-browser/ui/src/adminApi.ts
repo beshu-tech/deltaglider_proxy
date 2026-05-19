@@ -1650,6 +1650,13 @@ export interface DeltaspaceEfficiencyReport {
    * subtract from). UIs MUST gate on `original_size_estimated` before
    * rendering this as a savings figure — otherwise healthy S3
    * deltaspaces appear to have "negative savings".
+   *
+   * Wire type is `i64` server-side; JS `number` is precise only to
+   * 2^53 (≈9 PB). Past that ceiling, the displayed value is an
+   * approximation. The Rust side saturates at `i64::MIN`/`i64::MAX`
+   * to keep the cast well-defined. No bucket today gets close to
+   * either limit; documented here so a future report scanning an
+   * EB-scale archive doesn't surprise the next operator.
    */
   savings_bytes: number;
   efficiency: DeltaEfficiency;
@@ -1773,6 +1780,12 @@ export interface VerifyDeltaEfficiencyResponse {
   passthrough_count: number;
   total_original_bytes: number;
   total_stored_bytes: number;
+  /**
+   * Wire type is `i64` server-side. JS `number` is precise to 2^53
+   * (≈9 PB); past that ceiling the displayed value is an approximation.
+   * Rust saturates at i64::MIN/MAX rather than wrapping. See
+   * `savings_bytes` doc on `DeltaspaceEfficiencyReport` for context.
+   */
   true_savings_bytes: number;
   compression_ratio: number | null;
   per_delta: VerifiedDelta[];

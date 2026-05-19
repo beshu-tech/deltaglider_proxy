@@ -502,11 +502,17 @@ async fn run_scan(
         return Err(ScanFailure::Cancelled);
     }
     let engine = s3_state.engine.load();
+    // limit=None: the dashboard scan is the "real number" path; the
+    // operator triggered it explicitly. Cost is the operator's
+    // problem here — they're already waiting on a paginated walk of
+    // every user-visible object. The lightweight chip endpoint passes
+    // Some(REFERENCE_SCAN_LIMIT) instead. Truncation isn't surfaced
+    // on this path because it never happens.
     let refs = engine
-        .list_deltaspace_references(bucket, "")
+        .list_deltaspace_references(bucket, "", None)
         .await
         .map_err(|e| ScanFailure::Error(e.to_string()))?;
-    for meta in &refs {
+    for meta in &refs.references {
         totals.accumulate(meta);
     }
 

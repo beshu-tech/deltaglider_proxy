@@ -59,6 +59,10 @@ struct SavingsTotals {
 struct SavingsResponse {
     totals: SavingsTotals,
     savings_percentage: Option<f64>,
+    /// ISO-8601 UTC of when the scan completed. Used by the
+    /// coalescing test to assert that N concurrent cache-miss
+    /// requests share ONE compute (one `Utc::now()`).
+    computed_at: String,
 }
 
 async fn upload_sibling_family(server: &TestServer, prefix: &str) -> Vec<u8> {
@@ -279,6 +283,170 @@ async fn dashboard_bucket_scan_reports_reference_bytes() {
         "dashboard savings ({}%) ≥ 99% — reference bytes are still being ignored somewhere. result = {}",
         savings_pct,
         result,
+    );
+}
+
+/// Coalescing contract: N concurrent GETs for the same `(bucket, prefix)`
+/// against a COLD cache must share ONE compute_savings invocation.
+///
+/// We can't observe the compute count without a tracing hook, but we
+/// can observe the `computed_at` timestamp: moka's `try_get_with`
+/// guarantees a single compute, so all N responses MUST report the
+/// same instant (the one moment the single in-flight future
+/// completed). Without coalescing, N concurrent misses would each
+/// run compute_savings independently and produce N distinct
+/// timestamps that differ by milliseconds.
+///
+/// The test must HEAT the cache before firing the concurrent round,
+/// since moka's coalescing is for concurrent FUTURE calls; a single
+/// completed call populates the cache and subsequent calls become
+/// regular cache hits (also producing identical timestamps, which
+/// is correct). To exercise the coalescing path specifically we
+/// invalidate the cache first via process-recycle? No: we use a
+/// fresh `(bucket, prefix)` that has never been computed, fire the
+/// concurrent requests, and verify they all returned the same
+/// `computed_at`. Whether that uniformity came from coalescing (one
+/// compute, N awaiters) or from cache-hit (one compute then N
+/// hits) is moot — both are the right answer; the wrong answer is
+/// N distinct timestamps, which is exactly what the OLD `RwLock +
+/// HashMap` would have produced.
+#[tokio::test]
+async fn savings_endpoint_coalesces_concurrent_cold_misses() {
+    use std::collections::HashSet;
+    let server = TestServer::builder()
+        .bucket("delta-savings-coalesce")
+        .bootstrap_password(TEST_BOOTSTRAP_PASSWORD)
+        .build()
+        .await;
+    upload_sibling_family(&server, "releases/coalesce/").await;
+
+    let admin = admin_http_client(&server.endpoint()).await;
+    let url = format!(
+        "{}/_/api/admin/deltaspace/savings?bucket={}&prefix=releases/coalesce/",
+        server.endpoint(),
+        server.bucket()
+    );
+
+    // Fire 20 concurrent GETs against a cold cache. moka must share
+    // one in-flight compute across all of them.
+    let mut handles = Vec::new();
+    for _ in 0..20 {
+        let admin = admin.clone();
+        let url = url.clone();
+        handles.push(tokio::spawn(async move {
+            let resp = admin.get(&url).send().await.expect("savings request");
+            assert!(resp.status().is_success(), "got {}", resp.status());
+            resp.json::<SavingsResponse>()
+                .await
+                .expect("savings json")
+                .computed_at
+        }));
+    }
+    let mut timestamps: HashSet<String> = HashSet::new();
+    for h in handles {
+        let ts = h.await.expect("task join");
+        timestamps.insert(ts);
+    }
+    // Coalescing means all 20 callers see ONE timestamp. Pre-fix the
+    // RwLock+HashMap cache allowed 20 distinct computes (read-then-
+    // put under separate locks); each compute produced its own
+    // `Utc::now()`. The bound here is "no more than 2" — moka's
+    // coalescing window is tight but not literally infinite under
+    // load, and we accept one straggler if scheduling jitter
+    // produces a near-simultaneous miss after the first put.
+    assert!(
+        timestamps.len() <= 2,
+        "expected ≤2 distinct `computed_at` values under coalescing, got {}: {:?}",
+        timestamps.len(),
+        timestamps,
+    );
+}
+
+/// Reference-walk cap propagates `truncated: true` to the wire when
+/// the bucket has more deltaspaces than the lightweight chip path
+/// is willing to walk.
+///
+/// Strategy: override `DGP_REFERENCE_SCAN_LIMIT` to a tiny value
+/// (1) so the chip endpoint must truncate even on a 2-deltaspace
+/// bucket. We upload two SIBLING families under distinct prefixes
+/// so the engine has multiple references to walk.
+///
+/// Then we hit the endpoint with `prefix=` (whole bucket scope) so
+/// both deltaspaces are in scope; with limit=1 the second walks
+/// trip the cap and we get truncated=true. Pre-walk-cap (or pre-
+/// propagation), the chip silently scanned both and the operator
+/// had no way to know the chip was making 50 HEADs/second at the
+/// limit.
+#[tokio::test]
+async fn savings_endpoint_reports_truncated_when_over_reference_cap() {
+    let server = TestServer::builder()
+        .bucket("delta-savings-truncated")
+        .bootstrap_password(TEST_BOOTSTRAP_PASSWORD)
+        .env("DGP_REFERENCE_SCAN_LIMIT", "1")
+        .build()
+        .await;
+    // Two distinct sibling families → two distinct deltaspaces, each
+    // with its own reference.bin.
+    upload_sibling_family(&server, "releases/trunc/v1/").await;
+    upload_sibling_family(&server, "releases/trunc/v2/").await;
+
+    let admin = admin_http_client(&server.endpoint()).await;
+    let url = format!(
+        "{}/_/api/admin/deltaspace/savings?bucket={}&prefix=releases/trunc/",
+        server.endpoint(),
+        server.bucket()
+    );
+    let resp = admin.get(&url).send().await.expect("savings request");
+    assert!(resp.status().is_success(), "got {}", resp.status());
+    let body: serde_json::Value = resp.json().await.expect("savings json");
+    let truncated = body
+        .get("truncated")
+        .and_then(|v| v.as_bool())
+        .expect("response missing `truncated`");
+    assert!(
+        truncated,
+        "DGP_REFERENCE_SCAN_LIMIT=1 + 2 deltaspaces must trip `truncated`. body={body}",
+    );
+    // And the reference count reflects the cap (only ONE
+    // reference contributed bytes, even though 2 exist on disk).
+    let ref_count = body
+        .pointer("/totals/reference_count")
+        .and_then(|v| v.as_u64())
+        .expect("totals.reference_count");
+    assert_eq!(
+        ref_count, 1,
+        "with cap=1 only one reference must be folded in; got body {body}",
+    );
+}
+
+/// Inverse contract: no truncation when the scope fits under the cap.
+/// Same shape as the above but with the default (uncapped-for-tests)
+/// limit; `truncated` must be `false`.
+#[tokio::test]
+async fn savings_endpoint_reports_truncated_false_when_under_cap() {
+    let server = TestServer::builder()
+        .bucket("delta-savings-untruncated")
+        .bootstrap_password(TEST_BOOTSTRAP_PASSWORD)
+        .build()
+        .await;
+    upload_sibling_family(&server, "releases/untruncated/").await;
+
+    let admin = admin_http_client(&server.endpoint()).await;
+    let url = format!(
+        "{}/_/api/admin/deltaspace/savings?bucket={}&prefix=releases/untruncated/",
+        server.endpoint(),
+        server.bucket()
+    );
+    let resp = admin.get(&url).send().await.expect("savings request");
+    assert!(resp.status().is_success(), "got {}", resp.status());
+    let body: serde_json::Value = resp.json().await.expect("savings json");
+    let truncated = body
+        .get("truncated")
+        .and_then(|v| v.as_bool())
+        .expect("response missing `truncated`");
+    assert!(
+        !truncated,
+        "single-deltaspace family must NOT be truncated; got body {body}",
     );
 }
 

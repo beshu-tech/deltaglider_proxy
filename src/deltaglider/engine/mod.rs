@@ -181,6 +181,36 @@ pub struct ListObjectsPage {
     pub next_continuation_token: Option<String>,
 }
 
+/// Result of [`DeltaGliderEngine::list_deltaspace_references`] — the
+/// reference baselines found within a scope, plus a flag telling the
+/// caller whether they're seeing the full set or a bounded prefix.
+///
+/// `truncated == true` means the helper hit [`REFERENCE_SCAN_LIMIT`]
+/// before exhausting the scope. Callers folding these into a savings
+/// total MUST propagate `truncated` to the wire so the UI can render
+/// "scope truncated" rather than implying the number is exact.
+#[derive(Debug, Clone, Default)]
+pub struct ReferenceScan {
+    pub references: Vec<FileMetadata>,
+    pub truncated: bool,
+}
+
+/// Default maximum number of deltaspaces whose `reference.bin`
+/// metadata we will fold into a single lightweight savings scan.
+///
+/// Rationale: each match performs one `get_reference_metadata` —
+/// for the S3 backend that's a HEAD; without a cap a chip refresh
+/// on a 50k-deltaspace bucket fires 50k HEADs every cache miss.
+/// Lightweight callers (the SPA chip's per-prefix endpoint) pass
+/// `Some(REFERENCE_SCAN_LIMIT)`; the operator-triggered admin
+/// dashboard scan + the CLI `stats` command pass `None` to get
+/// the exhaustive answer regardless of cost.
+///
+/// Module-level (rather than associated const on `DeltaGliderEngine`)
+/// so callers can refer to it without specifying the storage backend
+/// type parameter `<S>`.
+pub const REFERENCE_SCAN_LIMIT: usize = 1000;
+
 /// Response from `retrieve_stream()` — either a streaming or buffered response.
 pub enum RetrieveResponse {
     /// Passthrough file streamed from backend (zero-copy, constant memory).
@@ -1000,7 +1030,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     }
 
     /// Return the `reference.bin` metadata for every deltaspace whose
-    /// prefix begins with `scope_prefix` in the given bucket.
+    /// prefix begins with `scope_prefix` in the given bucket, plus a
+    /// `truncated` flag set when the scan hit `limit` matching
+    /// deltaspaces.
     ///
     /// `list_objects` deliberately hides references from S3-compatible
     /// callers (a `reference.bin` is an implementation detail, not a
@@ -1011,7 +1043,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// without re-implementing per-backend listing details at the call
     /// sites.
     ///
-    /// `scope_prefix == ""` returns every reference in the bucket.
+    /// `scope_prefix == ""` returns every reference in the bucket
+    /// (bounded by `limit`).
+    /// `limit: None` means "no cap"; `limit: Some(n)` stops after n
+    /// matches and sets `truncated: true`. The constant
+    /// [`Self::REFERENCE_SCAN_LIMIT`] is the recommended cap for
+    /// latency-sensitive paths.
     ///
     /// Errors from `get_reference_metadata` for individual deltaspaces
     /// are logged and skipped — a missing or unreadable reference for
@@ -1020,7 +1057,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         &self,
         bucket: &str,
         scope_prefix: &str,
-    ) -> Result<Vec<crate::types::FileMetadata>, EngineError> {
+        limit: Option<usize>,
+    ) -> Result<ReferenceScan, EngineError> {
         let all = self.storage.list_deltaspaces(bucket).await?;
         // Normalise `scope_prefix` for the starts_with check below.
         // Storage backends return deltaspace prefixes WITHOUT trailing
@@ -1029,7 +1067,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // slash so `releases/v1/`-shaped scopes match `releases/v1` and
         // `releases/v1/sub`. An empty scope means "everything".
         let scope_norm = scope_prefix.trim_end_matches('/');
-        let mut out = Vec::new();
+        let mut references = Vec::new();
+        let mut truncated = false;
         let prefix_match = |p: &str| -> bool {
             if scope_norm.is_empty() {
                 return true;
@@ -1040,8 +1079,17 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             if !prefix_match(&prefix) {
                 continue;
             }
+            if limit.is_some_and(|n| references.len() >= n) {
+                truncated = true;
+                tracing::info!(
+                    "list_deltaspace_references: hit cap {:?} for bucket={bucket} scope={scope_prefix} \
+                     — caller should treat totals as a lower bound and surface `truncated` to the UI.",
+                    limit,
+                );
+                break;
+            }
             match self.storage.get_reference_metadata(bucket, &prefix).await {
-                Ok(meta) => out.push(meta),
+                Ok(meta) => references.push(meta),
                 Err(e) => {
                     tracing::warn!(
                         "list_deltaspace_references: skipping {}/{} ({}). \
@@ -1054,7 +1102,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 }
             }
         }
-        Ok(out)
+        Ok(ReferenceScan {
+            references,
+            truncated,
+        })
     }
 
     /// Internal: build a ListObjectsPage from bulk_list_objects + in-memory

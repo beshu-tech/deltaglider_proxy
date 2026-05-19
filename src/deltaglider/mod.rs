@@ -11,6 +11,9 @@ pub mod savings;
 pub use cache::ReferenceCache;
 pub use codec::{CodecError, DeltaCodec};
 pub(crate) use engine::{derive_key_id, interleave_and_paginate};
-pub use engine::{DeltaGliderEngine, DynEngine, EngineError, ListObjectsPage, RetrieveResponse};
+pub use engine::{
+    DeltaGliderEngine, DynEngine, EngineError, ListObjectsPage, ReferenceScan, RetrieveResponse,
+    REFERENCE_SCAN_LIMIT,
+};
 pub use file_router::{CompressionStrategy, FileRouter};
 pub use savings::SavingsTotals;

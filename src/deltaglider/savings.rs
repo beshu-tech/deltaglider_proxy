@@ -110,8 +110,23 @@ impl SavingsTotals {
     /// reference for nothing). The admin "delta efficiency" diagnostic
     /// reports this verbatim; UI surfaces meant for end users should
     /// prefer [`Self::saved_bytes`] which clamps to 0.
+    ///
+    /// Saturates at `i64::MIN`/`i64::MAX` rather than wrapping when
+    /// totals exceed the i64 range. In practice this only kicks in
+    /// for buckets past the 8 EB mark — far beyond anything physical
+    /// — but the explicit saturation prevents a future refactor from
+    /// silently shipping wrap-around UB. Note: JS `number` is precise
+    /// only to 2^53 (≈9 PB); past that, the SPA renders an
+    /// approximation. See `adminApi.ts::true_savings_bytes` for the
+    /// wire-side documentation.
     pub fn saved_bytes_signed(&self) -> i64 {
-        self.original_bytes as i64 - self.stored_bytes as i64
+        // i64::try_from is the explicit saturation primitive: it
+        // returns Err on overflow, which we then clamp to i64::MAX.
+        // The subtraction itself happens on i128 to avoid the
+        // intermediate overflow we'd otherwise hit on `u64 as i64 -
+        // u64 as i64` at u64::MAX.
+        let diff = self.original_bytes as i128 - self.stored_bytes as i128;
+        diff.clamp(i64::MIN as i128, i64::MAX as i128) as i64
     }
 
     /// Raw compression ratio `1 - stored/original` as a fraction (not
@@ -367,26 +382,45 @@ mod tests {
     /// the saturating semantics. Saturates if necessary so the worst
     /// case is bounded.
     #[test]
-    fn saved_bytes_signed_extreme_petabyte_scale() {
-        // 8 EB — comfortably past i64 range when cast.
+    fn saved_bytes_signed_saturates_past_i64_range() {
+        // u64::MAX original vs zero stored ≈ 18 EB. i64::MAX is half
+        // of u64::MAX, so the diff must saturate at i64::MAX rather
+        // than wrap to a negative number (the old `as i64`
+        // subtraction had this bug latent).
         let t = SavingsTotals {
             original_bytes: u64::MAX,
-            stored_bytes: u64::MAX / 2,
+            stored_bytes: 0,
             ..SavingsTotals::default()
         };
-        // The signed cast is documented to be safe up to 2^53 in
-        // adminApi.ts (JS number precision). The Rust side must at
-        // least produce a defined value (no panic, no UB).
-        let signed = t.saved_bytes_signed();
-        // Whatever the value, it must be finite and well-defined.
-        // We don't assert a specific number — at u64::MAX the cast to
-        // i64 wraps to -1, which is intentional (saturation is the
-        // caller's responsibility for display). Document that.
-        let _ = signed;
-        // Compression ratio must remain in (−∞, 1.0].
-        let r = t.compression_ratio().expect("ratio");
-        assert!(r.is_finite(), "ratio must be finite, got {r}");
-        assert!(r <= 1.0, "ratio must be ≤ 1.0, got {r}");
+        assert_eq!(
+            t.saved_bytes_signed(),
+            i64::MAX,
+            "must saturate at i64::MAX, not wrap to negative",
+        );
+
+        // Inverse: u64::MAX stored vs zero original must saturate at
+        // i64::MIN, expressing "the proxy is grossly heavier than
+        // what it claims to encode".
+        let t = SavingsTotals {
+            original_bytes: 0,
+            stored_bytes: u64::MAX,
+            ..SavingsTotals::default()
+        };
+        assert_eq!(
+            t.saved_bytes_signed(),
+            i64::MIN,
+            "negative saturation at i64::MIN",
+        );
+
+        // Pre-petabyte sanity: a 4 PB savings (well inside i64 +
+        // inside JS's 2^53 safe range) must be exact.
+        let four_pb = 4 * 1024u64.pow(5);
+        let t = SavingsTotals {
+            original_bytes: four_pb,
+            stored_bytes: 0,
+            ..SavingsTotals::default()
+        };
+        assert_eq!(t.saved_bytes_signed(), four_pb as i64);
     }
 
     /// Pin: calling `accumulate` twice on the same metadata DOES

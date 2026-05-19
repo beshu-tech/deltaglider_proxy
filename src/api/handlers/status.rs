@@ -111,12 +111,16 @@ async fn compute_stats(
         // hidden from list_objects but they cost real disk. Failures
         // for individual deltaspaces are warn-logged inside the helper
         // and don't poison the scan.
-        for meta in engine
-            .list_deltaspace_references(bucket, "")
+        //
+        // limit=None: /_/stats is the legacy headline that surfaces
+        // bucket totals. The cap exists for chip-style latency-
+        // sensitive paths, not here.
+        let scan = engine
+            .list_deltaspace_references(bucket, "", None)
             .await
-            .unwrap_or_default()
-        {
-            totals.accumulate(&meta);
+            .unwrap_or_default();
+        for meta in &scan.references {
+            totals.accumulate(meta);
         }
     }
 
