@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.12.0 — 2026-05-19
+
 ### Removed (BREAKING)
 
 - **Legacy axum-handler S3 adapter retired.** The `s3s` crate adapter
