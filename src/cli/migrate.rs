@@ -27,6 +27,7 @@ use crate::cli::s3_url::{is_s3_url, parse_s3_url, S3Loc};
 use crate::deltaglider::DynEngine;
 use std::collections::HashSet;
 use std::io::BufRead;
+use std::sync::Arc;
 
 #[derive(clap::Args, Debug, Clone)]
 pub struct MigrateArgs {
@@ -75,9 +76,23 @@ pub struct MigrateArgs {
     #[arg(short, long)]
     pub quiet: bool,
 
-    /// S3 endpoint URL.
+    /// S3 endpoint URL for the destination side (and the default for
+    /// the source side if `--source-endpoint-url` is not set).
     #[arg(long, value_name = "URL")]
     pub endpoint_url: Option<String>,
+
+    /// S3 endpoint URL for the SOURCE side. When set, the source
+    /// list and retrieve calls go to this endpoint; the destination
+    /// list and store calls keep using `--endpoint-url` (or the
+    /// default region endpoint). Use this to migrate between two
+    /// distinct S3 providers (e.g. Hetzner → AWS).
+    ///
+    /// Credentials for the source side come from the same `--profile`
+    /// / `--access-key-id` / `--secret-access-key` resolution as the
+    /// destination today. Add per-side credential flags later if
+    /// operators ask.
+    #[arg(long, value_name = "URL")]
+    pub source_endpoint_url: Option<String>,
 
     /// AWS region.
     #[arg(long, value_name = "NAME")]
@@ -147,7 +162,7 @@ pub async fn run(args: MigrateArgs) -> i32 {
         }
     };
 
-    let engine = match build_engine_from_args(&args).await {
+    let (src_engine, dst_engine) = match build_engines_from_args(&args).await {
         Ok(e) => e,
         Err(code) => return code,
     };
@@ -156,13 +171,13 @@ pub async fn run(args: MigrateArgs) -> i32 {
     let dest_prefix_eff = effective_dest_prefix(&src_loc.key, &dst_loc.key, preserve_prefix);
 
     // List source.
-    let src_keys = match list_prefix(&engine, &src_loc.bucket, &src_loc.key).await {
+    let src_keys = match list_prefix(&src_engine, &src_loc.bucket, &src_loc.key).await {
         Ok(k) => k,
         Err(code) => return code,
     };
 
     // List destination (for resume support — skip already-migrated keys).
-    let dst_keys = match list_prefix(&engine, &dst_loc.bucket, &dest_prefix_eff).await {
+    let dst_keys = match list_prefix(&dst_engine, &dst_loc.bucket, &dest_prefix_eff).await {
         Ok(k) => k,
         Err(code) => return code,
     };
@@ -233,7 +248,8 @@ pub async fn run(args: MigrateArgs) -> i32 {
             );
         }
         match copy_one(
-            &engine,
+            &src_engine,
+            &dst_engine,
             &src_loc.bucket,
             src_full,
             &dst_loc.bucket,
@@ -316,14 +332,15 @@ async fn list_prefix(engine: &DynEngine, bucket: &str, prefix: &str) -> Result<V
 }
 
 async fn copy_one(
-    engine: &DynEngine,
+    src_engine: &DynEngine,
+    dst_engine: &DynEngine,
     src_bucket: &str,
     src_key: &str,
     dst_bucket: &str,
     dst_key: &str,
     no_delta: bool,
 ) -> i32 {
-    let (data, metadata) = match engine.retrieve(src_bucket, src_key).await {
+    let (data, metadata) = match src_engine.retrieve(src_bucket, src_key).await {
         Ok(t) => t,
         Err(e) => {
             eprintln!("error: retrieve {src_key} failed: {e}");
@@ -335,7 +352,7 @@ async fn copy_one(
         user_meta.insert("dg-no-delta".to_string(), "true".to_string());
     }
     let ct = metadata.content_type;
-    match engine
+    match dst_engine
         .store(dst_bucket, dst_key, &data, ct, user_meta)
         .await
     {
@@ -358,7 +375,22 @@ fn parse_url(url: &str) -> Result<S3Loc, i32> {
     })
 }
 
-async fn build_engine_from_args(args: &MigrateArgs) -> Result<DynEngine, i32> {
+/// Build the (source, destination) engine pair.
+///
+/// When `--source-endpoint-url` is unset both halves of the tuple point
+/// to the same engine (via `Arc::clone`) — the two-engine path is paid
+/// only when the source actually lives on a different provider.
+/// Credentials are reused across both sides (per the v1 spec; per-side
+/// credential flags can land later if there's demand).
+///
+/// Returns `Arc`s because `DynEngine` (which holds an `Arc<dyn
+/// StorageBackend>` inside it) is not `Clone`-derived itself — the
+/// caller needs cheap sharing without a deep copy. `Arc` here is for
+/// the engine *handle*, not for the storage backend (which already
+/// internally Arc's its connection pool).
+async fn build_engines_from_args(
+    args: &MigrateArgs,
+) -> Result<(Arc<DynEngine>, Arc<DynEngine>), i32> {
     let creds = aws_creds::resolve(aws_creds::CredsInputs {
         access_key_flag: args.access_key_id.as_deref(),
         secret_key_flag: args.secret_access_key.as_deref(),
@@ -370,19 +402,41 @@ async fn build_engine_from_args(args: &MigrateArgs) -> Result<DynEngine, i32> {
         eprintln!("error: {e}");
         cli_exit::EXIT_AUTH
     })?;
-    let opts = CliEngineOpts {
+    let region = creds.region.unwrap_or_else(|| "us-east-1".into());
+    let dst_opts = CliEngineOpts {
         endpoint: args.endpoint_url.clone(),
-        region: creds.region.unwrap_or_else(|| "us-east-1".into()),
+        region: region.clone(),
         force_path_style: args.force_path_style,
-        access_key_id: creds.access_key_id,
-        secret_access_key: creds.secret_access_key,
+        access_key_id: creds.access_key_id.clone(),
+        secret_access_key: creds.secret_access_key.clone(),
         max_delta_ratio: args.max_ratio,
         allow_local: should_allow_local(args.endpoint_url.as_deref()),
     };
-    build_cli_engine(opts).await.map_err(|e| {
-        eprintln!("error: failed to initialise S3 client: {e}");
+    let dst_engine = Arc::new(build_cli_engine(dst_opts).await.map_err(|e| {
+        eprintln!("error: failed to initialise destination S3 client: {e}");
         cli_exit::EXIT_HTTP
-    })
+    })?);
+
+    let src_engine = match args.source_endpoint_url.as_deref() {
+        None => Arc::clone(&dst_engine),
+        Some(src_url) => {
+            let src_opts = CliEngineOpts {
+                endpoint: Some(src_url.to_string()),
+                region,
+                force_path_style: args.force_path_style,
+                access_key_id: creds.access_key_id,
+                secret_access_key: creds.secret_access_key,
+                max_delta_ratio: args.max_ratio,
+                allow_local: should_allow_local(Some(src_url)),
+            };
+            Arc::new(build_cli_engine(src_opts).await.map_err(|e| {
+                eprintln!("error: failed to initialise source S3 client: {e}");
+                cli_exit::EXIT_HTTP
+            })?)
+        }
+    };
+
+    Ok((src_engine, dst_engine))
 }
 
 /// Block on a yes/no confirmation. Returns true on `y` / `yes`.

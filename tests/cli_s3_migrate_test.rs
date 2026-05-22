@@ -54,6 +54,7 @@ fn migrate_args(src: String, dst: String) -> MigrateArgs {
         no_delta: false,
         quiet: true,
         endpoint_url: Some(minio_endpoint_url()),
+        source_endpoint_url: None,
         region: Some("us-east-1".into()),
         profile: None,
         access_key_id: Some(MINIO_ACCESS_KEY.into()),
