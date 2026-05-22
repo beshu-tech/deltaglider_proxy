@@ -61,6 +61,30 @@ impl DeltaGliderS3Service {
 
 #[async_trait::async_trait]
 impl s3s::S3 for DeltaGliderS3Service {
+    /// HeadBucket — `HEAD /<bucket>`
+    ///
+    /// The s3s default returns `501 NotImplemented`, which broke the
+    /// `error_test::test_nosuchbucket_xml_response` and
+    /// `test_entitytoolarge_response` integration tests after the legacy
+    /// axum HEAD-bucket handler was retired in `2f8e483`. Real AWS / MinIO
+    /// return `200` when the bucket exists and `404 NoSuchBucket` when it
+    /// doesn't, so we mirror that contract via `ensure_bucket_exists_s3s`.
+    ///
+    /// The `x-amz-bucket-region` header is conventionally returned on
+    /// HeadBucket; s3s emits it from `bucket_region` on the output, and
+    /// we hard-code `us-east-1` to match the legacy axum handler and the
+    /// `get_bucket_location` constraint.
+    async fn head_bucket(
+        &self,
+        req: s3s::S3Request<s3s::dto::HeadBucketInput>,
+    ) -> s3s::S3Result<s3s::S3Response<s3s::dto::HeadBucketOutput>> {
+        ensure_bucket_exists_s3s(&self.state, &req.input.bucket).await?;
+        Ok(s3s::S3Response::new(s3s::dto::HeadBucketOutput {
+            bucket_region: Some("us-east-1".to_string()),
+            ..Default::default()
+        }))
+    }
+
     async fn head_object(
         &self,
         req: s3s::S3Request<s3s::dto::HeadObjectInput>,
