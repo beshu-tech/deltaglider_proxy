@@ -2,6 +2,68 @@
 
 ## Unreleased
 
+## v1.0.0 — 2026-05-22 — Project-shape milestone
+
+v1.0.0 marks the official **single canonical implementation**: one Rust
+binary (`deltaglider_proxy`) ships the S3-compatible proxy, the
+AWS-CLI-shaped `s3` command group, and the web UI. The Python
+[`deltaglider`](https://github.com/beshu-tech/deltaglider) tool is
+deprecated as of its parallel v6.2.0 release; PyPI installs continue
+to work indefinitely but no further updates will land there. The wire
+format remains byte-identical across both tools.
+
+This release also closes the four post-v0.12.0 regression fixes
+(`HeadBucket` 501, multipart `x-amz-storage-type` header drop, `s3 ls`
+doctest, all from the v0.12.0 axum-handler retirement) plus the
+small UX gaps the v1.0.0 plan flagged.
+
+### Changed
+
+- **`s3 migrate` learned `--source-endpoint-url`** for cross-provider
+  migrations (e.g. Hetzner → AWS). When unset, behaviour is identical
+  to v0.12.0: a single engine handles both sides. When set, builds
+  two engines (source + destination); credentials are shared across
+  both. Per-side credential flags can land later if operators ask.
+- **`s3 cp` / `s3 sync` / `s3 migrate` learned `--max-object-size-mb`**
+  to override the engine's per-invocation 100 MiB defensive ceiling
+  (memory-safe limit for xdelta3 — reference + delta + result all
+  held in RAM simultaneously). Operators uploading large artifacts
+  (release ZIPs, disk images) used to hit a "Object too large" error
+  with no actionable hint; now there's a flag and the error text
+  points at it.
+
+### Fixed
+
+- **s3s: implement `HeadBucket` (`HEAD /<bucket>`).** The v0.12.0
+  axum-handler retirement deleted the legacy handler but the s3s
+  trait impl never had one of its own — s3s's default returned 501.
+  Real AWS / MinIO return `404 NoSuchBucket` when the bucket is
+  missing; we now mirror that. Restores
+  `error_test::test_nosuchbucket_xml_response` and
+  `test_entitytoolarge_response`.
+- **s3s multipart: emit `x-amz-storage-type` on
+  CompleteMultipartUpload.** The legacy axum handler set this header
+  from `store_result.metadata.storage_info.label()`; the s3s impl
+  dropped it during the v0.12.0 retirement. Restored to match
+  `head_object` / `get_object` / `put_object` parity, fixing
+  `test_multipart_delta_compression` and
+  `test_multipart_large_zip_forces_passthrough_on_s3_backend`.
+- **cli docs: `s3 ls` shell example no longer breaks `cargo test --doc`.**
+  The four-space indentation made rustdoc try to compile the example
+  as Rust. Wrapped in ```text so it stays prose.
+- **Stronger `--max-object-size-mb` error path:** Detect
+  `EngineError::TooLarge` in `cp` / `sync` / `migrate` and render an
+  actionable message naming both the per-invocation flag and the
+  server-side `max_object_size` YAML knob.
+
+### Deprecated (downstream — not in this repo)
+
+- **The Python `deltaglider` package is deprecated as of v6.2.0.**
+  Migration: `brew install beshu-tech/tap/deltaglider_proxy` (or
+  download the binary), then `alias dg='deltaglider_proxy s3'`. Every
+  Python subcommand has a 1:1 Rust equivalent. The Python repo will
+  be archived approximately one week after v6.2.0 hits PyPI.
+
 ## v0.12.0 — 2026-05-19
 
 ### Removed (BREAKING)
