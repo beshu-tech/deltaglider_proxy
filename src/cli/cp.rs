@@ -15,7 +15,7 @@
 
 use crate::cli::aws_creds;
 use crate::cli::config as cli_exit;
-use crate::cli::engine_factory::{build_cli_engine, CliEngineOpts};
+use crate::cli::engine_factory::{build_cli_engine, render_store_error, CliEngineOpts};
 use crate::cli::filter::Filter;
 use crate::cli::ls::should_allow_local;
 use crate::cli::s3_url::{is_s3_url, parse_s3_url, S3Loc};
@@ -101,6 +101,13 @@ pub struct CpArgs {
     /// Use path-style URLs (MinIO / LocalStack).
     #[arg(long)]
     pub force_path_style: bool,
+
+    /// Override the engine's per-object size ceiling (MiB). The proxy
+    /// defaults to 100 MiB — the memory-safe ceiling for xdelta3-based
+    /// delta encoding. Raise this for large artifacts (release ZIPs,
+    /// disk images). Affects this CLI invocation only.
+    #[arg(long, value_name = "MIB")]
+    pub max_object_size_mb: Option<u64>,
 }
 
 /// Direction the `cp` command resolves from SRC × DST.
@@ -189,6 +196,7 @@ pub async fn run(args: CpArgs) -> i32 {
         access_key_id: creds.access_key_id,
         secret_access_key: creds.secret_access_key,
         max_delta_ratio: args.max_ratio,
+        max_object_size: args.max_object_size_mb.map(|mb| mb * 1024 * 1024),
         allow_local: should_allow_local(args.endpoint_url.as_deref()),
     };
     let engine = match build_cli_engine(opts).await {
@@ -346,7 +354,7 @@ async fn upload_one(
     match engine.store(bucket, key, &data, content_type, meta).await {
         Ok(_) => cli_exit::EXIT_OK,
         Err(e) => {
-            eprintln!("error: upload {} failed: {e}", key);
+            eprintln!("error: upload {} failed: {}", key, render_store_error(&e));
             cli_exit::EXIT_HTTP
         }
     }
@@ -574,7 +582,7 @@ async fn copy_one(
     match engine.store(dst_bucket, dst_key, &data, ct, meta).await {
         Ok(_) => cli_exit::EXIT_OK,
         Err(e) => {
-            eprintln!("error: destination put failed: {e}");
+            eprintln!("error: destination put failed: {}", render_store_error(&e));
             cli_exit::EXIT_HTTP
         }
     }

@@ -20,7 +20,7 @@
 
 use crate::cli::aws_creds;
 use crate::cli::config as cli_exit;
-use crate::cli::engine_factory::{build_cli_engine, CliEngineOpts};
+use crate::cli::engine_factory::{build_cli_engine, render_store_error, CliEngineOpts};
 use crate::cli::filter::Filter;
 use crate::cli::ls::should_allow_local;
 use crate::cli::s3_url::{is_s3_url, parse_s3_url, S3Loc};
@@ -113,6 +113,12 @@ pub struct MigrateArgs {
     /// Use path-style URLs (MinIO / LocalStack).
     #[arg(long)]
     pub force_path_style: bool,
+
+    /// Override the engine's per-object size ceiling (MiB) for BOTH
+    /// source and destination. Default 100 MiB. Migrations of large
+    /// artifacts (release ZIPs, disk images) need this raised.
+    #[arg(long, value_name = "MIB")]
+    pub max_object_size_mb: Option<u64>,
 }
 
 /// Pure: compute the effective destination prefix given source prefix +
@@ -358,7 +364,7 @@ async fn copy_one(
     {
         Ok(_) => cli_exit::EXIT_OK,
         Err(e) => {
-            eprintln!("error: store {dst_key} failed: {e}");
+            eprintln!("error: store {dst_key} failed: {}", render_store_error(&e));
             cli_exit::EXIT_HTTP
         }
     }
@@ -410,6 +416,7 @@ async fn build_engines_from_args(
         access_key_id: creds.access_key_id.clone(),
         secret_access_key: creds.secret_access_key.clone(),
         max_delta_ratio: args.max_ratio,
+        max_object_size: args.max_object_size_mb.map(|mb| mb * 1024 * 1024),
         allow_local: should_allow_local(args.endpoint_url.as_deref()),
     };
     let dst_engine = Arc::new(build_cli_engine(dst_opts).await.map_err(|e| {
@@ -427,6 +434,7 @@ async fn build_engines_from_args(
                 access_key_id: creds.access_key_id,
                 secret_access_key: creds.secret_access_key,
                 max_delta_ratio: args.max_ratio,
+                max_object_size: args.max_object_size_mb.map(|mb| mb * 1024 * 1024),
                 allow_local: should_allow_local(Some(src_url)),
             };
             Arc::new(build_cli_engine(src_opts).await.map_err(|e| {

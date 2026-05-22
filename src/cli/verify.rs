@@ -87,6 +87,7 @@ pub async fn run(args: VerifyArgs) -> i32 {
         access_key_id: creds.access_key_id,
         secret_access_key: creds.secret_access_key,
         max_delta_ratio: None,
+        max_object_size: None,
         allow_local: should_allow_local(args.endpoint_url.as_deref()),
     };
     let engine = match build_cli_engine(opts).await {

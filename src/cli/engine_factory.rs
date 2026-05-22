@@ -22,6 +22,15 @@ pub struct CliEngineOpts {
     pub secret_access_key: String,
     /// Override `Config::max_delta_ratio` when set.
     pub max_delta_ratio: Option<f32>,
+    /// Override `Config::max_object_size` (in bytes) when set. The
+    /// engine's default is 100 MB — the proxy's defensive memory
+    /// ceiling because xdelta3 holds reference + delta + result in
+    /// RAM simultaneously. CLI invocations against large artifacts
+    /// (release ZIPs, OS images) need to raise this. Surfaced via
+    /// `--max-object-size-mb` on the CLI subcommands that ingest
+    /// data (`cp`, `sync`, `migrate`); reading-only verbs (`ls`,
+    /// `stats`, `verify`, `purge`, `rm`) ignore it.
+    pub max_object_size: Option<u64>,
     /// When the operator hands us a private-IP / localhost endpoint
     /// (typical MinIO / dev pattern), set `DGP_BACKEND_ALLOW_LOCAL=true`
     /// in the CLI process so the SSRF guard at `src/storage/s3.rs`
@@ -53,11 +62,14 @@ pub async fn build_cli_engine(opts: CliEngineOpts) -> Result<DynEngine, BuildErr
         secret_access_key: Some(opts.secret_access_key),
         allow_local: opts.allow_local,
     };
-    let cfg = Config {
+    let mut cfg = Config {
         backend,
         max_delta_ratio: opts.max_delta_ratio.unwrap_or_else(default_max_delta_ratio),
         ..Config::default()
     };
+    if let Some(size) = opts.max_object_size {
+        cfg.max_object_size = size;
+    }
 
     let engine = DynEngine::new(&cfg, None).await?;
     Ok(engine)
@@ -65,6 +77,32 @@ pub async fn build_cli_engine(opts: CliEngineOpts) -> Result<DynEngine, BuildErr
 
 fn default_max_delta_ratio() -> f32 {
     Config::default().max_delta_ratio
+}
+
+/// Render an engine error for the operator. For `TooLarge` we surface
+/// the actionable knob (`--max-object-size-mb`) so users don't have
+/// to dig through docs after their multi-GB release upload fails 100
+/// MiB in. Other errors fall through to the existing Display impl.
+///
+/// Kept tiny on purpose — the CLI ingest verbs (`cp`, `sync`,
+/// `migrate`) all want the same hint, but the read-only verbs never
+/// hit `TooLarge` so they don't need this helper.
+pub fn render_store_error(e: &crate::deltaglider::EngineError) -> String {
+    use crate::deltaglider::EngineError;
+    match e {
+        EngineError::TooLarge { size, max } => {
+            let size_mb = *size as f64 / (1024.0 * 1024.0);
+            let max_mb = *max as f64 / (1024.0 * 1024.0);
+            format!(
+                "object exceeds engine size cap ({size_mb:.1} MiB > {max_mb:.1} MiB). \
+                 Raise the cap for this invocation with --max-object-size-mb <MIB>, \
+                 or set `max_object_size` in the proxy config for server-side raises. \
+                 Note: xdelta3 memory scales with object size; values >1 GiB may OOM \
+                 small hosts."
+            )
+        }
+        other => other.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -111,6 +149,7 @@ mod tests {
             access_key_id: "AK".into(),
             secret_access_key: "SK".into(),
             max_delta_ratio: Some(0.5),
+            max_object_size: None,
             allow_local: false,
         };
         let cfg = Config {

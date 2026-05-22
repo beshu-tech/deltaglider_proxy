@@ -22,7 +22,7 @@
 
 use crate::cli::aws_creds;
 use crate::cli::config as cli_exit;
-use crate::cli::engine_factory::{build_cli_engine, CliEngineOpts};
+use crate::cli::engine_factory::{build_cli_engine, render_store_error, CliEngineOpts};
 use crate::cli::filter::Filter;
 use crate::cli::ls::should_allow_local;
 use crate::cli::s3_url::{is_s3_url, parse_s3_url};
@@ -98,6 +98,12 @@ pub struct SyncArgs {
     /// Use path-style URLs (MinIO / LocalStack).
     #[arg(long)]
     pub force_path_style: bool,
+
+    /// Override the engine's per-object size ceiling (MiB). Default
+    /// 100 MiB. Sync of large artifacts (release ZIPs, disk images)
+    /// needs this raised. See `cp --help` for context.
+    #[arg(long, value_name = "MIB")]
+    pub max_object_size_mb: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -561,7 +567,7 @@ async fn upload_one(
     match engine.store(bucket, key, &data, None, user_meta).await {
         Ok(_) => cli_exit::EXIT_OK,
         Err(e) => {
-            eprintln!("error: upload {key} failed: {e}");
+            eprintln!("error: upload {key} failed: {}", render_store_error(&e));
             cli_exit::EXIT_HTTP
         }
     }
@@ -613,7 +619,7 @@ async fn copy_one(
     {
         Ok(_) => cli_exit::EXIT_OK,
         Err(e) => {
-            eprintln!("error: store {dst_key} failed: {e}");
+            eprintln!("error: store {dst_key} failed: {}", render_store_error(&e));
             cli_exit::EXIT_HTTP
         }
     }
@@ -686,6 +692,7 @@ async fn build_engine_from_args(args: &SyncArgs) -> Result<DynEngine, i32> {
         access_key_id: creds.access_key_id,
         secret_access_key: creds.secret_access_key,
         max_delta_ratio: None,
+        max_object_size: args.max_object_size_mb.map(|mb| mb * 1024 * 1024),
         allow_local: should_allow_local(args.endpoint_url.as_deref()),
     };
     build_cli_engine(opts).await.map_err(|e| {

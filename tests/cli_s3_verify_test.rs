@@ -39,6 +39,7 @@ fn cp_args(src: String, dst: String) -> CpArgs {
         access_key_id: Some(MINIO_ACCESS_KEY.into()),
         secret_access_key: Some(MINIO_SECRET_KEY.into()),
         force_path_style: true,
+        max_object_size_mb: None,
     }
 }
 
