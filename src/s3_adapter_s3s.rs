@@ -1595,7 +1595,15 @@ fn engine_error_to_s3s(err: impl Into<crate::api::S3Error>) -> s3s::S3Error {
         crate::api::S3Error::AccessDenied => s3s::s3_error!(AccessDenied),
         crate::api::S3Error::PreconditionFailed => s3s::s3_error!(PreconditionFailed),
         crate::api::S3Error::InvalidRange => s3s::s3_error!(InvalidRange),
-        other => s3s::s3_error!(InternalError, "{}", other.code()),
+        other => {
+            // Catch-all → 500. The S3 wire error only carries the error *code*
+            // (a category), so without this the actual cause (upstream S3
+            // timeout/throttle, a storage I/O failure, etc.) is lost and prod
+            // 500s are undebuggable. Log the full Display (which includes the
+            // underlying error chain) at ERROR before mapping.
+            tracing::error!(error = %other, code = other.code(), "mapping engine error to 500 InternalError");
+            s3s::s3_error!(InternalError, "{}", other.code())
+        }
     }
 }
 

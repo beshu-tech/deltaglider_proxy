@@ -885,6 +885,28 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         Ok(None)
     }
 
+    /// Decide whether a LIST entry needs a per-object HEAD to report accurate
+    /// metadata, during `metadata=true` enrichment.
+    ///
+    /// A HEAD is needed only when the stored size could differ from the size the
+    /// lite LIST already reports:
+    ///   * the entry is already a delta (`meta.is_delta()`) — LIST shows the
+    ///     delta (stored) size, HEAD recovers the original; OR
+    ///   * the filename is delta-*eligible* by extension — it might be stored as
+    ///     a delta even if this LIST entry wasn't flagged, so HEAD to be sure.
+    ///
+    /// For everything else — a passthrough, non-delta-eligible object (checksum
+    /// sidecars, images, …) — the object is stored verbatim, so the LIST entry's
+    /// size/etag are authoritative and the HEAD is pure waste. Pure function on
+    /// the key + metadata; no I/O. Unit-tested.
+    fn list_entry_needs_head(router: &FileRouter, key: &str, meta: &FileMetadata) -> bool {
+        if meta.is_delta() {
+            return true;
+        }
+        let filename = key.rsplit('/').next().unwrap_or(key);
+        router.is_delta_eligible(filename)
+    }
+
     pub async fn head(&self, bucket: &str, key: &str) -> Result<FileMetadata, EngineError> {
         // Note: we do NOT use the metadata cache for HEAD. The cache is used for
         // LIST enrichment and file_size correction, but HEAD must always verify
@@ -1004,8 +1026,21 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             for (key, meta) in page.objects {
                 if let Some(cached) = self.metadata_cache.get(bucket, &key) {
                     cache_hits.push((key, cached));
-                } else {
+                } else if Self::list_entry_needs_head(&self.file_router, &key, &meta) {
+                    // Delta or delta-eligible: the LIST entry carries the stored
+                    // (delta) size; a HEAD is required to recover the original
+                    // size + storage type.
                     cache_misses.push((key, meta));
+                } else {
+                    // Passthrough, non-delta-eligible file (e.g. a `.sha1`/`.sha512`
+                    // checksum sidecar, an image). It is stored verbatim, so the
+                    // LIST entry's size/etag ARE the truth — a per-object HEAD
+                    // would return the same size and add nothing. Skipping it
+                    // avoids an upstream HEAD per object (the dominant cost on
+                    // build-artifact listings full of checksum sidecars, and the
+                    // source of the HEAD-burst throttling seen in prod). Use the
+                    // lite LIST metadata directly.
+                    cache_hits.push((key, meta));
                 }
             }
 
@@ -1961,5 +1996,77 @@ legacy_key_id: "old-kid"
         // Root local prefix (empty) — matches only prefixes without '/'
         assert!(DeltaGliderEngine::<FilesystemBackend>::local_prefix_could_match("", "app"));
         assert!(!DeltaGliderEngine::<FilesystemBackend>::local_prefix_could_match("", "releases/"));
+    }
+
+    #[test]
+    fn list_entry_needs_head_skips_passthrough_non_eligible() {
+        use crate::types::StorageInfo;
+        let router = FileRouter::new();
+
+        let passthrough = |name: &str| {
+            FileMetadata::fallback(
+                name.to_string(),
+                42,
+                "md5".to_string(),
+                chrono::Utc::now(),
+                None,
+                StorageInfo::Passthrough,
+            )
+        };
+        let delta = || {
+            let mut m = passthrough("app.zip");
+            m.storage_info = StorageInfo::Delta {
+                ref_path: "reference.bin".to_string(),
+                ref_sha256: "sha".to_string(),
+                delta_size: 10,
+                delta_cmd: "xdelta3".to_string(),
+            };
+            m
+        };
+
+        // Passthrough + non-delta-eligible extension → NO head (the win):
+        // the LIST size is authoritative for a verbatim-stored object.
+        for key in [
+            "ror/builds/1.70.0/readonlyrest-1.70.0_es7.8.1.zip.sha1",
+            "ror/builds/1.70.0/readonlyrest-1.70.0_es7.8.1.zip.sha512",
+            "images/logo.png",
+            "ror/builds/1.70.0/checksums.txt",
+        ] {
+            assert!(
+                !DeltaGliderEngine::<FilesystemBackend>::list_entry_needs_head(
+                    &router,
+                    key,
+                    &passthrough(key.rsplit('/').next().unwrap()),
+                ),
+                "{key} should skip HEAD"
+            );
+        }
+
+        // Delta-eligible extension (even if this LIST entry is passthrough) →
+        // HEAD, because it MIGHT be stored as a delta and need original-size.
+        for key in [
+            "ror/builds/1.70.0/readonlyrest-1.70.0_es7.8.1.zip",
+            "backups/db.sql",
+            "images/disk.iso",
+        ] {
+            assert!(
+                DeltaGliderEngine::<FilesystemBackend>::list_entry_needs_head(
+                    &router,
+                    key,
+                    &passthrough(key.rsplit('/').next().unwrap()),
+                ),
+                "{key} should HEAD"
+            );
+        }
+
+        // An entry already flagged as a delta always needs the HEAD,
+        // regardless of extension.
+        assert!(
+            DeltaGliderEngine::<FilesystemBackend>::list_entry_needs_head(
+                &router,
+                "anything.bin",
+                &delta(),
+            )
+        );
     }
 }

@@ -772,27 +772,47 @@ impl S3Backend {
             .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
             .unwrap_or_default();
 
+        // A `.delta` / `reference.bin` file is delta-machinery: missing DG
+        // metadata on one of those genuinely breaks reconstruction and is worth
+        // a loud WARN. Any other object (e.g. a `.sha1`/`.sha512` checksum
+        // sidecar, an image, anything copied without `--metadata`) falling back
+        // to passthrough is entirely benign — it just has no delta to track.
+        // Logging that at WARN per-object floods the log on every
+        // `metadata=true` listing (25k+ lines observed on a build-artifact
+        // bucket), so it goes to DEBUG. This is the level gate, computed once.
+        let is_delta_file = key.ends_with(".delta");
+        let is_reference = key.ends_with("reference.bin");
+        let delta_critical = is_delta_file || is_reference;
+
         // Try parsing DG metadata from headers. If headers are empty or
         // corrupted (missing required fields), fall back to passthrough metadata
         // from the HEAD response itself.
         if !headers.is_empty() {
             match self.headers_to_metadata(&headers) {
                 Ok(meta) => return Ok(meta),
-                Err(e) => {
+                Err(e) if delta_critical => {
                     warn!(
-                        "PATHOLOGICAL | Missing/corrupt DG metadata for {}/{} — falling back to passthrough. \
-                         This file was likely copied without --metadata flag. Error: {}",
+                        "PATHOLOGICAL | {} file {}/{} has missing/corrupt DG metadata — \
+                         delta reconstruction will not work. Was this file copied without \
+                         preserving S3 metadata? Re-copy with: \
+                         rclone copy src:bucket dst:bucket --metadata. Error: {}",
+                        if is_reference { "Reference" } else { "Delta" },
+                        bucket,
+                        key,
+                        e
+                    );
+                }
+                Err(e) => {
+                    debug!(
+                        "No DG metadata for {}/{} — serving as passthrough \
+                         (likely copied without --metadata). Error: {}",
                         bucket, key, e
                     );
                 }
             }
-        }
-
-        // Object exists on upstream S3 but has no (or corrupt) DeltaGlider metadata.
-        // This is a pathological condition — delta features are disabled for this object.
-        let is_delta_file = key.ends_with(".delta");
-        let is_reference = key.ends_with("reference.bin");
-        if is_delta_file || is_reference {
+        } else if delta_critical {
+            // Object exists on upstream S3 but carries NO metadata at all, and
+            // it's a delta/reference file — reconstruction is broken.
             warn!(
                 "PATHOLOGICAL | {} file {}/{} has NO DG metadata! \
                  Delta reconstruction will not work. Was this file copied without preserving S3 metadata? \
