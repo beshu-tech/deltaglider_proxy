@@ -832,7 +832,17 @@ impl S3Backend {
                     .map(|dt| dt.with_timezone(&Utc))
             })
             .unwrap_or_else(Utc::now);
-        let etag = response.e_tag().unwrap_or_default().to_string();
+        // Upstream S3 returns the ETag already wrapped in quotes (e.g.
+        // `"abc123"`). FileMetadata.md5 must hold the BARE value — the
+        // response-emit layer re-adds the quotes when forming the HEAD/GET
+        // ETag. Storing it quoted here produced a doubled-quote ETag
+        // (`""abc123""`) that strict S3 clients reject. Strip to match the
+        // listing path (`object.e_tag.map(|e| e.trim_matches('"'))`).
+        let etag = response
+            .e_tag()
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_string();
         let content_type = response.content_type().map(|s| s.to_string());
         Ok(FileMetadata::fallback(
             key.rsplit('/').next().unwrap_or(key).to_string(),
