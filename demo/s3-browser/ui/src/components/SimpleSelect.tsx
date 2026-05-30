@@ -26,9 +26,11 @@ interface Props {
   allowClear?: boolean;
   style?: React.CSSProperties;
   size?: 'small' | 'middle';
+  /** When true the trigger is non-interactive and visually dimmed. */
+  disabled?: boolean;
 }
 
-export default function SimpleSelect({ value, onChange, options, placeholder, allowClear, style, size }: Props) {
+export default function SimpleSelect({ value, onChange, options, placeholder, allowClear, style, size, disabled }: Props) {
   const colors = useColors();
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState('');
@@ -74,16 +76,18 @@ export default function SimpleSelect({ value, onChange, options, placeholder, al
       {/* Trigger button */}
       <div
         ref={triggerRef}
-        onClick={() => setOpen(!open)}
+        onClick={() => { if (!disabled) setOpen(!open); }}
         style={{
           display: 'inline-flex', alignItems: 'center', justifyContent: 'space-between',
-          height: h, padding: '0 10px', cursor: 'pointer',
+          height: h, padding: '0 10px', cursor: disabled ? 'not-allowed' : 'pointer',
           border: `1px solid ${open ? colors.ACCENT_BLUE : colors.BORDER}`,
           borderRadius: 6, background: colors.BG_ELEVATED,
           fontSize: isSmall ? 12 : 13, fontFamily: 'var(--font-ui)',
           color: selected ? colors.TEXT_PRIMARY : colors.TEXT_MUTED,
           transition: 'border-color 0.15s',
           minWidth: 0,
+          opacity: disabled ? 0.5 : 1,
+          pointerEvents: disabled ? 'none' : undefined,
           ...style,
         }}
       >

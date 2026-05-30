@@ -16,6 +16,7 @@
     "test:condition-prefix-rows": "node scripts/condition-prefix-rows-regression-test.mjs",
     "test:advanced-merge-patch": "node scripts/advanced-merge-patch-regression-test.mjs",
     "test:permission-conditions": "node scripts/permission-conditions-regression-test.mjs",
+    "test:permission-rows": "node scripts/permission-rows-regression-test.mjs",
     "test:upload-telemetry": "node scripts/upload-telemetry-regression-test.mjs",
     "test:page-size": "node scripts/page-size-regression-test.mjs",
     "e2e": "playwright test",

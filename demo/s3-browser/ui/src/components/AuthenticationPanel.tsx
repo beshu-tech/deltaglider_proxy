@@ -391,6 +391,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
               providers={providers}
               groups={groups}
               colors={colors}
+              disabled={rulesSaving}
               onUpdate={(req) => {
                 // Local edit only — no API call. Save button appears below.
                 const next = [...rules];
@@ -519,6 +520,9 @@ interface MappingRuleRowProps {
   colors: ReturnType<typeof useColors>;
   onUpdate: (req: Record<string, unknown>) => void;
   onDelete: () => void;
+  /** Locks all inputs while a Save Rules round-trip is in flight, so a
+   *  concurrent edit can't be lost when loadData() resyncs afterwards. */
+  disabled?: boolean;
 }
 
 const MATCH_TYPES = [
@@ -529,7 +533,7 @@ const MATCH_TYPES = [
   { value: 'claim_value', label: 'Claim value' },
 ];
 
-function MappingRuleRow({ rule, providers, groups, colors, onUpdate, onDelete }: MappingRuleRowProps) {
+function MappingRuleRow({ rule, providers, groups, colors, onUpdate, onDelete, disabled }: MappingRuleRowProps) {
   return (
     <div style={{
       display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px',
@@ -539,6 +543,7 @@ function MappingRuleRow({ rule, providers, groups, colors, onUpdate, onDelete }:
       <Text style={{ fontSize: 12, color: colors.TEXT_MUTED, whiteSpace: 'nowrap' }}>When</Text>
       <SimpleSelect
         size="small"
+        disabled={disabled}
         value={rule.match_type}
         onChange={v => onUpdate({ match_type: v })}
         options={MATCH_TYPES.map(t => ({ value: t.value, label: t.label }))}
@@ -549,6 +554,7 @@ function MappingRuleRow({ rule, providers, groups, colors, onUpdate, onDelete }:
           <Text style={{ fontSize: 12, color: colors.TEXT_MUTED }}>field</Text>
           <Input
             size="small"
+            disabled={disabled}
             value={rule.match_field}
             onChange={e => onUpdate({ match_field: e.target.value })}
             style={{ width: 80 }}
@@ -558,6 +564,7 @@ function MappingRuleRow({ rule, providers, groups, colors, onUpdate, onDelete }:
       <Text style={{ fontSize: 12, color: colors.TEXT_MUTED }}>matches</Text>
       <Input
         size="small"
+        disabled={disabled}
         value={rule.match_value}
         onChange={e => onUpdate({ match_value: e.target.value })}
         style={{ width: 180 }}
@@ -571,6 +578,7 @@ function MappingRuleRow({ rule, providers, groups, colors, onUpdate, onDelete }:
       <Text style={{ fontSize: 12, color: colors.TEXT_MUTED, whiteSpace: 'nowrap' }}>assign to</Text>
       <SimpleSelect
         size="small"
+        disabled={disabled}
         value={String(rule.group_id)}
         onChange={v => onUpdate({ group_id: Number(v) })}
         options={groups.map(g => ({ value: String(g.id), label: g.name }))}
@@ -578,6 +586,7 @@ function MappingRuleRow({ rule, providers, groups, colors, onUpdate, onDelete }:
       />
       <SimpleSelect
         size="small"
+        disabled={disabled}
         value={String(rule.provider_id ?? 0)}
         onChange={v => onUpdate({ provider_id: Number(v) === 0 ? null : Number(v) })}
         options={[
@@ -587,7 +596,7 @@ function MappingRuleRow({ rule, providers, groups, colors, onUpdate, onDelete }:
         style={{ width: 130 }}
 
       />
-      <Button size="small" danger icon={<DeleteOutlined />} onClick={onDelete} />
+      <Button size="small" danger disabled={disabled} icon={<DeleteOutlined />} onClick={onDelete} />
     </div>
   );
 }

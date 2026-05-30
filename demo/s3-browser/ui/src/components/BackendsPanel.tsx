@@ -221,6 +221,12 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
       body = { backends: list };
     }
 
+    // Tracks whether the try-block already set a precise result message this
+    // run. Using a local (not the closed-over `saveResult` state, which is the
+    // stale render snapshot) is what keeps the catch from either suppressing a
+    // genuine error — because a PREVIOUS success message is still in state — or
+    // clobbering the precise message just set with a generic one.
+    let resultSet = false;
     try {
       const result = await putSection('storage', body);
       if (!result.ok) {
@@ -228,6 +234,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
           ok: false,
           message: result.error || 'Failed to apply encryption change',
         });
+        resultSet = true;
         throw new Error(result.error || 'Apply failed');
       }
       setSaveResult({
@@ -236,7 +243,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
       });
       await refresh();
     } catch (e) {
-      if (e instanceof Error && !saveResult?.message) {
+      if (e instanceof Error && !resultSet) {
         setSaveResult({ ok: false, message: e.message });
       }
       throw e;

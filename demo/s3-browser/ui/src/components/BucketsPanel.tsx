@@ -54,9 +54,23 @@ import { useApplyHandler, useDirtySection } from '../useDirtySection';
 
 const { Text } = Typography;
 
+let rowIdCounter = 0;
+
+/** Monotonic, collision-free row id (stable React key; never reused). */
+const freshId = (): string => `bkt-${++rowIdCounter}`;
+
+/** A public-prefix entry carrying a stable synthetic id so the
+ *  prefix list keys by identity, not array index. */
+interface PrefixEntry {
+  id: string;
+  value: string;
+}
+
 /** Local working shape — mirrors the backend `BucketPolicyConfig`
  *  but normalises nulls to undefined for the form controllers. */
 interface BucketPolicyRow {
+  /** Stable synthetic id — React key + mutate-by-id target. Never serialised. */
+  _id: string;
   name: string;
   /** `null` = omit key / YAML null — inherit engine default (delta enabled). */
   compression: boolean | null;
@@ -65,8 +79,10 @@ interface BucketPolicyRow {
   alias: string;
   /** Tri-state source of truth for the anonymous-read radio group. */
   publicMode: 'none' | 'entire' | 'prefixes';
-  /** Specific prefixes — only surfaced when `publicMode === 'prefixes'`. */
-  public_prefixes: string[];
+  /** Specific prefixes — only surfaced when `publicMode === 'prefixes'`.
+   *  Local editing shape carries stable ids; converted to/from the wire
+   *  `string[]` in policyToRow / rowToPolicy. */
+  public_prefixes: PrefixEntry[];
   quota_bytes: number | null;
 }
 
@@ -96,6 +112,7 @@ function policyToRow(
     }
   }
   return {
+    _id: freshId(),
     name,
     compression:
       p.compression === undefined || p.compression === null ? null : p.compression,
@@ -103,7 +120,7 @@ function policyToRow(
     backend: p.backend ?? '',
     alias: p.alias ?? '',
     publicMode,
-    public_prefixes: prefixes,
+    public_prefixes: prefixes.map((value) => ({ id: freshId(), value })),
     quota_bytes: p.quota_bytes ?? null,
   };
 }
@@ -132,7 +149,9 @@ function rowToPolicy(row: BucketPolicyRow): {
   if (row.publicMode === 'entire') {
     out.public_prefixes = [''];
   } else if (row.publicMode === 'prefixes') {
-    const cleaned = row.public_prefixes.map((p) => p.trim()).filter((p) => p.length > 0);
+    const cleaned = row.public_prefixes
+      .map((p) => p.value.trim())
+      .filter((p) => p.length > 0);
     if (cleaned.length > 0) out.public_prefixes = cleaned;
   }
   return out;
@@ -203,16 +222,15 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
     void refresh();
   }, [refresh]);
 
-  const updateRow = (idx: number, patch: Partial<BucketPolicyRow>) => {
-    const next = rows.slice();
-    next[idx] = { ...next[idx], ...patch };
-    setRows(next);
+  const updateRow = (id: string, patch: Partial<BucketPolicyRow>) => {
+    setRows((cur) => cur.map((r) => (r._id === id ? { ...r, ...patch } : r)));
   };
 
   const addRow = () => {
-    setRows([
-      ...rows,
+    setRows((cur) => [
+      ...cur,
       {
+        _id: freshId(),
         name: '',
         compression: null,
         max_delta_ratio: null,
@@ -225,8 +243,7 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
     ]);
   };
 
-  const deleteRow = (idx: number) => {
-    const name = rows[idx].name;
+  const deleteRow = (id: string, name: string) => {
     Modal.confirm({
       title: `Remove bucket policy for "${name || '(unnamed)'}"?`,
       icon: <ExclamationCircleOutlined />,
@@ -241,7 +258,7 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
       okButtonProps: { danger: true },
       cancelText: 'Cancel',
       onOk: () => {
-        setRows(rows.filter((_, i) => i !== idx));
+        setRows((cur) => cur.filter((r) => r._id !== id));
       },
     });
   };
@@ -364,17 +381,26 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
         />
 
         <div style={{ marginTop: 16, display: 'flex', flexDirection: 'column', gap: 12 }}>
-          {rows.map((row, idx) => (
+          {rows.map((row) => (
             <BucketCard
-              key={idx}
+              key={row._id}
               row={row}
               backends={backends}
               defaultBackend={defaultBackend}
               availableBuckets={availableBuckets.filter(
-                (b) => !rows.some((r, i) => i !== idx && r.name === b)
+                (b) => !rows.some((r) => r._id !== row._id && r.name === b)
               )}
-              onChange={(patch) => updateRow(idx, patch)}
-              onDelete={() => deleteRow(idx)}
+              onChange={(patch) => updateRow(row._id, patch)}
+              onPrefixesChange={(fn) =>
+                setRows((cur) =>
+                  cur.map((r) =>
+                    r._id === row._id
+                      ? { ...r, public_prefixes: fn(r.public_prefixes) }
+                      : r
+                  )
+                )
+              }
+              onDelete={() => deleteRow(row._id, row.name)}
               inputRadius={inputRadius}
             />
           ))}
@@ -439,6 +465,9 @@ interface CardProps {
    */
   defaultBackend: string | null;
   onChange: (patch: Partial<BucketPolicyRow>) => void;
+  /** Apply a functional transform to this row's prefix list, by id,
+   *  via the parent's functional setRows — never a stale closure. */
+  onPrefixesChange: (fn: (prev: PrefixEntry[]) => PrefixEntry[]) => void;
   onDelete: () => void;
   inputRadius: { borderRadius: number };
 }
@@ -449,6 +478,7 @@ function BucketCard({
   availableBuckets,
   defaultBackend,
   onChange,
+  onPrefixesChange,
   onDelete,
   inputRadius,
 }: CardProps) {
@@ -677,7 +707,12 @@ function BucketCard({
             // prefixes seeds an empty list so the editor appears.
             onChange({
               publicMode: mode,
-              public_prefixes: mode === 'prefixes' ? (row.public_prefixes.length > 0 ? row.public_prefixes : ['']) : [],
+              public_prefixes:
+                mode === 'prefixes'
+                  ? row.public_prefixes.length > 0
+                    ? row.public_prefixes
+                    : [{ id: freshId(), value: '' }]
+                  : [],
             });
           }}
           style={{ display: 'flex', flexDirection: 'column', gap: 6 }}
@@ -725,24 +760,29 @@ function BucketCard({
                     gap: 4,
                   }}
                 >
-                  {row.public_prefixes.map((prefix, pi) => (
+                  {row.public_prefixes.map((prefix) => (
                     <div
-                      key={pi}
+                      key={prefix.id}
                       style={{ display: 'flex', alignItems: 'center', gap: 4 }}
                     >
                       <Input
-                        value={prefix}
+                        value={prefix.value}
                         onChange={(e) => {
-                          const next = row.public_prefixes.slice();
-                          next[pi] = e.target.value;
-                          onChange({ public_prefixes: next });
+                          const value = e.target.value;
+                          onPrefixesChange((prev) =>
+                            prev.map((p) =>
+                              p.id === prefix.id ? { ...p, value } : p
+                            )
+                          );
                         }}
                         onBlur={(e) => {
                           const v = e.target.value.trim();
                           if (v && !v.endsWith('/')) {
-                            const next = row.public_prefixes.slice();
-                            next[pi] = v + '/';
-                            onChange({ public_prefixes: next });
+                            onPrefixesChange((prev) =>
+                              prev.map((p) =>
+                                p.id === prefix.id ? { ...p, value: v + '/' } : p
+                              )
+                            );
                           }
                         }}
                         placeholder="e.g. builds/"
@@ -759,9 +799,9 @@ function BucketCard({
                         size="small"
                         danger
                         onClick={() => {
-                          onChange({
-                            public_prefixes: row.public_prefixes.filter((_, i) => i !== pi),
-                          });
+                          onPrefixesChange((prev) =>
+                            prev.filter((p) => p.id !== prefix.id)
+                          );
                         }}
                         style={{ padding: '0 8px', minWidth: 0 }}
                       >
@@ -774,7 +814,10 @@ function BucketCard({
                     size="small"
                     icon={<PlusOutlined />}
                     onClick={() => {
-                      onChange({ public_prefixes: [...row.public_prefixes, ''] });
+                      onPrefixesChange((prev) => [
+                        ...prev,
+                        { id: freshId(), value: '' },
+                      ]);
                     }}
                     style={{
                       padding: '0 8px',

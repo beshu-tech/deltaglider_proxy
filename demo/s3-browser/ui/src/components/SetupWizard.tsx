@@ -113,8 +113,21 @@ export default function SetupWizard({ onComplete, onCancel }: Props) {
   const [testResult, setTestResult] = useState<TestS3Response | null>(null);
   const [applying, setApplying] = useState(false);
 
-  const update = (patch: Partial<WizardState>) =>
+  // Any edit to an S3 connection field invalidates a prior "Connected ✓" —
+  // otherwise canAdvance (step 1) would let the operator proceed past an
+  // untested config change on the strength of a now-stale successful test.
+  const S3_TEST_FIELDS: (keyof WizardState)[] = [
+    's3Endpoint',
+    's3Region',
+    's3AccessKey',
+    's3SecretKey',
+  ];
+  const update = (patch: Partial<WizardState>) => {
     setState((s) => ({ ...s, ...patch }));
+    if (S3_TEST_FIELDS.some((f) => f in patch)) {
+      setTestResult(null);
+    }
+  };
 
   const generatedYaml = generateYaml(state);
 

@@ -103,6 +103,10 @@ function normalizeReplication(input: Partial<ReplicationConfig> | undefined): Re
   };
 }
 
+// Glob textareas are one-pattern-per-line. Blank/whitespace-only lines carry
+// no glob and are intentionally dropped (filter(Boolean)) rather than persisted
+// as empty-string globs the backend would reject — same normalization as the
+// reference ConditionPrefixInput. This is by design; do not "preserve blanks".
 function lineList(value: string): string[] {
   return value
     .split('\n')

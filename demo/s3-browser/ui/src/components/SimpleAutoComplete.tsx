@@ -98,6 +98,14 @@ export default function SimpleAutoComplete({
   const wrapRef = useRef<HTMLDivElement>(null);
   const dropRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  // The blur handler defers `setFocused(false)` so a click on a dropdown option
+  // (which blurs the input) lands before the dropdown unmounts. Track the timer
+  // so we can cancel it on unmount — otherwise a component torn down within the
+  // 150ms window fires setState-on-unmounted (dev warning + a stray timer).
+  const blurTimerRef = useRef<number | null>(null);
+  useEffect(() => () => {
+    if (blurTimerRef.current !== null) window.clearTimeout(blurTimerRef.current);
+  }, []);
 
   const query = filterText ?? value;
   const qLower = query.toLowerCase();
@@ -182,7 +190,11 @@ export default function SimpleAutoComplete({
           }}
           onBlur={() => {
             onBlur?.();
-            setTimeout(() => setFocused(false), 150);
+            if (blurTimerRef.current !== null) window.clearTimeout(blurTimerRef.current);
+            blurTimerRef.current = window.setTimeout(() => {
+              blurTimerRef.current = null;
+              setFocused(false);
+            }, 150);
           }}
           placeholder={placeholder ?? 'Type to search...'}
           title={inputTitle}

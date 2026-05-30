@@ -6,6 +6,7 @@ import { useColors } from '../ThemeContext';
 import { listBuckets } from '../s3client';
 import { parseResourcePattern } from '../storagePath';
 import type { PermissionRow } from './permissionRows';
+import { freshPermissionRowId } from './permissionRows';
 import { getConditionValue, setConditionValue, hasConditions } from './permissionConditions';
 import ResourcePatternInput from './ResourcePatternInput';
 import ConditionPrefixInput from './ConditionPrefixInput';
@@ -38,8 +39,30 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
   const { inputRadius } = useCardStyles();
   const colors = useColors();
   const [bucketNames, setBucketNames] = useState<string[]>([]);
-  /** Rows where the optional-filters pane was explicitly opened without data yet (adding first condition). */
-  const [expandedConditions, setExpandedConditions] = useState<Set<number>>(() => new Set());
+  /**
+   * Ids of rows whose optional-filters pane was explicitly opened without data
+   * yet. Keyed by the STABLE `_uiId` (not array index) so the expanded state
+   * follows the row through reorder/delete instead of leaking onto whatever
+   * row shifts into the old index.
+   */
+  const [expandedConditions, setExpandedConditions] = useState<Set<string>>(() => new Set());
+
+  // Backfill stable ids on any row that arrived without one (literal presets,
+  // FALLBACK_PRESETS, inline spreads). Done in an effect + propagated upward so
+  // the id sticks in the controlled prop and stays constant across renders —
+  // the guard keeps it from looping once every row has an id.
+  useEffect(() => {
+    if (permissions.some((p) => !p._uiId)) {
+      onChange(
+        permissions.map((p) => (p._uiId ? p : { ...p, _uiId: freshPermissionRowId() })),
+      );
+    }
+  }, [permissions, onChange]);
+
+  // Stable per-row key for this render even before the effect above persists
+  // the id. Falls back to a deterministic index-based key ONLY for the transient
+  // first render of an id-less row (the effect replaces it immediately after).
+  const rowKey = (row: PermissionRow, index: number): string => row._uiId ?? `pending-${index}`;
 
   useEffect(() => {
     let cancelled = false;
@@ -56,24 +79,28 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
     };
   }, []);
 
+  // Drop expanded-state entries for rows that no longer exist (deleted), keyed
+  // by id so a delete can't leak an expanded pane onto a surviving sibling.
   useEffect(() => {
     setExpandedConditions((prev) => {
-      const next = new Set<number>();
-      for (const idx of prev) {
-        if (idx >= 0 && idx < permissions.length) next.add(idx);
+      const liveIds = new Set(permissions.map((p) => p._uiId).filter(Boolean) as string[]);
+      const next = new Set<string>();
+      for (const id of prev) {
+        if (liveIds.has(id)) next.add(id);
       }
-      return next;
+      return next.size === prev.size ? prev : next;
     });
-  }, [permissions.length]);
+  }, [permissions]);
 
-  const toggleConditions = (index: number) => {
-    if (hasConditions(permissions[index]?.conditions)) {
+  const toggleConditions = (row: PermissionRow) => {
+    if (!row._uiId || hasConditions(row.conditions)) {
       return;
     }
+    const id = row._uiId;
     setExpandedConditions((prev) => {
       const next = new Set(prev);
-      if (next.has(index)) next.delete(index);
-      else next.add(index);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
       return next;
     });
   };
@@ -118,12 +145,12 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
       {permissions.map((row, i) => {
         const isDeny = row.effect === 'Deny';
         const hasCond = hasConditions(row.conditions);
-        const conditionsVisible = expandedConditions.has(i) || hasCond;
+        const conditionsVisible = (row._uiId ? expandedConditions.has(row._uiId) : false) || hasCond;
         const prefixVal = getConditionValue(row.conditions, 'StringLike', 's3:prefix');
         const ipVal = getConditionValue(row.conditions, 'IpAddress', 'aws:SourceIp');
 
         return (
-          <div key={i} style={{
+          <div key={rowKey(row, i)} style={{
             border: `1px solid ${isDeny ? `${colors.ACCENT_RED}40` : colors.BORDER}`,
             borderLeft: isDeny ? `3px solid ${colors.ACCENT_RED}` : `1px solid ${colors.BORDER}`,
             borderRadius: 8,
@@ -161,7 +188,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                       : 'Show optional conditions: prefix restriction and IP filtering'
                   }
                   disabled={hasCond}
-                  onClick={() => toggleConditions(i)}
+                  onClick={() => toggleConditions(row)}
                   style={{
                     opacity: conditionsVisible ? 1 : 0.75,
                     color: hasCond ? colors.ACCENT_PURPLE : undefined,
@@ -277,7 +304,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
         );
       })}
 
-      <Button type="dashed" icon={<PlusOutlined />} onClick={() => onChange([...permissions, { effect: 'Allow', actions: [], resources: '' }])} block style={{ borderRadius: 8, marginBottom: 16 }}>
+      <Button type="dashed" icon={<PlusOutlined />} onClick={() => onChange([...permissions, { _uiId: freshPermissionRowId(), effect: 'Allow', actions: [], resources: '' }])} block style={{ borderRadius: 8, marginBottom: 16 }}>
         Add Permission Rule
       </Button>
     </>

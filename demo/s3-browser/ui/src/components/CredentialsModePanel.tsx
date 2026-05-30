@@ -29,6 +29,7 @@
  * plumbing applies. Dirty state + ApplyDialog + AdminPage's
  * sidebar-dot coordination all free from `useDirtySection`.
  */
+import { useRef } from 'react';
 import {
   Alert,
   Button,
@@ -108,6 +109,12 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
   // auto-detect; the literal `"none"` means open access.
   const authMode: AuthMode = form.authentication === 'none' ? 'none' : 'auto';
 
+  // Latest form, read by the Modal.confirm onOk below. The modal captures its
+  // onOk closure when opened; without this ref it would write a stale `form`
+  // snapshot and clobber any field the user edits while the modal is open.
+  const formRef = useRef(form);
+  formRef.current = form;
+
   // ── Mutators ───────────────────────────────────────────
 
   const setIamMode = (next: IamMode) => {
@@ -144,7 +151,7 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
         okText: 'Switch to Declarative',
         okButtonProps: { danger: true },
         cancelText: 'Cancel',
-        onOk: () => setForm({ ...form, iam_mode: 'declarative' }),
+        onOk: () => setForm({ ...formRef.current, iam_mode: 'declarative' }),
       });
       return;
     }

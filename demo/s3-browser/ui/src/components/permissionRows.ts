@@ -2,14 +2,32 @@ import type { IamPermission } from '../adminApi';
 import { normalizeResourcePattern } from '../storagePath';
 
 export interface PermissionRow {
+  /**
+   * Stable UI-only identity for React keys + expanded-state tracking.
+   * Survives array reordering/deletion so a row's DOM (focus, IME
+   * composition, expanded conditions) never re-associates to a sibling.
+   * Assigned by `permissionsToRows` / `freshPermissionRowId`; NEVER sent to
+   * the server (`rowsToPermissions` drops it). Optional so literals/presets
+   * compile — PermissionEditor lazily backfills any row missing it.
+   */
+  _uiId?: string;
   effect: string;
   actions: string[];
   resources: string;
   conditions?: Record<string, Record<string, string | string[]>>;
 }
 
+let permissionRowIdCounter = 0;
+
+/** Monotonic, collision-free UI row id (stable React key; never reused). */
+export function freshPermissionRowId(): string {
+  permissionRowIdCounter += 1;
+  return `perm-${permissionRowIdCounter}`;
+}
+
 export function permissionsToRows(perms: IamPermission[]): PermissionRow[] {
   return perms.map(p => ({
+    _uiId: freshPermissionRowId(),
     effect: p.effect || 'Allow',
     actions: [...p.actions],
     resources: p.resources.join(', '),

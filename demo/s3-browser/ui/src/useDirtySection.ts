@@ -153,8 +153,10 @@ interface UseDirtySectionResult<T> {
   value: T;
   /** True when `value` differs from the last applied snapshot. */
   isDirty: boolean;
-  /** Update the form state. */
-  setValue: (next: T) => void;
+  /** Update the form state. Accepts a value or a functional updater
+   *  (`prev => next`) so callers can mutate-by-id without closing over a
+   *  stale snapshot of the current value. */
+  setValue: (next: T | ((prev: T) => T)) => void;
   /** Revert to the snapshot. */
   discard: () => void;
   /** Reset the snapshot to `value` — call after a successful Apply. */
@@ -246,7 +248,10 @@ export function useDirtySection<T>(
   // All callbacks are `useCallback`'d with stable deps so panels
   // that put them in `useCallback` / `useEffect` dependency arrays
   // don't re-run on every parent render.
-  const setValue = useCallback((next: T) => setValueState(next), []);
+  const setValue = useCallback(
+    (next: T | ((prev: T) => T)) => setValueState(next),
+    []
+  );
   const discard = useCallback(() => setValueState(snapshotRef.current), []);
   const markApplied = useCallback(() => {
     snapshotRef.current = valueRef.current;

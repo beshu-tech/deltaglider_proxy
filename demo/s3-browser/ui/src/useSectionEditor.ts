@@ -191,10 +191,14 @@ export function useSectionEditor<Wire, Local = Wire>(
       setPendingBody(null);
       void refresh();
     } catch (e) {
+      // Apply failed (network/server error). Close the dialog but do NOT
+      // refresh() — refreshing would overwrite the user's still-dirty form
+      // with server truth, silently discarding the edits they were trying to
+      // save (including any made while the request was in-flight). Leave the
+      // local edits intact so the operator can fix and retry.
       message.error(`Apply failed: ${e instanceof Error ? e.message : 'unknown'}`);
       setApplyOpen(false);
       setPendingBody(null);
-      void refresh();
     } finally {
       setApplying(false);
     }

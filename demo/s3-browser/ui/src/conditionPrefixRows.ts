@@ -36,7 +36,14 @@ export function normalizePrefixPattern(value: string): string {
   return normalizePrefix(trimmed);
 }
 
-/** Parse the persisted comma-joined string into editable rows (always ≥1 row). */
+/**
+ * Parse the persisted comma-joined string into editable rows (always ≥1 row).
+ *
+ * Splits on `,` with no escaping. This is safe because a comma is not a valid
+ * character in an S3 key/prefix, so a comma in the input is always a row
+ * separator, never part of a single pattern — escaping machinery would add
+ * round-trip risk for a case that cannot legitimately occur.
+ */
 export function parseRows(value: string): PrefixRow[] {
   const parts = value.split(',').map((part) => part.trim());
   const rows = (parts.length > 0 ? parts : ['']).map((text) => ({ id: freshRowId(), text }));

@@ -527,6 +527,7 @@ jobs:
           npm run test:condition-prefix-rows
           npm run test:advanced-merge-patch
           npm run test:permission-conditions
+          npm run test:permission-rows
       - name: npm audit
         run: cd demo/s3-browser/ui && npm audit --audit-level=high || true  # warn-only
 
