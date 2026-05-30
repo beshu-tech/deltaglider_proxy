@@ -174,9 +174,18 @@ impl s3s::S3 for DeltaGliderS3Service {
                 .retrieve(&input.bucket, &input.key)
                 .await
                 .map_err(engine_error_to_s3s)?;
+            // `checked` was validated against the HEAD `file_size`, but we
+            // slice into the freshly-reconstructed `data`. If stored
+            // `file_size` metadata is stale / larger than the actual bytes
+            // (delta reconstruction yielding fewer bytes, inconsistent
+            // metadata) the requested end can exceed `data.len()`. Use
+            // `.get()` so a malformed/stale range returns `InvalidRange`
+            // (400) instead of panicking the worker on an out-of-bounds slice.
+            let slice_start = usize::try_from(start).unwrap_or(usize::MAX);
+            let slice_end = usize::try_from(checked.end).unwrap_or(usize::MAX);
             let sliced = bytes::Bytes::copy_from_slice(
-                &data[usize::try_from(start).unwrap_or(usize::MAX)
-                    ..usize::try_from(checked.end).unwrap_or(usize::MAX)],
+                data.get(slice_start..slice_end)
+                    .ok_or_else(|| s3s::s3_error!(InvalidRange))?,
             );
             let body = s3s::dto::StreamingBlob::from(s3s::Body::from(sliced));
             let mut output = get_object_output_from_metadata(&metadata, body)?;

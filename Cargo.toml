@@ -136,4 +136,13 @@ aws-smithy-types = "1"
 # to the minimal reproducer. Deterministic via the PROPTEST_CASES
 # env var; default case count is 256.
 proptest = "1"
+# Benchmark harness for the delta-codec hot paths (encode/decode).
+# Local/manual signal only — NOT wired into the CI merge gate (benches
+# are slow + machine-dependent, treated like coverage). Run with
+# `cargo bench --bench codec`.
+criterion = "0.5"
+
+[[bench]]
+name = "codec"
+harness = false
 

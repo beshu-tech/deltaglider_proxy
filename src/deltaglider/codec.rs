@@ -658,3 +658,87 @@ mod tests {
         assert_eq!(reconstructed, target);
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    // THE INVARIANT: `decode(source, encode(source, target)) == target` must hold
+    // byte-for-byte for every input. This is the single most important correctness
+    // property of the whole product — if it ever fails, customer data is silently
+    // corrupted on GET (the delta reconstructed during retrieval would not equal
+    // the bytes that were stored). These property tests fuzz that round-trip across
+    // random, empty-source, and realistic-mutation workloads.
+    //
+    // Each case shells out to the xdelta3 subprocess twice (encode + decode), so we
+    // keep input sizes bounded (≤4 KiB) and rely on proptest's default case count to
+    // keep wall-clock cost reasonable. The whole module is guarded on CLI
+    // availability — like the rest of the codec tests, it short-circuits (here via
+    // `prop_assume!`) when the xdelta3 binary isn't installed so it never fails on a
+    // machine that lacks it.
+
+    /// Max generated input size. Bounded because every case spawns xdelta3 twice.
+    const MAX_LEN: usize = 4096;
+
+    proptest! {
+        /// Round-trip holds for arbitrary source/target byte vectors (random noise).
+        #[test]
+        fn prop_roundtrip_arbitrary(
+            source in proptest::collection::vec(any::<u8>(), 0..MAX_LEN),
+            target in proptest::collection::vec(any::<u8>(), 0..MAX_LEN),
+        ) {
+            let codec = DeltaCodec::default();
+            prop_assume!(codec.is_cli_available());
+
+            let delta = codec.encode(&source, &target).unwrap();
+            let reconstructed = codec.decode(&source, &delta).unwrap();
+            prop_assert_eq!(reconstructed, target);
+        }
+
+        /// Round-trip holds for the "no reference / first upload" case: encoding
+        /// against an empty source and decoding back must reproduce the target.
+        #[test]
+        fn prop_roundtrip_empty_source(
+            target in proptest::collection::vec(any::<u8>(), 0..MAX_LEN),
+        ) {
+            let codec = DeltaCodec::default();
+            prop_assume!(codec.is_cli_available());
+
+            let source: &[u8] = &[];
+            let delta = codec.encode(source, &target).unwrap();
+            let reconstructed = codec.decode(source, &delta).unwrap();
+            prop_assert_eq!(reconstructed, target);
+        }
+
+        /// Round-trip holds for the realistic delta-compression workload: a target
+        /// that is a small mutation of the source (bytes flipped + a few inserted).
+        /// This exercises xdelta3's actual copy/add VCDIFF paths rather than the
+        /// degenerate all-noise case.
+        #[test]
+        fn prop_roundtrip_small_mutation(
+            source in proptest::collection::vec(any::<u8>(), 1..MAX_LEN),
+            // Indices (mod source.len()) at which to flip a byte.
+            flips in proptest::collection::vec(any::<usize>(), 0..16),
+            // Bytes to splice into the middle of the target.
+            insert in proptest::collection::vec(any::<u8>(), 0..32),
+        ) {
+            let codec = DeltaCodec::default();
+            prop_assume!(codec.is_cli_available());
+
+            let mut target = source.clone();
+            for idx in flips {
+                let i = idx % target.len();
+                target[i] = target[i].wrapping_add(1);
+            }
+            // Splice the insert bytes near the middle so the delta has both a copy
+            // window before and after the edit.
+            let mid = target.len() / 2;
+            target.splice(mid..mid, insert);
+
+            let delta = codec.encode(&source, &target).unwrap();
+            let reconstructed = codec.decode(&source, &delta).unwrap();
+            prop_assert_eq!(reconstructed, target);
+        }
+    }
+}

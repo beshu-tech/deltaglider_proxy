@@ -34,6 +34,9 @@ cargo test --all --locked
 
 # Nightly CI also runs `test-all-nightly.yml` (`cargo test --all` default + s3s).
 
+# Benchmarks (local/manual only — NOT in the CI merge gate, like coverage)
+cargo bench --bench codec    # criterion harness for delta encode/decode hot paths (needs xdelta3)
+
 # Docker (multi-stage: UI build → Rust build → slim runtime)
 docker build -t deltaglider-proxy .
 ```
