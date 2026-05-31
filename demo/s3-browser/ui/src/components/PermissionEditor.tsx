@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Input, Button, Typography, Segmented, Checkbox } from 'antd';
+import { Input, Button, Typography, Segmented, Checkbox, Alert } from 'antd';
 import { PlusOutlined, DeleteOutlined, FilterOutlined } from '@ant-design/icons';
 import { useCardStyles, usePermissionStyles } from './shared-styles';
 import { useColors } from '../ThemeContext';
@@ -7,7 +7,14 @@ import { listBuckets } from '../s3client';
 import { parseResourcePattern } from '../storagePath';
 import type { PermissionRow } from './permissionRows';
 import { freshPermissionRowId } from './permissionRows';
-import { getConditionValue, setConditionValue, hasConditions } from './permissionConditions';
+import {
+  getConditionValue,
+  setConditionValue,
+  getConditionArray,
+  setConditionArray,
+  hasConditions,
+} from './permissionConditions';
+import { unknownBucketWarnings } from './permissionWarnings';
 import ResourcePatternInput from './ResourcePatternInput';
 import ConditionPrefixInput from './ConditionPrefixInput';
 
@@ -134,8 +141,9 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
         const isDeny = row.effect === 'Deny';
         const hasCond = hasConditions(row.conditions);
         const conditionsVisible = (row._uiId ? expandedConditions.has(row._uiId) : false) || hasCond;
-        const prefixVal = getConditionValue(row.conditions, 'StringLike', 's3:prefix');
+        const prefixVal = getConditionArray(row.conditions, 'StringLike', 's3:prefix');
         const ipVal = getConditionValue(row.conditions, 'IpAddress', 'aws:SourceIp');
+        const bucketWarnings = unknownBucketWarnings(row.resources, bucketNames);
 
         return (
           <div key={rowKey(row, i)} style={{
@@ -222,6 +230,28 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                 buckets={bucketNames}
                 style={{ ...inputRadius, marginTop: 4 }}
               />
+              {bucketWarnings.length > 0 && (
+                <Alert
+                  type="warning"
+                  showIcon
+                  style={{ marginTop: 6 }}
+                  message={
+                    <span style={{ fontSize: 12 }}>
+                      {bucketWarnings.map((w) => (
+                        <div key={w.resource}>
+                          <span style={monoTextStyle}>{w.resource}</span> targets bucket{' '}
+                          <span style={monoTextStyle}>{w.bucket}</span>, which doesn&apos;t exist
+                          {w.suggestion ? (
+                            <> — did you mean <span style={monoTextStyle}>{w.suggestion}</span>?</>
+                          ) : (
+                            <> — this rule will never match.</>
+                          )}
+                        </div>
+                      ))}
+                    </span>
+                  }
+                />
+              )}
             </div>
 
             {/* Conditions — collapsible only when empty; persisted rules with data stay open */}
@@ -252,7 +282,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                         const updated = [...permissions];
                         updated[i] = {
                           ...updated[i],
-                          conditions: setConditionValue(row.conditions, 'StringLike', 's3:prefix', value),
+                          conditions: setConditionArray(row.conditions, 'StringLike', 's3:prefix', value),
                         };
                         onChange(updated);
                       }}

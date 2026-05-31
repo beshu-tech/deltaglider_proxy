@@ -28,6 +28,63 @@ export function getConditionValue(
   return val || '';
 }
 
+/**
+ * Extract a condition value as a STRING ARRAY, preserving every entry —
+ * including the empty string `""`, which for `s3:prefix` means "list from
+ * the bucket root". Unlike {@link getConditionValue} (a comma-join that the
+ * comma-split round-trip silently collapses), this is lossless: it's the
+ * read side of the array contract used by the multi-row prefix editor.
+ */
+export function getConditionArray(
+  conditions: Conditions | undefined,
+  operator: string,
+  key: string,
+): string[] {
+  if (!conditions) return [];
+  const opBlock = conditions[operator];
+  if (!opBlock) return [];
+  const val = opBlock[key];
+  if (Array.isArray(val)) return [...val];
+  if (val === undefined || val === null) return [];
+  // A scalar (incl. "") is a single-entry list.
+  return [val];
+}
+
+/**
+ * Set a condition from a STRING ARRAY, preserving `""` entries (root prefix).
+ *
+ * The only entries dropped are pure-whitespace ones that are NOT the empty
+ * string — i.e. genuine blank rows the user never filled. `""` itself is
+ * KEPT because it is a meaningful s3:prefix value. A single survivor is left
+ * as an array (not coalesced to a scalar) so the wire shape is stable and an
+ * all-empty list removes the condition entirely.
+ */
+export function setConditionArray(
+  conditions: Conditions | undefined,
+  operator: string,
+  key: string,
+  values: string[],
+): Conditions {
+  const result = conditions ? { ...conditions } : {};
+  // Keep the literal empty string "" (root prefix). For everything else, keep
+  // the trimmed value if it's non-empty — so a " " whitespace-only row is
+  // dropped as noise but a real "" is preserved. De-dupe, order-preserving.
+  const seen = new Set<string>();
+  const cleaned: string[] = [];
+  for (const raw of values) {
+    const v = raw === '' ? '' : raw.trim();
+    if (raw !== '' && v === '') continue; // whitespace-only row → noise
+    if (seen.has(v)) continue;
+    seen.add(v);
+    cleaned.push(v);
+  }
+  if (cleaned.length === 0) {
+    return removeConditionKey(result, operator, key);
+  }
+  result[operator] = { ...(result[operator] || {}), [key]: cleaned };
+  return result;
+}
+
 /** Remove operator/key from the conditions map, pruning empty operator blocks. */
 function removeConditionKey(conditions: Conditions, operator: string, key: string): Conditions {
   const result = { ...conditions };

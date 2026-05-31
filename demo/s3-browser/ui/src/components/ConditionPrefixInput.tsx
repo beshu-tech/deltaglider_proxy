@@ -1,21 +1,27 @@
 import { DeleteOutlined, PlusOutlined } from '@ant-design/icons';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Button } from 'antd';
+import { Button, Checkbox } from 'antd';
 import { listCommonPrefixes } from '../s3client';
 import { normalizePrefix } from '../storagePath';
 import {
   freshRowId,
   normalizePrefixPattern,
-  parseRows,
-  serializeRows,
+  parseRowsArray,
+  serializeRowsArray,
   type PrefixRow,
 } from '../conditionPrefixRows';
 import { useColors } from '../ThemeContext';
 import SimpleAutoComplete, { type AutoCompleteEntry, type AutoCompleteGroup } from './SimpleAutoComplete';
 
 interface ConditionPrefixInputProps {
-  value: string;
-  onChange: (value: string) => void;
+  /**
+   * The s3:prefix condition value as a STRING ARRAY. The empty string `""`
+   * is a meaningful entry — "list from the bucket root" — and is surfaced as
+   * the dedicated "List bucket root" toggle rather than a text row (a blank
+   * text row is indistinguishable from one being edited).
+   */
+  value: string[];
+  onChange: (value: string[]) => void;
   bucket?: string;
   style?: React.CSSProperties;
 }
@@ -49,39 +55,57 @@ export default function ConditionPrefixInput({ value, onChange, bucket = '', sty
   // Local editing state is the single source of truth WHILE editing. The
   // `value` prop only seeds it, and only when the prop changes from something
   // this component did NOT just emit (external/programmatic updates).
-  const [rows, setRows] = useState<PrefixRow[]>(() => parseRows(value));
-  // Mirror of `rows` read synchronously by `emit` so a burst of edits within
-  // one tick always builds on the freshest rows, never a stale render snapshot.
+  const initial = useMemo(() => parseRowsArray(value), [value]);
+  const [rows, setRows] = useState<PrefixRow[]>(() => initial.rows);
+  const [includeRoot, setIncludeRoot] = useState<boolean>(() => initial.includeRoot);
+  // Mirror of `rows`/`includeRoot` read synchronously by `emit` so a burst of
+  // edits within one tick always builds on the freshest state, never a stale
+  // render snapshot.
   const rowsRef = useRef<PrefixRow[]>(rows);
   rowsRef.current = rows;
-  // The last comma string we emitted upward — used to distinguish our own
-  // echoes (ignore) from genuine external prop changes (re-seed local rows).
-  const lastEmitted = useRef<string>(serializeRows(rows));
+  const rootRef = useRef<boolean>(includeRoot);
+  rootRef.current = includeRoot;
+  // The last array (as a stable JSON string) we emitted upward — used to
+  // distinguish our own echoes (ignore) from genuine external prop changes.
+  const lastEmitted = useRef<string>(JSON.stringify(serializeRowsArray(rows, includeRoot)));
 
   useEffect(() => {
     // Ignore the prop change if it's the value we just emitted (echo).
-    if (value === lastEmitted.current) return;
-    // Genuine external change: re-seed local rows from the new prop.
-    lastEmitted.current = value;
-    const seeded = parseRows(value);
-    rowsRef.current = seeded;
-    setRows(seeded);
+    const incoming = JSON.stringify(value);
+    if (incoming === lastEmitted.current) return;
+    // Genuine external change: re-seed local state from the new prop.
+    lastEmitted.current = incoming;
+    const seeded = parseRowsArray(value);
+    rowsRef.current = seeded.rows;
+    rootRef.current = seeded.includeRoot;
+    setRows(seeded.rows);
+    setIncludeRoot(seeded.includeRoot);
   }, [value]);
 
-  // Apply a row mutation against the LATEST committed rows. We read the live
-  // rows via the rowsRef (kept in sync by the render below) rather than the
-  // closed-over `rows` snapshot — that snapshot staleness is the whole bug
-  // class we're killing. The setRows updater stays pure; the ref/onChange
-  // side effects run exactly once here, outside React's StrictMode double-render.
+  // Emit the current (rows, root) state upward as a string[]. Reads the live
+  // refs (kept in sync by render) rather than closed-over snapshots — that
+  // snapshot staleness is the whole bug class we're killing.
+  const emitNow = () => {
+    const serialized = serializeRowsArray(rowsRef.current, rootRef.current);
+    const key = JSON.stringify(serialized);
+    if (key !== lastEmitted.current) {
+      lastEmitted.current = key;
+      onChange(serialized);
+    }
+  };
+
+  // Apply a row mutation against the LATEST committed rows, then emit.
   const emit = (mutate: (current: PrefixRow[]) => PrefixRow[]) => {
     const next = mutate(rowsRef.current);
     rowsRef.current = next;
     setRows(next);
-    const serialized = serializeRows(next);
-    if (serialized !== lastEmitted.current) {
-      lastEmitted.current = serialized;
-      onChange(serialized);
-    }
+    emitNow();
+  };
+
+  const toggleRoot = (next: boolean) => {
+    rootRef.current = next;
+    setIncludeRoot(next);
+    emitNow();
   };
 
   const focusedRow = focusedId === null ? null : rows.find((r) => r.id === focusedId) || null;
@@ -210,7 +234,17 @@ export default function ConditionPrefixInput({ value, onChange, bucket = '', sty
 
   return (
     <div style={{ width: '100%' }}>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: style?.marginTop }}>
+      <Checkbox
+        checked={includeRoot}
+        onChange={(e) => toggleRoot(e.target.checked)}
+        style={{ fontSize: 12, marginTop: style?.marginTop }}
+      >
+        List bucket root{' '}
+        <span style={{ color: colors.TEXT_MUTED, fontFamily: 'var(--font-mono)' }}>
+          (empty prefix)
+        </span>
+      </Checkbox>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 6 }}>
         {rows.map((row) => (
           <div key={row.id} style={{ display: 'flex', gap: 6, alignItems: 'center', width: '100%' }}>
             <div style={{ flex: 1, minWidth: 0 }} onFocusCapture={() => setFocusedId(row.id)}>

@@ -527,6 +527,7 @@ jobs:
           npm run test:condition-prefix-rows
           npm run test:advanced-merge-patch
           npm run test:permission-conditions
+          npm run test:permission-warnings
           npm run test:permission-rows
           npm run test:rule-editor-helpers
           npm run test:credential-generation

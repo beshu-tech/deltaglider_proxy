@@ -27,36 +27,90 @@ const rowsUrl = await loadModule('../src/conditionPrefixRows.ts', 'conditionPref
   './storagePath': storagePathUrl,
 });
 
-const { parseRows, serializeRows, normalizePrefixPattern, freshRowId } = await import(rowsUrl);
+const {
+  parseRowsArray,
+  serializeRowsArray,
+  normalizePrefixPattern,
+  freshRowId,
+} = await import(rowsUrl);
 
 const texts = (rows) => rows.map((r) => r.text);
+// Test-harness adapters: seed rows from a comma string and read the serialized
+// non-root output back as a comma string. The COMPONENT uses the array helpers
+// (parseRowsArray/serializeRowsArray); these wrappers keep the legacy
+// edit-lifecycle assertions readable without re-exporting dead string helpers.
+const parseRows = (s) => parseRowsArray(s.split(',').map((p) => p.trim())).rows;
+const serializeRows = (rows) => serializeRowsArray(rows, false).join(', ');
+const mk = (...t) => t.map((text) => ({ id: freshRowId(), text }));
 
 // --- normalizePrefixPattern --------------------------------------------------
 assert.equal(normalizePrefixPattern('uploads/*'), 'uploads/*');
-assert.equal(normalizePrefixPattern(' uploads ' ), 'uploads/');
-assert.equal(normalizePrefixPattern('ror//builds/*'), 'ror/builds/*');
+assert.equal(normalizePrefixPattern('ror//builds/*'), 'ror/builds/*'); // collapse double slash
 assert.equal(normalizePrefixPattern('*'), '*');
 assert.equal(normalizePrefixPattern('.*'), '.*');
 assert.equal(normalizePrefixPattern(''), '');
 
-// --- parseRows ---------------------------------------------------------------
+// THE bug: a trailing slash must NOT be auto-appended on blur, because for an
+// `s3:prefix StringLike` condition `ror/libs` and `ror/libs/` are NOT
+// equivalent — the slash-less form also matches `ror/libs-internal/…`.
+assert.equal(normalizePrefixPattern('ror/libs'), 'ror/libs', 'no trailing slash forced');
+assert.equal(normalizePrefixPattern('ror/libs/'), 'ror/libs/', 'explicit trailing slash kept');
+assert.equal(normalizePrefixPattern(' ror/libs '), 'ror/libs', 'trimmed, still no slash');
+assert.equal(normalizePrefixPattern('ror//libs'), 'ror/libs', 'collapse // but no trailing slash');
+assert.equal(normalizePrefixPattern('ror\\libs'), 'ror/libs', 'backslash → slash, no trailing slash');
+// Wildcard forms preserve the operator's slash choice too.
+assert.equal(normalizePrefixPattern('ror/libs*'), 'ror/libs*');
+assert.equal(normalizePrefixPattern('ror/libs/*'), 'ror/libs/*');
+
+// --- parseRows (harness over parseRowsArray) ---------------------------------
 assert.deepEqual(texts(parseRows('uploads/*, ror/, ror/builds/, ror/e2e_reports/')), [
   'uploads/*', 'ror/', 'ror/builds/', 'ror/e2e_reports/',
 ]);
-assert.deepEqual(texts(parseRows('')), ['']); // always at least one editable row
-assert.deepEqual(texts(parseRows('a,,b')), ['a', '', 'b']); // empty middle row preserved on parse
+assert.deepEqual(texts(parseRows('')), ['']); // empty input → one blank editable row
 
 // stable, unique ids
 const ids = parseRows('a, b, c').map((r) => r.id);
 assert.equal(new Set(ids).size, 3);
 assert.notEqual(freshRowId(), freshRowId());
 
-// --- serializeRows -----------------------------------------------------------
-const mk = (...t) => t.map((text) => ({ id: freshRowId(), text }));
+// --- serializeRows (harness over serializeRowsArray) -------------------------
 assert.equal(serializeRows(mk('uploads/*', 'ror/')), 'uploads/*, ror/');
 assert.equal(serializeRows(mk('uploads/*', '', 'ror/')), 'uploads/*, ror/'); // empty rows dropped
 assert.equal(serializeRows(mk('', '')), ''); // all-empty -> empty string, no dangling commas
 assert.equal(serializeRows(mk(' a ', ' b ')), 'a, b'); // trimmed
+
+// --- Array contract: root-prefix ("") preservation (Obstacle 1) --------------
+// The persisted s3:prefix is a string[] where "" means "list bucket root".
+// parseRowsArray splits root into a boolean; serializeRowsArray recombines it,
+// emitting "" FIRST. This is the fix for the empty-prefix being silently
+// dropped by the old comma-split round-trip.
+{
+  // Parse: "" becomes includeRoot=true and is NOT a text row.
+  const a = parseRowsArray(['', 'ror/libs/', 'ror/libs/*']);
+  assert.equal(a.includeRoot, true);
+  assert.deepEqual(texts(a.rows), ['ror/libs/', 'ror/libs/*']);
+
+  // Parse with no root.
+  const b = parseRowsArray(['ror/libs/']);
+  assert.equal(b.includeRoot, false);
+  assert.deepEqual(texts(b.rows), ['ror/libs/']);
+
+  // Empty input → one blank editable row, no root.
+  const c = parseRowsArray([]);
+  assert.equal(c.includeRoot, false);
+  assert.deepEqual(texts(c.rows), ['']);
+
+  // Serialize: root emitted first, blanks dropped, de-duped, order preserved.
+  assert.deepEqual(serializeRowsArray(mk('ror/libs/', 'ror/libs/*'), true), ['', 'ror/libs/', 'ror/libs/*']);
+  assert.deepEqual(serializeRowsArray(mk('ror/libs/', '', 'ror/builds/'), false), ['ror/libs/', 'ror/builds/']);
+  assert.deepEqual(serializeRowsArray(mk('a', 'a', 'b'), false), ['a', 'b']); // de-dupe
+  assert.deepEqual(serializeRowsArray(mk('', ''), false), []); // all-blank, no root → empty (drops condition)
+  assert.deepEqual(serializeRowsArray(mk('', ''), true), ['']); // root only
+
+  // Round-trip: ["", "ror/"] survives intact (the case the OLD code collapsed).
+  const seeded = parseRowsArray(['', 'ror/']);
+  assert.deepEqual(serializeRowsArray(seeded.rows, seeded.includeRoot), ['', 'ror/']);
+}
 
 // --- Full edit-lifecycle simulation (THE regression) -------------------------
 // Models ConditionPrefixInput's local-state machine: rows live in state keyed
@@ -95,8 +149,20 @@ function makeEditor(initial) {
   ed.updateRow(4, 'newprefix');                  // type into the new row
   ed.blurRow(4);                                 // click outside (blur)
   assert.equal(ed.rows()[0].text, 'uploads/*', 'topmost row must survive blur of another row');
-  assert.deepEqual(texts(ed.rows()), ['uploads/*', 'ror/', 'ror/builds/', 'ror/e2e_reports/', 'newprefix/']);
-  assert.equal(ed.emitted(), 'uploads/*, ror/, ror/builds/, ror/e2e_reports/, newprefix/');
+  // Blur must NOT append a trailing slash (would change s3:prefix semantics).
+  assert.deepEqual(texts(ed.rows()), ['uploads/*', 'ror/', 'ror/builds/', 'ror/e2e_reports/', 'newprefix']);
+  assert.equal(ed.emitted(), 'uploads/*, ror/, ror/builds/, ror/e2e_reports/, newprefix');
+}
+
+// The exact case from the bug report: type `ror/libs` (no slash) into a new
+// row and blur — it must stay `ror/libs`, NOT become `ror/libs/`.
+{
+  const ed = makeEditor('ror/, ror/builds/, ror/e2e_reports/, ror/libs/');
+  ed.addRow();
+  ed.updateRow(4, 'ror/libs');
+  ed.blurRow(4);
+  assert.deepEqual(texts(ed.rows()), ['ror/', 'ror/builds/', 'ror/e2e_reports/', 'ror/libs/', 'ror/libs']);
+  assert.equal(ed.emitted(), 'ror/, ror/builds/, ror/e2e_reports/, ror/libs/, ror/libs');
 }
 
 // Add a row and blur WITHOUT typing — no existing row may vanish.

@@ -19,7 +19,13 @@ async function loadModule(relPath, fileName) {
 }
 
 const modUrl = await loadModule('../src/components/permissionConditions.ts', 'permissionConditions.ts');
-const { getConditionValue, setConditionValue, hasConditions } = await import(modUrl);
+const {
+  getConditionValue,
+  setConditionValue,
+  getConditionArray,
+  setConditionArray,
+  hasConditions,
+} = await import(modUrl);
 
 const OP = 'IpAddress';
 const KEY = 'aws:SourceIp';
@@ -78,6 +84,51 @@ const get = (conds) => getConditionValue(conds, OP, KEY);
 // (6b) hasConditions true once a real value lands.
 {
   assert.equal(hasConditions(set(undefined, 'a/16, b/8')), true);
+}
+
+// ── Array contract for s3:prefix: "" (root) MUST be preserved (Obstacle 1) ──
+const PREFIX_OP = 'StringLike';
+const PREFIX_KEY = 's3:prefix';
+const setArr = (conds, vals) => setConditionArray(conds, PREFIX_OP, PREFIX_KEY, vals);
+const getArr = (conds) => getConditionArray(conds, PREFIX_OP, PREFIX_KEY);
+
+// (A) The empty string "" (list bucket root) survives — the whole point.
+{
+  const result = setArr(undefined, ['', 'ror/libs/', 'ror/libs/*']);
+  assert.deepEqual(result.StringLike['s3:prefix'], ['', 'ror/libs/', 'ror/libs/*']);
+  assert.ok(result.StringLike['s3:prefix'].includes(''), 'root "" must be preserved');
+}
+
+// (B) A whitespace-only entry IS dropped, but a real "" is NOT.
+{
+  const result = setArr(undefined, ['', '  ', 'ror/']);
+  assert.deepEqual(result.StringLike['s3:prefix'], ['', 'ror/']);
+}
+
+// (C) De-dupe, order-preserving.
+{
+  const result = setArr(undefined, ['ror/', 'ror/', 'a/']);
+  assert.deepEqual(result.StringLike['s3:prefix'], ['ror/', 'a/']);
+}
+
+// (D) All-empty (no real entries, no root) removes the key entirely.
+{
+  assert.deepEqual(setArr(undefined, ['  ', '']), { StringLike: { 's3:prefix': [''] } }); // root kept
+  assert.deepEqual(setArr(undefined, ['  ', ' ']), {}); // no root, only noise → removed
+  assert.deepEqual(setArr(undefined, []), {});
+}
+
+// (E) Round-trip through getConditionArray is lossless for root + entries.
+{
+  const conds = setArr(undefined, ['', 'ror/libs/']);
+  assert.deepEqual(getArr(conds), ['', 'ror/libs/']);
+}
+
+// (F) getConditionArray reads a legacy scalar (incl. "") as a single-entry list.
+{
+  assert.deepEqual(getConditionArray({ StringLike: { 's3:prefix': 'ror/' } }, PREFIX_OP, PREFIX_KEY), ['ror/']);
+  assert.deepEqual(getConditionArray({ StringLike: { 's3:prefix': '' } }, PREFIX_OP, PREFIX_KEY), ['']);
+  assert.deepEqual(getConditionArray(undefined, PREFIX_OP, PREFIX_KEY), []);
 }
 
 console.log('permission conditions regression checks passed');

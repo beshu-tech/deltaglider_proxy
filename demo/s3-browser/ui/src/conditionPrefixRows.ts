@@ -1,4 +1,4 @@
-import { normalizePrefix } from './storagePath';
+import { normalizePrefixPreserveTrailingSlash } from './storagePath';
 
 /**
  * Pure row-management for the s3:prefix condition editor (ConditionPrefixInput).
@@ -25,39 +25,63 @@ export function freshRowId(): string {
   return `pfx-${rowIdCounter}`;
 }
 
-/** Canonicalize a single prefix pattern, preserving a trailing `*` wildcard. */
+/**
+ * Canonicalize a single s3:prefix pattern, preserving a trailing `*`
+ * wildcard AND the operator's trailing-slash choice.
+ *
+ * For an `s3:prefix StringLike` condition, `ror/libs` and `ror/libs/`
+ * are NOT equivalent: the slash-less form also matches sibling keys
+ * like `ror/libs-internal/…`, while the trailing-slash form scopes to
+ * the folder. We therefore only clean separators (collapse `//`,
+ * convert `\`, trim) and must NOT auto-append `/` on blur — doing so
+ * silently narrows the match the operator typed.
+ */
 export function normalizePrefixPattern(value: string): string {
   const trimmed = value.trim();
   if (!trimmed || trimmed === '.*' || trimmed === '*') return trimmed;
   if (trimmed.endsWith('*')) {
     const base = trimmed.slice(0, -1);
-    return `${normalizePrefix(base)}*`;
+    return `${normalizePrefixPreserveTrailingSlash(base)}*`;
   }
-  return normalizePrefix(trimmed);
+  return normalizePrefixPreserveTrailingSlash(trimmed);
 }
 
 /**
- * Parse the persisted comma-joined string into editable rows (always ≥1 row).
+ * Array-shaped seed/serialize for the s3:prefix editor.
  *
- * Splits on `,` with no escaping. This is safe because a comma is not a valid
- * character in an S3 key/prefix, so a comma in the input is always a row
- * separator, never part of a single pattern — escaping machinery would add
- * round-trip risk for a case that cannot legitimately occur.
+ * The persisted condition value is a `string[]` where the empty string `""`
+ * is a MEANINGFUL entry ("list from the bucket root"). The text-row editor
+ * can't represent `""` distinctly from a blank being-edited row, so the
+ * component models root as a separate boolean toggle. These helpers split an
+ * incoming array into `{ includeRoot, rows }` and recombine on the way out.
  */
-export function parseRows(value: string): PrefixRow[] {
-  const parts = value.split(',').map((part) => part.trim());
-  const rows = (parts.length > 0 ? parts : ['']).map((text) => ({ id: freshRowId(), text }));
-  return rows.length > 0 ? rows : [{ id: freshRowId(), text: '' }];
+interface PrefixArrayState {
+  /** True when the persisted value contains the `""` (root) entry. */
+  includeRoot: boolean;
+  /** Non-root prefixes as editable rows (always ≥1 so the UI has an input). */
+  rows: PrefixRow[];
+}
+
+export function parseRowsArray(values: string[]): PrefixArrayState {
+  const includeRoot = values.some((v) => v === '');
+  const nonRoot = values.filter((v) => v !== '' && v.trim() !== '');
+  const rows = (nonRoot.length > 0 ? nonRoot : ['']).map((text) => ({ id: freshRowId(), text }));
+  return { includeRoot, rows };
 }
 
 /**
- * Serialize editable rows back to the persisted comma-joined string.
- * Empty rows are dropped so the persisted value never carries dangling commas;
- * a trailing empty row being edited lives in component state, not here.
+ * Recombine text rows + the root toggle into the persisted `string[]`.
+ * Root (when enabled) is emitted FIRST as `""`; blank rows are dropped;
+ * non-root entries are trimmed and de-duped, order-preserving.
  */
-export function serializeRows(rows: PrefixRow[]): string {
-  return rows
-    .map((row) => row.text.trim())
-    .filter(Boolean)
-    .join(', ');
+export function serializeRowsArray(rows: PrefixRow[], includeRoot: boolean): string[] {
+  const out: string[] = includeRoot ? [''] : [];
+  const seen = new Set<string>(out);
+  for (const row of rows) {
+    const text = row.text.trim();
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    out.push(text);
+  }
+  return out;
 }

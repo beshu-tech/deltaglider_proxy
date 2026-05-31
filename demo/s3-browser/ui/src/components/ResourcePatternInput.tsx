@@ -1,5 +1,5 @@
 import { DeleteOutlined, PlusOutlined } from '@ant-design/icons';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from 'antd';
 import { listCommonPrefixes } from '../s3client';
 import {
@@ -45,6 +45,13 @@ function splitRows(value: string): string[] {
   return rows.length > 0 ? rows : [''];
 }
 
+let resourceRowIdCounter = 0;
+/** Monotonic, collision-free row id for stable React keys (never reused). */
+function freshResourceRowId(): string {
+  resourceRowIdCounter += 1;
+  return `res-${resourceRowIdCounter}`;
+}
+
 function serializeRows(rows: string[]): string {
   if (rows.every((row) => !row.trim())) return rows.length > 1 ? rows.map(() => '').join(', ') : '';
   return rows.map((row) => row.trim()).join(', ');
@@ -55,6 +62,19 @@ export default function ResourcePatternInput({ value, onChange, buckets = [], st
   const [prefixOptions, setPrefixOptions] = useState<string[]>([]);
   const [focusedIndex, setFocusedIndex] = useState<number | null>(null);
   const rows = useMemo(() => splitRows(value), [value]);
+
+  // Stable per-row ids for React keys. Rows are derived from `value` (positional),
+  // so we keep a parallel id list sized to the row count. The list is reconciled
+  // by COUNT here (append/truncate), and the row-mutating handlers below splice it
+  // in lockstep with the value mutation so a surviving row keeps its id through a
+  // middle-row delete — avoiding the key={index} class of focus/IME misplacement.
+  const idsRef = useRef<string[]>([]);
+  if (idsRef.current.length !== rows.length) {
+    const next = idsRef.current.slice(0, rows.length);
+    while (next.length < rows.length) next.push(freshResourceRowId());
+    idsRef.current = next;
+  }
+  const rowIds = idsRef.current;
   const activeValue = focusedIndex === null ? '' : rows[focusedIndex] || '';
   const activePattern = useMemo(() => parseResourcePattern(activeValue), [activeValue]);
   const knownBucket = activePattern.bucket && (buckets.includes(activePattern.bucket) || activeValue.includes('/'))
@@ -186,11 +206,15 @@ export default function ResourcePatternInput({ value, onChange, buckets = [], st
   };
 
   const addRow = () => {
+    idsRef.current = [...idsRef.current, freshResourceRowId()];
     onChange(serializeRows([...rows, '']));
   };
 
   const deleteRow = (index: number) => {
+    // Remove the id at the same index so the remaining rows keep their ids.
+    idsRef.current = idsRef.current.filter((_, i) => i !== index);
     const nextRows = rows.filter((_, rowIndex) => rowIndex !== index);
+    if (nextRows.length === 0) idsRef.current = [freshResourceRowId()];
     onChange(serializeRows(nextRows.length > 0 ? nextRows : ['']));
     setFocusedIndex((current) => {
       if (current === null) return null;
@@ -208,12 +232,12 @@ export default function ResourcePatternInput({ value, onChange, buckets = [], st
     <div style={{ width: '100%' }}>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: style?.marginTop }}>
         {rows.map((row, index) => (
-          <div key={index} style={{ display: 'flex', gap: 6, alignItems: 'center', width: '100%' }}>
+          <div key={rowIds[index] ?? `pending-${index}`} style={{ display: 'flex', gap: 6, alignItems: 'center', width: '100%' }}>
             <div style={{ flex: 1, minWidth: 0 }} onFocusCapture={() => setFocusedIndex(index)}>
               <SimpleAutoComplete
                 value={row}
                 filterText={row}
-                autoComplete={`dgp-resource-${index}`}
+                autoComplete={`dgp-resource-${rowIds[index] ?? index}`}
                 onChange={(v) => updateRow(index, v)}
                 onBlur={() => {
                   setFocusedIndex(null);

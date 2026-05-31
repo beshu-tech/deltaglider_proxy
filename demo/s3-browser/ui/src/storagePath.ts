@@ -23,6 +23,26 @@ export function normalizePrefix(value: string | null | undefined): string {
   return parts.length === 0 ? '' : `${parts.join('/')}/`;
 }
 
+/**
+ * Clean separators in a path-like value WITHOUT forcing a trailing slash.
+ *
+ * Collapses `\` → `/`, removes duplicate/empty segments, trims — but
+ * preserves the caller's trailing-slash decision. Unlike
+ * {@link normalizePrefix} (which always appends `/` to mark a folder),
+ * this is for contexts where `foo/bar` and `foo/bar/` are SEMANTICALLY
+ * DISTINCT — e.g. an `s3:prefix StringLike` condition, where the
+ * trailing slash is the difference between matching only keys under
+ * `foo/bar/` and also matching `foo/bar-baz`.
+ */
+export function normalizePrefixPreserveTrailingSlash(value: string | null | undefined): string {
+  const raw = (value || '').replace(/\\/g, '/');
+  const hadTrailingSlash = raw.trim().endsWith('/');
+  const parts = cleanPathSegments(raw);
+  if (parts.length === 0) return '';
+  const joined = parts.join('/');
+  return hadTrailingSlash ? `${joined}/` : joined;
+}
+
 export function getTrailingCommaSegment(value: string | null | undefined): CommaSegment {
   const raw = value || '';
   const commaIndex = raw.lastIndexOf(',');
