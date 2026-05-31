@@ -44,9 +44,15 @@ export interface BucketScanProgress {
   started_at: string;
 }
 
-/** Map of every bucket the server has a cached scan for. */
+/**
+ * Map of every bucket the server has a cached scan for, plus any scans
+ * currently in flight (`running`). The dashboard reads `running` on mount to
+ * re-attach its live view to scans that kept going server-side while the
+ * operator was on another page — so navigating away mid-scan no longer loses it.
+ */
 export async function getAllBucketScans(): Promise<{
   buckets: Record<string, BucketScanResult>;
+  running?: Record<string, BucketScanProgress>;
 }> {
   return fetchJson('/api/admin/diagnostics/scan/status', 'Bucket scan status (all)');
 }

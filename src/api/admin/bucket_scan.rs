@@ -228,9 +228,10 @@ impl BucketScanner {
         Ok(result)
     }
 
-    /// Snapshot of every bucket's last known state, for the no-bucket
-    /// dashboard view. Excludes in-flight running jobs from the totals
-    /// — those are only meaningful through SSE.
+    /// Snapshot of every bucket's last *completed* scan, for the no-bucket
+    /// dashboard view. Excludes in-flight running jobs — those are surfaced
+    /// separately via `snapshot_running()` so the dashboard can re-attach to
+    /// them after a navigation without re-triggering a scan.
     pub fn snapshot_all(&self) -> HashMap<String, ScanResult> {
         self.buckets
             .read()
@@ -238,6 +239,21 @@ impl BucketScanner {
             .filter_map(|(k, v)| match v {
                 BucketState::Done(r) => Some((k.clone(), r.clone())),
                 BucketState::Running(_) => None,
+            })
+            .collect()
+    }
+
+    /// Snapshot of every bucket with a scan currently in flight, keyed by
+    /// bucket name. Lets the dashboard reconnect its live view (SSE +
+    /// progress) to scans that kept running server-side while the operator
+    /// was on another page — the fix for "scan lost on navigation".
+    pub fn snapshot_running(&self) -> HashMap<String, ScanProgress> {
+        self.buckets
+            .read()
+            .iter()
+            .filter_map(|(k, v)| match v {
+                BucketState::Running(job) => Some((k.clone(), job.progress_rx.borrow().clone())),
+                BucketState::Done(_) => None,
             })
             .collect()
     }
@@ -573,7 +589,12 @@ pub enum StatusSnapshot {
 /// per-bucket cached scans.
 #[derive(Serialize)]
 pub struct AllStatusResponse {
+    /// Last completed scan per bucket (the cached results).
     pub buckets: HashMap<String, ScanResult>,
+    /// Buckets with a scan in flight right now, with their latest progress
+    /// frame. Lets the dashboard re-attach (re-open SSE) on mount instead of
+    /// showing nothing for a scan that's still running server-side.
+    pub running: HashMap<String, ScanProgress>,
 }
 
 #[derive(Deserialize)]
@@ -598,6 +619,7 @@ pub async fn get_scan_status(
     } else {
         Ok(Json(AllStatusResponse {
             buckets: scanner.snapshot_all(),
+            running: scanner.snapshot_running(),
         })
         .into_response())
     }
@@ -778,5 +800,50 @@ mod tests {
         assert_eq!(got.total_stored_bytes, 800_000);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_partitions_done_and_running() {
+        // Build a scanner with one completed bucket and one in-flight bucket,
+        // injecting state directly (no S3 needed). snapshot_all() must show only
+        // the completed one; snapshot_running() only the in-flight one — this is
+        // what lets the dashboard re-attach to a scan after navigating away.
+        let dir = std::env::temp_dir().join(format!("dgp_scan_test_{}", uuid::Uuid::new_v4()));
+        let scanner = BucketScanner::load(dir);
+
+        let done = ScanResult {
+            bucket: "done-bucket".to_string(),
+            total_objects: 10,
+            total_original_bytes: 100,
+            total_stored_bytes: 40,
+            total_reference_bytes: 5,
+            savings_percentage: 60.0,
+            started_at: Utc::now(),
+            completed_at: Utc::now(),
+            duration_ms: 1,
+            version: CURRENT_VERSION,
+        };
+        let (_tx, rx) = watch::channel(ScanProgress::initial("running-bucket"));
+        let running = RunningJob {
+            progress_rx: rx,
+            cancel: CancellationToken::new(),
+        };
+        {
+            let mut b = scanner.buckets.write();
+            b.insert("done-bucket".to_string(), BucketState::Done(done));
+            b.insert("running-bucket".to_string(), BucketState::Running(running));
+        }
+
+        let all = scanner.snapshot_all();
+        assert_eq!(all.len(), 1);
+        assert!(all.contains_key("done-bucket"));
+        assert!(!all.contains_key("running-bucket"));
+
+        let run = scanner.snapshot_running();
+        assert_eq!(run.len(), 1);
+        assert!(run.contains_key("running-bucket"));
+        assert!(!run.contains_key("done-bucket"));
+        assert_eq!(run["running-bucket"].bucket, "running-bucket");
+        assert!(!run["running-bucket"].finished);
     }
 }

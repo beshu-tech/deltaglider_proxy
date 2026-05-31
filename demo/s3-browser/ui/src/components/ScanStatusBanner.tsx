@@ -16,6 +16,8 @@ interface ScanStatusBannerProps {
   newestCompletedAt: string | null;
   oldestCompletedAt: string | null;
   unscannedCount: number;
+  /** Buckets whose cached scan is older than the 6h freshness window. */
+  staleCount: number;
   allBucketsCount: number;
   scansLoaded: boolean;
   isScanning: boolean;
@@ -45,6 +47,7 @@ export default function ScanStatusBanner({
   newestCompletedAt,
   oldestCompletedAt,
   unscannedCount,
+  staleCount,
   allBucketsCount,
   scansLoaded,
   isScanning,
@@ -99,6 +102,11 @@ export default function ScanStatusBanner({
             {unscannedCount > 0 && (
               <span style={{ color: colors.ACCENT_AMBER }}>
                 {' '}· {unscannedCount} unscanned excluded from totals
+              </span>
+            )}
+            {staleCount > 0 && (
+              <span style={{ color: colors.ACCENT_AMBER }} title="Cached results older than 6 hours. Data may have drifted — re-scan for fresh numbers.">
+                {' '}· <strong>{staleCount}</strong> stale (&gt;6h) — re-scan for fresh numbers
               </span>
             )}
           </>

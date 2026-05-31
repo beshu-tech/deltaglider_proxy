@@ -30,6 +30,7 @@
     "test:bulk-clear-selection": "node scripts/bulk-clear-selection-regression-test.mjs",
     "test:dest-prefix": "node scripts/dest-prefix-regression-test.mjs",
     "test:url-state": "node scripts/url-state-regression-test.mjs",
+    "test:scan-freshness": "node scripts/scan-freshness-regression-test.mjs",
     "test:trace-request": "node scripts/trace-request-regression-test.mjs",
     "test:rule-names": "node scripts/rule-names-regression-test.mjs",
     "test:lifecycle-helpers": "node scripts/lifecycle-helpers-regression-test.mjs",

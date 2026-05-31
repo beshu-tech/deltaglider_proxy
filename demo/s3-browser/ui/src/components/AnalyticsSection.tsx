@@ -53,6 +53,7 @@ import TopBucketsSortSelect from './TopBucketsSortSelect';
 import BucketFleetList from './BucketFleetList';
 import TopBucketsList from './TopBucketsList';
 import ScanStatusBanner from './ScanStatusBanner';
+import { isScanStale } from './scanFreshness';
 import { SORT_LABELS, type TopBucketsSortKey } from './topBucketsSort';
 
 /** Row shape consumed by chart + table. Derived from cache + live progress. */
@@ -169,16 +170,30 @@ export default function AnalyticsSection({ config }: Props) {
     try {
       const res = await getAllBucketScans();
       setScans(res.buckets);
+      return res.running ?? {};
     } catch {
       // Non-fatal: keep whatever's already on screen.
+      return {};
     } finally {
       setScansLoaded(true);
     }
   }, []);
 
   // Initial load: bucket list + persisted scans, in parallel.
+  //
+  // RE-ATTACH on mount: scans run server-side and keep going even if the
+  // operator navigates away (this component unmounts). On return we read the
+  // server's `running` map and re-seed the fan-out queue with any in-flight
+  // buckets — the queue-follow effect then re-opens SSE and live progress
+  // resumes, instead of the dashboard showing nothing. This is the core fix for
+  // "scan lost on navigation".
   useEffect(() => {
-    refreshScans();
+    refreshScans().then((running) => {
+      const inFlight = Object.keys(running);
+      if (inFlight.length > 0) {
+        setQueue((prev) => (prev.length > 0 ? prev : inFlight));
+      }
+    });
     listBuckets()
       .then(bs => setAllBuckets(bs.map(b => b.name)))
       .catch(() => setAllBuckets([]));
@@ -364,6 +379,10 @@ export default function AnalyticsSection({ config }: Props) {
     ? cachedRows.reduce((max, r) =>
         r.completedAt! > max ? r.completedAt! : max, cachedRows[0].completedAt!)
     : null;
+  // Buckets whose cached scan is older than the 6h freshness window. Surfaced
+  // as a "stale" nudge to re-scan — we never auto-rescan or delete (the data
+  // stays cached on disk; the operator decides when it's worth refreshing).
+  const staleCount = cachedRows.filter(r => isScanStale(r.completedAt)).length;
 
   const opportunities = bucketRows.filter(b => {
     const policy =
@@ -423,6 +442,7 @@ export default function AnalyticsSection({ config }: Props) {
         newestCompletedAt={newestCompletedAt}
         oldestCompletedAt={oldestCompletedAt}
         unscannedCount={unscannedCount}
+        staleCount={staleCount}
         allBucketsCount={allBuckets.length}
         scansLoaded={scansLoaded}
         isScanning={isScanning}
