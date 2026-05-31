@@ -27,16 +27,14 @@ import { useColors } from './ThemeContext';
 import useComputeSize from './useComputeSize';
 import { NavigationContext } from './NavigationContext';
 import { canRequestPrefixUsageScan, canUse, writablePrefixesForBucket } from './permissions';
+import { useUrlRouter } from './useUrlRouter';
+import { buildViewUrl, type View } from './urlState';
 
 const { Content } = Layout;
 const { useBreakpoint } = Grid;
 
-type View = 'browser' | 'upload' | 'metrics' | 'docs' | 'admin';
-
 /** Full-screen views hide the main sidebar and TopBar */
 const FULLSCREEN_VIEWS: Set<View> = new Set(['admin', 'docs']);
-
-const BASE = '/_/';
 
 // Shared Suspense fallback for lazy admin / metrics / docs page chunks.
 // Module-scope so we don't reallocate it on every render.
@@ -46,55 +44,10 @@ const LAZY_FALLBACK = (
   </div>
 );
 
-const SEGMENT_TO_VIEW: Record<string, View> = {
-  '': 'browser',
-  'browse': 'browser',
-  'upload': 'upload',
-  'metrics': 'metrics',
-  'docs': 'docs',
-  'admin': 'admin',
-};
+export default function App() {
+  const colors = useColors();
 
-/** Parse pathname into view + sub-path */
-function parsePath(): { view: View; subPath: string } {
-  let path = window.location.pathname;
-  if (path.startsWith(BASE)) path = path.slice(BASE.length);
-  else if (path.startsWith('/')) path = path.slice(1);
-  path = path.replace(/\/+$/, ''); // trim trailing slashes
-
-  const segments = path.split('/');
-  const view = SEGMENT_TO_VIEW[segments[0] || ''] ?? 'browser';
-  const subPath = segments.slice(1).join('/');
-  return { view, subPath };
-}
-
-
-function usePathRouter() {
-  const [state, setState] = useState(parsePath);
-  const skipNext = useRef(false);
-
-  // Redirect old hash-based URLs on first load
-  useEffect(() => {
-    if (window.location.hash.startsWith('#/')) {
-      const oldPath = window.location.hash.slice(1); // e.g., "/admin/users"
-      window.history.replaceState(null, '', BASE + oldPath.replace(/^\//, ''));
-      setState(parsePath());
-    }
-  }, []);
-
-  const navigate = useCallback((path: string, replace = false) => {
-    const cleanPath = path.replace(/^\//, '');
-    const fullPath = BASE + cleanPath;
-    if (window.location.pathname + window.location.hash === fullPath) return;
-    skipNext.current = true;
-    if (replace) {
-      window.history.replaceState(null, '', fullPath);
-    } else {
-      window.history.pushState(null, '', fullPath);
-    }
-    setState(parsePath());
-  }, []);
-
+  const { view, subPath, browser, navigate } = useUrlRouter();
   // Stable "go back to browser" callback. Previously inlined into
   // AdminPage / MetricsPage props as `() => navigate('browse')`, which
   // allocated a fresh arrow every App render and propagated as
@@ -103,26 +56,9 @@ function usePathRouter() {
   // so a fresh prop → fresh callback → `useEffect([loadData])` fires
   // → re-fetches → setState → re-render wave. This one-line fix
   // eliminates the most visible cause of excessive re-renders when
-  // navigating between admin sub-pages.
-  const navigateToBrowse = useCallback(() => navigate('browse'), [navigate]);
-
-  useEffect(() => {
-    const onPopState = () => {
-      if (skipNext.current) { skipNext.current = false; return; }
-      setState(parsePath());
-    };
-    window.addEventListener('popstate', onPopState);
-    return () => window.removeEventListener('popstate', onPopState);
-  }, []);
-
-  return { view: state.view, subPath: state.subPath, navigate, navigateToBrowse };
-}
-
-
-export default function App() {
-  const colors = useColors();
-
-  const { view, subPath, navigate, navigateToBrowse } = usePathRouter();
+  // navigating between admin sub-pages. `navigate` is stable, and
+  // `buildViewUrl('browser')` is a constant, so this stays stable too.
+  const navigateToBrowse = useCallback(() => navigate(buildViewUrl('browser')), [navigate]);
   const [siderOpen, setSiderOpen] = useState(false);
   const [needsConnect, setNeedsConnect] = useState(true); // start true, resolved in useEffect
   const [sessionLoading, setSessionLoading] = useState(true);
@@ -138,12 +74,22 @@ export default function App() {
     deriveSessionCapabilities({ valid: false, admin_gui: false }),
   );
   const hasAdminSession = sessionCaps.adminGui;
-  const activeBucket = getBucket();
+  // The URL is the source of truth for the active bucket (browser.bucket).
+  // Fall back to the s3client module state during the brief window before the
+  // first bucket is chosen / synced.
+  const activeBucket = browser.bucket || getBucket();
   const writablePrefixes = useMemo(
     () => writablePrefixesForBucket(identity, activeBucket),
     [identity, activeBucket],
   );
-  const s3 = useS3Browser({ writablePrefixes });
+  const s3 = useS3Browser({
+    writablePrefixes,
+    bucket: browser.bucket,
+    prefix: browser.prefix,
+    q: browser.q,
+    object: browser.object,
+    navigateUrl: navigate,
+  });
   const folderSize = useComputeSize();
   const computeSize = folderSize.compute;
   const reconnectS3 = s3.reconnect;
@@ -282,13 +228,13 @@ export default function App() {
     setIdentity(null);
     setSessionValid(false);
     setSessionCaps(deriveSessionCapabilities({ valid: false, admin_gui: false }));
-    navigate('browse');
+    navigate(buildViewUrl('browser'));
   };
 
   const handleBucketChange = useCallback((newBucket: string) => {
+    // changeBucket() already navigates the URL to /browse/<bucket>/ (PUSH).
     changeS3Bucket(newBucket);
-    navigate('browse');
-  }, [changeS3Bucket, navigate]);
+  }, [changeS3Bucket]);
 
   const isEmpty = s3.objects.length === 0 && s3.folders.length === 0;
   const hasBuckets = (bucketCount ?? 0) > 0;
@@ -316,8 +262,8 @@ export default function App() {
       ? canUse(identity, 'delete', activeBucket, selectedKey.slice('folder:'.length))
       : canUse(identity, 'delete', activeBucket, selectedKey)
   );
-  const canReadSelectedObject = Boolean(activeBucket && s3.selected) && canUse(identity, 'read', activeBucket, s3.selected?.key ?? '');
-  const canDeleteSelectedObject = Boolean(activeBucket && s3.selected) && canUse(identity, 'delete', activeBucket, s3.selected?.key ?? '');
+  const canReadSelectedObject = Boolean(activeBucket && s3.inspectorObject) && canUse(identity, 'read', activeBucket, s3.inspectorObject?.key ?? '');
+  const canDeleteSelectedObject = Boolean(activeBucket && s3.inspectorObject) && canUse(identity, 'delete', activeBucket, s3.inspectorObject?.key ?? '');
   const canCopyFromActiveBucket = canReadSelected && canWriteActivePrefix;
   const canMoveFromActiveBucket = canCopyFromActiveBucket && canDeleteSelected;
   const canReadActiveBucket = !activeBucket || canUse(identity, 'read', activeBucket, s3.prefix) || canUse(identity, 'list', activeBucket, s3.prefix);
@@ -325,9 +271,9 @@ export default function App() {
     <AccountMenu
       identityLabel={identity?.user?.name || currentAccessKey || 'user'}
       canAdmin={canAdmin}
-      onBrowserClick={() => navigate('browse')}
-      onSettingsClick={() => navigate('admin')}
-      onDocsClick={() => navigate('docs')}
+      onBrowserClick={() => navigate(buildViewUrl('browser'))}
+      onSettingsClick={() => navigate(buildViewUrl('admin'))}
+      onDocsClick={() => navigate(buildViewUrl('docs'))}
       onLogout={handleLogout}
       showHidden={includeBrowserToggles ? s3.showHidden : undefined}
       onToggleHidden={includeBrowserToggles ? () => s3.setShowHidden(!s3.showHidden) : undefined}
@@ -338,13 +284,13 @@ export default function App() {
   );
   const requestCreateBucket = () => {
     if (!canCreateBucket) return;
-    navigate('browse');
+    navigate(buildViewUrl('browser'));
     setSiderOpen(true);
     setCreateBucketFocusSignal((n) => n + 1);
   };
   const openUpload = () => {
     if (!canUploadToActiveBucket) return;
-    navigate('upload');
+    navigate(buildViewUrl('upload'));
     setSiderOpen(false);
   };
 
@@ -497,9 +443,9 @@ export default function App() {
               objects={s3.objects}
               folders={s3.folders}
               prefix={s3.prefix}
-              selected={s3.selected}
-              onSelect={s3.setSelected}
-              onNavigate={(p) => { navigate('browse'); s3.navigate(p); }}
+              selected={s3.inspectorObject}
+              onSelect={(obj) => s3.openInspector(obj.key)}
+              onNavigate={s3.navigate}
               selectedKeys={s3.selectedKeys}
               onToggleKey={s3.toggleKey}
               onToggleAll={s3.toggleAll}
@@ -553,7 +499,7 @@ export default function App() {
           {!FULLSCREEN_VIEWS.has(view) && (
             <TopBar
               prefix={s3.prefix}
-              onNavigate={(p) => { navigate('browse'); s3.navigate(p); }}
+              onNavigate={s3.navigate}
               isMobile={isMobile}
               onMenuClick={() => setSiderOpen(true)}
               onRefresh={s3.mutate}
@@ -576,8 +522,8 @@ export default function App() {
       </Layout>
 
       <InspectorPanel
-        object={s3.selected}
-        onClose={() => s3.setSelected(null)}
+        object={s3.inspectorObject}
+        onClose={s3.closeInspector}
         onDeleted={s3.mutate}
         onPreview={setPreviewObject}
         isMobile={isMobile}

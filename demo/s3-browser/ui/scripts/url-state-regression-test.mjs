@@ -1,0 +1,75 @@
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import ts from 'typescript';
+
+const sourceUrl = new URL('../src/urlState.ts', import.meta.url);
+const source = await readFile(sourceUrl, 'utf8');
+const { outputText } = ts.transpileModule(source, {
+  compilerOptions: { module: ts.ModuleKind.ES2020, target: ts.ScriptTarget.ES2020 },
+  fileName: 'urlState.ts',
+});
+const mod = await import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
+const { parseViewLocation, parseBrowserLocation, buildBrowserUrl, buildViewUrl, BASE } = mod;
+
+// --- parseViewLocation --------------------------------------------------------
+assert.deepEqual(parseViewLocation('/_/'), { view: 'browser', subPath: '' });
+assert.deepEqual(parseViewLocation('/_/browse'), { view: 'browser', subPath: '' });
+assert.deepEqual(parseViewLocation('/_/admin/configuration/access/credentials'), {
+  view: 'admin', subPath: 'configuration/access/credentials',
+});
+assert.deepEqual(parseViewLocation('/_/docs/configuration'), { view: 'docs', subPath: 'configuration' });
+assert.deepEqual(parseViewLocation('/_/metrics'), { view: 'metrics', subPath: '' });
+assert.deepEqual(parseViewLocation('/_/unknownthing'), { view: 'browser', subPath: '' });
+
+// --- parseBrowserLocation -----------------------------------------------------
+assert.deepEqual(parseBrowserLocation('/_/', ''), { bucket: '', prefix: '', q: '', object: '' });
+assert.deepEqual(parseBrowserLocation('/_/browse/beshu/', ''), { bucket: 'beshu', prefix: '', q: '', object: '' });
+assert.deepEqual(parseBrowserLocation('/_/browse/beshu/ror/builds/', ''), {
+  bucket: 'beshu', prefix: 'ror/builds/', q: '', object: '',
+});
+// query params
+assert.deepEqual(parseBrowserLocation('/_/browse/beshu/ror/', '?q=zip'), {
+  bucket: 'beshu', prefix: 'ror/', q: 'zip', object: '',
+});
+assert.deepEqual(parseBrowserLocation('/_/browse/beshu/ror/', '?object=ror/app.zip'), {
+  bucket: 'beshu', prefix: 'ror/', q: '', object: 'ror/app.zip',
+});
+
+// --- buildBrowserUrl ----------------------------------------------------------
+assert.equal(buildBrowserUrl({ bucket: '', prefix: '' }), '/_/browse');
+assert.equal(buildBrowserUrl({ bucket: 'beshu' }), '/_/browse/beshu/');
+assert.equal(buildBrowserUrl({ bucket: 'beshu', prefix: 'ror/builds/' }), '/_/browse/beshu/ror/builds/');
+assert.equal(buildBrowserUrl({ bucket: 'beshu', prefix: 'ror/', q: 'zip' }), '/_/browse/beshu/ror/?q=zip');
+assert.equal(
+  buildBrowserUrl({ bucket: 'beshu', prefix: 'ror/', object: 'ror/app.zip' }),
+  '/_/browse/beshu/ror/?object=ror%2Fapp.zip',
+);
+
+// --- buildViewUrl -------------------------------------------------------------
+assert.equal(buildViewUrl('admin', 'configuration/access/credentials'), '/_/admin/configuration/access/credentials');
+assert.equal(buildViewUrl('browser'), '/_/browse');
+assert.equal(buildViewUrl('docs', '/configuration/'), '/_/docs/configuration');
+
+// --- ROUND TRIP: parse(build(x)) === x (the core invariant) -------------------
+const cases = [
+  { bucket: '', prefix: '', q: '', object: '' },
+  { bucket: 'beshu', prefix: '', q: '', object: '' },
+  { bucket: 'beshu', prefix: 'ror/', q: '', object: '' },
+  { bucket: 'beshu', prefix: 'ror/builds/1.70.0-pre6/', q: '', object: '' },
+  { bucket: 'beshu', prefix: 'ror/', q: 'sha512', object: '' },
+  { bucket: 'beshu', prefix: 'ror/', q: '', object: 'ror/readonlyrest-1.70.0_es7.8.1.zip.sha512' },
+  // nasty keys: spaces, plus, unicode
+  { bucket: 'my-bucket', prefix: 'folder with spaces/sub+dir/', q: '', object: '' },
+  { bucket: 'b', prefix: 'café/数据/', q: 'a+b c', object: 'café/数据/x.txt' },
+];
+for (const c of cases) {
+  const url = buildBrowserUrl(c);
+  const [path, search = ''] = url.split('?');
+  const parsed = parseBrowserLocation(path, search);
+  assert.deepEqual(parsed, c, `round-trip failed for ${JSON.stringify(c)} -> ${url} -> ${JSON.stringify(parsed)}`);
+}
+
+// BASE export sanity
+assert.equal(BASE, '/_/');
+
+console.log('url state regression checks passed');

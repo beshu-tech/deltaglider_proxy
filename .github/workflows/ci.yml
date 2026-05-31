@@ -541,6 +541,7 @@ jobs:
           npm run test:trace-request
           npm run test:bulk-clear-selection
           npm run test:dest-prefix
+          npm run test:url-state
           npm run test:rule-names
           npm run test:lifecycle-helpers
           npm run test:upload-telemetry

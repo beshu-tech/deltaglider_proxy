@@ -1,0 +1,94 @@
+import { useState, useEffect, useRef, useCallback } from 'react';
+import {
+  BASE,
+  parseViewLocation,
+  parseBrowserLocation,
+  type View,
+  type BrowserLocation,
+} from './urlState';
+
+/**
+ * The full app location derived from `window.location`. `view` / `subPath`
+ * drive the top-level view switch (admin/docs/metrics/upload) exactly as the
+ * old inline `usePathRouter` did; `browser` carries the bucket-browser state
+ * (bucket / prefix / q / object) parsed from the path + query string.
+ */
+interface UrlLocation {
+  view: View;
+  subPath: string;
+  browser: BrowserLocation;
+}
+
+function readLocation(): UrlLocation {
+  const { view, subPath } = parseViewLocation(window.location.pathname);
+  const browser = parseBrowserLocation(window.location.pathname, window.location.search);
+  return { view, subPath, browser };
+}
+
+interface UrlRouter extends UrlLocation {
+  /**
+   * Low-level navigation. `url` is a full BASE-prefixed path (+ optional query),
+   * as produced by `buildBrowserUrl` / `buildViewUrl`. Pushes a history entry by
+   * default; pass `{ replace: true }` to swap the current entry instead (used for
+   * the debounced `?q=` filter so typing doesn't spam history). Stable identity
+   * (`useCallback([])`) so it can sit in consumer dependency arrays without
+   * cascading re-renders.
+   */
+  navigate: (url: string, opts?: { replace?: boolean }) => void;
+}
+
+/**
+ * Owns the pushState/popstate lifecycle for the whole SPA and exposes the
+ * current location (re-derived from `window.location` on every navigation and
+ * on Back/Forward). Built on the pure helpers in `urlState.ts`.
+ *
+ * Carries over verbatim from the old inline `usePathRouter`:
+ *  - the legacy `#/...` hash → path redirect on mount, and
+ *  - the `skipNext` guard so our own pushState doesn't double-handle via popstate.
+ */
+export function useUrlRouter(): UrlRouter {
+  const [location, setLocation] = useState<UrlLocation>(readLocation);
+  const skipNext = useRef(false);
+
+  // Redirect old hash-based URLs on first load (carried over verbatim).
+  useEffect(() => {
+    if (window.location.hash.startsWith('#/')) {
+      const oldPath = window.location.hash.slice(1); // e.g., "/admin/users"
+      window.history.replaceState(null, '', BASE + oldPath.replace(/^\//, ''));
+      setLocation(readLocation());
+    }
+  }, []);
+
+  const navigate = useCallback((url: string, opts?: { replace?: boolean }) => {
+    // `url` is already BASE-prefixed by build*Url; tolerate a missing BASE.
+    const fullPath = url.startsWith(BASE)
+      ? url
+      : BASE + url.replace(/^\//, '');
+    if (window.location.pathname + window.location.search + window.location.hash === fullPath) {
+      return;
+    }
+    skipNext.current = true;
+    if (opts?.replace) {
+      window.history.replaceState(null, '', fullPath);
+    } else {
+      window.history.pushState(null, '', fullPath);
+    }
+    setLocation(readLocation());
+  }, []);
+
+  useEffect(() => {
+    const onPopState = () => {
+      if (skipNext.current) { skipNext.current = false; return; }
+      setLocation(readLocation());
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
+
+  return {
+    view: location.view,
+    subPath: location.subPath,
+    browser: location.browser,
+    navigate,
+  };
+}

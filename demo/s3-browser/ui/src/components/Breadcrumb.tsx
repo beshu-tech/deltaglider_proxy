@@ -2,6 +2,7 @@ import { HomeFilled } from '@ant-design/icons';
 import { prefixSegments } from '../utils';
 import { getBucket } from '../s3client';
 import { useColors } from '../ThemeContext';
+import { buildBrowserUrl } from '../urlState';
 
 interface Props {
   prefix: string;
@@ -15,6 +16,11 @@ const segmentBase: React.CSSProperties = {
   overflow: 'hidden',
   textOverflow: 'ellipsis',
   fontFamily: "var(--font-ui)",
+  textDecoration: 'none',
+  background: 'none',
+  border: 'none',
+  padding: 0,
+  cursor: 'pointer',
 };
 
 export default function Breadcrumb({ prefix, onNavigate }: Props) {
@@ -23,19 +29,29 @@ export default function Breadcrumb({ prefix, onNavigate }: Props) {
   const segments = prefixSegments(prefix);
   const bucket = getBucket();
 
+  // Real <a href> so middle-click / cmd-click open the folder in a new tab.
+  // Plain left-click is intercepted (preventDefault) and routed through the
+  // SPA router via onNavigate; modified clicks fall through to the browser.
+  const hrefFor = (p: string) => buildBrowserUrl({ bucket, prefix: p });
+  const onCrumbClick = (p: string) => (e: React.MouseEvent) => {
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+    e.preventDefault();
+    onNavigate(p);
+  };
+
   return (
     <nav aria-label="Breadcrumb">
       <ol style={{ display: 'flex', alignItems: 'center', minWidth: 0, overflow: 'hidden', listStyle: 'none', margin: 0, padding: 0 }}>
         {/* Home */}
         <li>
-          <button
-            className="btn-reset"
-            onClick={() => onNavigate('')}
+          <a
+            href={hrefFor('')}
+            onClick={onCrumbClick('')}
             aria-label="Home"
-            style={{ color: prefix ? TEXT_SECONDARY : ACCENT_BLUE, fontSize: 14, flexShrink: 0, transition: 'color 0.15s' }}
+            style={{ color: prefix ? TEXT_SECONDARY : ACCENT_BLUE, fontSize: 14, flexShrink: 0, transition: 'color 0.15s', textDecoration: 'none', cursor: 'pointer' }}
           >
             <HomeFilled aria-hidden="true" />
-          </button>
+          </a>
         </li>
 
         <li aria-hidden="true" style={separatorStyle}>&rsaquo;</li>
@@ -43,13 +59,13 @@ export default function Breadcrumb({ prefix, onNavigate }: Props) {
         {/* Bucket name */}
         <li>
           {prefix ? (
-            <button
-              className="btn-reset"
-              onClick={() => onNavigate('')}
+            <a
+              href={hrefFor('')}
+              onClick={onCrumbClick('')}
               style={{ ...segmentBase, color: TEXT_SECONDARY, maxWidth: 140, transition: 'color 0.15s' }}
             >
               {bucket}
-            </button>
+            </a>
           ) : (
             <span style={{ ...segmentBase, color: TEXT_PRIMARY, maxWidth: 140, fontWeight: 600 }} aria-current="location">
               {bucket}
@@ -71,13 +87,13 @@ export default function Breadcrumb({ prefix, onNavigate }: Props) {
                   {seg.label}
                 </span>
               ) : (
-                <button
-                  className="btn-reset"
-                  onClick={() => onNavigate(seg.prefix)}
+                <a
+                  href={hrefFor(seg.prefix)}
+                  onClick={onCrumbClick(seg.prefix)}
                   style={{ ...segmentBase, color: TEXT_SECONDARY, maxWidth: 140, transition: 'color 0.15s' }}
                 >
                   {seg.label}
-                </button>
+                </a>
               )}
             </li>
           );

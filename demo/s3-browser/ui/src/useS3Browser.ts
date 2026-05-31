@@ -1,6 +1,7 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { message } from 'antd';
 import { listObjects, uploadObject, getBucket, setBucket, headObject, hasCredentials } from './s3client';
+import { buildBrowserUrl } from './urlState';
 import {
   bulkCopyObjects,
   bulkDeleteObjects,
@@ -20,21 +21,40 @@ const MAX_HEAD_CACHE_SIZE = 5000;
 
 interface UseS3BrowserOptions {
   writablePrefixes?: string[];
+  /**
+   * The browser location, derived from the URL by `useUrlRouter().browser`.
+   * The URL is the single source of truth for where-am-I: bucket / current
+   * folder prefix / search filter / open inspector object. Folder navigation
+   * therefore creates real history entries (Back/Forward work) and reload
+   * restores the folder.
+   */
+  bucket: string;
+  prefix: string;
+  q: string;
+  object: string;
+  /** Low-level URL navigation from the router (push by default, {replace} to swap). */
+  navigateUrl: (url: string, opts?: { replace?: boolean }) => void;
 }
 
-export default function useS3Browser(options: UseS3BrowserOptions = {}) {
-  const { writablePrefixes = [] } = options;
+export default function useS3Browser(options: UseS3BrowserOptions) {
+  const {
+    writablePrefixes = [],
+    bucket,
+    prefix,
+    q,
+    object,
+    navigateUrl,
+  } = options;
   const [refreshTrigger, setRefreshTrigger] = useState(0);
   const [objects, setObjects] = useState<S3Object[]>([]);
   const [folders, setFolders] = useState<string[]>([]);
   const [virtualFolders, setVirtualFolders] = useState<string[]>([]);
-  const [prefix, setPrefix] = useState('');
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [isTruncated, setIsTruncated] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [connected, setConnected] = useState(hasCredentials());
-  const [searchQuery, setSearchQuery] = useState('');
+  const searchQuery = q;
   const [showHidden, setShowHiddenState] = useState(() => localStorage.getItem('dg-show-hidden') === 'true');
   const setShowHidden = useCallback((v: boolean) => {
     setShowHiddenState(v);
@@ -48,6 +68,15 @@ export default function useS3Browser(options: UseS3BrowserOptions = {}) {
   const prefixRef = useRef(prefix);
   prefixRef.current = prefix;
   const isInitialLoad = useRef(true);
+
+  // Keep the s3client's module-level active bucket in sync with the URL bucket
+  // (the AWS-SDK calls read it). Runs before the list-fetch effect on a bucket
+  // change so listObjects() targets the right bucket.
+  useEffect(() => {
+    if (bucket && bucket !== getBucket()) {
+      setBucket(bucket);
+    }
+  }, [bucket]);
 
   const query = searchQuery.toLowerCase();
   const filteredObjects = query ? objects.filter((o) => o.key.toLowerCase().includes(query)) : objects;
@@ -74,6 +103,14 @@ export default function useS3Browser(options: UseS3BrowserOptions = {}) {
     isInitialLoad.current = true;
     clearSelection();
   }, [clearSelection]);
+
+  // The URL now drives location: whenever bucket or prefix changes (folder nav,
+  // bucket switch, Back/Forward, reload), reset transient browse state so stale
+  // rows from the previous folder don't flash before the new listing arrives.
+  // Previously this was done imperatively inside navigate()/changeBucket().
+  useEffect(() => {
+    resetBrowseState();
+  }, [bucket, prefix, resetBrowseState]);
 
   const refresh = useCallback(() => {
     setRefreshTrigger((k) => k + 1);
@@ -190,22 +227,61 @@ export default function useS3Browser(options: UseS3BrowserOptions = {}) {
     refresh();
   }, [refresh]);
 
-  const navigate = useCallback((newPrefix: string) => {
-    resetBrowseState();
-    setPrefix(newPrefix);
-    setSearchQuery('');
-  }, [resetBrowseState]);
+  // ── Inspector deep-link (?object=<key>) ──────────────────────────────────
+  // The "which object is open in the inspector drawer" state lives in the URL
+  // (?object=). Opening a row PUSHES that entry, so Back/Esc closes the drawer
+  // and the URL deep-links to a file (reload re-opens it). The inspector object
+  // is derived from the key: prefer the row already in the list; otherwise a
+  // light stub (InspectorPanel HEADs on mount to fill in size/metadata).
+  const inspectorObject = useMemo<S3Object | null>(() => {
+    if (!object) return null;
+    const found = objects.find((o) => o.key === object);
+    if (found) return found;
+    return { key: object, size: 0, lastModified: '' } as S3Object;
+  }, [object, objects]);
 
+  const openInspector = useCallback((key: string) => {
+    navigateUrl(buildBrowserUrl({ bucket, prefix, q, object: key }));
+  }, [navigateUrl, bucket, prefix, q]);
+
+  const closeInspector = useCallback(() => {
+    if (!object) return;
+    // The open PUSHed a ?object= entry, so Back is the natural close — it pops
+    // the drawer entry and restores the folder URL without it.
+    window.history.back();
+  }, [object]);
+
+  // Folder navigation: PUSH a new history entry for the new prefix (same bucket,
+  // drop any active search). Back returns to the parent folder. The URL change
+  // re-derives prefix and triggers the reset + list effects above.
+  const navigate = useCallback((newPrefix: string) => {
+    navigateUrl(buildBrowserUrl({ bucket, prefix: newPrefix }));
+  }, [navigateUrl, bucket]);
+
+  // Bucket switch: PUSH; prefix + search reset to root of the new bucket.
   const changeBucket = useCallback((newBucket: string) => {
-    setBucket(newBucket);       // Update the s3client's active bucket FIRST
-    resetBrowseState();
-    setPrefix('');
-    setRefreshTrigger((k) => k + 1);
-  }, [resetBrowseState]);
+    setBucket(newBucket); // keep s3client in sync immediately (the effect also does this)
+    navigateUrl(buildBrowserUrl({ bucket: newBucket }));
+  }, [navigateUrl]);
+
+  // Search filter lives in the URL as ?q=, written as a debounced REPLACE so
+  // typing doesn't spam the history stack (each keystroke swaps the current
+  // entry rather than pushing). REPLACE also means Back from a filtered view
+  // leaves the folder rather than undoing keystrokes.
+  const qDebounce = useRef<number | null>(null);
+  const setSearchQuery = useCallback((next: string) => {
+    if (qDebounce.current !== null) window.clearTimeout(qDebounce.current);
+    qDebounce.current = window.setTimeout(() => {
+      qDebounce.current = null;
+      navigateUrl(buildBrowserUrl({ bucket, prefix, q: next, object }), { replace: true });
+    }, 200);
+  }, [navigateUrl, bucket, prefix, object]);
+  useEffect(() => () => {
+    if (qDebounce.current !== null) window.clearTimeout(qDebounce.current);
+  }, []);
 
   const reconnect = useCallback(() => {
     resetBrowseState();
-    setPrefix('');
     setConnected(hasCredentials());
     setRefreshTrigger((k) => k + 1);
   }, [resetBrowseState]);
@@ -437,6 +513,10 @@ export default function useS3Browser(options: UseS3BrowserOptions = {}) {
     selectedKeys: selection.selectedKeys,
     toggleKey: selection.toggleKey,
     toggleAll: selection.toggleAll,
+    // Inspector (URL-backed: ?object=)
+    inspectorObject,
+    openInspector,
+    closeInspector,
     // Actions
     navigate,
     changeBucket,

@@ -45,6 +45,7 @@ import {
   AdvancedOverview,
 } from './sectionOverviews';
 import { useNavigation } from '../NavigationContext';
+import { buildViewUrl } from '../urlState';
 import TabHeader from './TabHeader';
 import { YamlImportExportModal } from './YamlImportExportModal';
 import { useDirtyGlobalIndicators, requestApplyCurrent } from '../useDirtySection';
@@ -176,7 +177,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, accountMe
   const activeSection = sectionForPath(adminPath);
   const navigateAdmin = useCallback(
     (path: string) => {
-      navigate(`admin/${path}`);
+      navigate(buildViewUrl('admin', path));
       // Close the mobile drawer (if open) on navigation. Harmless
       // no-op on wide viewports where the drawer is never shown.
       setMobileNavOpen(false);
@@ -198,7 +199,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, accountMe
     // (empty sub-path -> diagnostics/dashboard) — that's a fresh
     // navigation, not a legacy bookmark.
     if (rawSubPath && rawSubPath !== adminPath) {
-      navigate(`admin/${adminPath}`, /* replace */ true);
+      navigate(buildViewUrl('admin', adminPath), { replace: true });
     }
   }, [rawSubPath, adminPath, navigate]);
 
