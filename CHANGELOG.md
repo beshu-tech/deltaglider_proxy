@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.1.1 — 2026-06-01
+
 ### Changed — IAM permission editor
 
 - **One-line grant editor.** Each permission rule is now a single row —
