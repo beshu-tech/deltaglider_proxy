@@ -82,3 +82,40 @@ export function unknownBucketWarnings(
   }
   return out;
 }
+
+/** True if `s` contains any whitespace or control character. */
+function hasWhitespaceOrControl(s: string): boolean {
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    // C0 controls (incl. tab/newline), space, and DEL.
+    if (code <= 0x20 || code === 0x7f) return true;
+  }
+  return false;
+}
+
+/**
+ * Flag resource patterns the BACKEND `validate_permissions` rejects, so the
+ * operator sees the problem inline instead of a bare HTTP 400 on Apply. Mirrors
+ * the server rules (src/iam/permissions.rs): only a TRAILING `*` is allowed, and
+ * a pattern must not contain whitespace or control characters. Hyphens, dots,
+ * and slashes are fine. Returns one human-readable reason per offending pattern
+ * (empty list = all valid).
+ */
+export function invalidPatternWarnings(resources: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const part of resources.split(',')) {
+    const trimmed = part.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    if (hasWhitespaceOrControl(trimmed)) {
+      out.push(`"${trimmed}" contains a space or control character — patterns can't have them.`);
+      continue;
+    }
+    const star = trimmed.indexOf('*');
+    if (star !== -1 && star !== trimmed.length - 1) {
+      out.push(`"${trimmed}" has "*" mid-pattern — only a trailing "*" is allowed (e.g. bucket/prefix/*).`);
+    }
+  }
+  return out;
+}

@@ -4,6 +4,7 @@ import { checkSession, adminLogin, whoami, loginAs, exportBackup, importBackup, 
 import { getCredentials, initFromSession } from '../s3client';
 import { LockOutlined, MenuOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
+import { useIsNarrow } from '../useIsNarrow';
 import FullScreenHeader from './FullScreenHeader';
 import UsersPanel from './UsersPanel';
 import GroupsPanel from './GroupsPanel';
@@ -98,18 +99,6 @@ const LEGACY_TO_NEW: Record<string, string> = {
  * up live without a full reload. 900px matches the plan's promise
  * ("sidebar collapses to drawer at <900px").
  */
-function useIsNarrow(breakpoint: number = 900): boolean {
-  const [narrow, setNarrow] = useState(() =>
-    typeof window !== 'undefined' ? window.innerWidth < breakpoint : false
-  );
-  useEffect(() => {
-    const onResize = () => setNarrow(window.innerWidth < breakpoint);
-    window.addEventListener('resize', onResize);
-    return () => window.removeEventListener('resize', onResize);
-  }, [breakpoint]);
-  return narrow;
-}
-
 /**
  * Resolve an incoming `subPath` (anything the browser presents) to a
  * canonical path in the new 4-group scheme. Falls back to the default

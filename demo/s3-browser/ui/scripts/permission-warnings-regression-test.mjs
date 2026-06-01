@@ -25,7 +25,7 @@ const storagePathUrl = await loadModule('../src/storagePath.ts', 'storagePath.ts
 const modUrl = await loadModule('../src/components/permissionWarnings.ts', 'permissionWarnings.ts', {
   '../storagePath': storagePathUrl,
 });
-const { unknownBucketWarnings } = await import(modUrl);
+const { unknownBucketWarnings, invalidPatternWarnings } = await import(modUrl);
 
 const BUCKETS = ['beshu', 'debug', 'archive'];
 
@@ -71,5 +71,33 @@ assert.deepEqual(unknownBucketWarnings('${username}/scrap/*', BUCKETS), []);
 
 // Empty known-bucket list (still loading) → no false positives.
 assert.deepEqual(unknownBucketWarnings('ror/lib/*', []), []);
+
+// invalidPatternWarnings — mirrors the backend validate_permissions rejects.
+// Valid patterns → no warnings.
+assert.deepEqual(invalidPatternWarnings('beshu/ror/libs/*'), []);
+assert.deepEqual(invalidPatternWarnings('beshu, beshu/*, *'), []);
+assert.deepEqual(invalidPatternWarnings('beshu/my-bucket.name/*'), []); // hyphens/dots OK
+assert.deepEqual(invalidPatternWarnings('${username}/x/*'), []);        // template OK here
+// Mid-pattern `*` → rejected (only trailing allowed).
+{
+  const w = invalidPatternWarnings('beshu/*/thing');
+  assert.equal(w.length, 1);
+  assert.ok(w[0].includes('mid-pattern'));
+}
+// Internal whitespace → rejected.
+{
+  const w = invalidPatternWarnings('beshu/a b/*');
+  assert.equal(w.length, 1);
+  assert.ok(w[0].includes('space or control'));
+}
+// A wildcard inside the bucket segment → rejected as mid-pattern.
+assert.equal(invalidPatternWarnings('b*cket/x').length, 1);
+// Trailing whitespace alone is trimmed away → valid (no false positive).
+assert.deepEqual(invalidPatternWarnings('beshu/ok/*  '), []);
+// Multiple bad patterns → one message each, de-duped.
+{
+  const w = invalidPatternWarnings('a/*/b, a/*/b, c d/*');
+  assert.equal(w.length, 2);
+}
 
 console.log('permission warnings regression checks passed');

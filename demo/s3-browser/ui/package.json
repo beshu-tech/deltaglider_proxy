@@ -17,6 +17,8 @@
     "test:advanced-merge-patch": "node scripts/advanced-merge-patch-regression-test.mjs",
     "test:permission-conditions": "node scripts/permission-conditions-regression-test.mjs",
     "test:permission-warnings": "node scripts/permission-warnings-regression-test.mjs",
+    "test:action-chips": "node scripts/action-chips-regression-test.mjs",
+    "test:resource-pattern-rows": "node scripts/resource-pattern-rows-regression-test.mjs",
     "test:permission-rows": "node scripts/permission-rows-regression-test.mjs",
     "test:rule-editor-helpers": "node scripts/rule-editor-helpers-regression-test.mjs",
     "test:credential-generation": "node scripts/credential-generation-regression-test.mjs",

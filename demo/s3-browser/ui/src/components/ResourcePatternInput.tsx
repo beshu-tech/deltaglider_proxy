@@ -10,13 +10,6 @@ import {
 import { useColors } from '../ThemeContext';
 import SimpleAutoComplete, { type AutoCompleteEntry, type AutoCompleteGroup } from './SimpleAutoComplete';
 
-function normalizeList(value: string): string {
-  return value
-    .split(',')
-    .map((part) => normalizeResourcePattern(part))
-    .filter(Boolean)
-    .join(', ');
-}
 
 interface ResourcePatternInputProps {
   value: string;
@@ -228,6 +221,20 @@ export default function ResourcePatternInput({ value, onChange, buckets = [], st
     updateRow(focusedIndex, pattern);
   };
 
+  // Normalize ONLY the blurred row's text, in place. Crucially this does NOT
+  // re-split + filter the whole comma string (the old `normalizeList(value)`
+  // path), which dropped in-progress empty rows and desynced `idsRef` —
+  // reassigning React keys to surviving rows. Mirrors ConditionPrefixInput's
+  // per-row blur. An empty row stays empty (it's serialized away only when a
+  // sibling is non-empty, same as before, but the row COUNT is untouched here).
+  const normalizeRowOnBlur = (index: number) => {
+    setFocusedIndex(null);
+    const current = rows[index] ?? '';
+    if (!current.trim()) return; // empty row: nothing to normalize, keep as-is
+    const normalized = normalizeResourcePattern(current);
+    if (normalized !== current) updateRow(index, normalized);
+  };
+
   return (
     <div style={{ width: '100%' }}>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: style?.marginTop }}>
@@ -239,10 +246,7 @@ export default function ResourcePatternInput({ value, onChange, buckets = [], st
                 filterText={row}
                 autoComplete={`dgp-resource-${rowIds[index] ?? index}`}
                 onChange={(v) => updateRow(index, v)}
-                onBlur={() => {
-                  setFocusedIndex(null);
-                  onChange(normalizeList(value));
-                }}
+                onBlur={() => normalizeRowOnBlur(index)}
                 optionGroups={optionGroups}
                 placeholder="my-bucket/builds/*"
                 style={{ ...inputStyle, marginTop: 0 }}

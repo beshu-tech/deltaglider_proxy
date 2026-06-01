@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Input, Button, Typography, Segmented, Checkbox, Alert } from 'antd';
+import { Input, Button, Typography, Segmented, Alert } from 'antd';
 import { PlusOutlined, DeleteOutlined, FilterOutlined } from '@ant-design/icons';
 import { useCardStyles, usePermissionStyles } from './shared-styles';
 import { useColors } from '../ThemeContext';
@@ -14,20 +14,13 @@ import {
   setConditionArray,
   hasConditions,
 } from './permissionConditions';
-import { unknownBucketWarnings } from './permissionWarnings';
+import { unknownBucketWarnings, invalidPatternWarnings } from './permissionWarnings';
+import ActionChips from './ActionChips';
+import { grantSummary, reconcileActionsForScope, effectiveActions, isPrefixScoped } from './permissionActions';
 import ResourcePatternInput from './ResourcePatternInput';
 import ConditionPrefixInput from './ConditionPrefixInput';
 
 const { Text } = Typography;
-
-const ACTION_OPTIONS = [
-  { label: 'Read (GET/HEAD)', value: 'read' },
-  { label: 'Write (PUT)', value: 'write' },
-  { label: 'Delete (DELETE)', value: 'delete' },
-  { label: 'List (ListObjects)', value: 'list' },
-  { label: 'Admin (Bucket ops)', value: 'admin' },
-  { label: 'All (*)', value: '*' },
-];
 
 function firstConcreteResourceBucket(resources: string): string {
   for (const part of resources.split(',')) {
@@ -63,6 +56,25 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
     if (permissions.some((p) => !p._uiId)) {
       onChange(
         permissions.map((p) => (p._uiId ? p : { ...p, _uiId: freshPermissionRowId() })),
+      );
+    }
+  }, [permissions, onChange]);
+
+  // Normalize away any phantom `admin` on a prefix-scoped grant that arrived
+  // that way (loaded from the DB / hand-edited YAML / a pre-existing bad rule).
+  // The Admin chip is disabled in that case and so can't revoke it interactively
+  // — without this, an invalid `admin` would persist invisibly. Idempotent: only
+  // fires when a row actually needs fixing, so it can't loop.
+  useEffect(() => {
+    if (permissions.some((p) => {
+      const next = reconcileActionsForScope(p.actions, isPrefixScoped(p.resources));
+      return next !== p.actions;
+    })) {
+      onChange(
+        permissions.map((p) => {
+          const next = reconcileActionsForScope(p.actions, isPrefixScoped(p.resources));
+          return next === p.actions ? p : { ...p, actions: next };
+        }),
       );
     }
   }, [permissions, onChange]);
@@ -144,6 +156,13 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
         const prefixVal = getConditionArray(row.conditions, 'StringLike', 's3:prefix');
         const ipVal = getConditionValue(row.conditions, 'IpAddress', 'aws:SourceIp');
         const bucketWarnings = unknownBucketWarnings(row.resources, bucketNames);
+        const patternErrors = invalidPatternWarnings(row.resources);
+        // A rule is incomplete (and silently dropped on save by rowsToPermissions)
+        // if it has no actions OR no resource. Surface it so the drop is never a
+        // surprise — the operator sees exactly which half is missing.
+        const noActions = effectiveActions(row.actions).size === 0;
+        const noResource = row.resources.trim() === '';
+        const isIncomplete = noActions || noResource;
 
         return (
           <div key={rowKey(row, i)} style={{
@@ -199,32 +218,28 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
               </div>
             </div>
 
-            {/* Actions */}
-            <div style={{ marginBottom: 12 }}>
-              <Text type="secondary" style={{ fontSize: 12, fontWeight: 500 }}>Actions</Text>
-              <Checkbox.Group
-                value={row.actions}
-                onChange={v => {
-                  const updated = [...permissions];
-                  updated[i] = { ...updated[i], actions: v as string[] };
-                  onChange(updated);
-                }}
-                style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 10px', marginTop: 6 }}
-              >
-                {ACTION_OPTIONS.map(opt => (
-                  <Checkbox key={opt.value} value={opt.value} style={{ fontSize: 12 }}>{opt.label}</Checkbox>
-                ))}
-              </Checkbox.Group>
-            </div>
-
-            {/* Resources */}
-            <div style={{ marginBottom: conditionsVisible ? 12 : 4 }}>
-              <Text type="secondary" style={{ fontSize: 12, fontWeight: 500 }}>Resources</Text>
-              <ResourcePatternInput
+            {/* WHERE (resources) + CAN DO (action chips) — one tidy block.
+                On wide screens WHERE and CAN DO sit side by side; below 720px
+                they stack. The chips are a horizontal multi-select strip (not a
+                cumulative ladder), so write-without-delete stays expressible. */}
+            <div style={{
+              display: 'flex',
+              flexWrap: 'wrap',
+              gap: 14,
+              alignItems: 'flex-start',
+              marginBottom: conditionsVisible ? 12 : 4,
+            }}>
+              <div style={{ flex: '1 1 280px', minWidth: 240 }}>
+                <Text type="secondary" style={{ fontSize: 11, fontWeight: 600, letterSpacing: 0.4 }}>WHERE</Text>
+                <ResourcePatternInput
                 value={row.resources}
                 onChange={value => {
                   const updated = [...permissions];
-                  updated[i] = { ...updated[i], resources: value };
+                  // Reconcile actions to the new scope: narrowing from a bucket
+                  // to a prefix invalidates `admin` (bucket-only op), so strip it
+                  // here — the disabled Admin chip can no longer revoke it.
+                  const actions = reconcileActionsForScope(updated[i].actions, isPrefixScoped(value));
+                  updated[i] = { ...updated[i], resources: value, actions };
                   onChange(updated);
                 }}
                 buckets={bucketNames}
@@ -252,6 +267,84 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                   }
                 />
               )}
+              {patternErrors.length > 0 && (
+                <Alert
+                  type="error"
+                  showIcon
+                  style={{ marginTop: 6 }}
+                  message={
+                    <span style={{ fontSize: 12 }}>
+                      {patternErrors.map((msg, idx) => (
+                        <div key={idx}>{msg}</div>
+                      ))}
+                    </span>
+                  }
+                />
+              )}
+              </div>
+
+              <div style={{ flex: '1 1 360px', minWidth: 300 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, minHeight: 18 }}>
+                  <Text type="secondary" style={{ fontSize: 11, fontWeight: 600, letterSpacing: 0.4 }}>CAN DO</Text>
+                  {effectiveActions(row.actions).size > 1 && (
+                    <button
+                      type="button"
+                      title="Turn off all actions for this grant"
+                      onClick={() => {
+                        const updated = [...permissions];
+                        updated[i] = { ...updated[i], actions: [] };
+                        onChange(updated);
+                      }}
+                      style={{
+                        border: 'none',
+                        background: 'transparent',
+                        padding: 0,
+                        cursor: 'pointer',
+                        fontSize: 11,
+                        fontWeight: 600,
+                        color: colors.TEXT_SECONDARY,
+                        textDecoration: 'underline',
+                        textUnderlineOffset: 2,
+                      }}
+                    >
+                      Clear all
+                    </button>
+                  )}
+                </div>
+                <div style={{ marginTop: 6 }}>
+                  <ActionChips
+                    actions={row.actions}
+                    prefixScoped={isPrefixScoped(row.resources)}
+                    onChange={next => {
+                      const updated = [...permissions];
+                      updated[i] = { ...updated[i], actions: next };
+                      onChange(updated);
+                    }}
+                  />
+                  <div style={{
+                    fontSize: 11,
+                    color: row.actions.length === 0 ? colors.ACCENT_AMBER : colors.TEXT_MUTED,
+                    marginTop: 6,
+                    lineHeight: 1.45,
+                  }}>
+                    {grantSummary(row.actions)}
+                  </div>
+                  {row.actions.includes('*') && (
+                    <Alert
+                      type="warning"
+                      showIcon
+                      style={{ marginTop: 8 }}
+                      message={
+                        <span style={{ fontSize: 12 }}>
+                          <strong>Administrative access.</strong> This grants full control
+                          {isPrefixScoped(row.resources) ? ' of the targeted prefix' : ' of the bucket'},
+                          including create/delete bucket operations. It overrides every narrower limit.
+                        </span>
+                      }
+                    />
+                  )}
+                </div>
+              </div>
             </div>
 
             {/* Conditions — collapsible only when empty; persisted rules with data stay open */}
@@ -316,6 +409,25 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                     </div>
                   </div>
                 </div>
+              </div>
+            )}
+
+            {isIncomplete && (
+              <div style={{
+                marginTop: 10,
+                fontSize: 11,
+                fontWeight: 600,
+                color: colors.ACCENT_AMBER,
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+              }}>
+                <FilterOutlined style={{ transform: 'rotate(180deg)' }} />
+                {noResource && noActions
+                  ? 'Incomplete — add a resource and at least one action, or this rule is dropped on save.'
+                  : noResource
+                    ? 'No resource — pick a bucket/prefix, or this rule is dropped on save.'
+                    : 'No actions — turn on at least one, or this rule is dropped on save.'}
               </div>
             )}
           </div>
