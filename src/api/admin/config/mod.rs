@@ -154,6 +154,16 @@ pub(super) fn rebuild_bucket_derived_snapshots(
     buckets: &std::collections::BTreeMap<String, crate::bucket_policy::BucketPolicyConfig>,
     operator_blocks: &[crate::admission::AdmissionBlockSpec],
 ) {
+    // RESTRICTIVE-FIRST ORDERING (do not reorder — see audit A3). These two
+    // ArcSwaps are published sequentially (nanoseconds apart), so an in-flight
+    // request that reads one at an early middleware stage and the other later
+    // can briefly observe a torn mix. We publish the PUBLIC-PREFIX snapshot
+    // (the narrower-access half) BEFORE the admission chain so that a torn read
+    // can only ever grant LESS access, never more: an anonymous request is
+    // scoped to whatever prefix snapshot it reads, so seeing the new (e.g.
+    // just-privatized, narrower) prefixes + the old admission chain fails
+    // closed. Reversing this would open a (still tiny, but real) window where a
+    // torn read grants access being removed. Keep prefix-snapshot store first.
     let new_prefix_snapshot = crate::bucket_policy::PublicPrefixSnapshot::from_config(buckets);
     state
         .public_prefix_snapshot

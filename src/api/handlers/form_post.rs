@@ -577,6 +577,16 @@ fn authenticate_form_post(
         }
     };
 
+    // Validate the supplied signature's SHAPE before any timing-sensitive work.
+    // The computed HMAC-SHA256 hex is always 64 lowercase hex chars; the
+    // attacker-controlled `signature` is variable-length. Running
+    // `to_ascii_lowercase()` (cost ∝ length) and `ct_eq` on a mismatched length
+    // both leak the expected length via timing. Reject anything that isn't
+    // exactly 64 hex chars up front — this is a cheap, length-independent gate
+    // (one length check + a fixed-shape scan) that closes the oracle.
+    if signature.len() != 64 || !signature.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(S3Error::SignatureDoesNotMatch);
+    }
     let signing_key = derive_v4_signing_key(&secret_access_key, scope_date, scope_region);
     let computed_signature = hex::encode(hmac_sha256(&signing_key, policy_b64.as_bytes()));
     let sig_matches: bool = ConstantTimeEq::ct_eq(
