@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Fixed — hardening (from an adversarial Rust audit)
+
+- **Form-POST uploads can no longer OOM the proxy.** The `multipart/form-data`
+  POST interceptor buffered the request body with no ceiling
+  (`to_bytes(usize::MAX)`); because it ran above `DefaultBodyLimit` — which only
+  does an eager `Content-Length` check — a chunked or oversized POST slipped past
+  the limit. Now bounded by `max_object_size` (oversized → `413`). This also
+  fixes a real upload failure with aws-cli's chunked transfer encoding.
+- **CopyObject on a concurrently-deleted source now returns `404`, not `500`.**
+  The generic S3 error classifier didn't recognise `NoSuchKey`, so a benign race
+  surfaced as an internal error.
+- **Form-POST signature length is no longer leaked via timing.** The HMAC compare
+  now rejects any signature that isn't exactly 64 hex characters before any
+  length-dependent work.
+
 ## v1.1.1 — 2026-06-01
 
 ### Changed — IAM permission editor
