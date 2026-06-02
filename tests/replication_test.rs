@@ -30,6 +30,26 @@ replication:
       batch_size: 100
 ";
 
+// Fast tick so the event-driven consumer (and reconcile scheduler) wake
+// quickly in tests. The consumer drains the outbox each tick.
+const EVENT_DRIVEN_RULE_YAML: &str = "
+replication:
+  enabled: true
+  tick_interval: \"5s\"
+  rules:
+    - name: ev-a-to-b
+      enabled: true
+      source:
+        bucket: ev-src
+        prefix: \"\"
+      destination:
+        bucket: ev-dst
+        prefix: \"\"
+      interval: \"24h\"
+      batch_size: 100
+      replicate_deletes: true
+";
+
 const PAUSED_RULE_YAML: &str = "
 replication:
   enabled: true
@@ -1184,5 +1204,88 @@ async fn test_replication_any_error_flips_status_to_failed() {
         status, "failed",
         "M1 REGRESSION: errors={} but status={} (must be 'failed' on any error). body={}",
         errors, status, body
+    );
+}
+
+/// Event-driven replication: PUTting an object to the source bucket emits an
+/// ObjectCreated event that the background consumer drains and replicates to
+/// the destination — WITHOUT any run-now trigger. Then deleting it propagates
+/// the delete (replicate_deletes: true). This is the core event-driven path.
+#[tokio::test]
+async fn test_event_driven_replication_copies_and_deletes() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(EVENT_DRIVEN_RULE_YAML)
+        .build()
+        .await;
+
+    let client = server.s3_client().await;
+    for b in ["ev-src", "ev-dst"] {
+        client.create_bucket().bucket(b).send().await.ok();
+    }
+
+    // PUT a single object to the source. No run-now: the write-path emits an
+    // event and the consumer (5s tick) should replicate it on its own.
+    client
+        .put_object()
+        .bucket("ev-src")
+        .key("evt/obj.txt")
+        .body(ByteStream::from(b"event-driven".to_vec()))
+        .send()
+        .await
+        .expect("put source object");
+
+    // Poll the destination for up to ~30s (several consumer ticks).
+    let mut replicated = false;
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if let Ok(out) = client
+            .get_object()
+            .bucket("ev-dst")
+            .key("evt/obj.txt")
+            .send()
+            .await
+        {
+            let body = out.body.collect().await.unwrap().into_bytes();
+            if body.as_ref() == b"event-driven" {
+                replicated = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        replicated,
+        "object should be replicated to ev-dst by the event consumer (no run-now)"
+    );
+
+    // Now DELETE the source object — the delete event should propagate.
+    client
+        .delete_object()
+        .bucket("ev-src")
+        .key("evt/obj.txt")
+        .send()
+        .await
+        .expect("delete source object");
+
+    let mut deleted = false;
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        match client
+            .get_object()
+            .bucket("ev-dst")
+            .key("evt/obj.txt")
+            .send()
+            .await
+        {
+            Err(_) => {
+                deleted = true;
+                break;
+            }
+            Ok(_) => continue,
+        }
+    }
+    assert!(
+        deleted,
+        "delete should propagate to ev-dst (replicate_deletes: true)"
     );
 }

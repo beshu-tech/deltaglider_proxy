@@ -765,8 +765,13 @@ pub struct ReplicationRule {
     pub source: ReplicationEndpoint,
     pub destination: ReplicationEndpoint,
 
-    /// How often this rule runs. Humantime-parsed (`"15m"`, `"1h"`, ...).
-    /// Minimum enforced at config load time (`30s`).
+    /// How often the **full reconcile sweep** runs for this rule. Replication
+    /// is event-driven — object mutations are replicated in near-real time by
+    /// the event consumer — so this interval is the slow self-healing safety
+    /// net (full source list-and-diff that catches anything a dropped event
+    /// missed), NOT the primary trigger. Humantime-parsed (`"24h"`, `"6h"`,
+    /// ...); minimum enforced at config load (`30s`). Defaults to `24h`.
+    #[serde(default = "default_reconcile_interval")]
     pub interval: String,
 
     /// Objects per scheduler yield. The worker copies this many objects
@@ -804,6 +809,12 @@ fn default_rule_enabled() -> bool {
 
 fn default_batch_size() -> u32 {
     100
+}
+
+/// Default reconcile-sweep cadence. Events are the primary trigger, so the
+/// full list-and-diff only needs to run infrequently as a safety net.
+fn default_reconcile_interval() -> String {
+    "24h".to_string()
 }
 
 fn default_exclude_globs() -> Vec<String> {

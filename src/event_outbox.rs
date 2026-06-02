@@ -523,10 +523,16 @@ impl ConfigDb {
         Ok(updated)
     }
 
+    /// Delete up to `limit` delivered rows older than `before`. `min_keep_id`
+    /// is the prune FLOOR — only rows with `id <= min_keep_id` are eligible, so
+    /// the pruner never removes a row a slower listener (event-driven
+    /// replication) hasn't consumed yet. Pass `i64::MAX` for no floor (e.g. when
+    /// no listeners exist).
     pub fn event_outbox_prune_delivered_before(
         &self,
         before: i64,
         limit: u32,
+        min_keep_id: i64,
     ) -> Result<usize, ConfigDbError> {
         if limit == 0 {
             return Ok(0);
@@ -539,18 +545,24 @@ impl ConfigDb {
                      WHERE status = 'delivered'
                        AND delivered_at IS NOT NULL
                        AND delivered_at < ?
+                       AND id <= ?
                      ORDER BY delivered_at ASC, id ASC
                      LIMIT ?
               )",
-            params![before, limit as i64],
+            params![before, min_keep_id, limit as i64],
         )?;
         Ok(deleted)
     }
 
+    /// Delete delivered rows beyond `max_delivered_rows` (newest kept), bounded
+    /// by `limit` per call. `min_keep_id` is the prune FLOOR (see
+    /// [`Self::event_outbox_prune_delivered_before`]) — only rows at or below it
+    /// are eligible, so a slower listener's unconsumed rows survive.
     pub fn event_outbox_prune_delivered_over_count(
         &self,
         max_delivered_rows: u32,
         limit: u32,
+        min_keep_id: i64,
     ) -> Result<usize, ConfigDbError> {
         if limit == 0 {
             return Ok(0);
@@ -563,13 +575,14 @@ impl ConfigDb {
                             SELECT id
                               FROM event_outbox
                              WHERE status = 'delivered'
+                               AND id <= ?
                              ORDER BY COALESCE(delivered_at, occurred_at) DESC, id DESC
                              LIMIT -1 OFFSET ?
                       )
                      ORDER BY id ASC
                      LIMIT ?
               )",
-            params![max_delivered_rows as i64, limit as i64],
+            params![min_keep_id, max_delivered_rows as i64, limit as i64],
         )?;
         Ok(deleted)
     }
@@ -589,6 +602,151 @@ impl ConfigDb {
             .optional()?;
         Ok(row)
     }
+
+    // === Per-listener cursor API (event-driven replication, schema v12) ===
+    //
+    // The outbox is append-only. Each listener (webhook delivery, replication)
+    // reads `WHERE id > cursor` and tracks its own high-water `last_event_id`
+    // here — it does NOT touch the global `status`/`delivered_at`, so listeners
+    // never contend. Ordering is by autoincrement `id` (true arrival order).
+
+    /// Fetch up to `limit` outbox records with `id > after_id`, oldest first.
+    /// This is the listener drain query — `id ASC` is the contract compaction
+    /// and cursor advancement rely on.
+    pub fn event_outbox_since(
+        &self,
+        after_id: i64,
+        limit: u32,
+    ) -> Result<Vec<EventOutboxRecord>, ConfigDbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, bucket, object_key, source, occurred_at,
+                    payload_json, status, attempts, next_attempt_at,
+                    claimed_by, claimed_at, delivered_at, last_error, created_at
+               FROM event_outbox
+              WHERE id > ?
+              ORDER BY id ASC
+              LIMIT ?",
+        )?;
+        let rows = stmt
+            .query_map(params![after_id, limit as i64], event_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The listener's current high-water `last_event_id` (0 if it has never
+    /// recorded a cursor).
+    pub fn listener_cursor_load(&self, listener: &str) -> Result<i64, ConfigDbError> {
+        let cursor = self
+            .conn
+            .query_row(
+                "SELECT last_event_id FROM listener_cursors WHERE listener_name = ?",
+                params![listener],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        Ok(cursor.unwrap_or(0))
+    }
+
+    /// Advance the listener cursor to `new_id`. Monotonic: the stored value
+    /// never regresses (`MAX(existing, new)`), so a reordered or duplicate
+    /// advance can't move the high-water mark backwards.
+    pub fn listener_cursor_advance(
+        &self,
+        listener: &str,
+        new_id: i64,
+        now: i64,
+    ) -> Result<(), ConfigDbError> {
+        self.conn.execute(
+            "INSERT INTO listener_cursors (listener_name, last_event_id, updated_at)
+                  VALUES (?, ?, ?)
+             ON CONFLICT(listener_name) DO UPDATE SET
+                  last_event_id = MAX(last_event_id, excluded.last_event_id),
+                  updated_at    = excluded.updated_at",
+            params![listener, new_id, now],
+        )?;
+        Ok(())
+    }
+
+    /// Load the full cursor row (for surfacing "last event applied at" in the
+    /// admin UI). `None` if the listener has no cursor yet.
+    pub fn listener_cursor_load_full(
+        &self,
+        listener: &str,
+    ) -> Result<Option<ListenerCursor>, ConfigDbError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT listener_name, last_event_id, updated_at
+                   FROM listener_cursors WHERE listener_name = ?",
+                params![listener],
+                |row| {
+                    Ok(ListenerCursor {
+                        listener_name: row.get(0)?,
+                        last_event_id: row.get(1)?,
+                        updated_at: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// The smallest `last_event_id` across ALL listener cursors, or `None` when
+    /// there are no cursors. The webhook delivered-row pruner clamps its delete
+    /// floor to this so it never removes a row a slower listener (replication)
+    /// hasn't consumed yet.
+    pub fn event_outbox_min_listener_cursor(&self) -> Result<Option<i64>, ConfigDbError> {
+        let min = self
+            .conn
+            .query_row(
+                "SELECT MIN(last_event_id) FROM listener_cursors",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(min)
+    }
+
+    /// The smallest `last_event_id` across listener cursors that are still
+    /// ACTIVE — i.e. whose `updated_at` is within `max_age_secs` of `now`.
+    ///
+    /// A stuck or dead consumer (replication disabled mid-flight, a permanently
+    /// failing rule wedging the watermark, an instance that died holding the
+    /// consumer lease) would otherwise pin the pruner's delete floor forever and
+    /// let the outbox grow without bound. Ignoring stale cursors lets the pruner
+    /// reclaim space once a listener stops making progress; the cost is that a
+    /// listener idle longer than `max_age_secs` may have already-delivered rows
+    /// pruned out from under it — acceptable because a consumer that far behind
+    /// relies on the slow full reconcile to self-heal anyway.
+    ///
+    /// `None` when no cursor is active (→ no floor; pruner may delete any
+    /// delivered row).
+    pub fn event_outbox_min_active_listener_cursor(
+        &self,
+        now: i64,
+        max_age_secs: i64,
+    ) -> Result<Option<i64>, ConfigDbError> {
+        let cutoff = now.saturating_sub(max_age_secs);
+        let min = self
+            .conn
+            .query_row(
+                "SELECT MIN(last_event_id) FROM listener_cursors WHERE updated_at >= ?",
+                params![cutoff],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(min)
+    }
+}
+
+/// A listener's cursor row — its high-water `last_event_id` over the outbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenerCursor {
+    pub listener_name: String,
+    pub last_event_id: i64,
+    pub updated_at: i64,
 }
 
 fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventOutboxRecord> {
@@ -713,7 +871,9 @@ mod tests {
         assert!(db.event_outbox_mark_delivered(old, 100).unwrap());
         assert!(db.event_outbox_mark_delivered(new, 300).unwrap());
 
-        let deleted = db.event_outbox_prune_delivered_before(200, 100).unwrap();
+        let deleted = db
+            .event_outbox_prune_delivered_before(200, 100, i64::MAX)
+            .unwrap();
         assert_eq!(deleted, 1);
 
         let rows = db.event_outbox_recent(10).unwrap();
@@ -772,7 +932,9 @@ mod tests {
         db.event_outbox_mark_delivered(new, 300).unwrap();
         db.event_outbox_mark_failed(failed, "dead", None).unwrap();
 
-        let deleted = db.event_outbox_prune_delivered_over_count(2, 100).unwrap();
+        let deleted = db
+            .event_outbox_prune_delivered_over_count(2, 100, i64::MAX)
+            .unwrap();
         assert_eq!(deleted, 1);
 
         let rows = db.event_outbox_recent(10).unwrap();
@@ -828,5 +990,90 @@ mod tests {
         assert_eq!(pending_row.status, STATUS_PENDING);
         assert_eq!(pending_row.next_attempt_at, None);
         assert_eq!(delivered_row.status, STATUS_DELIVERED);
+    }
+
+    #[test]
+    fn listener_cursor_load_advance_monotonic() {
+        let db = ConfigDb::in_memory("test-pass").unwrap();
+        // Absent cursor reads as 0.
+        assert_eq!(db.listener_cursor_load("replication").unwrap(), 0);
+        db.listener_cursor_advance("replication", 5, 100).unwrap();
+        assert_eq!(db.listener_cursor_load("replication").unwrap(), 5);
+        // Monotonic: a lower advance does NOT regress the high-water mark.
+        db.listener_cursor_advance("replication", 3, 110).unwrap();
+        assert_eq!(db.listener_cursor_load("replication").unwrap(), 5);
+        db.listener_cursor_advance("replication", 9, 120).unwrap();
+        assert_eq!(db.listener_cursor_load("replication").unwrap(), 9);
+        // Distinct listeners are independent.
+        assert_eq!(db.listener_cursor_load("webhook").unwrap(), 0);
+        let full = db
+            .listener_cursor_load_full("replication")
+            .unwrap()
+            .unwrap();
+        assert_eq!(full.last_event_id, 9);
+        assert_eq!(full.updated_at, 120);
+    }
+
+    #[test]
+    fn min_active_listener_cursor_ignores_stale_cursors() {
+        let db = ConfigDb::in_memory("test-pass").unwrap();
+        // Two listeners: webhook fresh at id=20 (updated_at=1000), replication
+        // stale at id=5 (updated_at=100).
+        db.listener_cursor_advance("webhook", 20, 1000).unwrap();
+        db.listener_cursor_advance("replication", 5, 100).unwrap();
+        // Plain min sees the stale replication cursor → pins the floor at 5.
+        assert_eq!(db.event_outbox_min_listener_cursor().unwrap(), Some(5));
+        // Active variant at now=1000 with a 60s staleness window: replication
+        // (updated_at=100) is stale and ignored; only webhook (1000) counts.
+        assert_eq!(
+            db.event_outbox_min_active_listener_cursor(1000, 60)
+                .unwrap(),
+            Some(20)
+        );
+        // A wide window includes both again.
+        assert_eq!(
+            db.event_outbox_min_active_listener_cursor(1000, 100_000)
+                .unwrap(),
+            Some(5)
+        );
+        // When ALL cursors are stale, there's no floor (None) → pruner is free.
+        assert_eq!(
+            db.event_outbox_min_active_listener_cursor(100_000, 60)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn event_outbox_since_returns_id_ordered_window() {
+        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let a = db.event_outbox_insert(&event_at(10, "a")).unwrap();
+        let b = db.event_outbox_insert(&event_at(20, "b")).unwrap();
+        let c = db.event_outbox_insert(&event_at(30, "c")).unwrap();
+        // Everything after `a` → b, c in id order.
+        let rows = db.event_outbox_since(a, 100).unwrap();
+        assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), vec![b, c]);
+        // Cursor at the end → empty.
+        assert!(db.event_outbox_since(c, 100).unwrap().is_empty());
+        // Limit honored.
+        assert_eq!(db.event_outbox_since(0, 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn prune_respects_listener_cursor_floor() {
+        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let a = db.event_outbox_insert(&event_at(10, "a")).unwrap();
+        let b = db.event_outbox_insert(&event_at(20, "b")).unwrap();
+        // Both delivered long ago.
+        db.event_outbox_mark_delivered(a, 1).unwrap();
+        db.event_outbox_mark_delivered(b, 1).unwrap();
+        // Prune with floor = a (the listener has only consumed up to `a`): only
+        // `a` is eligible; `b` survives because the listener hasn't passed it.
+        let deleted = db
+            .event_outbox_prune_delivered_before(1_000_000, 100, a)
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert!(db.event_outbox_load(a).unwrap().is_none());
+        assert!(db.event_outbox_load(b).unwrap().is_some());
     }
 }

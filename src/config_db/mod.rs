@@ -25,7 +25,7 @@ pub struct ConfigDb {
 }
 
 /// Schema version — bump when adding migrations.
-const SCHEMA_VERSION: i32 = 11;
+const SCHEMA_VERSION: i32 = 12;
 
 pub(crate) mod auth_providers;
 mod declarative;
@@ -480,6 +480,25 @@ impl ConfigDb {
             )?;
             info!(
                 "Migrated config DB schema from v{} to v11 (renamed lifecycle counters)",
+                version
+            );
+        }
+
+        if version < 12 {
+            // v12: per-listener cursors over the append-only event_outbox.
+            // Event-driven replication consumes the outbox via its own
+            // high-water `last_event_id` (independent of the webhook
+            // dispatcher's global delivery status), so multiple listeners can
+            // drain the same append-only log without contention.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS listener_cursors (
+                    listener_name TEXT PRIMARY KEY,
+                    last_event_id INTEGER NOT NULL DEFAULT 0,
+                    updated_at    INTEGER NOT NULL DEFAULT (unixepoch())
+                );",
+            )?;
+            info!(
+                "Migrated config DB schema from v{} to v12 (added listener_cursors)",
                 version
             );
         }
