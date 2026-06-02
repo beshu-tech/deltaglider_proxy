@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.1.2 — 2026-06-02
+
 ### Fixed — hardening (from an adversarial Rust audit)
 
 - **Form-POST uploads can no longer OOM the proxy.** The `multipart/form-data`
