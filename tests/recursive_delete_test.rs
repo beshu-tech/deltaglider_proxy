@@ -28,14 +28,21 @@ async fn test_recursive_delete_paginates_and_deletes_all() {
     const N: usize = 1100;
     let bucket = server.bucket();
 
-    // Seed in batches via concurrent requests to keep the test quick.
+    // Seed concurrently to keep the test quick, but cap in-flight requests with
+    // a semaphore. Unbounded N-way fan-out opens N simultaneous TCP connections
+    // and exhausts the runner's file-descriptor limit ("Too many open files",
+    // Os code 24) on loaded CI hosts — bounding concurrency keeps open fds low
+    // while still pipelining the seed.
     let base = server.endpoint();
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(64));
     let put_handles: Vec<_> = (0..N)
         .map(|i| {
             let url = format!("{}/{}/toDelete/obj-{:05}.txt", base, bucket, i);
             let body = format!("payload-{}", i);
             let c = client.clone();
+            let sem = sem.clone();
             tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
                 c.put(&url).body(body).send().await.unwrap();
             })
         })
