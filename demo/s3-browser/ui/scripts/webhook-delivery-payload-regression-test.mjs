@@ -445,8 +445,13 @@ function route(name, bucket, globs, channel) {
   const routes = [route('CI', 'releases', [], '#ci')];
   const hit = resolveSlackChannelsPreview(routes, '#default', 'releases', 'x.zip');
   assert.deepEqual(hit.matches.map((m) => m.channel), ['#ci'], 'bucket route matches');
+  // Routes EXIST but none match → backend posts NOWHERE (no fallback to the
+  // single channel once routes are configured). Preview must NOT claim fallback.
   const miss = resolveSlackChannelsPreview(routes, '#default', 'scratch', 'x.zip');
-  assert.ok(miss.matches.length === 0 && miss.fellBackToChannel, 'non-matching bucket falls back');
+  assert.ok(
+    miss.matches.length === 0 && !miss.fellBackToChannel,
+    'non-matching bucket with routes present → no channel (NOT fallback)'
+  );
 }
 
 // ── fan-out: an event matches multiple routes → all channels (deduped) ──
@@ -471,7 +476,7 @@ function route(name, bucket, globs, channel) {
   );
   assert.ok(
     resolveSlackChannelsPreview(routes, '#default', 'any', 'dist/app.zip').matches.length === 0,
-    'non-matching prefix falls back'
+    'non-matching prefix → no channel'
   );
   const seg = [route('seg', '', ['dist/*.zip'], '#seg')];
   assert.deepEqual(

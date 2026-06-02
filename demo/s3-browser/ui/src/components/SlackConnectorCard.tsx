@@ -305,34 +305,18 @@ export default function SlackConnectorCard({
         />
       </AdvancedDisclosure>
 
-      {/* Live preview */}
-      <div style={{ marginTop: 20 }}>
-        <Text
-          type="secondary"
-          style={{
-            fontSize: 11,
-            fontWeight: 700,
-            letterSpacing: 0.5,
-            textTransform: 'uppercase',
-            display: 'block',
-            marginBottom: 8,
-          }}
-        >
-          Live preview — what lands in the channel
-        </Text>
-        {mode === 'bot' && form.slackRoutes.length > 0 && (
-          <RoutingPreview
-            form={form}
-            colors={colors}
-            inputRadius={inputRadius}
-            sampleBucket={sampleBucket}
-            sampleKey={sampleKey}
-            onBucket={setSampleBucket}
-            onKey={setSampleKey}
-          />
-        )}
-        <SlackPreview form={form} mode={mode} colors={colors} />
-      </div>
+      {/* Live preview — ONE sample event drives both the resolved-channel chips
+          AND the faux Slack message, so they never tell contradictory stories. */}
+      <LivePreview
+        form={form}
+        mode={mode}
+        colors={colors}
+        inputRadius={inputRadius}
+        sampleBucket={sampleBucket}
+        sampleKey={sampleKey}
+        onBucket={setSampleBucket}
+        onKey={setSampleKey}
+      />
 
       <Text type="secondary" style={{ fontSize: 11, display: 'block', marginTop: 12 }}>
         Need an app?{' '}
@@ -718,8 +702,9 @@ function ChannelRoutingEditor({
 // channel; or nowhere). Best-effort client-side glob match.
 // ─────────────────────────────────────────────────────────────────────────
 
-function RoutingPreview({
+function LivePreview({
   form,
+  mode,
   colors,
   inputRadius,
   sampleBucket,
@@ -728,6 +713,7 @@ function RoutingPreview({
   onKey,
 }: {
   form: WebhookFormState;
+  mode: SlackMode;
   colors: ReturnType<typeof useColors>;
   inputRadius: React.CSSProperties;
   sampleBucket: string;
@@ -735,10 +721,30 @@ function RoutingPreview({
   onBucket: (v: string) => void;
   onKey: (v: string) => void;
 }) {
+  const routed = mode === 'bot' && form.slackRoutes.length > 0;
+
+  // Resolve the SAMPLE event to its channel(s) once — drives both the chips and
+  // the faux message below, so they always agree.
   const resolved = useMemo(
     () => resolveSlackChannelsPreview(form.slackRoutes, form.slackChannel, sampleBucket, sampleKey),
     [form.slackRoutes, form.slackChannel, sampleBucket, sampleKey],
   );
+
+  // The channel the faux message shows. In webhook mode the message goes to the
+  // webhook's bound channel; in bot mode it's the resolved channel(s) for the
+  // sample, the fallback (no routes), or "no channel" (routed but unmatched).
+  let messageChannels: string[];
+  if (mode === 'webhook') {
+    messageChannels = ['webhook channel'];
+  } else if (resolved.matches.length > 0) {
+    messageChannels = resolved.matches.map((m) => fmtChannel(m.channel));
+  } else if (resolved.fellBackToChannel) {
+    messageChannels = [fmtChannel(resolved.fallbackChannel)];
+  } else if (!routed) {
+    messageChannels = [fmtChannel(form.slackChannel) || '#your-channel'];
+  } else {
+    messageChannels = []; // routed but unmatched → posts nowhere
+  }
 
   const chipBase: React.CSSProperties = {
     fontFamily: 'var(--font-mono)',
@@ -749,55 +755,88 @@ function RoutingPreview({
   };
 
   return (
-    <div
-      style={{
-        marginBottom: 12,
-        padding: 12,
-        border: `1px dashed ${colors.BORDER}`,
-        borderRadius: 8,
-      }}
-    >
-      <Text style={{ fontSize: 12, color: colors.TEXT_MUTED, display: 'block', marginBottom: 8 }}>
-        Resolve a sample event:
+    <div style={{ marginTop: 20 }}>
+      <Text
+        type="secondary"
+        style={{
+          fontSize: 11,
+          fontWeight: 700,
+          letterSpacing: 0.5,
+          textTransform: 'uppercase',
+          display: 'block',
+          marginBottom: 8,
+        }}
+      >
+        Live preview — what lands in the channel
       </Text>
-      <Space.Compact style={{ width: '100%', maxWidth: 420, marginBottom: 10 }}>
-        <Input
-          value={sampleBucket}
-          onChange={(e) => onBucket(e.target.value)}
-          placeholder="bucket"
-          style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13, maxWidth: 150 }}
-          title="Sample bucket"
-        />
-        <Input
-          value={sampleKey}
-          onChange={(e) => onKey(e.target.value)}
-          placeholder="path/to/key.zip"
-          style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }}
-          title="Sample object key"
-        />
-      </Space.Compact>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', fontSize: 13 }}>
-        <span style={{ color: colors.TEXT_MUTED }}>→</span>
-        {resolved.matches.length > 0 ? (
-          resolved.matches.map((m) => (
-            <span
-              key={m.channel}
-              style={{ ...chipBase, color: colors.ACCENT_BLUE }}
-              title={`Matched route: ${m.label}`}
-            >
-              {fmtChannel(m.channel)}
-            </span>
-          ))
-        ) : resolved.fellBackToChannel ? (
-          <span style={{ ...chipBase, color: colors.TEXT_SECONDARY }} title="No route matched — fallback channel">
-            (fallback) {fmtChannel(resolved.fallbackChannel)}
-          </span>
-        ) : (
-          <span style={{ ...chipBase, color: colors.TEXT_MUTED }} title="No route matched and no fallback channel set">
-            (no channel)
-          </span>
-        )}
-      </div>
+
+      {/* One sample event input (bot mode) → resolved-channel chips. */}
+      {mode === 'bot' && (
+        <div
+          style={{
+            marginBottom: 12,
+            padding: 12,
+            border: `1px dashed ${colors.BORDER}`,
+            borderRadius: 8,
+          }}
+        >
+          <Text style={{ fontSize: 12, color: colors.TEXT_MUTED, display: 'block', marginBottom: 8 }}>
+            Try a sample event{routed ? '' : ' (add routes to send buckets to different channels)'}:
+          </Text>
+          <Space.Compact style={{ width: '100%', maxWidth: 420, marginBottom: 10 }}>
+            <Input
+              value={sampleBucket}
+              onChange={(e) => onBucket(e.target.value)}
+              placeholder="bucket"
+              style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13, maxWidth: 150 }}
+              title="Sample bucket"
+            />
+            <Input
+              value={sampleKey}
+              onChange={(e) => onKey(e.target.value)}
+              placeholder="path/to/key.zip"
+              style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }}
+              title="Sample object key"
+            />
+          </Space.Compact>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', fontSize: 13 }}>
+            <span style={{ color: colors.TEXT_MUTED }}>→</span>
+            {resolved.matches.length > 0 ? (
+              resolved.matches.map((m) => (
+                <span
+                  key={m.channel}
+                  style={{ ...chipBase, color: colors.ACCENT_BLUE }}
+                  title={`Matched route: ${m.label}`}
+                >
+                  {fmtChannel(m.channel)}
+                </span>
+              ))
+            ) : resolved.fellBackToChannel ? (
+              <span style={{ ...chipBase, color: colors.TEXT_SECONDARY }} title="No route matched — fallback channel">
+                (fallback) {fmtChannel(resolved.fallbackChannel)}
+              </span>
+            ) : routed ? (
+              <span style={{ ...chipBase, color: colors.ACCENT_RED }} title="No route matched and no fallback — this event would be posted NOWHERE">
+                (no channel — not posted)
+              </span>
+            ) : (
+              <span style={{ ...chipBase, color: colors.TEXT_SECONDARY }}>
+                {fmtChannel(form.slackChannel) || '#your-channel'}
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* The faux Slack message — same sample + same resolved channel. */}
+      <SlackMessagePreview
+        form={form}
+        mode={mode}
+        colors={colors}
+        sampleBucket={sampleBucket || 'my-bucket'}
+        sampleKey={sampleKey || 'releases/app-v1.2.0.tar.gz'}
+        channels={messageChannels}
+      />
     </div>
   );
 }
@@ -813,27 +852,29 @@ function fmtChannel(c: string): string {
 // Live faux-Slack preview — rendered purely client-side from current settings.
 // ─────────────────────────────────────────────────────────────────────────
 
-function SlackPreview({
+function SlackMessagePreview({
   form,
   mode,
   colors,
+  sampleBucket,
+  sampleKey,
+  channels,
 }: {
   form: WebhookFormState;
   mode: SlackMode;
   colors: ReturnType<typeof useColors>;
+  sampleBucket: string;
+  sampleKey: string;
+  /** Resolved channel label(s) for the sample. Empty = posts nowhere. */
+  channels: string[];
 }) {
   // Slack's surfaces are always light; render a fixed light card so the preview
   // reads as "this is what Slack shows", independent of the admin theme.
   const appName =
     mode === 'webhook' && form.slackUsername.trim() ? form.slackUsername.trim() : 'DeltaGlider';
   const kind = form.slackNotifyKinds[0] ?? 'ObjectCreated';
-  const channelLabel = useMemo(() => {
-    if (mode === 'bot') {
-      const c = form.slackChannel.trim();
-      return c ? (c.startsWith('#') || c.startsWith('C') ? c : `#${c}`) : '#your-channel';
-    }
-    return 'webhook channel';
-  }, [mode, form.slackChannel]);
+  const channelLabel =
+    channels.length === 0 ? '(not posted)' : channels.join(', ');
 
   const verb =
     kind === 'ObjectDeleted'
@@ -901,7 +942,7 @@ function SlackPreview({
             📦 {verb} in <span style={{ color: '#1264a3' }}>{channelLabel}</span>
           </div>
           <div>
-            <span style={{ fontWeight: 700 }}>my-bucket</span>{' '}
+            <span style={{ fontWeight: 700 }}>{sampleBucket}</span>{' '}
             <code
               style={{
                 background: '#f6f6f6',
@@ -912,7 +953,7 @@ function SlackPreview({
                 color: '#c0392b',
               }}
             >
-              releases/app-v1.2.0.tar.gz
+              {sampleKey}
             </code>
           </div>
           <div style={{ color: '#616061', fontSize: 12, marginTop: 2 }}>2.4 MB · application/gzip</div>

@@ -724,9 +724,8 @@ export function resolveSlackChannelsPreview(
     });
   }
 
-  if (out.length === 0) {
-    const fb = fallbackChannel.trim();
-    return { matches: [], fellBackToChannel: fb.length > 0, fallbackChannel: fb };
-  }
+  // Routes EXIST but none matched → the backend posts NOWHERE (resolve_channels
+  // only falls back to slack_channel when there are zero routes). Do NOT show
+  // the fallback here, or the preview would claim delivery the backend won't do.
   return { matches: out, fellBackToChannel: false, fallbackChannel: '' };
 }

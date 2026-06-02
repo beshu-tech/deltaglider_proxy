@@ -390,6 +390,21 @@ struct BackupSecrets {
     /// secrets without replacing users / groups).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     oauth_client_secrets: std::collections::BTreeMap<String, String>,
+    /// Event-delivery secrets (`advanced.event_delivery.*`): the Slack bot token
+    /// and webhook header values. These are masked in the backup's `config.yaml`
+    /// (redact_all_secrets), so without capturing them here a cross-instance /
+    /// DR restore — where the running instance has no token to preserve from —
+    /// would silently lose them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    event_delivery: Option<SecretsEventDelivery>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct SecretsEventDelivery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slack_bot_token: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    webhook_headers: BTreeMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -527,6 +542,7 @@ async fn export_zip(
             storage: None,
             storage_backends: Default::default(),
             oauth_client_secrets: Default::default(),
+            event_delivery: None,
         };
         // Access-section bootstrap SigV4 pair.
         if cfg.access_key_id.is_some() || cfg.secret_access_key.is_some() {
@@ -574,6 +590,20 @@ async fn export_zip(
             if let Some(cs) = &p.client_secret {
                 s.oauth_client_secrets.insert(p.name.clone(), cs.clone());
             }
+        }
+        // Event-delivery secrets (Slack bot token + webhook header values) —
+        // masked in config.yaml, so captured here for cross-instance restore.
+        let ed = &cfg.event_delivery;
+        let has_token = ed
+            .slack_bot_token
+            .as_deref()
+            .map(|t| !t.trim().is_empty())
+            .unwrap_or(false);
+        if has_token || !ed.webhook_headers.is_empty() {
+            s.event_delivery = Some(SecretsEventDelivery {
+                slack_bot_token: ed.slack_bot_token.clone(),
+                webhook_headers: ed.webhook_headers.clone(),
+            });
         }
         s
     };
@@ -905,6 +935,21 @@ fn hydrate_config_with_backup_secrets(cfg: &mut Config, secrets: &BackupSecrets)
             if let [idx] = s3_named.as_slice() {
                 hydrate_s3_backend_credentials(&mut cfg.backends[*idx].backend, s);
             }
+        }
+    }
+
+    // Event-delivery secrets: restore the real Slack bot token + webhook header
+    // values over the masked placeholders in config.yaml. Without this, a
+    // cross-instance / DR restore (where the running instance has no token to
+    // preserve from) would lose them.
+    if let Some(ed) = &secrets.event_delivery {
+        if let Some(tok) = &ed.slack_bot_token {
+            cfg.event_delivery.slack_bot_token = Some(tok.clone());
+        }
+        for (k, v) in &ed.webhook_headers {
+            cfg.event_delivery
+                .webhook_headers
+                .insert(k.clone(), v.clone());
         }
     }
 }

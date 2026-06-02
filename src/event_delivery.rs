@@ -11,7 +11,19 @@ use crate::background::parse_duration_or;
 use crate::config::SharedConfig;
 use crate::config_db::ConfigDb;
 use crate::config_sections::{EventDeliveryConfig, EventDeliveryFormat};
+use crate::event_outbox::{
+    current_unix_seconds, EventOutboxRecord, STATUS_DELIVERED, STATUS_FAILED, STATUS_IN_PROGRESS,
+    STATUS_PENDING,
+};
+use async_trait::async_trait;
+use reqwest::header::{HeaderName, HeaderValue};
+use reqwest::Url;
+use serde::Serialize;
 use serde_json::Value;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
+use tracing::{debug, info, warn};
 
 /// Map a Slack Web API JSON response to a delivery result. The API returns HTTP
 /// 200 even on failure; the authoritative status is the `ok` boolean, with the
@@ -28,18 +40,6 @@ fn slack_api_result(body: &Value) -> Result<(), String> {
         Err(format!("slack chat.postMessage error: {err}"))
     }
 }
-use crate::event_outbox::{
-    current_unix_seconds, EventOutboxRecord, STATUS_DELIVERED, STATUS_FAILED, STATUS_IN_PROGRESS,
-    STATUS_PENDING,
-};
-use async_trait::async_trait;
-use reqwest::header::{HeaderName, HeaderValue};
-use reqwest::Url;
-use serde::Serialize;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
 
 const DEFAULT_TICK: Duration = Duration::from_secs(10);
 const MIN_TICK: Duration = Duration::from_secs(1);
@@ -179,33 +179,62 @@ impl HttpWebhookDeliveryClient {
                 }
                 return Ok(()); // routed, but this event matched no route
             }
-            for channel in channels {
+            // Post to each resolved channel, collecting per-channel outcomes.
+            //
+            // CRITICAL (at-least-once + fan-out): the outbox tracks ONE status
+            // per event row, not per channel. If we returned Err the moment any
+            // single channel failed, the whole row would re-queue and the next
+            // retry would re-post to the channels that ALREADY succeeded —
+            // duplicate Slack spam (chat.postMessage has no idempotency key).
+            //
+            // So: a PARTIAL success counts as delivered. We only return Err (→
+            // retry) when EVERY channel failed — in which case a retry re-posts
+            // to all, but none had succeeded, so there's no duplication. Channels
+            // that fail while others succeed are logged and dropped (a missed
+            // notification to one bad channel beats duplicating to the good ones).
+            let mut any_ok = false;
+            let mut failures: Vec<String> = Vec::new();
+            for channel in &channels {
                 let mut msg = body.clone();
                 if let Value::Object(ref mut map) = msg {
                     map.insert("channel".to_string(), Value::String(channel.clone()));
                 }
-                let response = self
-                    .client
-                    .post("https://slack.com/api/chat.postMessage")
-                    .timeout(timeout)
-                    .bearer_auth(&token)
-                    .json(&msg)
-                    .send()
-                    .await
-                    .map_err(|e| format!("slack chat.postMessage ({channel}): {e}"))?;
-                if !response.status().is_success() {
-                    return Err(format!(
-                        "slack chat.postMessage ({channel}) returned HTTP {}",
-                        response.status()
-                    ));
+                let result: Result<(), String> = async {
+                    let response = self
+                        .client
+                        .post("https://slack.com/api/chat.postMessage")
+                        .timeout(timeout)
+                        .bearer_auth(&token)
+                        .json(&msg)
+                        .send()
+                        .await
+                        .map_err(|e| format!("{e}"))?;
+                    if !response.status().is_success() {
+                        return Err(format!("HTTP {}", response.status()));
+                    }
+                    let parsed: Value = response.json().await.map_err(|e| format!("parse: {e}"))?;
+                    slack_api_result(&parsed)
                 }
-                let parsed: Value = response
-                    .json()
-                    .await
-                    .map_err(|e| format!("slack response parse ({channel}): {e}"))?;
-                slack_api_result(&parsed).map_err(|e| format!("{e} (channel {channel})"))?;
+                .await;
+                match result {
+                    Ok(()) => any_ok = true,
+                    Err(e) => {
+                        warn!("slack chat.postMessage to {channel} failed: {e}");
+                        failures.push(format!("{channel}: {e}"));
+                    }
+                }
             }
-            return Ok(());
+            // Partial success (≥1 channel OK) or all OK → delivered. Only when
+            // EVERY channel failed do we fail the row for retry (no dup risk —
+            // nothing was delivered yet).
+            if any_ok {
+                return Ok(());
+            }
+            return Err(format!(
+                "slack chat.postMessage failed for all {} channel(s): {}",
+                channels.len(),
+                failures.join("; ")
+            ));
         }
 
         // Incoming Webhook mode: POST {text, blocks, username?, icon_emoji?} to
