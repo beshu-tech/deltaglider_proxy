@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.2.0 — 2026-06-02
+
 ### Added — event-driven replication
 
 - **Replication now reacts to object mutations in near-real time.** Previously
