@@ -23,15 +23,15 @@
  *      `ApplyDialog`, on confirm call `putSection`.
  *   4. Discard: revert the dirty state to the last-applied snapshot.
  */
-import { useEffect, useRef, useState } from 'react';
+import { useRef, useState } from 'react';
 import { Button, Alert, Typography, Space, Modal } from 'antd';
 import {
   PlusOutlined,
   InfoCircleOutlined,
   ExclamationCircleOutlined,
 } from '@ant-design/icons';
-import type { AdmissionBlock, AdminConfig } from '../adminApi';
-import { getAdminConfig } from '../adminApi';
+import type { AdmissionBlock } from '../adminApi';
+import { useAdminConfig } from '../queries/config';
 import { useColors } from '../ThemeContext';
 import { useSectionEditor } from '../useSectionEditor';
 import AdmissionBlockList from './AdmissionBlockList';
@@ -58,7 +58,9 @@ export default function AdmissionPanel({
 }: Props) {
   const { BORDER, TEXT_MUTED } = useColors();
 
-  const [config, setConfig] = useState<AdminConfig | null>(null);
+  // Bucket-policies for the synthesised-blocks preview come from the
+  // cached config query (shared, invalidated by config mutations).
+  const { data: config } = useAdminConfig();
 
   // The shared editor handles the admission section (blocks[]).
   // Local state is `AdmissionBlock[]`; wire shape is
@@ -83,25 +85,6 @@ export default function AdmissionPanel({
     toPayload: (v) => ({ blocks: v }),
     noun: 'admission blocks',
   });
-
-  // We still need the bucket-policies for the synthesised-blocks
-  // preview — fetch them alongside, independently of the section editor.
-  useEffect(() => {
-    let cancelled = false;
-    void (async () => {
-      try {
-        const cfg = await getAdminConfig();
-        if (!cancelled) setConfig(cfg);
-      } catch (e) {
-        if (e instanceof Error && e.message.includes('401')) {
-          onSessionExpired?.();
-        }
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [onSessionExpired]);
 
   // Modal state: when the operator clicks Add or Edit, we set
   // `editing` to the index (or -1 for Add) and `editingBlock` to

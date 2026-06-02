@@ -3,8 +3,9 @@ import { useQueryClient } from '@tanstack/react-query';
 import { qk } from '../queries/keys';
 import { Button, Input, Radio, Switch, Typography, Space, Alert, Spin } from 'antd';
 import { PlusOutlined, DeleteOutlined, DatabaseOutlined, CloudOutlined, CheckCircleOutlined, ApiOutlined, FolderOutlined } from '@ant-design/icons';
-import type { BackendInfo, CreateBackendRequest, AdminConfig } from '../adminApi';
-import { getBackends, createBackend, deleteBackend, testS3Connection, getAdminConfig, updateAdminConfig, putSection } from '../adminApi';
+import type { BackendInfo, CreateBackendRequest } from '../adminApi';
+import { getBackends, createBackend, deleteBackend, testS3Connection, updateAdminConfig, putSection } from '../adminApi';
+import { useAdminConfig } from '../queries/config';
 import { useColors } from '../ThemeContext';
 import { useNavigation } from '../NavigationContext';
 import { useCardStyles } from './shared-styles';
@@ -29,7 +30,9 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
 
   const [backends, setBackends] = useState<BackendInfo[]>([]);
   const [defaultBackend, setDefaultBackend] = useState<string | null>(null);
-  const [config, setConfig] = useState<AdminConfig | null>(null);
+  // Config is read from the shared cache; mutations below invalidate
+  // `qk.config()` (via refresh()) so this stays fresh for all readers.
+  const { data: config } = useAdminConfig();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -52,17 +55,13 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
 
   const refresh = async () => {
     try {
-      const [data, cfg] = await Promise.all([
-        getBackends(),
-        getAdminConfig(),
-      ]);
+      const data = await getBackends();
       setBackends(data.backends);
       setDefaultBackend(data.default_backend);
-      setConfig(cfg);
       setError(null);
-      // Invalidate the shared cache so any other panel reading
-      // backends/config (e.g. CredentialsModePanel, BucketsPanel)
-      // will refetch the freshly-saved state on its next mount.
+      // Invalidate the shared cache so any panel reading backends/config
+      // (this panel's own `useAdminConfig()`, CredentialsModePanel,
+      // BucketsPanel, …) refetches the freshly-saved state.
       qc.invalidateQueries({ queryKey: qk.backends.list() });
       qc.invalidateQueries({ queryKey: qk.config() });
     } catch (e) {

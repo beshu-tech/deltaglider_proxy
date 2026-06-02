@@ -22,8 +22,9 @@
  */
 import { useEffect, useState } from 'react';
 import { TeamOutlined, CloudServerOutlined, SettingOutlined } from '@ant-design/icons';
-import type { AdminConfig, ExternalProviderInfo } from '../adminApi';
-import { getAdminConfig, whoami, getUsers, getGroups } from '../adminApi';
+import type { ExternalProviderInfo } from '../adminApi';
+import { whoami, getUsers, getGroups } from '../adminApi';
+import { useAdminConfig } from '../queries/config';
 import SectionOverview from './SectionOverview';
 import type { OverviewCard, OverviewStat } from './SectionOverview';
 import { childrenForPath } from './adminNavigation';
@@ -54,29 +55,24 @@ interface OverviewProps {
   onSessionExpired?: () => void;
 }
 
-function useAdminConfig(onSessionExpired?: () => void) {
-  const [config, setConfig] = useState<AdminConfig | null>(null);
-  const [error, setError] = useState<string | null>(null);
+/**
+ * Overview-config reader: thin wrapper over the shared `useAdminConfig`
+ * react-query hook that preserves the prior `{ config, error }` contract
+ * (string error, session-expired callback on a null/401 response).
+ */
+function useOverviewConfig(onSessionExpired?: () => void) {
+  const { data, error: queryError, isError } = useAdminConfig();
+  // getAdminConfig resolves to `null` on a non-OK (e.g. 401) response;
+  // treat that as a session-expiry signal like the old effect did.
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const cfg = await getAdminConfig();
-        if (cancelled) return;
-        if (!cfg) {
-          onSessionExpired?.();
-          return;
-        }
-        setConfig(cfg);
-      } catch (e) {
-        if (cancelled) return;
-        setError(e instanceof Error ? e.message : 'Failed to load config');
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [onSessionExpired]);
+    if (data === null) onSessionExpired?.();
+  }, [data, onSessionExpired]);
+  const config = data ?? null;
+  const error = isError
+    ? queryError instanceof Error
+      ? queryError.message
+      : 'Failed to load config'
+    : null;
   return { config, error };
 }
 
@@ -85,7 +81,7 @@ function useAdminConfig(onSessionExpired?: () => void) {
 // ═══════════════════════════════════════════════════
 
 export function AccessOverview({ onNavigateAdmin, onSessionExpired }: OverviewProps) {
-  const { config, error } = useAdminConfig(onSessionExpired);
+  const { config, error } = useOverviewConfig(onSessionExpired);
   // Users / groups / providers counts live outside AdminConfig —
   // fetch them in parallel. We tolerate errors here: if the IAM DB
   // is empty or the IAM mode is declarative and the lister returns
@@ -232,7 +228,7 @@ export function AccessOverview({ onNavigateAdmin, onSessionExpired }: OverviewPr
 // ═══════════════════════════════════════════════════
 
 export function StorageOverview({ onNavigateAdmin, onSessionExpired }: OverviewProps) {
-  const { config, error } = useAdminConfig(onSessionExpired);
+  const { config, error } = useOverviewConfig(onSessionExpired);
   if (error) {
     return <Alert type="error" showIcon message="Failed to load" description={error} />;
   }
@@ -335,7 +331,7 @@ export function StorageOverview({ onNavigateAdmin, onSessionExpired }: OverviewP
 // ═══════════════════════════════════════════════════
 
 export function AdvancedOverview({ onNavigateAdmin, onSessionExpired }: OverviewProps) {
-  const { config, error } = useAdminConfig(onSessionExpired);
+  const { config, error } = useOverviewConfig(onSessionExpired);
   if (error) {
     return <Alert type="error" showIcon message="Failed to load" description={error} />;
   }

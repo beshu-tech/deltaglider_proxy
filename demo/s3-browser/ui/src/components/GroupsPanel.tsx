@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Button, Typography, Alert, Input, Divider, Checkbox } from 'antd';
 import { PlusOutlined, FolderOutlined, DeleteOutlined, CopyOutlined } from '@ant-design/icons';
-import type { IamGroup, IamMode, IamUser } from '../adminApi';
-import { getAdminConfig, getGroups, createGroup, updateGroup, deleteGroup, addGroupMember, removeGroupMember, getUsers, cloneGroup } from '../adminApi';
+import type { IamGroup, IamUser } from '../adminApi';
+import { getGroups, createGroup, updateGroup, deleteGroup, addGroupMember, removeGroupMember, getUsers, cloneGroup } from '../adminApi';
+import { useAdminConfig } from '../queries/config';
 import { useCardStyles } from './shared-styles';
 import FormLabel from './FormLabel';
 import { useColors } from '../ThemeContext';
@@ -30,19 +31,10 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
   const [selectedId, setSelectedId] = useState<number | null>(initialGroupId ?? null);
   const [creating, setCreating] = useState(false);
   const [search, setSearch] = useState('');
-  const [iamMode, setIamMode] = useState<IamMode | undefined>(undefined);
 
-  // Load IAM mode once for the source-of-truth banner.
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      const cfg = await getAdminConfig();
-      if (!cancelled && cfg) setIamMode(cfg.iam_mode);
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  // IAM mode for the source-of-truth banner (cached react-query read).
+  const { data: cfg } = useAdminConfig();
+  const iamMode = cfg?.iam_mode;
 
   const loadData = useCallback(async () => {
     setLoading(true);

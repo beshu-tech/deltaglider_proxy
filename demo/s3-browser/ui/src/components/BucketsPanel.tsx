@@ -36,7 +36,8 @@ import {
   PlusOutlined,
 } from '@ant-design/icons';
 import type { AdminConfig, BackendInfo } from '../adminApi';
-import { getAdminConfig, getBackends } from '../adminApi';
+import { getBackends } from '../adminApi';
+import { useAdminConfig } from '../queries/config';
 import { listBuckets } from '../s3client';
 import { useCardStyles } from './shared-styles';
 import SectionHeader from './SectionHeader';
@@ -96,35 +97,30 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
     },
   });
 
-  const [backends, setBackends] = useState<BackendInfo[]>([]);
-  const [defaultBackend, setDefaultBackend] = useState<string | null>(null);
+  // Config (backends + default backend) comes from the shared cache.
+  const { data: cfg } = useAdminConfig();
+  // /api/admin/backends is the fallback when the config response doesn't
+  // carry a `backends` array (legacy shapes); available buckets come from
+  // the S3 list endpoint. Neither is part of the storage section body, so
+  // they're side-loaded independently of the section editor.
+  const [fallbackBackends, setFallbackBackends] = useState<BackendInfo[]>([]);
   const [availableBuckets, setAvailableBuckets] = useState<string[]>([]);
 
-  // Side-loaded data (backends, default backend, available buckets) is
-  // NOT part of the storage section body — fetch it independently. The
-  // section editor owns the row-editing shape + apply pipeline.
+  // getAdminConfig resolves to `null` on a 401; surface as session-expiry.
+  useEffect(() => {
+    if (cfg === null) onSessionExpired?.();
+  }, [cfg, onSessionExpired]);
+
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       try {
-        const [cfg, bs, realBuckets] = await Promise.all([
-          getAdminConfig(),
+        const [bs, realBuckets] = await Promise.all([
           getBackends().then((r) => r.backends).catch(() => [] as BackendInfo[]),
           listBuckets().catch(() => [] as Array<{ name: string }>),
         ]);
         if (cancelled) return;
-        if (!cfg) {
-          onSessionExpired?.();
-          return;
-        }
-        // Prefer the /api/admin/config response's `backends` array —
-        // it synthesises a "default" entry on the singleton-backend
-        // path, so the per-bucket encryption badge works uniformly
-        // regardless of YAML shape. Fall back to /api/admin/backends
-        // when the primary endpoint doesn't carry backends (legacy
-        // response shapes).
-        setBackends(cfg.backends && cfg.backends.length > 0 ? cfg.backends : bs);
-        setDefaultBackend(cfg.default_backend ?? null);
+        setFallbackBackends(bs);
         setAvailableBuckets(realBuckets.map((b) => b.name));
       } catch (e) {
         if (cancelled) return;
@@ -135,6 +131,15 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
       cancelled = true;
     };
   }, [onSessionExpired]);
+
+  // Prefer the /api/admin/config response's `backends` array — it
+  // synthesises a "default" entry on the singleton-backend path, so the
+  // per-bucket encryption badge works uniformly regardless of YAML shape.
+  // Fall back to /api/admin/backends when the primary endpoint doesn't
+  // carry backends (legacy response shapes).
+  const backends =
+    cfg?.backends && cfg.backends.length > 0 ? cfg.backends : fallbackBackends;
+  const defaultBackend = cfg?.default_backend ?? null;
 
   // Guarded apply: run the client-side duplicate-name check first and
   // surface the error, otherwise delegate to the section editor's

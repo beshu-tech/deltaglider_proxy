@@ -40,8 +40,8 @@ import {
   ControlOutlined,
   SyncOutlined,
 } from '@ant-design/icons';
-import type { AdminConfig, SectionApplyResponse } from '../adminApi';
-import { getAdminConfig } from '../adminApi';
+import type { SectionApplyResponse } from '../adminApi';
+import { useAdminConfig } from '../queries/config';
 import { useColors } from '../ThemeContext';
 import { useCardStyles } from './shared-styles';
 import { useSectionEditor } from '../useSectionEditor';
@@ -491,29 +491,18 @@ export function CachesPanel({ onSessionExpired }: PanelProps) {
 export function LimitsPanel({ onSessionExpired }: PanelProps) {
   const { cardStyle, inputRadius } = useCardStyles();
   const { ACCENT_AMBER, TEXT_SECONDARY, BG_ELEVATED, BORDER, TEXT_MUTED } = useColors();
-  const [config, setConfig] = useState<AdminConfig | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  // Read-only env-var view of the running config (cached react-query read).
+  const { data: config, error: queryError, isError } = useAdminConfig();
 
+  // getAdminConfig resolves to `null` on a 401; treat as session-expiry.
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const cfg = await getAdminConfig();
-        if (cancelled) return;
-        if (!cfg) {
-          onSessionExpired?.();
-          return;
-        }
-        setConfig(cfg);
-      } catch (e) {
-        if (cancelled) return;
-        setError(e instanceof Error ? e.message : 'Failed to load');
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [onSessionExpired]);
+    if (config === null) onSessionExpired?.();
+  }, [config, onSessionExpired]);
 
-  if (error) return <Alert type="error" showIcon message="Failed to load" description={error} />;
+  if (isError) {
+    const msg = queryError instanceof Error ? queryError.message : 'Failed to load';
+    return <Alert type="error" showIcon message="Failed to load" description={msg} />;
+  }
   if (!config) return <PanelShell><Text type="secondary">Loading...</Text></PanelShell>;
 
   const readOnlyField = (

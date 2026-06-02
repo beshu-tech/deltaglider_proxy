@@ -35,8 +35,10 @@
  */
 import { useCallback, useEffect, useState } from 'react';
 import { message } from 'antd';
+import { useQueryClient } from '@tanstack/react-query';
 import type { SectionApplyResponse, SectionName } from './adminApi';
 import { getSection, putSection, validateSection } from './adminApi';
+import { qk } from './queries/keys';
 import { useApplyHandler, useDirtySection } from './useDirtySection';
 
 interface UseSectionEditorOptions<Wire, Local = Wire> {
@@ -127,6 +129,7 @@ export function useSectionEditor<Wire, Local = Wire>(
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const queryClient = useQueryClient();
   const { value, isDirty, setValue, discard, markApplied, resetWith } =
     useDirtySection<Local>(dirtyKey, initial);
 
@@ -208,6 +211,11 @@ export function useSectionEditor<Wire, Local = Wire>(
       markApplied();
       setApplyOpen(false);
       setPendingBody(null);
+      // Other panels read the full config via the cached `qk.config()`
+      // query (AdmissionPanel's synthesised-blocks preview, Authentication/
+      // Groups banners, the section overviews, etc.). A section PUT changed
+      // server truth, so invalidate that cache to refetch.
+      void queryClient.invalidateQueries({ queryKey: qk.config() });
       void refresh();
     } catch (e) {
       // Apply failed (network/server error). Close the dialog but do NOT
@@ -221,7 +229,7 @@ export function useSectionEditor<Wire, Local = Wire>(
     } finally {
       setApplying(false);
     }
-  }, [section, pendingBody, markApplied, refresh]);
+  }, [section, pendingBody, markApplied, refresh, queryClient]);
 
   // ⌘S wiring: when dirty, ⌘S opens the validate → ApplyDialog sequence.
   // Registered under dirtyKey so ⌘S reaches the active panel, not all
