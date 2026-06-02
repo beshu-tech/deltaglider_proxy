@@ -25,6 +25,12 @@ use tracing::info;
 pub struct ReplicationOverview {
     pub worker_enabled: bool,
     pub tick_interval: String,
+    /// Replication is event-driven: this is the unix timestamp the event
+    /// consumer last advanced its outbox cursor (i.e. last applied an object
+    /// mutation). `None` if it hasn't processed anything yet. The per-rule
+    /// `next_due_at` is the slow reconcile-sweep countdown, not the primary
+    /// trigger.
+    pub last_event_applied_at: Option<i64>,
     pub rules: Vec<RuleOverview>,
 }
 
@@ -62,6 +68,7 @@ pub async fn list_rules(
             return Ok(Json(ReplicationOverview {
                 worker_enabled: repl.enabled,
                 tick_interval: repl.tick_interval.clone(),
+                last_event_applied_at: None,
                 rules: Vec::new(),
             }))
         }
@@ -93,9 +100,16 @@ pub async fn list_rules(
         });
     }
 
+    let last_event_applied_at = db
+        .listener_cursor_load_full(crate::replication::event_consumer::REPLICATION_LISTENER)
+        .ok()
+        .flatten()
+        .map(|c| c.updated_at);
+
     Ok(Json(ReplicationOverview {
         worker_enabled: repl.enabled,
         tick_interval: repl.tick_interval.clone(),
+        last_event_applied_at,
         rules: rules_out,
     }))
 }

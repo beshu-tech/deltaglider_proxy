@@ -106,6 +106,49 @@ Key configuration:
 **Why per-pod PVCs matter for Rust:**
 Rust compilation creates thousands of intermediate files (`.o`, `.rlib`, `.rmeta`) in the `target/` directory. With overlay2 (the default for emptyDir in container jobs), every write triggers a copy-on-write operation. On a project with ~80 crates, this added minutes to compilation. Direct SSD access via PVC bypasses this entirely.
 
+**Open-file limit (`nofile`) — REQUIRED, both host and workflow:**
+The runners execute inside **Ryzen LXC containers** (the `k3s` label is a historical
+alias — there is no Kubernetes anymore). An LXC container inherits a **low default
+`nofile` (~1024)** unless raised. The integration job runs **~35 test binaries in one
+`cargo test` invocation**, each spawning its own proxy + MinIO sockets, so the *aggregate*
+open-fd count easily crosses 1024 and surfaces — non-deterministically, under load — as:
+
+```
+ConnectError("tcp open error", Os { code: 24, message: "Too many open files" })
+```
+
+It typically panics mid-seed in whichever test opens the most connections (historically
+`recursive_delete_test`, which seeds 1100 objects), but the root cause is the shared,
+under-sized fd table, not any single test. Two layers fix it (keep BOTH):
+
+1. **Host side (the real fix).** On the Ryzen host, raise the LXC container's limit so
+   everything inside inherits it. Run the idempotent helper as root on the host:
+   ```
+   sudo scripts/bump-runner-nofile.sh            # auto-detects LXC/Incus/LXD containers
+   sudo scripts/bump-runner-nofile.sh ct1 ct2    # or name them explicitly
+   ```
+   It sets `lxc.prlimit.nofile` (or the Incus/LXD `limits.kernel.nofile` equivalent) and
+   pins `LimitNOFILE` on the in-container `actions-runner` systemd unit. Equivalent manual
+   steps:
+   ```
+   # /var/lib/lxc/<container>/config
+   lxc.prlimit.nofile = 1048576
+   # systemctl edit actions-runner   →   [Service]
+   LimitNOFILE=1048576
+   ```
+   Restart the container afterwards (`lxc-stop && lxc-start`, or `incus restart`). Verify
+   from a job step: `ulimit -Sn; ulimit -Hn; cat /proc/sys/fs/file-max`.
+
+2. **Workflow side (belt-and-suspenders, self-documenting).** Every `container:` block in
+   `ci.yml` sets `options: --ulimit nofile=1048576:1048576`. This makes the requirement
+   visible to future readers and keeps the workflow portable to a fresh runner host that
+   hasn't had the host-side bump applied yet. (It only takes effect up to the host's hard
+   limit, so the host bump in #1 is still authoritative.)
+
+Tests should also avoid unbounded N-way connection fan-out (cap seeding with a
+`tokio::sync::Semaphore`) so a single test can't dominate the shared fd budget — but that
+is hygiene, not a substitute for the limit bump.
+
 ### 3. sccache + Local MinIO
 
 **Manifest:** `.github/k8s/sccache-minio.yaml`

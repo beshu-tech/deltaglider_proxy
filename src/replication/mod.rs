@@ -17,6 +17,7 @@
 //! each rule's persisted `next_due_at`, skips paused/disabled rules, and
 //! executes due rules via the same worker used by "Run now".
 
+pub mod event_consumer;
 pub mod planner;
 pub mod scheduler;
 pub mod state_store;

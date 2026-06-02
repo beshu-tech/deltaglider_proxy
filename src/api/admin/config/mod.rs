@@ -572,6 +572,37 @@ pub(super) fn preserve_sigv4_pair(
     }
 }
 
+/// Preserve unredacted `event_delivery.webhook_headers` values across a section
+/// round-trip. The GET masks each header value to
+/// [`crate::config::REDACTED_SENTINEL`] (keeping the key), so an unedited
+/// round-trip would otherwise overwrite the real bearer token with the mask.
+///
+/// Per-key, three cases mirror the SigV4 "None means unchanged" contract:
+/// - value still equals the sentinel → the operator did not retype it → restore
+///   the old value (or drop the key if `old` has no such header — a masked value
+///   for a key that never existed is meaningless, treat as unset).
+/// - value differs from the sentinel → the operator typed a real value → keep it.
+/// - key absent from `new` → the operator removed it (the merge-patch already
+///   applied the delete) → nothing to do here.
+pub(super) fn preserve_event_delivery_secrets(
+    new: &mut crate::config_sections::EventDeliveryConfig,
+    old: &crate::config_sections::EventDeliveryConfig,
+) {
+    let sentinel = crate::config::REDACTED_SENTINEL;
+    let mut drop_keys: Vec<String> = Vec::new();
+    for (key, value) in new.webhook_headers.iter_mut() {
+        if value == sentinel {
+            match old.webhook_headers.get(key) {
+                Some(prev) => *value = prev.clone(),
+                None => drop_keys.push(key.clone()),
+            }
+        }
+    }
+    for key in drop_keys {
+        new.webhook_headers.remove(&key);
+    }
+}
+
 /// Preserve credentials on the PRIMARY backend across a config swap.
 ///
 /// Cases handled:
@@ -929,5 +960,87 @@ pub async fn sync_now(
             tracing::warn!("sync-now failed: {e}");
             Err(axum::http::StatusCode::BAD_GATEWAY)
         }
+    }
+}
+
+#[cfg(test)]
+mod preserve_tests {
+    use super::*;
+    use crate::config::REDACTED_SENTINEL;
+    use crate::config_sections::EventDeliveryConfig;
+    use std::collections::BTreeMap;
+
+    fn ed_with(headers: &[(&str, &str)]) -> EventDeliveryConfig {
+        EventDeliveryConfig {
+            webhook_headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..EventDeliveryConfig::default()
+        }
+    }
+
+    #[test]
+    fn preserve_restores_untouched_sentinel_value() {
+        // Operator left "Authorization" masked → restore the old token.
+        let old = ed_with(&[("Authorization", "Bearer real-token")]);
+        let mut new = ed_with(&[("Authorization", REDACTED_SENTINEL)]);
+        preserve_event_delivery_secrets(&mut new, &old);
+        assert_eq!(
+            new.webhook_headers.get("Authorization").map(String::as_str),
+            Some("Bearer real-token")
+        );
+    }
+
+    #[test]
+    fn preserve_keeps_retyped_value() {
+        // Operator typed a new token → keep it, don't restore the old one.
+        let old = ed_with(&[("Authorization", "Bearer old")]);
+        let mut new = ed_with(&[("Authorization", "Bearer NEW")]);
+        preserve_event_delivery_secrets(&mut new, &old);
+        assert_eq!(
+            new.webhook_headers.get("Authorization").map(String::as_str),
+            Some("Bearer NEW")
+        );
+    }
+
+    #[test]
+    fn preserve_drops_sentinel_for_unknown_key() {
+        // A masked value for a key the old config never had is meaningless → drop.
+        let old = ed_with(&[]);
+        let mut new = ed_with(&[("X-New", REDACTED_SENTINEL)]);
+        preserve_event_delivery_secrets(&mut new, &old);
+        assert!(!new.webhook_headers.contains_key("X-New"));
+    }
+
+    #[test]
+    fn preserve_leaves_removed_key_removed() {
+        // Operator removed "Authorization" (absent from new) → stays removed;
+        // a different untouched header is restored.
+        let old = ed_with(&[("Authorization", "Bearer real"), ("X-Env", "prod")]);
+        let mut new = ed_with(&[("X-Env", REDACTED_SENTINEL)]);
+        preserve_event_delivery_secrets(&mut new, &old);
+        assert!(!new.webhook_headers.contains_key("Authorization"));
+        assert_eq!(
+            new.webhook_headers.get("X-Env").map(String::as_str),
+            Some("prod")
+        );
+    }
+
+    #[test]
+    fn redact_masks_header_values_keeps_keys() {
+        // The GET-side redaction (config.rs) masks values but keeps keys.
+        let cfg = crate::config::Config {
+            event_delivery: ed_with(&[("Authorization", "Bearer secret"), ("X-Env", "prod")]),
+            ..crate::config::Config::default()
+        };
+        let redacted = cfg.redact_all_secrets();
+        let h: &BTreeMap<String, String> = &redacted.event_delivery.webhook_headers;
+        assert_eq!(
+            h.get("Authorization").map(String::as_str),
+            Some(REDACTED_SENTINEL)
+        );
+        assert_eq!(h.get("X-Env").map(String::as_str), Some(REDACTED_SENTINEL));
+        assert_eq!(h.len(), 2, "keys must survive redaction");
     }
 }

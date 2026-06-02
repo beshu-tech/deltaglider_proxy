@@ -288,6 +288,14 @@ pub const DEFAULT_CONFIG_FILENAME: &str = "deltaglider_proxy.toml";
 /// Default YAML config filename (preferred for new deployments).
 pub const DEFAULT_YAML_CONFIG_FILENAME: &str = "deltaglider_proxy.yaml";
 
+/// Placeholder substituted for secret VALUES that must keep their KEY visible in
+/// a redacted export (so the GUI can show *which* secrets exist while masking the
+/// value). Used for `event_delivery.webhook_headers` values. The section-PUT
+/// preserve path treats an incoming value equal to this sentinel as "unchanged,
+/// keep the runtime secret" — see `preserve_event_delivery_secrets`. SigV4 and
+/// backend creds use `None`-omission instead (no key to preserve).
+pub const REDACTED_SENTINEL: &str = "__redacted__";
+
 /// Ordered list of default config file locations. YAML is preferred over TOML
 /// when both exist in the same directory.
 pub const DEFAULT_CONFIG_SEARCH_PATHS: &[&str] = &[
@@ -2028,6 +2036,14 @@ impl Config {
         }
         export.access_key_id = None;
         export.secret_access_key = None;
+        // Webhook header values may carry bearer tokens. Mask the VALUE but keep
+        // the KEY so the GUI shows which headers exist; the section-PUT preserve
+        // path restores any value left as this sentinel. Endpoint URLs are left
+        // visible on purpose (operators must verify them; credentials belong in
+        // headers, not the URL).
+        for value in export.event_delivery.webhook_headers.values_mut() {
+            *value = REDACTED_SENTINEL.to_string();
+        }
         export
     }
 

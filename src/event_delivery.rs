@@ -32,6 +32,11 @@ const DEFAULT_RETRY_MAX: Duration = Duration::from_secs(300);
 const DEFAULT_STALE_CLAIM_AFTER: Duration = Duration::from_secs(60);
 const DEFAULT_DELIVERED_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// A listener cursor older than this (no advance in 1h) is treated as inactive
+/// and no longer pins the prune floor. A healthy consumer advances every tick
+/// (seconds), so this only ever fires for a stuck/dead/disabled listener.
+const LISTENER_CURSOR_STALE_SECS: i64 = 60 * 60;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct EventWebhookPayload<'a> {
     pub schema: &'static str,
@@ -190,19 +195,37 @@ pub async fn dispatch_once(
         }
     }
 
+    // Prune FLOOR: never delete a delivered row that a slower listener (e.g.
+    // event-driven replication) hasn't consumed yet. We may only remove rows at
+    // or below the smallest ACTIVE listener cursor. A cursor that hasn't
+    // advanced within LISTENER_CURSOR_STALE_SECS (consumer disabled, a wedged
+    // rule, or a dead instance holding the lease) is treated as inactive and no
+    // longer pins the floor — otherwise the append-only outbox would grow
+    // without bound. No active listeners → no floor.
+    let min_keep_id = {
+        let db = db.lock().await;
+        db.event_outbox_min_active_listener_cursor(now, LISTENER_CURSOR_STALE_SECS)
+            .unwrap_or(None)
+            .unwrap_or(i64::MAX)
+    };
+
     let retention = delivered_retention_secs(config);
     if retention > 0 {
         let before = now.saturating_sub(retention);
         let db = db.lock().await;
-        if let Err(err) = db.event_outbox_prune_delivered_before(before, config.prune_batch) {
+        if let Err(err) =
+            db.event_outbox_prune_delivered_before(before, config.prune_batch, min_keep_id)
+        {
             warn!("Event outbox delivered prune failed: {}", err);
         }
     }
     if config.prune_batch > 0 {
         let db = db.lock().await;
-        if let Err(err) = db
-            .event_outbox_prune_delivered_over_count(config.delivered_max_rows, config.prune_batch)
-        {
+        if let Err(err) = db.event_outbox_prune_delivered_over_count(
+            config.delivered_max_rows,
+            config.prune_batch,
+            min_keep_id,
+        ) {
             warn!("Event outbox delivered count-prune failed: {}", err);
         }
     }

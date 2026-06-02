@@ -57,6 +57,38 @@ impl DeltaGliderS3Service {
     pub fn state(&self) -> &Arc<AppState> {
         &self.state
     }
+
+    /// Append an object-mutation event to the durable outbox (best-effort).
+    ///
+    /// This is what makes replication EVENT-DRIVEN: every successful PUT /
+    /// DELETE / COPY / CompleteMultipartUpload publishes a fact here, which the
+    /// replication consumer (and webhook delivery) drain. DG-internal keys
+    /// (delta artifacts, dir markers, config-sync) are filtered so they never
+    /// generate replication work. Noops silently when no config DB is present
+    /// (open-mode dev) — same contract as the form-POST path.
+    async fn emit_object_event(
+        &self,
+        kind: crate::event_outbox::EventKind,
+        bucket: &str,
+        key: &str,
+        payload: serde_json::Value,
+    ) {
+        if !crate::replication::event_consumer::is_user_object_key(key) {
+            return;
+        }
+        crate::api::handlers::object_helpers::enqueue_object_event(
+            &self.state,
+            crate::event_outbox::NewEvent::new(
+                kind,
+                bucket,
+                key,
+                crate::event_outbox::EventSource::S3Api,
+                crate::replication::current_unix_seconds(),
+                payload,
+            ),
+        )
+        .await;
+    }
 }
 
 #[async_trait::async_trait]
@@ -630,7 +662,19 @@ impl s3s::S3 for DeltaGliderS3Service {
             .delete(&input.bucket, &input.key)
             .await
         {
-            Ok(()) | Err(crate::deltaglider::EngineError::NotFound(_)) => {
+            // Only a REAL delete (Ok) emits an event — a NotFound deleted
+            // nothing, so there's nothing for replication to mirror.
+            Ok(()) => {
+                self.emit_object_event(
+                    crate::event_outbox::EventKind::ObjectDeleted,
+                    &input.bucket,
+                    &input.key,
+                    serde_json::json!({}),
+                )
+                .await;
+                Ok(s3s::S3Response::new(s3s::dto::DeleteObjectOutput::default()))
+            }
+            Err(crate::deltaglider::EngineError::NotFound(_)) => {
                 Ok(s3s::S3Response::new(s3s::dto::DeleteObjectOutput::default()))
             }
             Err(e) => Err(engine_error_to_s3s(e)),
@@ -646,10 +690,33 @@ impl s3s::S3 for DeltaGliderS3Service {
         let quiet = input.delete.quiet.unwrap_or(false);
         let mut deleted = Vec::new();
         let mut errors = Vec::new();
+        // Collect ObjectDeleted events for keys that were ACTUALLY deleted
+        // (Ok, not NotFound), filtered to user objects, and batch-insert once
+        // after the loop (single DB lock).
+        let mut delete_events: Vec<crate::event_outbox::NewEvent> = Vec::new();
         for obj in input.delete.objects {
             let key = obj.key.trim_start_matches('/').to_string();
             match self.state.engine.load().delete(&input.bucket, &key).await {
-                Ok(()) | Err(crate::deltaglider::EngineError::NotFound(_)) => {
+                Ok(()) => {
+                    if crate::replication::event_consumer::is_user_object_key(&key) {
+                        delete_events.push(crate::event_outbox::NewEvent::new(
+                            crate::event_outbox::EventKind::ObjectDeleted,
+                            input.bucket.clone(),
+                            key.clone(),
+                            crate::event_outbox::EventSource::S3Api,
+                            crate::replication::current_unix_seconds(),
+                            serde_json::json!({}),
+                        ));
+                    }
+                    if !quiet {
+                        deleted.push(s3s::dto::DeletedObject {
+                            key: Some(obj.key),
+                            version_id: obj.version_id,
+                            ..Default::default()
+                        });
+                    }
+                }
+                Err(crate::deltaglider::EngineError::NotFound(_)) => {
                     if !quiet {
                         deleted.push(s3s::dto::DeletedObject {
                             key: Some(obj.key),
@@ -669,6 +736,8 @@ impl s3s::S3 for DeltaGliderS3Service {
                 }
             }
         }
+        crate::api::handlers::object_helpers::enqueue_object_events(&self.state, &delete_events)
+            .await;
         Ok(s3s::S3Response::new(s3s::dto::DeleteObjectsOutput {
             deleted: (!deleted.is_empty()).then_some(deleted),
             errors: (!errors.is_empty()).then_some(errors),
@@ -732,6 +801,17 @@ impl s3s::S3 for DeltaGliderS3Service {
             )
             .await
             .map_err(engine_error_to_s3s)?;
+        self.emit_object_event(
+            crate::event_outbox::EventKind::ObjectCreated,
+            &input.bucket,
+            &input.key,
+            serde_json::json!({
+                "content_length": data.len(),
+                "storage_type": result.metadata.storage_info.label(),
+                "etag": result.metadata.etag(),
+            }),
+        )
+        .await;
         let mut resp = s3s::S3Response::new(s3s::dto::PutObjectOutput {
             e_tag: Some(parse_s3s_etag(&result.metadata.etag())?),
             ..Default::default()
@@ -808,6 +888,19 @@ impl s3s::S3 for DeltaGliderS3Service {
             )
             .await
             .map_err(engine_error_to_s3s)?;
+        // A copy creates a new object at the destination — emit ObjectCreated
+        // for the dest key. Routing decides whether a replication rule cares.
+        self.emit_object_event(
+            crate::event_outbox::EventKind::ObjectCreated,
+            &input.bucket,
+            &input.key,
+            serde_json::json!({
+                "content_length": data.len(),
+                "storage_type": result.metadata.storage_info.label(),
+                "etag": result.metadata.etag(),
+            }),
+        )
+        .await;
         Ok(s3s::S3Response::new(s3s::dto::CopyObjectOutput {
             copy_object_result: Some(s3s::dto::CopyObjectResult {
                 e_tag: Some(parse_s3s_etag(&result.metadata.etag())?),
@@ -1042,6 +1135,19 @@ impl s3s::S3 for DeltaGliderS3Service {
             }
         };
         self.state.multipart.finish_upload(&input.upload_id);
+        // A completed multipart upload created the final object — emit
+        // ObjectCreated before `input.bucket`/`input.key` are moved into the
+        // response.
+        self.emit_object_event(
+            crate::event_outbox::EventKind::ObjectCreated,
+            &input.bucket,
+            &input.key,
+            serde_json::json!({
+                "etag": multipart_etag,
+                "storage_type": store_meta.as_ref().map(|m| m.storage_info.label()),
+            }),
+        )
+        .await;
         let location = format!("/{}/{}", input.bucket, input.key);
         let mut resp = s3s::S3Response::new(s3s::dto::CompleteMultipartUploadOutput {
             bucket: Some(input.bucket),

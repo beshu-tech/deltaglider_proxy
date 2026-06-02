@@ -41,6 +41,7 @@ import {
   LoggingPanel,
   ConfigDbSyncPanel,
 } from './advancedPanels';
+import WebhookDeliveryPanel from './WebhookDeliveryPanel';
 import {
   AccessOverview,
   StorageOverview,
@@ -732,6 +733,14 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, accountMe
         <>
           {header}
           <ConfigDbSyncPanel onSessionExpired={onSessionExpired} />
+        </>
+      );
+    }
+    if (adminPath === 'configuration/advanced/event-delivery') {
+      return (
+        <>
+          {header}
+          <WebhookDeliveryPanel onSessionExpired={onSessionExpired} />
         </>
       );
     }

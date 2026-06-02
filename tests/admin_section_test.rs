@@ -1122,3 +1122,116 @@ async fn section_put_storage_buckets_are_merged_not_replaced() {
 // future-proofing is the value of the shared helpers; the asymmetric
 // warning isn't reachable through the normal section-merge flow today.
 // -------------------------------------------------------------------------
+
+/// Webhook header secrets survive the GUI round-trip: GET masks header VALUES to
+/// the redaction sentinel (keeping keys), PUT with the sentinel preserves the
+/// real token, PUT with a real value overwrites, and PUT with `null` deletes the
+/// header. This is the secret-safety contract behind the Webhook delivery panel.
+#[tokio::test]
+async fn section_webhook_headers_secret_roundtrip() {
+    // Reference the library constant so a Rust-side rename of the sentinel
+    // breaks this test immediately (instead of silently passing on a stale literal).
+    const SENTINEL: &str = deltaglider_proxy::config::REDACTED_SENTINEL;
+    let server = TestServer::builder()
+        .auth("WHSEC1", "WHSECRET1")
+        .yaml_config()
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let url = format!("{}/_/api/admin/config/section/advanced", server.endpoint());
+
+    // 1. Seed a webhook with a secret header.
+    let resp = admin
+        .put(&url)
+        .json(&json!({
+            "event_delivery": {
+                "enabled": true,
+                "webhook_urls": ["https://hooks.example.com/in"],
+                "webhook_headers": { "Authorization": "Bearer real-token-123" }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "seed PUT must succeed");
+
+    // 2. GET must MASK the value but KEEP the key.
+    let resp = admin.get(&url).send().await.unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let hdrs = &body["event_delivery"]["webhook_headers"];
+    assert_eq!(
+        hdrs["Authorization"].as_str(),
+        Some(SENTINEL),
+        "GET must redact the header value, got: {body}"
+    );
+
+    // 3. PUT back the masked value (simulating an unedited round-trip) → the real
+    //    token must be PRESERVED, not overwritten with the sentinel.
+    let resp = admin
+        .put(&url)
+        .json(&json!({
+            "event_delivery": {
+                "webhook_headers": { "Authorization": SENTINEL }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Prove preservation: the persisted config on disk must still hold the REAL
+    // token, NOT the sentinel. (The GET always masks, so we read the persisted
+    // YAML directly — same technique as the document-apply preserve test.)
+    let persisted = std::fs::read_to_string(server.config_path()).expect("read persisted config");
+    assert!(
+        persisted.contains("Bearer real-token-123"),
+        "unedited sentinel round-trip must preserve the real token, persisted:\n{persisted}"
+    );
+    assert!(
+        !persisted.contains(SENTINEL),
+        "persisted config must not contain the sentinel (would mean the token was clobbered)"
+    );
+
+    // 4. PUT a REAL new value → overwrites.
+    let resp = admin
+        .put(&url)
+        .json(&json!({
+            "event_delivery": {
+                "webhook_headers": { "Authorization": "Bearer rotated-456" }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // GET still masks, so we can't read the value back; assert the key persists.
+    let resp = admin.get(&url).send().await.unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["event_delivery"]["webhook_headers"]["Authorization"].as_str(),
+        Some(SENTINEL),
+        "rotated header key must persist (value masked)"
+    );
+
+    // 5. PUT `null` for the header → DELETE it (RFC 7396).
+    let resp = admin
+        .put(&url)
+        .json(&json!({
+            "event_delivery": {
+                "webhook_headers": { "Authorization": null }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = admin.get(&url).send().await.unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let hdrs = &body["event_delivery"]["webhook_headers"];
+    assert!(
+        hdrs.get("Authorization").is_none()
+            || hdrs.is_null()
+            || hdrs.as_object().map(|m| m.is_empty()).unwrap_or(true),
+        "Authorization header must be deleted, got: {body}"
+    );
+}

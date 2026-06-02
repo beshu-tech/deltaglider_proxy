@@ -39,6 +39,7 @@
     "test:lifecycle-helpers": "node scripts/lifecycle-helpers-regression-test.mjs",
     "test:upload-telemetry": "node scripts/upload-telemetry-regression-test.mjs",
     "test:page-size": "node scripts/page-size-regression-test.mjs",
+    "test:webhook-delivery-payload": "node scripts/webhook-delivery-payload-regression-test.mjs",
     "e2e": "playwright test",
     "typecheck": "tsc --noEmit",
     "knip": "knip"

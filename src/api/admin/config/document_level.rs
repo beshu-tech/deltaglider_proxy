@@ -335,6 +335,14 @@ fn preserve_runtime_secrets(
     super::preserve_primary_backend_creds(incoming, current, &mut warnings);
     super::preserve_named_backends_creds(incoming, current, &mut warnings);
 
+    // Webhook header values are masked to REDACTED_SENTINEL on export
+    // (`redact_all_secrets`). A full-document export → edit → apply
+    // round-trip (GUI "Export/Import YAML" or any GitOps flow) would
+    // otherwise persist the literal sentinel as the bearer token. Mirror
+    // the section-PUT path so the document path preserves untouched
+    // secrets identically.
+    super::preserve_event_delivery_secrets(&mut incoming.event_delivery, &current.event_delivery);
+
     warnings
 }
 

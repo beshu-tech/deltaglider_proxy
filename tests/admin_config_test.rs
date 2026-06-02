@@ -666,6 +666,82 @@ async fn test_config_apply_preserves_sigv4_secret_on_redacted_roundtrip() {
     assert_eq!(cfg["access_key_id"], "PRESERVEKEY");
 }
 
+/// Document-level apply must preserve webhook header secrets across a redacted
+/// export → apply round-trip — the same contract as SigV4 above, for the
+/// `event_delivery.webhook_headers` values masked by `redact_all_secrets`.
+/// Without the `preserve_event_delivery_secrets` call in `preserve_runtime_secrets`,
+/// "Export YAML → Import YAML" (or any GitOps round-trip) would persist the
+/// literal sentinel as the bearer token.
+#[tokio::test]
+async fn test_config_apply_preserves_webhook_header_secret_on_redacted_roundtrip() {
+    let server = TestServer::builder()
+        .auth("WHDOCKEY", "WHDOCSECRET")
+        .yaml_config()
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    // Seed a webhook with a secret header via the section API.
+    let put = admin
+        .put(format!(
+            "{}/_/api/admin/config/section/advanced",
+            server.endpoint()
+        ))
+        .json(&json!({
+            "event_delivery": {
+                "enabled": true,
+                "webhook_urls": ["https://hooks.example.com/dg"],
+                "webhook_headers": { "Authorization": "Bearer WEBHOOK-DOC-TOKEN" }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::OK, "seed PUT must succeed");
+
+    // Export the full document — the header value must be redacted.
+    let exported = admin
+        .get(format!("{}/_/api/admin/config/export", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        !exported.contains("WEBHOOK-DOC-TOKEN"),
+        "precondition: export must redact the webhook header secret, got:\n{exported}"
+    );
+    assert!(
+        exported.contains("__redacted__"),
+        "precondition: export should carry the redaction sentinel"
+    );
+
+    // Apply the exported-as-is YAML (the Export→Import round-trip).
+    let resp = admin
+        .post(format!("{}/_/api/admin/config/apply", server.endpoint()))
+        .json(&json!({ "yaml": exported }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert_eq!(status, StatusCode::OK, "apply should succeed, body: {text}");
+
+    // The real token must survive in the persisted config (NOT clobbered with
+    // "__redacted__"). Re-export and confirm the sentinel is still a *mask* over
+    // a real value by checking the persisted YAML on disk holds the real token.
+    let persisted = std::fs::read_to_string(server.config_path()).expect("read persisted config");
+    assert!(
+        persisted.contains("Bearer WEBHOOK-DOC-TOKEN"),
+        "real webhook token must survive document apply, persisted config:\n{persisted}"
+    );
+    assert!(
+        !persisted.contains("__redacted__"),
+        "persisted config must NOT contain the sentinel (it would mean the token was clobbered)"
+    );
+}
+
 // ═══════════════════════════════════════════════════
 // Phase 1 — audit-driven correctness regressions
 // ═══════════════════════════════════════════════════

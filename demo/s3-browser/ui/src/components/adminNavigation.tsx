@@ -15,6 +15,7 @@ import {
   SettingOutlined,
   ThunderboltOutlined,
   SyncOutlined,
+  SendOutlined,
 } from '@ant-design/icons';
 import type { ReactNode } from 'react';
 import type { SectionName } from '../adminApi';
@@ -263,6 +264,15 @@ export const ADMIN_IA: Array<{ group: string; entries: SidebarEntry[] }> = [
             dirtyKey: 'configuration/advanced/sync',
             description:
               'S3 bucket for encrypted IAM/config database HA across proxy instances. This is not object replication.',
+          },
+          {
+            path: 'configuration/advanced/event-delivery',
+            label: 'Webhook delivery',
+            icon: <SendOutlined />,
+            section: 'advanced',
+            dirtyKey: 'configuration/advanced/event-delivery',
+            description:
+              'Deliver durable object events to HTTP webhooks: endpoints, auth headers, retry backoff, retention. Applies live, no restart.',
           },
         ],
       },

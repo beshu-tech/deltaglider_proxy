@@ -397,6 +397,11 @@ async fn apply_section(
         }
     }
 
+    // Webhook header values are masked to REDACTED_SENTINEL on GET; restore any
+    // the operator left untouched so an unedited round-trip doesn't clobber the
+    // real bearer token. (Headers the operator retyped or removed pass through.)
+    super::preserve_event_delivery_secrets(&mut new_cfg.event_delivery, &old_cfg.event_delivery);
+
     // The `removed_warnings` name is preserved here for readability of the
     // downstream call sites that thread it into `SectionApplyResponse`.
     // It now carries the FULL cred-preservation warning bag
