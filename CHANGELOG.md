@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+### Added — event-driven replication
+
+- **Replication now reacts to object mutations in near-real time.** Previously
+  replication was pure-poll: a timer did a full `list + HEAD` diff every tick,
+  scaling with bucket size rather than change rate. Object mutations
+  (PUT / DELETE / COPY / CompleteMultipartUpload) are now appended to the durable
+  `event_outbox` and drained by a per-process consumer that fans each key out to
+  the matching replication rules. The per-rule `interval` is repurposed as a slow
+  (default **24h**) full-reconcile safety net — events are the primary trigger.
+  - Pub/sub via a per-listener cursor over the append-only outbox: webhook
+    delivery and replication keep independent cursors and never contend.
+  - Per-key compaction collapses a burst of events for one key into a single
+    liveness verdict; idempotency stays in one place (the planner + a dest HEAD),
+    shared with reconcile — no new per-key sync table.
+  - At-least-once delivery: the cursor advances only to the highest contiguous
+    fully-handled event id; reconcile backstops the rest.
+  - The webhook pruner clamps its delete floor to the smallest **active** listener
+    cursor, so a stuck or disabled consumer can no longer pin the outbox and let
+    it grow without bound.
+
+### Added — Webhook delivery GUI
+
+- **Webhook (event-delivery) config is now editable from the admin UI** at
+  Configuration → Advanced → Webhook delivery — the last config surface that was
+  YAML/env-only. Enable switch, endpoint list, auth-header editor, retry /
+  retention / batching tuning, and a live delivery-status strip linking to the
+  Event Outbox viewer.
+- **Header secrets are masked and preserved.** Header values are shown masked in
+  the GUI and in every export; leaving a masked value untouched preserves the
+  real token on save (both the section-PUT and the full-document export→apply
+  paths), while a removed header is deleted and a renamed-but-not-retyped secret
+  is blocked rather than silently dropped.
+
+### Fixed — CI
+
+- **Self-hosted runner "Too many open files".** The CI integration job runs ~35
+  test binaries in parallel inside Ryzen LXC runners whose nested dockerd
+  defaulted to a 1024 nofile limit; the aggregate fd count overflowed it. Raised
+  the limit at the dockerd, workflow (`--ulimit`), and test-harness (seed
+  concurrency cap) layers.
+
 ## v1.1.2 — 2026-06-02
 
 ### Fixed — hardening (from an adversarial Rust audit)
