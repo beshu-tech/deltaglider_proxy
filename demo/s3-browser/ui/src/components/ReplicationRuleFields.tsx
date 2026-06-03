@@ -1,7 +1,8 @@
 import { Alert, Input, InputNumber, Radio, Switch, Tag, Typography } from 'antd';
 import type { ReplicationRuleConfig, ReplicationRuleOverview } from '../adminApi';
 import BucketPrefixInput from './BucketPrefixInput';
-import { AdvancedDisclosure, Field } from './ruleEditorFields';
+import FormField from './FormField';
+import { AdvancedDisclosure } from './ruleEditorFields';
 import { fmtUnix, lineList, lines } from './ruleEditorHelpers';
 import { formatBytes } from '../utils';
 import { statusTone } from './replicationStatus';
@@ -43,17 +44,29 @@ export default function ReplicationRuleFields({
       </div>
 
       <div style={{ marginTop: 16, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 14 }}>
-        <Field label="Rule name">
+        <FormField
+          label="Rule name"
+          yamlPath="storage.replication.rules[].name"
+          helpText="Unique identifier for this rule. ASCII letters, digits, dot, dash, underscore; max 64 chars."
+        >
           <Input
             value={rule.name}
             onChange={(e) => onRename(e.target.value.replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 64))}
             style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
           />
-        </Field>
-        <Field label="Enabled">
+        </FormField>
+        <FormField
+          label="Enabled"
+          yamlPath="storage.replication.rules[].enabled"
+          helpText="Per-rule toggle. The global scheduler must also be enabled for this rule to run automatically."
+        >
           <Switch checked={rule.enabled} onChange={(enabled) => onChange({ enabled })} />
-        </Field>
-        <Field label="Source">
+        </FormField>
+        <FormField
+          label="Source"
+          yamlPath="storage.replication.rules[].source"
+          helpText="Bucket and optional prefix to copy objects from."
+        >
           <BucketPrefixInput
             value={rule.source}
             onChange={(source) => onChange({ source })}
@@ -61,8 +74,12 @@ export default function ReplicationRuleFields({
             bucketPlaceholder="prod-artifacts"
             prefixPlaceholder="builds/releases/"
           />
-        </Field>
-        <Field label="Destination">
+        </FormField>
+        <FormField
+          label="Destination"
+          yamlPath="storage.replication.rules[].destination"
+          helpText="Bucket and optional prefix to copy objects into. An empty prefix mirrors the source key path."
+        >
           <BucketPrefixInput
             value={rule.destination}
             onChange={(destination) => onChange({ destination })}
@@ -70,19 +87,27 @@ export default function ReplicationRuleFields({
             bucketPlaceholder="backup-artifacts"
             prefixPlaceholder="mirror/releases/"
           />
-        </Field>
+        </FormField>
       </div>
 
       <AdvancedDisclosure title="Advanced rule behavior">
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 14 }}>
-          <Field label="Interval">
+          <FormField
+            label="Interval"
+            yamlPath="storage.replication.rules[].interval"
+            helpText="How often the scheduler runs this rule. Humantime duration, e.g. 5m, 1h, 24h."
+          >
             <Input
               value={rule.interval}
               onChange={(e) => onChange({ interval: e.target.value })}
               style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
             />
-          </Field>
-          <Field label="Batch size">
+          </FormField>
+          <FormField
+            label="Batch size"
+            yamlPath="storage.replication.rules[].batch_size"
+            helpText="Objects per listing page / copy batch. Larger values copy faster but use more memory. Default 100."
+          >
             <InputNumber
               value={rule.batch_size}
               onChange={(batch_size) => onChange({ batch_size: batch_size || 100 })}
@@ -90,8 +115,12 @@ export default function ReplicationRuleFields({
               max={10000}
               style={{ width: '100%', ...inputRadius }}
             />
-          </Field>
-          <Field label="Conflict policy">
+          </FormField>
+          <FormField
+            label="Conflict policy"
+            yamlPath="storage.replication.rules[].conflict"
+            helpText="How to resolve when the destination object already exists."
+          >
             <Radio.Group
               value={rule.conflict}
               onChange={(e) => onChange({ conflict: e.target.value })}
@@ -101,8 +130,12 @@ export default function ReplicationRuleFields({
               <Radio value="source-wins">Source wins — overwrite destination</Radio>
               <Radio value="skip-if-dest-exists">Skip existing destination objects</Radio>
             </Radio.Group>
-          </Field>
-          <Field label="Delete replication">
+          </FormField>
+          <FormField
+            label="Delete replication"
+            yamlPath="storage.replication.rules[].replicate_deletes"
+            helpText="Propagate source deletions to the destination. Only objects this rule previously wrote are removed."
+          >
             <Switch
               checked={rule.replicate_deletes}
               onChange={(replicate_deletes) => onChange({ replicate_deletes })}
@@ -114,8 +147,12 @@ export default function ReplicationRuleFields({
               description="When enabled, destination objects previously written by this rule are deleted if the corresponding source key disappears. Manually-created destination objects are preserved."
               style={{ marginTop: 8 }}
             />
-          </Field>
-          <Field label="Include globs">
+          </FormField>
+          <FormField
+            label="Include globs"
+            yamlPath="storage.replication.rules[].include_globs"
+            helpText="One glob per line. If non-empty, only matching source keys are replicated. Empty means everything under the source prefix."
+          >
             <Input.TextArea
               value={lines(rule.include_globs)}
               onChange={(e) => onChange({ include_globs: lineList(e.target.value) })}
@@ -123,8 +160,12 @@ export default function ReplicationRuleFields({
               placeholder={'*.zip\nreleases/**'}
               style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
             />
-          </Field>
-          <Field label="Exclude globs">
+          </FormField>
+          <FormField
+            label="Exclude globs"
+            yamlPath="storage.replication.rules[].exclude_globs"
+            helpText="One glob per line. Source keys matching any pattern are skipped."
+          >
             <Input.TextArea
               value={lines(rule.exclude_globs)}
               onChange={(e) => onChange({ exclude_globs: lineList(e.target.value) })}
@@ -132,7 +173,7 @@ export default function ReplicationRuleFields({
               placeholder=".dg/*"
               style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
             />
-          </Field>
+          </FormField>
         </div>
       </AdvancedDisclosure>
 

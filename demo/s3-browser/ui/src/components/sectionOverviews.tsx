@@ -20,11 +20,12 @@
  *   * `whoami()` is NOT used — auth mode lives on the AdminConfig
  *     response as `auth_enabled`.
  */
-import { useEffect, useState } from 'react';
+import { useEffect } from 'react';
 import { TeamOutlined, CloudServerOutlined, SettingOutlined } from '@ant-design/icons';
-import type { ExternalProviderInfo } from '../adminApi';
-import { whoami, getUsers, getGroups } from '../adminApi';
 import { useAdminConfig } from '../queries/config';
+import { useUsers } from '../queries/users';
+import { useGroups } from '../queries/groups';
+import { useWhoami } from '../queries/whoami';
 import SectionOverview from './SectionOverview';
 import type { OverviewCard, OverviewStat } from './SectionOverview';
 import { childrenForPath } from './adminNavigation';
@@ -82,39 +83,19 @@ function useOverviewConfig(onSessionExpired?: () => void) {
 
 export function AccessOverview({ onNavigateAdmin, onSessionExpired }: OverviewProps) {
   const { config, error } = useOverviewConfig(onSessionExpired);
-  // Users / groups / providers counts live outside AdminConfig —
-  // fetch them in parallel. We tolerate errors here: if the IAM DB
-  // is empty or the IAM mode is declarative and the lister returns
-  // 403, we fall back to "—".
-  const [userCount, setUserCount] = useState<number | null>(null);
-  const [groupCount, setGroupCount] = useState<number | null>(null);
-  const [providerCount, setProviderCount] = useState<number | null>(null);
+  // Users / groups / providers counts live outside AdminConfig — read them from
+  // the shared query cache instead of a bespoke Promise.all + setState effect.
+  // The lists tolerate errors (IAM DB empty, or declarative-mode 403) by
+  // falling back to "—" (null) while loading or on error.
+  const usersQuery = useUsers();
+  const groupsQuery = useGroups();
+  const whoamiQuery = useWhoami();
 
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const [users, groups, who] = await Promise.all([
-          getUsers().catch(() => [] as unknown as Array<unknown>),
-          getGroups().catch(() => [] as unknown as Array<unknown>),
-          whoami().catch(() => null),
-        ]);
-        if (cancelled) return;
-        setUserCount(Array.isArray(users) ? users.length : null);
-        setGroupCount(Array.isArray(groups) ? groups.length : null);
-        setProviderCount(
-          who?.external_providers
-            ? (who.external_providers as ExternalProviderInfo[]).length
-            : 0
-        );
-      } catch {
-        /* leave counters null */
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  const userCount = usersQuery.data ? usersQuery.data.length : null;
+  const groupCount = groupsQuery.data ? groupsQuery.data.length : null;
+  const providerCount = whoamiQuery.data
+    ? whoamiQuery.data.external_providers?.length ?? 0
+    : null;
 
   if (error) {
     return <Alert type="error" showIcon message="Failed to load" description={error} />;

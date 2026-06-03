@@ -1,11 +1,12 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { qk } from '../queries/keys';
 import { Button, Input, Radio, Switch, Typography, Space, Alert, Spin } from 'antd';
 import { PlusOutlined, DeleteOutlined, DatabaseOutlined, CloudOutlined, CheckCircleOutlined, ApiOutlined, FolderOutlined } from '@ant-design/icons';
 import type { BackendInfo, CreateBackendRequest } from '../adminApi';
-import { getBackends, createBackend, deleteBackend, testS3Connection, updateAdminConfig, putSection } from '../adminApi';
+import { createBackend, deleteBackend, testS3Connection, updateAdminConfig, putSection } from '../adminApi';
 import { useAdminConfig } from '../queries/config';
+import { useBackends } from '../queries/backends';
 import { useColors } from '../ThemeContext';
 import { useNavigation } from '../NavigationContext';
 import { useCardStyles } from './shared-styles';
@@ -29,13 +30,25 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
   const qc = useQueryClient();
   const { navigate } = useNavigation();
 
-  const [backends, setBackends] = useState<BackendInfo[]>([]);
-  const [defaultBackend, setDefaultBackend] = useState<string | null>(null);
-  // Config is read from the shared cache; mutations below invalidate
-  // `qk.config()` (via refresh()) so this stays fresh for all readers.
+  // Backends + config are read from the shared cache; mutations below invalidate
+  // `qk.backends.list()` + `qk.config()` (via refresh()) so all readers refresh.
+  const backendsQuery = useBackends();
+  const backends = backendsQuery.data?.backends ?? [];
+  const defaultBackend = backendsQuery.data?.default_backend ?? null;
   const { data: config } = useAdminConfig();
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const loading = backendsQuery.isLoading;
+  // Surface a load error (401 bubbles to the session-expired handler; anything
+  // else renders in the Alert below).
+  const loadError = backendsQuery.error;
+  if (loadError && loadError instanceof Error && loadError.message.includes('401')) {
+    onSessionExpired?.();
+  }
+  const error =
+    loadError && !(loadError instanceof Error && loadError.message.includes('401'))
+      ? loadError instanceof Error
+        ? loadError.message
+        : 'Failed to load'
+      : null;
 
   // New backend form
   const [showForm, setShowForm] = useState(false);
@@ -54,30 +67,16 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
   const [testingBackend, setTestingBackend] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<{ name: string; ok: boolean; message: string } | null>(null);
 
+  // After a mutation, invalidate the shared cache so any panel reading
+  // backends/config (this panel's own `useBackends()` + `useAdminConfig()`,
+  // CredentialsModePanel, BucketsPanel, …) refetches the freshly-saved state.
+  // The list READ itself is now `useBackends()` — no manual setState.
   const refresh = async () => {
-    try {
-      const data = await getBackends();
-      setBackends(data.backends);
-      setDefaultBackend(data.default_backend);
-      setError(null);
-      // Invalidate the shared cache so any panel reading backends/config
-      // (this panel's own `useAdminConfig()`, CredentialsModePanel,
-      // BucketsPanel, …) refetches the freshly-saved state.
-      qc.invalidateQueries({ queryKey: qk.backends.list() });
-      qc.invalidateQueries({ queryKey: qk.config() });
-    } catch (e) {
-      if (e instanceof Error && e.message.includes('401')) {
-        onSessionExpired?.();
-        return;
-      }
-      setError(e instanceof Error ? e.message : 'Failed to load');
-    } finally {
-      setLoading(false);
-    }
+    await Promise.all([
+      qc.invalidateQueries({ queryKey: qk.backends.list() }),
+      qc.invalidateQueries({ queryKey: qk.config() }),
+    ]);
   };
-
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => { refresh(); }, []);
 
   const handleCreate = async () => {
     setSaving(true);

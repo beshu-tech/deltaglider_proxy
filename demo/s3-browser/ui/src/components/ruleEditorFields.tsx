@@ -1,26 +1,16 @@
 import type { ReactNode } from 'react';
-import { Typography } from 'antd';
 import { useColors } from '../ThemeContext';
-
-const { Text } = Typography;
 
 /**
  * Shared React primitives for the storage sub-panels (Lifecycle / Replication /
  * Buckets). Pure helpers (lineList / lines / fmtUnix / formRow) live in the
  * sibling `ruleEditorHelpers.ts`.
+ *
+ * The old bespoke `Field` labelled-wrapper was retired in favour of the
+ * canonical `FormField` (label + YAML-path chip + help text + override bar) so
+ * storage rule forms match every other admin form and always carry summonable
+ * help.
  */
-
-/** Labelled field wrapper: 11px uppercase secondary label above its children. */
-export function Field({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <label style={{ display: 'block' }}>
-      <Text type="secondary" style={{ display: 'block', fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6 }}>
-        {label}
-      </Text>
-      {children}
-    </label>
-  );
-}
 
 /** Collapsible HTML5 `<details>` block with an uppercase summary header. */
 export function AdvancedDisclosure({ title, children }: { title: string; children: ReactNode }) {

@@ -2,10 +2,10 @@ import { useState } from 'react';
 import { Button, Typography } from 'antd';
 import { PlusOutlined, TeamOutlined, DeleteOutlined, CopyOutlined } from '@ant-design/icons';
 import { useQueryClient } from '@tanstack/react-query';
-import { cloneUser } from '../adminApi';
+import { getUsers } from '../adminApi';
 import type { IamUser } from '../adminApi';
 import { useColors } from '../ThemeContext';
-import { useUsers, useDeleteUser } from '../queries/users';
+import { useUsers, useDeleteUser, useCloneUser } from '../queries/users';
 import { useAdminConfig } from '../queries/config';
 import { qk } from '../queries/keys';
 import { userPermissionSummary, filterItems } from '../masterDetailFilter';
@@ -52,6 +52,7 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
   }
 
   const deleteMutation = useDeleteUser();
+  const cloneMutation = useCloneUser();
 
   const selectedUser = users.find(u => u.id === selectedId) ?? null;
   const filtered = filterItems(users, search, u => [u.name, u.access_key_id]);
@@ -74,7 +75,7 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
 
   const handleCreated = async (ak: string, sk: string) => {
     // Refetch synchronously to capture the new user's ID, then select it.
-    const result = await qc.fetchQuery({ queryKey: qk.users.list(), queryFn: () => import('../adminApi').then(m => m.getUsers()) });
+    const result = await qc.fetchQuery({ queryKey: qk.users.list(), queryFn: getUsers });
     const newUser = result.find(u => u.access_key_id === ak);
     if (newUser) setSelectedId(newUser.id);
     setCreating(false);
@@ -85,8 +86,8 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
     onSavingChange?.(true);
     setNewCreds(null);
     try {
-      const cloned = await cloneUser(user.id, { copy_group_memberships: true });
-      await qc.invalidateQueries({ queryKey: qk.users.list() });
+      // Clone via the mutation hook — it invalidates qk.users.list() on success.
+      const cloned = await cloneMutation.mutateAsync({ id: user.id, copyGroupMemberships: true });
       setCreating(false);
       setSelectedId(cloned.id);
       setNewCreds({ ak: cloned.access_key_id, sk: cloned.secret_access_key ?? '' });

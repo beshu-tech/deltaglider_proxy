@@ -5,7 +5,6 @@ import {
   Input,
   InputNumber,
   Modal,
-  Space,
   Switch,
   Tag,
   Typography,
@@ -38,7 +37,9 @@ import { useApplyHandler } from '../useDirtySection';
 import { useSectionEditor } from '../useSectionEditor';
 import { formatBytes } from '../utils';
 import ApplyDialog from './ApplyDialog';
-import { AdvancedDisclosure, Field } from './ruleEditorFields';
+import FormField from './FormField';
+import StickyDirtyBar from './StickyDirtyBar';
+import { AdvancedDisclosure } from './ruleEditorFields';
 import { formRow } from './ruleEditorHelpers';
 import RuleListEditor, { RuleRowLine, RuleRowTitle } from './RuleListEditor';
 import SectionHeader from './SectionHeader';
@@ -346,22 +347,6 @@ export default function LifecyclePanel({ onSessionExpired }: Props) {
 
   return (
     <div style={{ maxWidth: 1120, margin: '0 auto', padding: 'clamp(16px, 3vw, 24px)' }}>
-      {isDirty && (
-        <Alert
-          type="warning"
-          showIcon
-          message="Unsaved lifecycle config"
-          description="Lifecycle rules are YAML-backed storage config. Review the diff before enabling object deletion."
-          style={{ marginBottom: 16 }}
-          action={
-            <Space>
-              <Button size="small" onClick={discard} disabled={applying}>Discard</Button>
-              <Button size="small" type="primary" onClick={runApply} loading={applying}>Review apply</Button>
-            </Space>
-          }
-        />
-      )}
-
       <div style={{ ...cardStyle, marginBottom: 16 }}>
         <SectionHeader
           icon={<ClockCircleOutlined />}
@@ -376,23 +361,25 @@ export default function LifecyclePanel({ onSessionExpired }: Props) {
           <Text type="secondary" style={{ fontSize: 12 }}>
             Disabled by default. Current tick: <Text code>{lifecycle.tick_interval}</Text>.
           </Text>
-          <Button type="primary" onClick={runApply} disabled={!isDirty} loading={applying}>
-            Review apply
-          </Button>
         </div>
         <AdvancedDisclosure title="Advanced scheduler defaults">
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
-            <Field label="Scheduler tick">
+            <FormField
+              label="Scheduler tick"
+              yamlPath="storage.lifecycle.tick_interval"
+              helpText="How often the scheduler wakes to check for due rules. Humantime duration; default 1h. The backend warns below 60s."
+            >
               <Input
                 value={lifecycle.tick_interval}
                 onChange={(e) => updateConfig({ tick_interval: e.target.value })}
                 style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
               />
-              <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 4 }}>
-                Default: <Text code>1h</Text>. Backend warns below 60s.
-              </Text>
-            </Field>
-            <Field label="Failures retained">
+            </FormField>
+            <FormField
+              label="Failures retained"
+              yamlPath="storage.lifecycle.max_failures_retained"
+              helpText="Per-run cap on returned failure entries. Also caps preview candidates returned by the API. Default 100."
+            >
               <InputNumber
                 value={lifecycle.max_failures_retained}
                 onChange={(v) => updateConfig({ max_failures_retained: Number(v) || 100 })}
@@ -400,10 +387,7 @@ export default function LifecyclePanel({ onSessionExpired }: Props) {
                 max={10000}
                 style={{ width: '100%', ...inputRadius }}
               />
-              <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 4 }}>
-                Also caps preview candidates returned by the API. Default: <Text code>100</Text>.
-              </Text>
-            </Field>
+            </FormField>
           </div>
         </AdvancedDisclosure>
       </div>
@@ -490,6 +474,14 @@ export default function LifecyclePanel({ onSessionExpired }: Props) {
             <RuntimeDetails history={history} failures={failures} runtimeError={runtimeError} />
           </>
         )}
+      />
+
+      <StickyDirtyBar
+        visible={isDirty}
+        applying={applying}
+        onDiscard={discard}
+        onApply={runApply}
+        floating
       />
 
       <ApplyDialog

@@ -24,7 +24,7 @@
  *   4. Discard: revert the dirty state to the last-applied snapshot.
  */
 import { useRef, useState } from 'react';
-import { Button, Alert, Typography, Space, Modal } from 'antd';
+import { Button, Typography, Modal } from 'antd';
 import {
   PlusOutlined,
   InfoCircleOutlined,
@@ -38,6 +38,7 @@ import AdmissionBlockList from './AdmissionBlockList';
 import AdmissionBlockEditorModal from './AdmissionBlockEditorModal';
 import SynthesizedBlocksPreview from './SynthesizedBlocksPreview';
 import ApplyDialog from './ApplyDialog';
+import StickyDirtyBar from './StickyDirtyBar';
 
 const { Text } = Typography;
 
@@ -173,32 +174,6 @@ export default function AdmissionPanel({
         gap: 16,
       }}
     >
-      {/* Dirty-state banner with Apply / Discard */}
-      {isDirty && (
-        <Alert
-          type="warning"
-          showIcon
-          message="Unsaved changes to this section"
-          description="Review the diff in the Apply dialog before persisting."
-          action={
-            <Space>
-              <Button size="small" onClick={discard} disabled={applying}>
-                Discard
-              </Button>
-              <Button
-                type="primary"
-                size="small"
-                onClick={runApply}
-                disabled={applying}
-                loading={applying}
-              >
-                Apply
-              </Button>
-            </Space>
-          }
-        />
-      )}
-
       {/* Operator-authored blocks */}
       <section>
         <header
@@ -271,6 +246,14 @@ export default function AdmissionPanel({
         otherNames={otherNames}
         onCancel={closeEditor}
         onSave={handleSave}
+      />
+
+      <StickyDirtyBar
+        visible={isDirty}
+        applying={applying}
+        onDiscard={discard}
+        onApply={runApply}
+        floating
       />
 
       {/* Apply confirmation dialog */}

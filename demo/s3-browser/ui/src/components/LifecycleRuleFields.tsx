@@ -4,7 +4,8 @@ import type {
   LifecycleRuleOverview,
 } from '../adminApi';
 import BucketPrefixInput from './BucketPrefixInput';
-import { AdvancedDisclosure, Field } from './ruleEditorFields';
+import FormField from './FormField';
+import { AdvancedDisclosure } from './ruleEditorFields';
 import { fmtUnix, lineList, lines } from './ruleEditorHelpers';
 import SimpleSelect from './SimpleSelect';
 import { actionKind } from './lifecyclePayload';
@@ -69,20 +70,29 @@ export default function RuleEditor({
       />
 
       <div style={{ marginTop: 16, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 14 }}>
-        <Field label="Rule name">
+        <FormField
+          label="Rule name"
+          yamlPath="storage.lifecycle.rules[].name"
+          helpText="Unique identifier for this rule. ASCII letters, digits, dot, dash, underscore; max 64 chars."
+        >
           <Input
             value={rule.name}
             onChange={(e) => onRename(e.target.value.replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 64))}
             style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
           />
-        </Field>
-        <Field label="Enabled">
+        </FormField>
+        <FormField
+          label="Enabled"
+          yamlPath="storage.lifecycle.rules[].enabled"
+          helpText="Per-rule delete switch. The global scheduler must also be enabled for this rule to run automatically."
+        >
           <Switch checked={rule.enabled} onChange={(enabled) => onChange({ enabled })} />
-          <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 4 }}>
-            Per-rule delete switch. Global scheduler must also be enabled.
-          </Text>
-        </Field>
-        <Field label="Scope">
+        </FormField>
+        <FormField
+          label="Scope"
+          yamlPath="storage.lifecycle.rules[].bucket"
+          helpText="Bucket and optional prefix to scan for expired objects. An empty prefix scans the whole bucket."
+        >
           <BucketPrefixInput
             value={{ bucket: rule.bucket, prefix: rule.prefix }}
             onChange={(scope) => onChange({ bucket: scope.bucket, prefix: scope.prefix })}
@@ -90,19 +100,24 @@ export default function RuleEditor({
             bucketPlaceholder="prod-artifacts"
             prefixPlaceholder="builds/releases/"
           />
-        </Field>
-        <Field label="Expire after">
+        </FormField>
+        <FormField
+          label="Expire after"
+          yamlPath="storage.lifecycle.rules[].expire_after"
+          helpText="Objects whose created_at is older than this age become candidates. Humantime duration, e.g. 30d, 12h, 90d."
+        >
           <Input
             value={rule.expire_after}
             onChange={(e) => onChange({ expire_after: e.target.value })}
             placeholder="30d"
             style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
           />
-          <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 4 }}>
-            Humantime duration, e.g. <Text code>30d</Text>, <Text code>12h</Text>, <Text code>90d</Text>.
-          </Text>
-        </Field>
-        <Field label="Action">
+        </FormField>
+        <FormField
+          label="Action"
+          yamlPath="storage.lifecycle.rules[].action"
+          helpText="What to do with expired candidates: delete them, or archive/move them through the engine to another bucket."
+        >
           <SimpleSelect
             value={actionKind(rule.action)}
             onChange={(value) => {
@@ -124,12 +139,16 @@ export default function RuleEditor({
             ]}
             style={{ width: '100%', ...inputRadius }}
           />
-        </Field>
+        </FormField>
       </div>
 
       {transitionAction && (
         <div style={{ marginTop: 14, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 14 }}>
-          <Field label="Destination">
+          <FormField
+            label="Destination"
+            yamlPath="storage.lifecycle.rules[].action.destination"
+            helpText="Bucket and prefix that archived objects are copied into."
+          >
             <BucketPrefixInput
               value={{
                 bucket: transitionAction.destination?.bucket || '',
@@ -140,22 +159,27 @@ export default function RuleEditor({
               bucketPlaceholder="archive-artifacts"
               prefixPlaceholder="archive/releases/"
             />
-          </Field>
-          <Field label="Delete source after copy">
+          </FormField>
+          <FormField
+            label="Delete source after copy"
+            yamlPath="storage.lifecycle.rules[].action.delete_source_after_success"
+            helpText="Off archives by copying only. On makes it a move — the source is deleted, but only after the destination copy verifies."
+          >
             <Switch
               checked={Boolean(transitionAction.delete_source_after_success)}
               onChange={(checked) => updateTransition({ delete_source_after_success: checked })}
             />
-            <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 4 }}>
-              Off archives by copying only. On makes it a move, but source delete only happens after verified copy success.
-            </Text>
-          </Field>
+          </FormField>
         </div>
       )}
 
       <AdvancedDisclosure title="Filters and batch size">
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 14 }}>
-          <Field label="Include globs">
+          <FormField
+            label="Include globs"
+            yamlPath="storage.lifecycle.rules[].include_globs"
+            helpText="One glob per line. If non-empty, only matching keys are candidates. Empty means every key under the prefix."
+          >
             <Input.TextArea
               value={lines(rule.include_globs)}
               onChange={(e) => onChange({ include_globs: lineList(e.target.value) })}
@@ -163,11 +187,12 @@ export default function RuleEditor({
               placeholder={'*.zip\nreleases/**'}
               style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
             />
-            <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 4 }}>
-              Empty means include every key under the prefix.
-            </Text>
-          </Field>
-          <Field label="Exclude globs">
+          </FormField>
+          <FormField
+            label="Exclude globs"
+            yamlPath="storage.lifecycle.rules[].exclude_globs"
+            helpText="One glob per line. Keys matching any pattern are skipped. Defaults protect DeltaGlider's config-sync prefix."
+          >
             <Input.TextArea
               value={lines(rule.exclude_globs)}
               onChange={(e) => onChange({ exclude_globs: lineList(e.target.value) })}
@@ -175,8 +200,12 @@ export default function RuleEditor({
               placeholder=".deltaglider/**"
               style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
             />
-          </Field>
-          <Field label="Batch size">
+          </FormField>
+          <FormField
+            label="Batch size"
+            yamlPath="storage.lifecycle.rules[].batch_size"
+            helpText="Objects per listing page / worker batch. Default 100."
+          >
             <InputNumber
               value={rule.batch_size}
               onChange={(batch_size) => onChange({ batch_size: Number(batch_size) || 100 })}
@@ -184,10 +213,7 @@ export default function RuleEditor({
               max={10000}
               style={{ width: '100%', ...inputRadius }}
             />
-            <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 4 }}>
-              Worker/listing page size. Default: <Text code>100</Text>.
-            </Text>
-          </Field>
+          </FormField>
         </div>
       </AdvancedDisclosure>
     </div>

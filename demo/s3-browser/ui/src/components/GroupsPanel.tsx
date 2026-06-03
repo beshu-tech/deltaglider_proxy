@@ -1,14 +1,15 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect } from 'react';
 import { Button, Typography, Alert, Input, Divider, Checkbox } from 'antd';
 import { PlusOutlined, FolderOutlined, DeleteOutlined, CopyOutlined } from '@ant-design/icons';
 import type { IamGroup, IamUser } from '../adminApi';
-import { getGroups, createGroup, updateGroup, deleteGroup, addGroupMember, removeGroupMember, getUsers, cloneGroup } from '../adminApi';
 import { useAdminConfig } from '../queries/config';
+import { useGroups, useCreateGroup, useUpdateGroup, useDeleteGroup, useCloneGroup, useAddGroupMember, useRemoveGroupMember } from '../queries/groups';
+import { useUsers } from '../queries/users';
 import { useCardStyles } from './shared-styles';
 import FormLabel from './FormLabel';
 import { useColors } from '../ThemeContext';
 import PermissionEditor from './PermissionEditor';
-import { permissionsToRows, rowsToPermissions, type PermissionRow } from './permissionRows';
+import { permissionsToRows, rowsToPermissions, freshPermissionRowId, type PermissionRow } from './permissionRows';
 import { groupPermissionSummary, filterItems } from '../masterDetailFilter';
 import MasterDetailPanel from './MasterDetailPanel';
 import IamSourceBanner from './IamSourceBanner';
@@ -24,10 +25,6 @@ interface GroupsPanelProps {
 
 export default function GroupsPanel({ onSessionExpired, onSavingChange, initialGroupId, onGroupSelected }: GroupsPanelProps) {
   const colors = useColors();
-  const [groups, setGroups] = useState<IamGroup[]>([]);
-  const [users, setUsers] = useState<IamUser[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
   const [selectedId, setSelectedId] = useState<number | null>(initialGroupId ?? null);
   const [creating, setCreating] = useState(false);
   const [search, setSearch] = useState('');
@@ -36,24 +33,21 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
   const { data: cfg } = useAdminConfig();
   const iamMode = cfg?.iam_mode;
 
-  const loadData = useCallback(async () => {
-    setLoading(true);
-    setError('');
-    try {
-      const [g, u] = await Promise.all([getGroups(), getUsers()]);
-      setGroups(g);
-      setUsers(u);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : 'Failed to load data';
-      if (msg.includes('401')) onSessionExpired?.();
-      else setError(msg);
-    } finally {
-      setLoading(false);
-    }
-  }, [onSessionExpired]);
+  // Groups + users are read from the shared query cache; the form's mutations
+  // (create/update/delete/clone + membership add/remove) invalidate these keys
+  // on success, so there's no manual loadData()-after-every-mutation reload.
+  const groupsQuery = useGroups();
+  const usersQuery = useUsers();
+  const groups = groupsQuery.data ?? [];
+  const users = usersQuery.data ?? [];
+  const loading = groupsQuery.isLoading || usersQuery.isLoading;
+  const rawError = groupsQuery.error ?? usersQuery.error;
+  const error = rawError ? (rawError instanceof Error ? rawError.message : 'Failed to load data') : '';
 
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => { loadData(); }, []);  // Load once on mount; mutations call loadData() explicitly
+  // Bubble a 401 up so the login screen can take over (was the loadData catch).
+  if (rawError && rawError instanceof Error && rawError.message.includes('401')) {
+    onSessionExpired?.();
+  }
 
   // Navigate to a specific group when coming from UserForm
   useEffect(() => {
@@ -63,6 +57,11 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
       onGroupSelected?.();
     }
   }, [initialGroupId, groups.length, onGroupSelected]);
+
+  // Mutations used directly by the panel (the form gets its own). Each
+  // invalidates qk.groups.list() (+ users) so the list refreshes automatically.
+  const cloneMutation = useCloneGroup();
+  const deleteMutation = useDeleteGroup();
 
   const selectedGroup = groups.find(g => g.id === selectedId) ?? null;
   const filtered = filterItems(groups, search, g => [g.name]);
@@ -85,8 +84,9 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
    * Edit view for the thing they just made. That pattern matches the
    * UsersPanel post-create flow.
    */
+  // Mutations invalidate qk.groups.list() on success, so the list refetches
+  // automatically — these handlers only manage local selection state.
   const handleSaved = (createdId?: number) => {
-    loadData();
     if (creating) {
       setCreating(false);
       if (createdId !== undefined) setSelectedId(createdId);
@@ -96,7 +96,6 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
   const handleDeleted = () => {
     setSelectedId(null);
     setCreating(false);
-    loadData();
   };
 
   const handleClone = async (group: IamGroup) => {
@@ -105,13 +104,11 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
       : false;
     onSavingChange?.(true);
     try {
-      const cloned = await cloneGroup(group.id, { copy_members: copyMembers });
+      const cloned = await cloneMutation.mutateAsync({ id: group.id, copyMembers });
       setCreating(false);
       setSelectedId(cloned.id);
-      await loadData();
     } catch (err) {
       console.error('Duplicate group failed:', err);
-      setError(err instanceof Error ? err.message : 'Duplicate group failed');
     } finally {
       onSavingChange?.(false);
     }
@@ -205,15 +202,13 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
               danger
               size="small"
               icon={<DeleteOutlined />}
-              onClick={async (e) => {
+              onClick={(e) => {
                 e.stopPropagation();
                 if (!window.confirm(`Delete group "${group.name}"? This cannot be undone.`)) return;
-                try {
-                  await deleteGroup(group.id);
-                  handleDeleted();
-                } catch (err) {
-                  console.error('Delete group failed:', err);
-                }
+                deleteMutation.mutate(group.id, {
+                  onSuccess: handleDeleted,
+                  onError: (err) => console.error('Delete group failed:', err),
+                });
               }}
               style={{ opacity: 0.5, padding: '2px 4px', minWidth: 0 }}
               onMouseEnter={e => { e.currentTarget.style.opacity = '1'; }}
@@ -251,6 +246,14 @@ function GroupForm({ group, users, onSaved, onDeleted, onCancel, onSavingChange 
   const isEdit = group !== null;
   const { inputRadius } = useCardStyles();
 
+  // Mutations close the cache loop: each invalidates qk.groups.list() (+ users)
+  // on success, so the panel list refreshes without a manual reload callback.
+  const createGroupMutation = useCreateGroup();
+  const updateGroupMutation = useUpdateGroup();
+  const deleteGroupMutation = useDeleteGroup();
+  const addMemberMutation = useAddGroupMember();
+  const removeMemberMutation = useRemoveGroupMember();
+
   // Initialize from `group` once. The edit form is remounted with
   // `key={selectedGroup.id}` (see render site), and the create form mounts
   // fresh — so a keyed remount resets all state from these initializers. No
@@ -258,7 +261,10 @@ function GroupForm({ group, users, onSaved, onDeleted, onCancel, onSavingChange 
   const [name, setName] = useState(() => group?.name ?? '');
   const [description, setDescription] = useState(() => group?.description ?? '');
   const [permissions, setPermissions] = useState<PermissionRow[]>(() =>
-    group ? permissionsToRows(group.permissions) : [{ effect: 'Allow', actions: [], resources: '' }],
+    // Seed the initial empty row WITH a `_uiId` so PermissionEditor receives an
+    // id-bearing row and its adoption effect no-ops (match the fresh-row shape
+    // its Add button emits).
+    group ? permissionsToRows(group.permissions) : [{ _uiId: freshPermissionRowId(), effect: 'Allow', actions: [], resources: '' }],
   );
   const [memberIds, setMemberIds] = useState<Set<number>>(
     () => new Set(group?.member_ids ?? []),
@@ -276,33 +282,36 @@ function GroupForm({ group, users, onSaved, onDeleted, onCancel, onSavingChange 
     setError('');
     try {
       if (isEdit) {
-        await updateGroup(group.id, {
-          name: name.trim(),
-          description: description.trim(),
-          permissions: rowsToPermissions(permissions),
+        await updateGroupMutation.mutateAsync({
+          id: group.id,
+          patch: {
+            name: name.trim(),
+            description: description.trim(),
+            permissions: rowsToPermissions(permissions),
+          },
         });
 
         // Sync membership: add/remove as needed
         const currentMembers = new Set(group.member_ids);
         for (const uid of memberIds) {
           if (!currentMembers.has(uid)) {
-            await addGroupMember(group.id, uid);
+            await addMemberMutation.mutateAsync({ groupId: group.id, userId: uid });
           }
         }
         for (const uid of currentMembers) {
           if (!memberIds.has(uid)) {
-            await removeGroupMember(group.id, uid);
+            await removeMemberMutation.mutateAsync({ groupId: group.id, userId: uid });
           }
         }
       } else {
-        const created = await createGroup({
+        const created = await createGroupMutation.mutateAsync({
           name: name.trim(),
           description: description.trim(),
           permissions: rowsToPermissions(permissions),
         });
         // Add members to newly created group
         for (const uid of memberIds) {
-          await addGroupMember(created.id, uid);
+          await addMemberMutation.mutateAsync({ groupId: created.id, userId: uid });
         }
         onSaved(created.id);
         return;
@@ -319,7 +328,7 @@ function GroupForm({ group, users, onSaved, onDeleted, onCancel, onSavingChange 
     if (!group || deleting) return;
     setDeleting(true);
     try {
-      await deleteGroup(group.id);
+      await deleteGroupMutation.mutateAsync(group.id);
       onDeleted?.();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Delete failed');

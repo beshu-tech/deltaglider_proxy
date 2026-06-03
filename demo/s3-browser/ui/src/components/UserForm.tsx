@@ -1,8 +1,10 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { Input, Switch, Button, Alert, Space, Divider, Typography, Tag } from 'antd';
 import { ThunderboltOutlined, CheckCircleFilled, MinusCircleFilled, CrownFilled } from '@ant-design/icons';
-import type { IamUser, IamGroup, CreateUserRequest, UpdateUserRequest, CannedPolicy } from '../adminApi';
-import { createUser, updateUser, deleteUser, rotateUserKeys, getCannedPolicies, getGroups } from '../adminApi';
+import type { IamUser, CreateUserRequest, UpdateUserRequest } from '../adminApi';
+import { useCreateUser, useUpdateUser, useDeleteUser, useRotateUserKeys } from '../queries/users';
+import { useCannedPolicies } from '../queries/cannedPolicies';
+import { useGroups } from '../queries/groups';
 import { setCredentials, getCredentials } from '../s3client';
 import { useCardStyles } from './shared-styles';
 import FormLabel from './FormLabel';
@@ -56,18 +58,21 @@ export default function UserForm({ user, onSaved, onDeleted, onCancel, onCreated
   const [deleting, setDeletingState] = useState(false);
   const [error, setError] = useState('');
   const [savedCredentials, setSavedCredentials] = useState<{ ak: string; sk: string } | null>(null);
-  const [cannedPolicies, setCannedPolicies] = useState<CannedPolicy[]>([]);
-  const [userGroups, setUserGroups] = useState<IamGroup[]>([]);
+
+  // Presets + groups are read from the shared query cache (no per-mount fetch
+  // effect). `?? []` keeps the render paths below identical to the old state.
+  const cannedPolicies = useCannedPolicies().data ?? [];
+  const userGroups = useGroups().data ?? [];
+
+  // Mutations close the cache loop: each invalidates qk.users.list() on success
+  // so the panel list refreshes without a manual reload callback.
+  const createUserMutation = useCreateUser();
+  const updateUserMutation = useUpdateUser();
+  const deleteUserMutation = useDeleteUser();
+  const rotateKeysMutation = useRotateUserKeys();
 
   const setSaving = (v: boolean) => { setSavingState(v); onSavingChange?.(v); };
   const setDeleting = (v: boolean) => { setDeletingState(v); onSavingChange?.(v); };
-
-  useEffect(() => {
-    getCannedPolicies().then(policies => {
-      if (policies.length > 0) setCannedPolicies(policies);
-    });
-    getGroups().then(groups => setUserGroups(groups)).catch(() => {});
-  }, []);
 
 
   const handleSave = async () => {
@@ -82,16 +87,16 @@ export default function UserForm({ user, onSaved, onDeleted, onCancel, onCreated
           enabled,
           permissions: rowsToPermissions(permissions),
         };
-        await updateUser(user.id, req);
+        await updateUserMutation.mutateAsync({ id: user.id, patch: req });
 
         const akChanged = accessKeyId.trim() && accessKeyId.trim() !== user.access_key_id;
         const skChanged = secretKey.trim().length > 0;
         if (akChanged || skChanged) {
-          const rotated = await rotateUserKeys(
-            user.id,
-            accessKeyId.trim() || user.access_key_id,
-            skChanged ? secretKey.trim() : undefined,
-          );
+          const rotated = await rotateKeysMutation.mutateAsync({
+            id: user.id,
+            accessKeyId: accessKeyId.trim() || user.access_key_id,
+            secretAccessKey: skChanged ? secretKey.trim() : undefined,
+          });
           const browserAk = getCredentials().accessKeyId;
           // Compare against both old AK and new AK to avoid self-lockout when user changes their own AK
           if ((browserAk === user.access_key_id || browserAk === accessKeyId.trim()) && rotated.secret_access_key) {
@@ -108,7 +113,7 @@ export default function UserForm({ user, onSaved, onDeleted, onCancel, onCreated
           ...(accessKeyId.trim() ? { access_key_id: accessKeyId.trim() } : {}),
           ...(secretKey.trim() ? { secret_access_key: secretKey.trim() } : {}),
         };
-        const created = await createUser(req);
+        const created = await createUserMutation.mutateAsync(req);
         onSaved();
         onCreated?.(created.access_key_id, created.secret_access_key ?? '');
       }
@@ -123,7 +128,7 @@ export default function UserForm({ user, onSaved, onDeleted, onCancel, onCreated
     if (!user || deleting) return;
     setDeleting(true);
     try {
-      await deleteUser(user.id);
+      await deleteUserMutation.mutateAsync(user.id);
       onDeleted?.();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Delete failed');

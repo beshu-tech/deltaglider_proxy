@@ -8,7 +8,7 @@ import { summarizeObjectSavings } from '../savings';
 import type { S3Object } from '../types';
 import { useColors } from '../ThemeContext';
 import { getPreviewMode } from './filePreviewMode';
-import { getAdminConfig } from '../adminApi';
+import { useAdminConfig } from '../queries/config';
 import { useOnClickOutside } from '../useDocumentEvent';
 
 const SHARE_DURATIONS = [
@@ -240,9 +240,6 @@ export default function InspectorPanel({
   >(null);
   const blobRef = useRef<{ blob: Blob; name: string } | null>(null);
   const [shareDuration, setShareDuration] = useState<number | null>(null);
-  const [bucketPolicy, setBucketPolicy] = useState<BucketPolicyInfo | null>(null);
-  /** True until policy for the active bucket is fetched (initial true avoids a wrong branch before useEffect). */
-  const [bucketPolicyLoading, setBucketPolicyLoading] = useState(true);
   const objectKey = object?.key;
   const cachedHead = objectKey ? headCache?.[objectKey] : undefined;
 
@@ -258,56 +255,36 @@ export default function InspectorPanel({
   const latestKeyRef = useRef<string | undefined>(objectKey);
   useEffect(() => { latestKeyRef.current = objectKey; }, [objectKey]);
 
-  // Fetch bucket policy (compression + public prefixes) once per bucket — skip when the user
-  // has not signed in through Settings (would 403).
+  // Bucket policy (compression + public prefixes) is derived from the shared,
+  // cached admin config — no bespoke per-bucket fetch effect. Skip the query
+  // when the user has not signed in through Settings (a fetch would 403).
   //
   // `getBucket()` is a non-reactive module getter, so we read it during render
-  // into `currentBucket` and make THAT an explicit effect dependency. Previously
-  // the effect depended only on `[objectKey, hasAdminSession]`, which lied about
-  // its real trigger (the bucket) and only worked because object selection
-  // happens to change with the bucket — a latent stale-policy bug.
+  // into `currentBucket`. The previous effect tracked bucket changes manually
+  // and cancelled stale fetches; with a cached query the active bucket's policy
+  // is just a lookup against `config.bucket_policies`, recomputed each render.
+  const { data: adminConfig, isLoading: adminConfigLoading } = useAdminConfig({
+    enabled: hasAdminSession,
+  });
   const currentBucket = getBucket();
-  const lastBucketRef = useRef<string>('');
-  useEffect(() => {
-    const bucket = currentBucket;
-    if (!bucket) {
-      setBucketPolicy(null);
-      setBucketPolicyLoading(false);
-      lastBucketRef.current = '';
-      return;
-    }
-    if (bucket === lastBucketRef.current) return;
-    lastBucketRef.current = bucket;
-    setBucketPolicy(null);
-    if (!hasAdminSession) {
-      setBucketPolicyLoading(false);
-      lastBucketRef.current = '';
-      return;
-    }
-    setBucketPolicyLoading(true);
-    const bucketFetched = bucket;
-    let cancelled = false;
-    getAdminConfig()
-      .then((cfg) => {
-        if (cancelled || !cfg || getBucket() !== bucketFetched) return;
-        const bp = cfg.bucket_policies?.[bucketFetched] || cfg.bucket_policies?.[bucketFetched.toLowerCase()];
-        // Match `BucketPolicyRegistry::compression_enabled`: per-bucket `compression`
-        // only, then default `true`. Do not infer from `max_delta_ratio` — global
-        // ratio 0 is a *threshold* / passthrough decision, not the same as
-        // `compression: false` on the bucket.
-        setBucketPolicy({
-          compressionEnabled: bp?.compression ?? true,
-          publicPrefixes: bp?.public_prefixes ?? [],
-        });
-      })
-      .catch(() => {})
-      .finally(() => {
-        if (!cancelled && getBucket() === bucketFetched) setBucketPolicyLoading(false);
-      });
-    return () => {
-      cancelled = true;
+  const bucketPolicy: BucketPolicyInfo | null = (() => {
+    if (!hasAdminSession || !currentBucket || !adminConfig) return null;
+    const bp =
+      adminConfig.bucket_policies?.[currentBucket] ||
+      adminConfig.bucket_policies?.[currentBucket.toLowerCase()];
+    // Match `BucketPolicyRegistry::compression_enabled`: per-bucket `compression`
+    // only, then default `true`. Do not infer from `max_delta_ratio` — global
+    // ratio 0 is a *threshold* / passthrough decision, not the same as
+    // `compression: false` on the bucket.
+    return {
+      compressionEnabled: bp?.compression ?? true,
+      publicPrefixes: bp?.public_prefixes ?? [],
     };
-  }, [currentBucket, hasAdminSession]);
+  })();
+  // True until the policy for the active bucket is resolvable: still loading the
+  // config, while we have an admin session and a bucket but no config yet.
+  const bucketPolicyLoading =
+    hasAdminSession && !!currentBucket && !adminConfig && adminConfigLoading;
 
   useEffect(() => {
     if (!objectKey) { setHeadData(null); setHeadReadable(false); return; }

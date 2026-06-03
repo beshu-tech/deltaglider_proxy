@@ -32,11 +32,9 @@
 import { useRef } from 'react';
 import {
   Alert,
-  Button,
   Input,
   Modal,
   Radio,
-  Space,
   Typography,
 } from 'antd';
 import {
@@ -53,6 +51,7 @@ import { useSectionEditor } from '../useSectionEditor';
 import SectionHeader from './SectionHeader';
 import FormField from './FormField';
 import ApplyDialog from './ApplyDialog';
+import StickyDirtyBar from './StickyDirtyBar';
 import PasswordChangeCard from './PasswordChangeCard';
 import MaskedSecretInput from './MaskedSecretInput';
 
@@ -197,32 +196,6 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
         gap: 16,
       }}
     >
-      {/* Dirty-state banner with Apply / Discard */}
-      {isDirty && (
-        <Alert
-          type="warning"
-          showIcon
-          message="Unsaved changes to this section"
-          description="Review the diff in the Apply dialog before persisting."
-          action={
-            <Space>
-              <Button size="small" onClick={discard} disabled={applying}>
-                Discard
-              </Button>
-              <Button
-                type="primary"
-                size="small"
-                onClick={runApply}
-                disabled={applying}
-                loading={applying}
-              >
-                Apply
-              </Button>
-            </Space>
-          }
-        />
-      )}
-
       {/* IAM mode card — the architectural choice */}
       <div style={cardStyle}>
         <SectionHeader
@@ -391,6 +364,14 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
         </Text>
         <PasswordChangeCard />
       </div>
+
+      <StickyDirtyBar
+        visible={isDirty}
+        applying={applying}
+        onDiscard={discard}
+        onApply={runApply}
+        floating
+      />
 
       {/* Apply dialog */}
       <ApplyDialog

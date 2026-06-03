@@ -35,6 +35,9 @@ export const qk = {
   groupMappingRules: {
     list: () => ['group-mapping-rules'] as const,
   },
+  externalIdentities: {
+    list: () => ['external-identities'] as const,
+  },
 
   // ── Storage ─────────────────────────────────────────────────────
   backends: {

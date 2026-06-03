@@ -38,7 +38,9 @@ import { useCardStyles } from './shared-styles';
 import RuleListEditor, { RuleRowLine, RuleRowTitle } from './RuleListEditor';
 import SectionHeader from './SectionHeader';
 import ApplyDialog from './ApplyDialog';
-import { AdvancedDisclosure, Field } from './ruleEditorFields';
+import FormField from './FormField';
+import StickyDirtyBar from './StickyDirtyBar';
+import { AdvancedDisclosure } from './ruleEditorFields';
 import { useApplyHandler } from '../useDirtySection';
 import { useSectionEditor } from '../useSectionEditor';
 import {
@@ -244,22 +246,6 @@ export default function ReplicationPanel({ onSessionExpired }: Props) {
 
   return (
     <div style={{ maxWidth: 1120, margin: '0 auto', padding: 'clamp(16px, 3vw, 24px)' }}>
-      {isDirty && (
-        <Alert
-          type="warning"
-          showIcon
-          message="Unsaved replication config"
-          description="Replication rules are YAML-backed storage config. Review the section diff before applying."
-          style={{ marginBottom: 16 }}
-          action={
-            <Space>
-              <Button size="small" onClick={discard} disabled={applying}>Discard</Button>
-              <Button size="small" type="primary" onClick={runApply} loading={applying}>Review apply</Button>
-            </Space>
-          }
-        />
-      )}
-
       <div style={{ ...cardStyle, marginBottom: 16 }}>
         <SectionHeader
           icon={<SyncOutlined />}
@@ -274,46 +260,50 @@ export default function ReplicationPanel({ onSessionExpired }: Props) {
           <Text type="secondary" style={{ fontSize: 12 }}>
             Uses sane defaults: tick {replication.tick_interval}, failover {replication.lease_ttl}, heartbeat {replication.heartbeat_interval}.
           </Text>
-          <Button type="primary" onClick={runApply} disabled={!isDirty} loading={applying}>
-            Review apply
-          </Button>
         </div>
         <AdvancedDisclosure title="Advanced scheduler settings">
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
-            <Field label="Scheduler tick">
+            <FormField
+              label="Scheduler tick"
+              yamlPath="storage.replication.tick_interval"
+              helpText="How often the scheduler wakes to check for due rules. Humantime duration; default 30s (5s minimum)."
+            >
               <Input
                 value={replication.tick_interval}
                 onChange={(e) => updateConfig({ tick_interval: e.target.value })}
                 placeholder="30s"
                 style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
               />
-              <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 4 }}>
-                How often the scheduler checks for due rules. Default: <Text code>30s</Text>.
-              </Text>
-            </Field>
-            <Field label="Lease TTL">
+            </FormField>
+            <FormField
+              label="Lease TTL"
+              yamlPath="storage.replication.lease_ttl"
+              helpText="Single-flight lease lifetime. A dead runner's rule can be picked up by another instance after this expires. Default 60s."
+            >
               <Input
                 value={replication.lease_ttl}
                 onChange={(e) => updateConfig({ lease_ttl: e.target.value })}
                 placeholder="60s"
                 style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
               />
-              <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 4 }}>
-                Dead-runner failover window. Default: <Text code>60s</Text>.
-              </Text>
-            </Field>
-            <Field label="Heartbeat">
+            </FormField>
+            <FormField
+              label="Heartbeat"
+              yamlPath="storage.replication.heartbeat_interval"
+              helpText="How often a long-running rule renews its lease while copying. Default 20s."
+            >
               <Input
                 value={replication.heartbeat_interval}
                 onChange={(e) => updateConfig({ heartbeat_interval: e.target.value })}
                 placeholder="20s"
                 style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
               />
-              <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 4 }}>
-                Lease renewal cadence. Default: <Text code>20s</Text>.
-              </Text>
-            </Field>
-            <Field label="Failures retained">
+            </FormField>
+            <FormField
+              label="Failures retained"
+              yamlPath="storage.replication.max_failures_retained"
+              helpText="Per-rule failure ring bound kept in the config DB. Older entries are dropped past this. Default 100."
+            >
               <InputNumber
                 value={replication.max_failures_retained}
                 onChange={(v) => updateConfig({ max_failures_retained: v ?? 100 })}
@@ -321,10 +311,7 @@ export default function ReplicationPanel({ onSessionExpired }: Props) {
                 max={10000}
                 style={{ width: '100%', ...inputRadius }}
               />
-              <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 4 }}>
-                Per-rule failure history kept in the config DB. Default: <Text code>100</Text>.
-              </Text>
-            </Field>
+            </FormField>
           </div>
         </AdvancedDisclosure>
       </div>
@@ -409,6 +396,14 @@ export default function ReplicationPanel({ onSessionExpired }: Props) {
             <ReplicationRuntimeDetails history={history} failures={failures} />
           </>
         )}
+      />
+
+      <StickyDirtyBar
+        visible={isDirty}
+        applying={applying}
+        onDiscard={discard}
+        onApply={runApply}
+        floating
       />
 
       <ApplyDialog
