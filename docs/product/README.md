@@ -38,9 +38,9 @@ These docs are operator-facing — everything you need to install, secure, run, 
 - [Monitoring and alerts](40-monitoring-and-alerts.md) — Prometheus scrape, Grafana panels, alerting rules.
 - [Troubleshooting](41-troubleshooting.md) — common symptoms → fixes.
 - [FAQ](42-faq.md) — quick answers to common questions.
-- [Lazy bucket replication](reference/replication.md) — scheduled and run-now source → destination object replication through the engine.
+- [Bucket replication](reference/replication.md) — event-driven and run-now source → destination object replication through the engine, with a periodic full-reconcile safety net.
 - [Lifecycle rules](reference/lifecycle.md) — delete-only object expiration with preview, scheduler history, and failure diagnostics.
-- [Event outbox](reference/event-outbox.md) — durable object mutation journal plus webhook delivery, fan-out, retries, and requeue.
+- [Event outbox & notifications](reference/event-outbox.md) — durable object mutation journal plus webhook delivery, fan-out, retries, requeue, and Slack notifications.
 
 ### Reference
 
@@ -48,9 +48,9 @@ These docs are operator-facing — everything you need to install, secure, run, 
 - [Admin API reference](reference/admin-api.md) — every `/_/api/admin/*` endpoint.
 - [Authentication reference](reference/authentication.md) — conceptual model, error codes, claim shapes.
 - [Metrics reference](reference/metrics.md) — every Prometheus metric and label.
-- [Replication reference](reference/replication.md) — rule shape, run-now controls, delete replication, runtime state.
+- [Replication reference](reference/replication.md) — rule shape, event-driven trigger, run-now controls, delete replication, runtime state.
 - [Lifecycle rules](reference/lifecycle.md) — delete-only expiration config, preview/run-now API, scheduler state.
-- [Event outbox](reference/event-outbox.md) — delivery config, payload shape, admin diagnostics.
+- [Event outbox & notifications](reference/event-outbox.md) — delivery config, payload shape, Slack formatting/routing, admin diagnostics.
 - [How delta works](reference/how-delta-works.md) — on-disk layout, PUT/GET flow, integrity guarantees.
 - [Encryption at rest](reference/encryption-at-rest.md) — AES-256-GCM for stored objects, chunked streaming wire format, operational caveats.
 
@@ -75,5 +75,5 @@ These docs are operator-facing — everything you need to install, secure, run, 
 - SigV4 for S3 clients: `aws-cli`, `boto3`, Terraform, rclone.
 - OAuth/OIDC for admin UI access.
 - Per-user ABAC permissions with IP and prefix conditions.
-- Soft bucket quotas, bucket freeze, object lifecycle expiration, and object replication with delete replication.
-- Prometheus metrics, in-memory audit ring, durable event outbox, encrypted IAM DB, and optional multi-instance config sync.
+- Soft bucket quotas, bucket freeze, object lifecycle expiration, and event-driven object replication with delete replication.
+- Prometheus metrics, in-memory audit ring, durable event outbox (webhook fan-out + Slack notifications), encrypted IAM DB, and optional multi-instance config sync.

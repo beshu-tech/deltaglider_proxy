@@ -13,7 +13,9 @@ Endpoints documented here are **admin** only. The S3-compatible API lives under 
 | `POST` | `/_/api/admin/login` | Bootstrap password → session cookie |
 | `POST` | `/_/api/admin/login-as` | Log in as an IAM user (access_key_id + secret_access_key) |
 | `POST` | `/_/api/admin/logout` | End the current session |
-| `GET` | `/_/api/admin/session` | `{valid: true/false}` |
+| `GET` | `/_/api/admin/session` | `{valid, admin_gui}` |
+| `POST` | `/_/api/admin/session/browser-connect` | Issue a limited browser-lift session for an IAM non-admin (S3 browse only) |
+| `POST` | `/_/api/admin/session/open-browser-connect` | Browser-lift session when `authentication: none` |
 | `GET` | `/_/api/whoami` | `{mode, version, user, external_providers}` |
 | `POST` | `/_/api/admin/recover-db` | Reset the config DB when the bootstrap hash doesn't match (public, rate-limited) |
 | `PUT` | `/_/api/admin/password` | Change the bootstrap password — re-encrypts the SQLCipher DB atomically |
@@ -47,6 +49,8 @@ All three scopes route through the same `apply_config_transition` path, so hot-r
 |---|---|---|---|
 | `GET` | `/_/api/admin/config/export[?section=<name>]` | — | Canonical YAML (secrets redacted) |
 | `GET` | `/_/api/admin/config/declarative-iam-export` | — | Project current DB IAM into `access:` YAML fragment (for declarative GitOps seeding; see [declarative-iam.md](declarative-iam.md#workflow-a-already-populated-db--gitops)) |
+| `POST` | `/_/api/admin/config/declarative-iam-validate` | `{yaml: <access fragment>}` | Dry-run the declarative IAM reconcile (`diff_iam` preview, zero DB writes) |
+| `POST` | `/_/api/admin/config/declarative-iam-apply` | `{yaml: <access fragment>}` | Atomic single-transaction IAM reconcile from the YAML fragment |
 | `GET` | `/_/api/admin/config/defaults[?section=<name>]` | — | JSON Schema (for YAML LSP and Monaco) |
 | `POST` | `/_/api/admin/config/validate` | `{yaml: <doc>}` | Dry-run full-document apply |
 | `POST` | `/_/api/admin/config/section/:name/validate` | `{<section-body>}` | Dry-run section apply; in declarative mode warns with `diff_iam` preview (see [declarative-iam.md](declarative-iam.md#preview-before-applying)) |
@@ -72,6 +76,7 @@ deltaglider_proxy config apply deltaglider_proxy.yaml --server https://dgp.examp
 | `POST` | `/_/api/admin/backends` | Create; validates S3 creds upfront |
 | `DELETE` | `/_/api/admin/backends/:name` | Remove — refuses to delete the default or in-use backends |
 | `POST` | `/_/api/admin/test-s3` | Test an arbitrary S3 connection without persisting |
+| `GET` / `POST` | `/_/api/admin/buckets` | List bucket origins / create a bucket on a backend |
 
 ## IAM (gated by `iam_mode`)
 
@@ -82,8 +87,10 @@ deltaglider_proxy config apply deltaglider_proxy.yaml --server https://dgp.examp
 | `GET` / `POST` | `/_/api/admin/users` | List / create |
 | `PUT` / `DELETE` | `/_/api/admin/users/:id` | Update / delete |
 | `POST` | `/_/api/admin/users/:id/rotate-keys` | Rotate access keys |
+| `POST` | `/_/api/admin/users/:id/clone` | Clone a user (new keys, copied permissions) |
 | `GET` / `POST` | `/_/api/admin/groups` | List / create |
 | `PUT` / `DELETE` | `/_/api/admin/groups/:id` | Update / delete |
+| `POST` | `/_/api/admin/groups/:id/clone` | Clone a group |
 | `POST` | `/_/api/admin/groups/:id/members` | Add user to group |
 | `DELETE` | `/_/api/admin/groups/:id/members/:user_id` | Remove user from group |
 | `GET` | `/_/api/admin/iam/version` | Monotonic IAM-index rebuild counter for deterministic diagnostics/tests |
@@ -101,6 +108,7 @@ deltaglider_proxy config apply deltaglider_proxy.yaml --server https://dgp.examp
 | `POST` | `/_/api/admin/ext-auth/mappings/preview` | Preview which groups a given identity would be assigned |
 | `GET` | `/_/api/admin/ext-auth/identities` | List external identities (read-only, not gated) |
 | `POST` | `/_/api/admin/ext-auth/sync-memberships` | Re-evaluate mapping rules and sync group memberships |
+| `GET` | `/_/api/admin/ext-auth/version` | Monotonic external-auth rebuild counter (sibling of `iam/version`) for deterministic diagnostics/tests |
 | `POST` | `/_/api/admin/migrate` | Migrate legacy bootstrap creds into an IAM user |
 
 ### OAuth redirect flow (public, no session)
@@ -130,9 +138,30 @@ Legacy JSON-only import path is still supported for pre-v0.8.4 scripts.
 |---|---|---|
 | `POST` | `/_/api/admin/usage/scan` | Trigger a prefix-size scan |
 | `GET` | `/_/api/admin/usage` | Read the cached usage tree |
+| `GET` | `/_/api/admin/deltaspace/savings` | Per-prefix reference-aware delta savings (30s in-memory cache) |
+| `GET` | `/_/api/admin/diagnostics/delta-efficiency` | Cached delta-efficiency report for a bucket's deltaspaces |
+| `POST` | `/_/api/admin/diagnostics/delta-efficiency/scan` | Trigger a delta-efficiency scan |
+| `POST` | `/_/api/admin/diagnostics/delta-efficiency/verify` | Verify reconstructed objects against stored deltas |
+| `GET` | `/_/api/admin/diagnostics/scan[/status]` | Integrity-scan status (per-bucket or all-buckets map) |
+| `POST` | `/_/api/admin/diagnostics/scan/start` / `/stop` | Start / stop a background integrity scan |
+| `GET` | `/_/api/admin/diagnostics/scan/stream` | SSE stream of live scan progress |
 | `GET` | `/_/api/admin/audit[?limit=N]` | Snapshot of the in-memory audit ring, newest first. Bounded (default 500, override `DGP_AUDIT_RING_SIZE`). Stdout `tracing::info!` is still the long-term audit source. |
 | `GET` | `/_/api/admin/event-outbox[?status=failed&limit=N&offset=N&sort=occurred_at&order=desc]` | Paged durable object-event outbox rows plus status counts. Delivery is background-only; delivered rows default to 24h/10,000-row retention; see [event-outbox.md](event-outbox.md). |
+| `POST` | `/_/api/admin/event-outbox/:id/requeue` | Requeue a single failed outbox row for re-delivery |
+| `POST` | `/_/api/admin/event-outbox/requeue` | Bulk-requeue failed outbox rows |
 | `GET` / `PUT` / `DELETE` | `/_/api/admin/session/s3-credentials` | Per-session S3 credential store for the browse panel |
+
+## Object operations (browse panel)
+
+Server-side helpers behind the embedded S3 browser's bulk actions.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/_/api/admin/objects/list` | List all keys under a bucket/prefix |
+| `POST` | `/_/api/admin/objects/copy` | Server-side copy of selected objects |
+| `POST` | `/_/api/admin/objects/move` | Server-side move (copy + delete) |
+| `POST` | `/_/api/admin/objects/delete` | Bulk delete selected objects |
+| `GET` | `/_/api/admin/objects/zip` | Stream selected objects as a ZIP |
 
 ## Replication
 

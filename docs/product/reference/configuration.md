@@ -752,6 +752,49 @@ is marked delivered only after all endpoints return 2xx; failed rows back off
 and can be requeued from the admin API/UI. See [Event outbox](event-outbox.md)
 for payload and diagnostics details.
 
+### Slack format
+
+Set `format: slack` to render each event as a Slack message (Block Kit + text
+fallback) instead of the raw `{schema,event}` envelope. Two modes — pick one:
+
+```yaml
+advanced:
+  event_delivery:
+    enabled: true
+    format: slack
+    # Incoming Webhook mode (simplest, single channel):
+    webhook_url: "https://hooks.slack.com/services/T000/B000/XXXX"
+    slack_username: "DeltaGlider"        # optional cosmetic override
+    slack_icon_emoji: ":package:"        # optional
+    # Bot-token mode (multi-channel + @mentions) — set these INSTEAD of webhook_url:
+    # slack_bot_token: "xoxb-..."        # needs chat:write + chat:write.public scopes
+    # slack_channel: "C0123456"          # channel id or #name (required in this mode)
+    # Scope what gets posted:
+    slack_notify_kinds: ["ObjectCreated"]   # add ObjectDeleted, etc.
+    slack_include_globs: ["builds/**"]      # empty = all user objects
+    slack_exclude_globs: ["**/*.tmp"]       # exclude wins over include
+    # Per-bucket/prefix routing (bot-token mode only):
+    slack_routes:
+      - name: "Releases → #ci"
+        bucket: releases
+        prefix_globs: ["builds/**"]      # empty = any key in the bucket
+        channel: "C_CI"
+```
+
+| Key | Notes |
+|-----|-------|
+| `format` | `raw` (default) or `slack`. |
+| `slack_bot_token` | `xoxb-…` Slack Web API token. **Secret** — masked on export, preserved on an untouched round-trip. Selects bot-token mode (`chat.postMessage`). |
+| `slack_channel` | Target channel (`C0123` or `#name`). Required in bot-token mode; ignored for Incoming Webhook URLs (each URL is bound to one channel by Slack). |
+| `slack_username` / `slack_icon_emoji` | Cosmetic sender overrides (Incoming Webhook mode). |
+| `slack_notify_kinds` | Which event kinds post. Default `["ObjectCreated"]`. |
+| `slack_include_globs` / `slack_exclude_globs` | Key-glob pre-filter (exclude wins). |
+| `slack_routes` | Per-bucket / per-prefix → channel routing (**bot-token mode only**). When non-empty, an eligible event posts to every matching route; `slack_channel` is the fallback for events matching no route. |
+
+The whole thing is editable from the admin GUI at **Configuration → Advanced →
+Webhook delivery** (toggle the format to *Slack*). See [Event outbox](event-outbox.md#slack-notifications)
+for delivery semantics.
+
 ---
 
 ## Encryption at Rest

@@ -225,7 +225,7 @@ On each OAuth login, the user's group memberships are **merged** (not replaced) 
 Browser → /_/ login page → "Sign in with Google" button
     → Redirect to Google (PKCE + state + nonce)
     → User authenticates with Google
-    → Google redirects back to /_/api/admin/auth/callback
+    → Google redirects back to /_/api/admin/oauth/callback
     → Proxy validates JWT (algorithm from header, audience, issuer, nonce)
     → Auto-provision or update IAM user
     → Apply group mapping rules

@@ -65,47 +65,72 @@ Embedded UI smoke (Playwright — same as `e2e-smoke` CI job): from repo root, `
 
 ## Project Structure
 
+The S3 protocol surface (GET/PUT/HEAD/DELETE, ListObjectsV2, copy, multipart) is
+served by the **s3s** framework — `s3_adapter_s3s.rs` implements `s3s::S3` (~32
+verb methods) and is
+mounted as the axum `fallback_service` in `startup.rs`. The hand-rolled axum S3
+handlers were retired; what survives in `api/handlers/` is just shared state +
+the helpers s3s can't model (browser form-POST, health/stats). The admin API and
+demo UI stay axum, under `/_/`.
+
 ```
 src/
+├── s3_adapter_s3s.rs    # THE S3 implementation: impls s3s::S3 (~32 verb methods); delegates product logic to the engine
+├── startup.rs           # Server startup: builds the s3s service + axum router, middleware stack (admission → auth → interceptors → fallback)
 ├── api/
-│   ├── mod.rs           # API module root, S3Error type
-│   ├── handlers/        # S3 API handlers (object, bucket, multipart, status)
-│   ├── auth.rs          # SigV4 auth middleware + public prefix bypass
-│   ├── admin/           # Admin API (login, config, users, groups, auth providers, backup)
+│   ├── mod.rs           # API module root, re-exports S3Error
+│   ├── handlers/        # Post-s3s survivors: mod.rs (AppState + helpers), form_post.rs (browser PostObject), object_helpers.rs (quota gate + outbox enqueue), status.rs (/_/health, /_/stats)
+│   ├── auth.rs          # SigV4 + IAM authorization middleware + public prefix bypass
+│   ├── admin/           # Admin API (login, config, users, groups, external_auth, backup, replication, lifecycle, event_outbox, scanner, audit, …)
 │   ├── aws_chunked.rs   # AWS chunked transfer encoding decoder
-│   ├── errors.rs        # S3 error responses
-│   └── xml.rs           # S3 XML response/request builders
+│   └── errors.rs        # S3 error responses
 ├── deltaglider/
 │   ├── engine/          # Core engine (mod, store, retrieve submodules)
 │   ├── codec.rs         # xdelta3 encode/decode (subprocess)
 │   ├── cache.rs         # Reference file LRU cache (moka)
+│   ├── savings.rs       # Delta-savings accounting
 │   └── file_router.rs   # File type routing (delta-eligible vs passthrough)
 ├── storage/
 │   ├── traits.rs        # StorageBackend trait (async_trait, object-safe)
 │   ├── filesystem.rs    # Local filesystem backend (xattr metadata)
-│   ├── s3.rs            # S3 backend (AWS SDK)
+│   ├── s3.rs            # S3 backend (AWS SDK; classify_s3_error / classify_get_error pure fns)
+│   ├── encrypting.rs    # At-rest encryption wrapper backend (per-backend AES key)
 │   ├── routing.rs       # Multi-backend routing (virtual bucket → real backend)
 │   └── xattr_meta.rs    # Extended attribute helpers
 ├── iam/
-│   ├── mod.rs           # IamState enum, IamIndex, hot-swap
+│   ├── mod.rs           # IamState enum, IamIndex, hot-swap, IAM_VERSION counter
 │   ├── types.rs         # IamUser, Permission, AuthenticatedUser, S3Action
 │   ├── permissions.rs   # ABAC evaluation (legacy + iam-rs with conditions)
-│   ├── middleware.rs     # Per-request IAM authorization middleware
+│   ├── middleware.rs    # Per-request IAM authorization middleware
 │   ├── keygen.rs        # Secure access key generation
+│   ├── declarative.rs   # Declarative-mode reconciler (diff_iam → apply_iam_reconcile)
 │   └── external_auth/   # OAuth/OIDC providers (Google, generic OIDC)
-├── config_db/           # Encrypted SQLCipher database (users, groups, providers)
-├── config.rs            # Flat Config struct + ENV_VAR_REGISTRY (YAML canonical; TOML deprecated but still loads)
+├── config_db/           # Encrypted SQLCipher DB (users, groups, auth_providers, declarative; classify_sqlite_error)
+├── config.rs            # Flat Config struct + ENV_VAR_REGISTRY + env_parse/env_bool helpers + classify_auth_config (YAML canonical; TOML deprecated)
 ├── config_sections.rs   # Sectioned YAML wire shape (admission/access/storage/advanced) + shorthand expanders
+├── config_db_sync.rs    # Multi-instance IAM sync via S3 (reopen_and_rebuild_iam)
 ├── admission/           # Pre-auth admission chain (operator-authored + synthesized blocks)
+├── replication/         # Event-driven + scheduled bucket replication (planner, worker, scheduler, event_consumer, state_store)
+├── lifecycle/           # Delete-only object lifecycle rules (planner, scheduler, worker, state_store)
+├── transfer.rs          # Shared engine-routed copy primitive (used by replication + lifecycle)
+├── event_outbox.rs      # Durable object-event outbox (append on mutation)
+├── event_delivery.rs    # Background dispatcher → webhook JSON or Slack message
+├── slack_format.rs      # Pure Slack Block Kit formatter + notification filter
+├── security.rs          # Pure security primitives (validate_bucket_name, bucket_name_is_ip_like, outbound-URL SSRF policy)
+├── secret.rs            # Secret trait (opaque material + non-secret id) — future KMS/Vault home
+├── tls.rs               # TLS setup (user PEM or self-signed via rcgen)
+├── background.rs        # Shared background-runner helpers (parse_duration_or)
+├── init.rs              # Interactive --init config wizard
 ├── bucket_policy.rs     # Per-bucket policies + PublicPrefixSnapshot
-├── startup.rs           # Server startup, router assembly, middleware stack
 ├── session.rs           # Admin session store (OsRng tokens, IP binding)
 ├── rate_limiter.rs      # Per-IP rate limiting (token bucket)
 ├── metadata_cache.rs    # Object metadata LRU cache (moka)
-├── audit.rs             # Audit logging helpers
+├── usage_scanner.rs     # Background prefix size scanner (cached)
+├── audit.rs             # Audit logging + in-memory AuditEntry ring
 ├── multipart.rs         # In-memory multipart upload state
 ├── types.rs             # Core types (FileMetadata, StorageInfo, etc.)
 ├── demo.rs              # Embedded UI (rust-embed) + admin API router
+├── cli/                 # CLI subcommands (cp, sync, migrate, ls, rm, purge, verify, config, …)
 ├── lib.rs               # Library root
 └── main.rs              # Entry point
 demo/s3-browser/ui/      # React 18 + TypeScript + Ant Design 6 admin GUI
@@ -166,11 +191,29 @@ section-PUT and document export→apply paths. Removed map entries emit an expli
 `null` (RFC 7396 delete).
 
 **Shared visual primitives** (reuse, don't re-style): `useCardStyles` /
-`SectionHeader` (cards), `FormField` (label + YAML-path breadcrumb + helpText +
-example chips — wrap every field; help should always be present), `StickyDirtyBar`
-(the slim floating unsaved-changes bar — use `floating` when it can't be the last
-child in the scroll flow), `ApplyDialog` (plan → diff → apply). Every editable
-field should have a `helpText` and a `placeholder`/example.
+`SectionHeader` (cards — owns its own header gap), `FormField` (label +
+YAML-path breadcrumb + helpText + example chips — wrap every field; help should
+always be present; the yaml-path chip shows on hover/focus only so the bold label
+leads), `StickyDirtyBar` (the slim floating unsaved-changes bar — use `floating`
+when it can't be the last child in the scroll flow), `ApplyDialog` (plan → diff →
+apply). Every editable field should have a `helpText` and a `placeholder`/example.
+
+The PR #24 convergence pass added three more (use these instead of re-rolling):
+- **`MaskedSecretInput`** — the one masked-secret field. `mode="sentinel"`
+  (shows empty while the value is the `REDACTED_SENTINEL`, passes it through
+  untouched on save) for webhook headers / Slack bot token; `mode="blank-keeps"`
+  (blank = keep existing, non-blank = rotate) for SigV4-style secrets.
+- **`RowListEditor<T>`** — stable-`id`-keyed add/remove/update-by-id list
+  scaffolding (the "stable row ids, never array index" rule, centralised). You
+  supply `renderRow` + `newItem()`; it hands each row `update`/`remove`-by-id and
+  emits the next array for you to fold into your single source of truth.
+- **`StatePlaceholders`** — `LoadingState` / `EmptyState` chrome (consistent
+  centering, padding, icon size, type scale) so panels stop hand-rolling spinners.
+
+**IAM DB reads go through react-query**, not `useEffect(load)`. The
+`queries/{groups,authProviders,mappingRules,users,backends,…}.ts` hooks (keyed by
+`qk.*`) own reads + per-record mutations and invalidate `qk.*` on success — the
+old `loadData()`-after-every-mutation + prop→state-mirror idiom is gone.
 
 ## Submitting Changes
 

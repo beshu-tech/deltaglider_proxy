@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Added — Slack notifications connector
+
+- **Object events can now post to Slack.** Setting `event_delivery.format = slack`
+  renders each outbox event as a Slack message (Block Kit + plain-text fallback)
+  instead of the raw `{schema,event}` JSON envelope. Two delivery modes:
+  - **Incoming Webhook URL** — point `webhook_url`/`webhook_urls` at a
+    `hooks.slack.com` URL. Each URL is bound by Slack to a single channel; the
+    cosmetic `slack_username` / `slack_icon_emoji` overrides apply here.
+  - **Bot token** (`slack_bot_token`, `xoxb-…`) — delivery uses the Slack Web API
+    (`chat.postMessage`), posting to `slack_channel` with support for `@`-mentions
+    and any channel via `chat:write.public`.
+- **Per-bucket / per-prefix channel routing** (bot-token mode only). When
+  `slack_routes` is non-empty, an eligible event posts to EVERY route it matches —
+  so different buckets/prefixes can fan out to different channels (and one object
+  can hit several). `slack_notify_kinds` (default `["ObjectCreated"]`) plus
+  `slack_include_globs` / `slack_exclude_globs` are a global pre-filter for what's
+  eligible; routes then pick the channels.
+- **Editable from the admin UI** at Configuration → Advanced → Webhook delivery,
+  alongside the raw-webhook config. The **bot token is a secret**: it's masked in
+  the GUI and in every export, and leaving the masked value untouched preserves
+  the real token on save (both the section-PUT and full-document export→apply
+  paths), exactly like webhook auth headers.
+
 ## v1.2.0 — 2026-06-02
 
 ### Added — event-driven replication

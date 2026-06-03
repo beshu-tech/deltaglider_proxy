@@ -106,6 +106,20 @@ deltaglider_cache_miss_rate_ratio > 0.5     # cache thrashing
 |---|---|---|---|
 | `deltaglider_codec_semaphore_available` | Gauge | — | Available xdelta3 subprocess permits. `0` = all slots busy |
 
+## Multipart uploads
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `deltaglider_multipart_uploads_inflight` | Gauge | — | Current in-flight multipart upload count |
+| `deltaglider_multipart_sweep_runs_total` | Counter | `phase` | Multipart sweeper runs by phase |
+| `deltaglider_multipart_sweep_duration_seconds` | Histogram | `phase` | Sweeper run duration in seconds |
+| `deltaglider_multipart_swept_uploads_total` | Counter | `state` | Uploads reclaimed by sweeper, by upload state |
+| `deltaglider_multipart_sweep_reclaimed_bytes_total` | Counter | — | Cumulative bytes reclaimed by the sweeper |
+| `deltaglider_multipart_sweep_orphan_relay_dirs_total` | Counter | — | Orphan multipart relay directories removed |
+| `deltaglider_multipart_sweep_orphan_relay_files_total` | Counter | — | Orphan multipart relay files removed |
+| `deltaglider_multipart_sweep_last_uploads_reclaimed` | Gauge | — | Uploads reclaimed in the latest sweep run |
+| `deltaglider_multipart_sweep_last_reclaimed_bytes` | Gauge | — | Bytes reclaimed in the latest sweep run |
+
 ## Auth
 
 | Metric | Type | Labels | Description |

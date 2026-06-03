@@ -45,23 +45,36 @@ CI merge gate: `verify-integration-test-registry` → `fmt` → `clippy -D warni
 
 ## Architecture
 
+The S3 protocol surface is served by the **s3s** framework (the `s3s` crate),
+NOT hand-rolled axum handlers. `startup.rs::build_s3_router` mounts
+`s3_adapter_s3s::DeltaGliderS3Service` (impls `s3s::S3`, ~32 verb methods) as the
+axum `fallback_service`. The legacy axum S3 handlers were retired; `s3s` is the
+only S3 implementation. The admin API + demo UI stays axum, mounted under `/_/`.
+(The top doc-comment in `s3_adapter_s3s.rs` still calls itself "experimental /
+not wired in" — that comment is stale; it IS the production path.)
+
 ```
-HTTP request
+HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout, concurrency cap, CORS)
   → admission/middleware.rs  Pre-auth admission chain (deny / reject / allow-anonymous)
-  → api/handlers/       S3-compatible handlers split by domain:
-      object.rs            GET/PUT/HEAD/DELETE (range, conditional, Content-MD5, ACL stubs)
-      object_helpers.rs    Shared helpers extracted from object.rs (headers, conditional evaluation)
-      bucket.rs            Bucket CRUD and ListObjectsV2 (start-after, encoding-type, fetch-owner, base64 tokens). The canonical `validate_bucket_name` + `bucket_name_is_ip_like` pure validators live in `src/security.rs` (unit + proptest coverage), shared by the CLI URL parser
-      multipart.rs         Multipart upload lifecycle
-      status.rs            /health, /stats, /metrics
-  → api/auth.rs         SigV4 authentication middleware (bootstrap or per-user IAM)
-  → deltaglider/engine/   Orchestration split into submodules:
-      mod.rs               Core engine: route, compress, cache, metadata resolution
-      store.rs             PUT pipeline: delta encoding, migration, reference management
-      retrieve.rs          GET pipeline: delta reconstruction, streaming, range requests
+  → api/auth.rs              SigV4 + IAM authorization middleware (bootstrap or per-user IAM), runs before storage
+  → HEAD-`/` + POST form-data interceptors (shapes s3s rejects: Cyberduck probe, browser PostObject → api/handlers/form_post.rs)
+  → s3_adapter_s3s.rs        fallback_service: the `s3s::S3` adapter — owns S3 parse/DTO/XML/error; delegates product logic to the engine
+                             (GET/PUT/HEAD/DELETE, ListObjectsV2, copy, multipart lifecycle, ACL/tagging stubs)
+  → api/handlers/            Survivors after the s3s consolidation:
+      mod.rs                 AppState (shared by s3s adapter + admin API), audit_log_s3, ensure_bucket_exists helpers
+      object_helpers.rs      Shared quota gate + per-object event-outbox enqueue (called by s3s adapter & form_post)
+      form_post.rs           Browser multipart/form-data PostObject upload (s3s doesn't model this shape)
+      status.rs              /_/health, /_/stats
+  → deltaglider/engine/      Orchestration split into submodules:
+      mod.rs                 Core engine: route, compress, cache, metadata resolution, RetrieveResponse, validated_key
+      store.rs               PUT pipeline: delta encoding, migration, reference management
+      retrieve.rs            GET pipeline: delta reconstruction, streaming, range requests
   → storage/traits.rs       StorageBackend trait (async_trait, object-safe)
-  → storage/filesystem.rs   Local filesystem impl (xattr metadata, list_objects_delegated)
+  → storage/filesystem.rs   Local filesystem impl (xattr metadata via xattr_meta.rs, list_objects_delegated)
   → storage/s3.rs           AWS S3/MinIO impl (S3 user metadata headers, S3Op enum, `classify_s3_error` + `classify_get_error` pure fns with unit-test coverage)
+  → storage/encrypting.rs   At-rest encryption wrapper backend (per-backend AES key, dg-encryption-key-id metadata)
+  → storage/routing.rs      Multi-backend routing (virtual bucket → real backend)
+  → security.rs             Pure security primitives (validate_bucket_name, bucket_name_is_ip_like, outbound-URL SSRF policy) — unit + proptest, shared by CLI URL parser
   → demo.rs                 Embedded UI + admin API router, mounted under /_/
   → session.rs              In-memory session store (OsRng tokens, 4h default TTL)
   → admission/              Admission chain (pre-auth gating):
@@ -69,16 +82,34 @@ HTTP request
       evaluator.rs           Decision evaluator (first-match-wins over compiled chain)
       middleware.rs          Request-info extraction, marker injection for AllowAnonymous
       mod.rs                 Runtime Match/Action/Decision types, chain builder
-  → config.rs               Flat in-memory Config struct + ENV_VAR_REGISTRY
+  → config.rs               Flat in-memory Config struct + ENV_VAR_REGISTRY; `Config::classify_auth_config` pure auth-mode decision
   → config_sections.rs      Sectioned YAML wire shape (admission/access/storage/advanced) + shorthand expanders
   → iam/                    IAM module:
-      mod.rs                 IamState enum, auth mode detection
+      mod.rs                 IamState enum, auth mode detection, IAM_VERSION counter
       types.rs               IamUser, AuthenticatedUser, Permission types
       permissions.rs         ABAC evaluation, is_admin, action matching
       middleware.rs          Per-request auth middleware
       keygen.rs              Secure key generation
-  → config_db/              Encrypted SQLCipher database for IAM users
+      declarative.rs         Declarative-mode reconciler (diff_iam → apply_iam_reconcile)
+      external_auth/         OAuth/OIDC providers (Google, generic OIDC)
+  → config_db/              Encrypted SQLCipher DB (users.rs, groups.rs, auth_providers.rs, declarative.rs; `classify_sqlite_error` pure fn in mod.rs)
   → config_db_sync.rs       Multi-instance IAM sync via S3 (DGP_CONFIG_SYNC_BUCKET). Hosts `reopen_and_rebuild_iam` (shared by startup, periodic poller, and `POST /api/admin/config/sync-now`)
+  → event_outbox.rs         Durable object-event outbox: handlers append facts after successful mutations (never block S3 path)
+  → event_delivery.rs       Background dispatcher: claims due outbox rows, delivers as webhook JSON or Slack message; disabled unless advanced.event_delivery.enabled + a target
+  → slack_format.rs         PURE Slack Block Kit formatter + notification filter for event_delivery format=slack
+  → replication/            Event-driven + scheduled bucket replication (engine-routed so encryption/delta stay transparent):
+      planner.rs             Pure rewrite_key / should_replicate / plan_batch
+      worker.rs              Async copy loop (engine.retrieve source → engine.store dest)
+      scheduler.rs           Periodic tick from replication.tick_interval; executes due rules
+      event_consumer.rs      Consumes the event outbox for lazy/event-driven replication
+      state_store.rs         ConfigDb wrapper for replication_state / run_history / failures tables
+  → lifecycle/              Delete-only object lifecycle (YAML-authored, disabled by default, previewable; deletes through the engine): planner/scheduler/worker/state_store
+  → transfer.rs             Shared engine-routed copy primitive (retrieve→store, preserve multipart ETags, stamp provenance, retry transient) — used by replication + lifecycle
+  → usage_scanner.rs        Background prefix size scanner (cached results, LRU, scan cap)
+  → secret.rs               Secret trait (opaque material + non-secret stable id) — formalises the AES-key shape; future KMS/Vault impls plug in here
+  → tls.rs                  TLS setup: user-provided PEM or ephemeral self-signed (rcgen)
+  → background.rs           Shared background-runner helpers (parse_duration_or for replication/lifecycle/event_delivery)
+  → init.rs                 Interactive `--init` config wizard
   → cli/config.rs           `config migrate|lint|schema|defaults|apply` + `admission trace`
 ```
 
@@ -132,7 +163,7 @@ Auto-generated on first run (printed to stderr when stderr is a TTY; hidden in c
 
 IAM users have ABAC permissions: `{ actions: ["read", "write", "delete", "list", "admin"], resources: ["bucket/*"] }`. Admin = wildcard actions AND wildcard resources. The IAM DB is independent of the YAML config file — `access: {}` in YAML with no legacy creds is correct when users/groups/OAuth providers live in the DB. Multi-instance sync via S3 (`DGP_CONFIG_SYNC_BUCKET` / `config_sync_bucket`) uploads the encrypted DB after every mutation; readers poll S3 every 5 minutes and download on ETag change.
 
-Key files: `src/iam/` (types, permissions, middleware, keygen; `bump_iam_version`/`current_iam_version` + `GET /_/api/admin/iam/version` power the deterministic rebuild barrier used by tests), `src/config_db/` (SQLCipher CRUD), `src/config_db_sync.rs` (S3 sync + `reopen_and_rebuild_iam`), `src/api/admin/` (auth, users CRUD, config, groups, backup, scanner, audit; `with_config_db()` in `mod.rs` wraps the "lock DB → run closure → log-and-500" boilerplate), `src/api/admin/config/{document_level,field_level,section_level,password,trace}.rs` (section-level uses RFC 7396 merge-patch; `mod.rs` hosts `POST /api/admin/config/sync-now` — operator affordance for forcing an immediate pull from the sync bucket).
+Key files: `src/iam/` (types, permissions, middleware, keygen, declarative reconciler, `external_auth/` OAuth/OIDC; `bump_iam_version`/`current_iam_version` + `GET /_/api/admin/iam/version` power the deterministic rebuild barrier used by tests), `src/config_db/` (SQLCipher CRUD split into users/groups/auth_providers/declarative + `classify_sqlite_error` in mod.rs), `src/config_db_sync.rs` (S3 sync + `reopen_and_rebuild_iam`), `src/api/admin/` (auth, users CRUD, config, groups, external_auth, backup, scanner, audit, plus replication / lifecycle / event_outbox / backends / savings panels; `with_config_db()` in `mod.rs` wraps the "lock DB → run closure → log-and-500" boilerplate; `external_auth.rs` hosts `validate_mapping_rule` + the `EXT_AUTH_VERSION` counter), `src/api/admin/config/{document_level,field_level,section_level,password,trace}.rs` (section-level uses RFC 7396 merge-patch; `mod.rs` hosts `POST /api/admin/config/sync-now` — operator affordance for forcing an immediate pull from the sync bucket).
 
 ## Frontend (demo/s3-browser/ui)
 
@@ -152,7 +183,9 @@ The admin UI revamp (all 10 planned waves + Wave 11 audit viewer shipped in v0.8
 
 Key components: `MetricsPage` (Prometheus dashboard + analytics with Monitoring/Analytics tab toggle), `AnalyticsSection` (cost savings dashboard with per-bucket charts), `ObjectTable` (sortable, double-click preview, bulk selection), `BulkActionBar` (Copy/Move/ZIP/Delete for selected objects), `DestinationPickerModal` (bucket+prefix picker for copy/move), `InspectorPanel` (object details drawer with download, share duration selector, storage stats, metadata), `FilePreview` (double-click preview for text/images), `AdminPage` (full-screen settings container with hierarchical routing + keydown shortcuts + mobile drawer), `AdminSidebar` (4-group IA; amber dot for sections with unsaved edits; `ADMIN_IA` exported for the command palette), `CommandPalette` (⌘K palette with `CommandAction` + recents MRU + group headings), `ShortcutsHelp` (? modal — platform-aware key glyphs), `CopySectionYamlButton` (compact header-mounted section-scoped Copy YAML), `FormField` (label + YAML-path breadcrumb + help + default-placeholder + override-indicator + owner-badge wrapper), `ApplyDialog` (plan→diff→apply modal), `MonacoYamlEditor` (lazy-loaded Monaco + monaco-yaml with scoped JSON Schema), `IamSourceBanner` (explains DB vs YAML ownership for Access pages), `UsersPanel` (master-detail IAM user CRUD; list labels show direct-rule count AND group inheritance), `UserForm`, `AuthenticationPanel` (OAuth/OIDC providers, group mapping rules — "+ Add Rule" flushes pending edits before reload), `BackendsPanel` (storage backends), `BucketsPanel` (per-bucket policies with tri-state public read toggle: None / Specific prefixes / Entire bucket), `AdmissionPanel` (operator-authored block editor with drag-reorder + per-block form & YAML views), `GroupsPanel` (resets form + navigates to new row on successful Create), `TracePanel` (synthetic request → admission decision visualiser), `AuditLogPanel` (in-memory audit ring viewer with colour-coded Action tags + filter + 3s auto-refresh), `SetupWizard` (first-run 5-step onboarding at `/_/admin/setup`), `SimpleSelect`/`SimpleAutoComplete` (custom dropdowns — Ant Design popups are broken in this layout), `OAuthProviderList` (shared OAuth buttons), `TabHeader` (centered tab headers), `DocsPage` (embedded markdown docs with search, Mermaid diagrams, lightbox), `DocsLanding` (landing page with screenshots and feature cards), `FullScreenHeader` (shared header for Admin/Docs with branding + theme toggle + `extra` slot for hamburger + Copy/Export/Import buttons), `YamlImportExportModal` (full-document YAML round-trip). `useDirtySection` hook backs per-panel dirty state; `useApplyHandler` registers per-section Apply callbacks for ⌘S dispatch; `useDirtyGlobalIndicators` drives the `● ` tab-title prefix and beforeunload guard. `useSectionEditor` (`demo/s3-browser/ui/src/useSectionEditor.ts`) is the single home for the fetch → dirty → validate → ApplyDialog → PUT → markApplied pipeline (with `pick`/`toPayload` hooks for subset-editing Advanced sub-panels and the Admission array↔`{blocks}` shape); new section panels should plug into it rather than re-carrying ~150 LOC of boilerplate.
 
-Admin API at `/_/api/admin/*` (login, login-as, whoami, users CRUD, groups, config, auth providers, mapping rules, backup, config/section/:name, config/export, config/apply, config/validate, config/trace, config/defaults, config/sync-now, iam/version, **audit**). `POST /api/admin/backup` restores `external_identities` (v2+, with ID remapping + fallback heuristics for legacy backups without explicit user IDs). Whoami returns user identity from session (name, access_key_id, is_admin, version). S3 operations in `s3client.ts` (includes copyObject, listAllKeys, getObjectBytes). Metrics at `/_/metrics`, stats at `/_/stats` (metadata=true for accurate delta sizes), health at `/_/health` (no version — security). Error pages respect user theme (dark/light via localStorage + CSS prefers-color-scheme). **Ant Design tooltips are globally disabled** via CSS (`display: none !important` on `.ant-tooltip, .ant-popover`) — use native `title` attributes instead. The AntD 6 radio/checkbox "shrink on click" default is disabled in `theme.css`.
+**Convergence primitives (PR #24).** Three shared frontend primitives replaced copy-pasted variants — reuse, don't re-implement: `MaskedSecretInput` (`components/MaskedSecretInput.tsx`) — the single masked-secret field; `mode="sentinel"` (shows empty while carrying `REDACTED_SENTINEL`, passes it through untouched on save — webhook headers, Slack bot token) vs `mode="blank-keeps"` (blank = keep existing, non-blank = rotate). `RowListEditor<T>` (`components/RowListEditor.tsx`) — stable-`id`-keyed add/remove/update-by-id list scaffolding (never array index); the consumer owns `renderRow` + folds the next array into its single source of truth. `StatePlaceholders` (`components/StatePlaceholders.tsx`) — `LoadingState` / `EmptyState` chrome (consistent centering/padding/type scale). **IAM panels are react-query-backed**: the `queries/{groups,authProviders,mappingRules,users,backends,...}.ts` hooks (keyed by `qk.*`) own reads + per-record mutations and invalidate on success — the old `loadData()`/prop→state-mirror idiom is gone (residual `loadData` mentions in panels are tombstone comments). `FormField`'s yaml-path chip is hover/focus-only (`.dg-field .dg-yaml-path` in theme.css) so the bold label leads; `SectionHeader` owns its own header gap.
+
+Admin API at `/_/api/admin/*` (login, login-as, whoami, users CRUD, groups, config, auth providers, mapping rules, backup, config/section/:name, config/export, config/apply, config/validate, config/trace, config/defaults, config/sync-now, iam/version, ext-auth/version, **audit**). `POST /api/admin/backup` restores `external_identities` (v2+, with ID remapping + fallback heuristics for legacy backups without explicit user IDs). Whoami returns user identity from session (name, access_key_id, is_admin, version). S3 operations in `s3client.ts` (includes copyObject, listAllKeys, getObjectBytes). Metrics at `/_/metrics`, stats at `/_/stats` (metadata=true for accurate delta sizes), health at `/_/health` (no version — security). Error pages respect user theme (dark/light via localStorage + CSS prefers-color-scheme). **Ant Design tooltips are globally disabled** via CSS (`display: none !important` on `.ant-tooltip, .ant-popover`) — use native `title` attributes instead. The AntD 6 radio/checkbox "shrink on click" default is disabled in `theme.css`.
 
 ## Testing
 
@@ -172,11 +205,12 @@ Property tests via `proptest` (dev-dep) live in the same module as the pure func
 - Delta-eligible file types are defined in `deltaglider/file_router.rs`
 - Passthrough files (images, video) skip delta entirely — already compressed
 - Streaming is preferred for large files; delta reconstruction requires buffering the reference
+- Parse env vars through `env_parse` / `env_bool` / `env_parse_with_default` in `config.rs` — these are THE convention; don't hand-roll `std::env::var(...).ok().and_then(...)` at call sites
 
 ## Testability principles (write code that's testable from day one)
 
-- **Pure functions at decision points.** When a handler is deciding "is this request valid / authorized / retryable", extract the decision into a `fn(typed_input) -> typed_output` and have the handler do I/O around it. Prior art: `classify_s3_error` / `classify_get_error` in `src/storage/s3.rs`, `validate_bucket_name` / `bucket_name_is_ip_like` in `src/security.rs`. Both are unit-tested against the full truth table (and proptested in the bucket case) without spinning up a server.
-- **Expose observable counters for async state transitions.** The `IAM_VERSION` `AtomicU64` in `src/iam/mod.rs` + `GET /_/api/admin/iam/version` turned a 1s sleep into a 50ms deterministic barrier (`wait_for_iam_rebuild` in `tests/common/mod.rs`). Future async state changes (config reloads, external-auth discovery, scanner refreshes) should follow the same pattern: a monotonic counter bumped after the new state is published, polled by whoever needs to wait for it.
+- **Pure functions at decision points.** When a handler is deciding "is this request valid / authorized / retryable", extract the decision into a `fn(typed_input) -> typed_output` and have the handler do I/O around it. Prior art: `classify_s3_error` / `classify_get_error` in `src/storage/s3.rs`, `validate_bucket_name` / `bucket_name_is_ip_like` in `src/security.rs`, `classify_sqlite_error` in `src/config_db/mod.rs` (NotFound / Conflict / Other from a `rusqlite::Error`), `validate_mapping_rule` in `src/api/admin/external_auth.rs` (regex-compile gate for OIDC mapping rules), `Config::classify_auth_config` in `src/config.rs` (credentials-enabled / open-access / fatal auth-mode decision). All are unit-tested against the full truth table (and proptested where applicable) without spinning up a server.
+- **Expose observable counters for async state transitions.** The `IAM_VERSION` `AtomicU64` in `src/iam/mod.rs` + `GET /_/api/admin/iam/version` turned a 1s sleep into a 50ms deterministic barrier (`wait_for_iam_rebuild` in `tests/common/mod.rs`). `EXT_AUTH_VERSION` in `src/api/admin/external_auth.rs` + `GET /_/api/admin/ext-auth/version` mirrors the pattern for OAuth/OIDC-provider rebuilds (`bump_ext_auth_version` / `current_ext_auth_version`). Future async state changes (config reloads, external-auth discovery, scanner refreshes) should follow the same pattern: a monotonic counter bumped after the new state is published, polled by whoever needs to wait for it.
 - **Don't put test-relevant helpers in binary-only modules.** `reopen_and_rebuild_iam` had to move from `src/startup.rs` (binary) to `src/config_db_sync.rs` (library) before the admin `sync-now` handler could reach it. Rule: if a helper might be called from more than one trigger (startup, periodic task, admin endpoint, test), put it in the library side from day one — `src/startup.rs` is the last mile, not a grab bag.
 - **Test the observable contract, not the implementation.** Integration tests cost a TestServer spawn (~200ms + MinIO when S3). Unit-test anything that doesn't need the whole HTTP/SigV4/storage stack; reserve integration tests for request-pipeline seams, concurrency races, and cross-subsystem invariants (metadata cache vs storage, admission vs auth, etc.). The hygiene pass in `5f38941` deleted 659 LOC of integration tests that were re-covering pure-function logic.
 - **Property tests for pure validators.** Anywhere there's an "is this valid / allowed / well-formed" check, proptest it alongside hand-picked cases. Saves enumerating 20 shapes and catches the weird input nobody thought of. Keep the enumerated cases too — they document the specific invariants a reader should see at a glance. Stress with `PROPTEST_CASES=2000` locally before a big change.

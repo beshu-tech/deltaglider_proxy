@@ -1,9 +1,10 @@
-# Lazy bucket replication (v1)
+# Bucket replication (event-driven)
 
 *Engine-routed source → destination object copy, transparent to
-per-backend encryption and delta compression. v1 ships automatic
-scheduled runs, run-now, pause/resume, state, history, and delete
-replication.*
+per-backend encryption and delta compression. Replication is
+**event-driven** (v1.2.0): object mutations are copied in near-real
+time, with a slow full reconcile as the self-healing safety net.
+Ships run-now, pause/resume, state, history, and delete replication.*
 
 ## Why it lives in the proxy
 
@@ -20,13 +21,34 @@ to delta-compress and which encryption mode to apply.
 
 ![Object replication settings](/_/screenshots/object-replication.jpg)
 
-## v1 scope
+## How it triggers
+
+Replication has two paths, primary and backstop:
+
+- **Event-driven (primary).** Object mutations (PUT / DELETE / COPY /
+  CompleteMultipartUpload) are appended to the durable `event_outbox`
+  by the S3 write path. A per-process event consumer drains the outbox
+  in near-real time over its own per-listener cursor (`WHERE id > cursor`,
+  independent of the webhook-delivery listener), compacts a burst of
+  events for one `(bucket, key)` into a single liveness verdict, and fans
+  each surviving key out to every replication rule whose `source` matches.
+  The Copy-vs-skip / Delete-vs-noop idempotency is the planner's job
+  (`should_replicate` + a destination HEAD) — the same logic reconcile
+  uses, so there is no separate per-key sync table. See
+  [event-outbox.md](event-outbox.md) for the cursor/compaction model.
+- **Full reconcile (safety net).** Each rule's `interval` (default **24h**)
+  schedules a slow full source list-and-diff that catches anything a
+  dropped event missed. Events are the primary trigger; the reconcile
+  sweep is the self-healing backstop, NOT the main copy path.
+
+## Scope
 
 - One-way, bucket/prefix-level replication through the DeltaGlider
-  engine. The scheduler runs due rules automatically; operators can
+  engine. The event consumer replicates mutations automatically; the
+  reconcile scheduler runs due rules on their `interval`; operators can
   also trigger a rule through the admin API or GUI.
-- Rules carry `interval` and persisted `next_due_at` state. Disabled
-  rules and paused rules are skipped by both the scheduler and run-now.
+- Disabled rules and paused rules are skipped by the event consumer,
+  the reconcile scheduler, and run-now alike.
 - A per-rule DB lease prevents the scheduler and run-now from executing
   the same rule at the same time. If a rule is already leased, run-now
   returns `409 Conflict` and the scheduler skips that tick. Long runs
@@ -60,7 +82,7 @@ storage:
         destination:
           bucket: backup-artifacts
           prefix: ""                 # optional remap
-        interval: "15m"              # humantime (min 30s; used for next_due_at)
+        interval: "24h"              # full-reconcile safety net (humantime, min 30s) — NOT the primary trigger
         batch_size: 100              # objects per scheduler yield
         replicate_deletes: false
         conflict: newer-wins

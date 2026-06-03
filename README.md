@@ -72,8 +72,8 @@ Everything managed from a web UI served on the same port as the S3 API — no ex
 - **Backend management** — Add/remove storage backends, configure per-bucket routing, aliasing, compression policies, and public prefixes
 - **Bucket controls** — Configure soft quotas, read-only bucket freeze, public prefixes, aliases, and compression policy
 - **Object lifecycle** — Preview and run delete-only expiration rules, with scheduler history/failures and engine-routed deletes
-- **Object replication** — Configure source → destination replication rules, scheduler cadence, run-now, pause/resume, history/failures, and delete replication
-- **Event outbox** — Durable object mutation events with background webhook delivery, fan-out endpoints, retry backoff, and failed-row requeue
+- **Object replication** — Configure source → destination replication rules, all from the GUI: event-driven (mutations replicate in near-real time, with a slow full-reconcile safety net), run-now, pause/resume, history/failures, and delete replication
+- **Event outbox & notifications** — Durable object mutation events with background webhook delivery, fan-out endpoints, retry backoff, and failed-row requeue — all GUI-editable. Built-in **Slack** formatting: post object events to a channel via an Incoming Webhook URL or a bot token, with per-bucket/prefix → channel routing
 - **Monitoring dashboard** — Live Prometheus metrics: request rates, latencies, cache hit rates, status codes, auth events
 - **Storage analytics** — Per-bucket savings breakdown, estimated monthly cost savings, compression opportunity detection
 - **Embedded documentation** — Full-text searchable reference docs with architecture diagrams
