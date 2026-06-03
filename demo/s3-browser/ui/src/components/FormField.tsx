@@ -88,8 +88,8 @@ export default function FormField({
   children,
   style,
 }: FormFieldProps) {
-  const { TEXT_PRIMARY: TEXT, TEXT_MUTED, TEXT_FAINT, BG_CARD, BORDER } = useColors();
-  const barColour = overrideColour || '#d18616'; // amber — matches §2.6 "override" indicator
+  const { TEXT_PRIMARY: TEXT, TEXT_MUTED, TEXT_FAINT, BG_CARD, BORDER, ACCENT_AMBER } = useColors();
+  const barColour = overrideColour || ACCENT_AMBER; // amber — matches §2.6 "override" indicator
   // Tight groups, air between: the label→input→help unit hugs together; the
   // BIG gap lives at the bottom of the group so each field reads as one chunk.
   const containerStyle: CSSProperties = {

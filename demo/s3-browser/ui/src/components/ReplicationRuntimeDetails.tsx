@@ -2,6 +2,7 @@ import { Alert, Tag, Typography } from 'antd';
 import { WarningOutlined } from '@ant-design/icons';
 import type { ReplicationFailureEntry, ReplicationHistoryEntry } from '../adminApi';
 import { fmtUnix } from './ruleEditorHelpers';
+import { useColors } from '../ThemeContext';
 
 const { Text } = Typography;
 
@@ -84,6 +85,7 @@ function FailureSection({
   emptyText: string;
   prominent?: boolean;
 }) {
+  const { ACCENT_RED } = useColors();
   return (
     <div>
       <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' }}>
@@ -123,7 +125,7 @@ function FailureSection({
             }}
           >
             <div>
-              <WarningOutlined style={{ color: '#d1617a', marginRight: 6 }} />
+              <WarningOutlined style={{ color: ACCENT_RED, marginRight: 6 }} />
               <Text type="secondary">{fmtUnix(failure.occurred_at)}</Text>
               {failure.run_id != null && <Tag>run #{failure.run_id}</Tag>}
             </div>

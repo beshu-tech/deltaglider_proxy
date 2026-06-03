@@ -48,7 +48,7 @@ export default function ApplyDialog({
   loading,
   summary,
 }: Props) {
-  const { TEXT_PRIMARY: TEXT, TEXT_MUTED, BORDER, BG_CARD } = useColors();
+  const { TEXT_PRIMARY: TEXT, TEXT_MUTED, BORDER, BG_CARD, ACCENT_RED, ACCENT_GREEN } = useColors();
 
   if (!response) return null;
 
@@ -151,10 +151,10 @@ export default function ApplyDialog({
             {diffRows.map(([path, change]) => (
               <div key={path} style={{ marginBottom: 10 }}>
                 <div style={{ color: TEXT, fontWeight: 600, marginBottom: 2 }}>{path}</div>
-                <div style={{ color: '#d1617a', opacity: 0.9 }}>
+                <div style={{ color: ACCENT_RED, opacity: 0.9 }}>
                   -&nbsp;{formatValue(change.before)}
                 </div>
-                <div style={{ color: '#4bc77a', opacity: 0.9 }}>
+                <div style={{ color: ACCENT_GREEN, opacity: 0.9 }}>
                   +&nbsp;{formatValue(change.after)}
                 </div>
               </div>

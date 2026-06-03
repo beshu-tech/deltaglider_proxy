@@ -6,6 +6,7 @@ import type {
   LifecycleRunOutcome,
 } from '../adminApi';
 import { formatBytes } from '../utils';
+import { useColors } from '../ThemeContext';
 import { fmtUnix, formRow } from './ruleEditorHelpers';
 import { fmtDate } from './lifecycleHelpers';
 import Metric from './LifecycleMetric';
@@ -177,6 +178,7 @@ function FailureSection({
   emptyText: string;
   prominent?: boolean;
 }) {
+  const { ACCENT_RED } = useColors();
   return (
     <div>
       <div style={formRow(8, { justifyContent: 'space-between' })}>
@@ -211,7 +213,7 @@ function FailureSection({
             }}
           >
             <div>
-              <WarningOutlined style={{ color: '#d1617a', marginRight: 6 }} />
+              <WarningOutlined style={{ color: ACCENT_RED, marginRight: 6 }} />
               <Text type="secondary">{fmtUnix(failure.occurred_at)}</Text>
               {failure.run_id != null && <Tag>run #{failure.run_id}</Tag>}
             </div>

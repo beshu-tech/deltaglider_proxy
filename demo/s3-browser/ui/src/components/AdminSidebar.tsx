@@ -58,7 +58,7 @@ interface Props {
 }
 
 export default function AdminSidebar({ activePath, onNavigate }: Props) {
-  const { BG_CARD, BORDER, ACCENT_BLUE, TEXT_SECONDARY, TEXT_MUTED } = useColors();
+  const { BG_CARD, BORDER, ACCENT_BLUE, ACCENT_AMBER, TEXT_SECONDARY, TEXT_MUTED } = useColors();
   // Re-render whenever the dirty set changes (§5.2 amber dots).
   //
   // Structural dedupe: `getDirtySections()` returns a brand-new Set
@@ -138,7 +138,7 @@ export default function AdminSidebar({ activePath, onNavigate }: Props) {
                 width: 8,
                 height: 8,
                 borderRadius: 4,
-                background: '#d18616',
+                background: ACCENT_AMBER,
                 flexShrink: 0,
               }}
             />

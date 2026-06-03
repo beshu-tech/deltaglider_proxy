@@ -5,7 +5,7 @@ import rehypeHighlight from 'rehype-highlight';
 import rehypeSlug from 'rehype-slug';
 import mermaid from 'mermaid';
 import { DOCS, DOC_GROUPS, findDocByFilename, type DocEntry } from '../docs-imports';
-import { useColors } from '../ThemeContext';
+import { useColors, useTheme } from '../ThemeContext';
 import FullScreenHeader from './FullScreenHeader';
 import DocSearch from './DocSearch';
 import Lightbox from './Lightbox';
@@ -15,8 +15,6 @@ import '../docs.css';
 
 mermaid.initialize({
   startOnLoad: false,
-  theme: 'dark',
-  themeVariables: { primaryColor: '#2dd4bf', lineColor: '#5e7290' },
   flowchart: { useMaxWidth: false },
   sequence: { useMaxWidth: false },
 });
@@ -27,15 +25,26 @@ mermaid.initialize({
 function Mermaid({ chart, caption }: { chart: string; caption?: string }) {
   const ref = useRef<HTMLDivElement>(null);
   const [svg, setSvg] = useState('');
+  const { isDark } = useTheme();
+  const { ACCENT_BLUE, TEXT_FAINT } = useColors();
 
   useEffect(() => {
     let cancelled = false;
     const id = `mermaid-${Math.random().toString(36).slice(2, 8)}`;
+    // Re-apply theme-aware variables before each render so diagrams track
+    // the active light/dark theme instead of a frozen palette.
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: isDark ? 'dark' : 'default',
+      themeVariables: { primaryColor: ACCENT_BLUE, lineColor: TEXT_FAINT },
+      flowchart: { useMaxWidth: false },
+      sequence: { useMaxWidth: false },
+    });
     mermaid.render(id, chart).then(({ svg: rendered }) => {
       if (!cancelled) setSvg(rendered);
     }).catch(console.warn);
     return () => { cancelled = true; };
-  }, [chart]);
+  }, [chart, isDark, ACCENT_BLUE, TEXT_FAINT]);
 
   // After SVG is in the DOM, try to tighten the viewBox to fit the
   // drawn content — Mermaid's default is often 2-3× too tall, which
