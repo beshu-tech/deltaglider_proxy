@@ -12,8 +12,16 @@ and committable.**
 
 ## Deploy
 ```bash
-# 1. Pull secrets into the env (from Vault/SOPS/sealed-secrets/CI store).
-cp secrets.env.template secrets.env && <fill secrets.env>
+# 1. Get secrets into secrets.env (gitignored). Two ways:
+#
+#  EASY — from a fresh prod backup zip (current config + all real secrets):
+#    curl -fsS -b prod-cookies.txt https://<PROD>/_/api/admin/backup -o prod-backup.zip
+#    ./backup-zip-to-secrets-env.sh prod-backup.zip secrets.env
+#  (the script maps the zip's secrets.json + iam.json into secrets.env; values
+#   stay on your machine. Run it yourself — it touches live secrets.)
+#
+#  OR — wire each value from your secret manager (Vault/SOPS/1Password/CI):
+#    cp secrets.env.template secrets.env && <fill secrets.env>
 set -a && . ./secrets.env && set +a
 
 # 2. Render the ${VAR} placeholders in the YAML (Group-2 secrets).
@@ -25,6 +33,12 @@ deltaglider_proxy config lint config.yaml
 # 4. Run. DGP_* vars (Group 1) are read natively; DGP_CONFIG points at the file.
 DGP_CONFIG=/etc/deltaglider_proxy/config.yaml deltaglider_proxy
 ```
+
+> The backup zip is the single source of truth for **current** prod config +
+> secrets. The committed `deltaglider_proxy.yaml` is the *structure* (kept in
+> sync with prod); the zip fills the *secret values*. If the committed YAML and
+> a fresh backup's `iam.json` ever disagree on users/groups, prod drifted —
+> regenerate the YAML from the export.
 
 Helm/Kustomize users: skip `envsubst` and use your native secret-ref injection
 for the Group-2 `${VAR}` values; keep the Group-1 `DGP_*` values as container env.

@@ -2,3 +2,11 @@
 secrets.env
 *.rendered.yaml
 config.yaml
+
+# Backup artifacts (contain LIVE prod secrets — keep local, never commit).
+*.zip
+secrets.json
+iam.json
+manifest.json
+*.db
+*.db.bak
