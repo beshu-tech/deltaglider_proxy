@@ -19,22 +19,19 @@
 # =============================================================================
 
 storage:
-  # Default backend (kept for back-compat with single-backend deployments).
-  backend:
-    type: s3
-    endpoint: https://hel1.your-objectstorage.com
-    region: hel1
-    force_path_style: true
-    # Injected via DGP_BE_AWS_ACCESS_KEY_ID / DGP_BE_AWS_SECRET_ACCESS_KEY (Pattern A).
-    # access_key_id / secret_access_key intentionally omitted here.
-
+  # Named backends are the source of truth (the legacy singular `backend:` is
+  # ignored at runtime once `backends:` is non-empty, so it's omitted). Creds go
+  # inline as ${VAR} placeholders: the DGP_BE_AWS_* env vars only feed the
+  # singular backend, NOT named backends, so named-backend secrets must be
+  # substituted into the YAML by your deploy tooling.
   backends:
     - name: HetznerHelsinki1
       type: s3
       endpoint: https://hel1.your-objectstorage.com
       region: hel1
       force_path_style: true
-      # Same creds as `backend` above (single upstream). Injected via env.
+      access_key_id: ${BACKEND_HETZNER_ACCESS_KEY_ID}
+      secret_access_key: ${BACKEND_HETZNER_SECRET_ACCESS_KEY}
   default_backend: HetznerHelsinki1
 
   buckets:
@@ -96,18 +93,6 @@ access:
       enabled: true
       groups:
         - Customers
-
-    # NOTE: `test` exists in prod with full access to debug/*. Almost certainly
-    # a leftover test account — REVIEW: drop it from the prod IaC unless it's
-    # genuinely needed.
-    - name: test
-      access_key_id: test
-      secret_access_key: ${USER_TEST_SECRET}
-      enabled: true
-      permissions:
-        - effect: Allow
-          actions: [delete, write, list, read]
-          resources: ["debug/*"]
 
     # NOTE: `legacy-admin` is a wildcard-admin with access_key_id `admin` and
     # INLINE permissions (not via the Administrators group). REVIEW: consider

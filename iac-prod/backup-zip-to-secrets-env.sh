@@ -56,9 +56,8 @@ user_var() {
     "ror-ci-ro")        echo "USER_ROR_CI_RO_SECRET" ;;
     "rorkbn-ci")        echo "USER_RORKBN_CI_SECRET" ;;
     "xperi")            echo "USER_XPERI_SECRET" ;;
-    "test")             echo "USER_TEST_SECRET" ;;
     "legacy-admin")     echo "USER_LEGACY_ADMIN_SECRET" ;;
-    *)                  echo "" ;;   # OAuth-provisioned / unknown → skip
+    *)                  echo "" ;;   # OAuth-provisioned / dropped (test) / unknown → skip
   esac
 }
 
@@ -73,14 +72,17 @@ chmod 600 "$OUT"
 
 echo "Writing $OUT (filled keys logged, values hidden):"
 
-emit DGP_BE_AWS_ACCESS_KEY_ID     "$SEC" '.storage.access_key_id'
-emit DGP_BE_AWS_SECRET_ACCESS_KEY "$SEC" '.storage.secret_access_key'
 emit DGP_BOOTSTRAP_PASSWORD_HASH  "$SEC" '.bootstrap_password_hash'
 { echo "DGP_CONFIG=/etc/deltaglider_proxy/config.yaml"
   echo "DGP_LISTEN_ADDR=0.0.0.0:9000"
   echo
   echo "# ── \${VAR} placeholders substituted into the YAML ──"
 } >> "$OUT"
+
+# Named-backend (Hetzner) creds — inline in the YAML, so ${VAR}, not DGP_BE_AWS_*.
+# Pulled from the backup's storage secrets (same upstream as the singular backend).
+emit BACKEND_HETZNER_ACCESS_KEY_ID     "$SEC" '.storage.access_key_id'
+emit BACKEND_HETZNER_SECRET_ACCESS_KEY "$SEC" '.storage.secret_access_key'
 
 # OAuth client secret (provider name "goog" → GOOGLE_OAUTH_CLIENT_SECRET).
 emit GOOGLE_OAUTH_CLIENT_SECRET   "$SEC" '.oauth_client_secrets.goog'
