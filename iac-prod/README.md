@@ -9,6 +9,8 @@ and committable.**
 - `secrets.env.template` — every secret the deployment needs. Copy to
   `secrets.env`, fill from your secret manager, **never commit the filled copy**
   (`.gitignore` blocks it).
+- `backup-zip-to-secrets-env.sh` — converts a prod backup zip into a filled
+  `secrets.env` (run it yourself; values stay local). See Deploy step 1.
 
 ## Deploy
 ```bash
