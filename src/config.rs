@@ -2295,12 +2295,13 @@ pub enum ConfigError {
 /// secret-free config with `${env:...}` placeholders and inject the values as
 /// env vars.
 ///
-/// **The `env:` prefix is mandatory and deliberate.** DGP already uses the bare
-/// `${...}` namespace for runtime IAM permission templates (`${username}`,
-/// `${access_key_id}`, `${email}`, `${filename}`), which are substituted
-/// per-request at auth time — NOT here. Scoping env expansion to `${env:NAME}`
-/// keeps the two namespaces from colliding: a bare `${username}` passes through
-/// this expander untouched for the IAM layer to resolve later.
+/// **The `env:` prefix is mandatory and deliberate.** Other `${ns:...}`
+/// namespaces resolve at different times — notably `${iam:username}` /
+/// `${iam:access_key_id}` (runtime IAM permission templates, substituted
+/// per-request at auth time — NOT here). Scoping config expansion to `${env:..}`
+/// keeps the namespaces from colliding: every `${ns:name}` declares when it
+/// resolves, and ANY non-`env:` `${...}` (including `${iam:...}` and a bare
+/// `${foo}`) passes through this expander untouched.
 ///
 /// Rules (a small, predictable subset — NOT a shell):
 /// - `${env:NAME}` → the value of env var `NAME`; **error** if unset (fail loud,
@@ -2354,8 +2355,8 @@ pub(crate) fn expand_env_with(
                     })?;
                 let inner = &input[start..end];
                 // Only `${env:NAME...}` is an env reference. Anything else (IAM
-                // permission templates like `${username}`, or any other `${...}`)
-                // is emitted VERBATIM so the downstream consumer can handle it.
+                // permission templates like `${iam:username}`, or any other
+                // `${...}`) is emitted VERBATIM for the downstream consumer.
                 match inner.strip_prefix("env:") {
                     None => {
                         out.push_str(&input[i..=end]); // copy `${...}` unchanged
@@ -2476,32 +2477,33 @@ mod tests {
         assert_eq!(r, "a=[]");
     }
 
-    /// THE collision guard: bare `${...}` (IAM permission templates) is NEVER
-    /// touched by env expansion — only the `env:`-prefixed form expands. This is
-    /// the bug that crash-looped a live deploy: `${username}` in a declarative
-    /// config's resources must pass through to the IAM layer verbatim.
+    /// THE collision guard: any non-`env:` `${...}` (IAM permission templates
+    /// like `${iam:username}`, or a bare `${foo}`) is NEVER touched by env
+    /// expansion — only `${env:...}` expands. This is the bug that crash-looped
+    /// a live deploy: `${iam:username}` in a declarative config's resources must
+    /// pass through to the IAM layer verbatim.
     #[test]
     fn expand_leaves_iam_templates_untouched() {
         for tmpl in [
-            "resources: [debug/scrap/customers/${username}/*]",
-            "home/${access_key_id}/*",
-            "${email}",
-            "${filename}",
+            "resources: [debug/scrap/customers/${iam:username}/*]",
+            "home/${iam:access_key_id}/*",
+            "${iam:username}",
             "${anything_without_env_prefix}",
+            "${env_but_no_colon}", // not `env:` → passthrough
         ] {
             assert_eq!(
-                expand_env_with(tmpl, env_of(&[("username", "SHOULD_NOT_BE_USED")])).unwrap(),
+                expand_env_with(tmpl, env_of(&[("iam:username", "SHOULD_NOT_BE_USED")])).unwrap(),
                 tmpl,
-                "bare ${{...}} must pass through unexpanded"
+                "non-env ${{...}} must pass through unexpanded"
             );
         }
         // Mixed line: only the env: one expands, the IAM one is preserved.
         let r = expand_env_with(
-            "key: ${env:AK}  path: home/${username}/*",
+            "key: ${env:AK}  path: home/${iam:username}/*",
             env_of(&[("AK", "realkey")]),
         )
         .unwrap();
-        assert_eq!(r, "key: realkey  path: home/${username}/*");
+        assert_eq!(r, "key: realkey  path: home/${iam:username}/*");
     }
 
     #[test]

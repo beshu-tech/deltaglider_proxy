@@ -154,7 +154,7 @@ access:
       permissions:
         - effect: Allow
           actions: [read, write, delete]
-          resources: ["debug/scrap/customers/${username}/*"]
+          resources: ["debug/scrap/customers/${iam:username}/*"]
         - effect: Allow
           actions: [list]
           resources: ["debug"]
@@ -164,8 +164,8 @@ access:
                 - ""
                 - scrap/
                 - scrap/customers/
-                - scrap/customers/${username}/
-                - scrap/customers/${username}/*
+                - scrap/customers/${iam:username}/
+                - scrap/customers/${iam:username}/*
 
   auth_providers:
     - name: goog

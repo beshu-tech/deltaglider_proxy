@@ -112,7 +112,7 @@ export default function ConditionPrefixInput({ value, onChange, bucket = '', sty
   const activeValue = focusedRow?.text || '';
   const prefixQuery = useMemo(() => prefixQueryFromPattern(activeValue), [activeValue]);
   const templateSuggestions = useMemo(
-    () => ['home/${username}/*', 'keys/${access_key_id}/*', '.*'] as string[],
+    () => ['home/${iam:username}/*', 'keys/${iam:access_key_id}/*', '.*'] as string[],
     [],
   );
 

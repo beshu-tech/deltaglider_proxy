@@ -106,8 +106,10 @@ Resource strings and string condition values may use identity templates:
 
 | Template | Expands to |
 |---|---|
-| `${username}` | The authenticated IAM user's `name` |
-| `${access_key_id}` | The authenticated IAM user's access key ID |
+| `${iam:username}` | The authenticated IAM user's `name` |
+| `${iam:access_key_id}` | The authenticated IAM user's access key ID |
+
+The `iam:` prefix is required. It marks these as **request-time** identity substitutions, distinct from the `${env:NAME}` **load-time** config expansion (which fills secrets from the environment when the config file is read). A bare `${username}` (no namespace) is rejected — use `${iam:username}`.
 
 Expansion happens when the in-memory IAM index is built, after group permissions are merged into each member user. The DB/YAML keeps the raw template. Values are percent-encoded before substitution, so a username like `alice/team*` becomes `alice%2Fteam%2A` and cannot inject slashes or wildcards. Unknown templates are rejected by user/group API validation and declarative IAM apply.
 
@@ -117,7 +119,7 @@ Example per-user home prefix:
 {
   "effect": "Allow",
   "actions": ["read", "write", "list"],
-  "resources": ["my-bucket/home/${username}/*"]
+  "resources": ["my-bucket/home/${iam:username}/*"]
 }
 ```
 

@@ -24,11 +24,11 @@ const ATOMIC_ACTIONS = ['list', 'read', 'write', 'delete', 'admin'] as const;
  *   (admin offered / N/A).
  * - A MIXED list where ANY resource is bucket-level → false (admin meaningful
  *   for that one, so offer it; `.every` short-circuits).
- * - A template-bucket resource (`${username}/x/*`) WITH a prefix → true. A
+ * - A template-bucket resource (`${iam:username}/x/*`) WITH a prefix → true. A
  *   templated bucket is still not a real bucket-op target, and failing toward
  *   "admin hidden" is the privilege-safe choice. (This is the one spot the
  *   template case is intentionally treated like any other prefix grant —
- *   `${username}/*` with no prefix → false, admin offered, same as a bare
+ *   `${iam:username}/*` with no prefix → false, admin offered, same as a bare
  *   bucket.)
  */
 export function isPrefixScoped(resources: string): boolean {

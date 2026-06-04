@@ -481,7 +481,7 @@ mod tests {
                 id: 0,
                 effect: "Allow".into(),
                 actions: vec!["read".into()],
-                resources: vec!["prod/home/${username}/*".into()],
+                resources: vec!["prod/home/${iam:username}/*".into()],
                 conditions: None,
             }],
             member_ids: vec![1, 2],

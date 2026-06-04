@@ -18,7 +18,11 @@ use super::types::{Permission, S3Action};
 
 /// Valid action verbs for permissions.
 const VALID_ACTIONS: &[&str] = &["read", "write", "delete", "list", "admin", "*"];
-const ALLOWED_TEMPLATE_VARIABLES: &[&str] = &["username", "access_key_id"];
+/// IAM identity template variables, namespaced under `iam:`. The `iam:` prefix
+/// is mandatory and disambiguates these REQUEST-TIME substitutions from the
+/// `${env:NAME}` LOAD-TIME config expansion (see `config::expand_env_vars`):
+/// every `${ns:name}` declares its namespace, and a bare `${...}` is a literal.
+const ALLOWED_TEMPLATE_VARIABLES: &[&str] = &["iam:username", "iam:access_key_id"];
 
 fn validate_template_vars(value: &str) -> Result<(), String> {
     let mut rest = value;
@@ -28,9 +32,12 @@ fn validate_template_vars(value: &str) -> Result<(), String> {
             return Err(format!("unterminated template variable in '{}'", value));
         };
         let name = &after_start[..end];
+        // Only `iam:`-prefixed names are IAM template variables. A bare `${...}`
+        // (no recognised namespace) is rejected so a typo or a stale pre-`iam:`
+        // `${username}` policy fails loudly rather than silently never matching.
         if !ALLOWED_TEMPLATE_VARIABLES.contains(&name) {
             return Err(format!(
-                "unknown template variable '${{{}}}' in '{}' (allowed: ${{username}}, ${{access_key_id}})",
+                "unknown template variable '${{{}}}' in '{}' (allowed: ${{iam:username}}, ${{iam:access_key_id}})",
                 name, value
             ));
         }
@@ -69,8 +76,11 @@ fn expand_template_value(
 ) -> Result<String, String> {
     validate_template_vars(value)?;
     Ok(value
-        .replace("${username}", &encode_template_value(username))
-        .replace("${access_key_id}", &encode_template_value(access_key_id)))
+        .replace("${iam:username}", &encode_template_value(username))
+        .replace(
+            "${iam:access_key_id}",
+            &encode_template_value(access_key_id),
+        ))
 }
 
 fn expand_condition_templates(
@@ -106,7 +116,7 @@ fn expand_condition_templates(
 /// Expand identity templates in effective permissions for one authenticated user.
 ///
 /// Stored DB/YAML permissions remain raw templates. At index-build time,
-/// `${username}` and `${access_key_id}` are substituted with percent-encoded
+/// `${iam:username}` and `${iam:access_key_id}` are substituted with percent-encoded
 /// identity values so user-controlled names cannot inject `/` or `*`.
 pub fn expand_permission_templates(
     permissions: &[Permission],
@@ -352,7 +362,7 @@ pub fn normalize_permissions(permissions: &mut [Permission]) {
 /// - Resources must not be empty
 /// - Resource patterns: only trailing `*` is supported (no mid-pattern wildcards)
 /// - Resource must not contain whitespace or control characters
-/// - `${username}` and `${access_key_id}` may appear in resources or string condition values
+/// - `${iam:username}` and `${iam:access_key_id}` may appear in resources or string condition values
 /// - Maximum 100 rules per user/group
 pub fn validate_permissions(permissions: &[Permission]) -> Result<(), String> {
     if permissions.len() > MAX_PERMISSION_RULES {
@@ -1732,10 +1742,10 @@ mod tests {
             id: 0,
             effect: "Allow".into(),
             actions: vec!["read".into(), "list".into()],
-            resources: vec!["bucket/home/${username}/*".into()],
+            resources: vec!["bucket/home/${iam:username}/*".into()],
             conditions: Some(serde_json::json!({
                 "StringLike": {
-                    "s3:prefix": ["home/${username}/*", "keys/${access_key_id}/*"]
+                    "s3:prefix": ["home/${iam:username}/*", "keys/${iam:access_key_id}/*"]
                 }
             })),
         }];
@@ -1766,7 +1776,7 @@ mod tests {
             resources: vec!["bucket".into()],
             conditions: Some(serde_json::json!({
                 "StringLike": {
-                    "s3:prefix": ["home/${username}/*", "home/${email}/*"]
+                    "s3:prefix": ["home/${iam:username}/*", "home/${email}/*"]
                 }
             })),
         }];
@@ -1782,12 +1792,12 @@ mod tests {
             effect: "Allow".into(),
             actions: vec!["read".into(), "list".into()],
             resources: vec![
-                "bucket/home/${username}/*".into(),
-                "bucket/keys/${access_key_id}/*".into(),
+                "bucket/home/${iam:username}/*".into(),
+                "bucket/keys/${iam:access_key_id}/*".into(),
             ],
             conditions: Some(serde_json::json!({
                 "StringLike": {
-                    "s3:prefix": ["home/${username}/*", "keys/${access_key_id}/*"]
+                    "s3:prefix": ["home/${iam:username}/*", "keys/${iam:access_key_id}/*"]
                 }
             })),
         }];

@@ -83,7 +83,7 @@ async fn test_username_template_in_direct_permissions_scopes_to_own_prefix() {
         vec![json!({
             "effect": "Allow",
             "actions": ["read", "list"],
-            "resources": [format!("{}/home/${{username}}/*", server.bucket())]
+            "resources": [format!("{}/home/${{iam:username}}/*", server.bucket())]
         })],
     )
     .await;
@@ -119,7 +119,7 @@ async fn test_username_template_in_group_permissions_expands_per_member() {
             "permissions": [{
                 "effect": "Allow",
                 "actions": ["read", "list"],
-                "resources": [format!("{}/home/${{username}}/*", server.bucket())]
+                "resources": [format!("{}/home/${{iam:username}}/*", server.bucket())]
             }],
             "member_ids": [bob.id]
         }))

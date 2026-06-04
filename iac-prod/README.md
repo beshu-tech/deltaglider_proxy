@@ -19,9 +19,9 @@ and committable.**
 DGP expands `${env:NAME}` and `${env:NAME:-default}` **in-process** when it loads
 the config (the in-program replacement for an external `envsubst`). The `env:`
 prefix is mandatory and deliberate — it keeps env placeholders distinct from
-DGP's runtime IAM permission templates (`${username}`, `${access_key_id}`, …),
-which are left untouched for the auth layer. An unset `${env:NAME}` (with no
-`:-default`) **fails loudly at load**.
+DGP's runtime IAM permission templates (`${iam:username}`,
+`${iam:access_key_id}`), which are left untouched for the auth layer. An unset
+`${env:NAME}` (with no `:-default`) **fails loudly at load**.
 
 So there are two ways a secret reaches the proxy:
 - **Native `DGP_*` env** — read directly by DGP, overlaid on top of the YAML

@@ -77,10 +77,10 @@ export default function ResourcePatternInput({ value, onChange, buckets = [], st
     () =>
       knownBucket
         ? [
-            formatResourcePattern(knownBucket, 'home/${username}', true),
-            formatResourcePattern(knownBucket, 'keys/${access_key_id}', true),
+            formatResourcePattern(knownBucket, 'home/${iam:username}', true),
+            formatResourcePattern(knownBucket, 'keys/${iam:access_key_id}', true),
           ]
-        : ['my-bucket/home/${username}/*', 'my-bucket/keys/${access_key_id}/*'],
+        : ['my-bucket/home/${iam:username}/*', 'my-bucket/keys/${iam:access_key_id}/*'],
     [knownBucket],
   );
 

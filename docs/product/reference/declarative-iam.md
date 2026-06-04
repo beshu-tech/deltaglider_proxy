@@ -143,7 +143,7 @@ Mapping rules are wipe-and-rebuild (no stable per-row identity beyond the tuple 
 
 **Validation is separate from side effects.** Every YAML-only error (duplicate names, duplicate access keys, unknown group refs, invalid permissions, `$`-prefixed reserved names) surfaces BEFORE any DB write. A single typo means zero state change.
 
-**Permission templates.** `resources` and string condition values may contain `${username}` and `${access_key_id}`. The reconciler stores those templates literally in the DB; runtime IAM index rebuild expands them per user after group permissions are merged. Identity values are percent-encoded before substitution, so user names and access keys cannot inject `/` or `*`. Unknown `${...}` variables fail validation before any reconcile write.
+**Permission templates.** `resources` and string condition values may contain `${iam:username}` and `${iam:access_key_id}` (the `iam:` prefix is required — it distinguishes these request-time identity substitutions from `${env:NAME}` load-time config expansion). The reconciler stores those templates literally in the DB; runtime IAM index rebuild expands them per user after group permissions are merged. Identity values are percent-encoded before substitution, so user names and access keys cannot inject `/` or `*`. Unknown `${...}` variables (including a bare, unprefixed `${username}`) fail validation before any reconcile write.
 
 **ID preservation.** When a user exists in both YAML and DB by name, the row stays (UPDATE), never gets DELETE+INSERT. This matters because `external_identities` reference `user_id` — rotating an access key via YAML preserves the OAuth linkage.
 

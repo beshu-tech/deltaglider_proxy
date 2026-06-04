@@ -146,7 +146,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
         <div style={{ marginTop: 6, color: colors.TEXT_MUTED, fontSize: 12, lineHeight: 1.6 }}>
           Resources match objects: <span style={monoTextStyle}>bucket/*</span>, <span style={monoTextStyle}>bucket/releases/*</span>, or <span style={monoTextStyle}>*</span>. Prefix conditions filter LIST requests only, so pair <span style={monoTextStyle}>bucket/releases/*</span> with <span style={monoTextStyle}>releases/*</span> when users should only list that prefix.
           <div style={{ marginTop: 6 }}>
-            Variables: <span style={monoTextStyle}>{'${username}'}</span> and <span style={monoTextStyle}>{'${access_key_id}'}</span> expand per authenticated user.
+            Variables: <span style={monoTextStyle}>{'${iam:username}'}</span> and <span style={monoTextStyle}>{'${iam:access_key_id}'}</span> expand per authenticated user.
           </div>
         </div>
       </details>

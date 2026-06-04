@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Changed (breaking) — IAM permission templates are now `${iam:...}`
+
+- IAM identity templates in `resources` / string condition values are now
+  **`${iam:username}` and `${iam:access_key_id}`** (previously bare `${username}`
+  / `${access_key_id}`). The `iam:` prefix makes them an explicit namespace,
+  symmetric with the new `${env:NAME}` config expansion — every `${ns:name}`
+  declares when it resolves (iam = request time, env = load time), and a bare
+  `${...}` is now a literal.
+- **Breaking:** a bare `${username}` no longer substitutes — it fails policy
+  validation (user/group API + declarative apply). Update existing policies to
+  the `${iam:...}` form. No back-compat shim.
+
 ### Added — in-process `${env:...}` config expansion
 
 - **Config files now expand `${env:NAME}` / `${env:NAME:-default}` against the
