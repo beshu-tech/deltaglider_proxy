@@ -1,0 +1,4 @@
+# Never commit filled secrets or rendered configs containing real values.
+secrets.env
+*.rendered.yaml
+config.yaml

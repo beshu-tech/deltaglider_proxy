@@ -1,0 +1,203 @@
+# =============================================================================
+# DeltaGlider Proxy — production configuration (Infrastructure-as-Code)
+# =============================================================================
+# Generated from the current prod configuration via the admin config export
+# (`GET /_/api/admin/config/export` + `/config/declarative-iam-export`).
+#
+# SECRETS: this file is SECRET-FREE and safe to commit. Every secret is either
+#   (a) injected at runtime as a DGP_* env var (backend S3 creds, bootstrap
+#       password) — see secrets.env, OR
+#   (b) a `${VAR}` placeholder that your deploy tooling MUST substitute before
+#       the proxy reads the file (DGP does NOT expand ${VAR} itself; an
+#       unexpanded placeholder fails loudly at load).
+#
+# IAM is in `declarative` mode: this YAML is the source of truth for users,
+# groups, OAuth providers, and mapping rules. Admin-API IAM mutations return
+# 403; reconcile happens on every `config apply`.
+#
+# Validate before deploy:  deltaglider_proxy config lint deltaglider_proxy.yaml
+# =============================================================================
+
+storage:
+  # Default backend (kept for back-compat with single-backend deployments).
+  backend:
+    type: s3
+    endpoint: https://hel1.your-objectstorage.com
+    region: hel1
+    force_path_style: true
+    # Injected via DGP_BE_AWS_ACCESS_KEY_ID / DGP_BE_AWS_SECRET_ACCESS_KEY (Pattern A).
+    # access_key_id / secret_access_key intentionally omitted here.
+
+  backends:
+    - name: HetznerHelsinki1
+      type: s3
+      endpoint: https://hel1.your-objectstorage.com
+      region: hel1
+      force_path_style: true
+      # Same creds as `backend` above (single upstream). Injected via env.
+  default_backend: HetznerHelsinki1
+
+  buckets:
+    beshu:
+      public_prefixes:
+        - ror/libs/
+
+access:
+  # YAML owns IAM. The encrypted DB is reconciled to match this on every apply.
+  iam_mode: declarative
+
+  iam_users:
+    - name: Simone Scarduzio
+      access_key_id: AKF09PYNJ4TR0NSTPVW6
+      secret_access_key: ${USER_SIMONE_SECRET}
+      enabled: true
+      groups:
+        - Administrators
+        - ROR Staff
+
+    - name: ror-ci-rw
+      access_key_id: ror-ci-rw
+      secret_access_key: ${USER_ROR_CI_RW_SECRET}
+      enabled: true
+      permissions:
+        - effect: Allow
+          actions: [list, write, read]
+          resources: ["beshu/ror/builds/*"]
+        - effect: Allow
+          actions: [read, write, list]
+          resources: ["beshu/ror/e2e_reports/*"]
+
+    - name: ror-ci-ro
+      access_key_id: ror-ci-ro
+      secret_access_key: ${USER_ROR_CI_RO_SECRET}
+      enabled: true
+      permissions:
+        - effect: Allow
+          actions: [read, list]
+          resources: ["beshu/ror/*"]
+
+    # NOTE: OAuth-provisioned ROR Staff members (e.g. Mateusz Kołodziejczyk,
+    # Dawid Poliszak) are NOT listed here. They are auto-created on first Google
+    # login with an auto-generated access key, and the `email_domain:
+    # readonlyrest.com -> ROR Staff` mapping rule (below) assigns their group.
+    # Listing them explicitly would fight the auto-provisioning. Only users with
+    # STATIC credentials (CI keys, the bootstrap admin) belong in iam_users.
+
+    - name: rorkbn-ci
+      access_key_id: rorkbn-ci
+      secret_access_key: ${USER_RORKBN_CI_SECRET}
+      enabled: true
+      groups:
+        - ROR Staff
+
+    - name: xperi
+      access_key_id: xperi
+      secret_access_key: ${USER_XPERI_SECRET}
+      enabled: true
+      groups:
+        - Customers
+
+    # NOTE: `test` exists in prod with full access to debug/*. Almost certainly
+    # a leftover test account — REVIEW: drop it from the prod IaC unless it's
+    # genuinely needed.
+    - name: test
+      access_key_id: test
+      secret_access_key: ${USER_TEST_SECRET}
+      enabled: true
+      permissions:
+        - effect: Allow
+          actions: [delete, write, list, read]
+          resources: ["debug/*"]
+
+    # NOTE: `legacy-admin` is a wildcard-admin with access_key_id `admin` and
+    # INLINE permissions (not via the Administrators group). REVIEW: consider
+    # folding into the Administrators group or removing if superseded.
+    - name: legacy-admin
+      access_key_id: admin
+      secret_access_key: ${USER_LEGACY_ADMIN_SECRET}
+      enabled: true
+      permissions:
+        - effect: Allow
+          actions: ["*"]
+          resources: ["*"]
+
+  iam_groups:
+    - name: ROR Staff
+      description: Read builds, e2e reports, and RW own scrap space
+      permissions:
+        - effect: Allow
+          actions: [read, list]
+          resources: ["beshu/ror/builds/*"]
+        - effect: Allow
+          actions: ["*"]
+          resources: ["debug/scrap/*"]
+        - effect: Allow
+          actions: [read, list]
+          resources: ["beshu/ror/e2e_reports/*"]
+        - effect: Allow
+          actions: [list]
+          resources: ["beshu/*"]
+          conditions:
+            StringLike:
+              s3:prefix:
+                - ror/
+                - ror/builds/
+                - ror/e2e_reports/
+                - ror/lib/
+        - effect: Allow
+          actions: [list, read]
+          resources: ["ror/lib/*"]
+
+    - name: Administrators
+      description: DGP Admins
+      permissions:
+        - effect: Allow
+          actions: ["*"]
+          resources: ["*"]
+
+    - name: Customers
+      description: Scrap upload folder for customers
+      permissions:
+        - effect: Allow
+          actions: [read, write, delete]
+          resources: ["debug/scrap/customers/${username}/*"]
+        - effect: Allow
+          actions: [list]
+          resources: ["debug"]
+          conditions:
+            StringLike:
+              s3:prefix:
+                - ""
+                - scrap/
+                - scrap/customers/
+                - scrap/customers/${username}/
+                - scrap/customers/${username}/*
+
+  auth_providers:
+    - name: goog
+      provider_type: oidc
+      enabled: true
+      priority: 0
+      display_name: Google
+      client_id: 479270857704-gvs5pjf3284i587i3qccqh08ihuq9tcc.apps.googleusercontent.com
+      issuer_url: https://accounts.google.com
+      scopes: openid email profile
+      client_secret: ${GOOGLE_OAUTH_CLIENT_SECRET}
+
+  group_mapping_rules:
+    - priority: 0
+      match_type: email_domain
+      match_field: email
+      match_value: readonlyrest.com
+      group: ROR Staff
+    - priority: 0
+      match_type: email_exact
+      match_field: email
+      match_value: simone@readonlyrest.com
+      group: Administrators
+
+advanced:
+  # In prod the proxy listens on all interfaces (export shows the local
+  # 127.0.0.1 override — set the real prod bind here / via DGP_LISTEN_ADDR).
+  listen_addr: ${DGP_LISTEN_ADDR}
+  max_object_size: 536870912   # 512 MiB
