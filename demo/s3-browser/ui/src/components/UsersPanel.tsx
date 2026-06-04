@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Button, Typography } from 'antd';
 import { PlusOutlined, TeamOutlined, DeleteOutlined, CopyOutlined } from '@ant-design/icons';
 import { useQueryClient } from '@tanstack/react-query';
@@ -45,11 +45,14 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
   const rawError = usersQuery.error;
   const error = rawError ? (rawError instanceof Error ? rawError.message : 'Failed to load users') : '';
 
-  // Bubble up 401 to the parent so the login screen can take over.
-  // Useful side-effect of being called once when the error transitions.
-  if (rawError && rawError instanceof Error && rawError.message.includes('401')) {
-    onSessionExpired?.();
-  }
+  // Bubble up 401 to the parent so the login screen can take over. Effect, not
+  // render-body: react-query keeps `error` populated across renders, so calling
+  // it in render would fire a setState (navigation) during render.
+  useEffect(() => {
+    if (rawError instanceof Error && rawError.message.includes('401')) {
+      onSessionExpired?.();
+    }
+  }, [rawError, onSessionExpired]);
 
   const deleteMutation = useDeleteUser();
   const cloneMutation = useCloneUser();

@@ -2090,6 +2090,21 @@ impl Config {
         if export.event_delivery.slack_bot_token.is_some() {
             export.event_delivery.slack_bot_token = Some(REDACTED_SENTINEL.to_string());
         }
+        // Slack INCOMING-WEBHOOK URLs are bearer-equivalent: the `hooks.slack.com`
+        // path token IS the credential. In incoming-webhook mode (format=slack,
+        // no bot token) mask the webhook URL(s) like any other secret, preserved
+        // on an untouched round-trip. Raw-webhook URLs stay visible (their
+        // credentials live in headers, which are already masked above).
+        if export.event_delivery.format == crate::config_sections::EventDeliveryFormat::Slack
+            && !export.event_delivery.uses_slack_bot_token()
+        {
+            if export.event_delivery.webhook_url.is_some() {
+                export.event_delivery.webhook_url = Some(REDACTED_SENTINEL.to_string());
+            }
+            for url in export.event_delivery.webhook_urls.iter_mut() {
+                *url = REDACTED_SENTINEL.to_string();
+            }
+        }
         export
     }
 

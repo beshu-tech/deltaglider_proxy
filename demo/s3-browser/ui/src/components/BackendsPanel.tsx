@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { qk } from '../queries/keys';
 import { Button, Input, Radio, Switch, Typography, Space, Alert, Spin } from 'antd';
@@ -40,9 +40,12 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
   // Surface a load error (401 bubbles to the session-expired handler; anything
   // else renders in the Alert below).
   const loadError = backendsQuery.error;
-  if (loadError && loadError instanceof Error && loadError.message.includes('401')) {
-    onSessionExpired?.();
-  }
+  // Effect, not render-body: react-query keeps `error` populated across renders.
+  useEffect(() => {
+    if (loadError instanceof Error && loadError.message.includes('401')) {
+      onSessionExpired?.();
+    }
+  }, [loadError, onSessionExpired]);
   const error =
     loadError && !(loadError instanceof Error && loadError.message.includes('401'))
       ? loadError instanceof Error

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Button, Typography, Input, Alert, Switch, Divider, Spin, message } from 'antd';
 import { PlusOutlined, SearchOutlined, CopyOutlined, SafetyOutlined, CheckCircleOutlined, CloseCircleOutlined, SyncOutlined } from '@ant-design/icons';
 import {
@@ -46,10 +46,14 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
     providersQuery.error ?? rulesQuery.error ?? identitiesQuery.error ?? groupsQuery.error;
   const error = rawError ? (rawError instanceof Error ? rawError.message : 'Failed to load data') : '';
 
-  // Bubble a 401 up so the login screen can take over (was the loadData catch).
-  if (rawError && rawError instanceof Error && rawError.message.includes('401')) {
-    onSessionExpired?.();
-  }
+  // Bubble a 401 up so the login screen can take over. Effect, not render-body:
+  // react-query keeps `error` populated across renders, so navigating in render
+  // would fire a setState during render.
+  useEffect(() => {
+    if (rawError instanceof Error && rawError.message.includes('401')) {
+      onSessionExpired?.();
+    }
+  }, [rawError, onSessionExpired]);
 
   const qc = useQueryClient();
 

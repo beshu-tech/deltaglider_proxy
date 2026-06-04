@@ -44,10 +44,14 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
   const rawError = groupsQuery.error ?? usersQuery.error;
   const error = rawError ? (rawError instanceof Error ? rawError.message : 'Failed to load data') : '';
 
-  // Bubble a 401 up so the login screen can take over (was the loadData catch).
-  if (rawError && rawError instanceof Error && rawError.message.includes('401')) {
-    onSessionExpired?.();
-  }
+  // Bubble a 401 up so the login screen can take over. Must run as an effect,
+  // not in the render body: react-query keeps `error` populated across renders,
+  // so a render-phase navigate would fire a setState during render.
+  useEffect(() => {
+    if (rawError instanceof Error && rawError.message.includes('401')) {
+      onSessionExpired?.();
+    }
+  }, [rawError, onSessionExpired]);
 
   // Navigate to a specific group when coming from UserForm
   useEffect(() => {

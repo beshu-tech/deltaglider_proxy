@@ -504,8 +504,26 @@ fn compute_external_baseline_groups(
     let identities = db
         .list_external_identities()
         .map_err(|e| format!("load external_identities: {e}"))?;
+    // Only ENABLED providers can authenticate a login (ExternalAuthManager::
+    // rebuild skips disabled ones, src/iam/external_auth/mod.rs). An identity
+    // whose provider is disabled (or deleted) can therefore never be rebuilt by
+    // a real login, so its mapping-rule groups must NOT enter the baseline —
+    // otherwise an unreconstructable external user looks "reconstructable" and
+    // gets deleted, permanently losing state login can't restore. Skipping them
+    // keeps the baseline a strict under-approximation of what login grants
+    // (fails safe toward PRESERVE).
+    let enabled_provider_ids: std::collections::HashSet<i64> = db
+        .load_auth_providers()
+        .map_err(|e| format!("load auth_providers: {e}"))?
+        .into_iter()
+        .filter(|p| p.enabled)
+        .map(|p| p.id)
+        .collect();
     let mut baseline: HashMap<i64, Vec<i64>> = HashMap::new();
     for ident in &identities {
+        if !enabled_provider_ids.contains(&ident.provider_id) {
+            continue;
+        }
         // Reconstruct the identity info exactly as the OAuth callback +
         // the `migrate`/recompute path do (src/api/admin/external_auth.rs):
         // raw_claims when present, else an empty object; email/name from
@@ -1841,6 +1859,81 @@ mod tests {
             !external_user_is_reconstructable(&user_loaded, &baseline_groups),
             "user with a manual cross-provider group beyond the real-login \
              baseline must be preserved (not deleted)"
+        );
+    }
+
+    #[test]
+    fn baseline_excludes_disabled_provider_rules() {
+        // M3 (data-loss regression): a DISABLED provider can never authenticate
+        // a login (ExternalAuthManager::rebuild skips it), so its mapping-rule
+        // groups must NOT enter the baseline. If they did, an external user
+        // whose ONLY membership came from that disabled provider would look
+        // "reconstructable" and be DELETED — but a real login could never
+        // rebuild them, so the deletion is permanent state loss.
+        use crate::config_db::auth_providers::{
+            CreateAuthProviderRequest, CreateMappingRuleRequest,
+        };
+        use crate::config_db::ConfigDb;
+
+        let db = ConfigDb::in_memory("test-pass").unwrap();
+
+        // One DISABLED provider whose rule would grant 'eng'.
+        let prov = db
+            .create_auth_provider(&CreateAuthProviderRequest {
+                name: "legacy-okta".into(),
+                provider_type: "oidc".into(),
+                enabled: false, // ← disabled: login through it is impossible
+                priority: 0,
+                display_name: None,
+                client_id: None,
+                client_secret: None,
+                issuer_url: None,
+                scopes: default_scopes(),
+                extra_config: None,
+            })
+            .unwrap();
+        let grp_eng = db.create_group("eng", "", &[]).unwrap();
+        db.create_group_mapping_rule(&CreateMappingRuleRequest {
+            provider_id: Some(prov.id),
+            priority: 10,
+            match_type: "email_domain".into(),
+            match_field: "email".into(),
+            match_value: "corp.example".into(),
+            group_id: grp_eng.id,
+        })
+        .unwrap();
+
+        // External user provisioned (historically) through the now-disabled
+        // provider, member of 'eng'.
+        let user = db
+            .create_external_user("oauth-carol", "AKEXTCAR0001", "secret-carol1")
+            .unwrap();
+        db.create_external_identity(
+            user.id,
+            prov.id,
+            "carol-sub-1",
+            Some("carol@corp.example"),
+            Some("Carol"),
+            None,
+        )
+        .unwrap();
+        db.add_user_to_group(grp_eng.id, user.id).unwrap();
+
+        let rules = db.load_group_mapping_rules().unwrap();
+        let baseline = compute_external_baseline_groups(&db, &rules).unwrap();
+
+        // The disabled provider's rule must NOT contribute → empty baseline.
+        let got = baseline.get(&user.id).cloned().unwrap_or_default();
+        assert!(
+            got.is_empty(),
+            "disabled provider's rule must not enter the baseline, got {got:?}"
+        );
+
+        // actual = {eng}, baseline = {} → NOT reconstructable → PRESERVED.
+        let user_loaded = db.get_user_by_id(user.id).unwrap();
+        assert!(
+            !external_user_is_reconstructable(&user_loaded, &got),
+            "external user reachable only via a disabled provider must be preserved"
         );
     }
 }

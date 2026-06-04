@@ -15,6 +15,7 @@ use crate::event_outbox::{
     current_unix_seconds, EventOutboxRecord, STATUS_DELIVERED, STATUS_FAILED, STATUS_IN_PROGRESS,
     STATUS_PENDING,
 };
+use crate::security::{validate_outbound_url, UrlKind};
 use async_trait::async_trait;
 use reqwest::header::{HeaderName, HeaderValue};
 use reqwest::Url;
@@ -70,9 +71,76 @@ pub trait EventDeliveryClient: Send + Sync + 'static {
     ) -> Result<(), String>;
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct HttpWebhookDeliveryClient {
     client: reqwest::Client,
+    /// When true, skip the per-URL SSRF `validate_outbound_url` check. ONLY set
+    /// by tests that deliver to a local mock server; the production constructor
+    /// (`Default`) leaves it false so private/metadata targets are rejected.
+    skip_ssrf_check: bool,
+}
+
+impl Default for HttpWebhookDeliveryClient {
+    fn default() -> Self {
+        // Do NOT follow redirects: an operator-configured webhook URL is an
+        // SSRF surface, and a redirect could bounce a request that passed
+        // validate_outbound_url onto a private/metadata address. Pair with the
+        // per-URL validate_outbound_url(_, UrlKind::Webhook) checks below.
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_default();
+        Self {
+            client,
+            skip_ssrf_check: false,
+        }
+    }
+}
+
+impl HttpWebhookDeliveryClient {
+    /// Validate an operator-supplied delivery URL unless SSRF checks are
+    /// disabled (tests only). Centralises the guard so both the raw-webhook and
+    /// slack-incoming-webhook paths apply it identically.
+    fn check_ssrf(&self, endpoint: &str, what: &str) -> Result<(), String> {
+        if self.skip_ssrf_check {
+            return Ok(());
+        }
+        validate_outbound_url(endpoint, UrlKind::Webhook)
+            .map_err(|e| format!("{what} rejected: {e}"))
+    }
+
+    /// Test-only: like `default()` but skips the SSRF guard so tests can deliver
+    /// to a `127.0.0.1` mock server. Never used in production code.
+    #[cfg(test)]
+    fn for_tests() -> Self {
+        Self {
+            skip_ssrf_check: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// Redact a delivery URL for use in an error string that is PERSISTED to the
+/// outbox (`last_error`) and shown in the admin API. A Slack incoming-webhook
+/// URL is bearer-equivalent (the `hooks.slack.com` path token is the secret), so
+/// emitting the full URL would leak it. Keep `scheme://host` for diagnosability,
+/// replace the path/query with `/<redacted>`. Pure + used by every error site.
+fn redact_url_for_error(raw: &str) -> String {
+    match Url::parse(raw) {
+        Ok(u) => {
+            let host = u.host_str().unwrap_or("");
+            let port = u.port().map(|p| format!(":{p}")).unwrap_or_default();
+            // Only redact when there's a non-trivial path/query to hide.
+            if u.path().trim_matches('/').is_empty() && u.query().is_none() {
+                format!("{}://{host}{port}", u.scheme())
+            } else {
+                format!("{}://{host}{port}/<redacted>", u.scheme())
+            }
+        }
+        // Unparseable → don't echo it verbatim (could itself be a malformed
+        // secret); show a fixed placeholder.
+        Err(_) => "<invalid-url>".to_string(),
+    }
 }
 
 #[async_trait]
@@ -114,6 +182,9 @@ impl HttpWebhookDeliveryClient {
             event,
         };
         for endpoint in endpoints {
+            // SSRF guard: reject private/loopback/metadata targets before any
+            // outbound request (the client also refuses to follow redirects).
+            self.check_ssrf(endpoint, "webhook endpoint")?;
             let url = Url::parse(endpoint).map_err(|e| format!("invalid webhook endpoint: {e}"))?;
             let mut request = self
                 .client
@@ -131,10 +202,11 @@ impl HttpWebhookDeliveryClient {
                 .json(&payload)
                 .send()
                 .await
-                .map_err(|e| format!("{endpoint}: {e}"))?;
+                .map_err(|e| format!("{}: {e}", redact_url_for_error(endpoint)))?;
             if !response.status().is_success() {
                 return Err(format!(
-                    "{endpoint}: webhook returned HTTP {}",
+                    "{}: webhook returned HTTP {}",
+                    redact_url_for_error(endpoint),
                     response.status()
                 ));
             }
@@ -252,6 +324,10 @@ impl HttpWebhookDeliveryClient {
             }
         }
         for endpoint in endpoints {
+            // SSRF guard, same as the raw-webhook path. Slack's real
+            // hooks.slack.com is public so this never rejects a legitimate
+            // incoming webhook, but it blocks an operator-supplied internal URL.
+            self.check_ssrf(endpoint, "slack webhook URL")?;
             let url =
                 Url::parse(endpoint).map_err(|e| format!("invalid slack webhook URL: {e}"))?;
             let response = self
@@ -261,10 +337,11 @@ impl HttpWebhookDeliveryClient {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| format!("{endpoint}: {e}"))?;
+                .map_err(|e| format!("{}: {e}", redact_url_for_error(endpoint)))?;
             if !response.status().is_success() {
                 return Err(format!(
-                    "{endpoint}: slack webhook returned HTTP {}",
+                    "{}: slack webhook returned HTTP {}",
+                    redact_url_for_error(endpoint),
                     response.status()
                 ));
             }
@@ -532,6 +609,84 @@ mod tests {
         )
     }
 
+    /// M2: error strings persisted to the outbox must not leak a Slack
+    /// incoming-webhook secret (its path token). redact_url_for_error keeps
+    /// scheme+host, masks the path/query.
+    #[test]
+    fn redact_url_for_error_hides_slack_path_token() {
+        assert_eq!(
+            redact_url_for_error("https://hooks.slack.com/services/T01/B02/SECRETtoken"),
+            "https://hooks.slack.com/<redacted>"
+        );
+        assert_eq!(
+            redact_url_for_error("https://example.com/hook?token=abc"),
+            "https://example.com/<redacted>"
+        );
+        // No path/query → nothing secret to hide; host-only is fine.
+        assert_eq!(
+            redact_url_for_error("https://example.com/"),
+            "https://example.com"
+        );
+        assert_eq!(redact_url_for_error("not a url"), "<invalid-url>");
+        // Port preserved for diagnosability.
+        assert_eq!(
+            redact_url_for_error("http://host:8080/a/b"),
+            "http://host:8080/<redacted>"
+        );
+    }
+
+    /// M1 (SSRF): the PRODUCTION client (`default()`, guard ON) must reject a
+    /// private/loopback/metadata webhook target before any network call, for
+    /// both the raw and Slack-incoming-webhook formats.
+    #[tokio::test]
+    async fn production_client_rejects_ssrf_webhook_targets() {
+        let prod = HttpWebhookDeliveryClient::default();
+        // Insert one event + claim it so we have a real EventOutboxRecord; the
+        // SSRF guard fires before the record content matters.
+        let db = ConfigDb::in_memory("test-pass").unwrap();
+        db.event_outbox_insert(&event("k")).unwrap();
+        let rec = db
+            .event_outbox_claim_due("w", current_unix_seconds() + 1, 60, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        for url in [
+            "http://169.254.169.254/latest/meta-data/", // cloud metadata
+            "http://127.0.0.1:9000/hook",               // loopback
+            "http://10.0.0.5/hook",                     // private RFC1918
+            "http://localhost/hook",                    // loopback by name
+        ] {
+            // Raw webhook format.
+            let mut c = cfg();
+            c.webhook_url = Some(url.to_string());
+            c.webhook_urls = Vec::new();
+            let err = prod
+                .deliver(&c, &rec)
+                .await
+                .expect_err("SSRF target must be rejected (raw)");
+            assert!(
+                err.contains("rejected"),
+                "expected SSRF rejection for {url}, got: {err}"
+            );
+
+            // Slack incoming-webhook format.
+            let mut s = cfg();
+            s.format = EventDeliveryFormat::Slack;
+            s.webhook_url = Some(url.to_string());
+            s.webhook_urls = Vec::new();
+            s.slack_bot_token = None;
+            let err = prod
+                .deliver(&s, &rec)
+                .await
+                .expect_err("SSRF target must be rejected (slack)");
+            assert!(
+                err.contains("rejected"),
+                "expected SSRF rejection for slack {url}, got: {err}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn dispatch_marks_success_delivered() {
         let db = Arc::new(Mutex::new(ConfigDb::in_memory("test-pass").unwrap()));
@@ -644,7 +799,7 @@ mod tests {
         config
             .webhook_headers
             .insert("x-dgp-token".to_string(), "secret".to_string());
-        let client = HttpWebhookDeliveryClient::default();
+        let client = HttpWebhookDeliveryClient::for_tests();
 
         dispatch_once(&db, &client, &config, "test-worker", 200).await;
 
@@ -729,7 +884,7 @@ mod tests {
         config.webhook_url = Some(format!("{base}/services/T/B/X"));
         config.webhook_urls = Vec::new();
 
-        let client = HttpWebhookDeliveryClient::default();
+        let client = HttpWebhookDeliveryClient::for_tests();
         dispatch_once(&db, &client, &config, "test-worker", 200).await;
 
         // Exactly ONE Slack POST (the ObjectCreated); the delete was filtered.

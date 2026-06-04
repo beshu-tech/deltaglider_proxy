@@ -606,6 +606,23 @@ pub(super) fn preserve_event_delivery_secrets(
     if new.slack_bot_token.as_deref() == Some(sentinel) {
         new.slack_bot_token = old.slack_bot_token.clone();
     }
+    // Slack incoming-webhook URLs are masked to the sentinel on export (the
+    // hooks.slack.com path token is the credential); restore an untouched one.
+    // A sentinel with no old value to restore is meaningless → leave it (config
+    // validation will reject a literal sentinel as not a valid URL).
+    if new.webhook_url.as_deref() == Some(sentinel) {
+        new.webhook_url = old.webhook_url.clone();
+    }
+    // webhook_urls are masked element-wise on export; restore each sentinel from
+    // the same index in the old list (the GUI edits the list in place, so index
+    // alignment holds for an untouched round-trip).
+    for (i, url) in new.webhook_urls.iter_mut().enumerate() {
+        if url == sentinel {
+            if let Some(prev) = old.webhook_urls.get(i) {
+                *url = prev.clone();
+            }
+        }
+    }
 }
 
 /// Preserve credentials on the PRIMARY backend across a config swap.
@@ -1094,5 +1111,92 @@ mod preserve_tests {
         );
         assert_eq!(h.get("X-Env").map(String::as_str), Some(REDACTED_SENTINEL));
         assert_eq!(h.len(), 2, "keys must survive redaction");
+    }
+
+    // ── M2: Slack incoming-webhook URL is a secret ────────────────────────
+
+    #[test]
+    fn redact_masks_slack_incoming_webhook_url() {
+        use crate::config_sections::EventDeliveryFormat;
+        let cfg = crate::config::Config {
+            event_delivery: EventDeliveryConfig {
+                enabled: true,
+                format: EventDeliveryFormat::Slack,
+                slack_bot_token: None, // incoming-webhook mode
+                webhook_url: Some("https://hooks.slack.com/services/T/B/SECRET".to_string()),
+                webhook_urls: vec!["https://hooks.slack.com/services/T/B/SECRET2".to_string()],
+                ..Default::default()
+            },
+            ..crate::config::Config::default()
+        };
+        let r = cfg.redact_all_secrets();
+        assert_eq!(
+            r.event_delivery.webhook_url.as_deref(),
+            Some(REDACTED_SENTINEL),
+            "slack incoming-webhook URL must be masked"
+        );
+        assert_eq!(
+            r.event_delivery.webhook_urls,
+            vec![REDACTED_SENTINEL.to_string()]
+        );
+    }
+
+    #[test]
+    fn redact_keeps_raw_webhook_url_visible() {
+        use crate::config_sections::EventDeliveryFormat;
+        // Raw format: URL stays visible (creds live in headers, masked separately).
+        let cfg = crate::config::Config {
+            event_delivery: EventDeliveryConfig {
+                enabled: true,
+                format: EventDeliveryFormat::Raw,
+                webhook_url: Some("https://example.com/hook".to_string()),
+                ..Default::default()
+            },
+            ..crate::config::Config::default()
+        };
+        let r = cfg.redact_all_secrets();
+        assert_eq!(
+            r.event_delivery.webhook_url.as_deref(),
+            Some("https://example.com/hook")
+        );
+    }
+
+    #[test]
+    fn preserve_restores_untouched_slack_webhook_url() {
+        use crate::config_sections::EventDeliveryFormat;
+        let old = EventDeliveryConfig {
+            format: EventDeliveryFormat::Slack,
+            webhook_url: Some("https://hooks.slack.com/services/REAL".to_string()),
+            webhook_urls: vec!["https://hooks.slack.com/services/REAL2".to_string()],
+            ..Default::default()
+        };
+        // Operator left both masked (untouched round-trip).
+        let mut new = EventDeliveryConfig {
+            format: EventDeliveryFormat::Slack,
+            webhook_url: Some(REDACTED_SENTINEL.to_string()),
+            webhook_urls: vec![REDACTED_SENTINEL.to_string()],
+            ..Default::default()
+        };
+        preserve_event_delivery_secrets(&mut new, &old);
+        assert_eq!(
+            new.webhook_url.as_deref(),
+            Some("https://hooks.slack.com/services/REAL")
+        );
+        assert_eq!(
+            new.webhook_urls,
+            vec!["https://hooks.slack.com/services/REAL2".to_string()]
+        );
+
+        // A retyped URL is kept, not restored.
+        let mut new2 = EventDeliveryConfig {
+            format: EventDeliveryFormat::Slack,
+            webhook_url: Some("https://hooks.slack.com/services/NEW".to_string()),
+            ..Default::default()
+        };
+        preserve_event_delivery_secrets(&mut new2, &old);
+        assert_eq!(
+            new2.webhook_url.as_deref(),
+            Some("https://hooks.slack.com/services/NEW")
+        );
     }
 }
