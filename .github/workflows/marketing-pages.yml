@@ -6,6 +6,10 @@ on:
     paths:
       - 'marketing/**'
       - 'docs/screenshots/**'
+      # The website now renders the product docs (docs/product/**) directly —
+      # rebuild Pages when a doc or its manifest changes so the public site
+      # stays in lockstep with the in-product docs.
+      - 'docs/product/**'
       - '.github/workflows/marketing-pages.yml'
   workflow_dispatch:
 

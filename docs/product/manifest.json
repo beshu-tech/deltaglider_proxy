@@ -1,0 +1,41 @@
+{
+  "_comment": "Single source of truth for product-docs grouping + ordering. Consumed by BOTH the in-product docs viewer (demo/s3-browser/ui/src/docs-imports.ts) and the marketing website docs renderer (marketing/src/pages/docs). Add a doc: drop the .md under docs/product/, then add a `docs` entry here (path is relative to docs/product/, without the .md extension). `group` must be one of `groups[].id`. `order` sorts within a group (lower = earlier). CI (scripts/check-docs-registry.sh) keeps this in lockstep with the .md files on disk.",
+  "groups": [
+    { "id": "Start here", "tagline": "Install, first bucket, first upload." },
+    { "id": "Deploy to production", "tagline": "Hardening, TLS, backups, upgrades." },
+    { "id": "Authentication & access", "tagline": "OAuth, SigV4, IAM, rate limiting." },
+    { "id": "Day 2 operations", "tagline": "Monitoring, troubleshooting, FAQ." },
+    { "id": "Reference", "tagline": "Config fields, admin API, metrics, internals." }
+  ],
+  "docs": [
+    { "path": "README", "group": "Start here", "order": 0 },
+    { "path": "01-quickstart", "group": "Start here", "order": 10 },
+    { "path": "10-first-bucket", "group": "Start here", "order": 20 },
+
+    { "path": "20-production-deployment", "group": "Deploy to production", "order": 0 },
+    { "path": "20-production-security-checklist", "group": "Deploy to production", "order": 10 },
+    { "path": "21-upgrade-guide", "group": "Deploy to production", "order": 20 },
+    { "path": "23-docker-compose", "group": "Deploy to production", "order": 25 },
+    { "path": "22-kubernetes-helm", "group": "Deploy to production", "order": 30 },
+
+    { "path": "auth/30-oauth-setup", "group": "Authentication & access", "order": 0 },
+    { "path": "auth/31-sigv4-and-iam", "group": "Authentication & access", "order": 10 },
+    { "path": "auth/32-iam-conditions", "group": "Authentication & access", "order": 20 },
+    { "path": "auth/33-rate-limiting", "group": "Authentication & access", "order": 30 },
+
+    { "path": "40-monitoring-and-alerts", "group": "Day 2 operations", "order": 0 },
+    { "path": "41-troubleshooting", "group": "Day 2 operations", "order": 10 },
+    { "path": "42-faq", "group": "Day 2 operations", "order": 20 },
+
+    { "path": "reference/configuration", "group": "Reference", "order": 0 },
+    { "path": "reference/admin-api", "group": "Reference", "order": 10 },
+    { "path": "reference/authentication", "group": "Reference", "order": 20 },
+    { "path": "reference/metrics", "group": "Reference", "order": 30 },
+    { "path": "reference/how-delta-works", "group": "Reference", "order": 40 },
+    { "path": "reference/encryption-at-rest", "group": "Reference", "order": 50 },
+    { "path": "reference/declarative-iam", "group": "Reference", "order": 60 },
+    { "path": "reference/replication", "group": "Reference", "order": 70 },
+    { "path": "reference/lifecycle", "group": "Reference", "order": 80 },
+    { "path": "reference/event-outbox", "group": "Reference", "order": 90 }
+  ]
+}

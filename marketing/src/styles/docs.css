@@ -1,0 +1,144 @@
+/* docs.css — layout + prose styling for /docs pages. Uses the site's existing
+   custom properties (brand teal, dark surfaces) so docs feel native to the
+   marketing site rather than a bolted-on doc theme. */
+
+.docs-shell {
+  display: grid;
+  grid-template-columns: 260px minmax(0, 1fr);
+  gap: 48px;
+  max-width: var(--shell);
+  margin: 0 auto;
+  padding: 48px 24px 96px;
+  align-items: start;
+}
+
+/* ── Sidebar ─────────────────────────────────────────────────────────── */
+.docs-sidebar {
+  position: sticky;
+  top: 24px;
+  align-self: start;
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+  font-size: 0.875rem;
+  padding-right: 8px;
+}
+
+.docs-nav-home {
+  display: block;
+  font-weight: 700;
+  font-size: 0.95rem;
+  color: var(--ink-strong);
+  text-decoration: none;
+  margin-bottom: 20px;
+  letter-spacing: -0.01em;
+}
+.docs-nav-home.is-active { color: var(--brand); }
+
+.docs-nav-group { margin-bottom: 22px; }
+.docs-nav-group-title {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--ink-mute);
+  margin-bottom: 8px;
+}
+.docs-nav-group ul { list-style: none; margin: 0; padding: 0; }
+.docs-nav-group li { margin: 0; }
+.docs-nav-group a {
+  display: block;
+  padding: 4px 10px;
+  color: var(--ink-soft);
+  text-decoration: none;
+  border-radius: 6px;
+  border-left: 2px solid transparent;
+  line-height: 1.4;
+  transition: color 0.12s, background 0.12s, border-color 0.12s;
+}
+.docs-nav-group a:hover { color: var(--ink-strong); background: var(--bg-soft); }
+.docs-nav-group a.is-active {
+  color: var(--brand);
+  border-left-color: var(--brand);
+  background: var(--brand-soft);
+  font-weight: 600;
+}
+
+/* ── Content column ──────────────────────────────────────────────────── */
+.docs-content { min-width: 0; }
+
+.docs-landing-head h1 { margin: 0 0 8px; font-size: 2.2rem; letter-spacing: -0.02em; }
+.docs-landing-head p { color: var(--ink-soft); max-width: var(--measure); margin: 0 0 40px; }
+.docs-landing-group { margin-bottom: 36px; }
+.docs-landing-group h2 { margin: 0 0 4px; font-size: 1.3rem; }
+.docs-landing-tagline { color: var(--ink-mute); font-size: 0.9rem; margin: 0 0 14px; }
+.docs-landing-list {
+  list-style: none; margin: 0; padding: 0;
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 8px;
+}
+.docs-landing-list a {
+  display: block; padding: 12px 16px;
+  background: var(--bg-card); border: 1px solid var(--rule); border-radius: 10px;
+  color: var(--ink-strong); text-decoration: none; font-weight: 600; font-size: 0.95rem;
+  transition: border-color 0.12s, transform 0.12s;
+}
+.docs-landing-list a:hover { border-color: var(--brand); transform: translateY(-1px); }
+
+/* ── Prose ───────────────────────────────────────────────────────────── */
+.docs-prose {
+  max-width: var(--measure-wide);
+  line-height: 1.7;
+  color: var(--ink);
+}
+.docs-prose > :first-child { margin-top: 0; }
+.docs-prose h1 { font-size: 2.1rem; letter-spacing: -0.02em; margin: 0 0 16px; scroll-margin-top: 24px; }
+.docs-prose h2 {
+  font-size: 1.5rem; margin: 40px 0 14px; padding-top: 8px;
+  border-top: 1px solid var(--rule); scroll-margin-top: 24px;
+}
+.docs-prose h3 { font-size: 1.2rem; margin: 28px 0 10px; scroll-margin-top: 24px; }
+.docs-prose h4 { font-size: 1.02rem; margin: 22px 0 8px; scroll-margin-top: 24px; }
+.docs-prose p { margin: 0 0 16px; }
+.docs-prose a { color: var(--brand); text-decoration: underline; text-underline-offset: 2px; }
+.docs-prose a:hover { color: var(--brand-dark); }
+.docs-prose ul, .docs-prose ol { margin: 0 0 16px; padding-left: 24px; }
+.docs-prose li { margin: 4px 0; }
+.docs-prose img {
+  max-width: 100%; height: auto; border-radius: 10px;
+  border: 1px solid var(--rule); margin: 16px 0; display: block;
+}
+.docs-prose blockquote {
+  margin: 16px 0; padding: 8px 18px;
+  border-left: 3px solid var(--brand); background: var(--bg-soft);
+  color: var(--ink-soft); border-radius: 0 8px 8px 0;
+}
+.docs-prose code {
+  font-family: var(--font-mono); font-size: 0.875em;
+  background: var(--bg-alt); padding: 2px 6px; border-radius: 4px;
+}
+.docs-prose pre {
+  background: var(--bg-alt); border: 1px solid var(--rule); border-radius: 10px;
+  padding: 16px 18px; overflow-x: auto; margin: 0 0 18px; font-size: 0.85rem; line-height: 1.5;
+}
+.docs-prose pre code { background: none; padding: 0; font-size: inherit; }
+.docs-prose pre.mermaid {
+  background: var(--bg-card); text-align: center; border-style: dashed;
+}
+.docs-prose table {
+  width: 100%; border-collapse: collapse; margin: 0 0 18px; font-size: 0.9rem;
+  display: block; overflow-x: auto;
+}
+.docs-prose th, .docs-prose td {
+  border: 1px solid var(--rule); padding: 8px 12px; text-align: left;
+}
+.docs-prose th { background: var(--bg-soft); font-weight: 700; }
+.docs-prose hr { border: none; border-top: 1px solid var(--rule); margin: 32px 0; }
+
+/* ── Responsive: sidebar collapses above the content on narrow screens ── */
+@media (max-width: 860px) {
+  .docs-shell { grid-template-columns: 1fr; gap: 24px; padding: 24px 16px 64px; }
+  .docs-sidebar {
+    position: static; max-height: none; overflow: visible;
+    border-bottom: 1px solid var(--rule); padding-bottom: 16px;
+  }
+  .docs-nav-group { margin-bottom: 14px; }
+}

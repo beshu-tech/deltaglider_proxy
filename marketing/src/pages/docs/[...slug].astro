@@ -1,0 +1,89 @@
+---
+// /docs/[...slug] — one static page per product doc, rendered from the shared
+// docs/product/*.md content. Friendly slugs (numeric prefixes stripped) come
+// from the manifest via docs.ts; markdown is rendered with the same remark-gfm
+// pipeline the product uses, plus doc-aware link/image/heading/mermaid rewrites.
+import DocsLayout from '../../layouts/DocsLayout.astro';
+import { DOCS, docsByGroup } from '../../lib/docs';
+import { docContent } from '../../lib/docContent';
+import { renderDoc, extractSummary } from '../../lib/renderDoc';
+
+export async function getStaticPaths() {
+  const paths = [];
+
+  // One page per real doc (README has slug '' — that's the /docs landing, skip).
+  for (const doc of DOCS) {
+    if (doc.slug === '') continue;
+    paths.push({ params: { slug: doc.slug }, props: { kind: 'doc', path: doc.path, title: doc.title, slug: doc.slug } });
+  }
+
+  // Group-index aliases so /docs/reference, /docs/auth (etc.) resolve to a
+  // simple list of that group's docs — and so the marketing nav's
+  // `/docs/reference` link is never a 404. Keyed by the first path segment of
+  // each group's docs (reference/* → "reference", auth/* → "auth").
+  const seen = new Set(DOCS.map((d) => d.slug));
+  for (const g of docsByGroup()) {
+    const sub = g.docs.find((d) => d.slug.includes('/'));
+    if (!sub) continue;
+    const segment = sub.slug.split('/')[0];
+    if (seen.has(segment)) continue; // a real doc already owns this slug
+    seen.add(segment);
+    paths.push({ params: { slug: segment }, props: { kind: 'group', groupId: g.group.id, segment } });
+  }
+
+  return paths;
+}
+
+const props = Astro.props as
+  | { kind: 'doc'; path: string; title: string; slug: string }
+  | { kind: 'group'; groupId: string; segment: string };
+
+let title: string;
+let description: string;
+let activeSlug: string;
+let html: string | null = null;
+let groupDocs: { url: string; title: string }[] = [];
+
+if (props.kind === 'doc') {
+  const markdown = docContent(props.path) ?? '';
+  title = `${props.title} — DeltaGlider Proxy`;
+  description = extractSummary(markdown);
+  activeSlug = props.slug;
+  html = await renderDoc(markdown, props.path);
+} else {
+  const group = docsByGroup().find((g) => g.group.id === props.groupId)!;
+  title = `${props.groupId} — DeltaGlider Proxy docs`;
+  description = group.group.tagline;
+  activeSlug = '';
+  groupDocs = group.docs.filter((d) => d.slug !== '').map((d) => ({ url: d.url, title: d.title }));
+}
+---
+
+<DocsLayout title={title} description={description} activeSlug={activeSlug}>
+  {props.kind === 'doc' ? (
+    <div class="docs-prose" set:html={html} />
+  ) : (
+    <div class="docs-prose">
+      <h1>{props.groupId}</h1>
+      <ul>
+        {groupDocs.map((d) => (
+          <li><a href={d.url}>{d.title}</a></li>
+        ))}
+      </ul>
+    </div>
+  )}
+</DocsLayout>
+
+{props.kind === 'doc' && (
+  <script>
+    // Render any ```mermaid blocks (rewritten to <pre class="mermaid">).
+    // mermaid is bundled (a marketing dep) and code-split: this dynamic import
+    // only loads its chunk on doc pages that actually contain a diagram.
+    if (document.querySelector('pre.mermaid')) {
+      const mermaid = (await import('mermaid')).default;
+      const dark = window.matchMedia?.('(prefers-color-scheme: dark)').matches;
+      mermaid.initialize({ startOnLoad: false, theme: dark ? 'dark' : 'default' });
+      await mermaid.run({ querySelector: 'pre.mermaid' });
+    }
+  </script>
+)}

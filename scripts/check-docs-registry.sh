@@ -71,8 +71,66 @@ while IFS= read -r line; do
   fi
 done < <(grep -E "^import .* from '\\.\\./\\.\\./\\.\\./\\.\\./docs/" "$REGISTRY" || true)
 
+# (3) manifest.json ↔ disk parity. The manifest (docs/product/manifest.json)
+#     is the SHARED source of truth for grouping + ordering, read by BOTH the
+#     in-product viewer (docs-imports.ts) and the marketing website
+#     (marketing/src/lib/docs.ts). A doc that exists on disk but is missing
+#     from the manifest would render with no group/order in both surfaces (or
+#     not at all on the website); a manifest path with no file is a dangling
+#     entry. Keep them in lockstep.
+MANIFEST="$PRODUCT_DIR/manifest.json"
+if [ ! -f "$MANIFEST" ]; then
+  echo "ERROR: shared docs manifest not found at $MANIFEST" >&2
+  fail=1
+elif command -v node >/dev/null 2>&1; then
+  # Every .md on disk (relative path, no extension) must be a manifest path,
+  # and every manifest path must have a file. README.md included; manifest.json
+  # itself is not a doc.
+  node - "$PRODUCT_DIR" "$MANIFEST" <<'NODE' || fail=1
+const { readdirSync, statSync, readFileSync } = require('node:fs');
+const { join, relative } = require('node:path');
+const [dir, manifestPath] = process.argv.slice(2);
+
+function walk(d, acc = []) {
+  for (const e of readdirSync(d, { withFileTypes: true })) {
+    const p = join(d, e.name);
+    if (e.isDirectory()) walk(p, acc);
+    else if (e.name.endsWith('.md')) acc.push(relative(dir, p).replace(/\.md$/, ''));
+  }
+  return acc;
+}
+
+const onDisk = new Set(walk(dir));
+const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+const inManifest = new Set(manifest.docs.map((d) => d.path));
+const groupIds = new Set(manifest.groups.map((g) => g.id));
+
+let bad = false;
+for (const p of onDisk) {
+  if (!inManifest.has(p)) {
+    console.error(`MANIFEST MISSING: docs/product/${p}.md is on disk but not in manifest.json`);
+    console.error(`  -> add { "path": "${p}", "group": <one of groups[].id>, "order": <n> }`);
+    bad = true;
+  }
+}
+for (const d of manifest.docs) {
+  if (!onDisk.has(d.path)) {
+    console.error(`MANIFEST DANGLING: "${d.path}" in manifest.json has no docs/product/${d.path}.md`);
+    bad = true;
+  }
+  if (!groupIds.has(d.group)) {
+    console.error(`MANIFEST BAD GROUP: "${d.path}" references group "${d.group}" not in groups[]`);
+    bad = true;
+  }
+}
+process.exit(bad ? 1 : 0);
+NODE
+else
+  echo "WARN: node not available — skipping manifest↔disk parity check" >&2
+fi
+
 if [ "$fail" -eq 0 ]; then
-  echo "docs registry OK: all files under docs/product/ are bundled, no dev docs leaked"
+  echo "docs registry OK: bundled allow-list + manifest↔disk parity verified"
 fi
 
 exit "$fail"

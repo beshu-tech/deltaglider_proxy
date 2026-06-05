@@ -39,6 +39,46 @@ import REF_REPLICATION from '../../../../docs/product/reference/replication.md?r
 import REF_LIFECYCLE from '../../../../docs/product/reference/lifecycle.md?raw';
 import REF_EVENT_OUTBOX from '../../../../docs/product/reference/event-outbox.md?raw';
 
+// Grouping + ordering come from the shared manifest — the SINGLE source of
+// truth, read by BOTH this in-product viewer and the marketing-website docs
+// renderer (marketing/src/pages/docs). The `?raw` content imports above must
+// stay static (Vite requirement); only the metadata lives in the manifest.
+import manifest from '../../../../docs/product/manifest.json';
+
+/**
+ * Raw markdown keyed by the manifest `path` (relative to docs/product/,
+ * no extension). The manifest drives iteration order; this map supplies
+ * each entry's content. A manifest path with no content here is a build-time
+ * error surfaced below — keeps the two lists honest.
+ */
+const CONTENT_BY_PATH: Record<string, string> = {
+  'README': README,
+  '01-quickstart': QUICKSTART,
+  '10-first-bucket': FIRST_BUCKET,
+  '20-production-deployment': PROD_DEPLOY,
+  '20-production-security-checklist': PROD_SECURITY,
+  '21-upgrade-guide': UPGRADE_GUIDE,
+  '22-kubernetes-helm': KUBERNETES_HELM,
+  '23-docker-compose': DOCKER_COMPOSE,
+  'auth/30-oauth-setup': OAUTH_SETUP,
+  'auth/31-sigv4-and-iam': SIGV4_IAM,
+  'auth/32-iam-conditions': IAM_CONDITIONS,
+  'auth/33-rate-limiting': RATE_LIMITING,
+  '40-monitoring-and-alerts': MONITORING,
+  '41-troubleshooting': TROUBLESHOOTING,
+  '42-faq': FAQ,
+  'reference/configuration': REF_CONFIGURATION,
+  'reference/admin-api': REF_ADMIN_API,
+  'reference/authentication': REF_AUTHENTICATION,
+  'reference/metrics': REF_METRICS,
+  'reference/how-delta-works': REF_DELTA,
+  'reference/encryption-at-rest': REF_ENCRYPTION,
+  'reference/declarative-iam': REF_DECLARATIVE_IAM,
+  'reference/replication': REF_REPLICATION,
+  'reference/lifecycle': REF_LIFECYCLE,
+  'reference/event-outbox': REF_EVENT_OUTBOX,
+};
+
 /** Extract the first `# heading` from markdown content */
 function extractTitle(content: string): string {
   for (const line of content.split('\n')) {
@@ -48,29 +88,15 @@ function extractTitle(content: string): string {
   return 'Untitled';
 }
 
-export type DocGroup =
-  | 'Start here'
-  | 'Deploy to production'
-  | 'Authentication & access'
-  | 'Day 2 operations'
-  | 'Reference';
+// Group ids + taglines + ordering all derive from the shared manifest.
+export type DocGroup = string;
 
-export const DOC_GROUPS: readonly DocGroup[] = [
-  'Start here',
-  'Deploy to production',
-  'Authentication & access',
-  'Day 2 operations',
-  'Reference',
-] as const;
+export const DOC_GROUPS: readonly DocGroup[] = manifest.groups.map((g) => g.id);
 
 /** One-line summary of what a group is for — rendered on the landing. */
-export const GROUP_TAGLINE: Record<DocGroup, string> = {
-  'Start here': 'Install, first bucket, first upload.',
-  'Deploy to production': 'Hardening, TLS, backups, upgrades.',
-  'Authentication & access': 'OAuth, SigV4, IAM, rate limiting.',
-  'Day 2 operations': 'Monitoring, troubleshooting, FAQ.',
-  'Reference': 'Config fields, admin API, metrics, internals.',
-};
+export const GROUP_TAGLINE: Record<DocGroup, string> = Object.fromEntries(
+  manifest.groups.map((g) => [g.id, g.tagline]),
+);
 
 export interface DocEntry {
   id: string;
@@ -95,42 +121,20 @@ interface ProductDoc {
   order: number;
 }
 
-const PRODUCT_DOCS: ProductDoc[] = [
-  // Start here
-  { path: 'README', content: README, group: 'Start here', order: 0 },
-  { path: '01-quickstart', content: QUICKSTART, group: 'Start here', order: 10 },
-  { path: '10-first-bucket', content: FIRST_BUCKET, group: 'Start here', order: 20 },
-
-  // Deploy to production
-  { path: '20-production-deployment', content: PROD_DEPLOY, group: 'Deploy to production', order: 0 },
-  { path: '20-production-security-checklist', content: PROD_SECURITY, group: 'Deploy to production', order: 10 },
-  { path: '21-upgrade-guide', content: UPGRADE_GUIDE, group: 'Deploy to production', order: 20 },
-  { path: '23-docker-compose', content: DOCKER_COMPOSE, group: 'Deploy to production', order: 25 },
-  { path: '22-kubernetes-helm', content: KUBERNETES_HELM, group: 'Deploy to production', order: 30 },
-
-  // Authentication & access
-  { path: 'auth/30-oauth-setup', content: OAUTH_SETUP, group: 'Authentication & access', order: 0 },
-  { path: 'auth/31-sigv4-and-iam', content: SIGV4_IAM, group: 'Authentication & access', order: 10 },
-  { path: 'auth/32-iam-conditions', content: IAM_CONDITIONS, group: 'Authentication & access', order: 20 },
-  { path: 'auth/33-rate-limiting', content: RATE_LIMITING, group: 'Authentication & access', order: 30 },
-
-  // Day 2 operations
-  { path: '40-monitoring-and-alerts', content: MONITORING, group: 'Day 2 operations', order: 0 },
-  { path: '41-troubleshooting', content: TROUBLESHOOTING, group: 'Day 2 operations', order: 10 },
-  { path: '42-faq', content: FAQ, group: 'Day 2 operations', order: 20 },
-
-  // Reference
-  { path: 'reference/configuration', content: REF_CONFIGURATION, group: 'Reference', order: 0 },
-  { path: 'reference/admin-api', content: REF_ADMIN_API, group: 'Reference', order: 10 },
-  { path: 'reference/authentication', content: REF_AUTHENTICATION, group: 'Reference', order: 20 },
-  { path: 'reference/metrics', content: REF_METRICS, group: 'Reference', order: 30 },
-  { path: 'reference/how-delta-works', content: REF_DELTA, group: 'Reference', order: 40 },
-  { path: 'reference/encryption-at-rest', content: REF_ENCRYPTION, group: 'Reference', order: 50 },
-  { path: 'reference/declarative-iam', content: REF_DECLARATIVE_IAM, group: 'Reference', order: 60 },
-  { path: 'reference/replication', content: REF_REPLICATION, group: 'Reference', order: 70 },
-  { path: 'reference/lifecycle', content: REF_LIFECYCLE, group: 'Reference', order: 80 },
-  { path: 'reference/event-outbox', content: REF_EVENT_OUTBOX, group: 'Reference', order: 90 },
-];
+// Derived from the shared manifest: iterate the manifest entries (which own
+// group + order) and attach the statically-imported content for each path. A
+// manifest path with no matching content throws loudly at module load — that
+// only happens if a doc was added to the manifest without an import here, which
+// CI (check-docs-registry.sh) also guards.
+const PRODUCT_DOCS: ProductDoc[] = manifest.docs.map((d) => {
+  const content = CONTENT_BY_PATH[d.path];
+  if (content === undefined) {
+    throw new Error(
+      `docs manifest lists "${d.path}" but no ?raw import is registered in CONTENT_BY_PATH (docs-imports.ts)`,
+    );
+  }
+  return { path: d.path, content, group: d.group, order: d.order };
+});
 
 /**
  * Convert a doc path ("auth/30-oauth-setup") into a URL-safe id

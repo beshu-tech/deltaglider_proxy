@@ -1,0 +1,36 @@
+---
+// /docs — the documentation landing. Groups + ordering come from the shared
+// manifest, so it mirrors the in-product docs landing exactly.
+import DocsLayout from '../../layouts/DocsLayout.astro';
+import { docsByGroup } from '../../lib/docs';
+
+const groups = docsByGroup();
+---
+
+<DocsLayout
+  title="Documentation — DeltaGlider Proxy"
+  description="DeltaGlider Proxy documentation: quickstart, production deployment, authentication, and reference. The same docs that ship inside the product."
+  activeSlug=""
+>
+  <header class="docs-landing-head">
+    <h1>Documentation</h1>
+    <p>
+      Everything you need to run DeltaGlider Proxy — the same docs bundled into
+      the product, served here for easy linking.
+    </p>
+  </header>
+
+  {groups.map((g) => (
+    <section class="docs-landing-group">
+      <h2>{g.group.id}</h2>
+      <p class="docs-landing-tagline">{g.group.tagline}</p>
+      <ul class="docs-landing-list">
+        {g.docs.filter((d) => d.slug !== '').map((d) => (
+          <li>
+            <a href={d.url}>{d.title}</a>
+          </li>
+        ))}
+      </ul>
+    </section>
+  ))}
+</DocsLayout>

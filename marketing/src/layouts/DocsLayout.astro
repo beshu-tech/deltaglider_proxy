@@ -1,0 +1,50 @@
+---
+// DocsLayout.astro — shell for every /docs page: BaseLayout chrome + a
+// grouped sidebar (driven by the shared manifest) + the doc content slot.
+// The sidebar order/grouping is identical to the in-product docs viewer
+// because both read docs/product/manifest.json.
+
+import BaseLayout from './BaseLayout.astro';
+import { docsByGroup } from '../lib/docs';
+import '../styles/docs.css';
+
+interface Props {
+  title: string;
+  description: string;
+  /** Friendly slug of the current doc ('' for the landing) — highlights the nav. */
+  activeSlug: string;
+}
+
+const { title, description, activeSlug } = Astro.props;
+const groups = docsByGroup();
+---
+
+<BaseLayout title={title} description={description} ogType="article">
+  <div class="docs-shell">
+    <aside class="docs-sidebar" aria-label="Documentation">
+      <a href="/docs" class={`docs-nav-home${activeSlug === '' ? ' is-active' : ''}`}>
+        Documentation
+      </a>
+      {groups.map((g) => (
+        <div class="docs-nav-group">
+          <div class="docs-nav-group-title">{g.group.id}</div>
+          <ul>
+            {g.docs.filter((d) => d.slug !== '').map((d) => (
+              <li>
+                <a
+                  href={d.url}
+                  class={d.slug === activeSlug ? 'is-active' : undefined}
+                  aria-current={d.slug === activeSlug ? 'page' : undefined}
+                >{d.title}</a>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ))}
+    </aside>
+
+    <article class="docs-content">
+      <slot />
+    </article>
+  </div>
+</BaseLayout>
