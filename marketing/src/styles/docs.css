@@ -95,7 +95,7 @@
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.12em;
-  color: var(--ink-mute);
+  color: var(--ink-500); /* AA-legible chrome label (was --ink-mute, ~2.7:1) */
   display: flex;
   align-items: center;
   gap: 8px;
@@ -144,8 +144,8 @@
   gap: 6px; margin: 0; padding: 0; min-width: 0;
 }
 .docs-breadcrumb li { display: inline-flex; align-items: center; gap: 6px; margin: 0; }
-.docs-breadcrumb a { color: var(--ink-mute); text-decoration: none; transition: color 0.12s; }
-.docs-breadcrumb a:hover { color: var(--brand); }
+.docs-breadcrumb a { color: var(--ink-soft); text-decoration: none; transition: color 0.12s; }
+.docs-breadcrumb a:hover { color: var(--brand-dark); }
 .docs-breadcrumb span[aria-current='page'] {
   color: var(--ink-strong);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40ch;
@@ -153,11 +153,11 @@
 .docs-crumb-sep { color: var(--brand); opacity: 0.6; }
 .docs-edit-link {
   display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0;
-  color: var(--ink-mute); text-decoration: none;
-  padding: 3px 10px; border: 1px solid var(--rule); border-radius: 999px;
+  color: var(--ink-soft); text-decoration: none;
+  padding: 3px 10px; border: 1px solid var(--rule-strong); border-radius: 999px;
   transition: color 0.12s, border-color 0.12s;
 }
-.docs-edit-link:hover { color: var(--brand); border-color: var(--brand); }
+.docs-edit-link:hover { color: var(--brand-dark); border-color: var(--brand); }
 .docs-edit-link svg { display: block; }
 
 .docs-kicker {
@@ -372,22 +372,29 @@
   max-height: calc(100vh - 48px); overflow-y: auto;
   font-size: 0.82rem; border-left: 1px solid var(--rule); padding-left: 16px;
 }
+/* TOC eyebrow: the dim chrome label. --ink-500 (#94a3b8 ≈ 5.9:1 on the bg)
+   passes WCAG AA for small text, where --ink-mute (#475569 ≈ 2.7:1) failed. */
 .docs-toc-eyebrow {
-  font-family: var(--doc-label); font-size: 0.66rem; font-weight: 600;
-  text-transform: uppercase; letter-spacing: 0.1em; color: var(--ink-mute);
+  font-family: var(--doc-label); font-size: 0.7rem; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.1em; color: var(--ink-500);
   margin: 0 0 12px;
 }
 .docs-toc nav ul { list-style: none; margin: 0; padding: 0; }
 .docs-toc nav li { margin: 0; }
+/* TOC LINKS are navigation, not chrome — they must read clearly and outrank the
+   uppercase group label above them (the inverted-hierarchy bug). --ink-soft
+   (#cbd5e1 ≈ 11:1) is comfortably AA, and a touch larger than before. */
 .docs-toc a {
-  display: block; padding: 4px 0 4px 12px; margin-left: -17px;
-  border-left: 2px solid transparent; color: var(--ink-mute);
-  text-decoration: none; line-height: 1.35;
+  display: block; padding: 5px 0 5px 12px; margin-left: -17px;
+  border-left: 2px solid transparent; color: var(--ink-soft);
+  text-decoration: none; line-height: 1.4; font-size: 0.86rem;
   transition: color 0.12s, border-color 0.12s;
 }
 .docs-toc a:hover { color: var(--ink-strong); }
-.docs-toc a.is-active { color: var(--brand); border-left-color: var(--brand); font-weight: 600; }
-.docs-toc-sub a { padding-left: 26px; font-size: 0.95em; }
+.docs-toc a.is-active { color: var(--brand-dark); border-left-color: var(--brand); font-weight: 600; }
+.docs-toc-sub a { padding-left: 26px; font-size: 0.82rem; color: var(--ink-500); }
+.docs-toc-sub a:hover { color: var(--ink-strong); }
+.docs-toc-sub a.is-active { color: var(--brand-dark); }
 
 /* ── Copy-to-clipboard buttons ─────────────────────────────────────────── */
 .docs-prose pre.has-copy { position: relative; }
@@ -395,8 +402,8 @@
   position: absolute; top: 8px; right: 8px;
   display: inline-flex; align-items: center;
   font-family: var(--doc-label); font-size: 0.68rem; font-weight: 600; letter-spacing: 0.02em;
-  color: var(--ink-mute); background: var(--doc-code-bg);
-  border: 1px solid var(--rule); border-radius: 6px; padding: 4px 9px;
+  color: var(--ink-soft); background: var(--doc-code-bg);
+  border: 1px solid var(--rule-strong); border-radius: 6px; padding: 4px 9px;
   cursor: pointer; opacity: 0; transform: translateY(-2px);
   transition: opacity 0.14s, transform 0.14s, color 0.12s, border-color 0.12s, background 0.12s;
 }
@@ -446,7 +453,7 @@
 }
 .docs-landing-tagline {
   font-family: var(--doc-label); font-size: 0.72rem; letter-spacing: 0.08em;
-  text-transform: uppercase; color: var(--ink-mute); margin: 0 0 14px;
+  text-transform: uppercase; color: var(--ink-500); margin: 0 0 14px;
 }
 .docs-landing-list {
   list-style: none; margin: 0; padding: 0;

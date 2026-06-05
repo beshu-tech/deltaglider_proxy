@@ -1,0 +1,511 @@
+---
+// Capabilities.astro — art-directed bento for "what DeltaGlider does".
+// Hierarchy is encoded by SIZE + COLOR + GLOW, in the product's priority order:
+//   Tier 1 (hero, biggest, cyan glow): enterprise auth & access control
+//   Tier 2 (wide, fuchsia accent):     cross-cloud replication
+//   Tier 3 (two small, neutral):       delta compression + encryption at rest
+// Self-contained: markup + scoped styles. Accessibility: all text colours are
+// WCAG-AA on the dark surface (no --ink-mute as readable text).
+const tier1Tags = ["IAM", "ABAC", "OAuth / OIDC", "Lifecycle"];
+const tier2Tags = ["Event-driven", "Pause / Resume"];
+const tier3aTags = ["10×–100×", "Same S3 API"];
+const tier3bTags = ["AES-256-GCM", "Your key"];
+---
+
+<section class="section caps" aria-labelledby="caps-title">
+  <div class="shell">
+    <header class="caps-head">
+      <span class="section-eyebrow">What you get</span>
+      <h2 id="caps-title" class="caps-title">
+        Turn any S3 bucket into <span class="grad">enterprise S3</span>.
+      </h2>
+      <p class="caps-intro">
+        Point DeltaGlider at cheap storage — Hetzner, Wasabi, MinIO, any S3 —
+        and get the access control, governance, and data services AWS charges a
+        premium for. Drop-in. Transparent. No lock-in.
+      </p>
+    </header>
+
+    <div class="bento">
+      <!-- TIER 1 — HERO -->
+      <article class="tile tile--hero" style="--i:0">
+        <div class="hero-glow" aria-hidden="true"></div>
+        <div class="hero-grid">
+          <div class="hero-copy">
+            <span class="kicker">
+              <span class="kicker-idx">01</span> Control plane
+            </span>
+            <h3 class="tile-title">Enterprise auth &amp; access control</h3>
+            <p class="tile-desc">
+              Per-user IAM with fine-grained ABAC permissions, OAuth/OIDC SSO
+              with group mapping, and object lifecycle rules — the access and
+              governance layer, in front of any bucket.
+            </p>
+            <ul class="chips" aria-label="Capabilities">
+              {tier1Tags.map((t) => <li class="chip chip--brand">{t}</li>)}
+            </ul>
+          </div>
+
+          <!-- focal visual: a policy snippet + user→role→bucket map + SSO chips -->
+          <div class="hero-visual" aria-hidden="true">
+            <div class="policy">
+              <div class="policy-bar">
+                <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+                <span class="policy-name">access-policy.json</span>
+              </div>
+              <pre class="policy-code"><code><span class="ln"><span class="pun">&#123;</span></span>
+<span class="ln">  <span class="key">"actions"</span><span class="pun">:</span> <span class="brk">[</span><span class="str">"read"</span><span class="pun">,</span> <span class="str">"list"</span><span class="brk">]</span><span class="pun">,</span></span>
+<span class="ln">  <span class="key">"resources"</span><span class="pun">:</span> <span class="brk">[</span><span class="str">"prod/*"</span><span class="brk">]</span><span class="pun">,</span></span>
+<span class="ln">  <span class="key">"group"</span><span class="pun">:</span> <span class="str">"engineering"</span></span>
+<span class="ln"><span class="pun">&#125;</span></span></code></pre>
+            </div>
+
+            <div class="flowmap">
+              <span class="node node--user">user</span>
+              <span class="wire"></span>
+              <span class="node node--role">role</span>
+              <span class="wire"></span>
+              <span class="node node--bucket">bucket</span>
+            </div>
+
+            <div class="sso">
+              <span class="sso-chip">Google</span>
+              <span class="sso-chip">OIDC</span>
+              <span class="sso-chip">SSO</span>
+            </div>
+          </div>
+        </div>
+      </article>
+
+      <!-- TIER 2 — SECONDARY -->
+      <article class="tile tile--wide" style="--i:1">
+        <div class="accent-corner" aria-hidden="true"></div>
+        <span class="kicker kicker--accent">
+          <span class="kicker-idx">02</span> Mobility
+        </span>
+        <h3 class="tile-title">Cross-cloud replication</h3>
+        <p class="tile-desc">
+          Replicate objects between buckets across providers — event-driven,
+          with pause/resume. Migrate or run multi-cloud, without lock-in.
+        </p>
+        <div class="repl-route" aria-hidden="true">
+          <span class="rnode">S3</span>
+          <span class="rarrow">⇄</span>
+          <span class="rnode">MinIO</span>
+          <span class="rarrow">⇄</span>
+          <span class="rnode">Hetzner</span>
+        </div>
+        <ul class="chips" aria-label="Capabilities">
+          {tier2Tags.map((t) => <li class="chip chip--accent">{t}</li>)}
+        </ul>
+      </article>
+
+      <!-- TIER 3a -->
+      <article class="tile tile--small" style="--i:2">
+        <span class="kicker">
+          <span class="kicker-idx">03</span> Efficiency
+        </span>
+        <h3 class="tile-title tile-title--sm">Transparent delta compression</h3>
+        <p class="tile-desc">
+          Versioned binaries stored as deltas — up to 10×–100× fewer bytes,
+          behind the same S3 API.
+        </p>
+        <ul class="chips" aria-label="Capabilities">
+          {tier3aTags.map((t) => <li class="chip">{t}</li>)}
+        </ul>
+      </article>
+
+      <!-- TIER 3b -->
+      <article class="tile tile--small" style="--i:3">
+        <span class="kicker">
+          <span class="kicker-idx">04</span> Confidentiality
+        </span>
+        <h3 class="tile-title tile-title--sm">Encryption at rest</h3>
+        <p class="tile-desc">
+          AES-256-GCM before objects hit the bucket. Your key stays in your
+          runtime; the backend only ever sees ciphertext.
+        </p>
+        <ul class="chips" aria-label="Capabilities">
+          {tier3bTags.map((t) => <li class="chip">{t}</li>)}
+        </ul>
+      </article>
+    </div>
+  </div>
+</section>
+
+<style>
+  .caps { position: relative; overflow: hidden; }
+
+  /* faint atmospheric wash behind the whole section */
+  .caps::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background:
+      radial-gradient(60% 50% at 18% 22%, rgba(34, 211, 238, 0.07), transparent 70%),
+      radial-gradient(50% 45% at 88% 80%, rgba(217, 70, 239, 0.06), transparent 70%);
+    pointer-events: none;
+  }
+
+  /* ---------- header ---------- */
+  .caps-head {
+    max-width: 680px;
+    margin-bottom: 3rem;
+    position: relative;
+  }
+  .caps-title {
+    font-family: var(--font-sans);
+    font-weight: 800;
+    font-size: clamp(2rem, 4.6vw, 3.4rem);
+    line-height: 1.04;
+    letter-spacing: -0.02em;
+    color: var(--ink-strong);
+    margin: 0.7rem 0 1rem;
+  }
+  .caps-title .grad {
+    background: linear-gradient(100deg, var(--brand) 0%, var(--brand-dark) 50%, var(--accent) 120%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .caps-intro {
+    font-family: var(--font-sans);
+    font-size: clamp(1rem, 1.4vw, 1.15rem);
+    line-height: 1.6;
+    color: var(--ink-soft);
+    margin: 0;
+    max-width: 60ch;
+  }
+
+  /* ---------- bento grid ---------- */
+  .bento {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    grid-auto-rows: 1fr;
+    gap: 1.25rem;
+    grid-template-areas:
+      "hero hero wide"
+      "hero hero wide"
+      "sm1  sm2  wide";
+  }
+  .tile--hero { grid-area: hero; }
+  .tile--wide { grid-area: wide; }
+  .tile--small:nth-of-type(3) { grid-area: sm1; }
+  .tile--small:nth-of-type(4) { grid-area: sm2; }
+
+  /* ---------- shared tile shell ---------- */
+  .tile {
+    position: relative;
+    border: 1px solid var(--rule);
+    border-radius: 18px;
+    background: var(--bg-card);
+    backdrop-filter: blur(8px);
+    padding: 1.6rem 1.7rem;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    isolation: isolate;
+    transition: transform 0.35s cubic-bezier(0.2, 0.8, 0.2, 1),
+      border-color 0.35s ease, box-shadow 0.35s ease;
+    opacity: 0;
+    transform: translateY(22px);
+    animation: caps-rise 0.7s cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
+    animation-delay: calc(var(--i) * 110ms + 80ms);
+  }
+  .tile:hover {
+    transform: translateY(-5px);
+    border-color: var(--rule-strong);
+    box-shadow: var(--shadow-lg);
+  }
+  @keyframes caps-rise {
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  /* ---------- kickers / titles / desc ---------- */
+  .kicker {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.55rem;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--brand-dark);
+    margin-bottom: 0.9rem;
+  }
+  .kicker--accent { color: #f5b6fb; }
+  .kicker-idx {
+    font-variant-numeric: tabular-nums;
+    color: var(--ink-soft);            /* AA — was --ink-mute (~2.7:1) */
+    padding: 0.12rem 0.4rem;
+    border: 1px solid var(--rule-strong);
+    border-radius: 6px;
+  }
+  .tile-title {
+    font-family: var(--font-sans);
+    font-weight: 800;
+    letter-spacing: -0.015em;
+    color: var(--ink-strong);
+    margin: 0 0 0.6rem;
+    line-height: 1.1;
+    font-size: 1.3rem;
+  }
+  .tile-title--sm { font-size: 1.16rem; font-weight: 700; }
+  .tile-desc {
+    font-family: var(--font-sans);
+    font-size: 0.94rem;
+    line-height: 1.55;
+    color: var(--ink-soft);
+    margin: 0 0 1.1rem;
+  }
+
+  /* ---------- chips ---------- */
+  .chips {
+    list-style: none;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin: auto 0 0;
+    padding: 0;
+  }
+  .chip {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.02em;
+    color: var(--ink-soft);            /* AA */
+    padding: 0.32rem 0.6rem;
+    border: 1px solid var(--rule-strong);
+    border-radius: 999px;
+    background: var(--bg-soft);
+    white-space: nowrap;
+  }
+  .chip--brand {
+    color: var(--brand-dark);
+    border-color: rgba(34, 211, 238, 0.4);
+    background: rgba(34, 211, 238, 0.1);
+  }
+  .chip--accent {
+    color: #f5b6fb;
+    border-color: rgba(217, 70, 239, 0.45);
+    background: rgba(217, 70, 239, 0.12);
+  }
+
+  /* ===================================================== */
+  /* TIER 1 — HERO                                          */
+  /* ===================================================== */
+  .tile--hero {
+    padding: 2.2rem 2.3rem;
+    border-color: rgba(34, 211, 238, 0.4);
+    background:
+      linear-gradient(165deg, rgba(34, 211, 238, 0.08), rgba(30, 41, 59, 0.55) 42%);
+    box-shadow: 0 0 0 1px rgba(34, 211, 238, 0.08), var(--shadow-lg);
+  }
+  .tile--hero:hover {
+    border-color: rgba(34, 211, 238, 0.6);
+    box-shadow: 0 0 28px rgba(34, 211, 238, 0.22), var(--shadow-lg);
+  }
+  .hero-glow {
+    position: absolute;
+    inset: -30% -10% auto -10%;
+    height: 80%;
+    background: radial-gradient(50% 60% at 30% 20%, rgba(34, 211, 238, 0.3), transparent 70%);
+    filter: blur(18px);
+    z-index: -1;
+    animation: caps-pulse 5.5s ease-in-out infinite;
+  }
+  @keyframes caps-pulse {
+    0%, 100% { opacity: 0.5; }
+    50% { opacity: 0.9; }
+  }
+
+  .hero-grid {
+    display: grid;
+    grid-template-columns: 1.05fr 0.95fr;
+    gap: 2rem;
+    align-items: center;
+    height: 100%;
+  }
+  .hero-copy { display: flex; flex-direction: column; }
+  .tile--hero .kicker { font-size: 0.78rem; color: var(--brand); }
+  .tile--hero .tile-title {
+    font-size: clamp(1.5rem, 2.4vw, 2.1rem);
+  }
+  .tile--hero .tile-desc { font-size: 1rem; }
+
+  /* --- focal visual --- */
+  .hero-visual {
+    display: flex;
+    flex-direction: column;
+    gap: 0.9rem;
+  }
+  .policy {
+    border: 1px solid rgba(34, 211, 238, 0.25);
+    border-radius: 12px;
+    background: rgba(8, 13, 24, 0.82);
+    box-shadow: var(--shadow-glow);
+    overflow: hidden;
+  }
+  .policy-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.5rem 0.75rem;
+    border-bottom: 1px solid var(--rule);
+    background: rgba(255, 255, 255, 0.02);
+  }
+  .policy-bar .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--ink-500);
+  }
+  .policy-bar .dot:first-child { background: var(--accent); opacity: 0.85; }
+  .policy-name {
+    margin-left: 0.4rem;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--ink-soft);
+  }
+  .policy-code {
+    margin: 0;
+    padding: 0.85rem 0.95rem;
+    font-family: var(--font-mono);
+    font-size: 0.74rem;
+    line-height: 1.7;
+    color: var(--ink-soft);
+    overflow-x: auto;
+  }
+  .policy-code .ln { display: block; }
+  .policy-code .key { color: var(--brand-dark); }
+  .policy-code .str { color: #fcd34d; }
+  .policy-code .pun,
+  .policy-code .brk { color: var(--ink-500); }
+
+  .flowmap {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.3rem;
+  }
+  .node {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.04em;
+    padding: 0.34rem 0.55rem;
+    border-radius: 7px;
+    border: 1px solid var(--rule-strong);
+    background: var(--bg-soft);
+    color: var(--ink-soft);
+    white-space: nowrap;
+  }
+  .node--role {
+    color: var(--brand-dark);
+    border-color: rgba(34, 211, 238, 0.5);
+    background: rgba(34, 211, 238, 0.12);
+    box-shadow: 0 0 12px rgba(34, 211, 238, 0.25);
+  }
+  .wire {
+    flex: 1;
+    height: 1px;
+    background: linear-gradient(90deg, var(--rule), rgba(34, 211, 238, 0.6), var(--rule));
+    position: relative;
+  }
+  .wire::after {
+    content: "";
+    position: absolute;
+    top: -2px;
+    width: 5px; height: 5px;
+    border-radius: 50%;
+    background: var(--brand);
+    box-shadow: 0 0 8px var(--brand);
+    animation: caps-travel 2.6s linear infinite;
+  }
+  .flowmap .wire:nth-of-type(4)::after { animation-delay: 1.3s; }
+  @keyframes caps-travel {
+    from { left: 0%; opacity: 0; }
+    10% { opacity: 1; }
+    90% { opacity: 1; }
+    to { left: 100%; opacity: 0; }
+  }
+
+  .sso { display: flex; gap: 0.4rem; }
+  .sso-chip {
+    font-family: var(--font-mono);
+    font-size: 0.66rem;
+    letter-spacing: 0.05em;
+    padding: 0.28rem 0.55rem;
+    border-radius: 999px;
+    border: 1px solid var(--rule-strong);
+    background: rgba(255, 255, 255, 0.03);
+    color: var(--ink-soft);
+  }
+
+  /* ===================================================== */
+  /* TIER 2 — WIDE / TALL                                   */
+  /* ===================================================== */
+  .tile--wide {
+    background: linear-gradient(180deg, rgba(217, 70, 239, 0.07), var(--bg-card) 50%);
+    border-color: rgba(217, 70, 239, 0.24);
+    justify-content: flex-start;
+  }
+  .tile--wide:hover { border-color: rgba(217, 70, 239, 0.5); }
+  .accent-corner {
+    position: absolute;
+    top: -40px; right: -40px;
+    width: 140px; height: 140px;
+    background: radial-gradient(circle at center, rgba(217, 70, 239, 0.35), transparent 70%);
+    filter: blur(10px);
+    z-index: -1;
+  }
+  .repl-route {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin: 0.4rem 0 1.2rem;
+  }
+  .rnode {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    font-weight: 600;
+    padding: 0.36rem 0.6rem;
+    border-radius: 8px;
+    border: 1px solid rgba(217, 70, 239, 0.35);
+    background: rgba(217, 70, 239, 0.1);
+    color: #f5b6fb;
+  }
+  .rarrow { color: var(--accent); font-size: 0.95rem; }
+
+  /* ===================================================== */
+  /* responsive collapse                                    */
+  /* ===================================================== */
+  @media (max-width: 880px) {
+    .bento {
+      grid-template-columns: 1fr 1fr;
+      grid-auto-rows: auto;
+      grid-template-areas:
+        "hero hero"
+        "wide wide"
+        "sm1  sm2";
+    }
+    .hero-grid { grid-template-columns: 1fr; gap: 1.4rem; }
+  }
+  @media (max-width: 560px) {
+    .bento {
+      grid-template-columns: 1fr;
+      grid-template-areas:
+        "hero"
+        "wide"
+        "sm1"
+        "sm2";
+    }
+    .caps-head { margin-bottom: 2.25rem; }
+    .tile--hero { padding: 1.8rem 1.5rem; }
+  }
+
+  /* ---------- reduced motion ---------- */
+  @media (prefers-reduced-motion: reduce) {
+    .tile { animation: none; opacity: 1; transform: none; }
+    .hero-glow, .wire::after { animation: none; }
+    .tile:hover { transform: none; }
+  }
+</style>

@@ -13,6 +13,7 @@ import ComparisonTable from '../components/ComparisonTable.astro';
 import ScreenshotGallery from '../components/ScreenshotGallery.astro';
 import HeroSlideshow from '../components/HeroSlideshow.tsx';
 import HowItWorks from '../components/HowItWorks.astro';
+import Capabilities from '../components/Capabilities.astro';
 import {
   organizationSchema,
   webSiteSchema,
@@ -39,25 +40,25 @@ import {
           Open source · GPL-3.0
         </span>
 
-        <h1>Cut S3 storage&nbsp;10&times;.<br />Change&nbsp;nothing.</h1>
+        <h1>Turn any S3 bucket into&nbsp;enterprise&nbsp;S3.</h1>
 
         <p class="hero-lede">
-          A drop-in S3 proxy that stores versioned binaries — artifacts,
-          builds, backups, models — as deltas. Same API. Same buckets.
-          <strong>Up to 10&times;–100&times; fewer bytes stored.</strong>
+          A drop-in proxy that adds <strong>per-user IAM, OAuth, object
+          lifecycle, cross-cloud replication, and encryption</strong> in
+          front of Hetzner, Wasabi, MinIO, or AWS — plus transparent delta
+          compression. Same S3 API. Zero code changes.
         </p>
 
         <div class="hero-ctas">
-          <a href="/pricing" class="btn btn-brand">See what you'd save&nbsp;&rarr;</a>
-          <a href="/trial" class="btn">Start free trial</a>
+          <a href="/trial" class="btn btn-brand">Start free trial&nbsp;&rarr;</a>
+          <a href="/docs/quickstart" class="btn">Read the docs</a>
           <a href="https://github.com/beshu-tech/deltaglider_proxy" class="btn btn-ghost">GitHub</a>
         </div>
 
         <p class="hero-trust">
-          <strong>In production</strong> at banks, nuclear research &amp; EU
-          institutions, and 2&times; of the S&amp;P&nbsp;500 top&nbsp;5 —
-          built by the <a href="https://readonlyrest.com">ReadonlyREST</a>
-          team since 2017.
+          <strong>Open source, in production at Beshu Tech</strong> — storing
+          and serving every <a href="https://readonlyrest.com">ReadonlyREST</a>
+          build. Written by the same team, since 2017.
         </p>
       </div>
 
@@ -67,7 +68,14 @@ import {
     </div>
   </section>
 
+  {/* ============================ CAPABILITIES ======================== */}
+  {/* #1 message: enterprise S3 on cheap storage (auth → replication →
+      compression/encryption), as an art-directed bento right after the hero. */}
+  <Capabilities />
+
   {/* ============================ HOW IT WORKS ========================= */}
+  {/* The compression mechanism deep-dive — tier 3, so it sits below the
+      capabilities overview rather than leading the page. */}
   <HowItWorks />
 
   {/* ============================ TESTIMONIALS ========================= */}
