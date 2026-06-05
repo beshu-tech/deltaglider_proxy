@@ -407,8 +407,8 @@ support_cost       = bracket_lookup(stored_footprint)
 net_savings        = savings − support_cost`}
       </pre>
       <p>
-        Bracket lookup: 0–10 TB → Starter $10k · 10–50 TB → Growth $30k ·
-        50–250 TB → Scale $60k · 250 TB+ → Enterprise, talk to sales.
+        Bracket lookup: 0–10 TB → Starter $5k · 10–50 TB → Growth $15k ·
+        50–250 TB → Scale $30k · 250 TB+ → Enterprise, talk to sales.
       </p>
     </div>
   );

@@ -50,8 +50,8 @@ export const BRACKETS: readonly Bracket[] = [
   {
     id: 'starter',
     name: 'Production support — Starter',
-    priceUsd: 10_000,
-    priceLabel: '$10k/year',
+    priceUsd: 5_000,
+    priceLabel: '$5k/year',
     description:
       'Up to 10 TB stored footprint. Eng Slack + 4h business-hours response SLA.',
     rangeTb: [0, 10],
@@ -59,8 +59,8 @@ export const BRACKETS: readonly Bracket[] = [
   {
     id: 'growth',
     name: 'Production support — Growth',
-    priceUsd: 30_000,
-    priceLabel: '$30k/year',
+    priceUsd: 15_000,
+    priceLabel: '$15k/year',
     description:
       '10–50 TB stored footprint. Same SLA + quarterly review call.',
     rangeTb: [10, 50],
@@ -68,8 +68,8 @@ export const BRACKETS: readonly Bracket[] = [
   {
     id: 'scale',
     name: 'Production support — Scale',
-    priceUsd: 60_000,
-    priceLabel: '$60k/year',
+    priceUsd: 30_000,
+    priceLabel: '$30k/year',
     description:
       '50–250 TB stored footprint. 1h response SLA, monthly review, named eng contact.',
     rangeTb: [50, 250],

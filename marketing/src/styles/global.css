@@ -744,9 +744,13 @@ section { scroll-margin-top: 5rem; }
 .hero-slideshow__label { color: var(--brand); font-weight: 600; }
 .hero-slideshow__chrome-spacer { flex: 0 0 auto; width: 39px; }
 
+/* Stage is a <button> now (click → lightbox). Reset native button chrome. */
 .hero-slideshow__stage {
-  position: relative; aspect-ratio: 16 / 11; background: var(--ink-100); overflow: hidden;
+  position: relative; aspect-ratio: 16 / 11; background: var(--ink-100);
+  overflow: hidden; display: block; width: 100%; padding: 0; margin: 0;
+  border: none; cursor: zoom-in; appearance: none; text-align: left;
 }
+.hero-slideshow__stage:focus-visible { outline: 2px solid var(--brand); outline-offset: 3px; }
 .hero-slideshow__slide {
   position: absolute; inset: 0; margin: 0;
   opacity: 0; visibility: hidden; transform: scale(1.02);
@@ -762,6 +766,25 @@ section { scroll-margin-top: 5rem; }
 }
 .hero-slideshow__slide img {
   width: 100%; height: 100%; object-fit: cover; object-position: top center; display: block;
+  transition: transform 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+}
+/* zoom-on-hover: the active image scales up inside the frame */
+.hero-slideshow__stage:hover .hero-slideshow__slide.is-active img,
+.hero-slideshow__stage:focus-visible .hero-slideshow__slide.is-active img {
+  transform: scale(1.08);
+}
+/* zoom hint glyph, appears on hover */
+.hero-slideshow__zoomhint {
+  position: absolute; top: 12px; right: 12px; z-index: 4;
+  width: 30px; height: 30px; display: grid; place-items: center;
+  border-radius: 8px; font-size: 1rem; line-height: 1;
+  color: var(--ink-strong); background: rgba(8, 13, 24, 0.7);
+  border: 1px solid var(--rule-strong); backdrop-filter: blur(4px);
+  opacity: 0; transform: translateY(-3px); transition: opacity 0.2s, transform 0.2s;
+}
+.hero-slideshow__stage:hover .hero-slideshow__zoomhint,
+.hero-slideshow__stage:focus-visible .hero-slideshow__zoomhint {
+  opacity: 1; transform: translateY(0);
 }
 .hero-slideshow__caption {
   position: absolute; left: 0; right: 0; bottom: 0; padding: 1.4rem 1rem 0.85rem;
@@ -779,27 +802,84 @@ section { scroll-margin-top: 5rem; }
   50%      { background-position: -20% 0; }
 }
 
-.hero-slideshow__indicators { display: flex; justify-content: center; gap: 0.6rem; margin-top: 1.1rem; }
-.hero-slideshow__dot {
-  --dot: var(--ink-mute);
-  appearance: none; border: none; background: none; padding: 6px; cursor: pointer;
-  line-height: 0; border-radius: 999px;
+/* Prev / next arrow nav + counter (replaces the dot indicators). */
+.hero-slideshow__nav {
+  display: flex; align-items: center; justify-content: center;
+  gap: 1.1rem; margin-top: 1.1rem;
 }
-.hero-slideshow__dot-fill {
-  display: block; width: 8px; height: 8px; border-radius: 999px; background: var(--dot);
-  transition: width 0.4s cubic-bezier(0.16, 1, 0.3, 1), background 0.3s ease;
+.hero-slideshow__arrow {
+  display: grid; place-items: center;
+  width: 38px; height: 38px; padding: 0;
+  border-radius: 50%; cursor: pointer;
+  color: var(--ink-soft); background: var(--bg-card);
+  border: 1px solid var(--rule-strong);
+  transition: color 0.15s, border-color 0.15s, background 0.15s, transform 0.15s;
 }
-.hero-slideshow__dot:hover .hero-slideshow__dot-fill { background: var(--brand-dark); }
-.hero-slideshow__dot.is-active .hero-slideshow__dot-fill {
-  width: 22px; background: var(--brand); box-shadow: 0 0 12px rgba(34, 211, 238, 0.7);
+.hero-slideshow__arrow:hover {
+  color: var(--bg); background: var(--brand); border-color: var(--brand);
+  transform: translateY(-1px); box-shadow: 0 0 14px rgba(34, 211, 238, 0.45);
 }
-.hero-slideshow__dot:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+.hero-slideshow__arrow:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+.hero-slideshow__counter {
+  font-family: var(--font-mono); font-size: 0.82rem; color: var(--ink-soft);
+  min-width: 3.5ch; text-align: center; font-variant-numeric: tabular-nums;
+}
+.hero-slideshow__counter-sep { color: var(--ink-mute); margin: 0 0.15rem; }
+
+/* ---------- Lightbox ---------- */
+.hero-lightbox {
+  position: fixed; inset: 0; z-index: 1000;
+  display: flex; align-items: center; justify-content: center;
+  gap: 1rem; padding: clamp(1rem, 4vw, 3rem);
+  background: rgba(5, 8, 14, 0.86); backdrop-filter: blur(8px);
+  cursor: zoom-out;
+  animation: hero-lightbox-in 0.2s ease both;
+}
+@keyframes hero-lightbox-in { from { opacity: 0; } to { opacity: 1; } }
+.hero-lightbox__figure {
+  margin: 0; max-width: min(1100px, 92vw); max-height: 86vh;
+  display: flex; flex-direction: column; gap: 0.7rem; cursor: default;
+  animation: hero-lightbox-pop 0.25s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+@keyframes hero-lightbox-pop { from { transform: scale(0.96); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+.hero-lightbox__figure img {
+  max-width: 100%; max-height: 78vh; object-fit: contain;
+  border-radius: 12px; border: 1px solid var(--rule-strong);
+  box-shadow: 0 30px 80px -20px rgba(0, 0, 0, 0.8);
+}
+.hero-lightbox__figure figcaption {
+  font-family: var(--font-mono); font-size: 0.8rem; color: var(--ink-soft);
+  text-align: center;
+}
+.hero-lightbox__close {
+  position: absolute; top: clamp(0.75rem, 2vw, 1.5rem); right: clamp(0.75rem, 2vw, 1.5rem);
+  width: 42px; height: 42px; border-radius: 50%;
+  font-size: 1.5rem; line-height: 1; cursor: pointer;
+  color: var(--ink-soft); background: var(--bg-card); border: 1px solid var(--rule-strong);
+  transition: color 0.15s, background 0.15s, border-color 0.15s;
+}
+.hero-lightbox__close:hover { color: var(--ink-strong); border-color: var(--brand); }
+.hero-lightbox__arrow {
+  flex: 0 0 auto; display: grid; place-items: center;
+  width: 48px; height: 48px; border-radius: 50%; cursor: pointer;
+  color: var(--ink-soft); background: var(--bg-card); border: 1px solid var(--rule-strong);
+  transition: color 0.15s, background 0.15s, border-color 0.15s, transform 0.15s;
+}
+.hero-lightbox__arrow:hover {
+  color: var(--bg); background: var(--brand); border-color: var(--brand); transform: scale(1.06);
+}
+.hero-lightbox__arrow:focus-visible,
+.hero-lightbox__close:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+@media (max-width: 640px) {
+  .hero-lightbox__arrow { width: 40px; height: 40px; }
+}
 
 .hero-slideshow.is-reduced,
 .hero-slideshow.is-reduced .hero-slideshow__window { animation: none; transform: none; }
 .hero-slideshow.is-reduced .hero-slideshow__sheen { display: none; }
 .hero-slideshow.is-reduced .hero-slideshow__slide,
 .hero-slideshow.is-reduced .hero-slideshow__slide.is-active { transition: none; transform: none; }
+.hero-slideshow.is-reduced .hero-slideshow__stage:hover .hero-slideshow__slide.is-active img { transform: none; }
 
 @media (max-width: 999px) {
   .hero-slideshow { max-width: 520px; margin-top: 0.5rem; }

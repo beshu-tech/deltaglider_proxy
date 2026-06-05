@@ -70,6 +70,7 @@ function usePrefersReducedMotion(): boolean {
 export default function HeroSlideshow() {
   const [active, setActive] = useState(0);
   const [paused, setPaused] = useState(false);
+  const [lightbox, setLightbox] = useState(false);
   const reducedMotion = usePrefersReducedMotion();
   // Track which images have been requested so we never re-flash on revisit.
   const [loaded, setLoaded] = useState<Set<number>>(() => new Set([0]));
@@ -91,14 +92,32 @@ export default function HeroSlideshow() {
     });
   }, [active, count]);
 
-  // Auto-advance. Disabled entirely under reduced-motion or while paused.
+  // Auto-advance. Disabled under reduced-motion, while paused (hover/focus),
+  // or while the lightbox is open.
   useEffect(() => {
-    if (reducedMotion || paused) return;
+    if (reducedMotion || paused || lightbox) return;
     const id = window.setInterval(() => {
       setActive((a) => (a + 1) % count);
     }, INTERVAL_MS);
     return () => window.clearInterval(id);
-  }, [reducedMotion, paused, count]);
+  }, [reducedMotion, paused, lightbox, count]);
+
+  // Escape closes the lightbox; lock body scroll while it's open.
+  useEffect(() => {
+    if (!lightbox) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setLightbox(false);
+      else if (e.key === 'ArrowRight') setActive((a) => (a + 1) % count);
+      else if (e.key === 'ArrowLeft') setActive((a) => (a - 1 + count) % count);
+    };
+    document.addEventListener('keydown', onKey);
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.removeEventListener('keydown', onKey);
+      document.body.style.overflow = prev;
+    };
+  }, [lightbox, count]);
 
   const onKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'ArrowRight') {
@@ -142,17 +161,19 @@ export default function HeroSlideshow() {
           <span className="hero-slideshow__chrome-spacer" aria-hidden="true" />
         </div>
 
-        {/* Stage */}
-        <div className="hero-slideshow__stage">
+        {/* Stage — click to open the lightbox; image zooms on hover. */}
+        <button
+          type="button"
+          className="hero-slideshow__stage"
+          aria-label={`View ${SLIDES[active].label} full size`}
+          onClick={() => setLightbox(true)}
+        >
           {SLIDES.map((slide, i) => {
             const isActive = i === active;
             return (
               <figure
                 key={slide.src}
                 className={`hero-slideshow__slide${isActive ? ' is-active' : ''}`}
-                role="group"
-                aria-roledescription="slide"
-                aria-label={`${i + 1} of ${count}: ${slide.label}`}
                 aria-hidden={!isActive}
               >
                 {(loaded.has(i) || i === active || i === 0) && (
@@ -174,26 +195,71 @@ export default function HeroSlideshow() {
               </figure>
             );
           })}
+          <span className="hero-slideshow__zoomhint" aria-hidden="true">⤢</span>
           <span className="hero-slideshow__sheen" aria-hidden="true" />
-        </div>
+        </button>
       </div>
 
-      {/* Indicators */}
-      <div className="hero-slideshow__indicators" role="tablist" aria-label="Choose a screenshot">
-        {SLIDES.map((slide, i) => (
-          <button
-            key={slide.src}
-            type="button"
-            role="tab"
-            aria-selected={i === active}
-            aria-label={slide.label}
-            className={`hero-slideshow__dot${i === active ? ' is-active' : ''}`}
-            onClick={() => go(i)}
-          >
-            <span className="hero-slideshow__dot-fill" />
-          </button>
-        ))}
+      {/* Prev / next arrows (replaces dot indicators). */}
+      <div className="hero-slideshow__nav">
+        <button
+          type="button"
+          className="hero-slideshow__arrow"
+          aria-label="Previous screenshot"
+          onClick={() => go(active - 1)}
+        >
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 18l-6-6 6-6" /></svg>
+        </button>
+        <span className="hero-slideshow__counter" aria-live="polite">
+          {active + 1}<span className="hero-slideshow__counter-sep">/</span>{count}
+        </span>
+        <button
+          type="button"
+          className="hero-slideshow__arrow"
+          aria-label="Next screenshot"
+          onClick={() => go(active + 1)}
+        >
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18l6-6-6-6" /></svg>
+        </button>
       </div>
+
+      {/* Lightbox */}
+      {lightbox && (
+        <div
+          className="hero-lightbox"
+          role="dialog"
+          aria-modal="true"
+          aria-label={`${SLIDES[active].label} — full size`}
+          onClick={() => setLightbox(false)}
+        >
+          <button
+            type="button"
+            className="hero-lightbox__close"
+            aria-label="Close"
+            onClick={() => setLightbox(false)}
+          >×</button>
+          <button
+            type="button"
+            className="hero-lightbox__arrow hero-lightbox__arrow--prev"
+            aria-label="Previous screenshot"
+            onClick={(e) => { e.stopPropagation(); go(active - 1); }}
+          >
+            <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 18l-6-6 6-6" /></svg>
+          </button>
+          <figure className="hero-lightbox__figure" onClick={(e) => e.stopPropagation()}>
+            <img src={SLIDES[active].src} alt={SLIDES[active].alt} />
+            <figcaption>{SLIDES[active].label} — {SLIDES[active].caption}</figcaption>
+          </figure>
+          <button
+            type="button"
+            className="hero-lightbox__arrow hero-lightbox__arrow--next"
+            aria-label="Next screenshot"
+            onClick={(e) => { e.stopPropagation(); go(active + 1); }}
+          >
+            <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18l6-6-6-6" /></svg>
+          </button>
+        </div>
+      )}
     </div>
   );
 }

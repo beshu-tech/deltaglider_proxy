@@ -240,15 +240,24 @@
   width: 6px; height: 6px; border-radius: 1px;
   background: var(--brand); transform: rotate(45deg); opacity: 0.9;
 }
-.docs-prose ol { list-style: none; counter-reset: doc-ol; padding-left: 1.9em; margin: 0 0 18px; }
-.docs-prose ol > li { position: relative; margin: 7px 0; color: var(--ink-700); counter-increment: doc-ol; }
-.docs-prose ol > li::before {
-  content: counter(doc-ol, decimal-leading-zero);
-  position: absolute; left: -1.9em; top: 0.05em;
-  font-family: var(--doc-label); font-size: 0.78em; font-weight: 600;
-  color: var(--brand); opacity: 0.85;
+.docs-prose ol { list-style: none; counter-reset: doc-ol; padding-left: 2.6em; margin: 0 0 22px; }
+/* Roomier rows + flex so the "#1" marker and the content (incl. code chips)
+   share a top baseline regardless of the chip's box height. */
+.docs-prose ol > li {
+  display: flex; align-items: baseline; gap: 0.7em;
+  margin: 14px 0; color: var(--ink-700); counter-increment: doc-ol;
 }
-.docs-prose li > ul, .docs-prose li > ol { margin: 6px 0; }
+.docs-prose ol > li::before {
+  content: "#" counter(doc-ol);
+  flex: 0 0 1.9em; text-align: right;
+  font-family: var(--doc-label); font-size: 0.85em; font-weight: 600;
+  color: var(--brand-dark);
+  /* nudge onto the first text line's baseline so it lines up with code chips */
+  position: relative; top: 0.02em;
+}
+/* the li content sits in the flex track to the right of the marker */
+.docs-prose ol > li > :first-child { margin-top: 0; }
+.docs-prose li > ul, .docs-prose li > ol { margin: 8px 0; }
 
 /* ── Code — always light on dark; guards the inherited-dark-ink regression ─ */
 .docs-prose code {
@@ -304,8 +313,26 @@
   transition: opacity 0.14s;
 }
 .docs-prose .shiki-wrap:hover::after { opacity: 0; }
+/* Rendered mermaid block. The SVG ships with a tiny intrinsic width, so without
+   sizing it renders as a postage stamp in a big box. Force it to fill the
+   container (capped so very wide graphs stay readable) and give the frame real
+   padding so the diagram is a prominent figure, not a lost thumbnail. */
 .docs-prose pre.mermaid {
-  background: var(--bg-card); text-align: center; border-style: dashed; color: var(--ink-700);
+  background: var(--bg-card);
+  text-align: center;
+  border-style: dashed;
+  color: var(--ink-700);
+  padding: 24px clamp(12px, 4%, 40px);
+  display: flex;
+  justify-content: center;
+}
+.docs-prose pre.mermaid svg {
+  width: 100% !important;
+  max-width: 720px;
+  height: auto !important;
+  max-height: 460px;   /* tall graphs stay contained; aspect ratio preserved */
+  display: block;
+  margin: 0 auto;
 }
 
 /* ── Blockquote → engineered callout ───────────────────────────────────── */

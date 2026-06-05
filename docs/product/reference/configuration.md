@@ -123,10 +123,8 @@ Mixing `public: true` and a non-empty `public_prefixes` is a hard error.
 1. `DGP_CONFIG` env var (returned unconditionally — if set, the path is used even when the file doesn't yet exist).
 2. `./deltaglider_proxy.yaml`
 3. `./deltaglider_proxy.yml`
-4. `./deltaglider_proxy.toml` (deprecated)
-5. `/etc/deltaglider_proxy/config.yaml`
-6. `/etc/deltaglider_proxy/config.yml`
-7. `/etc/deltaglider_proxy/config.toml` (deprecated)
+4. `/etc/deltaglider_proxy/config.yaml`
+5. `/etc/deltaglider_proxy/config.yml`
 
 CLI flags (`--config <path>`, `--listen <addr>`) take precedence over all of the above; env vars take precedence over file contents.
 

@@ -158,8 +158,31 @@ const showToc = props.kind === 'doc' && toc.length >= 2;
     if (document.querySelector('pre.mermaid')) {
       const mermaid = (await import('mermaid')).default;
       const dark = window.matchMedia?.('(prefers-color-scheme: dark)').matches;
-      mermaid.initialize({ startOnLoad: false, theme: dark ? 'dark' : 'default' });
+      // useMaxWidth:false lets the rendered SVG scale up to fill its container
+      // (matches the in-product viewer) instead of locking to the tiny intrinsic
+      // width — the CSS in docs.css then caps it at a readable max-width.
+      mermaid.initialize({
+        startOnLoad: false,
+        theme: dark ? 'dark' : 'default',
+        flowchart: { useMaxWidth: false },
+        sequence: { useMaxWidth: false },
+      });
       await mermaid.run({ querySelector: 'pre.mermaid' });
+      // Tighten each SVG's viewBox to the actual drawn content. Mermaid's
+      // default viewBox is often 2–3× larger than the graph, which renders the
+      // diagram as a tiny island in a huge empty box. (Same fix the in-product
+      // docs viewer applies.)
+      document.querySelectorAll('pre.mermaid svg').forEach((svg) => {
+        try {
+          const bbox = svg.getBBox();
+          const pad = 8;
+          svg.setAttribute(
+            'viewBox',
+            `${bbox.x - pad} ${bbox.y - pad} ${bbox.width + pad * 2} ${bbox.height + pad * 2}`
+          );
+          svg.removeAttribute('height');
+        } catch { /* getBBox throws if detached; ignore */ }
+      });
     }
   </script>
 )}
