@@ -111,15 +111,29 @@
   border-left: 3px solid var(--brand); background: var(--bg-soft);
   color: var(--ink-soft); border-radius: 0 8px 8px 0;
 }
+/* Inline code: the body text colour is near-black navy (--ink-900), which is
+   invisible on the dark --bg-alt chip — give inline code a legible light/teal
+   tint instead of inheriting body ink. */
 .docs-prose code {
   font-family: var(--font-mono); font-size: 0.875em;
-  background: var(--bg-alt); padding: 2px 6px; border-radius: 4px;
+  background: var(--bg-alt); color: var(--brand-dark);
+  padding: 2px 6px; border-radius: 4px;
+  white-space: nowrap;
 }
 .docs-prose pre {
   background: var(--bg-alt); border: 1px solid var(--rule); border-radius: 10px;
   padding: 16px 18px; overflow-x: auto; margin: 0 0 18px; font-size: 0.85rem; line-height: 1.5;
+  color: var(--ink-strong);
 }
-.docs-prose pre code { background: none; padding: 0; font-size: inherit; }
+/* Code inside a fenced block must be display:block with intrinsic width so a
+   long line establishes the pre's scrollWidth and overflow-x:auto produces a
+   scrollbar — as inline (the UA default) the long line is clipped, not
+   scrollable. Reset the inline-code colour/nowrap/chip styling here. */
+.docs-prose pre code {
+  display: block; min-width: max-content;
+  background: none; color: inherit; white-space: pre;
+  padding: 0; font-size: inherit;
+}
 .docs-prose pre.mermaid {
   background: var(--bg-card); text-align: center; border-style: dashed;
 }
