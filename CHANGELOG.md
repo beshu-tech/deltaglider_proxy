@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.3.0 — 2026-06-05
+
 ### Changed (breaking) — IAM permission templates are now `${iam:...}`
 
 - IAM identity templates in `resources` / string condition values are now
