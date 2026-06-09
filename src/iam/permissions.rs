@@ -196,20 +196,24 @@ pub fn permission_to_iam_policy(perm: &Permission) -> IAMPolicy {
                 }
             }
             Err(e) => {
-                tracing::warn!("Failed to parse conditions: {} — input: {}", e, cond_json);
-                if perm.effect.eq_ignore_ascii_case("Deny") {
-                    // For Deny rules: fail safe by applying the Deny WITHOUT conditions.
-                    // A Deny with unparseable conditions should still deny (broadest deny).
-                    // Dropping it would silently allow access the admin intended to block.
-                    tracing::warn!(
-                        "  Applying Deny rule WITHOUT conditions (fail-safe for Deny rules)"
-                    );
-                    // Fall through — stmt is already built without conditions
-                } else {
-                    // For Allow rules: fail closed by skipping the statement entirely.
-                    // An Allow with unparseable conditions should NOT grant access.
-                    return IAMPolicy::new();
-                }
+                // An un-evaluatable condition is a configuration error.
+                // `validate_permissions` rejects these at config time, so reaching
+                // here means stored/legacy data slipped past validation. Drop the
+                // statement entirely (empty policy) for BOTH effects rather than
+                // changing its semantics:
+                //   - For Allow: dropping it correctly fails closed (no grant).
+                //   - For Deny: keeping it WITHOUT the condition would silently
+                //     broaden "deny IF <cond>" into an unconditional deny, blocking
+                //     access the admin scoped to a specific context. The condition's
+                //     intent is "only deny when this holds" — if it can't be
+                //     evaluated, the Deny must not fire unconditionally.
+                tracing::error!(
+                    "Permission has unparseable conditions (effect={}); dropping statement — this should have been rejected at config time: {} — input: {}",
+                    perm.effect,
+                    e,
+                    cond_json
+                );
+                return IAMPolicy::new();
             }
         }
     }
@@ -429,6 +433,14 @@ pub fn validate_permissions(permissions: &[Permission]) -> Result<(), String> {
         if let Some(conditions) = &perm.conditions {
             validate_condition_templates(conditions)
                 .map_err(|e| format!("{}: condition {}", ctx, e))?;
+            // Reject conditions that iam-rs can't parse at config time (fail closed).
+            // Otherwise a malformed condition would only surface at runtime in
+            // `permission_to_iam_policy`, where a Deny with an unparseable condition
+            // would otherwise be tempted to broaden into an unconditional Deny.
+            // Catching it here keeps the condition's intent: an un-evaluatable
+            // condition is a configuration error, not a silent scope change.
+            serde_json::from_value::<iam_rs::ConditionBlock>(conditions.clone())
+                .map_err(|e| format!("{}: condition could not be parsed: {}", ctx, e))?;
         }
     }
     Ok(())
@@ -1783,6 +1795,61 @@ mod tests {
 
         let err = validate_permissions(&perms).unwrap_err();
         assert!(err.contains("unknown template variable"), "error: {err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_unparseable_condition_block() {
+        // A condition that is valid JSON but not a valid iam-rs ConditionBlock
+        // (operator maps to a string, not a key→value object) must be rejected
+        // at config time so a Deny can never silently broaden at runtime.
+        let perms = vec![Permission {
+            id: 0,
+            effect: "Deny".into(),
+            actions: vec!["delete".into()],
+            resources: vec!["*".into()],
+            conditions: Some(serde_json::json!({"StringLike": "not-an-object"})),
+        }];
+        let err = validate_permissions(&perms).unwrap_err();
+        assert!(err.contains("condition could not be parsed"), "error: {err}");
+    }
+
+    #[test]
+    fn test_unparseable_deny_condition_drops_statement_not_broadens() {
+        // Defense in depth: if a malformed Deny condition slips past validation
+        // (e.g. legacy data), the runtime must NOT turn it into an unconditional
+        // deny. Dropping the statement means the Deny does not fire, so a
+        // co-existing Allow still applies.
+        let allow = Permission {
+            id: 0,
+            effect: "Allow".into(),
+            actions: vec!["*".into()],
+            resources: vec!["*".into()],
+            conditions: None,
+        };
+        let bad_deny = Permission {
+            id: 1,
+            effect: "Deny".into(),
+            actions: vec!["delete".into()],
+            resources: vec!["*".into()],
+            conditions: Some(serde_json::json!({"StringLike": "not-an-object"})),
+        };
+        let policies: Vec<IAMPolicy> = [allow, bad_deny]
+            .iter()
+            .map(permission_to_iam_policy)
+            .collect();
+
+        // The malformed Deny is dropped, so the Allow governs — delete is permitted
+        // rather than being unconditionally blocked everywhere.
+        assert!(
+            evaluate_iam(
+                &policies,
+                S3Action::Delete,
+                "bucket",
+                "key",
+                &Default::default()
+            ),
+            "unparseable Deny condition must drop the statement, not broaden to unconditional deny"
+        );
     }
 
     #[test]

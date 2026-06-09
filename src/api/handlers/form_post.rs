@@ -662,6 +662,33 @@ const MAX_FORM_POST_REPLAY_TTL_SECS: u64 = 24 * 60 * 60;
 /// to OOM the proxy.
 const MAX_FORM_POST_REPLAY_ENTRIES: usize = 50_000;
 
+/// Fraction of the hard cap to shed in one eviction sweep once the cap
+/// is breached, so a sustained flood can't pin the cache at the ceiling
+/// by re-filling a single freed slot per insert. 10% gives the next
+/// ~5,000 legitimate signatures breathing room before the next sweep.
+const FORM_POST_REPLAY_EVICT_FRACTION: usize = 10;
+
+/// Pick the keys to evict when the replay cache is over its hard cap:
+/// the `evict_count` entries with the **soonest** expiry (closest to
+/// being pruned anyway), so eviction prefers the least-valuable slots
+/// and never touches a live entry before an about-to-expire one. Pure:
+/// operates on a borrowed snapshot of `(key, expiry)` pairs, no I/O.
+fn form_post_replay_evict_keys(
+    entries: &[(String, std::time::Instant)],
+    evict_count: usize,
+) -> Vec<String> {
+    if evict_count == 0 || entries.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted: Vec<&(String, std::time::Instant)> = entries.iter().collect();
+    sorted.sort_by_key(|(_, exp)| *exp);
+    sorted
+        .into_iter()
+        .take(evict_count.min(entries.len()))
+        .map(|(k, _)| k.clone())
+        .collect()
+}
+
 /// Reject a captured presigned form-POST being replayed. Pure-ish:
 /// takes shared state, reads `parsed.fields_ci`, mutates the cache.
 fn enforce_form_post_replay(state: &Arc<AppState>, parsed: &ParsedFormPost) -> Result<(), S3Error> {
@@ -670,20 +697,31 @@ fn enforce_form_post_replay(state: &Arc<AppState>, parsed: &ParsedFormPost) -> R
     let now_instant = std::time::Instant::now();
 
     // Bounded prune: drop expired entries and, if still above cap,
-    // evict the oldest. Cheaper than a background sweeper task and
+    // evict a BATCH of the soonest-to-expire entries. Evicting only one
+    // entry per insert lets a sustained unique-signature flood hold the
+    // cache pinned at the ceiling indefinitely (every freed slot is
+    // immediately refilled by the next insert), so we shed
+    // `FORM_POST_REPLAY_EVICT_FRACTION`% of the cap in one sweep to
+    // create real headroom. Cheaper than a background sweeper task and
     // bounded by `MAX_FORM_POST_REPLAY_ENTRIES`.
     cache.retain(|_, exp_instant| *exp_instant > now_instant);
     if cache.len() > MAX_FORM_POST_REPLAY_ENTRIES {
-        // Hard cap reached — drop one arbitrary entry per insert.
-        // DashMap doesn't expose `pop`; iterate + remove the first.
-        if let Some(entry) = cache.iter().next() {
-            let k = entry.key().clone();
-            drop(entry);
-            cache.remove(&k);
+        let evict_count = (MAX_FORM_POST_REPLAY_ENTRIES / FORM_POST_REPLAY_EVICT_FRACTION).max(1);
+        // DashMap has no batch `pop`; snapshot (key, expiry) pairs,
+        // pick the soonest-to-expire keys via a pure helper, then
+        // remove them.
+        let snapshot: Vec<(String, std::time::Instant)> = cache
+            .iter()
+            .map(|e| (e.key().clone(), *e.value()))
+            .collect();
+        let evicted = form_post_replay_evict_keys(&snapshot, evict_count);
+        for k in &evicted {
+            cache.remove(k);
         }
         tracing::warn!(
-            "SECURITY | form_post_replay_cache hard-cap reached ({}) — possible flood",
-            cache.len()
+            "SECURITY | form_post_replay_cache hard-cap reached — evicted {} of {} entries (possible flood)",
+            evicted.len(),
+            snapshot.len()
         );
     }
 
@@ -1001,5 +1039,33 @@ mod tests {
             !cache.contains_key(&key),
             "expired entry must be evicted by the retain sweep"
         );
+    }
+
+    /// Over-cap eviction sheds a BATCH of the soonest-to-expire
+    /// entries (not one), and never picks a longer-lived slot before a
+    /// shorter-lived one. Guards the OOM-under-flood regression where a
+    /// single-eviction-per-insert strategy let the cache stay pinned at
+    /// the ceiling.
+    #[test]
+    fn form_post_replay_evict_picks_soonest_to_expire_batch() {
+        use std::time::{Duration, Instant};
+        let base = Instant::now();
+        // 10 entries with strictly increasing expiry: "k0" expires
+        // first, "k9" last.
+        let entries: Vec<(String, Instant)> = (0..10)
+            .map(|i| (format!("k{i}"), base + Duration::from_secs(i + 1)))
+            .collect();
+
+        // Evict 3 → the three soonest-to-expire keys.
+        let mut evicted = form_post_replay_evict_keys(&entries, 3);
+        evicted.sort();
+        assert_eq!(evicted, vec!["k0", "k1", "k2"]);
+
+        // evict_count larger than the cache size is clamped, not OOB.
+        assert_eq!(form_post_replay_evict_keys(&entries, 100).len(), 10);
+
+        // Degenerate inputs return nothing.
+        assert!(form_post_replay_evict_keys(&entries, 0).is_empty());
+        assert!(form_post_replay_evict_keys(&[], 5).is_empty());
     }
 }

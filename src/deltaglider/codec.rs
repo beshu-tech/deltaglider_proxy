@@ -110,7 +110,19 @@ fn pipe_stdin_stdout_stderr(
             let _result = condvar.wait_timeout(guard, timeout).unwrap();
             if !flag.load(std::sync::atomic::Ordering::Acquire) {
                 // Timeout expired and I/O hasn't finished — kill the child.
-                // Use raw kill(pid, SIGKILL) since we don't own the Child handle.
+                // Use raw kill(pid, SIGKILL) since we don't own the Child handle
+                // here (it's split into stdin/stdout/stderr and the `Child` stays
+                // in run_xdelta3 for wait_with_timeout). This is a best-effort
+                // timeout with a known, accepted PID-reuse race: in theory the
+                // child could exit naturally and the OS could recycle `child_id`
+                // for an unrelated process before this signal lands. In practice
+                // the condvar synchronisation closes the window — we only reach
+                // this branch after waiting the FULL timeout without the `done`
+                // flag being set, and the child cannot be reaped (its `Child`
+                // handle isn't waited on until run_xdelta3 calls
+                // wait_with_timeout AFTER the pipe threads — and hence this
+                // watchdog — have joined), so its PID stays reserved as a
+                // zombie and cannot be reused while we signal it.
                 #[cfg(unix)]
                 {
                     unsafe {

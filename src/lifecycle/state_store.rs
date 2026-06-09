@@ -236,6 +236,10 @@ impl ConfigDb {
         ttl_secs: i64,
     ) -> Result<bool, ConfigDbError> {
         let expires_at = now.saturating_add(ttl_secs.max(1));
+        // `>=` (not `>`): a renewal landing exactly on the expiry instant still
+        // belongs to the current owner, so it must succeed. Acquisition uses the
+        // mirror-image `<=` boundary (an expired lease is up for grabs at `now`),
+        // and this keeps the two sides from disagreeing about the boundary tick.
         let n = self.conn.execute(
             "UPDATE lifecycle_state
                 SET leader_expires_at = ?
@@ -243,7 +247,7 @@ impl ConfigDb {
                 AND leader_instance_id = ?
                 AND (
                     leader_expires_at IS NULL
-                    OR leader_expires_at > ?
+                    OR leader_expires_at >= ?
                 )",
             params![expires_at, rule_name, owner, now],
         )?;
@@ -454,19 +458,24 @@ mod tests {
     }
 
     #[test]
-    fn lease_renewal_rejects_expired_owner() {
+    fn lease_renewal_succeeds_on_expiry_boundary_but_rejects_past_it() {
         let db = db();
         db.lifecycle_ensure_state("r", 100).unwrap();
 
         assert!(db
             .lifecycle_try_acquire_lease("r", "owner-a", 100, 10)
             .unwrap());
+        // expires_at == 110; renew a tick before expiry.
         assert!(db.lifecycle_renew_lease("r", "owner-a", 109, 10).unwrap());
-        assert!(!db.lifecycle_renew_lease("r", "owner-a", 119, 10).unwrap());
+        // expires_at == 119; renew *exactly* at the expiry instant still belongs
+        // to the owner, so it must succeed (the `>=` boundary).
+        assert!(db.lifecycle_renew_lease("r", "owner-a", 119, 10).unwrap());
+        // expires_at == 129; one tick past expiry the lease is gone — reject.
+        assert!(!db.lifecycle_renew_lease("r", "owner-a", 130, 10).unwrap());
 
         let state = db.lifecycle_load_state("r").unwrap().unwrap();
         assert_eq!(state.leader_instance_id.as_deref(), Some("owner-a"));
-        assert_eq!(state.leader_expires_at, Some(119));
+        assert_eq!(state.leader_expires_at, Some(129));
     }
 
     #[test]

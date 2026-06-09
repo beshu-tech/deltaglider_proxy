@@ -450,19 +450,25 @@ async fn renew_run_lease(
     let Some(db) = db else {
         return Ok(true);
     };
-    let lost = !ctx.lease_alive.load(std::sync::atomic::Ordering::Acquire);
-    let renewed = if lost {
-        false
-    } else {
+    // Lock the DB BEFORE checking lease_alive so the check and the renewal are
+    // ordered against the heartbeat task, which sets lease_alive under the same
+    // lock when its own renewal fails. Without this, the heartbeat could declare
+    // the lease lost between an early flag load and acquiring the lock here, and
+    // we'd renew a lease the heartbeat already gave up on.
+    let renewed = {
         let guard = db.lock().await;
-        guard
-            .lifecycle_renew_lease(
-                &rule.name,
-                &lease.owner,
-                super::current_unix_seconds(),
-                lease.ttl_secs,
-            )
-            .map_err(|err| err.to_string())?
+        if !ctx.lease_alive.load(std::sync::atomic::Ordering::Acquire) {
+            false
+        } else {
+            guard
+                .lifecycle_renew_lease(
+                    &rule.name,
+                    &lease.owner,
+                    super::current_unix_seconds(),
+                    lease.ttl_secs,
+                )
+                .map_err(|err| err.to_string())?
+        }
     };
     if renewed {
         return Ok(true);

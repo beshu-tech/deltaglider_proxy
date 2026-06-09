@@ -2022,6 +2022,17 @@ impl Config {
         export
     }
 
+    /// True if any backend (singleton or named) uses SSE-KMS. Used to
+    /// flag at export time that the (non-secret but account-revealing)
+    /// `kms_key_id` ARN survives redaction.
+    fn has_kms_encryption(&self) -> bool {
+        matches!(self.backend_encryption.mode_tag(), "sse-kms")
+            || self
+                .backends
+                .iter()
+                .any(|b| b.encryption.mode_tag() == "sse-kms")
+    }
+
     /// Export variant: strips infra secrets AND every per-backend
     /// encryption key (singleton + named list). Intended for the admin
     /// API download endpoint where operators read the YAML out of band.
@@ -2029,6 +2040,19 @@ impl Config {
     /// or a bug report; we don't want encryption keys to follow it.
     fn redact_for_export(&self) -> Self {
         let mut export = self.redact_for_persist();
+        // SSE-KMS keeps `kms_key_id` visible after redaction (it's an ARN,
+        // not key material — operators need it to know WHICH key). But an
+        // ARN discloses the AWS account id, region, and key alias, and this
+        // export is the artifact that might land in GitOps or a bug report.
+        // Flag it at export time so operators can scrub the ARN themselves
+        // if those details are sensitive in their environment.
+        if export.has_kms_encryption() {
+            tracing::warn!(
+                "exported config retains SSE-KMS key ARN(s) (kms_key_id) — \
+                 these are not secret but disclose AWS account id / region / \
+                 key alias; scrub before sharing if that is sensitive"
+            );
+        }
         export.backend_encryption.redact_secrets();
         for named in &mut export.backends {
             named.encryption.redact_secrets();

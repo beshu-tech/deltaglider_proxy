@@ -582,6 +582,29 @@ fn resolve_legacy_shim(
     Ok((Some(parsed), Some(kid)))
 }
 
+/// Pure integrity check for a freshly-loaded reference baseline.
+///
+/// `expected_sha256` is the reference's own recorded checksum (from its
+/// stored `FileMetadata.file_sha256`). When it is empty we cannot verify
+/// — references uploaded out-of-band (e.g. the Python CLI, or fallback
+/// metadata with no DG xattrs) carry no checksum — so we treat that as a
+/// pass and let the downstream per-object checksum be the safety net.
+///
+/// When the checksum IS present and disagrees with the actual data, the
+/// reference on disk is corrupt; returning the `(expected, actual)` pair
+/// lets the caller fail fast WITHOUT caching the bad bytes. Without this,
+/// a corrupted reference would be cached on the first miss and poison
+/// every subsequent delta GET in the deltaspace until natural eviction
+/// (the downstream checksum-mismatch path in `retrieve.rs` only evicts
+/// after a reconstruction has already failed).
+fn reference_integrity_ok(actual_sha256: &str, expected_sha256: &str) -> Result<(), String> {
+    if expected_sha256.is_empty() || actual_sha256 == expected_sha256 {
+        Ok(())
+    } else {
+        Err(expected_sha256.to_string())
+    }
+}
+
 /// Derive the per-object `key_id` from the backend name + the 32 key
 /// bytes. Name is hashed in first, followed by a 0x00 separator, then
 /// the key bytes. Truncated to 16 hex chars of SHA-256.
@@ -1331,17 +1354,46 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         self.with_metrics(|m| m.cache_misses_total.inc());
 
-        // Load from storage
-        let data = self
-            .storage
-            .get_reference(bucket, deltaspace_id)
-            .await
-            .map_err(|e| match e {
-                StorageError::NotFound(_) => {
-                    EngineError::MissingReference(deltaspace_id.to_string())
+        // Load the reference data and its recorded metadata together. The
+        // metadata read is cheap (xattr / S3 HEAD) and runs in parallel so it
+        // doesn't add a serial round-trip to the miss path. We use the
+        // recorded checksum to verify the bytes BEFORE caching — a reference
+        // that's corrupt on disk would otherwise be cached on the first miss
+        // and poison every subsequent delta GET in the deltaspace.
+        let (data_result, meta_result) = tokio::join!(
+            self.storage.get_reference(bucket, deltaspace_id),
+            self.storage.get_reference_metadata(bucket, deltaspace_id),
+        );
+        let data = data_result.map_err(|e| match e {
+            StorageError::NotFound(_) => EngineError::MissingReference(deltaspace_id.to_string()),
+            other => EngineError::Storage(other),
+        })?;
+
+        // Validate against the reference's own recorded checksum when present.
+        // A missing metadata read or empty checksum (out-of-band / CLI-uploaded
+        // references) is treated as "cannot verify" — we proceed and let the
+        // downstream per-object checksum in retrieve.rs catch any corruption.
+        if let Ok(expected) = meta_result {
+            if !expected.file_sha256.is_empty() {
+                let actual = hex::encode(Sha256::digest(&data));
+                if let Err(expected_sha256) =
+                    reference_integrity_ok(&actual, &expected.file_sha256)
+                {
+                    // Do NOT cache corrupt bytes — fail fast so a single bad
+                    // reference doesn't fan out into repeated reconstruction
+                    // failures across the deltaspace.
+                    warn!(
+                        "Reference integrity check failed for {}/{}: expected {}, got {} — not caching",
+                        bucket, deltaspace_id, expected_sha256, actual
+                    );
+                    return Err(EngineError::ChecksumMismatch {
+                        key: format!("{}/.dg/reference.bin", deltaspace_id),
+                        expected: expected_sha256,
+                        actual,
+                    });
                 }
-                other => EngineError::Storage(other),
-            })?;
+            }
+        }
 
         // PERF: Convert Vec→Bytes once (zero-copy ownership transfer), then
         // clone the Bytes for the cache (refcount increment, no memcpy).
@@ -1835,6 +1887,29 @@ mod tests {
             derive_key_id("a", &key2),
             "name/key separator missing — two different (name, key) pairs collided"
         );
+    }
+
+    #[test]
+    fn test_reference_integrity_empty_expected_is_pass() {
+        // Out-of-band / CLI-uploaded references carry no recorded checksum.
+        // We cannot verify, so this must pass (the downstream per-object
+        // checksum is the safety net) — NOT regress the passthrough case.
+        assert!(reference_integrity_ok("deadbeef", "").is_ok());
+        assert!(reference_integrity_ok("", "").is_ok());
+    }
+
+    #[test]
+    fn test_reference_integrity_match_is_pass() {
+        assert!(reference_integrity_ok("abc123", "abc123").is_ok());
+    }
+
+    #[test]
+    fn test_reference_integrity_mismatch_returns_expected() {
+        // A present-but-disagreeing checksum means the on-disk reference is
+        // corrupt; the caller must fail fast and skip caching.
+        let err = reference_integrity_ok("actual_hash", "expected_hash")
+            .expect_err("mismatch must be rejected");
+        assert_eq!(err, "expected_hash");
     }
 
     #[test]

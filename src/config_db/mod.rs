@@ -44,12 +44,33 @@ pub fn config_db_path() -> PathBuf {
     db_dir.join("deltaglider_config.db")
 }
 
+/// True if `ident` is a safe bare SQL identifier (`[A-Za-z_][A-Za-z0-9_]*`).
+///
+/// SQLite identifiers (table/column names) cannot be bound as `?` parameters,
+/// so migration DDL has to interpolate them into the statement string. All
+/// current call sites pass hardcoded literals, but this gate is the
+/// defense-in-depth contract: identifiers MUST match this pattern and are
+/// never sourced from external input. Refactors that would feed a non-literal
+/// here will fail loudly via `ConfigDbError::Other` rather than risk injection.
+fn is_safe_sql_ident(ident: &str) -> bool {
+    let mut chars = ident.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 fn rename_column_if_exists(
     conn: &Connection,
     table: &str,
     old_column: &str,
     new_column: &str,
 ) -> Result<(), ConfigDbError> {
+    for ident in [table, old_column, new_column] {
+        if !is_safe_sql_ident(ident) {
+            return Err(ConfigDbError::Other(format!(
+                "refusing to interpolate unsafe SQL identifier: {ident:?}"
+            )));
+        }
+    }
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let columns = stmt
         .query_map([], |row| row.get::<_, String>(1))?
@@ -742,6 +763,35 @@ mod tests {
     fn classify_sqlite_error_not_found() {
         let e = rusqlite::Error::QueryReturnedNoRows;
         assert_eq!(classify_sqlite_error(&e), SqliteErrorClass::NotFound);
+    }
+
+    #[test]
+    fn is_safe_sql_ident_accepts_bare_identifiers() {
+        for ok in [
+            "lifecycle_state",
+            "objects_affected_lifetime",
+            "_leading_underscore",
+            "Mixed_Case123",
+            "a",
+        ] {
+            assert!(is_safe_sql_ident(ok), "{ok:?} should be accepted");
+        }
+    }
+
+    #[test]
+    fn is_safe_sql_ident_rejects_unsafe_input() {
+        for bad in [
+            "",                        // empty
+            "1leading_digit",          // can't start with a digit
+            "has space",               // whitespace
+            "drop;table",              // statement separator
+            "col\"quoted",             // quote
+            "name--comment",           // SQL comment dashes
+            "tbl(arg)",                // parens
+            "naïve",                   // non-ascii
+        ] {
+            assert!(!is_safe_sql_ident(bad), "{bad:?} should be rejected");
+        }
     }
 
     #[test]

@@ -188,6 +188,15 @@ impl Serialize for SourceIpEntry {
 impl<'de> Deserialize<'de> for SourceIpEntry {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let raw = String::deserialize(d)?;
+        // Defense-in-depth: reject embedded NULs before parsing. serde's
+        // contract gives us valid UTF-8, but a `203.0.113.5\0evil` payload
+        // could in principle be accepted by a lenient parser and then
+        // diverge from what the operator sees in diagnostics.
+        if raw.contains('\0') {
+            return Err(serde::de::Error::custom(
+                "invalid IP or CIDR: contains an embedded NUL byte",
+            ));
+        }
         // Try CIDR first; fall back to bare IP (promoted to /32 or /128).
         if let Ok(net) = raw.parse::<IpNet>() {
             return Ok(SourceIpEntry { net, raw });

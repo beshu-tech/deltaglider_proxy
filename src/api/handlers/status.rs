@@ -95,6 +95,18 @@ async fn compute_stats(
     let mut totals = crate::deltaglider::SavingsTotals::default();
     let mut truncated = false;
 
+    // SCAN_LIMIT is a *cumulative* cap across all buckets, not per-bucket:
+    // `totals` accumulates over the whole loop, so the scan stops as soon as
+    // the running user-visible count reaches the limit — even if that happens
+    // mid-way through the first bucket. Buckets later in `buckets_to_scan`
+    // (and the trailing reference.bin fold for the bucket that tripped the
+    // cap) are therefore NOT counted when `truncated` is true. This is the
+    // intended best-effort contract for a dashboard stats endpoint: bounded
+    // latency over exhaustive accuracy. Callers that need a complete tally
+    // must scope the query to a single bucket (`?bucket=NAME`), which scans
+    // that bucket up to the same cap. Do not relax the cap into "scan every
+    // bucket" — that reintroduces the unbounded-latency problem the cache and
+    // this limit exist to prevent.
     'outer: for bucket in &buckets_to_scan {
         let engine = state.engine.load();
         let page = engine

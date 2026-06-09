@@ -604,6 +604,13 @@ fn partition_deltaspace_scan(
 
 // ─── Admin API handlers ─────────────────────────────────────────────
 
+/// Clamp a caller-supplied `min_deltas` into a sane range. Defaults to 3,
+/// floors at 1 (0 would be meaningless) and caps at 1000 so a huge value
+/// can't blow up cache keys / scan work.
+fn clamp_min_deltas(min_deltas: Option<usize>) -> usize {
+    min_deltas.unwrap_or(3).clamp(1, 1000)
+}
+
 #[derive(Deserialize)]
 pub struct EfficiencyQuery {
     /// Bucket to scan. Required to bound work per request.
@@ -625,7 +632,7 @@ pub async fn get_delta_efficiency(
     State(state): State<Arc<AdminState>>,
     axum::extract::Query(q): axum::extract::Query<EfficiencyQuery>,
 ) -> impl IntoResponse {
-    let min_deltas = q.min_deltas.unwrap_or(3).max(1);
+    let min_deltas = clamp_min_deltas(q.min_deltas);
 
     // Cache hit → return immediately.
     if let Some(cached) = state.delta_efficiency_scanner.get(&q.bucket, min_deltas) {
@@ -674,7 +681,7 @@ pub async fn post_delta_efficiency_scan(
     State(state): State<Arc<AdminState>>,
     Json(req): Json<EfficiencyScanRequest>,
 ) -> impl IntoResponse {
-    let min_deltas = req.min_deltas.unwrap_or(3).max(1);
+    let min_deltas = clamp_min_deltas(req.min_deltas);
     let started = state.delta_efficiency_scanner.enqueue_scan(
         req.bucket.clone(),
         min_deltas,

@@ -76,17 +76,48 @@ pub enum KeyAction {
     Noop,
 }
 
+/// The source-side liveness a known event kind produces. `Copy` ⇒ object ends
+/// up PRESENT, `Delete` ⇒ ABSENT. `None` ⇒ the kind carries no liveness signal
+/// (not an object-state transition).
+///
+/// This is the single exhaustive `match` over [`EventKind`]: the `#[deny]`-free
+/// non-wildcard arm set means adding a variant to `EventKind` fails to compile
+/// here until it is explicitly classified, so a new event kind can never
+/// silently fall through to `Noop` (Finding 1). The two string predicates below
+/// derive from this so the DB-string path and the enum stay in lockstep.
+fn liveness_of_kind(kind: EventKind) -> Option<KeyAction> {
+    match kind {
+        EventKind::ObjectCreated
+        | EventKind::ObjectCopied
+        | EventKind::ReplicationObjectCopied
+        | EventKind::LifecycleTransitioned => Some(KeyAction::Copy),
+        EventKind::ObjectDeleted | EventKind::LifecycleExpired => Some(KeyAction::Delete),
+    }
+}
+
+/// Parse a raw outbox `kind` string back to the typed [`EventKind`], or `None`
+/// for an unrecognized string (an old/foreign event kind that this build does
+/// not know about). Mirrors [`EventKind::as_str`].
+fn parse_event_kind(kind: &str) -> Option<EventKind> {
+    match kind {
+        "ObjectCreated" => Some(EventKind::ObjectCreated),
+        "ObjectDeleted" => Some(EventKind::ObjectDeleted),
+        "ObjectCopied" => Some(EventKind::ObjectCopied),
+        "ReplicationObjectCopied" => Some(EventKind::ReplicationObjectCopied),
+        "LifecycleExpired" => Some(EventKind::LifecycleExpired),
+        "LifecycleTransitioned" => Some(EventKind::LifecycleTransitioned),
+        _ => None,
+    }
+}
+
 /// Event kinds whose effect leaves the object PRESENT at the source.
 fn is_present_producing(kind: &str) -> bool {
-    matches!(
-        kind,
-        "ObjectCreated" | "ObjectCopied" | "ReplicationObjectCopied" | "LifecycleTransitioned"
-    )
+    parse_event_kind(kind).and_then(liveness_of_kind) == Some(KeyAction::Copy)
 }
 
 /// Event kinds whose effect leaves the object ABSENT at the source.
 fn is_absent_producing(kind: &str) -> bool {
-    matches!(kind, "ObjectDeleted" | "LifecycleExpired")
+    parse_event_kind(kind).and_then(liveness_of_kind) == Some(KeyAction::Delete)
 }
 
 /// Collapse a key's events (in ascending `id`/arrival order) to one liveness
@@ -106,8 +137,20 @@ pub fn compact_key_events(kinds: &[&str]) -> KeyAction {
         None => KeyAction::Noop,
         Some(k) if is_absent_producing(k) => KeyAction::Delete,
         Some(k) if is_present_producing(k) => KeyAction::Copy,
-        // Unknown terminal kind (shouldn't happen for object events): do nothing.
-        Some(_) => KeyAction::Noop,
+        // Unknown terminal kind. The compile-time `liveness_of_kind` match means
+        // a NEW `EventKind` variant can't reach here un-classified — so this is
+        // only an event-kind string this build genuinely doesn't recognize
+        // (e.g. written by a newer/foreign instance). We still treat it as Noop
+        // and let the cursor advance, but warn loudly: a silent replication drop
+        // here would otherwise be invisible (Finding 1).
+        Some(k) => {
+            warn!(
+                "event consumer: unrecognized terminal event kind {k:?}; treating as Noop \
+                 (no replication action). If this is a new DeltaGlider event kind, update \
+                 liveness_of_kind/parse_event_kind."
+            );
+            KeyAction::Noop
+        }
     }
 }
 
@@ -358,17 +401,34 @@ async fn drain_once(
         for rule in matched {
             // Respect the SAME per-rule lease the scheduler/reconcile uses, so
             // fast-path + reconcile + multi-instance are mutually exclusive.
+            //
+            // Three outcomes, NOT two (Finding 2): `Ok(true)` = we hold the
+            // lease, proceed; `Ok(false)` = another worker holds it, stall this
+            // key for next tick; `Err(_)` = the DB itself failed. A DB error is
+            // NOT "lease busy" — collapsing it into a stall would silently pin
+            // the cursor on a transient fault. Abort the whole drain (advance
+            // nothing) and let the next tick retry the same window.
             let got = {
                 let dbg = db.lock().await;
                 let _ = dbg.replication_ensure_state(&rule.name, now);
                 dbg.replication_try_acquire_lease(&rule.name, instance_id, now, lease_ttl)
-                    .unwrap_or(false)
             };
-            if !got {
-                // Busy on another worker — leave for next tick (don't advance
-                // past this key's events).
-                failed_ids.insert(max_id_for_key);
-                continue;
+            match got {
+                Ok(true) => {}
+                Ok(false) => {
+                    // Busy on another worker — leave for next tick (don't advance
+                    // past this key's events).
+                    failed_ids.insert(max_id_for_key);
+                    continue;
+                }
+                Err(e) => {
+                    warn!(
+                        "event consumer: lease acquisition for rule '{}' failed (DB error): {e}; \
+                         aborting drain, cursor held at {cursor}",
+                        rule.name
+                    );
+                    return;
+                }
             }
 
             let outcome = apply_action(&engine, db, rule, bucket, key, action).await;
@@ -727,11 +787,35 @@ mod tests {
     }
 
     // ── EventKind ↔ liveness coupling ───────────────────────────────────────
-    // GUARD: compaction matches raw `EventKind::as_str` strings. If a variant's
-    // string drifts and is no longer classified as present/absent producing,
-    // compaction silently treats it as Noop and the cursor advances PAST the
-    // event — a silent replication drop. This test pins every variant to its
-    // expected liveness so a rename has to update both sides.
+    // GUARD: compaction matches raw `EventKind::as_str` strings, but the
+    // classification flows through the EXHAUSTIVE `liveness_of_kind` match over
+    // `EventKind` — so adding a variant fails to compile there until classified
+    // (no silent Noop drop). This test additionally pins every variant to its
+    // expected liveness so a string rename has to update both sides.
+    #[test]
+    fn liveness_of_kind_is_total_and_classifies_every_variant() {
+        use EventKind::*;
+        // Every known kind must produce a liveness verdict (never `None`); a new
+        // variant without an arm here won't compile.
+        for kind in [
+            ObjectCreated,
+            ObjectDeleted,
+            ObjectCopied,
+            ReplicationObjectCopied,
+            LifecycleExpired,
+            LifecycleTransitioned,
+        ] {
+            assert!(
+                liveness_of_kind(kind).is_some(),
+                "EventKind::{kind:?} has no liveness classification"
+            );
+            // The string round-trips through parse_event_kind too.
+            assert_eq!(parse_event_kind(kind.as_str()), Some(kind));
+        }
+        // An unrecognized string is None (treated as Noop downstream).
+        assert_eq!(parse_event_kind("TotallyMadeUp"), None);
+    }
+
     #[test]
     fn every_event_kind_has_a_liveness_classification() {
         use EventKind::*;

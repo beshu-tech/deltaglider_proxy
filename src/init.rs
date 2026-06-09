@@ -257,8 +257,20 @@ pub fn run_init_inner(
     let tls = if tls_enabled {
         let own_cert = prompt_yes_no(reader, writer, "Provide your own certificate?", false)?;
         if own_cert {
-            let cert_path = prompt(reader, writer, "Certificate PEM path", "")?;
-            let key_path = prompt(reader, writer, "Private key PEM path", "")?;
+            // Both paths must be set together or both omitted (tls.rs requires
+            // Some+Some or None+None — a partial pair is rejected). Retry until
+            // the user gives a valid pair.
+            let (cert_path, key_path) = loop {
+                let cert_path = prompt(reader, writer, "Certificate PEM path", "")?;
+                let key_path = prompt(reader, writer, "Private key PEM path", "")?;
+                if cert_path.is_empty() == key_path.is_empty() {
+                    break (cert_path, key_path);
+                }
+                writeln!(
+                    writer,
+                    "  Provide both certificate and key paths, or leave both empty."
+                )?;
+            };
             Some(TlsConfig {
                 enabled: true,
                 cert_path: if cert_path.is_empty() {

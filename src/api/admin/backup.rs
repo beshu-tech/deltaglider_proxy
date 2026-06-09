@@ -1863,8 +1863,19 @@ fn resolve_backup_user_id(bu: &BackupUser, idx: usize, backup: &IamBackup) -> i6
     if let Some(&cand) = member_ids.get(idx) {
         return cand;
     }
-    // Fallback (3): SQLite autoincrement assumption.
-    (idx as i64) + 1
+    // Fallback (3): SQLite autoincrement assumption. This is a pure guess
+    // and collides silently if the original DB had id gaps (deleted users),
+    // which would drop or misattach an external_identity. Surface it.
+    let guessed = (idx as i64) + 1;
+    tracing::warn!(
+        "Backup user '{}' (access_key_id {}) has no explicit id and no group-membership hint; \
+         falling back to autoincrement heuristic id {}. external_identities for this user may be \
+         dropped or misattached if the original DB had id gaps.",
+        bu.name,
+        bu.access_key_id,
+        guessed
+    );
+    guessed
 }
 
 #[derive(Serialize)]

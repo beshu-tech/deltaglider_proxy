@@ -185,14 +185,12 @@ pub async fn run_now(
         let db = db_arc.lock().await;
         let now = replication::current_unix_seconds();
         let _ = db.replication_ensure_state(&rule.name, now);
-        if let Ok(Some(st)) = db.replication_load_state(&rule.name) {
-            if st.paused {
-                return Err((
-                    StatusCode::CONFLICT,
-                    "rule is paused; resume it before running".to_string(),
-                ));
-            }
-        }
+        // Acquire the lease FIRST, then re-check `paused` while still holding
+        // the same DB lock. The lease is the true serialization anchor: making
+        // it the first mutation closes the check-then-act window where a
+        // concurrent pause/resume could toggle the flag between a standalone
+        // paused check and lease acquisition. Both the read and the lease grant
+        // happen under one uninterrupted lock hold, so the decision is atomic.
         let acquired = db
             .replication_try_acquire_lease(
                 &rule.name,
@@ -206,6 +204,18 @@ pub async fn run_now(
                 StatusCode::CONFLICT,
                 "rule is already running; wait for the current run to finish".to_string(),
             ));
+        }
+        // Paused check after we own the lease — if the rule is paused, release
+        // the lease we just took so a later resume+run isn't blocked by a
+        // dangling lease, and return 409.
+        if let Ok(Some(st)) = db.replication_load_state(&rule.name) {
+            if st.paused {
+                let _ = db.replication_release_lease(&rule.name, &lease_owner);
+                return Err((
+                    StatusCode::CONFLICT,
+                    "rule is paused; resume it before running".to_string(),
+                ));
+            }
         }
     }
 

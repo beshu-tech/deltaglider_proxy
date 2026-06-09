@@ -231,6 +231,19 @@ impl ConfigDbSync {
     }
 
     /// Upload the local config DB file to S3.
+    ///
+    /// Uses a conditional (compare-and-swap) PUT so two instances mutating
+    /// IAM concurrently can't silently clobber each other's writes:
+    ///   - if we've previously synced this object (`last_etag` is `Some`),
+    ///     send `If-Match: <etag>` so the PUT fails with 412 when a peer
+    ///     changed the remote copy since we last saw it;
+    ///   - if we've never seen the remote object (`last_etag` is `None`),
+    ///     send `If-None-Match: *` so the PUT fails with 412 if a peer
+    ///     created it concurrently (instead of overwriting their copy).
+    ///
+    /// On a precondition failure the upload is reported as a conflict; the
+    /// next poll cycle (`download_if_newer`) pulls the peer's version and the
+    /// caller can re-apply on top of the reconciled DB.
     pub async fn upload(&self) -> Result<(), String> {
         let data = tokio::fs::read(&self.local_path)
             .await
@@ -240,16 +253,45 @@ impl ConfigDbSync {
             return Err("Local config DB is empty — refusing to upload".to_string());
         }
 
-        let put_result = self
+        // Snapshot the ETag we expect the remote object to still carry. This is
+        // the compare half of the compare-and-swap.
+        let expected_etag = self.last_etag.read().await.clone();
+
+        let mut put = self
             .s3_client
             .put_object()
             .bucket(&self.bucket)
             .key(&self.object_key)
             .body(ByteStream::from(data.clone()))
-            .content_type("application/octet-stream")
-            .send()
-            .await
-            .map_err(|e| format!("Failed to upload config DB to S3: {}", e))?;
+            .content_type("application/octet-stream");
+        put = match &expected_etag {
+            Some(etag) => put.if_match(etag),
+            None => put.if_none_match("*"),
+        };
+
+        let put_result = match put.send().await {
+            Ok(result) => result,
+            Err(e) => {
+                let err_str = format!("{}", e);
+                if is_precondition_failed(&err_str) {
+                    // A peer instance updated the remote config DB since we last
+                    // synced. Forget our stale ETag so the next poll forces a
+                    // fresh HEAD+GET, then surface the conflict to the caller.
+                    *self.last_etag.write().await = None;
+                    warn!(
+                        "Config DB S3 upload conflict (bucket={}): remote copy changed since last sync \
+                         (expected etag={:?}) — a peer instance wrote concurrently; will re-sync on next poll",
+                        self.bucket, expected_etag
+                    );
+                    return Err(format!(
+                        "Config DB upload conflict: remote copy changed since last sync \
+                         (expected etag={:?}); re-sync and retry",
+                        expected_etag
+                    ));
+                }
+                return Err(format!("Failed to upload config DB to S3: {}", e));
+            }
+        };
 
         // Store the ETag from the PUT response
         if let Some(etag) = put_result.e_tag() {
@@ -295,6 +337,21 @@ impl ConfigDbSync {
 
         Ok(data)
     }
+}
+
+/// Pure classifier: does this stringified S3 SDK error represent a failed
+/// conditional-write precondition (HTTP 412)?
+///
+/// The conditional PUT in [`ConfigDbSync::upload`] relies on the backend
+/// rejecting the request with `412 Precondition Failed` when the `If-Match`
+/// / `If-None-Match` guard doesn't hold. AWS S3 and MinIO both surface this
+/// as `PreconditionFailed` / a 412 status in the error display string.
+/// Extracted as a pure fn so the decision is unit-testable without a live
+/// S3 backend (per the project's "pure functions at decision points" rule).
+fn is_precondition_failed(err_str: &str) -> bool {
+    err_str.contains("PreconditionFailed")
+        || err_str.contains("Precondition Failed")
+        || err_str.contains("412")
 }
 
 /// Reopen the config DB file after an S3-sync download has replaced it
@@ -362,5 +419,36 @@ pub async fn reopen_and_rebuild_iam(
                 context
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn precondition_failed_detected_from_common_shapes() {
+        // S3-style service error display.
+        assert!(is_precondition_failed(
+            "service error: PreconditionFailed: At least one of the pre-conditions you specified did not hold"
+        ));
+        // MinIO / human-readable status text.
+        assert!(is_precondition_failed("unhandled error (Precondition Failed)"));
+        // Raw HTTP status code.
+        assert!(is_precondition_failed(
+            "dispatch failure: response status: 412"
+        ));
+    }
+
+    #[test]
+    fn non_precondition_errors_are_not_misclassified() {
+        assert!(!is_precondition_failed(
+            "dispatch failure: connection refused"
+        ));
+        assert!(!is_precondition_failed("NoSuchBucket: bucket does not exist"));
+        assert!(!is_precondition_failed(
+            "service error: AccessDenied (status 403)"
+        ));
+        assert!(!is_precondition_failed(""));
     }
 }
