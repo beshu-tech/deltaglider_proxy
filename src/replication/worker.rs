@@ -201,6 +201,14 @@ pub async fn run_rule(
 
         totals.objects_skipped += plan.skipped.len() as i64;
 
+        // Events for this page are buffered and flushed in a single
+        // locked `event_outbox_insert_many` at page completion, rather
+        // than locking the DB per object. The outbox is asynchronous and
+        // replication doesn't need real-time delivery, so trading
+        // per-object immediacy for one lock acquisition per page is a
+        // pure throughput win on large runs.
+        let mut page_events: Vec<NewEvent> = Vec::with_capacity(plan.to_copy.len());
+
         // Execute the copies for this page.
         for (src_key, dest_key) in &plan.to_copy {
             if !renew_run_lease(
@@ -213,6 +221,11 @@ pub async fn run_rule(
             )
             .await?
             {
+                // Lost the lease mid-page. Flush whatever copy events we
+                // already buffered (the copies are durable) before
+                // abandoning the run, so the page-completion flush below
+                // — which we're about to skip — doesn't drop them.
+                flush_page_events(&db, &rule.name, &mut page_events).await;
                 totals.errors += 1;
                 hit_fatal_error = true;
                 break 'pages;
@@ -233,29 +246,21 @@ pub async fn run_rule(
                     let bytes_copied = outcome.bytes_copied;
                     totals.objects_copied += 1;
                     totals.bytes_copied += bytes_copied as i64;
-                    {
-                        let db = db.lock().await;
-                        if let Err(err) = db.event_outbox_insert(&NewEvent::new(
-                            EventKind::ReplicationObjectCopied,
-                            rule.destination.bucket.as_str(),
-                            dest_key.as_str(),
-                            EventSource::Replication,
-                            current_unix_seconds(),
-                            serde_json::json!({
-                                "rule_name": &rule.name,
-                                "source_bucket": &rule.source.bucket,
-                                "source_key": src_key.as_str(),
-                                "destination_bucket": &rule.destination.bucket,
-                                "destination_key": dest_key.as_str(),
-                                "content_length": bytes_copied,
-                            }),
-                        )) {
-                            warn!(
-                                "replication rule '{}' could not append event for {:?} -> {:?}: {}",
-                                rule.name, src_key, dest_key, err
-                            );
-                        }
-                    }
+                    page_events.push(NewEvent::new(
+                        EventKind::ReplicationObjectCopied,
+                        rule.destination.bucket.as_str(),
+                        dest_key.as_str(),
+                        EventSource::Replication,
+                        current_unix_seconds(),
+                        serde_json::json!({
+                            "rule_name": &rule.name,
+                            "source_bucket": &rule.source.bucket,
+                            "source_key": src_key.as_str(),
+                            "destination_bucket": &rule.destination.bucket,
+                            "destination_key": dest_key.as_str(),
+                            "content_length": bytes_copied,
+                        }),
+                    ));
                 }
                 Err(e) => {
                     totals.errors += 1;
@@ -283,12 +288,17 @@ pub async fn run_rule(
         }
 
         // Persist the cursor so the next tick can resume here if we
-        // crash before the run finishes naturally.
+        // crash before the run finishes naturally, and flush this page's
+        // buffered copy events in a single batched insert under the same
+        // lock acquisition. Event-append is non-critical: a failure is
+        // logged and the run continues (the copies themselves are
+        // durable).
         continuation = page.next_continuation_token.clone();
         {
             let db = db.lock().await;
             db.replication_set_continuation_token(&rule.name, continuation.as_deref())?;
             db.replication_update_run_progress(run_id, totals)?;
+            flush_page_events_locked(&db, &rule.name, &mut page_events);
         }
 
         if !page.is_truncated || continuation.is_none() {
@@ -443,6 +453,35 @@ async fn record_lost_lease(
     )
     .await?;
     Ok(false)
+}
+
+/// Flush buffered copy events under a freshly-acquired DB lock, draining
+/// `events`. Used on the lease-loss break path where there's no
+/// already-held guard. A failure is logged, not propagated — event
+/// append is non-critical (the copies themselves are durable).
+async fn flush_page_events(db: &Arc<Mutex<ConfigDb>>, rule_name: &str, events: &mut Vec<NewEvent>) {
+    if events.is_empty() {
+        return;
+    }
+    let guard = db.lock().await;
+    flush_page_events_locked(&guard, rule_name, events);
+}
+
+/// Flush buffered copy events through an already-held DB guard, draining
+/// `events`. Batches the whole page into one `event_outbox_insert_many`
+/// so a 10k-object run costs one insert per page instead of per object.
+fn flush_page_events_locked(db: &ConfigDb, rule_name: &str, events: &mut Vec<NewEvent>) {
+    if events.is_empty() {
+        return;
+    }
+    let count = events.len();
+    if let Err(err) = db.event_outbox_insert_many(events) {
+        warn!(
+            "replication rule '{}' could not append {} copy event(s): {}",
+            rule_name, count, err
+        );
+    }
+    events.clear();
 }
 
 async fn log_failure(

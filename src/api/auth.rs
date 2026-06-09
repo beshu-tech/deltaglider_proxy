@@ -47,14 +47,22 @@ fn prune_replay_cache(cache: &ReplayCache, replay_window: Duration, max_entries:
         return;
     }
 
-    // Pass 2: hard-cap oldest signatures first.
-    let mut by_oldest: Vec<(String, Instant)> = cache
+    // Pass 2: hard-cap oldest signatures first. We only need to identify the
+    // `to_remove` oldest entries, not fully order the cache — quickselect
+    // (`select_nth_unstable_by_key`) partitions the oldest prefix in O(n)
+    // average time instead of the O(n log n) full sort. The eviction set is
+    // identical (the genuinely-oldest signatures); only the partial ordering
+    // within that prefix is unspecified, which doesn't matter since they're
+    // all removed.
+    let to_remove = len_after_ttl - max_entries;
+    let mut entries: Vec<(String, Instant)> = cache
         .iter()
         .map(|entry| (entry.key().clone(), *entry.value()))
         .collect();
-    by_oldest.sort_by_key(|(_, seen_at)| *seen_at);
-    let to_remove = len_after_ttl - max_entries;
-    for (sig, _) in by_oldest.into_iter().take(to_remove) {
+    // `to_remove` is in `1..len_after_ttl` here (len_after_ttl > max_entries),
+    // so the pivot index is always valid.
+    entries.select_nth_unstable_by_key(to_remove - 1, |(_, seen_at)| *seen_at);
+    for (sig, _) in entries.into_iter().take(to_remove) {
         cache.remove(&sig);
     }
 }

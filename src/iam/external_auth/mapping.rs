@@ -130,33 +130,47 @@ fn matches_rule(rule: &GroupMappingRule, identity: &ExternalIdentityInfo) -> boo
 
 /// Simple glob matching: `*` matches any sequence of characters.
 /// Used for email patterns like `*@acme.com` or `*.eng@acme.com`.
+///
+/// Linear-time, allocation-free iterative matcher with a single backtrack
+/// pointer (the classic "remember the last star" algorithm). This runs in
+/// O(pattern.len() + text.len()) and avoids the exponential backtracking that
+/// a naive recursive matcher exhibits on patterns like `*a*b*c`. Operates on
+/// bytes since the glob path always passes ASCII-lowercased inputs.
 fn glob_match(pattern: &str, text: &str) -> bool {
-    glob_match_recursive(
-        &pattern.chars().collect::<Vec<_>>(),
-        &text.chars().collect::<Vec<_>>(),
-        0,
-        0,
-    )
-}
+    let pattern = pattern.as_bytes();
+    let text = text.as_bytes();
 
-fn glob_match_recursive(pattern: &[char], text: &[char], pi: usize, ti: usize) -> bool {
-    if pi == pattern.len() {
-        return ti == text.len();
-    }
-    if pattern[pi] == '*' {
-        // * matches zero or more characters
-        // Try matching rest of pattern at every position from ti to end
-        for i in ti..=text.len() {
-            if glob_match_recursive(pattern, text, pi + 1, i) {
-                return true;
-            }
+    let mut pi = 0; // index into pattern
+    let mut ti = 0; // index into text
+    // Backtrack anchors: position to resume matching after the most recent `*`.
+    let mut star_pi: Option<usize> = None;
+    let mut star_ti = 0;
+
+    while ti < text.len() {
+        if pi < pattern.len() && pattern[pi] == b'*' {
+            // Record the star and tentatively consume zero characters.
+            star_pi = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if pi < pattern.len() && pattern[pi] == text[ti] {
+            pi += 1;
+            ti += 1;
+        } else if let Some(sp) = star_pi {
+            // Mismatch: let the last `*` swallow one more character and retry.
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
         }
-        false
-    } else if ti < text.len() && pattern[pi] == text[ti] {
-        glob_match_recursive(pattern, text, pi + 1, ti + 1)
-    } else {
-        false
     }
+
+    // Consume any trailing `*`s in the pattern (they match the empty string).
+    while pi < pattern.len() && pattern[pi] == b'*' {
+        pi += 1;
+    }
+
+    pi == pattern.len()
 }
 
 #[cfg(test)]

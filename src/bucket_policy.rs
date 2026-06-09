@@ -65,6 +65,57 @@ pub struct BucketPolicyConfig {
     pub quota_bytes: Option<u64>,
 }
 
+/// Why a `public_prefix` was rejected during validation. Carries enough
+/// context for the caller to emit a precise operator-facing log line.
+/// The `BucketPolicyRegistry::new` path logs each variant; the snapshot
+/// path discards silently — but both share the SAME decision so the two
+/// surfaces (IAM authz vs anonymous admission) can never drift.
+enum PrefixOutcome {
+    /// Accepted; carries the normalized (leading-`/`-stripped) prefix.
+    /// `is_empty()` on the inner string means whole-bucket-public.
+    Accept(String),
+    /// `"/"`, `"//"`, … — strips to empty and would silently become
+    /// "entire bucket public". Almost certainly a typo.
+    BareSlash,
+    /// Contains `..`, NUL, or `//` after stripping the leading slash.
+    Dangerous,
+    /// Non-empty prefix without a trailing `/` — would match siblings
+    /// like `builds-internal/`. Carries the stripped prefix for the
+    /// error message.
+    MissingTrailingSlash(String),
+}
+
+/// Single source of truth for public-prefix validation + normalization.
+///
+/// Both [`BucketPolicyRegistry::new`] (IAM authz surface) and
+/// [`PublicPrefixSnapshot::from_config`] (anonymous-admission surface)
+/// route every prefix through here so the two can never drift on what
+/// counts as a valid, directory-shaped public prefix. The directory-shape
+/// rule itself is delegated to [`crate::security::validate_public_prefix`].
+///
+/// Pure: no logging, no I/O. Callers map the [`PrefixOutcome`] to their
+/// own logging / accept-or-discard policy.
+fn validate_and_normalize_prefix(prefix: &str) -> PrefixOutcome {
+    // Reject bare-slash variants explicitly. `"/"`, `"//"`, `"///"` etc.
+    // would strip to empty string and silently become "entire bucket
+    // public" — almost certainly a typo rather than intent.
+    if !prefix.is_empty() && prefix.chars().all(|c| c == '/') {
+        return PrefixOutcome::BareSlash;
+    }
+    // Strip leading slash.
+    let p = prefix.strip_prefix('/').unwrap_or(prefix).to_string();
+    // Directory-shape + dangerous-pattern gate (shared validator). It
+    // accepts the empty string (whole-bucket-public), rejects `..`/NUL/`//`,
+    // and requires a trailing `/` on non-empty prefixes.
+    match crate::security::validate_public_prefix(&p) {
+        Ok(()) => PrefixOutcome::Accept(p),
+        Err(_) if p.contains("..") || p.contains('\0') || p.contains("//") => {
+            PrefixOutcome::Dangerous
+        }
+        Err(_) => PrefixOutcome::MissingTrailingSlash(p),
+    }
+}
+
 impl BucketPolicyConfig {
     /// Expand shorthand forms into their canonical representation. Call
     /// this exactly once, after deserialization and before the config is
@@ -182,71 +233,56 @@ impl BucketPolicyRegistry {
                     v.public_prefixes = v
                         .public_prefixes
                         .into_iter()
-                        .filter_map(|mut p| {
-                            // Capture the original (as-authored) form before
-                            // we mutate `p` so warnings point at what the
-                            // operator actually wrote, not the stripped form.
-                            let original = p.clone();
-
-                            // Reject bare-slash variants explicitly. `"/"`,
-                            // `"//"`, `"///"` etc. would strip to empty
-                            // string and silently become "entire bucket
-                            // public" — almost certainly a typo rather than
-                            // intent. Operators who want whole-bucket public
-                            // should use `public: true` or an explicit
-                            // empty string, both of which fire a clear
-                            // warning.
-                            if !p.is_empty() && p.chars().all(|c| c == '/') {
-                                tracing::warn!(
-                                    "Bucket '{}': rejecting public_prefix {:?} — bare slashes are ambiguous. \
-                                     Use `public: true` (or an explicit empty string) for whole-bucket exposure.",
-                                    k, original
-                                );
-                                return None;
+                        .filter_map(|p| {
+                            // `original` is the as-authored form so warnings
+                            // point at what the operator actually wrote, not
+                            // the stripped form. Validation + normalization
+                            // is delegated to the shared
+                            // `validate_and_normalize_prefix` so this path
+                            // can't drift from the snapshot builder.
+                            let original = &p;
+                            match validate_and_normalize_prefix(&p) {
+                                PrefixOutcome::BareSlash => {
+                                    tracing::warn!(
+                                        "Bucket '{}': rejecting public_prefix {:?} — bare slashes are ambiguous. \
+                                         Use `public: true` (or an explicit empty string) for whole-bucket exposure.",
+                                        k, original
+                                    );
+                                    None
+                                }
+                                PrefixOutcome::Dangerous => {
+                                    tracing::warn!(
+                                        "Bucket '{}': rejecting invalid public_prefix {:?} (contains .., null, or //)",
+                                        k, original
+                                    );
+                                    None
+                                }
+                                PrefixOutcome::MissingTrailingSlash(stripped) => {
+                                    tracing::error!(
+                                        "Bucket '{}': REJECTING public_prefix {:?} — missing trailing '/'. \
+                                         Without the slash this would match '{}anything'. \
+                                         Use {:?} if you meant a directory.",
+                                        k,
+                                        original,
+                                        stripped,
+                                        format!("{stripped}/")
+                                    );
+                                    None
+                                }
+                                PrefixOutcome::Accept(normalized) => {
+                                    // Warn about entire-bucket exposure (only
+                                    // hits when the operator literally wrote
+                                    // the empty string — bare-slash variants
+                                    // are rejected above).
+                                    if normalized.is_empty() {
+                                        tracing::warn!(
+                                            "Bucket '{}': public_prefix is empty string — the ENTIRE bucket is publicly readable!",
+                                            k
+                                        );
+                                    }
+                                    Some(normalized)
+                                }
                             }
-
-                            // Strip leading slash
-                            if p.starts_with('/') {
-                                p = p[1..].to_string();
-                            }
-                            // Reject dangerous patterns
-                            if p.contains("..") || p.contains('\0') || p.contains("//") {
-                                tracing::warn!(
-                                    "Bucket '{}': rejecting invalid public_prefix {:?} (contains .., null, or //)",
-                                    k, original
-                                );
-                                return None;
-                            }
-                            // Warn about entire-bucket exposure (only hits
-                            // when the operator literally wrote the empty
-                            // string — bare-slash variants are rejected
-                            // above).
-                            if p.is_empty() {
-                                tracing::warn!(
-                                    "Bucket '{}': public_prefix is empty string — the ENTIRE bucket is publicly readable!",
-                                    k
-                                );
-                            }
-                            // REJECT non-empty prefixes without a
-                            // trailing '/' — silently exposing
-                            // `builds-internal/` because the operator
-                            // wrote `builds` was a real attack path.
-                            // Empty string (whole-bucket-public) is
-                            // allowed; everything else must be
-                            // directory-shaped.
-                            if !p.is_empty() && !p.ends_with('/') {
-                                tracing::error!(
-                                    "Bucket '{}': REJECTING public_prefix {:?} — missing trailing '/'. \
-                                     Without the slash this would match '{}anything'. \
-                                     Use {:?} if you meant a directory.",
-                                    k,
-                                    original,
-                                    p,
-                                    format!("{p}/")
-                                );
-                                return None;
-                            }
-                            Some(p)
                         })
                         .collect();
                     v.public_prefixes.sort();
@@ -380,22 +416,17 @@ impl PublicPrefixSnapshot {
                     .public_prefixes
                     .iter()
                     .filter_map(|p| {
-                        // Reject bare-slash variants to match the
-                        // BucketPolicyRegistry::new path. Keeping these
-                        // two filters in sync matters: the registry
-                        // reaches IAM authz, the snapshot reaches the
-                        // anonymous-admission path; a drift would let
-                        // `"/"` be public in one surface but not the
-                        // other.
-                        if !p.is_empty() && p.chars().all(|c| c == '/') {
-                            return None;
+                        // Route through the single shared validator so the
+                        // snapshot can't drift from the registry. The
+                        // registry reaches IAM authz, the snapshot reaches
+                        // the anonymous-admission path; a drift would let
+                        // `"/"` be public in one surface but not the other.
+                        // This surface discards rejections silently (the
+                        // registry already logged them at config-load).
+                        match validate_and_normalize_prefix(p) {
+                            PrefixOutcome::Accept(normalized) => Some(normalized),
+                            _ => None,
                         }
-                        let p = p.strip_prefix('/').unwrap_or(p).to_string();
-                        // Use the single shared validator so the
-                        // snapshot can't drift from the registry on
-                        // what counts as "directory-shaped".
-                        crate::security::validate_public_prefix(&p).ok()?;
-                        Some(p)
                     })
                     .collect();
                 (k.to_ascii_lowercase(), validated)

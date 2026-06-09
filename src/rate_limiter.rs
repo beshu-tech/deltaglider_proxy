@@ -290,31 +290,35 @@ impl RateLimiter {
     /// Call this periodically (e.g., every 5 minutes).
     pub fn cleanup_expired(&self) {
         let now = Instant::now();
-        let window = self.window;
-        let lockout = self.lockout;
 
-        self.entries.retain(|_ip, entry| {
-            // Keep entries that are currently locked out and lockout hasn't expired
-            if let Some(lockout_start) = entry.lockout_start {
-                if now.duration_since(lockout_start) < lockout {
-                    return true; // Keep: still locked out
-                }
-            }
-            // Keep entries within the active window
-            now.duration_since(entry.window_start) < window
-        });
+        self.entries
+            .retain(|_ip, entry| should_keep_entry(entry, now, self.lockout, self.window));
 
-        let acct_window = self.account_window;
-        let acct_lockout = self.account_lockout;
         self.account_entries.retain(|_subj, entry| {
-            if let Some(lockout_start) = entry.lockout_start {
-                if now.duration_since(lockout_start) < acct_lockout {
-                    return true;
-                }
-            }
-            now.duration_since(entry.window_start) < acct_window
+            should_keep_entry(entry, now, self.account_lockout, self.account_window)
         });
     }
+}
+
+/// Whether a rate-limit entry should be retained during cleanup.
+///
+/// Keep it if it is currently locked out (and the lockout hasn't expired),
+/// or if it is still within the active counting window. Shared by the
+/// per-IP and per-account retention passes, which differ only in policy.
+fn should_keep_entry(
+    entry: &RateLimitEntry,
+    now: Instant,
+    lockout: Duration,
+    window: Duration,
+) -> bool {
+    // Keep entries that are currently locked out and lockout hasn't expired
+    if let Some(lockout_start) = entry.lockout_start {
+        if now.duration_since(lockout_start) < lockout {
+            return true; // Keep: still locked out
+        }
+    }
+    // Keep entries within the active window
+    now.duration_since(entry.window_start) < window
 }
 
 /// Whether proxy-set headers (X-Forwarded-For, X-Real-IP) should be trusted

@@ -86,6 +86,16 @@ impl MetadataCache {
     /// Used for folder/prefix deletes. Iterates all entries (moka has no
     /// native prefix query), but this is acceptable because prefix deletes
     /// are infrequent bulk operations.
+    ///
+    /// Concurrency note: iteration walks a point-in-time snapshot of the cache.
+    /// Entries inserted by other threads *after* this iterator starts will not
+    /// be seen and therefore not invalidated. This is acceptable for the only
+    /// caller (prefix delete): a concurrent insert under a prefix being deleted
+    /// is a race the S3 caller already owns, and the 10-minute TTL bounds any
+    /// resulting staleness to one extra HEAD. We deliberately avoid moka's
+    /// `support_invalidation_closures()` (which would make this atomic) because
+    /// it adds per-entry memory overhead to *every* entry, undermining the
+    /// 50 MB budget for a rare bulk operation.
     pub fn invalidate_prefix(&self, bucket: &str, prefix: &str) {
         let prefix_str = Self::cache_key(bucket, prefix);
         let mut count = 0u64;

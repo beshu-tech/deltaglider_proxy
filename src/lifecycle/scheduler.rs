@@ -14,6 +14,17 @@ use tracing::{debug, info, warn};
 
 const DEFAULT_TICK: Duration = Duration::from_secs(3600);
 const MIN_TICK: Duration = Duration::from_secs(60);
+// Lifecycle leases are deliberately 5x longer than replication's
+// (TTL 300s/heartbeat 60s here vs 60s/20s in `replication::scheduler`).
+// The tick cadence differs by the same order of magnitude: lifecycle wakes
+// at most once a minute (MIN_TICK) and typically hourly (DEFAULT_TICK),
+// whereas replication wakes every few seconds. A single lifecycle run also
+// does heavier, slower work (full prefix scans + deletes through the engine),
+// so a longer TTL keeps the lease alive across a slow run without a peer
+// stealing it mid-flight. The tradeoff: if the lease holder crashes, another
+// instance waits up to TTL seconds before taking over — acceptable given how
+// rarely lifecycle runs. Heartbeat stays well under TTL so a live-but-slow run
+// keeps refreshing the lease.
 const DEFAULT_LEASE_TTL_SECS: i64 = 300;
 const DEFAULT_HEARTBEAT_SECS: i64 = 60;
 

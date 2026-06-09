@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+use std::collections::HashMap;
+
 use rusqlite::params;
 use rusqlite::OptionalExtension;
 
@@ -8,24 +10,79 @@ use crate::iam::{IamUser, Permission};
 use super::{ConfigDb, ConfigDbError};
 
 impl ConfigDb {
-    /// Load all users with their permissions.
+    /// Load all users with their permissions and group memberships.
+    ///
+    /// Hydrates with three queries total (users + all permissions + all
+    /// memberships) and joins by `user_id` in memory, rather than running
+    /// 1 + 2N queries (the per-user `load_permissions` / `get_user_group_ids`
+    /// follow-ups). Keeps load cost flat as the user count grows.
     pub fn load_users(&self) -> Result<Vec<IamUser>, ConfigDbError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, access_key_id, secret_access_key, enabled, created_at, auth_source FROM users",
         )?;
 
-        let users: Vec<IamUser> = stmt
+        let mut users: Vec<IamUser> = stmt
             .query_map([], Self::user_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
 
-        let mut result = Vec::with_capacity(users.len());
-        for mut user in users {
-            user.permissions = self.load_permissions(user.id)?;
-            user.group_ids = self.get_user_group_ids(user.id)?;
-            result.push(user);
+        let mut perms_by_user = self.load_all_permissions()?;
+        let mut groups_by_user = self.load_all_user_group_ids()?;
+
+        for user in &mut users {
+            user.permissions = perms_by_user.remove(&user.id).unwrap_or_default();
+            user.group_ids = groups_by_user.remove(&user.id).unwrap_or_default();
         }
 
-        Ok(result)
+        Ok(users)
+    }
+
+    /// Load every permission row keyed by `user_id` for batch hydration.
+    fn load_all_permissions(&self) -> Result<HashMap<i64, Vec<Permission>>, ConfigDbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT user_id, id, actions, resources, effect, conditions_json FROM permissions",
+        )?;
+        // `permission_from_row` reads columns 0..=4; here user_id is column 0
+        // and the permission fields are shifted one to the right.
+        let rows = stmt
+            .query_map([], |row| {
+                let user_id: i64 = row.get(0)?;
+                let perm = Permission {
+                    id: row.get(1)?,
+                    actions: serde_json::from_str(&row.get::<_, String>(2)?).unwrap_or_default(),
+                    resources: serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or_default(),
+                    effect: row
+                        .get::<_, String>(4)
+                        .unwrap_or_else(|_| "Allow".to_string()),
+                    conditions: row
+                        .get::<_, Option<String>>(5)
+                        .unwrap_or(None)
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                };
+                Ok((user_id, perm))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut map: HashMap<i64, Vec<Permission>> = HashMap::new();
+        for (user_id, perm) in rows {
+            map.entry(user_id).or_default().push(perm);
+        }
+        Ok(map)
+    }
+
+    /// Load every group membership keyed by `user_id` for batch hydration.
+    fn load_all_user_group_ids(&self) -> Result<HashMap<i64, Vec<i64>>, ConfigDbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT user_id, group_id FROM group_members")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut map: HashMap<i64, Vec<i64>> = HashMap::new();
+        for (user_id, group_id) in rows {
+            map.entry(user_id).or_default().push(group_id);
+        }
+        Ok(map)
     }
 
     /// Create a new user. Returns the user with generated ID.

@@ -88,14 +88,19 @@ pub(crate) fn sanitize_next_param(raw: &str) -> Option<String> {
     if !trimmed.starts_with("/_/") {
         return None;
     }
-    if trimmed.contains("://") || trimmed.contains("\\") {
+    if trimmed.contains("://") {
         return None;
     }
-    // Only printable visible ASCII (no space — legitimate paths use
-    // `%20`; the URL parser has already percent-decoded any encoded
-    // bytes by the time we see them, so a literal space here would
-    // be an injection attempt).
-    if !trimmed.bytes().all(|b| (0x21..=0x7E).contains(&b)) {
+    // Single byte scan: reject backslash and anything outside printable
+    // visible ASCII (no space — legitimate paths use `%20`; the URL
+    // parser has already percent-decoded any encoded bytes by the time
+    // we see them, so a literal space here would be an injection
+    // attempt). Folding the backslash check into this scan drops the
+    // separate `contains("\\")` substring pass.
+    if !trimmed
+        .bytes()
+        .all(|b| b != b'\\' && (0x21..=0x7E).contains(&b))
+    {
         return None;
     }
     Some(trimmed.to_string())
@@ -1129,9 +1134,13 @@ fn error_page(title: &str, message: &str) -> impl IntoResponse {
 /// Merge rule-evaluated groups into existing memberships, preserving manual assignments.
 /// Returns the union of `existing` and `rule_groups` (order-preserving, no duplicates).
 fn merge_group_memberships(existing: Vec<i64>, rule_groups: &[i64]) -> Vec<i64> {
+    // Track membership in a HashSet so each `rule_groups` lookup is O(1)
+    // instead of O(n) `Vec::contains`, while still pushing onto `merged`
+    // to keep the documented order-preserving contract.
+    let mut seen: std::collections::HashSet<i64> = existing.iter().copied().collect();
     let mut merged = existing;
     for gid in rule_groups {
-        if !merged.contains(gid) {
+        if seen.insert(*gid) {
             merged.push(*gid);
         }
     }
