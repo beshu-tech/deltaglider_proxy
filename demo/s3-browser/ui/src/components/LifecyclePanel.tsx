@@ -101,12 +101,21 @@ export default function LifecyclePanel({ onSessionExpired }: Props) {
   const [failures, setFailures] = useState<LifecycleFailureEntry[]>([]);
   const [runtimeError, setRuntimeError] = useState<string | null>(null);
   const [buckets, setBuckets] = useState<string[]>([]);
-  const [selected, setSelected] = useState<string | null>(null);
+  // Selection is by ARRAY INDEX, not name (a rule's name is edited live and
+  // isn't unique mid-rename). Index is stable across renames; add/remove
+  // reset it below.
+  const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [runLoading, setRunLoading] = useState(false);
+  // Previews are keyed by rule NAME because they cache backend run results,
+  // which are name-addressed (runLifecycleNow(name)). After a rename the
+  // selected rule legitimately has no current preview until re-run.
   const [previews, setPreviews] = useState<Record<string, LifecycleRunOutcome>>({});
 
-  const selectedRule = lifecycle.rules.find((r) => r.name === selected) || lifecycle.rules[0] || null;
+  const selectedRule =
+    selectedIndex != null && selectedIndex >= 0 && selectedIndex < lifecycle.rules.length
+      ? lifecycle.rules[selectedIndex]
+      : lifecycle.rules[0] || null;
   const selectedRuleName = selectedRule?.name;
   const selectedRuntime = selectedRule
     ? overview.find((r) => r.name === selectedRule.name)
@@ -134,11 +143,12 @@ export default function LifecyclePanel({ onSessionExpired }: Props) {
     void reloadRuntime();
   }, [reloadRuntime]);
 
-  // Keep `selected` aligned with the rules the section editor loaded.
+  // Keep `selectedIndex` in range as the section editor (re)loads rules.
   useEffect(() => {
-    setSelected((cur) => {
-      if (cur && lifecycle.rules.some((r) => r.name === cur)) return cur;
-      return lifecycle.rules[0]?.name || null;
+    setSelectedIndex((cur) => {
+      if (lifecycle.rules.length === 0) return null;
+      if (cur != null && cur >= 0 && cur < lifecycle.rules.length) return cur;
+      return 0;
     });
   }, [lifecycle.rules]);
 
@@ -186,33 +196,37 @@ export default function LifecyclePanel({ onSessionExpired }: Props) {
     setLifecycle({ ...lifecycle, ...patch });
   };
 
-  const updateRule = (name: string, patch: Partial<LifecycleRuleConfig>) => {
+  // Mutations target the rule by INDEX so a live rename can't retarget or
+  // collide with another rule.
+  const updateRule = (index: number, patch: Partial<LifecycleRuleConfig>) => {
     setLifecycle({
       ...lifecycle,
-      rules: lifecycle.rules.map((rule) =>
-        rule.name === name ? { ...rule, ...patch } : rule
-      ),
+      rules: lifecycle.rules.map((rule, i) => (i === index ? { ...rule, ...patch } : rule)),
     });
   };
 
   const addRule = () => {
     const rule = emptyRule(lifecycle.rules);
-    setLifecycle({ ...lifecycle, rules: [...lifecycle.rules, rule] });
-    setSelected(rule.name);
-  };
-
-  const removeRule = (name: string) => {
-    const next = lifecycle.rules.filter((r) => r.name !== name);
+    const next = [...lifecycle.rules, rule];
     setLifecycle({ ...lifecycle, rules: next });
-    setSelected(next[0]?.name || null);
-    setPreviews((prev) => {
-      const rest = { ...prev };
-      delete rest[name];
-      return rest;
-    });
+    setSelectedIndex(next.length - 1);
   };
 
-  const confirmRemoveRule = (name: string) => {
+  const removeRule = (index: number) => {
+    const removed = lifecycle.rules[index];
+    const next = lifecycle.rules.filter((_, i) => i !== index);
+    setLifecycle({ ...lifecycle, rules: next });
+    setSelectedIndex(next.length > 0 ? Math.min(index, next.length - 1) : null);
+    if (removed) {
+      setPreviews((prev) => {
+        const rest = { ...prev };
+        delete rest[removed.name];
+        return rest;
+      });
+    }
+  };
+
+  const confirmRemoveRule = (index: number, name: string) => {
     Modal.confirm({
       title: `Remove lifecycle rule ${name}?`,
       okText: 'Remove rule',
@@ -222,7 +236,7 @@ export default function LifecyclePanel({ onSessionExpired }: Props) {
           This only removes the YAML-backed rule draft. It does not delete objects.
         </Text>
       ),
-      onOk: () => removeRule(name),
+      onOk: () => removeRule(index),
     });
   };
 
@@ -401,9 +415,8 @@ export default function LifecyclePanel({ onSessionExpired }: Props) {
 
       <RuleListEditor
         rules={lifecycle.rules}
-        selectedName={selected}
-        getName={(rule) => rule.name}
-        onSelect={setSelected}
+        selectedIndex={selectedIndex}
+        onSelect={setSelectedIndex}
         onAdd={addRule}
         icon={<ClockCircleOutlined />}
         loading={loading}
@@ -430,18 +443,17 @@ export default function LifecyclePanel({ onSessionExpired }: Props) {
             </>
           );
         }}
-        renderDetail={(rule) => (
+        renderDetail={(rule, index) => (
           <>
             <RuleEditor
               rule={rule}
               runtime={selectedRuntime || null}
               buckets={buckets}
               inputRadius={inputRadius}
-              onChange={(patch) => updateRule(rule.name, patch)}
+              onChange={(patch) => updateRule(index, patch)}
               onRename={(nextName) => {
                 const prevName = rule.name;
-                updateRule(prevName, { name: nextName });
-                setSelected(nextName);
+                updateRule(index, { name: nextName });
                 // Carry the preview over to the new key so the renamed rule
                 // still shows its last preview instead of going blank.
                 setPreviews((prev) => {
@@ -475,7 +487,7 @@ export default function LifecyclePanel({ onSessionExpired }: Props) {
               >
                 Run {actionKind(rule.action) === 'transition' ? 'transition' : 'delete'} now
               </Button>
-              <Button danger onClick={() => confirmRemoveRule(rule.name)}>
+              <Button danger onClick={() => confirmRemoveRule(index, rule.name)}>
                 Remove rule
               </Button>
             </div>

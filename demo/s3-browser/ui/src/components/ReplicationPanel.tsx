@@ -97,10 +97,16 @@ export default function ReplicationPanel({ onSessionExpired }: Props) {
   const [history, setHistory] = useState<ReplicationHistoryEntry[]>([]);
   const [failures, setFailures] = useState<ReplicationFailureEntry[]>([]);
   const [buckets, setBuckets] = useState<string[]>([]);
-  const [selected, setSelected] = useState<string | null>(null);
+  // Selection is by ARRAY INDEX, not name: a rule's name is edited live and
+  // isn't unique mid-rename, so name-keyed selection could retarget the wrong
+  // rule. Index is stable across renames; add/remove reset it below.
+  const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
 
-  const selectedRule = replication.rules.find((r) => r.name === selected) || replication.rules[0] || null;
+  const selectedRule =
+    selectedIndex != null && selectedIndex >= 0 && selectedIndex < replication.rules.length
+      ? replication.rules[selectedIndex]
+      : replication.rules[0] || null;
   const selectedRuleName = selectedRule?.name;
   const selectedRuntime = selectedRule
     ? overview.find((r) => r.name === selectedRule.name)
@@ -122,11 +128,13 @@ export default function ReplicationPanel({ onSessionExpired }: Props) {
     void reloadRuntime();
   }, [reloadRuntime]);
 
-  // Keep `selected` aligned with the rules the section editor loaded.
+  // Keep `selectedIndex` in range as the section editor (re)loads rules.
+  // Clamp out-of-range to the first rule; null when the list is empty.
   useEffect(() => {
-    setSelected((cur) => {
-      if (cur && replication.rules.some((r) => r.name === cur)) return cur;
-      return replication.rules[0]?.name || null;
+    setSelectedIndex((cur) => {
+      if (replication.rules.length === 0) return null;
+      if (cur != null && cur >= 0 && cur < replication.rules.length) return cur;
+      return 0;
     });
   }, [replication.rules]);
 
@@ -156,25 +164,26 @@ export default function ReplicationPanel({ onSessionExpired }: Props) {
     setReplication({ ...replication, ...patch });
   };
 
-  const updateRule = (name: string, patch: Partial<ReplicationRuleConfig>) => {
+  // Mutations target the rule by INDEX so a live rename (which changes the
+  // name) can't retarget or collide with another rule.
+  const updateRule = (index: number, patch: Partial<ReplicationRuleConfig>) => {
     setReplication({
       ...replication,
-      rules: replication.rules.map((rule) =>
-        rule.name === name ? { ...rule, ...patch } : rule
-      ),
+      rules: replication.rules.map((rule, i) => (i === index ? { ...rule, ...patch } : rule)),
     });
   };
 
   const addRule = () => {
     const rule = emptyRule(replication.rules);
-    setReplication({ ...replication, rules: [...replication.rules, rule] });
-    setSelected(rule.name);
+    const next = [...replication.rules, rule];
+    setReplication({ ...replication, rules: next });
+    setSelectedIndex(next.length - 1);
   };
 
-  const removeRule = (name: string) => {
-    const next = replication.rules.filter((r) => r.name !== name);
+  const removeRule = (index: number) => {
+    const next = replication.rules.filter((_, i) => i !== index);
     setReplication({ ...replication, rules: next });
-    setSelected(next[0]?.name || null);
+    setSelectedIndex(next.length > 0 ? Math.min(index, next.length - 1) : null);
   };
 
   // Guarded apply: run the client-side validation first and surface the
@@ -318,9 +327,8 @@ export default function ReplicationPanel({ onSessionExpired }: Props) {
 
       <RuleListEditor
         rules={replication.rules}
-        selectedName={selected}
-        getName={(rule) => rule.name}
-        onSelect={setSelected}
+        selectedIndex={selectedIndex}
+        onSelect={setSelectedIndex}
         onAdd={addRule}
         icon={<SyncOutlined />}
         loading={loading}
@@ -346,18 +354,15 @@ export default function ReplicationPanel({ onSessionExpired }: Props) {
             </>
           );
         }}
-        renderDetail={(rule) => (
+        renderDetail={(rule, index) => (
           <>
             <ReplicationRuleFields
               rule={rule}
               runtime={selectedRuntime || null}
               buckets={buckets}
               inputRadius={inputRadius}
-              onChange={(patch) => updateRule(rule.name, patch)}
-              onRename={(nextName) => {
-                updateRule(rule.name, { name: nextName });
-                setSelected(nextName);
-              }}
+              onChange={(patch) => updateRule(index, patch)}
+              onRename={(nextName) => updateRule(index, { name: nextName })}
             />
 
             <div style={{ marginTop: 16, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
@@ -388,7 +393,7 @@ export default function ReplicationPanel({ onSessionExpired }: Props) {
                   Pause
                 </Button>
               )}
-              <Button danger onClick={() => removeRule(rule.name)}>
+              <Button danger onClick={() => removeRule(index)}>
                 Remove rule
               </Button>
             </div>

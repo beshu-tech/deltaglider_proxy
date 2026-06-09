@@ -13,28 +13,30 @@ const { Text } = Typography;
  * the "Add rule" button, and the empty-vs-detail card switch. The per-rule
  * field set and list-row body stay panel-specific via render props.
  *
- * Selection lives in the parent (it has to, since `selectedName` is derived
- * from the section-editor's loaded rules and kept in sync there); this
- * component is a pure presentation shell over `rules` + `selectedName`.
+ * Selection lives in the parent (it has to, since the selected index is
+ * derived from the section-editor's loaded rules and kept in sync there);
+ * this component is a pure presentation shell over `rules` + `selectedIndex`.
  *
- * Stable React keys: each rule row is keyed by `getName(rule)`, matching the
- * pre-refactor `key={rule.name}` on both panels. Rename flows must update
- * `selectedName` in the same render as the rule's name (both panels do, via
- * their `onRename`), so the key transition stays clean.
+ * Identity is by ARRAY INDEX, not by name. A rule's name is mutable (the
+ * detail editor renames it live, per keystroke) and is not guaranteed unique
+ * mid-edit, so keying selection/mutations on the name let a rename-to-collide
+ * silently retarget the wrong rule. The index is stable across renames; only
+ * add/remove shift it, and both reset the selection in the parent. The rule
+ * name is rendered by the panel's own `renderListItem`/`renderDetail`, so this
+ * scaffold never needs to read it.
  */
 interface RuleListEditorProps<TRule> {
   rules: TRule[];
-  selectedName: string | null;
-  getName: (rule: TRule) => string;
-  onSelect: (name: string) => void;
+  selectedIndex: number | null;
+  onSelect: (index: number) => void;
   onAdd: () => void;
   /** Section icon + the "N configured rule(s)" subtitle text. */
   icon: ReactNode;
   loading: boolean;
   /** Compact body for a list row (status tag + scope lines). */
-  renderListItem: (rule: TRule) => ReactNode;
+  renderListItem: (rule: TRule, index: number) => ReactNode;
   /** Detail editor for the selected rule (fields + action buttons + runtime). */
-  renderDetail: (rule: TRule) => ReactNode;
+  renderDetail: (rule: TRule, index: number) => ReactNode;
   /** Shown in the detail card when no rule is selected. */
   emptyState: ReactNode;
   /** Master-list column width (panels differ slightly). */
@@ -43,8 +45,7 @@ interface RuleListEditorProps<TRule> {
 
 export default function RuleListEditor<TRule>({
   rules,
-  selectedName,
-  getName,
+  selectedIndex,
   onSelect,
   onAdd,
   icon,
@@ -56,8 +57,15 @@ export default function RuleListEditor<TRule>({
 }: RuleListEditorProps<TRule>) {
   const colors = useColors();
   const { cardStyle } = useCardStyles();
-  const selectedRule = rules.find((r) => getName(r) === selectedName) || rules[0] || null;
-  const selectedKey = selectedRule ? getName(selectedRule) : null;
+  // Resolve the selected index, falling back to the first rule. `null` /
+  // out-of-range (e.g. just after a delete) collapses to "no selection".
+  const activeIndex =
+    selectedIndex != null && selectedIndex >= 0 && selectedIndex < rules.length
+      ? selectedIndex
+      : rules.length > 0
+        ? 0
+        : null;
+  const selectedRule = activeIndex != null ? rules[activeIndex] : null;
 
   return (
     <div style={{ display: 'grid', gridTemplateColumns: `${listColumn} minmax(0, 1fr)`, gap: 16 }}>
@@ -68,13 +76,12 @@ export default function RuleListEditor<TRule>({
           description={loading ? 'Loading...' : `${rules.length} configured rule${rules.length === 1 ? '' : 's'}.`}
         />
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-          {rules.map((rule) => {
-            const name = getName(rule);
-            const active = selectedKey === name;
+          {rules.map((rule, index) => {
+            const active = activeIndex === index;
             return (
               <button
-                key={name}
-                onClick={() => onSelect(name)}
+                key={index}
+                onClick={() => onSelect(index)}
                 style={{
                   textAlign: 'left',
                   border: `1px solid ${active ? colors.ACCENT_BLUE : colors.BORDER}`,
@@ -84,7 +91,7 @@ export default function RuleListEditor<TRule>({
                   cursor: 'pointer',
                 }}
               >
-                {renderListItem(rule)}
+                {renderListItem(rule, index)}
               </button>
             );
           })}
@@ -95,7 +102,9 @@ export default function RuleListEditor<TRule>({
       </div>
 
       <div style={cardStyle}>
-        {!selectedRule ? emptyState : renderDetail(selectedRule)}
+        {selectedRule == null || activeIndex == null
+          ? emptyState
+          : renderDetail(selectedRule, activeIndex)}
       </div>
     </div>
   );
