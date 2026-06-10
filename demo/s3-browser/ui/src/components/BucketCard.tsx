@@ -12,7 +12,7 @@
  * transform through the parent's functional `setRows`, so prefix edits
  * never read a stale closure (recent bug fix preserved).
  */
-import { Button, Input, InputNumber, Radio, Select, Typography } from 'antd';
+import { Button, Input, InputNumber, Modal, Radio, Select, Typography } from 'antd';
 import { DeleteOutlined } from '@ant-design/icons';
 import type { BackendInfo } from '../adminApi';
 import { resolveBackendFor, describeEncryption } from '../encryptionUi';
@@ -60,6 +60,38 @@ export default function BucketCard({
   const cardBorder = isPublic ? `${colors.ACCENT_AMBER}66` : colors.BORDER;
   const cardBg = isPublic ? `${colors.ACCENT_AMBER}0a` : colors.BG_ELEVATED;
 
+  // Changing the backend of a bucket that is ALREADY routed somewhere is a
+  // re-route, and re-routing only changes where the bucket points — it does NOT
+  // move existing objects, which then become unreachable through this bucket
+  // (the routing layer's explicit route wins, so the old backend is never
+  // HEAD-scanned). Confirm before applying such a change. First-time set on a
+  // fresh row (empty `row.backend`) is the create path, not a re-route — apply
+  // directly. AntD Select emits `undefined` on clear; coerce to '' to keep the
+  // non-optional string contract (and avoid the resolveBackendFor crash).
+  const handleBackendChange = (next: string | undefined) => {
+    const value = next ?? '';
+    const prev = row.backend;
+    if (!prev || value === prev) {
+      onChange({ backend: value });
+      return;
+    }
+    const bucketLabel = row.name || 'this bucket';
+    const target = value || '(default)';
+    Modal.confirm({
+      title: `Re-route ${bucketLabel} to ${target}?`,
+      okText: 'Re-route anyway',
+      okButtonProps: { danger: true },
+      content: (
+        <Text type="secondary">
+          Routing only — this does <strong>not</strong> move existing objects.
+          Objects already stored on <Text code>{prev}</Text> become unreachable
+          through this bucket until they are migrated.
+        </Text>
+      ),
+      onOk: () => onChange({ backend: value }),
+    });
+  };
+
   return (
     <div
       style={{
@@ -82,11 +114,9 @@ export default function BucketCard({
         {backends.length > 0 && (
           <Select
             value={row.backend || undefined}
-            // AntD Select emits `undefined` on clear; BucketPolicyRow.backend is
-            // a non-optional string, so coerce back to '' (no-backend = route to
-            // the default). Passing undefined through corrupted the row and
-            // crashed resolveBackendFor's .trim().
-            onChange={(v) => onChange({ backend: v ?? '' })}
+            // Re-routing an already-routed bucket is confirmed first (see
+            // handleBackendChange) because it orphans existing objects.
+            onChange={handleBackendChange}
             placeholder="Route to..."
             allowClear
             size="small"
@@ -116,6 +146,15 @@ export default function BucketCard({
           aria-label={`Remove ${row.name || 'bucket'}`}
         />
       </div>
+
+      {row.backend && (
+        <Text
+          type="secondary"
+          style={{ display: 'block', fontSize: 11, marginTop: -6, marginBottom: 10 }}
+        >
+          Routing only — won't move existing objects.
+        </Text>
+      )}
 
       {/* Compression + alias + quota row */}
       <div style={formRow(16, { flexWrap: 'wrap', marginBottom: 12 })}>

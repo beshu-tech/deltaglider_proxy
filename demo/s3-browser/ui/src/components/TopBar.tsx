@@ -22,6 +22,8 @@ interface Props {
   onSearchChange: (query: string) => void;
   refreshing: boolean;
   canRefresh?: boolean;
+  /** Show the breadcrumb's backend-origin chip (admin-only). */
+  canAdmin?: boolean;
   accountMenu?: React.ReactNode;
   /** Aggregated delta savings for the current prefix view. Auto-hides when no deltas present. */
   deltaSummary?: DeltaSummary | null;
@@ -78,7 +80,7 @@ function SearchInput({
   );
 }
 
-export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuClick, onRefresh, searchQuery, onSearchChange, refreshing, canRefresh = true, accountMenu, deltaSummary = null }: Props) {
+export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuClick, onRefresh, searchQuery, onSearchChange, refreshing, canRefresh = true, canAdmin = false, accountMenu, deltaSummary = null }: Props) {
   const { token } = theme.useToken();
   const { ACCENT_BLUE, TEXT_MUTED, BORDER } = useColors();
   const [searchOpen, setSearchOpen] = useState(false);
@@ -125,7 +127,7 @@ export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuCli
             />
           ) : (
             <>
-              <Breadcrumb bucket={bucket} prefix={prefix} onNavigate={onNavigate} />
+              <Breadcrumb bucket={bucket} prefix={prefix} onNavigate={onNavigate} canAdmin={canAdmin} />
               <DeltaSavingsChip summary={deltaSummary} />
             </>
           )

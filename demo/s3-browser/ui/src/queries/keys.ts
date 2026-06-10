@@ -42,6 +42,7 @@ export const qk = {
   // ── Storage ─────────────────────────────────────────────────────
   backends: {
     list: () => ['backends'] as const,
+    origins: () => ['backends', 'origins'] as const,
   },
 
   // ── Diagnostics ─────────────────────────────────────────────────

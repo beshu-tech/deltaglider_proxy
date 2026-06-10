@@ -2,6 +2,9 @@ import { HomeFilled } from '@ant-design/icons';
 import { prefixSegments } from '../utils';
 import { useColors } from '../ThemeContext';
 import { buildBrowserUrl } from '../urlState';
+import { useBucketOrigins } from '../queries/backends';
+import BucketBackendBadge from './BucketBackendBadge';
+import type { BucketBackendOrigin } from '../types';
 
 interface Props {
   /** The active bucket. Passed from the URL-derived source of truth — NOT read
@@ -11,6 +14,9 @@ interface Props {
   bucket: string;
   prefix: string;
   onNavigate: (prefix: string) => void;
+  /** Show the backend-origin chip. Gated to admins — the origins API
+   *  (/api/admin/buckets) is admin-only. */
+  canAdmin?: boolean;
 }
 
 const segmentBase: React.CSSProperties = {
@@ -27,10 +33,27 @@ const segmentBase: React.CSSProperties = {
   cursor: 'pointer',
 };
 
-export default function Breadcrumb({ bucket, prefix, onNavigate }: Props) {
+export default function Breadcrumb({ bucket, prefix, onNavigate, canAdmin = false }: Props) {
   const { TEXT_PRIMARY, TEXT_SECONDARY, TEXT_FAINT, ACCENT_BLUE } = useColors();
   const separatorStyle: React.CSSProperties = { color: TEXT_FAINT, margin: '0 6px', fontSize: 12, flexShrink: 0, userSelect: 'none' };
   const segments = prefixSegments(prefix);
+
+  // Backend-origin chip (admin-only — origins API is admin-gated). react-query
+  // dedupes this with the Backends panel's useBucketOrigins(); `enabled` keeps
+  // non-admins from firing the (403-ing) request.
+  const originsQuery = useBucketOrigins({ enabled: canAdmin && Boolean(bucket) });
+  const activeOrigin: BucketBackendOrigin | undefined = (() => {
+    const row = originsQuery.data?.buckets?.find((b) => b.name === bucket);
+    if (!row) return undefined;
+    return {
+      backendName: row.backend_name || undefined,
+      backendType: row.backend_type || undefined,
+      backendEndpoint: row.backend_endpoint || undefined,
+      backendRegion: row.backend_region || undefined,
+      backendPath: row.backend_path || undefined,
+      realBucket: row.real_bucket || undefined,
+    };
+  })();
 
   // Real <a href> so middle-click / cmd-click open the folder in a new tab.
   // Plain left-click is intercepted (preventDefault) and routed through the
@@ -75,6 +98,12 @@ export default function Breadcrumb({ bucket, prefix, onNavigate }: Props) {
             </span>
           )}
         </li>
+
+        {canAdmin && bucket && activeOrigin && (
+          <li style={{ display: 'inline-flex', alignItems: 'center', marginLeft: 6 }}>
+            <BucketBackendBadge origin={activeOrigin} />
+          </li>
+        )}
 
         {/* Prefix segments */}
         {segments.map((seg, i) => {

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { qk } from '../queries/keys';
 import { Button, Input, Radio, Switch, Typography, Space, Alert, Spin } from 'antd';
@@ -6,7 +6,8 @@ import { PlusOutlined, DeleteOutlined, DatabaseOutlined, CloudOutlined, CheckCir
 import type { BackendInfo, CreateBackendRequest } from '../adminApi';
 import { createBackend, deleteBackend, testS3Connection, updateAdminConfig, putSection } from '../adminApi';
 import { useAdminConfig } from '../queries/config';
-import { useBackends } from '../queries/backends';
+import { useBackends, useBucketOrigins } from '../queries/backends';
+import CreateBucketModal from './CreateBucketModal';
 import { useColors } from '../ThemeContext';
 import { useNavigation } from '../NavigationContext';
 import { useCardStyles } from './shared-styles';
@@ -36,6 +37,24 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
   const backends = backendsQuery.data?.backends ?? [];
   const defaultBackend = backendsQuery.data?.default_backend ?? null;
   const { data: config } = useAdminConfig();
+
+  // Bucket counts per backend, from the authoritative virtual→backend origin
+  // map (works for filesystem AND s3; testS3Connection is s3-only + transient).
+  // Buckets with no explicit backend_name route to the default backend.
+  const originsQuery = useBucketOrigins();
+  const countByBackend = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const o of originsQuery.data?.buckets ?? []) {
+      const key = o.backend_name ?? defaultBackend ?? '';
+      if (!key) continue;
+      counts[key] = (counts[key] ?? 0) + 1;
+    }
+    return counts;
+  }, [originsQuery.data, defaultBackend]);
+
+  // "Create bucket here" → opens the shared CreateBucketModal pre-targeted to a
+  // specific backend. This panel only renders for admins (admin route).
+  const [createBucketBackend, setCreateBucketBackend] = useState<string | null>(null);
   const loading = backendsQuery.isLoading;
   // Surface a load error (401 bubbles to the session-expired handler; anything
   // else renders in the Alert below).
@@ -219,6 +238,18 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
 
   return (
     <div style={{ maxWidth: 700, margin: '0 auto', padding: 'clamp(16px, 3vw, 24px)' }}>
+      <CreateBucketModal
+        open={createBucketBackend !== null}
+        presetBackend={createBucketBackend ?? undefined}
+        canAdmin
+        onClose={() => setCreateBucketBackend(null)}
+        onCreated={() => {
+          // Refresh the per-backend counts (and the backend list, in case the
+          // default-backend assignment shifted).
+          qc.invalidateQueries({ queryKey: qk.backends.origins() });
+          qc.invalidateQueries({ queryKey: qk.backends.list() });
+        }}
+      />
       <Space direction="vertical" size={0} style={{ width: '100%' }}>
 
         {saveResult && (
@@ -297,7 +328,23 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                       ? `filesystem: ${b.path}`
                       : `s3: ${b.endpoint || 'AWS'} (${b.region})`}
                   </div>
+                  <div style={{ fontSize: 11, color: colors.TEXT_MUTED, marginTop: 2 }}>
+                    {(() => {
+                      const n = countByBackend[b.name] ?? 0;
+                      return n === 0
+                        ? "No buckets routed here yet — use 'Create bucket here' to add one."
+                        : `${n} bucket${n === 1 ? '' : 's'} routed here`;
+                    })()}
+                  </div>
                 </div>
+                <Button
+                  size="small"
+                  icon={<PlusOutlined />}
+                  onClick={() => setCreateBucketBackend(b.name)}
+                  title="Create a bucket on this backend"
+                >
+                  Create bucket here
+                </Button>
                 {b.backend_type === 's3' && (
                   <Button size="small" icon={<ApiOutlined />} loading={testingBackend === b.name} onClick={() => handleTestConnection(b)} title="Test connection" />
                 )}

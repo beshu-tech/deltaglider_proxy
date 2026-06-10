@@ -1,6 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Layout, Button, Typography, Input, Drawer, theme, message, Modal, Select } from 'antd';
-import type { InputRef } from 'antd';
+import { Layout, Button, Typography, Drawer, theme, message, Modal } from 'antd';
 import {
   PlusOutlined,
   DeleteOutlined,
@@ -10,7 +9,6 @@ import {
 import {
   abortAllMultipartUploads,
   countMultipartUploads,
-  createBucket,
   deleteBucket,
   getBucket,
   listBuckets,
@@ -19,8 +17,7 @@ import {
 import type { BucketInfo } from '../types';
 import { useColors } from '../ThemeContext';
 import BucketBackendBadge from './BucketBackendBadge';
-import { getBackends } from '../adminApi';
-import type { BackendInfo } from '../adminApi';
+import CreateBucketModal from './CreateBucketModal';
 
 const { Sider } = Layout;
 const { Text } = Typography;
@@ -76,13 +73,10 @@ export default function Sidebar({
     TEXT_MUTED, TEXT_FAINT, ACCENT_BLUE, ACCENT_BLUE_LIGHT,
   } = useColors();
   const [buckets, setBuckets] = useState<BucketInfo[]>([]);
-  const [newBucketName, setNewBucketName] = useState('');
+  // Create-bucket dialog lives in <CreateBucketModal>; the Sidebar only owns
+  // its open/close + post-create refresh of its local bucket list.
   const [createBucketOpen, setCreateBucketOpen] = useState(false);
-  const [creatingBucket, setCreatingBucket] = useState(false);
-  const [createBucketBackends, setCreateBucketBackends] = useState<BackendInfo[]>([]);
-  const [selectedBackend, setSelectedBackend] = useState<string | undefined>(undefined);
   const [deletingBucketName, setDeletingBucketName] = useState<string | null>(null);
-  const newBucketInputRef = useRef<InputRef>(null);
   const deleteConfirmOpenRef = useRef(false);
   const { token } = theme.useToken();
   const [messageApi, contextHolder] = message.useMessage();
@@ -112,56 +106,20 @@ export default function Sidebar({
     setCreateBucketOpen(true);
   }, [createBucketFocusSignal]);
 
-  useEffect(() => {
-    if (!createBucketOpen) return;
-    const id = window.setTimeout(() => newBucketInputRef.current?.focus(), 80);
-    return () => window.clearTimeout(id);
-  }, [createBucketOpen]);
-
-  useEffect(() => {
-    if (!createBucketOpen || !canAdmin) return;
-    let cancelled = false;
-    getBackends()
-      .then((resp) => {
-        if (cancelled) return;
-        const backends = resp.backends || [];
-        setCreateBucketBackends(backends);
-        const preferred = resp.default_backend || backends[0]?.name;
-        setSelectedBackend(preferred || undefined);
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setCreateBucketBackends([]);
-        setSelectedBackend(undefined);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [createBucketOpen, canAdmin]);
-
-  const handleCreateBucket = async () => {
-    const name = newBucketName.trim();
-    if (!name) return;
-    setCreatingBucket(true);
+  // After CreateBucketModal reports success, refresh the Sidebar's local bucket
+  // list (it's plain useState, not react-query) and auto-select the new bucket
+  // if none is active yet.
+  const handleBucketCreated = async (name: string) => {
     try {
-      const explicitBackend = createBucketBackends.length > 1 ? selectedBackend : undefined;
-      await createBucket(name, explicitBackend);
-      setNewBucketName('');
-      setCreateBucketOpen(false);
-      setSelectedBackend(undefined);
-      messageApi.success(`Bucket "${name}" created`);
       const updated = await listBuckets({ includeOrigins: includeBucketOrigins });
       setBuckets(updated);
       onBucketsChanged?.(updated.length);
-      if (!getBucket()) {
-        setBucket(name);
-        onBucketChange(name);
-      }
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : 'Unknown error';
-      messageApi.error(`Failed to create bucket: ${msg}`);
-    } finally {
-      setCreatingBucket(false);
+    } catch {
+      /* refresh failure is non-fatal — the bucket was created */
+    }
+    if (!getBucket()) {
+      setBucket(name);
+      onBucketChange(name);
     }
   };
 
@@ -455,60 +413,12 @@ export default function Sidebar({
   );
 
   const createBucketModal = (
-    <Modal
-      title="Create bucket"
+    <CreateBucketModal
       open={createBucketOpen && canCreateBucket}
-      okText="Create"
-      onOk={handleCreateBucket}
-      confirmLoading={creatingBucket}
-      okButtonProps={{
-        disabled:
-          !newBucketName.trim()
-          || !canCreateBucket
-          || (canAdmin && createBucketBackends.length > 1 && !selectedBackend),
-      }}
-      onCancel={() => {
-        if (creatingBucket) return;
-        setCreateBucketOpen(false);
-        setNewBucketName('');
-        setSelectedBackend(undefined);
-      }}
-      destroyOnHidden
-    >
-      <Input
-        ref={newBucketInputRef}
-        placeholder="Bucket name"
-        aria-label="Bucket name"
-        value={newBucketName}
-        onChange={(e) => setNewBucketName(e.target.value)}
-        onPressEnter={handleCreateBucket}
-        style={{ fontFamily: "var(--font-mono)" }}
-      />
-      {canAdmin && createBucketBackends.length > 1 && (
-        <div style={{ marginTop: 12 }}>
-          <Select
-            value={selectedBackend}
-            onChange={(value) => setSelectedBackend(value || undefined)}
-            options={createBucketBackends.map((backend) => ({
-              value: backend.name,
-              label: backend.name,
-              sublabel: backend.backend_type,
-            }))}
-            optionRender={(opt) => (
-              <div>
-                <div>{opt.data.label}</div>
-                {opt.data.sublabel && <div style={{ fontSize: 11, opacity: 0.65 }}>{opt.data.sublabel}</div>}
-              </div>
-            )}
-            showSearch
-            optionFilterProp="label"
-            placeholder="Choose backend"
-            style={{ width: '100%' }}
-            size="middle"
-          />
-        </div>
-      )}
-    </Modal>
+      canAdmin={canAdmin}
+      onClose={() => setCreateBucketOpen(false)}
+      onCreated={handleBucketCreated}
+    />
   );
 
   if (isMobile) {

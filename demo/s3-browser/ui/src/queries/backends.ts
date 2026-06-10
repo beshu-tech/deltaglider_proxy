@@ -8,12 +8,26 @@
  * a write so the list and the cached config both refresh.
  */
 import { useQuery } from '@tanstack/react-query';
-import { getBackends } from '../adminApi';
+import { getBackends, getBucketOrigins } from '../adminApi';
 import { qk } from './keys';
 
 export function useBackends() {
   return useQuery({
     queryKey: qk.backends.list(),
     queryFn: getBackends,
+  });
+}
+
+/**
+ * Bucket→backend origin map (admin-only). Authoritative virtual→backend
+ * mapping for BOTH filesystem and S3 backends — used to count buckets per
+ * backend and to badge a bucket's origin. Cached so the count chip and the
+ * header badge don't each re-fetch.
+ */
+export function useBucketOrigins(opts?: { enabled?: boolean }) {
+  return useQuery({
+    queryKey: qk.backends.origins(),
+    queryFn: getBucketOrigins,
+    enabled: opts?.enabled ?? true,
   });
 }
