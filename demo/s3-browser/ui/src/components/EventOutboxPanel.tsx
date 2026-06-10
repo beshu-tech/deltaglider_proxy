@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Button, Input, message, Select, Space, Switch, Table, Tag, Typography } from 'antd';
 import {
   DatabaseOutlined,
@@ -77,10 +77,16 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
   const [requeueing, setRequeueing] = useState<number | 'bulk' | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  // Generation guard: the interval tick and dep-change refetches can overlap,
+  // so stamp each fetch and only publish the newest response (an older,
+  // slower response must not clobber a newer one).
+  const fetchGen = useRef(0);
   const refresh = useCallback(async () => {
+    const gen = ++fetchGen.current;
     try {
       setLoading(true);
       const res = await fetchEventOutbox(pageSize, status, (page - 1) * pageSize, sort, order);
+      if (gen !== fetchGen.current) return; // superseded by a newer refresh
       setRows(res.rows);
       setCounts(res.counts);
       setTotal(res.total);
@@ -88,13 +94,14 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
       setDeliveryActive(res.delivery_active);
       setError(null);
     } catch (e) {
+      if (gen !== fetchGen.current) return;
       if (e instanceof Error && e.message.includes('401')) {
         onSessionExpired?.();
         return;
       }
       setError(e instanceof Error ? e.message : 'Failed to load event outbox');
     } finally {
-      setLoading(false);
+      if (gen === fetchGen.current) setLoading(false);
     }
   }, [onSessionExpired, order, page, pageSize, sort, status]);
 

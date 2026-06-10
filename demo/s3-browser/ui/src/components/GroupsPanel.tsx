@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from 'react';
-import { Button, Typography, Alert, Input, Divider, Checkbox } from 'antd';
+import { Button, Typography, Alert, Input, Divider, Checkbox, message } from 'antd';
 import { PlusOutlined, FolderOutlined, DeleteOutlined, CopyOutlined } from '@ant-design/icons';
 import type { IamGroup, IamUser } from '../adminApi';
 import { useAdminConfig } from '../queries/config';
@@ -122,7 +122,7 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
       setCreating(false);
       setSelectedId(cloned.id);
     } catch (err) {
-      console.error('Duplicate group failed:', err);
+      message.error(err instanceof Error ? err.message : 'Duplicate group failed');
     } finally {
       onSavingChange?.(false);
     }

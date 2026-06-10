@@ -10,6 +10,9 @@ import { useColors } from '../ThemeContext';
 const { Header } = Layout;
 
 interface Props {
+  /** Active bucket (URL-derived) — threaded to the Breadcrumb so its links
+   *  use the canonical bucket, not lagging s3client module state. */
+  bucket: string;
   prefix: string;
   onNavigate: (prefix: string) => void;
   isMobile: boolean;
@@ -75,7 +78,7 @@ function SearchInput({
   );
 }
 
-export default function TopBar({ prefix, onNavigate, isMobile, onMenuClick, onRefresh, searchQuery, onSearchChange, refreshing, canRefresh = true, accountMenu, deltaSummary = null }: Props) {
+export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuClick, onRefresh, searchQuery, onSearchChange, refreshing, canRefresh = true, accountMenu, deltaSummary = null }: Props) {
   const { token } = theme.useToken();
   const { ACCENT_BLUE, TEXT_MUTED, BORDER } = useColors();
   const [searchOpen, setSearchOpen] = useState(false);
@@ -122,7 +125,7 @@ export default function TopBar({ prefix, onNavigate, isMobile, onMenuClick, onRe
             />
           ) : (
             <>
-              <Breadcrumb prefix={prefix} onNavigate={onNavigate} />
+              <Breadcrumb bucket={bucket} prefix={prefix} onNavigate={onNavigate} />
               <DeltaSavingsChip summary={deltaSummary} />
             </>
           )

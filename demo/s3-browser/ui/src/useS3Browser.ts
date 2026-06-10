@@ -67,6 +67,13 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
   const headInflight = useRef(new Set<string>());
   const prefixRef = useRef(prefix);
   prefixRef.current = prefix;
+  // bucket/object tracked in refs too so the debounced search write reads the
+  // LATEST values when its timer fires, not the values captured when the
+  // keystroke was typed (see setSearchQuery).
+  const bucketRef = useRef(bucket);
+  bucketRef.current = bucket;
+  const objectRef = useRef(object);
+  objectRef.current = object;
   const isInitialLoad = useRef(true);
 
   // Keep the s3client's module-level active bucket in sync with the URL bucket
@@ -281,9 +288,23 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     if (qDebounce.current !== null) window.clearTimeout(qDebounce.current);
     qDebounce.current = window.setTimeout(() => {
       qDebounce.current = null;
-      navigateUrl(buildBrowserUrl({ bucket, prefix, q: next, object }), { replace: true });
+      // Read bucket/prefix/object from refs (latest values), not from the
+      // closure captured when the keystroke was typed. Otherwise a bucket/
+      // prefix change during the 200ms window would write a stale URL — and if
+      // the captured bucket was '' (at bare /_/browse), buildBrowserUrl would
+      // drop the prefix entirely. Fall back to getBucket() for the same reason
+      // navigate() does.
+      navigateUrl(
+        buildBrowserUrl({
+          bucket: bucketRef.current || getBucket(),
+          prefix: prefixRef.current,
+          q: next,
+          object: objectRef.current,
+        }),
+        { replace: true },
+      );
     }, 200);
-  }, [navigateUrl, bucket, prefix, object]);
+  }, [navigateUrl]);
   useEffect(() => () => {
     if (qDebounce.current !== null) window.clearTimeout(qDebounce.current);
   }, []);
@@ -331,9 +352,8 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
 
   /** Get all object keys from the selection, expanding folders recursively. */
   /** Resolve selected keys, expanding folders recursively. Deduplicates overlapping folders. */
-  const resolveSelectedKeys = useCallback(async (): Promise<string[]> => {
+  const resolveSelectedKeys = useCallback(async (currentBucket: string): Promise<string[]> => {
     const keySet = new Set<string>();
-    const currentBucket = getBucket();
     for (const k of selectedKeys) {
       if (k.startsWith('folder:')) {
         const pfx = k.slice('folder:'.length);
@@ -363,12 +383,11 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
    *   loudly BEFORE any copy starts. The previous code would silently overwrite
    *   when two siblings shared a basename across nested folders.
    */
-  const resolveSelectionWithRelativeKeys = useCallback(async (): Promise<Array<{ source: string; relative: string }>> => {
+  const resolveSelectionWithRelativeKeys = useCallback(async (currentBucket: string): Promise<Array<{ source: string; relative: string }>> => {
     // dedupe by absolute source key while keeping the FIRST relative suffix we
     // saw — later overlapping folder selections shouldn't shorten a prefix that
     // an earlier folder already established.
     const seen = new Map<string, string>();
-    const currentBucket = getBucket();
     for (const k of selectedKeys) {
       if (k.startsWith('folder:')) {
         const pfx = k.slice('folder:'.length);
@@ -397,9 +416,13 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     // bookkeeping. Pre-migration the browser ran this loop itself via
     // @aws-sdk/client-s3, with no atomicity and ~250 KB of SDK code
     // shipped down the wire.
-    const items = await resolveSelectionWithRelativeKeys();
-    if (items.length === 0) return { succeeded: 0, failed: 0 };
+    // Snapshot the source bucket ONCE so the folder-expansion listing and the
+    // copy execute against the same bucket even if the user switches buckets
+    // mid-operation (selection clears on switch, but an in-flight op kept its
+    // own closure + re-read getBucket(), which could straddle two buckets).
     const sourceBucket = getBucket();
+    const items = await resolveSelectionWithRelativeKeys(sourceBucket);
+    if (items.length === 0) return { succeeded: 0, failed: 0 };
     const result = await bulkCopyObjects({
       source_bucket: sourceBucket,
       dest_bucket: destBucket,
@@ -419,9 +442,11 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     // sources are deleted ONLY when every copy succeeded. Difference
     // is now the policy is enforced inside one engine call instead of
     // a client-side loop that could be interrupted mid-flight.
-    const items = await resolveSelectionWithRelativeKeys();
-    if (items.length === 0) return { succeeded: 0, failed: 0 };
+    // Snapshot the source bucket once (see bulkCopy) so listing + move can't
+    // straddle a mid-operation bucket switch.
     const sourceBucket = getBucket();
+    const items = await resolveSelectionWithRelativeKeys(sourceBucket);
+    if (items.length === 0) return { succeeded: 0, failed: 0 };
     const result = await bulkMoveObjects({
       source_bucket: sourceBucket,
       dest_bucket: destBucket,
@@ -438,9 +463,9 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     // resolves the selection and triggers a same-origin download. No
     // SDK GETs in JS, no in-memory zip buffer, no 500 MB cap on JS
     // heap.
-    const keys = await resolveSelectedKeys();
-    if (keys.length === 0) return;
     const bucket = getBucket();
+    const keys = await resolveSelectedKeys(bucket);
+    if (keys.length === 0) return;
     const url = bulkZipDownloadUrl(keys.map((k) => `${bucket}/${k}`));
     const a = document.createElement('a');
     a.href = url;

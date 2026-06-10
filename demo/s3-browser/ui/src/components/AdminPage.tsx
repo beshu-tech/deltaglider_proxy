@@ -325,15 +325,18 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, accountMe
 
   // Check existing session on mount, or auto-login for IAM admins
   useEffect(() => {
+    let cancelled = false;
     setCheckingSession(true);
     setAccessDenied(false);
     setS3BrowserSessionOnly(false);
 
     (async () => {
       const info = await whoami();
+      if (cancelled) return;
       setExternalProviders(info.external_providers || []);
 
       const session = await checkSession();
+      if (cancelled) return;
       if (session.valid) {
         if (session.admin_gui) {
           if (info.user?.is_admin) {
@@ -359,6 +362,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, accountMe
         const sk = creds.secretAccessKey;
         if (ak && sk) {
           const result = await loginAs(ak, sk);
+          if (cancelled) return;
           if (result.ok) {
             setAuthed(true);
           } else {
@@ -367,8 +371,11 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, accountMe
         }
       }
 
+      if (cancelled) return;
       setCheckingSession(false);
     })();
+
+    return () => { cancelled = true; };
   }, []);
 
   const handleLogin = async () => {

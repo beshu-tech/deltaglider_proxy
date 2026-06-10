@@ -1,10 +1,14 @@
 import { HomeFilled } from '@ant-design/icons';
 import { prefixSegments } from '../utils';
-import { getBucket } from '../s3client';
 import { useColors } from '../ThemeContext';
 import { buildBrowserUrl } from '../urlState';
 
 interface Props {
+  /** The active bucket. Passed from the URL-derived source of truth — NOT read
+   *  from s3client module state, which can lag the URL on a fresh load and
+   *  produce wrong-bucket hrefs (middle-click / cmd-click would open the wrong
+   *  bucket in a new tab). */
+  bucket: string;
   prefix: string;
   onNavigate: (prefix: string) => void;
 }
@@ -23,11 +27,10 @@ const segmentBase: React.CSSProperties = {
   cursor: 'pointer',
 };
 
-export default function Breadcrumb({ prefix, onNavigate }: Props) {
+export default function Breadcrumb({ bucket, prefix, onNavigate }: Props) {
   const { TEXT_PRIMARY, TEXT_SECONDARY, TEXT_FAINT, ACCENT_BLUE } = useColors();
   const separatorStyle: React.CSSProperties = { color: TEXT_FAINT, margin: '0 6px', fontSize: 12, flexShrink: 0, userSelect: 'none' };
   const segments = prefixSegments(prefix);
-  const bucket = getBucket();
 
   // Real <a href> so middle-click / cmd-click open the folder in a new tab.
   // Plain left-click is intercepted (preventDefault) and routed through the

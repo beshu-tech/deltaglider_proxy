@@ -509,6 +509,7 @@ export default function App() {
         <Layout style={{ flex: 1, background: colors.BG_BASE }}>
           {!FULLSCREEN_VIEWS.has(view) && (
             <TopBar
+              bucket={activeBucket}
               prefix={s3.prefix}
               onNavigate={s3.navigate}
               isMobile={isMobile}

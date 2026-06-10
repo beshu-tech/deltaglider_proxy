@@ -332,11 +332,18 @@ function EfficiencyDashboard({
 }) {
   const colors = useColors();
   const [regressionsOnly, setRegressionsOnly] = useState(false);
-  // Per-prefix verification state. Map keyed by full s3:// URI so
-  // it stays meaningful across bucket switches (the dashboard
-  // remounts on bucket change anyway, but the URI is the canonical
-  // identifier).
+  // Per-prefix verification state, keyed by full s3:// URI. Cleared on
+  // response.bucket change by the effect below (the dashboard does NOT
+  // remount on a bucket switch, despite earlier comments to the contrary).
   const [verifyState, setVerifyState] = useState<Map<string, VerifyState>>(new Map());
+
+  // The dashboard does NOT remount on a bucket switch (it's rendered without a
+  // key and `response` isn't nulled on switch), so a verify result from the
+  // previous bucket would linger. Clear the Map whenever the response's bucket
+  // changes — `response.bucket` is the in-scope, canonical signal here.
+  useEffect(() => {
+    setVerifyState(new Map());
+  }, [response.bucket]);
 
   const totalReported = response.reported_deltaspaces;
   const actionable = counts.poor + counts.no_reference;

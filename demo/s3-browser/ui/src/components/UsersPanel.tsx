@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Button, Typography } from 'antd';
+import { Button, Typography, message } from 'antd';
 import { PlusOutlined, TeamOutlined, DeleteOutlined, CopyOutlined } from '@ant-design/icons';
 import { useQueryClient } from '@tanstack/react-query';
 import { getUsers } from '../adminApi';
@@ -99,7 +99,7 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
       setSelectedId(cloned.id);
       setNewCreds({ ak: cloned.access_key_id, sk: cloned.secret_access_key ?? '' });
     } catch (err) {
-      console.error('Duplicate user failed:', err);
+      message.error(err instanceof Error ? err.message : 'Duplicate user failed');
     } finally {
       onSavingChange?.(false);
     }

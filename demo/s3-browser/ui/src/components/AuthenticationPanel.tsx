@@ -109,8 +109,11 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
     try {
       const result = await previewMapping(previewEmail);
       setPreviewGroups(result.group_names);
-    } catch {
+    } catch (e) {
+      // Don't masquerade a request failure as "no matching rules" (an empty
+      // group list) — surface it so the operator can tell the two apart.
       setPreviewGroups([]);
+      message.error(e instanceof Error ? e.message : 'Mapping preview failed');
     }
   };
 

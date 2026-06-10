@@ -416,7 +416,10 @@ export default function InspectorPanel({
       try {
         url = await getPresignedUrl(reqKey, expiresInSeconds);
       } catch (e) {
-        console.warn('Presigned URL failed, falling back to direct URL:', e);
+        // Falling back to a direct URL is an expected, handled path — keep it
+        // off the console's error/warn channel (console.debug is hidden unless
+        // the operator opts into verbose levels).
+        console.debug('Presigned URL unavailable, using direct URL:', e);
         url = getObjectUrl(reqKey);
       }
       // Stale-commit guard: don't surface A's URL after the user moved to B.
