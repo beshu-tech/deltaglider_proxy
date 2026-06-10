@@ -1810,7 +1810,10 @@ mod tests {
             conditions: Some(serde_json::json!({"StringLike": "not-an-object"})),
         }];
         let err = validate_permissions(&perms).unwrap_err();
-        assert!(err.contains("condition could not be parsed"), "error: {err}");
+        assert!(
+            err.contains("condition could not be parsed"),
+            "error: {err}"
+        );
     }
 
     #[test]

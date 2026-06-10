@@ -1376,8 +1376,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         if let Ok(expected) = meta_result {
             if !expected.file_sha256.is_empty() {
                 let actual = hex::encode(Sha256::digest(&data));
-                if let Err(expected_sha256) =
-                    reference_integrity_ok(&actual, &expected.file_sha256)
+                if let Err(expected_sha256) = reference_integrity_ok(&actual, &expected.file_sha256)
                 {
                     // Do NOT cache corrupt bytes — fail fast so a single bad
                     // reference doesn't fan out into repeated reconstruction

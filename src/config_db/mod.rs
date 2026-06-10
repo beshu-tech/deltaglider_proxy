@@ -781,14 +781,14 @@ mod tests {
     #[test]
     fn is_safe_sql_ident_rejects_unsafe_input() {
         for bad in [
-            "",                        // empty
-            "1leading_digit",          // can't start with a digit
-            "has space",               // whitespace
-            "drop;table",              // statement separator
-            "col\"quoted",             // quote
-            "name--comment",           // SQL comment dashes
-            "tbl(arg)",                // parens
-            "naïve",                   // non-ascii
+            "",               // empty
+            "1leading_digit", // can't start with a digit
+            "has space",      // whitespace
+            "drop;table",     // statement separator
+            "col\"quoted",    // quote
+            "name--comment",  // SQL comment dashes
+            "tbl(arg)",       // parens
+            "naïve",          // non-ascii
         ] {
             assert!(!is_safe_sql_ident(bad), "{bad:?} should be rejected");
         }

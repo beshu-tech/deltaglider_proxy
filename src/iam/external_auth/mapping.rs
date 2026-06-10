@@ -142,7 +142,7 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 
     let mut pi = 0; // index into pattern
     let mut ti = 0; // index into text
-    // Backtrack anchors: position to resume matching after the most recent `*`.
+                    // Backtrack anchors: position to resume matching after the most recent `*`.
     let mut star_pi: Option<usize> = None;
     let mut star_ti = 0;
 

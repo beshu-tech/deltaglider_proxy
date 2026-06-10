@@ -433,7 +433,9 @@ mod tests {
             "service error: PreconditionFailed: At least one of the pre-conditions you specified did not hold"
         ));
         // MinIO / human-readable status text.
-        assert!(is_precondition_failed("unhandled error (Precondition Failed)"));
+        assert!(is_precondition_failed(
+            "unhandled error (Precondition Failed)"
+        ));
         // Raw HTTP status code.
         assert!(is_precondition_failed(
             "dispatch failure: response status: 412"
@@ -445,7 +447,9 @@ mod tests {
         assert!(!is_precondition_failed(
             "dispatch failure: connection refused"
         ));
-        assert!(!is_precondition_failed("NoSuchBucket: bucket does not exist"));
+        assert!(!is_precondition_failed(
+            "NoSuchBucket: bucket does not exist"
+        ));
         assert!(!is_precondition_failed(
             "service error: AccessDenied (status 403)"
         ));
