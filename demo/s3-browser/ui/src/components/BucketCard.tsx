@@ -81,8 +81,12 @@ export default function BucketCard({
         />
         {backends.length > 0 && (
           <Select
-            value={row.backend}
-            onChange={(v) => onChange({ backend: v })}
+            value={row.backend || undefined}
+            // AntD Select emits `undefined` on clear; BucketPolicyRow.backend is
+            // a non-optional string, so coerce back to '' (no-backend = route to
+            // the default). Passing undefined through corrupted the row and
+            // crashed resolveBackendFor's .trim().
+            onChange={(v) => onChange({ backend: v ?? '' })}
             placeholder="Route to..."
             allowClear
             size="small"

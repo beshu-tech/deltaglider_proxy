@@ -26,11 +26,13 @@ import type { BackendEncryptionSummary, BackendInfo } from './adminApi';
  *      resolvable target even when no named list is configured.
  */
 export function resolveBackendFor(
-  rowBackend: string,
+  rowBackend: string | null | undefined,
   backends: BackendInfo[],
   defaultBackend: string | null,
 ): BackendInfo | null {
-  const explicit = rowBackend.trim();
+  // Tolerate null/undefined: a bucket policy with no pinned backend, or an
+  // AntD Select cleared to `undefined`, must resolve to the default — never crash.
+  const explicit = (rowBackend ?? '').trim();
   if (explicit) {
     const match = backends.find((b) => b.name === explicit);
     if (match) return match;
