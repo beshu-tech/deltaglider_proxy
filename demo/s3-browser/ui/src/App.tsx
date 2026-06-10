@@ -28,7 +28,7 @@ import useComputeSize from './useComputeSize';
 import { NavigationContext } from './NavigationContext';
 import { canRequestPrefixUsageScan, canUse, writablePrefixesForBucket } from './permissions';
 import { useUrlRouter } from './useUrlRouter';
-import { buildViewUrl, type View } from './urlState';
+import { buildViewUrl, buildBrowserUrl, type View } from './urlState';
 
 const { Content } = Layout;
 const { useBreakpoint } = Grid;
@@ -78,6 +78,17 @@ export default function App() {
   // Fall back to the s3client module state during the brief window before the
   // first bucket is chosen / synced.
   const activeBucket = browser.bucket || getBucket();
+  // Canonicalize the URL once a bucket is active but absent from the path
+  // (landing at bare /_/browse: the Sidebar selects the first bucket into
+  // s3client module state, but nothing put it in the URL). Without the bucket
+  // segment, buildBrowserUrl drops the prefix, so folder clicks silently no-op
+  // until the user switches buckets. REPLACE (not push) so it doesn't add a
+  // spurious history entry. Fixes the v1.3.1 "folders don't open at /_/browse".
+  useEffect(() => {
+    if (view === 'browser' && !browser.bucket && activeBucket) {
+      navigate(buildBrowserUrl({ bucket: activeBucket }), { replace: true });
+    }
+  }, [view, browser.bucket, activeBucket, navigate]);
   const writablePrefixes = useMemo(
     () => writablePrefixesForBucket(identity, activeBucket),
     [identity, activeBucket],

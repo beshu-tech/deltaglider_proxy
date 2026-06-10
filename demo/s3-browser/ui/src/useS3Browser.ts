@@ -241,7 +241,11 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
   }, [object, objects]);
 
   const openInspector = useCallback((key: string) => {
-    navigateUrl(buildBrowserUrl({ bucket, prefix, q, object: key }));
+    // Fall back to the s3client's active bucket if the URL-derived bucket is
+    // still empty (e.g. landed at /_/browse before the URL gained the bucket
+    // segment). buildBrowserUrl drops everything when bucket is empty, which
+    // would otherwise no-op the navigation.
+    navigateUrl(buildBrowserUrl({ bucket: bucket || getBucket(), prefix, q, object: key }));
   }, [navigateUrl, bucket, prefix, q]);
 
   const closeInspector = useCallback(() => {
@@ -255,7 +259,11 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
   // drop any active search). Back returns to the parent folder. The URL change
   // re-derives prefix and triggers the reset + list effects above.
   const navigate = useCallback((newPrefix: string) => {
-    navigateUrl(buildBrowserUrl({ bucket, prefix: newPrefix }));
+    // Fall back to the s3client's active bucket when the URL-derived bucket is
+    // empty. At bare /_/browse, `bucket` is '' until the URL gains the segment;
+    // buildBrowserUrl({ bucket: '', ... }) drops the prefix and yields /_/browse,
+    // so a folder click would silently no-op (the v1.3.1 "folders don't open" bug).
+    navigateUrl(buildBrowserUrl({ bucket: bucket || getBucket(), prefix: newPrefix }));
   }, [navigateUrl, bucket]);
 
   // Bucket switch: PUSH; prefix + search reset to root of the new bucket.
