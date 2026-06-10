@@ -4,6 +4,54 @@
 
 ## v1.4.0 — 2026-06-10
 
+### Fixed — SigV4 replay handling no longer breaks retry-happy clients
+
+- **Idempotent reads (GET/HEAD) are no longer rejected as replays.** boto3
+  emits byte-identical SigV4 signatures for the same request issued (or
+  auto-retried) within one signing second, because SigV4 timestamps have
+  1-second granularity. A duplicate GET/HEAD within the replay window is now
+  served normally instead of returning `400 Request replay detected`; mutating
+  methods (PUT/POST/DELETE) stay strictly rejected.
+- **Replay rejections no longer count toward the auth-failure lockout.** A
+  replayed request carries a valid signature — it is not a credential failure.
+  It's now audited as `replay_rejected` and does not feed the per-IP
+  brute-force lockout, so a retry-happy client with a valid key can't self-DoS
+  its own production credentials. (`DGP_REPLAY_WINDOW_SECS=0` still disables
+  replay rejection entirely.)
+
+### Fixed — correctness & security hardening (multi-angle review)
+
+A broad review pass (correctness, simplification, optimization), with each
+finding independently verified, landed a batch of fixes:
+
+- **Form-POST replay cache** now batch-evicts the soonest-to-expire entries at
+  its hard cap instead of one-per-insert, so a unique-signature flood can't pin
+  the cache at the ceiling.
+- **Config-DB S3 sync** uses a conditional (compare-and-swap) PUT
+  (`If-Match` / `If-None-Match`) so two instances mutating IAM concurrently
+  can't silently overwrite each other; a precondition failure triggers a
+  re-pull instead of a lost write.
+- **Replication `run_now`** closes a TOCTOU window between the paused-flag check
+  and lease acquisition.
+- **Init wizard** rejects a half-specified TLS pair (cert without key, or vice
+  versa) that would otherwise write a non-bootable config.
+- **IAM permissions:** an unparseable condition now fails closed for both
+  effects (an Allow grants nothing; a Deny no longer silently broadens to an
+  unconditional deny), and is rejected at config-validation time.
+- Smaller fixes across the delta engine reference cache, lifecycle/replication
+  lease boundaries and event-consumer error handling, backup user-id
+  resolution, and several React admin panels (async-cancellation races,
+  stale-closure dialogs, name-keyed selection that could mis-target on rename).
+
+### Changed — docs accuracy
+
+- Corrected several customer-facing doc inaccuracies verified against the code:
+  the `DGP_TRUST_PROXY_HEADERS` default (`false`), the progressive rate-limit
+  delay table, the replay-window-vs-clock-skew distinction, the
+  `/_/health`·`/_/metrics`·`/_/stats` paths in the Docker docs, the container
+  image OCI labels (source URL + GPL-3.0-only license), and the marketing
+  quickstart's backend env vars.
+
 ## v1.3.1 — 2026-06-05
 
 ## v1.3.0 — 2026-06-05
