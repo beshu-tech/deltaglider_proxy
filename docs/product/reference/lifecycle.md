@@ -3,7 +3,7 @@
 Lifecycle expiration for engine-visible objects: delete old objects, or
 transition/archive them to another bucket/prefix.
 
-The admin UI exposes this under **Configuration → Storage → Object lifecycle**.
+The Settings UI exposes this on the **Jobs** screen (`/_/admin/jobs`) — one table for replication, lifecycle, and one-off maintenance jobs, with a per-rule drawer for definition, runs, and failures.
 Operators can edit YAML-backed rules, preview candidates without writing
 history rows, run a guarded execution, and inspect persisted history/failures.
 
@@ -56,15 +56,17 @@ HEAD when possible, and deletes the source only after the copy succeeds.
 
 ## Admin API
 
-All endpoints are session-gated.
+All endpoints are session-gated. Lifecycle shares the unified Jobs API: the
+job id is `lifecycle:<rule-name>`.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/_/api/admin/lifecycle` | List configured rules, global status, and per-rule runtime state |
-| `POST` | `/_/api/admin/lifecycle/rules/:name/preview` | Dry-run a rule and return candidate keys |
-| `POST` | `/_/api/admin/lifecycle/rules/:name/run-now` | Execute a rule synchronously; returns 409 if global/rule disabled or already running |
-| `GET` | `/_/api/admin/lifecycle/rules/:name/history?limit=N` | Recent persisted executions, newest first |
-| `GET` | `/_/api/admin/lifecycle/rules/:name/failures?limit=N` | Recent per-object failures, newest first |
+| `GET` | `/_/api/admin/jobs` | All jobs, lifecycle rules included: status, pause flag, runtime state |
+| `POST` | `/_/api/admin/jobs/lifecycle:<name>/preview` | Dry-run a rule and return candidate keys — read-only, no history rows, no leases |
+| `POST` | `/_/api/admin/jobs/lifecycle:<name>/run-now` | Execute a rule synchronously; 409 if global/rule disabled, paused, or already running |
+| `POST` | `/_/api/admin/jobs/lifecycle:<name>/pause` / `/resume` | Operator pause controls — persisted across restarts; paused rules are skipped by the scheduler and run-now alike |
+| `GET` | `/_/api/admin/jobs/lifecycle:<name>/runs?limit=N` | Recent persisted executions, newest first |
+| `GET` | `/_/api/admin/jobs/lifecycle:<name>/failures?limit=N` | Recent per-object failures, newest first |
 
 Run-now response:
 
@@ -140,6 +142,12 @@ The config DB stores:
 - `lifecycle_failures`: recent per-object failures, ring-bounded by `max_failures_retained` per rule.
 
 The scheduler uses a per-rule DB lease so multiple proxy instances sharing the same config DB do not execute the same lifecycle rule concurrently. A boot-time reconciliation marks runs left in `running` by a dead process as `failed` and records an operator-visible failure row.
+
+Runs persist a continuation cursor: a run interrupted by a crash or restart
+resumes from the stored cursor instead of rescanning from the top. A
+poison-token guard restarts the listing fresh exactly once if the stored
+cursor is rejected. Pause/resume state lives in the same row and survives
+restarts — parity with replication.
 
 ## Events
 

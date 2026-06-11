@@ -174,8 +174,8 @@ becomes the fallback for events that match no route.
 The top-level `slack_notify_kinds` + `slack_include/exclude_globs` are a global
 pre-filter (what's eligible at all); routes then decide which channels.
 
-All of this is editable from the admin GUI at **Configuration → Advanced →
-Webhook delivery** (toggle the format to *Slack*) — including a live preview of
+All of this is editable from the admin GUI at **Integrations →
+Event delivery** (toggle the format to *Slack*) — including a live preview of
 the message that will land in the channel.
 
 ## Admin API

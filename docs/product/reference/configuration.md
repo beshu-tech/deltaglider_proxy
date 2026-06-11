@@ -511,7 +511,7 @@ admission:
 
 Operator-authored `source_ip_list` entries round-trip verbatim (bare IPs stay bare, CIDRs stay CIDRs) so GitOps diffs don't flip on every apply.
 
-The admin GUI's Admission page (`/_/admin/configuration/admission`) is the authoring surface. Synthesized `public-prefix:*` blocks appear read-only below the operator list; edit them via Storage → Buckets instead.
+The admin GUI's Admission page (`/_/admin/access/admission`) is the authoring surface. Synthesized `public-prefix:*` blocks appear read-only below the operator list; edit them via Storage → Buckets instead.
 
 ---
 
@@ -699,7 +699,7 @@ When `public_prefixes` (or `public: true`) is set, anonymous users can GET, HEAD
 
 ## Lifecycle Rules
 
-Delete-only expiration rules live under `storage.lifecycle`. v1 is disabled by default and deletes only through the DeltaGlider engine.
+Expiration (delete) and transition/archive rules live under `storage.lifecycle`. Disabled by default; every delete and copy goes through the DeltaGlider engine.
 
 ```yaml
 storage:
@@ -718,7 +718,7 @@ storage:
         exclude_globs: [".deltaglider/**", "builds/golden/**"]
 ```
 
-Use `POST /_/api/admin/lifecycle/rules/:name/preview` before enabling a rule. See [Lifecycle Rules](lifecycle.md) for API details, skip rules, and v1 limitations.
+Use `POST /_/api/admin/jobs/lifecycle:<name>/preview` (or the Preview button on the Jobs screen) before enabling a rule. See [Lifecycle Rules](lifecycle.md) for API details, skip rules, and limitations.
 
 ---
 
@@ -796,8 +796,8 @@ advanced:
 | `slack_include_globs` / `slack_exclude_globs` | Key-glob pre-filter (exclude wins). |
 | `slack_routes` | Per-bucket / per-prefix → channel routing (**bot-token mode only**). When non-empty, an eligible event posts to every matching route; `slack_channel` is the fallback for events matching no route. |
 
-The whole thing is editable from the admin GUI at **Configuration → Advanced →
-Webhook delivery** (toggle the format to *Slack*). See [Event outbox](event-outbox.md#slack-notifications)
+The whole thing is editable from the admin GUI at **Integrations →
+Event delivery** (toggle the format to *Slack*). See [Event outbox](event-outbox.md#slack-notifications)
 for delivery semantics.
 
 ---

@@ -178,7 +178,7 @@ flowchart TD
 
 ### Create a group
 
-1. Admin GUI → **Groups** tab → **Create Group**
+1. Admin GUI → **Access → Groups** → **Create Group**
 2. Name: `ci-builders`
 3. Permissions:
 

@@ -53,7 +53,7 @@ storage:
     # Everything else hits the default (primary) backend.
 ```
 
-From the admin UI: **Configuration → Storage → Backends → + Add backend** and then on the per-bucket page, pick the backend from a dropdown.
+From the Settings UI: **Storage → Backends → + Add backend** and then on the per-bucket page, pick the backend from a dropdown.
 
 ## Alias (different bucket name on the backend)
 
@@ -154,7 +154,7 @@ PUT requests that would exceed the quota are rejected with 403. Quota is **soft*
 
 ## From the admin UI
 
-Everything above is also reachable from **Configuration → Storage → Buckets**. The UI round-trips through the same YAML, so changes made in the GUI show up in `/_/api/admin/config/export?section=storage` and vice versa.
+Everything above is also reachable from **Settings → Storage → Buckets** — a status-row page: each bucket is a row with its backend, origin, public access, and quota at a glance; expand a row to edit. The UI round-trips through the same YAML, so changes made in the GUI show up in `/_/api/admin/config/export?section=storage` and vice versa.
 
 ## Verification
 
@@ -179,7 +179,7 @@ If something doesn't behave as expected, check [Troubleshooting](41-troubleshoot
 ## Next steps
 
 - **Encrypt the backend.** Each backend carries an `encryption` block with four modes (`none`, `aes256-gcm-proxy`, `sse-kms`, `sse-s3`). Configure it in Admin → Storage → Backends, or add an `encryption: { mode: aes256-gcm-proxy, key: "${DGP_ENCRYPTION_KEY}" }` block to your YAML. See [reference/encryption-at-rest.md](reference/encryption-at-rest.md) for the decision tree and worked examples.
-- **Add IAM users.** The admin GUI at `/_/admin/configuration/access/users` — or via YAML + OAuth mapping rules. See [auth/31-sigv4-and-iam.md](auth/31-sigv4-and-iam.md).
+- **Add IAM users.** The admin GUI at `/_/admin/access/users` — or via YAML + OAuth mapping rules. See [auth/31-sigv4-and-iam.md](auth/31-sigv4-and-iam.md).
 - **Harden for production.** [20-production-security-checklist.md](20-production-security-checklist.md) covers SigV4, bootstrap password, rate limiting, TLS, and encryption at rest as a linear step-by-step.
 
 ## Related

@@ -174,7 +174,7 @@ Log level resolves in priority order:
 RUST_LOG=deltaglider_proxy=info,tower_http=warn deltaglider_proxy
 ```
 
-**Runtime changes without restart:** the admin UI (Settings → Advanced → Logging) hot-reloads the filter through the normal apply pipeline.
+**Runtime changes without restart:** the admin UI (Settings → System → Logging card) hot-reloads the filter through the normal apply pipeline.
 
 ## Performance knobs
 

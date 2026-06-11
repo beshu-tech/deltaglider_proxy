@@ -94,5 +94,5 @@ The object lands on disk under `./data/demo/`. The proxy automatically decides w
 - **Transparent delta compression** — repeated binary workloads stored as xdelta3 diffs against a reference; reconstructed on GET, byte-identical, SHA-256 verified.
 - **Multi-backend routing** — aggregate AWS S3, Hetzner, Backblaze, MinIO, and local filesystem behind one endpoint.
 - **Authentication** — SigV4 bootstrap, per-user IAM with ABAC permissions, or OAuth/OIDC.
-- **Admin UI** at `/_/` on the same port — file browser, user management, bucket policy, soft quotas, replication, backend config, Prometheus dashboard, analytics.
+- **Admin UI** at `/_/` on the same port — file browser, user management, bucket policy, soft quotas, background jobs (replication, lifecycle, re-encryption, migration), backend config, Prometheus dashboard, analytics. Press `?` anywhere for keyboard shortcuts, `⌘K` in Settings for the command palette.
 - **Single binary, single port** — no sidecars. The UI and API share port 9000.

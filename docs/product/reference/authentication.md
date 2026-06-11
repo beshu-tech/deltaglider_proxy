@@ -187,7 +187,7 @@ The proxy refuses to implicitly create a bucket as a side effect of a PUT. Even 
 
 Users can be organized into **groups** with shared permission rules. Group permissions are merged with the user's direct permissions at evaluation time.
 
-Groups are managed via the admin GUI (**Admin Settings > Groups**). OAuth group mapping rules automatically add users to groups on login.
+Groups are managed via the admin GUI (**Access → Groups**). OAuth group mapping rules automatically add users to groups on login.
 
 ## OAuth/OIDC Configuration
 
@@ -195,7 +195,7 @@ Groups are managed via the admin GUI (**Admin Settings > Groups**). OAuth group 
 
 ### Setting Up a Provider
 
-1. Open the admin GUI → **Admin Settings** → **Authentication**
+1. Open the admin GUI → **Access** → **External authentication**
 2. Click **Add Provider** and select the provider type (Google, OIDC Generic)
 3. Enter the required fields:
    - **Client ID** — from your identity provider's OAuth app

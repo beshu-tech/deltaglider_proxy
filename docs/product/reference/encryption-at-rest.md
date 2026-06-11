@@ -296,13 +296,28 @@ Truncation, reorder, and tamper attempts on proxy-AES objects all fail hard at G
 
 Changing the `key` on a backend makes objects written under the old key **unreadable** until the old key is restored OR the shim is configured.
 
-The shim (§Mode transitions) covers the proxy→native transition cleanly. Within the same mode — rotating a proxy-AES key to a NEW proxy-AES key — DeltaGlider does not ship a background re-encryption worker. Rotation either:
-- restore the old key as `legacy_key` + keep the new one as `key` (read shim works, but only for two generations at a time), or
-- create a new backend with the new key, copy objects through the proxy, retire the old backend.
+The shim (§Mode transitions) covers the proxy→native transition cleanly.
+Within the same mode — rotating a proxy-AES key to a NEW proxy-AES key —
+three paths exist:
+
+- restore the old key as `legacy_key` + keep the new one as `key` (read shim
+  works, but only for two generations at a time), then run a **Re-encrypt
+  job** (Jobs → + New job → Re-encrypt buckets…, or
+  `POST /_/api/admin/jobs/reencrypt`) to rewrite every object under the new
+  key, then clear `legacy_key`;
+- keep the shim indefinitely and let objects re-encrypt lazily as they are
+  rewritten; or
+- create a new backend with the new key, migrate the buckets
+  (`POST /_/api/admin/buckets/:bucket/migrate`), retire the old backend.
+
+The Re-encrypt job is durable and resumable (it survives a proxy restart),
+cancellable, and **write-gated**: while it runs, S3 writes to the bucket get
+`503 SlowDown` so a racing PUT can never land under the old key; reads are
+unaffected.
 
 ### Enabling is not retroactive
 
-Turning on encryption on a backend does not encrypt existing objects. Only new writes go through the encrypting wrapper.
+Turning on encryption on a backend does not encrypt existing objects automatically — only new writes go through the encrypting wrapper. To bring historical objects under the new mode, run a Re-encrypt job (the Backends page proposes one when you enable or change encryption): it rewrites every object whose stored encryption markers don't match the backend's configured mode, with writes to the bucket gated (503 SlowDown) for the duration.
 
 ### The global `advanced.encryption_key` is gone
 
@@ -394,6 +409,8 @@ aws s3 sync --endpoint http://proxy:9000 \
 ```
 
 Step 3 — Re-route the bucket alias to the new backend. Delete the old backend. `DGP_OLD_KEY` can now be forgotten.
+
+The copy step is a built-in job: **Storage → Buckets → (bucket) → Migrate data…** or `POST /_/api/admin/buckets/:bucket/migrate` with the new backend as `target_backend`. The job is durable, resumable, cancellable pre-flip, and write-gates the bucket so no client write races the copy.
 
 ### (C) Migrate from proxy-AES to SSE-KMS on an existing backend
 
@@ -555,7 +572,7 @@ Nothing. Once `legacy_key` is cleared from the config, reads of objects stamped 
 
 ### Is there a background worker that re-encrypts old objects after rotation?
 
-Not in this release. The `legacy_key` shim keeps the old key accessible for reads while new writes use the new key; operators re-encrypt lazily (by re-writing objects) or explicitly (rotation recipe B — copy-through-migration). A true background worker is a possible future add, not a current feature.
+Yes — as an explicit one-off job, not an always-on daemon. Start it from the Jobs screen (**+ New job → Re-encrypt buckets…**) or `POST /_/api/admin/jobs/reencrypt`. It rewrites every object that doesn't match the backend's current encryption config (encrypt, decrypt, or key change), is durable and resumable across restarts, and gates writes to the bucket (503 SlowDown) while it runs so no write can race the rewrite. For key rotation, configure the `legacy_key` shim first so the job can still read the old generation, then clear the shim once the job succeeds.
 
 ### Why are metadata (`x-amz-meta-*`) headers plaintext?
 

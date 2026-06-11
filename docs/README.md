@@ -17,7 +17,7 @@ See [product/README.md](product/README.md) — that file is also the landing pag
 2. **Deploy to production** — deployment, security checklist, upgrade guide
 3. **Authentication & access** — OAuth, SigV4, IAM, rate limiting
 4. **Day 2 operations** — monitoring, troubleshooting, FAQ, replication, lifecycle, event outbox
-5. **Reference** — config fields, admin API, metrics, lifecycle, replication, event delivery, internals
+5. **Reference** — config fields, admin API, metrics, jobs, lifecycle, replication, event delivery, internals
 
 ## Dev docs
 

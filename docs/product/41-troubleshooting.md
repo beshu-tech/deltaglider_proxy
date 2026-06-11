@@ -89,12 +89,22 @@ the reverse-proxy timeout still has to be raised.
 
 ## 503 SlowDown on PUT
 
-The proxy doesn't generate 503 itself — this comes from the upstream S3 backend when it's throttling you. Two tuning knobs:
+Unless a maintenance job is write-gating the bucket (see the next entry), the proxy doesn't generate 503 itself — this comes from the upstream S3 backend when it's throttling you. Two tuning knobs:
 
 1. **`DGP_MAX_MULTIPART_UPLOADS`** (default 1000) — limits concurrent multiparts in flight. Lowering this reduces the proxy's burst pressure on the backend.
 2. **`DGP_CODEC_CONCURRENCY`** — limits xdelta3 subprocess permits. When this saturates, PUTs queue on delta encoding; the backend isn't the bottleneck.
 
 Check `/_/metrics` → `deltaglider_codec_semaphore_available` (`0` = saturated) and `deltaglider_delta_encode_duration_seconds` for codec pressure. If codec is saturated, bump `DGP_CODEC_CONCURRENCY`.
+
+## Writes to one bucket return 503 SlowDown
+
+A maintenance job (re-encryption or migration) is running on that bucket.
+Writes are intentionally gated while the job rewrites objects — SDKs retry
+automatically and succeed once the job finishes. Reads are unaffected. Check
+**Settings → Jobs** (or `GET /_/api/admin/jobs`) for the job's progress; cancel
+it if it shouldn't be running. If a job is stuck, it survives restarts by
+design — cancel it via `POST /_/api/admin/jobs/maintenance:<id>/cancel` rather
+than restarting the proxy.
 
 ## Cache miss storm on GET
 

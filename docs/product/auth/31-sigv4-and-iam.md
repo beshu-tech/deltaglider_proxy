@@ -43,7 +43,7 @@ Every SigV4-signed request is replay-protected (5-second window) and clock-skew-
 
 ## Step 2: Create IAM users
 
-Admin Settings → **Access** → **Users** → **+ Add user**.
+Settings → **Access** → **Users** → **+ Add user**.
 
 | Field | Meaning |
 |---|---|
@@ -159,7 +159,7 @@ This is what the built-in Administrators group carries.
 
 ### Canned policy templates
 
-Admin Settings → **Access** → **Users** → **Apply template**:
+Settings → **Access** → **Users** → **Apply template**:
 
 - **Read-only** — `read, list` on every resource.
 - **Developer** — `read, write, list` on every resource.

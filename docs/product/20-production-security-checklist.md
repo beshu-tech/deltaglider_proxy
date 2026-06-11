@@ -128,7 +128,7 @@ DGP_BOOTSTRAP_PASSWORD_HASH=JDJiJDEyJENYbDVPRm84bDg2...
 
 **Why:** No shared credentials to leak. No keys to rotate manually. New hires get access on first login. Departing employees lose access when their IdP account is disabled.
 
-1. Open the admin GUI → **Admin Settings** → **Authentication**
+1. Open the admin GUI → **Access** → **External authentication**
 2. Click **Add Provider** (e.g., Google OIDC)
 3. Enter Client ID, Client Secret, and Issuer URL from your identity provider
 4. Add **Mapping Rules** to auto-assign permissions:
@@ -149,9 +149,9 @@ OAuth users get auto-provisioned IAM accounts on first login. Their group member
 
 **Why:** Release artifacts, public docs, or shared assets that should be accessible via a simple URL — no S3 credentials, no OAuth, just `curl`.
 
-1. Go to **Admin Settings** → **Backends**
-2. Find the bucket policy card (or create one)
-3. Under **Public Prefixes**, add the folder paths (e.g., `builds/`, `releases/`)
+1. Go to **Settings → Storage → Buckets**
+2. Expand the bucket's row (or add the bucket)
+3. Under **Anonymous read access**, pick *Specific prefixes* and add the folder paths (e.g., `builds/`, `releases/`)
 4. Save
 
 Anonymous users can now GET/HEAD/LIST objects under those prefixes. Writes still require authentication.

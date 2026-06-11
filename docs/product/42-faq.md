@@ -173,7 +173,7 @@ See [reference/encryption-at-rest.md](reference/encryption-at-rest.md) for the f
 
 ### Does enabling encryption re-encrypt my existing objects?
 
-No. The marker-based dispatch means old plaintext objects continue to be served as plaintext; only new writes go through the encrypt path. If you want to encrypt historical objects, copy them through the proxy to themselves (that's a rewrite, which routes through the new encrypt path).
+Not automatically. The marker-based dispatch means old plaintext objects continue to be served as plaintext; only new writes go through the encrypt path. To encrypt historical objects, run a **Re-encrypt job** (Settings → Jobs → + New job → Re-encrypt buckets…, or `POST /_/api/admin/jobs/reencrypt`). It rewrites every mismatched object, survives restarts, and blocks writes to the bucket (503 SlowDown) while it runs so nothing slips through under the old config. The Backends page offers to start one whenever you change a backend's encryption.
 
 ### Can I use cheap or untrusted S3-compatible storage safely?
 
@@ -193,10 +193,10 @@ This is why you should **store the key off-box** (secrets manager, password vaul
 
 ### How do I rotate a proxy-AES key?
 
-Not automatic. Two recipes, documented in [reference/encryption-at-rest.md §Rotation recipes](reference/encryption-at-rest.md#rotation-recipes):
+Two recipes, documented in [reference/encryption-at-rest.md §Rotation recipes](reference/encryption-at-rest.md#rotation-recipes):
 
-- **Shim-assisted (minimum downtime)** — keep the old key as `legacy_key`, put the new key in `key`. Reads try the new key first and fall back to the shim; new writes use the new key.
-- **Data migration (no runtime shim)** — create a new backend with the new key, copy through the proxy, retire the old backend.
+- **Shim-assisted** — keep the old key as `legacy_key`, put the new key in `key`, then run a Re-encrypt job to rewrite everything under the new key and clear the shim.
+- **Data migration (no runtime shim)** — create a new backend with the new key, migrate the buckets with the built-in Migrate job (`POST /_/api/admin/buckets/:bucket/migrate`), retire the old backend.
 
 ### Does compression still work with encryption enabled?
 

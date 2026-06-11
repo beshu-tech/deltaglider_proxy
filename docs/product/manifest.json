@@ -34,6 +34,7 @@
     { "path": "reference/how-delta-works", "group": "Reference", "order": 40 },
     { "path": "reference/encryption-at-rest", "group": "Reference", "order": 50 },
     { "path": "reference/declarative-iam", "group": "Reference", "order": 60 },
+    { "path": "reference/jobs", "group": "Reference", "order": 65 },
     { "path": "reference/replication", "group": "Reference", "order": 70 },
     { "path": "reference/lifecycle", "group": "Reference", "order": 80 },
     { "path": "reference/event-outbox", "group": "Reference", "order": 90 }

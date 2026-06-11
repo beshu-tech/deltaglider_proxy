@@ -228,7 +228,7 @@ groups:
 
 ## Built-in admin dashboard
 
-The admin UI ships a live monitoring page at `/_/admin/diagnostics/dashboard` — same metrics, auto-refreshed every 5s, with a storage-analytics tab that surfaces per-bucket savings and estimated cost. It's not a substitute for a proper Grafana setup in production (no historical retention, no alerting), but it's enough to answer "is the proxy healthy right now?" without leaving the UI.
+The admin UI ships a live monitoring page at `/_/admin/dashboard` — same metrics, auto-refreshed every 5s, with a storage-analytics tab that surfaces per-bucket savings and estimated cost. It's not a substitute for a proper Grafana setup in production (no historical retention, no alerting), but it's enough to answer "is the proxy healthy right now?" without leaving the UI.
 
 ## Related
 

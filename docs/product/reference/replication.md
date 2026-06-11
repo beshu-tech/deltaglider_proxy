@@ -2,7 +2,7 @@
 
 *Engine-routed source → destination object copy, transparent to
 per-backend encryption and delta compression. Replication is
-**event-driven** (v1.2.0): object mutations are copied in near-real
+**event-driven**: object mutations are copied in near-real
 time, with a slow full reconcile as the self-healing safety net.
 Ships run-now, pause/resume, state, history, and delete replication.*
 
@@ -96,16 +96,21 @@ key in the `replication_state` DB table.
 ## Admin API
 
 All endpoints are session-gated (no IAM gating — replication is
-operator-level storage config). Response shapes are JSON.
+operator-level storage config). Replication shares the unified Jobs API:
+the job id is `replication:<rule-name>`.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/_/api/admin/replication` | Overview: global + per-rule state. |
-| `POST` | `/_/api/admin/replication/rules/:name/run-now` | Trigger a synchronous run. Returns 409 Conflict on a paused rule. |
-| `POST` | `/_/api/admin/replication/rules/:name/pause` | Set paused=true. Persists across restarts. |
-| `POST` | `/_/api/admin/replication/rules/:name/resume` | Clear the paused flag. |
-| `GET` | `/_/api/admin/replication/rules/:name/history?limit=N` | Recent runs (default 20, max 100), including `triggered_by` (`scheduler`, `run-now`, or `unknown` for legacy rows). |
-| `GET` | `/_/api/admin/replication/rules/:name/failures?limit=N` | Recent per-object failures. |
+| `GET` | `/_/api/admin/jobs` | All jobs, replication rules included: state, pause flag, lifetime counters, last run. |
+| `POST` | `/_/api/admin/jobs/replication:<name>/run-now` | Trigger a synchronous run. Returns 409 Conflict on a paused or already-leased rule. |
+| `POST` | `/_/api/admin/jobs/replication:<name>/pause` | Set paused=true. Persists across restarts. |
+| `POST` | `/_/api/admin/jobs/replication:<name>/resume` | Clear the paused flag. |
+| `GET` | `/_/api/admin/jobs/replication:<name>/runs?limit=N` | Recent runs (default 20, max 100), including `triggered_by`. |
+| `GET` | `/_/api/admin/jobs/replication:<name>/failures?limit=N` | Recent per-object failures. |
+
+The Settings GUI surface is the **Jobs** screen (`/_/admin/jobs`) — one
+table for replication, lifecycle, and one-off maintenance jobs, with a
+per-job drawer (Definition / Runs / Failures).
 
 ### Run-now response
 
@@ -210,6 +215,9 @@ means:
 | All copies error out | Run marked `failed` even if some objects were skipped legitimately. |
 | Some copies error, some succeed | Run marked `succeeded` with `errors > 0` — lazy-sync catches up on the next tick. |
 
-## Deferred
+## Resumption
 
-- Continuation-token resumption for long runs that straddle ticks.
+Long runs persist a continuation cursor, so a run interrupted mid-page (crash,
+restart) resumes where it left off instead of restarting from the top. A
+poison-token guard restarts a run fresh exactly once if the stored token is
+rejected by the backend.

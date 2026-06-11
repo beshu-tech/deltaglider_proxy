@@ -77,6 +77,7 @@ deltaglider_proxy config apply deltaglider_proxy.yaml --server https://dgp.examp
 | `DELETE` | `/_/api/admin/backends/:name` | Remove — refuses to delete the default or in-use backends |
 | `POST` | `/_/api/admin/test-s3` | Test an arbitrary S3 connection without persisting |
 | `GET` / `POST` | `/_/api/admin/buckets` | List bucket origins / create a bucket on a backend |
+| `POST` | `/_/api/admin/buckets/:bucket/migrate` | Move a bucket's data to another backend as a durable, write-gated job — see [Jobs](#jobs--one-surface-for-everything-background) |
 
 ## IAM (gated by `iam_mode`)
 
@@ -163,36 +164,37 @@ Server-side helpers behind the embedded S3 browser's bulk actions.
 | `POST` | `/_/api/admin/objects/delete` | Bulk delete selected objects |
 | `GET` | `/_/api/admin/objects/zip` | Stream selected objects as a ZIP |
 
-## Replication
+## Jobs — one surface for everything background
 
-Lazy bucket replication via the engine. Rules are YAML-authoritative
-under `storage.replication.rules[]`; runtime state lives in the
-config DB. See [replication.md](replication.md) for the full shape.
-
-| Method | Path | Purpose |
-|---|---|---|
-| `GET` | `/_/api/admin/replication` | Rules + current state overview |
-| `POST` | `/_/api/admin/replication/rules/:name/run-now` | Synchronous run. 409 on a paused rule. |
-| `POST` | `/_/api/admin/replication/rules/:name/pause` / `/resume` | Operator pause controls (persisted across restarts). |
-| `GET` | `/_/api/admin/replication/rules/:name/history?limit=N` | Recent run records, newest first. |
-| `GET` | `/_/api/admin/replication/rules/:name/failures?limit=N` | Recent per-object failures, newest first. |
-
-## Lifecycle
-
-Delete-only lifecycle expiration via the engine. Rules are YAML-authoritative
-under `storage.lifecycle.rules[]`; v1 has preview/run-now and a conservative
-disabled-by-default scheduler. See [lifecycle.md](lifecycle.md) for the full
-shape and guardrails.
+Replication rules, lifecycle rules, and one-off maintenance jobs (re-encrypt,
+bucket migration) share a single read+action API. Job ids are namespaced:
+`replication:<rule>`, `lifecycle:<rule>`, `maintenance:<n>`. Rules stay
+YAML-authoritative under `storage.replication.rules[]` / `storage.lifecycle.rules[]`;
+maintenance one-offs are DB-born. See [replication.md](replication.md) and
+[lifecycle.md](lifecycle.md) for rule shapes and guardrails.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/_/api/admin/lifecycle` | Global status + configured rule overview. |
-| `POST` | `/_/api/admin/lifecycle/rules/:name/preview` | Dry-run a rule and return candidate keys without deleting. |
-| `POST` | `/_/api/admin/lifecycle/rules/:name/run-now` | Execute a rule synchronously. 409 when lifecycle/rule is disabled or already running. |
-| `GET` | `/_/api/admin/lifecycle/rules/:name/history?limit=N` | Recent persisted lifecycle executions, newest first. |
-| `GET` | `/_/api/admin/lifecycle/rules/:name/failures?limit=N` | Recent per-object lifecycle failures, linked to `run_id`. |
+| `GET` | `/_/api/admin/jobs` | Every job as one normalized row: kind, scope, status (`idle` / `queued` / `running` / `cancelling` / `succeeded` / `failed` / `cancelled`), pause flag, progress, last run. |
+| `GET` | `/_/api/admin/jobs/:id/runs?limit=N` | Recent runs, newest first. A maintenance one-off synthesizes a single run — the job IS its run. |
+| `GET` | `/_/api/admin/jobs/:id/failures?limit=N` | Recent per-object failures, newest first. |
+| `POST` | `/_/api/admin/jobs/:id/pause` / `/resume` | Replication and lifecycle rules. Persists across restarts. |
+| `POST` | `/_/api/admin/jobs/:id/run-now` | Replication and lifecycle rules. Synchronous; 409 when paused or already leased. |
+| `POST` | `/_/api/admin/jobs/:id/preview` | Lifecycle only — dry-run candidate keys. Read-only: no deletes, no history rows. |
+| `POST` | `/_/api/admin/jobs/:id/cancel` | Maintenance only — cancel a queued or running one-off. A pre-flip migrate cancel unwinds cleanly. |
+| `POST` | `/_/api/admin/jobs/reencrypt` | `{"buckets": [...]}` (max 100) → one durable re-encrypt job per bucket: `{started: [{bucket, job_id}], errors: [...]}`. |
+| `POST` | `/_/api/admin/buckets/:bucket/migrate` | `{"target_backend": "...", "delete_source": false}` → `202 Accepted` + `{job_id, id: "maintenance:<n>", bucket, from_backend, to_backend}`. |
+| `GET` | `/_/api/admin/jobs/bucket/:bucket` | The bucket's active maintenance job, if any — status/phase/counts only, no config detail. Session-light: browser-lift sessions can read it (powers the busy banner in the object browser). |
 
-Preview is intentionally read-only: it does not create history rows. Scheduler and run-now executions persist history/failure rows in the config DB and use per-rule leases to avoid duplicate deletes across instances sharing that DB.
+Actions outside a kind's capability matrix return `405` with the supported
+list. Lifecycle preview is intentionally read-only; scheduler and run-now
+executions persist history/failure rows in the config DB and use per-rule
+leases so instances sharing the DB never double-execute.
+
+**Write gate:** while a re-encrypt or migrate job is active, S3 **writes** to
+that bucket return `503 SlowDown` (SDKs back off and retry); reads pass
+untouched. The gate engages at job creation and lifts when the job finishes
+(for migrations, the moment the bucket flips to the new backend).
 
 ## Resource limits (env vars)
 
@@ -205,17 +207,23 @@ Preview is intentionally read-only: it does not create history rows. Scheduler a
 | `DGP_AUDIT_RING_SIZE` | `500` | In-memory audit ring capacity. |
 | `DGP_SESSION_TTL_HOURS` | `4` | Admin session cookie lifetime. |
 
-## Admin GUI keyboard shortcuts
+## Keyboard shortcuts (app-wide)
 
-Reachable via `?` in any admin page.
+Reachable via `?` anywhere in the UI (when focus is not in an input). `⌘` is `Ctrl` on non-Apple platforms.
 
-| Key | Action |
-|---|---|
-| `⌘K` / `Ctrl+K` | Command palette (fuzzy nav + shell actions) |
-| `⌘S` / `Ctrl+S` | Apply the currently-visible dirty section |
-| `?` | This shortcuts reference |
-| `Esc` | Close palette / modal |
-| `↑` / `↓` + `Enter` | Navigate + run inside the palette |
+| Key | Scope | Action |
+|---|---|---|
+| `⌘,` | Global | Open Settings |
+| `⌘/` | Global | Open Docs |
+| `?` | Global | This shortcuts reference |
+| `↑` / `↓` | Object browser | Move between objects and folders |
+| `Enter` / `→` | Object browser | Open folder / inspect object |
+| `←` / `Backspace` | Object browser | Go up one folder |
+| `Home` / `End` | Object browser | Jump to first / last row |
+| `Esc` | Object browser | Close inspector, or go up one folder |
+| `⌘K` | Settings | Command palette (fuzzy nav + shell actions) |
+| `⌘S` | Settings | Apply the currently-visible dirty section |
+| `↑` / `↓` + `Enter`, `Esc` | Palette | Navigate / run / close |
 
 ## Operational endpoints (no admin prefix)
 

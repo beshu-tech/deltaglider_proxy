@@ -58,7 +58,7 @@ Any provider with a `.well-known/openid-configuration` endpoint works. You'll ne
 
 ## Step 2: Add the provider in the admin UI
 
-Admin Settings → **Configuration** → **Access** → **External authentication** → **+ Add provider**.
+Settings → **Access** → **External authentication** → **+ Add provider**.
 
 ![OAuth provider and group mapping settings](/_/screenshots/oauth_group_mapping.jpg)
 
@@ -82,7 +82,7 @@ Click **Save**. The UI immediately shows "Sign in with &lt;provider&gt;" on the 
 
 Identity claims from the provider determine which IAM group(s) a user lands in. Example: "every identity with `hd: beshu.com` in their Google claims gets added to the `developers` IAM group."
 
-Admin Settings → **Access** → **External authentication** → **Mapping rules** → **+ Add rule**.
+Settings → **Access** → **External authentication** → **Mapping rules** → **+ Add rule**.
 
 | Field | Meaning |
 |---|---|

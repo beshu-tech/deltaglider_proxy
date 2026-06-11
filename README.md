@@ -35,7 +35,7 @@ Clients see standard S3. They don't know which backend stores their bucket. They
 ![Storage backends — multi-backend routing with per-bucket policies](docs/screenshots/storage_backends.jpg)
 
 - **Multi-backend routing** — Route each bucket to a different storage backend (AWS S3, Hetzner, Backblaze, MinIO, filesystem). Mix and match providers behind one endpoint.
-- **Bucket aliasing** — Present virtual bucket names to clients while mapping to real buckets on backends. Migrate between providers without changing a single client config.
+- **Bucket aliasing & migration** — Present virtual bucket names to clients while mapping to real buckets on backends. One-click bucket migration between backends as a durable, resumable, write-gated job — move providers without changing a single client config.
 - **Single endpoint** — Clients point at one URL. The proxy resolves which backend to use per bucket, transparently.
 - **Hot-reloadable** — Add backends, change routing, update policies — all from the admin GUI, no restart needed.
 
@@ -71,8 +71,10 @@ Everything managed from a web UI served on the same port as the S3 API — no ex
 - **OAuth configuration** — Add identity providers, configure group mapping rules, test SSO flows
 - **Backend management** — Add/remove storage backends, configure per-bucket routing, aliasing, compression policies, and public prefixes
 - **Bucket controls** — Configure soft quotas, read-only bucket freeze, public prefixes, aliases, and compression policy
-- **Object lifecycle** — Preview and run delete-only expiration rules, with scheduler history/failures and engine-routed deletes
+- **Object lifecycle** — Preview and run expiration and transition/archive rules, with pause/resume, crash-resume, scheduler history/failures, and engine-routed deletes
 - **Object replication** — Configure source → destination replication rules, all from the GUI: event-driven (mutations replicate in near-real time, with a slow full-reconcile safety net), run-now, pause/resume, history/failures, and delete replication
+- **One Jobs screen** — Replication, lifecycle, re-encryption, and migrations in one table with per-job runs, failures, progress, pause/resume, and cancel
+- **Bucket re-encryption** — Enable or rotate at-rest encryption, then rewrite existing objects with a one-off durable job; writes are gated (503 SlowDown) so nothing races the rewrite
 - **Event outbox & notifications** — Durable object mutation events with background webhook delivery, fan-out endpoints, retry backoff, and failed-row requeue — all GUI-editable. Built-in **Slack** formatting: post object events to a channel via an Incoming Webhook URL or a bot token, with per-bucket/prefix → channel routing
 - **Monitoring dashboard** — Live Prometheus metrics: request rates, latencies, cache hit rates, status codes, auth events
 - **Storage analytics** — Per-bucket savings breakdown, estimated monthly cost savings, compression opportunity detection
@@ -207,7 +209,7 @@ Silence the warning mid-migration with `DGP_SILENCE_TOML_DEPRECATION=1`. See the
 | **Conditional** | If-Match, If-None-Match (304), If-Modified-Since, If-Unmodified-Since (412) |
 | **Range** | Range requests (206 Partial Content) |
 | **Validation** | Content-MD5 on PUT/UploadPart |
-| **Lifecycle** | Delete-only expiration rules via scheduler, preview, run-now, and history/failures |
+| **Lifecycle** | Expiration and transition/archive rules via scheduler, preview, run-now, pause/resume, and history/failures |
 
 Not implemented: versioning, storage-class transitions, object lock.
 
