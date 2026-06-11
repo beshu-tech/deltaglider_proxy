@@ -24,16 +24,18 @@ import DOCKER_COMPOSE from '../../../../docs/product/23-docker-compose.md?raw';
 import OAUTH_SETUP from '../../../../docs/product/auth/30-oauth-setup.md?raw';
 import SIGV4_IAM from '../../../../docs/product/auth/31-sigv4-and-iam.md?raw';
 import IAM_CONDITIONS from '../../../../docs/product/auth/32-iam-conditions.md?raw';
-import RATE_LIMITING from '../../../../docs/product/auth/33-rate-limiting.md?raw';
+import REF_RATE_LIMITS from '../../../../docs/product/reference/rate-limits.md?raw';
 import MONITORING from '../../../../docs/product/40-monitoring-and-alerts.md?raw';
 import TROUBLESHOOTING from '../../../../docs/product/41-troubleshooting.md?raw';
 import FAQ from '../../../../docs/product/42-faq.md?raw';
 import REF_CONFIGURATION from '../../../../docs/product/reference/configuration.md?raw';
 import REF_ADMIN_API from '../../../../docs/product/reference/admin-api.md?raw';
 import REF_AUTHENTICATION from '../../../../docs/product/reference/authentication.md?raw';
+import REF_IAM_PERMISSIONS from '../../../../docs/product/reference/iam-permissions.md?raw';
+import REF_CLI from '../../../../docs/product/reference/cli.md?raw';
 import REF_METRICS from '../../../../docs/product/reference/metrics.md?raw';
 import REF_DELTA from '../../../../docs/product/reference/how-delta-works.md?raw';
-import REF_ENCRYPTION from '../../../../docs/product/reference/encryption-at-rest.md?raw';
+import REF_ENCRYPTION from '../../../../docs/product/reference/encryption.md?raw';
 import REF_DECLARATIVE_IAM from '../../../../docs/product/reference/declarative-iam.md?raw';
 import REF_JOBS from '../../../../docs/product/reference/jobs.md?raw';
 import REF_REPLICATION from '../../../../docs/product/reference/replication.md?raw';
@@ -64,16 +66,18 @@ const CONTENT_BY_PATH: Record<string, string> = {
   'auth/30-oauth-setup': OAUTH_SETUP,
   'auth/31-sigv4-and-iam': SIGV4_IAM,
   'auth/32-iam-conditions': IAM_CONDITIONS,
-  'auth/33-rate-limiting': RATE_LIMITING,
+  'reference/rate-limits': REF_RATE_LIMITS,
   '40-monitoring-and-alerts': MONITORING,
   '41-troubleshooting': TROUBLESHOOTING,
   '42-faq': FAQ,
   'reference/configuration': REF_CONFIGURATION,
   'reference/admin-api': REF_ADMIN_API,
   'reference/authentication': REF_AUTHENTICATION,
+  'reference/iam-permissions': REF_IAM_PERMISSIONS,
+  'reference/cli': REF_CLI,
   'reference/metrics': REF_METRICS,
   'reference/how-delta-works': REF_DELTA,
-  'reference/encryption-at-rest': REF_ENCRYPTION,
+  'reference/encryption': REF_ENCRYPTION,
   'reference/declarative-iam': REF_DECLARATIVE_IAM,
   'reference/jobs': REF_JOBS,
   'reference/replication': REF_REPLICATION,

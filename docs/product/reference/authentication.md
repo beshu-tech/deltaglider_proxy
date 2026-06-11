@@ -1,350 +1,150 @@
 # Authentication and access
 
-DeltaGlider Proxy supports multiple authentication methods: **SigV4** (standard S3 auth), **OAuth/OIDC** (Google, Okta, Azure AD), and **public prefixes** (anonymous read access). These can be combined — OAuth users get IAM permissions via group mapping, while specific folders are optionally published for unauthenticated download.
+Reference for the proxy's authentication modes, the bootstrap password, SigV4 verification, backend credentials, client configuration, anonymous access, and error responses.
 
-## Auth Modes
+## Authentication modes
 
-### Bootstrap Mode (default on fresh install)
+| Mode | Activated by | What is verified |
+|------|--------------|------------------|
+| **Bootstrap** | A single credential pair in `access.access_key_id` / `access.secret_access_key` (env: `DGP_ACCESS_KEY_ID` / `DGP_SECRET_ACCESS_KEY`). Default on a fresh install. | SigV4 signature against the shared secret. Admin GUI access requires the bootstrap password. |
+| **IAM** | One or more IAM users in the encrypted config DB (`deltaglider_config.db`). Activates when the first user is created — via admin GUI, declarative YAML, or OAuth auto-provisioning. | SigV4 signature against the per-user secret looked up by access key ID, then ABAC permission evaluation. Admin GUI access is permission-based. |
+| **OAuth/OIDC** | A configured provider (Google or any OIDC-compliant issuer). | The provider's JWT: algorithm from header, audience, issuer, nonce; the flow uses PKCE and a state parameter. Applies to browser sessions only — the S3 API remains SigV4. Logged-in users are provisioned as IAM users; permissions come from group mapping rules. |
+| **Open access** | `access.authentication: none` (env: `DGP_AUTHENTICATION=none`). | Nothing. No SigV4 verification. Development only. |
 
-A single S3 credential pair configured via YAML or environment variables. All clients share the same credentials. Admin GUI access requires the **bootstrap password**.
+The proxy refuses to start without authentication credentials unless `authentication: none` is set explicitly. Bootstrap and IAM coexist: the request's access key is tried against both the bootstrap pair and the IAM table. When the first IAM user is created, the bootstrap credentials are carried over as a `legacy-admin` user.
 
 ```yaml
-# deltaglider_proxy.yaml
+# validate
 access:
-  access_key_id: myaccesskey
-  secret_access_key: mysecretkey
+  access_key_id: dgp-shared-key
+  secret_access_key: dgp-shared-secret
 ```
 
-```bash
-export DGP_ACCESS_KEY_ID=myaccesskey
-export DGP_SECRET_ACCESS_KEY=mysecretkey
-```
+The orthogonal `access.iam_mode` selector (`gui`, default, or `declarative`) controls where IAM state lives — the encrypted DB or the YAML file. In `declarative` mode, admin-API IAM mutation routes return `403 { "error": "iam_declarative" }` and the YAML is reconciled into the DB on every config apply. See [Declarative IAM](declarative-iam.md).
 
-### IAM Mode (activates when IAM users exist)
-
-Per-user credentials stored in an encrypted SQLCipher database (`deltaglider_config.db`). Each user has their own access key, secret key, and permission rules. Admin GUI access is permission-based — IAM admins don't need the bootstrap password.
-
-IAM mode activates automatically when the first IAM user is created via the admin GUI or via OAuth auto-provisioning. The bootstrap credentials are migrated as a "legacy-admin" user.
-
-### IAM Source of Truth (`access.iam_mode`)
-
-Orthogonal to the bootstrap/IAM/OAuth selection above, the `access.iam_mode` YAML selector controls **where IAM state lives**:
-
-- `gui` *(default)* — the encrypted SQLCipher DB is authoritative. Admin GUI + admin API mutate the DB directly. YAML `access:` carries only the legacy SigV4 pair + `authentication` selector.
-- `declarative` — YAML is authoritative. Admin API IAM mutation routes (`POST/PUT/PATCH/DELETE` on `/users`, `/groups`, `/ext-auth/*`, `/migrate`, backup import) return `403 { "error": "iam_declarative" }`. Read routes stay accessible.
-
-```yaml
-access:
-  iam_mode: declarative
-```
-
-Mode transitions are audit-logged at `warn` level on the `deltaglider_proxy::config` target.
-
-In declarative mode, `access.iam_users`, `access.iam_groups`, `access.auth_providers`, and `access.group_mapping_rules` in the YAML ARE authoritative. The reconciler runs on every `/config/apply` (or section-PUT on `access`), diffs YAML against the encrypted DB, and applies creates/updates/deletes atomically in a single transaction. User/group IDs are preserved across updates so OAuth `external_identities` stay valid through access-key rotations. See [`declarative-iam.md`](declarative-iam.md) for the wire shape, adversarial edges, and the two setup workflows (export-from-DB vs author-from-scratch).
-
-### OAuth/OIDC Mode
-
-Users authenticate via an external identity provider (Google, Okta, Azure AD, Keycloak, or any OIDC-compliant provider). The proxy handles the full OAuth flow: PKCE, state parameter, nonce, and JWT validation.
-
-On first login, the proxy **auto-provisions** an IAM user from the identity provider's claims (email, name, subject). On subsequent logins, the existing user is updated with fresh identity data.
-
-**Group mapping rules** automatically assign permissions based on:
-- **Email domain** — `*@company.com` matches all company employees
-- **Email glob** — `admin-*@company.com` matches admin accounts
-- **Email regex** — full regex pattern matching
-- **Claim value** — match on any JWT claim (department, role, etc.)
-
-Configured via the admin GUI under **Access → External authentication → Mapping Rules** (in `iam_mode: gui`) or via `access.auth_providers` + `access.group_mapping_rules` in YAML (in `iam_mode: declarative` — see [`declarative-iam.md`](declarative-iam.md)).
-
-### Public Prefixes (anonymous read access)
-
-Specific bucket/prefix paths can be configured for unauthenticated read-only access. Anonymous users can GET, HEAD, and LIST objects under public prefixes — but cannot PUT, DELETE, or access anything outside the configured prefixes.
-
-```yaml
-storage:
-  buckets:
-    releases:
-      public_prefixes: ["builds/", "artifacts/"]
-    docs-site:
-      public: true        # shorthand for public_prefixes: [""]
-```
-
-See [Public Prefixes](#public-prefixes) below for details.
-
-### Operator-Authored Admission Blocks
-
-Pre-auth request gating is authored in `admission.blocks[]`. Blocks are evaluated top-to-bottom and fire before the synthesized public-prefix blocks derived from `storage.buckets[*].public_prefixes`.
-
-```yaml
-admission:
-  blocks:
-    - name: deny-known-bad-ips
-      match:
-        source_ip_list: ["203.0.113.5", "198.51.100.0/24"]
-      action: deny
-    - name: maintenance-mode
-      match: {}
-      action:
-        type: reject
-        status: 503
-        message: "We'll be right back."
-```
-
-See [configuration.md](configuration.md#admission-chain) for the full operator wire format.
-
-### Open Access (development only)
-
-The proxy **refuses to start** without authentication credentials. To explicitly run without authentication:
-
-```yaml
-access:
-  authentication: none
-```
-
-> **Security**: Open access exposes all S3 data without credentials. Never use in production.
-
-## Bootstrap Password
-
-A single infrastructure secret that serves three purposes:
-
-1. **Encrypts the config database** — IAM users, OAuth providers, and group mapping rules are stored in SQLCipher, encrypted with the bcrypt hash of this password
-2. **Signs admin session cookies** — HMAC-based session authentication for the admin GUI
-3. **Gates admin GUI access** — In bootstrap mode (before IAM users exist), this password is required to access settings
-
-### Lifecycle
-
-- **Auto-generated** on first run if not set. The plaintext is printed to stderr only when stderr is a TTY; in containers/CI only the bcrypt hash is logged. Hash saved to `.deltaglider_bootstrap_hash`.
-- **Set explicitly** via `DGP_BOOTSTRAP_PASSWORD_HASH` env var (accepts bcrypt or base64-encoded bcrypt — base64 avoids `$` escaping in Docker/shell). YAML: `advanced.bootstrap_password_hash`. Legacy alias: `DGP_ADMIN_PASSWORD_HASH`.
-- **Reset** via `--set-bootstrap-password` CLI flag (reads the new plaintext from stdin).
-
-> **Warning**: Resetting the bootstrap password invalidates the encrypted IAM database. All IAM users, OAuth providers, and group mappings will be lost. The proper rotation path is `PUT /_/api/admin/password` (verifies the current password and re-encrypts the DB atomically).
-
-## IAM Permissions (ABAC)
-
-![IAM user management with ABAC permissions](/_/screenshots/iam.jpg)
-
-Each IAM user (whether created manually or auto-provisioned via OAuth) has one or more permission rules:
-
-```json
-{
-  "effect": "Allow",
-  "actions": ["read", "list"],
-  "resources": ["mybucket/releases/*"],
-  "conditions": {
-    "IpAddress": { "aws:SourceIp": "10.0.0.0/8" }
-  }
-}
-```
-
-### Actions
-
-| Action | S3 Operations |
-|--------|---------------|
-| `read` | GetObject, HeadObject |
-| `write` | PutObject, CopyObject, CreateMultipartUpload, UploadPart, CompleteMultipartUpload |
-| `delete` | DeleteObject, DeleteObjects |
-| `list` | ListBuckets, ListObjectsV2, ListMultipartUploads, ListParts |
-| `admin` | Admin GUI access, config changes |
-| `*` | All actions |
-
-### Resources
-
-Glob patterns matching `bucket/key`:
-- `*` — all buckets and keys (full admin)
-- `mybucket/*` — all keys in `mybucket`
-- `mybucket/releases/*` — keys under `releases/` prefix
-
-### Effect
-
-- `Allow` — grants access (default)
-- `Deny` — explicitly blocks access (overrides Allow rules)
-
-### Conditions (optional)
-
-AWS IAM-style condition blocks:
-- `aws:SourceIp` — restrict by client IP (CIDR notation)
-- `s3:prefix` — restrict LIST operations to specific prefixes
-
-See [IAM conditions](../auth/32-iam-conditions.md) for full reference.
-
-A user is considered an **admin** when they have both wildcard actions (`*`) AND wildcard resources (`*`).
-
-### ListBucket scope filtering
-
-When a user with **prefix-scoped** permissions (e.g. `{ resources: ["bucket/alice/*"] }`) calls `GET /bucket?list-type=2&prefix=` with an empty prefix or a prefix wider than their policy covers, the proxy admits the request (so the user can discover their own keys) but **post-filters each returned key and CommonPrefix** through their per-key policy. Only keys the user has `read` OR `list` permission on are returned.
-
-Operators and SDKs can tell a filtered page from an unrestricted one via the `x-amz-meta-dg-list-filtered: true` response header.
-
-Pagination stays honest: `is_truncated` and the continuation token reflect the engine-level cursor (not the filtered count). The client's `max_keys` acts as a server-side inspection cap — the returned page may be smaller. This matches AWS's documented behaviour when denies apply within allows.
-
-**Unscoped users pay no filter cost** — if the policy covers the full bucket/prefix, the handler returns the engine page unchanged.
-
-### Workflow bypass prevention
-
-The proxy refuses to implicitly create a bucket as a side effect of a PUT. Even on the filesystem backend (where the underlying FS would happily create a parent directory), writes to a non-existent bucket return `404 NoSuchBucket` — matching the S3 backend's contract and preventing bypass of bucket-creation authorization.
-
-## IAM Groups
-
-Users can be organized into **groups** with shared permission rules. Group permissions are merged with the user's direct permissions at evaluation time.
-
-Groups are managed via the admin GUI (**Access → Groups**). OAuth group mapping rules automatically add users to groups on login.
-
-## OAuth/OIDC Configuration
+OAuth providers appear as buttons on the `/_/` login page:
 
 ![OAuth login with Google SSO](/_/screenshots/oauth_login.jpg)
 
-### Setting Up a Provider
+## Bootstrap password
 
-1. Open the admin GUI → **Access** → **External authentication**
-2. Click **Add Provider** and select the provider type (Google, OIDC Generic)
-3. Enter the required fields:
-   - **Client ID** — from your identity provider's OAuth app
-   - **Client Secret** — from your identity provider's OAuth app
-   - **Issuer URL** — OIDC discovery endpoint (e.g. `https://accounts.google.com`)
-   - **Display Name** — shown on the login button
-4. Save and test
+One infrastructure secret with three roles:
 
-### Group Mapping Rules
+| Role | Mechanism |
+|------|-----------|
+| Encrypts the config database | IAM users, OAuth providers, and group mapping rules are stored in SQLCipher, keyed by this password |
+| Signs admin session cookies | HMAC-based session authentication for the admin GUI |
+| Gates admin GUI access | Required to open settings in bootstrap mode (before IAM users exist) |
 
-![OAuth group mapping rules](/_/screenshots/oauth_group_mapping.jpg)
+Generation and reset facts:
 
-After configuring an OAuth provider, set up mapping rules to auto-assign permissions:
+- **Auto-generated** on first run when not set. The plaintext is printed to stderr only when stderr is a TTY; in containers/CI only the bcrypt hash is logged. The hash is saved to `.deltaglider_bootstrap_hash`.
+- **Set explicitly** via `DGP_BOOTSTRAP_PASSWORD_HASH` (bcrypt, or base64-encoded bcrypt to avoid `$` escaping in Docker). YAML: `advanced.bootstrap_password_hash`. Legacy alias: `DGP_ADMIN_PASSWORD_HASH`.
+- **Reset** via the `--set-bootstrap-password` CLI flag (reads the new plaintext from stdin). Resetting invalidates the encrypted IAM database — all IAM users, OAuth providers, and group mappings are lost.
+- **Rotation without data loss**: `PUT /_/api/admin/password` verifies the current password and re-encrypts the DB atomically.
 
-1. Go to **Authentication** → **Mapping Rules**
-2. Add a rule:
-   - **Match type**: email_domain, email_glob, email_regex, or claim_value
-   - **Match value**: the pattern to match (e.g. `company.com`, `admin-*@company.com`)
-   - **Target group**: which IAM group to add matched users to
-3. Save
-
-On each OAuth login, the user's group memberships are **merged** (not replaced) — existing group memberships from previous logins or manual assignment are preserved.
-
-### OAuth Login Flow
-
-```
-Browser → /_/ login page → "Sign in with Google" button
-    → Redirect to Google (PKCE + state + nonce)
-    → User authenticates with Google
-    → Google redirects back to /_/api/admin/oauth/callback
-    → Proxy validates JWT (algorithm from header, audience, issuer, nonce)
-    → Auto-provision or update IAM user
-    → Apply group mapping rules
-    → Create admin session + auto-populate S3 credentials
-    → Redirect to /_/browse
-```
-
-## Public Prefixes
-
-Public prefixes allow unauthenticated read-only access to specific bucket/prefix paths. Useful for publishing release artifacts, documentation, or public assets.
-
-### Configuration
-
-```yaml
-storage:
-  buckets:
-    releases:
-      public_prefixes: ["builds/", "docs/"]
-    docs-site:
-      public: true        # entire bucket — shorthand
-```
-
-Or via the admin GUI → **Storage → Buckets** → edit bucket → **Anonymous read access** (tri-state: None / Specific prefixes / Entire bucket).
-
-### Behavior
-
-- **Allowed without auth**: GET, HEAD on objects under the prefix; LIST with a matching prefix
-- **Always denied without auth**: PUT, DELETE, COPY, multipart uploads
-- **Scoped**: anonymous LIST only returns objects under the public prefix — not the whole bucket
-- **Auth still wins**: if a request carries valid SigV4 credentials, full IAM evaluation runs regardless of public prefix config
-- **Audit logged**: all anonymous access is logged as `user=$anonymous`
-
-### Security Notes
-
-- Trailing `/` on prefixes is significant: `builds/` only matches `builds/...`, not `buildscripts/`
-- Empty prefix `""` makes the **entire bucket** public (logged as a warning at startup)
-- Prefixes containing `..`, null bytes, or `//` are rejected
-
-## SigV4 Verification
+## SigV4 verification
 
 The proxy verifies SigV4 signatures from two sources:
 
-| Path | Source | Use case |
-|------|--------|----------|
-| **Header auth** | `Authorization: AWS4-HMAC-SHA256 ...` | Standard S3 SDK calls |
-| **Presigned URL** | `X-Amz-Algorithm` + `X-Amz-Signature` query params | Browser downloads, shareable links (up to 7 days) |
+| Path | Source | Use |
+|------|--------|-----|
+| Header auth | `Authorization: AWS4-HMAC-SHA256 ...` | Standard S3 SDK calls |
+| Presigned URL | `X-Amz-Algorithm` + `X-Amz-Signature` query parameters | Browser downloads, shareable links |
 
-Both paths extract the access key ID, look up the user (bootstrap: single credential; IAM: lookup by access key), and verify the HMAC-SHA256 signature against the user's secret key using constant-time comparison.
+Both paths extract the access key ID, resolve the user (bootstrap pair or IAM lookup), and verify the HMAC-SHA256 signature against the secret key using constant-time comparison. Any region is accepted in the credential scope. Presigned URLs expire after at most 7 days (604,800 s) and carry the signing user's permissions — Deny rules apply to presigned requests too.
 
-### Verify-Then-Re-sign
+### Verify, then re-sign
 
-SigV4 signatures are bound to the Host header and URI path. The proxy cannot forward the client's signature — it verifies it, discards it, and makes its own authenticated requests to the backend using the AWS SDK.
+SigV4 signatures are bound to the Host header and URI path, so the client's signature cannot be forwarded. The proxy verifies it, discards it, and issues its own authenticated requests to the backend using the backend credentials via the AWS SDK.
 
-## S3 Backend Credentials
+### Replay detection
 
-When using the S3 backend, the proxy needs two credential sets:
+Verified signatures are cached; a duplicate signature within the replay window (`DGP_REPLAY_WINDOW_SECS`, default 2 s, `0` disables) is rejected with 400 when the request is mutating (PUT/POST/DELETE) and served normally when it is an idempotent read (GET/HEAD). Replay rejections do not count toward the auth-failure lockout. Clock-skew tolerance is a separate check (`DGP_CLOCK_SKEW_SECONDS`, default 300 s). Full table: [Rate limits and concurrency](rate-limits.md).
 
-1. **Proxy credentials** — for client-to-proxy auth (SigV4 or OAuth)
-2. **Backend credentials** — for proxy-to-upstream-S3 auth
+## Backend credentials
+
+Two independent credential sets exist: client-to-proxy credentials (above) and proxy-to-backend credentials. For an S3 backend:
 
 ```bash
-# Backend auth (proxy → upstream S3/MinIO)
-export DGP_BE_AWS_ACCESS_KEY_ID=minioadmin
-export DGP_BE_AWS_SECRET_ACCESS_KEY=minioadmin
-export DGP_S3_ENDPOINT=http://localhost:9000
+export DGP_BE_AWS_ACCESS_KEY_ID=hetzner-backend-key
+export DGP_BE_AWS_SECRET_ACCESS_KEY=hetzner-backend-secret
+export DGP_S3_ENDPOINT=https://fsn1.your-objectstorage.com
 ```
 
-## Using with S3 Tools
+YAML equivalents are `storage.access_key_id` / `storage.secret_access_key` (shorthand) or `storage.backend.*` (canonical). With multiple named backends (for example `hetzner-fsn1`, `aws-dr`), each entry in `storage.backends[]` carries its own `access_key_id` / `secret_access_key`. Filesystem backends such as `local-disk` require no credentials. See [Configuration](configuration.md) for the full field table.
 
-### aws-cli
+## Client configuration
+
+Any SigV4 client (aws CLI, boto3, Terraform, rclone, Cyberduck) works against the proxy with an endpoint override and proxy credentials.
+
+aws CLI:
 
 ```bash
-export AWS_ACCESS_KEY_ID=myaccesskey
-export AWS_SECRET_ACCESS_KEY=mysecretkey
+export AWS_ACCESS_KEY_ID=ci-uploader-key
+export AWS_SECRET_ACCESS_KEY=ci-uploader-secret
 export AWS_ENDPOINT_URL=http://localhost:9000
 
-aws s3 cp file.zip s3://mybucket/file.zip
-aws s3 ls s3://mybucket/
-aws s3 presign s3://mybucket/file.zip --expires-in 3600
+aws s3 cp app-v2.4.0.zip s3://releases/builds/app-v2.4.0.zip
+aws s3 ls s3://releases/builds/
+aws s3 presign s3://releases/builds/app-v2.4.0.zip --expires-in 3600
 ```
 
-### boto3 (Python)
+boto3:
 
 ```python
 import boto3
 
 s3 = boto3.client(
-    's3',
-    endpoint_url='http://localhost:9000',
-    aws_access_key_id='myaccesskey',
-    aws_secret_access_key='mysecretkey',
-    region_name='us-east-1',
+    "s3",
+    endpoint_url="https://s3.acme.example",
+    aws_access_key_id="ci-uploader-key",
+    aws_secret_access_key="ci-uploader-secret",
+    region_name="us-east-1",
 )
 
-s3.upload_file('file.zip', 'mybucket', 'file.zip')
-url = s3.generate_presigned_url(
-    'get_object',
-    Params={'Bucket': 'mybucket', 'Key': 'file.zip'},
-    ExpiresIn=3600,
-)
+s3.upload_file("dump.sql.gz", "db-archive", "nightly/dump.sql.gz")
 ```
 
-## Error Responses
+## Public prefixes
 
-| Error Code | HTTP Status | Cause |
-|---|---|---|
-| `AccessDenied` | 403 | Missing credentials, insufficient permissions, or public prefix mismatch |
+Per-bucket configuration grants anonymous read-only access to specific prefixes:
+
+```yaml
+storage:
+  buckets:
+    releases:
+      public_prefixes: ["builds/"]
+    downloads:
+      public: true        # shorthand for public_prefixes: [""]
+```
+
+Semantics for requests without credentials:
+
+- **Allowed**: GET and HEAD on objects under a public prefix; LIST with a `prefix` parameter inside the public prefix. LIST results are scoped to the public prefix — never the whole bucket.
+- **Denied**: PUT, DELETE, COPY, and multipart uploads, always.
+- **Identity**: anonymous requests run as a synthesized `$anonymous` user with scoped read+list permissions (including `s3:prefix` conditions for LIST). All anonymous access is audit-logged as `user=$anonymous`.
+- **Credentials win**: a request carrying valid SigV4 credentials gets full IAM evaluation regardless of public-prefix configuration.
+- **Matching**: a trailing `/` is significant — `builds/` matches `builds/...` but not `buildscripts/`. The empty prefix `""` makes the entire bucket public (logged as a startup warning). Prefixes containing `..`, null bytes, or `//` are rejected.
+
+Public prefixes are synthesized into admission blocks named `public-prefix:*`, evaluated after any operator-authored `admission.blocks[]` (see [Configuration](configuration.md#admission-chain)).
+
+## Error responses
+
+S3-path errors are returned as standard S3 XML error documents:
+
+| Error code | HTTP status | Cause |
+|------------|-------------|-------|
+| `AccessDenied` | 403 | No credentials on a non-public path (anonymous), or valid credentials without a matching Allow / with a matching Deny (denied) — the response shape is identical in both cases |
 | `SignatureDoesNotMatch` | 403 | Signature verification failed |
-| `RequestTimeTooSkewed` | 403 | Client clock differs from server by more than the configured tolerance |
-| `InvalidArgument` | 400 | Malformed Authorization header or unparseable date/expiry |
-| `SlowDown` | 429 | Rate limited due to repeated auth failures |
+| `RequestTimeTooSkewed` | 403 | Request timestamp outside the clock-skew tolerance |
+| `InvalidArgument` | 400 | Malformed Authorization header, unparseable date/expiry, or replayed mutating signature |
+| `SlowDown` | 429 | Per-IP auth rate limit exceeded |
 
-All errors are returned as standard S3 XML error responses.
+Admin-API errors are JSON, not XML: IAM mutations in declarative mode return `403 { "error": "iam_declarative" }`; admin endpoints without an AdminGui session return `403 { "error": "admin_session_required" }`.
 
-## Security Considerations
+## Related
 
-- **Use HTTPS in production**: SigV4 authenticates but does not encrypt. Use a TLS-terminating reverse proxy or enable built-in TLS.
-- **Bootstrap password security**: The bootstrap password encrypts the IAM database. Treat it like a master key.
-- **Credential rotation**: IAM user keys can be rotated via the admin GUI without downtime.
-- **Presigned URL expiration**: Maximum 7 days. Generate short-lived URLs when possible.
-- **OAuth session hardening**: Sessions are IP-bound, have configurable TTL (default 4h), and auto-evict oldest when the concurrent session limit (10) is reached.
-- **Region**: The proxy accepts any region in the credential scope. Standard S3 tools default to `us-east-1`.
+- [About authentication and access control](../explanation/security-model.md)
+- [IAM permissions and conditions](iam-permissions.md)
+- [How to create IAM users and groups](../how-to/create-iam-users.md)

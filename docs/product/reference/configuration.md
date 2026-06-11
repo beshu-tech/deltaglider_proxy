@@ -123,8 +123,10 @@ Mixing `public: true` and a non-empty `public_prefixes` is a hard error.
 1. `DGP_CONFIG` env var (returned unconditionally — if set, the path is used even when the file doesn't yet exist).
 2. `./deltaglider_proxy.yaml`
 3. `./deltaglider_proxy.yml`
-4. `/etc/deltaglider_proxy/config.yaml`
-5. `/etc/deltaglider_proxy/config.yml`
+4. `./deltaglider_proxy.toml` (deprecated)
+5. `/etc/deltaglider_proxy/config.yaml`
+6. `/etc/deltaglider_proxy/config.yml`
+7. `/etc/deltaglider_proxy/config.toml` (deprecated)
 
 CLI flags (`--config <path>`, `--listen <addr>`) take precedence over all of the above; env vars take precedence over file contents.
 
@@ -153,9 +155,9 @@ advanced:
 
 ### `log_level`
 
-Tracing filter string. Overridden by `RUST_LOG` if set. Changeable at runtime via the admin GUI.
+Tracing filter string (`tracing-subscriber` syntax). Overridden by `RUST_LOG` if set. Changeable at runtime via the admin GUI (Settings → System → Logging card), which hot-reloads the filter through the apply pipeline.
 
-Resolution order at startup: `RUST_LOG` > `DGP_LOG_LEVEL` > `advanced.log_level` in file > `--verbose` CLI flag > default.
+Resolution order at startup: `RUST_LOG` > `DGP_LOG_LEVEL` > `advanced.log_level` in file > `--verbose` CLI flag (sets `trace`) > default.
 
 | | |
 |---|---|
@@ -261,7 +263,7 @@ Store an object as a delta only if `delta_size / original_size` is below this ra
 
 ### `max_object_size`
 
-Maximum object size in bytes for delta processing (xdelta3 memory constraint). Larger objects are passthrough.
+Maximum object size in bytes. Enforced as the HTTP request body limit, so it caps uploads for both delta and passthrough objects; it is also the per-object ceiling for delta processing (xdelta3 memory constraint) and sizes the multipart upload budget. `0` rejects all uploads (startup warning).
 
 | | |
 |---|---|
@@ -708,14 +710,14 @@ storage:
     tick_interval: "1h"
     max_failures_retained: 100
     rules:
-      - name: expire-old-builds
+      - name: expire-nightly-dumps
         enabled: false
-        bucket: releases
-        prefix: "builds/"
+        bucket: db-archive
+        prefix: "nightly/"
         action: delete
-        expire_after: "30d"
-        include_globs: ["builds/**/*.zip"]
-        exclude_globs: [".deltaglider/**", "builds/golden/**"]
+        expire_after: "90d"
+        include_globs: ["nightly/**/*.dump"]
+        exclude_globs: [".deltaglider/**", "nightly/golden/**"]
 ```
 
 Use `POST /_/api/admin/jobs/lifecycle:<name>/preview` (or the Preview button on the Jobs screen) before enabling a rule. See [Lifecycle Rules](lifecycle.md) for API details, skip rules, and limitations.
@@ -856,16 +858,7 @@ Rotation within a single mode is not automated — use the `legacy_key` / `legac
 
 ## CLI Subcommands
 
-| Command | Purpose |
-|---------|---------|
-| `deltaglider_proxy config migrate <in> [--out <out>]` | Convert TOML (or YAML) to canonical YAML |
-| `deltaglider_proxy config lint <file>` | Offline schema + semantic validation (matches `/config/validate`) |
-| `deltaglider_proxy config schema [--out <out>]` | Emit JSON Schema for the Config shape (for CI + YAML LSP) |
-| `deltaglider_proxy config defaults [--out <out>]` | Emit defaults + docstrings as JSON Schema |
-| `deltaglider_proxy config apply <file> [--server <url>] [--timeout <secs>]` | Push a YAML document to a running server via the admin API (reads `DGP_BOOTSTRAP_PASSWORD` env) |
-| `deltaglider_proxy admission trace --method <m> --path <p> [--authenticated] [--query <q>]` | Dry-run a synthetic request through the admission chain |
-
-Lint exit codes: `0` = valid (warnings on stderr allowed); `3` = I/O error; `4` = parse error; `6` = validation error.
+See [Command-line tools](cli.md).
 
 ---
 

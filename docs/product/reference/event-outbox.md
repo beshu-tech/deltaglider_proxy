@@ -1,41 +1,21 @@
 # Event outbox
 
-Durable object events are written to the encrypted config DB after successful
-S3 mutations. The outbox is append-first: PUT/COPY/DELETE, replication copy
-successes, and lifecycle delete/transition successes do not call external
-systems directly, so object operations do not wait on webhook latency or
-failures.
+Durable object events are written to the encrypted config DB after successful S3 mutations. The outbox is append-first: PUT/COPY/DELETE, replication copy successes, and lifecycle delete/transition successes do not call external systems directly, so object operations do not wait on webhook latency or failures.
 
 ## Semantics
 
-- Rows are stored in `event_outbox` with status `pending`, `in_progress`,
-  `delivered`, or `failed`.
-- Delivery is disabled by default. With no delivery config, the outbox is an
-  operator-visible journal only.
-- When HTTP delivery is enabled, a background dispatcher claims due rows in
-  small batches, POSTs each row to every configured webhook endpoint, and marks
-  it delivered only after all endpoints return 2xx.
-- Delivery is at-least-once. Webhook receivers must be idempotent, typically by
-  deduplicating on `event.id`.
-- Multiple webhooks are fan-out, not independent subscriptions. If one endpoint
-  fails, the row is retried and endpoints that already accepted the event may
-  see it again.
-- Failed attempts use exponential backoff. After `max_attempts`, the row becomes
-  permanently `failed` until an operator requeues it.
-- Requeue does not create a new event. It changes only `failed` rows back to
-  `pending`, clears claim/error fields, preserves `attempts` as delivery
-  history, and makes the row due immediately.
-- Stale `in_progress` claims are reclaimable so a crashed dispatcher does not
-  wedge rows forever.
-- Delivered rows are pruned by the dispatcher after `delivered_retention` and
-  capped by `delivered_max_rows`. Pending, in-progress, and failed rows are not
-  deleted by retention pruning because they still need operator or dispatcher
-  action.
-- Default healthy-state DB bound is: all non-delivered rows plus at most 10,000
-  delivered rows. If delivery is broken, pending/failed rows can exceed that
-  until the operator fixes delivery, requeues, or manually clears the DB.
+- Rows are stored in `event_outbox` with status `pending`, `in_progress`, `delivered`, or `failed`.
+- Delivery is disabled by default. With no delivery config, the outbox is an operator-visible journal only.
+- When HTTP delivery is enabled, a background dispatcher claims due rows in small batches, POSTs each row to every configured webhook endpoint, and marks it delivered only after all endpoints return 2xx.
+- Delivery is at-least-once. Webhook receivers must be idempotent, typically by deduplicating on `event.id`.
+- Multiple webhooks are fan-out, not independent subscriptions. If one endpoint fails, the row is retried and endpoints that already accepted the event may see it again.
+- Failed attempts use exponential backoff. After `max_attempts`, the row becomes permanently `failed` until an operator requeues it.
+- Requeue does not create a new event. It changes only `failed` rows back to `pending`, clears claim/error fields, preserves `attempts` as delivery history, and makes the row due immediately.
+- Stale `in_progress` claims are reclaimable so a crashed dispatcher does not wedge rows forever.
+- Delivered rows are pruned by the dispatcher after `delivered_retention` and capped by `delivered_max_rows`. Pending, in-progress, and failed rows are not deleted by retention pruning because they still need operator or dispatcher action.
+- Default healthy-state DB bound is: all non-delivered rows plus at most 10,000 delivered rows. If delivery is broken, pending/failed rows can exceed that until delivery is fixed, rows are requeued, or the DB is cleared.
 
-## YAML
+## YAML grammar
 
 ```yaml
 advanced:
@@ -59,22 +39,11 @@ advanced:
     prune_batch: 100
 ```
 
-Defaults are intentionally inert:
+The default is inert: `enabled: false`. `enabled=true` without `webhook_url` or `webhook_urls` is treated as inactive and surfaces a config warning. `webhook_url` is the single-endpoint shortcut; `webhook_urls` adds fan-out endpoints.
 
-```yaml
-advanced:
-  event_delivery:
-    enabled: false
-```
+## Webhook payload
 
-`enabled=true` without `webhook_url` or `webhook_urls` is treated as inactive
-and surfaces a config warning. `webhook_url` is kept as the single-endpoint
-shortcut; `webhook_urls` adds fan-out endpoints.
-
-## Webhook Payload
-
-Event kinds are currently `ObjectCreated`, `ObjectDeleted`, `ObjectCopied`,
-`ReplicationObjectCopied`, `LifecycleExpired`, and `LifecycleTransitioned`.
+Event kinds are `ObjectCreated`, `ObjectDeleted`, `ObjectCopied`, `ReplicationObjectCopied`, `LifecycleExpired`, and `LifecycleTransitioned`.
 
 Each POST body is JSON:
 
@@ -101,64 +70,18 @@ Each POST body is JSON:
 }
 ```
 
-## Slack notifications
+## Slack format
 
-Set `event_delivery.format: slack` to deliver Slack messages instead of the raw
-`{schema,event}` envelope. **No OAuth is required** — you paste a credential, so
-this works even when the proxy runs at a private/internal address (delivery is
-outbound HTTPS only). This mirrors how Grafana, self-hosted Sentry, and GitLab CE
-do Slack notifications.
+`event_delivery.format: slack` delivers Slack messages instead of the raw `{schema,event}` envelope. No OAuth is involved — delivery is outbound HTTPS with a pasted credential, in one of two mutually exclusive modes:
 
-Two modes — pick one:
+- **Incoming Webhook mode** — `webhook_url` is a `https://hooks.slack.com/services/…` URL. Each URL is bound to one channel by Slack. `slack_username` and `slack_icon_emoji` are optional cosmetic sender overrides.
+- **Bot-token mode** — `slack_bot_token` is an `xoxb-…` token (requires the `chat:write` and `chat:write.public` scopes); `slack_channel` (channel id or `#name`) is required and no webhook URL is set.
 
-**Incoming Webhook (simplest, single channel).** In Slack: create an app → enable
-*Incoming Webhooks* → pick a channel → copy the `https://hooks.slack.com/services/…`
-URL into `webhook_url`.
+The bot token is a secret: it is masked to `__redacted__` on export and in the admin GUI, and an unchanged round-trip preserves the real token. The Slack Web API returns HTTP 200 even on failure, so delivery checks the JSON `ok` field and retries on `{"ok": false}` (e.g. `channel_not_found`).
 
-```yaml
-event_delivery:
-  enabled: true
-  format: slack
-  webhook_url: "https://hooks.slack.com/services/T000/B000/XXXX"
-  slack_username: "DeltaGlider"      # optional cosmetic override
-  slack_icon_emoji: ":package:"      # optional
-```
+Filtering: `slack_notify_kinds` (default `["ObjectCreated"]`) selects which event kinds post; `slack_include_globs` / `slack_exclude_globs` are a key-glob pre-filter (exclude wins; empty include = all user objects). Directory markers and DeltaGlider internals (`reference.bin`, `*.delta`, `.deltaglider/*`) are never posted. Each message is Block Kit (header + object section + context line with size / storage strategy / timestamp) plus a plain `text` fallback.
 
-**Bot token (multi-channel + @mentions).** In Slack: create an app → add the
-`chat:write` and `chat:write.public` scopes → install to the workspace → copy the
-`xoxb-…` Bot User OAuth Token. Set it with a target channel (no webhook URL):
-
-```yaml
-event_delivery:
-  enabled: true
-  format: slack
-  slack_bot_token: "xoxb-…"          # secret: masked on export, preserved untouched
-  slack_channel: "C0123456"          # channel id or #name (required in this mode)
-```
-
-The bot token is treated like any other secret: it is masked to `__redacted__` on
-export and in the admin GUI, and an unchanged round-trip preserves the real token.
-The Slack Web API returns HTTP 200 even on failure, so delivery checks the JSON
-`ok` field and retries on `{"ok": false}` (e.g. `channel_not_found`).
-
-**What gets posted.** By default only `ObjectCreated` notifies. Widen or scope it:
-
-```yaml
-  slack_notify_kinds: ["ObjectCreated", "ObjectDeleted"]
-  slack_include_globs: ["builds/**"]   # empty = all user objects
-  slack_exclude_globs: ["**/*.tmp"]    # exclude wins over include
-```
-
-Directory markers and DeltaGlider internals (`reference.bin`, `*.delta`,
-`.deltaglider/*`) are never posted. Each message is Block Kit (header + object
-section + context line with size / storage strategy / timestamp) plus a plain
-`text` fallback for notifications and screen readers.
-
-**Per-bucket / per-prefix channel routing** (bot-token mode only — Incoming
-Webhook URLs are each bound to one channel by Slack). Set `slack_routes` to send
-different buckets or prefixes to different channels; an eligible event posts to
-**every** route it matches (so one object can hit several channels). `slack_channel`
-becomes the fallback for events that match no route.
+Per-bucket / per-prefix channel routing (`slack_routes`) is bot-token-mode-only. An eligible event posts to every route it matches; `slack_channel` is the fallback for events that match no route. The top-level kind/glob filters are a global pre-filter; routes then decide which channels.
 
 ```yaml
   slack_routes:
@@ -166,17 +89,12 @@ becomes the fallback for events that match no route.
       bucket: "releases"
       prefix_globs: ["builds/**"]   # empty = any key in the bucket
       channel: "C_CI"
-    - name: "Audit → #security"
-      bucket: "audit"               # no prefix_globs = the whole bucket
-      channel: "C_SECURITY"
+    - name: "DB archive → #ops"
+      bucket: "db-archive"          # no prefix_globs = the whole bucket
+      channel: "C_OPS"
 ```
 
-The top-level `slack_notify_kinds` + `slack_include/exclude_globs` are a global
-pre-filter (what's eligible at all); routes then decide which channels.
-
-All of this is editable from the admin GUI at **Integrations →
-Event delivery** (toggle the format to *Slack*) — including a live preview of
-the message that will land in the channel.
+The same fields are editable in the admin GUI at **Integrations → Event delivery**, including a live message preview.
 
 ## Admin API
 
@@ -189,23 +107,4 @@ All routes are session-gated.
 | `POST` | `/_/api/admin/event-outbox/:id/requeue` | Requeue one `failed` row. Returns `409` if the row is not currently failed. |
 | `POST` | `/_/api/admin/event-outbox/requeue` | Requeue failed rows by id: `{ "ids": [123, 124] }`. Non-failed ids are ignored. |
 
-`limit` defaults to 50 and is clamped to 500. Sort fields are `id`,
-`occurred_at`, `created_at`, `next_attempt_at`, `delivered_at`, `attempts`,
-`status`, `kind`, `bucket`, and `key`; `order` is `asc` or `desc`.
-
-Response:
-
-```json
-{
-  "rows": [],
-  "counts": { "pending": 0, "in_progress": 0, "delivered": 0, "failed": 0 },
-  "total": 0,
-  "limit": 50,
-  "offset": 0,
-  "status": null,
-  "sort": "occurred_at",
-  "order": "desc",
-  "delivery_enabled": false,
-  "delivery_active": false
-}
-```
+`limit` defaults to 50 and is clamped to 500. Sort fields are `id`, `occurred_at`, `created_at`, `next_attempt_at`, `delivered_at`, `attempts`, `status`, `kind`, `bucket`, and `key`; `order` is `asc` or `desc`. The list response carries `rows`, per-status `counts`, `total`, the echoed paging/sort parameters, and the `delivery_enabled` / `delivery_active` flags.
