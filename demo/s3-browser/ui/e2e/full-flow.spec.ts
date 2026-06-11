@@ -37,7 +37,10 @@ test('open auth: bucket, upload, list, admin login, sign out, reconnect, object 
     buffer: Buffer.from('deltaglider e2e payload\n'),
   });
 
-  await page.getByRole('button', { name: 'Back to browse' }).click();
+  // Upload completes near-instantly for a tiny file; the page swaps the
+  // "Back to browse" button for the success panel's single Done action.
+  await expect(page.getByText('Upload complete')).toBeVisible({ timeout: 60_000 });
+  await page.getByRole('button', { name: /Done — go to/ }).click();
   await expect(page.getByText(uploadName)).toBeVisible({ timeout: 60_000 });
 
   // ── Admin (bootstrap password) ──────────────────────────────────
