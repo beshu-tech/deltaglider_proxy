@@ -52,6 +52,7 @@ use tracing::info;
 use crate::api::handlers::AppState;
 use crate::config_apply::ConfigMutator;
 use crate::config_db::ConfigDb;
+use crate::job_loop::{Pager, MAX_JOB_PAGES};
 use crate::transfer::{copy_object_with_retries, ObjectTransferRequest, TransferProvenance};
 
 use super::store::MaintenanceJob;
@@ -61,7 +62,6 @@ use super::worker::{
 
 pub const TRANSIENT_PREFIX: &str = "__dgmigrate_";
 const PAGE_SIZE: u32 = 1000;
-const MAX_PAGES: u32 = 10_000;
 
 /// Kind-specific parameters carried in `maintenance_jobs.params` (JSON).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,7 +221,7 @@ async fn run_phases(
 ) -> Result<(), String> {
     let bucket = &job.bucket;
     let mut phase = job.phase.clone();
-    let mut token = job.continuation_token.clone();
+    let resume_token = job.continuation_token.clone();
     let mut done = job.objects_done;
     let mut skipped = job.objects_skipped;
     let mut failed = job.objects_failed;
@@ -254,13 +254,18 @@ async fn run_phases(
         // wait out any write admitted before it armed.
         drain_inflight_writes(state, bucket).await?;
         phase = "copy".to_string();
-        token = None;
         persist(db, job, &phase, None, done, skipped, failed, bytes, None).await;
     }
 
     // ── Phase: copy (resumable; ANY copy failure aborts pre-flip) ──
     if phase == "copy" {
-        for _ in 0..MAX_PAGES {
+        // Resume only when the job was persisted IN this phase.
+        let mut pager = Pager::resuming(if job.phase == "copy" {
+            resume_token.clone()
+        } else {
+            None
+        });
+        while pager.begin_page().is_some() {
             check_cancel(db, job.id).await?;
             // Re-assert the staging route: an admin config apply mid-job
             // replaces cfg.buckets wholesale; without the route the copies
@@ -274,10 +279,24 @@ async fn run_phases(
             )
             .await?;
             let engine = state.engine.load().clone();
-            let page = engine
-                .list_objects(bucket, "", None, PAGE_SIZE, token.as_deref(), false)
+            let page = match engine
+                .list_objects(bucket, "", None, PAGE_SIZE, pager.token(), false)
                 .await
-                .map_err(|e| format!("list source failed: {e}"))?;
+            {
+                Ok(p) => p,
+                Err(e) if pager.poisoned_resume_token() => {
+                    // Restart the phase from page 0: HEAD-skip makes the
+                    // re-list idempotent.
+                    tracing::warn!(
+                        "migrate: job #{} copy resume token rejected ({e}); restarting phase fresh",
+                        job.id
+                    );
+                    pager.restart_fresh();
+                    persist(db, job, "copy", None, done, skipped, failed, bytes, None).await;
+                    continue;
+                }
+                Err(e) => return Err(format!("list source failed: {e}")),
+            };
             for (key, _) in page.objects.iter().filter(|(k, _)| !k.ends_with('/')) {
                 if engine.head(&params.transient_key, key).await.is_ok() {
                     skipped += 1;
@@ -310,7 +329,7 @@ async fn run_phases(
                     }
                 }
             }
-            token = page.next_continuation_token;
+            let more = pager.advance(page.is_truncated, page.next_continuation_token);
             persist(
                 db,
                 job,
@@ -320,34 +339,50 @@ async fn run_phases(
                 skipped,
                 failed,
                 bytes,
-                token.as_deref(),
+                pager.token(),
             )
             .await;
             heartbeat(db, job.id, instance_id).await;
-            if token.is_none() {
+            if !more {
                 break;
             }
         }
         phase = "verify".to_string();
-        token = None;
         persist(db, job, &phase, None, done, skipped, failed, bytes, None).await;
     }
 
     // ── Phase: verify ──
     if phase == "verify" {
-        for _ in 0..MAX_PAGES {
+        let mut pager = Pager::resuming(if job.phase == "verify" {
+            resume_token.clone()
+        } else {
+            None
+        });
+        while pager.begin_page().is_some() {
             check_cancel(db, job.id).await?;
             let engine = state.engine.load().clone();
-            let page = engine
-                .list_objects(bucket, "", None, PAGE_SIZE, token.as_deref(), false)
+            let page = match engine
+                .list_objects(bucket, "", None, PAGE_SIZE, pager.token(), false)
                 .await
-                .map_err(|e| format!("verify list failed: {e}"))?;
+            {
+                Ok(p) => p,
+                Err(e) if pager.poisoned_resume_token() => {
+                    tracing::warn!(
+                        "migrate: job #{} verify resume token rejected ({e}); restarting phase fresh",
+                        job.id
+                    );
+                    pager.restart_fresh();
+                    persist(db, job, "verify", None, done, skipped, failed, bytes, None).await;
+                    continue;
+                }
+                Err(e) => return Err(format!("verify list failed: {e}")),
+            };
             for (key, _) in page.objects.iter().filter(|(k, _)| !k.ends_with('/')) {
                 if engine.head(&params.transient_key, key).await.is_err() {
                     return Err(format!("verification failed: '{key}' missing on target"));
                 }
             }
-            token = page.next_continuation_token;
+            let more = pager.advance(page.is_truncated, page.next_continuation_token);
             persist(
                 db,
                 job,
@@ -357,11 +392,11 @@ async fn run_phases(
                 skipped,
                 failed,
                 bytes,
-                token.as_deref(),
+                pager.token(),
             )
             .await;
             heartbeat(db, job.id, instance_id).await;
-            if token.is_none() {
+            if !more {
                 break;
             }
         }
@@ -432,7 +467,7 @@ async fn run_phases(
         .await?;
         let mut cleanup_token: Option<String> = None;
         let mut delete_failures = 0u32;
-        'cleanup: for _ in 0..MAX_PAGES {
+        'cleanup: for _ in 0..MAX_JOB_PAGES {
             if check_cancel(db, job.id).await.is_err() {
                 break 'cleanup; // flip already happened; stop deleting quietly
             }

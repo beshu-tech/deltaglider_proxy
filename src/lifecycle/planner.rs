@@ -8,8 +8,6 @@ use crate::types::FileMetadata;
 use chrono::{DateTime, Utc};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
-pub const MAX_PAGES_PER_RUN: u32 = 10_000;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     Apply { action: PlannedLifecycleAction },

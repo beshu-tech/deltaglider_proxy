@@ -109,6 +109,8 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
                             __dgmigrate_* routes, pre-flip cancel unwind), mod.rs (pure: resolve_desired/needs_rewrite/progress_percent)
   → config_apply.rs         ConfigMutator: mutate → rebuild engine (rollback on failure) → persist, for BACKGROUND tasks (migrate flips);
                             admin rebuild_engine delegates to rebuild_engine_only
+  → job_loop.rs             THE canonical pagination state machine (Pager): token threading, resume detection, poison-token
+                            guard (one-shot restart_fresh), MAX_JOB_PAGES cap — all worker loops paginate through it
   → config_db/job_store.rs  THE canonical job machinery (identifier-checked): leader-lease acquire/renew (lapsed never resurrects),
                             failure-ring prune (id DESC), zombie-run scan — all three subsystems delegate here
   → transfer.rs             Shared engine-routed copy primitive (retrieve→store, preserve multipart ETags, stamp provenance, retry transient) — used by replication + lifecycle

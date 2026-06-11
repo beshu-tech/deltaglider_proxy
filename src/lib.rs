@@ -20,6 +20,7 @@ pub mod event_delivery;
 pub mod event_outbox;
 pub mod iam;
 pub mod init;
+pub mod job_loop;
 pub mod lifecycle;
 pub mod maintenance;
 pub mod metadata_cache;

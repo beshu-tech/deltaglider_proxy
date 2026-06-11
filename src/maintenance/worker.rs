@@ -35,6 +35,7 @@ use crate::api::handlers::AppState;
 use crate::config::SharedConfig;
 use crate::config_apply::ConfigMutator;
 use crate::config_db::ConfigDb;
+use crate::job_loop::Pager;
 use crate::storage::encrypting::{ENCRYPTION_KEY_ID_KEY, ENCRYPTION_MARKER_KEY};
 use crate::transfer::{copy_object_with_retries, ObjectTransferRequest};
 
@@ -44,7 +45,6 @@ use super::{needs_rewrite, resolve_desired, strip_encryption_markers, DesiredEnc
 const POLL_INTERVAL_SECS: u64 = 3;
 const LEASE_TTL_SECS: i64 = 60;
 const PAGE_SIZE: u32 = 1000;
-const MAX_PAGES: u32 = 10_000;
 const MAX_FAILURES_RETAINED: usize = 200;
 const DRAIN_POLL_MS: u64 = 250;
 
@@ -177,7 +177,7 @@ async fn execute_phases(
     drain_inflight_writes(state, bucket).await?;
 
     let mut phase = job.phase.clone();
-    let mut token = job.continuation_token.clone();
+    let resume_token = job.continuation_token.clone();
     let mut total = job.objects_total;
     let mut done = job.objects_done;
     let mut skipped = job.objects_skipped;
@@ -187,46 +187,58 @@ async fn execute_phases(
     // ── Phase: counting ──
     if phase == "counting" {
         let mut count: i64 = 0;
-        for _ in 0..MAX_PAGES {
+        let mut pager = Pager::resuming(resume_token.clone());
+        while pager.begin_page().is_some() {
             check_cancel(db, job.id).await?;
             let engine = state.engine.load().clone();
-            let page = engine
-                .list_objects(bucket, "", None, PAGE_SIZE, token.as_deref(), false)
+            let page = match engine
+                .list_objects(bucket, "", None, PAGE_SIZE, pager.token(), false)
                 .await
-                .map_err(|e| format!("counting list failed: {e}"))?;
+            {
+                Ok(p) => p,
+                Err(e) if pager.poisoned_resume_token() => {
+                    // The persisted cursor is the prime suspect — drop it,
+                    // persist the clean cursor (a crash mid-retry must not
+                    // re-poison), and recount from page 0 (idempotent).
+                    warn!(
+                        "maintenance: job #{} counting resume token rejected ({e}); restarting phase fresh",
+                        job.id
+                    );
+                    pager.restart_fresh();
+                    count = 0;
+                    persist(db, job, "counting", Some(0), 0, 0, 0, 0, None).await;
+                    continue;
+                }
+                Err(e) => return Err(format!("counting list failed: {e}")),
+            };
             count += page
                 .objects
                 .iter()
                 .filter(|(k, _)| !k.ends_with('/'))
                 .count() as i64;
-            token = page.next_continuation_token;
-            persist(
-                db,
-                job,
-                "counting",
-                Some(count),
-                0,
-                0,
-                0,
-                0,
-                token.as_deref(),
-            )
-            .await;
+            let more = pager.advance(page.is_truncated, page.next_continuation_token);
+            persist(db, job, "counting", Some(count), 0, 0, 0, 0, pager.token()).await;
             heartbeat(db, job.id, instance_id).await;
-            if token.is_none() {
+            if !more {
                 break;
             }
         }
         total = Some(count);
         phase = "objects".to_string();
-        token = None;
         (done, skipped, failed, bytes) = (0, 0, 0, 0);
         persist(db, job, &phase, total, 0, 0, 0, 0, None).await;
     }
 
     // ── Phase: objects ──
     if phase == "objects" {
-        for _ in 0..MAX_PAGES {
+        // Resume only when the job was persisted IN this phase (a fresh
+        // transition from counting starts at page 0).
+        let mut pager = Pager::resuming(if job.phase == "objects" {
+            resume_token.clone()
+        } else {
+            None
+        });
+        while pager.begin_page().is_some() {
             check_cancel(db, job.id).await?;
             // Re-resolve the desired state every page: a config apply
             // mid-run swaps the engine; the job must follow (or abort if
@@ -236,10 +248,27 @@ async fn execute_phases(
                 resolve_desired(&cfg, bucket).map_err(|e| format!("config changed mid-run: {e}"))?
             };
             let engine = state.engine.load().clone();
-            let page = engine
-                .list_objects(bucket, "", None, PAGE_SIZE, token.as_deref(), false)
+            let page = match engine
+                .list_objects(bucket, "", None, PAGE_SIZE, pager.token(), false)
                 .await
-                .map_err(|e| format!("object list failed: {e}"))?;
+            {
+                Ok(p) => p,
+                Err(e) if pager.poisoned_resume_token() => {
+                    // Restart the phase from page 0: needs_rewrite makes the
+                    // re-scan idempotent (already-rewritten objects skip).
+                    warn!(
+                        "maintenance: job #{} objects resume token rejected ({e}); restarting phase fresh",
+                        job.id
+                    );
+                    pager.restart_fresh();
+                    persist(
+                        db, job, "objects", total, done, skipped, failed, bytes, None,
+                    )
+                    .await;
+                    continue;
+                }
+                Err(e) => return Err(format!("object list failed: {e}")),
+            };
 
             for (key, _) in page.objects.iter().filter(|(k, _)| !k.ends_with('/')) {
                 let meta = match engine.head(bucket, key).await {
@@ -277,7 +306,7 @@ async fn execute_phases(
                 }
             }
 
-            token = page.next_continuation_token;
+            let more = pager.advance(page.is_truncated, page.next_continuation_token);
             persist(
                 db,
                 job,
@@ -287,11 +316,11 @@ async fn execute_phases(
                 skipped,
                 failed,
                 bytes,
-                token.as_deref(),
+                pager.token(),
             )
             .await;
             heartbeat(db, job.id, instance_id).await;
-            if token.is_none() {
+            if !more {
                 break;
             }
         }

@@ -33,6 +33,7 @@ use crate::config_db::ConfigDb;
 use crate::config_sections::ReplicationRule;
 use crate::deltaglider::DynEngine;
 use crate::event_outbox::{EventKind, EventSource, NewEvent};
+use crate::job_loop::Pager;
 use crate::transfer::{
     copy_object_with_retries, ObjectTransferRequest, TransferProvenance,
     REPLICATION_RULE_METADATA_KEY,
@@ -65,11 +66,6 @@ pub struct RunLease {
     pub heartbeat_secs: i64,
 }
 
-/// Bound on the number of pages consumed in a single run, defending
-/// against pathological cases where pagination loops forever (the
-/// engine reports is_truncated=true but no next token, for example).
-const MAX_PAGES_PER_RUN: u32 = 10_000;
-
 pub async fn run_rule(
     db: Arc<Mutex<ConfigDb>>,
     engine: &Arc<DynEngine>,
@@ -82,7 +78,7 @@ pub async fn run_rule(
 
     // Look up the saved continuation token to resume from a prior tick.
     // Cleared at the end of a successful complete pass.
-    let (run_id, mut continuation) = {
+    let (run_id, continuation) = {
         let db = db.lock().await;
         db.replication_ensure_state(&rule.name, started_at)?;
         let state = db.replication_load_state(&rule.name)?;
@@ -90,7 +86,6 @@ pub async fn run_rule(
         let id = db.replication_begin_run(&rule.name, started_at, triggered_by)?;
         (id, resume_token)
     };
-    let resumed_from_token = continuation.is_some();
 
     info!(
         "Replication run starting: rule='{}' src={}/{} dst={}/{} resuming={}",
@@ -111,8 +106,9 @@ pub async fn run_rule(
     let heartbeat_handle =
         spawn_lease_heartbeat(db.clone(), &rule.name, lease.clone(), lease_alive.clone());
 
+    let mut pager = Pager::resuming(continuation);
     // ── Forward-copy pass: paginate source until exhausted ──
-    'pages: for page_idx in 0..MAX_PAGES_PER_RUN {
+    'pages: while let Some(page_idx) = pager.begin_page() {
         if !renew_run_lease(
             &db,
             rule,
@@ -134,7 +130,7 @@ pub async fn run_rule(
                 &source_prefix,
                 None,
                 cap,
-                continuation.as_deref(),
+                pager.token(),
                 true,
             )
             .await
@@ -149,7 +145,7 @@ pub async fn run_rule(
                 // to list most likely holds a backend-invalidated token —
                 // clear it so the next tick starts fresh instead of
                 // wedging every subsequent run on the same bad cursor.
-                if page_idx == 0 && resumed_from_token {
+                if pager.poisoned_resume_token() {
                     let db = db.lock().await;
                     let _ = db.replication_set_continuation_token(&rule.name, None);
                 }
@@ -303,15 +299,18 @@ pub async fn run_rule(
         // lock acquisition. Event-append is non-critical: a failure is
         // logged and the run continues (the copies themselves are
         // durable).
-        continuation = page.next_continuation_token.clone();
+        let more = pager.advance(page.is_truncated, page.next_continuation_token);
         {
+            // Single lock acquisition fuses the cursor persist, the run
+            // progress, and the page's event flush — do not split (see
+            // the throughput note above).
             let db = db.lock().await;
-            db.replication_set_continuation_token(&rule.name, continuation.as_deref())?;
+            db.replication_set_continuation_token(&rule.name, pager.token())?;
             db.replication_update_run_progress(run_id, totals)?;
             flush_page_events_locked(&db, &rule.name, &mut page_events);
         }
 
-        if !page.is_truncated || continuation.is_none() {
+        if !more {
             break 'pages;
         }
     }
@@ -537,10 +536,10 @@ async fn run_delete_pass(
     max_failures_retained: u32,
 ) -> Result<(), crate::config_db::ConfigDbError> {
     let cap = rule.batch_size.clamp(1, 10_000);
-    let mut cursor: Option<String> = None;
     let destination_prefix = normalize_prefix(&rule.destination.prefix);
 
-    'pages: for page_idx in 0..MAX_PAGES_PER_RUN {
+    let mut pager = Pager::fresh();
+    'pages: while let Some(page_idx) = pager.begin_page() {
         // metadata=true so user_metadata (carrying our provenance
         // marker, H2 fix) is populated in the listing — saves a
         // per-object HEAD round-trip.
@@ -550,7 +549,7 @@ async fn run_delete_pass(
                 &destination_prefix,
                 None,
                 cap,
-                cursor.as_deref(),
+                pager.token(),
                 true,
             )
             .await
@@ -681,8 +680,7 @@ async fn run_delete_pass(
             }
         }
 
-        cursor = page.next_continuation_token;
-        if !page.is_truncated || cursor.is_none() {
+        if !pager.advance(page.is_truncated, page.next_continuation_token) {
             break 'pages;
         }
     }
