@@ -135,7 +135,7 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         // the bucket they are viewing. The view carries only job
         // status/phase/counts — no config detail.
         .route(
-            "/_/api/admin/maintenance/bucket/:bucket",
+            "/_/api/admin/jobs/bucket/:bucket",
             get(admin::maintenance_bucket_status),
         )
         .route(
@@ -295,71 +295,18 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             "/_/api/admin/event-outbox/:id/requeue",
             post(admin::event_outbox_requeue_one),
         )
-        // Replication: overview + per-rule controls. Session-gated,
-        // not IAM-gated (admins manage replication the same way they
-        // manage other storage config).
+        // Jobs: ONE read+action surface over replication rules, lifecycle
+        // rules, and maintenance one-offs (reencrypt / migrate). Session-
+        // gated, not IAM-gated — admins manage background work the same
+        // way they manage other storage config.
+        .route("/_/api/admin/jobs", get(admin::jobs_list))
         .route(
-            "/_/api/admin/maintenance",
-            get(admin::maintenance_list_jobs),
-        )
-        .route(
-            "/_/api/admin/maintenance/reencrypt",
+            "/_/api/admin/jobs/reencrypt",
             post(admin::maintenance_start_reencrypt),
         )
-        .route(
-            "/_/api/admin/maintenance/jobs/:id/cancel",
-            post(admin::maintenance_cancel_job),
-        )
-        .route(
-            "/_/api/admin/replication",
-            get(admin::replication_list_rules),
-        )
-        .route(
-            "/_/api/admin/replication/rules/:name/run-now",
-            post(admin::replication_run_now),
-        )
-        .route(
-            "/_/api/admin/replication/rules/:name/pause",
-            post(admin::replication_pause),
-        )
-        .route(
-            "/_/api/admin/replication/rules/:name/resume",
-            post(admin::replication_resume),
-        )
-        .route(
-            "/_/api/admin/replication/rules/:name/history",
-            get(admin::replication_history),
-        )
-        .route(
-            "/_/api/admin/replication/rules/:name/failures",
-            get(admin::replication_failures),
-        )
-        // Lifecycle: delete-only expiration preview + explicit run-now.
-        .route("/_/api/admin/lifecycle", get(admin::lifecycle_list_rules))
-        .route(
-            "/_/api/admin/lifecycle/rules/:name/preview",
-            post(admin::lifecycle_preview),
-        )
-        .route(
-            "/_/api/admin/lifecycle/rules/:name/run-now",
-            post(admin::lifecycle_run_now),
-        )
-        .route(
-            "/_/api/admin/lifecycle/rules/:name/pause",
-            post(admin::lifecycle_pause),
-        )
-        .route(
-            "/_/api/admin/lifecycle/rules/:name/resume",
-            post(admin::lifecycle_resume),
-        )
-        .route(
-            "/_/api/admin/lifecycle/rules/:name/history",
-            get(admin::lifecycle_history),
-        )
-        .route(
-            "/_/api/admin/lifecycle/rules/:name/failures",
-            get(admin::lifecycle_failures),
-        )
+        .route("/_/api/admin/jobs/:id/runs", get(admin::jobs_runs))
+        .route("/_/api/admin/jobs/:id/failures", get(admin::jobs_failures))
+        .route("/_/api/admin/jobs/:id/:action", post(admin::jobs_action))
         // Server-side bulk object operations. Replaces what the
         // browser used to do via @aws-sdk/client-s3. Handlers call the
         // engine directly (no per-key SigV4 / IAM re-check on each

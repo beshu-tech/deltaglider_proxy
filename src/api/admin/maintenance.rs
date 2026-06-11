@@ -330,18 +330,6 @@ pub async fn start_migrate(
     ))
 }
 
-/// GET /_/api/admin/maintenance — recent jobs, newest first.
-pub async fn list_jobs(
-    State(state): State<Arc<AdminState>>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let jobs = super::with_config_db(&state, "list maintenance jobs", |db| {
-        db.maintenance_list_jobs(50)
-    })
-    .await?;
-    let views: Vec<MaintenanceJobView> = jobs.into_iter().map(Into::into).collect();
-    Ok(Json(serde_json::json!({ "jobs": views })))
-}
-
 /// POST /_/api/admin/maintenance/jobs/:id/cancel
 pub async fn cancel_job(
     State(state): State<Arc<AdminState>>,

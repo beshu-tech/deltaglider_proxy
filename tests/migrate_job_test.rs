@@ -64,9 +64,7 @@ async fn start_migrate(
 async fn wait_job_done(admin: &reqwest::Client, endpoint: &str, bucket: &str) {
     for _ in 0..600 {
         let v: serde_json::Value = admin
-            .get(format!(
-                "{endpoint}/_/api/admin/maintenance/bucket/{bucket}"
-            ))
+            .get(format!("{endpoint}/_/api/admin/jobs/bucket/{bucket}"))
             .send()
             .await
             .expect("status GET failed")
@@ -83,7 +81,7 @@ async fn wait_job_done(admin: &reqwest::Client, endpoint: &str, bucket: &str) {
 
 async fn newest_job(admin: &reqwest::Client, endpoint: &str) -> serde_json::Value {
     let v: serde_json::Value = admin
-        .get(format!("{endpoint}/_/api/admin/maintenance"))
+        .get(format!("{endpoint}/_/api/admin/jobs"))
         .send()
         .await
         .expect("jobs GET failed")
@@ -183,9 +181,9 @@ async fn test_migrate_full_cycle() {
     // ── Job row: migrate kind, completed, all 30 copied. ──
     let job = newest_job(&admin, &endpoint).await;
     assert_eq!(job["kind"], "migrate", "job: {job}");
-    assert_eq!(job["status"], "completed", "job: {job}");
-    assert_eq!(job["objects_done"], 30, "job: {job}");
-    assert_eq!(job["objects_failed"], 0, "job: {job}");
+    assert_eq!(job["status"], "succeeded", "job: {job}");
+    assert_eq!(job["progress"]["processed"], 30, "job: {job}");
+    assert_eq!(job["progress"]["failed"], 0, "job: {job}");
 
     // ── Config flipped + persisted; no transient leak. ──
     assert_eq!(
@@ -239,7 +237,7 @@ async fn test_migrate_delete_source() {
     wait_job_done(&admin, &endpoint, bucket).await;
 
     let job = newest_job(&admin, &endpoint).await;
-    assert_eq!(job["status"], "completed", "job: {job}");
+    assert_eq!(job["status"], "succeeded", "job: {job}");
 
     // Destination serves; source object files are gone.
     let bytes = get_bytes(&http, &endpoint, bucket, "obj-000.json").await;
@@ -326,7 +324,7 @@ async fn test_migrate_cancel_preflip_restores_source() {
 
     let cancel = admin
         .post(format!(
-            "{endpoint}/_/api/admin/maintenance/jobs/{job_id}/cancel"
+            "{endpoint}/_/api/admin/jobs/maintenance:{job_id}/cancel"
         ))
         .send()
         .await
@@ -341,7 +339,7 @@ async fn test_migrate_cancel_preflip_restores_source() {
     let job = newest_job(&admin, &endpoint).await;
     let status = job["status"].as_str().unwrap();
     assert!(
-        status == "cancelled" || status == "completed",
+        status == "cancelled" || status == "succeeded",
         "terminal expected: {job}"
     );
 

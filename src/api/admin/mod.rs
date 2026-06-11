@@ -12,6 +12,7 @@ mod delta_efficiency;
 mod event_outbox;
 pub mod external_auth;
 mod groups;
+pub(crate) mod jobs;
 mod lifecycle;
 pub(crate) mod maintenance;
 pub(crate) mod objects;
@@ -72,25 +73,17 @@ pub use groups::{
     add_group_member, clone_group, create_group, delete_group, list_groups, remove_group_member,
     update_group, AddGroupMemberRequest, CloneGroupRequest, CreateGroupRequest, UpdateGroupRequest,
 };
-pub use lifecycle::{
-    failures as lifecycle_failures, history as lifecycle_history,
-    list_rules as lifecycle_list_rules, pause as lifecycle_pause, preview as lifecycle_preview,
-    resume as lifecycle_resume, run_now as lifecycle_run_now, LifecycleOverview,
-    LifecycleRuleOverview,
+pub use jobs::{
+    job_action as jobs_action, job_failures as jobs_failures, job_runs as jobs_runs,
+    list_jobs as jobs_list,
 };
 pub use maintenance::{
-    bucket_status as maintenance_bucket_status, cancel_job as maintenance_cancel_job,
-    list_jobs as maintenance_list_jobs, start_migrate as maintenance_start_migrate,
+    bucket_status as maintenance_bucket_status, start_migrate as maintenance_start_migrate,
     start_reencrypt as maintenance_start_reencrypt,
 };
 pub use objects::{
     bulk_delete as bulk_delete_objects, copy_objects, download_zip, list_all as list_all_objects,
     move_objects,
-};
-pub use replication::{
-    failures as replication_failures, history as replication_history,
-    list_rules as replication_list_rules, pause as replication_pause, resume as replication_resume,
-    run_now as replication_run_now,
 };
 pub use savings::{get_savings, SavingsCache};
 pub use scanner::{get_usage, migrate_legacy, scan_usage, ScanUsageRequest, UsageQuery};

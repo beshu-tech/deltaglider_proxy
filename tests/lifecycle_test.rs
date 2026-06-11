@@ -120,7 +120,7 @@ async fn test_lifecycle_run_now_deletes_visible_expired_and_preserves_skipped_ke
     let admin = admin_http_client(&server.endpoint()).await;
     let preview: Value = admin
         .post(format!(
-            "{}/_/api/admin/lifecycle/rules/expire-old-prefix/preview",
+            "{}/_/api/admin/jobs/lifecycle:expire-old-prefix/preview",
             server.endpoint()
         ))
         .send()
@@ -134,7 +134,7 @@ async fn test_lifecycle_run_now_deletes_visible_expired_and_preserves_skipped_ke
 
     let history_before: Value = admin
         .get(format!(
-            "{}/_/api/admin/lifecycle/rules/expire-old-prefix/history",
+            "{}/_/api/admin/jobs/lifecycle:expire-old-prefix/runs",
             server.endpoint()
         ))
         .send()
@@ -151,7 +151,7 @@ async fn test_lifecycle_run_now_deletes_visible_expired_and_preserves_skipped_ke
 
     let run: Value = admin
         .post(format!(
-            "{}/_/api/admin/lifecycle/rules/expire-old-prefix/run-now",
+            "{}/_/api/admin/jobs/lifecycle:expire-old-prefix/run-now",
             server.endpoint()
         ))
         .send()
@@ -168,7 +168,7 @@ async fn test_lifecycle_run_now_deletes_visible_expired_and_preserves_skipped_ke
 
     let history_after: Value = admin
         .get(format!(
-            "{}/_/api/admin/lifecycle/rules/expire-old-prefix/history",
+            "{}/_/api/admin/jobs/lifecycle:expire-old-prefix/runs",
             server.endpoint()
         ))
         .send()
@@ -183,13 +183,13 @@ async fn test_lifecycle_run_now_deletes_visible_expired_and_preserves_skipped_ke
         Some("run-now")
     );
     assert_eq!(
-        history_after["runs"][0]["objects_affected"].as_i64(),
+        history_after["runs"][0]["objects_processed"].as_i64(),
         Some(1)
     );
 
     let failures: Value = admin
         .get(format!(
-            "{}/_/api/admin/lifecycle/rules/expire-old-prefix/failures",
+            "{}/_/api/admin/jobs/lifecycle:expire-old-prefix/failures",
             server.endpoint()
         ))
         .send()
@@ -250,7 +250,7 @@ async fn test_lifecycle_transition_copies_expired_object_and_preserves_source() 
     let admin = admin_http_client(&server.endpoint()).await;
     let preview: Value = admin
         .post(format!(
-            "{}/_/api/admin/lifecycle/rules/archive-old/preview",
+            "{}/_/api/admin/jobs/lifecycle:archive-old/preview",
             server.endpoint()
         ))
         .send()
@@ -275,7 +275,7 @@ async fn test_lifecycle_transition_copies_expired_object_and_preserves_source() 
 
     let run: Value = admin
         .post(format!(
-            "{}/_/api/admin/lifecycle/rules/archive-old/run-now",
+            "{}/_/api/admin/jobs/lifecycle:archive-old/run-now",
             server.endpoint()
         ))
         .send()
@@ -335,7 +335,7 @@ async fn test_lifecycle_transition_delete_source_after_success() {
     let admin = admin_http_client(&server.endpoint()).await;
     let run: Value = admin
         .post(format!(
-            "{}/_/api/admin/lifecycle/rules/move-old/run-now",
+            "{}/_/api/admin/jobs/lifecycle:move-old/run-now",
             server.endpoint()
         ))
         .send()
@@ -388,7 +388,7 @@ async fn test_lifecycle_transition_copy_failure_does_not_delete_source() {
     let admin = admin_http_client(&server.endpoint()).await;
     let run: Value = admin
         .post(format!(
-            "{}/_/api/admin/lifecycle/rules/failed-move/run-now",
+            "{}/_/api/admin/jobs/lifecycle:failed-move/run-now",
             server.endpoint()
         ))
         .send()
@@ -408,4 +408,105 @@ async fn test_lifecycle_transition_copy_failure_does_not_delete_source() {
         .send()
         .await
         .expect("source must survive failed transition copy");
+}
+
+/// Pause/resume parity (new in the unified jobs API): a paused lifecycle
+/// rule 409s run-now until resumed, and the jobs overview reports the flag.
+#[tokio::test]
+async fn test_lifecycle_pause_blocks_run_now() {
+    let server = TestServer::builder()
+        .bucket("life-pause")
+        .extra_yaml_storage_section(
+            r#"
+lifecycle:
+  enabled: true
+  tick_interval: "1h"
+  rules:
+    - name: pause-me
+      enabled: true
+      bucket: life-pause
+      prefix: ""
+      expire_after: "1ms"
+      batch_size: 100
+      include_globs: ["**"]
+      exclude_globs: []
+"#,
+        )
+        .build()
+        .await;
+    let admin = common::admin_http_client(&server.endpoint()).await;
+
+    let pause = admin
+        .post(format!(
+            "{}/_/api/admin/jobs/lifecycle:pause-me/pause",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(pause.status().is_success(), "pause: {}", pause.status());
+
+    let run = admin
+        .post(format!(
+            "{}/_/api/admin/jobs/lifecycle:pause-me/run-now",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(run.status(), 409, "paused rule must refuse run-now");
+
+    // Overview reports paused=true with the unified row shape.
+    let body: Value = admin
+        .get(format!("{}/_/api/admin/jobs", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = body["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|j| j["id"] == "lifecycle:pause-me")
+        .expect("rule visible in jobs overview")
+        .clone();
+    assert_eq!(row["kind"], "lifecycle");
+    assert_eq!(row["trigger"], "scheduled");
+    assert_eq!(row["paused"], true, "{row}");
+
+    let resume = admin
+        .post(format!(
+            "{}/_/api/admin/jobs/lifecycle:pause-me/resume",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(resume.status().is_success());
+    let run = admin
+        .post(format!(
+            "{}/_/api/admin/jobs/lifecycle:pause-me/run-now",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        run.status().is_success(),
+        "resumed rule runs: {}",
+        run.status()
+    );
+
+    // Unsupported action on a rule kind → 400 with the supported list.
+    let bad = admin
+        .post(format!(
+            "{}/_/api/admin/jobs/lifecycle:pause-me/cancel",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400, "cancel unsupported for lifecycle rules");
 }

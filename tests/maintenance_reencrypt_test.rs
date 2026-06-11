@@ -50,7 +50,7 @@ async fn start_reencrypt(
     bucket: &str,
 ) -> serde_json::Value {
     let resp = admin
-        .post(format!("{endpoint}/_/api/admin/maintenance/reencrypt"))
+        .post(format!("{endpoint}/_/api/admin/jobs/reencrypt"))
         .json(&serde_json::json!({ "buckets": [bucket] }))
         .send()
         .await
@@ -67,9 +67,7 @@ async fn start_reencrypt(
 async fn wait_job_done(admin: &reqwest::Client, endpoint: &str, bucket: &str) {
     for _ in 0..600 {
         let v: serde_json::Value = admin
-            .get(format!(
-                "{endpoint}/_/api/admin/maintenance/bucket/{bucket}"
-            ))
+            .get(format!("{endpoint}/_/api/admin/jobs/bucket/{bucket}"))
             .send()
             .await
             .expect("status GET failed")
@@ -87,7 +85,7 @@ async fn wait_job_done(admin: &reqwest::Client, endpoint: &str, bucket: &str) {
 /// Newest job row from the admin list.
 async fn newest_job(admin: &reqwest::Client, endpoint: &str) -> serde_json::Value {
     let v: serde_json::Value = admin
-        .get(format!("{endpoint}/_/api/admin/maintenance"))
+        .get(format!("{endpoint}/_/api/admin/jobs"))
         .send()
         .await
         .expect("jobs GET failed")
@@ -216,10 +214,13 @@ async fn test_reencrypt_full_cycle() {
 
     // ── Job row: completed, everything rewritten, nothing failed. ──
     let job = newest_job(&admin, &endpoint).await;
-    assert_eq!(job["status"], "completed", "job: {job}");
-    assert_eq!(job["objects_failed"], 0, "job: {job}");
-    assert_eq!(job["objects_total"], 42, "job: {job}");
-    assert_eq!(job["objects_done"], 42, "all objects were plaintext: {job}");
+    assert_eq!(job["status"], "succeeded", "job: {job}");
+    assert_eq!(job["progress"]["failed"], 0, "job: {job}");
+    assert_eq!(job["progress"]["total"], 42, "job: {job}");
+    assert_eq!(
+        job["progress"]["processed"], 42,
+        "all objects were plaintext: {job}"
+    );
     assert_eq!(job["percent"], 100, "job: {job}");
 
     // The dg-encrypted / dg-encryption-key-id markers are INTERNAL —
@@ -292,12 +293,15 @@ async fn test_reencrypt_full_cycle() {
     start_reencrypt(&admin, &endpoint, bucket).await;
     wait_job_done(&admin, &endpoint, bucket).await;
     let job2 = newest_job(&admin, &endpoint).await;
-    assert_eq!(job2["status"], "completed", "job2: {job2}");
+    assert_eq!(job2["status"], "succeeded", "job2: {job2}");
     assert_eq!(
-        job2["objects_done"], 0,
+        job2["progress"]["processed"], 0,
         "everything already encrypted: {job2}"
     );
-    assert_eq!(job2["objects_skipped"], 43, "42 seeded + after.txt: {job2}");
+    assert_eq!(
+        job2["progress"]["skipped"], 43,
+        "42 seeded + after.txt: {job2}"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -339,9 +343,9 @@ async fn test_decrypt_after_disable_strips_markers() {
     start_reencrypt(&admin, &endpoint, bucket).await;
     wait_job_done(&admin, &endpoint, bucket).await;
     let job = newest_job(&admin, &endpoint).await;
-    assert_eq!(job["status"], "completed", "job: {job}");
-    assert_eq!(job["objects_failed"], 0, "job: {job}");
-    assert_eq!(job["objects_done"], 1, "job: {job}");
+    assert_eq!(job["status"], "succeeded", "job: {job}");
+    assert_eq!(job["progress"]["failed"], 0, "job: {job}");
+    assert_eq!(job["progress"]["processed"], 1, "job: {job}");
 
     // The marker must be GONE — a decrypted object that kept its
     // dg-encrypted metadata would fail AEAD on every read. The GET below
@@ -411,7 +415,7 @@ async fn test_cancel_releases_gate() {
 
     let cancel = admin
         .post(format!(
-            "{endpoint}/_/api/admin/maintenance/jobs/{job_id}/cancel"
+            "{endpoint}/_/api/admin/jobs/maintenance:{job_id}/cancel"
         ))
         .send()
         .await
@@ -428,7 +432,7 @@ async fn test_cancel_releases_gate() {
     let job = newest_job(&admin, &endpoint).await;
     let status = job["status"].as_str().unwrap();
     assert!(
-        status == "cancelled" || status == "completed",
+        status == "cancelled" || status == "succeeded",
         "terminal state expected, got {job}"
     );
 

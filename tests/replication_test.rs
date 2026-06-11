@@ -161,7 +161,7 @@ async fn test_replication_run_now_copies_missing_objects() {
     let admin = admin_http_client(&server.endpoint()).await;
     let resp = admin
         .post(format!(
-            "{}/_/api/admin/replication/rules/repl-a-to-b/run-now",
+            "{}/_/api/admin/jobs/replication:repl-a-to-b/run-now",
             server.endpoint()
         ))
         .send()
@@ -197,7 +197,7 @@ async fn test_replication_run_now_copies_missing_objects() {
     // History endpoint: 1 run, status=succeeded, objects_copied=3.
     let hist: Value = admin
         .get(format!(
-            "{}/_/api/admin/replication/rules/repl-a-to-b/history",
+            "{}/_/api/admin/jobs/replication:repl-a-to-b/runs",
             server.endpoint()
         ))
         .send()
@@ -210,7 +210,7 @@ async fn test_replication_run_now_copies_missing_objects() {
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0]["status"].as_str(), Some("succeeded"));
     assert_eq!(runs[0]["triggered_by"].as_str(), Some("run-now"));
-    assert_eq!(runs[0]["objects_copied"].as_i64(), Some(3));
+    assert_eq!(runs[0]["objects_processed"].as_i64(), Some(3));
 }
 
 /// Scheduler regression: a rule added via the storage section should run
@@ -290,7 +290,7 @@ async fn test_replication_scheduler_copies_due_rule() {
     // plenty since the file already arrived; if status never settles
     // we have a real bug worth surfacing as the timeout.
     let history_url = format!(
-        "{}/_/api/admin/replication/rules/scheduler-rule/history",
+        "{}/_/api/admin/jobs/replication:scheduler-rule/runs",
         server.endpoint()
     );
     let status_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -321,7 +321,7 @@ async fn test_replication_scheduler_copies_due_rule() {
     assert_eq!(runs.len(), 1, "expected exactly one scheduler run: {hist}");
     assert_eq!(runs[0]["status"].as_str(), Some("succeeded"));
     assert_eq!(runs[0]["triggered_by"].as_str(), Some("scheduler"));
-    assert_eq!(runs[0]["objects_copied"].as_i64(), Some(1));
+    assert_eq!(runs[0]["objects_processed"].as_i64(), Some(1));
 }
 
 /// Prefix normalization regression: direct YAML may use `prefix: "source"`
@@ -361,7 +361,7 @@ async fn test_replication_normalizes_prefixes_at_worker_boundaries() {
     let admin = admin_http_client(&server.endpoint()).await;
     let resp = admin
         .post(format!(
-            "{}/_/api/admin/replication/rules/prefix-normalization-rule/run-now",
+            "{}/_/api/admin/jobs/replication:prefix-normalization-rule/run-now",
             server.endpoint()
         ))
         .send()
@@ -408,7 +408,7 @@ async fn test_replication_paused_rule_blocks_run_now() {
     // Pause the rule.
     let resp = admin
         .post(format!(
-            "{}/_/api/admin/replication/rules/paused-rule/pause",
+            "{}/_/api/admin/jobs/replication:paused-rule/pause",
             server.endpoint()
         ))
         .send()
@@ -419,7 +419,7 @@ async fn test_replication_paused_rule_blocks_run_now() {
     // Run-now must 409.
     let resp = admin
         .post(format!(
-            "{}/_/api/admin/replication/rules/paused-rule/run-now",
+            "{}/_/api/admin/jobs/replication:paused-rule/run-now",
             server.endpoint()
         ))
         .send()
@@ -430,7 +430,7 @@ async fn test_replication_paused_rule_blocks_run_now() {
     // Resume + verify run-now now accepts the call (with zero work).
     admin
         .post(format!(
-            "{}/_/api/admin/replication/rules/paused-rule/resume",
+            "{}/_/api/admin/jobs/replication:paused-rule/resume",
             server.endpoint()
         ))
         .send()
@@ -438,7 +438,7 @@ async fn test_replication_paused_rule_blocks_run_now() {
         .unwrap();
     let resp = admin
         .post(format!(
-            "{}/_/api/admin/replication/rules/paused-rule/run-now",
+            "{}/_/api/admin/jobs/replication:paused-rule/run-now",
             server.endpoint()
         ))
         .send()
@@ -479,7 +479,7 @@ async fn test_replication_paginates_until_complete() {
     let admin = admin_http_client(&server.endpoint()).await;
     let resp = admin
         .post(format!(
-            "{}/_/api/admin/replication/rules/multipage-rule/run-now",
+            "{}/_/api/admin/jobs/replication:multipage-rule/run-now",
             server.endpoint()
         ))
         .send()
@@ -511,7 +511,7 @@ async fn test_replication_paginates_until_complete() {
     // and conflict=newer-wins skips equal-or-older destinations.)
     let resp = admin
         .post(format!(
-            "{}/_/api/admin/replication/rules/multipage-rule/run-now",
+            "{}/_/api/admin/jobs/replication:multipage-rule/run-now",
             server.endpoint()
         ))
         .send()
@@ -572,7 +572,7 @@ async fn test_replication_replicate_deletes_removes_orphans() {
     // `manual.txt` is preserved because it has no provenance marker.
     let resp = admin
         .post(format!(
-            "{}/_/api/admin/replication/rules/delete-rule/run-now",
+            "{}/_/api/admin/jobs/replication:delete-rule/run-now",
             server.endpoint()
         ))
         .send()
@@ -610,7 +610,7 @@ async fn test_replication_replicate_deletes_removes_orphans() {
 
     let resp = admin
         .post(format!(
-            "{}/_/api/admin/replication/rules/delete-rule/run-now",
+            "{}/_/api/admin/jobs/replication:delete-rule/run-now",
             server.endpoint()
         ))
         .send()
@@ -668,7 +668,7 @@ async fn test_pause_resume_ghost_rule_returns_404_without_inserting_row() {
     for action in ["pause", "resume"] {
         let resp = admin
             .post(format!(
-                "{}/_/api/admin/replication/rules/ghost-rule/{}",
+                "{}/_/api/admin/jobs/replication:ghost-rule/{}",
                 server.endpoint(),
                 action
             ))
@@ -685,12 +685,12 @@ async fn test_pause_resume_ghost_rule_returns_404_without_inserting_row() {
 
     // Verify the overview doesn't list the ghost rule (no orphan row).
     let resp = admin
-        .get(format!("{}/_/api/admin/replication", server.endpoint()))
+        .get(format!("{}/_/api/admin/jobs", server.endpoint()))
         .send()
         .await
         .unwrap();
     let body: Value = resp.json().await.unwrap();
-    let names: Vec<&str> = body["rules"]
+    let names: Vec<&str> = body["jobs"]
         .as_array()
         .unwrap()
         .iter()
@@ -726,7 +726,7 @@ replication:
 
     let resp = admin
         .post(format!(
-            "{}/_/api/admin/replication/rules/disabled-rule/run-now",
+            "{}/_/api/admin/jobs/replication:disabled-rule/run-now",
             server.endpoint()
         ))
         .send()
@@ -763,7 +763,7 @@ replication:
 
     let resp = admin
         .post(format!(
-            "{}/_/api/admin/replication/rules/orphan/run-now",
+            "{}/_/api/admin/jobs/replication:orphan/run-now",
             server.endpoint()
         ))
         .send()
@@ -881,7 +881,7 @@ replication:
     let admin = admin_http_client(&server.endpoint()).await;
     let resp = admin
         .post(format!(
-            "{}/_/api/admin/replication/rules/mp-etag-rule/run-now",
+            "{}/_/api/admin/jobs/replication:mp-etag-rule/run-now",
             server.endpoint()
         ))
         .send()
@@ -1017,7 +1017,7 @@ async fn test_replication_delete_pass_skips_sibling_rule_keys() {
     for rule_name in ["sibling-a", "sibling-b"] {
         let resp = admin
             .post(format!(
-                "{}/_/api/admin/replication/rules/{}/run-now",
+                "{}/_/api/admin/jobs/replication:{}/run-now",
                 server.endpoint(),
                 rule_name
             ))
@@ -1059,7 +1059,7 @@ async fn test_replication_delete_pass_skips_sibling_rule_keys() {
 
     let resp = admin
         .post(format!(
-            "{}/_/api/admin/replication/rules/sibling-a/run-now",
+            "{}/_/api/admin/jobs/replication:sibling-a/run-now",
             server.endpoint()
         ))
         .send()
@@ -1180,7 +1180,7 @@ async fn test_replication_any_error_flips_status_to_failed() {
     let admin = admin_http_client(&server.endpoint()).await;
     let resp = admin
         .post(format!(
-            "{}/_/api/admin/replication/rules/missing-dst-rule/run-now",
+            "{}/_/api/admin/jobs/replication:missing-dst-rule/run-now",
             server.endpoint()
         ))
         .send()
