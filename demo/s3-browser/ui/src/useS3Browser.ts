@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { message } from 'antd';
-import { listObjects, uploadObject, getBucket, setBucket, headObject, hasCredentials } from './s3client';
+import { listObjects, getBucket, setBucket, headObject, hasCredentials } from './s3client';
 import { buildBrowserUrl } from './urlState';
 import {
   bulkCopyObjects,
@@ -475,23 +475,6 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     document.body.removeChild(a);
   }, [resolveSelectedKeys]);
 
-  const uploadFiles = useCallback(async (files: FileList) => {
-    const currentPrefix = prefixRef.current;
-    try {
-      for (const file of Array.from(files)) {
-        const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
-        const cleanRelativePath = relativePath.replace(/^\/+/, '').replace(/\/{2,}/g, '/');
-        const key = currentPrefix ? `${currentPrefix}${cleanRelativePath}` : cleanRelativePath;
-        await uploadObject(key, file);
-      }
-      setRefreshTrigger((k) => k + 1);
-    } catch (e) {
-      const msg = normalizeUiError(e, 'Upload failed');
-      setError(msg);
-      message.error(msg);
-    }
-  }, []);
-
   // Per-prefix delta savings, fetched from the server-side endpoint that
   // owns the canonical (reference-aware) math. Previously this was a
   // client-side accumulator over `headCache`, which undercounted by one
@@ -563,7 +546,6 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     bulkCopy,
     bulkMove,
     downloadZip,
-    uploadFiles,
     // Status
     deleting,
     // Search

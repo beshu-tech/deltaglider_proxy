@@ -5,6 +5,7 @@ import {
   FolderAddOutlined,
   ArrowLeftOutlined,
   DeleteOutlined,
+  CheckCircleFilled,
 } from '@ant-design/icons';
 import { getBucket } from '../s3client';
 import { formatBytes } from '../utils';
@@ -18,9 +19,20 @@ interface Props {
   prefix: string;
   onBack: () => void;
   onDone: () => void;
+  /** Files dropped onto the browser, staged for confirmation before upload. */
+  initialFiles?: File[];
+  /** Called once after the staged files have been taken, so App can clear them. */
+  onConsumeInitialFiles?: () => void;
+  /** "Big OK" when uploads finish: jump to the browser at the destination prefix. */
+  onFinish?: (destinationPrefix: string) => void;
 }
 
-export default function UploadPage({ prefix, onBack, onDone }: Props) {
+/** Normalize a destination prefix: strip leading/trailing/duplicate slashes. */
+function normalizeDestination(dest: string): string {
+  return dest.replace(/^\/+/, '').replace(/\/+$/, '').replace(/\/{2,}/g, '/');
+}
+
+export default function UploadPage({ prefix, onBack, onDone, initialFiles, onConsumeInitialFiles, onFinish }: Props) {
   const {
     BG_BASE, BG_ELEVATED, BORDER, TEXT_PRIMARY,
     TEXT_SECONDARY, TEXT_MUTED, ACCENT_BLUE, ACCENT_GREEN, ACCENT_RED, ACCENT_PURPLE, ACCENT_AMBER,
@@ -34,6 +46,11 @@ export default function UploadPage({ prefix, onBack, onDone }: Props) {
   const dropRef = useRef<HTMLDivElement>(null);
 
   const bucket = getBucket();
+  // Files staged from a drop (Finder→browser OR onto this page's drop zone),
+  // awaiting the user's confirmation of the destination before they enter the
+  // upload queue. Only the explicit "Select files/folder" buttons commit
+  // immediately — a deliberate pick made while looking at the destination.
+  const [pendingFiles, setPendingFiles] = useState<File[]>([]);
   const {
     queue,
     stats,
@@ -45,6 +62,39 @@ export default function UploadPage({ prefix, onBack, onDone }: Props) {
     cancelUpload,
     retryUpload,
   } = useUploadQueue(destination);
+
+  // Take the dropped files once, into the pending-confirmation staging area.
+  const consumedRef = useRef(false);
+  useEffect(() => {
+    if (consumedRef.current) return;
+    if (initialFiles && initialFiles.length > 0) {
+      consumedRef.current = true;
+      setPendingFiles(initialFiles);
+      onConsumeInitialFiles?.();
+    }
+  }, [initialFiles, onConsumeInitialFiles]);
+
+  const commitPending = () => {
+    if (pendingFiles.length === 0) return;
+    addFiles(pendingFiles);
+    setPendingFiles([]);
+  };
+
+  const normalizedDest = normalizeDestination(destination);
+  const destLabel = normalizedDest ? `${normalizedDest}/` : '/ (bucket root)';
+
+  // Finished = the queue has settled (nothing queued/uploading) AND at least one
+  // file actually succeeded. A batch that ALL failed leaves pendingCount at 0
+  // too, but must NOT show the green "Done — go to folder" affordance — the user
+  // should retry, not be sent to an empty folder.
+  const succeeded = queue.filter((i) => i.status === 'success');
+  const allUploaded = queue.length > 0 && pendingCount === 0 && succeeded.length > 0;
+  // Navigate to where the files ACTUALLY landed (the destination captured on the
+  // queued items at upload time), not the live input — which the user may have
+  // edited after the upload finished. Use the LAST success so a session with two
+  // batches to different folders lands at the most recent one.
+  const uploadedDest = succeeded[succeeded.length - 1]?.destination ?? normalizedDest;
+  const uploadedDestLabel = uploadedDest ? `${uploadedDest}/` : '/ (bucket root)';
 
   useEffect(() => {
     const el = dropRef.current;
@@ -73,7 +123,11 @@ export default function UploadPage({ prefix, onBack, onDone }: Props) {
       dragCount = 0;
       setDragging(false);
       if (e.dataTransfer?.files.length) {
-        addFiles(e.dataTransfer.files);
+        // Stage dropped files (don't upload yet) so the destination can be
+        // confirmed — consistent with a Finder→browser drop. The explicit
+        // "Select files/folder" buttons commit immediately instead.
+        const dropped = Array.from(e.dataTransfer.files);
+        setPendingFiles((prev) => [...prev, ...dropped]);
       }
     };
 
@@ -87,7 +141,8 @@ export default function UploadPage({ prefix, onBack, onDone }: Props) {
       el.removeEventListener('dragover', onDragOver);
       el.removeEventListener('drop', onDrop);
     };
-  }, [addFiles]);
+    // setPendingFiles is stable; the listeners need no other deps.
+  }, []);
 
   const handleBack = () => {
     onDone();
@@ -132,28 +187,88 @@ export default function UploadPage({ prefix, onBack, onDone }: Props) {
         Drag and drop files, or select files and folders to upload. Files are automatically compressed with delta encoding.
       </Text>
 
-      {/* Upload destination */}
-      <div style={{ marginBottom: 24 }}>
+      {/* Upload destination — the clear, editable target path. */}
+      <div
+        style={{
+          marginBottom: 24,
+          padding: 16,
+          borderRadius: 12,
+          background: BG_ELEVATED,
+          border: `1px solid ${BORDER}`,
+        }}
+      >
         <label htmlFor="upload-destination" style={{ fontSize: 11, fontWeight: 600, color: TEXT_MUTED, textTransform: 'uppercase', letterSpacing: 1, display: 'block', marginBottom: 8, fontFamily: "var(--font-ui)" }}>
-          Upload Destination
+          Files will be uploaded to
         </label>
+        {/* Full target path readout: bucket / prefix — the unambiguous landing spot. */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10, flexWrap: 'wrap', fontFamily: 'var(--font-mono)', fontSize: 14 }}>
+          <CloudUploadOutlined aria-hidden="true" style={{ color: ACCENT_BLUE }} />
+          <Text style={{ color: TEXT_SECONDARY, fontFamily: 'var(--font-mono)' }}>{bucket}</Text>
+          <Text style={{ color: TEXT_MUTED }} aria-hidden="true">/</Text>
+          <Text strong style={{ color: ACCENT_BLUE, fontFamily: 'var(--font-mono)' }} aria-live="polite">
+            {normalizedDest ? `${normalizedDest}/` : '(bucket root)'}
+          </Text>
+        </div>
         <div style={{ display: 'flex', gap: 8 }}>
           <Input
             id="upload-destination"
             value={destination}
             onChange={(e) => setDestination(e.target.value)}
             placeholder="/ (bucket root)"
+            aria-label="Destination path prefix — edit to change where files land"
             style={{ background: 'var(--input-bg)', borderColor: BORDER, color: TEXT_PRIMARY, fontFamily: "var(--font-mono)", fontSize: 13, flex: 1, borderRadius: 8 }}
           />
           <Button
             icon={<FolderAddOutlined />}
             onClick={handleNewFolder}
-            style={{ background: BG_ELEVATED, borderColor: BORDER, color: TEXT_SECONDARY, borderRadius: 8 }}
+            style={{ background: BG_BASE, borderColor: BORDER, color: TEXT_SECONDARY, borderRadius: 8 }}
           >
             New folder
           </Button>
         </div>
+        <Text style={{ display: 'block', marginTop: 8, fontSize: 12, color: TEXT_MUTED, fontFamily: 'var(--font-ui)' }}>
+          Edit the path above to change the destination folder. It is created if it doesn&rsquo;t exist.
+        </Text>
       </div>
+
+      {/* Pending dropped files — confirm the destination before they upload. */}
+      {pendingFiles.length > 0 && (
+        <div
+          style={{
+            marginBottom: 24,
+            padding: 16,
+            borderRadius: 12,
+            background: 'var(--drop-glow)',
+            border: `1px solid ${ACCENT_BLUE}`,
+          }}
+        >
+          <Text style={{ display: 'block', fontSize: 14, color: TEXT_PRIMARY, fontFamily: 'var(--font-ui)', fontWeight: 600, marginBottom: 4 }}>
+            {pendingFiles.length} file{pendingFiles.length !== 1 ? 's' : ''} ready to upload
+          </Text>
+          <Text style={{ display: 'block', fontSize: 12, color: TEXT_SECONDARY, fontFamily: 'var(--font-ui)', marginBottom: 12 }}>
+            Check the destination above, then start the upload. {pendingFiles.slice(0, 3).map((f) => f.name).join(', ')}
+            {pendingFiles.length > 3 ? `, +${pendingFiles.length - 3} more` : ''}
+          </Text>
+          <Space>
+            <Button
+              type="primary"
+              size="large"
+              icon={<CloudUploadOutlined />}
+              onClick={commitPending}
+              style={{ borderRadius: 8, fontWeight: 600 }}
+            >
+              Upload {pendingFiles.length} file{pendingFiles.length !== 1 ? 's' : ''} to {destLabel}
+            </Button>
+            <Button
+              size="large"
+              onClick={() => setPendingFiles([])}
+              style={{ background: BG_ELEVATED, borderColor: BORDER, color: TEXT_SECONDARY, borderRadius: 8 }}
+            >
+              Cancel
+            </Button>
+          </Space>
+        </div>
+      )}
 
       {/* New folder modal */}
       <Modal
@@ -317,20 +432,45 @@ export default function UploadPage({ prefix, onBack, onDone }: Props) {
         </div>
       )}
 
-      {/* Back button */}
-      <Button
-        icon={<ArrowLeftOutlined />}
-        onClick={handleBack}
-        style={{ background: BG_ELEVATED, borderColor: BORDER, color: TEXT_SECONDARY, borderRadius: 8 }}
-      >
-        Back to browse
-      </Button>
-
-      {pendingCount > 0 && (
-        <Text aria-live="polite" role="status" style={{ marginLeft: 16, fontSize: 12, color: ACCENT_BLUE, fontFamily: "var(--font-mono)" }}>
-          {pendingCount} file{pendingCount !== 1 ? 's' : ''} remaining...
-        </Text>
-      )}
+      {/* Footer actions. When every upload has finished, lead with the big
+          "Done" button that jumps straight to the folder the files landed in. */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+        {allUploaded ? (
+          <>
+            <Button
+              type="primary"
+              size="large"
+              icon={<CheckCircleFilled />}
+              onClick={() => {
+                onDone();
+                if (onFinish) onFinish(uploadedDest);
+                else onBack();
+              }}
+              style={{ borderRadius: 8, fontWeight: 600, minWidth: 220 }}
+            >
+              Done — go to {uploadedDestLabel}
+            </Button>
+            <Text aria-live="polite" role="status" style={{ fontSize: 13, color: ACCENT_GREEN, fontFamily: 'var(--font-ui)' }}>
+              {stats.uploaded} file{stats.uploaded !== 1 ? 's' : ''} uploaded
+            </Text>
+          </>
+        ) : (
+          <>
+            <Button
+              icon={<ArrowLeftOutlined />}
+              onClick={handleBack}
+              style={{ background: BG_ELEVATED, borderColor: BORDER, color: TEXT_SECONDARY, borderRadius: 8 }}
+            >
+              Back to browse
+            </Button>
+            {pendingCount > 0 && (
+              <Text aria-live="polite" role="status" style={{ fontSize: 12, color: ACCENT_BLUE, fontFamily: "var(--font-mono)" }}>
+                {pendingCount} file{pendingCount !== 1 ? 's' : ''} remaining...
+              </Text>
+            )}
+          </>
+        )}
+      </div>
     </div>
   );
 }

@@ -70,6 +70,17 @@ export default function App() {
   const [identity, setIdentity] = useState<WhoamiResponse | null>(null);
   const [bucketCount, setBucketCount] = useState<number | null>(null);
   const [createBucketFocusSignal, setCreateBucketFocusSignal] = useState(0);
+  // Files dropped onto the browser (from Finder) are staged here and the Upload
+  // view is opened so the user can confirm/adjust the destination prefix before
+  // they commit. Consumed once by UploadPage on mount, then cleared.
+  const [droppedFiles, setDroppedFiles] = useState<File[]>([]);
+  // Destination prefix captured at the moment the Upload view was opened (drop
+  // or sidebar button). Needed because navigating to /_/upload wipes
+  // browser.prefix from the URL, so uploadPrefix recomputes to '' — without
+  // this capture the upload view would always open at bucket root. A stale
+  // value across history back/forward into /_/upload is fine: it restores the
+  // previous upload session's target, and the destination is editable anyway.
+  const [uploadSeedPrefix, setUploadSeedPrefix] = useState<string | null>(null);
   // App-wide keyboard-shortcuts help modal (opened by `?`, the header help
   // icon, and the admin command palette). Owned here so a single instance
   // serves every view.
@@ -327,9 +338,24 @@ export default function App() {
   };
   const openUpload = () => {
     if (!canUploadToActiveBucket) return;
+    // Capture the destination BEFORE the URL changes: navigating to /_/upload
+    // resets browser.prefix (and so uploadPrefix) to '', which would seed the
+    // upload view at bucket root instead of the folder the user is in.
+    setUploadSeedPrefix(uploadPrefix);
     navigate(buildViewUrl('upload'));
     setSiderOpen(false);
   };
+  // Finder→Chrome drop on the browser: stage the files and open the Upload
+  // view (at the current folder) so the user confirms/adjusts the destination
+  // before committing — rather than silently uploading in place.
+  const handleBrowserDrop = useCallback((files: FileList) => {
+    if (!canUploadToActiveBucket || files.length === 0) return;
+    setDroppedFiles(Array.from(files));
+    // Same prefix capture as openUpload — see the comment there.
+    setUploadSeedPrefix(uploadPrefix);
+    navigate(buildViewUrl('upload'));
+    setSiderOpen(false);
+  }, [canUploadToActiveBucket, uploadPrefix, navigate]);
 
   // Stable context value so consumers of `useNavigation()` (AdminPage,
   // Sidebar, TopBar) don't re-render on every App render. Previously
@@ -415,9 +441,18 @@ export default function App() {
       }
       return (
         <UploadPage
-          prefix={uploadPrefix}
+          prefix={uploadSeedPrefix ?? uploadPrefix}
+          initialFiles={droppedFiles}
+          onConsumeInitialFiles={() => setDroppedFiles([])}
           onBack={navigateToBrowse}
           onDone={() => s3.mutate()}
+          onFinish={(destPrefix) => {
+            if (activeBucket) {
+              navigate(buildBrowserUrl({ bucket: activeBucket, prefix: destPrefix }));
+            } else {
+              navigateToBrowse();
+            }
+          }}
         />
       );
     }
@@ -584,7 +619,7 @@ export default function App() {
       {shortcutsOpen && (
         <ShortcutsHelp open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
       )}
-      {view === 'browser' && canWriteActivePrefix && <DropZone onDrop={s3.uploadFiles} prefix={s3.prefix} />}
+      {view === 'browser' && canWriteActivePrefix && <DropZone onDrop={handleBrowserDrop} prefix={s3.prefix} />}
     </Layout>
     </NavigationContext.Provider>
   );
