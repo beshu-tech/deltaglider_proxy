@@ -44,7 +44,7 @@ export default function UploadPage({ prefix, onBack, onDone, initialFiles, onCon
   const [folderName, setFolderName] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
-  const dropRef = useRef<HTMLDivElement>(null);
+  const pageDropRef = useRef<HTMLDivElement>(null);
 
   const bucket = getBucket();
   // Files staged from a drop (Finder→browser OR onto this page's drop zone),
@@ -97,8 +97,11 @@ export default function UploadPage({ prefix, onBack, onDone, initialFiles, onCon
   const uploadedDest = succeeded[succeeded.length - 1]?.destination ?? normalizedDest;
   const uploadedDestLabel = uploadedDest ? `${uploadedDest}/` : '/ (bucket root)';
 
+  // Drag-drop listeners live on the PAGE ROOT, not the dashed drop-zone box:
+  // the box is hidden once files are in context (staged or uploading), but
+  // dropping more files anywhere on the page must keep working.
   useEffect(() => {
-    const el = dropRef.current;
+    const el = pageDropRef.current;
     if (!el) return;
     let dragCount = 0;
 
@@ -170,7 +173,7 @@ export default function UploadPage({ prefix, onBack, onDone, initialFiles, onCon
   };
 
   return (
-    <div className="animate-fade-in" style={{ flex: 1, overflow: 'auto', padding: 'clamp(16px, 3vw, 32px)', background: BG_BASE }}>
+    <div ref={pageDropRef} className="animate-fade-in" style={{ flex: 1, overflow: 'auto', padding: 'clamp(16px, 3vw, 32px)', background: BG_BASE }}>
       {/* Breadcrumb */}
       <nav aria-label="Upload breadcrumb">
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 24 }}>
@@ -298,7 +301,9 @@ export default function UploadPage({ prefix, onBack, onDone, initialFiles, onCon
         />
       </Modal>
 
-      {/* Session statistics */}
+      {/* Session statistics — only once an upload has actually started; a wall
+          of zeros above the confirm button is noise. */}
+      {queue.length > 0 && (
       <div style={{ marginBottom: 24 }}>
         <Text style={{ fontSize: 11, fontWeight: 600, color: TEXT_MUTED, textTransform: 'uppercase', letterSpacing: 1, display: 'block', marginBottom: 12, fontFamily: "var(--font-ui)" }}>
           Upload Session Statistics
@@ -325,10 +330,13 @@ export default function UploadPage({ prefix, onBack, onDone, initialFiles, onCon
           ))}
         </div>
       </div>
+      )}
 
-      {/* Drop zone */}
+      {/* Drop-zone box — only while there are no files in context yet. Once
+          files are staged or uploading it's noise; dropping more files
+          anywhere on the page still works (listeners are on the page root). */}
+      {pendingFiles.length === 0 && queue.length === 0 && (
       <div
-        ref={dropRef}
         tabIndex={0}
         role="button"
         aria-label="Drop files here to upload, or press Enter to select files"
@@ -376,6 +384,7 @@ export default function UploadPage({ prefix, onBack, onDone, initialFiles, onCon
           </Button>
         </Space>
       </div>
+      )}
 
       {/* Hidden file inputs */}
       <input
@@ -402,42 +411,11 @@ export default function UploadPage({ prefix, onBack, onDone, initialFiles, onCon
         }}
       />
 
-      {/* Upload queue */}
-      {queue.length > 0 && (
-        <div style={{ marginBottom: 24 }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
-            <Text style={{ fontSize: 11, fontWeight: 600, color: TEXT_MUTED, textTransform: 'uppercase', letterSpacing: 1, fontFamily: "var(--font-ui)" }}>
-              Upload Queue ({queue.length})
-            </Text>
-            <Button
-              type="text"
-              size="small"
-              icon={<DeleteOutlined />}
-              onClick={clearCompleted}
-              style={{ color: TEXT_MUTED, fontSize: 12 }}
-            >
-              Clear completed
-            </Button>
-          </div>
-
-          <UploadProgressList
-            queue={queue}
-            borderColor={BORDER}
-            textPrimary={TEXT_PRIMARY}
-            textMuted={TEXT_MUTED}
-            accentBlue={ACCENT_BLUE}
-            accentGreen={ACCENT_GREEN}
-            accentRed={ACCENT_RED}
-            finalizingColor={ACCENT_AMBER}
-            onCancelUpload={cancelUpload}
-            onRetryUpload={retryUpload}
-          />
-        </div>
-      )}
-
-      {/* Footer actions. When every upload has finished, lead with the big
-          "Done" button that jumps straight to the folder the files landed in. */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+      {/* Primary actions — ABOVE the progress list so "Done" is reachable
+          without scrolling past every progress bar. When the batch has
+          finished, lead with the big Done button that jumps straight to the
+          folder the files landed in. */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', marginBottom: 24 }}>
         {allUploaded ? (
           <>
             <Button
@@ -474,6 +452,55 @@ export default function UploadPage({ prefix, onBack, onDone, initialFiles, onCon
           </>
         )}
       </div>
+
+      {/* Upload queue */}
+      {queue.length > 0 && (
+        <div style={{ marginBottom: 24 }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+            <Text style={{ fontSize: 11, fontWeight: 600, color: TEXT_MUTED, textTransform: 'uppercase', letterSpacing: 1, fontFamily: "var(--font-ui)" }}>
+              Upload Queue ({queue.length})
+            </Text>
+            <Space size={4}>
+              {/* The big drop-zone box is hidden once files are in context;
+                  this keeps an explicit add-more affordance reachable. */}
+              <Button
+                type="text"
+                size="small"
+                icon={<CloudUploadOutlined />}
+                onClick={() => fileInputRef.current?.click()}
+                style={{ color: TEXT_MUTED, fontSize: 12 }}
+              >
+                Add files
+              </Button>
+              <Button
+                type="text"
+                size="small"
+                icon={<DeleteOutlined />}
+                onClick={clearCompleted}
+                style={{ color: TEXT_MUTED, fontSize: 12 }}
+              >
+                Clear completed
+              </Button>
+            </Space>
+          </div>
+
+          {/* Cap the visible list at ~6 rows; the rest scrolls. */}
+          <div style={{ maxHeight: 520, overflowY: 'auto', borderRadius: 10 }}>
+            <UploadProgressList
+              queue={queue}
+              borderColor={BORDER}
+              textPrimary={TEXT_PRIMARY}
+              textMuted={TEXT_MUTED}
+              accentBlue={ACCENT_BLUE}
+              accentGreen={ACCENT_GREEN}
+              accentRed={ACCENT_RED}
+              finalizingColor={ACCENT_AMBER}
+              onCancelUpload={cancelUpload}
+              onRetryUpload={retryUpload}
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 }
