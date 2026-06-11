@@ -1,17 +1,16 @@
 /**
- * ShortcutsHelp — Wave 10 / 10.1, §10.3 of the admin UI revamp plan.
+ * ShortcutsHelp — app-wide keyboard-shortcuts reference modal.
  *
- * Modal summarising the keyboard shortcuts the admin UI respects.
- * Triggered by `?` (when the focus is NOT inside an input /
- * textarea / editable element — we don't want a literal "?" in a
- * password field to open a help modal).
+ * Lists every shortcut the app respects, grouped by scope (Global, Object
+ * browser, Settings command palette). Triggered app-wide by `?` (when focus is
+ * NOT in an input / textarea / editable element — we don't want a literal "?"
+ * in a password field to open it) and by the help icon in the header.
  *
- * Platform-aware (Wave 10.1): renders `⌘` on Apple and `Ctrl` on
- * everything else. A Mac user never sees the "Ctrl" duplicate;
- * a Windows user never sees the ⌘ glyph. Detection is a one-shot
- * at render time (see `platform.ts`). The keydown listener itself
- * in AdminPage still accepts BOTH modifiers — someone on a Mac
- * with a PC keyboard can still press Ctrl+K and everything works.
+ * Platform-aware: renders `⌘` on Apple and `Ctrl` on everything else. A Mac
+ * user never sees the "Ctrl" duplicate; a Windows user never sees the ⌘ glyph.
+ * Detection is a one-shot at render time (see `platform.ts`). The keydown
+ * listeners themselves accept BOTH modifiers — someone on a Mac with a PC
+ * keyboard can still press Ctrl+K and everything works.
  */
 import { Modal, Typography } from 'antd';
 import { useColors } from '../ThemeContext';
@@ -24,21 +23,49 @@ interface Shortcut {
   description: string;
 }
 
+interface ShortcutGroup {
+  title: string;
+  shortcuts: Shortcut[];
+}
+
 /**
- * Build the shortcut list for the current platform. Pulling this
- * through `metaKeyLabel()` at render time means the list is
- * trivially correct on both Mac and Windows/Linux — no duplicate
- * "same as X on non-Apple" noise rows.
+ * Build the grouped shortcut list for the current platform. Pulling this
+ * through `metaKeyLabel()` at render time means it's trivially correct on both
+ * Mac and Windows/Linux — no duplicate "same as X on non-Apple" noise rows.
  */
-function buildShortcuts(): Shortcut[] {
+function buildGroups(): ShortcutGroup[] {
   const mod = metaKeyLabel(); // "⌘" on Apple, "Ctrl" elsewhere
   return [
-    { keys: [mod, 'K'], description: 'Open command palette (quick nav)' },
-    { keys: [mod, 'S'], description: 'Apply the current dirty section (if any)' },
-    { keys: ['?'], description: 'Open this shortcuts reference' },
-    { keys: ['Esc'], description: 'Close the palette / active modal' },
-    { keys: ['↑', '↓'], description: 'Move cursor up/down in the command palette' },
-    { keys: ['Enter'], description: 'Run the highlighted command' },
+    {
+      title: 'Global',
+      shortcuts: [
+        { keys: [mod, ','], description: 'Open Settings' },
+        { keys: [mod, '/'], description: 'Open Docs' },
+        { keys: ['?'], description: 'Open this shortcuts reference' },
+      ],
+    },
+    {
+      title: 'Object browser',
+      shortcuts: [
+        { keys: ['↑', '↓'], description: 'Move between objects and folders' },
+        { keys: ['Enter'], description: 'Open folder / inspect object' },
+        { keys: ['→'], description: 'Open folder / inspect object' },
+        { keys: ['←'], description: 'Go up one folder' },
+        { keys: ['Backspace'], description: 'Go up one folder' },
+        { keys: ['Home', 'End'], description: 'Jump to first / last row' },
+        { keys: ['Esc'], description: 'Close inspector, or go up one folder' },
+      ],
+    },
+    {
+      title: 'Settings — command palette',
+      shortcuts: [
+        { keys: [mod, 'K'], description: 'Open command palette (quick nav)' },
+        { keys: [mod, 'S'], description: 'Apply the current dirty section (if any)' },
+        { keys: ['↑', '↓'], description: 'Move cursor in the palette' },
+        { keys: ['Enter'], description: 'Run the highlighted command' },
+        { keys: ['Esc'], description: 'Close the palette / active modal' },
+      ],
+    },
   ];
 }
 
@@ -51,7 +78,7 @@ export default function ShortcutsHelp({ open, onClose }: Props) {
   const colors = useColors();
   // Computed at render time so we don't freeze the list at module
   // load — cheap, and keeps the detection logic owned by platform.ts.
-  const shortcuts = buildShortcuts();
+  const groups = buildGroups();
   return (
     <Modal
       open={open}
@@ -61,28 +88,48 @@ export default function ShortcutsHelp({ open, onClose }: Props) {
       width={480}
       destroyOnHidden
     >
-      <table
-        style={{
-          width: '100%',
-          borderCollapse: 'collapse',
-          fontSize: 13,
-          fontFamily: 'var(--font-ui)',
-        }}
-      >
-        <tbody>
-          {shortcuts.map((s) => (
-            <tr key={s.keys.join('+') + s.description} style={{ borderBottom: `1px solid ${colors.BORDER}` }}>
-              <td style={{ padding: '10px 12px 10px 0', width: 160 }}>
-                <KeyCombo keys={s.keys} />
-              </td>
-              <td style={{ padding: '10px 0', color: colors.TEXT_SECONDARY }}>
-                {s.description}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-      <Text type="secondary" style={{ fontSize: 11, display: 'block', marginTop: 12, lineHeight: 1.6 }}>
+      {groups.map((group) => (
+        <div key={group.title} style={{ marginBottom: 18 }}>
+          <Text
+            style={{
+              display: 'block',
+              fontSize: 11,
+              fontWeight: 600,
+              letterSpacing: '0.04em',
+              textTransform: 'uppercase',
+              color: colors.TEXT_MUTED,
+              marginBottom: 4,
+            }}
+          >
+            {group.title}
+          </Text>
+          <table
+            style={{
+              width: '100%',
+              borderCollapse: 'collapse',
+              fontSize: 13,
+              fontFamily: 'var(--font-ui)',
+            }}
+          >
+            <tbody>
+              {group.shortcuts.map((s) => (
+                <tr
+                  key={s.keys.join('+') + s.description}
+                  style={{ borderBottom: `1px solid ${colors.BORDER}` }}
+                >
+                  <td style={{ padding: '8px 12px 8px 0', width: 160 }}>
+                    <KeyCombo keys={s.keys} />
+                  </td>
+                  <td style={{ padding: '8px 0', color: colors.TEXT_SECONDARY }}>
+                    {s.description}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ))}
+      <Text type="secondary" style={{ fontSize: 11, display: 'block', marginTop: 4, lineHeight: 1.6 }}>
         Tip: the palette accepts fuzzy input, e.g.{' '}
         <code style={{ fontFamily: 'var(--font-mono)' }}>adm cred</code>{' '}
         matches "Credentials &amp; mode" under Access.

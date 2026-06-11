@@ -33,7 +33,6 @@ import CommandPalette, {
   LogoutOutlined,
   QuestionCircleOutlined,
 } from './CommandPalette';
-import ShortcutsHelp from './ShortcutsHelp';
 import {
   ListenerTlsPanel,
   CachesPanel,
@@ -138,9 +137,11 @@ interface AdminPageProps {
   subPath?: string;
   accountMenu?: React.ReactNode;
   canAdmin?: boolean;
+  /** Open the app-wide keyboard-shortcuts modal (owned by App). */
+  onShowShortcuts: () => void;
 }
 
-export default function AdminPage({ onBack, onSessionExpired, subPath, accountMenu, canAdmin = false }: AdminPageProps) {
+export default function AdminPage({ onBack, onSessionExpired, subPath, accountMenu, canAdmin = false, onShowShortcuts }: AdminPageProps) {
   const colors = useColors();
   const { navigate } = useNavigation();
   // Declarative IAM: the IAM-writing backup-restore modes (full / iam-only /
@@ -155,11 +156,11 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, accountMe
   // navigates away from a dirty section.
   useDirtyGlobalIndicators();
 
-  // Command palette (⌘K / Ctrl+K) + Shortcuts help (?) — Wave 10
-  // polish. Global keydown listener only mounts while AdminPage is
-  // up so the shortcuts don't interfere with other views.
+  // Command palette (⌘K / Ctrl+K) — Wave 10 polish. Global keydown
+  // listener only mounts while AdminPage is up so the shortcut doesn't
+  // interfere with other views. The shortcuts-help modal (`?`) is now
+  // owned by App (app-wide); AdminPage delegates via `onShowShortcuts`.
   const [paletteOpen, setPaletteOpen] = useState(false);
-  const [helpOpen, setHelpOpen] = useState(false);
 
   // Mobile drawer (Wave 10.1 §10.4). Below 900px the persistent
   // 220px sidebar is replaced with an AntD Drawer that slides in
@@ -239,10 +240,6 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, accountMe
   useEffect(() => {
     if (!authed) return;
     const onKey = (e: KeyboardEvent) => {
-      const inText =
-        e.target instanceof HTMLInputElement ||
-        e.target instanceof HTMLTextAreaElement ||
-        (e.target instanceof HTMLElement && e.target.isContentEditable);
       const isBareCmdCtrl =
         (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey;
       if (isBareCmdCtrl && e.key.toLowerCase() === 'k') {
@@ -261,18 +258,16 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, accountMe
         }
         return;
       }
-      if (e.key === '?' && !inText) {
-        e.preventDefault();
-        setHelpOpen(true);
-      }
+      // `?` (shortcuts help) is handled app-wide by App's global listener,
+      // not here — avoids a double-open when both fire.
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [authed, activeDirtyKey]);
 
   // Memoised palette extra-actions. The underlying handlers
-  // (`setYamlModalMode`, `setHelpOpen`, `navigateAdmin`, `onBack`)
-  // are stable, so the only real dep is `navigateAdmin`. A fresh
+  // (`setYamlModalMode`, `onShowShortcuts`, `navigateAdmin`, `onBack`)
+  // are stable, so the array only changes if those change. A fresh
   // array each render would invalidate the palette's useMemo chain
   // (commands → filtered) on every keystroke in the search input —
   // unnecessary work, especially on lower-powered devices.
@@ -309,7 +304,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, accountMe
         keywords: 'help shortcuts keyboard bindings',
         icon: <QuestionCircleOutlined />,
         shortcut: '?',
-        onRun: () => setHelpOpen(true),
+        onRun: () => onShowShortcuts(),
       },
       {
         id: 'action:back-to-browser',
@@ -320,7 +315,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, accountMe
         onRun: () => onBack(),
       },
     ],
-    [navigateAdmin, onBack]
+    [navigateAdmin, onBack, onShowShortcuts]
   );
 
   // Check existing session on mount, or auto-login for IAM admins
@@ -863,6 +858,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, accountMe
       <FullScreenHeader
         title="Admin Settings"
         onBack={onBack}
+        onShowShortcuts={onShowShortcuts}
         extra={
           isNarrow ? (
             <Button
@@ -993,9 +989,6 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, accountMe
           onNavigateAdmin={navigateAdmin}
           extraActions={paletteExtraActions}
         />
-      )}
-      {helpOpen && (
-        <ShortcutsHelp open={helpOpen} onClose={() => setHelpOpen(false)} />
       )}
 
       {/* Body: sidebar + content (§3.1 four-group IA) */}

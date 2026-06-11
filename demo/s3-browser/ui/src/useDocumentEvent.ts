@@ -11,7 +11,7 @@ function useLatest<T>(value: T) {
   return ref;
 }
 
-function useDocumentEvent<K extends keyof DocumentEventMap>(
+export function useDocumentEvent<K extends keyof DocumentEventMap>(
   type: K,
   handler: (event: DocumentEventMap[K]) => void,
   enabled = true

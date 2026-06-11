@@ -1,7 +1,8 @@
 import { useRef, useState, useEffect } from 'react';
 import { Layout, Space, Button, Input, theme } from 'antd';
 import type { InputRef } from 'antd';
-import { MenuOutlined, SearchOutlined, CloseOutlined, ReloadOutlined } from '@ant-design/icons';
+import { MenuOutlined, SearchOutlined, CloseOutlined, ReloadOutlined, QuestionCircleOutlined } from '@ant-design/icons';
+import { metaKeyLabel } from '../platform';
 import Breadcrumb from './Breadcrumb';
 import DeltaSavingsChip from './DeltaSavingsChip';
 import type { DeltaSummary } from '../deltaSummary';
@@ -24,6 +25,8 @@ interface Props {
   canRefresh?: boolean;
   /** Show the breadcrumb's backend-origin chip (admin-only). */
   canAdmin?: boolean;
+  /** Open the keyboard-shortcuts help modal (header help icon). */
+  onShowShortcuts?: () => void;
   accountMenu?: React.ReactNode;
   /** Aggregated delta savings for the current prefix view. Auto-hides when no deltas present. */
   deltaSummary?: DeltaSummary | null;
@@ -80,7 +83,7 @@ function SearchInput({
   );
 }
 
-export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuClick, onRefresh, searchQuery, onSearchChange, refreshing, canRefresh = true, canAdmin = false, accountMenu, deltaSummary = null }: Props) {
+export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuClick, onRefresh, searchQuery, onSearchChange, refreshing, canRefresh = true, canAdmin = false, onShowShortcuts, accountMenu, deltaSummary = null }: Props) {
   const { token } = theme.useToken();
   const { ACCENT_BLUE, TEXT_MUTED, BORDER } = useColors();
   const [searchOpen, setSearchOpen] = useState(false);
@@ -165,6 +168,17 @@ export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuCli
             title="Refresh"
             onClick={onRefresh}
             aria-label="Refresh object list"
+            style={{ color: TEXT_MUTED, transition: 'color 0.15s' }}
+          />
+        )}
+        {onShowShortcuts && (
+          <Button
+            type="text"
+            icon={<QuestionCircleOutlined />}
+            size="small"
+            title={`Keyboard shortcuts (press ? — or ${metaKeyLabel()}+/ for docs)`}
+            aria-label="Keyboard shortcuts"
+            onClick={onShowShortcuts}
             style={{ color: TEXT_MUTED, transition: 'color 0.15s' }}
           />
         )}

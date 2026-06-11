@@ -18,6 +18,9 @@ const DocsPage = lazy(() => import('./components/DocsPage'));
 import FileBrowserSessionTip from './components/FileBrowserSessionTip';
 import AccountMenu from './components/AccountMenu';
 import DemoDataGenerator from './components/DemoDataGenerator';
+import ShortcutsHelp from './components/ShortcutsHelp';
+import { useGlobalShortcuts } from './useGlobalShortcuts';
+import { useBrowserKeyboardNav } from './useBrowserKeyboardNav';
 import { getBucket, hasCredentials, disconnect, initFromSession, getCredentials } from './s3client';
 import { clearSessionCredentials } from './sessionApi';
 import { adminLogout, whoami, checkSession, resolveIamIdentity } from './adminApi';
@@ -67,6 +70,11 @@ export default function App() {
   const [identity, setIdentity] = useState<WhoamiResponse | null>(null);
   const [bucketCount, setBucketCount] = useState<number | null>(null);
   const [createBucketFocusSignal, setCreateBucketFocusSignal] = useState(0);
+  // App-wide keyboard-shortcuts help modal (opened by `?`, the header help
+  // icon, and the admin command palette). Owned here so a single instance
+  // serves every view.
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const showShortcuts = useCallback(() => setShortcutsOpen(true), []);
 
   /** Any valid session cookie (administrator sign-in or access-key file browser). */
   const [sessionValid, setSessionValid] = useState(false);
@@ -100,6 +108,24 @@ export default function App() {
     q: browser.q,
     object: browser.object,
     navigateUrl: navigate,
+  });
+  // App-wide shortcuts: ⌘/Ctrl+, → Settings, ⌘/Ctrl+/ → Docs, ? → help.
+  // Disabled on the connect/login screen so we don't hijack keys there.
+  useGlobalShortcuts({
+    onSettings: () => navigate(buildViewUrl('admin')),
+    onDocs: () => navigate(buildViewUrl('docs')),
+    onHelp: showShortcuts,
+    enabled: !needsConnect,
+  });
+  // Arrow-key navigation of the object browser (only while the browser view is
+  // active). Returns the keyboard cursor for ObjectTable to highlight + follow.
+  const browserNav = useBrowserKeyboardNav({
+    folders: s3.folders,
+    objects: s3.objects,
+    prefix: s3.prefix,
+    navigate: s3.navigate,
+    openInspector: s3.openInspector,
+    enabled: view === 'browser' && !needsConnect,
   });
   const folderSize = useComputeSize();
   const computeSize = folderSize.compute;
@@ -345,6 +371,7 @@ export default function App() {
             subPath={subPath}
             accountMenu={accountMenu()}
             canAdmin={canAdmin}
+            onShowShortcuts={showShortcuts}
           />
         </Suspense>
       );
@@ -372,7 +399,7 @@ export default function App() {
     if (view === 'docs') {
       return (
         <Suspense fallback={LAZY_FALLBACK}>
-          <DocsPage onBack={navigateToBrowse} docId={subPath || undefined} accountMenu={accountMenu()} />
+          <DocsPage onBack={navigateToBrowse} docId={subPath || undefined} accountMenu={accountMenu()} onShowShortcuts={showShortcuts} />
         </Suspense>
       );
     }
@@ -472,6 +499,8 @@ export default function App() {
               onCancelSize={folderSize.cancel}
               onAutoPopulateSizes={hasAdminSession ? folderSize.autoPopulate : undefined}
               onPreview={setPreviewObject}
+              cursorKey={browserNav.cursorKey}
+              onCursorChange={browserNav.setCursorKey}
             />
           )}
         </div>
@@ -520,6 +549,7 @@ export default function App() {
               onSearchChange={s3.setSearchQuery}
               refreshing={s3.refreshing}
               canAdmin={canAdmin}
+              onShowShortcuts={showShortcuts}
               accountMenu={accountMenu(true)}
               deltaSummary={view === 'browser' ? s3.deltaSummary : null}
             />
@@ -551,6 +581,9 @@ export default function App() {
         object={previewObject}
         onClose={() => setPreviewObject(null)}
       />
+      {shortcutsOpen && (
+        <ShortcutsHelp open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
+      )}
       {view === 'browser' && canWriteActivePrefix && <DropZone onDrop={s3.uploadFiles} prefix={s3.prefix} />}
     </Layout>
     </NavigationContext.Provider>

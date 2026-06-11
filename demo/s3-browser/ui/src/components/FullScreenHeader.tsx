@@ -1,5 +1,5 @@
 import { Button } from 'antd';
-import { ArrowLeftOutlined } from '@ant-design/icons';
+import { ArrowLeftOutlined, QuestionCircleOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 
 interface Props {
@@ -7,11 +7,13 @@ interface Props {
   onBack: () => void;
   /** Optional right-side content (e.g. backup buttons) */
   extra?: React.ReactNode;
+  /** Open the keyboard-shortcuts help modal (renders a help icon when set). */
+  onShowShortcuts?: () => void;
   accountMenu?: React.ReactNode;
 }
 
 /** Shared header bar for full-screen views (Admin, Docs) */
-export default function FullScreenHeader({ title, onBack, extra, accountMenu }: Props) {
+export default function FullScreenHeader({ title, onBack, extra, onShowShortcuts, accountMenu }: Props) {
   const colors = useColors();
   return (
     <div style={{
@@ -79,6 +81,17 @@ export default function FullScreenHeader({ title, onBack, extra, accountMenu }: 
       {/* Right: optional actions + account menu */}
       <div style={{ minWidth: 100, display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 4 }}>
         {extra}
+        {onShowShortcuts && (
+          <Button
+            type="text"
+            icon={<QuestionCircleOutlined />}
+            size="small"
+            title="Keyboard shortcuts (press ?)"
+            aria-label="Keyboard shortcuts"
+            onClick={onShowShortcuts}
+            style={{ color: colors.TEXT_MUTED }}
+          />
+        )}
         {accountMenu}
       </div>
     </div>

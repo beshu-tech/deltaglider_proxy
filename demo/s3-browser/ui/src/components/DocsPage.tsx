@@ -163,9 +163,11 @@ interface Props {
   docId?: string;
   onBack?: () => void;
   accountMenu?: React.ReactNode;
+  /** Open the keyboard-shortcuts help modal (header help icon). */
+  onShowShortcuts?: () => void;
 }
 
-export default function DocsPage({ docId, onBack, accountMenu }: Props) {
+export default function DocsPage({ docId, onBack, accountMenu, onShowShortcuts }: Props) {
   const colors = useColors();
   const { navigate } = useNavigation();
 
@@ -244,7 +246,7 @@ export default function DocsPage({ docId, onBack, accountMenu }: Props) {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
-      {onBack && <FullScreenHeader title="Documentation" onBack={onBack} accountMenu={accountMenu} />}
+      {onBack && <FullScreenHeader title="Documentation" onBack={onBack} onShowShortcuts={onShowShortcuts} accountMenu={accountMenu} />}
 
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
       {/* Left sidebar: search + doc navigation */}

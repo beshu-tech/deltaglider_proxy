@@ -40,6 +40,8 @@
     "test:upload-telemetry": "node scripts/upload-telemetry-regression-test.mjs",
     "test:page-size": "node scripts/page-size-regression-test.mjs",
     "test:webhook-delivery-payload": "node scripts/webhook-delivery-payload-regression-test.mjs",
+    "test:keyboard": "node scripts/keyboard-regression-test.mjs",
+    "test:browser-nav": "node scripts/browser-nav-regression-test.mjs",
     "e2e": "playwright test",
     "typecheck": "tsc --noEmit",
     "knip": "knip"

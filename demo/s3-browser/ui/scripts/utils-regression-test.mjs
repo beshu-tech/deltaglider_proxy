@@ -13,7 +13,7 @@ const { outputText } = ts.transpileModule(source, {
   fileName: 'utils.ts',
 });
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`;
-const { clamp, dotPattern, ageLabel, formatBytes, getFileName, pluralize } = await import(moduleUrl);
+const { clamp, dotPattern, ageLabel, formatBytes, getFileName, pluralize, parentPrefix } = await import(moduleUrl);
 
 // --- clamp -------------------------------------------------------------------
 assert.equal(clamp(50, 0, 100), 50);
@@ -69,5 +69,15 @@ assert.equal(pluralize(0, 'item'), '0 items');
 assert.equal(pluralize(3, 'item'), '3 items');
 assert.equal(pluralize(2, 'entry', 'entries'), '2 entries');
 assert.equal(pluralize(1, 'entry', 'entries'), '1 entry');
+
+// --- parentPrefix (keyboard "up a folder" navigation) ------------------------
+assert.equal(parentPrefix(''), '', 'root stays root');
+assert.equal(parentPrefix('a/'), '', 'one level up from top → root');
+assert.equal(parentPrefix('a/b/'), 'a/', 'nested → parent with trailing slash');
+assert.equal(parentPrefix('a/b/c/'), 'a/b/', 'deep nested → immediate parent');
+// tolerates a missing trailing slash (defensive — callers pass prefixes that
+// normally end in "/", but a stray non-slashed prefix must not throw)
+assert.equal(parentPrefix('a/b'), 'a/', 'no trailing slash still climbs one');
+assert.equal(parentPrefix('single'), '', 'single segment, no slash → root');
 
 console.log('utils regression checks passed');

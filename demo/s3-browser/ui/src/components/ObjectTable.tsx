@@ -54,6 +54,10 @@ interface Props {
   onCancelSize: (prefix: string) => void;
   onAutoPopulateSizes?: (currentPrefix: string, folderPrefixes: string[]) => void;
   onPreview?: (obj: S3Object) => void;
+  /** rowKey of the keyboard-cursor row (arrow-key navigation), or null. */
+  cursorKey?: string | null;
+  /** Sync the keyboard cursor when a row is clicked. */
+  onCursorChange?: (key: string | null) => void;
 }
 
 type RowData = { _isFolder: true; key: string; name: string } | (S3Object & { _isFolder: false; name: string });
@@ -171,6 +175,8 @@ export default function ObjectTable({
   onCancelSize,
   onAutoPopulateSizes,
   onPreview,
+  cursorKey = null,
+  onCursorChange,
 }: Props) {
   const { token } = theme.useToken();
   const { TEXT_PRIMARY, TEXT_SECONDARY, TEXT_MUTED, ACCENT_BLUE, ACCENT_AMBER, ACCENT_PURPLE, STORAGE_TYPE_COLORS, STORAGE_TYPE_DEFAULT } = useColors();
@@ -243,6 +249,10 @@ export default function ObjectTable({
     }
   }, [prefix, folders, onAutoPopulateSizes]);
 
+  // Scroll container for the keyboard-cursor scroll-into-view (effect below,
+  // after `dataSource` is computed).
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+
   function fileIconColor(name: string): string {
     const ext = name.split('.').pop()?.toLowerCase() || '';
     if (['jpg', 'jpeg', 'png', 'gif', 'svg', 'webp', 'ico', 'bmp'].includes(ext)) return ACCENT_PURPLE;
@@ -267,6 +277,30 @@ export default function ObjectTable({
   const totalSelectable = totalItems;
   const allChecked = totalSelectable > 0 && selectedKeys.size === totalSelectable;
   const someChecked = selectedKeys.size > 0 && selectedKeys.size < totalSelectable;
+
+  // Keyboard cursor: follow it across pages and scroll its row into view.
+  // `dataSource` is folders-then-objects, matching the cursor's row ordering in
+  // useBrowserKeyboardNav. Depend on the cursor's INDEX (a number), not the
+  // array identity, so the effect only runs when the cursor actually moves to a
+  // different row — not on every re-render (which would re-fire the scroll).
+  //
+  // `currentPage` is deliberately NOT a dep: the effect READS it to decide
+  // whether to jump, but must only run when the CURSOR moves — including it
+  // would make a manual pager click (which changes currentPage) snap the page
+  // back to wherever the cursor sits, so the mouse pager would fight the cursor.
+  const cursorIndex = cursorKey ? dataSource.findIndex((r) => r.key === cursorKey) : -1;
+  useEffect(() => {
+    if (cursorIndex === -1 || !cursorKey) return;
+    const targetPage = Math.floor(cursorIndex / pageSize) + 1;
+    setCurrentPage((page) => (page === targetPage ? page : targetPage));
+    // Defer the scroll so the row exists after any page switch + render.
+    const id = requestAnimationFrame(() => {
+      scrollContainerRef.current
+        ?.querySelector(`[data-row-key="${CSS.escape(cursorKey)}"]`)
+        ?.scrollIntoView({ block: 'nearest' });
+    });
+    return () => cancelAnimationFrame(id);
+  }, [cursorKey, cursorIndex, pageSize]);
 
   const columns: ColumnsType<RowData> = [
     {
@@ -417,7 +451,7 @@ export default function ObjectTable({
         a standalone <Select> for "Rows per page" in the status bar
         below so the range readout and the size picker live together.
       */}
-      <div style={{ flex: 1, overflow: 'auto' }}>
+      <div ref={scrollContainerRef} style={{ flex: 1, overflow: 'auto' }}>
         <Table<RowData>
           columns={columns}
           dataSource={dataSource}
@@ -443,11 +477,14 @@ export default function ObjectTable({
           sticky
           scroll={undefined}
           rowClassName={(record) => {
-            if (!record._isFolder && selected?.key === record.key) return 'ant-table-row-selected';
-            return '';
+            const classes: string[] = [];
+            if (!record._isFolder && selected?.key === record.key) classes.push('ant-table-row-selected');
+            if (record.key === cursorKey) classes.push('dg-row-cursor');
+            return classes.join(' ');
           }}
           onRow={(record) => ({
             onClick: () => {
+              onCursorChange?.(record.key);
               if (!record._isFolder) onSelect(record);
             },
             onDoubleClick: () => {

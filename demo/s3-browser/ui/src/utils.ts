@@ -42,6 +42,18 @@ export function prefixSegments(prefix: string): { label: string; prefix: string 
   }));
 }
 
+/**
+ * Parent prefix one level up from `prefix`, or `''` (bucket root) when already
+ * at the top. `"a/b/c/"` → `"a/b/"`, `"a/"` → `""`, `""` → `""`. Used by the
+ * keyboard "up a folder" navigation (← / Backspace).
+ */
+export function parentPrefix(prefix: string): string {
+  if (!prefix) return '';
+  const trimmed = prefix.replace(/\/$/, '');
+  const idx = trimmed.lastIndexOf('/');
+  return idx === -1 ? '' : trimmed.slice(0, idx + 1);
+}
+
 /** Format a date as relative time, e.g. "6 hours ago" */
 export function timeAgo(date: Date): string {
   const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
