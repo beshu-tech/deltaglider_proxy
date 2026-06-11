@@ -65,6 +65,32 @@ impl ConfigMutator {
         context: &str,
         mutate: impl FnOnce(&mut Config),
     ) -> Result<(), String> {
+        self.mutate_inner(context, mutate, false).await
+    }
+
+    /// Like [`mutate_and_apply`] but a PERSIST failure is a hard error and
+    /// the whole mutation is rolled back (config restored, engine rebuilt
+    /// back). Use for mutations where the FILE lagging the running state
+    /// is dangerous — the migrate FLIP is the canonical case: if the file
+    /// still routed the bucket to the source after a crash, the resumed
+    /// cleanup phase would delete live data off a bucket clients are
+    /// actively writing to.
+    ///
+    /// [`mutate_and_apply`]: Self::mutate_and_apply
+    pub async fn mutate_and_apply_strict(
+        &self,
+        context: &str,
+        mutate: impl FnOnce(&mut Config),
+    ) -> Result<(), String> {
+        self.mutate_inner(context, mutate, true).await
+    }
+
+    async fn mutate_inner(
+        &self,
+        context: &str,
+        mutate: impl FnOnce(&mut Config),
+        persist_required: bool,
+    ) -> Result<(), String> {
         let mut cfg = self.config.write().await;
         let rollback = cfg.clone();
         mutate(&mut cfg);
@@ -73,6 +99,25 @@ impl ConfigMutator {
             return Err(format!("engine rebuild failed ({context}): {e}"));
         }
         if let Err(e) = cfg.persist_to_file(&self.persist_path) {
+            if persist_required {
+                // Unwind fully: restore the old config AND swap the old
+                // engine back so memory and file agree again.
+                let restore_err = rebuild_engine_only(
+                    &self.app,
+                    &rollback,
+                    &format!("rollback after failed persist ({context})"),
+                )
+                .await
+                .err();
+                *cfg = rollback;
+                return Err(format!(
+                    "config persist to '{}' failed ({context}): {e}{}",
+                    self.persist_path,
+                    restore_err
+                        .map(|r| format!(" (and engine rollback also failed: {r})"))
+                        .unwrap_or_default()
+                ));
+            }
             tracing::warn!(
                 "config persist to '{}' failed after '{}': {} — running state is \
                  correct; the next successful persist writes the same content",

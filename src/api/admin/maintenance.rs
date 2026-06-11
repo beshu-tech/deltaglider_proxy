@@ -4,15 +4,14 @@
 //!
 //! Routes:
 //!
-//! - `POST /_/api/admin/maintenance/reencrypt` `{buckets: [..]}` — create
+//! - `POST /_/api/admin/jobs/reencrypt` `{buckets: [..]}` — create
 //!   queued jobs (admin tier). Validation per bucket: must exist, must
 //!   route to a backend whose encryption mode the job supports
 //!   (none / aes256-gcm-proxy), must not already have an active job.
 //!   The write gate arms at CREATION (not at worker start) so there is
 //!   no window where a write slips in between create and claim.
-//! - `GET  /_/api/admin/maintenance` — recent jobs overview (admin tier).
-//! - `POST /_/api/admin/maintenance/jobs/:id/cancel` (admin tier).
-//! - `GET  /_/api/admin/maintenance/bucket/:bucket` — the bucket's active
+//! - `POST /_/api/admin/jobs/maintenance:<id>/cancel` (admin tier, via jobs.rs).
+//! - `GET  /_/api/admin/jobs/bucket/:bucket` — the bucket's active
 //!   job, if any. Registered on the SESSION-LIGHT tier (S3BrowserLift
 //!   included) so non-admin browser users see busy state + progress; the
 //!   response carries only status/phase/counts — no config detail.
@@ -101,7 +100,7 @@ pub struct ReencryptResponse {
     pub errors: Vec<ReencryptError>,
 }
 
-/// POST /_/api/admin/maintenance/reencrypt
+/// POST /_/api/admin/jobs/reencrypt
 pub async fn start_reencrypt(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
@@ -330,7 +329,7 @@ pub async fn start_migrate(
     ))
 }
 
-/// POST /_/api/admin/maintenance/jobs/:id/cancel
+/// POST /_/api/admin/jobs/maintenance:<id>/cancel (routed via jobs.rs)
 pub async fn cancel_job(
     State(state): State<Arc<AdminState>>,
     Path(id): Path<i64>,
@@ -382,7 +381,7 @@ pub async fn cancel_job(
     }
 }
 
-/// GET /_/api/admin/maintenance/bucket/:bucket — session-light tier.
+/// GET /_/api/admin/jobs/bucket/:bucket — session-light tier.
 pub async fn bucket_status(
     State(state): State<Arc<AdminState>>,
     Path(bucket): Path<String>,

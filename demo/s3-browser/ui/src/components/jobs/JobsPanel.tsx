@@ -371,6 +371,7 @@ export default function JobsPanel({ onSessionExpired }: Props) {
         lifecycle={lc.value}
         onReplicationChange={repl.setValue}
         onLifecycleChange={lc.setValue}
+        onJobIdChange={setDrawerJobId}
         inputRadius={inputRadius}
         onClose={() => setDrawerJobId(null)}
       />

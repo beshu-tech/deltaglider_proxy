@@ -367,7 +367,10 @@ impl ConfigDb {
     }
 
     /// Settle a job to a terminal status (`completed`/`failed`/`cancelled`)
-    /// and clear the lease.
+    /// and clear the lease. TERMINAL ROWS ARE IMMUTABLE: re-settling is a
+    /// no-op, so a phase that pre-settles with an operator note (migrate's
+    /// "source cleanup incomplete") can't have that note clobbered by the
+    /// worker's generic settle that follows.
     pub fn maintenance_finish(
         &self,
         job_id: i64,
@@ -379,7 +382,8 @@ impl ConfigDb {
             "UPDATE maintenance_jobs
                 SET status = ?, last_error = ?, finished_at = ?, updated_at = ?,
                     leader_instance_id = NULL, leader_expires_at = NULL
-              WHERE id = ?",
+              WHERE id = ?
+                AND status IN ('queued','running','cancelling')",
             params![status, last_error, now, now, job_id],
         )?;
         Ok(())
@@ -596,6 +600,34 @@ mod tests {
             .unwrap();
         assert_eq!(claimed.id, id);
         assert_eq!(claimed.started_at, Some(2));
+    }
+
+    #[test]
+    fn finish_is_terminal_and_immutable() {
+        let db = db();
+        let id = db
+            .maintenance_create_job("migrate", "b", "stage", None, "admin", 1)
+            .unwrap()
+            .unwrap();
+        db.maintenance_claim_next_job("w", 2, 60).unwrap().unwrap();
+        // Pre-settle with a note (migrate's cleanup-incomplete path) …
+        db.maintenance_finish(id, "completed", Some("source cleanup incomplete"))
+            .unwrap();
+        // … the worker's generic settle afterwards must be a NO-OP.
+        db.maintenance_finish(id, "completed", None).unwrap();
+        let job = db.maintenance_job_by_id(id).unwrap().unwrap();
+        assert_eq!(job.status, "completed");
+        assert_eq!(
+            job.last_error.as_deref(),
+            Some("source cleanup incomplete"),
+            "the operator note must survive the double-settle"
+        );
+        // And a terminal row can't be flipped to another terminal state.
+        db.maintenance_finish(id, "failed", Some("nope")).unwrap();
+        assert_eq!(
+            db.maintenance_job_by_id(id).unwrap().unwrap().status,
+            "completed"
+        );
     }
 
     #[test]

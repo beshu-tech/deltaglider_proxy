@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Admin API endpoints for lazy bucket replication.
-//!
-//! Routes (all session-gated via the surrounding middleware):
-//!
-//! - `GET  /_/api/admin/replication` — rules + state overview
-//! - `POST /_/api/admin/replication/rules/:name/run-now`
-//! - `POST /_/api/admin/replication/rules/:name/pause`
-//! - `POST /_/api/admin/replication/rules/:name/resume`
-//! - `GET  /_/api/admin/replication/rules/:name/history?limit=N`
-//! - `GET  /_/api/admin/replication/rules/:name/failures?limit=N`
+//! Per-rule replication actions (run-now / pause / resume), consumed by
+//! the unified jobs API (`api/admin/jobs.rs`) under
+//! `POST /_/api/admin/jobs/replication:<rule>/{run-now,pause,resume}`.
+//! Listing, runs, and failures live in the jobs module.
 
 use super::AdminState;
 use crate::replication;

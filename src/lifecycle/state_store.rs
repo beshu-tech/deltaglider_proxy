@@ -482,12 +482,17 @@ mod tests {
             .lifecycle_try_acquire_lease("r", "owner-b", 120, 30)
             .unwrap());
 
-        assert!(db
+        // AT exact expiry the owner still wins (renew/steal predicates tile
+        // — see config_db::job_store); strictly past it the steal succeeds.
+        assert!(!db
             .lifecycle_try_acquire_lease("r", "owner-b", 130, 30)
+            .unwrap());
+        assert!(db
+            .lifecycle_try_acquire_lease("r", "owner-b", 131, 30)
             .unwrap());
         let state = db.lifecycle_load_state("r").unwrap().unwrap();
         assert_eq!(state.leader_instance_id.as_deref(), Some("owner-b"));
-        assert_eq!(state.leader_expires_at, Some(160));
+        assert_eq!(state.leader_expires_at, Some(161));
     }
 
     #[test]

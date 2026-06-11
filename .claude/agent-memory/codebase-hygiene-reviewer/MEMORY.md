@@ -2,3 +2,4 @@
 - [Anti-patterns to flag](antipatterns.md) — what reviewers should call out aggressively
 - [Replication module patterns](replication_patterns.md) — worker/scheduler/planner/state_store module structure and common idioms
 - [Routing backend semantics](routing_backend.md) — resolve vs resolve_existing, listed_bucket_virtual_name change
+- [Migrate job machinery](migrate_job_machinery.md) — flip-persist crash window + maintenance_finish double-finish note clobber

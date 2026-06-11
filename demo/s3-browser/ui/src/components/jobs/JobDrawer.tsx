@@ -20,6 +20,9 @@ interface Props {
   lifecycle: LifecycleConfig;
   onReplicationChange: (fn: (cur: ReplicationConfig) => ReplicationConfig) => void;
   onLifecycleChange: (fn: (cur: LifecycleConfig) => LifecycleConfig) => void;
+  /** Rename support: the drawer is keyed by `<kind>:<name>`, so a rename
+   *  must retarget the key or the lookup loses the rule mid-keystroke. */
+  onJobIdChange: (next: string) => void;
   inputRadius: { borderRadius: number };
   onClose: () => void;
 }
@@ -35,6 +38,7 @@ export default function JobDrawer({
   lifecycle,
   onReplicationChange,
   onLifecycleChange,
+  onJobIdChange,
   inputRadius,
   onClose,
 }: Props) {
@@ -68,12 +72,13 @@ export default function JobDrawer({
               rules: cur.rules.map((r, i) => (i === replIndex ? { ...r, ...patch } : r)),
             }))
           }
-          onRename={(next) =>
+          onRename={(next) => {
             onReplicationChange((cur) => ({
               ...cur,
               rules: cur.rules.map((r, i) => (i === replIndex ? { ...r, name: next } : r)),
-            }))
-          }
+            }));
+            onJobIdChange(`replication:${next}`);
+          }}
         />
       );
     }
@@ -90,12 +95,13 @@ export default function JobDrawer({
               rules: cur.rules.map((r, i) => (i === lcIndex ? { ...r, ...patch } : r)),
             }))
           }
-          onRename={(next) =>
+          onRename={(next) => {
             onLifecycleChange((cur) => ({
               ...cur,
               rules: cur.rules.map((r, i) => (i === lcIndex ? { ...r, name: next } : r)),
-            }))
-          }
+            }));
+            onJobIdChange(`lifecycle:${next}`);
+          }}
         />
       );
     }

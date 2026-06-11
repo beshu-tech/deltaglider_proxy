@@ -84,6 +84,16 @@ pub fn is_pre_flip(phase: &str) -> bool {
     matches!(phase, "stage" | "copy" | "verify")
 }
 
+/// Should a job that FAILED in `phase` unwind its staging route?
+/// Pre-flip phases: yes (source untouched). The flip itself: also yes —
+/// `mutate_and_apply_strict` is atomic (rollback on rebuild OR persist
+/// failure), so a failed flip leaves the source authoritative and the
+/// staging route is just litter. Only `cleanup` failures keep routes
+/// alone (the migration already happened; cleanup removes its own).
+pub fn unwinds_on_failure(phase: &str) -> bool {
+    phase != "cleanup"
+}
+
 /// First free `__dgmigrate_<bucket>_<n>` name.
 pub fn pick_transient_key(bucket_key: &str, taken: &dyn Fn(&str) -> bool) -> String {
     let mut n = 0u32;
@@ -188,7 +198,7 @@ pub async fn execute_migrate_phases(
                 .map(|j| j.phase)
                 .unwrap_or_else(|| job.phase.clone())
         };
-        if is_pre_flip(&phase) {
+        if unwinds_on_failure(&phase) {
             // Source stays authoritative; remove the staging route.
             remove_routes(
                 mutator,
@@ -365,7 +375,11 @@ async fn run_phases(
         let target = params.target_backend.clone();
         let transient = params.transient_key.clone();
         mutator
-            .mutate_and_apply(
+            // STRICT: the flip's file-persist must succeed or the whole flip
+            // rolls back (engine swapped back to source). A file that lags
+            // the flip is the data-loss crash window: boot would route
+            // clients to the source while the resumed cleanup deletes it.
+            .mutate_and_apply_strict(
                 &format!("Bucket '{bucket_key}' migrated to backend '{target}'"),
                 move |cfg| {
                     let mut policy = cfg.buckets.get(&bucket_key).cloned().unwrap_or_default();
@@ -388,6 +402,25 @@ async fn run_phases(
 
     // ── Phase: cleanup (optional delete-source; never fails the job) ──
     if phase == "cleanup" && params.delete_source {
+        // Defense-in-depth for the crash window: deleting source objects is
+        // only safe if the LIVE config genuinely routes the bucket to the
+        // target. A resumed job whose flip didn't stick (file lagged the
+        // engine, then a crash) must fail loudly instead of deleting a
+        // bucket clients are actively writing to.
+        let routed_to_target = {
+            let cfg = mutator.read().await;
+            cfg.buckets
+                .get(bucket)
+                .and_then(|p| p.backend.as_deref().map(|b| b == params.target_backend))
+                .unwrap_or(false)
+        };
+        if !routed_to_target {
+            return Err(format!(
+                "cleanup refused: bucket '{}' is not routed to '{}' in the live \
+                 config — the flip did not persist; source data left untouched",
+                bucket, params.target_backend
+            ));
+        }
         let cleanup_key = format!("{}__src", params.transient_key);
         ensure_route(
             mutator,
@@ -422,14 +455,22 @@ async fn run_phases(
                     break 'cleanup;
                 }
             };
+            let mut deleted_this_sweep = 0u32;
             for (key, _) in page.objects.iter().filter(|(k, _)| !k.ends_with('/')) {
-                if let Err(e) = engine.delete(&cleanup_key, key).await {
-                    delete_failures += 1;
-                    record_failure(db, job.id, key, &format!("source delete failed: {e}")).await;
+                match engine.delete(&cleanup_key, key).await {
+                    Ok(()) => deleted_this_sweep += 1,
+                    Err(e) => {
+                        delete_failures += 1;
+                        record_failure(db, job.id, key, &format!("source delete failed: {e}"))
+                            .await;
+                    }
                 }
             }
             // Deletes shrink the listing — restart from the top each sweep.
-            if page.next_continuation_token.is_none() {
+            // A sweep that deleted NOTHING will never converge: stop instead
+            // of re-listing the same page (and re-recording the same
+            // failures) MAX_PAGES times.
+            if page.next_continuation_token.is_none() || deleted_this_sweep == 0 {
                 break 'cleanup;
             }
             cleanup_token = None;
@@ -485,6 +526,14 @@ mod tests {
         assert!(is_pre_flip("verify"));
         assert!(!is_pre_flip("flip"));
         assert!(!is_pre_flip("cleanup"));
+        assert!(unwinds_on_failure("stage"));
+        assert!(unwinds_on_failure("copy"));
+        assert!(unwinds_on_failure("verify"));
+        assert!(
+            unwinds_on_failure("flip"),
+            "atomic flip failure = source authoritative"
+        );
+        assert!(!unwinds_on_failure("cleanup"));
         assert_eq!(PHASES.len(), 5);
     }
 

@@ -44,6 +44,11 @@ fn check_idents(idents: &[&str]) -> Result<(), ConfigDbError> {
 
 /// Take the leader lease for `key` when it is free or expired.
 /// Returns true when this owner now holds the lease.
+///
+/// Boundary tiling with [`renew_leader_lease`]: renew succeeds while
+/// `expires_at >= now`, steal requires `expires_at < now` — the two
+/// predicates partition the timeline, so the exact expiry instant can
+/// never be both renewable by the owner AND stealable by a rival.
 pub(crate) fn try_acquire_leader_lease(
     conn: &Connection,
     table: &str,
@@ -64,7 +69,7 @@ pub(crate) fn try_acquire_leader_lease(
                 AND (
                     leader_instance_id IS NULL
                     OR leader_expires_at IS NULL
-                    OR leader_expires_at <= ?
+                    OR leader_expires_at < ?
                 )"
         ),
         params![owner, expires_at, key, now],
@@ -255,8 +260,11 @@ mod tests {
         assert_eq!(lease(&c), (Some("w1".into()), Some(160)));
         // held & unexpired by another → refused
         assert!(!try_acquire_leader_lease(&c, "jobs", "name", &"a", "w2", 120, 60).unwrap());
-        // expired (boundary: expires_at <= now) → stealable
-        assert!(try_acquire_leader_lease(&c, "jobs", "name", &"a", "w2", 160, 60).unwrap());
+        // AT expiry (now == expires_at) the OWNER still renews — not stealable
+        // (renew/steal predicates tile; see the doc comment).
+        assert!(!try_acquire_leader_lease(&c, "jobs", "name", &"a", "w2", 160, 60).unwrap());
+        // strictly past expiry → stealable
+        assert!(try_acquire_leader_lease(&c, "jobs", "name", &"a", "w2", 161, 60).unwrap());
         assert_eq!(lease(&c).0.as_deref(), Some("w2"));
         // same-owner re-acquire while held: refused (not expired) — callers
         // use renew for that.

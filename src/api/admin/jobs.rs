@@ -287,10 +287,11 @@ pub async fn list_jobs(
 
     if let Some(db) = state.config_db.as_ref() {
         let db = db.lock().await;
-        let now = crate::replication::current_unix_seconds();
 
         for rule in &repl_cfg.rules {
-            let _ = db.replication_ensure_state(&rule.name, now);
+            // Read-only: absent state rows render as defaults below.
+            // ensure_state belongs to the scheduler/run paths — doing it
+            // here would put N writes behind every 2s UI poll.
             let st = db.replication_load_state(&rule.name).ok().flatten();
             let status_raw = st
                 .as_ref()
@@ -337,7 +338,6 @@ pub async fn list_jobs(
         }
 
         for rule in &lc_cfg.rules {
-            let _ = db.lifecycle_ensure_state(&rule.name, now);
             let st = db.lifecycle_load_state(&rule.name).ok().flatten();
             let status_raw = st
                 .as_ref()
