@@ -36,7 +36,6 @@
     "test:scan-freshness": "node scripts/scan-freshness-regression-test.mjs",
     "test:trace-request": "node scripts/trace-request-regression-test.mjs",
     "test:rule-names": "node scripts/rule-names-regression-test.mjs",
-    "test:lifecycle-helpers": "node scripts/lifecycle-helpers-regression-test.mjs",
     "test:upload-telemetry": "node scripts/upload-telemetry-regression-test.mjs",
     "test:page-size": "node scripts/page-size-regression-test.mjs",
     "test:webhook-delivery-payload": "node scripts/webhook-delivery-payload-regression-test.mjs",

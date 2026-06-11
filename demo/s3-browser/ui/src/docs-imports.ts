@@ -35,6 +35,7 @@ import REF_METRICS from '../../../../docs/product/reference/metrics.md?raw';
 import REF_DELTA from '../../../../docs/product/reference/how-delta-works.md?raw';
 import REF_ENCRYPTION from '../../../../docs/product/reference/encryption-at-rest.md?raw';
 import REF_DECLARATIVE_IAM from '../../../../docs/product/reference/declarative-iam.md?raw';
+import REF_JOBS from '../../../../docs/product/reference/jobs.md?raw';
 import REF_REPLICATION from '../../../../docs/product/reference/replication.md?raw';
 import REF_LIFECYCLE from '../../../../docs/product/reference/lifecycle.md?raw';
 import REF_EVENT_OUTBOX from '../../../../docs/product/reference/event-outbox.md?raw';
@@ -74,6 +75,7 @@ const CONTENT_BY_PATH: Record<string, string> = {
   'reference/how-delta-works': REF_DELTA,
   'reference/encryption-at-rest': REF_ENCRYPTION,
   'reference/declarative-iam': REF_DECLARATIVE_IAM,
+  'reference/jobs': REF_JOBS,
   'reference/replication': REF_REPLICATION,
   'reference/lifecycle': REF_LIFECYCLE,
   'reference/event-outbox': REF_EVENT_OUTBOX,

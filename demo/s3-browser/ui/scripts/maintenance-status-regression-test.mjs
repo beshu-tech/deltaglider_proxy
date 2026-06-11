@@ -12,8 +12,7 @@ const { outputText } = ts.transpileModule(source, {
   fileName: 'maintenanceStatus.ts',
 });
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`;
-const { isActiveStatus, activePercent, phaseLabel, browserBannerText } =
-  await import(moduleUrl);
+const { activePercent, phaseLabel, browserBannerText } = await import(moduleUrl);
 
 const job = (over = {}) => ({
   id: 1,
@@ -27,7 +26,6 @@ const job = (over = {}) => ({
   objects_failed: 0,
   bytes_done: 1234,
   percent: 49,
-  last_error: null,
   triggered_by: 'admin',
   created_at: 1,
   started_at: 2,
@@ -35,9 +33,8 @@ const job = (over = {}) => ({
   ...over,
 });
 
-// ── isActiveStatus ──────────────────────────────────────────────────────────
-for (const s of ['queued', 'running', 'cancelling']) assert.equal(isActiveStatus(s), true, s);
-for (const s of ['completed', 'failed', 'cancelled']) assert.equal(isActiveStatus(s), false, s);
+// (isActiveStatus was deleted — the live-status check is jobsView.isActiveJobStatus,
+//  covered by test:jobs-view.)
 
 // ── activePercent ───────────────────────────────────────────────────────────
 assert.equal(activePercent(job()), 49);

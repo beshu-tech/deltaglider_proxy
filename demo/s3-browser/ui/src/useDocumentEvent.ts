@@ -43,13 +43,3 @@ export function useOnClickOutside(
     enabled
   );
 }
-
-export function useEscapeKey(onEscape: () => void, enabled = true) {
-  useDocumentEvent(
-    'keydown',
-    (event) => {
-      if (event.key === 'Escape') onEscape();
-    },
-    enabled
-  );
-}

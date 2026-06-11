@@ -56,7 +56,7 @@ export default function MigrateBucketModal({ open, bucket, onClose, onStarted }:
     try {
       await createMigrateJob(effectiveBucket, target, deleteSource);
       messageApi.success(
-        `Migration of ${effectiveBucket} → ${target} started — track it under Admin → Jobs`
+        `Migration of ${effectiveBucket} → ${target} started — track progress on the Jobs page`
       );
       qc.invalidateQueries({ queryKey: qk.jobs.list() });
       qc.invalidateQueries({ queryKey: qk.backends.origins() });

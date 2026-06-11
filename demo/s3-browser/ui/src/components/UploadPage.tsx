@@ -461,7 +461,7 @@ export default function UploadPage({ prefix, onBack, onDone, initialFiles, onCon
             }}
             style={{ borderRadius: 10, fontWeight: 600, minWidth: 280, height: 48, fontSize: 16, marginTop: 8 }}
           >
-            Done — go to {uploadedDestLabel}
+            {uploadedDest ? 'Done — open folder' : 'Done — back to browser'}
           </Button>
         </div>
       ) : (
@@ -475,7 +475,7 @@ export default function UploadPage({ prefix, onBack, onDone, initialFiles, onCon
           </Button>
           {pendingCount > 0 && (
             <Text aria-live="polite" role="status" style={{ fontSize: 12, color: ACCENT_BLUE, fontFamily: "var(--font-mono)" }}>
-              {pendingCount} file{pendingCount !== 1 ? 's' : ''} remaining...
+              {pendingCount} file{pendingCount !== 1 ? 's' : ''} remaining…
             </Text>
           )}
         </div>

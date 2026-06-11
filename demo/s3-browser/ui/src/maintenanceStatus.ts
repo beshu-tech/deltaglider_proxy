@@ -22,16 +22,12 @@ export interface MaintenanceJobView {
   objects_failed: number;
   bytes_done: number;
   percent: number | null;
-  last_error: string | null;
+  // No last_error: this projection is readable by non-admin browser
+  // sessions; error detail is admin-tier only (the jobs API).
   triggered_by: string | null;
   created_at: number;
   started_at: number | null;
   finished_at: number | null;
-}
-
-/** Statuses for which the bucket is gated (writes 503) and the UI shows busy. */
-export function isActiveStatus(status: string): boolean {
-  return status === 'queued' || status === 'running' || status === 'cancelling';
 }
 
 /**
@@ -51,7 +47,7 @@ export function phaseLabel(job: MaintenanceJobView): string {
     case 'counting':
       return 'Counting objects…';
     case 'references':
-      return 'Finalizing (shared baselines)…';
+      return 'Finalizing shared reference files…';
     default: {
       const total = job.objects_total;
       const processed = job.objects_done + job.objects_skipped;

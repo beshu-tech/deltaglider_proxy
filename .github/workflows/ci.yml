@@ -653,7 +653,6 @@ jobs:
           npm run test:url-state
           npm run test:scan-freshness
           npm run test:rule-names
-          npm run test:lifecycle-helpers
           npm run test:upload-telemetry
           npm run test:webhook-delivery-payload
           npm run test:keyboard

@@ -70,12 +70,20 @@ interface Props {
   onSessionExpired?: () => void;
 }
 
-const ACTION_META: Record<JobAction, { label: string; icon: React.ReactNode; danger?: boolean }> = {
-  pause: { label: 'Pause', icon: <PauseOutlined /> },
-  resume: { label: 'Resume', icon: <CaretRightOutlined /> },
+const ACTION_META: Record<
+  JobAction,
+  { label: string; icon: React.ReactNode; danger?: boolean; done?: string }
+> = {
+  pause: { label: 'Pause', icon: <PauseOutlined />, done: 'Paused' },
+  resume: { label: 'Resume', icon: <CaretRightOutlined />, done: 'Resumed' },
   'run-now': { label: 'Run now', icon: <CaretRightOutlined /> },
   preview: { label: 'Preview', icon: <EyeOutlined /> },
-  cancel: { label: 'Cancel', icon: <StopOutlined />, danger: true },
+  cancel: {
+    label: 'Cancel',
+    icon: <StopOutlined />,
+    danger: true,
+    done: 'Cancellation requested — the job stops at the next safe point',
+  },
 };
 
 export default function JobsPanel({ onSessionExpired }: Props) {
@@ -147,8 +155,15 @@ export default function JobsPanel({ onSessionExpired }: Props) {
   useApplyHandler('jobs', startApplyQueue, anyDirty);
 
   const confirmReplApply = useCallback(async () => {
-    await repl.confirmApply();
+    const ok = await repl.confirmApply();
     qc.invalidateQueries({ queryKey: qk.jobs.list() });
+    if (!ok) {
+      // Replication PUT failed: abort the queue. The lifecycle edits stay
+      // dirty (nothing is discarded) and its dialog must NOT open stacked
+      // on top of the failure the operator is looking at.
+      setQueueLifecycleNext(false);
+      return;
+    }
     if (queueLifecycleNext) {
       setQueueLifecycleNext(false);
       // Open the lifecycle dialog as the next step of the queue.
@@ -187,15 +202,17 @@ export default function JobsPanel({ onSessionExpired }: Props) {
         const r = result as { objects_copied?: number; objects_affected?: number; status?: string };
         const n = r?.objects_copied ?? r?.objects_affected;
         messageApi.success(
-          n != null ? `Run ${r?.status ?? 'finished'}: ${n} object(s) processed` : 'Run finished'
+          n != null
+            ? `Run ${r?.status ?? 'finished'}: ${n} object${n === 1 ? '' : 's'} processed`
+            : 'Run finished'
         );
       } else if (action === 'preview') {
         const r = result as { objects_affected?: number; objects_scanned?: number };
         messageApi.info(
-          `Preview: ${r?.objects_affected ?? 0} of ${r?.objects_scanned ?? 0} scanned object(s) would be affected`
+          `Preview: ${r?.objects_affected ?? 0} of ${r?.objects_scanned ?? 0} scanned objects would be affected`
         );
       } else {
-        messageApi.success(`${ACTION_META[action].label} OK`);
+        messageApi.success(ACTION_META[action].done ?? `${ACTION_META[action].label} OK`);
       }
       qc.invalidateQueries({ queryKey: qk.jobs.list() });
     } catch (e) {
@@ -210,8 +227,8 @@ export default function JobsPanel({ onSessionExpired }: Props) {
       { key: 'replication', label: 'Replication rule — continuous copy' },
       { key: 'lifecycle', label: 'Lifecycle rule — scheduled expiry / archive' },
       { type: 'divider' as const },
-      { key: 'reencrypt', label: 'Re-encrypt buckets…' },
-      { key: 'migrate', label: 'Migrate bucket…' },
+      { key: 'reencrypt', label: 'Re-encrypt buckets… — one-off rewrite' },
+      { key: 'migrate', label: 'Migrate bucket… — one-off move' },
     ],
     onClick: ({ key }: { key: string }) => {
       if (key === 'replication') {
@@ -413,7 +430,7 @@ export default function JobsPanel({ onSessionExpired }: Props) {
             })}
             locale={{
               emptyText:
-                'No background jobs yet. "New job" adds a replication or lifecycle rule, or starts a one-off re-encrypt / migrate.',
+                'No jobs yet. Use "New job" to add a replication or lifecycle rule, or start a one-off re-encrypt or migrate job.',
             }}
           />
         )}

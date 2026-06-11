@@ -108,8 +108,15 @@ export interface UseSectionEditorResult<Local, Wire = Local> {
   runApply: () => Promise<void>;
   /** Close the dialog without persisting. */
   cancelApply: () => void;
-  /** PUT the snapshot the dialog was showing. */
-  confirmApply: () => Promise<void>;
+  /**
+   * PUT the snapshot the dialog was showing. Resolves `true` only when the
+   * PUT succeeded and the snapshot was marked applied; `false` on a failed
+   * PUT or a network/server error (the edits stay dirty either way).
+   * Callers that sequence further work on success (e.g. the Jobs panel's
+   * sequential apply queue) must check the result; fire-and-forget call
+   * sites can ignore it.
+   */
+  confirmApply: () => Promise<boolean>;
   /** Manually re-fetch the section (rare — useful when external state changes). */
   refresh: () => Promise<void>;
 }
@@ -213,14 +220,14 @@ export function useSectionEditor<Wire, Local = Wire>(
     setPendingBody(null);
   }, []);
 
-  const confirmApply = useCallback(async () => {
-    if (!pendingBody) return;
+  const confirmApply = useCallback(async (): Promise<boolean> => {
+    if (!pendingBody) return false;
     setApplying(true);
     try {
       const resp = await putSection<Wire>(section, pendingBody);
       if (!resp.ok) {
         message.error(resp.error || 'Apply failed');
-        return;
+        return false;
       }
       message.success(
         resp.persisted_path ? `Applied + persisted to ${resp.persisted_path}` : 'Applied'
@@ -234,6 +241,7 @@ export function useSectionEditor<Wire, Local = Wire>(
       // server truth, so invalidate that cache to refetch.
       void queryClient.invalidateQueries({ queryKey: qk.config() });
       void refresh();
+      return true;
     } catch (e) {
       // Apply failed (network/server error). Close the dialog but do NOT
       // refresh() — refreshing would overwrite the user's still-dirty form
@@ -243,6 +251,7 @@ export function useSectionEditor<Wire, Local = Wire>(
       message.error(`Apply failed: ${e instanceof Error ? e.message : 'unknown'}`);
       setApplyOpen(false);
       setPendingBody(null);
+      return false;
     } finally {
       setApplying(false);
     }

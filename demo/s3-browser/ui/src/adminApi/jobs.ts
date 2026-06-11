@@ -57,7 +57,7 @@ export async function runJobAction(id: string, action: JobAction): Promise<unkno
   return safeJson(res);
 }
 
-/** Queue re-encryption jobs (moved here from /maintenance/reencrypt). */
+/** Queue re-encryption jobs for the given buckets. */
 export async function startReencrypt(buckets: string[]): Promise<{
   started: Array<{ bucket: string; job_id: number }>;
   errors: Array<{ bucket: string; error: string }>;

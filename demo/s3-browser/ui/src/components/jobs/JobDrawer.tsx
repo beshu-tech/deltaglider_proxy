@@ -131,7 +131,7 @@ export default function JobDrawer({
         </div>
       );
     }
-    return <Empty description="Rule not found in the editor" />;
+    return <Empty description="This job no longer exists — it may have been removed or already applied. Close this panel." />;
   })();
 
   const runsTable = (
@@ -172,7 +172,7 @@ export default function JobDrawer({
           render: (_: unknown, f) => (
             <Text style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>
               {f.bucket ? `${f.bucket}/` : ''}
-              {f.object_key || '(rule-level)'}
+              {f.object_key || '(job-level)'}
             </Text>
           ),
         },

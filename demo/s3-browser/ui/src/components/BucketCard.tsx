@@ -170,7 +170,11 @@ export default function BucketCard({
       <Chip
         key="busy"
         tone={colors.ACCENT_AMBER}
-        title="A re-encryption job is rewriting this bucket. Reads work; uploads and deletes are temporarily rejected."
+        title={
+          maintenanceJob.kind === 'migrate'
+            ? 'Migrating this bucket to another backend. Reads work; uploads and deletes are temporarily rejected.'
+            : 'A re-encryption job is rewriting this bucket. Reads work; uploads and deletes are temporarily rejected.'
+        }
       >
         <SyncOutlined spin style={{ fontSize: 10 }} /> busy{pct != null ? ` ${pct}%` : ''}
       </Chip>
@@ -334,7 +338,11 @@ export default function BucketCard({
               type="text"
               danger
               style={{ fontSize: 11, padding: '0 4px' }}
-              title="Stop the job. Already-rewritten objects stay rewritten (the job is idempotent — re-running later skips them)."
+              title={
+                maintenanceJob.kind === 'migrate'
+                  ? 'Stop the migration. The bucket stays on its current backend; nothing has switched over.'
+                  : 'Stop the job. Already-rewritten objects stay rewritten (the job is idempotent — re-running later skips them).'
+              }
               onClick={(e) => {
                 e.stopPropagation();
                 void runJobAction(maintenanceJob.id, 'cancel').catch(() => {

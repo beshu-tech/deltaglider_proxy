@@ -16,9 +16,7 @@ export function useJobs(opts?: { enabled?: boolean }) {
     enabled: opts?.enabled ?? true,
     refetchInterval: (query) => {
       const jobs = query.state.data?.jobs ?? [];
-      return jobs.some((j) => isActiveJobStatus(j.status) || j.status === 'running')
-        ? POLL_MS
-        : false;
+      return jobs.some((j) => isActiveJobStatus(j.status)) ? POLL_MS : false;
     },
   });
 }
