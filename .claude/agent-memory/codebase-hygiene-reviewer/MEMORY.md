@@ -3,3 +3,4 @@
 - [Replication module patterns](replication_patterns.md) — worker/scheduler/planner/state_store module structure and common idioms
 - [Routing backend semantics](routing_backend.md) — resolve vs resolve_existing, listed_bucket_virtual_name change
 - [Migrate job machinery](migrate_job_machinery.md) — flip-persist crash window + maintenance_finish double-finish note clobber
+- [Job Pager state machine](job_pager.md) — job_loop.rs::Pager semantics, the 3 intentional behavior deltas, phase-scoped resume, cosmetic counter inflation on poison restart

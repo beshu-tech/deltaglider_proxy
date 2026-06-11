@@ -256,6 +256,9 @@ async fn execute_phases(
                 Err(e) if pager.poisoned_resume_token() => {
                     // Restart the phase from page 0: needs_rewrite makes the
                     // re-scan idempotent (already-rewritten objects skip).
+                    // Counters are NOT reset, so re-encountered objects tally
+                    // as `skipped` again — display drift only, never a
+                    // re-rewrite.
                     warn!(
                         "maintenance: job #{} objects resume token rejected ({e}); restarting phase fresh",
                         job.id

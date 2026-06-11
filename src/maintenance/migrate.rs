@@ -286,7 +286,9 @@ async fn run_phases(
                 Ok(p) => p,
                 Err(e) if pager.poisoned_resume_token() => {
                     // Restart the phase from page 0: HEAD-skip makes the
-                    // re-list idempotent.
+                    // re-list idempotent. (Counters are NOT reset, so
+                    // already-copied objects tally as `skipped` a second
+                    // time — display drift only, never a re-copy.)
                     tracing::warn!(
                         "migrate: job #{} copy resume token rejected ({e}); restarting phase fresh",
                         job.id
@@ -504,7 +506,7 @@ async fn run_phases(
             // Deletes shrink the listing — restart from the top each sweep.
             // A sweep that deleted NOTHING will never converge: stop instead
             // of re-listing the same page (and re-recording the same
-            // failures) MAX_PAGES times.
+            // failures) up to the page cap.
             if page.next_continuation_token.is_none() || deleted_this_sweep == 0 {
                 break 'cleanup;
             }
