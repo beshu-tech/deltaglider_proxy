@@ -347,6 +347,22 @@ body {
   to { transform: rotate(360deg); }
 }
 
+/* Upload-complete celebration: one springy pop on entry, then a soft green
+   glow that settles. Celebrative, not confetti. */
+@keyframes successPop {
+  0% { opacity: 0; transform: scale(0.94) translateY(8px); }
+  60% { opacity: 1; transform: scale(1.015) translateY(0); }
+  100% { opacity: 1; transform: scale(1); }
+}
+@keyframes successGlow {
+  0% { box-shadow: 0 0 0 rgba(82, 196, 26, 0); }
+  40% { box-shadow: 0 0 28px rgba(82, 196, 26, 0.35); }
+  100% { box-shadow: 0 0 12px rgba(82, 196, 26, 0.15); }
+}
+.dg-upload-success {
+  animation: successPop 0.4s cubic-bezier(0.34, 1.56, 0.64, 1), successGlow 1.6s ease-out forwards;
+}
+
 .animate-fade-in {
   animation: fadeIn 0.3s ease-out;
 }

@@ -412,46 +412,65 @@ export default function UploadPage({ prefix, onBack, onDone, initialFiles, onCon
       />
 
       {/* Primary actions — ABOVE the progress list so "Done" is reachable
-          without scrolling past every progress bar. When the batch has
-          finished, lead with the big Done button that jumps straight to the
-          folder the files landed in. */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', marginBottom: 24 }}>
-        {allUploaded ? (
-          <>
-            <Button
-              type="primary"
-              size="large"
-              icon={<CheckCircleFilled />}
-              onClick={() => {
-                onDone();
-                if (onFinish) onFinish(uploadedDest);
-                else onBack();
-              }}
-              style={{ borderRadius: 8, fontWeight: 600, minWidth: 220 }}
-            >
-              Done — go to {uploadedDestLabel}
-            </Button>
-            <Text aria-live="polite" role="status" style={{ fontSize: 13, color: ACCENT_GREEN, fontFamily: 'var(--font-ui)' }}>
-              {stats.uploaded} file{stats.uploaded !== 1 ? 's' : ''} uploaded
+          without scrolling past every progress bar. */}
+      {allUploaded ? (
+        /* Upload complete: a centered, dominant, gently celebratory panel —
+           the Done button is THE action on this page now. */
+        <div
+          className="dg-upload-success"
+          role="status"
+          aria-live="polite"
+          style={{
+            marginBottom: 24,
+            padding: '28px 24px',
+            borderRadius: 14,
+            border: `1px solid ${ACCENT_GREEN}`,
+            background: 'var(--drop-glow)',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            gap: 8,
+            textAlign: 'center',
+          }}
+        >
+          <CheckCircleFilled aria-hidden="true" style={{ fontSize: 44, color: ACCENT_GREEN }} />
+          <Text style={{ fontSize: 18, fontWeight: 700, color: TEXT_PRIMARY, fontFamily: 'var(--font-ui)' }}>
+            Upload complete
+          </Text>
+          <Text style={{ fontSize: 13, color: TEXT_SECONDARY, fontFamily: 'var(--font-ui)' }}>
+            {stats.uploaded} file{stats.uploaded !== 1 ? 's' : ''} uploaded to{' '}
+            <Text code style={{ fontSize: 13 }}>{uploadedDestLabel}</Text>
+          </Text>
+          <Button
+            type="primary"
+            size="large"
+            icon={<CheckCircleFilled />}
+            onClick={() => {
+              onDone();
+              if (onFinish) onFinish(uploadedDest);
+              else onBack();
+            }}
+            style={{ borderRadius: 10, fontWeight: 600, minWidth: 280, height: 48, fontSize: 16, marginTop: 8 }}
+          >
+            Done — go to {uploadedDestLabel}
+          </Button>
+        </div>
+      ) : (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', marginBottom: 24 }}>
+          <Button
+            icon={<ArrowLeftOutlined />}
+            onClick={handleBack}
+            style={{ background: BG_ELEVATED, borderColor: BORDER, color: TEXT_SECONDARY, borderRadius: 8 }}
+          >
+            Back to browse
+          </Button>
+          {pendingCount > 0 && (
+            <Text aria-live="polite" role="status" style={{ fontSize: 12, color: ACCENT_BLUE, fontFamily: "var(--font-mono)" }}>
+              {pendingCount} file{pendingCount !== 1 ? 's' : ''} remaining...
             </Text>
-          </>
-        ) : (
-          <>
-            <Button
-              icon={<ArrowLeftOutlined />}
-              onClick={handleBack}
-              style={{ background: BG_ELEVATED, borderColor: BORDER, color: TEXT_SECONDARY, borderRadius: 8 }}
-            >
-              Back to browse
-            </Button>
-            {pendingCount > 0 && (
-              <Text aria-live="polite" role="status" style={{ fontSize: 12, color: ACCENT_BLUE, fontFamily: "var(--font-mono)" }}>
-                {pendingCount} file{pendingCount !== 1 ? 's' : ''} remaining...
-              </Text>
-            )}
-          </>
-        )}
-      </div>
+          )}
+        </div>
+      )}
 
       {/* Upload queue */}
       {queue.length > 0 && (
