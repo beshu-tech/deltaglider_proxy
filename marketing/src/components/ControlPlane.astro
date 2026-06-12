@@ -1,28 +1,46 @@
 ---
-// Capabilities.astro — art-directed bento for "what DeltaGlider does".
-// Hierarchy is encoded by SIZE + COLOR + GLOW, in the product's priority order:
-//   Tier 1 (hero, biggest, cyan glow): enterprise auth & access control
-//   Tier 2 (wide, fuchsia accent):     cross-cloud replication
-//   Tier 3 (two small, neutral):       delta compression + encryption at rest
-// Self-contained: markup + scoped styles. Accessibility: all text colours are
-// WCAG-AA on the dark surface (no --ink-mute as readable text).
-const tier1Tags = ["IAM", "ABAC", "OAuth / OIDC", "Lifecycle"];
+// ControlPlane.astro — "the other half of the product" section.
+// Replaces the old Capabilities bento + standalone screenshot gallery,
+// which were two parallel "what you get" lists. One section now: a bento
+// of the control-plane features (the delta tile is gone — the whole top
+// half of the page already sells compression; jobs/events/audit takes its
+// slot) followed by three real admin-UI screenshots as evidence, captions
+// always visible (the old gallery hid them behind hover — dead on mobile).
+const tier1Tags = ["IAM", "ABAC", "OAuth / OIDC", "Per-bucket"];
 const tier2Tags = ["Event-driven", "Scheduled", "Pause / resume"];
-const tier3aTags = ["10×–100×", "Same S3 API"];
-const tier3bTags = ["AES-256-GCM", "Your key"];
+const tier3aTags = ["AES-256-GCM", "Your key"];
+const tier3bTags = ["Webhooks", "Slack", "Audit log"];
+
+const shots = [
+  {
+    src: '/screenshots/iam.jpg',
+    alt: 'IAM user management screen in the embedded admin UI',
+    caption: 'IAM users with ABAC permissions and group mapping.',
+  },
+  {
+    src: '/screenshots/object-replication.jpg',
+    alt: 'Jobs screen showing replication and lifecycle rules',
+    caption: 'One Jobs screen: replication, lifecycle, migrations.',
+  },
+  {
+    src: '/screenshots/analytics.jpg',
+    alt: 'Storage analytics dashboard with per-bucket savings',
+    caption: 'Per-bucket savings, measured live — not estimated.',
+  },
+];
 ---
 
-<section class="section caps" aria-labelledby="caps-title">
+<section class="section cp" aria-labelledby="cp-title">
   <div class="shell">
-    <header class="caps-head">
-      <span class="section-eyebrow">What you get</span>
-      <h2 id="caps-title" class="caps-title">
-        The control plane AWS charges for, <span class="grad">on cheap storage</span>.
+    <header class="cp-head">
+      <span class="section-eyebrow">The other half</span>
+      <h2 id="cp-title" class="cp-title">
+        It's also the control plane your <span class="grad">cheap bucket</span> is missing
       </h2>
-      <p class="caps-intro">
-        Point DeltaGlider at Hetzner, Wasabi, MinIO, or any S3 bucket and get
-        access control, replication, lifecycle, and encryption in front of it.
-        Drop-in. Transparent. No lock-in.
+      <p class="cp-intro">
+        The compression pays for the move; this is why you stay. Point it
+        at Hetzner, Wasabi, MinIO, or AWS and the governance you'd
+        normally rent from a hyperscaler rides along in the same binary.
       </p>
     </header>
 
@@ -33,20 +51,19 @@ const tier3bTags = ["AES-256-GCM", "Your key"];
         <div class="hero-grid">
           <div class="hero-copy">
             <span class="kicker">
-              <span class="kicker-idx">01</span> Control plane
+              <span class="kicker-idx">01</span> Access
             </span>
             <h3 class="tile-title">Per-user auth &amp; access control</h3>
             <p class="tile-desc">
-              Per-user IAM with fine-grained ABAC permissions, OAuth/OIDC SSO
-              with group mapping, and object lifecycle rules — the access and
-              governance layer, in front of any bucket.
+              Per-user IAM with fine-grained ABAC permissions and
+              OAuth/OIDC SSO with group mapping — an access layer your
+              budget object store doesn't have, in front of any bucket.
             </p>
             <ul class="chips" aria-label="Capabilities">
               {tier1Tags.map((t) => <li class="chip chip--brand">{t}</li>)}
             </ul>
           </div>
 
-          <!-- focal visual: a policy snippet + user→role→bucket map + SSO chips -->
           <div class="hero-visual" aria-hidden="true">
             <div class="policy">
               <div class="policy-bar">
@@ -77,7 +94,7 @@ const tier3bTags = ["AES-256-GCM", "Your key"];
         </div>
       </article>
 
-      <!-- TIER 2 — SECONDARY -->
+      <!-- TIER 2 — REPLICATION -->
       <article class="tile tile--wide" style="--i:1">
         <div class="accent-corner" aria-hidden="true"></div>
         <span class="kicker kicker--accent">
@@ -85,9 +102,9 @@ const tier3bTags = ["AES-256-GCM", "Your key"];
         </span>
         <h3 class="tile-title">Cross-cloud replication</h3>
         <p class="tile-desc">
-          Replicate objects between buckets across providers — event-driven
-          or scheduled, with pause/resume. Migrate or run multi-cloud,
-          without lock-in.
+          Replicate objects between buckets across providers —
+          event-driven or scheduled, with pause/resume. Migrate or run
+          multi-cloud, without lock-in.
         </p>
         <div class="repl-route" aria-hidden="true">
           <span class="rnode">S3</span>
@@ -101,44 +118,94 @@ const tier3bTags = ["AES-256-GCM", "Your key"];
         </ul>
       </article>
 
-      <!-- TIER 3a -->
+      <!-- TIER 3a — ENCRYPTION -->
       <article class="tile tile--small" style="--i:2">
         <span class="kicker">
-          <span class="kicker-idx">03</span> Efficiency
+          <span class="kicker-idx">03</span> Confidentiality
         </span>
-        <h3 class="tile-title tile-title--sm">Transparent delta compression</h3>
+        <h3 class="tile-title tile-title--sm">Encryption at rest</h3>
         <p class="tile-desc">
-          Versioned binaries stored as deltas — 10×–100× fewer bytes when
-          versions resemble each other, behind the same S3 API.
+          AES-256-GCM before objects hit the bucket. Your key stays in
+          your runtime; the backend only ever sees ciphertext.
         </p>
         <ul class="chips" aria-label="Capabilities">
           {tier3aTags.map((t) => <li class="chip">{t}</li>)}
         </ul>
       </article>
 
-      <!-- TIER 3b -->
+      <!-- TIER 3b — OPERATIONS -->
       <article class="tile tile--small" style="--i:3">
         <span class="kicker">
-          <span class="kicker-idx">04</span> Confidentiality
+          <span class="kicker-idx">04</span> Operations
         </span>
-        <h3 class="tile-title tile-title--sm">Encryption at rest</h3>
+        <h3 class="tile-title tile-title--sm">Jobs, events &amp; audit</h3>
         <p class="tile-desc">
-          AES-256-GCM before objects hit the bucket. Your key stays in your
-          runtime; the backend only ever sees ciphertext.
+          Replication, lifecycle, migrations, and re-encryption run as
+          resumable background jobs with run history. Webhook or Slack on
+          every object event; an audit trail on every admin action.
         </p>
         <ul class="chips" aria-label="Capabilities">
           {tier3bTags.map((t) => <li class="chip">{t}</li>)}
         </ul>
       </article>
     </div>
+
+    <!-- EVIDENCE STRIP — real screens from the embedded admin UI -->
+    <p class="cp-proof-lede">
+      None of it is a separate product: these screens ship inside the
+      binary you download. Click to inspect.
+    </p>
+    <div class="shots">
+      {shots.map((s) => (
+        <figure class="shot">
+          <button class="shot-frame" type="button" data-src={s.src} data-alt={s.alt} aria-label={`Enlarge screenshot: ${s.caption}`}>
+            <img src={s.src} alt={s.alt} width="1147" height="1440" loading="lazy" decoding="async" />
+          </button>
+          <figcaption class="shot-caption">{s.caption}</figcaption>
+        </figure>
+      ))}
+    </div>
   </div>
 </section>
 
-<style>
-  .caps { position: relative; overflow: hidden; }
+<dialog id="cp-lightbox" class="lightbox">
+  <form method="dialog" class="lightbox-close-wrapper">
+    <button class="lightbox-close" aria-label="Close lightbox">&times;</button>
+  </form>
+  <img id="cp-lightbox-img" src="" alt="" loading="lazy" />
+</dialog>
 
-  /* faint atmospheric wash behind the whole section */
-  .caps::before {
+<script>
+  const frames = document.querySelectorAll('.shot-frame');
+  const dialog = document.getElementById('cp-lightbox') as HTMLDialogElement;
+  const img = document.getElementById('cp-lightbox-img') as HTMLImageElement;
+
+  if (frames.length > 0 && dialog && img) {
+    frames.forEach((frame) => {
+      frame.addEventListener('click', () => {
+        const src = frame.getAttribute('data-src');
+        const alt = frame.getAttribute('data-alt');
+        if (src) {
+          img.src = src;
+          img.alt = alt || '';
+          dialog.showModal();
+        }
+      });
+    });
+
+    dialog.addEventListener('click', (e) => {
+      const r = dialog.getBoundingClientRect();
+      if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) {
+        dialog.close();
+      }
+    });
+  }
+</script>
+
+<style>
+  .cp { position: relative; overflow: hidden; }
+
+  .cp::before {
     content: "";
     position: absolute;
     inset: 0;
@@ -149,12 +216,12 @@ const tier3bTags = ["AES-256-GCM", "Your key"];
   }
 
   /* ---------- header ---------- */
-  .caps-head {
+  .cp-head {
     max-width: 680px;
     margin-bottom: 3rem;
     position: relative;
   }
-  .caps-title {
+  .cp-title {
     font-family: var(--font-sans);
     font-weight: 800;
     font-size: clamp(2rem, 4.6vw, 3.4rem);
@@ -163,13 +230,13 @@ const tier3bTags = ["AES-256-GCM", "Your key"];
     color: var(--ink-strong);
     margin: 0.7rem 0 1rem;
   }
-  .caps-title .grad {
+  .cp-title .grad {
     background: linear-gradient(100deg, var(--brand) 0%, var(--brand-dark) 50%, var(--accent) 120%);
     -webkit-background-clip: text;
     background-clip: text;
     color: transparent;
   }
-  .caps-intro {
+  .cp-intro {
     font-family: var(--font-sans);
     font-size: clamp(1rem, 1.4vw, 1.15rem);
     line-height: 1.6;
@@ -194,7 +261,6 @@ const tier3bTags = ["AES-256-GCM", "Your key"];
   .tile--small:nth-of-type(3) { grid-area: sm1; }
   .tile--small:nth-of-type(4) { grid-area: sm2; }
 
-  /* ---------- shared tile shell ---------- */
   .tile {
     position: relative;
     border: 1px solid var(--rule);
@@ -210,7 +276,7 @@ const tier3bTags = ["AES-256-GCM", "Your key"];
       border-color 0.35s ease, box-shadow 0.35s ease;
     opacity: 0;
     transform: translateY(22px);
-    animation: caps-rise 0.7s cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
+    animation: cp-rise 0.7s cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
     animation-delay: calc(var(--i) * 110ms + 80ms);
   }
   .tile:hover {
@@ -218,11 +284,10 @@ const tier3bTags = ["AES-256-GCM", "Your key"];
     border-color: var(--rule-strong);
     box-shadow: var(--shadow-lg);
   }
-  @keyframes caps-rise {
+  @keyframes cp-rise {
     to { opacity: 1; transform: translateY(0); }
   }
 
-  /* ---------- kickers / titles / desc ---------- */
   .kicker {
     display: inline-flex;
     align-items: center;
@@ -238,7 +303,7 @@ const tier3bTags = ["AES-256-GCM", "Your key"];
   .kicker--accent { color: #f5b6fb; }
   .kicker-idx {
     font-variant-numeric: tabular-nums;
-    color: var(--ink-soft);            /* AA — was --ink-mute (~2.7:1) */
+    color: var(--ink-soft);
     padding: 0.12rem 0.4rem;
     border: 1px solid var(--rule-strong);
     border-radius: 6px;
@@ -261,7 +326,6 @@ const tier3bTags = ["AES-256-GCM", "Your key"];
     margin: 0 0 1.1rem;
   }
 
-  /* ---------- chips ---------- */
   .chips {
     list-style: none;
     display: flex;
@@ -269,12 +333,13 @@ const tier3bTags = ["AES-256-GCM", "Your key"];
     gap: 0.5rem;
     margin: auto 0 0;
     padding: 0;
+    max-width: none;
   }
   .chip {
     font-family: var(--font-mono);
     font-size: 0.72rem;
     letter-spacing: 0.02em;
-    color: var(--ink-soft);            /* AA */
+    color: var(--ink-soft);
     padding: 0.32rem 0.6rem;
     border: 1px solid var(--rule-strong);
     border-radius: 999px;
@@ -292,9 +357,7 @@ const tier3bTags = ["AES-256-GCM", "Your key"];
     background: rgba(217, 70, 239, 0.12);
   }
 
-  /* ===================================================== */
-  /* TIER 1 — HERO                                          */
-  /* ===================================================== */
+  /* ---------- hero tile ---------- */
   .tile--hero {
     padding: 2.2rem 2.3rem;
     border-color: rgba(34, 211, 238, 0.4);
@@ -313,9 +376,9 @@ const tier3bTags = ["AES-256-GCM", "Your key"];
     background: radial-gradient(50% 60% at 30% 20%, rgba(34, 211, 238, 0.3), transparent 70%);
     filter: blur(18px);
     z-index: -1;
-    animation: caps-pulse 5.5s ease-in-out infinite;
+    animation: cp-pulse 5.5s ease-in-out infinite;
   }
-  @keyframes caps-pulse {
+  @keyframes cp-pulse {
     0%, 100% { opacity: 0.5; }
     50% { opacity: 0.9; }
   }
@@ -334,7 +397,6 @@ const tier3bTags = ["AES-256-GCM", "Your key"];
   }
   .tile--hero .tile-desc { font-size: 1rem; }
 
-  /* --- focal visual --- */
   .hero-visual {
     display: flex;
     flex-direction: column;
@@ -418,10 +480,10 @@ const tier3bTags = ["AES-256-GCM", "Your key"];
     border-radius: 50%;
     background: var(--brand);
     box-shadow: 0 0 8px var(--brand);
-    animation: caps-travel 2.6s linear infinite;
+    animation: cp-travel 2.6s linear infinite;
   }
   .flowmap .wire:nth-of-type(4)::after { animation-delay: 1.3s; }
-  @keyframes caps-travel {
+  @keyframes cp-travel {
     from { left: 0%; opacity: 0; }
     10% { opacity: 1; }
     90% { opacity: 1; }
@@ -440,9 +502,7 @@ const tier3bTags = ["AES-256-GCM", "Your key"];
     color: var(--ink-soft);
   }
 
-  /* ===================================================== */
-  /* TIER 2 — WIDE / TALL                                   */
-  /* ===================================================== */
+  /* ---------- replication tile ---------- */
   .tile--wide {
     background: linear-gradient(180deg, rgba(217, 70, 239, 0.07), var(--bg-card) 50%);
     border-color: rgba(217, 70, 239, 0.24);
@@ -476,9 +536,114 @@ const tier3bTags = ["AES-256-GCM", "Your key"];
   }
   .rarrow { color: var(--accent); font-size: 0.95rem; }
 
-  /* ===================================================== */
-  /* responsive collapse                                    */
-  /* ===================================================== */
+  /* ---------- evidence strip ---------- */
+  .cp-proof-lede {
+    margin: 2.75rem 0 1.25rem;
+    color: var(--ink-soft);
+    font-size: 0.98rem;
+    max-width: var(--measure-wide);
+    position: relative;
+  }
+
+  .shots {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 1.4rem;
+    position: relative;
+  }
+  @media (min-width: 700px) {
+    .shots { grid-template-columns: repeat(3, 1fr); }
+  }
+
+  .shot { margin: 0; }
+
+  .shot-frame {
+    display: block;
+    width: 100%;
+    padding: 0;
+    border: 1px solid var(--rule);
+    border-radius: 12px;
+    overflow: hidden;
+    background: var(--bg-soft);
+    box-shadow: var(--shadow-sm);
+    aspect-ratio: 4 / 3;
+    cursor: zoom-in;
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+  }
+  .shot-frame:hover {
+    border-color: rgba(34, 211, 238, 0.45);
+    box-shadow: var(--shadow-md);
+  }
+  .shot-frame img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    object-position: top;
+    display: block;
+  }
+
+  .shot-caption {
+    margin-top: 0.6rem;
+    font-size: 0.88rem;
+    color: var(--ink-soft);
+    line-height: 1.45;
+  }
+
+  /* ---------- lightbox ---------- */
+  .lightbox {
+    padding: 0;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    max-width: 90vw;
+    max-height: 90vh;
+    overflow: visible;
+  }
+  .lightbox::backdrop {
+    background: rgba(11, 15, 25, 0.85);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+  }
+  .lightbox img {
+    display: block;
+    max-width: 100%;
+    max-height: 90vh;
+    border-radius: 8px;
+    box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+    object-fit: contain;
+  }
+  .lightbox-close-wrapper {
+    position: absolute;
+    top: -2rem;
+    right: -2rem;
+  }
+  .lightbox-close {
+    background: var(--bg-card);
+    border: 1px solid var(--rule);
+    color: var(--ink-strong);
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    font-size: 1.5rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    box-shadow: var(--shadow-md);
+    transition: all 0.2s ease;
+  }
+  .lightbox-close:hover {
+    background: var(--brand);
+    border-color: var(--brand);
+    color: #0b0f19;
+    transform: scale(1.1);
+  }
+  @media (max-width: 768px) {
+    .lightbox-close-wrapper { top: 0.5rem; right: 0.5rem; }
+    .lightbox-close { width: 32px; height: 32px; font-size: 1.2rem; }
+  }
+
+  /* ---------- responsive bento ---------- */
   @media (max-width: 880px) {
     .bento {
       grid-template-columns: 1fr 1fr;
@@ -499,11 +664,10 @@ const tier3bTags = ["AES-256-GCM", "Your key"];
         "sm1"
         "sm2";
     }
-    .caps-head { margin-bottom: 2.25rem; }
+    .cp-head { margin-bottom: 2.25rem; }
     .tile--hero { padding: 1.8rem 1.5rem; }
   }
 
-  /* ---------- reduced motion ---------- */
   @media (prefers-reduced-motion: reduce) {
     .tile { animation: none; opacity: 1; transform: none; }
     .hero-glow, .wire::after { animation: none; }

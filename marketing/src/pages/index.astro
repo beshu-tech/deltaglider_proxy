@@ -2,31 +2,27 @@
 // Homepage — rewritten 2026-06. Structure: one problem-first hero, then
 // each section answers exactly one question, in the order a skeptical
 // engineer asks them:
-//   hero        what is it, why do I care
-//   Scale       the claim drawn to scale (ten versions, two buckets)
-//   DropIn      what adoption costs (one config line) + trust facts
-//   Mechanism   "but ZIPs won't diff" — the obvious objection
-//   Capabilities what else do I get
-//   Proof       who runs it in anger
-//   Fit         is it for MY workload (honest no's included)
-//   Engineering can I trust the code and the people
-//   Doors       where do I go next
-//   Quickstart  let me touch it
-// No section repeats another's job — the old page had three overlapping
-// "what it does" blocks; they're consolidated into Capabilities.
+//   hero         what is it, why do I care
+//   Scale        the claim drawn to scale + the ZIP objection (same artifact)
+//   DropIn       what adoption costs (one config line) + trust facts
+//   ControlPlane the other half of the product + real admin-UI screens
+//   Receipts     migration log, engineering discipline, team track record
+//   Fit          is it for MY workload (honest no's) + where to go next
+//   Quickstart   let me touch it
+// No section repeats another's job. Casualties of the rethink: the stats
+// band, the abstract flow diagram, the standalone gallery, the doors grid,
+// and the alternatives comparison table — each either re-told a neighbour's
+// story or duplicated the nav.
 
 import BaseLayout from '../layouts/BaseLayout.astro';
 import JsonLd from '../components/JsonLd.astro';
 import TestimonialsBlock from '../components/TestimonialsBlock.astro';
 import SimoneCallout from '../components/SimoneCallout.astro';
-import MechanismExplanation from '../components/MechanismExplanation.astro';
 import WorkloadFitTable from '../components/WorkloadFitTable.astro';
-import ComparisonTable from '../components/ComparisonTable.astro';
-import ScreenshotGallery from '../components/ScreenshotGallery.astro';
 import HeroSlideshow from '../components/HeroSlideshow.tsx';
 import StorageScale from '../components/StorageScale.astro';
 import DropIn from '../components/DropIn.astro';
-import Capabilities from '../components/Capabilities.astro';
+import ControlPlane from '../components/ControlPlane.astro';
 import {
   organizationSchema,
   webSiteSchema,
@@ -97,71 +93,21 @@ import {
   {/* ============================ DROP-IN ============================= */}
   <DropIn />
 
-  {/* ===================== THE OBVIOUS OBJECTION ====================== */}
-  <section class="section">
-    <div class="shell">
-      <MechanismExplanation />
-    </div>
-  </section>
+  {/* ======================= THE OTHER HALF =========================== */}
+  <ControlPlane />
 
-  {/* ============================ CAPABILITIES ======================== */}
-  <Capabilities />
-
-  {/* ====================== THE WHOLE CONTROL PLANE =================== */}
+  {/* ============================ RECEIPTS ============================= */}
   <section class="section section-alt">
     <div class="shell">
-      <span class="section-eyebrow">In the box</span>
-      <h2>One admin surface for all of it</h2>
-      <p>
-        Buckets, backends, users, jobs, events, audit, trace — managed
-        from the embedded UI or as plain YAML, your pick. Every screen
-        below ships inside the binary.
-      </p>
-      <ScreenshotGallery />
-    </div>
-  </section>
-
-  {/* ========================= RUN IN ANGER =========================== */}
-  <section class="section">
-    <div class="shell">
-      <span class="section-eyebrow">Run in anger</span>
-      <h2>We migrated our own history through it — in public</h2>
+      <span class="section-eyebrow">Receipts</span>
+      <h2>Judge us by what we publish</h2>
 
       <p>
-        145 plugin versions, 8 years of release history, 1.71&nbsp;TB. The
-        migration log names the bugs we hit and what they cost to fix —
-        because a storage product that hides its own incidents is asking
-        you to find them for it.
+        A storage product asks for a lot of trust. Rather than assert
+        it, here's the paper trail:
       </p>
 
       <SimoneCallout />
-      <TestimonialsBlock />
-    </div>
-  </section>
-
-  {/* ============================ HONEST FIT ========================== */}
-  <section class="section section-alt">
-    <div class="shell">
-      <span class="section-eyebrow">Honest positioning</span>
-      <h2>Where it wins — and where it won't</h2>
-
-      <p>
-        Delta compression pays off when versions resemble each other.
-        If your workload doesn't look like that, the proxy still gives
-        you the control plane — but the savings claim doesn't apply,
-        and we'd rather you know now:
-      </p>
-
-      <WorkloadFitTable />
-      <ComparisonTable />
-    </div>
-  </section>
-
-  {/* ============================ ENGINEERING ========================= */}
-  <section class="section">
-    <div class="shell">
-      <span class="section-eyebrow">Engineering</span>
-      <h2>Built like we mean it</h2>
 
       <ul class="proof-list">
         <li>
@@ -184,36 +130,29 @@ import {
           <code>git log</code>.
         </li>
       </ul>
+
+      <TestimonialsBlock />
     </div>
   </section>
 
-  {/* ============================ NEXT DOORS ========================== */}
-  <section class="section section-alt">
+  {/* ============================ HONEST FIT ========================== */}
+  <section class="section">
     <div class="shell">
-      <h2>Where to read next</h2>
-      <div class="door-grid">
-        <a class="door" href="/saas">
-          <h3>For SaaS / platform teams →</h3>
-          <p>Versioned-artifact storage costs eating your AWS bill.</p>
-        </a>
-        <a class="door" href="/regulated">
-          <h3>For regulated buyers →</h3>
-          <p>Encryption-at-rest with local key custody on cheap S3-compatible backends.</p>
-        </a>
-        <a class="door" href="/pricing">
-          <h3>Pricing + savings calculator →</h3>
-          <p>Type your numbers. Get an honest answer in 30 seconds.</p>
-        </a>
-        <a class="door" href="/trial">
-          <h3>30-day production support trial →</h3>
-          <p>Try the relationship. The software's free regardless.</p>
-        </a>
-      </div>
+      <span class="section-eyebrow">Honest positioning</span>
+      <WorkloadFitTable />
+
+      <p class="fit-next">
+        Then put your real numbers into the
+        <a href="/pricing">savings calculator</a> — it answers in 30
+        seconds. There's also a longer pitch
+        <a href="/saas">for platform teams</a> and one
+        <a href="/regulated">for regulated buyers</a>.
+      </p>
     </div>
   </section>
 
   {/* ============================ QUICKSTART ========================== */}
-  <section class="section">
+  <section class="section section-alt">
     <div class="shell">
       <span class="section-eyebrow">Get started</span>
       <h2>Touch it in 60 seconds</h2>
@@ -231,7 +170,8 @@ import {
       </p>
 
       <p style="margin-top: 1.5rem;">
-        <a href="/docs/tutorials/first-delta-savings" class="btn">Full tutorial</a>
+        <a href="/docs/tutorials/first-delta-savings" class="btn btn-brand">Full tutorial</a>
+        <a href="/trial" class="btn" style="margin-left: 0.4rem;">30-day support trial</a>
         <a href="https://github.com/beshu-tech/deltaglider_proxy" class="btn" style="margin-left: 0.4rem;">GitHub</a>
       </p>
     </div>
@@ -264,51 +204,8 @@ import {
     margin: 0;
   }
 
-  .door-grid {
-    display: grid;
-    grid-template-columns: 1fr;
-    gap: 1rem;
-    margin: 2rem 0;
-    max-width: var(--measure-wide);
-  }
-
-  @media (min-width: 720px) {
-    .door-grid {
-      grid-template-columns: 1fr 1fr;
-    }
-  }
-
-  .door {
-    padding: 1.5rem 1.75rem;
-    background: var(--bg-card);
-    border: 1px solid var(--rule);
-    border-radius: 8px;
-    box-shadow: var(--shadow-sm);
-    text-decoration: none;
-    color: var(--ink);
-    transition: transform 0.1s ease, box-shadow 0.15s ease, border-color 0.15s ease;
-  }
-
-  .door:hover {
-    border-color: var(--brand);
-    box-shadow: var(--shadow-md);
-    transform: translateY(-2px);
-    text-decoration: none;
-  }
-
-  .door h3 {
-    margin: 0 0 0.4rem 0;
-    color: var(--ink);
-    font-size: 1.1rem;
-  }
-
-  .door:hover h3 {
-    color: var(--brand-dark);
-  }
-
-  .door p {
-    margin: 0;
+  .fit-next {
+    margin-top: 1.5rem;
     color: var(--ink-soft);
-    font-size: 0.95rem;
   }
 </style>

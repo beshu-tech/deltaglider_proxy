@@ -76,6 +76,22 @@ const rows = Array.from({ length: VERSIONS }, (_, i) => i + 1);
       rebuilds the exact original — behind the same S3 API your tools
       already speak.
     </p>
+
+    <aside class="scale-objection">
+      <p class="objection-q">
+        “Our artifacts are ZIPs and JARs. They're already compressed —
+        diffing them should do nothing.”
+      </p>
+      <p class="objection-a">
+        It would, on random bytes. But versioned archives aren't random:
+        version to version, the same entries land in the same order — same
+        manifest, same icons, same bundled CSS — so the binary diff stays
+        tiny. The 91&nbsp;MB artifact in the chart <em>is</em> a compressed
+        ZIP — a real ReadonlyREST plugin, stored 614× smaller.
+        <a href="/docs/explanation/delta-compression">The engineering
+        note</a> walks through why.
+      </p>
+    </aside>
   </div>
 </section>
 
@@ -224,6 +240,31 @@ const rows = Array.from({ length: VERSIONS }, (_, i) => i + 1);
     margin: 0.75rem 0 0;
     color: var(--ink-soft);
     font-size: 0.95rem;
+  }
+
+  .scale-objection {
+    max-width: var(--measure-wide);
+    margin: 2.25rem 0 0;
+    padding: 1.4rem 1.6rem;
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--brand);
+    border-radius: 10px;
+    background: var(--bg-card);
+  }
+
+  .objection-q {
+    margin: 0 0 0.7rem;
+    font-weight: 700;
+    color: var(--ink-strong);
+    font-style: italic;
+    max-width: none;
+  }
+
+  .objection-a {
+    margin: 0;
+    color: var(--ink-soft);
+    line-height: 1.6;
+    max-width: none;
   }
 
   @keyframes scale-grow {
