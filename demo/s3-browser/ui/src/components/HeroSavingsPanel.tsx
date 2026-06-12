@@ -40,6 +40,7 @@ import {
 import { SettingOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import { formatBytes, clamp } from '../utils';
+import { heroFontPx } from '../heroNumberSize';
 import { useFixedOverlayPosition } from '../useFixedOverlayPosition';
 
 /** Cost rate presets. */
@@ -204,6 +205,30 @@ function HeroInner({
     };
   }, [showCostConfig, popoverEl]);
 
+  // ─── Adaptive numeral sizing ─────────────────────────────────────
+  // Size from the FINAL target string (not the animated value) so the
+  // count-up never reflows the font mid-animation. The column width is
+  // tracked with a ResizeObserver; the pure math lives in
+  // heroNumberSize.ts. Hoisted above the early return (rules of hooks),
+  // like the keptWidth/savedWidth transforms above.
+  const leadString = useRatioLead
+    ? Math.round(targetRatio * 100).toLocaleString()
+    : targetPercent.toFixed(1);
+  const [leftCol, setLeftCol] = useState<HTMLDivElement | null>(null);
+  const [leftColWidth, setLeftColWidth] = useState(0);
+  useEffect(() => {
+    if (!leftCol) return;
+    const ro = new ResizeObserver(entries => {
+      const w = entries[0]?.contentRect.width ?? 0;
+      if (w > 0) {
+        setLeftColWidth(prev => (Math.abs(prev - w) < 0.5 ? prev : w));
+      }
+    });
+    ro.observe(leftCol);
+    return () => ro.disconnect();
+  }, [leftCol]);
+  const heroFontSize = heroFontPx(leadString.length, leftColWidth);
+
   // ─── Empty state ─────────────────────────────────────────────────
   if (!hasData) {
     return (
@@ -255,6 +280,7 @@ function HeroInner({
 
       {/* ── LEFT: the multiplier ─────────────────────────────────── */}
       <div
+        ref={setLeftCol}
         style={{
           display: 'flex',
           flexDirection: 'column',
@@ -262,6 +288,7 @@ function HeroInner({
           gap: 10,
           position: 'relative',
           zIndex: 1,
+          minWidth: 0,
         }}
       >
         <div
@@ -288,7 +315,9 @@ function HeroInner({
             display: 'flex',
             alignItems: 'baseline',
             fontWeight: 800,
-            fontSize: 'clamp(72px, 9.5vw, 138px)',
+            // Adaptive: sized for the FINAL string so "1%" renders huge
+            // and "100,000%" still fits the column (heroNumberSize.ts).
+            fontSize: heroFontSize,
             lineHeight: 0.95,
             letterSpacing: '-0.045em',
             fontVariantNumeric: 'tabular-nums',

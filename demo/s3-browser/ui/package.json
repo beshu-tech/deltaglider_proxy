@@ -46,6 +46,7 @@
     "test:jobs-view": "node scripts/jobs-view-regression-test.mjs",
     "test:admin-path-remap": "node scripts/admin-path-remap-regression-test.mjs",
     "test:destination-suggest": "node scripts/destination-suggest-regression-test.mjs",
+    "test:hero-number-size": "node scripts/hero-number-size-regression-test.mjs",
     "e2e": "playwright test",
     "typecheck": "tsc --noEmit",
     "knip": "knip"

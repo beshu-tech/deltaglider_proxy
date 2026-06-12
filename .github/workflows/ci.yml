@@ -662,6 +662,7 @@ jobs:
           npm run test:jobs-view
           npm run test:admin-path-remap
           npm run test:destination-suggest
+          npm run test:hero-number-size
       - name: npm audit
         run: cd demo/s3-browser/ui && npm audit --audit-level=high || true  # warn-only
 
