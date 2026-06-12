@@ -9,8 +9,9 @@ interface Props {
 /**
  * Docs landing — operator-journey layout.
  *
- * Five cards, ordered by the expected operator journey: Start here →
- * Deploy → Authentication → Day 2 → Reference. The old 6-feature
+ * One card per manifest group, in the Diátaxis reading order: Start
+ * here (tutorials) → the three Guides groups (how-to) → Reference →
+ * Concepts (explanation). The old 6-feature
  * emoji grid is gone — feature marketing belongs on a product page,
  * not every docs load. The one-paragraph hero + two screenshots
  * carry orientation; everything below is task-oriented navigation.
@@ -36,7 +37,7 @@ export default function DocsLanding({ onSelectDoc }: Props) {
   for (const [, docs] of grouped) docs.sort((a, b) => a.order - b.order);
 
   // Find the FAQ doc for the pitch-CTA link.
-  const faqDoc = DOCS.find((d) => d.id === '42-faq');
+  const faqDoc = DOCS.find((d) => d.id === 'faq');
 
   return (
     <div style={{ maxWidth: 1000, margin: '0 auto' }}>

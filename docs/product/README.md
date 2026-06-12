@@ -2,79 +2,79 @@
 
 *An S3-compatible control plane in front of existing storage, not another object store or storage cluster. DeltaGlider routes buckets across backends and local filesystems, gives operators a proper, centralized admin UI for IAM, OAuth, lifecycle, replication, events, audits, caching, encryption, and policy, and stores repeated binaries as compact xdelta3 deltas when that saves space.*
 
-![Object Browser](/_/screenshots/filebrowser.jpg)
-
 ## Why this exists
 
-When binary-similar objects are stored over many versions — backup archives, software catalogs, game builds, texture packs, AI model variants, DB dumps, tar archives — most of each new object may be identical to the previous one. DeltaGlider Proxy stores those versions as xdelta3 deltas against a reference baseline, typically cutting storage 60–95% on high-similarity workloads without changing anything on the client side.
+Versioned binary artifacts — firmware builds, backup archives, AI model variants, game builds, DB dumps — pay full price for every copy, even when each new version is 99% identical to the last. DeltaGlider Proxy stores those copies as xdelta3 deltas against a reference baseline, typically cutting storage 60–95% on high-similarity workloads. Clients see a standard S3 API and never know; you run the binary, point an S3 client at it, and carry on.
 
-Clients see a standard S3 API. Delta compression, reconstruction, integrity verification, zero trust encryption at rest, fast local-disk caching, lifecycle, replication, event delivery, audits, and backend routing are invisible to them.
+![Object Browser](/_/screenshots/filebrowser.jpg)
 
-## What's here
+## Pick your path
 
-These docs are operator-facing — everything you need to install, secure, run, and debug the proxy. Developer-facing docs (build from source, release process, CI infrastructure) live on the [GitHub repo](https://github.com/beshu-tech/deltaglider_proxy) rather than in the binary.
+### Learn it
 
-### Start here
+Three hands-on tutorials, each a complete session from nothing to a working result:
 
-- [Quickstart](01-quickstart.md) — install, first run, first upload.
-- [Setting up a bucket](10-first-bucket.md) — backend routing, aliases, public prefixes, per-bucket compression, soft quotas.
+- [Your first delta savings](tutorials/first-delta-savings.md) — run the proxy in Docker, upload two firmware versions, watch the second one shrink to almost nothing.
+- [Securing your first proxy](tutorials/secure-your-proxy.md) — go from open access to a locked-down proxy with real credentials and a least-privilege IAM user.
+- [Your first Helm deployment on kind](tutorials/kubernetes-hello-world.md) — install the official Helm chart on a disposable local cluster and prove it round-trips a file.
 
-### Deploy to production
+### Get something done
 
-- [Production deployment](20-production-deployment.md) — TLS, reverse proxy, cache sizing, backups, multi-instance sync.
-- [Security checklist](20-production-security-checklist.md) — SigV4, bootstrap password, IAM users, rate limiting.
-- [Upgrade guide](21-upgrade-guide.md) — standard upgrade workflow and the TOML → YAML migration.
-- [Kubernetes / Helm deployment](22-kubernetes-helm.md) — chart values, Secrets, PVC layout, Ingress, probes, and local OrbStack validation.
+Task-shaped guides, grouped by what you're touching:
 
-### Authentication & access
+- **Deploy and operate** — [go to production](how-to/go-to-production.md), [deploy with Docker Compose](how-to/deploy-with-docker-compose.md), [deploy on Kubernetes](how-to/deploy-on-kubernetes.md), [troubleshooting](how-to/troubleshooting.md). Also: TLS, upgrades, backups, HA, Prometheus, request tracing.
+- **Storage** — [route a bucket to a backend](how-to/route-a-bucket-to-a-backend.md), [migrate existing data into the proxy](how-to/migrate-existing-data-into-the-proxy.md), [encrypt data at rest](how-to/encrypt-data-at-rest.md), [replicate a bucket](how-to/replicate-a-bucket.md). Also: quotas and compression policy, bucket migration, lifecycle, key rotation, event notifications.
+- **Access** — [create IAM users](how-to/create-iam-users.md), [set up SSO](how-to/set-up-sso.md), [restrict access with conditions](how-to/restrict-access-with-conditions.md), [publish a public folder](how-to/publish-a-public-folder.md). Also: IAM as code, admission rules.
 
-- [OAuth / OIDC setup](auth/30-oauth-setup.md) — Google, Okta, Azure AD, generic OIDC. Single sign-on + group mapping.
-- [SigV4 and IAM users](auth/31-sigv4-and-iam.md) — per-user credentials with ABAC permissions.
-- [IAM conditions](auth/32-iam-conditions.md) — source-IP restrictions, prefix scoping, group policies.
-- [Rate limiting](auth/33-rate-limiting.md) — per-IP throttling, progressive delay, lockout model.
+### Look something up
 
-### Day 2 operations
+Every page under Reference is pure facts — fields, endpoints, defaults, limits. Start with:
 
-- [Monitoring and alerts](40-monitoring-and-alerts.md) — Prometheus scrape, Grafana panels, alerting rules.
-- [Troubleshooting](41-troubleshooting.md) — common symptoms → fixes.
-- [FAQ](42-faq.md) — quick answers to common questions.
-- [Bucket replication](reference/replication.md) — event-driven and run-now source → destination object replication through the engine, with a periodic full-reconcile safety net and crash-resume.
-- [Lifecycle rules](reference/lifecycle.md) — object expiration and transition/archive with preview, pause/resume, scheduler history, and failure diagnostics.
-- [Jobs](reference/jobs.md) — the one screen and one API for everything background: replication, lifecycle, bucket re-encryption, and bucket migration, with progress, runs, failures, and a write gate for maintenance jobs.
-- [Event outbox & notifications](reference/event-outbox.md) — durable object mutation journal plus webhook delivery, fan-out, retries, requeue, and Slack notifications.
+- [Configuration](reference/configuration.md) — every YAML field and env var.
+- [CLI](reference/cli.md) — every flag and subcommand of the binary.
+- [Admin API](reference/admin-api.md) — every `/_/api/admin/*` endpoint.
+- [Metrics](reference/metrics.md) — every Prometheus metric and label.
 
-### Reference
+Plus references for [authentication](reference/authentication.md), [IAM permissions](reference/iam-permissions.md), [encryption](reference/encryption.md), [jobs](reference/jobs.md), [replication](reference/replication.md), [lifecycle](reference/lifecycle.md), [the event outbox](reference/event-outbox.md), [declarative IAM](reference/declarative-iam.md), and [rate limits](reference/rate-limits.md).
 
-- [Configuration reference](reference/configuration.md) — every YAML field and env var.
-- [Admin API reference](reference/admin-api.md) — every `/_/api/admin/*` endpoint.
-- [Authentication reference](reference/authentication.md) — conceptual model, error codes, claim shapes.
-- [Metrics reference](reference/metrics.md) — every Prometheus metric and label.
-- [Replication reference](reference/replication.md) — rule shape, event-driven trigger, run-now controls, delete replication, runtime state.
-- [Lifecycle rules](reference/lifecycle.md) — expiration/transition config, preview/run-now/pause API, scheduler state.
-- [Event outbox & notifications](reference/event-outbox.md) — delivery config, payload shape, Slack formatting/routing, admin diagnostics.
-- [How delta works](reference/how-delta-works.md) — on-disk layout, PUT/GET flow, integrity guarantees.
-- [Encryption at rest](reference/encryption-at-rest.md) — AES-256-GCM for stored objects, chunked streaming wire format, operational caveats.
+### Understand it
+
+The why behind the design, one concept per page:
+
+- [How delta compression works](explanation/delta-compression.md) — what deltas well, what honestly doesn't, and why GETs are byte-identical.
+- [Multi-backend routing](explanation/multi-backend-architecture.md) — one endpoint over many backends, aliasing, and trusting cheap storage.
+- [Authentication and access control](explanation/security-model.md) — the four layers every request passes through, in order.
+- [Encryption at rest](explanation/encryption-at-rest.md) — the threat model, the modes, and the honest costs.
+- [Jobs, write gates, and durability](explanation/jobs-and-durability.md) — why background work is one surface, and what "durable" means here.
+
+## Install
+
+Pick one. All three give you the same binary.
+
+```bash
+# Docker (recommended) — then follow the first tutorial
+docker run --rm -it -p 9000:9000 -v dgp-data:/data beshultd/deltaglider_proxy
+```
+
+**Binary release** — grab the latest for macOS or Linux from the [releases page](https://github.com/beshu-tech/deltaglider_proxy/releases), unpack, run `./deltaglider_proxy`.
+
+**From source** — the UI is baked into the binary, so build it first (needs Node 20+): `cd demo/s3-browser/ui && npm ci && npm run build && cd -`, then `cargo build --release`.
 
 ## Operator summary
 
 **Shape**
 
-- Single-process Rust binary.
-- S3 API on `/`; admin UI and admin APIs on `/_/`.
-- Same-port deployment with embedded UI (`rust-embed`) and embedded product docs.
-- Backend can be filesystem, AWS S3, or any S3-compatible provider: Hetzner, Backblaze, Wasabi, R2, MinIO, or lower-cost S3 SaaS.
+- Single-process Rust binary, single port.
+- S3 API on `/`; admin UI, admin APIs, and these docs embedded on `/_/`.
+- Backend can be filesystem, AWS S3, or any S3-compatible provider: Hetzner, Backblaze, Wasabi, R2, MinIO.
 
 **Storage path**
 
-- Transparent xdelta3 compression for repeated binaries.
-- Byte-identical reconstruction on read.
-- SHA-256 verification for reconstructed objects.
+- Transparent xdelta3 compression for repeated binaries; byte-identical, SHA-256-verified reconstruction on read.
 - Optional proxy-side AES-256-GCM encryption keeps keys in your environment before bytes land in cheap or untrusted storage.
 
 **Control plane**
 
-- SigV4 for S3 clients: `aws-cli`, `boto3`, Terraform, rclone.
-- OAuth/OIDC for admin UI access.
-- Per-user ABAC permissions with IP and prefix conditions.
-- Soft bucket quotas, bucket freeze, object lifecycle expiration and archiving, event-driven object replication with delete replication, and one-off bucket re-encryption and migration jobs.
-- Prometheus metrics, in-memory audit ring, durable event outbox (webhook fan-out + Slack notifications), encrypted IAM DB, and optional multi-instance config sync.
+- SigV4 for S3 clients: `aws-cli`, `boto3`, Terraform, rclone. OAuth/OIDC for the admin UI.
+- Per-user ABAC permissions with IP and prefix conditions; soft quotas; admission rules.
+- Replication, lifecycle, re-encryption, and migration jobs on one screen; Prometheus metrics, audit ring, durable event outbox, encrypted IAM DB, optional multi-instance config sync.

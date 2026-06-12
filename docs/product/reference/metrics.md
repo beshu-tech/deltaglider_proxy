@@ -6,7 +6,7 @@
 
 `GET /_/metrics` returns Prometheus text format on the same port as the S3 API. Metrics are collected via lock-free atomics on the hot path — no mutexes, no sampling, no performance impact.
 
-For scrape configuration, Grafana panels, and alerting rules, see [Monitoring and alerts](../40-monitoring-and-alerts.md).
+For scrape configuration, Grafana panels, and alerting rules, see [How to monitor with Prometheus and Grafana](../how-to/monitor-with-prometheus.md).
 
 ## Quick sanity check
 

@@ -18,7 +18,7 @@ import TUT_DELTA from '../../../../docs/product/tutorials/first-delta-savings.md
 import TUT_SECURE from '../../../../docs/product/tutorials/secure-your-proxy.md?raw';
 import TUT_K8S from '../../../../docs/product/tutorials/kubernetes-hello-world.md?raw';
 import REF_RATE_LIMITS from '../../../../docs/product/reference/rate-limits.md?raw';
-import FAQ from '../../../../docs/product/42-faq.md?raw';
+import FAQ from '../../../../docs/product/faq.md?raw';
 import HT_GO_TO_PRODUCTION from '../../../../docs/product/how-to/go-to-production.md?raw';
 import HT_DEPLOY_WITH_DOCKER_COMPOSE from '../../../../docs/product/how-to/deploy-with-docker-compose.md?raw';
 import HT_DEPLOY_ON_KUBERNETES from '../../../../docs/product/how-to/deploy-on-kubernetes.md?raw';
@@ -80,7 +80,7 @@ const CONTENT_BY_PATH: Record<string, string> = {
   'tutorials/secure-your-proxy': TUT_SECURE,
   'tutorials/kubernetes-hello-world': TUT_K8S,
   'reference/rate-limits': REF_RATE_LIMITS,
-  '42-faq': FAQ,
+  'faq': FAQ,
   'how-to/go-to-production': HT_GO_TO_PRODUCTION,
   'how-to/deploy-with-docker-compose': HT_DEPLOY_WITH_DOCKER_COMPOSE,
   'how-to/deploy-on-kubernetes': HT_DEPLOY_ON_KUBERNETES,
@@ -205,8 +205,8 @@ export const DOCS: DocEntry[] = PRODUCT_DOCS.map((d) => ({
  * Resolve a markdown link to a DocEntry.
  *
  * Inter-doc links in the product bundle take three shapes:
- *   - `01-quickstart.md` (top-level)
- *   - `../20-production-deployment.md` (from a subfolder back to top)
+ *   - `faq.md` (top-level)
+ *   - `../faq.md` (from a subfolder back to top)
  *   - `reference/configuration.md` (from top-level into a subfolder)
  *   - `../reference/metrics.md` (from subfolder to subfolder)
  *

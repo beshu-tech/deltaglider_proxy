@@ -11,13 +11,14 @@ This tree splits into two audiences, enforced by CI so it can't drift:
 
 ## Product docs index
 
-See [product/README.md](product/README.md) — that file is also the landing page inside the running binary. Grouped by operator journey:
+See [product/README.md](product/README.md) — that file is also the landing page inside the running binary. The structure follows [Diátaxis](https://diataxis.fr): every page is exactly one of tutorial / how-to / reference / explanation:
 
-1. **Start here** — quickstart, setting up a bucket
-2. **Deploy to production** — deployment, security checklist, upgrade guide
-3. **Authentication & access** — OAuth, SigV4, IAM, rate limiting
-4. **Day 2 operations** — monitoring, troubleshooting, FAQ, replication, lifecycle, event outbox
-5. **Reference** — config fields, admin API, metrics, jobs, lifecycle, replication, event delivery, internals
+1. **Start here** — the three tutorials (first delta savings, securing the proxy, Helm on kind) + the FAQ index
+2. **Guides: deploy & operate** — how-to recipes: production checklist, Compose/Helm, TLS, upgrades, backups, HA, monitoring, tracing, troubleshooting
+3. **Guides: storage & data** — routing, migration (into the proxy and between backends), compression & quotas, replication, lifecycle, encryption, events
+4. **Guides: access & security** — IAM users, conditions, SSO, IAM-as-code, admission rules, public folders
+5. **Reference** — pure facts: configuration, CLI, admin API, authentication, IAM permissions, rate limits, encryption, jobs, replication, lifecycle, event outbox, declarative IAM, metrics
+6. **Concepts** — explanations: delta compression, multi-backend routing, the security model, encryption at rest, jobs & durability
 
 ## Dev docs
 

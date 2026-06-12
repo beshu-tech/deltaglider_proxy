@@ -40,7 +40,7 @@ Maintenance jobs live in the encrypted config DB (`maintenance_jobs` + failures 
 
 - [Replication](replication.md) — rule shape, triggers, conflict policies.
 - [Lifecycle rules](lifecycle.md) — expiration/transition rule shape, guardrails.
-- [Encryption at rest](encryption-at-rest.md) — what re-encryption rewrites.
+- [About encryption at rest](../explanation/encryption-at-rest.md) — what re-encryption rewrites.
 - [Admin API](admin-api.md#jobs--one-surface-for-everything-background) — the full endpoint table.
 - [About jobs, write gates, and durability](../explanation/jobs-and-durability.md)
 - [How to move a bucket to another backend](../how-to/move-a-bucket-between-backends.md)

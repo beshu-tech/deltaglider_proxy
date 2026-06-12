@@ -1,25 +1,29 @@
 {
-  "_comment": "Single source of truth for product-docs grouping + ordering. Consumed by BOTH the in-product docs viewer (demo/s3-browser/ui/src/docs-imports.ts) and the marketing website docs renderer (marketing/src/pages/docs). Add a doc: drop the .md under docs/product/, then add a `docs` entry here (path is relative to docs/product/, without the .md extension). `group` must be one of `groups[].id`. `order` sorts within a group (lower = earlier). CI (scripts/check-docs-registry.sh) keeps this in lockstep with the .md files on disk.",
+  "_comment": "Single source of truth for product-docs grouping + ordering. Consumed by BOTH the in-product docs viewer (demo/s3-browser/ui/src/docs-imports.ts) and the marketing website docs renderer (marketing/src/pages/docs). Add a doc: drop the .md under docs/product/, then add a `docs` entry here (path is relative to docs/product/, without the .md extension). `group` must be one of `groups[].id`. `order` sorts within a group (lower = earlier). CI (scripts/check-docs-registry.sh) keeps this in lockstep with the .md files on disk. The groups mirror the Diátaxis quadrants: Start here = tutorials, the three Guides groups = how-to, Reference = facts, Concepts = explanation.",
   "groups": [
     {
       "id": "Start here",
-      "tagline": "Install, first bucket, first upload."
+      "tagline": "What this is, plus guided lessons from zero to a working proxy."
     },
     {
-      "id": "Deploy to production",
-      "tagline": "Hardening, TLS, backups, upgrades."
+      "id": "Guides: deploy & operate",
+      "tagline": "Recipes for installing, upgrading, watching, and debugging a running proxy."
     },
     {
-      "id": "Authentication & access",
-      "tagline": "OAuth, SigV4, IAM, rate limiting."
+      "id": "Guides: storage & data",
+      "tagline": "Routing, migration, compression, replication, lifecycle, encryption."
     },
     {
-      "id": "Day 2 operations",
-      "tagline": "Monitoring, troubleshooting, FAQ."
+      "id": "Guides: access & security",
+      "tagline": "IAM, SSO, admission rules, public folders."
     },
     {
       "id": "Reference",
-      "tagline": "Config fields, admin API, metrics, internals."
+      "tagline": "Facts: every field, endpoint, metric, and limit. No opinions."
+    },
+    {
+      "id": "Concepts",
+      "tagline": "How it works and why — readable away from the keyboard."
     }
   ],
   "docs": [
@@ -44,14 +48,134 @@
       "order": 30
     },
     {
-      "path": "reference/rate-limits",
-      "group": "Authentication & access",
-      "order": 100
+      "path": "faq",
+      "group": "Start here",
+      "order": 90
     },
     {
-      "path": "42-faq",
-      "group": "Day 2 operations",
+      "path": "how-to/go-to-production",
+      "group": "Guides: deploy & operate",
+      "order": 0
+    },
+    {
+      "path": "how-to/deploy-with-docker-compose",
+      "group": "Guides: deploy & operate",
+      "order": 10
+    },
+    {
+      "path": "how-to/deploy-on-kubernetes",
+      "group": "Guides: deploy & operate",
+      "order": 20
+    },
+    {
+      "path": "how-to/serve-tls",
+      "group": "Guides: deploy & operate",
+      "order": 30
+    },
+    {
+      "path": "how-to/upgrade",
+      "group": "Guides: deploy & operate",
+      "order": 40
+    },
+    {
+      "path": "how-to/back-up-and-restore",
+      "group": "Guides: deploy & operate",
+      "order": 50
+    },
+    {
+      "path": "how-to/run-multiple-instances",
+      "group": "Guides: deploy & operate",
+      "order": 60
+    },
+    {
+      "path": "how-to/monitor-with-prometheus",
+      "group": "Guides: deploy & operate",
+      "order": 70
+    },
+    {
+      "path": "how-to/trace-requests",
+      "group": "Guides: deploy & operate",
+      "order": 80
+    },
+    {
+      "path": "how-to/troubleshooting",
+      "group": "Guides: deploy & operate",
       "order": 90
+    },
+    {
+      "path": "how-to/route-a-bucket-to-a-backend",
+      "group": "Guides: storage & data",
+      "order": 0
+    },
+    {
+      "path": "how-to/migrate-existing-data-into-the-proxy",
+      "group": "Guides: storage & data",
+      "order": 10
+    },
+    {
+      "path": "how-to/move-a-bucket-between-backends",
+      "group": "Guides: storage & data",
+      "order": 20
+    },
+    {
+      "path": "how-to/set-bucket-compression-and-quotas",
+      "group": "Guides: storage & data",
+      "order": 30
+    },
+    {
+      "path": "how-to/replicate-a-bucket",
+      "group": "Guides: storage & data",
+      "order": 40
+    },
+    {
+      "path": "how-to/expire-and-archive-objects",
+      "group": "Guides: storage & data",
+      "order": 50
+    },
+    {
+      "path": "how-to/encrypt-data-at-rest",
+      "group": "Guides: storage & data",
+      "order": 60
+    },
+    {
+      "path": "how-to/rotate-encryption-keys",
+      "group": "Guides: storage & data",
+      "order": 70
+    },
+    {
+      "path": "how-to/send-event-notifications",
+      "group": "Guides: storage & data",
+      "order": 80
+    },
+    {
+      "path": "how-to/create-iam-users",
+      "group": "Guides: access & security",
+      "order": 0
+    },
+    {
+      "path": "how-to/restrict-access-with-conditions",
+      "group": "Guides: access & security",
+      "order": 10
+    },
+    {
+      "path": "how-to/set-up-sso",
+      "group": "Guides: access & security",
+      "order": 20
+    },
+    {
+      "path": "how-to/manage-iam-as-code",
+      "group": "Guides: access & security",
+      "order": 30
+    },
+    {
+      "path": "how-to/gate-requests-with-admission-rules",
+      "group": "Guides: access & security",
+      "order": 40
+    },
+    {
+      "path": "how-to/publish-a-public-folder",
+      "group": "Guides: access & security",
+      "order": 50
     },
     {
       "path": "reference/configuration",
@@ -61,207 +185,87 @@
     {
       "path": "reference/cli",
       "group": "Reference",
-      "order": 5
+      "order": 10
     },
     {
       "path": "reference/admin-api",
       "group": "Reference",
-      "order": 10
+      "order": 20
     },
     {
       "path": "reference/authentication",
       "group": "Reference",
-      "order": 20
+      "order": 30
     },
     {
       "path": "reference/iam-permissions",
       "group": "Reference",
-      "order": 25
+      "order": 40
     },
     {
-      "path": "reference/metrics",
-      "group": "Reference",
-      "order": 30
-    },
-    {
-      "path": "explanation/delta-compression",
-      "group": "Reference",
-      "order": 200
-    },
-    {
-      "path": "explanation/multi-backend-architecture",
-      "group": "Reference",
-      "order": 210
-    },
-    {
-      "path": "explanation/security-model",
-      "group": "Reference",
-      "order": 220
-    },
-    {
-      "path": "explanation/encryption-at-rest",
-      "group": "Reference",
-      "order": 230
-    },
-    {
-      "path": "explanation/jobs-and-durability",
-      "group": "Reference",
-      "order": 240
-    },
-    {
-      "path": "reference/encryption",
+      "path": "reference/rate-limits",
       "group": "Reference",
       "order": 50
     },
     {
-      "path": "reference/declarative-iam",
+      "path": "reference/encryption",
       "group": "Reference",
       "order": 60
     },
     {
       "path": "reference/jobs",
       "group": "Reference",
-      "order": 65
+      "order": 70
     },
     {
       "path": "reference/replication",
       "group": "Reference",
-      "order": 70
+      "order": 80
     },
     {
       "path": "reference/lifecycle",
       "group": "Reference",
-      "order": 80
+      "order": 90
     },
     {
       "path": "reference/event-outbox",
       "group": "Reference",
-      "order": 90
-    },
-    {
-      "path": "how-to/go-to-production",
-      "group": "Deploy to production",
-      "order": 0
-    },
-    {
-      "path": "how-to/deploy-with-docker-compose",
-      "group": "Deploy to production",
-      "order": 10
-    },
-    {
-      "path": "how-to/deploy-on-kubernetes",
-      "group": "Deploy to production",
-      "order": 20
-    },
-    {
-      "path": "how-to/serve-tls",
-      "group": "Deploy to production",
-      "order": 30
-    },
-    {
-      "path": "how-to/upgrade",
-      "group": "Deploy to production",
-      "order": 40
-    },
-    {
-      "path": "how-to/back-up-and-restore",
-      "group": "Deploy to production",
-      "order": 50
-    },
-    {
-      "path": "how-to/run-multiple-instances",
-      "group": "Deploy to production",
-      "order": 60
-    },
-    {
-      "path": "how-to/monitor-with-prometheus",
-      "group": "Day 2 operations",
-      "order": 0
-    },
-    {
-      "path": "how-to/trace-requests",
-      "group": "Day 2 operations",
-      "order": 10
-    },
-    {
-      "path": "how-to/troubleshooting",
-      "group": "Day 2 operations",
-      "order": 20
-    },
-    {
-      "path": "how-to/route-a-bucket-to-a-backend",
-      "group": "Day 2 operations",
       "order": 100
     },
     {
-      "path": "how-to/migrate-existing-data-into-the-proxy",
-      "group": "Day 2 operations",
+      "path": "reference/declarative-iam",
+      "group": "Reference",
       "order": 110
     },
     {
-      "path": "how-to/move-a-bucket-between-backends",
-      "group": "Day 2 operations",
+      "path": "reference/metrics",
+      "group": "Reference",
       "order": 120
     },
     {
-      "path": "how-to/set-bucket-compression-and-quotas",
-      "group": "Day 2 operations",
-      "order": 130
-    },
-    {
-      "path": "how-to/replicate-a-bucket",
-      "group": "Day 2 operations",
-      "order": 140
-    },
-    {
-      "path": "how-to/expire-and-archive-objects",
-      "group": "Day 2 operations",
-      "order": 150
-    },
-    {
-      "path": "how-to/encrypt-data-at-rest",
-      "group": "Day 2 operations",
-      "order": 160
-    },
-    {
-      "path": "how-to/rotate-encryption-keys",
-      "group": "Day 2 operations",
-      "order": 170
-    },
-    {
-      "path": "how-to/send-event-notifications",
-      "group": "Day 2 operations",
-      "order": 180
-    },
-    {
-      "path": "how-to/create-iam-users",
-      "group": "Authentication & access",
+      "path": "explanation/delta-compression",
+      "group": "Concepts",
       "order": 0
     },
     {
-      "path": "how-to/restrict-access-with-conditions",
-      "group": "Authentication & access",
+      "path": "explanation/multi-backend-architecture",
+      "group": "Concepts",
       "order": 10
     },
     {
-      "path": "how-to/set-up-sso",
-      "group": "Authentication & access",
+      "path": "explanation/security-model",
+      "group": "Concepts",
       "order": 20
     },
     {
-      "path": "how-to/manage-iam-as-code",
-      "group": "Authentication & access",
+      "path": "explanation/encryption-at-rest",
+      "group": "Concepts",
       "order": 30
     },
     {
-      "path": "how-to/gate-requests-with-admission-rules",
-      "group": "Authentication & access",
+      "path": "explanation/jobs-and-durability",
+      "group": "Concepts",
       "order": 40
-    },
-    {
-      "path": "how-to/publish-a-public-folder",
-      "group": "Authentication & access",
-      "order": 50
     }
   ]
 }

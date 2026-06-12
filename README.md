@@ -191,7 +191,7 @@ deltaglider_proxy config lint deltaglider_proxy.yaml
 deltaglider_proxy config migrate deltaglider_proxy.toml --out deltaglider_proxy.yaml
 ```
 
-Silence the warning mid-migration with `DGP_SILENCE_TOML_DEPRECATION=1`. See the [upgrade guide](docs/product/21-upgrade-guide.md).
+Silence the warning mid-migration with `DGP_SILENCE_TOML_DEPRECATION=1`. See [How to upgrade the proxy](docs/product/how-to/upgrade.md).
 
 **Examples**: [deltaglider_proxy.example.yaml](deltaglider_proxy.example.yaml) (canonical). The legacy [deltaglider_proxy.toml.example](deltaglider_proxy.toml.example) is kept for reference only.
 
@@ -263,35 +263,28 @@ helm upgrade --install dgp ./charts/deltaglider-proxy \
   --set auth.existingSecret=deltaglider-secrets
 ```
 
-The chart mounts config at `/data/deltaglider_proxy.yaml` so the encrypted IAM DB is created at `/data/deltaglider_config.db` on the PVC. Full guide: [Kubernetes / Helm deployment](docs/product/22-kubernetes-helm.md).
+The chart mounts config at `/data/deltaglider_proxy.yaml` so the encrypted IAM DB is created at `/data/deltaglider_config.db` on the PVC. Full guide: [How to deploy on Kubernetes with Helm](docs/product/how-to/deploy-on-kubernetes.md).
 
 ## Documentation
 
 Operator-facing docs are also bundled into the running binary at `/_/docs/`. Source files:
 
-**Getting started:**
-- [Quickstart](docs/product/01-quickstart.md) — install, first run, first upload.
-- [Setting up a bucket](docs/product/10-first-bucket.md) — backend routing, aliases, public prefixes.
+The docs follow [Diátaxis](https://diataxis.fr) — every page is exactly one of tutorial / how-to / reference / explanation.
 
-**Production:**
-- [Production deployment](docs/product/20-production-deployment.md) — TLS, cache sizing, backups, multi-instance sync.
-- [Security checklist](docs/product/20-production-security-checklist.md) — SigV4, IAM, rate limiting.
-- [Upgrade guide](docs/product/21-upgrade-guide.md) — upgrade workflow and TOML → YAML migration.
-- [Kubernetes / Helm deployment](docs/product/22-kubernetes-helm.md) — kind hello world, chart values, Secrets, PVC layout, Ingress, and probes.
+**Tutorials** (guided lessons):
+- [Your first delta savings](docs/product/tutorials/first-delta-savings.md) — Docker to visible savings in 15 minutes.
+- [Securing your first proxy](docs/product/tutorials/secure-your-proxy.md) — own password, SigV4, a least-privilege CI user.
+- [Your first Helm deployment on kind](docs/product/tutorials/kubernetes-hello-world.md)
 
-**Authentication:**
-- [OAuth / OIDC setup](docs/product/auth/30-oauth-setup.md)
-- [SigV4 and IAM users](docs/product/auth/31-sigv4-and-iam.md)
-- [IAM conditions](docs/product/auth/32-iam-conditions.md)
-- [Rate limiting](docs/product/auth/33-rate-limiting.md)
+**How-to guides** (goal-named recipes): [take a proxy to production](docs/product/how-to/go-to-production.md) · [Docker Compose](docs/product/how-to/deploy-with-docker-compose.md) · [Kubernetes](docs/product/how-to/deploy-on-kubernetes.md) · [TLS](docs/product/how-to/serve-tls.md) · [upgrade](docs/product/how-to/upgrade.md) · [back up & restore](docs/product/how-to/back-up-and-restore.md) · [HA](docs/product/how-to/run-multiple-instances.md) · [monitor](docs/product/how-to/monitor-with-prometheus.md) · [trace & audit](docs/product/how-to/trace-requests.md) · [troubleshooting](docs/product/how-to/troubleshooting.md) · [route a bucket](docs/product/how-to/route-a-bucket-to-a-backend.md) · [migrate data in](docs/product/how-to/migrate-existing-data-into-the-proxy.md) · [move a bucket](docs/product/how-to/move-a-bucket-between-backends.md) · [compression & quotas](docs/product/how-to/set-bucket-compression-and-quotas.md) · [replicate](docs/product/how-to/replicate-a-bucket.md) · [expire & archive](docs/product/how-to/expire-and-archive-objects.md) · [encrypt](docs/product/how-to/encrypt-data-at-rest.md) · [rotate keys](docs/product/how-to/rotate-encryption-keys.md) · [events](docs/product/how-to/send-event-notifications.md) · [IAM users](docs/product/how-to/create-iam-users.md) · [conditions](docs/product/how-to/restrict-access-with-conditions.md) · [SSO](docs/product/how-to/set-up-sso.md) · [IAM as code](docs/product/how-to/manage-iam-as-code.md) · [admission rules](docs/product/how-to/gate-requests-with-admission-rules.md) · [public folders](docs/product/how-to/publish-a-public-folder.md)
 
-**Day 2:**
-- [Monitoring and alerts](docs/product/40-monitoring-and-alerts.md)
-- [Troubleshooting](docs/product/41-troubleshooting.md)
-- [FAQ](docs/product/42-faq.md)
+**Reference** (pure facts):
+- [Configuration](docs/product/reference/configuration.md) · [CLI](docs/product/reference/cli.md) · [Admin API](docs/product/reference/admin-api.md) · [Authentication](docs/product/reference/authentication.md) · [IAM permissions](docs/product/reference/iam-permissions.md) · [Rate limits](docs/product/reference/rate-limits.md) · [Encryption](docs/product/reference/encryption.md) · [Jobs](docs/product/reference/jobs.md) · [Replication](docs/product/reference/replication.md) · [Lifecycle](docs/product/reference/lifecycle.md) · [Event outbox](docs/product/reference/event-outbox.md) · [Declarative IAM](docs/product/reference/declarative-iam.md) · [Metrics](docs/product/reference/metrics.md)
 
-**Reference:**
-- [Configuration](docs/product/reference/configuration.md) · [Admin API](docs/product/reference/admin-api.md) · [Authentication](docs/product/reference/authentication.md) · [Metrics](docs/product/reference/metrics.md) · [How delta works](docs/product/reference/how-delta-works.md) · [Replication](docs/product/reference/replication.md) · [Lifecycle](docs/product/reference/lifecycle.md) · [Event outbox](docs/product/reference/event-outbox.md)
+**Concepts** (how it works and why):
+- [Delta compression](docs/product/explanation/delta-compression.md) · [Multi-backend routing](docs/product/explanation/multi-backend-architecture.md) · [The security model](docs/product/explanation/security-model.md) · [Encryption at rest](docs/product/explanation/encryption-at-rest.md) · [Jobs & durability](docs/product/explanation/jobs-and-durability.md)
+
+Plus the [FAQ index](docs/product/faq.md).
 
 **Contributor-only** (not in the binary):
 - [Contributing](docs/dev/contributing.md) · [Releasing](docs/dev/releasing.md) · [CI infrastructure](docs/dev/ci-infra.md) · [Historical design docs](docs/dev/historical/)

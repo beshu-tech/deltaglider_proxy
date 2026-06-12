@@ -8,7 +8,7 @@ As of v0.8.0, YAML is the canonical format. TOML still loads (emits a deprecatio
 deltaglider_proxy config migrate deltaglider_proxy.toml --out deltaglider_proxy.yaml
 ```
 
-See the [upgrade guide](../21-upgrade-guide.md) for the full TOML → YAML migration path.
+See the [How to upgrade the proxy](../how-to/upgrade.md) for the full TOML → YAML migration path.
 
 ## Table of Contents
 
@@ -580,7 +580,7 @@ Require HTTPS for admin session cookies (`Secure` flag).
 
 ### Rate Limiting
 
-Per-IP brute-force protection for auth endpoints. See [rate limiting](../auth/33-rate-limiting.md) for the full model.
+Per-IP brute-force protection for auth endpoints. See [Rate limits and concurrency](rate-limits.md) for the full model.
 
 | Setting | Env var | Default |
 |---------|---------|---------|
@@ -852,7 +852,7 @@ Name normalisation: `<NAME>` is uppercased; `-` and `.` become `_` (so `eu-archi
 
 **Formats:** `key` / `legacy_key` are 64-char lowercase hex (256 bits). `kms_key_id` is a KMS ARN or alias. `key_id` (optional) must match `[A-Za-z0-9_.-]{1,64}` (S3 user-metadata header-safe).
 
-Rotation within a single mode is not automated — use the `legacy_key` / `legacy_key_id` shim fields (decrypt-only, for proxy→native transitions) or copy objects to a new backend. See [encryption at rest](encryption-at-rest.md) for the full wire format, key-id mismatch mechanics, and the shim lifecycle.
+Rotation within a single mode is not automated — use the `legacy_key` / `legacy_key_id` shim fields (decrypt-only, for proxy→native transitions) or copy objects to a new backend. See the [encryption reference](encryption.md) for the full wire format, key-id mismatch mechanics, and the shim lifecycle.
 
 ---
 
