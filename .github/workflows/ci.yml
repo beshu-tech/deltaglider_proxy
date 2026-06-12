@@ -779,14 +779,11 @@ jobs:
           cargo run --locked --quiet -- config schema --out schema/deltaglider.schema.json
           echo "--- schema head ---"
           head -40 schema/deltaglider.schema.json
-      - name: Verify schema accepts migrated example
+      - name: Lint the canonical example config
         run: |
-          cargo run --locked --quiet -- config migrate deltaglider_proxy.toml.example \
-            --out /tmp/migrated.yaml
-          # Round-trip check: loading the migrated YAML must succeed.
-          cargo run --locked --quiet -- config migrate /tmp/migrated.yaml \
-            --out /tmp/roundtrip.yaml
-          diff /tmp/migrated.yaml /tmp/roundtrip.yaml
+          # YAML is the only config format (TOML removed in v1.4.1).
+          # The shipped example must always pass offline validation.
+          cargo run --locked --quiet -- config lint deltaglider_proxy.example.yaml
       - name: Upload schema artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

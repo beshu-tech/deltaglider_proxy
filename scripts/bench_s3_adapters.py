@@ -90,17 +90,16 @@ def wait_ready(port: int, proc: subprocess.Popen[bytes]) -> None:
 def start_server(adapter: str, port: int, tmp: Path) -> subprocess.Popen[bytes]:
     data_dir = tmp / f"{adapter}-data"
     data_dir.mkdir()
-    config = tmp / f"{adapter}.toml"
+    config = tmp / f"{adapter}.yaml"
     config.write_text(
         "\n".join(
             [
-                f'listen_addr = "127.0.0.1:{port}"',
-                'authentication = "none"',
-                "max_object_size = 134217728",
-                "",
-                "[backend]",
-                'type = "filesystem"',
-                f'path = "{data_dir}"',
+                f'listen_addr: "127.0.0.1:{port}"',
+                'authentication: "none"',
+                "max_object_size: 134217728",
+                "backend:",
+                "  type: filesystem",
+                f'  path: "{data_dir}"',
                 "",
             ]
         )

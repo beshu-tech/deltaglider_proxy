@@ -676,7 +676,6 @@ async fn test_config_apply_preserves_sigv4_secret_on_redacted_roundtrip() {
 async fn test_config_apply_preserves_webhook_header_secret_on_redacted_roundtrip() {
     let server = TestServer::builder()
         .auth("WHDOCKEY", "WHDOCSECRET")
-        .yaml_config()
         .build()
         .await;
     let admin = admin_http_client(&server.endpoint()).await;
@@ -972,7 +971,7 @@ async fn test_apply_warns_on_asymmetric_sigv4_credentials() {
 #[tokio::test]
 async fn test_backend_mutations_persist_to_configured_file_not_cwd_default() {
     // Regression coverage for a latent bug in `api/admin/backends.rs`:
-    // two `persist_to_file` sites used `DEFAULT_CONFIG_FILENAME` directly
+    // two `persist_to_file` sites used a hardcoded CWD-relative filename
     // instead of `active_config_path(&state)`. When the operator had
     // launched with `--config /some/other/path`, admin-API backend
     // creations silently wrote to the wrong file — the in-memory config
@@ -1005,7 +1004,7 @@ async fn test_backend_mutations_persist_to_configured_file_not_cwd_default() {
 
     // Read the config file the server was spawned with — the new backend
     // must appear here. If the fix regresses, the file will not contain
-    // the backend (it went to `deltaglider_proxy.toml` in CWD instead).
+    // the backend (it went to a CWD-relative default instead).
     let on_disk = std::fs::read_to_string(server.config_path()).unwrap();
     assert!(
         on_disk.contains("persist-regression-backend"),

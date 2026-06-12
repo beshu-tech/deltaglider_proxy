@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Removed (breaking)
+
+- **TOML config support removed entirely.** YAML is the only config
+  format. Gone: TOML loading (`Config::from_toml_file` / `from_toml_str`
+  and the `.toml` boot path), TOML persisting, the `config migrate`
+  subcommand, the `--show-toml` flag, the
+  `deltaglider_proxy.toml.example` file, and the
+  `DGP_SILENCE_TOML_DEPRECATION` env var. A `.toml` config — pointed at
+  via `DGP_CONFIG`/`--config` or found on the default search path — now
+  fails startup loudly with: "TOML configs are no longer supported
+  (removed in v1.4.1). Convert with `deltaglider_proxy config migrate`
+  on v1.4.0, then point the server at the YAML file." Upgrade path:
+  run `config migrate` on v1.4.0 (the last release that ships it)
+  BEFORE upgrading.
+
 ### Added
 
 - **`${env:NAME}` references round-trip.** The proxy now records which

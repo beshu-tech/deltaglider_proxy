@@ -101,7 +101,7 @@ docker run -v ./my-config.yaml:/etc/deltaglider_proxy.yaml \
   beshultd/deltaglider_proxy -c /etc/deltaglider_proxy.yaml
 ```
 
-(TOML config still loads but emits a deprecation warning on every startup; run `deltaglider_proxy config migrate <file>.toml --out <file>.yaml` to convert.)
+(TOML configs are no longer supported as of v1.4.1 — YAML is the only format. Convert with `deltaglider_proxy config migrate` on v1.4.0 before upgrading.)
 
 ## Built-in Admin GUI
 

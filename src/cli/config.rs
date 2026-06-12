@@ -2,15 +2,13 @@
 
 //! `deltaglider_proxy config <subcommand>` dispatcher.
 //!
-//! Phase 0 shipped `config migrate` and `config schema`. Phase 4 adds
-//! `apply` and `admission trace` as thin wrappers over the admin-API
-//! endpoints already merged in Phase 1/2. Further subcommands
-//! (`show`, `defaults`, `lint`, `init`, `explain`) depend on the Phase 3
-//! sectioned schema and land after it.
+//! Hosts `schema`, `defaults`, `lint`, plus the admin-API wrappers
+//! `apply` and `admission trace`. The old `config migrate` (TOML →
+//! YAML converter) was removed together with TOML support in v1.4.1 —
+//! convert on v1.4.0 if you still carry a TOML config.
 
-use crate::config::{Config, ConfigError, ConfigFormat};
+use crate::config::{Config, ConfigError};
 use std::io::Write;
-use std::path::Path;
 
 /// Exit codes for CLI subcommands. Stable contract for CI scripts.
 pub const EXIT_OK: i32 = 0;
@@ -26,73 +24,6 @@ pub const EXIT_NOT_FOUND: i32 = 8;
 pub const EXIT_INTEGRITY: i32 = 9;
 /// Recursive command finished with mixed success/failure across keys.
 pub const EXIT_PARTIAL: i32 = 10;
-
-/// `config migrate <input> [--out <output>]`
-///
-/// Loads a TOML (or YAML) config file and emits the canonical YAML form.
-/// When `--out` is omitted, YAML is written to stdout. Secrets are stripped
-/// before serialization (same policy as the admin API export path).
-pub fn migrate(input: &str, output: Option<&str>) -> i32 {
-    if !Path::new(input).exists() {
-        eprintln!("error: input file not found: {input}");
-        return EXIT_IO;
-    }
-
-    // Use migrate_to_string (which does NOT expand ${VAR}) so templates migrate
-    // with their placeholders intact, rather than Config::from_file (which
-    // expands on load and would bake secrets in / fail on unset vars).
-    let yaml = match migrate_to_string(input) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: failed to parse {input}: {e}");
-            return EXIT_PARSE;
-        }
-    };
-
-    match output {
-        Some(path) => match std::fs::write(path, &yaml) {
-            Ok(()) => {
-                eprintln!("migrated {input} -> {path}");
-                if ConfigFormat::from_path(path) != ConfigFormat::Yaml {
-                    eprintln!(
-                        "note: output extension is not .yaml/.yml; the file \
-                         contains YAML content regardless."
-                    );
-                }
-                EXIT_OK
-            }
-            Err(e) => {
-                eprintln!("error: failed to write {path}: {e}");
-                EXIT_IO
-            }
-        },
-        None => {
-            // Write directly to stdout so callers can pipe.
-            let stdout = std::io::stdout();
-            let mut lock = stdout.lock();
-            if let Err(e) = lock.write_all(yaml.as_bytes()) {
-                eprintln!("error: failed to write to stdout: {e}");
-                return EXIT_IO;
-            }
-            EXIT_OK
-        }
-    }
-}
-
-/// Adapter for callers that prefer `Result<(), ConfigError>` over exit codes.
-pub fn migrate_to_string(input: &str) -> Result<String, ConfigError> {
-    // Migrate is a structural transform of a (possibly templated) config, so it
-    // must NOT expand ${VAR} — placeholders are preserved verbatim in the output
-    // (expanding would bake secrets into the migrated file and fail on unset
-    // vars). Read + parse via the non-expanding string parsers, unlike the
-    // server load path (Config::from_file) which DOES expand.
-    let content = std::fs::read_to_string(input).map_err(|e| ConfigError::Io(e.to_string()))?;
-    let cfg = match crate::config::ConfigFormat::from_path(input) {
-        crate::config::ConfigFormat::Yaml => Config::from_yaml_str(&content)?,
-        crate::config::ConfigFormat::Toml => Config::from_toml_str(&content)?,
-    };
-    cfg.to_canonical_yaml()
-}
 
 /// `config schema [--out <path>]`
 ///
@@ -192,28 +123,20 @@ pub fn lint(file: &str) -> i32 {
         }
     };
 
-    // Dispatch by extension. Both YAML and TOML paths MUST run
-    // `normalize_shorthands` so lint catches the same semantic
-    // violations (duplicate admission block names, bad Reject
-    // status, `public: true` conflicts) that the server would reject
-    // at `/apply` time. `Config::from_yaml_str` runs it internally;
-    // for TOML we deserialize raw then call a helper that re-runs
-    // the same validation pipeline.
-    //
-    // The TOML path still goes through here (not `Config::from_toml_file`)
-    // because lint MUST NOT read its input as a filesystem path a
-    // second time — we've already slurped `content` into memory, so
-    // re-reading from disk would both waste syscalls and open a
-    // TOCTOU window where the file changes mid-lint.
-    let cfg = match std::path::Path::new(file)
-        .extension()
-        .and_then(|s| s.to_str())
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("yaml") | Some("yml") => Config::from_yaml_str(&content),
-        _ => Config::from_toml_str(&content),
-    };
+    // YAML is the only supported format. A `.toml` input is rejected
+    // with the actionable removal message (same contract as the server
+    // load path) — lint must not silently "succeed" on a file the
+    // server would refuse to load.
+    if crate::config::path_is_toml(file) {
+        eprintln!("error: {file}: {}", crate::config::TOML_REMOVED_MSG);
+        return EXIT_PARSE;
+    }
+
+    // `Config::from_yaml_str` runs `normalize_shorthands` internally,
+    // so lint catches the same semantic violations (duplicate admission
+    // block names, bad Reject status, `public: true` conflicts) that
+    // the server would reject at `/apply` time.
+    let cfg = Config::from_yaml_str(&content);
     let mut cfg = match cfg {
         Ok(c) => c,
         Err(e) => {
@@ -652,98 +575,6 @@ async fn admission_trace_async(args: TraceArgs, opts: AdminClientOpts) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-
-    #[test]
-    fn migrate_toml_to_yaml_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
-        let toml_path = dir.path().join("cfg.toml");
-        std::fs::write(
-            &toml_path,
-            r#"
-listen_addr = "0.0.0.0:9001"
-max_delta_ratio = 0.4
-
-[backend]
-type = "filesystem"
-path = "/tmp/dgp"
-"#,
-        )
-        .unwrap();
-
-        let yaml = migrate_to_string(toml_path.to_str().unwrap()).unwrap();
-        assert!(yaml.contains("9001"));
-        assert!(yaml.contains("0.4"));
-
-        // Round-trip through the dual-shape YAML deserializer, not
-        // `serde_yaml::from_str::<Config>` directly — the canonical emitter
-        // is sectioned, only `Config::from_yaml_str` knows how to collapse
-        // sections back to the flat shape.
-        let reparsed = Config::from_yaml_str(&yaml).unwrap();
-        assert_eq!(reparsed.listen_addr.port(), 9001);
-        assert!((reparsed.max_delta_ratio - 0.4).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn migrate_yaml_is_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
-        let toml_path = dir.path().join("cfg.toml");
-        std::fs::write(&toml_path, "listen_addr = \"127.0.0.1:9000\"\n").unwrap();
-
-        let yaml_a = migrate_to_string(toml_path.to_str().unwrap()).unwrap();
-
-        let yaml_path = dir.path().join("cfg.yaml");
-        let mut f = std::fs::File::create(&yaml_path).unwrap();
-        f.write_all(yaml_a.as_bytes()).unwrap();
-
-        let yaml_b = migrate_to_string(yaml_path.to_str().unwrap()).unwrap();
-        assert_eq!(yaml_a, yaml_b, "YAML → YAML migrate must be idempotent");
-    }
-
-    #[test]
-    fn migrate_strips_infra_secrets() {
-        // `migrate` must match `to_toml_string` / `to_canonical_yaml`:
-        // strip bootstrap hash and encryption key (infra secrets), keep SigV4
-        // creds so the output is drop-in-usable by the wizard path.
-        let dir = tempfile::tempdir().unwrap();
-        let toml_path = dir.path().join("cfg.toml");
-        std::fs::write(
-            &toml_path,
-            r#"
-access_key_id = "AKIAKEEPME"
-secret_access_key = "runtime-key-kept-for-file-use"
-bootstrap_password_hash = "$2b$12$xxxxxxxxxxxxxxxxxxxxxx"
-
-[backend_encryption]
-mode = "aes256-gcm-proxy"
-key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-key_id = "migrated-kid"
-"#,
-        )
-        .unwrap();
-
-        let yaml = migrate_to_string(toml_path.to_str().unwrap()).unwrap();
-        // Infra secrets stripped — bootstrap hash and encryption key
-        // must NOT appear in the migrated YAML.
-        assert!(!yaml.contains("$2b$"));
-        assert!(
-            !yaml.contains("0123456789abcdef"),
-            "encryption key must be redacted on migration, got:\n{yaml}"
-        );
-        // Non-secret identifiers survive.
-        assert!(
-            yaml.contains("migrated-kid"),
-            "key_id (not a secret) must survive migration"
-        );
-        assert!(
-            yaml.contains("aes256-gcm-proxy"),
-            "encryption mode must survive migration"
-        );
-        // SigV4 runtime creds survive — migration output must remain a
-        // drop-in YAML equivalent of the input TOML.
-        assert!(yaml.contains("AKIAKEEPME"));
-        assert!(yaml.contains("runtime-key-kept-for-file-use"));
-    }
 
     #[test]
     fn test_cleartext_detection() {
@@ -831,6 +662,17 @@ admission:
     fn lint_missing_file_is_exit_3() {
         let code = lint("/nonexistent/path/to/nothing.yaml");
         assert_eq!(code, EXIT_IO);
+    }
+
+    #[test]
+    fn lint_rejects_toml_input() {
+        // TOML support was removed in v1.4.1 — lint must refuse a .toml
+        // input rather than mis-parse it as YAML or silently pass it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.toml");
+        std::fs::write(&path, "listen_addr = \"127.0.0.1:9000\"\n").unwrap();
+        let code = lint(path.to_str().unwrap());
+        assert_eq!(code, EXIT_PARSE);
     }
 
     #[test]

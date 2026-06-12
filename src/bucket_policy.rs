@@ -832,16 +832,16 @@ mod tests {
     }
 
     #[test]
-    fn test_quota_bytes_toml_roundtrip() {
+    fn test_quota_bytes_yaml_roundtrip() {
         let policy = BucketPolicyConfig {
             quota_bytes: Some(5368709120), // 5 GB
             compression: Some(true),
             ..Default::default()
         };
-        let toml_str = toml::to_string_pretty(&policy).unwrap();
-        assert!(toml_str.contains("quota_bytes = 5368709120"));
+        let yaml_str = serde_yaml::to_string(&policy).unwrap();
+        assert!(yaml_str.contains("quota_bytes: 5368709120"));
 
-        let parsed: BucketPolicyConfig = toml::from_str(&toml_str).unwrap();
+        let parsed: BucketPolicyConfig = serde_yaml::from_str(&yaml_str).unwrap();
         assert_eq!(parsed.quota_bytes, Some(5368709120));
     }
 
@@ -851,8 +851,8 @@ mod tests {
             compression: Some(true),
             ..Default::default()
         };
-        let toml_str = toml::to_string_pretty(&policy).unwrap();
-        assert!(!toml_str.contains("quota_bytes"));
+        let yaml_str = serde_yaml::to_string(&policy).unwrap();
+        assert!(!yaml_str.contains("quota_bytes"));
     }
 
     // ── Phase 3b.1: `public: true` shorthand ────────────────────────────

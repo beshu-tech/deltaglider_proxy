@@ -12,20 +12,15 @@ The `deltaglider_proxy` binary is both the server and its CLI. With no subcomman
 | `--init` | Interactive configuration wizard, then exit |
 | `--set-bootstrap-password` | Read a password from stdin, write its bcrypt hash, then exit (alias: `--set-admin-password`) |
 | `--show-env` | Print all `DGP_*` environment variables in `.env` format, then exit |
-| `--show-toml` | Print an example TOML config, then exit |
 | `--version` | Version plus build timestamp |
 
 ## Exit codes
 
 Shared registry across all subcommands: `0` OK, `2` usage, `3` I/O error, `4` parse error, `5` HTTP error, `6` rejected by validation/server, `7` authentication failure, `8` S3 not found, `9` integrity (hash mismatch), `10` partial success in a recursive operation.
 
-## `config migrate <INPUT> [--out <OUTPUT>]`
-
-Converts a TOML (or YAML) config file to canonical sectioned YAML, written to stdout unless `--out` is given. `${env:NAME}` placeholders are **not** expanded — they migrate verbatim. Infra secrets (bootstrap password hash, encryption keys) are stripped; SigV4 credentials are kept so the output is drop-in usable. Exit: `0` / `3` (input missing, write failure) / `4` (parse).
-
 ## `config lint <FILE>`
 
-Offline validation — the same pipeline as the admin API's `/config/validate`: shape classification, deny-unknown-fields, shorthand normalization, admission-block semantics, `Config::check` warnings. `${env:NAME}` / `${env:NAME:-default}` references are expanded against the environment first; an unset variable without a default fails the lint. Files ending `.yaml`/`.yml` parse as YAML; anything else as TOML. Warnings go to stderr and are non-fatal. Exit: `0` valid (with or without warnings), `3` unreadable, `4` parse error, `6` validation error (including an unparseable `log_level` filter).
+Offline validation — the same pipeline as the admin API's `/config/validate`: shape classification, deny-unknown-fields, shorthand normalization, admission-block semantics, `Config::check` warnings. `${env:NAME}` / `${env:NAME:-default}` references are expanded against the environment first; an unset variable without a default fails the lint. YAML is the only supported format; a `.toml` input fails with the TOML-removed error (removed in v1.4.1 — convert with `config migrate` on v1.4.0). Warnings go to stderr and are non-fatal. Exit: `0` valid (with or without warnings), `3` unreadable, `4` parse error, `6` validation error (including an unparseable `log_level` filter).
 
 ## `config schema [--out <OUTPUT>]`
 
@@ -49,7 +44,7 @@ Dry-runs a synthetic request through the running server's admission chain via `P
 
 ## `--init`
 
-Interactive wizard, in the style of `npm init`. Prompts for output path (default `deltaglider_proxy.toml`), listen address, log level, backend (filesystem or S3 with endpoint/region/credentials), delta settings (`max_delta_ratio`, max object size, cache size), optional SigV4 credentials, and optional TLS. The generated config is printed for confirmation before writing; an existing file requires an explicit overwrite confirmation. The output format follows the file extension: `.yaml`/`.yml` produces sectioned YAML, anything else TOML.
+Interactive wizard, in the style of `npm init`. Prompts for output path (default `deltaglider_proxy.yaml`), listen address, log level, backend (filesystem or S3 with endpoint/region/credentials), delta settings (`max_delta_ratio`, max object size, cache size), optional SigV4 credentials, and optional TLS. The generated config is printed for confirmation before writing; an existing file requires an explicit overwrite confirmation. The output is always canonical sectioned YAML (a `.toml` output path is refused).
 
 ## `--set-bootstrap-password`
 

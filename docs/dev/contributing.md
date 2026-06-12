@@ -106,7 +106,7 @@ src/
 │   ├── declarative.rs   # Declarative-mode reconciler (diff_iam → apply_iam_reconcile)
 │   └── external_auth/   # OAuth/OIDC providers (Google, generic OIDC)
 ├── config_db/           # Encrypted SQLCipher DB (users, groups, auth_providers, declarative; classify_sqlite_error)
-├── config.rs            # Flat Config struct + ENV_VAR_REGISTRY + env_parse/env_bool helpers + classify_auth_config (YAML canonical; TOML deprecated)
+├── config.rs            # Flat Config struct + ENV_VAR_REGISTRY + env_parse/env_bool helpers + classify_auth_config (YAML is the only config format)
 ├── config_sections.rs   # Sectioned YAML wire shape (admission/access/storage/advanced) + shorthand expanders
 ├── config_db_sync.rs    # Multi-instance IAM sync via S3 (reopen_and_rebuild_iam)
 ├── admission/           # Pre-auth admission chain (operator-authored + synthesized blocks)

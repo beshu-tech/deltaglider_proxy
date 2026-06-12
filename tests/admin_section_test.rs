@@ -59,7 +59,6 @@ async fn section_get_unknown_returns_404() {
 async fn section_get_admission_defaults_to_empty_blocks() {
     let server = TestServer::builder()
         .auth("SECKEY2", "SECSECRET2")
-        .yaml_config()
         .build()
         .await;
     let admin = admin_http_client(&server.endpoint()).await;
@@ -91,7 +90,6 @@ async fn section_get_admission_defaults_to_empty_blocks() {
 async fn section_get_access_returns_iam_mode() {
     let server = TestServer::builder()
         .auth("SECKEY3", "SECSECRET3")
-        .yaml_config()
         .build()
         .await;
     let admin = admin_http_client(&server.endpoint()).await;
@@ -159,7 +157,6 @@ async fn section_put_advanced_max_delta_ratio_persists_and_diffs() {
     let server = TestServer::builder()
         .auth("SECKEY5", "SECSECRET5")
         .max_delta_ratio(0.8)
-        .yaml_config()
         .build()
         .await;
     let admin = admin_http_client(&server.endpoint()).await;
@@ -251,7 +248,6 @@ async fn section_put_is_merge_not_replace() {
     let server = TestServer::builder()
         .auth("MERGEKEY", "MERGESECRETVALUE")
         .max_delta_ratio(0.65)
-        .yaml_config()
         .build()
         .await;
     let admin = admin_http_client(&server.endpoint()).await;
@@ -311,7 +307,6 @@ async fn section_put_null_resets_field_to_default() {
     let server = TestServer::builder()
         .auth("NULLKEY", "NULLSECRETVALUE")
         .max_delta_ratio(0.33)
-        .yaml_config()
         .build()
         .await;
     let admin = admin_http_client(&server.endpoint()).await;
@@ -361,7 +356,6 @@ async fn section_put_storage_preserves_other_buckets() {
     // updating one bucket entry must not wipe the others.
     let server = TestServer::builder()
         .auth("BUCKKEY", "BUCKSECRETVALUE")
-        .yaml_config()
         .build()
         .await;
     let admin = admin_http_client(&server.endpoint()).await;
@@ -419,7 +413,6 @@ async fn section_put_storage_preserves_other_buckets() {
 async fn section_put_storage_compression_null_clears_explicit_override() {
     let server = TestServer::builder()
         .auth("CLRKEY1", "CLRSECRET1")
-        .yaml_config()
         .build()
         .await;
     let admin = admin_http_client(&server.endpoint()).await;
@@ -470,7 +463,6 @@ async fn section_put_storage_compression_null_clears_explicit_override() {
 async fn section_put_admission_blocks_replace_entire_list() {
     let server = TestServer::builder()
         .auth("SECKEY7", "SECSECRET7")
-        .yaml_config()
         .build()
         .await;
     let admin = admin_http_client(&server.endpoint()).await;
@@ -591,7 +583,6 @@ async fn section_validate_is_dry_run_no_state_change() {
 async fn section_validate_rejects_malformed_admission_block() {
     let server = TestServer::builder()
         .auth("SECKEY9", "SECSECRET9")
-        .yaml_config()
         .build()
         .await;
     let admin = admin_http_client(&server.endpoint()).await;
@@ -806,7 +797,6 @@ async fn section_put_access_round_trip_preserves_redacted_creds() {
     // the same way the document-level apply does.
     let server = TestServer::builder()
         .auth("PRESERVKEY", "PRESERVSECRET")
-        .yaml_config()
         .build()
         .await;
     let admin = admin_http_client(&server.endpoint()).await;
@@ -900,7 +890,6 @@ async fn section_put_advanced_rejects_bootstrap_password_hash_change() {
     // contract isn't "just happens to be safe because of ordering".
     let server = TestServer::builder()
         .auth("R2KEY", "R2SECRETVALUE")
-        .yaml_config()
         .build()
         .await;
     let admin = admin_http_client(&server.endpoint()).await;
@@ -936,7 +925,6 @@ async fn section_put_admission_is_merge_patch_regression_guard() {
     // them across a {blocks: [...]} PUT.
     let server = TestServer::builder()
         .auth("MPKEY", "MPSECRETVALUE")
-        .yaml_config()
         .build()
         .await;
     let admin = admin_http_client(&server.endpoint()).await;
@@ -1006,7 +994,6 @@ async fn section_put_storage_public_shorthand_expands_on_apply() {
     // while `PublicPrefixSnapshot` misses the prefix.
     let server = TestServer::builder()
         .auth("Y1KEY", "Y1SECRETVALUE")
-        .yaml_config()
         .build()
         .await;
     let admin = admin_http_client(&server.endpoint()).await;
@@ -1058,7 +1045,6 @@ async fn section_put_storage_buckets_are_merged_not_replaced() {
     // tests in admin_config_test.rs via preserve_runtime_secrets.)
     let server = TestServer::builder()
         .auth("BKTKEY", "BKTSECRETVALUE")
-        .yaml_config()
         .build()
         .await;
     let admin = admin_http_client(&server.endpoint()).await;
@@ -1134,7 +1120,6 @@ async fn section_webhook_headers_secret_roundtrip() {
     const SENTINEL: &str = deltaglider_proxy::config::REDACTED_SENTINEL;
     let server = TestServer::builder()
         .auth("WHSEC1", "WHSECRET1")
-        .yaml_config()
         .build()
         .await;
     let admin = admin_http_client(&server.endpoint()).await;

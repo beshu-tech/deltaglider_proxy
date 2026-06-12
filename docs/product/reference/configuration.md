@@ -2,13 +2,7 @@
 
 DeltaGlider Proxy is configured via a **YAML** file and/or environment variables (`DGP_*` prefix). Environment variables always take precedence over file contents.
 
-As of v0.8.0, YAML is the canonical format. TOML still loads (emits a deprecation warning on every startup; suppress with `DGP_SILENCE_TOML_DEPRECATION=1`). Convert with:
-
-```sh
-deltaglider_proxy config migrate deltaglider_proxy.toml --out deltaglider_proxy.yaml
-```
-
-See the [How to upgrade the proxy](../how-to/upgrade.md) for the full TOML → YAML migration path.
+YAML is the only supported format. TOML support was removed in v1.4.1: a `.toml` config — whether set via `DGP_CONFIG` or found on the default search path — makes the proxy fail at startup with `TOML configs are no longer supported (removed in v1.4.1)`. If you still carry a TOML config, run `deltaglider_proxy config migrate` **on v1.4.0** to convert it, then point the server at the YAML file before upgrading. See [How to upgrade the proxy](../how-to/upgrade.md).
 
 ## Table of contents
 
@@ -63,7 +57,7 @@ advanced:    # process-level tunables
   log_level: deltaglider_proxy=info
 ```
 
-Every section is optional. Fields equal to their default are omitted from canonical exports (`GET /api/admin/config/export` and `deltaglider_proxy config migrate`), keeping GitOps diffs minimal.
+Every section is optional. Fields equal to their default are omitted from canonical exports (`GET /api/admin/config/export`), keeping GitOps diffs minimal.
 
 The flat (pre-Phase-3) shape — root-level `listen_addr:`, `backend:`, etc. — still loads unchanged. Mixing the two shapes in one document is a hard parse error naming the conflicting keys.
 
@@ -123,10 +117,12 @@ Mixing `public: true` and a non-empty `public_prefixes` is a hard error.
 1. `DGP_CONFIG` env var (returned unconditionally — if set, the path is used even when the file doesn't yet exist).
 2. `./deltaglider_proxy.yaml`
 3. `./deltaglider_proxy.yml`
-4. `./deltaglider_proxy.toml` (deprecated)
+4. `./deltaglider_proxy.toml` (tripwire — startup fails)
 5. `/etc/deltaglider_proxy/config.yaml`
 6. `/etc/deltaglider_proxy/config.yml`
-7. `/etc/deltaglider_proxy/config.toml` (deprecated)
+7. `/etc/deltaglider_proxy/config.toml` (tripwire — startup fails)
+
+The `.toml` entries are tripwires, not loadable formats: a leftover TOML config matched by the search (with no YAML earlier in the order) stops startup with an actionable error rather than being silently ignored.
 
 CLI flags (`--config <path>`, `--listen <addr>`) take precedence over all of the above; env vars take precedence over file contents.
 
@@ -144,7 +140,6 @@ HTTP listen address.
 |---|---|
 | **Env var** | `DGP_LISTEN_ADDR` |
 | **YAML** | `advanced.listen_addr` (sectioned) or root `listen_addr:` (flat) |
-| **TOML** | `listen_addr` |
 | **Default** | `0.0.0.0:9000` |
 | **Hot-reload** | No (restart required) |
 
@@ -163,7 +158,6 @@ Resolution order at startup: `RUST_LOG` > `DGP_LOG_LEVEL` > `advanced.log_level`
 |---|---|
 | **Env var** | `DGP_LOG_LEVEL` |
 | **YAML** | `advanced.log_level` |
-| **TOML** | `log_level` |
 | **Default** | `deltaglider_proxy=debug,tower_http=debug` |
 | **Hot-reload** | Yes (via admin GUI or `config apply`) |
 
@@ -210,7 +204,6 @@ Tokio blocking thread-pool size. Controls how many concurrent CPU-bound ops (xde
 |---|---|
 | **Env var** | `DGP_BLOCKING_THREADS` |
 | **YAML** | `advanced.blocking_threads` |
-| **TOML** | `blocking_threads` |
 | **Default** | tokio default (512) |
 | **Hot-reload** | No |
 
@@ -257,7 +250,6 @@ Store an object as a delta only if `delta_size / original_size` is below this ra
 |---|---|
 | **Env var** | `DGP_MAX_DELTA_RATIO` |
 | **YAML** | `advanced.max_delta_ratio` |
-| **TOML** | `max_delta_ratio` |
 | **Default** | `0.75` |
 | **Hot-reload** | Yes |
 
@@ -279,7 +271,6 @@ In-memory reference cache size in MB. **Recommend 1024+ MB for production.** Und
 |---|---|
 | **Env var** | `DGP_CACHE_MB` |
 | **YAML** | `advanced.cache_size_mb` |
-| **TOML** | `cache_size_mb` |
 | **Default** | `100` |
 | **Hot-reload** | No |
 
@@ -291,7 +282,6 @@ In-memory `FileMetadata` cache size in MB. Set to `0` to disable. Budget: ~125K-
 |---|---|
 | **Env var** | `DGP_METADATA_CACHE_MB` |
 | **YAML** | `advanced.metadata_cache_mb` |
-| **TOML** | `metadata_cache_mb` |
 | **Default** | `50` |
 | **Hot-reload** | No |
 
@@ -303,7 +293,6 @@ Maximum concurrent xdelta3 subprocesses. Auto-detected as `num_cpus * 4` (min 16
 |---|---|
 | **Env var** | `DGP_CODEC_CONCURRENCY` |
 | **YAML** | `advanced.codec_concurrency` |
-| **TOML** | `codec_concurrency` |
 | **Default** | `num_cpus * 4` (min 16) |
 | **Hot-reload** | No |
 
@@ -332,7 +321,6 @@ Local filesystem. Activated by setting `DGP_DATA_DIR` or a `backend:` block with
 | **Env var** | `DGP_DATA_DIR` |
 | **YAML (shorthand)** | `storage.filesystem: <path>` |
 | **YAML (canonical)** | `storage.backend.path` |
-| **TOML** | `backend.path` |
 | **Default** | `./data` |
 | **Hot-reload** | Yes (triggers engine rebuild) |
 
@@ -356,13 +344,13 @@ AWS S3 / MinIO / Hetzner / Backblaze / any S3-compatible service. Activated by s
 
 #### `endpoint` / `region` / `force_path_style` / `access_key_id` / `secret_access_key`
 
-| Field | Env var | YAML shorthand | YAML canonical | TOML | Default |
-|-------|---------|----------------|----------------|------|---------|
-| endpoint | `DGP_S3_ENDPOINT` | `storage.s3: <url>` | `storage.backend.endpoint` | `backend.endpoint` | — (AWS default) |
-| region | `DGP_S3_REGION` | `storage.region` | `storage.backend.region` | `backend.region` | `us-east-1` |
-| force_path_style | `DGP_S3_PATH_STYLE` | `storage.force_path_style` | `storage.backend.force_path_style` | `backend.force_path_style` | `true` |
-| access_key_id | `DGP_BE_AWS_ACCESS_KEY_ID` | `storage.access_key_id` | `storage.backend.access_key_id` | `backend.access_key_id` | — |
-| secret_access_key | `DGP_BE_AWS_SECRET_ACCESS_KEY` | `storage.secret_access_key` | `storage.backend.secret_access_key` | `backend.secret_access_key` | — |
+| Field | Env var | YAML shorthand | YAML canonical | Default |
+|-------|---------|----------------|----------------|---------|
+| endpoint | `DGP_S3_ENDPOINT` | `storage.s3: <url>` | `storage.backend.endpoint` | — (AWS default) |
+| region | `DGP_S3_REGION` | `storage.region` | `storage.backend.region` | `us-east-1` |
+| force_path_style | `DGP_S3_PATH_STYLE` | `storage.force_path_style` | `storage.backend.force_path_style` | `true` |
+| access_key_id | `DGP_BE_AWS_ACCESS_KEY_ID` | `storage.access_key_id` | `storage.backend.access_key_id` | — |
+| secret_access_key | `DGP_BE_AWS_SECRET_ACCESS_KEY` | `storage.secret_access_key` | `storage.backend.secret_access_key` | — |
 
 ```yaml
 # Shorthand
@@ -399,7 +387,6 @@ Explicit auth-mode selector. Absent = auto-detect from credentials; `"none"` = o
 |---|---|
 | **Env var** | `DGP_AUTHENTICATION` |
 | **YAML** | `access.authentication` |
-| **TOML** | `authentication` |
 | **Default** | — (auto-detect; **fatal error** if absent AND no credentials) |
 | **Hot-reload** | No |
 
@@ -411,7 +398,6 @@ Proxy-level SigV4 credentials (the "bootstrap admin" credential pair).
 |---|---|
 | **Env vars** | `DGP_ACCESS_KEY_ID` / `DGP_SECRET_ACCESS_KEY` |
 | **YAML** | `access.access_key_id` / `access.secret_access_key` |
-| **TOML** | `access_key_id` / `secret_access_key` |
 | **Default** | None |
 | **Hot-reload** | Yes |
 
@@ -429,7 +415,6 @@ Bcrypt hash of the bootstrap password (encrypts the IAM config DB, signs session
 |---|---|
 | **Env var** | `DGP_BOOTSTRAP_PASSWORD_HASH` (legacy alias: `DGP_ADMIN_PASSWORD_HASH`) |
 | **YAML** | `advanced.bootstrap_password_hash` (treated as an **infra secret** — stripped by canonical exports) |
-| **TOML** | `bootstrap_password_hash` |
 | **Default** | Auto-generated on first run |
 
 ### `DGP_BOOTSTRAP_PASSWORD`
@@ -620,7 +605,6 @@ Multi-instance IAM sync via S3. When enabled, the encrypted config DB file is re
 |---|---|
 | **Env var** | `DGP_CONFIG_SYNC_BUCKET` |
 | **YAML** | `advanced.config_sync_bucket` |
-| **TOML** | `config_sync_bucket` |
 | **Default** | None (disabled) |
 
 ```yaml
@@ -976,7 +960,7 @@ Exhaustive list of every `DGP_*` variable the server reads. The unit test `test_
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DGP_CONFIG` | auto | Path to the config file (`.yaml` / `.yml` / `.toml`) |
+| `DGP_CONFIG` | auto | Path to the YAML config file (`.yaml` / `.yml`) |
 | `DGP_LISTEN_ADDR` | `0.0.0.0:9000` | HTTP listen address |
 | `DGP_LOG_LEVEL` | `deltaglider_proxy=debug,tower_http=debug` | Tracing filter (overridden by `RUST_LOG`) |
 | `DGP_BLOCKING_THREADS` | 512 | Max tokio blocking threads |
@@ -1041,7 +1025,6 @@ Exhaustive list of every `DGP_*` variable the server reads. The unit test `test_
 | `DGP_CONFIG_SYNC_BUCKET` | — | S3 bucket for encrypted-DB multi-instance sync |
 | `DGP_ENCRYPTION_KEY` | — | Singleton-backend AES-256 key (64-char hex). Named backends use `DGP_BACKEND_<NAME>_ENCRYPTION_KEY`. |
 | `DGP_SSE_KMS_KEY_ID` | — | Singleton-backend SSE-KMS ARN/alias. Named backends use `DGP_BACKEND_<NAME>_SSE_KMS_KEY_ID`. |
-| `DGP_SILENCE_TOML_DEPRECATION` | false | Suppress the TOML-is-deprecated startup warning |
 
 ### Consumed only by tests / build
 

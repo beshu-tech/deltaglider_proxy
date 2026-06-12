@@ -1,6 +1,6 @@
 # How to upgrade the proxy
 
-This guide shows you how to move between DeltaGlider Proxy versions safely, including the TOML → YAML config migration and the v0.9 encryption-config change.
+This guide shows you how to move between DeltaGlider Proxy versions safely, including the one-time TOML → YAML config conversion (mandatory before v1.4.1) and the v0.9 encryption-config change.
 
 ## Standard upgrade workflow
 
@@ -62,23 +62,26 @@ Patch and minor upgrades inside the `0.8.x` line are drop-in. The config file fo
 
 **Across majors (future 0.x → 1.0):** pre-release — expect breaking changes. Always follow the release notes for that version, and always export a Full Backup before trying it.
 
-## TOML → YAML migration
+## TOML → YAML migration (mandatory before v1.4.1)
 
-YAML is the canonical format as of v0.8.0. TOML still loads but emits a deprecation warning on every startup (suppress with `DGP_SILENCE_TOML_DEPRECATION=1`). TOML will be removed in a future minor release; migrate at your own pace within the grace window.
+**TOML support was removed in v1.4.1.** A v1.4.1+ proxy refuses to start when its config is a `.toml` file — whether pointed at via `DGP_CONFIG` / `--config` or found on the default search path — with the error `TOML configs are no longer supported (removed in v1.4.1)`. There is no deprecation warning anymore, and the `config migrate` subcommand is gone from v1.4.1+ binaries.
+
+The one-time conversion path is: **run `config migrate` on v1.4.0 (the last release that ships it), point the server at the YAML file, verify, and only then upgrade to v1.4.1+.**
 
 ### One-liner (most installs)
 
 ```bash
+# On a v1.4.0 binary — config migrate no longer exists in v1.4.1+
 deltaglider_proxy config migrate \
   /etc/deltaglider_proxy/config.toml \
   --out /etc/deltaglider_proxy/config.yaml
 ```
 
-Point the server at the new file (`--config` flag, `DGP_CONFIG` env, or via the standard search path) and restart. Done.
+Point the server at the new file (`--config` flag, `DGP_CONFIG` env, or via the standard search path), restart, verify — then upgrade.
 
 ### Step-by-step
 
-**1. Run the migrator.**
+**1. Run the migrator (on v1.4.0).**
 
 ```bash
 deltaglider_proxy config migrate /etc/deltaglider_proxy/config.toml \
@@ -126,12 +129,12 @@ Wire this into CI so drift is caught in PR.
 1. `DGP_CONFIG` env var
 2. `./deltaglider_proxy.yaml`
 3. `./deltaglider_proxy.yml`
-4. `./deltaglider_proxy.toml` (deprecated)
+4. `./deltaglider_proxy.toml` (tripwire — startup fails on v1.4.1+)
 5. `/etc/deltaglider_proxy/config.yaml`
 6. `/etc/deltaglider_proxy/config.yml`
-7. `/etc/deltaglider_proxy/config.toml` (deprecated)
+7. `/etc/deltaglider_proxy/config.toml` (tripwire — startup fails on v1.4.1+)
 
-If you keep both `.toml` and `.yaml` in the same directory, `.yaml` wins.
+If you keep both `.toml` and `.yaml` in the same directory, `.yaml` wins — but delete the `.toml` once verified: on v1.4.1+ a leftover TOML matched first by the search stops startup rather than being silently ignored.
 
 **5. Feed the stripped secrets back in.** The migrator strips infra secrets only:
 
@@ -140,11 +143,7 @@ If you keep both `.toml` and `.yaml` in the same directory, `.yaml` wins.
 
 OAuth `client_secret` values live in the encrypted config DB, not the YAML — they are untouched by the migration.
 
-**6. Silence the deprecation warning on stragglers.** If you can't migrate immediately (e.g. third-party Ansible using TOML):
-
-```bash
-DGP_SILENCE_TOML_DEPRECATION=1 deltaglider_proxy
-```
+**6. Delete the old TOML and upgrade.** Once the v1.4.0 proxy runs cleanly from the YAML file, remove the `.toml` (it would trip the v1.4.1+ startup check) and roll to the new version.
 
 ## The S3-synced IAM database
 
@@ -217,5 +216,5 @@ After any upgrade or migration:
 
 - [How to back up and restore](back-up-and-restore.md) — the backup you take in step 1
 - [Configuration reference](../reference/configuration.md) — the complete YAML field reference
-- [CLI reference](../reference/cli.md) — `config migrate` / `config lint` exit codes
+- [CLI reference](../reference/cli.md) — `config lint` exit codes
 - [Admin API reference](../reference/admin-api.md) — Full Backup export/import

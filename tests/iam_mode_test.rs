@@ -126,11 +126,7 @@ async fn set_iam_mode(admin: &reqwest::Client, endpoint: &str, mode: &str) {
 
 #[tokio::test]
 async fn test_declarative_mode_returns_403_on_user_create() {
-    let server = TestServer::builder()
-        .yaml_config()
-        .auth("IAMMK1", "IAMMS1")
-        .build()
-        .await;
+    let server = TestServer::builder().auth("IAMMK1", "IAMMS1").build().await;
     let admin = admin_http_client(&server.endpoint()).await;
 
     // Flip to declarative.
@@ -157,11 +153,7 @@ async fn test_declarative_mode_returns_403_on_user_create() {
 
 #[tokio::test]
 async fn test_declarative_mode_allows_user_list() {
-    let server = TestServer::builder()
-        .yaml_config()
-        .auth("IAMMK2", "IAMMS2")
-        .build()
-        .await;
+    let server = TestServer::builder().auth("IAMMK2", "IAMMS2").build().await;
     let admin = admin_http_client(&server.endpoint()).await;
 
     set_iam_mode(&admin, &server.endpoint(), "declarative").await;
@@ -181,11 +173,7 @@ async fn test_declarative_mode_allows_user_list() {
 
 #[tokio::test]
 async fn test_declarative_mode_blocks_group_mutations() {
-    let server = TestServer::builder()
-        .yaml_config()
-        .auth("IAMMK3", "IAMMS3")
-        .build()
-        .await;
+    let server = TestServer::builder().auth("IAMMK3", "IAMMS3").build().await;
     let admin = admin_http_client(&server.endpoint()).await;
 
     set_iam_mode(&admin, &server.endpoint(), "declarative").await;
@@ -210,11 +198,7 @@ async fn test_declarative_mode_blocks_group_mutations() {
 
 #[tokio::test]
 async fn test_declarative_mode_blocks_ext_auth_provider_mutations() {
-    let server = TestServer::builder()
-        .yaml_config()
-        .auth("IAMMK4", "IAMMS4")
-        .build()
-        .await;
+    let server = TestServer::builder().auth("IAMMK4", "IAMMS4").build().await;
     let admin = admin_http_client(&server.endpoint()).await;
 
     set_iam_mode(&admin, &server.endpoint(), "declarative").await;
@@ -240,11 +224,7 @@ async fn test_declarative_mode_blocks_ext_auth_provider_mutations() {
 
 #[tokio::test]
 async fn test_declarative_mode_does_not_block_config_routes() {
-    let server = TestServer::builder()
-        .yaml_config()
-        .auth("IAMMK5", "IAMMS5")
-        .build()
-        .await;
+    let server = TestServer::builder().auth("IAMMK5", "IAMMS5").build().await;
     let admin = admin_http_client(&server.endpoint()).await;
 
     set_iam_mode(&admin, &server.endpoint(), "declarative").await;
@@ -265,11 +245,7 @@ async fn test_declarative_mode_does_not_block_config_routes() {
 
 #[tokio::test]
 async fn test_declarative_to_gui_toggle_hot_restores_crud() {
-    let server = TestServer::builder()
-        .yaml_config()
-        .auth("IAMMK6", "IAMMS6")
-        .build()
-        .await;
+    let server = TestServer::builder().auth("IAMMK6", "IAMMS6").build().await;
     let admin = admin_http_client(&server.endpoint()).await;
 
     // Start in gui: create works (201 Created per REST conventions).
@@ -309,7 +285,6 @@ async fn test_declarative_to_gui_toggle_hot_restores_crud() {
 #[tokio::test]
 async fn test_mode_flip_cycle_preserves_session_and_chain() {
     let server = TestServer::builder()
-        .yaml_config()
         .auth("FLIP", "FLIPSECRET")
         .build()
         .await;

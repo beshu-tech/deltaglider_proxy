@@ -33,7 +33,7 @@ fn builder() -> common::TestServerBuilder {
     TestServer::builder()
         .bucket(BUCKET)
         .auth("TESTKEY", "TESTSECRET")
-        .bucket_policy(BUCKET, r#"public_prefixes = ["builds/"]"#)
+        .bucket_policy(BUCKET, r#"public_prefixes: ["builds/"]"#)
 }
 
 // ═══════════════════════════════════════════════════
@@ -177,7 +177,7 @@ async fn test_public_prefix_boundary() {
     let server = TestServer::builder()
         .bucket(BUCKET)
         .auth("TESTKEY", "TESTSECRET")
-        .bucket_policy(BUCKET, r#"public_prefixes = ["pub/"]"#)
+        .bucket_policy(BUCKET, r#"public_prefixes: ["pub/"]"#)
         .build()
         .await;
 
@@ -206,7 +206,7 @@ async fn test_public_multiple_prefixes() {
     let server = TestServer::builder()
         .bucket(BUCKET)
         .auth("TESTKEY", "TESTSECRET")
-        .bucket_policy(BUCKET, r#"public_prefixes = ["builds/", "docs/"]"#)
+        .bucket_policy(BUCKET, r#"public_prefixes: ["builds/", "docs/"]"#)
         .build()
         .await;
 

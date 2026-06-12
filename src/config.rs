@@ -4,7 +4,6 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -52,8 +51,8 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_CONFIG",
-        description: "Path to TOML config file",
-        example: "/etc/deltaglider_proxy/config.toml",
+        description: "Path to YAML config file",
+        example: "/etc/deltaglider_proxy/config.yaml",
         category: "Server",
     },
     // ── Delta engine ────────────────────────────────────────
@@ -300,11 +299,25 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
 ];
 
-/// Default config filename used by `--init` and legacy persistence (TOML).
-pub const DEFAULT_CONFIG_FILENAME: &str = "deltaglider_proxy.toml";
-
-/// Default YAML config filename (preferred for new deployments).
+/// Default YAML config filename.
 pub const DEFAULT_YAML_CONFIG_FILENAME: &str = "deltaglider_proxy.yaml";
+
+/// Error message for any attempt to load or persist a `.toml` config.
+/// TOML support was removed in v1.4.1; the message names the one-time
+/// conversion path so operators are never left guessing.
+pub const TOML_REMOVED_MSG: &str = "TOML configs are no longer supported (removed in v1.4.1). \
+     Convert with `deltaglider_proxy config migrate` on v1.4.0, then point the server at the \
+     YAML file.";
+
+/// True when the path carries a `.toml` extension (case-insensitive).
+/// Used to reject removed-format configs loudly instead of silently
+/// ignoring them — see [`TOML_REMOVED_MSG`].
+pub fn path_is_toml(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("toml"))
+}
 
 /// Placeholder substituted for secret VALUES that must keep their KEY visible in
 /// a redacted export (so the GUI can show *which* secrets exist while masking the
@@ -314,12 +327,14 @@ pub const DEFAULT_YAML_CONFIG_FILENAME: &str = "deltaglider_proxy.yaml";
 /// backend creds use `None`-omission instead (no key to preserve).
 pub const REDACTED_SENTINEL: &str = "__redacted__";
 
-/// Ordered list of default config file locations. YAML is preferred over TOML
-/// when both exist in the same directory.
+/// Ordered list of default config file locations. The `.toml` entries
+/// are TRIPWIRES, not loadable formats: a leftover TOML config found on
+/// disk (with no YAML earlier in the order) makes startup fail loudly
+/// with [`TOML_REMOVED_MSG`] instead of being silently ignored.
 pub const DEFAULT_CONFIG_SEARCH_PATHS: &[&str] = &[
     DEFAULT_YAML_CONFIG_FILENAME,
     "deltaglider_proxy.yml",
-    DEFAULT_CONFIG_FILENAME,
+    "deltaglider_proxy.toml",
     "/etc/deltaglider_proxy/config.yaml",
     "/etc/deltaglider_proxy/config.yml",
     "/etc/deltaglider_proxy/config.toml",
@@ -506,9 +521,6 @@ pub struct Config {
     /// Parsed from `admission.blocks:` in the sectioned YAML OR from
     /// `admission_blocks:` at the root of a flat-shape YAML (both
     /// shapes round-trip through `from_yaml_str` → `to_canonical_yaml`).
-    /// TOML loading carries the field as well, though
-    /// `admission_blocks:` typing is limited in TOML and operators
-    /// should prefer YAML for admission authoring.
     ///
     /// The admission chain builder ([`crate::admission::AdmissionChain::from_config_parts`])
     /// compiles these into runtime [`crate::admission::Match::Predicates`]
@@ -555,7 +567,7 @@ pub struct Config {
     /// provision a secret-free template → tweak via the GUI (persisted with
     /// refs intact) → export → put the export back into IaC.
     ///
-    /// Populated by [`Self::from_yaml_file`] / [`Self::from_toml_file`] and
+    /// Populated by [`Self::from_yaml_file`] and
     /// by the admin document-apply path (which expands against the SERVER
     /// environment and merges the previous config's provenance). Refs whose
     /// `:-default` was used are not recorded (see
@@ -1089,29 +1101,6 @@ pub fn env_bool(var: &str, default: bool) -> bool {
     }
 }
 
-/// Supported config file formats, inferred from file extension.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConfigFormat {
-    Toml,
-    Yaml,
-}
-
-impl ConfigFormat {
-    /// Infer the format from a file path's extension. Defaults to TOML for
-    /// unknown/missing extensions (backwards compatibility).
-    pub fn from_path(path: &str) -> Self {
-        match std::path::Path::new(path)
-            .extension()
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("yaml") | Some("yml") => ConfigFormat::Yaml,
-            _ => ConfigFormat::Toml,
-        }
-    }
-}
-
 /// Classification of a parsed YAML document's top-level shape.
 ///
 /// The [`ConfigShape::Mixed`] variant is a hard error: silently picking
@@ -1205,70 +1194,15 @@ fn classify_shape(doc: &serde_yaml::Value) -> ConfigShape {
 }
 
 impl Config {
-    /// Load configuration from a file. Dispatches on extension: `.yaml`/`.yml`
-    /// → YAML, anything else → TOML.
+    /// Load configuration from a file. YAML is the only supported format;
+    /// a `.toml` path fails loudly with [`TOML_REMOVED_MSG`] (operators
+    /// must learn the format is gone, not have their file silently
+    /// ignored). Any other extension is parsed as YAML.
     pub fn from_file(path: &str) -> Result<Self, ConfigError> {
-        match ConfigFormat::from_path(path) {
-            ConfigFormat::Yaml => Self::from_yaml_file(path),
-            ConfigFormat::Toml => Self::from_toml_file(path),
+        if path_is_toml(path) {
+            return Err(ConfigError::Parse(format!("{path}: {TOML_REMOVED_MSG}")));
         }
-    }
-
-    /// Parse TOML content into a validated `Config`.
-    ///
-    /// Runs the same `normalize_shorthands` pipeline as the YAML
-    /// loader, so callers (including `config lint`) see identical
-    /// semantic validation regardless of input format.
-    ///
-    /// Unlike [`Self::from_toml_file`], this does NOT emit the TOML
-    /// deprecation warning — the warning is the `from_toml_file`
-    /// caller's signal ("loaded TOML from disk"), not "parsed TOML
-    /// bytes" which also fires from lint / tests / in-process use.
-    pub fn from_toml_str(content: &str) -> Result<Self, ConfigError> {
-        let mut config: Config =
-            toml::from_str(content).map_err(|e| ConfigError::Parse(e.to_string()))?;
-        config.normalize_shorthands()?;
-        Ok(config)
-    }
-
-    /// Load configuration from a TOML file explicitly.
-    ///
-    /// **Deprecated**: TOML is being phased out in favor of YAML. Every
-    /// successful load emits a `tracing::warn!` pointing at the
-    /// migration tool. The flag `DGP_SILENCE_TOML_DEPRECATION=1`
-    /// silences the warning for environments that cannot upgrade
-    /// immediately (e.g. vendored config in a container image).
-    ///
-    /// Removal timeline: TOML support stays through the next two minor
-    /// releases (grace period for migration), then the loader returns
-    /// `ConfigError::Parse("TOML is no longer supported; use YAML")`
-    /// unconditionally. `deltaglider_proxy config migrate` converts in
-    /// one shot.
-    pub fn from_toml_file(path: &str) -> Result<Self, ConfigError> {
-        let content = std::fs::read_to_string(path).map_err(|e| ConfigError::Io(e.to_string()))?;
-        // Expand ${VAR} / ${VAR:-default} before parsing — see from_yaml_file.
-        let (content, env_refs) = expand_env_vars_recording(&content)?;
-        let mut config = Self::from_toml_str(&content)?;
-        config.env_refs = env_refs;
-
-        // Phase 6 deprecation warn. Fires exactly once per load (no
-        // per-request overhead — config loads only at startup and on
-        // explicit apply). Silencable via env var for operators who
-        // know about the deprecation and cannot upgrade yet.
-        if !env_bool("DGP_SILENCE_TOML_DEPRECATION", false) {
-            tracing::warn!(
-                target: "deltaglider_proxy::config",
-                path = %path,
-                "[config] TOML config format is deprecated. Convert to YAML with \
-                 `deltaglider_proxy config migrate {} --out deltaglider_proxy.yaml` \
-                 and point the server at the new file. TOML support will be removed \
-                 in a future minor release. Set DGP_SILENCE_TOML_DEPRECATION=1 to \
-                 suppress this warning.",
-                path
-            );
-        }
-
-        Ok(config)
+        Self::from_yaml_file(path)
     }
 
     /// Load configuration from a YAML file explicitly.
@@ -1330,8 +1264,8 @@ impl Config {
             } => {
                 return Err(ConfigError::Parse(format!(
                     "config YAML mixes legacy flat keys ({}) with Phase 3+ section headers ({}); \
-                     pick one shape. The canonical export (`deltaglider_proxy config migrate` / \
-                     the admin API `/config/export`) always emits the sectioned shape.",
+                     pick one shape. The canonical export (the admin API `/config/export`) \
+                     always emits the sectioned shape.",
                     flat_keys.join(", "),
                     section_keys.join(", "),
                 )));
@@ -1374,7 +1308,7 @@ impl Config {
         }
         // Validate admission blocks on EVERY load path — the sectioned
         // loader also calls `AdmissionSpec::validate` inside
-        // `into_flat`, but that bypasses flat-shape YAML and TOML.
+        // `into_flat`, but that bypasses flat-shape YAML.
         // Running validation here (after both paths converge) closes
         // the gap.
         if !self.admission_blocks.is_empty() {
@@ -1518,7 +1452,9 @@ impl Config {
     ///    through would redirect the admin-API persist to a CWD-relative
     ///    file the operator never asked for.
     /// 2. Otherwise, the first existing file in
-    ///    [`DEFAULT_CONFIG_SEARCH_PATHS`]. YAML is preferred over TOML.
+    ///    [`DEFAULT_CONFIG_SEARCH_PATHS`]. A leftover `.toml` match is
+    ///    returned too — the load path rejects it loudly rather than
+    ///    silently skipping it.
     pub fn resolve_config_path() -> Option<String> {
         if let Ok(path) = std::env::var("DGP_CONFIG") {
             if !path.is_empty() {
@@ -1535,8 +1471,17 @@ impl Config {
 
     /// Load configuration: file first, then env var overrides on top.
     /// Environment variables always take precedence over file-based config.
+    ///
+    /// A `.toml` config — whether pointed at via `DGP_CONFIG` or found on
+    /// the default search path — is a FATAL startup error (exit 1) with an
+    /// actionable message ([`TOML_REMOVED_MSG`]). Falling back to defaults
+    /// for a removed format would silently ignore the operator's intent.
     pub fn load() -> Self {
         let mut config = if let Ok(path) = std::env::var("DGP_CONFIG") {
+            if path_is_toml(&path) {
+                eprintln!("ERROR: DGP_CONFIG points at '{path}': {TOML_REMOVED_MSG}");
+                std::process::exit(1);
+            }
             match Self::from_file(&path) {
                 Ok(c) => c,
                 Err(e) => {
@@ -1548,10 +1493,15 @@ impl Config {
                 }
             }
         } else {
-            // Try default config file locations (YAML first, then TOML)
+            // Try default config file locations (YAML preferred; a
+            // leftover `.toml` is rejected loudly, never skipped).
             let mut found = None;
             for path in DEFAULT_CONFIG_SEARCH_PATHS {
                 if std::path::Path::new(path).exists() {
+                    if path_is_toml(path) {
+                        eprintln!("ERROR: found legacy TOML config '{path}': {TOML_REMOVED_MSG}");
+                        std::process::exit(1);
+                    }
                     if let Ok(config) = Self::from_file(path) {
                         found = Some(config);
                         break;
@@ -1901,7 +1851,7 @@ impl Config {
     }
 
     /// Ensure bootstrap_password_hash is set. Resolution order:
-    /// 1. Already set in config (env var or TOML) — use it.
+    /// 1. Already set in config (env var or config file) — use it.
     /// 2. Persisted state file `.deltaglider_bootstrap_hash` (or legacy `.deltaglider_admin_hash`).
     /// 3. Generate a random password, hash it, persist, and print to stderr.
     ///
@@ -2004,44 +1954,6 @@ impl Config {
             println!("# {}", entry.description);
             println!("{}={}", entry.name, entry.example);
         }
-    }
-
-    /// Print an example TOML config derived from `Config::default()`.
-    ///
-    /// The default section is programmatic (any new `#[serde(default)]` field
-    /// appears automatically). A commented-out S3 + TLS + auth variant is
-    /// appended so every option is visible.
-    pub fn print_example_toml() {
-        let default_cfg = Config::default();
-        let base = toml::to_string_pretty(&default_cfg).expect("Config serializes to TOML");
-        println!("# DeltaGlider Proxy — example configuration");
-        println!("# Generated from compiled-in defaults\n");
-        println!("{base}");
-
-        // Append commented-out advanced sections
-        let mut extra = String::new();
-        let _ = writeln!(
-            extra,
-            "# ── S3 backend (uncomment to switch from filesystem) ──"
-        );
-        let _ = writeln!(extra, "# [backend]");
-        let _ = writeln!(extra, "# type = \"s3\"");
-        let _ = writeln!(extra, "# endpoint = \"http://localhost:9000\"");
-        let _ = writeln!(extra, "# region = \"us-east-1\"");
-        let _ = writeln!(extra, "# force_path_style = true");
-        let _ = writeln!(extra, "# access_key_id = \"minioadmin\"");
-        let _ = writeln!(extra, "# secret_access_key = \"minioadmin\"");
-        let _ = writeln!(extra);
-        let _ = writeln!(extra, "# ── Proxy authentication (SigV4) ──");
-        let _ = writeln!(extra, "# access_key_id = \"my-access-key\"");
-        let _ = writeln!(extra, "# secret_access_key = \"my-secret-key\"");
-        let _ = writeln!(extra);
-        let _ = writeln!(extra, "# ── TLS ──");
-        let _ = writeln!(extra, "# [tls]");
-        let _ = writeln!(extra, "# enabled = true");
-        let _ = writeln!(extra, "# cert_path = \"/etc/ssl/certs/proxy.pem\"");
-        let _ = writeln!(extra, "# key_path = \"/etc/ssl/private/proxy-key.pem\"");
-        print!("{extra}");
     }
 
     /// Re-insert `${env:NAME}` references for every scalar whose value the
@@ -2345,29 +2257,17 @@ impl Config {
         export
     }
 
-    /// Serialize config to TOML string (strips infra secrets: bootstrap
-    /// hash and per-backend encryption keys). SigV4 credentials are kept —
-    /// see [`Self::redact_all_secrets`] for the fully-redacted export
-    /// variant.
-    ///
-    /// **Used for `GET /config/export` and `config migrate`** where the
-    /// emitted YAML/TOML is a downloadable artifact. The persist path
-    /// deliberately does NOT go through this function — see
-    /// [`Self::persist_to_file`] for the rationale.
-    pub fn to_toml_string(&self) -> Result<String, ConfigError> {
-        let export = self.with_env_refs_reinserted().redact_for_export();
-        toml::to_string_pretty(&export).map_err(|e| ConfigError::Parse(e.to_string()))
-    }
-
     /// Serialize config to canonical YAML string.
     ///
     /// Emits the Phase 3 **sectioned** shape: top-level `admission:` /
     /// `access:` / `storage:` / `advanced:` groups, with each group omitted
     /// when it equals its default (minimal-diff GitOps-friendly output).
-    /// Strips infra secrets (same policy as `to_toml_string`) so that
-    /// `config migrate`, `config show`, and the admin `/export` endpoint
-    /// never leak the bootstrap hash or the AES master key into disk
-    /// artifacts.
+    /// Strips infra secrets (bootstrap hash and per-backend encryption
+    /// keys; SigV4 credentials are kept — see [`Self::redact_all_secrets`]
+    /// for the fully-redacted variant) so that `config show` and the admin
+    /// `/export` endpoint never leak the bootstrap hash or the AES master
+    /// key into disk artifacts. The persist path deliberately does NOT go
+    /// through this function — see [`Self::persist_to_file`].
     ///
     /// The dual-shape deserializer accepts the legacy flat YAML too, but
     /// we only ever *emit* sectioned — legacy readers eventually disappear,
@@ -2389,19 +2289,15 @@ impl Config {
     /// is set, historical-encrypted reads error and new writes land
     /// plaintext. The operator's in-memory state is correct but their
     /// on-disk source of truth disagrees.
-    fn to_toml_string_for_persist(&self) -> Result<String, ConfigError> {
-        let export = self.with_env_refs_reinserted().redact_for_persist();
-        toml::to_string_pretty(&export).map_err(|e| ConfigError::Parse(e.to_string()))
-    }
-
     fn to_canonical_yaml_for_persist(&self) -> Result<String, ConfigError> {
         let export = self.with_env_refs_reinserted().redact_for_persist();
         let sectioned = crate::config_sections::SectionedConfig::from_flat(&export);
         serde_yaml::to_string(&sectioned).map_err(|e| ConfigError::Parse(e.to_string()))
     }
 
-    /// Persist the current config to a file atomically. Dispatches on
-    /// extension: `.yaml` / `.yml` writes YAML, anything else writes TOML.
+    /// Persist the current config to a file atomically. Always writes
+    /// canonical sectioned YAML; a `.toml` target path is refused with
+    /// [`TOML_REMOVED_MSG`] (TOML support was removed in v1.4.1).
     ///
     /// Atomicity is achieved by writing to a sibling tempfile on the same
     /// filesystem, `fsync()`-ing it to force the bytes to disk, then
@@ -2414,51 +2310,14 @@ impl Config {
     /// encryption keys. If the operator put keys in YAML, they stay
     /// there across admin-API mutations (which is an invariant the
     /// docs advertise — see `docs/product/reference/encryption-at-rest.md`).
-    ///
-    /// Returns `ConfigError::Parse` when the target is a TOML file but
-    /// the config holds YAML-only fields. Rationale: operator-authored
-    /// admission blocks (especially the tagged `Reject { type, status,
-    /// message }` action) and `iam_mode: declarative` don't round-trip
-    /// cleanly through TOML's `toml::to_string_pretty`, and a silent
-    /// half-persist (in-memory state updated, on-disk file missing the
-    /// new fields) is the worst failure mode possible — next restart
-    /// silently reverts.
     pub fn persist_to_file(&self, path: &str) -> Result<(), ConfigError> {
-        let format = ConfigFormat::from_path(path);
-        if matches!(format, ConfigFormat::Toml) {
-            self.check_toml_persistable(path)?;
+        if path_is_toml(path) {
+            return Err(ConfigError::Parse(format!(
+                "cannot persist config to `{path}`: {TOML_REMOVED_MSG}"
+            )));
         }
-        let content = match format {
-            ConfigFormat::Yaml => self.to_canonical_yaml_for_persist()?,
-            ConfigFormat::Toml => self.to_toml_string_for_persist()?,
-        };
+        let content = self.to_canonical_yaml_for_persist()?;
         atomic_write(std::path::Path::new(path), content.as_bytes())
-    }
-
-    /// Refuse to persist to TOML when the config holds fields that are
-    /// YAML-only (admission blocks with tagged actions, declarative IAM
-    /// mode). Called from `persist_to_file` before serialisation so
-    /// the operator sees an actionable error instead of a silent
-    /// half-persist.
-    fn check_toml_persistable(&self, path: &str) -> Result<(), ConfigError> {
-        let mut blockers: Vec<&'static str> = Vec::new();
-        if !self.admission_blocks.is_empty() {
-            blockers.push("admission.blocks");
-        }
-        if self.iam_mode != crate::config_sections::IamMode::default() {
-            blockers.push("access.iam_mode");
-        }
-        if blockers.is_empty() {
-            return Ok(());
-        }
-        Err(ConfigError::Parse(format!(
-            "cannot persist runtime config to `{path}` (TOML): the in-memory config holds \
-             YAML-only fields ({}). Convert the target file to YAML first — run \
-             `deltaglider_proxy config migrate {path} --out {path_yaml}` — and point the \
-             server at the new file, then re-apply.",
-            blockers.join(", "),
-            path_yaml = std::path::Path::new(path).with_extension("yaml").display()
-        )))
     }
 }
 
@@ -2545,7 +2404,7 @@ pub enum ConfigError {
 }
 
 /// Expand `${env:NAME}` and `${env:NAME:-default}` references in a config file
-/// against the process environment, BEFORE the YAML/TOML is parsed. This is the
+/// against the process environment, BEFORE the YAML is parsed. This is the
 /// in-process replacement for an external `envsubst` step — operators ship a
 /// secret-free config with `${env:...}` placeholders and inject the values as
 /// env vars.
@@ -2572,7 +2431,7 @@ pub enum ConfigError {
 /// `${}` is a [`ConfigError::BadEnvRef`]. Pure except for the env lookup, which
 /// is injected via `lookup` so the whole thing is unit-testable.
 ///
-/// **Substituted values are spliced as raw pre-parse text and are NOT YAML/TOML
+/// **Substituted values are spliced as raw pre-parse text and are NOT YAML
 /// -escaped.** A value containing a newline or control char is rejected
 /// ([`ConfigError::UnsafeEnvValue`]) because it could restructure the document;
 /// values with YAML indicators (leading `@`, `*`, `:` `, ` etc.) parse as
@@ -2695,7 +2554,7 @@ pub(crate) fn expand_env_with(
                             },
                         };
                         // The value is spliced as RAW pre-parse text, so a
-                        // newline/control char would inject YAML/TOML structure.
+                        // newline/control char would inject YAML structure.
                         // Fail loud rather than silently corrupt the document.
                         if has_unsafe_control_char(&resolved) {
                             return Err(ConfigError::UnsafeEnvValue(name.to_string()));
@@ -2728,7 +2587,7 @@ fn is_valid_env_name(name: &str) -> bool {
 }
 
 /// True if `s` contains a character that, spliced as raw pre-parse text into a
-/// YAML/TOML scalar, could break or restructure the document: any control char
+/// YAML scalar, could break or restructure the document: any control char
 /// EXCEPT tab (newlines, NUL, etc.). Tab is allowed (legitimate in some values).
 fn has_unsafe_control_char(s: &str) -> bool {
     s.chars().any(|c| c.is_control() && c != '\t')
@@ -3068,58 +2927,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_config_parse_filesystem() {
-        let toml = r#"
-            listen_addr = "0.0.0.0:8080"
-            max_delta_ratio = 0.3
-
-            [backend]
-            type = "filesystem"
-            path = "/var/lib/deltaglider_proxy"
-        "#;
-
-        let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(config.listen_addr.port(), 8080);
-        assert_eq!(config.max_delta_ratio, 0.3);
-
-        match config.backend {
-            BackendConfig::Filesystem { path } => {
-                assert_eq!(path, PathBuf::from("/var/lib/deltaglider_proxy"));
-            }
-            _ => panic!("Expected filesystem backend"),
-        }
-    }
-
-    #[test]
-    fn test_config_parse_s3() {
-        let toml = r#"
-            listen_addr = "0.0.0.0:8080"
-
-            [backend]
-            type = "s3"
-            endpoint = "http://localhost:9000"
-            region = "us-east-1"
-            force_path_style = true
-        "#;
-
-        let config: Config = toml::from_str(toml).unwrap();
-
-        match config.backend {
-            BackendConfig::S3 {
-                endpoint,
-                region,
-                force_path_style,
-                ..
-            } => {
-                assert_eq!(endpoint, Some("http://localhost:9000".to_string()));
-                assert_eq!(region, "us-east-1");
-                assert!(force_path_style);
-            }
-            _ => panic!("Expected S3 backend"),
-        }
-    }
-
     /// Ensure every env var read in `from_env()` is present in the registry.
     #[test]
     fn test_registry_completeness() {
@@ -3226,59 +3033,66 @@ mod tests {
 
     #[test]
     fn test_authentication_field_deserializes() {
-        let toml = r#"
-            listen_addr = "127.0.0.1:9000"
-            authentication = "none"
-
-            [backend]
-            type = "filesystem"
-            path = "/tmp/test"
-        "#;
-        let config: Config = toml::from_str(toml).unwrap();
+        let yaml = r#"
+listen_addr: "127.0.0.1:9000"
+authentication: "none"
+backend:
+  type: filesystem
+  path: /tmp/test
+"#;
+        let config = Config::from_yaml_str(yaml).unwrap();
         assert_eq!(
             config.authentication.as_deref(),
             Some("none"),
-            "authentication field must be deserialized from TOML"
+            "authentication field must be deserialized from YAML"
         );
     }
 
     #[test]
     fn test_authentication_field_absent_is_none() {
-        let toml = r#"
-            listen_addr = "127.0.0.1:9000"
-
-            [backend]
-            type = "filesystem"
-            path = "/tmp/test"
-        "#;
-        let config: Config = toml::from_str(toml).unwrap();
+        let yaml = r#"
+listen_addr: "127.0.0.1:9000"
+backend:
+  type: filesystem
+  path: /tmp/test
+"#;
+        let config = Config::from_yaml_str(yaml).unwrap();
         assert!(
             config.authentication.is_none(),
             "absent authentication field must be None"
         );
     }
 
+    // ── YAML-only format (TOML removed in v1.4.1) ────────────────────────
+
     #[test]
-    fn test_print_example_toml_is_valid() {
-        // The base TOML from Config::default() must round-trip
-        let default_cfg = Config::default();
-        let toml_str = toml::to_string_pretty(&default_cfg).unwrap();
-        let parsed: Config = toml::from_str(&toml_str).unwrap();
-        assert_eq!(parsed.listen_addr, default_cfg.listen_addr);
-        assert_eq!(parsed.cache_size_mb, default_cfg.cache_size_mb);
-        assert_eq!(parsed.max_delta_ratio, default_cfg.max_delta_ratio);
+    fn test_path_is_toml() {
+        assert!(path_is_toml("foo.toml"));
+        assert!(path_is_toml("foo.TOML"));
+        assert!(path_is_toml("/etc/deltaglider_proxy/config.toml"));
+        assert!(!path_is_toml("foo.yaml"));
+        assert!(!path_is_toml("foo.yml"));
+        assert!(!path_is_toml("foo"));
+        assert!(!path_is_toml("/etc/dgp.txt"));
+        assert!(!path_is_toml("toml")); // no extension — not a .toml path
     }
 
-    // ── YAML parity tests (Phase 0) ──────────────────────────────────────
-
     #[test]
-    fn test_config_format_from_path() {
-        assert_eq!(ConfigFormat::from_path("foo.yaml"), ConfigFormat::Yaml);
-        assert_eq!(ConfigFormat::from_path("foo.YAML"), ConfigFormat::Yaml);
-        assert_eq!(ConfigFormat::from_path("foo.yml"), ConfigFormat::Yaml);
-        assert_eq!(ConfigFormat::from_path("foo.toml"), ConfigFormat::Toml);
-        assert_eq!(ConfigFormat::from_path("foo"), ConfigFormat::Toml);
-        assert_eq!(ConfigFormat::from_path("/etc/dgp.txt"), ConfigFormat::Toml);
+    fn test_from_file_rejects_toml_with_actionable_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("cfg.toml");
+        std::fs::write(&toml_path, "listen_addr = \"127.0.0.1:9100\"\n").unwrap();
+        let err = Config::from_file(toml_path.to_str().unwrap())
+            .expect_err("loading a .toml config must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("TOML configs are no longer supported (removed in v1.4.1)"),
+            "error must say the format was removed, got: {msg}"
+        );
+        assert!(
+            msg.contains("config migrate") && msg.contains("v1.4.0"),
+            "error must name the one-time conversion path, got: {msg}"
+        );
     }
 
     #[test]
@@ -3339,59 +3153,24 @@ backend:
     }
 
     #[test]
-    fn test_yaml_toml_parity_filesystem() {
-        // Same semantic content in both formats → same in-memory shape.
-        let toml = r#"
-listen_addr = "127.0.0.1:9500"
-max_delta_ratio = 0.25
-cache_size_mb = 128
-metadata_cache_mb = 64
-
-[backend]
-type = "filesystem"
-path = "/srv/dgp"
-"#;
-        let yaml = r#"
-listen_addr: "127.0.0.1:9500"
-max_delta_ratio: 0.25
-cache_size_mb: 128
-metadata_cache_mb: 64
-backend:
-  type: filesystem
-  path: /srv/dgp
-"#;
-        let toml_cfg: Config = toml::from_str(toml).unwrap();
-        let yaml_cfg: Config = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(toml_cfg.listen_addr, yaml_cfg.listen_addr);
-        assert_eq!(toml_cfg.max_delta_ratio, yaml_cfg.max_delta_ratio);
-        assert_eq!(toml_cfg.cache_size_mb, yaml_cfg.cache_size_mb);
-        assert_eq!(toml_cfg.metadata_cache_mb, yaml_cfg.metadata_cache_mb);
-        match (toml_cfg.backend, yaml_cfg.backend) {
-            (BackendConfig::Filesystem { path: a }, BackendConfig::Filesystem { path: b }) => {
-                assert_eq!(a, b)
-            }
-            _ => panic!("Both backends should be filesystem"),
-        }
-    }
-
-    #[test]
-    fn test_from_file_dispatches_by_extension() {
+    fn test_from_file_parses_yaml_for_any_non_toml_extension() {
         let dir = tempfile::tempdir().unwrap();
-        let toml_path = dir.path().join("a.toml");
-        std::fs::write(&toml_path, "listen_addr = \"127.0.0.1:9100\"\n").unwrap();
-        let cfg = Config::from_file(toml_path.to_str().unwrap()).unwrap();
-        assert_eq!(cfg.listen_addr.port(), 9100);
-
         let yaml_path = dir.path().join("b.yaml");
         std::fs::write(&yaml_path, "listen_addr: \"127.0.0.1:9200\"\n").unwrap();
         let cfg = Config::from_file(yaml_path.to_str().unwrap()).unwrap();
         assert_eq!(cfg.listen_addr.port(), 9200);
 
-        // .yml also dispatches to YAML
+        // .yml also parses as YAML
         let yml_path = dir.path().join("c.yml");
         std::fs::write(&yml_path, "listen_addr: \"127.0.0.1:9300\"\n").unwrap();
         let cfg = Config::from_file(yml_path.to_str().unwrap()).unwrap();
         assert_eq!(cfg.listen_addr.port(), 9300);
+
+        // Unknown extensions parse as YAML too (YAML is the only format).
+        let other_path = dir.path().join("d.conf");
+        std::fs::write(&other_path, "listen_addr: \"127.0.0.1:9400\"\n").unwrap();
+        let cfg = Config::from_file(other_path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.listen_addr.port(), 9400);
     }
 
     #[test]
@@ -3422,7 +3201,7 @@ backend:
 
     #[test]
     fn test_canonical_yaml_strips_infra_secrets() {
-        // to_canonical_yaml matches to_toml_string: infra secrets only.
+        // to_canonical_yaml strips infra secrets only.
         // Full redaction (incl. SigV4 creds) goes through redact_all_secrets.
         let cfg = Config {
             access_key_id: Some("AKIAKEEPME".into()),
@@ -3838,12 +3617,12 @@ encryption_key: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
     }
 
     #[test]
-    fn test_persist_to_file_dispatches_by_extension() {
+    fn test_persist_to_file_writes_sectioned_yaml() {
         let dir = tempfile::tempdir().unwrap();
         // Deliberately non-default listen_addr so the sectioned canonical
         // YAML exporter surfaces an `advanced:` block — a default Config
         // round-trips to an (intentionally) empty YAML document, which
-        // would make this dispatcher test vacuous.
+        // would make this test vacuous.
         let cfg = Config {
             listen_addr: "127.0.0.1:9099".parse().unwrap(),
             ..Config::default()
@@ -3861,58 +3640,36 @@ encryption_key: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
             "sectioned YAML must group listen_addr under `advanced:`, got: {content}"
         );
 
-        let toml_path = dir.path().join("out.toml");
-        cfg.persist_to_file(toml_path.to_str().unwrap()).unwrap();
-        let content = std::fs::read_to_string(&toml_path).unwrap();
+        // A non-.yaml/.yml extension still writes YAML content (YAML is
+        // the only persist format).
+        let other_path = dir.path().join("out.conf");
+        cfg.persist_to_file(other_path.to_str().unwrap()).unwrap();
+        let content = std::fs::read_to_string(&other_path).unwrap();
         assert!(
-            content.contains("listen_addr ="),
-            "TOML output must use = separator, got: {content}"
+            content.contains("listen_addr:"),
+            "non-YAML extension must still receive YAML content, got: {content}"
         );
     }
 
     #[test]
-    fn test_persist_to_toml_rejects_admission_blocks() {
-        // H4 from deep correctness review: refuse to persist sectioned-
-        // only fields (admission blocks / iam_mode: declarative) to a
-        // TOML target. Silent half-persist is the worst possible
-        // failure mode — the in-memory runtime has the new state but
-        // the on-disk file reverts on next restart.
-        use crate::admission::spec::{ActionSpec, AdmissionBlockSpec, MatchSpec, SimpleAction};
-        let cfg = Config {
-            admission_blocks: vec![AdmissionBlockSpec {
-                name: "deny-bad".into(),
-                match_: MatchSpec::default(),
-                action: ActionSpec::Simple(SimpleAction::Deny),
-            }],
-            ..Config::default()
-        };
+    fn test_persist_to_toml_path_rejected_with_actionable_message() {
+        // TOML persistence was removed in v1.4.1. Writing YAML bytes into
+        // a `.toml` file would be a trap on the next load, so the persist
+        // refuses with the same actionable message as the load path.
+        let cfg = Config::default();
         let dir = tempfile::tempdir().unwrap();
         let toml_path = dir.path().join("out.toml");
         let err = cfg
             .persist_to_file(toml_path.to_str().unwrap())
-            .expect_err("persist to TOML with admission blocks must fail");
+            .expect_err("persist to a .toml path must fail");
         let msg = format!("{err}");
         assert!(
-            msg.contains("admission.blocks") && msg.contains("YAML"),
-            "error must name the offending field + point at YAML, got: {msg}"
+            msg.contains("TOML configs are no longer supported (removed in v1.4.1)"),
+            "error must say the format was removed, got: {msg}"
         );
-    }
-
-    #[test]
-    fn test_persist_to_toml_rejects_declarative_iam_mode() {
-        let cfg = Config {
-            iam_mode: crate::config_sections::IamMode::Declarative,
-            ..Config::default()
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let toml_path = dir.path().join("out.toml");
-        let err = cfg
-            .persist_to_file(toml_path.to_str().unwrap())
-            .expect_err("persist to TOML with iam_mode: declarative must fail");
-        let msg = format!("{err}");
         assert!(
-            msg.contains("access.iam_mode") && msg.contains("YAML"),
-            "error must name the offending field + point at YAML, got: {msg}"
+            !toml_path.exists(),
+            "no file may be created on a refused persist"
         );
     }
 
@@ -3935,25 +3692,6 @@ encryption_key: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
         let content = std::fs::read_to_string(&yaml_path).unwrap();
         assert!(content.contains("deny-bad"));
         assert!(content.contains("iam_mode: declarative"));
-    }
-
-    #[test]
-    fn test_example_toml_migrates_to_valid_yaml() {
-        // The canonical example file must round-trip through migrate.
-        let example_path = "deltaglider_proxy.toml.example";
-        if !std::path::Path::new(example_path).exists() {
-            // Test is best-effort when run outside the repo root; skip silently.
-            return;
-        }
-        let toml_cfg = Config::from_file(example_path).unwrap();
-        let yaml = toml_cfg.to_canonical_yaml().unwrap();
-        // Round-trip goes through the dual-shape deserializer: the canonical
-        // exporter emits sectioned YAML, and only `from_yaml_str` knows how
-        // to collapse it back into the flat in-memory Config.
-        let yaml_cfg = Config::from_yaml_str(&yaml).unwrap();
-        assert_eq!(toml_cfg.listen_addr, yaml_cfg.listen_addr);
-        assert_eq!(toml_cfg.max_delta_ratio, yaml_cfg.max_delta_ratio);
-        assert_eq!(toml_cfg.cache_size_mb, yaml_cfg.cache_size_mb);
     }
 
     // ── Correctness regressions (post Phase-1 audit) ────────────────────

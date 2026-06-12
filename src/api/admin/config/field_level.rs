@@ -82,7 +82,7 @@ pub struct ConfigResponse {
     // The UI uses this to render a banner when declarative mode is
     // active (IAM edits blocked) and to drive a toggle.
     iam_mode: crate::config_sections::IamMode,
-    // Fields that differ from the TOML config file on disk
+    // Fields that differ from the config file on disk
     tainted_fields: Vec<String>,
 }
 
@@ -309,7 +309,7 @@ pub struct ConfigUpdateResponse {
     requires_restart: bool,
 }
 
-/// Compare the runtime config against the TOML file on disk.
+/// Compare the runtime config against the config file on disk.
 /// Returns a list of field names where the runtime value differs from disk.
 fn compute_tainted_fields(runtime: &crate::config::Config) -> Vec<String> {
     let disk = match crate::config::Config::resolve_config_path() {

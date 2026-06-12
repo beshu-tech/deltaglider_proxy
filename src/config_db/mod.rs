@@ -35,7 +35,7 @@ mod users;
 
 /// Compute the path to the IAM config database file.
 ///
-/// Derives the directory from `DGP_CONFIG` (parent of the TOML config file)
+/// Derives the directory from `DGP_CONFIG` (parent of the config file)
 /// or falls back to the current working directory.
 pub fn config_db_path() -> PathBuf {
     let db_dir = std::env::var("DGP_CONFIG")

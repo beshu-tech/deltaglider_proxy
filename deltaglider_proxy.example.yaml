@@ -15,9 +15,8 @@
 # Every section is optional — a bare `storage: { filesystem: /var/dgp }`
 # is a complete, runnable config.
 #
-# Canonical export (`deltaglider_proxy config migrate` or the admin API
-# `/config/export`) always emits this shape and omits default-valued
-# sections.
+# Canonical export (the admin API `/config/export`) always emits this
+# shape and omits default-valued sections.
 
 
 # ── storage — single-backend shorthand (T1 five-line deployment) ────

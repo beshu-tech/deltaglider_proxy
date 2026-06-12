@@ -191,7 +191,7 @@ impl TestProxyServer {
 
         // Point DGP_CONFIG to temp dir so each test gets its own config DB
         // (prevents interference from .db.bak files left by other tests)
-        let config_path = data_dir.path().join("deltaglider_proxy.toml");
+        let config_path = data_dir.path().join("deltaglider_proxy.yaml");
         std::fs::write(&config_path, "").expect("Failed to create empty config");
 
         let process = cmd

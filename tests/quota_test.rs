@@ -44,7 +44,7 @@ async fn test_quota_put_under_limit() {
     let server = TestServer::builder()
         .bucket(BUCKET)
         .auth("TESTKEY", "TESTSECRET")
-        .bucket_policy(BUCKET, "quota_bytes = 1048576")
+        .bucket_policy(BUCKET, "quota_bytes: 1048576")
         .build()
         .await;
 
@@ -63,7 +63,7 @@ async fn test_quota_zero_blocks_all_writes() {
     let server = TestServer::builder()
         .bucket(BUCKET)
         .auth("TESTKEY2", "TESTSECRET2")
-        .bucket_policy(BUCKET, "quota_bytes = 0")
+        .bucket_policy(BUCKET, "quota_bytes: 0")
         .build()
         .await;
 
@@ -97,7 +97,7 @@ async fn test_quota_first_put_optimistic() {
     let server = TestServer::builder()
         .bucket(BUCKET)
         .auth("TESTKEY4", "TESTSECRET4")
-        .bucket_policy(BUCKET, "quota_bytes = 1") // 1 byte quota
+        .bucket_policy(BUCKET, "quota_bytes: 1") // 1 byte quota
         .build()
         .await;
 
@@ -123,7 +123,7 @@ async fn test_quota_second_put_enforced() {
     let server = TestServer::builder()
         .bucket(BUCKET)
         .auth("TESTKEY5", "TESTSECRET5")
-        .bucket_policy(BUCKET, "quota_bytes = 10000") // 10 KB
+        .bucket_policy(BUCKET, "quota_bytes: 10000") // 10 KB
         .env("DGP_USAGE_CACHE_TTL_SECS", "1")
         .build()
         .await;
@@ -157,7 +157,7 @@ async fn test_quota_delete_frees_space() {
     let server = TestServer::builder()
         .bucket(BUCKET)
         .auth("TESTKEY6", "TESTSECRET6")
-        .bucket_policy(BUCKET, "quota_bytes = 10000") // 10 KB
+        .bucket_policy(BUCKET, "quota_bytes: 10000") // 10 KB
         .env("DGP_USAGE_CACHE_TTL_SECS", "1")
         .build()
         .await;
@@ -215,7 +215,7 @@ async fn test_quota_zero_blocks_copy_object() {
     let server = TestServer::builder()
         .bucket(BUCKET)
         .auth("COPYKEY", "COPYSECRET")
-        .bucket_policy(BUCKET, "quota_bytes = 0") // freeze
+        .bucket_policy(BUCKET, "quota_bytes: 0") // freeze
         .env("DGP_USAGE_CACHE_TTL_SECS", "1")
         .build()
         .await;
@@ -249,7 +249,7 @@ async fn test_quota_zero_blocks_complete_multipart_upload() {
     let server = TestServer::builder()
         .bucket(BUCKET)
         .auth("MPUKEY", "MPUSECRET")
-        .bucket_policy(BUCKET, "quota_bytes = 0") // freeze
+        .bucket_policy(BUCKET, "quota_bytes: 0") // freeze
         .env("DGP_USAGE_CACHE_TTL_SECS", "1")
         .build()
         .await;

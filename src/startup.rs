@@ -922,7 +922,7 @@ pub async fn init_config_sync(
     let sync_bucket = match &config.config_sync_bucket {
         Some(b) if !b.is_empty() => b.clone(),
         _ => {
-            info!("Config DB S3 sync: disabled (set config_sync_bucket in TOML or DGP_CONFIG_SYNC_BUCKET env var)");
+            info!("Config DB S3 sync: disabled (set config_sync_bucket in the config file or DGP_CONFIG_SYNC_BUCKET env var)");
             return None;
         }
     };

@@ -43,7 +43,7 @@ async fn server_with_public_prefix(
     let server = TestServer::builder()
         .bucket(bucket)
         .auth("admin", "admin-secret-1234567890")
-        .bucket_policy(bucket, &format!("public_prefixes = [\"{public_prefix}\"]"))
+        .bucket_policy(bucket, &format!("public_prefixes: [\"{public_prefix}\"]"))
         .build()
         .await;
 

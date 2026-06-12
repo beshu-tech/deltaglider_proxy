@@ -66,10 +66,6 @@ struct Cli {
     #[arg(long)]
     show_env: bool,
 
-    /// Print an example TOML config with all options, then exit
-    #[arg(long)]
-    show_toml: bool,
-
     /// Optional subcommand. When present, the server is not started — the
     /// subcommand runs to completion and the process exits.
     #[command(subcommand)]
@@ -91,7 +87,7 @@ struct Cli {
 /// `dg='deltaglider_proxy s3'`.
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Configuration-file tooling (migrate, schema, apply, ...).
+    /// Configuration-file tooling (lint, schema, apply, ...).
     Config {
         #[command(subcommand)]
         action: ConfigCommand,
@@ -138,15 +134,6 @@ enum S3Command {
 
 #[derive(Subcommand, Debug)]
 enum ConfigCommand {
-    /// Convert a TOML (or YAML) config file to canonical YAML on stdout.
-    Migrate {
-        /// Input config file (TOML or YAML).
-        #[arg(value_name = "INPUT")]
-        input: String,
-        /// Write output to a file instead of stdout.
-        #[arg(long, value_name = "OUTPUT")]
-        out: Option<String>,
-    },
     /// Emit the JSON Schema for the canonical Config shape (for CI / YAML LSP).
     Schema {
         /// Write schema to a file instead of stdout.
@@ -180,7 +167,7 @@ enum ConfigCommand {
     /// path/to/config.yaml` in a pre-merge hook catches operator
     /// typos before they reach production.
     Lint {
-        /// Config file to validate (YAML or TOML).
+        /// Config file to validate (YAML).
         #[arg(value_name = "FILE")]
         file: String,
     },
@@ -231,11 +218,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Subcommand dispatch (runs synchronously, exits before tokio runtime).
     if let Some(ref cmd) = cli.command {
         use deltaglider_proxy::cli::config::{
-            admission_trace, apply, defaults, lint, migrate, schema, AdminClientOpts, TraceArgs,
+            admission_trace, apply, defaults, lint, schema, AdminClientOpts, TraceArgs,
         };
         let code = match cmd {
             Command::Config { action } => match action {
-                ConfigCommand::Migrate { input, out } => migrate(input, out.as_deref()),
                 ConfigCommand::Schema { out } => schema(out.as_deref()),
                 ConfigCommand::Apply {
                     file,
@@ -317,7 +303,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Interactive config wizard (runs synchronously, exits before tokio runtime)
     if cli.init {
         match deltaglider_proxy::init::run_interactive_init(
-            deltaglider_proxy::config::DEFAULT_CONFIG_FILENAME,
+            deltaglider_proxy::config::DEFAULT_YAML_CONFIG_FILENAME,
         ) {
             Ok(()) => std::process::exit(0),
             Err(e) => {
@@ -368,13 +354,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(0);
     }
 
-    // Dump env vars or example TOML and exit (no runtime needed)
+    // Dump env vars and exit (no runtime needed)
     if cli.show_env {
         Config::print_env_vars();
-        std::process::exit(0);
-    }
-    if cli.show_toml {
-        Config::print_example_toml();
         std::process::exit(0);
     }
 

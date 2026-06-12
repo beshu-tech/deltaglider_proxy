@@ -22,9 +22,8 @@
 //! The public [`Config`](crate::config::Config) deserializer uses a
 //! [`#[serde(untagged)]`] enum that tries the sectioned shape first and
 //! falls back to the historical flat shape. Both shapes produce the same
-//! in-memory `Config`. Serialization emits the sectioned shape for YAML
-//! (via [`SectionedConfig::from_flat`] + `to_string`); TOML persistence
-//! keeps the flat shape because TOML is deprecation-bound.
+//! in-memory `Config`. Serialization always emits the sectioned shape
+//! (via [`SectionedConfig::from_flat`] + `to_string`).
 //!
 //! # Why not `#[serde(flatten)]`?
 //!

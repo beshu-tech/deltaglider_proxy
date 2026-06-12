@@ -185,15 +185,9 @@ advanced:
 deltaglider_proxy config lint deltaglider_proxy.yaml
 ```
 
-**Migration from TOML**: TOML still loads but emits a deprecation warning on every startup. Convert with:
+**TOML support was removed in v1.4.1** — YAML is the only config format. A `.toml` config makes the proxy fail at startup with an actionable error. Still on TOML? Run `deltaglider_proxy config migrate` on v1.4.0 to convert, then upgrade. See [How to upgrade the proxy](docs/product/how-to/upgrade.md).
 
-```sh
-deltaglider_proxy config migrate deltaglider_proxy.toml --out deltaglider_proxy.yaml
-```
-
-Silence the warning mid-migration with `DGP_SILENCE_TOML_DEPRECATION=1`. See [How to upgrade the proxy](docs/product/how-to/upgrade.md).
-
-**Examples**: [deltaglider_proxy.example.yaml](deltaglider_proxy.example.yaml) (canonical). The legacy [deltaglider_proxy.toml.example](deltaglider_proxy.toml.example) is kept for reference only.
+**Example**: [deltaglider_proxy.example.yaml](deltaglider_proxy.example.yaml).
 
 **Admin API for GitOps** — full-document apply, per-section PATCH (RFC 7396 merge-patch), JSON Schema export, and an admission-chain trace endpoint. See the [admin API reference](docs/product/reference/admin-api.md).
 

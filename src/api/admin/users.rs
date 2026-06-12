@@ -64,7 +64,7 @@ fn mask_user(user: &IamUser) -> IamUser {
 /// Rebuild the in-memory IamIndex from the database and store it.
 /// If no users exist, restores Disabled mode to avoid locking out all access.
 /// On first IAM user creation (Legacy -> IAM transition), auto-migrates the
-/// legacy TOML credentials as a "legacy-admin" user with full access so
+/// legacy config-file credentials as a "legacy-admin" user with full access so
 /// existing S3 clients don't break.
 pub(super) fn rebuild_iam_index(
     db: &ConfigDb,

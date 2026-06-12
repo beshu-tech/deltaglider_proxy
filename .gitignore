@@ -46,7 +46,10 @@ data/
 !marketing/src/data/
 !marketing/src/data/**
 
-# Config (contains secrets/credentials)
+# Config (contains secrets/credentials). The .toml form is a pre-v1.4.1
+# leftover (TOML support removed) but may still hold secrets — keep ignored.
+deltaglider_proxy.yaml
+deltaglider_proxy.yml
 deltaglider_proxy.toml
 .deltaglider_admin_hash
 .deltaglider_bootstrap_hash

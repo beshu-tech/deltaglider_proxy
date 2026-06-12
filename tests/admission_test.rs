@@ -366,11 +366,7 @@ async fn apply_admission_yaml(
 
 #[tokio::test]
 async fn test_operator_deny_block_produces_deny_decision() {
-    let server = TestServer::builder()
-        .yaml_config()
-        .auth("DENYK1", "DENYS1")
-        .build()
-        .await;
+    let server = TestServer::builder().auth("DENYK1", "DENYS1").build().await;
     let admin = admin_http_client(&server.endpoint()).await;
 
     apply_admission_yaml(
@@ -426,11 +422,7 @@ admission:
 
 #[tokio::test]
 async fn test_operator_reject_block_produces_reject_with_status() {
-    let server = TestServer::builder()
-        .yaml_config()
-        .auth("REJK1", "REJS1")
-        .build()
-        .await;
+    let server = TestServer::builder().auth("REJK1", "REJS1").build().await;
     let admin = admin_http_client(&server.endpoint()).await;
 
     apply_admission_yaml(
@@ -479,11 +471,7 @@ async fn test_operator_deny_short_circuits_live_s3_path() {
     // Because the test server won't have that env set, this test
     // exercises the path_glob + authenticated predicates instead — they
     // don't need source_ip to fire.
-    let server = TestServer::builder()
-        .yaml_config()
-        .auth("DENYLK", "DENYLS")
-        .build()
-        .await;
+    let server = TestServer::builder().auth("DENYLK", "DENYLS").build().await;
     let admin = admin_http_client(&server.endpoint()).await;
 
     apply_admission_yaml(
@@ -528,11 +516,7 @@ admission:
 
 #[tokio::test]
 async fn test_operator_reject_short_circuits_live_s3_path() {
-    let server = TestServer::builder()
-        .yaml_config()
-        .auth("REJLK", "REJLS")
-        .build()
-        .await;
+    let server = TestServer::builder().auth("REJLK", "REJLS").build().await;
     let admin = admin_http_client(&server.endpoint()).await;
 
     apply_admission_yaml(
@@ -564,11 +548,7 @@ admission:
 
 #[tokio::test]
 async fn test_operator_path_glob_predicate_via_trace() {
-    let server = TestServer::builder()
-        .yaml_config()
-        .auth("PGK1", "PGS1")
-        .build()
-        .await;
+    let server = TestServer::builder().auth("PGK1", "PGS1").build().await;
     let admin = admin_http_client(&server.endpoint()).await;
 
     apply_admission_yaml(
@@ -625,11 +605,7 @@ async fn test_admission_blocks_roundtrip_through_export_apply() {
     // GitOps dogfood for Phase 3b.2.b: apply a block, export the
     // canonical YAML, re-apply it, trace once more — behavior
     // unchanged on the second apply.
-    let server = TestServer::builder()
-        .yaml_config()
-        .auth("RTK1", "RTS1")
-        .build()
-        .await;
+    let server = TestServer::builder().auth("RTK1", "RTS1").build().await;
     let admin = admin_http_client(&server.endpoint()).await;
 
     let original_yaml = r#"
@@ -700,11 +676,7 @@ admission:
 /// `public-prefix:...` — H3 guards that).
 #[tokio::test]
 async fn test_operator_block_coexists_with_bucket_public_shorthand() {
-    let server = TestServer::builder()
-        .yaml_config()
-        .auth("COEXK", "COEXS")
-        .build()
-        .await;
+    let server = TestServer::builder().auth("COEXK", "COEXS").build().await;
     let admin = admin_http_client(&server.endpoint()).await;
 
     // Fetch current config and merge: add a public bucket AND an

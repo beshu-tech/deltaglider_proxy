@@ -14,6 +14,8 @@ dist/
 
 # Runtime data & secrets
 data/
+deltaglider_proxy.yaml
+deltaglider_proxy.yml
 deltaglider_proxy.toml
 .deltaglider_admin_hash
 .env

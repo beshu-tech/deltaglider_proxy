@@ -149,7 +149,6 @@ async fn declarative_iam_is_reconciled_at_startup_no_apply() {
 async fn reconcile_gui_to_declarative_creates_users_and_groups() {
     let server = TestServer::builder()
         .auth("BOOTKEY1", "BOOTSECRET1")
-        .yaml_config()
         .build()
         .await;
     let admin = admin_http_client(&server.endpoint()).await;
@@ -233,7 +232,6 @@ async fn reconcile_gui_to_declarative_creates_users_and_groups() {
 async fn reconcile_second_apply_updates_and_deletes() {
     let server = TestServer::builder()
         .auth("BOOTKEY2", "BOOTSECRET2")
-        .yaml_config()
         .build()
         .await;
     let admin = admin_http_client(&server.endpoint()).await;
@@ -339,7 +337,6 @@ async fn reconcile_second_apply_updates_and_deletes() {
 async fn reconcile_rejects_gui_to_declarative_empty_yaml() {
     let server = TestServer::builder()
         .auth("BOOTKEY3", "BOOTSECRET3")
-        .yaml_config()
         .build()
         .await;
     let admin = admin_http_client(&server.endpoint()).await;
@@ -416,7 +413,6 @@ async fn reconcile_rejects_gui_to_declarative_empty_yaml() {
 async fn reconcile_declarative_to_gui_preserves_db() {
     let server = TestServer::builder()
         .auth("BOOTKEY4", "BOOTSECRET4")
-        .yaml_config()
         .build()
         .await;
     let admin = admin_http_client(&server.endpoint()).await;
@@ -472,7 +468,6 @@ async fn reconcile_declarative_to_gui_preserves_db() {
 async fn reconcile_atomic_rollback_on_validation_error() {
     let server = TestServer::builder()
         .auth("BOOTKEY5", "BOOTSECRET5")
-        .yaml_config()
         .build()
         .await;
     let admin = admin_http_client(&server.endpoint()).await;
@@ -558,7 +553,6 @@ async fn reconcile_atomic_rollback_on_validation_error() {
 async fn reconcile_idempotent_reapply_is_noop() {
     let server = TestServer::builder()
         .auth("BOOTKEY6", "BOOTSECRET6")
-        .yaml_config()
         .build()
         .await;
     let admin = admin_http_client(&server.endpoint()).await;
@@ -641,7 +635,6 @@ async fn export_declarative_iam_round_trips_as_noop() {
     // a no-op. This is the "Workflow A" button's reason for existing.
     let server = TestServer::builder()
         .auth("BOOTKEY_EXPORT", "BOOTSECRET_EXPORT")
-        .yaml_config()
         .build()
         .await;
     let admin = admin_http_client(&server.endpoint()).await;
@@ -798,7 +791,6 @@ async fn export_declarative_iam_round_trips_as_noop() {
 async fn validate_surfaces_declarative_iam_preview_line() {
     let server = TestServer::builder()
         .auth("BOOTKEY_PREVIEW", "BOOTSECRET_PREVIEW")
-        .yaml_config()
         .build()
         .await;
     let admin = admin_http_client(&server.endpoint()).await;
@@ -856,7 +848,6 @@ async fn validate_surfaces_declarative_iam_preview_line() {
 async fn validate_empty_yaml_declarative_flip_previews_refusal() {
     let server = TestServer::builder()
         .auth("BOOTKEY_PREVIEW2", "BOOTSECRET_PREVIEW2")
-        .yaml_config()
         .build()
         .await;
     let admin = admin_http_client(&server.endpoint()).await;
@@ -912,7 +903,6 @@ async fn validate_empty_yaml_declarative_flip_previews_refusal() {
 async fn declarative_mode_blocks_admin_api_iam_mutations() {
     let server = TestServer::builder()
         .auth("BOOTKEY7", "BOOTSECRET7")
-        .yaml_config()
         .build()
         .await;
     let admin = admin_http_client(&server.endpoint()).await;

@@ -2,8 +2,8 @@
 
 //! Interactive configuration wizard for `--init` flag.
 //!
-//! Walks the user through creating a `deltaglider_proxy.toml` file,
-//! similar to `npm init` or `cargo init`.
+//! Walks the user through creating a `deltaglider_proxy.yaml` file
+//! (canonical sectioned shape), similar to `npm init` or `cargo init`.
 
 use crate::config::{BackendConfig, Config, ConfigError, TlsConfig};
 use std::io::{self, BufRead, Write};
@@ -330,11 +330,11 @@ pub fn run_init_inner(
         env_refs: Default::default(),
     };
 
-    // Show summary
+    // Show summary (canonical sectioned YAML — the only config format)
     writeln!(writer)?;
     writeln!(writer, "--- Generated Configuration ---")?;
-    let toml_str = config.to_toml_string()?;
-    writeln!(writer, "{toml_str}")?;
+    let yaml_str = config.to_canonical_yaml()?;
+    writeln!(writer, "{yaml_str}")?;
 
     // Confirm write
     let do_write = prompt_yes_no(reader, writer, &format!("Write to {output_path}?"), true)?;
@@ -383,9 +383,20 @@ mod tests {
         let (output, file) = run_wizard(input);
         assert!(output.contains("DeltaGlider Proxy"));
         let file = file.expect("file should be written");
-        assert!(file.contains("listen_addr"));
-        assert!(file.contains("filesystem"));
-        assert!(file.contains("log_level"));
+        // The wizard writes canonical sectioned YAML; default-valued fields
+        // are omitted, so assert semantically via the YAML loader.
+        let cfg = crate::config::Config::from_yaml_str(&file)
+            .expect("wizard output must be loadable YAML");
+        assert!(
+            matches!(cfg.backend, BackendConfig::Filesystem { .. }),
+            "default backend must be filesystem, got: {file}"
+        );
+        // Wizard default (0.5) differs from the config default (0.75), so
+        // it must survive the omit-defaults canonical exporter.
+        assert!(
+            (cfg.max_delta_ratio - 0.5).abs() < f32::EPSILON,
+            "wizard max_delta_ratio default must persist, got: {file}"
+        );
     }
 
     #[test]
