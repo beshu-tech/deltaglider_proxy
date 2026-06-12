@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.4.1 — 2026-06-12
+
 ### Removed (breaking)
 
 - **TOML config support removed entirely.** YAML is the only config
