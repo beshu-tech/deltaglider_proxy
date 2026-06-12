@@ -1,12 +1,14 @@
 ---
-// /trial — v5 plan §4.6.
-// 30-day production support trial. The software is GPL-3.0 and
-// free regardless; the trial is for the support relationship
-// (eng Slack + SLA + arch review call). Frame C: trial the
-// relationship, not the software.
+// /trial — 30-day production support trial. The software is GPL-3.0 and
+// free regardless; the trial is for the support relationship (eng Slack +
+// SLA + arch review call). Frame C: trial the relationship, not the
+// software. v2 layout: hero illustration (Gemini-generated, brand
+// palette, /illustrations/trial-pairing.jpg), glyph cards for what's
+// included, a visual 30-day timeline, honesty columns.
 
 import BaseLayout from '../layouts/BaseLayout.astro';
 import JsonLd from '../components/JsonLd.astro';
+import Glyph from '../components/Glyph.astro';
 import {
   webPageSchema,
   breadcrumbListSchema,
@@ -16,6 +18,57 @@ import {
 const title = '30-day production support trial — DeltaGlider';
 const description =
   "Try the relationship. Direct engineering Slack, response SLA, one architecture review call. The software stays free regardless — it's GPL-3.0.";
+
+const included = [
+  {
+    glyph: 'pulse',
+    title: 'Direct engineering Slack',
+    desc: 'A shared channel with named contacts on the Beshu Tech side — the people whose names are in git log.',
+  },
+  {
+    glyph: 'clock',
+    title: '4h response SLA',
+    desc: 'Business-hours response commitment on questions and issues, from day one.',
+  },
+  {
+    glyph: 'bulb',
+    title: 'Architecture review call',
+    desc: '60 minutes on your deployment: what’s standard, what’s risky, what’s suboptimal, what’s outright broken.',
+  },
+  {
+    glyph: 'chart',
+    title: 'Migration sizing',
+    desc: 'Moving an existing bucket? We size the migration with you before you commit to it.',
+  },
+  {
+    glyph: 'wrench',
+    title: 'Cutover cover',
+    desc: 'Tactical Slack help during your first cutover window, if you want us on call for it.',
+  },
+] as const;
+
+const timeline = [
+  {
+    day: 'Day 0',
+    text: 'You email contact@beshu.tech with subject “DeltaGlider — Production support trial.” We respond within 1 business day with a Slack invite and a scheduling link.',
+  },
+  {
+    day: 'Days 1–7',
+    text: 'Slack onboarding. We learn your deployment shape, the workload, the storage backend, your SLOs.',
+  },
+  {
+    day: 'Days 8–14',
+    text: 'Architecture review call (60 min). Output: a short written summary of recommendations, in your shared channel.',
+  },
+  {
+    day: 'Days 15–29',
+    text: 'Ongoing Slack support. You ask questions, file issues, get answers from the senior engineers who wrote the code.',
+  },
+  {
+    day: 'Day 30',
+    text: 'Conversion conversation. Sign a paid support contract (Starter $2.5k, Growth $7.5k, Scale $15k) — or thank us, exit, and keep running the OSS build for free. Nothing changes on your side.',
+  },
+] as const;
 ---
 
 <BaseLayout title={title} description={description}>
@@ -29,32 +82,48 @@ const description =
     />
     <JsonLd schema={trialOfferSchema({ durationDays: 30 })} />
   </Fragment>
+
   <section class="hero">
-    <div class="shell">
-      <h1>30-day production support trial.</h1>
+    <div class="shell trial-hero-grid">
+      <div class="trial-hero-copy">
+        <h1>30-day production support trial.</h1>
 
-      <p class="hero-lede">
-        Try the relationship. The software is free regardless.
-      </p>
+        <p class="hero-lede">
+          Try the relationship. The software is free regardless.
+        </p>
 
-      <p>
-        DeltaGlider is GPL-3.0 — you can run the OSS build forever
-        without paying us. The trial isn't for the software. It's for the
-        support relationship: direct Slack access to Beshu Tech's 10
-        senior engineers, a response SLA, and one architecture review
-        call.
-      </p>
+        <p>
+          DeltaGlider is GPL-3.0 — you can run the OSS build forever
+          without paying us. The trial isn't for the software. It's for the
+          support relationship: direct Slack access to Beshu Tech's 10
+          senior engineers, a response SLA, and one architecture review
+          call.
+        </p>
 
-      <p>Free for 30 days. No credit card. No auto-conversion.</p>
+        <p class="trial-no-strings">
+          Free for 30 days · No credit card · No auto-conversion
+        </p>
 
-      <div class="hero-ctas">
-        <a
-          href="mailto:contact@beshu.tech?subject=DeltaGlider%20-%20Production%20support%20trial"
-          class="btn btn-primary"
-        >
-          Start the trial
-        </a>
-        <a href="/docs/tutorials/first-delta-savings" class="btn">Try the OSS build first</a>
+        <div class="hero-ctas">
+          <a
+            href="mailto:contact@beshu.tech?subject=DeltaGlider%20-%20Production%20support%20trial"
+            class="btn btn-primary"
+          >
+            Start the trial
+          </a>
+          <a href="/docs/tutorials/first-delta-savings" class="btn">Try the OSS build first</a>
+        </div>
+      </div>
+
+      <div class="trial-hero-visual">
+        <img
+          src="/illustrations/trial-pairing.jpg"
+          alt="Illustration: two engineers at a shared terminal reviewing a glowing storage diagram together, with a chat panel beside them"
+          width="1200"
+          height="896"
+          loading="eager"
+          decoding="async"
+        />
       </div>
     </div>
   </section>
@@ -63,94 +132,72 @@ const description =
     <section class="included">
       <h2>What's included for 30 days</h2>
 
-      <ul>
-        <li>
-          Direct engineering Slack channel with named contacts on the
-          Beshu Tech side
-        </li>
-        <li>
-          4h business-hours response SLA on questions and issues
-        </li>
-        <li>
-          One 60-minute architecture review call: we look at your
-          deployment, point out what's standard, what's risky, what's
-          suboptimal, and what's outright broken
-        </li>
-        <li>
-          Migration sizing if you're moving an existing bucket
-        </li>
-        <li>
-          Tactical Slack help during your first cutover window if you
-          want us on call
-        </li>
-      </ul>
-    </section>
-
-    <section class="not-included">
-      <h2>What we don't do during the trial</h2>
-
-      <ul>
-        <li>
-          We don't get root on your infrastructure. The trial is async
-          help, not managed services.
-        </li>
-        <li>
-          We don't sign DPAs / MSAs for the trial itself. If you need
-          those, they come with a paid contract — and that's a separate
-          sales conversation.
-        </li>
-        <li>
-          We don't auto-bill you on day 31. Conversion is your decision
-          and an explicit step.
-        </li>
-      </ul>
+      <div class="inc-grid">
+        {included.map((item) => (
+          <div class="inc-card">
+            <Glyph name={item.glyph} size={36} />
+            <div>
+              <h3 class="inc-title">{item.title}</h3>
+              <p class="inc-desc">{item.desc}</p>
+            </div>
+          </div>
+        ))}
+      </div>
     </section>
 
     <section class="schedule">
       <h2>What the 30 days actually look like</h2>
 
-      <p>
-        <strong>Day 0.</strong> You email
-        <a href="mailto:contact@beshu.tech?subject=DeltaGlider%20-%20Production%20support%20trial">contact@beshu.tech</a>
-        with subject "DeltaGlider — Production support trial." We
-        respond within 1 business day with a Slack invite and a
-        scheduling link for the arch review call.
-      </p>
-
-      <p>
-        <strong>Days 1–7.</strong> Slack onboarding. We learn your
-        deployment shape, the workload, the storage backend, your
-        SLOs.
-      </p>
-
-      <p>
-        <strong>Days 8–14.</strong> Architecture review call (60 min).
-        Output: a short written summary of recommendations, in your
-        shared channel.
-      </p>
-
-      <p>
-        <strong>Days 15–29.</strong> Ongoing Slack support. You ask
-        questions, file issues, get answers from the senior engineers
-        who wrote the code.
-      </p>
-
-      <p>
-        <strong>Day 30.</strong> Conversion conversation. You either:
-      </p>
-
-      <ol>
-        <li>
-          Sign a paid production support contract (Starter $2.5k,
-          Growth $7.5k, or Scale $15k depending on your stored
-          footprint), or
-        </li>
-        <li>
-          Thank us, exit the trial, and keep using the OSS build for
-          free. Your data is yours, your deployment is yours, nothing
-          changes on your side.
-        </li>
+      <ol class="tl">
+        {timeline.map((t) => (
+          <li class="tl-item">
+            <span class="tl-day">{t.day}</span>
+            <p class="tl-text">{t.text}</p>
+          </li>
+        ))}
       </ol>
+    </section>
+
+    <section class="honesty">
+      <div class="honesty-grid">
+        <div class="honesty-col">
+          <h2>What we don't do during the trial</h2>
+          <ul class="x-list">
+            <li>
+              We don't get root on your infrastructure. The trial is async
+              help, not managed services.
+            </li>
+            <li>
+              We don't sign DPAs / MSAs for the trial itself. Those come
+              with a paid contract — a separate sales conversation.
+            </li>
+            <li>
+              We don't auto-bill you on day 31. Conversion is your decision
+              and an explicit step.
+            </li>
+          </ul>
+        </div>
+
+        <div class="honesty-col">
+          <h2>When the trial isn't right for you</h2>
+          <ul class="x-list">
+            <li>
+              You haven't deployed DeltaGlider yet — start with
+              <a href="/docs/tutorials/first-delta-savings">the first tutorial</a>.
+              There's no point trialing support for software you haven't
+              tried.
+            </li>
+            <li>
+              You need 24/7 on-call coverage — the trial is business-hours
+              only. 24/7 is part of paid Enterprise contracts.
+            </li>
+            <li>
+              You need a contract signed before any interaction — skip the
+              trial, talk to sales directly.
+            </li>
+          </ul>
+        </div>
+      </div>
     </section>
 
     <section class="why">
@@ -172,27 +219,6 @@ const description =
       </p>
     </section>
 
-    <section class="not-right">
-      <h2>When the trial isn't right for you</h2>
-
-      <ul>
-        <li>
-          You haven't deployed DeltaGlider yet — start with
-          <a href="/docs/tutorials/first-delta-savings">/docs/tutorials/first-delta-savings</a> first. There's
-          no point trialing support for software you haven't even
-          tried.
-        </li>
-        <li>
-          You need 24/7 on-call coverage — the trial is business-hours
-          only. 24/7 is part of paid Enterprise contracts.
-        </li>
-        <li>
-          You need a contract signed before any interaction — fine,
-          skip the trial, talk to sales directly.
-        </li>
-      </ul>
-    </section>
-
     <section class="cta">
       <h2>Start your trial</h2>
 
@@ -210,12 +236,174 @@ const description =
 </BaseLayout>
 
 <style>
-  .included,
-  .not-included,
-  .schedule,
-  .why,
-  .not-right,
-  .cta {
-    margin: 3rem 0;
+  /* ── hero: copy + illustration ─────────────────────────────────────── */
+  .trial-hero-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 2.5rem;
+    align-items: center;
   }
+  @media (min-width: 1000px) {
+    .trial-hero-grid { grid-template-columns: 1.02fr 0.98fr; gap: 3rem; }
+  }
+
+  .trial-no-strings {
+    font-family: var(--font-mono);
+    font-size: 0.95rem;
+    color: var(--brand-dark);
+    margin: 1.25rem 0 0;
+  }
+
+  .trial-hero-visual img {
+    display: block;
+    width: 100%;
+    height: auto;
+    border-radius: 18px;
+    border: 1px solid rgba(34, 211, 238, 0.25);
+    box-shadow: var(--shadow-lg), 0 0 36px rgba(34, 211, 238, 0.12);
+    /* the illustration's left edge is plain navy — blend it into the page */
+    mask-image: linear-gradient(90deg, transparent 0, #000 12%);
+    -webkit-mask-image: linear-gradient(90deg, transparent 0, #000 12%);
+  }
+
+  /* ── what's included: glyph cards ──────────────────────────────────── */
+  .included { margin: 4rem 0; }
+
+  .inc-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 1.1rem;
+    margin-top: 1.75rem;
+  }
+  @media (min-width: 720px) {
+    .inc-grid { grid-template-columns: 1fr 1fr; }
+  }
+  @media (min-width: 1100px) {
+    .inc-grid { grid-template-columns: repeat(3, 1fr); }
+  }
+
+  .inc-card {
+    display: flex;
+    gap: 1rem;
+    align-items: flex-start;
+    padding: 1.4rem 1.5rem;
+    background: var(--bg-card);
+    border: 1px solid var(--rule);
+    border-radius: 14px;
+    box-shadow: var(--shadow-sm);
+  }
+
+  .inc-title {
+    margin: 0.1rem 0 0.35rem;
+    font-size: 1.08rem;
+    font-weight: 700;
+    color: var(--ink-strong);
+  }
+
+  .inc-desc {
+    margin: 0;
+    color: var(--ink-soft);
+    font-size: 0.93rem;
+    line-height: 1.55;
+    max-width: none;
+  }
+
+  /* ── 30-day timeline ───────────────────────────────────────────────── */
+  .schedule { margin: 4.5rem 0; }
+
+  .tl {
+    list-style: none;
+    margin: 2rem 0 0;
+    padding: 0;
+    position: relative;
+  }
+  .tl::before {
+    content: '';
+    position: absolute;
+    left: 5.4rem;
+    top: 0.5rem;
+    bottom: 0.5rem;
+    width: 2px;
+    background: linear-gradient(180deg, var(--brand), rgba(217, 70, 239, 0.6));
+    opacity: 0.5;
+  }
+
+  .tl-item {
+    display: grid;
+    grid-template-columns: 8rem 1fr;
+    gap: 1.5rem;
+    align-items: start;
+    margin: 0 0 1.9rem;
+    position: relative;
+  }
+
+  .tl-day {
+    font-family: var(--font-mono);
+    font-size: 0.88rem;
+    font-weight: 700;
+    color: var(--brand-dark);
+    text-align: right;
+    padding: 0.3rem 0.6rem;
+    border: 1px solid rgba(34, 211, 238, 0.35);
+    border-radius: 8px;
+    background: rgba(34, 211, 238, 0.07);
+    text-align: center;
+    position: relative;
+    z-index: 1;
+  }
+
+  .tl-text {
+    margin: 0.15rem 0 0;
+    color: var(--ink-soft);
+    line-height: 1.6;
+    max-width: 62ch;
+  }
+
+  @media (max-width: 560px) {
+    .tl::before { display: none; }
+    .tl-item { grid-template-columns: 1fr; gap: 0.5rem; }
+    .tl-day { justify-self: start; }
+  }
+
+  /* ── honesty columns ───────────────────────────────────────────────── */
+  .honesty { margin: 4.5rem 0; }
+
+  .honesty-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 2rem;
+  }
+  @media (min-width: 900px) {
+    .honesty-grid { grid-template-columns: 1fr 1fr; gap: 3rem; }
+  }
+
+  .honesty-col h2 { font-size: 1.35rem; }
+
+  .x-list {
+    list-style: none;
+    margin: 1.25rem 0 0;
+    padding: 0;
+    display: grid;
+    gap: 0.9rem;
+    max-width: none;
+  }
+  .x-list li {
+    position: relative;
+    padding: 0 0 0 2rem;
+    color: var(--ink-soft);
+    line-height: 1.55;
+    margin: 0;
+    max-width: none;
+  }
+  .x-list li::before {
+    content: '✕';
+    position: absolute;
+    left: 0;
+    top: 0.1rem;
+    font-family: var(--font-mono);
+    font-weight: 700;
+    color: #fda4af;
+  }
+
+  .why, .cta { margin: 4rem 0; }
 </style>
