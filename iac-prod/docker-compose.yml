@@ -20,7 +20,7 @@ services:
   # it can create the encrypted IAM DB there. (The image runs as non-root; a
   # fresh named volume is root-owned.) No rendering happens here anymore.
   init-perms:
-    image: beshultd/deltaglider_proxy:${DGP_IMAGE_TAG:-1.4.0}
+    image: beshultd/deltaglider_proxy:${DGP_IMAGE_TAG:-1.4.1}
     user: "0:0"
     entrypoint: ["/bin/sh", "-c", "chown 999:999 /etc/deltaglider_proxy && chmod 750 /etc/deltaglider_proxy"]
     volumes:
@@ -29,7 +29,7 @@ services:
 
   dgp:
     # Override with DGP_IMAGE_TAG (e.g. a newer release, or `latest`).
-    image: beshultd/deltaglider_proxy:${DGP_IMAGE_TAG:-1.4.0}
+    image: beshultd/deltaglider_proxy:${DGP_IMAGE_TAG:-1.4.1}
     depends_on:
       init-perms:
         condition: service_completed_successfully
