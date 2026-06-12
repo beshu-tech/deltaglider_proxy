@@ -7,7 +7,7 @@
  *     "You uploaded 1.4 TB. You're storing 96 GB."
  *
  * Layout: two zones over a full-width proof.
- *   - LEFT — the multiplier ("15.2×") at billboard size in gradient
+ *   - LEFT — the magnitude as a percentage ("270% smaller") at billboard size in gradient
  *     ink. Unbounded and visceral where the old % hero was capped and
  *     flat. The % survives as a green pill underneath.
  *   - RIGHT — the before/after proof: a dashed ghost bar ("without
@@ -113,8 +113,11 @@ function HeroInner({
   const targetSavedWidth = clamp(savingsPercent, 0, 100);
   const targetDollars = Math.max(0, monthlySavings);
 
+  // GOLDEN RULE: magnitudes are expressed as percentages, never as "N×".
+  // The lead figure is the multiplier × 100 — "2.7× smaller" renders as
+  // "270% smaller".
   const ratioDisplay = useTransform(ratioMV, v =>
-    v >= 100 ? Math.round(v).toString() : v.toFixed(1).replace(/\.0$/, ''),
+    Math.round(v * 100).toLocaleString(),
   );
   const dollarDisplay = useTransform(dollarMV, v => v.toFixed(2));
   const percentLead = useTransform(ratioMV, () => targetPercent.toFixed(1));
@@ -276,7 +279,7 @@ function HeroInner({
           aria-live="polite"
           aria-label={
             useRatioLead
-              ? `${targetRatio.toFixed(1)} times smaller`
+              ? `${Math.round(targetRatio * 100)} percent smaller`
               : `${targetPercent.toFixed(1)} percent storage saved`
           }
           animate={settled ? { scale: [1, 1.015, 1] } : undefined}
@@ -300,7 +303,7 @@ function HeroInner({
           {useRatioLead ? (
             <>
               <m.span>{ratioDisplay}</m.span>
-              <span style={{ fontSize: '0.42em', fontWeight: 800, marginLeft: 2 }}>×</span>
+              <span style={{ fontSize: '0.42em', fontWeight: 800, marginLeft: 2 }}>%</span>
             </>
           ) : (
             <>
@@ -833,7 +836,7 @@ function EmptyHero({
           />
         </div>
         <div style={{ fontSize: 11, color: colors.TEXT_MUTED }}>
-          Versioned builds and backups typically compress 5–50×.
+          Versioned builds and backups typically end up 80–98% smaller.
         </div>
       </div>
     </div>

@@ -6,7 +6,7 @@
  * Each row, on a shared column grid so numerals align down the page:
  *   rank · name + backend chip + status · ratio bar (kept|saved, new
  *   palette) over a footprint under-bar · bytes before→after · saved %
- *   (tier-colored) · multiplier · age · per-row scan/stop action.
+ *   (tier-colored) · age · per-row scan/stop action.
  *
  * Palette story matches the hero: dense teal = kept, luminous green =
  * saved. Rows answer hover with a surface tint and a glow on the
@@ -110,7 +110,6 @@ function FleetRow({
   const hasData = b.totalOriginal > 0;
   const keptPct = hasData ? 100 - b.savingsPercent : 0;
   const footprintPct = (b.totalOriginal / maxOriginal) * 100;
-  const ratio = b.totalStored > 0 ? b.totalOriginal / b.totalStored : 0;
   const pctColor = tierColor(colors, b.savingsPercent, hasData);
 
   const backendName = backendOf(b.bucket);
@@ -129,7 +128,7 @@ function FleetRow({
       style={{
         display: 'grid',
         gridTemplateColumns:
-          '20px minmax(130px, 0.9fr) minmax(180px, 1.6fr) minmax(150px, auto) 58px 52px 30px',
+          '20px minmax(130px, 0.9fr) minmax(180px, 1.6fr) minmax(150px, auto) 58px 30px',
         alignItems: 'center',
         gap: 14,
         padding: '9px 10px',
@@ -340,20 +339,6 @@ function FleetRow({
         }}
       >
         {hasData ? `${b.savingsPercent.toFixed(1)}%` : '—'}
-      </span>
-
-      {/* multiplier */}
-      <span
-        style={{
-          fontFamily: 'var(--font-mono)',
-          fontSize: 11,
-          fontWeight: 600,
-          color: ratio >= 1.05 ? colors.TEXT_SECONDARY : colors.TEXT_FAINT,
-          fontVariantNumeric: 'tabular-nums',
-          textAlign: 'right',
-        }}
-      >
-        {hasData && ratio >= 1.05 ? `${ratio >= 100 ? Math.round(ratio) : ratio.toFixed(1).replace(/\.0$/, '')}×` : ''}
       </span>
 
       {/* action */}
