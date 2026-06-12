@@ -50,40 +50,12 @@ storage:
     beshu:
       public_prefixes:
         - ror/libs/
-    # REVIEW: the three buckets below look like staging experiments that made
-    # it into the prod config (they route to the local-disk backend). Prune
-    # here AND in prod if they're not load-bearing.
-    didi:
-      backend: LOCAL1BE
-    pippo:
-      backend: LOCAL1BE
-    reenc-demo:
-      backend: LOCAL1BE
-
-  # Background replication machinery is ON (workers + scheduler); the single
-  # rule is currently DISABLED — kept for one-click re-enable from the GUI.
-  replication:
-    enabled: true
-    tick_interval: 30s
-    lease_ttl: 60s
-    heartbeat_interval: 20s
-    max_failures_retained: 100
-    rules:
-      - name: mirror-debug-to-local
-        enabled: false
-        source:
-          bucket: debug
-          prefix: builds/
-        destination:
-          bucket: pippo
-          prefix: mirror/
-        interval: 24h
-        batch_size: 100
-        replicate_deletes: false
-        conflict: newer-wins
-        include_globs: []
-        exclude_globs:
-          - .deltaglider/**
+    # PRUNED 2026-06-12: the staging-experiment buckets didi / pippo /
+    # reenc-demo (and the disabled mirror-debug-to-local replication rule
+    # that targeted pippo) were removed from this template. Applying this
+    # config deletes their ROUTING POLICY only — any historical data stays
+    # on the LOCAL1BE backend volume (which is kept below, with its key,
+    # so that data remains readable if ever re-routed).
 
   # Lifecycle is fully OFF (subsystem disabled AND the rule disabled).
   lifecycle:
