@@ -333,6 +333,8 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
 
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 4 }}>
             <Button
+              data-testid="buckets-create"
+              aria-label="Create bucket"
               icon={<PlusOutlined />}
               onClick={() => setCreateOpen(true)}
               style={{ borderRadius: 8, fontFamily: 'var(--font-ui)' }}

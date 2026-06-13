@@ -590,7 +590,7 @@ export default function InspectorPanel({
                     </div>
                   </div>
                 ) : (
-                  <div style={{
+                  <div data-testid="inspector-savings" style={{
                     background: BG_SIDEBAR,
                     borderRadius: 10,
                     padding: '16px',

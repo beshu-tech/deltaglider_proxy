@@ -224,13 +224,16 @@ export default function BackendEncryptionEditor({ backendName, current, onApply 
                 Rotate key
               </Button>
             )}
-            <Select
-              value={current.mode}
-              onChange={(v) => startEdit(v as BackendEncryptionMode)}
-              options={modeOptions}
-              size="small"
-              style={{ width: 220 }}
-            />
+            <span data-testid="encryption-mode-select">
+              <Select
+                aria-label="Encryption mode"
+                value={current.mode}
+                onChange={(v) => startEdit(v as BackendEncryptionMode)}
+                options={modeOptions}
+                size="small"
+                style={{ width: 220 }}
+              />
+            </span>
           </Space>
         )}
       </div>
@@ -338,6 +341,8 @@ export default function BackendEncryptionEditor({ backendName, current, onApply 
               </Space>
               <div style={{ marginTop: 8 }}>
                 <Checkbox
+                  data-testid="encryption-key-stored"
+                  aria-label="I have stored this encryption key safely"
                   checked={storedSafelyChecked}
                   onChange={(e) => setStoredSafelyChecked(e.target.checked)}
                 >
@@ -403,6 +408,8 @@ export default function BackendEncryptionEditor({ backendName, current, onApply 
               Cancel
             </Button>
             <Button
+              data-testid="encryption-apply"
+              aria-label="Apply encryption change"
               size="small"
               type="primary"
               loading={applying}

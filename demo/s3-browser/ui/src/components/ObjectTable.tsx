@@ -350,7 +350,7 @@ export default function ObjectTable({
           );
         }
         return (
-          <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span data-testid={`object-row-${record.name}`} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <FileOutlined aria-hidden="true" style={{ color: fileIconColor(record.name), fontSize: 14 }} />
             <span style={{ fontFamily: "var(--font-mono)", fontSize: 13, color: TEXT_PRIMARY, cursor: 'pointer', flex: 1 }}>
               {record.name}

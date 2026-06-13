@@ -390,7 +390,7 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
 
       <div style={{ marginBottom: 16 }}>
         <FormLabel text="Name" />
-        <Input value={name} onChange={e => setName(e.target.value)} placeholder="e.g. developers" disabled={readOnly} style={{ ...inputRadius }} />
+        <Input data-testid="group-name" aria-label="Group name" value={name} onChange={e => setName(e.target.value)} placeholder="e.g. developers" disabled={readOnly} style={{ ...inputRadius }} />
       </div>
 
       <div style={{ marginBottom: 16 }}>
@@ -462,7 +462,7 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
             )}
             {!isEdit && onCancel && <Button onClick={onCancel}>Cancel</Button>}
           </div>
-          <Button type="primary" onClick={handleSave} loading={saving}>{isEdit ? 'Save' : 'Create Group'}</Button>
+          <Button data-testid="group-save" aria-label={isEdit ? 'Save group' : 'Create group'} type="primary" onClick={handleSave} loading={saving}>{isEdit ? 'Save' : 'Create Group'}</Button>
         </div>
       )}
     </div>

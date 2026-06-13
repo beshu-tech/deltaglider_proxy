@@ -98,7 +98,14 @@ export default function MasterDetailPanel<T>({
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
               <Text strong style={{ fontSize: 14 }}>{title}</Text>
               {!readOnly && (
-                <Button type="primary" size="small" icon={<PlusOutlined />} onClick={onCreate}>
+                <Button
+                  data-testid={`md-new-${title.toLowerCase().replace(/\s+/g, '-')}`}
+                  aria-label={`New ${title.replace(/s$/, '') || title}`}
+                  type="primary"
+                  size="small"
+                  icon={<PlusOutlined />}
+                  onClick={onCreate}
+                >
                   New
                 </Button>
               )}

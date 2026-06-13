@@ -122,6 +122,7 @@ export default function CreateBucketModal({
       >
         <Input
           ref={inputRef}
+          data-testid="bucket-name"
           placeholder="Bucket name"
           aria-label="Bucket name"
           value={name}
@@ -134,8 +135,9 @@ export default function CreateBucketModal({
           style={{ fontFamily: 'var(--font-mono)' }}
         />
         {showPicker && (
-          <div style={{ marginTop: 12 }}>
+          <div style={{ marginTop: 12 }} data-testid="bucket-backend-select">
             <Select
+              aria-label="Backend"
               value={selectedBackend}
               onChange={(value) => setSelectedBackend(value || undefined)}
               options={backends.map((backend) => ({

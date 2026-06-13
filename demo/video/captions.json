@@ -1,0 +1,18 @@
+{
+  "_comment": "Caption track for the DeltaGlider Proxy 90s demo. Times are in SECONDS relative to the FINAL composed video (after the title card). compose.sh offsets the raw screen capture by TITLE_SEC and renders these as burned-in lower-third captions. Golden rule: savings as percent, never N×.",
+  "title_card_seconds": 2.5,
+  "outro_card_seconds": 4.0,
+  "captions": [
+    { "start": 0.0,  "end": 6.5,  "text": "Add a storage backend — encrypted at rest, no extra services" },
+    { "start": 6.5,  "end": 12.0, "text": "AES-256-GCM, proxy-side. The key stays yours" },
+    { "start": 12.0, "end": 18.0, "text": "Delta compression on by default — versioned uploads dedupe automatically" },
+    { "start": 18.0, "end": 24.0, "text": "Existing objects? One click to re-encrypt in the background" },
+    { "start": 24.0, "end": 33.0, "text": "Create a bucket — routed to that backend, encryption inherited" },
+    { "start": 33.0, "end": 40.0, "text": "Review the change, then apply and persist" },
+    { "start": 40.0, "end": 48.0, "text": "Add an IAM user — fine-grained, attribute-based permissions" },
+    { "start": 48.0, "end": 55.0, "text": "Scope it to a bucket and the actions it needs — nothing more" },
+    { "start": 55.0, "end": 62.0, "text": "Group users for shared access policies" },
+    { "start": 62.0, "end": 68.0, "text": "Browse objects through a standard S3 API — clients never change" },
+    { "start": 68.0, "end": 78.0, "text": "Every object: real delta savings, measured live — 96.7% smaller on disk" }
+  ]
+}

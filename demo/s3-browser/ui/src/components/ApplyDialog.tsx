@@ -74,6 +74,8 @@ export default function ApplyDialog({
             Cancel
           </Button>
           <Button
+            data-testid="apply-dialog-confirm"
+            aria-label="Apply and persist changes"
             type="primary"
             onClick={onApply}
             disabled={!ok || loading}

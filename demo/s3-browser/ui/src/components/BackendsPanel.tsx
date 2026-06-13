@@ -422,7 +422,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
           ))}
 
           {!showForm && (
-            <Button icon={<PlusOutlined />} onClick={() => setShowForm(true)} style={{ marginTop: 12, borderRadius: 8, fontFamily: 'var(--font-ui)', fontWeight: 600 }} block type="dashed">
+            <Button data-testid="backends-add" aria-label="Add backend" icon={<PlusOutlined />} onClick={() => setShowForm(true)} style={{ marginTop: 12, borderRadius: 8, fontFamily: 'var(--font-ui)', fontWeight: 600 }} block type="dashed">
               Add Backend
             </Button>
           )}
@@ -434,7 +434,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
             <SectionHeader icon={<PlusOutlined />} title="New Backend" />
             <div>
               <FormField label="Name" yamlPath="storage.backends[].name">
-                <Input value={formName} onChange={(e) => setFormName(e.target.value)} placeholder="e.g. local, hetzner, aws-prod" style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }} />
+                <Input data-testid="backend-name" aria-label="Backend name" value={formName} onChange={(e) => setFormName(e.target.value)} placeholder="e.g. local, hetzner, aws-prod" style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }} />
               </FormField>
               <FormField label="Type" yamlPath="storage.backends[].type">
                 <Radio.Group value={formType} onChange={(e) => setFormType(e.target.value)} style={{ display: 'flex', gap: 0 }}>
@@ -484,7 +484,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
               <Text style={{ fontSize: 13, fontFamily: 'var(--font-ui)' }}>Set as default backend</Text>
             </div>
             <div style={{ marginTop: 16, display: 'flex', gap: 8 }}>
-              <Button type="primary" icon={<CheckCircleOutlined />} onClick={handleCreate} loading={saving} disabled={!formName.trim()} style={{ flex: 1, borderRadius: 8, fontWeight: 600 }}>
+              <Button data-testid="backend-create" aria-label="Create backend" type="primary" icon={<CheckCircleOutlined />} onClick={handleCreate} loading={saving} disabled={!formName.trim()} style={{ flex: 1, borderRadius: 8, fontWeight: 600 }}>
                 Create Backend
               </Button>
               <Button onClick={() => { setShowForm(false); resetForm(); }} style={{ borderRadius: 8 }}>Cancel</Button>
@@ -503,6 +503,8 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
           />
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 12 }}>
             <Switch
+              data-testid="delta-compression-switch"
+              aria-label="Delta compression default"
               checked={globalCompressionOn}
               onChange={async (on) => {
                 try {

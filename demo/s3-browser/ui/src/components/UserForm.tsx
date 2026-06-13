@@ -209,7 +209,7 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
 
       <div style={{ marginBottom: 16 }}>
         <FormLabel text="Name" />
-        <Input value={name} onChange={e => setName(e.target.value)} placeholder="e.g. ci-bot" disabled={readOnly} style={{ ...inputRadius }} />
+        <Input data-testid="user-name" aria-label="User name" value={name} onChange={e => setName(e.target.value)} placeholder="e.g. ci-bot" disabled={readOnly} style={{ ...inputRadius }} />
       </div>
 
       <div style={{ marginBottom: 16 }}>
@@ -317,12 +317,12 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
             {!isEdit && onCancel && <Button onClick={onCancel}>Cancel</Button>}
           </div>
           {hasKeyChanges ? (
-            <Button type="primary" loading={saving} onClick={async () => {
+            <Button data-testid="user-save" aria-label={isEdit ? 'Save user' : 'Create user'} type="primary" loading={saving} onClick={async () => {
               if (!window.confirm('Update credentials? The new secret will be shown once — make sure to save it.')) return;
               await handleSave();
             }}>{isEdit ? 'Save' : 'Create User'}</Button>
           ) : (
-            <Button type="primary" onClick={handleSave} loading={saving}>{isEdit ? 'Save' : 'Create User'}</Button>
+            <Button data-testid="user-save" aria-label={isEdit ? 'Save user' : 'Create user'} type="primary" onClick={handleSave} loading={saving}>{isEdit ? 'Save' : 'Create User'}</Button>
           )}
         </div>
       )}

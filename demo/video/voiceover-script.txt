@@ -1,0 +1,17 @@
+DeltaGlider Proxy — 90s demo · voiceover / caption script
+
+[0:00–0:02]  TITLE CARD: DeltaGlider Proxy — S3-compatible storage with transparent delta compression
+
+[0:02–0:09]  Add a storage backend — encrypted at rest, no extra services
+[0:09–0:14]  AES-256-GCM, proxy-side. The key stays yours
+[0:14–0:20]  Delta compression on by default — versioned uploads dedupe automatically
+[0:20–0:26]  Existing objects? One click to re-encrypt in the background
+[0:26–0:35]  Create a bucket — routed to that backend, encryption inherited
+[0:35–0:42]  Review the change, then apply and persist
+[0:42–0:50]  Add an IAM user — fine-grained, attribute-based permissions
+[0:50–0:57]  Scope it to a bucket and the actions it needs — nothing more
+[0:57–1:04]  Group users for shared access policies
+[1:04–1:10]  Browse objects through a standard S3 API — clients never change
+[1:10–1:20]  Every object: real delta savings, measured live — 96.7% smaller on disk
+
+[outro 2s]  Point any S3 client at it. Carry on. · github.com/beshu-tech/deltaglider_proxy
