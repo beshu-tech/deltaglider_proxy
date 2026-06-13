@@ -772,7 +772,7 @@ section { scroll-margin-top: 5rem; }
 
 /* Stage is a <button> now (click → lightbox). Reset native button chrome. */
 .hero-slideshow__stage {
-  position: relative; aspect-ratio: 16 / 11; background: var(--ink-100);
+  position: relative; aspect-ratio: 1 / 1; background: var(--ink-100);
   overflow: hidden; display: block; width: 100%; padding: 0; margin: 0;
   border: none; cursor: zoom-in; appearance: none; text-align: left;
 }

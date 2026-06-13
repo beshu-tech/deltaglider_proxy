@@ -20,18 +20,20 @@ interface Slide {
 }
 
 // The 5 most striking + representative shots for "real, polished product".
+// The square frame leads with the analytics money shot (a near-1:1 capture);
+// the landscape captures that follow are top-anchored inside the square frame.
 const SLIDES: Slide[] = [
+  {
+    src: '/screenshots/analytics-hero.jpg',
+    label: 'Storage analytics',
+    alt: 'Live storage analytics dashboard: 1,174% smaller on disk, 2.3 TB stored as 197 GB, per-bucket compression ratios across releases, db-archive, ml-models and downloads.',
+    caption: 'Live savings, measured — not estimated',
+  },
   {
     src: '/screenshots/filebrowser.jpg',
     label: 'Object browser',
     alt: 'DeltaGlider object browser showing a versioned zip with 97.2% storage savings, delta metadata and download/share controls.',
     caption: 'Transparent delta dedup — 97% saved, same S3 API',
-  },
-  {
-    src: '/screenshots/analytics.jpg',
-    label: 'Storage analytics',
-    alt: 'Live storage analytics dashboard: total storage, space saved via delta compression, and per-bucket compression ratios.',
-    caption: 'Live compression analytics across every bucket',
   },
   {
     src: '/screenshots/iam.jpg',
