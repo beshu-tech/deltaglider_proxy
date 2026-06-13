@@ -1,0 +1,57 @@
+---
+// DemoVideo.astro — "see it in action": the 90-second product walkthrough.
+// A real screen recording (encrypted+compressed backend → routed bucket →
+// IAM → browse → live delta metadata), captioned, with a soft music bed.
+// Lazy: preload="none" + a poster frame so the homepage stays fast; the
+// 5 MB mp4 only downloads once the visitor hits play.
+---
+
+<section class="section demo-video">
+  <div class="shell">
+    <span class="section-eyebrow">See it in action</span>
+    <h2>Ninety seconds, end to end</h2>
+    <p class="demo-video-lede">
+      A real screen recording — not a mockup. Spin up an encrypted,
+      compression-enabled backend, route a bucket to it, set up a user,
+      then watch a versioned upload land at <strong>96.7% smaller on
+      disk</strong>, measured live.
+    </p>
+
+    <figure class="demo-video-frame">
+      <video
+        controls
+        preload="none"
+        playsinline
+        poster="/deltaglider-demo-poster.jpg"
+        aria-label="DeltaGlider Proxy 90-second product demo"
+      >
+        <source src="/deltaglider-demo.mp4" type="video/mp4" />
+        Your browser can't play this video.
+        <a href="/deltaglider-demo.mp4">Download it instead.</a>
+      </video>
+    </figure>
+  </div>
+</section>
+
+<style>
+  .demo-video { text-align: center; }
+  .demo-video-lede {
+    max-width: 60ch;
+    margin: 0.75rem auto 2rem;
+  }
+  .demo-video-frame {
+    margin: 0 auto;
+    max-width: 880px;
+    border-radius: 16px;
+    overflow: hidden;
+    border: 1px solid var(--rule);
+    box-shadow: var(--shadow-md);
+    background: var(--ink-100);
+    line-height: 0;
+  }
+  .demo-video-frame video {
+    width: 100%;
+    height: auto;
+    display: block;
+  }
+</style>
