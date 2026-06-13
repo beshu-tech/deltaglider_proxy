@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.4.2 — 2026-06-13
+
 ### Added
 
 - **Inline video & audio preview in the object browser.** Double-clicking
