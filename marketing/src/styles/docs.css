@@ -243,21 +243,23 @@
   background: var(--brand); transform: rotate(45deg); opacity: 0.9;
 }
 .docs-prose ol { list-style: none; counter-reset: doc-ol; padding-left: 2.6em; margin: 0 0 22px; }
-/* Roomier rows + flex so the "#1" marker and the content (incl. code chips)
-   share a top baseline regardless of the chip's box height. */
+/* Hanging "#1" marker via absolute positioning — the li stays a normal
+   block so a step that contains a paragraph + a code block + trailing
+   prose stacks those vertically. (A previous `display:flex` turned each
+   block child into a side-by-side flex item, squeezing every column to
+   one word per line.) */
 .docs-prose ol > li {
-  display: flex; align-items: baseline; gap: 0.7em;
+  position: relative;
   margin: 14px 0; color: var(--ink-700); counter-increment: doc-ol;
 }
 .docs-prose ol > li::before {
   content: "#" counter(doc-ol);
-  flex: 0 0 1.9em; text-align: right;
+  position: absolute; left: -2.6em; top: 0;
+  width: 1.9em; text-align: right;
   font-family: var(--doc-label); font-size: 0.85em; font-weight: 600;
   color: var(--brand-dark);
-  /* nudge onto the first text line's baseline so it lines up with code chips */
-  position: relative; top: 0.02em;
 }
-/* the li content sits in the flex track to the right of the marker */
+/* first block in the step hugs the marker's top line */
 .docs-prose ol > li > :first-child { margin-top: 0; }
 .docs-prose li > ul, .docs-prose li > ol { margin: 8px 0; }
 
