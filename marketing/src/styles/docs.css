@@ -628,14 +628,60 @@
   max-height: 70vh;
   overflow-y: auto;
 }
-/* Tint Pagefind's default UI to the docs brand token. */
+/* Tint Pagefind's default UI to the docs theme. Its CSS variables set the
+   broad strokes; the explicit overrides below fix the two things the default
+   stylesheet hard-codes for a light theme (input text colour) or sizes against
+   its own scale (the Clear button position). */
 .docs-search-modal {
   --pagefind-ui-primary: var(--brand);
   --pagefind-ui-text: var(--ink-strong);
-  --pagefind-ui-background: var(--bg-card);
+  --pagefind-ui-background: var(--bg);
   --pagefind-ui-border: var(--rule);
+  --pagefind-ui-tag: var(--bg-soft);
   --pagefind-ui-font: inherit;
+  --pagefind-ui-scale: 0.9;
 }
+/* The default `.pagefind-ui__search-input` rule sets background but NOT text
+   colour, so the typed text falls back to the page's dark default and is
+   unreadable on the dark field. Force it (and the placeholder) explicitly. */
+.docs-search-modal .pagefind-ui__search-input {
+  color: var(--ink-strong);
+  background-color: var(--bg);
+  border-color: var(--rule);
+}
+.docs-search-modal .pagefind-ui__search-input::placeholder {
+  color: var(--ink-500);
+  opacity: 1;
+}
+/* The Clear button is absolutely positioned inside `.pagefind-ui__form`, but
+   that form also wraps the results drawer — so it's much taller than the input
+   row. The default `top: 3px*scale` leaves the button overlapping the top
+   border here. Anchor it to half the INPUT height (Pagefind sizes the input at
+   64px*scale) so it sits centred inside the field, not against the whole form. */
+.docs-search-modal .pagefind-ui__form { position: relative; }
+.docs-search-modal .pagefind-ui__search-clear {
+  top: calc(32px * var(--pagefind-ui-scale));
+  right: 8px;
+  bottom: auto;
+  height: auto;
+  transform: translateY(-50%);
+  padding: 4px 10px;
+  color: var(--ink-soft);
+  background-color: var(--bg-soft);
+  border: 1px solid var(--rule);
+  border-radius: 7px;
+  font-weight: 600;
+}
+.docs-search-modal .pagefind-ui__search-clear:hover {
+  color: var(--ink-strong);
+  border-color: var(--brand);
+}
+/* Result links + meta in the docs theme. */
+.docs-search-modal .pagefind-ui__result-link { color: var(--ink-strong); }
+.docs-search-modal .pagefind-ui__result-link:hover { color: var(--brand-dark); }
+.docs-search-modal .pagefind-ui__result-excerpt,
+.docs-search-modal .pagefind-ui__message { color: var(--ink-soft); }
+.docs-search-modal mark { background: var(--brand-soft); color: var(--ink-strong); }
 
 /* ── Version badge (sidebar footer) ─────────────────────────────────────── */
 .docs-version-badge {
