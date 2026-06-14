@@ -208,6 +208,11 @@
       "order": 50
     },
     {
+      "path": "reference/capacity-planning",
+      "group": "Reference",
+      "order": 55
+    },
+    {
       "path": "reference/encryption",
       "group": "Reference",
       "order": 60
@@ -248,6 +253,11 @@
       "order": 0
     },
     {
+      "path": "explanation/how-migration-works",
+      "group": "Concepts",
+      "order": 5
+    },
+    {
       "path": "explanation/multi-backend-architecture",
       "group": "Concepts",
       "order": 10
@@ -266,6 +276,11 @@
       "path": "explanation/jobs-and-durability",
       "group": "Concepts",
       "order": 40
+    },
+    {
+      "path": "explanation/versioning-vs-s3-versioning",
+      "group": "Concepts",
+      "order": 50
     }
   ]
 }

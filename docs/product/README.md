@@ -8,13 +8,30 @@ Versioned binary artifacts — firmware builds, backup archives, AI model varian
 
 ![Object Browser](/_/screenshots/filebrowser.jpg)
 
+## Where it sits: the data path
+
+DeltaGlider is a proxy *in front of* storage you already have, not a new object store. Your client speaks the standard S3 API to the proxy; the proxy authenticates the request, decides whether the object is delta-eligible, runs xdelta3 if so, and reads or writes the actual bytes on whichever backend that bucket is routed to — AWS S3, an S3-compatible provider, or a local filesystem.
+
+```mermaid
+flowchart LR
+    C["S3 client<br/>(aws-cli, boto3,<br/>Terraform, rclone)"] -->|"S3 API (SigV4)"| P
+    subgraph P["DeltaGlider Proxy"]
+        direction TB
+        A["Auth + admission<br/>IAM / SigV4"] --> R["Router<br/>bucket → backend"]
+        R --> X["xdelta3 codec<br/>encode on PUT /<br/>reconstruct on GET"]
+    end
+    P -->|"baselines + deltas"| B[("Backend<br/>AWS S3 · Hetzner ·<br/>Backblaze · filesystem")]
+```
+
+The control plane (IAM, routing table, per-object metadata, jobs) lives in the proxy; the data plane (your bytes) lives on the backends. That split is the design decision everything else follows from — see [multi-backend routing](explanation/multi-backend-architecture.md) for why, and [how delta compression works](explanation/delta-compression.md) for the PUT/GET mechanics. Before a production rollout, read [capacity planning](reference/capacity-planning.md): because the proxy actively encodes and reconstructs payloads, it has a different CPU/RAM profile than a pass-through proxy.
+
 ## Pick your path
 
 ### Learn it
 
-Three hands-on tutorials, each a complete session from nothing to a working result:
+Three hands-on tutorials, each a complete session from nothing to a working result. **New here? Start with the first one — it's the quickstart:**
 
-- [Your first delta savings](tutorials/first-delta-savings.md) — run the proxy in Docker, upload two firmware versions, watch the second one shrink to almost nothing.
+- [Your first delta savings](tutorials/first-delta-savings.md) **(quickstart)** — run the proxy in Docker, upload two firmware versions, watch the second one shrink to almost nothing.
 - [Securing your first proxy](tutorials/secure-your-proxy.md) — go from open access to a locked-down proxy with real credentials and a least-privilege IAM user.
 - [Your first Helm deployment on kind](tutorials/kubernetes-hello-world.md) — install the official Helm chart on a disposable local cluster and prove it round-trips a file.
 
@@ -34,6 +51,7 @@ Every page under Reference is pure facts — fields, endpoints, defaults, limits
 - [CLI](reference/cli.md) — every flag and subcommand of the binary.
 - [Admin API](reference/admin-api.md) — every `/_/api/admin/*` endpoint.
 - [Metrics](reference/metrics.md) — every Prometheus metric and label.
+- [Capacity planning](reference/capacity-planning.md) — CPU/RAM/disk sizing for a production rollout.
 
 Plus references for [authentication](reference/authentication.md), [IAM permissions](reference/iam-permissions.md), [encryption](reference/encryption.md), [jobs](reference/jobs.md), [replication](reference/replication.md), [lifecycle](reference/lifecycle.md), [the event outbox](reference/event-outbox.md), [declarative IAM](reference/declarative-iam.md), and [rate limits](reference/rate-limits.md).
 
@@ -42,6 +60,8 @@ Plus references for [authentication](reference/authentication.md), [IAM permissi
 The why behind the design, one concept per page:
 
 - [How delta compression works](explanation/delta-compression.md) — what deltas well, what honestly doesn't, and why GETs are byte-identical.
+- [How migration works](explanation/how-migration-works.md) — in-place vs. copy-through, why it's not lazy-on-read, and why there's no downtime.
+- [Compression vs. S3 Object Versioning](explanation/versioning-vs-s3-versioning.md) — the disambiguation: DeltaGlider does not implement native S3 versioning, and what that means for ransomware rollback.
 - [Multi-backend routing](explanation/multi-backend-architecture.md) — one endpoint over many backends, aliasing, and trusting cheap storage.
 - [Authentication and access control](explanation/security-model.md) — the four layers every request passes through, in order.
 - [Encryption at rest](explanation/encryption-at-rest.md) — the threat model, the modes, and the honest costs.

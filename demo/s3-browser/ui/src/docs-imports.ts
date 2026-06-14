@@ -61,6 +61,9 @@ import REF_JOBS from '../../../../docs/product/reference/jobs.md?raw';
 import REF_REPLICATION from '../../../../docs/product/reference/replication.md?raw';
 import REF_LIFECYCLE from '../../../../docs/product/reference/lifecycle.md?raw';
 import REF_EVENT_OUTBOX from '../../../../docs/product/reference/event-outbox.md?raw';
+import REF_CAPACITY from '../../../../docs/product/reference/capacity-planning.md?raw';
+import EXP_MIGRATION from '../../../../docs/product/explanation/how-migration-works.md?raw';
+import EXP_VERSIONING from '../../../../docs/product/explanation/versioning-vs-s3-versioning.md?raw';
 
 // Grouping + ordering come from the shared manifest — the SINGLE source of
 // truth, read by BOTH this in-product viewer and the marketing-website docs
@@ -113,16 +116,19 @@ const CONTENT_BY_PATH: Record<string, string> = {
   'reference/cli': REF_CLI,
   'reference/metrics': REF_METRICS,
   'explanation/delta-compression': EXP_DELTA,
+  'explanation/how-migration-works': EXP_MIGRATION,
   'explanation/multi-backend-architecture': EXP_MULTIBACKEND,
   'explanation/security-model': EXP_SECURITY,
   'explanation/encryption-at-rest': EXP_ENCRYPTION,
   'explanation/jobs-and-durability': EXP_JOBS,
+  'explanation/versioning-vs-s3-versioning': EXP_VERSIONING,
   'reference/encryption': REF_ENCRYPTION,
   'reference/declarative-iam': REF_DECLARATIVE_IAM,
   'reference/jobs': REF_JOBS,
   'reference/replication': REF_REPLICATION,
   'reference/lifecycle': REF_LIFECYCLE,
   'reference/event-outbox': REF_EVENT_OUTBOX,
+  'reference/capacity-planning': REF_CAPACITY,
 };
 
 /** Extract the first `# heading` from markdown content */
