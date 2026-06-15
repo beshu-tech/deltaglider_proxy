@@ -3,11 +3,12 @@
 //! Lifecycle execution through the DeltaGlider engine.
 
 use super::planner::{
-    compile_rule_globs, lifecycle_prefix, plan_object, Decision, PlannedLifecycleAction, SkipReason,
+    compile_rule_globs, is_internal_key, lifecycle_prefix, plan_object, plan_retain_newest,
+    Candidate, Decision, PlannedLifecycleAction, QualifySpec, SkipReason,
 };
 use super::state_store::{LifecycleFailureInsert, LifecycleRunTotals};
 use crate::config_db::ConfigDb;
-use crate::config_sections::LifecycleRule;
+use crate::config_sections::{LifecycleAction, LifecycleRetainNewestAction, LifecycleRule};
 use crate::deltaglider::DynEngine;
 use crate::event_outbox::{EventKind, EventSource, NewEvent};
 use crate::job_loop::Pager;
@@ -52,8 +53,19 @@ pub struct LifecycleRunOutcome {
     pub objects_skipped: i64,
     pub bytes_affected: i64,
     pub errors: i64,
+    /// retain-newest only: candidates excluded by `qualify` (too small / too
+    /// young) — never kept, never deleted. Default 0 for age rules.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub objects_ignored: i64,
+    /// retain-newest only: candidates spared by `protect_younger_than` this run.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub objects_protected: i64,
     pub candidates: Vec<PreviewObject>,
     pub failures: Vec<LifecycleFailure>,
+}
+
+fn is_zero_i64(v: &i64) -> bool {
+    *v == 0
 }
 
 #[derive(Debug, Clone)]
@@ -194,10 +206,26 @@ async fn run_or_preview(
     execute: bool,
     ctx: Option<RunContext>,
 ) -> Result<LifecycleRunOutcome, String> {
-    let expire_after = humantime::parse_duration(&rule.expire_after)
-        .map_err(|err| format!("expire_after={} invalid: {}", rule.expire_after, err))?;
+    // retain-newest is SET-RELATIVE (it ranks the whole prefix) and takes a
+    // dedicated collect→rank→act path — it must never touch the per-object age
+    // machinery below (which would parse a nonexistent expire_after and apply a
+    // per-object decision that can't express "keep newest N").
+    if let LifecycleAction::RetainNewest(action) = &rule.action {
+        return run_or_preview_retain_newest(db, engine, rule, action, response_cap, execute, ctx)
+            .await;
+    }
+
+    let expire_after_str = rule.expire_after.as_deref().ok_or_else(|| {
+        format!(
+            "lifecycle rule '{}' {} action requires expire_after",
+            rule.name,
+            rule.action.kind()
+        )
+    })?;
+    let expire_after = humantime::parse_duration(expire_after_str)
+        .map_err(|err| format!("expire_after={expire_after_str} invalid: {err}"))?;
     let expire_after = ChronoDuration::from_std(expire_after)
-        .map_err(|err| format!("expire_after={} out of range: {}", rule.expire_after, err))?;
+        .map_err(|err| format!("expire_after={expire_after_str} out of range: {err}"))?;
     let expire_before = Utc::now() - expire_after;
     let (include_globs, exclude_globs) = compile_rule_globs(rule).map_err(|err| err.to_string())?;
     let prefix = lifecycle_prefix(rule);
@@ -367,6 +395,243 @@ async fn run_or_preview(
         out.status = "failed".to_string();
     }
     Ok(out)
+}
+
+/// Upper bound on objects collected for a single retain-newest pass. The decision
+/// is set-relative, so we must hold the whole candidate set in memory. Backup
+/// prefixes are tiny; this cap only fires on a pathological prefix, and when it
+/// does we FAIL the run rather than rank a truncated set (which could delete an
+/// object that is actually in the newest N). ~200k candidates ≈ a few MB.
+const MAX_RETAIN_NEWEST_CANDIDATES: usize = 200_000;
+
+/// Dedicated collect→rank→act path for `retain-newest` rules.
+///
+/// Unlike the age path this is NOT resumable mid-prefix: the keep/delete decision
+/// needs the COMPLETE candidate set, so a half-collected set is meaningless. The
+/// collect phase is read-only, so restarting it after a crash is free and correct;
+/// only the act phase mutates, and `engine.delete` is idempotent.
+#[allow(clippy::too_many_arguments)]
+async fn run_or_preview_retain_newest(
+    db: Option<Arc<Mutex<ConfigDb>>>,
+    engine: &Arc<DynEngine>,
+    rule: &LifecycleRule,
+    action: &LifecycleRetainNewestAction,
+    response_cap: usize,
+    execute: bool,
+    ctx: Option<RunContext>,
+) -> Result<LifecycleRunOutcome, String> {
+    // Defensive guard: a count-0 retain rule would delete every qualifying
+    // object in the prefix. The Deserialize impl and validate_lifecycle already
+    // reject it, but a delete path gets belt-and-suspenders — refuse to run,
+    // delete nothing, regardless of how the rule was constructed.
+    if action.count == 0 {
+        return Err(format!(
+            "lifecycle rule '{}' retain-newest count is 0 — refusing to run (would delete the \
+             whole prefix)",
+            rule.name
+        ));
+    }
+
+    let (include_globs, exclude_globs) = compile_rule_globs(rule).map_err(|err| err.to_string())?;
+    let prefix = lifecycle_prefix(rule);
+    let page_size = rule.batch_size.clamp(1, 10_000);
+
+    let qualify = QualifySpec {
+        min_size_bytes: action.qualify.min_size_bytes,
+        min_age: parse_chrono_duration_opt(action.qualify.min_age.as_deref(), "qualify.min_age")?,
+    };
+    let protect_younger_than = parse_chrono_duration_opt(
+        action.protect_younger_than.as_deref(),
+        "protect_younger_than",
+    )?;
+
+    let mut out = LifecycleRunOutcome {
+        run_id: ctx.as_ref().and_then(|c| c.run_id),
+        rule_name: rule.name.clone(),
+        status: if execute { "succeeded" } else { "preview" }.to_string(),
+        ..LifecycleRunOutcome::default()
+    };
+
+    // ── Collect phase (read-only): the full candidate set, structurally filtered ──
+    // Keep the FileMetadata alongside each candidate so the act phase can emit the
+    // delete event without a second metadata fetch.
+    let mut metas: std::collections::HashMap<String, crate::types::FileMetadata> =
+        std::collections::HashMap::new();
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut pager = Pager::fresh();
+
+    'pages: while let Some(page_idx) = pager.begin_page() {
+        if execute
+            && !renew_run_lease(&db, rule, ctx.as_ref(), &mut out.failures, response_cap).await?
+        {
+            out.errors += 1;
+            break 'pages;
+        }
+        let page = engine
+            .list_objects(&rule.bucket, &prefix, None, page_size, pager.token(), true)
+            .await
+            .map_err(|err| format!("list lifecycle page {page_idx} failed: {err}"))?;
+
+        out.objects_scanned += page.objects.len() as i64;
+        for (key, meta) in page.objects {
+            // Same structural guards as the age path (the pure plan_object's
+            // first three checks). Globs/internal/marker filtering happens HERE,
+            // BEFORE the size/age qualify ranking in plan_retain_newest.
+            if key.ends_with('/') || is_internal_key(&key) {
+                out.objects_skipped += 1;
+                continue;
+            }
+            if exclude_globs.is_match(&key) {
+                out.objects_skipped += 1;
+                continue;
+            }
+            if !include_globs.is_empty() && !include_globs.is_match(&key) {
+                out.objects_skipped += 1;
+                continue;
+            }
+
+            if candidates.len() >= MAX_RETAIN_NEWEST_CANDIDATES {
+                // Truncating the set could delete an object that is actually in
+                // the newest N — never silently keep the wrong set.
+                let msg = format!(
+                    "retain-newest candidate cap ({MAX_RETAIN_NEWEST_CANDIDATES}) exceeded for \
+                     prefix {:?}; refusing to rank a truncated set — narrow the prefix or add \
+                     include_globs",
+                    prefix
+                );
+                warn!("lifecycle rule '{}': {}", rule.name, msg);
+                out.errors += 1;
+                push_failure(&mut out.failures, response_cap, String::new(), msg.clone());
+                record_failure(&db, rule, ctx.as_ref(), "", &msg).await?;
+                out.status = "failed".to_string();
+                return Ok(out);
+            }
+            candidates.push(Candidate {
+                key: key.clone(),
+                created_at: meta.created_at,
+                size: meta.file_size,
+            });
+            metas.insert(key, meta);
+        }
+
+        if !pager.advance(page.is_truncated, page.next_continuation_token) {
+            break 'pages;
+        }
+    }
+
+    // ── Rank phase (pure): the entire data-loss-sensitive decision ──
+    let plan = plan_retain_newest(
+        &candidates,
+        action.count,
+        &qualify,
+        protect_younger_than,
+        now(),
+    );
+
+    out.objects_ignored = plan.ignored.len() as i64;
+    out.objects_protected = plan.protected.len() as i64;
+
+    // Preview rows = the would-delete set (what the operator most needs to see).
+    for c in &plan.delete {
+        if out.candidates.len() >= response_cap {
+            break;
+        }
+        out.candidates.push(PreviewObject {
+            bucket: rule.bucket.clone(),
+            key: c.key.clone(),
+            action: "delete".to_string(),
+            destination_bucket: None,
+            destination_key: None,
+            delete_source_after_success: false,
+            created_at: c.created_at.to_rfc3339(),
+            size: c.size,
+        });
+    }
+
+    // ── Act phase ──
+    if !execute {
+        out.objects_affected = plan.delete.len() as i64;
+        out.bytes_affected = plan.delete.iter().map(|c| c.size as i64).sum();
+        return Ok(out);
+    }
+
+    for c in &plan.delete {
+        // TOCTOU guard: the ranking used a snapshot taken during collect. If the
+        // object was OVERWRITTEN between collect and now (same key, newer
+        // created_at), the snapshot is stale — re-ranked, the fresh object might
+        // be in the KEEP set. Re-HEAD and skip the delete on a created_at change
+        // so a concurrent backup upload can never be deleted out from under the
+        // client. (A delete by another writer surfaces as NotFound → already gone.)
+        match engine.head(&rule.bucket, &c.key).await {
+            Ok(current) if current.created_at != c.created_at => {
+                out.objects_skipped += 1;
+                debug!(
+                    "lifecycle rule '{}': retain-newest skipping {:?} — changed since collect \
+                     (ranked {} → current {})",
+                    rule.name,
+                    c.key,
+                    c.created_at.to_rfc3339(),
+                    current.created_at.to_rfc3339()
+                );
+                continue;
+            }
+            // Already gone (deleted by another writer) — nothing to do.
+            Err(crate::deltaglider::EngineError::NotFound(_)) => {
+                out.objects_skipped += 1;
+                continue;
+            }
+            // Unchanged, or HEAD failed for another reason: fall through to the
+            // delete, which re-resolves metadata and reports its own errors.
+            _ => {}
+        }
+
+        let meta = metas.get(&c.key);
+        match engine.delete(&rule.bucket, &c.key).await {
+            Ok(()) => {
+                out.objects_affected += 1;
+                out.bytes_affected += c.size as i64;
+                if let Some(meta) = meta {
+                    append_lifecycle_delete_event(db.as_ref(), rule, &c.key, meta, "retain-newest")
+                        .await;
+                }
+            }
+            Err(err) => {
+                out.errors += 1;
+                let msg = err.to_string();
+                push_failure(&mut out.failures, response_cap, c.key.clone(), msg.clone());
+                record_failure(&db, rule, ctx.as_ref(), &c.key, &msg).await?;
+            }
+        }
+    }
+
+    if out.errors > 0 {
+        out.status = "failed".to_string();
+    }
+    Ok(out)
+}
+
+/// Parse an optional humantime string into a chrono Duration, mapping errors to
+/// the run-failure string with the field name for context.
+fn parse_chrono_duration_opt(
+    value: Option<&str>,
+    field: &str,
+) -> Result<Option<ChronoDuration>, String> {
+    match value {
+        None => Ok(None),
+        Some(s) => {
+            let std = humantime::parse_duration(s)
+                .map_err(|err| format!("{field}={s} invalid: {err}"))?;
+            let chrono = ChronoDuration::from_std(std)
+                .map_err(|err| format!("{field}={s} out of range: {err}"))?;
+            Ok(Some(chrono))
+        }
+    }
+}
+
+/// `Utc::now()` indirection so the retain path uses a single timestamp for the
+/// whole pass (consistent qualify/protect cutoffs across the candidate set).
+fn now() -> chrono::DateTime<Utc> {
+    Utc::now()
 }
 
 fn preview_action_fields(

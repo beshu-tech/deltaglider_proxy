@@ -303,6 +303,45 @@ const {
   assert.equal(actionKind('delete'), 'delete');
 }
 
+// (9b) retain-newest: actionKind, count validation, expire_after dropped,
+//      empty qualify fields stripped from the wire.
+{
+  assert.equal(
+    actionKind({ type: 'retain-newest', count: 2 }),
+    'retain-newest'
+  );
+
+  // count < 1 is rejected (a 0 would empty the prefix — must be an explicit
+  // delete rule, never a retain typo).
+  assert.equal(
+    buildLifecyclePayload({ ...DEFAULT_LIFECYCLE, rules: [{
+      ...emptyDeleteRule('keep'), bucket: 'b',
+      action: { type: 'retain-newest', count: 0 },
+    }] }).error,
+    'Rule keep: retain-newest count must be at least 1.'
+  );
+
+  // A valid retain rule needs NO expire_after, and any stray expire_after is
+  // dropped from the wire; qualify with only min_size keeps just that field.
+  const res = buildLifecyclePayload({ ...DEFAULT_LIFECYCLE, rules: [{
+    ...emptyDeleteRule('keep-last-2'), bucket: 'db-archive', prefix: 'nightly',
+    expire_after: '99d', // must be dropped
+    action: {
+      type: 'retain-newest',
+      count: 2,
+      qualify: { min_size_bytes: 1048576, min_age: '' /* empty → stripped */ },
+      protect_younger_than: '',
+    },
+  }] });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  const rule = res.body.lifecycle.rules[0];
+  assert.equal(rule.expire_after, undefined, 'expire_after dropped for retain-newest');
+  assert.equal(rule.action.type, 'retain-newest');
+  assert.equal(rule.action.count, 2);
+  assert.deepEqual(rule.action.qualify, { min_size_bytes: 1048576 }, 'empty min_age stripped');
+  assert.equal('protect_younger_than' in rule.action, false, 'empty protect stripped');
+}
+
 // (10) normalizeLifecycle backfills defaults from emptyRule for partial rules,
 //      and normalises a transition action (exercises normalizeAction).
 {

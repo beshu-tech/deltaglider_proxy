@@ -1,6 +1,6 @@
 # Lifecycle rules
 
-Lifecycle expiration for engine-visible objects: delete old objects, or transition/archive them to another bucket/prefix. Lifecycle rules appear on the unified Jobs surface (`GET /_/api/admin/jobs`, job id `lifecycle:<rule-name>`); see [Jobs](jobs.md).
+Lifecycle for engine-visible objects: delete old objects by age, keep the newest *N* by count (`retain-newest`), or transition/archive them to another bucket/prefix. Lifecycle rules appear on the unified Jobs surface (`GET /_/api/admin/jobs`, job id `lifecycle:<rule-name>`); see [Jobs](jobs.md).
 
 ## Scope
 
@@ -43,6 +43,35 @@ Rule names use `[A-Za-z0-9_.-]{1,64}` and must be unique.
 ```
 
 `delete_source_after_success: false` makes transition an archive/copy; `true` gives move semantics. Transition is copy-first: lifecycle copies, verifies the destination HEAD when possible, and deletes the source only after the copy succeeds.
+
+### Count-based retention: `retain-newest`
+
+`retain-newest` keeps the newest `count` objects in a prefix and deletes the rest — selection by *count*, not age (the rule native S3 lifecycle never shipped). `expire_after` does not apply to a `retain-newest` rule and may be omitted.
+
+```yaml
+      - name: keep-last-two-nightly-dumps
+        enabled: true
+        bucket: db-archive
+        prefix: "nightly/"
+        action:
+          type: retain-newest
+          count: 2                  # keep the 2 newest QUALIFYING objects
+          qualify:                  # only objects passing ALL of these are ranked
+            min_size_bytes: 1048576 #   ignore truncated/empty junk (1 MiB)
+            min_age: "1h"           #   ignore objects still being uploaded
+          protect_younger_than: "7d" # optional delete-side guard (see below)
+        include_globs: ["nightly/**/*.dump"]
+```
+
+- **`count`** (required, ≥ 1) — how many of the newest *qualifying* objects to keep. Objects are ranked by `created_at` descending, with a deterministic key-descending tie-break (stable across runs).
+- **`qualify`** (optional) — an **eligibility filter**, not a delete guard. An object failing it is *invisible* to the rule: never counted toward `count`, never deleted. This is what stops an accidental empty/truncated file (a stray `README`, a half-written dump) from anchoring the keep set and pushing a real backup into the delete set.
+  - **`min_size_bytes`** — the object's *original* (hydrated) size must be ≥ this. Guards against empty/placeholder files.
+  - **`min_age`** (humantime) — object must be older than this. Guards against in-flight uploads being counted before they finish.
+- **`protect_younger_than`** (optional, humantime) — a **delete-side guard**: an object selected for deletion is spared *this run* if it is younger than this. It is never promoted into the keep set; next run, once older, normal ranking applies. Most rules omit it.
+
+The eligibility-vs-guard distinction is deliberate: `qualify.min_age` means "too young to count yet" (ignored); `protect_younger_than` means "old enough to count, but don't physically delete it yet" (spared). Preview reports `objects_ignored` and `objects_protected` so the disposition is visible before anything runs.
+
+Unlike age rules, a `retain-newest` run is **atomic per execution** — its keep/delete decision needs the complete candidate set, so it does not resume mid-prefix from a cursor (the read-only collect phase simply restarts). A prefix with more than 200,000 candidate objects fails the rule loudly rather than rank a truncated set.
 
 ## Admin API
 

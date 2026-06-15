@@ -441,6 +441,10 @@ pub enum LifecycleAction {
     #[default]
     Delete,
     Transition(LifecycleTransitionAction),
+    /// Count-based retention: keep the newest `count` qualifying objects in
+    /// the prefix, delete the rest. The rule S3 lifecycle never shipped —
+    /// see `docs/plan/lifecycle-retain-newest.md`.
+    RetainNewest(LifecycleRetainNewestAction),
 }
 
 impl LifecycleAction {
@@ -448,6 +452,7 @@ impl LifecycleAction {
         match self {
             Self::Delete => "delete",
             Self::Transition(_) => "transition",
+            Self::RetainNewest(_) => "retain-newest",
         }
     }
 }
@@ -457,6 +462,43 @@ pub struct LifecycleTransitionAction {
     pub destination: LifecycleDestination,
     #[serde(default)]
     pub delete_source_after_success: bool,
+}
+
+/// Count-based retention action. Keep the newest `count` *qualifying* objects;
+/// delete the rest.
+///
+/// The `qualify` filter is an ELIGIBILITY gate, not a delete guard: an object
+/// failing it is invisible to the rule — never counted toward `count`, never
+/// deleted. This is what stops an accidental empty/truncated file from anchoring
+/// the keep set and pushing a real backup into the delete set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LifecycleRetainNewestAction {
+    /// Number of newest qualifying objects to keep. Must be >= 1 (validated).
+    pub count: u32,
+    /// Eligibility filter — only objects passing this are ranked/counted.
+    #[serde(default)]
+    pub qualify: LifecycleQualifySpec,
+    /// Delete-side guard: an object selected for deletion is spared this run if
+    /// it is younger than this (humantime). It is NOT promoted into the keep
+    /// set — just not physically deleted yet. Optional; most users omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protect_younger_than: Option<String>,
+}
+
+/// Eligibility filter for `retain-newest`. An object must pass ALL set fields to
+/// be counted/ranked. Absent field = no filter on that dimension.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LifecycleQualifySpec {
+    /// Object's ORIGINAL (hydrated) size must be >= this many bytes. Guards
+    /// against empty/truncated/placeholder files anchoring the keep set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_size_bytes: Option<u64>,
+    /// Object must be older than this (humantime). Guards against half-written /
+    /// in-flight objects being counted before the upload finishes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_age: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -475,6 +517,13 @@ struct LifecycleActionMap {
     destination: Option<LifecycleDestination>,
     #[serde(default)]
     delete_source_after_success: bool,
+    // retain-newest fields
+    #[serde(default)]
+    count: Option<u32>,
+    #[serde(default)]
+    qualify: Option<LifecycleQualifySpec>,
+    #[serde(default)]
+    protect_younger_than: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -483,6 +532,21 @@ struct LifecycleTransitionActionWire<'a> {
     kind: &'static str,
     destination: &'a LifecycleDestination,
     delete_source_after_success: bool,
+}
+
+#[derive(Serialize)]
+struct LifecycleRetainNewestActionWire<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    count: u32,
+    #[serde(skip_serializing_if = "lifecycle_qualify_is_empty")]
+    qualify: &'a LifecycleQualifySpec,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    protect_younger_than: &'a Option<String>,
+}
+
+fn lifecycle_qualify_is_empty(q: &&LifecycleQualifySpec) -> bool {
+    q.min_size_bytes.is_none() && q.min_age.is_none()
 }
 
 impl Serialize for LifecycleAction {
@@ -496,6 +560,13 @@ impl Serialize for LifecycleAction {
                 kind: "transition",
                 destination: &action.destination,
                 delete_source_after_success: action.delete_source_after_success,
+            }
+            .serialize(serializer),
+            Self::RetainNewest(action) => LifecycleRetainNewestActionWire {
+                kind: "retain-newest",
+                count: action.count,
+                qualify: &action.qualify,
+                protect_younger_than: &action.protect_younger_than,
             }
             .serialize(serializer),
         }
@@ -520,6 +591,9 @@ impl<'de> Deserialize<'de> for LifecycleAction {
                 "transition" | "archive" => Err(serde::de::Error::custom(
                     "lifecycle transition action must include destination: { type: transition, destination: { bucket, prefix } }",
                 )),
+                "retain-newest" => Err(serde::de::Error::custom(
+                    "lifecycle retain-newest action must include count: { type: retain-newest, count: N }",
+                )),
                 other => Err(serde::de::Error::custom(format!(
                     "unknown lifecycle action {other:?}"
                 ))),
@@ -535,6 +609,29 @@ impl<'de> Deserialize<'de> for LifecycleAction {
                     Ok(Self::Transition(LifecycleTransitionAction {
                         destination,
                         delete_source_after_success: map.delete_source_after_success,
+                    }))
+                }
+                "retain-newest" => {
+                    let count = map.count.ok_or_else(|| {
+                        serde::de::Error::custom(
+                            "lifecycle retain-newest action requires count",
+                        )
+                    })?;
+                    // HARD reject count==0 at parse time — a count-0 retain rule
+                    // deletes EVERY qualifying object in the prefix. This must
+                    // fail the config load loudly (not a skippable warning), so
+                    // a typo or an empty `${env:KEEP}` can never silently empty a
+                    // backup prefix. (validate_lifecycle also warns, for the GUI.)
+                    if count == 0 {
+                        return Err(serde::de::Error::custom(
+                            "lifecycle retain-newest count must be >= 1 (count: 0 would delete \
+                             every object in the prefix — use a delete rule if that is intended)",
+                        ));
+                    }
+                    Ok(Self::RetainNewest(LifecycleRetainNewestAction {
+                        count,
+                        qualify: map.qualify.unwrap_or_default(),
+                        protect_younger_than: map.protect_younger_than,
                     }))
                 }
                 other => Err(serde::de::Error::custom(format!(
@@ -569,8 +666,11 @@ pub struct LifecycleRule {
     pub action: LifecycleAction,
 
     /// Delete objects whose `created_at` metadata is older than this age.
-    /// Humantime string, e.g. `30d`, `12h`.
-    pub expire_after: String,
+    /// Humantime string, e.g. `30d`, `12h`. REQUIRED for `delete`/`transition`
+    /// actions; ignored (and may be omitted) for `retain-newest`, which selects
+    /// by count rather than age. Validated per-action in `validate_lifecycle`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expire_after: Option<String>,
 
     /// Optional globset: if non-empty, only matching keys are candidates.
     #[serde(default)]
@@ -1646,16 +1746,59 @@ pub fn validate_lifecycle(cfg: &LifecycleConfig) -> Vec<String> {
             }
         }
 
-        match humantime::parse_duration(&rule.expire_after) {
-            Ok(d) if d.as_secs() == 0 => warnings.push(format!(
-                "lifecycle rule '{}' expire_after={} would expire everything immediately",
-                rule.name, rule.expire_after
-            )),
-            Ok(_) => {}
-            Err(e) => warnings.push(format!(
-                "lifecycle rule '{}' expire_after={} invalid: {}",
-                rule.name, rule.expire_after, e
-            )),
+        // expire_after vs. action: age-based actions (delete/transition) REQUIRE a
+        // valid expire_after; retain-newest selects by count and ignores it.
+        match &rule.action {
+            LifecycleAction::RetainNewest(action) => {
+                if action.count == 0 {
+                    warnings.push(format!(
+                        "lifecycle rule '{}' retain-newest count=0 would delete everything — use a delete rule if that is intended",
+                        rule.name
+                    ));
+                }
+                if let Some(min_age) = &action.qualify.min_age {
+                    if let Err(e) = humantime::parse_duration(min_age) {
+                        warnings.push(format!(
+                            "lifecycle rule '{}' qualify.min_age={} invalid: {}",
+                            rule.name, min_age, e
+                        ));
+                    }
+                }
+                if let Some(protect) = &action.protect_younger_than {
+                    if let Err(e) = humantime::parse_duration(protect) {
+                        warnings.push(format!(
+                            "lifecycle rule '{}' protect_younger_than={} invalid: {}",
+                            rule.name, protect, e
+                        ));
+                    }
+                }
+                if rule.expire_after.is_some() {
+                    warnings.push(format!(
+                        "lifecycle rule '{}' sets expire_after but uses retain-newest — expire_after is ignored for count-based rules",
+                        rule.name
+                    ));
+                }
+            }
+            LifecycleAction::Delete | LifecycleAction::Transition(_) => {
+                match rule.expire_after.as_deref() {
+                    None => warnings.push(format!(
+                        "lifecycle rule '{}' {} action requires expire_after",
+                        rule.name,
+                        rule.action.kind()
+                    )),
+                    Some(expire_after) => match humantime::parse_duration(expire_after) {
+                        Ok(d) if d.as_secs() == 0 => warnings.push(format!(
+                            "lifecycle rule '{}' expire_after={} would expire everything immediately",
+                            rule.name, expire_after
+                        )),
+                        Ok(_) => {}
+                        Err(e) => warnings.push(format!(
+                            "lifecycle rule '{}' expire_after={} invalid: {}",
+                            rule.name, expire_after, e
+                        )),
+                    },
+                }
+            }
         }
 
         if rule.batch_size == 0 || rule.batch_size > MAX_LIFECYCLE_BATCH_SIZE {
@@ -2399,5 +2542,177 @@ mod tests {
         let yaml = serde_yaml::to_string(&cfg).unwrap();
         let back: ReplicationConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(cfg, back);
+    }
+
+    // ───────────────────── retain-newest config (serde + validation) ─────────────
+
+    fn lifecycle_rule_retain(action: LifecycleAction) -> LifecycleRule {
+        LifecycleRule {
+            name: "keep-last".to_string(),
+            enabled: true,
+            bucket: "db-archive".to_string(),
+            prefix: "nightly/".to_string(),
+            action,
+            expire_after: None,
+            include_globs: vec![],
+            exclude_globs: default_lifecycle_exclude_globs(),
+            batch_size: default_lifecycle_batch_size(),
+        }
+    }
+
+    #[test]
+    fn retain_newest_action_yaml_roundtrip() {
+        let action = LifecycleAction::RetainNewest(LifecycleRetainNewestAction {
+            count: 2,
+            qualify: LifecycleQualifySpec {
+                min_size_bytes: Some(1024 * 1024),
+                min_age: Some("1h".to_string()),
+            },
+            protect_younger_than: Some("7d".to_string()),
+        });
+        let yaml = serde_yaml::to_string(&action).unwrap();
+        assert!(yaml.contains("retain-newest"), "yaml: {yaml}");
+        let back: LifecycleAction = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(action, back);
+    }
+
+    #[test]
+    fn retain_newest_action_minimal_yaml_parses() {
+        // Only count — qualify defaults to empty, protect absent.
+        let yaml = "type: retain-newest\ncount: 3\n";
+        let action: LifecycleAction = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            action,
+            LifecycleAction::RetainNewest(LifecycleRetainNewestAction {
+                count: 3,
+                qualify: LifecycleQualifySpec::default(),
+                protect_younger_than: None,
+            })
+        );
+    }
+
+    #[test]
+    fn retain_newest_string_form_is_rejected() {
+        // Bare "retain-newest" string has no count → explicit error, not a panic.
+        let err = serde_yaml::from_str::<LifecycleAction>("retain-newest")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("count"), "err: {err}");
+    }
+
+    #[test]
+    fn retain_newest_map_without_count_is_rejected() {
+        let err = serde_yaml::from_str::<LifecycleAction>("type: retain-newest\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("count"), "err: {err}");
+    }
+
+    #[test]
+    fn retain_newest_count_zero_is_hard_rejected_at_parse() {
+        // count: 0 would delete the WHOLE prefix — it must fail the config LOAD
+        // loudly, not slip through as an advisory warning (the apply path does
+        // not block on warnings). This is the config-file/GitOps safety net.
+        let err = serde_yaml::from_str::<LifecycleAction>("type: retain-newest\ncount: 0\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("must be >= 1") || err.contains(">= 1"),
+            "count:0 must be rejected at parse, err: {err}"
+        );
+    }
+
+    #[test]
+    fn retain_newest_unknown_field_is_rejected() {
+        // deny_unknown_fields on the qualify spec guards typos: a misspelled
+        // `min_sized` must NOT silently parse as "no size filter" (which would
+        // let junk poison the keep set). The untagged Wire enum surfaces this as
+        // a generic "did not match any variant" rather than a field-specific
+        // message — acceptable: the safety property is that it's REJECTED, not
+        // silently accepted. (A `min_sized` that parsed would be the dangerous bug.)
+        let res = serde_yaml::from_str::<LifecycleAction>(
+            "type: retain-newest\ncount: 2\nqualify:\n  min_sized: 5\n",
+        );
+        assert!(
+            res.is_err(),
+            "a typo'd qualify field must be rejected, got: {res:?}"
+        );
+    }
+
+    #[test]
+    fn validate_retain_newest_count_zero_warns() {
+        let cfg = LifecycleConfig {
+            rules: vec![lifecycle_rule_retain(LifecycleAction::RetainNewest(
+                LifecycleRetainNewestAction {
+                    count: 0,
+                    qualify: LifecycleQualifySpec::default(),
+                    protect_younger_than: None,
+                },
+            ))],
+            ..Default::default()
+        };
+        let warnings = validate_lifecycle(&cfg);
+        assert!(
+            warnings.iter().any(|w| w.contains("count=0")),
+            "warnings: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn validate_retain_newest_bad_min_age_warns() {
+        let cfg = LifecycleConfig {
+            rules: vec![lifecycle_rule_retain(LifecycleAction::RetainNewest(
+                LifecycleRetainNewestAction {
+                    count: 2,
+                    qualify: LifecycleQualifySpec {
+                        min_size_bytes: None,
+                        min_age: Some("not-a-duration".to_string()),
+                    },
+                    protect_younger_than: None,
+                },
+            ))],
+            ..Default::default()
+        };
+        let warnings = validate_lifecycle(&cfg);
+        assert!(
+            warnings.iter().any(|w| w.contains("min_age")),
+            "warnings: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn validate_delete_action_without_expire_after_warns() {
+        // The flip side: a delete rule MUST carry expire_after.
+        let cfg = LifecycleConfig {
+            rules: vec![lifecycle_rule_retain(LifecycleAction::Delete)],
+            ..Default::default()
+        };
+        let warnings = validate_lifecycle(&cfg);
+        assert!(
+            warnings.iter().any(|w| w.contains("requires expire_after")),
+            "warnings: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn validate_retain_newest_valid_rule_is_clean() {
+        let cfg = LifecycleConfig {
+            rules: vec![lifecycle_rule_retain(LifecycleAction::RetainNewest(
+                LifecycleRetainNewestAction {
+                    count: 2,
+                    qualify: LifecycleQualifySpec {
+                        min_size_bytes: Some(1_048_576),
+                        min_age: Some("1h".to_string()),
+                    },
+                    protect_younger_than: Some("7d".to_string()),
+                },
+            ))],
+            ..Default::default()
+        };
+        let warnings = validate_lifecycle(&cfg);
+        assert!(
+            warnings.is_empty(),
+            "expected no warnings, got: {warnings:?}"
+        );
     }
 }

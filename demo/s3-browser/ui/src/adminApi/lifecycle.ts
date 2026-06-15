@@ -2,6 +2,11 @@
 import type { AdminConfig } from './core';
 import type { ReplicationConfig } from './replication';
 
+export interface LifecycleQualifySpec {
+  min_size_bytes?: number;
+  min_age?: string;
+}
+
 export type LifecycleAction =
   | 'delete'
   | {
@@ -11,6 +16,12 @@ export type LifecycleAction =
         prefix?: string;
       };
       delete_source_after_success?: boolean;
+    }
+  | {
+      type: 'retain-newest';
+      count: number;
+      qualify?: LifecycleQualifySpec;
+      protect_younger_than?: string;
     };
 
 export interface LifecycleRuleConfig {
@@ -19,7 +30,8 @@ export interface LifecycleRuleConfig {
   bucket: string;
   prefix: string;
   action?: LifecycleAction;
-  expire_after: string;
+  /** Required for delete/transition; omitted for retain-newest (count-based). */
+  expire_after?: string;
   include_globs: string[];
   exclude_globs: string[];
   batch_size: number;

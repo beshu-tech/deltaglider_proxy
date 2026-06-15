@@ -1,10 +1,13 @@
 import { Alert, Input, InputNumber, Select, Switch } from 'antd';
-import type { LifecycleRuleConfig } from '../adminApi';
+import type { LifecycleAction, LifecycleRuleConfig } from '../adminApi';
 import BucketPrefixInput from './BucketPrefixInput';
 import FormField from './FormField';
 import { AdvancedDisclosure } from './ruleEditorFields';
 import { lineList, lines } from './ruleEditorHelpers';
 import { actionKind } from './lifecyclePayload';
+
+type RetainAction = Extract<LifecycleAction, { type: 'retain-newest' }>;
+type TransitionAction = Extract<LifecycleAction, { type: 'transition' | 'archive' }>;
 
 
 /**
@@ -24,19 +27,30 @@ export default function RuleEditor({
   onChange: (patch: Partial<LifecycleRuleConfig>) => void;
   onRename: (nextName: string) => void;
 }) {
+  const kind = actionKind(rule.action);
   const transitionAction =
-    actionKind(rule.action) === 'transition' && typeof rule.action === 'object'
-      ? rule.action
+    kind === 'transition' && typeof rule.action === 'object'
+      ? (rule.action as TransitionAction)
       : null;
-  const updateTransition = (
-    patch: Partial<Exclude<LifecycleRuleConfig['action'], 'delete' | undefined>>
-  ) => {
-    const current = transitionAction || {
-      type: 'transition' as const,
+  const retainAction =
+    kind === 'retain-newest' && typeof rule.action === 'object'
+      ? (rule.action as RetainAction)
+      : null;
+  const updateTransition = (patch: Partial<TransitionAction>) => {
+    const current: TransitionAction = transitionAction || {
+      type: 'transition',
       destination: { bucket: '', prefix: 'archive/' },
       delete_source_after_success: false,
     };
     onChange({ action: { ...current, ...patch } });
+  };
+  const updateRetain = (patch: Partial<RetainAction>) => {
+    const current: RetainAction = retainAction || { type: 'retain-newest', count: 2 };
+    onChange({ action: { ...current, ...patch } });
+  };
+  const updateQualify = (patch: { min_size_bytes?: number; min_age?: string }) => {
+    const current: RetainAction = retainAction || { type: 'retain-newest', count: 2 };
+    updateRetain({ qualify: { ...current.qualify, ...patch } });
   };
 
   return (
@@ -81,25 +95,27 @@ export default function RuleEditor({
             prefixPlaceholder="builds/releases/"
           />
         </FormField>
-        <FormField
-          label="Expire after"
-          yamlPath="storage.lifecycle.rules[].expire_after"
-          helpText="Objects whose created_at is older than this age become candidates. Humantime duration, e.g. 30d, 12h, 90d."
-        >
-          <Input
-            value={rule.expire_after}
-            onChange={(e) => onChange({ expire_after: e.target.value })}
-            placeholder="30d"
-            style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
-          />
-        </FormField>
+        {kind !== 'retain-newest' && (
+          <FormField
+            label="Expire after"
+            yamlPath="storage.lifecycle.rules[].expire_after"
+            helpText="Objects whose created_at is older than this age become candidates. Humantime duration, e.g. 30d, 12h, 90d."
+          >
+            <Input
+              value={rule.expire_after || ''}
+              onChange={(e) => onChange({ expire_after: e.target.value })}
+              placeholder="30d"
+              style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
+            />
+          </FormField>
+        )}
         <FormField
           label="Action"
           yamlPath="storage.lifecycle.rules[].action"
-          helpText="What to do with expired candidates: delete them, or archive/move them through the engine to another bucket."
+          helpText="What to do with candidates: delete by age, keep the newest N by count, or archive/move them through the engine to another bucket."
         >
           <Select
-            value={actionKind(rule.action)}
+            value={kind}
             onChange={(value) => {
               if (value === 'transition') {
                 onChange({
@@ -109,12 +125,15 @@ export default function RuleEditor({
                     delete_source_after_success: false,
                   },
                 });
+              } else if (value === 'retain-newest') {
+                onChange({ action: { type: 'retain-newest', count: 2 } });
               } else {
                 onChange({ action: 'delete' });
               }
             }}
             options={[
-              { value: 'delete', label: 'Delete', sublabel: 'Expire source objects' },
+              { value: 'delete', label: 'Delete', sublabel: 'Expire source objects by age' },
+              { value: 'retain-newest', label: 'Keep newest N', sublabel: 'Count-based — keep the latest, delete the rest' },
               { value: 'transition', label: 'Archive / move', sublabel: 'Copy first, optional source delete' },
             ]}
             optionRender={(opt) => (
@@ -129,6 +148,76 @@ export default function RuleEditor({
           />
         </FormField>
       </div>
+
+      {retainAction && (
+        <>
+          <Alert
+            type="info"
+            showIcon
+            message="Keep the newest N — count-based retention"
+            description="Ranks objects newest-first and keeps the latest N qualifying ones; the rest are deleted. The qualify filters below are an eligibility gate, not a delete guard: a file that fails them is ignored entirely — never counted toward N, never deleted — so an accidental empty or half-written file can't push a real backup out of the keep set."
+            style={{ marginTop: 14 }}
+          />
+          <div style={{ marginTop: 14, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 14 }}>
+            <FormField
+              label="Keep newest"
+              yamlPath="storage.lifecycle.rules[].action.count"
+              helpText="How many of the newest qualifying objects to keep. Everything else is deleted. Must be at least 1."
+            >
+              <InputNumber
+                value={retainAction.count}
+                onChange={(count) => updateRetain({ count: Math.max(1, Math.floor(Number(count) || 1)) })}
+                min={1}
+                max={100000}
+                style={{ width: '100%', ...inputRadius }}
+              />
+            </FormField>
+            <FormField
+              label="Ignore objects smaller than"
+              yamlPath="storage.lifecycle.rules[].action.qualify.min_size_bytes"
+              helpText="Bytes. Objects below this ORIGINAL size are ignored — never kept, never deleted — so empty/truncated junk can't anchor the keep set. Leave 0 for no size filter."
+            >
+              <InputNumber
+                value={retainAction.qualify?.min_size_bytes ?? 0}
+                onChange={(v) => {
+                  const n = Math.max(0, Math.floor(Number(v) || 0));
+                  updateQualify({ min_size_bytes: n > 0 ? n : undefined });
+                }}
+                min={0}
+                step={1048576}
+                style={{ width: '100%', ...inputRadius }}
+                addonAfter="bytes"
+              />
+            </FormField>
+            <FormField
+              label="Ignore objects younger than"
+              yamlPath="storage.lifecycle.rules[].action.qualify.min_age"
+              helpText="Humantime, e.g. 1h. Objects this young are ignored (still being uploaded). Leave blank for no age filter."
+            >
+              <Input
+                value={retainAction.qualify?.min_age || ''}
+                onChange={(e) => updateQualify({ min_age: e.target.value || undefined })}
+                placeholder="1h"
+                style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
+              />
+            </FormField>
+          </div>
+          <AdvancedDisclosure title="Delete-side guard (advanced)">
+            <FormField
+              label="Don't delete anything younger than"
+              yamlPath="storage.lifecycle.rules[].action.protect_younger_than"
+              helpText="Humantime. An object selected for deletion is spared THIS run if younger than this — distinct from the qualify filters above (which exclude from counting). Most rules leave this blank."
+            >
+              <Input
+                value={retainAction.protect_younger_than || ''}
+                onChange={(e) => updateRetain({ protect_younger_than: e.target.value || undefined })}
+                placeholder="7d"
+                style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
+              />
+            </FormField>
+          </AdvancedDisclosure>
+        </>
+      )}
 
       {transitionAction && (
         <div style={{ marginTop: 14, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 14 }}>

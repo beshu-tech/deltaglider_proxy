@@ -393,6 +393,10 @@ pub async fn list_jobs(
                 detail: serde_json::json!({
                     "action": rule.action.kind(),
                     "expire_after": rule.expire_after,
+                    "retain_count": match &rule.action {
+                        crate::config_sections::LifecycleAction::RetainNewest(a) => Some(a.count),
+                        _ => None,
+                    },
                     "include_globs": rule.include_globs,
                     "exclude_globs": rule.exclude_globs,
                 }),

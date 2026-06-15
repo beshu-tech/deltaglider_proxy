@@ -510,3 +510,131 @@ lifecycle:
         .unwrap();
     assert_eq!(bad.status(), 400, "cancel unsupported for lifecycle rules");
 }
+
+const LIFECYCLE_RETAIN_NEWEST_YAML: &str = r#"
+lifecycle:
+  enabled: true
+  tick_interval: "1h"
+  rules:
+    - name: keep-last-two
+      enabled: true
+      bucket: retain-bucket
+      prefix: "nightly/"
+      action:
+        type: retain-newest
+        count: 2
+        qualify:
+          min_size_bytes: 1048576
+      batch_size: 100
+"#;
+
+/// The headline use case, end to end: keep the newest 2 real backups, delete
+/// older ones, and a stray 0-byte file must be IGNORED (never counted, never
+/// deleted) so it can't push a real backup out of the keep set.
+#[tokio::test]
+async fn test_lifecycle_retain_newest_keeps_reals_and_ignores_junk() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(LIFECYCLE_RETAIN_NEWEST_YAML)
+        .build()
+        .await;
+
+    let client = server.s3_client().await;
+    client
+        .create_bucket()
+        .bucket("retain-bucket")
+        .send()
+        .await
+        .ok();
+
+    // A >=1 MiB body qualifies; the empty file does not. Seed OLDEST first so
+    // upload order == age order (created_at is monotonic per PUT).
+    let big = vec![b'x'; 2 * 1024 * 1024];
+    for key in [
+        "nightly/dump-1.bin",
+        "nightly/dump-2.bin",
+        "nightly/dump-3.bin",
+    ] {
+        client
+            .put_object()
+            .bucket("retain-bucket")
+            .key(key)
+            .body(ByteStream::from(big.clone()))
+            .send()
+            .await
+            .expect("seed dump");
+    }
+    // The stray junk file, newest of all — a naive "keep newest 2" would keep
+    // THIS plus dump-3 and delete a real backup. min_size must exclude it.
+    client
+        .put_object()
+        .bucket("retain-bucket")
+        .key("nightly/README")
+        .body(ByteStream::from(Vec::new()))
+        .send()
+        .await
+        .expect("seed junk");
+
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    // Preview: 1 deletion (dump-1), README ignored.
+    let preview: Value = admin
+        .post(format!(
+            "{}/_/api/admin/jobs/lifecycle:keep-last-two/preview",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .expect("preview")
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(preview["status"].as_str(), Some("preview"));
+    assert_eq!(
+        preview["objects_affected"].as_i64(),
+        Some(1),
+        "exactly dump-1 should delete: {preview}"
+    );
+    assert_eq!(
+        preview["objects_ignored"].as_i64(),
+        Some(1),
+        "README must be ignored, not counted: {preview}"
+    );
+
+    // Run it.
+    let run: Value = admin
+        .post(format!(
+            "{}/_/api/admin/jobs/lifecycle:keep-last-two/run-now",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .expect("run-now")
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(run["objects_affected"].as_i64(), Some(1), "{run}");
+    assert_eq!(run["errors"].as_i64(), Some(0), "{run}");
+
+    // dump-1 (oldest real) is gone.
+    assert!(
+        client
+            .get_object()
+            .bucket("retain-bucket")
+            .key("nightly/dump-1.bin")
+            .send()
+            .await
+            .is_err(),
+        "oldest real backup should be deleted"
+    );
+    // The two newest reals AND the junk file all survive.
+    for key in ["nightly/dump-2.bin", "nightly/dump-3.bin", "nightly/README"] {
+        client
+            .get_object()
+            .bucket("retain-bucket")
+            .key(key)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{key} must be preserved: {e:?}"));
+    }
+}
