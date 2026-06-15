@@ -316,9 +316,13 @@
 .docs-prose code {
   font-family: var(--font-mono);
   font-size: 0.86em;
+  /* Keep the chip's border-to-border height INSIDE the prose line box: tight
+     line-height + minimal vertical padding so the box hugs the glyphs instead
+     of bulging past the surrounding text. Horizontal padding stays generous. */
+  line-height: 1.15;
   background: var(--bg-alt);
   color: var(--brand-dark);
-  padding: 0.12em 0.42em;
+  padding: 0.05em 0.42em;
   border: 1px solid var(--rule);
   border-radius: 4px;
   white-space: nowrap;
