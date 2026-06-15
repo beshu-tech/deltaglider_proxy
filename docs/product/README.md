@@ -8,22 +8,11 @@ Versioned binary artifacts — firmware builds, backup archives, AI model varian
 
 ![Object Browser](/_/screenshots/filebrowser.jpg)
 
-## Where it sits: the data path
+## Where it sits
 
 DeltaGlider is a proxy *in front of* storage you already have, not a new object store. Your client speaks the standard S3 API to the proxy; the proxy authenticates the request, decides whether the object is delta-eligible, runs xdelta3 if so, and reads or writes the actual bytes on whichever backend that bucket is routed to — AWS S3, an S3-compatible provider, or a local filesystem.
 
-```mermaid
-flowchart LR
-    C["S3 client<br/>(aws-cli, boto3,<br/>Terraform, rclone)"] -->|"S3 API (SigV4)"| P
-    subgraph P["DeltaGlider Proxy"]
-        direction TB
-        A["Auth + admission<br/>IAM / SigV4"] --> R["Router<br/>bucket → backend"]
-        R --> X["xdelta3 codec<br/>encode on PUT /<br/>reconstruct on GET"]
-    end
-    P -->|"baselines + deltas"| B[("Backend<br/>AWS S3 · Hetzner ·<br/>Backblaze · filesystem")]
-```
-
-The control plane (IAM, routing table, per-object metadata, jobs) lives in the proxy; the data plane (your bytes) lives on the backends. That split is the design decision everything else follows from — see [multi-backend routing](explanation/multi-backend-architecture.md) for why, and [how delta compression works](explanation/delta-compression.md) for the PUT/GET mechanics. Before a production rollout, read [capacity planning](reference/capacity-planning.md): because the proxy actively encodes and reconstructs payloads, it has a different CPU/RAM profile than a pass-through proxy.
+The control plane (IAM, routing table, per-object metadata, jobs) lives in the proxy; the data plane (your bytes) lives on the backends. That split is the design decision everything else follows from — see [multi-backend routing](explanation/multi-backend-architecture.md) for the data-path diagram and why, and [how delta compression works](explanation/delta-compression.md) for the PUT/GET mechanics. Before a production rollout, read [capacity planning](reference/capacity-planning.md): because the proxy actively encodes and reconstructs payloads, it has a different CPU/RAM profile than a pass-through proxy.
 
 ## Pick your path
 

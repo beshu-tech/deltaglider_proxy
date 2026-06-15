@@ -4,6 +4,27 @@
 
 A common first question is "does this replace S3 or proxy to it?" Proxy. DeltaGlider never terminates your data — it holds the routing table, the IAM database, and per-object metadata, while the actual bytes live on whatever backends you point it at: AWS S3, any S3-compatible provider, or a local filesystem path. That split — control plane in the proxy, data plane in the backends — is the design decision everything else on this page follows from.
 
+## The data path
+
+Your client speaks the standard S3 API to the proxy; the proxy authenticates the request, decides whether the object is delta-eligible, runs xdelta3 if so, and reads or writes the actual bytes on whichever backend that bucket is routed to.
+
+```text
+                       ┌─────────────────────────────────────────┐
+   S3 client           │            DeltaGlider Proxy            │        Backend
+ (aws-cli, boto3,      │                                         │   (AWS S3, Hetzner,
+  Terraform, rclone)   │   Auth + admission  (IAM / SigV4)       │   Backblaze, filesystem)
+        │              │            │                            │           ▲
+        │  S3 API      │            ▼                            │           │
+        │  (SigV4)     │   Router   (bucket → backend)           │  baselines │
+        └─────────────▶│            │                            │  + deltas  │
+                       │            ▼                            │           │
+                       │   xdelta3 codec                         │───────────┘
+                       │   (encode on PUT, reconstruct on GET)   │
+                       └─────────────────────────────────────────┘
+```
+
+The control plane (IAM, routing table, per-object metadata, jobs) lives in the proxy; the data plane (your bytes) lives on the backends. Everything below follows from that split. For the encode/reconstruct mechanics see [how delta compression works](delta-compression.md); for the CPU/RAM cost of a proxy that actively rewrites payloads, see [capacity planning](../reference/capacity-planning.md).
+
 ## One endpoint over many backends
 
 Consider how Acme runs it. Their admin, `dana`, registers three backends: `hetzner-fsn1` (cheap S3-compatible storage in Falkenstein), `local-disk` (a filesystem path on the proxy host), and `aws-dr` (an AWS bucket kept as a disaster-recovery target). She then routes buckets across them: `releases` — the firmware artifacts that `ci-uploader` pushes — lives on `hetzner-fsn1`; `db-archive`, where `backup-bot` drops nightly Postgres dumps, sits on `local-disk`; and DR copies replicate to `aws-dr`.
