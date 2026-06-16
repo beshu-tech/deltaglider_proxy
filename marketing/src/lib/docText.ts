@@ -27,6 +27,15 @@ export function extractSummary(markdown: string, max = 155): string {
       para.push(line);
     }
   }
-  const text = para.join(' ').replace(/[*_`#>[\]()]/g, '').replace(/\s+/g, ' ').trim();
+  const text = para
+    .join(' ')
+    // Collapse markdown links/images to their visible text FIRST, so the URL
+    // inside (...) is dropped — not left fused to the link text. ![alt](src)
+    // and [text](href) → alt / text.
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1')
+    // Then strip residual inline-markdown punctuation.
+    .replace(/[*_`#>]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
   return text.length > max ? text.slice(0, max - 1).trimEnd() + '…' : text;
 }

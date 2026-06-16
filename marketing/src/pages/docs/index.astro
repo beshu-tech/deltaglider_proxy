@@ -33,27 +33,31 @@ const GROUP_GLYPHS: Record<string, any> = {
       working unchanged. Open source (GPL-3.0).
     </p>
     <p class="docs-landing-sub">
-      These are the same docs bundled into the product, served here for easy
-      linking. New here? Start below, or press <kbd>⌘K</kbd> to search.
+      New here? Start with one of these, or press <kbd>⌘K</kbd> to search.
     </p>
 
+    <p class="docs-landing-start-label">Recommended starting points</p>
     <div class="docs-landing-start">
       <a class="docs-start-card" href="/docs/tutorials/first-delta-savings">
         <span class="docs-start-eyebrow">Start here</span>
-        <span class="docs-start-title">See your first delta savings →</span>
+        <span class="docs-start-title">See your first delta <span class="docs-start-nowrap">savings&nbsp;→</span></span>
         <span class="docs-start-note">A guided tutorial from zero to a working proxy with measurable compression.</span>
       </a>
       <a class="docs-start-card" href="/docs/explanation/delta-compression">
         <span class="docs-start-eyebrow">Understand it</span>
-        <span class="docs-start-title">How delta compression works →</span>
+        <span class="docs-start-title">How delta compression <span class="docs-start-nowrap">works&nbsp;→</span></span>
         <span class="docs-start-note">The concept behind the savings — what compresses, what doesn't, and why.</span>
       </a>
       <a class="docs-start-card" href="/docs/reference/configuration">
         <span class="docs-start-eyebrow">Reference</span>
-        <span class="docs-start-title">Configuration reference →</span>
+        <span class="docs-start-title">Configuration <span class="docs-start-nowrap">reference&nbsp;→</span></span>
         <span class="docs-start-note">Every config field, with types, defaults, and hot-reload behavior.</span>
       </a>
     </div>
+
+    <p class="docs-landing-footnote">
+      These are the same docs bundled into the product, served here for easy linking.
+    </p>
   </header>
 
   {groups.map((g) => (
@@ -66,7 +70,10 @@ const GROUP_GLYPHS: Record<string, any> = {
       <ul class="docs-landing-list">
         {g.docs.filter((d) => d.slug !== '').map((d) => (
           <li>
-            <a href={d.url}>{d.title}</a>
+            <a href={d.url}>
+              <span class="docs-landing-list-title">{d.title}</span>
+              {d.summary && <span class="docs-landing-list-note">{d.summary}</span>}
+            </a>
           </li>
         ))}
       </ul>

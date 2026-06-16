@@ -535,16 +535,30 @@
 .docs-landing-head .docs-landing-lede {
   font-size: 1.08rem; line-height: 1.6; color: var(--ink-strong); margin: 0 0 14px;
 }
-.docs-landing-head .docs-landing-sub { font-size: 0.95rem; margin: 0 0 28px; }
+.docs-landing-head .docs-landing-sub { font-size: 0.95rem; margin: 0 0 22px; }
 .docs-landing-head .docs-landing-sub kbd {
   font-family: var(--doc-label); font-size: 0.72rem; color: var(--ink-500);
   background: var(--bg-soft); border: 1px solid var(--rule); border-radius: 5px; padding: 1px 5px;
 }
-
-.docs-landing-start {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 14px; margin: 0 0 48px;
+/* Eyebrow heading above the three featured cards. */
+.docs-landing-start-label {
+  font-family: var(--doc-label); font-size: 0.8125rem; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-500);
+  margin: 0 0 12px;
 }
+/* Footnote demoting the "bundled into the product" note below the cards. */
+.docs-landing-footnote {
+  font-size: 0.8125rem; color: var(--ink-500); margin: 0 0 44px;
+}
+
+/* Three featured cards: a clean 3-across row on desktop (was auto-fit, which
+   wrapped to 2 + 1 orphan at this column width). Collapses responsively. */
+.docs-landing-start {
+  display: grid; grid-template-columns: repeat(3, 1fr);
+  gap: 14px; margin: 0 0 20px;
+}
+/* Pins the arrow to the last word so it never wraps to its own line. */
+.docs-start-nowrap { white-space: nowrap; }
 .docs-start-card {
   display: flex; flex-direction: column; gap: 6px;
   padding: 16px 18px; text-decoration: none;
@@ -567,30 +581,36 @@
   display: flex; align-items: center; gap: 14px;
 }
 .docs-landing-group-title .dg-glyph { border-radius: 10px; }
-.docs-landing-group .docs-landing-tagline { margin: 0 0 14px 62px; }
+.docs-landing-group .docs-landing-tagline { margin: 0 0 16px 62px; }
+/* Section descriptor — a readable sentence-case sub-line, NOT an eyebrow.
+   (Uppercase-mono is reserved for the short eyebrow labels only.) */
 .docs-landing-tagline {
-  font-family: var(--doc-label); font-size: 0.72rem; letter-spacing: 0.08em;
-  text-transform: uppercase; color: var(--ink-500); margin: 0 0 14px;
+  font-size: 0.95rem; line-height: 1.5; color: var(--ink-soft); margin: 0 0 16px;
+  max-width: var(--measure);
 }
 .docs-landing-list {
   list-style: none; margin: 0; padding: 0;
   display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px;
 }
 .docs-landing-list a {
-  display: block; padding: 13px 16px;
+  display: flex; flex-direction: column; gap: 4px; padding: 13px 34px 13px 16px;
   background: var(--bg-card); border: 1px solid var(--rule); border-radius: 10px;
-  color: var(--ink-strong); text-decoration: none; font-weight: 600; font-size: 0.95rem;
-  font-family: var(--doc-display); letter-spacing: -0.01em;
+  text-decoration: none;
   position: relative;
   transition: border-color 0.14s, transform 0.14s;
 }
+.docs-landing-list-title {
+  color: var(--ink-strong); font-weight: 600; font-size: 0.95rem;
+  font-family: var(--doc-display); letter-spacing: -0.01em;
+}
+.docs-landing-list-note { color: var(--ink-soft); font-size: 0.84rem; line-height: 1.4; }
 .docs-landing-list a::after {
-  content: "→"; position: absolute; right: 14px; top: 50%; transform: translateY(-50%);
+  content: "→"; position: absolute; right: 14px; top: 16px;
   color: var(--brand); opacity: 0; transition: opacity 0.14s, transform 0.14s;
   font-family: var(--font-mono);
 }
 .docs-landing-list a:hover { border-color: var(--brand); transform: translateY(-1px); }
-.docs-landing-list a:hover::after { opacity: 1; transform: translateY(-50%) translateX(2px); }
+.docs-landing-list a:hover::after { opacity: 1; transform: translateX(2px); }
 
 /* ════════════════════════════════════════════════════════════════════════
    Responsive
@@ -601,6 +621,9 @@
 }
 @media (max-width: 960px) {
   .docs-prose h2::before { display: none; }
+  /* 3 featured cards don't fit cleanly below ~960px (and 2-across would
+     recreate the 2 + 1 orphan). Stack them. */
+  .docs-landing-start { grid-template-columns: 1fr; }
 }
 @media (max-width: 860px) {
   .docs-shell, .docs-shell.has-toc {

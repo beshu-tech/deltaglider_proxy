@@ -9,7 +9,7 @@
 
 import manifest from '../../../docs/product/manifest.json';
 import { docContent } from './docContent';
-import { extractTitle } from './docText';
+import { extractTitle, extractSummary } from './docText';
 
 export interface DocGroup {
   id: string;
@@ -25,6 +25,8 @@ export interface DocMeta {
   url: string;
   /** First `# heading` of the doc — the human title shown in nav/links. */
   title: string;
+  /** One-line summary (first prose sentence) — for landing card sub-lines. */
+  summary: string;
   group: string;
   order: number;
 }
@@ -54,7 +56,8 @@ export const DOCS: DocMeta[] = manifest.docs.map((d) => {
   const slug = pathToSlug(d.path);
   const content = docContent(d.path);
   const title = content ? extractTitle(content) : d.path;
-  return { path: d.path, slug, url: slugToUrl(slug), title, group: d.group, order: d.order };
+  const summary = content ? extractSummary(content, 90) : '';
+  return { path: d.path, slug, url: slugToUrl(slug), title, summary, group: d.group, order: d.order };
 });
 
 /** Docs grouped + sorted exactly as the product viewer groups them. */
