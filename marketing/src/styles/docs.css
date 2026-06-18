@@ -2,7 +2,7 @@
    docs.css — "Technical Logbook" reading experience for /docs.
 
    Display: Schibsted Grotesk (commissioned newspaper grotesque — engineered
-   editorial voice). Labels/eyebrows/§/# markers: Spline Sans Mono (a softer
+   editorial voice). Labels/eyebrows/# anchor markers: Spline Sans Mono (a softer
    mono than the code face, so the "logbook label" voice reads distinct from
    actual code). Code: JetBrains Mono via shiki, brand-tuned theme.
 
@@ -247,13 +247,6 @@
   font-weight: 700; line-height: 1.18; letter-spacing: -0.018em;
   margin: 52px 0 16px; padding-top: 22px;
   border-top: 1px solid var(--doc-rule);
-}
-.docs-prose h2::before {
-  content: "§";
-  font-family: var(--doc-label);
-  font-size: 0.62em; font-weight: 600;
-  color: var(--brand);
-  position: absolute; top: 22px; left: -1.4em; opacity: 0.5;
 }
 .docs-prose h3 {
   font-size: 1.22rem; font-weight: 600; letter-spacing: -0.012em;
@@ -638,7 +631,6 @@
   .docs-toc { display: none; }
 }
 @media (max-width: 960px) {
-  .docs-prose h2::before { display: none; }
   /* 3 featured cards don't fit cleanly below ~960px (and 2-across would
      recreate the 2 + 1 orphan). Stack them. */
   .docs-landing-start { grid-template-columns: 1fr; }
