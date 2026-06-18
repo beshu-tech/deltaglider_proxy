@@ -703,6 +703,11 @@ jobs:
       #    (docs/dev/**) sneak into the product bundle. ──
       - name: Docs registry allow-list
         run: ./scripts/check-docs-registry.sh
+      # ── Blocking: the bundled changelog doc (docs/product/changelog.md)
+      #    is generated from the root CHANGELOG.md. Fail if it drifted —
+      #    run scripts/gen-changelog-doc.sh and commit. ──
+      - name: Changelog doc in sync with CHANGELOG.md
+        run: ./scripts/gen-changelog-doc.sh --check
       # ── Blocking: every `# validate`-tagged fenced YAML block in
       #    docs/product/**/*.md parses + validates under the real
       #    schema. Prevents example drift. Needs a built binary. ──

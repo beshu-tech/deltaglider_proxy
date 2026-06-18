@@ -65,6 +65,9 @@ import REF_EVENT_OUTBOX from '../../../../docs/product/reference/event-outbox.md
 import REF_CAPACITY from '../../../../docs/product/reference/capacity-planning.md?raw';
 import EXP_MIGRATION from '../../../../docs/product/explanation/how-migration-works.md?raw';
 import EXP_VERSIONING from '../../../../docs/product/explanation/versioning-vs-s3-versioning.md?raw';
+// Generated from the root CHANGELOG.md by scripts/gen-changelog-doc.sh —
+// do not hand-edit docs/product/changelog.md (CI checks it stays in sync).
+import CHANGELOG from '../../../../docs/product/changelog.md?raw';
 
 // Grouping + ordering come from the shared manifest — the SINGLE source of
 // truth, read by BOTH this in-product viewer and the marketing-website docs
@@ -131,6 +134,7 @@ const CONTENT_BY_PATH: Record<string, string> = {
   'reference/lifecycle': REF_LIFECYCLE,
   'reference/event-outbox': REF_EVENT_OUTBOX,
   'reference/capacity-planning': REF_CAPACITY,
+  'changelog': CHANGELOG,
 };
 
 /** Extract the first `# heading` from markdown content */

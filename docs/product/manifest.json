@@ -24,6 +24,10 @@
     {
       "id": "Concepts",
       "tagline": "How it works and why — readable away from the keyboard."
+    },
+    {
+      "id": "Releases",
+      "tagline": "What changed in every published version, newest first."
     }
   ],
   "docs": [
@@ -286,6 +290,11 @@
       "path": "explanation/versioning-vs-s3-versioning",
       "group": "Concepts",
       "order": 50
+    },
+    {
+      "path": "changelog",
+      "group": "Releases",
+      "order": 0
     }
   ]
 }
