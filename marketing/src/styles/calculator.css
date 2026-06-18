@@ -131,7 +131,7 @@
 .region-buttons .btn-active {
   background: var(--brand);
   border-color: var(--brand);
-  color: #0b0f19;
+  color: #141a2b;
   box-shadow: var(--shadow-glow);
 }
 

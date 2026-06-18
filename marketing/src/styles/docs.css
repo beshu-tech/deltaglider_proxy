@@ -25,11 +25,13 @@
   --doc-callout-bg: rgba(34, 211, 238, 0.06);
   --doc-measure: 70ch;
 
-  /* Code panel: lighter than the page (--bg #0b0f19) so the "this is a
-     copyable command" surface reads as a distinct panel, not a void. Was
-     #070a12 (DARKER than the page → ~1.03:1, invisible boundary). */
-  --doc-code-bg: #11192b;
-  --doc-code-border: #2a3344;
+  /* Code panel: lighter than the page (--bg #141a2b) so the "this is a
+     copyable command" surface reads as a distinct panel, not a void. Must stay
+     a step above --bg — if it ever drops below it the boundary disappears
+     (the old #070a12-on-#0b0f19 was ~1.03:1, invisible). Keep in lockstep with
+     the shiki theme bg in lib/highlight.ts (shiki writes it inline). */
+  --doc-code-bg: #1d2336;
+  --doc-code-border: #323c54;
 
   /* A softer, desaturated blue used as an ACCENT on small eyebrow text —
      replaces raw brand cyan (#22d3ee), which vibrates on near-black at small

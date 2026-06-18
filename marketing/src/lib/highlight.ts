@@ -19,8 +19,8 @@ const LANG_ALIAS: Record<string, string> = {
   conf: 'nginx',
 };
 
-// Brand-tuned theme. Background matches the docs `pre` surface (#11192b —
-// LIGHTER than the page --bg #0b0f19 so the code panel reads as a distinct,
+// Brand-tuned theme. Background matches the docs `pre` surface (#1d2336 —
+// LIGHTER than the page --bg #141a2b so the code panel reads as a distinct,
 // copyable surface). Shiki writes this as an inline background-color on the
 // emitted <pre>, which would otherwise win over the CSS panel colour, so it
 // must be kept in lockstep with --doc-code-bg in docs.css. The signal cyan is
@@ -30,11 +30,11 @@ const DG_THEME = {
   name: 'deltaglider-dark',
   type: 'dark' as const,
   colors: {
-    'editor.background': '#11192b',
+    'editor.background': '#1d2336',
     'editor.foreground': '#cbd5e1',
   },
   settings: [
-    { settings: { foreground: '#cbd5e1', background: '#11192b' } },
+    { settings: { foreground: '#cbd5e1', background: '#1d2336' } },
     { scope: ['comment', 'punctuation.definition.comment'], settings: { foreground: '#5b6b86', fontStyle: 'italic' } },
     { scope: ['string', 'string.quoted', 'meta.string'], settings: { foreground: '#8fd6c4' } },
     { scope: ['constant.numeric', 'constant.language', 'constant.character'], settings: { foreground: '#f0a868' } },

@@ -73,7 +73,7 @@
   --ink-faint: var(--ink-500);
   --ink-mute: var(--ink-400);
   
-  --bg: #0b0f19;
+  --bg: #141a2b;
   --bg-soft: rgba(15, 23, 42, 0.4);
   --bg-card: rgba(30, 41, 59, 0.5);
   --bg-alt: #1e293b;
@@ -745,14 +745,14 @@ hr {
 .btn-brand {
   background: var(--brand);
   border-color: var(--brand);
-  color: #0b0f19;
+  color: #141a2b;
   box-shadow: var(--shadow-glow);
 }
 
 .btn-brand:hover {
   background: var(--brand-dark);
   border-color: var(--brand-dark);
-  color: #0b0f19;
+  color: #141a2b;
   transform: translateY(-2px) scale(1.02);
 }
 
