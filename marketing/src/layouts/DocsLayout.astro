@@ -65,15 +65,21 @@ const groups = docsByGroup();
       <nav class="docs-nav-groups" aria-label="Documentation sections">
       {groups.map((g) => {
         const items = g.docs.filter((d) => d.slug !== '');
-        // Open the group that contains the current page; others start open too
-        // on first load (no stored state yet) but collapse on click. A reader
-        // never lands on a doc whose group is shut.
+        // Only the group holding the current page is expanded on load; the rest
+        // start collapsed. The reader can open others by hand (native <details>
+        // toggle) — no persistence, so navigating always re-focuses on the
+        // section at hand. On the landing (no active doc) open "Start here".
         const hasActive = items.some((d) => d.slug === activeSlug);
+        const openByDefault = activeSlug === '' ? g.group.id === 'Start here' : hasActive;
+        // Strip the repeated "Guides: " prefix in the label — three stacked
+        // "Guides:" lines were visual noise. "Guides: deploy & operate" →
+        // "Deploy & operate". Full id stays for grouping/aria.
+        const label = g.group.id.replace(/^Guides:\s*/, '').replace(/^./, (c) => c.toUpperCase());
         return (
-          <details class="docs-nav-group" data-group={g.group.id} data-has-active={hasActive ? 'true' : undefined} open>
+          <details class="docs-nav-group" open={openByDefault}>
             <summary class="docs-nav-group-title">
-              <span>{g.group.id}</span>
-              <svg class="docs-nav-chevron" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2">
+              <span class="docs-nav-group-label">{label}</span>
+              <svg class="docs-nav-chevron" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7">
                 <path d="M4 6l4 4 4-4" stroke-linecap="round" stroke-linejoin="round" />
               </svg>
             </summary>
@@ -188,31 +194,4 @@ const groups = docsByGroup();
     })();
   </script>
 
-  {/* Sidebar group collapse/expand persistence. Groups render open (good
-      no-JS fallback); this restores each group's last open/closed state and
-      remembers changes. The group containing the current page is always forced
-      open so a reader never lands on a doc inside a collapsed group. */}
-  <script is:inline>
-    (function () {
-      var KEY = 'dg-docs-nav-collapsed';
-      var groups = document.querySelectorAll('.docs-nav-group[data-group]');
-      if (!groups.length) return;
-
-      var collapsed = {};
-      try { collapsed = JSON.parse(localStorage.getItem(KEY) || '{}') || {}; } catch (e) {}
-
-      groups.forEach(function (g) {
-        var id = g.getAttribute('data-group');
-        if (g.getAttribute('data-has-active') === 'true') {
-          g.open = true; // never hide the active page's group
-        } else if (collapsed[id]) {
-          g.open = false;
-        }
-        g.addEventListener('toggle', function () {
-          if (g.open) delete collapsed[id]; else collapsed[id] = true;
-          try { localStorage.setItem(KEY, JSON.stringify(collapsed)); } catch (e) {}
-        });
-      });
-    })();
-  </script>
 </BaseLayout>

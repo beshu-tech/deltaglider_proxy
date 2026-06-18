@@ -107,65 +107,75 @@
 }
 .docs-nav-home.is-active { color: var(--brand); }
 
-/* ── Collapsible groups (Warp-style tree) ───────────────────────────────────
-   Each group is a native <details>. The <summary> is the bold, uppercase
-   header with a chevron that rotates when open; children are indented under a
-   vertical guide line. Active leaf = bold near-white on a subtle gray pill. */
-.docs-nav-group { margin-bottom: 6px; }
+/* ── Collapsible nav groups ──────────────────────────────────────────────────
+   Each group is a native <details>. The label uses the display face in calm
+   title-case (the old uppercase-mono shouted and wrapped to two lines); a
+   small muted chevron is the only ornament. Only the active page's group is
+   open on load. Children hang under a hairline rail; the active leaf gets a
+   brand accent bar, not a heavy pill. */
+.docs-nav-group { margin-bottom: 1px; }
 .docs-nav-group-title {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  padding: 8px 8px;
-  font-family: var(--doc-label);
-  font-size: 0.8125rem; /* 13px — was 0.72rem */
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--ink-strong);
+  gap: 10px;
+  padding: 9px 10px;
+  font-family: var(--doc-display);
+  font-size: 0.95rem;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  color: var(--ink-700);
   cursor: pointer;
   border-radius: 8px;
   list-style: none; /* kill the default disclosure triangle (Firefox) */
   user-select: none;
-  transition: background 0.12s, color 0.12s;
+  transition: background 0.13s ease, color 0.13s ease;
 }
 .docs-nav-group-title::-webkit-details-marker { display: none; } /* Safari/Chrome */
-.docs-nav-group-title:hover { background: var(--bg-soft); }
+.docs-nav-group-title:hover { background: var(--bg-soft); color: var(--ink-strong); }
+.docs-nav-group[open] > .docs-nav-group-title { color: var(--ink-strong); }
+.docs-nav-group-label { min-width: 0; }
 .docs-nav-chevron {
   flex: none;
   color: var(--ink-500);
   transform: rotate(-90deg); /* points right when collapsed */
-  transition: transform 0.18s ease;
+  transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
 .docs-nav-group[open] > .docs-nav-group-title > .docs-nav-chevron {
   transform: rotate(0deg); /* points down when open */
 }
 
-/* Children: indented list with a vertical guide rail. */
+/* Children: hang under a hairline rail aligned with the label text. */
 .docs-nav-children {
   list-style: none;
-  margin: 2px 0 8px;
+  margin: 1px 0 6px;
   padding: 0;
-  margin-left: 16px;
-  border-left: 1.5px solid var(--rule);
+  margin-left: 14px;
+  border-left: 1px solid var(--rule);
 }
 .docs-nav-children li { margin: 0; }
 .docs-nav-children a {
   display: block;
-  padding: 6px 10px 6px 14px;
-  margin-left: -1.5px; /* let the active pill sit flush over the rail */
+  position: relative;
+  padding: 6px 10px 6px 16px;
   color: var(--ink-soft);
+  font-size: 0.875rem;
   text-decoration: none;
-  border-radius: 7px;
-  line-height: 1.35;
-  transition: color 0.12s, background 0.12s;
+  border-radius: 0 7px 7px 0;
+  line-height: 1.4;
+  transition: color 0.12s ease, background 0.12s ease;
 }
 .docs-nav-children a:hover { color: var(--ink-strong); background: var(--bg-soft); }
 .docs-nav-children a.is-active {
   color: var(--ink-strong);
-  background: var(--bg-soft);
-  font-weight: 700;
+  font-weight: 600;
+  background: var(--brand-soft);
+}
+/* Brand accent bar on the rail for the active leaf. */
+.docs-nav-children a.is-active::before {
+  content: "";
+  position: absolute; left: -1px; top: 4px; bottom: 4px; width: 2px;
+  background: var(--brand); border-radius: 2px;
 }
 
 .docs-content { min-width: 0; }
