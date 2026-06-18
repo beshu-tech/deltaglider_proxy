@@ -4,6 +4,38 @@
 
 ## v1.4.3 — 2026-06-18
 
+### Added
+
+- **Count-based lifecycle retention (`retain-newest`).** A new lifecycle
+  action that keeps the newest N objects in a prefix and deletes the rest
+  — selection by *count*, not age — for the canonical "keep the last N
+  backups" cleanup that native S3 lifecycle never shipped:
+
+  ```yaml
+  action:
+    type: retain-newest
+    count: 2
+    qualify:                   # eligibility filter (NOT a delete guard)
+      min_size_bytes: 1048576  #   ignore truncated/empty junk
+      min_age: "1h"            #   ignore in-flight uploads
+    protect_younger_than: "7d" # optional delete-side guard
+  ```
+
+  `qualify` is an eligibility gate — an object failing it is invisible
+  (never counted toward N, never deleted) — so an accidental empty or
+  half-written file can't anchor the keep set or displace a real backup.
+  `protect_younger_than` is a separate delete-side guard (spares an object
+  this run, never promotes it into the keep set). "Keep newest N" is
+  set-relative, so it runs on a dedicated collect→rank→act worker path;
+  the age-based path stays per-object/streaming and unchanged.
+
+- **Savings dashboard reads as a before/after bill.** The metrics hero
+  dollar line now tells the bill story directly: the regular monthly bill
+  (what you'd pay without DeltaGlider) struck through, the compressed bill
+  as the green headline (what you actually pay), and the saving kept quiet
+  underneath ($/mo · $/yr). Previously the green headline showed the
+  *saved* amount, which read like "what you pay" when it was the opposite.
+
 ### Fixed
 
 - **Browser form-POST upload returned 403 on an idempotent retry.** The
@@ -20,6 +52,24 @@
   **different key or body** is still blocked (form-POST `key` is
   `starts-with ""`, so one signature could otherwise authorise writing
   anywhere). Replay protection is preserved; legitimate retries succeed.
+
+### Docs & site
+
+- **Documentation site overhaul.** A Warp-style collapsible sidebar tree
+  with a calmer editorial type scale and focus-on-current-section
+  navigation; clickable heading anchors; a readable search input with a
+  correctly-centred Clear button that closes on result selection; the
+  `/docs` landing reworked into 3-up feature cards with readable
+  descriptors; and an accessibility/readability pass (type scale, code
+  panels, link accent, inline-code chip sizing).
+- **Accurate, more complete docs content.** Acted on an expert docs-site
+  review (search, intro, S3-compatibility, FAQ) and onboarding/
+  architecture/versioning gaps; corrected the `authentication: none`
+  tutorial; embedded all product-doc screenshots (not a stale subset);
+  and replaced the ASCII data-path diagram with a rendered image.
+- **Marketing site polish.** Split-bleed hero with an upbeat captioned
+  demo video, a lighter page background, and a branded glow on the demo
+  video frame.
 
 ## v1.4.2 — 2026-06-13
 
