@@ -441,3 +441,16 @@ Do **not** use `--network host` — that puts MinIO on the k3s node's network, n
     ci.yml                  # CI pipeline (fmt, clippy, test, audit)
     release.yml             # Release pipeline (build, Docker, GitHub Release)
 ```
+
+## CLA signing
+
+First-time contributors must sign the CLA. On any open PR the `cla-check` flags,
+post a comment containing exactly:
+
+```
+I have read the CLA Document and I hereby sign the CLA
+```
+
+The CLA Assistant records the signature into `.cla-signatures/signatures.json`
+from the commenter's verified GitHub identity. The bot allowlist
+(`.github/workflows/cla.yml`) skips Dependabot / Renovate / github-actions.
