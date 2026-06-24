@@ -19,6 +19,12 @@ export interface WhoamiResponse {
   external_providers?: ExternalProviderInfo[];
 }
 
+/** Single source of truth for "is the config DB locked": typed signal first,
+ *  the older bool kept only as a fallback for servers predating lock_state. */
+export function isConfigDbLocked(info: WhoamiResponse): boolean {
+  return info.lock_state === 'locked' || info.config_db_mismatch === true;
+}
+
 export async function whoami(): Promise<WhoamiResponse> {
   try {
     const res = await adminFetch('/api/whoami');

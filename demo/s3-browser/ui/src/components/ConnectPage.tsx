@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { Button, Input, Typography, Space, Alert, Spin, message } from 'antd';
 import { WarningOutlined, CheckCircleOutlined, CopyOutlined, SunOutlined, MoonOutlined } from '@ant-design/icons';
 import { testConnection, setEndpoint, setCredentials, setBucket, initFromSession, getBucket } from '../s3client';
-import { adminLogin, loginAs, whoami, recoverDb, browserSessionConnect, openBrowserConnect } from '../adminApi';
+import { adminLogin, loginAs, whoami, isConfigDbLocked, recoverDb, browserSessionConnect, openBrowserConnect } from '../adminApi';
 import type { ExternalProviderInfo } from '../adminApi';
 import OAuthProviderList from './OAuthProviderList';
 import { detectDefaultEndpoint } from '../utils';
@@ -116,10 +116,9 @@ export default function ConnectPage({ onConnect, showError }: Props) {
       () => ({ ok: false, error: '' } as const),
     );
     if (!result.ok) {
-      // Surface the server's actual reason rather than always blaming the
-      // backend. A locked config DB (bootstrap-hash mismatch) reports itself
-      // clearly here — telling the operator to "check server configuration"
-      // sends them debugging a backend that may be perfectly fine.
+      // Surface the server's real reason, not a blanket "backend unreachable".
+      // Mount-time uses the typed lock signal (isConfigDbLocked); this raw-S3
+      // path only has the error string, so it sniffs it as a last resort.
       const reason = 'error' in result ? result.error : '';
       const looksLocked = /bootstrap|mismatch|recover/i.test(reason || '');
       return {
@@ -155,8 +154,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
         if (cancelled) return;
         setAuthMode(info.mode as 'bootstrap' | 'iam' | 'open');
         setExternalProviders(info.external_providers || []);
-        // Typed lock signal preferred; config_db_mismatch kept as fallback.
-        if (info.lock_state === 'locked' || info.config_db_mismatch) {
+        if (isConfigDbLocked(info)) {
           setShowRecovery(true);
           setDetecting(false);
           return;
@@ -212,9 +210,9 @@ export default function ConnectPage({ onConnect, showError }: Props) {
           return;
         }
 
-        // Check for config DB mismatch after successful login
+        // Check for config DB lock after successful login
         const info = await whoami();
-        if (info.config_db_mismatch) {
+        if (isConfigDbLocked(info)) {
           setShowRecovery(true);
           setLoading(false);
           return;

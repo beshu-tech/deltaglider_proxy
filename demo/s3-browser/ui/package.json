@@ -54,6 +54,7 @@
     "test:destination-suggest": "node scripts/destination-suggest-regression-test.mjs",
     "test:hero-number-size": "node scripts/hero-number-size-regression-test.mjs",
     "test:file-preview-mode": "node scripts/file-preview-mode-regression-test.mjs",
+    "test:make-zip": "node scripts/make-zip-regression-test.mjs",
     "e2e": "playwright test",
     "typecheck": "tsc --noEmit",
     "knip": "knip"

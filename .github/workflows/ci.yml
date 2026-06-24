@@ -664,6 +664,7 @@ jobs:
           npm run test:destination-suggest
           npm run test:hero-number-size
           npm run test:file-preview-mode
+          npm run test:make-zip
       - name: npm audit
         run: cd demo/s3-browser/ui && npm audit --audit-level=high || true  # warn-only
 

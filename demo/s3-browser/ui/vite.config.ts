@@ -42,9 +42,8 @@ export default defineConfig({
     __BUILD_VERSION__: JSON.stringify(resolveBuildVersion()),
   },
   build: {
-    // Source maps kept ON deliberately for ease of debugging the embedded
-    // admin UI in production. (They do ship in the binary — DemoAssets embeds
-    // the whole dist/ — which is an accepted tradeoff here.)
+    // Kept ON for debugging the embedded admin UI; maps DO ship in the binary
+    // (DemoAssets embeds all of dist/) — an accepted tradeoff.
     sourcemap: true,
     //
     // manualChunks: split heavy vendor libs out of the main shell so
