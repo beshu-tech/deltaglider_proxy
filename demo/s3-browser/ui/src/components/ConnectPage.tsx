@@ -26,6 +26,46 @@ function finishConnect(onConnect: () => void) {
   onConnect();
 }
 
+/** Tiny diagram for the locked-DB wizard: one password + random salt → two
+ *  different hashes; only the original hash is the DB's key. Explains, honestly
+ *  and at a glance, why the password alone can't unlock the database. */
+function LockedDbExplainer({ accent, muted, text }: { accent: string; muted: string; text: string }) {
+  const ok = 'var(--accent-success)';
+  const warn = 'var(--accent-warning)';
+  const mono = 'var(--font-mono)';
+  const Pill = ({ color, children }: { color: string; children: React.ReactNode }) => (
+    <span style={{ fontFamily: mono, fontSize: 11, color, border: `1px solid ${color}`, borderRadius: 6, padding: '2px 7px', whiteSpace: 'nowrap' }}>{children}</span>
+  );
+  const Arrow = ({ label }: { label: string }) => (
+    <span style={{ display: 'inline-flex', flexDirection: 'column', alignItems: 'center', color: muted, fontSize: 10, fontFamily: 'var(--font-ui)' }}>
+      <span>{label}</span>
+      <span style={{ fontSize: 14, lineHeight: 1, color: muted }}>→</span>
+    </span>
+  );
+  return (
+    <div style={{ marginTop: 14, padding: 14, borderRadius: 10, background: 'color-mix(in srgb, var(--input-bg) 80%, var(--glass-bg) 20%)', border: '1px solid var(--border-subtle)' }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          <Pill color={accent}>your password</Pill>
+          <Arrow label="+ salt A" />
+          <Pill color={ok}>hash A</Pill>
+          <span style={{ color: ok, fontSize: 13, fontFamily: 'var(--font-ui)' }}>🔓 unlocks the DB</span>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          <Pill color={accent}>your password</Pill>
+          <Arrow label="+ salt B" />
+          <Pill color={warn}>hash B</Pill>
+          <span style={{ color: warn, fontSize: 13, fontFamily: 'var(--font-ui)' }}>✗ wrong key</span>
+        </div>
+      </div>
+      <div style={{ marginTop: 10, fontSize: 11.5, lineHeight: 1.55, color: text, fontFamily: 'var(--font-ui)' }}>
+        Same password, random salt → a new hash each time. The DB only opens with the
+        <b> exact hash</b> that encrypted it (hash A) — not one freshly made from the password.
+      </div>
+    </div>
+  );
+}
+
 interface Props {
   onConnect: () => void;
   showError?: boolean;
@@ -359,13 +399,22 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                     </div>
                   </div>
                   <div style={{ color: TEXT_SECONDARY, fontSize: 14, lineHeight: 1.7, fontFamily: "var(--font-ui)" }}>
-                    The bootstrap password hash in your configuration does not match the
-                    encryption key of the existing IAM database. S3 API access is blocked until resolved.
+                    The IAM database is encrypted with your bootstrap password <b>hash</b>, and
+                    the hash loaded at startup doesn’t match the one that encrypted it.
                   </div>
+                  <LockedDbExplainer accent={ACCENT_BLUE} muted={TEXT_MUTED} text={TEXT_SECONDARY} />
                   <div style={{ color: TEXT_SECONDARY, fontSize: 13, marginTop: 12, lineHeight: 1.7, fontFamily: "var(--font-ui)" }}>
-                    Paste the original <code style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: ACCENT_BLUE }}>DGP_BOOTSTRAP_PASSWORD_HASH</code> value
-                    below. Check your previous deployment config, environment variables,
-                    or <code style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: ACCENT_BLUE }}>.deltaglider_bootstrap_hash</code> file.
+                    <b>Why not just the password?</b> Each hash bakes in a random salt, so the
+                    same password produces a <i>different</i> hash every time — only the exact
+                    original hash can unlock the DB. Paste it from your previous{' '}
+                    <code style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: ACCENT_BLUE }}>DGP_BOOTSTRAP_PASSWORD_HASH</code>,
+                    env vars, or the <code style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: ACCENT_BLUE }}>.deltaglider_bootstrap_hash</code> file.
+                  </div>
+                  <div style={{ color: TEXT_MUTED, fontSize: 12, marginTop: 8, lineHeight: 1.6, fontFamily: "var(--font-ui)" }}>
+                    Lost the hash? It can’t be recovered — but your data is safe. Run{' '}
+                    <code style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: TEXT_SECONDARY }}>--set-bootstrap-password</code>{' '}
+                    to start fresh; the old DB is preserved as{' '}
+                    <code style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: TEXT_SECONDARY }}>.db.bak</code> in case the hash turns up.
                   </div>
                 </div>
                 {recoveryError && <Alert type="error" message={recoveryError} showIcon />}
