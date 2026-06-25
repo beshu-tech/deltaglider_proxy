@@ -590,6 +590,54 @@ hr {
   transform: none;
 }
 
+/* Animated walkthrough — the default hero backdrop. Cover-scales a fixed
+   1920×1080 canvas to fill the plate, anchored top-left so the right edge
+   bleeds off behind the fade veil. */
+.hero-walkthrough {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+.hero-walkthrough__canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: top left;
+  /* width/height (1920×1080) + transform: scale() set inline by the component */
+}
+.hero-walkthrough__toggle {
+  position: absolute;
+  left: 18px;
+  bottom: 18px;
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 8px;
+  border: 1px solid rgba(14, 42, 50, 0.14);
+  background: rgba(251, 253, 253, 0.72);
+  color: #0e2a32;
+  cursor: pointer;
+  pointer-events: auto;        /* plate is pointer-events:none — opt back in */
+  backdrop-filter: blur(4px);
+  transition: background 120ms ease, opacity 120ms ease;
+  opacity: 0.55;
+}
+.hero-walkthrough__toggle:hover {
+  background: rgba(251, 253, 253, 0.95);
+  opacity: 1;
+}
+
+/* Reduced motion: hide the animated walkthrough, show the screenshot
+   slideshow fallback instead. Pure-CSS swap — no hydration flash. */
+.hero-plate .hero-slideshow--backdrop { display: none; }
+@media (prefers-reduced-motion: reduce) {
+  .hero-walkthrough { display: none; }
+  .hero-plate .hero-slideshow--backdrop { display: block; }
+}
+
 /* Narrow screens: drop the screenshot entirely, text-only hero. */
 @media (max-width: 900px) {
   .hero--full { min-height: auto; }

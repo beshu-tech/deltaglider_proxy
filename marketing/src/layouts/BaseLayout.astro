@@ -36,12 +36,13 @@ const ogImageUrl = new URL(ogImage, Astro.site).toString();
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
 
-    {/* Manrope — variable display sans. font-display:swap inherited. */}
+    {/* Manrope — display sans. Spectral + Hanken Grotesk — hero walkthrough.
+        (JetBrains Mono is self-hosted in global.css.) font-display:swap. */}
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
       rel="stylesheet"
-      href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Spectral:wght@400;500;600;700&family=Hanken+Grotesk:wght@400;450;500;600;700&display=swap"
     />
 
     <title>{title}</title>
