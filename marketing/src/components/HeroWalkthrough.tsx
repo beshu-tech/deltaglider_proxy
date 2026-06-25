@@ -1,15 +1,13 @@
 // HeroWalkthrough.tsx — animated DeltaGlider product walkthrough for the hero.
 //
-// Ported from the Claude Design "Deltaglider proxy product walkthrough" (Video.jsx)
-// and adapted for the hero plate: autoplay-loop + minimal play/pause only (no
-// scrubber/timecode/keyboard chrome), cover-scaled into the plate, returns null
-// under prefers-reduced-motion so the screenshot slideshow fallback takes over.
-//
-// Self-contained: a tiny Stage/Sprite/Timeline engine + easing helpers + 7 scenes.
-// Pure React 19 + requestAnimationFrame, no animation lib (matches the site).
+// PORTRAIT (1080×1440, 3:4) so it fits the tall hero column naturally — no crop,
+// no right-bleed. A 37s, 7-scene motion piece (Hook → delta compression →
+// deltaspaces → drop-in S3 → IAM/ABAC → built-in UI → outro), self-contained:
+// a tiny Stage/Sprite/Timeline engine + easing + 7 scenes. Pure React 19 + RAF.
 
 import {
   createContext,
+  useCallback,
   useContext,
   useEffect,
   useMemo,
@@ -42,9 +40,14 @@ const clamp = (v: number, min: number, max: number) => Math.max(min, Math.min(ma
 interface TimelineValue {
   time: number;
   duration: number;
+  seek?: (t: number) => void;
 }
 const TimelineContext = createContext<TimelineValue>({ time: 0, duration: 37 });
 const useTimeline = () => useContext(TimelineContext);
+
+// Scene start times — shared by ProgressDots (jump targets) and the scenes.
+const SCENE_MARKS = [0, 4.6, 13.4, 18.6, 23.2, 28.2, 33.4];
+const SCENE_LABELS = ['Intro', 'Compression', 'Deltaspaces', 'Drop-in', 'Access', 'Browser', 'Outro'];
 
 interface SpriteValue {
   localTime: number;
@@ -76,29 +79,37 @@ function Sprite({
   );
 }
 
-// ── Design tokens (teal / blue) ───────────────────────────────────────────────
+// ── Design tokens — light canvas, SITE brand accents (cyan #22d3ee + fuchsia
+// #d946ef). The bright site hues are used for fills/bars; deeper derivatives
+// carry text so they stay legible on the cream canvas. ───────────────────────
 const C = {
-  cream: '#ECF3F4',
-  paper: '#FBFDFD',
-  ink: '#0E2A32',
-  muted: '#5C737A',
-  line: '#D6E3E5',
-  lineSoft: '#E6EFF0',
-  clay: '#0E9AA4',
-  claySoft: '#A9DCDF',
-  clayBg: '#DBEFF0',
-  slate: '#2B6CB0',
-  slateBg: '#E1ECF6',
-  green: '#2A9D8F',
-  dark: '#0C242B',
-  darkLine: '#1A3B45',
+  cream: '#EAF6F8', // faint cyan-tinted off-white (was warm teal)
+  paper: '#FBFEFF',
+  ink: '#0B1A2B', // site-navy-derived ink
+  muted: '#5A6B7E',
+  line: '#D2E4EA',
+  lineSoft: '#E6F1F4',
+  // accent = site cyan. `clay` (text/strokes) is a deepened cyan for contrast;
+  // `clayBright` is the literal site #22d3ee for fills/bars/dots.
+  clay: '#0E8BA8',
+  clayBright: '#22d3ee',
+  claySoft: '#9FE0EC',
+  clayBg: '#D6F1F6',
+  // secondary = site fuchsia, deepened for text on light.
+  slate: '#B5179E',
+  slateBg: '#F7E1F4',
+  green: '#1FA98C',
+  dark: '#0C1C2B', // terminal panel — site-navy family
+  darkLine: '#1B3148',
 };
 const SERIF = "'Spectral', Georgia, serif";
 const SANS = "'Hanken Grotesk', system-ui, sans-serif";
 const MONO = "'JetBrains Mono', ui-monospace, monospace";
 
-const W = 1920;
-const H = 1080;
+// Portrait stage. 3:4.
+const W = 1080;
+const H = 1440;
+const PAD = 72; // common left/right margin
 
 const ease = (t: number, fn: (t: number) => number = Easing.easeOutCubic) => fn(clamp(t, 0, 1));
 
@@ -145,6 +156,7 @@ function Scene({
   );
 }
 
+// Top caption band — kicker + serif headline, centered across the portrait width.
 function Caption({ kicker, text }: { kicker: string; text: ReactNode }) {
   const { localTime, duration } = useSprite();
   const inT = ease(localTime / 0.5);
@@ -155,13 +167,13 @@ function Caption({ kicker, text }: { kicker: string; text: ReactNode }) {
     <div
       style={{
         position: 'absolute',
-        top: 96,
-        left: 0,
-        right: 0,
+        top: 120,
+        left: PAD,
+        right: PAD,
         display: 'flex',
         flexDirection: 'column',
         alignItems: 'center',
-        gap: 18,
+        gap: 22,
         opacity: o,
         transform: `translateY(${ty}px)`,
       }}
@@ -169,8 +181,8 @@ function Caption({ kicker, text }: { kicker: string; text: ReactNode }) {
       <div
         style={{
           fontFamily: MONO,
-          fontSize: 19,
-          letterSpacing: '0.22em',
+          fontSize: 22,
+          letterSpacing: '0.24em',
           textTransform: 'uppercase',
           color: C.clay,
           fontWeight: 500,
@@ -186,13 +198,12 @@ function Caption({ kicker, text }: { kicker: string; text: ReactNode }) {
       <div
         style={{
           fontFamily: SERIF,
-          fontSize: 56,
+          fontSize: 60,
           fontWeight: 500,
           color: C.ink,
           letterSpacing: '-0.02em',
           textAlign: 'center',
-          maxWidth: 1240,
-          lineHeight: 1.08,
+          lineHeight: 1.12,
         }}
       >
         {text}
@@ -201,7 +212,7 @@ function Caption({ kicker, text }: { kicker: string; text: ReactNode }) {
   );
 }
 
-function Logo({ size = 34, color = C.ink, mark = C.clay, gap = 16 }) {
+function Logo({ size = 34, color = C.ink, mark = C.clayBright, gap = 16 }) {
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap }}>
       <svg width={size} height={size} viewBox="0 0 32 32" fill="none">
@@ -247,7 +258,7 @@ function Card({
         height: h,
         background: C.paper,
         border: `1px solid ${C.line}`,
-        borderRadius: 18,
+        borderRadius: 20,
         boxShadow: '0 24px 60px -30px rgba(14,42,50,0.30)',
         ...style,
       }}
@@ -267,8 +278,8 @@ function SceneHook() {
   const logoO = ease((lt - 0.0) / 0.6);
   return (
     <Scene start={0} end={4.6} fade={0.45} scaleFrom={1.0} scaleTo={1.035}>
-      <div style={{ position: 'absolute', top: 80, left: 96, opacity: logoO }}>
-        <Logo size={32} />
+      <div style={{ position: 'absolute', top: 96, left: 0, right: 0, display: 'flex', justifyContent: 'center', opacity: logoO }}>
+        <Logo size={40} />
       </div>
       <div
         style={{
@@ -278,18 +289,19 @@ function SceneHook() {
           flexDirection: 'column',
           alignItems: 'center',
           justifyContent: 'center',
-          gap: 8,
+          gap: 4,
+          padding: `0 ${PAD}px`,
+          textAlign: 'center',
         }}
       >
         <div
           style={{
             fontFamily: SANS,
-            fontSize: 30,
+            fontSize: 38,
             color: C.muted,
             fontWeight: 500,
             opacity: line1,
             transform: `translateY(${(1 - line1) * 12}px)`,
-            letterSpacing: '0.01em',
           }}
         >
           An 82&nbsp;MB release upload.
@@ -300,29 +312,32 @@ function SceneHook() {
             fontSize: 132,
             fontWeight: 600,
             color: C.ink,
-            letterSpacing: '-0.035em',
+            letterSpacing: '-0.03em',
             opacity: big,
-            whiteSpace: 'nowrap',
+            lineHeight: 1.04,
             transform: `translateY(${(1 - big) * 22}px)`,
-            lineHeight: 1.0,
-            marginTop: 6,
+            marginTop: 18,
           }}
         >
-          Stored as <span style={{ color: C.clay }}>1.4&nbsp;MB.</span>
+          Stored as
+          <br />
+          <span style={{ color: C.clay }}>1.4&nbsp;MB.</span>
         </div>
         <div
           style={{
             fontFamily: SANS,
-            fontSize: 28,
+            fontSize: 32,
             color: C.muted,
             fontWeight: 450,
             opacity: line3,
             transform: `translateY(${(1 - line3) * 12}px)`,
-            marginTop: 46,
-            letterSpacing: '0.005em',
+            marginTop: 56,
+            lineHeight: 1.4,
           }}
         >
-          Reconstructed byte-identical. Clients see standard S3.
+          Reconstructed byte-identical.
+          <br />
+          Clients see standard S3.
         </div>
       </div>
     </Scene>
@@ -348,11 +363,11 @@ function Stat({
       <div
         style={{
           fontFamily: MONO,
-          fontSize: 15,
+          fontSize: 17,
           letterSpacing: '0.14em',
           textTransform: 'uppercase',
           color: C.muted,
-          marginBottom: 8,
+          marginBottom: 10,
         }}
       >
         {label}
@@ -360,7 +375,7 @@ function Stat({
       <div
         style={{
           fontFamily: SERIF,
-          fontSize: 52,
+          fontSize: 64,
           fontWeight: 700,
           color: accent,
           lineHeight: 1,
@@ -381,7 +396,7 @@ function SceneCompression() {
   const { time } = useTimeline();
   const lt = time - S;
 
-  const cmd = '$ aws s3 cp releases/v2.zip s3://builds/releases/';
+  const cmd = '$ aws s3 cp \\\n    releases/v2.zip \\\n    s3://builds/releases/';
   const typeT = clamp((lt - 0.8) / 1.4, 0, 1);
   const shown = cmd.slice(0, Math.round(typeT * cmd.length));
   const uploaded = lt > 2.4;
@@ -389,8 +404,8 @@ function SceneCompression() {
   const collapseStart = 3.4;
   const collapseDur = 1.8;
   const cp = ease((lt - collapseStart) / collapseDur, Easing.easeInOutCubic);
-  const fullW = 1180;
-  const storedW = Math.max(12, fullW * 0.017);
+  const fullW = W - PAD * 2;
+  const storedW = Math.max(14, fullW * 0.017);
   const barW = fullW - (fullW - storedW) * cp;
 
   const sizeNow = 82.0 - (82.0 - 1.4) * cp;
@@ -400,67 +415,71 @@ function SceneCompression() {
 
   return (
     <Scene start={S} end={E} fade={0.5}>
-      <Sprite start={S + 0.0} end={E}>
+      <Sprite start={S} end={E}>
         <Caption
           kicker="Delta compression"
           text={
             <>
-              Transparent <span style={{ color: C.clay }}>xdelta3</span> diff vs a baseline.
+              Transparent <span style={{ color: C.clay }}>xdelta3</span>
+              <br />
+              diff vs a baseline.
             </>
           }
         />
       </Sprite>
 
+      {/* Terminal (multi-line in portrait) */}
       <Card
-        x={370}
-        y={300}
-        w={1180}
-        h={130}
-        style={{ background: C.dark, border: `1px solid ${C.darkLine}`, borderRadius: 14 }}
+        x={PAD}
+        y={400}
+        w={fullW}
+        h={250}
+        style={{ background: C.dark, border: `1px solid ${C.darkLine}`, borderRadius: 16 }}
       >
-        <div style={{ display: 'flex', gap: 9, padding: '18px 0 0 22px' }}>
+        <div style={{ display: 'flex', gap: 10, padding: '22px 0 0 26px' }}>
           {['#E5685A', '#E6B14C', '#62B25A'].map((c, i) => (
             <span
               key={i}
-              style={{ width: 13, height: 13, borderRadius: 7, background: c, opacity: 0.92 }}
+              style={{ width: 15, height: 15, borderRadius: 8, background: c, opacity: 0.92 }}
             />
           ))}
         </div>
         <div
           style={{
-            padding: '16px 26px',
+            padding: '20px 30px',
             fontFamily: MONO,
-            fontSize: 26,
+            fontSize: 28,
             color: '#DCEEF0',
             letterSpacing: '0.01em',
+            whiteSpace: 'pre-wrap',
+            lineHeight: 1.45,
           }}
         >
           {shown}
           {typeT < 1 && <span style={{ opacity: Math.floor(lt * 2) % 2 ? 1 : 0.1 }}>▋</span>}
           {uploaded && (
-            <span style={{ color: '#5FD0C4', marginLeft: 14, opacity: ease((lt - 2.5) / 0.4) }}>
-              ✓ 200 OK
-            </span>
+            <span style={{ color: '#5FD0C4', opacity: ease((lt - 2.5) / 0.4) }}>{'  ✓ 200 OK'}</span>
           )}
         </div>
       </Card>
 
-      <div style={{ position: 'absolute', left: 370, top: 506, width: 1180 }}>
+      {/* Bar viz */}
+      <div style={{ position: 'absolute', left: PAD, top: 760, width: fullW }}>
         <div
           style={{
             display: 'flex',
             justifyContent: 'space-between',
             alignItems: 'flex-end',
-            marginBottom: 16,
+            marginBottom: 18,
           }}
         >
-          <div style={{ fontFamily: MONO, fontSize: 22, color: C.muted, letterSpacing: '0.02em' }}>
+          <div style={{ fontFamily: MONO, fontSize: 24, color: C.muted, letterSpacing: '0.02em' }}>
             releases/v2.zip
           </div>
           <div
             style={{
               fontFamily: SERIF,
-              fontSize: 30,
+              fontSize: 36,
               color: C.ink,
               fontWeight: 600,
               fontVariantNumeric: 'tabular-nums',
@@ -470,16 +489,16 @@ function SceneCompression() {
           </div>
         </div>
 
-        <div style={{ position: 'relative', height: 72 }}>
+        <div style={{ position: 'relative', height: 84 }}>
           <div
             style={{
               position: 'absolute',
               left: 0,
               top: 0,
               width: fullW,
-              height: 72,
+              height: 84,
               border: `2px dashed ${C.claySoft}`,
-              borderRadius: 12,
+              borderRadius: 14,
               opacity: cp * 0.9,
             }}
           />
@@ -489,46 +508,31 @@ function SceneCompression() {
               left: 0,
               top: 0,
               width: barW,
-              height: 72,
-              background: `linear-gradient(180deg, ${C.clay}, #0B7E87)`,
-              borderRadius: 12,
-              boxShadow: '0 10px 28px -12px rgba(14,154,164,0.6)',
+              height: 84,
+              background: `linear-gradient(180deg, ${C.clayBright}, ${C.clay})`,
+              borderRadius: 14,
+              boxShadow: '0 10px 28px -12px rgba(34,211,238,0.55)',
             }}
           />
-          {showStored && (
-            <div
-              style={{
-                position: 'absolute',
-                left: barW + 22,
-                top: 18,
-                opacity: ease((lt - collapseStart - 0.2) / 0.5),
-                fontFamily: SANS,
-                fontSize: 21,
-                color: C.clay,
-                fontWeight: 600,
-              }}
-            >
-              ← only the changed bytes stored
-            </div>
-          )}
         </div>
-
         <div
           style={{
-            marginTop: 18,
-            fontFamily: MONO,
-            fontSize: 17,
-            color: C.muted,
-            letterSpacing: '0.01em',
-            opacity: ease((lt - collapseStart - 0.1) / 0.6),
+            marginTop: 14,
+            height: 28,
+            opacity: ease((lt - collapseStart - 0.2) / 0.5),
+            fontFamily: SANS,
+            fontSize: 23,
+            color: C.clay,
+            fontWeight: 600,
           }}
         >
-          stored as a delta when it beats the 50% threshold · else passes through untouched
+          ↑ only the changed bytes are stored
         </div>
 
-        <div style={{ display: 'flex', gap: 56, marginTop: 26, alignItems: 'center' }}>
+        {/* stats — side by side, fits portrait width */}
+        <div style={{ display: 'flex', gap: 80, marginTop: 40 }}>
           <Stat
-            label="Stored on backend"
+            label="On backend"
             value="1.4 MB"
             accent={C.clay}
             show={showStored}
@@ -541,34 +545,37 @@ function SceneCompression() {
             show={showStored}
             t={lt - collapseStart - 0.15}
           />
-          <div
+        </div>
+
+        {/* GET line */}
+        <div
+          style={{
+            marginTop: 44,
+            opacity: ease((lt - 6.4) / 0.6),
+            transform: `translateY(${(1 - ease((lt - 6.4) / 0.6)) * 12}px)`,
+            display: showGet ? 'flex' : 'none',
+            alignItems: 'center',
+            gap: 14,
+            fontFamily: SANS,
+            fontSize: 25,
+            color: C.muted,
+            fontWeight: 500,
+          }}
+        >
+          <span
             style={{
-              opacity: ease((lt - 6.4) / 0.6),
-              transform: `translateX(${(1 - ease((lt - 6.4) / 0.6)) * 16}px)`,
-              display: showGet ? 'flex' : 'none',
-              alignItems: 'center',
-              gap: 12,
-              fontFamily: SANS,
-              fontSize: 23,
-              color: C.muted,
-              fontWeight: 500,
+              fontFamily: MONO,
+              fontSize: 20,
+              color: C.green,
+              background: '#DEF0ED',
+              padding: '8px 14px',
+              borderRadius: 9,
+              fontWeight: 600,
             }}
           >
-            <span
-              style={{
-                fontFamily: MONO,
-                fontSize: 18,
-                color: C.green,
-                background: '#DEF0ED',
-                padding: '6px 12px',
-                borderRadius: 8,
-                fontWeight: 600,
-              }}
-            >
-              GET
-            </span>
-            rebuilt byte-identical · SHA-256 verified
-          </div>
+            GET
+          </span>
+          rebuilt byte-identical · SHA-256 verified
         </div>
       </div>
     </Scene>
@@ -586,6 +593,7 @@ function SceneDeltaspace() {
     { n: 'v2.zip', tag: 'delta', sub: 'xdelta3 vs baseline', size: '1.4 MB', kind: 'delta' },
     { n: 'v3.zip', tag: 'delta', sub: 'xdelta3 vs baseline', size: '0.9 MB', kind: 'delta' },
   ];
+  const cardW = W - PAD * 2;
   return (
     <Scene start={S} end={E} fade={0.5} drift={-14}>
       <Sprite start={S} end={E}>
@@ -593,28 +601,30 @@ function SceneDeltaspace() {
           kicker="Deltaspaces"
           text={
             <>
-              Files sharing a prefix share <span style={{ color: C.clay }}>one baseline.</span>
+              One prefix,
+              <br />
+              <span style={{ color: C.clay }}>one baseline.</span>
             </>
           }
         />
       </Sprite>
-      <Card x={460} y={340} w={1000} h={500}>
+      <Card x={PAD} y={480} w={cardW} h={620}>
         <div
           style={{
             display: 'flex',
             alignItems: 'center',
-            gap: 14,
-            padding: '28px 36px',
+            gap: 16,
+            padding: '34px 40px',
             borderBottom: `1px solid ${C.lineSoft}`,
           }}
         >
-          <svg width="26" height="26" viewBox="0 0 24 24" fill="none">
+          <svg width="30" height="30" viewBox="0 0 24 24" fill="none">
             <path d="M3 6h6l2 2h10v11H3z" stroke={C.clay} strokeWidth="1.7" />
           </svg>
-          <span style={{ fontFamily: MONO, fontSize: 25, color: C.ink, fontWeight: 600 }}>
+          <span style={{ fontFamily: MONO, fontSize: 30, color: C.ink, fontWeight: 600 }}>
             deltaspace
           </span>
-          <span style={{ fontFamily: MONO, fontSize: 25, color: C.clay, fontWeight: 600 }}>
+          <span style={{ fontFamily: MONO, fontSize: 30, color: C.clay, fontWeight: 600 }}>
             releases/
           </span>
         </div>
@@ -627,8 +637,8 @@ function SceneDeltaspace() {
               style={{
                 display: 'flex',
                 alignItems: 'center',
-                gap: 22,
-                padding: '28px 36px',
+                gap: 24,
+                padding: '36px 40px',
                 borderBottom: i < rows.length - 1 ? `1px solid ${C.lineSoft}` : 'none',
                 opacity: o,
                 transform: `translateX(${(1 - o) * 22}px)`,
@@ -636,32 +646,30 @@ function SceneDeltaspace() {
               }}
             >
               <span
-                style={{ fontFamily: MONO, fontSize: 24, color: C.ink, fontWeight: 600, width: 130 }}
+                style={{ fontFamily: MONO, fontSize: 30, color: C.ink, fontWeight: 600, width: 150 }}
               >
                 {r.n}
               </span>
               <span
                 style={{
                   fontFamily: MONO,
-                  fontSize: 16,
+                  fontSize: 18,
                   fontWeight: 600,
                   letterSpacing: '0.06em',
                   textTransform: 'uppercase',
                   color: isBase ? C.slate : C.clay,
                   background: isBase ? C.slateBg : C.clayBg,
-                  padding: '7px 14px',
-                  borderRadius: 8,
+                  padding: '8px 16px',
+                  borderRadius: 9,
                 }}
               >
                 {r.tag}
               </span>
-              <span style={{ flex: 1, fontFamily: SANS, fontSize: 19, color: C.muted }}>
-                {r.sub}
-              </span>
+              <span style={{ flex: 1 }} />
               <span
                 style={{
                   fontFamily: SERIF,
-                  fontSize: 30,
+                  fontSize: 38,
                   fontWeight: 700,
                   color: isBase ? C.ink : C.clay,
                   fontVariantNumeric: 'tabular-nums',
@@ -676,48 +684,41 @@ function SceneDeltaspace() {
       <div
         style={{
           position: 'absolute',
-          top: 870,
-          left: 0,
-          right: 0,
+          top: 1150,
+          left: PAD,
+          right: PAD,
           textAlign: 'center',
           fontFamily: MONO,
-          fontSize: 18,
+          fontSize: 22,
           color: C.muted,
           opacity: ease((lt - 1.4) / 0.6),
+          lineHeight: 1.5,
         }}
       >
-        the first upload seeds the baseline — later versions are stored as diffs
+        the first upload seeds the baseline —
+        <br />
+        later versions are stored as diffs
       </div>
     </Scene>
   );
 }
 
-// ── SCENE 4 — DROP-IN S3 (18.6–23.2) ──────────────────────────────────────────
+// ── SCENE 4 — DROP-IN S3 (18.6–23.2) — VERTICAL flow in portrait ──────────────
 function SceneDropIn() {
   const S = 18.6;
   const E = 23.2;
   const { time } = useTimeline();
   const lt = time - S;
   const flow = (lt % 1.6) / 1.6;
+  const nodeW = 620;
+  const nodeX = (W - nodeW) / 2; // centred
+  const nodeH = 180;
+  const gapY = 84;
+  const startY = 470;
   const nodes = [
-    {
-      title: 'S3 clients',
-      lines: ['aws-cli · SDKs', 'presigned URLs'],
-      x: 250,
-      brand: false,
-    },
-    {
-      title: 'DeltaGlider',
-      lines: ['delta · reconstruct', 'SigV4 · cache'],
-      x: 810,
-      brand: true,
-    },
-    {
-      title: 'Backend',
-      lines: ['Filesystem', 'S3 / MinIO'],
-      x: 1370,
-      brand: false,
-    },
+    { title: 'S3 clients', lines: ['aws-cli · SDKs · presigned URLs'], brand: false },
+    { title: 'DeltaGlider', lines: ['delta · reconstruct · SigV4 · cache'], brand: true },
+    { title: 'Backend', lines: ['Filesystem · S3 / MinIO'], brand: false },
   ];
   return (
     <Scene start={S} end={E} fade={0.5} drift={-10}>
@@ -726,46 +727,49 @@ function SceneDropIn() {
           kicker="S3-compatible"
           text={
             <>
-              Drop-in. <span style={{ color: C.clay }}>Your clients never know.</span>
+              Drop-in.
+              <br />
+              <span style={{ color: C.clay }}>Clients never know.</span>
             </>
           }
         />
       </Sprite>
+      {/* vertical connectors with flowing dot */}
       <svg width={W} height={H} style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}>
-        {[
-          [550, 760],
-          [1110, 1320],
-        ].map(([x1, x2], i) => {
-          const y = 500;
+        {[0, 1].map((i) => {
+          const x = W / 2;
+          const yTop = startY + nodeH + (nodeH + gapY) * i;
+          const yBot = yTop + gapY;
           const o = ease((lt - 0.5 - i * 0.2) / 0.5);
-          const dx = x1 + (x2 - x1) * ((flow + i * 0.5) % 1);
+          const dy = yTop + (yBot - yTop) * ((flow + i * 0.5) % 1);
           return (
             <g key={i}>
               <line
-                x1={x1}
-                y1={y}
-                x2={x2}
-                y2={y}
+                x1={x}
+                y1={yTop}
+                x2={x}
+                y2={yBot}
                 stroke={C.clay}
                 strokeWidth="2.5"
                 strokeDasharray="2 9"
                 strokeLinecap="round"
                 opacity={o * 0.6}
               />
-              {lt > 0.8 ? <circle cx={dx} cy={y} r="6" fill={C.clay} opacity={o} /> : null}
+              {lt > 0.8 ? <circle cx={x} cy={dy} r="7" fill={C.clayBright} opacity={o} /> : null}
             </g>
           );
         })}
       </svg>
       {nodes.map((n, i) => {
         const o = ease((lt - 0.3 - i * 0.22) / 0.5);
+        const y = startY + (nodeH + gapY) * i;
         return (
           <Card
             key={i}
-            x={n.x}
-            y={400}
-            w={300}
-            h={200}
+            x={nodeX}
+            y={y}
+            w={nodeW}
+            h={nodeH}
             style={{
               opacity: o,
               transform: `translateY(${(1 - o) * 18}px)`,
@@ -773,52 +777,51 @@ function SceneDropIn() {
               flexDirection: 'column',
               alignItems: 'center',
               justifyContent: 'center',
-              gap: 12,
+              gap: 14,
               border: n.brand ? `2px solid ${C.clay}` : `1px solid ${C.line}`,
             }}
           >
             {n.brand ? (
-              <Logo size={26} />
+              <Logo size={34} />
             ) : (
-              <div style={{ fontFamily: SANS, fontSize: 28, fontWeight: 700, color: C.ink }}>
+              <div style={{ fontFamily: SANS, fontSize: 34, fontWeight: 700, color: C.ink }}>
                 {n.title}
               </div>
             )}
             {n.lines.map((l, j) => (
-              <div key={j} style={{ fontFamily: MONO, fontSize: 18, color: C.muted }}>
+              <div key={j} style={{ fontFamily: MONO, fontSize: 22, color: C.muted }}>
                 {l}
               </div>
             ))}
           </Card>
         );
       })}
+      {/* op chips */}
       <div
         style={{
           position: 'absolute',
-          top: 700,
-          left: 0,
-          right: 0,
+          top: startY + (nodeH + gapY) * 3 + 20,
+          left: PAD,
+          right: PAD,
           display: 'flex',
           justifyContent: 'center',
           gap: 14,
           flexWrap: 'wrap',
           opacity: ease((lt - 1.2) / 0.6),
-          maxWidth: 1300,
-          margin: '0 auto',
         }}
       >
-        {['PutObject', 'GetObject', 'Multipart', 'ListObjectsV2', 'Range', 'Conditional', 'CopyObject'].map(
+        {['PutObject', 'GetObject', 'Multipart', 'ListObjectsV2', 'Range', 'CopyObject'].map(
           (op, i) => (
             <span
               key={i}
               style={{
                 fontFamily: MONO,
-                fontSize: 19,
+                fontSize: 22,
                 color: C.ink,
                 background: C.paper,
                 border: `1px solid ${C.line}`,
-                padding: '11px 20px',
-                borderRadius: 10,
+                padding: '12px 22px',
+                borderRadius: 11,
               }}
             >
               {op}
@@ -841,6 +844,7 @@ function SceneIAM() {
     { name: 'mara.k', role: 'Release engineer', tag: 'read · write: releases/*' },
     { name: 'auditor', role: 'Read-only', tag: 'read: *' },
   ];
+  const cardW = W - PAD * 2;
   return (
     <Scene start={S} end={E} fade={0.5} drift={-12}>
       <Sprite start={S} end={E}>
@@ -848,37 +852,38 @@ function SceneIAM() {
           kicker="Access control"
           text={
             <>
-              Per-user IAM, <span style={{ color: C.clay }}>fine-grained ABAC.</span>
+              Per-user IAM,
+              <br />
+              <span style={{ color: C.clay }}>fine-grained ABAC.</span>
             </>
           }
         />
       </Sprite>
-      <Card x={420} y={340} w={1080} h={470}>
+      <Card x={PAD} y={470} w={cardW} h={680}>
         <div
           style={{
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'space-between',
-            padding: '24px 34px',
+            padding: '30px 38px',
             borderBottom: `1px solid ${C.lineSoft}`,
           }}
         >
-          <div style={{ fontFamily: SANS, fontSize: 24, fontWeight: 600, color: C.ink }}>
+          <div style={{ fontFamily: SANS, fontSize: 28, fontWeight: 600, color: C.ink }}>
             Access policy
           </div>
-          <div style={{ display: 'flex', gap: 12, opacity: ease((lt - 0.3) / 0.5) }}>
-            {['SigV4', 'Presigned URLs', 'ABAC'].map((b, i) => (
+          <div style={{ display: 'flex', gap: 10, opacity: ease((lt - 0.3) / 0.5) }}>
+            {['SigV4', 'ABAC'].map((b, i) => (
               <span
                 key={i}
                 style={{
                   fontFamily: MONO,
-                  fontSize: 16,
+                  fontSize: 18,
                   color: C.slate,
                   background: C.slateBg,
                   padding: '8px 14px',
                   borderRadius: 9,
                   fontWeight: 600,
-                  letterSpacing: '0.02em',
                 }}
               >
                 {b}
@@ -895,7 +900,7 @@ function SceneIAM() {
                 display: 'flex',
                 alignItems: 'center',
                 gap: 22,
-                padding: '22px 34px',
+                padding: '30px 38px',
                 borderBottom: `1px solid ${C.lineSoft}`,
                 opacity: o,
                 transform: `translateX(${(1 - o) * 22}px)`,
@@ -903,9 +908,9 @@ function SceneIAM() {
             >
               <div
                 style={{
-                  width: 54,
-                  height: 54,
-                  borderRadius: 27,
+                  width: 62,
+                  height: 62,
+                  borderRadius: 31,
                   flexShrink: 0,
                   background: i === 0 ? C.clayBg : C.slateBg,
                   display: 'flex',
@@ -913,32 +918,19 @@ function SceneIAM() {
                   justifyContent: 'center',
                   fontFamily: SANS,
                   fontWeight: 700,
-                  fontSize: 22,
+                  fontSize: 26,
                   color: i === 0 ? C.clay : C.slate,
                 }}
               >
                 {u.name[0].toUpperCase()}
               </div>
               <div style={{ flex: 1 }}>
-                <div style={{ fontFamily: MONO, fontSize: 23, color: C.ink, fontWeight: 600 }}>
+                <div style={{ fontFamily: MONO, fontSize: 26, color: C.ink, fontWeight: 600 }}>
                   {u.name}
                 </div>
-                <div style={{ fontFamily: SANS, fontSize: 18, color: C.muted, marginTop: 3 }}>
-                  {u.role}
+                <div style={{ fontFamily: MONO, fontSize: 20, color: C.clay, marginTop: 6 }}>
+                  {u.tag}
                 </div>
-              </div>
-              <div
-                style={{
-                  fontFamily: MONO,
-                  fontSize: 18,
-                  color: C.ink,
-                  background: C.cream,
-                  padding: '10px 16px',
-                  borderRadius: 10,
-                  border: `1px solid ${C.line}`,
-                }}
-              >
-                {u.tag}
               </div>
             </div>
           );
@@ -947,19 +939,19 @@ function SceneIAM() {
           style={{
             display: 'flex',
             alignItems: 'center',
-            gap: 12,
-            padding: '20px 34px',
+            gap: 14,
+            padding: '28px 38px',
             fontFamily: SANS,
-            fontSize: 19,
+            fontSize: 22,
             color: C.muted,
             opacity: ease((lt - 1.5) / 0.6),
           }}
         >
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
             <rect x="5" y="11" width="14" height="9" rx="2" fill={C.green} />
             <path d="M8 11V8a4 4 0 0 1 8 0v3" stroke={C.green} strokeWidth="2" />
           </svg>
-          IAM users stored in an encrypted SQLCipher database
+          Encrypted SQLCipher database
         </div>
       </Card>
     </Scene>
@@ -972,11 +964,15 @@ function SceneBrowser() {
   const E = 33.4;
   const { time } = useTimeline();
   const lt = time - S;
-  const rows = [
-    { n: 'v3.zip', t: 'delta', real: '82 MB', stored: '0.9 MB', c: C.clay },
-    { n: 'v2.zip', t: 'delta', real: '82 MB', stored: '1.4 MB', c: C.clay },
-    { n: 'v1.zip', t: 'baseline', real: '82 MB', stored: '82 MB', c: C.slate },
-    { n: 'logo.png', t: 'passthrough', real: '4.2 MB', stored: '4.2 MB', c: C.muted },
+  // Faithful to the REAL object browser: a file list + the inspector drawer
+  // with the savings panel (Original→Stored bars, Delta badge) and dg-* metadata.
+  const files = ['app-v1.zip', 'app-v2.zip', 'app-v3.zip', 'app-v4.zip', 'app-v5.zip'];
+  const selected = 3; // app-v4.zip — the one open in the inspector
+  const cardW = W - PAD * 2;
+  const barFill = ease((lt - 1.2) / 0.9, Easing.easeInOutCubic);
+  const meta = [
+    { k: 'dg-delta-cmd', v: 'xdelta3 -e -9 -s reference.bin' },
+    { k: 'dg-delta-size', v: '1389 bytes' },
   ];
   return (
     <Scene start={S} end={E} fade={0.5} scaleFrom={1.02} scaleTo={1.0}>
@@ -985,128 +981,201 @@ function SceneBrowser() {
           kicker="Built-in UI"
           text={
             <>
-              Browse &amp; monitor — <span style={{ color: C.clay }}>served at /_/</span>
+              Browse &amp; inspect,
+              <br />
+              <span style={{ color: C.clay }}>served at /_/</span>
             </>
           }
         />
       </Sprite>
-      <Card x={360} y={320} w={1200} h={540} style={{ overflow: 'hidden' }}>
+
+      {/* File list */}
+      <Card x={PAD} y={460} w={cardW} h={250} style={{ overflow: 'hidden', padding: '8px 0' }}>
         <div
           style={{
             display: 'flex',
             alignItems: 'center',
-            gap: 14,
-            padding: '22px 30px',
-            borderBottom: `1px solid ${C.lineSoft}`,
-          }}
-        >
-          <span style={{ fontFamily: MONO, fontSize: 19, color: C.muted }}>builds</span>
-          <span style={{ color: C.line }}>/</span>
-          <span style={{ fontFamily: MONO, fontSize: 19, color: C.ink, fontWeight: 600 }}>
-            releases
-          </span>
-          <div style={{ flex: 1 }} />
-          <span style={{ fontFamily: SANS, fontSize: 17, color: C.green, fontWeight: 600 }}>
-            ↓ 98% storage saved
-          </span>
-        </div>
-        <div
-          style={{
-            display: 'flex',
-            padding: '14px 30px',
+            gap: 12,
+            padding: '14px 30px 18px',
             fontFamily: MONO,
-            fontSize: 14,
-            letterSpacing: '0.1em',
-            textTransform: 'uppercase',
+            fontSize: 20,
             color: C.muted,
-            borderBottom: `1px solid ${C.lineSoft}`,
           }}
         >
-          <div style={{ flex: 1 }}>Object</div>
-          <div style={{ width: 170 }}>Strategy</div>
-          <div style={{ width: 150, textAlign: 'right' }}>Logical</div>
-          <div style={{ width: 160, textAlign: 'right' }}>On backend</div>
+          <span style={{ color: C.ink, fontWeight: 600 }}>demo-bucket</span>
+          <span style={{ color: C.line }}>›</span>
+          <span style={{ color: C.ink, fontWeight: 600 }}>demo-releases</span>
         </div>
-        {rows.map((r, i) => {
-          const o = ease((lt - 0.4 - i * 0.18) / 0.45);
+        {files.map((f, i) => {
+          const o = ease((lt - 0.3 - i * 0.1) / 0.4);
+          const sel = i === selected;
           return (
             <div
               key={i}
               style={{
                 display: 'flex',
                 alignItems: 'center',
-                padding: '20px 30px',
-                borderBottom: i < rows.length - 1 ? `1px solid ${C.lineSoft}` : 'none',
+                gap: 14,
+                padding: '0 30px',
+                height: 40,
                 opacity: o,
-                transform: `translateY(${(1 - o) * 12}px)`,
+                background: sel ? C.clayBg : 'transparent',
+                borderLeft: sel ? `4px solid ${C.clayBright}` : '4px solid transparent',
+                fontFamily: MONO,
+                fontSize: 22,
+                color: C.ink,
               }}
             >
-              <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 14 }}>
-                <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
-                  <path d="M6 3h8l4 4v14H6z" stroke={C.muted} strokeWidth="1.6" />
-                  <path d="M14 3v4h4" stroke={C.muted} strokeWidth="1.6" />
-                </svg>
-                <span style={{ fontFamily: MONO, fontSize: 21, color: C.ink }}>{r.n}</span>
-              </div>
-              <div style={{ width: 170 }}>
-                <span
-                  style={{
-                    fontFamily: MONO,
-                    fontSize: 15,
-                    fontWeight: 600,
-                    color: r.c,
-                    background:
-                      r.c === C.muted ? C.lineSoft : r.c === C.slate ? C.slateBg : C.clayBg,
-                    padding: '6px 12px',
-                    borderRadius: 7,
-                    letterSpacing: '0.03em',
-                  }}
-                >
-                  {r.t}
-                </span>
-              </div>
-              <div
-                style={{
-                  width: 150,
-                  textAlign: 'right',
-                  fontFamily: MONO,
-                  fontSize: 19,
-                  color: C.muted,
-                }}
-              >
-                {r.real}
-              </div>
-              <div
-                style={{
-                  width: 160,
-                  textAlign: 'right',
-                  fontFamily: MONO,
-                  fontSize: 19,
-                  color: r.stored === r.real ? C.muted : C.clay,
-                  fontWeight: 600,
-                }}
-              >
-                {r.stored}
-              </div>
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+                <path d="M6 3h8l4 4v14H6z" stroke={C.muted} strokeWidth="1.6" />
+                <path d="M14 3v4h4" stroke={C.muted} strokeWidth="1.6" />
+              </svg>
+              {f}
             </div>
           );
         })}
       </Card>
-      <div
-        style={{
-          position: 'absolute',
-          top: 880,
-          left: 0,
-          right: 0,
-          textAlign: 'center',
-          fontFamily: MONO,
-          fontSize: 18,
-          color: C.muted,
-          opacity: ease((lt - 1.6) / 0.6),
-        }}
+
+      {/* Inspector drawer */}
+      <Card
+        x={PAD}
+        y={726}
+        w={cardW}
+        h={620}
+        style={{ overflow: 'hidden', opacity: ease((lt - 0.7) / 0.5) }}
       >
-        live dashboards for cache, compression &amp; HTTP traffic — no extra containers
-      </div>
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 14,
+            padding: '26px 32px',
+            borderBottom: `1px solid ${C.lineSoft}`,
+          }}
+        >
+          <svg width="26" height="26" viewBox="0 0 24 24" fill="none">
+            <path d="M6 3h8l4 4v14H6z" stroke={C.clay} strokeWidth="1.6" />
+            <path d="M14 3v4h4" stroke={C.clay} strokeWidth="1.6" />
+          </svg>
+          <span style={{ fontFamily: MONO, fontSize: 28, color: C.ink, fontWeight: 600 }}>
+            app-v4.zip
+          </span>
+        </div>
+
+        {/* Savings panel */}
+        <div style={{ padding: '28px 32px' }}>
+          <div
+            style={{
+              fontFamily: MONO,
+              fontSize: 16,
+              letterSpacing: '0.12em',
+              textTransform: 'uppercase',
+              color: C.muted,
+              textAlign: 'center',
+            }}
+          >
+            Savings
+          </div>
+          <div
+            style={{
+              fontFamily: SERIF,
+              fontSize: 88,
+              fontWeight: 700,
+              color: C.green,
+              textAlign: 'center',
+              lineHeight: 1.05,
+              letterSpacing: '-0.02em',
+            }}
+          >
+            97.2%
+          </div>
+          <div
+            style={{
+              fontFamily: SANS,
+              fontSize: 20,
+              color: C.muted,
+              textAlign: 'center',
+              marginBottom: 24,
+            }}
+          >
+            47.5 KB saved
+          </div>
+
+          {[
+            { label: 'Original', val: '48.8 KB', frac: 1 },
+            { label: 'Stored', val: '1.4 KB', frac: 0.028 },
+          ].map((b, i) => (
+            <div key={i} style={{ marginBottom: 16 }}>
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  fontFamily: MONO,
+                  fontSize: 20,
+                  color: i === 0 ? C.muted : C.clay,
+                  fontWeight: i === 0 ? 400 : 600,
+                  marginBottom: 8,
+                }}
+              >
+                <span>{b.label}</span>
+                <span>{b.val}</span>
+              </div>
+              <div style={{ height: 10, borderRadius: 5, background: C.lineSoft }}>
+                <div
+                  style={{
+                    width: `${b.frac * 100 * (i === 0 ? 1 : barFill) + (i === 0 ? 0 : 0)}%`,
+                    height: 10,
+                    borderRadius: 5,
+                    background: i === 0 ? C.claySoft : C.clayBright,
+                  }}
+                />
+              </div>
+            </div>
+          ))}
+
+          <div style={{ textAlign: 'center', marginTop: 18 }}>
+            <span
+              style={{
+                fontFamily: MONO,
+                fontSize: 18,
+                fontWeight: 600,
+                color: C.slate,
+                background: C.slateBg,
+                padding: '8px 18px',
+                borderRadius: 9,
+                letterSpacing: '0.04em',
+              }}
+            >
+              Delta
+            </span>
+          </div>
+        </div>
+
+        {/* Custom metadata */}
+        <div style={{ padding: '6px 32px' }}>
+          {meta.map((m, i) => {
+            const o = ease((lt - 1.8 - i * 0.18) / 0.5);
+            return (
+              <div
+                key={i}
+                style={{
+                  background: C.cream,
+                  borderRadius: 10,
+                  padding: '14px 18px',
+                  marginBottom: 10,
+                  opacity: o,
+                  transform: `translateY(${(1 - o) * 8}px)`,
+                }}
+              >
+                <div style={{ fontFamily: MONO, fontSize: 16, color: C.muted }}>{m.k}</div>
+                <div style={{ fontFamily: MONO, fontSize: 20, color: C.ink, marginTop: 4 }}>
+                  {m.v}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </Card>
     </Scene>
   );
 }
@@ -1129,34 +1198,33 @@ function SceneOutro() {
           flexDirection: 'column',
           alignItems: 'center',
           justifyContent: 'center',
-          gap: 30,
+          gap: 40,
+          padding: `0 ${PAD}px`,
+          textAlign: 'center',
         }}
       >
         <div style={{ opacity: logoO, transform: `translateY(${(1 - logoO) * 14}px)` }}>
-          <Logo size={64} />
+          <Logo size={72} />
         </div>
         <div
           style={{
             fontFamily: SERIF,
-            fontSize: 40,
+            fontSize: 50,
             fontWeight: 500,
             color: C.ink,
             opacity: tagO,
             transform: `translateY(${(1 - tagO) * 12}px)`,
-            textAlign: 'center',
-            maxWidth: 1150,
-            lineHeight: 1.25,
+            lineHeight: 1.3,
             letterSpacing: '-0.015em',
           }}
         >
-          A drop-in S3 proxy that delta-compresses
-          <br />
-          versioned binaries. Storage drops <span style={{ color: C.clay }}>60–95%.</span>
+          Delta-compress versioned binaries. Storage drops{' '}
+          <span style={{ color: C.clay }}>60–95%.</span>
         </div>
         <div
           style={{
             fontFamily: MONO,
-            fontSize: 20,
+            fontSize: 24,
             color: C.muted,
             letterSpacing: '0.04em',
             opacity: ease((lt - 1.6) / 0.6),
@@ -1178,17 +1246,16 @@ function Vignette() {
         inset: 0,
         pointerEvents: 'none',
         background:
-          'radial-gradient(120% 120% at 50% 40%, transparent 55%, rgba(12,40,48,0.06) 100%)',
+          'radial-gradient(120% 100% at 50% 35%, transparent 55%, rgba(12,40,48,0.06) 100%)',
       }}
     />
   );
 }
 
 function ProgressDots() {
-  const { time } = useTimeline();
-  const marks = [0, 4.6, 13.4, 18.6, 23.2, 28.2, 33.4];
+  const { time, seek } = useTimeline();
   let active = 0;
-  marks.forEach((m, i) => {
+  SCENE_MARKS.forEach((m, i) => {
     if (time >= m) active = i;
   });
   return (
@@ -1200,67 +1267,84 @@ function ProgressDots() {
         right: 0,
         display: 'flex',
         justifyContent: 'center',
-        gap: 14,
+        gap: 18,
+        pointerEvents: 'auto', // plate is pointer-events:none — opt back in
       }}
     >
-      {marks.map((_m, i) => (
-        <div
+      {SCENE_MARKS.map((m, i) => (
+        <button
           key={i}
+          type="button"
+          onClick={() => seek?.(m + 0.6)}
+          aria-label={`Go to ${SCENE_LABELS[i]}`}
+          title={SCENE_LABELS[i]}
           style={{
-            width: i === active ? 34 : 9,
-            height: 9,
-            borderRadius: 5,
-            background: i === active ? C.clay : C.line,
-            transition: 'width 0.4s, background 0.4s',
+            width: i === active ? 44 : 26,
+            height: 26,
+            padding: 0,
+            border: 'none',
+            background: 'transparent',
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
           }}
-        />
+        >
+          {/* the visible pill — bigger transparent hit-area around it */}
+          <span
+            style={{
+              width: i === active ? 40 : 11,
+              height: 11,
+              borderRadius: 6,
+              background: i === active ? C.clayBright : C.line,
+              transition: 'width 0.35s, background 0.35s',
+            }}
+          />
+        </button>
       ))}
     </div>
   );
 }
 
-// ── prefers-reduced-motion ────────────────────────────────────────────────────
-function usePrefersReducedMotion() {
-  const [reduced, setReduced] = useState(false);
-  useEffect(() => {
-    const mq = window.matchMedia('(prefers-reduced-motion: reduce)');
-    setReduced(mq.matches);
-    const on = () => setReduced(mq.matches);
-    mq.addEventListener('change', on);
-    return () => mq.removeEventListener('change', on);
-  }, []);
-  return reduced;
-}
-
-// ── Hero walkthrough: cover-scaled canvas + autoplay loop + play/pause ─────────
+// ── Hero walkthrough: contain-fit portrait canvas + autoplay loop + play/pause ─
 const DURATION = 37;
 
 export default function HeroWalkthrough() {
-  const reduced = usePrefersReducedMotion();
   const wrapRef = useRef<HTMLDivElement>(null);
   const rafRef = useRef<number | null>(null);
   const lastTsRef = useRef<number | null>(null);
   const [time, setTime] = useState(0);
   const [playing, setPlaying] = useState(true);
-  const [scale, setScale] = useState(1);
+  const [frame, setFrame] = useState({ w: 0, h: 0, scale: 1 });
 
-  // Cover-scale the 1920×1080 canvas to fill the plate (crop, anchor left/top).
+  // CONTAIN-fit the portrait W×H canvas inside the frame; the frame maximizes to
+  // the column (capped to the W/H aspect) so the whole composition is visible.
   useEffect(() => {
     const el = wrapRef.current;
     if (!el) return;
     const measure = () => {
-      const s = Math.max(el.clientWidth / W, el.clientHeight / H);
-      setScale(s > 0 ? s : 1);
+      const cs = getComputedStyle(el);
+      const availW = el.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+      const availH = el.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom);
+      if (availW <= 1 || availH <= 1) return;
+      // Fit the W:H (portrait) box inside the available area.
+      const fh = Math.min(availH, availW * (H / W));
+      const fw = fh * (W / H);
+      setFrame({ w: fw, h: fh, scale: fw / W });
     };
     measure();
+    const raf = requestAnimationFrame(measure);
     const ro = new ResizeObserver(measure);
     ro.observe(el);
-    return () => ro.disconnect();
+    return () => {
+      cancelAnimationFrame(raf);
+      ro.disconnect();
+    };
   }, []);
 
   // Autoplay RAF loop (loops at DURATION). Paused state stops it.
   useEffect(() => {
-    if (!playing || reduced) {
+    if (!playing) {
       lastTsRef.current = null;
       return;
     }
@@ -1276,51 +1360,59 @@ export default function HeroWalkthrough() {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       lastTsRef.current = null;
     };
-  }, [playing, reduced]);
+  }, [playing]);
 
-  const ctx = useMemo(() => ({ time, duration: DURATION }), [time]);
-
-  // Under reduced-motion render nothing — the screenshot slideshow fallback
-  // (gated by CSS in index.astro) takes the plate instead.
-  if (reduced) return null;
+  // Jump to a scene; reset the RAF delta so the loop continues smoothly from there.
+  const seek = useCallback((t: number) => {
+    lastTsRef.current = null;
+    setTime(clamp(t, 0, DURATION));
+  }, []);
+  const ctx = useMemo(() => ({ time, duration: DURATION, seek }), [time, seek]);
 
   return (
     <div ref={wrapRef} className="hero-walkthrough">
-      <div
-        className="hero-walkthrough__canvas"
-        style={{ width: W, height: H, transform: `scale(${scale})`, background: C.cream }}
-      >
-        <TimelineContext.Provider value={ctx}>
-          <Vignette />
-          <SceneHook />
-          <SceneCompression />
-          <SceneDeltaspace />
-          <SceneDropIn />
-          <SceneIAM />
-          <SceneBrowser />
-          <SceneOutro />
-          <ProgressDots />
-        </TimelineContext.Provider>
-      </div>
+      <div className="hero-walkthrough__glow" aria-hidden="true" />
 
-      <button
-        type="button"
-        className="hero-walkthrough__toggle"
-        onClick={() => setPlaying((p) => !p)}
-        aria-label={playing ? 'Pause walkthrough' : 'Play walkthrough'}
-        title={playing ? 'Pause' : 'Play'}
+      <div
+        className="hero-walkthrough__frame"
+        style={{ width: frame.w || undefined, height: frame.h || undefined }}
       >
-        {playing ? (
-          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
-            <rect x="3" y="2" width="3" height="10" fill="currentColor" />
-            <rect x="8" y="2" width="3" height="10" fill="currentColor" />
-          </svg>
-        ) : (
-          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
-            <path d="M3 2l9 5-9 5V2z" fill="currentColor" />
-          </svg>
-        )}
-      </button>
+        <div
+          className="hero-walkthrough__canvas"
+          style={{ width: W, height: H, zoom: frame.scale, background: C.cream }}
+        >
+          <TimelineContext.Provider value={ctx}>
+            <Vignette />
+            <SceneHook />
+            <SceneCompression />
+            <SceneDeltaspace />
+            <SceneDropIn />
+            <SceneIAM />
+            <SceneBrowser />
+            <SceneOutro />
+            <ProgressDots />
+          </TimelineContext.Provider>
+        </div>
+
+        <button
+          type="button"
+          className="hero-walkthrough__toggle"
+          onClick={() => setPlaying((p) => !p)}
+          aria-label={playing ? 'Pause walkthrough' : 'Play walkthrough'}
+          title={playing ? 'Pause' : 'Play'}
+        >
+          {playing ? (
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+              <rect x="3" y="2" width="3" height="10" fill="currentColor" />
+              <rect x="8" y="2" width="3" height="10" fill="currentColor" />
+            </svg>
+          ) : (
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+              <path d="M3 2l9 5-9 5V2z" fill="currentColor" />
+            </svg>
+          )}
+        </button>
+      </div>
     </div>
   );
 }

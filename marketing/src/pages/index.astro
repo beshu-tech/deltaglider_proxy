@@ -18,7 +18,6 @@ import BaseLayout from '../layouts/BaseLayout.astro';
 import JsonLd from '../components/JsonLd.astro';
 import TestimonialsBlock from '../components/TestimonialsBlock.astro';
 import WorkloadFitTable from '../components/WorkloadFitTable.astro';
-import HeroSlideshow from '../components/HeroSlideshow.tsx';
 import HeroWalkthrough from '../components/HeroWalkthrough.tsx';
 import DemoVideo from '../components/DemoVideo.astro';
 import StorageScale from '../components/StorageScale.astro';
@@ -46,14 +45,11 @@ import {
       dashboard slideshow occupies the right half and bleeds to the right
       viewport edge. On narrow screens the screenshot is dropped entirely
       (text-only hero). */}
-  <section class="hero hero--full">
-    {/* Right-side image plate — bleeds to the right viewport edge.
+  <section class="hero hero--full hero--walkthrough">
+    {/* Right column holds the device-framed product walkthrough (always plays).
         Hidden below the breakpoint (CSS). */}
-    {/* Animated walkthrough by default; the screenshot slideshow is the
-        prefers-reduced-motion fallback (swapped via CSS — no JS branching). */}
     <div class="hero-plate" aria-hidden="false">
-      <HeroWalkthrough client:visible />
-      <HeroSlideshow client:visible variant="backdrop" />
+      <HeroWalkthrough client:load />
       <div class="hero-plate-fade" aria-hidden="true"></div>
     </div>
 

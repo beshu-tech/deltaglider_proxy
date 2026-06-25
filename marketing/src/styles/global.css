@@ -518,6 +518,17 @@ hr {
   z-index: 0;
   pointer-events: none; /* clicks fall through to the copy/CTAs */
 }
+/* The framed walkthrough wants more horizontal room than the bleeding
+   screenshot did — start the plate earlier and let it run to the edge. */
+.hero--walkthrough .hero-plate { left: 50%; }
+@media (max-width: 1200px) {
+  .hero--walkthrough .hero-plate { left: 54%; }
+}
+/* The copy column is width:100% at z-index 2, so its transparent right half
+   covers the frame and would eat its clicks. Make the column pass-through and
+   re-enable only the actual copy (text + CTAs). */
+.hero--walkthrough .hero-full-inner { pointer-events: none; }
+.hero--walkthrough .hero-full-inner .hero-copy { pointer-events: auto; }
 /* Left fade: a strong dark veil over the plate's left third so the copy
    column ALWAYS has contrast where text can reach (the headline extends
    past the plate's left edge). Holds near-opaque, then clears so the
@@ -590,25 +601,75 @@ hr {
   transform: none;
 }
 
-/* Animated walkthrough — the default hero backdrop. Cover-scales a fixed
-   1920×1080 canvas to fill the plate, anchored top-left so the right edge
-   bleeds off behind the fade veil. */
+/* Animated walkthrough — a device-framed viewport floating in the plate.
+   The 16:9 composition is CONTAIN-fit (never cropped) and maximized to the
+   column at every width. A teal ambient glow blends it into the dark hero. */
 .hero-walkthrough {
   position: absolute;
   inset: 0;
-  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;         /* portrait frame sits centred in the right column */
+  padding: clamp(1.75rem, 3.5vh, 3.5rem) clamp(1.5rem, 3vw, 3rem);
 }
+
+/* Walkthrough hero: veil only the thin strip where the headline overlaps the
+   plate's left edge, clearing fast so the framed screen to the right is never
+   dimmed. (The headline reaches just a little into the plate.) */
+.hero--walkthrough .hero-plate-fade {
+  background: linear-gradient(90deg,
+    var(--bg) 0%,
+    rgba(11, 15, 25, 0.5) 8%,
+    rgba(11, 15, 25, 0.0) 22%);
+}
+
+/* Soft teal halo behind the frame, bleeding into the dark background. */
+.hero-walkthrough__glow {
+  position: absolute;
+  inset: 8%;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(60% 55% at 60% 45%, rgba(34, 211, 238, 0.30), transparent 70%),
+    radial-gradient(50% 60% at 40% 72%, rgba(217, 70, 239, 0.16), transparent 72%);
+  filter: blur(44px);
+}
+
+/* The "screen": rounded bezel, fine border, floating shadow. Straight-on (no
+   3D tilt) — the tilt fought the canvas's own scale transform and made the
+   rounded corner flicker. The clip lives here; nothing inside re-transforms it. */
+.hero-walkthrough__frame {
+  position: relative;
+  z-index: 1;
+  overflow: hidden;
+  border-radius: 16px;
+  background: #ecf3f4;
+  border: 1px solid rgba(14, 42, 50, 0.5);
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.06),
+    0 40px 80px -28px rgba(0, 0, 0, 0.7),
+    0 18px 50px -24px rgba(34, 211, 238, 0.4);
+  isolation: isolate;
+  /* The frame is clear of the copy column (verified gap), so make it
+     interactive — its children (scene dots, play/pause) become clickable while
+     the rest of the plate stays pass-through for the CTAs underneath. */
+  pointer-events: auto;
+}
+/* Scene content itself shouldn't grab the pointer — only the controls. */
+.hero-walkthrough__canvas { pointer-events: none; }
+
 .hero-walkthrough__canvas {
   position: absolute;
   top: 0;
   left: 0;
-  transform-origin: top left;
-  /* width/height (1920×1080) + transform: scale() set inline by the component */
+  /* width/height (1920×1080) + zoom (contain-fit) set inline by the component */
 }
+
 .hero-walkthrough__toggle {
   position: absolute;
-  left: 18px;
-  bottom: 18px;
+  z-index: 2;
+  left: 14px;
+  bottom: 14px;
   width: 30px;
   height: 30px;
   display: flex;
@@ -616,27 +677,18 @@ hr {
   justify-content: center;
   padding: 0;
   border-radius: 8px;
-  border: 1px solid rgba(14, 42, 50, 0.14);
-  background: rgba(251, 253, 253, 0.72);
+  border: 1px solid rgba(14, 42, 50, 0.16);
+  background: rgba(251, 253, 253, 0.7);
   color: #0e2a32;
   cursor: pointer;
-  pointer-events: auto;        /* plate is pointer-events:none — opt back in */
-  backdrop-filter: blur(4px);
+  pointer-events: auto;            /* plate is pointer-events:none — opt back in */
+  backdrop-filter: blur(6px);
   transition: background 120ms ease, opacity 120ms ease;
-  opacity: 0.55;
+  opacity: 0;                      /* reveal on frame hover — keep the screen clean */
 }
-.hero-walkthrough__toggle:hover {
-  background: rgba(251, 253, 253, 0.95);
-  opacity: 1;
-}
+.hero-walkthrough:hover .hero-walkthrough__toggle { opacity: 0.7; }
+.hero-walkthrough__toggle:hover { background: rgba(251, 253, 253, 0.96); opacity: 1; }
 
-/* Reduced motion: hide the animated walkthrough, show the screenshot
-   slideshow fallback instead. Pure-CSS swap — no hydration flash. */
-.hero-plate .hero-slideshow--backdrop { display: none; }
-@media (prefers-reduced-motion: reduce) {
-  .hero-walkthrough { display: none; }
-  .hero-plate .hero-slideshow--backdrop { display: block; }
-}
 
 /* Narrow screens: drop the screenshot entirely, text-only hero. */
 @media (max-width: 900px) {
