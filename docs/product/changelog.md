@@ -8,7 +8,44 @@ Every released version of DeltaGlider Proxy, newest first. Versions
 follow [semantic versioning](https://semver.org/); the Docker image
 `beshultd/deltaglider_proxy:<version>` is published for each tag.
 
-_Last updated: 2026-06-18_
+_Last updated: 2026-06-25_
+
+## v1.5.0 — 2026-06-25
+
+### Added
+
+- **Gigantic-file replication: streaming multipart copy with rclone-class
+  concurrency.** Replicating a large passthrough object (e.g. a 30 GB backup
+  tarball) used to buffer the whole object in memory twice and fail when the
+  single monolithic GET dropped mid-stream. The transfer path now streams large
+  passthrough objects source→destination via multipart upload with **bounded
+  memory** (only `upload_concurrency × part_size` resident, not the whole
+  object), **per-part range-resume** (a dropped connection retries just that
+  part, not the entire object), and **concurrency** on two axes — parts within
+  an object and objects within a run:
+
+  ```yaml
+  replication:
+    transfers: 4            # objects copied concurrently per run
+    upload_concurrency: 4   # multipart parts in flight per object
+  ```
+
+  Delta objects still reconstruct transparently; proxy-side AES-encrypted
+  backends fall back to the buffered path (native multipart for them is
+  deferred). New `max_passthrough_object_size` (default 64 GiB) decouples the
+  streaming ceiling from the delta-reconstruction limit.
+
+- **Replication run resilience.** A single slow or poison object can no longer
+  kill a whole run. Lease defaults raised (TTL 60s→300s, heartbeat 20s→60s) so a
+  multi-minute copy can't lapse the run lease; new `replication.object_timeout`
+  (default `30m`) bounds a stalled copy; `replication.object_skip_after_failures`
+  (default 5) skips an object that fails N consecutive runs so it stops blocking
+  the queue head (stays visible in the job's failures).
+
+- **Replication observability.** New Prometheus metrics expose the streaming
+  characteristics for Grafana: `deltaglider_replication_part_bytes_resident`
+  (+`_peak`), `_parts_inflight` (+`_peak`), `_objects_inflight` (+`_peak`),
+  `_multipart_parts_total`, `_part_retries_total`, `_bytes_streamed_total`.
 
 ## v1.4.3 — 2026-06-18
 
