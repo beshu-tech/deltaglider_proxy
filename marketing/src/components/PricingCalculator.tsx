@@ -17,6 +17,12 @@ import {
   type CalculatorResult,
   type BreakdownLine,
 } from '../lib/pricing';
+import {
+  PROVIDERS,
+  getProvider,
+  monthlyCostUsd,
+  effectiveUsdPerGbMonth,
+} from '../lib/providers';
 
 // Default slider positions per v5 plan §5.3.
 // compressionRatio stays a multiplier internally so the math module
@@ -40,27 +46,30 @@ const PCT_SAVED_MAX = 99;
 const pctSavedToRatio = (pct: number): number => 1 / (1 - pct / 100);
 const ratioToPctSaved = (ratio: number): number => (1 - 1 / ratio) * 100;
 
-const COST_SHORTCUTS = [
-  { label: 'AWS Standard', value: 0.023 },
-  { label: 'GCS Standard', value: 0.020 },
-  { label: 'Azure Hot', value: 0.0184 },
-  { label: 'Backblaze B2', value: 0.006 },
-];
-
 export default function PricingCalculator() {
   const [inputs, setInputs] = useState<CalculatorInputs>(DEFAULTS);
+  const [providerId, setProviderId] = useState<string>('s3');
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [showFormula, setShowFormula] = useState(false);
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle');
 
-  const result = useMemo(() => calculate(inputs), [inputs]);
+  // The picked provider is the source of truth for cost. Its EFFECTIVE $/GB at
+  // the visitor's current footprint (which captures min-billing floors + free
+  // tiers) feeds the existing, fully-tested `calculate()` unchanged.
+  const sourceGb = inputs.sourceTb * 1024;
+  const effectiveInputs: CalculatorInputs = {
+    ...inputs,
+    costPerGbMonthUsd: effectiveUsdPerGbMonth(providerId, sourceGb),
+  };
+
+  const result = useMemo(() => calculate(effectiveInputs), [effectiveInputs]);
 
   const update = (patch: Partial<CalculatorInputs>) => {
     setInputs((prev) => ({ ...prev, ...patch }));
   };
 
   const handleCopy = async () => {
-    const md = buildMarkdown(inputs, result);
+    const md = buildMarkdown(effectiveInputs, result);
     try {
       await navigator.clipboard.writeText(md);
       setCopyState('copied');
@@ -127,33 +136,26 @@ export default function PricingCalculator() {
           </div>
 
           <div className="field">
-            <label htmlFor="calc-cost">
-              Storage cost
-              <span className="field-value">${inputs.costPerGbMonthUsd}/GB-mo</span>
+            <label htmlFor="calc-provider">
+              Your storage provider
+              <span className="field-value">
+                ≈ ${effectiveInputs.costPerGbMonthUsd.toFixed(4)}/GB-mo
+              </span>
             </label>
-            <input
-              id="calc-cost"
-              type="number"
-              min={0.001}
-              max={0.5}
-              step={0.001}
-              value={inputs.costPerGbMonthUsd}
-              onChange={(e) =>
-                update({ costPerGbMonthUsd: parseFloat(e.target.value) || 0 })
-              }
-              aria-label="Storage cost per GB per month, in USD"
-            />
-            <div className="cost-shortcuts">
-              {COST_SHORTCUTS.map((s) => (
+            <div className="provider-chips" role="group" aria-label="Storage provider">
+              {PROVIDERS.filter((p) => !p.archive).map((p) => (
                 <button
-                  key={s.label}
+                  key={p.id}
                   type="button"
-                  onClick={() => update({ costPerGbMonthUsd: s.value })}
+                  className={providerId === p.id ? 'btn-active' : ''}
+                  onClick={() => setProviderId(p.id)}
+                  aria-pressed={providerId === p.id}
                 >
-                  {s.label} ${s.value}
+                  {p.name}
                 </button>
               ))}
             </div>
+            <p className="field-help">{getProvider(providerId).notes}</p>
           </div>
 
           <button
@@ -226,8 +228,86 @@ export default function PricingCalculator() {
             showFormula={showFormula}
             onToggleFormula={() => setShowFormula((v) => !v)}
           />
+          <ProviderComparison
+            sourceGb={sourceGb}
+            storedGb={sourceGb / inputs.compressionRatio}
+            selectedId={providerId}
+            onSelect={setProviderId}
+          />
         </section>
       </div>
+    </div>
+  );
+}
+
+// ===========================================================================
+
+interface ProviderComparisonProps {
+  sourceGb: number;
+  storedGb: number;
+  selectedId: string;
+  onSelect: (id: string) => void;
+}
+
+/** What this footprint costs per month on each provider — today vs after
+ *  DeltaGlider. Sorted cheapest-today first; the min-billing floor shows up as
+ *  a flat post-DGP bar that can't shrink further. */
+function ProviderComparison({ sourceGb, storedGb, selectedId, onSelect }: ProviderComparisonProps) {
+  const rows = PROVIDERS.map((p) => ({
+    p,
+    today: monthlyCostUsd(p.id, sourceGb),
+    dgp: monthlyCostUsd(p.id, storedGb),
+  })).sort((a, b) => a.today - b.today);
+
+  const max = Math.max(...rows.map((r) => r.today), 1);
+  const fmt = (n: number) =>
+    n >= 1000 ? `$${(n / 1000).toFixed(1)}k` : `$${n.toFixed(n < 10 ? 2 : 0)}`;
+
+  return (
+    <div className="provider-compare">
+      <div className="provider-compare-head">
+        <span>Monthly storage cost · {formatTb(sourceGb / 1024)} of artifacts</span>
+        <span className="provider-compare-legend">
+          <i className="dot dot-today" /> today
+          <i className="dot dot-dgp" /> with DeltaGlider
+        </span>
+      </div>
+      <ul className="provider-rows">
+        {rows.map(({ p, today, dgp }) => (
+          <li
+            key={p.id}
+            className={`provider-row${p.id === selectedId ? ' is-selected' : ''}`}
+          >
+            <button
+              type="button"
+              className="provider-row-name"
+              onClick={() => onSelect(p.id)}
+              aria-pressed={p.id === selectedId}
+              title={p.notes}
+            >
+              {p.name}
+              {p.currency === 'EUR' && <span className="provider-eur">€</span>}
+              {p.archive && <span className="provider-archive">archive</span>}
+            </button>
+            <div className="provider-bars">
+              <div className="provider-bar provider-bar-today" style={{ width: `${(today / max) * 100}%` }}>
+                <span>{fmt(today)}</span>
+              </div>
+              <div
+                className="provider-bar provider-bar-dgp"
+                style={{ width: `${Math.max((dgp / max) * 100, 1.5)}%` }}
+              >
+                <span>{fmt(dgp)}</span>
+              </div>
+            </div>
+          </li>
+        ))}
+      </ul>
+      <p className="provider-compare-note">
+        Costs normalised to USD/month for comparison (€-priced providers tagged).
+        Min-billing floors mean some bars can't shrink below ~$6–8/mo — DeltaGlider
+        helps most where you store far above the floor. Egress & API fees excluded.
+      </p>
     </div>
   );
 }
