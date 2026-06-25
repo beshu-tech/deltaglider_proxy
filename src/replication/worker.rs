@@ -301,7 +301,7 @@ pub async fn run_rule(
         // event. The page boundary is the barrier: the cursor does not
         // advance until every in-flight object of this page finishes.
         let object_results: Vec<Result<PerObjectResult, crate::config_db::ConfigDbError>> =
-            futures::stream::iter(plan.to_copy.clone().into_iter())
+            futures::stream::iter(plan.to_copy.clone())
                 .map(|(src_key, dest_key)| {
                     let db = db.clone();
                     let engine = engine.clone();
