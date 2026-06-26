@@ -558,6 +558,15 @@ pub(crate) fn is_transient_copy_error(message: &str) -> bool {
         "slowdown",
         "internalerror",
         "broken pipe",
+        // Transient source-backend 5xx. Hetzner phrases 503 as "throttled" and
+        // 502/504 as "failed (status=50x)" — none match the words above, so
+        // they were landing in the failure ring instead of being retried.
+        "throttled",
+        "status=502",
+        "status=503",
+        "status=504",
+        "bad gateway",
+        "gateway timeout",
     ]
     .iter()
     .any(|needle| m.contains(needle))
@@ -574,6 +583,17 @@ mod tests {
         ));
         assert!(is_transient_copy_error("connection reset by peer"));
         assert!(is_transient_copy_error("503 SlowDown"));
+
+        // Exact source-backend (Hetzner) transient strings from the failure ring.
+        assert!(is_transient_copy_error(
+            "source retrieve failed: Storage error: Backend throttled: head_object throttled (status=503): service error"
+        ));
+        assert!(is_transient_copy_error(
+            "source retrieve failed: Storage error: S3 error: head_object failed (status=502): service error"
+        ));
+        assert!(is_transient_copy_error(
+            "source retrieve failed: Storage error: S3 error: get_object failed (status=504): service error"
+        ));
 
         assert!(!is_transient_copy_error(
             "destination store failed: Storage error: Bucket not found: test-bucket"
