@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.5.3 — 2026-06-26
+
 ### Added
 
 - **Delta-passthrough replication fast path.** Replicating a delta-compressed
