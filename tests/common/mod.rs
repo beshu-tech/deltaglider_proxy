@@ -1005,6 +1005,7 @@ pub struct MetricsSnapshot {
     pub part_retries_total: u64,
     pub bytes_streamed_total: u64,
     pub delta_bytes_saved_total: u64,
+    pub delta_passthrough_bytes_saved_total: u64,
     pub process_peak_rss_bytes: u64,
 }
 
@@ -1052,6 +1053,9 @@ pub async fn metrics_snapshot(endpoint: &str) -> MetricsSnapshot {
             "deltaglider_replication_part_retries_total" => snap.part_retries_total = parsed,
             "deltaglider_replication_bytes_streamed_total" => snap.bytes_streamed_total = parsed,
             "deltaglider_delta_bytes_saved_total" => snap.delta_bytes_saved_total = parsed,
+            "deltaglider_replication_delta_passthrough_bytes_saved_total" => {
+                snap.delta_passthrough_bytes_saved_total = parsed
+            }
             "process_peak_rss_bytes" => snap.process_peak_rss_bytes = parsed,
             _ => {}
         }

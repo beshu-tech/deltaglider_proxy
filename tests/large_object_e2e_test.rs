@@ -345,18 +345,25 @@ replication:
             .expect("seed src");
     }
 
-    let before = metrics_snapshot(&server.endpoint())
-        .await
-        .delta_bytes_saved_total;
+    let before = metrics_snapshot(&server.endpoint()).await;
     run_now_ok(&server).await;
-    let after = metrics_snapshot(&server.endpoint())
-        .await
-        .delta_bytes_saved_total;
+    let after = metrics_snapshot(&server.endpoint()).await;
 
-    let saved = after.saturating_sub(before);
+    // Replicating a delta object saves bytes via ONE of two paths:
+    // - delta-passthrough: the .delta is shipped verbatim (egress saved), or
+    // - reconstruct+recompress: re-encoded at the dest (compression saved).
+    // Either is a valid "delta saved bytes" — assert the union, then that the
+    // saving is most of the logical object (the v2 delta is tiny vs 8 MiB).
+    let recompress = after
+        .delta_bytes_saved_total
+        .saturating_sub(before.delta_bytes_saved_total);
+    let passthrough = after
+        .delta_passthrough_bytes_saved_total
+        .saturating_sub(before.delta_passthrough_bytes_saved_total);
+    let saved = recompress.max(passthrough);
     eprintln!(
-        "[info] delta_bytes_saved_total delta {} for a {}-byte v2",
-        saved, v_size
+        "[info] saved {} for a {}-byte v2 (recompress {}, passthrough {})",
+        saved, v_size, recompress, passthrough
     );
     assert!(saved > 0, "replicating a delta object must save bytes");
     assert!(
