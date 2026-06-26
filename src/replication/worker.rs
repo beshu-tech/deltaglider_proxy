@@ -36,7 +36,7 @@ use crate::event_outbox::{EventKind, EventSource, NewEvent};
 use crate::job_loop::Pager;
 use crate::metrics::{bump_peak, Metrics};
 use crate::transfer::{
-    copy_object_with_retries, ObjectTransferRequest, TransferProvenance,
+    copy_object_with_retries, CopyStrategy, ObjectTransferRequest, TransferProvenance,
     REPLICATION_RULE_METADATA_KEY,
 };
 use futures::stream::StreamExt;
@@ -342,6 +342,8 @@ pub async fn run_rule(
             totals.objects_skipped += res.objects_skipped;
             totals.bytes_copied += res.bytes_copied;
             totals.errors += res.errors;
+            totals.delta_passthrough += res.delta_passthrough;
+            totals.bytes_egress_saved += res.bytes_egress_saved;
             if res.had_error {
                 had_any_error = true;
             }
@@ -466,6 +468,9 @@ struct PerObjectResult {
     errors: i64,
     had_error: bool,
     event: Option<NewEvent>,
+    // Fast-path attribution for the successful copy (zero otherwise).
+    delta_passthrough: i64,
+    bytes_egress_saved: i64,
 }
 
 /// Copy one object: poison-skip check → bounded copy → record/clear the
@@ -540,6 +545,12 @@ async fn copy_one_object(
             let bytes_copied = outcome.bytes_copied;
             out.objects_copied = 1;
             out.bytes_copied = bytes_copied as i64;
+            // Only the fast path is counted; bytes_egress_saved is computed once
+            // on the outcome (non-zero only for DeltaPassthrough).
+            out.bytes_egress_saved = outcome.bytes_egress_saved as i64;
+            if outcome.strategy == CopyStrategy::DeltaPassthrough {
+                out.delta_passthrough = 1;
+            }
             {
                 let db = db.lock().await;
                 db.replication_clear_object_failure(rule_name, src_key)?;
@@ -557,6 +568,8 @@ async fn copy_one_object(
                     "destination_bucket": dst_bucket,
                     "destination_key": dest_key,
                     "content_length": bytes_copied,
+                    "strategy": outcome.strategy.as_str(),
+                    "source_storage_type": outcome.source_storage_label,
                 }),
             ));
         }
@@ -999,6 +1012,7 @@ mod tests {
             objects_deleted: 0,
             bytes_copied: 1234,
             errors: 2,
+            ..Default::default()
         };
         db.replication_update_run_progress(run_id, totals).unwrap();
 

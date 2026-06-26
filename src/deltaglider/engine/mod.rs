@@ -830,6 +830,105 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
     }
 
+    // === Raw deltaspace blob accessors (replication delta-passthrough) ===
+    //
+    // These read/write the LITERAL stored blob + metadata through the
+    // routed+wrapped storage top. For a plaintext object the encrypting
+    // wrapper is a no-op so the round-trip is byte-verbatim; markers on
+    // the returned metadata reflect AT-REST state (the wrapper encrypts
+    // bodies, not metadata). Policy lives in `transfer.rs`; the engine
+    // only exposes the routed raw I/O + the per-deltaspace lock.
+
+    /// Read a delta blob verbatim from a deltaspace.
+    pub async fn get_delta_raw(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<Vec<u8>, StorageError> {
+        self.storage.get_delta(bucket, prefix, filename).await
+    }
+
+    /// Write a delta blob + metadata verbatim into a deltaspace.
+    pub async fn put_delta_raw(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        data: &[u8],
+        metadata: &FileMetadata,
+    ) -> Result<(), StorageError> {
+        self.storage
+            .put_delta(bucket, prefix, filename, data, metadata)
+            .await
+    }
+
+    /// Read a deltaspace reference blob verbatim.
+    pub async fn get_reference_raw(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Vec<u8>, StorageError> {
+        self.storage.get_reference(bucket, prefix).await
+    }
+
+    /// Write a deltaspace reference blob + metadata verbatim.
+    pub async fn put_reference_raw(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        data: &[u8],
+        metadata: &FileMetadata,
+    ) -> Result<(), StorageError> {
+        self.storage
+            .put_reference(bucket, prefix, data, metadata)
+            .await
+    }
+
+    /// Reference metadata as a `Result` (errors propagate) — for callers that
+    /// must distinguish "no reference" from a read failure during seeding.
+    pub async fn reference_metadata_raw(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<FileMetadata, StorageError> {
+        self.storage.get_reference_metadata(bucket, prefix).await
+    }
+
+    /// Reference metadata for a deltaspace, or `None` when no reference exists.
+    pub async fn reference_meta(&self, bucket: &str, prefix: &str) -> Option<FileMetadata> {
+        if !self.storage.has_reference(bucket, prefix).await {
+            return None;
+        }
+        self.storage
+            .get_reference_metadata(bucket, prefix)
+            .await
+            .ok()
+    }
+
+    /// Delta metadata for one object (full Delta info incl. `ref_sha256`).
+    pub async fn delta_meta(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<FileMetadata, StorageError> {
+        self.storage
+            .get_delta_metadata(bucket, prefix, filename)
+            .await
+    }
+
+    /// Run `f` while holding the per-deltaspace prefix lock, serialising
+    /// the reference seed against concurrent live PUTs to that deltaspace.
+    pub async fn with_dest_prefix_lock<F, Fut, R>(&self, prefix: &str, f: F) -> R
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = R>,
+    {
+        let _guard = self.acquire_prefix_lock(prefix).await;
+        f().await
+    }
+
     /// Parse and validate an S3 key, returning the parsed key and deltaspace ID.
     fn validated_key(bucket: &str, key: &str) -> Result<(ObjectKey, String), EngineError> {
         let obj_key = ObjectKey::parse(bucket, key);

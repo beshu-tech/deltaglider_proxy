@@ -25,7 +25,7 @@ pub struct ConfigDb {
 }
 
 /// Schema version — bump when adding migrations.
-const SCHEMA_VERSION: i32 = 16;
+const SCHEMA_VERSION: i32 = 17;
 
 pub(crate) mod auth_providers;
 mod declarative;
@@ -650,6 +650,24 @@ impl ConfigDb {
             )?;
             info!(
                 "Migrated config DB schema from v{} to v16 (replication object-failure ledger)",
+                version
+            );
+        }
+
+        if version < 17 {
+            // v17: delta-passthrough fast-path run stats. Additive, idempotent.
+            // Other strategies are derivable (objects_copied - delta_passthrough),
+            // so only the fast-path count + egress saved are persisted.
+            for col in ["delta_passthrough", "bytes_egress_saved"] {
+                add_column_if_missing(
+                    conn,
+                    "replication_run_history",
+                    col,
+                    "INTEGER NOT NULL DEFAULT 0",
+                )?;
+            }
+            info!(
+                "Migrated config DB schema from v{} to v17 (delta-passthrough run stats)",
                 version
             );
         }

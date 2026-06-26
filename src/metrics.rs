@@ -81,6 +81,7 @@ pub struct Metrics {
     pub replication_multipart_parts_total: IntCounter,
     pub replication_part_retries_total: IntCounter,
     pub replication_bytes_streamed_total: IntCounter,
+    pub replication_delta_passthrough_bytes_saved_total: IntCounter,
 }
 
 /// Set `peak` to `live`'s current value when it has risen above the prior
@@ -489,6 +490,14 @@ impl Metrics {
             )
             .unwrap()
         );
+        let replication_delta_passthrough_bytes_saved_total = register!(
+            registry,
+            IntCounter::new(
+                "deltaglider_replication_delta_passthrough_bytes_saved_total",
+                "Total egress bytes saved by shipping deltas verbatim (logical − delta size)",
+            )
+            .unwrap()
+        );
 
         Metrics {
             registry,
@@ -532,6 +541,7 @@ impl Metrics {
             replication_multipart_parts_total,
             replication_part_retries_total,
             replication_bytes_streamed_total,
+            replication_delta_passthrough_bytes_saved_total,
         }
     }
 }

@@ -94,9 +94,44 @@ pub(crate) struct ObjectTransferRequest<'a> {
     pub upload_concurrency: Option<usize>,
 }
 
+/// How one object was physically moved source→dest. Surfaced to the
+/// run totals, per-object event, and jobs API so operators can see the
+/// fast path working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyStrategy {
+    /// The `.delta` blob was shipped verbatim (no xdelta3, no full-body
+    /// transfer). Saves `file_size - delta_size` egress bytes.
+    DeltaPassthrough,
+    /// A delta source was reconstructed (xdelta3) then re-stored.
+    Reconstructed,
+    /// A passthrough source was streamed via multipart (bounded memory).
+    StreamedPassthrough,
+    /// A passthrough source was buffered then re-stored.
+    BufferedPassthrough,
+}
+
+impl CopyStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CopyStrategy::DeltaPassthrough => "delta_passthrough",
+            CopyStrategy::Reconstructed => "reconstructed",
+            CopyStrategy::StreamedPassthrough => "streamed_passthrough",
+            CopyStrategy::BufferedPassthrough => "buffered_passthrough",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ObjectTransferOutcome {
     pub bytes_copied: usize,
+    pub strategy: CopyStrategy,
+    /// At-rest storage label of the SOURCE object ("delta" / "passthrough").
+    pub source_storage_label: &'static str,
+    /// Logical (hydrated) source size — only meaningful on the fast path.
+    pub source_file_size: u64,
+    /// Egress bytes the fast path saved vs reconstruct (`file_size - delta`);
+    /// 0 on every non-`DeltaPassthrough` path. Single source for metric + column.
+    pub bytes_egress_saved: u64,
 }
 
 pub(crate) async fn copy_object_with_retries(
@@ -161,6 +196,19 @@ async fn copy_object_once(
         return stream_copy_passthrough(engine, request, &source_head).await;
     }
 
+    // Delta fast path: when the source is delta-stored, try shipping the
+    // `.delta` blob verbatim (seeding the dest reference if needed). Any
+    // `Ok(None)` = the gate said fall back → the buffered reconstruct path
+    // below runs unchanged (no duplication).
+    if matches!(
+        source_head.storage_info,
+        crate::types::StorageInfo::Delta { .. }
+    ) {
+        if let Some(outcome) = delta_passthrough_copy(engine, request, &source_head).await? {
+            return Ok(outcome);
+        }
+    }
+
     let (data, meta) = engine
         .retrieve(request.source_bucket, request.source_key)
         .await
@@ -218,8 +266,22 @@ async fn copy_object_once(
         source_head.multipart_etag.as_deref(),
     )
     .await?;
+    // A delta source went through the reconstruct→re-store cycle; a
+    // passthrough source was buffered then re-stored.
+    let strategy = if matches!(
+        source_head.storage_info,
+        crate::types::StorageInfo::Delta { .. }
+    ) {
+        CopyStrategy::Reconstructed
+    } else {
+        CopyStrategy::BufferedPassthrough
+    };
     Ok(ObjectTransferOutcome {
         bytes_copied: bytes,
+        strategy,
+        source_storage_label: source_head.storage_info.label(),
+        source_file_size: source_head.file_size,
+        bytes_egress_saved: 0,
     })
 }
 
@@ -387,6 +449,10 @@ async fn stream_copy_passthrough(
     .await?;
     Ok(ObjectTransferOutcome {
         bytes_copied: bytes,
+        strategy: CopyStrategy::StreamedPassthrough,
+        source_storage_label: source_head.storage_info.label(),
+        source_file_size: source_head.file_size,
+        bytes_egress_saved: 0,
     })
 }
 
@@ -572,6 +638,266 @@ pub(crate) fn is_transient_copy_error(message: &str) -> bool {
     .any(|needle| m.contains(needle))
 }
 
+// ── Delta-passthrough fast path ──────────────────────────────────────
+//
+// Shipping a `.delta` blob verbatim only reconstructs correctly at the
+// destination if the dest deltaspace holds the byte-identical reference
+// the delta was encoded against. The gate `can_delta_passthrough` is the
+// single decision point; corruption is impossible as long as it returns
+// `Fallback` on any sha/enc doubt. v1 ships ONLY plaintext sources.
+
+/// At-rest encryption fingerprint of a blob, derived from metadata markers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EncFingerprint {
+    Plaintext,
+    Encrypted { key_id: Option<String> },
+}
+
+/// Facts about the SOURCE delta needed to decide the fast path.
+#[derive(Debug, Clone)]
+pub(crate) struct SrcDeltaFacts {
+    pub ref_sha256: String,
+    pub enc: EncFingerprint,
+}
+
+/// Facts about the DEST deltaspace reference (when one exists).
+#[derive(Debug, Clone)]
+pub(crate) struct DestRefFacts {
+    pub file_sha256: String,
+    pub enc: EncFingerprint,
+}
+
+/// Gate verdict. `Fallback` carries a stable reason for diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeltaPassthroughDecision {
+    ShipVerbatim,
+    SeedThenShip,
+    Fallback { reason: &'static str },
+}
+
+/// True iff the two fingerprints can host the SAME verbatim blob: both
+/// plaintext, or both encrypted with an equal KNOWN key_id. `Encrypted{None}`
+/// is never compatible — we can't prove the two blobs share a key.
+fn enc_compatible(a: &EncFingerprint, b: &EncFingerprint) -> bool {
+    match (a, b) {
+        (EncFingerprint::Plaintext, EncFingerprint::Plaintext) => true,
+        (
+            EncFingerprint::Encrypted { key_id: Some(ka) },
+            EncFingerprint::Encrypted { key_id: Some(kb) },
+        ) => ka == kb,
+        _ => false,
+    }
+}
+
+/// PURE decision: can we ship the source `.delta` verbatim to the dest?
+///
+/// Precedence is exact and load-bearing:
+///   1. dest present AND sha differs → Fallback{ref_sha_mismatch}
+///      UNCONDITIONALLY (before any enc check). A wrong reference is
+///      silent corruption; nothing overrides this.
+///   2. enc incompatible → Fallback{enc_incompatible}.
+///   3. dest absent → SeedThenShip (we'll seed the matching reference).
+///   4. dest present + sha equal + enc compatible → ShipVerbatim.
+pub(crate) fn can_delta_passthrough(
+    src: &SrcDeltaFacts,
+    dest_ref: Option<&DestRefFacts>,
+) -> DeltaPassthroughDecision {
+    if let Some(dest) = dest_ref {
+        if dest.file_sha256 != src.ref_sha256 {
+            return DeltaPassthroughDecision::Fallback {
+                reason: "ref_sha_mismatch",
+            };
+        }
+        if !enc_compatible(&src.enc, &dest.enc) {
+            return DeltaPassthroughDecision::Fallback {
+                reason: "enc_incompatible",
+            };
+        }
+        DeltaPassthroughDecision::ShipVerbatim
+    } else {
+        DeltaPassthroughDecision::SeedThenShip
+    }
+}
+
+/// Build an [`EncFingerprint`] from at-rest user-metadata markers.
+fn enc_fingerprint(meta: &crate::types::FileMetadata) -> EncFingerprint {
+    use crate::storage::encrypting::{ENCRYPTION_KEY_ID_KEY, ENCRYPTION_MARKER_KEY};
+    if meta.user_metadata.contains_key(ENCRYPTION_MARKER_KEY) {
+        EncFingerprint::Encrypted {
+            key_id: meta.user_metadata.get(ENCRYPTION_KEY_ID_KEY).cloned(),
+        }
+    } else {
+        EncFingerprint::Plaintext
+    }
+}
+
+/// Try the delta fast path. `Ok(None)` = fell back; the caller runs the
+/// existing reconstruct path. Enforces three corruption-defense layers
+/// (gate sha-check, seed sha-assert, post-lock re-gate).
+async fn delta_passthrough_copy(
+    engine: &Arc<DynEngine>,
+    request: ObjectTransferRequest<'_>,
+    source_head: &crate::types::FileMetadata,
+) -> Result<Option<ObjectTransferOutcome>, Box<dyn std::error::Error + Send + Sync>> {
+    use crate::types::{ObjectKey, StorageInfo};
+
+    // Source delta facts. `ref_sha256` comes from the HEAD; recover it via
+    // delta_meta if a lite-list stub left it empty.
+    let (src_prefix, src_filename, src_delta_size, mut src_ref_sha256) =
+        match &source_head.storage_info {
+            StorageInfo::Delta {
+                ref_sha256,
+                delta_size,
+                ..
+            } => {
+                let key = ObjectKey::parse(request.source_bucket, request.source_key);
+                (
+                    key.prefix.clone(),
+                    key.filename.clone(),
+                    *delta_size,
+                    ref_sha256.clone(),
+                )
+            }
+            _ => return Ok(None),
+        };
+    // Safety net: HEAD normally populates ref_sha256, but if a future lite-list
+    // path leaves it empty, recover via delta_meta. Empty after that → fall back
+    // to reconstruct (never ship without a known reference hash).
+    if src_ref_sha256.is_empty() {
+        match engine
+            .delta_meta(request.source_bucket, &src_prefix, &src_filename)
+            .await
+        {
+            Ok(m) => {
+                if let StorageInfo::Delta { ref_sha256, .. } = &m.storage_info {
+                    src_ref_sha256 = ref_sha256.clone();
+                }
+            }
+            Err(_) => return Ok(None),
+        }
+    }
+    if src_ref_sha256.is_empty() {
+        return Ok(None);
+    }
+
+    let src_enc = enc_fingerprint(source_head);
+    // v1 ships ONLY plaintext sources: get_delta→put_delta through the
+    // encrypting wrapper would re-encrypt with a new IV (not verbatim).
+    if src_enc != EncFingerprint::Plaintext {
+        return Ok(None);
+    }
+
+    let src = SrcDeltaFacts {
+        ref_sha256: src_ref_sha256.clone(),
+        enc: src_enc,
+    };
+
+    let dest_key = ObjectKey::parse(request.destination_bucket, request.destination_key);
+    let dest_prefix = dest_key.prefix.clone();
+    let dest_filename = dest_key.filename.clone();
+
+    // The shipped delta's metadata: clone the source delta metadata so the
+    // LOGICAL fields (file_sha256/file_size/multipart_etag/original_name/
+    // content_type/StorageInfo::Delta{}) survive; stamp provenance + strip.
+    let mut meta = source_head.clone();
+    if let Some(provenance) = request.provenance {
+        meta.user_metadata.insert(
+            provenance.metadata_key.to_string(),
+            provenance.metadata_value.to_string(),
+        );
+    }
+    for key in request.strip_user_metadata_keys {
+        meta.user_metadata.remove(*key);
+    }
+
+    // Decide AND ship under the dest prefix lock, so the gate's reference read
+    // and the delta write are one critical section — mirrors the normal PUT
+    // path (store.rs) and closes the gate→write TOCTOU. A concurrent reference
+    // teardown/re-seed can't slip a wrong-sha reference under our delta.
+    let dest_bucket = request.destination_bucket.to_string();
+    let src_bucket = request.source_bucket.to_string();
+    let src_prefix2 = src_prefix.clone();
+    let src_filename2 = src_filename.clone();
+    let dest_prefix2 = dest_prefix.clone();
+    let dest_filename2 = dest_filename.clone();
+    let engine2 = engine.clone();
+    let shipped: Result<bool, Box<dyn std::error::Error + Send + Sync>> = engine
+        .with_dest_prefix_lock(&dest_prefix, || async move {
+            // Re-read the dest reference UNDER the lock and re-run the SAME pure
+            // gate — identical sha + enc precedence to the first read.
+            let dest_ref = engine2
+                .reference_meta(&dest_bucket, &dest_prefix2)
+                .await
+                .map(|m| DestRefFacts {
+                    file_sha256: m.file_sha256.clone(),
+                    enc: enc_fingerprint(&m),
+                });
+            match can_delta_passthrough(&src, dest_ref.as_ref()) {
+                DeltaPassthroughDecision::Fallback { .. } => return Ok(false),
+                DeltaPassthroughDecision::ShipVerbatim => {}
+                DeltaPassthroughDecision::SeedThenShip => {
+                    // Seed the dest reference verbatim, asserting it matches
+                    // src.ref_sha256 before writing (defense layer 2).
+                    let ref_data = engine2.get_reference_raw(&src_bucket, &src_prefix2).await?;
+                    let ref_meta = engine2
+                        .reference_metadata_raw(&src_bucket, &src_prefix2)
+                        .await?;
+                    if ref_meta.file_sha256 != src.ref_sha256 {
+                        return Ok(false);
+                    }
+                    engine2
+                        .put_reference_raw(&dest_bucket, &dest_prefix2, &ref_data, &ref_meta)
+                        .await?;
+                }
+            }
+            // Ship the delta blob verbatim — still under the lock.
+            let delta_bytes = engine2
+                .get_delta_raw(&src_bucket, &src_prefix2, &src_filename2)
+                .await?;
+            engine2
+                .put_delta_raw(
+                    &dest_bucket,
+                    &dest_prefix2,
+                    &dest_filename2,
+                    &delta_bytes,
+                    &meta,
+                )
+                .await?;
+            Ok(true)
+        })
+        .await;
+    if !shipped? {
+        return Ok(None);
+    }
+
+    // HEAD reports the LOGICAL size, not the delta size.
+    verify_destination(
+        engine,
+        request,
+        source_head.file_size as usize,
+        source_head.multipart_etag.as_deref(),
+    )
+    .await?;
+
+    let bytes_egress_saved = source_head.file_size.saturating_sub(src_delta_size);
+    // Metric counts replication only — lifecycle transitions share this path
+    // but shouldn't be attributed to replication egress savings.
+    if request.operation == "replication" {
+        if let Some(m) = engine.metrics() {
+            m.replication_delta_passthrough_bytes_saved_total
+                .inc_by(bytes_egress_saved);
+        }
+    }
+
+    Ok(Some(ObjectTransferOutcome {
+        bytes_copied: src_delta_size as usize,
+        strategy: CopyStrategy::DeltaPassthrough,
+        source_storage_label: "delta",
+        source_file_size: source_head.file_size,
+        bytes_egress_saved,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,5 +926,220 @@ mod tests {
         ));
         assert!(!is_transient_copy_error("AccessDenied"));
         assert!(!is_transient_copy_error("NoSuchKey"));
+    }
+
+    #[test]
+    fn copy_strategy_as_str_is_snake_case() {
+        assert_eq!(CopyStrategy::DeltaPassthrough.as_str(), "delta_passthrough");
+        assert_eq!(CopyStrategy::Reconstructed.as_str(), "reconstructed");
+        assert_eq!(
+            CopyStrategy::StreamedPassthrough.as_str(),
+            "streamed_passthrough"
+        );
+        assert_eq!(
+            CopyStrategy::BufferedPassthrough.as_str(),
+            "buffered_passthrough"
+        );
+    }
+
+    // ── can_delta_passthrough truth table (one named test per row) ──
+
+    fn plain_src(ref_sha: &str) -> SrcDeltaFacts {
+        SrcDeltaFacts {
+            ref_sha256: ref_sha.to_string(),
+            enc: EncFingerprint::Plaintext,
+        }
+    }
+    fn enc_src(ref_sha: &str, kid: Option<&str>) -> SrcDeltaFacts {
+        SrcDeltaFacts {
+            ref_sha256: ref_sha.to_string(),
+            enc: EncFingerprint::Encrypted {
+                key_id: kid.map(str::to_string),
+            },
+        }
+    }
+    fn plain_dest(sha: &str) -> DestRefFacts {
+        DestRefFacts {
+            file_sha256: sha.to_string(),
+            enc: EncFingerprint::Plaintext,
+        }
+    }
+    fn enc_dest(sha: &str, kid: Option<&str>) -> DestRefFacts {
+        DestRefFacts {
+            file_sha256: sha.to_string(),
+            enc: EncFingerprint::Encrypted {
+                key_id: kid.map(str::to_string),
+            },
+        }
+    }
+
+    #[test]
+    fn row_plaintext_dest_absent_seeds() {
+        assert_eq!(
+            can_delta_passthrough(&plain_src("aaa"), None),
+            DeltaPassthroughDecision::SeedThenShip
+        );
+    }
+
+    #[test]
+    fn row_plaintext_match_plaintext_ships() {
+        assert_eq!(
+            can_delta_passthrough(&plain_src("aaa"), Some(&plain_dest("aaa"))),
+            DeltaPassthroughDecision::ShipVerbatim
+        );
+    }
+
+    #[test]
+    fn row_plaintext_differ_fallback_ref_sha_mismatch() {
+        assert_eq!(
+            can_delta_passthrough(&plain_src("aaa"), Some(&plain_dest("bbb"))),
+            DeltaPassthroughDecision::Fallback {
+                reason: "ref_sha_mismatch"
+            }
+        );
+    }
+
+    #[test]
+    fn row_plaintext_match_encrypted_fallback_enc_incompatible() {
+        assert_eq!(
+            can_delta_passthrough(&plain_src("aaa"), Some(&enc_dest("aaa", Some("k")))),
+            DeltaPassthroughDecision::Fallback {
+                reason: "enc_incompatible"
+            }
+        );
+    }
+
+    #[test]
+    fn row_encrypted_k_match_encrypted_k_ships() {
+        // The PURE gate says ship; the copy fn downgrades encrypted to
+        // fallback in v1, but the gate must encode the correct verdict.
+        assert_eq!(
+            can_delta_passthrough(
+                &enc_src("aaa", Some("k")),
+                Some(&enc_dest("aaa", Some("k")))
+            ),
+            DeltaPassthroughDecision::ShipVerbatim
+        );
+    }
+
+    #[test]
+    fn row_encrypted_k_dest_absent_seeds() {
+        assert_eq!(
+            can_delta_passthrough(&enc_src("aaa", Some("k")), None),
+            DeltaPassthroughDecision::SeedThenShip
+        );
+    }
+
+    #[test]
+    fn row_encrypted_k_match_encrypted_j_fallback() {
+        assert_eq!(
+            can_delta_passthrough(
+                &enc_src("aaa", Some("k")),
+                Some(&enc_dest("aaa", Some("j")))
+            ),
+            DeltaPassthroughDecision::Fallback {
+                reason: "enc_incompatible"
+            }
+        );
+    }
+
+    #[test]
+    fn row_encrypted_none_both_fallback_enc_incompatible() {
+        assert_eq!(
+            can_delta_passthrough(&enc_src("aaa", None), Some(&enc_dest("aaa", None))),
+            DeltaPassthroughDecision::Fallback {
+                reason: "enc_incompatible"
+            }
+        );
+    }
+
+    #[test]
+    fn row_any_differ_fallback_before_enc_check() {
+        // sha differs AND enc differs → ref_sha_mismatch wins (checked first).
+        assert_eq!(
+            can_delta_passthrough(&enc_src("aaa", Some("k")), Some(&enc_dest("bbb", None))),
+            DeltaPassthroughDecision::Fallback {
+                reason: "ref_sha_mismatch"
+            }
+        );
+    }
+}
+
+#[cfg(test)]
+mod gate_proptests {
+    use super::{
+        can_delta_passthrough, DeltaPassthroughDecision, DestRefFacts, EncFingerprint,
+        SrcDeltaFacts,
+    };
+    use proptest::prelude::*;
+
+    fn enc_strategy() -> impl Strategy<Value = EncFingerprint> {
+        prop_oneof![
+            Just(EncFingerprint::Plaintext),
+            Just(EncFingerprint::Encrypted {
+                key_id: Some("a".to_string())
+            }),
+            Just(EncFingerprint::Encrypted {
+                key_id: Some("b".to_string())
+            }),
+            Just(EncFingerprint::Encrypted { key_id: None }),
+        ]
+    }
+
+    fn compatible(a: &EncFingerprint, b: &EncFingerprint) -> bool {
+        matches!(
+            (a, b),
+            (EncFingerprint::Plaintext, EncFingerprint::Plaintext)
+        ) || matches!(
+            (a, b),
+            (
+                EncFingerprint::Encrypted { key_id: Some(x) },
+                EncFingerprint::Encrypted { key_id: Some(y) },
+            ) if x == y
+        )
+    }
+
+    proptest! {
+        #[test]
+        fn invariants_hold(
+            src_enc in enc_strategy(),
+            dest in proptest::option::of((proptest::bool::ANY, enc_strategy())),
+        ) {
+            // sha space is just {match, nomatch}.
+            let src = SrcDeltaFacts { ref_sha256: "REF".to_string(), enc: src_enc.clone() };
+            let dest_ref = dest.as_ref().map(|(sha_match, denc)| DestRefFacts {
+                file_sha256: (if *sha_match { "REF" } else { "OTHER" }).to_string(),
+                enc: denc.clone(),
+            });
+            let decision = can_delta_passthrough(&src, dest_ref.as_ref());
+            // Bound to a local so the `{ .. }` pattern stays out of the
+            // prop_assert format-string parser.
+            let is_fallback = matches!(decision, DeltaPassthroughDecision::Fallback { .. });
+            let is_ship = matches!(decision, DeltaPassthroughDecision::ShipVerbatim);
+            let is_seed = matches!(decision, DeltaPassthroughDecision::SeedThenShip);
+
+            // Invariant 1: sha-differ ⇒ always Fallback.
+            if let Some(d) = dest_ref.as_ref() {
+                if d.file_sha256 != src.ref_sha256 {
+                    prop_assert!(is_fallback);
+                }
+            }
+            // Invariant 2: ShipVerbatim ⇒ dest present ∧ sha equal ∧ enc compatible.
+            if is_ship {
+                let d = dest_ref.as_ref().expect("ship requires a dest ref");
+                prop_assert_eq!(&d.file_sha256, &src.ref_sha256);
+                prop_assert!(compatible(&src.enc, &d.enc));
+            }
+            // Invariant 3: SeedThenShip ⇒ dest absent.
+            if is_seed {
+                prop_assert!(dest_ref.is_none());
+            }
+            // Invariant 4: never Ship/Seed when enc incompatible (present dest).
+            if let Some(d) = dest_ref.as_ref() {
+                if !compatible(&src.enc, &d.enc) {
+                    prop_assert!(is_fallback);
+                }
+            }
+        }
     }
 }

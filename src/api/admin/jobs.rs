@@ -220,6 +220,11 @@ pub struct JobRunEntry {
     pub objects_deleted: Option<i64>,
     pub bytes: i64,
     pub errors: i64,
+    /// Objects that shipped their `.delta` verbatim on the fast path
+    /// (replication only; 0 for other subsystems). The rest = copied −
+    /// delta_passthrough. Egress saved = Σ(logical − delta).
+    pub delta_passthrough: i64,
+    pub bytes_egress_saved: i64,
 }
 
 /// Unified failure entry — field union; `object_key` is always set
@@ -478,6 +483,8 @@ pub async fn job_runs(
                 objects_deleted: Some(r.objects_deleted),
                 bytes: r.bytes_copied,
                 errors: r.errors,
+                delta_passthrough: r.delta_passthrough,
+                bytes_egress_saved: r.bytes_egress_saved,
             })
             .collect(),
         JobSubsystem::Lifecycle => db
@@ -497,6 +504,8 @@ pub async fn job_runs(
                 objects_deleted: None,
                 bytes: r.bytes_affected,
                 errors: r.errors,
+                delta_passthrough: 0,
+                bytes_egress_saved: 0,
             })
             .collect(),
         JobSubsystem::Maintenance => {
@@ -518,6 +527,8 @@ pub async fn job_runs(
                 objects_deleted: None,
                 bytes: job.bytes_done,
                 errors: job.objects_failed,
+                delta_passthrough: 0,
+                bytes_egress_saved: 0,
             }]
         }
     };

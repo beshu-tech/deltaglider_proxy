@@ -430,6 +430,7 @@ jobs:
             --test migrate_job_test \
             --test quota_test \
             --test replication_test \
+            --test delta_passthrough_test \
             --test streaming_copy_test \
             --test large_object_e2e_test \
             --test parity_test \

@@ -48,6 +48,9 @@ pub struct RunRecord {
     pub bytes_copied: i64,
     pub errors: i64,
     pub status: String,
+    // Fast-path run stats (v17).
+    pub delta_passthrough: i64,
+    pub bytes_egress_saved: i64,
 }
 
 /// A per-object failure row.
@@ -88,6 +91,11 @@ pub struct RunTotals {
     pub objects_deleted: i64,
     pub bytes_copied: i64,
     pub errors: i64,
+    // Fast-path run stats (v17). `delta_passthrough` = objects that shipped
+    // their `.delta` verbatim; `bytes_egress_saved` = Σ(logical − delta). Other
+    // strategy counts are derivable (objects_copied − delta_passthrough).
+    pub delta_passthrough: i64,
+    pub bytes_egress_saved: i64,
 }
 
 pub fn current_unix_seconds() -> i64 {
@@ -318,14 +326,16 @@ impl ConfigDb {
     ) -> Result<(), ConfigDbError> {
         self.conn.execute(
             "UPDATE replication_run_history
-                SET finished_at     = ?,
-                    objects_scanned = ?,
-                    objects_copied  = ?,
-                    objects_skipped = ?,
-                    objects_deleted = ?,
-                    bytes_copied    = ?,
-                    errors          = ?,
-                    status          = ?
+                SET finished_at        = ?,
+                    objects_scanned    = ?,
+                    objects_copied     = ?,
+                    objects_skipped    = ?,
+                    objects_deleted    = ?,
+                    bytes_copied       = ?,
+                    errors             = ?,
+                    status             = ?,
+                    delta_passthrough  = ?,
+                    bytes_egress_saved = ?
               WHERE id = ?",
             params![
                 finished_at,
@@ -336,6 +346,8 @@ impl ConfigDb {
                 totals.bytes_copied,
                 totals.errors,
                 status,
+                totals.delta_passthrough,
+                totals.bytes_egress_saved,
                 run_id
             ],
         )?;
@@ -370,12 +382,14 @@ impl ConfigDb {
     ) -> Result<(), ConfigDbError> {
         self.conn.execute(
             "UPDATE replication_run_history
-                SET objects_scanned = ?,
-                    objects_copied  = ?,
-                    objects_skipped = ?,
-                    objects_deleted = ?,
-                    bytes_copied    = ?,
-                    errors          = ?
+                SET objects_scanned    = ?,
+                    objects_copied     = ?,
+                    objects_skipped    = ?,
+                    objects_deleted    = ?,
+                    bytes_copied       = ?,
+                    errors             = ?,
+                    delta_passthrough  = ?,
+                    bytes_egress_saved = ?
               WHERE id = ?
                 AND status = 'running'",
             params![
@@ -385,6 +399,8 @@ impl ConfigDb {
                 totals.objects_deleted,
                 totals.bytes_copied,
                 totals.errors,
+                totals.delta_passthrough,
+                totals.bytes_egress_saved,
                 run_id,
             ],
         )?;
@@ -586,7 +602,8 @@ impl ConfigDb {
         let mut stmt = self.conn.prepare(
             "SELECT id, rule_name, triggered_by, started_at, finished_at,
                     objects_scanned, objects_copied, objects_skipped, objects_deleted,
-                    bytes_copied, errors, status
+                    bytes_copied, errors, status,
+                    delta_passthrough, bytes_egress_saved
              FROM replication_run_history
              WHERE rule_name = ?
              ORDER BY started_at DESC
@@ -607,6 +624,8 @@ impl ConfigDb {
                     bytes_copied: r.get(9)?,
                     errors: r.get(10)?,
                     status: r.get(11)?,
+                    delta_passthrough: r.get(12)?,
+                    bytes_egress_saved: r.get(13)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -733,6 +752,7 @@ mod tests {
             objects_deleted: 0,
             bytes_copied: 1024,
             errors: 0,
+            ..Default::default()
         };
         db.replication_finish_run(id, "r", "succeeded", 300, totals, 900)
             .unwrap();
