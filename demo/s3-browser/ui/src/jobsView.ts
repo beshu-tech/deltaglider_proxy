@@ -208,7 +208,9 @@ export function rerunVerdictMeta(rerun: RerunVerdict): {
           ? "Re-run won't help: policy skips existing destination"
           : rerun.why === 'dest_newer_than_source'
             ? "Re-run won't help: destination is newer"
-            : rerun.why === 'orphan_needs_delete'
+            : rerun.why === 'tied_timestamps_no_winner'
+              ? "Re-run won't help: timestamps tied, no winner"
+              : rerun.why === 'orphan_needs_delete'
               ? "Re-run won't help: needs a delete"
               : rerun.why === 'foreign_not_ours'
                 ? "Re-run won't help: not written by this rule"

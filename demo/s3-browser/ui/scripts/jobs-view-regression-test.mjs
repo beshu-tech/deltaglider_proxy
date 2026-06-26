@@ -164,10 +164,15 @@ assert.deepEqual(rerunVerdictMeta({ verdict: 'conditional', why: 'newer_wins_dep
 // dest newer / copy failing — also hard (red) no.
 assert.equal(rerunVerdictMeta({ verdict: 'no', why: 'dest_newer_than_source' }).color, 'red');
 assert.equal(rerunVerdictMeta({ verdict: 'no', why: 'copy_keeps_failing' }).color, 'red');
+// tied timestamps — a distinct, honest label (not the false "destination is newer").
+assert.match(
+  rerunVerdictMeta({ verdict: 'no', why: 'tied_timestamps_no_winner' }).label,
+  /timestamps tied/,
+);
 // orphan-needs-delete / foreign — soft (gold) no: the real fix is an out-of-band delete.
 assert.equal(rerunVerdictMeta({ verdict: 'no', why: 'orphan_needs_delete' }).color, 'gold');
 assert.equal(rerunVerdictMeta({ verdict: 'no', why: 'foreign_not_ours' }).color, 'gold');
-for (const why of ['policy_skips_existing_dest', 'dest_newer_than_source', 'orphan_needs_delete', 'foreign_not_ours', 'copy_keeps_failing']) {
+for (const why of ['policy_skips_existing_dest', 'dest_newer_than_source', 'tied_timestamps_no_winner', 'orphan_needs_delete', 'foreign_not_ours', 'copy_keeps_failing']) {
   assert.equal(rerunVerdictMeta({ verdict: 'no', why }).tone, 'bad', `no:${why} is a bad tone`);
 }
 

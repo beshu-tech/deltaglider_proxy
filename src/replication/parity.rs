@@ -51,8 +51,9 @@ pub struct ObjState {
     pub etag: Option<String>,
     /// Part count parsed off a `"...-N"` multipart ETag, if any.
     pub multipart_parts: Option<u32>,
-    /// Object creation time (unix seconds) — the age signal for newer-wins
-    /// remediation. `compare_pair`/`diff_parity` ignore this.
+    /// Object creation time (unix MILLIS) — the age signal for newer-wins
+    /// remediation. Millis (not whole seconds) so the s>d / s==d / d>s fork
+    /// matches the planner's full-DateTime compare. `compare_pair` ignores it.
     pub created_at: Option<i64>,
     /// `Some(true/false)` once the dest scan resolves rule ownership; `None`
     /// on source entries and until annotated (rule-agnostic at construction).
@@ -69,8 +70,11 @@ impl ObjState {
             .multipart_etag
             .clone()
             .or_else(|| (!m.md5.is_empty()).then(|| m.md5.clone()));
-        let multipart_parts = m
-            .multipart_etag
+        // Parse the `-N` part count off the RESOLVED etag (not just
+        // multipart_etag) so a FOREIGN multipart object — whose multipart shape
+        // arrives via md5, with multipart_etag absent — still demotes the tier-2
+        // etag compare to size-only instead of a false ChecksumMismatch.
+        let multipart_parts = etag
             .as_deref()
             .and_then(|e| e.rsplit_once('-'))
             .and_then(|(_, n)| n.parse::<u32>().ok());
@@ -79,7 +83,7 @@ impl ObjState {
             size: m.file_size,
             etag,
             multipart_parts,
-            created_at: Some(m.created_at.timestamp()),
+            created_at: Some(m.created_at.timestamp_millis()),
             owned_by_rule: None,
         }
     }
@@ -127,7 +131,8 @@ pub struct ParityFinding {
 /// Returns `(kind, verifier, unverifiable, detail)`:
 /// 1. Both sha present → compare sha256 + size (strongest).
 /// 2. Sha missing a side but both have an etag AND sizes equal → EtagSize,
-///    UNLESS multipart part-counts differ (can't prove equality) → fall to 3.
+///    UNLESS the multipart shapes differ (a `-N` count mismatch, including
+///    single-part vs multipart) — etags aren't comparable then → fall to 3.
 /// 3. Size only: equal → `Match` + `unverifiable`; differ → `ChecksumMismatch`.
 ///
 /// A size difference is ALWAYS a `ChecksumMismatch` (size is authoritative).
@@ -163,12 +168,12 @@ pub fn compare_pair(
         );
     }
 
-    // Tier 2: etag + size (sha missing a side). Differing multipart
-    // part-counts can't prove byte-equality → demote to tier 3.
-    let parts_conflict = matches!(
-        (src.multipart_parts, dst.multipart_parts),
-        (Some(a), Some(b)) if a != b
-    );
+    // Tier 2: etag + size (sha missing a side). A multipart ETag is md5-of-
+    // md5s with a `-N` suffix, NOT the object md5 — so it's only comparable
+    // when BOTH sides are the same multipart shape. If the part-counts differ,
+    // or one side is multipart and the other isn't, the etags can't prove
+    // byte-equality → demote to tier 3 (size-only / unverifiable).
+    let parts_conflict = src.multipart_parts != dst.multipart_parts;
     if !parts_conflict {
         if let (Some(se), Some(de)) = (&src.etag, &dst.etag) {
             if se == de {
@@ -337,7 +342,8 @@ fn push_capped(v: &mut Vec<ParityFinding>, f: ParityFinding) {
 /// - Missing: source ts, dst ts `None` (absent on dest).
 /// - Mismatch: both timestamps from the present pair.
 /// - Orphan: dest ts + `owned_by_rule` (resolved during the dest scan).
-/// - Ledger lookup is by the dest-namespace sample key (the keys `diff` carries).
+/// - Ledger lookup inverts the dest-namespace finding key to the raw source key
+///   via `dest_to_source` (the ledger is keyed by the worker's source key).
 pub fn annotate_findings(
     diff: &mut ParityDiff,
     source: &BTreeMap<String, ObjState>,
@@ -345,7 +351,12 @@ pub fn annotate_findings(
     policy: ConflictPolicy,
     replicate_deletes: bool,
     ledger: &HashMap<String, ObjectFailure>,
+    dest_to_source: &HashMap<String, String>,
 ) {
+    // Ledger is source-keyed; findings are dest-keyed. Invert, then look up.
+    let ledger_for = |dest_key: &str| -> Option<&ObjectFailure> {
+        dest_to_source.get(dest_key).and_then(|sk| ledger.get(sk))
+    };
     for f in &mut diff.missing_samples {
         let src = source.get(&f.key);
         let facts = FindingFacts {
@@ -355,7 +366,7 @@ pub fn annotate_findings(
             src_created_at: src.and_then(|s| s.created_at),
             dst_created_at: None,
             dest_owned_by_rule: None,
-            ledger: ledger.get(&f.key),
+            ledger: ledger_for(&f.key),
         };
         f.remediation = Some(analyze_finding(&facts));
     }
@@ -367,7 +378,7 @@ pub fn annotate_findings(
             src_created_at: source.get(&f.key).and_then(|s| s.created_at),
             dst_created_at: dest.get(&f.key).and_then(|d| d.created_at),
             dest_owned_by_rule: None,
-            ledger: ledger.get(&f.key),
+            ledger: ledger_for(&f.key),
         };
         f.remediation = Some(analyze_finding(&facts));
     }
@@ -380,7 +391,7 @@ pub fn annotate_findings(
             src_created_at: None,
             dst_created_at: dst.and_then(|d| d.created_at),
             dest_owned_by_rule: dst.and_then(|d| d.owned_by_rule),
-            ledger: ledger.get(&f.key),
+            ledger: ledger_for(&f.key),
         };
         f.remediation = Some(analyze_finding(&facts));
     }
@@ -487,8 +498,16 @@ pub async fn parity_audit(
 
     let mut source: BTreeMap<String, ObjState> = BTreeMap::new();
     let mut dest: BTreeMap<String, ObjState> = BTreeMap::new();
+    // Reverse map dest-key → raw source-key, so the failure-ledger join (keyed
+    // by the worker's raw source_key) can be looked up from a dest-namespace
+    // finding even when source.prefix != destination.prefix.
+    let mut dest_to_source: HashMap<String, String> = HashMap::new();
     let mut truncated = false;
-    let mut total: usize = 0;
+
+    // Each side gets its OWN budget (capped at max_objects) so a balanced large
+    // mirror isn't spuriously truncated and a big source can't starve the dest
+    // scan into emitting false 'missing' findings.
+    let mut src_count: usize = 0;
 
     // --- Scan SOURCE ---
     let mut pager = crate::job_loop::Pager::fresh();
@@ -505,7 +524,7 @@ pub async fn parity_audit(
             .await
             .map_err(|e| format!("list source page failed: {e}"))?;
         for (key, meta) in &page.objects {
-            if total >= max_objects {
+            if src_count >= max_objects {
                 truncated = true;
                 break 'src_pages;
             }
@@ -518,8 +537,9 @@ pub async fn parity_audit(
             }
             let dest_key = rewrite_key(&rule.source.prefix, &rule.destination.prefix, key)
                 .map_err(|e| e.to_string())?;
+            dest_to_source.insert(dest_key.clone(), key.clone());
             source.insert(dest_key, ObjState::from_metadata(meta));
-            total += 1;
+            src_count += 1;
         }
         if !pager.advance(page.is_truncated, page.next_continuation_token) {
             break;
@@ -530,6 +550,7 @@ pub async fn parity_audit(
     }
 
     // --- Scan DEST ---
+    let mut dst_count: usize = 0;
     let mut pager = crate::job_loop::Pager::fresh();
     'dst_pages: while let Some(_page) = pager.begin_page() {
         let page = engine
@@ -544,7 +565,7 @@ pub async fn parity_audit(
             .await
             .map_err(|e| format!("list dest page failed: {e}"))?;
         for (key, meta) in &page.objects {
-            if total >= max_objects {
+            if dst_count >= max_objects {
                 truncated = true;
                 break 'dst_pages;
             }
@@ -556,7 +577,7 @@ pub async fn parity_audit(
             // foreign-orphan discriminator for remediation.
             st.owned_by_rule = Some(event_consumer::owned_by_rule(meta, &rule.name));
             dest.insert(key.clone(), st);
-            total += 1;
+            dst_count += 1;
         }
         if !pager.advance(page.is_truncated, page.next_continuation_token) {
             break;
@@ -586,12 +607,16 @@ pub async fn parity_audit(
     // Annotate the bounded samples (≤300 keys) with the causal model. The
     // ledger join is one small `IN (…)` query over exactly those keys; empty
     // when no config DB was passed (still a correct, ledger-less diagnosis).
+    // The ledger is keyed by the worker's RAW SOURCE key, but findings carry
+    // dest-namespace keys — invert via dest_to_source so the join hits when
+    // source.prefix != destination.prefix (orphans have no source key → skip).
     let sample_keys: Vec<&str> = diff
         .missing_samples
         .iter()
         .chain(&diff.orphan_samples)
         .chain(&diff.mismatch_samples)
-        .map(|f| f.key.as_str())
+        .filter_map(|f| dest_to_source.get(&f.key))
+        .map(|s| s.as_str())
         .collect();
     // Lock the DB ONLY here, for the synchronous ledger query — never across
     // the listing awaits above (a `&ConfigDb` is `!Send`, so holding one across
@@ -611,6 +636,7 @@ pub async fn parity_audit(
         rule.conflict,
         rule.replicate_deletes,
         &ledger,
+        &dest_to_source,
     );
     let actionable = fold_actionable(&diff);
 
@@ -960,8 +986,9 @@ mod tests {
         let m = FileMetadata::new_passthrough("x".into(), "sha".into(), "md5val".into(), 7, None);
         // new_passthrough stamps created_at = now; assert we propagate it.
         let st = ObjState::from_metadata(&m);
-        assert_eq!(st.created_at, Some(m.created_at.timestamp()));
-        assert!(st.created_at.unwrap() >= now.timestamp() - 5);
+        // Sub-second precision (millis) so the newer-wins fork matches the planner.
+        assert_eq!(st.created_at, Some(m.created_at.timestamp_millis()));
+        assert!(st.created_at.unwrap() >= now.timestamp_millis() - 5000);
         assert_eq!(st.owned_by_rule, None, "ownership is rule-agnostic here");
     }
 
@@ -975,6 +1002,7 @@ mod tests {
         let source = map(&[("k", src)]);
         let dest: BTreeMap<String, ObjState> = BTreeMap::new();
         let mut diff = diff_parity(&source, &dest);
+        let d2s = HashMap::from([("k".to_string(), "k".to_string())]);
         annotate_findings(
             &mut diff,
             &source,
@@ -982,6 +1010,7 @@ mod tests {
             ConflictPolicy::NewerWins,
             false,
             &HashMap::new(),
+            &d2s,
         );
         let rem = diff.missing_samples[0].remediation.as_ref().unwrap();
         assert_eq!(rem.reason, ReasonCode::NeverCopied);
@@ -1001,6 +1030,7 @@ mod tests {
         let source = map(&[("k", s)]);
         let dest = map(&[("k", d)]);
         let mut diff = diff_parity(&source, &dest);
+        let d2s = HashMap::from([("k".to_string(), "k".to_string())]);
         annotate_findings(
             &mut diff,
             &source,
@@ -1008,6 +1038,7 @@ mod tests {
             ConflictPolicy::SkipIfDestExists,
             false,
             &HashMap::new(),
+            &d2s,
         );
         let rem = diff.mismatch_samples[0].remediation.as_ref().unwrap();
         assert_eq!(
@@ -1036,9 +1067,71 @@ mod tests {
             ConflictPolicy::NewerWins,
             true,
             &HashMap::new(),
+            &HashMap::new(),
         );
         let rem = diff.orphan_samples[0].remediation.as_ref().unwrap();
         assert_eq!(rem.reason, ReasonCode::ForeignOrphan);
         assert_eq!(fold_actionable(&diff).foreign_orphans, 1);
+    }
+
+    #[test]
+    fn ledger_join_inverts_dest_key_to_source_key_across_prefixes() {
+        // F1: rule rewrites src "firmware/a.bin" → dest "mirror/a.bin". The
+        // failure ledger is keyed by the SOURCE key; the finding by the DEST
+        // key. The join must invert via dest_to_source or CopyFailing is lost.
+        use super::super::remediation::ReasonCode;
+        let mut s = st(Some("h"), 1, None, None);
+        s.created_at = Some(500);
+        let source = map(&[("mirror/a.bin", s)]); // already dest-namespace in the map
+        let dest: BTreeMap<String, ObjState> = BTreeMap::new();
+        let mut diff = diff_parity(&source, &dest);
+        let ledger = HashMap::from([(
+            "firmware/a.bin".to_string(),
+            ObjectFailure {
+                consecutive_failures: 3,
+                last_error: "AccessDenied".to_string(),
+                last_failed_at: 1,
+            },
+        )]);
+        let d2s = HashMap::from([("mirror/a.bin".to_string(), "firmware/a.bin".to_string())]);
+        annotate_findings(
+            &mut diff,
+            &source,
+            &dest,
+            ConflictPolicy::NewerWins,
+            false,
+            &ledger,
+            &d2s,
+        );
+        // With the inversion the missing object is correctly CopyFailing, NOT
+        // the harmful NeverCopied/"re-run fixes this".
+        let rem = diff.missing_samples[0].remediation.as_ref().unwrap();
+        assert_eq!(rem.reason, ReasonCode::CopyFailing);
+    }
+
+    #[test]
+    fn foreign_multipart_object_demotes_to_size_only_not_false_mismatch() {
+        // F5: a foreign dest object carries its multipart shape in md5 (no
+        // multipart_etag). The src is a managed single-part object. Same bytes,
+        // different etag SHAPE must NOT report a false ChecksumMismatch.
+        let src =
+            FileMetadata::new_passthrough("x".into(), String::new(), "abc123".into(), 10, None);
+        let mut dst = FileMetadata::fallback(
+            "x".into(),
+            10,
+            "abc123-4".into(), // multipart-shaped md5, 4 parts, foreign (no sha)
+            chrono::Utc::now(),
+            None,
+            crate::types::StorageInfo::Passthrough,
+        );
+        dst.file_sha256 = String::new();
+        let a = ObjState::from_metadata(&src);
+        let b = ObjState::from_metadata(&dst);
+        // b's multipart_parts must be parsed off the resolved etag (md5 here).
+        assert_eq!(b.multipart_parts, Some(4));
+        let (kind, v, unver, _) = compare_pair(&a, &b);
+        assert_eq!(kind, FindingKind::Match, "must not false-mismatch");
+        assert_eq!(v, Some(Verifier::SizeOnly));
+        assert!(unver);
     }
 }

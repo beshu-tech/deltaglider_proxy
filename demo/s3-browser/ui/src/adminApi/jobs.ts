@@ -63,6 +63,7 @@ export type RerunVerdict =
       why:
         | 'policy_skips_existing_dest'
         | 'dest_newer_than_source'
+        | 'tied_timestamps_no_winner'
         | 'orphan_needs_delete'
         | 'foreign_not_ours'
         | 'copy_keeps_failing';

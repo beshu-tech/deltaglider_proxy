@@ -51,6 +51,9 @@ pub enum ReasonCode {
 pub enum NoReason {
     PolicySkipsExistingDest,
     DestNewerThanSource,
+    /// newer-wins can't break a tie: src and dst share the same timestamp but
+    /// differ in content, so a re-run neither side wins → skipped.
+    TiedTimestampsNoWinner,
     OrphanNeedsDelete,
     ForeignNotOurs,
     CopyKeepsFailing,
@@ -219,7 +222,7 @@ fn analyze_mismatch_newer_wins(facts: &FindingFacts) -> Remediation {
             // s == d: equal timestamps, diverged content. Newer-wins can't break the tie.
             reason: ReasonCode::DivergedSameTimestamp,
             rerun_helps: RerunVerdict::No {
-                why: NoReason::DestNewerThanSource,
+                why: NoReason::TiedTimestampsNoWinner,
             },
             fix: FixAction::CopyOverwrite,
             reason_detail: "content differs but timestamps are equal — newer-wins won't re-copy"
@@ -406,7 +409,7 @@ mod tests {
         assert_eq!(
             r.rerun_helps,
             RerunVerdict::No {
-                why: NoReason::DestNewerThanSource
+                why: NoReason::TiedTimestampsNoWinner
             }
         );
         assert_eq!(r.fix, FixAction::CopyOverwrite);
