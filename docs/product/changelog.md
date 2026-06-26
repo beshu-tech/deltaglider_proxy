@@ -10,6 +10,26 @@ follow [semantic versioning](https://semver.org/); the Docker image
 
 _Last updated: 2026-06-26_
 
+## v1.5.2 — 2026-06-26
+
+### Fixed
+
+- **Reject malformed `//` keys at ingest.** The proxy is the S3 gateway, but it
+  used to store a client's path-join bug verbatim — keys with an empty path
+  segment (`a//b`, distinct from `a/b` in S3). Now `PUT`, browser `POST`
+  form-upload, and multipart uploads all refuse internal `//` keys. Reads and
+  deletes stay permissive so any pre-existing `//` objects remain reachable for
+  cleanup; a single trailing `/` (folder marker / listing prefix) is unaffected.
+
+- **Parity Verify survives transient listing throttle.** A parity audit over a
+  large bucket lists both sides page-by-page; a single Hetzner `503 SlowDown`
+  mid-scan used to fail the whole verify. The page-list now retries transient
+  throttle errors with backoff, so a momentary 503 no longer aborts the audit.
+
+- **Live job Runs tab.** A running job's Runs tab now updates its
+  scanned/processed counters live, sourced from the jobs-list poll (no second
+  poller) — and refetches run history once when the run finishes.
+
 ## v1.5.1 — 2026-06-26
 
 ### Added
