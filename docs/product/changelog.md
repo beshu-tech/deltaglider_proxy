@@ -10,6 +10,23 @@ follow [semantic versioning](https://semver.org/); the Docker image
 
 _Last updated: 2026-06-26_
 
+## v1.5.3 — 2026-06-26
+
+### Added
+
+- **Delta-passthrough replication fast path.** Replicating a delta-compressed
+  object between two compressed buckets no longer reconstructs the full object,
+  ships it whole, and re-compresses it at the destination. When the destination
+  already holds the byte-identical reference baseline (or has none yet — it's
+  seeded), the `.delta` blob is shipped **verbatim**: no xdelta3 on either end,
+  and only the delta's bytes cross the wire instead of the full logical object.
+  For versioned-artifact mirrors this is a large egress + CPU saving. The fast
+  path is gated hard for correctness — it only fires when the destination
+  reference's checksum matches and both sides are plaintext, and always falls
+  back to the proven reconstruct path otherwise. Each run reports how many
+  objects took the fast path and the egress bytes saved (a
+  `deltaglider_replication_delta_passthrough_bytes_saved_total` metric).
+
 ## v1.5.2 — 2026-06-26
 
 ### Fixed
