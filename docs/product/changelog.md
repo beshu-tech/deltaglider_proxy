@@ -8,7 +8,37 @@ Every released version of DeltaGlider Proxy, newest first. Versions
 follow [semantic versioning](https://semver.org/); the Docker image
 `beshultd/deltaglider_proxy:<version>` is published for each tag.
 
-_Last updated: 2026-06-25_
+_Last updated: 2026-06-26_
+
+## v1.5.1 — 2026-06-26
+
+### Added
+
+- **Replication parity audit — "is my mirror verified identical?"** A new
+  **Verify** tab on each replication job runs an on-demand source↔destination
+  parity check and returns an explicit verdict instead of inferring sync from
+  `status=succeeded`. It compares logical SHA-256 + size from metadata (no
+  downloads — works for delta-stored objects too) and classifies every object
+  Match / checksum-mismatch / missing-on-destination / extra-on-destination.
+  The green **"Verified in sync"** verdict is the headline; a foreign-object
+  three-tier verifier (sha → etag+size → size-only) avoids false alarms on
+  objects not written through the proxy.
+
+- **Closed-loop remediation per finding.** Every difference now explains its
+  cause, says **policy-awarely** whether re-running the rule will fix it, and
+  guides the operator to the right action. Crucially honest: a checksum mismatch
+  under a `skip-if-dest-exists` rule is reported as "re-run won't help — overwrite
+  manually or change the policy", not a false "just re-run". A persistently
+  failing copy surfaces its last error. "Run now" is offered only where it
+  actually helps.
+
+### Fixed
+
+- **Replication retries transient source 5xx.** Transient Hetzner-phrased
+  throttle/gateway errors (`throttled (status=503)`, `failed (status=502/504)`)
+  are now recognised as retryable, so small objects no longer land in the
+  failure ring on a momentary source blip — they retry in-line and succeed
+  within the same run.
 
 ## v1.5.0 — 2026-06-25
 
