@@ -23,6 +23,7 @@ pub mod iam;
 pub mod init;
 pub mod job_loop;
 pub mod lifecycle;
+pub mod logs;
 pub mod maintenance;
 pub mod metadata_cache;
 pub mod metrics;

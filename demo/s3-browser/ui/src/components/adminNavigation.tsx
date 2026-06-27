@@ -7,6 +7,7 @@ import {
   ExperimentOutlined,
   FileTextOutlined,
   LockOutlined,
+  ProfileOutlined,
   SecurityScanOutlined,
   SendOutlined,
   SettingOutlined,
@@ -87,6 +88,12 @@ export const ADMIN_IA: Array<{ group: string; entries: SidebarEntry[] }> = [
         label: 'Audit log',
         icon: <FileTextOutlined />,
         description: 'Recent authentication and mutation events from this process.',
+      },
+      {
+        path: 'diagnostics/logs',
+        label: 'Logs',
+        icon: <ProfileOutlined />,
+        description: 'Live tail + filter of the proxy operational logs (INFO+).',
       },
       {
         path: 'diagnostics/delta-efficiency',

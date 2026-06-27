@@ -14,6 +14,7 @@ pub mod external_auth;
 mod groups;
 pub(crate) mod jobs;
 mod lifecycle;
+mod logs;
 pub(crate) mod maintenance;
 pub(crate) mod objects;
 pub(crate) mod replication;
@@ -77,6 +78,7 @@ pub use jobs::{
     job_action as jobs_action, job_failures as jobs_failures, job_runs as jobs_runs,
     list_jobs as jobs_list,
 };
+pub use logs::{get_logs, get_logs_stream};
 pub use maintenance::{
     bucket_status as maintenance_bucket_status, start_migrate as maintenance_start_migrate,
     start_reencrypt as maintenance_start_reencrypt,

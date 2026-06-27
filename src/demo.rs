@@ -293,6 +293,8 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         // (all admins see the same log so there's no per-identity
         // filtering to do at this layer).
         .route("/_/api/admin/audit", get(admin::get_audit))
+        .route("/_/api/admin/logs", get(admin::get_logs))
+        .route("/_/api/admin/logs/stream", get(admin::get_logs_stream))
         // Durable event outbox diagnostics and operator requeue controls.
         .route("/_/api/admin/event-outbox", get(admin::event_outbox_list))
         .route(

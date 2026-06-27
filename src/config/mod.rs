@@ -51,6 +51,18 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Server",
     },
     EnvVarEntry {
+        name: "DGP_LOG_RING_SIZE",
+        description: "Max entries in the in-memory log ring powering the admin GUI log viewer (default: 2000).",
+        example: "2000",
+        category: "Server",
+    },
+    EnvVarEntry {
+        name: "DGP_LOG_RING_LEVEL",
+        description: "Minimum severity captured into the GUI log ring/stream (error|warn|info|debug|trace; default: info). Independent of the stdout log level.",
+        example: "info",
+        category: "Server",
+    },
+    EnvVarEntry {
         name: "DGP_CODEC_CONCURRENCY",
         description: "Max concurrent delta encode/decode ops (default: CPU cores)",
         example: "4",
@@ -2626,6 +2638,8 @@ mod tests {
             "DGP_DEBUG_HEADERS",                     // api::handlers::debug_headers_enabled()
             "DGP_TRUST_PROXY_HEADERS",               // rate_limiter::trust_proxy_headers()
             "DGP_LOG_FORMAT",                        // startup::init_tracing() (text|json)
+            "DGP_LOG_RING_SIZE",                     // logs::ring_capacity()
+            "DGP_LOG_RING_LEVEL",                    // logs::ring_min_level()
             "DGP_SESSION_TTL_HOURS",                 // session::default_session_ttl()
             "DGP_MAX_MULTIPART_UPLOADS",             // multipart::default_max_uploads()
             "DGP_MULTIPART_SWEEP_INTERVAL_SECS",     // main multipart sweeper cadence

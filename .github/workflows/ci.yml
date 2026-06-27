@@ -436,6 +436,7 @@ jobs:
             --test parity_test \
             --test savings_test \
             --test bucket_usage_test \
+            --test logs_test \
             --test admission_test \
             --test aws_chunked_upload_test \
             --test iam_list_scope_test \

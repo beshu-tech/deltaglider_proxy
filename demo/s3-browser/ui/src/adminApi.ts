@@ -10,6 +10,7 @@ export * from './adminApi/cannedPolicies';
 export * from './adminApi/groups';
 export * from './adminApi/whoami';
 export * from './adminApi/scanner';
+export * from './adminApi/logs';
 export * from './adminApi/backup';
 export * from './adminApi/backends';
 export * from './adminApi/recovery';

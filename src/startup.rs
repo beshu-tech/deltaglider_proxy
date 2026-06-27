@@ -62,9 +62,15 @@ pub fn init_tracing(cli: &Cli) -> reload::Handle<EnvFilter, tracing_subscriber::
             .boxed()
     };
 
+    // 3rd layer: capture events (at the DGP_LOG_RING_LEVEL floor, default INFO)
+    // into the in-process ring + broadcast that power the admin GUI log viewer
+    // (GET /_/api/admin/logs[/stream]). Gated by the global EnvFilter above, so a
+    // hot level change affects it too; its own floor keeps per-request debug spam
+    // out of the ring.
     tracing_subscriber::registry()
         .with(filter_layer)
         .with(fmt_layer)
+        .with(deltaglider_proxy::logs::LogCaptureLayer::new())
         .init();
 
     reload_handle

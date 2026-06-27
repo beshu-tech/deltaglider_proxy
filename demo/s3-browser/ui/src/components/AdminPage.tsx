@@ -21,6 +21,7 @@ import BucketsPanel from './BucketsPanel';
 import SetupWizard from './SetupWizard';
 import TracePanel from './TracePanel';
 import AuditLogPanel from './AuditLogPanel';
+import LogsPanel from './LogsPanel';
 import DeltaEfficiencyPanel from './DeltaEfficiencyPanel';
 import EventOutboxPanel from './EventOutboxPanel';
 import CommandPalette, {
@@ -471,6 +472,14 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, accountMe
         <>
           {header}
           <AuditLogPanel onSessionExpired={onSessionExpired} />
+        </>
+      );
+    }
+    if (adminPath === 'diagnostics/logs') {
+      return (
+        <>
+          {header}
+          <LogsPanel onSessionExpired={onSessionExpired} />
         </>
       );
     }
