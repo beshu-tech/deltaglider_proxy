@@ -563,6 +563,38 @@ pub struct StoreResult {
     pub metadata: FileMetadata,
     /// Actual bytes written to storage (may be less than original for deltas)
     pub stored_size: u64,
+    /// Usage-counter accounting captured by the store path (the only place that
+    /// knows prior state). `replaced` = the prior object's metadata when this
+    /// PUT overwrote an existing key (its contribution must be subtracted so the
+    /// counter nets to +0 objects on overwrite); `None` on a fresh create.
+    /// `reference_created_bytes` = bytes of a brand-new `reference.bin` this PUT
+    /// seeded (added to stored_bytes, symmetric with delete's reclamation).
+    pub replaced: Option<Box<FileMetadata>>,
+    pub reference_created_bytes: u64,
+}
+
+impl StoreResult {
+    /// Construct with no overwrite/reference accounting (a fresh create that
+    /// seeded no reference). The store path enriches via [`Self::with_accounting`].
+    pub fn new(metadata: FileMetadata, stored_size: u64) -> Self {
+        Self {
+            metadata,
+            stored_size,
+            replaced: None,
+            reference_created_bytes: 0,
+        }
+    }
+
+    /// Attach overwrite/reference-creation accounting (called by the store path).
+    pub fn with_accounting(
+        mut self,
+        replaced: Option<FileMetadata>,
+        reference_created_bytes: u64,
+    ) -> Self {
+        self.replaced = replaced.map(Box::new);
+        self.reference_created_bytes = reference_created_bytes;
+        self
+    }
 }
 
 /// Deduplicate `(key, FileMetadata)` pairs, keeping only the entry with the

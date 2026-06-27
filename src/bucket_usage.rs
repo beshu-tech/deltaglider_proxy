@@ -135,15 +135,28 @@ impl BucketUsage {
         d_logical: i64,
         d_stored: i64,
     ) -> Result<(), rusqlite::Error> {
-        self.conn.lock().unwrap().execute(
+        // RETURNING the post-update row so we can detect a column going negative
+        // — that is ALWAYS a real accounting bug (a missed-count somewhere
+        // upstream), never a steady state, so warn loudly. The read path still
+        // clamps at 0 for display; this surfaces the drift instead of hiding it.
+        let (oc, lb, sb): (i64, i64, i64) = self.conn.lock().unwrap().query_row(
             "INSERT INTO bucket_usage (bucket, object_count, logical_bytes, stored_bytes)
                  VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(bucket) DO UPDATE SET
                  object_count  = object_count  + excluded.object_count,
                  logical_bytes = logical_bytes + excluded.logical_bytes,
-                 stored_bytes  = stored_bytes  + excluded.stored_bytes",
+                 stored_bytes  = stored_bytes  + excluded.stored_bytes
+             RETURNING object_count, logical_bytes, stored_bytes",
             params![bucket, d_count, d_logical, d_stored],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
+        if oc < 0 || lb < 0 || sb < 0 {
+            warn!(
+                "bucket_usage: counter for '{}' went negative (count={}, logical={}, stored={}) — \
+                 an upstream mutation was miscounted; run Refresh to reconcile",
+                bucket, oc, lb, sb
+            );
+        }
         Ok(())
     }
 
@@ -167,7 +180,7 @@ impl BucketUsage {
                 "SELECT object_count, logical_bytes, stored_bytes, last_scan_at
                    FROM bucket_usage WHERE bucket = ?1",
                 params![bucket],
-                Self::map_row,
+                |r| Self::map_row_at(r, 0),
             )
             .map(Some)
             .or_else(|e| match e {
@@ -185,7 +198,7 @@ impl BucketUsage {
         )?;
         let rows = stmt
             .query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, Self::map_row_offset1(r)?))
+                Ok((r.get::<_, String>(0)?, Self::map_row_at(r, 1)?))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
@@ -217,27 +230,32 @@ impl BucketUsage {
         Ok(())
     }
 
-    fn map_row(r: &rusqlite::Row<'_>) -> Result<BucketUsageRow, rusqlite::Error> {
+    /// Map a row whose count/logical/stored/last_scan_at columns start at
+    /// `base` (counters clamped at 0 — a negative is a bug, never a real size).
+    /// `read` selects from offset 0; `read_all` puts `bucket` first so offset 1.
+    fn map_row_at(r: &rusqlite::Row<'_>, base: usize) -> Result<BucketUsageRow, rusqlite::Error> {
         Ok(BucketUsageRow {
-            object_count: r.get::<_, i64>(0)?.max(0) as u64,
-            logical_bytes: r.get::<_, i64>(1)?.max(0) as u64,
-            stored_bytes: r.get::<_, i64>(2)?.max(0) as u64,
-            last_scan_at: r.get::<_, Option<i64>>(3)?,
-        })
-    }
-
-    fn map_row_offset1(r: &rusqlite::Row<'_>) -> Result<BucketUsageRow, rusqlite::Error> {
-        Ok(BucketUsageRow {
-            object_count: r.get::<_, i64>(1)?.max(0) as u64,
-            logical_bytes: r.get::<_, i64>(2)?.max(0) as u64,
-            stored_bytes: r.get::<_, i64>(3)?.max(0) as u64,
-            last_scan_at: r.get::<_, Option<i64>>(4)?,
+            object_count: r.get::<_, i64>(base)?.max(0) as u64,
+            logical_bytes: r.get::<_, i64>(base + 1)?.max(0) as u64,
+            stored_bytes: r.get::<_, i64>(base + 2)?.max(0) as u64,
+            last_scan_at: r.get::<_, Option<i64>>(base + 3)?,
         })
     }
 }
 
+/// Transient internal buckets/routes the counter must IGNORE — migration
+/// staging (`__dgmigrate_*`) writes/deletes real objects under throwaway bucket
+/// names that are filtered out of every listing and torn down at flip. Counting
+/// them would leak orphan rows that inflate the global `/_/stats` aggregate
+/// forever. Matches the engine/maintenance convention (these prefixes are
+/// already gated from creation and hidden from listings).
+pub fn is_transient_bucket(bucket: &str) -> bool {
+    bucket.starts_with("__dgmigrate_")
+}
+
 /// Best-effort apply: log-and-drop on error so a counter hiccup never fails
-/// the S3 path (mirrors `enqueue_object_event`'s contract).
+/// the S3 path (mirrors `enqueue_object_event`'s contract). Skips transient
+/// internal buckets.
 pub fn record_object(
     usage: &Option<std::sync::Arc<BucketUsage>>,
     bucket: &str,
@@ -245,6 +263,15 @@ pub fn record_object(
     sign: i8,
 ) {
     let Some(u) = usage else { return };
+    record_object_into(u, bucket, meta, sign);
+}
+
+/// Like [`record_object`] but against an already-unwrapped handle (the engine
+/// holds `&BucketUsage` directly when applying a multi-step net delta).
+pub fn record_object_into(u: &BucketUsage, bucket: &str, meta: &FileMetadata, sign: i8) {
+    if is_transient_bucket(bucket) {
+        return;
+    }
     if let Err(e) = u.apply_object(bucket, meta, sign) {
         warn!(
             "bucket_usage: failed to apply object delta for {}: {}",

@@ -146,6 +146,13 @@ pub async fn get_bucket_usage(
     State(state): State<Arc<AdminState>>,
     Path(bucket): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(e) = crate::security::validate_bucket_name(&bucket) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("invalid bucket name: {}", e)})),
+        )
+            .into_response();
+    }
     let Some(usage) = state.s3_state.bucket_usage.as_ref() else {
         return (
             StatusCode::OK,
@@ -169,6 +176,13 @@ pub async fn refresh_bucket_usage(
     State(state): State<Arc<AdminState>>,
     axum::extract::Query(q): axum::extract::Query<UsageQuery>,
 ) -> impl IntoResponse {
+    if let Err(e) = crate::security::validate_bucket_name(&q.bucket) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("invalid bucket name: {}", e)})),
+        )
+            .into_response();
+    }
     let Some(usage) = state.s3_state.bucket_usage.as_ref() else {
         return (
             StatusCode::OK,

@@ -106,6 +106,21 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         let (obj_key, deltaspace_id) = Self::validated_key_ingest(bucket, key)?;
 
+        // Usage-counter accounting: capture the PRIOR object metadata (if this
+        // key already exists, S3 PUT is an upsert) so the counter can net the
+        // overwrite to +0 objects instead of double-counting. Only resolved when
+        // a counter is attached. Small TOCTOU window vs the write below is
+        // acceptable — the counter is best-effort/approximate and reconciled by
+        // Refresh; a concurrent same-key PUT is already racy at the S3 layer.
+        let prior_for_counter: Option<FileMetadata> = if self.bucket_usage.is_some() {
+            self.resolve_metadata(bucket, &deltaspace_id, &obj_key)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+
         // Calculate hashes
         let sha256 = hex::encode(Sha256::digest(data));
         let md5 = hex::encode(Md5::digest(data));
@@ -156,7 +171,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             }
             self.metadata_cache
                 .insert(bucket, key, result.metadata.clone());
-            return Ok(result);
+            // Passthrough creates no reference baseline; only overwrite-net.
+            return Ok(result.with_accounting(prior_for_counter, 0));
         }
 
         // Acquire per-deltaspace lock to prevent concurrent reference overwrites.
@@ -233,9 +249,17 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         };
         self.metadata_cache
             .insert(bucket, key, result.metadata.clone());
-        // NB: recorded in the public delegators (store / store_with_multipart_etag),
-        // not here — store_inner is shared, recording here would double-count.
-        Ok(result)
+        // NB: the COUNTER is recorded in the public delegators (store /
+        // store_with_multipart_etag), not here — store_inner is shared, so
+        // recording here would double-count. We only attach the accounting the
+        // delegators need: the prior object (overwrite-net) + a newly-seeded
+        // reference's bytes (symmetric with delete's reclamation subtraction).
+        let reference_created_bytes = if has_existing_reference {
+            0
+        } else {
+            ref_meta.file_size
+        };
+        Ok(result.with_accounting(prior_for_counter, reference_created_bytes))
     }
 
     /// Encode a delta against the reference, evaluate the compression ratio,
@@ -399,10 +423,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             );
         }
 
-        Ok(StoreResult {
-            metadata,
-            stored_size: delta.len() as u64,
-        })
+        Ok(StoreResult::new(metadata, delta.len() as u64))
     }
 
     /// Store the internal deltaspace reference baseline.
@@ -566,10 +587,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             );
         }
 
-        let result = StoreResult {
-            metadata,
-            stored_size: total_size,
-        };
+        let result = StoreResult::new(metadata, total_size);
         self.metadata_cache
             .insert(bucket, key, result.metadata.clone());
         // NB: recorded in the public delegators, not here (shared inner).
@@ -657,10 +675,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             );
         }
 
-        let result = StoreResult {
-            metadata,
-            stored_size: total_size,
-        };
+        let result = StoreResult::new(metadata, total_size);
         self.metadata_cache
             .insert(bucket, key, result.metadata.clone());
         self.record_store(bucket, &result);
@@ -746,10 +761,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             );
         }
 
-        let result = StoreResult {
-            metadata,
-            stored_size: total_size,
-        };
+        let result = StoreResult::new(metadata, total_size);
         self.metadata_cache
             .insert(bucket, key, result.metadata.clone());
         self.record_store(bucket, &result);
@@ -854,6 +866,18 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // `assembled` (buffering backends only) is already caller-ordered.
         parts.sort_by_key(|p| p.part_number);
 
+        // Overwrite-net accounting for the usage counter (see store_inner). The
+        // handle already holds the per-deltaspace lock, so this is race-safe.
+        let obj_key = crate::types::ObjectKey::parse(&handle.bucket, &handle.key);
+        let prior_for_counter: Option<FileMetadata> = if self.bucket_usage.is_some() {
+            self.resolve_metadata(&handle.bucket, &handle.deltaspace_id, &obj_key)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+
         let mut metadata = FileMetadata::new_passthrough(
             handle.filename.clone(),
             sha256,
@@ -885,12 +909,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             );
         }
 
-        let result = StoreResult {
-            metadata,
-            stored_size: handle.total_size,
-        };
+        let result =
+            StoreResult::new(metadata, handle.total_size).with_accounting(prior_for_counter, 0);
         self.metadata_cache
             .insert(&handle.bucket, &handle.key, result.metadata.clone());
+        // This is the 7th store-completing path (streaming multipart, used by
+        // large replication/lifecycle copies) — record like the other 6.
+        self.record_store(&handle.bucket, &result);
         Ok(result)
     }
 
@@ -931,10 +956,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             )
             .await?;
 
-        Ok(StoreResult {
-            metadata,
-            stored_size: ctx.data.len() as u64,
-        })
+        Ok(StoreResult::new(metadata, ctx.data.len() as u64))
     }
 
     /// Delete a storage object, ignoring NotFound errors (idempotent delete).

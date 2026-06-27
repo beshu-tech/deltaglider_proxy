@@ -821,7 +821,15 @@ async fn delta_passthrough_copy(
     let dest_prefix2 = dest_prefix.clone();
     let dest_filename2 = dest_filename.clone();
     let engine2 = engine.clone();
-    let shipped: Result<bool, Box<dyn std::error::Error + Send + Sync>> = engine
+    // Keep a copy of the shipped delta's metadata + dest bucket for the usage
+    // counter after the lock is released (the originals are moved into the
+    // closure). The counter must see this fast-path store too — it bypasses the
+    // engine store() choke point via put_delta_raw.
+    let counter_meta = meta.clone();
+    let counter_dest_bucket = dest_bucket.clone();
+    // `Some(ref_bytes)` = shipped (ref_bytes = bytes of a reference we SEEDED on
+    // this copy, 0 if the dest already had one); `None` = fell back.
+    let shipped: Result<Option<u64>, Box<dyn std::error::Error + Send + Sync>> = engine
         .with_dest_prefix_lock(&dest_prefix, || async move {
             // Re-read the dest reference UNDER the lock and re-run the SAME pure
             // gate — identical sha + enc precedence to the first read.
@@ -832,8 +840,9 @@ async fn delta_passthrough_copy(
                     file_sha256: m.file_sha256.clone(),
                     enc: enc_fingerprint(&m),
                 });
+            let mut seeded_ref_bytes = 0u64;
             match can_delta_passthrough(&src, dest_ref.as_ref()) {
-                DeltaPassthroughDecision::Fallback { .. } => return Ok(false),
+                DeltaPassthroughDecision::Fallback { .. } => return Ok(None),
                 DeltaPassthroughDecision::ShipVerbatim => {}
                 DeltaPassthroughDecision::SeedThenShip => {
                     // Seed the dest reference verbatim, asserting it matches
@@ -843,8 +852,9 @@ async fn delta_passthrough_copy(
                         .reference_metadata_raw(&src_bucket, &src_prefix2)
                         .await?;
                     if ref_meta.file_sha256 != src.ref_sha256 {
-                        return Ok(false);
+                        return Ok(None);
                     }
+                    seeded_ref_bytes = ref_meta.file_size;
                     engine2
                         .put_reference_raw(&dest_bucket, &dest_prefix2, &ref_data, &ref_meta)
                         .await?;
@@ -863,12 +873,24 @@ async fn delta_passthrough_copy(
                     &meta,
                 )
                 .await?;
-            Ok(true)
+            Ok(Some(seeded_ref_bytes))
         })
         .await;
-    if !shipped? {
+    let Some(seeded_ref_bytes) = shipped? else {
         return Ok(None);
-    }
+    };
+
+    // Record the destination contribution into the usage counter — the fast
+    // path bypasses the engine store() choke point, so do it explicitly here.
+    // Overwrite-aware (the dest key may already exist) + add a seeded reference.
+    engine
+        .record_fast_path_copy(
+            &counter_dest_bucket,
+            request.destination_key,
+            &counter_meta,
+            seeded_ref_bytes,
+        )
+        .await;
 
     // HEAD reports the LOGICAL size, not the delta size.
     verify_destination(
