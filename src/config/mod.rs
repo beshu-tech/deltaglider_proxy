@@ -2,6 +2,7 @@
 
 //! Configuration for DeltaGlider Proxy S3 server
 
+pub mod advisories;
 mod env;
 mod expansion;
 
@@ -41,6 +42,12 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         name: "DGP_LOG_LEVEL",
         description: "Log level filter (overridden by RUST_LOG)",
         example: "deltaglider_proxy=debug,tower_http=debug",
+        category: "Server",
+    },
+    EnvVarEntry {
+        name: "DGP_LOG_FORMAT",
+        description: "Log output format: 'text' (default, human-readable) or 'json' (one JSON object per line, greppable with jq). Startup-only — not hot-reloadable.",
+        example: "json",
         category: "Server",
     },
     EnvVarEntry {
@@ -1783,6 +1790,16 @@ impl Config {
             &self.event_delivery,
         ));
 
+        // Cross-field advisories — "this combination is suspicious" checks that a
+        // single field can't reveal (rate-limit/trust-proxy collapse, stale IAM
+        // templates, etc). Non-fatal; rendered alongside the warnings above.
+        let env = advisories::EnvView::from_env();
+        warnings.extend(
+            advisories::advisories(self, &env)
+                .iter()
+                .map(|a| a.render()),
+        );
+
         warnings
     }
 
@@ -2608,6 +2625,7 @@ mod tests {
             "DGP_CONFIG",                            // config::load()
             "DGP_DEBUG_HEADERS",                     // api::handlers::debug_headers_enabled()
             "DGP_TRUST_PROXY_HEADERS",               // rate_limiter::trust_proxy_headers()
+            "DGP_LOG_FORMAT",                        // startup::init_tracing() (text|json)
             "DGP_SESSION_TTL_HOURS",                 // session::default_session_ttl()
             "DGP_MAX_MULTIPART_UPLOADS",             // multipart::default_max_uploads()
             "DGP_MULTIPART_SWEEP_INTERVAL_SECS",     // main multipart sweeper cadence
@@ -3145,6 +3163,39 @@ encryption_key: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
                 .iter()
                 .any(|w| w.contains("unconfigured-xyz-42") && w.contains("DGP_BACKEND_")),
             "aes mode with no key must produce env-var hint, got {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_check_surfaces_stale_iam_template_advisory() {
+        // End-to-end wiring proof: a user whose permission uses the stale bare
+        // `${username}` (removed in the breaking ${iam:username} rename) must
+        // surface as a check() warning at save/lint time — the footgun that's
+        // silently denying the `xperi` user in prod.
+        let mut cfg = Config {
+            iam_users: vec![crate::iam::DeclarativeUser {
+                name: "xperi".into(),
+                access_key_id: "AKXPERI".into(),
+                secret_access_key: "s".into(),
+                enabled: true,
+                groups: vec![],
+                permissions: vec![crate::iam::types::Permission {
+                    id: 0,
+                    effect: "Allow".into(),
+                    actions: vec!["write".into()],
+                    resources: vec!["scrap/customers/${username}/*".into()],
+                    conditions: None,
+                }],
+            }],
+            ..Config::default()
+        };
+        let warnings = cfg.check();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("xperi") && w.contains("${iam:username}")),
+            "stale ${{username}} template must surface as a check() advisory, got {:?}",
             warnings
         );
     }

@@ -671,8 +671,11 @@ pub async fn sigv4_auth_middleware(
         .map(|ci| ci.0.ip());
     let client_ip = rate_limiter::extract_client_ip_with_peer(request.headers(), peer_ip);
 
-    // Extract audit fields from request headers before the closure captures them
-    let (audit_ip, audit_ua) = crate::audit::extract_client_info(request.headers());
+    // Extract audit fields before the closure captures them. Use the PEER-aware
+    // resolver so audit lines agree with the rate limiter on the client IP for
+    // this request (else audit logs "unknown" while the limiter keys on the peer).
+    let (audit_ip, audit_ua) =
+        crate::audit::extract_client_info_with_peer(request.headers(), peer_ip);
 
     let record_auth_failure = {
         let metrics = metrics.clone();
@@ -684,19 +687,23 @@ pub async fn sigv4_auth_middleware(
                 m.auth_attempts_total.with_label_values(&["failure"]).inc();
                 m.auth_failures_total.with_label_values(&[reason]).inc();
             }
-            // Record failure in rate limiter + security logging
+            // Record failure in rate limiter + security logging. `bucket_key` is
+            // the IP the rate limiter buckets on; `trust_proxy` reveals whether
+            // that's the real client or a shared proxy IP — the field that makes
+            // "all clients collapsed onto one bucket" diagnosable at a glance.
             if let (Some(rl), Some(ip)) = (&rate_limiter, &client_ip) {
                 let locked = rl.record_failure(ip);
                 let count = rl.failure_count(ip);
+                let trust_proxy = crate::rate_limiter::trust_proxy_headers();
                 if locked {
                     warn!(
-                        "SECURITY | event=brute_force_lockout | ip={} | attempts={} | reason={} | ua={}",
-                        ip, count, reason, audit_ua
+                        "SECURITY | event=brute_force_lockout | ip={} | bucket_key={} | trust_proxy={} | attempts={} | reason={} | ua={}",
+                        ip, ip, trust_proxy, count, reason, audit_ua
                     );
                 } else if count >= 3 {
                     warn!(
-                        "SECURITY | event=repeated_auth_failure | ip={} | attempts={} | reason={} | ua={}",
-                        ip, count, reason, audit_ua
+                        "SECURITY | event=repeated_auth_failure | ip={} | bucket_key={} | trust_proxy={} | attempts={} | reason={} | ua={}",
+                        ip, ip, trust_proxy, count, reason, audit_ua
                     );
                 }
             }
@@ -762,8 +769,8 @@ pub async fn sigv4_auth_middleware(
         if rl.is_limited(ip) {
             let count = rl.failure_count(ip);
             warn!(
-                "SECURITY | event=brute_force_blocked | ip={} | attempts={} | action=blocked",
-                ip, count
+                "SECURITY | event=brute_force_blocked | ip={} | bucket_key={} | trust_proxy={} | attempts={} | action=blocked",
+                ip, ip, crate::rate_limiter::trust_proxy_headers(), count
             );
             return Err(
                 S3Error::SlowDown("Rate limited due to repeated auth failures".into())

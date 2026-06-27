@@ -45,9 +45,26 @@ pub fn init_tracing(cli: &Cli) -> reload::Handle<EnvFilter, tracing_subscriber::
         });
 
     let (filter_layer, reload_handle) = reload::Layer::new(initial_filter);
+
+    // Log FORMAT is a startup-only choice (it can't hot-reload like the level):
+    // DGP_LOG_FORMAT=json emits one JSON object per line (greppable with `jq` —
+    // every span field becomes a key), else the human-readable text format.
+    // Boxed so both arms share one registry-build site.
+    use tracing_subscriber::Layer;
+    let json_format = std::env::var("DGP_LOG_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+    let fmt_layer = if json_format {
+        tracing_subscriber::fmt::layer().json().boxed()
+    } else {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(std::io::stdout().is_terminal())
+            .boxed()
+    };
+
     tracing_subscriber::registry()
         .with(filter_layer)
-        .with(tracing_subscriber::fmt::layer().with_ansi(std::io::stdout().is_terminal()))
+        .with(fmt_layer)
         .init();
 
     reload_handle

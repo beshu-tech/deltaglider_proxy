@@ -33,21 +33,43 @@ pub fn sanitize(s: &str) -> String {
         .replace('|', "\\|")
 }
 
-/// Extract client IP and user-agent from request headers.
-/// Uses `rate_limiter::extract_client_ip` which respects `DGP_TRUST_PROXY_HEADERS`.
-pub fn extract_client_info(headers: &HeaderMap) -> (String, String) {
-    let ip = crate::rate_limiter::extract_client_ip(headers)
-        .map(|ip| ip.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+/// Truncated (≤256 char) user-agent from request headers.
+fn extract_ua(headers: &HeaderMap) -> String {
     let ua_raw = headers
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let ua = ua_raw
+    ua_raw
         .get(..256.min(ua_raw.len()))
         .unwrap_or(ua_raw)
-        .to_string();
-    (ip, ua)
+        .to_string()
+}
+
+/// Extract client IP and user-agent from request headers (headers-only).
+/// Uses `rate_limiter::extract_client_ip` which respects `DGP_TRUST_PROXY_HEADERS`.
+/// Prefer [`extract_client_info_with_peer`] where the TCP peer is available —
+/// without it, a client behind a proxy with trust-proxy off resolves to
+/// "unknown" here while the rate limiter keys on the peer IP, producing
+/// inconsistent log lines for the same request.
+pub fn extract_client_info(headers: &HeaderMap) -> (String, String) {
+    let ip = crate::rate_limiter::extract_client_ip(headers)
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    (ip, extract_ua(headers))
+}
+
+/// Like [`extract_client_info`] but resolves the IP exactly as the rate limiter
+/// does (`extract_client_ip_with_peer`) — XFF/X-Real-IP when trusted, else the
+/// TCP peer. This keeps audit lines and rate-limit events in agreement about
+/// the client IP for the same request.
+pub fn extract_client_info_with_peer(
+    headers: &HeaderMap,
+    peer_ip: Option<std::net::IpAddr>,
+) -> (String, String) {
+    let ip = crate::rate_limiter::extract_client_ip_with_peer(headers, peer_ip)
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    (ip, extract_ua(headers))
 }
 
 /// One audit-log entry in the in-memory ring.
