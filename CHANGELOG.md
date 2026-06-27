@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.6.0 — 2026-06-27
+
 ### Added
 
 - **Instant per-bucket size — no more O(n) listing sweeps.** S3 has no
