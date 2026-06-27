@@ -10,6 +10,76 @@ follow [semantic versioning](https://semver.org/); the Docker image
 
 _Last updated: 2026-06-27_
 
+## v1.6.0 — 2026-06-27
+
+### Added
+
+- **Instant per-bucket size — no more O(n) listing sweeps.** S3 has no
+  protocol call for "how big is this bucket?" — the only primitive is an
+  O(n) `ListObjectsV2` sweep, and the old stats scan capped out at 1000
+  objects per bucket (slow, and simply wrong for large buckets). The proxy
+  now keeps a running per-bucket counter (object count + logical pre-delta
+  bytes + stored bytes), updated on every write and delete, the way Ceph or
+  Backblaze B2 surface an instant number. `/_/stats` reads it in O(1) — the
+  1000-object cap and `truncated` flag are gone — and a **bucket size chip**
+  in the browser top bar shows size · object count at a glance (admin
+  session only). The counter is per-instance and best-effort (it never
+  blocks or fails an S3 request); a **Refresh** button runs an uncapped full
+  reconciling scan on demand. `GET /_/api/admin/usage/bucket/:bucket` exposes
+  the O(1) read; `POST /_/api/admin/usage/refresh` triggers the reconcile.
+
+- **Save-time config advisories.** The admin Apply dialog (and `config lint`)
+  now surface cross-field "this combination is suspicious" warnings *before*
+  you save, instead of leaving you to discover the misconfiguration in
+  production. Seed rules catch a rate limit running with proxy-header trust
+  disabled (which collapses every client onto the proxy's own IP and one
+  shared rate-limit bucket), a stale `${username}` IAM permission template
+  that silently denies access, a frozen bucket quota, and a public-prefix
+  rule that is redundant when auth is already open.
+
+- **In-GUI operational logs — live tail + filter, no SSH required.** A new
+  **System logs** view in the admin UI tails the proxy's operational log
+  stream live (server-sent events) with a Follow toggle, and filters a
+  bounded in-memory backlog by level, target, and free-text search — so
+  diagnosing an incident no longer means SSH-ing in to grep stdout. Backed
+  by `GET /_/api/admin/logs` (filtered backlog) and
+  `GET /_/api/admin/logs/stream` (live SSE), both admin-session-gated. The
+  ring is per-instance and in-memory (size via `DGP_LOG_RING_SIZE`, default
+  2000; floor via `DGP_LOG_RING_LEVEL`, default INFO) — it supplements, and
+  does not replace, shipping the full stdout stream to your log aggregator.
+
+- **`DGP_LOG_FORMAT=json` structured logs.** Opt-in JSON log output so prod
+  logs are field-greppable with `jq` (e.g. by client IP, bucket, or action)
+  instead of being parsed out of free-text lines.
+
+### Changed
+
+- **Slimmer admin sidebar.** The settings sidebar was consolidated from
+  eight groups down to five — single- and two-leaf groups that cost more in
+  headers than they earned are folded together (Dashboard, Trace, Delta
+  efficiency, Audit log, and System logs now sit under one **Observability**
+  group; the single Jobs screen moves under Storage). Every page URL is
+  unchanged.
+
+- **More readable audit & auth logs.** Audit lines now resolve the client IP
+  the same proxy-aware way the rate limiter does (no more `ip=unknown`
+  splitting one client across two values), and brute-force / lockout log
+  lines now include the rate-limit bucket key and proxy-trust state — the
+  fields that make "all clients collapsed onto one bucket" obvious at a
+  glance.
+
+### Fixed
+
+- **Delta uploads work on newer xdelta3 builds (3.1+).** A newer xdelta3
+  enables stream "armor" by default, which requires a seekable target the
+  proxy doesn't provide when piping — making every delta-eligible `PUT`
+  fail with `armor requires a seekable target` on those builds. The codec
+  now probes its xdelta3 at startup and disables armor when supported,
+  while staying compatible with the older 3.0.x builds that lack the flag.
+  Deltas remain format-identical across versions (plain RFC-3284 VCDIFF), so
+  a delta encoded on one xdelta3 version still decodes on any other. The
+  exact xdelta3 version and armor state are now logged at boot.
+
 ## v1.5.4 — 2026-06-27
 
 ### Changed
