@@ -82,6 +82,7 @@ export default function JobDrawer({
             ...r,
             status: serverRow.status,
             objects_processed: serverRow.progress.processed,
+            objects_skipped: serverRow.progress.skipped,
             errors: serverRow.progress.failed,
           }
         : r,
@@ -190,8 +191,21 @@ export default function JobDrawer({
             <Tag color={jobStatusTone({ status: r.status })}>{r.status}</Tag>
           ),
         },
-        { title: 'Scanned', dataIndex: 'objects_scanned', width: 80 },
-        { title: 'Processed', dataIndex: 'objects_processed', width: 90 },
+        {
+          title: <span title="Objects listed from the source bucket">Scanned</span>,
+          dataIndex: 'objects_scanned',
+          width: 80,
+        },
+        {
+          title: <span title="Objects copied to the destination">Copied</span>,
+          dataIndex: 'objects_processed',
+          width: 80,
+        },
+        {
+          title: <span title="Already in sync — present on destination, nothing to copy">Skipped</span>,
+          dataIndex: 'objects_skipped',
+          width: 80,
+        },
         { title: 'Errors', dataIndex: 'errors', width: 70 },
       ]}
     />
