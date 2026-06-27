@@ -111,7 +111,7 @@ reference = seekable temp file; delta output is small + capped).
   override = stream GET body to file. Reference cache becomes path-aware above
   `DGP_REFERENCE_INLINE_MAX`; small refs stay in RAM (common case).
 
-### Phase 3 — GET: decode-to-spool + streaming response (blocks 2,5,6)
+### Phase 3 — GET: decode-to-spool + streaming response (blocks 2,5,6) — ✅ DONE (commit c8d18f2)
 - New `retrieve_delta_spooled` + `RetrieveResponse::SpooledFile { spool, metadata, cache_hit }`.
 - Flow: acquire permit+spool → get_reference_to_file → spawn_blocking
   `decode_to_writer(ref, delta, tee(spool, sha256))` → **compare hash to
