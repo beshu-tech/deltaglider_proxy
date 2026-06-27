@@ -56,8 +56,8 @@ export interface SidebarEntry {
 }
 
 /**
- * The 7-group / 15-leaf IA — one group per control domain (see
- * docs/plan/admin-ui-taxonomy.md): Overview, Diagnostics, Access,
+ * The 8-group / 15-leaf IA — one group per control domain (see
+ * docs/plan/admin-ui-taxonomy.md): Overview, Diagnostics, Logs, Access,
  * Storage, Jobs, Integrations, System. No parent/overview pages: every
  * entry is a destination.
  */
@@ -84,6 +84,17 @@ export const ADMIN_IA: Array<{ group: string; entries: SidebarEntry[] }> = [
           'Replay a synthetic request against the admission chain and see which rule fires.',
       },
       {
+        path: 'diagnostics/delta-efficiency',
+        label: 'Delta efficiency',
+        icon: <ThunderboltOutlined />,
+        description: 'Find prefixes where the delta baseline is underperforming.',
+      },
+    ],
+  },
+  {
+    group: 'Logs',
+    entries: [
+      {
         path: 'diagnostics/audit',
         label: 'Audit log',
         icon: <FileTextOutlined />,
@@ -91,15 +102,9 @@ export const ADMIN_IA: Array<{ group: string; entries: SidebarEntry[] }> = [
       },
       {
         path: 'diagnostics/logs',
-        label: 'Logs',
+        label: 'System logs',
         icon: <ProfileOutlined />,
         description: 'Live tail + filter of the proxy operational logs (INFO+).',
-      },
-      {
-        path: 'diagnostics/delta-efficiency',
-        label: 'Delta efficiency',
-        icon: <ThunderboltOutlined />,
-        description: 'Find prefixes where the delta baseline is underperforming.',
       },
     ],
   },
