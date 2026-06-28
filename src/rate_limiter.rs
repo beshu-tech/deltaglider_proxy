@@ -336,7 +336,7 @@ fn should_keep_entry(
 /// `aws:SourceIp` IAM conditions. The connection peer IP is always available
 /// via `ConnectInfo<SocketAddr>` (see `extract_client_ip_with_peer`), so per-IP
 /// rate limiting works regardless of this setting.
-pub(crate) fn trust_proxy_headers() -> bool {
+pub fn trust_proxy_headers() -> bool {
     crate::config::env_bool("DGP_TRUST_PROXY_HEADERS", false)
 }
 

@@ -599,11 +599,11 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // --- Proxy header trust ---
+    // Raw read ONLY for the unset-vs-set log distinction; the truth value comes
+    // from the canonical parse so the banner can't disagree with the runtime
+    // (which also accepts yes/on via env_bool).
     let trust_proxy_explicit = std::env::var("DGP_TRUST_PROXY_HEADERS").ok();
-    let trust_proxy = trust_proxy_explicit
-        .as_deref()
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false); // default false — secure-by-default, see rate_limiter::trust_proxy_headers()
+    let trust_proxy = deltaglider_proxy::rate_limiter::trust_proxy_headers();
     if trust_proxy {
         info!("  Proxy headers: trusted (DGP_TRUST_PROXY_HEADERS=true) — X-Forwarded-For/X-Real-IP used for rate limiting and aws:SourceIp");
     } else if trust_proxy_explicit.is_none() {
