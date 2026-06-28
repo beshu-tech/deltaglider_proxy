@@ -166,10 +166,19 @@ export default function JobDrawer({
           )}
           {entries.map(([k, v]) => (
             <div key={k} style={{ display: 'flex', gap: 12, padding: '6px 0' }}>
-              <Text type="secondary" style={{ width: 90, fontSize: 12 }}>
+              <Text type="secondary" style={{ width: 90, flexShrink: 0, fontSize: 12 }}>
                 {k}
               </Text>
-              <Text style={{ fontFamily: 'var(--font-mono)', fontSize: 13 }}>{v}</Text>
+              <Text
+                style={{
+                  fontFamily: 'var(--font-mono)',
+                  fontSize: 13,
+                  wordBreak: 'break-word',
+                  minWidth: 0,
+                }}
+              >
+                {v}
+              </Text>
             </div>
           ))}
         </div>
@@ -185,8 +194,13 @@ export default function JobDrawer({
       size="small"
       pagination={false}
       locale={{ emptyText: 'No runs yet' }}
+      scroll={{ x: 'max-content' }}
       columns={[
-        { title: 'Started', render: (_: unknown, r) => <TimeAgo ts={r.started_at} /> },
+        {
+          title: 'Started',
+          width: 92,
+          render: (_: unknown, r) => <TimeAgo ts={r.started_at} />,
+        },
         {
           title: <span title="What triggered this run">By</span>,
           dataIndex: 'triggered_by',
@@ -203,7 +217,7 @@ export default function JobDrawer({
         },
         {
           title: 'Status',
-          width: 100,
+          width: 92,
           render: (_: unknown, r) => (
             <Tag color={jobStatusTone({ status: r.status })}>
               {jobStatusLabel({ status: r.status })}
@@ -212,6 +226,7 @@ export default function JobDrawer({
         },
         {
           title: <span title="green = copied · red = errors · blank = skipped (already in sync). Number = copied.">Progress</span>,
+          width: 150,
           render: (_: unknown, r) => (
             <RunProgressBar
               scanned={r.objects_scanned}
@@ -232,21 +247,40 @@ export default function JobDrawer({
       size="small"
       pagination={false}
       locale={{ emptyText: 'No recorded failures' }}
+      scroll={{ x: 'max-content' }}
       columns={[
-        { title: 'When', width: 160, render: (_: unknown, f) => <TimeAgo ts={f.occurred_at} /> },
+        { title: 'When', width: 96, render: (_: unknown, f) => <TimeAgo ts={f.occurred_at} /> },
         {
           title: 'Object',
-          render: (_: unknown, f) => (
-            <Text style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>
-              {f.bucket ? `${f.bucket}/` : ''}
-              {f.object_key || '(job-level)'}
-            </Text>
-          ),
+          width: 240,
+          render: (_: unknown, f) => {
+            const obj = `${f.bucket ? `${f.bucket}/` : ''}${f.object_key || '(job-level)'}`;
+            return (
+              <Text
+                title={obj}
+                ellipsis
+                style={{
+                  fontFamily: 'var(--font-mono)',
+                  fontSize: 12,
+                  maxWidth: 240,
+                  display: 'block',
+                }}
+              >
+                {obj}
+              </Text>
+            );
+          },
         },
         {
           title: 'Error',
+          width: 280,
           render: (_: unknown, f) => (
-            <Text type="danger" style={{ fontSize: 12 }}>
+            <Text
+              type="danger"
+              title={f.error}
+              ellipsis
+              style={{ fontSize: 12, maxWidth: 280, display: 'block' }}
+            >
               {f.error}
             </Text>
           ),
@@ -259,7 +293,7 @@ export default function JobDrawer({
     <Drawer
       open={!!jobId}
       onClose={onClose}
-      width={640}
+      width="min(640px, 100vw)"
       title={
         serverRow ? (
           <span>

@@ -29,12 +29,18 @@ export default function RunProgressBar({
   const greenPct = acted === 0 ? 100 : (copied / acted) * 100;
   const redPct = acted === 0 ? 0 : (errors / acted) * 100;
 
+  const label =
+    copied.toLocaleString() +
+    ' copied' +
+    (errors > 0 ? ` · ${errors.toLocaleString()} error${errors === 1 ? '' : 's'}` : '');
+
   return (
     <div
       title={title}
       style={{
         position: 'relative',
         height: 18,
+        minWidth: 90,
         borderRadius: 4,
         overflow: 'hidden',
         background: c.BORDER,
@@ -55,20 +61,19 @@ export default function RunProgressBar({
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',
-          gap: 6,
+          padding: '0 6px',
           fontSize: 11,
           fontWeight: 600,
           fontVariantNumeric: 'tabular-nums',
           color: acted === 0 ? c.TEXT_SECONDARY : '#0a0f1c',
           pointerEvents: 'none',
+          // Clip to the pill — a squeezed cell must NOT bleed text into siblings.
+          whiteSpace: 'nowrap',
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
         }}
       >
-        <span>{copied.toLocaleString()} copied</span>
-        {errors > 0 && (
-          <span style={{ color: '#0a0f1c' }}>
-            · {errors.toLocaleString()} error{errors === 1 ? '' : 's'}
-          </span>
-        )}
+        {label}
       </span>
     </div>
   );
