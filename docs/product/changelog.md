@@ -8,7 +8,84 @@ Every released version of DeltaGlider Proxy, newest first. Versions
 follow [semantic versioning](https://semver.org/); the Docker image
 `beshultd/deltaglider_proxy:<version>` is published for each tag.
 
-_Last updated: 2026-06-28_
+_Last updated: 2026-06-29_
+
+## v1.8.0 — 2026-06-29
+
+### Security
+
+- **Spoofable client IP via `X-Forwarded-For` is now gated behind a trusted-proxy
+  allow-list.** When `DGP_TRUST_PROXY_HEADERS=true` (the documented reverse-proxy
+  setup), the proxy previously trusted the first `X-Forwarded-For` element
+  verbatim — letting any client forge the IP used for `aws:SourceIp` IAM
+  conditions and admission `source_ip` rules. The new `DGP_TRUSTED_PROXY_CIDRS`
+  lets you list the CIDRs of your real proxies; `X-Forwarded-For` is then honored
+  **only** from a trusted peer and parsed right-to-left (the rightmost
+  non-trusted hop is the real client). Default behavior is unchanged
+  (`DGP_TRUST_PROXY_HEADERS=false` still ignores the header); operators behind a
+  proxy should set the CIDR list to close the spoofing window.
+- **SSRF guard now resolves DNS.** Outbound URLs (OIDC issuer/JWKS/token,
+  webhooks) were checked only as literal IPs, so a hostname whose DNS record
+  pointed at `169.254.169.254` or a private range passed. A connect-time resolver
+  on the OIDC and webhook clients now re-checks the **resolved** address and
+  fails closed. Note: an OIDC issuer or webhook on a private/internal address is
+  now rejected — set it to a publicly-resolvable host, or reach out if you need
+  an internal-network escape hatch.
+
+### Added
+
+- **Replication "Verify" (parity audit) is now a fast, server-side background
+  job.** Verifying that a replication mirror is byte-identical used to run
+  synchronously in the request (HEAD-per-object every time) and lived only in the
+  browser — navigating away recomputed it from scratch. It now runs as a
+  background job whose result is **persisted server-side** (survives navigation
+  and proxy restart), with a **persistent per-object cache** so re-verify is
+  HEAD-free, plus **live progress** and a **Cancel** button. Exposed at
+  `GET/POST /_/api/admin/jobs/:id/verify` (+ `/verify/cancel`).
+- **Readiness probe at `/_/ready`.** `/_/health` is now liveness-only (fast, no
+  I/O) and honest about it; the new `/_/ready` actually probes the storage
+  backend (bounded by a 3s timeout) and the config DB, returning `503` when not
+  ready. Point your load balancer's readiness check at `/_/ready`.
+- **Multi-instance / HA contract is documented.** `CLAUDE.md` now states plainly
+  which planes are shared across instances (IAM/OAuth via the S3-synced DB,
+  background-job leases) versus instance-local (sessions, multipart uploads,
+  metadata cache, rate limiter), plus the hard prerequisites for running behind a
+  load balancer. See also `docs/plan/architecture-ha-audit-2026-06-28.md`.
+
+### Fixed
+
+- **Multi-instance config sync no longer clobbers in-flight job state.** The
+  encrypted config DB sync replaced the **whole** SQLCipher file on every
+  download — wiping this node's per-node coordination state (replication /
+  lifecycle / maintenance job cursors and leases, the event outbox, listener
+  cursors) along with the IAM tables it was meant to share. The sync now merges
+  **only** the IAM tables out of a peer's DB, leaving coordination state intact,
+  so background jobs and event-driven replication stay consistent across a synced
+  fleet. A schema-version guard skips the merge during a rolling upgrade rather
+  than risk a column mismatch, and the sync ETag only advances on a successful
+  merge (a failed merge retries on the next poll).
+- **`CompleteMultipartUpload` on the wrong instance now explains itself.**
+  Multipart upload state is per-instance; behind a non-sticky load balancer a
+  part/complete landing on a different node than the create returned a bare
+  `NoSuchUpload`. The error message now names the per-instance cause and points
+  at sticky sessions (the S3 error code is unchanged for client compatibility).
+- **Startup banner no longer disagrees with the runtime on proxy-header trust.**
+  The banner parsed `DGP_TRUST_PROXY_HEADERS` as a narrower set than the runtime
+  (`yes`/`on` logged "untrusted" while the runtime trusted them); both now use
+  the same parser.
+
+### Changed
+
+- **The storage backend's streaming memory bound is now enforced by the type
+  system.** `get_passthrough_stream` / `get_passthrough_stream_range` had
+  buffering fallbacks that a backend could silently inherit (defeating the
+  memory bound for large ranged GETs); they are now required methods. No
+  behavior change for the built-in filesystem and S3 backends.
+- **Internal hardening + test-determinism:** typed config-apply pipeline shared
+  by the backup-restore path, replication run/event version counters that replace
+  sleep-based test waits, `parse_copy_range` unit + property tests, and a shared
+  `RunLease` type. The Jobs admin tables also render consistently across mobile
+  and desktop.
 
 ## v1.7.0 — 2026-06-28
 
