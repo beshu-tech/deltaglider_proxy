@@ -1727,7 +1727,23 @@ fn engine_error_to_s3s(err: impl Into<crate::api::S3Error>) -> s3s::S3Error {
         crate::api::S3Error::EntityTooLarge { .. } => s3s::s3_error!(EntityTooLarge),
         crate::api::S3Error::InvalidArgument(msg) => s3s::s3_error!(InvalidArgument, "{}", msg),
         crate::api::S3Error::InvalidRequest(msg) => s3s::s3_error!(InvalidRequest, "{}", msg),
-        crate::api::S3Error::NoSuchUpload(_) => s3s::s3_error!(NoSuchUpload),
+        crate::api::S3Error::NoSuchUpload(id) => {
+            // Multipart upload state is in-memory and PER-INSTANCE. Behind a
+            // non-sticky load balancer, an UploadPart/Complete that lands on a
+            // different node than CreateMultipartUpload sees no such upload —
+            // indistinguishable, to the client, from a genuinely-missing id. The
+            // proxy can't tell the two apart, so we don't warn (would spam
+            // single-instance logs on legitimate retries-after-abort), but we DO
+            // enrich the client-visible message so an operator behind an LB has a
+            // pointer instead of a bare NoSuchUpload. debug-level for diagnosis.
+            tracing::debug!("NoSuchUpload for upload_id={id} (multipart state is per-instance)");
+            s3s::s3_error!(
+                NoSuchUpload,
+                "the upload id is unknown to this instance; multipart upload state is \
+                 per-instance — behind a load balancer, pin multipart requests to one \
+                 node (sticky sessions)"
+            )
+        }
         crate::api::S3Error::InvalidPart(msg) => s3s::s3_error!(InvalidPart, "{}", msg),
         crate::api::S3Error::InvalidPartOrder => s3s::s3_error!(InvalidPartOrder),
         crate::api::S3Error::InvalidBucketName(msg) => {
