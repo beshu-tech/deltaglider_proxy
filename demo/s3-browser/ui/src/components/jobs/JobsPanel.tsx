@@ -15,7 +15,7 @@
  * have no dirty state, just live progress + cancel.
  */
 import { useCallback, useMemo, useState } from 'react';
-import { Alert, Button, Dropdown, Progress, Space, Spin, Table, Tag, Typography, message } from 'antd';
+import { Alert, Button, Dropdown, Space, Spin, Tag, Typography, message } from 'antd';
 import {
   CaretRightOutlined,
   EyeOutlined,
@@ -34,16 +34,16 @@ import {
   jobStatusTone,
   kindLabel,
   mergeDraftRules,
-  progressLabel,
   triggerLabel,
 } from '../../jobsView';
 import { qk } from '../../queries/keys';
 import { useJobs } from '../../queries/jobs';
 import TimeAgo from '../TimeAgo';
+import RecordList, { type RecordColumn } from './RecordList';
+import OutcomeMeter from './OutcomeMeter';
 import { useSectionEditor } from '../../useSectionEditor';
 import { useApplyHandler } from '../../useDirtySection';
 import { useCardStyles } from '../shared-styles';
-import { useColors } from '../../ThemeContext';
 import ApplyDialog from '../ApplyDialog';
 import StickyDirtyBar from '../StickyDirtyBar';
 import SectionHeader from '../SectionHeader';
@@ -88,7 +88,6 @@ const ACTION_META: Record<
 };
 
 export default function JobsPanel({ onSessionExpired }: Props) {
-  const colors = useColors();
   const { cardStyle, inputRadius } = useCardStyles();
   const qc = useQueryClient();
   const [messageApi, msgCtx] = message.useMessage();
@@ -252,16 +251,17 @@ export default function JobsPanel({ onSessionExpired }: Props) {
     },
   };
 
-  const columns = [
+  const columns: RecordColumn<JobDisplayRow>[] = [
     {
-      title: 'Job',
       key: 'job',
-      render: (_: unknown, d: JobDisplayRow) => (
-        <Space size={8}>
+      label: 'Job',
+      track: 'minmax(0,1.4fr)',
+      render: (d) => (
+        <Space size={8} wrap>
           <Tag color={d.row.kind === 'replication' ? 'blue' : d.row.kind === 'lifecycle' ? 'purple' : 'gold'}>
             {kindLabel(d.row.kind)}
           </Tag>
-          <Text strong style={{ fontFamily: 'var(--font-mono)', fontSize: 13, whiteSpace: 'nowrap' }}>
+          <Text strong style={{ fontFamily: 'var(--font-mono)', fontSize: 13 }}>
             {d.row.name}
           </Text>
           {d.draft && <Tag color="warning">draft — not applied</Tag>}
@@ -270,10 +270,11 @@ export default function JobsPanel({ onSessionExpired }: Props) {
       ),
     },
     {
-      title: 'Scope',
       key: 'scope',
-      render: (_: unknown, d: JobDisplayRow) => (
-        <Text type="secondary" style={{ fontFamily: 'var(--font-mono)', fontSize: 12, wordBreak: 'normal' }}>
+      label: 'Scope',
+      track: 'minmax(0,1.2fr)',
+      render: (d) => (
+        <Text type="secondary" style={{ fontFamily: 'var(--font-mono)', fontSize: 12, wordBreak: 'break-word' }}>
           {d.row.scope.bucket}
           {d.row.scope.prefix ? `/${d.row.scope.prefix}` : ''}
           {d.row.scope.target ? ` → ${d.row.scope.target}` : ''}
@@ -281,41 +282,39 @@ export default function JobsPanel({ onSessionExpired }: Props) {
       ),
     },
     {
-      title: 'Trigger',
       key: 'trigger',
-      width: 110,
-      render: (_: unknown, d: JobDisplayRow) => (
+      label: 'Trigger',
+      track: 'max-content',
+      render: (d) => (
         <Text type="secondary" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
           {triggerLabel(d.row.trigger)}
         </Text>
       ),
     },
     {
-      title: 'Status',
       key: 'status',
-      width: 220,
-      render: (_: unknown, d: JobDisplayRow) => {
+      label: 'Status',
+      track: 'minmax(0,1.4fr)',
+      render: (d) => {
         const live = d.row.trigger === 'oneoff' && (d.row.status === 'running' || d.row.status === 'cancelling' || d.row.status === 'queued');
         return (
-          <div>
-            <Tag color={jobStatusTone(d.row)}>{jobStatusLabel(d.row)}</Tag>
-            {live && (
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
-                <Progress
-                  percent={d.row.percent ?? 100}
-                  status="active"
-                  showInfo={d.row.percent != null}
-                  size="small"
-                  strokeColor={colors.ACCENT_AMBER}
-                  style={{ margin: 0, width: 120 }}
-                />
-                <Text type="secondary" style={{ fontSize: 11, whiteSpace: 'nowrap' }}>
-                  {progressLabel(d.row)}
-                </Text>
-              </div>
+          <div style={{ minWidth: 0 }}>
+            {live ? (
+              <OutcomeMeter
+                scanned={d.row.progress.processed + d.row.progress.skipped + d.row.progress.failed}
+                copied={d.row.progress.processed}
+                errors={d.row.progress.failed}
+                skipped={d.row.progress.skipped}
+                status={d.row.status}
+                percent={d.row.percent ?? null}
+              />
+            ) : (
+              <Tag color={jobStatusTone(d.row)} style={{ margin: 0 }}>
+                {jobStatusLabel(d.row)}
+              </Tag>
             )}
             {!live && d.row.last_error && (
-              <Text type="danger" style={{ display: 'block', fontSize: 11, maxWidth: 200 }} ellipsis>
+              <Text type="danger" style={{ display: 'block', fontSize: 11, marginTop: 2 }} ellipsis title={d.row.last_error}>
                 {d.row.last_error}
               </Text>
             )}
@@ -324,24 +323,28 @@ export default function JobsPanel({ onSessionExpired }: Props) {
       },
     },
     {
-      title: 'Last run',
       key: 'last',
-      width: 130,
-      render: (_: unknown, d: JobDisplayRow) => {
+      label: 'Last run',
+      track: 'max-content',
+      render: (d) => {
         const ts = d.row.last_run_at ?? d.row.finished_at ?? d.row.started_at;
         return (
-          <Text type="secondary" style={{ fontSize: 12 }}>
+          <Text type="secondary" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
             <TimeAgo ts={ts} />
           </Text>
         );
       },
     },
     {
-      title: '',
       key: 'actions',
-      width: 200,
-      render: (_: unknown, d: JobDisplayRow) =>
-        d.draft ? null : (
+      label: 'Actions',
+      track: 'max-content',
+      align: 'end',
+      hideLabelOnNarrow: true,
+      render: (d) =>
+        d.draft ? (
+          <span />
+        ) : (
           <Space size={4} onClick={(e) => e.stopPropagation()}>
             {availableActions(d.row).map((a) => (
               <Button
@@ -422,22 +425,15 @@ export default function JobsPanel({ onSessionExpired }: Props) {
             message={jobsQuery.error instanceof Error ? jobsQuery.error.message : 'Failed to load jobs'}
           />
         ) : (
-          <Table<JobDisplayRow>
-            style={{ marginTop: 16 }}
-            dataSource={displayRows}
-            columns={columns}
-            rowKey={(d) => d.row.id}
-            pagination={false}
-            size="small"
-            onRow={(d) => ({
-              onClick: () => setDrawerJobId(d.row.id),
-              style: { cursor: 'pointer' },
-            })}
-            locale={{
-              emptyText:
-                'No jobs yet. Use "New job" to add a replication or lifecycle rule, or start a one-off re-encrypt or migrate job.',
-            }}
-          />
+          <div style={{ marginTop: 16 }}>
+            <RecordList
+              rows={displayRows}
+              columns={columns}
+              rowKey={(d) => d.row.id}
+              onRowClick={(d) => setDrawerJobId(d.row.id)}
+              empty='No jobs yet. Use "New job" to add a replication or lifecycle rule, or start a one-off re-encrypt or migrate job.'
+            />
+          </div>
         )}
       </div>
 

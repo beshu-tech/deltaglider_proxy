@@ -349,3 +349,93 @@ export function mergeDraftRules(
   }
   return out;
 }
+
+// ── Outcome meter (the calm-by-default run-result visual) ─────────────────
+export type MeterState = 'in-sync' | 'copied' | 'errors' | 'mixed' | 'running' | 'idle';
+
+export interface OutcomeMeterInput {
+  scanned: number;
+  copied: number;
+  errors: number;
+  skipped: number;
+  status: string;
+  /** Live percent for a running run; null/undefined = unknown (indeterminate). */
+  percent?: number | null;
+}
+
+export interface MeterView {
+  state: MeterState;
+  greenPct: number;
+  redPct: number;
+  dot: 'green' | 'red' | 'amber' | 'muted';
+  label: string;
+  aria: string;
+}
+
+/** PURE: the whole meter is a function of a run's numbers + status. Color is an
+ *  attention budget — the dominant all-skipped "in sync" case stays calm, and
+ *  saturated green/red is spent only on work that happened or failed. */
+export function deriveMeter(p: OutcomeMeterInput): MeterView {
+  const { scanned, copied, errors, skipped, status, percent } = p;
+  const acted = copied + errors;
+  const running = status === 'running' || status === 'queued' || status === 'cancelling';
+
+  const aria =
+    `${scanned.toLocaleString()} scanned, ${copied.toLocaleString()} copied, ` +
+    `${skipped.toLocaleString()} skipped (already in sync), ` +
+    `${errors.toLocaleString()} error${errors === 1 ? '' : 's'}` +
+    `; status ${jobStatusLabel({ status })}`;
+
+  if (running) {
+    const known = percent != null;
+    return {
+      state: 'running',
+      greenPct: known ? Math.max(0, Math.min(100, percent)) : 0,
+      redPct: 0,
+      dot: 'amber',
+      label: known
+        ? `running · ${copied.toLocaleString()} copied${errors > 0 ? ` · ${errors.toLocaleString()} err` : ''}`
+        : `running · ${copied.toLocaleString()} copied…`,
+      aria,
+    };
+  }
+  if (status === 'cancelled') {
+    return { state: 'idle', greenPct: 0, redPct: 0, dot: 'muted', label: 'cancelled', aria };
+  }
+  if (status === 'failed' && acted === 0) {
+    return { state: 'errors', greenPct: 0, redPct: 100, dot: 'red', label: 'failed', aria };
+  }
+  if (acted === 0) {
+    return {
+      state: 'in-sync',
+      greenPct: 0,
+      redPct: 0,
+      dot: 'muted',
+      label: scanned === 0 ? 'no objects' : 'in sync',
+      aria,
+    };
+  }
+  const greenPct = (copied / acted) * 100;
+  const redPct = (errors / acted) * 100;
+  if (errors > 0 && copied > 0) {
+    return {
+      state: 'mixed',
+      greenPct,
+      redPct,
+      dot: 'red',
+      label: `${copied.toLocaleString()} copied · ${errors.toLocaleString()} err`,
+      aria,
+    };
+  }
+  if (errors > 0) {
+    return {
+      state: 'errors',
+      greenPct,
+      redPct,
+      dot: 'red',
+      label: `${errors.toLocaleString()} error${errors === 1 ? '' : 's'}`,
+      aria,
+    };
+  }
+  return { state: 'copied', greenPct, redPct, dot: 'green', label: `${copied.toLocaleString()} copied`, aria };
+}

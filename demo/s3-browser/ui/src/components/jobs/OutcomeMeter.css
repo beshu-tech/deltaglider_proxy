@@ -1,0 +1,81 @@
+/* Outcome meter: [dot] [proportional track] [label]. Colors are injected as
+   CSS custom props from useColors() — this file owns layout only. */
+.dg-meter {
+  display: grid;
+  grid-template-columns: auto minmax(28px, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  container-type: inline-size;
+  container-name: meter;
+}
+
+.dg-meter-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.dg-meter-dot[data-dot='green'] { background: var(--m-green); }
+.dg-meter-dot[data-dot='red'] { background: var(--m-red); }
+.dg-meter-dot[data-dot='amber'] { background: var(--m-amber); }
+.dg-meter-dot[data-dot='muted'] { background: var(--m-track); }
+
+.dg-meter-track {
+  position: relative;
+  height: 8px;
+  min-width: 28px;
+  border-radius: 999px;
+  overflow: hidden;
+  display: flex;
+  background: var(--m-track);
+}
+/* Calm: in-sync / cancelled tracks are the muted border color, ghosted. */
+.dg-meter[data-state='in-sync'] .dg-meter-track,
+.dg-meter[data-state='idle'] .dg-meter-track {
+  opacity: 0.45;
+}
+
+.dg-meter-seg { height: 100%; }
+.dg-meter-green { width: var(--m-green-pct); background: var(--m-green); }
+.dg-meter-red { width: var(--m-red-pct); background: var(--m-red); }
+
+/* Running with unknown percent: amber indeterminate shimmer. */
+.dg-meter-indeterminate {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, var(--m-amber), transparent);
+  opacity: 0.5;
+  animation: dg-meter-slide 1.4s ease-in-out infinite;
+}
+@keyframes dg-meter-slide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .dg-meter-indeterminate { animation: none; }
+}
+
+.dg-meter-label {
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  color: var(--m-text-muted);
+}
+/* Loud states get full-strength text; calm states stay muted. */
+.dg-meter[data-state='copied'] .dg-meter-label,
+.dg-meter[data-state='errors'] .dg-meter-label,
+.dg-meter[data-state='mixed'] .dg-meter-label,
+.dg-meter[data-state='running'] .dg-meter-label {
+  color: var(--m-text);
+}
+
+/* Extreme narrow: drop the track, keep dot + label so the number still reads. */
+@container meter (max-width: 120px) {
+  .dg-meter { grid-template-columns: auto 1fr; }
+  .dg-meter-track { display: none; }
+}

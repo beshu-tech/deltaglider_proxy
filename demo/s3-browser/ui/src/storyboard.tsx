@@ -7,7 +7,7 @@ import { useState } from 'react';
 import ThemeProvider from './ThemeProvider';
 import { useColors } from './ThemeContext';
 import { ParityResult } from './components/jobs/VerifyTab';
-import RunProgressBar from './components/jobs/RunProgressBar';
+import OutcomeMeter from './components/jobs/OutcomeMeter';
 import type {
   ActionableSummary,
   ParityOutcome,
@@ -265,11 +265,13 @@ function Storyboard() {
                 </div>
               </td>
               <td style={{ width: 220 }}>
-                <RunProgressBar
+                <OutcomeMeter
                   scanned={r.scanned}
                   copied={r.copied}
                   errors={r.errors}
                   skipped={r.skipped}
+                  status={r.status}
+                  percent={r.percent}
                 />
               </td>
             </tr>
@@ -280,14 +282,25 @@ function Storyboard() {
   );
 }
 
-/** RunProgressBar fixtures — real-shaped cases (incremental mirror, failures,
- *  a balanced copy) so the work-done scaling is visibly legible. */
-const RUN_BAR_CASES = [
-  { label: 'Incremental run (all in sync)', scanned: 3400, copied: 7, errors: 0, skipped: 3393 },
-  { label: 'One transient error', scanned: 4100, copied: 10, errors: 1, skipped: 4089 },
-  { label: 'Nothing copied, one error', scanned: 100, copied: 0, errors: 1, skipped: 99 },
-  { label: 'Large incremental', scanned: 12300, copied: 70, errors: 1, skipped: 12229 },
-  { label: 'Balanced copy (60/40)', scanned: 200, copied: 120, errors: 80, skipped: 0 },
+/** OutcomeMeter fixtures — real-shaped cases across the calm→loud spectrum so
+ *  the attention-budget treatment (quiet in-sync vs loud error) is legible. */
+const RUN_BAR_CASES: Array<{
+  label: string;
+  scanned: number;
+  copied: number;
+  errors: number;
+  skipped: number;
+  status: string;
+  percent?: number | null;
+}> = [
+  { label: 'Incremental (all in sync)', scanned: 3400, copied: 0, errors: 0, skipped: 3400, status: 'succeeded' },
+  { label: 'Copied a few', scanned: 3400, copied: 7, errors: 0, skipped: 3393, status: 'succeeded' },
+  { label: 'One transient error', scanned: 4100, copied: 10, errors: 1, skipped: 4089, status: 'succeeded' },
+  { label: 'Failed, nothing copied', scanned: 58, copied: 0, errors: 58, skipped: 0, status: 'failed' },
+  { label: 'Balanced copy (60/40)', scanned: 200, copied: 120, errors: 80, skipped: 0, status: 'succeeded' },
+  { label: 'Running (known %)', scanned: 1000, copied: 400, errors: 0, skipped: 0, status: 'running', percent: 40 },
+  { label: 'Running (unknown %)', scanned: 0, copied: 120, errors: 0, skipped: 0, status: 'running', percent: null },
+  { label: 'Cancelled', scanned: 500, copied: 30, errors: 0, skipped: 470, status: 'cancelled' },
 ];
 
 ReactDOM.createRoot(document.getElementById('root')!).render(

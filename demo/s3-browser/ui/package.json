@@ -50,6 +50,7 @@
     "test:dropped-files": "node scripts/dropped-files-regression-test.mjs",
     "test:maintenance-status": "node scripts/maintenance-status-regression-test.mjs",
     "test:jobs-view": "node scripts/jobs-view-regression-test.mjs",
+    "test:outcome-meter": "node scripts/outcome-meter-regression-test.mjs",
     "test:admin-path-remap": "node scripts/admin-path-remap-regression-test.mjs",
     "test:destination-suggest": "node scripts/destination-suggest-regression-test.mjs",
     "test:hero-number-size": "node scripts/hero-number-size-regression-test.mjs",

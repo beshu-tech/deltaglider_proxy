@@ -4,8 +4,7 @@
  */
 import { useEffect, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Alert, Drawer, Empty, Table, Tabs, Tag, Typography } from 'antd';
-import { ClockCircleOutlined } from '@ant-design/icons';
+import { Alert, Drawer, Empty, Tabs, Tag, Typography } from 'antd';
 import { useColors } from '../../ThemeContext';
 import type { LifecycleConfig, ReplicationConfig } from '../../adminApi';
 import type { JobRow } from '../../jobsView';
@@ -13,7 +12,8 @@ import { isActiveJobStatus, jobStatusLabel, jobStatusTone, kindLabel, parseJobId
 import { qk } from '../../queries/keys';
 import { useJobFailures, useJobRuns } from '../../queries/jobs';
 import TimeAgo from '../TimeAgo';
-import RunProgressBar from './RunProgressBar';
+import RecordList from './RecordList';
+import OutcomeMeter from './OutcomeMeter';
 import ReplicationRuleFields from '../ReplicationRuleFields';
 import LifecycleRuleFields from '../LifecycleRuleFields';
 import VerifyTab from './VerifyTab';
@@ -88,6 +88,8 @@ export default function JobDrawer({
             objects_processed: serverRow.progress.processed,
             objects_skipped: serverRow.progress.skipped,
             errors: serverRow.progress.failed,
+            // Carry live percent so the running run's meter fills (null = unknown).
+            __percent: serverRow.percent ?? null,
           }
         : r,
     );
@@ -188,51 +190,42 @@ export default function JobDrawer({
   })();
 
   const runsTable = (
-    <Table
-      dataSource={liveRuns}
-      rowKey="id"
-      size="small"
-      pagination={false}
-      locale={{ emptyText: 'No runs yet' }}
-      scroll={{ x: 'max-content' }}
+    <RecordList
+      rows={liveRuns}
+      rowKey={(r) => String(r.id)}
+      empty="No runs yet"
       columns={[
         {
-          title: 'Started',
-          width: 92,
-          render: (_: unknown, r) => <TimeAgo ts={r.started_at} />,
-        },
-        {
-          title: <span title="What triggered this run">By</span>,
-          dataIndex: 'triggered_by',
-          width: 48,
-          align: 'center' as const,
-          render: (by: string) =>
-            by === 'scheduler' ? (
-              <ClockCircleOutlined title="scheduler" style={{ color: c.TEXT_MUTED }} />
-            ) : (
-              <span title={by} style={{ fontSize: 12 }}>
-                {by}
+          key: 'started',
+          label: 'Started',
+          track: 'max-content',
+          render: (r) => (
+            <span style={{ whiteSpace: 'nowrap' }}>
+              {/* "By" folded in as a leading glyph: ⏱ scheduler / ▸ manual. */}
+              <span
+                title={r.triggered_by === 'scheduler' ? 'scheduler' : r.triggered_by}
+                aria-label={r.triggered_by === 'scheduler' ? 'scheduled' : 'manual run'}
+                style={{ color: c.TEXT_MUTED, marginRight: 4 }}
+              >
+                {r.triggered_by === 'scheduler' ? '⏱' : '▸'}
               </span>
-            ),
-        },
-        {
-          title: 'Status',
-          width: 92,
-          render: (_: unknown, r) => (
-            <Tag color={jobStatusTone({ status: r.status })}>
-              {jobStatusLabel({ status: r.status })}
-            </Tag>
+              <TimeAgo ts={r.started_at} />
+            </span>
           ),
         },
         {
-          title: <span title="green = copied · red = errors · blank = skipped (already in sync). Number = copied.">Progress</span>,
-          width: 150,
-          render: (_: unknown, r) => (
-            <RunProgressBar
+          key: 'meter',
+          label: 'Outcome',
+          track: 'minmax(0,1fr)',
+          hideLabelOnNarrow: true,
+          render: (r) => (
+            <OutcomeMeter
               scanned={r.objects_scanned}
               copied={r.objects_processed}
               errors={r.errors}
               skipped={r.objects_skipped}
+              status={r.status}
+              percent={'__percent' in r ? (r as { __percent: number | null }).__percent : null}
             />
           ),
         },
@@ -241,48 +234,42 @@ export default function JobDrawer({
   );
 
   const failuresTable = (
-    <Table
-      dataSource={failuresQuery.data?.failures ?? []}
-      rowKey="id"
-      size="small"
-      pagination={false}
-      locale={{ emptyText: 'No recorded failures' }}
-      scroll={{ x: 'max-content' }}
+    <RecordList
+      rows={failuresQuery.data?.failures ?? []}
+      rowKey={(f) => String(f.id)}
+      empty="No recorded failures"
       columns={[
-        { title: 'When', width: 96, render: (_: unknown, f) => <TimeAgo ts={f.occurred_at} /> },
         {
-          title: 'Object',
-          width: 240,
-          render: (_: unknown, f) => {
+          key: 'when',
+          label: 'When',
+          track: 'max-content',
+          render: (f) => (
+            <span style={{ whiteSpace: 'nowrap' }}>
+              <TimeAgo ts={f.occurred_at} />
+            </span>
+          ),
+        },
+        {
+          key: 'object',
+          label: 'Object',
+          track: 'minmax(0,1.2fr)',
+          render: (f) => {
             const obj = `${f.bucket ? `${f.bucket}/` : ''}${f.object_key || '(job-level)'}`;
             return (
-              <Text
-                title={obj}
-                ellipsis
-                style={{
-                  fontFamily: 'var(--font-mono)',
-                  fontSize: 12,
-                  maxWidth: 240,
-                  display: 'block',
-                }}
-              >
+              <span className="dg-fail-text" title={obj} style={{ fontFamily: 'var(--font-mono)' }}>
                 {obj}
-              </Text>
+              </span>
             );
           },
         },
         {
-          title: 'Error',
-          width: 280,
-          render: (_: unknown, f) => (
-            <Text
-              type="danger"
-              title={f.error}
-              ellipsis
-              style={{ fontSize: 12, maxWidth: 280, display: 'block' }}
-            >
+          key: 'error',
+          label: 'Error',
+          track: 'minmax(0,1.5fr)',
+          render: (f) => (
+            <span className="dg-fail-text" title={f.error} style={{ color: c.ACCENT_RED }}>
               {f.error}
-            </Text>
+            </span>
           ),
         },
       ]}

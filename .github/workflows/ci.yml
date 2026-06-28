@@ -666,6 +666,7 @@ jobs:
           npm run test:dropped-files
           npm run test:maintenance-status
           npm run test:jobs-view
+          npm run test:outcome-meter
           npm run test:admin-path-remap
           npm run test:destination-suggest
           npm run test:hero-number-size
