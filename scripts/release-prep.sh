@@ -165,5 +165,14 @@ if ! grep -qE '^## Unreleased$' "$CHANGELOG"; then
     err "CHANGELOG.md lost its Unreleased heading after stamp"
 fi
 
+# Regenerate the rendered changelog doc from the stamped CHANGELOG.md so the
+# release PR stays in parity with the CI gate (gen-changelog-doc.sh --check).
+# Without this, EVERY release PR fails the changelog-parity check and needs a
+# manual fix on the release branch — the recurring release gotcha.
+if [ -x "$ROOT/scripts/gen-changelog-doc.sh" ]; then
+    "$ROOT/scripts/gen-changelog-doc.sh" >/dev/null \
+        || err "gen-changelog-doc.sh failed after CHANGELOG stamp"
+fi
+
 # ── Output for the workflow to consume ──────────────────────────────
 echo "NEW_VERSION=$NEW_VERSION"
