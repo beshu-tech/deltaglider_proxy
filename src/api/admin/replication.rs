@@ -319,6 +319,10 @@ pub async fn verify(
     }
 
     // Detach the audit. It persists its own result + releases the lease.
+    // ponytail: this one-shot detached + select-heartbeat + catch_unwind + settle
+    // orchestration is the ONLY instance of its shape (lease primitives are already
+    // shared via config_db::job_store; maintenance is a different poll-loop shape).
+    // Don't extract a BackgroundJob driver until a genuine 2nd one-shot task lands.
     let engine = state.s3_state.engine.load().clone();
     let rule_clone = rule.clone();
     let db_for_task = db_arc.clone();

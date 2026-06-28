@@ -14,15 +14,14 @@ pub mod worker;
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
+pub use crate::background::RunLease;
 pub use planner::{
     compile_rule_globs, plan_object, Decision, PlanError, PlannedLifecycleAction, SkipReason,
 };
 pub use state_store::{
     LifecycleFailureRecord, LifecycleRunRecord, LifecycleRunTotals, LifecycleState,
 };
-pub use worker::{
-    preview_rule, run_rule, LifecycleFailure, LifecycleRunOutcome, PreviewObject, RunLease,
-};
+pub use worker::{preview_rule, run_rule, LifecycleFailure, LifecycleRunOutcome, PreviewObject};
 
 pub fn current_unix_seconds() -> i64 {
     std::time::SystemTime::now()

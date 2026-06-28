@@ -72,7 +72,31 @@ integration test waits deterministically instead of polling the status row.
 - ponytail: only ship the counter + ONE consumer (the test). No speculative
   endpoints beyond the one the test needs.
 
-### T4 — extract `BackgroundJob` / status-FSM abstraction (Arch#1) — LAST, reversible
+### T4 — OUTCOME: do NOT extract the abstraction (investigated, declined)
+
+Investigated for extraction; the honest finding is **there is nothing to
+extract yet**:
+- The genuine shared seam — lease acquire/renew/release, failure-ring prune,
+  zombie-scan — is ALREADY factored into `config_db/job_store.rs`. Parity's
+  `parity_try_acquire_lease`/`renew`/`release` delegate straight to
+  `job_store::*_leader_lease`, exactly like replication + maintenance.
+- What remains uniquely in parity's spawn is the ORCHESTRATION (one-shot
+  detached task + `tokio::select!` heartbeat + `catch_unwind` + settle). Grep
+  confirms this idiom has **exactly one instance** in the codebase
+  (`catch_unwind` appears only here + a usage_scanner TEST).
+- Maintenance is a different shape entirely: a persistent claim-drain-poll
+  loop (queue consumer) with heartbeats interleaved in multi-phase logic and a
+  deliberate non-settling `LEASE_LOST` path. Forcing it + parity into one
+  driver would gut maintenance's queue semantics or fake-queue parity — the
+  bad fit this plan explicitly said to refuse.
+
+A driver wrapping ONE caller is a one-implementation abstraction — barred by
+ponytail rung 1 (YAGNI) and the project's own CLAUDE.md anti-pattern list
+("no interface with one implementation"). **Revisit when a genuine 2nd
+one-shot-detached-leased task lands** (the reviewer's own "4th task" trigger).
+Recorded as a `ponytail:` note at the parity spawn so it isn't re-litigated.
+
+### (original T4 plan — superseded by the OUTCOME above) extract `BackgroundJob` / status-FSM abstraction
 Three async background flavours now exist: replication/lifecycle (scheduled,
 cursor+poison-token), maintenance (one-off, lease-aware requeue), parity
 (read-only audit, own FSM). The shared seam is the **lease + status-FSM +

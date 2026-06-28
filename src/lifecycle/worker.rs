@@ -7,6 +7,7 @@ use super::planner::{
     Candidate, Decision, PlannedLifecycleAction, QualifySpec, SkipReason,
 };
 use super::state_store::{LifecycleFailureInsert, LifecycleRunTotals};
+use crate::background::RunLease;
 use crate::config_db::ConfigDb;
 use crate::config_sections::{LifecycleAction, LifecycleRetainNewestAction, LifecycleRule};
 use crate::deltaglider::DynEngine;
@@ -66,13 +67,6 @@ pub struct LifecycleRunOutcome {
 
 fn is_zero_i64(v: &i64) -> bool {
     *v == 0
-}
-
-#[derive(Debug, Clone)]
-pub struct RunLease {
-    pub owner: String,
-    pub ttl_secs: i64,
-    pub heartbeat_secs: i64,
 }
 
 pub async fn preview_rule(

@@ -25,6 +25,7 @@ pub mod scheduler;
 pub mod state_store;
 pub mod worker;
 
+pub use crate::background::RunLease;
 pub use parity::{parity_audit, ParityOutcome};
 pub use planner::{
     normalize_prefix, plan_batch, rewrite_key, should_replicate, BatchPlan, Decision,
@@ -37,4 +38,4 @@ pub use state_store::{
     current_unix_seconds, FailureRecord, ObjectFailure, ParityResultRow, ReplicationState,
     RunRecord, RunTotals,
 };
-pub use worker::{run_rule, RunConcurrency, RunLease, RunOutcome};
+pub use worker::{run_rule, RunConcurrency, RunOutcome};

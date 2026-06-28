@@ -29,6 +29,7 @@
 
 use super::planner::{normalize_prefix, plan_batch};
 use super::state_store::{current_unix_seconds, FailureInsert, RunTotals};
+use crate::background::RunLease;
 use crate::config_db::ConfigDb;
 use crate::config_sections::ReplicationRule;
 use crate::deltaglider::DynEngine;
@@ -94,13 +95,6 @@ pub struct RunOutcome {
     /// Terminal status string (goes into `replication_run_history.status`).
     pub status: String,
     pub totals: RunTotals,
-}
-
-#[derive(Debug, Clone)]
-pub struct RunLease {
-    pub owner: String,
-    pub ttl_secs: i64,
-    pub heartbeat_secs: i64,
 }
 
 /// Per-run concurrency knobs (Phase B+). `transfers` = concurrent objects
