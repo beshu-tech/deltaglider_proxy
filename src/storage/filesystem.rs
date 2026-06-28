@@ -64,6 +64,19 @@ async fn atomic_write_with_metadata(
     .map_err(super::join_error)?
 }
 
+/// Materialise `src` at `dest` cheaply: hardlink (O(1), no extra bytes) when on
+/// the same filesystem, byte-copy as fallback across fs boundaries (EXDEV).
+/// `dest` is removed first (hard_link refuses an existing target — the caller may
+/// hand a pre-created spool temp). Shared by `get_reference_to_file` and
+/// `put_reference_from_file`.
+async fn hardlink_or_copy(src: &Path, dest: &Path) -> Result<(), StorageError> {
+    let _ = fs::remove_file(dest).await;
+    if fs::hard_link(src, dest).await.is_err() {
+        fs::copy(src, dest).await?;
+    }
+    Ok(())
+}
+
 /// Atomically copy file data + metadata to destination using temp + rename.
 async fn atomic_copy_with_metadata(
     source_path: &Path,
@@ -795,18 +808,7 @@ impl StorageBackend for FilesystemBackend {
                 prefix
             )));
         }
-        // The reference is already a local file. Hardlink it to `dest` — O(1),
-        // zero extra bytes, no heap load. dest must not already exist for
-        // hard_link, so the caller hands us a fresh path; if it does (e.g. a
-        // pre-created spool temp file), remove it first. Fall back to a byte copy
-        // across filesystem boundaries (EXDEV).
-        let _ = tokio::fs::remove_file(dest).await;
-        match tokio::fs::hard_link(&src, dest).await {
-            Ok(()) => {}
-            Err(_) => {
-                tokio::fs::copy(&src, dest).await?;
-            }
-        }
+        hardlink_or_copy(&src, dest).await?;
         let len = tokio::fs::metadata(dest).await?.len();
         Ok(len)
     }
@@ -845,15 +847,7 @@ impl StorageBackend for FilesystemBackend {
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).await?;
         }
-        // Hardlink the source into place (O(1), no heap load); copy across fs
-        // boundaries. dest must not pre-exist for hard_link.
-        let _ = fs::remove_file(&dest).await;
-        match fs::hard_link(source_path, &dest).await {
-            Ok(()) => {}
-            Err(_) => {
-                fs::copy(source_path, &dest).await?;
-            }
-        }
+        hardlink_or_copy(source_path, &dest).await?;
         xattr_meta::write_metadata(&dest, metadata).await
     }
 

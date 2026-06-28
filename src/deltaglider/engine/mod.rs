@@ -809,25 +809,45 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.file_router.is_delta_eligible(filename)
     }
 
-    /// Acquire a spool file from the engine's quota'd spool dir (for the adapter
-    /// to stage a large PUT/POST body before `store_spooled_delta`).
-    ///
-    /// Bounded wait — same as the GET-side reconstruct (fbe67de): under budget
-    /// contention this fails with SlowDown rather than parking the request (and
-    /// its budget) indefinitely. PUT and POST share this accessor, so both ingest
-    /// paths get the timeout (review B1.1).
+    /// Run a spool acquisition under the configured timeout, mapping a timeout to
+    /// SlowDown (don't park the request + its budget forever under contention).
+    /// The ONE place the timeout/Overloaded policy lives — both PUT/POST
+    /// (`spool_acquire`) and GET (`spool_acquire_pair`) go through it.
+    async fn with_spool_timeout<T, F>(fut: F) -> Result<T, EngineError>
+    where
+        F: std::future::Future<Output = std::io::Result<T>>,
+    {
+        let secs = crate::config::env_parse_with_default("DGP_SPOOL_ACQUIRE_TIMEOUT_SECS", 120u64);
+        tokio::time::timeout(std::time::Duration::from_secs(secs), fut)
+            .await
+            .map_err(|_| {
+                EngineError::Overloaded("spool budget exhausted; retry shortly".to_string())
+            })?
+            .map_err(|e| EngineError::Storage(StorageError::from(e)))
+    }
+
+    /// Acquire a spool file (timed). For the adapter to stage a large PUT/POST
+    /// body before `store_spooled_delta`. Both ingest paths share it (B1.1).
     pub async fn spool_acquire(
         &self,
         bytes: u64,
     ) -> Result<crate::deltaglider::spool::Spool, EngineError> {
-        let secs = crate::config::env_parse_with_default("DGP_SPOOL_ACQUIRE_TIMEOUT_SECS", 120u64);
-        tokio::time::timeout(
-            std::time::Duration::from_secs(secs),
-            self.spool.acquire(bytes),
-        )
-        .await
-        .map_err(|_| EngineError::Overloaded("spool budget exhausted; retry shortly".to_string()))?
-        .map_err(|e| EngineError::Storage(StorageError::from(e)))
+        Self::with_spool_timeout(self.spool.acquire(bytes)).await
+    }
+
+    /// Acquire a deadlock-safe spool PAIR (timed) — the GET reconstruct path.
+    pub async fn spool_acquire_pair(
+        &self,
+        a: u64,
+        b: u64,
+    ) -> Result<
+        (
+            crate::deltaglider::spool::Spool,
+            crate::deltaglider::spool::Spool,
+        ),
+        EngineError,
+    > {
+        Self::with_spool_timeout(self.spool.acquire_pair(a, b)).await
     }
 
     /// Whether the codec passes `-a` (armor disabled) to xdelta3 (3.1+ only).

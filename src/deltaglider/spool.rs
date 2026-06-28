@@ -173,23 +173,11 @@ impl SpoolDir {
 }
 
 impl Spool {
+    /// The spool file's path. Callers write/read it directly (the codec hands it
+    /// to xdelta3 as a file arg; storage hardlinks/streams it). The `Spool` owns
+    /// the `NamedTempFile`, so the file lives until this drops.
     pub fn path(&self) -> &Path {
         self.file.path()
-    }
-
-    /// Reopen the spool file for reading (e.g. to stream it to a client after
-    /// the codec wrote it). The original `NamedTempFile` keeps the file alive
-    /// until `Spool` drops.
-    pub fn reopen_read(&self) -> std::io::Result<std::fs::File> {
-        std::fs::File::open(self.file.path())
-    }
-
-    /// A fresh writable handle to the spool file.
-    pub fn write_handle(&self) -> std::io::Result<std::fs::File> {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(self.file.path())
     }
 }
 
@@ -202,7 +190,6 @@ fn mib_ceil(bytes: u64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     #[test]
     fn mib_ceil_rounds_up() {
@@ -218,9 +205,7 @@ mod tests {
         let pool = SpoolDir::new(tmp.path().to_path_buf(), 64 * 1024 * 1024).unwrap();
         let spool = pool.acquire(4 * 1024 * 1024).await.unwrap();
         assert!(spool.path().starts_with(tmp.path()));
-        let mut w = spool.write_handle().unwrap();
-        w.write_all(b"hello").unwrap();
-        w.flush().unwrap();
+        std::fs::write(spool.path(), b"hello").unwrap();
         let back = std::fs::read(spool.path()).unwrap();
         assert_eq!(&back, b"hello");
     }

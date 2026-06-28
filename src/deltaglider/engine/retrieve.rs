@@ -243,19 +243,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         // ONE combined reservation for both spools (ref + out) — a single permit
         // can't half-acquire and self-deadlock, and two concurrent large GETs
-        // never hold one spool while waiting for the other (x-ray blocker).
-        // Bounded wait: if the budget is saturated, fail with SlowDown rather than
-        // parking the request (and its budget) indefinitely under contention.
-        let acquire_secs =
-            crate::config::env_parse_with_default("DGP_SPOOL_ACQUIRE_TIMEOUT_SECS", 120u64);
-        let (ref_spool, out_spool) = tokio::time::timeout(
-            std::time::Duration::from_secs(acquire_secs),
-            self.spool
-                .acquire_pair(metadata.file_size, metadata.file_size),
-        )
-        .await
-        .map_err(|_| EngineError::Overloaded("spool budget exhausted; retry shortly".to_string()))?
-        .map_err(StorageError::from)?;
+        // never hold one spool while waiting for the other (x-ray blocker). Timed
+        // (shared with the PUT/POST path) so a saturated budget SlowDowns instead
+        // of parking the request forever.
+        let (ref_spool, out_spool) = self
+            .spool_acquire_pair(metadata.file_size, metadata.file_size)
+            .await?;
 
         // Materialise the reference as a seekable file WITHOUT heap-loading it
         // (Phase 2: filesystem hardlink / S3 stream-to-file).
