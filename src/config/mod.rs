@@ -269,6 +269,12 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Security",
     },
     EnvVarEntry {
+        name: "DGP_TRUSTED_PROXY_CIDRS",
+        description: "Comma-separated CIDRs of trusted reverse proxies; XFF honored only from these peers (prevents aws:SourceIp / admission source_ip spoofing)",
+        example: "10.0.0.0/8,192.168.1.5",
+        category: "Security",
+    },
+    EnvVarEntry {
         name: "DGP_SESSION_TTL_HOURS",
         description: "Admin session TTL in hours (default: 4)",
         example: "4",
@@ -2708,6 +2714,7 @@ mod tests {
             "DGP_S3_CONNECT_TIMEOUT_SECS",    // storage::s3::build_client()
             "DGP_S3_OPERATION_ATTEMPT_TIMEOUT_SECS", // storage::s3::build_client()
             "DGP_S3_STALL_GRACE_SECS",        // storage::s3::build_client()
+            "DGP_TRUSTED_PROXY_CIDRS",        // rate_limiter::trusted_proxy_cidrs()
         ];
         for name in &registry_names {
             if used_outside_from_env.contains(name) {

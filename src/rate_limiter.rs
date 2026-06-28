@@ -340,6 +340,37 @@ pub fn trust_proxy_headers() -> bool {
     crate::config::env_bool("DGP_TRUST_PROXY_HEADERS", false)
 }
 
+/// Parse `DGP_TRUSTED_PROXY_CIDRS` (comma-separated CIDRs / bare IPs) into a set
+/// of networks. Empty / unset → empty vec. A bare IP becomes a /32 (or /128).
+/// When non-empty, `X-Forwarded-For` is honored ONLY for a peer inside one of
+/// these networks (a real reverse proxy); otherwise the header is attacker-
+/// controlled and ignored. Invalid entries are skipped with a warning.
+pub fn trusted_proxy_cidrs() -> Vec<ipnet::IpNet> {
+    let raw = match std::env::var("DGP_TRUSTED_PROXY_CIDRS") {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| match s.parse::<ipnet::IpNet>() {
+            Ok(net) => Some(net),
+            Err(_) => match s.parse::<IpAddr>() {
+                Ok(IpAddr::V4(v4)) => Some(ipnet::IpNet::V4(
+                    ipnet::Ipv4Net::new(v4, 32).expect("32 valid"),
+                )),
+                Ok(IpAddr::V6(v6)) => Some(ipnet::IpNet::V6(
+                    ipnet::Ipv6Net::new(v6, 128).expect("128 valid"),
+                )),
+                Err(_) => {
+                    tracing::warn!("DGP_TRUSTED_PROXY_CIDRS: ignoring invalid entry {s:?}");
+                    None
+                }
+            },
+        })
+        .collect()
+}
+
 /// Extract client IP from request headers/connection info.
 ///
 /// When `DGP_TRUST_PROXY_HEADERS=true`, checks X-Forwarded-For and X-Real-IP
@@ -354,39 +385,95 @@ pub fn extract_client_ip(headers: &axum::http::HeaderMap) -> Option<IpAddr> {
 }
 
 /// Extract client IP from trusted proxy headers or peer socket fallback.
-///
-/// Resolution order:
-/// 1. Trusted proxy headers (`X-Forwarded-For`, `X-Real-IP`) when
-///    `DGP_TRUST_PROXY_HEADERS=true`.
-/// 2. Direct peer socket IP from axum `ConnectInfo` (when provided).
-/// 3. `None` if neither source is available.
+/// Reads env (`trust_proxy_headers()`, `trusted_proxy_cidrs()`) then delegates
+/// to the pure [`resolve_client_ip`] so the spoofing truth-table is unit-tested.
 pub fn extract_client_ip_with_peer(
     headers: &axum::http::HeaderMap,
     peer_ip: Option<IpAddr>,
 ) -> Option<IpAddr> {
-    if trust_proxy_headers() {
-        // Check X-Forwarded-For header (first IP is the client)
-        if let Some(xff) = headers.get("x-forwarded-for") {
-            if let Ok(xff_str) = xff.to_str() {
-                if let Some(first_ip) = xff_str.split(',').next() {
-                    if let Ok(ip) = first_ip.trim().parse::<IpAddr>() {
-                        return Some(normalize_ip(ip));
+    resolve_client_ip(
+        headers,
+        peer_ip,
+        trust_proxy_headers(),
+        &trusted_proxy_cidrs(),
+    )
+}
+
+/// Pure client-IP resolver — the anti-spoofing decision, injectable for tests.
+///
+/// - `trust == false`: proxy headers are ignored entirely; the TCP `peer_ip` is
+///   the client (secure default).
+/// - `trust == true` AND `trusted_cidrs` non-empty: headers are honored ONLY when
+///   `peer_ip` is inside a trusted network (a real reverse proxy). The XFF chain
+///   is then walked **right-to-left**, returning the rightmost address that is
+///   NOT itself a trusted hop — i.e. the real client the trusted proxy saw. This
+///   defeats a client that prepends a forged XFF entry.
+/// - `trust == true` AND `trusted_cidrs` EMPTY: back-compat with the historical
+///   "first XFF element" behavior (operators who set trust but no CIDR list).
+///   This path is spoofable — operators should set `DGP_TRUSTED_PROXY_CIDRS`.
+pub fn resolve_client_ip(
+    headers: &axum::http::HeaderMap,
+    peer_ip: Option<IpAddr>,
+    trust: bool,
+    trusted_cidrs: &[ipnet::IpNet],
+) -> Option<IpAddr> {
+    if !trust {
+        return peer_ip.map(normalize_ip);
+    }
+
+    let peer_trusted = |ip: IpAddr| trusted_cidrs.iter().any(|n| n.contains(&ip));
+
+    if trusted_cidrs.is_empty() {
+        // Legacy spoofable path: first XFF element, then X-Real-IP, then peer.
+        if let Some(ip) = first_xff(headers).or_else(|| header_ip(headers, "x-real-ip")) {
+            return Some(normalize_ip(ip));
+        }
+        return peer_ip.map(normalize_ip);
+    }
+
+    // CIDR-gated path: only trust headers from a trusted peer.
+    match peer_ip {
+        Some(p) if peer_trusted(p) => {
+            // Walk XFF right-to-left; the first (rightmost) entry that isn't a
+            // trusted hop is the real client. If every entry is trusted, fall to
+            // X-Real-IP, then the peer.
+            if let Some(xff) = header_str(headers, "x-forwarded-for") {
+                for hop in xff.rsplit(',') {
+                    if let Ok(ip) = hop.trim().parse::<IpAddr>() {
+                        if !peer_trusted(ip) {
+                            return Some(normalize_ip(ip));
+                        }
                     }
                 }
             }
-        }
-
-        // Check X-Real-IP header
-        if let Some(real_ip) = headers.get("x-real-ip") {
-            if let Ok(ip_str) = real_ip.to_str() {
-                if let Ok(ip) = ip_str.trim().parse::<IpAddr>() {
-                    return Some(normalize_ip(ip));
-                }
+            if let Some(ip) = header_ip(headers, "x-real-ip") {
+                return Some(normalize_ip(ip));
             }
+            Some(normalize_ip(p))
         }
+        // Untrusted (or absent) peer: headers are attacker-controlled, ignore them.
+        other => other.map(normalize_ip),
     }
+}
 
-    peer_ip.map(normalize_ip)
+fn header_str(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+fn header_ip(headers: &axum::http::HeaderMap, name: &str) -> Option<IpAddr> {
+    header_str(headers, name).and_then(|s| s.trim().parse::<IpAddr>().ok())
+}
+
+fn first_xff(headers: &axum::http::HeaderMap) -> Option<IpAddr> {
+    header_str(headers, "x-forwarded-for")?
+        .split(',')
+        .next()?
+        .trim()
+        .parse::<IpAddr>()
+        .ok()
 }
 
 /// Collapse IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) back to their
@@ -604,6 +691,90 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+    }
+
+    // ── resolve_client_ip (pure — no env, no lock) ────────────────────────
+    fn hdrs(pairs: &[(&str, &str)]) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+    fn cidr(s: &str) -> ipnet::IpNet {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn resolve_client_ip_truth_table() {
+        let proxy = ip("10.0.0.1"); // a trusted proxy peer
+        let trusted = vec![cidr("10.0.0.0/8")];
+        let xff = |v: &str| hdrs(&[("x-forwarded-for", v)]);
+
+        // trust=false → headers ignored, peer wins.
+        assert_eq!(
+            resolve_client_ip(&xff("1.2.3.4"), Some(proxy), false, &trusted),
+            Some(proxy)
+        );
+        // trust + trusted peer → real client is the rightmost non-trusted XFF hop.
+        assert_eq!(
+            resolve_client_ip(&xff("203.0.113.9, 10.0.0.5"), Some(proxy), true, &trusted),
+            Some(ip("203.0.113.9"))
+        );
+        // Attacker prepends a forged hop: "evil, realclient" via a trusted proxy.
+        // right-to-left walk returns the rightmost non-trusted = the real client.
+        assert_eq!(
+            resolve_client_ip(&xff("9.9.9.9, 203.0.113.9"), Some(proxy), true, &trusted),
+            Some(ip("203.0.113.9"))
+        );
+        // UNtrusted peer with a spoofed XFF → header ignored, peer wins.
+        let attacker = ip("203.0.113.50");
+        assert_eq!(
+            resolve_client_ip(&xff("1.1.1.1"), Some(attacker), true, &trusted),
+            Some(attacker)
+        );
+        // trusted peer, every XFF hop trusted → fall back to X-Real-IP then peer.
+        assert_eq!(
+            resolve_client_ip(
+                &hdrs(&[
+                    ("x-forwarded-for", "10.0.0.7"),
+                    ("x-real-ip", "198.51.100.2")
+                ]),
+                Some(proxy),
+                true,
+                &trusted
+            ),
+            Some(ip("198.51.100.2"))
+        );
+        // trust=true but NO trusted CIDRs → legacy first-XFF behavior (spoofable).
+        assert_eq!(
+            resolve_client_ip(&xff("203.0.113.9, 10.0.0.5"), Some(proxy), true, &[]),
+            Some(ip("203.0.113.9"))
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn resolve_client_ip_untrusted_peer_never_honors_headers(
+            a in 0u8..=255, b in 0u8..=255, c in 0u8..=255, d in 0u8..=255,
+        ) {
+            // An UNtrusted peer must always resolve to the peer itself,
+            // regardless of any forged XFF — the anti-spoof core invariant.
+            let attacker = IpAddr::V4(Ipv4Addr::new(a, b, c, d));
+            let trusted = vec![cidr("10.0.0.0/8")];
+            if trusted.iter().any(|n| n.contains(&attacker)) { return Ok(()); } // skip trusted
+            let h = hdrs(&[("x-forwarded-for", "1.2.3.4, 5.6.7.8"), ("x-real-ip", "9.9.9.9")]);
+            proptest::prop_assert_eq!(
+                resolve_client_ip(&h, Some(attacker), true, &trusted),
+                Some(normalize_ip(attacker))
+            );
+        }
     }
 
     #[test]
