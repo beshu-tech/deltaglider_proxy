@@ -943,9 +943,9 @@ pub async fn sync_now(
         .ok_or(axum::http::StatusCode::NOT_FOUND)?;
 
     match sync.poll_and_sync().await {
-        Ok(true) => {
-            // New state downloaded — reopen the DB and rebuild IAM, exactly
-            // as the periodic poll does. Kept consistent by funnelling
+        Ok(Some(dl)) => {
+            // New state downloaded — merge IAM into the live DB and rebuild,
+            // exactly as the periodic poll does. Kept consistent by funnelling
             // through the same helper (`reopen_and_rebuild_iam` in the
             // config_db_sync module).
             //
@@ -954,20 +954,28 @@ pub async fn sync_now(
             // across an await would block the task's Send contract even
             // though logically we only need the string value.
             let password_hash = state.password_hash.read().clone();
-            crate::config_db_sync::reopen_and_rebuild_iam(
+            let applied = crate::config_db_sync::reopen_and_rebuild_iam(
                 &state.config_db,
                 &password_hash,
                 &state.iam_state,
                 &state.external_auth,
+                &dl.temp_path,
                 "sync-now endpoint",
             )
             .await;
+            if applied {
+                sync.commit_downloaded_etag(dl.etag).await;
+            }
             Ok(Json(SyncNowResponse {
-                downloaded: true,
-                status: "Downloaded newer config DB and reloaded IAM".to_string(),
+                downloaded: applied,
+                status: if applied {
+                    "Downloaded newer config DB and reloaded IAM".to_string()
+                } else {
+                    "Downloaded newer config DB but IAM merge failed; will retry".to_string()
+                },
             }))
         }
-        Ok(false) => Ok(Json(SyncNowResponse {
+        Ok(None) => Ok(Json(SyncNowResponse {
             downloaded: false,
             status: "Local copy is current (ETag unchanged)".to_string(),
         })),

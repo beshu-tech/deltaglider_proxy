@@ -864,6 +864,108 @@ impl ConfigDb {
         Ok(())
     }
 
+    /// The IAM-truth tables that the S3 sync owns. ORDER MATTERS: parents
+    /// before children (for INSERT). The reverse order is used for DELETE.
+    /// Everything NOT in this list (replication_*, lifecycle_*, maintenance_*,
+    /// event_outbox, listener_cursors, replication_parity*) is per-node
+    /// COORDINATION state that the sync must never touch — see `merge_iam_from`.
+    const IAM_SYNC_TABLES: &'static [&'static str] = &[
+        "users",
+        "groups",
+        "auth_providers",
+        "group_mapping_rules",
+        "permissions",         // FK → users
+        "group_members",       // FK → groups, users
+        "group_permissions",   // FK → groups
+        "external_identities", // FK → users
+    ];
+
+    /// Replace ONLY the IAM-truth tables from a downloaded peer DB, leaving this
+    /// node's coordination tables (jobs/leases/outbox/cursors/parity) intact.
+    ///
+    /// This is the B3 fix for the audit's CRITICAL finding: the old sync path
+    /// `fs::rename`d the whole SQLCipher file, wholesale-clobbering coordination
+    /// state that is correct per-node and lease-shared — silently desyncing
+    /// `event_outbox` cursors and replication/maintenance leases across instances.
+    /// We now ATTACH the peer file and copy across only the 8 IAM tables in one
+    /// transaction, so the synced plane (IAM) converges while the coordination
+    /// plane stays node-local. No `reopen` is needed — the live connection keeps
+    /// its coordination rows.
+    pub fn merge_iam_from(
+        &self,
+        downloaded_path: &Path,
+        passphrase: &str,
+    ) -> Result<(), ConfigDbError> {
+        let attach_path = downloaded_path.to_string_lossy().replace('\'', "''");
+        // ATTACH + KEY the encrypted peer DB. (SQLCipher: key the attached DB via
+        // the `KEY` clause on ATTACH.)
+        self.conn.execute_batch(&format!(
+            "ATTACH DATABASE '{attach_path}' AS remote KEY '{}';",
+            passphrase.replace('\'', "''")
+        ))?;
+
+        // Guard: if anything below fails, always DETACH so the connection isn't
+        // left with a dangling attachment.
+        let result = (|| -> Result<(), ConfigDbError> {
+            // Sanity: the attached DB must be readable (correct key) — a bad key
+            // surfaces here rather than mid-merge.
+            self.conn
+                .query_row("SELECT count(*) FROM remote.sqlite_master", [], |r| {
+                    r.get::<_, i32>(0)
+                })?;
+
+            // Schema-version gate (review fix): `INSERT ... SELECT *` is positional,
+            // so a peer on a DIFFERENT schema version (rolling upgrade: a node with
+            // an extra/renamed IAM column) would corrupt or abort the copy. Refuse
+            // unless the peer's user_version matches ours; the operator finishes the
+            // rolling upgrade and the next sync converges cleanly.
+            let remote_version: i32 =
+                self.conn
+                    .query_row("PRAGMA remote.user_version", [], |r| r.get(0))?;
+            if remote_version != SCHEMA_VERSION {
+                return Err(ConfigDbError::Other(format!(
+                    "peer config DB schema v{remote_version} != local v{SCHEMA_VERSION}; \
+                     skipping IAM merge until the rolling upgrade completes"
+                )));
+            }
+
+            // NOTE: foreign_keys cannot be toggled inside a transaction (SQLite
+            // silently ignores the pragma mid-txn), so the DELETE/INSERT order
+            // below is what keeps us FK-correct, NOT a pragma. Verified against
+            // the IAM FK graph: DELETE children-first, INSERT parents-first.
+            // (All IAM FKs are ON DELETE CASCADE, so delete order is also safe on
+            // its own; insert order must put users/groups/auth_providers before
+            // their referrers — IAM_SYNC_TABLES is ordered for exactly this.)
+            self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+            let tx = (|| -> Result<(), ConfigDbError> {
+                for table in Self::IAM_SYNC_TABLES.iter().rev() {
+                    self.conn
+                        .execute(&format!("DELETE FROM main.{table}"), [])?;
+                }
+                for table in Self::IAM_SYNC_TABLES {
+                    self.conn.execute(
+                        &format!("INSERT INTO main.{table} SELECT * FROM remote.{table}"),
+                        [],
+                    )?;
+                }
+                Ok(())
+            })();
+            match tx {
+                Ok(()) => {
+                    self.conn.execute_batch("COMMIT;")?;
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = self.conn.execute_batch("ROLLBACK;");
+                    Err(e)
+                }
+            }
+        })();
+
+        let _ = self.conn.execute_batch("DETACH DATABASE remote;");
+        result
+    }
+
     /// Re-encrypt the database with a new passphrase (after bootstrap password change).
     pub fn rekey(&self, new_passphrase: &str) -> Result<(), ConfigDbError> {
         self.conn.pragma_update(None, "rekey", new_passphrase)?;
@@ -1213,6 +1315,112 @@ mod tests {
                 .err()
                 .map(|e| e.to_string())
                 .unwrap_or_else(|| "Ok".into())
+        );
+    }
+
+    #[test]
+    fn merge_iam_from_replaces_iam_but_preserves_coordination() {
+        // B3: a sync download must replace IAM tables from the peer while
+        // leaving this node's coordination tables (here: a listener cursor)
+        // intact — the bug the old fs::rename caused.
+        let dir = tempfile::tempdir().unwrap();
+        let local_path = dir.path().join("local.db");
+        let peer_path = dir.path().join("peer.db");
+        let pass = "shared-bootstrap-hash";
+
+        // LOCAL: one user ("local-only") + a coordination cursor at 4242.
+        let local = ConfigDb::open_or_create(&local_path, pass).unwrap();
+        local
+            .create_user("local-only", "AKLOCAL00001", "secret0000001", true, &[])
+            .unwrap();
+        local
+            .listener_cursor_advance("replication", 4242, 1)
+            .unwrap();
+
+        // PEER: a DIFFERENT user set ("peer-user") + its OWN cursor (must NOT
+        // overwrite local's).
+        {
+            let peer = ConfigDb::open_or_create(&peer_path, pass).unwrap();
+            peer.create_user("peer-user", "AKPEER000001", "secret0000002", true, &[])
+                .unwrap();
+            peer.listener_cursor_advance("replication", 9999, 2)
+                .unwrap();
+        }
+
+        // Merge peer's IAM into local.
+        local.merge_iam_from(&peer_path, pass).unwrap();
+
+        // IAM replaced: local-only gone, peer-user present.
+        let names: Vec<String> = local
+            .load_users()
+            .unwrap()
+            .into_iter()
+            .map(|u| u.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["peer-user"],
+            "IAM must be replaced by the peer's"
+        );
+
+        // Coordination preserved: local's cursor (4242) survived, NOT clobbered
+        // to the peer's 9999.
+        assert_eq!(
+            local.listener_cursor_load("replication").unwrap(),
+            4242,
+            "coordination state must NOT be touched by an IAM merge"
+        );
+    }
+
+    #[test]
+    fn merge_iam_from_rejects_wrong_passphrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let local_path = dir.path().join("local.db");
+        let peer_path = dir.path().join("peer.db");
+        let local = ConfigDb::open_or_create(&local_path, "local-pass").unwrap();
+        local
+            .create_user("keep", "AKKEEP000001", "secret0000001", true, &[])
+            .unwrap();
+        {
+            ConfigDb::open_or_create(&peer_path, "DIFFERENT-pass").unwrap();
+        }
+        // Merging a peer encrypted with a different key must fail and leave the
+        // local IAM untouched (no half-applied wipe).
+        assert!(local.merge_iam_from(&peer_path, "local-pass").is_err());
+        assert_eq!(
+            local.load_users().unwrap().len(),
+            1,
+            "local IAM intact on failure"
+        );
+    }
+
+    #[test]
+    fn merge_iam_from_rejects_schema_version_drift() {
+        // Review fix: INSERT..SELECT * is positional, so a peer on a different
+        // schema version (rolling upgrade) must be REFUSED, not corrupt the copy.
+        let dir = tempfile::tempdir().unwrap();
+        let local_path = dir.path().join("local.db");
+        let peer_path = dir.path().join("peer.db");
+        let pass = "shared";
+        let local = ConfigDb::open_or_create(&local_path, pass).unwrap();
+        local
+            .create_user("keep", "AKKEEP000001", "secret0000001", true, &[])
+            .unwrap();
+        {
+            let peer = ConfigDb::open_or_create(&peer_path, pass).unwrap();
+            peer.conn
+                .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+                .unwrap();
+        }
+        let err = local.merge_iam_from(&peer_path, pass).unwrap_err();
+        assert!(
+            err.to_string().contains("schema"),
+            "expected a schema-version rejection, got: {err}"
+        );
+        assert_eq!(
+            local.load_users().unwrap().len(),
+            1,
+            "local IAM intact on drift"
         );
     }
 

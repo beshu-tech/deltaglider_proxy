@@ -29,6 +29,14 @@ use crate::iam::{IamIndex, IamState, SharedIamState};
 pub const DEFAULT_CONFIG_SYNC_OBJECT_KEY: &str = ".deltaglider/config.db";
 
 /// Synchronizes the encrypted config DB file to/from S3.
+/// A validated, downloaded peer DB awaiting an IAM merge. The caller merges the
+/// IAM tables out of `temp_path`, deletes it, and — only on success — calls
+/// `commit_downloaded_etag(etag)` so a failed merge re-downloads next poll.
+pub struct DownloadedDb {
+    pub temp_path: std::path::PathBuf,
+    pub etag: Option<String>,
+}
+
 pub struct ConfigDbSync {
     s3_client: Client,
     bucket: String,
@@ -125,8 +133,14 @@ impl ConfigDbSync {
 
     /// Check S3 for a newer config DB file and download it if the ETag differs.
     ///
-    /// Returns `true` if a new version was downloaded (caller should reopen the DB).
-    pub async fn download_if_newer(&self) -> Result<bool, String> {
+    /// Returns `Some(DownloadedDb)` when a new version was downloaded + validated.
+    /// The caller MUST merge its IAM tables into the live DB via
+    /// `ConfigDb::merge_iam_from` (NOT a file swap — that would clobber per-node
+    /// coordination state; see B3), delete the temp file, and — ONLY on a
+    /// successful merge — call `commit_downloaded_etag(dl.etag)`. The ETag is
+    /// deliberately NOT advanced here so a failed merge re-downloads next poll.
+    /// Returns `None` when the local copy is already current.
+    pub async fn download_if_newer(&self) -> Result<Option<DownloadedDb>, String> {
         // HEAD to get current ETag
         let head_result = self
             .s3_client
@@ -148,7 +162,7 @@ impl ConfigDbSync {
                         "Config DB not found in S3 (bucket={}) — using local copy",
                         self.bucket
                     );
-                    return Ok(false);
+                    return Ok(None);
                 }
                 return Err(format!("Failed to HEAD config DB in S3: {}", e));
             }
@@ -158,7 +172,7 @@ impl ConfigDbSync {
         let current_etag = self.last_etag.read().await;
         if *current_etag == remote_etag {
             debug!("Config DB S3 ETag unchanged — no download needed");
-            return Ok(false);
+            return Ok(None);
         }
         drop(current_etag);
 
@@ -211,23 +225,32 @@ impl ConfigDbSync {
                      NOT replacing local copy: {}",
                     e
                 );
-                return Ok(false);
+                return Ok(None);
             }
         }
 
-        tokio::fs::rename(&tmp_path, &self.local_path)
-            .await
-            .map_err(|e| format!("Failed to rename temp config DB: {}", e))?;
-
-        // Update stored ETag
-        *self.last_etag.write().await = remote_etag;
-
+        // B3: do NOT rename over the live DB (that wholesale-clobbers per-node
+        // coordination tables) and do NOT advance the ETag yet. The caller merges
+        // ONLY the IAM tables out of the temp file, and ONLY on a SUCCESSFUL merge
+        // calls `commit_downloaded_etag` — so a failed merge leaves the ETag
+        // behind and the next poll retries (review fix: previously the ETag was
+        // advanced here, stranding the node with stale IAM on a merge failure).
         info!(
-            "Config DB downloaded from S3 (bucket={}, size={} bytes)",
+            "Config DB downloaded from S3 (bucket={}, size={} bytes) — IAM merge pending",
             self.bucket,
             data.len()
         );
-        Ok(true)
+        Ok(Some(DownloadedDb {
+            temp_path: tmp_path,
+            etag: remote_etag,
+        }))
+    }
+
+    /// Record that a downloaded version was successfully applied (IAM merged),
+    /// so the next poll doesn't re-download it. Call ONLY after the merge
+    /// succeeds — a failed merge must leave the ETag behind so the poll retries.
+    pub async fn commit_downloaded_etag(&self, etag: Option<String>) {
+        *self.last_etag.write().await = etag;
     }
 
     /// Upload the local config DB file to S3.
@@ -307,8 +330,9 @@ impl ConfigDbSync {
     }
 
     /// Poll S3 for ETag changes. Called periodically (every 5 minutes).
-    /// Returns `true` if a new version was downloaded.
-    pub async fn poll_and_sync(&self) -> Result<bool, String> {
+    /// Returns `Some(temp_path)` when a new version was downloaded (caller merges
+    /// IAM tables + deletes the temp), `None` otherwise.
+    pub async fn poll_and_sync(&self) -> Result<Option<DownloadedDb>, String> {
         self.download_if_newer().await
     }
 
@@ -371,23 +395,34 @@ fn is_precondition_failed(err_str: &str) -> bool {
 ///
 /// Gracefully no-ops when `config_db` is `None` (legacy/open-access
 /// mode, no IAM DB to reopen).
+/// Returns `true` if the IAM merge was applied (so the caller can commit the
+/// downloaded ETag); `false` on any failure, so the next poll retries.
 pub async fn reopen_and_rebuild_iam(
     config_db: &Option<Arc<Mutex<ConfigDb>>>,
     admin_password_hash: &str,
     iam_state: &SharedIamState,
     external_auth: &Option<Arc<ExternalAuthManager>>,
+    downloaded: &std::path::Path,
     context: &str,
-) {
+) -> bool {
     let Some(db_arc) = config_db else {
-        return;
+        // No live DB (legacy/open mode) — nothing to merge into. Drop the temp.
+        // Treat as applied (there's no IAM to converge), so we don't re-download.
+        let _ = tokio::fs::remove_file(downloaded).await;
+        return true;
     };
-    let mut db = db_arc.lock().await;
-    if let Err(e) = db.reopen(admin_password_hash) {
+    let db = db_arc.lock().await;
+    // B3: merge ONLY the IAM tables out of the downloaded peer DB into the live
+    // connection — the live coordination tables (jobs/leases/outbox/cursors)
+    // stay intact (a file swap would clobber them). Then drop the temp file.
+    let merge = db.merge_iam_from(downloaded, admin_password_hash);
+    let _ = tokio::fs::remove_file(downloaded).await;
+    if let Err(e) = merge {
         warn!(
-            "Config DB S3 sync ({}): failed to reopen after download: {}",
+            "Config DB S3 sync ({}): failed to merge IAM after download: {}",
             context, e
         );
-        return;
+        return false;
     }
 
     // Rebuild IAM index from the new DB
@@ -420,6 +455,7 @@ pub async fn reopen_and_rebuild_iam(
             );
         }
     }
+    true
 }
 
 #[cfg(test)]

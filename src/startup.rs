@@ -1004,17 +1004,22 @@ pub async fn init_config_sync(
 
     // Try to download a newer version from S3
     match sync.download_if_newer().await {
-        Ok(true) => {
-            reopen_and_rebuild_iam(
+        Ok(Some(dl)) => {
+            let applied = reopen_and_rebuild_iam(
                 config_db,
                 admin_password_hash,
                 iam_state,
                 external_auth,
+                &dl.temp_path,
                 "startup",
             )
             .await;
+            // Commit the ETag only on a successful merge so a failure retries.
+            if applied {
+                sync.commit_downloaded_etag(dl.etag).await;
+            }
         }
-        Ok(false) => {
+        Ok(None) => {
             info!("Config DB S3 sync: local copy is current");
         }
         Err(e) => {
@@ -1051,17 +1056,21 @@ pub fn spawn_config_sync_poll(
         loop {
             tick.tick().await;
             match sync.poll_and_sync().await {
-                Ok(true) => {
-                    reopen_and_rebuild_iam(
+                Ok(Some(dl)) => {
+                    let applied = reopen_and_rebuild_iam(
                         &db_arc,
                         &password_hash,
                         &iam,
                         &ext_auth,
+                        &dl.temp_path,
                         "periodic poll",
                     )
                     .await;
+                    if applied {
+                        sync.commit_downloaded_etag(dl.etag).await;
+                    }
                 }
-                Ok(false) => {
+                Ok(None) => {
                     tracing::debug!("Config DB S3 sync poll: no changes");
                 }
                 Err(e) => {
