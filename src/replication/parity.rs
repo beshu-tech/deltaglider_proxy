@@ -33,6 +33,36 @@ use super::planner::{
 use super::remediation::{analyze_finding, FindingFacts, Remediation};
 use super::state_store::{ObjectFailure, ParityCacheEntry, ParitySide};
 
+/// Live-progress + cancel control for a background parity audit. The driver
+/// reports `objects scanned so far` into the parity row once per LIST page, and
+/// checks whether an external `POST verify/cancel` flipped the row to
+/// `cancelling` — if so it aborts with [`CANCELLED`]. Both use the same DB
+/// handle the audit already holds; passing `None` runs without progress/cancel
+/// (the no-DB / synchronous fallback path).
+pub struct ParityProgress<'a> {
+    pub db: &'a tokio::sync::Mutex<ConfigDb>,
+    pub rule: &'a str,
+}
+
+/// Sentinel error string an audit returns when cancelled, so the caller can
+/// settle the row as `cancelled` rather than `failed`. `ponytail`: a sentinel
+/// over a custom error enum — the audit's error channel is already `String`,
+/// and cancel is the single case that needs distinguishing.
+pub const CANCELLED: &str = "__parity_cancelled__";
+
+impl ParityProgress<'_> {
+    /// Status-only cancel check — used at phase boundaries OUTSIDE the per-page
+    /// scan loop (the resolve/HEAD-burst tail can be slow on a cold cache, so a
+    /// cancel must be honoured there too, not just during listing).
+    async fn check_cancel(&self) -> Result<(), String> {
+        let db = self.db.lock().await;
+        if matches!(db.parity_status(self.rule).ok().flatten(), Some(s) if s == "cancelling") {
+            return Err(CANCELLED.to_string());
+        }
+        Ok(())
+    }
+}
+
 /// Per-category sample cap surfaced to the UI (exact counts stay unbounded).
 pub const SAMPLE_CAP: usize = 100;
 /// Hard ceiling on total objects scanned across both sides before we stop
@@ -689,17 +719,34 @@ async fn cache_put(
 /// Paginate one bucket+prefix, feeding each object to `keep`. `keep` inserts
 /// (and returns `Ok(true)` if it consumed a slot, `Ok(false)` to skip). Caps
 /// at `max` kept objects. Returns `Ok(truncated)`.
+#[allow(clippy::too_many_arguments)]
 async fn scan_prefix(
     engine: &DynEngine,
     bucket: &str,
     prefix: &str,
     max: usize,
+    progress: Option<&ParityProgress<'_>>,
+    // Objects scanned on the OTHER side already — so the reported running total
+    // is cumulative across both side-scans, not reset per side.
+    base_scanned: usize,
     mut keep: impl FnMut(&str, &FileMetadata) -> Result<bool, String>,
-) -> Result<bool, String> {
+) -> Result<(bool, usize), String> {
     let mut kept = 0usize;
+    let mut seen = 0usize;
     let mut truncated = false;
     let mut pager = crate::job_loop::Pager::fresh();
     'pages: while pager.begin_page().is_some() {
+        // Cancel check + progress report, once per page (cheap, bounded by the
+        // page count, not the object count). Status-only read — never loads the
+        // big outcome_json. The lock is held only for the SELECT + UPDATE.
+        if let Some(p) = progress {
+            let db = p.db.lock().await;
+            if matches!(db.parity_status(p.rule).ok().flatten(), Some(s) if s == "cancelling") {
+                return Err(CANCELLED.to_string());
+            }
+            let now = super::current_unix_seconds();
+            let _ = db.parity_result_progress(p.rule, (base_scanned + seen) as i64, now);
+        }
         // Retry transient list errors (Hetzner 503 throttle on a long scan)
         // with backoff instead of failing the whole audit on one blip.
         // LITE list (metadata=false) — no per-object HEAD; logical metadata for
@@ -731,6 +778,7 @@ async fn scan_prefix(
                 truncated = true;
                 break 'pages;
             }
+            seen += 1;
             if keep(key, meta)? {
                 kept += 1;
             }
@@ -739,7 +787,13 @@ async fn scan_prefix(
             break;
         }
     }
-    Ok(truncated || pager.truncated_by_page_budget())
+    // Final report for this side so the dest scan starts from the right base.
+    if let Some(p) = progress {
+        let db = p.db.lock().await;
+        let now = super::current_unix_seconds();
+        let _ = db.parity_result_progress(p.rule, (base_scanned + seen) as i64, now);
+    }
+    Ok((truncated || pager.truncated_by_page_budget(), seen))
 }
 
 pub async fn parity_audit(
@@ -747,7 +801,9 @@ pub async fn parity_audit(
     rule: &ReplicationRule,
     max_objects: usize,
     failures: Option<&tokio::sync::Mutex<ConfigDb>>,
+    progress: Option<ParityProgress<'_>>,
 ) -> Result<ParityOutcome, String> {
+    let progress = progress.as_ref();
     let (inc, exc) = compile_rule_globs(rule).map_err(|e| e.to_string())?;
     let source_prefix = normalize_prefix(&rule.source.prefix);
     let dest_prefix = normalize_prefix(&rule.destination.prefix);
@@ -771,11 +827,13 @@ pub async fn parity_audit(
     // LITE list (metadata=false) — no per-object HEAD. For delta objects the
     // lite list carries the DELTA-blob size/etag (not logical), so those keys
     // are queued for logical resolution (cache first, HEAD only on a miss).
-    let src_truncated = scan_prefix(
+    let (src_truncated, src_seen) = scan_prefix(
         engine,
         &rule.source.bucket,
         &source_prefix,
         max_objects,
+        progress,
+        0,
         |key, meta| {
             if !matches!(
                 should_replicate(key, meta, None, ConflictPolicy::SourceWins, &inc, &exc),
@@ -795,11 +853,13 @@ pub async fn parity_audit(
     )
     .await?;
 
-    let dst_truncated = scan_prefix(
+    let (dst_truncated, _dst_seen) = scan_prefix(
         engine,
         &rule.destination.bucket,
         &dest_prefix,
         max_objects,
+        progress,
+        src_seen,
         |key, meta| {
             if is_skippable_key(key) {
                 return Ok(false);
@@ -818,6 +878,12 @@ pub async fn parity_audit(
     // Resolve logical metadata for the delta-eligible keys: parity cache first
     // (HEAD-free — the win), then a bounded HEAD burst for the misses, writing
     // results back into the cache so the NEXT verify is HEAD-free too.
+    // The HEAD-burst tail can be the slow part on a cold cache, so honour a
+    // cancel at each resolve boundary (the per-page check above only covers
+    // listing).
+    if let Some(p) = progress {
+        p.check_cancel().await?;
+    }
     resolve_logical(
         engine,
         rule,
@@ -829,6 +895,9 @@ pub async fn parity_audit(
         failures,
     )
     .await;
+    if let Some(p) = progress {
+        p.check_cancel().await?;
+    }
     resolve_logical_dest(
         engine,
         rule,

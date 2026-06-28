@@ -4,6 +4,7 @@
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
+  cancelVerifyParity,
   getJobFailures,
   getJobRuns,
   getJobs,
@@ -56,7 +57,10 @@ export function useParityStatus(ruleName: string) {
     queryKey: qk.jobs.verify(ruleName),
     queryFn: () => getVerifyStatus(ruleName),
     enabled: !!ruleName,
-    refetchInterval: (q) => (q.state.data?.status === 'running' ? POLL_MS : false),
+    refetchInterval: (q) => {
+      const st = q.state.data?.status;
+      return st === 'running' || st === 'cancelling' ? POLL_MS : false;
+    },
   });
 }
 
@@ -65,6 +69,18 @@ export function useStartVerify(ruleName: string) {
   const qc = useQueryClient();
   return useMutation<ParityStatus, Error, void>({
     mutationFn: () => startVerifyParity(ruleName),
+    onSuccess: (data) => {
+      qc.setQueryData(qk.jobs.verify(ruleName), data);
+      qc.invalidateQueries({ queryKey: qk.jobs.verify(ruleName) });
+    },
+  });
+}
+
+/** Cancel a running parity audit; refetch status so the UI settles. */
+export function useCancelVerify(ruleName: string) {
+  const qc = useQueryClient();
+  return useMutation<ParityStatus, Error, void>({
+    mutationFn: () => cancelVerifyParity(ruleName),
     onSuccess: (data) => {
       qc.setQueryData(qk.jobs.verify(ruleName), data);
       qc.invalidateQueries({ queryKey: qk.jobs.verify(ruleName) });

@@ -251,6 +251,7 @@ pub async fn verify(
             &rule,
             replication::parity::MAX_PARITY_OBJECTS,
             None,
+            None,
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
@@ -317,6 +318,10 @@ pub async fn verify(
             &rule_clone,
             replication::parity::MAX_PARITY_OBJECTS,
             Some(&db_for_task),
+            Some(replication::parity::ParityProgress {
+                db: &db_for_task,
+                rule: &rule_clone.name,
+            }),
         ));
         let audit = futures::FutureExt::catch_unwind(audit);
         // Heartbeat: renew the lease every TTL/3 so a scan that runs longer than
@@ -348,7 +353,18 @@ pub async fn verify(
         };
         let now = crate::replication::current_unix_seconds();
         let db = db_for_task.lock().await;
+        // Honour a cancel that landed in the final window (after the audit's
+        // last in-scan check but before this terminal write): if the row is
+        // 'cancelling', settle it 'cancelled' rather than overwriting with
+        // 'done'. Read under the held lock so it's atomic with the write.
+        let cancel_pending = matches!(
+            db.parity_status(&rule_clone.name).ok().flatten(),
+            Some(s) if s == "cancelling"
+        );
         match result {
+            Ok(_) if cancel_pending => {
+                let _ = db.parity_result_cancelled(&rule_clone.name, now);
+            }
             // Persist 'failed' (not a hollow 'done') if the outcome won't
             // serialize — a 'done' with empty outcome_json reads as no result.
             Ok(outcome) => match serde_json::to_string(&outcome) {
@@ -363,6 +379,9 @@ pub async fn verify(
                     );
                 }
             },
+            Err(e) if e == replication::parity::CANCELLED => {
+                let _ = db.parity_result_cancelled(&rule_clone.name, now);
+            }
             Err(e) => {
                 let _ = db.parity_result_failed(&rule_clone.name, &e, now);
             }
@@ -388,6 +407,27 @@ pub async fn verify_status(
     let row = match &state.config_db {
         Some(db_arc) => {
             let db = db_arc.lock().await;
+            db.parity_result_load(&name).ok().flatten()
+        }
+        None => None,
+    };
+    Ok(Json(parity_status_from_row(row)))
+}
+
+/// POST: request cancellation of a running parity audit. Flips the row to
+/// 'cancelling'; the background scan polls this between LIST pages and bails,
+/// settling the row to 'cancelled'. Returns the current status either way
+/// (idempotent — cancelling an idle/done audit is a no-op).
+pub async fn verify_cancel(
+    Path(name): Path<String>,
+    State(state): State<Arc<AdminState>>,
+) -> Result<Json<ParityStatusResponse>, (StatusCode, String)> {
+    let _ = snapshot_and_find_rule(&state, &name).await?;
+    let row = match &state.config_db {
+        Some(db_arc) => {
+            let db = db_arc.lock().await;
+            let now = crate::replication::current_unix_seconds();
+            let _ = db.parity_request_cancel(&name, now);
             db.parity_result_load(&name).ok().flatten()
         }
         None => None,

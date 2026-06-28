@@ -203,4 +203,36 @@ async fn test_parity_audit_lifecycle() {
         404,
         "parity verify is replication-only — lifecycle jobs have no verify"
     );
+
+    // 6. Cancel contract: cancelling a finished (done) audit is a 200 no-op that
+    //    leaves the verdict intact; cancel on a lifecycle id is 404.
+    let cancel = admin
+        .post(format!(
+            "{}/_/api/admin/jobs/replication:parity-a-to-b/verify/cancel",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .expect("verify cancel request");
+    assert_eq!(cancel.status().as_u16(), 200, "cancel returns 200");
+    let cs: Value = cancel.json().await.unwrap();
+    assert_eq!(
+        cs["status"].as_str(),
+        Some("done"),
+        "cancelling a finished audit is a no-op — status stays done"
+    );
+
+    let lc_cancel = admin
+        .post(format!(
+            "{}/_/api/admin/jobs/lifecycle:lc-expire/verify/cancel",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .expect("lifecycle cancel request");
+    assert_eq!(
+        lc_cancel.status().as_u16(),
+        404,
+        "verify cancel is replication-only"
+    );
 }

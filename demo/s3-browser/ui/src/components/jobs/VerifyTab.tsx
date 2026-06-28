@@ -19,7 +19,12 @@ import {
 } from '@ant-design/icons';
 import type { FindingKind, ParityFinding, ParityOutcome, Verifier } from '../../adminApi';
 import { conflictPolicyLabel, fixActionMeta, parityKindMeta, rerunVerdictMeta } from '../../jobsView';
-import { useParityStatus, useRunReplicationNow, useStartVerify } from '../../queries/jobs';
+import {
+  useCancelVerify,
+  useParityStatus,
+  useRunReplicationNow,
+  useStartVerify,
+} from '../../queries/jobs';
 import { useColors } from '../../ThemeContext';
 import { timeAgo } from '../../utils';
 
@@ -58,13 +63,16 @@ export default function VerifyTab({ ruleName }: Props) {
   // restart), polls while a scan runs. `start` POSTs to kick one off.
   const status = useParityStatus(ruleName);
   const start = useStartVerify(ruleName);
+  const cancel = useCancelVerify(ruleName);
   const runNow = useRunReplicationNow();
 
   const s = status.data;
-  const running = s?.status === 'running' || start.isPending;
+  const cancelling = s?.status === 'cancelling' || cancel.isPending;
+  const running = s?.status === 'running' || cancelling || start.isPending;
   const outcome = s?.outcome;
 
   const run = () => start.mutate();
+  const onCancel = () => cancel.mutate();
   // The one executable per-finding fix: run the rule, then re-verify.
   const onRunNow = () => runNow.mutate(ruleName, { onSuccess: () => start.mutate() });
 
@@ -73,9 +81,39 @@ export default function VerifyTab({ ruleName }: Props) {
     return <LoadingBlock c={c} label="Loading verification status…" />;
   }
 
-  // ── running with NO prior result → live progress ───────────────────────────
+  // ── running with NO prior result → live progress + cancel ──────────────────
   if (running && !outcome) {
-    return <LoadingBlock c={c} label="Comparing source and destination…" scanned={s?.progress_scanned} />;
+    return (
+      <LoadingBlock
+        c={c}
+        label={cancelling ? 'Cancelling…' : 'Comparing source and destination…'}
+        scanned={s?.progress_scanned}
+        onCancel={cancelling ? undefined : onCancel}
+      />
+    );
+  }
+
+  // ── cancelled (and no prior result to show) ───────────────────────────────
+  if (s?.status === 'cancelled' && !outcome) {
+    return (
+      <div style={{ padding: '8px 4px' }}>
+        <Alert
+          type="info"
+          showIcon
+          message="Verification cancelled"
+          description="The parity audit was cancelled before it finished."
+          style={{ borderRadius: 8, marginBottom: 16 }}
+        />
+        <Button
+          type="primary"
+          icon={<SafetyCertificateOutlined />}
+          onClick={run}
+          loading={start.isPending}
+        >
+          Run verification
+        </Button>
+      </div>
+    );
   }
 
   // ── failed (and no prior result to show) ───────────────────────────────────
@@ -130,7 +168,9 @@ export default function VerifyTab({ ruleName }: Props) {
     <ParityResult
       outcome={outcome}
       reverifying={running}
+      reverifyScanned={running ? s?.progress_scanned : undefined}
       onReverify={run}
+      onCancelReverify={cancelling ? undefined : onCancel}
       onRunNow={onRunNow}
       runNowPending={runNow.isPending}
       c={c}
@@ -142,10 +182,13 @@ function LoadingBlock({
   c,
   label = 'Comparing source and destination…',
   scanned,
+  onCancel,
 }: {
   c: ReturnType<typeof useColors>;
   label?: string;
   scanned?: number;
+  /** When provided, shows a Cancel button (a running audit). */
+  onCancel?: () => void;
 }) {
   return (
     <div
@@ -170,6 +213,11 @@ function LoadingBlock({
       <Text type="secondary" style={{ fontSize: 11.5, color: c.TEXT_MUTED }}>
         Runs in the background — safe to navigate away.
       </Text>
+      {onCancel && (
+        <Button size="small" onClick={onCancel} style={{ marginTop: 4 }}>
+          Cancel
+        </Button>
+      )}
       <style>{`
         .dg-verify-spinner {
           width: 28px; height: 28px; border-radius: 50%;
@@ -188,7 +236,9 @@ function LoadingBlock({
 export function ParityResult({
   outcome,
   reverifying,
+  reverifyScanned,
   onReverify,
+  onCancelReverify,
   onRunNow,
   runNowPending,
   c,
@@ -196,7 +246,11 @@ export function ParityResult({
   outcome: ParityOutcome;
   /** A background re-verify is running — show a subtle badge + spin the button. */
   reverifying?: boolean;
+  /** Live objects-scanned of the in-flight re-verify (for the badge). */
+  reverifyScanned?: number;
   onReverify: () => void;
+  /** Cancel the in-flight re-verify. Omitted (or while cancelling) = no button. */
+  onCancelReverify?: () => void;
   /** Executes the rule's run-now (the only executable fix). Omitted = disabled CTA. */
   onRunNow?: () => void;
   runNowPending?: boolean;
@@ -334,10 +388,20 @@ export function ParityResult({
           Checked {timeAgo(scannedDate)} · logical SHA-256 + size, from metadata
         </div>
 
-        <div style={{ marginTop: 18 }}>
+        <div style={{ marginTop: 18, display: 'flex', gap: 8, justifyContent: 'center', alignItems: 'center' }}>
           <Button icon={<ReloadOutlined />} onClick={onReverify} loading={reverifying}>
             {reverifying ? 'Re-verifying…' : inSync ? 'Re-verify' : 'Verify again'}
           </Button>
+          {reverifying && onCancelReverify && (
+            <Button size="small" onClick={onCancelReverify}>
+              Cancel
+            </Button>
+          )}
+          {reverifying && reverifyScanned != null && reverifyScanned > 0 && (
+            <Text type="secondary" style={{ fontSize: 12, color: c.TEXT_MUTED, fontVariantNumeric: 'tabular-nums' }}>
+              {reverifyScanned.toLocaleString()} scanned
+            </Text>
+          )}
         </div>
       </div>
 

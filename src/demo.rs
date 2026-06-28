@@ -325,6 +325,10 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             "/_/api/admin/jobs/:id/verify",
             get(admin::jobs_verify_status).post(admin::jobs_verify_start),
         )
+        .route(
+            "/_/api/admin/jobs/:id/verify/cancel",
+            post(admin::jobs_verify_cancel),
+        )
         .route("/_/api/admin/jobs/:id/:action", post(admin::jobs_action))
         // Server-side bulk object operations. Replaces what the
         // browser used to do via @aws-sdk/client-s3. Handlers call the

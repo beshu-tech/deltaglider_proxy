@@ -886,6 +886,29 @@ impl ConfigDb {
         Ok(())
     }
 
+    /// Request cancellation: flip a RUNNING audit to 'cancelling'. The scan loop
+    /// polls this between pages and bails. No-op (returns false) if the row isn't
+    /// currently running. Returns true if a running audit was signalled.
+    pub fn parity_request_cancel(&self, rule: &str, now: i64) -> Result<bool, ConfigDbError> {
+        let n = self.conn.execute(
+            "UPDATE replication_parity SET status = 'cancelling', updated_at = ?
+             WHERE rule_name = ? AND status = 'running'",
+            params![now, rule],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Settle a cancelled audit to its terminal 'cancelled' state.
+    pub fn parity_result_cancelled(&self, rule: &str, now: i64) -> Result<(), ConfigDbError> {
+        self.conn.execute(
+            "UPDATE replication_parity
+             SET status = 'cancelled', last_error = NULL, updated_at = ?
+             WHERE rule_name = ?",
+            params![now, rule],
+        )?;
+        Ok(())
+    }
+
     /// Try to acquire the parity background-job lease for a rule.
     pub fn parity_try_acquire_lease(
         &self,
@@ -943,11 +966,12 @@ impl ConfigDb {
         Ok(())
     }
 
-    /// Boot reconcile: mark any 'running' row failed (a previous process died
-    /// mid-audit) AND clear its lease UNCONDITIONALLY. A process restart means
-    /// the holding process is gone, so the lease is dead even if it hasn't
-    /// expired yet — leaving a non-expired lease in place would block re-verify
-    /// for up to the full TTL. Returns rows reconciled.
+    /// Boot reconcile: mark any in-flight row ('running' OR 'cancelling') failed
+    /// (a previous process died mid-audit) AND clear its lease UNCONDITIONALLY.
+    /// A process restart means the holding process is gone, so the lease is dead
+    /// even if it hasn't expired — leaving it would block re-verify for the full
+    /// TTL; and a row stuck at 'cancelling' would make the UI poll forever.
+    /// Returns rows reconciled.
     pub fn parity_reconcile_on_boot(&self) -> Result<usize, ConfigDbError> {
         let now = current_unix_seconds();
         let n = self.conn.execute(
@@ -957,12 +981,25 @@ impl ConfigDb {
                  leader_instance_id = NULL,
                  leader_expires_at = NULL,
                  updated_at = ?
-             WHERE status = 'running'",
+             WHERE status IN ('running', 'cancelling')",
             params![now],
         )?;
         // Also clear any other stale (expired) leases on non-running rows.
         job_store::clear_stale_leases(&self.conn, "replication_parity", now)?;
         Ok(n)
+    }
+
+    /// Cheap status-only read for the per-page cancel check — avoids loading the
+    /// (possibly large) outcome_json just to compare the status string.
+    pub fn parity_status(&self, rule: &str) -> Result<Option<String>, ConfigDbError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT status FROM replication_parity WHERE rule_name = ?",
+                [rule],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?)
     }
 }
 
@@ -1344,6 +1381,27 @@ mod tests {
         let row = db.parity_result_load("r").unwrap().unwrap();
         assert_eq!(row.status, "failed");
         assert_eq!(row.last_error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn parity_cancel_flow_running_to_cancelled() {
+        let db = db();
+        // Cancelling an idle audit is a no-op.
+        assert!(!db.parity_request_cancel("r", 100).unwrap());
+        db.parity_result_set_running("r", 100).unwrap();
+        // Now a running audit can be signalled.
+        assert!(db.parity_request_cancel("r", 110).unwrap());
+        assert_eq!(
+            db.parity_result_load("r").unwrap().unwrap().status,
+            "cancelling"
+        );
+        // The scan settles it.
+        db.parity_result_cancelled("r", 120).unwrap();
+        let row = db.parity_result_load("r").unwrap().unwrap();
+        assert_eq!(row.status, "cancelled");
+        assert!(row.last_error.is_none());
+        // Cancelling a non-running (cancelled) row is again a no-op.
+        assert!(!db.parity_request_cancel("r", 130).unwrap());
     }
 
     #[test]

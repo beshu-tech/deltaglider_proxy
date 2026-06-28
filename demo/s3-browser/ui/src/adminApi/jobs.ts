@@ -171,6 +171,16 @@ export async function getVerifyStatus(ruleName: string): Promise<ParityStatus> {
   );
 }
 
+/** POST: cancel a running parity audit. */
+export async function cancelVerifyParity(ruleName: string): Promise<ParityStatus> {
+  const res = await adminFetch(
+    `/api/admin/jobs/replication:${encodeURIComponent(ruleName)}/verify/cancel`,
+    'POST'
+  );
+  if (!res.ok) await throwApiError(res, 'Cancel verification');
+  return safeJson(res);
+}
+
 export async function getJobRuns(id: string): Promise<{ runs: JobRunEntry[] }> {
   return fetchJson(`/api/admin/jobs/${encodeURIComponent(id)}/runs`, 'Job runs');
 }

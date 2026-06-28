@@ -489,6 +489,20 @@ pub async fn job_verify_start(
     Ok((code, Json(serde_json::to_value(resp).map_err(internal)?)))
 }
 
+/// POST /_/api/admin/jobs/:id/verify/cancel — cancel a running parity audit
+/// (replication only).
+pub async fn job_verify_cancel(
+    Path(id): Path<String>,
+    State(state): State<Arc<AdminState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let (sub, key) = parse_job_id(&id).ok_or(not_found())?;
+    if sub != JobSubsystem::Replication {
+        return Err(not_found());
+    }
+    let Json(resp) = super::replication::verify_cancel(Path(key.to_string()), State(state)).await?;
+    Ok(Json(serde_json::to_value(resp).map_err(internal)?))
+}
+
 /// GET /_/api/admin/jobs/:id/runs
 pub async fn job_runs(
     Path(id): Path<String>,
