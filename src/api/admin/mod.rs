@@ -76,9 +76,9 @@ pub use groups::{
 };
 pub use jobs::{
     job_action as jobs_action, job_failures as jobs_failures, job_parity_version,
-    job_runs as jobs_runs, job_verify_cancel as jobs_verify_cancel,
-    job_verify_start as jobs_verify_start, job_verify_status as jobs_verify_status,
-    list_jobs as jobs_list,
+    job_replication_event_version, job_replication_run_version, job_runs as jobs_runs,
+    job_verify_cancel as jobs_verify_cancel, job_verify_start as jobs_verify_start,
+    job_verify_status as jobs_verify_status, list_jobs as jobs_list,
 };
 pub use logs::{get_logs, get_logs_stream};
 pub use maintenance::{

@@ -869,6 +869,48 @@ pub async fn wait_for_iam_rebuild(client: &reqwest::Client, endpoint: &str, base
     }
 }
 
+/// Read the event-driven replication drain counter
+/// (`GET …/jobs/replication-event-version`), bumped each time the event
+/// consumer advances its cursor after handling real events.
+pub async fn get_replication_event_version(client: &reqwest::Client, endpoint: &str) -> u64 {
+    let resp = client
+        .get(format!(
+            "{endpoint}/_/api/admin/jobs/replication-event-version"
+        ))
+        .send()
+        .await
+        .expect("replication-event-version GET");
+    assert!(
+        resp.status().is_success(),
+        "replication-event-version must return 2xx (use an admin_http_client — \
+         the /_/api/admin/jobs/* routes are session-gated), got {}",
+        resp.status()
+    );
+    let body: serde_json::Value = resp.json().await.expect("event-version JSON");
+    body["version"].as_u64().expect("version is u64")
+}
+
+/// Wait until the event consumer has drained at least once past `baseline`.
+/// Deadline is generous (35s) because the consumer ticks on its own interval
+/// (≈5s) — the barrier replaces a `for _ in 0..30 { sleep(1s); get_object }`
+/// loop, so a settled drain (not S3 polling) is the observable. Panics on
+/// timeout so a broken consumer fails loudly.
+pub async fn wait_for_replication_event(client: &reqwest::Client, endpoint: &str, baseline: u64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(35);
+    loop {
+        if get_replication_event_version(client, endpoint).await > baseline {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "wait_for_replication_event timed out after 35s (baseline={baseline}) — \
+                 the event consumer didn't drain (cursor never advanced)"
+            );
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// Read the proxy's external-auth (OAuth/OIDC provider) version counter.
 ///
 /// Backed by `GET /_/api/admin/ext-auth/version`, incremented by

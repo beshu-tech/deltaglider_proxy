@@ -441,6 +441,10 @@ pub async fn run_rule(
         }
         db.replication_finish_run(run_id, &rule.name, &status, finished_at, totals, next_due)?;
     }
+    // Settle barrier: bump AFTER the terminal row is written so a test polling
+    // the run-version sees the settled run. The single chokepoint all scheduled
+    // runs pass through.
+    super::state_store::bump_replication_run_version();
 
     info!(
         "Replication run finished: rule='{}' status={} scanned={} copied={} skipped={} deleted={} errors={} bytes={}",

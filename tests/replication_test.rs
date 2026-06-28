@@ -1230,8 +1230,12 @@ async fn test_event_driven_replication_copies_and_deletes() {
         client.create_bucket().bucket(b).send().await.ok();
     }
 
+    let endpoint = server.endpoint();
+    let http = admin_http_client(&endpoint).await;
+
     // PUT a single object to the source. No run-now: the write-path emits an
     // event and the consumer (5s tick) should replicate it on its own.
+    let ev_before = common::get_replication_event_version(&http, &endpoint).await;
     client
         .put_object()
         .bucket("ev-src")
@@ -1241,30 +1245,20 @@ async fn test_event_driven_replication_copies_and_deletes() {
         .await
         .expect("put source object");
 
-    // Poll the destination for up to ~30s (several consumer ticks).
-    let mut replicated = false;
-    for _ in 0..30 {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        if let Ok(out) = client
-            .get_object()
-            .bucket("ev-dst")
-            .key("evt/obj.txt")
-            .send()
-            .await
-        {
-            let body = out.body.collect().await.unwrap().into_bytes();
-            if body.as_ref() == b"event-driven" {
-                replicated = true;
-                break;
-            }
-        }
-    }
-    assert!(
-        replicated,
-        "object should be replicated to ev-dst by the event consumer (no run-now)"
-    );
+    // Barrier on the consumer drain (no S3 polling / sleeps), then confirm once.
+    common::wait_for_replication_event(&http, &endpoint, ev_before).await;
+    let out = client
+        .get_object()
+        .bucket("ev-dst")
+        .key("evt/obj.txt")
+        .send()
+        .await
+        .expect("object should be replicated to ev-dst by the event consumer (no run-now)");
+    let body = out.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), b"event-driven", "replicated body matches");
 
     // Now DELETE the source object — the delete event should propagate.
+    let del_before = common::get_replication_event_version(&http, &endpoint).await;
     client
         .delete_object()
         .bucket("ev-src")
@@ -1273,23 +1267,14 @@ async fn test_event_driven_replication_copies_and_deletes() {
         .await
         .expect("delete source object");
 
-    let mut deleted = false;
-    for _ in 0..30 {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        match client
-            .get_object()
-            .bucket("ev-dst")
-            .key("evt/obj.txt")
-            .send()
-            .await
-        {
-            Err(_) => {
-                deleted = true;
-                break;
-            }
-            Ok(_) => continue,
-        }
-    }
+    common::wait_for_replication_event(&http, &endpoint, del_before).await;
+    let deleted = client
+        .get_object()
+        .bucket("ev-dst")
+        .key("evt/obj.txt")
+        .send()
+        .await
+        .is_err();
     assert!(
         deleted,
         "delete should propagate to ev-dst (replicate_deletes: true)"

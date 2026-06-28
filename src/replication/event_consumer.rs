@@ -475,9 +475,18 @@ async fn drain_once(
     // at or past the first failed id is left for next tick → at-least-once).
     let watermark = contiguous_watermark(&rows, &failed_ids, cursor);
     if watermark > cursor {
-        let dbg = db.lock().await;
-        let _ =
-            dbg.listener_cursor_advance(REPLICATION_LISTENER, watermark, current_unix_seconds());
+        {
+            let dbg = db.lock().await;
+            let _ = dbg.listener_cursor_advance(
+                REPLICATION_LISTENER,
+                watermark,
+                current_unix_seconds(),
+            );
+        }
+        // Settle barrier: a drain that advanced the cursor handled real events.
+        // Bump after the advance so a test polling the event-version can wait on
+        // a drain instead of polling S3 / sleeping (event-driven writes no run).
+        super::state_store::bump_replication_event_version();
         debug!(
             "event consumer: cursor {} -> {} ({} events drained)",
             cursor,

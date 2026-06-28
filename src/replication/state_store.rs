@@ -105,6 +105,33 @@ pub fn current_unix_seconds() -> i64 {
         .unwrap_or(0)
 }
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Monotonic counters bumped when a replication run settles (scheduled path) or
+/// an event-driven drain advances its cursor (event path). Mirror
+/// `PARITY_VERSION` / `IAM_VERSION` — let integration tests poll
+/// `GET …/jobs/replication-run-version` / `…/replication-event-version` for a
+/// deterministic barrier instead of sleeping. Process-local (one per proxy).
+static REPLICATION_RUN_VERSION: AtomicU64 = AtomicU64::new(0);
+static REPLICATION_EVENT_VERSION: AtomicU64 = AtomicU64::new(0);
+
+// ponytail: REPLICATION_RUN_VERSION ships ahead of its first consumer — it's the
+// convention-aligned scheduled-run barrier (mirrors PARITY_VERSION) for the next
+// scheduled-run test that would otherwise reach for sleep. The event-driven sibling
+// below already has a consumer (wait_for_replication_event).
+pub fn bump_replication_run_version() -> u64 {
+    REPLICATION_RUN_VERSION.fetch_add(1, Ordering::SeqCst) + 1
+}
+pub fn current_replication_run_version() -> u64 {
+    REPLICATION_RUN_VERSION.load(Ordering::SeqCst)
+}
+pub fn bump_replication_event_version() -> u64 {
+    REPLICATION_EVENT_VERSION.fetch_add(1, Ordering::SeqCst) + 1
+}
+pub fn current_replication_event_version() -> u64 {
+    REPLICATION_EVENT_VERSION.load(Ordering::SeqCst)
+}
+
 impl ConfigDb {
     /// Upsert the initial state row for a rule. Idempotent: existing
     /// rows (including `paused` flag + lifetime counters) are preserved.

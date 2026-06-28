@@ -511,6 +511,22 @@ pub async fn job_parity_version() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "version": crate::replication::parity::current_parity_version() }))
 }
 
+/// GET /_/api/admin/jobs/replication-run-version — bumped each time a SCHEDULED
+/// replication run settles. Sibling of parity-version; same test-barrier role.
+pub async fn job_replication_run_version() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "version": crate::replication::state_store::current_replication_run_version()
+    }))
+}
+
+/// GET /_/api/admin/jobs/replication-event-version — bumped each time an
+/// EVENT-DRIVEN drain advances its cursor (event-driven runs write no run row).
+pub async fn job_replication_event_version() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "version": crate::replication::state_store::current_replication_event_version()
+    }))
+}
+
 /// GET /_/api/admin/jobs/:id/runs
 pub async fn job_runs(
     Path(id): Path<String>,
