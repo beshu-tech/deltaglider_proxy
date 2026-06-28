@@ -30,6 +30,27 @@ limitations.
 - **True round-robin (non-sticky) HA: not yet** — proven correctness + security
   defects appear under exactly the topology `DGP_CONFIG_SYNC_BUCKET` was built for.
 
+> **Tier-C execution update (C1/C3/C4 — investigated, NOT built):** three of the
+> four strategic refactors this report proposed do not survive code inspection.
+> **C1 (collapse dual SigV4):** NOT feasible — the hand-rolled `sigv4_auth_middleware`
+> is not redundant with s3s; it uniquely owns the replay cache, rate-limiter
+> feedback, the `AuthenticatedUser` extension that authorization + the s3s adapter
+> read, the x-amz-content-sha256 body-integrity gate, and the anonymous/public-prefix
+> short-circuit. axum applies `.layer()` bottom-up, so SigV4+authorization run in the
+> middleware stack BEFORE the s3s fallback service — s3s structurally cannot be the
+> sole authority feeding an authorization step that runs earlier. The "~1000 LOC
+> deleted" premise is false; a two-phase redesign would keep most of the LOC and add
+> risk to the auth path. **C3 (promote parity):** declined — parity is cohesively
+> coupled to replication (operates on `ReplicationRule`, reuses the replication
+> planner's `rewrite_key`/`should_replicate`, `event_consumer`, `remediation`); moving
+> it leaks replication internals and the `JobSubsystem` trait is a one-implementation
+> abstraction. **C4 (single ConfigView):** declined — the 4 ArcSwaps span two structs
+> (engine on AppState w/ 48 read sites; the rest on AdminState); the transition already
+> runs the only fallible step first and the torn-read window fails closed (LOW
+> severity). Only **C2 (capability-split StorageBackend)** is a genuine, modest
+> improvement. Lesson: audit recommendations need their premise verified against the
+> wiring before execution.
+
 ### The core trap (biggest architectural risk)
 **Multi-instance coherence is half-true in a way operators cannot infer.** DGP
 ships a multi-instance story (IAM + job leases genuinely share state via
