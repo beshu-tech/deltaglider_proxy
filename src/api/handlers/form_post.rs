@@ -26,7 +26,7 @@
 //!
 //! ## Replay-guard blast-radius trade-off (documented)
 //!
-//! `form_post_replay_check` is now an idempotency/observability ledger, not a
+//! `form_post_replay_record` is now an idempotency/observability ledger, not a
 //! gate — it always allows. This MATCHES native AWS S3, which has no form-POST
 //! replay protection: a presigned POST is valid for as many policy-conforming
 //! uploads as fit within its expiration. The earlier guard capped a captured
@@ -707,16 +707,12 @@ fn form_post_replay_ttl(
 /// slot for more than 24 h regardless of the policy's claimed expiry.
 const MAX_FORM_POST_REPLAY_TTL_SECS: u64 = 24 * 60 * 60;
 
-/// A live entry in the form-POST replay cache.
+/// A live entry in the form-POST idempotency ledger.
 ///
-/// `expiry` is the policy's expiration `Instant` (capped at 24 h);
-/// `fingerprint` identifies the (resolved key, body) that this signature
-/// first wrote. Re-sending the SAME signed request reproduces the same
-/// fingerprint — that's an idempotent retry and is allowed. Reusing the
-/// captured signature to write a DIFFERENT key or body yields a different
-/// fingerprint and is blocked as a replay (form-POST `key` is
-/// `starts-with ""`, so one signature would otherwise authorise writing
-/// to ANY key).
+/// `expiry` is the policy's expiration `Instant` (capped at 24 h), used only for
+/// TTL eviction. The entry is keyed by `(signature, fingerprint)` in the cache
+/// (see [`form_post_replay_cache_key`]), so distinct files under one signature
+/// are distinct entries and a resend of the same file just refreshes its expiry.
 #[derive(Clone, Copy, Debug)]
 pub struct ReplayEntry {
     pub expiry: std::time::Instant,
@@ -831,7 +827,7 @@ fn enforce_form_post_replay(state: &Arc<AppState>, parsed: &ParsedFormPost) -> R
 
 /// Cache key for the replay guard: the request signature COMBINED with the
 /// `(key, body)` fingerprint. Keying on the pair is what distinguishes a true
-/// replay from a legitimate batch upload — see [`form_post_replay_check`].
+/// replay from a legitimate batch upload — see [`form_post_replay_record`].
 fn form_post_replay_cache_key(sig: &str, fingerprint: u64) -> String {
     format!("{sig}:{fingerprint:016x}")
 }
