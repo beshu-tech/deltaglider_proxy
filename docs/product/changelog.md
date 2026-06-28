@@ -8,7 +8,38 @@ Every released version of DeltaGlider Proxy, newest first. Versions
 follow [semantic versioning](https://semver.org/); the Docker image
 `beshultd/deltaglider_proxy:<version>` is published for each tag.
 
-_Last updated: 2026-06-27_
+_Last updated: 2026-06-28_
+
+## v1.7.0 — 2026-06-28
+
+### Fixed
+
+- **Batch uploads under one presigned POST signature no longer 403.** A
+  presigned browser/CI form-POST policy with `starts-with $key` is designed to
+  upload many files under a single signature (e.g. a release's `.zip` +
+  `.sha512` + `.sha1`). The replay guard treated the second and later files as a
+  replay attack and intermittently returned `403 SignatureDoesNotMatch` — after
+  the body had fully uploaded — whenever two files were signed in the same
+  second. The guard now keys on the signature **and** the file fingerprint, so a
+  batch of distinct files passes while an exact resend stays an idempotent
+  overwrite. The policy's own conditions (`starts-with $key`,
+  `content-length-range`, `expiration`) remain enforced on every request and are
+  the real bound on what a captured signature can write.
+
+### Added
+
+- **Streaming delta compression for unbounded object sizes (opt-in, dormant by
+  default).** New code paths reconstruct (GET) and encode (PUT/POST/copy) delta
+  objects through bounded-memory spool files instead of buffering the whole
+  object in RAM — so delta dedup can scale past the previous in-memory ceiling.
+  This is **off by default**: `DGP_SPOOL_THRESHOLD_BYTES` defaults to
+  `max_object_size`, so the streaming paths are unreachable until an operator
+  lowers the threshold. New tunables: `DGP_SPOOL_DIR`, `DGP_SPOOL_MAX_BYTES`,
+  `DGP_SPOOL_THRESHOLD_BYTES`, `DGP_SPOOL_ACQUIRE_TIMEOUT_SECS`,
+  `DGP_CODEC_STALL_SECS`, `DGP_CODEC_ABSOLUTE_SECS`. The xdelta3 codec gained a
+  stall-based watchdog and streaming entry points; the storage backends gained
+  `get_reference_to_file` / `put_reference_from_file` (filesystem hardlinks, S3
+  streams). See `docs/plan/streaming-delta-any-size.md`.
 
 ## v1.6.0 — 2026-06-27
 

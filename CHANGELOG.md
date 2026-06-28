@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.7.0 — 2026-06-28
+
 ### Fixed
 
 - **Batch uploads under one presigned POST signature no longer 403.** A
