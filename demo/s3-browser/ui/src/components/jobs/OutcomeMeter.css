@@ -6,6 +6,9 @@
   align-items: center;
   gap: 8px;
   min-width: 0;
+  /* Fill the cell: container-type:inline-size is size-contained and would
+     otherwise collapse to min-content inside the flex cell, hiding the track. */
+  width: 100%;
   container-type: inline-size;
   container-name: meter;
 }

@@ -5,6 +5,9 @@
   container-name: recordlist;
   display: grid;
   grid-template-columns: var(--rl-cols);
+  /* Fill the container so 1fr tracks expand — without it the grid shrinks to
+     content and the outcome column collapses, clipping the meter + label. */
+  width: 100%;
   column-gap: 12px;
   font-size: 12px;
 }
