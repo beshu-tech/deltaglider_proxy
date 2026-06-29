@@ -10,6 +10,17 @@ follow [semantic versioning](https://semver.org/); the Docker image
 
 _Last updated: 2026-06-29_
 
+## v1.8.2 — 2026-06-29
+
+### Fixed
+
+- **Job-drawer Runs/Failures/Verify lists collapsed to a sliver.** In the Jobs
+  drawer, the record list shrank to its content width instead of filling the
+  drawer, and the outcome meter inside it collapsed — the proportional track
+  disappeared and the outcome text clipped to a few characters (`run…`,
+  `459…`), readable only by hovering for the tooltip. The list now fills the
+  available width and the meter renders in full (dot · track · label).
+
 ## v1.8.1 — 2026-06-29
 
 ### Fixed
