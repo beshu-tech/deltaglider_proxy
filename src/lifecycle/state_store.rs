@@ -113,9 +113,20 @@ impl ConfigDb {
     /// page 0. Correct because `expire_before` is recomputed at the resumed
     /// run's start (a later cutoff only ever adds candidates) and every
     /// plan decision is per-object.
-    pub fn lifecycle_reconcile_on_boot(&self) -> Result<usize, ConfigDbError> {
+    ///
+    /// `max_failures_retained` is the same per-rule ring bound the normal
+    /// `lifecycle_record_failure` path uses — after inserting a failure
+    /// row per zombie the ring is pruned to it per affected rule, so a
+    /// rapid-restart loop can't grow `lifecycle_failures` unbounded.
+    pub fn lifecycle_reconcile_on_boot(
+        &self,
+        max_failures_retained: u32,
+    ) -> Result<usize, ConfigDbError> {
         let now = crate::lifecycle::current_unix_seconds();
         let zombies = job_store::find_zombie_runs(&self.conn, "lifecycle_run_history")?;
+        // Collect the distinct affected rules so the ring is pruned once per
+        // rule after the inserts (a rule with several zombie runs gets one prune).
+        let mut affected_rules: Vec<String> = Vec::new();
         for (id, rule_name, started_at) in &zombies {
             job_store::mark_run_failed(&self.conn, "lifecycle_run_history", *id, now)?;
             self.conn.execute(
@@ -138,6 +149,18 @@ impl ConfigDb {
                         last_run_at = ?
                   WHERE rule_name = ?",
                 params![now, rule_name],
+            )?;
+            if !affected_rules.contains(rule_name) {
+                affected_rules.push(rule_name.clone());
+            }
+        }
+        for rule_name in &affected_rules {
+            job_store::prune_failure_ring(
+                &self.conn,
+                "lifecycle_failures",
+                "rule_name",
+                rule_name,
+                max_failures_retained,
             )?;
         }
         job_store::clear_stale_leases(&self.conn, "lifecycle_state", now)?;
@@ -464,7 +487,7 @@ mod tests {
         db.lifecycle_set_continuation_token("r", Some("page-3"), "b|")
             .unwrap();
         let run = db.lifecycle_begin_run("r", 10, "scheduler").unwrap();
-        let n = db.lifecycle_reconcile_on_boot().unwrap();
+        let n = db.lifecycle_reconcile_on_boot(100).unwrap();
         assert_eq!(n, 1);
         let runs = db.lifecycle_recent_runs("r", 5).unwrap();
         assert_eq!(runs[0].id, run);
@@ -612,7 +635,7 @@ mod tests {
         db.lifecycle_ensure_state("r", 100).unwrap();
         db.lifecycle_begin_run("r", 200, "scheduler").unwrap();
 
-        let count = db.lifecycle_reconcile_on_boot().unwrap();
+        let count = db.lifecycle_reconcile_on_boot(100).unwrap();
         assert_eq!(count, 1);
 
         let runs = db.lifecycle_recent_runs("r", 10).unwrap();
@@ -620,5 +643,31 @@ mod tests {
         let failures = db.lifecycle_recent_failures("r", 10).unwrap();
         assert_eq!(failures.len(), 1);
         assert!(failures[0].error_message.contains("died mid-lifecycle-run"));
+    }
+
+    #[test]
+    fn reconcile_on_boot_prunes_failure_ring_per_affected_rule() {
+        // A rapid-restart loop inserts a failure row per zombie run but the
+        // ring must stay bounded to `max_failures_retained` per rule — the
+        // boot path now prunes, matching the normal record_failure path.
+        let db = db();
+        db.lifecycle_ensure_state("r", 100).unwrap();
+        const MAX: u32 = 3;
+        for _ in 0..(MAX as usize + 5) {
+            db.lifecycle_begin_run("r", 200, "scheduler").unwrap();
+        }
+
+        let count = db.lifecycle_reconcile_on_boot(MAX).unwrap();
+        assert_eq!(count, MAX as usize + 5);
+
+        let failures = db.lifecycle_recent_failures("r", 100).unwrap();
+        assert_eq!(
+            failures.len(),
+            MAX as usize,
+            "boot reconcile must prune the failure ring to max_failures_retained"
+        );
+        assert!(failures
+            .iter()
+            .all(|f| f.error_message.contains("died mid-lifecycle-run")));
     }
 }

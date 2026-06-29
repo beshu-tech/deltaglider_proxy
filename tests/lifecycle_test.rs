@@ -638,3 +638,83 @@ async fn test_lifecycle_retain_newest_keeps_reals_and_ignores_junk() {
             .unwrap_or_else(|e| panic!("{key} must be preserved: {e:?}"));
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════
+// Regression: a delete-action rule missing `expire_after` is a CONFIG
+// validation error, not an internal server error. Preview/run-now must
+// return 400 BAD_REQUEST, not 500. Previously the handler mapped every
+// Err(String) from run_or_preview to INTERNAL_SERVER_ERROR.
+// See lifecycle::classify_lifecycle_run_error.
+// ═════════════════════════════════════════════════════════════════════
+
+const LIFECYCLE_DELETE_MISSING_EXPIRE_AFTER_YAML: &str = r#"
+lifecycle:
+  enabled: true
+  tick_interval: "1h"
+  rules:
+    - name: expire-old
+      enabled: true
+      bucket: life-bucket
+      prefix: ""
+      # No expire_after — a delete (expire) action REQUIRES it. The run/preview
+      # path returns Err("lifecycle rule 'expire-old' delete action requires
+      # expire_after"); the admin handler must classify that as 400, not 500.
+      batch_size: 100
+      include_globs: ["old/**"]
+      exclude_globs: []
+"#;
+
+#[tokio::test]
+async fn test_lifecycle_preview_delete_without_expire_after_is_400_not_500() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(LIFECYCLE_DELETE_MISSING_EXPIRE_AFTER_YAML)
+        .build()
+        .await;
+
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    // Preview: validation error → 400 BAD_REQUEST (was 500 before the fix).
+    let resp = admin
+        .post(format!(
+            "{}/_/api/admin/jobs/lifecycle:expire-old/preview",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .expect("preview request");
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status.as_u16(),
+        400,
+        "preview of delete rule missing expire_after must be 400 (validation), got {}: {body}",
+        status
+    );
+    assert!(
+        body.contains("requires expire_after"),
+        "400 body should name the missing field, got: {body}"
+    );
+
+    // run-now: same validation error → 400 BAD_REQUEST (was 500 before the fix).
+    let resp = admin
+        .post(format!(
+            "{}/_/api/admin/jobs/lifecycle:expire-old/run-now",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .expect("run-now request");
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status.as_u16(),
+        400,
+        "run-now of delete rule missing expire_after must be 400 (validation), got {}: {body}",
+        status
+    );
+    assert!(
+        body.contains("requires expire_after"),
+        "400 body should name the missing field, got: {body}"
+    );
+}

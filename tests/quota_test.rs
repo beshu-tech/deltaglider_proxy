@@ -128,13 +128,29 @@ async fn test_quota_second_put_enforced() {
         .build()
         .await;
 
-    // First PUT: 20 KB (optimistic, no cached data)
+    // First PUT: 20 KB (optimistic, no cached data) — it triggers a background
+    // scan via check_quota → get_or_scan (cache empty → enqueue).
     put_sized(&server, "seed.bin", 20000).await.ok();
 
-    // Poll until the scanner catches up and blocks writes (max 10 seconds)
+    // Signal-driven poll: wait for a scan to complete (bounded, non-panicking),
+    // then probe. Replaces the old blind sleep(500ms)×N loop while preserving
+    // its retry-until-cache-reflects-reality structure (an early scan could
+    // cache a pre-seed snapshot). See common::wait_usage_scan_refresh_bounded.
+    let http = reqwest::Client::new();
+    let endpoint = server.endpoint();
     let mut blocked = false;
     for _ in 0..20 {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Wait for the next scan to settle (signal-driven, bounded to 500ms so
+        // the first iteration — no scan triggered yet — falls through like the
+        // old sleep did). Fresh baseline per iteration: no cross-iter mutation.
+        let baseline = common::get_usage_scan_version(&http, &endpoint).await;
+        let _ = common::wait_usage_scan_refresh_bounded(
+            &http,
+            &endpoint,
+            baseline,
+            std::time::Duration::from_millis(500),
+        )
+        .await;
         if put_sized(&server, "probe.bin", 10).await.is_err() {
             blocked = true;
             break;
@@ -166,10 +182,19 @@ async fn test_quota_delete_frees_space() {
     put_sized(&server, "fill1.bin", 8000).await.ok();
     put_sized(&server, "fill2.bin", 8000).await.ok();
 
-    // Wait for scanner to enforce quota
+    // Signal-driven poll for the scanner to catch up and enforce quota.
+    let http = reqwest::Client::new();
+    let endpoint = server.endpoint();
     let mut blocked = false;
     for _ in 0..20 {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let baseline = common::get_usage_scan_version(&http, &endpoint).await;
+        let _ = common::wait_usage_scan_refresh_bounded(
+            &http,
+            &endpoint,
+            baseline,
+            std::time::Duration::from_millis(500),
+        )
+        .await;
         if put_sized(&server, "probe_over.bin", 10).await.is_err() {
             blocked = true;
             break;
@@ -182,11 +207,18 @@ async fn test_quota_delete_frees_space() {
     delete(&server, "fill1.bin").await;
     delete(&server, "fill2.bin").await;
 
-    // Poll until scanner refreshes and allows writes again (max 15 seconds)
+    // Signal-driven poll until scanner refreshes and allows writes again.
     // Scanner cache TTL is 5 minutes, but get_or_scan re-triggers scan when stale.
     let mut freed = false;
     for _ in 0..30 {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let baseline = common::get_usage_scan_version(&http, &endpoint).await;
+        let _ = common::wait_usage_scan_refresh_bounded(
+            &http,
+            &endpoint,
+            baseline,
+            std::time::Duration::from_millis(500),
+        )
+        .await;
         if put_sized(&server, "after_delete.bin", 100).await.is_ok() {
             freed = true;
             break;

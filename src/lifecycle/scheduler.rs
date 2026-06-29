@@ -60,6 +60,22 @@ async fn run_due_rules(
     instance_id: &str,
 ) {
     for rule in lifecycle.rules.iter().filter(|rule| rule.enabled) {
+        // Config-time fatal gate: a rule that can NEVER run (delete/transition
+        // missing·invalid·out-of-range expire_after, retain-newest count=0,
+        // bad globs/durations) is skipped here — not run-and-failed every
+        // tick (the origin of the recurring Jobs-FAILED row). The same fn is
+        // enforced at /config/apply + `config lint`, so a new bad config is
+        // rejected before it reaches the scheduler; this guard is the
+        // defence for a rule already present in a YAML file at startup.
+        let fatal = super::planner::lifecycle_rule_errors(rule);
+        if !fatal.is_empty() {
+            warn!(
+                "Lifecycle scheduler skipping invalid rule '{}': {}",
+                rule.name,
+                fatal.join("; ")
+            );
+            continue;
+        }
         let now = super::current_unix_seconds();
         let mut process_guard = None;
         let should_run = if let Some(db) = db.as_ref() {

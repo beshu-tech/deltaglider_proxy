@@ -1231,7 +1231,9 @@ async fn test_event_driven_replication_copies_and_deletes() {
     }
 
     let endpoint = server.endpoint();
-    let http = admin_http_client(&endpoint).await;
+    // The jobs/*-version routes are public (like iam/version), so the barrier
+    // can be polled with a plain, unauthenticated client.
+    let http = reqwest::Client::new();
 
     // PUT a single object to the source. No run-now: the write-path emits an
     // event and the consumer (5s tick) should replicate it on its own.

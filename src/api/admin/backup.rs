@@ -1178,14 +1178,6 @@ async fn import_zip_full_backup(
         }
     }
 
-    // ── Phase B.1: apply config.yaml via the existing document-apply
-    //       endpoint (same path /_/api/admin/config/apply uses).
-    //       For simplicity we POST to our own endpoint rather than
-    //       refactoring the helper out of its handler — that lets
-    //       the YAML go through the exact same validate → apply →
-    //       persist pipeline a human would trigger via the GUI.
-    //       TODO(v0.9): extract a pub(crate) helper so this can be
-    //       called directly without the HTTP round-trip. ──
     if mode.restores_config() {
         if let Some(yaml_str) = yaml_str {
             // Skip application if the YAML is empty/whitespace-only.

@@ -50,8 +50,8 @@ lifecycle:
 /// Kick off the background parity audit (POST → 202) then poll the status
 /// (GET) until it reaches a terminal state, returning the `outcome` object so
 /// the existing assertions (out["in_sync"], out["matched"], …) keep working.
-async fn parity_version(admin: &reqwest::Client, endpoint: &str) -> u64 {
-    admin
+async fn parity_version(client: &reqwest::Client, endpoint: &str) -> u64 {
+    client
         .get(format!("{endpoint}/_/api/admin/jobs/parity-version"))
         .send()
         .await
@@ -65,9 +65,13 @@ async fn parity_version(admin: &reqwest::Client, endpoint: &str) -> u64 {
 
 async fn verify(admin: &reqwest::Client, endpoint: &str) -> Value {
     let url = format!("{endpoint}/_/api/admin/jobs/replication:parity-a-to-b/verify");
+    // The jobs/parity-version route is public (like iam/version), so the settle
+    // barrier can be polled with a plain, unauthenticated client. `admin` is
+    // still used for the verify POST/GET (those remain session-gated).
+    let barrier = reqwest::Client::new();
     // Capture the settle-counter BEFORE kicking off — the audit bumps it on
     // terminal write, giving a deterministic barrier (no status-row polling).
-    let before = parity_version(admin, endpoint).await;
+    let before = parity_version(&barrier, endpoint).await;
     let resp = admin.post(&url).send().await.expect("verify POST");
     let code = resp.status().as_u16();
     assert!(
@@ -76,7 +80,7 @@ async fn verify(admin: &reqwest::Client, endpoint: &str) -> Value {
     );
     // Wait for the counter to advance (≤ ~10s), then read the settled status.
     for _ in 0..100 {
-        if parity_version(admin, endpoint).await > before {
+        if parity_version(&barrier, endpoint).await > before {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

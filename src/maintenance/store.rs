@@ -244,9 +244,18 @@ impl ConfigDb {
             .collect())
     }
 
-    /// Claim the oldest queued job: set it `running`, stamp `started_at`
-    /// (first claim only — a resumed job keeps the original), and take
-    /// the leader lease. Returns the claimed job.
+    /// Claim the oldest queued job: take the leader lease via the canonical
+    /// `job_store` primitive (the same shape replication/lifecycle use), then
+    /// flip the row to `running` and stamp `started_at` (first claim only — a
+    /// resumed job keeps the original). Returns the claimed job.
+    ///
+    /// Both the lease acquire and the status flip run in ONE transaction so a
+    /// failed status UPDATE rolls back the lease — no stranded lease on a row
+    /// we don't own. `try_acquire_leader_lease` only touches the lease columns
+    /// (with a saturating expiry, unlike the old hand-rolled `now + ttl`); the
+    /// second UPDATE carries the status transition, guarded by
+    /// `status='queued'` (can't clobber a row another instance flipped) and
+    /// `leader_instance_id=?` (only the row we just leased).
     pub fn maintenance_claim_next_job(
         &self,
         instance_id: &str,
@@ -269,19 +278,38 @@ impl ConfigDb {
         let Some(id) = candidate else {
             return Ok(None);
         };
-        let updated = self.conn.execute(
+        // Route the lease write through the canonical job_store primitive and
+        // follow it with the status flip, both in one transaction.
+        let tx = self.conn.unchecked_transaction()?;
+        let acquired = job_store::try_acquire_leader_lease(
+            &tx,
+            "maintenance_jobs",
+            "id",
+            &id,
+            instance_id,
+            now,
+            lease_ttl_secs,
+        )?;
+        if !acquired {
+            // Another claimer holds the lease — nothing was written; the tx
+            // rolls back on drop.
+            return Ok(None);
+        }
+        let updated = tx.execute(
             "UPDATE maintenance_jobs
                 SET status = 'running',
                     started_at = COALESCE(started_at, ?),
-                    leader_instance_id = ?,
-                    leader_expires_at = ?,
                     updated_at = ?
-              WHERE id = ? AND status = 'queued'",
-            params![now, instance_id, now + lease_ttl_secs.max(1), now, id],
+              WHERE id = ? AND status = 'queued' AND leader_instance_id = ?",
+            params![now, now, id, instance_id],
         )?;
         if updated == 0 {
-            return Ok(None); // raced by another claimer
+            // The row slipped out of 'queued' between select and update (e.g.
+            // cancelled). Roll back the lease so the row stays claimable.
+            tx.rollback()?;
+            return Ok(None);
         }
+        tx.commit()?;
         let job = self.conn.query_row(
             &format!("SELECT {JOB_COLUMNS} FROM maintenance_jobs WHERE id = ?"),
             params![id],
@@ -579,6 +607,84 @@ mod tests {
             .maintenance_claim_next_job("worker-2", 11, 60)
             .unwrap()
             .is_none());
+    }
+
+    fn lease_cols(db: &ConfigDb, id: i64) -> (Option<String>, Option<i64>) {
+        db.conn
+            .query_row(
+                "SELECT leader_instance_id, leader_expires_at FROM maintenance_jobs WHERE id = ?",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn two_concurrent_claims_on_same_id_exactly_one_wins() {
+        // The canonical-lease claim must serialise two claimers on the same
+        // queued row: the first takes the lease + flips to running, the second
+        // gets Ok(None). Exercises the new job_store::try_acquire_leader_lease
+        // path (saturating expiry, single tx) end-to-end.
+        let db = db();
+        let id = db
+            .maintenance_create_job("reencrypt", "b", "counting", None, "admin", 1)
+            .unwrap()
+            .unwrap();
+
+        let winner = db
+            .maintenance_claim_next_job("inst-a", 100, 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!(winner.id, id);
+        assert_eq!(winner.status, "running");
+        assert_eq!(lease_cols(&db, id), (Some("inst-a".into()), Some(160)));
+
+        // A second claimer finds no 'queued' candidate (the row is now
+        // 'running') — exactly one winner.
+        assert!(db
+            .maintenance_claim_next_job("inst-b", 110, 60)
+            .unwrap()
+            .is_none());
+        // The winner's lease is untouched by the losing attempt.
+        assert_eq!(lease_cols(&db, id), (Some("inst-a".into()), Some(160)));
+    }
+
+    #[test]
+    fn reclaim_after_lease_expiry_succeeds_for_another_instance() {
+        // After the leader lease lapses, maintenance_requeue_abandoned flips
+        // the row back to 'queued', and a DIFFERENT instance can then claim it.
+        // This is the canonical-lease re-acquire path (steal requires
+        // `leader_expires_at < now` — strictly past, never at the boundary).
+        let db = db();
+        let id = db
+            .maintenance_create_job("reencrypt", "b", "counting", None, "admin", 1)
+            .unwrap()
+            .unwrap();
+        db.maintenance_claim_next_job("inst-a", 100, 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease_cols(&db, id).1, Some(160));
+
+        // A second claimer can't take the row while it's still 'running'
+        // under inst-a's live lease (the claim SELECT only picks 'queued').
+        assert!(db
+            .maintenance_claim_next_job("inst-b", 160, 60)
+            .unwrap()
+            .is_none());
+        // A lapsed lease can't be renewed either: inst-a's heartbeat AFTER
+        // expiry (now=161 > expires_at=160) is refused by the canonical
+        // `renew_leader_lease` (`>=` renew / `<` steal partition).
+        assert!(!db.maintenance_heartbeat(id, "inst-a", 161, 60).unwrap());
+        // requeue_abandoned (real clock > 160) flips the lapsed row back to
+        // 'queued'; a fresh claim by another instance then succeeds.
+        assert_eq!(db.maintenance_requeue_abandoned().unwrap(), 1);
+        let reclaimed = db
+            .maintenance_claim_next_job("inst-b", 200, 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reclaimed.id, id);
+        assert_eq!(reclaimed.status, "running");
+        assert_eq!(lease_cols(&db, id), (Some("inst-b".into()), Some(260)));
     }
 
     #[test]

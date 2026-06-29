@@ -16,6 +16,7 @@ pub mod config_apply;
 pub mod config_db;
 pub mod config_db_sync;
 pub mod config_sections;
+pub mod cors;
 pub mod deltaglider;
 pub mod event_delivery;
 pub mod event_outbox;

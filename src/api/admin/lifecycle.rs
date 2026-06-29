@@ -26,7 +26,7 @@ pub async fn preview(
     lifecycle::preview_rule(&engine, &rule, lifecycle_cfg.max_failures_retained as usize)
         .await
         .map(Json)
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))
+        .map_err(|err| (lifecycle::classify_lifecycle_run_error(&err), err))
 }
 
 /// Pause a lifecycle rule (scheduler skips it; run-now 409s).
@@ -187,7 +187,7 @@ pub async fn run_now(
         }),
     )
     .await
-    .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err));
+    .map_err(|err| (lifecycle::classify_lifecycle_run_error(&err), err));
     {
         let db = db_arc.lock().await;
         let _ = db.lifecycle_release_lease(&rule.name, &lease_owner);

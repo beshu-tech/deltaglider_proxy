@@ -184,6 +184,16 @@ pub async fn iam_version() -> impl IntoResponse {
     Json(serde_json::json!({ "version": iam::current_iam_version() }))
 }
 
+/// GET /api/admin/usage-scan-version — monotonic counter bumped after every
+/// completed usage-scan cache insert (success OR truncated). Sibling of
+/// `iam/version`: lets integration tests poll for a deterministic scan-refresh
+/// barrier instead of `sleep(500ms)` polls. Unauthenticated (public_admin):
+/// an opaque number that leaks no bucket/key state, matching the iam/version
+/// precedent.
+pub async fn usage_scan_version() -> impl IntoResponse {
+    Json(serde_json::json!({ "version": crate::usage_scanner::current_usage_scan_version() }))
+}
+
 /// GET /api/admin/users — list all users (secrets masked).
 /// Returns empty list if IAM DB is not initialized (legacy/open mode).
 pub async fn list_users(

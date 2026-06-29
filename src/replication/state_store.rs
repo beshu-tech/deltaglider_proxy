@@ -187,9 +187,22 @@ impl ConfigDb {
     /// them `failed` and log a per-rule failure row for operator
     /// visibility. Returns the number of zombie runs reconciled. Also
     /// clears stale leader leases.
-    pub fn replication_reconcile_on_boot(&self) -> Result<usize, ConfigDbError> {
+    ///
+    /// `max_failures_retained` is the same per-rule ring bound the normal
+    /// `replication_record_failure` path uses — after inserting a failure
+    /// row per zombie the ring is pruned to it per affected rule, so a
+    /// rapid-restart loop can't grow `replication_failures` unbounded
+    /// (only the normal failure-insert path pruned before).
+    pub fn replication_reconcile_on_boot(
+        &self,
+        max_failures_retained: u32,
+    ) -> Result<usize, ConfigDbError> {
         let now = current_unix_seconds();
         let zombies = job_store::find_zombie_runs(&self.conn, "replication_run_history")?;
+        // Collect the distinct affected rules so the ring is pruned once per
+        // rule after the inserts (a rule with several zombie runs gets one prune,
+        // not one per row).
+        let mut affected_rules: Vec<String> = Vec::new();
         for (id, rule_name, started_at) in &zombies {
             job_store::mark_run_failed(&self.conn, "replication_run_history", *id, now)?;
             self.conn.execute(
@@ -205,6 +218,18 @@ impl ConfigDb {
                         started_at
                     )
                 ],
+            )?;
+            if !affected_rules.contains(rule_name) {
+                affected_rules.push(rule_name.clone());
+            }
+        }
+        for rule_name in &affected_rules {
+            job_store::prune_failure_ring(
+                &self.conn,
+                "replication_failures",
+                "rule_name",
+                rule_name,
+                max_failures_retained,
             )?;
         }
         job_store::clear_stale_leases(&self.conn, "replication_state", now)?;
@@ -1314,7 +1339,7 @@ mod tests {
         db.replication_ensure_state("r", 100).unwrap();
         db.replication_begin_run("r", 200, "scheduler").unwrap();
 
-        let count = db.replication_reconcile_on_boot().unwrap();
+        let count = db.replication_reconcile_on_boot(100).unwrap();
         assert_eq!(count, 1);
 
         let runs = db.replication_recent_runs("r", 10).unwrap();
@@ -1322,6 +1347,43 @@ mod tests {
         let fails = db.replication_recent_failures("r", 10).unwrap();
         assert_eq!(fails.len(), 1);
         assert!(fails[0].error_message.contains("died mid-run"));
+    }
+
+    #[test]
+    fn reconcile_on_boot_prunes_failure_ring_per_affected_rule() {
+        // A rapid-restart loop inserts a failure row per zombie run but the
+        // ring must stay bounded to `max_failures_retained` per rule — the
+        // boot path now prunes, matching the normal record_failure path.
+        let db = db();
+        db.replication_ensure_state("r", 100).unwrap();
+        const MAX: u32 = 3;
+        // Start (MAX + 5) zombie runs for the same rule — each boot reconcile
+        // would otherwise accumulate one failure row, growing unbounded.
+        for _ in 0..(MAX as usize + 5) {
+            db.replication_begin_run("r", 200, "scheduler").unwrap();
+        }
+        // Sanity: that many running rows exist before reconcile.
+        let running = db
+            .replication_recent_runs("r", 100)
+            .unwrap()
+            .iter()
+            .filter(|r| r.status == "running")
+            .count();
+        assert_eq!(running, MAX as usize + 5);
+
+        let count = db.replication_reconcile_on_boot(MAX).unwrap();
+        assert_eq!(count, MAX as usize + 5);
+
+        // The ring is pruned to MAX for rule "r".
+        let fails = db.replication_recent_failures("r", 100).unwrap();
+        assert_eq!(
+            fails.len(),
+            MAX as usize,
+            "boot reconcile must prune the failure ring to max_failures_retained"
+        );
+        assert!(fails
+            .iter()
+            .all(|f| f.error_message.contains("died mid-run")));
     }
 
     #[test]

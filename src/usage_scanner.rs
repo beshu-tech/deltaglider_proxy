@@ -3,6 +3,7 @@
 //! Background usage scanner — computes prefix sizes asynchronously and caches results.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -12,6 +13,27 @@ use tracing::{debug, warn};
 
 use crate::api::handlers::AppState;
 use crate::storage::StorageBackend as _;
+
+/// Monotonic counter bumped after every completed usage-scan cache insert.
+/// Sibling of `iam::IAM_VERSION` / `EXT_AUTH_VERSION`: lets integration tests
+/// poll `GET /_/api/admin/usage-scan-version` for a deterministic scan-refresh
+/// barrier instead of blind `sleep(500ms)` polls (CLAUDE.md testability rule:
+/// "future async state changes … should follow the same pattern: a monotonic
+/// counter bumped after the new state is published"). Process-local: the
+/// scanner is a per-instance cache (per the HA contract).
+static USAGE_SCAN_VERSION: AtomicU64 = AtomicU64::new(0);
+
+/// Bump the scan-refresh counter. Called after a scan's result is inserted
+/// into the cache (success OR truncated — both are a settled cache entry).
+/// Returns the new version.
+pub fn bump_usage_scan_version() -> u64 {
+    USAGE_SCAN_VERSION.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// Current scan-refresh counter. Poll this to detect a completed scan.
+pub fn current_usage_scan_version() -> u64 {
+    USAGE_SCAN_VERSION.load(Ordering::SeqCst)
+}
 
 /// Cache TTL in seconds (5 minutes).
 /// Cache TTL for usage-scan results. Default 5 minutes; quota tests
@@ -224,6 +246,10 @@ impl UsageScanner {
                         "Usage scan complete"
                     );
                     Self::insert_with_eviction(&scanner.cache, key.clone(), entry);
+                    // Publish: a scan settled (success OR truncated) — bump the
+                    // refresh counter so test barriers (and future operators)
+                    // can detect it deterministically instead of blind-sleeping.
+                    crate::usage_scanner::bump_usage_scan_version();
                 }
                 Err(e) => {
                     warn!(
@@ -315,6 +341,19 @@ impl UsageScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_scan_version_is_monotonic() {
+        // The refresh counter must be strictly monotonic across bumps so a
+        // `wait_for_usage_scan_refresh(baseline)` barrier can detect completion
+        // by `current > baseline` without false positives.
+        let a = bump_usage_scan_version();
+        let b = bump_usage_scan_version();
+        let c = bump_usage_scan_version();
+        assert!(b > a, "bump must strictly increase: a={a} b={b}");
+        assert!(c > b, "bump must strictly increase: b={b} c={c}");
+        assert_eq!(current_usage_scan_version(), c);
+    }
 
     fn make_entry(bucket: &str, prefix: &str, size: u64, objects: u64) -> UsageEntry {
         UsageEntry {

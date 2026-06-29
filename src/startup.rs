@@ -16,7 +16,6 @@ use std::io::IsTerminal;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
-use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -681,7 +680,18 @@ pub fn build_s3_router(
                 1024usize,
             ),
         ))
-        .layer(CorsLayer::permissive())
+        .layer({
+            // SECURITY: In production (single-port architecture), CORS is not
+            // needed because the UI is served from the same origin.
+            // `CorsLayer::permissive()` would let any cross-origin browser
+            // context call the S3 API. Only enable permissive CORS when
+            // `DGP_CORS_PERMISSIVE=true` (dev mode). S3 SDK/CLI are non-browser
+            // so they're unaffected; the embedded UI is same-origin so it's
+            // unaffected in prod. Mirrors the admin router's branch in
+            // `demo.rs` via the shared `cors::cors_layer_for` pure fn.
+            let permissive = deltaglider_proxy::config::env_bool("DGP_CORS_PERMISSIVE", false);
+            deltaglider_proxy::cors::cors_layer_for(permissive)
+        })
         .with_state(state.clone())
 }
 
@@ -742,7 +752,7 @@ pub fn init_config_db(
     let db_file = config_db_path();
     match deltaglider_proxy::config_db::ConfigDb::open_or_create(&db_file, admin_password_hash) {
         Ok(db) => {
-            match db.replication_reconcile_on_boot() {
+            match db.replication_reconcile_on_boot(config.replication.max_failures_retained) {
                 Ok(count) if count > 0 => {
                     warn!(
                         "Reconciled {count} replication run(s) left running by a previous process"
@@ -763,7 +773,7 @@ pub fn init_config_db(
                     warn!("Failed to reconcile parity audit state on boot: {err}");
                 }
             }
-            match db.lifecycle_reconcile_on_boot() {
+            match db.lifecycle_reconcile_on_boot(config.lifecycle.max_failures_retained) {
                 Ok(count) if count > 0 => {
                     warn!("Reconciled {count} lifecycle run(s) left running by a previous process");
                 }

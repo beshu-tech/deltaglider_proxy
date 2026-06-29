@@ -523,7 +523,14 @@ pub async fn oauth_callback(
     // Evaluate group mapping rules and MERGE with existing memberships.
     // Manual group assignments (e.g., admin added user to "administrators" via GUI)
     // are preserved — mapping rules only ADD groups, never remove manually-assigned ones.
+    //
+    // SECURITY: gate email-based rules on `email_verified` — an unverified email
+    // (attacker-controllable on self-service IdPs) must not bootstrap a group
+    // grant via an `*@corp.com → administrators` rule. Non-email rules are
+    // unaffected. Login still succeeds as a bare identity with no email-derived
+    // groups; only the mapping is gated. See mapping::filter_rules_for_email_verification.
     let rules = db.load_group_mapping_rules().unwrap_or_default();
+    let rules = mapping::filter_rules_for_email_verification(&rules, &identity);
     let rule_groups = mapping::evaluate_mappings(&rules, &identity, provider_config.id);
     let existing_groups = db.get_user_group_ids(user.id).unwrap_or_default();
     let merged = merge_group_memberships(existing_groups, &rule_groups);

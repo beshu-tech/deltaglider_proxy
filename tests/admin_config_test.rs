@@ -467,6 +467,83 @@ backend:
 }
 
 #[tokio::test]
+async fn test_config_validate_rejects_lifecycle_delete_without_expire_after() {
+    // Root-cause fix: a delete-action lifecycle rule missing `expire_after` can
+    // NEVER run, so it's a fatal config error — /validate and /apply must
+    // reject with 400 (not accept it as a warning and then fail every scheduler
+    // tick → the Jobs FAILED row → the preview 500 the user hit). See
+    // lifecycle::planner::lifecycle_rule_errors + parse_and_validate_yaml.
+    let server = TestServer::builder()
+        .auth("LCPREVIEW", "LCSECRET")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    let yaml = r#"
+listen_addr: "127.0.0.1:9000"
+backend:
+  type: filesystem
+  path: /tmp/dgp-lifecycle-validate-test
+lifecycle:
+  enabled: true
+  tick_interval: "1h"
+  rules:
+    - name: expire-old
+      enabled: true
+      bucket: b
+      prefix: ""
+      # delete action, NO expire_after — fatal.
+      batch_size: 100
+      include_globs: ["old/**"]
+      exclude_globs: []
+"#;
+
+    // /validate: dry-run → 400 + error naming the missing field.
+    let resp = admin
+        .post(format!("{}/_/api/admin/config/validate", server.endpoint()))
+        .json(&json!({ "yaml": yaml }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "validate must reject delete rule missing expire_after with 400"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], false);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("requires expire_after"),
+        "error must name the missing field: {body}"
+    );
+
+    // /apply: same rejection — the bad rule never enters running config.
+    let resp = admin
+        .post(format!("{}/_/api/admin/config/apply", server.endpoint()))
+        .json(&json!({ "yaml": yaml }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "apply must reject delete rule missing expire_after with 400"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["applied"], false);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("requires expire_after"),
+        "error must name the missing field: {body}"
+    );
+}
+
+#[tokio::test]
 async fn test_config_apply_hot_reloads_ratio() {
     let server = TestServer::builder()
         .auth("APPLYKEY", "APPLYSECRET")

@@ -12,7 +12,6 @@ use axum::{
 };
 use rust_embed::Embed;
 use std::sync::Arc;
-use tower_http::cors::{Any, CorsLayer};
 
 use deltaglider_proxy::api::admin::{self, AdminState};
 
@@ -314,21 +313,6 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             "/_/api/admin/jobs/reencrypt",
             post(admin::maintenance_start_reencrypt),
         )
-        // Literal siblings of /jobs/:id/* (1-deep, like reencrypt) — settle
-        // counters for deterministic test barriers (parity / scheduled run /
-        // event-driven drain).
-        .route(
-            "/_/api/admin/jobs/parity-version",
-            get(admin::job_parity_version),
-        )
-        .route(
-            "/_/api/admin/jobs/replication-run-version",
-            get(admin::job_replication_run_version),
-        )
-        .route(
-            "/_/api/admin/jobs/replication-event-version",
-            get(admin::job_replication_event_version),
-        )
         .route("/_/api/admin/jobs/:id/runs", get(admin::jobs_runs))
         .route("/_/api/admin/jobs/:id/failures", get(admin::jobs_failures))
         // `verify` is a LITERAL segment handling BOTH GET (poll status) and POST
@@ -388,11 +372,35 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         // number and is consumed by integration tests + internal tooling
         // to barrier on IAM mutations without a blind `sleep(1s)`.
         .route("/_/api/admin/iam/version", get(admin::iam_version))
+        // Sibling of iam/version: monotonic counter bumped after every completed
+        // usage-scan cache insert. Public (opaque number, no state leak) — lets
+        // tests poll a deterministic scan-refresh barrier instead of blind sleeps.
+        .route(
+            "/_/api/admin/usage-scan-version",
+            get(admin::usage_scan_version),
+        )
         // Sibling of iam/version: monotonic counter bumped on every external-auth
         // (OAuth/OIDC provider) rebuild. Public for the same reasons.
         .route(
             "/_/api/admin/ext-auth/version",
             get(admin::external_auth::ext_auth_version),
+        )
+        // Monotonic settle counters for the jobs subsystem. Public by design —
+        // each exposes an opaque number (no PII / config leak) and is consumed
+        // by integration tests + internal tooling to barrier on background-job
+        // completion (parity audit / scheduled run / event-driven drain)
+        // without a blind `sleep`.
+        .route(
+            "/_/api/admin/jobs/parity-version",
+            get(admin::job_parity_version),
+        )
+        .route(
+            "/_/api/admin/jobs/replication-run-version",
+            get(admin::job_replication_run_version),
+        )
+        .route(
+            "/_/api/admin/jobs/replication-event-version",
+            get(admin::job_replication_event_version),
         )
         .route("/_/api/whoami", get(admin::whoami))
         // OAuth flow (public — browser redirects back here)
@@ -460,16 +468,7 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             // enable CSRF attacks against session-cookie-authenticated admin endpoints.
             // Only enable permissive CORS when DGP_CORS_PERMISSIVE=true (dev mode).
             let permissive = deltaglider_proxy::config::env_bool("DGP_CORS_PERMISSIVE", false);
-            if permissive {
-                CorsLayer::new()
-                    .allow_origin(Any)
-                    .allow_methods(Any)
-                    .allow_headers(Any)
-            } else {
-                // Same-origin requests don't need CORS headers; cross-origin
-                // requests are blocked by the browser's same-origin policy.
-                CorsLayer::new()
-            }
+            deltaglider_proxy::cors::cors_layer_for(permissive)
         })
 }
 

@@ -869,6 +869,90 @@ pub async fn wait_for_iam_rebuild(client: &reqwest::Client, endpoint: &str, base
     }
 }
 
+/// Read the usage-scan refresh counter (`GET …/usage-scan-version`), bumped
+/// after every completed usage-scan cache insert. Sibling of
+/// [`get_iam_version`]; used by [`wait_for_usage_scan_refresh`].
+pub async fn get_usage_scan_version(client: &reqwest::Client, endpoint: &str) -> u64 {
+    let resp = client
+        .get(format!("{endpoint}/_/api/admin/usage-scan-version"))
+        .send()
+        .await
+        .expect("usage-scan-version GET");
+    assert!(
+        resp.status().is_success(),
+        "usage-scan-version must return 2xx, got {}",
+        resp.status()
+    );
+    let body: serde_json::Value = resp.json().await.expect("usage-scan-version JSON");
+    body["version"].as_u64().expect("version is u64")
+}
+
+/// Wait until the usage-scan refresh counter advances past `baseline` — i.e.
+/// a background scan has completed and inserted its result into the cache.
+/// Replaces the blind `sleep(500ms)×N` polling the quota tests used to use
+/// (CLAUDE.md testability rule: observable counter over sleep). `deadline_secs`
+/// defaults to 15 because a scan lists the prefix (heavier than an IAM rebuild)
+/// and the TTL-shortened test scans re-trigger on each stale probe.
+///
+/// Call pattern: capture `baseline` BEFORE the action that triggers a scan
+/// (a PUT's `check_quota` → `get_or_scan` enqueues one when the cache is
+/// missing/stale), then `wait_for_usage_scan_refresh(&http, &endpoint, baseline)`.
+pub async fn wait_for_usage_scan_refresh(client: &reqwest::Client, endpoint: &str, baseline: u64) {
+    wait_for_usage_scan_refresh_within(client, endpoint, baseline, Duration::from_secs(15)).await
+}
+
+pub async fn wait_for_usage_scan_refresh_within(
+    client: &reqwest::Client,
+    endpoint: &str,
+    baseline: u64,
+    deadline_dur: Duration,
+) {
+    let deadline = std::time::Instant::now() + deadline_dur;
+    let mut attempts = 0u32;
+    loop {
+        let current = get_usage_scan_version(client, endpoint).await;
+        if current > baseline {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "wait_for_usage_scan_refresh timed out after {deadline_dur:?}: \
+                 baseline={baseline}, current={current}, attempts={attempts} — no \
+                 usage scan completed; either nothing triggered get_or_scan or \
+                 the counter isn't being bumped"
+            );
+        }
+        attempts += 1;
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Bounded, NON-panicking variant of [`wait_for_usage_scan_refresh`]: waits up
+/// to `max` for the counter to advance past `baseline`, returning the highest
+/// version seen (== `baseline` if no scan completed in the window). For retry
+/// loops that must fall through on no-advance (e.g. the first iteration before
+/// any scan is triggered) instead of panicking — replaces the old blind
+/// `sleep(500ms)` polls in the quota tests with a signal-driven wait that still
+/// preserves their retry-until-cache-reflects-reality structure.
+pub async fn wait_usage_scan_refresh_bounded(
+    client: &reqwest::Client,
+    endpoint: &str,
+    baseline: u64,
+    max: Duration,
+) -> u64 {
+    let deadline = std::time::Instant::now() + max;
+    loop {
+        let current = get_usage_scan_version(client, endpoint).await;
+        if current > baseline {
+            return current;
+        }
+        if std::time::Instant::now() >= deadline {
+            return current;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Read the event-driven replication drain counter
 /// (`GET …/jobs/replication-event-version`), bumped each time the event
 /// consumer advances its cursor after handling real events.
@@ -882,8 +966,7 @@ pub async fn get_replication_event_version(client: &reqwest::Client, endpoint: &
         .expect("replication-event-version GET");
     assert!(
         resp.status().is_success(),
-        "replication-event-version must return 2xx (use an admin_http_client — \
-         the /_/api/admin/jobs/* routes are session-gated), got {}",
+        "replication-event-version must return 2xx (the route is public — no auth needed), got {}",
         resp.status()
     );
     let body: serde_json::Value = resp.json().await.expect("event-version JSON");

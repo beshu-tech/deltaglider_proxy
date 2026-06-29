@@ -213,26 +213,39 @@ impl ConfigDb {
             .ok_or_else(|| ConfigDbError::Other("event outbox insert returned no row id".into()))
     }
 
+    /// Insert a batch of outbox events **atomically**.
+    ///
+    /// All rows commit in a single SQLite transaction
+    /// (`unchecked_transaction` + `commit`), so a crash mid-batch can never
+    /// leave a partial write — a ~10K-row batch either lands in full or not
+    /// at all. Mirrors the atomicity guarantee of
+    /// [`event_outbox_requeue_failed_many`](Self::event_outbox_requeue_failed_many).
+    /// No schema change; the S3 path still holds the same `ConfigDb` tokio
+    /// Mutex (a later phase addresses contention).
     pub fn event_outbox_insert_many(&self, events: &[NewEvent]) -> Result<Vec<i64>, ConfigDbError> {
-        let mut stmt = self.conn.prepare(
-            "INSERT INTO event_outbox
-                (kind, bucket, object_key, source, occurred_at, payload_json, status)
-             VALUES (?, ?, ?, ?, ?, ?, 'pending')",
-        )?;
+        let tx = self.conn.unchecked_transaction()?;
         let mut ids = Vec::with_capacity(events.len());
-        for event in events {
-            let payload_json = serde_json::to_string(&event.payload)
-                .map_err(|e| ConfigDbError::Other(e.to_string()))?;
-            let id = stmt.insert(params![
-                event.kind.as_str(),
-                event.bucket,
-                event.key,
-                event.source.as_str(),
-                event.occurred_at,
-                payload_json
-            ])?;
-            ids.push(id);
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO event_outbox
+                    (kind, bucket, object_key, source, occurred_at, payload_json, status)
+                 VALUES (?, ?, ?, ?, ?, ?, 'pending')",
+            )?;
+            for event in events {
+                let payload_json = serde_json::to_string(&event.payload)
+                    .map_err(|e| ConfigDbError::Other(e.to_string()))?;
+                let id = stmt.insert(params![
+                    event.kind.as_str(),
+                    event.bucket,
+                    event.key,
+                    event.source.as_str(),
+                    event.occurred_at,
+                    payload_json
+                ])?;
+                ids.push(id);
+            }
         }
+        tx.commit()?;
         Ok(ids)
     }
 
@@ -834,6 +847,34 @@ mod tests {
         assert_eq!(rows[0].status, STATUS_PENDING);
         assert_eq!(rows[0].payload, json!({ "size": 123 }));
         assert_eq!(rows[1].key, "a");
+    }
+
+    #[test]
+    fn insert_many_atomic_and_ordered() {
+        // Mirrors `insert_and_recent_preserve_payload_order` but exercises the
+        // batched `event_outbox_insert_many` path: N=0 is a no-op, and a
+        // multi-row batch commits atomically (all-or-nothing) with ids landing
+        // in insertion order.
+        let db = ConfigDb::in_memory("test-pass").unwrap();
+
+        // N=0: no-op — empty ids, nothing written.
+        let ids = db.event_outbox_insert_many(&[]).unwrap();
+        assert!(ids.is_empty());
+        assert_eq!(db.event_outbox_recent(10).unwrap().len(), 0);
+
+        // N=3: single atomic transaction; ids strictly increasing.
+        let events = vec![event_at(10, "a"), event_at(20, "b"), event_at(30, "c")];
+        let ids = db.event_outbox_insert_many(&events).unwrap();
+        assert_eq!(ids.len(), 3);
+        assert!(ids[0] < ids[1] && ids[1] < ids[2]);
+
+        // event_outbox_recent orders newest-first (occurred_at DESC, id DESC).
+        let rows = db.event_outbox_recent(10).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].key, "c");
+        assert_eq!(rows[1].key, "b");
+        assert_eq!(rows[2].key, "a");
+        assert_eq!(rows[0].status, STATUS_PENDING);
     }
 
     #[test]
