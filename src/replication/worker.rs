@@ -154,6 +154,10 @@ pub async fn run_rule(
     let mut totals = RunTotals::default();
     let mut had_any_error = false;
     let mut hit_fatal_error = false;
+    // Set when the operator pauses the rule mid-run (DB `paused` flag, re-read
+    // at each page boundary). A paused stop is NOT an error: it preserves the
+    // cursor so resume continues, and settles the run as "stopped".
+    let mut stopped_paused = false;
     let cap = rule.batch_size.clamp(1, 10_000);
     let source_prefix = normalize_prefix(&rule.source.prefix);
     let lease_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -163,6 +167,28 @@ pub async fn run_rule(
     let mut pager = Pager::resuming(continuation);
     // ── Forward-copy pass: paginate source until exhausted ──
     'pages: while let Some(page_idx) = pager.begin_page() {
+        // Honor an operator pause MID-RUN: re-read the DB `paused` flag at each
+        // page boundary so a long sweep stops promptly instead of running to
+        // completion (the bug: pause only blocked the SCHEDULER from STARTING a
+        // run, never the in-flight one). Clean stop — cursor is preserved below
+        // so resume continues; not an error.
+        // ponytail: this covers PAUSE (a DB flag, live-visible here). DISABLE
+        // (`enabled: false`) is a config edit and the worker holds a snapshot
+        // `&ReplicationRule`, so a mid-run disable is NOT yet interrupted — the
+        // operator's stop button is Pause. To also honor disable mid-run, thread
+        // the live SharedConfig into run_rule and re-check `rule.enabled` here.
+        if {
+            let db = db.lock().await;
+            matches!(db.replication_load_state(&rule.name), Ok(Some(st)) if st.paused)
+        } {
+            info!(
+                "replication rule '{}' paused mid-run — stopping after page {} (cursor preserved for resume)",
+                rule.name, page_idx
+            );
+            stopped_paused = true;
+            break 'pages;
+        }
+
         if !renew_run_lease(
             &db,
             rule,
@@ -387,7 +413,7 @@ pub async fn run_rule(
     // Only fires when forward-copy didn't hit a fatal error — partial
     // listing failures could leave us thinking source is empty when
     // it's not, and a full destination wipe would be catastrophic.
-    if rule.replicate_deletes && !hit_fatal_error {
+    if rule.replicate_deletes && !hit_fatal_error && !stopped_paused {
         if let Err(e) = run_delete_pass(
             db.clone(),
             engine,
@@ -412,7 +438,12 @@ pub async fn run_rule(
     //   still copied everything else; flagging it "failed" cried wolf on
     //   99.99%-good runs and buried real fatal failures in the noise.
     // - "succeeded": clean pass, zero errors.
-    let status = if hit_fatal_error || (had_any_error && totals.objects_copied == 0) {
+    // A pause stop settles as "stopped" — NOT failed/completed (the sweep was
+    // intentionally interrupted, not broken). It outranks the error-derived
+    // states because the partial-progress that's left is by operator request.
+    let status = if stopped_paused {
+        "stopped".to_string()
+    } else if hit_fatal_error || (had_any_error && totals.objects_copied == 0) {
         "failed".to_string()
     } else if had_any_error {
         "completed_with_errors".to_string()
@@ -430,9 +461,11 @@ pub async fn run_rule(
         compute_next_due(rule, finished_at)
     };
 
-    // Clear the continuation token on a clean complete pass — next
-    // run starts from the beginning of the prefix.
-    let clear_cursor_on_clean = !hit_fatal_error;
+    // Clear the continuation token on a clean complete pass — next run starts
+    // from the beginning. A paused stop PRESERVES the cursor so resume picks up
+    // mid-prefix; a fatal error also keeps it (poison-token guard handles bad
+    // tokens separately).
+    let clear_cursor_on_clean = !hit_fatal_error && !stopped_paused;
 
     {
         let db = db.lock().await;

@@ -78,7 +78,10 @@ pub fn normalize_status(raw: &str) -> &'static str {
         "succeeded" | "completed" => "succeeded",
         "completed_with_errors" => "completed_with_errors",
         "failed" => "failed",
-        "cancelled" => "cancelled",
+        // A run halted mid-sweep by an operator pause is terminal-but-interrupted —
+        // surface it as `cancelled` (same vocabulary as an explicit cancel) so the
+        // UI stops showing it as `running`. Cursor is preserved; resume continues.
+        "cancelled" | "stopped" => "cancelled",
         _ => "idle",
     }
 }

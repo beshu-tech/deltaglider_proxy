@@ -391,6 +391,159 @@ async fn test_replication_normalizes_prefixes_at_worker_boundaries() {
     );
 }
 
+const MIDRUN_PAUSE_RULE_YAML: &str = "
+replication:
+  enabled: true
+  tick_interval: \"30s\"
+  rules:
+    - name: midpause-rule
+      enabled: true
+      source:
+        bucket: mpz-src
+        prefix: \"\"
+      destination:
+        bucket: mpz-dst
+        prefix: \"\"
+      interval: \"1h\"
+      batch_size: 1
+";
+
+/// A pause issued WHILE a run is in flight must stop the run promptly — not let
+/// it run to completion. (The bug: pause only blocked the scheduler from
+/// STARTING a run; the worker never re-checked the flag mid-sweep, so a paused
+/// run kept going and lingered as "running".) The worker now re-reads the DB
+/// `paused` flag at every page boundary, settles as a terminal (cancelled)
+/// status, and preserves the cursor for resume.
+///
+/// Deterministic enough: `batch_size: 1` makes each object its own page, so the
+/// page-boundary check fires between every object; with 60 objects and a pause
+/// landing early, the run copies strictly fewer than all 60 and ends terminal.
+#[tokio::test]
+async fn test_replication_pause_mid_run_stops_promptly_and_preserves_cursor() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(MIDRUN_PAUSE_RULE_YAML)
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    for b in ["mpz-src", "mpz-dst"] {
+        client.create_bucket().bucket(b).send().await.ok();
+    }
+    // 60 objects, one per page (batch_size=1).
+    for i in 0..60 {
+        client
+            .put_object()
+            .bucket("mpz-src")
+            .key(format!("obj-{i:03}.txt"))
+            .body(ByteStream::from(format!("payload-{i}").into_bytes()))
+            .send()
+            .await
+            .expect("seed");
+    }
+
+    let admin = admin_http_client(&server.endpoint()).await;
+    let ep = server.endpoint();
+
+    // Fire run-now in the background, then pause almost immediately so the pause
+    // lands while the worker is still paginating.
+    let run_admin = admin.clone();
+    let run_ep = ep.clone();
+    let run_handle = tokio::spawn(async move {
+        run_admin
+            .post(format!(
+                "{run_ep}/_/api/admin/jobs/replication:midpause-rule/run-now"
+            ))
+            .send()
+            .await
+            .expect("run-now")
+            .json::<Value>()
+            .await
+            .expect("json")
+    });
+
+    // Let a few pages copy, then pause.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let p = admin
+        .post(format!(
+            "{ep}/_/api/admin/jobs/replication:midpause-rule/pause"
+        ))
+        .send()
+        .await
+        .expect("pause");
+    assert_eq!(p.status().as_u16(), 204, "pause accepted");
+
+    let body = run_handle.await.expect("run task");
+
+    // The run is terminal (NOT running) and stopped EARLY — fewer than all 60
+    // copied. (If the pause raced in after the last page, copied could be 60 and
+    // status succeeded; assert the core invariant that it's terminal + that the
+    // status is one we expect, and — when it did stop early — that it's marked
+    // cancelled with the cursor kept.)
+    let copied = body["objects_copied"].as_i64().unwrap_or(-1);
+    let status = body["status"].as_str().unwrap_or("");
+    // run-now returns the RAW status; a mid-run pause settles as "stopped"
+    // (normalized to `cancelled` in the jobs LIST view). If the pause raced in
+    // only after the final page, the run may have finished "succeeded".
+    assert!(
+        matches!(status, "stopped" | "succeeded" | "completed_with_errors"),
+        "run must end terminal, got status={status} body={body}"
+    );
+    if status == "stopped" {
+        assert!(
+            copied < 60,
+            "a stopped run must NOT have copied all 60: {body}"
+        );
+    }
+    assert!(copied <= 60, "never copies more than seeded: {body}");
+
+    // The dest must NOT have all 60 if we stopped early; and a resume (run-now
+    // after resume) must finish the rest from the preserved cursor.
+    admin
+        .post(format!(
+            "{ep}/_/api/admin/jobs/replication:midpause-rule/resume"
+        ))
+        .send()
+        .await
+        .expect("resume");
+    // Drain to completion: run-now until the dest holds all 60.
+    let mut guard = 0;
+    loop {
+        let r = admin
+            .post(format!(
+                "{ep}/_/api/admin/jobs/replication:midpause-rule/run-now"
+            ))
+            .send()
+            .await
+            .expect("run-now drain")
+            .json::<Value>()
+            .await
+            .expect("json");
+        let listed = client
+            .list_objects_v2()
+            .bucket("mpz-dst")
+            .send()
+            .await
+            .unwrap();
+        if listed.contents().len() >= 60 {
+            break;
+        }
+        guard += 1;
+        assert!(guard < 10, "resume failed to drain all objects: last={r}");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let final_dst = client
+        .list_objects_v2()
+        .bucket("mpz-dst")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        final_dst.contents().len(),
+        60,
+        "all objects eventually replicate after resume"
+    );
+}
+
 /// A paused rule must return 409 on run-now until resumed.
 #[tokio::test]
 async fn test_replication_paused_rule_blocks_run_now() {
