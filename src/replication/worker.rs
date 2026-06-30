@@ -154,6 +154,10 @@ pub async fn run_rule(
     let mut totals = RunTotals::default();
     let mut had_any_error = false;
     let mut hit_fatal_error = false;
+    // Set only on a dest-unusable abort (dead bucket / over quota). Such a dest
+    // won't recover in 60s, so we back off to the rule's normal cadence rather
+    // than re-firing every minute and hammering the dead endpoint forever.
+    let mut dest_unusable = false;
     // Set when the operator pauses the rule mid-run (DB `paused` flag, re-read
     // at each page boundary). A paused stop is NOT an error: it preserves the
     // cursor so resume continues, and settles the run as "stopped".
@@ -378,6 +382,7 @@ pub async fn run_rule(
         // failure/clear writes already happened inside each unit; any
         // ConfigDb error is surfaced here (the first one wins).
         let mut dest_fatal = false;
+        let mut page_copied: i64 = 0;
         for res in object_results {
             let res = res?;
             totals.objects_copied += res.objects_copied;
@@ -386,6 +391,7 @@ pub async fn run_rule(
             totals.errors += res.errors;
             totals.delta_passthrough += res.delta_passthrough;
             totals.bytes_egress_saved += res.bytes_egress_saved;
+            page_copied += res.objects_copied;
             if res.had_error {
                 had_any_error = true;
             }
@@ -398,13 +404,18 @@ pub async fn run_rule(
         }
         // Destination unusable (bucket missing / over quota) — abort the run
         // instead of retrying every remaining object against a dead dest.
-        if dest_fatal {
+        // GATE on zero successes this page: a single object's stray token
+        // ("quota" in an IAM denial, a key echoing "storage limit") must NOT
+        // abort a page that is otherwise copying fine. A truly dead dest fails
+        // EVERY object, so page_copied==0 holds for the real case.
+        if dest_fatal && page_copied == 0 {
             flush_page_events(&db, &rule.name, &mut page_events).await;
             warn!(
                 "replication rule '{}' aborting run: destination unusable (bucket missing or over quota)",
                 rule.name
             );
             hit_fatal_error = true;
+            dest_unusable = true;
             break 'pages;
         }
         {
@@ -501,9 +512,13 @@ pub async fn run_rule(
     };
 
     let finished_at = current_unix_seconds();
-    let next_due = if hit_fatal_error {
-        // Tighter retry on fatal errors so the operator-facing
-        // "next due" doesn't claim a long sleep when the worker
+    let next_due = if dest_unusable {
+        // Dead dest won't recover in a minute — back off to the rule's normal
+        // cadence (but never faster than 60s) instead of hammering every minute.
+        compute_next_due(rule, finished_at).max(finished_at + 60)
+    } else if hit_fatal_error {
+        // Tighter retry on other fatal errors (e.g. couldn't list source) so the
+        // operator-facing "next due" doesn't claim a long sleep when the worker
         // gave up immediately.
         finished_at + 60
     } else {
@@ -704,6 +719,13 @@ async fn copy_one_object(
 /// against a dead destination (the prod case: a Backblaze bucket over quota was
 /// surfacing `NoSuchBucket`/quota errors per-object and grinding through ~93K
 /// objects every tick). Pure so the truth table is unit-tested.
+///
+/// This answers "COULD this error mean a dead dest" — some tokens (quota,
+/// access denied) can also be per-object. The caller's page-level zero-success
+/// gate makes that safe: a dead dest fails every object, so the abort only fires
+/// when nothing copied. (A fuller fix would classify on the typed StorageError
+/// variant before the retry loop — deferred; substring + the page gate closes
+/// the prod incident without re-plumbing the engine error type.)
 fn is_destination_fatal(err: &str) -> bool {
     let e = err.to_ascii_lowercase();
     // Dest bucket missing / account suspended (StorageError::BucketNotFound's
@@ -715,6 +737,18 @@ fn is_destination_fatal(err: &str) -> bool {
         || e.contains("insufficient storage")
         || e.contains("cap exceeded")
         || e.contains("storage limit")
+        // Real Backblaze B2 over-cap shapes (machine code + human text + the
+        // 403-disabled message). The page-level zero-success gate in the fold
+        // makes these safe to match even though they CAN appear per-object.
+        || e.contains("cap_exceeded")
+        || e.contains("exceed account cap")
+        || e.contains("account cap")
+        || e.contains("all access to this object has been disabled")
+        // Dead/wrong destination credentials or endpoint — no object will land.
+        || e.contains("accessdenied")
+        || e.contains("access denied")
+        || e.contains("signaturedoesnotmatch")
+        || e.contains("permanentredirect")
 }
 
 /// Resolves to `true` once a kill is requested for `run_id` (polls the DB
@@ -1105,10 +1139,20 @@ mod tests {
             "Insufficient storage",
             "B2 cap exceeded for account",
             "monthly storage limit reached",
+            // Real Backblaze B2 over-cap + dead-creds shapes (C2).
+            "S3 error: put_object failed (status=403): cap_exceeded",
+            "Cannot upload, would exceed account cap",
+            "all access to this object has been disabled",
+            "S3 error: AccessDenied",
+            "SignatureDoesNotMatch: the request signature we calculated",
+            "PermanentRedirect: the bucket is in a different region",
         ] {
             assert!(is_destination_fatal(f), "expected fatal: {f}");
         }
-        // Per-object hiccups: NOT fatal — keep going.
+        // Per-object hiccups: NOT fatal — keep going. (Note: tokens like a bare
+        // "quota" or "access denied" CAN be per-object, but the fold's
+        // page-level zero-success gate stops one such object aborting a healthy
+        // page — this fn only answers "could this be a dead dest".)
         for ok in [
             "object copy timed out after 1800s",
             "S3 error: put_object failed (status=503): SlowDown",
