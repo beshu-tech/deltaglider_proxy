@@ -600,6 +600,39 @@ impl ConfigDb {
         Ok(deleted)
     }
 
+    /// Age out terminal `failed` rows older than `before` (occurred_at), bounded
+    /// by `limit`. Failed rows (retries exhausted) are otherwise never pruned —
+    /// a dead webhook/Slack target would grow the DB unbounded. The operator can
+    /// also purge them on demand via the admin route.
+    pub fn event_outbox_prune_failed_before(
+        &self,
+        before: i64,
+        limit: u32,
+    ) -> Result<usize, ConfigDbError> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let deleted = self.conn.execute(
+            "DELETE FROM event_outbox
+              WHERE id IN (
+                    SELECT id FROM event_outbox
+                     WHERE status = 'failed' AND occurred_at < ?
+                     ORDER BY occurred_at ASC, id ASC
+                     LIMIT ?
+              )",
+            params![before, limit as i64],
+        )?;
+        Ok(deleted)
+    }
+
+    /// Operator on-demand purge of ALL terminal `failed` rows. Returns the count.
+    pub fn event_outbox_purge_failed(&self) -> Result<usize, ConfigDbError> {
+        let deleted = self
+            .conn
+            .execute("DELETE FROM event_outbox WHERE status = 'failed'", [])?;
+        Ok(deleted)
+    }
+
     fn event_outbox_load(&self, id: i64) -> Result<Option<EventOutboxRecord>, ConfigDbError> {
         let row = self
             .conn
@@ -1031,6 +1064,32 @@ mod tests {
         assert_eq!(pending_row.status, STATUS_PENDING);
         assert_eq!(pending_row.next_attempt_at, None);
         assert_eq!(delivered_row.status, STATUS_DELIVERED);
+    }
+
+    #[test]
+    fn prune_and_purge_failed_rows() {
+        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let old_failed = db.event_outbox_insert(&event_at(10, "old")).unwrap();
+        let new_failed = db.event_outbox_insert(&event_at(100, "new")).unwrap();
+        let delivered = db.event_outbox_insert(&event_at(20, "ok")).unwrap();
+        db.event_outbox_mark_failed(old_failed, "dead", None)
+            .unwrap();
+        db.event_outbox_mark_failed(new_failed, "dead", None)
+            .unwrap();
+        db.event_outbox_mark_delivered(delivered, 25).unwrap();
+
+        // Age-out only failed rows older than `before` — never the delivered one.
+        let pruned = db.event_outbox_prune_failed_before(50, 100).unwrap();
+        assert_eq!(pruned, 1, "only the occurred_at<50 failed row");
+        assert!(db.event_outbox_load(old_failed).unwrap().is_none());
+        assert!(db.event_outbox_load(new_failed).unwrap().is_some());
+        assert!(db.event_outbox_load(delivered).unwrap().is_some());
+
+        // On-demand purge drops the remaining failed row, leaves delivered.
+        let purged = db.event_outbox_purge_failed().unwrap();
+        assert_eq!(purged, 1);
+        assert!(db.event_outbox_load(new_failed).unwrap().is_none());
+        assert!(db.event_outbox_load(delivered).unwrap().is_some());
     }
 
     #[test]

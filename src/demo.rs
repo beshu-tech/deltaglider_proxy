@@ -304,6 +304,10 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             "/_/api/admin/event-outbox/:id/requeue",
             post(admin::event_outbox_requeue_one),
         )
+        .route(
+            "/_/api/admin/event-outbox/purge-failed",
+            post(admin::event_outbox_purge_failed),
+        )
         // Jobs: ONE read+action surface over replication rules, lifecycle
         // rules, and maintenance one-offs (reencrypt / migrate). Session-
         // gated, not IAM-gated — admins manage background work the same

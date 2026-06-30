@@ -191,3 +191,33 @@ pub async fn requeue_many(
 
     Ok(Json(RequeueEventOutboxResponse { requeued }))
 }
+
+/// POST /_/api/admin/event-outbox/purge-failed — drop ALL terminal failed rows.
+/// The escape hatch for a dead target whose failed rows would otherwise grow
+/// the DB unbounded (requeue only re-fails them against a still-dead target).
+pub async fn purge_failed(
+    State(state): State<Arc<AdminState>>,
+) -> Result<Json<PurgeFailedResponse>, (StatusCode, String)> {
+    let db = state
+        .config_db
+        .as_ref()
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "config DB not available".to_string(),
+            )
+        })?
+        .lock()
+        .await;
+
+    let purged = db
+        .event_outbox_purge_failed()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(PurgeFailedResponse { purged }))
+}
+
+#[derive(serde::Serialize)]
+pub struct PurgeFailedResponse {
+    pub purged: usize,
+}

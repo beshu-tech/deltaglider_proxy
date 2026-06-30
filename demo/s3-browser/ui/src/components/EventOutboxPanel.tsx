@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Button, Input, message, Select, Space, Switch, Table, Tag, Typography } from 'antd';
 import {
   DatabaseOutlined,
+  DeleteOutlined,
   ReloadOutlined,
   SearchOutlined,
   SyncOutlined,
@@ -13,6 +14,7 @@ import {
   fetchEventOutbox,
   requeueEventOutbox,
   requeueEventOutboxMany,
+  purgeFailedEventOutbox,
   type EventOutboxRecord,
   type EventOutboxStatus,
 } from '../adminApi';
@@ -74,7 +76,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
   const [order, setOrder] = useState<SortOrder>('desc');
   const [autoRefresh, setAutoRefresh] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [requeueing, setRequeueing] = useState<number | 'bulk' | null>(null);
+  const [requeueing, setRequeueing] = useState<number | 'bulk' | 'purge' | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   // Generation guard: the interval tick and dep-change refetches can overlap,
@@ -307,6 +309,26 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
     }
   };
 
+  const purgeFailed = async () => {
+    if (!window.confirm(`Permanently delete all ${counts.failed} failed event(s)? They have exhausted retries; requeue would only re-fail them against a still-broken target.`)) {
+      return;
+    }
+    try {
+      setRequeueing('purge');
+      const res = await purgeFailedEventOutbox();
+      message.success(`Purged ${res.purged} failed event${res.purged === 1 ? '' : 's'}`);
+      await refresh();
+    } catch (e) {
+      if (e instanceof Error && e.message.includes('401')) {
+        onSessionExpired?.();
+        return;
+      }
+      message.error(e instanceof Error ? e.message : 'Failed to purge failed events');
+    } finally {
+      setRequeueing(null);
+    }
+  };
+
   return (
     <div style={{ maxWidth: 1180, margin: '0 auto', padding: 'clamp(12px, 2vw, 18px)', display: 'flex', flexDirection: 'column', gap: 10 }}>
       <div
@@ -372,6 +394,16 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
           loading={requeueing === 'bulk'}
         >
           Requeue failed shown ({visibleFailedIds.length})
+        </Button>
+        <Button
+          danger
+          icon={<DeleteOutlined />}
+          onClick={() => void purgeFailed()}
+          disabled={counts.failed === 0}
+          loading={requeueing === 'purge'}
+          title="Permanently delete all failed events (retries exhausted)"
+        >
+          Purge failed ({counts.failed})
         </Button>
         <Space size={6}>
           <Switch size="small" checked={autoRefresh} onChange={setAutoRefresh} />

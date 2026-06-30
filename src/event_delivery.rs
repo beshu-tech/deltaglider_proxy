@@ -466,6 +466,11 @@ pub async fn dispatch_once(
         {
             warn!("Event outbox delivered prune failed: {}", err);
         }
+        // Age out terminal failed rows too (retries exhausted) — else a dead
+        // target grows the DB forever.
+        if let Err(err) = db.event_outbox_prune_failed_before(before, config.prune_batch) {
+            warn!("Event outbox failed prune failed: {}", err);
+        }
     }
     if config.prune_batch > 0 {
         let db = db.lock().await;

@@ -67,9 +67,9 @@ pub use delta_efficiency::{
     DeltaEfficiencyScanner, Efficiency,
 };
 pub use event_outbox::{
-    list as event_outbox_list, requeue_many as event_outbox_requeue_many,
-    requeue_one as event_outbox_requeue_one, EventOutboxQuery, EventOutboxResponse,
-    RequeueEventOutboxRequest, RequeueEventOutboxResponse,
+    list as event_outbox_list, purge_failed as event_outbox_purge_failed,
+    requeue_many as event_outbox_requeue_many, requeue_one as event_outbox_requeue_one,
+    EventOutboxQuery, EventOutboxResponse, RequeueEventOutboxRequest, RequeueEventOutboxResponse,
 };
 pub use groups::{
     add_group_member, clone_group, create_group, delete_group, list_groups, remove_group_member,

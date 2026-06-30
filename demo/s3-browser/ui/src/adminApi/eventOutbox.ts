@@ -76,3 +76,9 @@ export async function requeueEventOutboxMany(ids: number[]): Promise<EventOutbox
   if (!res.ok) await throwApiError(res, 'Event outbox bulk requeue');
   return safeJson(res);
 }
+
+export async function purgeFailedEventOutbox(): Promise<{ purged: number }> {
+  const res = await adminFetch('/api/admin/event-outbox/purge-failed', 'POST');
+  if (!res.ok) await throwApiError(res, 'Event outbox purge failed');
+  return safeJson(res);
+}
