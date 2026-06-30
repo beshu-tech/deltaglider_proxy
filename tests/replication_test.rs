@@ -1282,3 +1282,133 @@ async fn test_event_driven_replication_copies_and_deletes() {
         "delete should propagate to ev-dst (replicate_deletes: true)"
     );
 }
+
+const FOREIGN_RULE_YAML: &str = "
+replication:
+  enabled: true
+  tick_interval: \"30s\"
+  rules:
+    - name: foreign-newerwins
+      enabled: true
+      source:
+        bucket: fk-src
+        prefix: \"\"
+      destination:
+        bucket: fk-dst
+        prefix: \"\"
+      interval: \"1h\"
+      batch_size: 100
+";
+
+/// Convergence guard for FOREIGN objects (written to the backend out-of-band,
+/// carrying partial DG metadata but NO `dg-created-at`): replication NewerWins
+/// must SKIP them on the 2nd run, never re-copy every tick.
+///
+/// IMPORTANT (multi-agent review finding): this passes BOTH before and after the
+/// `created_at→LastModified` fix — for a same-backend src/dst with identity key
+/// rewriting, foreign objects already converge (source LastModified < the dest's
+/// copy-time created_at). So this test does NOT reproduce the prod re-copy; it is
+/// a guard that the same-backend foreign case stays convergent. The prod scenario
+/// (cross-backend Hetzner→filesystem, distinct buckets) is NOT yet reproduced here
+/// — see docs/plan/rca-replication-recopy-2026-06-30.md (root cause still open).
+///
+/// Both shapes are exercised to document the scope:
+///  - `artifact.zip` is delta-ELIGIBLE → LIST HEADs it → touches the fixed path.
+///  - `artifact.sha1` is NON-eligible → LIST lite (no-HEAD) path, already stable.
+/// Requires MinIO.
+#[tokio::test]
+async fn test_replication_foreign_object_missing_created_at_converges_on_second_run() {
+    let server = TestServer::builder()
+        .s3_endpoint(&common::minio_endpoint_url())
+        .env("DGP_BACKEND_ALLOW_LOCAL", "true")
+        .bucket("fk-src")
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(FOREIGN_RULE_YAML)
+        .build()
+        .await;
+
+    // Buckets via the proxy (single S3 backend → identity routing, same names
+    // on MinIO).
+    let proxy = server.s3_client().await;
+    for b in ["fk-src", "fk-dst"] {
+        proxy.create_bucket().bucket(b).send().await.ok();
+    }
+
+    // RAW client straight to MinIO, bypassing the proxy, so we can plant objects
+    // with PARTIAL DG metadata and NO dg-created-at (the proxy would always
+    // stamp dg-created-at on a normal PUT).
+    let raw = {
+        let creds = aws_sdk_s3::config::Credentials::new(
+            common::MINIO_ACCESS_KEY,
+            common::MINIO_SECRET_KEY,
+            None,
+            None,
+            "test",
+        );
+        let cfg = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .endpoint_url(common::minio_endpoint_url())
+            .credentials_provider(creds)
+            .force_path_style(true)
+            .build();
+        aws_sdk_s3::Client::from_conf(cfg)
+    };
+
+    // A valid-shaped (64-hex) sha; the read path doesn't validate its content.
+    let sha = "a".repeat(64);
+    for key in ["artifact.zip", "artifact.sha1"] {
+        raw.put_object()
+            .bucket("fk-src")
+            .key(key)
+            .body(ByteStream::from(format!("foreign-{key}").into_bytes()))
+            .metadata("dg-tool", "foreign-uploader")
+            .metadata("dg-original-name", key)
+            .metadata("dg-file-sha256", &sha)
+            // deliberately NO dg-created-at
+            .send()
+            .await
+            .expect("plant foreign object");
+    }
+
+    let admin = admin_http_client(&server.endpoint()).await;
+    let run_now = || async {
+        admin
+            .post(format!(
+                "{}/_/api/admin/jobs/replication:foreign-newerwins/run-now",
+                server.endpoint()
+            ))
+            .send()
+            .await
+            .expect("run-now")
+            .json::<Value>()
+            .await
+            .expect("run-now json")
+    };
+
+    // Run 1: dest empty → both objects copied (dest=None → Copy, policy-agnostic).
+    let r1 = run_now().await;
+    assert_eq!(r1["status"].as_str(), Some("succeeded"), "run1: {r1}");
+    assert_eq!(
+        r1["objects_copied"].as_i64(),
+        Some(2),
+        "run1 must copy both foreign objects: {r1}"
+    );
+
+    // Run 2 — THE REGRESSION ASSERTION. Source created_at now resolves to the
+    // planted objects' stable S3 LastModified (< the dest's run-1 copy time) →
+    // NewerWins skips. Pre-fix, the .zip re-synthesised Utc::now() each scan →
+    // always newer → re-copied → this assert fails with copied=1 (or 2).
+    let r2 = run_now().await;
+    assert_eq!(r2["status"].as_str(), Some("succeeded"), "run2: {r2}");
+    assert_eq!(
+        r2["objects_copied"].as_i64(),
+        Some(0),
+        "REGRESSION: foreign object(s) re-copied on 2nd run (created_at→now bug): {r2}"
+    );
+    assert_eq!(
+        r2["objects_skipped"].as_i64(),
+        Some(2),
+        "both foreign objects should be skipped as not-newer on 2nd run: {r2}"
+    );
+}

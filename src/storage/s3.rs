@@ -59,12 +59,19 @@ fn resolve_created_at(meta_value: Option<String>, fallback: DateTime<Utc>) -> Da
     let Some(raw) = meta_value else {
         return fallback;
     };
-    let ts = raw.trim_end_matches('Z');
-    DateTime::parse_from_rfc3339(&format!("{}+00:00", ts))
+    let raw = raw.trim();
+    // Try full RFC3339 first — it correctly handles `Z`, lowercase `z`, and any
+    // numeric offset (`+02:00`), converting to UTC. Only then fall back to the
+    // proxy's historical no-offset naive shape. NEVER string-surgery the offset:
+    // the old `trim_end_matches('Z') + "+00:00"` silently dropped offset/`z`
+    // values to the fallback (multi-agent review finding).
+    DateTime::parse_from_rfc3339(raw)
         .map(|dt| dt.with_timezone(&Utc))
         .or_else(|_| {
-            chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.f")
-                .map(|ndt| ndt.and_utc())
+            chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%.fZ").map(|n| n.and_utc())
+        })
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%.f").map(|n| n.and_utc())
         })
         .unwrap_or(fallback)
 }
@@ -2234,6 +2241,38 @@ mod tests {
             fallback
         );
         assert_eq!(resolve_created_at(Some(String::new()), fallback), fallback);
+    }
+
+    #[test]
+    fn created_at_offset_and_lowercase_z_parse_to_true_instant() {
+        // Regression: the old string-surgery silently dropped these to the
+        // fallback. A real offset must convert to UTC; lowercase `z` is a valid
+        // RFC3339 zulu marker.
+        let fallback = dt("2026-05-14T21:33:48Z");
+        assert_eq!(
+            resolve_created_at(Some("2026-03-01T10:00:00+02:00".into()), fallback),
+            dt("2026-03-01T08:00:00Z"),
+            "offset must convert to UTC, not fall back"
+        );
+        assert_eq!(
+            resolve_created_at(Some("2026-03-01T10:00:00.5+02:00".into()), fallback),
+            dt("2026-03-01T08:00:00.5Z")
+        );
+        assert_eq!(
+            resolve_created_at(Some("2026-03-01T10:00:00z".into()), fallback),
+            dt("2026-03-01T10:00:00Z"),
+            "lowercase z is a valid zulu marker"
+        );
+    }
+
+    #[test]
+    fn created_at_round_trips_the_proxy_write_format() {
+        // Lock the write/read contract: whatever types.rs writes
+        // (`%Y-%m-%dT%H:%M:%S%.6fZ`) must read back to the same instant.
+        let fallback = dt("2000-01-01T00:00:00Z");
+        let original = dt("2026-03-01T10:00:00.123456Z");
+        let written = original.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
+        assert_eq!(resolve_created_at(Some(written), fallback), original);
     }
 
     /// Build a minimal `HttpResponse` with the given status code and an
