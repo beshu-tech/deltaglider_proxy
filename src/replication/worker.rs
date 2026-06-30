@@ -158,6 +158,10 @@ pub async fn run_rule(
     // at each page boundary). A paused stop is NOT an error: it preserves the
     // cursor so resume continues, and settles the run as "stopped".
     let mut stopped_paused = false;
+    // Operator KILL: run flipped to 'cancelling' mid-flight. Checked at every
+    // page boundary AND raced against the in-flight page so a wedged object
+    // (e.g. stuck on a dead B2 dest) aborts immediately, not after its timeout.
+    let mut killed = false;
     let cap = rule.batch_size.clamp(1, 10_000);
     let source_prefix = normalize_prefix(&rule.source.prefix);
     let lease_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -186,6 +190,20 @@ pub async fn run_rule(
                 rule.name, page_idx
             );
             stopped_paused = true;
+            break 'pages;
+        }
+
+        // Operator kill at a page boundary — clean stop, cursor preserved.
+        let cancel_requested = {
+            let db = db.lock().await;
+            db.replication_run_cancel_requested(run_id).unwrap_or(false)
+        };
+        if cancel_requested {
+            info!(
+                "replication rule '{}' killed mid-run — stopping after page {}",
+                rule.name, page_idx
+            );
+            killed = true;
             break 'pages;
         }
 
@@ -320,38 +338,52 @@ pub async fn run_rule(
         // Arc<Mutex<ConfigDb>>) and returns its totals delta + optional
         // event. The page boundary is the barrier: the cursor does not
         // advance until every in-flight object of this page finishes.
-        let object_results: Vec<Result<PerObjectResult, crate::config_db::ConfigDbError>> =
-            futures::stream::iter(plan.to_copy.clone())
-                .map(|(src_key, dest_key)| {
-                    let db = db.clone();
-                    let engine = engine.clone();
-                    let rule_name = rule.name.clone();
-                    let src_bucket = rule.source.bucket.clone();
-                    let dst_bucket = rule.destination.bucket.clone();
-                    async move {
-                        // Guard increments objects_inflight (+peak) on entry and
-                        // decrements on drop → proves the `transfers` concurrency.
-                        let _obj_guard = engine.metrics().cloned().map(ObjectGuard::new);
-                        copy_one_object(
-                            &db,
-                            &engine,
-                            &rule_name,
-                            &src_bucket,
-                            &dst_bucket,
-                            &src_key,
-                            &dest_key,
-                            run_id,
-                            object_timeout,
-                            object_skip_after_failures,
-                            upload_concurrency,
-                            max_failures_retained,
-                        )
-                        .await
-                    }
-                })
-                .buffer_unordered(transfers)
-                .collect()
-                .await;
+        let copy_page = futures::stream::iter(plan.to_copy.clone())
+            .map(|(src_key, dest_key)| {
+                let db = db.clone();
+                let engine = engine.clone();
+                let rule_name = rule.name.clone();
+                let src_bucket = rule.source.bucket.clone();
+                let dst_bucket = rule.destination.bucket.clone();
+                async move {
+                    // Guard increments objects_inflight (+peak) on entry and
+                    // decrements on drop → proves the `transfers` concurrency.
+                    let _obj_guard = engine.metrics().cloned().map(ObjectGuard::new);
+                    copy_one_object(
+                        &db,
+                        &engine,
+                        &rule_name,
+                        &src_bucket,
+                        &dst_bucket,
+                        &src_key,
+                        &dest_key,
+                        run_id,
+                        object_timeout,
+                        object_skip_after_failures,
+                        upload_concurrency,
+                        max_failures_retained,
+                    )
+                    .await
+                }
+            })
+            .buffer_unordered(transfers)
+            .collect::<Vec<_>>();
+
+        // Race the page against a kill poll. If the operator kills the run, the
+        // collect future is DROPPED — every in-flight copy_one_object drops with
+        // it, aborting the underlying HTTP transfers immediately (a wedged
+        // object on a dead dest dies now, not after object_timeout).
+        let object_results: Vec<Result<PerObjectResult, crate::config_db::ConfigDbError>> = tokio::select! {
+            biased;
+            killed_now = poll_run_killed(&db, run_id) => {
+                if killed_now { killed = true; }
+                Vec::new()
+            }
+            results = copy_page => results,
+        };
+        if killed {
+            break 'pages;
+        }
 
         // Fold the concurrent results into totals + flags + events. DB
         // failure/clear writes already happened inside each unit; any
@@ -428,7 +460,7 @@ pub async fn run_rule(
     // Only fires when forward-copy didn't hit a fatal error — partial
     // listing failures could leave us thinking source is empty when
     // it's not, and a full destination wipe would be catastrophic.
-    if rule.replicate_deletes && !hit_fatal_error && !stopped_paused {
+    if rule.replicate_deletes && !hit_fatal_error && !stopped_paused && !killed {
         if let Err(e) = run_delete_pass(
             db.clone(),
             engine,
@@ -456,7 +488,9 @@ pub async fn run_rule(
     // A pause stop settles as "stopped" — NOT failed/completed (the sweep was
     // intentionally interrupted, not broken). It outranks the error-derived
     // states because the partial-progress that's left is by operator request.
-    let status = if stopped_paused {
+    let status = if killed {
+        "cancelled".to_string()
+    } else if stopped_paused {
         "stopped".to_string()
     } else if hit_fatal_error || (had_any_error && totals.objects_copied == 0) {
         "failed".to_string()
@@ -480,7 +514,7 @@ pub async fn run_rule(
     // from the beginning. A paused stop PRESERVES the cursor so resume picks up
     // mid-prefix; a fatal error also keeps it (poison-token guard handles bad
     // tokens separately).
-    let clear_cursor_on_clean = !hit_fatal_error && !stopped_paused;
+    let clear_cursor_on_clean = !hit_fatal_error && !stopped_paused && !killed;
 
     {
         let db = db.lock().await;
@@ -681,6 +715,21 @@ fn is_destination_fatal(err: &str) -> bool {
         || e.contains("insufficient storage")
         || e.contains("cap exceeded")
         || e.contains("storage limit")
+}
+
+/// Resolves to `true` once a kill is requested for `run_id` (polls the DB
+/// `cancelling` flag ~1×/s). Used as the cancel arm of the per-page select —
+/// when it wins, the page's copy future is dropped and in-flight transfers abort.
+async fn poll_run_killed(db: &Arc<Mutex<ConfigDb>>, run_id: i64) -> bool {
+    loop {
+        {
+            let db = db.lock().await;
+            if db.replication_run_cancel_requested(run_id).unwrap_or(false) {
+                return true;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
 }
 
 fn spawn_lease_heartbeat(

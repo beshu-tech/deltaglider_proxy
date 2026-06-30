@@ -176,6 +176,16 @@ impl ConfigDb {
                     "DELETE FROM replication_parity WHERE rule_name = ?",
                     params![existing],
                 )?;
+                // Run history + failure ring are also keyed by rule_name; drop
+                // them so a deleted rule leaves no orphaned rows in the GUI.
+                self.conn.execute(
+                    "DELETE FROM replication_run_history WHERE rule_name = ?",
+                    params![existing],
+                )?;
+                self.conn.execute(
+                    "DELETE FROM replication_failures WHERE rule_name = ?",
+                    params![existing],
+                )?;
                 removed += n;
             }
         }
@@ -479,6 +489,31 @@ impl ConfigDb {
             ],
         )?;
         Ok(())
+    }
+
+    /// Operator KILL: flip a rule's RUNNING run to `cancelling`. The worker
+    /// polls this between objects (and aborts in-flight copies), then settles
+    /// the run to `cancelled`. Returns true if a running run was flipped.
+    pub fn replication_request_run_cancel(&self, rule_name: &str) -> Result<bool, ConfigDbError> {
+        let n = self.conn.execute(
+            "UPDATE replication_run_history SET status = 'cancelling'
+              WHERE rule_name = ? AND status = 'running'",
+            params![rule_name],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Whether a kill has been requested for this run (status == 'cancelling').
+    pub fn replication_run_cancel_requested(&self, run_id: i64) -> Result<bool, ConfigDbError> {
+        let v: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT status FROM replication_run_history WHERE id = ?",
+                params![run_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(matches!(v.as_deref(), Some("cancelling")))
     }
 
     /// Persist the continuation token for a rule.
@@ -1249,6 +1284,21 @@ mod tests {
         assert_eq!(runs[0].status, "succeeded");
         assert_eq!(runs[0].objects_copied, 7);
         assert_eq!(runs[0].bytes_copied, 1024);
+    }
+
+    #[test]
+    fn request_run_cancel_flips_running_and_is_observable() {
+        let db = db();
+        db.replication_ensure_state("r", 100).unwrap();
+        let id = db.replication_begin_run("r", 200, "scheduler").unwrap();
+        assert!(!db.replication_run_cancel_requested(id).unwrap());
+        // Flip the running run → cancelling.
+        assert!(db.replication_request_run_cancel("r").unwrap());
+        assert!(db.replication_run_cancel_requested(id).unwrap());
+        // No running run left after settle → second request is a no-op.
+        db.replication_finish_run(id, "r", "cancelled", 300, Default::default(), 900)
+            .unwrap();
+        assert!(!db.replication_request_run_cancel("r").unwrap());
     }
 
     #[test]

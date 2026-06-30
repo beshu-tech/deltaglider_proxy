@@ -13,7 +13,7 @@
 import type { ConflictPolicy, FixAction, RerunVerdict } from './adminApi';
 
 export type JobKind = 'replication' | 'lifecycle' | 'reencrypt' | 'migrate' | string;
-export type JobAction = 'pause' | 'resume' | 'run-now' | 'preview' | 'cancel';
+export type JobAction = 'pause' | 'resume' | 'run-now' | 'preview' | 'cancel' | 'delete' | 'kill';
 
 export interface JobRow {
   id: string; // "replication:<rule>" | "lifecycle:<rule>" | "maintenance:<n>"
@@ -125,6 +125,9 @@ export function availableActions(row: JobRow): JobAction[] {
     out.push(row.paused ? 'resume' : 'pause');
     if (row.kind === 'lifecycle') out.push('preview');
     if (row.enabled !== false && !row.paused && row.status !== 'running') out.push('run-now');
+    // Kill the in-flight run at will (interrupts mid-object, unlike pause).
+    if (row.status === 'running') out.push('kill');
+    out.push('delete');
     return out;
   }
   if (isActiveJobStatus(row.status) && row.status !== 'cancelling') out.push('cancel');

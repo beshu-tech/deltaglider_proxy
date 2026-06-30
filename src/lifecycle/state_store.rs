@@ -101,6 +101,16 @@ impl ConfigDb {
                     "DELETE FROM lifecycle_state WHERE rule_name = ?",
                     params![existing],
                 )?;
+                // Run history + failure ring are keyed by rule_name too; drop
+                // them so a deleted rule leaves no orphaned rows in the GUI.
+                self.conn.execute(
+                    "DELETE FROM lifecycle_run_history WHERE rule_name = ?",
+                    params![existing],
+                )?;
+                self.conn.execute(
+                    "DELETE FROM lifecycle_failures WHERE rule_name = ?",
+                    params![existing],
+                )?;
                 removed += n;
             }
         }

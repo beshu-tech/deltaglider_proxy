@@ -64,13 +64,17 @@ assert.equal(kindLabel('migrate'), 'Migrate');
 assert.equal(triggerLabel('oneoff'), 'one-off');
 
 // ── availableActions matrix ─────────────────────────────────────────────────
-assert.deepEqual(availableActions(row()), ['pause', 'run-now']);
-assert.deepEqual(availableActions(row({ paused: true })), ['resume'], 'paused blocks run-now');
-assert.deepEqual(availableActions(row({ status: 'running' })), ['pause'], 'mid-run blocks run-now');
-assert.deepEqual(availableActions(row({ enabled: false })), ['pause'], 'disabled blocks run-now');
+assert.deepEqual(availableActions(row()), ['pause', 'run-now', 'delete']);
+assert.deepEqual(availableActions(row({ paused: true })), ['resume', 'delete'], 'paused blocks run-now');
+assert.deepEqual(
+  availableActions(row({ status: 'running' })),
+  ['pause', 'kill', 'delete'],
+  'mid-run: kill available, run-now blocked'
+);
+assert.deepEqual(availableActions(row({ enabled: false })), ['pause', 'delete'], 'disabled blocks run-now');
 assert.deepEqual(
   availableActions(row({ kind: 'lifecycle' })),
-  ['pause', 'preview', 'run-now']
+  ['pause', 'preview', 'run-now', 'delete']
 );
 assert.deepEqual(
   availableActions(row({ kind: 'reencrypt', trigger: 'oneoff', status: 'running' })),

@@ -18,10 +18,12 @@ import { useCallback, useMemo, useState } from 'react';
 import { Alert, Button, Dropdown, Space, Spin, Tag, Typography, message } from 'antd';
 import {
   CaretRightOutlined,
+  DeleteOutlined,
   EyeOutlined,
   PauseOutlined,
   PlusOutlined,
   StopOutlined,
+  ThunderboltOutlined,
 } from '@ant-design/icons';
 import { useQueryClient } from '@tanstack/react-query';
 import type { LifecycleConfig, ReplicationConfig, StorageSectionBody } from '../../adminApi';
@@ -82,6 +84,18 @@ const ACTION_META: Record<
     icon: <StopOutlined />,
     danger: true,
     done: 'Cancellation requested — the job stops at the next safe point',
+  },
+  kill: {
+    label: 'Kill run',
+    icon: <ThunderboltOutlined />,
+    danger: true,
+    done: 'Kill requested — the running sweep aborts in-flight',
+  },
+  delete: {
+    label: 'Delete',
+    icon: <DeleteOutlined />,
+    danger: true,
+    done: 'Rule deleted',
   },
 };
 
@@ -193,6 +207,9 @@ export default function JobsPanel({ onSessionExpired }: Props) {
   const [actionBusy, setActionBusy] = useState<string | null>(null);
 
   const runAction = async (row: JobRow, action: JobAction) => {
+    if (action === 'delete' && !window.confirm(`Delete rule "${row.name}"? This removes it from config and clears its run history.`)) {
+      return;
+    }
     setActionBusy(`${row.id}:${action}`);
     try {
       const result = await runJobAction(row.id, action);
@@ -212,6 +229,8 @@ export default function JobsPanel({ onSessionExpired }: Props) {
       } else {
         messageApi.success(ACTION_META[action].done ?? `${ACTION_META[action].label} OK`);
       }
+      // A deleted rule no longer exists — close its drawer.
+      if (action === 'delete' && drawerJobId === row.id) setDrawerJobId(null);
       // Refresh the list AND this job's runs/failures tables — a resume/run-now
       // starts a new run that the open drawer's Runs/Failures tabs must show.
       qc.invalidateQueries({ queryKey: qk.jobs.list() });

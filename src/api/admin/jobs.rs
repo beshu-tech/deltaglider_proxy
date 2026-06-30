@@ -94,6 +94,8 @@ pub enum JobAction {
     Preview,
     Cancel,
     Verify,
+    Delete,
+    Kill,
 }
 
 impl JobAction {
@@ -105,6 +107,8 @@ impl JobAction {
             "preview" => Some(Self::Preview),
             "cancel" => Some(Self::Cancel),
             "verify" => Some(Self::Verify),
+            "delete" => Some(Self::Delete),
+            "kill" => Some(Self::Kill),
             _ => None,
         }
     }
@@ -121,6 +125,8 @@ impl JobAction {
             Self::Preview => "preview",
             Self::Cancel => "cancel",
             Self::Verify => "verify",
+            Self::Delete => "delete",
+            Self::Kill => "kill",
         }
     }
 }
@@ -133,12 +139,15 @@ pub fn supported_actions(sub: JobSubsystem) -> &'static [JobAction] {
             JobAction::Resume,
             JobAction::RunNow,
             JobAction::Verify,
+            JobAction::Delete,
+            JobAction::Kill,
         ],
         JobSubsystem::Lifecycle => &[
             JobAction::Pause,
             JobAction::Resume,
             JobAction::RunNow,
             JobAction::Preview,
+            JobAction::Delete,
         ],
         JobSubsystem::Maintenance => &[JobAction::Cancel],
     }
@@ -750,8 +759,107 @@ pub async fn job_action(
                 super::maintenance::cancel_job(State(state), Path(job_id), headers).await?;
             Ok((StatusCode::OK, Json(resp)))
         }
+        (JobSubsystem::Replication | JobSubsystem::Lifecycle, JobAction::Delete) => {
+            delete_rule(&state, sub, &name, &headers).await?;
+            Ok((StatusCode::NO_CONTENT, Json(serde_json::json!({}))))
+        }
+        (JobSubsystem::Replication, JobAction::Kill) => {
+            let db = state.config_db.as_ref().ok_or_else(db_unavailable)?;
+            let flipped = {
+                let db = db.lock().await;
+                db.replication_request_run_cancel(&name).map_err(internal)?
+            };
+            if !flipped {
+                return Err((StatusCode::CONFLICT, "no running run to kill".to_string()));
+            }
+            crate::audit::audit_log("replication_kill", "admin", &name, &headers, "", "");
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({"killing": true})),
+            ))
+        }
         _ => unreachable!("supported_actions gate covers the matrix"),
     }
+}
+
+/// Delete a replication/lifecycle rule: remove it from the YAML config,
+/// rebuild the engine, persist, then purge its DB state/history/failure rows.
+/// `reconcile_rules` is the existing orphan-prune — calling it with the
+/// REMAINING rule names drops exactly the deleted rule's rows.
+async fn delete_rule(
+    state: &Arc<AdminState>,
+    sub: JobSubsystem,
+    name: &str,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, String)> {
+    // 1. Remove from config + rebuild + persist (engine rollback on failure).
+    let remaining: Vec<String> = {
+        let mut cfg = state.config.write().await;
+        let existed = match sub {
+            JobSubsystem::Replication => {
+                let before = cfg.replication.rules.len();
+                cfg.replication.rules.retain(|r| r.name != name);
+                cfg.replication.rules.len() != before
+            }
+            JobSubsystem::Lifecycle => {
+                let before = cfg.lifecycle.rules.len();
+                cfg.lifecycle.rules.retain(|r| r.name != name);
+                cfg.lifecycle.rules.len() != before
+            }
+            JobSubsystem::Maintenance => unreachable!(),
+        };
+        if !existed {
+            return Err(not_found());
+        }
+        super::config::rebuild_engine(state, &cfg, "Engine rebuilt on rule delete")
+            .await
+            .map_err(internal)?;
+        let path = super::config::active_config_path(state);
+        cfg.persist_to_file(&path).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("rule removed in memory but FAILED to persist to {path}: {e}"),
+            )
+        })?;
+        match sub {
+            JobSubsystem::Replication => cfg
+                .replication
+                .rules
+                .iter()
+                .map(|r| r.name.clone())
+                .collect(),
+            JobSubsystem::Lifecycle => cfg.lifecycle.rules.iter().map(|r| r.name.clone()).collect(),
+            JobSubsystem::Maintenance => unreachable!(),
+        }
+    };
+
+    // 2. Purge the deleted rule's DB rows (state/parity/history/failures).
+    if let Some(db) = state.config_db.as_ref() {
+        let db = db.lock().await;
+        let res = match sub {
+            JobSubsystem::Replication => db.replication_reconcile_rules(&remaining),
+            JobSubsystem::Lifecycle => db.lifecycle_reconcile_rules(&remaining),
+            JobSubsystem::Maintenance => unreachable!(),
+        };
+        if let Err(e) = res {
+            // Config is already deleted+persisted; orphan rows are harmless and
+            // get pruned on next boot. Log, don't fail the delete.
+            tracing::warn!("rule '{name}' deleted but DB row purge failed: {e}");
+        }
+    }
+
+    crate::audit::audit_log(
+        match sub {
+            JobSubsystem::Replication => "replication_delete",
+            _ => "lifecycle_delete",
+        },
+        "admin",
+        name,
+        headers,
+        "",
+        "",
+    );
+    Ok(())
 }
 
 fn not_found() -> (StatusCode, String) {
@@ -821,15 +929,16 @@ mod tests {
         use JobAction::*;
         assert_eq!(
             supported_actions(JobSubsystem::Replication),
-            &[Pause, Resume, RunNow, Verify]
+            &[Pause, Resume, RunNow, Verify, Delete, Kill]
         );
         assert_eq!(
             supported_actions(JobSubsystem::Lifecycle),
-            &[Pause, Resume, RunNow, Preview]
+            &[Pause, Resume, RunNow, Preview, Delete]
         );
         assert_eq!(supported_actions(JobSubsystem::Maintenance), &[Cancel]);
         assert_eq!(JobAction::parse("run-now"), Some(RunNow));
         assert_eq!(JobAction::parse("verify"), Some(Verify));
+        assert_eq!(JobAction::parse("delete"), Some(Delete));
         assert_eq!(JobAction::parse("nope"), None);
         // Verify is replication-only.
         assert!(!supported_actions(JobSubsystem::Lifecycle).contains(&Verify));
