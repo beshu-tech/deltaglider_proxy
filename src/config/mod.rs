@@ -3647,8 +3647,7 @@ encryption_key: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
     /// other's value and fails intermittently (only under CI scheduling). The
     /// guard holds this lock for its whole lifetime, so env-driven tests run one
     /// at a time. Mirrors the `ENV_LOCK` pattern used by the `DGP_TEST_*` tests.
-    static ENV_GUARD_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
-        std::sync::OnceLock::new();
+    static ENV_GUARD_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
 
     /// Test-only RAII guard that sets an env var on construction and
     /// unsets it on drop. Prevents one test from polluting another when
