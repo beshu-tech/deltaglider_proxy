@@ -925,6 +925,23 @@ pub async fn parity_audit(
     )
     .await?;
 
+    // Logical metadata (real size/etag via HEAD) only changes the verdict for a
+    // key that exists on BOTH sides (match vs mismatch). A source key MISSING on
+    // the destination is "missing" regardless of its logical size — HEADing it is
+    // pure waste. So scope the source HEAD-burst to the intersection with the
+    // dest key set. This is what makes a verify against an empty/sparse dest fast:
+    // every source key is trivially missing, so zero source HEADs are issued.
+    src_needs_logical.retain(|raw| {
+        match rewrite_key(&rule.source.prefix, &rule.destination.prefix, raw) {
+            Ok(dk) => dest.contains_key(&dk),
+            Err(_) => false,
+        }
+    });
+    // Symmetric: a dest ORPHAN (not on source) is "extra on dest" regardless of
+    // its logical size, so it needs no HEAD either. Both `dst_needs_logical` and
+    // `source` are keyed by dest-key, so the intersection is a direct lookup.
+    dst_needs_logical.retain(|dk| source.contains_key(dk));
+
     // Resolve logical metadata for the delta-eligible keys: parity cache first
     // (HEAD-free — the win), then a bounded HEAD burst for the misses, writing
     // results back into the cache so the NEXT verify is HEAD-free too.

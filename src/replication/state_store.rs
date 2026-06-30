@@ -508,6 +508,26 @@ impl ConfigDb {
         Ok(n > 0)
     }
 
+    /// Status of the most recent run-history row for a rule, if any. The jobs
+    /// list uses this to surface a `cancelling` run-in-flight that hasn't settled
+    /// `replication_state.last_status` yet — otherwise a killed run keeps showing
+    /// as plain `running` until the worker reaches a cancel checkpoint.
+    pub fn replication_latest_run_status(
+        &self,
+        rule_name: &str,
+    ) -> Result<Option<String>, ConfigDbError> {
+        let v: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT status FROM replication_run_history
+                  WHERE rule_name = ? ORDER BY id DESC LIMIT 1",
+                params![rule_name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v)
+    }
+
     /// Whether a kill has been requested for this run (status == 'cancelling').
     pub fn replication_run_cancel_requested(&self, run_id: i64) -> Result<bool, ConfigDbError> {
         let v: Option<String> = self
@@ -1300,10 +1320,20 @@ mod tests {
         // Flip the running run → cancelling.
         assert!(db.replication_request_run_cancel("r").unwrap());
         assert!(db.replication_run_cancel_requested(id).unwrap());
+        // The jobs list reads the live history status (cancelling), not the
+        // stale state.last_status (still 'running' until the worker settles).
+        assert_eq!(
+            db.replication_latest_run_status("r").unwrap().as_deref(),
+            Some("cancelling")
+        );
         // No running run left after settle → second request is a no-op.
         db.replication_finish_run(id, "r", "cancelled", 300, Default::default(), 900)
             .unwrap();
         assert!(!db.replication_request_run_cancel("r").unwrap());
+        assert_eq!(
+            db.replication_latest_run_status("r").unwrap().as_deref(),
+            Some("cancelled")
+        );
     }
 
     #[test]

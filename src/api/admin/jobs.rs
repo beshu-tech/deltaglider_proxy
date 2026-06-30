@@ -336,10 +336,22 @@ pub async fn list_jobs(
             // ensure_state belongs to the scheduler/run paths — doing it
             // here would put N writes behind every 2s UI poll.
             let st = db.replication_load_state(&rule.name).ok().flatten();
-            let status_raw = st
+            let mut status_raw = st
                 .as_ref()
                 .map(|s| s.last_status.clone())
                 .unwrap_or_else(|| "idle".to_string());
+            // `replication_state.last_status` only settles when the worker
+            // FINISHES a run. A kill flips the run-history row to `cancelling`
+            // immediately, but the worker may not observe it for a while (e.g.
+            // wedged in the planning phase). Surface the live history status so a
+            // killed run shows `cancelling`, not a stale `running`.
+            if status_raw == "running" {
+                if let Ok(Some(live)) = db.replication_latest_run_status(&rule.name) {
+                    if live == "cancelling" {
+                        status_raw = live;
+                    }
+                }
+            }
             jobs.push(JobView {
                 id: format!("replication:{}", rule.name),
                 kind: "replication".into(),

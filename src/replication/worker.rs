@@ -168,9 +168,20 @@ pub async fn run_rule(
     let mut killed = false;
     let cap = rule.batch_size.clamp(1, 10_000);
     let source_prefix = normalize_prefix(&rule.source.prefix);
+    let dest_prefix = normalize_prefix(&rule.destination.prefix);
     let lease_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let heartbeat_handle =
         spawn_lease_heartbeat(db.clone(), &rule.name, lease.clone(), lease_alive.clone());
+
+    // Build a dest-key existence index ONCE per run by LISTING the destination
+    // prefix (one list call per ~1000 keys), instead of HEADing every source key
+    // during planning. A HEAD per object against a remote dest is what made a
+    // copy to an empty/sparse destination spend minutes "thinking" before copying
+    // anything — every HEAD just confirmed the key was absent (→ always Copy).
+    // With the index, planning HEADs a dest key ONLY when it actually exists.
+    // Bounded: if the dest is enormous the index build itself is capped and we
+    // fall back to per-key HEAD (preserving old behavior for that rare case).
+    let dest_index = build_dest_index(engine, &rule.destination.bucket, &dest_prefix).await;
 
     let mut pager = Pager::resuming(continuation);
     // ── Forward-copy pass: paginate source until exhausted ──
@@ -197,8 +208,23 @@ pub async fn run_rule(
             break 'pages;
         }
 
-        // Operator kill is caught by the select! race around the copy page
-        // below — no separate page-boundary check needed.
+        // Operator kill: check at the page boundary too, not only via the
+        // select! race around copy. The race covers the COPY phase; this covers a
+        // kill requested during the per-page LIST + PLAN phase (which can take a
+        // while), so the run stops before planning the next page instead of
+        // grinding to the next copy checkpoint.
+        let cancel_requested = {
+            let db = db.lock().await;
+            db.replication_run_cancel_requested(run_id).unwrap_or(false)
+        };
+        if cancel_requested {
+            info!(
+                "replication rule '{}' killed mid-run — stopping at page {} boundary",
+                rule.name, page_idx
+            );
+            killed = true;
+            break 'pages;
+        }
 
         if !renew_run_lease(
             &db,
@@ -263,11 +289,21 @@ pub async fn run_rule(
         let plan = {
             let head_engine = engine.clone();
             let dest_bucket = rule.destination.bucket.clone();
+            let dest_index = &dest_index;
             plan_batch(&page.objects, rule, move |dest_key| {
                 let engine = head_engine.clone();
                 let dest_bucket = dest_bucket.clone();
                 let dk = dest_key.to_string();
-                async move { engine.head(&dest_bucket, &dk).await.ok() }
+                // Skip the HEAD entirely when the index proves the key is absent —
+                // a missing dest object always copies under every conflict policy,
+                // so its metadata is never needed. Only HEAD when it might exist.
+                let maybe_present = dest_index.may_contain(&dk);
+                async move {
+                    if !maybe_present {
+                        return None;
+                    }
+                    engine.head(&dest_bucket, &dk).await.ok()
+                }
             })
             .await
         };
@@ -1112,6 +1148,67 @@ fn dest_to_source_key(rule: &ReplicationRule, dest_key: &str) -> Option<String> 
     }
     let tail = dest_key.strip_prefix(dst_prefix)?;
     Some(format!("{}{}", src_prefix, tail.trim_start_matches('/')))
+}
+
+/// Existence index for destination keys, built by listing the dest prefix once
+/// per run. Lets planning skip a per-object HEAD when the key is provably absent.
+enum DestIndex {
+    /// Fully listed: `may_contain` is exact. Empty set ⇒ every source key is
+    /// absent ⇒ zero HEADs (the empty-dest fast path).
+    Known(std::collections::HashSet<String>),
+    /// Dest was too large to fully list (or listing errored) — fall back to the
+    /// old behavior: treat every key as possibly-present so it gets a real HEAD.
+    Unbounded,
+}
+
+impl DestIndex {
+    /// True if the key MIGHT exist on the destination (so a HEAD is warranted).
+    /// `Unbounded` always returns true (preserves the HEAD-every-key fallback).
+    fn may_contain(&self, dest_key: &str) -> bool {
+        match self {
+            DestIndex::Known(set) => set.contains(dest_key),
+            DestIndex::Unbounded => true,
+        }
+    }
+}
+
+/// Cap on how many dest keys we'll hold in the existence index. Above this the
+/// index degrades to `Unbounded` (per-key HEAD) to bound memory. 1M keys ≈ tens
+/// of MB of strings — fine; an enormous mirror beyond that is the rare case.
+const DEST_INDEX_MAX_KEYS: usize = 1_000_000;
+
+/// List the destination prefix into a key-existence set (paginated). Returns
+/// `Unbounded` if the prefix exceeds [`DEST_INDEX_MAX_KEYS`] or a list page
+/// errors — both fall back to the safe HEAD-every-key path.
+async fn build_dest_index(engine: &DynEngine, bucket: &str, prefix: &str) -> DestIndex {
+    let mut set = std::collections::HashSet::new();
+    let mut pager = Pager::fresh();
+    while pager.begin_page().is_some() {
+        // LITE list (metadata=false) — we only need keys, not per-object metadata.
+        let page = match engine
+            .list_objects(bucket, prefix, None, 1000, pager.token(), false)
+            .await
+        {
+            Ok(p) => p,
+            // A list error here is non-fatal: fall back to per-key HEAD rather
+            // than mis-reporting the whole dest as empty (which would re-copy
+            // everything). Correctness over speed on the error path.
+            Err(e) => {
+                warn!("replication dest index list for {bucket}/{prefix} failed ({e}); falling back to per-key HEAD");
+                return DestIndex::Unbounded;
+            }
+        };
+        for (key, _) in &page.objects {
+            set.insert(key.clone());
+            if set.len() > DEST_INDEX_MAX_KEYS {
+                return DestIndex::Unbounded;
+            }
+        }
+        if !pager.advance(page.is_truncated, page.next_continuation_token.clone()) {
+            break;
+        }
+    }
+    DestIndex::Known(set)
 }
 
 /// Compute when this rule should next be due. Falls back to a 1-hour
