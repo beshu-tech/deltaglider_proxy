@@ -10,6 +10,47 @@ follow [semantic versioning](https://semver.org/); the Docker image
 
 _Last updated: 2026-06-30_
 
+## v1.9.1 — 2026-06-30
+
+A hardening release for the v1.9.0 replication job controls (kill/delete), plus
+three operator recovery hatches surfaced by an adversarial review.
+
+### Fixed
+
+- **Killing a run no longer leaks a multipart upload.** A killed replication run
+  dropped the in-flight copy future without aborting the destination multipart
+  upload, leaving it dangling on backends that don't garbage-collect incomplete
+  uploads (e.g. Backblaze B2). The abort now runs on the cancellation path too.
+- **A cancelled run is settled authoritatively.** A kill requested while the last
+  page was draining could be overwritten by a success status; and a crash between
+  the kill and the run settling left the row stuck `cancelling` forever. The
+  `cancelling` state is now honored at settle time and reconciled at boot.
+- **Deleting a replication/lifecycle rule can't resurrect it.** A persist failure
+  during delete left the in-memory and on-disk config out of sync, so the deleted
+  rule reappeared on the next restart. Delete now rolls back cleanly on failure,
+  skips a needless engine rebuild, and purges the rule's DB rows in one
+  transaction.
+- **Fail-fast destination detection now matches real failures.** The "destination
+  unusable" fast-abort missed the actual Backblaze B2 over-cap / dead-credential
+  error shapes and could over-eagerly abort a healthy run on a stray token. It
+  now recognizes the real shapes, only aborts when an entire page copies nothing,
+  and backs off to the rule's normal cadence instead of re-firing every minute.
+- **Lifecycle rules no longer show a non-functional Kill button** in the Jobs UI
+  (kill is replication-only); killing a run now asks for confirmation.
+
+### Added
+
+- **Admin session revocation.** A new Access › Sessions page lists live admin
+  sessions and lets an admin force-logout a single session or every session of a
+  given access key — the escape hatch for a stolen cookie or a rotated key,
+  without restarting the proxy.
+- **Event-outbox failed-row purge.** Failed delivery rows (retries exhausted) are
+  now aged out automatically and can be purged on demand from the Event outbox
+  page, so a dead webhook/Slack target can't grow the database unbounded.
+- **Config-DB recovery auto-unlocks on restart.** When the bootstrap password
+  mismatches the encrypted config DB, a successful recovery now persists the
+  recovered hash so the next restart comes up unlocked — no manual env wiring.
+
 ## v1.9.0 — 2026-06-30
 
 ### Changed (BREAKING)
