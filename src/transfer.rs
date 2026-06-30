@@ -347,6 +347,8 @@ async fn stream_copy_passthrough(
         })?;
     let native = handle.native();
     let handle = Arc::new(handle);
+    // Abort the upload if THIS future is dropped (killed) before complete/abort.
+    let mut abort_guard = MultipartAbortGuard::new(engine.clone(), handle.clone());
 
     info!(
         "{} streaming multipart copy src={}/{} dst={}/{} ({} bytes, {} parts, concurrency={})",
@@ -417,7 +419,9 @@ async fn stream_copy_passthrough(
     let collected = match results {
         Ok(v) => v,
         Err(e) => {
-            abort_shared_handle(engine, handle).await;
+            // Explicit abort on a part failure — disarm so the guard's Drop
+            // doesn't double-abort, then abort synchronously here.
+            abort_shared_handle(engine, abort_guard.disarm()).await;
             return Err(e.into());
         }
     };
@@ -439,10 +443,13 @@ async fn stream_copy_passthrough(
     let md5 = source_head.md5.clone();
     let multipart_etag = source_head.multipart_etag.clone();
 
-    let handle =
-        Arc::try_unwrap(handle).map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+    // Reached complete: disarm the guard (it holds a clone) so the Arc is sole-owned.
+    drop(handle);
+    let handle = Arc::try_unwrap(abort_guard.disarm()).map_err(
+        |_| -> Box<dyn std::error::Error + Send + Sync> {
             "internal: multipart handle still shared at finish".into()
-        })?;
+        },
+    )?;
     let result = engine
         .finish_passthrough_multipart(handle, parts, assembled, sha256, md5, multipart_etag)
         .await
@@ -476,6 +483,41 @@ async fn abort_shared_handle(
 ) {
     if let Ok(h) = Arc::try_unwrap(handle) {
         engine.abort_passthrough_multipart(h).await;
+    }
+}
+
+/// Aborts the multipart upload on drop UNLESS disarmed. Covers the
+/// cancellation path: when a kill drops the streaming-copy future mid-part,
+/// neither the Ok nor the Err arm runs, so without this the upload is left
+/// dangling on the destination (backends like B2 don't GC incomplete uploads).
+/// On an armed drop we spawn a detached best-effort abort (Drop is sync).
+struct MultipartAbortGuard {
+    engine: Arc<DynEngine>,
+    handle: Option<Arc<crate::deltaglider::PassthroughMultipartHandle>>,
+}
+
+impl MultipartAbortGuard {
+    fn new(
+        engine: Arc<DynEngine>,
+        handle: Arc<crate::deltaglider::PassthroughMultipartHandle>,
+    ) -> Self {
+        Self {
+            engine,
+            handle: Some(handle),
+        }
+    }
+    /// Hand the handle back; the normal complete/abort path now owns cleanup.
+    fn disarm(&mut self) -> Arc<crate::deltaglider::PassthroughMultipartHandle> {
+        self.handle.take().expect("disarm called twice")
+    }
+}
+
+impl Drop for MultipartAbortGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let engine = self.engine.clone();
+            tokio::spawn(async move { abort_shared_handle(&engine, handle).await });
+        }
     }
 }
 

@@ -194,7 +194,7 @@ pub(crate) fn find_zombie_runs(
         "SELECT h.id, h.rule_name, h.started_at
            FROM {run_table} h
            LEFT JOIN {state_table} s ON s.rule_name = h.rule_name
-          WHERE h.status = 'running'
+          WHERE h.status IN ('running', 'cancelling')
             AND (s.leader_instance_id IS NULL
                  OR s.leader_expires_at IS NULL
                  OR s.leader_expires_at < ?)"
@@ -399,6 +399,19 @@ mod tests {
             })
             .unwrap();
         assert_eq!((status.as_str(), fin), ("failed", 99));
+
+        // A 'cancelling' row left by a crash mid-kill is ALSO a zombie — else it
+        // stays 'cancelling' forever and the GUI polls it indefinitely (K3).
+        c.execute(
+            "INSERT INTO runs (rule_name, started_at, status) VALUES ('r3', 30, 'cancelling')",
+            [],
+        )
+        .unwrap();
+        let z = find_zombie_runs(&c, "runs", "run_state", 100).unwrap();
+        assert!(
+            z.iter().any(|(_, n, _)| n == "r3"),
+            "a leaderless 'cancelling' row must be reconciled, got {z:?}"
+        );
     }
 
     #[test]

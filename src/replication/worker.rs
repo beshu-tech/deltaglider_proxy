@@ -477,6 +477,17 @@ pub async fn run_rule(
     // A pause stop settles as "stopped" — NOT failed/completed (the sweep was
     // intentionally interrupted, not broken). It outranks the error-derived
     // states because the partial-progress that's left is by operator request.
+    // Final authoritative kill check: a kill requested while the LAST page was
+    // draining wouldn't have flipped `killed` (the select! race resolved to the
+    // results arm). The DB `cancelling` row is the source of truth — honor it so
+    // the operator's kill is never silently overwritten by a success status.
+    if !killed {
+        let db = db.lock().await;
+        if db.replication_run_cancel_requested(run_id).unwrap_or(false) {
+            killed = true;
+        }
+    }
+
     let status = if killed {
         "cancelled".to_string()
     } else if stopped_paused {

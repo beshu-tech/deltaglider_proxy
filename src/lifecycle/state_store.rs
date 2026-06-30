@@ -95,25 +95,28 @@ impl ConfigDb {
         let known: std::collections::HashSet<&str> =
             known_rule_names.iter().map(|s| s.as_str()).collect();
         let mut removed = 0usize;
+        // One transaction for all orphans' multi-table deletes (see replication twin).
+        let tx = self.conn.unchecked_transaction()?;
         for existing in rows {
             if !known.contains(existing.as_str()) {
-                let n = self.conn.execute(
+                let n = tx.execute(
                     "DELETE FROM lifecycle_state WHERE rule_name = ?",
                     params![existing],
                 )?;
                 // Run history + failure ring are keyed by rule_name too; drop
                 // them so a deleted rule leaves no orphaned rows in the GUI.
-                self.conn.execute(
+                tx.execute(
                     "DELETE FROM lifecycle_run_history WHERE rule_name = ?",
                     params![existing],
                 )?;
-                self.conn.execute(
+                tx.execute(
                     "DELETE FROM lifecycle_failures WHERE rule_name = ?",
                     params![existing],
                 )?;
                 removed += n;
             }
         }
+        tx.commit()?;
         Ok(removed)
     }
 

@@ -792,9 +792,15 @@ async fn delete_rule(
     name: &str,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, String)> {
-    // 1. Remove from config + rebuild + persist (engine rollback on failure).
+    // 1. Remove from config + persist, restoring on persist failure so memory
+    //    and disk never diverge (a divergence would resurrect the rule on the
+    //    next restart). The engine does NOT read replication/lifecycle rules
+    //    (not in engine_affecting_fields_changed), so no engine rebuild is
+    //    needed — and skipping it removes a failure surface that has nothing to
+    //    do with rule removal (e.g. a momentarily-unreachable backend).
     let remaining: Vec<String> = {
         let mut cfg = state.config.write().await;
+        let rollback = cfg.clone();
         let existed = match sub {
             JobSubsystem::Replication => {
                 let before = cfg.replication.rules.len();
@@ -811,16 +817,14 @@ async fn delete_rule(
         if !existed {
             return Err(not_found());
         }
-        super::config::rebuild_engine(state, &cfg, "Engine rebuilt on rule delete")
-            .await
-            .map_err(internal)?;
         let path = super::config::active_config_path(state);
-        cfg.persist_to_file(&path).map_err(|e| {
-            (
+        if let Err(e) = cfg.persist_to_file(&path) {
+            *cfg = rollback;
+            return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("rule removed in memory but FAILED to persist to {path}: {e}"),
-            )
-        })?;
+                format!("rule delete FAILED to persist to {path} (rolled back, no change): {e}"),
+            ));
+        }
         match sub {
             JobSubsystem::Replication => cfg
                 .replication

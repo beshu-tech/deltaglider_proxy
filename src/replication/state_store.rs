@@ -163,32 +163,37 @@ impl ConfigDb {
         let known: std::collections::HashSet<&str> =
             known_rule_names.iter().map(|s| s.as_str()).collect();
         let mut removed = 0usize;
+        // One transaction for all orphans' multi-table deletes: a crash mid-purge
+        // must not leak the run_history/failures rows this is meant to clear.
+        let tx = self.conn.unchecked_transaction()?;
         for existing in rows {
             if !known.contains(existing.as_str()) {
-                let n = self.conn.execute(
+                let n = tx.execute(
                     "DELETE FROM replication_state WHERE rule_name = ?",
                     params![existing],
                 )?;
-                // Drop the rule's parity object-cache AND result row too —
-                // otherwise they're orphaned forever (both keyed by rule_name).
-                self.parity_cache_clear(&existing)?;
-                self.conn.execute(
+                // Drop the rule's parity object-cache AND result row, run history,
+                // and failure ring too — all keyed by rule_name, else orphaned.
+                tx.execute(
+                    "DELETE FROM replication_parity_objects WHERE rule_name = ?",
+                    params![existing],
+                )?;
+                tx.execute(
                     "DELETE FROM replication_parity WHERE rule_name = ?",
                     params![existing],
                 )?;
-                // Run history + failure ring are also keyed by rule_name; drop
-                // them so a deleted rule leaves no orphaned rows in the GUI.
-                self.conn.execute(
+                tx.execute(
                     "DELETE FROM replication_run_history WHERE rule_name = ?",
                     params![existing],
                 )?;
-                self.conn.execute(
+                tx.execute(
                     "DELETE FROM replication_failures WHERE rule_name = ?",
                     params![existing],
                 )?;
                 removed += n;
             }
         }
+        tx.commit()?;
         Ok(removed)
     }
 
