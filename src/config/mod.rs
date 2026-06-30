@@ -3641,19 +3641,39 @@ encryption_key: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
         drop(guard);
     }
 
+    /// Process-wide lock serializing every `EnvGuard`-using test. `cargo test`
+    /// runs the suite in parallel threads of ONE process, so two tests mutating
+    /// the same env var (`DGP_CONFIG`) otherwise race — one reads back the
+    /// other's value and fails intermittently (only under CI scheduling). The
+    /// guard holds this lock for its whole lifetime, so env-driven tests run one
+    /// at a time. Mirrors the `ENV_LOCK` pattern used by the `DGP_TEST_*` tests.
+    static ENV_GUARD_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+
     /// Test-only RAII guard that sets an env var on construction and
     /// unsets it on drop. Prevents one test from polluting another when
     /// they exercise environment-driven behavior.
     struct EnvGuard {
         key: &'static str,
         prior: Option<String>,
+        // Held for the guard's lifetime to serialize env-touching tests.
+        // `'static` via the `OnceLock`; poison is irrelevant (unit `()` state).
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl EnvGuard {
         fn set(key: &'static str, value: &str) -> Self {
+            let lock = ENV_GUARD_LOCK
+                .get_or_init(|| std::sync::Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             let prior = std::env::var(key).ok();
             std::env::set_var(key, value);
-            Self { key, prior }
+            Self {
+                key,
+                prior,
+                _lock: lock,
+            }
         }
     }
 
