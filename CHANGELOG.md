@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.9.2 — 2026-06-30
+
 ## v1.9.1 — 2026-06-30
 
 A hardening release for the v1.9.0 replication job controls (kill/delete), plus
