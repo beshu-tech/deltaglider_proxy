@@ -23,6 +23,7 @@ export * from './adminApi/mappingRules';
 export * from './adminApi/externalIdentities';
 export * from './adminApi/audit';
 export * from './adminApi/eventOutbox';
+export * from './adminApi/sessions';
 export * from './adminApi/bulkObjects';
 export * from './adminApi/deltaEfficiency';
 export * from './adminApi/bucketScan';

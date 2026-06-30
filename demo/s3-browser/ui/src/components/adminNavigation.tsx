@@ -146,6 +146,14 @@ export const ADMIN_IA: Array<{ group: string; entries: SidebarEntry[] }> = [
         saveModel: 'review',
         description: 'Pre-auth request gating. First matching rule wins.',
       },
+      {
+        path: 'access/sessions',
+        label: 'Sessions',
+        icon: <LockOutlined />,
+        section: 'access',
+        saveModel: 'immediate',
+        description: 'Live admin sessions. Force-logout a stolen cookie or all sessions of a key.',
+      },
     ],
   },
   {

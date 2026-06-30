@@ -93,6 +93,21 @@ struct SessionInfo {
     kind: SessionKind,
 }
 
+/// Redacted view of a live session for the admin revocation UI. Never carries
+/// the auth token or any S3 secret.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionSummary {
+    /// Non-secret short id (token prefix) — used to target revocation.
+    pub id: String,
+    pub ip: Option<String>,
+    pub age_secs: u64,
+    pub admin_gui: bool,
+    /// Auth kind: bootstrap / iam / iam_browser / open / external.
+    pub auth: String,
+    /// access_key_id (IAM) or provider name (external); None for bootstrap/open.
+    pub identity: Option<String>,
+}
+
 /// Thread-safe in-memory session store.
 pub struct SessionStore {
     sessions: RwLock<HashMap<String, SessionInfo>>,
@@ -215,6 +230,90 @@ impl SessionStore {
     /// Remove a session (logout).
     pub fn remove(&self, token: &str) {
         self.sessions.write().remove(token);
+    }
+
+    /// A non-secret session id derived from the token — the first 12 hex chars.
+    /// Enough to identify a session in the admin list and target it for
+    /// revocation without exposing the full 64-char auth token.
+    fn session_id(token: &str) -> String {
+        token.chars().take(12).collect()
+    }
+
+    /// List live (non-expired) sessions for the admin revocation UI. Redacted:
+    /// never returns the token or S3 secret — only a short id, IP, age, kind,
+    /// and the auth identity (access key / provider).
+    pub fn list(&self) -> Vec<SessionSummary> {
+        let sessions = self.sessions.read();
+        sessions
+            .iter()
+            .filter(|(_, info)| info.created_at.elapsed() < self.ttl)
+            .map(|(token, info)| {
+                let (auth, identity) = match &info.auth_method {
+                    AuthMethod::Bootstrap => ("bootstrap", None),
+                    AuthMethod::IamLoginAs { access_key_id } => {
+                        ("iam", Some(access_key_id.clone()))
+                    }
+                    AuthMethod::IamBrowserLift { access_key_id } => {
+                        ("iam_browser", Some(access_key_id.clone()))
+                    }
+                    AuthMethod::OpenLift => ("open", None),
+                    AuthMethod::External { provider_name, .. } => {
+                        ("external", Some(provider_name.clone()))
+                    }
+                };
+                SessionSummary {
+                    id: Self::session_id(token),
+                    ip: info.ip.map(|i| i.to_string()),
+                    age_secs: info.created_at.elapsed().as_secs(),
+                    admin_gui: info.kind == SessionKind::AdminGui,
+                    auth: auth.to_string(),
+                    identity,
+                }
+            })
+            .collect()
+    }
+
+    /// True if `token` (a full session token) has the given short `id`. Used to
+    /// stop an admin revoking their own session via the revoke-by-id route.
+    pub fn session_id_matches(&self, token: &str, id: &str) -> bool {
+        Self::session_id(token) == id
+    }
+
+    /// Revoke a session by its non-secret id (force-logout). Returns true if a
+    /// session matched. The id is a token prefix; matching by prefix is safe
+    /// because a 12-hex-char (48-bit) collision among ≤10 live sessions is
+    /// negligible, and we only ever revoke server-held tokens.
+    pub fn revoke_by_id(&self, id: &str) -> bool {
+        let mut sessions = self.sessions.write();
+        let targets: Vec<String> = sessions
+            .keys()
+            .filter(|t| Self::session_id(t) == id)
+            .cloned()
+            .collect();
+        for t in &targets {
+            sessions.remove(t);
+        }
+        !targets.is_empty()
+    }
+
+    /// Force-logout EVERY session of an IAM user (by access_key_id). Used when a
+    /// key is rotated/compromised — rotating the key alone does NOT invalidate
+    /// already-minted session cookies. Returns the count revoked.
+    pub fn revoke_by_access_key(&self, access_key_id: &str) -> usize {
+        let mut sessions = self.sessions.write();
+        let targets: Vec<String> = sessions
+            .iter()
+            .filter(|(_, info)| match &info.auth_method {
+                AuthMethod::IamLoginAs { access_key_id: k }
+                | AuthMethod::IamBrowserLift { access_key_id: k } => k == access_key_id,
+                _ => false,
+            })
+            .map(|(t, _)| t.clone())
+            .collect();
+        for t in &targets {
+            sessions.remove(t);
+        }
+        targets.len()
     }
 
     /// Store S3 credentials in an existing session.
@@ -413,5 +512,36 @@ mod tests {
         );
         assert!(store.allows_admin_gui(&admin_t, None));
         assert!(!store.allows_admin_gui(&lift_t, None));
+    }
+
+    #[test]
+    fn test_list_and_revoke_sessions() {
+        let store = SessionStore::new();
+        let admin_t = store.create_session(None, AuthMethod::Bootstrap, SessionKind::AdminGui);
+        let user_t = store.create_session(
+            None,
+            AuthMethod::IamLoginAs {
+                access_key_id: "AKIA1".into(),
+            },
+            SessionKind::AdminGui,
+        );
+
+        // list() is redacted: short id, no token.
+        let list = store.list();
+        assert_eq!(list.len(), 2);
+        assert!(list.iter().all(|s| s.id.len() == 12));
+        assert!(list.iter().any(|s| s.identity.as_deref() == Some("AKIA1")));
+
+        // revoke_by_id force-logs-out the targeted session, leaves the other.
+        let admin_id = SessionStore::session_id(&admin_t);
+        assert!(store.revoke_by_id(&admin_id));
+        assert!(!store.validate(&admin_t, None));
+        assert!(store.validate(&user_t, None));
+        assert!(!store.revoke_by_id("deadbeefdead"), "unknown id → false");
+
+        // revoke_by_access_key kills every session of that IAM user.
+        let n = store.revoke_by_access_key("AKIA1");
+        assert_eq!(n, 1);
+        assert!(!store.validate(&user_t, None));
     }
 }

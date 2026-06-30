@@ -16,6 +16,7 @@ import AdminSidebar from './AdminSidebar';
 import { headerForPath, ADMIN_IA } from './adminNavigation';
 import { findEntry } from '../adminNavTree';
 import AdmissionPanel from './AdmissionPanel';
+import SessionsPanel from './SessionsPanel';
 import CredentialsModePanel from './CredentialsModePanel';
 import BucketsPanel from './BucketsPanel';
 import SetupWizard from './SetupWizard';
@@ -559,6 +560,14 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, accountMe
         <>
           {header}
           <AuthenticationPanel onSessionExpired={onSessionExpired} />
+        </>
+      );
+    }
+    if (adminPath === 'access/sessions') {
+      return (
+        <>
+          {header}
+          <SessionsPanel onSessionExpired={onSessionExpired} />
         </>
       );
     }

@@ -20,6 +20,7 @@ pub(crate) mod objects;
 pub(crate) mod replication;
 mod savings;
 mod scanner;
+mod sessions;
 pub(crate) mod users;
 
 use parking_lot::RwLock;
@@ -95,6 +96,7 @@ pub use scanner::{
     get_bucket_usage, get_usage, migrate_legacy, refresh_bucket_usage, scan_usage,
     ScanUsageRequest, UsageQuery,
 };
+pub use sessions::{list_sessions, revoke_session, revoke_user_sessions};
 pub use users::{
     clone_user, create_user, delete_user, get_canned_policies, iam_version, list_users,
     rotate_user_keys, update_user, usage_scan_version, CloneUserRequest, CreateUserRequest,

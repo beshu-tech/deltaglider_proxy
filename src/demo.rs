@@ -292,6 +292,14 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         // (all admins see the same log so there's no per-identity
         // filtering to do at this layer).
         .route("/_/api/admin/audit", get(admin::get_audit))
+        // Live admin session list + force-logout (revoke a stolen cookie / all
+        // sessions of a compromised IAM key) without restarting the proxy.
+        .route("/_/api/admin/sessions", get(admin::list_sessions))
+        .route("/_/api/admin/sessions/:id", delete(admin::revoke_session))
+        .route(
+            "/_/api/admin/sessions/revoke-user",
+            post(admin::revoke_user_sessions),
+        )
         .route("/_/api/admin/logs", get(admin::get_logs))
         .route("/_/api/admin/logs/stream", get(admin::get_logs_stream))
         // Durable event outbox diagnostics and operator requeue controls.
