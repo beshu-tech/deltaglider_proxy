@@ -8,7 +8,23 @@ Every released version of DeltaGlider Proxy, newest first. Versions
 follow [semantic versioning](https://semver.org/); the Docker image
 `beshultd/deltaglider_proxy:<version>` is published for each tag.
 
-_Last updated: 2026-06-29_
+_Last updated: 2026-06-30_
+
+## v1.9.0 — 2026-06-30
+
+### Changed (BREAKING)
+
+- **Replication: removed the `source-wins` conflict policy; added `content-diff`.**
+  `source-wins` copied every object on every reconcile sweep unconditionally — it
+  could never converge on a recurring rule (the rule re-shipped the entire bucket
+  forever). It is replaced by `content-diff`, which keeps the destination an exact
+  mirror by copying **only when the bytes differ** (size differs, or both sides
+  carry a logical SHA-256 and those differ) and skipping byte-identical objects —
+  so the rule converges and a healthy sweep eventually copies nothing. **A config
+  carrying `conflict: source-wins` is now rejected at load** (`unknown variant
+  'source-wins', expected one of 'newer-wins', 'content-diff', 'skip-if-dest-exists'`);
+  switch such rules to `content-diff` (same "dest = source" intent, without the
+  re-ship).
 
 ## v1.8.3 — 2026-06-29
 
