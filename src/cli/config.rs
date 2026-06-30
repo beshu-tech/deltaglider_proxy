@@ -175,12 +175,7 @@ pub fn lint(file: &str) -> i32 {
     // so a CI `config lint` catches a delete rule missing expire_after before
     // it ships. Suppress the (now-redundant) advisory warnings when errors are
     // present so the operator sees the fatal message once, not twice.
-    let lifecycle_errors: Vec<String> = cfg
-        .lifecycle
-        .rules
-        .iter()
-        .flat_map(crate::lifecycle::planner::lifecycle_rule_errors)
-        .collect();
+    let lifecycle_errors = crate::lifecycle::planner::lifecycle_config_errors(&cfg.lifecycle);
     if !lifecycle_errors.is_empty() {
         for e in &lifecycle_errors {
             eprintln!("error: {e}");

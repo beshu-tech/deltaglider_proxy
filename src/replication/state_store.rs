@@ -198,7 +198,12 @@ impl ConfigDb {
         max_failures_retained: u32,
     ) -> Result<usize, ConfigDbError> {
         let now = current_unix_seconds();
-        let zombies = job_store::find_zombie_runs(&self.conn, "replication_run_history")?;
+        let zombies = job_store::find_zombie_runs(
+            &self.conn,
+            "replication_run_history",
+            "replication_state",
+            now,
+        )?;
         // Collect the distinct affected rules so the ring is pruned once per
         // rule after the inserts (a rule with several zombie runs gets one prune,
         // not one per row).
@@ -218,6 +223,16 @@ impl ConfigDb {
                         started_at
                     )
                 ],
+            )?;
+            // Stamp the per-rule state row too, so the admin UI doesn't keep
+            // reporting the rule as "running" for up to a full schedule interval
+            // after the process actually died. (Lifecycle's twin already does
+            // this; this closes the asymmetry.)
+            self.conn.execute(
+                "UPDATE replication_state
+                    SET last_status = 'failed', last_run_at = ?
+                  WHERE rule_name = ?",
+                params![now, rule_name],
             )?;
             if !affected_rules.contains(rule_name) {
                 affected_rules.push(rule_name.clone());
@@ -1347,6 +1362,12 @@ mod tests {
         let fails = db.replication_recent_failures("r", 10).unwrap();
         assert_eq!(fails.len(), 1);
         assert!(fails[0].error_message.contains("died mid-run"));
+
+        // C8: the per-rule state row's last_status is also flipped to 'failed',
+        // so the admin UI doesn't keep reporting the rule as 'running' after the
+        // crash (matches lifecycle's twin).
+        let st = db.replication_load_state("r").unwrap().unwrap();
+        assert_eq!(st.last_status, "failed");
     }
 
     #[test]

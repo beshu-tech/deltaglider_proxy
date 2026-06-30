@@ -1220,3 +1220,56 @@ async fn section_webhook_headers_secret_roundtrip() {
         "Authorization header must be deleted, got: {body}"
     );
 }
+
+#[tokio::test]
+async fn section_put_storage_rejects_fatal_lifecycle_rule_with_400() {
+    // C2: the GUI Jobs/Storage editor saves through the SECTION PUT path. A
+    // delete lifecycle rule missing `expire_after` must be rejected here with
+    // 400 (same gate the document-level /apply runs) — not accepted as a
+    // warning and then failed every scheduler tick. Regression for the gap
+    // where apply_section only ran the advisory check().
+    let server = TestServer::builder()
+        .auth("SECLC1", "SECLCSECRET")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    let resp = admin
+        .put(format!(
+            "{}/_/api/admin/config/section/storage",
+            server.endpoint()
+        ))
+        .json(&json!({
+            "lifecycle": {
+                "enabled": true,
+                "tick_interval": "1h",
+                "rules": [{
+                    "name": "expire-old",
+                    "enabled": true,
+                    "bucket": "b",
+                    "prefix": "",
+                    // delete action, NO expire_after — fatal.
+                    "batch_size": 100,
+                    "include_globs": ["old/**"],
+                    "exclude_globs": []
+                }]
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "section PUT must reject the fatal lifecycle rule with 400"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], false);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("requires expire_after"),
+        "error must name the missing field: {body}"
+    );
+}

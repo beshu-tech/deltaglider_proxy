@@ -123,7 +123,12 @@ impl ConfigDb {
         max_failures_retained: u32,
     ) -> Result<usize, ConfigDbError> {
         let now = crate::lifecycle::current_unix_seconds();
-        let zombies = job_store::find_zombie_runs(&self.conn, "lifecycle_run_history")?;
+        let zombies = job_store::find_zombie_runs(
+            &self.conn,
+            "lifecycle_run_history",
+            "lifecycle_state",
+            now,
+        )?;
         // Collect the distinct affected rules so the ring is pruned once per
         // rule after the inserts (a rule with several zombie runs gets one prune).
         let mut affected_rules: Vec<String> = Vec::new();

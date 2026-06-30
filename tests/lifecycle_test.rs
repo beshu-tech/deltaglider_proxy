@@ -717,4 +717,24 @@ async fn test_lifecycle_preview_delete_without_expire_after_is_400_not_500() {
         body.contains("requires expire_after"),
         "400 body should name the missing field, got: {body}"
     );
+
+    // C6: the rejected run-now must NOT have recorded a spurious FAILED run row
+    // (the pre-gate now 400s BEFORE acquiring a lease / opening a run). The Jobs
+    // Runs view must stay empty for this rule.
+    let runs: Value = admin
+        .get(format!(
+            "{}/_/api/admin/jobs/lifecycle:expire-old/runs",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .expect("runs history")
+        .json()
+        .await
+        .expect("runs json");
+    let history = runs["runs"].as_array().map(|a| a.len()).unwrap_or(0);
+    assert_eq!(
+        history, 0,
+        "a fatal rule's rejected run-now must create no run row, got {runs}"
+    );
 }

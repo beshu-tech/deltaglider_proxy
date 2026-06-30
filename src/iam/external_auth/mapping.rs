@@ -26,14 +26,17 @@ pub fn evaluate_mappings(
 /// True iff `rule` keys its match on the `email` claim (and thus must NOT fire
 /// when the identity's email is unverified — an unverified email is attacker-
 /// controllable on IdPs that allow self-service signup). The four `email_*`
-/// match types read `identity.email`; `claim_value` and unknown types do not
-/// (they key on other claims, whose trust is independent of email verification).
+/// match types read `identity.email`; so does a `claim_value` rule whose
+/// `match_field` is the `email` claim — that path reads the same attacker-
+/// controllable value, so it MUST be gated too (a `claim_value`+`email` rule was
+/// previously a bypass). Any other `claim_value` field (or unknown type) keys on
+/// a claim whose trust is independent of email verification and is left alone.
 /// Pure so the gate is unit-testable without a DB / IdP.
 pub fn rule_keys_on_email(rule: &GroupMappingRule) -> bool {
     matches!(
         rule.match_type.as_str(),
         "email_exact" | "email_domain" | "email_glob" | "email_regex"
-    )
+    ) || (rule.match_type == "claim_value" && rule.match_field.eq_ignore_ascii_case("email"))
 }
 
 /// SECURITY GATE: drop email-based mapping rules when the identity's email is
@@ -275,6 +278,25 @@ mod tests {
             "department",
             "eng",
             10,
+        )));
+        // SECURITY: a claim_value rule keyed on the `email` claim reads the SAME
+        // attacker-controllable value as the email_* types → it MUST be gated
+        // (this was a bypass). Case-insensitive on the field name.
+        assert!(rule_keys_on_email(&make_rule(
+            1,
+            None,
+            "claim_value",
+            "email",
+            "a@corp.com",
+            10
+        )));
+        assert!(rule_keys_on_email(&make_rule(
+            1,
+            None,
+            "claim_value",
+            "Email",
+            "a@corp.com",
+            10
         )));
         // Unknown match_type is NOT email-keyed (matches_rule already warns +
         // returns false for it; the gate shouldn't double-block it).

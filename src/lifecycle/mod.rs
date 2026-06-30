@@ -55,6 +55,8 @@ const LIFECYCLE_DURATION_FIELDS: &[&str] = &[
 /// `run_or_preview_retain_newest` + `planner::PlanError::InvalidGlob`:
 /// - "lifecycle rule '{}' {kind} action requires expire_after"
 /// - "lifecycle rule '{}' {field}={s} invalid: {err}" / " out of range: {err}"
+/// - "lifecycle rule '{}' transition destination bucket is empty"
+/// - "lifecycle rule name '{}' is duplicated …"
 /// - "invalid glob {pattern:?}: {reason}"
 /// - "lifecycle rule '{}' retain-newest count is 0 — refusing to run …"
 ///
@@ -65,6 +67,8 @@ const LIFECYCLE_DURATION_FIELDS: &[&str] = &[
 fn is_lifecycle_config_validation_error(err: &str) -> bool {
     if err.contains("requires expire_after")
         || err.contains("count is 0")
+        || err.contains("transition destination bucket is empty")
+        || err.contains("is duplicated")
         || err.starts_with("invalid glob")
     {
         return true;

@@ -2,7 +2,7 @@
 
 //! Pure lifecycle planning functions.
 
-use crate::config_sections::{LifecycleAction, LifecycleRule};
+use crate::config_sections::{LifecycleAction, LifecycleConfig, LifecycleRule};
 use crate::replication::{normalize_prefix, rewrite_key};
 use crate::types::FileMetadata;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -76,6 +76,17 @@ pub fn lifecycle_rule_errors(rule: &LifecycleRule) -> Vec<String> {
                     }
                 },
             }
+            // A transition with no destination bucket fails every object at run
+            // time (the recurring-FAILED class this gate exists to stop), so
+            // it's fatal at config time, not just advisory.
+            if let LifecycleAction::Transition(action) = &rule.action {
+                if action.destination.bucket.trim().is_empty() {
+                    errs.push(format!(
+                        "lifecycle rule '{}' transition destination bucket is empty",
+                        rule.name
+                    ));
+                }
+            }
         }
     }
     // Globs apply to every action (the worker compiles them for delete /
@@ -83,6 +94,33 @@ pub fn lifecycle_rule_errors(rule: &LifecycleRule) -> Vec<String> {
     // surface it at config time here so the rule is rejected before it runs.
     if let Err(e) = compile_rule_globs(rule) {
         errs.push(format!("{e}"));
+    }
+    errs
+}
+
+/// Whole-config fatal lifecycle errors — the single gate every config path
+/// (document apply/validate, section PUT, CLI lint, scheduler) should run.
+///
+/// Folds every rule's [`lifecycle_rule_errors`] AND adds config-level checks a
+/// per-rule view can't see:
+/// - **Duplicate rule names are fatal.** Lifecycle state/cursor/lease are keyed
+///   by `rule.name`, so two same-named rules corrupt each other's resume cursor
+///   and lease. Previously only an advisory warning (`validate_lifecycle`).
+///
+/// Pure (no I/O) so the truth table is unit-tested. Strings stay recognizable to
+/// [`super::classify_lifecycle_run_error`] so config-time and run-time agree.
+pub fn lifecycle_config_errors(cfg: &LifecycleConfig) -> Vec<String> {
+    let mut errs = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for rule in &cfg.rules {
+        if !seen.insert(rule.name.as_str()) {
+            errs.push(format!(
+                "lifecycle rule name '{}' is duplicated — rule names must be unique \
+                 (state, cursor and lease are keyed by name)",
+                rule.name
+            ));
+        }
+        errs.extend(lifecycle_rule_errors(rule));
     }
     errs
 }
@@ -553,6 +591,76 @@ mod tests {
         assert!(
             errs[0].contains("transition") && errs[0].contains("requires expire_after"),
             "must name the transition kind + missing field: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn transition_empty_destination_bucket_is_fatal() {
+        // C5: an empty transition dest bucket fails every object at run time →
+        // fatal at config time (was advisory-only). expire_after is set so this
+        // is the ONLY error.
+        use crate::config_sections::{LifecycleDestination, LifecycleTransitionAction};
+        let mut r = rule(&["old/**"], &[]);
+        r.action = LifecycleAction::Transition(LifecycleTransitionAction {
+            destination: LifecycleDestination {
+                bucket: "   ".to_string(), // whitespace-only → empty
+                prefix: String::new(),
+            },
+            delete_source_after_success: false,
+        });
+        let errs = lifecycle_rule_errors(&r);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("transition destination bucket is empty")),
+            "{errs:?}"
+        );
+        // And the run/config classifier treats it as a 400 (config defect).
+        assert_eq!(
+            crate::lifecycle::classify_lifecycle_run_error(&errs.join("; ")),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn duplicate_rule_names_are_a_fatal_config_error() {
+        // C7: two same-named rules corrupt each other's keyed state → fatal at
+        // the CONFIG level (lifecycle_rule_errors can't see it; the new
+        // lifecycle_config_errors does).
+        use crate::config_sections::LifecycleConfig;
+        let r1 = rule(&["a/**"], &[]);
+        let mut r2 = rule(&["b/**"], &[]);
+        r2.prefix = "different/".to_string(); // same name, different scope
+        let cfg = LifecycleConfig {
+            enabled: true,
+            rules: vec![r1, r2],
+            ..Default::default()
+        };
+        let errs = lifecycle_config_errors(&cfg);
+        assert!(
+            errs.iter().any(|e| e.contains("is duplicated")),
+            "duplicate name must be fatal: {errs:?}"
+        );
+        assert_eq!(
+            crate::lifecycle::classify_lifecycle_run_error(&errs.join("; ")),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn lifecycle_config_errors_folds_per_rule_errors() {
+        // The config validator must also surface each rule's own fatal errors.
+        use crate::config_sections::LifecycleConfig;
+        let mut bad = rule(&["old/**"], &[]);
+        bad.expire_after = None; // delete missing expire_after
+        let cfg = LifecycleConfig {
+            enabled: true,
+            rules: vec![bad],
+            ..Default::default()
+        };
+        let errs = lifecycle_config_errors(&cfg);
+        assert!(
+            errs.iter().any(|e| e.contains("requires expire_after")),
+            "{errs:?}"
         );
     }
 

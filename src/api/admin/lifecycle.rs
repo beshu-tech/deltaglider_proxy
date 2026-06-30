@@ -22,6 +22,14 @@ pub async fn preview(
         .cloned()
         .ok_or_else(|| (StatusCode::NOT_FOUND, "rule not found".to_string()))?;
 
+    // Symmetry with run_now: a fatal-config rule 400s up front rather than
+    // surfacing the same error deeper in preview_rule.
+    let fatal = lifecycle::planner::lifecycle_rule_errors(&rule);
+    if !fatal.is_empty() {
+        let msg = fatal.join("; ");
+        return Err((lifecycle::classify_lifecycle_run_error(&msg), msg));
+    }
+
     let engine = state.s3_state.engine.load().clone();
     lifecycle::preview_rule(&engine, &rule, lifecycle_cfg.max_failures_retained as usize)
         .await
@@ -102,6 +110,16 @@ pub async fn run_now(
                 rule.name
             ),
         ));
+    }
+
+    // Pre-gate: a fatal-config rule (missing expire_after, empty transition
+    // dest, …) must 400 BEFORE we take a lease / open a run — otherwise the
+    // worker errors mid-run and records a spurious FAILED run row (the exact
+    // recurring-FAILED noise the config gate + scheduler-skip exist to stop).
+    let fatal = lifecycle::planner::lifecycle_rule_errors(&rule);
+    if !fatal.is_empty() {
+        let msg = fatal.join("; ");
+        return Err((lifecycle::classify_lifecycle_run_error(&msg), msg));
     }
 
     // Same deferral the scheduler applies: run-now must not write into a

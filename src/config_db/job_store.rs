@@ -177,16 +177,30 @@ pub(crate) fn prune_failure_ring(
 /// Boot-time zombie scan: run-history rows left `running` by a dead
 /// process. Returns `(id, name, started_at)` triples; the caller applies
 /// its subsystem's policy (mark failed / re-queue / stamp state).
+/// Lease-aware: a `running` run is only a zombie if the rule's leader lease (on
+/// `state_table`, keyed by `rule_name`) has LAPSED — never resurrect a run whose
+/// lease a live peer still holds. Mirrors `maintenance_requeue_abandoned`'s
+/// `leader_expires_at < now` guard. Harmless under today's node-local
+/// coordination tables, but removes the asymmetry so a future shared config DB
+/// can't fail/resurrect a peer's live run. `now` is the lapse cutoff.
 pub(crate) fn find_zombie_runs(
     conn: &Connection,
     run_table: &str,
+    state_table: &str,
+    now: i64,
 ) -> Result<Vec<(i64, String, i64)>, ConfigDbError> {
-    check_idents(&[run_table])?;
+    check_idents(&[run_table, state_table])?;
     let mut stmt = conn.prepare(&format!(
-        "SELECT id, rule_name, started_at FROM {run_table} WHERE status = 'running'"
+        "SELECT h.id, h.rule_name, h.started_at
+           FROM {run_table} h
+           LEFT JOIN {state_table} s ON s.rule_name = h.rule_name
+          WHERE h.status = 'running'
+            AND (s.leader_instance_id IS NULL
+                 OR s.leader_expires_at IS NULL
+                 OR s.leader_expires_at < ?)"
     ))?;
     let rows = stmt
-        .query_map([], |r| {
+        .query_map(params![now], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
@@ -237,6 +251,11 @@ mod tests {
                 started_at INTEGER NOT NULL,
                 finished_at INTEGER,
                 status TEXT NOT NULL
+            );
+            CREATE TABLE run_state (
+                rule_name TEXT PRIMARY KEY,
+                leader_instance_id TEXT,
+                leader_expires_at INTEGER
             );",
         )
         .unwrap();
@@ -351,8 +370,28 @@ mod tests {
              INSERT INTO runs (rule_name, started_at, status) VALUES ('r2', 20, 'succeeded');",
         )
         .unwrap();
-        let zombies = find_zombie_runs(&c, "runs").unwrap();
+        // No lease row for r1 → LEFT JOIN yields NULL lease → it's a zombie.
+        let zombies = find_zombie_runs(&c, "runs", "run_state", 100).unwrap();
         assert_eq!(zombies, vec![(1, "r1".to_string(), 10)]);
+
+        // But if a LIVE peer lease exists (expires in the future), r1 is NOT a
+        // zombie — never resurrect a run a peer still holds.
+        c.execute(
+            "INSERT INTO run_state (rule_name, leader_instance_id, leader_expires_at)
+             VALUES ('r1', 'peer-b', 9999)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            find_zombie_runs(&c, "runs", "run_state", 100)
+                .unwrap()
+                .is_empty(),
+            "a live peer lease protects the running row"
+        );
+        // Once the lease lapses (now > expiry), it's a zombie again.
+        let after = find_zombie_runs(&c, "runs", "run_state", 10000).unwrap();
+        assert_eq!(after, vec![(1, "r1".to_string(), 10)]);
+
         mark_run_failed(&c, "runs", 1, 99).unwrap();
         let (status, fin): (String, i64) = c
             .query_row("SELECT status, finished_at FROM runs WHERE id=1", [], |r| {
@@ -371,7 +410,8 @@ mod tests {
         assert!(release_leader_lease(&c, bad, "name", &"a", "w").is_err());
         assert!(clear_stale_leases(&c, bad, 0).is_err());
         assert!(prune_failure_ring(&c, bad, "rule_name", &"r", 1).is_err());
-        assert!(find_zombie_runs(&c, bad).is_err());
+        assert!(find_zombie_runs(&c, bad, "run_state", 0).is_err());
+        assert!(find_zombie_runs(&c, "runs", bad, 0).is_err());
         assert!(mark_run_failed(&c, bad, 1, 0).is_err());
     }
 }

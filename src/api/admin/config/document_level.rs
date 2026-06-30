@@ -273,12 +273,7 @@ fn parse_and_validate_yaml(yaml: &str) -> Result<(crate::config::Config, Vec<Str
     // globs/durations) is rejected here, not accepted as a warning and then
     // failed every scheduler tick. Gate is shared by /validate (dry-run) and
     // /apply since both route through this fn. Mirrors the log_level gate above.
-    let lifecycle_errors: Vec<String> = cfg
-        .lifecycle
-        .rules
-        .iter()
-        .flat_map(crate::lifecycle::planner::lifecycle_rule_errors)
-        .collect();
+    let lifecycle_errors = crate::lifecycle::planner::lifecycle_config_errors(&cfg.lifecycle);
     if !lifecycle_errors.is_empty() {
         return Err(lifecycle_errors.join("; "));
     }

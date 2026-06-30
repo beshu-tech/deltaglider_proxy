@@ -174,6 +174,23 @@ fn build_globset(patterns: &[String]) -> Result<GlobSet, PlanError> {
     })
 }
 
+/// Resolve an object's comparable ETag + multipart part-count from its metadata,
+/// the same way `parity::ObjState::from_metadata` does: prefer the multipart
+/// ETag, else a non-empty md5; parse the `-N` part count off the RESOLVED etag
+/// so a foreign multipart object (shape arriving via md5) is handled too.
+/// Used by content-diff's tier-2 compare so it agrees with parity/Verify.
+fn resolve_etag_and_parts(m: &FileMetadata) -> (Option<String>, Option<u32>) {
+    let etag = m
+        .multipart_etag
+        .clone()
+        .or_else(|| (!m.md5.is_empty()).then(|| m.md5.clone()));
+    let parts = etag
+        .as_deref()
+        .and_then(|e| e.rsplit_once('-'))
+        .and_then(|(_, n)| n.parse::<u32>().ok());
+    (etag, parts)
+}
+
 /// Pure predicate: should we copy `source_key` from `src_meta` to
 /// destination, given optional `dest_meta`?
 ///
@@ -235,7 +252,18 @@ pub fn should_replicate(
             let sha_differs = !src_meta.file_sha256.is_empty()
                 && !dest.file_sha256.is_empty()
                 && src_meta.file_sha256 != dest.file_sha256;
-            if size_differs || sha_differs {
+            // Tier-2 (sha absent a side): equal-size objects whose ETags differ
+            // ARE different bytes — copy. Mirrors parity::compare_pair so
+            // content-diff and Verify agree for foreign/legacy objects (those
+            // missing a logical SHA). Only comparable when the multipart shapes
+            // match (a multipart `-N` etag is md5-of-md5s, not the object md5);
+            // mismatched shapes demote to size-only, like parity's tier-3.
+            let (s_etag, s_parts) = resolve_etag_and_parts(src_meta);
+            let (d_etag, d_parts) = resolve_etag_and_parts(dest);
+            let etag_differs = !sha_differs
+                && s_parts == d_parts
+                && matches!((&s_etag, &d_etag), (Some(s), Some(d)) if s != d);
+            if size_differs || sha_differs || etag_differs {
                 Decision::Copy {
                     dest_key: source_key.to_string(),
                 }
@@ -496,6 +524,77 @@ mod tests {
                 }
             ),
             "size-match + missing sha must skip, got {d:?}"
+        );
+    }
+
+    #[test]
+    fn should_replicate_content_diff_foreign_etag_differs_copies() {
+        // C4: a foreign object (no logical sha either side), equal size, whose
+        // ETag (md5) differs → the bytes differ → COPY. Parity flags this as a
+        // tier-2 mismatch; content-diff must agree (it used to wrongly skip).
+        let mut rule = default_rule();
+        rule.conflict = ConflictPolicy::ContentDiff;
+        let (inc, exc) = compile_rule_globs(&rule).unwrap();
+        let mut src = make_meta("file.txt", 10, Utc.timestamp_opt(100, 0).unwrap());
+        let mut dst = make_meta("file.txt", 10, Utc.timestamp_opt(100, 0).unwrap());
+        src.file_sha256 = String::new();
+        dst.file_sha256 = String::new();
+        src.md5 = "aaaaaaaa".to_string();
+        dst.md5 = "bbbbbbbb".to_string();
+        let d = should_replicate("file.txt", &src, Some(&dst), rule.conflict, &inc, &exc);
+        assert!(
+            matches!(d, Decision::Copy { .. }),
+            "differing etag must copy: {d:?}"
+        );
+    }
+
+    #[test]
+    fn should_replicate_content_diff_foreign_etag_equal_skips() {
+        // Same foreign shape but equal ETag → identical bytes → SKIP (converge).
+        let mut rule = default_rule();
+        rule.conflict = ConflictPolicy::ContentDiff;
+        let (inc, exc) = compile_rule_globs(&rule).unwrap();
+        let mut src = make_meta("file.txt", 10, Utc.timestamp_opt(900, 0).unwrap());
+        let mut dst = make_meta("file.txt", 10, Utc.timestamp_opt(100, 0).unwrap());
+        src.file_sha256 = String::new();
+        dst.file_sha256 = String::new();
+        src.md5 = "samesame".to_string();
+        dst.md5 = "samesame".to_string();
+        let d = should_replicate("file.txt", &src, Some(&dst), rule.conflict, &inc, &exc);
+        assert!(
+            matches!(
+                d,
+                Decision::Skip {
+                    reason: SkipReason::DestIdentical
+                }
+            ),
+            "equal etag must skip: {d:?}"
+        );
+    }
+
+    #[test]
+    fn should_replicate_content_diff_multipart_shape_mismatch_skips() {
+        // Mismatched multipart shapes (different part counts) make the ETags
+        // incomparable → demote to size-only and SKIP, exactly like parity
+        // tier-3 (a multipart `-N` etag is md5-of-md5s, not the object md5).
+        let mut rule = default_rule();
+        rule.conflict = ConflictPolicy::ContentDiff;
+        let (inc, exc) = compile_rule_globs(&rule).unwrap();
+        let mut src = make_meta("file.txt", 10, Utc.timestamp_opt(100, 0).unwrap());
+        let mut dst = make_meta("file.txt", 10, Utc.timestamp_opt(100, 0).unwrap());
+        src.file_sha256 = String::new();
+        dst.file_sha256 = String::new();
+        src.multipart_etag = Some("abc-3".to_string()); // 3 parts
+        dst.multipart_etag = Some("def-5".to_string()); // 5 parts
+        let d = should_replicate("file.txt", &src, Some(&dst), rule.conflict, &inc, &exc);
+        assert!(
+            matches!(
+                d,
+                Decision::Skip {
+                    reason: SkipReason::DestIdentical
+                }
+            ),
+            "incomparable multipart shapes must skip (size-only): {d:?}"
         );
     }
 

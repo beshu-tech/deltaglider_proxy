@@ -449,6 +449,27 @@ async fn apply_section(
     // warnings pipeline the document-level apply runs).
     let warnings_from_check = new_cfg.check();
 
+    // Fatal lifecycle gate — the SAME gate the document-level apply runs
+    // (`parse_and_validate_yaml`). The GUI's Jobs/Storage editor saves through
+    // THIS section path, so without it a delete rule missing `expire_after`
+    // (or a dup rule name, empty transition dest, …) was accepted as a mere
+    // warning and then failed every scheduler tick.
+    let lifecycle_errors = crate::lifecycle::planner::lifecycle_config_errors(&new_cfg.lifecycle);
+    if !lifecycle_errors.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(SectionApplyResponse {
+                ok: false,
+                warnings: removed_warnings,
+                requires_restart: false,
+                persisted_path: None,
+                error: Some(lifecycle_errors.join("; ")),
+                diff: None,
+            }),
+        )
+            .into_response();
+    }
+
     // Compute the diff before we potentially swap. This is the shape
     // the UI renders in the Apply dialog.
     let diff = compute_section_diff(section, &old_cfg, &new_cfg);
