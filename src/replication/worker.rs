@@ -31,7 +31,7 @@ use super::planner::{normalize_prefix, plan_batch};
 use super::state_store::{current_unix_seconds, FailureInsert, RunTotals};
 use crate::background::RunLease;
 use crate::config_db::ConfigDb;
-use crate::config_sections::ReplicationRule;
+use crate::config_sections::{ConflictPolicy, ReplicationRule};
 use crate::deltaglider::DynEngine;
 use crate::event_outbox::{EventKind, EventSource, NewEvent};
 use crate::job_loop::Pager;
@@ -40,6 +40,7 @@ use crate::transfer::{
     copy_object_with_retries, CopyStrategy, ObjectTransferRequest, TransferProvenance,
     REPLICATION_RULE_METADATA_KEY,
 };
+use crate::types::FileMetadata;
 use futures::stream::StreamExt;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -173,15 +174,16 @@ pub async fn run_rule(
     let heartbeat_handle =
         spawn_lease_heartbeat(db.clone(), &rule.name, lease.clone(), lease_alive.clone());
 
-    // Build a dest-key existence index ONCE per run by LISTING the destination
-    // prefix (one list call per ~1000 keys), instead of HEADing every source key
-    // during planning. A HEAD per object against a remote dest is what made a
-    // copy to an empty/sparse destination spend minutes "thinking" before copying
-    // anything — every HEAD just confirmed the key was absent (→ always Copy).
-    // With the index, planning HEADs a dest key ONLY when it actually exists.
-    // Bounded: if the dest is enormous the index build itself is capped and we
-    // fall back to per-key HEAD (preserving old behavior for that rare case).
-    let dest_index = build_dest_index(engine, &rule.destination.bucket, &dest_prefix).await;
+    // Build a dest-presence ORACLE once per run by DESCENDING the dest+source
+    // prefix trees with a `/` delimiter, instead of HEADing every source key (or
+    // even flat-listing the whole dest). A HEAD per object against a remote dest
+    // is what made a copy to an empty/sparse destination spend minutes "thinking"
+    // before copying anything. With the oracle, an absent dest subtree is proven
+    // from a single common-prefix probe — its objects all copy with no HEAD — and
+    // planning HEADs a dest key ONLY when it actually exists. Bounded: an enormous
+    // or errored/cancelled descent falls back to per-key HEAD (old behavior).
+    let dest_oracle =
+        build_dest_oracle(engine, &db, run_id, rule, &dest_prefix, &source_prefix).await;
 
     let mut pager = Pager::resuming(continuation);
     // ── Forward-copy pass: paginate source until exhausted ──
@@ -289,20 +291,41 @@ pub async fn run_rule(
         let plan = {
             let head_engine = engine.clone();
             let dest_bucket = rule.destination.bucket.clone();
-            let dest_index = &dest_index;
+            let dest_oracle = &dest_oracle;
+            let conflict = rule.conflict;
             plan_batch(&page.objects, rule, move |dest_key| {
                 let engine = head_engine.clone();
                 let dest_bucket = dest_bucket.clone();
                 let dk = dest_key.to_string();
-                // Skip the HEAD entirely when the index proves the key is absent —
-                // a missing dest object always copies under every conflict policy,
-                // so its metadata is never needed. Only HEAD when it might exist.
-                let maybe_present = dest_index.may_contain(&dk);
-                async move {
-                    if !maybe_present {
-                        return None;
+                // Decide what dest metadata (if any) the planner needs WITHOUT a
+                // HEAD where provable:
+                //  - absent on dest   → None (copy under every policy).
+                //  - SkipIfDestExists → existence ONLY; the policy discards the
+                //    metadata, so a synth meta (any) skips the HEAD. Safe on every
+                //    backend incl. encrypted (we never read the dest's content).
+                //  - else (ContentDiff / NewerWins / delta-eligible) → real HEAD.
+                //    NOTE: ContentDiff head-free from the lite list is UNSAFE on an
+                //    encrypting dest backend — the lite list returns ciphertext
+                //    size/etag while a HEAD returns decrypted logical facts, so a
+                //    lite compare would over-copy every tick. Deferred until the
+                //    engine can cheaply report whether a dest bucket encrypts.
+                let maybe_present = dest_oracle.may_contain(&dk);
+                let synth = if !maybe_present {
+                    Some(None) // resolved: absent
+                } else if let Some(leaf) = dest_oracle.leaf(&dk) {
+                    if matches!(conflict, ConflictPolicy::SkipIfDestExists) {
+                        Some(Some(leaf.synth_meta(&dk)))
+                    } else {
+                        None // need a real HEAD (decrypted/logical facts)
                     }
-                    engine.head(&dest_bucket, &dk).await.ok()
+                } else {
+                    None // Unbounded / no leaf — HEAD
+                };
+                async move {
+                    match synth {
+                        Some(resolved) => resolved,
+                        None => engine.head(&dest_bucket, &dk).await.ok(),
+                    }
                 }
             })
             .await
@@ -1150,65 +1173,299 @@ fn dest_to_source_key(rule: &ReplicationRule, dest_key: &str) -> Option<String> 
     Some(format!("{}{}", src_prefix, tail.trim_start_matches('/')))
 }
 
-/// Existence index for destination keys, built by listing the dest prefix once
-/// per run. Lets planning skip a per-object HEAD when the key is provably absent.
-enum DestIndex {
-    /// Fully listed: `may_contain` is exact. Empty set ⇒ every source key is
-    /// absent ⇒ zero HEADs (the empty-dest fast path).
-    Known(std::collections::HashSet<String>),
-    /// Dest was too large to fully list (or listing errored) — fall back to the
-    /// old behavior: treat every key as possibly-present so it gets a real HEAD.
+/// Minimal lite facts about a present destination object, captured from the
+/// delimiter listing so policy compares (NewerWins timestamp, ContentDiff
+/// size/etag) can run HEAD-free for passthrough keys (see the planner closure).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DestLeaf {
+    file_size: u64,
+    /// Stored ETag from the lite list (md5 for passthrough, delta-blob etag for
+    /// delta objects). Empty string ⇒ none.
+    etag: String,
+    created_at: i64,
+}
+
+impl DestLeaf {
+    /// Synthesize a passthrough-shaped `FileMetadata` from the lite facts, so
+    /// `should_replicate` can run a HEAD-free compare (Case 2/4). `file_sha256`
+    /// is empty (the lite list never carries it) — ContentDiff then compares on
+    /// size + etag, exactly as it does for any foreign object missing a SHA.
+    fn synth_meta(&self, dest_key: &str) -> FileMetadata {
+        use chrono::TimeZone;
+        let name = dest_key.rsplit('/').next().unwrap_or(dest_key).to_string();
+        let created = chrono::Utc
+            .timestamp_millis_opt(self.created_at)
+            .single()
+            .unwrap_or_else(chrono::Utc::now);
+        FileMetadata::fallback(
+            name,
+            self.file_size,
+            self.etag.clone(),
+            created,
+            None,
+            crate::types::StorageInfo::Passthrough,
+        )
+    }
+}
+
+/// Prefix-tree destination oracle, built once per run by DESCENDING the dest (and
+/// source) trees with a `/` delimiter instead of flat-listing every key. Answers
+/// the same `may_contain(dest_key)` question the old flat `DestIndex` did, but a
+/// whole dest subtree that doesn't exist is proven absent from a single
+/// common-prefix probe — so an empty/sparse dest costs near-zero dest work and a
+/// missing subtree's objects all copy with no per-object HEAD.
+enum DestOracle {
+    Known {
+        /// Dest keys that EXIST, with their lite facts (under existing subtrees).
+        present: std::collections::HashMap<String, DestLeaf>,
+        /// Normalized `pfx/` subtrees proven to have ZERO keys on the dest.
+        absent_subtrees: Vec<String>,
+    },
+    /// Dest too large / listing errored / build cancelled — HEAD every key
+    /// (identical to the pre-oracle behavior). NEVER a partial `Known`.
     Unbounded,
 }
 
-impl DestIndex {
+impl DestOracle {
     /// True if the key MIGHT exist on the destination (so a HEAD is warranted).
     /// `Unbounded` always returns true (preserves the HEAD-every-key fallback).
+    /// A key under a proven-absent subtree short-circuits to false (copy, no HEAD).
     fn may_contain(&self, dest_key: &str) -> bool {
         match self {
-            DestIndex::Known(set) => set.contains(dest_key),
-            DestIndex::Unbounded => true,
+            DestOracle::Unbounded => true,
+            DestOracle::Known {
+                present,
+                absent_subtrees,
+            } => {
+                if absent_subtrees
+                    .iter()
+                    .any(|p| dest_key.starts_with(p.as_str()))
+                {
+                    return false;
+                }
+                present.contains_key(dest_key)
+            }
+        }
+    }
+
+    /// Lite facts for a present dest key, if known (HEAD-free policy compare).
+    fn leaf(&self, dest_key: &str) -> Option<&DestLeaf> {
+        match self {
+            DestOracle::Unbounded => None,
+            DestOracle::Known { present, .. } => present.get(dest_key),
         }
     }
 }
 
-/// Cap on how many dest keys we'll hold in the existence index. Above this the
-/// index degrades to `Unbounded` (per-key HEAD) to bound memory. 1M keys ≈ tens
-/// of MB of strings — fine; an enormous mirror beyond that is the rare case.
+/// Cap on how many dest keys we'll hold in `present`. Above this the oracle
+/// degrades to `Unbounded` (per-key HEAD) to bound memory. 1M keys ≈ tens of MB.
 const DEST_INDEX_MAX_KEYS: usize = 1_000_000;
+/// Cap on list calls during the descent (frontier pops). Bounds a pathological
+/// deeply-nested tree; breach ⇒ `Unbounded`.
+const MAX_ORACLE_LEVELS: usize = 50_000;
+/// Cap on queued + recorded subtrees; breach ⇒ `Unbounded`.
+const MAX_ORACLE_FRONTIER: usize = 100_000;
+const MAX_ABSENT_SUBTREES: usize = 100_000;
+/// Per-level page size for the delimiter listing (matches the old flat builder).
+const LEVEL_PAGE_KEYS: u32 = 1000;
 
-/// List the destination prefix into a key-existence set (paginated). Returns
-/// `Unbounded` if the prefix exceeds [`DEST_INDEX_MAX_KEYS`] or a list page
-/// errors — both fall back to the safe HEAD-every-key path.
-async fn build_dest_index(engine: &DynEngine, bucket: &str, prefix: &str) -> DestIndex {
-    let mut set = std::collections::HashSet::new();
-    let mut pager = Pager::fresh();
-    while pager.begin_page().is_some() {
-        // LITE list (metadata=false) — we only need keys, not per-object metadata.
-        let page = match engine
-            .list_objects(bucket, prefix, None, 1000, pager.token(), false)
-            .await
-        {
-            Ok(p) => p,
-            // A list error here is non-fatal: fall back to per-key HEAD rather
-            // than mis-reporting the whole dest as empty (which would re-copy
-            // everything). Correctness over speed on the error path.
-            Err(e) => {
-                warn!("replication dest index list for {bucket}/{prefix} failed ({e}); falling back to per-key HEAD");
-                return DestIndex::Unbounded;
+/// One level's pure classification: given the source and dest listings AT a
+/// common prefix (objects + child common-prefixes), decide what to record. This
+/// is the testable heart of the descent — no I/O.
+struct LevelOutcome {
+    /// Dest leaf objects present at this level → (dest_key, facts).
+    present: Vec<(String, DestLeaf)>,
+    /// Dest child subtrees to descend into (they exist on dest) → dest prefix.
+    descend: Vec<String>,
+    /// Source child subtrees absent on dest → dest prefix (copy-all, no HEADs).
+    absent: Vec<String>,
+}
+
+/// PURE: classify one descended level. `src_cps`/`dest_cps` are child
+/// common-prefixes (already dest-namespace for dest, source-namespace for src);
+/// `rewrite` maps a source child prefix into the dest namespace.
+fn step_level(
+    dest_objects: &[(String, FileMetadata)],
+    dest_cps: &[String],
+    src_cps: &[String],
+    rewrite: impl Fn(&str) -> Option<String>,
+) -> LevelOutcome {
+    let present: Vec<(String, DestLeaf)> = dest_objects
+        .iter()
+        .map(|(k, m)| {
+            (
+                k.clone(),
+                DestLeaf {
+                    file_size: m.file_size,
+                    etag: m.md5.clone(),
+                    created_at: m.created_at.timestamp_millis(),
+                },
+            )
+        })
+        .collect();
+    let dest_set: std::collections::HashSet<&str> = dest_cps.iter().map(|s| s.as_str()).collect();
+    // Dest child subtrees that exist → descend (compare finer).
+    let descend: Vec<String> = dest_cps.to_vec();
+    // Source child subtrees with no matching dest common-prefix → absent.
+    let mut absent = Vec::new();
+    for scp in src_cps {
+        if let Some(dcp) = rewrite(scp) {
+            if !dest_set.contains(dcp.as_str()) {
+                absent.push(dcp);
             }
-        };
-        for (key, _) in &page.objects {
-            set.insert(key.clone());
-            if set.len() > DEST_INDEX_MAX_KEYS {
-                return DestIndex::Unbounded;
-            }
-        }
-        if !pager.advance(page.is_truncated, page.next_continuation_token.clone()) {
-            break;
         }
     }
-    DestIndex::Known(set)
+    LevelOutcome {
+        present,
+        descend,
+        absent,
+    }
+}
+
+/// Translate a SOURCE prefix into the destination namespace (the forward of
+/// [`dest_to_source_key`]) — used to compare source children against dest
+/// common-prefixes during the tree descent.
+fn source_prefix_to_dest(rule: &ReplicationRule, src_prefix: &str) -> Option<String> {
+    let dst = normalize_prefix(&rule.destination.prefix);
+    let src = normalize_prefix(&rule.source.prefix);
+    let (dst, src) = (dst.as_str(), src.as_str());
+    if (dst.is_empty() && src.is_empty()) || dst == src {
+        return Some(src_prefix.to_string());
+    }
+    if src.is_empty() {
+        return Some(format!("{}{}", dst, src_prefix.trim_start_matches('/')));
+    }
+    let tail = src_prefix.strip_prefix(src)?;
+    Some(format!("{}{}", dst, tail.trim_start_matches('/')))
+}
+
+/// Build the prefix-tree destination oracle by descending BOTH trees with a `/`
+/// delimiter. Returns `Unbounded` (HEAD-every-key) on any list error, cap breach,
+/// or kill/pause — never a partial `Known`. `dest_prefix`/`source_prefix` are the
+/// normalized rule prefixes.
+async fn build_dest_oracle(
+    engine: &DynEngine,
+    db: &Arc<Mutex<ConfigDb>>,
+    run_id: i64,
+    rule: &ReplicationRule,
+    dest_prefix: &str,
+    source_prefix: &str,
+) -> DestOracle {
+    let mut present: std::collections::HashMap<String, DestLeaf> = std::collections::HashMap::new();
+    let mut absent_subtrees: Vec<String> = Vec::new();
+    // Frontier holds (dest_prefix, source_prefix) pairs to descend in lockstep.
+    let mut frontier: std::collections::VecDeque<(String, String)> =
+        std::collections::VecDeque::new();
+    frontier.push_back((dest_prefix.to_string(), source_prefix.to_string()));
+    let mut levels = 0usize;
+
+    while let Some((dpfx, spfx)) = frontier.pop_front() {
+        levels += 1;
+        if levels > MAX_ORACLE_LEVELS
+            || frontier.len() > MAX_ORACLE_FRONTIER
+            || absent_subtrees.len() > MAX_ABSENT_SUBTREES
+        {
+            return DestOracle::Unbounded;
+        }
+        // Honor kill/pause during the (potentially long) descent — same checks
+        // the copy loop uses. Bail to Unbounded (a partial Known over-marks
+        // absent and would over-copy).
+        {
+            let g = db.lock().await;
+            if g.replication_run_cancel_requested(run_id).unwrap_or(false)
+                || matches!(g.replication_load_state(&rule.name), Ok(Some(st)) if st.paused)
+            {
+                return DestOracle::Unbounded;
+            }
+        }
+
+        // List the dest level (delimiter='/', metadata=true so leaves carry lite
+        // facts for the HEAD-free policy compare), draining the level's own
+        // pagination. Accumulate child common-prefixes across pages.
+        let mut dest_cps: Vec<String> = Vec::new();
+        let mut dest_objects: Vec<(String, FileMetadata)> = Vec::new();
+        let mut pager = Pager::fresh();
+        while pager.begin_page().is_some() {
+            let page = match engine
+                .list_objects(
+                    &rule.destination.bucket,
+                    &dpfx,
+                    Some("/"),
+                    LEVEL_PAGE_KEYS,
+                    pager.token(),
+                    true,
+                )
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("replication dest oracle list {}/{dpfx} failed ({e}); HEAD-every-key fallback", rule.destination.bucket);
+                    return DestOracle::Unbounded;
+                }
+            };
+            dest_cps.extend(page.common_prefixes.iter().cloned());
+            dest_objects.extend(page.objects.iter().cloned());
+            if pager.truncated_by_page_budget() {
+                return DestOracle::Unbounded;
+            }
+            if !pager.advance(page.is_truncated, page.next_continuation_token.clone()) {
+                break;
+            }
+        }
+
+        // List the source level for child common-prefixes (lite — we only need
+        // the prefix names to decide descend-vs-absent).
+        let mut src_cps: Vec<String> = Vec::new();
+        let mut spager = Pager::fresh();
+        while spager.begin_page().is_some() {
+            let page = match engine
+                .list_objects(
+                    &rule.source.bucket,
+                    &spfx,
+                    Some("/"),
+                    LEVEL_PAGE_KEYS,
+                    spager.token(),
+                    false,
+                )
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("replication source oracle list {}/{spfx} failed ({e}); HEAD-every-key fallback", rule.source.bucket);
+                    return DestOracle::Unbounded;
+                }
+            };
+            src_cps.extend(page.common_prefixes.iter().cloned());
+            if spager.truncated_by_page_budget() {
+                return DestOracle::Unbounded;
+            }
+            if !spager.advance(page.is_truncated, page.next_continuation_token.clone()) {
+                break;
+            }
+        }
+
+        let outcome = step_level(&dest_objects, &dest_cps, &src_cps, |scp| {
+            source_prefix_to_dest(rule, scp)
+        });
+        for (k, leaf) in outcome.present {
+            present.insert(k, leaf);
+            if present.len() > DEST_INDEX_MAX_KEYS {
+                return DestOracle::Unbounded;
+            }
+        }
+        absent_subtrees.extend(outcome.absent);
+        // Descend shared subtrees: pair each dest child with its source prefix.
+        for dcp in outcome.descend {
+            if let Some(scp) = dest_to_source_key(rule, &dcp) {
+                frontier.push_back((dcp, scp));
+            }
+        }
+    }
+
+    DestOracle::Known {
+        present,
+        absent_subtrees,
+    }
 }
 
 /// Compute when this rule should next be due. Falls back to a 1-hour
@@ -1258,6 +1515,103 @@ mod tests {
         ] {
             assert!(!is_destination_fatal(ok), "expected non-fatal: {ok}");
         }
+    }
+
+    fn leaf(size: u64) -> DestLeaf {
+        DestLeaf {
+            file_size: size,
+            etag: "etag".into(),
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn oracle_may_contain_truth_table() {
+        // Unbounded → everything may be present (HEAD-every-key fallback).
+        let u = DestOracle::Unbounded;
+        assert!(u.may_contain("anything"));
+        assert!(u.leaf("anything").is_none());
+
+        let mut present = std::collections::HashMap::new();
+        present.insert("builds/a.txt".to_string(), leaf(10));
+        let k = DestOracle::Known {
+            present,
+            absent_subtrees: vec!["mirror/".to_string()],
+        };
+        // Present key → may contain + leaf available.
+        assert!(k.may_contain("builds/a.txt"));
+        assert_eq!(k.leaf("builds/a.txt").map(|l| l.file_size), Some(10));
+        // Key under a proven-absent subtree → definitely missing (copy, no HEAD).
+        assert!(!k.may_contain("mirror/anything/deep.bin"));
+        // Key neither present nor under an absent subtree → missing (no leaf).
+        assert!(!k.may_contain("builds/b.txt"));
+        assert!(k.leaf("builds/b.txt").is_none());
+    }
+
+    #[test]
+    fn step_level_classifies_descend_absent_present() {
+        // Dest has child "shared/" and a leaf "f.txt"; source has children
+        // "shared/" and "fresh/". → descend shared/, mark fresh/ absent, present f.txt.
+        let dest_objs = vec![(
+            "f.txt".to_string(),
+            FileMetadata::fallback(
+                "f.txt".into(),
+                5,
+                "e".into(),
+                chrono::Utc::now(),
+                None,
+                crate::types::StorageInfo::Passthrough,
+            ),
+        )];
+        let dest_cps = vec!["shared/".to_string()];
+        let src_cps = vec!["shared/".to_string(), "fresh/".to_string()];
+        let out = step_level(&dest_objs, &dest_cps, &src_cps, |p| Some(p.to_string()));
+        assert_eq!(out.descend, vec!["shared/".to_string()]);
+        assert_eq!(out.absent, vec!["fresh/".to_string()]);
+        assert_eq!(out.present.len(), 1);
+        assert_eq!(out.present[0].0, "f.txt");
+        assert_eq!(out.present[0].1.file_size, 5);
+    }
+
+    #[test]
+    fn step_level_empty_dest_marks_all_source_absent() {
+        let src_cps = vec!["a/".to_string(), "b/".to_string()];
+        let out = step_level(&[], &[], &src_cps, |p| Some(p.to_string()));
+        assert!(out.descend.is_empty());
+        assert!(out.present.is_empty());
+        assert_eq!(out.absent, vec!["a/".to_string(), "b/".to_string()]);
+    }
+
+    #[test]
+    fn source_prefix_to_dest_rewrites() {
+        let mut rule = mk_rule();
+        // identity when both empty
+        assert_eq!(
+            source_prefix_to_dest(&rule, "builds/"),
+            Some("builds/".to_string())
+        );
+        rule.source.prefix = "builds/".into();
+        rule.destination.prefix = "mirror/".into();
+        assert_eq!(
+            source_prefix_to_dest(&rule, "builds/releases/"),
+            Some("mirror/releases/".to_string())
+        );
+        // a source child outside the source prefix → None (not this rule's).
+        assert_eq!(source_prefix_to_dest(&rule, "other/"), None);
+    }
+
+    #[test]
+    fn dest_leaf_synth_meta_round_trips_size_etag() {
+        let l = DestLeaf {
+            file_size: 42,
+            etag: "abc".into(),
+            created_at: 1_700_000_000_000,
+        };
+        let m = l.synth_meta("builds/x.bin");
+        assert_eq!(m.file_size, 42);
+        assert_eq!(m.md5, "abc");
+        assert!(m.file_sha256.is_empty()); // lite never carries sha
+        assert_eq!(m.created_at.timestamp_millis(), 1_700_000_000_000);
     }
 
     fn mk_rule() -> ReplicationRule {

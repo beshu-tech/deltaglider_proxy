@@ -213,6 +213,114 @@ async fn test_replication_run_now_copies_missing_objects() {
     assert_eq!(runs[0]["objects_processed"].as_i64(), Some(3));
 }
 
+const SPARSE_RULE_YAML: &str = "
+replication:
+  enabled: true
+  tick_interval: \"30s\"
+  rules:
+    - name: sparse-rule
+      enabled: true
+      source:
+        bucket: sparse-src
+        prefix: \"\"
+      destination:
+        bucket: sparse-dst
+        prefix: \"\"
+      interval: \"1h\"
+      batch_size: 100
+      conflict: content-diff
+";
+
+/// Prefix-tree dest oracle: a SPARSE destination (one subtree already mirrored,
+/// another entirely absent) converges in one run. The absent subtree is
+/// bulk-copied without per-object dest HEADs (proven absent from a common-prefix
+/// probe); the present subtree is descended and compared. Exercises
+/// build_dest_oracle's descend/absent classification end-to-end.
+#[tokio::test]
+async fn test_replication_sparse_dest_prefix_tree() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(SPARSE_RULE_YAML)
+        .build()
+        .await;
+
+    let client = server.s3_client().await;
+    for b in ["sparse-src", "sparse-dst"] {
+        client.create_bucket().bucket(b).send().await.ok();
+    }
+
+    // Source: two subtrees + a root object.
+    for (key, body) in [
+        ("present/a.txt", &b"alpha"[..]),
+        ("present/b.txt", &b"bravo"[..]),
+        ("absent/x.txt", &b"xray"[..]),
+        ("absent/deep/y.txt", &b"yankee"[..]),
+        ("root.txt", &b"rootbytes"[..]),
+    ] {
+        client
+            .put_object()
+            .bucket("sparse-src")
+            .key(key)
+            .body(ByteStream::from(body.to_vec()))
+            .send()
+            .await
+            .expect("seed src");
+    }
+    // Dest: pre-seed ONLY the `present/` subtree, byte-identical (content-diff
+    // should SKIP these), so the oracle descends present/ and bulk-copies the
+    // rest (absent/ subtree + root.txt).
+    for (key, body) in [
+        ("present/a.txt", &b"alpha"[..]),
+        ("present/b.txt", &b"bravo"[..]),
+    ] {
+        client
+            .put_object()
+            .bucket("sparse-dst")
+            .key(key)
+            .body(ByteStream::from(body.to_vec()))
+            .send()
+            .await
+            .expect("seed dst");
+    }
+
+    let admin = admin_http_client(&server.endpoint()).await;
+    let resp = admin
+        .post(format!(
+            "{}/_/api/admin/jobs/replication:sparse-rule/run-now",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .expect("run-now");
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["status"].as_str(), Some("succeeded"), "{body}");
+    // The 2 byte-identical present/ objects are SKIPPED (content-diff); the 3
+    // absent objects (absent/x, absent/deep/y, root.txt) are copied.
+    assert_eq!(
+        body["objects_copied"].as_i64().unwrap_or(-1),
+        3,
+        "only the absent subtree + root copy; present/ skipped: {body}"
+    );
+
+    // Every source object now exists on dest (full convergence).
+    for key in [
+        "present/a.txt",
+        "present/b.txt",
+        "absent/x.txt",
+        "absent/deep/y.txt",
+        "root.txt",
+    ] {
+        client
+            .get_object()
+            .bucket("sparse-dst")
+            .key(key)
+            .send()
+            .await
+            .unwrap_or_else(|_| panic!("dest missing {key}"));
+    }
+}
+
 /// Scheduler regression: a rule added via the storage section should run
 /// automatically when due, without calling the run-now endpoint.
 #[tokio::test]

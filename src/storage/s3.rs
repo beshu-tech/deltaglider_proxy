@@ -2029,10 +2029,16 @@ impl StorageBackend for S3Backend {
                 .await
                 .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::ListObjects))?;
 
-            // Collect CommonPrefixes
+            // Collect CommonPrefixes, skipping hidden/internal (`.dg/`, any
+            // dot-prefixed segment) to match the filesystem backend — these are
+            // never user-visible keys and would only add wasted descents.
             if let Some(cps) = response.common_prefixes {
                 for cp in cps {
                     if let Some(p) = cp.prefix {
+                        let last_seg = p.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+                        if last_seg.starts_with('.') {
+                            continue;
+                        }
                         all_common_prefixes.insert(p);
                     }
                 }
