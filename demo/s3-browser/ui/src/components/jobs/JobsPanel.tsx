@@ -210,6 +210,10 @@ export default function JobsPanel({ onSessionExpired }: Props) {
     if (action === 'delete' && !window.confirm(`Delete rule "${row.name}"? This removes it from config and clears its run history.`)) {
       return;
     }
+    // Kill aborts in-flight work mid-object — confirm like delete.
+    if (action === 'kill' && !window.confirm(`Kill the running "${row.name}" run? In-flight transfers are aborted immediately.`)) {
+      return;
+    }
     setActionBusy(`${row.id}:${action}`);
     try {
       const result = await runJobAction(row.id, action);

@@ -126,7 +126,8 @@ export function availableActions(row: JobRow): JobAction[] {
     if (row.kind === 'lifecycle') out.push('preview');
     if (row.enabled !== false && !row.paused && row.status !== 'running') out.push('run-now');
     // Kill the in-flight run at will (interrupts mid-object, unlike pause).
-    if (row.status === 'running') out.push('kill');
+    // Replication only — the backend has no lifecycle-kill arm (would 400).
+    if (row.kind === 'replication' && row.status === 'running') out.push('kill');
     out.push('delete');
     return out;
   }

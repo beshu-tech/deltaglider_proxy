@@ -77,6 +77,11 @@ assert.deepEqual(
   ['pause', 'preview', 'run-now', 'delete']
 );
 assert.deepEqual(
+  availableActions(row({ kind: 'lifecycle', status: 'running' })),
+  ['pause', 'preview', 'delete'],
+  'lifecycle has NO kill (backend would 400)'
+);
+assert.deepEqual(
   availableActions(row({ kind: 'reencrypt', trigger: 'oneoff', status: 'running' })),
   ['cancel']
 );
