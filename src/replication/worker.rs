@@ -193,19 +193,8 @@ pub async fn run_rule(
             break 'pages;
         }
 
-        // Operator kill at a page boundary — clean stop, cursor preserved.
-        let cancel_requested = {
-            let db = db.lock().await;
-            db.replication_run_cancel_requested(run_id).unwrap_or(false)
-        };
-        if cancel_requested {
-            info!(
-                "replication rule '{}' killed mid-run — stopping after page {}",
-                rule.name, page_idx
-            );
-            killed = true;
-            break 'pages;
-        }
+        // Operator kill is caught by the select! race around the copy page
+        // below — no separate page-boundary check needed.
 
         if !renew_run_lease(
             &db,
@@ -720,6 +709,8 @@ fn is_destination_fatal(err: &str) -> bool {
 /// Resolves to `true` once a kill is requested for `run_id` (polls the DB
 /// `cancelling` flag ~1×/s). Used as the cancel arm of the per-page select —
 /// when it wins, the page's copy future is dropped and in-flight transfers abort.
+// ponytail: 1s poll → ≤1s kill latency. A notify channel would be tighter but
+// the run loop has no other reason to hold one; poll until that changes.
 async fn poll_run_killed(db: &Arc<Mutex<ConfigDb>>, run_id: i64) -> bool {
     loop {
         {
