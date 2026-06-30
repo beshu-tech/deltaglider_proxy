@@ -121,3 +121,67 @@ that the replication signal is meaningless for objects with no stored timestamp.
   history / failures / parity outcome, but it's SQLCipher-encrypted with the
   bootstrap **password** (only the bcrypt *hash* is in `secrets.env`), so the
   numbers above come from the code + the raw backend object metadata, not the DB.
+
+---
+
+# CORRECTED RCA (2026-06-30, from live prod telemetry via admin session)
+
+The `created_at` theory is **fully refuted by the run telemetry**. The real cause:
+
+## Topology (confirmed)
+`copyHzToB2`: source `beshu` (Hetzner backend) → dest `beshu-b2` (virtual bucket
+routed to the **`b2` = Backblaze backend**, `s3.eu-central-003.backblazeb2.com`).
+- Source `beshu`: 93,721 objects. Dest `beshu-b2`: only **21,298** landed (~72K short).
+- Rule policy: **`conflict: source-wins`** (NOT newer-wins).
+
+## Root cause — two compounding factors, neither is created_at
+
+1. **`conflict: source-wins` copies EVERY object EVERY run, by design.**
+   `planner::should_replicate`: `(Some(_), SourceWins) => Decision::Copy`. There is
+   no skip/convergence under source-wins — content/timestamp are never consulted.
+   So a healthy run copies all ~93K every 15-min tick. The "55K+ copied overnight"
+   is exactly this policy working as specified, not a bug. (`newer-wins` would
+   skip-once-present; `source-wins` re-copies forever.)
+
+2. **The Backblaze B2 destination is failing**, so runs error out and the dest
+   never reaches parity (stuck at 21K/93K). Retained failures (run 33, ongoing):
+   - `Bucket not found: beshu-b2 (after 2 attempts)`
+   - `put_object failed (status=500): service error` (Backblaze 500s, ~12 of 20)
+   - `destination verify head failed` (B2 HEAD failing)
+   A run that hits a fatal/`Bucket not found` is marked `failed`; objects whose B2
+   put 500'd never land → still missing next tick → re-attempted. The mix of
+   `failed` / `completed_with_errors` rows with errors 1→75 is B2 flakiness.
+
+## Why Verify said 175 but the run "copied 55K"
+Verify compares **content** (sha+size) over the portion that DID land → 175 real
+diffs. Replication under `source-wins` **re-ships everything regardless of
+content**, and keeps retrying the ~72K not-yet-on-B2 objects. The two numbers were
+never measuring the same thing — and the gap is policy + a broken dest, not drift.
+
+## Recommended actions (no code change required)
+1. **Switch `copyHzToB2` to `conflict: newer-wins`** (or `skip-if-dest-exists`) so
+   it stops re-copying objects already on the dest — immediate ~75% load cut.
+2. **Fix the Backblaze B2 dest**: confirm the real B2 bucket exists + creds valid +
+   investigate the 500s (B2 rate-limit / region / app-key scope). The
+   `Bucket not found` suggests an intermittent routing/credential/region issue.
+3. Re-run Verify after the dest is healthy + policy fixed — expect diffs → ~0.
+
+The committed `created_at`/`resolve_created_at` change is still valid hardening
+(+ the 3 parsing fixes + 2 lifecycle repairs) but is UNRELATED to this incident.
+
+---
+
+# DESIGN FIX (2026-06-30): `source-wins` removed
+
+Per the finding that an UNCONDITIONAL conflict policy makes no sense on a recurring
+rule (every replication rule is recurring — there is no one-shot rule concept), the
+`source-wins` policy was **removed** and replaced by **`content-diff`** (commit on
+branch `feat/replication-content-diff-drop-source-wins`). content-diff copies only
+when bytes differ and skips identical objects, so it converges while preserving the
+"keep dest = source" intent. A config carrying `source-wins` now fails to load with
+a clear `unknown variant` error.
+
+**Prod follow-up still required (operator):** before deploying the new binary,
+switch `copyHzToB2` from `source-wins` to `content-diff` (else the config won't
+load), AND fix the Backblaze B2 destination (the 500s / bucket-not-found are the
+reason the dest is stuck at 21K/93K — independent of the policy change).
