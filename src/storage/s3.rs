@@ -46,6 +46,29 @@ use std::collections::{HashMap, HashSet};
 
 use tracing::{debug, instrument, warn};
 
+/// Resolve an object's `created_at` from its (optional) `dg-created-at`
+/// metadata value, falling back to `fallback` (the object's stable S3
+/// `LastModified`) when the value is absent OR unparseable.
+///
+/// CRITICAL: the fallback is a STABLE per-object timestamp, never `Utc::now()`.
+/// A synthesised "now" makes replication's NewerWins policy (which compares
+/// `created_at`) re-copy the object on every tick forever — the root cause in
+/// docs/plan/rca-replication-recopy-2026-06-30.md. Pure so the truth table is
+/// unit-tested without an S3 client.
+fn resolve_created_at(meta_value: Option<String>, fallback: DateTime<Utc>) -> DateTime<Utc> {
+    let Some(raw) = meta_value else {
+        return fallback;
+    };
+    let ts = raw.trim_end_matches('Z');
+    DateTime::parse_from_rfc3339(&format!("{}+00:00", ts))
+        .map(|dt| dt.with_timezone(&Utc))
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.f")
+                .map(|ndt| ndt.and_utc())
+        })
+        .unwrap_or(fallback)
+}
+
 /// Operation context for S3 error classification.
 #[derive(Debug)]
 enum S3Op {
@@ -437,9 +460,15 @@ impl S3Backend {
     }
 
     /// Convert S3 metadata headers to FileMetadata
+    /// `created_at_fallback` is the object's stable S3 `LastModified`, used when
+    /// the DG metadata omits `dg-created-at`. NEVER fall back to `Utc::now()`
+    /// here: a synthesised "now" makes replication's NewerWins (which compares
+    /// `created_at`) re-copy the object every tick. See the RCA in
+    /// docs/plan/rca-replication-recopy-2026-06-30.md.
     fn headers_to_metadata(
         &self,
         headers: &HashMap<String, String>,
+        created_at_fallback: DateTime<Utc>,
     ) -> Result<FileMetadata, StorageError> {
         use crate::types::meta_keys as mk;
 
@@ -470,18 +499,12 @@ impl S3Backend {
         let file_size: u64 = file_size_str
             .parse()
             .map_err(|_| StorageError::Other(format!("Invalid file size: {}", file_size_str)))?;
-        let created_at_str =
-            get_value(&[mk::CREATED_AT, "created-at"]).unwrap_or_else(|| Utc::now().to_rfc3339());
-        let created_at: DateTime<Utc> = {
-            let ts = created_at_str.trim_end_matches('Z');
-            DateTime::parse_from_rfc3339(&format!("{}+00:00", ts))
-                .map(|dt| dt.with_timezone(&Utc))
-                .or_else(|_| {
-                    chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.f")
-                        .map(|ndt| ndt.and_utc())
-                })
-                .unwrap_or_else(|_| Utc::now())
-        };
+        // Missing/malformed `dg-created-at` → the object's stable S3
+        // LastModified, NOT `now()` (see the doc-comment above + the RCA).
+        let created_at = resolve_created_at(
+            get_value(&[mk::CREATED_AT, "created-at"]),
+            created_at_fallback,
+        );
 
         let note = get_value(&[mk::NOTE, "note"]);
         // Read ref path: try new name (dg-ref-path) first, fall back to legacy (dg-ref-key, ref-key)
@@ -820,6 +843,21 @@ impl S3Backend {
             .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
             .unwrap_or_default();
 
+        // The object's S3 LastModified — a STABLE per-object timestamp. Used as
+        // the `created_at` fallback when DG metadata is present but carries no
+        // `dg-created-at` (e.g. checksum sidecars uploaded with partial DG
+        // metadata). Without this, `headers_to_metadata` would synthesise
+        // `Utc::now()` on every read, making replication's NewerWins re-copy the
+        // object every tick forever. See docs/plan/rca-replication-recopy-2026-06-30.md.
+        let s3_last_modified = response
+            .last_modified()
+            .and_then(|t| {
+                DateTime::parse_from_rfc3339(&t.to_string())
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            })
+            .unwrap_or_else(Utc::now);
+
         // A `.delta` / `reference.bin` file is delta-machinery: missing DG
         // metadata on one of those genuinely breaks reconstruction and is worth
         // a loud WARN. Any other object (e.g. a `.sha1`/`.sha512` checksum
@@ -836,7 +874,7 @@ impl S3Backend {
         // corrupted (missing required fields), fall back to passthrough metadata
         // from the HEAD response itself.
         if !headers.is_empty() {
-            match self.headers_to_metadata(&headers) {
+            match self.headers_to_metadata(&headers, s3_last_modified) {
                 Ok(meta) => return Ok(meta),
                 Err(e) if delta_critical => {
                     warn!(
@@ -872,14 +910,7 @@ impl S3Backend {
         }
         // Treat as passthrough with best-effort metadata from HEAD response.
         let file_size = response.content_length().unwrap_or(0).max(0) as u64;
-        let last_modified = response
-            .last_modified()
-            .and_then(|t| {
-                DateTime::parse_from_rfc3339(&t.to_string())
-                    .ok()
-                    .map(|dt| dt.with_timezone(&Utc))
-            })
-            .unwrap_or_else(Utc::now);
+        let last_modified = s3_last_modified;
         // Upstream S3 returns the ETag already wrapped in quotes (e.g.
         // `"abc123"`). FileMetadata.md5 must hold the BARE value — the
         // response-emit layer re-adds the quotes when forming the HEAD/GET
@@ -2161,6 +2192,49 @@ mod tests {
     use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
     use aws_smithy_runtime_api::http::StatusCode;
     use aws_smithy_types::body::SdkBody;
+
+    // ── resolve_created_at: the replication re-copy fix (RCA 2026-06-30) ──
+
+    fn dt(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn created_at_absent_uses_stable_fallback_not_now() {
+        // The bug: a missing dg-created-at must resolve to the object's stable
+        // LastModified, NEVER a fresh `now()` (which makes NewerWins re-copy
+        // every tick). This is the exact case of the foreign .sha1/.sha512
+        // sidecars in prod (partial DG metadata, no dg-created-at).
+        let last_modified = dt("2026-05-14T21:33:48Z");
+        assert_eq!(resolve_created_at(None, last_modified), last_modified);
+    }
+
+    #[test]
+    fn created_at_present_and_valid_is_parsed() {
+        let fallback = dt("2026-05-14T21:33:48Z");
+        // rfc3339 with trailing Z
+        assert_eq!(
+            resolve_created_at(Some("2026-03-01T10:00:00Z".into()), fallback),
+            dt("2026-03-01T10:00:00Z")
+        );
+        // the proxy's own write format (microseconds, trailing Z)
+        assert_eq!(
+            resolve_created_at(Some("2026-03-01T10:00:00.123456Z".into()), fallback),
+            dt("2026-03-01T10:00:00.123456Z")
+        );
+    }
+
+    #[test]
+    fn created_at_malformed_degrades_to_fallback() {
+        // A present-but-garbage value must not panic and must not become `now()`;
+        // it degrades to the stable LastModified like the absent case.
+        let fallback = dt("2026-05-14T21:33:48Z");
+        assert_eq!(
+            resolve_created_at(Some("not-a-timestamp".into()), fallback),
+            fallback
+        );
+        assert_eq!(resolve_created_at(Some(String::new()), fallback), fallback);
+    }
 
     /// Build a minimal `HttpResponse` with the given status code and an
     /// optional `x-amz-request-id` header. The SDK uses both to populate
