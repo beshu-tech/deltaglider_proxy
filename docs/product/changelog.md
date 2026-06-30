@@ -8,7 +8,40 @@ Every released version of DeltaGlider Proxy, newest first. Versions
 follow [semantic versioning](https://semver.org/); the Docker image
 `beshultd/deltaglider_proxy:<version>` is published for each tag.
 
-_Last updated: 2026-06-30_
+_Last updated: 2026-07-01_
+
+## v1.9.2 — 2026-07-01
+
+Replication performance + the kill/responsiveness fixes that an
+empty-destination copy exposed in production.
+
+### Added
+
+- **Directory-aware replication (prefix-tree destination oracle).** Replication
+  now descends the destination and source prefix trees like directories instead
+  of flat-listing every key. A destination subtree that doesn't exist is proven
+  absent from a single common-prefix probe, so its entire source subtree is
+  bulk-copied with **zero per-object destination HEAD requests**. A copy to an
+  empty or sparse destination no longer spends minutes "thinking" before it
+  starts copying — an empty destination costs one list call. `SkipIfDestExists`
+  rules now decide from the listing alone and never issue a per-object HEAD, even
+  against a fully-populated destination.
+
+### Fixed
+
+- **Copy to an empty/sparse destination was pathologically slow.** The planner
+  issued one destination HEAD per source object just to discover the object was
+  absent (it always copies when missing, under every conflict policy) — minutes
+  of wasted round-trips against a remote backend. Replication now lists the
+  destination once and only HEADs keys that actually exist.
+- **A running replication job could not be killed while it was planning.** The
+  kill check only ran during the copy phase, so a run wedged in the per-page
+  list/plan phase ignored the operator's Kill until it reached a copy
+  checkpoint. The kill is now honored at every page boundary.
+- **A killed run kept showing as "running" and a second Kill returned 409.** The
+  Jobs list read the rule's last-finished status while Kill flips the in-flight
+  run-history row to "cancelling" immediately — so a killed-but-not-yet-settled
+  run is now correctly shown as "cancelling" instead of a stale "running".
 
 ## v1.9.1 — 2026-06-30
 
