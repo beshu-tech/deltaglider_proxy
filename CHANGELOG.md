@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.9.0 — 2026-06-30
+
 ### Changed (BREAKING)
 
 - **Replication: removed the `source-wins` conflict policy; added `content-diff`.**
@@ -15,6 +17,37 @@
   'source-wins', expected one of 'newer-wins', 'content-diff', 'skip-if-dest-exists'`);
   switch such rules to `content-diff` (same "dest = source" intent, without the
   re-ship).
+
+### Added
+
+- **Lifecycle rules are validated at config time and rejected if they can never
+  run.** A delete/transition rule missing (or with an invalid/out-of-range)
+  `expire_after`, a retain-newest `count: 0`, an empty transition destination
+  bucket, a malformed glob, or a duplicate rule name is now a **fatal config
+  error (400)** on every path — `config apply`/`validate`, the admin section PUT
+  (the GUI Storage/Jobs editor's save), and `config lint` — instead of being
+  accepted as a warning and then failing every scheduler tick.
+
+### Fixed
+
+- **Replication now honors pause mid-run.** Pausing a rule while a sweep was in
+  flight previously had no effect (the flag was only checked when *starting* a
+  run), so a long run kept going and lingered as "running". The worker now
+  re-checks the pause flag at every page boundary, stops promptly, preserves the
+  cursor for resume, and settles the run as terminal.
+- **Lifecycle run-now/preview on an invalid rule returns 400 without recording a
+  spurious FAILED run row.**
+- **Security: an unverified email can no longer bootstrap a group grant via a
+  `claim_value` rule keyed on the `email` claim** — that path read the same
+  attacker-controllable value as the `email_*` rules and is now gated identically.
+- **Hardened object-timestamp handling**: a missing `dg-created-at` resolves to
+  the object's stable S3 `LastModified` instead of a fresh `now()` (and the
+  parser now accepts timezone-offset / lowercase-`z` timestamps), removing a
+  class of spurious re-reads.
+- **HA state consistency**: a replication rule whose process died mid-run is now
+  marked `failed` in its state row on boot (was left showing "running"), and the
+  crash-recovery zombie-run scan is lease-aware so it never resurrects a run a
+  live peer still holds.
 
 ## v1.8.3 — 2026-06-29
 
