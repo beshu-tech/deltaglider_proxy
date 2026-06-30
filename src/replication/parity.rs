@@ -35,7 +35,7 @@ use super::state_store::{ObjectFailure, ParityCacheEntry, ParitySide};
 
 /// Live-progress + cancel control for a background parity audit. The driver
 /// reports `objects scanned so far` into the parity row (throttled — every
-/// [`PROGRESS_EVERY_N_PAGES`] pages), and checks for cancellation. Cancel uses
+/// [`PROGRESS_FLUSH_EVERY_N_PAGES`] pages), and checks for cancellation. Cancel uses
 /// TWO signals: a fast in-process `AtomicBool` (no lock, checked every page)
 /// AND the durable `cancelling` DB row (checked at phase boundaries — covers a
 /// cancel from ANOTHER instance / after a restart, where the in-process flag is
@@ -47,11 +47,19 @@ pub struct ParityProgress<'a> {
     pub cancel: &'a std::sync::atomic::AtomicBool,
 }
 
-/// Write progress to the DB once every N pages (not every page) — the global
+/// Flush progress to the DB once every N pages (not every page) — the global
 /// ConfigDb mutex is shared with the whole IAM/admin path, and the count is a
-/// spinner-grade estimate. `ponytail`: fixed N; lower it if live progress ever
-/// needs to be finer-grained.
-const PROGRESS_EVERY_N_PAGES: usize = 8;
+/// spinner-grade estimate, so coarsening the flush cuts global-mutex churn on a
+/// long scan without losing the settle flush. `ponytail`: fixed N; lower it if
+/// live progress ever needs to be finer-grained.
+const PROGRESS_FLUSH_EVERY_N_PAGES: usize = 64;
+
+/// Pure decision: should the per-page progress counter flush to the DB at this
+/// page index? Flushes on every `every`-th page (page 0, `every`, `2*every`, …).
+/// Extracted so the cadence is unit-testable without a DB / scan.
+fn should_flush(page: u64, every: u64) -> bool {
+    every > 0 && page.is_multiple_of(every)
+}
 
 /// Sentinel error string an audit returns when cancelled, so the caller can
 /// settle the row as `cancelled` rather than `failed`. `ponytail`: a sentinel
@@ -779,7 +787,7 @@ async fn scan_prefix(
             }
             // Progress write is throttled (lock-bearing) — the count is a
             // spinner-grade estimate, not worth the global-mutex churn per page.
-            if page_idx.is_multiple_of(PROGRESS_EVERY_N_PAGES) {
+            if should_flush(page_idx as u64, PROGRESS_FLUSH_EVERY_N_PAGES as u64) {
                 let db = p.db.lock().await;
                 let now = super::current_unix_seconds();
                 let _ = db.parity_result_progress(p.rule, (base_scanned + seen) as i64, now);
@@ -1070,6 +1078,30 @@ mod tests {
             etag: Some("logical-etag".into()),
             stored_etag: stored.map(str::to_string),
         }
+    }
+
+    // ─────────────── progress flush cadence (pure decision) ────────────────────
+
+    #[test]
+    fn should_flush_at_every_th_page_boundary() {
+        // Flush at page 0 and every `every`-th page; nowhere else.
+        assert!(should_flush(0, 64), "page 0 always flushes (first page)");
+        assert!(should_flush(64, 64));
+        assert!(should_flush(128, 64));
+        assert!(!should_flush(63, 64));
+        assert!(!should_flush(65, 64));
+        assert!(!should_flush(127, 64));
+        // `every` of 1 flushes every page (the degenerate fine-grained case).
+        assert!(should_flush(0, 1) && should_flush(1, 1) && should_flush(2, 1));
+    }
+
+    #[test]
+    fn should_flush_never_when_every_is_zero() {
+        // Defensive: a zero cadence must never flush (avoid panic on `% 0`),
+        // so a misconfigured constant degrades to no mid-scan writes rather
+        // than panicking — the settle flush still fires at scan end.
+        assert!(!should_flush(0, 0));
+        assert!(!should_flush(64, 0));
     }
 
     #[test]

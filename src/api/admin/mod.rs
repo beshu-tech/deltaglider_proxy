@@ -97,8 +97,8 @@ pub use scanner::{
 };
 pub use users::{
     clone_user, create_user, delete_user, get_canned_policies, iam_version, list_users,
-    rotate_user_keys, update_user, CloneUserRequest, CreateUserRequest, RotateKeysRequest,
-    UpdateUserRequest,
+    rotate_user_keys, update_user, usage_scan_version, CloneUserRequest, CreateUserRequest,
+    RotateKeysRequest, UpdateUserRequest,
 };
 
 /// Type alias for the tracing reload handle.

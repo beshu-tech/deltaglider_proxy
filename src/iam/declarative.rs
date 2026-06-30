@@ -62,7 +62,7 @@
 
 use crate::config_db::auth_providers::{AuthProviderConfig, GroupMappingRule};
 use crate::config_db::ConfigDb;
-use crate::iam::external_auth::mapping::evaluate_mappings;
+use crate::iam::external_auth::mapping::{evaluate_mappings, filter_rules_for_email_verification};
 use crate::iam::external_auth::types::ExternalIdentityInfo;
 use crate::iam::{normalize_permissions, validate_permissions, Group, IamUser, Permission};
 use schemars::JsonSchema;
@@ -551,7 +551,7 @@ fn compute_external_baseline_groups(
         let identity_info = ExternalIdentityInfo {
             subject: ident.external_sub.clone(),
             email: ident.email.clone(),
-            email_verified: true,
+            email_verified: ident.email_verified,
             name: ident.display_name.clone(),
             groups: vec![],
             raw_claims: ident
@@ -559,7 +559,11 @@ fn compute_external_baseline_groups(
                 .clone()
                 .unwrap_or_else(|| serde_json::json!({})),
         };
-        let groups = evaluate_mappings(mapping_rules, &identity_info, ident.provider_id);
+        // SECURITY: gate email-based rules on the stored email_verified, same
+        // as the OAuth callback — never grant email-based groups to an
+        // unverified identity on a declarative recompute.
+        let gated_rules = filter_rules_for_email_verification(mapping_rules, &identity_info);
+        let groups = evaluate_mappings(&gated_rules, &identity_info, ident.provider_id);
         let entry = baseline.entry(ident.user_id).or_default();
         for gid in groups {
             if !entry.contains(&gid) {
@@ -1893,6 +1897,7 @@ mod tests {
             Some("bob@corp.example"),
             Some("Bob"),
             None,
+            true,
         )
         .unwrap();
 
@@ -1980,6 +1985,7 @@ mod tests {
             Some("carol@corp.example"),
             Some("Carol"),
             None,
+            true,
         )
         .unwrap();
         db.add_user_to_group(grp_eng.id, user.id).unwrap();

@@ -11,12 +11,52 @@ use super::types::ExternalIdentityInfo;
 ///
 /// Rules are evaluated in priority order (already sorted by ConfigDb).
 /// All matching rules contribute (union of groups, not first-match-wins).
+///
+/// Callers SHOULD pre-filter with [`filter_rules_for_email_verification`] so an
+/// unverified email can't bootstrap a group grant via an email-based rule
+/// (the email claim is only trustworthy when `email_verified == true`).
 pub fn evaluate_mappings(
     rules: &[GroupMappingRule],
     identity: &ExternalIdentityInfo,
     provider_id: i64,
 ) -> Vec<i64> {
     collect_matching_groups(rules, identity, Some(provider_id))
+}
+
+/// True iff `rule` keys its match on the `email` claim (and thus must NOT fire
+/// when the identity's email is unverified — an unverified email is attacker-
+/// controllable on IdPs that allow self-service signup). The four `email_*`
+/// match types read `identity.email`; `claim_value` and unknown types do not
+/// (they key on other claims, whose trust is independent of email verification).
+/// Pure so the gate is unit-testable without a DB / IdP.
+pub fn rule_keys_on_email(rule: &GroupMappingRule) -> bool {
+    matches!(
+        rule.match_type.as_str(),
+        "email_exact" | "email_domain" | "email_glob" | "email_regex"
+    )
+}
+
+/// SECURITY GATE: drop email-based mapping rules when the identity's email is
+/// NOT verified. An unverified email must never bootstrap a local group grant
+/// (a self-service-IdP attacker could register `admin@corp.com` unverified and
+/// land in an `*@corp.com → administrators` rule). Non-email rules
+/// (`claim_value` on a verified-claim field, etc.) are unaffected — their trust
+/// is independent of email verification. Login still succeeds as a bare
+/// authenticated identity with no email-derived groups; only the mapping is
+/// gated, not authentication. Pure so the truth table is unit-tested without
+/// an OIDC mock (the callback path has no integration-test IdP today).
+pub fn filter_rules_for_email_verification(
+    rules: &[GroupMappingRule],
+    identity: &ExternalIdentityInfo,
+) -> Vec<GroupMappingRule> {
+    if identity.email_verified {
+        return rules.to_vec();
+    }
+    rules
+        .iter()
+        .filter(|r| !rule_keys_on_email(r))
+        .cloned()
+        .collect()
 }
 
 /// Preview which groups an email would match against.
@@ -178,10 +218,18 @@ mod tests {
     use super::*;
 
     fn make_identity(email: &str, claims: serde_json::Value) -> ExternalIdentityInfo {
+        make_identity_with_verification(email, true, claims)
+    }
+
+    fn make_identity_with_verification(
+        email: &str,
+        email_verified: bool,
+        claims: serde_json::Value,
+    ) -> ExternalIdentityInfo {
         ExternalIdentityInfo {
             subject: "sub-123".into(),
             email: Some(email.into()),
-            email_verified: true,
+            email_verified,
             name: Some("Test User".into()),
             groups: vec![],
             raw_claims: claims,
@@ -206,6 +254,90 @@ mod tests {
             group_id,
             created_at: String::new(),
         }
+    }
+
+    // ─────────────── email-verification security gate (pure decision) ────────
+
+    #[test]
+    fn rule_keys_on_email_for_the_four_email_match_types() {
+        // The email-* match types read `identity.email` and thus must be gated
+        // on email_verified; claim_value and unknown types do not.
+        for mt in ["email_exact", "email_domain", "email_glob", "email_regex"] {
+            assert!(
+                rule_keys_on_email(&make_rule(1, None, mt, "email", "x", 10)),
+                "{mt} keys on email"
+            );
+        }
+        assert!(!rule_keys_on_email(&make_rule(
+            1,
+            None,
+            "claim_value",
+            "department",
+            "eng",
+            10,
+        )));
+        // Unknown match_type is NOT email-keyed (matches_rule already warns +
+        // returns false for it; the gate shouldn't double-block it).
+        assert!(!rule_keys_on_email(&make_rule(
+            1, None, "bogus", "", "", 10
+        )));
+    }
+
+    #[test]
+    fn verified_email_keeps_all_rules() {
+        // A verified email is trustworthy → every rule is eligible (the gate
+        // is a no-op). Covers email + claim_value rules together.
+        let rules = vec![
+            make_rule(1, None, "email_domain", "email", "corp.com", 10),
+            make_rule(2, None, "claim_value", "department", "eng", 20),
+        ];
+        let id = make_identity_with_verification("alice@corp.com", true, serde_json::json!({}));
+        let kept = filter_rules_for_email_verification(&rules, &id);
+        assert_eq!(kept.len(), 2, "verified email keeps all rules");
+    }
+
+    #[test]
+    fn unverified_email_drops_email_rules_keeps_claim_rules() {
+        // The security fix: an unverified email must NOT bootstrap a group via
+        // an email-based rule (attacker registers admin@corp.com unverified on
+        // a self-service IdP), but non-email rules (claim_value on a verified
+        // token claim) are unaffected — their trust is independent of email.
+        let rules = vec![
+            make_rule(1, None, "email_domain", "email", "corp.com", 10),
+            make_rule(2, None, "email_exact", "email", "admin@corp.com", 11),
+            make_rule(3, None, "email_regex", "email", ".*@corp\\.com$", 12),
+            make_rule(4, None, "email_glob", "email", "*@corp.com", 13),
+            make_rule(5, None, "claim_value", "department", "eng", 20),
+        ];
+        let id = make_identity_with_verification(
+            "admin@corp.com",
+            false,
+            serde_json::json!({"department": "eng"}),
+        );
+        let kept = filter_rules_for_email_verification(&rules, &id);
+        // Only the claim_value rule survives; all four email-* rules are dropped.
+        assert_eq!(
+            kept.len(),
+            1,
+            "unverified email drops all email-based rules"
+        );
+        assert_eq!(kept[0].id, 5);
+        assert_eq!(kept[0].match_type, "claim_value");
+    }
+
+    #[test]
+    fn unverified_email_with_only_email_rules_maps_to_no_groups() {
+        // End-to-end intent: an unverified identity whose only matching rules
+        // are email-based gets NO groups (login still succeeds as a bare
+        // identity — the gate is on mapping, not authentication).
+        let rules = vec![make_rule(1, None, "email_domain", "email", "corp.com", 10)];
+        let id = make_identity_with_verification("alice@corp.com", false, serde_json::json!({}));
+        let gated = filter_rules_for_email_verification(&rules, &id);
+        let groups = evaluate_mappings(&gated, &id, 1);
+        assert!(
+            groups.is_empty(),
+            "unverified email with only email rules → no groups"
+        );
     }
 
     #[test]

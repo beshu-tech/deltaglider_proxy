@@ -5,8 +5,87 @@
 use crate::config_sections::{LifecycleAction, LifecycleRule};
 use crate::replication::{normalize_prefix, rewrite_key};
 use crate::types::FileMetadata;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use globset::{Glob, GlobSet, GlobSetBuilder};
+
+/// FATAL per-rule config errors: conditions under which the rule can NEVER run
+/// successfully, so it must be REJECTED at config time (apply / lint / validate)
+/// and SKIPPED by the scheduler — not accepted as a warning and then failed
+/// every tick (the origin of the recurring "Lifecycle rule '{}' failed: …\n…
+/// requires expire_after" Jobs-FAILED row + the preview 500).
+///
+/// Distinct from `config_sections::validate_lifecycle`, which emits only
+/// ADVISORY warnings (prefix normalisation, duplicate names, expire_after=0
+/// immediate-expire, etc.). This fn is the hard gate; the strings it emits are
+/// recognised by [`super::classify_lifecycle_run_error`] so the run path and
+/// the config path classify the same defect identically.
+///
+/// Covered: delete/transition missing·invalid·out-of-range `expire_after`;
+/// retain-newest `count=0` + invalid `min_age` / `protect_younger_than`;
+/// malformed include/exclude globs (compiled here, not by `validate_lifecycle`).
+pub fn lifecycle_rule_errors(rule: &LifecycleRule) -> Vec<String> {
+    let mut errs = Vec::new();
+    match &rule.action {
+        LifecycleAction::RetainNewest(action) => {
+            if action.count == 0 {
+                errs.push(format!(
+                    "lifecycle rule '{}' retain-newest count is 0 — refusing to run (would delete the whole prefix)",
+                    rule.name
+                ));
+            }
+            if let Some(min_age) = &action.qualify.min_age {
+                if let Err(e) = humantime::parse_duration(min_age) {
+                    errs.push(format!(
+                        "lifecycle rule '{}' qualify.min_age={} invalid: {}",
+                        rule.name, min_age, e
+                    ));
+                }
+            }
+            if let Some(protect) = &action.protect_younger_than {
+                if let Err(e) = humantime::parse_duration(protect) {
+                    errs.push(format!(
+                        "lifecycle rule '{}' protect_younger_than={} invalid: {}",
+                        rule.name, protect, e
+                    ));
+                }
+            }
+        }
+        LifecycleAction::Delete | LifecycleAction::Transition(_) => {
+            match rule.expire_after.as_deref() {
+                None => errs.push(format!(
+                    "lifecycle rule '{}' {} action requires expire_after",
+                    rule.name,
+                    rule.action.kind()
+                )),
+                Some(s) => match humantime::parse_duration(s) {
+                    Err(e) => errs.push(format!(
+                        "lifecycle rule '{}' expire_after={} invalid: {}",
+                        rule.name, s, e
+                    )),
+                    Ok(d) => {
+                        // Defensive: humantime's range (≤~584y) is narrower
+                        // than chrono's (~292k y), so this branch is effectively
+                        // unreachable — kept to mirror worker.rs's parse pipeline
+                        // and guard against a future chrono change.
+                        if let Err(e) = ChronoDuration::from_std(d) {
+                            errs.push(format!(
+                                "lifecycle rule '{}' expire_after={} out of range: {}",
+                                rule.name, s, e
+                            ));
+                        }
+                    }
+                },
+            }
+        }
+    }
+    // Globs apply to every action (the worker compiles them for delete /
+    // transition / retain-newest alike). A bad glob fails at run time today;
+    // surface it at config time here so the rule is rejected before it runs.
+    if let Err(e) = compile_rule_globs(rule) {
+        errs.push(format!("{e}"));
+    }
+    errs
+}
 
 /// Every bucket a rule run WRITES to: the scanned bucket (deletes happen
 /// there) and, for transition rules, the destination. The maintenance
@@ -379,6 +458,145 @@ mod tests {
             exclude_globs: exclude.iter().map(|s| s.to_string()).collect(),
             batch_size: 100,
         }
+    }
+
+    // ─────────────── lifecycle_rule_errors (fatal config gate) ──────────────
+
+    #[test]
+    fn valid_delete_rule_has_no_errors() {
+        // A well-formed delete rule (valid expire_after + valid globs) is clean.
+        let r = rule(&["old/**"], &[]);
+        assert!(
+            lifecycle_rule_errors(&r).is_empty(),
+            "valid rule must have no fatal errors"
+        );
+    }
+
+    #[test]
+    fn delete_without_expire_after_is_fatal() {
+        // The exact reported scenario: delete action, no expire_after → the rule
+        // can never run, so it's a fatal config error (was only a warning).
+        let mut r = rule(&["old/**"], &[]);
+        r.expire_after = None;
+        let errs = lifecycle_rule_errors(&r);
+        assert_eq!(errs.len(), 1, "exactly one fatal error: {errs:?}");
+        assert!(
+            errs[0].contains("requires expire_after"),
+            "must name the missing field: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn delete_with_unparseable_expire_after_is_fatal() {
+        let mut r = rule(&["old/**"], &[]);
+        r.expire_after = Some("5x".to_string());
+        let errs = lifecycle_rule_errors(&r);
+        assert!(
+            errs.iter().any(|e| e.contains("expire_after=5x invalid")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn retain_newest_count_zero_is_fatal() {
+        // count=0 would delete the whole prefix — the worker refuses, so it's
+        // fatal at config time, not a warning.
+        use crate::config_sections::{LifecycleQualifySpec, LifecycleRetainNewestAction};
+        let mut r = rule(&["old/**"], &[]);
+        r.action = LifecycleAction::RetainNewest(LifecycleRetainNewestAction {
+            count: 0,
+            qualify: LifecycleQualifySpec::default(),
+            protect_younger_than: None,
+        });
+        r.expire_after = None; // retain-newest ignores expire_after
+        let errs = lifecycle_rule_errors(&r);
+        assert!(errs.iter().any(|e| e.contains("count is 0")), "{errs:?}");
+    }
+
+    #[test]
+    fn retain_newest_bad_min_age_is_fatal() {
+        use crate::config_sections::{LifecycleQualifySpec, LifecycleRetainNewestAction};
+        let mut r = rule(&["old/**"], &[]);
+        r.action = LifecycleAction::RetainNewest(LifecycleRetainNewestAction {
+            count: 2,
+            qualify: LifecycleQualifySpec {
+                min_size_bytes: None,
+                min_age: Some("not-a-duration".to_string()),
+            },
+            protect_younger_than: None,
+        });
+        r.expire_after = None;
+        let errs = lifecycle_rule_errors(&r);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("min_age") && e.contains("invalid")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn transition_without_expire_after_is_fatal() {
+        // Transition shares the expire_after arm with Delete but writes to a
+        // SECOND bucket — the riskier action, so cover it explicitly.
+        use crate::config_sections::{LifecycleDestination, LifecycleTransitionAction};
+        let mut r = rule(&["old/**"], &[]);
+        r.action = LifecycleAction::Transition(LifecycleTransitionAction {
+            destination: LifecycleDestination {
+                bucket: "archive".to_string(),
+                prefix: String::new(),
+            },
+            delete_source_after_success: false,
+        });
+        r.expire_after = None;
+        let errs = lifecycle_rule_errors(&r);
+        assert_eq!(errs.len(), 1, "exactly one fatal error: {errs:?}");
+        assert!(
+            errs[0].contains("transition") && errs[0].contains("requires expire_after"),
+            "must name the transition kind + missing field: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn retain_newest_bad_protect_younger_than_is_fatal() {
+        // The protect_younger_than branch is separate from min_age — exercise it.
+        use crate::config_sections::{LifecycleQualifySpec, LifecycleRetainNewestAction};
+        let mut r = rule(&["old/**"], &[]);
+        r.action = LifecycleAction::RetainNewest(LifecycleRetainNewestAction {
+            count: 2,
+            qualify: LifecycleQualifySpec::default(),
+            protect_younger_than: Some("not-a-duration".to_string()),
+        });
+        r.expire_after = None;
+        let errs = lifecycle_rule_errors(&r);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("protect_younger_than") && e.contains("invalid")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn expire_after_zero_is_not_fatal() {
+        // expire_after=0 is the surprising boundary: it's ADVISORY (warning),
+        // never a fatal config error (0s = delete immediately, which parses fine).
+        let mut r = rule(&["old/**"], &[]);
+        r.expire_after = Some("0s".to_string());
+        assert!(
+            lifecycle_rule_errors(&r).is_empty(),
+            "expire_after=0 must NOT be a fatal error (it's advisory-only)"
+        );
+    }
+
+    #[test]
+    fn malformed_glob_is_fatal() {
+        // Bad globs currently fail only at run time; the config gate compiles
+        // them too so the rule is rejected before it ever runs.
+        let r = rule(&["[unclosed"], &[]);
+        let errs = lifecycle_rule_errors(&r);
+        assert!(
+            errs.iter().any(|e| e.starts_with("invalid glob")),
+            "{errs:?}"
+        );
     }
 
     fn globs(include: &[&str], exclude: &[&str]) -> (LifecycleRule, GlobSet, GlobSet) {

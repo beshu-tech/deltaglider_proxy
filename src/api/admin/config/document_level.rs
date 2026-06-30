@@ -268,6 +268,20 @@ fn parse_and_validate_yaml(yaml: &str) -> Result<(crate::config::Config, Vec<Str
         ));
     }
     let warnings = cfg.check();
+    // Fatal lifecycle rule errors: a rule that can NEVER run (delete/transition
+    // missing·invalid·out-of-range expire_after, retain-newest count=0, bad
+    // globs/durations) is rejected here, not accepted as a warning and then
+    // failed every scheduler tick. Gate is shared by /validate (dry-run) and
+    // /apply since both route through this fn. Mirrors the log_level gate above.
+    let lifecycle_errors: Vec<String> = cfg
+        .lifecycle
+        .rules
+        .iter()
+        .flat_map(crate::lifecycle::planner::lifecycle_rule_errors)
+        .collect();
+    if !lifecycle_errors.is_empty() {
+        return Err(lifecycle_errors.join("; "));
+    }
     Ok((cfg, warnings))
 }
 

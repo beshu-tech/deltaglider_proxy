@@ -171,6 +171,27 @@ pub fn lint(file: &str) -> i32 {
         return EXIT_REJECTED;
     }
 
+    // Fatal lifecycle rule errors: reject (exit 6) the same way /apply does,
+    // so a CI `config lint` catches a delete rule missing expire_after before
+    // it ships. Suppress the (now-redundant) advisory warnings when errors are
+    // present so the operator sees the fatal message once, not twice.
+    let lifecycle_errors: Vec<String> = cfg
+        .lifecycle
+        .rules
+        .iter()
+        .flat_map(crate::lifecycle::planner::lifecycle_rule_errors)
+        .collect();
+    if !lifecycle_errors.is_empty() {
+        for e in &lifecycle_errors {
+            eprintln!("error: {e}");
+        }
+        eprintln!(
+            "{file}: rejected — {} fatal lifecycle rule error(s)",
+            lifecycle_errors.len()
+        );
+        return EXIT_REJECTED;
+    }
+
     for w in &warnings {
         eprintln!("warning: {w}");
     }

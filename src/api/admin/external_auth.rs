@@ -456,6 +456,7 @@ pub async fn oauth_callback(
                 identity.email.as_deref(),
                 identity.name.as_deref(),
                 Some(&identity.raw_claims),
+                identity.email_verified,
             );
             match db.get_user_by_id(ext_id.user_id) {
                 Ok(user) => (user, false),
@@ -487,6 +488,7 @@ pub async fn oauth_callback(
                         identity.email.as_deref(),
                         identity.name.as_deref(),
                         Some(&identity.raw_claims),
+                        identity.email_verified,
                     ) {
                         tracing::error!("Failed to create external identity: {}", e);
                     }
@@ -523,7 +525,14 @@ pub async fn oauth_callback(
     // Evaluate group mapping rules and MERGE with existing memberships.
     // Manual group assignments (e.g., admin added user to "administrators" via GUI)
     // are preserved — mapping rules only ADD groups, never remove manually-assigned ones.
+    //
+    // SECURITY: gate email-based rules on `email_verified` — an unverified email
+    // (attacker-controllable on self-service IdPs) must not bootstrap a group
+    // grant via an `*@corp.com → administrators` rule. Non-email rules are
+    // unaffected. Login still succeeds as a bare identity with no email-derived
+    // groups; only the mapping is gated. See mapping::filter_rules_for_email_verification.
     let rules = db.load_group_mapping_rules().unwrap_or_default();
+    let rules = mapping::filter_rules_for_email_verification(&rules, &identity);
     let rule_groups = mapping::evaluate_mappings(&rules, &identity, provider_config.id);
     let existing_groups = db.get_user_group_ids(user.id).unwrap_or_default();
     let merged = merge_group_memberships(existing_groups, &rule_groups);
@@ -955,17 +964,24 @@ pub async fn sync_memberships(
             continue;
         }
 
-        // Build a minimal identity info for mapping evaluation
+        // Build a minimal identity info for mapping evaluation. Carry the
+        // STORED `email_verified` (not a hardcoded true) so the gate below
+        // matches what the live OAuth callback would grant.
         let identity_info = crate::iam::external_auth::types::ExternalIdentityInfo {
             subject: ext_id.external_sub.clone(),
             email: ext_id.email.clone(),
-            email_verified: true,
+            email_verified: ext_id.email_verified,
             name: ext_id.display_name.clone(),
             groups: vec![],
             raw_claims: ext_id.raw_claims.clone().unwrap_or(serde_json::json!({})),
         };
 
-        let rule_groups = mapping::evaluate_mappings(&rules, &identity_info, ext_id.provider_id);
+        // SECURITY: same email-verification gate as the OAuth callback — an
+        // unverified email must not bootstrap an email-based group mapping on a
+        // re-sync. See mapping::filter_rules_for_email_verification.
+        let gated_rules = mapping::filter_rules_for_email_verification(&rules, &identity_info);
+        let rule_groups =
+            mapping::evaluate_mappings(&gated_rules, &identity_info, ext_id.provider_id);
         let current_groups = db.get_user_group_ids(ext_id.user_id).unwrap_or_default();
 
         // Merge: add rule-matched groups to existing memberships (preserve manual assignments)

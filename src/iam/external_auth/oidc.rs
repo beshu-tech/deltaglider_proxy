@@ -487,6 +487,30 @@ mod tests {
     }
 
     #[test]
+    fn email_verified_omitted_claim_is_fail_closed() {
+        // SECURITY: an IdP that omits `email_verified` entirely must map to the
+        // identity's `email_verified = false` (fail-closed), so email-based group
+        // mappings are NOT granted. A regression to `unwrap_or(true)` here would
+        // silently re-open the unverified-email → group-grant hole.
+        let omitted: IdTokenClaims =
+            serde_json::from_value(serde_json::json!({"iss":"i","sub":"s","aud":"a"})).unwrap();
+        assert_eq!(omitted.email_verified, None);
+        assert!(!omitted.email_verified.unwrap_or(false), "omitted ⇒ false");
+
+        let yes: IdTokenClaims = serde_json::from_value(
+            serde_json::json!({"iss":"i","sub":"s","aud":"a","email_verified":true}),
+        )
+        .unwrap();
+        assert_eq!(yes.email_verified, Some(true));
+
+        let no: IdTokenClaims = serde_json::from_value(
+            serde_json::json!({"iss":"i","sub":"s","aud":"a","email_verified":false}),
+        )
+        .unwrap();
+        assert_eq!(no.email_verified, Some(false));
+    }
+
+    #[test]
     fn test_extract_raw_claims_nested_objects() {
         let payload = serde_json::json!({
             "sub": "123",
