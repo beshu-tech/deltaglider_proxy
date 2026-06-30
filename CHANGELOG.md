@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.9.1 — 2026-06-30
+
 ## v1.9.0 — 2026-06-30
 
 ### Changed (BREAKING)
