@@ -138,6 +138,12 @@ pub struct ExternalIdentity {
     pub last_login: Option<String>,
     pub raw_claims: Option<serde_json::Value>,
     pub created_at: String,
+    /// IdP-asserted email-verification at the most recent write. Gates
+    /// email-based group mappings on re-evaluation (sync/declarative). Stored
+    /// fail-closed: unknown (pre-v20 rows, or a legacy backup without the
+    /// field) reads as `false` via `#[serde(default)]`.
+    #[serde(default)]
+    pub email_verified: bool,
 }
 
 // ── ConfigDb CRUD implementations ──
@@ -468,7 +474,7 @@ impl ConfigDb {
     pub fn list_external_identities(&self) -> Result<Vec<ExternalIdentity>, ConfigDbError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, user_id, provider_id, external_sub, email, display_name, \
-             last_login, raw_claims, created_at \
+             last_login, raw_claims, created_at, email_verified \
              FROM external_identities ORDER BY id ASC",
         )?;
         let identities = stmt
@@ -487,7 +493,7 @@ impl ConfigDb {
             .conn
             .query_row(
                 "SELECT id, user_id, provider_id, external_sub, email, display_name, \
-                 last_login, raw_claims, created_at \
+                 last_login, raw_claims, created_at, email_verified \
                  FROM external_identities WHERE provider_id = ?1 AND external_sub = ?2",
                 params![provider_id, external_sub],
                 Self::external_identity_from_row,
@@ -497,6 +503,7 @@ impl ConfigDb {
     }
 
     /// Create a new external identity record.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_external_identity(
         &self,
         user_id: i64,
@@ -505,20 +512,22 @@ impl ConfigDb {
         email: Option<&str>,
         display_name: Option<&str>,
         raw_claims: Option<&serde_json::Value>,
+        email_verified: bool,
     ) -> Result<ExternalIdentity, ConfigDbError> {
         let claims_json: Option<String> =
             raw_claims.map(|v| serde_json::to_string(v).unwrap_or_default());
         self.conn.execute(
             "INSERT INTO external_identities (user_id, provider_id, external_sub, email, \
-             display_name, last_login, raw_claims) \
-             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'), ?6)",
+             display_name, last_login, raw_claims, email_verified) \
+             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'), ?6, ?7)",
             params![
                 user_id,
                 provider_id,
                 external_sub,
                 email,
                 display_name,
-                claims_json
+                claims_json,
+                email_verified as i64,
             ],
         )?;
         let id = self.conn.last_insert_rowid();
@@ -532,13 +541,14 @@ impl ConfigDb {
         email: Option<&str>,
         display_name: Option<&str>,
         raw_claims: Option<&serde_json::Value>,
+        email_verified: bool,
     ) -> Result<ExternalIdentity, ConfigDbError> {
         let claims_json: Option<String> =
             raw_claims.map(|v| serde_json::to_string(v).unwrap_or_default());
         self.conn.execute(
             "UPDATE external_identities SET email = ?1, display_name = ?2, \
-             last_login = datetime('now'), raw_claims = ?3 WHERE id = ?4",
-            params![email, display_name, claims_json, id],
+             last_login = datetime('now'), raw_claims = ?3, email_verified = ?5 WHERE id = ?4",
+            params![email, display_name, claims_json, id, email_verified as i64],
         )?;
         self.get_external_identity(id)
     }
@@ -550,7 +560,7 @@ impl ConfigDb {
     ) -> Result<Vec<ExternalIdentity>, ConfigDbError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, user_id, provider_id, external_sub, email, display_name, \
-             last_login, raw_claims, created_at \
+             last_login, raw_claims, created_at, email_verified \
              FROM external_identities WHERE user_id = ?1",
         )?;
         let identities = stmt
@@ -563,7 +573,7 @@ impl ConfigDb {
         self.conn
             .query_row(
                 "SELECT id, user_id, provider_id, external_sub, email, display_name, \
-                 last_login, raw_claims, created_at \
+                 last_login, raw_claims, created_at, email_verified \
                  FROM external_identities WHERE id = ?1",
                 params![id],
                 Self::external_identity_from_row,
@@ -590,6 +600,7 @@ impl ConfigDb {
             last_login: row.get(6)?,
             raw_claims,
             created_at: row.get(8)?,
+            email_verified: row.get::<_, i64>(9)? != 0,
         })
     }
 
@@ -776,6 +787,7 @@ mod tests {
                 Some("alice@company.com"),
                 Some("Alice"),
                 Some(&claims),
+                true,
             )
             .unwrap();
         assert_eq!(identity.external_sub, "google-123");
@@ -801,6 +813,7 @@ mod tests {
                 Some("alice@newcorp.com"),
                 Some("Alice N"),
                 None,
+                true,
             )
             .unwrap();
         assert_eq!(updated.email.as_deref(), Some("alice@newcorp.com"));
@@ -815,6 +828,33 @@ mod tests {
     }
 
     #[test]
+    fn email_verified_round_trips_through_create_and_update() {
+        // The M1 security fix depends on email_verified persisting: a re-sync
+        // reads the STORED flag, so create/update/load must preserve it exactly.
+        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let user = db.create_user("u", "AK1", "SK1", true, &[]).unwrap();
+        let provider = db.create_auth_provider(&make_provider_req("okta")).unwrap();
+
+        // Created unverified → stays unverified on read.
+        let id = db
+            .create_external_identity(user.id, provider.id, "sub-x", None, None, None, false)
+            .unwrap();
+        assert!(
+            !id.email_verified,
+            "created unverified must read back false"
+        );
+        assert!(!db.get_external_identity(id.id).unwrap().email_verified);
+        assert!(!db.list_external_identities().unwrap()[0].email_verified);
+
+        // A returning login that asserts a verified email flips it to true.
+        let updated = db
+            .update_external_identity(id.id, Some("a@x.com"), None, None, true)
+            .unwrap();
+        assert!(updated.email_verified, "update to verified must persist");
+        assert!(db.get_external_identity(id.id).unwrap().email_verified);
+    }
+
+    #[test]
     fn test_external_identity_cascades_on_user_delete() {
         let db = ConfigDb::in_memory("test-pass").unwrap();
 
@@ -823,7 +863,7 @@ mod tests {
             .unwrap();
         let provider = db.create_auth_provider(&make_provider_req("okta")).unwrap();
 
-        db.create_external_identity(user.id, provider.id, "okta-456", None, None, None)
+        db.create_external_identity(user.id, provider.id, "okta-456", None, None, None, true)
             .unwrap();
 
         // Delete user — identity should cascade
@@ -921,7 +961,7 @@ mod tests {
         let provider = db.create_auth_provider(&make_provider_req("prov")).unwrap();
         let user = db.create_user("u", "AK1", "SK1", true, &[]).unwrap();
 
-        db.create_external_identity(user.id, provider.id, "sub-1", None, None, None)
+        db.create_external_identity(user.id, provider.id, "sub-1", None, None, None, true)
             .unwrap();
 
         db.delete_auth_provider(provider.id).unwrap();
@@ -938,9 +978,10 @@ mod tests {
         let provider = db.create_auth_provider(&make_provider_req("prov")).unwrap();
         let user = db.create_user("u", "AK1", "SK1", true, &[]).unwrap();
 
-        db.create_external_identity(user.id, provider.id, "sub-1", None, None, None)
+        db.create_external_identity(user.id, provider.id, "sub-1", None, None, None, true)
             .unwrap();
-        let result = db.create_external_identity(user.id, provider.id, "sub-1", None, None, None);
+        let result =
+            db.create_external_identity(user.id, provider.id, "sub-1", None, None, None, true);
         assert!(
             result.is_err(),
             "Duplicate (provider_id, external_sub) should fail"

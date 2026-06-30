@@ -1750,6 +1750,7 @@ async fn import_backup_iam(
             ident.email.as_deref(),
             ident.display_name.as_deref(),
             ident.raw_claims.as_ref(),
+            ident.email_verified,
         ) {
             Ok(_) => result.external_identities_created += 1,
             Err(e) => {
@@ -2113,6 +2114,7 @@ storage:
                 last_login: None,
                 raw_claims: Some(serde_json::json!({"sub": "google-123"})),
                 created_at: "2024-01-01".into(),
+                email_verified: true,
             }],
         };
 

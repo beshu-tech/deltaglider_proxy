@@ -25,6 +25,12 @@ use tower_http::cors::{Any, CorsLayer};
 ///
 /// Pure: takes the already-resolved boolean so it can be unit-tested without
 /// reading the environment.
+///
+/// SECURITY: the permissive branch deliberately does NOT call
+/// `.allow_credentials(true)`. With `Any` origin, tower-http will not emit
+/// `Access-Control-Allow-Credentials`, so a browser never sends the
+/// `dgp_session` cookie cross-origin — keeping CLAUDE.md's "never permissive
+/// CORS with cookie auth" invariant. Do not add credentials here.
 pub fn cors_layer_for(permissive: bool) -> CorsLayer {
     if permissive {
         CorsLayer::new()
@@ -39,37 +45,50 @@ pub fn cors_layer_for(permissive: bool) -> CorsLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::{header, Request};
+    use axum::{routing::get, Router};
+    use tower::ServiceExt; // oneshot
 
-    #[test]
-    fn permissive_allows_any_origin_methods_headers() {
-        // Structural equality via Debug: CorsLayer has private fields and no
-        // PartialEq impl, but it derives Debug, so the Debug representation is
-        // a faithful, deterministic snapshot of its config.
-        let expected = CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods(Any)
-            .allow_headers(Any);
-        assert_eq!(
-            format!("{:?}", cors_layer_for(true)),
-            format!("{:?}", expected)
-        );
+    /// Drive a cross-origin GET through the layer and return the response's
+    /// `Access-Control-Allow-*` headers — the actual HTTP contract a browser
+    /// sees, not a Debug snapshot of the builder.
+    async fn cors_headers(permissive: bool) -> (Option<String>, Option<String>) {
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(cors_layer_for(permissive));
+        let req = Request::builder()
+            .uri("/")
+            .header(header::ORIGIN, "https://evil.example")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        let h = res.headers();
+        let allow_origin = h
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .map(|v| v.to_str().unwrap().to_string());
+        let allow_creds = h
+            .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+            .map(|v| v.to_str().unwrap().to_string());
+        (allow_origin, allow_creds)
     }
 
-    #[test]
-    fn restrictive_emits_no_cors_headers() {
-        let expected = CorsLayer::new();
+    #[tokio::test]
+    async fn permissive_emits_wildcard_origin_and_no_credentials() {
+        let (origin, creds) = cors_headers(true).await;
         assert_eq!(
-            format!("{:?}", cors_layer_for(false)),
-            format!("{:?}", expected)
+            origin.as_deref(),
+            Some("*"),
+            "permissive must allow any origin"
         );
+        // The security invariant: wildcard origin with NO credentials header, so
+        // the browser never sends the session cookie cross-origin.
+        assert_eq!(creds, None, "must NOT allow credentials in permissive mode");
     }
 
-    #[test]
-    fn permissive_and_restrictive_differ() {
-        // Sanity: the two branches must not produce identical layers.
-        assert_ne!(
-            format!("{:?}", cors_layer_for(true)),
-            format!("{:?}", cors_layer_for(false))
-        );
+    #[tokio::test]
+    async fn restrictive_emits_no_allow_origin_header() {
+        let (origin, creds) = cors_headers(false).await;
+        assert_eq!(origin, None, "restrictive must emit no Allow-Origin header");
+        assert_eq!(creds, None);
     }
 }

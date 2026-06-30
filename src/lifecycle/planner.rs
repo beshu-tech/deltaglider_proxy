@@ -535,6 +535,59 @@ mod tests {
     }
 
     #[test]
+    fn transition_without_expire_after_is_fatal() {
+        // Transition shares the expire_after arm with Delete but writes to a
+        // SECOND bucket — the riskier action, so cover it explicitly.
+        use crate::config_sections::{LifecycleDestination, LifecycleTransitionAction};
+        let mut r = rule(&["old/**"], &[]);
+        r.action = LifecycleAction::Transition(LifecycleTransitionAction {
+            destination: LifecycleDestination {
+                bucket: "archive".to_string(),
+                prefix: String::new(),
+            },
+            delete_source_after_success: false,
+        });
+        r.expire_after = None;
+        let errs = lifecycle_rule_errors(&r);
+        assert_eq!(errs.len(), 1, "exactly one fatal error: {errs:?}");
+        assert!(
+            errs[0].contains("transition") && errs[0].contains("requires expire_after"),
+            "must name the transition kind + missing field: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn retain_newest_bad_protect_younger_than_is_fatal() {
+        // The protect_younger_than branch is separate from min_age — exercise it.
+        use crate::config_sections::{LifecycleQualifySpec, LifecycleRetainNewestAction};
+        let mut r = rule(&["old/**"], &[]);
+        r.action = LifecycleAction::RetainNewest(LifecycleRetainNewestAction {
+            count: 2,
+            qualify: LifecycleQualifySpec::default(),
+            protect_younger_than: Some("not-a-duration".to_string()),
+        });
+        r.expire_after = None;
+        let errs = lifecycle_rule_errors(&r);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("protect_younger_than") && e.contains("invalid")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn expire_after_zero_is_not_fatal() {
+        // expire_after=0 is the surprising boundary: it's ADVISORY (warning),
+        // never a fatal config error (0s = delete immediately, which parses fine).
+        let mut r = rule(&["old/**"], &[]);
+        r.expire_after = Some("0s".to_string());
+        assert!(
+            lifecycle_rule_errors(&r).is_empty(),
+            "expire_after=0 must NOT be a fatal error (it's advisory-only)"
+        );
+    }
+
+    #[test]
     fn malformed_glob_is_fatal() {
         // Bad globs currently fail only at run time; the config gate compiles
         // them too so the rule is rejected before it ever runs.

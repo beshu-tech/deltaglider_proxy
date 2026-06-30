@@ -38,21 +38,45 @@ pub fn classify_lifecycle_run_error(err: &str) -> axum::http::StatusCode {
     }
 }
 
+/// The duration fields a lifecycle rule can carry; a `<field>=<val> invalid:` /
+/// `out of range:` error from any of them is a config defect, not a runtime
+/// fault. Keep in sync with the `format!("{field}=…")` sites in
+/// `planner::lifecycle_rule_errors` + `worker` (the only producers).
+const LIFECYCLE_DURATION_FIELDS: &[&str] = &[
+    "expire_after=",
+    "qualify.min_age=",
+    "min_age=",
+    "protect_younger_than=",
+];
+
 /// True iff `err` is a rule-config validation failure (attacker/operator can
 /// fix it by editing the rule), not a runtime/IO failure. Signatures come from
-/// `worker::run_or_preview` + `run_or_preview_retain_newest` +
-/// `planner::PlanError::InvalidGlob`:
+/// `planner::lifecycle_rule_errors` + `worker::run_or_preview` +
+/// `run_or_preview_retain_newest` + `planner::PlanError::InvalidGlob`:
 /// - "lifecycle rule '{}' {kind} action requires expire_after"
-/// - "expire_after={s} invalid: {err}" / " out of range: {err}"
-/// - "{field}={s} invalid: {err}" / " out of range: {err}" (retain-newest field durations)
+/// - "lifecycle rule '{}' {field}={s} invalid: {err}" / " out of range: {err}"
 /// - "invalid glob {pattern:?}: {reason}"
 /// - "lifecycle rule '{}' retain-newest count is 0 — refusing to run …"
+///
+/// The duration matchers are ANCHORED to a known `<field>=` token (not the bare
+/// " invalid: " / " out of range: " fragment) so a runtime/IO error that merely
+/// happens to contain those English words — e.g. an S3 list failure — is NOT
+/// misclassified as a client 400.
 fn is_lifecycle_config_validation_error(err: &str) -> bool {
-    err.contains("requires expire_after")
+    if err.contains("requires expire_after")
         || err.contains("count is 0")
         || err.starts_with("invalid glob")
-        || err.contains(" invalid: ")
-        || err.contains(" out of range: ")
+    {
+        return true;
+    }
+    // Anchored duration error: a known field token followed (later in the
+    // string) by the validation marker. Both producers emit `{field}={val}
+    // invalid|out of range: …`, so the field token always precedes the marker.
+    let has_marker = err.contains(" invalid: ") || err.contains(" out of range: ");
+    has_marker
+        && LIFECYCLE_DURATION_FIELDS
+            .iter()
+            .any(|field| err.contains(field))
 }
 
 pub fn current_unix_seconds() -> i64 {
@@ -102,12 +126,15 @@ mod tests {
     fn validation_errors_map_to_bad_request() {
         // Each signature the run/preview path emits for a malformed RULE CONFIG
         // must classify as 400 (operator fixable), not 500.
+        // These are the ACTUAL strings the producers emit (planner +
+        // worker) — field names match the real config keys, not generic
+        // placeholders, so the anchored classifier recognises them.
         let cases = [
             "lifecycle rule 'expire-old' delete action requires expire_after",
-            "expire_after=5x invalid: character 'x' not expected",
-            "expire_after=999999999d out of range: value out of range",
-            "older_than=abc invalid: expected number",
-            "younger_than=1y out of range: value out of bounds",
+            "lifecycle rule 'r' expire_after=5x invalid: character 'x' not expected",
+            "lifecycle rule 'r' expire_after=999999999d out of range: value out of range",
+            "lifecycle rule 'r' qualify.min_age=abc invalid: expected number",
+            "lifecycle rule 'r' protect_younger_than=1y out of range: value out of bounds",
             "invalid glob \"[unclosed\": error building glob set",
             "lifecycle rule 'keep-top' retain-newest count is 0 — refusing to run (would delete the whole prefix)",
         ];
@@ -129,12 +156,37 @@ mod tests {
             "could not rewrite lifecycle destination for \"a/b\": empty key",
             "storage error: NoSuchBucket",
             "config db error: SqliteFailure",
+            // Adversarial: runtime errors that DO contain the bare validation
+            // markers but are NOT lifecycle-config defects. The old unanchored
+            // matcher misclassified these as 400.
+            "list page failed: parameter invalid: bad continuation token",
+            "storage HEAD failed: byte offset out of range: 9999",
+            "S3 InvalidArgument: timestamp invalid: malformed",
         ];
         for err in cases {
             assert_eq!(
                 classify_lifecycle_run_error(err),
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "should be 500 (runtime): {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn anchored_duration_errors_map_to_bad_request() {
+        // Every lifecycle duration-field validation error (field-anchored) is a
+        // config defect → 400, across all four duration fields.
+        let cases = [
+            "lifecycle rule 'r' expire_after=5x invalid: unknown unit 'x'",
+            "lifecycle rule 'r' expire_after=999999d out of range: overflow",
+            "lifecycle rule 'r' qualify.min_age=2z invalid: unknown unit",
+            "lifecycle rule 'r' protect_younger_than=-1 invalid: negative",
+        ];
+        for err in cases {
+            assert_eq!(
+                classify_lifecycle_run_error(err),
+                StatusCode::BAD_REQUEST,
+                "should be 400 (config): {err}"
             );
         }
     }

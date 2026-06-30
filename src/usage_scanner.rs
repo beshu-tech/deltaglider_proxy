@@ -352,7 +352,10 @@ mod tests {
         let c = bump_usage_scan_version();
         assert!(b > a, "bump must strictly increase: a={a} b={b}");
         assert!(c > b, "bump must strictly increase: b={b} c={c}");
-        assert_eq!(current_usage_scan_version(), c);
+        // `>=` not `==`: the counter is a process-global static, so a concurrent
+        // test bumping it between our last bump and this read is benign — it can
+        // only have advanced past `c`, never regressed.
+        assert!(current_usage_scan_version() >= c);
     }
 
     fn make_entry(bucket: &str, prefix: &str, size: u64, objects: u64) -> UsageEntry {

@@ -25,7 +25,7 @@ pub struct ConfigDb {
 }
 
 /// Schema version — bump when adding migrations.
-const SCHEMA_VERSION: i32 = 19;
+const SCHEMA_VERSION: i32 = 20;
 
 pub(crate) mod auth_providers;
 mod declarative;
@@ -721,6 +721,25 @@ impl ConfigDb {
             )?;
             info!(
                 "Migrated config DB schema from v{} to v19 (replication parity result cache)",
+                version
+            );
+        }
+
+        if version < 20 {
+            // v20: persist the IdP-asserted `email_verified` per external
+            // identity so re-evaluation paths (admin sync-memberships,
+            // declarative reconcile) can gate email-based group mappings the
+            // same way the live OAuth callback does. DEFAULT 0 is deliberate
+            // and fail-closed: an identity stored before this column existed
+            // has unknown verification status, so it must NOT grant email-based
+            // groups until its next login re-asserts a verified claim.
+            conn.execute(
+                "ALTER TABLE external_identities ADD COLUMN \
+                 email_verified INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+            info!(
+                "Migrated config DB schema from v{} to v20 (external_identities.email_verified)",
                 version
             );
         }

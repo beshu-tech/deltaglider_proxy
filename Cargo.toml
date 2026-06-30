@@ -122,6 +122,9 @@ walkdir = "2"
 
 [dev-dependencies]
 tokio-test = "0.4"
+# `util` brings ServiceExt::oneshot so cors.rs can drive a request through the
+# CorsLayer and assert the real Access-Control-* response headers (not Debug).
+tower = { version = "0.5", features = ["util"] }
 reqwest = { version = "0.12", features = ["json", "cookies", "multipart"] }
 # Already transitive via aws-sdk-s3; named here so storage/s3.rs unit
 # tests can construct `SdkError::service_error(...)` values directly

@@ -262,6 +262,11 @@ impl ConfigDb {
         now: i64,
         lease_ttl_secs: i64,
     ) -> Result<Option<MaintenanceJob>, ConfigDbError> {
+        // Candidate finder, intentionally OUTSIDE the claim transaction below: it
+        // only narrows which row to attempt. Correctness does not rely on it —
+        // the tx re-validates everything via its WHERE-clause guards, so a stale
+        // candidate (raced by a peer) simply yields Ok(None). Do not "fix" this
+        // into a TOCTOU by trusting the SELECT result.
         let candidate: Option<i64> = self
             .conn
             .query_row(
@@ -619,34 +624,93 @@ mod tests {
             .unwrap()
     }
 
+    fn job_status(db: &ConfigDb, id: i64) -> String {
+        db.conn
+            .query_row(
+                "SELECT status FROM maintenance_jobs WHERE id = ?",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
     #[test]
-    fn two_concurrent_claims_on_same_id_exactly_one_wins() {
-        // The canonical-lease claim must serialise two claimers on the same
-        // queued row: the first takes the lease + flips to running, the second
-        // gets Ok(None). Exercises the new job_store::try_acquire_leader_lease
-        // path (saturating expiry, single tx) end-to-end.
+    fn claim_when_row_already_leased_rolls_back_and_loses() {
+        // The contention branch: a claimer whose candidate SELECT still sees the
+        // row 'queued' (so it gets PAST the SELECT) but whose lease-acquire is
+        // REFUSED because a peer already holds an unexpired lease. This is the
+        // race the single-transaction rewrite guards — `try_acquire_leader_lease`
+        // returns false, the tx drops/rolls back, the row is untouched.
+        // Reproduced deterministically by pre-installing a live peer lease while
+        // leaving status='queued' (simulating peer-acquired-but-not-yet-flipped).
         let db = db();
         let id = db
             .maintenance_create_job("reencrypt", "b", "counting", None, "admin", 1)
             .unwrap()
             .unwrap();
+        db.conn
+            .execute(
+                "UPDATE maintenance_jobs
+                    SET leader_instance_id = 'peer-a', leader_expires_at = 9999
+                  WHERE id = ?",
+                params![id],
+            )
+            .unwrap();
 
-        let winner = db
-            .maintenance_claim_next_job("inst-a", 100, 60)
+        // Candidate SELECT sees 'queued' (peer hasn't flipped status), so the
+        // claimer proceeds to the lease step — and is refused (peer's lease is
+        // live: now=100 < 9999). Must roll back and return None.
+        assert!(
+            db.maintenance_claim_next_job("inst-b", 100, 60)
+                .unwrap()
+                .is_none(),
+            "claim must lose to the live peer lease"
+        );
+        // Nothing mutated: still queued, peer's lease intact (no half-apply).
+        assert_eq!(job_status(&db, id), "queued");
+        assert_eq!(lease_cols(&db, id), (Some("peer-a".into()), Some(9999)));
+    }
+
+    #[test]
+    fn two_real_threads_claim_same_row_exactly_one_wins() {
+        // End-to-end concurrency on a SHARED on-disk DB: two OS threads, two
+        // independent connections, race to claim the same queued row. SQLite's
+        // per-row write lock + the WHERE-clause guards must yield exactly one
+        // winner and one clean loser (no double-claim, no corruption).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("maint-race.db");
+        let setup = ConfigDb::open_or_create(&path, "testpass").unwrap();
+        let id = setup
+            .maintenance_create_job("reencrypt", "b", "counting", None, "admin", 1)
             .unwrap()
             .unwrap();
-        assert_eq!(winner.id, id);
-        assert_eq!(winner.status, "running");
-        assert_eq!(lease_cols(&db, id), (Some("inst-a".into()), Some(160)));
+        drop(setup); // release the single connection before the racers open theirs
 
-        // A second claimer finds no 'queued' candidate (the row is now
-        // 'running') — exactly one winner.
-        assert!(db
-            .maintenance_claim_next_job("inst-b", 110, 60)
-            .unwrap()
-            .is_none());
-        // The winner's lease is untouched by the losing attempt.
-        assert_eq!(lease_cols(&db, id), (Some("inst-a".into()), Some(160)));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = ["inst-a", "inst-b"]
+            .into_iter()
+            .map(|inst| {
+                let p = path.clone();
+                let b = barrier.clone();
+                std::thread::spawn(move || {
+                    let db = ConfigDb::open_or_create(&p, "testpass").unwrap();
+                    b.wait(); // maximise the overlap window
+                    db.maintenance_claim_next_job(inst, 100, 60).unwrap()
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let winners = results.iter().filter(|r| r.is_some()).count();
+        assert_eq!(winners, 1, "exactly one thread may claim the row");
+
+        // The row is now exactly-once running under one instance.
+        let verify = ConfigDb::open_or_create(&path, "testpass").unwrap();
+        assert_eq!(job_status(&verify, id), "running");
+        let (leader, _) = lease_cols(&verify, id);
+        assert!(
+            leader.as_deref() == Some("inst-a") || leader.as_deref() == Some("inst-b"),
+            "lease held by exactly one racer: {leader:?}"
+        );
     }
 
     #[test]
