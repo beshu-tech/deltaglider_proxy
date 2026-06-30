@@ -28,6 +28,9 @@ pub enum Decision {
 pub enum SkipReason {
     /// Destination has the same-or-newer copy already.
     DestNewerOrEqual,
+    /// `conflict: content-diff` and the destination is byte-identical
+    /// (same size, and matching SHA-256 when both sides carry one).
+    DestIdentical,
     /// Rule `conflict: skip-if-dest-exists` and destination exists.
     DestExists,
     /// Object excluded by glob patterns.
@@ -220,10 +223,28 @@ pub fn should_replicate(
         (Some(_), ConflictPolicy::SkipIfDestExists) => Decision::Skip {
             reason: SkipReason::DestExists,
         },
-        // source-wins: always copy.
-        (Some(_), ConflictPolicy::SourceWins) => Decision::Copy {
-            dest_key: source_key.to_string(),
-        },
+        // content-diff: copy only when the bytes actually differ — the
+        // converging "exact mirror" policy. Same comparison parity/Verify
+        // uses (size is authoritative; SHA-256 confirms equal-size objects
+        // when both sides carry one). Byte-identical → skip, so the rule
+        // converges. A foreign object missing its SHA on either side falls
+        // back to size-only here (can't prove a same-size difference); that
+        // matches parity's tier-3 and avoids re-shipping on every sweep.
+        (Some(dest), ConflictPolicy::ContentDiff) => {
+            let size_differs = src_meta.file_size != dest.file_size;
+            let sha_differs = !src_meta.file_sha256.is_empty()
+                && !dest.file_sha256.is_empty()
+                && src_meta.file_sha256 != dest.file_sha256;
+            if size_differs || sha_differs {
+                Decision::Copy {
+                    dest_key: source_key.to_string(),
+                }
+            } else {
+                Decision::Skip {
+                    reason: SkipReason::DestIdentical,
+                }
+            }
+        }
         // newer-wins: strict comparison on created_at. On ties, fall
         // through to skip (can't distinguish clocks across storage
         // tiers; at-least-once semantics make this safe — next tick
@@ -400,14 +421,82 @@ mod tests {
     }
 
     #[test]
-    fn should_replicate_source_wins_always_copies() {
+    fn should_replicate_content_diff_skips_identical_object() {
+        // The convergence property that source-wins lacked: identical bytes
+        // (same size + same sha) are SKIPPED regardless of timestamps, so a
+        // recurring rule eventually copies nothing.
         let mut rule = default_rule();
-        rule.conflict = ConflictPolicy::SourceWins;
+        rule.conflict = ConflictPolicy::ContentDiff;
         let (inc, exc) = compile_rule_globs(&rule).unwrap();
-        let src = make_meta("file.txt", 1, Utc.timestamp_opt(100, 0).unwrap());
-        let dst = make_meta("file.txt", 1, Utc.timestamp_opt(500, 0).unwrap());
+        // Identical content, but the source timestamp is NEWER (would have
+        // copied under newer-wins / source-wins) — content-diff still skips.
+        let src = make_meta("file.txt", 10, Utc.timestamp_opt(900, 0).unwrap());
+        let dst = make_meta("file.txt", 10, Utc.timestamp_opt(100, 0).unwrap());
         let d = should_replicate("file.txt", &src, Some(&dst), rule.conflict, &inc, &exc);
-        assert!(matches!(d, Decision::Copy { .. }));
+        assert!(
+            matches!(
+                d,
+                Decision::Skip {
+                    reason: SkipReason::DestIdentical
+                }
+            ),
+            "identical content must skip, got {d:?}"
+        );
+    }
+
+    #[test]
+    fn should_replicate_content_diff_copies_on_size_difference() {
+        let mut rule = default_rule();
+        rule.conflict = ConflictPolicy::ContentDiff;
+        let (inc, exc) = compile_rule_globs(&rule).unwrap();
+        let src = make_meta("file.txt", 20, Utc.timestamp_opt(100, 0).unwrap());
+        let dst = make_meta("file.txt", 10, Utc.timestamp_opt(100, 0).unwrap());
+        let d = should_replicate("file.txt", &src, Some(&dst), rule.conflict, &inc, &exc);
+        assert!(
+            matches!(d, Decision::Copy { .. }),
+            "size diff must copy: {d:?}"
+        );
+    }
+
+    #[test]
+    fn should_replicate_content_diff_copies_on_sha_difference() {
+        let mut rule = default_rule();
+        rule.conflict = ConflictPolicy::ContentDiff;
+        let (inc, exc) = compile_rule_globs(&rule).unwrap();
+        // Same size, but the logical SHA-256 differs on both sides present.
+        let mut src = make_meta("file.txt", 10, Utc.timestamp_opt(100, 0).unwrap());
+        let mut dst = make_meta("file.txt", 10, Utc.timestamp_opt(100, 0).unwrap());
+        src.file_sha256 = "aaaa".to_string();
+        dst.file_sha256 = "bbbb".to_string();
+        let d = should_replicate("file.txt", &src, Some(&dst), rule.conflict, &inc, &exc);
+        assert!(
+            matches!(d, Decision::Copy { .. }),
+            "sha diff must copy: {d:?}"
+        );
+    }
+
+    #[test]
+    fn should_replicate_content_diff_size_match_missing_sha_skips() {
+        // A foreign object whose SHA is absent on one side: can't prove a
+        // same-size difference, so fall back to size-only and SKIP (matches
+        // parity tier-3; avoids re-shipping every sweep).
+        let mut rule = default_rule();
+        rule.conflict = ConflictPolicy::ContentDiff;
+        let (inc, exc) = compile_rule_globs(&rule).unwrap();
+        let mut src = make_meta("file.txt", 10, Utc.timestamp_opt(100, 0).unwrap());
+        let mut dst = make_meta("file.txt", 10, Utc.timestamp_opt(100, 0).unwrap());
+        src.file_sha256 = String::new(); // foreign: no logical sha
+        dst.file_sha256 = "bbbb".to_string();
+        let d = should_replicate("file.txt", &src, Some(&dst), rule.conflict, &inc, &exc);
+        assert!(
+            matches!(
+                d,
+                Decision::Skip {
+                    reason: SkipReason::DestIdentical
+                }
+            ),
+            "size-match + missing sha must skip, got {d:?}"
+        );
     }
 
     #[test]

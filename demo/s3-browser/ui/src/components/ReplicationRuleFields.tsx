@@ -111,7 +111,7 @@ export default function ReplicationRuleFields({
               style={{ display: 'flex', flexDirection: 'column', gap: 6 }}
             >
               <Radio value="newer-wins">Newer wins — safest default</Radio>
-              <Radio value="source-wins">Source wins — overwrite destination</Radio>
+              <Radio value="content-diff">Content diff — mirror (copy only when bytes differ)</Radio>
               <Radio value="skip-if-dest-exists">Skip existing destination objects</Radio>
             </Radio.Group>
           </FormField>

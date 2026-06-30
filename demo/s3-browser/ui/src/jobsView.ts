@@ -180,8 +180,8 @@ export function conflictPolicyLabel(p: ConflictPolicy): string {
   switch (p) {
     case 'newer-wins':
       return 'newer wins';
-    case 'source-wins':
-      return 'source wins';
+    case 'content-diff':
+      return 'content diff';
     case 'skip-if-dest-exists':
       return 'skip if destination exists';
     default:

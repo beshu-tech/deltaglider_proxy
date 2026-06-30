@@ -1093,14 +1093,21 @@ pub struct ReplicationEndpoint {
 #[serde(rename_all = "kebab-case")]
 pub enum ConflictPolicy {
     /// Copy only if source is strictly newer than destination (default).
-    /// Ties fall through to source-wins (can't distinguish clocks across
-    /// storage tiers).
+    /// On a tie (equal timestamps, or clocks that can't be compared across
+    /// storage tiers) it SKIPS — so the rule converges (a healthy reconcile
+    /// sweep eventually copies nothing).
     #[default]
     NewerWins,
-    /// Always copy, overwriting destination.
-    SourceWins,
-    /// Never copy when destination exists. Useful for "seed once"
-    /// replication rules.
+    /// Copy only when the content actually differs: size differs, or both
+    /// sides carry a logical SHA-256 and those differ. Byte-identical objects
+    /// are skipped. This is the "keep the destination an exact mirror of the
+    /// source" policy — and unlike the removed `source-wins`, it CONVERGES
+    /// (matches what Verify/parity calls "in sync"), so it's safe on a
+    /// recurring rule.
+    ContentDiff,
+    /// Never copy when the destination already exists. Useful for a one-shot
+    /// "seed once" rule (an empty destination is still populated via the
+    /// dest-missing path).
     SkipIfDestExists,
 }
 

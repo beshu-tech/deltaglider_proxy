@@ -882,8 +882,11 @@ pub async fn parity_audit(
         progress,
         0,
         |key, meta| {
+            // dest_meta=None here → this is purely the glob/eligibility filter
+            // ("would this key replicate at all"); the conflict policy is
+            // irrelevant because every policy copies a missing destination.
             if !matches!(
-                should_replicate(key, meta, None, ConflictPolicy::SourceWins, &inc, &exc),
+                should_replicate(key, meta, None, ConflictPolicy::NewerWins, &inc, &exc),
                 Decision::Copy { .. }
             ) {
                 return Ok(false);

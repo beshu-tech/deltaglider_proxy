@@ -91,14 +91,14 @@ const remSkipLie: Remediation = {
   rerun_helps: { verdict: 'no', why: 'policy_skips_existing_dest' },
   fix: { action: 'copy_overwrite' },
   reason_detail: 'source and destination differ, but the rule skips existing destination keys',
-  fix_detail: 're-run will NOT fix this — overwrite manually, or change the policy to source-wins',
+  fix_detail: 're-run will NOT fix this — overwrite manually, or switch the policy to content-diff',
 };
 const remChangePolicy: Remediation = {
   reason: 'dest_modified_after_copy',
   rerun_helps: { verdict: 'no', why: 'policy_skips_existing_dest' },
-  fix: { action: 'change_conflict_policy', to: 'source-wins' },
+  fix: { action: 'change_conflict_policy', to: 'content-diff' },
   reason_detail: 'source and destination differ, but the rule skips existing destination keys',
-  fix_detail: 'change the conflict policy to source-wins so re-runs overwrite the destination',
+  fix_detail: 'switch the conflict policy to content-diff so re-runs copy the changed object',
 };
 const remConditional: Remediation = {
   reason: 'diverged_unknown_age',

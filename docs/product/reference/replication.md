@@ -14,7 +14,7 @@ Replication has two paths, primary and backstop:
 - One-way, bucket/prefix-level replication through the DeltaGlider engine. The event consumer replicates mutations automatically; the reconcile scheduler runs due rules on their `interval`; a rule can also be triggered through the admin API (`POST /_/api/admin/jobs/replication:<name>/run-now`) or the Jobs screen.
 - Disabled rules and paused rules are skipped by the event consumer, the reconcile scheduler, and run-now alike.
 - A per-rule DB lease prevents the scheduler and run-now from executing the same rule at the same time. If a rule is already leased, run-now returns `409 Conflict` and the scheduler skips that tick. Long runs heartbeat the lease before starting new pages/objects; if the lease is lost, the worker stops before doing more work and records a failure.
-- At-least-once semantics. Conflict policies: `newer-wins` (default), `source-wins`, `skip-if-dest-exists`.
+- At-least-once semantics. Conflict policies: `newer-wins` (default), `content-diff`, `skip-if-dest-exists`.
 - Optional delete replication for destination objects previously written by the same rule.
 - Optional include / exclude glob filters per rule.
 - Static validation at config load: rule-name regex, humantime interval parsing, self-loop rejection, multi-hop cycle detection.
@@ -54,7 +54,7 @@ Rule-name grammar: `[A-Za-z0-9_.-]{1,64}`. The name is also the primary key in t
 | Policy | Behavior |
 |---|---|
 | `newer-wins` (default) | Copy only if source is strictly newer than destination. Ties fall through to skip — the clocks of two storage tiers aren't comparable. |
-| `source-wins` | Always copy, overwriting destination. |
+| `content-diff` | Keep the destination an exact mirror: copy only when the bytes differ (size differs, or both sides carry a logical SHA-256 and those differ). Byte-identical objects are skipped, so a recurring rule converges. |
 | `skip-if-dest-exists` | Never copy when destination exists (seed-once semantics). |
 
 ## Delete replication

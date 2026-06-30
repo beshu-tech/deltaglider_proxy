@@ -42,7 +42,7 @@ export type Verifier = 'sha256' | 'etag_size' | 'size_only';
 type FindingKind = 'match' | 'checksum_mismatch' | 'missing_on_dest' | 'orphan_on_dest';
 
 /** The rule's conflict policy (kebab-case on the wire — see ConflictPolicy). */
-export type ConflictPolicy = 'newer-wins' | 'source-wins' | 'skip-if-dest-exists';
+export type ConflictPolicy = 'newer-wins' | 'content-diff' | 'skip-if-dest-exists';
 
 /** The diagnosed cause of a finding (mirrors backend `ReasonCode`). */
 export type ReasonCode =

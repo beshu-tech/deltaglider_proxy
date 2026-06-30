@@ -1,6 +1,6 @@
 // === Object Replication ===
 
-type ReplicationConflictPolicy = 'newer-wins' | 'source-wins' | 'skip-if-dest-exists';
+type ReplicationConflictPolicy = 'newer-wins' | 'content-diff' | 'skip-if-dest-exists';
 
 interface ReplicationEndpoint {
   bucket: string;

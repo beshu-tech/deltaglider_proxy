@@ -56,7 +56,7 @@ Directory markers and storage-layer delta artifacts never replicate; the engine 
 ## 4. Pick a conflict policy
 
 - If the destination is write-only DR (nothing else writes to `releases-dr`), keep the default `newer-wins`: copies happen only when the source is strictly newer.
-- If the source must always win, even over manual edits on the destination, use `source-wins`.
+- If the destination must stay an exact mirror of the source, even over manual edits on the destination, use `content-diff` — it overwrites any object whose bytes differ but skips identical ones (so it converges instead of re-copying everything every sweep).
 - If you're seeding a bucket once and never overwriting, use `skip-if-dest-exists`.
 
 ## 5. Decide on delete replication

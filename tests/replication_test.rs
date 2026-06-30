@@ -1412,3 +1412,130 @@ async fn test_replication_foreign_object_missing_created_at_converges_on_second_
         "both foreign objects should be skipped as not-newer on 2nd run: {r2}"
     );
 }
+
+const CONTENT_DIFF_RULE_YAML: &str = "
+replication:
+  enabled: true
+  tick_interval: \"30s\"
+  rules:
+    - name: cd-rule
+      enabled: true
+      source:
+        bucket: cd-src
+        prefix: \"\"
+      destination:
+        bucket: cd-dst
+        prefix: \"\"
+      interval: \"1h\"
+      batch_size: 100
+      conflict: content-diff
+";
+
+/// `content-diff` is the converging replacement for the removed `source-wins`:
+/// it copies an object only when its bytes differ, and SKIPS byte-identical
+/// objects — so a recurring rule converges (run 2 copies nothing) yet still
+/// propagates a real content change (run 3 copies exactly the changed object).
+/// This is the property source-wins could never have (it re-copied everything
+/// every run).
+#[tokio::test]
+async fn test_replication_content_diff_converges_then_copies_real_change() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(CONTENT_DIFF_RULE_YAML)
+        .build()
+        .await;
+
+    let client = server.s3_client().await;
+    for b in ["cd-src", "cd-dst"] {
+        client.create_bucket().bucket(b).send().await.ok();
+    }
+    for (key, body) in [
+        ("a.txt", &b"alpha"[..]),
+        ("b.txt", &b"bravo"[..]),
+        ("c.txt", &b"charlie"[..]),
+    ] {
+        client
+            .put_object()
+            .bucket("cd-src")
+            .key(key)
+            .body(ByteStream::from(body.to_vec()))
+            .send()
+            .await
+            .expect("seed");
+    }
+
+    let admin = admin_http_client(&server.endpoint()).await;
+    let run_now = || async {
+        admin
+            .post(format!(
+                "{}/_/api/admin/jobs/replication:cd-rule/run-now",
+                server.endpoint()
+            ))
+            .send()
+            .await
+            .expect("run-now")
+            .json::<Value>()
+            .await
+            .expect("json")
+    };
+
+    // Run 1: dest empty → all 3 copied.
+    let r1 = run_now().await;
+    assert_eq!(
+        r1["objects_copied"].as_i64(),
+        Some(3),
+        "run1 copies all: {r1}"
+    );
+
+    // Run 2: identical content already on dest → content-diff copies NOTHING
+    // (the convergence source-wins lacked).
+    let r2 = run_now().await;
+    assert_eq!(
+        r2["objects_copied"].as_i64(),
+        Some(0),
+        "content-diff must converge: 2nd run copies 0, got {r2}"
+    );
+    assert_eq!(
+        r2["objects_skipped"].as_i64(),
+        Some(3),
+        "all 3 skipped as identical: {r2}"
+    );
+
+    // Overwrite ONE object's content on the source.
+    client
+        .put_object()
+        .bucket("cd-src")
+        .key("b.txt")
+        .body(ByteStream::from(b"bravo-CHANGED-and-longer".to_vec()))
+        .send()
+        .await
+        .expect("overwrite b.txt");
+
+    // Run 3: exactly the changed object copies; the other two stay skipped.
+    let r3 = run_now().await;
+    assert_eq!(
+        r3["objects_copied"].as_i64(),
+        Some(1),
+        "content-diff must copy exactly the changed object: {r3}"
+    );
+    assert_eq!(
+        r3["objects_skipped"].as_i64(),
+        Some(2),
+        "the two unchanged objects skip: {r3}"
+    );
+
+    // The dest now carries the new bytes.
+    let got = client
+        .get_object()
+        .bucket("cd-dst")
+        .key("b.txt")
+        .send()
+        .await
+        .expect("dest b.txt");
+    let bytes = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(
+        &bytes[..],
+        b"bravo-CHANGED-and-longer",
+        "dest reflects the new content"
+    );
+}

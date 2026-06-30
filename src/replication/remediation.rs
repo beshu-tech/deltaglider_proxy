@@ -169,13 +169,17 @@ fn analyze_mismatch(facts: &FindingFacts) -> Remediation {
         return copy_failing(led);
     }
     match facts.policy {
-        ConflictPolicy::SourceWins => Remediation {
+        ConflictPolicy::ContentDiff => Remediation {
+            // Content differs and the policy copies on any content difference,
+            // so a re-run resolves it.
             reason: ReasonCode::SourceModifiedAfterCopy,
             rerun_helps: RerunVerdict::Yes,
             fix: FixAction::RunNow,
-            reason_detail: "source and destination differ; source-wins overwrites on re-run"
+            reason_detail:
+                "source and destination differ; content-diff re-copies the changed object"
+                    .to_string(),
+            fix_detail: "re-run the rule — content-diff copies any object whose bytes differ"
                 .to_string(),
-            fix_detail: "re-run the rule — source-wins re-copies over the destination".to_string(),
         },
         ConflictPolicy::SkipIfDestExists => Remediation {
             // THE LIE, encoded: telling a skip-if-exists user to "just re-run"
@@ -189,7 +193,7 @@ fn analyze_mismatch(facts: &FindingFacts) -> Remediation {
                 "source and destination differ, but the rule skips existing destination keys"
                     .to_string(),
             fix_detail:
-                "re-run will NOT fix this — overwrite manually, or change the policy to source-wins"
+                "re-run will NOT fix this — overwrite manually, or switch the policy to content-diff"
                     .to_string(),
         },
         ConflictPolicy::NewerWins => analyze_mismatch_newer_wins(facts),
@@ -348,8 +352,8 @@ mod tests {
     // ─────────────── Mismatch (8 rows) ───────────────
 
     #[test]
-    fn mismatch_source_wins_reruns() {
-        let f = facts(FindingKind::ChecksumMismatch, ConflictPolicy::SourceWins);
+    fn mismatch_content_diff_reruns() {
+        let f = facts(FindingKind::ChecksumMismatch, ConflictPolicy::ContentDiff);
         let r = analyze_finding(&f);
         assert_eq!(r.reason, ReasonCode::SourceModifiedAfterCopy);
         assert_eq!(r.rerun_helps, RerunVerdict::Yes);
@@ -433,10 +437,10 @@ mod tests {
 
     #[test]
     fn mismatch_with_ledger_is_copy_failing_overrides_policy() {
-        // Even under SourceWins (a copy-permitting policy), a failing ledger
+        // Even under ContentDiff (a copy-permitting policy), a failing ledger
         // wins: the bytes never land.
         let l = led(5);
-        let mut f = facts(FindingKind::ChecksumMismatch, ConflictPolicy::SourceWins);
+        let mut f = facts(FindingKind::ChecksumMismatch, ConflictPolicy::ContentDiff);
         f.ledger = Some(&l);
         let r = analyze_finding(&f);
         assert_eq!(r.reason, ReasonCode::CopyFailing);
@@ -536,7 +540,7 @@ mod tests {
     fn arb_policy() -> impl Strategy<Value = ConflictPolicy> {
         prop_oneof![
             Just(ConflictPolicy::NewerWins),
-            Just(ConflictPolicy::SourceWins),
+            Just(ConflictPolicy::ContentDiff),
             Just(ConflictPolicy::SkipIfDestExists),
         ]
     }
