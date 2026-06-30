@@ -356,6 +356,7 @@ pub async fn run_rule(
         // Fold the concurrent results into totals + flags + events. DB
         // failure/clear writes already happened inside each unit; any
         // ConfigDb error is surfaced here (the first one wins).
+        let mut dest_fatal = false;
         for res in object_results {
             let res = res?;
             totals.objects_copied += res.objects_copied;
@@ -367,9 +368,23 @@ pub async fn run_rule(
             if res.had_error {
                 had_any_error = true;
             }
+            if res.dest_fatal {
+                dest_fatal = true;
+            }
             if let Some(ev) = res.event {
                 page_events.push(ev);
             }
+        }
+        // Destination unusable (bucket missing / over quota) — abort the run
+        // instead of retrying every remaining object against a dead dest.
+        if dest_fatal {
+            flush_page_events(&db, &rule.name, &mut page_events).await;
+            warn!(
+                "replication rule '{}' aborting run: destination unusable (bucket missing or over quota)",
+                rule.name
+            );
+            hit_fatal_error = true;
+            break 'pages;
         }
         {
             let db = db.lock().await;
@@ -505,6 +520,10 @@ struct PerObjectResult {
     bytes_copied: i64,
     errors: i64,
     had_error: bool,
+    // The error means the DESTINATION is unusable for the whole run (bucket
+    // missing / over quota) — the caller aborts the run instead of retrying
+    // every remaining object against a dead dest.
+    dest_fatal: bool,
     event: Option<NewEvent>,
     // Fast-path attribution for the successful copy (zero otherwise).
     delta_passthrough: i64,
@@ -638,9 +657,30 @@ async fn copy_one_object(
                 "replication rule '{}' object failure src={:?} dst={:?}: {}",
                 rule_name, src_key, dest_key, e
             );
+            out.dest_fatal = is_destination_fatal(&err_msg);
         }
     }
     Ok(out)
+}
+
+/// True iff a copy error means the DESTINATION is fundamentally unusable for the
+/// whole run — the dest bucket doesn't exist, the account is suspended, or the
+/// backend is out of storage/quota. These are NOT per-object hiccups: no object
+/// will ever land, so the run must FAIL FAST instead of retrying every object
+/// against a dead destination (the prod case: a Backblaze bucket over quota was
+/// surfacing `NoSuchBucket`/quota errors per-object and grinding through ~93K
+/// objects every tick). Pure so the truth table is unit-tested.
+fn is_destination_fatal(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    // Dest bucket missing / account suspended (StorageError::BucketNotFound's
+    // Display is "Bucket not found: …"; Backblaze returns NoSuchBucket).
+    e.contains("bucket not found")
+        || e.contains("nosuchbucket")
+        // Storage cap / quota exhaustion — provider-agnostic signatures.
+        || e.contains("quota")
+        || e.contains("insufficient storage")
+        || e.contains("cap exceeded")
+        || e.contains("storage limit")
 }
 
 fn spawn_lease_heartbeat(
@@ -1003,6 +1043,30 @@ fn compute_next_due(rule: &ReplicationRule, finished_at: i64) -> i64 {
 mod tests {
     use super::*;
     use crate::config_sections::{ConflictPolicy, ReplicationEndpoint, ReplicationRule};
+
+    #[test]
+    fn destination_fatal_truth_table() {
+        // Fatal: dest bucket gone / account suspended / over quota.
+        for f in [
+            "Bucket not found: beshu-b2",
+            "S3 error: NoSuchBucket",
+            "storage error: quota exceeded",
+            "Insufficient storage",
+            "B2 cap exceeded for account",
+            "monthly storage limit reached",
+        ] {
+            assert!(is_destination_fatal(f), "expected fatal: {f}");
+        }
+        // Per-object hiccups: NOT fatal — keep going.
+        for ok in [
+            "object copy timed out after 1800s",
+            "S3 error: put_object failed (status=503): SlowDown",
+            "connection reset by peer",
+            "NoSuchKey",
+        ] {
+            assert!(!is_destination_fatal(ok), "expected non-fatal: {ok}");
+        }
+    }
 
     fn mk_rule() -> ReplicationRule {
         ReplicationRule {
