@@ -138,7 +138,7 @@ assert.deepEqual(parityKindMeta('match'), { label: 'match', color: 'default' }, 
 
 // ── conflictPolicyLabel ─────────────────────────────────────────────────────
 assert.equal(conflictPolicyLabel('newer-wins'), 'newer wins');
-assert.equal(conflictPolicyLabel('source-wins'), 'source wins');
+assert.equal(conflictPolicyLabel('content-diff'), 'content diff');
 assert.equal(conflictPolicyLabel('skip-if-dest-exists'), 'skip if destination exists');
 
 // ── rerunVerdictMeta (the policy-aware verdict chip) ────────────────────────
@@ -181,8 +181,8 @@ for (const why of ['policy_skips_existing_dest', 'dest_newer_than_source', 'tied
 assert.deepEqual(fixActionMeta({ action: 'run_now' }), { label: 'Run now', runnable: true });
 // change_conflict_policy → instructional, carries the target policy in the label.
 {
-  const m = fixActionMeta({ action: 'change_conflict_policy', to: 'source-wins' });
-  assert.equal(m.label, 'Change policy to source-wins');
+  const m = fixActionMeta({ action: 'change_conflict_policy', to: 'content-diff' });
+  assert.equal(m.label, 'Change policy to content-diff');
   assert.equal(m.runnable, false);
   assert.match(m.how, /conflict policy/);
 }
