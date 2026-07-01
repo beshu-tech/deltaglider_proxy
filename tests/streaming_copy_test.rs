@@ -13,8 +13,7 @@
 mod common;
 
 use aws_sdk_s3::primitives::ByteStream;
-use common::{admin_http_client, big_passthrough_body, TestServer};
-use serde_json::Value;
+use common::{admin_http_client, big_passthrough_body, wait_for_run, TestServer};
 
 const STREAM_RULE_YAML: &str = "
 replication:
@@ -73,17 +72,14 @@ async fn test_streaming_multipart_copy_large_passthrough() {
         .send()
         .await
         .expect("run-now request");
-    assert_eq!(resp.status().as_u16(), 200, "run-now should succeed");
-    let outcome: Value = resp.json().await.unwrap();
+    // run-now is fire-and-forget (202); poll the run history for the outcome.
+    assert_eq!(resp.status().as_u16(), 202, "run-now accepted");
+    let run = wait_for_run(&admin, &server.endpoint(), "stream-a-to-b").await;
+    assert_eq!(run["status"].as_str(), Some("succeeded"), "run: {run}");
     assert_eq!(
-        outcome["status"].as_str(),
-        Some("succeeded"),
-        "run status: {outcome}"
-    );
-    assert_eq!(
-        outcome["objects_copied"].as_i64().unwrap_or(-1),
+        run["objects_processed"].as_i64().unwrap_or(-1),
         1,
-        "exactly one object copied: {outcome}"
+        "exactly one object copied: {run}"
     );
 
     // Destination object must be byte-identical and correctly sized.

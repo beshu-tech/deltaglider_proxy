@@ -17,7 +17,7 @@
 mod common;
 
 use aws_sdk_s3::primitives::ByteStream;
-use common::{admin_http_client, big_passthrough_body, metrics_snapshot, TestServer};
+use common::{admin_http_client, big_passthrough_body, metrics_snapshot, wait_for_run, TestServer};
 use serde_json::Value;
 
 const MIB: usize = 1024 * 1024;
@@ -58,14 +58,11 @@ async fn run_now_ok(server: &TestServer) -> Value {
         .send()
         .await
         .expect("run-now request");
-    assert_eq!(resp.status().as_u16(), 200, "run-now should succeed");
-    let outcome: Value = resp.json().await.unwrap();
-    assert_eq!(
-        outcome["status"].as_str(),
-        Some("succeeded"),
-        "run status: {outcome}"
-    );
-    outcome
+    // Fire-and-forget (202); poll the run history for the settled outcome.
+    assert_eq!(resp.status().as_u16(), 202, "run-now accepted");
+    let run = wait_for_run(&admin, &server.endpoint(), "e2e").await;
+    assert_eq!(run["status"].as_str(), Some("succeeded"), "run: {run}");
+    run
 }
 
 /// Seed one passthrough `.bin` into the source bucket.

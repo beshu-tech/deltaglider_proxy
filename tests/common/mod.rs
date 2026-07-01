@@ -994,6 +994,39 @@ pub async fn wait_for_replication_event(client: &reqwest::Client, endpoint: &str
     }
 }
 
+/// Poll a replication rule's run history until the latest run reaches a terminal
+/// status, then return that run object. `run-now` is fire-and-forget (202) — a
+/// large sync can't block the HTTP response — so tests assert on the settled
+/// run-history row (`objects_processed`, `status`), not the run-now response.
+pub async fn wait_for_run(
+    admin: &reqwest::Client,
+    endpoint: &str,
+    rule: &str,
+) -> serde_json::Value {
+    let url = format!("{endpoint}/_/api/admin/jobs/replication:{rule}/runs");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let h: serde_json::Value = admin.get(&url).send().await.unwrap().json().await.unwrap();
+        if let Some(run) = h["runs"].as_array().and_then(|r| {
+            r.iter()
+                .max_by_key(|x| x["id"].as_i64().unwrap_or(i64::MIN))
+        }) {
+            let st = run["status"].as_str().unwrap_or("");
+            if matches!(
+                st,
+                "succeeded" | "failed" | "completed_with_errors" | "cancelled" | "stopped"
+            ) {
+                return run.clone();
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "run for rule '{rule}' did not settle in 60s; last history: {h}"
+        );
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// Read the proxy's external-auth (OAuth/OIDC provider) version counter.
 ///
 /// Backed by `GET /_/api/admin/ext-auth/version`, incremented by

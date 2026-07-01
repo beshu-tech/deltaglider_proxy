@@ -19,7 +19,7 @@
 mod common;
 
 use aws_sdk_s3::primitives::ByteStream;
-use common::{admin_http_client, generate_binary, mutate_binary, TestServer};
+use common::{admin_http_client, generate_binary, mutate_binary, wait_for_run, TestServer};
 use serde_json::Value;
 
 const RULE_YAML: &str = "
@@ -78,8 +78,10 @@ async fn run_now(server: &TestServer) -> Value {
         .send()
         .await
         .expect("run-now request");
-    assert_eq!(resp.status().as_u16(), 200, "run-now should succeed");
-    resp.json().await.unwrap()
+    // Fire-and-forget (202); return the SETTLED run-history row (has `status`
+    // and `objects_processed`).
+    assert_eq!(resp.status().as_u16(), 202, "run-now accepted");
+    wait_for_run(&admin, &server.endpoint(), "dp-rule").await
 }
 
 async fn latest_run(server: &TestServer) -> Value {
@@ -136,7 +138,7 @@ async fn delta_passthrough_replicates_verbatim_and_is_idempotent() {
     let r1 = run_now(&server).await;
     assert_eq!(r1["status"].as_str(), Some("succeeded"), "run1: {}", r1);
     assert_eq!(
-        r1["objects_copied"].as_i64(),
+        r1["objects_processed"].as_i64(),
         Some(2),
         "copied v1+v2: {}",
         r1
@@ -170,7 +172,7 @@ async fn delta_passthrough_replicates_verbatim_and_is_idempotent() {
     let r2 = run_now(&server).await;
     assert_eq!(r2["status"].as_str(), Some("succeeded"), "run2: {}", r2);
     assert_eq!(
-        r2["objects_copied"].as_i64(),
+        r2["objects_processed"].as_i64(),
         Some(0),
         "second run copies nothing: {}",
         r2
