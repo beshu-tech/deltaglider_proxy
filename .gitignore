@@ -92,3 +92,4 @@ dgp-backup-*.zip
 # Generated demo video (regenerate with demo/video/make.sh)
 deltaglider-demo-90s.mp4
 deltaglider-demo-90s-music.mp4
+.deltaglider_scans/
