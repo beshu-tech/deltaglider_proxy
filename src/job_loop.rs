@@ -63,11 +63,19 @@ impl Pager {
         Self::resuming(None)
     }
 
-    /// Test-only page-budget override.
-    #[cfg(test)]
+    /// Page-budget override — unit tests and the `DGP_TEST_MAX_JOB_PAGES`
+    /// integration seam (replication truncation regression).
     pub fn with_max_pages(mut self, max_pages: u32) -> Self {
         self.max_pages = max_pages;
         self
+    }
+
+    /// The env-seam variant: applies `DGP_TEST_MAX_JOB_PAGES` when set.
+    pub fn with_test_max_pages_env(self) -> Self {
+        match crate::config::env_parse::<u32>("DGP_TEST_MAX_JOB_PAGES") {
+            Some(n) if n > 0 => self.with_max_pages(n),
+            _ => self,
+        }
     }
 
     /// Begin the next page. Returns the 0-based page index, or `None`
@@ -113,8 +121,8 @@ impl Pager {
     /// reencrypt) MUST treat this as fatal: falling through to the next
     /// phase here means "verified"/"flipped"/"deleted" over a listing
     /// that was silently truncated. Cursor-driven callers (replication,
-    /// lifecycle) may ignore it — their persisted token resumes the tail
-    /// on the next tick.
+    /// lifecycle) MUST keep their persisted token when this is true —
+    /// clearing it "on clean finish" would orphan the tail forever.
     pub fn truncated_by_page_budget(&self) -> bool {
         self.pages_started >= self.max_pages && self.more_pending
     }

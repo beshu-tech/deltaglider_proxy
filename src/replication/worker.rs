@@ -173,6 +173,18 @@ pub async fn run_rule(
     let lease_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let heartbeat_handle =
         spawn_lease_heartbeat(db.clone(), &rule.name, lease.clone(), lease_alive.clone());
+    // A run-now is a deliberate ONE-OFF: it runs even a paused rule (pause
+    // governs the scheduler); KILL is the stop affordance for a running one-off.
+    let ctrl = RunControl {
+        db: db.clone(),
+        rule_name: rule.name.clone(),
+        run_id,
+        lease: lease.clone(),
+        lease_alive: lease_alive.clone(),
+        one_off: triggered_by == "run-now",
+        max_failures_retained,
+    };
+    let events_sink: EventSink = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
 
     // Build a dest-presence ORACLE once per run by DESCENDING the dest+source
     // prefix trees with a `/` delimiter, instead of HEADing every source key (or
@@ -182,65 +194,37 @@ pub async fn run_rule(
     // from a single common-prefix probe — its objects all copy with no HEAD — and
     // planning HEADs a dest key ONLY when it actually exists. Bounded: an enormous
     // or errored/cancelled descent falls back to per-key HEAD (old behavior).
-    let dest_oracle =
-        build_dest_oracle(engine, &db, run_id, rule, &dest_prefix, &source_prefix).await;
+    let dest_oracle = build_dest_oracle(engine, &ctrl, rule, &dest_prefix, &source_prefix).await;
 
-    let mut pager = Pager::resuming(continuation);
+    let mut pager = Pager::resuming(continuation).with_test_max_pages_env();
     // ── Forward-copy pass: paginate source until exhausted ──
     'pages: while let Some(page_idx) = pager.begin_page() {
-        // Honor an operator pause MID-RUN: re-read the DB `paused` flag at each
-        // page boundary so a long sweep stops promptly instead of running to
-        // completion (the bug: pause only blocked the SCHEDULER from STARTING a
-        // run, never the in-flight one). Clean stop — cursor is preserved below
-        // so resume continues; not an error.
-        // ponytail: this covers PAUSE (a DB flag, live-visible here). DISABLE
-        // (`enabled: false`) is a config edit and the worker holds a snapshot
-        // `&ReplicationRule`, so a mid-run disable is NOT yet interrupted — the
-        // operator's stop button is Pause. To also honor disable mid-run, thread
-        // the live SharedConfig into run_rule and re-check `rule.enabled` here.
-        if {
-            let db = db.lock().await;
-            matches!(db.replication_load_state(&rule.name), Ok(Some(st)) if st.paused)
-        } {
-            info!(
-                "replication rule '{}' paused mid-run — stopping after page {} (cursor preserved for resume)",
-                rule.name, page_idx
-            );
-            stopped_paused = true;
-            break 'pages;
-        }
-
-        // Operator kill: check at the page boundary too, not only via the
-        // select! race around copy. The race covers the COPY phase; this covers a
-        // kill requested during the per-page LIST + PLAN phase (which can take a
-        // while), so the run stops before planning the next page instead of
-        // grinding to the next copy checkpoint.
-        let cancel_requested = {
-            let db = db.lock().await;
-            db.replication_run_cancel_requested(run_id).unwrap_or(false)
-        };
-        if cancel_requested {
-            info!(
-                "replication rule '{}' killed mid-run — stopping at page {} boundary",
-                rule.name, page_idx
-            );
-            killed = true;
-            break 'pages;
-        }
-
-        if !renew_run_lease(
-            &db,
-            rule,
-            lease.as_ref(),
-            &lease_alive,
-            run_id,
-            max_failures_retained,
-        )
-        .await?
-        {
-            totals.errors += 1;
-            hit_fatal_error = true;
-            break 'pages;
+        // Uniform page-boundary control check (kill / pause / lease renew).
+        // ponytail: PAUSE is a live DB flag; DISABLE is a config edit the worker
+        // can't see through its `&ReplicationRule` snapshot — Pause is the button.
+        match ctrl.check(true).await? {
+            ControlVerdict::Continue => {}
+            ControlVerdict::Killed => {
+                info!(
+                    "replication rule '{}' killed mid-run — stopping at page {} boundary",
+                    rule.name, page_idx
+                );
+                killed = true;
+                break 'pages;
+            }
+            ControlVerdict::Paused => {
+                info!(
+                    "replication rule '{}' paused mid-run — stopping after page {} (cursor preserved for resume)",
+                    rule.name, page_idx
+                );
+                stopped_paused = true;
+                break 'pages;
+            }
+            ControlVerdict::LeaseLost => {
+                totals.errors += 1;
+                hit_fatal_error = true;
+                break 'pages;
+            }
         }
 
         let page = match engine
@@ -356,33 +340,24 @@ pub async fn run_rule(
 
         totals.objects_skipped += plan.skipped.len() as i64;
 
-        // Events for this page are buffered and flushed in a single
-        // locked `event_outbox_insert_many` at page completion, rather
-        // than locking the DB per object. The outbox is asynchronous and
-        // replication doesn't need real-time delivery, so trading
-        // per-object immediacy for one lock acquisition per page is a
-        // pure throughput win on large runs.
-        let mut page_events: Vec<NewEvent> = Vec::with_capacity(plan.to_copy.len());
-
         // Renew the lease ONCE before the page's concurrent copy batch.
         // The independent heartbeat task keeps it alive during the batch;
-        // we re-check `lease_alive` after the batch (and per page). This
-        // preserves the single-flight-lease invariant — concurrency is
-        // WITHIN one run; the lease still guarantees one worker per rule.
-        if !renew_run_lease(
-            &db,
-            rule,
-            lease.as_ref(),
-            &lease_alive,
-            run_id,
-            max_failures_retained,
-        )
-        .await?
-        {
-            flush_page_events(&db, &rule.name, &mut page_events).await;
-            totals.errors += 1;
-            hit_fatal_error = true;
-            break 'pages;
+        // the post-batch check re-reads it. Events flush post-loop.
+        match ctrl.check(true).await? {
+            ControlVerdict::Continue => {}
+            ControlVerdict::Killed => {
+                killed = true;
+                break 'pages;
+            }
+            ControlVerdict::Paused => {
+                stopped_paused = true;
+                break 'pages;
+            }
+            ControlVerdict::LeaseLost => {
+                totals.errors += 1;
+                hit_fatal_error = true;
+                break 'pages;
+            }
         }
 
         // Copy up to `transfers` objects concurrently. Each unit does its
@@ -397,6 +372,7 @@ pub async fn run_rule(
                 let rule_name = rule.name.clone();
                 let src_bucket = rule.source.bucket.clone();
                 let dst_bucket = rule.destination.bucket.clone();
+                let events = events_sink.clone();
                 async move {
                     // Guard increments objects_inflight (+peak) on entry and
                     // decrements on drop → proves the `transfers` concurrency.
@@ -414,6 +390,7 @@ pub async fn run_rule(
                         object_skip_after_failures,
                         upload_concurrency,
                         max_failures_retained,
+                        &events,
                     )
                     .await
                 }
@@ -457,9 +434,6 @@ pub async fn run_rule(
             if res.dest_fatal {
                 dest_fatal = true;
             }
-            if let Some(ev) = res.event {
-                page_events.push(ev);
-            }
         }
         // Destination unusable (bucket missing / over quota) — abort the run
         // instead of retrying every remaining object against a dead dest.
@@ -468,7 +442,6 @@ pub async fn run_rule(
         // abort a page that is otherwise copying fine. A truly dead dest fails
         // EVERY object, so page_copied==0 holds for the real case.
         if dest_fatal && page_copied == 0 {
-            flush_page_events(&db, &rule.name, &mut page_events).await;
             warn!(
                 "replication rule '{}' aborting run: destination unusable (bucket missing or over quota)",
                 rule.name
@@ -482,12 +455,24 @@ pub async fn run_rule(
             db.replication_update_run_progress(run_id, totals)?;
         }
 
-        // If the lease lapsed during the batch, stop before advancing.
-        if !lease_alive.load(std::sync::atomic::Ordering::Acquire) && lease.is_some() {
-            flush_page_events(&db, &rule.name, &mut page_events).await;
-            totals.errors += 1;
-            hit_fatal_error = true;
-            break 'pages;
+        // Post-batch control re-check: stop before persisting the cursor if a
+        // kill/pause/lease-loss landed while the batch ran (no renew: the
+        // heartbeat owns liveness during the batch).
+        match ctrl.check(false).await? {
+            ControlVerdict::Continue => {}
+            ControlVerdict::Killed => {
+                killed = true;
+                break 'pages;
+            }
+            ControlVerdict::Paused => {
+                stopped_paused = true;
+                break 'pages;
+            }
+            ControlVerdict::LeaseLost => {
+                totals.errors += 1;
+                hit_fatal_error = true;
+                break 'pages;
+            }
         }
 
         // Persist the cursor so the next tick can resume here if we
@@ -504,7 +489,8 @@ pub async fn run_rule(
             let db = db.lock().await;
             db.replication_set_continuation_token(&rule.name, pager.token())?;
             db.replication_update_run_progress(run_id, totals)?;
-            flush_page_events_locked(&db, &rule.name, &mut page_events);
+            let mut drained: Vec<NewEvent> = std::mem::take(&mut *events_sink.lock());
+            flush_page_events_locked(&db, &rule.name, &mut drained);
         }
 
         if !more {
@@ -512,16 +498,23 @@ pub async fn run_rule(
         }
     }
 
+    // Unconditional flush: covers EVERY break path (kill, pause, lease,
+    // dest-fatal) — events pushed by durably-completed copies must survive.
+    flush_event_sink(&db, &rule.name, &events_sink).await;
+    // Forward pass ran out of page budget with pages pending: the cursor
+    // stays persisted so the next tick resumes the tail (never a clean pass).
+    let truncated = pager.truncated_by_page_budget();
+
     // ── Delete-replication pass (opt-in per rule) ──
     //
     // After the forward copy completes, paginate the destination prefix
     // and delete every key whose corresponding source key is missing.
-    // Only fires when forward-copy didn't hit a fatal error — partial
-    // listing failures could leave us thinking source is empty when
-    // it's not, and a full destination wipe would be catastrophic.
-    if rule.replicate_deletes && !hit_fatal_error && !stopped_paused && !killed {
-        if let Err(e) = run_delete_pass(
-            db.clone(),
+    // Only fires on a COMPLETE clean forward pass — a partial/truncated
+    // listing could make a present source key look missing, and a false
+    // destination wipe would be catastrophic.
+    if rule.replicate_deletes && !hit_fatal_error && !stopped_paused && !killed && !truncated {
+        match run_delete_pass(
+            &ctrl,
             engine,
             rule,
             run_id,
@@ -531,8 +524,17 @@ pub async fn run_rule(
         )
         .await
         {
-            warn!("replication rule '{}' delete pass error: {}", rule.name, e);
-            had_any_error = true;
+            Ok(ControlVerdict::Continue) => {}
+            Ok(ControlVerdict::Killed) => killed = true,
+            Ok(ControlVerdict::Paused) => stopped_paused = true,
+            Ok(ControlVerdict::LeaseLost) => {
+                totals.errors += 1;
+                hit_fatal_error = true;
+            }
+            Err(e) => {
+                warn!("replication rule '{}' delete pass error: {}", rule.name, e);
+                had_any_error = true;
+            }
         }
     }
 
@@ -553,10 +555,8 @@ pub async fn run_rule(
     // the operator's kill is never silently overwritten by a success status.
     let finished_at = current_unix_seconds();
     // Settle under ONE lock: re-read the DB cancel flag, derive the terminal
-    // status, and write finish_run without releasing in between. H1 fix — a kill
-    // landing between a separate re-check and finish_run used to be overwritten
-    // by `status='succeeded'`. Holding the lock across both closes that gap; the
-    // finish UPDATE is also conditioned on the row not already being terminal.
+    // status, and write finish_run without releasing in between (H1 fix); the
+    // finish UPDATE is ALSO guarded `status IN ('running','cancelling')` in SQL.
     let status: String = {
         let db = db.lock().await;
         // Authoritative final kill check (see the select! race comment above):
@@ -566,41 +566,44 @@ pub async fn run_rule(
             killed = true;
         }
 
-        let status = if killed {
-            "cancelled"
-        } else if stopped_paused {
-            "stopped"
-        } else if hit_fatal_error || (had_any_error && totals.objects_copied == 0) {
-            "failed"
-        } else if had_any_error {
-            "completed_with_errors"
-        } else {
-            "succeeded"
-        };
+        let decision = settle_run(SettleInput {
+            killed,
+            stopped_paused,
+            hit_fatal_error,
+            had_any_error,
+            objects_copied: totals.objects_copied,
+            truncated,
+        });
 
         let next_due = if dest_unusable {
             // Dead dest won't recover in a minute — back off to the rule's normal
             // cadence (but never faster than 60s) instead of hammering every minute.
             compute_next_due(rule, finished_at).max(finished_at + 60)
-        } else if hit_fatal_error {
-            // Tighter retry on other fatal errors (e.g. couldn't list source) so the
-            // operator-facing "next due" doesn't claim a long sleep when the worker
-            // gave up immediately.
+        } else if hit_fatal_error || truncated {
+            // Tight retry on fatal errors AND budget truncation: the persisted
+            // cursor resumes the tail promptly instead of waiting a full cadence.
             finished_at + 60
         } else {
             compute_next_due(rule, finished_at)
         };
 
-        // Clear the continuation token on a clean complete pass — next run starts
-        // from the beginning. A paused stop PRESERVES the cursor so resume picks up
-        // mid-prefix; a fatal error also keeps it (poison-token guard handles bad
-        // tokens separately).
-        let clear_cursor_on_clean = !hit_fatal_error && !stopped_paused && !killed;
-        if clear_cursor_on_clean {
+        if decision.clear_cursor {
             db.replication_set_continuation_token(&rule.name, None)?;
         }
-        db.replication_finish_run(run_id, &rule.name, status, finished_at, totals, next_due)?;
-        status.to_string()
+        if !db.replication_finish_run(
+            run_id,
+            &rule.name,
+            decision.status,
+            finished_at,
+            totals,
+            next_due,
+        )? {
+            warn!(
+                "replication rule '{}' run {} already terminal; settle to '{}' skipped",
+                rule.name, run_id, decision.status
+            );
+        }
+        decision.status.to_string()
     };
     // Settle barrier: bump AFTER the terminal row is written so a test polling
     // the run-version sees the settled run. The single chokepoint all scheduled
@@ -637,7 +640,8 @@ struct PerObjectResult {
     // missing / over quota) — the caller aborts the run instead of retrying
     // every remaining object against a dead dest.
     dest_fatal: bool,
-    event: Option<NewEvent>,
+    // Events go straight to the run's EventSink (not through this result):
+    // a kill dropping the page's collect future must not lose them.
     // Fast-path attribution for the successful copy (zero otherwise).
     delta_passthrough: i64,
     bytes_egress_saved: i64,
@@ -660,6 +664,7 @@ async fn copy_one_object(
     object_skip_after_failures: u32,
     upload_concurrency: usize,
     max_failures_retained: u32,
+    events: &EventSink,
 ) -> Result<PerObjectResult, crate::config_db::ConfigDbError> {
     let mut out = PerObjectResult::default();
 
@@ -721,11 +726,9 @@ async fn copy_one_object(
             if outcome.strategy == CopyStrategy::DeltaPassthrough {
                 out.delta_passthrough = 1;
             }
-            {
-                let db = db.lock().await;
-                db.replication_clear_object_failure(rule_name, src_key)?;
-            }
-            out.event = Some(NewEvent::new(
+            // Push the event BEFORE any further await: the copy is durable, so
+            // a kill dropping this future from here on must not lose it.
+            events.lock().push(NewEvent::new(
                 EventKind::ReplicationObjectCopied,
                 dst_bucket,
                 dest_key,
@@ -742,6 +745,10 @@ async fn copy_one_object(
                     "source_storage_type": outcome.source_storage_label,
                 }),
             ));
+            {
+                let db = db.lock().await;
+                db.replication_clear_object_failure(rule_name, src_key)?;
+            }
         }
         Err(e) => {
             out.errors = 1;
@@ -884,46 +891,143 @@ fn spawn_lease_heartbeat(
     }))
 }
 
-async fn renew_run_lease(
-    db: &Arc<Mutex<ConfigDb>>,
-    rule: &ReplicationRule,
-    lease: Option<&RunLease>,
-    lease_alive: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    run_id: i64,
-    max_failures_retained: u32,
-) -> Result<bool, crate::config_db::ConfigDbError> {
-    let Some(lease) = lease else {
-        return Ok(true);
-    };
-    if !lease_alive.load(std::sync::atomic::Ordering::Acquire) {
-        return record_lost_lease(db, &rule.name, run_id, max_failures_retained).await;
-    }
-    let now = current_unix_seconds();
-    let guard = db.lock().await;
-    if guard.replication_renew_lease(&rule.name, &lease.owner, now, lease.ttl_secs)? {
-        return Ok(true);
-    }
-    drop(guard);
-    record_lost_lease(db, &rule.name, run_id, max_failures_retained).await
+/// Inputs to the PURE terminal-settle decision (see `settle_run`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SettleInput {
+    killed: bool,
+    stopped_paused: bool,
+    hit_fatal_error: bool,
+    had_any_error: bool,
+    objects_copied: i64,
+    /// Forward pass ran out of page budget with pages still pending.
+    truncated: bool,
 }
 
-async fn record_lost_lease(
-    db: &Arc<Mutex<ConfigDb>>,
-    rule_name: &str,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SettleDecision {
+    status: &'static str,
+    clear_cursor: bool,
+}
+
+/// Terminal status + cursor decision, pure so the truth table is unit-tested.
+/// Precedence: killed > paused > fatal > budget-truncation ("stopped": halted
+/// mid-sweep, cursor kept, next tick resumes the tail) > errors > clean.
+/// The cursor survives ANY interrupted/truncated pass — clearing it on a
+/// truncated "clean" run permanently orphaned objects past the page budget.
+fn settle_run(i: SettleInput) -> SettleDecision {
+    let status = if i.killed {
+        "cancelled"
+    } else if i.stopped_paused {
+        "stopped"
+    } else if i.hit_fatal_error || (i.had_any_error && i.objects_copied == 0) {
+        "failed"
+    } else if i.truncated {
+        "stopped"
+    } else if i.had_any_error {
+        "completed_with_errors"
+    } else {
+        "succeeded"
+    };
+    let clear_cursor = !i.killed && !i.stopped_paused && !i.hit_fatal_error && !i.truncated;
+    SettleDecision {
+        status,
+        clear_cursor,
+    }
+}
+
+/// What a run-control check decided. Precedence: Killed > LeaseLost > Paused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlVerdict {
+    Continue,
+    Killed,
+    Paused,
+    LeaseLost,
+}
+
+/// PURE precedence fold for the page-boundary control check. `one_off`
+/// (run-now) suppresses ONLY the pause — kill and lease always apply.
+fn control_verdict(
+    cancel_requested: bool,
+    paused: bool,
+    one_off: bool,
+    lease_ok: bool,
+) -> ControlVerdict {
+    if cancel_requested {
+        ControlVerdict::Killed
+    } else if !lease_ok {
+        ControlVerdict::LeaseLost
+    } else if paused && !one_off {
+        ControlVerdict::Paused
+    } else {
+        ControlVerdict::Continue
+    }
+}
+
+/// Uniform run-control: kill / pause / lease evaluated identically at every
+/// page boundary of every pass (forward copy, delete pass, oracle descent).
+struct RunControl {
+    db: Arc<Mutex<ConfigDb>>,
+    rule_name: String,
     run_id: i64,
+    lease: Option<RunLease>,
+    lease_alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    one_off: bool,
     max_failures_retained: u32,
-) -> Result<bool, crate::config_db::ConfigDbError> {
-    log_failure(
-        db,
-        rule_name,
-        run_id,
-        "",
-        "",
-        "lost replication lease; stopping run before more work",
-        max_failures_retained,
-    )
-    .await?;
-    Ok(false)
+}
+
+impl RunControl {
+    /// One db.lock: cancel flag + paused flag + (when `renew`) lease renewal.
+    /// A lost lease is recorded as a run failure only on the `renew` variant
+    /// so back-to-back checks don't double-log.
+    async fn check(&self, renew: bool) -> Result<ControlVerdict, crate::config_db::ConfigDbError> {
+        let mut lease_ok =
+            self.lease.is_none() || self.lease_alive.load(std::sync::atomic::Ordering::Acquire);
+        let (cancel_requested, paused) = {
+            let g = self.db.lock().await;
+            let cancel = g
+                .replication_run_cancel_requested(self.run_id)
+                .unwrap_or(false);
+            let paused = matches!(
+                g.replication_load_state(&self.rule_name),
+                Ok(Some(st)) if st.paused
+            );
+            if lease_ok && renew {
+                if let Some(l) = &self.lease {
+                    lease_ok = g.replication_renew_lease(
+                        &self.rule_name,
+                        &l.owner,
+                        current_unix_seconds(),
+                        l.ttl_secs,
+                    )?;
+                }
+            }
+            (cancel, paused)
+        };
+        let verdict = control_verdict(cancel_requested, paused, self.one_off, lease_ok);
+        if verdict == ControlVerdict::LeaseLost && renew {
+            log_failure(
+                &self.db,
+                &self.rule_name,
+                self.run_id,
+                "",
+                "",
+                "lost replication lease; stopping run before more work",
+                self.max_failures_retained,
+            )
+            .await?;
+        }
+        Ok(verdict)
+    }
+}
+
+/// Per-run event sink: copy futures push events the moment a copy is durable,
+/// so a kill that drops the page's collect future can't lose them.
+type EventSink = std::sync::Arc<parking_lot::Mutex<Vec<NewEvent>>>;
+
+/// Drain the sink and flush under a freshly-acquired DB lock.
+async fn flush_event_sink(db: &Arc<Mutex<ConfigDb>>, rule_name: &str, sink: &EventSink) {
+    let mut drained: Vec<NewEvent> = std::mem::take(&mut *sink.lock());
+    flush_page_events(db, rule_name, &mut drained).await;
 }
 
 /// Flush buffered copy events under a freshly-acquired DB lock, draining
@@ -989,19 +1093,32 @@ async fn log_failure(
 /// the destination key is preserved. Better to leave an extra copy than
 /// to false-delete on a transient.
 async fn run_delete_pass(
-    db: Arc<Mutex<ConfigDb>>,
+    ctrl: &RunControl,
     engine: &Arc<DynEngine>,
     rule: &ReplicationRule,
     run_id: i64,
     totals: &mut RunTotals,
     had_any_error: &mut bool,
     max_failures_retained: u32,
-) -> Result<(), crate::config_db::ConfigDbError> {
+) -> Result<ControlVerdict, crate::config_db::ConfigDbError> {
+    let db = ctrl.db.clone();
     let cap = rule.batch_size.clamp(1, 10_000);
     let destination_prefix = normalize_prefix(&rule.destination.prefix);
 
-    let mut pager = Pager::fresh();
+    let mut pager = Pager::fresh().with_test_max_pages_env();
     'pages: while let Some(page_idx) = pager.begin_page() {
+        // This is the run's only DESTRUCTIVE phase — the same page-boundary
+        // control check as the forward pass: a killed run must stop deleting.
+        match ctrl.check(true).await? {
+            ControlVerdict::Continue => {}
+            verdict => {
+                info!(
+                    "replication rule '{}' delete pass stopping at page {} ({:?})",
+                    rule.name, page_idx, verdict
+                );
+                return Ok(verdict);
+            }
+        }
         // metadata=true so user_metadata (carrying our provenance
         // marker, H2 fix) is populated in the listing — saves a
         // per-object HEAD round-trip.
@@ -1034,7 +1151,7 @@ async fn run_delete_pass(
                 .await?;
                 totals.errors += 1;
                 *had_any_error = true;
-                return Ok(());
+                return Ok(ControlVerdict::Continue);
             }
         };
 
@@ -1147,7 +1264,24 @@ async fn run_delete_pass(
         }
     }
 
-    Ok(())
+    // Budget truncation: the dest tail was never scanned. Surface it (safe
+    // direction — under-delete) instead of pretending the sweep completed.
+    if pager.truncated_by_page_budget() {
+        log_failure(
+            &db,
+            &rule.name,
+            run_id,
+            "",
+            "",
+            "delete pass truncated by page budget; destination tail not swept this run",
+            max_failures_retained,
+        )
+        .await?;
+        totals.errors += 1;
+        *had_any_error = true;
+    }
+
+    Ok(ControlVerdict::Continue)
 }
 
 /// Translate a destination key back to its source-side counterpart by
@@ -1350,8 +1484,7 @@ fn source_prefix_to_dest(rule: &ReplicationRule, src_prefix: &str) -> Option<Str
 /// normalized rule prefixes.
 async fn build_dest_oracle(
     engine: &DynEngine,
-    db: &Arc<Mutex<ConfigDb>>,
-    run_id: i64,
+    ctrl: &RunControl,
     rule: &ReplicationRule,
     dest_prefix: &str,
     source_prefix: &str,
@@ -1372,16 +1505,12 @@ async fn build_dest_oracle(
         {
             return DestOracle::Unbounded;
         }
-        // Honor kill/pause during the (potentially long) descent — same checks
-        // the copy loop uses. Bail to Unbounded (a partial Known over-marks
-        // absent and would over-copy).
-        {
-            let g = db.lock().await;
-            if g.replication_run_cancel_requested(run_id).unwrap_or(false)
-                || matches!(g.replication_load_state(&rule.name), Ok(Some(st)) if st.paused)
-            {
-                return DestOracle::Unbounded;
-            }
+        // Honor kill/pause/lease-loss during the (potentially long) descent —
+        // the same uniform check as the copy loop (one-off ignores pause).
+        // Bail to Unbounded: a partial Known over-marks absent → over-copy.
+        match ctrl.check(false).await {
+            Ok(ControlVerdict::Continue) => {}
+            _ => return DestOracle::Unbounded,
         }
 
         // List the dest level (delimiter='/', metadata=true so leaves carry lite
@@ -1496,6 +1625,96 @@ fn compute_next_due(rule: &ReplicationRule, finished_at: i64) -> i64 {
 mod tests {
     use super::*;
     use crate::config_sections::{ConflictPolicy, ReplicationEndpoint, ReplicationRule};
+
+    #[test]
+    fn control_verdict_truth_table() {
+        use ControlVerdict::*;
+        // (cancel, paused, one_off, lease_ok) -> verdict
+        let cases = [
+            ((false, false, false, true), Continue),
+            ((false, false, true, true), Continue),
+            // Paused stops a scheduled run but NOT a one-off (run-now contract).
+            ((false, true, false, true), Paused),
+            ((false, true, true, true), Continue),
+            // Kill outranks everything, one-off included.
+            ((true, false, false, true), Killed),
+            ((true, true, true, true), Killed),
+            ((true, false, false, false), Killed),
+            // Lease loss outranks pause, applies to one-offs too.
+            ((false, true, false, false), LeaseLost),
+            ((false, false, true, false), LeaseLost),
+            ((false, true, true, false), LeaseLost),
+        ];
+        for ((cancel, paused, one_off, lease_ok), want) in cases {
+            assert_eq!(
+                control_verdict(cancel, paused, one_off, lease_ok),
+                want,
+                "cancel={cancel} paused={paused} one_off={one_off} lease_ok={lease_ok}"
+            );
+        }
+    }
+
+    #[test]
+    fn settle_run_truth_table() {
+        let base = SettleInput {
+            killed: false,
+            stopped_paused: false,
+            hit_fatal_error: false,
+            had_any_error: false,
+            objects_copied: 0,
+            truncated: false,
+        };
+        let d = settle_run(base);
+        assert_eq!((d.status, d.clear_cursor), ("succeeded", true));
+
+        // Budget truncation: NEVER clear the cursor — the tail must resume.
+        let d = settle_run(SettleInput {
+            truncated: true,
+            ..base
+        });
+        assert_eq!((d.status, d.clear_cursor), ("stopped", false));
+
+        let d = settle_run(SettleInput {
+            killed: true,
+            truncated: true,
+            ..base
+        });
+        assert_eq!((d.status, d.clear_cursor), ("cancelled", false));
+
+        let d = settle_run(SettleInput {
+            stopped_paused: true,
+            ..base
+        });
+        assert_eq!((d.status, d.clear_cursor), ("stopped", false));
+
+        let d = settle_run(SettleInput {
+            hit_fatal_error: true,
+            ..base
+        });
+        assert_eq!((d.status, d.clear_cursor), ("failed", false));
+
+        // Errors with zero progress = failed; with progress = partial.
+        let d = settle_run(SettleInput {
+            had_any_error: true,
+            ..base
+        });
+        assert_eq!((d.status, d.clear_cursor), ("failed", true));
+        let d = settle_run(SettleInput {
+            had_any_error: true,
+            objects_copied: 5,
+            ..base
+        });
+        assert_eq!((d.status, d.clear_cursor), ("completed_with_errors", true));
+
+        // Truncated + nonfatal errors: still resumable, cursor kept.
+        let d = settle_run(SettleInput {
+            had_any_error: true,
+            objects_copied: 5,
+            truncated: true,
+            ..base
+        });
+        assert_eq!((d.status, d.clear_cursor), ("stopped", false));
+    }
 
     #[test]
     fn destination_fatal_truth_table() {

@@ -402,7 +402,9 @@ impl ConfigDb {
     }
 
     /// Finish a run with the given status + totals. Updates both the
-    /// history row and the state row's lifetime counters.
+    /// history row and the state row's lifetime counters. The UPDATE is
+    /// guarded on a non-terminal status so a late settle can never overwrite
+    /// an already-terminal row (H1 shape); returns false when it was skipped.
     #[allow(clippy::too_many_arguments)]
     pub fn replication_finish_run(
         &self,
@@ -412,8 +414,8 @@ impl ConfigDb {
         finished_at: i64,
         totals: RunTotals,
         next_due_at: i64,
-    ) -> Result<(), ConfigDbError> {
-        self.conn.execute(
+    ) -> Result<bool, ConfigDbError> {
+        let changed = self.conn.execute(
             "UPDATE replication_run_history
                 SET finished_at        = ?,
                     objects_scanned    = ?,
@@ -425,7 +427,7 @@ impl ConfigDb {
                     status             = ?,
                     delta_passthrough  = ?,
                     bytes_egress_saved = ?
-              WHERE id = ?",
+              WHERE id = ? AND status IN ('running', 'cancelling')",
             params![
                 finished_at,
                 totals.objects_scanned,
@@ -440,6 +442,9 @@ impl ConfigDb {
                 run_id
             ],
         )?;
+        if changed == 0 {
+            return Ok(false);
+        }
         self.conn.execute(
             "UPDATE replication_state
                 SET last_run_at = ?,
@@ -457,7 +462,7 @@ impl ConfigDb {
                 rule_name
             ],
         )?;
-        Ok(())
+        Ok(true)
     }
 
     /// Update the in-progress counters for a running replication row.
