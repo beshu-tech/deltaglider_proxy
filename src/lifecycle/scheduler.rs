@@ -59,7 +59,19 @@ async fn run_due_rules(
     state: &Arc<AppState>,
     instance_id: &str,
 ) {
+    // Duplicate names share one lifecycle_state row (keyed by name): the second
+    // rule is silently starved and both corrupt the cursor — skip the WHOLE set.
+    let dup_names =
+        super::planner::duplicate_rule_names(lifecycle.rules.iter().filter(|r| r.enabled));
     for rule in lifecycle.rules.iter().filter(|rule| rule.enabled) {
+        if dup_names.contains(&rule.name) {
+            warn!(
+                "Lifecycle scheduler skipping rule '{}': name is duplicated across enabled rules \
+                 (state/cursor/lease are keyed by name)",
+                rule.name
+            );
+            continue;
+        }
         // Config-time fatal gate: a rule that can NEVER run (delete/transition
         // missing·invalid·out-of-range expire_after, retain-newest count=0,
         // bad globs/durations) is skipped here — not run-and-failed every

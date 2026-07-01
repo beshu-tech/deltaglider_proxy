@@ -447,27 +447,38 @@ async fn apply_section(
 
     // Validate semantically via `Config::check` (runs the same
     // warnings pipeline the document-level apply runs).
-    let warnings_from_check = new_cfg.check();
+    let mut warnings_from_check = new_cfg.check();
 
-    // Fatal lifecycle gate — the SAME gate the document-level apply runs
-    // (`parse_and_validate_yaml`). The GUI's Jobs/Storage editor saves through
-    // THIS section path, so without it a delete rule missing `expire_after`
-    // (or a dup rule name, empty transition dest, …) was accepted as a mere
-    // warning and then failed every scheduler tick.
-    let lifecycle_errors = crate::lifecycle::planner::lifecycle_config_errors(&new_cfg.lifecycle);
-    if !lifecycle_errors.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(SectionApplyResponse {
-                ok: false,
-                warnings: removed_warnings,
-                requires_restart: false,
-                persisted_path: None,
-                error: Some(lifecycle_errors.join("; ")),
-                diff: None,
-            }),
-        )
-            .into_response();
+    // Lifecycle gate — the SAME changed-only gate the document-level apply runs.
+    // The GUI's Jobs/Storage editor saves through THIS section path, so without
+    // it a delete rule missing `expire_after` (or a dup rule name, empty
+    // transition dest, …) was accepted as a mere warning and then failed every
+    // scheduler tick. Errors on UNCHANGED lifecycle content downgrade to
+    // warnings so a pre-existing bad rule can't block unrelated config edits.
+    match crate::lifecycle::planner::lifecycle_gate(&old_cfg.lifecycle, &new_cfg.lifecycle) {
+        Ok(lifecycle_warnings) => {
+            if !lifecycle_warnings.is_empty() {
+                tracing::warn!(
+                    "section apply: pre-existing invalid lifecycle config left unchanged: {}",
+                    lifecycle_warnings.join("; ")
+                );
+                warnings_from_check.extend(lifecycle_warnings);
+            }
+        }
+        Err(lifecycle_errors) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(SectionApplyResponse {
+                    ok: false,
+                    warnings: removed_warnings,
+                    requires_restart: false,
+                    persisted_path: None,
+                    error: Some(lifecycle_errors.join("; ")),
+                    diff: None,
+                }),
+            )
+                .into_response();
+        }
     }
 
     // Compute the diff before we potentially swap. This is the shape

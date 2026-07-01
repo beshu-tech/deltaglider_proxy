@@ -111,18 +111,48 @@ pub fn lifecycle_rule_errors(rule: &LifecycleRule) -> Vec<String> {
 /// [`super::classify_lifecycle_run_error`] so config-time and run-time agree.
 pub fn lifecycle_config_errors(cfg: &LifecycleConfig) -> Vec<String> {
     let mut errs = Vec::new();
-    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for name in duplicate_rule_names(&cfg.rules) {
+        errs.push(format!(
+            "lifecycle rule name '{name}' is duplicated — rule names must be unique \
+             (state, cursor and lease are keyed by name)"
+        ));
+    }
     for rule in &cfg.rules {
-        if !seen.insert(rule.name.as_str()) {
-            errs.push(format!(
-                "lifecycle rule name '{}' is duplicated — rule names must be unique \
-                 (state, cursor and lease are keyed by name)",
-                rule.name
-            ));
-        }
         errs.extend(lifecycle_rule_errors(rule));
     }
     errs
+}
+
+/// Names appearing on MORE than one rule (each reported once, first-seen order).
+/// Shared by [`lifecycle_config_errors`] and the scheduler's dup-skip defence.
+pub fn duplicate_rule_names<'a, I>(rules: I) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a LifecycleRule>,
+{
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut dups: Vec<String> = Vec::new();
+    for rule in rules {
+        if !seen.insert(rule.name.as_str()) && !dups.iter().any(|d| d == &rule.name) {
+            dups.push(rule.name.clone());
+        }
+    }
+    dups
+}
+
+/// Config-time lifecycle gate for apply paths: errors are FATAL only when the
+/// lifecycle content actually CHANGED vs the running config; an unchanged (e.g.
+/// pre-existing pre-v1.9.0) invalid lifecycle downgrades to warnings so it
+/// cannot block unrelated config edits. `Ok(warnings)` / `Err(fatal)`.
+pub fn lifecycle_gate(
+    old: &LifecycleConfig,
+    new: &LifecycleConfig,
+) -> Result<Vec<String>, Vec<String>> {
+    let errs = lifecycle_config_errors(new);
+    if errs.is_empty() || old == new {
+        Ok(errs)
+    } else {
+        Err(errs)
+    }
 }
 
 /// Every bucket a rule run WRITES to: the scanned bucket (deletes happen
@@ -131,10 +161,14 @@ pub fn lifecycle_config_errors(cfg: &LifecycleConfig) -> Vec<String> {
 /// PUT landing on a bucket mid-reencrypt/migrate is exactly the racing
 /// write the gate exists to stop.
 pub fn rule_write_buckets(rule: &LifecycleRule) -> Vec<&str> {
-    let mut buckets = vec![rule.bucket.as_str()];
+    // Trim BOTH sides symmetrically: the planner/C5 gate trim the destination at
+    // action build, so an untrimmed name here would miss the gated real bucket.
+    let source = rule.bucket.trim();
+    let mut buckets = vec![source];
     if let LifecycleAction::Transition(t) = &rule.action {
-        if !t.destination.bucket.trim().is_empty() && t.destination.bucket != rule.bucket {
-            buckets.push(t.destination.bucket.as_str());
+        let dest = t.destination.bucket.trim();
+        if !dest.is_empty() && dest != source {
+            buckets.push(dest);
         }
     }
     buckets
@@ -662,6 +696,73 @@ mod tests {
             errs.iter().any(|e| e.contains("requires expire_after")),
             "{errs:?}"
         );
+    }
+
+    #[test]
+    fn duplicate_rule_names_reports_each_name_once() {
+        let r1 = rule(&[], &[]);
+        let r2 = rule(&[], &[]); // same name as r1
+        let r3 = rule(&[], &[]); // and a third occurrence
+        let mut other = rule(&[], &[]);
+        other.name = "unique".to_string();
+        let rules = vec![r1, r2, r3, other];
+        assert_eq!(duplicate_rule_names(&rules), vec!["expire-old"]);
+        assert!(duplicate_rule_names(&rules[..1]).is_empty());
+        assert!(duplicate_rule_names(std::iter::empty()).is_empty());
+    }
+
+    #[test]
+    fn rule_write_buckets_trims_source_and_destination() {
+        // Untrimmed names must not dodge the maintenance write gate: the planner
+        // trims the destination at action build, so the gate must see " archive"
+        // as "archive" (and dedup " b" against "b").
+        use crate::config_sections::{LifecycleDestination, LifecycleTransitionAction};
+        let mut r = rule(&[], &[]);
+        r.bucket = " b ".to_string();
+        r.action = LifecycleAction::Transition(LifecycleTransitionAction {
+            destination: LifecycleDestination {
+                bucket: " archive".to_string(),
+                prefix: String::new(),
+            },
+            delete_source_after_success: false,
+        });
+        assert_eq!(rule_write_buckets(&r), vec!["b", "archive"]);
+
+        // Trimmed-equal destination dedups to the single source bucket.
+        let mut same = rule(&[], &[]);
+        same.bucket = "b".to_string();
+        same.action = LifecycleAction::Transition(LifecycleTransitionAction {
+            destination: LifecycleDestination {
+                bucket: " b ".to_string(),
+                prefix: "cold/".to_string(),
+            },
+            delete_source_after_success: false,
+        });
+        assert_eq!(rule_write_buckets(&same), vec!["b"]);
+    }
+
+    #[test]
+    fn lifecycle_gate_is_fatal_only_on_changed_invalid_content() {
+        use crate::config_sections::LifecycleConfig;
+        let valid = LifecycleConfig {
+            enabled: true,
+            rules: vec![rule(&[], &[])],
+            ..Default::default()
+        };
+        let mut invalid = valid.clone();
+        invalid.rules[0].expire_after = None; // delete without expire_after → error
+        let mut other_invalid = invalid.clone();
+        other_invalid.rules[0].prefix = "changed/".to_string();
+
+        // Unchanged-invalid (pre-existing defect): warnings, edit goes through.
+        let warns = lifecycle_gate(&invalid, &invalid).expect("unchanged must not be fatal");
+        assert!(warns.iter().any(|w| w.contains("requires expire_after")));
+        // Changed-invalid: fatal.
+        assert!(lifecycle_gate(&valid, &invalid).is_err());
+        assert!(lifecycle_gate(&other_invalid, &invalid).is_err());
+        // Changed-valid and unchanged-valid: clean.
+        assert_eq!(lifecycle_gate(&invalid, &valid), Ok(vec![]));
+        assert_eq!(lifecycle_gate(&valid, &valid), Ok(vec![]));
     }
 
     #[test]
