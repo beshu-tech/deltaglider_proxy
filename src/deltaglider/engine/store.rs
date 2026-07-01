@@ -1186,7 +1186,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         metadata.user_metadata = std::mem::take(&mut handle.user_metadata);
         metadata.multipart_etag = multipart_etag;
 
-        self.storage
+        if let Err(e) = self
+            .storage
             .complete_multipart_upload(
                 &handle.upload,
                 &handle.deltaspace_id,
@@ -1195,7 +1196,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 &assembled,
                 &metadata,
             )
-            .await?;
+            .await
+        {
+            // Complete failed: abort so the fully-uploaded part set doesn't
+            // dangle on backends (B2) that never GC incomplete uploads.
+            self.abort_passthrough_multipart_ref(&handle).await;
+            return Err(e.into());
+        }
 
         if let Err(e) = self
             .delete_delta_idempotent(&handle.bucket, &handle.deltaspace_id, &handle.filename)
@@ -1217,9 +1224,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         Ok(result)
     }
 
-    /// Abort an in-progress passthrough multipart upload (best-effort).
-    /// Consumes the handle (releases the prefix lock).
-    pub async fn abort_passthrough_multipart(&self, handle: PassthroughMultipartHandle) {
+    /// Abort an in-progress passthrough multipart upload (best-effort)
+    /// WITHOUT consuming the handle — callers holding it behind an Arc can
+    /// abort at any strong count (the prefix lock releases when the last
+    /// clone drops).
+    pub async fn abort_passthrough_multipart_ref(&self, handle: &PassthroughMultipartHandle) {
         if let Err(e) = self
             .storage
             .abort_multipart_upload(&handle.upload, &handle.deltaspace_id, &handle.filename)

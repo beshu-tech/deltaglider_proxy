@@ -419,9 +419,10 @@ async fn stream_copy_passthrough(
     let collected = match results {
         Ok(v) => v,
         Err(e) => {
-            // Explicit abort on a part failure — disarm so the guard's Drop
-            // doesn't double-abort, then abort synchronously here.
-            abort_shared_handle(engine, abort_guard.disarm()).await;
+            // Explicit abort on a part failure — by ref, so it works at any
+            // Arc strong count; disarm so the guard's Drop doesn't double-abort.
+            engine.abort_passthrough_multipart_ref(&handle).await;
+            drop(abort_guard.disarm());
             return Err(e.into());
         }
     };
@@ -474,18 +475,6 @@ async fn stream_copy_passthrough(
     })
 }
 
-/// Abort a shared multipart handle (best-effort). Unwraps the Arc when
-/// it's the sole owner; otherwise the in-flight tasks have already failed
-/// and the upload is abandoned (the backend GCs incomplete uploads).
-async fn abort_shared_handle(
-    engine: &Arc<DynEngine>,
-    handle: Arc<crate::deltaglider::PassthroughMultipartHandle>,
-) {
-    if let Ok(h) = Arc::try_unwrap(handle) {
-        engine.abort_passthrough_multipart(h).await;
-    }
-}
-
 /// Aborts the multipart upload on drop UNLESS disarmed. Covers the
 /// cancellation path: when a kill drops the streaming-copy future mid-part,
 /// neither the Ok nor the Err arm runs, so without this the upload is left
@@ -516,7 +505,9 @@ impl Drop for MultipartAbortGuard {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
             let engine = self.engine.clone();
-            tokio::spawn(async move { abort_shared_handle(&engine, handle).await });
+            // By-ref abort: correct even while the dropped future's other Arc
+            // clones are still being torn down.
+            tokio::spawn(async move { engine.abort_passthrough_multipart_ref(&handle).await });
         }
     }
 }
@@ -1292,6 +1283,530 @@ mod gate_proptests {
                     prop_assert!(is_fallback);
                 }
             }
+        }
+    }
+}
+
+/// Regression tests for the multipart-abort paths: a dangling multipart
+/// upload on backends without incomplete-upload GC (B2) accrues storage
+/// forever, so EVERY failure path must reach `abort_multipart_upload`.
+#[cfg(test)]
+mod multipart_abort_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::deltaglider::DeltaGliderEngine;
+    use crate::storage::{MultipartUpload, StorageBackend, StorageError, UploadedPart};
+    use crate::types::FileMetadata;
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use futures::stream::BoxStream;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// Spy backend: serves one in-memory passthrough source object, fakes a
+    /// native multipart destination, and records every abort. Failure modes
+    /// are toggled per test.
+    struct AbortSpy {
+        src_bytes: Vec<u8>,
+        src_meta: FileMetadata,
+        fail_part: AtomicBool,
+        slow_parts: AtomicBool,
+        fail_complete: AtomicBool,
+        aborts: Mutex<Vec<String>>,
+    }
+
+    impl AbortSpy {
+        fn new(src_bytes: Vec<u8>) -> Self {
+            let meta = FileMetadata::new_passthrough(
+                "src.bin".to_string(),
+                "0".repeat(64),
+                "0".repeat(32),
+                src_bytes.len() as u64,
+                Some("application/octet-stream".to_string()),
+            );
+            Self {
+                src_bytes,
+                src_meta: meta,
+                fail_part: AtomicBool::new(false),
+                slow_parts: AtomicBool::new(false),
+                fail_complete: AtomicBool::new(false),
+                aborts: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    fn nope() -> StorageError {
+        StorageError::Other("AbortSpy: not implemented".into())
+    }
+
+    #[async_trait]
+    impl StorageBackend for AbortSpy {
+        async fn create_multipart_upload(
+            &self,
+            bucket: &str,
+            _: &str,
+            _: &str,
+            _: &FileMetadata,
+        ) -> Result<MultipartUpload, StorageError> {
+            Ok(MultipartUpload {
+                bucket: bucket.to_string(),
+                upload_id: "spy-upload-1".to_string(),
+                native: true,
+                backend: None,
+            })
+        }
+        async fn upload_part(
+            &self,
+            _: &MultipartUpload,
+            _: &str,
+            _: &str,
+            part_number: i32,
+            _: Bytes,
+        ) -> Result<UploadedPart, StorageError> {
+            if self.slow_parts.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+            if self.fail_part.load(Ordering::Relaxed) {
+                return Err(StorageError::Other("injected part failure".into()));
+            }
+            Ok(UploadedPart {
+                part_number,
+                etag: format!("etag-{part_number}"),
+            })
+        }
+        async fn complete_multipart_upload(
+            &self,
+            _: &MultipartUpload,
+            _: &str,
+            _: &str,
+            _: &[UploadedPart],
+            _: &[Bytes],
+            _: &FileMetadata,
+        ) -> Result<String, StorageError> {
+            if self.fail_complete.load(Ordering::Relaxed) {
+                return Err(StorageError::Other("injected complete failure".into()));
+            }
+            Ok("final-etag".to_string())
+        }
+        async fn abort_multipart_upload(
+            &self,
+            upload: &MultipartUpload,
+            _: &str,
+            _: &str,
+        ) -> Result<(), StorageError> {
+            self.aborts.lock().unwrap().push(upload.upload_id.clone());
+            Ok(())
+        }
+
+        // Source-object reads used by the streaming copy path.
+        async fn get_passthrough_metadata(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<FileMetadata, StorageError> {
+            Ok(self.src_meta.clone())
+        }
+        async fn get_delta_metadata(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<FileMetadata, StorageError> {
+            Err(StorageError::NotFound("no delta".into()))
+        }
+        async fn get_passthrough_stream_range(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            start: u64,
+            end: u64,
+        ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), StorageError> {
+            let end = std::cmp::min(end, self.src_bytes.len() as u64 - 1);
+            let slice = self.src_bytes[start as usize..=end as usize].to_vec();
+            let len = slice.len() as u64;
+            Ok((
+                Box::pin(futures::stream::once(async move { Ok(Bytes::from(slice)) })),
+                len,
+            ))
+        }
+
+        // Required by the trait; irrelevant to these tests.
+        async fn create_bucket(&self, _: &str) -> Result<(), StorageError> {
+            Err(nope())
+        }
+        async fn delete_bucket(&self, _: &str) -> Result<(), StorageError> {
+            Err(nope())
+        }
+        async fn list_buckets(&self) -> Result<Vec<String>, StorageError> {
+            Err(nope())
+        }
+        async fn head_bucket(&self, _: &str) -> Result<bool, StorageError> {
+            Err(nope())
+        }
+        async fn get_reference(&self, _: &str, _: &str) -> Result<Vec<u8>, StorageError> {
+            Err(nope())
+        }
+        async fn put_reference(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[u8],
+            _: &FileMetadata,
+        ) -> Result<(), StorageError> {
+            Err(nope())
+        }
+        async fn put_reference_metadata(
+            &self,
+            _: &str,
+            _: &str,
+            _: &FileMetadata,
+        ) -> Result<(), StorageError> {
+            Err(nope())
+        }
+        async fn get_reference_metadata(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<FileMetadata, StorageError> {
+            Err(nope())
+        }
+        async fn has_reference(&self, _: &str, _: &str) -> bool {
+            false
+        }
+        async fn delete_reference(&self, _: &str, _: &str) -> Result<(), StorageError> {
+            Err(nope())
+        }
+        async fn get_delta(&self, _: &str, _: &str, _: &str) -> Result<Vec<u8>, StorageError> {
+            Err(nope())
+        }
+        async fn put_delta(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &[u8],
+            _: &FileMetadata,
+        ) -> Result<(), StorageError> {
+            Err(nope())
+        }
+        async fn delete_delta(&self, _: &str, _: &str, _: &str) -> Result<(), StorageError> {
+            Ok(())
+        }
+        async fn get_passthrough(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<u8>, StorageError> {
+            Err(nope())
+        }
+        async fn put_passthrough(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &[u8],
+            _: &FileMetadata,
+        ) -> Result<(), StorageError> {
+            Err(nope())
+        }
+        async fn delete_passthrough(&self, _: &str, _: &str, _: &str) -> Result<(), StorageError> {
+            Err(nope())
+        }
+        async fn get_passthrough_stream(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<BoxStream<'static, Result<Bytes, StorageError>>, StorageError> {
+            Err(nope())
+        }
+        async fn scan_deltaspace(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<FileMetadata>, StorageError> {
+            Err(nope())
+        }
+        async fn list_deltaspaces(&self, _: &str) -> Result<Vec<String>, StorageError> {
+            Err(nope())
+        }
+        async fn total_size(&self, _: Option<&str>) -> Result<u64, StorageError> {
+            Err(nope())
+        }
+        async fn bulk_list_objects(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<(String, FileMetadata)>, StorageError> {
+            Err(nope())
+        }
+    }
+
+    fn spy_engine(spy: AbortSpy) -> (Arc<DynEngine>, Arc<AbortSpy>) {
+        let spy = Arc::new(spy);
+        let backend: Box<dyn StorageBackend> = Box::new(SpyRef(spy.clone()));
+        let engine =
+            DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None);
+        (Arc::new(engine), spy)
+    }
+
+    /// Thin forwarding wrapper so the test keeps an `Arc<AbortSpy>` for
+    /// assertions while the engine owns the boxed backend.
+    struct SpyRef(Arc<AbortSpy>);
+
+    #[async_trait]
+    impl StorageBackend for SpyRef {
+        async fn create_multipart_upload(
+            &self,
+            b: &str,
+            p: &str,
+            f: &str,
+            m: &FileMetadata,
+        ) -> Result<MultipartUpload, StorageError> {
+            self.0.create_multipart_upload(b, p, f, m).await
+        }
+        async fn upload_part(
+            &self,
+            u: &MultipartUpload,
+            p: &str,
+            f: &str,
+            n: i32,
+            d: Bytes,
+        ) -> Result<UploadedPart, StorageError> {
+            self.0.upload_part(u, p, f, n, d).await
+        }
+        async fn complete_multipart_upload(
+            &self,
+            u: &MultipartUpload,
+            p: &str,
+            f: &str,
+            parts: &[UploadedPart],
+            a: &[Bytes],
+            m: &FileMetadata,
+        ) -> Result<String, StorageError> {
+            self.0.complete_multipart_upload(u, p, f, parts, a, m).await
+        }
+        async fn abort_multipart_upload(
+            &self,
+            u: &MultipartUpload,
+            p: &str,
+            f: &str,
+        ) -> Result<(), StorageError> {
+            self.0.abort_multipart_upload(u, p, f).await
+        }
+        async fn get_passthrough_metadata(
+            &self,
+            b: &str,
+            p: &str,
+            f: &str,
+        ) -> Result<FileMetadata, StorageError> {
+            self.0.get_passthrough_metadata(b, p, f).await
+        }
+        async fn get_delta_metadata(
+            &self,
+            b: &str,
+            p: &str,
+            f: &str,
+        ) -> Result<FileMetadata, StorageError> {
+            self.0.get_delta_metadata(b, p, f).await
+        }
+        async fn get_passthrough_stream_range(
+            &self,
+            b: &str,
+            p: &str,
+            f: &str,
+            s: u64,
+            e: u64,
+        ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), StorageError> {
+            self.0.get_passthrough_stream_range(b, p, f, s, e).await
+        }
+        async fn create_bucket(&self, b: &str) -> Result<(), StorageError> {
+            self.0.create_bucket(b).await
+        }
+        async fn delete_bucket(&self, b: &str) -> Result<(), StorageError> {
+            self.0.delete_bucket(b).await
+        }
+        async fn list_buckets(&self) -> Result<Vec<String>, StorageError> {
+            self.0.list_buckets().await
+        }
+        async fn head_bucket(&self, b: &str) -> Result<bool, StorageError> {
+            self.0.head_bucket(b).await
+        }
+        async fn get_reference(&self, b: &str, p: &str) -> Result<Vec<u8>, StorageError> {
+            self.0.get_reference(b, p).await
+        }
+        async fn put_reference(
+            &self,
+            b: &str,
+            p: &str,
+            d: &[u8],
+            m: &FileMetadata,
+        ) -> Result<(), StorageError> {
+            self.0.put_reference(b, p, d, m).await
+        }
+        async fn put_reference_metadata(
+            &self,
+            b: &str,
+            p: &str,
+            m: &FileMetadata,
+        ) -> Result<(), StorageError> {
+            self.0.put_reference_metadata(b, p, m).await
+        }
+        async fn get_reference_metadata(
+            &self,
+            b: &str,
+            p: &str,
+        ) -> Result<FileMetadata, StorageError> {
+            self.0.get_reference_metadata(b, p).await
+        }
+        async fn has_reference(&self, b: &str, p: &str) -> bool {
+            self.0.has_reference(b, p).await
+        }
+        async fn delete_reference(&self, b: &str, p: &str) -> Result<(), StorageError> {
+            self.0.delete_reference(b, p).await
+        }
+        async fn get_delta(&self, b: &str, p: &str, f: &str) -> Result<Vec<u8>, StorageError> {
+            self.0.get_delta(b, p, f).await
+        }
+        async fn put_delta(
+            &self,
+            b: &str,
+            p: &str,
+            f: &str,
+            d: &[u8],
+            m: &FileMetadata,
+        ) -> Result<(), StorageError> {
+            self.0.put_delta(b, p, f, d, m).await
+        }
+        async fn delete_delta(&self, b: &str, p: &str, f: &str) -> Result<(), StorageError> {
+            self.0.delete_delta(b, p, f).await
+        }
+        async fn get_passthrough(
+            &self,
+            b: &str,
+            p: &str,
+            f: &str,
+        ) -> Result<Vec<u8>, StorageError> {
+            self.0.get_passthrough(b, p, f).await
+        }
+        async fn put_passthrough(
+            &self,
+            b: &str,
+            p: &str,
+            f: &str,
+            d: &[u8],
+            m: &FileMetadata,
+        ) -> Result<(), StorageError> {
+            self.0.put_passthrough(b, p, f, d, m).await
+        }
+        async fn delete_passthrough(&self, b: &str, p: &str, f: &str) -> Result<(), StorageError> {
+            self.0.delete_passthrough(b, p, f).await
+        }
+        async fn get_passthrough_stream(
+            &self,
+            b: &str,
+            p: &str,
+            f: &str,
+        ) -> Result<BoxStream<'static, Result<Bytes, StorageError>>, StorageError> {
+            self.0.get_passthrough_stream(b, p, f).await
+        }
+        async fn scan_deltaspace(
+            &self,
+            b: &str,
+            p: &str,
+        ) -> Result<Vec<FileMetadata>, StorageError> {
+            self.0.scan_deltaspace(b, p).await
+        }
+        async fn list_deltaspaces(&self, b: &str) -> Result<Vec<String>, StorageError> {
+            self.0.list_deltaspaces(b).await
+        }
+        async fn total_size(&self, b: Option<&str>) -> Result<u64, StorageError> {
+            self.0.total_size(b).await
+        }
+        async fn bulk_list_objects(
+            &self,
+            b: &str,
+            p: &str,
+        ) -> Result<Vec<(String, FileMetadata)>, StorageError> {
+            self.0.bulk_list_objects(b, p).await
+        }
+    }
+
+    fn copy_request() -> ObjectTransferRequest<'static> {
+        ObjectTransferRequest {
+            source_bucket: "srcb",
+            source_key: "src.bin",
+            destination_bucket: "dstb",
+            destination_key: "dst.bin",
+            provenance: None,
+            strip_user_metadata_keys: &[],
+            operation: "test",
+            upload_concurrency: Some(2),
+        }
+    }
+
+    #[tokio::test]
+    async fn part_failure_aborts_the_multipart_upload() {
+        let spy = AbortSpy::new(vec![7u8; 64]);
+        spy.fail_part.store(true, Ordering::Relaxed);
+        let (engine, spy) = spy_engine(spy);
+        let meta = spy.src_meta.clone();
+
+        let res = stream_copy_passthrough(&engine, copy_request(), &meta).await;
+        assert!(res.is_err(), "part failure must surface");
+        assert_eq!(
+            spy.aborts.lock().unwrap().as_slice(),
+            &["spy-upload-1".to_string()],
+            "the Err arm must abort the multipart upload exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_failure_aborts_the_multipart_upload() {
+        let spy = AbortSpy::new(vec![7u8; 64]);
+        spy.fail_complete.store(true, Ordering::Relaxed);
+        let (engine, spy) = spy_engine(spy);
+        let meta = spy.src_meta.clone();
+
+        let res = stream_copy_passthrough(&engine, copy_request(), &meta).await;
+        assert!(res.is_err(), "complete failure must surface");
+        assert_eq!(
+            spy.aborts.lock().unwrap().as_slice(),
+            &["spy-upload-1".to_string()],
+            "finish_passthrough_multipart must abort when complete fails"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_copy_future_aborts_the_multipart_upload() {
+        let spy = AbortSpy::new(vec![7u8; 64]);
+        spy.slow_parts.store(true, Ordering::Relaxed);
+        let (engine, spy) = spy_engine(spy);
+        let meta = spy.src_meta.clone();
+
+        let eng = engine.clone();
+        let task = tokio::spawn(async move {
+            let _ = stream_copy_passthrough(&eng, copy_request(), &meta).await;
+        });
+        // Let the copy reach the (stalled) upload_part, then kill it — the
+        // abort guard's Drop must abort even while part-task Arcs unwind.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        task.abort();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if spy.aborts.lock().unwrap().len() == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "guard-drop abort never reached the backend"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 }
