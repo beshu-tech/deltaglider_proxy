@@ -802,6 +802,29 @@ async fn delete_rule(
     name: &str,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, String)> {
+    // H2: refuse to delete a replication rule with a LIVE run. Purging its DB
+    // rows out from under a running worker orphans the run and lets the in-flight
+    // copy keep going against a deleted rule. Make the operator kill the run
+    // first (409), rather than silently destroying coordination state.
+    if let (JobSubsystem::Replication, Some(db)) = (sub, state.config_db.as_ref()) {
+        let live = {
+            let db = db.lock().await;
+            matches!(
+                db.replication_latest_run_status(name)
+                    .ok()
+                    .flatten()
+                    .as_deref(),
+                Some("running") | Some("cancelling")
+            )
+        };
+        if live {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("rule '{name}' has a run in progress — kill it before deleting"),
+            ));
+        }
+    }
+
     // 1. Remove from config + persist, restoring on persist failure so memory
     //    and disk never diverge (a divergence would resurrect the rule on the
     //    next restart). The engine does NOT read replication/lifecycle rules

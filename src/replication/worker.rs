@@ -551,52 +551,57 @@ pub async fn run_rule(
     // draining wouldn't have flipped `killed` (the select! race resolved to the
     // results arm). The DB `cancelling` row is the source of truth — honor it so
     // the operator's kill is never silently overwritten by a success status.
-    if !killed {
+    let finished_at = current_unix_seconds();
+    // Settle under ONE lock: re-read the DB cancel flag, derive the terminal
+    // status, and write finish_run without releasing in between. H1 fix — a kill
+    // landing between a separate re-check and finish_run used to be overwritten
+    // by `status='succeeded'`. Holding the lock across both closes that gap; the
+    // finish UPDATE is also conditioned on the row not already being terminal.
+    let status: String = {
         let db = db.lock().await;
-        if db.replication_run_cancel_requested(run_id).unwrap_or(false) {
+        // Authoritative final kill check (see the select! race comment above):
+        // the DB `cancelling` row is the source of truth for a kill that arrived
+        // while the last page drained.
+        if !killed && db.replication_run_cancel_requested(run_id).unwrap_or(false) {
             killed = true;
         }
-    }
 
-    let status = if killed {
-        "cancelled".to_string()
-    } else if stopped_paused {
-        "stopped".to_string()
-    } else if hit_fatal_error || (had_any_error && totals.objects_copied == 0) {
-        "failed".to_string()
-    } else if had_any_error {
-        "completed_with_errors".to_string()
-    } else {
-        "succeeded".to_string()
-    };
+        let status = if killed {
+            "cancelled"
+        } else if stopped_paused {
+            "stopped"
+        } else if hit_fatal_error || (had_any_error && totals.objects_copied == 0) {
+            "failed"
+        } else if had_any_error {
+            "completed_with_errors"
+        } else {
+            "succeeded"
+        };
 
-    let finished_at = current_unix_seconds();
-    let next_due = if dest_unusable {
-        // Dead dest won't recover in a minute — back off to the rule's normal
-        // cadence (but never faster than 60s) instead of hammering every minute.
-        compute_next_due(rule, finished_at).max(finished_at + 60)
-    } else if hit_fatal_error {
-        // Tighter retry on other fatal errors (e.g. couldn't list source) so the
-        // operator-facing "next due" doesn't claim a long sleep when the worker
-        // gave up immediately.
-        finished_at + 60
-    } else {
-        compute_next_due(rule, finished_at)
-    };
+        let next_due = if dest_unusable {
+            // Dead dest won't recover in a minute — back off to the rule's normal
+            // cadence (but never faster than 60s) instead of hammering every minute.
+            compute_next_due(rule, finished_at).max(finished_at + 60)
+        } else if hit_fatal_error {
+            // Tighter retry on other fatal errors (e.g. couldn't list source) so the
+            // operator-facing "next due" doesn't claim a long sleep when the worker
+            // gave up immediately.
+            finished_at + 60
+        } else {
+            compute_next_due(rule, finished_at)
+        };
 
-    // Clear the continuation token on a clean complete pass — next run starts
-    // from the beginning. A paused stop PRESERVES the cursor so resume picks up
-    // mid-prefix; a fatal error also keeps it (poison-token guard handles bad
-    // tokens separately).
-    let clear_cursor_on_clean = !hit_fatal_error && !stopped_paused && !killed;
-
-    {
-        let db = db.lock().await;
+        // Clear the continuation token on a clean complete pass — next run starts
+        // from the beginning. A paused stop PRESERVES the cursor so resume picks up
+        // mid-prefix; a fatal error also keeps it (poison-token guard handles bad
+        // tokens separately).
+        let clear_cursor_on_clean = !hit_fatal_error && !stopped_paused && !killed;
         if clear_cursor_on_clean {
             db.replication_set_continuation_token(&rule.name, None)?;
         }
-        db.replication_finish_run(run_id, &rule.name, &status, finished_at, totals, next_due)?;
-    }
+        db.replication_finish_run(run_id, &rule.name, status, finished_at, totals, next_due)?;
+        status.to_string()
+    };
     // Settle barrier: bump AFTER the terminal row is written so a test polling
     // the run-version sees the settled run. The single chokepoint all scheduled
     // runs pass through.
