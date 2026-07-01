@@ -998,10 +998,36 @@ pub async fn wait_for_replication_event(client: &reqwest::Client, endpoint: &str
 /// status, then return that run object. `run-now` is fire-and-forget (202) — a
 /// large sync can't block the HTTP response — so tests assert on the settled
 /// run-history row (`objects_processed`, `status`), not the run-now response.
+///
+/// Firing run-now MORE THAN ONCE in a test? Baseline with [`latest_run_id`]
+/// before the fire and use [`wait_for_run_after`] — the new run's history row
+/// only appears once its background task starts, so this max-id variant can
+/// return the PREVIOUS run's terminal row.
 pub async fn wait_for_run(
     admin: &reqwest::Client,
     endpoint: &str,
     rule: &str,
+) -> serde_json::Value {
+    wait_for_run_after(admin, endpoint, rule, -1).await
+}
+
+/// `id` of the newest run in a rule's history, or 0 when none exists yet.
+pub async fn latest_run_id(admin: &reqwest::Client, endpoint: &str, rule: &str) -> i64 {
+    let url = format!("{endpoint}/_/api/admin/jobs/replication:{rule}/runs");
+    let h: serde_json::Value = admin.get(&url).send().await.unwrap().json().await.unwrap();
+    h["runs"]
+        .as_array()
+        .and_then(|r| r.iter().filter_map(|x| x["id"].as_i64()).max())
+        .unwrap_or(0)
+}
+
+/// Like [`wait_for_run`] but only accepts a run with `id > after_id` — the
+/// baseline that makes back-to-back run-now assertions race-free.
+pub async fn wait_for_run_after(
+    admin: &reqwest::Client,
+    endpoint: &str,
+    rule: &str,
+    after_id: i64,
 ) -> serde_json::Value {
     let url = format!("{endpoint}/_/api/admin/jobs/replication:{rule}/runs");
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
@@ -1011,17 +1037,20 @@ pub async fn wait_for_run(
             r.iter()
                 .max_by_key(|x| x["id"].as_i64().unwrap_or(i64::MIN))
         }) {
+            let id = run["id"].as_i64().unwrap_or(0);
             let st = run["status"].as_str().unwrap_or("");
-            if matches!(
-                st,
-                "succeeded" | "failed" | "completed_with_errors" | "cancelled" | "stopped"
-            ) {
+            if id > after_id
+                && matches!(
+                    st,
+                    "succeeded" | "failed" | "completed_with_errors" | "cancelled" | "stopped"
+                )
+            {
                 return run.clone();
             }
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "run for rule '{rule}' did not settle in 60s; last history: {h}"
+            "new run (id > {after_id}) for rule '{rule}' did not settle in 60s; last history: {h}"
         );
         sleep(Duration::from_millis(200)).await;
     }

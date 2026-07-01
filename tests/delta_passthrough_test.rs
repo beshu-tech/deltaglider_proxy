@@ -19,7 +19,7 @@
 mod common;
 
 use aws_sdk_s3::primitives::ByteStream;
-use common::{admin_http_client, generate_binary, mutate_binary, wait_for_run, TestServer};
+use common::{admin_http_client, generate_binary, mutate_binary, TestServer};
 use serde_json::Value;
 
 const RULE_YAML: &str = "
@@ -70,6 +70,10 @@ async fn put_tar(server: &TestServer, bucket: &str, key: &str, body: Vec<u8>) {
 
 async fn run_now(server: &TestServer) -> Value {
     let admin = admin_http_client(&server.endpoint()).await;
+    // Baseline BEFORE firing: the new run's history row only appears when its
+    // background task starts, so waiting on max-id could return the PREVIOUS
+    // settled run (this helper fires twice in the idempotency test).
+    let before = common::latest_run_id(&admin, &server.endpoint(), "dp-rule").await;
     let resp = admin
         .post(format!(
             "{}/_/api/admin/jobs/replication:dp-rule/run-now",
@@ -81,7 +85,7 @@ async fn run_now(server: &TestServer) -> Value {
     // Fire-and-forget (202); return the SETTLED run-history row (has `status`
     // and `objects_processed`).
     assert_eq!(resp.status().as_u16(), 202, "run-now accepted");
-    wait_for_run(&admin, &server.endpoint(), "dp-rule").await
+    common::wait_for_run_after(&admin, &server.endpoint(), "dp-rule", before).await
 }
 
 async fn latest_run(server: &TestServer) -> Value {

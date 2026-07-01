@@ -601,7 +601,7 @@ async fn test_replication_normalizes_prefixes_at_worker_boundaries() {
 const MIDRUN_PAUSE_RULE_YAML: &str = "
 replication:
   enabled: true
-  tick_interval: \"30s\"
+  tick_interval: \"1s\"
   rules:
     - name: midpause-rule
       enabled: true
@@ -615,12 +615,10 @@ replication:
       batch_size: 1
 ";
 
-/// A pause issued WHILE a run is in flight must stop the run promptly — not let
-/// it run to completion. (The bug: pause only blocked the scheduler from
-/// STARTING a run; the worker never re-checked the flag mid-sweep, so a paused
-/// run kept going and lingered as "running".) The worker now re-reads the DB
-/// `paused` flag at every page boundary, settles as a terminal (cancelled)
-/// status, and preserves the cursor for resume.
+/// A pause issued WHILE a SCHEDULED run is in flight must stop the run
+/// promptly — not let it run to completion. (One-offs are the opposite
+/// contract: run-now ignores pause and is stopped by KILL, so this test uses a
+/// scheduler-started run — tick_interval 1s — as the pause target.)
 ///
 /// Deterministic enough: `batch_size: 1` makes each object its own page, so the
 /// page-boundary check fires between every object; with 60 objects and a pause
@@ -651,19 +649,28 @@ async fn test_replication_pause_mid_run_stops_promptly_and_preserves_cursor() {
     let admin = admin_http_client(&server.endpoint()).await;
     let ep = server.endpoint();
 
-    // Fire run-now (fire-and-forget, 202), then pause almost immediately so the
-    // pause lands while the background worker is still paginating.
-    let resp = admin
-        .post(format!(
-            "{ep}/_/api/admin/jobs/replication:midpause-rule/run-now"
-        ))
-        .send()
-        .await
-        .expect("run-now");
-    assert_eq!(resp.status().as_u16(), 202, "run-now accepted");
-
-    // Let a few pages copy, then pause.
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    // Wait for the SCHEDULER to start a run (tick 1s; next_due_at starts 0),
+    // then pause while it is still paginating.
+    let runs_url = format!("{ep}/_/api/admin/jobs/replication:midpause-rule/runs");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let h: Value = admin
+            .get(&runs_url)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if newest_run(&h).is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "scheduler never started a run: {h}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     let p = admin
         .post(format!(
             "{ep}/_/api/admin/jobs/replication:midpause-rule/pause"
@@ -757,9 +764,12 @@ async fn test_replication_pause_mid_run_stops_promptly_and_preserves_cursor() {
     );
 }
 
-/// A paused rule must return 409 on run-now until resumed.
+/// A run-now on a PAUSED rule is a deliberate one-off: it must actually
+/// REPLICATE (pause governs the scheduler, kill stops a running one-off) and
+/// leave the rule paused. Regression for the tautology where the one-off was
+/// accepted (202) but the worker's page-0 pause check silently copied nothing.
 #[tokio::test]
-async fn test_replication_paused_rule_blocks_run_now() {
+async fn test_replication_paused_rule_one_off_actually_copies() {
     let server = TestServer::builder()
         .auth("bootstrap_key", "bootstrap_secret")
         .extra_yaml_storage_section(PAUSED_RULE_YAML)
@@ -768,6 +778,16 @@ async fn test_replication_paused_rule_blocks_run_now() {
     let client = server.s3_client().await;
     for b in ["p-src", "p-dst"] {
         client.create_bucket().bucket(b).send().await.ok();
+    }
+    for i in 0..3 {
+        client
+            .put_object()
+            .bucket("p-src")
+            .key(format!("obj-{i}.txt"))
+            .body(ByteStream::from(format!("payload-{i}").into_bytes()))
+            .send()
+            .await
+            .expect("seed");
     }
     let admin = admin_http_client(&server.endpoint()).await;
 
@@ -782,32 +802,21 @@ async fn test_replication_paused_rule_blocks_run_now() {
         .expect("pause");
     assert_eq!(resp.status().as_u16(), 204);
 
-    // run-now is a deliberate ONE-OFF: it runs even a paused rule once (202),
-    // without un-pausing it.
-    let resp = admin
-        .post(format!(
-            "{}/_/api/admin/jobs/replication:paused-rule/run-now",
-            server.endpoint()
-        ))
+    // The one-off runs to completion DESPITE the pause and copies everything.
+    let run = fire_run_now(&admin, &server.endpoint(), "paused-rule").await;
+    assert_eq!(
+        run["status"].as_str(),
+        Some("succeeded"),
+        "paused one-off must complete: {run}"
+    );
+    assert_eq!(run["objects_processed"].as_i64(), Some(3), "{run}");
+    let dst = client
+        .list_objects_v2()
+        .bucket("p-dst")
         .send()
         .await
-        .expect("run-now");
-    assert_eq!(
-        resp.status().as_u16(),
-        202,
-        "paused rule still runs one-off"
-    );
-    let run = wait_for_latest_run(&admin, &server.endpoint(), "paused-rule").await;
-    // The one-off is accepted (202) and starts, but the background worker now
-    // honors the paused flag mid-run and stops promptly (settles stopped/
-    // cancelled). Either way it did NOT error and copied nothing (empty source).
-    assert!(
-        matches!(
-            run["status"].as_str(),
-            Some("succeeded") | Some("stopped") | Some("cancelled")
-        ),
-        "paused one-off must settle terminal without error: {run}"
-    );
+        .unwrap();
+    assert_eq!(dst.contents().len(), 3, "one-off copied all seeded objects");
 
     // The rule is STILL paused after the one-off (run-now doesn't resume it).
     let jobs: Value = admin
@@ -1119,6 +1128,25 @@ replication:
         .send()
         .await
         .expect("one-off copied the object to dest");
+
+    // The one-off must NOT flip the rule enabled — the scheduler stays off.
+    let jobs: Value = admin
+        .get(format!("{}/_/api/admin/jobs", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let enabled = jobs["jobs"]
+        .as_array()
+        .and_then(|a| a.iter().find(|j| j["id"] == "replication:disabled-rule"))
+        .and_then(|j| j["enabled"].as_bool());
+    assert_eq!(
+        enabled,
+        Some(false),
+        "one-off must not enable the rule: {jobs}"
+    );
 }
 
 #[tokio::test]
@@ -1887,4 +1915,450 @@ async fn test_replication_content_diff_converges_then_copies_real_change() {
         b"bravo-CHANGED-and-longer",
         "dest reflects the new content"
     );
+}
+
+// ───────────────────────── kill / delete / truncation ─────────────────────────
+// The kill feature shipped three fix waves with ZERO tests calling the kill
+// action; these are the regression pins for the whole control surface.
+
+/// POST kill until the worker's run is killable (202) — tolerates the window
+/// before the background run row exists (409 "no running run to kill").
+async fn fire_kill(admin: &reqwest::Client, endpoint: &str, rule: &str) {
+    let url = format!("{endpoint}/_/api/admin/jobs/replication:{rule}/kill");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let code = admin
+            .post(&url)
+            .send()
+            .await
+            .expect("kill")
+            .status()
+            .as_u16();
+        if code == 202 {
+            return;
+        }
+        assert_eq!(code, 409, "kill: unexpected status {code}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "kill for '{rule}' kept returning 409 (run never became killable)"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+const KILL_RULE_YAML: &str = "
+replication:
+  enabled: true
+  tick_interval: \"30s\"
+  rules:
+    - name: kill-rule
+      enabled: true
+      source:
+        bucket: kr-src
+        prefix: \"\"
+      destination:
+        bucket: kr-dst
+        prefix: \"\"
+      interval: \"1h\"
+      batch_size: 1
+";
+
+/// Kill mid-run: the run settles `cancelled`, copying STOPS (dest count is
+/// stable after settle), and a later run-now resumes and drains the rest.
+#[tokio::test]
+async fn test_replication_kill_mid_run_settles_cancelled_and_stops_copying() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(KILL_RULE_YAML)
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    for b in ["kr-src", "kr-dst"] {
+        client.create_bucket().bucket(b).send().await.ok();
+    }
+    for i in 0..150 {
+        client
+            .put_object()
+            .bucket("kr-src")
+            .key(format!("obj-{i:03}.txt"))
+            .body(ByteStream::from(format!("payload-{i}").into_bytes()))
+            .send()
+            .await
+            .expect("seed");
+    }
+    let admin = admin_http_client(&server.endpoint()).await;
+    let ep = server.endpoint();
+
+    let resp = admin
+        .post(format!(
+            "{ep}/_/api/admin/jobs/replication:kill-rule/run-now"
+        ))
+        .send()
+        .await
+        .expect("run-now");
+    assert_eq!(resp.status().as_u16(), 202);
+
+    fire_kill(&admin, &ep, "kill-rule").await;
+    let run = wait_for_latest_run(&admin, &ep, "kill-rule").await;
+    assert_eq!(
+        run["status"].as_str(),
+        Some("cancelled"),
+        "killed run must settle cancelled, never succeeded: {run}"
+    );
+    let copied = run["objects_processed"].as_i64().unwrap_or(-1);
+    assert!(
+        (0..150).contains(&copied),
+        "killed run must stop before copying everything: {run}"
+    );
+
+    // Copying actually STOPPED: the dest count is stable after settle.
+    let count_a = client
+        .list_objects_v2()
+        .bucket("kr-dst")
+        .send()
+        .await
+        .unwrap()
+        .contents()
+        .len();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let count_b = client
+        .list_objects_v2()
+        .bucket("kr-dst")
+        .send()
+        .await
+        .unwrap()
+        .contents()
+        .len();
+    assert_eq!(count_a, count_b, "no copies after a settled kill");
+    assert!(count_b < 150, "kill left the sweep incomplete");
+
+    // A later one-off drains the tail (cursor preserved by the kill settle).
+    let mut guard = 0;
+    loop {
+        let run = fire_run_now(&admin, &ep, "kill-rule").await;
+        let dst = client
+            .list_objects_v2()
+            .bucket("kr-dst")
+            .send()
+            .await
+            .unwrap()
+            .contents()
+            .len();
+        if dst >= 150 {
+            break;
+        }
+        guard += 1;
+        assert!(
+            guard < 10,
+            "post-kill drain never completed: last run {run}"
+        );
+    }
+}
+
+const KILLDEL_RULE_YAML: &str = "
+replication:
+  enabled: true
+  tick_interval: \"30s\"
+  rules:
+    - name: killdel-rule
+      enabled: true
+      replicate_deletes: true
+      source:
+        bucket: kd-src
+        prefix: \"\"
+      destination:
+        bucket: kd-dst
+        prefix: \"\"
+      interval: \"1h\"
+      batch_size: 1
+";
+
+/// Kill during the DELETE pass (the run's only destructive phase): a killed
+/// run must stop deleting destination objects, not grind through the sweep
+/// and then claim "cancelled".
+#[tokio::test]
+async fn test_replication_kill_stops_delete_pass() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(KILLDEL_RULE_YAML)
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    for b in ["kd-src", "kd-dst"] {
+        client.create_bucket().bucket(b).send().await.ok();
+    }
+    for i in 0..150 {
+        client
+            .put_object()
+            .bucket("kd-src")
+            .key(format!("obj-{i:03}.txt"))
+            .body(ByteStream::from(format!("payload-{i}").into_bytes()))
+            .send()
+            .await
+            .expect("seed");
+    }
+    let admin = admin_http_client(&server.endpoint()).await;
+    let ep = server.endpoint();
+
+    // Run 1: full replication (stamps the provenance markers the delete pass
+    // requires).
+    let run = fire_run_now(&admin, &ep, "killdel-rule").await;
+    assert_eq!(run["status"].as_str(), Some("succeeded"), "{run}");
+
+    // Remove every source object → run 2's delete pass wants to delete all
+    // 150 dest objects, one page each (batch_size 1).
+    for i in 0..150 {
+        client
+            .delete_object()
+            .bucket("kd-src")
+            .key(format!("obj-{i:03}.txt"))
+            .send()
+            .await
+            .expect("unseed");
+    }
+
+    let before = latest_run_id(&admin, &ep, "killdel-rule").await;
+    let resp = admin
+        .post(format!(
+            "{ep}/_/api/admin/jobs/replication:killdel-rule/run-now"
+        ))
+        .send()
+        .await
+        .expect("run-now");
+    assert_eq!(resp.status().as_u16(), 202);
+
+    fire_kill(&admin, &ep, "killdel-rule").await;
+    let run = wait_for_run_after(&admin, &ep, "killdel-rule", before).await;
+    assert_eq!(
+        run["status"].as_str(),
+        Some("cancelled"),
+        "killed delete-pass run settles cancelled: {run}"
+    );
+
+    // The kill landed before the sweep finished: destination objects survive,
+    // and the count is stable after settle (deleting actually STOPPED).
+    let count_a = client
+        .list_objects_v2()
+        .bucket("kd-dst")
+        .send()
+        .await
+        .unwrap()
+        .contents()
+        .len();
+    assert!(
+        count_a > 0,
+        "killed delete pass must leave destination objects behind"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let count_b = client
+        .list_objects_v2()
+        .bucket("kd-dst")
+        .send()
+        .await
+        .unwrap()
+        .contents()
+        .len();
+    assert_eq!(count_a, count_b, "no deletions after a settled kill");
+}
+
+const DELRULE_YAML: &str = "
+replication:
+  enabled: true
+  tick_interval: \"30s\"
+  rules:
+    - name: del-rule
+      enabled: true
+      source:
+        bucket: dr-src
+        prefix: \"\"
+      destination:
+        bucket: dr-dst
+        prefix: \"\"
+      interval: \"1h\"
+      batch_size: 1
+";
+
+/// H2 regression: deleting a rule with a live run is refused (409) — even in
+/// the acquire-to-run-row gap right after run-now's 202, because the LEASE is
+/// the liveness anchor. After kill+settle the delete succeeds and purges the
+/// rule everywhere.
+#[tokio::test]
+async fn test_replication_delete_rule_refused_under_live_run_then_succeeds() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(DELRULE_YAML)
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    for b in ["dr-src", "dr-dst"] {
+        client.create_bucket().bucket(b).send().await.ok();
+    }
+    for i in 0..150 {
+        client
+            .put_object()
+            .bucket("dr-src")
+            .key(format!("obj-{i:03}.txt"))
+            .body(ByteStream::from(format!("payload-{i}").into_bytes()))
+            .send()
+            .await
+            .expect("seed");
+    }
+    let admin = admin_http_client(&server.endpoint()).await;
+    let ep = server.endpoint();
+    let delete_url = format!("{ep}/_/api/admin/jobs/replication:del-rule/delete");
+
+    let resp = admin
+        .post(format!(
+            "{ep}/_/api/admin/jobs/replication:del-rule/run-now"
+        ))
+        .send()
+        .await
+        .expect("run-now");
+    assert_eq!(resp.status().as_u16(), 202);
+
+    // IMMEDIATELY after the 202 the run row may not exist yet — but the lease
+    // does, so the delete must already be refused (the exact race H2 had).
+    let code = admin
+        .post(&delete_url)
+        .send()
+        .await
+        .expect("delete")
+        .status()
+        .as_u16();
+    assert_eq!(code, 409, "delete under a live run (lease held) must 409");
+
+    fire_kill(&admin, &ep, "del-rule").await;
+    let run = wait_for_latest_run(&admin, &ep, "del-rule").await;
+    assert_eq!(run["status"].as_str(), Some("cancelled"), "{run}");
+
+    // The spawned task releases the lease just after settle — tolerate the
+    // brief 409 window, then the delete must go through.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let code = admin
+            .post(&delete_url)
+            .send()
+            .await
+            .expect("delete")
+            .status()
+            .as_u16();
+        if code == 204 {
+            break;
+        }
+        assert_eq!(code, 409, "delete after settle: unexpected {code}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "delete kept 409ing after the run settled"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // Gone from the jobs list, runs endpoint, and run-now 404s.
+    let jobs: Value = admin
+        .get(format!("{ep}/_/api/admin/jobs"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        !jobs["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|j| j["id"] == "replication:del-rule"),
+        "deleted rule must vanish from the jobs list: {jobs}"
+    );
+    let code = admin
+        .post(format!(
+            "{ep}/_/api/admin/jobs/replication:del-rule/run-now"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16();
+    assert_eq!(code, 404, "run-now on a deleted rule is 404");
+}
+
+const TRUNC_RULE_YAML: &str = "
+replication:
+  enabled: true
+  tick_interval: \"30s\"
+  rules:
+    - name: trunc-rule
+      enabled: true
+      source:
+        bucket: tr-src
+        prefix: \"\"
+      destination:
+        bucket: tr-dst
+        prefix: \"\"
+      interval: \"1h\"
+      batch_size: 1
+";
+
+/// Page-budget truncation regression: a truncated forward pass must settle
+/// "stopped" (NOT "succeeded") and KEEP the cursor so later runs drain the
+/// tail — the bug settled succeeded + cleared the cursor, permanently
+/// orphaning every object past the budget.
+#[tokio::test]
+async fn test_replication_budget_truncation_keeps_cursor_and_resumes() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .env("DGP_TEST_MAX_JOB_PAGES", "2")
+        .extra_yaml_storage_section(TRUNC_RULE_YAML)
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    for b in ["tr-src", "tr-dst"] {
+        client.create_bucket().bucket(b).send().await.ok();
+    }
+    for i in 0..5 {
+        client
+            .put_object()
+            .bucket("tr-src")
+            .key(format!("obj-{i}.txt"))
+            .body(ByteStream::from(format!("payload-{i}").into_bytes()))
+            .send()
+            .await
+            .expect("seed");
+    }
+    let admin = admin_http_client(&server.endpoint()).await;
+    let ep = server.endpoint();
+
+    // Run 1: 2-page budget over 5 one-object pages → truncated. Must be
+    // "stopped" with exactly 2 copied — and the cursor kept.
+    let run = fire_run_now(&admin, &ep, "trunc-rule").await;
+    // The jobs view folds stopped→cancelled for display; the RAW status is the
+    // settle contract under test.
+    assert_eq!(
+        run["status_raw"].as_str(),
+        Some("stopped"),
+        "truncated pass must NOT claim success: {run}"
+    );
+    assert_eq!(run["objects_processed"].as_i64(), Some(2), "{run}");
+
+    // Run 2 RESUMES from the cursor: 2 more, no re-copying (processed==2).
+    let run = fire_run_now(&admin, &ep, "trunc-rule").await;
+    assert_eq!(run["objects_processed"].as_i64(), Some(2), "resumed: {run}");
+    let dst = client
+        .list_objects_v2()
+        .bucket("tr-dst")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dst.contents().len(), 4, "two runs drained four objects");
+
+    // Run 3 finishes the tail cleanly.
+    let run = fire_run_now(&admin, &ep, "trunc-rule").await;
+    assert_eq!(run["status"].as_str(), Some("succeeded"), "{run}");
+    let dst = client
+        .list_objects_v2()
+        .bucket("tr-dst")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dst.contents().len(), 5, "tail fully drained across runs");
 }
