@@ -808,37 +808,46 @@ async fn delete_rule(
     name: &str,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, String)> {
-    // H2: refuse to delete a replication rule with a LIVE run. Purging its DB
-    // rows out from under a running worker orphans the run and lets the in-flight
-    // copy keep going against a deleted rule. Make the operator kill the run
-    // first (409), rather than silently destroying coordination state.
-    if let (JobSubsystem::Replication, Some(db)) = (sub, state.config_db.as_ref()) {
-        let live = {
-            let db = db.lock().await;
-            matches!(
+    // ONE critical section (config.write OUTER → db.lock INNER, the codebase
+    // order): liveness check, config retain+persist, and the DB row purge all
+    // under the same guards. Holding the db lock across the purge closes the
+    // H2 race — run-now/scheduler acquire the lease under this same lock, and
+    // the LEASE (taken before the run row exists) is the liveness anchor.
+    {
+        let mut cfg = state.config.write().await;
+        let db_guard = match state.config_db.as_ref() {
+            Some(db) => Some(db.lock().await),
+            None => None,
+        };
+
+        // H2: refuse to delete a replication rule with a LIVE run — a running
+        // row, a cancelling row, OR an unexpired lease (acquired pre-spawn).
+        if let (JobSubsystem::Replication, Some(db)) = (sub, db_guard.as_ref()) {
+            let run_live = matches!(
                 db.replication_latest_run_status(name)
                     .ok()
                     .flatten()
                     .as_deref(),
                 Some("running") | Some("cancelling")
-            )
-        };
-        if live {
-            return Err((
-                StatusCode::CONFLICT,
-                format!("rule '{name}' has a run in progress — kill it before deleting"),
-            ));
+            );
+            let lease_live = db
+                .replication_lease_is_held(
+                    name,
+                    crate::replication::state_store::current_unix_seconds(),
+                )
+                .unwrap_or(false);
+            if run_live || lease_live {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!("rule '{name}' has a run in progress — kill it before deleting"),
+                ));
+            }
         }
-    }
 
-    // 1. Remove from config + persist, restoring on persist failure so memory
-    //    and disk never diverge (a divergence would resurrect the rule on the
-    //    next restart). The engine does NOT read replication/lifecycle rules
-    //    (not in engine_affecting_fields_changed), so no engine rebuild is
-    //    needed — and skipping it removes a failure surface that has nothing to
-    //    do with rule removal (e.g. a momentarily-unreachable backend).
-    let remaining: Vec<String> = {
-        let mut cfg = state.config.write().await;
+        // Remove from config + persist, restoring on persist failure so memory
+        // and disk never diverge (a divergence would resurrect the rule on the
+        // next restart). The engine does NOT read replication/lifecycle rules,
+        // so no engine rebuild is needed.
         let rollback = cfg.clone();
         let existed = match sub {
             JobSubsystem::Replication => {
@@ -864,7 +873,7 @@ async fn delete_rule(
                 format!("rule delete FAILED to persist to {path} (rolled back, no change): {e}"),
             ));
         }
-        match sub {
+        let remaining: Vec<String> = match sub {
             JobSubsystem::Replication => cfg
                 .replication
                 .rules
@@ -873,21 +882,21 @@ async fn delete_rule(
                 .collect(),
             JobSubsystem::Lifecycle => cfg.lifecycle.rules.iter().map(|r| r.name.clone()).collect(),
             JobSubsystem::Maintenance => unreachable!(),
-        }
-    };
-
-    // 2. Purge the deleted rule's DB rows (state/parity/history/failures).
-    if let Some(db) = state.config_db.as_ref() {
-        let db = db.lock().await;
-        let res = match sub {
-            JobSubsystem::Replication => db.replication_reconcile_rules(&remaining),
-            JobSubsystem::Lifecycle => db.lifecycle_reconcile_rules(&remaining),
-            JobSubsystem::Maintenance => unreachable!(),
         };
-        if let Err(e) = res {
-            // Config is already deleted+persisted; orphan rows are harmless and
-            // get pruned on next boot. Log, don't fail the delete.
-            tracing::warn!("rule '{name}' deleted but DB row purge failed: {e}");
+
+        // Purge the deleted rule's DB rows under the SAME db guard as the
+        // liveness check — no window for a run to start in between.
+        if let Some(db) = db_guard.as_ref() {
+            let res = match sub {
+                JobSubsystem::Replication => db.replication_reconcile_rules(&remaining),
+                JobSubsystem::Lifecycle => db.lifecycle_reconcile_rules(&remaining),
+                JobSubsystem::Maintenance => unreachable!(),
+            };
+            if let Err(e) = res {
+                // Config is already deleted+persisted; orphan rows are harmless
+                // and get pruned on next boot. Log, don't fail the delete.
+                tracing::warn!("rule '{name}' deleted but DB row purge failed: {e}");
+            }
         }
     }
 

@@ -380,6 +380,23 @@ impl ConfigDb {
         )
     }
 
+    /// True when ANY owner holds an unexpired lease on the rule — the liveness
+    /// anchor for delete-vs-run: a lease is taken BEFORE the run row exists,
+    /// so a run-row check alone races the acquire-then-spawn gap.
+    pub fn replication_lease_is_held(
+        &self,
+        rule_name: &str,
+        now: i64,
+    ) -> Result<bool, ConfigDbError> {
+        job_store::lease_is_held(
+            &self.conn,
+            "replication_state",
+            "rule_name",
+            &rule_name,
+            now,
+        )
+    }
+
     /// Begin a new run. Returns the newly-assigned history row id.
     pub fn replication_begin_run(
         &self,

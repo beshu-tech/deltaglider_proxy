@@ -128,6 +128,22 @@ pub async fn run_now(
         // releases the lease normally, leaving `paused` untouched.
     }
 
+    // Post-acquire re-check: delete_rule holds the config lock while it checks
+    // our lease, so if the rule vanished here we lost that race — back out.
+    if !state
+        .config
+        .read()
+        .await
+        .replication
+        .rules
+        .iter()
+        .any(|r| r.name == rule.name)
+    {
+        let db = db_arc.lock().await;
+        let _ = db.replication_release_lease(&rule.name, &lease_owner);
+        return Err((StatusCode::NOT_FOUND, "rule was deleted".to_string()));
+    }
+
     info!("Replication run-now via admin API: rule='{}'", name);
 
     crate::audit::audit_log(

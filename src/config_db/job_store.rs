@@ -129,6 +129,31 @@ pub(crate) fn release_leader_lease(
     Ok(n > 0)
 }
 
+/// True when SOME owner holds an unexpired lease on `key`. The liveness
+/// probe for "is a worker (possibly not yet visible via a run row) active" —
+/// consistent with the acquire/renew tiling: held while `expires_at >= now`.
+pub(crate) fn lease_is_held(
+    conn: &Connection,
+    table: &str,
+    key_col: &str,
+    key: &dyn ToSql,
+    now: i64,
+) -> Result<bool, ConfigDbError> {
+    check_idents(&[table, key_col])?;
+    let held: i64 = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM {table}
+              WHERE {key_col} = ?
+                AND leader_instance_id IS NOT NULL
+                AND leader_expires_at IS NOT NULL
+                AND leader_expires_at >= ?"
+        ),
+        params![key, now],
+        |row| row.get(0),
+    )?;
+    Ok(held > 0)
+}
+
 /// Clear every expired lease in `table` (boot reconcile).
 pub(crate) fn clear_stale_leases(
     conn: &Connection,

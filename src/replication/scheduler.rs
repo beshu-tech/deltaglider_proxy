@@ -39,7 +39,7 @@ pub fn spawn_scheduler(
 
             let replication = { config.read().await.replication.clone() };
             if replication.enabled {
-                run_due_rules(&replication, &db, &state, &instance_id).await;
+                run_due_rules(&replication, &config, &db, &state, &instance_id).await;
             } else {
                 debug!("Replication scheduler skipped: global replication disabled");
             }
@@ -49,6 +49,7 @@ pub fn spawn_scheduler(
 
 async fn run_due_rules(
     replication: &ReplicationConfig,
+    config: &SharedConfig,
     db: &Arc<Mutex<ConfigDb>>,
     state: &Arc<AppState>,
     instance_id: &str,
@@ -101,6 +102,21 @@ async fn run_due_rules(
         };
 
         if !should_run {
+            continue;
+        }
+
+        // Post-acquire re-check against the LIVE config: delete_rule verifies
+        // our lease under the config lock, so a vanished rule = we lost the race.
+        if !config
+            .read()
+            .await
+            .replication
+            .rules
+            .iter()
+            .any(|r| r.name == rule.name)
+        {
+            let db = db.lock().await;
+            let _ = db.replication_release_lease(&rule.name, instance_id);
             continue;
         }
 
