@@ -1452,7 +1452,10 @@ mod tests {
         let users = probe_bak_users(&bak, "$2b$04$whatever");
         assert_eq!(users, Some(0), "junk bak opens but has no users");
         let promotable = users.is_some_and(|n| n > 0);
-        assert!(!promotable, "the Err-branch promote gate must refuse a junk bak");
+        assert!(
+            !promotable,
+            "the Err-branch promote gate must refuse a junk bak"
+        );
     }
 
     // ── startup_declarative_action policy (IaC cold-start guards) ──────────

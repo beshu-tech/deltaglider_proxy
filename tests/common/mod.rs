@@ -736,12 +736,11 @@ pub async fn put_object(
         .send()
         .await
         .expect("PUT failed");
-    assert!(
-        resp.status().is_success(),
-        "PUT {} failed: {}",
-        key,
-        resp.status()
-    );
+    if !resp.status().is_success() {
+        let st = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        panic!("PUT {} failed: {} body={}", key, st, body);
+    }
     resp
 }
 
