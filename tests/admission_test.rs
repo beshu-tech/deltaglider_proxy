@@ -14,7 +14,7 @@
 
 mod common;
 
-use common::{admin_http_client, TestServer};
+use common::{admin_http_client, metrics_text, prometheus_counter_has_labels, TestServer};
 use reqwest::StatusCode;
 use serde_json::json;
 
@@ -511,6 +511,20 @@ admission:
     assert!(
         body.contains("admission-deny:block-unauth-put"),
         "error message must name the matched block: {body}"
+    );
+
+    let metrics = metrics_text(&server.endpoint()).await;
+    assert!(
+        prometheus_counter_has_labels(
+            &metrics,
+            "deltaglider_http_requests_total",
+            &[
+                "method=\"PUT\"",
+                "status=\"403\"",
+                "operation=\"put_object\""
+            ],
+        ),
+        "admission short-circuit denial should increment sanitized PUT/403/put_object metrics"
     );
 }
 

@@ -1221,6 +1221,34 @@ pub async fn metrics_snapshot(endpoint: &str) -> MetricsSnapshot {
     snap
 }
 
+pub async fn metrics_text(endpoint: &str) -> String {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("metrics client");
+    let url = format!("{}/_/metrics", endpoint);
+    client
+        .get(&url)
+        .send()
+        .await
+        .expect("GET /_/metrics failed")
+        .text()
+        .await
+        .expect("read /_/metrics body")
+}
+
+pub fn prometheus_counter_has_labels(metrics: &str, name: &str, labels: &[&str]) -> bool {
+    metrics.lines().any(|line| {
+        if !line.starts_with(name) || labels.iter().any(|label| !line.contains(label)) {
+            return false;
+        }
+        line.rsplit_once(' ')
+            .and_then(|(_, value)| value.trim().parse::<f64>().ok())
+            .map(|value| value > 0.0)
+            .unwrap_or(false)
+    })
+}
+
 /// Mutate binary data by changing a percentage of bytes
 pub fn mutate_binary(data: &[u8], change_ratio: f64) -> Vec<u8> {
     let mut result = data.to_vec();
