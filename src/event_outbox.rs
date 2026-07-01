@@ -1190,6 +1190,52 @@ mod tests {
     }
 
     #[test]
+    fn cursor_heartbeat_bumps_updated_at_without_advancing() {
+        let db = ConfigDb::in_memory("test-pass").unwrap();
+        db.listener_cursor_advance("replication", 5, 100).unwrap();
+        // Zero-advance heartbeat: same id, later now → updated_at moves, id doesn't.
+        db.listener_cursor_advance("replication", 5, 5000).unwrap();
+        let full = db
+            .listener_cursor_load_full("replication")
+            .unwrap()
+            .unwrap();
+        assert_eq!(full.last_event_id, 5);
+        assert_eq!(full.updated_at, 5000);
+    }
+
+    #[test]
+    fn stale_cursor_still_pins_operator_purge_floor() {
+        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let below = db.event_outbox_insert(&event_at(10, "below")).unwrap();
+        let above = db.event_outbox_insert(&event_at(10, "above")).unwrap();
+        for id in [below, above] {
+            db.event_outbox_mark_failed(id, "dead", None).unwrap();
+        }
+        // Cursor between the two rows, last bumped ages ago (stalled consumer).
+        db.listener_cursor_advance("replication", below, 100)
+            .unwrap();
+        // The staleness-filtered floor evaporates (background pruner semantics) …
+        assert_eq!(
+            db.event_outbox_min_active_listener_cursor(1_000_000, 60 * 60)
+                .unwrap(),
+            None
+        );
+        // … but the operator floor (no staleness filter) stays pinned: the
+        // unconsumed `above` row still blocks the purge.
+        let floor = db
+            .event_outbox_min_listener_cursor()
+            .unwrap()
+            .unwrap_or(i64::MAX);
+        assert_eq!(floor, below);
+        assert_eq!(db.event_outbox_failed_above_floor(floor).unwrap(), 1);
+        assert_eq!(db.event_outbox_purge_failed(floor).unwrap(), 1);
+        assert!(
+            db.event_outbox_load(above).unwrap().is_some(),
+            "the stalled consumer's unconsumed row survives the operator purge"
+        );
+    }
+
+    #[test]
     fn event_outbox_since_returns_id_ordered_window() {
         let db = ConfigDb::in_memory("test-pass").unwrap();
         let a = db.event_outbox_insert(&event_at(10, "a")).unwrap();

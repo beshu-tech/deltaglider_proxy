@@ -357,7 +357,15 @@ async fn drain_once(
 ) {
     let cursor = {
         let dbg = db.lock().await;
-        dbg.listener_cursor_load(REPLICATION_LISTENER).unwrap_or(0)
+        match dbg.listener_cursor_load_full(REPLICATION_LISTENER) {
+            Ok(Some(row)) => {
+                // Heartbeat: bump updated_at even on zero-advance ticks so a stalled
+                // consumer keeps pinning the purge floor (MAX-upsert keeps last_event_id).
+                let _ = dbg.listener_cursor_advance(REPLICATION_LISTENER, row.last_event_id, now);
+                row.last_event_id
+            }
+            _ => 0,
+        }
     };
     let rows = {
         let dbg = db.lock().await;

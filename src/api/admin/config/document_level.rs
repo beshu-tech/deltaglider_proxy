@@ -268,15 +268,8 @@ fn parse_and_validate_yaml(yaml: &str) -> Result<(crate::config::Config, Vec<Str
         ));
     }
     let warnings = cfg.check();
-    // Fatal lifecycle rule errors: a rule that can NEVER run (delete/transition
-    // missing·invalid·out-of-range expire_after, retain-newest count=0, bad
-    // globs/durations) is rejected here, not accepted as a warning and then
-    // failed every scheduler tick. Gate is shared by /validate (dry-run) and
-    // /apply since both route through this fn. Mirrors the log_level gate above.
-    let lifecycle_errors = crate::lifecycle::planner::lifecycle_config_errors(&cfg.lifecycle);
-    if !lifecycle_errors.is_empty() {
-        return Err(lifecycle_errors.join("; "));
-    }
+    // Lifecycle fatality is decided by the callers via `lifecycle_gate` (needs
+    // the RUNNING config to tell a new defect from a pre-existing one).
     Ok((cfg, warnings))
 }
 
@@ -285,16 +278,37 @@ fn parse_and_validate_yaml(yaml: &str) -> Result<(crate::config::Config, Vec<Str
 /// Parses the YAML body, runs validation, and reports warnings or errors.
 /// No runtime state is mutated. Used by CI (`dgpctl config lint` in Phase 4)
 /// and by the admin GUI's pre-apply confirmation modal.
-pub async fn validate_config_doc(Json(body): Json<ConfigDocumentRequest>) -> impl IntoResponse {
+pub async fn validate_config_doc(
+    State(state): State<Arc<AdminState>>,
+    Json(body): Json<ConfigDocumentRequest>,
+) -> impl IntoResponse {
     match parse_and_validate_yaml(&body.yaml) {
-        Ok((_, warnings)) => (
-            StatusCode::OK,
-            Json(ConfigValidateResponse {
-                ok: true,
-                warnings,
-                error: None,
-            }),
-        ),
+        Ok((cfg, mut warnings)) => {
+            // Same changed-only gate as apply, so validate can't pass a doc
+            // apply would reject (or vice versa for unchanged-invalid rules).
+            let current_lifecycle = state.config.read().await.lifecycle.clone();
+            match crate::lifecycle::planner::lifecycle_gate(&current_lifecycle, &cfg.lifecycle) {
+                Ok(lifecycle_warnings) => warnings.extend(lifecycle_warnings),
+                Err(errs) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ConfigValidateResponse {
+                            ok: false,
+                            warnings: vec![],
+                            error: Some(errs.join("; ")),
+                        }),
+                    );
+                }
+            }
+            (
+                StatusCode::OK,
+                Json(ConfigValidateResponse {
+                    ok: true,
+                    warnings,
+                    error: None,
+                }),
+            )
+        }
         Err(err) => (
             StatusCode::BAD_REQUEST,
             Json(ConfigValidateResponse {
@@ -422,6 +436,35 @@ pub(crate) async fn apply_config_inner(
     //    cannot race our read-for-compare and our write-to-swap.
     let mut cfg = state.config.write().await;
 
+    // 2b. Lifecycle gate (changed-only): fatal only when this doc actually EDITS
+    //     an invalid lifecycle; an unchanged pre-existing bad rule downgrades to
+    //     warnings so it can't block unrelated config edits.
+    let lifecycle_warnings =
+        match crate::lifecycle::planner::lifecycle_gate(&cfg.lifecycle, &incoming.lifecycle) {
+            Ok(warns) => {
+                if !warns.is_empty() {
+                    tracing::warn!(
+                        "config apply: pre-existing invalid lifecycle config left unchanged: {}",
+                        warns.join("; ")
+                    );
+                }
+                warns
+            }
+            Err(errs) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    ConfigApplyResponse {
+                        applied: false,
+                        persisted: false,
+                        requires_restart: false,
+                        warnings: parse_warnings,
+                        error: Some(errs.join("; ")),
+                        persisted_path: None,
+                    },
+                );
+            }
+        };
+
     // 3. Merge runtime secrets into the incoming doc. `preserve_runtime_secrets`
     //    emits its own warnings for credential transitions that would
     //    silently clear state — surface them to the caller.
@@ -525,6 +568,7 @@ pub(crate) async fn apply_config_inner(
 
     let warnings: Vec<String> = parse_warnings
         .into_iter()
+        .chain(lifecycle_warnings)
         .chain(preserve_warnings)
         .chain(transition_warnings)
         .chain(persist_warning)

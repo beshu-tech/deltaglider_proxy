@@ -495,9 +495,10 @@ impl ConfigDb {
         Ok(rows)
     }
 
-    /// Reconciliation: jobs left `running`/`cancelling` by a dead process
-    /// go back to `queued` with phase + continuation token PRESERVED, so
-    /// the worker resumes them. ONLY rows whose leader lease has lapsed
+    /// Reconciliation: jobs left `running` by a dead process go back to
+    /// `queued` with phase + continuation token PRESERVED, so the worker
+    /// resumes them; `cancelling` rows instead settle to `cancelled` (the
+    /// operator's cancel outranks resume). ONLY rows whose leader lease has lapsed
     /// are touched: under multi-instance config sync the DB file (with
     /// `maintenance_jobs` rows in it) is copied between instances, and a
     /// peer's LIVE job must not be resurrected here — its heartbeats keep
@@ -506,13 +507,28 @@ impl ConfigDb {
     /// poll tick, not just at boot. Returns the number re-queued.
     pub fn maintenance_requeue_abandoned(&self) -> Result<usize, ConfigDbError> {
         let now = current_unix_seconds();
+        // Operator cancel is authoritative: a dead runner's 'cancelling' row
+        // settles to 'cancelled' (same shape as maintenance_finish), never requeues.
+        self.conn.execute(
+            "UPDATE maintenance_jobs
+                SET status = 'cancelled',
+                    leader_instance_id = NULL,
+                    leader_expires_at = NULL,
+                    finished_at = ?,
+                    updated_at = ?
+              WHERE status = 'cancelling'
+                AND (leader_instance_id IS NULL
+                     OR leader_expires_at IS NULL
+                     OR leader_expires_at < ?)",
+            params![now, now, now],
+        )?;
         let n = self.conn.execute(
             "UPDATE maintenance_jobs
                 SET status = 'queued',
                     leader_instance_id = NULL,
                     leader_expires_at = NULL,
                     updated_at = ?
-              WHERE status IN ('running','cancelling')
+              WHERE status = 'running'
                 AND (leader_instance_id IS NULL
                      OR leader_expires_at IS NULL
                      OR leader_expires_at < ?)",
@@ -835,6 +851,32 @@ mod tests {
             .unwrap();
         assert_eq!(claimed.id, id);
         assert_eq!(claimed.started_at, Some(wall));
+    }
+
+    #[test]
+    fn requeue_abandoned_settles_lapsed_cancelling_as_cancelled() {
+        let db = db();
+        let id = db
+            .maintenance_create_job("reencrypt", "b", "counting", None, "admin", 1)
+            .unwrap()
+            .unwrap();
+        db.maintenance_claim_next_job("w", 2, 60).unwrap().unwrap();
+        // Operator cancels, then the runner dies (lease lapses: expiry 2+60=62 << wall clock).
+        assert_eq!(
+            db.maintenance_request_cancel(id).unwrap(),
+            CancelOutcome::CancelRequested
+        );
+        // Requeue must NOT resurrect the cancelled job as 'queued'.
+        assert_eq!(db.maintenance_requeue_abandoned().unwrap(), 0);
+        let job = db.maintenance_job_by_id(id).unwrap().unwrap();
+        assert_eq!(job.status, "cancelled");
+        assert!(job.finished_at.is_some(), "settled rows stamp finished_at");
+        // Terminal: not claimable, no longer arms the write gate.
+        assert!(db
+            .maintenance_claim_next_job("w2", current_unix_seconds(), 60)
+            .unwrap()
+            .is_none());
+        assert!(db.maintenance_active_job_for_bucket("b").unwrap().is_none());
     }
 
     #[test]
