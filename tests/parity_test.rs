@@ -15,7 +15,7 @@
 mod common;
 
 use aws_sdk_s3::primitives::ByteStream;
-use common::{admin_http_client, TestServer};
+use common::{admin_http_client, wait_for_run, TestServer};
 use serde_json::Value;
 
 // Replication rule + a lifecycle rule (the latter only to assert that
@@ -129,8 +129,8 @@ async fn test_parity_audit_lifecycle() {
 
     let admin = admin_http_client(&server.endpoint()).await;
 
-    // Replicate.
-    let run = admin
+    // Replicate. run-now is fire-and-forget (202); poll the settled run.
+    let resp = admin
         .post(format!(
             "{}/_/api/admin/jobs/replication:parity-a-to-b/run-now",
             server.endpoint()
@@ -138,10 +138,10 @@ async fn test_parity_audit_lifecycle() {
         .send()
         .await
         .expect("run-now");
-    assert_eq!(run.status().as_u16(), 200);
-    let run: Value = run.json().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 202);
+    let run = wait_for_run(&admin, &server.endpoint(), "parity-a-to-b").await;
     assert_eq!(run["status"].as_str(), Some("succeeded"), "{run}");
-    assert_eq!(run["objects_copied"].as_i64(), Some(N), "{run}");
+    assert_eq!(run["objects_processed"].as_i64(), Some(N), "{run}");
 
     // 1. Fully in sync.
     let out = verify(&admin, &server.endpoint()).await;
