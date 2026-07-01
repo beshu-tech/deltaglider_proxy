@@ -96,15 +96,11 @@ pub(crate) async fn revoke_identities_everywhere(
         }
     }
 
-    let mut pushed = false;
-    if persisted && !state.config_db_mismatch {
-        if let Some(sync) = state.config_sync.as_ref() {
-            match sync.upload().await {
-                Ok(()) => pushed = true,
-                Err(e) => tracing::warn!("revoke: config sync push failed: {e}"),
-            }
-        }
-    }
+    let pushed = persisted
+        && matches!(
+            super::push_config_sync_now(state).await,
+            super::SyncPush::Uploaded
+        );
     RevokeOutcome {
         revoked_local,
         persisted,
