@@ -1290,6 +1290,9 @@ pub struct AdvancedSection {
     pub config_sync_object_key: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_sync_update_cas: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsConfig>,
 
     /// Bcrypt hash of the bootstrap password. An infra secret: stripped
@@ -1425,6 +1428,13 @@ impl SectionedConfig {
                 log_level: some_if_nondefault_str(&flat.log_level, default_log_level()),
                 config_sync_bucket: flat.config_sync_bucket.clone(),
                 config_sync_object_key: flat.config_sync_object_key.clone(),
+                config_sync_update_cas: if flat.config_sync_update_cas
+                    == crate::config::default_config_sync_update_cas()
+                {
+                    None
+                } else {
+                    Some(flat.config_sync_update_cas)
+                },
                 tls: flat.tls.clone(),
                 bootstrap_password_hash: flat.bootstrap_password_hash.clone(),
                 event_delivery: flat.event_delivery.clone(),
@@ -1502,6 +1512,10 @@ impl SectionedConfig {
             log_level: self.advanced.log_level.unwrap_or(defaults.log_level),
             config_sync_bucket: self.advanced.config_sync_bucket,
             config_sync_object_key: self.advanced.config_sync_object_key,
+            config_sync_update_cas: self
+                .advanced
+                .config_sync_update_cas
+                .unwrap_or(defaults.config_sync_update_cas),
             tls: self.advanced.tls,
             event_delivery: self.advanced.event_delivery,
             buckets: self.storage.buckets,

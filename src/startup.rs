@@ -1021,6 +1021,7 @@ pub async fn init_config_sync(
         sync_bucket.clone(),
         object_key,
         db_file,
+        config.config_sync_update_cas,
         admin_password_hash.to_string(),
     )
     .await

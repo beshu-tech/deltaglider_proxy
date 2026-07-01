@@ -43,8 +43,28 @@ pub struct ConfigDbSync {
     object_key: String,
     local_path: PathBuf,
     last_etag: Arc<RwLock<Option<String>>>,
+    config_sync_update_cas: bool,
     /// The local bootstrap password hash, used to validate downloaded DBs.
     bootstrap_password_hash: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UploadGuard<'a> {
+    IfNoneMatch,
+    IfMatch(&'a str),
+    UnguardedUpdate,
+}
+
+fn upload_guard(expected_etag: Option<&str>, config_sync_update_cas: bool) -> UploadGuard<'_> {
+    match (expected_etag, config_sync_update_cas) {
+        (Some(etag), true) => UploadGuard::IfMatch(etag),
+        (Some(_), false) => UploadGuard::UnguardedUpdate,
+        (None, _) => UploadGuard::IfNoneMatch,
+    }
+}
+
+fn record_unadopted_remote_etag(config_sync_update_cas: bool) -> bool {
+    !config_sync_update_cas
 }
 
 impl ConfigDbSync {
@@ -57,6 +77,7 @@ impl ConfigDbSync {
         sync_bucket: String,
         object_key: String,
         local_path: PathBuf,
+        config_sync_update_cas: bool,
         bootstrap_password_hash: String,
     ) -> Result<Self, String> {
         let client = Self::build_client(backend_config).await?;
@@ -73,6 +94,7 @@ impl ConfigDbSync {
             object_key,
             local_path,
             last_etag: Arc::new(RwLock::new(None)),
+            config_sync_update_cas,
             bootstrap_password_hash,
         })
     }
@@ -225,6 +247,13 @@ impl ConfigDbSync {
                      NOT replacing local copy: {}",
                     e
                 );
+                if record_unadopted_remote_etag(self.config_sync_update_cas) {
+                    *self.last_etag.write().await = remote_etag;
+                    tracing::warn!(
+                        "Config DB S3 sync update CAS is disabled; treating existing unadopted \
+                         remote object as the target for the next single-writer upload"
+                    );
+                }
                 return Ok(None);
             }
         }
@@ -287,9 +316,10 @@ impl ConfigDbSync {
             .key(&self.object_key)
             .body(ByteStream::from(data.clone()))
             .content_type("application/octet-stream");
-        put = match &expected_etag {
-            Some(etag) => put.if_match(etag),
-            None => put.if_none_match("*"),
+        put = match upload_guard(expected_etag.as_deref(), self.config_sync_update_cas) {
+            UploadGuard::IfMatch(etag) => put.if_match(etag),
+            UploadGuard::IfNoneMatch => put.if_none_match("*"),
+            UploadGuard::UnguardedUpdate => put,
         };
 
         let put_result = match put.send().await {
@@ -501,5 +531,32 @@ mod tests {
             "service error: AccessDenied (status 403)"
         ));
         assert!(!is_precondition_failed(""));
+    }
+
+    #[test]
+    fn upload_guard_defaults_to_cas_for_existing_remote_db() {
+        assert_eq!(
+            upload_guard(Some("\"etag-1\""), true),
+            UploadGuard::IfMatch("\"etag-1\"")
+        );
+    }
+
+    #[test]
+    fn upload_guard_can_disable_update_cas_without_disabling_create_guard() {
+        assert_eq!(upload_guard(None, false), UploadGuard::IfNoneMatch);
+        assert_eq!(
+            upload_guard(Some("\"etag-1\""), false),
+            UploadGuard::UnguardedUpdate
+        );
+    }
+
+    #[test]
+    fn invalid_remote_etag_is_not_recorded_when_update_cas_is_enabled() {
+        assert!(!record_unadopted_remote_etag(true));
+    }
+
+    #[test]
+    fn invalid_remote_etag_is_recorded_only_for_single_writer_update_cas_opt_out() {
+        assert!(record_unadopted_remote_etag(false));
     }
 }

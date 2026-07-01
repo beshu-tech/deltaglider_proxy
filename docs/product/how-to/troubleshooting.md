@@ -153,6 +153,8 @@ Continuous mismatch usually means two instances are **both writing** via `DGP_CO
 
 Fix: run only one instance as the IAM administration surface and point the others at the same sync bucket read-only (see [How to run multiple instances](run-multiple-instances.md)). Or switch to `iam_mode: declarative` and manage IAM via YAML + GitOps (takes both writes out of the picture).
 
+If an S3-compatible endpoint rejects `If-Match` conditional update PUTs, a single-writer deployment can set `DGP_CONFIG_SYNC_UPDATE_CAS=false`. With the opt-out, an existing remote DB that cannot be decrypted with the local bootstrap key is replaced by the next local upload instead of being treated as a guarded first create. Keep the default `true` whenever more than one instance can write.
+
 ## Audit ring is empty after a restart
 
 The audit ring is **in-memory only**. It resets to empty on every restart — that's by design. For persistent audit, the authoritative source is stdout `tracing::info!` — scrape it into your log pipeline.

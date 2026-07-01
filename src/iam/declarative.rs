@@ -765,8 +765,12 @@ pub fn diff_iam(yaml: &DeclarativeIam, db: &CurrentIam) -> Result<IamDiff, Strin
         yaml.users.iter().map(|u| (u.name.as_str(), u)).collect();
     for yu in &yaml.users {
         match db.users.iter().find(|du| du.name == yu.name) {
-            Some(du) if user_equal(du, yu, &db_group_id_to_name) => {}
-            Some(du) => diff.users_to_update.push((du.id, yu.clone())),
+            Some(du) => {
+                let desired = desired_existing_user(du, yu);
+                if !user_equal(du, &desired, &db_group_id_to_name) {
+                    diff.users_to_update.push((du.id, desired));
+                }
+            }
             None => diff.users_to_create.push(yu.clone()),
         }
     }
@@ -821,6 +825,16 @@ pub fn diff_iam(yaml: &DeclarativeIam, db: &CurrentIam) -> Result<IamDiff, Strin
 }
 
 // ───── Equality predicates ─────────────────────────────────────────────
+
+fn desired_existing_user(db: &IamUser, yaml: &DeclarativeUser) -> DeclarativeUser {
+    if !yaml.secret_access_key.is_empty() {
+        return yaml.clone();
+    }
+    DeclarativeUser {
+        secret_access_key: db.secret_access_key.clone(),
+        ..yaml.clone()
+    }
+}
 
 fn group_equal(db: &Group, yaml: &DeclarativeGroup) -> bool {
     db.name == yaml.name
@@ -1268,6 +1282,31 @@ mod tests {
         assert!(
             diff.is_empty(),
             "YAML equivalent to DB must produce empty diff, got {diff:?}"
+        );
+    }
+
+    #[test]
+    fn diff_redacted_existing_user_secret_is_idempotent() {
+        let yaml = DeclarativeIam {
+            users: vec![DeclarativeUser {
+                secret_access_key: String::new(),
+                ..yu("alice", "AKIA1")
+            }],
+            ..Default::default()
+        };
+        let current = CurrentIam {
+            users: vec![IamUser {
+                secret_access_key: "existing-secret".into(),
+                ..db_user(1, "alice", "AKIA1")
+            }],
+            ..empty_db()
+        };
+
+        let diff = diff_iam(&yaml, &current).unwrap();
+
+        assert!(
+            diff.users_to_update.is_empty(),
+            "redacted exported secret must not rotate existing user credentials: {diff:?}"
         );
     }
 

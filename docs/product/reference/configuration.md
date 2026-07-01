@@ -638,6 +638,8 @@ advanced:
 
 Sync uses the same S3 credentials as the storage backend (`DGP_BE_AWS_*`) and only works when the storage backend is S3 (not filesystem). On every IAM mutation, the DB is uploaded to `s3://<bucket>/.deltaglider/config.db`; readers poll the S3 ETag every 5 minutes and download on change.
 
+By default update uploads use `If-Match` compare-and-swap protection. For a single-writer deployment on an S3-compatible endpoint that rejects conditional update PUTs, set `advanced.config_sync_update_cas: false` or `DGP_CONFIG_SYNC_UPDATE_CAS=false`. First-create uploads still use `If-None-Match: *`; if a remote object already exists but cannot be adopted by the local bootstrap key, the next upload is treated as an unguarded single-writer replacement. Disabling update CAS is not safe for multi-writer use.
+
 ---
 
 ## Multi-backend routing
@@ -1051,6 +1053,7 @@ Exhaustive list of every `DGP_*` variable the server reads. The unit test `test_
 | `DGP_TLS_CERT` | auto self-signed | PEM cert path |
 | `DGP_TLS_KEY` | auto self-signed | PEM key path |
 | `DGP_CONFIG_SYNC_BUCKET` | — | S3 bucket for encrypted-DB multi-instance sync |
+| `DGP_CONFIG_SYNC_UPDATE_CAS` | true | Use `If-Match` CAS on encrypted-DB update uploads; set false only for single-writer S3 endpoints that reject conditional update PUTs |
 | `DGP_ENCRYPTION_KEY` | — | Singleton-backend AES-256 key (64-char hex). Named backends use `DGP_BACKEND_<NAME>_ENCRYPTION_KEY`. |
 | `DGP_SSE_KMS_KEY_ID` | — | Singleton-backend SSE-KMS ARN/alias. Named backends use `DGP_BACKEND_<NAME>_SSE_KMS_KEY_ID`. |
 

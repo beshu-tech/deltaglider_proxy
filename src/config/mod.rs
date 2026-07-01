@@ -255,6 +255,12 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         example: ".deltaglider/config.db",
         category: "Config Sync",
     },
+    EnvVarEntry {
+        name: "DGP_CONFIG_SYNC_UPDATE_CAS",
+        description: "Use If-Match compare-and-swap on config DB update uploads; set false only for single-writer S3 endpoints that reject If-Match",
+        example: "true",
+        category: "Config Sync",
+    },
     // ── Security / Runtime ─────────────────────────────────
     EnvVarEntry {
         name: "DGP_DEBUG_HEADERS",
@@ -600,6 +606,15 @@ pub struct Config {
     /// `DGP_CONFIG_SYNC_KEY` overrides this when set.
     #[serde(default)]
     pub config_sync_object_key: Option<String>,
+
+    /// Use `If-Match` compare-and-swap for config DB update uploads.
+    /// Keep enabled for HA safety; disable only for single-writer S3 endpoints
+    /// that reject conditional update PUTs.
+    #[serde(
+        default = "default_config_sync_update_cas",
+        skip_serializing_if = "is_default_config_sync_update_cas"
+    )]
+    pub config_sync_update_cas: bool,
 
     /// TLS configuration (optional).
     /// When enabled, both the S3 port and the demo UI port serve HTTPS.
@@ -1122,6 +1137,14 @@ pub(crate) fn default_log_level() -> String {
     "deltaglider_proxy=debug,tower_http=debug".to_string()
 }
 
+pub(crate) fn default_config_sync_update_cas() -> bool {
+    true
+}
+
+fn is_default_config_sync_update_cas(value: &bool) -> bool {
+    *value == default_config_sync_update_cas()
+}
+
 impl Default for BackendConfig {
     fn default() -> Self {
         BackendConfig::Filesystem {
@@ -1150,6 +1173,7 @@ impl Default for Config {
             log_level: default_log_level(),
             config_sync_bucket: None,
             config_sync_object_key: None,
+            config_sync_update_cas: default_config_sync_update_cas(),
             tls: None,
             buckets: std::collections::BTreeMap::new(),
             backends: Vec::new(),
@@ -1493,6 +1517,8 @@ impl Config {
                 self.config_sync_object_key = Some(key);
             }
         }
+        self.config_sync_update_cas =
+            env_bool("DGP_CONFIG_SYNC_UPDATE_CAS", self.config_sync_update_cas);
 
         // Per-backend encryption overrides.
         //
@@ -2670,6 +2696,7 @@ mod tests {
             "DGP_LOG_LEVEL",
             "DGP_CONFIG_SYNC_BUCKET",
             "DGP_CONFIG_SYNC_KEY",
+            "DGP_CONFIG_SYNC_UPDATE_CAS",
             "DGP_TLS_ENABLED",
             "DGP_TLS_CERT",
             "DGP_TLS_KEY",
@@ -2737,6 +2764,18 @@ mod tests {
                 "Env var {name} is in ENV_VAR_REGISTRY but not used in from_env() or listed in used_outside_from_env"
             );
         }
+    }
+
+    #[test]
+    fn config_sync_update_cas_defaults_enabled_and_can_be_disabled_by_env() {
+        std::env::remove_var("DGP_CONFIG_SYNC_UPDATE_CAS");
+        assert!(Config::default().config_sync_update_cas);
+
+        std::env::set_var("DGP_CONFIG_SYNC_UPDATE_CAS", "false");
+        let config = Config::from_env();
+        std::env::remove_var("DGP_CONFIG_SYNC_UPDATE_CAS");
+
+        assert!(!config.config_sync_update_cas);
     }
 
     #[test]
