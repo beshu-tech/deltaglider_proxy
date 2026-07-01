@@ -29,6 +29,18 @@ pub async fn preview(
         let msg = fatal.join("; ");
         return Err((lifecycle::classify_lifecycle_run_error(&msg), msg));
     }
+    // Duplicate-name defence, mirroring the scheduler: same-named rules share
+    // one name-keyed state row — running "the first match" would corrupt the
+    // other rule's cursor/lease.
+    if lifecycle::planner::duplicate_rule_names(lifecycle_cfg.rules.iter()).contains(&rule.name) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "rule name '{}' is duplicated in the config — rename one of the copies first",
+                rule.name
+            ),
+        ));
+    }
 
     let engine = state.s3_state.engine.load().clone();
     lifecycle::preview_rule(&engine, &rule, lifecycle_cfg.max_failures_retained as usize)
@@ -120,6 +132,18 @@ pub async fn run_now(
     if !fatal.is_empty() {
         let msg = fatal.join("; ");
         return Err((lifecycle::classify_lifecycle_run_error(&msg), msg));
+    }
+    // Duplicate-name defence, mirroring the scheduler: same-named rules share
+    // one name-keyed state row — running "the first match" would corrupt the
+    // other rule's cursor/lease.
+    if lifecycle::planner::duplicate_rule_names(lifecycle_cfg.rules.iter()).contains(&rule.name) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "rule name '{}' is duplicated in the config — rename one of the copies first",
+                rule.name
+            ),
+        ));
     }
 
     // Same deferral the scheduler applies: run-now must not write into a

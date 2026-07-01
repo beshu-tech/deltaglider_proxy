@@ -54,7 +54,7 @@ const DEFAULT_DELIVERED_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 /// A listener cursor older than this (no advance in 1h) is treated as inactive
 /// and no longer pins the prune floor. A healthy consumer advances every tick
 /// (seconds), so this only ever fires for a stuck/dead/disabled listener.
-const LISTENER_CURSOR_STALE_SECS: i64 = 60 * 60;
+pub(crate) const LISTENER_CURSOR_STALE_SECS: i64 = 60 * 60;
 /// Failed (retries-exhausted) rows age out after this even when
 /// `delivered_retention` is 0 — bounds DB growth from a dead delivery target.
 /// Only rows at or below the listener-cursor floor are eligible (never drops an

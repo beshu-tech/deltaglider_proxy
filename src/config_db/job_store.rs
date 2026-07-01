@@ -236,7 +236,9 @@ pub(crate) fn find_zombie_runs(
     Ok(rows)
 }
 
-/// Flip one zombie run-history row to `failed`.
+/// Settle one zombie run-history row: a crashed 'cancelling' run becomes
+/// `cancelled` (the operator's kill is authoritative — same rule as
+/// maintenance_requeue_abandoned); a crashed 'running' run becomes `failed`.
 pub(crate) fn mark_run_failed(
     conn: &Connection,
     run_table: &str,
@@ -245,7 +247,12 @@ pub(crate) fn mark_run_failed(
 ) -> Result<(), ConfigDbError> {
     check_idents(&[run_table])?;
     conn.execute(
-        &format!("UPDATE {run_table} SET status = 'failed', finished_at = ? WHERE id = ?"),
+        &format!(
+            "UPDATE {run_table}
+                SET status = CASE WHEN status = 'cancelling' THEN 'cancelled' ELSE 'failed' END,
+                    finished_at = ?
+              WHERE id = ?"
+        ),
         params![now, run_id],
     )?;
     Ok(())
@@ -437,6 +444,16 @@ mod tests {
             z.iter().any(|(_, n, _)| n == "r3"),
             "a leaderless 'cancelling' row must be reconciled, got {z:?}"
         );
+        // ...and it settles as CANCELLED (the operator's kill is authoritative),
+        // not 'failed' — mirror of the maintenance requeue rule.
+        let r3_id: i64 = c
+            .query_row("SELECT id FROM runs WHERE rule_name='r3'", [], |r| r.get(0))
+            .unwrap();
+        mark_run_failed(&c, "runs", r3_id, 101).unwrap();
+        let status: String = c
+            .query_row("SELECT status FROM runs WHERE id=?", [r3_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "cancelled");
     }
 
     #[test]

@@ -74,17 +74,32 @@ async fn run_now(server: &TestServer) -> Value {
     // background task starts, so waiting on max-id could return the PREVIOUS
     // settled run (this helper fires twice in the idempotency test).
     let before = common::latest_run_id(&admin, &server.endpoint(), "dp-rule").await;
-    let resp = admin
-        .post(format!(
-            "{}/_/api/admin/jobs/replication:dp-rule/run-now",
-            server.endpoint()
-        ))
-        .send()
-        .await
-        .expect("run-now request");
+    // The previous run's lease is released AFTER its history row settles —
+    // tolerate the brief 409 window when firing back-to-back.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let code = admin
+            .post(format!(
+                "{}/_/api/admin/jobs/replication:dp-rule/run-now",
+                server.endpoint()
+            ))
+            .send()
+            .await
+            .expect("run-now request")
+            .status()
+            .as_u16();
+        if code == 202 {
+            break;
+        }
+        assert_eq!(code, 409, "run-now: unexpected status {code}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "run-now kept returning 409 (lease never released)"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     // Fire-and-forget (202); return the SETTLED run-history row (has `status`
     // and `objects_processed`).
-    assert_eq!(resp.status().as_u16(), 202, "run-now accepted");
     common::wait_for_run_after(&admin, &server.endpoint(), "dp-rule", before).await
 }
 

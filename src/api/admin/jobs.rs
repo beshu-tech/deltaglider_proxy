@@ -821,20 +821,14 @@ async fn delete_rule(
         // H2: refuse to delete a replication rule with a LIVE run — a running
         // row, a cancelling row, OR an unexpired lease (acquired pre-spawn).
         if let (JobSubsystem::Replication, Some(db)) = (sub, db_guard.as_ref()) {
-            let run_live = matches!(
-                db.replication_latest_run_status(name)
-                    .ok()
-                    .flatten()
-                    .as_deref(),
-                Some("running") | Some("cancelling")
-            );
+            let run_status = db.replication_latest_run_status(name).ok().flatten();
             let lease_live = db
                 .replication_lease_is_held(
                     name,
                     crate::replication::state_store::current_unix_seconds(),
                 )
                 .unwrap_or(false);
-            if run_live || lease_live {
+            if delete_blocked_by_live_run(run_status.as_deref(), lease_live) {
                 return Err((
                     StatusCode::CONFLICT,
                     format!("rule '{name}' has a run in progress — kill it before deleting"),
@@ -912,6 +906,13 @@ async fn delete_rule(
     Ok(())
 }
 
+/// Pure H2 liveness predicate: a rule is delete-blocked when its latest run
+/// row is live OR any unexpired lease is held — the lease exists BEFORE the
+/// run row, so checking the row alone races the acquire-then-spawn gap.
+fn delete_blocked_by_live_run(latest_run_status: Option<&str>, lease_held: bool) -> bool {
+    lease_held || matches!(latest_run_status, Some("running") | Some("cancelling"))
+}
+
 fn not_found() -> (StatusCode, String) {
     (StatusCode::NOT_FOUND, "job not found".to_string())
 }
@@ -954,6 +955,21 @@ mod tests {
             parse_job_id("replication:a:b"),
             Some((JobSubsystem::Replication, "a:b"))
         );
+    }
+
+    #[test]
+    fn delete_liveness_predicate() {
+        // The lease alone blocks (the acquire-to-run-row gap)...
+        assert!(delete_blocked_by_live_run(None, true));
+        assert!(delete_blocked_by_live_run(Some("succeeded"), true));
+        // ...as does a live run row without a visible lease.
+        assert!(delete_blocked_by_live_run(Some("running"), false));
+        assert!(delete_blocked_by_live_run(Some("cancelling"), false));
+        // Settled/no history + no lease = deletable.
+        assert!(!delete_blocked_by_live_run(None, false));
+        assert!(!delete_blocked_by_live_run(Some("succeeded"), false));
+        assert!(!delete_blocked_by_live_run(Some("failed"), false));
+        assert!(!delete_blocked_by_live_run(Some("cancelled"), false));
     }
 
     #[test]

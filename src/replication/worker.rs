@@ -197,34 +197,48 @@ pub async fn run_rule(
     let dest_oracle = build_dest_oracle(engine, &ctrl, rule, &dest_prefix, &source_prefix).await;
 
     let mut pager = Pager::resuming(continuation).with_test_max_pages_env();
+    // Fold a DB error into a fatal STOP instead of `?`-returning out of
+    // run_rule: the post-loop event flush + settle must ALWAYS run (an early
+    // return leaves the run row 'running' forever and drops buffered events).
+    macro_rules! fatal_break {
+        ($lbl:lifetime, $msg:expr) => {{
+            warn!("replication rule '{}': {}", rule.name, $msg);
+            totals.errors += 1;
+            hit_fatal_error = true;
+            break $lbl;
+        }};
+    }
     // ── Forward-copy pass: paginate source until exhausted ──
     'pages: while let Some(page_idx) = pager.begin_page() {
         // Uniform page-boundary control check (kill / pause / lease renew).
         // ponytail: PAUSE is a live DB flag; DISABLE is a config edit the worker
         // can't see through its `&ReplicationRule` snapshot — Pause is the button.
-        match ctrl.check(true).await? {
-            ControlVerdict::Continue => {}
-            ControlVerdict::Killed => {
-                info!(
-                    "replication rule '{}' killed mid-run — stopping at page {} boundary",
-                    rule.name, page_idx
-                );
-                killed = true;
-                break 'pages;
-            }
-            ControlVerdict::Paused => {
-                info!(
-                    "replication rule '{}' paused mid-run — stopping after page {} (cursor preserved for resume)",
-                    rule.name, page_idx
-                );
-                stopped_paused = true;
-                break 'pages;
-            }
-            ControlVerdict::LeaseLost => {
-                totals.errors += 1;
-                hit_fatal_error = true;
-                break 'pages;
-            }
+        match ctrl.check(true).await {
+            Err(e) => fatal_break!('pages, format!("control check failed: {e}")),
+            Ok(v) => match v {
+                ControlVerdict::Continue => {}
+                ControlVerdict::Killed => {
+                    info!(
+                        "replication rule '{}' killed mid-run — stopping at page {} boundary",
+                        rule.name, page_idx
+                    );
+                    killed = true;
+                    break 'pages;
+                }
+                ControlVerdict::Paused => {
+                    info!(
+                        "replication rule '{}' paused mid-run — stopping after page {} (cursor preserved for resume)",
+                        rule.name, page_idx
+                    );
+                    stopped_paused = true;
+                    break 'pages;
+                }
+                ControlVerdict::LeaseLost => {
+                    totals.errors += 1;
+                    hit_fatal_error = true;
+                    break 'pages;
+                }
+            },
         }
 
         let page = match engine
@@ -252,7 +266,7 @@ pub async fn run_rule(
                     let db = db.lock().await;
                     let _ = db.replication_set_continuation_token(&rule.name, None);
                 }
-                log_failure(
+                if let Err(le) = log_failure(
                     &db,
                     &rule.name,
                     run_id,
@@ -261,7 +275,13 @@ pub async fn run_rule(
                     &format!("list source failed: {}", e),
                     max_failures_retained,
                 )
-                .await?;
+                .await
+                {
+                    warn!(
+                        "replication rule '{}': failure-ring write failed: {le}",
+                        rule.name
+                    );
+                }
                 totals.errors += 1;
                 hit_fatal_error = true;
                 break 'pages;
@@ -322,7 +342,7 @@ pub async fn run_rule(
                     "replication rule '{}' page {} planner error: {}",
                     rule.name, page_idx, e
                 );
-                log_failure(
+                if let Err(le) = log_failure(
                     &db,
                     &rule.name,
                     run_id,
@@ -331,7 +351,13 @@ pub async fn run_rule(
                     &format!("planner error: {}", e),
                     max_failures_retained,
                 )
-                .await?;
+                .await
+                {
+                    warn!(
+                        "replication rule '{}': failure-ring write failed: {le}",
+                        rule.name
+                    );
+                }
                 totals.errors += 1;
                 hit_fatal_error = true;
                 break 'pages;
@@ -343,17 +369,18 @@ pub async fn run_rule(
         // Renew the lease ONCE before the page's concurrent copy batch.
         // The independent heartbeat task keeps it alive during the batch;
         // the post-batch check re-reads it. Events flush post-loop.
-        match ctrl.check(true).await? {
-            ControlVerdict::Continue => {}
-            ControlVerdict::Killed => {
+        match ctrl.check(true).await {
+            Err(e) => fatal_break!('pages, format!("control check failed: {e}")),
+            Ok(ControlVerdict::Continue) => {}
+            Ok(ControlVerdict::Killed) => {
                 killed = true;
                 break 'pages;
             }
-            ControlVerdict::Paused => {
+            Ok(ControlVerdict::Paused) => {
                 stopped_paused = true;
                 break 'pages;
             }
-            ControlVerdict::LeaseLost => {
+            Ok(ControlVerdict::LeaseLost) => {
                 totals.errors += 1;
                 hit_fatal_error = true;
                 break 'pages;
@@ -420,7 +447,10 @@ pub async fn run_rule(
         let mut dest_fatal = false;
         let mut page_copied: i64 = 0;
         for res in object_results {
-            let res = res?;
+            let res = match res {
+                Ok(r) => r,
+                Err(e) => fatal_break!('pages, format!("per-object DB write failed: {e}")),
+            };
             totals.objects_copied += res.objects_copied;
             totals.objects_skipped += res.objects_skipped;
             totals.bytes_copied += res.bytes_copied;
@@ -452,23 +482,39 @@ pub async fn run_rule(
         }
         {
             let db = db.lock().await;
-            db.replication_update_run_progress(run_id, totals)?;
+            if let Err(e) = db.replication_update_run_progress(run_id, totals) {
+                drop(db);
+                fatal_break!('pages, format!("progress persist failed: {e}"));
+            }
         }
 
         // Post-batch control re-check: stop before persisting the cursor if a
         // kill/pause/lease-loss landed while the batch ran (no renew: the
         // heartbeat owns liveness during the batch).
-        match ctrl.check(false).await? {
-            ControlVerdict::Continue => {}
-            ControlVerdict::Killed => {
+        match ctrl.check(false).await {
+            Err(e) => fatal_break!('pages, format!("control check failed: {e}")),
+            Ok(ControlVerdict::Continue) => {}
+            Ok(ControlVerdict::Killed) => {
                 killed = true;
                 break 'pages;
             }
-            ControlVerdict::Paused => {
+            Ok(ControlVerdict::Paused) => {
                 stopped_paused = true;
                 break 'pages;
             }
-            ControlVerdict::LeaseLost => {
+            Ok(ControlVerdict::LeaseLost) => {
+                // First detection (check(false) never logs): record it so the
+                // failure ring explains the failed run.
+                let _ = log_failure(
+                    &db,
+                    &rule.name,
+                    run_id,
+                    "",
+                    "",
+                    "lost replication lease; stopping run before more work",
+                    max_failures_retained,
+                )
+                .await;
                 totals.errors += 1;
                 hit_fatal_error = true;
                 break 'pages;
@@ -487,10 +533,15 @@ pub async fn run_rule(
             // progress, and the page's event flush — do not split (see
             // the throughput note above).
             let db = db.lock().await;
-            db.replication_set_continuation_token(&rule.name, pager.token())?;
-            db.replication_update_run_progress(run_id, totals)?;
+            let persist = db
+                .replication_set_continuation_token(&rule.name, pager.token())
+                .and_then(|_| db.replication_update_run_progress(run_id, totals));
             let mut drained: Vec<NewEvent> = std::mem::take(&mut *events_sink.lock());
             flush_page_events_locked(&db, &rule.name, &mut drained);
+            if let Err(e) = persist {
+                drop(db);
+                fatal_break!('pages, format!("cursor/progress persist failed: {e}"));
+            }
         }
 
         if !more {
@@ -557,7 +608,9 @@ pub async fn run_rule(
     // Settle under ONE lock: re-read the DB cancel flag, derive the terminal
     // status, and write finish_run without releasing in between (H1 fix); the
     // finish UPDATE is ALSO guarded `status IN ('running','cancelling')` in SQL.
-    let status: String = {
+    // Errors inside settle must NOT skip the heartbeat abort below — capture,
+    // abort, then propagate.
+    let settle_result: Result<String, crate::config_db::ConfigDbError> = async {
         let db = db.lock().await;
         // Authoritative final kill check (see the select! race comment above):
         // the DB `cancelling` row is the source of truth for a kill that arrived
@@ -603,12 +656,17 @@ pub async fn run_rule(
                 rule.name, run_id, decision.status
             );
         }
-        decision.status.to_string()
-    };
+        Ok(decision.status.to_string())
+    }
+    .await;
     // Settle barrier: bump AFTER the terminal row is written so a test polling
     // the run-version sees the settled run. The single chokepoint all scheduled
     // runs pass through.
     super::state_store::bump_replication_run_version();
+    if let Some(handle) = heartbeat_handle {
+        handle.abort();
+    }
+    let status = settle_result?;
 
     info!(
         "Replication run finished: rule='{}' status={} scanned={} copied={} skipped={} deleted={} errors={} bytes={}",
@@ -621,9 +679,6 @@ pub async fn run_rule(
         totals.errors,
         totals.bytes_copied,
     );
-    if let Some(handle) = heartbeat_handle {
-        handle.abort();
-    }
     Ok((run_id, RunOutcome { status, totals }))
 }
 

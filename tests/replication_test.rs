@@ -631,6 +631,20 @@ async fn test_replication_pause_mid_run_stops_promptly_and_preserves_cursor() {
         .build()
         .await;
     let client = server.s3_client().await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let ep = server.endpoint();
+
+    // Pause IMMEDIATELY so the scheduler can't start a run mid-seed (the tick
+    // is clamped to >=5s; seeding must not race it).
+    let p = admin
+        .post(format!(
+            "{ep}/_/api/admin/jobs/replication:midpause-rule/pause"
+        ))
+        .send()
+        .await
+        .expect("boot pause");
+    assert_eq!(p.status().as_u16(), 204);
+
     for b in ["mpz-src", "mpz-dst"] {
         client.create_bucket().bucket(b).send().await.ok();
     }
@@ -646,13 +660,20 @@ async fn test_replication_pause_mid_run_stops_promptly_and_preserves_cursor() {
             .expect("seed");
     }
 
-    let admin = admin_http_client(&server.endpoint()).await;
-    let ep = server.endpoint();
+    // Resume: the next scheduler tick starts the run against the full seed.
+    let r = admin
+        .post(format!(
+            "{ep}/_/api/admin/jobs/replication:midpause-rule/resume"
+        ))
+        .send()
+        .await
+        .expect("resume");
+    assert_eq!(r.status().as_u16(), 204);
 
-    // Wait for the SCHEDULER to start a run (tick 1s; next_due_at starts 0),
-    // then pause while it is still paginating.
+    // Wait for the SCHEDULER to start a run, then pause while it paginates.
     let runs_url = format!("{ep}/_/api/admin/jobs/replication:midpause-rule/runs");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // tick_interval is clamped to a 5s minimum — allow a couple of ticks.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         let h: Value = admin
             .get(&runs_url)
@@ -2032,10 +2053,17 @@ async fn test_replication_kill_mid_run_settles_cancelled_and_stops_copying() {
     assert_eq!(count_a, count_b, "no copies after a settled kill");
     assert!(count_b < 150, "kill left the sweep incomplete");
 
-    // A later one-off drains the tail (cursor preserved by the kill settle).
+    // A later one-off drains the tail FROM THE PRESERVED CURSOR: when the
+    // kill landed after >=1 persisted page, the resumed run must scan fewer
+    // than all 150 (a cleared cursor would restart from key zero).
+    let killed_copied = copied.max(0);
     let mut guard = 0;
+    let mut first_resume_scanned: Option<i64> = None;
     loop {
         let run = fire_run_now(&admin, &ep, "kill-rule").await;
+        if first_resume_scanned.is_none() {
+            first_resume_scanned = run["objects_scanned"].as_i64();
+        }
         let dst = client
             .list_objects_v2()
             .bucket("kr-dst")
@@ -2053,12 +2081,20 @@ async fn test_replication_kill_mid_run_settles_cancelled_and_stops_copying() {
             "post-kill drain never completed: last run {run}"
         );
     }
+    if killed_copied > 0 {
+        let scanned = first_resume_scanned.unwrap_or(150);
+        assert!(
+            scanned < 150,
+            "resume must continue from the kill's preserved cursor, not restart \
+             (killed after {killed_copied} copies, resumed run scanned {scanned})"
+        );
+    }
 }
 
 const KILLDEL_RULE_YAML: &str = "
 replication:
   enabled: true
-  tick_interval: \"30s\"
+  tick_interval: \"1h\"
   rules:
     - name: killdel-rule
       enabled: true

@@ -406,12 +406,12 @@ pub async fn delete_user(
         tracing::warn!("Last IAM user deleted — switching to open access (no authentication)");
     }
 
-    rebuild_iam_index(&db, &state.iam_state)?;
+    // Rebuild AFTER capturing the result — the revocation below must run even
+    // when the rebuild errs (a deleted user's sessions dying is the invariant).
+    let rebuild_result = rebuild_iam_index(&db, &state.iam_state);
     drop(db);
-    trigger_config_sync(&state);
-
-    // Deleting the user must also kill any live sessions it minted — here and
-    // on peers. The helper re-locks the DB, so it runs after the lock is dropped.
+    // No separate trigger_config_sync: revoke_identities_everywhere pushes the
+    // same DB file (a second concurrent push just self-inflicts CAS churn).
     let outcome = super::sessions::revoke_identities_everywhere(&state, &identities).await;
     if outcome.revoked_local > 0 {
         tracing::info!(
@@ -420,6 +420,7 @@ pub async fn delete_user(
             user_id
         );
     }
+    rebuild_result?;
 
     tracing::info!(
         "IAM user {} deleted ({} users remaining)",
@@ -432,6 +433,9 @@ pub async fn delete_user(
 
 /// All identities `revoke_identities_everywhere` should target when `user_id`
 /// is deleted: their access_key_id + one `provider:user_id` per external login.
+/// KNOWN LIMIT: external identities use the provider's CURRENT name; a session
+/// minted before a provider RENAME carries the old name and is missed here —
+/// revoke it via the sessions panel (per-session revoke) if that ever bites.
 fn revocation_identities_for_user(db: &crate::config_db::ConfigDb, user_id: i64) -> Vec<String> {
     let mut identities = Vec::new();
     if let Ok(user) = db.get_user_by_id(user_id) {
@@ -486,9 +490,11 @@ pub async fn rotate_user_keys(
             StatusCode::NOT_FOUND
         })?;
 
-    rebuild_iam_index(&db, &state.iam_state)?;
+    // Rebuild AFTER capturing the result — the old-key revocation below must
+    // run even when the rebuild errs (the rotation is already durable).
+    let rebuild_result = rebuild_iam_index(&db, &state.iam_state);
     drop(db);
-    trigger_config_sync(&state);
+    // No separate trigger_config_sync: the revoke push below carries the DB.
 
     // Rotating a key does NOT invalidate already-minted session cookies —
     // revoke the old identity everywhere (helper re-locks the DB itself).
@@ -504,6 +510,7 @@ pub async fn rotate_user_keys(
             );
         }
     }
+    rebuild_result?;
 
     tracing::info!(
         "IAM user '{}' keys rotated (new: {})",

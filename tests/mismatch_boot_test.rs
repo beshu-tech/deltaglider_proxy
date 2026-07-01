@@ -119,8 +119,9 @@ async fn wrong_hash_boot_stays_locked_and_correct_hash_promotes_backup() {
         "boot 4: promote must consume .db.bak (recovery terminates)"
     );
     assert!(
-        !discarded_path.exists(),
-        "boot 4: promote must clean up .db.discarded after verifying the DB"
+        discarded_path.exists(),
+        "boot 4: promote must KEEP .db.discarded — the swapped-out live file is \
+         unverifiable and deleting it could destroy foreign-hash data"
     );
 
     // The promoted DB still has alice → IAM mode with the user intact.

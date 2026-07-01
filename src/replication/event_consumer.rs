@@ -318,7 +318,7 @@ pub fn spawn_event_consumer(
                 continue;
             }
 
-            drain_once(&db, &state, &replication, &instance_id, now).await;
+            drain_once(&config, &db, &state, &replication, &instance_id, now).await;
 
             let dbg = db.lock().await;
             let _ = dbg.replication_release_lease(CONSUMER_LEASE_KEY, &instance_id);
@@ -349,6 +349,7 @@ async fn seed_cursor_if_absent(db: &Arc<Mutex<ConfigDb>>) {
 /// act (copy/delete) under the per-rule lease, and advance the cursor to the
 /// highest CONTIGUOUS fully-handled id.
 async fn drain_once(
+    config: &crate::config::SharedConfig,
     db: &Arc<Mutex<ConfigDb>>,
     state: &Arc<AppState>,
     replication: &crate::config_sections::ReplicationConfig,
@@ -433,7 +434,23 @@ async fn drain_once(
                 dbg.replication_try_acquire_lease(&rule.name, instance_id, now, lease_ttl)
             };
             match got {
-                Ok(true) => {}
+                Ok(true) => {
+                    // Post-acquire re-check against the LIVE config (the rule
+                    // snapshot is a tick stale): delete_rule verifies our lease
+                    // under the config lock, so a vanished rule = lost race.
+                    if !config
+                        .read()
+                        .await
+                        .replication
+                        .rules
+                        .iter()
+                        .any(|r| r.name == rule.name)
+                    {
+                        let dbg = db.lock().await;
+                        let _ = dbg.replication_release_lease(&rule.name, instance_id);
+                        continue;
+                    }
+                }
                 Ok(false) => {
                     // Busy on another worker — leave for next tick (don't advance
                     // past this key's events).
@@ -455,6 +472,13 @@ async fn drain_once(
             {
                 let dbg = db.lock().await;
                 let _ = dbg.replication_release_lease(&rule.name, instance_id);
+                // Mid-drain heartbeat: a long drain (up to 500 engine copies)
+                // must keep pinning the background pruner's staleness floor.
+                let _ = dbg.listener_cursor_advance(
+                    REPLICATION_LISTENER,
+                    cursor,
+                    current_unix_seconds(),
+                );
             }
 
             if let Err(err) = outcome {

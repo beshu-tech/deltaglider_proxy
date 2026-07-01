@@ -63,11 +63,13 @@ pub struct RevokeUserRequest {
 }
 
 /// Result of a fan-out revocation, so callers can report honestly: how many
-/// sessions died HERE, whether the epoch is durable, whether peers were pushed.
+/// sessions died HERE, whether the epoch is durable, whether peers were pushed,
+/// and whether ANY cross-instance path exists (sync configured + not blocked).
 pub(crate) struct RevokeOutcome {
     pub revoked_local: usize,
     pub persisted: bool,
     pub pushed: bool,
+    pub sync_reachable: bool,
 }
 
 /// Revoke every live session for each identity: locally, durably, and on peers.
@@ -96,15 +98,24 @@ pub(crate) async fn revoke_identities_everywhere(
         }
     }
 
-    let pushed = persisted
-        && matches!(
-            super::push_config_sync_now(state).await,
-            super::SyncPush::Uploaded
-        );
+    let (pushed, sync_reachable) = if persisted {
+        match super::push_config_sync_now(state).await {
+            super::SyncPush::Uploaded => (true, true),
+            // Failed pushes are queued (mark_needs_upload) — the poll flush
+            // still delivers, so a convergence bound exists.
+            super::SyncPush::Failed(_) => (false, true),
+            // No sync path at all: disabled, or blocked by a mismatch
+            // incident (nothing flushes until recovery) — no bound.
+            super::SyncPush::Disabled | super::SyncPush::BlockedMismatch => (false, false),
+        }
+    } else {
+        (false, false)
+    };
     RevokeOutcome {
         revoked_local,
         persisted,
         pushed,
+        sync_reachable,
     }
 }
 
@@ -128,12 +139,12 @@ pub async fn revoke_user_sessions(
     audit_log("session_revoke_user", "admin", &identity, &headers);
 
     // Peers POLL the sync bucket every 5 minutes: pushed ⇒ they converge within
-    // one poll (~300s); persisted-not-pushed ⇒ our next poll flushes the upload
-    // first, so up to two cycles (~600s); not persisted ⇒ no cross-instance
-    // guarantee at all (local-only revoke).
+    // one poll (~300s); persisted + queued push ⇒ our poll flushes first, so up
+    // to two cycles (~600s); no reachable sync (disabled / mismatch-blocked) or
+    // not persisted ⇒ NO cross-instance guarantee (local-only revoke).
     let propagation_bound_secs = if outcome.pushed {
         Some(300)
-    } else if outcome.persisted {
+    } else if outcome.persisted && outcome.sync_reachable {
         Some(600)
     } else {
         None

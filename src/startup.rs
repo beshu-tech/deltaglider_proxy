@@ -746,40 +746,56 @@ fn should_preserve_as_backup(db_exists: bool, bak_exists: bool) -> bool {
 }
 
 /// What to do about a lingering `.db.bak` when the live config DB OPENED fine.
-/// A lingering backup means an earlier mismatch incident is still unresolved.
+/// A lingering backup means an earlier mismatch incident MAY be unresolved.
+/// Promotion is deliberately NOT an Ok-branch option: the real incident's
+/// recovery (correct hash restored) always lands in the ERR branch, so an
+/// Ok-open node never auto-swaps databases.
 #[derive(Debug, PartialEq, Eq)]
 enum BakDisposition {
     /// No `.db.bak` on disk — the normal healthy boot.
     NoBak,
-    /// The backup does NOT open with the current hash: the incident is still
-    /// live (the good DB is parked in `.db.bak`) — stay mismatched/locked.
+    /// Backup undecryptable + live DB EMPTY: the wrong-hash incident shape —
+    /// stay mismatched/locked (the good DB is parked in `.db.bak`).
     Sticky,
-    /// The backup opens with the current hash AND the live DB is empty:
-    /// finish the recovery by promoting the backup over the empty live DB.
-    Promote,
-    /// The backup opens but the live DB has users — never auto-delete data on
-    /// a healthy node; tell the operator to remove the stale backup manually.
+    /// Anything else (bak decrypts, or the live DB has users): a stray backup
+    /// on a working node — warn loudly, never lock, never touch either file.
     AmbiguousWarn,
 }
 
 /// Pure classifier for a lingering `.db.bak` on an Ok-open boot. When
-/// `bak_exists` is false the other inputs are don't-cares.
+/// `bak_exists` is false the other inputs are don't-cares. `bak_users` is
+/// `None` when the backup does not decrypt with the current hash.
 fn classify_lingering_bak(
     bak_exists: bool,
-    bak_decrypts: bool,
+    bak_users: Option<usize>,
     live_user_count: usize,
 ) -> BakDisposition {
-    match (bak_exists, bak_decrypts, live_user_count) {
+    match (bak_exists, bak_users, live_user_count) {
         (false, _, _) => BakDisposition::NoBak,
-        (true, false, _) => BakDisposition::Sticky,
-        (true, true, 0) => BakDisposition::Promote,
-        (true, true, _) => BakDisposition::AmbiguousWarn,
+        // Undecryptable bak + EMPTY live DB = the boot-2 incident shape.
+        (true, None, 0) => BakDisposition::Sticky,
+        // A populated live DB that opens is NOT the incident DB — a stray
+        // undecryptable bak must not lock a healthy node.
+        (true, None, _) => BakDisposition::AmbiguousWarn,
+        (true, Some(_), _) => BakDisposition::AmbiguousWarn,
     }
 }
 
+/// Probe `.db.bak` with the current hash: `Some(user_count)` when it opens,
+/// `None` when it doesn't. A junk/empty file opens under ANY hash (SQLCipher
+/// treats it as fresh) — the user count is what distinguishes a real parked
+/// IAM DB from junk, so promotion requires `Some(n) with n > 0`.
+fn probe_bak_users(bak_path: &std::path::Path, admin_password_hash: &str) -> Option<usize> {
+    deltaglider_proxy::config_db::ConfigDb::open_or_create(bak_path, admin_password_hash)
+        .ok()
+        .and_then(|db| db.load_users().ok())
+        .map(|u| u.len())
+}
+
 /// Promote `.db.bak` over the live DB: park the live file as `.db.discarded`,
-/// move the backup into place, verify it opens, then drop the parked copy.
-/// Rename-based so a crash mid-promote leaves both files recoverable on disk.
+/// move the backup into place, verify it opens. The parked file is KEPT — the
+/// Err-branch live DB is unverifiable (it merely failed to open with the
+/// current hash), so deleting it could destroy real data under another hash.
 fn promote_backup_db(
     db_file: &std::path::Path,
     bak_path: &std::path::Path,
@@ -804,10 +820,11 @@ fn promote_backup_db(
     }
     let db = deltaglider_proxy::config_db::ConfigDb::open_or_create(db_file, admin_password_hash)
         .map_err(|e| format!("reopen promoted {}: {e}", db_file.display()))?;
-    let _ = std::fs::remove_file(&discarded);
     info!(
-        "config-db mismatch incident resolved: promoted backup {} over the live DB",
-        bak_path.display()
+        "config-db mismatch incident resolved: promoted backup {} over the live DB \
+         (previous live file kept as {} — remove it manually once verified)",
+        bak_path.display(),
+        discarded.display()
     );
     Ok(db)
 }
@@ -847,51 +864,32 @@ fn init_config_db_attempt(
             // node with an unresolved mismatch incident must stay locked.
             let bak_path = db_file.with_extension("db.bak");
             let disposition = if bak_path.exists() {
-                let bak_decrypts = deltaglider_proxy::config_db::ConfigDb::open_or_create(
-                    &bak_path,
-                    admin_password_hash,
-                )
-                .is_ok();
-                // On a load error err on the side of "has users" — never
-                // auto-promote over a live DB whose emptiness is unverified.
+                let bak_users = probe_bak_users(&bak_path, admin_password_hash);
+                // On a load error err on the side of "has users" — a populated
+                // live DB must never be treated as the incident-empty DB.
                 let live_user_count = db.load_users().map(|u| u.len()).unwrap_or(usize::MAX);
-                classify_lingering_bak(true, bak_decrypts, live_user_count)
+                classify_lingering_bak(true, bak_users, live_user_count)
             } else {
                 BakDisposition::NoBak
             };
-            let db = match disposition {
-                BakDisposition::NoBak => db,
+            match disposition {
+                BakDisposition::NoBak => {}
                 BakDisposition::Sticky => {
                     error!(
-                        "Lingering {} does not decrypt with the current bootstrap password hash — \
-                         an earlier mismatch incident is unresolved. S3 API stays locked; restart \
-                         with the original bootstrap password or use the admin GUI recovery wizard.",
+                        "Lingering {} does not decrypt with the current bootstrap password hash \
+                         and the live DB is empty — an earlier mismatch incident is unresolved. \
+                         S3 API stays locked; restart with the original bootstrap password or \
+                         use the admin GUI recovery wizard.",
                         bak_path.display()
                     );
                     return (Some(Arc::new(tokio::sync::Mutex::new(db))), true);
                 }
-                BakDisposition::Promote => {
-                    drop(db);
-                    match promote_backup_db(&db_file, &bak_path, admin_password_hash) {
-                        Ok(promoted) => promoted,
-                        Err(err) => {
-                            error!(
-                                "Failed to promote {} over the empty live DB: {err} — S3 API \
-                                 stays locked; both files remain on disk for manual recovery.",
-                                bak_path.display()
-                            );
-                            return (None, true);
-                        }
-                    }
-                }
                 BakDisposition::AmbiguousWarn => {
                     warn!(
-                        "Stale {} decrypts with the current bootstrap password hash but the live \
-                         DB already has users — refusing to touch either. Remove the stale \
-                         backup manually.",
+                        "Stale {} sits next to a working live config DB — refusing to touch \
+                         either file. Remove the stale backup manually.",
                         bak_path.display()
                     );
-                    db
                 }
             };
             match db.replication_reconcile_on_boot(config.replication.max_failures_retained) {
@@ -1064,18 +1062,15 @@ fn init_config_db_attempt(
         }
         Err(e) => {
             let bak_path = db_file.with_extension("db.bak");
-            // Recovery boot: the live DB won't open but .db.bak DOES open with
-            // the current hash — the operator restarted with the GOOD password.
-            // Promote the backup and retry once instead of wedging forever
-            // (the live file is the incident-created DB under the wrong hash).
+            // Recovery boot: the live DB won't open but .db.bak opens with the
+            // current hash AND contains users — the operator restarted with the
+            // GOOD password. Promote and retry once instead of wedging forever.
+            // The user-count gate is the safety anchor: a junk/zero-byte bak
+            // opens under ANY hash, and promoting it would destroy the live DB.
             if allow_promote
                 && db_file.exists()
                 && bak_path.exists()
-                && deltaglider_proxy::config_db::ConfigDb::open_or_create(
-                    &bak_path,
-                    admin_password_hash,
-                )
-                .is_ok()
+                && probe_bak_users(&bak_path, admin_password_hash).is_some_and(|n| n > 0)
             {
                 match promote_backup_db(&db_file, &bak_path, admin_password_hash) {
                     Ok(db) => {
@@ -1399,29 +1394,30 @@ mod tests {
     fn lingering_bak_disposition_truth_table() {
         use BakDisposition::*;
         // No bak → healthy boot regardless of the other (don't-care) inputs.
-        assert_eq!(classify_lingering_bak(false, false, 0), NoBak);
-        assert_eq!(classify_lingering_bak(false, false, 3), NoBak);
-        assert_eq!(classify_lingering_bak(false, true, 0), NoBak);
-        assert_eq!(classify_lingering_bak(false, true, 3), NoBak);
-        // Bak that does NOT decrypt → incident unresolved → sticky mismatch,
-        // regardless of live users. This is the boot-2 regression fix.
-        assert_eq!(classify_lingering_bak(true, false, 0), Sticky);
-        assert_eq!(classify_lingering_bak(true, false, 7), Sticky);
-        // Bak decrypts + empty live DB → complete the recovery.
-        assert_eq!(classify_lingering_bak(true, true, 0), Promote);
-        // Bak decrypts but live DB has users → never auto-delete on a healthy
-        // node; warn only (includes the load-error sentinel usize::MAX).
-        assert_eq!(classify_lingering_bak(true, true, 1), AmbiguousWarn);
+        assert_eq!(classify_lingering_bak(false, None, 0), NoBak);
+        assert_eq!(classify_lingering_bak(false, None, 3), NoBak);
+        assert_eq!(classify_lingering_bak(false, Some(2), 0), NoBak);
+        // Undecryptable bak + EMPTY live DB = the boot-2 incident shape.
+        assert_eq!(classify_lingering_bak(true, None, 0), Sticky);
+        // Undecryptable bak next to a POPULATED live DB is a stray file on a
+        // healthy node — never lock it (includes the load-error sentinel).
+        assert_eq!(classify_lingering_bak(true, None, 7), AmbiguousWarn);
         assert_eq!(
-            classify_lingering_bak(true, true, usize::MAX),
+            classify_lingering_bak(true, None, usize::MAX),
             AmbiguousWarn
         );
+        // A decryptable bak never auto-promotes on an Ok-open boot — the real
+        // incident's recovery always lands in the Err branch.
+        assert_eq!(classify_lingering_bak(true, Some(0), 0), AmbiguousWarn);
+        assert_eq!(classify_lingering_bak(true, Some(3), 0), AmbiguousWarn);
+        assert_eq!(classify_lingering_bak(true, Some(3), 5), AmbiguousWarn);
     }
 
     /// The promote rename dance: park live as .discarded, move .bak into
-    /// place, verify it opens, then drop the parked copy.
+    /// place, verify it opens. The parked live file is KEPT (the Err-branch
+    /// live DB is unverifiable — deleting it could destroy foreign-hash data).
     #[test]
-    fn promote_backup_db_swaps_and_cleans_up() {
+    fn promote_backup_db_swaps_and_keeps_discarded() {
         let dir = tempfile::tempdir().unwrap();
         let db_file = dir.path().join("deltaglider_config.db");
         let bak = db_file.with_extension("db.bak");
@@ -1435,13 +1431,28 @@ mod tests {
         assert!(db_file.exists(), "live DB must exist after promote");
         assert!(!bak.exists(), ".db.bak must be consumed by promote");
         assert!(
-            !db_file.with_extension("db.discarded").exists(),
-            ".db.discarded must be removed after a verified promote"
+            db_file.with_extension("db.discarded").exists(),
+            ".db.discarded must be KEPT for manual recovery"
         );
         // The promoted live DB opens with the good hash.
         assert!(
             deltaglider_proxy::config_db::ConfigDb::open_or_create(&db_file, "$2b$04$good").is_ok()
         );
+    }
+
+    /// The junk-bak guard: a zero-byte `.db.bak` opens under ANY hash
+    /// (SQLCipher treats it as fresh) but reports zero users — the promote
+    /// gate must treat it as non-promotable so it can never destroy the
+    /// real live DB.
+    #[test]
+    fn probe_bak_users_zero_byte_bak_is_not_promotable() {
+        let dir = tempfile::tempdir().unwrap();
+        let bak = dir.path().join("deltaglider_config.db.bak");
+        std::fs::write(&bak, b"").unwrap();
+        let users = probe_bak_users(&bak, "$2b$04$whatever");
+        assert_eq!(users, Some(0), "junk bak opens but has no users");
+        let promotable = users.is_some_and(|n| n > 0);
+        assert!(!promotable, "the Err-branch promote gate must refuse a junk bak");
     }
 
     // ── startup_declarative_action policy (IaC cold-start guards) ──────────

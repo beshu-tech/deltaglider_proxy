@@ -505,6 +505,9 @@ impl ConfigDb {
     /// the lease fresh. A genuinely dead runner's row becomes claimable
     /// within one lease TTL because the worker loop calls this on every
     /// poll tick, not just at boot. Returns the number re-queued.
+    /// KNOWN LIMIT: a migrate job settled 'cancelled' here skips the live
+    /// worker's pre-flip unwind; its transient __dgmigrate_* route stays until
+    /// the next boot reconcile clears it (gated + hidden from listings = inert).
     pub fn maintenance_requeue_abandoned(&self) -> Result<usize, ConfigDbError> {
         let now = current_unix_seconds();
         // Operator cancel is authoritative: a dead runner's 'cancelling' row

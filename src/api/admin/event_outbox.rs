@@ -216,10 +216,25 @@ pub async fn purge_failed(
     // Unlike the background pruner, the operator floor ignores cursor staleness:
     // ANY existing listener cursor pins it — a stalled consumer's unconsumed rows
     // must never become purgeable just because it stopped ticking for an hour.
-    let min_keep_id = db
-        .event_outbox_min_listener_cursor()
+    // EXCEPTION: replication RETIRED (globally disabled or zero rules) — its
+    // orphaned cursor row would otherwise pin the floor forever; fall back to
+    // the staleness-filtered floor so webhook-only deployments can still purge.
+    let replication_retired = {
+        let cfg = state.config.read().await;
+        !cfg.replication.enabled || cfg.replication.rules.is_empty()
+    };
+    let min_keep_id = if replication_retired {
+        db.event_outbox_min_active_listener_cursor(
+            crate::event_outbox::current_unix_seconds(),
+            crate::event_delivery::LISTENER_CURSOR_STALE_SECS,
+        )
         .unwrap_or(None)
-        .unwrap_or(i64::MAX);
+        .unwrap_or(i64::MAX)
+    } else {
+        db.event_outbox_min_listener_cursor()
+            .unwrap_or(None)
+            .unwrap_or(i64::MAX)
+    };
 
     let above = db
         .event_outbox_failed_above_floor(min_keep_id)

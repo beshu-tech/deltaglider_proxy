@@ -125,6 +125,10 @@ async fn run_due_rules(
                 "Replication scheduler deferring rule '{}': destination '{}' is under maintenance",
                 rule.name, rule.destination.bucket
             );
+            // Release the just-acquired lease — leaking it blocks run-now AND
+            // (via the lease-anchored liveness check) rule deletion for a TTL.
+            let db = db.lock().await;
+            let _ = db.replication_release_lease(&rule.name, instance_id);
             continue;
         }
 

@@ -87,10 +87,17 @@ impl ConfigDbSync {
     ) -> Result<Self, String> {
         let client = Self::build_client(backend_config).await?;
 
-        // Clean up orphaned .db.tmp files from previous interrupted downloads
-        let tmp_path = local_path.with_extension("db.tmp");
-        if tmp_path.exists() {
-            let _ = std::fs::remove_file(&tmp_path);
+        // Clean up orphaned .db.tmp* files from previous interrupted downloads
+        // (per-download unique suffixes — see download_if_newer).
+        if let (Some(dir), Some(stem)) = (local_path.parent(), local_path.file_name()) {
+            let prefix = format!("{}.tmp", stem.to_string_lossy());
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for e in entries.flatten() {
+                    if e.file_name().to_string_lossy().starts_with(&prefix) {
+                        let _ = std::fs::remove_file(e.path());
+                    }
+                }
+            }
         }
 
         Ok(Self {
@@ -242,8 +249,12 @@ impl ConfigDbSync {
             return Err("Downloaded config DB from S3 is empty".to_string());
         }
 
-        // Write to a temp file first, then validate before replacing
-        let tmp_path = self.local_path.with_extension("db.tmp");
+        // Write to a per-download UNIQUE temp file (concurrent poll / sync-now /
+        // conflict-reconcile downloads must never clobber each other's tmp),
+        // then validate before the caller merges from it.
+        let tmp_path = self
+            .local_path
+            .with_extension(format!("db.tmp.{}", uuid::Uuid::new_v4().simple()));
         tokio::fs::write(&tmp_path, &data)
             .await
             .map_err(|e| format!("Failed to write temp config DB: {}", e))?;
@@ -457,6 +468,15 @@ pub async fn upload_with_reconcile(
                 last_err = UploadError::Conflict;
                 // Pull + merge the peer's version so the retried upload sits
                 // on top of the reconciled DB instead of clobbering it.
+                // KNOWN LIMIT: IAM tables are replace-merged (last-writer-wins,
+                // the pre-existing sync model) — a concurrent peer mutation can
+                // revert THIS node's row-level change; only session_revocations
+                // merge monotonically. Callers with security-critical intent
+                // must re-assert it after this returns (revoke does).
+                warn!(
+                    "Config DB sync ({context}): CAS conflict — merging peer state before retry; \
+                     concurrent IAM row changes resolve last-writer-wins"
+                );
                 match sync.download_if_newer().await {
                     Ok(Some(dl)) => {
                         let applied = reopen_and_rebuild_iam(

@@ -159,6 +159,12 @@ async fn run_due_rules(
                 "Lifecycle scheduler deferring rule '{}': bucket '{}' is under maintenance",
                 rule.name, busy
             );
+            // Release the just-acquired lease — leaking it blocks run-now
+            // for a full TTL after the maintenance window.
+            if let Some(db) = db.as_ref() {
+                let db = db.lock().await;
+                let _ = db.lifecycle_release_lease(&rule.name, instance_id);
+            }
             continue;
         }
 
