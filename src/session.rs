@@ -132,7 +132,8 @@ pub struct SessionSummary {
     pub admin_gui: bool,
     /// Auth kind: bootstrap / iam / iam_browser / open / external.
     pub auth: String,
-    /// access_key_id (IAM) or provider name (external); None for bootstrap/open.
+    /// Revocation identity: access_key_id (IAM) or `provider:user_id`
+    /// (external); None for bootstrap/open.
     pub identity: Option<String>,
 }
 
@@ -181,7 +182,9 @@ impl SessionStore {
         self.ttl
     }
 
-    fn entry_valid(&self, info: &SessionInfo, ip: Option<IpAddr>) -> bool {
+    /// TTL + cross-instance revocation-epoch check (no IP binding) — the
+    /// "does this session still exist anywhere" half of `entry_valid`.
+    fn entry_live(&self, info: &SessionInfo) -> bool {
         if info.created_at.elapsed() >= self.ttl {
             return false;
         }
@@ -195,25 +198,27 @@ impl SessionStore {
                 }
             }
         }
-        if let Some(stored_ip) = info.ip {
-            match ip {
-                Some(caller_ip) if caller_ip == stored_ip => {}
-                Some(caller_ip) => {
-                    tracing::warn!(
-                        "Session IP mismatch: stored={}, caller={}",
-                        stored_ip,
-                        caller_ip
-                    );
-                    return false;
-                }
-                None => {
-                    tracing::warn!(
-                        "Session has IP binding ({}) but caller provided no IP",
-                        stored_ip
-                    );
-                    return false;
-                }
+        true
+    }
+
+    fn entry_valid(&self, info: &SessionInfo, ip: Option<IpAddr>) -> bool {
+        if !self.entry_live(info) {
+            return false;
+        }
+        if !ip_ok(info.ip, ip) {
+            match (info.ip, ip) {
+                (Some(stored_ip), Some(caller_ip)) => tracing::warn!(
+                    "Session IP mismatch: stored={}, caller={}",
+                    stored_ip,
+                    caller_ip
+                ),
+                (Some(stored_ip), None) => tracing::warn!(
+                    "Session has IP binding ({}) but caller provided no IP",
+                    stored_ip
+                ),
+                _ => {}
             }
+            return false;
         }
         true
     }
@@ -298,27 +303,21 @@ impl SessionStore {
         token.chars().take(12).collect()
     }
 
-    /// List live (non-expired) sessions for the admin revocation UI. Redacted:
-    /// never returns the token or S3 secret — only a short id, IP, age, kind,
-    /// and the auth identity (access key / provider).
+    /// List live (non-expired, non-revoked) sessions for the admin revocation
+    /// UI. Redacted: never returns the token or S3 secret — only a short id,
+    /// IP, age, kind, and the revocation identity (access key / provider:user_id).
     pub fn list(&self) -> Vec<SessionSummary> {
         let sessions = self.sessions.read();
         sessions
             .iter()
-            .filter(|(_, info)| info.created_at.elapsed() < self.ttl)
+            .filter(|(_, info)| self.entry_live(info))
             .map(|(token, info)| {
-                let (auth, identity) = match &info.auth_method {
-                    AuthMethod::Bootstrap => ("bootstrap", None),
-                    AuthMethod::IamLoginAs { access_key_id } => {
-                        ("iam", Some(access_key_id.clone()))
-                    }
-                    AuthMethod::IamBrowserLift { access_key_id } => {
-                        ("iam_browser", Some(access_key_id.clone()))
-                    }
-                    AuthMethod::OpenLift => ("open", None),
-                    AuthMethod::External { provider_name, .. } => {
-                        ("external", Some(provider_name.clone()))
-                    }
+                let auth = match &info.auth_method {
+                    AuthMethod::Bootstrap => "bootstrap",
+                    AuthMethod::IamLoginAs { .. } => "iam",
+                    AuthMethod::IamBrowserLift { .. } => "iam_browser",
+                    AuthMethod::OpenLift => "open",
+                    AuthMethod::External { .. } => "external",
                 };
                 SessionSummary {
                     id: Self::session_id(token),
@@ -326,7 +325,9 @@ impl SessionStore {
                     age_secs: info.created_at.elapsed().as_secs(),
                     admin_gui: info.kind == SessionKind::AdminGui,
                     auth: auth.to_string(),
-                    identity,
+                    // The same string revoke-by-identity matches on, so what the
+                    // admin sees in the table is exactly what they can revoke.
+                    identity: info.auth_method.revocation_identity(),
                 }
             })
             .collect()
@@ -355,18 +356,15 @@ impl SessionStore {
         !targets.is_empty()
     }
 
-    /// Force-logout EVERY session of an IAM user (by access_key_id). Used when a
-    /// key is rotated/compromised — rotating the key alone does NOT invalidate
+    /// Force-logout EVERY session matching a revocation identity (IAM
+    /// access_key_id or `provider:user_id` for external logins). Used when a
+    /// key is compromised — rotating the key alone does NOT invalidate
     /// already-minted session cookies. Returns the count revoked.
-    pub fn revoke_by_access_key(&self, access_key_id: &str) -> usize {
+    pub fn revoke_by_identity(&self, identity: &str) -> usize {
         let mut sessions = self.sessions.write();
         let targets: Vec<String> = sessions
             .iter()
-            .filter(|(_, info)| match &info.auth_method {
-                AuthMethod::IamLoginAs { access_key_id: k }
-                | AuthMethod::IamBrowserLift { access_key_id: k } => k == access_key_id,
-                _ => false,
-            })
+            .filter(|(_, info)| info.auth_method.revocation_identity().as_deref() == Some(identity))
             .map(|(t, _)| t.clone())
             .collect();
         for t in &targets {
@@ -383,11 +381,12 @@ impl SessionStore {
         }
     }
 
-    /// Retrieve S3 credentials from a session (if present and session is valid).
-    pub fn get_s3_creds(&self, token: &str) -> Option<S3SessionCredentials> {
+    /// Retrieve S3 credentials from a session — full validity gate (TTL +
+    /// revocation epoch + IP binding), same as `validate`.
+    pub fn get_s3_creds(&self, token: &str, ip: Option<IpAddr>) -> Option<S3SessionCredentials> {
         let sessions = self.sessions.read();
         sessions.get(token).and_then(|info| {
-            if info.created_at.elapsed() >= self.ttl {
+            if !self.entry_valid(info, ip) {
                 return None;
             }
             info.s3_creds.clone()
@@ -420,6 +419,15 @@ impl SessionStore {
         self.sessions
             .write()
             .retain(|_, info| info.created_at.elapsed() < ttl);
+    }
+}
+
+/// Pure IP-binding check: a session bound to an IP is only valid for a caller
+/// presenting that same IP; unbound sessions accept any caller.
+fn ip_ok(stored: Option<IpAddr>, caller: Option<IpAddr>) -> bool {
+    match stored {
+        None => true,
+        Some(stored) => caller == Some(stored),
     }
 }
 
@@ -598,10 +606,130 @@ mod tests {
         assert!(store.validate(&user_t, None));
         assert!(!store.revoke_by_id("deadbeefdead"), "unknown id → false");
 
-        // revoke_by_access_key kills every session of that IAM user.
-        let n = store.revoke_by_access_key("AKIA1");
+        // revoke_by_identity kills every session of that IAM user.
+        let n = store.revoke_by_identity("AKIA1");
         assert_eq!(n, 1);
         assert!(!store.validate(&user_t, None));
+    }
+
+    #[test]
+    fn ip_ok_truth_table() {
+        let a: IpAddr = "10.0.0.1".parse().unwrap();
+        let b: IpAddr = "10.0.0.2".parse().unwrap();
+        // Unbound session: any caller (including none) is fine.
+        assert!(ip_ok(None, None));
+        assert!(ip_ok(None, Some(a)));
+        // Bound session: only the exact same IP passes.
+        assert!(ip_ok(Some(a), Some(a)));
+        assert!(!ip_ok(Some(a), Some(b)));
+        assert!(!ip_ok(Some(a), None));
+    }
+
+    #[test]
+    fn revoke_by_identity_matches_iam_and_external_but_not_bootstrap() {
+        let store = SessionStore::new();
+        let login_t = store.create_session(
+            None,
+            AuthMethod::IamLoginAs {
+                access_key_id: "AKZZ".into(),
+            },
+            SessionKind::AdminGui,
+        );
+        let lift_t = store.create_session(
+            None,
+            AuthMethod::IamBrowserLift {
+                access_key_id: "AKZZ".into(),
+            },
+            SessionKind::S3BrowserLift,
+        );
+        let boot_t = store.create_session(None, AuthMethod::Bootstrap, SessionKind::AdminGui);
+        let ext_t = store.create_session(
+            None,
+            AuthMethod::External {
+                provider_name: "okta".into(),
+                user_id: 7,
+            },
+            SessionKind::AdminGui,
+        );
+
+        // Both IAM variants match the access key; bootstrap/external untouched.
+        assert_eq!(store.revoke_by_identity("AKZZ"), 2);
+        assert!(!store.validate(&login_t, None));
+        assert!(!store.validate(&lift_t, None));
+        assert!(store.validate(&boot_t, None));
+        assert!(store.validate(&ext_t, None));
+
+        // External sessions are revocable via provider:user_id.
+        assert_eq!(store.revoke_by_identity("okta:7"), 1);
+        assert!(!store.validate(&ext_t, None));
+
+        // Bootstrap has no revocation identity — nothing to match.
+        assert_eq!(store.revoke_by_identity("bootstrap"), 0);
+        assert!(store.validate(&boot_t, None));
+    }
+
+    #[test]
+    fn list_omits_revoked_and_shows_external_identity() {
+        let store = SessionStore::new();
+        store.create_session(
+            None,
+            AuthMethod::External {
+                provider_name: "okta".into(),
+                user_id: 7,
+            },
+            SessionKind::AdminGui,
+        );
+        store.create_session(
+            None,
+            AuthMethod::IamLoginAs {
+                access_key_id: "AKL1".into(),
+            },
+            SessionKind::AdminGui,
+        );
+
+        // External rows expose the FULL provider:user_id revocation identity.
+        let list = store.list();
+        assert_eq!(list.len(), 2);
+        assert!(list.iter().any(|s| s.identity.as_deref() == Some("okta:7")));
+
+        // A revocation epoch at/after creation hides the session from list().
+        store.note_revocation("AKL1", now_unix() + 1);
+        let list = store.list();
+        assert_eq!(list.len(), 1);
+        assert!(list.iter().all(|s| s.identity.as_deref() != Some("AKL1")));
+    }
+
+    #[test]
+    fn get_s3_creds_gated_on_revocation_and_ip() {
+        let ip1: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip2: IpAddr = "10.0.0.2".parse().unwrap();
+        let store = SessionStore::new();
+        let token = store.create_session(
+            Some(ip1),
+            AuthMethod::IamBrowserLift {
+                access_key_id: "AKS3".into(),
+            },
+            SessionKind::S3BrowserLift,
+        );
+        store.set_s3_creds(
+            &token,
+            S3SessionCredentials {
+                endpoint: "http://localhost:9000".into(),
+                region: "us-east-1".into(),
+                bucket: "b".into(),
+                access_key_id: "AKS3".into(),
+                secret_access_key: "sekrit".into(),
+            },
+        );
+
+        assert!(store.get_s3_creds(&token, Some(ip1)).is_some());
+        // Wrong / missing caller IP: the stored secret must not come back.
+        assert!(store.get_s3_creds(&token, Some(ip2)).is_none());
+        assert!(store.get_s3_creds(&token, None).is_none());
+
+        // Revoked identity: creds gone even from the right IP.
+        store.note_revocation("AKS3", now_unix() + 1);
+        assert!(store.get_s3_creds(&token, Some(ip1)).is_none());
     }
 
     #[test]

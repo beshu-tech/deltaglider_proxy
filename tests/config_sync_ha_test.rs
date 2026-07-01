@@ -344,6 +344,151 @@ async fn ha_sync_now_is_noop_when_etag_unchanged() {
     );
 }
 
+/// Cross-instance session revocation: a session minted on replica B is killed
+/// by a revoke-by-identity issued on replica A. A persists the revocation
+/// epoch in the synced DB and pushes it (reconcile-then-retry upload); B pulls
+/// via sync-now, refreshes its revocation snapshot, and 401s the cookie.
+#[tokio::test]
+async fn ha_revocation_reaches_peer() {
+    skip_unless_minio!();
+
+    let sync_key = unique_config_sync_object_key();
+
+    let server_a = TestServer::builder()
+        .auth("HAKEY-A5", "HASECRET-A5-1234567890")
+        .s3_endpoint(&minio_endpoint_url())
+        .bucket(MINIO_BUCKET)
+        .config_sync_bucket(MINIO_BUCKET)
+        .config_sync_object_key(&sync_key)
+        .build()
+        .await;
+    let admin_a = admin_http_client(&server_a.endpoint()).await;
+
+    // IAM ADMIN user on A (login-as requires admin permissions).
+    let user_name = unique_user_name("ha-revoke");
+    let resp = admin_a
+        .post(format!("{}/_/api/admin/users", server_a.endpoint()))
+        .json(&json!({
+            "name": user_name,
+            "permissions": [{"actions": ["*"], "resources": ["*"]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 201, "create user on A must succeed");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let ak = body["access_key_id"].as_str().unwrap().to_string();
+    let sk = body["secret_access_key"].as_str().unwrap().to_string();
+
+    // Wait for A's user-create upload to land before booting B.
+    let s3 = server_a.s3_client().await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if s3
+            .head_object()
+            .bucket(MINIO_BUCKET)
+            .key(&sync_key)
+            .send()
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("A's config.db never appeared in sync bucket");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // Replica B pulls A's state at startup, so login-as works there.
+    let server_b = TestServer::builder()
+        .auth("HAKEY-B5", "HASECRET-B5-1234567890")
+        .s3_endpoint(&minio_endpoint_url())
+        .bucket(MINIO_BUCKET)
+        .config_sync_bucket(MINIO_BUCKET)
+        .config_sync_object_key(&sync_key)
+        .build()
+        .await;
+    let admin_b = admin_http_client(&server_b.endpoint()).await;
+
+    // Session minted ON B for the user (the stolen-cookie stand-in).
+    let cookie_b = reqwest::Client::builder()
+        .cookie_store(true)
+        .no_proxy()
+        .build()
+        .unwrap();
+    let resp = cookie_b
+        .post(format!("{}/_/api/admin/login-as", server_b.endpoint()))
+        .json(&json!({ "access_key_id": ak, "secret_access_key": sk }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "login-as on B must succeed after startup pull"
+    );
+    let resp = cookie_b
+        .get(format!("{}/_/api/admin/config", server_b.endpoint()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "B session must work pre-revoke"
+    );
+
+    // Revoke on A by identity — must be durable so B can converge.
+    let resp = admin_a
+        .post(format!(
+            "{}/_/api/admin/sessions/revoke-user",
+            server_a.endpoint()
+        ))
+        .json(&json!({ "identity": ak }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["persisted"], true,
+        "revocation must be persisted to the synced DB, got {body:?}"
+    );
+
+    // B pulls the revocation. The push on A is awaited before its response,
+    // but allow a few sync-now rounds in case the CAS upload needed the
+    // poll-flush fallback (pushed=false is still a valid durable outcome).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let sync = admin_b
+            .post(format!(
+                "{}/_/api/admin/config/sync-now",
+                server_b.endpoint()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert!(sync.status().is_success(), "sync-now on B must be 2xx");
+
+        let resp = cookie_b
+            .get(format!("{}/_/api/admin/config", server_b.endpoint()))
+            .send()
+            .await
+            .unwrap();
+        if resp.status().as_u16() == 401 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "B's session for revoked identity still valid after sync-now; last status {}",
+                resp.status()
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 /// Wrong-passphrase rejection: replica B boots with a DIFFERENT
 /// bootstrap password than A. Its startup sync downloads A's DB,
 /// the `ConfigDb::open_or_create` validation step fails (the SQLCipher

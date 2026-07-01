@@ -55,38 +55,97 @@ pub async fn revoke_session(
 
 #[derive(Deserialize)]
 pub struct RevokeUserRequest {
-    pub access_key_id: String,
+    /// Revocation identity: an IAM access_key_id or `provider:user_id` for
+    /// external logins (what the sessions list shows in its Identity column).
+    pub identity: Option<String>,
+    /// Legacy alias for `identity` (older UI builds post this field).
+    pub access_key_id: Option<String>,
 }
 
-/// POST /api/admin/sessions/revoke-user — force-logout EVERY session of an IAM
-/// user (by access_key_id), on THIS instance AND every other. The escape hatch
-/// when a key is compromised.
+/// Result of a fan-out revocation, so callers can report honestly: how many
+/// sessions died HERE, whether the epoch is durable, whether peers were pushed.
+pub(crate) struct RevokeOutcome {
+    pub revoked_local: usize,
+    pub persisted: bool,
+    pub pushed: bool,
+}
+
+/// Revoke every live session for each identity: locally, durably, and on peers.
+/// Ordering IS the security invariant: local kill + in-memory epoch FIRST (this
+/// node fails closed immediately), durable epoch second, peer push last.
+pub(crate) async fn revoke_identities_everywhere(
+    state: &Arc<AdminState>,
+    identities: &[String],
+) -> RevokeOutcome {
+    let now = crate::event_outbox::current_unix_seconds();
+    let mut revoked_local = 0;
+    for identity in identities {
+        revoked_local += state.sessions.revoke_by_identity(identity);
+        state.sessions.note_revocation(identity, now);
+    }
+
+    let mut persisted = false;
+    if let Some(db) = state.config_db.as_ref() {
+        let db = db.lock().await;
+        persisted = true;
+        for identity in identities {
+            if let Err(e) = db.revoke_identity_sessions(identity, now) {
+                tracing::warn!("revoke: failed to persist revocation for {identity}: {e}");
+                persisted = false;
+            }
+        }
+    }
+
+    let pushed = persisted
+        && matches!(
+            super::push_config_sync_now(state).await,
+            super::SyncPush::Uploaded
+        );
+    RevokeOutcome {
+        revoked_local,
+        persisted,
+        pushed,
+    }
+}
+
+/// POST /api/admin/sessions/revoke-user — force-logout EVERY session of an
+/// identity (IAM access key or external `provider:user_id`), on THIS instance
+/// AND — via the synced revocation epoch — every other. The escape hatch when
+/// a key or cookie is compromised.
 pub async fn revoke_user_sessions(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
     Json(req): Json<RevokeUserRequest>,
 ) -> impl IntoResponse {
-    // 1. Local, immediate: drop this node's live sessions for the key.
-    let n = state.sessions.revoke_by_access_key(&req.access_key_id);
+    let Some(identity) = req.identity.or(req.access_key_id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "identity (or access_key_id) is required" })),
+        );
+    };
 
-    // 2. Cross-instance: record the revoke epoch in the synced DB and note it
-    //    locally so `entry_valid` rejects the key everywhere (a stolen cookie
-    //    minted on another node is invalidated once the revocation syncs). Push
-    //    the sync immediately so peers converge in seconds, not the 5-min poll.
-    let now = crate::event_outbox::current_unix_seconds();
-    state.sessions.note_revocation(&req.access_key_id, now);
-    if let Some(db) = state.config_db.as_ref() {
-        let write = {
-            let db = db.lock().await;
-            db.revoke_identity_sessions(&req.access_key_id, now)
-        };
-        if let Err(e) = write {
-            tracing::warn!("revoke-user: failed to persist revocation: {e}");
-        } else {
-            super::trigger_config_sync(&state);
-        }
-    }
+    let outcome = revoke_identities_everywhere(&state, std::slice::from_ref(&identity)).await;
+    audit_log("session_revoke_user", "admin", &identity, &headers);
 
-    audit_log("session_revoke_user", "admin", &req.access_key_id, &headers);
-    (StatusCode::OK, Json(serde_json::json!({ "revoked": n })))
+    // Peers POLL the sync bucket every 5 minutes: pushed ⇒ they converge within
+    // one poll (~300s); persisted-not-pushed ⇒ our next poll flushes the upload
+    // first, so up to two cycles (~600s); not persisted ⇒ no cross-instance
+    // guarantee at all (local-only revoke).
+    let propagation_bound_secs = if outcome.pushed {
+        Some(300)
+    } else if outcome.persisted {
+        Some(600)
+    } else {
+        None
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "revoked": outcome.revoked_local,
+            "revoked_local": outcome.revoked_local,
+            "persisted": outcome.persisted,
+            "pushed": outcome.pushed,
+            "propagation_bound_secs": propagation_bound_secs,
+        })),
+    )
 }

@@ -56,11 +56,16 @@ export default function SessionsPanel({ onSessionExpired }: { onSessionExpired?:
   const revokeUser = async () => {
     const key = revokeKey.trim();
     if (!key) return;
-    if (!window.confirm(`Force-logout ALL sessions of access key "${key}" — on every instance. If this is YOUR OWN key you will be logged out too. Use this after rotating a compromised key.`)) return;
+    if (!window.confirm(`Force-logout ALL sessions of identity "${key}" — on every instance. If this is YOUR OWN identity you will be logged out too. Use this after rotating a compromised key.`)) return;
     try {
       setBusy('user');
       const res = await revokeUserSessions(key);
-      message.success(`Revoked ${res.revoked} session${res.revoked === 1 ? '' : 's'}`);
+      const local = `Revoked ${res.revoked_local} session${res.revoked_local === 1 ? '' : 's'} locally`;
+      if (!res.persisted) {
+        message.warning(`${local} — but the revocation could NOT be persisted; sessions on OTHER instances stay valid. Retry, or restart the peers.`);
+      } else {
+        message.success(`${local}; peers converge within ~${Math.ceil((res.propagation_bound_secs ?? 300) / 60)} min`);
+      }
       setRevokeKey('');
       await refresh();
     } catch (e) {
@@ -106,7 +111,7 @@ export default function SessionsPanel({ onSessionExpired }: { onSessionExpired?:
       <Table rowKey="id" size="small" columns={columns} dataSource={rows} loading={loading} pagination={false} />
       <Space.Compact style={{ maxWidth: 480 }}>
         <Input
-          placeholder="access_key_id to force-logout (all its sessions)"
+          placeholder="identity to force-logout: access_key_id, or provider:user-id for external users"
           value={revokeKey}
           onChange={(e) => setRevokeKey(e.target.value)}
           onPressEnter={() => void revokeUser()}

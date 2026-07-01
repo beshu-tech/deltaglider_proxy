@@ -15,7 +15,9 @@ use aws_credential_types::Credentials;
 use aws_sdk_s3::config::BehaviorVersion;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
+use rand::Rng;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
@@ -37,6 +39,28 @@ pub struct DownloadedDb {
     pub etag: Option<String>,
 }
 
+/// Why an upload failed: a CAS conflict (peer wrote concurrently — reconcile
+/// and retry) vs anything else (transport, permissions, empty DB, ...).
+#[derive(Debug)]
+pub enum UploadError {
+    Conflict,
+    Other(String),
+}
+
+impl std::fmt::Display for UploadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UploadError::Conflict => {
+                write!(
+                    f,
+                    "upload conflict: remote config DB changed since last sync"
+                )
+            }
+            UploadError::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
 pub struct ConfigDbSync {
     s3_client: Client,
     bucket: String,
@@ -45,6 +69,8 @@ pub struct ConfigDbSync {
     last_etag: Arc<RwLock<Option<String>>>,
     /// The local bootstrap password hash, used to validate downloaded DBs.
     bootstrap_password_hash: String,
+    /// Set when an upload exhausted its retries; the periodic poll flushes it.
+    needs_upload: AtomicBool,
 }
 
 impl ConfigDbSync {
@@ -74,7 +100,18 @@ impl ConfigDbSync {
             local_path,
             last_etag: Arc::new(RwLock::new(None)),
             bootstrap_password_hash,
+            needs_upload: AtomicBool::new(false),
         })
+    }
+
+    /// Queue an upload for the next poll tick (set after retry exhaustion).
+    pub fn mark_needs_upload(&self) {
+        self.needs_upload.store(true, Ordering::SeqCst);
+    }
+
+    /// Consume the pending-upload flag (the poll flush claims the work).
+    pub fn take_needs_upload(&self) -> bool {
+        self.needs_upload.swap(false, Ordering::SeqCst)
     }
 
     /// Build an S3 client from BackendConfig, reusing the same credentials.
@@ -264,16 +301,18 @@ impl ConfigDbSync {
     ///     send `If-None-Match: *` so the PUT fails with 412 if a peer
     ///     created it concurrently (instead of overwriting their copy).
     ///
-    /// On a precondition failure the upload is reported as a conflict; the
-    /// next poll cycle (`download_if_newer`) pulls the peer's version and the
-    /// caller can re-apply on top of the reconciled DB.
-    pub async fn upload(&self) -> Result<(), String> {
+    /// On a precondition failure the upload is reported as
+    /// [`UploadError::Conflict`]; `upload_with_reconcile` pulls the peer's
+    /// version, merges, and retries on top of the reconciled DB.
+    pub async fn upload(&self) -> Result<(), UploadError> {
         let data = tokio::fs::read(&self.local_path)
             .await
-            .map_err(|e| format!("Failed to read local config DB: {}", e))?;
+            .map_err(|e| UploadError::Other(format!("Failed to read local config DB: {}", e)))?;
 
         if data.is_empty() {
-            return Err("Local config DB is empty — refusing to upload".to_string());
+            return Err(UploadError::Other(
+                "Local config DB is empty — refusing to upload".to_string(),
+            ));
         }
 
         // Snapshot the ETag we expect the remote object to still carry. This is
@@ -296,23 +335,26 @@ impl ConfigDbSync {
             Ok(result) => result,
             Err(e) => {
                 let err_str = format!("{}", e);
-                if is_precondition_failed(&err_str) {
-                    // A peer instance updated the remote config DB since we last
-                    // synced. Forget our stale ETag so the next poll forces a
-                    // fresh HEAD+GET, then surface the conflict to the caller.
-                    *self.last_etag.write().await = None;
-                    warn!(
-                        "Config DB S3 upload conflict (bucket={}): remote copy changed since last sync \
-                         (expected etag={:?}) — a peer instance wrote concurrently; will re-sync on next poll",
-                        self.bucket, expected_etag
-                    );
-                    return Err(format!(
-                        "Config DB upload conflict: remote copy changed since last sync \
-                         (expected etag={:?}); re-sync and retry",
-                        expected_etag
-                    ));
+                match classify_upload_error(&err_str) {
+                    UploadError::Conflict => {
+                        // A peer instance updated the remote config DB since we
+                        // last synced. Forget our stale ETag so the next download
+                        // forces a fresh HEAD+GET, then surface the conflict.
+                        *self.last_etag.write().await = None;
+                        warn!(
+                            "Config DB S3 upload conflict (bucket={}): remote copy changed since last sync \
+                             (expected etag={:?}) — a peer instance wrote concurrently",
+                            self.bucket, expected_etag
+                        );
+                        return Err(UploadError::Conflict);
+                    }
+                    UploadError::Other(_) => {
+                        return Err(UploadError::Other(format!(
+                            "Failed to upload config DB to S3: {}",
+                            e
+                        )));
+                    }
                 }
-                return Err(format!("Failed to upload config DB to S3: {}", e));
             }
         };
 
@@ -376,6 +418,80 @@ fn is_precondition_failed(err_str: &str) -> bool {
     err_str.contains("PreconditionFailed")
         || err_str.contains("Precondition Failed")
         || err_str.contains("412")
+}
+
+/// Pure classifier: map a stringified S3 PUT error to [`UploadError`] —
+/// CAS precondition failures become `Conflict`, everything else `Other`.
+fn classify_upload_error(err_str: &str) -> UploadError {
+    if is_precondition_failed(err_str) {
+        UploadError::Conflict
+    } else {
+        UploadError::Other(err_str.to_string())
+    }
+}
+
+/// Maximum upload attempts before parking the work on the poll flush.
+const MAX_UPLOAD_ATTEMPTS: u32 = 3;
+
+/// Upload the config DB with reconcile-then-retry CAS-conflict handling.
+///
+/// Converges because each retry merges peer state FIRST (revocations are
+/// monotonic MAX-upserts), so the re-upload carries both sides' facts.
+/// On exhaustion the upload is queued (`mark_needs_upload`) so the periodic
+/// poll flushes it — a revocation is never silently dropped.
+#[allow(clippy::too_many_arguments)]
+pub async fn upload_with_reconcile(
+    sync: &ConfigDbSync,
+    config_db: &Option<Arc<Mutex<ConfigDb>>>,
+    admin_password_hash: &str,
+    iam_state: &SharedIamState,
+    external_auth: &Option<Arc<ExternalAuthManager>>,
+    sessions: Option<&Arc<crate::session::SessionStore>>,
+    context: &str,
+) -> Result<(), UploadError> {
+    let mut last_err = UploadError::Other("upload never attempted".to_string());
+    for attempt in 1..=MAX_UPLOAD_ATTEMPTS {
+        match sync.upload().await {
+            Ok(()) => return Ok(()),
+            Err(UploadError::Conflict) => {
+                last_err = UploadError::Conflict;
+                // Pull + merge the peer's version so the retried upload sits
+                // on top of the reconciled DB instead of clobbering it.
+                match sync.download_if_newer().await {
+                    Ok(Some(dl)) => {
+                        let applied = reopen_and_rebuild_iam(
+                            config_db,
+                            admin_password_hash,
+                            iam_state,
+                            external_auth,
+                            sessions,
+                            &dl.temp_path,
+                            context,
+                        )
+                        .await;
+                        if applied {
+                            sync.commit_downloaded_etag(dl.etag).await;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!("Config DB sync ({context}): reconcile download failed: {e}");
+                    }
+                }
+            }
+            Err(UploadError::Other(e)) => {
+                warn!("Config DB sync ({context}): upload attempt {attempt} failed: {e}");
+                last_err = UploadError::Other(e);
+            }
+        }
+        if attempt < MAX_UPLOAD_ATTEMPTS {
+            let jitter_ms = rand::thread_rng().gen_range(100..=300);
+            tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+        }
+    }
+    sync.mark_needs_upload();
+    warn!("Config DB sync ({context}): upload retries exhausted — queued for next poll tick");
+    Err(last_err)
 }
 
 /// Reopen the config DB file after an S3-sync download has replaced it
@@ -501,5 +617,24 @@ mod tests {
             "service error: AccessDenied (status 403)"
         ));
         assert!(!is_precondition_failed(""));
+    }
+
+    #[test]
+    fn upload_error_classification() {
+        // CAS precondition shapes → Conflict (reconcile-then-retry path).
+        assert!(matches!(
+            classify_upload_error("service error: PreconditionFailed"),
+            UploadError::Conflict
+        ));
+        assert!(matches!(
+            classify_upload_error("dispatch failure: response status: 412"),
+            UploadError::Conflict
+        ));
+        // Everything else → Other, carrying the original message.
+        match classify_upload_error("dispatch failure: connection refused") {
+            UploadError::Other(e) => assert!(e.contains("connection refused")),
+            UploadError::Conflict => panic!("transport error misclassified as conflict"),
+        }
+        assert!(matches!(classify_upload_error(""), UploadError::Other(_)));
     }
 }

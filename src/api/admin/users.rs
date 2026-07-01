@@ -391,6 +391,10 @@ pub async fn delete_user(
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let db = db.lock().await;
 
+    // Capture every revocation identity BEFORE the rows disappear: the access
+    // key plus each external login (`provider:user_id`, see AuthMethod).
+    let identities = revocation_identities_for_user(&db, user_id);
+
     db.delete_user(user_id).map_err(|e| {
         tracing::warn!("Failed to delete user {}: {}", user_id, e);
         StatusCode::NOT_FOUND
@@ -403,7 +407,19 @@ pub async fn delete_user(
     }
 
     rebuild_iam_index(&db, &state.iam_state)?;
+    drop(db);
     trigger_config_sync(&state);
+
+    // Deleting the user must also kill any live sessions it minted — here and
+    // on peers. The helper re-locks the DB, so it runs after the lock is dropped.
+    let outcome = super::sessions::revoke_identities_everywhere(&state, &identities).await;
+    if outcome.revoked_local > 0 {
+        tracing::info!(
+            "Revoked {} live session(s) of deleted user {}",
+            outcome.revoked_local,
+            user_id
+        );
+    }
 
     tracing::info!(
         "IAM user {} deleted ({} users remaining)",
@@ -412,6 +428,27 @@ pub async fn delete_user(
     );
     audit_log("delete_user", "admin", &user_id.to_string(), &headers);
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// All identities `revoke_identities_everywhere` should target when `user_id`
+/// is deleted: their access_key_id + one `provider:user_id` per external login.
+fn revocation_identities_for_user(db: &crate::config_db::ConfigDb, user_id: i64) -> Vec<String> {
+    let mut identities = Vec::new();
+    if let Ok(user) = db.get_user_by_id(user_id) {
+        identities.push(user.access_key_id);
+    }
+    if let (Ok(ext_ids), Ok(providers)) = (
+        db.get_external_identities_for_user(user_id),
+        db.load_auth_providers(),
+    ) {
+        for ext in ext_ids {
+            if let Some(provider) = providers.iter().find(|p| p.id == ext.provider_id) {
+                identities.push(format!("{}:{}", provider.name, user_id));
+            }
+        }
+    }
+    identities.dedup();
+    identities
 }
 
 /// POST /api/admin/users/:id/rotate-keys — set or regenerate access keys.
@@ -439,6 +476,9 @@ pub async fn rotate_user_keys(
         ),
     };
 
+    // Capture the OLD key before rotation: sessions minted with it must die.
+    let old_access_key = db.get_user_by_id(user_id).ok().map(|u| u.access_key_id);
+
     let user = db
         .rotate_keys(user_id, &new_access_key, &new_secret_key)
         .map_err(|e| {
@@ -447,7 +487,23 @@ pub async fn rotate_user_keys(
         })?;
 
     rebuild_iam_index(&db, &state.iam_state)?;
+    drop(db);
     trigger_config_sync(&state);
+
+    // Rotating a key does NOT invalidate already-minted session cookies —
+    // revoke the old identity everywhere (helper re-locks the DB itself).
+    if let Some(old_key) = old_access_key {
+        let outcome =
+            super::sessions::revoke_identities_everywhere(&state, std::slice::from_ref(&old_key))
+                .await;
+        if outcome.revoked_local > 0 {
+            tracing::info!(
+                "Revoked {} live session(s) of rotated key {}",
+                outcome.revoked_local,
+                old_key
+            );
+        }
+    }
 
     tracing::info!(
         "IAM user '{}' keys rotated (new: {})",

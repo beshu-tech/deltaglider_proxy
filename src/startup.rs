@@ -1280,6 +1280,23 @@ pub fn spawn_config_sync_poll(
                     warn!("Config DB S3 sync poll failed: {}", e);
                 }
             }
+            // Flush an upload that exhausted its retries earlier — a parked
+            // revocation/mutation must not wait for the next admin action.
+            if sync.take_needs_upload() {
+                if let Err(e) = deltaglider_proxy::config_db_sync::upload_with_reconcile(
+                    &sync,
+                    &db_arc,
+                    &password_hash,
+                    &iam,
+                    &ext_auth,
+                    Some(&sessions),
+                    "poll flush",
+                )
+                .await
+                {
+                    warn!("Config DB S3 sync poll: pending upload flush failed: {}", e);
+                }
+            }
         }
     });
 }

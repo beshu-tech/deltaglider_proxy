@@ -167,6 +167,46 @@ pub struct AdminState {
 pub type ParityCancels =
     Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>;
 
+/// Outcome of an awaited config-sync push (see [`push_config_sync_now`]).
+pub(crate) enum SyncPush {
+    /// No sync bucket configured on this instance.
+    Disabled,
+    /// Blocked: bootstrap password mismatch (recovery required).
+    BlockedMismatch,
+    /// The local DB is durably in S3 (possibly after reconcile retries).
+    Uploaded,
+    Failed(String),
+}
+
+/// Push the config DB to S3 NOW, awaited, with reconcile-then-retry on CAS
+/// conflicts. Callers that must report durability (session revocation) await
+/// this; fire-and-forget callers go through [`trigger_config_sync`].
+pub(crate) async fn push_config_sync_now(state: &Arc<AdminState>) -> SyncPush {
+    if state.config_db_mismatch {
+        tracing::warn!("Config sync blocked — bootstrap password mismatch (recovery required)");
+        return SyncPush::BlockedMismatch;
+    }
+    let Some(sync) = state.config_sync.as_ref() else {
+        return SyncPush::Disabled;
+    };
+    // Clone the hash out of the parking_lot lock before awaiting (guard isn't Send).
+    let password_hash = state.password_hash.read().clone();
+    match crate::config_db_sync::upload_with_reconcile(
+        sync,
+        &state.config_db,
+        &password_hash,
+        &state.iam_state,
+        &state.external_auth,
+        Some(&state.sessions),
+        "admin push",
+    )
+    .await
+    {
+        Ok(()) => SyncPush::Uploaded,
+        Err(e) => SyncPush::Failed(e.to_string()),
+    }
+}
+
 /// Trigger an async config DB upload to S3 if sync is enabled.
 /// Spawns a background task so the caller is not blocked.
 /// No-op when config_db_mismatch is true (prevents overwriting good DB with empty one).
@@ -175,16 +215,15 @@ pub(crate) fn trigger_config_sync(state: &Arc<AdminState>) {
         tracing::warn!("Config sync blocked — bootstrap password mismatch (recovery required)");
         return;
     }
-    if let Some(ref sync) = state.config_sync {
-        tokio::spawn({
-            let sync = sync.clone();
-            async move {
-                if let Err(e) = sync.upload().await {
-                    tracing::warn!("Config DB S3 sync upload failed: {}", e);
-                }
-            }
-        });
+    if state.config_sync.is_none() {
+        return;
     }
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        if let SyncPush::Failed(e) = push_config_sync_now(&state).await {
+            tracing::warn!("Config DB S3 sync upload failed: {}", e);
+        }
+    });
 }
 
 /// Run a synchronous operation against the locked config DB.
