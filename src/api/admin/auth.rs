@@ -977,6 +977,15 @@ pub async fn require_admin_gui_session(
         )
             .into_response();
     };
+    // No LIVE session (unknown / expired / REVOKED / wrong IP) is 401 — the UI
+    // must re-login. 403 is reserved for a live session of the wrong KIND.
+    if !state.sessions.validate(&token, client_ip) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "unauthorized"})),
+        )
+            .into_response();
+    }
     if !state.sessions.allows_admin_gui(&token, client_ip) {
         return (
             StatusCode::FORBIDDEN,
