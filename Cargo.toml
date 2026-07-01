@@ -1,6 +1,6 @@
 [package]
 name = "deltaglider_proxy"
-version = "1.9.2"
+version = "1.9.3"
 description = "S3-compatible proxy with transparent delta compression"
 license = "GPL-3.0-only"
 readme = "README.md"

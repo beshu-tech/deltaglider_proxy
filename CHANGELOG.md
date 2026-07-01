@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.9.3 — 2026-07-01
+
 ## v1.9.2 — 2026-07-01
 
 Replication performance + the kill/responsiveness fixes that an
