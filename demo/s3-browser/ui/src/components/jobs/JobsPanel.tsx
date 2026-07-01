@@ -367,20 +367,30 @@ export default function JobsPanel({ onSessionExpired }: Props) {
           <span />
         ) : (
           <Space size={4} onClick={(e) => e.stopPropagation()}>
-            {availableActions(d.row).map((a) => (
-              <Button
-                key={a}
-                size="small"
-                type="text"
-                danger={ACTION_META[a].danger}
-                icon={ACTION_META[a].icon}
-                loading={actionBusy === `${d.row.id}:${a}`}
-                title={ACTION_META[a].label}
-                onClick={() => void runAction(d.row, a)}
-              >
-                {ACTION_META[a].label}
-              </Button>
-            ))}
+            {availableActions(d.row).map((a) => {
+              // A one-off on a disabled/paused rule reads as "Run once" (it runs
+              // the rule a single time without re-enabling/resuming it).
+              const oneOff =
+                a === 'run-now' && (d.row.enabled === false || d.row.paused === true);
+              const label = oneOff ? 'Run once' : ACTION_META[a].label;
+              const title = oneOff
+                ? 'Run this rule once now — does not enable or resume it'
+                : ACTION_META[a].label;
+              return (
+                <Button
+                  key={a}
+                  size="small"
+                  type="text"
+                  danger={ACTION_META[a].danger}
+                  icon={ACTION_META[a].icon}
+                  loading={actionBusy === `${d.row.id}:${a}`}
+                  title={title}
+                  onClick={() => void runAction(d.row, a)}
+                >
+                  {label}
+                </Button>
+              );
+            })}
           </Space>
         ),
     },

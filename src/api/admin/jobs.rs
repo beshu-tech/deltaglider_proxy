@@ -732,11 +732,9 @@ pub async fn job_action(
             Ok((StatusCode::NO_CONTENT, Json(serde_json::json!({}))))
         }
         (JobSubsystem::Replication, JobAction::RunNow) => {
-            let Json(resp) = super::replication::run_now(Path(name), State(state)).await?;
-            Ok((
-                StatusCode::OK,
-                Json(serde_json::to_value(resp).map_err(internal)?),
-            ))
+            // Background run — returns 202 + the (running) status immediately.
+            let (code, Json(resp)) = super::replication::run_now(Path(name), State(state)).await?;
+            Ok((code, Json(serde_json::to_value(resp).map_err(internal)?)))
         }
         (JobSubsystem::Replication, JobAction::Verify) => {
             // Kicks off a BACKGROUND audit; returns 202 + the (running) status.

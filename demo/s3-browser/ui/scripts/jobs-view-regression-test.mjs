@@ -65,13 +65,23 @@ assert.equal(triggerLabel('oneoff'), 'one-off');
 
 // ── availableActions matrix ─────────────────────────────────────────────────
 assert.deepEqual(availableActions(row()), ['pause', 'run-now', 'delete']);
-assert.deepEqual(availableActions(row({ paused: true })), ['resume', 'delete'], 'paused blocks run-now');
+// run-now is a one-off: available even when paused or disabled (backend runs it
+// once without flipping the flag). Only a RUNNING rule has nothing to trigger.
+assert.deepEqual(
+  availableActions(row({ paused: true })),
+  ['resume', 'run-now', 'delete'],
+  'paused still allows a one-off run'
+);
 assert.deepEqual(
   availableActions(row({ status: 'running' })),
   ['pause', 'kill', 'delete'],
   'mid-run: kill available, run-now blocked'
 );
-assert.deepEqual(availableActions(row({ enabled: false })), ['pause', 'delete'], 'disabled blocks run-now');
+assert.deepEqual(
+  availableActions(row({ enabled: false })),
+  ['pause', 'run-now', 'delete'],
+  'disabled still allows a one-off run'
+);
 assert.deepEqual(
   availableActions(row({ kind: 'lifecycle' })),
   ['pause', 'preview', 'run-now', 'delete']

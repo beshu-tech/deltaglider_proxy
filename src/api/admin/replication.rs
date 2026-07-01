@@ -13,7 +13,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::Serialize;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Response for run-now.
 #[derive(Debug, Serialize)]
@@ -49,28 +49,22 @@ async fn snapshot_and_find_rule(
 pub async fn run_now(
     Path(name): Path<String>,
     State(state): State<Arc<AdminState>>,
-) -> Result<Json<RunNowResponse>, (StatusCode, String)> {
+) -> Result<(StatusCode, Json<RunNowResponse>), (StatusCode, String)> {
     let (repl, rule) = snapshot_and_find_rule(&state, &name).await?;
 
-    // M2 fix: respect both the global kill-switch (`replication.enabled`)
-    // and the per-rule `enabled` flag. Pre-fix, an admin-triggered
-    // `run-now` would copy objects even with `enabled=false` — making
-    // the flag misleading documentation rather than an actual gate.
+    // The GLOBAL kill-switch (`replication.enabled`) stays a hard block — it's
+    // the master off-switch (e.g. frozen during a migration).
     if !repl.enabled {
         return Err((
             StatusCode::CONFLICT,
             "replication is globally disabled (storage.replication.enabled = false)".to_string(),
         ));
     }
-    if !rule.enabled {
-        return Err((
-            StatusCode::CONFLICT,
-            format!(
-                "rule '{}' is disabled (set enabled: true in YAML to run it)",
-                rule.name
-            ),
-        ));
-    }
+    // A manual run-now is a deliberate ONE-OFF: it runs the rule once even when
+    // the rule is `enabled: false` or paused. It does NOT flip either flag — the
+    // scheduler stays off, so this is a single operator-triggered sync, not a
+    // silent re-enable. (The per-rule disabled/paused 409s are intentionally
+    // gone; the operator asked for exactly this affordance.)
 
     // Same deferral the scheduler and event consumer apply: run-now must
     // not write into a destination a maintenance job is rewriting.
@@ -128,50 +122,13 @@ pub async fn run_now(
                 "rule is already running; wait for the current run to finish".to_string(),
             ));
         }
-        // Paused check after we own the lease — if the rule is paused, release
-        // the lease we just took so a later resume+run isn't blocked by a
-        // dangling lease, and return 409.
-        if let Ok(Some(st)) = db.replication_load_state(&rule.name) {
-            if st.paused {
-                let _ = db.replication_release_lease(&rule.name, &lease_owner);
-                return Err((
-                    StatusCode::CONFLICT,
-                    "rule is paused; resume it before running".to_string(),
-                ));
-            }
-        }
+        // NOTE: no paused check — a manual run-now is a deliberate one-off that
+        // runs even a paused rule once (see the header comment). The lease we
+        // just took serializes it against a concurrent run; the run settles and
+        // releases the lease normally, leaving `paused` untouched.
     }
 
     info!("Replication run-now via admin API: rule='{}'", name);
-
-    let engine = state.s3_state.engine.load().clone();
-    let run_result = replication::run_rule(
-        db_arc.clone(),
-        &engine,
-        &rule,
-        repl.max_failures_retained,
-        replication::scheduler::object_timeout(&repl),
-        repl.object_skip_after_failures,
-        "run-now",
-        Some(replication::RunLease {
-            owner: lease_owner.clone(),
-            ttl_secs: replication::scheduler::lease_ttl_secs(&repl),
-            heartbeat_secs: replication::scheduler::heartbeat_secs(&repl),
-        }),
-        replication::RunConcurrency {
-            transfers: repl.transfers,
-            upload_concurrency: repl.upload_concurrency,
-        },
-    )
-    .await;
-
-    {
-        let db = db_arc.lock().await;
-        let _ = db.replication_release_lease(&rule.name, &lease_owner);
-    }
-
-    let (run_id, outcome) =
-        run_result.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)))?;
 
     crate::audit::audit_log(
         "replication_run_now",
@@ -182,15 +139,67 @@ pub async fn run_now(
         &rule.source.prefix,
     );
 
-    Ok(Json(RunNowResponse {
-        run_id,
-        status: outcome.status,
-        objects_scanned: outcome.totals.objects_scanned,
-        objects_copied: outcome.totals.objects_copied,
-        objects_skipped: outcome.totals.objects_skipped,
-        bytes_copied: outcome.totals.bytes_copied,
-        errors: outcome.totals.errors,
-    }))
+    // Run in the BACKGROUND and return immediately. A replication run can copy
+    // many GB (streaming multipart) and take minutes — blocking the HTTP request
+    // until it finishes hangs the admin AJAX for the whole sync. We already hold
+    // the lease (acquired above under the DB lock, so a double run-now still
+    // 409s); the spawned task owns the run and releases the lease when done. The
+    // run appears in the jobs list as `running` with live progress via the
+    // existing run-history polling — the client polls, it does not wait here.
+    let engine = state.s3_state.engine.load().clone();
+    let max_failures_retained = repl.max_failures_retained;
+    let object_timeout = replication::scheduler::object_timeout(&repl);
+    let object_skip_after_failures = repl.object_skip_after_failures;
+    let lease_ttl_secs = replication::scheduler::lease_ttl_secs(&repl);
+    let heartbeat_secs = replication::scheduler::heartbeat_secs(&repl);
+    let concurrency = replication::RunConcurrency {
+        transfers: repl.transfers,
+        upload_concurrency: repl.upload_concurrency,
+    };
+    let rule_owned = rule.clone();
+    tokio::spawn(async move {
+        let result = replication::run_rule(
+            db_arc.clone(),
+            &engine,
+            &rule_owned,
+            max_failures_retained,
+            object_timeout,
+            object_skip_after_failures,
+            "run-now",
+            Some(replication::RunLease {
+                owner: lease_owner.clone(),
+                ttl_secs: lease_ttl_secs,
+                heartbeat_secs,
+            }),
+            concurrency,
+        )
+        .await;
+        {
+            let db = db_arc.lock().await;
+            let _ = db.replication_release_lease(&rule_owned.name, &lease_owner);
+        }
+        if let Err(e) = result {
+            warn!(
+                "Replication run-now background task failed: rule='{}': {}",
+                rule_owned.name, e
+            );
+        }
+    });
+
+    // 202 Accepted — the run started; poll the jobs list / run history for
+    // progress and the final outcome. Totals are 0 here (not yet known).
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(RunNowResponse {
+            run_id: 0,
+            status: "running".to_string(),
+            objects_scanned: 0,
+            objects_copied: 0,
+            objects_skipped: 0,
+            bytes_copied: 0,
+            errors: 0,
+        }),
+    ))
 }
 
 /// The poll envelope for the parity audit (a background job). `status` is

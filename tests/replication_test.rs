@@ -13,6 +13,104 @@ use aws_sdk_s3::primitives::ByteStream;
 use common::{admin_http_client, TestServer};
 use serde_json::Value;
 
+/// Poll a rule's run-history until its latest run reaches a terminal status,
+/// then return that latest run object. run-now is fire-and-forget (202 + a
+/// background task) — a large sync can't block the HTTP response — so tests
+/// assert on the settled run-history row, not the run-now response body.
+async fn wait_for_latest_run(admin: &reqwest::Client, endpoint: &str, rule: &str) -> Value {
+    wait_for_run_after(admin, endpoint, rule, -1).await
+}
+
+/// The run row with the highest `id` in a rule's history (the history endpoint
+/// orders by `started_at DESC`, but ties within the same second are arbitrary,
+/// so we pick by `id` rather than array position).
+fn newest_run(h: &Value) -> Option<&Value> {
+    h["runs"]
+        .as_array()?
+        .iter()
+        .max_by_key(|run| run["id"].as_i64().unwrap_or(i64::MIN))
+}
+
+fn is_terminal(status: &str) -> bool {
+    matches!(
+        status,
+        "succeeded" | "failed" | "completed_with_errors" | "cancelled" | "stopped"
+    )
+}
+
+/// Fire run-now and return the settled NEW run row. Baselines the latest run
+/// id first, tolerates the brief 409 "already running" window while a prior
+/// background run releases its lease, then waits for a genuinely new terminal
+/// run. This is THE helper for tests that fire run-now more than once.
+async fn fire_run_now(admin: &reqwest::Client, endpoint: &str, rule: &str) -> Value {
+    let before = latest_run_id(admin, endpoint, rule).await;
+    let url = format!("{endpoint}/_/api/admin/jobs/replication:{rule}/run-now");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let code = admin
+            .post(&url)
+            .send()
+            .await
+            .expect("run-now")
+            .status()
+            .as_u16();
+        if code == 202 {
+            break;
+        }
+        assert_eq!(
+            code, 409,
+            "run-now: unexpected status {code} for rule '{rule}'"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "run-now for rule '{rule}' kept returning 409 (lease never released)"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    wait_for_run_after(admin, endpoint, rule, before).await
+}
+
+/// `id` of the latest run in a rule's history, or 0 if none yet. Used to
+/// baseline a NEW run before firing a subsequent run-now (the history row for
+/// the new run only appears once its background task starts, so the plain
+/// `wait_for_latest_run` would otherwise return the PREVIOUS run's terminal row).
+async fn latest_run_id(admin: &reqwest::Client, endpoint: &str, rule: &str) -> i64 {
+    let url = format!("{endpoint}/_/api/admin/jobs/replication:{rule}/runs");
+    let h: Value = admin.get(&url).send().await.unwrap().json().await.unwrap();
+    newest_run(&h)
+        .and_then(|run| run["id"].as_i64())
+        .unwrap_or(0)
+}
+
+/// Like `wait_for_latest_run`, but waits for a run whose `id` is strictly
+/// greater than `after_id` (i.e. a genuinely NEW run) to reach a terminal
+/// status. Essential for tests that fire run-now multiple times and read each
+/// run's totals in turn.
+async fn wait_for_run_after(
+    admin: &reqwest::Client,
+    endpoint: &str,
+    rule: &str,
+    after_id: i64,
+) -> Value {
+    let url = format!("{endpoint}/_/api/admin/jobs/replication:{rule}/runs");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let h: Value = admin.get(&url).send().await.unwrap().json().await.unwrap();
+        if let Some(run) = newest_run(&h) {
+            let id = run["id"].as_i64().unwrap_or(0);
+            let st = run["status"].as_str().unwrap_or("");
+            if id > after_id && is_terminal(st) {
+                return run.clone();
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "new run (id > {after_id}) for rule '{rule}' did not settle in 10s; last history: {h}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 const RULE_YAML: &str = "
 replication:
   enabled: true
@@ -167,15 +265,16 @@ async fn test_replication_run_now_copies_missing_objects() {
         .send()
         .await
         .expect("run-now request");
-    assert_eq!(resp.status().as_u16(), 200, "run-now should succeed");
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["status"].as_str(), Some("succeeded"), "run status");
+    // run-now is fire-and-forget: 202 Accepted, run continues in the background.
+    assert_eq!(resp.status().as_u16(), 202, "run-now should be accepted");
+    // Wait for the background run to settle, then assert the outcome.
+    let run = wait_for_latest_run(&admin, &server.endpoint(), "repl-a-to-b").await;
     assert_eq!(
-        body["objects_copied"].as_i64().unwrap_or(-1),
-        3,
-        "copied count in run-now response: {}",
-        body
+        run["status"].as_str(),
+        Some("succeeded"),
+        "run status: {run}"
     );
+    assert_eq!(run["objects_processed"].as_i64(), Some(3), "copied: {run}");
 
     // Verify the destination now has all three objects.
     for key in ["a.txt", "b.txt", "nested/c.txt"] {
@@ -292,15 +391,15 @@ async fn test_replication_sparse_dest_prefix_tree() {
         .send()
         .await
         .expect("run-now");
-    assert_eq!(resp.status().as_u16(), 200);
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["status"].as_str(), Some("succeeded"), "{body}");
+    assert_eq!(resp.status().as_u16(), 202);
+    let run = wait_for_latest_run(&admin, &server.endpoint(), "sparse-rule").await;
+    assert_eq!(run["status"].as_str(), Some("succeeded"), "{run}");
     // The 2 byte-identical present/ objects are SKIPPED (content-diff); the 3
     // absent objects (absent/x, absent/deep/y, root.txt) are copied.
     assert_eq!(
-        body["objects_copied"].as_i64().unwrap_or(-1),
-        3,
-        "only the absent subtree + root copy; present/ skipped: {body}"
+        run["objects_processed"].as_i64(),
+        Some(3),
+        "only the absent subtree + root copy; present/ skipped: {run}"
     );
 
     // Every source object now exists on dest (full convergence).
@@ -475,10 +574,10 @@ async fn test_replication_normalizes_prefixes_at_worker_boundaries() {
         .send()
         .await
         .expect("run-now");
-    assert_eq!(resp.status().as_u16(), 200);
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["status"].as_str(), Some("succeeded"), "{body}");
-    assert_eq!(body["objects_copied"].as_i64(), Some(1), "{body}");
+    assert_eq!(resp.status().as_u16(), 202);
+    let run = wait_for_latest_run(&admin, &server.endpoint(), "prefix-normalization-rule").await;
+    assert_eq!(run["status"].as_str(), Some("succeeded"), "{run}");
+    assert_eq!(run["objects_processed"].as_i64(), Some(1), "{run}");
 
     client
         .head_object()
@@ -552,22 +651,16 @@ async fn test_replication_pause_mid_run_stops_promptly_and_preserves_cursor() {
     let admin = admin_http_client(&server.endpoint()).await;
     let ep = server.endpoint();
 
-    // Fire run-now in the background, then pause almost immediately so the pause
-    // lands while the worker is still paginating.
-    let run_admin = admin.clone();
-    let run_ep = ep.clone();
-    let run_handle = tokio::spawn(async move {
-        run_admin
-            .post(format!(
-                "{run_ep}/_/api/admin/jobs/replication:midpause-rule/run-now"
-            ))
-            .send()
-            .await
-            .expect("run-now")
-            .json::<Value>()
-            .await
-            .expect("json")
-    });
+    // Fire run-now (fire-and-forget, 202), then pause almost immediately so the
+    // pause lands while the background worker is still paginating.
+    let resp = admin
+        .post(format!(
+            "{ep}/_/api/admin/jobs/replication:midpause-rule/run-now"
+        ))
+        .send()
+        .await
+        .expect("run-now");
+    assert_eq!(resp.status().as_u16(), 202, "run-now accepted");
 
     // Let a few pages copy, then pause.
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -580,23 +673,27 @@ async fn test_replication_pause_mid_run_stops_promptly_and_preserves_cursor() {
         .expect("pause");
     assert_eq!(p.status().as_u16(), 204, "pause accepted");
 
-    let body = run_handle.await.expect("run task");
+    // Wait for the background run to settle in the run-history.
+    let body = wait_for_latest_run(&admin, &ep, "midpause-rule").await;
 
     // The run is terminal (NOT running) and stopped EARLY — fewer than all 60
     // copied. (If the pause raced in after the last page, copied could be 60 and
     // status succeeded; assert the core invariant that it's terminal + that the
     // status is one we expect, and — when it did stop early — that it's marked
-    // cancelled with the cursor kept.)
-    let copied = body["objects_copied"].as_i64().unwrap_or(-1);
+    // stopped/cancelled with the cursor kept.)
+    let copied = body["objects_processed"].as_i64().unwrap_or(-1);
     let status = body["status"].as_str().unwrap_or("");
-    // run-now returns the RAW status; a mid-run pause settles as "stopped"
-    // (normalized to `cancelled` in the jobs LIST view). If the pause raced in
-    // only after the final page, the run may have finished "succeeded".
+    // A mid-run pause settles as "stopped" (normalized to `cancelled` in the
+    // jobs LIST view). If the pause raced in only after the final page, the run
+    // may have finished "succeeded".
     assert!(
-        matches!(status, "stopped" | "succeeded" | "completed_with_errors"),
+        matches!(
+            status,
+            "stopped" | "cancelled" | "succeeded" | "completed_with_errors"
+        ),
         "run must end terminal, got status={status} body={body}"
     );
-    if status == "stopped" {
+    if matches!(status, "stopped" | "cancelled") {
         assert!(
             copied < 60,
             "a stopped run must NOT have copied all 60: {body}"
@@ -613,19 +710,27 @@ async fn test_replication_pause_mid_run_stops_promptly_and_preserves_cursor() {
         .send()
         .await
         .expect("resume");
-    // Drain to completion: run-now until the dest holds all 60.
+    // Drain to completion: run-now until the dest holds all 60. run-now is
+    // fire-and-forget; a prior background run may still be releasing its lease
+    // (409 "already running"), so tolerate that and retry.
     let mut guard = 0;
+    let mut r = Value::Null;
     loop {
-        let r = admin
+        let resp = admin
             .post(format!(
                 "{ep}/_/api/admin/jobs/replication:midpause-rule/run-now"
             ))
             .send()
             .await
-            .expect("run-now drain")
-            .json::<Value>()
-            .await
-            .expect("json");
+            .expect("run-now drain");
+        let code = resp.status().as_u16();
+        assert!(
+            code == 202 || code == 409,
+            "run-now drain: unexpected status {code}"
+        );
+        if code == 202 {
+            r = wait_for_latest_run(&admin, &ep, "midpause-rule").await;
+        }
         let listed = client
             .list_objects_v2()
             .bucket("mpz-dst")
@@ -636,7 +741,7 @@ async fn test_replication_pause_mid_run_stops_promptly_and_preserves_cursor() {
             break;
         }
         guard += 1;
-        assert!(guard < 10, "resume failed to drain all objects: last={r}");
+        assert!(guard < 20, "resume failed to drain all objects: last={r}");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     let final_dst = client
@@ -677,7 +782,8 @@ async fn test_replication_paused_rule_blocks_run_now() {
         .expect("pause");
     assert_eq!(resp.status().as_u16(), 204);
 
-    // Run-now must 409.
+    // run-now is a deliberate ONE-OFF: it runs even a paused rule once (202),
+    // without un-pausing it.
     let resp = admin
         .post(format!(
             "{}/_/api/admin/jobs/replication:paused-rule/run-now",
@@ -686,26 +792,41 @@ async fn test_replication_paused_rule_blocks_run_now() {
         .send()
         .await
         .expect("run-now");
-    assert_eq!(resp.status().as_u16(), 409);
+    assert_eq!(
+        resp.status().as_u16(),
+        202,
+        "paused rule still runs one-off"
+    );
+    let run = wait_for_latest_run(&admin, &server.endpoint(), "paused-rule").await;
+    // The one-off is accepted (202) and starts, but the background worker now
+    // honors the paused flag mid-run and stops promptly (settles stopped/
+    // cancelled). Either way it did NOT error and copied nothing (empty source).
+    assert!(
+        matches!(
+            run["status"].as_str(),
+            Some("succeeded") | Some("stopped") | Some("cancelled")
+        ),
+        "paused one-off must settle terminal without error: {run}"
+    );
 
-    // Resume + verify run-now now accepts the call (with zero work).
-    admin
-        .post(format!(
-            "{}/_/api/admin/jobs/replication:paused-rule/resume",
-            server.endpoint()
-        ))
+    // The rule is STILL paused after the one-off (run-now doesn't resume it).
+    let jobs: Value = admin
+        .get(format!("{}/_/api/admin/jobs", server.endpoint()))
         .send()
         .await
-        .unwrap();
-    let resp = admin
-        .post(format!(
-            "{}/_/api/admin/jobs/replication:paused-rule/run-now",
-            server.endpoint()
-        ))
-        .send()
+        .unwrap()
+        .json()
         .await
         .unwrap();
-    assert_eq!(resp.status().as_u16(), 200);
+    let paused = jobs["jobs"]
+        .as_array()
+        .and_then(|a| a.iter().find(|j| j["id"] == "replication:paused-rule"))
+        .and_then(|j| j["paused"].as_bool());
+    assert_eq!(
+        paused,
+        Some(true),
+        "one-off must not un-pause the rule: {jobs}"
+    );
 }
 
 /// H1 fix regression: a single run-now must replicate ALL objects
@@ -746,11 +867,11 @@ async fn test_replication_paginates_until_complete() {
         .send()
         .await
         .expect("run-now");
-    assert_eq!(resp.status().as_u16(), 200);
-    let body: Value = resp.json().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 202);
+    let body = wait_for_latest_run(&admin, &server.endpoint(), "multipage-rule").await;
     // Pre-fix: copied was capped at batch_size=5. Post-fix: 17.
     assert_eq!(
-        body["objects_copied"].as_i64().unwrap_or(-1),
+        body["objects_processed"].as_i64().unwrap_or(-1),
         17,
         "H1 REGRESSION: should copy all 17 objects across pages, got {}",
         body
@@ -770,17 +891,9 @@ async fn test_replication_paginates_until_complete() {
     // Continuation token should be cleared after a clean complete pass.
     // (Implicitly: a second run-now copies nothing because all keys exist
     // and conflict=newer-wins skips equal-or-older destinations.)
-    let resp = admin
-        .post(format!(
-            "{}/_/api/admin/jobs/replication:multipage-rule/run-now",
-            server.endpoint()
-        ))
-        .send()
-        .await
-        .unwrap();
-    let body: Value = resp.json().await.unwrap();
+    let body = fire_run_now(&admin, &server.endpoint(), "multipage-rule").await;
     assert_eq!(
-        body["objects_copied"].as_i64().unwrap_or(-1),
+        body["objects_processed"].as_i64().unwrap_or(-1),
         0,
         "second run should be a no-op when source==dest, got {}",
         body
@@ -831,15 +944,7 @@ async fn test_replication_replicate_deletes_removes_orphans() {
     // First run: forward-copy 4 keys onto dst (with provenance markers).
     // Delete pass: nothing to delete (each replicated key still on src).
     // `manual.txt` is preserved because it has no provenance marker.
-    let resp = admin
-        .post(format!(
-            "{}/_/api/admin/jobs/replication:delete-rule/run-now",
-            server.endpoint()
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status().as_u16(), 200);
+    fire_run_now(&admin, &server.endpoint(), "delete-rule").await;
 
     for key in ["a.txt", "b.txt", "c.txt", "d.txt"] {
         client
@@ -869,15 +974,7 @@ async fn test_replication_replicate_deletes_removes_orphans() {
         .await
         .unwrap();
 
-    let resp = admin
-        .post(format!(
-            "{}/_/api/admin/jobs/replication:delete-rule/run-now",
-            server.endpoint()
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status().as_u16(), 200);
+    fire_run_now(&admin, &server.endpoint(), "delete-rule").await;
 
     // d.txt should be GONE from dst (replicated delete).
     let head_d = client
@@ -964,9 +1061,10 @@ async fn test_pause_resume_ghost_rule_returns_404_without_inserting_row() {
     );
 }
 
-/// M2 fix: run-now respects `rule.enabled` and global `replication.enabled`.
+/// A disabled rule still runs a deliberate ONE-OFF via run-now (202) — it does
+/// not flip `enabled`. The scheduler stays off; only the manual trigger runs.
 #[tokio::test]
-async fn test_run_now_rejects_disabled_rule() {
+async fn test_run_now_disabled_rule_runs_one_off() {
     let server = TestServer::builder()
         .auth("bootstrap_key", "bootstrap_secret")
         .extra_yaml_storage_section(
@@ -976,13 +1074,25 @@ replication:
   rules:
     - name: disabled-rule
       enabled: false
-      source: { bucket: x, prefix: \"\" }
-      destination: { bucket: y, prefix: \"\" }
+      source: { bucket: dis-src, prefix: \"\" }
+      destination: { bucket: dis-dst, prefix: \"\" }
       interval: \"1h\"
 ",
         )
         .build()
         .await;
+    let client = server.s3_client().await;
+    for b in ["dis-src", "dis-dst"] {
+        client.create_bucket().bucket(b).send().await.ok();
+    }
+    client
+        .put_object()
+        .bucket("dis-src")
+        .key("a.txt")
+        .body(ByteStream::from(b"alpha".to_vec()))
+        .send()
+        .await
+        .expect("seed");
     let admin = admin_http_client(&server.endpoint()).await;
 
     let resp = admin
@@ -995,11 +1105,20 @@ replication:
         .unwrap();
     assert_eq!(
         resp.status().as_u16(),
-        409,
-        "M2: run-now on disabled rule must 409"
+        202,
+        "disabled rule still runs a one-off"
     );
-    let body = resp.text().await.unwrap();
-    assert!(body.contains("disabled"), "got: {}", body);
+    let run = wait_for_latest_run(&admin, &server.endpoint(), "disabled-rule").await;
+    assert_eq!(run["status"].as_str(), Some("succeeded"), "{run}");
+    assert_eq!(run["objects_processed"].as_i64(), Some(1), "{run}");
+    // The object landed on the dest even though the rule is disabled.
+    client
+        .get_object()
+        .bucket("dis-dst")
+        .key("a.txt")
+        .send()
+        .await
+        .expect("one-off copied the object to dest");
 }
 
 #[tokio::test]
@@ -1148,7 +1267,8 @@ replication:
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(resp.status().as_u16(), 202);
+    wait_for_latest_run(&admin, &server.endpoint(), "mp-etag-rule").await;
 
     // HEAD destination — must return the SAME multipart ETag.
     let dest_head = client
@@ -1285,7 +1405,8 @@ async fn test_replication_delete_pass_skips_sibling_rule_keys() {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status().as_u16(), 200, "run {} failed", rule_name);
+        assert_eq!(resp.status().as_u16(), 202, "run {} failed", rule_name);
+        wait_for_latest_run(&admin, &server.endpoint(), rule_name).await;
     }
 
     // Sanity: all four keys present on dst.
@@ -1318,16 +1439,7 @@ async fn test_replication_delete_pass_skips_sibling_rule_keys() {
         .await
         .unwrap();
 
-    let resp = admin
-        .post(format!(
-            "{}/_/api/admin/jobs/replication:sibling-a/run-now",
-            server.endpoint()
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status().as_u16(), 200);
-    let body: Value = resp.json().await.unwrap();
+    let body = fire_run_now(&admin, &server.endpoint(), "sibling-a").await;
     assert_eq!(
         body["status"].as_str(),
         Some("succeeded"),
@@ -1447,8 +1559,8 @@ async fn test_replication_any_error_flips_status_to_failed() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status().as_u16(), 200);
-    let body: Value = resp.json().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 202);
+    let body = wait_for_latest_run(&admin, &server.endpoint(), "missing-dst-rule").await;
 
     let errors = body["errors"].as_i64().unwrap_or(0);
     let status = body["status"].as_str().unwrap_or("");
@@ -1464,7 +1576,7 @@ async fn test_replication_any_error_flips_status_to_failed() {
     // the partial-progress "completed_with_errors" (which is reserved for
     // runs that copied SOME objects but hit a transient error on others).
     assert_eq!(
-        body["objects_copied"].as_i64().unwrap_or(-1),
+        body["objects_processed"].as_i64().unwrap_or(-1),
         0,
         "test pre-condition: nothing should copy into a missing bucket. body={body}"
     );
@@ -1633,25 +1745,13 @@ async fn test_replication_foreign_object_missing_created_at_converges_on_second_
     }
 
     let admin = admin_http_client(&server.endpoint()).await;
-    let run_now = || async {
-        admin
-            .post(format!(
-                "{}/_/api/admin/jobs/replication:foreign-newerwins/run-now",
-                server.endpoint()
-            ))
-            .send()
-            .await
-            .expect("run-now")
-            .json::<Value>()
-            .await
-            .expect("run-now json")
-    };
+    let run_now = || async { fire_run_now(&admin, &server.endpoint(), "foreign-newerwins").await };
 
     // Run 1: dest empty → both objects copied (dest=None → Copy, policy-agnostic).
     let r1 = run_now().await;
     assert_eq!(r1["status"].as_str(), Some("succeeded"), "run1: {r1}");
     assert_eq!(
-        r1["objects_copied"].as_i64(),
+        r1["objects_processed"].as_i64(),
         Some(2),
         "run1 must copy both foreign objects: {r1}"
     );
@@ -1663,7 +1763,7 @@ async fn test_replication_foreign_object_missing_created_at_converges_on_second_
     let r2 = run_now().await;
     assert_eq!(r2["status"].as_str(), Some("succeeded"), "run2: {r2}");
     assert_eq!(
-        r2["objects_copied"].as_i64(),
+        r2["objects_processed"].as_i64(),
         Some(0),
         "REGRESSION: foreign object(s) re-copied on 2nd run (created_at→now bug): {r2}"
     );
@@ -1726,24 +1826,12 @@ async fn test_replication_content_diff_converges_then_copies_real_change() {
     }
 
     let admin = admin_http_client(&server.endpoint()).await;
-    let run_now = || async {
-        admin
-            .post(format!(
-                "{}/_/api/admin/jobs/replication:cd-rule/run-now",
-                server.endpoint()
-            ))
-            .send()
-            .await
-            .expect("run-now")
-            .json::<Value>()
-            .await
-            .expect("json")
-    };
+    let run_now = || async { fire_run_now(&admin, &server.endpoint(), "cd-rule").await };
 
     // Run 1: dest empty → all 3 copied.
     let r1 = run_now().await;
     assert_eq!(
-        r1["objects_copied"].as_i64(),
+        r1["objects_processed"].as_i64(),
         Some(3),
         "run1 copies all: {r1}"
     );
@@ -1752,7 +1840,7 @@ async fn test_replication_content_diff_converges_then_copies_real_change() {
     // (the convergence source-wins lacked).
     let r2 = run_now().await;
     assert_eq!(
-        r2["objects_copied"].as_i64(),
+        r2["objects_processed"].as_i64(),
         Some(0),
         "content-diff must converge: 2nd run copies 0, got {r2}"
     );
@@ -1775,7 +1863,7 @@ async fn test_replication_content_diff_converges_then_copies_real_change() {
     // Run 3: exactly the changed object copies; the other two stay skipped.
     let r3 = run_now().await;
     assert_eq!(
-        r3["objects_copied"].as_i64(),
+        r3["objects_processed"].as_i64(),
         Some(1),
         "content-diff must copy exactly the changed object: {r3}"
     );
