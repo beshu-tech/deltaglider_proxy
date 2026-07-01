@@ -1051,13 +1051,15 @@ pub async fn require_not_declarative(
 /// the browser's bfcache from retaining the secret.
 pub async fn get_s3_session_creds(
     State(state): State<Arc<AdminState>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let token = match extract_session_token(&headers) {
         Some(t) => t,
         None => return StatusCode::UNAUTHORIZED.into_response(),
     };
-    match state.sessions.get_s3_creds(&token) {
+    let client_ip = request_client_ip(&headers, connect_info.as_ref());
+    match state.sessions.get_s3_creds(&token, client_ip) {
         Some(creds) => (
             StatusCode::OK,
             [

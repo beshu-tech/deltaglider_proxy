@@ -21,8 +21,16 @@ export async function revokeSession(id: string): Promise<void> {
   if (!res.ok) await throwApiError(res, 'Revoke session');
 }
 
-export async function revokeUserSessions(accessKeyId: string): Promise<{ revoked: number }> {
-  const res = await adminFetch('/api/admin/sessions/revoke-user', 'POST', { access_key_id: accessKeyId });
+export interface RevokeUserResult {
+  revoked: number;
+  revoked_local: number;
+  persisted: boolean;
+  pushed: boolean;
+  propagation_bound_secs: number | null;
+}
+
+export async function revokeUserSessions(identity: string): Promise<RevokeUserResult> {
+  const res = await adminFetch('/api/admin/sessions/revoke-user', 'POST', { identity });
   if (!res.ok) await throwApiError(res, 'Revoke user sessions');
   return safeJson(res);
 }
