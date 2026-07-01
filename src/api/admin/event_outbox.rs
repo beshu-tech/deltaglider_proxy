@@ -192,11 +192,14 @@ pub async fn requeue_many(
     Ok(Json(RequeueEventOutboxResponse { requeued }))
 }
 
-/// POST /_/api/admin/event-outbox/purge-failed — drop ALL terminal failed rows.
-/// The escape hatch for a dead target whose failed rows would otherwise grow
-/// the DB unbounded (requeue only re-fails them against a still-dead target).
+/// POST /_/api/admin/event-outbox/purge-failed — drop terminal failed rows the
+/// listeners have already passed. REFUSES (409) if any failed row sits above the
+/// active listener-cursor floor — those rows may still be consumed by event-driven
+/// replication (the outbox is a shared stream), and purging them would silently
+/// drop object events. Requeue those, or wait for replication to drain past them.
 pub async fn purge_failed(
     State(state): State<Arc<AdminState>>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<PurgeFailedResponse>, (StatusCode, String)> {
     let db = state
         .config_db
@@ -210,10 +213,33 @@ pub async fn purge_failed(
         .lock()
         .await;
 
+    // Same floor the background pruner uses (min cursor of active listeners; no
+    // active listeners → i64::MAX → everything eligible). 1h staleness window.
+    let now = crate::event_outbox::current_unix_seconds();
+    let min_keep_id = db
+        .event_outbox_min_active_listener_cursor(now, 60 * 60)
+        .unwrap_or(None)
+        .unwrap_or(i64::MAX);
+
+    let above = db
+        .event_outbox_failed_above_floor(min_keep_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if above > 0 {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "{above} failed event(s) are above the active replication cursor and \
+                 may still be consumed — requeue them or wait for replication to drain, \
+                 then purge. Refusing to drop unconsumed events."
+            ),
+        ));
+    }
+
     let purged = db
-        .event_outbox_purge_failed()
+        .event_outbox_purge_failed(min_keep_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    crate::audit::audit_log("event_outbox_purge_failed", "admin", "", &headers, "", "");
     Ok(Json(PurgeFailedResponse { purged }))
 }
 

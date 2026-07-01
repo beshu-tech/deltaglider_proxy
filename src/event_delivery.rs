@@ -55,6 +55,11 @@ const DEFAULT_DELIVERED_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 /// and no longer pins the prune floor. A healthy consumer advances every tick
 /// (seconds), so this only ever fires for a stuck/dead/disabled listener.
 const LISTENER_CURSOR_STALE_SECS: i64 = 60 * 60;
+/// Failed (retries-exhausted) rows age out after this even when
+/// `delivered_retention` is 0 — bounds DB growth from a dead delivery target.
+/// Only rows at or below the listener-cursor floor are eligible (never drops an
+/// event replication hasn't consumed). 24h matches the default delivered window.
+const FAILED_ROW_MAX_AGE_SECS: i64 = 24 * 60 * 60;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct EventWebhookPayload<'a> {
@@ -466,9 +471,18 @@ pub async fn dispatch_once(
         {
             warn!("Event outbox delivered prune failed: {}", err);
         }
-        // Age out terminal failed rows too (retries exhausted) — else a dead
-        // target grows the DB forever.
-        if let Err(err) = db.event_outbox_prune_failed_before(before, config.prune_batch) {
+    }
+    // Age out terminal failed rows independently of `delivered_retention` — a dead
+    // target grows the DB even when delivered-retention is 0. Uses a fixed window
+    // (or the delivered retention if larger) and the SAME listener-cursor floor so
+    // it never drops an event replication hasn't consumed.
+    {
+        let failed_window = retention.max(FAILED_ROW_MAX_AGE_SECS);
+        let before = now.saturating_sub(failed_window);
+        let db = db.lock().await;
+        if let Err(err) =
+            db.event_outbox_prune_failed_before(before, config.prune_batch, min_keep_id)
+        {
             warn!("Event outbox failed prune failed: {}", err);
         }
     }

@@ -602,12 +602,19 @@ impl ConfigDb {
 
     /// Age out terminal `failed` rows older than `before` (occurred_at), bounded
     /// by `limit`. Failed rows (retries exhausted) are otherwise never pruned —
-    /// a dead webhook/Slack target would grow the DB unbounded. The operator can
-    /// also purge them on demand via the admin route.
+    /// a dead webhook/Slack target would grow the DB unbounded.
+    ///
+    /// CURSOR FLOOR (`min_keep_id`): the outbox is a shared id-ordered stream that
+    /// event-driven REPLICATION also consumes (`event_outbox_since`, no status
+    /// filter). A `failed` delivery-row above the replication listener cursor has
+    /// NOT been consumed by replication yet — deleting it would silently drop that
+    /// object event. So only prune rows at or below the min active listener cursor,
+    /// exactly like the delivered pruner.
     pub fn event_outbox_prune_failed_before(
         &self,
         before: i64,
         limit: u32,
+        min_keep_id: i64,
     ) -> Result<usize, ConfigDbError> {
         if limit == 0 {
             return Ok(0);
@@ -616,20 +623,39 @@ impl ConfigDb {
             "DELETE FROM event_outbox
               WHERE id IN (
                     SELECT id FROM event_outbox
-                     WHERE status = 'failed' AND occurred_at < ?
+                     WHERE status = 'failed' AND occurred_at < ? AND id <= ?
                      ORDER BY occurred_at ASC, id ASC
                      LIMIT ?
               )",
-            params![before, limit as i64],
+            params![before, min_keep_id, limit as i64],
         )?;
         Ok(deleted)
     }
 
-    /// Operator on-demand purge of ALL terminal `failed` rows. Returns the count.
-    pub fn event_outbox_purge_failed(&self) -> Result<usize, ConfigDbError> {
-        let deleted = self
-            .conn
-            .execute("DELETE FROM event_outbox WHERE status = 'failed'", [])?;
+    /// Count `failed` rows ABOVE the listener-cursor floor (id > min_keep_id) —
+    /// i.e. rows an active listener (replication) may still consume. The operator
+    /// purge route refuses when this is non-zero so a manual purge can never drop
+    /// an unconsumed event.
+    pub fn event_outbox_failed_above_floor(
+        &self,
+        min_keep_id: i64,
+    ) -> Result<usize, ConfigDbError> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM event_outbox WHERE status = 'failed' AND id > ?",
+            params![min_keep_id],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
+    /// Operator on-demand purge of terminal `failed` rows AT OR BELOW the listener
+    /// floor (`id <= min_keep_id`). Rows above the floor are left for the caller to
+    /// refuse — see [`Self::event_outbox_failed_above_floor`]. Returns the count.
+    pub fn event_outbox_purge_failed(&self, min_keep_id: i64) -> Result<usize, ConfigDbError> {
+        let deleted = self.conn.execute(
+            "DELETE FROM event_outbox WHERE status = 'failed' AND id <= ?",
+            params![min_keep_id],
+        )?;
         Ok(deleted)
     }
 
@@ -1067,29 +1093,48 @@ mod tests {
     }
 
     #[test]
-    fn prune_and_purge_failed_rows() {
+    fn prune_and_purge_failed_rows_respect_cursor_floor() {
         let db = ConfigDb::in_memory("test-pass").unwrap();
-        let old_failed = db.event_outbox_insert(&event_at(10, "old")).unwrap();
-        let new_failed = db.event_outbox_insert(&event_at(100, "new")).unwrap();
-        let delivered = db.event_outbox_insert(&event_at(20, "ok")).unwrap();
-        db.event_outbox_mark_failed(old_failed, "dead", None)
-            .unwrap();
-        db.event_outbox_mark_failed(new_failed, "dead", None)
-            .unwrap();
-        db.event_outbox_mark_delivered(delivered, 25).unwrap();
+        // Three failed rows, ascending id: below, at, above the floor.
+        let below = db.event_outbox_insert(&event_at(10, "below")).unwrap();
+        let at = db.event_outbox_insert(&event_at(10, "at")).unwrap();
+        let above = db.event_outbox_insert(&event_at(10, "above")).unwrap();
+        for id in [below, at, above] {
+            db.event_outbox_mark_failed(id, "dead", None).unwrap();
+        }
+        // Floor = `at`: rows with id <= at are prunable; `above` is protected
+        // (a listener like replication may still consume it).
+        let floor = at;
 
-        // Age-out only failed rows older than `before` — never the delivered one.
-        let pruned = db.event_outbox_prune_failed_before(50, 100).unwrap();
-        assert_eq!(pruned, 1, "only the occurred_at<50 failed row");
-        assert!(db.event_outbox_load(old_failed).unwrap().is_none());
-        assert!(db.event_outbox_load(new_failed).unwrap().is_some());
-        assert!(db.event_outbox_load(delivered).unwrap().is_some());
+        // Age-out with the floor: only below+at (old + id<=floor); above survives.
+        let pruned = db.event_outbox_prune_failed_before(50, 100, floor).unwrap();
+        assert_eq!(
+            pruned, 2,
+            "below+at prunable; above is protected by the floor"
+        );
+        assert!(db.event_outbox_load(below).unwrap().is_none());
+        assert!(db.event_outbox_load(at).unwrap().is_none());
+        assert!(
+            db.event_outbox_load(above).unwrap().is_some(),
+            "a failed row above the listener cursor must NOT be dropped"
+        );
 
-        // On-demand purge drops the remaining failed row, leaves delivered.
-        let purged = db.event_outbox_purge_failed().unwrap();
-        assert_eq!(purged, 1);
-        assert!(db.event_outbox_load(new_failed).unwrap().is_none());
-        assert!(db.event_outbox_load(delivered).unwrap().is_some());
+        // The operator purge is gated by the above-floor count.
+        assert_eq!(
+            db.event_outbox_failed_above_floor(floor).unwrap(),
+            1,
+            "the `above` row is still there and above the floor"
+        );
+        // Purge below the floor drops nothing now (below+at already gone) and
+        // leaves `above` untouched.
+        let purged = db.event_outbox_purge_failed(floor).unwrap();
+        assert_eq!(purged, 0);
+        assert!(db.event_outbox_load(above).unwrap().is_some());
+
+        // Once the floor advances past `above` (replication drained), it's purgeable.
+        assert_eq!(db.event_outbox_failed_above_floor(above).unwrap(), 0);
+        assert_eq!(db.event_outbox_purge_failed(above).unwrap(), 1);
+        assert!(db.event_outbox_load(above).unwrap().is_none());
     }
 
     #[test]
