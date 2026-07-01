@@ -10,6 +10,46 @@ follow [semantic versioning](https://semver.org/); the Docker image
 
 _Last updated: 2026-07-01_
 
+## v1.9.3 — 2026-07-01
+
+Security + data-integrity fixes from an adversarial code review, plus the
+non-blocking run-now the copyHzToBackup incident called for.
+
+### Fixed
+
+- **Config-DB recovery no longer destroys the IAM database (data loss).** After a
+  bootstrap-password mismatch, a second unattended restart could overwrite the
+  preserved backup (`deltaglider_config.db.bak`) with the empty database created
+  on the mismatch boot — permanently losing IAM users, groups, and OAuth
+  providers. The boot backup now refuses to clobber an existing `.bak`, and
+  recovery is read-only (it returns the correct hash for you to set, rather than
+  writing hidden state that led into the loop).
+- **The bootstrap-hash sidecar is created private (0600) in one step.** It was
+  written world-readable then chmod-ed, leaving a brief window in which a local
+  user could read the SQLCipher key on a shared host.
+- **Event-outbox "purge failed" can no longer drop unconsumed replication events.**
+  The outbox is a shared stream that event-driven replication also reads; the
+  failed-row pruner and the operator purge now respect the replication cursor
+  floor (the purge refuses with a clear message when failed rows still sit above
+  it), and failed rows age out even when delivered-retention is 0.
+- **Killing a run is settled reliably.** A kill arriving in the gap between the
+  final cancel check and the run settling could be overwritten by a "succeeded"
+  status; the check and the settle now happen under one lock.
+- **Deleting a replication rule with a run in progress is refused** (409 "kill it
+  first") instead of purging the running worker's state out from under it.
+- **`run-now` returns immediately (202) instead of hanging the request** for the
+  whole replication — a multi-GB sync no longer blocks the admin call. Progress
+  shows in the jobs list. `run-now` also runs a disabled or paused rule as a
+  deliberate one-off (labelled "Run once") without re-enabling it.
+
+### Added
+
+- **Cross-instance session revocation.** Force-logging-out a user (the
+  compromised-key escape hatch) now takes effect on every instance, not just the
+  one serving the request — a synced revocation table is consulted on every auth
+  check. (Killing a running replication job remains instance-local under a
+  non-sticky load balancer — the UI/response now say so.)
+
 ## v1.9.2 — 2026-07-01
 
 Replication performance + the kill/responsiveness fixes that an
