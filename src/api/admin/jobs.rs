@@ -783,12 +783,10 @@ pub async fn job_action(
                 return Err((StatusCode::CONFLICT, "no running run to kill".to_string()));
             }
             crate::audit::audit_log("replication_kill", "admin", &name, &headers, "", "");
-            // Push a sync so peers converge faster. NOTE: replication_run_history
-            // is NOT in the IAM sync set today, so this does not yet deliver the
-            // `cancelling` flip to a leader on another instance — kill reaches the
-            // run only on the instance holding its lease. Under a non-sticky LB it
-            // may not reach the leader; true cross-instance kill is HA-roadmap work.
-            super::trigger_config_sync(&state);
+            // NOTE: no sync push — replication_run_history is NODE-LOCAL (not in
+            // the IAM sync set), so a push cannot deliver the `cancelling` flip to
+            // a peer. Kill reaches only the instance holding the lease; true
+            // cross-instance kill is HA-roadmap work.
             Ok((
                 StatusCode::ACCEPTED,
                 Json(serde_json::json!({"killing": true, "instance_local": true})),

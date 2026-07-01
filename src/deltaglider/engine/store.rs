@@ -387,6 +387,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             return Ok(result.with_accounting(prior_for_counter, 0));
         }
 
+        // B1 (open): this lock is IN-PROCESS only — two instances writing the
+        // same deltaspace can corrupt reference.bin (see CLAUDE.md HA contract).
         let _guard = self.acquire_prefix_lock(&deltaspace_id).await;
         let has_existing_reference = self.storage.has_reference(bucket, &deltaspace_id).await;
 

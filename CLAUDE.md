@@ -195,13 +195,19 @@ N instances behind a **sticky-session** LB, not naive round-robin, until the
 single-instance planes below are addressed.
 
 **Shared across instances (genuinely HA):**
-- IAM / OAuth providers / mapping rules — the encrypted SQLCipher DB synced via
-  `DGP_CONFIG_SYNC_BUCKET` (ETag-poll every 5 min → eventually consistent, ≤5min lag).
-- Background-job leadership — replication/lifecycle/maintenance/parity leases via
-  `config_db/job_store.rs` (so jobs don't double-run **once the lease row is
-  visible**; note the same 5-min sync lag applies to lease visibility).
+- IAM / OAuth providers / mapping rules / session revocations — the encrypted
+  SQLCipher DB synced via `DGP_CONFIG_SYNC_BUCKET` (ETag-poll every 5 min →
+  eventually consistent, ≤5min lag; mutations push immediately with
+  reconcile-then-retry on CAS conflict).
 
 **Instance-LOCAL (NOT shared — break or degrade under non-sticky round-robin):**
+- **Background-job leadership** — replication/lifecycle/maintenance/parity leases
+  (`config_db/job_store.rs`) are NODE-LOCAL: coordination tables were dropped
+  from the sync set in B3, so a peer NEVER sees another node's lease. Two
+  instances CAN double-run the same rule (duplicate copy/delete work, divergent
+  run history), and kill/pause reach only the instance holding the lease. Run
+  job-plane workloads on ONE instance (or sticky-route the scheduler's traffic)
+  until cross-instance leases ship.
 - **Admin/browser sessions** (`session.rs`, in-memory) — a cookie minted on node A
   is invalid on B (intermittent 401s). Sticky sessions required for the admin GUI.
 - **Multipart uploads** (`multipart.rs`, in-memory) — UploadPart/Complete must hit

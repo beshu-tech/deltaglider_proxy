@@ -5,7 +5,7 @@
 //! `POST /_/api/admin/jobs/replication:<rule>/{run-now,pause,resume}`.
 //! Listing, runs, and failures live in the jobs module.
 
-use super::{trigger_config_sync, AdminState};
+use super::AdminState;
 use crate::config_sections::{ReplicationConfig, ReplicationRule};
 use crate::replication;
 use axum::extract::{Path, State};
@@ -319,10 +319,9 @@ pub async fn verify(
         let db = db_arc.lock().await;
         let _ = db.parity_result_set_running(&rule.name, now);
     }
-    // Push the encrypted DB so a peer instance sees the lease + 'running' before
-    // its 5-min poll — without this, both could acquire the same rule's lease and
-    // double-scan within the sync lag. No-op when sync is unconfigured.
-    trigger_config_sync(&state);
+    // NOTE: no sync push — coordination tables (leases, parity, run history)
+    // are NODE-LOCAL (dropped from the IAM sync set in B3), so a push cannot
+    // make a peer see this lease. Two instances CAN double-scan; see CLAUDE.md.
 
     info!("Replication verify (background) started: rule='{}'", name);
     crate::audit::audit_log(
