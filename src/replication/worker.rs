@@ -1417,6 +1417,12 @@ async fn build_dest_oracle(
                 break;
             }
         }
+        // Post-loop guard: begin_page() returns None at the budget boundary and
+        // exits the loop WITHOUT re-checking, so a level truncated exactly at the
+        // last allowed page would otherwise be treated as complete → over-copy.
+        if pager.truncated_by_page_budget() {
+            return DestOracle::Unbounded;
+        }
 
         // List the source level for child common-prefixes (lite — we only need
         // the prefix names to decide descend-vs-absent).
@@ -1447,6 +1453,9 @@ async fn build_dest_oracle(
             if !spager.advance(page.is_truncated, page.next_continuation_token.clone()) {
                 break;
             }
+        }
+        if spager.truncated_by_page_budget() {
+            return DestOracle::Unbounded;
         }
 
         let outcome = step_level(&dest_objects, &dest_cps, &src_cps, |scp| {
