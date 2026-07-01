@@ -56,7 +56,7 @@ export default function SessionsPanel({ onSessionExpired }: { onSessionExpired?:
   const revokeUser = async () => {
     const key = revokeKey.trim();
     if (!key) return;
-    if (!window.confirm(`Force-logout ALL sessions of access key "${key}"? Use this after rotating a compromised key.`)) return;
+    if (!window.confirm(`Force-logout ALL sessions of access key "${key}" — on every instance. If this is YOUR OWN key you will be logged out too. Use this after rotating a compromised key.`)) return;
     try {
       setBusy('user');
       const res = await revokeUserSessions(key);

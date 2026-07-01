@@ -625,6 +625,14 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let shared_config = config.clone().into_shared();
     let (config_db, config_db_mismatch) = init_config_db(&admin_password_hash, &iam_state, &config);
 
+    // Load the synced session-revocation snapshot so a revoke performed on any
+    // instance (before this one started) is honored immediately.
+    if let Some(db) = config_db.as_ref() {
+        if let Ok(rows) = db.lock().await.load_session_revocations() {
+            session_store.set_revocations(rows);
+        }
+    }
+
     // --- App state ---
     let usage_scanner = Arc::new(UsageScanner::new());
     let maintenance_gate = Arc::new(deltaglider_proxy::maintenance::gate::MaintenanceGate::new());
@@ -806,6 +814,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         &config_db,
         &iam_state,
         &external_auth,
+        &session_store,
     )
     .await;
 
@@ -816,6 +825,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             &config_db,
             &iam_state,
             &external_auth,
+            &session_store,
             &admin_password_hash,
         );
     }

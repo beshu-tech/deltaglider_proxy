@@ -7,7 +7,7 @@
 //! consistency. Encryption key is derived from the admin GUI password.
 
 use crate::iam::{IamUser, Permission};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 
@@ -25,7 +25,7 @@ pub struct ConfigDb {
 }
 
 /// Schema version — bump when adding migrations.
-const SCHEMA_VERSION: i32 = 20;
+const SCHEMA_VERSION: i32 = 21;
 
 pub(crate) mod auth_providers;
 mod declarative;
@@ -744,6 +744,24 @@ impl ConfigDb {
             );
         }
 
+        if version < 21 {
+            // v21: cross-instance session revocation. `identity` is the
+            // access_key_id (IAM) or `provider:user_id` (external); a session is
+            // invalid iff `revoked_since >= its created_at`. Synced across
+            // instances (IAM_SYNC_TABLES) with a MAX-upsert merge so a revocation
+            // on any node reaches every node — the stolen-cookie escape hatch.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS session_revocations (
+                    identity      TEXT PRIMARY KEY,
+                    revoked_since INTEGER NOT NULL
+                );",
+            )?;
+            info!(
+                "Migrated config DB schema from v{} to v21 (session_revocations)",
+                version
+            );
+        }
+
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         debug!("Config DB schema at version {}", SCHEMA_VERSION);
         Ok(())
@@ -967,6 +985,18 @@ impl ConfigDb {
                         [],
                     )?;
                 }
+                // session_revocations is NOT a replace-merge (that would let one
+                // node's sync wipe another's revocations). It's a monotonic
+                // MAX-upsert union: a revocation only ever moves `revoked_since`
+                // forward, so merging keeps the latest from either side.
+                self.conn.execute(
+                    "INSERT INTO main.session_revocations (identity, revoked_since)
+                       SELECT identity, revoked_since FROM remote.session_revocations
+                     WHERE true
+                     ON CONFLICT(identity) DO UPDATE SET
+                       revoked_since = MAX(revoked_since, excluded.revoked_since)",
+                    [],
+                )?;
                 Ok(())
             })();
             match tx {
@@ -983,6 +1013,44 @@ impl ConfigDb {
 
         let _ = self.conn.execute_batch("DETACH DATABASE remote;");
         result
+    }
+
+    /// Revoke every session of `identity` (access_key_id or `provider:user_id`)
+    /// created at or before `now`. Monotonic MAX-upsert so a later revocation
+    /// never moves the epoch backward. Synced cross-instance via `merge_iam_from`.
+    pub fn revoke_identity_sessions(&self, identity: &str, now: i64) -> Result<(), ConfigDbError> {
+        self.conn.execute(
+            "INSERT INTO session_revocations (identity, revoked_since) VALUES (?, ?)
+             ON CONFLICT(identity) DO UPDATE SET revoked_since = MAX(revoked_since, excluded.revoked_since)",
+            params![identity, now],
+        )?;
+        Ok(())
+    }
+
+    /// The revoke epoch for `identity`, if any. A session is invalid when its
+    /// `created_at <= revoked_since`. Cheap PK lookup (called on the auth path).
+    pub fn session_revoked_since(&self, identity: &str) -> Result<Option<i64>, ConfigDbError> {
+        let v: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT revoked_since FROM session_revocations WHERE identity = ?",
+                params![identity],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v)
+    }
+
+    /// Load ALL revocations into a map for the in-memory session-store snapshot
+    /// (so `validate()` stays a pure map lookup, no DB hit per request).
+    pub fn load_session_revocations(&self) -> Result<Vec<(String, i64)>, ConfigDbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT identity, revoked_since FROM session_revocations")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Re-encrypt the database with a new passphrase (after bootstrap password change).
@@ -1138,6 +1206,32 @@ mod tests {
             }
             other => panic!("expected ConfigDbError::Sqlite, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn session_revocation_is_monotonic_max_upsert() {
+        let db = ConfigDb::in_memory("test-pass").unwrap();
+        assert_eq!(db.session_revoked_since("AKIA1").unwrap(), None);
+
+        db.revoke_identity_sessions("AKIA1", 100).unwrap();
+        assert_eq!(db.session_revoked_since("AKIA1").unwrap(), Some(100));
+
+        // A later revoke moves the epoch forward.
+        db.revoke_identity_sessions("AKIA1", 200).unwrap();
+        assert_eq!(db.session_revoked_since("AKIA1").unwrap(), Some(200));
+
+        // An EARLIER timestamp never moves it backward (monotonic MAX).
+        db.revoke_identity_sessions("AKIA1", 150).unwrap();
+        assert_eq!(db.session_revoked_since("AKIA1").unwrap(), Some(200));
+
+        // Distinct identities are independent; load returns all.
+        db.revoke_identity_sessions("goog:7", 50).unwrap();
+        let mut rows = db.load_session_revocations().unwrap();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![("AKIA1".to_string(), 200), ("goog:7".to_string(), 50)]
+        );
     }
 
     #[test]

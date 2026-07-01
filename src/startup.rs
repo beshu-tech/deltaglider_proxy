@@ -989,12 +989,14 @@ pub fn init_config_db(
 
 /// Initialize config DB S3 sync if DGP_CONFIG_SYNC_BUCKET is set.
 /// On startup: downloads from S3 if newer, reopens the DB, and rebuilds IAM index.
+#[allow(clippy::too_many_arguments)]
 pub async fn init_config_sync(
     config: &Config,
     admin_password_hash: &str,
     config_db: &Option<Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::ConfigDb>>>,
     iam_state: &SharedIamState,
     external_auth: &Option<Arc<deltaglider_proxy::iam::external_auth::ExternalAuthManager>>,
+    sessions: &Arc<deltaglider_proxy::session::SessionStore>,
 ) -> Option<Arc<ConfigDbSync>> {
     let sync_bucket = match &config.config_sync_bucket {
         Some(b) if !b.is_empty() => b.clone(),
@@ -1040,6 +1042,7 @@ pub async fn init_config_sync(
                 admin_password_hash,
                 iam_state,
                 external_auth,
+                Some(sessions),
                 &dl.temp_path,
                 "startup",
             )
@@ -1067,16 +1070,19 @@ pub async fn init_config_sync(
 pub use deltaglider_proxy::config_db_sync::reopen_and_rebuild_iam;
 
 /// Spawn periodic config DB S3 sync poll (every 5 minutes).
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_config_sync_poll(
     sync: Arc<ConfigDbSync>,
     config_db: &Option<Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::ConfigDb>>>,
     iam_state: &SharedIamState,
     external_auth: &Option<Arc<deltaglider_proxy::iam::external_auth::ExternalAuthManager>>,
+    sessions: &Arc<deltaglider_proxy::session::SessionStore>,
     admin_password_hash: &str,
 ) {
     let db_arc = config_db.clone();
     let iam = iam_state.clone();
     let ext_auth = external_auth.clone();
+    let sessions = sessions.clone();
     let password_hash = admin_password_hash.to_string();
 
     tokio::spawn(async move {
@@ -1092,6 +1098,7 @@ pub fn spawn_config_sync_poll(
                         &password_hash,
                         &iam,
                         &ext_auth,
+                        Some(&sessions),
                         &dl.temp_path,
                         "periodic poll",
                     )

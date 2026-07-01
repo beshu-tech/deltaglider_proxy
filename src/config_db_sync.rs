@@ -397,11 +397,13 @@ fn is_precondition_failed(err_str: &str) -> bool {
 /// mode, no IAM DB to reopen).
 /// Returns `true` if the IAM merge was applied (so the caller can commit the
 /// downloaded ETag); `false` on any failure, so the next poll retries.
+#[allow(clippy::too_many_arguments)]
 pub async fn reopen_and_rebuild_iam(
     config_db: &Option<Arc<Mutex<ConfigDb>>>,
     admin_password_hash: &str,
     iam_state: &SharedIamState,
     external_auth: &Option<Arc<ExternalAuthManager>>,
+    sessions: Option<&Arc<crate::session::SessionStore>>,
     downloaded: &std::path::Path,
     context: &str,
 ) -> bool {
@@ -438,6 +440,15 @@ pub async fn reopen_and_rebuild_iam(
         );
     }
     iam_state.store(Arc::new(state));
+
+    // Refresh the session-revocation snapshot from the just-merged table so a
+    // revoke performed on another instance takes effect here (the cross-instance
+    // stolen-cookie escape hatch).
+    if let Some(sessions) = sessions {
+        if let Ok(rows) = db.load_session_revocations() {
+            sessions.set_revocations(rows);
+        }
+    }
 
     // Rebuild ExternalAuthManager from the new DB. Release the DB
     // lock before the async discovery round — it can take seconds

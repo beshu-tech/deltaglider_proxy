@@ -59,13 +59,34 @@ pub struct RevokeUserRequest {
 }
 
 /// POST /api/admin/sessions/revoke-user — force-logout EVERY session of an IAM
-/// user (by access_key_id). The escape hatch when a key is compromised.
+/// user (by access_key_id), on THIS instance AND every other. The escape hatch
+/// when a key is compromised.
 pub async fn revoke_user_sessions(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
     Json(req): Json<RevokeUserRequest>,
 ) -> impl IntoResponse {
+    // 1. Local, immediate: drop this node's live sessions for the key.
     let n = state.sessions.revoke_by_access_key(&req.access_key_id);
+
+    // 2. Cross-instance: record the revoke epoch in the synced DB and note it
+    //    locally so `entry_valid` rejects the key everywhere (a stolen cookie
+    //    minted on another node is invalidated once the revocation syncs). Push
+    //    the sync immediately so peers converge in seconds, not the 5-min poll.
+    let now = crate::event_outbox::current_unix_seconds();
+    state.sessions.note_revocation(&req.access_key_id, now);
+    if let Some(db) = state.config_db.as_ref() {
+        let write = {
+            let db = db.lock().await;
+            db.revoke_identity_sessions(&req.access_key_id, now)
+        };
+        if let Err(e) = write {
+            tracing::warn!("revoke-user: failed to persist revocation: {e}");
+        } else {
+            super::trigger_config_sync(&state);
+        }
+    }
+
     audit_log("session_revoke_user", "admin", &req.access_key_id, &headers);
     (StatusCode::OK, Json(serde_json::json!({ "revoked": n })))
 }

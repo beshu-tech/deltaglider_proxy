@@ -21,6 +21,13 @@ fn default_session_ttl() -> Duration {
     Duration::from_secs(hours * 3600)
 }
 
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// S3 credentials stored in a server-side session.
 /// Held in memory only — never written to disk or localStorage.
 #[derive(Clone, Serialize, Deserialize)]
@@ -87,10 +94,31 @@ pub enum SessionKind {
 
 struct SessionInfo {
     created_at: Instant,
+    /// Wall-clock creation time (unix seconds) — compared against the synced
+    /// revocation epoch (`created_unix <= revoked_since` ⇒ invalid). `created_at`
+    /// is monotonic and can't be compared to a wall-clock timestamp.
+    created_unix: i64,
     ip: Option<IpAddr>,
     s3_creds: Option<S3SessionCredentials>,
     auth_method: AuthMethod,
     kind: SessionKind,
+}
+
+impl AuthMethod {
+    /// The identity a cross-instance revocation targets: the IAM access_key_id,
+    /// or `provider:user_id` for external logins. Bootstrap/open have no
+    /// revocable identity (None) — those are cleared by restart / password reset.
+    fn revocation_identity(&self) -> Option<String> {
+        match self {
+            AuthMethod::IamLoginAs { access_key_id }
+            | AuthMethod::IamBrowserLift { access_key_id } => Some(access_key_id.clone()),
+            AuthMethod::External {
+                provider_name,
+                user_id,
+            } => Some(format!("{provider_name}:{user_id}")),
+            AuthMethod::Bootstrap | AuthMethod::OpenLift => None,
+        }
+    }
 }
 
 /// Redacted view of a live session for the admin revocation UI. Never carries
@@ -112,6 +140,11 @@ pub struct SessionSummary {
 pub struct SessionStore {
     sessions: RwLock<HashMap<String, SessionInfo>>,
     ttl: Duration,
+    /// identity → revoke epoch (unix secs). A session with
+    /// `created_unix <= revoked_since` is invalid on EVERY instance. Snapshotted
+    /// from the synced `session_revocations` table (refreshed on revoke + after
+    /// config sync) so `entry_valid` stays a pure in-memory check.
+    revocations: RwLock<HashMap<String, i64>>,
 }
 
 impl Default for SessionStore {
@@ -125,7 +158,22 @@ impl SessionStore {
         Self {
             sessions: RwLock::new(HashMap::new()),
             ttl: default_session_ttl(),
+            revocations: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Replace the revocation snapshot (from the synced `session_revocations`
+    /// table). Called on startup, after each revoke, and after a config sync.
+    pub fn set_revocations(&self, rows: Vec<(String, i64)>) {
+        *self.revocations.write() = rows.into_iter().collect();
+    }
+
+    /// Record a local revocation immediately (so the current instance rejects the
+    /// identity without waiting for a DB round-trip / sync). MAX so it's monotonic.
+    pub fn note_revocation(&self, identity: &str, revoked_since: i64) {
+        let mut r = self.revocations.write();
+        let e = r.entry(identity.to_string()).or_insert(revoked_since);
+        *e = (*e).max(revoked_since);
     }
 
     /// The configured session TTL.
@@ -136,6 +184,16 @@ impl SessionStore {
     fn entry_valid(&self, info: &SessionInfo, ip: Option<IpAddr>) -> bool {
         if info.created_at.elapsed() >= self.ttl {
             return false;
+        }
+        // Cross-instance revocation: if this session's identity was revoked at or
+        // after the session was created, it's invalid — even if it was minted on
+        // another node (the stolen-cookie / compromised-key escape hatch).
+        if let Some(identity) = info.auth_method.revocation_identity() {
+            if let Some(&revoked_since) = self.revocations.read().get(&identity) {
+                if info.created_unix <= revoked_since {
+                    return false;
+                }
+            }
         }
         if let Some(stored_ip) = info.ip {
             match ip {
@@ -196,6 +254,7 @@ impl SessionStore {
             token.clone(),
             SessionInfo {
                 created_at: Instant::now(),
+                created_unix: now_unix(),
                 ip,
                 s3_creds: None,
                 auth_method,
@@ -543,5 +602,52 @@ mod tests {
         let n = store.revoke_by_access_key("AKIA1");
         assert_eq!(n, 1);
         assert!(!store.validate(&user_t, None));
+    }
+
+    #[test]
+    fn cross_instance_revocation_snapshot_invalidates_by_identity() {
+        let store = SessionStore::new();
+        // A session minted "on another node" — model it via a normal create.
+        let t = store.create_session(
+            None,
+            AuthMethod::IamLoginAs {
+                access_key_id: "AKIA9".into(),
+            },
+            SessionKind::AdminGui,
+        );
+        assert!(store.validate(&t, None), "valid before any revocation");
+
+        // A revocation with epoch in the FUTURE (>= created_unix) invalidates it,
+        // even though the session lives only in this store — this is what a synced
+        // revocation from another instance looks like after set_revocations().
+        let future = now_unix() + 3600;
+        store.set_revocations(vec![("AKIA9".to_string(), future)]);
+        assert!(!store.validate(&t, None), "revoked identity is rejected");
+
+        // A different identity's session is untouched.
+        let other = store.create_session(
+            None,
+            AuthMethod::IamLoginAs {
+                access_key_id: "AKIB0".into(),
+            },
+            SessionKind::AdminGui,
+        );
+        assert!(store.validate(&other, None));
+
+        // A revocation epoch BEFORE the session was created does NOT invalidate a
+        // session created afterwards (revocation only kills pre-existing sessions).
+        let store2 = SessionStore::new();
+        store2.set_revocations(vec![("AKIC1".to_string(), now_unix() - 3600)]);
+        let fresh = store2.create_session(
+            None,
+            AuthMethod::IamLoginAs {
+                access_key_id: "AKIC1".into(),
+            },
+            SessionKind::AdminGui,
+        );
+        assert!(
+            store2.validate(&fresh, None),
+            "a session created AFTER the revoke epoch stays valid"
+        );
     }
 }

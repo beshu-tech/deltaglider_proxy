@@ -959,6 +959,7 @@ pub async fn sync_now(
                 &password_hash,
                 &state.iam_state,
                 &state.external_auth,
+                Some(&state.sessions),
                 &dl.temp_path,
                 "sync-now endpoint",
             )
