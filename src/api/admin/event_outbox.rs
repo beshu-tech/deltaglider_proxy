@@ -194,7 +194,7 @@ pub async fn requeue_many(
 
 /// POST /_/api/admin/event-outbox/purge-failed — drop terminal failed rows the
 /// listeners have already passed. REFUSES (409) if any failed row sits above the
-/// active listener-cursor floor — those rows may still be consumed by event-driven
+/// listener-cursor floor — those rows may still be consumed by event-driven
 /// replication (the outbox is a shared stream), and purging them would silently
 /// drop object events. Requeue those, or wait for replication to drain past them.
 pub async fn purge_failed(
@@ -213,11 +213,11 @@ pub async fn purge_failed(
         .lock()
         .await;
 
-    // Same floor the background pruner uses (min cursor of active listeners; no
-    // active listeners → i64::MAX → everything eligible). 1h staleness window.
-    let now = crate::event_outbox::current_unix_seconds();
+    // Unlike the background pruner, the operator floor ignores cursor staleness:
+    // ANY existing listener cursor pins it — a stalled consumer's unconsumed rows
+    // must never become purgeable just because it stopped ticking for an hour.
     let min_keep_id = db
-        .event_outbox_min_active_listener_cursor(now, 60 * 60)
+        .event_outbox_min_listener_cursor()
         .unwrap_or(None)
         .unwrap_or(i64::MAX);
 
