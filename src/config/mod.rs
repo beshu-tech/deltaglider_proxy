@@ -2509,12 +2509,16 @@ pub fn write_bootstrap_hash_file(path: &std::path::Path, hash: &str) -> std::io:
     {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::PermissionsExt;
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
             .open(path)?;
+        // `mode(0o600)` only applies at CREATE; a pre-existing looser file
+        // keeps its old mode — repair it via the handle on every rewrite.
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         f.write_all(hash.as_bytes())?;
         Ok(())
     }
@@ -2845,6 +2849,15 @@ backend:
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "$2b$12$xyz");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+        // A looser pre-existing mode must be REPAIRED by a rewrite.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_bootstrap_hash_file(&path, "$2b$12$rewrite").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "$2b$12$rewrite");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "rewrite must repair a loose mode, got {mode:o}"
+        );
     }
 
     #[test]

@@ -1318,3 +1318,50 @@ pub fn read_xattr_metadata(
     }
     out
 }
+
+impl TestServer {
+    /// Kill + respawn against the SAME config file, data dir, and port —
+    /// with `extra` env vars applied AFTER the default `env_remove` calls
+    /// (so a test can inject e.g. `DGP_BOOTSTRAP_PASSWORD_HASH`).
+    pub async fn respawn_with_env(&mut self, extra: &[(&str, &str)]) {
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+        // Poll until the kernel releases the listening socket (mirrors
+        // `respawn_without_encryption_key`); bounded to ~2s.
+        let addr = format!("127.0.0.1:{}", self.port);
+        let mut rebind_ok = false;
+        for _ in 0..40 {
+            match std::net::TcpListener::bind(&addr) {
+                Ok(listener) => {
+                    drop(listener);
+                    rebind_ok = true;
+                    break;
+                }
+                Err(_) => sleep(Duration::from_millis(50)).await,
+            }
+        }
+        assert!(
+            rebind_ok,
+            "port {} did not free within ~2s after killing the old child; \
+             another process may be holding it (try `lsof -i :{}`)",
+            self.port, self.port
+        );
+
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"));
+        cmd.env("DGP_CONFIG", &self.config_path)
+            .env("RUST_LOG", "deltaglider_proxy=warn")
+            .env("DGP_DEBUG_HEADERS", "true")
+            .env("DGP_TRUST_PROXY_HEADERS", "true")
+            .env_remove("DGP_BOOTSTRAP_PASSWORD_HASH")
+            .env_remove("DGP_ADMIN_PASSWORD_HASH");
+        for (key, value) in &self.extra_env {
+            cmd.env(key, value);
+        }
+        // `extra` LAST so it wins over the removals above.
+        for (key, value) in extra {
+            cmd.env(key, value);
+        }
+        self.process = cmd.spawn().expect("Failed to respawn server");
+        self.wait_ready().await;
+    }
+}
