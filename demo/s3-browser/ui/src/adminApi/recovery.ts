@@ -6,8 +6,6 @@ interface RecoverDbResponse {
   correct_hash?: string;
   correct_hash_base64?: string;
   error?: string;
-  /** True if the recovered hash was persisted; a restart now comes up unlocked. */
-  persisted_for_restart?: boolean;
 }
 
 export async function recoverDb(candidatePassword: string): Promise<RecoverDbResponse> {

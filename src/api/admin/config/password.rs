@@ -183,10 +183,6 @@ pub struct RecoverDbResponse {
     correct_hash_base64: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
-    /// True when the recovered hash was persisted to the bootstrap-hash sidecar,
-    /// so the next restart comes up unlocked WITHOUT manual env wiring.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    persisted_for_restart: Option<bool>,
 }
 
 /// POST /api/admin/recover-db — try a candidate password against the locked config DB.
@@ -206,7 +202,6 @@ pub async fn recover_db(
                 success: false,
                 correct_hash: None,
                 correct_hash_base64: None,
-                persisted_for_restart: None,
                 error: Some("No config DB mismatch detected".into()),
             }),
         )
@@ -241,7 +236,6 @@ pub async fn recover_db(
                     success: false,
                     correct_hash: None,
                     correct_hash_base64: None,
-                    persisted_for_restart: None,
                     error: Some("Too many attempts — try again later".into()),
                 }),
             )
@@ -273,7 +267,6 @@ pub async fn recover_db(
                         success: false,
                         correct_hash: None,
                         correct_hash_base64: None,
-                        persisted_for_restart: None,
                         error: Some(
                             "Input is not a bcrypt hash. Provide the hash ($2b$12$...) or its base64 encoding."
                                 .into(),
@@ -319,7 +312,6 @@ pub async fn recover_db(
                 success: false,
                 correct_hash: None,
                 correct_hash_base64: None,
-                persisted_for_restart: None,
                 error: Some(
                     "No config database found to recover (no .bak file and no S3 copy)".into(),
                 ),
@@ -349,17 +341,12 @@ pub async fn recover_db(
                 candidate_hash.as_bytes(),
             );
 
-            // Persist the recovered hash to the sidecar boot reads, so the next
-            // restart comes up UNLOCKED with no manual env wiring. (A full
-            // in-process hot-swap of the DB handle is a documented follow-up;
-            // restart-to-unlock is the safe, testable first step.)
-            let persisted = crate::config::write_bootstrap_hash_file(
-                std::path::Path::new(".deltaglider_bootstrap_hash"),
-                &candidate_hash,
-            )
-            .map_err(|e| tracing::warn!("recover_db: failed to persist bootstrap hash: {e}"))
-            .is_ok();
-
+            // Recovery is READ-ONLY: it validates the hash against the preserved
+            // .db.bak and hands it back for the operator to set as the bootstrap
+            // password, then restart. It deliberately does NOT write the sidecar
+            // or promote the DB — an earlier auto-write left the empty .db in
+            // place (still undecryptable) while claiming "just restart", which
+            // was false and, before the boot clobber-guard, destructive.
             audit_log("recover_db_success", "admin", "", &headers);
 
             // Response body contains the bcrypt hash that decrypts
@@ -379,7 +366,6 @@ pub async fn recover_db(
                     correct_hash: Some(candidate_hash),
                     correct_hash_base64: Some(hash_base64),
                     error: None,
-                    persisted_for_restart: Some(persisted),
                 }),
             )
                 .into_response()
@@ -393,7 +379,6 @@ pub async fn recover_db(
                     success: false,
                     correct_hash: None,
                     correct_hash_base64: None,
-                    persisted_for_restart: None,
                     error: Some("Password does not match the encrypted database".into()),
                 }),
             )

@@ -2501,15 +2501,27 @@ pub enum ConfigError {
 
 /// Write the bootstrap hash file with restrictive permissions (0600).
 /// This file doubles as the SQLCipher encryption key, so it must not be
-/// world-readable.
+/// world-readable — not even transiently. Create it 0600 in one syscall
+/// (not fs::write-then-chmod, which leaves an umask-wide window on a path
+/// where the key is known-valid).
 pub fn write_bootstrap_hash_file(path: &std::path::Path, hash: &str) -> std::io::Result<()> {
-    std::fs::write(path, hash)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(hash.as_bytes())?;
+        Ok(())
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, hash)
+    }
 }
 
 #[cfg(test)]
@@ -2816,6 +2828,23 @@ backend:
             msg.contains("config migrate") && msg.contains("v1.4.0"),
             "error must name the one-time conversion path, got: {msg}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_hash_file_created_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".deltaglider_bootstrap_hash");
+        write_bootstrap_hash_file(&path, "$2b$12$abc").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "sidecar must be 0600 at create, got {mode:o}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "$2b$12$abc");
+        // Overwrite path stays 0600 too (truncate, not append).
+        write_bootstrap_hash_file(&path, "$2b$12$xyz").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "$2b$12$xyz");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

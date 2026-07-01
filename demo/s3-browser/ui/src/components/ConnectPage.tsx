@@ -101,7 +101,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
   // (whoami() still reports config_db_mismatch until the operator updates the server
   // config), so the user keeps seeing the hash they need to copy. We must not clear it
   // when re-entering the wizard or that recovered hash would be lost.
-  const [recoveredHash, setRecoveredHash] = useState<{ hash: string; base64: string; persisted?: boolean } | null>(() => {
+  const [recoveredHash, setRecoveredHash] = useState<{ hash: string; base64: string } | null>(() => {
     try {
       const saved = sessionStorage.getItem('dg-recovered-hash');
       return saved ? JSON.parse(saved) : null;
@@ -316,7 +316,6 @@ export default function ConnectPage({ onConnect, showError }: Props) {
         const recovered = {
           hash: result.correct_hash,
           base64: result.correct_hash_base64 || '',
-          persisted: result.persisted_for_restart === true,
         };
         setRecoveredHash(recovered);
         try { sessionStorage.setItem('dg-recovered-hash', JSON.stringify(recovered)); } catch { /* Safari private mode — fine to skip */ }
@@ -390,9 +389,10 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                     </div>
                   </div>
                   <div style={{ color: TEXT_SECONDARY, fontSize: 14, fontFamily: "var(--font-ui)", lineHeight: 1.7 }}>
-                    {recoveredHash.persisted
-                      ? 'The correct hash has been saved on the server — just restart it and the S3 API comes back unlocked. No config change needed (the hash below is a fallback).'
-                      : 'Update your configuration with the hash below, then restart the server.'}
+                    Set this hash as your bootstrap password (env <code>DGP_BOOTSTRAP_PASSWORD_HASH</code>
+                    or the config), then restart the server to unlock. Your original config
+                    database is preserved on the server as <code>deltaglider_config.db.bak</code> and
+                    is not modified by recovery.
                   </div>
                 </div>
                 <div style={{ background: 'color-mix(in srgb, var(--input-bg) 78%, var(--glass-bg) 22%)', borderRadius: 12, padding: 16 }}>

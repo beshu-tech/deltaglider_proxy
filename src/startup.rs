@@ -737,6 +737,15 @@ pub fn startup_declarative_action(
 }
 
 /// Initialize the encrypted IAM config database. If it contains existing users,
+/// On a config-DB-mismatch boot: should we rename the current `.db` to `.db.bak`?
+/// ONLY when the db exists AND no `.db.bak` already does — an existing `.db.bak`
+/// holds the GOOD DB from an earlier mismatch boot, and the current `.db` is the
+/// empty one that boot created, so renaming would clobber the real IAM data
+/// (the C1 data-loss bug). Pure so the invariant is unit-tested.
+fn should_preserve_as_backup(db_exists: bool, bak_exists: bool) -> bool {
+    db_exists && !bak_exists
+}
+
 /// switch to IAM mode immediately.
 ///
 /// Returns `(config_db, mismatch)` where `mismatch` is true if the bootstrap
@@ -921,9 +930,13 @@ pub fn init_config_db(
             (Some(Arc::new(tokio::sync::Mutex::new(db))), false)
         }
         Err(e) => {
-            // Preserve the existing DB as .bak instead of deleting — recovery needs it
+            // Preserve the existing DB as .bak instead of deleting — recovery needs it.
+            // CLOBBER-GUARD: if a .bak already exists it holds the GOOD DB from an
+            // EARLIER mismatch boot; the current db_file is the empty DB that boot
+            // created. `rename` would overwrite the good backup with the empty one
+            // and destroy the real IAM data — so never rename over an existing .bak.
             let bak_path = db_file.with_extension("db.bak");
-            if db_file.exists() {
+            if should_preserve_as_backup(db_file.exists(), bak_path.exists()) {
                 if let Err(rename_err) = std::fs::rename(&db_file, &bak_path) {
                     warn!(
                         "Failed to backup config DB to {}: {}",
@@ -937,6 +950,13 @@ pub fn init_config_db(
                         bak_path.display()
                     );
                 }
+            } else if db_file.exists() {
+                // .bak already holds the good DB — leave it untouched.
+                error!(
+                    "Bootstrap password does not match config DB — good backup already \
+                     preserved at {}. Use the admin GUI recovery wizard to resolve.",
+                    bak_path.display()
+                );
             } else {
                 warn!(
                     "Config DB file does not exist: {} (error: {})",
@@ -1170,6 +1190,19 @@ pub async fn shutdown_signal() {
 mod tests {
     use super::*;
     use deltaglider_proxy::config::Config;
+
+    #[test]
+    fn backup_clobber_guard() {
+        // Fresh mismatch: db present, no bak yet → preserve (rename db → bak).
+        assert!(should_preserve_as_backup(true, false));
+        // SECOND mismatch boot: db (the empty one) present AND a good bak
+        // already exists → do NOT rename (would clobber the good backup). This
+        // is the C1 data-loss guard.
+        assert!(!should_preserve_as_backup(true, true));
+        // No db at all → nothing to preserve.
+        assert!(!should_preserve_as_backup(false, false));
+        assert!(!should_preserve_as_backup(false, true));
+    }
 
     // ── startup_declarative_action policy (IaC cold-start guards) ──────────
 
