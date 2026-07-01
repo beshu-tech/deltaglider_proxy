@@ -428,6 +428,7 @@ jobs:
             --test lifecycle_test \
             --test maintenance_reencrypt_test \
             --test migrate_job_test \
+            --test mismatch_boot_test \
             --test quota_test \
             --test replication_test \
             --test delta_passthrough_test \
