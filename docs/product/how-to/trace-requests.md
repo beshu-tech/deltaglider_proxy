@@ -6,7 +6,7 @@ This guide shows you how to find out why the proxy allowed or denied a request �
 
 ![Audit log panel](/_/screenshots/audit-log.jpg)
 
-When a client reports a denial, start at **Observability → Audit log** (`/_/admin/diagnostics/audit`). Every IAM denial lands there with the user, action, bucket, and path — usually that's the whole investigation. The same data is available as JSON:
+When a client reports a denial, start at **Settings → Observability → Audit log** (`/_/admin/diagnostics/audit`). Every IAM denial lands there with the user, action, bucket, and path — usually that's the whole investigation. The same data is available as JSON:
 
 ```bash
 curl -b cookies "https://s3.acme.example/_/api/admin/audit?limit=500"
@@ -22,7 +22,7 @@ Know what the ring is: an **in-memory** buffer (default 500 entries, `DGP_AUDIT_
 
 Three equivalent front doors to the same evaluator — none of them touches real data:
 
-**Admin UI:** **Observability → Trace** (`/_/admin/diagnostics/trace`). Enter method, path, and whether the request is authenticated; the panel renders the reason path and offers Copy-as-JSON.
+**Admin UI:** **Settings → Observability → Trace** (`/_/admin/diagnostics/trace`). Enter method, path, and whether the request is authenticated; the panel renders the reason path and offers Copy-as-JSON.
 
 **CLI:**
 

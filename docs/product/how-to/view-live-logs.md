@@ -4,7 +4,7 @@ This guide shows you how to tail and filter the proxy's operational logs from th
 
 ## Where it lives
 
-Open **Observability → System logs** (`/_/admin/diagnostics/logs`). The view shows the proxy's operational log stream — security, rate-limit, S3-error, replication, and lifecycle lines — captured at `INFO` and above.
+Open **Settings → Observability → System logs** (`/_/admin/diagnostics/logs`). The view shows the proxy's operational log stream — security, rate-limit, S3-error, replication, and lifecycle lines — captured at `INFO` and above.
 
 This is admin-session-gated: you must be signed in to the admin GUI.
 

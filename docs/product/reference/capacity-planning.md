@@ -10,7 +10,7 @@ A request is cheap until it touches a delta. **Passthrough** objects (already-co
 
 The cost centre is the `xdelta3` subprocess, invoked once per delta encode (on PUT) and once per delta reconstruction (on a cold GET). It is fast — xdelta3 typically processes a 100 MB object in under five seconds — but it is real CPU work, unlike a byte-copy proxy.
 
-- **Concurrency is bounded by `DGP_CODEC_CONCURRENCY`** (default: number of CPU cores). This caps how many encode/decode operations run at once, so the proxy can't oversubscribe the box with subprocesses. Requests beyond the cap queue for a codec slot.
+- **Concurrency is bounded by `DGP_CODEC_CONCURRENCY`** (default: `num_cpus × 4`, minimum 16 — xdelta3 decode is fast, so the bottleneck is I/O, not CPU). This caps how many encode/decode operations run at once, so the proxy can't oversubscribe the box with subprocesses. Requests beyond the cap queue for a codec slot.
 - **Rule of thumb:** size cores for your *peak concurrent delta operations*, not your total request rate. A workload that's 90% passthrough reads and 10% delta writes needs far fewer cores than its request count suggests.
 - A hung subprocess is killed after `DGP_CODEC_TIMEOUT_SECS` (default 60s) so it can't permanently hold a slot.
 
@@ -22,7 +22,7 @@ Memory is the variable most people underestimate, because it scales with *object
 
 - **Passthrough reads/writes:** constant memory. They stream.
 - **Delta reads (reconstruction):** xdelta3 needs the reference baseline and the output object in RAM at once. Peak working memory for a single delta GET is on the order of the reconstructed object size plus the reference — bounded per object by **`DGP_MAX_OBJECT_SIZE`** (default 100 MB). With the default cap and N concurrent delta GETs of large objects, plan for roughly `N × (object + reference)` of transient RAM on top of the baseline footprint.
-- **Reference cache (`DGP_CACHE_MB`, default 50 MB):** an LRU that keeps hot baselines in memory so only the first cold read of a deltaspace pays a backend round-trip. Raising it trades RAM for fewer backend fetches on read-heavy workloads; it does not change the per-request buffering cost.
+- **Reference cache (`DGP_CACHE_MB`, default 100 MB):** an LRU that keeps hot baselines in memory so only the first cold read of a deltaspace pays a backend round-trip. Raising it trades RAM for fewer backend fetches on read-heavy workloads; it does not change the per-request buffering cost.
 - **Metadata cache (`DGP_METADATA_CACHE_MB`, default 50 MB):** caches per-object `FileMetadata` for HEAD/GET/LIST. Small and bounded.
 
 **Worked example.** Suppose your delta-eligible objects average 40 MB and you expect up to 16 concurrent delta reads at peak. Transient reconstruction memory is roughly `16 × (40 MB + reference)` ≈ 1.3 GB on top of the caches and base process. Lowering `DGP_MAX_OBJECT_SIZE` (objects above the cap go passthrough and stream) or lowering codec concurrency both cap that number directly.
@@ -47,9 +47,9 @@ Before production, decide each of these from your workload, not the defaults:
 
 | Lever | Env var | Default | Size it from |
 |---|---|---|---|
-| Codec concurrency | `DGP_CODEC_CONCURRENCY` | CPU cores | Peak concurrent delta ops |
+| Codec concurrency | `DGP_CODEC_CONCURRENCY` | num_cpus × 4 (min 16) | Peak concurrent delta ops |
 | Max delta-eligible object size | `DGP_MAX_OBJECT_SIZE` | 100 MB | Largest object you want compressed (bigger → passthrough) |
-| Reference cache | `DGP_CACHE_MB` | 50 MB | Number/size of hot baselines, read-heaviness |
+| Reference cache | `DGP_CACHE_MB` | 100 MB | Number/size of hot baselines, read-heaviness |
 | Metadata cache | `DGP_METADATA_CACHE_MB` | 50 MB | LIST/HEAD volume |
 | HTTP concurrency ceiling | `DGP_MAX_CONCURRENT_REQUESTS` | 1024 | Peak in-flight requests |
 

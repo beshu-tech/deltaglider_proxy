@@ -108,10 +108,10 @@ docker run -v ./my-config.yaml:/etc/deltaglider_proxy.yaml \
 The admin GUI is served at `/_/` on the same port as the S3 API:
 
 - **S3 Object Browser** — browse, upload, download, delete objects; file preview on double-click; bulk copy/move/ZIP
-- **Proxy Dashboard** — live Prometheus metrics with charts (cache health, compression stats, HTTP traffic, auth) plus per-bucket savings analytics
-- **Settings** — hot-reload configuration, multi-backend routing, per-bucket policies, compression tuning, admission control, lifecycle, replication, and webhook/Slack notification delivery
+- **Proxy Dashboard** — live Prometheus metrics: 9 headline KPIs up front (savings, requests, memory, error rate, cache health), with deep telemetry behind a collapsible "Detailed telemetry" section, plus per-bucket savings analytics
+- **Configuration** — hot-reload settings split across Access, Storage, Integrations, and System sections: multi-backend routing, per-bucket policies, compression tuning, admission control, lifecycle, replication, and webhook/Slack notification delivery
 - **IAM User Management** — create, edit, delete users with ABAC permissions; OAuth/OIDC providers and group-mapping rules
-- **Audit log** — in-memory ring of recent access events
+- **Audit log** — in-memory ring of recent access events (size via `DGP_AUDIT_RING_SIZE`, default 500)
 - **API Reference** — interactive API documentation
 - **Demo Data Generator** — populate test data for evaluation
 
@@ -149,8 +149,8 @@ The Docker image includes a built-in healthcheck on port 9000 (15s interval).
 | Tag | Description |
 |-----|-------------|
 | `latest` | Latest stable release |
-| `1.2.0` | Specific version |
-| `1.2` | Latest patch in 1.2.x |
+| `1.9.3` | Specific version |
+| `1.9` | Latest patch in 1.9.x |
 | `1` | Latest minor in 1.x.x |
 
 ## Source & License

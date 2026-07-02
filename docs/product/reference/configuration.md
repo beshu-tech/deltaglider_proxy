@@ -62,13 +62,13 @@ Every section is optional. Fields equal to their default are omitted from canoni
 
 The flat (pre-Phase-3) shape — root-level `listen_addr:`, `backend:`, etc. — still loads unchanged. Mixing the two shapes in one document is a hard parse error naming the conflicting keys.
 
-The same document is editable from the admin UI. The form keeps section ownership visible, shows YAML paths next to fields, and calls out restart-only environment overrides.
+The same document is editable from the admin UI. The form keeps section ownership visible and surfaces each field's YAML path on hover; environment-driven fields note their `DGP_*` variable inline in the help text.
 
 ![Access configuration form](/_/screenshots/config-access-form.jpg)
 
 ![Storage backend configuration form](/_/screenshots/config-storage-form.jpg)
 
-![Advanced limits configuration form](/_/screenshots/config-limits-form.jpg)
+![System limits configuration form](/_/screenshots/config-limits-form.jpg)
 
 ---
 
@@ -978,7 +978,7 @@ DGP_TLS_KEY=/etc/ssl/private/proxy-key.pem
 
 ## Environment variable registry
 
-Exhaustive list of every `DGP_*` variable the server reads. The unit test `test_registry_completeness` in `src/config.rs` enforces that this list and `ENV_VAR_REGISTRY` stay in sync.
+Exhaustive list of every `DGP_*` variable the server reads. The unit test `test_registry_completeness` in `src/config/mod.rs` enforces that this list and `ENV_VAR_REGISTRY` stay in sync.
 
 ### Server / Advanced
 
