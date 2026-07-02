@@ -889,3 +889,54 @@ mod tests {
         assert_eq!(plan.skipped.len(), 2, "a skipped + .dg/skip skipped");
     }
 }
+
+#[cfg(test)]
+mod rewrite_key_proptests {
+    use super::{normalize_prefix, rewrite_key};
+    use proptest::prelude::*;
+
+    // Path-segment strategy: lowercase letters only, so prefixes and tails
+    // compose predictably without `..`/`//` edge cases (those have their own
+    // hand tests). We build keys that are guaranteed to live under the source.
+    fn seg() -> impl Strategy<Value = String> {
+        "[a-z]{1,6}"
+    }
+
+    proptest! {
+        /// Never panics / never errors when the key genuinely lives under the
+        /// source prefix (the worker's scoping guarantee).
+        #[test]
+        fn in_scope_never_errors(src in prop::collection::vec(seg(), 0..3),
+                                 dst in prop::collection::vec(seg(), 0..3),
+                                 tail in prop::collection::vec(seg(), 1..3)) {
+            let src_prefix = if src.is_empty() { String::new() } else { format!("{}/", src.join("/")) };
+            let tail_key = tail.join("/");
+            let source_key = format!("{src_prefix}{tail_key}");
+            let dst_prefix = if dst.is_empty() { String::new() } else { format!("{}/", dst.join("/")) };
+            prop_assert!(rewrite_key(&src_prefix, &dst_prefix, &source_key).is_ok());
+        }
+
+        /// ROUND-TRIP: strip-then-prepend is reversible. Rewriting source→dest
+        /// then dest→source recovers the original key. Guards against a prefix
+        /// swap that silently drops or duplicates a path segment.
+        #[test]
+        fn round_trip_recovers_original(src in prop::collection::vec(seg(), 0..3),
+                                        dst in prop::collection::vec(seg(), 0..3),
+                                        tail in prop::collection::vec(seg(), 1..3)) {
+            let src_prefix = if src.is_empty() { String::new() } else { format!("{}/", src.join("/")) };
+            let dst_prefix = if dst.is_empty() { String::new() } else { format!("{}/", dst.join("/")) };
+            let source_key = format!("{src_prefix}{}", tail.join("/"));
+
+            let forward = rewrite_key(&src_prefix, &dst_prefix, &source_key).unwrap();
+            let back = rewrite_key(&dst_prefix, &src_prefix, &forward).unwrap();
+            prop_assert_eq!(&back, &source_key, "round-trip changed the key: {} -> {} -> {}", source_key, forward, back);
+        }
+
+        /// normalize_prefix is idempotent — a fixpoint.
+        #[test]
+        fn normalize_prefix_idempotent(s in "[a-z/]{0,30}") {
+            let once = normalize_prefix(&s);
+            prop_assert_eq!(&once, &normalize_prefix(&once));
+        }
+    }
+}

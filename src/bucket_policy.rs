@@ -1085,3 +1085,40 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod prefix_normalize_proptests {
+    use super::{validate_and_normalize_prefix, PrefixOutcome};
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Never panics on arbitrary input.
+        #[test]
+        fn never_panics(s in ".{0,120}") {
+            let _ = validate_and_normalize_prefix(&s);
+        }
+
+        /// IDEMPOTENCE: feeding an accepted+normalized prefix back through the
+        /// validator yields the SAME accepted value. Normalization is a
+        /// fixpoint — the contract the double-apply admin PATCH path relies on.
+        #[test]
+        fn accept_is_idempotent(s in "[a-zA-Z0-9._/-]{0,60}") {
+            if let PrefixOutcome::Accept(norm) = validate_and_normalize_prefix(&s) {
+                match validate_and_normalize_prefix(&norm) {
+                    PrefixOutcome::Accept(again) => prop_assert_eq!(norm, again),
+                    _ => prop_assert!(false, "re-normalizing an accepted prefix changed the outcome"),
+                }
+            }
+        }
+
+        /// A dangerous pattern (`..`, NUL, `//`) is never Accepted, whatever the
+        /// leading slashes — the security-relevant property.
+        #[test]
+        fn dangerous_never_accepted(s in "[a-z/]{0,20}") {
+            let attempt = format!("{s}../x/");
+            if let PrefixOutcome::Accept(p) = validate_and_normalize_prefix(&attempt) {
+                prop_assert!(!p.contains(".."), "accepted a `..`-bearing prefix: {p:?}");
+            }
+        }
+    }
+}

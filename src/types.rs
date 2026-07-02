@@ -889,3 +889,40 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod key_path_proptests {
+    use super::{validate_key_path, ObjectKey};
+    use proptest::prelude::*;
+
+    proptest! {
+        /// The validator never panics on arbitrary input, either mode.
+        #[test]
+        fn never_panics(s in ".{0,200}", allow_slashes in any::<bool>()) {
+            let _ = validate_key_path(&s, allow_slashes);
+        }
+
+        /// Anything accepted satisfies every individual rule — the invariant
+        /// a reader relies on. NUL-free, backslash-free, no `..` segment, and
+        /// slash-free when slashes are disallowed.
+        #[test]
+        fn accepted_paths_satisfy_all_rules(s in ".{0,120}", allow_slashes in any::<bool>()) {
+            if validate_key_path(&s, allow_slashes).is_ok() {
+                prop_assert!(!s.contains('\0'));
+                prop_assert!(!s.contains('\\'));
+                prop_assert!(!s.split('/').any(|seg| seg == ".."));
+                if !allow_slashes {
+                    prop_assert!(!s.contains('/'));
+                }
+            }
+        }
+
+        /// A traversal attempt (`..` as a full segment) is always rejected as a
+        /// prefix — the security-relevant property.
+        #[test]
+        fn dotdot_segment_always_rejected(pre in "[a-z/]{0,20}", post in "[a-z/]{0,20}") {
+            let key = format!("{pre}/../{post}");
+            prop_assert!(ObjectKey::validate_prefix(&key).is_err());
+        }
+    }
+}

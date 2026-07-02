@@ -349,3 +349,56 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod classify_action_proptests {
+    use super::classify_action;
+    use crate::iam::types::S3Action;
+    use axum::http::Method;
+    use proptest::prelude::*;
+
+    fn method(i: u8) -> Method {
+        match i % 6 {
+            0 => Method::GET,
+            1 => Method::HEAD,
+            2 => Method::PUT,
+            3 => Method::DELETE,
+            4 => Method::POST,
+            _ => Method::PATCH,
+        }
+    }
+
+    proptest! {
+        /// Never panics on arbitrary method+path.
+        #[test]
+        fn never_panics(mi in any::<u8>(), path in ".{0,120}") {
+            let _ = classify_action(&method(mi), &path);
+        }
+
+        /// SECURITY INVARIANT: a mutating HTTP method must NEVER classify as a
+        /// read-only action (Read or List). A regression here would let a
+        /// read-only IAM user perform writes/deletes.
+        #[test]
+        fn mutating_methods_never_map_to_read(path in ".{0,120}") {
+            for m in [Method::PUT, Method::DELETE, Method::POST, Method::PATCH] {
+                let a = classify_action(&m, &path);
+                prop_assert!(
+                    !matches!(a, S3Action::Read | S3Action::List),
+                    "mutating method {m} on {path:?} mapped to read-only {a:?}"
+                );
+            }
+        }
+
+        /// Read methods (GET/HEAD) never escalate to a write-class action.
+        #[test]
+        fn read_methods_never_escalate(path in ".{0,120}") {
+            for m in [Method::GET, Method::HEAD] {
+                let a = classify_action(&m, &path);
+                prop_assert!(
+                    matches!(a, S3Action::Read | S3Action::List),
+                    "read method {m} on {path:?} escalated to {a:?}"
+                );
+            }
+        }
+    }
+}
