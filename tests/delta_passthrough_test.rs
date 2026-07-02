@@ -271,3 +271,68 @@ async fn delta_passthrough_falls_back_on_different_dest_reference() {
         run
     );
 }
+
+/// AES key for the encrypted verbatim-ship test (32 bytes, hex).
+const ENC_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+/// Phase 0a: an ENCRYPTED delta source replicated to a same-key-id destination
+/// must take the delta-passthrough FAST PATH (ship the .delta blob, no xdelta3
+/// reconstruct) AND produce a dest object that is byte-identical after decrypt.
+/// This is the corruption-sensitive path: get_delta_raw decrypts → put_delta_raw
+/// re-encrypts under the dest key + re-stamps the key-id; the source encryption
+/// markers MUST be stripped so the dest metadata matches the (re-encrypted) body.
+#[tokio::test]
+async fn delta_passthrough_encrypted_same_key_ships_verbatim_and_reads_back() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .encryption_key(ENC_KEY) // one key for the whole backend → src & dst share key-id
+        .extra_yaml_storage_section(RULE_YAML)
+        .build()
+        .await;
+
+    let s3 = server.s3_client().await;
+    for b in ["dp-src", "dp-dst"] {
+        s3.create_bucket().bucket(b).send().await.ok();
+    }
+
+    // Seed a delta pair on the (encrypted) source.
+    let v2 = seed_delta(&server, "dp-src", "rel/").await;
+
+    let r1 = run_now(&server).await;
+    assert_eq!(r1["status"].as_str(), Some("succeeded"), "run1: {}", r1);
+    assert_eq!(
+        r1["objects_processed"].as_i64(),
+        Some(2),
+        "copied v1+v2: {}",
+        r1
+    );
+
+    // THE correctness net: the dest object decrypts + reconstructs byte-identical.
+    // (A stale source key-id marker surviving onto the re-encrypted dest body
+    // would make this GET hard-fail — the exact corruption this phase guards.)
+    let dest_v2 = get_bytes(&server, "dp-dst", "rel/v2.tar").await;
+    assert_eq!(
+        dest_v2, v2,
+        "encrypted dest v2 must reconstruct byte-identical"
+    );
+
+    let run1 = latest_run(&server).await;
+    let dp = run1["delta_passthrough"].as_i64().unwrap_or(0);
+    if xdelta3_available() {
+        // Same key-id both sides → the fast path MUST fire (no reconstruct).
+        assert!(
+            dp >= 1,
+            "encrypted same-key delta must ship via the fast path (delta_passthrough=0): {}",
+            run1
+        );
+    }
+
+    // Idempotent: a 2nd run copies nothing (content-diff sees identical).
+    let r2 = run_now(&server).await;
+    assert_eq!(
+        r2["objects_processed"].as_i64(),
+        Some(0),
+        "2nd run no-op: {}",
+        r2
+    );
+}

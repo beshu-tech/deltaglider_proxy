@@ -1458,6 +1458,18 @@ enum DestOracle {
     Unbounded,
 }
 
+/// PURE: is `key` under the proven-absent subtree `prefix`? A `/`-terminated
+/// prefix matches only true path descendants (`foo/` matches `foo/x`, NOT
+/// `foobar/x`). An empty prefix (whole-bucket absent) matches everything. A
+/// non-`/`-terminated prefix (shouldn't happen — common-prefixes always end in
+/// `/`) is rejected defensively so it can never false-match a sibling.
+fn key_under_absent_prefix(key: &str, prefix: &str) -> bool {
+    if prefix.is_empty() {
+        return true;
+    }
+    prefix.ends_with('/') && key.starts_with(prefix)
+}
+
 impl DestOracle {
     /// True if the key MIGHT exist on the destination (so a HEAD is warranted).
     /// `Unbounded` always returns true (preserves the HEAD-every-key fallback).
@@ -1469,9 +1481,13 @@ impl DestOracle {
                 present,
                 absent_subtrees,
             } => {
+                // `key_under_absent_prefix` requires the prefix to be `/`-terminated
+                // so a sibling `foobar/x` can NEVER match the absent subtree `foo/`
+                // (a raw `starts_with` would). Marking a live sibling absent →
+                // copy-with-no-HEAD → overwrite, so this boundary is load-bearing.
                 if absent_subtrees
                     .iter()
-                    .any(|p| dest_key.starts_with(p.as_str()))
+                    .any(|p| key_under_absent_prefix(dest_key, p))
                 {
                     return false;
                 }
@@ -1718,6 +1734,25 @@ fn compute_next_due(rule: &ReplicationRule, finished_at: i64) -> i64 {
 mod tests {
     use super::*;
     use crate::config_sections::{ConflictPolicy, ReplicationEndpoint, ReplicationRule};
+
+    #[test]
+    fn absent_prefix_matches_only_path_descendants() {
+        // A live sibling must NEVER match a proven-absent subtree.
+        assert!(key_under_absent_prefix("foo/x", "foo/"));
+        assert!(key_under_absent_prefix("foo/bar/x", "foo/"));
+        assert!(
+            !key_under_absent_prefix("foobar/x", "foo/"),
+            "sibling must not match"
+        );
+        assert!(!key_under_absent_prefix("food", "foo/"));
+        // The prefix key itself (no trailing slash) is not "under" the subtree.
+        assert!(!key_under_absent_prefix("foo", "foo/"));
+        // Whole-bucket absent (empty prefix) matches everything.
+        assert!(key_under_absent_prefix("anything/at/all", ""));
+        // Defensive: a non-slash prefix (shouldn't occur) never matches.
+        assert!(!key_under_absent_prefix("foobar/x", "foo"));
+        assert!(!key_under_absent_prefix("foo/x", "foo"));
+    }
 
     #[test]
     fn control_verdict_truth_table() {

@@ -796,6 +796,15 @@ pub(crate) fn can_delta_passthrough(
     }
 }
 
+/// Drop the at-rest encryption markers so the DEST write decides them fresh:
+/// re-stamped iff the dest actually encrypts, absent iff it writes plaintext
+/// (PassThrough shim / no key). Keeps stored metadata consistent with the body.
+fn strip_encryption_markers(user_metadata: &mut std::collections::HashMap<String, String>) {
+    use crate::storage::encrypting::{ENCRYPTION_KEY_ID_KEY, ENCRYPTION_MARKER_KEY};
+    user_metadata.remove(ENCRYPTION_MARKER_KEY);
+    user_metadata.remove(ENCRYPTION_KEY_ID_KEY);
+}
+
 /// Build an [`EncFingerprint`] from at-rest user-metadata markers.
 fn enc_fingerprint(meta: &crate::types::FileMetadata) -> EncFingerprint {
     use crate::storage::encrypting::{ENCRYPTION_KEY_ID_KEY, ENCRYPTION_MARKER_KEY};
@@ -857,12 +866,16 @@ async fn delta_passthrough_copy(
         return Ok(None);
     }
 
+    // ENCRYPTED sources are eligible: get_delta_raw / get_reference_raw DECRYPT
+    // to plaintext, and put_delta_raw / put_reference_raw RE-ENCRYPT under the
+    // DEST key (+re-stamp the dest key-id) — so a same-key-id ship is byte-
+    // preserving (skips the whole-object xdelta3 reconstruct). The gate below
+    // Fallbacks on enc-incompatible / Encrypted{None}. We MUST strip the source
+    // encryption markers before the ship (see the `meta` strip below): a dest
+    // wrapper in decrypt-only PassThrough mode (or no key) does NOT re-stamp, so
+    // a surviving source marker on a now-plaintext body would make the read pick
+    // the wrong key and hard-fail.
     let src_enc = enc_fingerprint(source_head);
-    // v1 ships ONLY plaintext sources: get_delta→put_delta through the
-    // encrypting wrapper would re-encrypt with a new IV (not verbatim).
-    if src_enc != EncFingerprint::Plaintext {
-        return Ok(None);
-    }
 
     let src = SrcDeltaFacts {
         ref_sha256: src_ref_sha256.clone(),
@@ -886,6 +899,13 @@ async fn delta_passthrough_copy(
     for key in request.strip_user_metadata_keys {
         meta.user_metadata.remove(*key);
     }
+    // Strip the SOURCE encryption markers: the dest write re-stamps them iff it
+    // actually encrypts (encrypt mode), and leaves the body plaintext-with-no-
+    // marker iff it doesn't (PassThrough shim / no key). Either way the stored
+    // metadata matches the body — a surviving source marker on a re-encrypted or
+    // passed-through body is silent corruption on read. Mirrors the reencrypt
+    // job (maintenance/worker.rs strip_encryption_markers).
+    strip_encryption_markers(&mut meta.user_metadata);
 
     // Decide AND ship under the dest prefix lock, so the gate's reference read
     // and the delta write are one critical section — mirrors the normal PUT
@@ -930,12 +950,16 @@ async fn delta_passthrough_copy(
                     // Seed the dest reference verbatim, asserting it matches
                     // src.ref_sha256 before writing (defense layer 2).
                     let ref_data = engine2.get_reference_raw(&src_bucket, &src_prefix2).await?;
-                    let ref_meta = engine2
+                    let mut ref_meta = engine2
                         .reference_metadata_raw(&src_bucket, &src_prefix2)
                         .await?;
                     if ref_meta.file_sha256 != src.ref_sha256 {
                         return Ok(None);
                     }
+                    // Same marker strip as the delta: the dest write re-stamps
+                    // (encrypt) or leaves plaintext (passthrough); a surviving
+                    // source marker would corrupt the reference read.
+                    strip_encryption_markers(&mut ref_meta.user_metadata);
                     seeded_ref_bytes = ref_meta.file_size;
                     engine2
                         .put_reference_raw(&dest_bucket, &dest_prefix2, &ref_data, &ref_meta)
@@ -1204,8 +1228,8 @@ mod tests {
 
     #[test]
     fn row_encrypted_k_match_encrypted_k_ships() {
-        // The PURE gate says ship; the copy fn downgrades encrypted to
-        // fallback in v1, but the gate must encode the correct verdict.
+        // Same key-id both sides → ship. The copy fn strips source markers so
+        // the dest re-stamps its own key-id (byte-preserving after decrypt).
         assert_eq!(
             can_delta_passthrough(
                 &enc_src("aaa", Some("k")),
