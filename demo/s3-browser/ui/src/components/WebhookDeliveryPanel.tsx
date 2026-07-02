@@ -32,7 +32,7 @@ import {
   Tag,
   Typography,
 } from 'antd';
-import { ApiOutlined, DeleteOutlined, SendOutlined } from '@ant-design/icons';
+import { ApiOutlined, DeleteOutlined } from '@ant-design/icons';
 import type { SectionApplyResponse } from '../adminApi';
 import { fetchEventOutbox } from '../adminApi';
 import { useCardStyles, contentColumn, CONTENT_WIDE } from './shared-styles';
@@ -303,14 +303,14 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
       )}
 
       {/* ── 1. GENERIC DELIVERY CONFIG (all format-agnostic settings together) ── */}
+      {/* No SectionHeader here — TabHeader already titles the page "Event delivery". */}
       <div style={cardStyle}>
-        <SectionHeader
-          icon={<SendOutlined />}
-          title="Event delivery"
-          description="Deliver durable object events (create/delete/copy) downstream. The outbox accrues events even while disabled — they deliver once you enable + configure a destination below."
-        />
         <div>
-          <FormField label="Enable delivery" yamlPath="advanced.event_delivery.enabled">
+          <FormField
+            label="Enable delivery"
+            yamlPath="advanced.event_delivery.enabled"
+            helpText="Object events (create/delete/copy) queue in the outbox even while this is off — they deliver once you enable it and set a destination below."
+          >
             <Switch checked={form.enabled} onChange={(v) => setField({ enabled: v })} />
           </FormField>
 

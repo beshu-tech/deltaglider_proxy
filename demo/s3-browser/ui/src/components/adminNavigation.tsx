@@ -56,7 +56,7 @@ export interface SidebarEntry {
 }
 
 /**
- * The 5-group / 15-leaf IA — merged from 8 to drop single/double-leaf header
+ * The 5-group / 17-leaf IA — merged from 8 to drop single/double-leaf header
  * tax (see docs/plan/admin-ui-taxonomy.md): Observability (overview +
  * diagnostics + logs), Access, Storage (incl. Jobs), Integrations, System.
  * No parent/overview pages: every entry is a destination. Leaf paths are
