@@ -2127,6 +2127,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn engine_error_maps_to_s3s_code() {
+        use crate::api::S3Error;
+        // The mappings the wire tests used to prove end-to-end (missing
+        // key/bucket → the right S3 error code the client sees).
+        assert_eq!(
+            engine_error_to_s3s(S3Error::NoSuchKey("k".into())).code(),
+            &s3s::S3ErrorCode::NoSuchKey
+        );
+        assert_eq!(
+            engine_error_to_s3s(S3Error::NoSuchBucket("b".into())).code(),
+            &s3s::S3ErrorCode::NoSuchBucket
+        );
+        assert_eq!(
+            engine_error_to_s3s(S3Error::PreconditionFailed).code(),
+            &s3s::S3ErrorCode::PreconditionFailed
+        );
+        // Catch-all: an unmapped engine error becomes a 500 InternalError
+        // rather than leaking an unrelated code.
+        assert_eq!(
+            engine_error_to_s3s(S3Error::MalformedXML).code(),
+            &s3s::S3ErrorCode::InternalError
+        );
+    }
+
     #[tokio::test]
     async fn collect_blob_limited_rejects_oversize_body() {
         let blob =

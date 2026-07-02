@@ -9,22 +9,11 @@ mod common;
 
 use common::TestServer;
 
-#[tokio::test]
-async fn test_nosuchkey_xml_response() {
-    let server = TestServer::filesystem().await;
-    let client = reqwest::Client::new();
-
-    let url = format!("{}/{}/nonexistent.txt", server.endpoint(), server.bucket());
-    let resp = client.get(&url).send().await.unwrap();
-
-    assert_eq!(resp.status().as_u16(), 404);
-    let body = resp.text().await.unwrap();
-    assert!(
-        body.contains("<Code>NoSuchKey</Code>"),
-        "Should contain NoSuchKey error code, got: {}",
-        body
-    );
-}
+// NOTE: the plain "missing key → NoSuchKey code" mapping is unit-tested
+// directly in src/s3_adapter_s3s.rs (`engine_error_to_s3s`); no TestServer
+// spawn is needed to prove it. The tests below cover PIPELINE behaviour that
+// the pure mapping can't (s3s XML body parsing → 400, multipart state, the
+// content-type the framework renders, HEAD-bucket status).
 
 #[tokio::test]
 async fn test_nosuchbucket_xml_response() {
