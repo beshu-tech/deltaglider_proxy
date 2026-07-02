@@ -404,7 +404,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// natively by the backend (passthrough only). Returns `Ok(None)` when the
     /// caller should fall back to the buffered path (delta/reference, or
     /// unmanaged objects where we don't know the storage type up front).
-    #[instrument(skip(self))]
+    /// `expected_source`: generation pin for multi-part copies. When `Some`,
+    /// the metadata CACHE is bypassed (fresh resolve) and the resolved object
+    /// must still match the pinned size + content hash — a concurrent
+    /// overwrite mid-copy fails the range instead of silently mixing
+    /// generations into the destination ("frankenobject" guard).
+    #[instrument(skip(self, expected_source))]
     #[allow(clippy::type_complexity)]
     pub async fn retrieve_stream_range(
         &self,
@@ -412,6 +417,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         key: &str,
         start: u64,
         end: u64,
+        expected_source: Option<&FileMetadata>,
     ) -> Result<
         Option<(
             BoxStream<'static, Result<Bytes, StorageError>>,
@@ -425,8 +431,18 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // Check metadata cache first. Track cache provenance so a stale
         // strategy (e.g. passthrough cached before a concurrent rewrite to
         // delta) can be invalidated and retried like `retrieve_stream()`.
-        let (metadata, from_cache) = if let Some(cached) = self.metadata_cache.get(bucket, key) {
-            (Some(cached), true)
+        // A generation-pinned read never trusts the cache: the pin exists to
+        // DETECT change, and the same-node cache would mask it.
+        let (metadata, from_cache) = if expected_source.is_none() {
+            if let Some(cached) = self.metadata_cache.get(bucket, key) {
+                (Some(cached), true)
+            } else {
+                (
+                    self.resolve_metadata_with_migration(bucket, &deltaspace_id, &obj_key)
+                        .await?,
+                    false,
+                )
+            }
         } else {
             (
                 self.resolve_metadata_with_migration(bucket, &deltaspace_id, &obj_key)
@@ -434,6 +450,15 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 false,
             )
         };
+
+        if let (Some(expected), Some(actual)) = (expected_source, metadata.as_ref()) {
+            if !Self::same_generation(expected, actual) {
+                return Err(EngineError::Storage(StorageError::Other(format!(
+                    "source changed during copy: {}/{} (size {} -> {})",
+                    bucket, key, expected.file_size, actual.file_size
+                ))));
+            }
+        }
 
         let metadata = match metadata {
             Some(m) => {
@@ -724,5 +749,80 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             Err(StorageError::NotFound(_)) => Err(EngineError::NotFound(obj_key.full_key())),
             Err(e) => Err(EngineError::Storage(e)),
         }
+    }
+
+    /// PURE: do two metadata snapshots describe the same object generation?
+    /// Size must match; then the strongest hash both sides carry decides
+    /// (sha256 > md5 > multipart_etag). Same size with NO shared hash is
+    /// conservatively DIFFERENT — a pinned copy must never guess.
+    fn same_generation(expected: &FileMetadata, actual: &FileMetadata) -> bool {
+        if expected.file_size != actual.file_size {
+            return false;
+        }
+        let pairs = [
+            (&expected.file_sha256, &actual.file_sha256),
+            (&expected.md5, &actual.md5),
+        ];
+        for (e, a) in pairs {
+            if !e.is_empty() && !a.is_empty() {
+                return e == a;
+            }
+        }
+        match (&expected.multipart_etag, &actual.multipart_etag) {
+            (Some(e), Some(a)) if !e.is_empty() && !a.is_empty() => e == a,
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+    use crate::types::FileMetadata;
+
+    fn meta(size: u64, sha: &str, md5: &str, metag: Option<&str>) -> FileMetadata {
+        let mut m =
+            FileMetadata::new_passthrough("f.bin".into(), sha.into(), md5.into(), size, None);
+        m.multipart_etag = metag.map(|s| s.to_string());
+        m
+    }
+
+    #[test]
+    fn same_generation_truth_table() {
+        type E = DeltaGliderEngine<Box<dyn crate::storage::StorageBackend>>;
+        // Identical sha → same.
+        assert!(E::same_generation(
+            &meta(10, "aa", "m1", None),
+            &meta(10, "aa", "m2", None)
+        ));
+        // Size differs → different, regardless of hashes.
+        assert!(!E::same_generation(
+            &meta(10, "aa", "m1", None),
+            &meta(11, "aa", "m1", None)
+        ));
+        // Sha differs → different (md5 agreement is NOT consulted).
+        assert!(!E::same_generation(
+            &meta(10, "aa", "m1", None),
+            &meta(10, "bb", "m1", None)
+        ));
+        // No sha on one side → falls to md5.
+        assert!(E::same_generation(
+            &meta(10, "", "m1", None),
+            &meta(10, "bb", "m1", None)
+        ));
+        assert!(!E::same_generation(
+            &meta(10, "", "m1", None),
+            &meta(10, "", "m2", None)
+        ));
+        // Only multipart etags shared → compared.
+        assert!(E::same_generation(
+            &meta(10, "", "", Some("e-3")),
+            &meta(10, "", "", Some("e-3"))
+        ));
+        // Same size, NO shared hash at all → conservatively different.
+        assert!(!E::same_generation(
+            &meta(10, "", "", None),
+            &meta(10, "", "", None)
+        ));
     }
 }

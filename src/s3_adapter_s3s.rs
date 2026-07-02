@@ -188,7 +188,7 @@ impl s3s::S3 for DeltaGliderS3Service {
             let content_range = format!("bytes {start}-{end_inclusive}/{}", head.file_size);
 
             if let Some((stream, content_length, metadata)) = engine
-                .retrieve_stream_range(&input.bucket, &input.key, start, end_inclusive)
+                .retrieve_stream_range(&input.bucket, &input.key, start, end_inclusive, None)
                 .await
                 .map_err(engine_error_to_s3s)?
             {

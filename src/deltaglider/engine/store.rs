@@ -1292,7 +1292,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     }
 
     /// Delete a passthrough file, ignoring NotFound (idempotent).
-    async fn delete_passthrough_idempotent(
+    pub(crate) async fn delete_passthrough_idempotent(
         &self,
         bucket: &str,
         deltaspace_id: &str,

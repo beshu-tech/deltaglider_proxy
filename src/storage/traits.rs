@@ -641,6 +641,40 @@ macro_rules! impl_storage_backend_for_box {
             ) -> Result<(), StorageError> {
                 (**self).put_reference(bucket, prefix, data, metadata).await
             }
+            // MUST forward: these two are the bounded-memory backbone (stream the
+            // reference to/from a local file). Falling through to the trait
+            // DEFAULT heap-loads the whole baseline on every streaming-delta op.
+            async fn get_reference_to_file(
+                &self,
+                bucket: &str,
+                prefix: &str,
+                dest: &std::path::Path,
+            ) -> Result<u64, StorageError> {
+                (**self).get_reference_to_file(bucket, prefix, dest).await
+            }
+            async fn put_reference_from_file(
+                &self,
+                bucket: &str,
+                prefix: &str,
+                source_path: &std::path::Path,
+                metadata: &FileMetadata,
+            ) -> Result<(), StorageError> {
+                (**self)
+                    .put_reference_from_file(bucket, prefix, source_path, metadata)
+                    .await
+            }
+            async fn put_passthrough_parts(
+                &self,
+                bucket: &str,
+                prefix: &str,
+                filename: &str,
+                part_paths: &[std::path::PathBuf],
+                metadata: &FileMetadata,
+            ) -> Result<(), StorageError> {
+                (**self)
+                    .put_passthrough_parts(bucket, prefix, filename, part_paths, metadata)
+                    .await
+            }
             async fn put_reference_metadata(
                 &self,
                 bucket: &str,

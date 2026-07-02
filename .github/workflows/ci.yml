@@ -433,6 +433,7 @@ jobs:
             --test replication_test \
             --test delta_passthrough_test \
             --test streaming_copy_test \
+            --test generation_pin_test \
             --test large_object_e2e_test \
             --test parity_test \
             --test savings_test \

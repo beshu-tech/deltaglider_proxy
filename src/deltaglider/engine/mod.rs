@@ -763,18 +763,25 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// (`transfer.rs`), which ships a `.delta` verbatim via `put_delta_raw` and
     /// thus bypasses the `store()` choke point. Overwrite-aware + adds any
     /// reference the copy seeded. Mirrors [`Self::record_store`].
-    pub async fn record_fast_path_copy(
+    /// Snapshot the destination's PRIOR metadata for fast-path accounting.
+    /// MUST be called BEFORE the fast-path write — calling `prior_for_counter`
+    /// after the write returns the just-written delta, netting an overwrite to
+    /// zero (the dest bucket usage counter then never grows).
+    pub async fn fast_path_prior(&self, bucket: &str, dest_key: &str) -> Option<FileMetadata> {
+        self.prior_for_counter(bucket, dest_key).await
+    }
+
+    pub fn record_fast_path_copy(
         &self,
         bucket: &str,
-        dest_key: &str,
+        prior: Option<&FileMetadata>,
         delta_meta: &FileMetadata,
         seeded_reference_bytes: u64,
     ) {
-        let prior = self.prior_for_counter(bucket, dest_key).await;
         let Some(u) = &self.bucket_usage else { return };
         u.apply_net(
             bucket,
-            prior.as_ref(),
+            prior,
             Some(delta_meta),
             seeded_reference_bytes as i64,
         );
@@ -1006,7 +1013,29 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     ) -> Result<(), StorageError> {
         self.storage
             .put_delta(bucket, prefix, filename, data, metadata)
+            .await?;
+        // Mirror every engine store path: a delta write supersedes any stale
+        // PASSTHROUGH variant of the same key — leaving it behind lets a
+        // later delta delete resurrect old content. Cache must drop too.
+        if let Err(e) = self
+            .delete_passthrough_idempotent(bucket, prefix, filename)
             .await
+        {
+            tracing::warn!(
+                "fast-path delta write {}/{}/{}: stale passthrough cleanup failed: {}",
+                bucket,
+                prefix,
+                filename,
+                e
+            );
+        }
+        let full_key = if prefix.is_empty() {
+            filename.to_string()
+        } else {
+            format!("{}/{}", prefix, filename)
+        };
+        self.metadata_cache.invalidate(bucket, &full_key);
+        Ok(())
     }
 
     /// Read a deltaspace reference blob verbatim.

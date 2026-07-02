@@ -369,6 +369,7 @@ async fn stream_copy_passthrough(
     // `finish` can assemble them; that path isn't memory-critical (local).
     let src_bucket = request.source_bucket.to_string();
     let src_key = request.source_key.to_string();
+    let pinned_head = source_head.clone();
     let metrics = engine.metrics().cloned();
     let results: Result<Vec<PartUploadResult>, String> =
         futures::stream::iter(spans.iter().copied())
@@ -377,6 +378,7 @@ async fn stream_copy_passthrough(
                 let handle = handle.clone();
                 let src_bucket = src_bucket.clone();
                 let src_key = src_key.clone();
+                let pinned_head = pinned_head.clone();
                 let metrics = metrics.clone();
                 async move {
                     // Guard increments parts_inflight on entry, holds resident
@@ -388,6 +390,7 @@ async fn stream_copy_passthrough(
                         &src_bucket,
                         &src_key,
                         &span,
+                        &pinned_head,
                         metrics.as_ref(),
                     )
                     .await
@@ -446,11 +449,15 @@ async fn stream_copy_passthrough(
 
     // Reached complete: disarm the guard (it holds a clone) so the Arc is sole-owned.
     drop(handle);
-    let handle = Arc::try_unwrap(abort_guard.disarm()).map_err(
-        |_| -> Box<dyn std::error::Error + Send + Sync> {
-            "internal: multipart handle still shared at finish".into()
-        },
-    )?;
+    let handle = match Arc::try_unwrap(abort_guard.disarm()) {
+        Ok(h) => h,
+        Err(shared) => {
+            // Should be sole-owned here; if not, ABORT the upload before
+            // erroring — the guard is already disarmed, so nobody else will.
+            engine.abort_passthrough_multipart_ref(&shared).await;
+            return Err("internal: multipart handle still shared at finish".into());
+        }
+    };
     let result = engine
         .finish_passthrough_multipart(handle, parts, assembled, sha256, md5, multipart_etag)
         .await
@@ -519,14 +526,21 @@ async fn fetch_part_with_resume(
     bucket: &str,
     key: &str,
     span: &PartSpan,
+    source_head: &crate::types::FileMetadata,
     metrics: Option<&Arc<Metrics>>,
 ) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
     const MAX_PART_ATTEMPTS: u32 = 4;
     let mut last_err: Option<String> = None;
     for attempt in 1..=MAX_PART_ATTEMPTS {
-        match fetch_part_once(engine, bucket, key, span).await {
+        match fetch_part_once(engine, bucket, key, span, source_head).await {
             Ok(bytes) => return Ok(bytes),
             Err(msg) => {
+                // A generation-pin failure can never heal at the PART level
+                // (the pin is fixed) — abort now; the whole-copy retry
+                // re-HEADs and copies the NEW generation cleanly.
+                if msg.contains(SOURCE_CHANGED_TOKEN) {
+                    return Err(msg.into());
+                }
                 if !is_transient_copy_error(&msg) || attempt == MAX_PART_ATTEMPTS {
                     return Err(msg.into());
                 }
@@ -554,6 +568,7 @@ async fn fetch_part_once(
     bucket: &str,
     key: &str,
     span: &PartSpan,
+    source_head: &crate::types::FileMetadata,
 ) -> Result<Bytes, String> {
     // Test-only fault injection (inert without the env var): fire a
     // transient-classified error exactly once for the named part so the
@@ -561,8 +576,17 @@ async fn fetch_part_once(
     if let Some(e) = maybe_inject_part_failure(span.number) {
         return Err(e);
     }
+    // Generation-pinned: the engine resolves the source FRESH (no cache) and
+    // fails when it no longer matches `source_head` — a concurrent overwrite
+    // mid-copy must abort the copy, never mix generations into the dest.
     let ranged = engine
-        .retrieve_stream_range(bucket, key, span.start, span.end_inclusive)
+        .retrieve_stream_range(
+            bucket,
+            key,
+            span.start,
+            span.end_inclusive,
+            Some(source_head),
+        )
         .await
         .map_err(|e| format!("ranged retrieve failed: {}", e))?;
     let (stream, content_length, _meta) = ranged.ok_or_else(|| {
@@ -653,9 +677,14 @@ async fn maybe_part_barrier() {
     }
 }
 
+/// Marker for a generation-pin failure (see retrieve_stream_range): fatal at
+/// the part level, transient at the whole-copy level (retry re-HEADs).
+pub(crate) const SOURCE_CHANGED_TOKEN: &str = "source changed during copy";
+
 pub(crate) fn is_transient_copy_error(message: &str) -> bool {
     let m = message.to_ascii_lowercase();
     [
+        SOURCE_CHANGED_TOKEN,
         "failed to read response body",
         "streaming error",
         "connection reset",
@@ -871,6 +900,11 @@ async fn delta_passthrough_copy(
     // engine store() choke point via put_delta_raw.
     let counter_meta = meta.clone();
     let counter_dest_bucket = dest_bucket.clone();
+    // Snapshot the dest's PRIOR metadata BEFORE the write — reading it after
+    // returns the just-written delta and nets the overwrite to zero.
+    let counter_prior = engine
+        .fast_path_prior(&counter_dest_bucket, request.destination_key)
+        .await;
     // `Some(ref_bytes)` = shipped (ref_bytes = bytes of a reference we SEEDED on
     // this copy, 0 if the dest already had one); `None` = fell back.
     let shipped: Result<Option<u64>, Box<dyn std::error::Error + Send + Sync>> = engine
@@ -927,14 +961,12 @@ async fn delta_passthrough_copy(
     // Record the destination contribution into the usage counter — the fast
     // path bypasses the engine store() choke point, so do it explicitly here.
     // Overwrite-aware (the dest key may already exist) + add a seeded reference.
-    engine
-        .record_fast_path_copy(
-            &counter_dest_bucket,
-            request.destination_key,
-            &counter_meta,
-            seeded_ref_bytes,
-        )
-        .await;
+    engine.record_fast_path_copy(
+        &counter_dest_bucket,
+        counter_prior.as_ref(),
+        &counter_meta,
+        seeded_ref_bytes,
+    );
 
     // HEAD reports the LOGICAL size, not the delta size.
     verify_destination(

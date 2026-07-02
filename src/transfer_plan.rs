@@ -65,7 +65,10 @@ impl PartSpan {
 
 /// Env-resolved stream-copy threshold (`DGP_STREAM_COPY_THRESHOLD`).
 pub fn stream_copy_threshold() -> u64 {
-    env_parse_with_default("DGP_STREAM_COPY_THRESHOLD", STREAM_COPY_THRESHOLD)
+    // Floored at 1: threshold 0 would admit a 0-byte object, and plan_parts(0)
+    // is empty → a zero-part CompleteMultipartUpload. A 1-byte object still has
+    // one part, so `>= 1` keeps empties off the streaming path.
+    env_parse_with_default("DGP_STREAM_COPY_THRESHOLD", STREAM_COPY_THRESHOLD).max(1)
 }
 
 /// Env-resolved multipart part size (`DGP_MULTIPART_PART_SIZE`), clamped
