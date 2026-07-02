@@ -236,6 +236,16 @@ impl ConfigDb {
         )
     }
 
+    /// True when SOME owner holds an unexpired lifecycle lease on the rule —
+    /// the H2 delete-guard anchor for lifecycle (mirrors replication, #10).
+    pub fn lifecycle_lease_is_held(
+        &self,
+        rule_name: &str,
+        now: i64,
+    ) -> Result<bool, ConfigDbError> {
+        job_store::lease_is_held(&self.conn, "lifecycle_state", "rule_name", &rule_name, now)
+    }
+
     pub fn lifecycle_release_lease(
         &self,
         rule_name: &str,

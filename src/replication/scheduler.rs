@@ -151,6 +151,7 @@ async fn run_due_rules(
                 transfers: replication.transfers,
                 upload_concurrency: replication.upload_concurrency,
             },
+            Some(state.maintenance_gate.clone()),
         )
         .await
         {

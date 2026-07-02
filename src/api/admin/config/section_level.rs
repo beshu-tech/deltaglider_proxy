@@ -481,6 +481,25 @@ async fn apply_section(
         }
     }
 
+    // Same changed-only fatal gate for duplicate replication rule names (#13):
+    // state/cursor/lease are keyed by name, so dups corrupt each other's cursor.
+    if let Err(errs) =
+        crate::config_sections::replication_gate(&old_cfg.replication, &new_cfg.replication)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(SectionApplyResponse {
+                ok: false,
+                warnings: removed_warnings,
+                requires_restart: false,
+                persisted_path: None,
+                error: Some(errs.join("; ")),
+                diff: None,
+            }),
+        )
+            .into_response();
+    }
+
     // Compute the diff before we potentially swap. This is the shape
     // the UI renders in the Apply dialog.
     let diff = compute_section_diff(section, &old_cfg, &new_cfg);

@@ -91,6 +91,24 @@ assert.deepEqual(
   ['pause', 'preview', 'delete'],
   'lifecycle has NO kill (backend would 400)'
 );
+// Lifecycle run-now is NOT a paused/disabled one-off (backend 409s both) — the
+// UI must not offer a button the backend structurally rejects.
+assert.deepEqual(
+  availableActions(row({ kind: 'lifecycle', paused: true })),
+  ['resume', 'preview', 'delete'],
+  'paused lifecycle: no run-now (backend 409s it)'
+);
+assert.deepEqual(
+  availableActions(row({ kind: 'lifecycle', enabled: false })),
+  ['pause', 'preview', 'delete'],
+  'disabled lifecycle: no run-now (backend 409s it)'
+);
+// Replication one-off is unchanged: paused/disabled still runnable.
+assert.deepEqual(
+  availableActions(row({ kind: 'replication', paused: true })),
+  ['resume', 'run-now', 'delete'],
+  'paused replication still allows a one-off'
+);
 assert.deepEqual(
   availableActions(row({ kind: 'reencrypt', trigger: 'oneoff', status: 'running' })),
   ['cancel']

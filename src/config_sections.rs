@@ -1567,6 +1567,39 @@ const MAX_BATCH_SIZE: u32 = 10_000;
 /// (empty = all-good). NOT hard errors — the existing `Config::check`
 /// contract is warnings-only; the worker refuses to act on rules that
 /// this validator flagged.
+/// Duplicate replication rule names, each reported once. FATAL, not advisory:
+/// replication_state / cursor / lease are keyed by rule.name, so two same-named
+/// rules corrupt each other's resume cursor (mirrors the lifecycle rule, #13).
+pub fn replication_duplicate_rule_names(cfg: &ReplicationConfig) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut dups = Vec::new();
+    for rule in &cfg.rules {
+        if !seen.insert(rule.name.as_str()) && !dups.contains(&rule.name) {
+            dups.push(rule.name.clone());
+        }
+    }
+    dups
+}
+
+/// Changed-only fatal gate for replication (mirrors `lifecycle_gate`): a
+/// duplicate rule name is fatal, but a config whose replication section is
+/// UNCHANGED from `old` is let through (so a pre-existing dup can't brick an
+/// unrelated edit — the operator fixes it on the next replication edit).
+pub fn replication_gate(
+    old: &ReplicationConfig,
+    new: &ReplicationConfig,
+) -> Result<(), Vec<String>> {
+    let dups = replication_duplicate_rule_names(new);
+    if dups.is_empty() || old == new {
+        Ok(())
+    } else {
+        Err(dups
+            .into_iter()
+            .map(|n| format!("replication rule name '{n}' is duplicated — rename one copy"))
+            .collect())
+    }
+}
+
 pub fn validate_replication(cfg: &ReplicationConfig) -> Vec<String> {
     let mut warnings = Vec::new();
 
@@ -2476,6 +2509,33 @@ mod tests {
         };
         let warnings = validate_replication(&cfg);
         assert!(warnings.iter().any(|w| w.contains("duplicated")));
+    }
+
+    #[test]
+    fn replication_gate_is_fatal_on_changed_dup_but_lets_unchanged_through() {
+        let clean = ReplicationConfig {
+            rules: vec![rule("r1", ("a", ""), ("b", ""), "1h")],
+            ..Default::default()
+        };
+        let dup = ReplicationConfig {
+            rules: vec![
+                rule("r1", ("a", ""), ("b", ""), "1h"),
+                rule("r1", ("c", ""), ("d", ""), "1h"),
+            ],
+            ..Default::default()
+        };
+        // Introducing a dup is FATAL.
+        assert!(replication_gate(&clean, &dup).is_err());
+        // A clean config is fine.
+        assert!(replication_gate(&clean, &clean).is_ok());
+        // A PRE-EXISTING dup that is UNCHANGED downgrades (can't block an
+        // unrelated edit) — old == new short-circuits to Ok.
+        assert!(replication_gate(&dup, &dup).is_ok());
+        // Each dup name reported once.
+        assert_eq!(
+            replication_duplicate_rule_names(&dup),
+            vec!["r1".to_string()]
+        );
     }
 
     #[test]

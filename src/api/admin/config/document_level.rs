@@ -286,8 +286,8 @@ pub async fn validate_config_doc(
         Ok((cfg, mut warnings)) => {
             // Same changed-only gate as apply, so validate can't pass a doc
             // apply would reject (or vice versa for unchanged-invalid rules).
-            let current_lifecycle = state.config.read().await.lifecycle.clone();
-            match crate::lifecycle::planner::lifecycle_gate(&current_lifecycle, &cfg.lifecycle) {
+            let current = state.config.read().await.clone();
+            match crate::lifecycle::planner::lifecycle_gate(&current.lifecycle, &cfg.lifecycle) {
                 Ok(lifecycle_warnings) => warnings.extend(lifecycle_warnings),
                 Err(errs) => {
                     return (
@@ -299,6 +299,18 @@ pub async fn validate_config_doc(
                         }),
                     );
                 }
+            }
+            if let Err(errs) =
+                crate::config_sections::replication_gate(&current.replication, &cfg.replication)
+            {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ConfigValidateResponse {
+                        ok: false,
+                        warnings: vec![],
+                        error: Some(errs.join("; ")),
+                    }),
+                );
             }
             (
                 StatusCode::OK,
@@ -464,6 +476,23 @@ pub(crate) async fn apply_config_inner(
                 );
             }
         };
+
+    // 2c. Same changed-only fatal gate for duplicate replication rule names (#13).
+    if let Err(errs) =
+        crate::config_sections::replication_gate(&cfg.replication, &incoming.replication)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            ConfigApplyResponse {
+                applied: false,
+                persisted: false,
+                requires_restart: false,
+                warnings: parse_warnings,
+                error: Some(errs.join("; ")),
+                persisted_path: None,
+            },
+        );
+    }
 
     // 3. Merge runtime secrets into the incoming doc. `preserve_runtime_secrets`
     //    emits its own warnings for credential transitions that would

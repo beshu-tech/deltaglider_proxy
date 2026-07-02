@@ -27,9 +27,6 @@ pub struct RunNowResponse {
     pub errors: i64,
 }
 
-/// Trigger an immediate synchronous run of a rule. Used by the admin
-/// UI + integration tests. Honours the paused flag: a paused rule
-/// returns 409 Conflict.
 /// Snapshot the replication config (lock released immediately) and find the
 /// named rule, or 404. Returns the whole `repl` too — callers need its flags.
 async fn snapshot_and_find_rule(
@@ -163,6 +160,7 @@ pub async fn run_now(
     // run appears in the jobs list as `running` with live progress via the
     // existing run-history polling — the client polls, it does not wait here.
     let engine = state.s3_state.engine.load().clone();
+    let maintenance_gate = state.s3_state.maintenance_gate.clone();
     let max_failures_retained = repl.max_failures_retained;
     let object_timeout = replication::scheduler::object_timeout(&repl);
     let object_skip_after_failures = repl.object_skip_after_failures;
@@ -188,6 +186,7 @@ pub async fn run_now(
                 heartbeat_secs,
             }),
             concurrency,
+            Some(maintenance_gate),
         )
         .await;
         {

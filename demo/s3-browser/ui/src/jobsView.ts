@@ -124,10 +124,15 @@ export function availableActions(row: JobRow): JobAction[] {
   if (row.kind === 'replication' || row.kind === 'lifecycle') {
     out.push(row.paused ? 'resume' : 'pause');
     if (row.kind === 'lifecycle') out.push('preview');
-    // run-now is a deliberate ONE-OFF: the backend runs the rule once even when
-    // it's disabled or paused (it does not flip those flags). Only a rule that's
-    // already running has nothing to trigger.
-    if (row.status !== 'running') out.push('run-now');
+    // run-now availability differs by kind (matches the backend contract):
+    //  - replication: a deliberate ONE-OFF that runs even a disabled/paused
+    //    rule once (without flipping the flag) — offer whenever not running.
+    //  - lifecycle: the backend 409s a disabled OR paused rule, so only offer
+    //    run-now for an enabled, non-paused, non-running lifecycle rule.
+    const runnable =
+      row.status !== 'running' &&
+      (row.kind === 'replication' || (row.enabled !== false && !row.paused));
+    if (runnable) out.push('run-now');
     // Kill the in-flight run at will (interrupts mid-object, unlike pause).
     // Replication only — the backend has no lifecycle-kill arm (would 400).
     if (row.kind === 'replication' && row.status === 'running') out.push('kill');

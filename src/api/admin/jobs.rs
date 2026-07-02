@@ -818,16 +818,23 @@ async fn delete_rule(
             None => None,
         };
 
-        // H2: refuse to delete a replication rule with a LIVE run — a running
-        // row, a cancelling row, OR an unexpired lease (acquired pre-spawn).
-        if let (JobSubsystem::Replication, Some(db)) = (sub, db_guard.as_ref()) {
+        // H2: refuse to delete a rule with a LIVE run. For replication: a
+        // running/cancelling row OR an unexpired run/verify lease. For
+        // lifecycle: an unexpired lifecycle lease (#10 — the guard was
+        // replication-only, so a lifecycle rule could be purged mid-run).
+        if let Some(db) = db_guard.as_ref() {
             let now = crate::replication::state_store::current_unix_seconds();
-            let run_status = db.replication_latest_run_status(name).ok().flatten();
-            // Live = a run (row or lease) OR an in-flight background verify —
-            // a verify scan re-inserts parity rows after a mid-scan purge (#30).
-            let lease_live = db.replication_lease_is_held(name, now).unwrap_or(false)
-                || db.parity_lease_is_held(name, now).unwrap_or(false);
-            if delete_blocked_by_live_run(run_status.as_deref(), lease_live) {
+            let blocked = match sub {
+                JobSubsystem::Replication => {
+                    let run_status = db.replication_latest_run_status(name).ok().flatten();
+                    let lease_live = db.replication_lease_is_held(name, now).unwrap_or(false)
+                        || db.parity_lease_is_held(name, now).unwrap_or(false);
+                    delete_blocked_by_live_run(run_status.as_deref(), lease_live)
+                }
+                JobSubsystem::Lifecycle => db.lifecycle_lease_is_held(name, now).unwrap_or(false),
+                JobSubsystem::Maintenance => false,
+            };
+            if blocked {
                 return Err((
                     StatusCode::CONFLICT,
                     format!(

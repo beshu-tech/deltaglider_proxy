@@ -126,6 +126,7 @@ pub async fn run_rule(
     triggered_by: &str,
     lease: Option<RunLease>,
     concurrency: RunConcurrency,
+    maintenance_gate: Option<Arc<crate::maintenance::gate::MaintenanceGate>>,
 ) -> Result<(i64, RunOutcome), crate::config_db::ConfigDbError> {
     let transfers = concurrency.transfers.clamp(1, 64) as usize;
     let upload_concurrency = concurrency.upload_concurrency.clamp(1, 16) as usize;
@@ -183,6 +184,8 @@ pub async fn run_rule(
         lease_alive: lease_alive.clone(),
         one_off: triggered_by == "run-now",
         max_failures_retained,
+        dest_bucket: rule.destination.bucket.clone(),
+        maintenance_gate,
     };
     let events_sink: EventSink = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
 
@@ -1028,6 +1031,11 @@ struct RunControl {
     lease_alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
     one_off: bool,
     max_failures_retained: u32,
+    /// Destination bucket + the write-gate: if a maintenance job starts
+    /// rewriting the dest MID-RUN, defer (stop, cursor preserved) instead of
+    /// writing into a bucket being migrated/re-encrypted (finding #12).
+    dest_bucket: String,
+    maintenance_gate: Option<Arc<crate::maintenance::gate::MaintenanceGate>>,
 }
 
 impl RunControl {
@@ -1058,7 +1066,23 @@ impl RunControl {
             }
             (cancel, paused)
         };
-        let verdict = control_verdict(cancel_requested, paused, self.one_off, lease_ok);
+        // Mid-run maintenance deferral: a dest bucket that became write-gated
+        // (migrate / re-encrypt) must stop the run like a pause — cursor kept,
+        // resumes when the maintenance job clears. Not suppressed by one_off:
+        // a one-off must NOT write into a bucket being rewritten either.
+        let maint_busy = self
+            .maintenance_gate
+            .as_ref()
+            .map(|g| g.is_busy(&self.dest_bucket))
+            .unwrap_or(false);
+        let verdict = if control_verdict(cancel_requested, false, self.one_off, lease_ok)
+            == ControlVerdict::Continue
+            && maint_busy
+        {
+            ControlVerdict::Paused
+        } else {
+            control_verdict(cancel_requested, paused, self.one_off, lease_ok)
+        };
         if verdict == ControlVerdict::LeaseLost && renew {
             log_failure(
                 &self.db,
