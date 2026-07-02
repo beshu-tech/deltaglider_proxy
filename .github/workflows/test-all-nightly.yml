@@ -74,3 +74,68 @@ jobs:
         if: always()
         run: docker rm -f minio-nightly 2>/dev/null || true
 
+  # ── Moved off the PR critical path (were `continue-on-error` on ci.yml,
+  #    i.e. non-gating). Coverage re-runs the whole --lib suite under
+  #    instrumentation; supply-chain drift is a daily concern, not per-commit.
+  #    Tools (cargo-llvm-cov, cargo-deny) are baked into the builder image. ──
+  coverage:
+    name: Unit Coverage (nightly)
+    runs-on: k3s
+    timeout-minutes: 20
+    continue-on-error: true
+    container:
+      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
+      options: --ulimit nofile=1048576:1048576
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Build demo UI (rust-embed)
+        run: cd demo/s3-browser/ui && npm ci && npm run build
+      - name: Run lib tests under llvm-cov
+        env:
+          RUST_BACKTRACE: "1"
+        run: cargo llvm-cov --locked --lib --no-report
+      - name: Emit summary table (top 20 worst-covered files)
+        run: |
+          cargo llvm-cov report --summary-only > /tmp/cov-summary.txt
+          echo "## Unit-test coverage summary" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat /tmp/cov-summary.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "### Worst-covered files (line %)" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cargo llvm-cov report \
+            | awk 'NR>2 && $1 !~ /^TOTAL/ && $1 !~ /^-/ {gsub(/%/, "", $10); printf "%6s  %s\n", $10, $1}' \
+            | sort -n | head -20 >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+      - name: Upload lcov artifact
+        if: always()
+        run: cargo llvm-cov report --lcov --output-path /tmp/lcov.info || true
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: lcov-coverage
+          path: /tmp/lcov.info
+          if-no-files-found: ignore
+
+  supply-chain:
+    name: Supply-chain (audit + deny)
+    runs-on: k3s
+    timeout-minutes: 10
+    continue-on-error: true
+    container:
+      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      RUSTC_WRAPPER: ""  # metadata-only checks, no compile
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: cargo audit
+        run: cargo audit
+      - name: cargo deny check
+        run: cargo deny check 2>&1 || true
+

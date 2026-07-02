@@ -28,6 +28,65 @@ env:
   AWS_SECRET_ACCESS_KEY: sccache-secret-key
 
 jobs:
+  # ── Build-once, consume-many ─────────────────────────────────────────
+  # The demo UI dist/ (rust-embed input) and the release binary were each
+  # rebuilt in ~8 and ~3 downstream jobs respectively. Build each ONCE here
+  # and pass as an artifact; consumers `needs:` + download instead of
+  # re-running `npm ci` / `cargo build --release`.
+  build-ui:
+    name: Build UI (dist artifact)
+    runs-on: k3s
+    timeout-minutes: 10
+    container:
+      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Scrub stale workspace (drop .claude leftovers from prior runs)
+        shell: bash
+        run: rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Build demo UI
+        run: cd demo/s3-browser/ui && npm ci && npm run build
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ui-dist
+          path: demo/s3-browser/ui/dist
+          if-no-files-found: error
+          retention-days: 1
+
+  build-bin:
+    name: Build release binary (artifact)
+    runs-on: k3s
+    timeout-minutes: 20
+    needs: build-ui
+    container:
+      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
+      options: --ulimit nofile=1048576:1048576
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Scrub stale workspace (drop .claude leftovers from prior runs)
+        shell: bash
+        run: rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/download-artifact@448e3f862ab3ef47aa50ff917776823c9946035b # v6.0.0
+        with:
+          name: ui-dist
+          path: demo/s3-browser/ui/dist
+      - name: cargo build --release (sccache warm — same cache as the test jobs)
+        env:
+          RUST_BACKTRACE: "1"
+        run: cargo build --locked --release --bin deltaglider_proxy
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dgp-bin
+          path: target/release/deltaglider_proxy
+          if-no-files-found: error
+          retention-days: 1
+
   verify-integration-test-registry:
     name: Integration test registry
     runs-on: ubuntu-latest
@@ -115,6 +174,7 @@ jobs:
   clippy:
     name: Clippy
     runs-on: k3s
+    needs: build-ui
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       # Raise the open-file limit. These jobs run on the self-hosted
@@ -137,8 +197,10 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: sccache stats (pre)
         run: sccache --show-stats
-      - name: Build demo UI (required by rust-embed)
-        run: cd demo/s3-browser/ui && npm ci && npm run build
+      - uses: actions/download-artifact@448e3f862ab3ef47aa50ff917776823c9946035b # v6.0.0
+        with:
+          name: ui-dist
+          path: demo/s3-browser/ui/dist
       - name: cargo clippy (with sccache bypass + diagnostic capture)
         shell: bash
         env:
@@ -187,6 +249,7 @@ jobs:
   test-unit:
     name: Unit Tests
     runs-on: k3s
+    needs: build-ui
     timeout-minutes: 15
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
@@ -208,89 +271,14 @@ jobs:
         run: |
           rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Build demo UI (required by rust-embed)
-        run: cd demo/s3-browser/ui && npm ci && npm run build
+      - uses: actions/download-artifact@448e3f862ab3ef47aa50ff917776823c9946035b # v6.0.0
+        with:
+          name: ui-dist
+          path: demo/s3-browser/ui/dist
       - name: cargo test --lib
         env:
           RUST_BACKTRACE: "1"
         run: cargo test --lib --locked
-
-  coverage:
-    name: Unit Coverage (non-blocking)
-    runs-on: k3s
-    timeout-minutes: 20
-    # Signal, not a gate. A flaky coverage tool must not block merges.
-    # When a regression is real, the PR author sees the summary in
-    # the job log; when it's noise (a new file without tests added
-    # alongside, a cfg-gated branch, etc.) we want to avoid burning
-    # review time on it.
-    continue-on-error: true
-    container:
-      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
-      # Raise the open-file limit. These jobs run on the self-hosted
-      # `k3s`-labelled Ryzen LXC runners, where the container inherits a low
-      # default nofile (~1024). The integration suite spawns ~35 test
-      # binaries in parallel, each with its own proxy + MinIO sockets, so the
-      # aggregate fd count blows past 1024 and surfaces as
-      # `ConnectError("tcp open error", Os code 24 "Too many open files")`.
-      # The LXC host also bumps nofile (lxc.prlimit.nofile) — this is the
-      # belt-and-suspenders so the workflow is self-documenting and portable.
-      options: --ulimit nofile=1048576:1048576
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - name: Scrub stale workspace (drop .claude leftovers from prior runs)
-        shell: bash
-        run: |
-          rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Install cargo-llvm-cov
-        # binstall is fast (~5s) and the builder image may not ship it.
-        # `--locked` pins to the lockfile-compatible version; no version
-        # drift between runs.
-        run: |
-          if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
-            cargo install --locked cargo-llvm-cov
-          fi
-      - name: Build demo UI (required by rust-embed)
-        run: cd demo/s3-browser/ui && npm ci && npm run build
-      - name: Run lib tests under llvm-cov
-        env:
-          RUST_BACKTRACE: "1"
-        run: |
-          cargo llvm-cov --locked --lib --no-report
-      - name: Emit summary table (top 20 worst-covered files)
-        run: |
-          cargo llvm-cov report --summary-only > /tmp/cov-summary.txt
-          echo "## Unit-test coverage summary" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          cat /tmp/cov-summary.txt >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Worst-covered files (line %)" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          # Column 10 is line-coverage %, column 1 is filename. Strip
-          # the trailing % so `sort -n` orders numerically. Drop the
-          # TOTAL and separator rows.
-          cargo llvm-cov report \
-            | awk 'NR>2 && $1 !~ /^TOTAL/ && $1 !~ /^-/ {gsub(/%/, "", $10); printf "%6s  %s\n", $10, $1}' \
-            | sort -n \
-            | head -20 \
-            >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-      - name: Upload lcov artifact
-        # LCOV file lets consumers (Codecov, Coveralls, local tooling)
-        # drill into individual file / line coverage. Optional — future
-        # PR-comment bots plug into this without touching the job.
-        if: always()
-        run: cargo llvm-cov report --lcov --output-path /tmp/lcov.info || true
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: lcov-coverage
-          path: /tmp/lcov.info
-          if-no-files-found: ignore
 
   test-integration:
     name: Integration Tests
@@ -303,6 +291,7 @@ jobs:
       github.event_name != 'push' ||
       contains(github.event.head_commit.message, '[ci-integration]')
     runs-on: k3s
+    needs: build-ui
     timeout-minutes: 50
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
@@ -340,8 +329,10 @@ jobs:
         run: |
           rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Build demo UI (required by rust-embed)
-        run: cd demo/s3-browser/ui && npm ci && npm run build
+      - uses: actions/download-artifact@448e3f862ab3ef47aa50ff917776823c9946035b # v6.0.0
+        with:
+          name: ui-dist
+          path: demo/s3-browser/ui/dist
       - name: Clean up stale config DB files
         run: |
           rm -f deltaglider_config.db deltaglider_config.db.bak .deltaglider_bootstrap_hash
@@ -460,6 +451,7 @@ jobs:
   test-delta:
     name: Delta & Optimization Tests
     runs-on: k3s
+    needs: build-ui
     timeout-minutes: 15
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
@@ -481,8 +473,10 @@ jobs:
         run: |
           rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Build demo UI (required by rust-embed)
-        run: cd demo/s3-browser/ui && npm ci && npm run build
+      - uses: actions/download-artifact@448e3f862ab3ef47aa50ff917776823c9946035b # v6.0.0
+        with:
+          name: ui-dist
+          path: demo/s3-browser/ui/dist
       - name: Delta, optimization, and memory tests
         env:
           RUST_BACKTRACE: "1"
@@ -496,6 +490,7 @@ jobs:
   e2e-smoke:
     name: E2E smoke (embedded UI)
     runs-on: k3s
+    needs: build-bin
     timeout-minutes: 35
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
@@ -517,12 +512,14 @@ jobs:
         run: |
           rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Build demo UI + release binary
-        env:
-          RUSTC_WRAPPER: ""
+      - uses: actions/download-artifact@448e3f862ab3ef47aa50ff917776823c9946035b # v6.0.0
+        with:
+          name: dgp-bin
+          path: target/release
+      - name: Restore binary perms + install Playwright deps
         run: |
-          cd demo/s3-browser/ui && npm ci && npm run build
-          cd ../.. && cargo build --locked --release --bin deltaglider_proxy
+          chmod +x target/release/deltaglider_proxy
+          cd demo/s3-browser/ui && npm ci
       - name: Install Playwright Chromium
         run: |
           cd demo/s3-browser/ui
@@ -531,68 +528,6 @@ jobs:
         env:
           DELTAGLIDER_PROXY_BIN: ${{ github.workspace }}/target/release/deltaglider_proxy
         run: ./scripts/e2e-smoke.sh
-
-  audit:
-    name: RustSec Audit
-    runs-on: k3s
-    container:
-      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
-      # Raise the open-file limit. These jobs run on the self-hosted
-      # `k3s`-labelled Ryzen LXC runners, where the container inherits a low
-      # default nofile (~1024). The integration suite spawns ~35 test
-      # binaries in parallel, each with its own proxy + MinIO sockets, so the
-      # aggregate fd count blows past 1024 and surfaces as
-      # `ConnectError("tcp open error", Os code 24 "Too many open files")`.
-      # The LXC host also bumps nofile (lxc.prlimit.nofile) — this is the
-      # belt-and-suspenders so the workflow is self-documenting and portable.
-      options: --ulimit nofile=1048576:1048576
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    continue-on-error: true
-    steps:
-      - name: Scrub stale workspace (drop .claude leftovers from prior runs)
-        shell: bash
-        run: |
-          rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: cargo audit
-        env:
-          RUSTC_WRAPPER: ""  # audit doesn't compile
-        run: cargo audit
-
-  deny:
-    name: Cargo Deny
-    runs-on: k3s
-    container:
-      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
-      # Raise the open-file limit. These jobs run on the self-hosted
-      # `k3s`-labelled Ryzen LXC runners, where the container inherits a low
-      # default nofile (~1024). The integration suite spawns ~35 test
-      # binaries in parallel, each with its own proxy + MinIO sockets, so the
-      # aggregate fd count blows past 1024 and surfaces as
-      # `ConnectError("tcp open error", Os code 24 "Too many open files")`.
-      # The LXC host also bumps nofile (lxc.prlimit.nofile) — this is the
-      # belt-and-suspenders so the workflow is self-documenting and portable.
-      options: --ulimit nofile=1048576:1048576
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    continue-on-error: true  # warn-only until config stabilises
-    steps:
-      - name: Scrub stale workspace (drop .claude leftovers from prior runs)
-        shell: bash
-        run: |
-          rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Install cargo-deny
-        env:
-          RUSTC_WRAPPER: ""
-        run: cargo install --locked cargo-deny 2>/dev/null || echo "cargo-deny install failed (non-blocking)"
-      - name: cargo deny check
-        env:
-          RUSTC_WRAPPER: ""
-        run: cargo deny check 2>&1 || true
 
   frontend-lint:
     name: Frontend Lint
@@ -680,14 +615,12 @@ jobs:
   docs:
     name: Docs bundling + link check + YAML examples
     runs-on: k3s
-    # 25 min ceiling: this job does the UI bundle + a from-scratch release
-    # `cargo build --bin deltaglider_proxy` for the config-lint (≈13 min cold on
-    # a loaded k3s runner, even with sccache) plus the (now hard-capped, warn-
-    # only) lychee link check. The earlier 10/15-min limits kept killing
-    # otherwise-green runs and blocking the release. Generous headroom here +
-    # the per-step `timeout` on lychee guarantees the job completes instead of
-    # being cancelled.
-    timeout-minutes: 25
+    needs: build-bin
+    # The from-scratch release build (the old dominant cost) is gone — the
+    # config-lint now consumes the shared build-bin artifact. Only the docs
+    # registry/changelog guards + the hard-capped, warn-only lychee link
+    # check remain, so the ceiling can be modest.
+    timeout-minutes: 15
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       # Raise the open-file limit. These jobs run on the self-hosted
@@ -720,13 +653,14 @@ jobs:
         run: ./scripts/gen-changelog-doc.sh --check
       # ── Blocking: every `# validate`-tagged fenced YAML block in
       #    docs/product/**/*.md parses + validates under the real
-      #    schema. Prevents example drift. Needs a built binary. ──
-      - name: Build deltaglider_proxy (for config lint)
-        # Use the workflow-default sccache wrapper (do NOT empty RUSTC_WRAPPER):
-        # this cold release build was the dominant cost making the job blow past
-        # its timeout. With sccache warm (same cache the clippy/unit jobs use)
-        # the build drops from ~10min to a few, well inside the limit.
-        run: cd demo/s3-browser/ui && npm ci && npm run build && cd ../../.. && cargo build --locked --release --bin deltaglider_proxy
+      #    schema. Prevents example drift. Uses the shared binary artifact
+      #    from build-bin instead of a from-scratch release compile. ──
+      - uses: actions/download-artifact@448e3f862ab3ef47aa50ff917776823c9946035b # v6.0.0
+        with:
+          name: dgp-bin
+          path: target/release
+      - name: Restore binary perms
+        run: chmod +x target/release/deltaglider_proxy
       - name: Validate docs YAML examples
         env:
           DELTAGLIDER_PROXY_BIN: ./target/release/deltaglider_proxy
@@ -752,10 +686,14 @@ jobs:
           RUSTC_WRAPPER: ""
         run: |
           set +e
-          timeout 210 cargo install --locked --quiet lychee || {
-            echo "::warning::cargo install lychee failed/timed out; skipping link check"
-            exit 0
-          }
+          # lychee is baked into the builder image; fall back to a from-source
+          # install only if this container predates that (transitional).
+          if ! command -v lychee >/dev/null 2>&1; then
+            timeout 210 cargo install --locked --quiet lychee || {
+              echo "::warning::lychee not baked and install failed/timed out; skipping link check"
+              exit 0
+            }
+          fi
           timeout 60 lychee --no-progress --accept 200,204,301,302,429 \
             --timeout 20 --max-retries 2 --exclude-mail \
             'docs/product/**/*.md' || {
@@ -766,6 +704,7 @@ jobs:
   config-schema:
     name: Config JSON Schema
     runs-on: k3s
+    needs: build-bin
     timeout-minutes: 10
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
@@ -787,19 +726,23 @@ jobs:
         run: |
           rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Build demo UI (required by rust-embed)
-        run: cd demo/s3-browser/ui && npm ci && npm run build
+      - uses: actions/download-artifact@448e3f862ab3ef47aa50ff917776823c9946035b # v6.0.0
+        with:
+          name: dgp-bin
+          path: target/release
+      - name: Restore binary perms
+        run: chmod +x target/release/deltaglider_proxy
       - name: Generate canonical JSON Schema
         run: |
           mkdir -p schema
-          cargo run --locked --quiet -- config schema --out schema/deltaglider.schema.json
+          ./target/release/deltaglider_proxy config schema --out schema/deltaglider.schema.json
           echo "--- schema head ---"
           head -40 schema/deltaglider.schema.json
       - name: Lint the canonical example config
         run: |
           # YAML is the only config format (TOML removed in v1.4.1).
           # The shipped example must always pass offline validation.
-          cargo run --locked --quiet -- config lint deltaglider_proxy.example.yaml
+          ./target/release/deltaglider_proxy config lint deltaglider_proxy.example.yaml
       - name: Upload schema artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

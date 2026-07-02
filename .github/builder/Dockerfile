@@ -47,8 +47,15 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
   && rm -rf "$RUSTUP_HOME"/toolchains/*/share/man
 
 # ── Cargo tools (baked in, zero runtime install) ───────────────────
+# cargo-llvm-cov (coverage), cargo-deny (supply-chain), and lychee (docs
+# link check) were previously `cargo install`ed from source on every CI run.
+# Bake them so the nightly coverage/supply-chain jobs and the docs job pay
+# zero install cost.
 RUN cargo install cargo-audit --locked \
   && cargo install cargo-sbom --locked \
+  && cargo install cargo-llvm-cov --locked \
+  && cargo install cargo-deny --locked \
+  && cargo install lychee --locked \
   && cargo install sccache --locked \
   && rm -rf "$CARGO_HOME"/registry "$CARGO_HOME"/git
 
@@ -66,6 +73,9 @@ RUN echo "--- Builder image verification ---" \
   && cargo clippy --version \
   && cargo audit --version \
   && cargo sbom --help | head -1 \
+  && cargo llvm-cov --version \
+  && cargo deny --version \
+  && lychee --version \
   && sccache --version \
   && xdelta3 -V \
   && (xdelta3 -V 2>&1 | grep -q "3.0.11" || (echo "FATAL: xdelta3 not pinned to 3.0.11" && exit 1)) \
