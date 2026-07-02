@@ -479,23 +479,29 @@ async fn run_or_preview_retain_newest(
         std::collections::HashMap::new();
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut pager = Pager::fresh();
+    // retain-newest is SET-RELATIVE and has NO resume cursor: ranking over a
+    // partial collect would delete objects that are globally in the newest N.
+    // ANY early break out of the collect loop (maintenance defer, lease loss)
+    // must therefore ABORT before rank/act — never delete over a partial set.
+    let mut incomplete_collect: Option<&'static str> = None;
 
     'pages: while let Some(page_idx) = pager.begin_page() {
-        // Mid-run maintenance defer: if a write bucket (source or transition
-        // dest) becomes gated mid-run, stop — cursor preserved, resumes when the
-        // maintenance job clears. Mirrors the replication RunControl fix (#12);
-        // preview never writes, so it's execute-only.
+        // Mid-run maintenance defer: a write bucket (source or transition dest)
+        // became gated mid-run. Abort — the next scheduled run re-collects the
+        // WHOLE set once maintenance clears. execute-only (preview never writes).
         if execute && maintenance_write_bucket_busy(rule, maintenance_gate.as_ref()) {
             info!(
                 "lifecycle rule '{}' deferring mid-run — a write bucket is under maintenance",
                 rule.name
             );
+            incomplete_collect = Some("a write bucket is under maintenance");
             break 'pages;
         }
         if execute
             && !renew_run_lease(&db, rule, ctx.as_ref(), &mut out.failures, response_cap).await?
         {
             out.errors += 1;
+            incomplete_collect = Some("replication lease lost");
             break 'pages;
         }
         let page = engine
@@ -550,12 +556,35 @@ async fn run_or_preview_retain_newest(
         }
     }
 
+    // An early break (maintenance defer / lease loss) left the candidate set
+    // PARTIAL — abort before rank/act. retain-newest can't resume a partial set
+    // (set-relative, no cursor), so it just doesn't run this tick; the next full
+    // collect handles it. A maintenance defer is NOT an error (status stays
+    // succeeded, no work done); a lease loss already stamped errors above.
+    if !retain_newest_may_delete(
+        incomplete_collect.is_some(),
+        pager.truncated_by_page_budget(),
+    ) {
+        // Partial collect — abort before rank/act (never delete over a partial
+        // set). An early break (defer/lease) is handled here; a budget overrun
+        // falls into the loud failure below.
+        if let Some(reason) = incomplete_collect {
+            info!(
+                "lifecycle rule '{}' retain-newest deferred before ranking ({}) — no objects \
+                 deleted this run (a full re-collect will run next tick)",
+                rule.name, reason
+            );
+            if out.errors > 0 {
+                out.status = "failed".to_string();
+            }
+            return Ok(out);
+        }
+    }
+
     // Page-budget truncation is the SAME data-loss hazard as the candidate cap:
     // ranking "keep newest N" over a listing that stopped at MAX_JOB_PAGES could
     // delete an object that is actually in the newest N. Refuse rather than
-    // delete over a partial set (retain-newest is set-relative — see #4). A
-    // mid-run maintenance/lease break above set `execute`-stop, not truncation,
-    // so this only fires on a genuine budget overrun.
+    // delete over a partial set (retain-newest is set-relative — see #4).
     if pager.truncated_by_page_budget() {
         let msg = format!(
             "retain-newest listing hit the page budget ({} pages) for prefix {:?}; refusing to \
@@ -802,6 +831,16 @@ fn spawn_lease_heartbeat(
 /// True when any bucket this rule WRITES to (source-for-deletes + transition
 /// destination) is under a maintenance write-gate. Used to defer a lifecycle
 /// run mid-sweep so it never writes into a bucket being migrated/re-encrypted.
+/// PURE: may a retain-newest run proceed to rank + DELETE? Only when the
+/// candidate collect saw the WHOLE prefix — a partial collect (early break
+/// from a maintenance defer / lease loss, or a page-budget overrun) would rank
+/// "keep newest N" over an incomplete set and delete objects that are globally
+/// in the newest N. retain-newest is set-relative with no resume cursor, so a
+/// partial set is NEVER safe to act on.
+fn retain_newest_may_delete(collect_incomplete: bool, budget_truncated: bool) -> bool {
+    !collect_incomplete && !budget_truncated
+}
+
 fn maintenance_write_bucket_busy(
     rule: &LifecycleRule,
     gate: Option<&Arc<crate::maintenance::gate::MaintenanceGate>>,
@@ -969,5 +1008,30 @@ async fn append_lifecycle_transition_event(
 fn push_failure(failures: &mut Vec<LifecycleFailure>, cap: usize, key: String, error: String) {
     if failures.len() < cap {
         failures.push(LifecycleFailure { key, error });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retain_newest_may_delete;
+
+    /// retain-newest may rank+delete ONLY over a complete, non-truncated
+    /// collect — a partial set (early defer/lease break OR budget overrun)
+    /// must never be acted on (set-relative, no resume cursor → data loss).
+    #[test]
+    fn retain_newest_delete_gate() {
+        assert!(
+            retain_newest_may_delete(false, false),
+            "complete collect → may delete"
+        );
+        assert!(
+            !retain_newest_may_delete(true, false),
+            "incomplete collect → abort"
+        );
+        assert!(
+            !retain_newest_may_delete(false, true),
+            "budget-truncated → abort"
+        );
+        assert!(!retain_newest_may_delete(true, true), "both → abort");
     }
 }
