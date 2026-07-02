@@ -10,6 +10,30 @@ follow [semantic versioning](https://semver.org/); the Docker image
 
 _Last updated: 2026-07-02_
 
+## v1.9.5 — 2026-07-02
+
+Jobs-screen usability fixes.
+
+### Fixed
+
+- **Replication and lifecycle glob fields accept multiple lines again.** The
+  Include/Exclude glob editors silently ate the Enter key — a controlled
+  round-trip stripped the trailing blank line on every keystroke, so you could
+  never start a second line. They now hold the raw text while you edit and only
+  normalise on blur.
+- **The Jobs table is cleaner and responsive.** Removed the segmented per-cell
+  underlines (one row separator now), stopped the Scope and rule-name columns
+  from wrapping (single-line with a full-text tooltip), and made the row actions
+  icon-only so a job row no longer overflows; it collapses to readable cards on
+  narrow screens.
+- **The Verify "Differences" panel no longer repeats itself.** The WHY column
+  showed the same cause twice (a wrapping amber block plus a duplicate grey
+  line); it's now one compact verdict chip and a single cause line. The FIX
+  column's guidance no longer looks like a clickable button.
+- **The "New job" menu closes when you pick a type**, and opening a draft rule
+  that was already discarded or renamed closes cleanly instead of flashing
+  "this job no longer exists".
+
 ## v1.9.4 — 2026-07-02
 
 Admin-UI simplification, a leaner CI pipeline, and wider property-test coverage.
