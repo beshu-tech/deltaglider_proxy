@@ -11,7 +11,7 @@ import { useGroupMappingRules, useCreateMappingRule, useUpdateMappingRule, useDe
 import { useExternalIdentities } from '../queries/externalIdentities';
 import { useGroups } from '../queries/groups';
 import { useColors } from '../ThemeContext';
-import { useFormLabelStyle } from './shared-styles';
+import { useFormLabelStyle, contentColumn, CONTENT_FORM } from './shared-styles';
 import SectionHeader from './SectionHeader';
 import IamSourceBanner from './IamSourceBanner';
 import MappingRuleRow from './MappingRuleRow';
@@ -162,7 +162,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
   if (error) return <Alert type="error" message={error} style={{ margin: 16 }} />;
 
   return (
-    <div style={{ padding: 'clamp(16px, 3vw, 24px)', maxWidth: 960, margin: '0 auto' }}>
+    <div style={contentColumn(CONTENT_FORM)}>
       {/* IAM source-of-truth banner — OAuth providers + mapping rules
           live in the encrypted IAM DB, not YAML, in GUI mode. */}
       <IamSourceBanner iamMode={iamMode} resource="OAuth providers + mapping rules" />

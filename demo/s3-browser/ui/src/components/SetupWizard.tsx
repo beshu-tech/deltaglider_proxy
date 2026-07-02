@@ -58,7 +58,7 @@ import {
 } from '../adminApi';
 import { useColors } from '../ThemeContext';
 import { useCopyToClipboard } from '../useCopyToClipboard';
-import { useCardStyles } from './shared-styles';
+import { useCardStyles, contentColumn, CONTENT_FORM } from './shared-styles';
 import FormField from './FormField';
 
 const { Text, Paragraph } = Typography;
@@ -256,8 +256,7 @@ export default function SetupWizard({ onComplete, onCancel }: Props) {
   return (
     <div
       style={{
-        maxWidth: 820,
-        margin: '0 auto',
+        ...contentColumn(CONTENT_FORM),
         padding: 'clamp(16px, 4vw, 32px)',
         display: 'flex',
         flexDirection: 'column',

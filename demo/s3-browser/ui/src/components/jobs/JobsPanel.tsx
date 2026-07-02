@@ -44,7 +44,7 @@ import RecordList, { type RecordColumn } from './RecordList';
 import OutcomeMeter from './OutcomeMeter';
 import { useSectionEditor } from '../../useSectionEditor';
 import { useApplyHandler } from '../../useDirtySection';
-import { useCardStyles } from '../shared-styles';
+import { useCardStyles, contentColumn, CONTENT_WIDE } from '../shared-styles';
 import ApplyDialog from '../ApplyDialog';
 import StickyDirtyBar from '../StickyDirtyBar';
 import ReencryptProposalModal from '../ReencryptProposalModal';
@@ -405,7 +405,7 @@ export default function JobsPanel({ onSessionExpired }: Props) {
   }
 
   return (
-    <div style={{ maxWidth: 1100, margin: '0 auto', padding: 'clamp(16px, 3vw, 24px)' }}>
+    <div style={contentColumn(CONTENT_WIDE)}>
       {msgCtx}
       <ReencryptProposalModal
         open={reencryptOpen}

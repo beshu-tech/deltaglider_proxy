@@ -45,7 +45,7 @@ import {
 } from '@ant-design/icons';
 import type { IamMode } from '../adminApi';
 import { useColors } from '../ThemeContext';
-import { useCardStyles } from './shared-styles';
+import { useCardStyles, contentColumn, CONTENT_FORM } from './shared-styles';
 import { useSectionEditor } from '../useSectionEditor';
 import SectionHeader from './SectionHeader';
 import FormField from './FormField';
@@ -183,9 +183,7 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
   return (
     <div
       style={{
-        maxWidth: 740,
-        margin: '0 auto',
-        padding: 'clamp(16px, 3vw, 24px)',
+        ...contentColumn(CONTENT_FORM),
         display: 'flex',
         flexDirection: 'column',
         gap: 16,

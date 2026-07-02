@@ -34,7 +34,7 @@ import {
 import type { SectionApplyResponse } from '../adminApi';
 import { useAdminConfig } from '../queries/config';
 import { useColors } from '../ThemeContext';
-import { useCardStyles } from './shared-styles';
+import { useCardStyles, contentColumn, CONTENT_FORM } from './shared-styles';
 import { useSectionEditor } from '../useSectionEditor';
 import type { UseSectionEditorResult } from '../useSectionEditor';
 import { undefinedToNullSubset } from './advancedPayload';
@@ -216,9 +216,7 @@ function PanelShell(props: { children: React.ReactNode }) {
   return (
     <div
       style={{
-        maxWidth: 740,
-        margin: '0 auto',
-        padding: 'clamp(16px, 3vw, 24px)',
+        ...contentColumn(CONTENT_FORM),
         display: 'flex',
         flexDirection: 'column',
         gap: 16,
@@ -474,7 +472,7 @@ export function CachesPanel({ onSessionExpired }: PanelProps) {
 
 export function LimitsPanel({ onSessionExpired }: PanelProps) {
   const { cardStyle, inputRadius } = useCardStyles();
-  const { ACCENT_AMBER, TEXT_SECONDARY, BG_ELEVATED, BORDER, TEXT_MUTED } = useColors();
+  const { TEXT_MUTED } = useColors();
   // Read-only env-var view of the running config (cached react-query read).
   const { data: config, error: queryError, isError } = useAdminConfig();
 
@@ -489,64 +487,26 @@ export function LimitsPanel({ onSessionExpired }: PanelProps) {
   }
   if (!config) return <PanelShell><LoadingState /></PanelShell>;
 
+  // label + read-only value + one help line; the env var name rides in the help
+  // as a mono chip. The card header states restart-required once for all fields.
   const readOnlyField = (
     label: string,
     value: string | number,
     helpText: string,
-    envName: string,
-    envValue: string
+    envName: string
   ) => (
     <div style={{ marginTop: 16 }}>
       <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: TEXT_MUTED, marginBottom: 4 }}>
         {label}
-        <span
-          title="Env-var only; no YAML field. Requires a process restart to change."
-          style={{
-            fontSize: 9,
-            fontWeight: 700,
-            letterSpacing: 0.5,
-            padding: '1px 6px',
-            borderRadius: 10,
-            background: `${ACCENT_AMBER}20`,
-            color: ACCENT_AMBER,
-            marginLeft: 8,
-          }}
-        >
-          Restart required
-        </span>
       </div>
       <Input
         value={String(value)}
         readOnly
-        style={{
-          ...inputRadius,
-          fontFamily: 'var(--font-mono)',
-          fontSize: 13,
-          opacity: 0.7,
-        }}
+        style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13, opacity: 0.7 }}
       />
       <Text type="secondary" style={{ fontSize: 12, fontFamily: 'var(--font-ui)', display: 'block', marginTop: 4 }}>
-        {helpText}
+        {helpText} Set with <Text code style={{ fontSize: 11 }}>{envName}</Text>.
       </Text>
-      <div
-        style={{
-          marginTop: 4,
-          padding: '6px 10px',
-          background: BG_ELEVATED,
-          border: `1px solid ${BORDER}`,
-          borderRadius: 6,
-          fontSize: 11,
-          fontFamily: 'var(--font-mono)',
-          lineHeight: 1.6,
-          color: TEXT_MUTED,
-        }}
-      >
-        <span style={{ color: TEXT_SECONDARY }}>ENV:</span>&nbsp;{envName}={envValue}
-        <br />
-        <span style={{ fontStyle: 'italic', fontSize: 10 }}>
-          environment-variable only — no YAML/config-file field.
-        </span>
-      </div>
     </div>
   );
 
@@ -556,28 +516,25 @@ export function LimitsPanel({ onSessionExpired }: PanelProps) {
         <SectionHeader
           icon={<CloudOutlined />}
           title="Request limits"
-          description="Protect the server from overload and abuse. These are environment-variable driven — changing any of them requires a process restart."
+          description="Protect the server from overload and abuse. Set via environment variables; changing any requires a restart."
         />
         {readOnlyField(
           'Request timeout (seconds)',
           config.request_timeout_secs,
           'Maximum time for any single request. Returns HTTP 504 Gateway Timeout when exceeded.',
-          'DGP_REQUEST_TIMEOUT_SECS',
-          String(config.request_timeout_secs)
+          'DGP_REQUEST_TIMEOUT_SECS'
         )}
         {readOnlyField(
           'Max concurrent requests',
           config.max_concurrent_requests,
           'Maximum in-flight HTTP requests. Additional requests queue until a slot opens.',
-          'DGP_MAX_CONCURRENT_REQUESTS',
-          String(config.max_concurrent_requests)
+          'DGP_MAX_CONCURRENT_REQUESTS'
         )}
         {readOnlyField(
           'Max multipart uploads',
           config.max_multipart_uploads,
           'Maximum concurrent multipart uploads. Each holds part data in memory.',
-          'DGP_MAX_MULTIPART_UPLOADS',
-          String(config.max_multipart_uploads)
+          'DGP_MAX_MULTIPART_UPLOADS'
         )}
       </div>
     </PanelShell>

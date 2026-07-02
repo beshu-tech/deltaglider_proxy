@@ -10,6 +10,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { Typography, Button, Tag, Table, Space, message, Input } from 'antd';
 import { ReloadOutlined, LogoutOutlined } from '@ant-design/icons';
 import { listSessions, revokeSession, revokeUserSessions, type SessionSummary } from '../adminApi';
+import { contentColumn, CONTENT_WIDE } from './shared-styles';
 
 const { Text } = Typography;
 
@@ -103,7 +104,7 @@ export default function SessionsPanel({ onSessionExpired }: { onSessionExpired?:
   ];
 
   return (
-    <div style={{ maxWidth: 1100, margin: '0 auto', padding: 'clamp(12px, 2vw, 18px)', display: 'flex', flexDirection: 'column', gap: 14 }}>
+    <div style={{ ...contentColumn(CONTENT_WIDE), padding: 'clamp(12px, 2vw, 18px)', display: 'flex', flexDirection: 'column', gap: 14 }}>
       <Space>
         <Button icon={<ReloadOutlined />} onClick={() => void refresh()} loading={loading}>Refresh</Button>
         <Text type="secondary">{rows.length} live session{rows.length === 1 ? '' : 's'}</Text>

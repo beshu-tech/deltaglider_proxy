@@ -34,6 +34,7 @@ import type { AdmissionBlock } from '../adminApi';
 import { useAdminConfig } from '../queries/config';
 import { useColors } from '../ThemeContext';
 import { useSectionEditor } from '../useSectionEditor';
+import { contentColumn, CONTENT_FORM } from './shared-styles';
 import AdmissionBlockList from './AdmissionBlockList';
 import AdmissionBlockEditorModal from './AdmissionBlockEditorModal';
 import SynthesizedBlocksPreview from './SynthesizedBlocksPreview';
@@ -166,19 +167,7 @@ export default function AdmissionPanel({
   return (
     <div
       style={{
-        // Match the responsive-pad wrapper used by every other
-        // Configuration page (CredentialsModePanel, advanced sub-
-        // panels, etc.). Without this wrapper the admission list
-        // renders flush against the sidebar's right edge and feels
-        // visually disconnected from the section header above.
-        // `maxWidth: 960` (wider than the 740 used by form panels)
-        // so the admission block rows — which have drag handle +
-        // block name + match summary + action badge + chevron —
-        // have breathing room without forcing horizontal scroll on
-        // long block names.
-        maxWidth: 960,
-        margin: '0 auto',
-        padding: 'clamp(16px, 3vw, 24px)',
+        ...contentColumn(CONTENT_FORM),
         display: 'flex',
         flexDirection: 'column',
         gap: 16,

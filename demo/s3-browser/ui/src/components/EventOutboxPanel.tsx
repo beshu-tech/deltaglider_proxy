@@ -19,6 +19,7 @@ import {
   type EventOutboxRecord,
   type EventOutboxStatus,
 } from '../adminApi';
+import { contentColumn, CONTENT_WIDE } from './shared-styles';
 
 const { Text } = Typography;
 const DEFAULT_PAGE_SIZE = 50;
@@ -328,7 +329,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
   };
 
   return (
-    <div style={{ maxWidth: 1180, margin: '0 auto', padding: 'clamp(12px, 2vw, 18px)', display: 'flex', flexDirection: 'column', gap: 10 }}>
+    <div style={{ ...contentColumn(CONTENT_WIDE), padding: 'clamp(12px, 2vw, 18px)', display: 'flex', flexDirection: 'column', gap: 10 }}>
       <div
         style={{
           display: 'flex',

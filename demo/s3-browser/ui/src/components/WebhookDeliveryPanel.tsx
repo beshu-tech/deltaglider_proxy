@@ -35,7 +35,7 @@ import {
 import { ApiOutlined, DeleteOutlined, SendOutlined } from '@ant-design/icons';
 import type { SectionApplyResponse } from '../adminApi';
 import { fetchEventOutbox } from '../adminApi';
-import { useCardStyles } from './shared-styles';
+import { useCardStyles, contentColumn, CONTENT_WIDE } from './shared-styles';
 import { useColors } from '../ThemeContext';
 import { useIsNarrow } from '../useIsNarrow';
 import { useSectionEditor } from '../useSectionEditor';
@@ -96,11 +96,8 @@ function PanelShell({ children }: { children: React.ReactNode }) {
     <div
       style={{
         // Wide canvas: the Slack destination zone lays out as two columns
-        // (config + pinned preview) and needs the horizontal room. The generic
-        // config card up top still reads fine at this width.
-        maxWidth: 1180,
-        margin: '0 auto',
-        padding: 'clamp(20px, 3vw, 32px)',
+        // (config + pinned preview) and needs the horizontal room.
+        ...contentColumn(CONTENT_WIDE),
         display: 'flex',
         flexDirection: 'column',
         gap: 24,

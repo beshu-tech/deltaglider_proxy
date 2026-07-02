@@ -31,7 +31,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { useAdminConfig } from '../queries/config';
 import { useBackends, useBucketNames } from '../queries/backends';
 import { qk } from '../queries/keys';
-import { useCardStyles } from './shared-styles';
+import { useCardStyles, contentColumn, CONTENT_FORM } from './shared-styles';
 import ApplyDialog from './ApplyDialog';
 import BucketCard from './BucketCard';
 import CreateBucketModal from './CreateBucketModal';
@@ -228,9 +228,7 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
   return (
     <div
       style={{
-        maxWidth: 820,
-        margin: '0 auto',
-        padding: 'clamp(16px, 3vw, 24px)',
+        ...contentColumn(CONTENT_FORM),
         display: 'flex',
         flexDirection: 'column',
         gap: 16,

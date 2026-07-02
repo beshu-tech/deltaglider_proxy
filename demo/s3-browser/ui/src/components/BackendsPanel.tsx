@@ -10,7 +10,7 @@ import { useBackends, useBucketOrigins } from '../queries/backends';
 import CreateBucketModal from './CreateBucketModal';
 import ReencryptProposalModal, { type ReencryptTransition } from './ReencryptProposalModal';
 import { useColors } from '../ThemeContext';
-import { useCardStyles } from './shared-styles';
+import { useCardStyles, contentColumn, CONTENT_FORM } from './shared-styles';
 import SectionHeader from './SectionHeader';
 import FormField from './FormField';
 import BackendEncryptionEditor, { type BackendEncryptionPatch } from './BackendEncryptionEditor';
@@ -308,7 +308,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
   }
 
   return (
-    <div style={{ maxWidth: 700, margin: '0 auto', padding: 'clamp(16px, 3vw, 24px)' }}>
+    <div style={contentColumn(CONTENT_FORM)}>
       <ReencryptProposalModal
         open={reencryptProposal !== null}
         transition={reencryptProposal?.transition ?? 'encrypt'}

@@ -2,6 +2,19 @@ import { useMemo } from 'react';
 import { useColors } from '../ThemeContext';
 
 /**
+ * Two shared content-column widths for admin section panels — replaces the
+ * per-panel magic numbers (740/820/860/960/1100/1180). FORM suits single-column
+ * forms and list+detail layouts (readable line length); WIDE suits data tables.
+ * Spread `contentColumn(FORM|WIDE)` onto a panel's outer wrapper.
+ */
+export const CONTENT_FORM = 880;
+export const CONTENT_WIDE = 1140;
+
+export function contentColumn(width: number): React.CSSProperties {
+  return { maxWidth: width, margin: '0 auto', padding: 'clamp(16px, 3vw, 24px)' };
+}
+
+/**
  * Shared card, label, and input styles used across Settings
  * sub-components.
  *

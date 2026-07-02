@@ -42,7 +42,7 @@ import { adminFetch } from '../adminApi';
 import { throwApiError, normalizeUiError } from '../errorHandling';
 import { buildTraceBody } from '../traceRequest';
 import { useColors } from '../ThemeContext';
-import { useCardStyles } from './shared-styles';
+import { useCardStyles, contentColumn, CONTENT_FORM } from './shared-styles';
 import { METHODS } from '../schemas/admissionSchema';
 import SectionHeader from './SectionHeader';
 import FormField from './FormField';
@@ -112,9 +112,7 @@ export default function TracePanel({ onSessionExpired }: Props) {
   return (
     <div
       style={{
-        maxWidth: 860,
-        margin: '0 auto',
-        padding: 'clamp(16px, 3vw, 24px)',
+        ...contentColumn(CONTENT_FORM),
         display: 'flex',
         flexDirection: 'column',
         gap: 16,

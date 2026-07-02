@@ -33,6 +33,7 @@ import {
 import { useColors } from '../ThemeContext';
 import { fetchAudit, type AuditEntry } from '../adminApi';
 import { relativeTime } from '../utils';
+import { contentColumn, CONTENT_WIDE } from './shared-styles';
 
 const { Text } = Typography;
 
@@ -121,17 +122,10 @@ export default function AuditLogPanel({ onSessionExpired }: Props) {
   return (
     <div
       style={{
-        // Responsive-pad wrapper (same as AdmissionPanel et al.) so
-        // the audit viewer doesn't render flush against the sidebar.
-        // Width 1100: the 6-column table (time / action / user / ip /
-        // bucket / target) needs more breathing room than the 960
-        // form panels, otherwise Target/Path clips on common paths.
-        // width:100% + min-width:0 pin this to the pane width so the table's
-        // max-content scrolls within its card instead of ballooning the page.
+        // width:100% + min-width:0 pin this to the pane width so the wide
+        // table's max-content scrolls within its card, not the page.
+        ...contentColumn(CONTENT_WIDE),
         width: '100%',
-        maxWidth: 1100,
-        margin: '0 auto',
-        padding: 'clamp(16px, 3vw, 24px)',
         display: 'flex',
         flexDirection: 'column',
         minWidth: 0,
