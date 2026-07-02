@@ -21,12 +21,12 @@ import {
   fetchDeltaEfficiency,
   triggerDeltaEfficiencyScan,
   verifyDeltaEfficiency,
-  getBucketOrigins,
   type DeltaEfficiencyResponse,
   type DeltaspaceEfficiencyReport,
   type DeltaEfficiency,
   type VerifyDeltaEfficiencyResponse,
 } from '../adminApi';
+import { useBucketNames } from '../queries/backends';
 import HoverHint from './HoverHint';
 
 /**
@@ -78,7 +78,7 @@ const SCAN_TIMEOUT_MS = 300_000;
 
 export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
   const colors = useColors();
-  const [buckets, setBuckets] = useState<string[]>([]);
+  const bucketNames = useBucketNames();
   const [bucket, setBucket] = useState<string | undefined>(undefined);
   const [minDeltas, setMinDeltas] = useState<number>(3);
   const [response, setResponse] = useState<DeltaEfficiencyResponse | null>(null);
@@ -91,29 +91,12 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
   // B) can't overwrite the newer scan's result. See runScan.
   const scanIdRef = useRef(0);
 
-  // Load bucket list on mount.
+  // Bucket names from the SHARED query cache (sorted) — no per-mount fetch of
+  // /buckets that other panels already hold. Auto-select the first once loaded.
+  const buckets = useMemo(() => [...bucketNames].sort(), [bucketNames]);
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const origins = await getBucketOrigins();
-        if (cancelled) return;
-        const names = origins.buckets.map((b: { name: string }) => b.name).sort();
-        setBuckets(names);
-        if (names.length > 0 && bucket === undefined) {
-          setBucket(names[0]);
-        }
-      } catch (e) {
-        if (cancelled) return;
-        const msg = e instanceof Error ? e.message : String(e);
-        if (/401|session/i.test(msg)) {
-          onSessionExpired?.();
-        }
-        setError(`Could not load bucket list: ${msg}`);
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [onSessionExpired]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (buckets.length > 0 && bucket === undefined) setBucket(buckets[0]);
+  }, [buckets, bucket]);
 
   /**
    * Server returns one of:

@@ -26,9 +26,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Alert, Button, Space, Typography, message } from 'antd';
 import { PlusOutlined } from '@ant-design/icons';
-import type { AdminConfig, BackendInfo } from '../adminApi';
-import { getBackends, getBucketOrigins } from '../adminApi';
+import type { AdminConfig } from '../adminApi';
 import { useAdminConfig } from '../queries/config';
+import { useBackends, useBucketNames } from '../queries/backends';
 import { useCardStyles } from './shared-styles';
 import ApplyDialog from './ApplyDialog';
 import BucketCard from './BucketCard';
@@ -99,8 +99,11 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
 
   // Config (backends + default backend + global compression) from the cache.
   const { data: cfg } = useAdminConfig();
-  const [fallbackBackends, setFallbackBackends] = useState<BackendInfo[]>([]);
-  const [realBuckets, setRealBuckets] = useState<string[]>([]);
+  // Backends + real bucket names from the SHARED query cache — not a per-mount
+  // Promise.all. `useBucketNames` derives names from the cached origins map, so
+  // this panel no longer re-fetches /buckets that other consumers already hold.
+  const fallbackBackends = useBackends().data ?? [];
+  const realBuckets = useBucketNames();
   const [createOpen, setCreateOpen] = useState(false);
   /** Expanded row: `real:<name>` for buckets, the row `_id` for drafts. */
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
@@ -113,26 +116,6 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
   useEffect(() => {
     if (cfg === null) onSessionExpired?.();
   }, [cfg, onSessionExpired]);
-
-  const loadSideData = useCallback(async () => {
-    try {
-      // Real buckets come from the admin origins endpoint (server-side
-      // listing) — NOT the browser's S3 client, which may not have
-      // credentials when the operator lands here directly.
-      const [bs, origins] = await Promise.all([
-        getBackends().then((r) => r.backends).catch(() => [] as BackendInfo[]),
-        getBucketOrigins().catch(() => ({ buckets: [] })),
-      ]);
-      setFallbackBackends(bs);
-      setRealBuckets(origins.buckets.map((b) => b.name));
-    } catch (e) {
-      if (e instanceof Error && e.message.includes('401')) onSessionExpired?.();
-    }
-  }, [onSessionExpired]);
-
-  useEffect(() => {
-    void loadSideData();
-  }, [loadSideData]);
 
   // Prefer the /api/admin/config `backends` array — it synthesises a
   // "default" entry on the singleton path so encryption badges resolve
