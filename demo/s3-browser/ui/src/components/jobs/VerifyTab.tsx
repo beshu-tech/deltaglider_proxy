@@ -788,14 +788,20 @@ function WhyCell({ finding, c }: { finding: ParityFinding; c: ReturnType<typeof 
     );
   }
   const v = rerunVerdictMeta(rem.rerun_helps);
+  // Show the verdict as ONE compact chip + a single cause line. Prefer the
+  // structured `cause` (concise) over the backend's longer `reason_detail`, and
+  // never render both — they say the same thing (that was the duplication).
+  const cause = v.cause ?? rem.reason_detail;
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-      <Tag color={v.color} style={{ marginInlineEnd: 0, whiteSpace: 'normal' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }}>
+      <Tag color={v.color} style={{ marginInlineEnd: 0, alignSelf: 'flex-start', whiteSpace: 'nowrap' }}>
         {v.label}
       </Tag>
-      <Text type="secondary" style={{ fontSize: 12, lineHeight: 1.45 }}>
-        {rem.reason_detail}
-      </Text>
+      {cause && (
+        <Text type="secondary" style={{ fontSize: 12, lineHeight: 1.45 }}>
+          {cause}
+        </Text>
+      )}
     </div>
   );
 }
@@ -841,10 +847,13 @@ function FixCell({
     );
   }
 
-  // Guidance only — no write button. Chip + how-to (title carries fix_detail).
+  // Guidance only — no write button. Render as a LABELLED INSTRUCTION (a strong
+  // action verb + the how-to), NOT a chip that mimics a clickable button.
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }} title={rem.fix_detail}>
-      <Tag style={{ marginInlineEnd: 0, whiteSpace: 'normal' }}>{meta.label}</Tag>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }} title={rem.fix_detail}>
+      <Text strong style={{ fontSize: 12.5, color: c.TEXT_PRIMARY, lineHeight: 1.35 }}>
+        {meta.label}
+      </Text>
       <Text type="secondary" style={{ fontSize: 11.5, color: c.TEXT_MUTED, lineHeight: 1.4 }}>
         {meta.how ?? rem.fix_detail}
       </Text>

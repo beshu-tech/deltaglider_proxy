@@ -209,7 +209,10 @@ export function conflictPolicyLabel(p: ConflictPolicy): string {
  * provably skips / keeps the dest / keeps failing).
  */
 export function rerunVerdictMeta(rerun: RerunVerdict): {
+  /** SHORT chip label — the verdict only. The specific cause is `cause`. */
   label: string;
+  /** One-line cause, shown next to the chip (NOT duplicated by reason_detail). */
+  cause?: string;
   color: string;
   tone: 'good' | 'bad' | 'maybe';
 } {
@@ -222,19 +225,19 @@ export function rerunVerdictMeta(rerun: RerunVerdict): {
       // Gold = soft (an out-of-band delete is the real fix, nothing lied);
       // red = the hard policy lie (re-run runs but provably won't help).
       const soft = rerun.why === 'orphan_needs_delete' || rerun.why === 'foreign_not_ours';
-      const label =
+      const cause =
         rerun.why === 'policy_skips_existing_dest'
-          ? "Re-run won't help: policy skips existing destination"
+          ? 'policy skips existing destination'
           : rerun.why === 'dest_newer_than_source'
-            ? "Re-run won't help: destination is newer"
+            ? 'destination is newer'
             : rerun.why === 'tied_timestamps_no_winner'
-              ? "Re-run won't help: timestamps tied, no winner"
+              ? 'timestamps tied, no winner'
               : rerun.why === 'orphan_needs_delete'
-              ? "Re-run won't help: needs a delete"
-              : rerun.why === 'foreign_not_ours'
-                ? "Re-run won't help: not written by this rule"
-                : "Re-run won't help: copy keeps failing";
-      return { label, color: soft ? 'gold' : 'red', tone: 'bad' };
+                ? 'needs a delete'
+                : rerun.why === 'foreign_not_ours'
+                  ? 'not written by this rule'
+                  : 'copy keeps failing';
+      return { label: "Re-run won't help", cause, color: soft ? 'gold' : 'red', tone: 'bad' };
     }
     default:
       return { label: "Re-run won't help", color: 'red', tone: 'bad' };
