@@ -281,31 +281,46 @@ export default function JobsPanel({ onSessionExpired }: Props) {
     {
       key: 'job',
       label: 'Job',
-      track: 'minmax(0,1.4fr)',
+      track: 'minmax(160px,1.3fr)',
       render: (d) => (
-        <Space size={8} wrap>
-          <Tag color={d.row.kind === 'replication' ? 'blue' : d.row.kind === 'lifecycle' ? 'purple' : 'gold'}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+          <Tag
+            color={d.row.kind === 'replication' ? 'blue' : d.row.kind === 'lifecycle' ? 'purple' : 'gold'}
+            style={{ margin: 0, flexShrink: 0 }}
+          >
             {kindLabel(d.row.kind)}
           </Tag>
-          <Text strong style={{ fontFamily: 'var(--font-mono)', fontSize: 13 }}>
+          <Text
+            strong
+            ellipsis={{ tooltip: d.row.name }}
+            style={{ fontFamily: 'var(--font-mono)', fontSize: 13, minWidth: 0 }}
+          >
             {d.row.name}
           </Text>
-          {d.draft && <Tag color="warning">draft — not applied</Tag>}
-          {d.pendingDelete && <Tag color="error">removed on apply</Tag>}
-        </Space>
+          {d.draft && <Tag color="warning" style={{ margin: 0, flexShrink: 0 }}>draft</Tag>}
+          {d.pendingDelete && <Tag color="error" style={{ margin: 0, flexShrink: 0 }}>removing</Tag>}
+        </div>
       ),
     },
     {
       key: 'scope',
       label: 'Scope',
-      track: 'minmax(0,1.2fr)',
-      render: (d) => (
-        <Text type="secondary" style={{ fontFamily: 'var(--font-mono)', fontSize: 12, wordBreak: 'break-word' }}>
-          {d.row.scope.bucket}
-          {d.row.scope.prefix ? `/${d.row.scope.prefix}` : ''}
-          {d.row.scope.target ? ` → ${d.row.scope.target}` : ''}
-        </Text>
-      ),
+      track: 'minmax(140px,1.2fr)',
+      render: (d) => {
+        const scope = `${d.row.scope.bucket}${d.row.scope.prefix ? `/${d.row.scope.prefix}` : ''}${
+          d.row.scope.target ? ` → ${d.row.scope.target}` : ''
+        }`;
+        return (
+          <Text
+            type="secondary"
+            className="dg-cell-truncate"
+            title={scope}
+            style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}
+          >
+            {scope || '—'}
+          </Text>
+        );
+      },
     },
     {
       key: 'trigger',
@@ -371,7 +386,7 @@ export default function JobsPanel({ onSessionExpired }: Props) {
         d.draft ? (
           <span />
         ) : (
-          <Space size={4} onClick={(e) => e.stopPropagation()}>
+          <Space size={2} onClick={(e) => e.stopPropagation()}>
             {availableActions(d.row).map((a) => {
               // A one-off on a disabled/paused rule reads as "Run once" (it runs
               // the rule a single time without re-enabling/resuming it).
@@ -380,7 +395,7 @@ export default function JobsPanel({ onSessionExpired }: Props) {
               const label = oneOff ? 'Run once' : ACTION_META[a].label;
               const title = oneOff
                 ? 'Run this rule once now — does not enable or resume it'
-                : ACTION_META[a].label;
+                : label;
               return (
                 <Button
                   key={a}
@@ -390,9 +405,12 @@ export default function JobsPanel({ onSessionExpired }: Props) {
                   icon={ACTION_META[a].icon}
                   loading={actionBusy === `${d.row.id}:${a}`}
                   title={title}
+                  aria-label={title}
                   onClick={() => void runAction(d.row, a)}
                 >
-                  {label}
+                  {/* Icon-only on the wide table (label in the tooltip); the
+                      caption returns on the narrow stacked card. */}
+                  <span className="dg-action-label">{label}</span>
                 </Button>
               );
             })}
