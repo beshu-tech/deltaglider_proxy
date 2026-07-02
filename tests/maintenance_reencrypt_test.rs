@@ -447,3 +447,148 @@ async fn test_cancel_releases_gate() {
     )
     .await;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Key ROTATION A → B (the headline correctness path)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const KEY_B: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+const KEY_B_ID: &str = "maint-test-key-2";
+
+/// The subsystem's whole reason to exist: rotate a bucket's encryption key from
+/// A to B (A retained as the legacy decrypt shim), re-encrypt, and prove every
+/// object is (a) readable byte-identical, (b) re-stamped with B's key-id on
+/// disk, (c) idempotent on a second run, and (d) STILL readable after A is
+/// retired (legacy shim removed) — i.e. fully migrated off A.
+#[tokio::test]
+async fn test_reencrypt_key_rotation_a_to_b() {
+    let bucket = "maintrot";
+    let server = TestServer::builder().bucket(bucket).build().await;
+    let http = reqwest::Client::new();
+    let endpoint = server.endpoint();
+    let admin = admin_http_client(&endpoint).await;
+
+    // Encrypt under key A, seed passthrough + a delta pair (all stamped A).
+    enable_encryption(&admin, &endpoint).await;
+    let v1_expected = seed_bucket(&http, &endpoint, bucket, 8).await;
+    let data_dir = server.data_dir().unwrap();
+
+    // Every encrypted object on disk is stamped with A's key-id.
+    let stamped_kids = |dir: &std::path::Path| -> Vec<String> {
+        common::read_xattr_metadata(dir)
+            .into_iter()
+            .filter_map(|(_, v)| {
+                v.get("user_metadata")
+                    .and_then(|um| um.get("dg-encryption-key-id"))
+                    .and_then(|k| k.as_str())
+                    .map(String::from)
+            })
+            .collect()
+    };
+    let before = stamped_kids(&data_dir);
+    assert!(
+        !before.is_empty(),
+        "objects must be encrypted before rotation"
+    );
+    assert!(
+        before.iter().all(|k| k == KEY_ID),
+        "all objects stamped with A before rotation: {before:?}"
+    );
+
+    // ── Rotate: B primary, A retained as legacy decrypt shim. ──
+    put_storage_encryption(
+        &admin,
+        &endpoint,
+        serde_json::json!({
+            "mode": "aes256-gcm-proxy",
+            "key": KEY_B, "key_id": KEY_B_ID,
+            "legacy_key": KEY, "legacy_key_id": KEY_ID,
+        }),
+    )
+    .await;
+
+    start_reencrypt(&admin, &endpoint, bucket).await;
+    wait_job_done(&admin, &endpoint, bucket).await;
+    let job = newest_job(&admin, &endpoint).await;
+    assert_eq!(job["status"], "succeeded", "rotation job: {job}");
+    assert_eq!(job["progress"]["failed"], 0, "rotation job: {job}");
+
+    // (a) readable byte-identical under B; (b) re-stamped to B on disk.
+    assert_eq!(
+        get_bytes(&http, &endpoint, bucket, "plain-00.json").await,
+        [PLAINTEXT_MARKER, b" object 0"].concat()
+    );
+    assert_eq!(
+        get_bytes(&http, &endpoint, bucket, "rel/v1.zip").await,
+        v1_expected,
+        "delta object must reconstruct byte-identical under B"
+    );
+    let after = stamped_kids(&data_dir);
+    assert!(
+        after.iter().all(|k| k == KEY_B_ID),
+        "all objects re-stamped to B after rotation: {after:?}"
+    );
+
+    // (c) idempotent: a 2nd rotation re-encrypt skips everything.
+    start_reencrypt(&admin, &endpoint, bucket).await;
+    wait_job_done(&admin, &endpoint, bucket).await;
+    let job2 = newest_job(&admin, &endpoint).await;
+    assert_eq!(
+        job2["progress"]["processed"], 0,
+        "2nd run no rewrites: {job2}"
+    );
+
+    // (d) retire A (drop the legacy shim) — everything still readable under B.
+    put_storage_encryption(
+        &admin,
+        &endpoint,
+        serde_json::json!({ "mode": "aes256-gcm-proxy", "key": KEY_B, "key_id": KEY_B_ID }),
+    )
+    .await;
+    assert_eq!(
+        get_bytes(&http, &endpoint, bucket, "plain-00.json").await,
+        [PLAINTEXT_MARKER, b" object 0"].concat(),
+        "object must stay readable after A is retired"
+    );
+    assert_eq!(
+        get_bytes(&http, &endpoint, bucket, "rel/v1.zip").await,
+        v1_expected,
+        "delta must stay readable after A is retired"
+    );
+}
+
+/// A rotation to B WITHOUT the legacy shim, run against a bucket that still has
+/// A-stamped objects: reading an un-rewritten A object must HARD-FAIL (never
+/// serve ciphertext) with the rotation-hint error — pins pick_decrypt_key.
+#[tokio::test]
+async fn test_read_after_rotation_without_shim_hard_fails() {
+    let bucket = "maintnoshim";
+    let server = TestServer::builder().bucket(bucket).build().await;
+    let http = reqwest::Client::new();
+    let endpoint = server.endpoint();
+    let admin = admin_http_client(&endpoint).await;
+
+    enable_encryption(&admin, &endpoint).await;
+    let body = [PLAINTEXT_MARKER, b" secret"].concat();
+    put_object(&http, &endpoint, bucket, "a.json", body, "text/plain").await;
+
+    // Rotate to B with NO legacy shim, and DON'T re-encrypt — a.json stays A.
+    put_storage_encryption(
+        &admin,
+        &endpoint,
+        serde_json::json!({ "mode": "aes256-gcm-proxy", "key": KEY_B, "key_id": KEY_B_ID }),
+    )
+    .await;
+
+    // GET must fail (wrong/absent key), never return ciphertext.
+    let resp = http
+        .get(format!("{endpoint}/{bucket}/a.json"))
+        .send()
+        .await
+        .expect("GET sent");
+    assert!(
+        resp.status().is_server_error() || resp.status().is_client_error(),
+        "read of an A-stamped object under B-with-no-shim must fail, got {}",
+        resp.status()
+    );
+}
