@@ -227,6 +227,7 @@ pub async fn run_now(
             ttl_secs: lifecycle::scheduler::lease_ttl_secs(),
             heartbeat_secs: lifecycle::scheduler::heartbeat_secs(),
         }),
+        Some(state.s3_state.maintenance_gate.clone()),
     )
     .await
     .map_err(|err| (lifecycle::classify_lifecycle_run_error(&err), err));

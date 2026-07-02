@@ -182,6 +182,7 @@ async fn run_due_rules(
                 ttl_secs: lease_ttl_secs(),
                 heartbeat_secs: heartbeat_secs(),
             }),
+            Some(state.maintenance_gate.clone()),
         )
         .await
         {

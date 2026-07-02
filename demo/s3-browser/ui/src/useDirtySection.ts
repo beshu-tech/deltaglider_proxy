@@ -140,6 +140,19 @@ export function requestApplyCurrent(key: DirtyKey | null): boolean {
 }
 
 /**
+ * ⌘S for a MULTI-editor page (e.g. System stacks listener/caches/logging/sync,
+ * each registering under its own dirtyKey only while dirty). Dispatch to the
+ * first key with a live handler. Returns true if one ran. Without this a page
+ * that has `dirtyKeys` but no single `applyKey` had a dead ⌘S.
+ */
+export function requestApplyFirst(keys: readonly DirtyKey[]): boolean {
+  for (const key of keys) {
+    if (requestApplyCurrent(key)) return true;
+  }
+  return false;
+}
+
+/**
  * React-hook sugar: register `handler` for a section, ref-stable
  * across renders so the dispatcher always reaches the latest
  * closure. Skipped when `enabled` is false — callers pass their

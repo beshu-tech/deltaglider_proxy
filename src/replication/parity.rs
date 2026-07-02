@@ -616,6 +616,9 @@ fn cache_hit_fresh(cached: &ParityCacheEntry, lite_stored_etag: &Option<String>)
 /// HEAD burst for the misses + the changed objects, persisting fresh results so
 /// the next verify is HEAD-free. `source` is keyed by the dest-namespace key.
 #[allow(clippy::too_many_arguments)]
+/// Returns the number of keys left UNRESOLVED by a transient HEAD failure —
+/// the caller must treat a non-zero count as a partial audit (in_sync=false),
+/// since a dropped key can't be compared and would otherwise vanish silently.
 async fn resolve_logical(
     engine: &DynEngine,
     rule: &ReplicationRule,
@@ -625,9 +628,9 @@ async fn resolve_logical(
     raw_keys: &[String],
     source: &mut BTreeMap<String, ObjState>,
     failures: Option<&tokio::sync::Mutex<ConfigDb>>,
-) {
+) -> usize {
     if raw_keys.is_empty() {
-        return;
+        return 0;
     }
     let dest_keys: Vec<String> = raw_keys
         .iter()
@@ -648,6 +651,7 @@ async fn resolve_logical(
     }
     let fresh = head_burst(engine, bucket, &miss_raw).await;
     let mut to_cache: Vec<(String, ParityCacheEntry)> = Vec::new();
+    let mut unresolved = 0usize;
     for (raw, outcome) in fresh {
         let Ok(dk) = rewrite_key(src_prefix, dst_prefix, &raw) else {
             continue;
@@ -663,17 +667,22 @@ async fn resolve_logical(
             HeadOutcome::Gone => {
                 source.remove(&dk);
             }
-            // Transient HEAD failure → drop from the compare rather than
-            // emitting a false verdict on the untrusted lite size (#16).
+            // Transient HEAD failure → drop from the compare (a false verdict on
+            // the untrusted lite size is worse, #16) but COUNT it so the audit
+            // is reported partial, not silently in_sync (#3 regression).
             HeadOutcome::Unresolved => {
                 source.remove(&dk);
+                unresolved += 1;
             }
         }
     }
     cache_put(failures, &rule.name, ParitySide::Source, &to_cache).await;
+    unresolved
 }
 
 /// Dest-side logical resolution: dest is keyed by its own raw key (== cache key).
+/// Returns the count of keys left UNRESOLVED by a transient HEAD (see
+/// `resolve_logical`). A non-zero count makes the audit partial.
 async fn resolve_logical_dest(
     engine: &DynEngine,
     rule: &ReplicationRule,
@@ -681,12 +690,25 @@ async fn resolve_logical_dest(
     raw_keys: &[String],
     dest: &mut BTreeMap<String, ObjState>,
     failures: Option<&tokio::sync::Mutex<ConfigDb>>,
-) {
+) -> usize {
     if raw_keys.is_empty() {
-        return;
+        return 0;
     }
     let keys: Vec<String> = raw_keys.to_vec();
-    let cached = cache_get(failures, &rule.name, ParitySide::Dest, &keys).await;
+    // When the lite list can't carry provenance (S3 / encrypting dest),
+    // ownership was left provisional in the scan and must be overlaid from a
+    // FRESH HEAD. The parity cache stores logical facts (size/etag/sha) but NOT
+    // ownership, and ownership isn't stored-etag-stable (it depends on the
+    // source still existing), so a cache hit would leave the provisional
+    // not-owned in place — re-misdiagnosing a rule-owned orphan as foreign on
+    // every verify after the first. So on a non-authoritative dest, bypass the
+    // cache entirely: every key gets a fresh HEAD.
+    let lite_authoritative = engine.lite_list_carries_logical_facts(bucket);
+    let cached = if lite_authoritative {
+        cache_get(failures, &rule.name, ParitySide::Dest, &keys).await
+    } else {
+        std::collections::HashMap::new()
+    };
     let mut miss: Vec<&String> = Vec::new();
     for k in raw_keys {
         let lite = lite_stored_etag(dest, k);
@@ -696,10 +718,8 @@ async fn resolve_logical_dest(
         }
     }
     let fresh = head_burst(engine, bucket, &miss).await;
-    // When the lite list can't carry provenance (S3 / encrypting dest),
-    // ownership was left provisional in the scan — overlay it from the HEAD.
-    let lite_authoritative = engine.lite_list_carries_logical_facts(bucket);
     let mut to_cache: Vec<(String, ParityCacheEntry)> = Vec::new();
+    let mut unresolved = 0usize;
     for (k, outcome) in fresh {
         match outcome {
             HeadOutcome::Resolved(meta) => {
@@ -716,12 +736,17 @@ async fn resolve_logical_dest(
             HeadOutcome::Gone => {
                 dest.remove(&k);
             }
+            // Transient HEAD failure → drop (a false verdict is worse) but COUNT
+            // so the audit is partial — a dropped dest orphan would otherwise
+            // vanish and yield a false in_sync (#3 regression).
             HeadOutcome::Unresolved => {
                 dest.remove(&k);
+                unresolved += 1;
             }
         }
     }
     cache_put(failures, &rule.name, ParitySide::Dest, &to_cache).await;
+    unresolved
 }
 
 /// Outcome of one HEAD in the burst. A NotFound is a raced delete (the object
@@ -922,6 +947,10 @@ pub async fn parity_audit(
     // LITE list (metadata=false) — no per-object HEAD. For delta objects the
     // lite list carries the DELTA-blob size/etag (not logical), so those keys
     // are queued for logical resolution (cache first, HEAD only on a miss).
+    // On a SOURCE whose lite list is untrustworthy (encrypting/S3 → ciphertext
+    // size/etag), EVERY key must be HEAD-resolved for a correct compare — the
+    // symmetric guard to the dest side (finding #5 was one-directional).
+    let src_lite_authoritative = engine.lite_list_carries_logical_facts(&rule.source.bucket);
     let (src_truncated, src_seen) = scan_prefix(
         engine,
         &rule.source.bucket,
@@ -942,7 +971,7 @@ pub async fn parity_audit(
             let dest_key = rewrite_key(&rule.source.prefix, &rule.destination.prefix, key)
                 .map_err(|e| e.to_string())?;
             dest_to_source.insert(dest_key.clone(), key.to_string());
-            if needs_logical_resolution(engine, key, meta) {
+            if !src_lite_authoritative || needs_logical_resolution(engine, key, meta) {
                 src_needs_logical.push(key.to_string());
             }
             source.insert(dest_key, ObjState::from_metadata(meta));
@@ -1012,7 +1041,7 @@ pub async fn parity_audit(
     if let Some(p) = progress {
         p.check_cancel().await?;
     }
-    resolve_logical(
+    let src_unresolved = resolve_logical(
         engine,
         rule,
         &rule.source.bucket,
@@ -1026,7 +1055,7 @@ pub async fn parity_audit(
     if let Some(p) = progress {
         p.check_cancel().await?;
     }
-    resolve_logical_dest(
+    let dst_unresolved = resolve_logical_dest(
         engine,
         rule,
         &rule.destination.bucket,
@@ -1036,12 +1065,16 @@ pub async fn parity_audit(
     )
     .await;
 
-    let truncated = src_truncated || dst_truncated;
+    // A transient HEAD that left a key unresolved means the audit couldn't see
+    // every object — treat it as truncated (partial) so it never reports a
+    // false in_sync off keys that were silently dropped from the compare.
+    let unresolved = src_unresolved + dst_unresolved;
+    let truncated = src_truncated || dst_truncated || unresolved > 0;
 
     if truncated {
         warn!(
-            "parity audit for rule '{}' hit the scan cap ({} objects) — result is partial",
-            rule.name, max_objects
+            "parity audit for rule '{}' is partial (scan cap {} objects, {} unresolved HEADs)",
+            rule.name, max_objects, unresolved
         );
     }
 

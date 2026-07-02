@@ -389,4 +389,31 @@ replication:
         foreign, 1,
         "the directly-placed object must be a FOREIGN orphan: {out}"
     );
+
+    // SECOND verify (regression for the verify-swarm's finding #1): the first
+    // verify cached logical facts for the dest orphans. A cache HIT must NOT
+    // skip the ownership HEAD-overlay — otherwise the rule-owned orphan reverts
+    // to the provisional not-owned and is re-misdiagnosed as foreign. On a
+    // non-lite-authoritative (S3) dest the fix bypasses the cache for ownership.
+    let out2 = verify_rule(&admin, &server.endpoint(), "parity-s3").await;
+    let samples2 = out2["orphan_samples"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let owned2 = samples2
+        .iter()
+        .filter(|s| reason(s) == "rule_owned_orphan_source_deleted")
+        .count();
+    let foreign2 = samples2
+        .iter()
+        .filter(|s| reason(s) == "foreign_orphan")
+        .count();
+    assert_eq!(
+        owned2, 1,
+        "SECOND verify must STILL see the rule-owned orphan (no cache regression): {out2}"
+    );
+    assert_eq!(
+        foreign2, 1,
+        "SECOND verify must STILL see the foreign orphan: {out2}"
+    );
 }

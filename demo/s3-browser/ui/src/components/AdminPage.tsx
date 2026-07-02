@@ -42,7 +42,7 @@ import { buildViewUrl } from '../urlState';
 import TabHeader from './TabHeader';
 import { YamlImportExportModal } from './YamlImportExportModal';
 import { FullIamYamlModal } from './FullIamYamlModal';
-import { useDirtyGlobalIndicators, requestApplyCurrent } from '../useDirtySection';
+import { useDirtyGlobalIndicators, requestApplyFirst } from '../useDirtySection';
 import type { SectionName } from '../adminApi';
 import type { AccountMenuConfigProps } from './AccountMenu';
 
@@ -112,7 +112,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, accountMe
   // The per-leaf dirty/apply key for ⌘S dispatch (panels register under this,
   // not the coarse section). `activeSection` is still used for the avatar
   // menu's section-YAML target (which IS section-scoped).
-  const activeDirtyKey = applyKeyForPath(adminPath);
+  const activeApplyKeys = useMemo(() => applyKeysForPath(adminPath), [adminPath]);
   const navigateAdmin = useCallback(
     (path: string) => {
       navigate(buildViewUrl('admin', path));
@@ -188,7 +188,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, accountMe
         // Configuration pages), let the browser's default fire — we
         // don't want to silently eat ⌘S when there's no contextual
         // meaning.
-        if (activeDirtyKey && requestApplyCurrent(activeDirtyKey)) {
+        if (activeApplyKeys.length > 0 && requestApplyFirst(activeApplyKeys)) {
           e.preventDefault();
         }
         return;
@@ -198,7 +198,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, accountMe
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [authed, activeDirtyKey]);
+  }, [authed, activeApplyKeys]);
 
   // Memoised palette extra-actions. The underlying handlers
   // (`setYamlModalMode`, `onShowShortcuts`, `navigateAdmin`, `onBack`)
@@ -945,6 +945,12 @@ function sectionForPath(path: string): SectionName | undefined {
  * per-leaf key (not the coarse `SectionName`). Returns undefined when the path
  * isn't a dirty-capable config leaf (Diagnostics, immediate-save CRUD, etc.).
  */
-function applyKeyForPath(path: string): string | undefined {
-  return findEntry(ADMIN_IA, path)?.applyKey;
+/// ⌘S dispatch candidates for a path: the single `applyKey` if set, else the
+/// leaf's `dirtyKeys` (multi-editor pages like System register per-editor and
+/// have no single applyKey — without this fallback ⌘S was dead there).
+function applyKeysForPath(path: string): string[] {
+  const entry = findEntry(ADMIN_IA, path);
+  if (!entry) return [];
+  if (entry.applyKey) return [entry.applyKey];
+  return entry.dirtyKeys ?? [];
 }

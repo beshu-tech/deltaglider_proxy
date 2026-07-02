@@ -21,7 +21,7 @@ use chrono::{Duration as ChronoDuration, Utc};
 use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PreviewObject {
@@ -74,9 +74,11 @@ pub async fn preview_rule(
     rule: &LifecycleRule,
     max_candidates: usize,
 ) -> Result<LifecycleRunOutcome, String> {
-    run_or_preview(None, engine, rule, max_candidates, false, None).await
+    // Preview never writes → no maintenance gate needed.
+    run_or_preview(None, engine, rule, max_candidates, false, None, None).await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_rule(
     db: Option<Arc<Mutex<ConfigDb>>>,
     engine: &Arc<DynEngine>,
@@ -85,6 +87,7 @@ pub async fn run_rule(
     triggered_by: &str,
     next_due_delay_secs: i64,
     lease: Option<RunLease>,
+    maintenance_gate: Option<Arc<crate::maintenance::gate::MaintenanceGate>>,
 ) -> Result<LifecycleRunOutcome, String> {
     let started_at = super::current_unix_seconds();
     let run_id = if let Some(db) = db.as_ref() {
@@ -116,6 +119,7 @@ pub async fn run_rule(
         max_failures_retained as usize,
         true,
         Some(ctx.clone()),
+        maintenance_gate.clone(),
     )
     .await;
     if let Some(handle) = heartbeat_handle {
@@ -199,14 +203,24 @@ async fn run_or_preview(
     response_cap: usize,
     execute: bool,
     ctx: Option<RunContext>,
+    maintenance_gate: Option<Arc<crate::maintenance::gate::MaintenanceGate>>,
 ) -> Result<LifecycleRunOutcome, String> {
     // retain-newest is SET-RELATIVE (it ranks the whole prefix) and takes a
     // dedicated collect→rank→act path — it must never touch the per-object age
     // machinery below (which would parse a nonexistent expire_after and apply a
     // per-object decision that can't express "keep newest N").
     if let LifecycleAction::RetainNewest(action) = &rule.action {
-        return run_or_preview_retain_newest(db, engine, rule, action, response_cap, execute, ctx)
-            .await;
+        return run_or_preview_retain_newest(
+            db,
+            engine,
+            rule,
+            action,
+            response_cap,
+            execute,
+            ctx,
+            maintenance_gate,
+        )
+        .await;
     }
 
     let expire_after_str = rule.expire_after.as_deref().ok_or_else(|| {
@@ -265,6 +279,17 @@ async fn run_or_preview(
     };
 
     'pages: while let Some(page_idx) = pager.begin_page() {
+        // Mid-run maintenance defer: if a write bucket (source or transition
+        // dest) becomes gated mid-run, stop — cursor preserved, resumes when the
+        // maintenance job clears. Mirrors the replication RunControl fix (#12);
+        // preview never writes, so it's execute-only.
+        if execute && maintenance_write_bucket_busy(rule, maintenance_gate.as_ref()) {
+            info!(
+                "lifecycle rule '{}' deferring mid-run — a write bucket is under maintenance",
+                rule.name
+            );
+            break 'pages;
+        }
         if execute
             && !renew_run_lease(&db, rule, ctx.as_ref(), &mut out.failures, response_cap).await?
         {
@@ -413,6 +438,7 @@ async fn run_or_preview_retain_newest(
     response_cap: usize,
     execute: bool,
     ctx: Option<RunContext>,
+    maintenance_gate: Option<Arc<crate::maintenance::gate::MaintenanceGate>>,
 ) -> Result<LifecycleRunOutcome, String> {
     // Defensive guard: a count-0 retain rule would delete every qualifying
     // object in the prefix. The Deserialize impl and validate_lifecycle already
@@ -455,6 +481,17 @@ async fn run_or_preview_retain_newest(
     let mut pager = Pager::fresh();
 
     'pages: while let Some(page_idx) = pager.begin_page() {
+        // Mid-run maintenance defer: if a write bucket (source or transition
+        // dest) becomes gated mid-run, stop — cursor preserved, resumes when the
+        // maintenance job clears. Mirrors the replication RunControl fix (#12);
+        // preview never writes, so it's execute-only.
+        if execute && maintenance_write_bucket_busy(rule, maintenance_gate.as_ref()) {
+            info!(
+                "lifecycle rule '{}' deferring mid-run — a write bucket is under maintenance",
+                rule.name
+            );
+            break 'pages;
+        }
         if execute
             && !renew_run_lease(&db, rule, ctx.as_ref(), &mut out.failures, response_cap).await?
         {
@@ -511,6 +548,27 @@ async fn run_or_preview_retain_newest(
         if !pager.advance(page.is_truncated, page.next_continuation_token) {
             break 'pages;
         }
+    }
+
+    // Page-budget truncation is the SAME data-loss hazard as the candidate cap:
+    // ranking "keep newest N" over a listing that stopped at MAX_JOB_PAGES could
+    // delete an object that is actually in the newest N. Refuse rather than
+    // delete over a partial set (retain-newest is set-relative — see #4). A
+    // mid-run maintenance/lease break above set `execute`-stop, not truncation,
+    // so this only fires on a genuine budget overrun.
+    if pager.truncated_by_page_budget() {
+        let msg = format!(
+            "retain-newest listing hit the page budget ({} pages) for prefix {:?}; refusing to \
+             rank a truncated set — narrow the prefix or add include_globs",
+            crate::job_loop::MAX_JOB_PAGES,
+            prefix
+        );
+        warn!("lifecycle rule '{}': {}", rule.name, msg);
+        out.errors += 1;
+        push_failure(&mut out.failures, response_cap, String::new(), msg.clone());
+        record_failure(&db, rule, ctx.as_ref(), "", &msg).await?;
+        out.status = "failed".to_string();
+        return Ok(out);
     }
 
     // ── Rank phase (pure): the entire data-loss-sensitive decision ──
@@ -739,6 +797,21 @@ fn spawn_lease_heartbeat(
             }
         }
     }))
+}
+
+/// True when any bucket this rule WRITES to (source-for-deletes + transition
+/// destination) is under a maintenance write-gate. Used to defer a lifecycle
+/// run mid-sweep so it never writes into a bucket being migrated/re-encrypted.
+fn maintenance_write_bucket_busy(
+    rule: &LifecycleRule,
+    gate: Option<&Arc<crate::maintenance::gate::MaintenanceGate>>,
+) -> bool {
+    let Some(gate) = gate else {
+        return false;
+    };
+    super::planner::rule_write_buckets(rule)
+        .into_iter()
+        .any(|b| gate.is_busy(b))
 }
 
 async fn renew_run_lease(
