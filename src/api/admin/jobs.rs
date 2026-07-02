@@ -821,17 +821,18 @@ async fn delete_rule(
         // H2: refuse to delete a replication rule with a LIVE run — a running
         // row, a cancelling row, OR an unexpired lease (acquired pre-spawn).
         if let (JobSubsystem::Replication, Some(db)) = (sub, db_guard.as_ref()) {
+            let now = crate::replication::state_store::current_unix_seconds();
             let run_status = db.replication_latest_run_status(name).ok().flatten();
-            let lease_live = db
-                .replication_lease_is_held(
-                    name,
-                    crate::replication::state_store::current_unix_seconds(),
-                )
-                .unwrap_or(false);
+            // Live = a run (row or lease) OR an in-flight background verify —
+            // a verify scan re-inserts parity rows after a mid-scan purge (#30).
+            let lease_live = db.replication_lease_is_held(name, now).unwrap_or(false)
+                || db.parity_lease_is_held(name, now).unwrap_or(false);
             if delete_blocked_by_live_run(run_status.as_deref(), lease_live) {
                 return Err((
                     StatusCode::CONFLICT,
-                    format!("rule '{name}' has a run in progress — kill it before deleting"),
+                    format!(
+                        "rule '{name}' has a run or verify in progress — stop it before deleting"
+                    ),
                 ));
             }
         }

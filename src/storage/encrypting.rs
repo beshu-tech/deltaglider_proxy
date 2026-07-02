@@ -1392,6 +1392,15 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         self.inner.supports_native_multipart(bucket)
     }
 
+    fn lite_list_carries_logical_facts(&self, bucket: &str) -> bool {
+        // When actively encrypting, the lite list reports CIPHERTEXT size/etag —
+        // parity must HEAD for plaintext logical facts.
+        if self.actively_encrypts() {
+            return false;
+        }
+        self.inner.lite_list_carries_logical_facts(bucket)
+    }
+
     async fn get_passthrough_stream_range(
         &self,
         bucket: &str,

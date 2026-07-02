@@ -1618,6 +1618,12 @@ impl StorageBackend for S3Backend {
         true
     }
 
+    fn lite_list_carries_logical_facts(&self, _bucket: &str) -> bool {
+        // S3 LIST returns NO user metadata (so replication-provenance ownership
+        // can't be read from a lite entry) — parity must HEAD to know ownership.
+        false
+    }
+
     #[instrument(skip(self, metadata))]
     async fn create_multipart_upload(
         &self,

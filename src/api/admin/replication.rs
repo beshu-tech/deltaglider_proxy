@@ -293,8 +293,25 @@ pub async fn verify(
     };
 
     let owner = format!("verify:{}", uuid::Uuid::new_v4());
-    // Acquire the lease; if someone else holds it, just report current status.
     let now = crate::replication::current_unix_seconds();
+    // A verify DURING a replication run of the same rule is meaningless — the
+    // dest is expected to be mid-sync — and the UI's "fix then verify" flow
+    // (run-now → verify) would otherwise race a false 'not in sync' verdict.
+    // Refuse with 409 while the run lease is held (finding #17).
+    {
+        let db = db_arc.lock().await;
+        if db
+            .replication_lease_is_held(&rule.name, now)
+            .unwrap_or(false)
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                "a replication run is in progress for this rule — verify after it settles"
+                    .to_string(),
+            ));
+        }
+    }
+    // Acquire the lease; if someone else holds it, just report current status.
     let acquired = {
         let db = db_arc.lock().await;
         db.parity_try_acquire_lease(&rule.name, &owner, now, PARITY_LEASE_TTL_SECS)

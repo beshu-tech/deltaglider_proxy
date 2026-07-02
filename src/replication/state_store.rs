@@ -1082,6 +1082,13 @@ impl ConfigDb {
         )
     }
 
+    /// True when SOME owner holds an unexpired parity (verify) lease on the
+    /// rule — an in-flight background verify. The delete-rule H2 guard consults
+    /// it so a rule isn't purged out from under a running scan (finding #30).
+    pub fn parity_lease_is_held(&self, rule: &str, now: i64) -> Result<bool, ConfigDbError> {
+        job_store::lease_is_held(&self.conn, "replication_parity", "rule_name", &rule, now)
+    }
+
     /// Renew the parity lease this owner still holds (heartbeat during a long
     /// scan). Returns false if the owner lost it (lapsed / taken) — the caller
     /// should then stop, since another owner may have started a fresh scan.

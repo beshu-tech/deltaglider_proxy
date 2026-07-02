@@ -448,6 +448,17 @@ pub trait StorageBackend: Send + Sync {
         false
     }
 
+    /// Does the LITE list (`bulk_list_objects` / `scan_deltaspace_lite`) for
+    /// `bucket` carry trustworthy LOGICAL facts — real user_metadata (for
+    /// replication-provenance ownership) AND plaintext size/etag? Filesystem
+    /// stamps xattr metadata into the lite entry (true); S3 LIST returns
+    /// neither user metadata nor plaintext size on an encrypted backend
+    /// (false → parity must resolve every key via HEAD). Default `true` (the
+    /// filesystem default); S3 + actively-encrypting wrapper override `false`.
+    fn lite_list_carries_logical_facts(&self, _bucket: &str) -> bool {
+        true
+    }
+
     // === Scanning operations ===
 
     /// Scan a deltaspace directory and return all file metadata
@@ -889,6 +900,9 @@ macro_rules! impl_storage_backend_for_box {
             }
             fn supports_native_multipart(&self, bucket: &str) -> bool {
                 (**self).supports_native_multipart(bucket)
+            }
+            fn lite_list_carries_logical_facts(&self, bucket: &str) -> bool {
+                (**self).lite_list_carries_logical_facts(bucket)
             }
 
             async fn scan_deltaspace(

@@ -677,6 +677,17 @@ impl StorageBackend for RoutingBackend {
         self.default_backend().supports_native_multipart(bucket)
     }
 
+    fn lite_list_carries_logical_facts(&self, bucket: &str) -> bool {
+        if let Some(route) = self.routes.get(bucket) {
+            return self.backends[&route.backend_name]
+                .as_ref()
+                .as_ref()
+                .lite_list_carries_logical_facts(bucket);
+        }
+        self.default_backend()
+            .lite_list_carries_logical_facts(bucket)
+    }
+
     // === Scanning operations ===
 
     async fn scan_deltaspace(

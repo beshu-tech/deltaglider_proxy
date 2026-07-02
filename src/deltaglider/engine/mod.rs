@@ -889,6 +889,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         ) && self.storage.supports_native_multipart(bucket)
     }
 
+    /// True when a lite LIST of `bucket` carries trustworthy logical facts
+    /// (real user_metadata + plaintext size/etag). False → parity must HEAD
+    /// every key for ownership + logical size (S3, or an encrypting backend).
+    pub fn lite_list_carries_logical_facts(&self, bucket: &str) -> bool {
+        self.storage.lite_list_carries_logical_facts(bucket)
+    }
+
     /// Return the number of entries in the reference cache (O(1) atomic read).
     pub fn cache_entry_count(&self) -> u64 {
         self.cache.entry_count()

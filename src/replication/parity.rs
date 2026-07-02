@@ -648,14 +648,27 @@ async fn resolve_logical(
     }
     let fresh = head_burst(engine, bucket, &miss_raw).await;
     let mut to_cache: Vec<(String, ParityCacheEntry)> = Vec::new();
-    for (raw, meta) in fresh {
+    for (raw, outcome) in fresh {
         let Ok(dk) = rewrite_key(src_prefix, dst_prefix, &raw) else {
             continue;
         };
-        let stored = lite_stored_etag(source, &dk);
-        let e = cache_entry_from_meta(&meta, stored);
-        apply_logical(source, &dk, &e);
-        to_cache.push((dk, e));
+        match outcome {
+            HeadOutcome::Resolved(meta) => {
+                let stored = lite_stored_etag(source, &dk);
+                let e = cache_entry_from_meta(&meta, stored);
+                apply_logical(source, &dk, &e);
+                to_cache.push((dk, e));
+            }
+            // Raced delete → drop from the compare (it's genuinely gone).
+            HeadOutcome::Gone => {
+                source.remove(&dk);
+            }
+            // Transient HEAD failure → drop from the compare rather than
+            // emitting a false verdict on the untrusted lite size (#16).
+            HeadOutcome::Unresolved => {
+                source.remove(&dk);
+            }
+        }
     }
     cache_put(failures, &rule.name, ParitySide::Source, &to_cache).await;
 }
@@ -683,36 +696,71 @@ async fn resolve_logical_dest(
         }
     }
     let fresh = head_burst(engine, bucket, &miss).await;
+    // When the lite list can't carry provenance (S3 / encrypting dest),
+    // ownership was left provisional in the scan — overlay it from the HEAD.
+    let lite_authoritative = engine.lite_list_carries_logical_facts(bucket);
     let mut to_cache: Vec<(String, ParityCacheEntry)> = Vec::new();
-    for (k, meta) in fresh {
-        let stored = lite_stored_etag(dest, &k);
-        let e = cache_entry_from_meta(&meta, stored);
-        apply_logical(dest, &k, &e);
-        to_cache.push((k, e));
+    for (k, outcome) in fresh {
+        match outcome {
+            HeadOutcome::Resolved(meta) => {
+                if !lite_authoritative {
+                    if let Some(st) = dest.get_mut(&k) {
+                        st.owned_by_rule = Some(event_consumer::owned_by_rule(&meta, &rule.name));
+                    }
+                }
+                let stored = lite_stored_etag(dest, &k);
+                let e = cache_entry_from_meta(&meta, stored);
+                apply_logical(dest, &k, &e);
+                to_cache.push((k, e));
+            }
+            HeadOutcome::Gone => {
+                dest.remove(&k);
+            }
+            HeadOutcome::Unresolved => {
+                dest.remove(&k);
+            }
+        }
     }
     cache_put(failures, &rule.name, ParitySide::Dest, &to_cache).await;
 }
 
-/// Bounded-concurrent HEAD burst (the cache-miss path). Reuses the engine's
-/// per-object `head`; missing objects (raced deletes) are simply dropped.
+/// Outcome of one HEAD in the burst. A NotFound is a raced delete (the object
+/// is genuinely gone → drop it). A TRANSIENT error (throttle/5xx) must NOT be
+/// treated as "resolved to the lite/delta size" — that yields a false
+/// ChecksumMismatch. It is surfaced as Unresolved so the caller keeps the key
+/// out of the compare rather than emitting a bogus verdict (finding #16).
+enum HeadOutcome {
+    Resolved(Box<FileMetadata>),
+    Gone,
+    Unresolved,
+}
+
+/// Bounded-concurrent HEAD burst (the cache-miss path). Returns per-key
+/// outcomes so a transient failure is distinguishable from a raced delete.
 async fn head_burst(
     engine: &DynEngine,
     bucket: &str,
     keys: &[&String],
-) -> Vec<(String, FileMetadata)> {
+) -> Vec<(String, HeadOutcome)> {
     use futures::stream::StreamExt;
     const HEAD_CONCURRENCY: usize = 50;
-    // Own the keys up front (avoids a `&&String` higher-ranked-lifetime tangle
-    // in the stream closure that propagates out as a non-Send future).
     let owned: Vec<String> = keys.iter().map(|k| (*k).clone()).collect();
     futures::stream::iter(owned.into_iter().map(|key| async move {
-        match engine.head(bucket, &key).await {
-            Ok(m) => Some((key, m)),
-            Err(_) => None,
-        }
+        let outcome = match engine.head(bucket, &key).await {
+            Ok(m) => HeadOutcome::Resolved(Box::new(m)),
+            Err(e) => {
+                let s = e.to_string();
+                let s = s.to_ascii_lowercase();
+                if s.contains("not found") || s.contains("nosuchkey") {
+                    HeadOutcome::Gone
+                } else {
+                    HeadOutcome::Unresolved
+                }
+            }
+        };
+        (key, outcome)
     }))
     .buffer_unordered(HEAD_CONCURRENCY)
-    .filter_map(|x| async move { x })
     .collect()
     .await
 }
@@ -903,6 +951,11 @@ pub async fn parity_audit(
     )
     .await?;
 
+    // On a backend whose lite list carries neither user_metadata (ownership)
+    // nor plaintext size/etag (S3, or an actively-encrypting wrapper), EVERY
+    // dest key must be HEAD-resolved: the lite entry can't be trusted for the
+    // orphan-ownership check (#4) or the size/etag compare (#5).
+    let dest_lite_authoritative = engine.lite_list_carries_logical_facts(&rule.destination.bucket);
     let (dst_truncated, _dst_seen) = scan_prefix(
         engine,
         &rule.destination.bucket,
@@ -915,8 +968,15 @@ pub async fn parity_audit(
                 return Ok(false);
             }
             let mut st = ObjState::from_metadata(meta);
-            st.owned_by_rule = Some(event_consumer::owned_by_rule(meta, &rule.name));
-            if needs_logical_resolution(engine, key, meta) {
+            // Ownership from the lite entry is authoritative ONLY when the
+            // backend surfaces user_metadata in lists; otherwise it is
+            // provisional (default not-owned) and overlaid from the HEAD.
+            st.owned_by_rule = if dest_lite_authoritative {
+                Some(event_consumer::owned_by_rule(meta, &rule.name))
+            } else {
+                Some(false)
+            };
+            if !dest_lite_authoritative || needs_logical_resolution(engine, key, meta) {
                 dst_needs_logical.push(key.to_string());
             }
             dest.insert(key.to_string(), st);
@@ -938,9 +998,10 @@ pub async fn parity_audit(
         }
     });
     // Symmetric: a dest ORPHAN (not on source) is "extra on dest" regardless of
-    // its logical size, so it needs no HEAD either. Both `dst_needs_logical` and
-    // `source` are keyed by dest-key, so the intersection is a direct lookup.
-    dst_needs_logical.retain(|dk| source.contains_key(dk));
+    // its logical SIZE, so it needs no size-HEAD. BUT when the lite list can't
+    // carry ownership (S3/encrypting dest), an orphan is exactly the key whose
+    // OWNERSHIP must be HEAD-resolved (delete-safety) — keep those.
+    dst_needs_logical.retain(|dk| source.contains_key(dk) || !dest_lite_authoritative);
 
     // Resolve logical metadata for the delta-eligible keys: parity cache first
     // (HEAD-free — the win), then a bounded HEAD burst for the misses, writing
