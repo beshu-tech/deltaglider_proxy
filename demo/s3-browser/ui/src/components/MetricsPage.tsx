@@ -20,6 +20,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { Typography, Spin, Progress } from 'antd';
 import { useColors } from '../ThemeContext';
 import { formatBytes } from '../utils';
+import { useVisiblePolling } from '../useVisiblePolling';
 import AnalyticsSection from './AnalyticsSection';
 import BucketScanCard from './BucketScanCard';
 import { useAdminConfig } from '../queries/config';
@@ -175,7 +176,6 @@ export default function MetricsPage({ onBack, embedded }: Props) {
   // with whoever else mounted recently (CredentialsModePanel, etc.).
   const { data: adminConfigData } = useAdminConfig();
   const adminConfig = adminConfigData ?? null;
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const prevRef = useRef<{ hits: number; misses: number; http: number; latencySum: number; latencyCount: number } | null>(null);
 
   const tt = chartTooltipStyle(colors);
@@ -218,12 +218,12 @@ export default function MetricsPage({ onBack, embedded }: Props) {
   }, []);
 
   useEffect(() => { fetchMetrics(); }, [fetchMetrics]);
-  useEffect(() => {
-    if (cadence === 'off') return;
-    const ms = cadence === '30s' ? 30_000 : 5_000;
-    intervalRef.current = setInterval(fetchMetrics, ms);
-    return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
-  }, [cadence, fetchMetrics]);
+  // Poll the (heavy) full /_/metrics text ONLY when it's actually on screen:
+  // the Monitoring view is active, cadence isn't off, AND the tab is visible.
+  // On the Analytics view or a backgrounded tab the Prometheus data isn't
+  // rendered, so scraping + parsing it every 5-30s is pure waste.
+  const metricsPollActive = cadence !== 'off' && activeView === 'monitoring';
+  useVisiblePolling(fetchMetrics, cadence === '30s' ? 30_000 : 5_000, metricsPollActive);
 
   if (loading) return <div style={{ display: 'flex', justifyContent: 'center', padding: 64 }}><Spin description="Loading metrics..." /></div>;
 
