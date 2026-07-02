@@ -3,7 +3,7 @@ import type { LifecycleAction, LifecycleRuleConfig } from '../adminApi';
 import BucketPrefixInput from './BucketPrefixInput';
 import FormField from './FormField';
 import { AdvancedDisclosure } from './ruleEditorFields';
-import { lineList, lines } from './ruleEditorHelpers';
+import GlobListTextArea from './GlobListTextArea';
 import { actionKind } from './lifecyclePayload';
 
 type RetainAction = Extract<LifecycleAction, { type: 'retain-newest' }>;
@@ -257,9 +257,9 @@ export default function RuleEditor({
             yamlPath="storage.lifecycle.rules[].include_globs"
             helpText="One glob per line. If non-empty, only matching keys are candidates. Empty means every key under the prefix."
           >
-            <Input.TextArea
-              value={lines(rule.include_globs)}
-              onChange={(e) => onChange({ include_globs: lineList(e.target.value) })}
+            <GlobListTextArea
+              value={rule.include_globs}
+              onChange={(v) => onChange({ include_globs: v })}
               rows={3}
               placeholder={'*.zip\nreleases/**'}
               style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
@@ -270,9 +270,9 @@ export default function RuleEditor({
             yamlPath="storage.lifecycle.rules[].exclude_globs"
             helpText="One glob per line. Keys matching any pattern are skipped. Defaults protect DeltaGlider's config-sync prefix."
           >
-            <Input.TextArea
-              value={lines(rule.exclude_globs)}
-              onChange={(e) => onChange({ exclude_globs: lineList(e.target.value) })}
+            <GlobListTextArea
+              value={rule.exclude_globs}
+              onChange={(v) => onChange({ exclude_globs: v })}
               rows={3}
               placeholder=".deltaglider/**"
               style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}

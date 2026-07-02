@@ -3,7 +3,7 @@ import type { ReplicationRuleConfig } from '../adminApi';
 import BucketPrefixInput from './BucketPrefixInput';
 import FormField from './FormField';
 import { AdvancedDisclosure } from './ruleEditorFields';
-import { lineList, lines } from './ruleEditorHelpers';
+import GlobListTextArea from './GlobListTextArea';
 
 const { Text } = Typography;
 
@@ -137,9 +137,9 @@ export default function ReplicationRuleFields({
             yamlPath="storage.replication.rules[].include_globs"
             helpText="One glob per line. If non-empty, only matching source keys are replicated. Empty means everything under the source prefix."
           >
-            <Input.TextArea
-              value={lines(rule.include_globs)}
-              onChange={(e) => onChange({ include_globs: lineList(e.target.value) })}
+            <GlobListTextArea
+              value={rule.include_globs}
+              onChange={(v) => onChange({ include_globs: v })}
               rows={3}
               placeholder={'*.zip\nreleases/**'}
               style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
@@ -150,9 +150,9 @@ export default function ReplicationRuleFields({
             yamlPath="storage.replication.rules[].exclude_globs"
             helpText="One glob per line. Source keys matching any pattern are skipped."
           >
-            <Input.TextArea
-              value={lines(rule.exclude_globs)}
-              onChange={(e) => onChange({ exclude_globs: lineList(e.target.value) })}
+            <GlobListTextArea
+              value={rule.exclude_globs}
+              onChange={(v) => onChange({ exclude_globs: v })}
               rows={3}
               placeholder=".dg/*"
               style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
