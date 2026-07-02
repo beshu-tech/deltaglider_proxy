@@ -1145,6 +1145,45 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
             .await
     }
 
+    /// BOUNDED-MEMORY relayed-parts store: concatenate the ordered part files
+    /// into ONE temp plaintext file (streamed, `std::io::copy` — never a whole
+    /// `Vec`), then hand it to the streaming `put_passthrough_file` above so the
+    /// encrypt is windowed. The trait default assembles every part into one
+    /// in-RAM `Vec` (O(object)); with the raised passthrough ceiling that OOMs a
+    /// multi-GiB encrypted multipart upload. PassThrough / no-key → delegate.
+    async fn put_passthrough_parts(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        part_paths: &[std::path::PathBuf],
+        metadata: &FileMetadata,
+    ) -> Result<(), StorageError> {
+        if self.current_write_mode() == WriteMode::PassThrough || self.current_key().is_none() {
+            return self
+                .inner
+                .put_passthrough_parts(bucket, prefix, filename, part_paths, metadata)
+                .await;
+        }
+        let parts = part_paths.to_vec();
+        let joined = tokio::task::spawn_blocking(
+            move || -> Result<tempfile::NamedTempFile, StorageError> {
+                let mut tmp = tempfile::NamedTempFile::new().map_err(io_to_storage_error)?;
+                for p in &parts {
+                    let mut f = std::fs::File::open(p).map_err(io_to_storage_error)?;
+                    std::io::copy(&mut f, tmp.as_file_mut()).map_err(io_to_storage_error)?;
+                }
+                std::io::Write::flush(&mut tmp).map_err(io_to_storage_error)?;
+                Ok(tmp)
+            },
+        )
+        .await
+        .map_err(|e| StorageError::Other(format!("relay-join task: {e}")))??;
+        // Delegate to the windowed encrypt-to-file path (bounded).
+        self.put_passthrough_file(bucket, prefix, filename, joined.path(), metadata)
+            .await
+    }
+
     // put_passthrough_chunked: re-slices incoming chunks into 64 KiB
     // plaintext windows, encrypts each into a framed ciphertext chunk,
     // and forwards a new `Vec<Bytes>` (header + all frames) to the
@@ -1788,6 +1827,32 @@ mod tests {
             assert!(
                 is_chunked_encrypted(&stored_meta),
                 "size {size}: not chunked on disk"
+            );
+
+            // Same via the RELAYED-PARTS sink (the multipart-upload path): split
+            // into 3 part files, store, read back byte-identical.
+            let third = size / 3;
+            let mut part_files = Vec::new();
+            let mut off = 0usize;
+            for len in [third, third, size - 2 * third] {
+                let mut pf = tempfile::NamedTempFile::new().unwrap();
+                std::io::Write::write_all(&mut pf, &plaintext[off..off + len]).unwrap();
+                off += len;
+                part_files.push(pf);
+            }
+            let part_paths: Vec<std::path::PathBuf> =
+                part_files.iter().map(|f| f.path().to_path_buf()).collect();
+            wrapper
+                .put_passthrough_parts("b", "p", "parts.bin", &part_paths, &meta)
+                .await
+                .unwrap_or_else(|e| panic!("size {size}: parts put failed: {e:?}"));
+            let got_parts = wrapper
+                .get_passthrough("b", "p", "parts.bin")
+                .await
+                .unwrap();
+            assert_eq!(
+                got_parts, plaintext,
+                "size {size}: parts roundtrip mismatch"
             );
         }
     }

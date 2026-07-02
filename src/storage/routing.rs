@@ -530,6 +530,48 @@ impl StorageBackend for RoutingBackend {
         )
     }
 
+    // Forward the FILE + PARTS sinks so a routed EncryptingBackend's streaming
+    // overrides are reached — the trait default `tokio::fs::read`s the whole
+    // object into RAM (O(object), no cap), which defeats the bounded-memory
+    // guarantee for the production multi-backend shape.
+    async fn put_passthrough_file(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        source_path: &std::path::Path,
+        metadata: &FileMetadata,
+    ) -> Result<(), StorageError> {
+        route_existing!(
+            self,
+            bucket,
+            put_passthrough_file,
+            prefix,
+            filename,
+            source_path,
+            metadata
+        )
+    }
+
+    async fn put_passthrough_parts(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        part_paths: &[std::path::PathBuf],
+        metadata: &FileMetadata,
+    ) -> Result<(), StorageError> {
+        route_existing!(
+            self,
+            bucket,
+            put_passthrough_parts,
+            prefix,
+            filename,
+            part_paths,
+            metadata
+        )
+    }
+
     async fn get_passthrough_metadata(
         &self,
         bucket: &str,
