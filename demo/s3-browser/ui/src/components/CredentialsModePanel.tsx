@@ -29,7 +29,6 @@
  * plumbing applies. Dirty state + ApplyDialog + AdminPage's
  * sidebar-dot coordination all free from `useDirtySection`.
  */
-import { useRef } from 'react';
 import {
   Alert,
   Input,
@@ -110,13 +109,11 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
   // auto-detect; the literal `"none"` means open access.
   const authMode: AuthMode = form.authentication === 'none' ? 'none' : 'auto';
 
-  // Latest form, read by the Modal.confirm onOk below. The modal captures its
-  // onOk closure when opened; without this ref it would write a stale `form`
-  // snapshot and clobber any field the user edits while the modal is open.
-  const formRef = useRef(form);
-  formRef.current = form;
-
   // ── Mutators ───────────────────────────────────────────
+  // All write through `setForm((prev) => …)` so a burst of edits — or the
+  // Modal.confirm onOk firing after the user edited another field while the
+  // modal was open — always builds on the freshest state, never a stale
+  // render snapshot (that snapshot staleness was the whole bug class).
 
   const setIamMode = (next: IamMode) => {
     if (next === form.iam_mode) return;
@@ -150,25 +147,25 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
         okText: 'Switch to Declarative',
         okButtonProps: { danger: true },
         cancelText: 'Cancel',
-        onOk: () => setForm({ ...formRef.current, iam_mode: 'declarative' }),
+        onOk: () => setForm((prev) => ({ ...prev, iam_mode: 'declarative' })),
       });
       return;
     }
-    setForm({ ...form, iam_mode: next });
+    setForm((prev) => ({ ...prev, iam_mode: next }));
   };
 
   const setAuthMode = (next: AuthMode) => {
-    setForm({
-      ...form,
+    setForm((prev) => ({
+      ...prev,
       // `undefined` means "absent from the body" which the server
       // interprets as auto-detect. `"none"` is the explicit
       // open-access opt-in.
       authentication: next === 'none' ? 'none' : undefined,
-    });
+    }));
   };
 
-  const setAccessKey = (v: string) => setForm({ ...form, access_key_id: v || undefined });
-  const setSecretKey = (v: string) => setForm({ ...form, secret_access_key: v || undefined });
+  const setAccessKey = (v: string) => setForm((prev) => ({ ...prev, access_key_id: v || undefined }));
+  const setSecretKey = (v: string) => setForm((prev) => ({ ...prev, secret_access_key: v || undefined }));
 
   if (error) {
     return <Alert type="error" showIcon message="Failed to load" description={error} />;

@@ -218,14 +218,20 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
   }, []);
 
   // ── Row + field mutators (edit the editor value directly) ──
-  const setField = (patch: Partial<WebhookFormState>) => setForm({ ...form, ...patch });
+  // Functional updater: a burst of edits within one tick always builds on the
+  // freshest state (`setForm` from useSectionEditor supports `prev => next`),
+  // never a closed-over render snapshot. `setField` accepts a flat patch OR a
+  // `prev => patch` fn so row mutators can splice against the latest rows.
+  const setField = (
+    patch: Partial<WebhookFormState> | ((prev: WebhookFormState) => Partial<WebhookFormState>),
+  ) => setForm((prev) => ({ ...prev, ...(typeof patch === 'function' ? patch(prev) : patch) }));
 
   const updateUrl = (id: string, url: string) =>
-    setField({ urlRows: form.urlRows.map((r) => (r.id === id ? { ...r, url } : r)) });
+    setField((prev) => ({ urlRows: prev.urlRows.map((r) => (r.id === id ? { ...r, url } : r)) }));
   const addUrl = () =>
-    setField({ urlRows: [...form.urlRows, { id: nextId(), url: '' } as WebhookUrlRow] });
+    setField((prev) => ({ urlRows: [...prev.urlRows, { id: nextId(), url: '' } as WebhookUrlRow] }));
   const removeUrl = (id: string) =>
-    setField({ urlRows: form.urlRows.filter((r) => r.id !== id) });
+    setField((prev) => ({ urlRows: prev.urlRows.filter((r) => r.id !== id) }));
 
   // Header rows are edited inline via RowListEditor in the raw-webhook block;
   // the value field's MaskedSecretInput emits `{ value, masked: false }` so a

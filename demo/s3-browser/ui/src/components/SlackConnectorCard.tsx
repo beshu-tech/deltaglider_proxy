@@ -54,7 +54,9 @@ type SlackMode = 'webhook' | 'bot';
 
 interface Props {
   form: WebhookFormState;
-  setField: (patch: Partial<WebhookFormState>) => void;
+  setField: (
+    patch: Partial<WebhookFormState> | ((prev: WebhookFormState) => Partial<WebhookFormState>),
+  ) => void;
   nextId: () => string;
   /** Live validation errors that belong to the Slack card (shown inline). */
   errors: string[];
@@ -107,70 +109,74 @@ export default function SlackConnectorCard({
   };
 
   // ── Glob row mutators (stable-id keyed, never array index) ──
+  // All read the LATEST rows via the `prev => patch` form of setField — a burst
+  // of edits in one tick never clobbers a sibling by building on a stale snapshot.
   const updateGlob = (
     key: 'slackIncludeRows' | 'slackExcludeRows',
     id: string,
     glob: string,
   ) =>
-    setField({
-      [key]: form[key].map((r) => (r.id === id ? { ...r, glob } : r)),
-    } as Partial<WebhookFormState>);
+    setField((prev) => ({
+      [key]: prev[key].map((r) => (r.id === id ? { ...r, glob } : r)),
+    } as Partial<WebhookFormState>));
   const addGlob = (key: 'slackIncludeRows' | 'slackExcludeRows') =>
-    setField({
-      [key]: [...form[key], { id: nextId(), glob: '' } as SlackGlobRow],
-    } as Partial<WebhookFormState>);
+    setField((prev) => ({
+      [key]: [...prev[key], { id: nextId(), glob: '' } as SlackGlobRow],
+    } as Partial<WebhookFormState>));
   const removeGlob = (key: 'slackIncludeRows' | 'slackExcludeRows', id: string) =>
-    setField({
-      [key]: form[key].filter((r) => r.id !== id),
-    } as Partial<WebhookFormState>);
+    setField((prev) => ({
+      [key]: prev[key].filter((r) => r.id !== id),
+    } as Partial<WebhookFormState>));
 
   // ── Channel-routing row mutators (stable-id keyed, never array index) ──
   const updateRoute = (id: string, patch: Partial<SlackRouteRow>) =>
-    setField({
-      slackRoutes: form.slackRoutes.map((r) => (r.id === id ? { ...r, ...patch } : r)),
-    });
+    setField((prev) => ({
+      slackRoutes: prev.slackRoutes.map((r) => (r.id === id ? { ...r, ...patch } : r)),
+    }));
   const addRoute = () =>
-    setField({
+    setField((prev) => ({
       slackRoutes: [
-        ...form.slackRoutes,
+        ...prev.slackRoutes,
         { id: nextId(), name: '', bucket: '', prefixGlobs: [], channel: '' } as SlackRouteRow,
       ],
-    });
+    }));
   const removeRoute = (id: string) =>
-    setField({ slackRoutes: form.slackRoutes.filter((r) => r.id !== id) });
+    setField((prev) => ({ slackRoutes: prev.slackRoutes.filter((r) => r.id !== id) }));
 
   // Nested glob-row mutators scoped to ONE route (stable-id keyed throughout).
   const updateRouteGlob = (routeId: string, globId: string, glob: string) =>
-    setField({
-      slackRoutes: form.slackRoutes.map((r) =>
+    setField((prev) => ({
+      slackRoutes: prev.slackRoutes.map((r) =>
         r.id === routeId
           ? { ...r, prefixGlobs: r.prefixGlobs.map((g) => (g.id === globId ? { ...g, glob } : g)) }
           : r,
       ),
-    });
+    }));
   const addRouteGlob = (routeId: string) =>
-    setField({
-      slackRoutes: form.slackRoutes.map((r) =>
+    setField((prev) => ({
+      slackRoutes: prev.slackRoutes.map((r) =>
         r.id === routeId
           ? { ...r, prefixGlobs: [...r.prefixGlobs, { id: nextId(), glob: '' } as SlackGlobRow] }
           : r,
       ),
-    });
+    }));
   const removeRouteGlob = (routeId: string, globId: string) =>
-    setField({
-      slackRoutes: form.slackRoutes.map((r) =>
+    setField((prev) => ({
+      slackRoutes: prev.slackRoutes.map((r) =>
         r.id === routeId
           ? { ...r, prefixGlobs: r.prefixGlobs.filter((g) => g.id !== globId) }
           : r,
       ),
-    });
+    }));
 
   const toggleKind = (kind: string, on: boolean) => {
-    const set = new Set(form.slackNotifyKinds);
-    if (on) set.add(kind);
-    else set.delete(kind);
     // Preserve canonical ordering so the YAML diff stays stable.
-    setField({ slackNotifyKinds: SLACK_NOTIFY_KINDS.filter((k) => set.has(k)) });
+    setField((prev) => {
+      const set = new Set(prev.slackNotifyKinds);
+      if (on) set.add(kind);
+      else set.delete(kind);
+      return { slackNotifyKinds: SLACK_NOTIFY_KINDS.filter((k) => set.has(k)) };
+    });
   };
 
   // ── LEFT column: header + the whole config form ──
@@ -426,7 +432,9 @@ function WebhookModeFields({
   updateUrl: (id: string, url: string) => void;
   addUrl: () => void;
   removeUrl: (id: string) => void;
-  setField: (patch: Partial<WebhookFormState>) => void;
+  setField: (
+    patch: Partial<WebhookFormState> | ((prev: WebhookFormState) => Partial<WebhookFormState>),
+  ) => void;
   colors: ReturnType<typeof useColors>;
 }) {
   return (
@@ -498,7 +506,9 @@ function BotModeFields({
   inputRadius,
 }: {
   form: WebhookFormState;
-  setField: (patch: Partial<WebhookFormState>) => void;
+  setField: (
+    patch: Partial<WebhookFormState> | ((prev: WebhookFormState) => Partial<WebhookFormState>),
+  ) => void;
   inputRadius: React.CSSProperties;
 }) {
   return (
