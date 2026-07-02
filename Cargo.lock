@@ -1146,7 +1146,7 @@ dependencies = [
 
 [[package]]
 name = "deltaglider_proxy"
-version = "1.9.3"
+version = "1.9.4"
 dependencies = [
  "aes-gcm",
  "arc-swap",
