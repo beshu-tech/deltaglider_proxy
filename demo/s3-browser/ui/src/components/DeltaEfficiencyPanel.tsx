@@ -28,6 +28,7 @@ import {
 } from '../adminApi';
 import { useBucketNames } from '../queries/backends';
 import HoverHint from './HoverHint';
+import { contentColumn, CONTENT_WIDE } from './shared-styles';
 
 /**
  * Per-row verification state, keyed by prefix. Stored at the
@@ -189,14 +190,11 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
   }, [response]);
 
   return (
-    <div style={{ padding: '16px 24px' }}>
+    <div style={contentColumn(CONTENT_WIDE)}>
       <Paragraph style={{ marginBottom: 12, color: colors.TEXT_SECONDARY }}>
-        Scan a bucket and surface deltaspaces where the reference
-        baseline doesn't compress its siblings — typically the median
-        delta is the same size as the reference, or larger. Re-uploading
-        such a prefix lets the proxy pick a better seed and recovers
-        most of the stored bytes. Read-only diagnostic; you decide what
-        to re-upload.
+        Find prefixes whose reference baseline compresses its siblings poorly.
+        Re-uploading such a prefix lets the proxy pick a better seed and recover
+        most of the stored bytes. Read-only — you decide what to re-upload.
       </Paragraph>
 
       <Space wrap style={{ marginBottom: 16 }}>

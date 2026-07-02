@@ -133,21 +133,33 @@ export default function AuditLogPanel({ onSessionExpired }: Props) {
         gap: 16,
       }}
     >
-      <Alert
-        type="info"
-        showIcon
-        icon={<FileTextOutlined />}
-        message="In-memory audit ring"
-        description={
-          <>
-            Shows the most-recent {entries.length === 0 ? '' : entries.length + ' '}
-            audit entries from this process. The ring is bounded (default 500
-            entries; set <code>DGP_AUDIT_RING_SIZE</code> to change). Stdout /
-            your log pipeline remains authoritative for long-term audit —
-            this panel surfaces recent activity for quick inspection.
-          </>
-        }
-      />
+      {/* One quiet line — TabHeader already titles the page "Audit log".
+          Stdout / your log pipeline stays authoritative for long-term audit. */}
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 8,
+          padding: '8px 12px',
+          borderLeft: `3px solid ${colors.ACCENT_BLUE}`,
+          background: colors.BG_ELEVATED,
+          borderRadius: 6,
+          fontSize: 12.5,
+          color: colors.TEXT_SECONDARY,
+          lineHeight: 1.5,
+        }}
+      >
+        <FileTextOutlined style={{ color: colors.ACCENT_BLUE, flexShrink: 0 }} aria-hidden />
+        <span>
+          Newest {entries.length || 500} entries kept in memory for quick inspection.{' '}
+          <code
+            title="Environment variable controlling the ring size (default 500)"
+            style={{ fontFamily: 'var(--font-mono)', fontSize: 11, opacity: 0.6, color: colors.TEXT_MUTED }}
+          >
+            DGP_AUDIT_RING_SIZE
+          </code>
+        </span>
+      </div>
 
       {error && <Alert type="error" showIcon message="Fetch failed" description={error} />}
 

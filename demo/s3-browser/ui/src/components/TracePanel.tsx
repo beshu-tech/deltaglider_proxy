@@ -118,15 +118,10 @@ export default function TracePanel({ onSessionExpired }: Props) {
         gap: 16,
       }}
     >
-      {/* Request form */}
+      {/* Request form — TabHeader already titles the page "Trace". */}
       <div style={cardStyle}>
-        <SectionHeader
-          icon={<ExperimentOutlined />}
-          title="Synthetic request"
-          description="Evaluate the admission chain against a request shape of your choosing. No real traffic hits the backends — this is a dry-run against the live chain."
-        />
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-          <FormField label="Method" helpText="HTTP verb to trace.">
+          <FormField label="Method" helpText="HTTP verb to trace. No real traffic hits the backends — this is a dry-run against the live chain.">
             <Radio.Group
               value={method}
               onChange={(e) => setMethod(e.target.value)}
