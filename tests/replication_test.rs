@@ -2398,3 +2398,102 @@ async fn test_replication_budget_truncation_keeps_cursor_and_resumes() {
         .unwrap();
     assert_eq!(dst.contents().len(), 5, "tail fully drained across runs");
 }
+
+const TIMEOUT_RULE_YAML: &str = "
+replication:
+  enabled: true
+  tick_interval: \"30s\"
+  object_timeout: \"1s\"
+  rules:
+    - name: timeout-rule
+      enabled: true
+      source:
+        bucket: to-src
+        prefix: \"\"
+      destination:
+        bucket: to-dst
+        prefix: \"\"
+      interval: \"1h\"
+      batch_size: 10
+";
+
+/// Per-object copy timeout (Phase A) — the Elapsed arm was untested. With a 1s
+/// object_timeout and a 3s per-object test barrier, every object exceeds its
+/// deadline: the run records errors and copies nothing, exercising the timeout
+/// branch (worker.rs copy_result Err(_elapsed)).
+#[tokio::test]
+async fn test_replication_object_timeout_fires_and_records_error() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(TIMEOUT_RULE_YAML)
+        .env("DGP_TEST_COPY_STALL_MS", "3000") // > the 1s object_timeout
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    for b in ["to-src", "to-dst"] {
+        client.create_bucket().bucket(b).send().await.ok();
+    }
+    for i in 0..2 {
+        client
+            .put_object()
+            .bucket("to-src")
+            .key(format!("obj-{i}.bin"))
+            .body(ByteStream::from(vec![i as u8; 1024]))
+            .send()
+            .await
+            .expect("seed");
+    }
+    let admin = admin_http_client(&server.endpoint()).await;
+    let run = fire_run_now(&admin, &server.endpoint(), "timeout-rule").await;
+
+    // Every object timed out → nothing copied, errors recorded.
+    assert_eq!(
+        run["objects_processed"].as_i64(),
+        Some(0),
+        "timed-out objects must not count as copied: {run}"
+    );
+    assert!(
+        run["errors"].as_i64().unwrap_or(0) >= 1,
+        "the object-timeout branch must record a failure: {run}"
+    );
+    // Dest stays empty — no partial/torn write from a timed-out copy.
+    let dst = client
+        .list_objects_v2()
+        .bucket("to-dst")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        dst.contents().len(),
+        0,
+        "timed-out copy must not land on dest"
+    );
+
+    // A failure row is surfaced (the timeout message).
+    let failures: Value = admin
+        .get(format!(
+            "{}/_/api/admin/jobs/replication:timeout-rule/failures",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let has_timeout = failures["failures"]
+        .as_array()
+        .map(|a| {
+            a.iter().any(|f| {
+                f["error"]
+                    .as_str()
+                    .map(|m| m.contains("timed out"))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    assert!(
+        has_timeout,
+        "a 'timed out' failure must be recorded: {failures}"
+    );
+}

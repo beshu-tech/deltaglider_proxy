@@ -81,6 +81,16 @@ async fn maybe_object_barrier() {
     }
 }
 
+/// Test-only stall placed INSIDE the per-object timeout scope so the
+/// object-timeout Elapsed arm is deterministically testable. Sleeps
+/// `DGP_TEST_COPY_STALL_MS` ms when set (>0). Inert in prod (unset → no-op).
+async fn maybe_copy_stall() {
+    let ms: u64 = crate::config::env_parse_with_default("DGP_TEST_COPY_STALL_MS", 0);
+    if ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+}
+
 /// User-metadata key stamped on objects created by replication so the
 /// delete pass (H2 fix) can tell its own copies apart from objects
 /// written by other rules or operators sharing the same destination
@@ -761,16 +771,20 @@ async fn copy_one_object(
     };
     // Bound the copy: a stalled object fails fast instead of hanging until
     // lease lapse. `Elapsed` routes into the Err arm below.
+    let copy_fut = async {
+        // Test-only stall INSIDE the timeout scope (inert in prod) so the
+        // object-timeout Elapsed arm is deterministically exercisable.
+        maybe_copy_stall().await;
+        copy_object_with_retries(engine, transfer).await
+    };
     let copy_result = match object_timeout {
-        Some(timeout) => {
-            match tokio::time::timeout(timeout, copy_object_with_retries(engine, transfer)).await {
-                Ok(r) => r,
-                Err(_elapsed) => {
-                    Err(format!("object copy timed out after {}s", timeout.as_secs()).into())
-                }
+        Some(timeout) => match tokio::time::timeout(timeout, copy_fut).await {
+            Ok(r) => r,
+            Err(_elapsed) => {
+                Err(format!("object copy timed out after {}s", timeout.as_secs()).into())
             }
-        }
-        None => copy_object_with_retries(engine, transfer).await,
+        },
+        None => copy_fut.await,
     };
 
     match copy_result {

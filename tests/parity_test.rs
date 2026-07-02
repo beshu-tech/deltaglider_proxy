@@ -15,7 +15,7 @@
 mod common;
 
 use aws_sdk_s3::primitives::ByteStream;
-use common::{admin_http_client, wait_for_run, TestServer};
+use common::{admin_http_client, minio_endpoint_url, wait_for_run, TestServer, MINIO_BUCKET};
 use serde_json::Value;
 
 // Replication rule + a lifecycle rule (the latter only to assert that
@@ -64,7 +64,11 @@ async fn parity_version(client: &reqwest::Client, endpoint: &str) -> u64 {
 }
 
 async fn verify(admin: &reqwest::Client, endpoint: &str) -> Value {
-    let url = format!("{endpoint}/_/api/admin/jobs/replication:parity-a-to-b/verify");
+    verify_rule(admin, endpoint, "parity-a-to-b").await
+}
+
+async fn verify_rule(admin: &reqwest::Client, endpoint: &str, rule: &str) -> Value {
+    let url = format!("{endpoint}/_/api/admin/jobs/replication:{rule}/verify");
     // The jobs/parity-version route is public (like iam/version), so the settle
     // barrier can be polled with a plain, unauthenticated client. `admin` is
     // still used for the verify POST/GET (those remain session-gated).
@@ -257,5 +261,132 @@ async fn test_parity_audit_lifecycle() {
         lc_cancel.status().as_u16(),
         404,
         "verify cancel is replication-only"
+    );
+}
+
+/// Wave-3 regression (finding #4/#23): on an S3 backend the lite LIST carries
+/// NO user_metadata, so parity must HEAD-resolve ownership. This plants BOTH a
+/// rule-OWNED orphan (source deleted after copy → owned_by_rule=true) and a
+/// FOREIGN object (never replicated) on the dest and asserts parity tells them
+/// apart — the exact distinction the filesystem test can't exercise.
+#[tokio::test]
+async fn test_parity_orphan_ownership_via_head_on_s3() {
+    skip_unless_minio!();
+    let uniq = format!("{}", std::process::id());
+    let src = format!("parity-s3-src-{uniq}");
+    let dst = format!("parity-s3-dst-{uniq}");
+    let rule_yaml = format!(
+        "
+replication:
+  enabled: true
+  tick_interval: \"30s\"
+  rules:
+    - name: parity-s3
+      enabled: true
+      source: {{ bucket: {src}, prefix: \"\" }}
+      destination: {{ bucket: {dst}, prefix: \"\" }}
+      interval: \"1h\"
+      batch_size: 100
+      replicate_deletes: false
+"
+    );
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .s3_endpoint(&minio_endpoint_url())
+        .bucket(MINIO_BUCKET)
+        .extra_yaml_storage_section(&rule_yaml)
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    for b in [&src, &dst] {
+        client.create_bucket().bucket(b).send().await.ok();
+    }
+
+    // Seed 2 source objects and replicate (stamps the provenance marker).
+    for i in 0..2 {
+        client
+            .put_object()
+            .bucket(&src)
+            .key(format!("obj-{i}.bin"))
+            .body(aws_sdk_s3::primitives::ByteStream::from(
+                format!("v{i}").into_bytes(),
+            ))
+            .send()
+            .await
+            .expect("seed");
+    }
+    let admin = admin_http_client(&server.endpoint()).await;
+    let resp = admin
+        .post(format!(
+            "{}/_/api/admin/jobs/replication:parity-s3/run-now",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 202);
+    let run = wait_for_run(&admin, &server.endpoint(), "parity-s3").await;
+    assert_eq!(run["status"].as_str(), Some("succeeded"), "{run}");
+
+    // A FOREIGN object placed directly on the dest (no provenance marker).
+    client
+        .put_object()
+        .bucket(&dst)
+        .key("foreign.bin")
+        .body(aws_sdk_s3::primitives::ByteStream::from(
+            b"not ours".to_vec(),
+        ))
+        .send()
+        .await
+        .expect("foreign");
+
+    // A rule-OWNED orphan: delete one source object so its replicated copy is
+    // now source-less but still carries the provenance marker.
+    client
+        .delete_object()
+        .bucket(&src)
+        .key("obj-0.bin")
+        .send()
+        .await
+        .expect("delete source");
+
+    let out = verify_rule(&admin, &server.endpoint(), "parity-s3").await;
+    // Both dest-extras are orphans (not on source): the foreign one AND the
+    // owned orphan. The KEY assertion is that ownership was HEAD-resolved on
+    // S3 (lite has no user_metadata) — the owned orphan is NOT misreported as
+    // foreign. Parity exposes the owned/foreign split in the orphan samples.
+    assert_eq!(
+        out["orphan_on_dest"].as_u64(),
+        Some(2),
+        "both extras are orphans: {out}"
+    );
+    // Ownership surfaces as the annotated remediation reason: HEAD-resolved
+    // ownership on S3 must diagnose the deleted-source copy as rule-owned and
+    // the directly-placed object as foreign — NOT both foreign (the #4 bug).
+    let samples = out["orphan_samples"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let reason = |s: &serde_json::Value| {
+        s["remediation"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    };
+    let owned = samples
+        .iter()
+        .filter(|s| reason(s) == "rule_owned_orphan_source_deleted")
+        .count();
+    let foreign = samples
+        .iter()
+        .filter(|s| reason(s) == "foreign_orphan")
+        .count();
+    assert_eq!(
+        owned, 1,
+        "the deleted-source copy must be a RULE-OWNED orphan (HEAD-resolved): {out}"
+    );
+    assert_eq!(
+        foreign, 1,
+        "the directly-placed object must be a FOREIGN orphan: {out}"
     );
 }

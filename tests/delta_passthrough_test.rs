@@ -22,6 +22,18 @@ use aws_sdk_s3::primitives::ByteStream;
 use common::{admin_http_client, generate_binary, mutate_binary, TestServer};
 use serde_json::Value;
 
+/// True when the `xdelta3` CLI is on PATH — CI always has it (the delta codec
+/// shells out to it). When present, the delta-passthrough fast path MUST fire;
+/// the escape hatch below applies ONLY to a dev machine genuinely missing it,
+/// so the gate can't pass vacuously in CI (the repo's own >0 rule).
+fn xdelta3_available() -> bool {
+    std::process::Command::new("xdelta3")
+        .arg("-V")
+        .output()
+        .map(|o| o.status.success() || !o.stderr.is_empty())
+        .unwrap_or(false)
+}
+
 const RULE_YAML: &str = "
 replication:
   enabled: true
@@ -171,8 +183,15 @@ async fn delta_passthrough_replicates_verbatim_and_is_idempotent() {
     let dp = run1["delta_passthrough"].as_i64().unwrap_or(0);
     let saved = run1["bytes_egress_saved"].as_i64().unwrap_or(0);
 
-    if dp >= 1 {
-        // Fast path fired (xdelta3 available, v2 stored as delta).
+    if xdelta3_available() {
+        // xdelta3 present (always in CI) → the fast path MUST fire and save
+        // egress. No vacuous pass: a regression that stops delta-shipping fails.
+        assert!(
+            dp >= 1,
+            "xdelta3 is available but the delta-passthrough fast path did not \
+             fire (delta_passthrough=0): {}",
+            run1
+        );
         assert!(
             saved > 0,
             "delta_passthrough run must save egress bytes: {}",
@@ -180,9 +199,8 @@ async fn delta_passthrough_replicates_verbatim_and_is_idempotent() {
         );
     } else {
         eprintln!(
-            "NOTE: delta_passthrough=0 — v2 did not store as a delta on this \
-             machine (xdelta3 /dev/stdin quirk?); skipping fast-path totals. \
-             Correctness (byte-identical dest) still asserted. run={}",
+            "NOTE: xdelta3 not on PATH — skipping fast-path totals (dev machine \
+             only). Correctness (byte-identical dest) still asserted. run={}",
             run1
         );
     }
@@ -240,14 +258,16 @@ async fn delta_passthrough_falls_back_on_different_dest_reference() {
     );
 
     let run = latest_run(&server).await;
-    // The mismatched-reference object must have fallen back to a non-fast
-    // path: at least one copied object was NOT delta_passthrough'd. (Other
-    // strategy counts are derivable as copied − delta_passthrough.)
+    // The mismatched-reference object must NOT have fast-path-shipped: the dest
+    // reference mismatches, so the fast path is INELIGIBLE — dp MUST be 0 (not
+    // merely `copied - dp >= 1`, which passed vacuously whether or not the fast
+    // path fires). At least one object was copied via the fallback.
     let dp = run["delta_passthrough"].as_i64().unwrap_or(0);
     let copied = run["objects_processed"].as_i64().unwrap_or(0);
-    assert!(
-        copied - dp >= 1,
-        "mismatched dest reference must route through a non-fast path: {}",
+    assert!(copied >= 1, "at least one object copied: {}", run);
+    assert_eq!(
+        dp, 0,
+        "a mismatched dest reference is fast-path-INELIGIBLE — must fall back (no fast-path ships): {}",
         run
     );
 }

@@ -151,6 +151,7 @@ fn warn_active_test_seams() {
         "DGP_TEST_PART_DELAY_MS",
         "DGP_TEST_OBJECT_BARRIER",
         "DGP_TEST_OBJECT_DELAY_MS",
+        "DGP_TEST_COPY_STALL_MS",
         "DGP_TEST_MAX_JOB_PAGES",
     ];
     let active: Vec<&str> = SEAMS
