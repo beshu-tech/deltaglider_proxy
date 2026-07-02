@@ -189,6 +189,20 @@ export default function JobDrawer({
     return <Empty description="This job no longer exists — it may have been removed or already applied. Close this panel." />;
   })();
 
+  // A rule-kind jobId that resolves to NEITHER a live editor rule NOR a server
+  // row is a stale draft reference (the draft was discarded or renamed while the
+  // drawer pointed at it). Close instead of flashing the "no longer exists"
+  // Empty — that copy is for genuinely-vanished one-off/server jobs.
+  const staleRuleRef =
+    !!parsed &&
+    (parsed.subsystem === 'replication' || parsed.subsystem === 'lifecycle') &&
+    replIndex < 0 &&
+    lcIndex < 0 &&
+    !serverRow;
+  useEffect(() => {
+    if (staleRuleRef) onClose();
+  }, [staleRuleRef, onClose]);
+
   const runsTable = (
     <RecordList
       rows={liveRuns}

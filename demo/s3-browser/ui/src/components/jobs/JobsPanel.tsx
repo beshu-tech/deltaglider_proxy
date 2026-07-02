@@ -202,6 +202,7 @@ export default function JobsPanel({ onSessionExpired }: Props) {
 
   // ── Drawer + creation modals. ──
   const [drawerJobId, setDrawerJobId] = useState<string | null>(null);
+  const [newJobMenuOpen, setNewJobMenuOpen] = useState(false);
   const [reencryptOpen, setReencryptOpen] = useState(false);
   const [migrateOpen, setMigrateOpen] = useState(false);
   const [actionBusy, setActionBusy] = useState<string | null>(null);
@@ -256,6 +257,10 @@ export default function JobsPanel({ onSessionExpired }: Props) {
       { key: 'migrate', label: 'Migrate bucket… — one-off move' },
     ],
     onClick: ({ key }: { key: string }) => {
+      // Close the menu explicitly: opening a drawer / modal synchronously in
+      // these handlers otherwise leaves the dropdown lingering over the drawer
+      // until the next click.
+      setNewJobMenuOpen(false);
       if (key === 'replication') {
         const rule = emptyReplicationRule(repl.value.rules);
         repl.setValue((cur) => ({ ...cur, rules: [...cur.rules, rule] }));
@@ -441,7 +446,12 @@ export default function JobsPanel({ onSessionExpired }: Props) {
             {displayRows.length} job{displayRows.length === 1 ? '' : 's'} — tap one for definition,
             runs, and failures.
           </Text>
-          <Dropdown menu={newJobMenu} trigger={['click']}>
+          <Dropdown
+            menu={newJobMenu}
+            trigger={['click']}
+            open={newJobMenuOpen}
+            onOpenChange={setNewJobMenuOpen}
+          >
             <Button type="primary" icon={<PlusOutlined />}>
               New job
             </Button>
