@@ -27,8 +27,10 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Alert, Button, Space, Typography, message } from 'antd';
 import { PlusOutlined } from '@ant-design/icons';
 import type { AdminConfig } from '../adminApi';
+import { useQueryClient } from '@tanstack/react-query';
 import { useAdminConfig } from '../queries/config';
 import { useBackends, useBucketNames } from '../queries/backends';
+import { qk } from '../queries/keys';
 import { useCardStyles } from './shared-styles';
 import ApplyDialog from './ApplyDialog';
 import BucketCard from './BucketCard';
@@ -99,10 +101,11 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
 
   // Config (backends + default backend + global compression) from the cache.
   const { data: cfg } = useAdminConfig();
+  const queryClient = useQueryClient();
   // Backends + real bucket names from the SHARED query cache — not a per-mount
   // Promise.all. `useBucketNames` derives names from the cached origins map, so
   // this panel no longer re-fetches /buckets that other consumers already hold.
-  const fallbackBackends = useBackends().data ?? [];
+  const fallbackBackends = useBackends().data?.backends ?? [];
   const realBuckets = useBucketNames();
   const [createOpen, setCreateOpen] = useState(false);
   /** Expanded row: `real:<name>` for buckets, the row `_id` for drafts. */
@@ -364,7 +367,9 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
         canAdmin
         onClose={() => setCreateOpen(false)}
         onCreated={(name) => {
-          void loadSideData();
+          // Refresh the shared origins cache so the new bucket appears in the
+          // list (and everywhere else that reads useBucketOrigins).
+          void queryClient.invalidateQueries({ queryKey: qk.backends.origins() });
           setExpandedKey(`real:${name}`);
         }}
       />
