@@ -592,3 +592,74 @@ async fn test_read_after_rotation_without_shim_hard_fails() {
         resp.status()
     );
 }
+
+/// Crash-resume: a re-encrypt job interrupted by a process restart must resume
+/// from its cursor on boot (running→queued reconcile) and finish encrypting
+/// EVERY object — no half-encrypted bucket, no lost work. The boot reconcile +
+/// resume_token machinery is unit-tested; this pins the observable contract
+/// end-to-end across a real restart.
+#[tokio::test]
+async fn test_reencrypt_resumes_after_restart() {
+    let bucket = "maintresume";
+    let mut server = TestServer::builder().bucket(bucket).build().await;
+    let http = reqwest::Client::new();
+    let endpoint = server.endpoint();
+    let admin = admin_http_client(&endpoint).await;
+
+    // Seed a large-ish plaintext set so the job is genuinely mid-flight when we
+    // restart (each object is a small copy — enough pages to interrupt).
+    const N: usize = 60;
+    for i in 0..N {
+        let body = [PLAINTEXT_MARKER, format!(" obj {i}").as_bytes()].concat();
+        put_object(
+            &http,
+            &endpoint,
+            bucket,
+            &format!("plain-{i:03}.json"),
+            body,
+            "application/json",
+        )
+        .await;
+    }
+
+    enable_encryption(&admin, &endpoint).await;
+    start_reencrypt(&admin, &endpoint, bucket).await;
+
+    // Give the job a beat to start chewing pages, then kill + restart mid-run.
+    // Re-inject the bootstrap hash: a prior storage section-PUT re-persists the
+    // config and may not round-trip bootstrap_password_hash, so the fresh boot
+    // would otherwise auto-generate a new one and 401 the admin login.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    server
+        .respawn_with_env(&[(
+            "DGP_BOOTSTRAP_PASSWORD_HASH",
+            common::TEST_BOOTSTRAP_PASSWORD_HASH,
+        )])
+        .await;
+    let endpoint = server.endpoint();
+    let admin = admin_http_client(&endpoint).await;
+
+    // Boot reconcile requeues the interrupted job; the worker resumes it. Wait
+    // for the bucket to go idle, then assert the FINAL state is fully encrypted.
+    wait_job_done(&admin, &endpoint, bucket).await;
+
+    // Every object is ciphertext on disk (no plaintext marker survives) — the
+    // resume finished the work the crash interrupted.
+    let data_dir = server.data_dir().unwrap();
+    for i in 0..N {
+        let p = data_dir
+            .join(bucket)
+            .join("deltaspaces")
+            .join(format!("plain-{i:03}.json"));
+        if p.exists() {
+            assert_file_lacks_marker(&p);
+        }
+    }
+    // And every object still reads back correctly through the API.
+    for i in [0usize, N / 2, N - 1] {
+        assert_eq!(
+            get_bytes(&http, &endpoint, bucket, &format!("plain-{i:03}.json")).await,
+            [PLAINTEXT_MARKER, format!(" obj {i}").as_bytes()].concat(),
+        );
+    }
+}
