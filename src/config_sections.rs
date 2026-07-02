@@ -1051,6 +1051,14 @@ pub struct ReplicationRule {
     #[serde(default)]
     pub conflict: ConflictPolicy,
 
+    /// ContentDiff only: when `true`, a same-size object with NO comparable
+    /// hash (both SHAs absent, or mismatched multipart-etag shapes) resolves to
+    /// COPY instead of the default same-size SKIP. Correctness-over-convergence:
+    /// guarantees a foreign same-size object can't leave stale bytes forever, at
+    /// the cost of re-copying it every sweep. Default `false` (fast convergence).
+    #[serde(default)]
+    pub strict_content_diff: bool,
+
     /// Optional globset: if non-empty, ONLY keys matching at least one
     /// of these patterns are replicated. Applied in addition to
     /// `exclude_globs`.
@@ -2467,6 +2475,7 @@ mod tests {
             batch_size: 100,
             replicate_deletes: false,
             conflict: ConflictPolicy::NewerWins,
+            strict_content_diff: false,
             include_globs: Vec::new(),
             exclude_globs: default_exclude_globs(),
         }

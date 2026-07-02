@@ -191,15 +191,34 @@ fn resolve_etag_and_parts(m: &FileMetadata) -> (Option<String>, Option<u32>) {
     (etag, parts)
 }
 
+/// PURE: for two same-size objects, do we hold ANY hash that could prove them
+/// equal-or-different? True when both carry a SHA-256, OR both carry a
+/// comparable etag (same multipart part-count + both present). False → the
+/// size-tie is INDETERMINATE (the `strict_content_diff` copy trigger).
+fn have_comparable_hash(
+    src: &FileMetadata,
+    dest: &FileMetadata,
+    s_parts: Option<u32>,
+    d_parts: Option<u32>,
+    s_etag: &Option<String>,
+    d_etag: &Option<String>,
+) -> bool {
+    let both_sha = !src.file_sha256.is_empty() && !dest.file_sha256.is_empty();
+    let both_etag = s_parts == d_parts && s_etag.is_some() && d_etag.is_some();
+    both_sha || both_etag
+}
+
 /// Pure predicate: should we copy `source_key` from `src_meta` to
 /// destination, given optional `dest_meta`?
 ///
 /// The globs must be pre-compiled (cheap if cached across a batch).
+#[allow(clippy::too_many_arguments)]
 pub fn should_replicate(
     source_key: &str,
     src_meta: &FileMetadata,
     dest_meta: Option<&FileMetadata>,
     conflict: ConflictPolicy,
+    strict_content_diff: bool,
     include_globs: &GlobSet,
     exclude_globs: &GlobSet,
 ) -> Decision {
@@ -263,7 +282,16 @@ pub fn should_replicate(
             let etag_differs = !sha_differs
                 && s_parts == d_parts
                 && matches!((&s_etag, &d_etag), (Some(s), Some(d)) if s != d);
-            if size_differs || sha_differs || etag_differs {
+            // Same-size objects we CANNOT prove identical: no comparable SHA
+            // (either side absent) AND no comparable etag (shape mismatch or
+            // absent). Under `strict_content_diff` these resolve to COPY
+            // (correctness) rather than the default size-only SKIP (convergence).
+            let indeterminate = !size_differs
+                && !sha_differs
+                && !etag_differs
+                && !have_comparable_hash(src_meta, dest, s_parts, d_parts, &s_etag, &d_etag);
+            if size_differs || sha_differs || etag_differs || (strict_content_diff && indeterminate)
+            {
                 Decision::Copy {
                     dest_key: source_key.to_string(),
                 }
@@ -317,6 +345,7 @@ where
             src_meta,
             dest_meta.as_ref(),
             rule.conflict,
+            rule.strict_content_diff,
             &includes,
             &excludes,
         ) {
@@ -365,9 +394,67 @@ mod tests {
             batch_size: 100,
             replicate_deletes: false,
             conflict: ConflictPolicy::NewerWins,
+            strict_content_diff: false,
             include_globs: Vec::new(),
             exclude_globs: vec![".dg/*".into()],
         }
+    }
+
+    #[test]
+    fn content_diff_size_tie_no_hash_skips_by_default_copies_when_strict() {
+        // Both sides same size, NO comparable hash (empty sha, empty md5) →
+        // indeterminate. Default: skip (convergence). strict: copy (safety).
+        let mut src = make_meta("f.txt", 100, Utc.timestamp_opt(0, 0).unwrap());
+        let mut dst = make_meta("f.txt", 100, Utc.timestamp_opt(0, 0).unwrap());
+        for m in [&mut src, &mut dst] {
+            m.file_sha256 = String::new();
+            m.md5 = String::new();
+            m.multipart_etag = None;
+        }
+        let (inc, exc) = (GlobSet::empty(), GlobSet::empty());
+        assert!(matches!(
+            should_replicate(
+                "f.txt",
+                &src,
+                Some(&dst),
+                ConflictPolicy::ContentDiff,
+                false,
+                &inc,
+                &exc
+            ),
+            Decision::Skip {
+                reason: SkipReason::DestIdentical
+            }
+        ));
+        assert!(matches!(
+            should_replicate(
+                "f.txt",
+                &src,
+                Some(&dst),
+                ConflictPolicy::ContentDiff,
+                true,
+                &inc,
+                &exc
+            ),
+            Decision::Copy { .. }
+        ));
+        // With a comparable sha both sides, strict does NOT force-copy identical bytes.
+        src.file_sha256 = "abc".into();
+        dst.file_sha256 = "abc".into();
+        assert!(matches!(
+            should_replicate(
+                "f.txt",
+                &src,
+                Some(&dst),
+                ConflictPolicy::ContentDiff,
+                true,
+                &inc,
+                &exc
+            ),
+            Decision::Skip {
+                reason: SkipReason::DestIdentical
+            }
+        ));
     }
 
     #[test]
@@ -419,7 +506,7 @@ mod tests {
         let rule = default_rule();
         let (inc, exc) = compile_rule_globs(&rule).unwrap();
         let src = make_meta("file.txt", 1, Utc.timestamp_opt(0, 0).unwrap());
-        let d = should_replicate("file.txt", &src, None, rule.conflict, &inc, &exc);
+        let d = should_replicate("file.txt", &src, None, rule.conflict, false, &inc, &exc);
         assert!(matches!(d, Decision::Copy { .. }));
     }
 
@@ -429,7 +516,15 @@ mod tests {
         let (inc, exc) = compile_rule_globs(&rule).unwrap();
         let src = make_meta("file.txt", 1, Utc.timestamp_opt(100, 0).unwrap());
         let dst = make_meta("file.txt", 1, Utc.timestamp_opt(200, 0).unwrap());
-        let d = should_replicate("file.txt", &src, Some(&dst), rule.conflict, &inc, &exc);
+        let d = should_replicate(
+            "file.txt",
+            &src,
+            Some(&dst),
+            rule.conflict,
+            false,
+            &inc,
+            &exc,
+        );
         assert!(matches!(
             d,
             Decision::Skip {
@@ -444,7 +539,15 @@ mod tests {
         let (inc, exc) = compile_rule_globs(&rule).unwrap();
         let src = make_meta("file.txt", 1, Utc.timestamp_opt(300, 0).unwrap());
         let dst = make_meta("file.txt", 1, Utc.timestamp_opt(100, 0).unwrap());
-        let d = should_replicate("file.txt", &src, Some(&dst), rule.conflict, &inc, &exc);
+        let d = should_replicate(
+            "file.txt",
+            &src,
+            Some(&dst),
+            rule.conflict,
+            false,
+            &inc,
+            &exc,
+        );
         assert!(matches!(d, Decision::Copy { .. }));
     }
 
@@ -460,7 +563,15 @@ mod tests {
         // copied under newer-wins / source-wins) — content-diff still skips.
         let src = make_meta("file.txt", 10, Utc.timestamp_opt(900, 0).unwrap());
         let dst = make_meta("file.txt", 10, Utc.timestamp_opt(100, 0).unwrap());
-        let d = should_replicate("file.txt", &src, Some(&dst), rule.conflict, &inc, &exc);
+        let d = should_replicate(
+            "file.txt",
+            &src,
+            Some(&dst),
+            rule.conflict,
+            false,
+            &inc,
+            &exc,
+        );
         assert!(
             matches!(
                 d,
@@ -479,7 +590,15 @@ mod tests {
         let (inc, exc) = compile_rule_globs(&rule).unwrap();
         let src = make_meta("file.txt", 20, Utc.timestamp_opt(100, 0).unwrap());
         let dst = make_meta("file.txt", 10, Utc.timestamp_opt(100, 0).unwrap());
-        let d = should_replicate("file.txt", &src, Some(&dst), rule.conflict, &inc, &exc);
+        let d = should_replicate(
+            "file.txt",
+            &src,
+            Some(&dst),
+            rule.conflict,
+            false,
+            &inc,
+            &exc,
+        );
         assert!(
             matches!(d, Decision::Copy { .. }),
             "size diff must copy: {d:?}"
@@ -496,7 +615,15 @@ mod tests {
         let mut dst = make_meta("file.txt", 10, Utc.timestamp_opt(100, 0).unwrap());
         src.file_sha256 = "aaaa".to_string();
         dst.file_sha256 = "bbbb".to_string();
-        let d = should_replicate("file.txt", &src, Some(&dst), rule.conflict, &inc, &exc);
+        let d = should_replicate(
+            "file.txt",
+            &src,
+            Some(&dst),
+            rule.conflict,
+            false,
+            &inc,
+            &exc,
+        );
         assert!(
             matches!(d, Decision::Copy { .. }),
             "sha diff must copy: {d:?}"
@@ -515,7 +642,15 @@ mod tests {
         let mut dst = make_meta("file.txt", 10, Utc.timestamp_opt(100, 0).unwrap());
         src.file_sha256 = String::new(); // foreign: no logical sha
         dst.file_sha256 = "bbbb".to_string();
-        let d = should_replicate("file.txt", &src, Some(&dst), rule.conflict, &inc, &exc);
+        let d = should_replicate(
+            "file.txt",
+            &src,
+            Some(&dst),
+            rule.conflict,
+            false,
+            &inc,
+            &exc,
+        );
         assert!(
             matches!(
                 d,
@@ -541,7 +676,15 @@ mod tests {
         dst.file_sha256 = String::new();
         src.md5 = "aaaaaaaa".to_string();
         dst.md5 = "bbbbbbbb".to_string();
-        let d = should_replicate("file.txt", &src, Some(&dst), rule.conflict, &inc, &exc);
+        let d = should_replicate(
+            "file.txt",
+            &src,
+            Some(&dst),
+            rule.conflict,
+            false,
+            &inc,
+            &exc,
+        );
         assert!(
             matches!(d, Decision::Copy { .. }),
             "differing etag must copy: {d:?}"
@@ -560,7 +703,15 @@ mod tests {
         dst.file_sha256 = String::new();
         src.md5 = "samesame".to_string();
         dst.md5 = "samesame".to_string();
-        let d = should_replicate("file.txt", &src, Some(&dst), rule.conflict, &inc, &exc);
+        let d = should_replicate(
+            "file.txt",
+            &src,
+            Some(&dst),
+            rule.conflict,
+            false,
+            &inc,
+            &exc,
+        );
         assert!(
             matches!(
                 d,
@@ -586,7 +737,15 @@ mod tests {
         dst.file_sha256 = String::new();
         src.multipart_etag = Some("abc-3".to_string()); // 3 parts
         dst.multipart_etag = Some("def-5".to_string()); // 5 parts
-        let d = should_replicate("file.txt", &src, Some(&dst), rule.conflict, &inc, &exc);
+        let d = should_replicate(
+            "file.txt",
+            &src,
+            Some(&dst),
+            rule.conflict,
+            false,
+            &inc,
+            &exc,
+        );
         assert!(
             matches!(
                 d,
@@ -605,7 +764,15 @@ mod tests {
         let (inc, exc) = compile_rule_globs(&rule).unwrap();
         let src = make_meta("file.txt", 1, Utc.timestamp_opt(300, 0).unwrap());
         let dst = make_meta("file.txt", 1, Utc.timestamp_opt(100, 0).unwrap());
-        let d = should_replicate("file.txt", &src, Some(&dst), rule.conflict, &inc, &exc);
+        let d = should_replicate(
+            "file.txt",
+            &src,
+            Some(&dst),
+            rule.conflict,
+            false,
+            &inc,
+            &exc,
+        );
         assert!(matches!(
             d,
             Decision::Skip {
@@ -620,7 +787,7 @@ mod tests {
         let (inc, exc) = compile_rule_globs(&rule).unwrap();
         let src = make_meta("x", 1, Utc.timestamp_opt(0, 0).unwrap());
         for key in [".deltaglider/config.db", "nested/.deltaglider/config.db"] {
-            let d = should_replicate(key, &src, None, rule.conflict, &inc, &exc);
+            let d = should_replicate(key, &src, None, rule.conflict, false, &inc, &exc);
             assert!(matches!(
                 d,
                 Decision::Skip {
@@ -635,7 +802,7 @@ mod tests {
         let rule = default_rule();
         let (inc, exc) = compile_rule_globs(&rule).unwrap();
         let src = make_meta("x", 0, Utc.timestamp_opt(0, 0).unwrap());
-        let d = should_replicate("folder/", &src, None, rule.conflict, &inc, &exc);
+        let d = should_replicate("folder/", &src, None, rule.conflict, false, &inc, &exc);
         assert!(matches!(
             d,
             Decision::Skip {
@@ -650,7 +817,7 @@ mod tests {
         rule.exclude_globs.push("*.tmp".into());
         let (inc, exc) = compile_rule_globs(&rule).unwrap();
         let src = make_meta("scratch.tmp", 1, Utc.timestamp_opt(0, 0).unwrap());
-        let d = should_replicate("scratch.tmp", &src, None, rule.conflict, &inc, &exc);
+        let d = should_replicate("scratch.tmp", &src, None, rule.conflict, false, &inc, &exc);
         assert!(matches!(
             d,
             Decision::Skip {
@@ -666,10 +833,26 @@ mod tests {
         let (inc, exc) = compile_rule_globs(&rule).unwrap();
         let src = make_meta("x", 1, Utc.timestamp_opt(0, 0).unwrap());
         // In includes → copy.
-        let d = should_replicate("releases/v1.zip", &src, None, rule.conflict, &inc, &exc);
+        let d = should_replicate(
+            "releases/v1.zip",
+            &src,
+            None,
+            rule.conflict,
+            false,
+            &inc,
+            &exc,
+        );
         assert!(matches!(d, Decision::Copy { .. }));
         // Outside includes → skip.
-        let d = should_replicate("staging/v1.zip", &src, None, rule.conflict, &inc, &exc);
+        let d = should_replicate(
+            "staging/v1.zip",
+            &src,
+            None,
+            rule.conflict,
+            false,
+            &inc,
+            &exc,
+        );
         assert!(matches!(
             d,
             Decision::Skip {

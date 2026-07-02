@@ -1991,6 +1991,7 @@ mod tests {
             batch_size: 100,
             replicate_deletes: false,
             conflict: ConflictPolicy::NewerWins,
+            strict_content_diff: false,
             include_globs: Vec::new(),
             exclude_globs: vec![".dg/*".into()],
         }

@@ -561,6 +561,7 @@ async fn apply_action(
                 &src_meta,
                 dest_meta.as_ref(),
                 rule.conflict,
+                rule.strict_content_diff,
                 &include_globs,
                 &exclude_globs,
             );
@@ -661,6 +662,7 @@ mod tests {
             batch_size: 100,
             replicate_deletes: false,
             conflict: ConflictPolicy::default(),
+            strict_content_diff: false,
             include_globs: Vec::new(),
             exclude_globs: Vec::new(),
         }

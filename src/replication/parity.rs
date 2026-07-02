@@ -963,7 +963,15 @@ pub async fn parity_audit(
             // ("would this key replicate at all"); the conflict policy is
             // irrelevant because every policy copies a missing destination.
             if !matches!(
-                should_replicate(key, meta, None, ConflictPolicy::NewerWins, &inc, &exc),
+                should_replicate(
+                    key,
+                    meta,
+                    None,
+                    ConflictPolicy::NewerWins,
+                    false,
+                    &inc,
+                    &exc
+                ),
                 Decision::Copy { .. }
             ) {
                 return Ok(false);
