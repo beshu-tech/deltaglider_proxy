@@ -917,6 +917,42 @@ async fn scan_prefix(
     Ok((truncated || pager.truncated_by_page_budget(), seen))
 }
 
+/// Evict cache rows for objects no longer present (deleted since last scan) —
+/// bounds growth + drops stale rows. ONLY runs after a COMPLETE scan: a
+/// truncated scan didn't see every key, so it can't tell deleted from unscanned.
+/// Each side is pruned against ITS OWN live key set. Best-effort (logs on error).
+async fn prune_parity_cache(
+    rule: &ReplicationRule,
+    failures: Option<&tokio::sync::Mutex<ConfigDb>>,
+    truncated: bool,
+    source: &BTreeMap<String, ObjState>,
+    dest: &BTreeMap<String, ObjState>,
+) {
+    if truncated {
+        return;
+    }
+    let Some(mutex) = failures else { return };
+    let src_live: Vec<String> = source.keys().cloned().collect();
+    let dst_live: Vec<String> = dest.keys().cloned().collect();
+    let mut db = mutex.lock().await;
+    for (side, live) in [
+        (ParitySide::Source, &src_live),
+        (ParitySide::Dest, &dst_live),
+    ] {
+        if let Err(e) = db.parity_cache_retain(&rule.name, side, live) {
+            warn!("parity cache prune failed for rule '{}': {e}", rule.name);
+        }
+    }
+}
+
+/// Audit a replication rule's parity: scan both sides (lite list), resolve
+/// logical metadata for delta-eligible keys (cache-first, bounded HEAD burst),
+/// diff, and annotate the sample findings. Phases in body:
+///   1. scan SOURCE prefix → `source` map + `src_needs_logical`
+///   2. scan DEST prefix → `dest` map + `dst_needs_logical` (+ provisional ownership)
+///   3. prune the needs-logical sets to the keys where a HEAD changes the verdict
+///   4. resolve logical metadata (HEAD burst) → unresolved count feeds `truncated`
+///   5. prune stale cache, diff, annotate → `ParityOutcome`
 pub async fn parity_audit(
     engine: &DynEngine,
     rule: &ReplicationRule,
@@ -951,6 +987,7 @@ pub async fn parity_audit(
     // On a SOURCE whose lite list is untrustworthy (encrypting/S3 → ciphertext
     // size/etag), EVERY key must be HEAD-resolved for a correct compare — the
     // symmetric guard to the dest side (finding #5 was one-directional).
+    // ── Phase 1: scan SOURCE prefix ──
     let src_lite_authoritative = engine.lite_list_carries_logical_facts(&rule.source.bucket);
     let (src_truncated, src_seen) = scan_prefix(
         engine,
@@ -993,6 +1030,7 @@ pub async fn parity_audit(
     // nor plaintext size/etag (S3, or an actively-encrypting wrapper), EVERY
     // dest key must be HEAD-resolved: the lite entry can't be trusted for the
     // orphan-ownership check (#4) or the size/etag compare (#5).
+    // ── Phase 2: scan DEST prefix ──
     let dest_lite_authoritative = engine.lite_list_carries_logical_facts(&rule.destination.bucket);
     let (dst_truncated, _dst_seen) = scan_prefix(
         engine,
@@ -1029,6 +1067,7 @@ pub async fn parity_audit(
     // pure waste. So scope the source HEAD-burst to the intersection with the
     // dest key set. This is what makes a verify against an empty/sparse dest fast:
     // every source key is trivially missing, so zero source HEADs are issued.
+    // ── Phase 3: prune needs-logical to keys where a HEAD changes the verdict ──
     src_needs_logical.retain(|raw| {
         match rewrite_key(&rule.source.prefix, &rule.destination.prefix, raw) {
             Ok(dk) => dest.contains_key(&dk),
@@ -1047,6 +1086,7 @@ pub async fn parity_audit(
     // The HEAD-burst tail can be the slow part on a cold cache, so honour a
     // cancel at each resolve boundary (the per-page check above only covers
     // listing).
+    // ── Phase 4: resolve logical metadata (cache-first, bounded HEAD burst) ──
     if let Some(p) = progress {
         p.check_cancel().await?;
     }
@@ -1087,25 +1127,8 @@ pub async fn parity_audit(
         );
     }
 
-    // Prune cache rows for objects no longer present (deleted since last scan) —
-    // bounds growth + evicts stale rows. ONLY after a COMPLETE scan: a truncated
-    // scan didn't see every key, so it can't tell deleted from unscanned. Each
-    // side is pruned against ITS OWN live key set.
-    if !truncated {
-        if let Some(mutex) = failures {
-            let src_live: Vec<String> = source.keys().cloned().collect();
-            let dst_live: Vec<String> = dest.keys().cloned().collect();
-            let mut db = mutex.lock().await;
-            for (side, live) in [
-                (ParitySide::Source, &src_live),
-                (ParitySide::Dest, &dst_live),
-            ] {
-                if let Err(e) = db.parity_cache_retain(&rule.name, side, live) {
-                    warn!("parity cache prune failed for rule '{}': {e}", rule.name);
-                }
-            }
-        }
-    }
+    // Phase 5: prune stale cache rows, then diff + annotate into the outcome.
+    prune_parity_cache(rule, failures, truncated, &source, &dest).await;
 
     let source_objects = source.len() as u64;
     let dest_objects = dest.len() as u64;
