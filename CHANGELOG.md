@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.9.4 — 2026-07-02
+
 Admin-UI simplification, a leaner CI pipeline, and wider property-test coverage.
 
 ### Changed

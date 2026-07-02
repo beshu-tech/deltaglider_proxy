@@ -8,7 +8,40 @@ Every released version of DeltaGlider Proxy, newest first. Versions
 follow [semantic versioning](https://semver.org/); the Docker image
 `beshultd/deltaglider_proxy:<version>` is published for each tag.
 
-_Last updated: 2026-07-01_
+_Last updated: 2026-07-02_
+
+## v1.9.4 — 2026-07-02
+
+Admin-UI simplification, a leaner CI pipeline, and wider property-test coverage.
+
+### Changed
+
+- **Admin pages simplified to their essentials.** Config panels now share two
+  content widths instead of a dozen ad-hoc ones; the System "Request limits"
+  fields dropped their per-field restart badges and environment-variable boxes
+  for a single help line; the "data lives in the encrypted DB, not YAML" banner
+  on Users/Groups/External-auth shrank from a three-fact block to one quiet
+  line; Credentials and Backends copy is plainer with YAML keys as hover chips.
+- **Dashboard leads with headline KPIs.** The Monitoring view shows 9 always-
+  useful cards up front and tucks 11 deep-telemetry charts behind a default-
+  closed "Detailed telemetry" toggle, so a fresh install no longer opens onto a
+  wall of empty graphs.
+- Removed duplicate in-panel headers on Event delivery, Trace, and Audit log
+  (the page title already names them).
+
+### Internal
+
+- **CI is faster and leaner.** The UI bundle and release binary are now built
+  once and shared as artifacts instead of being rebuilt in ~8 and ~3 jobs; the
+  non-gating coverage and supply-chain (deny/audit) jobs moved to the nightly
+  workflow, so the PR gate is correctness-only. E2E, docs, and config-schema
+  jobs dropped several minutes each.
+- **Wider property-test coverage** on the pure validators — bucket-key paths,
+  the IAM method→action classifier (with a security invariant that mutating
+  methods never map to read-only actions), public-prefix normalization, and
+  replication key rewriting.
+- Documentation refreshed to match the current admin UI and corrected config
+  defaults (`DGP_CACHE_MB` 100 MB, `DGP_CODEC_CONCURRENCY` num_cpus × 4).
 
 ## v1.9.3 — 2026-07-01
 
