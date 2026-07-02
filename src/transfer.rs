@@ -706,6 +706,10 @@ pub(crate) fn is_transient_copy_error(message: &str) -> bool {
         "status=504",
         "bad gateway",
         "gateway timeout",
+        // Spool budget exhaustion under concurrent large copies is a CONTENTION
+        // signal, not a permanent failure — retry (with backoff) rather than
+        // poisoning the object into the failure ring (finding #14).
+        "spool budget exhausted",
     ]
     .iter()
     .any(|needle| m.contains(needle))
@@ -1101,6 +1105,20 @@ mod tests {
         ));
         assert!(!is_transient_copy_error("AccessDenied"));
         assert!(!is_transient_copy_error("NoSuchKey"));
+
+        // Spool budget exhaustion is contention, not permanent (finding #14):
+        // the Overloaded Display string must classify transient so the copy
+        // retries instead of poisoning the object into the failure ring.
+        assert!(is_transient_copy_error(
+            "source retrieve failed: Service overloaded: spool budget exhausted; retry shortly"
+        ));
+
+        // A generation-pin change is FATAL at the part level (part loop returns
+        // it immediately) but the whole-copy retry re-HEADs → transient here.
+        assert!(is_transient_copy_error(&format!(
+            "{}: b/k (size 10 -> 11)",
+            SOURCE_CHANGED_TOKEN
+        )));
     }
 
     #[test]

@@ -328,13 +328,24 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         use tokio::io::AsyncReadExt;
 
         self.metadata_cache.invalidate(bucket, key);
-        if size > self.max_object_size {
-            return Err(EngineError::TooLarge {
-                size,
-                max: self.max_object_size,
-            });
-        }
         let (obj_key, deltaspace_id) = Self::validated_key_ingest(bucket, key)?;
+        // Size ceiling depends on the STRATEGY: a delta-eligible object is
+        // bounded by max_object_size (it will be xdelta3-encoded in RAM); a
+        // passthrough object streams from the spool and is bounded by the far
+        // larger max_passthrough_object_size. Applying the delta limit to
+        // passthrough objects made every spooled passthrough copy fail
+        // TooLarge under default config (finding #3).
+        let compression_disabled = !self.bucket_policies.compression_enabled(bucket);
+        let is_passthrough =
+            compression_disabled || !self.file_router.is_delta_eligible(&obj_key.filename);
+        let ceiling = if is_passthrough {
+            self.max_passthrough_object_size
+        } else {
+            self.max_object_size
+        };
+        if size > ceiling {
+            return Err(EngineError::TooLarge { size, max: ceiling });
+        }
         let prior_for_counter = self.prior_for_counter(bucket, key).await;
         let mpe = multipart_etag.clone().unwrap_or_default();
 
@@ -369,8 +380,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         };
 
         // (2) Not delta-eligible → passthrough from the body spool.
-        let compression_disabled = !self.bucket_policies.compression_enabled(bucket);
-        if compression_disabled || !self.file_router.is_delta_eligible(&obj_key.filename) {
+        if is_passthrough {
             let result = self
                 .store_passthrough_file_with_multipart_etag(
                     bucket,

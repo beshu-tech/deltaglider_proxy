@@ -13,7 +13,9 @@
 mod common;
 
 use aws_sdk_s3::primitives::ByteStream;
-use common::{admin_http_client, big_passthrough_body, wait_for_run, TestServer};
+use common::{
+    admin_http_client, big_passthrough_body, minio_endpoint_url, wait_for_run, TestServer,
+};
 
 const STREAM_RULE_YAML: &str = "
 replication:
@@ -36,11 +38,13 @@ replication:
 
 #[tokio::test]
 async fn test_streaming_multipart_copy_large_passthrough() {
+    skip_unless_minio!();
     // ~6 MiB object, 1 MiB stream threshold, 5 MiB parts → 2 parts.
     let body = big_passthrough_body(6 * 1024 * 1024);
 
     let server = TestServer::builder()
         .auth("bootstrap_key", "bootstrap_secret")
+        .s3_endpoint(&minio_endpoint_url())
         .extra_yaml_storage_section(STREAM_RULE_YAML)
         .env("DGP_STREAM_COPY_THRESHOLD", "1048576") // 1 MiB
         .env("DGP_MULTIPART_PART_SIZE", "5242880") // 5 MiB (S3 min)

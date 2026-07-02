@@ -1383,6 +1383,15 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         self.inner.multipart_storage_label(bucket)
     }
 
+    fn supports_native_multipart(&self, bucket: &str) -> bool {
+        // Proxy-AES rewrites each part's bytes, so the passthrough streaming
+        // multipart path can't be used regardless of the inner backend.
+        if self.actively_encrypts() {
+            return false;
+        }
+        self.inner.supports_native_multipart(bucket)
+    }
+
     async fn get_passthrough_stream_range(
         &self,
         bucket: &str,

@@ -1614,6 +1614,10 @@ impl StorageBackend for S3Backend {
 
     // === Multipart upload (Phase B native streaming copy) ===
 
+    fn supports_native_multipart(&self, _bucket: &str) -> bool {
+        true
+    }
+
     #[instrument(skip(self, metadata))]
     async fn create_multipart_upload(
         &self,

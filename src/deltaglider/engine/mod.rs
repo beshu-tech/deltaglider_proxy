@@ -878,12 +878,15 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.storage.multipart_storage_label(bucket)
     }
 
-    /// True when the backend serving `bucket` supports native multipart
-    /// (i.e. is NOT a whole-object proxy-AES-encrypting backend).
+    /// True when a streaming multipart copy to `bucket` stays memory-bounded:
+    /// the backend must (a) NOT be a whole-object proxy-AES backend (the label
+    /// gate) AND (b) write parts durably+incrementally (native multipart).
+    /// A filesystem/buffering destination fails (b) and would otherwise retain
+    /// the whole object in RAM on the "streaming" path — route it to spool.
     pub fn destination_supports_native_multipart(&self, bucket: &str) -> bool {
         crate::transfer_plan::backend_supports_native_multipart(
             self.storage.multipart_storage_label(bucket),
-        )
+        ) && self.storage.supports_native_multipart(bucket)
     }
 
     /// Return the number of entries in the reference cache (O(1) atomic read).

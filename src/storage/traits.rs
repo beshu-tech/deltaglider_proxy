@@ -438,6 +438,16 @@ pub trait StorageBackend: Send + Sync {
         "none"
     }
 
+    /// Does the backend serving `bucket` write multipart parts DURABLY and
+    /// incrementally (S3 `native: true`)? The streaming copy path is only
+    /// memory-bounded on such backends — a `false` backend forces the caller
+    /// to retain every part's bytes for `complete` (O(object_size) RAM), so
+    /// the streaming gate must route those to the spooled/buffered path
+    /// instead. Default `false` (the buffering default impl + filesystem).
+    fn supports_native_multipart(&self, _bucket: &str) -> bool {
+        false
+    }
+
     // === Scanning operations ===
 
     /// Scan a deltaspace directory and return all file metadata
@@ -876,6 +886,9 @@ macro_rules! impl_storage_backend_for_box {
             }
             fn multipart_storage_label(&self, bucket: &str) -> &'static str {
                 (**self).multipart_storage_label(bucket)
+            }
+            fn supports_native_multipart(&self, bucket: &str) -> bool {
+                (**self).supports_native_multipart(bucket)
             }
 
             async fn scan_deltaspace(
