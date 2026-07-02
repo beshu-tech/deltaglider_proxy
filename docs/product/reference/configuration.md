@@ -1019,6 +1019,22 @@ Exhaustive list of every `DGP_*` variable the server reads. The unit test `test_
 | `DGP_S3_PATH_STYLE` | true | Use path-style URLs (MinIO/LocalStack) |
 | `DGP_BE_AWS_ACCESS_KEY_ID` | — | Backend S3 access key |
 | `DGP_BE_AWS_SECRET_ACCESS_KEY` | — | Backend S3 secret key |
+| `DGP_MAX_PASSTHROUGH_OBJECT_SIZE` | 64 GiB | Max size of a passthrough (non-delta) object |
+| `DGP_S3_CONNECT_TIMEOUT_SECS` | 10 | Backend S3 connect timeout |
+| `DGP_S3_READ_TIMEOUT_SECS` | 60 | Backend S3 read timeout |
+| `DGP_S3_OPERATION_ATTEMPT_TIMEOUT_SECS` | 300 | Per-attempt backend S3 operation timeout |
+| `DGP_S3_STALL_GRACE_SECS` | 30 | Backend S3 no-progress stall grace |
+
+### Replication / streaming copy
+
+Tuning knobs for the large-object streaming multipart copy path (replication + lifecycle transitions). Defaults suit most deployments; raise concurrency only if the backend + network have headroom.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DGP_STREAM_COPY_THRESHOLD` | 64 MiB | Object size at/above which a passthrough copy streams via multipart (floored at 1) |
+| `DGP_MULTIPART_PART_SIZE` | 64 MiB | Part size for the streaming copy (clamped to the 5 MiB S3 minimum) |
+| `DGP_UPLOAD_CONCURRENCY` | 4 | In-flight parts per streaming object (1–16) |
+| `DGP_REPLICATION_TRANSFERS` | 4 | Concurrent objects per replication page (1–64) |
 
 ### Authentication
 

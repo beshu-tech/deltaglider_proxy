@@ -82,6 +82,7 @@ pub fn log_startup_banner(config: &Config) {
         env!("CARGO_PKG_VERSION"),
         env!("DGP_BUILD_TIME"),
     );
+    warn_active_test_seams();
     info!("  Listen address: {}", config.listen_addr);
 
     match &config.backend {
@@ -139,6 +140,33 @@ pub fn log_startup_banner(config: &Config) {
 ///
 /// The decision itself is the pure [`Config::classify_auth_config`]; this
 /// wrapper owns the logging and the `process::exit` (the un-testable I/O).
+/// The DGP_TEST_* seams inject faults/delays and clamp page budgets. They ship
+/// in release code paths (inert unless set), so loudly warn if one is active —
+/// an operator who exported one by accident would otherwise silently run a
+/// crippled proxy (finding #32).
+fn warn_active_test_seams() {
+    const SEAMS: &[&str] = &[
+        "DGP_TEST_FAIL_PART_ONCE",
+        "DGP_TEST_PART_BARRIER",
+        "DGP_TEST_PART_DELAY_MS",
+        "DGP_TEST_OBJECT_BARRIER",
+        "DGP_TEST_OBJECT_DELAY_MS",
+        "DGP_TEST_MAX_JOB_PAGES",
+    ];
+    let active: Vec<&str> = SEAMS
+        .iter()
+        .copied()
+        .filter(|k| std::env::var_os(k).is_some())
+        .collect();
+    if !active.is_empty() {
+        warn!(
+            "  TEST SEAMS ACTIVE ({}) — these inject faults/delays/budget clamps and \
+             must NEVER be set in production.",
+            active.join(", ")
+        );
+    }
+}
+
 fn validate_auth_config(config: &Config) {
     use deltaglider_proxy::config::AuthConfigOutcome;
     match config.classify_auth_config() {
