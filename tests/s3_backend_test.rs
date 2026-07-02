@@ -2,9 +2,12 @@
 
 //! S3 backend parity tests
 //!
-//! Runs the same core operations as s3_api_test but against TestServer::s3()
-//! to verify the S3 storage backend works identically to filesystem.
-//! All tests gated with skip_unless_minio!() — skips gracefully without MinIO.
+//! TWO tests only (trimmed in a prior QA pass — see the note below): an
+//! S3-plumbing smoke test and the delta+S3 interaction that no other suite
+//! covers. NOT a re-run of s3_api_test's operations — those trait-level
+//! behaviours are guaranteed by the AWS SDK + the filesystem suites, so we
+//! don't re-pay a MinIO round-trip for them. Both gated with
+//! skip_unless_minio!() — skip gracefully without MinIO.
 
 mod common;
 
