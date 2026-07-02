@@ -487,7 +487,29 @@ export default function MetricsPage({ onBack, embedded }: Props) {
               </div>
             )}
           </Panel>
+        </DashboardGrid>
+      )}
 
+      {activeView === 'monitoring' && (
+        <details className="dg-telemetry-details">
+          <summary
+            className="dg-telemetry-summary"
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              padding: '8px 14px',
+              marginBottom: 12,
+              border: `1px solid ${colors.BORDER}`,
+              borderRadius: 8,
+              fontFamily: 'var(--font-ui)',
+              fontSize: 13,
+              fontWeight: 600,
+              color: colors.TEXT_SECONDARY,
+            }}
+          >
+            Detailed telemetry
+          </summary>
+          <DashboardGrid>
           {/* ── Row 5: Delta codec stats (4× 3-col) ───────────────── */}
           <Panel title="Avg encode" subtitle={`${fmtNum(encodeStats.count)} total encodes`} colSpan={3}>
             <StatValue value={encodeStats.count > 0 ? fmtDuration(encodeStats.avg) : '—'} hint="xdelta3 encode wall time" />
@@ -668,7 +690,8 @@ export default function MetricsPage({ onBack, embedded }: Props) {
               </div>
             </Panel>
           )}
-        </DashboardGrid>
+          </DashboardGrid>
+        </details>
       )}
     </div>
   );

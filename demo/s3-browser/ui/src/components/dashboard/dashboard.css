@@ -95,3 +95,16 @@
 @media (prefers-reduced-motion: reduce) {
   .dg-saved-sheen { display: none; }
 }
+
+/* ── Collapsible deep-telemetry section (colors set inline via theme) ── */
+.dg-telemetry-details { margin-top: 16px; }
+.dg-telemetry-summary { cursor: pointer; list-style: none; user-select: none; }
+.dg-telemetry-summary::-webkit-details-marker { display: none; }
+.dg-telemetry-summary::before {
+  content: '▸';
+  display: inline-block;
+  font-size: 11px;
+  margin-right: 8px;
+  transition: transform 0.15s ease;
+}
+.dg-telemetry-details[open] > .dg-telemetry-summary::before { transform: rotate(90deg); }
