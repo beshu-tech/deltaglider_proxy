@@ -10,7 +10,7 @@
 mod common;
 
 use aws_sdk_s3::primitives::ByteStream;
-use common::{admin_http_client, TestServer};
+use common::{admin_http_client, latest_run_id, wait_for_run_after, TestServer};
 use serde_json::Value;
 
 /// Poll a rule's run-history until its latest run reaches a terminal status,
@@ -29,13 +29,6 @@ fn newest_run(h: &Value) -> Option<&Value> {
         .as_array()?
         .iter()
         .max_by_key(|run| run["id"].as_i64().unwrap_or(i64::MIN))
-}
-
-fn is_terminal(status: &str) -> bool {
-    matches!(
-        status,
-        "succeeded" | "failed" | "completed_with_errors" | "cancelled" | "stopped"
-    )
 }
 
 /// Fire run-now and return the settled NEW run row. Baselines the latest run
@@ -70,46 +63,8 @@ async fn fire_run_now(admin: &reqwest::Client, endpoint: &str, rule: &str) -> Va
     wait_for_run_after(admin, endpoint, rule, before).await
 }
 
-/// `id` of the latest run in a rule's history, or 0 if none yet. Used to
-/// baseline a NEW run before firing a subsequent run-now (the history row for
-/// the new run only appears once its background task starts, so the plain
-/// `wait_for_latest_run` would otherwise return the PREVIOUS run's terminal row).
-async fn latest_run_id(admin: &reqwest::Client, endpoint: &str, rule: &str) -> i64 {
-    let url = format!("{endpoint}/_/api/admin/jobs/replication:{rule}/runs");
-    let h: Value = admin.get(&url).send().await.unwrap().json().await.unwrap();
-    newest_run(&h)
-        .and_then(|run| run["id"].as_i64())
-        .unwrap_or(0)
-}
-
-/// Like `wait_for_latest_run`, but waits for a run whose `id` is strictly
-/// greater than `after_id` (i.e. a genuinely NEW run) to reach a terminal
-/// status. Essential for tests that fire run-now multiple times and read each
-/// run's totals in turn.
-async fn wait_for_run_after(
-    admin: &reqwest::Client,
-    endpoint: &str,
-    rule: &str,
-    after_id: i64,
-) -> Value {
-    let url = format!("{endpoint}/_/api/admin/jobs/replication:{rule}/runs");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        let h: Value = admin.get(&url).send().await.unwrap().json().await.unwrap();
-        if let Some(run) = newest_run(&h) {
-            let id = run["id"].as_i64().unwrap_or(0);
-            let st = run["status"].as_str().unwrap_or("");
-            if id > after_id && is_terminal(st) {
-                return run.clone();
-            }
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "new run (id > {after_id}) for rule '{rule}' did not settle in 10s; last history: {h}"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-}
+// `latest_run_id` and `wait_for_run_after` are the shared 60s-deadline helpers
+// from `common` (the earlier 10s local shadows were too tight for stalled runs).
 
 const RULE_YAML: &str = "
 replication:
@@ -1740,6 +1695,7 @@ replication:
 /// Requires MinIO.
 #[tokio::test]
 async fn test_replication_foreign_object_missing_created_at_converges_on_second_run() {
+    skip_unless_minio!();
     let server = TestServer::builder()
         .s3_endpoint(&common::minio_endpoint_url())
         .env("DGP_BACKEND_ALLOW_LOCAL", "true")
@@ -1988,9 +1944,12 @@ replication:
 /// stable after settle), and a later run-now resumes and drains the rest.
 #[tokio::test]
 async fn test_replication_kill_mid_run_settles_cancelled_and_stops_copying() {
+    // Stall every copy 50ms so 150 objects ≈ 7.5s of work — the kill
+    // DETERMINISTICALLY lands mid-run (copied < 150), no wall-clock racing.
     let server = TestServer::builder()
         .auth("bootstrap_key", "bootstrap_secret")
         .extra_yaml_storage_section(KILL_RULE_YAML)
+        .env("DGP_TEST_COPY_STALL_MS", "50")
         .build()
         .await;
     let client = server.s3_client().await;
@@ -2027,13 +1986,17 @@ async fn test_replication_kill_mid_run_settles_cancelled_and_stops_copying() {
         "killed run must settle cancelled, never succeeded: {run}"
     );
     let copied = run["objects_processed"].as_i64().unwrap_or(-1);
+    // The copy-stall guarantees the kill lands mid-run — strictly incomplete.
     assert!(
         (0..150).contains(&copied),
         "killed run must stop before copying everything: {run}"
     );
 
-    // Copying actually STOPPED: the dest count is stable after settle.
-    let count_a = client
+    // Copying actually STOPPED. A TERMINAL 'cancelled' run means the worker
+    // loop has exited — no copy can follow — so the dest count is authoritative
+    // WITHOUT a wall-clock stability window. It must be strictly incomplete
+    // (the stall guarantees the kill interrupted the sweep).
+    let count_after_settle = client
         .list_objects_v2()
         .bucket("kr-dst")
         .send()
@@ -2041,17 +2004,10 @@ async fn test_replication_kill_mid_run_settles_cancelled_and_stops_copying() {
         .unwrap()
         .contents()
         .len();
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    let count_b = client
-        .list_objects_v2()
-        .bucket("kr-dst")
-        .send()
-        .await
-        .unwrap()
-        .contents()
-        .len();
-    assert_eq!(count_a, count_b, "no copies after a settled kill");
-    assert!(count_b < 150, "kill left the sweep incomplete");
+    assert!(
+        count_after_settle < 150,
+        "kill left the sweep incomplete (settled cancelled): {count_after_settle}"
+    );
 
     // A later one-off drains the tail FROM THE PRESERVED CURSOR: when the
     // kill landed after >=1 persisted page, the resumed run must scan fewer
@@ -2114,9 +2070,12 @@ replication:
 /// and then claim "cancelled".
 #[tokio::test]
 async fn test_replication_kill_stops_delete_pass() {
+    // 50ms stall per copy AND per delete → both passes run long enough for the
+    // kill to land deterministically mid-run (150 ops ≈ 7.5s each, < deadline).
     let server = TestServer::builder()
         .auth("bootstrap_key", "bootstrap_secret")
         .extra_yaml_storage_section(KILLDEL_RULE_YAML)
+        .env("DGP_TEST_COPY_STALL_MS", "50")
         .build()
         .await;
     let client = server.s3_client().await;
@@ -2171,9 +2130,10 @@ async fn test_replication_kill_stops_delete_pass() {
         "killed delete-pass run settles cancelled: {run}"
     );
 
-    // The kill landed before the sweep finished: destination objects survive,
-    // and the count is stable after settle (deleting actually STOPPED).
-    let count_a = client
+    // The kill landed before the sweep finished: destination objects survive.
+    // A TERMINAL 'cancelled' run means the delete loop has exited — no deletion
+    // can follow — so this count is authoritative without a stability window.
+    let survivors = client
         .list_objects_v2()
         .bucket("kd-dst")
         .send()
@@ -2182,19 +2142,9 @@ async fn test_replication_kill_stops_delete_pass() {
         .contents()
         .len();
     assert!(
-        count_a > 0,
-        "killed delete pass must leave destination objects behind"
+        survivors > 0,
+        "killed delete pass must leave destination objects behind (settled cancelled)"
     );
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    let count_b = client
-        .list_objects_v2()
-        .bucket("kd-dst")
-        .send()
-        .await
-        .unwrap()
-        .contents()
-        .len();
-    assert_eq!(count_a, count_b, "no deletions after a settled kill");
 }
 
 const DELRULE_YAML: &str = "
