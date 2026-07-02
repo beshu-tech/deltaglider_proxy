@@ -49,6 +49,7 @@
 //! Objects with `dg-encrypted: aes-256-gcm-chunked-v1` → chunked decrypt.
 //! Objects without the marker → returned as-is (backward compatible).
 
+use super::io_to_storage_error;
 use super::traits::{
     DelegatedListResult, LiteScanResult, MultipartUpload, StorageBackend, StorageError,
     UploadedPart,
@@ -1041,6 +1042,109 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
             .await
     }
 
+    /// BOUNDED-MEMORY file store: encrypt the source file in 64 KiB windows
+    /// into the chunked wire format, streamed to a temp file (peak ≈ one window
+    /// + one frame, ~130 KiB — never the whole object), then hand THAT file to
+    /// the inner backend (which streams it to disk/S3). This is the re-encrypt /
+    /// large-passthrough path; the trait default `tokio::fs::read`s the whole
+    /// file and single-shot-encrypts (100 MiB-capped, O(object) RAM).
+    /// PassThrough / no-key → delegate to inner (no encryption, still streamed).
+    async fn put_passthrough_file(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        source_path: &std::path::Path,
+        metadata: &FileMetadata,
+    ) -> Result<(), StorageError> {
+        if self.current_write_mode() == WriteMode::PassThrough {
+            return self
+                .inner
+                .put_passthrough_file(bucket, prefix, filename, source_path, metadata)
+                .await;
+        }
+        let Some(key) = self.current_key() else {
+            return self
+                .inner
+                .put_passthrough_file(bucket, prefix, filename, source_path, metadata)
+                .await;
+        };
+
+        let key_id = self.current_key_id();
+        let src = source_path.to_path_buf();
+        // Encrypt source → chunked temp file on a blocking thread (file I/O +
+        // AES). Returns the temp file so its lifetime spans the inner PUT.
+        let tmp = tokio::task::spawn_blocking(
+            move || -> Result<tempfile::NamedTempFile, StorageError> {
+                use std::io::{Read, Write};
+                let mut input = std::fs::File::open(&src).map_err(io_to_storage_error)?;
+                let mut tmp = tempfile::NamedTempFile::new().map_err(io_to_storage_error)?;
+                let mut base_iv = [0u8; IV_LEN];
+                rand::rngs::OsRng.fill_bytes(&mut base_iv);
+                let mut header = Vec::with_capacity(CHUNK_HEADER_LEN);
+                header.extend_from_slice(&CHUNK_MAGIC);
+                header.extend_from_slice(&base_iv);
+                tmp.write_all(&header).map_err(io_to_storage_error)?;
+
+                // Read one plaintext window ahead so we know which frame is FINAL
+                // (the chunked format needs is_final on the last frame for the
+                // truncation guard). `cur` holds the window not yet written.
+                let mut buf = vec![0u8; CHUNK_PLAINTEXT_SIZE];
+                let mut cur: Option<Vec<u8>> = None;
+                let mut chunk_index: u32 = 0;
+                let mut wrote_any = false;
+                loop {
+                    // Fill a full window (short read only at EOF).
+                    let mut filled = 0usize;
+                    while filled < CHUNK_PLAINTEXT_SIZE {
+                        let n = input
+                            .read(&mut buf[filled..])
+                            .map_err(io_to_storage_error)?;
+                        if n == 0 {
+                            break;
+                        }
+                        filled += n;
+                    }
+                    if filled == 0 {
+                        break; // EOF, no more windows
+                    }
+                    let next = buf[..filled].to_vec();
+                    if let Some(prev) = cur.take() {
+                        // `prev` is followed by `next` → not final.
+                        let frame = encrypt_chunk(&key, &base_iv, chunk_index, false, &prev)?;
+                        tmp.write_all(&frame).map_err(io_to_storage_error)?;
+                        wrote_any = true;
+                        chunk_index = chunk_index.checked_add(1).ok_or_else(|| {
+                            StorageError::Encryption(
+                                "chunk index overflow (object too large)".into(),
+                            )
+                        })?;
+                    }
+                    cur = Some(next);
+                    if filled < CHUNK_PLAINTEXT_SIZE {
+                        break; // short read = EOF
+                    }
+                }
+                // Flush the FINAL frame: the last window, or an empty final frame
+                // for a zero-byte object (matches put_passthrough_chunked case a).
+                let final_pt = cur.unwrap_or_default();
+                let _ = wrote_any;
+                let frame = encrypt_chunk(&key, &base_iv, chunk_index, true, &final_pt)?;
+                tmp.write_all(&frame).map_err(io_to_storage_error)?;
+                tmp.flush().map_err(io_to_storage_error)?;
+                Ok(tmp)
+            },
+        )
+        .await
+        .map_err(|e| StorageError::Other(format!("encrypt-to-file task join: {e}")))??;
+
+        let mut meta = metadata.clone();
+        mark_chunked_encrypted(&mut meta, key_id.as_deref());
+        self.inner
+            .put_passthrough_file(bucket, prefix, filename, tmp.path(), &meta)
+            .await
+    }
+
     // put_passthrough_chunked: re-slices incoming chunks into 64 KiB
     // plaintext windows, encrypts each into a framed ciphertext chunk,
     // and forwards a new `Vec<Bytes>` (header + all frames) to the
@@ -1625,6 +1729,67 @@ mod tests {
     fn test_key() -> EncryptionKey {
         EncryptionKey::from_hex("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
             .unwrap()
+    }
+
+    /// The streaming `put_passthrough_file` must produce a chunked object that
+    /// decrypts byte-identically via the normal read path — across the framing
+    /// boundaries (empty, sub-window, exact window, exact 2 windows, multi+tail).
+    #[tokio::test]
+    async fn streaming_put_passthrough_file_roundtrips_all_boundaries() {
+        use crate::storage::filesystem::FilesystemBackend;
+        let cw = CHUNK_PLAINTEXT_SIZE;
+        for size in [
+            0usize,
+            1,
+            100,
+            cw - 1,
+            cw,
+            cw + 1,
+            2 * cw,
+            2 * cw + 7,
+            5 * cw + 123,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let fs = FilesystemBackend::new(dir.path().to_path_buf())
+                .await
+                .unwrap();
+            let cfg = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
+                key: Some(test_key()),
+                key_id: Some("kid-1".to_string()),
+                ..Default::default()
+            })));
+            let wrapper = EncryptingBackend::new(fs, cfg);
+            wrapper.create_bucket("b").await.unwrap();
+
+            let plaintext: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let mut src = tempfile::NamedTempFile::new().unwrap();
+            std::io::Write::write_all(&mut src, &plaintext).unwrap();
+            let meta = FileMetadata::fallback(
+                "o.bin".into(),
+                size as u64,
+                "md5".into(),
+                Utc::now(),
+                None,
+                crate::types::StorageInfo::Passthrough,
+            );
+            wrapper
+                .put_passthrough_file("b", "p", "o.bin", src.path(), &meta)
+                .await
+                .unwrap_or_else(|e| panic!("size {size}: put failed: {e:?}"));
+
+            let got = wrapper.get_passthrough("b", "p", "o.bin").await.unwrap();
+            assert_eq!(got, plaintext, "size {size}: roundtrip mismatch");
+            // On-disk body must be chunked-encrypted (not plaintext, not single-shot).
+            let stored_meta = wrapper
+                .inner
+                .get_passthrough_metadata("b", "p", "o.bin")
+                .await
+                .unwrap();
+            assert!(
+                is_chunked_encrypted(&stored_meta),
+                "size {size}: not chunked on disk"
+            );
+        }
     }
 
     fn other_key() -> EncryptionKey {
