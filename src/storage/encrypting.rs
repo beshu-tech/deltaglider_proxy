@@ -76,6 +76,21 @@ pub const CHUNK_MARKER_VALUE: &str = "aes-256-gcm-chunked-v1";
 /// mismatch check only fires when BOTH sides have a key_id, so the
 /// upgrade path for pre-key-id objects is a no-op.
 pub const ENCRYPTION_KEY_ID_KEY: &str = "dg-encryption-key-id";
+
+/// Drop the at-rest encryption markers from an object's user-metadata so a
+/// SUBSEQUENT write decides them fresh: re-stamped iff that write actually
+/// encrypts, absent iff it writes plaintext (PassThrough shim / no key). This
+/// is the single home for the marker-key set — a stale marker on a plaintext
+/// (or re-encrypted) body makes reads pick the wrong key and hard-fail. Used by
+/// the re-encrypt job (maintenance) AND the delta-passthrough ship (transfer);
+/// both live ABOVE this module, so it belongs here where the consts do.
+pub(crate) fn strip_encryption_markers(
+    user_metadata: &mut std::collections::HashMap<String, String>,
+) {
+    user_metadata.remove(ENCRYPTION_MARKER_KEY);
+    user_metadata.remove(ENCRYPTION_KEY_ID_KEY);
+}
+
 const IV_LEN: usize = 12;
 const GCM_TAG_LEN: usize = 16;
 

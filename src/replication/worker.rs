@@ -81,10 +81,12 @@ async fn maybe_object_barrier() {
     }
 }
 
-/// Test-only stall placed INSIDE the per-object timeout scope so the
-/// object-timeout Elapsed arm is deterministically testable. Sleeps
-/// `DGP_TEST_COPY_STALL_MS` ms when set (>0). Inert in prod (unset → no-op).
-async fn maybe_copy_stall() {
+/// Test-only per-object stall, called in BOTH the forward-copy pass (inside the
+/// per-object timeout scope, so the object-timeout Elapsed arm is testable) AND
+/// the delete pass (so a kill lands deterministically mid-delete). Sleeps
+/// `DGP_TEST_COPY_STALL_MS` ms when set (>0) — the env var keeps its historical
+/// name. Inert in prod (unset → no-op).
+async fn maybe_pass_stall() {
     let ms: u64 = crate::config::env_parse_with_default("DGP_TEST_COPY_STALL_MS", 0);
     if ms > 0 {
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
@@ -774,7 +776,7 @@ async fn copy_one_object(
     let copy_fut = async {
         // Test-only stall INSIDE the timeout scope (inert in prod) so the
         // object-timeout Elapsed arm is deterministically exercisable.
-        maybe_copy_stall().await;
+        maybe_pass_stall().await;
         copy_object_with_retries(engine, transfer).await
     };
     let copy_result = match object_timeout {
@@ -1335,7 +1337,7 @@ async fn run_delete_pass(
                         // Source missing → replicate the deletion.
                         // Same test-only stall as the copy path: lets a kill land
                         // deterministically mid-delete-pass (inert in prod).
-                        maybe_copy_stall().await;
+                        maybe_pass_stall().await;
                         match engine.delete(&rule.destination.bucket, dest_key).await {
                             Ok(_) => {
                                 totals.objects_deleted += 1;

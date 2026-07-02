@@ -615,10 +615,11 @@ fn cache_hit_fresh(cached: &ParityCacheEntry, lite_stored_etag: &Option<String>)
 /// first (HEAD-free, but ONLY when the stored-etag still matches), then a bounded
 /// HEAD burst for the misses + the changed objects, persisting fresh results so
 /// the next verify is HEAD-free. `source` is keyed by the dest-namespace key.
-#[allow(clippy::too_many_arguments)]
+///
 /// Returns the number of keys left UNRESOLVED by a transient HEAD failure —
 /// the caller must treat a non-zero count as a partial audit (in_sync=false),
 /// since a dropped key can't be compared and would otherwise vanish silently.
+#[allow(clippy::too_many_arguments)]
 async fn resolve_logical(
     engine: &DynEngine,
     rule: &ReplicationRule,

@@ -837,6 +837,21 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         Ok(result)
     }
 
+    /// Guard a PASSTHROUGH store against the passthrough ceiling (64 GiB
+    /// default), NOT the much smaller delta `max_object_size`. Every
+    /// passthrough sink shares this — a new one that forgets the check would
+    /// let an object past the wrong limit. (The delta path uses its own
+    /// strategy-aware ceiling in `store_spooled_delta`; don't route it here.)
+    fn ensure_within_passthrough_ceiling(&self, total_size: u64) -> Result<(), EngineError> {
+        if total_size > self.max_passthrough_object_size {
+            return Err(EngineError::TooLarge {
+                size: total_size,
+                max: self.max_passthrough_object_size,
+            });
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn store_passthrough_chunked_inner(
         &self,
@@ -848,13 +863,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         user_metadata: HashMap<String, String>,
         multipart_etag: Option<String>,
     ) -> Result<StoreResult, EngineError> {
-        // Passthrough store → passthrough ceiling (see the multipart_etag twin).
-        if total_size > self.max_passthrough_object_size {
-            return Err(EngineError::TooLarge {
-                size: total_size,
-                max: self.max_passthrough_object_size,
-            });
-        }
+        self.ensure_within_passthrough_ceiling(total_size)?;
 
         // Invalidate stale metadata on overwrite
         self.metadata_cache.invalidate(bucket, key);
@@ -927,13 +936,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         user_metadata: HashMap<String, String>,
         multipart_etag: String,
     ) -> Result<StoreResult, EngineError> {
-        // Passthrough store → passthrough ceiling (see the source_path twin).
-        if total_size > self.max_passthrough_object_size {
-            return Err(EngineError::TooLarge {
-                size: total_size,
-                max: self.max_passthrough_object_size,
-            });
-        }
+        self.ensure_within_passthrough_ceiling(total_size)?;
 
         self.metadata_cache.invalidate(bucket, key);
         let (obj_key, deltaspace_id) = Self::validated_key_ingest(bucket, key)?;
@@ -1016,16 +1019,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         user_metadata: HashMap<String, String>,
         multipart_etag: String,
     ) -> Result<StoreResult, EngineError> {
-        // This stores a PASSTHROUGH object → the passthrough ceiling, NOT the
-        // (much smaller) delta max_object_size. Using the delta limit here made
-        // a >100MB passthrough object un-rotatable (TooLarge) even though its
-        // own PUT succeeded. Mirrors the store_spooled_delta ceiling logic.
-        if total_size > self.max_passthrough_object_size {
-            return Err(EngineError::TooLarge {
-                size: total_size,
-                max: self.max_passthrough_object_size,
-            });
-        }
+        self.ensure_within_passthrough_ceiling(total_size)?;
 
         self.metadata_cache.invalidate(bucket, key);
         let (obj_key, deltaspace_id) = Self::validated_key_ingest(bucket, key)?;
@@ -1107,12 +1101,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
     ) -> Result<PassthroughMultipartHandle, EngineError> {
-        if total_size > self.max_passthrough_object_size {
-            return Err(EngineError::TooLarge {
-                size: total_size,
-                max: self.max_passthrough_object_size,
-            });
-        }
+        self.ensure_within_passthrough_ceiling(total_size)?;
 
         self.metadata_cache.invalidate(bucket, key);
         let (obj_key, deltaspace_id) = Self::validated_key_ingest(bucket, key)?;

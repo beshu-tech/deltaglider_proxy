@@ -796,14 +796,7 @@ pub(crate) fn can_delta_passthrough(
     }
 }
 
-/// Drop the at-rest encryption markers so the DEST write decides them fresh:
-/// re-stamped iff the dest actually encrypts, absent iff it writes plaintext
-/// (PassThrough shim / no key). Keeps stored metadata consistent with the body.
-fn strip_encryption_markers(user_metadata: &mut std::collections::HashMap<String, String>) {
-    use crate::storage::encrypting::{ENCRYPTION_KEY_ID_KEY, ENCRYPTION_MARKER_KEY};
-    user_metadata.remove(ENCRYPTION_MARKER_KEY);
-    user_metadata.remove(ENCRYPTION_KEY_ID_KEY);
-}
+use crate::storage::encrypting::strip_encryption_markers;
 
 /// Build an [`EncFingerprint`] from at-rest user-metadata markers.
 fn enc_fingerprint(meta: &crate::types::FileMetadata) -> EncFingerprint {

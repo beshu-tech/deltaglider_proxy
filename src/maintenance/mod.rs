@@ -146,15 +146,11 @@ pub fn needs_rewrite(user_metadata: &HashMap<String, String>, desired: &DesiredE
     }
 }
 
-/// Remove the proxy-encryption markers from a metadata map. Used when
-/// rewriting toward `Plain` (and harmlessly before any re-encrypting
-/// store, which re-stamps them): a decrypted object that KEPT a stale
-/// `dg-encrypted` marker would make every subsequent read attempt AEAD
-/// decryption of plaintext and fail.
-pub fn strip_encryption_markers(user_metadata: &mut HashMap<String, String>) {
-    user_metadata.remove(ENCRYPTION_MARKER_KEY);
-    user_metadata.remove(ENCRYPTION_KEY_ID_KEY);
-}
+// `strip_encryption_markers` lives in `storage::encrypting` (where the marker
+// consts do) — the single home shared by the re-encrypt job here AND the
+// delta-passthrough ship in `transfer`. Re-exported so `super::` callers in this
+// module are unaffected.
+pub(crate) use crate::storage::encrypting::strip_encryption_markers;
 
 /// Display percent for a job ROW: 100 once completed, otherwise
 /// [`progress_percent`]. The one home for the rule both admin views
