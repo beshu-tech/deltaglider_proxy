@@ -65,7 +65,21 @@ async fn start_reencrypt(
 
 /// Poll the session-light bucket endpoint until no job is active.
 async fn wait_job_done(admin: &reqwest::Client, endpoint: &str, bucket: &str) {
-    for _ in 0..600 {
+    wait_job_done_within(admin, endpoint, bucket, 600).await;
+}
+
+/// Like [`wait_job_done`] but with an explicit poll budget (×100ms). The
+/// crash-resume path needs a longer budget: the killed job's lease must LAPSE
+/// (LEASE_TTL_SECS = 60s) before the boot reconcile requeues it — the HA safety
+/// that a live peer's job is never resurrected — so the resume can't even start
+/// for ~60s after the crash.
+async fn wait_job_done_within(
+    admin: &reqwest::Client,
+    endpoint: &str,
+    bucket: &str,
+    max_polls: usize,
+) {
+    for _ in 0..max_polls {
         let v: serde_json::Value = admin
             .get(format!("{endpoint}/_/api/admin/jobs/bucket/{bucket}"))
             .send()
@@ -79,7 +93,10 @@ async fn wait_job_done(admin: &reqwest::Client, endpoint: &str, bucket: &str) {
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    panic!("maintenance job on '{bucket}' did not finish within 60s");
+    panic!(
+        "maintenance job on '{bucket}' did not finish within {}s",
+        max_polls / 10
+    );
 }
 
 /// Newest job row from the admin list.
@@ -639,9 +656,10 @@ async fn test_reencrypt_resumes_after_restart() {
     let endpoint = server.endpoint();
     let admin = admin_http_client(&endpoint).await;
 
-    // Boot reconcile requeues the interrupted job; the worker resumes it. Wait
-    // for the bucket to go idle, then assert the FINAL state is fully encrypted.
-    wait_job_done(&admin, &endpoint, bucket).await;
+    // Boot reconcile requeues the interrupted job AFTER its lease lapses
+    // (LEASE_TTL_SECS = 60s), then the worker resumes it. Budget 150s to cover
+    // the lease-lapse wait + the resumed sweep on a slow CI runner.
+    wait_job_done_within(&admin, &endpoint, bucket, 1500).await;
 
     // Every object is ciphertext on disk (no plaintext marker survives) — the
     // resume finished the work the crash interrupted.

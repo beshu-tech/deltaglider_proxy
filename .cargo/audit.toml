@@ -8,4 +8,12 @@ ignore = [
     # We never set a custom global logger, so the unsoundness can't be
     # triggered. Waiting for rand 0.9.3+.
     "RUSTSEC-2026-0097",
+
+    # quick-xml 0.40.1 (memory-exhaustion + quadratic-runtime XML DoS): a
+    # TRANSITIVE pin of `s3s = 0.14.0` (the S3 protocol adapter), which requires
+    # `quick-xml ^0.40.1` and so excludes the fixed 0.41.0. No route to bump
+    # without an upstream s3s release loosening the constraint. Tracked; remove
+    # both once s3s ships a build on quick-xml >= 0.41.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]

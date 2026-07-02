@@ -128,9 +128,9 @@ function registerApplyHandler(
  * true if a handler ran (so the caller can `preventDefault` the
  * browser's "save page" dialog). Returns false when no handler is
  * registered (e.g. on Diagnostics pages) so the browser default
- * can proceed.
+ * can proceed. Module-private — callers go through `requestApplyFirst`.
  */
-export function requestApplyCurrent(key: DirtyKey | null): boolean {
+function requestApplyCurrent(key: DirtyKey | null): boolean {
   if (!key) return false;
   const stack = applyHandlers.get(key);
   if (!stack || stack.length === 0) return false;
