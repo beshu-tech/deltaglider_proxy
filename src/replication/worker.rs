@@ -1035,6 +1035,27 @@ fn control_verdict(
     }
 }
 
+/// PURE: `control_verdict` plus the mid-run maintenance overlay. A dest bucket
+/// that went write-gated mid-run defers like a pause (cursor kept) — but ONLY
+/// when nothing higher-precedence fired: a kill or a lost lease MUST still win
+/// (we're stopping regardless; the reason matters for status/settle). `one_off`
+/// does NOT suppress the maintenance defer (a one-off must not write into a
+/// bucket being rewritten either).
+fn control_verdict_with_maintenance(
+    cancel_requested: bool,
+    paused: bool,
+    one_off: bool,
+    lease_ok: bool,
+    maint_busy: bool,
+) -> ControlVerdict {
+    let base = control_verdict(cancel_requested, paused, one_off, lease_ok);
+    if base == ControlVerdict::Continue && maint_busy {
+        ControlVerdict::Paused
+    } else {
+        base
+    }
+}
+
 /// Uniform run-control: kill / pause / lease evaluated identically at every
 /// page boundary of every pass (forward copy, delete pass, oracle descent).
 struct RunControl {
@@ -1089,14 +1110,13 @@ impl RunControl {
             .as_ref()
             .map(|g| g.is_busy(&self.dest_bucket))
             .unwrap_or(false);
-        let verdict = if control_verdict(cancel_requested, false, self.one_off, lease_ok)
-            == ControlVerdict::Continue
-            && maint_busy
-        {
-            ControlVerdict::Paused
-        } else {
-            control_verdict(cancel_requested, paused, self.one_off, lease_ok)
-        };
+        let verdict = control_verdict_with_maintenance(
+            cancel_requested,
+            paused,
+            self.one_off,
+            lease_ok,
+            maint_busy,
+        );
         if verdict == ControlVerdict::LeaseLost && renew {
             log_failure(
                 &self.db,
@@ -1780,6 +1800,43 @@ mod tests {
                 "cancel={cancel} paused={paused} one_off={one_off} lease_ok={lease_ok}"
             );
         }
+    }
+
+    #[test]
+    fn maintenance_overlay_defers_only_from_continue() {
+        use ControlVerdict::*;
+        // maint_busy turns a Continue into Paused (mid-run defer) — even for a
+        // one-off (must not write into a bucket being rewritten).
+        assert_eq!(
+            control_verdict_with_maintenance(false, false, false, true, true),
+            Paused
+        );
+        assert_eq!(
+            control_verdict_with_maintenance(false, false, true, true, true),
+            Paused,
+            "one-off is NOT exempt from the maintenance defer"
+        );
+        // Without maint_busy, base verdict is unchanged.
+        assert_eq!(
+            control_verdict_with_maintenance(false, false, false, true, false),
+            Continue
+        );
+        // Higher-precedence verdicts are NOT masked by the maintenance overlay.
+        assert_eq!(
+            control_verdict_with_maintenance(true, false, false, true, true),
+            Killed,
+            "kill must win over a maintenance defer"
+        );
+        assert_eq!(
+            control_verdict_with_maintenance(false, false, false, false, true),
+            LeaseLost,
+            "lease loss must win over a maintenance defer"
+        );
+        // Already-Paused stays Paused (idempotent overlay).
+        assert_eq!(
+            control_verdict_with_maintenance(false, true, false, true, true),
+            Paused
+        );
     }
 
     #[test]

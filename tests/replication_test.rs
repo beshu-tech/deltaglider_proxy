@@ -2318,6 +2318,78 @@ async fn test_replication_delete_rule_refused_under_live_run_then_succeeds() {
     assert_eq!(code, 404, "run-now on a deleted rule is 404");
 }
 
+/// Finding #17: a parity VERIFY fired while a replication run of the same rule
+/// is live must 409 (the dest is mid-sync — a verdict would be a false
+/// 'not in sync'). Same lease-race technique as the delete test: the run lease
+/// exists in the gap right after the 202, before the run row.
+#[tokio::test]
+async fn test_replication_verify_refused_under_live_run() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(DELRULE_YAML)
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    for b in ["dr-src", "dr-dst"] {
+        client.create_bucket().bucket(b).send().await.ok();
+    }
+    for i in 0..150 {
+        client
+            .put_object()
+            .bucket("dr-src")
+            .key(format!("obj-{i:03}.txt"))
+            .body(ByteStream::from(format!("p-{i}").into_bytes()))
+            .send()
+            .await
+            .expect("seed");
+    }
+    let admin = admin_http_client(&server.endpoint()).await;
+    let ep = server.endpoint();
+
+    let resp = admin
+        .post(format!(
+            "{ep}/_/api/admin/jobs/replication:del-rule/run-now"
+        ))
+        .send()
+        .await
+        .expect("run-now");
+    assert_eq!(resp.status().as_u16(), 202);
+
+    // The lease is held in the acquire-to-run-row gap → verify must 409.
+    let code = admin
+        .post(format!("{ep}/_/api/admin/jobs/replication:del-rule/verify"))
+        .send()
+        .await
+        .expect("verify")
+        .status()
+        .as_u16();
+    assert_eq!(code, 409, "verify under a live run (lease held) must 409");
+
+    // After kill + settle, verify is allowed again (202/200).
+    fire_kill(&admin, &ep, "del-rule").await;
+    let run = wait_for_latest_run(&admin, &ep, "del-rule").await;
+    assert_eq!(run["status"].as_str(), Some("cancelled"), "{run}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let code = admin
+            .post(format!("{ep}/_/api/admin/jobs/replication:del-rule/verify"))
+            .send()
+            .await
+            .expect("verify")
+            .status()
+            .as_u16();
+        if code == 202 || code == 200 {
+            break;
+        }
+        assert_eq!(code, 409, "verify after settle: unexpected {code}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "verify kept 409ing after the run settled"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 const TRUNC_RULE_YAML: &str = "
 replication:
   enabled: true

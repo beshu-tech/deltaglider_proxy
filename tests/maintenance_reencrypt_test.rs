@@ -485,7 +485,7 @@ async fn test_reencrypt_key_rotation_a_to_b() {
             })
             .collect()
     };
-    let before = stamped_kids(&data_dir);
+    let before = stamped_kids(data_dir);
     assert!(
         !before.is_empty(),
         "objects must be encrypted before rotation"
@@ -523,7 +523,7 @@ async fn test_reencrypt_key_rotation_a_to_b() {
         v1_expected,
         "delta object must reconstruct byte-identical under B"
     );
-    let after = stamped_kids(&data_dir);
+    let after = stamped_kids(data_dir);
     assert!(
         after.iter().all(|k| k == KEY_B_ID),
         "all objects re-stamped to B after rotation: {after:?}"
