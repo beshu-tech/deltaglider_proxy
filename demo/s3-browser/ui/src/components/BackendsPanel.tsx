@@ -346,7 +346,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
               backends.length === 0
                 ? 'No backend configured.'
                 : backends.every((b) => b.is_synthesized)
-                  ? 'Running on the legacy singleton backend (shown below). Add a named backend to migrate to the multi-backend shape; the singleton stays active until you clear `storage.backend` in YAML.'
+                  ? 'Running on a single unnamed backend (below). Add a named backend to move to the multi-backend setup.'
                   : `${backends.length} backend${backends.length !== 1 ? 's' : ''} configured.`
             }
           />

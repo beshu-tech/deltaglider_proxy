@@ -206,11 +206,8 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
               <div>
                 <div style={{ fontWeight: 600 }}>GUI-managed (default)</div>
                 <Text type="secondary" style={{ fontSize: 12, lineHeight: 1.5 }}>
-                  You manage users right here in the admin GUI. Users you
-                  list under
-                  <code style={{ margin: '0 4px' }}>access.users</code>
-                  in YAML are ignored. Recommended for solo and GUI-first
-                  setups.
+                  Manage users here in the admin GUI. Any users in your
+                  YAML config are ignored. Best for solo and GUI-first setups.
                 </Text>
               </div>
             </Radio>
