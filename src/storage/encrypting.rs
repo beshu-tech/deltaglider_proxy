@@ -359,6 +359,67 @@ pub fn encrypt_chunk(
     Ok(frame)
 }
 
+/// Sequences a stream of ≤64 KiB plaintext windows into framed ciphertext,
+/// owning the ONE tricky invariant of the chunked format: the LAST frame — and
+/// only the last — is stamped `is_final=true` (the read-side truncation guard),
+/// with monotonic `chunk_index` and overflow protection. A zero-byte object
+/// yields exactly one empty final frame.
+///
+/// It works one window AHEAD: `push_window` emits the PREVIOUSLY-held window as
+/// a non-final frame (we now know a successor exists) and holds the new one;
+/// `finish` emits whatever is held (or an empty window) as the final frame. Both
+/// the file→tempfile and the in-memory `Vec<Bytes>` paths drive this, so the
+/// is_final/index logic lives in exactly one place.
+struct ChunkFramer {
+    base_iv: [u8; IV_LEN],
+    index: u32,
+    /// The window seen most recently but not yet emitted (we don't know if it's
+    /// final until either another window arrives or `finish` is called).
+    pending: Option<Vec<u8>>,
+    started: bool,
+}
+
+impl ChunkFramer {
+    fn new(base_iv: [u8; IV_LEN]) -> Self {
+        Self {
+            base_iv,
+            index: 0,
+            pending: None,
+            started: false,
+        }
+    }
+
+    /// Take ownership of the next plaintext window. Returns the frame for the
+    /// PREVIOUS window (now known non-final), or `None` for the first window.
+    fn push_window(
+        &mut self,
+        key: &EncryptionKey,
+        window: Vec<u8>,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        self.started = true;
+        let emitted = match self.pending.take() {
+            Some(prev) => {
+                let frame = encrypt_chunk(key, &self.base_iv, self.index, false, &prev)?;
+                self.index = self.index.checked_add(1).ok_or_else(|| {
+                    StorageError::Encryption("chunk index overflow (object too large)".into())
+                })?;
+                Some(frame)
+            }
+            None => None,
+        };
+        self.pending = Some(window);
+        Ok(emitted)
+    }
+
+    /// Emit the final frame: the held window, or an empty final frame for a
+    /// zero-byte object (nothing was ever pushed).
+    fn finish(mut self, key: &EncryptionKey) -> Result<Vec<u8>, StorageError> {
+        let final_pt = self.pending.take().unwrap_or_default();
+        let _ = self.started;
+        encrypt_chunk(key, &self.base_iv, self.index, true, &final_pt)
+    }
+}
+
 /// Decrypt a chunk's ciphertext back to plaintext. Unlike `encrypt_chunk`,
 /// this takes the raw ciphertext (without the length prefix) — the framing
 /// is handled by `ChunkedDecryptStream`.
@@ -1101,13 +1162,11 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
                 header.extend_from_slice(&base_iv);
                 tmp.write_all(&header).map_err(io_to_storage_error)?;
 
-                // Read one plaintext window ahead so we know which frame is FINAL
-                // (the chunked format needs is_final on the last frame for the
-                // truncation guard). `cur` holds the window not yet written.
+                // Read the source in 64 KiB windows; ChunkFramer owns the
+                // is_final/index framing so this path just feeds windows and
+                // writes the frames it hands back.
+                let mut framer = ChunkFramer::new(base_iv);
                 let mut buf = vec![0u8; CHUNK_PLAINTEXT_SIZE];
-                let mut cur: Option<Vec<u8>> = None;
-                let mut chunk_index: u32 = 0;
-                let mut wrote_any = false;
                 loop {
                     // Fill a full window (short read only at EOF).
                     let mut filled = 0usize;
@@ -1123,29 +1182,16 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
                     if filled == 0 {
                         break; // EOF, no more windows
                     }
-                    let next = buf[..filled].to_vec();
-                    if let Some(prev) = cur.take() {
-                        // `prev` is followed by `next` → not final.
-                        let frame = encrypt_chunk(&key, &base_iv, chunk_index, false, &prev)?;
+                    if let Some(frame) = framer.push_window(&key, buf[..filled].to_vec())? {
                         tmp.write_all(&frame).map_err(io_to_storage_error)?;
-                        wrote_any = true;
-                        chunk_index = chunk_index.checked_add(1).ok_or_else(|| {
-                            StorageError::Encryption(
-                                "chunk index overflow (object too large)".into(),
-                            )
-                        })?;
                     }
-                    cur = Some(next);
                     if filled < CHUNK_PLAINTEXT_SIZE {
                         break; // short read = EOF
                     }
                 }
-                // Flush the FINAL frame: the last window, or an empty final frame
-                // for a zero-byte object (matches put_passthrough_chunked case a).
-                let final_pt = cur.unwrap_or_default();
-                let _ = wrote_any;
-                let frame = encrypt_chunk(&key, &base_iv, chunk_index, true, &final_pt)?;
-                tmp.write_all(&frame).map_err(io_to_storage_error)?;
+                // The final frame (or an empty final frame for a zero-byte object).
+                tmp.write_all(&framer.finish(&key)?)
+                    .map_err(io_to_storage_error)?;
                 tmp.flush().map_err(io_to_storage_error)?;
                 Ok(tmp)
             },
@@ -1235,22 +1281,13 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         let mut out_frames: Vec<Bytes> = Vec::with_capacity(chunks.len() + 4);
         out_frames.push(Bytes::from(header));
 
-        // Re-slice incoming chunks into exactly CHUNK_PLAINTEXT_SIZE
-        // windows. Multipart uploads typically arrive in 5 MiB (or
-        // bigger) chunks, so one incoming Bytes gets split into ~80
-        // plaintext windows. Small final remainder is sent as the
-        // last chunk with is_final=true.
+        // Re-slice incoming chunks into exactly CHUNK_PLAINTEXT_SIZE windows
+        // (multipart parts arrive ~5 MiB, so one Bytes splits into ~80 windows)
+        // and drive them through ChunkFramer — which owns the is_final/index
+        // invariant and the zero-byte / sub-window / boundary tail cases that
+        // used to be a 5-branch hand-rolled block here.
+        let mut framer = ChunkFramer::new(base_iv);
         let mut pt_window: Vec<u8> = Vec::with_capacity(CHUNK_PLAINTEXT_SIZE);
-        let mut chunk_index: u32 = 0;
-
-        // Two-phase iteration: collect full windows, then flush the
-        // tail as the final chunk. We need to know when we're on the
-        // LAST non-empty window to stamp is_final=true correctly; so
-        // we accumulate all full windows first, then emit them with
-        // is_final=false if any tail remains, else the last one gets
-        // is_final=true.
-        let mut pending_frames: Vec<Vec<u8>> = Vec::new();
-
         for incoming in chunks {
             let mut remaining: &[u8] = incoming.as_ref();
             while !remaining.is_empty() {
@@ -1259,85 +1296,22 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
                 pt_window.extend_from_slice(&remaining[..take]);
                 remaining = &remaining[take..];
                 if pt_window.len() == CHUNK_PLAINTEXT_SIZE {
-                    // Emit this window; don't know yet if it's final.
-                    pending_frames.push(pt_window.clone());
-                    pt_window.clear();
-                    // Soft cap: if we've buffered many pending frames
-                    // that we know for sure aren't final, flush them
-                    // (the earlier chunk can't be final). This keeps
-                    // pending_frames memory bounded at ~1 frame (~65K)
-                    // instead of growing with object size.
-                    if pending_frames.len() > 1 {
-                        let frame_idx = chunk_index;
-                        let pt = pending_frames.remove(0);
-                        let frame = encrypt_chunk(&key, &base_iv, frame_idx, false, &pt)?;
+                    if let Some(frame) = framer.push_window(&key, std::mem::take(&mut pt_window))? {
                         out_frames.push(Bytes::from(frame));
-                        chunk_index = chunk_index.checked_add(1).ok_or_else(|| {
-                            StorageError::Encryption(
-                                "chunk index overflow (> 2^32 chunks — object too large)".into(),
-                            )
-                        })?;
                     }
+                    pt_window = Vec::with_capacity(CHUNK_PLAINTEXT_SIZE);
                 }
             }
         }
-
-        // End of input. `pending_frames` holds 0 or 1 full 64-KiB
-        // window; `pt_window` holds 0..CHUNK_PLAINTEXT_SIZE bytes of
-        // tail.
-        //
-        // Cases:
-        //   (a) Both empty and chunk_index == 0: object is zero-bytes.
-        //       Emit one frame with empty plaintext, is_final=true.
-        //   (b) Both empty and chunk_index > 0: the last emitted frame
-        //       was the true tail but we stamped it is_final=false
-        //       (the 2-frame pipeline stamps only after confirming a
-        //       follower exists). Fix by: we always keep at least one
-        //       frame queued; the invariant is that `pending_frames`
-        //       has the true final frame when input ends, plus maybe
-        //       a non-empty `pt_window`.
-        //   (c) pending_frames has 1 frame and pt_window is empty: the
-        //       pending frame IS the final frame (full 64 KiB).
-        //   (d) pending_frames has 1 frame and pt_window is non-empty:
-        //       the pending frame is non-final, pt_window is final.
-        //   (e) pending_frames is empty and pt_window is non-empty:
-        //       pt_window is the ONLY and final frame (object smaller
-        //       than 64 KiB).
-
-        if pending_frames.is_empty() && pt_window.is_empty() && chunk_index == 0 {
-            // Zero-byte object (case a).
-            let frame = encrypt_chunk(&key, &base_iv, 0, true, &[])?;
-            out_frames.push(Bytes::from(frame));
-        } else if pending_frames.len() == 1 && pt_window.is_empty() {
-            // Case (c): the queued frame is final.
-            let pt = pending_frames.remove(0);
-            let frame = encrypt_chunk(&key, &base_iv, chunk_index, true, &pt)?;
-            out_frames.push(Bytes::from(frame));
-        } else if pending_frames.len() == 1 && !pt_window.is_empty() {
-            // Case (d): queued frame is non-final, pt_window is final.
-            let pt = pending_frames.remove(0);
-            let frame = encrypt_chunk(&key, &base_iv, chunk_index, false, &pt)?;
-            out_frames.push(Bytes::from(frame));
-            chunk_index = chunk_index.checked_add(1).ok_or_else(|| {
-                StorageError::Encryption(
-                    "chunk index overflow (> 2^32 chunks — object too large)".into(),
-                )
-            })?;
-            let tail = encrypt_chunk(&key, &base_iv, chunk_index, true, &pt_window)?;
-            out_frames.push(Bytes::from(tail));
-        } else if pending_frames.is_empty() && !pt_window.is_empty() {
-            // Case (e): sub-64KiB object.
-            let frame = encrypt_chunk(&key, &base_iv, chunk_index, true, &pt_window)?;
-            out_frames.push(Bytes::from(frame));
-        } else {
-            // Case (b): unreachable given the drain-on-2-frames
-            // invariant above. If we ever hit it, the safe play is
-            // to fail loudly rather than produce a stream without a
-            // final-flag-set chunk (which would fail decrypt).
-            return Err(StorageError::Encryption(
-                "internal: chunking invariant violated (no final frame)".into(),
-            ));
+        // Feed a non-empty tail (sub-window remainder) as the last window, then
+        // let the framer emit the final frame. An all-empty input → finish()
+        // emits the single empty final frame (zero-byte object).
+        if !pt_window.is_empty() {
+            if let Some(frame) = framer.push_window(&key, pt_window)? {
+                out_frames.push(Bytes::from(frame));
+            }
         }
+        out_frames.push(Bytes::from(framer.finish(&key)?));
 
         let mut meta = metadata.clone();
         mark_chunked_encrypted(&mut meta, self.current_key_id().as_deref());
@@ -2010,6 +1984,72 @@ mod tests {
         assert_ne!(a, b, "AAD must differ when final flag differs");
         assert_eq!(a[8], 0);
         assert_eq!(b[8], 1);
+    }
+
+    /// ChunkFramer owns the is_final/index invariant for BOTH the file and the
+    /// in-memory chunked paths. Feed it N full windows + an optional tail and
+    /// assert: exactly one final frame (the last), monotonic 0..k indices, and a
+    /// zero-window input still emits one empty final frame. Decrypting each frame
+    /// with the index/is_final it was framed under must succeed (any drift in
+    /// index or final-flag placement fails the AEAD auth).
+    #[test]
+    fn chunk_framer_stamps_final_and_index_correctly() {
+        let key = test_key();
+        let base_iv = test_base_iv();
+
+        // Drive the framer with `n_full` full windows + a `tail_len`-byte tail
+        // (tail_len == 0 means no tail). Returns the emitted frames in order.
+        let run = |n_full: usize, tail_len: usize| -> Vec<Vec<u8>> {
+            let mut framer = ChunkFramer::new(base_iv);
+            let mut frames = Vec::new();
+            for i in 0..n_full {
+                let w = vec![(i as u8).wrapping_add(1); CHUNK_PLAINTEXT_SIZE];
+                if let Some(f) = framer.push_window(&key, w).unwrap() {
+                    frames.push(f);
+                }
+            }
+            if tail_len > 0 {
+                if let Some(f) = framer.push_window(&key, vec![0xAB; tail_len]).unwrap() {
+                    frames.push(f);
+                }
+            }
+            frames.push(framer.finish(&key).unwrap());
+            frames
+        };
+
+        // Decode a frame body (strip the 4-byte LE length prefix) and verify it
+        // decrypts under (index, is_final) — proving the framer stamped both.
+        let verify = |frames: &[Vec<u8>]| {
+            let last = frames.len() - 1;
+            for (idx, frame) in frames.iter().enumerate() {
+                let ct = &frame[CHUNK_FRAME_LEN_FIELD..];
+                let is_final = idx == last;
+                decrypt_chunk(&key, &base_iv, idx as u32, is_final, ct)
+                    .unwrap_or_else(|e| panic!("frame {idx} (final={is_final}) failed: {e:?}"));
+                // A non-final frame must NOT verify as final and vice-versa.
+                assert!(
+                    decrypt_chunk(&key, &base_iv, idx as u32, !is_final, ct).is_err(),
+                    "frame {idx} verified under the WRONG final-flag — is_final drift"
+                );
+            }
+        };
+
+        // Zero-byte object → exactly one empty final frame.
+        let z = run(0, 0);
+        assert_eq!(z.len(), 1, "zero-byte → one final frame");
+        verify(&z);
+        // Sub-window, exact one window, one window + tail, several + tail.
+        for (n_full, tail) in [(0, 100), (1, 0), (1, 7), (3, 0), (3, 4096)] {
+            let frames = run(n_full, tail);
+            let expected = n_full + if tail > 0 { 1 } else { 0 };
+            let expected = expected.max(1); // always ≥1 (the final frame)
+            assert_eq!(
+                frames.len(),
+                expected,
+                "n_full={n_full} tail={tail} frame count"
+            );
+            verify(&frames);
+        }
     }
 
     #[test]
