@@ -17,6 +17,10 @@ const queryClient = new QueryClient({
     queries: {
       staleTime: 5_000, // 5s: deduplicate concurrent reads from sibling panels
       refetchOnWindowFocus: true,
+      // A backgrounded tab does NOT keep firing refetchInterval pollers (jobs,
+      // parity, maintenance) — they resume on return. Explicit so it can't
+      // silently flip; a hidden tab shouldn't hammer the admin API every 2s.
+      refetchIntervalInBackground: false,
       retry: 1, // one retry; bigger N hides real backend issues
     },
     mutations: {

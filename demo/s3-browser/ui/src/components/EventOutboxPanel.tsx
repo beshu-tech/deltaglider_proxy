@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useVisiblePolling } from '../useVisiblePolling';
 import { Alert, Button, Input, message, Select, Space, Switch, Table, Tag, Typography } from 'antd';
 import {
   DatabaseOutlined,
@@ -111,11 +112,8 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
     void refresh();
   }, [refresh]);
 
-  useEffect(() => {
-    if (!autoRefresh) return;
-    const id = setInterval(() => void refresh(), 3000);
-    return () => clearInterval(id);
-  }, [autoRefresh, refresh]);
+  // Visibility-gated: a backgrounded tab stops polling and catches up on return.
+  useVisiblePolling(() => void refresh(), 3000, autoRefresh);
 
   const filtered = useMemo(() => {
     const q = filter.trim().toLowerCase();

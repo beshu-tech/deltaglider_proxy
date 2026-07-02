@@ -24,6 +24,7 @@
  */
 import { useEffect, useMemo, useState } from 'react';
 import { Typography, Input, Button, Tag, Alert, Space, Switch } from 'antd';
+import { useVisiblePolling } from '../useVisiblePolling';
 import {
   ReloadOutlined,
   SearchOutlined,
@@ -98,15 +99,10 @@ export default function AuditLogPanel({ onSessionExpired }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Auto-refresh. Interval is intentionally 3s — quick enough for
-  // incident-debugging ("does my click show up?") without being
-  // abusive.
-  useEffect(() => {
-    if (!autoRefresh) return;
-    const id = setInterval(() => void refresh(), 3000);
-    return () => clearInterval(id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoRefresh]);
+  // Auto-refresh. 3s — quick enough for incident-debugging ("does my click show
+  // up?") without being abusive. Visibility-gated: a backgrounded tab stops
+  // polling and catches up on return, instead of hammering the audit endpoint.
+  useVisiblePolling(() => void refresh(), 3000, autoRefresh);
 
   // Client-side filter — free-text substring match across action,
   // user, target, ip, bucket, and path. Deliberately lenient:
