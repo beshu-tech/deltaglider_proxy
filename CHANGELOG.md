@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.9.5 — 2026-07-02
+
 Jobs-screen usability fixes.
 
 ### Fixed
