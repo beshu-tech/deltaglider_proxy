@@ -191,19 +191,22 @@ assert.deepEqual(rerunVerdictMeta({ verdict: 'conditional', why: 'newer_wins_dep
   color: 'blue',
   tone: 'maybe',
 });
-// THE LIE — skip-if-dest-exists mismatch: a HARD no (red).
+// THE LIE — skip-if-dest-exists mismatch: a HARD no (red). The verdict label is
+// now a fixed short chip; the specific cause moved to `cause` (de-dup fix so the
+// WHY column doesn't say the same thing twice).
 {
   const m = rerunVerdictMeta({ verdict: 'no', why: 'policy_skips_existing_dest' });
   assert.equal(m.color, 'red', 'policy-skip is a hard (red) no');
   assert.equal(m.tone, 'bad');
-  assert.match(m.label, /skips existing destination/);
+  assert.equal(m.label, "Re-run won't help");
+  assert.match(m.cause, /skips existing destination/);
 }
 // dest newer / copy failing — also hard (red) no.
 assert.equal(rerunVerdictMeta({ verdict: 'no', why: 'dest_newer_than_source' }).color, 'red');
 assert.equal(rerunVerdictMeta({ verdict: 'no', why: 'copy_keeps_failing' }).color, 'red');
-// tied timestamps — a distinct, honest label (not the false "destination is newer").
+// tied timestamps — a distinct, honest cause (not the false "destination is newer").
 assert.match(
-  rerunVerdictMeta({ verdict: 'no', why: 'tied_timestamps_no_winner' }).label,
+  rerunVerdictMeta({ verdict: 'no', why: 'tied_timestamps_no_winner' }).cause,
   /timestamps tied/,
 );
 // orphan-needs-delete / foreign — soft (gold) no: the real fix is an out-of-band delete.
