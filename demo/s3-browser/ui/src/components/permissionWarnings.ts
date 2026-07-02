@@ -62,14 +62,14 @@ function nearestBucket(bucket: string, knownBuckets: string[]): string | undefin
  * to avoid false positives.
  */
 export function unknownBucketWarnings(
-  resources: string,
+  resources: string[],
   knownBuckets: string[],
 ): ResourceWarning[] {
   if (knownBuckets.length === 0) return [];
   const known = new Set(knownBuckets);
   const out: ResourceWarning[] = [];
   const seen = new Set<string>();
-  for (const part of resources.split(',')) {
+  for (const part of resources) {
     const trimmed = part.trim();
     if (!trimmed || trimmed === '*') continue;
     const { bucket, global } = parseResourcePattern(trimmed);
@@ -101,10 +101,10 @@ function hasWhitespaceOrControl(s: string): boolean {
  * and slashes are fine. Returns one human-readable reason per offending pattern
  * (empty list = all valid).
  */
-export function invalidPatternWarnings(resources: string): string[] {
+export function invalidPatternWarnings(resources: string[]): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
-  for (const part of resources.split(',')) {
+  for (const part of resources) {
     const trimmed = part.trim();
     if (!trimmed || seen.has(trimmed)) continue;
     seen.add(trimmed);

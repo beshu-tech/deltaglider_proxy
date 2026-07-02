@@ -22,8 +22,8 @@ import ConditionPrefixInput from './ConditionPrefixInput';
 
 const { Text } = Typography;
 
-function firstConcreteResourceBucket(resources: string): string {
-  for (const part of resources.split(',')) {
+function firstConcreteResourceBucket(resources: string[]): string {
+  for (const part of resources) {
     const parsed = parseResourcePattern(part);
     if (parsed.bucket && !parsed.bucket.includes('${')) return parsed.bucket;
   }
@@ -163,7 +163,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
         // if it has no actions OR no resource. Surface it so the drop is never a
         // surprise — the operator sees exactly which half is missing.
         const noActions = effectiveActions(row.actions).size === 0;
-        const noResource = row.resources.trim() === '';
+        const noResource = row.resources.every((r) => r.trim() === '');
         const isIncomplete = noActions || noResource;
 
         return (
@@ -412,7 +412,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
         );
       })}
 
-      <Button type="dashed" icon={<PlusOutlined />} onClick={() => onChange([...permissions, { _uiId: freshPermissionRowId(), effect: 'Allow', actions: [], resources: '' }])} block style={{ borderRadius: 8, marginBottom: 16 }}>
+      <Button type="dashed" icon={<PlusOutlined />} onClick={() => onChange([...permissions, { _uiId: freshPermissionRowId(), effect: 'Allow', actions: [], resources: [] }])} block style={{ borderRadius: 8, marginBottom: 16 }}>
         Add Permission Rule
       </Button>
     </>

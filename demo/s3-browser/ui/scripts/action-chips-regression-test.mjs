@@ -92,18 +92,19 @@ assert.equal(grantSummary(['admin']), 'Manage buckets. Grants admin.');
 assert.equal(grantSummary(['write', 'admin']), 'Upload & manage buckets. Grants write, admin.');
 
 // isPrefixScoped — the truth table that drives the Admin-chip guard.
-assert.equal(isPrefixScoped('beshu'), false, 'bucket only → admin offered');
-assert.equal(isPrefixScoped('beshu/*'), false, 'bucket wildcard → admin offered');
-assert.equal(isPrefixScoped('beshu/ror/*'), true, 'sub-prefix → admin suppressed');
-assert.equal(isPrefixScoped('*'), false, 'global → admin offered');
-assert.equal(isPrefixScoped(''), false, 'empty → false');
-assert.equal(isPrefixScoped('   '), false, 'whitespace-only → false');
+// Now takes a string[] (resources are an array end-to-end, never comma-joined).
+assert.equal(isPrefixScoped(['beshu']), false, 'bucket only → admin offered');
+assert.equal(isPrefixScoped(['beshu/*']), false, 'bucket wildcard → admin offered');
+assert.equal(isPrefixScoped(['beshu/ror/*']), true, 'sub-prefix → admin suppressed');
+assert.equal(isPrefixScoped(['*']), false, 'global → admin offered');
+assert.equal(isPrefixScoped([]), false, 'empty → false');
+assert.equal(isPrefixScoped(['   ']), false, 'whitespace-only → false');
 // Mixed: any bucket-level resource → admin offered (.every short-circuits).
-assert.equal(isPrefixScoped('beshu/ror/*, beshu'), false, 'mixed with a bucket → admin offered');
-assert.equal(isPrefixScoped('beshu/ror/*, beshu/x/*'), true, 'all sub-prefix → suppressed');
-assert.equal(isPrefixScoped('beshu/ror/*, *'), false, 'any global → admin offered');
+assert.equal(isPrefixScoped(['beshu/ror/*', 'beshu']), false, 'mixed with a bucket → admin offered');
+assert.equal(isPrefixScoped(['beshu/ror/*', 'beshu/x/*']), true, 'all sub-prefix → suppressed');
+assert.equal(isPrefixScoped(['beshu/ror/*', '*']), false, 'any global → admin offered');
 // Template bucket: with a prefix → suppressed (privilege-safe); without → offered.
-assert.equal(isPrefixScoped('${iam:username}/x/*'), true, 'templated bucket + prefix → suppressed');
-assert.equal(isPrefixScoped('${iam:username}/*'), false, 'templated bucket, no prefix → offered');
+assert.equal(isPrefixScoped(['${iam:username}/x/*']), true, 'templated bucket + prefix → suppressed');
+assert.equal(isPrefixScoped(['${iam:username}/*']), false, 'templated bucket, no prefix → offered');
 
 console.log('action chips regression checks passed');

@@ -13,7 +13,9 @@ export interface PermissionRow {
   _uiId?: string;
   effect: string;
   actions: string[];
-  resources: string;
+  /** Resource patterns as an ARRAY — never a comma-joined string (a pattern
+   *  may legitimately contain a comma). Edited via ResourcePatternInput. */
+  resources: string[];
   conditions?: Record<string, Record<string, string | string[]>>;
 }
 
@@ -30,20 +32,20 @@ export function permissionsToRows(perms: IamPermission[]): PermissionRow[] {
     _uiId: freshPermissionRowId(),
     effect: p.effect || 'Allow',
     actions: [...p.actions],
-    resources: p.resources.join(', '),
+    resources: [...p.resources],
     conditions: p.conditions,
   }));
 }
 
 export function rowsToPermissions(rows: PermissionRow[]): IamPermission[] {
   return rows
-    .filter(r => r.actions.length > 0 && r.resources.trim() !== '')
+    .filter(r => r.actions.length > 0 && r.resources.some(res => res.trim() !== ''))
     .map(r => {
       const perm: IamPermission = {
         id: 0,
         effect: r.effect || 'Allow',
         actions: r.actions,
-        resources: r.resources.split(',').map(s => normalizeResourcePattern(s)).filter(Boolean),
+        resources: r.resources.map(s => normalizeResourcePattern(s)).filter(Boolean),
       };
       // Only include conditions if at least one is non-empty
       if (r.conditions && Object.keys(r.conditions).length > 0) {

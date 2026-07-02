@@ -298,7 +298,7 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
     // Seed the initial empty row WITH a `_uiId` so PermissionEditor receives an
     // id-bearing row and its adoption effect no-ops (match the fresh-row shape
     // its Add button emits).
-    group ? permissionsToRows(group.permissions) : [{ _uiId: freshPermissionRowId(), effect: 'Allow', actions: [], resources: '' }],
+    group ? permissionsToRows(group.permissions) : [{ _uiId: freshPermissionRowId(), effect: 'Allow', actions: [], resources: [] }],
   );
   const [memberIds, setMemberIds] = useState<Set<number>>(
     () => new Set(group?.member_ids ?? []),

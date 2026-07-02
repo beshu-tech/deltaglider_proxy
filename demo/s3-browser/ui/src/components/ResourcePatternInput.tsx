@@ -4,16 +4,26 @@ import { Button } from 'antd';
 import { listCommonPrefixes } from '../s3client';
 import {
   formatResourcePattern,
-  normalizeResourcePattern,
   parseResourcePattern,
 } from '../storagePath';
+import {
+  freshResourceRowId,
+  normalizeResourceRowPattern,
+  parseResourceRows,
+  serializeResourceRows,
+  type ResourceRow,
+} from '../resourcePatternRows';
 import { useColors } from '../ThemeContext';
 import SimpleAutoComplete, { type AutoCompleteEntry, type AutoCompleteGroup } from './SimpleAutoComplete';
 
 
 interface ResourcePatternInputProps {
-  value: string;
-  onChange: (value: string) => void;
+  /**
+   * Resource patterns as a STRING ARRAY (the server model). A pattern may
+   * contain a literal comma — it is NEVER used as a delimiter here.
+   */
+  value: string[];
+  onChange: (value: string[]) => void;
   buckets?: string[];
   style?: React.CSSProperties;
 }
@@ -33,42 +43,49 @@ function uniqueEntries(entries: AutoCompleteEntry[]): AutoCompleteEntry[] {
   return out;
 }
 
-function splitRows(value: string): string[] {
-  const rows = value.split(',').map((part) => part.trim());
-  return rows.length > 0 ? rows : [''];
-}
-
-let resourceRowIdCounter = 0;
-/** Monotonic, collision-free row id for stable React keys (never reused). */
-function freshResourceRowId(): string {
-  resourceRowIdCounter += 1;
-  return `res-${resourceRowIdCounter}`;
-}
-
-function serializeRows(rows: string[]): string {
-  if (rows.every((row) => !row.trim())) return rows.length > 1 ? rows.map(() => '').join(', ') : '';
-  return rows.map((row) => row.trim()).join(', ');
-}
-
 export default function ResourcePatternInput({ value, onChange, buckets = [], style }: ResourcePatternInputProps) {
   const colors = useColors();
   const [prefixOptions, setPrefixOptions] = useState<string[]>([]);
-  const [focusedIndex, setFocusedIndex] = useState<number | null>(null);
-  const rows = useMemo(() => splitRows(value), [value]);
+  const [focusedId, setFocusedId] = useState<string | null>(null);
 
-  // Stable per-row ids for React keys. Rows are derived from `value` (positional),
-  // so we keep a parallel id list sized to the row count. The list is reconciled
-  // by COUNT here (append/truncate), and the row-mutating handlers below splice it
-  // in lockstep with the value mutation so a surviving row keeps its id through a
-  // middle-row delete — avoiding the key={index} class of focus/IME misplacement.
-  const idsRef = useRef<string[]>([]);
-  if (idsRef.current.length !== rows.length) {
-    const next = idsRef.current.slice(0, rows.length);
-    while (next.length < rows.length) next.push(freshResourceRowId());
-    idsRef.current = next;
-  }
-  const rowIds = idsRef.current;
-  const activeValue = focusedIndex === null ? '' : rows[focusedIndex] || '';
+  // Local editing state is the single source of truth WHILE editing. The
+  // `value` prop only seeds it, and only on a genuine external change (not our
+  // own echo). Mirrors ConditionPrefixInput — the sanctioned row-editor model.
+  const initial = useMemo(() => parseResourceRows(value), [value]);
+  const [rows, setRows] = useState<ResourceRow[]>(() => initial);
+  const rowsRef = useRef<ResourceRow[]>(rows);
+  rowsRef.current = rows;
+  const lastEmitted = useRef<string>(JSON.stringify(serializeResourceRows(rows)));
+
+  useEffect(() => {
+    const incoming = JSON.stringify(value);
+    if (incoming === lastEmitted.current) return; // our own echo — ignore
+    lastEmitted.current = incoming;
+    const seeded = parseResourceRows(value);
+    rowsRef.current = seeded;
+    setRows(seeded);
+  }, [value]);
+
+  // Emit the current rows upward as a string[]. Reads the live ref, never a
+  // closed-over snapshot (the staleness class we're killing).
+  const emitNow = () => {
+    const serialized = serializeResourceRows(rowsRef.current);
+    const key = JSON.stringify(serialized);
+    if (key !== lastEmitted.current) {
+      lastEmitted.current = key;
+      onChange(serialized);
+    }
+  };
+
+  const emit = (mutate: (current: ResourceRow[]) => ResourceRow[]) => {
+    const next = mutate(rowsRef.current);
+    rowsRef.current = next;
+    setRows(next);
+    emitNow();
+  };
+
+  const focusedRow = focusedId === null ? null : rows.find((r) => r.id === focusedId) || null;
+  const activeValue = focusedRow?.text || '';
   const activePattern = useMemo(() => parseResourcePattern(activeValue), [activeValue]);
   const knownBucket = activePattern.bucket && (buckets.includes(activePattern.bucket) || activeValue.includes('/'))
     ? activePattern.bucket
@@ -192,61 +209,58 @@ export default function ResourcePatternInput({ value, onChange, buckets = [], st
     };
   }, [activePattern.prefix, knownBucket]);
 
-  const updateRow = (index: number, nextValue: string) => {
-    const nextRows = [...rows];
-    nextRows[index] = nextValue.replace(/\r?\n/g, ' ');
-    onChange(serializeRows(nextRows));
+  const updateRow = (id: string, nextValue: string) => {
+    emit((current) =>
+      current.map((row) => (row.id === id ? { ...row, text: nextValue.replace(/\r?\n/g, ' ') } : row)),
+    );
   };
 
   const addRow = () => {
-    idsRef.current = [...idsRef.current, freshResourceRowId()];
-    onChange(serializeRows([...rows, '']));
+    // New empty row lives in LOCAL state only (an empty row contributes nothing
+    // to the persisted array); it becomes persistable once the user types.
+    const next = [...rowsRef.current, { id: freshResourceRowId(), text: '' }];
+    rowsRef.current = next;
+    setRows(next);
   };
 
-  const deleteRow = (index: number) => {
-    // Remove the id at the same index so the remaining rows keep their ids.
-    idsRef.current = idsRef.current.filter((_, i) => i !== index);
-    const nextRows = rows.filter((_, rowIndex) => rowIndex !== index);
-    if (nextRows.length === 0) idsRef.current = [freshResourceRowId()];
-    onChange(serializeRows(nextRows.length > 0 ? nextRows : ['']));
-    setFocusedIndex((current) => {
-      if (current === null) return null;
-      if (current === index) return null;
-      return current > index ? current - 1 : current;
+  const deleteRow = (id: string) => {
+    emit((current) => {
+      const remaining = current.filter((row) => row.id !== id);
+      return remaining.length > 0 ? remaining : [{ id: freshResourceRowId(), text: '' }];
     });
+    setFocusedId((current) => (current === id ? null : current));
   };
 
   const applySuggestion = (pattern: string) => {
-    if (focusedIndex === null) return;
-    updateRow(focusedIndex, pattern);
+    if (focusedId === null) return;
+    updateRow(focusedId, pattern);
   };
 
-  // Normalize ONLY the blurred row's text, in place. Crucially this does NOT
-  // re-split + filter the whole comma string (the old `normalizeList(value)`
-  // path), which dropped in-progress empty rows and desynced `idsRef` —
-  // reassigning React keys to surviving rows. Mirrors ConditionPrefixInput's
-  // per-row blur. An empty row stays empty (it's serialized away only when a
-  // sibling is non-empty, same as before, but the row COUNT is untouched here).
-  const normalizeRowOnBlur = (index: number) => {
-    setFocusedIndex(null);
-    const current = rows[index] ?? '';
-    if (!current.trim()) return; // empty row: nothing to normalize, keep as-is
-    const normalized = normalizeResourcePattern(current);
-    if (normalized !== current) updateRow(index, normalized);
+  // Normalize ONLY the blurred row's text, in local state — no reparse of a
+  // comma string, no stale closure over the prop (mirrors ConditionPrefixInput).
+  const normalizeRowOnBlur = (id: string) => {
+    setFocusedId(null);
+    emit((current) =>
+      current.map((row) => {
+        if (row.id !== id) return row;
+        if (!row.text.trim()) return row; // empty stays empty
+        return { ...row, text: normalizeResourceRowPattern(row.text) };
+      }),
+    );
   };
 
   return (
     <div style={{ width: '100%' }}>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: style?.marginTop }}>
-        {rows.map((row, index) => (
-          <div key={rowIds[index] ?? `pending-${index}`} style={{ display: 'flex', gap: 6, alignItems: 'center', width: '100%' }}>
-            <div style={{ flex: 1, minWidth: 0 }} onFocusCapture={() => setFocusedIndex(index)}>
+        {rows.map((row) => (
+          <div key={row.id} style={{ display: 'flex', gap: 6, alignItems: 'center', width: '100%' }}>
+            <div style={{ flex: 1, minWidth: 0 }} onFocusCapture={() => setFocusedId(row.id)}>
               <SimpleAutoComplete
-                value={row}
-                filterText={row}
-                autoComplete={`dgp-resource-${rowIds[index] ?? index}`}
-                onChange={(v) => updateRow(index, v)}
-                onBlur={() => normalizeRowOnBlur(index)}
+                value={row.text}
+                filterText={row.text}
+                autoComplete={`dgp-resource-${row.id}`}
+                onChange={(v) => updateRow(row.id, v)}
+                onBlur={() => normalizeRowOnBlur(row.id)}
                 optionGroups={optionGroups}
                 placeholder="my-bucket/builds/*"
                 style={{ ...inputStyle, marginTop: 0 }}
@@ -259,7 +273,7 @@ export default function ResourcePatternInput({ value, onChange, buckets = [], st
                 size="small"
                 icon={<DeleteOutlined />}
                 onMouseDown={(e) => e.preventDefault()}
-                onClick={() => deleteRow(index)}
+                onClick={() => deleteRow(row.id)}
                 style={{ flex: '0 0 auto' }}
               />
             )}
@@ -277,7 +291,7 @@ export default function ResourcePatternInput({ value, onChange, buckets = [], st
       >
         Add resource
       </Button>
-      {focusedIndex !== null && (
+      {focusedId !== null && (
         <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
           {chipSuggestions.map((pattern) => (
             <Button

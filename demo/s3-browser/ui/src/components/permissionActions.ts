@@ -31,8 +31,8 @@ const ATOMIC_ACTIONS = ['list', 'read', 'write', 'delete', 'admin'] as const;
  *   `${iam:username}/*` with no prefix → false, admin offered, same as a bare
  *   bucket.)
  */
-export function isPrefixScoped(resources: string): boolean {
-  const parts = resources.split(',').map((p) => p.trim()).filter(Boolean);
+export function isPrefixScoped(resources: string[]): boolean {
+  const parts = resources.map((p) => p.trim()).filter(Boolean);
   if (parts.length === 0) return false;
   return parts.every((p) => {
     if (p === '*') return false;

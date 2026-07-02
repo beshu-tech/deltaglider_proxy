@@ -24,9 +24,9 @@ const { Text, Title } = Typography;
 
 // Fallback presets used if the API is unavailable
 const FALLBACK_PRESETS: Record<string, PermissionRow[]> = {
-  'Full Admin': [{ effect: 'Allow', actions: ['*'], resources: '*' }],
-  'Read/Write': [{ effect: 'Allow', actions: ['read', 'write', 'list'], resources: '*' }],
-  'Read Only': [{ effect: 'Allow', actions: ['read', 'list'], resources: '*' }],
+  'Full Admin': [{ effect: 'Allow', actions: ['*'], resources: ['*'] }],
+  'Read/Write': [{ effect: 'Allow', actions: ['read', 'write', 'list'], resources: ['*'] }],
+  'Read Only': [{ effect: 'Allow', actions: ['read', 'list'], resources: ['*'] }],
 };
 
 interface UserFormProps {
@@ -63,7 +63,7 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
   const [permissions, setPermissions] = useState<PermissionRow[]>(() =>
     user
       ? permissionsToRows(user.permissions)
-      : [{ _uiId: freshPermissionRowId(), effect: 'Allow', actions: ['*'], resources: '*' }],
+      : [{ _uiId: freshPermissionRowId(), effect: 'Allow', actions: ['*'], resources: ['*'] }],
   );
   const [saving, setSavingState] = useState(false);
   const [deleting, setDeletingState] = useState(false);
@@ -256,7 +256,7 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
           {(cannedPolicies.length > 0 ? cannedPolicies : Object.entries(FALLBACK_PRESETS).map(([name, perms]) => ({
             name,
             description: '',
-            permissions: perms.map(p => ({ id: 0, effect: p.effect, actions: p.actions, resources: p.resources.split(',').map(s => s.trim()).filter(Boolean) })),
+            permissions: perms.map(p => ({ id: 0, effect: p.effect, actions: p.actions, resources: p.resources.map(s => s.trim()).filter(Boolean) })),
           }))).map(policy => {
             return (
                 <Tag
@@ -264,7 +264,7 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
                   color="blue"
                   style={{ cursor: 'pointer', borderRadius: 10, fontSize: 12, padding: '2px 10px', margin: 0, userSelect: 'none' }}
                   onClick={() => {
-                    const hasExisting = permissions.some(r => r.actions.length > 0 || r.resources.trim() !== '');
+                    const hasExisting = permissions.some(r => r.actions.length > 0 || r.resources.some(res => res.trim() !== ''));
                     if (hasExisting && !window.confirm('Replace existing permissions?')) return;
                     setPermissions(permissionsToRows(policy.permissions));
                   }}
