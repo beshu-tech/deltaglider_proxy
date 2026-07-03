@@ -9,6 +9,27 @@ use futures::stream::BoxStream;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+/// Verdict of a conditional-write capability probe. Distinguishes a fact learned
+/// by a real round-trip (`Probed`) from a static assumption (`Assumed`), so a
+/// caller can log the provenance and decide how much to trust it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalWriteSupport {
+    /// Confirmed by an actual `If-None-Match` round-trip: `true` = enforced
+    /// (412 on conflict), `false` = rejected (501 / silently ignored).
+    Probed(bool),
+    /// Not probed — a static default or fixed-vendor answer.
+    Assumed(bool),
+}
+
+impl ConditionalWriteSupport {
+    /// The boolean verdict, collapsing provenance.
+    pub fn is_supported(&self) -> bool {
+        match self {
+            ConditionalWriteSupport::Probed(b) | ConditionalWriteSupport::Assumed(b) => *b,
+        }
+    }
+}
+
 /// Bucket listing entry with optional routing-origin metadata.
 #[derive(Debug, Clone)]
 pub struct BucketListing {
@@ -459,6 +480,39 @@ pub trait StorageBackend: Send + Sync {
         true
     }
 
+    /// Does the backend serving `bucket` enforce S3 conditional-write
+    /// preconditions (`If-None-Match: *` create-if-absent, `If-Match: <etag>`
+    /// compare-and-swap)? This is the primitive a cross-instance reference lock
+    /// or S3-object lease HINGES on — a `false` backend must fall back to the
+    /// in-process lock / prefix-affinity (see the HA contract).
+    ///
+    /// CONSERVATIVE default `false` — a backend is only trusted to support CAS
+    /// once it has been PROVEN, either by an explicit startup probe
+    /// ([`conditional_write_probe`]) or a fixed-answer cloud vendor. Never infer
+    /// `true` from platform identity alone: conditional-write support is
+    /// version-gated (an old MinIO self-IDs as MinIO but returns 501). Measured:
+    /// Hetzner/Ceph + recent MinIO enforce it (412); Backblaze B2 returns 501.
+    fn supports_conditional_writes(&self, _bucket: &str) -> bool {
+        false
+    }
+
+    /// Actively PROBE whether `bucket`'s backend enforces conditional writes, by
+    /// attempting a real create-if-absent on a throwaway key and observing the
+    /// result. Returns the verdict so a caller can cache it (e.g. flip a startup
+    /// flag that `supports_conditional_writes` then reads). Default = the static
+    /// `supports_conditional_writes` answer wrapped as `Assumed` — a backend that
+    /// can genuinely probe (S3) overrides this to do the round-trip.
+    async fn conditional_write_probe(
+        &self,
+        bucket: &str,
+    ) -> Result<ConditionalWriteSupport, StorageError> {
+        Ok(if self.supports_conditional_writes(bucket) {
+            ConditionalWriteSupport::Assumed(true)
+        } else {
+            ConditionalWriteSupport::Assumed(false)
+        })
+    }
+
     // === Scanning operations ===
 
     /// Scan a deltaspace directory and return all file metadata
@@ -903,6 +957,15 @@ macro_rules! impl_storage_backend_for_box {
             }
             fn lite_list_carries_logical_facts(&self, bucket: &str) -> bool {
                 (**self).lite_list_carries_logical_facts(bucket)
+            }
+            fn supports_conditional_writes(&self, bucket: &str) -> bool {
+                (**self).supports_conditional_writes(bucket)
+            }
+            async fn conditional_write_probe(
+                &self,
+                bucket: &str,
+            ) -> Result<ConditionalWriteSupport, StorageError> {
+                (**self).conditional_write_probe(bucket).await
             }
 
             async fn scan_deltaspace(

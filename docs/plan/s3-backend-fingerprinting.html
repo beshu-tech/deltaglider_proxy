@@ -1,0 +1,623 @@
+<title>S3 Backend Fingerprinting &amp; Capability Probing</title>
+<style>
+  :root {
+    --ground: #14171c;
+    --paper: #f7f8fa;
+    --card: #ffffff;
+    --ink: #1a1d23;
+    --ink-soft: #454b56;
+    --muted: #6a7482;
+    --line: #e3e6eb;
+    --line-strong: #cfd4dc;
+    --amber: #b8701f;
+    --amber-soft: #f6ecdd;
+    --good: #2f7d52;
+    --good-soft: #e6f2ea;
+    --danger: #b23b3b;
+    --danger-soft: #f8e7e5;
+    --warn: #9a6a12;
+    --warn-soft: #f7efdb;
+    --info: #3a6ea5;
+    --info-soft: #e7eef6;
+    --mono: ui-monospace, "SF Mono", "SFMono-Regular", "JetBrains Mono", "Menlo", "Consolas", monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+
+  /* ---- header ---- */
+  header.masthead {
+    background: var(--ground);
+    color: #e8ebf0;
+    border-bottom: 3px solid var(--amber);
+  }
+  .masthead .wrap { padding-top: 52px; padding-bottom: 44px; }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--amber);
+    margin: 0 0 14px;
+  }
+  h1 {
+    font-size: clamp(28px, 4.5vw, 44px);
+    line-height: 1.1;
+    margin: 0 0 16px;
+    font-weight: 680;
+    letter-spacing: -0.02em;
+    text-wrap: balance;
+    color: #fbfcfd;
+  }
+  .lede {
+    font-size: 18px;
+    color: #b9c1cd;
+    max-width: 64ch;
+    margin: 0;
+  }
+  .lede strong { color: #eef1f5; font-weight: 620; }
+
+  /* ---- verdict banner ---- */
+  .verdict {
+    margin-top: 30px;
+    border: 1px solid rgba(184,112,31,0.5);
+    background: rgba(184,112,31,0.10);
+    border-radius: 8px;
+    padding: 18px 20px;
+    display: flex;
+    gap: 16px;
+    align-items: flex-start;
+  }
+  .verdict .tag {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    background: var(--amber);
+    color: #14171c;
+    padding: 4px 9px;
+    border-radius: 4px;
+    font-weight: 700;
+    white-space: nowrap;
+    margin-top: 2px;
+  }
+  .verdict p { margin: 0; color: #dfe4ea; font-size: 15.5px; }
+  .verdict strong { color: #fff; }
+
+  /* ---- section ---- */
+  section { padding: 46px 0 8px; border-top: 1px solid var(--line); }
+  section:first-of-type { border-top: none; }
+  .sec-num {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--amber);
+    letter-spacing: 0.1em;
+    font-weight: 600;
+  }
+  h2 {
+    font-size: 25px;
+    letter-spacing: -0.015em;
+    margin: 6px 0 6px;
+    font-weight: 660;
+    text-wrap: balance;
+  }
+  .sec-sub { color: var(--muted); margin: 0 0 26px; font-size: 15.5px; max-width: 70ch; }
+  h3 {
+    font-size: 17px;
+    margin: 34px 0 12px;
+    font-weight: 640;
+    letter-spacing: -0.01em;
+  }
+  p { margin: 0 0 16px; }
+  a { color: var(--info); text-decoration: none; border-bottom: 1px solid rgba(58,110,165,0.3); }
+  a:hover { border-bottom-color: var(--info); }
+  strong { font-weight: 640; }
+
+  code {
+    font-family: var(--mono);
+    font-size: 0.855em;
+    background: #eef0f4;
+    color: #24303c;
+    padding: 1.5px 5px;
+    border-radius: 4px;
+    border: 1px solid #e0e3e9;
+    white-space: nowrap;
+  }
+  .danger-code { background: var(--danger-soft); color: #8a2a2a; border-color: #eecac6; }
+  .good-code { background: var(--good-soft); color: #1e5a3a; border-color: #cbe4d5; }
+
+  /* ---- code blocks ---- */
+  pre {
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.55;
+    background: var(--ground);
+    color: #d6dbe3;
+    padding: 16px 18px;
+    border-radius: 8px;
+    overflow-x: auto;
+    margin: 0 0 20px;
+    border: 1px solid #2a2f38;
+  }
+  pre .c { color: #7f8b9c; }
+  pre .k { color: #d99a4e; }
+  pre .g { color: #7fc99a; }
+  pre .r { color: #e58b83; }
+  pre .b { color: #7fb0e0; }
+
+  /* ---- tables ---- */
+  .tscroll { overflow-x: auto; margin: 0 0 22px; border: 1px solid var(--line-strong); border-radius: 8px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+  th, td {
+    text-align: left;
+    padding: 9px 13px;
+    border-bottom: 1px solid var(--line);
+    vertical-align: top;
+    white-space: nowrap;
+  }
+  td.wrap-cell { white-space: normal; min-width: 220px; }
+  thead th {
+    background: #eef0f4;
+    font-size: 11.5px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
+    font-weight: 640;
+    position: sticky;
+    top: 0;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: #fafbfc; }
+  td.impl { font-weight: 640; white-space: nowrap; }
+  td .mono, th .mono { font-family: var(--mono); font-size: 12.5px; }
+  .cell-mono { font-family: var(--mono); font-size: 12.5px; color: #2a3542; white-space: nowrap; }
+
+  /* status pills */
+  .pill {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 7px;
+    border-radius: 10px;
+    letter-spacing: 0.02em;
+    white-space: nowrap;
+  }
+  .pill.good { background: var(--good-soft); color: #1e5a3a; }
+  .pill.bad  { background: var(--danger-soft); color: #8a2a2a; }
+  .pill.warn { background: var(--warn-soft); color: #7a5310; }
+  .pill.info { background: var(--info-soft); color: #2c5680; }
+  .pill.none { background: #eceef1; color: #6a7482; }
+
+  /* ---- callouts ---- */
+  .callout {
+    border-radius: 8px;
+    padding: 16px 18px 16px 20px;
+    margin: 0 0 22px;
+    border: 1px solid;
+    border-left-width: 4px;
+    font-size: 14.5px;
+  }
+  .callout p { margin: 0 0 10px; }
+  .callout p:last-child { margin: 0; }
+  .callout .label {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    font-weight: 700;
+    display: block;
+    margin-bottom: 7px;
+  }
+  .callout.danger { background: var(--danger-soft); border-color: #e3a9a3; }
+  .callout.danger .label { color: var(--danger); }
+  .callout.good { background: var(--good-soft); border-color: #b6d8c4; }
+  .callout.good .label { color: var(--good); }
+  .callout.info { background: var(--info-soft); border-color: #b7cde4; }
+  .callout.info .label { color: var(--info); }
+
+  /* ---- probe steps ---- */
+  ol.steps { counter-reset: step; list-style: none; padding: 0; margin: 0 0 22px; }
+  ol.steps > li {
+    position: relative;
+    padding: 0 0 18px 46px;
+    margin: 0;
+  }
+  ol.steps > li::before {
+    counter-increment: step;
+    content: counter(step);
+    position: absolute; left: 0; top: -2px;
+    width: 30px; height: 30px;
+    background: var(--ground); color: #f3d9b3;
+    font-family: var(--mono); font-size: 14px; font-weight: 700;
+    border-radius: 7px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  ol.steps > li:not(:last-child)::after {
+    content: "";
+    position: absolute; left: 14.5px; top: 32px; bottom: 4px;
+    width: 1px; background: var(--line-strong);
+  }
+  ol.steps b { font-weight: 640; }
+
+  ul.tight { margin: 0 0 18px; padding-left: 22px; }
+  ul.tight li { margin-bottom: 7px; }
+
+  .outcome-grid { display: grid; gap: 10px; margin: 0 0 8px; }
+  .outcome {
+    display: grid;
+    grid-template-columns: 128px 1fr;
+    gap: 14px;
+    align-items: baseline;
+    padding: 11px 14px;
+    border: 1px solid var(--line);
+    border-radius: 7px;
+    background: var(--card);
+    font-size: 14px;
+  }
+  .outcome .sig { font-family: var(--mono); font-size: 12.5px; font-weight: 600; }
+  .outcome.good { border-left: 4px solid var(--good); }
+  .outcome.bad  { border-left: 4px solid var(--danger); }
+  .outcome.warn { border-left: 4px solid var(--warn); }
+  .outcome.good .sig { color: #1e5a3a; }
+  .outcome.bad  .sig { color: #8a2a2a; }
+  .outcome.warn .sig { color: #7a5310; }
+
+  /* ranking */
+  .rank { display: grid; gap: 12px; margin: 0 0 8px; }
+  .rank-item {
+    display: grid; grid-template-columns: 40px 1fr; gap: 14px;
+    padding: 14px 16px; border: 1px solid var(--line-strong);
+    border-radius: 8px; background: var(--card); align-items: start;
+  }
+  .rank-item .n {
+    font-family: var(--mono); font-size: 20px; font-weight: 700;
+    color: var(--amber); line-height: 1;
+  }
+  .rank-item h4 { margin: 0 0 4px; font-size: 15px; font-weight: 660; }
+  .rank-item p { margin: 0; font-size: 13.5px; color: var(--ink-soft); }
+  .rank-item .impl-tag {
+    font-family: var(--mono); font-size: 11px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.06em;
+  }
+
+  footer {
+    margin-top: 50px; background: var(--ground); color: #97a1b0;
+    padding: 32px 0; font-size: 13px; border-top: 3px solid var(--amber);
+  }
+  footer .wrap { display: flex; flex-wrap: wrap; gap: 8px 28px; justify-content: space-between; }
+  footer a { color: #c9d2dd; border-bottom-color: rgba(201,210,221,0.25); }
+  footer .src { max-width: 62ch; }
+
+  .note { font-size: 13px; color: var(--muted); font-style: italic; margin: -8px 0 20px; }
+
+  @media (max-width: 620px) {
+    body { font-size: 15px; }
+    .outcome { grid-template-columns: 1fr; gap: 3px; }
+    .verdict { flex-direction: column; gap: 10px; }
+  }
+</style>
+
+<header class="masthead">
+  <div class="wrap">
+    <p class="eyebrow">DeltaGlider Proxy · backend research</p>
+    <h1>Fingerprinting the S3 implementation behind the endpoint</h1>
+    <p class="lede">How to tell MinIO from Ceph from R2 from AWS using nothing but HTTP responses — and why, for the one capability the proxy actually needs to know (<strong>conditional writes</strong>), you should <strong>probe the behavior, not the badge</strong>.</p>
+    <div class="verdict">
+      <span class="tag">Bottom line</span>
+      <p><strong>Fingerprint the vendor for telemetry; probe the capability for correctness.</strong> Conditional-write support is a property of <code style="background:rgba(255,255,255,0.1);color:#f3d9b3;border-color:transparent">vendor × version × bucket-config × fronting-proxy</code>, not of the vendor name. The failure mode of guessing wrong is <strong>silent data loss</strong>, so the compare-and-swap decision must come from a live two-step probe that fails closed.</p>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+<!-- ============ SECTION 1 ============ -->
+<section>
+  <span class="sec-num">01 / HEADERS</span>
+  <h2>Response headers that leak identity</h2>
+  <p class="sec-sub">The cheapest signal, and the least trustworthy — a reverse proxy (nginx, CloudFront, Cloudflare) in front of the origin routinely rewrites or strips <code>Server</code> and <code>x-amz-*</code>. Treat a matching <code>Server</code> string as a strong positive, but never treat its absence as a negative.</p>
+
+  <div class="tscroll">
+    <table>
+      <thead>
+        <tr>
+          <th>Implementation</th>
+          <th><code class="mono">Server:</code></th>
+          <th><code class="mono">x-amz-id-2</code></th>
+          <th><code class="mono">x-amz-request-id</code> shape</th>
+          <th>Distinctive extra header</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="impl">AWS S3</td>
+          <td><span class="cell-mono">AmazonS3</span></td>
+          <td><span class="pill good">always</span> <span class="cell-mono">~76ch base64 =</span></td>
+          <td><span class="cell-mono">16ch uppercase base36</span></td>
+          <td class="wrap-cell">both id headers always present</td>
+        </tr>
+        <tr>
+          <td class="impl">MinIO</td>
+          <td><span class="cell-mono">MinIO</span> <span class="note" style="font-style:normal">(no version)</span></td>
+          <td><span class="pill warn">conditional</span> <span class="cell-mono">64ch hex</span></td>
+          <td><span class="cell-mono">uppercase hex of UnixNano</span></td>
+          <td class="wrap-cell"><code>X-Xss-Protection: 1; mode=block</code></td>
+        </tr>
+        <tr>
+          <td class="impl">Ceph RadosGW</td>
+          <td><span class="pill none">proxy / absent</span></td>
+          <td><span class="pill bad">absent</span></td>
+          <td><span class="cell-mono">tx…-&lt;zone&gt;</span></td>
+          <td class="wrap-cell">sometimes <code>x-rgw-*</code> (e.g. <code>x-rgw-object-type</code>)</td>
+        </tr>
+        <tr>
+          <td class="impl">SeaweedFS</td>
+          <td><span class="cell-mono">SeaweedFS &lt;ver&gt;</span></td>
+          <td><span class="pill bad">absent</span></td>
+          <td><span class="cell-mono">own reqID</span></td>
+          <td class="wrap-cell">self-identifying <code>Server</code> string</td>
+        </tr>
+        <tr>
+          <td class="impl">Garage</td>
+          <td><span class="pill bad">none</span></td>
+          <td><span class="pill bad">none</span></td>
+          <td><span class="pill bad">none</span></td>
+          <td class="wrap-cell">the all-absent negative case</td>
+        </tr>
+        <tr>
+          <td class="impl">Cloudflare R2</td>
+          <td><span class="cell-mono">cloudflare</span></td>
+          <td><span class="pill bad">absent</span></td>
+          <td><span class="pill none">usually absent</span></td>
+          <td class="wrap-cell"><code>cf-ray: &lt;hex&gt;-&lt;colo&gt;</code></td>
+        </tr>
+        <tr>
+          <td class="impl">Backblaze B2</td>
+          <td><span class="pill none">≠ AmazonS3 (unconf.)</span></td>
+          <td><span class="pill good">present</span></td>
+          <td><span class="cell-mono">16ch uppercase hex</span></td>
+          <td class="wrap-cell">no <code>x-bz-*</code> on the S3 endpoint</td>
+        </tr>
+        <tr>
+          <td class="impl">Wasabi</td>
+          <td><span class="cell-mono">WasabiS3/&lt;ver&gt;-&lt;date&gt;-&lt;sha&gt;</span></td>
+          <td><span class="pill good">present</span></td>
+          <td><span class="cell-mono">16hex + <b>:A</b>/<b>:B</b> suffix</span></td>
+          <td class="wrap-cell">versioned self-ID <code>Server</code> string</td>
+        </tr>
+        <tr>
+          <td class="impl">DO Spaces</td>
+          <td><span class="pill none">proxy-masked</span></td>
+          <td><span class="pill bad">absent</span></td>
+          <td><span class="cell-mono">tx…-nyc3a / -ams3a</span></td>
+          <td class="wrap-cell">Ceph zone suffix in request-id</td>
+        </tr>
+        <tr>
+          <td class="impl">Hetzner Obj.</td>
+          <td><span class="pill none">proxy-masked</span></td>
+          <td><span class="pill bad">absent</span></td>
+          <td><span class="cell-mono">tx…-fsn1-prod1-ceph4</span></td>
+          <td class="wrap-cell"><code>x-rgw-object-type: Normal</code></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note">MinIO, SeaweedFS, AWS, Wasabi and Cloudflare source-code-confirmed or captured live. Ceph <code>Server</code> string was never found in a real capture — RadosGW sits behind Beast/Civetweb/nginx.</p>
+
+  <h3>The captures that prove the point</h3>
+  <p>Two live probes taken while writing this show exactly why the <code>Server</code> header alone is a trap — and how the <em>body + secondary headers</em> rescue the identification:</p>
+  <pre><span class="c"># play.min.io — a real MinIO, but fronted by nginx:</span>
+Server: <span class="r">nginx/1.24.0 (Ubuntu)</span>       <span class="c">← Server says nginx, not MinIO!</span>
+X-Amz-Request-Id: <span class="k">18BEBD140E1DBDB4</span>     <span class="c">← 16 uppercase HEX = MinIO tell</span>
+X-Amz-Id-2: <span class="b">3e996b2f…8681eac</span>          <span class="c">← 64ch lowercase hex</span>
+X-Xss-Protection: <span class="k">1; mode=block</span>       <span class="c">← MinIO sets this; AWS/Ceph don't</span>
+
+&lt;Error&gt;…&lt;BucketName&gt;…&lt;/BucketName&gt;
+       <span class="g">&lt;Region&gt;us-east-1&lt;/Region&gt;</span>          <span class="c">← &lt;Region&gt; in error body = MinIO</span>
+       &lt;HostId&gt;<span class="b">3e996b2f…8681eac</span>&lt;/HostId&gt;  <span class="c">← HostId == x-amz-id-2 = MinIO</span></pre>
+  <div class="callout info">
+    <span class="label">Takeaway</span>
+    <p>When a proxy overwrites <code>Server</code>, MinIO still gives itself away four other ways: hex-timestamp <code>x-amz-request-id</code>, 64-char-hex <code>x-amz-id-2</code>, <code>X-Xss-Protection</code>, and the <code>&lt;Region&gt;</code> element in the error body (where <code>HostId</code> mirrors <code>x-amz-id-2</code>). Fingerprinting = weighing several weak signals, not reading one header.</p>
+  </div>
+</section>
+
+<!-- ============ SECTION 2 ============ -->
+<section>
+  <span class="sec-num">02 / BEHAVIOR</span>
+  <h2>Behavioral fingerprints in the response body</h2>
+  <p class="sec-sub">Bodies survive proxies. The error-XML shape, the way "unsupported" is signaled, and a handful of hardcoded values are the durable tells.</p>
+
+  <h3>Error-XML shape — who emits which element</h3>
+  <div class="tscroll">
+    <table>
+      <thead>
+        <tr>
+          <th>Element</th><th>AWS</th><th>MinIO</th><th>Ceph</th><th>SeaweedFS</th><th>Garage</th><th>R2</th><th>B2</th><th>Wasabi</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td class="impl"><code>&lt;RequestId&gt;</code></td><td>✅</td><td>✅</td><td>✅ <span class="cell-mono">tx…</span></td><td>✅</td><td>❌</td><td>❌</td><td>❌</td><td>✅</td></tr>
+        <tr><td class="impl"><code>&lt;HostId&gt;</code></td><td>✅ b64</td><td>✅ =id2</td><td>✅ <span class="cell-mono">hex-zone</span></td><td>❌</td><td>❌</td><td>❌</td><td>❌</td><td>✅ b64</td></tr>
+        <tr><td class="impl"><code>&lt;Resource&gt;</code></td><td>often</td><td>✅</td><td>❌</td><td>✅</td><td>opt</td><td>❌</td><td>some</td><td>✅</td></tr>
+        <tr><td class="impl"><code>&lt;Region&gt;</code></td><td>redirect</td><td>✅ <b>always</b></td><td>❌</td><td>❌</td><td>✅ <b>always</b></td><td>❌</td><td>❌</td><td>❌</td></tr>
+        <tr><td class="impl">SigV4 debug fields</td><td>✅</td><td>❌</td><td>❌</td><td>❌</td><td>❌</td><td>❌</td><td>❌</td><td>✅</td></tr>
+        <tr><td class="impl">unique field</td><td class="cell-mono">—</td><td class="cell-mono">—</td><td class="cell-mono">—</td><td class="cell-mono">—</td><td class="cell-mono">—</td><td class="cell-mono">—</td><td class="cell-mono">—</td><td class="cell-mono">CMReferenceId</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note">Live-captured error bodies. Wasabi's <code>&lt;CMReferenceId&gt;</code> and the <code>:A</code>/<code>:B</code> request-id suffix are unique to Wasabi. DigitalOcean's Ceph body carries <code>&lt;Resource&gt;</code> + <code>&lt;RequestId&gt;not available&lt;/RequestId&gt;</code> and no <code>&lt;HostId&gt;</code>.</p>
+
+  <div class="outcome-grid">
+    <div class="outcome good"><span class="sig">Region + ids</span><span><b>MinIO</b> — <code>&lt;Region&gt;</code> present alongside <code>&lt;RequestId&gt;</code> + <code>&lt;HostId&gt;</code> (and <code>HostId == x-amz-id-2</code>).</span></div>
+    <div class="outcome good"><span class="sig">Region, no ids</span><span><b>Garage</b> — <code>&lt;Region&gt;garage&lt;/Region&gt;</code> but <em>no</em> request/host id, and no <code>SignatureDoesNotMatch</code> code (it returns <code>AccessDenied</code>).</span></div>
+    <div class="outcome good"><span class="sig">Resource, no HostId</span><span><b>SeaweedFS / Ceph family</b> — <code>&lt;Resource&gt;</code> present, <code>&lt;HostId&gt;</code> absent. Ceph adds a <code>tx…</code> RequestId; SeaweedFS uses a plain one.</span></div>
+    <div class="outcome good"><span class="sig">SigV4 dump</span><span><b>AWS or Wasabi</b> — <code>StringToSign</code>/<code>CanonicalRequest</code> flood a <code>SignatureDoesNotMatch</code> body. Nobody else does this. Split the pair on the <code>CMReferenceId</code>/<code>Server</code> tell.</span></div>
+  </div>
+
+  <h3>How "unsupported feature" is signaled</h3>
+  <p>Two dialects. High-compatibility servers answer a never-configured sub-resource with <span class="pill info">404 NoSuch…</span>; leaner servers answer with <span class="pill warn">501 NotImplemented</span>. That split is itself a fingerprint.</p>
+  <div class="tscroll">
+    <table>
+      <thead>
+        <tr><th>Probe</th><th>AWS</th><th>MinIO</th><th>Ceph</th><th>SeaweedFS</th><th>Garage</th><th>R2</th><th>B2</th><th>Wasabi</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="impl">GetBucketReplication (unset)</td>
+          <td><span class="pill info">404</span></td><td><span class="pill info">404</span></td><td><span class="pill none">partial</span></td><td><span class="pill info">404</span></td>
+          <td><span class="pill warn">501</span></td><td><span class="pill warn">501</span></td><td><span class="pill none">unsup</span></td><td><span class="pill info">404*</span></td>
+        </tr>
+        <tr>
+          <td class="impl">GetBucketPolicy (unset)</td>
+          <td><span class="pill info">404</span></td><td><span class="pill info">404</span></td><td><span class="pill info">404</span></td><td><span class="pill info">404</span></td>
+          <td><span class="pill warn">501</span></td><td><span class="pill info">404</span></td><td><span class="pill info">404</span></td><td><span class="pill info">404</span></td>
+        </tr>
+        <tr>
+          <td class="impl">SelectObjectContent</td>
+          <td><span class="pill good">ok</span></td><td><span class="pill good">ok</span></td><td><span class="pill good">ok</span></td><td><span class="pill info">404</span></td>
+          <td><span class="pill warn">501</span></td><td><span class="pill warn">501</span></td><td><span class="pill warn">501</span></td><td><span class="pill warn">501</span></td>
+        </tr>
+        <tr>
+          <td class="impl">GetObjectLockConfiguration</td>
+          <td><span class="pill info">404</span></td><td><span class="pill info">404</span></td><td><span class="pill info">404</span></td><td><span class="pill info">404</span></td>
+          <td><span class="pill warn">501</span></td><td><span class="pill info">404</span></td><td><span class="pill warn">501</span></td><td><span class="pill good">200</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note">* Wasabi returns <code>404 NoSuchReplicationConfiguration</code> — note the <em>different code string</em> vs AWS's <code>ReplicationConfigurationNotFoundError</code>. <code>GetBucketReplication</code> is the single best "which dialect" discriminator.</p>
+
+  <h3>Hardcoded values — the deterministic tells</h3>
+  <ul class="tight">
+    <li><b>MinIO ListBuckets Owner</b> is hardcoded on <em>every</em> install: ID <code>02d6176db174dc93cb1b899f7c6078f08654445fe8cf1b6ce98d8855f66bdbf4</code>, DisplayName <code>minio</code>. Single call, deterministic — the strongest tell in the set.</li>
+    <li><b>GetBucketLocation LocationConstraint:</b> Garage → literal <code>garage</code>; R2 → <code>auto</code>; B2 → <code>us-west-00N</code>; MinIO → empty by default; SeaweedFS → wrong root element <code>&lt;CreateBucketConfiguration&gt;</code>.</li>
+    <li><b>Multipart ETag:</b> everyone uses AWS <code>md5(md5s)-N</code> <em>except</em> R2 (non-reconstructable) and B2 (SHA1-native, opaque) — both break s3cmd/s5cmd MD5 checks, a strong B2/R2 tell.</li>
+  </ul>
+</section>
+
+<!-- ============ SECTION 3 ============ -->
+<section>
+  <span class="sec-num">03 / CAPABILITY</span>
+  <h2>The decision that actually matters: conditional writes</h2>
+  <p class="sec-sub">The proxy needs one yes/no answer — does this backend honor compare-and-swap (<code>If-None-Match: *</code> / <code>If-Match: &lt;etag&gt;</code> on PUT)? This is the highest-signal probe <em>and</em> the most dangerous one to get wrong.</p>
+
+  <div class="tscroll">
+    <table>
+      <thead>
+        <tr><th>Backend</th><th><code class="mono">If-None-Match: *</code> PUT</th><th><code class="mono">If-Match</code> PUT</th><th class="wrap-cell">When unsupported</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="impl">AWS S3</td><td><span class="pill good">412</span></td><td><span class="pill good">412</span></td><td class="wrap-cell">reference (since Aug/Nov 2024)</td></tr>
+        <tr><td class="impl">Cloudflare R2</td><td><span class="pill good">412</span></td><td><span class="pill good">412</span></td><td class="wrap-cell">reference-grade, incl. weak ETags &amp; <code>*</code></td></tr>
+        <tr><td class="impl">MinIO ≥ 2024-09-13</td><td><span class="pill good">412</span></td><td><span class="pill good">412</span></td><td class="wrap-cell">—</td></tr>
+        <tr><td class="impl">MinIO &lt; 2024-09-13</td><td><span class="pill bad">silent 200 ⚠</span></td><td><span class="pill none">n/a</span></td><td class="wrap-cell">treated <code>*</code> as a literal ETag → overwrote</td></tr>
+        <tr><td class="impl">Ceph RGW</td><td><span class="pill none">version-dep.</span></td><td><span class="pill warn">etag semantics</span></td><td class="wrap-cell">undocumented for PUT; probe it</td></tr>
+        <tr><td class="impl">SeaweedFS</td><td><span class="pill bad">silent 200 ⚠</span></td><td><span class="pill none">partial</span></td><td class="wrap-cell">ignored on versioned/locked buckets (#8073)</td></tr>
+        <tr><td class="impl">Garage</td><td><span class="pill bad">not enforced</span></td><td><span class="pill bad">no</span></td><td class="wrap-cell">by design — no consensus algorithm</td></tr>
+        <tr><td class="impl">Backblaze B2</td><td><span class="pill warn">501-class</span></td><td><span class="pill warn">501-class</span></td><td class="wrap-cell">unsupported (must probe)</td></tr>
+        <tr><td class="impl">Wasabi</td><td><span class="pill warn">501</span></td><td><span class="pill warn">501</span></td><td class="wrap-cell"><code>NotImplemented</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout danger">
+    <span class="label">⚠ The silent-ignore hazard</span>
+    <p>A naive one-shot probe — "send a conditional PUT, saw <code>200</code> → supported" — concludes <b>supported</b> on exactly the backends that will later eat your data. Old MinIO and SeaweedFS (on versioned/locked buckets) <em>accept</em> <code class="danger-code">If-None-Match: *</code>, <em>ignore</em> the precondition, overwrite, and return <code class="danger-code">200</code>. The client believes it won an exclusive create; it actually clobbered another writer.</p>
+    <p>A <code>200</code> is <b>ambiguous</b>. Never let a lone <code>200</code> mean "supported."</p>
+  </div>
+</section>
+
+<!-- ============ SECTION 4 ============ -->
+<section>
+  <span class="sec-num">04 / PROBE</span>
+  <h2>A safe two-step probe that can't be fooled</h2>
+  <p class="sec-sub">Force the precondition to be the <em>only</em> possible reason for failure, then assert on the rejection — the one outcome a silent-ignore server can't fake.</p>
+
+  <ol class="steps">
+    <li><b>Establish existence.</b> Plain <code>PUT</code> a random scratch key you own, e.g. <code>.dgp-capprobe/&lt;uuid&gt;</code>. Expect <code class="good-code">200</code>. The object now provably exists.</li>
+    <li><b>The discriminating request.</b> <code>PUT</code> the <em>same</em> key again with <code>If-None-Match: *</code>. This is the assertion that can only pass if the precondition was actually evaluated.</li>
+    <li><b>Read the status — and only trust the rejection.</b> See the outcome table below.</li>
+    <li><b>Confirm the positive path (optional).</b> A fresh random key + <code>If-None-Match: *</code> should return <code class="good-code">200</code> (created). A backend that <code>412</code>s a brand-new key isn't honoring semantics either — fail closed.</li>
+    <li><b>Clean up.</b> <code>DELETE</code> the scratch keys.</li>
+  </ol>
+
+  <div class="outcome-grid">
+    <div class="outcome good"><span class="sig">412</span><span><b>CAS honored</b> — the only success signal. AWS, R2, MinIO ≥ 2024-09-13.</span></div>
+    <div class="outcome bad"><span class="sig">200</span><span><b>Precondition silently ignored → NOT supported.</b> The object was just overwritten. This is the trap a one-step probe fails. Old MinIO, SeaweedFS on versioned buckets.</span></div>
+    <div class="outcome warn"><span class="sig">501 / 400</span><span><b>Explicitly unsupported.</b> Wasabi, B2. Safe — the server told you the truth.</span></div>
+    <div class="outcome warn"><span class="sig">500</span><span><b>Broken implementation</b> (s3proxy-style). Treat as unsupported.</span></div>
+  </div>
+
+  <div class="callout good">
+    <span class="label">Design rules that make the probe correct</span>
+    <p><b>Order is load-bearing.</b> PUT-then-conditional-PUT and expect the <code>412</code>. Expecting <em>success</em> proves nothing — a silent-ignore server returns <code>200</code> too. Expecting <code>412</code> on a known-existing key is the only assertion that requires the precondition to have run.</p>
+    <p><b>Sign with SigV4.</b> AWS-compatible impls only evaluate conditional writes under SigV4; a SigV2/legacy-presigned request makes the header a silent no-op — a false negative <em>and</em> a silent-ignore source.</p>
+    <p><b>Probe per representative bucket, then cache.</b> Capability flips with bucket config (versioning + object-lock changed SeaweedFS's answer). If you write to versioned buckets, probe a versioned bucket. Cache the result <em>per destination bucket</em>, not once per backend.</p>
+    <p><b>Fail closed.</b> Any non-<code>412</code> outcome → assume no CAS, fall back to the lock-based path. The costs are asymmetric: a false "supported" is silent overwrite; a false "unsupported" is a slower write. Bias hard toward unsupported.</p>
+  </div>
+
+  <h3>AWS reference semantics (the contract you're testing against)</h3>
+  <ul class="tight">
+    <li><code>If-None-Match: *</code> — no object → <code class="good-code">200</code>; object exists → <code class="danger-code">412 PreconditionFailed</code>. Concurrent writers: first wins, rest get <code>412</code>. A concurrent delete can surface <code>409 ConditionalRequestConflict</code> (retryable).</li>
+    <li><code>If-Match: &lt;etag&gt;</code> — match → <code>200</code>; mismatch → <code>412</code>; key deleted underneath → <code>404</code> (reupload).</li>
+    <li>Requires <b>SigV4</b>. Works on <code>PutObject</code>, <code>CompleteMultipartUpload</code>, <code>CopyObject</code>. <code>If-None-Match</code> on PUT only accepts the literal <code>*</code> at AWS.</li>
+  </ul>
+</section>
+
+<!-- ============ SECTION 5 ============ -->
+<section>
+  <span class="sec-num">05 / TOOLING</span>
+  <h2>Is there a library that already does this?</h2>
+  <p class="sec-sub">Short answer: no purpose-built "which S3 vendor is this" library exists. What's out there splits into header-matchers and compatibility suites that <em>assume you already told them</em> the backend.</p>
+  <ul class="tight">
+    <li><b>nuclei-templates</b> — MinIO coverage is misconfig/exploit-oriented (default <code>minioadmin</code> login, console exposure), not vendor fingerprinting. Its model is "match a <code>Server</code> header / body regex" — exactly the brittle approach.</li>
+    <li><b>ceph/s3-tests</b> — the canonical compat suite does <em>not</em> auto-detect. You hand it an endpoint + creds; gating is by pytest markers you choose. Telling signal: even the reference suite treats capability as a <em>configured input</em>, then verifies with real requests.</li>
+    <li><b>warp / s3-benchmark</b> — throughput benchmarks, zero vendor logic.</li>
+    <li><b>Wappalyzer / WhatWeb</b> — generic header/HTML matchers; object storage isn't their focus; no robust MinIO/Ceph signature set.</li>
+    <li><b>Shodan / Censys</b> — no official filter; practitioners dork on the leaked <code>Server</code> / <code>x-amz-*</code> shapes described in §1.</li>
+    <li><b>Rust / Go capability probers</b> — none found. The ecosystem just <em>tries the operation</em> via the AWS SDK. That absence <em>is</em> the recommendation: the field probes, it doesn't fingerprint.</li>
+  </ul>
+</section>
+
+<!-- ============ SECTION 6 ============ -->
+<section>
+  <span class="sec-num">06 / RANKING</span>
+  <h2>Most reliable fingerprints, in order</h2>
+  <p class="sec-sub">If you build a detector, weight the signals like this — hardcoded determinism first, then the safety-relevant behavioral probe, then the shape tells.</p>
+
+  <div class="rank">
+    <div class="rank-item"><span class="n">1</span><div><span class="impl-tag">MinIO</span><h4>Hardcoded ListBuckets Owner ID</h4><p><code>02d6176d…f66bdbf4</code> + DisplayName <code>minio</code>, identical on every install. One call, deterministic.</p></div></div>
+    <div class="rank-item"><span class="n">2</span><div><span class="impl-tag">safety-critical</span><h4>CAS PUT on an existing key</h4><p><code>412</code> vs silent <code>200</code> vs <code>501</code> partitions the field <em>and</em> flags the dangerous silent-overwrite backends. This is the one you actually need.</p></div></div>
+    <div class="rank-item"><span class="n">3</span><div><span class="impl-tag">Garage</span><h4>Four independent tells</h4><p>LocationConstraint <code>garage</code>; error body has <code>&lt;Region&gt;</code> but no ids; no <code>SignatureDoesNotMatch</code>; ListBuckets has no xmlns.</p></div></div>
+    <div class="rank-item"><span class="n">4</span><div><span class="impl-tag">Ceph family</span><h4>tx-id + missing x-amz-id-2</h4><p><code>tx…</code> request-id with no <code>x-amz-id-2</code>. Split by zone suffix: <code>-default</code> vanilla, <code>-nyc3a</code> DO, <code>-fsn1…ceph4</code> + <code>x-rgw-*</code> Hetzner.</p></div></div>
+    <div class="rank-item"><span class="n">5</span><div><span class="impl-tag">dialect</span><h4>501 on GetBucketReplication</h4><p>Separates Garage / R2 / B2 / Wasabi (501) from the 404-<code>NoSuch…</code> compat backends (AWS / MinIO / Ceph / SeaweedFS).</p></div></div>
+    <div class="rank-item"><span class="n">6</span><div><span class="impl-tag">B2 · R2</span><h4>Multipart ETag that won't reconstruct</h4><p>B2 (SHA1-native) and R2 (opaque) both break MD5-of-MD5s verification — a strong tell where <code>Server</code> is masked.</p></div></div>
+  </div>
+
+  <div class="callout info">
+    <span class="label">Hardest pair</span>
+    <p><b>AWS vs Wasabi.</b> Wasabi is deliberately AWS-faithful — identical SigV4 debug fields and error shapes. Split them on the <code>Server: WasabiS3/…</code> string, the <code>&lt;CMReferenceId&gt;</code> error element, or the <code>:A</code>/<code>:B</code> request-id suffix.</p>
+  </div>
+</section>
+
+</div>
+
+<footer>
+  <div class="wrap">
+    <div class="src">
+      <strong style="color:#c9d2dd">Sources.</strong> MinIO/SeaweedFS/Garage source (github.com/minio/minio, seaweedfs/seaweedfs, git.deuxfleurs.fr/Deuxfleurs/garage) · AWS <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html">conditional-writes</a> &amp; <a href="https://docs.aws.amazon.com/AmazonS3/latest/API/get-request-ids.html">request-ids</a> · minio#20346 · seaweedfs#8073 · gaul/s3proxy#831 · Cloudflare R2 &amp; <a href="https://garagehq.deuxfleurs.fr/documentation/reference-manual/known-issues/">Garage known-issues</a> · live curl captures of s3.amazonaws.com, play.min.io, s3.wasabisys.com, r2.cloudflarestorage.com, digitaloceanspaces.com.
+    </div>
+    <div>DeltaGlider Proxy · backend research · 2026-07</div>
+  </div>
+</footer>

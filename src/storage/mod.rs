@@ -4,6 +4,7 @@
 
 pub mod encrypting;
 mod filesystem;
+pub mod platform;
 pub(crate) mod routing;
 mod s3;
 mod traits;
@@ -12,6 +13,7 @@ pub(crate) mod xattr_meta;
 
 pub use encrypting::{EncryptingBackend, EncryptionConfig, EncryptionKey, WriteMode};
 pub use filesystem::FilesystemBackend;
+pub use platform::{detect_platform, ResponseSignals, S3Platform};
 pub use routing::RoutingBackend;
 pub use s3::{NativeEncryptionConfig, S3Backend};
 pub use traits::{
