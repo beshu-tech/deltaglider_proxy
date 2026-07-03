@@ -139,6 +139,7 @@ pub async fn run_rule(
     lease: Option<RunLease>,
     concurrency: RunConcurrency,
     maintenance_gate: Option<Arc<crate::maintenance::gate::MaintenanceGate>>,
+    coordination_lease: Option<Arc<dyn crate::coordination::CoordinationLease>>,
 ) -> Result<(i64, RunOutcome), crate::config_db::ConfigDbError> {
     let transfers = concurrency.transfers.clamp(1, 64) as usize;
     let upload_concurrency = concurrency.upload_concurrency.clamp(1, 16) as usize;
@@ -184,8 +185,13 @@ pub async fn run_rule(
     let source_prefix = normalize_prefix(&rule.source.prefix);
     let dest_prefix = normalize_prefix(&rule.destination.prefix);
     let lease_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let heartbeat_handle =
-        spawn_lease_heartbeat(db.clone(), &rule.name, lease.clone(), lease_alive.clone());
+    let heartbeat_handle = spawn_lease_heartbeat(
+        db.clone(),
+        &rule.name,
+        lease.clone(),
+        coordination_lease.clone(),
+        lease_alive.clone(),
+    );
     // A run-now is a deliberate ONE-OFF: it runs even a paused rule (pause
     // governs the scheduler); KILL is the stop affordance for a running one-off.
     let ctrl = RunControl {
@@ -193,6 +199,7 @@ pub async fn run_rule(
         rule_name: rule.name.clone(),
         run_id,
         lease: lease.clone(),
+        coordination_lease: coordination_lease.clone(),
         lease_alive: lease_alive.clone(),
         one_off: triggered_by == "run-now",
         max_failures_retained,
@@ -917,6 +924,7 @@ fn spawn_lease_heartbeat(
     db: Arc<Mutex<ConfigDb>>,
     rule_name: &str,
     lease: Option<RunLease>,
+    coordination_lease: Option<Arc<dyn crate::coordination::CoordinationLease>>,
     lease_alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let lease = lease?;
@@ -927,34 +935,46 @@ fn spawn_lease_heartbeat(
         let lock_wait = std::time::Duration::from_secs(2);
         loop {
             tokio::time::sleep(interval).await;
-            // Lock-light retry: a slow worker-side DB hold shouldn't drop the
-            // lease. A lock-acquire timeout is retried (up to 3×); only a renew
-            // that returns false (the SQL guard says the lease genuinely
-            // lapsed) is terminal. `>= now` anti-resurrection lives in the SQL.
-            let mut renewed = false;
-            for _ in 0..3 {
-                match tokio::time::timeout(lock_wait, db.lock()).await {
-                    // Renew result is terminal either way: true = renewed,
-                    // false/err = genuinely lapsed → stop retrying.
-                    Ok(db) => {
-                        renewed = db
-                            .replication_renew_lease(
-                                &rule_name,
-                                &lease.owner,
-                                current_unix_seconds(),
-                                lease.ttl_secs,
-                            )
-                            .unwrap_or(false);
-                        break;
+            let renewed = if let Some(cl) = &coordination_lease {
+                // Shared/cross-instance renew — matches the trait-based acquire.
+                // The trait impl already carries its own bounded transient retry
+                // (S3Lease) or is a single SQLite CAS (LocalLease). A false/err
+                // verdict is terminal (genuinely lapsed / stolen).
+                cl.renew(
+                    crate::coordination::LeaseSubsystem::Replication,
+                    &rule_name,
+                    &lease.owner,
+                    current_unix_seconds(),
+                    lease.ttl_secs,
+                )
+                .await
+                .unwrap_or(false)
+            } else {
+                // Node-local SQLite renew with lock-light retry: a slow worker-side
+                // DB hold shouldn't drop the lease. Lock-acquire timeout retried
+                // (up to 3×); only a renew returning false is terminal.
+                let mut ok = false;
+                for _ in 0..3 {
+                    match tokio::time::timeout(lock_wait, db.lock()).await {
+                        Ok(db) => {
+                            ok = db
+                                .replication_renew_lease(
+                                    &rule_name,
+                                    &lease.owner,
+                                    current_unix_seconds(),
+                                    lease.ttl_secs,
+                                )
+                                .unwrap_or(false);
+                            break;
+                        }
+                        Err(_elapsed) => continue,
                     }
-                    // Couldn't even acquire the lock in time — retry the window.
-                    Err(_elapsed) => continue,
                 }
-            }
+                ok
+            };
             if renewed {
                 continue;
             }
-            // Lost if renew said false, OR all retries failed to acquire lock.
             lease_alive.store(false, std::sync::atomic::Ordering::Release);
             warn!(
                 "Replication lease heartbeat lost for rule '{}'; worker will stop before more work",
@@ -1065,6 +1085,11 @@ struct RunControl {
     rule_name: String,
     run_id: i64,
     lease: Option<RunLease>,
+    /// Cross-instance lease (when the job plane runs shared). When present the
+    /// heartbeat + control renew go through it (matching the acquire), so an
+    /// S3-CAS lease is renewed against the SAME object the scheduler took — not
+    /// the node-local SQLite row.
+    coordination_lease: Option<Arc<dyn crate::coordination::CoordinationLease>>,
     lease_alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
     one_off: bool,
     max_failures_retained: u32,
@@ -1082,6 +1107,9 @@ impl RunControl {
     async fn check(&self, renew: bool) -> Result<ControlVerdict, crate::config_db::ConfigDbError> {
         let mut lease_ok =
             self.lease.is_none() || self.lease_alive.load(std::sync::atomic::Ordering::Acquire);
+        // Read cancel/paused under the DB lock, then DROP it before any lease
+        // renew — the trait renew may do S3 I/O and must never run while holding
+        // the global config-DB mutex.
         let (cancel_requested, paused) = {
             let g = self.db.lock().await;
             let cancel = g
@@ -1091,18 +1119,33 @@ impl RunControl {
                 g.replication_load_state(&self.rule_name),
                 Ok(Some(st)) if st.paused
             );
-            if lease_ok && renew {
-                if let Some(l) = &self.lease {
-                    lease_ok = g.replication_renew_lease(
+            (cancel, paused)
+        };
+        if lease_ok && renew {
+            if let (Some(l), Some(cl)) = (&self.lease, &self.coordination_lease) {
+                // Shared/cross-instance renew — matches the trait-based acquire.
+                lease_ok = cl
+                    .renew(
+                        crate::coordination::LeaseSubsystem::Replication,
                         &self.rule_name,
                         &l.owner,
                         current_unix_seconds(),
                         l.ttl_secs,
-                    )?;
-                }
+                    )
+                    .await
+                    .unwrap_or(false);
+            } else if let Some(l) = &self.lease {
+                // No injected coordination lease (e.g. an admin run-now without
+                // one) → the node-local SQLite renew, as before.
+                let g = self.db.lock().await;
+                lease_ok = g.replication_renew_lease(
+                    &self.rule_name,
+                    &l.owner,
+                    current_unix_seconds(),
+                    l.ttl_secs,
+                )?;
             }
-            (cancel, paused)
-        };
+        }
         // Mid-run maintenance deferral: a dest bucket that became write-gated
         // (migrate / re-encrypt) must stop the run like a pause — cursor kept,
         // resumes when the maintenance job clears. Not suppressed by one_off:

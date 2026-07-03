@@ -122,7 +122,9 @@ impl ConfigDbSync {
     }
 
     /// Build an S3 client from BackendConfig, reusing the same credentials.
-    async fn build_client(config: &BackendConfig) -> Result<Client, String> {
+    /// `pub` so the coordination-lease builder (in the binary crate's startup)
+    /// shares the exact same client construction as the config sync.
+    pub async fn build_client(config: &BackendConfig) -> Result<Client, String> {
         let (endpoint, region, force_path_style, access_key_id, secret_access_key) = match config {
             BackendConfig::S3 {
                 endpoint,
@@ -633,7 +635,7 @@ fn node_id() -> String {
 /// as `PreconditionFailed` / a 412 status in the error display string.
 /// Extracted as a pure fn so the decision is unit-testable without a live
 /// S3 backend (per the project's "pure functions at decision points" rule).
-fn is_precondition_failed(err_str: &str) -> bool {
+pub(crate) fn is_precondition_failed(err_str: &str) -> bool {
     err_str.contains("PreconditionFailed")
         || err_str.contains("Precondition Failed")
         || err_str.contains("412")
@@ -641,8 +643,9 @@ fn is_precondition_failed(err_str: &str) -> bool {
 
 /// Pure: does a stringified GET error signal the object is ABSENT (a 404-class
 /// response) rather than a real failure? Extracted so `read_witness`'s
-/// absent-vs-error decision is unit-testable without a live backend.
-fn is_object_absent(err_str: &str) -> bool {
+/// absent-vs-error decision is unit-testable without a live backend. Shared with
+/// the S3 coordination-lease read path.
+pub(crate) fn is_object_absent(err_str: &str) -> bool {
     err_str.contains("NoSuchKey") || err_str.contains("NotFound") || err_str.contains("404")
 }
 

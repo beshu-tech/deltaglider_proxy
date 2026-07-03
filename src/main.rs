@@ -727,6 +727,17 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 db.clone(),
             );
         }
+        // Job-plane leader lease: S3-CAS (cross-node failover) when a validated
+        // coordination bucket is configured, else node-local. Built ONCE, before
+        // the schedulers spawn. This cut wires REPLICATION only (the high-freq
+        // 30s-tick timer where cross-node double-run is costliest); lifecycle
+        // (hourly, pure-plan-idempotent) + maintenance (operator one-offs) stay
+        // node-local for now — documented follow-ups.
+        let coordination_lease = if let Some(db) = config_db.as_ref() {
+            Some(build_coordination_lease(&config, db, &admin_password_hash).await)
+        } else {
+            None
+        };
         deltaglider_proxy::lifecycle::scheduler::spawn_scheduler(
             shared_config.clone(),
             config_db.clone(),
@@ -738,6 +749,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 shared_config.clone(),
                 db.clone(),
                 state.clone(),
+                coordination_lease.clone(),
             );
             // Event-driven consumer — the PRIMARY trigger: drains object
             // mutations from the outbox and replicates in near-real time.

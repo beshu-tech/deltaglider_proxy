@@ -187,6 +187,9 @@ pub async fn run_now(
             }),
             concurrency,
             Some(maintenance_gate),
+            // Admin run-now uses the node-local SQLite lease (it is an explicit,
+            // sticky-routed operator action) — not the cross-instance trait lease.
+            None,
         )
         .await;
         {

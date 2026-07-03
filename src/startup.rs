@@ -1177,6 +1177,91 @@ fn init_config_db_attempt(
     }
 }
 
+/// Build the job-plane leader lease, selecting the impl by whether a
+/// CAS-capable coordination bucket is configured. Called BEFORE the schedulers
+/// spawn so they receive a live handle.
+///
+/// - No `config_sync_bucket` → [`LocalLease`] (single-instance, node-local, no S3
+///   traffic). "HA inactive".
+/// - `config_sync_bucket` set → validate it enforces conditional writes
+///   ([`ConfigDbSync::validate_coordination_bucket`], which CRASHES on a
+///   silent-clobber backend). On success → [`S3Lease`] (real cross-node failover).
+///   If the bucket/client can't be built at all, LOG and fall back to
+///   [`LocalLease`] rather than block startup (edge case E6 — never a SPOF).
+///
+/// The validation here is idempotent with `init_config_sync`'s later call (the
+/// witness fast-path makes the second a single cheap GET).
+pub async fn build_coordination_lease(
+    config: &Config,
+    config_db: &Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::ConfigDb>>,
+    admin_password_hash: &str,
+) -> Arc<dyn deltaglider_proxy::coordination::CoordinationLease> {
+    use deltaglider_proxy::coordination::{durable_node_id, LocalLease, S3Lease};
+
+    let local = || Arc::new(LocalLease::new(config_db.clone()));
+
+    let sync_bucket = match &config.config_sync_bucket {
+        Some(b) if !b.is_empty() => b.clone(),
+        _ => {
+            info!("Job-plane lease: node-local (single-instance; no coordination bucket)");
+            return local();
+        }
+    };
+
+    let node_id = durable_node_id(
+        config_db_path()
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new(".")),
+    );
+
+    // Build the coordination client + validate the bucket enforces CAS. The
+    // validation CRASHES on a silent-clobber backend (data-loss trap); it is
+    // idempotent with init_config_sync's later call (witness fast-path).
+    let sync = match ConfigDbSync::new(
+        &config.backend,
+        sync_bucket.clone(),
+        config
+            .config_sync_object_key
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| {
+                deltaglider_proxy::config_db_sync::DEFAULT_CONFIG_SYNC_OBJECT_KEY.to_string()
+            }),
+        config_db_path(),
+        admin_password_hash.to_string(),
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                "Job-plane lease: coordination client for bucket '{sync_bucket}' failed to build \
+                 ({e}) — node-local fallback (NOT cross-node HA)"
+            );
+            return local();
+        }
+    };
+
+    if let Err(e) = sync.validate_coordination_bucket().await {
+        error!("FATAL: coordination bucket validation failed (lease build): {e}");
+        std::process::exit(1);
+    }
+
+    match ConfigDbSync::build_client(&config.backend).await {
+        Ok(client) => {
+            info!(
+                "Job-plane lease: S3-CAS on bucket '{sync_bucket}' (cross-node failover, \
+                 node_id={node_id})"
+            );
+            Arc::new(S3Lease::new(client, sync_bucket, node_id))
+        }
+        Err(e) => {
+            warn!("Job-plane lease: coordination client build failed ({e}) — node-local fallback");
+            local()
+        }
+    }
+}
+
 /// Initialize config DB S3 sync if DGP_CONFIG_SYNC_BUCKET is set.
 /// On startup: downloads from S3 if newer, reopens the DB, and rebuilds IAM index.
 #[allow(clippy::too_many_arguments)]

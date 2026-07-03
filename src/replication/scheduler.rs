@@ -11,6 +11,7 @@ use crate::background::parse_duration_or;
 use crate::config::SharedConfig;
 use crate::config_db::ConfigDb;
 use crate::config_sections::ReplicationConfig;
+use crate::coordination::{CoordinationLease, LeaseSubsystem, LocalLease};
 use crate::replication::{current_unix_seconds, run_rule, RunLease};
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,8 +27,13 @@ pub fn spawn_scheduler(
     config: SharedConfig,
     db: Arc<Mutex<ConfigDb>>,
     state: Arc<AppState>,
+    lease: Option<Arc<dyn CoordinationLease>>,
 ) -> tokio::task::JoinHandle<()> {
     let instance_id = format!("scheduler:{}", uuid::Uuid::new_v4());
+    // Default to a node-local lease when none was injected (dev / no coordination
+    // bucket) so the scheduler always has a lease handle to call.
+    let lease: Arc<dyn CoordinationLease> =
+        lease.unwrap_or_else(|| Arc::new(LocalLease::new(db.clone())));
     tokio::spawn(async move {
         info!("Replication scheduler started: instance_id={}", instance_id);
         loop {
@@ -39,7 +45,7 @@ pub fn spawn_scheduler(
 
             let replication = { config.read().await.replication.clone() };
             if replication.enabled {
-                run_due_rules(&replication, &config, &db, &state, &instance_id).await;
+                run_due_rules(&replication, &config, &db, &state, &instance_id, &lease).await;
             } else {
                 debug!("Replication scheduler skipped: global replication disabled");
             }
@@ -53,10 +59,17 @@ async fn run_due_rules(
     db: &Arc<Mutex<ConfigDb>>,
     state: &Arc<AppState>,
     instance_id: &str,
+    lease: &Arc<dyn CoordinationLease>,
 ) {
     for rule in replication.rules.iter().filter(|rule| rule.enabled) {
         let now = current_unix_seconds();
-        let should_run = {
+        // Phase 1 (DB lock): advisory pre-filter — is the rule initialised, not
+        // paused, and due? The lease acquire (phase 2) is the real mutual
+        // exclusion, so these checks racing another node is harmless (the loser
+        // of the lease just skips). Splitting the lock here — vs the old
+        // single-lock acquire — is safe because the lease, not the DB row, is now
+        // the arbiter across instances.
+        let eligible = {
             let db = db.lock().await;
             if let Err(err) = db.replication_ensure_state(&rule.name, now) {
                 warn!(
@@ -71,25 +84,7 @@ async fn run_due_rules(
                         false
                     }
                     Ok(Some(st)) if st.next_due_at > now => false,
-                    Ok(Some(_)) | Ok(None) => match db.replication_try_acquire_lease(
-                        &rule.name,
-                        instance_id,
-                        now,
-                        lease_ttl_secs(replication),
-                    ) {
-                        Ok(true) => true,
-                        Ok(false) => {
-                            debug!("Replication scheduler skipped busy rule '{}'", rule.name);
-                            false
-                        }
-                        Err(err) => {
-                            warn!(
-                                "Replication scheduler could not acquire lease for rule '{}': {}",
-                                rule.name, err
-                            );
-                            false
-                        }
-                    },
+                    Ok(Some(_)) | Ok(None) => true,
                     Err(err) => {
                         warn!(
                             "Replication scheduler could not load state for rule '{}': {}",
@@ -98,6 +93,34 @@ async fn run_due_rules(
                         false
                     }
                 }
+            }
+        };
+        if !eligible {
+            continue;
+        }
+
+        // Phase 2 (lease acquire — cross-instance arbiter). Exactly one node wins.
+        let should_run = match lease
+            .try_acquire(
+                LeaseSubsystem::Replication,
+                &rule.name,
+                instance_id,
+                now,
+                lease_ttl_secs(replication),
+            )
+            .await
+        {
+            Ok(true) => true,
+            Ok(false) => {
+                debug!("Replication scheduler skipped busy rule '{}'", rule.name);
+                false
+            }
+            Err(err) => {
+                warn!(
+                    "Replication scheduler could not acquire lease for rule '{}': {}",
+                    rule.name, err
+                );
+                false
             }
         };
 
@@ -115,8 +138,9 @@ async fn run_due_rules(
             .iter()
             .any(|r| r.name == rule.name)
         {
-            let db = db.lock().await;
-            let _ = db.replication_release_lease(&rule.name, instance_id);
+            let _ = lease
+                .release(LeaseSubsystem::Replication, &rule.name, instance_id)
+                .await;
             continue;
         }
 
@@ -127,8 +151,9 @@ async fn run_due_rules(
             );
             // Release the just-acquired lease — leaking it blocks run-now AND
             // (via the lease-anchored liveness check) rule deletion for a TTL.
-            let db = db.lock().await;
-            let _ = db.replication_release_lease(&rule.name, instance_id);
+            let _ = lease
+                .release(LeaseSubsystem::Replication, &rule.name, instance_id)
+                .await;
             continue;
         }
 
@@ -152,6 +177,7 @@ async fn run_due_rules(
                 upload_concurrency: replication.upload_concurrency,
             },
             Some(state.maintenance_gate.clone()),
+            Some(lease.clone()),
         )
         .await
         {
@@ -160,10 +186,9 @@ async fn run_due_rules(
                 rule.name, err
             );
         }
-        {
-            let db = db.lock().await;
-            let _ = db.replication_release_lease(&rule.name, instance_id);
-        }
+        let _ = lease
+            .release(LeaseSubsystem::Replication, &rule.name, instance_id)
+            .await;
     }
 }
 
