@@ -437,155 +437,171 @@ impl ConfigDbSync {
     ///     STALE witness is refreshed with a plain overwrite (CAS already proven
     ///     in step 2; the timestamp bump isn't CAS-critical).
     pub async fn validate_coordination_bucket(&self) -> Result<CoordinationValidation, String> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let witness_key = COORDINATION_WITNESS_KEY;
-
-        // ── 1. Witness fast-path ──
-        // `refreshing_stale` = we saw an EXISTING witness that aged out. It
-        // matters for step 3: a stale witness must be OVERWRITTEN (its key already
-        // exists, so a create-if-absent write would 412 and never bump the stamp).
-        let mut refreshing_stale = false;
-        match self.read_witness(witness_key).await {
-            Ok(Some(w)) if witness_is_fresh(w.validated_at_unix, now, WITNESS_MAX_AGE_SECS) => {
-                return Ok(CoordinationValidation::CachedWitness {
-                    validated_at_unix: w.validated_at_unix,
-                    validated_by: w.validated_by,
-                });
-            }
-            Ok(Some(_)) => refreshing_stale = true, // exists but aged out → overwrite
-            Ok(None) => {}                          // absent → create-if-absent
-            Err(e) => {
-                // A read error is not itself a validation failure (transient), but
-                // don't crash on it — fall through to the probe, which is the real
-                // gate. Log via the returned variant if the probe then passes.
-                tracing::debug!("coordination witness read failed (will probe): {e}");
-            }
-        }
-
-        // ── 2. Isolated probe on a random key (fail-closed) ──
-        let probe_key = format!(".deltaglider/_cwprobe/{}", uuid::Uuid::new_v4());
-        let supported = self.probe_conditional_write(&probe_key).await?;
-        if !supported {
-            return Err(format!(
-                "Coordination bucket '{}' does NOT enforce atomic conditional writes \
-                 (If-None-Match). HA coordination (leases, single-writer locks) would be \
-                 UNSAFE — refusing to start. Use a coordination bucket on AWS S3, MinIO \
-                 (>=2024-09), or Ceph/Hetzner; Backblaze B2 (501) and old MinIO/SeaweedFS \
-                 (silent overwrite) are NOT supported.",
-                self.bucket
-            ));
-        }
-
-        // ── 3. Witness write (create-if-absent; overwrite if refreshing stale) ──
-        self.write_witness(witness_key, now, refreshing_stale).await; // best-effort
-        Ok(CoordinationValidation::Probed)
-    }
-
-    /// Read + parse the witness object. `Ok(None)` = absent (a 404/NoSuchKey).
-    async fn read_witness(&self, key: &str) -> Result<Option<Witness>, String> {
-        match self
-            .s3_client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
+        validate_cas_bucket(&self.s3_client, &self.bucket, COORDINATION_WITNESS_KEY)
             .await
-        {
-            Ok(out) => {
-                let bytes = out
-                    .body
-                    .collect()
-                    .await
-                    .map_err(|e| format!("witness body read: {e}"))?
-                    .into_bytes();
-                Ok(serde_json::from_slice::<Witness>(&bytes).ok())
-            }
-            Err(e) => {
-                let s = format!("{e:?}");
-                if is_object_absent(&s) {
-                    Ok(None)
-                } else {
-                    Err(s)
-                }
-            }
+            .map_err(|failure| match failure {
+                CasValidationFailure::NonCas => format!(
+                    "Coordination bucket '{}' does NOT enforce atomic conditional writes \
+                     (If-None-Match). HA coordination (leases, single-writer locks) would be \
+                     UNSAFE — refusing to start. Use a coordination bucket on AWS S3, MinIO \
+                     (>=2024-09), or Ceph/Hetzner; Backblaze B2 (501) and old MinIO/SeaweedFS \
+                     (silent overwrite) are NOT supported.",
+                    self.bucket
+                ),
+                CasValidationFailure::Indeterminate(e) => e,
+            })
+    }
+}
+
+/// Why a CAS validation did not pass. `NonCas` is DEFINITIVE (the backend
+/// accepted an `If-None-Match:*` re-PUT it should have 412'd); `Indeterminate`
+/// means the probe could not run (network, missing bucket) — callers decide
+/// whether that is fatal (coordination: yes) or a loud warning (data-plane
+/// capability gate: yes-warn, no-crash).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CasValidationFailure {
+    NonCas,
+    Indeterminate(String),
+}
+
+/// Generalized boot-time CAS validation of an arbitrary (client, bucket):
+/// witness fast-path → random-key fail-closed probe → best-effort witness
+/// write. The single implementation behind BOTH the coordination-bucket gate
+/// and the per-backend write-capability gate (they differ only in witness key
+/// and in how the caller treats failure).
+pub async fn validate_cas_bucket(
+    client: &Client,
+    bucket: &str,
+    witness_key: &str,
+) -> Result<CoordinationValidation, CasValidationFailure> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    // ── 1. Witness fast-path ──
+    // `refreshing_stale` = we saw an EXISTING witness that aged out. It
+    // matters for step 3: a stale witness must be OVERWRITTEN (its key already
+    // exists, so a create-if-absent write would 412 and never bump the stamp).
+    let mut refreshing_stale = false;
+    match read_witness(client, bucket, witness_key).await {
+        Ok(Some(w)) if witness_is_fresh(w.validated_at_unix, now, WITNESS_MAX_AGE_SECS) => {
+            return Ok(CoordinationValidation::CachedWitness {
+                validated_at_unix: w.validated_at_unix,
+                validated_by: w.validated_by,
+            });
+        }
+        Ok(Some(_)) => refreshing_stale = true, // exists but aged out → overwrite
+        Ok(None) => {}                          // absent → create-if-absent
+        Err(e) => {
+            // A read error is not itself a validation failure (transient), but
+            // don't fail on it — fall through to the probe, the real gate.
+            tracing::debug!("CAS witness read failed on '{bucket}' (will probe): {e}");
         }
     }
 
-    /// Best-effort witness write. Never fatal — the probe already proved the
-    /// bucket; a missing witness just re-probes next boot.
-    ///
-    /// `overwrite` picks the mode:
-    ///  - `false` (absent witness): create-if-absent (`If-None-Match:*`) so 16
-    ///    concurrent nodes don't clobber — exactly one wins, the rest 412
-    ///    harmlessly (a free live-fire CAS test).
-    ///  - `true` (refreshing a STALE witness): plain overwrite — the key already
-    ///    exists, so create-if-absent would 412 forever and never bump the stamp.
-    async fn write_witness(&self, key: &str, now: i64, overwrite: bool) {
-        let body = serde_json::to_vec(&Witness {
-            version: 1,
-            validated_at_unix: now,
-            validated_by: node_id(),
-            primitive: "if-none-match-cas".to_string(),
-        })
-        .unwrap_or_default();
-        let mut put = self
-            .s3_client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .body(ByteStream::from(body))
-            .content_type("application/json");
-        if !overwrite {
-            put = put.if_none_match("*");
-        }
-        // Ignore the result: 412 (peer won the create race) and any transient
-        // error are both non-fatal — validation already succeeded via the probe.
-        let _ = put.send().await;
+    // ── 2. Isolated probe on a random key (fail-closed) ──
+    let probe_key = format!(".deltaglider/_cwprobe/{}", uuid::Uuid::new_v4());
+    match probe_conditional_write(client, bucket, &probe_key).await {
+        Ok(true) => {}
+        Ok(false) => return Err(CasValidationFailure::NonCas),
+        Err(e) => return Err(CasValidationFailure::Indeterminate(e)),
     }
 
-    /// The isolated two-step conditional-write probe on a caller-owned key.
-    /// `Ok(true)` iff the re-PUT with `If-None-Match:*` returned a real `412`.
-    async fn probe_conditional_write(&self, key: &str) -> Result<bool, String> {
-        // Step 1: unconditional PUT to establish existence.
-        self.s3_client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"1"))
-            .send()
-            .await
-            .map_err(|e| format!("probe could not write to '{}': {e:?}", self.bucket))?;
-        // Step 2: re-PUT If-None-Match:* on the SAME key — MUST be 412.
-        let put2 = self
-            .s3_client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"2"))
-            .if_none_match("*")
-            .send()
-            .await;
-        let supported = match &put2 {
-            Ok(_) => false, // precondition ignored → silent overwrite
-            Err(e) => is_precondition_failed(&format!("{e:?}")),
-        };
-        // Best-effort cleanup.
-        let _ = self
-            .s3_client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await;
-        Ok(supported)
+    // ── 3. Witness write (create-if-absent; overwrite if refreshing stale) ──
+    write_witness(client, bucket, witness_key, now, refreshing_stale).await; // best-effort
+    Ok(CoordinationValidation::Probed)
+}
+
+/// Read + parse a witness object. `Ok(None)` = absent (a 404/NoSuchKey).
+async fn read_witness(client: &Client, bucket: &str, key: &str) -> Result<Option<Witness>, String> {
+    match client.get_object().bucket(bucket).key(key).send().await {
+        Ok(out) => {
+            let bytes = out
+                .body
+                .collect()
+                .await
+                .map_err(|e| format!("witness body read: {e}"))?
+                .into_bytes();
+            Ok(serde_json::from_slice::<Witness>(&bytes).ok())
+        }
+        Err(e) => {
+            let s = format!("{e:?}");
+            if is_object_absent(&s) {
+                Ok(None)
+            } else {
+                Err(s)
+            }
+        }
     }
+}
+
+/// Best-effort witness write. Never fatal — the probe already proved the
+/// bucket; a missing witness just re-probes next boot.
+///
+/// `overwrite` picks the mode:
+///  - `false` (absent witness): create-if-absent (`If-None-Match:*`) so 16
+///    concurrent nodes don't clobber — exactly one wins, the rest 412
+///    harmlessly (a free live-fire CAS test).
+///  - `true` (refreshing a STALE witness): plain overwrite — the key already
+///    exists, so create-if-absent would 412 forever and never bump the stamp.
+async fn write_witness(client: &Client, bucket: &str, key: &str, now: i64, overwrite: bool) {
+    let body = serde_json::to_vec(&Witness {
+        version: 1,
+        validated_at_unix: now,
+        validated_by: node_id(),
+        primitive: "if-none-match-cas".to_string(),
+    })
+    .unwrap_or_default();
+    let mut put = client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from(body))
+        .content_type("application/json");
+    if !overwrite {
+        put = put.if_none_match("*");
+    }
+    // Ignore the result: 412 (peer won the create race) and any transient
+    // error are both non-fatal — validation already succeeded via the probe.
+    let _ = put.send().await;
+}
+
+/// The isolated two-step conditional-write probe on a caller-owned key.
+/// `Ok(true)` iff the re-PUT with `If-None-Match:*` returned a real `412`.
+async fn probe_conditional_write(client: &Client, bucket: &str, key: &str) -> Result<bool, String> {
+    // Step 1: unconditional PUT to establish existence.
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"1"))
+        .send()
+        .await
+        .map_err(|e| format!("probe could not write to '{bucket}': {e:?}"))?;
+    // Step 2: re-PUT If-None-Match:* on the SAME key — MUST be 412.
+    let put2 = client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"2"))
+        .if_none_match("*")
+        .send()
+        .await;
+    let supported = match &put2 {
+        Ok(_) => false, // precondition ignored → silent overwrite
+        Err(e) => is_precondition_failed(&format!("{e:?}")),
+    };
+    // Best-effort cleanup.
+    let _ = client.delete_object().bucket(bucket).key(key).send().await;
+    Ok(supported)
 }
 
 /// Fixed object key for the coordination-bucket validation witness.
 const COORDINATION_WITNESS_KEY: &str = ".deltaglider/coordination-witness.json";
+/// Witness key for the per-backend write-capability validation (written in the
+/// probed DATA bucket, distinct from the coordination witness).
+pub const BACKEND_CAPABILITY_WITNESS_KEY: &str = ".deltaglider/backend-capability-witness.json";
 /// Re-validate a witnessed bucket only after this age — a huge default so normal
 /// boots always take the cheap fast-path, while still catching a backend that
 /// silently REGRESSED (e.g. versioning toggled) within a season.

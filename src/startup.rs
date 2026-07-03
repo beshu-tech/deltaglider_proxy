@@ -153,6 +153,7 @@ fn warn_active_test_seams() {
         "DGP_TEST_OBJECT_DELAY_MS",
         "DGP_TEST_COPY_STALL_MS",
         "DGP_TEST_MAX_JOB_PAGES",
+        "DGP_TEST_FORCE_NONCAS_BACKEND",
     ];
     let active: Vec<&str> = SEAMS
         .iter()
@@ -1258,6 +1259,83 @@ pub async fn build_coordination_lease(
         Err(e) => {
             warn!("Job-plane lease: coordination client build failed ({e}) — node-local fallback");
             local()
+        }
+    }
+}
+
+/// Startup gate (guard B): under multi-instance, every NAMED S3 backend that
+/// hosts a client-writable routed bucket must enforce conditional writes —
+/// without CAS, two nodes' concurrent same-deltaspace PUTs can corrupt
+/// `reference.bin` (the in-process prefix lock doesn't span processes).
+///
+/// Fail-fast contract (observability is the point — every outcome is loud):
+///  - single-instance → one `info!`, no probes, zero cost.
+///  - each validated backend → one `info!` (probed vs witness-cached).
+///  - DEFINITIVE non-CAS (the `If-None-Match:*` re-PUT succeeded) → doc-linked
+///    `FATAL` naming the buckets, the backend, and both fixes → `exit(1)`.
+///  - indeterminate probe (network, missing bucket) → loud `warn!` + Unknown
+///    verdict in the cache (GUI banner), NOT a crash — mirrors the "never a
+///    SPOF" stance of the lease builder above.
+///
+/// The DEFAULT backend is exempt here: the coordination bucket lives on it
+/// (`ConfigDbSync` builds from `config.backend`), so `validate_coordination_bucket`
+/// already crash-validates it. `replication_target_only` buckets are exempt:
+/// they have no client writers (guard A).
+pub async fn validate_backend_write_capability(
+    config: &Config,
+    cache: &deltaglider_proxy::coordination::BackendCapabilityCache,
+) {
+    use deltaglider_proxy::coordination::capability::{
+        client_writable_s3_backends, establish_backend_verdict, forced_noncas_backends,
+        CapabilityVerdict, CAPABILITY_DOC_URL,
+    };
+
+    if config
+        .config_sync_bucket
+        .as_deref()
+        .is_none_or(|b| b.is_empty())
+    {
+        info!(
+            "Backend capability gate skipped: single instance (config_sync_bucket not set) — \
+             the in-process lock is sufficient"
+        );
+        return;
+    }
+    let groups = client_writable_s3_backends(config);
+    if groups.is_empty() {
+        info!(
+            "Backend capability gate: no client-writable buckets on named S3 backends — \
+             nothing to validate (default backend is covered by the coordination gate)"
+        );
+        return;
+    }
+    let forced = forced_noncas_backends();
+    for (name, group) in groups {
+        let verdict = establish_backend_verdict(&name, &group, &forced).await;
+        cache.set(&name, verdict.clone());
+        match verdict {
+            CapabilityVerdict::CasVerified { via } => info!(
+                "backend capability: '{name}' conditional writes verified ({via:?}) — \
+                 client-writable bucket(s) {:?} are safe under multi-instance",
+                group.buckets
+            ),
+            CapabilityVerdict::NonCas => {
+                error!(
+                    "FATAL: backend '{name}' does not support conditional writes, but \
+                     client-writable bucket(s) {:?} route to it and multi-instance mode is \
+                     active (config_sync_bucket is set). Concurrent writes from two instances \
+                     can corrupt delta references. Fix: move these buckets to a CAS-capable \
+                     backend, or mark each as replication_target_only. — see {CAPABILITY_DOC_URL}",
+                    group.buckets
+                );
+                std::process::exit(1);
+            }
+            CapabilityVerdict::Unknown { reason } => warn!(
+                "backend capability: '{name}' could NOT be verified ({reason}) — bucket(s) \
+                 {:?} are unvalidated; the proxy continues but multi-instance write safety \
+                 is UNPROVEN on this backend. See {CAPABILITY_DOC_URL}",
+                group.buckets
+            ),
         }
     }
 }

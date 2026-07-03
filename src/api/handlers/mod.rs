@@ -82,6 +82,10 @@ pub struct AppState {
     pub maintenance_gate: Arc<crate::maintenance::gate::MaintenanceGate>,
     /// Wakes the maintenance worker immediately when a job is created.
     pub maintenance_notify: Arc<tokio::sync::Notify>,
+    /// Per-backend conditional-write verdicts from the startup capability
+    /// gate (empty when single-instance — the gate doesn't run). Consulted
+    /// by the hot-apply pre-commit gate + the admin backends API.
+    pub backend_capabilities: Arc<crate::coordination::BackendCapabilityCache>,
 }
 
 // ---------------------------------------------------------------------------

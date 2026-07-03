@@ -243,6 +243,17 @@ pub(crate) async fn apply_config_transition(
     let mut warnings = Vec::new();
     let mut requires_restart = false;
 
+    // 0. Backend write-capability pre-commit gate (guard B, hot-apply half):
+    //    refuse a transition that would route a client-writable bucket onto a
+    //    known/probed non-CAS backend under multi-instance — the startup gate
+    //    alone would let a runtime apply bypass it. Runs FIRST so a refusal
+    //    side-effects nothing. No-op when single-instance.
+    crate::coordination::capability::hot_apply_capability_gate(
+        new_cfg,
+        &state.s3_state.backend_capabilities,
+    )
+    .await?;
+
     // 1. Engine rebuild — only on fields the engine reads. Bail early on
     //    failure so callers can roll back their in-memory mutation
     //    without having side-effected anything downstream.

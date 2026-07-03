@@ -51,10 +51,7 @@ pub(crate) async fn enqueue_object_events(state: &Arc<AppState>, events: &[NewEv
     }
 }
 
-/// Doc anchor for backend-capability / write-boundary enforcement messages.
-/// The GUI linkifies this and rewrites it to the in-app docs viewer.
-pub(crate) const CAPABILITY_DOC_URL: &str =
-    "https://deltaglider.com/docs/how-to/backend-capability-validation";
+use crate::coordination::capability::CAPABILITY_DOC_URL;
 
 /// Client-write boundary gate. A bucket marked `replication_target_only`
 /// refuses ALL client writes (PUT/DELETE/multipart/copy-into/admin bulk)

@@ -637,6 +637,15 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let usage_scanner = Arc::new(UsageScanner::new());
     let maintenance_gate = Arc::new(deltaglider_proxy::maintenance::gate::MaintenanceGate::new());
     let maintenance_notify = Arc::new(tokio::sync::Notify::new());
+    let backend_capabilities =
+        Arc::new(deltaglider_proxy::coordination::BackendCapabilityCache::default());
+
+    // Backend write-capability gate (guard B): under multi-instance, a
+    // client-writable bucket on a non-CAS named backend is a data-corruption
+    // trap — die HERE, before anything serves. Single-instance: one info!
+    // line, zero probes. See docs/product/how-to/backend-capability-validation.md.
+    startup::validate_backend_write_capability(&config, &backend_capabilities).await;
+
     let state = Arc::new(AppState {
         engine: ArcSwap::from_pointee(engine),
         multipart,
@@ -647,6 +656,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         form_post_replay: Arc::new(dashmap::DashMap::new()),
         maintenance_gate: maintenance_gate.clone(),
         maintenance_notify: maintenance_notify.clone(),
+        backend_capabilities: backend_capabilities.clone(),
     });
 
     // Re-arm the maintenance write-gate for jobs that survived a restart
