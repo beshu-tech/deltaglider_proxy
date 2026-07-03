@@ -51,8 +51,8 @@
 
 use super::io_to_storage_error;
 use super::traits::{
-    ConditionalWriteSupport, DelegatedListResult, LiteScanResult, MultipartUpload, StorageBackend,
-    StorageError, UploadedPart,
+    DelegatedListResult, LiteScanResult, MultipartUpload, StorageBackend, StorageError,
+    UploadedPart,
 };
 use crate::types::FileMetadata;
 use aes_gcm::aead::{Aead, Payload};
@@ -1531,19 +1531,6 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
             return false;
         }
         self.inner.lite_list_carries_logical_facts(bucket)
-    }
-
-    fn supports_conditional_writes(&self, bucket: &str) -> bool {
-        // Encryption rewrites the body but the conditional-PUT precondition is a
-        // pure metadata/existence check on the object key — unaffected. Delegate.
-        self.inner.supports_conditional_writes(bucket)
-    }
-
-    async fn conditional_write_probe(
-        &self,
-        bucket: &str,
-    ) -> Result<ConditionalWriteSupport, StorageError> {
-        self.inner.conditional_write_probe(bucket).await
     }
 
     async fn get_passthrough_stream_range(

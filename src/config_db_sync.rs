@@ -503,7 +503,7 @@ impl ConfigDbSync {
             }
             Err(e) => {
                 let s = format!("{e:?}");
-                if s.contains("NoSuchKey") || s.contains("NotFound") || s.contains("404") {
+                if is_object_absent(&s) {
                     Ok(None)
                 } else {
                     Err(s)
@@ -637,6 +637,13 @@ fn is_precondition_failed(err_str: &str) -> bool {
     err_str.contains("PreconditionFailed")
         || err_str.contains("Precondition Failed")
         || err_str.contains("412")
+}
+
+/// Pure: does a stringified GET error signal the object is ABSENT (a 404-class
+/// response) rather than a real failure? Extracted so `read_witness`'s
+/// absent-vs-error decision is unit-testable without a live backend.
+fn is_object_absent(err_str: &str) -> bool {
+    err_str.contains("NoSuchKey") || err_str.contains("NotFound") || err_str.contains("404")
 }
 
 /// Pure classifier: map a stringified S3 PUT error to [`UploadError`] —
@@ -831,6 +838,15 @@ mod tests {
         // Clock skew: witness "from the future" → treated as stale, not fresh
         // (guards against a bad clock making a bogus witness look eternally valid).
         assert!(!witness_is_fresh(2000, 1000, max));
+    }
+
+    #[test]
+    fn object_absent_detected_from_common_shapes() {
+        assert!(is_object_absent("service error: NoSuchKey"));
+        assert!(is_object_absent("dispatch failure: NotFound"));
+        assert!(is_object_absent("HTTP 404"));
+        assert!(!is_object_absent("AccessDenied"));
+        assert!(!is_object_absent("PreconditionFailed"));
     }
 
     #[test]

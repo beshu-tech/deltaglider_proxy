@@ -18,8 +18,8 @@ use futures::stream::BoxStream;
 use crate::types::FileMetadata;
 
 use super::traits::{
-    BucketListing, ConditionalWriteSupport, DelegatedListResult, LiteScanResult, MultipartUpload,
-    StorageBackend, StorageError, UploadedPart,
+    BucketListing, DelegatedListResult, LiteScanResult, MultipartUpload, StorageBackend,
+    StorageError, UploadedPart,
 };
 
 /// Route entry: maps a virtual bucket to a backend and optional real bucket name.
@@ -728,30 +728,6 @@ impl StorageBackend for RoutingBackend {
         }
         self.default_backend()
             .lite_list_carries_logical_facts(bucket)
-    }
-
-    fn supports_conditional_writes(&self, bucket: &str) -> bool {
-        if let Some(route) = self.routes.get(bucket) {
-            return self.backends[&route.backend_name]
-                .as_ref()
-                .as_ref()
-                .supports_conditional_writes(bucket);
-        }
-        self.default_backend().supports_conditional_writes(bucket)
-    }
-
-    async fn conditional_write_probe(
-        &self,
-        bucket: &str,
-    ) -> Result<ConditionalWriteSupport, StorageError> {
-        if let Some(route) = self.routes.get(bucket) {
-            return self.backends[&route.backend_name]
-                .as_ref()
-                .as_ref()
-                .conditional_write_probe(bucket)
-                .await;
-        }
-        self.default_backend().conditional_write_probe(bucket).await
     }
 
     // === Scanning operations ===

@@ -27,8 +27,8 @@
 //!   - storage/s3/metadata_io.rs    — header/metadata serialisation
 
 use super::traits::{
-    ConditionalWriteSupport, DelegatedListResult, LiteScanResult, MultipartUpload, StorageBackend,
-    StorageError, UploadedPart,
+    DelegatedListResult, LiteScanResult, MultipartUpload, StorageBackend, StorageError,
+    UploadedPart,
 };
 use crate::config::BackendConfig;
 use crate::types::{FileMetadata, StorageInfo};
@@ -205,12 +205,6 @@ pub struct S3Backend {
     /// Per-backend native S3 server-side encryption mode. Applied to
     /// every `put_object`/`put_directory_marker` call.
     native_encryption: NativeEncryptionConfig,
-    /// Cached conditional-write capability, set by `conditional_write_probe` and
-    /// read by `supports_conditional_writes`. 0=unknown, 1=supported, 2=absent.
-    /// Backend-wide (not per-bucket) — a backend's S3 server either implements
-    /// conditional PUT or it doesn't; bucket-versioning nuances are handled by
-    /// probing a representative bucket. `AtomicU8` so the gate is lock-free.
-    conditional_writes: std::sync::Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl S3Backend {
@@ -351,7 +345,6 @@ impl S3Backend {
         Ok(Self {
             client,
             native_encryption,
-            conditional_writes: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         })
     }
 
@@ -1631,70 +1624,6 @@ impl StorageBackend for S3Backend {
         false
     }
 
-    fn supports_conditional_writes(&self, _bucket: &str) -> bool {
-        // Reads the cached probe verdict; `false` until proven (0=unknown → false).
-        self.conditional_writes
-            .load(std::sync::atomic::Ordering::Relaxed)
-            == 1
-    }
-
-    async fn conditional_write_probe(
-        &self,
-        bucket: &str,
-    ) -> Result<ConditionalWriteSupport, StorageError> {
-        // TWO-STEP probe (fail-closed): the ONLY trustworthy signal is a 412 on a
-        // re-PUT with `If-None-Match:*` against an EXISTING key. A one-shot
-        // "sent conditional PUT, got 200 → supported" is WRONG on the dangerous
-        // backends (old MinIO <2024-09-13, SeaweedFS on versioned buckets) that
-        // silently IGNORE the precondition and overwrite. Requiring the 412 is the
-        // one outcome a silent-ignore server cannot fake. Backblaze B2 → 501.
-        let key = format!(".deltaglider/_cwprobe/{}", uuid::Uuid::new_v4());
-        // Step 1: establish the key exists (unconditional PUT).
-        let put1 = self
-            .client
-            .put_object()
-            .bucket(bucket)
-            .key(&key)
-            .body(ByteStream::from_static(b"1"))
-            .send()
-            .await;
-        if let Err(e) = put1 {
-            // Can't even write — don't claim a verdict; surface the error.
-            return Err(StorageError::Other(format!(
-                "conditional-write probe could not write to {bucket}: {e}"
-            )));
-        }
-        // Step 2: re-PUT the SAME key with If-None-Match:* — MUST fail with 412.
-        let put2 = self
-            .client
-            .put_object()
-            .bucket(bucket)
-            .key(&key)
-            .body(ByteStream::from_static(b"2"))
-            .if_none_match("*")
-            .send()
-            .await;
-        let supported = match put2 {
-            // Success = precondition IGNORED (silent overwrite) → NOT supported.
-            Ok(_) => false,
-            // The one trustworthy positive: 412 Precondition Failed.
-            Err(e) => is_precondition_failed(&format!("{e:?}")),
-        };
-        // Best-effort cleanup of the throwaway probe key.
-        let _ = self
-            .client
-            .delete_object()
-            .bucket(bucket)
-            .key(&key)
-            .send()
-            .await;
-        self.conditional_writes.store(
-            if supported { 1 } else { 2 },
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        Ok(ConditionalWriteSupport::Probed(supported))
-    }
-
     #[instrument(skip(self, metadata))]
     async fn create_multipart_upload(
         &self,
@@ -2274,16 +2203,6 @@ fn apply_native_encryption_mpu(
 // reproduce the Hetzner/Ceph 403-for-missing-bucket quirk that the
 // code explicitly handles.
 //
-/// Does an S3 error's display string carry an HTTP 412 / precondition-failed
-/// signal? Pure so the conditional-write probe's positive verdict is testable
-/// without a live backend. Mirrors `config_db_sync::is_precondition_failed`
-/// (kept local — the two probe paths are independent and each cheap).
-fn is_precondition_failed(err_str: &str) -> bool {
-    err_str.contains("PreconditionFailed")
-        || err_str.contains("Precondition Failed")
-        || err_str.contains("412")
-}
-
 // We construct `SdkError` values directly instead of pulling in
 // `aws-smithy-mocks` — the dep isn't in the tree, the helpers we
 // need (`SdkError::service_error`, `Response::new`) are already
@@ -2294,15 +2213,6 @@ fn is_precondition_failed(err_str: &str) -> bool {
 mod tests {
     use super::*;
     use aws_sdk_s3::operation::get_object::GetObjectError;
-
-    #[test]
-    fn precondition_failed_detected_from_common_shapes() {
-        assert!(is_precondition_failed("service error: PreconditionFailed"));
-        assert!(is_precondition_failed("HTTP 412 Precondition Failed"));
-        assert!(is_precondition_failed("status=412"));
-        assert!(!is_precondition_failed("NotImplemented (501)"));
-        assert!(!is_precondition_failed("AccessDenied"));
-    }
     use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
     use aws_smithy_runtime_api::http::StatusCode;
     use aws_smithy_types::body::SdkBody;
