@@ -1682,12 +1682,16 @@ mod tests {
     fn parity_reap_if_dead_settles_expired_lease_but_spares_live() {
         let db = db();
         // Live lease (expires at 100+60=160), running row.
-        db.parity_try_acquire_lease("r", "owner-a", 100, 60).unwrap();
+        db.parity_try_acquire_lease("r", "owner-a", 100, 60)
+            .unwrap();
         db.parity_result_set_running("r", 100).unwrap();
 
         // Before expiry: NOT reaped, still running.
         assert!(!db.parity_reap_if_dead("r", 150).unwrap());
-        assert_eq!(db.parity_result_load("r").unwrap().unwrap().status, "running");
+        assert_eq!(
+            db.parity_result_load("r").unwrap().unwrap().status,
+            "running"
+        );
 
         // After expiry (now > 160): reaped to failed.
         assert!(db.parity_reap_if_dead("r", 200).unwrap());
