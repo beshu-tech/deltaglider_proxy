@@ -189,12 +189,23 @@ fn reject_if_under_maintenance(
     Ok(())
 }
 
+/// 403 when the bucket is `replication_target_only` — admin bulk ops are
+/// client writes too (same seam as the S3 gate, adapted to admin errors).
+fn reject_if_replication_target_only(
+    state: &std::sync::Arc<crate::api::admin::AdminState>,
+    bucket: &str,
+) -> Result<(), (StatusCode, String)> {
+    crate::api::handlers::object_helpers::check_client_write_allowed(&state.s3_state, bucket)
+        .map_err(|e| (StatusCode::FORBIDDEN, e.to_string()))
+}
+
 pub async fn copy_objects(
     Extension(_gate): Extension<AdminGuiGate>,
     State(state): State<Arc<crate::api::admin::AdminState>>,
     Json(req): Json<CopyRequest>,
 ) -> Result<Json<CopyResponse>, (StatusCode, String)> {
     reject_if_under_maintenance(&state, &req.dest_bucket)?;
+    reject_if_replication_target_only(&state, &req.dest_bucket)?;
     if req.items.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "no items to copy".into()));
     }
@@ -342,6 +353,9 @@ pub async fn move_objects(
 ) -> Result<Json<MoveResponse>, (StatusCode, String)> {
     reject_if_under_maintenance(&state, &req.dest_bucket)?;
     reject_if_under_maintenance(&state, &req.source_bucket)?;
+    // Move = store into dest + delete from source: both are client writes.
+    reject_if_replication_target_only(&state, &req.dest_bucket)?;
+    reject_if_replication_target_only(&state, &req.source_bucket)?;
     if req.items.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "no items to move".into()));
     }
@@ -471,6 +485,7 @@ pub async fn bulk_delete(
     Json(req): Json<DeleteRequest>,
 ) -> Result<Json<DeleteResponse>, (StatusCode, String)> {
     reject_if_under_maintenance(&state, &req.bucket)?;
+    reject_if_replication_target_only(&state, &req.bucket)?;
     if req.keys.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "no keys to delete".into()));
     }

@@ -63,6 +63,15 @@ pub struct BucketPolicyConfig {
     /// Example: `10737418240` = 10 GB. `0` = freeze bucket (block all writes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_bytes: Option<u64>,
+
+    /// Declare this bucket a replication destination only: all CLIENT writes
+    /// (PUT, DELETE, multipart, copy-into, admin bulk ops) are refused with
+    /// 403 so replication remains the single writer. This makes a non-CAS
+    /// backend (e.g. Backblaze B2) safe to use as a mirror under
+    /// multi-instance — see docs/product/how-to/backend-capability-validation.md.
+    /// Reads are unaffected.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replication_target_only: bool,
 }
 
 /// Why a `public_prefix` was rejected during validation. Carries enough
@@ -344,6 +353,14 @@ impl BucketPolicyRegistry {
     /// Get the quota for a bucket (None = unlimited).
     pub fn quota_bytes(&self, bucket: &str) -> Option<u64> {
         self.policies.get(bucket).and_then(|p| p.quota_bytes)
+    }
+
+    /// Whether client writes to this bucket are disabled because it is a
+    /// declared replication destination (single-writer guarantee).
+    pub fn replication_target_only(&self, bucket: &str) -> bool {
+        self.policies
+            .get(bucket)
+            .is_some_and(|p| p.replication_target_only)
     }
 
     /// Resolve routing for a bucket: returns (backend_name, real_bucket_name).

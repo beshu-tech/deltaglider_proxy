@@ -1693,6 +1693,63 @@ impl Config {
             }
         }
 
+        // replication_target_only coherence. The marker's safety argument is
+        // "replication is the SINGLE writer"; warn on configs that weaken it.
+        // See docs/product/how-to/backend-capability-validation.md.
+        let eq_bucket = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+        for (bucket, policy) in &self.buckets {
+            if !policy.replication_target_only {
+                continue;
+            }
+            if !self
+                .replication
+                .rules
+                .iter()
+                .any(|r| eq_bucket(&r.destination.bucket, bucket))
+            {
+                warnings.push(format!(
+                    "bucket '{bucket}' is replication_target_only but no replication rule \
+                     targets it — writes are blocked and nothing replicates in. Add a rule \
+                     or remove the marker."
+                ));
+            }
+            for rule in &self.lifecycle.rules {
+                let writes_into_marked = eq_bucket(&rule.bucket, bucket)
+                    || matches!(
+                        &rule.action,
+                        crate::config_sections::LifecycleAction::Transition(t)
+                            if eq_bucket(&t.destination.bucket, bucket)
+                    );
+                if writes_into_marked {
+                    warnings.push(format!(
+                        "lifecycle rule '{}' writes into replication_target_only bucket \
+                         '{bucket}' — a second internal writer weakens the single-writer \
+                         guarantee on non-CAS backends.",
+                        rule.name
+                    ));
+                }
+            }
+        }
+        // Two replication rules writing overlapping prefixes of one destination
+        // bucket = two writers into the same deltaspace. Warn regardless of the
+        // marker — the safety argument is per destination prefix.
+        let rules = &self.replication.rules;
+        for i in 0..rules.len() {
+            for j in (i + 1)..rules.len() {
+                let (a, b) = (&rules[i], &rules[j]);
+                if eq_bucket(&a.destination.bucket, &b.destination.bucket)
+                    && (a.destination.prefix.starts_with(&b.destination.prefix)
+                        || b.destination.prefix.starts_with(&a.destination.prefix))
+                {
+                    warnings.push(format!(
+                        "replication rules '{}' and '{}' both write into bucket '{}' with \
+                         overlapping prefixes — give each rule a distinct destination prefix.",
+                        a.name, b.name, a.destination.bucket
+                    ));
+                }
+            }
+        }
+
         // Per-backend encryption validation. Each named backend + the
         // legacy singleton gets checked against:
         //   * native modes (SseKms / SseS3) on filesystem backends → error.
@@ -3302,6 +3359,125 @@ encryption_key: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
                 .any(|w| w.contains("xperi") && w.contains("${iam:username}")),
             "stale ${{username}} template must surface as a check() advisory, got {:?}",
             warnings
+        );
+    }
+
+    /// Parse a sectioned YAML doc and run check(), returning the warnings.
+    fn check_yaml(yaml: &str) -> Vec<String> {
+        let mut cfg = Config::from_yaml_str(yaml).expect("fixture must parse");
+        cfg.check()
+    }
+
+    #[test]
+    fn test_check_warns_orphaned_replication_target_only_marker() {
+        let warnings = check_yaml(
+            r#"
+storage:
+  buckets:
+    mirror:
+      replication_target_only: true
+"#,
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("mirror") && w.contains("no replication rule")),
+            "orphaned marker must warn, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_check_accepts_marker_with_rule_and_public_prefixes() {
+        // marker + public_prefixes is COHERENT (read-only published mirror);
+        // a targeting rule silences the orphan warning. Regression-pin both.
+        let warnings = check_yaml(
+            r#"
+storage:
+  buckets:
+    mirror:
+      replication_target_only: true
+      public_prefixes: ["releases/"]
+  replication:
+    rules:
+      - name: seed-mirror
+        source: { bucket: releases }
+        destination: { bucket: mirror }
+"#,
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.contains("replication_target_only")),
+            "marked+targeted+public bucket must not warn, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_check_warns_lifecycle_writing_into_marked_bucket() {
+        let warnings = check_yaml(
+            r#"
+storage:
+  buckets:
+    mirror:
+      replication_target_only: true
+  replication:
+    rules:
+      - name: seed-mirror
+        source: { bucket: releases }
+        destination: { bucket: mirror }
+  lifecycle:
+    rules:
+      - name: prune-mirror
+        bucket: mirror
+        expire_after: 30d
+"#,
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("prune-mirror") && w.contains("second internal writer")),
+            "lifecycle-into-marked must warn, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_check_warns_overlapping_replication_destinations() {
+        let warnings = check_yaml(
+            r#"
+storage:
+  replication:
+    rules:
+      - name: rule-a
+        source: { bucket: src-a }
+        destination: { bucket: mirror, prefix: "builds/" }
+      - name: rule-b
+        source: { bucket: src-b }
+        destination: { bucket: mirror, prefix: "builds/v2/" }
+"#,
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("rule-a") && w.contains("rule-b") && w.contains("overlapping")),
+            "overlapping dest prefixes must warn, got {warnings:?}"
+        );
+        // Distinct prefixes on the same bucket are fine.
+        let ok = check_yaml(
+            r#"
+storage:
+  replication:
+    rules:
+      - name: rule-a
+        source: { bucket: src-a }
+        destination: { bucket: mirror, prefix: "builds/" }
+      - name: rule-b
+        source: { bucket: src-b }
+        destination: { bucket: mirror, prefix: "docs/" }
+"#,
+        );
+        assert!(
+            !ok.iter().any(|w| w.contains("overlapping")),
+            "distinct prefixes must not warn, got {ok:?}"
         );
     }
 

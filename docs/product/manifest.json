@@ -92,6 +92,11 @@
       "order": 60
     },
     {
+      "path": "how-to/backend-capability-validation",
+      "group": "Guides: deploy & operate",
+      "order": 65
+    },
+    {
       "path": "how-to/monitor-with-prometheus",
       "group": "Guides: deploy & operate",
       "order": 70

@@ -640,6 +640,11 @@ impl s3s::S3 for DeltaGliderS3Service {
     ) -> s3s::S3Result<s3s::S3Response<s3s::dto::DeleteObjectOutput>> {
         let auth_user = req.extensions.get::<AuthenticatedUser>().cloned();
         let input = req.input;
+        crate::api::handlers::object_helpers::check_client_write_allowed(
+            &self.state,
+            &input.bucket,
+        )
+        .map_err(engine_error_to_s3s)?;
         if input.key.ends_with('/') {
             let (deleted, denied) = recursive_delete_prefix_s3s(
                 &self.state,
@@ -687,6 +692,11 @@ impl s3s::S3 for DeltaGliderS3Service {
         req: s3s::S3Request<s3s::dto::DeleteObjectsInput>,
     ) -> s3s::S3Result<s3s::S3Response<s3s::dto::DeleteObjectsOutput>> {
         let input = req.input;
+        crate::api::handlers::object_helpers::check_client_write_allowed(
+            &self.state,
+            &input.bucket,
+        )
+        .map_err(engine_error_to_s3s)?;
         validate_delete_objects_count(input.delete.objects.len())?;
         let quiet = input.delete.quiet.unwrap_or(false);
         let mut deleted = Vec::new();
@@ -764,6 +774,13 @@ impl s3s::S3 for DeltaGliderS3Service {
         {
             return Err(s3s::s3_error!(NoSuchBucket));
         }
+        // Reject before buffering the body: a replication_target_only
+        // bucket never accepts client bytes.
+        crate::api::handlers::object_helpers::check_client_write_allowed(
+            &self.state,
+            &input.bucket,
+        )
+        .map_err(engine_error_to_s3s)?;
 
         let data =
             collect_blob_limited(input.body, engine.max_object_size(), Some(&headers)).await?;
@@ -875,6 +892,12 @@ impl s3s::S3 for DeltaGliderS3Service {
             input.copy_source_if_modified_since.as_ref(),
             input.copy_source_if_unmodified_since.as_ref(),
         )?;
+        // Gate on the DESTINATION bucket — copy-into is a client write.
+        crate::api::handlers::object_helpers::check_client_write_allowed(
+            &self.state,
+            &input.bucket,
+        )
+        .map_err(engine_error_to_s3s)?;
         if source_meta.file_size > engine.max_object_size() {
             return Err(s3s::s3_error!(EntityTooLarge));
         }
@@ -950,6 +973,13 @@ impl s3s::S3 for DeltaGliderS3Service {
     ) -> s3s::S3Result<s3s::S3Response<s3s::dto::CreateMultipartUploadOutput>> {
         let input = req.input;
         ensure_bucket_exists_s3s(&self.state, &input.bucket).await?;
+        // Earliest reject: parts are staged in-memory, but refusing at
+        // create saves the client uploading them at all.
+        crate::api::handlers::object_helpers::check_client_write_allowed(
+            &self.state,
+            &input.bucket,
+        )
+        .map_err(engine_error_to_s3s)?;
         let delta_limit = crate::config::env_parse_with_default(
             "DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES",
             64 * 1024 * 1024,
@@ -1068,6 +1098,13 @@ impl s3s::S3 for DeltaGliderS3Service {
     ) -> s3s::S3Result<s3s::S3Response<s3s::dto::CompleteMultipartUploadOutput>> {
         let input = req.input;
         ensure_bucket_exists_s3s(&self.state, &input.bucket).await?;
+        // Defense-in-depth: the marker can be hot-applied mid-upload, so
+        // Complete (the moment bytes reach the backend) re-checks.
+        crate::api::handlers::object_helpers::check_client_write_allowed(
+            &self.state,
+            &input.bucket,
+        )
+        .map_err(engine_error_to_s3s)?;
         let requested_parts = completed_parts_to_request(input.multipart_upload.as_ref())?;
         let engine = self.state.engine.load();
         let delta_limit = crate::config::env_parse_with_default(
@@ -1251,6 +1288,12 @@ impl s3s::S3 for DeltaGliderS3Service {
         check_copy_source_access_s3s(auth_user.as_ref(), &source_bucket, &source_key)?;
         ensure_bucket_exists_s3s(&self.state, &source_bucket).await?;
         ensure_bucket_exists_s3s(&self.state, &input.bucket).await?;
+        // Gate on the DESTINATION bucket — part-copy feeds a client write.
+        crate::api::handlers::object_helpers::check_client_write_allowed(
+            &self.state,
+            &input.bucket,
+        )
+        .map_err(engine_error_to_s3s)?;
         let engine = self.state.engine.load();
         let source_meta = engine
             .head(&source_bucket, &source_key)

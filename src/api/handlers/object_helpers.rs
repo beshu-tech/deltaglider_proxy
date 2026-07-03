@@ -51,6 +51,34 @@ pub(crate) async fn enqueue_object_events(state: &Arc<AppState>, events: &[NewEv
     }
 }
 
+/// Doc anchor for backend-capability / write-boundary enforcement messages.
+/// The GUI linkifies this and rewrites it to the in-app docs viewer.
+pub(crate) const CAPABILITY_DOC_URL: &str =
+    "https://deltaglider.com/docs/how-to/backend-capability-validation";
+
+/// Client-write boundary gate. A bucket marked `replication_target_only`
+/// refuses ALL client writes (PUT/DELETE/multipart/copy-into/admin bulk)
+/// with 403 so replication remains the single writer — the property that
+/// makes a non-CAS backend (e.g. B2) safe as a mirror. Replication,
+/// lifecycle, and maintenance call the engine directly and never pass
+/// through this gate.
+pub(crate) fn check_client_write_allowed(
+    state: &Arc<AppState>,
+    bucket: &str,
+) -> Result<(), S3Error> {
+    let engine = state.engine.load();
+    if engine
+        .bucket_policy_registry()
+        .replication_target_only(bucket)
+    {
+        return Err(S3Error::AccessDeniedReason(format!(
+            "Bucket '{bucket}' is replication_target_only: client writes are disabled so \
+             replication remains the single writer — see {CAPABILITY_DOC_URL}"
+        )));
+    }
+    Ok(())
+}
+
 /// Pre-write quota gate. Returns `Err` when the write would push the
 /// bucket past its `quota_bytes` policy, or when quota is set to 0
 /// (the "freeze the bucket" override).

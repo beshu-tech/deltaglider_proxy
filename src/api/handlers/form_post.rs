@@ -41,7 +41,7 @@
 //! `{"key": "..."}` condition (where reuse genuinely is an attack) while leaving
 //! `starts-with` policies permissive; not done here.
 
-use super::object_helpers::{check_quota, enqueue_object_event};
+use super::object_helpers::{check_client_write_allowed, check_quota, enqueue_object_event};
 use super::{audit_log_s3, ensure_bucket_exists, AppState};
 use crate::api::errors::S3Error;
 use crate::event_outbox::{current_unix_seconds, EventKind, EventSource, NewEvent};
@@ -888,6 +888,7 @@ pub async fn handle_form_post_upload(
     // captured form-POST is replayable for the entire policy
     // expiration window (hours to days).
     enforce_form_post_replay(state, &parsed)?;
+    check_client_write_allowed(state, bucket)?;
     check_quota(state, bucket, parsed.file_data.len() as u64)?;
     let engine = state.engine.load();
     let size = parsed.file_data.len() as u64;
