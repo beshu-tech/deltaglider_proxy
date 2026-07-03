@@ -8,7 +8,25 @@ Every released version of DeltaGlider Proxy, newest first. Versions
 follow [semantic versioning](https://semver.org/); the Docker image
 `beshultd/deltaglider_proxy:<version>` is published for each tag.
 
-_Last updated: 2026-07-02_
+_Last updated: 2026-07-03_
+
+## v1.9.6 — 2026-07-03
+
+Verify reliability + a Jobs-table icon fix.
+
+### Fixed
+
+- **A crashed Verify audit no longer shows "running" forever.** A verify
+  (parity) audit runs as a background task that settles its own status when it
+  finishes. If the proxy was killed mid-audit (or a re-launched audit crashed
+  again) with no restart afterward, the row stayed stuck on `running` — the
+  Jobs → Verify tab polled a spinner indefinitely, which looked like an
+  extremely slow scan. The status read now self-heals: a `running` row whose
+  background lease has expired (a live audit renews it continuously) is
+  recognised as dead and settled to `failed`, without needing a restart.
+- **Distinct icon for "Run now" vs "Resume".** After the Jobs actions went
+  icon-only, a paused rule showed two identical play carets (Resume and Run
+  now). Run now now uses a circled-play icon.
 
 ## v1.9.5 — 2026-07-02
 
