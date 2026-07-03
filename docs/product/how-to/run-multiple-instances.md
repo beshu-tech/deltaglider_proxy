@@ -62,6 +62,7 @@ Watch the reader's logs for `[config-sync]` lines — a download on ETag change 
 
 ## Related
 
+- [How to use non-CAS backends safely](backend-capability-validation.md) — the conditional-write validation that runs at startup when the sync bucket is set, and what it refuses
 - [How to back up and restore](back-up-and-restore.md) — sync replicates state; it does not protect it
 - [How to manage IAM as code](manage-iam-as-code.md) — the GitOps alternative to a designated writer
 - [How to monitor with Prometheus and Grafana](monitor-with-prometheus.md) — scraping multiple targets

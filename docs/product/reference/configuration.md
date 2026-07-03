@@ -690,6 +690,9 @@ storage:
       public_prefixes: ["public/"]
     docs-site:
       public: true                # shorthand for public_prefixes: [""]
+    releases-mirror:
+      backend: b2-archive
+      replication_target_only: true
 ```
 
 | Field | Type | Default | Description |
@@ -701,6 +704,7 @@ storage:
 | `public_prefixes` | `[string]` | `[]` | Anonymous read (GET/HEAD/LIST) scoped to these key prefixes |
 | `public` | bool | — | Shorthand for `public_prefixes: [""]` (entire bucket public) |
 | `quota_bytes` | u64 | — | Soft storage quota (may overshoot by up to 5 minutes of writes); `0` = freeze bucket |
+| `replication_target_only` | bool | `false` | Client writes return 403; replication is the only writer. Makes a non-CAS backend (e.g. Backblaze B2) a safe mirror — see [backend capability validation](../how-to/backend-capability-validation.md) |
 
 ### Public prefixes
 

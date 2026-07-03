@@ -126,6 +126,7 @@ Pause and resume from the job row (or `POST …/pause` / `…/resume`); paused r
 
 ## Related
 
+- [How to use non-CAS backends safely](backend-capability-validation.md) — mark the destination `replication_target_only` to host a mirror on a cheap backend like Backblaze B2.
 - [Replication reference](../reference/replication.md) — rule grammar, conflict policies, failure modes, what doesn't replicate.
 - [Jobs reference](../reference/jobs.md) — the unified jobs API the rule appears on.
 - [Event outbox reference](../reference/event-outbox.md) — the event stream that drives near-real-time copies.

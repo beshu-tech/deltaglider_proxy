@@ -248,6 +248,26 @@ single-instance planes below are addressed.
 - Config-apply on one instance does NOT propagate to others except via the IAM/DB
   sync; YAML config itself is per-instance.
 
+**Backend-role CAS boundaries (enforced, guard A+B):**
+
+| Role | CAS needed | Enforcement |
+|---|---|---|
+| Coordination bucket (`config_sync_bucket`) | always | boot probe → exit(1) |
+| Client-writable delta storage, multi-instance | yes | startup probe of every named S3 backend hosting such buckets + hot-apply pre-commit gate (`apply_config_transition` step 0) → exit(1)/reject |
+| Client-writable delta storage, single-instance | no | in-process prefix lock (no probes, zero cost) |
+| `replication_target_only` bucket (any backend incl. B2) | no | client writes → 403 (`check_client_write_allowed`, ten s3s/form-POST/admin-bulk call sites) → replication is the single writer |
+
+The `replication_target_only` bucket marker (`bucket_policy.rs`) is what makes a
+non-CAS backend (Backblaze B2 answers conditional writes with 501) safe as a cheap
+replication destination. Verdicts live in `BackendCapabilityCache`
+(`src/coordination/capability.rs`, stamped on `GET /backends` → BackendsPanel
+banner); probes are witness-cached per backend
+(`.deltaglider/backend-capability-witness.json`, 30d). Every enforcement message
+ends with the doc URL (`CAPABILITY_DOC_URL` → `docs/product/how-to/backend-capability-validation.md`);
+the GUI linkifies it (`LinkifiedText`). Test seam: `DGP_TEST_FORCE_NONCAS_BACKEND`.
+`Config::check()` warns on orphaned markers, lifecycle rules writing into marked
+buckets, and overlapping replication destination prefixes.
+
 See `docs/plan/architecture-ha-audit-2026-06-28.md` for the full analysis and the
 roadmap (audit Tiers A→C) toward true round-robin HA. `/_/health` is liveness-only
 (fast, no I/O); `/_/ready` does a real backend + config-DB probe (503 when not

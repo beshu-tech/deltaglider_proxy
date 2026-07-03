@@ -43,6 +43,15 @@ storage:
   #     compression: true
   #     max_delta_ratio: 0.5
   #
+  #   # A cheap mirror on a backend WITHOUT conditional-write support
+  #   # (e.g. Backblaze B2): mark it replication_target_only so client
+  #   # writes 403 and replication stays the single writer — the property
+  #   # that makes a non-CAS backend safe under multi-instance. See
+  #   # https://deltaglider.com/docs/how-to/backend-capability-validation
+  #   releases-mirror:
+  #     backend: b2-archive
+  #     replication_target_only: true
+  #
   # Lifecycle expiration. Disabled by default; preview first via
   # POST /_/api/admin/jobs/lifecycle:<name>/preview (or the Jobs screen).
   # lifecycle:
