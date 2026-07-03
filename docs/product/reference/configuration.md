@@ -623,7 +623,7 @@ When `cert_path` and `key_path` are both absent, a self-signed certificate is ge
 
 ## Config sync
 
-Multi-instance IAM sync via S3. When enabled, the encrypted config DB file is replicated to a shared S3 bucket.
+Multi-instance coordination via S3. When enabled, the shared bucket does three things: the encrypted config DB file is replicated to it (IAM sync); it hosts the per-rule replication leader leases (`_dgp/leases/replication/…`, automatic failover); and setting it activates the boot-time conditional-write validation — of this bucket AND of every named S3 backend hosting client-writable buckets (non-CAS → the proxy refuses to start; see [backend capability validation](../how-to/backend-capability-validation.md)).
 
 | | |
 |---|---|

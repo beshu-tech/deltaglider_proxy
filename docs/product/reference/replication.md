@@ -13,7 +13,7 @@ Replication has two paths, primary and backstop:
 
 - One-way, bucket/prefix-level replication through the DeltaGlider engine. The event consumer replicates mutations automatically; the reconcile scheduler runs due rules on their `interval`; a rule can also be triggered through the admin API (`POST /_/api/admin/jobs/replication:<name>/run-now`) or the Jobs screen.
 - Disabled rules and paused rules are skipped by the event consumer, the reconcile scheduler, and run-now alike.
-- A per-rule DB lease prevents the scheduler and run-now from executing the same rule at the same time. If a rule is already leased, run-now returns `409 Conflict` and the scheduler skips that tick. Long runs heartbeat the lease before starting new pages/objects; if the lease is lost, the worker stops before doing more work and records a failure.
+- A per-rule leader lease prevents two executions of the same rule at the same time. Single-instance (no `config_sync_bucket`) it is a node-local DB lease; with a coordination bucket configured it is an S3 conditional-write lease object (`_dgp/leases/replication/<rule>.json`) visible to every instance — a dead leader's lease lapses and a peer takes over automatically. If a rule is already leased, run-now returns `409 Conflict` and the scheduler skips that tick. Long runs heartbeat the lease before starting new pages/objects; if the lease is lost, the worker stops before doing more work and records a failure.
 - At-least-once semantics. Conflict policies: `newer-wins` (default), `content-diff`, `skip-if-dest-exists`.
 - Optional delete replication for destination objects previously written by the same rule.
 - Optional include / exclude glob filters per rule.
@@ -26,8 +26,8 @@ storage:
   replication:
     enabled: true                    # master kill-switch
     tick_interval: "30s"             # scheduler poll rate (min 5s)
-    lease_ttl: "60s"                 # failover window for a dead runner (min 15s)
-    heartbeat_interval: "20s"        # lease renewal cadence (min 5s; must be < lease_ttl)
+    lease_ttl: "300s"                # failover window for a dead runner (min 15s; default 5m)
+    heartbeat_interval: "60s"        # lease renewal cadence (min 5s; must be < lease_ttl)
     max_failures_retained: 100       # per-rule failure ring size
 
     rules:
@@ -75,7 +75,7 @@ The guardrail is provenance: delete replication only targets objects that carry 
 
 - **Rules** are YAML-authored. Changes apply through the section PUT pipeline; cycle detection runs on every load.
 - **Runtime state** lives in the encrypted config DB (`ConfigDb` v6):
-    - `replication_state`: one row per rule. Scheduling state + pause flag + lifetime counters + continuation token + leader lease columns. `INSERT OR IGNORE` on config load preserves operator-set pause + lifetime counters across reloads.
+    - `replication_state`: one row per rule. Scheduling state + pause flag + lifetime counters + continuation token + leader lease columns (the node-local lease; with a coordination bucket the authoritative lease is the S3 lease object, and these columns back the run-now/worker bookkeeping on the leader). `INSERT OR IGNORE` on config load preserves operator-set pause + lifetime counters across reloads.
     - `replication_run_history`: append-only per-run records. CASCADE DELETE on rule removal.
     - `replication_failures`: per-object error ring, bounded by `max_failures_retained`.
 - **Boot reconciliation**: any `status='running'` rows left from a previous process are flipped to `failed` on startup with a diagnostic failure entry. Prevents zombie run rows.

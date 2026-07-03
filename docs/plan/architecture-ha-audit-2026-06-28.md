@@ -1,5 +1,21 @@
 # DGP Architecture & HA Audit — 2026-06-28
 
+> **STATUS (2026-07-03 — partially superseded by shipped work).** Since this
+> audit: (a) the **S3-CAS coordination lease shipped** (`src/coordination/` —
+> `CoordinationLease` trait, `LocalLease` SQLite default, `S3Lease` on the
+> boot-validated coordination bucket): REPLICATION leader election now has
+> automatic cross-instance failover, superseding the "job leases are node-local
+> SQLite → zero cross-instance exclusion" premise *for the replication path*
+> (lifecycle/maintenance/parity/run-now remain node-local, as documented in the
+> CLAUDE.md HA contract). (b) The coordination bucket AND named S3 backends
+> hosting client-writable buckets are **CAS-validated at boot** (witness-cached
+> probe; non-CAS → exit 1; hot-apply gate at runtime), and the
+> **`replication_target_only`** bucket marker makes non-CAS backends (B2) safe
+> replication destinations. (c) The reference-RMW finding (#3) is **still
+> open** — `prefix_locks` remains an in-process DashMap; the new gates BOUND who
+> may write, they do not fix the RMW itself. The headline "true round-robin HA
+> today? NO" still stands overall, but for narrower reasons than written below.
+
 Expert-swarm audit (1 survey + 7 parallel expert lenses + synthesis, 9 agents,
 44 findings). Read-only; every quantitative claim traced to source. Lenses:
 architecture, security, correctness, statelessness, HA/load-balancing, debt/perf,

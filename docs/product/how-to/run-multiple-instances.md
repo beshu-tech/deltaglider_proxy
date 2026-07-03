@@ -1,8 +1,8 @@
 # How to run multiple instances (HA)
 
-This guide shows you how to run more than one DeltaGlider Proxy instance against the same storage, with IAM state kept in sync via a shared S3 bucket.
+This guide shows you how to run more than one DeltaGlider Proxy instance against the same storage, coordinated through a shared S3 bucket.
 
-The thing that needs coordinating is the encrypted config DB (`deltaglider_config.db`) — IAM users, groups, OAuth providers. Object data needs nothing: all instances route to the same backends. Why it's built this way: [Multi-backend architecture](../explanation/multi-backend-architecture.md).
+The shared bucket does two jobs: it syncs the encrypted config DB (`deltaglider_config.db` — IAM users, groups, OAuth providers) between instances, and it hosts the replication leader leases that stop two instances from running the same rule (with automatic failover when a leader dies). Because leases depend on atomic conditional writes, the proxy validates the bucket's backend at boot and refuses to start on one that can't enforce them — see [How to use non-CAS backends safely](backend-capability-validation.md). Object data itself needs nothing: all instances route to the same backends. Why it's built this way: [Multi-backend architecture](../explanation/multi-backend-architecture.md).
 
 ## 1. Point every instance at a sync bucket
 
@@ -37,7 +37,7 @@ Use this during rollouts and incident response — e.g. you just disabled a leak
 
 ## 4. If you scale with Helm
 
-`replicaCount` defaults to `1` — do not raise it until the sync bucket is configured. Each pod with its own independent `/data/deltaglider_config.db` is an independent control plane: replication and lifecycle runs are guarded by per-rule database leases (`lease_ttl: "60s"`, `heartbeat_interval: "20s"`), and the lease guard only coordinates when every replica sees the same durable DB state. With sync configured, a dead runner's lease becomes stealable after roughly a minute.
+`replicaCount` defaults to `1` — do not raise it until the sync bucket is configured. With the sync bucket set, **replication** rules elect a single leader per rule through an S3 lease object in that bucket (conditional-write CAS): if the leader dies, its lease lapses (default `lease_ttl: "300s"`) and a peer takes over automatically — no double-run, no shared DB required. **Lifecycle and maintenance** jobs still use node-local database leases (`heartbeat_interval: "60s"` renewals), so under multiple replicas those can run on more than one pod; their operations are idempotent, so this wastes work rather than corrupting data. The sync bucket must pass the boot-time conditional-write validation — see [How to use non-CAS backends safely](backend-capability-validation.md).
 
 See [How to deploy on Kubernetes with Helm](deploy-on-kubernetes.md) for the chart specifics.
 

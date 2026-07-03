@@ -36,7 +36,7 @@ While a re-encrypt or migrate job is active, S3 **writes** (PUT, DELETE, POST, m
 
 ## Durability
 
-Maintenance jobs live in the encrypted config DB (`maintenance_jobs` + failures tables) and are re-queued on boot: a proxy restart mid-job resumes the job rather than orphaning a half-migrated bucket. A cancel before a migration's routing flip unwinds cleanly; the source is never deleted on a failed or cancelled run. All three subsystems share the same leader-lease, failure-ring, and zombie-run machinery, and all paginated work goes through one cursor state machine with crash-resume and a one-shot poison-token guard.
+Maintenance jobs live in the encrypted config DB (`maintenance_jobs` + failures tables) and are re-queued on boot: a proxy restart mid-job resumes the job rather than orphaning a half-migrated bucket. A cancel before a migration's routing flip unwinds cleanly; the source is never deleted on a failed or cancelled run. All three subsystems share the same leader-lease, failure-ring, and zombie-run machinery (replication's lease upgrades to a cross-instance S3 lease when a coordination bucket is configured; lifecycle and maintenance leases stay node-local), and all paginated work goes through one cursor state machine with crash-resume and a one-shot poison-token guard.
 
 ## Related
 

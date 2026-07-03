@@ -147,7 +147,7 @@ The chart ships the hardening the Dockerfile expects — leave these alone:
 
 `replicaCount` defaults to `1` — keep it there unless the pods share IAM state.
 
-Replication runs are guarded by per-rule database leases (`lease_ttl: "60s"`, `heartbeat_interval: "20s"`), which coordinate correctly only when every replica sees the same durable config DB state. Do not scale above one replica if each pod has its own independent `/data/deltaglider_config.db` — in that shape, each pod is an independent control plane. To run more than one instance, set up config sync first: [How to run multiple instances (HA)](run-multiple-instances.md).
+With config sync set up, replication rules elect one leader per rule through an S3-CAS lease in the sync bucket (default `lease_ttl: "300s"`, `heartbeat_interval: "60s"`); a dead leader's lease lapses and a peer takes over automatically. Lifecycle and maintenance jobs still use node-local database leases, so they may run on more than one pod (idempotent — wasteful, not corrupting). Do not scale above one replica if each pod has its own independent `/data/deltaglider_config.db` — in that shape, each pod is an independent control plane. To run more than one instance, set up config sync first: [How to run multiple instances (HA)](run-multiple-instances.md).
 
 ## Useful values
 
