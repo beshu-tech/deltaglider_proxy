@@ -70,6 +70,7 @@ const defaultFields = {
   publicMode: 'none',
   public_prefixes: [],
   quota_bytes: null,
+  replication_target_only: false,
 };
 
 // (1) Synthetic ids are unique + monotonic, and NEVER appear in the wire.
@@ -110,7 +111,29 @@ const defaultFields = {
     public: null,
     public_prefixes: null,
     quota_bytes: 1073741824,
+    replication_target_only: null,
   });
+}
+
+// (2b) replication_target_only passthrough: a MARKER-ONLY policy must not
+//      round-trip as "all default" (that would serialise as policy DELETION
+//      and silently wipe the marker on any bucket-panel apply).
+{
+  const row = policyToRow('mirror', { replication_target_only: true });
+  assert.equal(row.replication_target_only, true);
+  assert.equal(isAllDefaultRow(row), false, 'marker-only row is NOT all-default');
+  const res = buildBucketPayload([row], ['mirror']);
+  assert.equal(res.ok, true);
+  assert.equal(
+    res.body.buckets.mirror.replication_target_only,
+    true,
+    'marker must survive the round-trip verbatim'
+  );
+  // Unmarked rows emit explicit null so a cleared marker merge-deletes.
+  const un = buildBucketPayload([
+    { _id: 'bkt-u', name: 'u', ...defaultFields, backend: 'b1' },
+  ]);
+  assert.equal(un.body.buckets.u.replication_target_only, null);
 }
 
 // (3) compression:null is preserved as explicit null (merge-clears the key).

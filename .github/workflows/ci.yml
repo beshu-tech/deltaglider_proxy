@@ -588,6 +588,7 @@ jobs:
           npm run test:overlay-styles
           npm run test:admin-nav-tree
           npm run test:yaml-utils
+          npm run test:linkify
           npm run test:utils
           npm run test:request-id-suffix
           npm run test:storage-section-payload

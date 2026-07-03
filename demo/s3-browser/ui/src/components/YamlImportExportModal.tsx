@@ -22,6 +22,7 @@
  */
 
 import { useCallback, useEffect, useState } from 'react';
+import { LinkifiedText } from './LinkifiedText';
 import { Alert, Button, Modal, Space, Typography, Tag, Input } from 'antd';
 import { CopyOutlined, CheckOutlined, UploadOutlined, DownloadOutlined } from '@ant-design/icons';
 import {
@@ -227,7 +228,12 @@ export function YamlImportExportModal({ open, mode, onClose, onApplied }: YamlMo
           />
 
           {error && (
-            <Alert type="error" message="Validation error" description={error} showIcon />
+            <Alert
+              type="error"
+              message="Validation error"
+              description={<LinkifiedText text={error} />}
+              showIcon
+            />
           )}
           {warnings.length > 0 && (
             <Alert
@@ -237,7 +243,7 @@ export function YamlImportExportModal({ open, mode, onClose, onApplied }: YamlMo
                 <ul style={{ margin: '4px 0', paddingLeft: 18 }}>
                   {warnings.map((w, i) => (
                     <li key={i} style={{ fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 12 }}>
-                      {w}
+                      <LinkifiedText text={w} />
                     </li>
                   ))}
                 </ul>

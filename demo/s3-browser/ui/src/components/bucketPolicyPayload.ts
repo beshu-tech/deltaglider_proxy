@@ -57,6 +57,11 @@ export interface BucketPolicyRow {
    *  `string[]` in policyToRow / rowToPolicy. */
   public_prefixes: PrefixEntry[];
   quota_bytes: number | null;
+  /** Read-only passthrough of the server marker (no editor in this panel —
+   *  set it in YAML). Carried through the row model so a bucket whose ONLY
+   *  policy is the marker doesn't round-trip as "all default" and get its
+   *  policy DELETED on apply (the silent-field-loss bug class). */
+  replication_target_only: boolean;
 }
 
 /** One bucket's merge-patch: every clearable field present (value or null). */
@@ -71,6 +76,9 @@ export interface BucketPolicyPatch {
   public: null;
   public_prefixes: string[] | null;
   quota_bytes: number | null;
+  /** `true` preserved verbatim; `null` clears (the field has no editor here,
+   *  so it always mirrors what the server sent at fetch time). */
+  replication_target_only: boolean | null;
 }
 
 /** The storage-section merge body: per-bucket patch, or `null` = delete policy. */
@@ -85,6 +93,7 @@ export const DEFAULT_ROW_FIELDS: Omit<BucketPolicyRow, '_id' | 'name'> = Object.
   publicMode: 'none' as const,
   public_prefixes: [],
   quota_bytes: null,
+  replication_target_only: false,
 });
 
 let rowIdCounter = 0;
@@ -124,6 +133,7 @@ export function policyToRow(
     publicMode,
     public_prefixes: prefixes.map((value) => ({ id: freshId(), value })),
     quota_bytes: p.quota_bytes ?? null,
+    replication_target_only: p.replication_target_only ?? false,
   };
 }
 
@@ -145,6 +155,7 @@ export function isAllDefaultRow(row: BucketPolicyRow): boolean {
     row.backend === '' &&
     row.alias === '' &&
     row.quota_bytes === null &&
+    !row.replication_target_only &&
     (row.publicMode === 'none' ||
       (row.publicMode === 'prefixes' && cleanedPrefixes(row).length === 0))
   );
@@ -175,6 +186,7 @@ function rowToPolicy(row: BucketPolicyRow): BucketPolicyPatch {
     public: null,
     public_prefixes,
     quota_bytes: row.quota_bytes ?? null,
+    replication_target_only: row.replication_target_only ? true : null,
   };
 }
 

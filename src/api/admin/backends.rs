@@ -121,7 +121,7 @@ fn build_backend_config(req: &CreateBackendRequest) -> Result<BackendConfig, Str
 /// `GET /config`'s `backends[]` projection; both endpoints now agree.
 pub async fn list_backends(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
     let cfg = state.config.read().await;
-    let backends: Vec<super::config::BackendInfoResponse> = if cfg.backends.is_empty() {
+    let mut backends: Vec<super::config::BackendInfoResponse> = if cfg.backends.is_empty() {
         vec![super::config::BackendInfoResponse::synthesized_default(
             &cfg,
         )]
@@ -131,6 +131,12 @@ pub async fn list_backends(State(state): State<Arc<AdminState>>) -> impl IntoRes
             .map(super::config::BackendInfoResponse::from)
             .collect()
     };
+    // Stamp the startup capability-gate verdicts (guard B) so the panel can
+    // render a per-backend conditional-write banner. Absent = not assessed.
+    let verdicts = state.s3_state.backend_capabilities.snapshot();
+    for b in &mut backends {
+        b.capability = verdicts.get(&b.name).cloned();
+    }
 
     Json(BackendListResponse {
         backends,

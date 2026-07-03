@@ -17,6 +17,7 @@
  * - Dialog is stateless — reopens with fresh data each time.
  */
 import { Modal, Alert, Typography, Button, Space } from 'antd';
+import { LinkifiedText } from './LinkifiedText';
 import { CheckCircleOutlined, WarningOutlined, SyncOutlined } from '@ant-design/icons';
 import type { SectionApplyResponse, SectionName } from '../adminApi';
 import { useColors } from '../ThemeContext';
@@ -94,7 +95,7 @@ export default function ApplyDialog({
           showIcon
           icon={<WarningOutlined />}
           message="Validation failed"
-          description={error}
+          description={<LinkifiedText text={error} />}
           style={{ marginBottom: 12 }}
         />
       )}
@@ -109,7 +110,9 @@ export default function ApplyDialog({
           description={
             <ul style={{ marginBottom: 0, paddingLeft: 20 }}>
               {warnings.map((w, i) => (
-                <li key={i}>{w}</li>
+                <li key={i}>
+                  <LinkifiedText text={w} />
+                </li>
               ))}
             </ul>
           }

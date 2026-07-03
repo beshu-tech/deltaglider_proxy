@@ -31,6 +31,7 @@
     "test:overlay-styles": "node scripts/overlay-styles-regression-test.mjs",
     "test:admin-nav-tree": "node scripts/admin-nav-tree-regression-test.mjs",
     "test:yaml-utils": "node scripts/yaml-utils-regression-test.mjs",
+    "test:linkify": "node scripts/linkify-regression-test.mjs",
     "test:utils": "node scripts/utils-regression-test.mjs",
     "test:request-id-suffix": "node scripts/request-id-suffix-regression-test.mjs",
     "test:storage-section-payload": "node scripts/storage-section-payload-regression-test.mjs",

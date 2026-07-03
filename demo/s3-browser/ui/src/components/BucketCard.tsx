@@ -233,6 +233,17 @@ export default function BucketCard({
       </Chip>
     );
   }
+  if (eff.replication_target_only) {
+    chips.push(
+      <Chip
+        key="rto"
+        tone={colors.ACCENT_BLUE}
+        title="replication_target_only: client writes are rejected (403); replication is the only writer."
+      >
+        replication target
+      </Chip>
+    );
+  }
   if (eff.compression !== null || eff.max_delta_ratio !== null) {
     chips.push(
       <Chip key="comp" tone={colors.ACCENT_PURPLE} title="Compression override on this bucket">
@@ -375,6 +386,32 @@ export default function BucketCard({
       {/* ── Expanded editor: Public access / Placement / Advanced ── */}
       {expanded && (
         <div style={{ padding: '0 14px 14px', borderTop: `1px solid ${colors.BORDER}` }}>
+          {eff.replication_target_only && (
+            <div
+              style={{
+                marginTop: 12,
+                padding: '8px 12px',
+                borderRadius: 6,
+                border: `1px solid ${colors.ACCENT_BLUE}44`,
+                background: `${colors.ACCENT_BLUE}0a`,
+                fontSize: 12,
+                color: colors.TEXT_MUTED,
+              }}
+            >
+              This bucket is a <Text code>replication_target_only</Text> mirror: client
+              writes (uploads, deletes, copies into it) are rejected with 403 so
+              replication stays the single writer — which is what makes a non-CAS
+              backend (e.g. Backblaze B2) safe to host it. Reads are unaffected. Set
+              or clear the marker in YAML.{' '}
+              <a
+                href="/_/docs/how-to-backend-capability-validation"
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                Learn more
+              </a>
+            </div>
+          )}
           {/* Public access — the consequential group, first and amber. */}
           <div style={{ paddingTop: 12 }}>
             <Text style={{ ...groupLabel, color: isPublic ? colors.ACCENT_AMBER : colors.TEXT_MUTED }}>

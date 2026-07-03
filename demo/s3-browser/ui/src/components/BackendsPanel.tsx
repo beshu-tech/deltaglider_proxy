@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { LinkifiedText } from './LinkifiedText';
 import { useQueryClient } from '@tanstack/react-query';
 import { qk } from '../queries/keys';
 import { Button, Input, Modal, Radio, Switch, Typography, Space, Alert, Spin } from 'antd';
@@ -408,6 +409,48 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
               </div>
               {testResult?.name === b.name && (
                 <Alert type={testResult.ok ? 'success' : 'error'} message={testResult.message} showIcon style={{ marginTop: 8, borderRadius: 6 }} />
+              )}
+              {/* Conditional-write verdict from the startup capability gate
+                 (guard B). Absent = not assessed (single-instance, or no
+                 client-writable buckets routed here). */}
+              {b.capability?.verdict === 'cas-verified' && (
+                <Alert
+                  type="success"
+                  showIcon
+                  message={`Conditional writes: verified (${b.capability.via === 'probe' ? 'live probe' : 'witness cache'}) — safe for multi-instance client writes`}
+                  style={{ marginTop: 8, borderRadius: 6 }}
+                />
+              )}
+              {b.capability?.verdict === 'non-cas' && (
+                <Alert
+                  type="warning"
+                  showIcon
+                  message="Conditional writes NOT supported"
+                  description={
+                    <LinkifiedText
+                      text={
+                        'This backend cannot host the coordination bucket or multi-instance ' +
+                        'client-writable buckets. It remains a safe replication target: mark its ' +
+                        'buckets replication_target_only. — see ' +
+                        'https://deltaglider.com/docs/how-to/backend-capability-validation'
+                      }
+                    />
+                  }
+                  style={{ marginTop: 8, borderRadius: 6 }}
+                />
+              )}
+              {b.capability?.verdict === 'unknown' && (
+                <Alert
+                  type="info"
+                  showIcon
+                  message="Conditional-write support could not be verified"
+                  description={
+                    <LinkifiedText
+                      text={`${b.capability.reason} — multi-instance write safety is unproven on this backend. See https://deltaglider.com/docs/how-to/backend-capability-validation`}
+                    />
+                  }
+                  style={{ marginTop: 8, borderRadius: 6 }}
+                />
               )}
               {/* Per-backend encryption subsection: shows the current
                  mode, exposes a mode-change picker, and wraps the

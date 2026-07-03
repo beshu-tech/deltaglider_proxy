@@ -91,6 +91,9 @@ export interface AdminConfig {
        */
       public?: boolean;
       quota_bytes?: number;
+      /** Declared replication destination: client writes 403; replication
+       *  is the single writer (safe on non-CAS backends like B2). */
+      replication_target_only?: boolean;
     }
   >;
   // Multi-backend
@@ -204,7 +207,19 @@ export interface BackendInfo {
    * Omitted in the response when false.
    */
   is_synthesized?: boolean;
+  /**
+   * Conditional-write verdict from the startup backend-capability gate
+   * (guard B). Absent when the gate didn't assess this backend
+   * (single-instance, or no client-writable routed buckets on it).
+   */
+  capability?: BackendCapabilityVerdict;
 }
+
+/** Mirror of the server's coordination::CapabilityVerdict (kebab-case tag). */
+type BackendCapabilityVerdict =
+  | { verdict: 'cas-verified'; via: 'probe' | 'witness' }
+  | { verdict: 'non-cas' }
+  | { verdict: 'unknown'; reason: string };
 
 export async function getAdminConfig(): Promise<AdminConfig | null> {
   const res = await adminFetch('/api/admin/config');

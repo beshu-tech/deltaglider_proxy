@@ -210,6 +210,12 @@ pub struct BackendInfoResponse {
     /// Omitted when `false` to keep the payload compact.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_synthesized: bool,
+    /// Conditional-write verdict from the startup capability gate. `None`
+    /// when the gate didn't assess this backend (single-instance, or a
+    /// backend with no client-writable routed buckets). Populated by
+    /// `GET /backends` only — drives the BackendsPanel capability banner.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capability: Option<crate::coordination::CapabilityVerdict>,
 }
 
 impl From<&crate::config::NamedBackendConfig> for BackendInfoResponse {
@@ -226,6 +232,7 @@ impl From<&crate::config::NamedBackendConfig> for BackendInfoResponse {
                 has_credentials: false,
                 encryption,
                 is_synthesized: false,
+                capability: None,
             },
             crate::config::BackendConfig::S3 {
                 endpoint,
@@ -243,6 +250,7 @@ impl From<&crate::config::NamedBackendConfig> for BackendInfoResponse {
                 has_credentials: access_key_id.is_some(),
                 encryption,
                 is_synthesized: false,
+                capability: None,
             },
         }
     }
