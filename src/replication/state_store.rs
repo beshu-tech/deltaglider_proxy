@@ -1145,6 +1145,29 @@ impl ConfigDb {
         Ok(n)
     }
 
+    /// Read-time zombie reaper: settle a row stuck 'running'/'cancelling' whose
+    /// lease has EXPIRED. A live audit renews its lease every TTL/3 (heartbeat),
+    /// so an expired lease on a running row means the task/process is dead —
+    /// boot reconcile handles restarts, but this heals the case where the audit
+    /// died WITHOUT a subsequent boot (SIGKILL of the task, a re-launch that
+    /// crashed again), which otherwise leaves the UI polling 'running' forever.
+    /// Returns true if it reaped this row. `now`-driven so it's pure/testable.
+    pub fn parity_reap_if_dead(&self, rule: &str, now: i64) -> Result<bool, ConfigDbError> {
+        let n = self.conn.execute(
+            "UPDATE replication_parity
+                SET status = 'failed',
+                    last_error = 'proxy died mid-audit (lease expired)',
+                    leader_instance_id = NULL,
+                    leader_expires_at = NULL,
+                    updated_at = ?
+              WHERE rule_name = ?
+                AND status IN ('running', 'cancelling')
+                AND (leader_expires_at IS NULL OR leader_expires_at < ?)",
+            params![now, rule, now],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Cheap status-only read for the per-page cancel check — avoids loading the
     /// (possibly large) outcome_json just to compare the status string.
     pub fn parity_status(&self, rule: &str) -> Result<Option<String>, ConfigDbError> {
@@ -1653,6 +1676,27 @@ mod tests {
         assert!(db
             .parity_try_acquire_lease("r", "owner-c", 200, 60)
             .unwrap());
+    }
+
+    #[test]
+    fn parity_reap_if_dead_settles_expired_lease_but_spares_live() {
+        let db = db();
+        // Live lease (expires at 100+60=160), running row.
+        db.parity_try_acquire_lease("r", "owner-a", 100, 60).unwrap();
+        db.parity_result_set_running("r", 100).unwrap();
+
+        // Before expiry: NOT reaped, still running.
+        assert!(!db.parity_reap_if_dead("r", 150).unwrap());
+        assert_eq!(db.parity_result_load("r").unwrap().unwrap().status, "running");
+
+        // After expiry (now > 160): reaped to failed.
+        assert!(db.parity_reap_if_dead("r", 200).unwrap());
+        let row = db.parity_result_load("r").unwrap().unwrap();
+        assert_eq!(row.status, "failed");
+        assert!(row.last_error.unwrap().contains("lease expired"));
+
+        // Idempotent — a settled row isn't re-reaped.
+        assert!(!db.parity_reap_if_dead("r", 300).unwrap());
     }
 
     #[test]

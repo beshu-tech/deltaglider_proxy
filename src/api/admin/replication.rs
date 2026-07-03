@@ -480,6 +480,10 @@ pub async fn verify_status(
     let row = match &state.config_db {
         Some(db_arc) => {
             let db = db_arc.lock().await;
+            // Self-heal a zombie 'running' row (dead task, no boot since) before
+            // the read, so the UI doesn't poll a stuck spinner forever.
+            let now = crate::replication::current_unix_seconds();
+            let _ = db.parity_reap_if_dead(&name, now);
             db.parity_result_load(&name).ok().flatten()
         }
         None => None,
