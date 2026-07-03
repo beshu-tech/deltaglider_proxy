@@ -21,6 +21,7 @@ import {
   DeleteOutlined,
   EyeOutlined,
   PauseOutlined,
+  PlayCircleOutlined,
   PlusOutlined,
   StopOutlined,
   ThunderboltOutlined,
@@ -76,8 +77,11 @@ const ACTION_META: Record<
   { label: string; icon: React.ReactNode; danger?: boolean; done?: string }
 > = {
   pause: { label: 'Pause', icon: <PauseOutlined />, done: 'Paused' },
+  // Resume (un-pause the schedule) keeps the bare play caret; Run now/once
+  // (fire a single execution) uses a DISTINCT circled-play so the two icons
+  // don't collide on a paused rule that offers both.
   resume: { label: 'Resume', icon: <CaretRightOutlined />, done: 'Resumed' },
-  'run-now': { label: 'Run now', icon: <CaretRightOutlined /> },
+  'run-now': { label: 'Run now', icon: <PlayCircleOutlined /> },
   preview: { label: 'Preview', icon: <EyeOutlined /> },
   cancel: {
     label: 'Cancel',
