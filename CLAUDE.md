@@ -198,7 +198,15 @@ single-instance planes below are addressed.
 - IAM / OAuth providers / mapping rules / session revocations — the encrypted
   SQLCipher DB synced via `DGP_CONFIG_SYNC_BUCKET` (ETag-poll every 5 min →
   eventually consistent, ≤5min lag; mutations push immediately with
-  reconcile-then-retry on CAS conflict).
+  reconcile-then-retry on CAS conflict). The sync IS atomic at the S3-OBJECT
+  level (`config_db_sync.rs` PUT uses `If-Match`/`If-None-Match` → 412 →
+  reconcile-retry, a real compare-and-swap) — but the IAM merge is
+  DELETE-all+INSERT-all table-replace, i.e. **row-level LAST-WRITER-WINS**: a
+  concurrent IAM edit on peer B can silently revert node A's row (only
+  `session_revocations` merges monotonically via `MAX`). So: linearizable blob,
+  LWW rows, coordination tables excluded entirely. This shape is fine for
+  human-paced identity and structurally WRONG for leases/locks — which is
+  exactly why B3 dropped the coordination tables (below) rather than sync them.
 
 **Instance-LOCAL (NOT shared — break or degrade under non-sticky round-robin):**
 - **Background-job leadership** — replication/lifecycle/maintenance/parity leases
