@@ -41,23 +41,56 @@ pub enum CapabilityVerdict {
 }
 
 /// Thread-safe backend-name → verdict map, `Arc`-shared into `AppState`.
+///
+/// Entries carry a FINGERPRINT of the `BackendConfig` they were probed
+/// against: a hot-apply that redefines a backend (new endpoint, rotated
+/// credentials) under the same name misses the cache and re-probes — a stale
+/// `CasVerified` must never vouch for a swapped-out endpoint, and a stale
+/// `NonCas` must never lock out a fixed one.
 #[derive(Debug, Default)]
 pub struct BackendCapabilityCache {
-    verdicts: parking_lot::RwLock<HashMap<String, CapabilityVerdict>>,
+    verdicts: parking_lot::RwLock<HashMap<String, (String, CapabilityVerdict)>>,
+}
+
+/// In-memory identity of a backend definition (includes credentials — never
+/// persisted or exposed; a credential rotation deliberately re-probes).
+fn fingerprint(config: &crate::config::BackendConfig) -> String {
+    serde_json::to_string(config).unwrap_or_default()
 }
 
 impl BackendCapabilityCache {
-    pub fn set(&self, backend: &str, verdict: CapabilityVerdict) {
-        self.verdicts.write().insert(backend.to_string(), verdict);
+    pub fn set(
+        &self,
+        backend: &str,
+        config: &crate::config::BackendConfig,
+        verdict: CapabilityVerdict,
+    ) {
+        self.verdicts
+            .write()
+            .insert(backend.to_string(), (fingerprint(config), verdict));
     }
 
-    pub fn get(&self, backend: &str) -> Option<CapabilityVerdict> {
-        self.verdicts.read().get(backend).cloned()
+    /// Verdict for this backend NAME, only if it was established against this
+    /// exact backend DEFINITION. `None` = never probed or definition changed.
+    pub fn get(
+        &self,
+        backend: &str,
+        config: &crate::config::BackendConfig,
+    ) -> Option<CapabilityVerdict> {
+        self.verdicts
+            .read()
+            .get(backend)
+            .filter(|(fp, _)| *fp == fingerprint(config))
+            .map(|(_, v)| v.clone())
     }
 
-    /// Snapshot for the admin backends API.
+    /// Snapshot for the admin backends API (name → verdict).
     pub fn snapshot(&self) -> HashMap<String, CapabilityVerdict> {
-        self.verdicts.read().clone()
+        self.verdicts
+            .read()
+            .iter()
+            .map(|(k, (_, v))| (k.clone(), v.clone()))
+            .collect()
     }
 }
 
@@ -129,19 +162,23 @@ pub fn forced_noncas_backends() -> std::collections::BTreeSet<String> {
         .unwrap_or_default()
 }
 
-/// Establish a CAS verdict for one backend group: forced-hook → witness
-/// fast-path → live probe (via [`crate::config_db_sync::validate_cas_bucket`]).
+/// How long a backend capability probe may run before we give up with an
+/// `Unknown` verdict (bounds both the startup gate and the hot-apply gate).
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Establish a CAS verdict for one backend group: forced-hook → live probe.
 /// Shared by the startup gate and the hot-apply pre-commit gate; the CALLER
 /// decides what each verdict means (exit(1) vs reject-apply vs warn).
+///
+/// NO witness object in the data bucket: a witness there is client-visible,
+/// blocks DeleteBucket with a ghost key, and lands unencrypted on encrypting
+/// backends. The probe is 3 requests once per (backend definition, boot) —
+/// the in-memory fingerprint cache absorbs repeats within a process.
 pub async fn establish_backend_verdict(
     name: &str,
     group: &ClientWritableGroup,
     forced_noncas: &std::collections::BTreeSet<String>,
 ) -> CapabilityVerdict {
-    use crate::config_db_sync::{
-        validate_cas_bucket, CasValidationFailure, CoordinationValidation,
-        BACKEND_CAPABILITY_WITNESS_KEY,
-    };
     if forced_noncas.contains(name) {
         return CapabilityVerdict::NonCas;
     }
@@ -153,15 +190,21 @@ pub async fn establish_backend_verdict(
             }
         }
     };
-    match validate_cas_bucket(&client, &group.probe_bucket, BACKEND_CAPABILITY_WITNESS_KEY).await {
-        Ok(CoordinationValidation::Probed) => CapabilityVerdict::CasVerified {
+    let probe_key = format!(".deltaglider/_cwprobe/{}", uuid::Uuid::new_v4());
+    match tokio::time::timeout(
+        PROBE_TIMEOUT,
+        crate::config_db_sync::probe_conditional_write(&client, &group.probe_bucket, &probe_key),
+    )
+    .await
+    {
+        Err(_) => CapabilityVerdict::Unknown {
+            reason: format!("capability probe timed out ({}s)", PROBE_TIMEOUT.as_secs()),
+        },
+        Ok(Ok(true)) => CapabilityVerdict::CasVerified {
             via: VerifiedVia::Probe,
         },
-        Ok(CoordinationValidation::CachedWitness { .. }) => CapabilityVerdict::CasVerified {
-            via: VerifiedVia::Witness,
-        },
-        Err(CasValidationFailure::NonCas) => CapabilityVerdict::NonCas,
-        Err(CasValidationFailure::Indeterminate(reason)) => CapabilityVerdict::Unknown { reason },
+        Ok(Ok(false)) => CapabilityVerdict::NonCas,
+        Ok(Err(reason)) => CapabilityVerdict::Unknown { reason },
     }
 }
 
@@ -169,8 +212,13 @@ pub async fn establish_backend_verdict(
 /// client-writable bucket onto a known- (or freshly-probed-) non-CAS backend
 /// while multi-instance. Runs AFTER `Config::check()` passes and BEFORE the
 /// transition commits; only active when a coordination bucket is configured.
-/// `Unknown`/unprobed backends are probed inline with a bounded timeout so a
-/// brand-new backend added via the GUI still gets a verdict before commit.
+///
+/// Verdicts are trusted only for the exact backend DEFINITION they were
+/// probed against (fingerprint match) — a redefined backend re-probes once,
+/// bounded by [`PROBE_TIMEOUT`]. A fingerprint-matched `Unknown` is NOT
+/// re-probed here (mirrors the startup gate's warn-don't-block stance and
+/// keeps unrelated config applies from stalling behind an unreachable
+/// backend on every attempt).
 pub async fn hot_apply_capability_gate(
     new_config: &crate::config::Config,
     cache: &BackendCapabilityCache,
@@ -184,23 +232,12 @@ pub async fn hot_apply_capability_gate(
     }
     let forced = forced_noncas_backends();
     for (name, group) in client_writable_s3_backends(new_config) {
-        let verdict = match cache.get(&name) {
-            Some(v @ CapabilityVerdict::CasVerified { .. })
-            | Some(v @ CapabilityVerdict::NonCas) => v,
-            // Unknown or never probed: probe inline, bounded, and record.
-            _ => {
-                let v = match tokio::time::timeout(
-                    std::time::Duration::from_secs(15),
-                    establish_backend_verdict(&name, &group, &forced),
-                )
-                .await
-                {
-                    Ok(v) => v,
-                    Err(_) => CapabilityVerdict::Unknown {
-                        reason: "capability probe timed out (15s)".to_string(),
-                    },
-                };
-                cache.set(&name, v.clone());
+        let verdict = match cache.get(&name, &group.backend) {
+            Some(v) => v,
+            // Never probed against THIS definition: probe inline and record.
+            None => {
+                let v = establish_backend_verdict(&name, &group, &forced).await;
+                cache.set(&name, &group.backend, v.clone());
                 v
             }
         };
@@ -223,19 +260,51 @@ pub async fn hot_apply_capability_gate(
 mod tests {
     use super::*;
 
+    fn s3_backend(endpoint: &str) -> crate::config::BackendConfig {
+        crate::config::BackendConfig::S3 {
+            endpoint: Some(endpoint.to_string()),
+            region: "us-east-1".into(),
+            force_path_style: true,
+            access_key_id: Some("k".into()),
+            secret_access_key: Some("s".into()),
+            allow_local: true,
+        }
+    }
+
     #[test]
     fn cache_set_get_snapshot() {
         let cache = BackendCapabilityCache::default();
-        assert_eq!(cache.get("b2"), None);
-        cache.set("b2", CapabilityVerdict::NonCas);
+        let b2 = s3_backend("https://b2.example");
+        assert_eq!(cache.get("b2", &b2), None);
+        cache.set("b2", &b2, CapabilityVerdict::NonCas);
         cache.set(
             "hetzner",
+            &s3_backend("https://hetzner.example"),
             CapabilityVerdict::CasVerified {
                 via: VerifiedVia::Probe,
             },
         );
-        assert_eq!(cache.get("b2"), Some(CapabilityVerdict::NonCas));
+        assert_eq!(cache.get("b2", &b2), Some(CapabilityVerdict::NonCas));
         assert_eq!(cache.snapshot().len(), 2);
+    }
+
+    #[test]
+    fn cache_misses_on_redefined_backend() {
+        // A hot-apply that swaps the endpoint under the same NAME must miss
+        // the cache: a stale CasVerified must not vouch for the new endpoint,
+        // and a stale NonCas must not lock out a fixed one.
+        let cache = BackendCapabilityCache::default();
+        let old_def = s3_backend("https://hetzner.example");
+        let new_def = s3_backend("https://b2.example");
+        cache.set(
+            "remote",
+            &old_def,
+            CapabilityVerdict::CasVerified {
+                via: VerifiedVia::Probe,
+            },
+        );
+        assert_eq!(cache.get("remote", &new_def), None, "redefinition → miss");
+        assert!(cache.get("remote", &old_def).is_some(), "same def → hit");
     }
 
     #[test]

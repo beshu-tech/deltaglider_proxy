@@ -1730,6 +1730,41 @@ impl Config {
                 }
             }
         }
+        // Aliasing hole: a marked bucket's single-writer guarantee applies to
+        // its REAL (backend, bucket) storage; an unmarked second virtual name
+        // resolving to the same real location reopens client writes to it.
+        {
+            let resolved: Vec<(&String, String, String, bool)> = self
+                .buckets
+                .iter()
+                .map(|(name, p)| {
+                    (
+                        name,
+                        p.backend.clone().unwrap_or_default().to_ascii_lowercase(),
+                        p.alias
+                            .clone()
+                            .unwrap_or_else(|| name.clone())
+                            .to_ascii_lowercase(),
+                        p.replication_target_only,
+                    )
+                })
+                .collect();
+            for (name, backend, real, marked) in &resolved {
+                if !marked {
+                    continue;
+                }
+                for (other, ob, oreal, omarked) in &resolved {
+                    if other != name && !omarked && ob == backend && oreal == real {
+                        warnings.push(format!(
+                            "bucket '{other}' aliases the same storage as replication_target_only \
+                             bucket '{name}' but is NOT marked — client writes through '{other}' \
+                             defeat the single-writer guarantee. Mark every virtual name that \
+                             points at the protected storage."
+                        ));
+                    }
+                }
+            }
+        }
         // Two replication rules writing overlapping prefixes of one destination
         // bucket = two writers into the same deltaspace. Warn regardless of the
         // marker — the safety argument is per destination prefix.
@@ -3437,6 +3472,57 @@ storage:
                 .iter()
                 .any(|w| w.contains("prune-mirror") && w.contains("second internal writer")),
             "lifecycle-into-marked must warn, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_check_warns_unmarked_alias_of_marked_bucket() {
+        let warnings = check_yaml(
+            r#"
+storage:
+  buckets:
+    mirror:
+      backend: b2
+      alias: real-mirror
+      replication_target_only: true
+    shadow:
+      backend: b2
+      alias: real-mirror
+  replication:
+    rules:
+      - name: seed
+        source: { bucket: src }
+        destination: { bucket: mirror }
+"#,
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("shadow") && w.contains("single-writer")),
+            "unmarked alias of a marked bucket must warn, got {warnings:?}"
+        );
+        // A DIFFERENT real bucket on the same backend does not warn.
+        let ok = check_yaml(
+            r#"
+storage:
+  buckets:
+    mirror:
+      backend: b2
+      alias: real-mirror
+      replication_target_only: true
+    unrelated:
+      backend: b2
+      alias: real-other
+  replication:
+    rules:
+      - name: seed
+        source: { bucket: src }
+        destination: { bucket: mirror }
+"#,
+        );
+        assert!(
+            !ok.iter().any(|w| w.contains("single-writer")),
+            "distinct real buckets must not warn, got {ok:?}"
         );
     }
 

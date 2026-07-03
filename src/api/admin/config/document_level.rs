@@ -559,7 +559,7 @@ pub(crate) async fn apply_config_inner(
                             .chain(preserve_warnings)
                             .collect(),
                         error: Some(format!(
-                            "Failed to build engine from applied config (no state changed): {}",
+                            "Config transition refused (no state changed): {}",
                             e
                         )),
                         persisted_path: None,

@@ -568,8 +568,17 @@ async fn write_witness(client: &Client, bucket: &str, key: &str, now: i64, overw
 }
 
 /// The isolated two-step conditional-write probe on a caller-owned key.
-/// `Ok(true)` iff the re-PUT with `If-None-Match:*` returned a real `412`.
-async fn probe_conditional_write(client: &Client, bucket: &str, key: &str) -> Result<bool, String> {
+/// Three-way outcome: `Ok(true)` = CAS enforced (a real `412`); `Ok(false)` =
+/// DEFINITIVELY unsupported (the condition was silently ignored, or rejected
+/// with a 501/NotImplemented — Backblaze B2's answer); `Err` = the probe
+/// couldn't establish anything (transport error, missing bucket) — callers
+/// must treat that as INDETERMINATE, never as non-CAS, or a network blip
+/// becomes a spurious fatal verdict.
+pub(crate) async fn probe_conditional_write(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+) -> Result<bool, String> {
     // Step 1: unconditional PUT to establish existence.
     client
         .put_object()
@@ -589,19 +598,27 @@ async fn probe_conditional_write(client: &Client, bucket: &str, key: &str) -> Re
         .send()
         .await;
     let supported = match &put2 {
-        Ok(_) => false, // precondition ignored → silent overwrite
-        Err(e) => is_precondition_failed(&format!("{e:?}")),
+        Ok(_) => Ok(false), // precondition ignored → silent overwrite
+        Err(e) => {
+            let msg = format!("{e:?}");
+            if is_precondition_failed(&msg) {
+                Ok(true)
+            } else if is_not_implemented(&msg) {
+                Ok(false) // loud rejection of the conditional (B2-style 501)
+            } else {
+                Err(format!(
+                    "probe re-PUT to '{bucket}' failed with a non-conditional error: {msg}"
+                ))
+            }
+        }
     };
     // Best-effort cleanup.
     let _ = client.delete_object().bucket(bucket).key(key).send().await;
-    Ok(supported)
+    supported
 }
 
 /// Fixed object key for the coordination-bucket validation witness.
 const COORDINATION_WITNESS_KEY: &str = ".deltaglider/coordination-witness.json";
-/// Witness key for the per-backend write-capability validation (written in the
-/// probed DATA bucket, distinct from the coordination witness).
-pub const BACKEND_CAPABILITY_WITNESS_KEY: &str = ".deltaglider/backend-capability-witness.json";
 /// Re-validate a witnessed bucket only after this age — a huge default so normal
 /// boots always take the cheap fast-path, while still catching a backend that
 /// silently REGRESSED (e.g. versioning toggled) within a season.
@@ -655,6 +672,13 @@ pub(crate) fn is_precondition_failed(err_str: &str) -> bool {
     err_str.contains("PreconditionFailed")
         || err_str.contains("Precondition Failed")
         || err_str.contains("412")
+}
+
+/// Pure classifier: did the backend LOUDLY reject the conditional request as
+/// unimplemented (HTTP 501 / NotImplemented)? Backblaze B2 answers conditional
+/// writes this way — a DEFINITIVE "no CAS", unlike a transport error.
+pub(crate) fn is_not_implemented(err_str: &str) -> bool {
+    err_str.contains("NotImplemented") || err_str.contains("501")
 }
 
 /// Pure: does a stringified GET error signal the object is ABSENT (a 404-class
@@ -910,6 +934,23 @@ mod tests {
             "service error: AccessDenied (status 403)"
         ));
         assert!(!is_precondition_failed(""));
+    }
+
+    #[test]
+    fn not_implemented_classification() {
+        // B2-style loud rejections → DEFINITIVE non-CAS.
+        assert!(is_not_implemented(
+            "service error: NotImplemented: conditional writes not supported"
+        ));
+        assert!(is_not_implemented("http status: 501"));
+        // Transport-class errors are NOT "not implemented" — they must map to
+        // Indeterminate, never to a fatal non-CAS verdict.
+        assert!(!is_not_implemented("dispatch failure: connection refused"));
+        assert!(!is_not_implemented("timeout waiting for response"));
+        assert!(!is_not_implemented(
+            "service error: AccessDenied (status 403)"
+        ));
+        assert!(!is_not_implemented(""));
     }
 
     #[test]

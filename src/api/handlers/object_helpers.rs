@@ -64,9 +64,10 @@ pub(crate) fn check_client_write_allowed(
     bucket: &str,
 ) -> Result<(), S3Error> {
     let engine = state.engine.load();
+    // Registry keys are lowercased; form-POST passes the raw path segment.
     if engine
         .bucket_policy_registry()
-        .replication_target_only(bucket)
+        .replication_target_only(&bucket.to_ascii_lowercase())
     {
         return Err(S3Error::AccessDeniedReason(format!(
             "Bucket '{bucket}' is replication_target_only: client writes are disabled so \

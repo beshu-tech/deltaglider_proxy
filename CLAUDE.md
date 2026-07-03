@@ -261,8 +261,10 @@ The `replication_target_only` bucket marker (`bucket_policy.rs`) is what makes a
 non-CAS backend (Backblaze B2 answers conditional writes with 501) safe as a cheap
 replication destination. Verdicts live in `BackendCapabilityCache`
 (`src/coordination/capability.rs`, stamped on `GET /backends` → BackendsPanel
-banner); probes are witness-cached per backend
-(`.deltaglider/backend-capability-witness.json`, 30d). Every enforcement message
+banner), keyed to the backend DEFINITION fingerprint (redefine = re-probe; no
+witness object in data buckets — it would be client-visible and block
+DeleteBucket). Probe outcomes: 412=CAS, 200-or-501=definitive non-CAS,
+transport error=Unknown (warn, never fatal). Every enforcement message
 ends with the doc URL (`CAPABILITY_DOC_URL` → `docs/product/how-to/backend-capability-validation.md`);
 the GUI linkifies it (`LinkifiedText`). Test seam: `DGP_TEST_FORCE_NONCAS_BACKEND`.
 `Config::check()` warns on orphaned markers, lifecycle rules writing into marked

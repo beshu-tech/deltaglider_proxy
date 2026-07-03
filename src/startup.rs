@@ -1270,7 +1270,7 @@ pub async fn build_coordination_lease(
 ///
 /// Fail-fast contract (observability is the point — every outcome is loud):
 ///  - single-instance → one `info!`, no probes, zero cost.
-///  - each validated backend → one `info!` (probed vs witness-cached).
+///  - each validated backend → one `info!`.
 ///  - DEFINITIVE non-CAS (the `If-None-Match:*` re-PUT succeeded) → doc-linked
 ///    `FATAL` naming the buckets, the backend, and both fixes → `exit(1)`.
 ///  - indeterminate probe (network, missing bucket) → loud `warn!` + Unknown
@@ -1312,7 +1312,7 @@ pub async fn validate_backend_write_capability(
     let forced = forced_noncas_backends();
     for (name, group) in groups {
         let verdict = establish_backend_verdict(&name, &group, &forced).await;
-        cache.set(&name, verdict.clone());
+        cache.set(&name, &group.backend, verdict.clone());
         match verdict {
             CapabilityVerdict::CasVerified { via } => info!(
                 "backend capability: '{name}' conditional writes verified ({via:?}) — \

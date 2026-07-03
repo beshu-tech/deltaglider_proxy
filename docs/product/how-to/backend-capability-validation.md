@@ -28,11 +28,15 @@ So the proxy validates capability up front, loudly, and refuses configurations i
 
 ## How the probe works
 
-At startup the proxy writes a small object under an isolated key (`.deltaglider/_cwprobe/<random>`) and immediately re-writes it with `If-None-Match: *`. A CAS-capable backend must answer **412 Precondition Failed**; a backend that answers 200 has *ignored* the condition and is treated as non-CAS (fail-closed — a backend that silently accepts conditions it doesn't enforce is the dangerous case). The probe object is deleted afterwards.
+At startup the proxy writes a small object under an isolated key (`.deltaglider/_cwprobe/<random>`) and immediately re-writes it with `If-None-Match: *`. Three outcomes:
 
-The verdict is cached in a witness object (`.deltaglider/backend-capability-witness.json`) for 30 days, so restarts don't re-probe. Random probe keys mean a fleet of instances booting at once can validate concurrently without colliding.
+- **412 Precondition Failed** — the backend enforces the condition: verified.
+- **200, or a 501/NotImplemented rejection** — definitively non-CAS. A 200 means the condition was *silently ignored* (the dangerous case); a 501 is how Backblaze B2 answers conditional writes.
+- **Anything else** (network error, missing bucket) — *unverified*, not non-CAS: the proxy logs a loud warning and continues rather than crashing on a transient blip. An unverified backend shows as such in the GUI until a later boot or config apply probes it successfully.
 
-The same mechanism validates the coordination bucket itself (witness: `.deltaglider/coordination-witness.json`).
+The probe object is deleted afterwards. Random probe keys mean a fleet of instances booting at once can validate concurrently without colliding. Per-backend verdicts are held in memory for the life of the process, keyed to the exact backend definition — redefining a backend (new endpoint, rotated credentials) re-probes; a plain restart re-probes once (3 requests per backend).
+
+The same probe validates the coordination bucket itself; there the verdict IS cached across restarts in a witness object (`.deltaglider/coordination-witness.json`, 30 days) inside the coordination bucket.
 
 ## Using Backblaze B2 (or any non-CAS backend) as a replication target
 
@@ -58,7 +62,7 @@ With the marker set:
 - Reads (GET, HEAD, LIST) are unaffected. You can even publish prefixes read-only with `public_prefixes` — a published mirror is a coherent setup.
 - The bucket is exempt from the multi-instance CAS requirement, so the proxy boots even though B2 is non-CAS.
 
-Keep one replication rule per destination prefix. The single-writer guarantee assumes replication is the *only* writer; the proxy warns at config validation if it spots overlapping destination rules or a lifecycle rule that also writes into a marked bucket.
+Keep one replication rule per destination prefix. The single-writer guarantee assumes replication is the *only* writer; the proxy warns at config validation if it spots overlapping destination rules, a lifecycle rule that also writes into a marked bucket, or an **unmarked second virtual bucket aliasing the same real storage** (the marker protects a virtual name — every alias pointing at the protected bucket must carry it too).
 
 ## The messages, verbatim, and their fixes
 
@@ -98,9 +102,8 @@ The bucket named by `config_sync_bucket` is on a non-CAS backend. The coordinati
 Validation is deliberately loud even when everything passes. At startup, look for:
 
 ```
-backend capability: 'hetzner-fsn1' conditional writes verified (probe)
-backend capability: 'aws-dr' conditional writes verified (witness cache)
-backend capability gate skipped: single instance (config_sync_bucket not set)
+backend capability: 'hetzner-fsn1' conditional writes verified (Probe)
+Backend capability gate skipped: single instance (config_sync_bucket not set)
 ```
 
 One line per validated backend (or one line telling you the gate didn't apply). If you don't see any of these lines, you're on a version that predates the gate.
