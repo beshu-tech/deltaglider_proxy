@@ -4,6 +4,8 @@
 
 ## v1.9.6 — 2026-07-03
 
+## v1.9.6 — 2026-07-03
+
 Verify reliability + a Jobs-table icon fix.
 
 ### Fixed
