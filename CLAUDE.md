@@ -209,13 +209,23 @@ single-instance planes below are addressed.
   exactly why B3 dropped the coordination tables (below) rather than sync them.
 
 **Instance-LOCAL (NOT shared — break or degrade under non-sticky round-robin):**
-- **Background-job leadership** — replication/lifecycle/maintenance/parity leases
-  (`config_db/job_store.rs`) are NODE-LOCAL: coordination tables were dropped
-  from the sync set in B3, so a peer NEVER sees another node's lease. Two
-  instances CAN double-run the same rule (duplicate copy/delete work, divergent
-  run history), and kill/pause reach only the instance holding the lease. Run
-  job-plane workloads on ONE instance (or sticky-route the scheduler's traffic)
-  until cross-instance leases ship.
+- **Background-job leadership** — the SQLite leases (`config_db/job_store.rs`) are
+  NODE-LOCAL (B3 dropped coordination tables from the sync set). **Exception —
+  REPLICATION now has an OPTIONAL cross-instance lease** (`src/coordination/`):
+  when a CAS-capable coordination bucket is configured (`config_sync_bucket`), the
+  replication scheduler elects a single leader via an S3-CAS lease OBJECT
+  (`_dgp/leases/replication/<rule>.json`) → a dead leader's lease lapses (≤TTL,
+  default 300s) and a peer steals it = automatic failover, no double-run. The seam
+  is `CoordinationLease` (trait) with `LocalLease` (SQLite, single-instance default)
+  and `S3Lease` (shared) impls, selected once at startup; `durable_node_id` lets a
+  rebooted node reclaim its own live lease. **Still node-local:** LIFECYCLE (hourly,
+  pure-plan-idempotent), MAINTENANCE (operator one-offs), PARITY, and admin
+  RUN-NOW — those still double-run under round-robin. **Cross-node kill/pause,
+  resume-from-cursor on takeover, and post-failover run-history are NOT delivered**
+  (cursor / `cancelling`+`paused` rows / run_history stay node-local) — a cross-node
+  takeover RESTARTS the run (safe: idempotent copy / generation-pin / provenance-
+  gated delete — just wasteful). A non-CAS coordination backend (B2/501) falls back
+  to `LocalLease` (every node runs; tolerable churn) — never a SPOF.
 - **Admin/browser sessions** (`session.rs`, in-memory) — a cookie minted on node A
   is invalid on B (intermittent 401s). Sticky sessions required for the admin GUI.
 - **Multipart uploads** (`multipart.rs`, in-memory) — UploadPart/Complete must hit

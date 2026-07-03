@@ -1,5 +1,17 @@
 # Coordination via S3 conditional-writes — platform detection, capability gating, and the one-path question
 
+> **STATUS (shipped).** The boot-time coordination-bucket CAS validation + witness
+> is live. The dead speculative CAS surface (platform.rs, the trait
+> `supports_conditional_writes`/probe, the AtomicU8 cache) was DELETED. The
+> `CoordinationLease` seam (`src/coordination/`) shipped with `LocalLease` (SQLite,
+> single-instance) + `S3Lease` (cross-instance CAS object) + `durable_node_id`.
+> **REPLICATION** is wired to the shared lease → automatic leader failover on a
+> CAS-capable coordination bucket (integration-tested against MinIO). Still
+> node-local + documented follow-ups: LIFECYCLE, MAINTENANCE, PARITY, admin
+> RUN-NOW; and cross-node kill/pause + resume-from-cursor + post-failover run
+> history (those need the coordination TABLES shared, a larger change — a
+> cross-node takeover currently RESTARTS the run, which is safe-but-wasteful).
+
 Status: DESIGN (2026-07-03). Prereq facts are empirically confirmed (see
 `memory/project_backend_cas_support.md`): Hetzner/Ceph enforces atomic
 `If-None-Match:*` (HTTP 412 + 1-of-N race); Backblaze B2 rejects conditional
