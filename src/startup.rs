@@ -1224,6 +1224,28 @@ pub async fn init_config_sync(
 
     info!("Config DB S3 sync: enabled (bucket={})", sync_bucket);
 
+    // Boot gate: PROVE the coordination bucket enforces atomic conditional
+    // writes before any HA feature (leases, single-writer locks) hinges on it.
+    // A silent-clobber bucket is a data-loss trap — crash rather than run unsafe.
+    // Skips itself on the fast path when a fresh witness from a prior boot exists.
+    match sync.validate_coordination_bucket().await {
+        Ok(deltaglider_proxy::config_db_sync::CoordinationValidation::CachedWitness {
+            validated_at_unix,
+            validated_by,
+        }) => info!(
+            "Coordination bucket '{}': conditional-write support confirmed (cached witness, validated at unix={} by {})",
+            sync_bucket, validated_at_unix, validated_by
+        ),
+        Ok(deltaglider_proxy::config_db_sync::CoordinationValidation::Probed) => info!(
+            "Coordination bucket '{}': conditional-write support PROBED and confirmed (witness written)",
+            sync_bucket
+        ),
+        Err(e) => {
+            error!("FATAL: coordination bucket validation failed: {e}");
+            std::process::exit(1);
+        }
+    }
+
     // Try to download a newer version from S3
     match sync.download_if_newer().await {
         Ok(Some(dl)) => {

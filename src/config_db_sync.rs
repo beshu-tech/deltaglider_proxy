@@ -414,6 +414,214 @@ impl ConfigDbSync {
 
         Ok(data)
     }
+
+    /// Boot-time gate: PROVE the coordination bucket enforces atomic
+    /// conditional writes (`If-None-Match: *`) before any HA feature hinges on
+    /// it. Returns `Err` on a bucket that can't be trusted — the caller CRASHES
+    /// the process (a silent-clobber coordination bucket is a data-loss trap).
+    ///
+    /// Design (simple + 16-node-concurrency-safe):
+    ///  1. WITNESS fast-path — if `.deltaglider/coordination-witness.json` exists
+    ///     and is fresh, a prior boot already proved this bucket. Skip the probe.
+    ///     (One cheap GET on the normal boot path.)
+    ///  2. PROBE on a RANDOM key (uuid) — so 16 nodes booting at once each run a
+    ///     self-contained probe that no peer's cleanup can disturb (a shared
+    ///     probe key would race into false negatives → spurious crashes). The
+    ///     probe is fail-closed: it demands a real `412`, the one signal a
+    ///     silent-ignore backend can't fake.
+    ///  3. WITNESS write — create-if-absent (`If-None-Match: *`). With 16 nodes,
+    ///     exactly one wins the write and 15 get `412`; that lost race is itself
+    ///     a free live-fire CAS test, and either way the witness now exists. A
+    ///     STALE witness is refreshed with a plain overwrite (CAS already proven
+    ///     in step 2; the timestamp bump isn't CAS-critical).
+    pub async fn validate_coordination_bucket(&self) -> Result<CoordinationValidation, String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let witness_key = COORDINATION_WITNESS_KEY;
+
+        // ── 1. Witness fast-path ──
+        // `refreshing_stale` = we saw an EXISTING witness that aged out. It
+        // matters for step 3: a stale witness must be OVERWRITTEN (its key already
+        // exists, so a create-if-absent write would 412 and never bump the stamp).
+        let mut refreshing_stale = false;
+        match self.read_witness(witness_key).await {
+            Ok(Some(w)) if witness_is_fresh(w.validated_at_unix, now, WITNESS_MAX_AGE_SECS) => {
+                return Ok(CoordinationValidation::CachedWitness {
+                    validated_at_unix: w.validated_at_unix,
+                    validated_by: w.validated_by,
+                });
+            }
+            Ok(Some(_)) => refreshing_stale = true, // exists but aged out → overwrite
+            Ok(None) => {}                          // absent → create-if-absent
+            Err(e) => {
+                // A read error is not itself a validation failure (transient), but
+                // don't crash on it — fall through to the probe, which is the real
+                // gate. Log via the returned variant if the probe then passes.
+                tracing::debug!("coordination witness read failed (will probe): {e}");
+            }
+        }
+
+        // ── 2. Isolated probe on a random key (fail-closed) ──
+        let probe_key = format!(".deltaglider/_cwprobe/{}", uuid::Uuid::new_v4());
+        let supported = self.probe_conditional_write(&probe_key).await?;
+        if !supported {
+            return Err(format!(
+                "Coordination bucket '{}' does NOT enforce atomic conditional writes \
+                 (If-None-Match). HA coordination (leases, single-writer locks) would be \
+                 UNSAFE — refusing to start. Use a coordination bucket on AWS S3, MinIO \
+                 (>=2024-09), or Ceph/Hetzner; Backblaze B2 (501) and old MinIO/SeaweedFS \
+                 (silent overwrite) are NOT supported.",
+                self.bucket
+            ));
+        }
+
+        // ── 3. Witness write (create-if-absent; overwrite if refreshing stale) ──
+        self.write_witness(witness_key, now, refreshing_stale).await; // best-effort
+        Ok(CoordinationValidation::Probed)
+    }
+
+    /// Read + parse the witness object. `Ok(None)` = absent (a 404/NoSuchKey).
+    async fn read_witness(&self, key: &str) -> Result<Option<Witness>, String> {
+        match self
+            .s3_client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(out) => {
+                let bytes = out
+                    .body
+                    .collect()
+                    .await
+                    .map_err(|e| format!("witness body read: {e}"))?
+                    .into_bytes();
+                Ok(serde_json::from_slice::<Witness>(&bytes).ok())
+            }
+            Err(e) => {
+                let s = format!("{e:?}");
+                if s.contains("NoSuchKey") || s.contains("NotFound") || s.contains("404") {
+                    Ok(None)
+                } else {
+                    Err(s)
+                }
+            }
+        }
+    }
+
+    /// Best-effort witness write. Never fatal — the probe already proved the
+    /// bucket; a missing witness just re-probes next boot.
+    ///
+    /// `overwrite` picks the mode:
+    ///  - `false` (absent witness): create-if-absent (`If-None-Match:*`) so 16
+    ///    concurrent nodes don't clobber — exactly one wins, the rest 412
+    ///    harmlessly (a free live-fire CAS test).
+    ///  - `true` (refreshing a STALE witness): plain overwrite — the key already
+    ///    exists, so create-if-absent would 412 forever and never bump the stamp.
+    async fn write_witness(&self, key: &str, now: i64, overwrite: bool) {
+        let body = serde_json::to_vec(&Witness {
+            version: 1,
+            validated_at_unix: now,
+            validated_by: node_id(),
+            primitive: "if-none-match-cas".to_string(),
+        })
+        .unwrap_or_default();
+        let mut put = self
+            .s3_client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(ByteStream::from(body))
+            .content_type("application/json");
+        if !overwrite {
+            put = put.if_none_match("*");
+        }
+        // Ignore the result: 412 (peer won the create race) and any transient
+        // error are both non-fatal — validation already succeeded via the probe.
+        let _ = put.send().await;
+    }
+
+    /// The isolated two-step conditional-write probe on a caller-owned key.
+    /// `Ok(true)` iff the re-PUT with `If-None-Match:*` returned a real `412`.
+    async fn probe_conditional_write(&self, key: &str) -> Result<bool, String> {
+        // Step 1: unconditional PUT to establish existence.
+        self.s3_client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"1"))
+            .send()
+            .await
+            .map_err(|e| format!("probe could not write to '{}': {e:?}", self.bucket))?;
+        // Step 2: re-PUT If-None-Match:* on the SAME key — MUST be 412.
+        let put2 = self
+            .s3_client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"2"))
+            .if_none_match("*")
+            .send()
+            .await;
+        let supported = match &put2 {
+            Ok(_) => false, // precondition ignored → silent overwrite
+            Err(e) => is_precondition_failed(&format!("{e:?}")),
+        };
+        // Best-effort cleanup.
+        let _ = self
+            .s3_client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await;
+        Ok(supported)
+    }
+}
+
+/// Fixed object key for the coordination-bucket validation witness.
+const COORDINATION_WITNESS_KEY: &str = ".deltaglider/coordination-witness.json";
+/// Re-validate a witnessed bucket only after this age — a huge default so normal
+/// boots always take the cheap fast-path, while still catching a backend that
+/// silently REGRESSED (e.g. versioning toggled) within a season.
+const WITNESS_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
+
+/// Outcome of a coordination-bucket validation (for logging provenance).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoordinationValidation {
+    /// A prior boot's fresh witness let us skip the probe.
+    CachedWitness {
+        validated_at_unix: i64,
+        validated_by: String,
+    },
+    /// We ran the live probe this boot (and it passed).
+    Probed,
+}
+
+/// The witness object written after a successful validation.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct Witness {
+    version: u32,
+    validated_at_unix: i64,
+    validated_by: String,
+    primitive: String,
+}
+
+/// Pure freshness check — extracted so the TTL decision is unit-testable.
+fn witness_is_fresh(validated_at: i64, now: i64, max_age: i64) -> bool {
+    now >= validated_at && now - validated_at < max_age
+}
+
+/// Best-effort stable-ish node identifier for witness provenance (hostname or a
+/// random fallback). Purely diagnostic — never used for coordination decisions.
+fn node_id() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("node-{}", uuid::Uuid::new_v4()))
 }
 
 /// Pure classifier: does this stringified S3 SDK error represent a failed
@@ -608,6 +816,36 @@ pub async fn reopen_and_rebuild_iam(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn witness_freshness_truth_table() {
+        let max = WITNESS_MAX_AGE_SECS;
+        // Just written → fresh.
+        assert!(witness_is_fresh(1000, 1000, max));
+        // One second short of the TTL → fresh.
+        assert!(witness_is_fresh(1000, 1000 + max - 1, max));
+        // Exactly at the TTL → stale (re-validate).
+        assert!(!witness_is_fresh(1000, 1000 + max, max));
+        // Well past → stale.
+        assert!(!witness_is_fresh(1000, 1000 + max + 999_999, max));
+        // Clock skew: witness "from the future" → treated as stale, not fresh
+        // (guards against a bad clock making a bogus witness look eternally valid).
+        assert!(!witness_is_fresh(2000, 1000, max));
+    }
+
+    #[test]
+    fn witness_json_round_trips() {
+        let w = Witness {
+            version: 1,
+            validated_at_unix: 1_783_000_000,
+            validated_by: "node-abc".into(),
+            primitive: "if-none-match-cas".into(),
+        };
+        let bytes = serde_json::to_vec(&w).unwrap();
+        let back: Witness = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.validated_at_unix, w.validated_at_unix);
+        assert_eq!(back.primitive, "if-none-match-cas");
+    }
 
     #[test]
     fn precondition_failed_detected_from_common_shapes() {
