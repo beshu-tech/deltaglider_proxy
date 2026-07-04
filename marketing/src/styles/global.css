@@ -490,6 +490,14 @@ hr {
   position: relative;
 }
 
+/* Gradient text on the hero headline */
+.hero-copy h1 {
+  background: linear-gradient(135deg, var(--ink-900) 0%, var(--brand) 50%, var(--ink-900) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
 /* ============================================================
    Split full-bleed hero: the copy column is pinned to a fixed margin
    from the LEFT viewport edge; the dashboard slideshow occupies the
