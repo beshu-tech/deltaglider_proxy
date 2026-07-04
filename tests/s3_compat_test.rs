@@ -2362,6 +2362,108 @@ async fn test_form_post_upload_succeeds_with_presigned_policy() {
     assert_eq!(body.as_ref(), b"hello-form-post");
 }
 
+/// C2 regression: a form field NOT covered by any policy condition is rejected
+/// (AWS's "every field must have a condition" rule). Here the policy signs only
+/// bucket/key/algorithm/credential/date but the form smuggles an unapproved
+/// `x-amz-meta-injected` — must 403, not store the metadata.
+#[tokio::test]
+async fn test_form_post_rejects_field_not_covered_by_policy() {
+    let server = TestServer::builder()
+        .auth("POSTACCESSKEY", "POSTSECRETKEY123")
+        .build()
+        .await;
+    let client = reqwest::Client::new();
+    let (bucket, endpoint) = (server.bucket(), server.endpoint());
+    let amz_date = "20260507T120000Z";
+    let credential = "POSTACCESSKEY/20260507/us-east-1/s3/aws4_request";
+    let policy = serde_json::json!({
+        "expiration": "2099-01-01T00:00:00.000Z",
+        "conditions": [
+            { "bucket": bucket },
+            ["starts-with", "$key", "post/"],
+            { "x-amz-algorithm": "AWS4-HMAC-SHA256" },
+            { "x-amz-credential": credential },
+            { "x-amz-date": amz_date }
+        ]
+    });
+    let policy_b64 = base64::engine::general_purpose::STANDARD.encode(policy.to_string());
+    let signing_key = derive_post_signing_key("POSTSECRETKEY123", "20260507", "us-east-1");
+    let signature = hex::encode(hmac_sha256(&signing_key, policy_b64.as_bytes()));
+    let form = reqwest::multipart::Form::new()
+        .text("key", "post/x.txt")
+        .text("policy", policy_b64)
+        .text("x-amz-algorithm", "AWS4-HMAC-SHA256")
+        .text("x-amz-credential", credential)
+        .text("x-amz-date", amz_date)
+        .text("x-amz-signature", signature)
+        // Smuggled — no policy condition references x-amz-meta-injected.
+        .text("x-amz-meta-injected", "evil")
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(b"x".to_vec())
+                .file_name("x.txt")
+                .mime_str("text/plain")
+                .unwrap(),
+        );
+    let resp = client
+        .post(format!("{}/{}", endpoint, bucket))
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "a form field absent from the policy must be rejected, got {}",
+        resp.status()
+    );
+}
+
+/// C1 regression: a form-POST to a traversal bucket name (`..`) is rejected
+/// BEFORE any filesystem path is constructed — `root.join("..")` must never be
+/// reached. reqwest normalises `..` out of a URL, so we send a RAW HTTP request
+/// over a TCP socket carrying the literal `POST /.. HTTP/1.1` request-line.
+#[tokio::test]
+async fn test_form_post_rejects_bucket_name_traversal() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let server = TestServer::builder()
+        .auth("POSTACCESSKEY", "POSTSECRETKEY123")
+        .build()
+        .await;
+    let addr = server.endpoint().replace("http://", "");
+
+    // Minimal multipart body — the bucket-name gate fires before parse/auth,
+    // so the body content doesn't matter, only that content-type is multipart.
+    let boundary = "X";
+    let body = format!(
+        "--{b}\r\nContent-Disposition: form-data; name=\"key\"\r\n\r\nx.txt\r\n\
+         --{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"x.txt\"\r\n\
+         Content-Type: text/plain\r\n\r\nx\r\n--{b}--\r\n",
+        b = boundary
+    );
+    let req = format!(
+        "POST /.. HTTP/1.1\r\nHost: {addr}\r\n\
+         Content-Type: multipart/form-data; boundary={boundary}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).await.unwrap();
+    let status_line = resp.lines().next().unwrap_or("");
+    assert!(
+        status_line.contains(" 400 ") || status_line.contains(" 404 "),
+        "form-POST to a `..` bucket must be rejected (400/404), not routed to \
+         root.join(\"..\"); got status line: {status_line:?}"
+    );
+    // And it must NOT be a 2xx (the write must never land).
+    assert!(
+        !status_line.contains(" 200 ") && !status_line.contains(" 204 "),
+        "traversal bucket write must never succeed; got: {status_line:?}"
+    );
+}
+
 /// THE CI-403 REGRESSION: one presigned policy/signature uploads a BATCH of
 /// distinct files (the AWS-intended `starts-with $key` pattern the ROR CI uses
 /// for .zip/.sha512/.sha1). The replay guard used to 403 the 2nd file under a

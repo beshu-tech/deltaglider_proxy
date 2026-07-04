@@ -288,9 +288,17 @@ fn validate_form_post_policy(
         .and_then(|v| v.as_array())
         .ok_or_else(|| S3Error::InvalidArgument("Policy is missing conditions".into()))?;
 
+    // AWS requires EVERY submitted form field to be covered by a policy
+    // condition. We collect each field name a condition references, then reject
+    // any submitted field not in that set (nor in the always-exempt set below).
+    // Without this, a leaked signature over a narrow policy lets an attacker
+    // smuggle an unapproved content-type or x-amz-meta-* into the stored object.
+    let mut covered: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     for cond in conditions {
         if let Some(obj) = cond.as_object() {
             for (k, v) in obj {
+                covered.insert(k.to_ascii_lowercase());
                 let expected = v.as_str().ok_or_else(|| {
                     S3Error::InvalidArgument(format!("Policy condition '{}' must be a string", k))
                 })?;
@@ -400,6 +408,8 @@ fn validate_form_post_policy(
                 let variable = arr[1].as_str().ok_or_else(|| {
                     S3Error::InvalidArgument(format!("{} variable must be a string", op))
                 })?;
+                // `$key` / `${filename}` → field name "key"; a bare "$foo" → "foo".
+                covered.insert(variable.trim_start_matches('$').to_ascii_lowercase());
                 let expected = arr[2].as_str().ok_or_else(|| {
                     S3Error::InvalidArgument(format!("{} match value must be a string", op))
                 })?;
@@ -428,6 +438,34 @@ fn validate_form_post_policy(
                     other
                 )));
             }
+        }
+    }
+
+    // Every submitted form field must be covered by a condition (AWS rule).
+    // Exempt: the signing/auth fields (the signature covers them intrinsically),
+    // `file`/`key`/`content-type` (`file` is the payload; key/content-type are
+    // handled by their own conditions or the resolved-key path), and the
+    // browser-only `submit`/`x-ignore-*` helpers AWS also ignores.
+    const EXEMPT: &[&str] = &[
+        "policy",
+        "x-amz-signature",
+        "x-amz-credential",
+        "x-amz-algorithm",
+        "x-amz-date",
+        "x-amz-security-token",
+        "file",
+        "key",
+    ];
+    for field in fields_ci.keys() {
+        let f = field.to_ascii_lowercase();
+        if EXEMPT.contains(&f.as_str()) || f.starts_with("x-ignore-") || f == "submit" {
+            continue;
+        }
+        if !covered.contains(&f) {
+            tracing::warn!(
+                "form-POST DENY | reason=uncovered_field | bucket={bucket} key={key_field} field={f}"
+            );
+            return Err(S3Error::AccessDenied);
         }
     }
 
@@ -771,8 +809,12 @@ fn form_post_replay_evict_keys(
         .collect()
 }
 
-/// Reject a captured presigned form-POST being replayed. Pure-ish:
-/// takes shared state, reads `parsed.fields_ci`, mutates the cache.
+/// Record a form-POST in the idempotency/observability ledger and enforce the
+/// cache's bounded-size invariant. This does NOT reject replays — AWS presigned
+/// POSTs are reusable until the policy expires; the ledger is keyed on
+/// `(signature, key+body fingerprint)` so a true replay just refreshes its entry
+/// (see [`form_post_replay_record`]). Its security job is the hard-cap eviction
+/// that stops a unique-signature flood from OOMing the cache.
 fn enforce_form_post_replay(state: &Arc<AppState>, parsed: &ParsedFormPost) -> Result<(), S3Error> {
     let cache = &state.form_post_replay;
     let now = chrono::Utc::now();
@@ -875,20 +917,40 @@ pub async fn handle_form_post_upload(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<Response, S3Error> {
+    // Validate the bucket name FIRST. The s3s adapter gets AWS name validation
+    // for free; this interceptor bypasses s3s, so an unvalidated segment like
+    // `..` would otherwise reach `bucket_dir = root.join("..")` and escape the
+    // storage root. Also normalises the uppercase/underscore drift vs s3s.
+    if let Err(e) = crate::security::validate_bucket_name(bucket) {
+        tracing::warn!("form-POST DENY | reason=invalid_bucket_name | bucket={bucket} err={e:?}");
+        return Err(S3Error::InvalidBucketName(bucket.to_string()));
+    }
+    // Refuse a replication_target_only bucket before any backend I/O or body
+    // parse (403-before-404 parity with the PUT path, commit b1b2249).
+    check_client_write_allowed(state, bucket)?;
     ensure_bucket_exists(state, bucket).await?;
     let parsed = parse_form_post_upload(headers, body).await?;
-    let auth_user = authenticate_form_post(iam_state, bucket, &parsed)?;
-    // After authentication: gate the form-POST policy signature
-    // through the replay cache. Form-POSTs are presigned-style — the
-    // SigV4 path skips replay detection for presigned URLs because
-    // they're MEANT to be reused. Form-POST is the opposite: each
-    // submission should fire at most once (per uploader's intent),
-    // but the SigV4 middleware short-circuits past the replay cache
-    // for POSTs that carry a `policy` field. Without this guard, a
-    // captured form-POST is replayable for the entire policy
-    // expiration window (hours to days).
+    let auth_user = match authenticate_form_post(iam_state, bucket, &parsed) {
+        Ok(u) => u,
+        Err(e) => {
+            // Mirror the IAM middleware's PUT-denial audit so operators can see
+            // form-POST 403s in the admin audit ring (not just stdout warns) —
+            // the surface that produced the original hard-to-diagnose prod 403.
+            audit_log_s3(
+                "s3_post_denied",
+                "$form_post",
+                headers,
+                bucket,
+                &parsed.resolved_key,
+            );
+            return Err(e);
+        }
+    };
+    // Form-POST replay is an observability ledger, NOT a rejection: AWS presigned
+    // POSTs are intentionally reusable until the policy expires, so we record the
+    // (signature, key+body-fingerprint) rather than block re-sends. See the ledger
+    // doc on `form_post_replay_record`.
     enforce_form_post_replay(state, &parsed)?;
-    check_client_write_allowed(state, bucket)?;
     check_quota(state, bucket, parsed.file_data.len() as u64)?;
     let engine = state.engine.load();
     let size = parsed.file_data.len() as u64;

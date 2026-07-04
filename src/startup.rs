@@ -580,7 +580,18 @@ pub fn build_s3_router(
             return next.run(request).await;
         }
 
-        // Pass-through guard 3: path shape `/:bucket` (single segment,
+        // Pass-through guard 3: no query string. This MUST match
+        // `is_form_post_policy_candidate` in api/auth.rs (which refuses to
+        // defer form-POST auth when a query is present) — otherwise a SIGNED
+        // multipart POST carrying a query string would pass the SigV4
+        // middleware as a normal signed request and then be mis-intercepted
+        // here as a form upload. Keeping the two predicates identical means the
+        // intercept set and the auth-deferral set are provably the same.
+        if request.uri().query().is_some() {
+            return next.run(request).await;
+        }
+
+        // Pass-through guard 4: path shape `/:bucket` (single segment,
         // no key suffix). Anything else (`/`, `/bucket/key`) is not a
         // browser form-POST upload.
         let raw_path = request.uri().path().trim_start_matches('/');
@@ -595,6 +606,22 @@ pub fn build_s3_router(
             .extensions()
             .get::<deltaglider_proxy::iam::SharedIamState>()
             .cloned();
+
+        // Pull the rate limiter + client IP so a failed form-POST signature
+        // feeds the SAME per-IP brute-force lockout as a failed SigV4 header
+        // request. The SigV4 middleware defers form-POSTs to this handler, so
+        // WITHOUT this the form-POST endpoint would be the one auth surface with
+        // no rate limiting. Extracted here (before the body is consumed) because
+        // `into_parts` moves the extensions.
+        let rate_limiter = request
+            .extensions()
+            .get::<deltaglider_proxy::rate_limiter::RateLimiter>()
+            .cloned();
+        let metrics = request.extensions().get::<Arc<Metrics>>().cloned();
+        let peer_ip = request
+            .extensions()
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|ci| ci.0.ip());
 
         // Consume the body, bounded by `max_object_size`. This is the
         // authoritative cap for this path: `DefaultBodyLimit` only does an
@@ -613,11 +640,13 @@ pub fn build_s3_router(
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!("form-POST body collection failed or exceeded limit: {e}");
-                return (
-                    axum::http::StatusCode::PAYLOAD_TOO_LARGE,
-                    "form-POST body exceeded the configured max object size",
-                )
-                    .into_response();
+                // Proper S3 XML error (EntityTooLarge) so SDKs/Cyberduck parse it,
+                // matching the PUT path's collect_blob_limited behaviour.
+                return deltaglider_proxy::api::S3Error::EntityTooLarge {
+                    size: 0,
+                    max: max_body as u64,
+                }
+                .into_response();
             }
         };
 
@@ -633,7 +662,40 @@ pub fn build_s3_router(
         .await
         {
             Ok(response) => response,
-            Err(s3_err) => s3_err.into_response(),
+            Err(s3_err) => {
+                // An auth-class rejection (bad signature, unknown/denied
+                // credential, expired/violated policy) feeds the per-IP
+                // brute-force limiter + auth-failure metric, so this surface
+                // is throttled and observable like the SigV4 path.
+                if matches!(
+                    s3_err,
+                    deltaglider_proxy::api::S3Error::AccessDenied
+                        | deltaglider_proxy::api::S3Error::AccessDeniedReason(_)
+                        | deltaglider_proxy::api::S3Error::SignatureDoesNotMatch
+                ) {
+                    if let Some(m) = &metrics {
+                        m.auth_attempts_total.with_label_values(&["failure"]).inc();
+                        m.auth_failures_total
+                            .with_label_values(&["form_post_denied"])
+                            .inc();
+                    }
+                    if let (Some(rl), Some(ip)) = (&rate_limiter, &peer_ip) {
+                        let ip = deltaglider_proxy::rate_limiter::extract_client_ip_with_peer(
+                            &parts.headers,
+                            Some(*ip),
+                        );
+                        if let Some(ip) = ip {
+                            let locked = rl.record_failure(&ip);
+                            if locked {
+                                tracing::warn!(
+                                    "SECURITY | event=brute_force_lockout | surface=form_post | ip={ip} | bucket={bucket}"
+                                );
+                            }
+                        }
+                    }
+                }
+                s3_err.into_response()
+            }
         }
     }
 
