@@ -1,8 +1,0 @@
-$ aws s3 cp smoke.txt s3://smoke-data/smoke.txt
-Completed 12 Bytes/12 Bytes (360 Bytes/s) with 1 file(s) remainingupload: ../../../../../tmp/smoke.txt to s3://smoke-data/smoke2.txt
-
-$ aws s3api put-object --bucket b2-mirror --key nope.txt
-aws: [ERROR]: An error occurred (AccessDenied) when calling the PutObject operation: Bucket 'b2-mirror' is replication_target_only: client writes are disabled so replication remains the single writer — see https://deltaglider.com/docs/how-to/backend-capability-validation
-
-$ aws s3api delete-object --bucket b2-mirror --key x.txt
-aws: [ERROR]: An error occurred (AccessDenied) when calling the DeleteObject operation: Bucket 'b2-mirror' is replication_target_only: client writes are disabled so replication remains the single writer — see https://deltaglider.com/docs/how-to/backend-capability-validation
