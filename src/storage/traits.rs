@@ -18,6 +18,11 @@ pub struct BucketListing {
     pub backend_name: Option<String>,
     /// Real bucket name on that backend, when it differs from the visible name.
     pub real_bucket: Option<String>,
+    /// `Some(origin_error)` when this bucket's backend could NOT be listed
+    /// (503/throttle/connection). The bucket is config-declared so we still
+    /// surface it — flagged unavailable, carrying the VERBATIM backend error so
+    /// an operator sees exactly why it's dark. `None` = listed live, reachable.
+    pub unavailable: Option<String>,
 }
 
 /// Errors that can occur during storage operations
@@ -110,6 +115,7 @@ pub trait StorageBackend: Send + Sync {
                 creation_date,
                 backend_name: None,
                 real_bucket: None,
+                unavailable: None,
             })
             .collect())
     }

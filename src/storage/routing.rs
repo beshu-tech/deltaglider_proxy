@@ -387,6 +387,7 @@ impl StorageBackend for RoutingBackend {
                                 creation_date,
                                 backend_name: Some(backend_name.clone()),
                                 real_bucket: real_bucket_alias,
+                                unavailable: None,
                             },
                         ));
                     }
@@ -397,11 +398,45 @@ impl StorageBackend for RoutingBackend {
                         backend_name,
                         e
                     );
+                    // Don't DROP this backend's buckets — that hides them and
+                    // reads as "these buckets vanished". Emit the CONFIG-DECLARED
+                    // buckets routed to this backend as placeholders flagged
+                    // unavailable, carrying the verbatim origin error. Priority 3
+                    // (below any live listing) so a backend that recovers within
+                    // the same call still wins the dedup.
+                    let origin = e.to_string();
+                    for (virtual_name, route) in &self.routes {
+                        if route.backend_name != *backend_name {
+                            continue;
+                        }
+                        if Self::is_listing_plumbing(virtual_name) {
+                            continue;
+                        }
+                        let real_alias = route
+                            .real_bucket
+                            .as_ref()
+                            .filter(|rb| rb.as_str() != virtual_name.as_str())
+                            .cloned();
+                        candidates.push((
+                            virtual_name.clone(),
+                            3,
+                            backend_name.clone(),
+                            BucketListing {
+                                name: virtual_name.clone(),
+                                creation_date: chrono::Utc::now(),
+                                backend_name: Some(backend_name.clone()),
+                                real_bucket: real_alias,
+                                unavailable: Some(origin.clone()),
+                            },
+                        ));
+                    }
                     last_err = Some(e);
                 }
             }
         }
-        if !any_ok {
+        if !any_ok && candidates.is_empty() {
+            // Nothing reachable AND nothing config-declared to show → surface
+            // the error rather than an empty list.
             if let Some(e) = last_err {
                 return Err(e);
             }
@@ -1200,6 +1235,63 @@ mod tests {
         );
         assert!(routing.list_buckets_with_dates().await.is_err());
         assert!(routing.list_bucket_origins().await.is_err());
+    }
+
+    /// The union requirement (user, 2026-07-05): when a backend fails its live
+    /// listing, its CONFIG-DECLARED buckets must NOT be dropped — they appear
+    /// flagged `unavailable` carrying the VERBATIM origin error. A bucket that's
+    /// temporarily unreachable is still the user's bucket; hiding it reads as
+    /// "it vanished".
+    #[tokio::test]
+    async fn failed_backend_lists_config_declared_buckets_as_unavailable() {
+        let mut backends = HashMap::new();
+        backends.insert(
+            "up".to_string(),
+            Arc::new(Box::new(TestBackend::with_buckets(&["alive"])) as Box<dyn StorageBackend>),
+        );
+        backends.insert(
+            "down".to_string(),
+            Arc::new(Box::new(TestBackend::failing()) as Box<dyn StorageBackend>),
+        );
+        // Two buckets are config-declared as routed to the DOWN backend.
+        let mut routes = HashMap::new();
+        routes.insert("mirror-a".to_string(), ("down".to_string(), None));
+        routes.insert(
+            "mirror-b".to_string(),
+            ("down".to_string(), Some("real-mirror-b".to_string())),
+        );
+        let routing =
+            RoutingBackend::new(backends, routes, "up".to_string()).expect("routing backend");
+
+        let origins = routing.list_bucket_origins().await.expect("must be Ok");
+        let by: HashMap<_, _> = origins.iter().map(|b| (b.name.as_str(), b)).collect();
+
+        // The reachable bucket is present and NOT flagged.
+        assert!(
+            by["alive"].unavailable.is_none(),
+            "reachable bucket must be clean"
+        );
+        // Both config-declared buckets on the down backend ARE present, flagged
+        // with the verbatim backend error — never dropped.
+        for name in ["mirror-a", "mirror-b"] {
+            let b = by
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} must be listed"));
+            let err = b
+                .unavailable
+                .as_deref()
+                .unwrap_or_else(|| panic!("{name} must be flagged unavailable"));
+            assert!(
+                err.contains("simulated backend outage"),
+                "{name} must carry the verbatim origin error, got: {err}"
+            );
+            assert_eq!(b.backend_name.as_deref(), Some("down"));
+        }
+        assert_eq!(
+            by["mirror-b"].real_bucket.as_deref(),
+            Some("real-mirror-b"),
+            "alias preserved on the unavailable placeholder"
+        );
     }
 
     /// The complement: a PARTIAL failure (one backend up, one down) still

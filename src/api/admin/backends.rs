@@ -29,6 +29,12 @@ pub struct BucketBackendOriginResponse {
     pub backend_region: Option<String>,
     pub backend_path: Option<String>,
     pub real_bucket: Option<String>,
+    /// Present + non-null when this bucket's backend could not be listed
+    /// (503 / throttle / connection). Carries the VERBATIM backend error so the
+    /// UI can show why it's dark. The bucket is still listed (config-declared),
+    /// flagged unavailable — never silently dropped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -206,6 +212,7 @@ pub async fn list_bucket_origins(
                 backend_region: backend.and_then(|b| b.region.clone()),
                 backend_path: backend.and_then(|b| b.path.clone()),
                 real_bucket: bucket.real_bucket,
+                unavailable: bucket.unavailable,
             }
         })
         .collect();

@@ -19,6 +19,9 @@ export interface BucketInfo {
   name: string;
   creationDate: string;
   backend?: BucketBackendOrigin;
+  /** Verbatim backend error when the bucket's backend is unreachable; the
+   *  bucket is still listed but flagged unavailable. Undefined = reachable. */
+  unavailable?: string;
 }
 
 export interface BucketBackendOrigin {

@@ -17,6 +17,8 @@ interface BucketOriginResponse {
   backend_region?: string | null;
   backend_path?: string | null;
   real_bucket?: string | null;
+  /** Verbatim backend error when this bucket's backend couldn't be listed (503/throttle). */
+  unavailable?: string | null;
 }
 
 interface BucketOriginListResponse {

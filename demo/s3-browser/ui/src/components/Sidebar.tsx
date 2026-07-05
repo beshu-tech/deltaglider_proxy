@@ -73,6 +73,13 @@ export default function Sidebar({
     TEXT_MUTED, TEXT_FAINT, ACCENT_BLUE, ACCENT_BLUE_LIGHT,
   } = useColors();
   const [buckets, setBuckets] = useState<BucketInfo[]>([]);
+  // Distinguishes "the bucket listing FAILED" (a backend is down / 503-ing)
+  // from "there are genuinely zero buckets". Without this, a failed ListBuckets
+  // collapses to an empty list that reads as "no buckets — create your first",
+  // hiding an outage (the prod RCA: an upstream 503 emptied the sidebar with a
+  // clean console). On error we keep whatever we last had and show a retry row.
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [reloadSignal, setReloadSignal] = useState(0);
   // Create-bucket dialog lives in <CreateBucketModal>; the Sidebar only owns
   // its open/close + post-create refresh of its local bucket list.
   const [createBucketOpen, setCreateBucketOpen] = useState(false);
@@ -82,8 +89,11 @@ export default function Sidebar({
   const [messageApi, contextHolder] = message.useMessage();
 
   useEffect(() => {
+    let cancelled = false;
     listBuckets({ includeOrigins: includeBucketOrigins })
       .then((list) => {
+        if (cancelled) return;
+        setLoadError(null);
         setBuckets(list);
         onBucketsChanged?.(list.length);
         if (list.length > 0 && !list.some((b) => b.name === getBucket())) {
@@ -95,11 +105,16 @@ export default function Sidebar({
           onBucketChange('');
         }
       })
-      .catch(() => {
-        setBuckets([]);
-        onBucketsChanged?.(0);
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        // Do NOT clear the list to [] — that would render the empty state and
+        // mask the failure. Surface an error the operator can retry.
+        setLoadError(formatError(e));
       });
-  }, [onBucketChange, onBucketsChanged, includeBucketOrigins]);
+    return () => {
+      cancelled = true;
+    };
+  }, [onBucketChange, onBucketsChanged, includeBucketOrigins, reloadSignal]);
 
   useEffect(() => {
     if (createBucketFocusSignal <= 0) return;
@@ -279,26 +294,57 @@ export default function Sidebar({
           )}
         </div>
 
+        {loadError && (
+          <div
+            role="alert"
+            style={{
+              margin: '0 0 10px', padding: '10px 12px', borderRadius: 6,
+              border: `1px solid ${token.colorErrorBorder}`,
+              background: token.colorErrorBg, fontSize: 12, lineHeight: 1.4,
+            }}
+          >
+            <div style={{ color: token.colorError, fontWeight: 600, marginBottom: 4 }}>
+              Couldn’t load buckets
+            </div>
+            <div style={{ color: TEXT_SECONDARY, marginBottom: 8, wordBreak: 'break-word' }}>
+              A storage backend may be unavailable or rate-limiting requests.
+              This is not the same as having no buckets — nothing has been created or deleted.
+            </div>
+            <Button size="small" onClick={() => { setLoadError(null); setReloadSignal((n) => n + 1); }}>
+              Retry
+            </Button>
+          </div>
+        )}
+
         <ul style={{ listStyle: 'none', margin: 0, padding: 0 }}>
-          {buckets.map((b) => (
+          {buckets.map((b) => {
+            const isUnavailable = Boolean(b.unavailable);
+            return (
             <li key={b.name} style={{ display: 'flex', alignItems: 'center', minWidth: 0 }}>
               <button
                 className="btn-reset"
-                onClick={() => handleSelectBucket(b.name)}
+                onClick={() => { if (!isUnavailable) handleSelectBucket(b.name); }}
+                disabled={isUnavailable}
                 aria-current={b.name === activeBucket ? 'true' : undefined}
+                aria-disabled={isUnavailable || undefined}
+                // Full origin backend error, verbatim, on hover — so an operator
+                // sees exactly WHY the bucket is dark (e.g. the raw 503/SlowDown).
+                title={isUnavailable ? `Temporarily unavailable — ${b.unavailable}` : undefined}
                 style={{
                   flex: 1,
                   minWidth: 0,
                   padding: '7px 10px',
                   borderRadius: 6,
                   marginBottom: 2,
+                  cursor: isUnavailable ? 'not-allowed' : 'pointer',
+                  opacity: isUnavailable ? 0.5 : 1,
                   background: b.name === activeBucket ? `rgba(45, 212, 191, 0.1)` : 'transparent',
                   color: b.name === activeBucket ? ACCENT_BLUE_LIGHT : TEXT_SECONDARY,
                   transition: 'all 0.15s ease',
                   borderLeft: b.name === activeBucket ? `2px solid ${ACCENT_BLUE}` : '2px solid transparent',
                 }}
                 onMouseEnter={(e) => {
-                  if (b.name !== activeBucket) e.currentTarget.style.background = 'var(--surface-hover)';
+                  if (!isUnavailable && b.name !== activeBucket) e.currentTarget.style.background = 'var(--surface-hover)';
                 }}
                 onMouseLeave={(e) => {
                   if (b.name !== activeBucket) e.currentTarget.style.background = 'transparent';
@@ -318,10 +364,23 @@ export default function Sidebar({
                   }}>
                     {b.name}
                   </span>
+                  {isUnavailable && (
+                    <span
+                      title={b.unavailable}
+                      style={{
+                        flexShrink: 0, fontSize: 9, fontWeight: 700, letterSpacing: 0.5,
+                        textTransform: 'uppercase', padding: '1px 5px', borderRadius: 4,
+                        color: token.colorWarning,
+                        border: `1px solid ${token.colorWarning}`,
+                      }}
+                    >
+                      Unavailable
+                    </span>
+                  )}
                   {canAdmin && <BucketBackendBadge origin={b.backend} />}
                 </span>
               </button>
-              {canDeleteBucket(b.name) && (
+              {!isUnavailable && canDeleteBucket(b.name) && (
                 <Button
                   type="text"
                   size="small"
@@ -341,7 +400,8 @@ export default function Sidebar({
                 />
               )}
             </li>
-          ))}
+            );
+          })}
         </ul>
 
         {canUpload && (

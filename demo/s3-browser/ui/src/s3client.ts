@@ -537,22 +537,41 @@ export async function listBuckets(opts?: ListBucketsOptions): Promise<BucketInfo
     originsPromise,
   ]);
   const originByName = new Map((origins?.buckets || []).map((b) => [b.name, b]));
-  return (resp.Buckets || []).map((b) => {
+  const toBackend = (o: NonNullable<typeof origins>['buckets'][number]) => ({
+    backendName: o.backend_name || undefined,
+    backendType: o.backend_type || undefined,
+    backendEndpoint: o.backend_endpoint || undefined,
+    backendRegion: o.backend_region || undefined,
+    backendPath: o.backend_path || undefined,
+    realBucket: o.real_bucket || undefined,
+  });
+  const s3Names = new Set((resp.Buckets || []).map((b) => b.Name || ''));
+  const merged: BucketInfo[] = (resp.Buckets || []).map((b) => {
     const name = b.Name || '';
     const origin = originByName.get(name);
     return {
       name,
       creationDate: b.CreationDate?.toISOString() || origin?.creation_date || '',
-      backend: origin ? {
-        backendName: origin.backend_name || undefined,
-        backendType: origin.backend_type || undefined,
-        backendEndpoint: origin.backend_endpoint || undefined,
-        backendRegion: origin.backend_region || undefined,
-        backendPath: origin.backend_path || undefined,
-        realBucket: origin.real_bucket || undefined,
-      } : undefined,
+      backend: origin ? toBackend(origin) : undefined,
+      unavailable: origin?.unavailable || undefined,
     };
   });
+  // Union in buckets that the admin origins endpoint reports but S3 ListBuckets
+  // did NOT return — these are config-declared buckets whose backend is
+  // unreachable (503/throttle). We must SHOW them (flagged unavailable), never
+  // drop them, so the operator sees the full roster + why one is dark.
+  for (const o of origins?.buckets || []) {
+    if (s3Names.has(o.name)) continue;
+    if (!o.unavailable) continue; // only surface origin-only rows when they're flagged unavailable
+    merged.push({
+      name: o.name,
+      creationDate: o.creation_date || '',
+      backend: toBackend(o),
+      unavailable: o.unavailable,
+    });
+  }
+  merged.sort((a, b) => a.name.localeCompare(b.name));
+  return merged;
 }
 
 export async function createBucket(name: string, backendName?: string): Promise<void> {
