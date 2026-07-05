@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.11.0 — 2026-07-05
+
 ## v1.10.0 — 2026-07-04
 
 Safe non-CAS backends (Backblaze B2 as a cheap replication target), automatic
