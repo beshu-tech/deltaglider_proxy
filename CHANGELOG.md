@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+## v1.11.0 — 2026-07-05
+
+The bucket list never lies about what exists when a backend is unreachable.
+
+### Fixed
+
+- **A temporarily-unreachable backend no longer empties or silently truncates
+  the bucket list.** When a storage backend returns errors (a provider
+  503-throttling, a connection failure), its buckets used to vanish from the
+  list — and if every backend was erroring, the list came back empty, which the
+  UI showed as "create your first bucket" with a clean console. Now: if *all*
+  backends fail, the listing returns an error (the UI shows a distinct
+  "couldn't load buckets" state with retry, not an empty one); if *some* fail,
+  the reachable buckets are still listed.
+
+### Added
+
+- **Unreachable buckets stay visible, flagged and explained.** A bucket whose
+  backend is temporarily down is now listed (greyed, non-clickable, with an
+  "unavailable" badge) instead of being dropped — sourced from the configured
+  routing table so the roster stays complete. Hovering it shows the **verbatim
+  backend error** (e.g. the raw `503 SlowDown`), so operators see exactly why a
+  bucket is dark rather than assuming it disappeared.
+
 ## v1.10.0 — 2026-07-04
 
 Safe non-CAS backends (Backblaze B2 as a cheap replication target), automatic
