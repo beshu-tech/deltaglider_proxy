@@ -8,7 +8,49 @@ Every released version of DeltaGlider Proxy, newest first. Versions
 follow [semantic versioning](https://semver.org/); the Docker image
 `beshultd/deltaglider_proxy:<version>` is published for each tag.
 
-_Last updated: 2026-07-03_
+_Last updated: 2026-07-04_
+
+## v1.10.0 — 2026-07-04
+
+Safe non-CAS backends (Backblaze B2 as a cheap replication target), automatic
+replication failover across instances, and a hardened browser upload path.
+
+### Added
+
+- **`replication_target_only` bucket marker.** Mark a bucket a
+  replication-destination-only mirror: client writes (PUT, DELETE, multipart,
+  copy-into, browser uploads, admin bulk copy/move/delete) are refused with
+  403 so replication stays the single writer. This is what makes a backend
+  without conditional-write support (e.g. Backblaze B2) safe to host a mirror —
+  reads are unaffected, and prefixes can still be published read-only. See the
+  new how-to, [Using non-CAS backends safely](docs/product/how-to/backend-capability-validation.md).
+- **Backend conditional-write validation.** When multi-instance mode is active
+  (a `config_sync_bucket` is set), the proxy probes every S3 backend that hosts
+  a client-writable bucket at startup and refuses to boot on one that doesn't
+  enforce conditional writes (a data-corruption trap under concurrent writes).
+  A runtime `/config/apply` that would create the same situation is rejected.
+  Verdicts surface in the admin GUI's Backends panel; every enforcement message
+  links to the troubleshooting doc.
+- **Automatic replication failover across instances.** With a CAS-capable
+  coordination bucket, replication rules elect a single leader per rule via an
+  S3 lease object; a dead leader's lease lapses and a peer takes over
+  automatically — no double-run, no shared database required. Single-instance
+  deployments keep the node-local lease (zero S3 traffic).
+
+### Fixed
+
+- **Hardened the browser form-POST upload path.** Closed a bucket-name path
+  traversal (an unvalidated bucket segment could escape the storage root),
+  routed failed upload signatures through the same per-IP brute-force limiter
+  and audit ring as every other auth surface, and now reject form fields not
+  covered by the signed policy (AWS's "every field must have a condition"
+  rule). The signature/policy verification itself was audited clean.
+
+### Docs
+
+- New troubleshooting guide for backend capability validation; corrected stale
+  HA/multi-instance claims across the README, product docs, and code comments
+  to reflect the shipped cross-instance replication lease.
 
 ## v1.9.6 — 2026-07-03
 
