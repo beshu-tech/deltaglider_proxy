@@ -258,12 +258,18 @@ impl StorageBackend for RoutingBackend {
     async fn list_buckets(&self) -> Result<Vec<String>, StorageError> {
         let mut all_buckets = HashSet::new();
 
-        // Query each backend — errors are logged but don't prevent listing
-        // buckets from other backends (partial results are better than no results
-        // for a listing operation).
+        // Query each backend. A failing backend is logged but doesn't drop the
+        // reachable ones (partial > nothing for a listing). BUT if EVERY backend
+        // fails we must NOT return an empty Ok — that reads as "zero buckets" and
+        // renders the UI's "create your first bucket" empty state during a
+        // transient upstream outage (e.g. an S3 provider 503-throttling us).
+        // Propagate the error so the client sees a real 5xx instead.
+        let mut last_err: Option<StorageError> = None;
+        let mut any_ok = false;
         for (backend_name, backend) in &self.backends {
             match backend.list_buckets().await {
                 Ok(buckets) => {
+                    any_ok = true;
                     for real_bucket in buckets {
                         let virtual_name =
                             self.listed_bucket_virtual_name(backend_name, &real_bucket);
@@ -279,7 +285,13 @@ impl StorageBackend for RoutingBackend {
                         backend_name,
                         e
                     );
+                    last_err = Some(e);
                 }
+            }
+        }
+        if !any_ok {
+            if let Some(e) = last_err {
+                return Err(e);
             }
         }
 
@@ -296,10 +308,15 @@ impl StorageBackend for RoutingBackend {
     ) -> Result<Vec<(String, chrono::DateTime<chrono::Utc>)>, StorageError> {
         let mut all_buckets: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
 
-        // Query backends first — real dates take precedence
+        // Query backends first — real dates take precedence. As in
+        // `list_buckets`: total failure returns Err (not an empty Ok that reads
+        // as "zero buckets" and empties the UI during an upstream outage).
+        let mut last_err: Option<StorageError> = None;
+        let mut any_ok = false;
         for (backend_name, backend) in &self.backends {
             match backend.list_buckets_with_dates().await {
                 Ok(buckets) => {
+                    any_ok = true;
                     for (real_bucket, date) in buckets {
                         let virtual_name =
                             self.listed_bucket_virtual_name(backend_name, &real_bucket);
@@ -315,7 +332,13 @@ impl StorageBackend for RoutingBackend {
                         backend_name,
                         e
                     );
+                    last_err = Some(e);
                 }
+            }
+        }
+        if !any_ok {
+            if let Some(e) = last_err {
+                return Err(e);
             }
         }
 
@@ -330,9 +353,15 @@ impl StorageBackend for RoutingBackend {
     async fn list_bucket_origins(&self) -> Result<Vec<BucketListing>, StorageError> {
         let mut candidates: Vec<(String, u8, String, BucketListing)> = Vec::new();
 
+        // Same total-failure guard as list_buckets: don't return an empty Ok
+        // when every backend errored (empties the admin buckets panel on a
+        // transient upstream outage).
+        let mut last_err: Option<StorageError> = None;
+        let mut any_ok = false;
         for (backend_name, backend) in &self.backends {
             match backend.list_buckets_with_dates().await {
                 Ok(buckets) => {
+                    any_ok = true;
                     for (real_bucket, creation_date) in buckets {
                         let virtual_name =
                             self.listed_bucket_virtual_name(backend_name, &real_bucket);
@@ -368,7 +397,13 @@ impl StorageBackend for RoutingBackend {
                         backend_name,
                         e
                     );
+                    last_err = Some(e);
                 }
+            }
+        }
+        if !any_ok {
+            if let Some(e) = last_err {
+                return Err(e);
             }
         }
 
@@ -833,6 +868,9 @@ mod tests {
     struct TestBackend {
         buckets: Arc<StdMutex<HashSet<String>>>,
         create_calls: Arc<StdMutex<Vec<String>>>,
+        /// When true, list_buckets(_with_dates) returns an error — models an
+        /// upstream backend 503-ing so the total-failure guard can be tested.
+        fail_list: bool,
     }
 
     impl TestBackend {
@@ -842,7 +880,14 @@ mod tests {
                     buckets.iter().map(|b| b.to_string()).collect(),
                 )),
                 create_calls: Arc::new(StdMutex::new(Vec::new())),
+                fail_list: false,
             }
+        }
+
+        fn failing() -> Self {
+            let mut b = Self::with_buckets(&[]);
+            b.fail_list = true;
+            b
         }
 
         fn create_calls(&self) -> Vec<String> {
@@ -867,6 +912,9 @@ mod tests {
         }
 
         async fn list_buckets(&self) -> Result<Vec<String>, StorageError> {
+            if self.fail_list {
+                return Err(StorageError::S3("simulated backend outage".into()));
+            }
             Ok(self.buckets.lock().unwrap().iter().cloned().collect())
         }
 
@@ -1130,6 +1178,47 @@ mod tests {
             "create_bucket must not create a duplicate on the default backend"
         );
         assert_eq!(archive_probe.create_calls(), vec!["shared".to_string()]);
+    }
+
+    /// Regression (prod RCA 2026-07-05): when EVERY backend errors on
+    /// list_buckets (an upstream provider 503-throttling us), the routing layer
+    /// must return Err — NOT an empty Ok. An empty Ok reads to the UI as "zero
+    /// buckets" and shows the "create your first bucket" empty state during a
+    /// transient outage, with a clean JS console (200 response, empty list).
+    #[tokio::test]
+    async fn total_backend_failure_returns_err_not_empty_ok() {
+        let mut backends = HashMap::new();
+        backends.insert(
+            "only".to_string(),
+            Arc::new(Box::new(TestBackend::failing()) as Box<dyn StorageBackend>),
+        );
+        let routing = RoutingBackend::new(backends, HashMap::new(), "only".to_string())
+            .expect("routing backend");
+        assert!(
+            routing.list_buckets().await.is_err(),
+            "all-backends-failed must be Err, got an Ok (would empty the UI)"
+        );
+        assert!(routing.list_buckets_with_dates().await.is_err());
+        assert!(routing.list_bucket_origins().await.is_err());
+    }
+
+    /// The complement: a PARTIAL failure (one backend up, one down) still
+    /// returns the reachable buckets — partial results beat none for a listing.
+    #[tokio::test]
+    async fn partial_backend_failure_returns_reachable_buckets() {
+        let mut backends = HashMap::new();
+        backends.insert(
+            "up".to_string(),
+            Arc::new(Box::new(TestBackend::with_buckets(&["alive"])) as Box<dyn StorageBackend>),
+        );
+        backends.insert(
+            "down".to_string(),
+            Arc::new(Box::new(TestBackend::failing()) as Box<dyn StorageBackend>),
+        );
+        let routing = RoutingBackend::new(backends, HashMap::new(), "up".to_string())
+            .expect("routing backend");
+        let names = routing.list_buckets().await.expect("partial must be Ok");
+        assert_eq!(names, vec!["alive".to_string()]);
     }
 
     #[tokio::test]
