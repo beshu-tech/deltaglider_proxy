@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.12.0 — 2026-07-06
+
 ## v1.11.0 — 2026-07-05
 
 The bucket list never lies about what exists when a backend is unreachable.
