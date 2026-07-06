@@ -25,7 +25,7 @@ pub struct ConfigDb {
 }
 
 /// Schema version — bump when adding migrations.
-const SCHEMA_VERSION: i32 = 21;
+const SCHEMA_VERSION: i32 = 22;
 
 pub(crate) mod auth_providers;
 mod declarative;
@@ -758,6 +758,21 @@ impl ConfigDb {
             )?;
             info!(
                 "Migrated config DB schema from v{} to v21 (session_revocations)",
+                version
+            );
+        }
+
+        if version < 22 {
+            // v22: parity progress denominator. `progress_total` is the object
+            // count to compare once listing finishes (0 = unknown → the UI shows
+            // an indeterminate bar). Additive, node-local (not in IAM_SYNC_TABLES).
+            conn.execute(
+                "ALTER TABLE replication_parity ADD COLUMN \
+                 progress_total INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+            info!(
+                "Migrated config DB schema from v{} to v22 (replication_parity.progress_total)",
                 version
             );
         }

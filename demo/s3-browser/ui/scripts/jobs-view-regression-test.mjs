@@ -23,6 +23,8 @@ const {
   conflictPolicyLabel,
   rerunVerdictMeta,
   fixActionMeta,
+  computeRate,
+  deriveVerifyProgress,
 } = await import(moduleUrl);
 
 const row = (over = {}) => ({
@@ -265,5 +267,24 @@ for (const fix of [
 ]) {
   assert.equal(fixActionMeta(fix).runnable, false, `${fix.action} is guidance-only`);
 }
+
+// computeRate: EMA of objects/sec, holds on Δ=0, no negatives ---------------
+assert.equal(computeRate(null, 0, 0, 1000, 1000), 1000, 'first sample = instantaneous');
+assert.equal(computeRate(1000, 1000, 1000, 1000, 3000), 1000, 'Δ=0 holds previous rate');
+assert.equal(computeRate(1000, 5000, 1000, 4000, 3000), 1000, 'backwards count holds previous rate');
+assert.equal(computeRate(null, 0, 1000, 0, 1000), 0, 'no dt, no prev → 0');
+{
+  // 800 obj over 2s = 400/s instant; EMA(0.4) toward 1000 prev = 760
+  const r = computeRate(1000, 1000, 1000, 1800, 3000);
+  assert.ok(r > 400 && r < 1000, `EMA blends toward instantaneous, got ${r}`);
+}
+assert.ok(computeRate(5, 100, 1000, 90, 2000) >= 0, 'never negative');
+
+// deriveVerifyProgress: indeterminate until total known, then clamped percent -
+assert.deepEqual(deriveVerifyProgress(500, 0), { determinate: false, percent: 0 }, 'total 0 → indeterminate');
+assert.deepEqual(deriveVerifyProgress(500, undefined), { determinate: false, percent: 0 }, 'no total → indeterminate');
+assert.deepEqual(deriveVerifyProgress(500, 1000), { determinate: true, percent: 50 });
+assert.deepEqual(deriveVerifyProgress(2000, 1000), { determinate: true, percent: 100 }, 'clamped at 100');
+assert.deepEqual(deriveVerifyProgress(0, 1000), { determinate: true, percent: 0 });
 
 console.log('jobs view regression checks passed');

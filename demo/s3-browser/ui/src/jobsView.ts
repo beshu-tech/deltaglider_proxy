@@ -454,3 +454,40 @@ export function deriveMeter(p: OutcomeMeterInput): MeterView {
   }
   return { state: 'copied', greenPct, redPct, dot: 'green', label: `${copied.toLocaleString()} copied`, aria };
 }
+
+/**
+ * Verify progress bar model. `total > 0` (after listing finishes) → determinate
+ * percent; else indeterminate. Pure so it's testable. Percent is clamped and
+ * never regresses past 100 (a late-arriving count can exceed the denominator).
+ */
+export function deriveVerifyProgress(
+  scanned: number,
+  total: number | undefined,
+): { determinate: boolean; percent: number } {
+  if (!total || total <= 0) return { determinate: false, percent: 0 };
+  const pct = Math.round((scanned / total) * 100);
+  return { determinate: true, percent: Math.max(0, Math.min(100, pct)) };
+}
+
+/**
+ * Fold one poll sample into a smoothed objects/sec rate. Pure so it's testable.
+ * Returns the new EMA, or the previous rate unchanged when there's no forward
+ * progress (the DB flushes the count in chunks, so most 2s polls show Δ=0 — a
+ * raw Δ/Δt would flicker to 0 and read as "dead"). `null` prev / non-positive
+ * dt / backwards count → treat as no update.
+ */
+export function computeRate(
+  prevRate: number | null,
+  prevScanned: number,
+  prevTs: number,
+  scanned: number,
+  ts: number,
+  alpha = 0.4,
+): number {
+  const dScanned = scanned - prevScanned;
+  const dt = (ts - prevTs) / 1000;
+  if (dScanned <= 0 || dt <= 0) return Math.max(0, prevRate ?? 0);
+  const inst = dScanned / dt;
+  const next = prevRate == null ? inst : alpha * inst + (1 - alpha) * prevRate;
+  return Math.max(0, next);
+}

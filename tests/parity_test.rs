@@ -159,6 +159,9 @@ async fn test_parity_audit_lifecycle() {
     assert_eq!(out["orphan_on_dest"].as_u64(), Some(0), "{out}");
     assert_eq!(out["checksum_mismatch"].as_u64(), Some(0), "{out}");
     assert_eq!(out["truncated"].as_bool(), Some(false), "{out}");
+    // Plaintext filesystem both sides + same compression → PureMirror path
+    // (stored size+etag from the lite list, no HEAD burst).
+    assert_eq!(out["regime"].as_str(), Some("pure_mirror"), "{out}");
 
     // 2. Delete one dest object out-of-band → missing_on_dest == 1.
     client
@@ -351,6 +354,10 @@ replication:
         .expect("delete source");
 
     let out = verify_rule(&admin, &server.endpoint(), "parity-s3").await;
+    // S3 both sides → lite list is non-authoritative → Transforming path (the
+    // orphan-ownership HEAD still runs; the regime split must NOT take the pure
+    // shortcut here or ownership would degrade to all-foreign).
+    assert_eq!(out["regime"].as_str(), Some("transforming"), "{out}");
     // Both dest-extras are orphans (not on source): the foreign one AND the
     // owned orphan. The KEY assertion is that ownership was HEAD-resolved on
     // S3 (lite has no user_metadata) — the owned orphan is NOT misreported as

@@ -124,6 +124,9 @@ export interface ParityOutcome {
   /** THE signal: true iff !truncated && missing/orphan/mismatch/unverifiable all 0. */
   in_sync: boolean;
   scanned_at: number; // unix SECONDS
+  /** How parity was checked: 'pure_mirror' (verbatim copy → stored size+etag,
+   *  no downloads) vs 'transforming' (re-derived bytes → logical SHA). */
+  regime?: 'pure_mirror' | 'transforming';
   /** The rule's conflict policy — sets up WHY the verdicts read as they do. */
   conflict_policy: ConflictPolicy;
   /** Whether the rule mirrors source deletes to the destination. */
@@ -148,6 +151,8 @@ export async function getJobs(): Promise<JobsOverview> {
 export interface ParityStatus {
   status: 'idle' | 'running' | 'cancelling' | 'done' | 'failed' | 'cancelled';
   progress_scanned: number;
+  /** Compare-phase denominator (0/absent = unknown → indeterminate bar). */
+  progress_total?: number;
   scanned_at?: number;
   outcome?: ParityOutcome;
   error?: string;

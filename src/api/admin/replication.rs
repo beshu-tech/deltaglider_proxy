@@ -227,6 +227,8 @@ pub async fn run_now(
 pub struct ParityStatusResponse {
     pub status: String,
     pub progress_scanned: i64,
+    /// Compare-phase denominator (0 = unknown → indeterminate bar).
+    pub progress_total: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scanned_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -242,6 +244,7 @@ fn parity_status_from_row(
         return ParityStatusResponse {
             status: "idle".into(),
             progress_scanned: 0,
+            progress_total: 0,
             scanned_at: None,
             outcome: None,
             error: None,
@@ -254,6 +257,7 @@ fn parity_status_from_row(
     ParityStatusResponse {
         status: row.status,
         progress_scanned: row.progress_scanned,
+        progress_total: row.progress_total,
         scanned_at: row.scanned_at,
         outcome,
         error: row.last_error,
@@ -287,6 +291,7 @@ pub async fn verify(
             Json(ParityStatusResponse {
                 status: "done".into(),
                 progress_scanned: outcome.source_objects as i64,
+                progress_total: outcome.source_objects as i64,
                 scanned_at: Some(outcome.scanned_at),
                 outcome: Some(outcome),
                 error: None,

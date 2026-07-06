@@ -939,7 +939,7 @@ impl ConfigDb {
         let row = self
             .conn
             .query_row(
-                "SELECT status, scanned_at, progress_scanned, outcome_json, last_error
+                "SELECT status, scanned_at, progress_scanned, progress_total, outcome_json, last_error
                  FROM replication_parity WHERE rule_name = ?",
                 [rule],
                 |r| {
@@ -947,8 +947,9 @@ impl ConfigDb {
                         status: r.get(0)?,
                         scanned_at: r.get(1)?,
                         progress_scanned: r.get(2)?,
-                        outcome_json: r.get(3)?,
-                        last_error: r.get(4)?,
+                        progress_total: r.get(3)?,
+                        outcome_json: r.get(4)?,
+                        last_error: r.get(5)?,
                     })
                 },
             )
@@ -960,11 +961,26 @@ impl ConfigDb {
     /// keeps the last outcome_json visible while the new scan runs).
     pub fn parity_result_set_running(&self, rule: &str, now: i64) -> Result<(), ConfigDbError> {
         self.conn.execute(
-            "INSERT INTO replication_parity (rule_name, status, progress_scanned, updated_at)
-             VALUES (?, 'running', 0, ?)
+            "INSERT INTO replication_parity (rule_name, status, progress_scanned, progress_total, updated_at)
+             VALUES (?, 'running', 0, 0, ?)
              ON CONFLICT(rule_name) DO UPDATE SET
-                status = 'running', progress_scanned = 0, last_error = NULL, updated_at = ?",
+                status = 'running', progress_scanned = 0, progress_total = 0, last_error = NULL, updated_at = ?",
             params![rule, now, now],
+        )?;
+        Ok(())
+    }
+
+    /// Publish the compare-phase denominator (source object count) once listing
+    /// finishes, so the UI bar goes determinate. 0 stays indeterminate.
+    pub fn parity_result_set_total(
+        &self,
+        rule: &str,
+        total: i64,
+        now: i64,
+    ) -> Result<(), ConfigDbError> {
+        self.conn.execute(
+            "UPDATE replication_parity SET progress_total = ?, updated_at = ? WHERE rule_name = ?",
+            params![total, now, rule],
         )?;
         Ok(())
     }
@@ -1188,6 +1204,8 @@ pub struct ParityResultRow {
     pub status: String,
     pub scanned_at: Option<i64>,
     pub progress_scanned: i64,
+    /// Compare-phase denominator (0 = unknown → indeterminate bar).
+    pub progress_total: i64,
     pub outcome_json: Option<String>,
     pub last_error: Option<String>,
 }

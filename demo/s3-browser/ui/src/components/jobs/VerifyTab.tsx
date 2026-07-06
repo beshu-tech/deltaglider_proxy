@@ -9,6 +9,7 @@
  * Owns its own state via a useMutation (no poll, no auto-run on mount); it does
  * NOT touch the editable Definition form.
  */
+import { useEffect, useRef, useState } from 'react';
 import { Alert, Button, Tag, Typography } from 'antd';
 import RecordList from './RecordList';
 import {
@@ -19,7 +20,7 @@ import {
   WarningOutlined,
 } from '@ant-design/icons';
 import type { ParityFinding, ParityOutcome, Verifier } from '../../adminApi';
-import { conflictPolicyLabel, fixActionMeta, parityKindMeta, rerunVerdictMeta } from '../../jobsView';
+import { computeRate, conflictPolicyLabel, deriveVerifyProgress, fixActionMeta, parityKindMeta, rerunVerdictMeta } from '../../jobsView';
 import {
   useCancelVerify,
   useParityStatus,
@@ -47,6 +48,42 @@ function verifierLabel(v: Verifier | undefined): string | null {
     default:
       return null;
   }
+}
+
+/**
+ * Smoothed objects/sec from the live `scanned` count. Resets when the scan
+ * stops/restarts (scanned drops or goes undefined). Returns a display string
+ * ("—/s" until a second forward sample) so the running UI reads as alive.
+ */
+function useObjRate(scanned: number | undefined): string {
+  const prev = useRef<{ scanned: number; ts: number; rate: number | null }>({
+    scanned: 0,
+    ts: 0,
+    rate: null,
+  });
+  const [rate, setRate] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (scanned == null) {
+      prev.current = { scanned: 0, ts: 0, rate: null };
+      setRate(null);
+      return;
+    }
+    const now = Date.now();
+    const p = prev.current;
+    if (scanned < p.scanned || p.ts === 0) {
+      // fresh scan (or first sample) — seed, no rate yet
+      prev.current = { scanned, ts: now, rate: null };
+      setRate(null);
+      return;
+    }
+    const next = computeRate(p.rate, p.scanned, p.ts, scanned, now);
+    prev.current = { scanned, ts: now, rate: next };
+    setRate(next);
+  }, [scanned]);
+
+  if (rate == null || rate <= 0) return '—/s';
+  return `~${rate < 10 ? rate.toFixed(1) : Math.round(rate).toLocaleString()}/s`;
 }
 
 /** Severity drives the halo + headline color: clean → green, mismatch → red, else amber. */
@@ -89,6 +126,7 @@ export default function VerifyTab({ ruleName }: Props) {
         c={c}
         label={cancelling ? 'Cancelling…' : 'Comparing source and destination…'}
         scanned={s?.progress_scanned}
+        total={s?.progress_total}
         onCancel={cancelling ? undefined : onCancel}
       />
     );
@@ -170,6 +208,7 @@ export default function VerifyTab({ ruleName }: Props) {
       outcome={outcome}
       reverifying={running}
       reverifyScanned={running ? s?.progress_scanned : undefined}
+      reverifyTotal={running ? s?.progress_total : undefined}
       onReverify={run}
       onCancelReverify={cancelling ? undefined : onCancel}
       onRunNow={onRunNow}
@@ -189,14 +228,18 @@ function LoadingBlock({
   c,
   label = 'Comparing source and destination…',
   scanned,
+  total,
   onCancel,
 }: {
   c: ReturnType<typeof useColors>;
   label?: string;
   scanned?: number;
+  total?: number;
   /** When provided, shows a Cancel button (a running audit). */
   onCancel?: () => void;
 }) {
+  const rate = useObjRate(scanned);
+  const prog = deriveVerifyProgress(scanned ?? 0, total);
   return (
     <div style={{ padding: '4px 2px' }}>
       <div
@@ -247,7 +290,7 @@ function LoadingBlock({
           {label}
         </div>
 
-        {/* Live scanned count — the anchor while it runs. */}
+        {/* Live scanned count + rate — the anchor while it runs. */}
         <div
           style={{
             fontSize: 13,
@@ -257,11 +300,14 @@ function LoadingBlock({
           }}
         >
           {scanned != null && scanned > 0
-            ? `${scanned.toLocaleString()} objects scanned`
+            ? prog.determinate
+              ? `${scanned.toLocaleString()} of ${total!.toLocaleString()} · ${rate}`
+              : `${scanned.toLocaleString()} objects scanned · ${rate}`
             : 'Starting scan…'}
         </div>
 
-        {/* Indeterminate progress bar (no known total from the server). */}
+        {/* Progress bar: determinate once the server publishes the total, else
+            an indeterminate marquee (during listing). */}
         <div
           style={{
             position: 'relative',
@@ -273,7 +319,23 @@ function LoadingBlock({
             overflow: 'hidden',
           }}
         >
-          <span className="dg-verify-bar" style={{ background: c.ACCENT_BLUE }} aria-hidden />
+          {prog.determinate ? (
+            <span
+              style={{
+                position: 'absolute',
+                top: 0,
+                left: 0,
+                height: '100%',
+                width: `${prog.percent}%`,
+                borderRadius: 999,
+                background: c.ACCENT_BLUE,
+                transition: 'width 0.4s ease',
+              }}
+              aria-hidden
+            />
+          ) : (
+            <span className="dg-verify-bar" style={{ background: c.ACCENT_BLUE }} aria-hidden />
+          )}
         </div>
 
         <Text type="secondary" style={{ display: 'block', fontSize: 11.5, color: c.TEXT_MUTED, marginTop: 16 }}>
@@ -327,6 +389,7 @@ export function ParityResult({
   outcome,
   reverifying,
   reverifyScanned,
+  reverifyTotal,
   onReverify,
   onCancelReverify,
   onRunNow,
@@ -338,6 +401,8 @@ export function ParityResult({
   reverifying?: boolean;
   /** Live objects-scanned of the in-flight re-verify (for the badge). */
   reverifyScanned?: number;
+  /** Compare-phase denominator of the in-flight re-verify (determinate bar). */
+  reverifyTotal?: number;
   onReverify: () => void;
   /** Cancel the in-flight re-verify. Omitted (or while cancelling) = no button. */
   onCancelReverify?: () => void;
@@ -348,6 +413,9 @@ export function ParityResult({
 }) {
   const tone = toneFor(outcome);
   const inSync = outcome.in_sync;
+  // PureMirror proved a verbatim byte-copy from the listing (stored size+etag,
+  // no downloads); Transforming compared the logical SHA via HEAD.
+  const pure = outcome.regime === 'pure_mirror';
 
   const haloColor =
     tone === 'green' ? c.ACCENT_GREEN : tone === 'red' ? c.ACCENT_RED : c.ACCENT_AMBER;
@@ -375,6 +443,7 @@ export function ParityResult({
         <ReverifyBanner
           c={c}
           scanned={reverifyScanned}
+          total={reverifyTotal}
           onCancel={onCancelReverify}
           since={scannedDate}
         />
@@ -445,7 +514,7 @@ export function ParityResult({
             <span style={{ color: haloColor, fontWeight: 700 }}>
               {outcome.matched.toLocaleString()}
             </span>{' '}
-            objects match by checksum. No missing files, no extras.
+            objects {pure ? 'are exact copies (same stored size + etag)' : 'match by checksum'}. No missing files, no extras.
           </div>
         ) : (
           <div style={{ fontSize: 14, color: c.TEXT_SECONDARY, lineHeight: 1.55, maxWidth: 460, margin: '0 auto' }}>
@@ -491,7 +560,10 @@ export function ParityResult({
           style={{ fontSize: 12, color: c.TEXT_MUTED, marginTop: 18 }}
           title={`Scanned at ${scannedAbsolute}`}
         >
-          Checked {timeAgo(scannedDate)} · logical SHA-256 + size, from metadata
+          Checked {timeAgo(scannedDate)} ·{' '}
+          {pure
+            ? 'exact-copy check: stored size + etag from listing — no downloads'
+            : 'logical SHA-256 + size, from metadata'}
         </div>
 
         {/* Re-verify control lives here only when idle; while running, the
@@ -566,14 +638,18 @@ export function ParityResult({
 function ReverifyBanner({
   c,
   scanned,
+  total,
   onCancel,
   since,
 }: {
   c: ReturnType<typeof useColors>;
   scanned?: number;
+  total?: number;
   onCancel?: () => void;
   since: Date;
 }) {
+  const rate = useObjRate(scanned);
+  const prog = deriveVerifyProgress(scanned ?? 0, total);
   return (
     <div
       role="status"
@@ -596,7 +672,9 @@ function ReverifyBanner({
         </Text>
         <Text type="secondary" style={{ fontSize: 12.5, color: c.TEXT_MUTED }}>
           {scanned != null && scanned > 0
-            ? `${scanned.toLocaleString()} objects scanned · `
+            ? prog.determinate
+              ? `${scanned.toLocaleString()} of ${total!.toLocaleString()} · ${rate} · `
+              : `${scanned.toLocaleString()} objects scanned · ${rate} · `
             : ''}
           recomputing — the result below is from {timeAgo(since)} and is being refreshed.
         </Text>
