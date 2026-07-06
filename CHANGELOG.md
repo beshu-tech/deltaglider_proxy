@@ -4,6 +4,31 @@
 
 ## v1.12.0 — 2026-07-06
 
+Verifying a replication mirror now shows real motion, and a pure 1:1 mirror
+verifies without downloading anything.
+
+### Added
+
+- **Verify shows live progress.** While a parity recompute runs, the panel now
+  shows a scanned-object count that ticks steadily plus an objects/sec rate, and
+  a determinate progress bar once the total is known — instead of a spinner that
+  gave no sense of movement.
+- **Pure mirrors verify with zero downloads.** When source and destination use
+  the same encryption and compression (a plain 1:1 mirror), Verify now compares
+  the stored object size and etag straight from the bucket listing — no
+  per-object metadata fetches. The verdict reads honestly as "exact copies (same
+  stored size + etag)", and the footnote says the check used the listing, not a
+  checksum download.
+
+### Changed
+
+- **Verify picks its strategy per rule.** A mirror that re-encrypts,
+  re-compresses, or re-deltas at the destination (so the stored bytes
+  legitimately differ) still uses the full logical-checksum comparison — that
+  path is unchanged. Only genuine byte-for-byte mirrors take the cheap
+  listing-only path, so an encrypted or transformed destination is never falsely
+  flagged as mismatched.
+
 ## v1.11.0 — 2026-07-05
 
 The bucket list never lies about what exists when a backend is unreachable.
