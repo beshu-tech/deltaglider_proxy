@@ -563,9 +563,11 @@ impl s3s::S3 for DeltaGliderS3Service {
         req: s3s::S3Request<s3s::dto::CreateBucketInput>,
     ) -> s3s::S3Result<s3s::S3Response<s3s::dto::CreateBucketOutput>> {
         let bucket = req.input.bucket;
-        // A client must not (re)create a replication mirror's bucket.
-        crate::api::handlers::object_helpers::check_client_write_allowed(&self.state, &bucket)
-            .map_err(engine_error_to_s3s)?;
+        // NOTE: CreateBucket is deliberately NOT gated by the
+        // replication_target_only marker — an empty destination bucket must be
+        // creatable (that's how a replication target is bootstrapped). The
+        // marker gates OBJECT writes and bucket DELETION; a bare CreateBucket
+        // corrupts nothing (an existing bucket returns BucketAlreadyOwnedByYou).
         self.state
             .engine
             .load()

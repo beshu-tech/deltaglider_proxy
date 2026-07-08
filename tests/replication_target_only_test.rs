@@ -183,6 +183,23 @@ async fn test_marked_bucket_rejects_client_writes_replication_still_works() {
         .send()
         .await
         .expect("copy OUT of marked bucket must succeed");
+
+    // 9. DeleteBucket on the marked bucket → 403 (destroying a replication
+    //    destination is a client write). CreateBucket, by contrast, is allowed
+    //    — an empty destination must be bootstrappable.
+    let err = client
+        .delete_bucket()
+        .bucket("rto-dst")
+        .send()
+        .await
+        .expect_err("DeleteBucket on marked bucket must fail");
+    assert_access_denied(&err, "DeleteBucket");
+    client
+        .create_bucket()
+        .bucket("rto-dst")
+        .send()
+        .await
+        .expect("CreateBucket on an existing marked bucket must be allowed");
 }
 
 #[tokio::test]
