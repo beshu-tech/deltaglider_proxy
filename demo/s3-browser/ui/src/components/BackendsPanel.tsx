@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { LinkifiedText } from './LinkifiedText';
+import { CAPABILITY_DOC_URL } from '../linkifyDocUrl';
 import { useQueryClient } from '@tanstack/react-query';
 import { qk } from '../queries/keys';
 import { Button, Input, Modal, Radio, Switch, Typography, Space, Alert, Spin } from 'antd';
@@ -417,7 +418,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                 <Alert
                   type="success"
                   showIcon
-                  message={`Conditional writes: verified (${b.capability.via === 'probe' ? 'live probe' : 'witness cache'}) — safe for multi-instance client writes`}
+                  message="Conditional writes: verified by live probe — safe for multi-instance client writes"
                   style={{ marginTop: 8, borderRadius: 6 }}
                 />
               )}
@@ -431,8 +432,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                       text={
                         'This backend cannot host the coordination bucket or multi-instance ' +
                         'client-writable buckets. It remains a safe replication target: mark its ' +
-                        'buckets replication_target_only. — see ' +
-                        'https://deltaglider.com/docs/how-to/backend-capability-validation'
+                        `buckets replication_target_only. — see ${CAPABILITY_DOC_URL}`
                       }
                     />
                   }
@@ -446,7 +446,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                   message="Conditional-write support could not be verified"
                   description={
                     <LinkifiedText
-                      text={`${b.capability.reason} — multi-instance write safety is unproven on this backend. See https://deltaglider.com/docs/how-to/backend-capability-validation`}
+                      text={`${b.capability.reason} — multi-instance write safety is unproven on this backend. See ${CAPABILITY_DOC_URL}`}
                     />
                   }
                   style={{ marginTop: 8, borderRadius: 6 }}

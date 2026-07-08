@@ -1253,7 +1253,9 @@ impl StorageBackend for S3Backend {
             .list_buckets()
             .send()
             .await
-            .map_err(|e| StorageError::S3(format!("list_buckets failed: {}", e)))?;
+            // classify (not a bare S3(...)) so a 503 throttle surfaces as
+            // Throttled → SlowDown, not a retry-storm-inducing 500.
+            .map_err(|e| Self::classify_s3_error("", &e, S3Op::Other("list_buckets")))?;
 
         let mut buckets: Vec<(String, DateTime<Utc>)> = response
             .buckets()

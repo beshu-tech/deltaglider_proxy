@@ -11,6 +11,10 @@ export interface LinkSegment {
   href?: string;
 }
 
+/** The one capability-boundary doc anchor (mirrors Rust CAPABILITY_DOC_URL). */
+export const CAPABILITY_DOC_URL =
+  'https://deltaglider.com/docs/how-to/backend-capability-validation';
+
 const DOCS_URL_RE = /^https:\/\/(?:www\.)?deltaglider\.com\/docs\/([A-Za-z0-9/_.-]+)$/;
 
 /** deltaglider.com/docs/<path> → in-app docs route (`/_/docs/<flattened-id>`),

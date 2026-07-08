@@ -97,8 +97,11 @@ export default function Sidebar({
         setBuckets(list);
         onBucketsChanged?.(list.length);
         if (list.length > 0 && !list.some((b) => b.name === getBucket())) {
-          setBucket(list[0].name);
-          onBucketChange(list[0].name);
+          // Never auto-select an unavailable placeholder — it would drive the
+          // object pane at a dead backend.
+          const firstLive = list.find((b) => !b.unavailable) ?? list[0];
+          setBucket(firstLive.name);
+          onBucketChange(firstLive.name);
         }
         if (list.length === 0 && getBucket()) {
           setBucket('');
@@ -309,6 +312,9 @@ export default function Sidebar({
             <div style={{ color: TEXT_SECONDARY, marginBottom: 8, wordBreak: 'break-word' }}>
               A storage backend may be unavailable or rate-limiting requests.
               This is not the same as having no buckets — nothing has been created or deleted.
+            </div>
+            <div style={{ color: TEXT_SECONDARY, marginBottom: 8, wordBreak: 'break-word', opacity: 0.8 }}>
+              {loadError}
             </div>
             <Button size="small" onClick={() => { setLoadError(null); setReloadSignal((n) => n + 1); }}>
               Retry

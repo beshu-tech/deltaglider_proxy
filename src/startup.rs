@@ -1383,12 +1383,11 @@ pub async fn validate_backend_write_capability(
             ),
             CapabilityVerdict::NonCas => {
                 error!(
-                    "FATAL: backend '{name}' does not support conditional writes, but \
-                     client-writable bucket(s) {:?} route to it and multi-instance mode is \
-                     active (config_sync_bucket is set). Concurrent writes from two instances \
-                     can corrupt delta references. Fix: move these buckets to a CAS-capable \
-                     backend, or mark each as replication_target_only. — see {CAPABILITY_DOC_URL}",
-                    group.buckets
+                    "FATAL: {}",
+                    deltaglider_proxy::coordination::capability::noncas_enforcement_message(
+                        &name,
+                        &group.buckets
+                    )
                 );
                 std::process::exit(1);
             }

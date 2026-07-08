@@ -22,7 +22,7 @@ pub struct BackendListResponse {
 #[derive(Serialize)]
 pub struct BucketBackendOriginResponse {
     pub name: String,
-    pub creation_date: String,
+    pub creation_date: Option<String>,
     pub backend_name: Option<String>,
     pub backend_type: Option<String>,
     pub backend_endpoint: Option<String>,
@@ -205,7 +205,7 @@ pub async fn list_bucket_origins(
                 .and_then(|name| backend_by_name.get(name).copied());
             BucketBackendOriginResponse {
                 name: bucket.name,
-                creation_date: bucket.creation_date.to_rfc3339(),
+                creation_date: bucket.creation_date.map(|d| d.to_rfc3339()),
                 backend_name,
                 backend_type: backend.map(|b| b.backend_type.clone()),
                 backend_endpoint: backend.and_then(|b| b.endpoint.clone()),

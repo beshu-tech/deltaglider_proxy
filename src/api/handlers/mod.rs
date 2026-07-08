@@ -66,16 +66,6 @@ pub struct AppState {
     /// every rebuild so a config reload never drops the counter.
     pub bucket_usage: Option<Arc<crate::bucket_usage::BucketUsage>>,
     pub config_db: Option<Arc<tokio::sync::Mutex<ConfigDb>>>,
-    /// Replay cache for form-POST policy signatures. Keyed on the
-    /// signature itself; value carries the policy's expiration `Instant`
-    /// (NOT the insertion time — form-POST entries need per-entry
-    /// TTLs because policy expirations vary from minutes to days) plus a
-    /// fingerprint of the (key, body) that the signature first wrote, so
-    /// an idempotent re-send of the SAME object is allowed while reuse of
-    /// the signature for a DIFFERENT key/body is still blocked.
-    /// See `enforce_form_post_replay` in `handlers/form_post.rs`.
-    pub form_post_replay:
-        Arc<dashmap::DashMap<String, crate::api::handlers::form_post::ReplayEntry>>,
     /// Per-bucket WRITE gate for maintenance jobs (re-encryption). Layered
     /// into the S3 router as middleware; admin handlers and background
     /// writers consult it explicitly. See `src/maintenance/gate.rs`.

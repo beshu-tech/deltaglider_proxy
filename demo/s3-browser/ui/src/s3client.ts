@@ -532,11 +532,16 @@ export async function listBuckets(opts?: ListBucketsOptions): Promise<BucketInfo
   const originsPromise = includeOrigins
     ? getBucketOrigins().catch(() => null)
     : Promise.resolve(null);
-  const [resp, origins] = await Promise.all([
-    sendCommand<ListBucketsCommandOutput>(new ListBucketsCommand({}), 'List buckets'),
+  // allSettled, NOT all: on a TOTAL backend failure the S3 list rejects, but
+  // the admin origins endpoint still returns the config-declared roster as
+  // unavailable placeholders — we must render those, not throw them away.
+  const [respSettled, origins] = await Promise.all([
+    sendCommand<ListBucketsCommandOutput>(new ListBucketsCommand({}), 'List buckets').then(
+      (v) => ({ ok: true as const, v }),
+      (e) => ({ ok: false as const, e }),
+    ),
     originsPromise,
   ]);
-  const originByName = new Map((origins?.buckets || []).map((b) => [b.name, b]));
   const toBackend = (o: NonNullable<typeof origins>['buckets'][number]) => ({
     backendName: o.backend_name || undefined,
     backendType: o.backend_type || undefined,
@@ -545,6 +550,20 @@ export async function listBuckets(opts?: ListBucketsOptions): Promise<BucketInfo
     backendPath: o.backend_path || undefined,
     realBucket: o.real_bucket || undefined,
   });
+  if (!respSettled.ok) {
+    const flagged = (origins?.buckets || []).filter((b) => b.unavailable);
+    if (flagged.length === 0) throw respSettled.e;
+    return flagged
+      .map((o) => ({
+        name: o.name,
+        creationDate: o.creation_date || '',
+        backend: toBackend(o),
+        unavailable: o.unavailable || undefined,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+  const resp = respSettled.v;
+  const originByName = new Map((origins?.buckets || []).map((b) => [b.name, b]));
   const s3Names = new Set((resp.Buckets || []).map((b) => b.Name || ''));
   const merged: BucketInfo[] = (resp.Buckets || []).map((b) => {
     const name = b.Name || '';

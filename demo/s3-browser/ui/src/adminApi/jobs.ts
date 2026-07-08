@@ -124,8 +124,8 @@ export interface ParityOutcome {
   /** THE signal: true iff !truncated && missing/orphan/mismatch/unverifiable all 0. */
   in_sync: boolean;
   scanned_at: number; // unix SECONDS
-  /** How parity was checked: 'pure_mirror' (verbatim copy → stored size+etag,
-   *  no downloads) vs 'transforming' (re-derived bytes → logical SHA). */
+  /** How logical facts were sourced: 'pure_mirror' (from the listing — zero
+   *  per-object reads) vs 'transforming' (HEAD-resolved). Same compare. */
   regime?: 'pure_mirror' | 'transforming';
   /** The rule's conflict policy — sets up WHY the verdicts read as they do. */
   conflict_policy: ConflictPolicy;

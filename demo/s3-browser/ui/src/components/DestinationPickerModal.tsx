@@ -39,7 +39,7 @@ export default function DestinationPickerModal({ open, mode, itemCount, onConfir
 
   useEffect(() => {
     if (open) {
-      listBuckets().then(bs => setBuckets(bs.map(b => b.name))).catch(() => {});
+      listBuckets().then(bs => setBuckets(bs.filter(b => !b.unavailable).map(b => b.name))).catch(() => {});
       setDestBucket(getBucket());
       setDestPrefix('');
     }

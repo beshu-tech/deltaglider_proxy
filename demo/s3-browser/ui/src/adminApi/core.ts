@@ -217,7 +217,7 @@ export interface BackendInfo {
 
 /** Mirror of the server's coordination::CapabilityVerdict (kebab-case tag). */
 type BackendCapabilityVerdict =
-  | { verdict: 'cas-verified'; via: 'probe' | 'witness' }
+  | { verdict: 'cas-verified'; via: 'probe' }
   | { verdict: 'non-cas' }
   | { verdict: 'unknown'; reason: string };
 

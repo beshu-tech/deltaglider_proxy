@@ -34,10 +34,19 @@ struct BucketRoute {
 ///
 /// Dispatches each storage operation to the correct underlying backend
 /// by resolving the virtual bucket name to a `(backend, real_bucket)` pair.
+/// One backend's (real_bucket, creation_date) roster.
+type BackendRoster = Vec<(String, chrono::DateTime<chrono::Utc>)>;
+/// (backend_name, listing outcome) from the parallel fan-out.
+type BackendListing = (String, Result<BackendRoster, StorageError>);
+
 pub struct RoutingBackend {
     backends: HashMap<String, Arc<Box<dyn StorageBackend>>>,
     routes: HashMap<String, BucketRoute>,
     default_backend: String,
+    /// Last successful (real_bucket, date) listing per backend — the roster
+    /// used to synthesize unavailable placeholders when that backend fails
+    /// (explicit routes alone would miss default-backend buckets).
+    last_known: parking_lot::Mutex<HashMap<String, BackendRoster>>,
 }
 
 impl RoutingBackend {
@@ -85,6 +94,7 @@ impl RoutingBackend {
             backends,
             routes,
             default_backend,
+            last_known: parking_lot::Mutex::new(HashMap::new()),
         })
     }
 
@@ -187,6 +197,42 @@ macro_rules! route_existing {
 }
 
 impl RoutingBackend {
+    /// Query every backend CONCURRENTLY, in stable name order — one dead
+    /// backend costs a single timeout, not one per backend in sequence.
+    /// Successful listings refresh the last-known-good snapshot.
+    async fn gather_listings(&self) -> Vec<BackendListing> {
+        let mut names: Vec<&String> = self.backends.keys().collect();
+        names.sort();
+        let futs = names.into_iter().map(|name| {
+            let backend = &self.backends[name];
+            async move { (name.clone(), backend.list_buckets_with_dates().await) }
+        });
+        let results = futures::future::join_all(futs).await;
+        let mut snap = self.last_known.lock();
+        for (name, res) in &results {
+            if let Ok(list) = res {
+                snap.insert(name.clone(), list.clone());
+            }
+        }
+        drop(snap);
+        results
+    }
+
+    /// Total-failure guard shared by the three listing methods: `Some(Err)`
+    /// when NO backend answered — an empty Ok would read as "zero buckets" and
+    /// render the UI's first-run empty state during a transient outage. The
+    /// aggregate is deterministic (backends already name-sorted).
+    fn total_failure_error(results: &[BackendListing]) -> Option<StorageError> {
+        if results.iter().any(|(_, r)| r.is_ok()) {
+            return None;
+        }
+        let msgs: Vec<String> = results
+            .iter()
+            .filter_map(|(n, r)| r.as_ref().err().map(|e| format!("{n}: {e}")))
+            .collect();
+        (!msgs.is_empty()).then(|| StorageError::S3(msgs.join("; ")))
+    }
+
     /// Resolve the backend an in-progress multipart upload belongs to.
     /// `MultipartUpload.backend` is the configured name stamped by
     /// `create_multipart_upload`; fall back to the default backend when it
@@ -256,92 +302,65 @@ impl StorageBackend for RoutingBackend {
 
     /// Aggregate buckets across all backends, deduplicating by virtual name.
     async fn list_buckets(&self) -> Result<Vec<String>, StorageError> {
+        // Parallel fan-out; a failing backend is logged but doesn't drop the
+        // reachable ones. Total failure → Err (see `total_failure_error`).
+        let results = self.gather_listings().await;
+        if let Some(e) = Self::total_failure_error(&results) {
+            return Err(e);
+        }
         let mut all_buckets = HashSet::new();
-
-        // Query each backend. A failing backend is logged but doesn't drop the
-        // reachable ones (partial > nothing for a listing). BUT if EVERY backend
-        // fails we must NOT return an empty Ok — that reads as "zero buckets" and
-        // renders the UI's "create your first bucket" empty state during a
-        // transient upstream outage (e.g. an S3 provider 503-throttling us).
-        // Propagate the error so the client sees a real 5xx instead.
-        let mut last_err: Option<StorageError> = None;
-        let mut any_ok = false;
-        for (backend_name, backend) in &self.backends {
-            match backend.list_buckets().await {
+        for (backend_name, res) in &results {
+            match res {
                 Ok(buckets) => {
-                    any_ok = true;
-                    for real_bucket in buckets {
+                    for (real_bucket, _) in buckets {
                         let virtual_name =
-                            self.listed_bucket_virtual_name(backend_name, &real_bucket);
+                            self.listed_bucket_virtual_name(backend_name, real_bucket);
                         if Self::is_listing_plumbing(&virtual_name) {
                             continue;
                         }
                         all_buckets.insert(virtual_name);
                     }
                 }
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to list buckets from backend '{}': {} — results may be incomplete",
-                        backend_name,
-                        e
-                    );
-                    last_err = Some(e);
-                }
+                Err(e) => tracing::error!(
+                    "Failed to list buckets from backend '{}': {} — results may be incomplete",
+                    backend_name,
+                    e
+                ),
             }
         }
-        if !any_ok {
-            if let Some(e) = last_err {
-                return Err(e);
-            }
-        }
-
         let mut result: Vec<String> = all_buckets.into_iter().collect();
         result.sort();
         Ok(result)
     }
 
     /// Aggregate buckets with dates across all backends.
-    /// Queries backends first to get real dates, then adds routed virtual
-    /// names (with current time) only if they weren't already found.
     async fn list_buckets_with_dates(
         &self,
     ) -> Result<Vec<(String, chrono::DateTime<chrono::Utc>)>, StorageError> {
+        let results = self.gather_listings().await;
+        if let Some(e) = Self::total_failure_error(&results) {
+            return Err(e);
+        }
         let mut all_buckets: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
-
-        // Query backends first — real dates take precedence. As in
-        // `list_buckets`: total failure returns Err (not an empty Ok that reads
-        // as "zero buckets" and empties the UI during an upstream outage).
-        let mut last_err: Option<StorageError> = None;
-        let mut any_ok = false;
-        for (backend_name, backend) in &self.backends {
-            match backend.list_buckets_with_dates().await {
+        for (backend_name, res) in &results {
+            match res {
                 Ok(buckets) => {
-                    any_ok = true;
                     for (real_bucket, date) in buckets {
                         let virtual_name =
-                            self.listed_bucket_virtual_name(backend_name, &real_bucket);
+                            self.listed_bucket_virtual_name(backend_name, real_bucket);
                         if Self::is_listing_plumbing(&virtual_name) {
                             continue;
                         }
-                        all_buckets.entry(virtual_name).or_insert(date);
+                        all_buckets.entry(virtual_name).or_insert(*date);
                     }
                 }
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to list buckets from backend '{}': {} — results may be incomplete",
-                        backend_name,
-                        e
-                    );
-                    last_err = Some(e);
-                }
+                Err(e) => tracing::error!(
+                    "Failed to list buckets from backend '{}': {} — results may be incomplete",
+                    backend_name,
+                    e
+                ),
             }
         }
-        if !any_ok {
-            if let Some(e) = last_err {
-                return Err(e);
-            }
-        }
-
         let mut result: Vec<_> = all_buckets.into_iter().collect();
         result.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(result)
@@ -351,40 +370,35 @@ impl StorageBackend for RoutingBackend {
     /// produced each visible bucket. This is used by the admin UI to display
     /// compact provider badges without changing S3-compatible XML semantics.
     async fn list_bucket_origins(&self) -> Result<Vec<BucketListing>, StorageError> {
+        let results = self.gather_listings().await;
         let mut candidates: Vec<(String, u8, String, BucketListing)> = Vec::new();
-
-        // Same total-failure guard as list_buckets: don't return an empty Ok
-        // when every backend errored (empties the admin buckets panel on a
-        // transient upstream outage).
-        let mut last_err: Option<StorageError> = None;
         let mut any_ok = false;
-        for (backend_name, backend) in &self.backends {
-            match backend.list_buckets_with_dates().await {
+        for (backend_name, res) in &results {
+            match res {
                 Ok(buckets) => {
                     any_ok = true;
                     for (real_bucket, creation_date) in buckets {
                         let virtual_name =
-                            self.listed_bucket_virtual_name(backend_name, &real_bucket);
+                            self.listed_bucket_virtual_name(backend_name, real_bucket);
                         if Self::is_listing_plumbing(&virtual_name) {
                             continue;
                         }
-                        let priority = if self.reverse_lookup(backend_name, &real_bucket).is_some()
-                        {
+                        let priority = if self.reverse_lookup(backend_name, real_bucket).is_some() {
                             0
                         } else if backend_name == &self.default_backend {
                             1
                         } else {
                             2
                         };
-                        let real_bucket_alias =
-                            (real_bucket != virtual_name).then_some(real_bucket);
+                        let real_bucket_alias = (real_bucket.as_str() != virtual_name.as_str())
+                            .then(|| real_bucket.clone());
                         candidates.push((
                             virtual_name.clone(),
                             priority,
                             backend_name.clone(),
                             BucketListing {
                                 name: virtual_name,
-                                creation_date,
+                                creation_date: Some(*creation_date),
                                 backend_name: Some(backend_name.clone()),
                                 real_bucket: real_bucket_alias,
                                 unavailable: None,
@@ -398,18 +412,31 @@ impl StorageBackend for RoutingBackend {
                         backend_name,
                         e
                     );
-                    // Don't DROP this backend's buckets — that hides them and
-                    // reads as "these buckets vanished". Emit the CONFIG-DECLARED
-                    // buckets routed to this backend as placeholders flagged
-                    // unavailable, carrying the verbatim origin error. Priority 3
-                    // (below any live listing) so a backend that recovers within
-                    // the same call still wins the dedup.
+                    // Don't DROP this backend's buckets — synthesize placeholders
+                    // flagged unavailable (verbatim origin error), from the union
+                    // of CONFIG routes and the LAST-KNOWN-GOOD listing (routes
+                    // alone miss default-backend buckets). Priority 3 so a live
+                    // listing always wins the dedup; no fabricated date.
                     let origin = e.to_string();
+                    let mut push = |virtual_name: String, real_alias: Option<String>| {
+                        if Self::is_listing_plumbing(&virtual_name) {
+                            return;
+                        }
+                        candidates.push((
+                            virtual_name.clone(),
+                            3,
+                            backend_name.clone(),
+                            BucketListing {
+                                name: virtual_name,
+                                creation_date: None,
+                                backend_name: Some(backend_name.clone()),
+                                real_bucket: real_alias,
+                                unavailable: Some(origin.clone()),
+                            },
+                        ));
+                    };
                     for (virtual_name, route) in &self.routes {
                         if route.backend_name != *backend_name {
-                            continue;
-                        }
-                        if Self::is_listing_plumbing(virtual_name) {
                             continue;
                         }
                         let real_alias = route
@@ -417,27 +444,23 @@ impl StorageBackend for RoutingBackend {
                             .as_ref()
                             .filter(|rb| rb.as_str() != virtual_name.as_str())
                             .cloned();
-                        candidates.push((
-                            virtual_name.clone(),
-                            3,
-                            backend_name.clone(),
-                            BucketListing {
-                                name: virtual_name.clone(),
-                                creation_date: chrono::Utc::now(),
-                                backend_name: Some(backend_name.clone()),
-                                real_bucket: real_alias,
-                                unavailable: Some(origin.clone()),
-                            },
-                        ));
+                        push(virtual_name.clone(), real_alias);
                     }
-                    last_err = Some(e);
+                    let snapshot = self.last_known.lock().get(backend_name).cloned();
+                    for (real_bucket, _) in snapshot.unwrap_or_default() {
+                        let virtual_name =
+                            self.listed_bucket_virtual_name(backend_name, &real_bucket);
+                        let real_alias = (real_bucket.as_str() != virtual_name.as_str())
+                            .then(|| real_bucket.clone());
+                        push(virtual_name, real_alias);
+                    }
                 }
             }
         }
         if !any_ok && candidates.is_empty() {
-            // Nothing reachable AND nothing config-declared to show → surface
-            // the error rather than an empty list.
-            if let Some(e) = last_err {
+            // Nothing reachable AND nothing declared/remembered → surface the
+            // aggregate error rather than an empty list.
+            if let Some(e) = Self::total_failure_error(&results) {
                 return Err(e);
             }
         }
@@ -904,8 +927,8 @@ mod tests {
         buckets: Arc<StdMutex<HashSet<String>>>,
         create_calls: Arc<StdMutex<Vec<String>>>,
         /// When true, list_buckets(_with_dates) returns an error — models an
-        /// upstream backend 503-ing so the total-failure guard can be tested.
-        fail_list: bool,
+        /// upstream backend 503-ing. Shared so a test can flip it mid-test.
+        fail_list: Arc<StdMutex<bool>>,
     }
 
     impl TestBackend {
@@ -915,13 +938,13 @@ mod tests {
                     buckets.iter().map(|b| b.to_string()).collect(),
                 )),
                 create_calls: Arc::new(StdMutex::new(Vec::new())),
-                fail_list: false,
+                fail_list: Arc::new(StdMutex::new(false)),
             }
         }
 
         fn failing() -> Self {
-            let mut b = Self::with_buckets(&[]);
-            b.fail_list = true;
+            let b = Self::with_buckets(&[]);
+            *b.fail_list.lock().unwrap() = true;
             b
         }
 
@@ -947,7 +970,7 @@ mod tests {
         }
 
         async fn list_buckets(&self) -> Result<Vec<String>, StorageError> {
-            if self.fail_list {
+            if *self.fail_list.lock().unwrap() {
                 return Err(StorageError::S3("simulated backend outage".into()));
             }
             Ok(self.buckets.lock().unwrap().iter().cloned().collect())
@@ -1169,6 +1192,7 @@ mod tests {
             backends: HashMap::new(),
             routes,
             default_backend: "primary".to_string(),
+            last_known: parking_lot::Mutex::new(HashMap::new()),
         };
 
         assert_eq!(
@@ -1292,6 +1316,42 @@ mod tests {
             Some("real-mirror-b"),
             "alias preserved on the unavailable placeholder"
         );
+    }
+
+    /// H1 regression: an UNROUTED bucket (no explicit `backend:` policy — the
+    /// common default-backend case) must survive its backend's outage via the
+    /// last-known-good snapshot, flagged unavailable — not silently vanish.
+    #[tokio::test]
+    async fn failed_backend_keeps_last_known_unrouted_buckets_as_unavailable() {
+        let flaky = TestBackend::with_buckets(&["unrouted-data"]);
+        let flip = flaky.fail_list.clone();
+        let mut backends = HashMap::new();
+        backends.insert(
+            "up".to_string(),
+            Arc::new(Box::new(TestBackend::with_buckets(&["alive"])) as Box<dyn StorageBackend>),
+        );
+        backends.insert(
+            "flaky".to_string(),
+            Arc::new(Box::new(flaky) as Box<dyn StorageBackend>),
+        );
+        let routing = RoutingBackend::new(backends, HashMap::new(), "up".to_string())
+            .expect("routing backend");
+
+        // First listing succeeds → populates the last-known-good snapshot.
+        let origins = routing.list_bucket_origins().await.expect("ok");
+        assert!(origins
+            .iter()
+            .any(|b| b.name == "unrouted-data" && b.unavailable.is_none()));
+
+        // Backend goes dark → the bucket is still listed, flagged, undated.
+        *flip.lock().unwrap() = true;
+        let origins = routing.list_bucket_origins().await.expect("ok");
+        let b = origins
+            .iter()
+            .find(|b| b.name == "unrouted-data")
+            .expect("unrouted bucket must survive the outage");
+        assert!(b.unavailable.as_deref().unwrap_or("").contains("simulated"));
+        assert!(b.creation_date.is_none(), "no fabricated date");
     }
 
     /// The complement: a PARTIAL failure (one backend up, one down) still

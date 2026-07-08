@@ -105,24 +105,29 @@ impl ParityProgress<'_> {
         Ok(())
     }
 
-    /// Publish the compare-phase denominator once listing finishes (best-effort;
-    /// a failed write just leaves the bar indeterminate).
+    /// Publish the denominator once it's known (best-effort; a failed write
+    /// just leaves the bar indeterminate).
     async fn set_total(&self, total: u64) {
         let now = super::current_unix_seconds();
         let db = self.db.lock().await;
         let _ = db.parity_result_set_total(self.rule, total as i64, now);
     }
+
+    /// Best-effort write of the running objects-examined counter.
+    async fn flush_scanned(&self, scanned: u64) {
+        let db = self.db.lock().await;
+        let now = super::current_unix_seconds();
+        let _ = db.parity_result_progress(self.rule, scanned as i64, now);
+    }
 }
 
-/// Which comparison regime a rule runs in — the plan's core split.
+/// Which comparison regime a rule runs in.
 ///
-/// `PureMirror`: dest is a byte-identical verbatim copy (same compression, both
-/// sides' lite list is trustworthy → plaintext, non-encrypting). We compare the
-/// STORED blob size+etag straight from the lite list — ZERO HEADs.
-///
-/// `Transforming`: dest bytes are re-derived (re-encrypt / compression change /
-/// re-delta), so stored size legitimately differs; only the logical SHA is
-/// faithful → the existing HEAD-burst compare.
+/// `PureMirror`: both sides' lite list carries LOGICAL facts (filesystem xattr —
+/// sha256/size/etag inline), so the same `compare_pair` runs on lite data with
+/// ZERO HEADs. `Transforming`: at least one side's lite list is untrustworthy
+/// (S3 / encrypting → ciphertext size/etag), so logical facts are HEAD-resolved
+/// first. The COMPARE is identical either way — only the resolution path differs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Regime {
@@ -136,18 +141,10 @@ fn default_regime() -> Regime {
     Regime::Transforming
 }
 
-/// PURE classifier. `PureMirror` only when BOTH sides carry trustworthy lite
-/// facts (plaintext, non-encrypting, ownership-in-list) AND compression matches
-/// — else any stored-size/etag compare would false-flag correct mirrors.
-/// A single signal (`lite_list_carries_logical_facts`) already subsumes
-/// "encrypting" and "S3 without metadata"; compression parity is the one extra.
-pub fn classify_regime(
-    src_lite_authoritative: bool,
-    dst_lite_authoritative: bool,
-    src_compression: bool,
-    dst_compression: bool,
-) -> Regime {
-    if src_lite_authoritative && dst_lite_authoritative && src_compression == dst_compression {
+/// PURE classifier: `PureMirror` iff BOTH sides carry trustworthy lite facts.
+/// The compare is logical, so compression settings don't affect its validity.
+pub fn classify_regime(src_lite_authoritative: bool, dst_lite_authoritative: bool) -> Regime {
+    if src_lite_authoritative && dst_lite_authoritative {
         Regime::PureMirror
     } else {
         Regime::Transforming
@@ -171,10 +168,6 @@ pub struct ObjState {
     pub sha256: Option<String>,
     /// Logical (hydrated) size in bytes.
     pub size: u64,
-    /// STORED (physical) blob size — `delta_size` for a delta, else `file_size`.
-    /// Immune to the file_size cache-correction; used ONLY by the PureMirror
-    /// compare, where dest bytes are verbatim so stored size+etag IS the proof.
-    pub stored_size: u64,
     /// `multipart_etag` if present, else `md5` if present (inline — there is
     /// no `FileMetadata::etag()` accessor).
     pub etag: Option<String>,
@@ -210,7 +203,6 @@ impl ObjState {
         ObjState {
             sha256,
             size: m.file_size,
-            stored_size: m.stored_size(),
             etag,
             multipart_parts,
             created_at: Some(m.created_at.timestamp_millis()),
@@ -333,50 +325,6 @@ pub fn compare_pair(
     )
 }
 
-/// PURE compare for the `PureMirror` regime: the dest blob is a verbatim copy,
-/// so equal STORED size + equal stored etag proves a byte-identical mirror with
-/// zero HEADs. (S3 etag = content MD5 for a single-part object.) A stored-size
-/// difference means the object was NOT verbatim-shipped (a re-delta) — flag it
-/// for a logical HEAD rather than asserting a mismatch.
-pub fn compare_pair_stored(
-    src: &ObjState,
-    dst: &ObjState,
-) -> (FindingKind, Option<Verifier>, bool, String) {
-    if src.stored_size != dst.stored_size {
-        // Not a verbatim copy — caller HEADs this key for a logical verdict.
-        return (
-            FindingKind::ChecksumMismatch,
-            None,
-            true,
-            format!(
-                "stored size differs (src {} vs dst {}) — re-delta, needs checksum",
-                src.stored_size, dst.stored_size
-            ),
-        );
-    }
-    match (&src.etag, &dst.etag) {
-        (Some(se), Some(de)) if se == de => (
-            FindingKind::Match,
-            Some(Verifier::EtagSize),
-            false,
-            "exact copy — stored size + etag match".to_string(),
-        ),
-        (Some(_), Some(_)) => (
-            FindingKind::ChecksumMismatch,
-            Some(Verifier::EtagSize),
-            false,
-            "stored etag differs at equal size".to_string(),
-        ),
-        // Equal stored size, etag missing a side → size-only proof.
-        _ => (
-            FindingKind::Match,
-            Some(Verifier::SizeOnly),
-            true,
-            "matched on stored size only".to_string(),
-        ),
-    }
-}
-
 /// Exact diff counts plus bounded per-category sample vecs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParityDiff {
@@ -396,7 +344,6 @@ pub struct ParityDiff {
 pub fn diff_parity(
     source: &BTreeMap<String, ObjState>,
     dest: &BTreeMap<String, ObjState>,
-    regime: Regime,
 ) -> ParityDiff {
     let mut out = ParityDiff::default();
     let mut s = source.iter().peekable();
@@ -407,12 +354,7 @@ pub fn diff_parity(
             (Some((sk, sv)), Some((dk, dv))) => {
                 match sk.cmp(dk) {
                     std::cmp::Ordering::Equal => {
-                        // PureMirror compares STORED size+etag (no HEAD ran);
-                        // Transforming compares logical sha/etag/size.
-                        let (kind, verifier, unverifiable, detail) = match regime {
-                            Regime::PureMirror => compare_pair_stored(sv, dv),
-                            Regime::Transforming => compare_pair(sv, dv),
-                        };
+                        let (kind, verifier, unverifiable, detail) = compare_pair(sv, dv);
                         match kind {
                             FindingKind::Match => {
                                 out.matched += 1;
@@ -641,10 +583,10 @@ pub struct ParityOutcome {
     /// The signal: strict — `unverifiable` counts against it.
     pub in_sync: bool,
     pub scanned_at: i64,
-    /// How parity was checked: `pure_mirror` (verbatim copy → stored size+etag,
-    /// no downloads) vs `transforming` (re-derived bytes → logical SHA HEAD).
-    /// Drives the honest provenance footnote. Defaults to `transforming` for
-    /// outcomes serialized before this field existed.
+    /// How logical facts were sourced: `pure_mirror` (from the listing — zero
+    /// HEADs) vs `transforming` (cache-first HEAD resolution). Same compare
+    /// either way; drives the provenance footnote. Defaults to `transforming`
+    /// for outcomes serialized before this field existed.
     #[serde(default = "default_regime")]
     pub regime: Regime,
     /// The rule's conflict policy — sets up WHY the verdicts read as they do.
@@ -738,6 +680,8 @@ async fn resolve_logical(
     raw_keys: &[String],
     source: &mut BTreeMap<String, ObjState>,
     failures: Option<&tokio::sync::Mutex<ConfigDb>>,
+    progress: Option<&ParityProgress<'_>>,
+    progress_base: u64,
 ) -> usize {
     if raw_keys.is_empty() {
         return 0;
@@ -759,7 +703,12 @@ async fn resolve_logical(
             _ => miss_raw.push(raw),
         }
     }
-    let fresh = head_burst(engine, bucket, &miss_raw).await;
+    // Cache hits resolve instantly — count them before the burst starts.
+    let hits = (raw_keys.len() - miss_raw.len()) as u64;
+    if let Some(p) = progress {
+        p.flush_scanned(progress_base + hits).await;
+    }
+    let fresh = head_burst(engine, bucket, &miss_raw, progress, progress_base + hits).await;
     let mut to_cache: Vec<(String, ParityCacheEntry)> = Vec::new();
     let mut unresolved = 0usize;
     for (raw, outcome) in fresh {
@@ -793,6 +742,7 @@ async fn resolve_logical(
 /// Dest-side logical resolution: dest is keyed by its own raw key (== cache key).
 /// Returns the count of keys left UNRESOLVED by a transient HEAD (see
 /// `resolve_logical`). A non-zero count makes the audit partial.
+#[allow(clippy::too_many_arguments)]
 async fn resolve_logical_dest(
     engine: &DynEngine,
     rule: &ReplicationRule,
@@ -800,6 +750,8 @@ async fn resolve_logical_dest(
     raw_keys: &[String],
     dest: &mut BTreeMap<String, ObjState>,
     failures: Option<&tokio::sync::Mutex<ConfigDb>>,
+    progress: Option<&ParityProgress<'_>>,
+    progress_base: u64,
 ) -> usize {
     if raw_keys.is_empty() {
         return 0;
@@ -827,7 +779,12 @@ async fn resolve_logical_dest(
             _ => miss.push(k),
         }
     }
-    let fresh = head_burst(engine, bucket, &miss).await;
+    // Cache hits resolve instantly — count them before the burst starts.
+    let hits = (raw_keys.len() - miss.len()) as u64;
+    if let Some(p) = progress {
+        p.flush_scanned(progress_base + hits).await;
+    }
+    let fresh = head_burst(engine, bucket, &miss, progress, progress_base + hits).await;
     let mut to_cache: Vec<(String, ParityCacheEntry)> = Vec::new();
     let mut unresolved = 0usize;
     for (k, outcome) in fresh {
@@ -872,15 +829,20 @@ enum HeadOutcome {
 
 /// Bounded-concurrent HEAD burst (the cache-miss path). Returns per-key
 /// outcomes so a transient failure is distinguishable from a raced delete.
+/// Flushes running progress (`base` + completed) so the count keeps moving
+/// through a long burst instead of freezing at the end-of-listing value.
 async fn head_burst(
     engine: &DynEngine,
     bucket: &str,
     keys: &[&String],
+    progress: Option<&ParityProgress<'_>>,
+    base: u64,
 ) -> Vec<(String, HeadOutcome)> {
     use futures::stream::StreamExt;
     const HEAD_CONCURRENCY: usize = 50;
+    const FLUSH_EVERY_N_HEADS: usize = 500;
     let owned: Vec<String> = keys.iter().map(|k| (*k).clone()).collect();
-    futures::stream::iter(owned.into_iter().map(|key| async move {
+    let mut stream = futures::stream::iter(owned.into_iter().map(|key| async move {
         let outcome = match engine.head(bucket, &key).await {
             Ok(m) => HeadOutcome::Resolved(Box::new(m)),
             Err(e) => {
@@ -895,9 +857,17 @@ async fn head_burst(
         };
         (key, outcome)
     }))
-    .buffer_unordered(HEAD_CONCURRENCY)
-    .collect()
-    .await
+    .buffer_unordered(HEAD_CONCURRENCY);
+    let mut out: Vec<(String, HeadOutcome)> = Vec::new();
+    while let Some(item) = stream.next().await {
+        out.push(item);
+        if let Some(p) = progress {
+            if out.len().is_multiple_of(FLUSH_EVERY_N_HEADS) {
+                p.flush_scanned(base + out.len() as u64).await;
+            }
+        }
+    }
+    out
 }
 
 async fn cache_get(
@@ -968,12 +938,10 @@ async fn scan_prefix(
             if p.cancelled_local() {
                 return Err(CANCELLED.to_string());
             }
-            // Progress write is throttled (lock-bearing) — the count is a
-            // spinner-grade estimate, not worth the global-mutex churn per page.
+            // Progress write is throttled (lock-bearing) — flush every N pages,
+            // often enough for a live count without per-page global-mutex churn.
             if should_flush(page_idx as u64, PROGRESS_FLUSH_EVERY_N_PAGES as u64) {
-                let db = p.db.lock().await;
-                let now = super::current_unix_seconds();
-                let _ = db.parity_result_progress(p.rule, (base_scanned + seen) as i64, now);
+                p.flush_scanned((base_scanned + seen) as u64).await;
             }
         }
         page_idx += 1;
@@ -1019,9 +987,7 @@ async fn scan_prefix(
     }
     // Final report for this side so the dest scan starts from the right base.
     if let Some(p) = progress {
-        let db = p.db.lock().await;
-        let now = super::current_unix_seconds();
-        let _ = db.parity_result_progress(p.rule, (base_scanned + seen) as i64, now);
+        p.flush_scanned((base_scanned + seen) as u64).await;
     }
     Ok((truncated || pager.truncated_by_page_budget(), seen))
 }
@@ -1097,17 +1063,11 @@ pub async fn parity_audit(
     // size/etag), EVERY key must be HEAD-resolved for a correct compare — the
     // symmetric guard to the dest side (finding #5 was one-directional).
     // ── Regime classification (cheap config read, no I/O) ──
-    // PureMirror ⇒ dest is a verbatim byte-copy ⇒ compare STORED size+etag from
-    // the lite list, ZERO HEADs. Transforming ⇒ re-derived bytes ⇒ logical HEAD.
+    // PureMirror ⇒ both lite lists carry logical facts ⇒ compare directly,
+    // ZERO HEADs. Transforming ⇒ logical facts need cache/HEAD resolution.
     let src_lite_authoritative = engine.lite_list_carries_logical_facts(&rule.source.bucket);
     let dest_lite_authoritative = engine.lite_list_carries_logical_facts(&rule.destination.bucket);
-    let reg = engine.bucket_policy_registry();
-    let regime = classify_regime(
-        src_lite_authoritative,
-        dest_lite_authoritative,
-        reg.compression_enabled(&rule.source.bucket),
-        reg.compression_enabled(&rule.destination.bucket),
-    );
+    let regime = classify_regime(src_lite_authoritative, dest_lite_authoritative);
     let pure_mirror = regime == Regime::PureMirror;
 
     // ── Phase 1: scan SOURCE prefix ──
@@ -1139,8 +1099,8 @@ pub async fn parity_audit(
             let dest_key = rewrite_key(&rule.source.prefix, &rule.destination.prefix, key)
                 .map_err(|e| e.to_string())?;
             dest_to_source.insert(dest_key.clone(), key.to_string());
-            // PureMirror skips logical resolution entirely (stored size+etag
-            // from the lite list is the proof).
+            // PureMirror skips resolution: the lite entry already carries the
+            // logical sha/size/etag (filesystem xattr), so the compare is direct.
             if !pure_mirror
                 && (!src_lite_authoritative || needs_logical_resolution(engine, key, meta))
             {
@@ -1157,7 +1117,7 @@ pub async fn parity_audit(
     // dest key must be HEAD-resolved: the lite entry can't be trusted for the
     // orphan-ownership check (#4) or the size/etag compare (#5).
     // ── Phase 2: scan DEST prefix ──
-    let (dst_truncated, _dst_seen) = scan_prefix(
+    let (dst_truncated, dst_seen) = scan_prefix(
         engine,
         &rule.destination.bucket,
         &dest_prefix,
@@ -1188,11 +1148,6 @@ pub async fn parity_audit(
     )
     .await?;
 
-    // Both sides listed → publish the denominator so the UI bar goes determinate.
-    if let Some(p) = progress {
-        p.set_total(source.len() as u64).await;
-    }
-
     // Logical metadata (real size/etag via HEAD) only changes the verdict for a
     // key that exists on BOTH sides (match vs mismatch). A source key MISSING on
     // the destination is "missing" regardless of its logical size — HEADing it is
@@ -1211,6 +1166,15 @@ pub async fn parity_audit(
     // carry ownership (S3/encrypting dest), an orphan is exactly the key whose
     // OWNERSHIP must be HEAD-resolved (delete-safety) — keep those.
     dst_needs_logical.retain(|dk| source.contains_key(dk) || !dest_lite_authoritative);
+
+    // Denominator = everything the audit will examine, in the SAME units as
+    // progress_scanned (listed objects + keys needing logical resolution) — so
+    // the bar goes determinate here and climbs monotonically to exactly 100%.
+    let listed = (src_seen + dst_seen) as u64;
+    if let Some(p) = progress {
+        p.set_total(listed + (src_needs_logical.len() + dst_needs_logical.len()) as u64)
+            .await;
+    }
 
     // Resolve logical metadata for the delta-eligible keys: parity cache first
     // (HEAD-free — the win), then a bounded HEAD burst for the misses, writing
@@ -1231,6 +1195,8 @@ pub async fn parity_audit(
         &src_needs_logical,
         &mut source,
         failures,
+        progress,
+        listed,
     )
     .await;
     if let Some(p) = progress {
@@ -1243,8 +1209,16 @@ pub async fn parity_audit(
         &dst_needs_logical,
         &mut dest,
         failures,
+        progress,
+        listed + src_needs_logical.len() as u64,
     )
     .await;
+
+    // Everything examined — land the counter exactly on the denominator.
+    if let Some(p) = progress {
+        p.flush_scanned(listed + (src_needs_logical.len() + dst_needs_logical.len()) as u64)
+            .await;
+    }
 
     // A transient HEAD that left a key unresolved means the audit couldn't see
     // every object — treat it as truncated (partial) so it never reports a
@@ -1264,7 +1238,7 @@ pub async fn parity_audit(
 
     let source_objects = source.len() as u64;
     let dest_objects = dest.len() as u64;
-    let mut diff = diff_parity(&source, &dest, regime);
+    let mut diff = diff_parity(&source, &dest);
 
     let in_sync = !truncated
         && diff.missing_on_dest == 0
@@ -1340,51 +1314,18 @@ mod tests {
     #[test]
     fn classify_regime_truth_table() {
         use Regime::*;
-        // Both authoritative + same compression → pure.
-        assert_eq!(classify_regime(true, true, true, true), PureMirror);
-        assert_eq!(classify_regime(true, true, false, false), PureMirror);
+        // Both sides' lite list carries logical facts → pure (zero HEADs).
+        assert_eq!(classify_regime(true, true), PureMirror);
         // Either side non-authoritative (S3 / encrypting) → transforming.
-        assert_eq!(classify_regime(false, true, true, true), Transforming);
-        assert_eq!(classify_regime(true, false, true, true), Transforming);
-        // Compression differs → transforming (re-delta changes stored size).
-        assert_eq!(classify_regime(true, true, true, false), Transforming);
-    }
-
-    #[test]
-    fn compare_pair_stored_verbatim_and_redelta() {
-        // Verbatim copy: equal stored size + etag → exact-copy match.
-        let a = st_stored(1000, Some("etag-x"));
-        assert_eq!(compare_pair_stored(&a, &a).0, FindingKind::Match);
-        // Etag differs at equal stored size → mismatch.
-        let b = st_stored(1000, Some("etag-y"));
-        assert_eq!(compare_pair_stored(&a, &b).0, FindingKind::ChecksumMismatch);
-        // Stored size differs (a re-delta) → flagged, unverifiable (needs HEAD).
-        let c = st_stored(1234, Some("etag-x"));
-        let (kind, _, unverifiable, _) = compare_pair_stored(&a, &c);
-        assert_eq!(kind, FindingKind::ChecksumMismatch);
-        assert!(
-            unverifiable,
-            "re-delta is flagged as needs-checksum, not asserted-wrong"
-        );
-    }
-
-    fn st_stored(stored: u64, etag: Option<&str>) -> ObjState {
-        ObjState {
-            sha256: None,
-            size: stored,
-            stored_size: stored,
-            etag: etag.map(|s| s.to_string()),
-            multipart_parts: None,
-            created_at: None,
-            owned_by_rule: None,
-        }
+        assert_eq!(classify_regime(false, true), Transforming);
+        assert_eq!(classify_regime(true, false), Transforming);
+        assert_eq!(classify_regime(false, false), Transforming);
     }
 
     fn st(sha: Option<&str>, size: u64, etag: Option<&str>, parts: Option<u32>) -> ObjState {
         ObjState {
             sha256: sha.map(|s| s.to_string()),
             size,
-            stored_size: size,
             etag: etag.map(|s| s.to_string()),
             multipart_parts: parts,
             created_at: None,
@@ -1573,7 +1514,7 @@ mod tests {
             ("b", st(Some("h2"), 2, None, None)),
         ]);
         let d = s.clone();
-        let r = diff_parity(&s, &d, Regime::Transforming);
+        let r = diff_parity(&s, &d);
         assert_eq!(r.matched, 2);
         assert_eq!(r.missing_on_dest, 0);
         assert_eq!(r.orphan_on_dest, 0);
@@ -1588,7 +1529,7 @@ mod tests {
             ("b", st(Some("h2"), 2, None, None)),
         ]);
         let d = map(&[("a", st(Some("h"), 1, None, None))]);
-        let r = diff_parity(&s, &d, Regime::Transforming);
+        let r = diff_parity(&s, &d);
         assert_eq!(r.matched, 1);
         assert_eq!(r.missing_on_dest, 1);
         assert_eq!(r.missing_samples.len(), 1);
@@ -1602,7 +1543,7 @@ mod tests {
             ("a", st(Some("h"), 1, None, None)),
             ("z", st(Some("h3"), 3, None, None)),
         ]);
-        let r = diff_parity(&s, &d, Regime::Transforming);
+        let r = diff_parity(&s, &d);
         assert_eq!(r.matched, 1);
         assert_eq!(r.orphan_on_dest, 1);
         assert_eq!(r.orphan_samples[0].key, "z");
@@ -1612,7 +1553,7 @@ mod tests {
     fn diff_one_mismatch() {
         let s = map(&[("a", st(Some("h"), 1, None, None))]);
         let d = map(&[("a", st(Some("DIFFERENT"), 1, None, None))]);
-        let r = diff_parity(&s, &d, Regime::Transforming);
+        let r = diff_parity(&s, &d);
         assert_eq!(r.checksum_mismatch, 1);
         assert_eq!(r.matched, 0);
         assert_eq!(r.mismatch_samples[0].key, "a");
@@ -1620,7 +1561,7 @@ mod tests {
 
     #[test]
     fn diff_empty_empty() {
-        let r = diff_parity(&BTreeMap::new(), &BTreeMap::new(), Regime::Transforming);
+        let r = diff_parity(&BTreeMap::new(), &BTreeMap::new());
         assert_eq!(r, ParityDiff::default());
     }
 
@@ -1630,7 +1571,7 @@ mod tests {
             ("a", st(Some("h"), 1, None, None)),
             ("b", st(Some("h2"), 2, None, None)),
         ]);
-        let r = diff_parity(&BTreeMap::new(), &d, Regime::Transforming);
+        let r = diff_parity(&BTreeMap::new(), &d);
         assert_eq!(r.orphan_on_dest, 2);
         assert_eq!(r.missing_on_dest, 0);
     }
@@ -1641,7 +1582,7 @@ mod tests {
             ("a", st(Some("h"), 1, None, None)),
             ("b", st(Some("h2"), 2, None, None)),
         ]);
-        let r = diff_parity(&s, &BTreeMap::new(), Regime::Transforming);
+        let r = diff_parity(&s, &BTreeMap::new());
         assert_eq!(r.missing_on_dest, 2);
         assert_eq!(r.orphan_on_dest, 0);
     }
@@ -1657,7 +1598,7 @@ mod tests {
             ("a", st(None, 1, None, None)),
             ("b", st(Some("h"), 2, None, None)),
         ]);
-        let r = diff_parity(&s, &d, Regime::Transforming);
+        let r = diff_parity(&s, &d);
         assert_eq!(r.matched, 2);
         assert_eq!(r.unverifiable, 1);
     }
@@ -1668,7 +1609,7 @@ mod tests {
         for i in 0..250 {
             s.insert(format!("k{i:04}"), st(Some("h"), 1, None, None));
         }
-        let r = diff_parity(&s, &BTreeMap::new(), Regime::Transforming);
+        let r = diff_parity(&s, &BTreeMap::new());
         assert_eq!(r.missing_on_dest, 250, "exact count is unbounded");
         assert_eq!(r.missing_samples.len(), SAMPLE_CAP, "samples capped at 100");
     }
@@ -1685,7 +1626,6 @@ mod tests {
             .prop_map(|(sha, size, etag, parts)| ObjState {
                 sha256: sha,
                 size,
-                stored_size: size,
                 etag,
                 multipart_parts: parts,
                 created_at: None,
@@ -1700,7 +1640,7 @@ mod tests {
     proptest! {
         #[test]
         fn counts_partition_key_union_exactly_once(s in arb_map(), d in arb_map()) {
-            let r = diff_parity(&s, &d, Regime::Transforming);
+            let r = diff_parity(&s, &d);
             // Every key in the union lands in exactly one of: matched+mismatch
             // (intersection), missing (source-only), orphan (dest-only).
             let union: std::collections::BTreeSet<&String> =
@@ -1722,7 +1662,7 @@ mod tests {
 
         #[test]
         fn samples_never_exceed_cap(s in arb_map(), d in arb_map()) {
-            let r = diff_parity(&s, &d, Regime::Transforming);
+            let r = diff_parity(&s, &d);
             prop_assert!(r.missing_samples.len() <= SAMPLE_CAP);
             prop_assert!(r.orphan_samples.len() <= SAMPLE_CAP);
             prop_assert!(r.mismatch_samples.len() <= SAMPLE_CAP);
@@ -1732,7 +1672,7 @@ mod tests {
         fn in_sync_iff_all_zero_and_not_truncated(
             s in arb_map(), d in arb_map(), truncated in any::<bool>()
         ) {
-            let r = diff_parity(&s, &d, Regime::Transforming);
+            let r = diff_parity(&s, &d);
             let in_sync = !truncated
                 && r.missing_on_dest == 0
                 && r.orphan_on_dest == 0
@@ -1796,7 +1736,7 @@ mod tests {
         src.created_at = Some(500);
         let source = map(&[("k", src)]);
         let dest: BTreeMap<String, ObjState> = BTreeMap::new();
-        let mut diff = diff_parity(&source, &dest, Regime::Transforming);
+        let mut diff = diff_parity(&source, &dest);
         let d2s = HashMap::from([("k".to_string(), "k".to_string())]);
         annotate_findings(
             &mut diff,
@@ -1824,7 +1764,7 @@ mod tests {
         d.owned_by_rule = Some(true);
         let source = map(&[("k", s)]);
         let dest = map(&[("k", d)]);
-        let mut diff = diff_parity(&source, &dest, Regime::Transforming);
+        let mut diff = diff_parity(&source, &dest);
         let d2s = HashMap::from([("k".to_string(), "k".to_string())]);
         annotate_findings(
             &mut diff,
@@ -1854,7 +1794,7 @@ mod tests {
         let mut d = st(Some("h"), 5, None, None);
         d.owned_by_rule = Some(false); // foreign
         let dest = map(&[("z", d)]);
-        let mut diff = diff_parity(&source, &dest, Regime::Transforming);
+        let mut diff = diff_parity(&source, &dest);
         annotate_findings(
             &mut diff,
             &source,
@@ -1879,7 +1819,7 @@ mod tests {
         s.created_at = Some(500);
         let source = map(&[("mirror/a.bin", s)]); // already dest-namespace in the map
         let dest: BTreeMap<String, ObjState> = BTreeMap::new();
-        let mut diff = diff_parity(&source, &dest, Regime::Transforming);
+        let mut diff = diff_parity(&source, &dest);
         let ledger = HashMap::from([(
             "firmware/a.bin".to_string(),
             ObjectFailure {

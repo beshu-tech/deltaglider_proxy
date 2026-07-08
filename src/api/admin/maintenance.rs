@@ -279,6 +279,23 @@ pub async fn start_migrate(
         }
     };
 
+    // Capability boundary: the migrate flip persists routing WITHOUT the
+    // hot-apply gate, so enforce the non-CAS refusal here (else the next boot
+    // exit(1)s on the persisted config — a crash loop).
+    {
+        // Clone-and-drop: the gate may probe for up to 15s — never hold the
+        // config read lock across that await (write-lock starvation).
+        let cfg = state.config.read().await.clone();
+        crate::coordination::capability::migrate_target_capability_gate(
+            &cfg,
+            &state.s3_state.backend_capabilities,
+            &bucket_key,
+            &params.target_backend,
+        )
+        .await
+        .map_err(|e| (StatusCode::CONFLICT, e))?;
+    }
+
     let params_json = serde_json::to_string(&params)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let created = {

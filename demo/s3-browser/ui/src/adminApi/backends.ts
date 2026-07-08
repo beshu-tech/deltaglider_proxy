@@ -10,7 +10,7 @@ interface BackendListResponse {
 
 interface BucketOriginResponse {
   name: string;
-  creation_date: string;
+  creation_date: string | null;
   backend_name?: string | null;
   backend_type?: string | null;
   backend_endpoint?: string | null;

@@ -13,7 +13,9 @@ use thiserror::Error;
 #[derive(Debug, Clone)]
 pub struct BucketListing {
     pub name: String,
-    pub creation_date: chrono::DateTime<chrono::Utc>,
+    /// `None` for a synthesized placeholder (unreachable backend) — never a
+    /// fabricated timestamp.
+    pub creation_date: Option<chrono::DateTime<chrono::Utc>>,
     /// Configured backend name when known (for `RoutingBackend` listings).
     pub backend_name: Option<String>,
     /// Real bucket name on that backend, when it differs from the visible name.
@@ -112,7 +114,7 @@ pub trait StorageBackend: Send + Sync {
             .into_iter()
             .map(|(name, creation_date)| BucketListing {
                 name,
-                creation_date,
+                creation_date: Some(creation_date),
                 backend_name: None,
                 real_bucket: None,
                 unavailable: None,

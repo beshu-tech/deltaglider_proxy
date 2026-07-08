@@ -2419,6 +2419,60 @@ async fn test_form_post_rejects_field_not_covered_by_policy() {
     );
 }
 
+/// `key` is NOT exempt from the covered-fields rule: a policy signed with no
+/// key condition must 403 (AWS: "Extra input fields: key"), else a leaked
+/// minimal-policy signature could write to ANY key in the signer's scope.
+#[tokio::test]
+async fn test_form_post_rejects_policy_without_key_condition() {
+    let server = TestServer::builder()
+        .auth("POSTACCESSKEY", "POSTSECRETKEY123")
+        .build()
+        .await;
+    let client = reqwest::Client::new();
+    let (bucket, endpoint) = (server.bucket(), server.endpoint());
+    let amz_date = "20260507T120000Z";
+    let credential = "POSTACCESSKEY/20260507/us-east-1/s3/aws4_request";
+    // No `key` condition anywhere — only bucket + signing fields.
+    let policy = serde_json::json!({
+        "expiration": "2099-01-01T00:00:00.000Z",
+        "conditions": [
+            { "bucket": bucket },
+            { "x-amz-algorithm": "AWS4-HMAC-SHA256" },
+            { "x-amz-credential": credential },
+            { "x-amz-date": amz_date }
+        ]
+    });
+    let policy_b64 = base64::engine::general_purpose::STANDARD.encode(policy.to_string());
+    let signing_key = derive_post_signing_key("POSTSECRETKEY123", "20260507", "us-east-1");
+    let signature = hex::encode(hmac_sha256(&signing_key, policy_b64.as_bytes()));
+    let form = reqwest::multipart::Form::new()
+        .text("key", "anywhere/i-like.txt")
+        .text("policy", policy_b64)
+        .text("x-amz-algorithm", "AWS4-HMAC-SHA256")
+        .text("x-amz-credential", credential)
+        .text("x-amz-date", amz_date)
+        .text("x-amz-signature", signature)
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(b"x".to_vec())
+                .file_name("x.txt")
+                .mime_str("text/plain")
+                .unwrap(),
+        );
+    let resp = client
+        .post(format!("{}/{}", endpoint, bucket))
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "an uncovered `key` field must be rejected, got {}",
+        resp.status()
+    );
+}
+
 /// C1 regression: a form-POST to a traversal bucket name (`..`) is rejected
 /// BEFORE any filesystem path is constructed — `root.join("..")` must never be
 /// reached. reqwest normalises `..` out of a URL, so we send a RAW HTTP request
@@ -2668,7 +2722,9 @@ async fn test_form_post_upload_rejects_invalid_signature() {
         .text("x-amz-algorithm", "AWS4-HMAC-SHA256")
         .text("x-amz-credential", credential)
         .text("x-amz-date", amz_date)
-        .text("x-amz-signature", format!("{signature}00"))
+        // Well-FORMED 64-hex sig with flipped leading bytes — exercises the
+        // constant-time HMAC compare, not just the length/shape pre-gate.
+        .text("x-amz-signature", format!("deadbeef{}", &signature[8..]))
         .part(
             "file",
             reqwest::multipart::Part::bytes(b"body".to_vec())

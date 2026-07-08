@@ -146,7 +146,7 @@ async fn test_hot_apply_rejects_routing_client_writable_bucket_to_noncas_backend
     let body = resp.text().await.unwrap();
     assert_ne!(status, 200, "apply must be refused, got {status}: {body}");
     assert!(
-        body.contains("does NOT support conditional writes")
+        body.contains("does not support conditional writes")
             && body.contains("backend-capability-validation"),
         "rejection must be doc-linked and name the cause, got: {body}"
     );

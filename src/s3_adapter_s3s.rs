@@ -563,6 +563,9 @@ impl s3s::S3 for DeltaGliderS3Service {
         req: s3s::S3Request<s3s::dto::CreateBucketInput>,
     ) -> s3s::S3Result<s3s::S3Response<s3s::dto::CreateBucketOutput>> {
         let bucket = req.input.bucket;
+        // A client must not (re)create a replication mirror's bucket.
+        crate::api::handlers::object_helpers::check_client_write_allowed(&self.state, &bucket)
+            .map_err(engine_error_to_s3s)?;
         self.state
             .engine
             .load()
@@ -579,6 +582,10 @@ impl s3s::S3 for DeltaGliderS3Service {
         req: s3s::S3Request<s3s::dto::DeleteBucketInput>,
     ) -> s3s::S3Result<s3s::S3Response<s3s::dto::DeleteBucketOutput>> {
         let bucket = req.input.bucket;
+        // A client must not delete a replication mirror (an object-empty or
+        // freshly-marked destination would otherwise be destructible).
+        crate::api::handlers::object_helpers::check_client_write_allowed(&self.state, &bucket)
+            .map_err(engine_error_to_s3s)?;
         let engine = self.state.engine.load();
 
         // Check object emptiness first: only visible objects are hard blockers.
@@ -1799,6 +1806,9 @@ fn engine_error_to_s3s(err: impl Into<crate::api::S3Error>) -> s3s::S3Error {
         crate::api::S3Error::AccessDeniedReason(msg) => s3s::s3_error!(AccessDenied, "{}", msg),
         crate::api::S3Error::PreconditionFailed => s3s::s3_error!(PreconditionFailed),
         crate::api::S3Error::InvalidRange => s3s::s3_error!(InvalidRange),
+        // 503 SlowDown must reach the wire as SlowDown — AWS SDKs back off on
+        // it; a catch-all 500 InternalError is treated as permanent instead.
+        crate::api::S3Error::SlowDown(msg) => s3s::s3_error!(SlowDown, "{}", msg),
         other => {
             // Catch-all → 500. The S3 wire error only carries the error *code*
             // (a category), so without this the actual cause (upstream S3

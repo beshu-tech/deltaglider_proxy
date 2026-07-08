@@ -163,7 +163,7 @@ export default function BucketScanCard({ onRenderActions, scopeBucket }: Props) 
   useEffect(() => {
     refreshAllScans();
     listBuckets()
-      .then((bs) => setAllBuckets(bs.map((b) => b.name)))
+      .then((bs) => setAllBuckets(bs.filter((b) => !b.unavailable).map((b) => b.name)))
       .catch(() => setAllBuckets([]));
     // Re-poll every 30s — covers the case where another tab kicked
     // off a scan that completed in the background. SSE handles the

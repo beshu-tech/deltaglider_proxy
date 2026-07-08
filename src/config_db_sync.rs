@@ -347,8 +347,7 @@ impl ConfigDbSync {
         let put_result = match put.send().await {
             Ok(result) => result,
             Err(e) => {
-                let err_str = format!("{}", e);
-                match classify_upload_error(&err_str) {
+                match classify_upload_error(&sdk_error_signal(&e)) {
                     UploadError::Conflict => {
                         // A peer instance updated the remote config DB since we
                         // last synced. Forget our stale ETag so the next download
@@ -526,11 +525,10 @@ async fn read_witness(client: &Client, bucket: &str, key: &str) -> Result<Option
             Ok(serde_json::from_slice::<Witness>(&bytes).ok())
         }
         Err(e) => {
-            let s = format!("{e:?}");
-            if is_object_absent(&s) {
+            if is_object_absent(&sdk_error_signal(&e)) {
                 Ok(None)
             } else {
-                Err(s)
+                Err(format!("{e:?}"))
             }
         }
     }
@@ -600,14 +598,15 @@ pub(crate) async fn probe_conditional_write(
     let supported = match &put2 {
         Ok(_) => Ok(false), // precondition ignored → silent overwrite
         Err(e) => {
-            let msg = format!("{e:?}");
-            if is_precondition_failed(&msg) {
+            // Classify on status+code only — the debug string is diagnostics.
+            let signal = sdk_error_signal(e);
+            if is_precondition_failed(&signal) {
                 Ok(true)
-            } else if is_not_implemented(&msg) {
+            } else if is_not_implemented(&signal) {
                 Ok(false) // loud rejection of the conditional (B2-style 501)
             } else {
                 Err(format!(
-                    "probe re-PUT to '{bucket}' failed with a non-conditional error: {msg}"
+                    "probe re-PUT to '{bucket}' failed with a non-conditional error ({signal}): {e:?}"
                 ))
             }
         }
@@ -659,15 +658,32 @@ fn node_id() -> String {
         .unwrap_or_else(|| format!("node-{}", uuid::Uuid::new_v4()))
 }
 
+/// Compact classification signal from a typed SDK error: HTTP status + error
+/// code ONLY. Never feed the substring classifiers `format!("{e:?}")` — the
+/// debug string embeds endpoint/bucket/request-ids that can contain "412"/
+/// "501"/"404" and poison the match (e.g. a backend on port 9501).
+pub(crate) fn sdk_error_signal<E>(e: &aws_sdk_s3::error::SdkError<E>) -> String
+where
+    E: aws_sdk_s3::error::ProvideErrorMetadata,
+{
+    use aws_sdk_s3::error::ProvideErrorMetadata;
+    let code = e.code().unwrap_or("");
+    match e {
+        aws_sdk_s3::error::SdkError::ServiceError(svc) => {
+            format!("status={} code={code}", svc.raw().status().as_u16())
+        }
+        _ => format!("transport code={code}"),
+    }
+}
+
 /// Pure classifier: does this stringified S3 SDK error represent a failed
 /// conditional-write precondition (HTTP 412)?
 ///
 /// The conditional PUT in [`ConfigDbSync::upload`] relies on the backend
 /// rejecting the request with `412 Precondition Failed` when the `If-Match`
 /// / `If-None-Match` guard doesn't hold. AWS S3 and MinIO both surface this
-/// as `PreconditionFailed` / a 412 status in the error display string.
-/// Extracted as a pure fn so the decision is unit-testable without a live
-/// S3 backend (per the project's "pure functions at decision points" rule).
+/// as `PreconditionFailed` / a 412 status. Feed it [`sdk_error_signal`]
+/// output (status+code only), never a raw debug string — see that helper.
 pub(crate) fn is_precondition_failed(err_str: &str) -> bool {
     err_str.contains("PreconditionFailed")
         || err_str.contains("Precondition Failed")
@@ -885,6 +901,9 @@ mod tests {
 
     #[test]
     fn object_absent_detected_from_common_shapes() {
+        // The sdk_error_signal contract shape:
+        assert!(is_object_absent("status=404 code=NoSuchKey"));
+        assert!(!is_object_absent("status=403 code=AccessDenied"));
         assert!(is_object_absent("service error: NoSuchKey"));
         assert!(is_object_absent("dispatch failure: NotFound"));
         assert!(is_object_absent("HTTP 404"));
@@ -943,6 +962,10 @@ mod tests {
             "service error: NotImplemented: conditional writes not supported"
         ));
         assert!(is_not_implemented("http status: 501"));
+        // The sdk_error_signal contract shape — and the poisoning class it
+        // exists to prevent: "501" in an endpoint/bucket must never classify.
+        assert!(is_not_implemented("status=501 code=NotImplemented"));
+        assert!(!is_not_implemented("status=403 code=AccessDenied"));
         // Transport-class errors are NOT "not implemented" — they must map to
         // Indeterminate, never to a fatal non-CAS verdict.
         assert!(!is_not_implemented("dispatch failure: connection refused"));

@@ -145,11 +145,12 @@ impl S3Lease {
                 }
             }
             Err(e) => {
-                let s = format!("{e:?}");
-                if crate::config_db_sync::is_object_absent(&s) {
+                if crate::config_db_sync::is_object_absent(
+                    &crate::config_db_sync::sdk_error_signal(&e),
+                ) {
                     Ok(None)
                 } else {
-                    Err(s)
+                    Err(format!("{e:?}"))
                 }
             }
         }
@@ -189,11 +190,12 @@ impl S3Lease {
         match put.send().await {
             Ok(_) => Ok(true),
             Err(e) => {
-                let s = format!("{e:?}");
-                if crate::config_db_sync::is_precondition_failed(&s) {
+                if crate::config_db_sync::is_precondition_failed(
+                    &crate::config_db_sync::sdk_error_signal(&e),
+                ) {
                     Ok(false) // a peer won the race — expected, not an error
                 } else {
-                    Err(s)
+                    Err(format!("{e:?}"))
                 }
             }
         }

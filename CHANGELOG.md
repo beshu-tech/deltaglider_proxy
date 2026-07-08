@@ -66,7 +66,7 @@ replication failover across instances, and a hardened browser upload path.
   403 so replication stays the single writer. This is what makes a backend
   without conditional-write support (e.g. Backblaze B2) safe to host a mirror —
   reads are unaffected, and prefixes can still be published read-only. See the
-  new how-to, [Using non-CAS backends safely](docs/product/how-to/backend-capability-validation.md).
+  new how-to, [Using non-CAS backends safely](https://deltaglider.com/docs/how-to/backend-capability-validation).
 - **Backend conditional-write validation.** When multi-instance mode is active
   (a `config_sync_bucket` is set), the proxy probes every S3 backend that hosts
   a client-writable bucket at startup and refuses to boot on one that doesn't

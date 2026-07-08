@@ -413,8 +413,8 @@ export function ParityResult({
 }) {
   const tone = toneFor(outcome);
   const inSync = outcome.in_sync;
-  // PureMirror proved a verbatim byte-copy from the listing (stored size+etag,
-  // no downloads); Transforming compared the logical SHA via HEAD.
+  // Same logical compare either way; 'pure_mirror' sourced it straight from
+  // the listing (zero per-object reads) — surfaced in the provenance footnote.
   const pure = outcome.regime === 'pure_mirror';
 
   const haloColor =
@@ -514,7 +514,7 @@ export function ParityResult({
             <span style={{ color: haloColor, fontWeight: 700 }}>
               {outcome.matched.toLocaleString()}
             </span>{' '}
-            objects {pure ? 'are exact copies (same stored size + etag)' : 'match by checksum'}. No missing files, no extras.
+            objects match by checksum. No missing files, no extras.
           </div>
         ) : (
           <div style={{ fontSize: 14, color: c.TEXT_SECONDARY, lineHeight: 1.55, maxWidth: 460, margin: '0 auto' }}>
@@ -562,7 +562,7 @@ export function ParityResult({
         >
           Checked {timeAgo(scannedDate)} ·{' '}
           {pure
-            ? 'exact-copy check: stored size + etag from listing — no downloads'
+            ? 'logical SHA-256 + size from listing metadata — no per-object reads'
             : 'logical SHA-256 + size, from metadata'}
         </div>
 

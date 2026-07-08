@@ -21,6 +21,7 @@
  * for pre-provisioning drafts).
  */
 import { useState } from 'react';
+import { CAPABILITY_DOC_URL, docsUrlToInAppHref } from '../linkifyDocUrl';
 import { Button, Collapse, Input, InputNumber, Modal, Progress, Radio, Select, Typography } from 'antd';
 import { DownOutlined, RightOutlined, SyncOutlined } from '@ant-design/icons';
 import type { BackendInfo } from '../adminApi';
@@ -404,7 +405,7 @@ export default function BucketCard({
               backend (e.g. Backblaze B2) safe to host it. Reads are unaffected. Set
               or clear the marker in YAML.{' '}
               <a
-                href="/_/docs/how-to-backend-capability-validation"
+                href={docsUrlToInAppHref(CAPABILITY_DOC_URL) ?? CAPABILITY_DOC_URL}
                 target="_blank"
                 rel="noopener noreferrer"
               >

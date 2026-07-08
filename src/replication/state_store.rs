@@ -986,10 +986,8 @@ impl ConfigDb {
     }
 
     /// Update the live progress counter of a running parity audit.
-    /// `ponytail`: the audit doesn't yet call this per-page — the scan is now
-    /// metadata-only + cache-warm (seconds), so the UI shows a spinner, not a
-    /// live count. This is the hook for a future streaming-progress pass; the UI
-    /// already degrades gracefully (it only renders the count when > 0).
+    /// Called by the audit on a throttled cadence (every N list pages / HEAD
+    /// completions) — feeds the live count + rate + x-of-y bar in the UI.
     pub fn parity_result_progress(
         &self,
         rule: &str,
@@ -1626,13 +1624,14 @@ mod tests {
         assert_eq!(row.progress_scanned, 0);
 
         db.parity_result_progress("r", 4200, 110).unwrap();
-        assert_eq!(
-            db.parity_result_load("r")
-                .unwrap()
-                .unwrap()
-                .progress_scanned,
-            4200
-        );
+        db.parity_result_set_total("r", 9000, 110).unwrap();
+        let row = db.parity_result_load("r").unwrap().unwrap();
+        assert_eq!(row.progress_scanned, 4200);
+        assert_eq!(row.progress_total, 9000);
+        // A new run resets BOTH counters (else a stale denominator shows).
+        db.parity_result_set_running("r", 115).unwrap();
+        let row = db.parity_result_load("r").unwrap().unwrap();
+        assert_eq!((row.progress_scanned, row.progress_total), (0, 0));
 
         db.parity_result_done("r", true, "{\"in_sync\":true}", 120)
             .unwrap();

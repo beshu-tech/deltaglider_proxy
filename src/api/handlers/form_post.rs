@@ -24,22 +24,17 @@
 //! coupling is the dispatcher choosing between DeleteObjects and form
 //! upload at the top of `delete_objects`.
 //!
-//! ## Replay-guard blast-radius trade-off (documented)
+//! ## No replay guard (deliberate — matches AWS)
 //!
-//! `form_post_replay_record` is now an idempotency/observability ledger, not a
-//! gate — it always allows. This MATCHES native AWS S3, which has no form-POST
-//! replay protection: a presigned POST is valid for as many policy-conforming
-//! uploads as fit within its expiration. The earlier guard capped a captured
-//! signature at ONE object; removing that cap widens the blast radius of a
-//! *leaked* signature to "any key matching the policy's `starts-with $key`, until
-//! `expiration`." We accept this because (a) it was breaking the legitimate
-//! AWS-intended batch pattern (the ROR CI uploads `.zip`/`.sha512`/`.sha1` under
-//! one signature), and (b) the policy's own conditions — `starts-with $key`,
+//! Native S3 has NO form-POST replay protection: a presigned POST is valid for
+//! as many policy-conforming uploads as fit within its expiration (the
+//! AWS-intended `starts-with $key` batch pattern). An earlier signature-keyed
+//! guard 403'd that legitimate pattern (same-size files signed in the same
+//! second share a signature) and was removed; a later write-only ledger added
+//! per-request SHA-256 + eviction cost while never rejecting, and was removed
+//! too. The policy's own conditions — `starts-with $key`,
 //! `content-length-range`, `expiration` — are re-validated on EVERY request
-//! (`validate_form_post_policy`) and are the real bound. A future tightening
-//! could re-impose the one-object cap ONLY for policies with an exact
-//! `{"key": "..."}` condition (where reuse genuinely is an attack) while leaving
-//! `starts-with` policies permissive; not done here.
+//! (`validate_form_post_policy`) and are the real bound on a leaked signature.
 
 use super::object_helpers::{check_client_write_allowed, check_quota, enqueue_object_event};
 use super::{audit_log_s3, ensure_bucket_exists, AppState};
@@ -441,11 +436,10 @@ fn validate_form_post_policy(
         }
     }
 
-    // Every submitted form field must be covered by a condition (AWS rule).
-    // Exempt: the signing/auth fields (the signature covers them intrinsically),
-    // `file`/`key`/`content-type` (`file` is the payload; key/content-type are
-    // handled by their own conditions or the resolved-key path), and the
-    // browser-only `submit`/`x-ignore-*` helpers AWS also ignores.
+    // Every submitted form field must be covered by a condition (AWS rule) —
+    // INCLUDING `key`: exempting it would let a leaked minimal-policy signature
+    // (no key condition) write to ANY key in the signer's scope. AWS likewise
+    // rejects an uncovered key ("Extra input fields: key").
     const EXEMPT: &[&str] = &[
         "policy",
         "x-amz-signature",
@@ -454,7 +448,6 @@ fn validate_form_post_policy(
         "x-amz-date",
         "x-amz-security-token",
         "file",
-        "key",
     ];
     for field in fields_ci.keys() {
         let f = field.to_ascii_lowercase();
@@ -710,199 +703,6 @@ fn authenticate_form_post(
     Ok(Some(auth_user))
 }
 
-/// Replay-cache TTL for a form-POST signature: the policy's own
-/// expiration capped at [`MAX_FORM_POST_REPLAY_TTL_SECS`] so an
-/// attacker uploading a multi-day-expiry policy can't pin a cache
-/// slot indefinitely. Pure: no I/O, no global state.
-fn form_post_replay_ttl(
-    policy_b64: &str,
-    now: chrono::DateTime<chrono::Utc>,
-) -> std::time::Duration {
-    use std::time::Duration;
-    // Decode → parse JSON → extract `expiration`. Any failure short-
-    // circuits to the floor TTL (sig is still cached, just for a
-    // short window).
-    let parsed = base64::engine::general_purpose::STANDARD
-        .decode(policy_b64.as_bytes())
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .and_then(|j| {
-            j.get("expiration")
-                .and_then(|e| e.as_str())
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-        });
-    let max = Duration::from_secs(MAX_FORM_POST_REPLAY_TTL_SECS);
-    let floor = Duration::from_secs(5);
-    let raw = match parsed {
-        Some(exp) if exp > now => exp.signed_duration_since(now).to_std().unwrap_or(floor),
-        _ => floor,
-    };
-    raw.min(max).max(floor)
-}
-
-/// Cap on the form-POST replay-cache TTL — no single entry can pin a
-/// slot for more than 24 h regardless of the policy's claimed expiry.
-const MAX_FORM_POST_REPLAY_TTL_SECS: u64 = 24 * 60 * 60;
-
-/// A live entry in the form-POST idempotency ledger.
-///
-/// `expiry` is the policy's expiration `Instant` (capped at 24 h), used only for
-/// TTL eviction. The entry is keyed by `(signature, fingerprint)` in the cache
-/// (see [`form_post_replay_cache_key`]), so distinct files under one signature
-/// are distinct entries and a resend of the same file just refreshes its expiry.
-#[derive(Clone, Copy, Debug)]
-pub struct ReplayEntry {
-    pub expiry: std::time::Instant,
-    // The file fingerprint is encoded in the cache KEY (`{sig}:{fp}`), not stored
-    // here — the entry only needs its expiry for TTL eviction.
-}
-
-/// Stable fingerprint of the (resolved key, body) a form-POST writes.
-/// Sha256 over `key`, a domain separator, and the body, folded to a
-/// `u64` — collision-resistant enough to tell "same object re-sent" from
-/// "signature reused for different content" without storing the full
-/// body. Pure.
-fn form_post_fingerprint(resolved_key: &str, body: &[u8]) -> u64 {
-    use sha2::Digest;
-    let mut hasher = Sha256::new();
-    hasher.update((resolved_key.len() as u64).to_le_bytes());
-    hasher.update(resolved_key.as_bytes());
-    hasher.update([0u8]); // domain separator between key and body
-    hasher.update(body);
-    let digest = hasher.finalize();
-    u64::from_le_bytes(digest[..8].try_into().expect("sha256 >= 8 bytes"))
-}
-
-/// Cap on the replay-cache total entries. A flood of unique-signature
-/// form-POSTs (an attacker minting fresh policies) must not be able
-/// to OOM the proxy.
-const MAX_FORM_POST_REPLAY_ENTRIES: usize = 50_000;
-
-/// Fraction of the hard cap to shed in one eviction sweep once the cap
-/// is breached, so a sustained flood can't pin the cache at the ceiling
-/// by re-filling a single freed slot per insert. 10% gives the next
-/// ~5,000 legitimate signatures breathing room before the next sweep.
-const FORM_POST_REPLAY_EVICT_FRACTION: usize = 10;
-
-/// Pick the keys to evict when the replay cache is over its hard cap:
-/// the `evict_count` entries with the **soonest** expiry (closest to
-/// being pruned anyway), so eviction prefers the least-valuable slots
-/// and never touches a live entry before an about-to-expire one. Pure:
-/// operates on a borrowed snapshot of `(key, expiry)` pairs, no I/O.
-fn form_post_replay_evict_keys(
-    entries: &[(String, std::time::Instant)],
-    evict_count: usize,
-) -> Vec<String> {
-    // Operates on (signature, expiry) pairs — the caller projects each
-    // `ReplayEntry` down to its `expiry` before calling, so the eviction
-    // policy stays purely a function of remaining TTL.
-    if evict_count == 0 || entries.is_empty() {
-        return Vec::new();
-    }
-    let mut sorted: Vec<&(String, std::time::Instant)> = entries.iter().collect();
-    sorted.sort_by_key(|(_, exp)| *exp);
-    sorted
-        .into_iter()
-        .take(evict_count.min(entries.len()))
-        .map(|(k, _)| k.clone())
-        .collect()
-}
-
-/// Record a form-POST in the idempotency/observability ledger and enforce the
-/// cache's bounded-size invariant. This does NOT reject replays — AWS presigned
-/// POSTs are reusable until the policy expires; the ledger is keyed on
-/// `(signature, key+body fingerprint)` so a true replay just refreshes its entry
-/// (see [`form_post_replay_record`]). Its security job is the hard-cap eviction
-/// that stops a unique-signature flood from OOMing the cache.
-fn enforce_form_post_replay(state: &Arc<AppState>, parsed: &ParsedFormPost) -> Result<(), S3Error> {
-    let cache = &state.form_post_replay;
-    let now = chrono::Utc::now();
-    let now_instant = std::time::Instant::now();
-
-    // Bounded prune: drop expired entries and, if still above cap,
-    // evict a BATCH of the soonest-to-expire entries. Evicting only one
-    // entry per insert lets a sustained unique-signature flood hold the
-    // cache pinned at the ceiling indefinitely (every freed slot is
-    // immediately refilled by the next insert), so we shed
-    // `FORM_POST_REPLAY_EVICT_FRACTION`% of the cap in one sweep to
-    // create real headroom. Cheaper than a background sweeper task and
-    // bounded by `MAX_FORM_POST_REPLAY_ENTRIES`.
-    cache.retain(|_, entry| entry.expiry > now_instant);
-    if cache.len() > MAX_FORM_POST_REPLAY_ENTRIES {
-        let evict_count = (MAX_FORM_POST_REPLAY_ENTRIES / FORM_POST_REPLAY_EVICT_FRACTION).max(1);
-        // DashMap has no batch `pop`; snapshot (key, expiry) pairs,
-        // pick the soonest-to-expire keys via a pure helper, then
-        // remove them.
-        let snapshot: Vec<(String, std::time::Instant)> = cache
-            .iter()
-            .map(|e| (e.key().clone(), e.value().expiry))
-            .collect();
-        let evicted = form_post_replay_evict_keys(&snapshot, evict_count);
-        for k in &evicted {
-            cache.remove(k);
-        }
-        tracing::warn!(
-            "SECURITY | form_post_replay_cache hard-cap reached — evicted {} of {} entries (possible flood)",
-            evicted.len(),
-            snapshot.len()
-        );
-    }
-
-    let Some(sig) = lookup_form_field(&parsed.fields_ci, "x-amz-signature") else {
-        // Unsigned form-POST (authentication=none mode) skips the
-        // replay check — there's nothing to replay against. The
-        // un-auth path is gated elsewhere.
-        return Ok(());
-    };
-    let Some(policy_b64) = lookup_form_field(&parsed.fields_ci, "policy") else {
-        return Ok(());
-    };
-
-    let key = sig.to_ascii_lowercase();
-    let ttl = form_post_replay_ttl(policy_b64, now);
-    let new_expiry = now_instant + ttl;
-    let fingerprint = form_post_fingerprint(&parsed.resolved_key, &parsed.file_data);
-    form_post_replay_record(cache, &key, fingerprint, new_expiry);
-    Ok(())
-}
-
-/// Cache key for the replay guard: the request signature COMBINED with the
-/// `(key, body)` fingerprint. Keying on the pair is what distinguishes a true
-/// replay from a legitimate batch upload — see [`form_post_replay_record`].
-fn form_post_replay_cache_key(sig: &str, fingerprint: u64) -> String {
-    format!("{sig}:{fingerprint:016x}")
-}
-
-/// Record a form-POST attempt in the idempotency/observability ledger. There is
-/// no reject path: the ledger is keyed on `(signature, fingerprint)`, so a true
-/// replay (same sig + same body) just refreshes its entry, and a different file
-/// under the same signature (the AWS-intended `starts-with $key` batch pattern —
-/// the ROR CI uploads .zip/.sha512/.sha1 under one signature) is a distinct
-/// entry, NOT a rejection.
-///
-/// History: the guard used to key ONLY on the signature and 403 any reuse with a
-/// DIFFERENT `(key, body)` fingerprint, on the theory that a captured signature
-/// rewriting a different object is an attack. But two files of the SAME SIZE
-/// (every `.sha1` is 41 bytes, every `.sha512` is 129) signed in the same second
-/// get a byte-identical signature, so that "different fingerprint" was the
-/// LEGITIMATE batch case — and it 403'd intermittently. The policy's own
-/// conditions (`starts-with $key`, `content-length-range`, `expiration`) are
-/// re-validated on every request and are the real bound on a captured signature;
-/// the replay guard couldn't add to that without breaking the batch pattern.
-fn form_post_replay_record(
-    cache: &dashmap::DashMap<String, ReplayEntry>,
-    key: &str,
-    fingerprint: u64,
-    new_expiry: std::time::Instant,
-) {
-    let cache_key = form_post_replay_cache_key(key, fingerprint);
-    cache
-        .entry(cache_key)
-        .and_modify(|existing| existing.expiry = new_expiry)
-        .or_insert(ReplayEntry { expiry: new_expiry });
-}
-
 /// Run the full presigned-form-POST pipeline.
 ///
 /// Called from `object::delete_objects` when the dispatcher detects a
@@ -946,11 +746,6 @@ pub async fn handle_form_post_upload(
             return Err(e);
         }
     };
-    // Form-POST replay is an observability ledger, NOT a rejection: AWS presigned
-    // POSTs are intentionally reusable until the policy expires, so we record the
-    // (signature, key+body-fingerprint) rather than block re-sends. See the ledger
-    // doc on `form_post_replay_record`.
-    enforce_form_post_replay(state, &parsed)?;
     check_quota(state, bucket, parsed.file_data.len() as u64)?;
     let engine = state.engine.load();
     let size = parsed.file_data.len() as u64;
@@ -1129,203 +924,5 @@ mod tests {
                 other
             ),
         }
-    }
-
-    /// TTL is the policy's own remaining expiry, capped at 24h with
-    /// a 5-second floor. Pure function; no test infrastructure
-    /// needed.
-    #[test]
-    fn form_post_replay_ttl_follows_policy_expiry() {
-        use chrono::{Duration as Cd, Utc};
-        use std::time::Duration;
-
-        // Policy expiring in 30 min → TTL ≈ 30 min.
-        let now = Utc::now();
-        let policy = serde_json::json!({
-            "expiration": (now + Cd::minutes(30)).to_rfc3339(),
-        });
-        let policy_b64 = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            serde_json::to_vec(&policy).unwrap(),
-        );
-        let ttl = form_post_replay_ttl(&policy_b64, now);
-        assert!(ttl > Duration::from_secs(60 * 25));
-        assert!(ttl < Duration::from_secs(60 * 35));
-
-        // Policy expiring in 10 days → capped at 24 h.
-        let policy = serde_json::json!({
-            "expiration": (now + Cd::days(10)).to_rfc3339(),
-        });
-        let policy_b64 = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            serde_json::to_vec(&policy).unwrap(),
-        );
-        let ttl = form_post_replay_ttl(&policy_b64, now);
-        assert_eq!(ttl, Duration::from_secs(MAX_FORM_POST_REPLAY_TTL_SECS));
-
-        // Already-expired policy → floor (5s) — caller will still
-        // reject on the expiration check; this is the safe fallback.
-        let policy = serde_json::json!({
-            "expiration": (now - Cd::minutes(1)).to_rfc3339(),
-        });
-        let policy_b64 = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            serde_json::to_vec(&policy).unwrap(),
-        );
-        assert_eq!(
-            form_post_replay_ttl(&policy_b64, now),
-            Duration::from_secs(5)
-        );
-
-        // Garbage policy → floor.
-        assert_eq!(
-            form_post_replay_ttl("not-base64-at-all", now),
-            Duration::from_secs(5)
-        );
-        // Valid base64 but not JSON → floor.
-        let bogus = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"not json");
-        assert_eq!(form_post_replay_ttl(&bogus, now), Duration::from_secs(5));
-    }
-
-    /// Adversarial: a second insertion for the same signature within
-    /// the TTL window must observe the first entry as live so the
-    /// caller (`enforce_form_post_replay`) rejects the replay. Tests
-    /// the cache-shape contract directly — the full route-layer flow
-    /// is covered by integration tests.
-    #[test]
-    fn form_post_replay_cache_marks_signature_as_seen() {
-        let cache: std::sync::Arc<dashmap::DashMap<String, ReplayEntry>> =
-            std::sync::Arc::new(dashmap::DashMap::new());
-        let key = "deadbeef".to_string();
-        let now = std::time::Instant::now();
-        // Insert with 10-min TTL.
-        cache.insert(
-            key.clone(),
-            ReplayEntry {
-                expiry: now + std::time::Duration::from_secs(600),
-            },
-        );
-        // A freshly-inserted entry within its TTL must read as live (the
-        // expiry-window mechanic the replay ledger relies on).
-        let live = cache
-            .get(&key)
-            .map(|v| v.expiry > std::time::Instant::now())
-            .unwrap_or(false);
-        assert!(live, "a within-TTL entry must report as still live");
-    }
-
-    /// The fix's core invariant: ONE presigned signature may upload a BATCH of
-    /// distinct files (the AWS-intended `starts-with $key` pattern, used by the
-    /// ROR CI for `.zip`/`.sha512`/`.sha1`). Previously the guard 403'd the 2nd+
-    /// distinct file under a live signature; now every (sig, body) pair gets its
-    /// own ledger entry, and an exact resend stays idempotent.
-    #[test]
-    fn form_post_replay_allows_batch_under_one_signature() {
-        use std::time::{Duration, Instant};
-        let cache: dashmap::DashMap<String, ReplayEntry> = dashmap::DashMap::new();
-        let sig = "deadbeefcafef00d";
-        let now = Instant::now();
-        let exp = now + Duration::from_secs(3600);
-
-        // Two SAME-SIZE files (e.g. two .sha1, both 41 bytes) under one signing
-        // second get a byte-identical signature `sig` — the exact 403 trigger.
-        // Different bodies → different fingerprints → distinct ledger keys.
-        let fp_a = form_post_fingerprint("ror/builds/1.71/a.zip.sha1", b"aaaaaaaa\n");
-        let fp_b = form_post_fingerprint("ror/builds/1.71/b.zip.sha1", b"bbbbbbbb\n");
-        let fp_c = form_post_fingerprint("ror/builds/1.71/x.zip.sha512", b"sha512hash\n");
-
-        // A batch of 3 distinct files under ONE signature — the ledger records
-        // each without rejecting (the old guard 403'd the 2nd/3rd).
-        form_post_replay_record(&cache, sig, fp_a, exp);
-        form_post_replay_record(&cache, sig, fp_b, exp);
-        form_post_replay_record(&cache, sig, fp_c, exp);
-        // Exact resend (CI retry) refreshes its entry, does not add one.
-        form_post_replay_record(&cache, sig, fp_c, exp);
-
-        // Each distinct (sig, body) is its own entry — three files = three keys
-        // (NOT one key with rejections). This is the property that fixes the 403.
-        assert_eq!(cache.len(), 3, "one ledger entry per distinct (sig, body)");
-        assert!(
-            cache.contains_key(&form_post_replay_cache_key(sig, fp_a))
-                && cache.contains_key(&form_post_replay_cache_key(sig, fp_b))
-                && cache.contains_key(&form_post_replay_cache_key(sig, fp_c)),
-            "same-signature, different-body files must each get a distinct key"
-        );
-    }
-
-    /// Fingerprint distinguishes (key, body) tuples and is stable for
-    /// identical input — and changing EITHER the key or the body changes
-    /// it, so a signature can't be repointed at a different key with the
-    /// same body (or the same key with different body).
-    #[test]
-    fn form_post_fingerprint_is_stable_and_discriminating() {
-        let base = form_post_fingerprint("k/one", b"body");
-        assert_eq!(base, form_post_fingerprint("k/one", b"body"), "stable");
-        assert_ne!(base, form_post_fingerprint("k/two", b"body"), "key matters");
-        assert_ne!(
-            base,
-            form_post_fingerprint("k/one", b"other"),
-            "body matters"
-        );
-        // Domain separation: ("ab","c") must not collide with ("a","bc").
-        assert_ne!(
-            form_post_fingerprint("ab", b"c"),
-            form_post_fingerprint("a", b"bc"),
-            "key/body boundary must be unambiguous"
-        );
-    }
-
-    /// Adversarial: a signature whose TTL has elapsed must be
-    /// purged on access so the slot can be reused — but a legitimate
-    /// retry doesn't "leak" indefinitely.
-    #[test]
-    fn form_post_replay_cache_expired_entries_are_drained() {
-        let cache: std::sync::Arc<dashmap::DashMap<String, ReplayEntry>> =
-            std::sync::Arc::new(dashmap::DashMap::new());
-        let key = "deadbeef".to_string();
-        let now = std::time::Instant::now();
-        // Insert with a NEGATIVE TTL (already expired).
-        cache.insert(
-            key.clone(),
-            ReplayEntry {
-                expiry: now
-                    .checked_sub(std::time::Duration::from_secs(60))
-                    .unwrap_or(now),
-            },
-        );
-        // Prune: same `retain` shape the enforcer uses.
-        cache.retain(|_, entry| entry.expiry > std::time::Instant::now());
-        assert!(
-            !cache.contains_key(&key),
-            "expired entry must be evicted by the retain sweep"
-        );
-    }
-
-    /// Over-cap eviction sheds a BATCH of the soonest-to-expire
-    /// entries (not one), and never picks a longer-lived slot before a
-    /// shorter-lived one. Guards the OOM-under-flood regression where a
-    /// single-eviction-per-insert strategy let the cache stay pinned at
-    /// the ceiling.
-    #[test]
-    fn form_post_replay_evict_picks_soonest_to_expire_batch() {
-        use std::time::{Duration, Instant};
-        let base = Instant::now();
-        // 10 entries with strictly increasing expiry: "k0" expires
-        // first, "k9" last.
-        let entries: Vec<(String, Instant)> = (0..10)
-            .map(|i| (format!("k{i}"), base + Duration::from_secs(i + 1)))
-            .collect();
-
-        // Evict 3 → the three soonest-to-expire keys.
-        let mut evicted = form_post_replay_evict_keys(&entries, 3);
-        evicted.sort();
-        assert_eq!(evicted, vec!["k0", "k1", "k2"]);
-
-        // evict_count larger than the cache size is clamped, not OOB.
-        assert_eq!(form_post_replay_evict_keys(&entries, 100).len(), 10);
-
-        // Degenerate inputs return nothing.
-        assert!(form_post_replay_evict_keys(&entries, 0).is_empty());
-        assert!(form_post_replay_evict_keys(&[], 5).is_empty());
     }
 }

@@ -166,7 +166,7 @@ export default function AnalyticsSection({ config }: Props) {
     });
     listBuckets()
       .then(bs => {
-        const names = bs.map(b => b.name);
+        const names = bs.filter(b => !b.unavailable).map(b => b.name);
         setAllBuckets(names);
         // Seed instant O(1) sizes for every bucket (best-effort; 403 → skip).
         names.forEach(name => {

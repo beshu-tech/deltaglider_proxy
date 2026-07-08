@@ -653,7 +653,6 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         usage_scanner: usage_scanner.clone(),
         bucket_usage: bucket_usage.clone(),
         config_db: config_db.clone(),
-        form_post_replay: Arc::new(dashmap::DashMap::new()),
         maintenance_gate: maintenance_gate.clone(),
         maintenance_notify: maintenance_notify.clone(),
         backend_capabilities: backend_capabilities.clone(),
