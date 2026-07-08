@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.12.1 — 2026-07-08
+
 ## v1.12.0 — 2026-07-06
 
 Verifying a replication mirror now shows real motion, and a pure 1:1 mirror
