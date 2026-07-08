@@ -924,16 +924,20 @@ async fn test_brute_force_rate_limiting() {
 
     let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
 
-    // Send rapid requests with wrong credentials from the same "IP"
-    // (via X-Forwarded-For header, trusted because DGP_TRUST_PROXY_HEADERS=true in tests)
-    // Rate limit overridden to 5 attempts for this test.
+    // Send rapid requests with UNKNOWN access keys from the same "IP" (via
+    // X-Forwarded-For, trusted because DGP_TRUST_PROXY_HEADERS=true in tests).
+    // NOTE: the brute-force lockout keys on credential (access-key) failures —
+    // the enumeration attack that matters. Since the SigV4-dedup refactor, a
+    // valid-AKID/wrong-SECRET forged signature is rejected by s3s (403) and does
+    // NOT feed this limiter (guessing an HMAC secret is infeasible anyway); the
+    // access-key path below is the surviving, meaningful defense.
     let mut statuses = Vec::new();
     for i in 0..15 {
         let resp = build_signed_get(
             &server.endpoint(),
             &format!("/{}", server.bucket()),
-            "testkey",
-            &format!("wrong_secret_{}", i),
+            &format!("WRONGKEY{}", i),
+            "irrelevant_secret",
             &now,
         )
         .header("x-forwarded-for", "10.0.0.99")
@@ -1636,6 +1640,115 @@ async fn test_sigv4_payload_hash_match_succeeds() {
         resp.status().as_u16(),
         200,
         "correctly-signed PUT must succeed, got {}",
+        resp.status()
+    );
+}
+
+// ============================================================================
+// Adversarial: prove s3s is the AUTHORITATIVE signature rejector
+// ----------------------------------------------------------------------------
+// These forge a WELL-FORMED signature (valid AKID, valid canonicalization,
+// wrong signature bytes) so the request passes parse + identity resolution and
+// is rejected purely on the SIGNATURE COMPARISON. They lock in the invariant
+// that the SigV4-dedup refactor rests on: a forged signature is 403'd on every
+// shape. They must pass BOTH with the outer verifier present AND after it is
+// removed (s3s alone). See docs/plan/sigv4-dedup.
+// ============================================================================
+
+/// Flip the last 8 hex chars of a 64-hex SigV4 signature so it stays
+/// well-formed but cryptographically wrong.
+fn tamper_signature(sig: &str) -> String {
+    let keep = &sig[..sig.len().saturating_sub(8)];
+    format!("{keep}deadbeef")
+}
+
+/// A header-signed GET with a TAMPERED signature must be 403 (the signature
+/// comparison rejects, not the parse or the identity lookup).
+#[tokio::test]
+async fn test_forged_header_signature_rejected() {
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .build()
+        .await;
+    let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let path = format!("/{}", server.bucket());
+    let date = &now[..8];
+    let region = "us-east-1";
+    let host = server
+        .endpoint()
+        .strip_prefix("http://")
+        .unwrap_or(&server.endpoint())
+        .to_string();
+    let scope = format!("{date}/{region}/s3/aws4_request");
+    let payload_hash = "UNSIGNED-PAYLOAD";
+    let canonical_headers =
+        format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{now}\n");
+    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+    let canonical_request =
+        format!("GET\n{path}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{now}\n{scope}\n{}",
+        sha256_hex(canonical_request.as_bytes())
+    );
+    let signing_key = derive_signing_key("testsecret", date, region, "s3");
+    let good_sig = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+    let forged = tamper_signature(&good_sig);
+    let auth_header = format!(
+        "AWS4-HMAC-SHA256 Credential=testkey/{scope}, SignedHeaders={signed_headers}, Signature={forged}"
+    );
+
+    let resp = reqwest::Client::new()
+        .get(format!("{}{path}", server.endpoint()))
+        .header("authorization", auth_header)
+        .header("x-amz-date", &now)
+        .header("x-amz-content-sha256", payload_hash)
+        .header("host", host)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a forged header signature must be rejected 403, got {}",
+        resp.status()
+    );
+}
+
+/// A presigned URL whose X-Amz-Signature is TAMPERED must be 403.
+#[tokio::test]
+async fn test_forged_presigned_signature_rejected() {
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .build()
+        .await;
+    let client = server.s3_client_with_creds("testkey", "testsecret").await;
+    // Mint a genuine presigned GET URL, then corrupt its signature param.
+    let presigned = client
+        .get_object()
+        .bucket(server.bucket())
+        .key("whatever.txt")
+        .presigned(PresigningConfig::expires_in(Duration::from_secs(300)).unwrap())
+        .await
+        .expect("presign");
+    let url = presigned.uri().to_string();
+    // Replace the signature value with a well-formed-but-wrong one.
+    let forged_url = {
+        let re_key = "X-Amz-Signature=";
+        let idx = url.find(re_key).expect("has signature param") + re_key.len();
+        let end = url[idx..].find('&').map(|e| idx + e).unwrap_or(url.len());
+        let mut u = url.clone();
+        u.replace_range(idx..end, &"0".repeat(end - idx));
+        u
+    };
+    let resp = reqwest::Client::new()
+        .get(&forged_url)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a forged presigned signature must be rejected 403, got {}",
         resp.status()
     );
 }
