@@ -209,6 +209,12 @@ pub struct BucketPolicyRegistry {
     policies: HashMap<String, BucketPolicyConfig>,
     default_compression: bool,
     default_max_delta_ratio: f32,
+    /// Lowercased REAL storage names of every `replication_target_only` bucket
+    /// (`alias` or, absent one, the virtual name). A client write to an
+    /// UNCONFIGURED name equal to one of these resolves — via the cross-backend
+    /// probe in `resolve_existing_named` — onto the protected mirror's storage,
+    /// so it must be blocked even though no policy is keyed under that name.
+    replication_target_real_names: std::collections::HashSet<String>,
 }
 
 impl BucketPolicyRegistry {
@@ -224,7 +230,7 @@ impl BucketPolicyRegistry {
     ) -> Self {
         let policies: HashMap<String, BucketPolicyConfig> = policies.into_iter().collect();
         // Normalize bucket names to lowercase and validate ratio values + public prefixes
-        let policies = policies
+        let policies: HashMap<String, BucketPolicyConfig> = policies
             .into_iter()
             .map(|(k, mut v)| {
                 if let Some(ratio) = v.max_delta_ratio {
@@ -316,10 +322,23 @@ impl BucketPolicyRegistry {
                 (k.to_ascii_lowercase(), v)
             })
             .collect();
+        // Index the real storage name of every marked bucket (alias, else the
+        // virtual name) so an unconfigured request onto that storage is blocked.
+        let replication_target_real_names: std::collections::HashSet<String> = policies
+            .iter()
+            .filter(|(_, p)| p.replication_target_only)
+            .map(|(name, p)| {
+                p.alias
+                    .clone()
+                    .unwrap_or_else(|| name.clone())
+                    .to_ascii_lowercase()
+            })
+            .collect();
         Self {
             policies,
             default_compression: true,
             default_max_delta_ratio,
+            replication_target_real_names,
         }
     }
 
@@ -361,6 +380,43 @@ impl BucketPolicyRegistry {
         self.policies
             .get(bucket)
             .is_some_and(|p| p.replication_target_only)
+    }
+
+    /// Reason (if any) a client write to `bucket` must be blocked to preserve
+    /// the `replication_target_only` single-writer guarantee. `None` = allowed.
+    ///
+    /// Two cases: the CONFIGURED marked name (looked up directly), and an
+    /// UNCONFIGURED name that equals a marked bucket's real storage name — the
+    /// alias hole, where `resolve_existing_named`'s cross-backend probe would
+    /// otherwise route the write onto protected storage. Over-blocking a
+    /// genuinely-different same-named bucket is the safe trade (a 403 with a
+    /// fix hint vs. silent mirror corruption); an explicit backend route
+    /// disambiguates it, since configured names bypass the probe.
+    pub fn client_write_block_reason(&self, bucket: &str) -> Option<String> {
+        let key = bucket.to_ascii_lowercase();
+        if self.replication_target_only(&key) {
+            return Some(format!(
+                "Bucket '{bucket}' is replication_target_only: client writes are disabled so \
+                 replication remains the single writer — see {url}",
+                url = crate::coordination::capability::CAPABILITY_DOC_URL
+            ));
+        }
+        // Only UNCONFIGURED names are dangerous here: a configured name resolves
+        // via its own route (or the default-backend head-probe) to its OWN
+        // storage and never falls through to the cross-backend probe that would
+        // reach the mirror. So a name with its own policy is exempt — which is
+        // exactly the "declare it explicitly with a backend route" escape hatch
+        // the message promises.
+        if !self.policies.contains_key(&key) && self.replication_target_real_names.contains(&key) {
+            return Some(format!(
+                "Bucket name '{bucket}' maps to the storage of a replication_target_only \
+                 bucket, so client writes are blocked to keep replication the single writer. \
+                 If this is a different bucket, declare it explicitly with a backend route — \
+                 see {url}",
+                url = crate::coordination::capability::CAPABILITY_DOC_URL
+            ));
+        }
+        None
     }
 
     /// Resolve routing for a bucket: returns (backend_name, real_bucket_name).
@@ -570,6 +626,93 @@ mod tests {
         let (backend, real) = registry.resolve_backend("dev-data");
         assert_eq!(backend, Some("local"));
         assert_eq!(real, "dev-data");
+    }
+
+    // ── replication_target_only write gate (incl. the alias hole) ──
+
+    fn marked(alias: Option<&str>, backend: Option<&str>) -> BucketPolicyConfig {
+        BucketPolicyConfig {
+            replication_target_only: true,
+            alias: alias.map(String::from),
+            backend: backend.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn client_write_block_reason_covers_configured_and_alias_names() {
+        let mut policies = HashMap::new();
+        // Marked bucket with an alias on a NAMED backend — the alias hole:
+        // an unconfigured request to `real-mirror` resolves onto this storage.
+        policies.insert("mirror".into(), marked(Some("real-mirror"), Some("b2")));
+        // Marked bucket WITHOUT an alias — real name == virtual name.
+        policies.insert("plain-mirror".into(), marked(None, None));
+        let reg = BucketPolicyRegistry::new(policies, 0.75);
+
+        // (a) Configured marked name → blocked with the original message.
+        let r = reg.client_write_block_reason("mirror").expect("blocked");
+        assert!(r.contains("replication_target_only"), "{r}");
+
+        // (b) Unconfigured name equal to the alias → blocked (the hole).
+        let r = reg
+            .client_write_block_reason("real-mirror")
+            .expect("alias hole must be blocked");
+        assert!(r.contains("maps to the storage"), "{r}");
+
+        // (c) Case-insensitive on both paths.
+        assert!(reg.client_write_block_reason("REAL-MIRROR").is_some());
+        assert!(reg.client_write_block_reason("Mirror").is_some());
+
+        // (d) No-alias marked bucket: real name == virtual name → the direct
+        //     marker path fires (original message, not the collision one).
+        let r = reg
+            .client_write_block_reason("plain-mirror")
+            .expect("blocked");
+        assert!(r.contains("replication_target_only"), "{r}");
+
+        // (e) An unrelated unconfigured name is allowed.
+        assert!(reg.client_write_block_reason("some-other-bucket").is_none());
+    }
+
+    #[test]
+    fn client_write_block_reason_exempts_explicitly_configured_colliding_name() {
+        let mut policies = HashMap::new();
+        // Marked bucket whose real storage name is `shared-data`.
+        policies.insert("mirror".into(), marked(Some("shared-data"), Some("b2")));
+        // A genuinely DIFFERENT bucket that happens to share that name but has
+        // its own explicit route — it resolves to `local`, never the mirror.
+        policies.insert(
+            "shared-data".into(),
+            BucketPolicyConfig {
+                backend: Some("local".into()),
+                ..Default::default()
+            },
+        );
+        let reg = BucketPolicyRegistry::new(policies, 0.75);
+
+        // The explicitly-configured name is NOT blocked — the escape hatch the
+        // collision message advertises actually works.
+        assert!(
+            reg.client_write_block_reason("shared-data").is_none(),
+            "a name with its own backend route must not be blocked"
+        );
+        // The mirror's virtual name is still blocked (control).
+        assert!(reg.client_write_block_reason("mirror").is_some());
+    }
+
+    #[test]
+    fn client_write_block_reason_allows_when_no_markers() {
+        let mut policies = HashMap::new();
+        policies.insert(
+            "normal".into(),
+            BucketPolicyConfig {
+                backend: Some("local".into()),
+                ..Default::default()
+            },
+        );
+        let reg = BucketPolicyRegistry::new(policies, 0.75);
+        assert!(reg.client_write_block_reason("normal").is_none());
+        assert!(reg.client_write_block_reason("real-mirror").is_none());
     }
 
     // ── Public prefix tests (via PublicPrefixSnapshot — the production path) ──

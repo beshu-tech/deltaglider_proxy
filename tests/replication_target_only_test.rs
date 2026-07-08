@@ -202,6 +202,55 @@ async fn test_marked_bucket_rejects_client_writes_replication_still_works() {
         .expect("CreateBucket on an existing marked bucket must be allowed");
 }
 
+/// The alias hole: a marked bucket declared with an `alias` is protected under
+/// its VIRTUAL name, but a client PUT to the UNCONFIGURED real (alias) name
+/// resolves — via the cross-backend probe — onto the same protected storage.
+/// That write must be blocked too; an unrelated unconfigured name still writes.
+#[tokio::test]
+async fn test_marked_bucket_alias_name_is_also_blocked() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        // Marked virtual name `mirror` aliases real storage `real-mirror`.
+        .bucket_policy(
+            "mirror",
+            "replication_target_only: true\nalias: real-mirror",
+        )
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    client.create_bucket().bucket("mirror").send().await.ok();
+
+    // PUT to the UNCONFIGURED alias name → 403 with the collision message.
+    let err = client
+        .put_object()
+        .bucket("real-mirror")
+        .key("sneaky.txt")
+        .body(ByteStream::from_static(b"nope"))
+        .send()
+        .await
+        .expect_err("write to the alias real-name must be blocked");
+    assert_eq!(err.meta().code().unwrap_or(""), "AccessDenied", "{err:?}");
+    assert!(
+        err.meta()
+            .message()
+            .unwrap_or("")
+            .contains("maps to the storage"),
+        "must be the alias-collision message, got {:?}",
+        err.meta().message()
+    );
+
+    // An unrelated unconfigured bucket accepts writes (control).
+    client.create_bucket().bucket("unrelated").send().await.ok();
+    client
+        .put_object()
+        .bucket("unrelated")
+        .key("ok.txt")
+        .body(ByteStream::from_static(b"fine"))
+        .send()
+        .await
+        .expect("unrelated unconfigured bucket must accept writes");
+}
+
 #[tokio::test]
 async fn test_admin_bulk_ops_respect_marker() {
     let server = TestServer::builder()

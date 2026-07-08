@@ -51,8 +51,6 @@ pub(crate) async fn enqueue_object_events(state: &Arc<AppState>, events: &[NewEv
     }
 }
 
-use crate::coordination::capability::CAPABILITY_DOC_URL;
-
 /// Client-write boundary gate. A bucket marked `replication_target_only`
 /// refuses ALL client writes (PUT/DELETE/multipart/copy-into/admin bulk)
 /// with 403 so replication remains the single writer — the property that
@@ -64,15 +62,13 @@ pub(crate) fn check_client_write_allowed(
     bucket: &str,
 ) -> Result<(), S3Error> {
     let engine = state.engine.load();
-    // Registry keys are lowercased; form-POST passes the raw path segment.
-    if engine
+    // Blocks the configured marked name AND an unconfigured name that resolves
+    // onto marked storage (the alias hole). Registry lowercases internally.
+    if let Some(reason) = engine
         .bucket_policy_registry()
-        .replication_target_only(&bucket.to_ascii_lowercase())
+        .client_write_block_reason(bucket)
     {
-        return Err(S3Error::AccessDeniedReason(format!(
-            "Bucket '{bucket}' is replication_target_only: client writes are disabled so \
-             replication remains the single writer — see {CAPABILITY_DOC_URL}"
-        )));
+        return Err(S3Error::AccessDeniedReason(reason));
     }
     Ok(())
 }
