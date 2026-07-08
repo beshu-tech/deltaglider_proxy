@@ -148,6 +148,20 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Storage",
     },
     EnvVarEntry {
+        name: "DGP_BACKEND_LIST_COOLDOWN_SECS",
+        description: "How long a backend that fails a bucket listing is skipped \
+                      (served from last-known-good) before the next re-probe",
+        example: "30",
+        category: "Storage",
+    },
+    EnvVarEntry {
+        name: "DGP_BACKEND_LIST_TIMEOUT_SECS",
+        description: "Per-backend timeout for a single bucket-listing call \
+                      (bounds a hung backend)",
+        example: "5",
+        category: "Storage",
+    },
+    EnvVarEntry {
         name: "DGP_CACHE_MB",
         description: "Reference cache size in MB",
         example: "100",
@@ -2822,6 +2836,8 @@ mod tests {
             "DGP_S3_CONNECT_TIMEOUT_SECS",    // storage::s3::build_client()
             "DGP_S3_OPERATION_ATTEMPT_TIMEOUT_SECS", // storage::s3::build_client()
             "DGP_S3_STALL_GRACE_SECS",        // storage::s3::build_client()
+            "DGP_BACKEND_LIST_COOLDOWN_SECS", // storage::routing::RoutingBackend::new()
+            "DGP_BACKEND_LIST_TIMEOUT_SECS",  // storage::routing::RoutingBackend::new()
             "DGP_TRUSTED_PROXY_CIDRS",        // rate_limiter::trusted_proxy_cidrs()
         ];
         for name in &registry_names {

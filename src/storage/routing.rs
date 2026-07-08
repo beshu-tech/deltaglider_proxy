@@ -39,14 +39,29 @@ type BackendRoster = Vec<(String, chrono::DateTime<chrono::Utc>)>;
 /// (backend_name, listing outcome) from the parallel fan-out.
 type BackendListing = (String, Result<BackendRoster, StorageError>);
 
+/// Per-backend listing health, behind one lock (`gather_listings` takes it once
+/// after the fan-out anyway).
+#[derive(Default)]
+struct BackendHealth {
+    /// Last successful (real_bucket, date) listing per backend — synthesizes
+    /// unavailable placeholders when that backend fails (explicit routes alone
+    /// would miss default-backend buckets).
+    last_known: HashMap<String, BackendRoster>,
+    /// Backends in failure cooldown: name → (retry-after deadline, last error).
+    /// Skipped by `gather_listings` until the deadline, so one dead backend
+    /// doesn't tax every listing with a connect timeout.
+    cooldown: HashMap<String, (std::time::Instant, String)>,
+}
+
 pub struct RoutingBackend {
     backends: HashMap<String, Arc<Box<dyn StorageBackend>>>,
     routes: HashMap<String, BucketRoute>,
     default_backend: String,
-    /// Last successful (real_bucket, date) listing per backend — the roster
-    /// used to synthesize unavailable placeholders when that backend fails
-    /// (explicit routes alone would miss default-backend buckets).
-    last_known: parking_lot::Mutex<HashMap<String, BackendRoster>>,
+    health: parking_lot::Mutex<BackendHealth>,
+    /// How long a backend stays in cooldown after a failed listing.
+    list_cooldown: std::time::Duration,
+    /// Per-backend cap for a single listing call (bounds a hung backend).
+    list_timeout: std::time::Duration,
 }
 
 impl RoutingBackend {
@@ -58,6 +73,34 @@ impl RoutingBackend {
         backends: HashMap<String, Arc<Box<dyn StorageBackend>>>,
         routes: HashMap<String, (String, Option<String>)>,
         default_backend: String,
+    ) -> Result<Self, StorageError> {
+        // Read the listing-resilience knobs once (rebuilt fresh with the engine,
+        // so a hot config reload clears cooldowns for free).
+        let list_cooldown = std::time::Duration::from_secs(crate::config::env_parse_with_default(
+            "DGP_BACKEND_LIST_COOLDOWN_SECS",
+            30u64,
+        ));
+        // Floor the timeout at 1s: a 0 would make tokio::time::timeout elapse
+        // before any real network call, cycling every backend through cooldown.
+        let list_timeout = std::time::Duration::from_secs(
+            crate::config::env_parse_with_default("DGP_BACKEND_LIST_TIMEOUT_SECS", 5u64).max(1),
+        );
+        Self::with_health_config(
+            backends,
+            routes,
+            default_backend,
+            list_cooldown,
+            list_timeout,
+        )
+    }
+
+    /// Constructor with injectable cooldown/timeout — the test seam.
+    fn with_health_config(
+        backends: HashMap<String, Arc<Box<dyn StorageBackend>>>,
+        routes: HashMap<String, (String, Option<String>)>,
+        default_backend: String,
+        list_cooldown: std::time::Duration,
+        list_timeout: std::time::Duration,
     ) -> Result<Self, StorageError> {
         if !backends.contains_key(&default_backend) {
             return Err(StorageError::Other(format!(
@@ -94,7 +137,9 @@ impl RoutingBackend {
             backends,
             routes,
             default_backend,
-            last_known: parking_lot::Mutex::new(HashMap::new()),
+            health: parking_lot::Mutex::new(BackendHealth::default()),
+            list_cooldown,
+            list_timeout,
         })
     }
 
@@ -203,18 +248,80 @@ impl RoutingBackend {
     async fn gather_listings(&self) -> Vec<BackendListing> {
         let mut names: Vec<&String> = self.backends.keys().collect();
         names.sort();
-        let futs = names.into_iter().map(|name| {
-            let backend = &self.backends[name];
-            async move { (name.clone(), backend.list_buckets_with_dates().await) }
-        });
-        let results = futures::future::join_all(futs).await;
-        let mut snap = self.last_known.lock();
-        for (name, res) in &results {
-            if let Ok(list) = res {
-                snap.insert(name.clone(), list.clone());
+        let now = std::time::Instant::now();
+
+        // Decide per backend: probe it, or short-circuit as cooling-down. The
+        // first request past a deadline optimistically RE-ARMS the cooldown
+        // before probing, so concurrent requests in the same window skip and
+        // exactly one prober pays the timeout per cooldown period.
+        let mut to_probe: Vec<&String> = Vec::new();
+        let mut cooling: Vec<BackendListing> = Vec::new();
+        {
+            let mut h = self.health.lock();
+            for name in names {
+                // Snapshot the entry so the mutable re-arm below doesn't alias
+                // the immutable `.get()` borrow.
+                match h.cooldown.get(name).cloned() {
+                    Some((deadline, last_err)) if deadline > now => {
+                        let secs = (deadline - now).as_secs();
+                        cooling.push((
+                            name.clone(),
+                            Err(StorageError::S3(format!(
+                                "backend in failure cooldown ({secs}s remaining): {last_err}"
+                            ))),
+                        ));
+                    }
+                    Some((_, last_err)) => {
+                        // Deadline expired → re-arm now; this request re-probes.
+                        h.cooldown
+                            .insert(name.clone(), (now + self.list_cooldown, last_err));
+                        to_probe.push(name);
+                    }
+                    None => to_probe.push(name),
+                }
             }
         }
-        drop(snap);
+
+        // Probe the live candidates concurrently, each capped by list_timeout.
+        let futs = to_probe.into_iter().map(|name| {
+            let backend = &self.backends[name];
+            let timeout = self.list_timeout;
+            async move {
+                let outcome =
+                    match tokio::time::timeout(timeout, backend.list_buckets_with_dates()).await {
+                        Ok(res) => res,
+                        Err(_) => Err(StorageError::S3(format!(
+                            "listing timed out after {}s",
+                            timeout.as_secs()
+                        ))),
+                    };
+                (name.clone(), outcome)
+            }
+        });
+        let probed = futures::future::join_all(futs).await;
+
+        // Update health from the probes: success clears cooldown + refreshes the
+        // roster; failure (re)arms cooldown with the real error.
+        {
+            let mut h = self.health.lock();
+            for (name, res) in &probed {
+                match res {
+                    Ok(list) => {
+                        h.last_known.insert(name.clone(), list.clone());
+                        h.cooldown.remove(name);
+                    }
+                    Err(e) => {
+                        h.cooldown
+                            .insert(name.clone(), (now + self.list_cooldown, e.to_string()));
+                    }
+                }
+            }
+        }
+
+        // Deterministic order (backends were name-sorted; re-sort the union).
+        let mut results = probed;
+        results.extend(cooling);
+        results.sort_by(|a, b| a.0.cmp(&b.0));
         results
     }
 
@@ -446,7 +553,7 @@ impl StorageBackend for RoutingBackend {
                             .cloned();
                         push(virtual_name.clone(), real_alias);
                     }
-                    let snapshot = self.last_known.lock().get(backend_name).cloned();
+                    let snapshot = self.health.lock().last_known.get(backend_name).cloned();
                     for (real_bucket, _) in snapshot.unwrap_or_default() {
                         let virtual_name =
                             self.listed_bucket_virtual_name(backend_name, &real_bucket);
@@ -929,6 +1036,8 @@ mod tests {
         /// When true, list_buckets(_with_dates) returns an error — models an
         /// upstream backend 503-ing. Shared so a test can flip it mid-test.
         fail_list: Arc<StdMutex<bool>>,
+        /// Count of list_buckets calls — asserts the cooldown skips a backend.
+        list_calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl TestBackend {
@@ -939,6 +1048,7 @@ mod tests {
                 )),
                 create_calls: Arc::new(StdMutex::new(Vec::new())),
                 fail_list: Arc::new(StdMutex::new(false)),
+                list_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
 
@@ -970,6 +1080,8 @@ mod tests {
         }
 
         async fn list_buckets(&self) -> Result<Vec<String>, StorageError> {
+            self.list_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if *self.fail_list.lock().unwrap() {
                 return Err(StorageError::S3("simulated backend outage".into()));
             }
@@ -1192,7 +1304,9 @@ mod tests {
             backends: HashMap::new(),
             routes,
             default_backend: "primary".to_string(),
-            last_known: parking_lot::Mutex::new(HashMap::new()),
+            health: parking_lot::Mutex::new(BackendHealth::default()),
+            list_cooldown: std::time::Duration::from_secs(30),
+            list_timeout: std::time::Duration::from_secs(5),
         };
 
         assert_eq!(
@@ -1352,6 +1466,143 @@ mod tests {
             .expect("unrouted bucket must survive the outage");
         assert!(b.unavailable.as_deref().unwrap_or("").contains("simulated"));
         assert!(b.creation_date.is_none(), "no fabricated date");
+    }
+
+    // ── dead-backend listing cooldown (Design A) ──
+
+    /// Build a routing backend with an injected cooldown TTL (timeout large so
+    /// it never fires in these logic tests).
+    fn routing_with_cooldown(
+        backends: HashMap<String, Arc<Box<dyn StorageBackend>>>,
+        default: &str,
+        cooldown: std::time::Duration,
+    ) -> RoutingBackend {
+        RoutingBackend::with_health_config(
+            backends,
+            HashMap::new(),
+            default.to_string(),
+            cooldown,
+            std::time::Duration::from_secs(30),
+        )
+        .expect("routing backend")
+    }
+
+    #[tokio::test]
+    async fn failed_backend_is_skipped_during_cooldown() {
+        let dead = TestBackend::failing();
+        let probe_count = dead.list_calls.clone();
+        let mut backends = HashMap::new();
+        backends.insert(
+            "up".to_string(),
+            Arc::new(Box::new(TestBackend::with_buckets(&["alive"])) as Box<dyn StorageBackend>),
+        );
+        backends.insert(
+            "dead".to_string(),
+            Arc::new(Box::new(dead) as Box<dyn StorageBackend>),
+        );
+        let routing = routing_with_cooldown(backends, "up", std::time::Duration::from_secs(300));
+
+        // First listing probes the dead backend (fails → arms cooldown).
+        let _ = routing.list_bucket_origins().await.expect("ok");
+        assert_eq!(probe_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Second listing must NOT re-probe it, yet still flag it unavailable
+        // with the cooldown-prefixed origin error.
+        let origins = routing.list_bucket_origins().await.expect("ok");
+        assert_eq!(
+            probe_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "dead backend must not be re-probed during cooldown"
+        );
+        // (no unavailable placeholder here because 'dead' has no routes/roster;
+        //  the reachable bucket is still returned — the point is zero re-probe.)
+        assert!(origins.iter().any(|b| b.name == "alive"));
+    }
+
+    #[tokio::test]
+    async fn cooldown_prefixed_error_carries_the_real_origin() {
+        // A dead backend WITH a last-known roster → the placeholder path fires
+        // on the cooled request, carrying the cooldown-prefixed real error.
+        let flaky = TestBackend::with_buckets(&["data"]);
+        let flip = flaky.fail_list.clone();
+        let mut backends = HashMap::new();
+        backends.insert(
+            "up".to_string(),
+            Arc::new(Box::new(TestBackend::with_buckets(&["alive"])) as Box<dyn StorageBackend>),
+        );
+        backends.insert(
+            "flaky".to_string(),
+            Arc::new(Box::new(flaky) as Box<dyn StorageBackend>),
+        );
+        let routing = routing_with_cooldown(backends, "up", std::time::Duration::from_secs(300));
+
+        routing.list_bucket_origins().await.expect("ok"); // seed roster
+        *flip.lock().unwrap() = true;
+        routing.list_bucket_origins().await.expect("ok"); // fail → arm cooldown
+        let origins = routing.list_bucket_origins().await.expect("ok"); // cooled
+        let b = origins
+            .iter()
+            .find(|b| b.name == "data")
+            .expect("placeholder from last-known roster");
+        let err = b.unavailable.as_deref().unwrap_or("");
+        assert!(err.contains("failure cooldown"), "{err}");
+        assert!(err.contains("simulated backend outage"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn successful_probe_clears_cooldown() {
+        let flaky = TestBackend::with_buckets(&["data"]);
+        let flip = flaky.fail_list.clone();
+        let count = flaky.list_calls.clone();
+        let mut backends = HashMap::new();
+        backends.insert(
+            "up".to_string(),
+            Arc::new(Box::new(TestBackend::with_buckets(&["alive"])) as Box<dyn StorageBackend>),
+        );
+        backends.insert(
+            "flaky".to_string(),
+            Arc::new(Box::new(flaky) as Box<dyn StorageBackend>),
+        );
+        // TTL zero → every request re-probes (no lingering cooldown).
+        let routing = routing_with_cooldown(backends, "up", std::time::Duration::ZERO);
+
+        *flip.lock().unwrap() = true;
+        routing.list_bucket_origins().await.expect("ok"); // fail
+        *flip.lock().unwrap() = false; // recover
+        let before = count.load(std::sync::atomic::Ordering::SeqCst);
+        let origins = routing.list_bucket_origins().await.expect("ok");
+        assert!(
+            count.load(std::sync::atomic::Ordering::SeqCst) > before,
+            "a zero-TTL cooldown must let the next request re-probe"
+        );
+        // Recovered → listed live, not flagged.
+        assert!(origins
+            .iter()
+            .any(|b| b.name == "data" && b.unavailable.is_none()));
+    }
+
+    #[tokio::test]
+    async fn all_backends_cooling_returns_err_with_origins() {
+        let d1 = TestBackend::failing();
+        let d2 = TestBackend::failing();
+        let mut backends = HashMap::new();
+        backends.insert(
+            "a".to_string(),
+            Arc::new(Box::new(d1) as Box<dyn StorageBackend>),
+        );
+        backends.insert(
+            "b".to_string(),
+            Arc::new(Box::new(d2) as Box<dyn StorageBackend>),
+        );
+        let routing = routing_with_cooldown(backends, "a", std::time::Duration::from_secs(300));
+
+        // First call fails all → arms cooldowns and returns Err.
+        assert!(routing.list_buckets().await.is_err());
+        // Second call: all cooling; still Err, and the aggregate names the real
+        // origin error, not just "in cooldown".
+        let err = routing.list_buckets().await.expect_err("all cooling → Err");
+        let msg = err.to_string();
+        assert!(msg.contains("simulated backend outage"), "{msg}");
     }
 
     /// The complement: a PARTIAL failure (one backend up, one down) still
