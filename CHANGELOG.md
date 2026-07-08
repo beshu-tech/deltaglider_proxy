@@ -4,6 +4,43 @@
 
 ## v1.12.1 — 2026-07-08
 
+A hardening release from a full adversarial review of the last several versions.
+No new features; correctness and safety fixes throughout.
+
+### Fixed
+
+- **Verify no longer flags a healthy mirror as broken.** On same-backend
+  mirrors, some correctly-replicated objects could show up as a permanent
+  "checksum mismatch" that no re-run could clear. Verify now compares the same
+  logical checksum in every case (reading it straight from the listing when the
+  backend allows, so it stays download-free), and the progress bar climbs
+  smoothly to 100% instead of overshooting or freezing.
+- **A temporarily-unreachable backend no longer hides buckets.** Buckets on a
+  backend that's throttling or down now stay listed (flagged unavailable) even
+  when they aren't explicitly pinned to that backend, and the bucket list
+  survives a full outage instead of collapsing to an error. A throttled backend
+  now returns a proper "slow down" signal so clients back off, rather than an
+  error clients treat as permanent. The UI also stops trying to browse, scan,
+  or copy into buckets it knows are unavailable.
+- **Storage migration can't strand the proxy.** Migrating a bucket onto a
+  backend that doesn't support the required safety guarantees is now refused up
+  front, instead of succeeding and then failing to start on the next restart.
+- **Backend capability detection is more robust.** The check that decides
+  whether a backend is safe for multi-instance use no longer misreads unrelated
+  details (an endpoint port, a request id) as a failure, and never leaves a
+  stray probe object behind in your buckets.
+- **Browser (form) uploads honor the full upload policy.** An upload whose
+  signed policy doesn't constrain the object key is now rejected, matching AWS
+  behavior, so a leaked upload signature can't be reused to write elsewhere.
+- **Replication mirrors are protected from accidental deletion.** A
+  replication-target bucket can no longer be created or deleted through the S3
+  API by clients.
+
+### Changed
+
+- Faster bucket listings when multiple backends are configured (queried in
+  parallel), and clearer error detail when a backend can't be reached.
+
 ## v1.12.0 — 2026-07-06
 
 Verifying a replication mirror now shows real motion, and a pure 1:1 mirror
