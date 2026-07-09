@@ -10,6 +10,8 @@ import { useColors } from '../ThemeContext';
 import { getPreviewMode } from './filePreviewMode';
 import { useAdminConfig } from '../queries/config';
 import { useOnClickOutside } from '../useDocumentEvent';
+import { useOverlayClose } from '../hooks/useOverlayClose';
+import { useNavigation } from '../NavigationContext';
 
 const SHARE_DURATIONS = [
   { label: '1 hour', seconds: 3600 },
@@ -239,6 +241,10 @@ export default function InspectorPanel({
     | null
   >(null);
   const blobRef = useRef<{ blob: Blob; name: string } | null>(null);
+  // --- Back-button close for download/share modal ---
+  const { markPushed, closeOverlay } = useOverlayClose();
+  const { navigate } = useNavigation();
+  const pushedForModal = useRef(false);
   const [shareDuration, setShareDuration] = useState<number | null>(null);
   const objectKey = object?.key;
   const cachedHead = objectKey ? headCache?.[objectKey] : undefined;
@@ -325,6 +331,31 @@ export default function InspectorPanel({
     blobRef.current = null;
   }, [objectKey]);
 
+  // Push a history entry when the modal opens so Back closes it before
+  // leaving the page.  The entry reuses the current URL (no visible change);
+  // popstate is the signal to close.
+  useEffect(() => {
+    if (modalState && !pushedForModal.current) {
+      window.history.pushState(null, '', window.location.href);
+      markPushed();
+      pushedForModal.current = true;
+    }
+    if (!modalState) {
+      pushedForModal.current = false;
+    }
+  }, [modalState, markPushed]);
+
+  // Close the modal on popstate (Back button or history.back()).
+  useEffect(() => {
+    if (!modalState) return;
+    const onPopState = () => {
+      setModalState(null);
+      blobRef.current = null;
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, [modalState !== null]);
+
   if (!object) return null;
 
   const fileName = getFileName(object.key);
@@ -404,6 +435,7 @@ export default function InspectorPanel({
   const triggerBlobDownload = () => {
     if (!blobRef.current) return;
     downloadBlobAsFile(blobRef.current.blob, blobRef.current.name);
+    closeOverlay(window.location.pathname + window.location.search, navigate);
     setModalState(null);
   };
 
@@ -732,7 +764,7 @@ export default function InspectorPanel({
       {/* Download / Share modal */}
       <Modal
         open={!!modalState}
-        onCancel={() => { setModalState(null); blobRef.current = null; }}
+        onCancel={() => { closeOverlay(window.location.pathname + window.location.search, navigate); setModalState(null); blobRef.current = null; }}
         footer={null}
         centered
         width={420}

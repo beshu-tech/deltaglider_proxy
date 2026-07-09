@@ -35,6 +35,8 @@ import DashboardToolbar, { type RefreshCadence } from './dashboard/DashboardTool
 import { CHART_PALETTE, STATUS_COLORS, chartTooltipStyle, axisTickStyle, fmtDuration, fmtNum, fmtPct } from './dashboard/chartDefaults';
 import './dashboard/dashboard.css';
 import { normalizeUiError } from '../errorHandling';
+import { useNavigation } from '../NavigationContext';
+import { parseAdminQuery, buildViewUrl } from '../urlState';
 
 const { Text } = Typography;
 
@@ -152,10 +154,11 @@ interface Snapshot {
 
 const MAX_HISTORY = 60;
 
-interface Props { onBack: () => void; embedded?: boolean; }
+interface Props { onBack: () => void; embedded?: boolean; search?: string; }
 
-export default function MetricsPage({ onBack, embedded }: Props) {
+export default function MetricsPage({ onBack, embedded, search }: Props) {
   const colors = useColors();
+  const { navigate } = useNavigation();
   const [metricsMap, setMetricsMap] = useState<Map<string, ParsedMetric>>(new Map());
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -170,8 +173,10 @@ export default function MetricsPage({ onBack, embedded }: Props) {
   const [scanCardActions, setScanCardActions] = useState<React.ReactNode>(null);
   const scanCardAccent: 'green' | 'amber' | null = null;
   const [activeView, setActiveView] = useState<'monitoring' | 'analytics'>(() => {
-    const saved = localStorage.getItem('dg-metrics-view');
-    return saved === 'analytics' ? 'analytics' : 'monitoring';
+    // Deep-linked via ?view=analytics. The URL is the source of truth; the
+    // toggle below replace-navigates instead of touching localStorage.
+    const q = parseAdminQuery(search || '');
+    return q.view === 'analytics' ? 'analytics' : 'monitoring';
   });
   // Admin config is shared across panels; the cached read deduplicates
   // with whoever else mounted recently (CredentialsModePanel, etc.).
@@ -292,7 +297,19 @@ export default function MetricsPage({ onBack, embedded }: Props) {
         title="Proxy Dashboard"
         meta={<>v{buildVersion} · {backendType} backend · up {uptimeStr}</>}
         view={activeView}
-        onView={(v) => { setActiveView(v); localStorage.setItem('dg-metrics-view', v); }}
+        onView={(v) => {
+          setActiveView(v);
+          // Replace (not push) so toggling doesn't spam history. The base
+          // URL is context-dependent: embedded lives at /_/admin/dashboard,
+          // the standalone page at /_/metrics — so the same ?view= param
+          // deep-links correctly from either surface.
+          navigate(
+            embedded
+              ? buildViewUrl('admin', 'dashboard', { view: v })
+              : buildViewUrl('metrics', '', { view: v }),
+            { replace: true },
+          );
+        }}
         range="5m"
         onRange={() => {}}
         cadence={cadence}

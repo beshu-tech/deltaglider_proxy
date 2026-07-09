@@ -39,6 +39,7 @@ import { useAdminConfig } from '../queries/config';
 import { useNavigation } from '../NavigationContext';
 import { resolveAdminPath as remapAdminPath } from '../adminPathRemap';
 import { buildViewUrl, parseAdminQuery } from '../urlState';
+import { useOverlayClose } from '../hooks/useOverlayClose';
 import TabHeader from './TabHeader';
 import { YamlImportExportModal } from './YamlImportExportModal';
 import { FullIamYamlModal } from './FullIamYamlModal';
@@ -163,6 +164,41 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
   const [yamlModalMode, setYamlModalMode] = useState<'import' | 'export' | null>(null);
   const [iamYamlMode, setIamYamlMode] = useState<'import' | 'export' | null>(null);
   const [restoreFile, setRestoreFile] = useState<File | null>(null);
+
+  // Back-button close for modals (Tier 1.6). When a modal opens we push a
+  // history entry with ?modal=… so Back closes the modal instead of leaving
+  // the page. On direct-load/shared link, closeOverlay replaces the URL.
+  const { markPushed, closeOverlay } = useOverlayClose();
+
+  const openYamlModal = useCallback((mode: 'import' | 'export') => {
+    setYamlModalMode(mode);
+    navigate(buildViewUrl('admin', adminPath, { modal: 'yaml' }));
+    markPushed();
+  }, [navigate, adminPath, markPushed]);
+
+  const closeYamlModal = useCallback(() => {
+    closeOverlay(buildViewUrl('admin', adminPath), navigate);
+    setYamlModalMode(null);
+  }, [closeOverlay, navigate, adminPath]);
+
+  const openIamYamlModal = useCallback((mode: 'import' | 'export') => {
+    setIamYamlMode(mode);
+    navigate(buildViewUrl('admin', adminPath, { modal: 'iam' }));
+    markPushed();
+  }, [navigate, adminPath, markPushed]);
+
+  const closeIamYamlModal = useCallback(() => {
+    closeOverlay(buildViewUrl('admin', adminPath), navigate);
+    setIamYamlMode(null);
+  }, [closeOverlay, navigate, adminPath]);
+
+  // Sync modal state with URL on Back/Forward (popstate). When the URL
+  // no longer carries ?modal=…, close the corresponding modal.
+  useEffect(() => {
+    const q = parseAdminQuery(search ?? '');
+    if (q.modal !== 'yaml' && yamlModalMode !== null) setYamlModalMode(null);
+    if (q.modal !== 'iam' && iamYamlMode !== null) setIamYamlMode(null);
+  }, [search, yamlModalMode, iamYamlMode]);
 
   // Global keyboard shortcuts (Wave 10 / 10.1 §10.3):
   //
@@ -351,9 +387,13 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
   const navigateToGroup = useCallback(
     (groupId: number) => {
       setPendingGroupId(groupId);
-      navigateAdmin('access/groups');
+      // Write ?group=<id> so the URL is the source of truth for the selection
+      // (direct-load + Back/Forward). pendingGroupId stays as a fallback for
+      // the rare case where the param is absent on mount.
+      navigate(buildViewUrl('admin', 'access/groups', { group: String(groupId) }));
+      setMobileNavOpen(false);
     },
-    [navigateAdmin]
+    [navigate]
   );
 
   const handleExportFullBackup = useCallback(async () => {
@@ -455,6 +495,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
         <SetupWizard
           onComplete={() => navigateAdmin('dashboard')}
           onCancel={() => navigateAdmin('dashboard')}
+          search={search}
         />
       );
     }
@@ -465,7 +506,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
       // already carries title + live indicator + tab switcher +
       // refresh controls. Rendering both would duplicate the
       // page-level identity and steal vertical real estate.
-      return <MetricsPage onBack={onBack} embedded />;
+      return <MetricsPage onBack={onBack} embedded search={search} />;
     }
     if (adminPath === 'diagnostics/trace') {
       return (
@@ -546,6 +587,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
           <UsersPanel
             onSessionExpired={onSessionExpired}
             onNavigateToGroup={navigateToGroup}
+            search={search}
           />
         </>
       );
@@ -558,6 +600,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
             onSessionExpired={onSessionExpired}
             initialGroupId={pendingGroupId}
             onGroupSelected={() => setPendingGroupId(null)}
+            search={search}
           />
         </>
       );
@@ -631,7 +674,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
     // Unknown path — land on dashboard
     return (
       <>
-        <MetricsPage onBack={onBack} embedded />
+        <MetricsPage onBack={onBack} embedded search={search} />
       </>
     );
   };
@@ -717,10 +760,10 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
   const adminAccountMenu = canAdmin && isValidElement<AccountMenuConfigProps>(accountMenu)
     ? cloneElement(accountMenu, {
         configSection: activeSection,
-        onShowFullConfigYaml: () => setYamlModalMode('export'),
-        onImportFullConfigYaml: () => setYamlModalMode('import'),
-        onExportFullIam: () => setIamYamlMode('export'),
-        onImportFullIam: () => setIamYamlMode('import'),
+        onShowFullConfigYaml: () => openYamlModal('export'),
+        onImportFullConfigYaml: () => openYamlModal('import'),
+        onExportFullIam: () => openIamYamlModal('export'),
+        onImportFullIam: () => openIamYamlModal('import'),
       })
     : accountMenu;
 
@@ -752,7 +795,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
       <YamlImportExportModal
         open={yamlModalMode !== null}
         mode={yamlModalMode ?? 'export'}
-        onClose={() => setYamlModalMode(null)}
+        onClose={closeYamlModal}
         onApplied={() => {
           // Soft refresh — reload the page so every panel re-fetches
           // from the updated /config endpoint. The alternative (piping
@@ -764,7 +807,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
       <FullIamYamlModal
         open={iamYamlMode !== null}
         mode={iamYamlMode ?? 'export'}
-        onClose={() => setIamYamlMode(null)}
+        onClose={closeIamYamlModal}
         onApplied={() => {
           // Full IAM was reconciled — reload so every IAM-aware panel
           // (Users, Groups, Auth providers) re-fetches from the DB.

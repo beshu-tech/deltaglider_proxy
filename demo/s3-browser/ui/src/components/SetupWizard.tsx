@@ -31,7 +31,7 @@
  *   * Skip where legitimate.
  *   * Total time under 3 minutes.
  */
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import {
   Alert,
   Button,
@@ -61,6 +61,8 @@ import { useCopyToClipboard } from '../useCopyToClipboard';
 import { useCardStyles, contentColumn, CONTENT_FORM } from './shared-styles';
 import FormField from './FormField';
 import { normalizeUiError } from '../errorHandling';
+import { useNavigation } from '../NavigationContext';
+import { parseAdminQuery, buildViewUrl } from '../urlState';
 
 const { Text, Paragraph } = Typography;
 
@@ -100,17 +102,41 @@ const INITIAL: WizardState = {
   enablePublicBucket: false,
 };
 
+/** Last valid wizard step index (0-based across the 5 screens). */
+const MAX_STEP = 4;
+
 interface Props {
   onComplete: () => void;
   onCancel: () => void;
+  /** Raw query string (with leading `?`) for the ?step=N deep-link. */
+  search?: string;
 }
 
-export default function SetupWizard({ onComplete, onCancel }: Props) {
+export default function SetupWizard({ onComplete, onCancel, search }: Props) {
   const colors = useColors();
   const { cardStyle, inputRadius } = useCardStyles();
+  const { navigate } = useNavigation();
 
   const [state, setState] = useState<WizardState>(INITIAL);
-  const [step, setStep] = useState(0);
+  // The wizard step is deep-linked via ?step=N so a refresh keeps the
+  // operator on the same screen and browser Back traverses steps. The
+  // value is clamped to the valid range; a missing/garbage param falls
+  // back to step 0.
+  const [step, setStep] = useState(() => {
+    const q = parseAdminQuery(search || '');
+    const n = parseInt(q.step ?? '', 10);
+    if (Number.isNaN(n)) return 0;
+    return Math.max(0, Math.min(n, MAX_STEP));
+  });
+  // Keep local state in sync with the URL so browser Back/Forward
+  // (which changes `search` without touching the wizard buttons) still
+  // moves the displayed step. Without this, pushing ?step= on Next would
+  // create history entries that Back couldn't actually retreat through.
+  useEffect(() => {
+    const q = parseAdminQuery(search || '');
+    const n = parseInt(q.step ?? '', 10);
+    setStep(Number.isNaN(n) ? 0 : Math.max(0, Math.min(n, MAX_STEP)));
+  }, [search]);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<TestS3Response | null>(null);
   const [applying, setApplying] = useState(false);
@@ -159,8 +185,18 @@ export default function SetupWizard({ onComplete, onCancel }: Props) {
     }
   })();
 
-  const next = () => setStep((s) => Math.min(s + 1, 4));
-  const prev = () => setStep((s) => Math.max(s - 1, 0));
+  const next = () => {
+    const ns = Math.min(step + 1, MAX_STEP);
+    setStep(ns);
+    // Push (not replace) so browser Back walks through wizard steps
+    // rather than exiting the flow on the first press.
+    navigate(buildViewUrl('admin', 'setup', { step: String(ns) }));
+  };
+  const prev = () => {
+    const ns = Math.max(step - 1, 0);
+    setStep(ns);
+    navigate(buildViewUrl('admin', 'setup', { step: String(ns) }));
+  };
 
   const runTest = async () => {
     setTesting(true);

@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useCallback } from 'react';
 import { Button, Typography, Alert, Input, Divider, Checkbox, message } from 'antd';
 import { PlusOutlined, FolderOutlined, DeleteOutlined, CopyOutlined } from '@ant-design/icons';
 import type { IamGroup, IamUser } from '../adminApi';
@@ -14,6 +14,8 @@ import { groupPermissionSummary, filterItems } from '../masterDetailFilter';
 import MasterDetailPanel from './MasterDetailPanel';
 import IamSourceBanner from './IamSourceBanner';
 import { normalizeUiError } from '../errorHandling';
+import { useNavigation } from '../NavigationContext';
+import { buildViewUrl, parseAdminQuery } from '../urlState';
 
 const { Text, Title } = Typography;
 
@@ -22,13 +24,21 @@ interface GroupsPanelProps {
   onSavingChange?: (saving: boolean) => void;
   initialGroupId?: number | null;
   onGroupSelected?: () => void;
+  /** Raw query string (with leading `?`) for the ?group=<id> deep-link. */
+  search?: string;
 }
 
-export default function GroupsPanel({ onSessionExpired, onSavingChange, initialGroupId, onGroupSelected }: GroupsPanelProps) {
+export default function GroupsPanel({ onSessionExpired, onSavingChange, initialGroupId, onGroupSelected, search }: GroupsPanelProps) {
   const colors = useColors();
-  const [selectedId, setSelectedId] = useState<number | null>(initialGroupId ?? null);
+  const { navigate } = useNavigation();
+  // URL deep-link: ?group=<id> pre-selects a group on direct load and is kept
+  // in sync on every selection change (replace, not push, to avoid history
+  // spam). The local filter textbox is a separate piece of state.
+  const queryParams = useMemo(() => parseAdminQuery(search ?? ''), [search]);
+  const urlGroupId = queryParams.group && !Number.isNaN(Number(queryParams.group)) ? Number(queryParams.group) : null;
+  const [selectedId, setSelectedId] = useState<number | null>(urlGroupId ?? initialGroupId ?? null);
   const [creating, setCreating] = useState(false);
-  const [search, setSearch] = useState('');
+  const [filterText, setFilterText] = useState('');
 
   // IAM mode for the source-of-truth banner (cached react-query read).
   const { data: cfg } = useAdminConfig();
@@ -73,22 +83,46 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
     onGroupSelected?.();
   }, [initialGroupId, groups, onGroupSelected]);
 
+  // URL → state: when the query string changes (direct load, Back/Forward,
+  // or a programmatic navigateToGroup that wrote ?group=), re-select that
+  // group. Only acts when a ?group= param is present so local-only state
+  // (e.g. the unsaved "creating" form) isn't clobbered by a param-less URL.
+  useEffect(() => {
+    if (urlGroupId == null) return;
+    setSelectedId(urlGroupId);
+    setCreating(false);
+  }, [urlGroupId]);
+
   // Mutations used directly by the panel (the form gets its own). Each
   // invalidates qk.groups.list() (+ users) so the list refreshes automatically.
   const cloneMutation = useCloneGroup();
   const deleteMutation = useDeleteGroup();
 
   const selectedGroup = groups.find(g => g.id === selectedId) ?? null;
-  const filtered = filterItems(groups, search, g => [g.name]);
+  const filtered = filterItems(groups, filterText, g => [g.name]);
+
+  // Write ?group=<id> (or strip it) into the URL bar on every selection
+  // change. `replace: true` swaps the current entry instead of pushing, so
+  // row clicks don't spam browser history — Back still leaves the admin
+  // section entirely, which is the desired behaviour.
+  const writeSelectionUrl = useCallback(
+    (id: number | null) => {
+      const query = id != null ? { group: String(id) } : undefined;
+      navigate(buildViewUrl('admin', 'access/groups', query), { replace: true });
+    },
+    [navigate],
+  );
 
   const handleSelect = (group: IamGroup) => {
     setCreating(false);
     setSelectedId(group.id);
+    writeSelectionUrl(group.id);
   };
 
   const handleCreate = () => {
     setSelectedId(null);
     setCreating(true);
+    writeSelectionUrl(null);
   };
 
   /**
@@ -104,13 +138,17 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
   const handleSaved = (createdId?: number) => {
     if (creating) {
       setCreating(false);
-      if (createdId !== undefined) setSelectedId(createdId);
+      if (createdId !== undefined) {
+        setSelectedId(createdId);
+        writeSelectionUrl(createdId);
+      }
     }
   };
 
   const handleDeleted = () => {
     setSelectedId(null);
     setCreating(false);
+    writeSelectionUrl(null);
   };
 
   const handleClone = async (group: IamGroup) => {
@@ -122,6 +160,7 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
       const cloned = await cloneMutation.mutateAsync({ id: group.id, copyMembers });
       setCreating(false);
       setSelectedId(cloned.id);
+      writeSelectionUrl(cloned.id);
     } catch (err) {
       message.error(normalizeUiError(err, "Duplicate group failed"));
     } finally {
@@ -183,8 +222,8 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
       rowPadding="10px 16px"
       onCreate={handleCreate}
       readOnly={readOnly}
-      search={search}
-      onSearchChange={setSearch}
+      search={filterText}
+      onSearchChange={setFilterText}
       loading={loading}
       error={error}
       listEmptyState={(

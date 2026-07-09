@@ -34,6 +34,8 @@ import { NavigationContext } from './NavigationContext';
 import { canRequestPrefixUsageScan, canUse, writablePrefixesForBucket } from './permissions';
 import { useUrlRouter } from './useUrlRouter';
 import { buildViewUrl, buildBrowserUrl, type View } from './urlState';
+import { useOverlayClose } from './hooks/useOverlayClose';
+import type { S3Object } from './types';
 
 const { Content } = Layout;
 const { useBreakpoint } = Grid;
@@ -127,6 +129,41 @@ export default function App() {
     object: browser.object,
     navigateUrl: navigate,
   });
+
+  // --- FilePreview deep-link (?object=…&preview=1) ---
+  // Opening the preview pushes ?preview=1 alongside ?object=… so the overlay
+  // is deep-linkable, reload-safe, and Back closes it without over-navigating
+  // out of the folder.
+  const { markPushed: markPreviewPushed, closeOverlay: closePreviewOverlay } = useOverlayClose();
+
+  const openPreview = useCallback(
+    (obj: S3Object) => {
+      setPreviewObject(obj);
+      navigate(buildBrowserUrl({ ...browser, object: obj.key, preview: '1' }));
+      markPreviewPushed();
+    },
+    [browser, navigate, markPreviewPushed],
+  );
+
+  // Close: remove preview=1 but keep ?object=… so the inspector stays open.
+  const closePreview = useCallback(() => {
+    const key = previewObject?.key ?? browser.object;
+    closePreviewOverlay(buildBrowserUrl({ ...browser, object: key, preview: '' }), navigate);
+    setPreviewObject(null);
+  }, [browser, previewObject, navigate, closePreviewOverlay]);
+
+  // Sync preview state with the URL: open on direct-load with ?preview=1,
+  // close when Back / navigation removes the flag.
+  useEffect(() => {
+    if (browser.preview === '1' && browser.object && !previewObject) {
+      const obj = s3.objects.find((o) => o.key === browser.object);
+      if (obj) setPreviewObject(obj);
+    }
+    if (browser.preview !== '1' && previewObject) {
+      setPreviewObject(null);
+    }
+  }, [browser.preview, browser.object, previewObject, s3.objects]);
+
   // App-wide shortcuts: ⌘/Ctrl+, → Settings, ⌘/Ctrl+/ → Docs, ? → help.
   // Disabled on the connect/login screen so we don't hijack keys there.
   useGlobalShortcuts({
@@ -433,7 +470,7 @@ export default function App() {
       }
       return (
         <Suspense fallback={LAZY_FALLBACK}>
-          <MetricsPage onBack={navigateToBrowse} />
+          <MetricsPage onBack={navigateToBrowse} search={search} />
         </Suspense>
       );
     }
@@ -579,7 +616,7 @@ export default function App() {
               onComputeSize={computeFolderSize}
               onCancelSize={folderSize.cancel}
               onAutoPopulateSizes={hasAdminSession ? folderSize.autoPopulate : undefined}
-              onPreview={setPreviewObject}
+              onPreview={openPreview}
               cursorKey={browserNav.cursorKey}
               onCursorChange={browserNav.setCursorKey}
             />
@@ -649,7 +686,7 @@ export default function App() {
         object={s3.inspectorObject}
         onClose={s3.closeInspector}
         onDeleted={s3.mutate}
-        onPreview={setPreviewObject}
+        onPreview={openPreview}
         isMobile={isMobile}
         headCache={s3.headCache}
         canDelete={canDeleteSelectedObject}
@@ -660,7 +697,7 @@ export default function App() {
       <FilePreview
         open={previewObject !== null}
         object={previewObject}
-        onClose={() => setPreviewObject(null)}
+        onClose={closePreview}
       />
       {shortcutsOpen && (
         <ShortcutsHelp open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />

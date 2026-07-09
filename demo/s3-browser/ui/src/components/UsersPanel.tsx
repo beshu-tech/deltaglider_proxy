@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState, useCallback } from 'react';
 import { Button, Typography, message } from 'antd';
 import { PlusOutlined, TeamOutlined, DeleteOutlined, CopyOutlined } from '@ant-design/icons';
 import { useQueryClient } from '@tanstack/react-query';
@@ -14,6 +14,8 @@ import UserForm from './UserForm';
 import CredentialsBanner from './CredentialsBanner';
 import IamSourceBanner from './IamSourceBanner';
 import { normalizeUiError } from '../errorHandling';
+import { useNavigation } from '../NavigationContext';
+import { buildViewUrl, parseAdminQuery } from '../urlState';
 
 const { Text } = Typography;
 
@@ -21,14 +23,22 @@ interface UsersPanelProps {
   onSessionExpired?: () => void;
   onSavingChange?: (saving: boolean) => void;
   onNavigateToGroup?: (groupId: number) => void;
+  /** Raw query string (with leading `?`) for the ?user=<id> deep-link. */
+  search?: string;
 }
 
-export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigateToGroup }: UsersPanelProps) {
+export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigateToGroup, search }: UsersPanelProps) {
   const colors = useColors();
   const qc = useQueryClient();
-  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const { navigate } = useNavigation();
+  // URL deep-link: ?user=<id> pre-selects a user on direct load and is kept
+  // in sync on every selection change (replace, not push, to avoid history
+  // spam). The local filter textbox is a separate piece of state.
+  const queryParams = useMemo(() => parseAdminQuery(search ?? ''), [search]);
+  const urlUserId = queryParams.user && !Number.isNaN(Number(queryParams.user)) ? Number(queryParams.user) : null;
+  const [selectedId, setSelectedId] = useState<number | null>(urlUserId);
   const [creating, setCreating] = useState(false);
-  const [search, setSearch] = useState('');
+  const [filterText, setFilterText] = useState('');
   const [newCreds, setNewCreds] = useState<{ ak: string; sk: string } | null>(null);
 
   // IAM mode banner: tells the operator where user state lives (DB in
@@ -59,22 +69,46 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
     }
   }, [rawError, onSessionExpired]);
 
+  // URL → state: when the query string changes (direct load, Back/Forward),
+  // re-select that user. Only acts when a ?user= param is present so local
+  // state (e.g. the unsaved "creating" form) isn't clobbered by a param-less
+  // URL.
+  useEffect(() => {
+    if (urlUserId == null) return;
+    setSelectedId(urlUserId);
+    setCreating(false);
+    setNewCreds(null);
+  }, [urlUserId]);
+
   const deleteMutation = useDeleteUser();
   const cloneMutation = useCloneUser();
 
   const selectedUser = users.find(u => u.id === selectedId) ?? null;
-  const filtered = filterItems(users, search, u => [u.name, u.access_key_id]);
+  const filtered = filterItems(users, filterText, u => [u.name, u.access_key_id]);
+
+  // Write ?user=<id> (or strip it) into the URL bar on every selection change.
+  // `replace: true` swaps the current entry instead of pushing, so row clicks
+  // don't spam browser history — Back still leaves the admin section entirely.
+  const writeSelectionUrl = useCallback(
+    (id: number | null) => {
+      const query = id != null ? { user: String(id) } : undefined;
+      navigate(buildViewUrl('admin', 'access/users', query), { replace: true });
+    },
+    [navigate],
+  );
 
   const handleSelect = (user: IamUser) => {
     setCreating(false);
     setSelectedId(user.id);
     setNewCreds(null);
+    writeSelectionUrl(user.id);
   };
 
   const handleCreate = () => {
     setSelectedId(null);
     setCreating(true);
     setNewCreds(null);
+    writeSelectionUrl(null);
   };
 
   const handleSaved = () => {
@@ -85,7 +119,10 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
     // Refetch synchronously to capture the new user's ID, then select it.
     const result = await qc.fetchQuery({ queryKey: qk.users.list(), queryFn: getUsers });
     const newUser = result.find(u => u.access_key_id === ak);
-    if (newUser) setSelectedId(newUser.id);
+    if (newUser) {
+      setSelectedId(newUser.id);
+      writeSelectionUrl(newUser.id);
+    }
     setCreating(false);
     setNewCreds({ ak, sk });
   };
@@ -98,6 +135,7 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
       const cloned = await cloneMutation.mutateAsync({ id: user.id, copyGroupMemberships: true });
       setCreating(false);
       setSelectedId(cloned.id);
+      writeSelectionUrl(cloned.id);
       setNewCreds({ ak: cloned.access_key_id, sk: cloned.secret_access_key ?? '' });
     } catch (err) {
       message.error(normalizeUiError(err, "Duplicate user failed"));
@@ -110,6 +148,7 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
     setSelectedId(null);
     setCreating(false);
     setNewCreds(null);
+    writeSelectionUrl(null);
     qc.invalidateQueries({ queryKey: qk.users.list() });
   };
 
@@ -188,8 +227,8 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
       rowClassName="user-list-item"
       onCreate={handleCreate}
       readOnly={readOnly}
-      search={search}
-      onSearchChange={setSearch}
+      search={filterText}
+      onSearchChange={setFilterText}
       loading={loading}
       error={error}
       listEmptyState={(

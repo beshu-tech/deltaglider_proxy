@@ -54,6 +54,8 @@ export interface BrowserLocation {
   q: string;
   /** Open inspector object key (?object=), or ''. */
   object: string;
+  /** File-preview overlay flag (?preview=1), or ''. */
+  preview: string;
 }
 
 /** Strip BASE / leading slash and trailing slashes from a raw pathname. */
@@ -98,7 +100,8 @@ export function parseBrowserLocation(pathname: string, search: string): BrowserL
   const params = new URLSearchParams(search.startsWith('?') ? search.slice(1) : search);
   const q = params.get('q') ?? '';
   const object = params.get('object') ?? '';
-  return { bucket, prefix, q, object };
+  const preview = params.get('preview') ?? '';
+  return { bucket, prefix, q, object, preview };
 }
 
 /**
@@ -110,6 +113,7 @@ export function buildBrowserUrl(loc: Partial<BrowserLocation>): string {
   const prefix = loc.prefix ?? '';
   const q = loc.q ?? '';
   const object = loc.object ?? '';
+  const preview = loc.preview ?? '';
 
   const segments: string[] = ['browse'];
   if (bucket) {
@@ -127,6 +131,7 @@ export function buildBrowserUrl(loc: Partial<BrowserLocation>): string {
   const params = new URLSearchParams();
   if (q) params.set('q', q);
   if (object) params.set('object', object);
+  if (preview) params.set('preview', preview);
   const qs = params.toString();
   if (qs) url += `?${qs}`;
   return url;

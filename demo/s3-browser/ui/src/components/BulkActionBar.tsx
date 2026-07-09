@@ -1,10 +1,12 @@
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Button, message } from 'antd';
 import { DeleteOutlined, CopyOutlined, ScissorOutlined, DownloadOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import { pluralize } from '../utils';
 import DestinationPickerModal from './DestinationPickerModal';
 import { normalizeUiError } from '../errorHandling';
+import { useOverlayClose } from '../hooks/useOverlayClose';
+import { useNavigation } from '../NavigationContext';
 
 interface Props {
   selectedCount: number;
@@ -23,6 +25,31 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
   const [operating, setOperating] = useState(false);
   const [downloading, setDownloading] = useState(false);
 
+  // --- Back-button close for destination picker ---
+  const { markPushed, closeOverlay } = useOverlayClose();
+  const { navigate } = useNavigation();
+  const pushedForModal = useRef(false);
+
+  // Push a history entry when the destination picker opens so Back closes it.
+  useEffect(() => {
+    if (modal && !pushedForModal.current) {
+      window.history.pushState(null, '', window.location.href);
+      markPushed();
+      pushedForModal.current = true;
+    }
+    if (!modal) {
+      pushedForModal.current = false;
+    }
+  }, [modal, markPushed]);
+
+  // Close the modal on popstate (Back button or history.back()).
+  useEffect(() => {
+    if (!modal) return;
+    const onPopState = () => setModal(null);
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, [modal !== null]);
+
   const handleOperation = async (op: 'copy' | 'move', destBucket: string, destPrefix: string) => {
     setOperating(true);
     try {
@@ -38,6 +65,7 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
       message.error(normalizeUiError(e, `${op} failed`));
     } finally {
       setOperating(false);
+      closeOverlay(window.location.pathname + window.location.search, navigate);
       setModal(null);
     }
   };
@@ -126,7 +154,7 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
         mode={modal || 'copy'}
         itemCount={selectedCount}
         onConfirm={(bucket, prefix) => { if (modal) handleOperation(modal, bucket, prefix); }}
-        onCancel={() => setModal(null)}
+        onCancel={() => { closeOverlay(window.location.pathname + window.location.search, navigate); setModal(null); }}
         loading={operating}
       />
     </>
