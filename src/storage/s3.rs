@@ -210,7 +210,11 @@ pub struct S3Backend {
 impl S3Backend {
     /// Max concurrent HEAD requests to avoid S3 503 SlowDown throttling.
     /// See `bounded_head_calls()` for rationale.
-    const MAX_CONCURRENT_HEADS: usize = 50;
+    // 10, down from 50: fifty concurrent HEADs is a burst that trips Ceph
+    // qos (Hetzner 503 SlowDown RCA, 2026-07-09); ten keeps a 1000-key page
+    // enrich fast on a healthy backend while quartering the instantaneous
+    // pressure, and doubles as the throttle-breaker batch size.
+    const MAX_CONCURRENT_HEADS: usize = 10;
 }
 
 impl S3Backend {
@@ -285,6 +289,11 @@ impl S3Backend {
             .credentials_provider(credentials)
             .force_path_style(force_path_style)
             .timeout_config(timeout_config)
+            // Adaptive retry = the SDK's client-wide rate limiter: a 503
+            // SlowDown from the backend throttles EVERY subsequent request on
+            // this client (HEAD bursts, listings, replication reads) instead
+            // of each call site independently hammering a struggling backend.
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::adaptive())
             .stalled_stream_protection(stalled_stream_protection)
             .request_checksum_calculation(
                 aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
@@ -1037,11 +1046,14 @@ impl S3Backend {
     /// are collected into a Vec BEFORE streaming. Without this, the async closures
     /// capture `&self` and `&str` which can't satisfy the `'static` bound that
     /// `buffer_unordered` requires.
+    /// Returns the successful lookups plus a count of throttle rejections
+    /// (503 SlowDown), so callers can stop a HEAD sweep against a backend
+    /// that is actively shedding load instead of grinding through it.
     async fn bounded_head_calls<'a, I>(
         &self,
         bucket: &str,
         keys: I,
-    ) -> HashMap<String, FileMetadata>
+    ) -> (HashMap<String, FileMetadata>, usize)
     where
         I: Iterator<Item = &'a str>,
     {
@@ -1057,8 +1069,19 @@ impl S3Backend {
             .collect();
         futures::stream::iter(head_futs)
             .buffer_unordered(Self::MAX_CONCURRENT_HEADS)
-            .filter_map(|(key, result)| async move { result.ok().map(|meta| (key, meta)) })
-            .collect()
+            .fold(
+                (HashMap::new(), 0usize),
+                |(mut ok, throttled), (key, result)| async move {
+                    match result {
+                        Ok(meta) => {
+                            ok.insert(key, meta);
+                            (ok, throttled)
+                        }
+                        Err(StorageError::Throttled(_)) => (ok, throttled + 1),
+                        Err(_) => (ok, throttled),
+                    }
+                },
+            )
             .await
     }
 
@@ -1811,9 +1834,15 @@ impl StorageBackend for S3Backend {
             .filter(|obj| obj.key.ends_with(".delta"))
             .map(|obj| obj.key.clone())
             .collect();
-        let head_results = self
+        // Deltaspace scans want completeness (savings accounting), so no
+        // throttle bail here — the SDK's adaptive rate limiter paces the
+        // sweep instead. The count is logged for observability only.
+        let (head_results, throttled) = self
             .bounded_head_calls(bucket, delta_keys.iter().map(|k| k.as_str()))
             .await;
+        if throttled > 0 {
+            warn!("deltaspace scan of {bucket}: {throttled} HEADs throttled (503 SlowDown)");
+        }
 
         // `head_results` only contains the delta keys we HEAD'd above —
         // non-delta entries fall through to the no-HEAD builder.
@@ -1938,9 +1967,30 @@ impl StorageBackend for S3Backend {
             })
             .collect();
 
-        let head_results = self
-            .bounded_head_calls(bucket, s3_keys.iter().map(|s| s.as_str()))
-            .await;
+        // Partition the HEADs into batches and stop the sweep if a batch comes
+        // back mostly throttled — the remaining objects fall back to their
+        // (perfectly serviceable) lite listing metadata instead of bombing a
+        // backend that is already answering 503 SlowDown. Enrichment here is
+        // cosmetic (original sizes for delta entries in listings), never worth
+        // grinding a struggling backend for.
+        let mut head_results: HashMap<String, FileMetadata> = HashMap::new();
+        for batch in s3_keys.chunks(Self::MAX_CONCURRENT_HEADS) {
+            let (ok, throttled) = self
+                .bounded_head_calls(bucket, batch.iter().map(|s| s.as_str()))
+                .await;
+            head_results.extend(ok);
+            if throttled * 2 >= batch.len() {
+                warn!(
+                    "HEAD enrichment aborted for {}: {}/{} throttled in one batch — \
+                     serving lite metadata for the remaining {} objects",
+                    bucket,
+                    throttled,
+                    batch.len(),
+                    s3_keys.len().saturating_sub(head_results.len()),
+                );
+                break;
+            }
+        }
 
         let enriched: Vec<(String, FileMetadata)> = objects
             .into_iter()

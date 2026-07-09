@@ -3597,9 +3597,11 @@ async fn test_usage_cache_returns_result() {
         .await
         .unwrap();
 
-    // Wait for scan to complete
+    // Wait for scan to complete. 30s, not 10s: under a multi-binary local run
+    // the background scan queues behind other TestServers' work and 10s flaked
+    // twice (2026-07-09) — always passing solo.
     let mut completed = false;
-    for _ in 0..50 {
+    for _ in 0..150 {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let resp = admin
             .get(format!(

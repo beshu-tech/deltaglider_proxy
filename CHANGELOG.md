@@ -2,7 +2,19 @@
 
 ## Unreleased
 
-Nothing yet.
+### Fixed
+
+- **HEAD sweeps stop instead of grinding a throttled backend.** Listing
+  enrichment now runs its per-object HEAD lookups in batches of 10 (down
+  from 50 concurrent) and aborts the sweep when a batch comes back mostly
+  `503 SlowDown` — the remaining objects render with their listing
+  metadata. Deltaspace savings scans keep full coverage but log throttle
+  counts.
+- **The S3 client uses adaptive retry.** One throttle response now
+  rate-limits every subsequent request on that backend client (HEAD
+  bursts, listings, replication reads) via the AWS SDK's client-wide
+  adaptive rate limiter, instead of each call site independently
+  hammering a struggling backend.
 
 ## v1.12.3 — 2026-07-09
 
