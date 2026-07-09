@@ -1742,7 +1742,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         &self,
         b: &str,
         p: &str,
-        d: &str,
+        d: Option<&str>,
         m: u32,
         t: Option<&str>,
     ) -> Result<Option<DelegatedListResult>, StorageError> {

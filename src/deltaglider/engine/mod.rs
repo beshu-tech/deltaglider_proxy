@@ -1326,28 +1326,24 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         ObjectKey::validate_prefix(prefix)
             .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
 
-        // Fast path: delegate delimiter collapsing to the storage backend (S3
-        // handles this natively, avoiding the need to fetch every object).
-        let mut page = if let Some(delim) = delimiter {
-            if let Some(result) = self
-                .storage
-                .list_objects_delegated(bucket, prefix, delim, max_keys, continuation_token)
-                .await?
-            {
-                ListObjectsPage {
-                    objects: result.objects,
-                    common_prefixes: result.common_prefixes,
-                    is_truncated: result.is_truncated,
-                    next_continuation_token: result.next_continuation_token,
-                }
-            } else {
-                // Backend doesn't support delegated listing — fall through to
-                // the generic bulk_list + in-memory collapsing path.
-                self.list_objects_bulk(bucket, prefix, Some(delim), max_keys, continuation_token)
-                    .await?
+        // Fast path: delegate listing to the storage backend (S3 pages
+        // natively — with OR without a delimiter — so we never materialise
+        // the whole prefix just to cut one page out of it).
+        let mut page = if let Some(result) = self
+            .storage
+            .list_objects_delegated(bucket, prefix, delimiter, max_keys, continuation_token)
+            .await?
+        {
+            ListObjectsPage {
+                objects: result.objects,
+                common_prefixes: result.common_prefixes,
+                is_truncated: result.is_truncated,
+                next_continuation_token: result.next_continuation_token,
             }
         } else {
-            self.list_objects_bulk(bucket, prefix, None, max_keys, continuation_token)
+            // Backend doesn't support delegated listing for this shape — fall
+            // through to the generic bulk_list + in-memory paging path.
+            self.list_objects_bulk(bucket, prefix, delimiter, max_keys, continuation_token)
                 .await?
         };
 

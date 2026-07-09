@@ -440,8 +440,10 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
           scroll={{ x: 'max-content' }}
           onChange={onTableChange}
           locale={{
+            // While loading the Table's own spinner overlay provides the motion;
+            // a static "Loading..." underneath it just reads as a dead label.
             emptyText: loading
-              ? 'Loading...'
+              ? ' '
               : status === 'all' && !filter
                 ? 'No object events have been recorded yet.'
                 : 'No outbox rows match this view.',

@@ -1324,12 +1324,14 @@ impl StorageBackend for FilesystemBackend {
         &self,
         bucket: &str,
         prefix: &str,
-        delimiter: &str,
+        delimiter: Option<&str>,
         max_keys: u32,
         continuation_token: Option<&str>,
     ) -> Result<Option<DelegatedListResult>, StorageError> {
-        // Only handle the "/" delimiter; fall back for anything else.
-        if delimiter != "/" {
+        // Only handle the "/" delimiter; fall back for anything else —
+        // including delimiter-less listings, which stay on the bulk path
+        // (a local-disk walk; the S3 backend is where paging pays off).
+        if delimiter != Some("/") {
             return Ok(None);
         }
 
@@ -1834,7 +1836,7 @@ mod tests {
             .expect("put reference");
 
         let listed = backend
-            .list_objects_delegated("bucket", "", "/", 100, None)
+            .list_objects_delegated("bucket", "", Some("/"), 100, None)
             .await
             .expect("list")
             .expect("delegated");

@@ -36,6 +36,7 @@ import { ApiOutlined, DeleteOutlined } from '@ant-design/icons';
 import type { SectionApplyResponse } from '../adminApi';
 import { fetchEventOutbox } from '../adminApi';
 import { useCardStyles, contentColumn, CONTENT_WIDE } from './shared-styles';
+import { LoadingState } from './StatePlaceholders';
 import { useColors } from '../ThemeContext';
 import { useIsNarrow } from '../useIsNarrow';
 import { useSectionEditor } from '../useSectionEditor';
@@ -252,7 +253,7 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
   if (loading)
     return (
       <PanelShell>
-        <Text type="secondary">Loading…</Text>
+        <LoadingState label="Loading delivery settings…" />
       </PanelShell>
     );
 

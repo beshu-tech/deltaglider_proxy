@@ -5,6 +5,7 @@ import { FolderOutlined, FileOutlined, LoadingOutlined, CalculatorOutlined, Clos
 import type { S3Object } from '../types';
 import { formatBytes, displayName, timeAgo, numericCompare } from '../utils';
 import type { ColumnsType } from 'antd/es/table';
+import type { Reference as TableReference } from '@rc-component/table';
 import { useColors } from '../ThemeContext';
 import type { FolderSizeState } from '../useComputeSize';
 import { getPreviewMode } from './filePreviewMode';
@@ -252,6 +253,40 @@ export default function ObjectTable({
   // Scroll container for the keyboard-cursor scroll-into-view (effect below,
   // after `dataSource` is computed).
   const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const tableRef = useRef<TableReference>(null);
+
+  // Virtualized body height: the Table renders only visible rows (Tier 3.2),
+  // which needs a fixed scroll.y in px. The app is a page-scrolling layout
+  // (ancestors grow with content, min-height:auto all the way up), so the
+  // container's own height is CONTENT-driven — measuring it feeds back into
+  // itself and the body balloons to the full row count. Derive the height
+  // from the VIEWPORT instead: window height minus the table's viewport
+  // offset minus the fixed chrome below the body (header row + pagination +
+  // status bar). Content changes can't move that number, only real window /
+  // pane geometry changes can.
+  const [bodyHeight, setBodyHeight] = useState(400);
+  useEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    // 39 thead + 48 pagination + 44 status bar + 9 breathing room.
+    const CHROME_BELOW = 140;
+    const measure = () => {
+      // Clamp a negative top (window resized while the page is scrolled) so
+      // the height stays viewport-bounded instead of growing by the scroll.
+      const top = Math.max(0, el.getBoundingClientRect().top);
+      setBodyHeight(Math.max(240, window.innerHeight - top - CHROME_BELOW));
+    };
+    measure();
+    window.addEventListener('resize', measure);
+    // Sidebar collapse / banner appearance moves the table without a window
+    // resize — a ResizeObserver on the container's OFFSET parent catches it.
+    const ro = new ResizeObserver(measure);
+    if (el.parentElement) ro.observe(el.parentElement);
+    return () => {
+      window.removeEventListener('resize', measure);
+      ro.disconnect();
+    };
+  }, []);
 
   function fileIconColor(name: string): string {
     const ext = name.split('.').pop()?.toLowerCase() || '';
@@ -294,10 +329,10 @@ export default function ObjectTable({
     const targetPage = Math.floor(cursorIndex / pageSize) + 1;
     setCurrentPage((page) => (page === targetPage ? page : targetPage));
     // Defer the scroll so the row exists after any page switch + render.
+    // With `virtual`, offscreen rows have no DOM node, so use the table's
+    // scrollTo({key}) instead of querySelector + scrollIntoView.
     const id = requestAnimationFrame(() => {
-      scrollContainerRef.current
-        ?.querySelector(`[data-row-key="${CSS.escape(cursorKey)}"]`)
-        ?.scrollIntoView({ block: 'nearest' });
+      tableRef.current?.scrollTo?.({ key: cursorKey });
     });
     return () => cancelAnimationFrame(id);
   }, [cursorKey, cursorIndex, pageSize]);
@@ -453,6 +488,8 @@ export default function ObjectTable({
       */}
       <div ref={scrollContainerRef} style={{ flex: 1, overflow: 'auto' }}>
         <Table<RowData>
+          ref={tableRef}
+          virtual
           columns={columns}
           dataSource={dataSource}
           rowKey="key"
@@ -474,8 +511,11 @@ export default function ObjectTable({
               `${range[0].toLocaleString()}–${range[1].toLocaleString()} of ${totalCount.toLocaleString()}`,
           }}
           size="small"
-          sticky
-          scroll={undefined}
+          /* `virtual` needs a fixed body height and pins the header itself,
+             so the old `sticky` + free-flow scroll={undefined} are gone.
+             `x` must be numeric in virtual mode (rc-table warns + forces 1
+             otherwise): fixed columns sum to ~370, plus a Name minimum. */
+          scroll={{ y: bodyHeight, x: 700 }}
           rowClassName={(record) => {
             const classes: string[] = [];
             if (!record._isFolder && selected?.key === record.key) classes.push('ant-table-row-selected');

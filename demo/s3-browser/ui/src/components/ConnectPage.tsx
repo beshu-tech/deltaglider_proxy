@@ -586,7 +586,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                     style={loginInputStyle}
                   />
                   <Text className="dg-login-hint">
-                    Deployment-level access for first run and recovery
+                    For first-time setup and recovery
                   </Text>
                 </div>
               ) : (

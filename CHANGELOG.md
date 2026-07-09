@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+Nothing yet.
+
+## v1.12.2 — 2026-07-09
+
+The "feels alive" release: the golden-roadmap UX waves (verify progress that
+never looks dead, first-press Back button, deep-linkable admin views, plainer
+copy, a virtualized object table), a listing memory fix, community-contributed
+deny-path metrics + an IAM secret-preservation fix, and the three maintenance
+commits that accumulated after v1.12.1 (SigV4 single-verification, dead-backend
+listing cooldown, replication-target alias hardening).
+
+
 ### Added
 
 - **Every admin view is now deep-linkable.** The job drawer, metrics view
@@ -11,6 +23,18 @@
   Back/Forward — the UI restores to the right place. Modals close on Back
   button; direct-loaded deep links open the overlay and close safely without
   walking out of the SPA.
+
+- **Denied requests now show up in Prometheus.** Admission-rule and IAM
+  authorization 403s short-circuit before the metrics middleware, so they were
+  invisible to `deltaglider_http_requests_total`. Both deny paths now record
+  the sanitized counter (method/status/operation). Contributed by @skel84.
+- **The object table is virtualized.** Only the visible rows render in the
+  DOM (previously up to 500), the body height fits the viewport, and the
+  pagination bar stays visible. Keyboard navigation scrolls via the table's
+  native `scrollTo`.
+- **Loading states show motion everywhere.** Bare "Loading…" labels in the
+  webhook, audit, buckets, outbox, and dashboard panels are replaced with the
+  shared spinner/skeleton primitive.
 
 ### Fixed
 
@@ -47,29 +71,20 @@
   through `useVisiblePolling`, which stops polling on hidden tabs and fires
   an immediate refresh on tab return.
 
-### Changed
-
-- **Clearer labels throughout the admin UI.** "Bootstrap password" → "Admin
-  password", "Storage footprint" → "Storage used", "Trace" → "Rule tester",
-  "Delta efficiency" → "Compression health", "Admission rules" → "Request
-  rules", "Event outbox" → "Event log". Six verbose verify descriptions
-  replaced with plain language. Rust denial messages softened to
-  human-readable text. Product docs updated to match.
-- **Natural sort everywhere.** Bucket names, object keys, and rule lists now
-  sort naturally (`v2` before `v10`) via a shared `numericCompare` helper.
-- **Consistent error display.** All 58 `e instanceof Error` sites across 25
-  files replaced with a shared `normalizeUiError` helper.
-- **Config warnings use human-readable text.** `Config::check()` warnings
-  no longer leak the internal field name `replication_target_only`.
-
-## v1.12.2 — 2026-07-09
-
-A maintenance release shipping three CI-green commits that accumulated on `main`
-after v1.12.1. No new features; auth cleanup, routing resilience, and a
-bucket-policy hardening fix.
-
-### Fixed
-
+- **Delimiter-less LIST no longer materializes the whole prefix.** A
+  ListObjectsV2 without a delimiter fetched every key under the prefix into
+  memory before cutting one page out of it. The S3 backend now pages natively
+  with a provably-safe early exit (the completeness horizon accounts for
+  `.delta`-suffix collation — prefix-sharing names like `v1`/`v1.2` were the
+  hard case, validated by brute-force simulation).
+- **Applying an exported config no longer wipes IAM user secrets.** The
+  document export deliberately redacts `secret_access_key` to an empty
+  string; the declarative reconciler treated that as a rotation to an empty
+  secret and broke every user's credentials. Empty now means "keep the
+  existing secret", matching the field- and section-level admin paths.
+  Contributed by @skel84.
+- **The bootstrap login hint speaks plainly.** "Deployment-level access for
+  first run and recovery" → "For first-time setup and recovery".
 - **Replication-target buckets can't be written via their unconfigured alias.**
   A client PUT to a marked bucket's real (alias) name — the one discovered by
   cross-backend head-probe, not the configured virtual name — bypassed the
@@ -86,6 +101,18 @@ bucket-policy hardening fix.
 
 ### Changed
 
+- **Clearer labels throughout the admin UI.** "Bootstrap password" → "Admin
+  password", "Storage footprint" → "Storage used", "Trace" → "Rule tester",
+  "Delta efficiency" → "Compression health", "Admission rules" → "Request
+  rules", "Event outbox" → "Event log". Six verbose verify descriptions
+  replaced with plain language. Rust denial messages softened to
+  human-readable text. Product docs updated to match.
+- **Natural sort everywhere.** Bucket names, object keys, and rule lists now
+  sort naturally (`v2` before `v10`) via a shared `numericCompare` helper.
+- **Consistent error display.** All 58 `e instanceof Error` sites across 25
+  files replaced with a shared `normalizeUiError` helper.
+- **Config warnings use human-readable text.** `Config::check()` warnings
+  no longer leak the internal field name `replication_target_only`.
 - **SigV4 is verified once, not twice.** The redundant outer axum signature
   verifier (~380 LOC of hand-rolled canonical-request + HMAC) is deleted; s3s
   is now the sole SigV4 authority. The outer middleware resolves identity only

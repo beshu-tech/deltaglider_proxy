@@ -550,17 +550,18 @@ pub trait StorageBackend: Send + Sync {
         Ok(objects)
     }
 
-    /// Optimised listing with delimiter support.
+    /// Optimised listing, natively paged by the underlying store.
     ///
-    /// Backends that can delegate delimiter collapsing to the underlying store
-    /// (e.g. S3) override this to avoid fetching every object just to collapse
-    /// them into CommonPrefixes.  Returns `None` by default so the engine
-    /// falls back to `bulk_list_objects` + in-memory collapsing.
+    /// Backends that can delegate listing to the underlying store (e.g. S3)
+    /// override this to avoid materialising every key under the prefix.
+    /// `delimiter: Some(_)` additionally collapses CommonPrefixes natively.
+    /// Returns `None` when the backend can't delegate this shape, and the
+    /// engine falls back to `bulk_list_objects` + in-memory paging.
     async fn list_objects_delegated(
         &self,
         _bucket: &str,
         _prefix: &str,
-        _delimiter: &str,
+        _delimiter: Option<&str>,
         _max_keys: u32,
         _continuation_token: Option<&str>,
     ) -> Result<Option<DelegatedListResult>, StorageError> {
@@ -958,7 +959,7 @@ macro_rules! impl_storage_backend_for_box {
                 &self,
                 bucket: &str,
                 prefix: &str,
-                delimiter: &str,
+                delimiter: Option<&str>,
                 max_keys: u32,
                 continuation_token: Option<&str>,
             ) -> Result<Option<DelegatedListResult>, StorageError> {

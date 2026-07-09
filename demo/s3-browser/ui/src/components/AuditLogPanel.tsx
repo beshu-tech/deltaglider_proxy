@@ -32,6 +32,7 @@ import {
 } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import { fetchAudit, type AuditEntry } from '../adminApi';
+import { LoadingState } from './StatePlaceholders';
 import { relativeTime } from '../utils';
 import { contentColumn, CONTENT_WIDE } from './shared-styles';
 import { normalizeUiError } from '../errorHandling';
@@ -239,16 +240,20 @@ export default function AuditLogPanel({ onSessionExpired }: Props) {
           <div>Target / Path</div>
         </div>
         {filtered.length === 0 ? (
-          <div
-            style={{
-              padding: 40,
-              textAlign: 'center',
-              color: colors.TEXT_MUTED,
-              fontSize: 13,
-            }}
-          >
-            {loading ? 'Loading…' : 'No entries match this filter.'}
-          </div>
+          loading ? (
+            <LoadingState label="Loading audit entries…" />
+          ) : (
+            <div
+              style={{
+                padding: 40,
+                textAlign: 'center',
+                color: colors.TEXT_MUTED,
+                fontSize: 13,
+              }}
+            >
+              No entries match this filter.
+            </div>
+          )
         ) : (
           filtered.map((e, i) => (
             <div

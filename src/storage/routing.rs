@@ -1007,7 +1007,7 @@ impl StorageBackend for RoutingBackend {
         &self,
         bucket: &str,
         prefix: &str,
-        delimiter: &str,
+        delimiter: Option<&str>,
         max_keys: u32,
         continuation_token: Option<&str>,
     ) -> Result<Option<DelegatedListResult>, StorageError> {

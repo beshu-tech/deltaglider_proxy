@@ -2001,13 +2001,15 @@ impl StorageBackend for S3Backend {
         &self,
         bucket: &str,
         prefix: &str,
-        delimiter: &str,
+        delimiter: Option<&str>,
         max_keys: u32,
         continuation_token: Option<&str>,
     ) -> Result<Option<DelegatedListResult>, StorageError> {
         // We need to over-fetch from upstream because internal files
-        // (reference.bin, .delta suffixes) inflate the key count.
-        // Fetch in pages until we have enough user-visible entries.
+        // (reference.bin, .delta suffixes) inflate the key count — but only
+        // until the page is provably complete (see fetch_boundary below), not
+        // until the prefix is exhausted (the old behaviour materialised the
+        // whole subtree on delimiter-less lists — the audit's memory HIGH).
         let mut all_common_prefixes = std::collections::BTreeSet::new();
         let mut raw_objects: Vec<S3ListedObject> = Vec::new();
         let mut upstream_token: Option<String> = None;
@@ -2023,7 +2025,7 @@ impl StorageBackend for S3Backend {
                 .list_objects_v2()
                 .bucket(bucket)
                 .prefix(prefix)
-                .delimiter(delimiter);
+                .set_delimiter(delimiter.map(String::from));
 
             // On the first page use start_after; on subsequent pages use
             // the upstream continuation token.
@@ -2070,6 +2072,23 @@ impl StorageBackend for S3Backend {
                 upstream_token = response.next_continuation_token;
             } else {
                 break;
+            }
+
+            // Early exit: stop fetching once the final page is provably
+            // complete instead of draining the whole prefix into memory.
+            if let Some(boundary) = list_fetch_boundary(
+                raw_objects.iter().map(|o| o.key.as_str()),
+                all_common_prefixes.iter().map(|p| p.as_str()),
+                max_keys,
+                continuation_token,
+            ) {
+                let past_boundary = raw_objects
+                    .last()
+                    .map(|o| o.key.as_str() > boundary.as_str())
+                    .unwrap_or(false);
+                if past_boundary {
+                    break;
+                }
             }
         }
 
@@ -2135,6 +2154,63 @@ impl StorageBackend for S3Backend {
         debug!("Created directory marker: {}/{}", bucket, key);
         Ok(())
     }
+}
+
+/// Early-exit decision for the delegated-listing fetch loop.
+///
+/// Given the raw keys + common prefixes fetched so far, returns the raw-key
+/// boundary past which the final page of `max_keys` user-visible entries is
+/// provably complete — or `None` when more candidates are still needed.
+///
+/// The horizon is `max(p + ".delta")` over EVERY prefix `p` of the anchor key
+/// `U` (the (max_keys+1)-th distinct user key — its existence also proves
+/// `is_truncated`). A raw key maps to a user key by at most stripping
+/// `.delta`, so a raw key whose user key `u` sorts ≤ U is either `u` itself
+/// (≤ U ≤ horizon) or `u + ".delta"`; if `u` is not a prefix of U the suffix
+/// never gets compared (`u.delta` < U ≤ horizon), and if it IS a prefix it is
+/// covered by the max. The naive `U + ".delta"` horizon is WRONG for
+/// prefix-sharing names — "v1" < "v1.2" but "v1.delta" > "v1.2.delta" — so a
+/// page containing `v1` would early-exit before its raw key `v1.delta`
+/// arrived and silently drop the object (see
+/// `boundary_prefix_chain_regression`).
+///
+/// Distinct counting matters too: `k` and `k.delta` dedup into one entry, so
+/// counting duplicates could stop the fetch with an under-filled page and a
+/// false `is_truncated=false`.
+fn list_fetch_boundary<'a>(
+    raw_keys: impl Iterator<Item = &'a str>,
+    common_prefixes: impl Iterator<Item = &'a str>,
+    max_keys: u32,
+    continuation_token: Option<&str>,
+) -> Option<String> {
+    let token = continuation_token.unwrap_or("");
+    let mut candidates: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for key in raw_keys {
+        let filename = key.rsplit('/').next().unwrap_or(key);
+        if filename == "reference.bin" {
+            continue;
+        }
+        let user_key: &str = if let Some(stripped) = key.strip_suffix(".delta") {
+            stripped
+        } else {
+            key
+        };
+        if user_key > token {
+            candidates.insert(user_key);
+        }
+    }
+    for cp in common_prefixes {
+        if cp > token {
+            candidates.insert(cp);
+        }
+    }
+    // Need max_keys+1 distinct entries: max_keys fill the page, the extra one
+    // proves truncation. Its user key U anchors the completeness horizon.
+    let anchor = candidates.iter().nth(max_keys as usize)?;
+    (1..=anchor.len())
+        .filter(|&n| anchor.is_char_boundary(n))
+        .map(|n| format!("{}.delta", &anchor[..n]))
+        .max()
 }
 
 /// Apply native S3 encryption headers to a PutObject builder in
@@ -2218,6 +2294,82 @@ mod tests {
     use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
     use aws_smithy_runtime_api::http::StatusCode;
     use aws_smithy_types::body::SdkBody;
+
+    // ── list_fetch_boundary: delegated-listing early exit (Tier 3.4) ──
+
+    fn boundary(raw: &[&str], cps: &[&str], max_keys: u32, token: Option<&str>) -> Option<String> {
+        list_fetch_boundary(raw.iter().copied(), cps.iter().copied(), max_keys, token)
+    }
+
+    #[test]
+    fn boundary_none_until_enough_distinct_candidates() {
+        // 2 candidates, need max_keys+1 = 3 → keep fetching.
+        assert_eq!(boundary(&["a", "b"], &[], 2, None), None);
+        // 3rd candidate arrives → boundary anchored at the 3rd ("c").
+        assert_eq!(
+            boundary(&["a", "b", "c"], &[], 2, None),
+            Some("c.delta".into())
+        );
+    }
+
+    #[test]
+    fn boundary_counts_distinct_user_keys_not_raw_keys() {
+        // "b" + "b.delta" dedup into ONE user entry — counting raw keys would
+        // stop early with an under-filled page and a false is_truncated=false.
+        assert_eq!(boundary(&["a", "b", "b.delta"], &[], 2, None), None);
+        assert_eq!(
+            boundary(&["a", "b", "b.delta", "c"], &[], 2, None),
+            Some("c.delta".into())
+        );
+    }
+
+    #[test]
+    fn boundary_skips_internal_files_and_respects_token() {
+        // reference.bin is deltaspace machinery, never user-visible.
+        assert_eq!(
+            boundary(&["a", "p/.dg/reference.bin", "b"], &[], 2, None),
+            None
+        );
+        // A raw key whose USER key equals the token is not a candidate
+        // (start_after skips raw "t", but "t.delta" > "t" still arrives).
+        assert_eq!(boundary(&["t.delta", "u", "v"], &[], 2, Some("t")), None);
+        assert_eq!(
+            boundary(&["t.delta", "u", "v", "w"], &[], 2, Some("t")),
+            Some("w.delta".into())
+        );
+    }
+
+    #[test]
+    fn boundary_interleaves_common_prefixes() {
+        // CPs count toward max-keys exactly like objects (S3 semantics).
+        assert_eq!(
+            boundary(&["a", "z"], &["m/"], 2, None),
+            Some("z.delta".into())
+        );
+    }
+
+    #[test]
+    fn boundary_prefix_chain_regression() {
+        // The adversarial-review CRITICAL: versioned artifacts v1 / v1.2 /
+        // v1.2.3 all stored as .delta. Raw sort order is REVERSED vs user
+        // order ("v1.2.3.delta" < "v1.2.delta" < "v1.delta"), so the naive
+        // U+".delta" horizon stopped the fetch before v1's raw key arrived
+        // and silently dropped it from listings. The prefix-max horizon for
+        // anchor "v1.2.3" must be "v1.delta" (max over every prefix+".delta")
+        // so the fetch keeps going until v1.delta has been seen.
+        assert_eq!(
+            boundary(&["v1.2.3.delta", "v1.2.delta"], &[], 1, None),
+            Some("v1.delta".into())
+        );
+        // Same shape, delimiter path: user keys "a" (from a.delta) and "a."
+        // (from a..delta). Anchor "a." → horizon max("a.delta","a..delta")
+        // = "a.delta", which is NOT yet passed at raw "a.delta" (equal) —
+        // the loop keeps fetching instead of emitting "a." before "a".
+        assert_eq!(
+            boundary(&["a..delta", "a.delta"], &[], 1, None),
+            Some("a.delta".into())
+        );
+    }
 
     // ── resolve_created_at: the replication re-copy fix (RCA 2026-06-30) ──
 

@@ -26,6 +26,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Alert, Button, Space, Typography, message } from 'antd';
 import { PlusOutlined } from '@ant-design/icons';
+import { LoadingState } from './StatePlaceholders';
 import type { AdminConfig } from '../adminApi';
 import { useQueryClient } from '@tanstack/react-query';
 import { useAdminConfig } from '../queries/config';
@@ -259,7 +260,7 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
             so this is just the dynamic count line (no duplicate heading). */}
         <Text type="secondary" style={{ fontSize: 13 }}>
           {loading
-            ? 'Loading…'
+            ? 'Loading buckets…'
             : `${sortedReal.length} bucket${sortedReal.length === 1 ? '' : 's'}` +
               (overrideCount > 0
                 ? ` · ${overrideCount} with custom settings`
@@ -268,6 +269,7 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
         </Text>
 
         <div style={{ marginTop: 16, display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {loading && sortedReal.length === 0 && <LoadingState />}
           {sortedReal.map((name) => {
             const row = rowByName.get(name) ?? null;
             const key = `real:${name}`;

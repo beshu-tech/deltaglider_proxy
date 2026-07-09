@@ -14,6 +14,7 @@
  */
 import { useEffect, useRef } from 'react';
 import type { ReactNode } from 'react';
+import { Spin } from 'antd';
 import { useColors } from '../../ThemeContext';
 import type { ColorTokens } from '../../ThemeContext';
 
@@ -226,6 +227,7 @@ function PanelBody({
           fontSize: 12,
         }}
       >
+        <Spin size="small" style={{ marginRight: 8 }} />
         Loading…
       </div>
     );
