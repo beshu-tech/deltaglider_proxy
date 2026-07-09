@@ -855,30 +855,64 @@ async fn head_burst(
     base: u64,
 ) -> Vec<(String, HeadOutcome)> {
     use futures::stream::StreamExt;
-    const HEAD_CONCURRENCY: usize = 50;
+    // 10, down from 50: fifty concurrent HEADs is the burst shape that trips
+    // Ceph qos (Hetzner 503 SlowDown RCA, 2026-07-09). Ten keeps a resolve
+    // sweep fast on a healthy backend and doubles as the abort batch size.
+    const HEAD_CONCURRENCY: usize = 10;
     const FLUSH_EVERY_N_HEADS: usize = 500;
     let owned: Vec<String> = keys.iter().map(|k| (*k).clone()).collect();
-    let mut stream = futures::stream::iter(owned.into_iter().map(|key| async move {
-        let outcome = match engine.head(bucket, &key).await {
-            Ok(m) => HeadOutcome::Resolved(Box::new(m)),
-            Err(e) => {
-                let s = e.to_string();
-                let s = s.to_ascii_lowercase();
-                if s.contains("not found") || s.contains("nosuchkey") {
-                    HeadOutcome::Gone
-                } else {
-                    HeadOutcome::Unresolved
-                }
-            }
-        };
-        (key, outcome)
-    }))
-    .buffer_unordered(HEAD_CONCURRENCY);
     let mut out: Vec<(String, HeadOutcome)> = Vec::new();
-    while let Some(item) = stream.next().await {
-        out.push(item);
+    let mut remaining = owned.as_slice();
+    while !remaining.is_empty() {
+        let (batch, rest) = remaining.split_at(remaining.len().min(HEAD_CONCURRENCY));
+        remaining = rest;
+        let results: Vec<(String, HeadOutcome)> =
+            futures::stream::iter(batch.iter().cloned().map(|key| async move {
+                let outcome = match engine.head(bucket, &key).await {
+                    Ok(m) => HeadOutcome::Resolved(Box::new(m)),
+                    Err(e) => {
+                        let s = e.to_string();
+                        let s = s.to_ascii_lowercase();
+                        if s.contains("not found") || s.contains("nosuchkey") {
+                            HeadOutcome::Gone
+                        } else {
+                            HeadOutcome::Unresolved
+                        }
+                    }
+                };
+                (key, outcome)
+            }))
+            .buffer_unordered(HEAD_CONCURRENCY)
+            .collect()
+            .await;
+        // A batch where EVERY head failed transiently means the backend is
+        // shedding load (503 SlowDown) or unreachable — stop asking and mark
+        // the rest Unresolved. The audit already reports honest partial
+        // coverage for Unresolved keys; grinding on buys nothing.
+        let batch_unresolved = results
+            .iter()
+            .filter(|(_, o)| matches!(o, HeadOutcome::Unresolved))
+            .count();
+        let full_batch_failed = batch_unresolved == results.len() && results.len() >= 3;
+        out.extend(results);
+        if full_batch_failed {
+            tracing::warn!(
+                "parity resolve on {bucket}: a whole HEAD batch failed transiently — \
+                 marking the remaining {} keys unresolved (partial audit) instead of \
+                 grinding a throttled backend",
+                remaining.len()
+            );
+            out.extend(
+                remaining
+                    .iter()
+                    .map(|k| (k.clone(), HeadOutcome::Unresolved)),
+            );
+            break;
+        }
         if let Some(p) = progress {
-            if out.len().is_multiple_of(FLUSH_EVERY_N_HEADS) {
+            if (out.len() / FLUSH_EVERY_N_HEADS)
+                > (out.len().saturating_sub(batch.len())) / FLUSH_EVERY_N_HEADS
+            {
                 p.flush_scanned(base + out.len() as u64).await;
             }
         }

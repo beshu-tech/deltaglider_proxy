@@ -10,6 +10,13 @@
   `503 SlowDown` — the remaining objects render with their listing
   metadata. Deltaspace savings scans keep full coverage but log throttle
   counts.
+- **Background jobs stop hammering a throttled backend.** A replication
+  run now aborts (and backs off to the rule's cadence) when a whole page
+  of copies is rejected with `503 SlowDown`, instead of grinding the
+  remaining key list — the cursor resumes where it left off. Verify's
+  HEAD-resolution runs in batches of 10 (down from 50 concurrent) and
+  marks the remaining keys unresolved (honest partial audit) when a whole
+  batch fails transiently.
 - **The S3 client uses adaptive retry.** One throttle response now
   rate-limits every subsequent request on that backend client (HEAD
   bursts, listings, replication reads) via the AWS SDK's client-wide

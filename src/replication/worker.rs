@@ -173,6 +173,10 @@ pub async fn run_rule(
     // won't recover in 60s, so we back off to the rule's normal cadence rather
     // than re-firing every minute and hammering the dead endpoint forever.
     let mut dest_unusable = false;
+    // Set on a whole-page throttle abort (503 SlowDown): same backoff as
+    // dest_unusable — a backend shedding load needs breathing room, not a
+    // 60s retry hammer.
+    let mut backend_throttled = false;
     // Set when the operator pauses the rule mid-run (DB `paused` flag, re-read
     // at each page boundary). A paused stop is NOT an error: it preserves the
     // cursor so resume continues, and settles the run as "stopped".
@@ -468,6 +472,7 @@ pub async fn run_rule(
         // ConfigDb error is surfaced here (the first one wins).
         let mut dest_fatal = false;
         let mut page_copied: i64 = 0;
+        let mut page_throttled: i64 = 0;
         for res in object_results {
             let res = match res {
                 Ok(r) => r,
@@ -486,6 +491,9 @@ pub async fn run_rule(
             if res.dest_fatal {
                 dest_fatal = true;
             }
+            if res.throttled {
+                page_throttled += 1;
+            }
         }
         // Destination unusable (bucket missing / over quota) — abort the run
         // instead of retrying every remaining object against a dead dest.
@@ -500,6 +508,33 @@ pub async fn run_rule(
             );
             hit_fatal_error = true;
             dest_unusable = true;
+            break 'pages;
+        }
+        // Backend shedding load (503 SlowDown / 429): abort instead of
+        // grinding the remaining key list through per-object retries. Gated
+        // on ≥3 throttled objects AND zero successes so one stray 503 on an
+        // otherwise-copying page never aborts. The persisted cursor resumes
+        // this page on the next (backed-off) run; copies are idempotent.
+        if page_throttled >= 3 && page_copied == 0 {
+            warn!(
+                "replication rule '{}' aborting run: backend throttled ({} objects rejected with SlowDown this page)",
+                rule.name, page_throttled
+            );
+            let _ = log_failure(
+                &db,
+                &rule.name,
+                run_id,
+                "",
+                "",
+                &format!(
+                    "run aborted: backend throttled ({page_throttled} SlowDown rejections in one page); \
+                     resuming from cursor after backoff"
+                ),
+                max_failures_retained,
+            )
+            .await;
+            hit_fatal_error = true;
+            backend_throttled = true;
             break 'pages;
         }
         {
@@ -650,9 +685,10 @@ pub async fn run_rule(
             truncated,
         });
 
-        let next_due = if dest_unusable {
-            // Dead dest won't recover in a minute — back off to the rule's normal
-            // cadence (but never faster than 60s) instead of hammering every minute.
+        let next_due = if dest_unusable || backend_throttled {
+            // Dead dest won't recover in a minute, and a throttling backend
+            // needs breathing room — back off to the rule's normal cadence
+            // (but never faster than 60s) instead of hammering every minute.
             compute_next_due(rule, finished_at).max(finished_at + 60)
         } else if hit_fatal_error || truncated {
             // Tight retry on fatal errors AND budget truncation: the persisted
@@ -717,6 +753,10 @@ struct PerObjectResult {
     // missing / over quota) — the caller aborts the run instead of retrying
     // every remaining object against a dead dest.
     dest_fatal: bool,
+    // The error was a backend throttle (503 SlowDown / 429): the caller
+    // aborts the run when a whole page throttles instead of grinding the
+    // remaining key list against a backend that is shedding load.
+    throttled: bool,
     // Events go straight to the run's EventSink (not through this result):
     // a kill dropping the page's collect future must not lose them.
     // Fast-path attribution for the successful copy (zero otherwise).
@@ -859,6 +899,7 @@ async fn copy_one_object(
                 rule_name, src_key, dest_key, e
             );
             out.dest_fatal = is_destination_fatal(&err_msg);
+            out.throttled = is_backend_throttled(&err_msg);
         }
     }
     Ok(out)
@@ -901,6 +942,20 @@ fn is_destination_fatal(err: &str) -> bool {
         || e.contains("access denied")
         || e.contains("signaturedoesnotmatch")
         || e.contains("permanentredirect")
+}
+
+/// True iff a copy error is a backend THROTTLE signal (Ceph/AWS `503
+/// SlowDown`, generic 429). Like `is_destination_fatal` this answers "COULD
+/// this be a throttle" — the caller's page-level gate (several throttled
+/// objects AND zero successes) keeps a stray token from aborting a healthy
+/// run. Pure so the truth table is unit-tested.
+fn is_backend_throttled(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("slowdown")
+        || e.contains("throttl") // "throttled"/"throttling" (StorageError::Throttled Display)
+        || e.contains("too many requests")
+        || e.contains("status=503")
+        || e.contains("(503")
 }
 
 /// Resolves to `true` once a kill is requested for `run_id` (polls the DB
@@ -1980,6 +2035,32 @@ mod tests {
             "NoSuchKey",
         ] {
             assert!(!is_destination_fatal(ok), "expected non-fatal: {ok}");
+        }
+    }
+
+    #[test]
+    fn backend_throttled_truth_table() {
+        // Throttle signals: Ceph/AWS SlowDown, StorageError::Throttled
+        // Display, generic 429, bare 503 statuses.
+        for t in [
+            "S3 error: put_object failed (status=503): SlowDown",
+            "Backend throttled: get_object throttled (status=503): service error",
+            "429 Too Many Requests",
+            "head_object failed (status=503)",
+            "service error (503 Service Unavailable)",
+        ] {
+            assert!(is_backend_throttled(t), "expected throttled: {t}");
+        }
+        // Everything else: not a throttle — per-object handling continues.
+        for ok in [
+            "Bucket not found: beshu-b2",
+            "object copy timed out after 1800s",
+            "connection reset by peer",
+            "NoSuchKey",
+            "S3 error: AccessDenied",
+            "storage error: quota exceeded",
+        ] {
+            assert!(!is_backend_throttled(ok), "expected non-throttle: {ok}");
         }
     }
 
