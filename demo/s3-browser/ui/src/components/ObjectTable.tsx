@@ -5,7 +5,7 @@ import { FolderOutlined, FileOutlined, LoadingOutlined, CalculatorOutlined, Clos
 import type { S3Object } from '../types';
 import { formatBytes, displayName, timeAgo, numericCompare } from '../utils';
 import type { ColumnsType } from 'antd/es/table';
-import type { Reference as TableReference } from '@rc-component/table';
+import type { GetRef } from 'antd';
 import { useColors } from '../ThemeContext';
 import type { FolderSizeState } from '../useComputeSize';
 import { getPreviewMode } from './filePreviewMode';
@@ -253,7 +253,7 @@ export default function ObjectTable({
   // Scroll container for the keyboard-cursor scroll-into-view (effect below,
   // after `dataSource` is computed).
   const scrollContainerRef = useRef<HTMLDivElement>(null);
-  const tableRef = useRef<TableReference>(null);
+  const tableRef = useRef<GetRef<typeof Table<RowData>>>(null);
 
   // Virtualized body height: the Table renders only visible rows (Tier 3.2),
   // which needs a fixed scroll.y in px. The app is a page-scrolling layout
