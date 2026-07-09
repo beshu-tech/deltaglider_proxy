@@ -8,7 +8,15 @@ import { Alert, Drawer, Empty, Tabs, Tag, Typography } from 'antd';
 import { useColors } from '../../ThemeContext';
 import type { LifecycleConfig, ReplicationConfig } from '../../adminApi';
 import type { JobRow } from '../../jobsView';
-import { isActiveJobStatus, jobStatusLabel, jobStatusTone, kindLabel, parseJobId } from '../../jobsView';
+import {
+  isActiveJobStatus,
+  jobInFlight,
+  jobStatusLabel,
+  jobStatusTone,
+  kindLabel,
+  parseJobId,
+} from '../../jobsView';
+import { formatBytes } from '../../utils';
 import { qk } from '../../queries/keys';
 import { useJobFailures, useJobRuns } from '../../queries/jobs';
 import TimeAgo from '../TimeAgo';
@@ -59,6 +67,9 @@ export default function JobDrawer({
   const c = useColors();
   const parsed = jobId ? parseJobId(jobId) : null;
   const serverRow = rows.find((r) => r.id === jobId) ?? null;
+  // Live "currently copying" objects (name + size) — justifies a slow-moving
+  // counter when the run is chewing through multi-GB files.
+  const inFlight = jobInFlight(serverRow);
   // Runs/failures only exist for jobs the SERVER knows (not drafts).
   // These are NOT polled — the jobs LIST already polls (2s while active) and
   // carries the live progress in `serverRow`. We overlay that onto the running
@@ -335,6 +346,29 @@ export default function JobDrawer({
         )
       }
     >
+      {inFlight.length > 0 && (
+        <div
+          style={{
+            marginBottom: 12,
+            padding: '8px 12px',
+            borderRadius: 8,
+            background: c.BG_ELEVATED,
+            fontSize: 12.5,
+          }}
+        >
+          {inFlight.map((f) => (
+            <div key={f.key} style={{ display: 'flex', gap: 8, alignItems: 'baseline' }}>
+              <Typography.Text type="secondary">copying</Typography.Text>
+              <Typography.Text style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }} ellipsis>
+                {f.key}
+              </Typography.Text>
+              <Typography.Text type="secondary" style={{ whiteSpace: 'nowrap' }}>
+                {formatBytes(f.size)} · <TimeAgo ts={f.started_unix * 1000} />
+              </Typography.Text>
+            </div>
+          ))}
+        </div>
+      )}
       <Tabs
         activeKey={clampedTab}
         onChange={onTabChange}

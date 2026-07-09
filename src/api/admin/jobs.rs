@@ -388,6 +388,13 @@ pub async fn list_jobs(
                 detail: serde_json::json!({
                     "interval": rule.interval,
                     "destination_prefix": rule.destination.prefix,
+                    // Live "currently copying" objects (largest first, top 3)
+                    // so a slow-moving counter is explained in the UI — a
+                    // 4 GB tarball at 10 MB/s is work, not a hang.
+                    "in_flight": crate::replication::worker::inflight_snapshot(&rule.name)
+                        .into_iter()
+                        .take(3)
+                        .collect::<Vec<_>>(),
                 }),
             });
         }

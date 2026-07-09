@@ -10,6 +10,11 @@
   `503 SlowDown` — the remaining objects render with their listing
   metadata. Deltaspace savings scans keep full coverage but log throttle
   counts.
+- **The job drawer shows WHAT a replication run is copying.** An active
+  run now lists its in-flight objects (name, size, started) above the
+  tabs — a counter sitting on "1 copied" for 30 minutes reads as honest
+  work on a 4 GB tarball instead of a hang. Live view, top 3 largest,
+  refreshed by the existing 2s poll.
 - **Background jobs stop hammering a throttled backend.** A replication
   run now aborts (and backs off to the rule's cadence) when a whole page
   of copies is rejected with `503 SlowDown`, instead of grinding the

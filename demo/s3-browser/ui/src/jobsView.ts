@@ -50,6 +50,26 @@ export function isActiveJobStatus(status: string): boolean {
   return status === 'queued' || status === 'running' || status === 'cancelling';
 }
 
+export type InFlightCopy = { key: string; size: number; started_unix: number };
+
+/**
+ * Live "currently copying" entries from a job row's detail (replication
+ * rows on an active run). Defensive: the field is absent on old servers,
+ * drafts, and non-replication kinds.
+ */
+export function jobInFlight(row: Pick<JobRow, 'status' | 'detail'> | null): InFlightCopy[] {
+  if (!row || !isActiveJobStatus(row.status)) return [];
+  const raw = row.detail?.in_flight;
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(
+    (e): e is InFlightCopy =>
+      !!e &&
+      typeof e === 'object' &&
+      typeof (e as InFlightCopy).key === 'string' &&
+      typeof (e as InFlightCopy).size === 'number',
+  );
+}
+
 /** AntD tag color for a job row. Pause/disable win over the last status. */
 export function jobStatusTone(row: Pick<JobRow, 'status' | 'paused' | 'enabled'>): string {
   if (row.enabled === false) return 'default';

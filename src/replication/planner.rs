@@ -45,8 +45,9 @@ pub enum SkipReason {
 /// Plan describing what a single batch iteration should do.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct BatchPlan {
-    /// Objects the worker must copy (source_key, dest_key).
-    pub to_copy: Vec<(String, String)>,
+    /// Objects the worker must copy (source_key, dest_key, source size in
+    /// bytes — carried so the run UI can show WHAT is copying and how big).
+    pub to_copy: Vec<(String, String, u64)>,
     /// Per-object skip reasons — surfaced in totals/telemetry.
     pub skipped: Vec<(String, SkipReason)>,
 }
@@ -350,7 +351,8 @@ where
             &excludes,
         ) {
             Decision::Copy { .. } => {
-                plan.to_copy.push((src_key.clone(), dest_key));
+                plan.to_copy
+                    .push((src_key.clone(), dest_key, src_meta.file_size));
             }
             Decision::Skip { reason } => {
                 plan.skipped.push((src_key.clone(), reason));
@@ -884,8 +886,8 @@ mod tests {
         };
         let plan = plan_batch(&objects, &rule, head_dest).await.unwrap();
         assert_eq!(plan.to_copy.len(), 2, "b + c copy; a is newer on dest");
-        assert!(plan.to_copy.iter().any(|(s, _)| s == "b.txt"));
-        assert!(plan.to_copy.iter().any(|(s, _)| s == "c.txt"));
+        assert!(plan.to_copy.iter().any(|(s, _, _)| s == "b.txt"));
+        assert!(plan.to_copy.iter().any(|(s, _, _)| s == "c.txt"));
         assert_eq!(plan.skipped.len(), 2, "a skipped + .dg/skip skipped");
     }
 }

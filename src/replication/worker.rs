@@ -46,6 +46,69 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+/// One object currently being copied — feeds the Jobs UI so a slow-moving
+/// counter is explained ("copying big.tar.gz · 4.2 GB"). In-memory and
+/// node-local by design: this is LIVE progress, not durable state (a restart
+/// or kill simply clears it via the RAII guards).
+#[derive(Clone, serde::Serialize)]
+pub struct InFlightCopy {
+    pub key: String,
+    pub size: u64,
+    pub started_unix: i64,
+}
+
+static INFLIGHT: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<String, Vec<InFlightCopy>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Snapshot of a rule's in-flight copies for the admin jobs API,
+/// largest-first (the big file is the one that explains the wait).
+pub fn inflight_snapshot(rule: &str) -> Vec<InFlightCopy> {
+    let map = INFLIGHT.lock();
+    let mut v = map.get(rule).cloned().unwrap_or_default();
+    v.sort_by_key(|e| std::cmp::Reverse(e.size));
+    v
+}
+
+/// RAII registration of one in-flight copy: inserted on construction, removed
+/// on drop — a killed page (its collect future dropped) cleans up implicitly.
+struct InFlightGuard {
+    rule: String,
+    key: String,
+}
+
+impl InFlightGuard {
+    fn new(rule: &str, key: &str, size: u64) -> Self {
+        INFLIGHT
+            .lock()
+            .entry(rule.to_string())
+            .or_default()
+            .push(InFlightCopy {
+                key: key.to_string(),
+                size,
+                started_unix: current_unix_seconds(),
+            });
+        Self {
+            rule: rule.to_string(),
+            key: key.to_string(),
+        }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let mut map = INFLIGHT.lock();
+        if let Some(v) = map.get_mut(&self.rule) {
+            if let Some(pos) = v.iter().position(|e| e.key == self.key) {
+                v.remove(pos);
+            }
+            if v.is_empty() {
+                map.remove(&self.rule);
+            }
+        }
+    }
+}
+
 /// RAII guard for one in-flight replication object. Increments
 /// `objects_inflight` (+peak) on construction and decrements on drop so the
 /// gauge always settles, even on an early return/abort.
@@ -419,7 +482,7 @@ pub async fn run_rule(
         // event. The page boundary is the barrier: the cursor does not
         // advance until every in-flight object of this page finishes.
         let copy_page = futures::stream::iter(plan.to_copy.clone())
-            .map(|(src_key, dest_key)| {
+            .map(|(src_key, dest_key, src_size)| {
                 let db = db.clone();
                 let engine = engine.clone();
                 let rule_name = rule.name.clone();
@@ -430,6 +493,9 @@ pub async fn run_rule(
                     // Guard increments objects_inflight (+peak) on entry and
                     // decrements on drop → proves the `transfers` concurrency.
                     let _obj_guard = engine.metrics().cloned().map(ObjectGuard::new);
+                    // Live "currently copying" registration for the Jobs UI
+                    // (RAII: a kill dropping this future unregisters it).
+                    let _inflight = InFlightGuard::new(&rule_name, &src_key, src_size);
                     copy_one_object(
                         &db,
                         &engine,
