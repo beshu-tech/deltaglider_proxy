@@ -33,6 +33,7 @@ import {
 } from '../adminApi';
 import { useColors } from '../ThemeContext';
 import { useCopyToClipboard } from '../useCopyToClipboard';
+import { normalizeUiError } from '../errorHandling';
 
 const { Text, Paragraph } = Typography;
 
@@ -75,7 +76,7 @@ export function YamlImportExportModal({ open, mode, onClose, onApplied }: YamlMo
         })
         .catch((e) => {
           if (cancelled) return;
-          setError(e instanceof Error ? e.message : String(e));
+          setError(normalizeUiError(e, "YAML operation failed"));
           setLoading(false);
         });
     } else {
@@ -109,7 +110,7 @@ export function YamlImportExportModal({ open, mode, onClose, onApplied }: YamlMo
         setError(resp.error);
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(normalizeUiError(e, "YAML operation failed"));
     } finally {
       setLoading(false);
     }
@@ -127,7 +128,7 @@ export function YamlImportExportModal({ open, mode, onClose, onApplied }: YamlMo
         onApplied();
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(normalizeUiError(e, "YAML operation failed"));
     } finally {
       setLoading(false);
     }

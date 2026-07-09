@@ -18,6 +18,7 @@ import { startReencrypt } from '../adminApi';
 import { qk } from '../queries/keys';
 import { useColors } from '../ThemeContext';
 import { useBucketOrigins } from '../queries/backends';
+import { normalizeUiError } from '../errorHandling';
 
 const { Text } = Typography;
 
@@ -90,7 +91,7 @@ export default function ReencryptProposalModal({
       qc.invalidateQueries({ queryKey: qk.jobs.list() });
       if (res.errors.length === 0) onClose();
     } catch (e) {
-      messageApi.error(e instanceof Error ? e.message : 'Failed to start');
+      messageApi.error(normalizeUiError(e, 'Failed to start'));
     } finally {
       setStarting(false);
     }

@@ -4,6 +4,7 @@ import { DeleteOutlined, CopyOutlined, ScissorOutlined, DownloadOutlined } from 
 import { useColors } from '../ThemeContext';
 import { pluralize } from '../utils';
 import DestinationPickerModal from './DestinationPickerModal';
+import { normalizeUiError } from '../errorHandling';
 
 interface Props {
   selectedCount: number;
@@ -34,7 +35,7 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
         message.success(`${pluralize(result.succeeded, 'item')} ${op === 'copy' ? 'copied' : 'moved'}`);
       }
     } catch (e) {
-      message.error(e instanceof Error ? e.message : `${op} failed`);
+      message.error(normalizeUiError(e, `${op} failed`));
     } finally {
       setOperating(false);
       setModal(null);
@@ -47,7 +48,7 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
       if (!onDownloadZip) return;
       await onDownloadZip();
     } catch (e) {
-      message.error(e instanceof Error ? e.message : 'Download failed');
+      message.error(normalizeUiError(e, "Download failed"));
     } finally {
       setDownloading(false);
     }

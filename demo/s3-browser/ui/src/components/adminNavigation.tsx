@@ -74,14 +74,14 @@ export const ADMIN_IA: Array<{ group: string; entries: SidebarEntry[] }> = [
       },
       {
         path: 'diagnostics/trace',
-        label: 'Trace',
+        label: 'Rule tester',
         icon: <ExperimentOutlined />,
         description:
           'Replay a synthetic request against the admission chain and see which rule fires.',
       },
       {
         path: 'diagnostics/delta-efficiency',
-        label: 'Delta efficiency',
+        label: 'Compression health',
         icon: <ThunderboltOutlined />,
         description: 'Find prefixes where the delta baseline is underperforming.',
       },
@@ -138,7 +138,7 @@ export const ADMIN_IA: Array<{ group: string; entries: SidebarEntry[] }> = [
       },
       {
         path: 'access/admission',
-        label: 'Admission rules',
+        label: 'Request rules',
         icon: <SecurityScanOutlined />,
         section: 'admission',
         dirtyKeys: ['admission'],
@@ -205,7 +205,7 @@ export const ADMIN_IA: Array<{ group: string; entries: SidebarEntry[] }> = [
       },
       {
         path: 'integrations/event-outbox',
-        label: 'Event outbox',
+        label: 'Event log',
         icon: <CloudServerOutlined />,
         description: 'The durable queue behind event delivery: delivered, retrying, failed.',
       },

@@ -225,10 +225,10 @@ pub async fn establish_backend_verdict(
 pub fn noncas_enforcement_message(name: &str, buckets: &[String]) -> String {
     format!(
         "backend '{name}' does not support conditional writes, but client-writable \
-         bucket(s) {buckets:?} route to it and multi-instance mode is active \
-         (config_sync_bucket is set). Concurrent writes from two instances can corrupt \
-         delta references. Fix: move these buckets to a CAS-capable backend, or mark \
-         each as replication_target_only. — see {CAPABILITY_DOC_URL}"
+         bucket(s) {buckets:?} route to it and multi-instance mode is active. \
+         Concurrent writes from two instances can corrupt delta references. \
+         Fix: move these buckets to a backend that supports conditional writes, or \
+         mark each as configured for replication targets only. — see {CAPABILITY_DOC_URL}"
     )
 }
 

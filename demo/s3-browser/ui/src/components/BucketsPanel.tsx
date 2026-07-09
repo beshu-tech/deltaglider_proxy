@@ -42,6 +42,7 @@ import { useJobs } from '../queries/jobs';
 import { busyJobForBucket } from '../jobsView';
 import type { BucketPolicyRow, BucketPolicyPatch, PrefixEntry } from './bucketPolicyPayload';
 import { DEFAULT_ROW_FIELDS, buildBucketPayload, freshId, isAllDefaultRow, policyToRow } from './bucketPolicyPayload';
+import { numericCompare } from '../utils';
 
 interface Props {
   onSessionExpired?: () => void;
@@ -87,7 +88,7 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
       const nextRows = Object.entries(policies)
         .filter((e): e is [string, PolicyGet] => e[1] != null)
         .map(([name, p]) => policyToRow(name, p));
-      nextRows.sort((a, b) => a.name.localeCompare(b.name));
+      nextRows.sort((a, b) => numericCompare(a.name, b.name));
       return nextRows;
     },
     // The guarded `runApply` below blocks the apply on validation failure,
@@ -217,7 +218,7 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
   // ── Display list: every real bucket (with its row when one exists), then
   //    policy rows / drafts whose bucket doesn't exist. ──
   const rowByName = new Map(rows.filter((r) => r.name).map((r) => [r.name, r]));
-  const sortedReal = [...realBuckets].sort((a, b) => a.localeCompare(b));
+  const sortedReal = [...realBuckets].sort((a, b) => numericCompare(a, b));
   const orphanRows = rows.filter((r) => !r.name || !realBuckets.includes(r.name));
   const overrideCount = rows.filter((r) => r.name && realBuckets.includes(r.name)).length;
 

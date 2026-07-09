@@ -20,6 +20,7 @@ import {
   type EventOutboxStatus,
 } from '../adminApi';
 import { contentColumn, CONTENT_WIDE } from './shared-styles';
+import { normalizeUiError } from '../errorHandling';
 
 const { Text } = Typography;
 const DEFAULT_PAGE_SIZE = 50;
@@ -103,7 +104,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
         onSessionExpired?.();
         return;
       }
-      setError(e instanceof Error ? e.message : 'Failed to load event outbox');
+      setError(normalizeUiError(e, "Failed to load event outbox"));
     } finally {
       if (gen === fetchGen.current) setLoading(false);
     }
@@ -284,7 +285,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
         onSessionExpired?.();
         return;
       }
-      message.error(e instanceof Error ? e.message : 'Failed to requeue event');
+      message.error(normalizeUiError(e, "Failed to requeue event"));
     } finally {
       setRequeueing(null);
     }
@@ -302,7 +303,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
         onSessionExpired?.();
         return;
       }
-      message.error(e instanceof Error ? e.message : 'Failed to requeue failed events');
+      message.error(normalizeUiError(e, "Failed to requeue failed events"));
     } finally {
       setRequeueing(null);
     }
@@ -322,7 +323,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
         onSessionExpired?.();
         return;
       }
-      message.error(e instanceof Error ? e.message : 'Failed to purge failed events');
+      message.error(normalizeUiError(e, "Failed to purge failed events"));
     } finally {
       setRequeueing(null);
     }

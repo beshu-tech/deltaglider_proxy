@@ -18,6 +18,7 @@ import FormField from './FormField';
 import BackendEncryptionEditor, { type BackendEncryptionPatch } from './BackendEncryptionEditor';
 import { buildEncryptionSectionBody } from '../backendEncryptionPayload';
 import MaskedSecretInput from './MaskedSecretInput';
+import { normalizeUiError } from '../errorHandling';
 
 const { Text } = Typography;
 
@@ -75,9 +76,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
   }, [loadError, onSessionExpired]);
   const error =
     loadError && !(loadError instanceof Error && loadError.message.includes('401'))
-      ? loadError instanceof Error
-        ? loadError.message
-        : 'Failed to load'
+      ? normalizeUiError(loadError, 'Failed to load backends')
       : null;
 
   // New backend form
@@ -165,7 +164,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
         setSaveResult({ ok: false, message: result.error || 'Failed to create backend' });
       }
     } catch (e) {
-      setSaveResult({ ok: false, message: e instanceof Error ? e.message : 'Network error' });
+      setSaveResult({ ok: false, message: normalizeUiError(e, "Network error") });
     } finally {
       setSaving(false);
     }
@@ -201,7 +200,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
             setSaveResult({ ok: false, message: result.error || 'Failed to delete' });
           }
         } catch (e) {
-          setSaveResult({ ok: false, message: e instanceof Error ? e.message : 'Network error' });
+          setSaveResult({ ok: false, message: normalizeUiError(e, "Network error") });
         }
       },
     });
@@ -297,7 +296,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
       }
     } catch (e) {
       if (e instanceof Error && !resultSet) {
-        setSaveResult({ ok: false, message: e.message });
+        setSaveResult({ ok: false, message: normalizeUiError(e, 'Re-encryption proposal failed') });
       }
       throw e;
     }

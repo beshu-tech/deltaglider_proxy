@@ -396,8 +396,8 @@ impl BucketPolicyRegistry {
         let key = bucket.to_ascii_lowercase();
         if self.replication_target_only(&key) {
             return Some(format!(
-                "Bucket '{bucket}' is replication_target_only: client writes are disabled so \
-                 replication remains the single writer — see {url}",
+                "Bucket '{bucket}' is configured for replication targets only: client writes are \
+                 disabled so replication remains the single writer — see {url}",
                 url = crate::coordination::capability::CAPABILITY_DOC_URL
             ));
         }
@@ -409,10 +409,10 @@ impl BucketPolicyRegistry {
         // the message promises.
         if !self.policies.contains_key(&key) && self.replication_target_real_names.contains(&key) {
             return Some(format!(
-                "Bucket name '{bucket}' maps to the storage of a replication_target_only \
-                 bucket, so client writes are blocked to keep replication the single writer. \
-                 If this is a different bucket, declare it explicitly with a backend route — \
-                 see {url}",
+                "Bucket name '{bucket}' maps to the storage of a bucket configured for \
+                 replication targets only, so client writes are blocked to keep replication the \
+                 single writer. If this is a different bucket, declare it explicitly with a \
+                 backend route — see {url}",
                 url = crate::coordination::capability::CAPABILITY_DOC_URL
             ));
         }

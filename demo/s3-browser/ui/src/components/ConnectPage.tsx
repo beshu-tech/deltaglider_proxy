@@ -7,6 +7,7 @@ import type { ExternalProviderInfo } from '../adminApi';
 import OAuthProviderList from './OAuthProviderList';
 import { detectDefaultEndpoint } from '../utils';
 import { useColors, useTheme } from '../ThemeContext';
+import { normalizeUiError } from '../errorHandling';
 
 const { Text } = Typography;
 
@@ -199,7 +200,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
       if (authMode === 'bootstrap') {
         // Bootstrap mode: login with password, session auto-provides S3 creds
         if (!adminPassword.trim()) {
-          setError('Bootstrap password is required');
+          setError('Admin password is required');
           setLoading(false);
           return;
         }
@@ -282,7 +283,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
 
       finishConnect(onConnect, iamOutcome);
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Connection failed');
+      setError(normalizeUiError(e, "Connection failed"));
     } finally {
       setLoading(false);
     }
@@ -323,7 +324,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
         setRecoveryError(result.error || 'Password does not match');
       }
     } catch (e) {
-      setRecoveryError(e instanceof Error ? e.message : 'Recovery failed');
+      setRecoveryError(normalizeUiError(e, 'Recovery failed'));
     } finally {
       setRecoveryLoading(false);
     }
@@ -389,7 +390,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                     </div>
                   </div>
                   <div style={{ color: TEXT_SECONDARY, fontSize: 14, fontFamily: "var(--font-ui)", lineHeight: 1.7 }}>
-                    Set this hash as your bootstrap password (env <code>DGP_BOOTSTRAP_PASSWORD_HASH</code>
+                    Set this hash as your admin password (env <code>DGP_BOOTSTRAP_PASSWORD_HASH</code>
                     or the config), then restart the server to unlock. Your original config
                     database is preserved on the server as <code>deltaglider_config.db.bak</code> and
                     is not modified by recovery.
@@ -428,7 +429,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                     </div>
                   </div>
                   <div style={{ color: TEXT_SECONDARY, fontSize: 14, lineHeight: 1.7, fontFamily: "var(--font-ui)" }}>
-                    The IAM database is encrypted with your bootstrap password <b>hash</b>, and
+                    The IAM database is encrypted with your admin password <b>hash</b>, and
                     the hash loaded at startup doesn’t match the one that encrypted it.
                   </div>
                   <LockedDbExplainer accent={ACCENT_BLUE} muted={TEXT_MUTED} text={TEXT_SECONDARY} />
@@ -449,7 +450,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                 {recoveryError && <Alert type="error" message={recoveryError} showIcon />}
                 <div>
                   <label style={{ fontSize: 13, fontWeight: 600, color: TEXT_SECONDARY, fontFamily: "var(--font-ui)", marginBottom: 6, display: 'block' }}>
-                    Original Bootstrap Password Hash
+                    Original Admin Password Hash
                   </label>
                   <Input.TextArea
                     value={recoveryPassword}
@@ -567,12 +568,12 @@ export default function ConnectPage({ onConnect, showError }: Props) {
               {isBootstrap ? (
                 /* Bootstrap mode: password only */
                 <div>
-                  <label className="dg-login-label">Bootstrap password</label>
+                  <label className="dg-login-label">Admin password</label>
                   <Input.Password
                     value={adminPassword}
                     onChange={(e) => setAdminPassword(e.target.value)}
                     onPressEnter={handleConnect}
-                    placeholder="Bootstrap password"
+                    placeholder="Admin password"
                     size="large"
                     autoFocus={externalProviders.length === 0}
                     style={loginInputStyle}

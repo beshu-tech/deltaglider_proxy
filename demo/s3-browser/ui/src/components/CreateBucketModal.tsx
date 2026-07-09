@@ -19,6 +19,7 @@ import type { InputRef } from 'antd';
 import { createBucket } from '../s3client';
 import { getBackends } from '../adminApi';
 import type { BackendInfo } from '../adminApi';
+import { normalizeUiError } from '../errorHandling';
 
 const { Text } = Typography;
 
@@ -95,7 +96,7 @@ export default function CreateBucketModal({
       onClose();
       onCreated(trimmed);
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : 'Unknown error';
+      const msg = normalizeUiError(e, "Unknown error");
       messageApi.error(`Failed to create bucket: ${msg}`);
     } finally {
       setCreating(false);

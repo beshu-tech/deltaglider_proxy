@@ -11,6 +11,7 @@ import { Typography, Button, Tag, Table, Space, message, Input } from 'antd';
 import { ReloadOutlined, LogoutOutlined } from '@ant-design/icons';
 import { listSessions, revokeSession, revokeUserSessions, type SessionSummary } from '../adminApi';
 import { contentColumn, CONTENT_WIDE } from './shared-styles';
+import { normalizeUiError } from '../errorHandling';
 
 const { Text } = Typography;
 
@@ -32,7 +33,7 @@ export default function SessionsPanel({ onSessionExpired }: { onSessionExpired?:
       setRows(await listSessions());
     } catch (e) {
       if (e instanceof Error && e.message.includes('401')) { onSessionExpired?.(); return; }
-      message.error(e instanceof Error ? e.message : 'Failed to load sessions');
+      message.error(normalizeUiError(e, 'Failed to load sessions'));
     } finally {
       setLoading(false);
     }
@@ -48,7 +49,7 @@ export default function SessionsPanel({ onSessionExpired }: { onSessionExpired?:
       message.success('Session revoked');
       await refresh();
     } catch (e) {
-      message.error(e instanceof Error ? e.message : 'Failed to revoke session');
+      message.error(normalizeUiError(e, 'Failed to revoke session'));
     } finally {
       setBusy(null);
     }
@@ -70,7 +71,7 @@ export default function SessionsPanel({ onSessionExpired }: { onSessionExpired?:
       setRevokeKey('');
       await refresh();
     } catch (e) {
-      message.error(e instanceof Error ? e.message : 'Failed to revoke user sessions');
+      message.error(normalizeUiError(e, 'Failed to revoke user sessions'));
     } finally {
       setBusy(null);
     }

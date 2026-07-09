@@ -188,7 +188,7 @@ export default function VerifyTab({ ruleName }: Props) {
           Verify that every object in the source exists on the destination with a matching checksum.
         </Text>
         <Text type="secondary" style={{ display: 'block', fontSize: 12.5, marginBottom: 18 }}>
-          Compares logical SHA-256 + size from metadata — no downloads. Runs in the background;
+          Checks that every object matches — no downloads. Runs in the background;
           the result is saved, so you can leave this page and come back.
         </Text>
         <Button
@@ -344,7 +344,7 @@ function LoadingBlock({
         </div>
 
         <Text type="secondary" style={{ display: 'block', fontSize: 11.5, color: c.TEXT_MUTED, marginTop: 16 }}>
-          Logical SHA-256 + size from metadata — no downloads. Runs in the background, so you can
+          Checks that every object matches — no downloads. Runs in the background, so you can
           leave this page and come back.
         </Text>
 
@@ -524,7 +524,7 @@ export function ParityResult({
         ) : (
           <div style={{ fontSize: 14, color: c.TEXT_SECONDARY, lineHeight: 1.55, maxWidth: 460, margin: '0 auto' }}>
             {outcome.matched.toLocaleString()} of {outcome.source_objects.toLocaleString()} source
-            objects match. The destination is not an exact mirror.
+            objects match. Some files are missing or different on the destination.
           </div>
         )}
 
@@ -567,8 +567,8 @@ export function ParityResult({
         >
           Checked {timeAgo(scannedDate)} ·{' '}
           {pure
-            ? 'logical SHA-256 + size from listing metadata — no per-object reads'
-            : 'logical SHA-256 + size, from metadata'}
+            ? 'metadata only — no downloads'
+            : 'metadata only — no downloads'}
         </div>
 
         {/* Re-verify control lives here only when idle; while running, the
@@ -618,7 +618,7 @@ export function ParityResult({
               showIcon
               style={{ borderRadius: 8, marginTop: 14 }}
               message="Some objects matched on size only"
-              description="These objects weren't written through the proxy, so no logical SHA-256 is available — write them through the proxy for full checksum parity."
+              description="These objects weren't written through the proxy, so only size could be checked — write them through the proxy for full checksum parity."
             />
           )}
 

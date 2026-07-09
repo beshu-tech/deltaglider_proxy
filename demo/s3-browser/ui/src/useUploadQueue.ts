@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { uploadObject, type UploadTelemetry } from './s3client';
 import { summarizeObjectSavings } from './savings';
 import { clampPercent, mergeTotalBytes, type UploadStatus } from './uploadTelemetry';
+import { normalizeUiError } from './errorHandling';
 
 export interface UploadQueueItem {
   id: string;
@@ -184,7 +185,7 @@ export default function useUploadQueue(destination: string) {
               ? {
                   ...entry,
                   status: 'error',
-                  error: err instanceof Error ? err.message : 'Upload failed',
+                  error: normalizeUiError(err, 'Upload failed'),
                   inFlightParts: 0,
                   activeConnections: 0,
                   speedBytesPerSec: 0,

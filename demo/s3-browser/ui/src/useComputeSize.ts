@@ -1,6 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { scanPrefixUsage, getPrefixUsage } from './adminApi';
 import { getBucket } from './s3client';
+import { normalizeUiError } from './errorHandling';
 
 export interface FolderSizeState {
   progress: { totalSize: number; totalFiles: number; done: boolean } | null;
@@ -89,7 +90,7 @@ export default function useComputeSize() {
           [prefix]: {
             progress: null,
             loading: false,
-            error: err instanceof Error ? err.message : String(err),
+            error: normalizeUiError(err, "Compute size failed"),
           },
         }));
       });

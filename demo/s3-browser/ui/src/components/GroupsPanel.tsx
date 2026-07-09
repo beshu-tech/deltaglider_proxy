@@ -13,6 +13,7 @@ import { permissionsToRows, rowsToPermissions, freshPermissionRowId, type Permis
 import { groupPermissionSummary, filterItems } from '../masterDetailFilter';
 import MasterDetailPanel from './MasterDetailPanel';
 import IamSourceBanner from './IamSourceBanner';
+import { normalizeUiError } from '../errorHandling';
 
 const { Text, Title } = Typography;
 
@@ -47,7 +48,7 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
   const users = useMemo(() => usersQuery.data ?? [], [usersQuery.data]);
   const loading = groupsQuery.isLoading || usersQuery.isLoading;
   const rawError = groupsQuery.error ?? usersQuery.error;
-  const error = rawError ? (rawError instanceof Error ? rawError.message : 'Failed to load data') : '';
+  const error = rawError ? (normalizeUiError(rawError, "Failed to load data")) : '';
 
   // Bubble a 401 up so the login screen can take over. Must run as an effect,
   // not in the render body: react-query keeps `error` populated across renders,
@@ -122,7 +123,7 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
       setCreating(false);
       setSelectedId(cloned.id);
     } catch (err) {
-      message.error(err instanceof Error ? err.message : 'Duplicate group failed');
+      message.error(normalizeUiError(err, "Duplicate group failed"));
     } finally {
       onSavingChange?.(false);
     }
@@ -352,7 +353,7 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
       }
       onSaved();
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Operation failed');
+      setError(normalizeUiError(e, "Operation failed"));
     } finally {
       setSaving(false);
     }
@@ -365,7 +366,7 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
       await deleteGroupMutation.mutateAsync(group.id);
       onDeleted?.();
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Delete failed');
+      setError(normalizeUiError(e, "Delete failed"));
     } finally {
       setDeleting(false);
     }

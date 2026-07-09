@@ -60,6 +60,7 @@ import { useColors } from '../ThemeContext';
 import { useCopyToClipboard } from '../useCopyToClipboard';
 import { useCardStyles, contentColumn, CONTENT_FORM } from './shared-styles';
 import FormField from './FormField';
+import { normalizeUiError } from '../errorHandling';
 
 const { Text, Paragraph } = Typography;
 
@@ -194,8 +195,7 @@ export default function SetupWizard({ onComplete, onCancel }: Props) {
       onComplete();
     } catch (e) {
       message.error(
-        `Apply failed: ${e instanceof Error ? e.message : 'unknown'}`
-      );
+        `Apply failed: ${normalizeUiError(e, 'unknown')}`);
     } finally {
       setApplying(false);
     }

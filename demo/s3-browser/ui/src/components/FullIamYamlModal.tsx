@@ -43,6 +43,7 @@ import {
 } from '../adminApi';
 import { useColors } from '../ThemeContext';
 import { useCopyToClipboard } from '../useCopyToClipboard';
+import { normalizeUiError } from '../errorHandling';
 
 const { Text, Paragraph } = Typography;
 
@@ -123,7 +124,7 @@ export function FullIamYamlModal({ open, mode, onClose, onApplied }: Props) {
         })
         .catch((e) => {
           if (cancelled) return;
-          setError(e instanceof Error ? e.message : String(e));
+          setError(normalizeUiError(e, "YAML operation failed"));
           setLoading(false);
         });
     } else {
@@ -163,7 +164,7 @@ export function FullIamYamlModal({ open, mode, onClose, onApplied }: Props) {
     try {
       setPreview(await validateFullIamYaml(yaml));
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(normalizeUiError(e, "YAML operation failed"));
     } finally {
       setLoading(false);
     }
@@ -177,7 +178,7 @@ export function FullIamYamlModal({ open, mode, onClose, onApplied }: Props) {
       setApplied(res);
       onApplied?.();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(normalizeUiError(e, "YAML operation failed"));
     } finally {
       setLoading(false);
     }

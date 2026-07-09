@@ -15,6 +15,7 @@ import { Tag, Typography, Tooltip } from 'antd';
 import { LockOutlined, RightOutlined } from '@ant-design/icons';
 import type { AdminConfig } from '../adminApi';
 import { useColors } from '../ThemeContext';
+import { numericCompare } from '../utils';
 
 const { Text } = Typography;
 
@@ -48,7 +49,7 @@ function synthesise(policies: AdminConfig['bucket_policies']): SynthesisedRow[] 
     });
   }
   // Stable alphabetical order so reloads don't shuffle the display.
-  out.sort((a, b) => a.bucket.localeCompare(b.bucket));
+  out.sort((a, b) => numericCompare(a.bucket, b.bucket));
   return out;
 }
 

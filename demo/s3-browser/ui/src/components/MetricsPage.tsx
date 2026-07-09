@@ -34,6 +34,7 @@ import StatValue from './dashboard/StatValue';
 import DashboardToolbar, { type RefreshCadence } from './dashboard/DashboardToolbar';
 import { CHART_PALETTE, STATUS_COLORS, chartTooltipStyle, axisTickStyle, fmtDuration, fmtNum, fmtPct } from './dashboard/chartDefaults';
 import './dashboard/dashboard.css';
+import { normalizeUiError } from '../errorHandling';
 
 const { Text } = Typography;
 
@@ -213,7 +214,7 @@ export default function MetricsPage({ onBack, embedded }: Props) {
       setHistory(prev => [...prev, snap].slice(-MAX_HISTORY));
       setError(null);
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to fetch');
+      setError(normalizeUiError(e, 'Failed to fetch'));
     } finally { setLoading(false); setRefreshing(false); }
   }, []);
 
@@ -336,8 +337,8 @@ export default function MetricsPage({ onBack, embedded }: Props) {
             header stays the visual seam.
           */}
           <Panel
-            title="Storage footprint"
-            subtitle="Honest totals from the on-disk scan cache"
+            title="Storage used"
+            subtitle="From the on-disk scan cache"
             colSpan={6}
             accent={
               scanCardAccent === 'green'

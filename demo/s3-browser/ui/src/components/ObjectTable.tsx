@@ -3,7 +3,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { Table, Typography, Alert, Progress, Checkbox, theme, Button, Select } from 'antd';
 import { FolderOutlined, FileOutlined, LoadingOutlined, CalculatorOutlined, CloseCircleOutlined, WarningOutlined } from '@ant-design/icons';
 import type { S3Object } from '../types';
-import { formatBytes, displayName, timeAgo } from '../utils';
+import { formatBytes, displayName, timeAgo, numericCompare } from '../utils';
 import type { ColumnsType } from 'antd/es/table';
 import { useColors } from '../ThemeContext';
 import type { FolderSizeState } from '../useComputeSize';
@@ -326,7 +326,7 @@ export default function ObjectTable({
       title: () => <span style={{ ...COL_HEADER_STYLE, color: TEXT_MUTED }}>Name</span>,
       dataIndex: 'name',
       key: 'name',
-      sorter: (a, b) => a.name.localeCompare(b.name),
+      sorter: (a, b) => numericCompare(a.name, b.name),
       ellipsis: true,
       render: (_: unknown, record: RowData) => {
         if (record._isFolder) {
@@ -400,7 +400,7 @@ export default function ObjectTable({
       sorter: (a, b) => {
         const da = a._isFolder ? '' : a.lastModified || '';
         const db = b._isFolder ? '' : b.lastModified || '';
-        return da.localeCompare(db);
+        return numericCompare(da, db);
       },
       render: (_: unknown, record: RowData) => {
         if (record._isFolder) return null;

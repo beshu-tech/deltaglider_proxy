@@ -45,6 +45,7 @@ import { FullIamYamlModal } from './FullIamYamlModal';
 import { useDirtyGlobalIndicators, requestApplyFirst } from '../useDirtySection';
 import type { SectionName } from '../adminApi';
 import type { AccountMenuConfigProps } from './AccountMenu';
+import { normalizeUiError } from '../errorHandling';
 
 const { Text } = Typography;
 
@@ -314,6 +315,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
   }, []);
 
   const handleLogin = async () => {
+    if (loginLoading) return; // in-flight guard: prevents Enter + form-submit double-fire
     setLoginLoading(true);
     setLoginError('');
     try {
@@ -366,7 +368,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
       message.success('Full backup exported');
     } catch (e) {
       message.error(
-        'Export failed: ' + (e instanceof Error ? e.message : 'unknown')
+        'Export failed: ' + (normalizeUiError(e, 'unknown'))
       );
     }
   }, []);
@@ -396,7 +398,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
       } else {
         console.error('Full backup restore failed before request', e);
         message.error(
-          'Import failed: ' + (e instanceof Error ? e.message : 'invalid file')
+          'Import failed: ' + (normalizeUiError(e, 'invalid file'))
         );
       }
     } finally {
@@ -650,7 +652,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
     );
   }
 
-  // Login gate (bootstrap password + optional OAuth buttons)
+  // Login gate (admin password + optional OAuth buttons)
   if (!authed && !checkingSession) {
     return (
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 1, background: colors.BG_BASE }}>
@@ -659,7 +661,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
             <LockOutlined style={{ fontSize: 32, color: colors.ACCENT_BLUE, marginBottom: 12 }} />
             <div><Text strong style={{ fontSize: 18, fontFamily: 'var(--font-ui)' }}>Admin Login</Text></div>
             <Text type="secondary" style={{ fontSize: 13 }}>
-              {externalProviders.length > 0 ? 'Sign in to continue.' : 'Enter the bootstrap password to continue.'}
+              {externalProviders.length > 0 ? 'Sign in to continue.' : 'Enter the admin password to continue.'}
             </Text>
           </div>
           {s3BrowserSessionOnly && (
@@ -667,7 +669,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
               type="info"
               showIcon
               message="File browser session active"
-              description="You are signed in for S3 browsing only. Use the bootstrap password (or OAuth if configured) below to open a full administrator session."
+              description="You are signed in for S3 browsing only. Use the admin password (or OAuth if configured) below to open a full administrator session."
               style={{ marginBottom: 16, borderRadius: 8 }}
             />
           )}
@@ -684,9 +686,10 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
           )}
           {loginError && <Alert type="error" message={loginError} showIcon style={{ marginBottom: 16, borderRadius: 8 }} />}
           <Input.Password
-            placeholder="Bootstrap password"
+            placeholder="Admin password"
             value={password}
             onChange={e => setPassword(e.target.value)}
+            onPressEnter={handleLogin}
             size="large"
             autoFocus={externalProviders.length === 0}
             style={{ borderRadius: 10, marginBottom: 16 }}

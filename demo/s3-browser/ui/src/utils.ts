@@ -103,6 +103,13 @@ export function dotPattern(color: string): string {
   return `url("data:image/svg+xml;utf8,${svg.replace(/"/g, "'")}")`;
 }
 
+/** Natural (numeric) string comparator — `v2` < `v10`, `file-1` < `file-20`.
+ *  Uses `localeCompare` with `{ numeric: true }`. Shared across all sort sites
+ *  so the object table, bucket list, and key list never disagree. */
+export function numericCompare(a: string, b: string): number {
+  return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+}
+
 /** "3h 21m ago" / "47s ago" / "never" — coarse age label for cache timestamps. */
 export function ageLabel(iso: string | null): string {
   if (!iso) return 'never';

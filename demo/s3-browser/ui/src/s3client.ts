@@ -18,7 +18,7 @@ import {
 import { Upload } from '@aws-sdk/lib-storage';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import type { S3Object, ListResult, BucketInfo } from './types';
-import { detectDefaultEndpoint } from './utils';
+import { detectDefaultEndpoint, numericCompare } from './utils';
 import { createBucketOnBackend, getBucketOrigins } from './adminApi';
 import { normalizeS3Error } from './errorHandling';
 import {
@@ -560,7 +560,7 @@ export async function listBuckets(opts?: ListBucketsOptions): Promise<BucketInfo
         backend: toBackend(o),
         unavailable: o.unavailable || undefined,
       }))
-      .sort((a, b) => a.name.localeCompare(b.name));
+      .sort((a, b) => numericCompare(a.name, b.name));
   }
   const resp = respSettled.v;
   const originByName = new Map((origins?.buckets || []).map((b) => [b.name, b]));
@@ -589,7 +589,7 @@ export async function listBuckets(opts?: ListBucketsOptions): Promise<BucketInfo
       unavailable: o.unavailable,
     });
   }
-  merged.sort((a, b) => a.name.localeCompare(b.name));
+  merged.sort((a, b) => numericCompare(a.name, b.name));
   return merged;
 }
 

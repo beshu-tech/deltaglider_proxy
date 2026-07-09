@@ -34,6 +34,7 @@ import { useColors } from '../ThemeContext';
 import { fetchAudit, type AuditEntry } from '../adminApi';
 import { relativeTime } from '../utils';
 import { contentColumn, CONTENT_WIDE } from './shared-styles';
+import { normalizeUiError } from '../errorHandling';
 
 const { Text } = Typography;
 
@@ -88,8 +89,7 @@ export default function AuditLogPanel({ onSessionExpired }: Props) {
         return;
       }
       setError(
-        `Failed to load audit entries: ${e instanceof Error ? e.message : 'unknown'}`
-      );
+        `Failed to load audit entries: ${normalizeUiError(e, 'unknown')}`);
     } finally {
       setLoading(false);
     }

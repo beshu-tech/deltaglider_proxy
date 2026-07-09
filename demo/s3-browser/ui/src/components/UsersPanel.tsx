@@ -13,6 +13,7 @@ import MasterDetailPanel from './MasterDetailPanel';
 import UserForm from './UserForm';
 import CredentialsBanner from './CredentialsBanner';
 import IamSourceBanner from './IamSourceBanner';
+import { normalizeUiError } from '../errorHandling';
 
 const { Text } = Typography;
 
@@ -47,7 +48,7 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
   const users = usersQuery.data ?? [];
   const loading = usersQuery.isLoading;
   const rawError = usersQuery.error;
-  const error = rawError ? (rawError instanceof Error ? rawError.message : 'Failed to load users') : '';
+  const error = rawError ? (normalizeUiError(rawError, "Failed to load users")) : '';
 
   // Bubble up 401 to the parent so the login screen can take over. Effect, not
   // render-body: react-query keeps `error` populated across renders, so calling
@@ -99,7 +100,7 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
       setSelectedId(cloned.id);
       setNewCreds({ ak: cloned.access_key_id, sk: cloned.secret_access_key ?? '' });
     } catch (err) {
-      message.error(err instanceof Error ? err.message : 'Duplicate user failed');
+      message.error(normalizeUiError(err, "Duplicate user failed"));
     } finally {
       onSavingChange?.(false);
     }

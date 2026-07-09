@@ -43,6 +43,7 @@ import FormField from './FormField';
 import ApplyDialog from './ApplyDialog';
 import StickyDirtyBar from './StickyDirtyBar';
 import { LoadingState } from './StatePlaceholders';
+import { normalizeUiError } from '../errorHandling';
 
 const { Text } = Typography;
 
@@ -482,7 +483,7 @@ export function LimitsPanel({ onSessionExpired }: PanelProps) {
   }, [config, onSessionExpired]);
 
   if (isError) {
-    const msg = queryError instanceof Error ? queryError.message : 'Failed to load';
+    const msg = normalizeUiError(queryError, 'Failed to load');
     return <Alert type="error" showIcon message="Failed to load" description={msg} />;
   }
   if (!config) return <PanelShell><LoadingState /></PanelShell>;

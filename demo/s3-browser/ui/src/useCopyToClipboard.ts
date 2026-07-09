@@ -17,6 +17,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { message } from 'antd';
+import { normalizeUiError } from './errorHandling';
 
 interface CopyOptions {
   /** Toast shown on a successful clipboard write. */
@@ -87,7 +88,7 @@ export function useCopyToClipboard() {
       }, resetMs);
       return true;
     } catch (e) {
-      fallback(`Copy failed: ${e instanceof Error ? e.message : 'unknown error'}`);
+      fallback(`Copy failed: ${normalizeUiError(e, 'unknown error')}`);
       return false;
     }
   }, []);

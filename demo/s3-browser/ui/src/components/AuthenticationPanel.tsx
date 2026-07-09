@@ -17,6 +17,7 @@ import IamSourceBanner from './IamSourceBanner';
 import MappingRuleRow from './MappingRuleRow';
 import { useQueryClient } from '@tanstack/react-query';
 import { qk } from '../queries/keys';
+import { normalizeUiError } from '../errorHandling';
 
 const { Text } = Typography;
 
@@ -44,7 +45,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
     providersQuery.isLoading || rulesQuery.isLoading || identitiesQuery.isLoading || groupsQuery.isLoading;
   const rawError =
     providersQuery.error ?? rulesQuery.error ?? identitiesQuery.error ?? groupsQuery.error;
-  const error = rawError ? (rawError instanceof Error ? rawError.message : 'Failed to load data') : '';
+  const error = rawError ? (normalizeUiError(rawError, 'Failed to load data')) : '';
 
   // Bubble a 401 up so the login screen can take over. Effect, not render-body:
   // react-query keeps `error` populated across renders, so navigating in render
@@ -98,7 +99,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
       const result = await testAuthProvider(id);
       setTestResult(result);
     } catch (e) {
-      setTestResult({ success: false, error: e instanceof Error ? e.message : 'Test failed' });
+      setTestResult({ success: false, error: normalizeUiError(e, 'Test failed') });
     } finally {
       setTesting(false);
     }
@@ -113,7 +114,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
       // Don't masquerade a request failure as "no matching rules" (an empty
       // group list) — surface it so the operator can tell the two apart.
       setPreviewGroups([]);
-      message.error(e instanceof Error ? e.message : 'Mapping preview failed');
+      message.error(normalizeUiError(e, 'Mapping preview failed'));
     }
   };
 
@@ -127,7 +128,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
       qc.invalidateQueries({ queryKey: qk.users.list() });
       qc.invalidateQueries({ queryKey: qk.groups.list() });
     } catch (e) {
-      message.error(e instanceof Error ? e.message : 'Sync failed');
+      message.error(normalizeUiError(e, 'Sync failed'));
     } finally {
       setSyncing(false);
     }
@@ -262,7 +263,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
                   group_id: groups[0].id,
                 });
               } catch (e) {
-                message.error(e instanceof Error ? e.message : 'Failed');
+                message.error(normalizeUiError(e, 'Failed'));
               } finally {
                 setRulesSaving(false);
               }
@@ -321,7 +322,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
               await flushPendingRules();
               message.success('Mapping rules saved');
             } catch (e) {
-              message.error(e instanceof Error ? e.message : 'Save failed');
+              message.error(normalizeUiError(e, 'Save failed'));
             } finally {
               setRulesSaving(false);
             }
@@ -477,7 +478,7 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
       }
       onSaved();
     } catch (e) {
-      message.error(e instanceof Error ? e.message : 'Save failed');
+      message.error(normalizeUiError(e, 'Save failed'));
     } finally {
       setSaving(false);
     }
@@ -491,7 +492,7 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
       message.success('Provider deleted');
       onDeleted?.();
     } catch (e) {
-      message.error(e instanceof Error ? e.message : 'Delete failed');
+      message.error(normalizeUiError(e, 'Delete failed'));
     }
   };
 

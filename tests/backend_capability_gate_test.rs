@@ -72,7 +72,7 @@ fn test_noncas_backend_with_client_writable_bucket_fails_boot() {
         "FATAL line must name the backend and bucket, output:\n{output}"
     );
     assert!(
-        output.contains("replication_target_only")
+        output.contains("replication targets only")
             && output.contains("deltaglider.com/docs/how-to/backend-capability-validation"),
         "FATAL line must state both fixes + the doc link, output:\n{output}"
     );

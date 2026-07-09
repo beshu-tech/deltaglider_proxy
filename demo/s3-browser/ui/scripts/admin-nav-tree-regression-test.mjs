@@ -34,7 +34,7 @@ const IA = [
     entries: [
       { path: 'access/credentials', label: 'Credentials & mode', dirtyKeys: ['access/credentials'] },
       { path: 'access/users', label: 'Users' },
-      { path: 'access/admission', label: 'Admission rules', dirtyKeys: ['admission'] },
+      { path: 'access/admission', label: 'Request rules', dirtyKeys: ['admission'] },
     ],
   },
   {

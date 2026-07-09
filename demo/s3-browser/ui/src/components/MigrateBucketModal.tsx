@@ -14,6 +14,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { createMigrateJob } from '../adminApi';
 import { qk } from '../queries/keys';
 import { useBackends, useBucketOrigins } from '../queries/backends';
+import { normalizeUiError } from '../errorHandling';
 
 const { Text } = Typography;
 
@@ -64,7 +65,7 @@ export default function MigrateBucketModal({ open, bucket, onClose, onStarted }:
       onClose();
       onStarted?.();
     } catch (e) {
-      messageApi.error(e instanceof Error ? e.message : 'Failed to start migration');
+      messageApi.error(normalizeUiError(e, 'Failed to start migration'));
     } finally {
       setStarting(false);
     }

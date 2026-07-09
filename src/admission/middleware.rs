@@ -101,7 +101,7 @@ pub async fn admission_middleware(mut request: Request<Body>, next: Next) -> Res
             // tests/admission_test.rs): a denied client can see which rule
             // fired, mirroring how SigV4/IAM denials are already traceable.
             return crate::api::errors::S3Error::AccessDeniedReason(format!(
-                "admission-deny:{matched}"
+                "Blocked by access rule '{matched}'"
             ))
             .into_response();
         }

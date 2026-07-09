@@ -37,6 +37,11 @@ export default function DeltaSavingsChip({ summary }: Props) {
   // rules (integer floor + 99 ceiling for the scope view).
   const view = summarizeScopeSavings(summary.originalBytes, summary.storedBytes);
   const pct = view.pct;
+
+  // Hide when savings round down to zero — a "0% smaller · 0 B saved" chip
+  // is noise, not information.
+  if (pct === 0 || animatedSaved === 0) return null;
+
   const savedLabel = formatBytes(animatedSaved);
 
   const refDetail = summary.referenceBytes > 0

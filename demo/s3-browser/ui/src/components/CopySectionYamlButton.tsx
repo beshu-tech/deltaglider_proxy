@@ -18,6 +18,7 @@ import { getSectionYaml } from '../adminApi';
 import { useColors } from '../ThemeContext';
 import { useCopyToClipboard } from '../useCopyToClipboard';
 import { isRedactedEmptyAccessYaml } from '../yamlUtils';
+import { normalizeUiError } from '../errorHandling';
 
 const ACCESS_EMPTY_YAML_EXPLAINER = `# -----------------------------------------------------------------------------
 # Why this block looks empty (expected)
@@ -72,7 +73,7 @@ export function SectionYamlModal({ section, open, onClose }: SectionYamlModalPro
       .catch((e) => {
         if (cancelled || !mountedRef.current) return;
         setYaml('');
-        setError(e instanceof Error ? e.message : 'unknown error');
+        setError(normalizeUiError(e, "Copy failed"));
       })
       .finally(() => {
         if (!cancelled && mountedRef.current) setLoading(false);

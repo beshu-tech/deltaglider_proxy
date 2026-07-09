@@ -29,6 +29,7 @@ import {
 import { useBucketNames } from '../queries/backends';
 import HoverHint from './HoverHint';
 import { contentColumn, CONTENT_WIDE } from './shared-styles';
+import { normalizeUiError } from '../errorHandling';
 
 /**
  * Per-row verification state, keyed by prefix. Stored at the
@@ -156,7 +157,7 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
       if (r) setResponse(r);
     } catch (e) {
       if (scanIdRef.current !== scanId) return;
-      const msg = e instanceof Error ? e.message : String(e);
+      const msg = normalizeUiError(e, String(e));
       if (/401|session/i.test(msg)) onSessionExpired?.();
       setError(`Scan failed: ${msg}`);
     } finally {
@@ -192,8 +193,8 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
   return (
     <div style={contentColumn(CONTENT_WIDE)}>
       <Paragraph style={{ marginBottom: 12, color: colors.TEXT_SECONDARY }}>
-        Find prefixes whose reference baseline compresses its siblings poorly.
-        Re-uploading such a prefix lets the proxy pick a better seed and recover
+        Find folders whose reference file compresses its neighbors poorly.
+        Re-uploading such a folder lets the proxy pick a better seed and recover
         most of the stored bytes. Read-only — you decide what to re-upload.
       </Paragraph>
 
@@ -206,7 +207,7 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
           options={buckets.map(b => ({ value: b, label: b }))}
           showSearch
         />
-        <HoverHint hint="Skip prefixes with fewer than this many deltas. Smaller deltaspaces don't have enough signal to draw a verdict from.">
+        <HoverHint hint="Skip folders with fewer than this many compressed files. Smaller folders don't have enough signal to draw a verdict from.">
           <span>
             min deltas:{' '}
             <InputNumber
@@ -345,7 +346,7 @@ function EfficiencyDashboard({
         const result = await verifyDeltaEfficiency(bucket, prefix);
         setVerifyState((prev) => new Map(prev).set(key, { status: 'ok', result }));
       } catch (e) {
-        const message = e instanceof Error ? e.message : String(e);
+        const message = normalizeUiError(e, String(e));
         setVerifyState((prev) =>
           new Map(prev).set(key, { status: 'error', message }),
         );

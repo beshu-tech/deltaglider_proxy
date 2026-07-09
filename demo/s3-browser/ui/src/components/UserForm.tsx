@@ -19,6 +19,7 @@ import {
 } from './permissionRows';
 import CredentialsBanner from './CredentialsBanner';
 import { generateId, generateSecret } from '../credentialGeneration';
+import { normalizeUiError } from '../errorHandling';
 
 const { Text, Title } = Typography;
 
@@ -129,7 +130,7 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
         onCreated?.(created.access_key_id, created.secret_access_key ?? '');
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Operation failed');
+      setError(normalizeUiError(e, 'Operation failed'));
     } finally {
       setSaving(false);
     }
@@ -142,7 +143,7 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
       await deleteUserMutation.mutateAsync(user.id);
       onDeleted?.();
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Delete failed');
+      setError(normalizeUiError(e, 'Delete failed'));
     } finally {
       setDeleting(false);
     }

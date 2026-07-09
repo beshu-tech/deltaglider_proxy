@@ -44,7 +44,7 @@ where
         err.meta()
             .message()
             .unwrap_or("")
-            .contains("replication_target_only"),
+            .contains("replication targets only"),
         "{what}: message must name the marker, got {:?}",
         err.meta().message()
     );
@@ -291,7 +291,7 @@ async fn test_admin_bulk_ops_respect_marker() {
         .text()
         .await
         .unwrap()
-        .contains("replication_target_only"));
+        .contains("replication targets only"));
 
     // Bulk move with marked SOURCE → 403 (the post-copy source deletes).
     let resp = admin

@@ -32,11 +32,11 @@ export default function PasswordChangeCard() {
   return (
     <form onSubmit={(e) => { e.preventDefault(); handleSubmit(); }} style={cardStyle}>
       <Space direction="vertical" size="middle" style={{ width: '100%' }}>
-        <SectionHeader icon={<LockOutlined />} title="Change Bootstrap Password" />
+        <SectionHeader icon={<LockOutlined />} title="Change Admin Password" />
 
         <div style={{ fontSize: 13, color: TEXT_MUTED, lineHeight: 1.6 }}>
           <Text style={{ color: TEXT_MUTED, fontSize: 13 }}>
-            The bootstrap password is a single infrastructure secret that serves three purposes:
+            The admin password is a single infrastructure secret that serves three purposes:
           </Text>
           <ul style={{ margin: '8px 0', paddingLeft: 20 }}>
             <li><strong>Encrypts the user database</strong> — all user credentials are stored encrypted, locked with this password.</li>
@@ -56,14 +56,14 @@ export default function PasswordChangeCard() {
 
         <input type="text" autoComplete="username" defaultValue="admin" aria-hidden="true" style={{ display: 'none' }} />
         <Input.Password
-          placeholder="Current bootstrap password"
+          placeholder="Current admin password"
           value={currentPassword}
           onChange={(e) => setCurrentPassword(e.target.value)}
           autoComplete="current-password"
           style={inputRadius}
         />
         <Input.Password
-          placeholder="New bootstrap password"
+          placeholder="New admin password"
           value={newPassword}
           onChange={(e) => setNewPassword(e.target.value)}
           autoComplete="new-password"
@@ -73,7 +73,7 @@ export default function PasswordChangeCard() {
         {result && (
           <Alert
             type={result.ok ? 'success' : 'error'}
-            message={result.ok ? 'Bootstrap password changed. All sessions invalidated.' : (result.error || 'Failed')}
+            message={result.ok ? 'Admin password changed. All sessions invalidated.' : (result.error || 'Failed')}
             showIcon
             style={{ borderRadius: 8 }}
           />
@@ -86,7 +86,7 @@ export default function PasswordChangeCard() {
           block
           style={{ ...inputRadius, fontFamily: "var(--font-ui)", fontWeight: 600, background: ACCENT_AMBER, borderColor: ACCENT_AMBER, color: TEXT_PRIMARY }}
         >
-          Change Bootstrap Password
+          Change Admin Password
         </Button>
       </Space>
     </form>

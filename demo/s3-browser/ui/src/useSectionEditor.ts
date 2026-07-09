@@ -40,6 +40,7 @@ import type { SectionApplyResponse, SectionName } from './adminApi';
 import { getSection, putSection, validateSection } from './adminApi';
 import { qk } from './queries/keys';
 import { useApplyHandler, useDirtySection } from './useDirtySection';
+import { normalizeUiError } from './errorHandling';
 
 interface UseSectionEditorOptions<Wire, Local = Wire> {
   section: SectionName;
@@ -185,7 +186,7 @@ export function useSectionEditor<Wire, Local = Wire>(
         onSessionExpired?.();
         return;
       }
-      setError(`Failed to load ${noun} section: ${e instanceof Error ? e.message : 'unknown'}`);
+      setError(`Failed to load ${noun} section: ${normalizeUiError(e, 'unknown')}`);
     } finally {
       setLoading(false);
     }
@@ -211,7 +212,7 @@ export function useSectionEditor<Wire, Local = Wire>(
       setPendingBody(snapshot);
       setApplyOpen(true);
     } catch (e) {
-      message.error(`Validate failed: ${e instanceof Error ? e.message : 'unknown'}`);
+      message.error(`Validate failed: ${normalizeUiError(e, 'unknown')}`);
     }
   }, [section, buildPayload, value]);
 
@@ -248,7 +249,7 @@ export function useSectionEditor<Wire, Local = Wire>(
       // with server truth, silently discarding the edits they were trying to
       // save (including any made while the request was in-flight). Leave the
       // local edits intact so the operator can fix and retry.
-      message.error(`Apply failed: ${e instanceof Error ? e.message : 'unknown'}`);
+      message.error(`Apply failed: ${normalizeUiError(e, 'unknown')}`);
       setApplyOpen(false);
       setPendingBody(null);
       return false;

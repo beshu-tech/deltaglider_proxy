@@ -459,7 +459,7 @@ export default function BucketScanCard({ onRenderActions, scopeBucket }: Props) 
                 color: colors.ACCENT_AMBER,
               }}
             >
-              {unscanned} of {totalBuckets} buckets never scanned — totals exclude them
+              {unscanned} of {totalBuckets} buckets not measured yet — press "Scan all" to include them
             </div>
           </Tooltip>
         )}
@@ -472,7 +472,7 @@ export default function BucketScanCard({ onRenderActions, scopeBucket }: Props) 
               color: colors.TEXT_MUTED,
             }}
           >
-            Persistent cache · numbers reflect last completed scan
+            Updated at last scan
           </div>
         )}
       </div>

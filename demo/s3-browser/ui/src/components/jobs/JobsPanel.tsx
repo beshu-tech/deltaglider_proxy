@@ -68,6 +68,7 @@ import {
 } from '../lifecyclePayload';
 import ReplicationApplySummary from '../ReplicationApplySummary';
 import { LifecycleApplySummary } from '../LifecycleSummary';
+import { normalizeUiError } from '../../errorHandling';
 
 const { Text } = Typography;
 
@@ -305,7 +306,7 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
       qc.invalidateQueries({ queryKey: qk.jobs.runs(row.id) });
       qc.invalidateQueries({ queryKey: qk.jobs.failures(row.id) });
     } catch (e) {
-      messageApi.error(e instanceof Error ? e.message : `${action} failed`);
+      messageApi.error(normalizeUiError(e, `${action} failed`));
     } finally {
       setActionBusy(null);
     }

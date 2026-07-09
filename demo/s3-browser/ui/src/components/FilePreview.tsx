@@ -6,6 +6,7 @@ import { downloadObject, getPresignedUrl } from '../s3client';
 import { formatBytes, getFileName, downloadBlobAsFile } from '../utils';
 import { useColors } from '../ThemeContext';
 import { getPreviewMode } from './filePreviewMode';
+import { normalizeUiError } from '../errorHandling';
 
 const { Text } = Typography;
 
@@ -56,7 +57,7 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
             setTextContent(raw);
           }
         })
-        .catch(e => { if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load file'); })
+        .catch(e => { if (!cancelled) setError(normalizeUiError(e, "Failed to load file")); })
         .finally(() => { if (!cancelled) setLoading(false); });
     } else if (mode === 'image' || mode === 'video' || mode === 'audio') {
       // Stream the bytes straight from a presigned URL — the browser's native
@@ -64,7 +65,7 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
       // media never has to be buffered through JS.
       getPresignedUrl(object.key)
         .then(url => { if (!cancelled) setMediaUrl(url); })
-        .catch(e => { if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load media'); })
+        .catch(e => { if (!cancelled) setError(normalizeUiError(e, "Failed to load media")); })
         .finally(() => { if (!cancelled) setLoading(false); });
     } else {
       setLoading(false);
