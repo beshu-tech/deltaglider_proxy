@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react';
 import { useColors } from '../ThemeContext';
 import { formatBytes } from '../utils';
 import { summarizeScopeSavings } from '../savings';
+import { useTweenedCount } from '../hooks/useTweenedCount';
 import type { DeltaSummary } from '../deltaSummary';
 
 interface Props {
@@ -19,30 +19,9 @@ export default function DeltaSavingsChip({ summary }: Props) {
   const palette = STORAGE_TYPE_COLORS['delta'];
 
   // Smooth count-up so the savings tick into place rather than snap.
-  const [animatedSaved, setAnimatedSaved] = useState(0);
   const target =
     summary != null ? Math.max(0, summary.originalBytes - summary.storedBytes) : 0;
-
-  useEffect(() => {
-    if (target <= 0) {
-      setAnimatedSaved(0);
-      return;
-    }
-    let raf = 0;
-    const startVal = animatedSaved;
-    const delta = target - startVal;
-    const duration = 450;
-    const startedAt = performance.now();
-    const tick = (now: number) => {
-      const t = Math.min(1, (now - startedAt) / duration);
-      const eased = 1 - Math.pow(1 - t, 3);
-      setAnimatedSaved(startVal + delta * eased);
-      if (t < 1) raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [target]);
+  const animatedSaved = useTweenedCount(target);
 
   // Hide cases:
   //   - no summary at all

@@ -54,11 +54,27 @@ pub struct ParityProgress<'a> {
 /// minutes-long scan is negligible.
 const PROGRESS_FLUSH_EVERY_N_PAGES: usize = 8;
 
+/// Minimum wall-clock interval between progress flushes. Combined with the
+/// page-count throttle above, this ensures a fast scan (sub-second pages)
+/// still publishes intermediate counts: flush when EITHER N pages OR this
+/// interval has elapsed since the last flush. Caps at ≤4 writes/s to limit
+/// global-mutex contention with the IAM/admin path.
+const PROGRESS_FLUSH_MIN_INTERVAL_MS: u64 = 250;
+
 /// Pure decision: should the per-page progress counter flush to the DB at this
 /// page index? Flushes on every `every`-th page (page 0, `every`, `2*every`, …).
 /// Extracted so the cadence is unit-testable without a DB / scan.
 fn should_flush(page: u64, every: u64) -> bool {
     every > 0 && page.is_multiple_of(every)
+}
+
+/// Pure decision: should we flush progress now, considering both the page-count
+/// throttle and wall-clock elapsed since the last flush? Flushes when EITHER
+/// the page-count condition fires OR enough time has passed. `elapsed_ms` is
+/// milliseconds since the last flush (or `u64::MAX` if no flush has happened
+/// yet, which guarantees the first page always flushes).
+fn should_flush_now(page: u64, every: u64, elapsed_ms: u64, min_interval_ms: u64) -> bool {
+    should_flush(page, every) || elapsed_ms >= min_interval_ms
 }
 
 /// Sentinel error string an audit returns when cancelled, so the caller can
@@ -931,6 +947,7 @@ async fn scan_prefix(
     let mut seen = 0usize;
     let mut page_idx = 0usize;
     let mut truncated = false;
+    let mut last_flush: Option<std::time::Instant> = None;
     let mut pager = crate::job_loop::Pager::fresh();
     'pages: while pager.begin_page().is_some() {
         // Fast cancel check EVERY page — in-process AtomicBool, no lock.
@@ -938,10 +955,21 @@ async fn scan_prefix(
             if p.cancelled_local() {
                 return Err(CANCELLED.to_string());
             }
-            // Progress write is throttled (lock-bearing) — flush every N pages,
-            // often enough for a live count without per-page global-mutex churn.
-            if should_flush(page_idx as u64, PROGRESS_FLUSH_EVERY_N_PAGES as u64) {
+            // Progress write is throttled (lock-bearing) — flush when EITHER
+            // N pages OR 250ms have elapsed since the last flush, whichever
+            // comes first. On a fast scan (sub-second pages) the time arm
+            // fires; on a slow scan the page arm fires. Caps at ≤4 writes/s.
+            let elapsed_ms = last_flush
+                .map(|t| t.elapsed().as_millis() as u64)
+                .unwrap_or(u64::MAX);
+            if should_flush_now(
+                page_idx as u64,
+                PROGRESS_FLUSH_EVERY_N_PAGES as u64,
+                elapsed_ms,
+                PROGRESS_FLUSH_MIN_INTERVAL_MS,
+            ) {
                 p.flush_scanned((base_scanned + seen) as u64).await;
+                last_flush = Some(std::time::Instant::now());
             }
         }
         page_idx += 1;
@@ -1369,6 +1397,32 @@ mod tests {
         // than panicking — the settle flush still fires at scan end.
         assert!(!should_flush(0, 0));
         assert!(!should_flush(64, 0));
+    }
+
+    #[test]
+    fn should_flush_now_fires_on_either_arm() {
+        let n = PROGRESS_FLUSH_EVERY_N_PAGES as u64;
+        let min = PROGRESS_FLUSH_MIN_INTERVAL_MS;
+
+        // Page arm alone (not enough time): page 0 always flushes.
+        assert!(should_flush_now(0, n, 0, min));
+        assert!(should_flush_now(n, n, 10, min));
+
+        // Time arm alone (not a page boundary, but enough time elapsed).
+        assert!(should_flush_now(1, n, min, min));
+        assert!(should_flush_now(3, n, min + 100, min));
+
+        // Neither arm fires → no flush.
+        assert!(!should_flush_now(1, n, 0, min));
+        assert!(!should_flush_now(7, n, min - 1, min));
+
+        // First-page guarantee: elapsed = u64::MAX always flushes.
+        assert!(should_flush_now(3, n, u64::MAX, min));
+
+        // Both arms off when every=0 and time not yet elapsed.
+        assert!(!should_flush_now(0, 0, min - 1, min));
+        // But time arm still fires even with every=0.
+        assert!(should_flush_now(0, 0, min, min));
     }
 
     #[test]

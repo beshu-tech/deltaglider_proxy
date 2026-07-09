@@ -28,6 +28,7 @@ import {
   useStartVerify,
 } from '../../queries/jobs';
 import { useColors } from '../../ThemeContext';
+import { useTweenedCount } from '../../hooks/useTweenedCount';
 import { timeAgo } from '../../utils';
 
 const { Text } = Typography;
@@ -240,6 +241,10 @@ function LoadingBlock({
 }) {
   const rate = useObjRate(scanned);
   const prog = deriveVerifyProgress(scanned ?? 0, total);
+  // Smooth count-up so the scanned count ticks into place rather than
+  // snapping — LOAD-BEARING for PureMirror fast scans where the full
+  // count arrives in a single update (no incremental HEAD phase).
+  const animatedScanned = useTweenedCount(scanned ?? 0);
   return (
     <div style={{ padding: '4px 2px' }}>
       <div
@@ -299,10 +304,10 @@ function LoadingBlock({
             minHeight: 18,
           }}
         >
-          {scanned != null && scanned > 0
+          {scanned != null
             ? prog.determinate
-              ? `${scanned.toLocaleString()} of ${total!.toLocaleString()} · ${rate}`
-              : `${scanned.toLocaleString()} objects scanned · ${rate}`
+              ? `${Math.round(animatedScanned).toLocaleString()} of ${total!.toLocaleString()} · ${rate}`
+              : `${Math.round(animatedScanned).toLocaleString()} objects scanned · ${rate}`
             : 'Starting scan…'}
         </div>
 
@@ -650,6 +655,7 @@ function ReverifyBanner({
 }) {
   const rate = useObjRate(scanned);
   const prog = deriveVerifyProgress(scanned ?? 0, total);
+  const animatedScanned = useTweenedCount(scanned ?? 0);
   return (
     <div
       role="status"
@@ -671,10 +677,10 @@ function ReverifyBanner({
           Re-verifying parity…
         </Text>
         <Text type="secondary" style={{ fontSize: 12.5, color: c.TEXT_MUTED }}>
-          {scanned != null && scanned > 0
+          {scanned != null
             ? prog.determinate
-              ? `${scanned.toLocaleString()} of ${total!.toLocaleString()} · ${rate} · `
-              : `${scanned.toLocaleString()} objects scanned · ${rate} · `
+              ? `${Math.round(animatedScanned).toLocaleString()} of ${total!.toLocaleString()} · ${rate} · `
+              : `${Math.round(animatedScanned).toLocaleString()} objects scanned · ${rate} · `
             : ''}
           recomputing — the result below is from {timeAgo(since)} and is being refreshed.
         </Text>

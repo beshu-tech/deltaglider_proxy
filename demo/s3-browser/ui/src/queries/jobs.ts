@@ -18,6 +18,14 @@ import { qk } from './keys';
 
 const POLL_MS = 2000;
 
+/**
+ * Faster poll for the parity-verify progress bar (800ms vs 2s generic).
+ * The server's wall-clock flush throttle (250ms) writes intermediate counts
+ * fast enough that 800ms captures them; each poll takes the same no-WAL DB
+ * mutex, so going below 800ms risks contention without UI benefit.
+ */
+const VERIFY_POLL_MS = 800;
+
 export function useJobs(opts?: { enabled?: boolean }) {
   return useQuery({
     queryKey: qk.jobs.list(),
@@ -50,7 +58,8 @@ export function useJobFailures(id: string | null) {
  * Server-side parity verification status for a replication rule. The audit is a
  * BACKGROUND job: the result is persisted server-side, so this query gives an
  * instant cached verdict on mount (survives navigation + restart) and polls
- * (2s) while a scan is running. `useStartVerify` POSTs to kick one off.
+ * (800ms while running — faster than the 2s generic jobs poll) so the progress
+ * bar animates smoothly. `useStartVerify` POSTs to kick one off.
  */
 export function useParityStatus(ruleName: string) {
   return useQuery<ParityStatus, Error>({
@@ -59,7 +68,7 @@ export function useParityStatus(ruleName: string) {
     enabled: !!ruleName,
     refetchInterval: (q) => {
       const st = q.state.data?.status;
-      return st === 'running' || st === 'cancelling' ? POLL_MS : false;
+      return st === 'running' || st === 'cancelling' ? VERIFY_POLL_MS : false;
     },
   });
 }
