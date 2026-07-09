@@ -47,8 +47,8 @@ test('open auth: bucket, upload, list, admin login, sign out, reconnect, object 
 
   // ── Admin (bootstrap password) ──────────────────────────────────
   await page.goto('/_/admin');
-  await expect(page.getByRole('textbox', { name: 'Bootstrap password' })).toBeVisible({ timeout: 30_000 });
-  await page.getByRole('textbox', { name: 'Bootstrap password' }).fill(TEST_BOOTSTRAP_PASSWORD);
+  await expect(page.getByRole('textbox', { name: 'Admin password' })).toBeVisible({ timeout: 30_000 });
+  await page.getByRole('textbox', { name: 'Admin password' }).fill(TEST_BOOTSTRAP_PASSWORD);
   await page.getByRole('button', { name: 'Sign In' }).click();
   await expect(page.getByText('Dashboard').first()).toBeVisible({ timeout: 30_000 });
 
