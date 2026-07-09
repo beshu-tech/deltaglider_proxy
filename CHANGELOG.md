@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+## v1.12.2 — 2026-07-09
+
+A maintenance release shipping three CI-green commits that accumulated on `main`
+after v1.12.1. No new features; auth cleanup, routing resilience, and a
+bucket-policy hardening fix.
+
+### Fixed
+
+- **Replication-target buckets can't be written via their unconfigured alias.**
+  A client PUT to a marked bucket's real (alias) name — the one discovered by
+  cross-backend head-probe, not the configured virtual name — bypassed the
+  single-writer guarantee. The proxy now indexes every marked bucket's real
+  storage name and blocks writes that resolve onto protected storage, while
+  still exempting names with their own explicit backend route.
+
+- **A dead backend no longer hangs bucket listings.** After the parallel
+  fan-out, one unreachable backend still cost a connect timeout (up to 10s) on
+  every ListBuckets refresh. A per-backend failure cooldown
+  (`DGP_BACKEND_LIST_COOLDOWN_SECS`, default 30) now skips a backend that just
+  failed a listing — serving from last-known-good, flagged unavailable — and
+  each listing call is bounded by `DGP_BACKEND_LIST_TIMEOUT_SECS` (default 5).
+
+### Changed
+
+- **SigV4 is verified once, not twice.** The redundant outer axum signature
+  verifier (~380 LOC of hand-rolled canonical-request + HMAC) is deleted; s3s
+  is now the sole SigV4 authority. The outer middleware resolves identity only
+  (access-key → user) and keeps replay detection, rate-limiting, and anonymous
+  public-prefix minting. s3s rejects forged signatures — header, presigned, and
+  chunked streaming — before any handler runs. A valid-AKID/wrong-secret
+  forgery is still 403'd but no longer feeds the outer brute-force lockout
+  (HMAC-guessing is infeasible; locking on it would let an attacker DoS a
+  victim's key). Credential-enumeration lockout is unchanged.
+
 ## v1.12.1 — 2026-07-08
 
 A hardening release from a full adversarial review of the last several versions.
