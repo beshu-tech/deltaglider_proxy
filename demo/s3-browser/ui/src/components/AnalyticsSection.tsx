@@ -32,6 +32,7 @@ import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { Button } from 'antd';
 import { CaretRightOutlined, ReloadOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
+import { useVisiblePolling } from '../useVisiblePolling';
 import { listBuckets } from '../s3client';
 import { getBucketUsage } from '../adminApi';
 import type { AdminConfig, BucketUsage } from '../adminApi';
@@ -178,9 +179,11 @@ export default function AnalyticsSection({ config }: Props) {
         });
       })
       .catch(() => setAllBuckets([]));
-    const id = window.setInterval(refreshScans, 30_000);
-    return () => window.clearInterval(id);
   }, [refreshScans]);
+
+  // Re-poll every 30s for cross-tab scan settling. Routed through
+  // useVisiblePolling so a backgrounded tab stops wasting requests (Tier 3.3).
+  useVisiblePolling(refreshScans, 30_000);
 
   // Tear down any SSE on unmount so we don't leak listeners.
   useEffect(() => {

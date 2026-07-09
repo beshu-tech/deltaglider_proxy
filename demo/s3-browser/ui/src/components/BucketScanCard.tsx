@@ -37,6 +37,7 @@ import {
   ClockCircleOutlined,
 } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
+import { useVisiblePolling } from '../useVisiblePolling';
 import { formatBytes } from '../utils';
 import { summarizeScopeSavings } from '../savings';
 import { fmtNum } from './dashboard/chartDefaults';
@@ -165,13 +166,14 @@ export default function BucketScanCard({ onRenderActions, scopeBucket }: Props) 
     listBuckets()
       .then((bs) => setAllBuckets(bs.filter((b) => !b.unavailable).map((b) => b.name)))
       .catch(() => setAllBuckets([]));
-    // Re-poll every 30s — covers the case where another tab kicked
-    // off a scan that completed in the background. SSE handles the
-    // live case for the tab that started a scan; this catches
-    // cross-tab settling.
-    const id = window.setInterval(refreshAllScans, 30_000);
-    return () => window.clearInterval(id);
   }, [refreshAllScans]);
+
+  // Re-poll every 30s — covers the case where another tab kicked
+  // off a scan that completed in the background. SSE handles the
+  // live case for the tab that started a scan; this catches
+  // cross-tab settling. Routed through useVisiblePolling so a
+  // backgrounded tab stops wasting requests (Tier 3.3).
+  useVisiblePolling(refreshAllScans, 30_000);
 
   /** Tear down any live subscription on unmount. */
   useEffect(() => {
