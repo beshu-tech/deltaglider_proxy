@@ -31,6 +31,8 @@ use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
+use crate::metrics::{record_http_request_total, Metrics};
+
 /// Marker inserted into request extensions when the chain produces
 /// `AllowAnonymous`. SigV4 middleware looks for this marker and, when
 /// present, skips signature verification and mints the `$anonymous`
@@ -81,6 +83,14 @@ pub async fn admission_middleware(mut request: Request<Body>, next: Next) -> Res
             // Fall through to SigV4 — no extension inserted.
         }
         Decision::Deny { matched } => {
+            if let Some(metrics) = request.extensions().get::<std::sync::Arc<Metrics>>() {
+                record_http_request_total(
+                    metrics,
+                    request.method().as_str(),
+                    request.uri().path(),
+                    StatusCode::FORBIDDEN,
+                );
+            }
             // Short-circuit with 403. Audit log line gives operators the
             // block name + request context so they can trace denied
             // requests back to the rule that fired.

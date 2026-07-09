@@ -11,7 +11,10 @@ mod common;
 
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
-use common::{admin_http_client, get_iam_version, wait_for_iam_rebuild, TestServer};
+use common::{
+    admin_http_client, get_iam_version, metrics_text, prometheus_counter_has_labels,
+    wait_for_iam_rebuild, TestServer,
+};
 use hmac::{Hmac, Mac};
 use reqwest::StatusCode;
 use serde_json::json;
@@ -382,6 +385,20 @@ async fn test_presigned_url_respects_iam_permissions() {
         resp.status(),
         StatusCode::FORBIDDEN,
         "reader presigned PUT should be rejected by IAM"
+    );
+
+    let metrics = metrics_text(&server.endpoint()).await;
+    assert!(
+        prometheus_counter_has_labels(
+            &metrics,
+            "deltaglider_http_requests_total",
+            &[
+                "method=\"PUT\"",
+                "status=\"403\"",
+                "operation=\"put_object\""
+            ],
+        ),
+        "IAM short-circuit denial should increment sanitized PUT/403/put_object metrics"
     );
 }
 

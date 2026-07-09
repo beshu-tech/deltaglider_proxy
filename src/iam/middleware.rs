@@ -10,6 +10,7 @@ use iam_rs::Context;
 use tracing::debug;
 
 use super::types::{AuthenticatedUser, ListScope, S3Action};
+use crate::metrics::{record_http_request_total, Metrics};
 
 /// Map an HTTP method + path to an S3 action.
 fn classify_action(method: &axum::http::Method, path: &str) -> S3Action {
@@ -232,6 +233,14 @@ pub async fn authorization_middleware(
             "IAM denied: user='{}' action={:?} bucket='{}' key='{}'",
             user.name, action, bucket, key
         );
+        if let Some(metrics) = request.extensions().get::<std::sync::Arc<Metrics>>() {
+            record_http_request_total(
+                metrics,
+                method.as_str(),
+                path.as_str(),
+                axum::http::StatusCode::FORBIDDEN,
+            );
+        }
         // Audit-log every IAM denial.
         //
         // Previously this was `debug!`-only, which made runtime
