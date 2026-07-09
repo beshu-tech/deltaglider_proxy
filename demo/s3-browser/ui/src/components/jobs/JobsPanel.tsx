@@ -257,6 +257,18 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
     [navigate, markPushed],
   );
 
+  // Rename retarget: same as openDrawer but REPLACE (not push) so typing
+  // 5 characters doesn't create 5 history entries.  The drawer is already
+  // open; we're just updating which job it points at.
+  const retargetDrawer = useCallback(
+    (jobId: string) => {
+      setDrawerJobId(jobId);
+      const url = buildViewUrl('admin', 'jobs', { job: jobId, ...(drawerTab !== 'definition' ? { tab: drawerTab } : {}) });
+      navigate(url, { replace: true });
+    },
+    [navigate, drawerTab],
+  );
+
   const handleDrawerClose = useCallback(() => {
     setDrawerJobId(null);
     setDrawerTab('definition');
@@ -514,7 +526,7 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
         lifecycle={lc.value}
         onReplicationChange={repl.setValue}
         onLifecycleChange={lc.setValue}
-        onJobIdChange={openDrawer}
+        onJobIdChange={retargetDrawer}
         activeTab={drawerTab}
         onTabChange={handleTabChange}
         inputRadius={inputRadius}
@@ -547,7 +559,7 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
             type="error"
             showIcon
             style={{ marginTop: 16, borderRadius: 8 }}
-            message={jobsQuery.error instanceof Error ? jobsQuery.error.message : 'Failed to load jobs'}
+            message={normalizeUiError(jobsQuery.error, 'Failed to load jobs')}
           />
         ) : (
           <div style={{ marginTop: 16 }}>

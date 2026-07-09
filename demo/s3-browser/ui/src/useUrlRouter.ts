@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import {
   BASE,
   parseViewLocation,
@@ -47,12 +47,16 @@ interface UrlRouter extends UrlLocation {
  * on Back/Forward). Built on the pure helpers in `urlState.ts`.
  *
  * Carries over verbatim from the old inline `usePathRouter`:
- *  - the legacy `#/...` hash → path redirect on mount, and
- *  - the `skipNext` guard so our own pushState doesn't double-handle via popstate.
+ *  - the legacy `#/...` hash → path redirect on mount.
+ *
+ * NOTE: the old `skipNext` guard (armed on pushState so our own navigation
+ * wouldn't double-handle via popstate) has been removed — pushState and
+ * replaceState never emit popstate, so the flag sat armed and swallowed the
+ * first real Back press.  Removing it fixes the "first Back does nothing"
+ * bug without any downside.
  */
 export function useUrlRouter(): UrlRouter {
   const [location, setLocation] = useState<UrlLocation>(readLocation);
-  const skipNext = useRef(false);
 
   // Redirect old hash-based URLs on first load (carried over verbatim).
   useEffect(() => {
@@ -71,7 +75,6 @@ export function useUrlRouter(): UrlRouter {
     if (window.location.pathname + window.location.search + window.location.hash === fullPath) {
       return;
     }
-    skipNext.current = true;
     if (opts?.replace) {
       window.history.replaceState(null, '', fullPath);
     } else {
@@ -82,7 +85,6 @@ export function useUrlRouter(): UrlRouter {
 
   useEffect(() => {
     const onPopState = () => {
-      if (skipNext.current) { skipNext.current = false; return; }
       setLocation(readLocation());
     };
     window.addEventListener('popstate', onPopState);

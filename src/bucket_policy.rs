@@ -651,7 +651,7 @@ mod tests {
 
         // (a) Configured marked name → blocked with the original message.
         let r = reg.client_write_block_reason("mirror").expect("blocked");
-        assert!(r.contains("replication_target_only"), "{r}");
+        assert!(r.contains("replication targets only"), "{r}");
 
         // (b) Unconfigured name equal to the alias → blocked (the hole).
         let r = reg
@@ -668,7 +668,7 @@ mod tests {
         let r = reg
             .client_write_block_reason("plain-mirror")
             .expect("blocked");
-        assert!(r.contains("replication_target_only"), "{r}");
+        assert!(r.contains("replication targets only"), "{r}");
 
         // (e) An unrelated unconfigured name is allowed.
         assert!(reg.client_write_block_reason("some-other-bucket").is_none());

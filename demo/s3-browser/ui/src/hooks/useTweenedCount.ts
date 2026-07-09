@@ -15,7 +15,7 @@ import { useEffect, useRef, useState } from 'react';
  * @returns        The currently-displayed (animated) value.
  */
 export function useTweenedCount(target: number, duration = 450): number {
-  const [displayed, setDisplayed] = useState(target);
+  const [displayed, setDisplayed] = useState(0);
   const displayedRef = useRef(displayed);
 
   // Keep ref in sync so the effect closure sees the latest value without

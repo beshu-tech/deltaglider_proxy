@@ -1722,7 +1722,7 @@ impl Config {
                 .any(|r| eq_bucket(&r.destination.bucket, bucket))
             {
                 warnings.push(format!(
-                    "bucket '{bucket}' is replication_target_only but no replication rule \
+                    "bucket '{bucket}' is configured for replication targets only but no replication rule \
                      targets it — writes are blocked and nothing replicates in. Add a rule \
                      or remove the marker."
                 ));
@@ -1736,8 +1736,8 @@ impl Config {
                     );
                 if writes_into_marked {
                     warnings.push(format!(
-                        "lifecycle rule '{}' writes into replication_target_only bucket \
-                         '{bucket}' — a second internal writer weakens the single-writer \
+                        "lifecycle rule '{}' writes into bucket '{bucket}' which is configured \
+                         for replication targets only — a second internal writer weakens the single-writer \
                          guarantee on non-CAS backends.",
                         rule.name
                     ));
@@ -1770,10 +1770,10 @@ impl Config {
                 for (other, ob, oreal, omarked) in &resolved {
                     if other != name && !omarked && ob == backend && oreal == real {
                         warnings.push(format!(
-                            "bucket '{other}' aliases the same storage as replication_target_only \
-                             bucket '{name}' but is NOT marked — client writes through '{other}' \
-                             defeat the single-writer guarantee. Mark every virtual name that \
-                             points at the protected storage."
+                            "bucket '{other}' aliases the same storage as bucket '{name}' which is \
+                             configured for replication targets only, but '{other}' is NOT marked — client \
+                             writes through '{other}' defeat the single-writer guarantee. Mark every virtual \
+                             name that points at the protected storage."
                         ));
                     }
                 }

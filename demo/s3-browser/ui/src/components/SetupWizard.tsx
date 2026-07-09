@@ -31,7 +31,7 @@
  *   * Skip where legitimate.
  *   * Total time under 3 minutes.
  */
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import {
   Alert,
   Button,
@@ -118,21 +118,22 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
   const { navigate } = useNavigation();
 
   const [state, setState] = useState<WizardState>(INITIAL);
-  // The wizard step is deep-linked via ?step=N so a refresh keeps the
-  // operator on the same screen and browser Back traverses steps. The
-  // value is clamped to the valid range; a missing/garbage param falls
-  // back to step 0.
-  const [step, setStep] = useState(() => {
-    const q = parseAdminQuery(search || '');
-    const n = parseInt(q.step ?? '', 10);
-    if (Number.isNaN(n)) return 0;
-    return Math.max(0, Math.min(n, MAX_STEP));
-  });
+  // The wizard step is deep-linked via ?step=N so browser Back traverses
+  // steps in-session. But we DON'T restore from URL on initial load — a
+  // refresh resets form state to INITIAL while the URL still says ?step=4,
+  // which would land the operator on the Review step over empty config.
+  // The URL sync effect below handles in-session Back/Forward only.
+  const [step, setStep] = useState(0);
+  const stepSyncMounted = useRef(false);
   // Keep local state in sync with the URL so browser Back/Forward
   // (which changes `search` without touching the wizard buttons) still
-  // moves the displayed step. Without this, pushing ?step= on Next would
-  // create history entries that Back couldn't actually retreat through.
+  // moves the displayed step. Skip the first run so a direct-loaded
+  // ?step=N doesn't override the safe initial step 0.
   useEffect(() => {
+    if (!stepSyncMounted.current) {
+      stepSyncMounted.current = true;
+      return;
+    }
     const q = parseAdminQuery(search || '');
     const n = parseInt(q.step ?? '', 10);
     setStep(Number.isNaN(n) ? 0 : Math.max(0, Math.min(n, MAX_STEP)));

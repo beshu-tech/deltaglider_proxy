@@ -8,9 +8,9 @@ Admission blocks run before signature verification, so they can do what IAM can'
 
 Acme's `downloads` bucket serves a public prefix, which attracts anonymous upload attempts. Deny anonymous mutations on the whole bucket outright.
 
-In the UI: **Settings → Access → Admission rules** → add a block, set the match fields, pick the action, and drag to position. Each block has a form view and a YAML view.
+In the UI: **Settings → Access → Request rules** → add a block, set the match fields, pick the action, and drag to position. Each block has a form view and a YAML view.
 
-![Admission rules editor](/_/screenshots/admission-rules.jpg)
+![Request rules editor](/_/screenshots/admission-rules.jpg)
 
 The same block in YAML:
 
@@ -52,7 +52,7 @@ deltaglider_proxy admission trace --method PUT --path /downloads/public/installe
 
 Expect a `deny` decision naming `deny-anonymous-writes-downloads`. Re-run with `--authenticated`: the block no longer matches (its `authenticated: false` predicate fails), and the request falls through to SigV4 authentication.
 
-The same tool lives in the UI at **Settings → Observability → Trace** — it renders the decision path, the matched block, and ready-made example requests, with a Copy-as-JSON button:
+The same tool lives in the UI at **Settings → Observability → Rule tester** — it renders the decision path, the matched block, and ready-made example requests, with a Copy-as-JSON button:
 
 ![Request trace diagnostics](/_/screenshots/request-trace.jpg)
 

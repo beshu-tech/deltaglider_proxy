@@ -72,7 +72,7 @@ The following families have no handler — `s3s` returns `NotImplemented`. Where
 
 - **Lifecycle:** `PutBucketLifecycleConfiguration` / `GetBucketLifecycleConfiguration` / `DeleteBucketLifecycle` → configure through the proxy instead ([Expire and archive objects](../how-to/expire-and-archive-objects.md), [Lifecycle reference](lifecycle.md)).
 - **Replication:** `PutBucketReplication` / `GetBucketReplication` / `DeleteBucketReplication` → configure through the proxy instead ([Replicate a bucket](../how-to/replicate-a-bucket.md), [Replication reference](replication.md)).
-- **Notifications:** `PutBucketNotificationConfiguration` / `GetBucketNotificationConfiguration` → use the proxy's [event notifications](../how-to/send-event-notifications.md) / [event outbox](event-outbox.md).
+- **Notifications:** `PutBucketNotificationConfiguration` / `GetBucketNotificationConfiguration` → use the proxy's [event notifications](../how-to/send-event-notifications.md) / [event log](event-outbox.md).
 - **Object Lock / retention / legal hold:** `PutObjectLockConfiguration`, `PutObjectRetention`, `PutObjectLegalHold` (and their getters).
 - **CORS:** `PutBucketCors` / `GetBucketCors` / `DeleteBucketCors`.
 - **Website / logging / accelerate / request-payment.**

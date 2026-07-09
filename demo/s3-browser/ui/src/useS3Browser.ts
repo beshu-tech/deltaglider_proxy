@@ -12,6 +12,7 @@ import {
 } from './adminApi';
 import { type DeltaSummary, summaryFromResponse } from './deltaSummary';
 import { normalizeUiError } from './errorHandling';
+import { useOverlayClose } from './hooks/useOverlayClose';
 import useSelection from './useSelection';
 import { virtualWritableChildren } from './permissions';
 // Bulk actions → admin objects API; gate with `sessionCapabilities.canBulkOps` / `adminGui`.
@@ -247,20 +248,28 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     return { key: object, size: 0, lastModified: '' } as S3Object;
   }, [object, objects]);
 
+  // Direct-load-safe close for the inspector overlay (Tier 1.6 fix).
+  const { markPushed: markInspectorPushed, closeOverlay: closeInspectorOverlay } = useOverlayClose();
+
   const openInspector = useCallback((key: string) => {
     // Fall back to the s3client's active bucket if the URL-derived bucket is
     // still empty (e.g. landed at /_/browse before the URL gained the bucket
     // segment). buildBrowserUrl drops everything when bucket is empty, which
     // would otherwise no-op the navigation.
     navigateUrl(buildBrowserUrl({ bucket: bucket || getBucket(), prefix, q, object: key }));
-  }, [navigateUrl, bucket, prefix, q]);
+    markInspectorPushed();
+  }, [navigateUrl, bucket, prefix, q, markInspectorPushed]);
 
   const closeInspector = useCallback(() => {
     if (!object) return;
-    // The open PUSHed a ?object= entry, so Back is the natural close — it pops
-    // the drawer entry and restores the folder URL without it.
-    window.history.back();
-  }, [object]);
+    // Direct-load-safe: if we pushed the ?object= entry, Back pops it cleanly.
+    // If the page was loaded with ?object= already present (shared link),
+    // replace the URL to drop it instead of walking out of the SPA.
+    closeInspectorOverlay(
+      buildBrowserUrl({ bucket: bucket || getBucket(), prefix, q }),
+      navigateUrl,
+    );
+  }, [object, closeInspectorOverlay, navigateUrl, bucket, prefix, q]);
 
   // Folder navigation: PUSH a new history entry for the new prefix (same bucket,
   // drop any active search). Back returns to the parent folder. The URL change

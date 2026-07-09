@@ -38,9 +38,9 @@ export default function DeltaSavingsChip({ summary }: Props) {
   const view = summarizeScopeSavings(summary.originalBytes, summary.storedBytes);
   const pct = view.pct;
 
-  // Hide when savings round down to zero — a "0% smaller · 0 B saved" chip
-  // is noise, not information.
-  if (pct === 0 || animatedSaved === 0) return null;
+  // Guard on the RAW savings percent, not the integer-floored display value —
+  // a genuine 0.5% savings floors to 0 for display but is still real savings.
+  if ((summary.savingsPct ?? 0) <= 0 || animatedSaved === 0) return null;
 
   const savedLabel = formatBytes(animatedSaved);
 

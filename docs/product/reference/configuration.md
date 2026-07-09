@@ -769,7 +769,7 @@ advanced:
 `webhook_url` is the single-endpoint shortcut. `webhook_urls` adds fan-out
 endpoints, and `webhook_headers` are attached to every delivery request. A row
 is marked delivered only after all endpoints return 2xx; failed rows back off
-and can be requeued from the admin API/UI. See [Event outbox](event-outbox.md)
+and can be requeued from the admin API/UI. See [Event log](event-outbox.md)
 for payload and diagnostics details.
 
 ### Slack format
@@ -812,7 +812,7 @@ advanced:
 | `slack_routes` | Per-bucket / per-prefix → channel routing (**bot-token mode only**). When non-empty, an eligible event posts to every matching route; `slack_channel` is the fallback for events matching no route. |
 
 The whole thing is editable from the admin GUI at **Integrations →
-Event delivery** (toggle the format to *Slack*). See [Event outbox](event-outbox.md#slack-format)
+Event delivery** (toggle the format to *Slack*). See [Event log](event-outbox.md#slack-format)
 for delivery semantics.
 
 ---

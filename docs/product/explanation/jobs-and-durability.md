@@ -39,4 +39,4 @@ They share the transfer machinery but honor different contracts. **Replication**
 - How-to: [Move a bucket between backends](../how-to/move-a-bucket-between-backends.md)
 - How-to: [Replicate a bucket](../how-to/replicate-a-bucket.md)
 - Reference: [Jobs](../reference/jobs.md)
-- Reference: [Event outbox](../reference/event-outbox.md)
+- Reference: [Event log](../reference/event-outbox.md)

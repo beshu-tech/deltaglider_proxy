@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────
-// Delta efficiency diagnostics
+// Compression health diagnostics
 // ─────────────────────────────────────────────────────────────
 import { throwApiError } from '../errorHandling';
 import { adminFetch, safeJson } from './core';
@@ -109,7 +109,7 @@ export async function fetchDeltaEfficiency(
   if (res.status === 202) {
     return safeJson(res) as Promise<DeltaEfficiencyScanning>;
   }
-  if (!res.ok) await throwApiError(res, 'Delta efficiency fetch');
+  if (!res.ok) await throwApiError(res, 'Compression health fetch');
   return safeJson(res);
 }
 
@@ -126,7 +126,7 @@ export async function triggerDeltaEfficiencyScan(
     'POST',
     { bucket, min_deltas: minDeltas },
   );
-  if (!res.ok && res.status !== 202) await throwApiError(res, 'Delta efficiency scan trigger');
+  if (!res.ok && res.status !== 202) await throwApiError(res, 'Compression health scan trigger');
   return safeJson(res);
 }
 
@@ -190,6 +190,6 @@ export async function verifyDeltaEfficiency(
     'POST',
     { bucket, prefix },
   );
-  if (!res.ok) await throwApiError(res, 'Delta efficiency verify');
+  if (!res.ok) await throwApiError(res, 'Compression health verify');
   return safeJson(res);
 }

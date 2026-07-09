@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { Button, Input, Typography, Space, Alert, Spin, message } from 'antd';
 import { WarningOutlined, CheckCircleOutlined, CopyOutlined, SunOutlined, MoonOutlined } from '@ant-design/icons';
 import { testConnection, setEndpoint, setCredentials, setBucket, initFromSession, getBucket } from '../s3client';
@@ -86,6 +86,10 @@ export default function ConnectPage({ onConnect, showError }: Props) {
   const [secretKey, setSecretKey] = useState('');
   const [adminPassword, setAdminPassword] = useState('');
   const [loading, setLoading] = useState(false);
+  // Synchronous guard — setLoading is async React state, so two Enter-triggered
+  // calls in the same tick (onPressEnter + button onClick) both see loading===false
+  // and double-fire.  The ref is set synchronously before the first await.
+  const loginInFlight = useRef(false);
   const [error, setError] = useState('');
   const [authMode, setAuthMode] = useState<'bootstrap' | 'iam' | 'open' | null>(null);
   const [externalProviders, setExternalProviders] = useState<ExternalProviderInfo[]>([]);
@@ -194,6 +198,8 @@ export default function ConnectPage({ onConnect, showError }: Props) {
   }, [onConnect, runOpenModeConnect]);
 
   const handleConnect = async () => {
+    if (loginInFlight.current) return;
+    loginInFlight.current = true;
     setLoading(true);
     setError('');
     try {
@@ -285,6 +291,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
     } catch (e) {
       setError(normalizeUiError(e, "Connection failed"));
     } finally {
+      loginInFlight.current = false;
       setLoading(false);
     }
   };

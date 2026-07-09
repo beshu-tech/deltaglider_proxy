@@ -2,6 +2,66 @@
 
 ## Unreleased
 
+### Added
+
+- **Every admin view is now deep-linkable.** The job drawer, metrics view
+  toggle, setup wizard step, file preview, user/group selections, and all
+  modals (YAML import/export, full-IAM, inspector, destination picker) push
+  their state to the URL query string. Share a link, bookmark it, or use
+  Back/Forward — the UI restores to the right place. Modals close on Back
+  button; direct-loaded deep links open the overlay and close safely without
+  walking out of the SPA.
+
+### Fixed
+
+- **Verify progress bar no longer looks dead on large scans.** A four-part
+  fix: the server now flushes parity progress on a 250ms wall-clock throttle
+  (not just per-page), the UI polls verify status at 800ms (not the generic
+  2s), the first progress frame is no longer stuck on "Starting scan…", and
+  a reusable `useTweenedCount` hook adds a smooth count-up animation that
+  honors `prefers-reduced-motion`.
+- **First browser Back no longer swallowed.** The SPA router's `skipNext`
+  flag was armed on every `pushState` but `pushState` never emits `popstate`,
+  so the flag sat armed and ate the first real Back press. The flag is
+  removed entirely — Back works on the first press.
+- **Login no longer double-fires on Enter.** A synchronous `useRef` guard
+  replaces the async `useState` check, so `onPressEnter` and the button
+  `onClick` in the same tick can't both pass the guard.
+- **Renaming a job no longer spams browser history.** The drawer's rename
+  retarget now uses `history.replaceState` instead of `pushState`, so typing
+  5 characters doesn't create 5 Back entries.
+- **Invalid `?tab=` on a shared job link no longer renders a blank drawer.**
+  The tab is clamped to the tabs that exist for that job kind.
+- **Inspector close on a direct-loaded `?object=` link no longer walks out
+  of the SPA.** The close handler now uses the direct-load-safe overlay
+  pattern: `history.back()` if we pushed the entry, `replaceState` if it
+  was loaded from a shared link.
+- **Setup wizard no longer offers "Save and start" over empty config after
+  a refresh.** The step is forced to 0 when form state is initial; the
+  `?step=` deep-link only applies to in-session Back/Forward.
+- **Savings chip no longer hides genuine sub-1% savings.** The zero-guard
+  now checks the raw float from the server, not the integer-floored display
+  value.
+- **Hidden tabs no longer waste network requests.** Two unguarded 30s
+  `setInterval` pollers (bucket scan card, analytics section) are routed
+  through `useVisiblePolling`, which stops polling on hidden tabs and fires
+  an immediate refresh on tab return.
+
+### Changed
+
+- **Clearer labels throughout the admin UI.** "Bootstrap password" → "Admin
+  password", "Storage footprint" → "Storage used", "Trace" → "Rule tester",
+  "Delta efficiency" → "Compression health", "Admission rules" → "Request
+  rules", "Event outbox" → "Event log". Six verbose verify descriptions
+  replaced with plain language. Rust denial messages softened to
+  human-readable text. Product docs updated to match.
+- **Natural sort everywhere.** Bucket names, object keys, and rule lists now
+  sort naturally (`v2` before `v10`) via a shared `numericCompare` helper.
+- **Consistent error display.** All 58 `e instanceof Error` sites across 25
+  files replaced with a shared `normalizeUiError` helper.
+- **Config warnings use human-readable text.** `Config::check()` warnings
+  no longer leak the internal field name `replication_target_only`.
+
 ## v1.12.2 — 2026-07-09
 
 A maintenance release shipping three CI-green commits that accumulated on `main`

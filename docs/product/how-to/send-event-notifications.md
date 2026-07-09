@@ -1,6 +1,6 @@
 # How to send events to webhooks and Slack
 
-This guide shows you how to deliver object events (created, deleted, copied, replicated, expired) to an HTTP webhook or a Slack channel. Delivery rides on the durable event outbox, so the S3 write path never waits on your endpoint — semantics in the [event outbox reference](../reference/event-outbox.md).
+This guide shows you how to deliver object events (created, deleted, copied, replicated, expired) to an HTTP webhook or a Slack channel. Delivery rides on the durable event outbox, so the S3 write path never waits on your endpoint — semantics in the [event log reference](../reference/event-outbox.md).
 
 ## 1. Configure a webhook destination
 
@@ -77,7 +77,7 @@ The bot token is masked on export and in the GUI; an unchanged round-trip preser
    ```
 
 2. Within one `tick_interval` (10s default) the dispatcher claims the row and POSTs it. Check your endpoint logs or the Slack channel.
-3. Check the row's status in the outbox at **Settings → Integrations → Event outbox**, or:
+3. Check the row's status in the outbox at **Settings → Integrations → Event log**, or:
 
    ```bash
    curl -b cookies "https://s3.acme.example/_/api/admin/event-outbox?limit=10"
@@ -95,13 +95,13 @@ curl -b cookies -X POST https://s3.acme.example/_/api/admin/event-outbox/requeue
   -H 'Content-Type: application/json' -d '{"ids": [123, 124]}'
 ```
 
-Requeue doesn't create a new event — it flips `failed` back to `pending`, keeps the attempt history, and makes the row due immediately. The Event outbox page does the same with a button.
+Requeue doesn't create a new event — it flips `failed` back to `pending`, keeps the attempt history, and makes the row due immediately. The Event log page does the same with a button.
 
 Note Slack's Web API returns HTTP 200 even on failure; the dispatcher checks the JSON `ok` field and retries on `{"ok": false}` (e.g. `channel_not_found`), so Slack misconfigurations show up as retries, not silent drops.
 
 ## 6. Monitor outbox depth
 
-The outbox list response carries per-status counts (`pending`, `in_progress`, `delivered`, `failed`). A growing `pending` count means the dispatcher can't keep up or the endpoint is down; a non-zero `failed` count means rows are waiting on you. Watch the counts on the Event outbox page, poll the endpoint above from your monitoring, and see the [metrics reference](../reference/metrics.md) for the Prometheus side. Delivered rows are pruned automatically; pending and failed rows are not.
+The outbox list response carries per-status counts (`pending`, `in_progress`, `delivered`, `failed`). A growing `pending` count means the dispatcher can't keep up or the endpoint is down; a non-zero `failed` count means rows are waiting on you. Watch the counts on the Event log page, poll the endpoint above from your monitoring, and see the [metrics reference](../reference/metrics.md) for the Prometheus side. Delivered rows are pruned automatically; pending and failed rows are not.
 
 ## Verify
 
@@ -111,7 +111,7 @@ The outbox list response carries per-status counts (`pending`, `in_progress`, `d
 
 ## Related
 
-- [Event outbox reference](../reference/event-outbox.md) — payload schema, all delivery knobs, admin API.
+- [Event log reference](../reference/event-outbox.md) — payload schema, all delivery knobs, admin API.
 - [Jobs and durability](../explanation/jobs-and-durability.md) — why delivery rides a durable outbox instead of blocking the write path.
 - [How to replicate a bucket to another backend](replicate-a-bucket.md) — the other consumer of the same outbox.
 - [How to expire and archive objects](expire-and-archive-objects.md) — the lifecycle events you'll see.

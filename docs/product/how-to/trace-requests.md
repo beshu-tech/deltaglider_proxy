@@ -22,7 +22,7 @@ Know what the ring is: an **in-memory** buffer (default 500 entries, `DGP_AUDIT_
 
 Three equivalent front doors to the same evaluator — none of them touches real data:
 
-**Admin UI:** **Settings → Observability → Trace** (`/_/admin/diagnostics/trace`). Enter method, path, and whether the request is authenticated; the panel renders the reason path and offers Copy-as-JSON.
+**Admin UI:** **Settings → Observability → Rule tester** (`/_/admin/diagnostics/trace`). Enter method, path, and whether the request is authenticated; the panel renders the reason path and offers Copy-as-JSON.
 
 **CLI:**
 

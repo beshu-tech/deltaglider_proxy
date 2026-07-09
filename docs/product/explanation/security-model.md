@@ -8,7 +8,7 @@ Every request walks the same path: admission, then authentication, then authoriz
 
 **Admission comes first because it's cheap and identity-free.** Admission blocks are operator-authored rules — match on method, source IP or CIDR, bucket, path glob — evaluated top-to-bottom, first match wins, *before* any signature is verified. That ordering is the point. Signature verification costs HMAC computations and a credential lookup; rejecting a request because it came from a blocklisted IP costs a CIDR comparison. When Acme wants the admin surface reachable only from the office network (`203.0.113.0/24`), or wants anonymous writes to the `downloads` bucket refused outright, those rules don't need to know who the caller is — so they shouldn't pay for finding out. Admission is also where you put a maintenance-mode reject (503 with a human-readable message) that fires on everything, regardless of credentials.
 
-![Admission rules](/_/screenshots/admission-rules.jpg)
+![Request rules](/_/screenshots/admission-rules.jpg)
 
 **SigV4 and sessions answer "who are you."** Once a request survives admission, the proxy verifies its identity: SigV4 signatures (header auth or presigned URLs) for the S3 API, session cookies for the admin GUI. Verification is constant-time, with clock-skew tolerance and replay detection for mutating requests. Identity and permission are deliberately separate steps — a valid signature from `ci-uploader` proves the request came from `ci-uploader`, nothing more.
 

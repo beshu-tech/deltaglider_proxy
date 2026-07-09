@@ -1,4 +1,4 @@
-# Event outbox
+# Event log
 
 Durable object events are written to the encrypted config DB after successful S3 mutations. The outbox is append-first: PUT/COPY/DELETE, replication copy successes, and lifecycle delete/transition successes do not call external systems directly, so object operations do not wait on webhook latency or failures.
 

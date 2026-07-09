@@ -2,7 +2,7 @@
  * Job detail drawer: Definition (editable for rule kinds via the parent's
  * section editors; read-only parameters for one-offs), Runs, Failures.
  */
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useMemo } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Alert, Drawer, Empty, Tabs, Tag, Typography } from 'antd';
 import { useColors } from '../../ThemeContext';
@@ -296,6 +296,19 @@ export default function JobDrawer({
     />
   );
 
+  // Clamp the URL-deep-linked tab to one that actually exists for this job —
+  // e.g. ?tab=verify on a lifecycle job would otherwise render a blank body.
+  const availableTabs = useMemo(() => {
+    const tabs = ['definition'];
+    if (serverRow) {
+      tabs.push('runs', 'failures');
+      if (parsed?.subsystem === 'replication') tabs.push('verify');
+    }
+    return tabs;
+  }, [serverRow, parsed]);
+
+  const clampedTab = activeTab && availableTabs.includes(activeTab) ? activeTab : 'definition';
+
   return (
     <Drawer
       open={!!jobId}
@@ -323,7 +336,7 @@ export default function JobDrawer({
       }
     >
       <Tabs
-        activeKey={activeTab}
+        activeKey={clampedTab}
         onChange={onTabChange}
         items={[
           { key: 'definition', label: 'Definition', children: definition },
