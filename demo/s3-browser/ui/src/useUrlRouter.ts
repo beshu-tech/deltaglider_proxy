@@ -11,18 +11,22 @@ import {
  * The full app location derived from `window.location`. `view` / `subPath`
  * drive the top-level view switch (admin/docs/metrics/upload) exactly as the
  * old inline `usePathRouter` did; `browser` carries the bucket-browser state
- * (bucket / prefix / q / object) parsed from the path + query string.
+ * (bucket / prefix / q / object) parsed from the path + query string;
+ * `search` exposes the raw query string for non-browser views (admin deep-
+ * links like `?job=…&tab=…`).
  */
 interface UrlLocation {
   view: View;
   subPath: string;
   browser: BrowserLocation;
+  /** Raw query string (with leading `?`) for non-browser views. */
+  search: string;
 }
 
 function readLocation(): UrlLocation {
   const { view, subPath } = parseViewLocation(window.location.pathname);
   const browser = parseBrowserLocation(window.location.pathname, window.location.search);
-  return { view, subPath, browser };
+  return { view, subPath, browser, search: window.location.search };
 }
 
 interface UrlRouter extends UrlLocation {
@@ -89,6 +93,7 @@ export function useUrlRouter(): UrlRouter {
     view: location.view,
     subPath: location.subPath,
     browser: location.browser,
+    search: location.search,
     navigate,
   };
 }

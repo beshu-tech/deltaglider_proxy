@@ -38,7 +38,7 @@ import WebhookDeliveryPanel from './WebhookDeliveryPanel';
 import { useAdminConfig } from '../queries/config';
 import { useNavigation } from '../NavigationContext';
 import { resolveAdminPath as remapAdminPath } from '../adminPathRemap';
-import { buildViewUrl } from '../urlState';
+import { buildViewUrl, parseAdminQuery } from '../urlState';
 import TabHeader from './TabHeader';
 import { YamlImportExportModal } from './YamlImportExportModal';
 import { FullIamYamlModal } from './FullIamYamlModal';
@@ -70,13 +70,15 @@ interface AdminPageProps {
   onBack: () => void;
   onSessionExpired?: () => void;
   subPath?: string;
+  /** Raw query string (with leading `?`) for admin deep-links (?job=…&tab=…). */
+  search?: string;
   accountMenu?: React.ReactNode;
   canAdmin?: boolean;
   /** Open the app-wide keyboard-shortcuts modal (owned by App). */
   onShowShortcuts: () => void;
 }
 
-export default function AdminPage({ onBack, onSessionExpired, subPath, accountMenu, canAdmin = false, onShowShortcuts }: AdminPageProps) {
+export default function AdminPage({ onBack, onSessionExpired, subPath, search, accountMenu, canAdmin = false, onShowShortcuts }: AdminPageProps) {
   const colors = useColors();
   const { navigate } = useNavigation();
   // Declarative IAM: the IAM-writing backup-restore modes (full / iam-only /
@@ -137,9 +139,12 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, accountMe
     // (empty sub-path -> diagnostics/dashboard) — that's a fresh
     // navigation, not a legacy bookmark.
     if (rawSubPath && rawSubPath !== adminPath) {
-      navigate(buildViewUrl('admin', adminPath), { replace: true });
+      // Preserve any query params (e.g. ?job=…&tab=…) that were present
+      // on the legacy URL — the canonical path must not wipe them.
+      const query = parseAdminQuery(search ?? window.location.search);
+      navigate(buildViewUrl('admin', adminPath, Object.keys(query).length > 0 ? query : undefined), { replace: true });
     }
-  }, [rawSubPath, adminPath, navigate]);
+  }, [rawSubPath, adminPath, navigate, search]);
 
   const [authed, setAuthed] = useState(false);
   const [checkingSession, setCheckingSession] = useState(true);
@@ -596,7 +601,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, accountMe
       return (
         <>
           {header}
-          <JobsPanel onSessionExpired={onSessionExpired} />
+          <JobsPanel onSessionExpired={onSessionExpired} search={search} />
         </>
       );
     }

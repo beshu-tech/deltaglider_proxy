@@ -132,9 +132,40 @@ export function buildBrowserUrl(loc: Partial<BrowserLocation>): string {
   return url;
 }
 
-/** Build a non-browser view URL (admin/docs/metrics/upload) from a sub-path. */
-export function buildViewUrl(view: View, subPath = ''): string {
+/**
+ * Build a non-browser view URL (admin/docs/metrics/upload) from a sub-path
+ * and optional query params. The inverse of `parseViewLocation` + the query
+ * string: `buildViewUrl('admin', 'jobs', { job: 'replication:foo', tab: 'runs' })`
+ * → `/_/admin/jobs?job=replication%3Afoo&tab=runs`.
+ *
+ * Empty/undefined values are omitted from the query string automatically.
+ */
+export function buildViewUrl(view: View, subPath = '', query?: Record<string, string>): string {
   const seg = VIEW_TO_SEGMENT[view];
   const clean = subPath.replace(/^\/+/, '').replace(/\/+$/, '');
-  return BASE + (clean ? `${seg}/${clean}` : seg);
+  let url = BASE + (clean ? `${seg}/${clean}` : seg);
+  if (query) {
+    const params = new URLSearchParams();
+    for (const [k, v] of Object.entries(query)) {
+      if (v) params.set(k, v);
+    }
+    const qs = params.toString();
+    if (qs) url += `?${qs}`;
+  }
+  return url;
+}
+
+/**
+ * Parse query params from a search string for non-browser views (admin/docs/etc.).
+ * Returns a flat key→value map. `search` may include or omit the leading `?`.
+ * Complements `parseBrowserLocation` which handles the browser-specific `?q=`
+ * and `?object=` params.
+ */
+export function parseAdminQuery(search: string): Record<string, string> {
+  const params = new URLSearchParams(search.startsWith('?') ? search.slice(1) : search);
+  const result: Record<string, string> = {};
+  for (const [k, v] of params.entries()) {
+    result[k] = v;
+  }
+  return result;
 }

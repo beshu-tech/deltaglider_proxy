@@ -52,7 +52,7 @@ const LAZY_FALLBACK = (
 export default function App() {
   const colors = useColors();
 
-  const { view, subPath, browser, navigate } = useUrlRouter();
+  const { view, subPath, browser, navigate, search } = useUrlRouter();
   // Stable "go back to browser" callback. Previously inlined into
   // AdminPage / MetricsPage props as `() => navigate('browse')`, which
   // allocated a fresh arrow every App render and propagated as
@@ -410,6 +410,7 @@ export default function App() {
             onBack={navigateToBrowse}
             onSessionExpired={navigateToBrowse}
             subPath={subPath}
+            search={search}
             accountMenu={accountMenu()}
             canAdmin={canAdmin}
             onShowShortcuts={showShortcuts}

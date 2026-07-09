@@ -31,6 +31,10 @@ interface Props {
   /** Rename support: the drawer is keyed by `<kind>:<name>`, so a rename
    *  must retarget the key or the lookup loses the rule mid-keystroke. */
   onJobIdChange: (next: string) => void;
+  /** Currently active tab (URL-deep-linked). */
+  activeTab?: string;
+  /** Called when the user switches tabs. */
+  onTabChange?: (tab: string) => void;
   inputRadius: { borderRadius: number };
   onClose: () => void;
 }
@@ -47,6 +51,8 @@ export default function JobDrawer({
   onReplicationChange,
   onLifecycleChange,
   onJobIdChange,
+  activeTab,
+  onTabChange,
   inputRadius,
   onClose,
 }: Props) {
@@ -317,6 +323,8 @@ export default function JobDrawer({
       }
     >
       <Tabs
+        activeKey={activeTab}
+        onChange={onTabChange}
         items={[
           { key: 'definition', label: 'Definition', children: definition },
           ...(serverRow

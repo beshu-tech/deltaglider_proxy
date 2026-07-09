@@ -14,7 +14,7 @@
  * One-off jobs are DB-born (created via the modals), not config: they
  * have no dirty state, just live progress + cancel.
  */
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Alert, Button, Dropdown, Space, Spin, Tag, Typography, message } from 'antd';
 import {
   CaretRightOutlined,
@@ -40,6 +40,9 @@ import {
 } from '../../jobsView';
 import { qk } from '../../queries/keys';
 import { useJobs } from '../../queries/jobs';
+import { useNavigation } from '../../NavigationContext';
+import { buildViewUrl, parseAdminQuery } from '../../urlState';
+import { useOverlayClose } from '../../hooks/useOverlayClose';
 import TimeAgo from '../TimeAgo';
 import RecordList, { type RecordColumn } from './RecordList';
 import OutcomeMeter from './OutcomeMeter';
@@ -70,6 +73,8 @@ const { Text } = Typography;
 
 interface Props {
   onSessionExpired?: () => void;
+  /** Raw query string (with leading `?`) for deep-linking (?job=…&tab=…). */
+  search?: string;
 }
 
 const ACTION_META: Record<
@@ -103,10 +108,12 @@ const ACTION_META: Record<
   },
 };
 
-export default function JobsPanel({ onSessionExpired }: Props) {
+export default function JobsPanel({ onSessionExpired, search }: Props) {
   const { cardStyle, inputRadius } = useCardStyles();
   const qc = useQueryClient();
   const [messageApi, msgCtx] = message.useMessage();
+  const { navigate } = useNavigation();
+  const { markPushed, closeOverlay } = useOverlayClose();
 
   const jobsQuery = useJobs();
   const serverRows: JobRow[] = useMemo(
@@ -204,12 +211,64 @@ export default function JobsPanel({ onSessionExpired }: Props) {
     [serverRows, repl.value.rules, lc.value.rules]
   );
 
-  // ── Drawer + creation modals. ──
-  const [drawerJobId, setDrawerJobId] = useState<string | null>(null);
+  // ── Drawer + creation modals ──
+  // The drawer's open job and active tab are URL-deep-linked via ?job=…&tab=…
+  // so shared links, browser Back/Forward, and reloads all land on the right
+  // view. On first mount we read from the query string; thereafter the URL is
+  // the single source of truth.
+  const queryParams = useMemo(() => parseAdminQuery(search ?? ''), [search]);
+  const [drawerJobId, setDrawerJobId] = useState<string | null>(queryParams.job ?? null);
+  const [drawerTab, setDrawerTab] = useState<string>(queryParams.tab ?? 'definition');
   const [newJobMenuOpen, setNewJobMenuOpen] = useState(false);
   const [reencryptOpen, setReencryptOpen] = useState(false);
   const [migrateOpen, setMigrateOpen] = useState(false);
   const [actionBusy, setActionBusy] = useState<string | null>(null);
+
+  // Sync URL → state: when the query string changes (Back/Forward / shared link),
+  // update the local drawer state.
+  useEffect(() => {
+    setDrawerJobId(queryParams.job ?? null);
+    setDrawerTab(queryParams.tab ?? 'definition');
+  }, [queryParams.job, queryParams.tab]);
+
+  // Sync state → URL: when the drawer opens/closes or tab changes, update the
+  // URL so it's shareable and Back-button navigable. We replace (not push) for
+  // tab changes to avoid history spam; push for open/close transitions.
+  const updateDrawerUrl = useCallback(
+    (job: string | null, tab: string) => {
+      const query: Record<string, string> = {};
+      if (job) query.job = job;
+      if (job && tab && tab !== 'definition') query.tab = tab;
+      const url = buildViewUrl('admin', 'jobs', Object.keys(query).length > 0 ? query : undefined);
+      navigate(url, { replace: true });
+    },
+    [navigate],
+  );
+
+  const openDrawer = useCallback(
+    (jobId: string) => {
+      setDrawerJobId(jobId);
+      setDrawerTab('definition');
+      const url = buildViewUrl('admin', 'jobs', { job: jobId });
+      navigate(url);
+      markPushed();
+    },
+    [navigate, markPushed],
+  );
+
+  const handleDrawerClose = useCallback(() => {
+    setDrawerJobId(null);
+    setDrawerTab('definition');
+    closeOverlay(buildViewUrl('admin', 'jobs'), navigate);
+  }, [closeOverlay, navigate]);
+
+  const handleTabChange = useCallback(
+    (tab: string) => {
+      setDrawerTab(tab);
+      if (drawerJobId) updateDrawerUrl(drawerJobId, tab);
+    },
+    [drawerJobId, updateDrawerUrl],
+  );
 
   const runAction = async (row: JobRow, action: JobAction) => {
     if (action === 'delete' && !window.confirm(`Delete rule "${row.name}"? This removes it from config and clears its run history.`)) {
@@ -239,7 +298,7 @@ export default function JobsPanel({ onSessionExpired }: Props) {
         messageApi.success(ACTION_META[action].done ?? `${ACTION_META[action].label} OK`);
       }
       // A deleted rule no longer exists — close its drawer.
-      if (action === 'delete' && drawerJobId === row.id) setDrawerJobId(null);
+      if (action === 'delete' && drawerJobId === row.id) handleDrawerClose();
       // Refresh the list AND this job's runs/failures tables — a resume/run-now
       // starts a new run that the open drawer's Runs/Failures tabs must show.
       qc.invalidateQueries({ queryKey: qk.jobs.list() });
@@ -268,11 +327,11 @@ export default function JobsPanel({ onSessionExpired }: Props) {
       if (key === 'replication') {
         const rule = emptyReplicationRule(repl.value.rules);
         repl.setValue((cur) => ({ ...cur, rules: [...cur.rules, rule] }));
-        setDrawerJobId(`replication:${rule.name}`);
+        openDrawer(`replication:${rule.name}`);
       } else if (key === 'lifecycle') {
         const rule = emptyLifecycleRule(lc.value.rules);
         lc.setValue((cur) => ({ ...cur, rules: [...cur.rules, rule] }));
-        setDrawerJobId(`lifecycle:${rule.name}`);
+        openDrawer(`lifecycle:${rule.name}`);
       } else if (key === 'reencrypt') {
         setReencryptOpen(true);
       } else {
@@ -454,9 +513,11 @@ export default function JobsPanel({ onSessionExpired }: Props) {
         lifecycle={lc.value}
         onReplicationChange={repl.setValue}
         onLifecycleChange={lc.setValue}
-        onJobIdChange={setDrawerJobId}
+        onJobIdChange={openDrawer}
+        activeTab={drawerTab}
+        onTabChange={handleTabChange}
         inputRadius={inputRadius}
-        onClose={() => setDrawerJobId(null)}
+        onClose={handleDrawerClose}
       />
 
       <div style={cardStyle}>
@@ -493,7 +554,7 @@ export default function JobsPanel({ onSessionExpired }: Props) {
               rows={displayRows}
               columns={columns}
               rowKey={(d) => d.row.id}
-              onRowClick={(d) => setDrawerJobId(d.row.id)}
+              onRowClick={(d) => openDrawer(d.row.id)}
               empty='No jobs yet. Use "New job" to add a replication or lifecycle rule, or start a one-off re-encrypt or migrate job.'
             />
           </div>

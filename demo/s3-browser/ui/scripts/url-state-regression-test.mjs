@@ -9,7 +9,7 @@ const { outputText } = ts.transpileModule(source, {
   fileName: 'urlState.ts',
 });
 const mod = await import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
-const { parseViewLocation, parseBrowserLocation, buildBrowserUrl, buildViewUrl, BASE } = mod;
+const { parseViewLocation, parseBrowserLocation, buildBrowserUrl, buildViewUrl, parseAdminQuery, BASE } = mod;
 
 // --- parseViewLocation --------------------------------------------------------
 assert.deepEqual(parseViewLocation('/_/'), { view: 'browser', subPath: '' });
@@ -49,6 +49,18 @@ assert.equal(
 assert.equal(buildViewUrl('admin', 'configuration/access/credentials'), '/_/admin/configuration/access/credentials');
 assert.equal(buildViewUrl('browser'), '/_/browse');
 assert.equal(buildViewUrl('docs', '/configuration/'), '/_/docs/configuration');
+// buildViewUrl with query params (deep-linking)
+assert.equal(buildViewUrl('admin', 'jobs', { job: 'replication:foo' }), '/_/admin/jobs?job=replication%3Afoo');
+assert.equal(buildViewUrl('admin', 'jobs', { job: 'replication:foo', tab: 'runs' }), '/_/admin/jobs?job=replication%3Afoo&tab=runs');
+assert.equal(buildViewUrl('admin', 'jobs', { job: 'replication:foo', tab: 'definition' }), '/_/admin/jobs?job=replication%3Afoo&tab=definition');
+assert.equal(buildViewUrl('admin', 'jobs'), '/_/admin/jobs');
+assert.equal(buildViewUrl('admin', 'jobs', {}), '/_/admin/jobs');
+
+// --- parseAdminQuery ----------------------------------------------------------
+assert.deepEqual(parseAdminQuery('?job=replication%3Afoo&tab=runs'), { job: 'replication:foo', tab: 'runs' });
+assert.deepEqual(parseAdminQuery('job=replication%3Afoo'), { job: 'replication:foo' });
+assert.deepEqual(parseAdminQuery(''), {});
+assert.deepEqual(parseAdminQuery('?'), {});
 
 // --- ROUND TRIP: parse(build(x)) === x (the core invariant) -------------------
 const cases = [
