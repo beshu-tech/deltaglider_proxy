@@ -162,6 +162,14 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Storage",
     },
     EnvVarEntry {
+        name: "DGP_BACKEND_LIST_FRESH_SECS",
+        description: "How long a successful bucket listing is served without \
+                      re-probing upstream (coalesces the GUI's paired \
+                      ListBuckets + origins calls); 0 disables",
+        example: "5",
+        category: "Storage",
+    },
+    EnvVarEntry {
         name: "DGP_CACHE_MB",
         description: "Reference cache size in MB",
         example: "100",
@@ -2838,6 +2846,7 @@ mod tests {
             "DGP_S3_STALL_GRACE_SECS",        // storage::s3::build_client()
             "DGP_BACKEND_LIST_COOLDOWN_SECS", // storage::routing::RoutingBackend::new()
             "DGP_BACKEND_LIST_TIMEOUT_SECS",  // storage::routing::RoutingBackend::new()
+            "DGP_BACKEND_LIST_FRESH_SECS",    // storage::routing::RoutingBackend::new()
             "DGP_TRUSTED_PROXY_CIDRS",        // rate_limiter::trusted_proxy_cidrs()
         ];
         for name in &registry_names {

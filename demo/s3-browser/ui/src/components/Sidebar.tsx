@@ -11,6 +11,7 @@ import {
   countMultipartUploads,
   deleteBucket,
   getBucket,
+  invalidateListBucketsCache,
   listBuckets,
   setBucket,
 } from '../s3client';
@@ -90,6 +91,9 @@ export default function Sidebar({
 
   useEffect(() => {
     let cancelled = false;
+    // A signal-driven reload is an explicit refresh (user click, post-upload):
+    // bypass the short-lived shared listBuckets result so it can't look dead.
+    if (reloadSignal > 0) invalidateListBucketsCache();
     listBuckets({ includeOrigins: includeBucketOrigins })
       .then((list) => {
         if (cancelled) return;

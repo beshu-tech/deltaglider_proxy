@@ -27,7 +27,10 @@ export function useBucketMaintenance(bucket: string | null) {
     // No session (anonymous browser) → the endpoint 401s; stop polling
     // rather than hammering it. A signed-in session re-mounts the query.
     retry: false,
+    // Idle floor 60s: with no job running this poll only needs to catch a
+    // maintenance job STARTING (rare, operator-initiated) — 15s was chatty
+    // for a permanently-mounted browser-view query.
     refetchInterval: (query) =>
-      query.state.error ? false : query.state.data?.active ? POLL_MS : 15_000,
+      query.state.error ? false : query.state.data?.active ? POLL_MS : 60_000,
   });
 }

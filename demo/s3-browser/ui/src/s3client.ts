@@ -527,7 +527,38 @@ type ListBucketsOptions = {
   includeOrigins?: boolean;
 };
 
+// Five independent callers (Sidebar, DestinationPickerModal, AnalyticsSection,
+// BucketScanCard, PermissionEditor) each fire listBuckets on mount/open. Share
+// one in-flight promise + a short-lived result so near-simultaneous callers
+// cost ONE ListBuckets + origins pair instead of five.
+const LIST_BUCKETS_TTL_MS = 5_000;
+let listBucketsShared: { at: number; key: string; promise: Promise<BucketInfo[]> } | null = null;
+
+/** Drop the shared listBuckets result (call after create/delete bucket). */
+export function invalidateListBucketsCache(): void {
+  listBucketsShared = null;
+}
+
 export async function listBuckets(opts?: ListBucketsOptions): Promise<BucketInfo[]> {
+  const key = opts?.includeOrigins === false ? 'no-origins' : 'origins';
+  const now = Date.now();
+  if (
+    listBucketsShared &&
+    listBucketsShared.key === key &&
+    now - listBucketsShared.at < LIST_BUCKETS_TTL_MS
+  ) {
+    return listBucketsShared.promise;
+  }
+  const promise = listBucketsUncached(opts);
+  listBucketsShared = { at: now, key, promise };
+  // A failed listing must not poison the window — let the next caller retry.
+  promise.catch(() => {
+    if (listBucketsShared?.promise === promise) listBucketsShared = null;
+  });
+  return promise;
+}
+
+async function listBucketsUncached(opts?: ListBucketsOptions): Promise<BucketInfo[]> {
   const includeOrigins = opts?.includeOrigins !== false;
   const originsPromise = includeOrigins
     ? getBucketOrigins().catch(() => null)
@@ -596,9 +627,11 @@ export async function listBuckets(opts?: ListBucketsOptions): Promise<BucketInfo
 export async function createBucket(name: string, backendName?: string): Promise<void> {
   if (backendName) {
     await createBucketOnBackend(name, backendName);
+    invalidateListBucketsCache();
     return;
   }
   await sendCommand(new CreateBucketCommand({ Bucket: name }), `Create bucket ${name}`);
+  invalidateListBucketsCache();
 }
 
 export async function deleteBucket(name: string): Promise<void> {
@@ -606,6 +639,7 @@ export async function deleteBucket(name: string): Promise<void> {
     new DeleteBucketCommand({ Bucket: name }),
     `Delete bucket ${name}`,
   );
+  invalidateListBucketsCache();
 }
 
 type MultipartUploadRef = {

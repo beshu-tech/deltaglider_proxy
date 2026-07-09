@@ -45,8 +45,12 @@ type BackendListing = (String, Result<BackendRoster, StorageError>);
 struct BackendHealth {
     /// Last successful (real_bucket, date) listing per backend — synthesizes
     /// unavailable placeholders when that backend fails (explicit routes alone
-    /// would miss default-backend buckets).
-    last_known: HashMap<String, BackendRoster>,
+    /// would miss default-backend buckets). The `Option<Instant>` is the fetch
+    /// time: while younger than `list_fresh` the roster is served WITHOUT
+    /// re-probing upstream (the GUI fires ListBuckets + bucket-origins ~30ms
+    /// apart — without this window every refresh cost 2× upstream ListBuckets
+    /// per backend). `None` = stale-but-usable (kept for placeholders).
+    last_known: HashMap<String, (Option<std::time::Instant>, BackendRoster)>,
     /// Backends in failure cooldown: name → (retry-after deadline, last error).
     /// Skipped by `gather_listings` until the deadline, so one dead backend
     /// doesn't tax every listing with a connect timeout.
@@ -62,6 +66,9 @@ pub struct RoutingBackend {
     list_cooldown: std::time::Duration,
     /// Per-backend cap for a single listing call (bounds a hung backend).
     list_timeout: std::time::Duration,
+    /// How long a successful listing stays fresh enough to serve without
+    /// re-probing upstream (coalesces near-simultaneous ListBuckets calls).
+    list_fresh: std::time::Duration,
 }
 
 impl RoutingBackend {
@@ -85,12 +92,18 @@ impl RoutingBackend {
         let list_timeout = std::time::Duration::from_secs(
             crate::config::env_parse_with_default("DGP_BACKEND_LIST_TIMEOUT_SECS", 5u64).max(1),
         );
+        // 0 disables the freshness window (every call probes upstream).
+        let list_fresh = std::time::Duration::from_secs(crate::config::env_parse_with_default(
+            "DGP_BACKEND_LIST_FRESH_SECS",
+            5u64,
+        ));
         Self::with_health_config(
             backends,
             routes,
             default_backend,
             list_cooldown,
             list_timeout,
+            list_fresh,
         )
     }
 
@@ -101,6 +114,7 @@ impl RoutingBackend {
         default_backend: String,
         list_cooldown: std::time::Duration,
         list_timeout: std::time::Duration,
+        list_fresh: std::time::Duration,
     ) -> Result<Self, StorageError> {
         if !backends.contains_key(&default_backend) {
             return Err(StorageError::Other(format!(
@@ -140,6 +154,7 @@ impl RoutingBackend {
             health: parking_lot::Mutex::new(BackendHealth::default()),
             list_cooldown,
             list_timeout,
+            list_fresh,
         })
     }
 
@@ -250,15 +265,27 @@ impl RoutingBackend {
         names.sort();
         let now = std::time::Instant::now();
 
-        // Decide per backend: probe it, or short-circuit as cooling-down. The
-        // first request past a deadline optimistically RE-ARMS the cooldown
-        // before probing, so concurrent requests in the same window skip and
-        // exactly one prober pays the timeout per cooldown period.
+        // Decide per backend: serve fresh, probe, or short-circuit as
+        // cooling-down. The first request past a deadline optimistically
+        // RE-ARMS the cooldown before probing, so concurrent requests in the
+        // same window skip and exactly one prober pays the timeout per
+        // cooldown period.
         let mut to_probe: Vec<&String> = Vec::new();
         let mut cooling: Vec<BackendListing> = Vec::new();
         {
             let mut h = self.health.lock();
             for name in names {
+                // Freshness window: a roster fetched moments ago is served
+                // as-is — the GUI's paired ListBuckets + bucket-origins calls
+                // (and any rapid client re-list) share one upstream probe.
+                if !self.list_fresh.is_zero() {
+                    if let Some((Some(fetched_at), roster)) = h.last_known.get(name) {
+                        if now.duration_since(*fetched_at) < self.list_fresh {
+                            cooling.push((name.clone(), Ok(roster.clone())));
+                            continue;
+                        }
+                    }
+                }
                 // Snapshot the entry so the mutable re-arm below doesn't alias
                 // the immutable `.get()` borrow.
                 match h.cooldown.get(name).cloned() {
@@ -307,7 +334,7 @@ impl RoutingBackend {
             for (name, res) in &probed {
                 match res {
                     Ok(list) => {
-                        h.last_known.insert(name.clone(), list.clone());
+                        h.last_known.insert(name.clone(), (Some(now), list.clone()));
                         h.cooldown.remove(name);
                     }
                     Err(e) => {
@@ -323,6 +350,17 @@ impl RoutingBackend {
         results.extend(cooling);
         results.sort_by(|a, b| a.0.cmp(&b.0));
         results
+    }
+
+    /// Drop the freshness marker on every cached roster (keep the rosters —
+    /// they still back the unavailable-placeholder path) so the next listing
+    /// re-probes upstream. Called after create/delete bucket: read-after-write
+    /// must see the change immediately, not after the freshness window.
+    fn invalidate_listing_freshness(&self) {
+        let mut h = self.health.lock();
+        for entry in h.last_known.values_mut() {
+            entry.0 = None;
+        }
     }
 
     /// Total-failure guard shared by the three listing methods: `Some(Err)`
@@ -400,11 +438,19 @@ impl StorageBackend for RoutingBackend {
     // === Bucket operations ===
 
     async fn create_bucket(&self, bucket: &str) -> Result<(), StorageError> {
-        route_existing!(self, bucket, create_bucket)
+        let res = route_existing!(self, bucket, create_bucket);
+        if res.is_ok() {
+            self.invalidate_listing_freshness();
+        }
+        res
     }
 
     async fn delete_bucket(&self, bucket: &str) -> Result<(), StorageError> {
-        route_existing!(self, bucket, delete_bucket)
+        let res = route_existing!(self, bucket, delete_bucket);
+        if res.is_ok() {
+            self.invalidate_listing_freshness();
+        }
+        res
     }
 
     /// Aggregate buckets across all backends, deduplicating by virtual name.
@@ -553,7 +599,12 @@ impl StorageBackend for RoutingBackend {
                             .cloned();
                         push(virtual_name.clone(), real_alias);
                     }
-                    let snapshot = self.health.lock().last_known.get(backend_name).cloned();
+                    let snapshot = self
+                        .health
+                        .lock()
+                        .last_known
+                        .get(backend_name)
+                        .map(|(_, roster)| roster.clone());
                     for (real_bucket, _) in snapshot.unwrap_or_default() {
                         let virtual_name =
                             self.listed_bucket_virtual_name(backend_name, &real_bucket);
@@ -1307,6 +1358,7 @@ mod tests {
             health: parking_lot::Mutex::new(BackendHealth::default()),
             list_cooldown: std::time::Duration::from_secs(30),
             list_timeout: std::time::Duration::from_secs(5),
+            list_fresh: std::time::Duration::ZERO,
         };
 
         assert_eq!(
@@ -1448,8 +1500,17 @@ mod tests {
             "flaky".to_string(),
             Arc::new(Box::new(flaky) as Box<dyn StorageBackend>),
         );
-        let routing = RoutingBackend::new(backends, HashMap::new(), "up".to_string())
-            .expect("routing backend");
+        // Freshness OFF: this test flips the backend dark right after a
+        // successful listing and needs the very next call to re-probe.
+        let routing = RoutingBackend::with_health_config(
+            backends,
+            HashMap::new(),
+            "up".to_string(),
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(30),
+            std::time::Duration::ZERO,
+        )
+        .expect("routing backend");
 
         // First listing succeeds → populates the last-known-good snapshot.
         let origins = routing.list_bucket_origins().await.expect("ok");
@@ -1483,8 +1544,74 @@ mod tests {
             default.to_string(),
             cooldown,
             std::time::Duration::from_secs(30),
+            // Freshness OFF in cooldown-logic tests: they assert exact probe
+            // counts across rapid successive calls.
+            std::time::Duration::ZERO,
         )
         .expect("routing backend")
+    }
+
+    /// Build a routing backend with the freshness window ON (cooldown/timeout
+    /// large so they never interfere).
+    fn routing_with_fresh(
+        backends: HashMap<String, Arc<Box<dyn StorageBackend>>>,
+        default: &str,
+        fresh: std::time::Duration,
+    ) -> RoutingBackend {
+        RoutingBackend::with_health_config(
+            backends,
+            HashMap::new(),
+            default.to_string(),
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(30),
+            fresh,
+        )
+        .expect("routing backend")
+    }
+
+    #[tokio::test]
+    async fn fresh_window_coalesces_back_to_back_listings() {
+        // The GUI fires ListBuckets + bucket-origins ~30ms apart: the second
+        // call must be served from the fresh roster, not re-probe upstream.
+        let backend = TestBackend::with_buckets(&["b1"]);
+        let probes = backend.list_calls.clone();
+        let mut backends: HashMap<String, Arc<Box<dyn StorageBackend>>> = HashMap::new();
+        backends.insert("primary".into(), Arc::new(Box::new(backend)));
+        let routing = routing_with_fresh(backends, "primary", std::time::Duration::from_secs(5));
+
+        let first = routing.list_buckets().await.expect("first listing");
+        let second = routing.list_buckets().await.expect("second listing");
+        assert_eq!(first, second);
+        assert_eq!(
+            probes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "second listing within the fresh window must not probe upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_bucket_invalidates_fresh_window() {
+        // Read-after-write: a bucket created through the proxy must appear in
+        // the very next listing even inside the freshness window.
+        let backend = TestBackend::with_buckets(&["b1"]);
+        let probes = backend.list_calls.clone();
+        let mut backends: HashMap<String, Arc<Box<dyn StorageBackend>>> = HashMap::new();
+        backends.insert("primary".into(), Arc::new(Box::new(backend)));
+        let routing = routing_with_fresh(backends, "primary", std::time::Duration::from_secs(5));
+
+        let before = routing.list_buckets().await.expect("first listing");
+        assert!(!before.contains(&"b2".to_string()));
+        routing.create_bucket("b2").await.expect("create");
+        let after = routing.list_buckets().await.expect("listing after create");
+        assert!(
+            after.contains(&"b2".to_string()),
+            "new bucket must be visible immediately: {after:?}"
+        );
+        assert_eq!(
+            probes.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "create_bucket must invalidate the fresh roster"
+        );
     }
 
     #[tokio::test]

@@ -1030,6 +1030,7 @@ Exhaustive list of every `DGP_*` variable the server reads. The unit test `test_
 | `DGP_S3_STALL_GRACE_SECS` | 30 | Backend S3 no-progress stall grace |
 | `DGP_BACKEND_LIST_COOLDOWN_SECS` | 30 | After a backend fails a bucket listing, skip it (serve last-known-good, flagged unavailable) for this long before re-probing — so one dead backend doesn't add a connect timeout to every `ListBuckets` |
 | `DGP_BACKEND_LIST_TIMEOUT_SECS` | 5 | Per-backend timeout for a single bucket-listing call; bounds a hung (not-refusing) backend |
+| `DGP_BACKEND_LIST_FRESH_SECS` | 5 | Serve a bucket listing fetched this recently without re-probing upstream — the browser fires `ListBuckets` and the origins lookup back-to-back, and this collapses them into one upstream call per backend. Bucket create/delete through the proxy invalidates it immediately; 0 disables |
 
 ### Replication / streaming copy
 

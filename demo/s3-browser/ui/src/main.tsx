@@ -16,7 +16,10 @@ const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
       staleTime: 5_000, // 5s: deduplicate concurrent reads from sibling panels
-      refetchOnWindowFocus: true,
+      // No focus-refetch burst: every alt-tab back used to re-fire ALL active
+      // queries (origins, usage, jobs, mounted panel reads). Live data is
+      // covered by explicit pollers; static admin reads refresh on navigation.
+      refetchOnWindowFocus: false,
       // A backgrounded tab does NOT keep firing refetchInterval pollers (jobs,
       // parity, maintenance) — they resume on return. Explicit so it can't
       // silently flip; a hidden tab shouldn't hammer the admin API every 2s.
