@@ -96,12 +96,12 @@ pub async fn admission_middleware(mut request: Request<Body>, next: Next) -> Res
             // Route through the canonical S3 error builder so the XML shape
             // (and the `x-amz-request-id` header) match every other
             // AccessDenied the proxy emits — while keeping the matched-block
-            // name in the `<Message>` (`admission-deny:<block>`). That name is
-            // a deliberate operator-debugging affordance (asserted by
+            // name in the `<Message>`. That name is a deliberate
+            // operator-debugging affordance (asserted by
             // tests/admission_test.rs): a denied client can see which rule
             // fired, mirroring how SigV4/IAM denials are already traceable.
             return crate::api::errors::S3Error::AccessDeniedReason(format!(
-                "Blocked by access rule '{matched}'"
+                "Blocked by access rule '{matched}'",
             ))
             .into_response();
         }

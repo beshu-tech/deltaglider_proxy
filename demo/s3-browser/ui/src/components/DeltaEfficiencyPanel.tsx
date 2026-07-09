@@ -263,7 +263,7 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
           {response.reports.length === 0 ? (
             <Alert
               type="success"
-              message="No deltaspaces met the reporting threshold"
+              message="No compression scopes met the reporting threshold"
               description={`No prefix in '${response.bucket}' has at least ${response.min_deltas} deltas. Try lowering 'min deltas' or pick another bucket.`}
               showIcon
             />
@@ -477,7 +477,7 @@ function HeroHeadline({
     ? 'All prefixes are compressing well.'
     : `${actionable} of ${totalReported.toLocaleString()} prefixes need re-baselining`;
   const subText = allHealthy
-    ? `Scanned ${totalReported.toLocaleString()} deltaspace(s) with ≥${minDeltas} deltas. No regression found.`
+    ? `Scanned ${totalReported.toLocaleString()} scope(s) with ≥${minDeltas} deltas. No regression found.`
     : `≈ ${formatBytes(totalRecoverableBytes)} stored as bad-reference deltas. Re-upload the listed prefixes to recover.`;
 
   return (

@@ -211,10 +211,14 @@ export default function DocsPage({ docId, onBack, accountMenu, onShowShortcuts }
   const resolvedId = (docId && DOCS.some(d => d.id === docId)) ? docId : DOCS[0]?.id || '';
   const [selectedId, setSelectedIdState] = useState(resolvedId);
 
-  // Sync selectedId when URL changes (browser back/forward)
+  // Sync selectedId when URL changes (browser back/forward).
+  // When navigating back to the docs landing (no docId), restore the default
+  // instead of keeping the last doc visible.
   useEffect(() => {
     if (docId && DOCS.some(d => d.id === docId)) {
       setSelectedIdState(docId);
+    } else if (!docId) {
+      setSelectedIdState(DOCS[0]?.id || '');
     }
   }, [docId]);
 

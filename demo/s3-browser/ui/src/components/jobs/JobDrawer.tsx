@@ -197,17 +197,17 @@ export default function JobDrawer({
 
   // A rule-kind jobId that resolves to NEITHER a live editor rule NOR a server
   // row is a stale draft reference (the draft was discarded or renamed while the
-  // drawer pointed at it). Close instead of flashing the "no longer exists"
-  // Empty — that copy is for genuinely-vanished one-off/server jobs.
-  const staleRuleRef =
-    !!parsed &&
-    (parsed.subsystem === 'replication' || parsed.subsystem === 'lifecycle') &&
-    replIndex < 0 &&
-    lcIndex < 0 &&
-    !serverRow;
+  // drawer pointed at it). Don't auto-close — instead the definition section
+  // renders an Empty state so the user sees "this job no longer exists" on
+  // a shared/deep-linked URL instead of a silent close.
+  // Guard on configs having loaded at least once — on initial render both
+  // sections are still `{rules: []}`, so findIndex returns -1 prematurely.
+  const hasLoadedConfigs = useRef(false);
   useEffect(() => {
-    if (staleRuleRef) onClose();
-  }, [staleRuleRef, onClose]);
+    if (!hasLoadedConfigs.current && (replication.rules.length > 0 || lifecycle.rules.length > 0)) {
+      hasLoadedConfigs.current = true;
+    }
+  }, [replication, lifecycle]);
 
   const runsTable = (
     <RecordList

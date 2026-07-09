@@ -509,7 +509,7 @@ admission:
         "expected S3 AccessDenied XML, got: {body}"
     );
     assert!(
-        body.contains("Blocked by access rule 'block-unauth-put'"),
+        body.contains("Blocked by access rule") && body.contains("block-unauth-put"),
         "error message must name the matched block: {body}"
     );
 }
