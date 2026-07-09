@@ -4,6 +4,30 @@
 
 Nothing yet.
 
+## v1.12.3 — 2026-07-09
+
+A network-hygiene patch, prompted by a Hetzner `SlowDown` throttling episode
+whose RCA surfaced how chatty a bucket refresh really was.
+
+### Fixed
+
+- **One upstream `ListBuckets` per backend per refresh, not two.** The browser
+  fires the S3 bucket list and the backend-origins lookup back-to-back; the
+  routing layer now serves a listing fetched within the last 5 seconds without
+  re-probing upstream (`DGP_BACKEND_LIST_FRESH_SECS`, `0` disables). Creating
+  or deleting a bucket through the proxy invalidates the window immediately,
+  so read-after-write stays exact. Stale rosters still back the
+  unavailable-placeholder path during outages.
+- **Five UI components no longer fire five independent bucket listings.** The
+  sidebar, destination picker, analytics, scan card, and permission editor now
+  share one in-flight request and a short-lived result; the explicit refresh
+  button and bucket create/delete bypass the cache.
+- **Alt-tabbing back no longer bursts the admin API.** React Query's
+  focus-refetch re-fired every active query on each window focus; it's off —
+  live data is covered by the explicit pollers.
+- **The idle bucket-maintenance poll runs 4× less often** (60s instead of 15s
+  when no job is running; still 2s while one is active).
+
 ## v1.12.2 — 2026-07-09
 
 The "feels alive" release: the golden-roadmap UX waves (verify progress that
