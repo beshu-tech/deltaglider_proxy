@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+Nothing yet.
+
+## v1.12.4 — 2026-07-09
+
+The "plays nice with throttled backends" release: batched HEAD sweeps with
+circuit breakers, adaptive client-side rate limiting, replication runs that
+back off instead of grinding a throttled key list — and a job drawer that
+shows WHAT is copying (name + size), so a slow counter reads as honest work.
+
 ### Fixed
 
 - **HEAD sweeps stop instead of grinding a throttled backend.** Listing

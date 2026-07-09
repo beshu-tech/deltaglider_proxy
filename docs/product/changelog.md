@@ -10,6 +10,39 @@ follow [semantic versioning](https://semver.org/); the Docker image
 
 _Last updated: 2026-07-09_
 
+## v1.12.4 — 2026-07-09
+
+The "plays nice with throttled backends" release: batched HEAD sweeps with
+circuit breakers, adaptive client-side rate limiting, replication runs that
+back off instead of grinding a throttled key list — and a job drawer that
+shows WHAT is copying (name + size), so a slow counter reads as honest work.
+
+### Fixed
+
+- **HEAD sweeps stop instead of grinding a throttled backend.** Listing
+  enrichment now runs its per-object HEAD lookups in batches of 10 (down
+  from 50 concurrent) and aborts the sweep when a batch comes back mostly
+  `503 SlowDown` — the remaining objects render with their listing
+  metadata. Deltaspace savings scans keep full coverage but log throttle
+  counts.
+- **The job drawer shows WHAT a replication run is copying.** An active
+  run now lists its in-flight objects (name, size, started) above the
+  tabs — a counter sitting on "1 copied" for 30 minutes reads as honest
+  work on a 4 GB tarball instead of a hang. Live view, top 3 largest,
+  refreshed by the existing 2s poll.
+- **Background jobs stop hammering a throttled backend.** A replication
+  run now aborts (and backs off to the rule's cadence) when a whole page
+  of copies is rejected with `503 SlowDown`, instead of grinding the
+  remaining key list — the cursor resumes where it left off. Verify's
+  HEAD-resolution runs in batches of 10 (down from 50 concurrent) and
+  marks the remaining keys unresolved (honest partial audit) when a whole
+  batch fails transiently.
+- **The S3 client uses adaptive retry.** One throttle response now
+  rate-limits every subsequent request on that backend client (HEAD
+  bursts, listings, replication reads) via the AWS SDK's client-wide
+  adaptive rate limiter, instead of each call site independently
+  hammering a struggling backend.
+
 ## v1.12.3 — 2026-07-09
 
 A network-hygiene patch, prompted by a Hetzner `SlowDown` throttling episode
