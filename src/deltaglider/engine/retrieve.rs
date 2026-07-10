@@ -621,13 +621,18 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 };
                 let delta = delta_result?;
 
-                // Guard against oversized inputs before spawning the codec task.
-                // The reference + delta combined size is a lower bound for the
-                // reconstructed object; reject early to avoid OOM.
-                let combined_size = reference.len() as u64 + delta.len() as u64;
-                if combined_size > self.max_object_size {
+                // Decompression-bomb guard: reject if the object's DECLARED
+                // reconstruction size exceeds max. Using ref.len()+delta.len()
+                // here was WRONG — that is not a lower bound for the output
+                // (a small delta against a large reference can exceed it), so
+                // it falsely rejected legitimately-stored objects on every GET,
+                // making them permanently unreadable. The true reconstruction
+                // size is metadata.file_size (already ≤ max at store time), so
+                // a correctly-stored object never trips this; a tampered
+                // metadata claiming an oversized output still does.
+                if metadata.file_size > self.max_object_size {
                     return Err(EngineError::TooLarge {
-                        size: combined_size,
+                        size: metadata.file_size,
                         max: self.max_object_size,
                     });
                 }
