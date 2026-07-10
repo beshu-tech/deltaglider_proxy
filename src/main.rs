@@ -729,6 +729,14 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Built once here so it's in scope both for the schedulers below AND for the
+    // AdminState (so run-now/verify/delete can check the active lease — H14/29/48).
+    let coordination_lease = if let Some(db) = config_db.as_ref() {
+        Some(build_coordination_lease(&config, db, &admin_password_hash).await)
+    } else {
+        None
+    };
+
     if !config_db_mismatch {
         if let Some(db) = config_db.as_ref() {
             deltaglider_proxy::maintenance::worker::spawn_worker(
@@ -742,11 +750,6 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         // 30s-tick timer where cross-node double-run is costliest); lifecycle
         // (hourly, pure-plan-idempotent) + maintenance (operator one-offs) stay
         // node-local for now — documented follow-ups.
-        let coordination_lease = if let Some(db) = config_db.as_ref() {
-            Some(build_coordination_lease(&config, db, &admin_password_hash).await)
-        } else {
-            None
-        };
         deltaglider_proxy::lifecycle::scheduler::spawn_scheduler(
             shared_config.clone(),
             config_db.clone(),
@@ -875,6 +878,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         public_prefix_snapshot,
         admission_chain,
         parity_cancels: Default::default(),
+        coordination_lease: coordination_lease.clone(),
     });
 
     // --- TLS ---

@@ -813,6 +813,28 @@ async fn delete_rule(
     name: &str,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, String)> {
+    // Cross-backend liveness gate (H29): the SQLite lease check below is blind to
+    // a scheduled run holding ONLY the coordination (S3) lease, so a rule could
+    // be purged mid-run. Check the active lease FIRST — before the config/db
+    // locks, since is_held may do S3 I/O we must not run under those locks.
+    if sub == JobSubsystem::Replication {
+        if let Some(lease) = state.coordination_lease.as_ref() {
+            let now = crate::replication::state_store::current_unix_seconds();
+            if lease
+                .is_held(crate::coordination::LeaseSubsystem::Replication, name, now)
+                .await
+                .unwrap_or(false)
+            {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!(
+                        "rule '{name}' has a run or verify in progress — stop it before deleting"
+                    ),
+                ));
+            }
+        }
+    }
+
     // ONE critical section (config.write OUTER → db.lock INNER, the codebase
     // order): liveness check, config retain+persist, and the DB row purge all
     // under the same guards. Holding the db lock across the purge closes the

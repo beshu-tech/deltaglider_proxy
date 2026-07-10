@@ -70,6 +70,18 @@ pub trait CoordinationLease: Send + Sync {
         rule: &str,
         owner: &str,
     ) -> Result<(), String>;
+
+    /// Read-only: is a (non-expired) lease currently held for `(subsystem,
+    /// rule)`? Used by admin handlers (run-now / verify / delete) to gate against
+    /// an in-flight run REGARDLESS of which lease backend holds it — the
+    /// node-local SQLite check alone is blind to a scheduler holding the S3 lease,
+    /// which let run-now double-run and verify/delete race a live run (H14/H29/H48).
+    async fn is_held(
+        &self,
+        subsystem: LeaseSubsystem,
+        rule: &str,
+        now: i64,
+    ) -> Result<bool, String>;
 }
 
 /// Node-local lease backed by the SQLite CAS in `config_db/job_store.rs` (via the
@@ -136,6 +148,20 @@ impl CoordinationLease for LocalLease {
         .map_err(|e| e.to_string())?;
         Ok(())
     }
+
+    async fn is_held(
+        &self,
+        subsystem: LeaseSubsystem,
+        rule: &str,
+        now: i64,
+    ) -> Result<bool, String> {
+        let db = self.db.lock().await;
+        match subsystem {
+            LeaseSubsystem::Replication => db.replication_lease_is_held(rule, now),
+            LeaseSubsystem::Lifecycle => db.lifecycle_lease_is_held(rule, now),
+        }
+        .map_err(|e| e.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -176,6 +202,21 @@ mod tests {
         assert!(lease.try_acquire(r, "rule1", "B", 271, 60).await.unwrap());
         // And the old owner A can no longer renew (lapsed → stop).
         assert!(!lease.renew(r, "rule1", "A", 271, 60).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn local_lease_is_held_reflects_liveness() {
+        // is_held backs the admin run-now/verify/delete cross-backend gate.
+        let lease = LocalLease::new(mem_db());
+        let r = LeaseSubsystem::Replication;
+        ensure_rule(&lease, "rule1").await;
+
+        // Nothing held yet.
+        assert!(!lease.is_held(r, "rule1", 100).await.unwrap());
+        // Acquire (TTL 60 → expires 160): held at now=150, not at now=161.
+        assert!(lease.try_acquire(r, "rule1", "A", 100, 60).await.unwrap());
+        assert!(lease.is_held(r, "rule1", 150).await.unwrap());
+        assert!(!lease.is_held(r, "rule1", 161).await.unwrap());
     }
 
     #[tokio::test]

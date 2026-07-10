@@ -93,6 +93,25 @@ pub async fn run_now(
 
     let lease_owner = format!("run-now:{}", uuid::Uuid::new_v4());
 
+    // Cross-backend liveness gate (H14): when a coordination (S3) lease is
+    // active, a scheduled run holds ONLY that lease — the node-local SQLite
+    // acquire below would succeed (SQLite lease free) and DOUBLE-RUN. Check the
+    // active lease first; a held lease → 409. (No-op when only LocalLease is
+    // wired, which the SQLite acquire already covers.)
+    if let Some(lease) = state.coordination_lease.as_ref() {
+        let now = replication::current_unix_seconds();
+        if lease
+            .is_held(crate::coordination::LeaseSubsystem::Replication, &rule.name, now)
+            .await
+            .unwrap_or(false)
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                "rule is already running; wait for the current run to finish".to_string(),
+            ));
+        }
+    }
+
     // Short lock for the precheck + lease acquisition only — run_rule
     // acquires the lock itself at each sync boundary (see its doc comment).
     {
@@ -309,6 +328,22 @@ pub async fn verify(
         let db = db_arc.lock().await;
         if db
             .replication_lease_is_held(&rule.name, now)
+            .unwrap_or(false)
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                "a replication run is in progress for this rule — verify after it settles"
+                    .to_string(),
+            ));
+        }
+    }
+    // Cross-backend liveness gate (H48): a scheduled run under a coordination
+    // (S3) lease is invisible to the SQLite check above — consult the active
+    // lease too so verify doesn't run a parity audit against a mid-sync dest.
+    if let Some(lease) = state.coordination_lease.as_ref() {
+        if lease
+            .is_held(crate::coordination::LeaseSubsystem::Replication, &rule.name, now)
+            .await
             .unwrap_or(false)
         {
             return Err((

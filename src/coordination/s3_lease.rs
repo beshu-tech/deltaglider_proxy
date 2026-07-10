@@ -322,6 +322,22 @@ impl CoordinationLease for S3Lease {
         }
         Ok(())
     }
+
+    async fn is_held(
+        &self,
+        subsystem: LeaseSubsystem,
+        rule: &str,
+        now: i64,
+    ) -> Result<bool, String> {
+        let key = Self::object_key(subsystem, rule);
+        // Held = the lease object exists AND hasn't lapsed. A transient read
+        // error is surfaced (the caller treats an Err conservatively).
+        Ok(self
+            .read_lease(&key)
+            .await?
+            .map(|(lease, _etag)| lease.expires_at >= now)
+            .unwrap_or(false))
+    }
 }
 
 #[cfg(test)]
