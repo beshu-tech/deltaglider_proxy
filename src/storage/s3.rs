@@ -55,6 +55,17 @@ use tracing::{debug, instrument, warn};
 /// `created_at`) re-copy the object on every tick forever — the root cause in
 /// docs/plan/rca-replication-recopy-2026-06-30.md. Pure so the truth table is
 /// unit-tested without an S3 client.
+/// Percent-encode an S3 object key for the `x-amz-copy-source` header, which is
+/// URL-decoded server-side. Encodes each `/`-separated segment (preserving the
+/// path separators) so keys with `%`, `?`, `+`, `#`, spaces, etc. survive the
+/// server-side decode. Pure — unit-tested without an S3 client.
+fn encode_copy_source_key(key: &str) -> String {
+    key.split('/')
+        .map(|seg| urlencoding::encode(seg).into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn resolve_created_at(meta_value: Option<String>, fallback: DateTime<Utc>) -> DateTime<Utc> {
     let Some(raw) = meta_value else {
         return fallback;
@@ -1364,7 +1375,12 @@ impl StorageBackend for S3Backend {
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         let key = self.reference_key(prefix);
-        let copy_source = format!("{}/{}", bucket, key);
+        // x-amz-copy-source is URL-DECODED server-side, so the caller must
+        // percent-encode it — a legal key char like '%', '?', '+' or '#' in the
+        // prefix (e.g. "sale 50% off/") would otherwise be an invalid escape and
+        // AWS/MinIO reject the CopyObject with 400. Encode per path segment so
+        // the '/' separators are preserved.
+        let copy_source = format!("{}/{}", bucket, encode_copy_source_key(&key));
         let headers = self.metadata_to_headers(metadata);
 
         let mut request = self
@@ -2265,11 +2281,12 @@ fn list_fetch_boundary<'a>(
         if filename == "reference.bin" {
             continue;
         }
-        let user_key: &str = if let Some(stripped) = key.strip_suffix(".delta") {
-            stripped
-        } else {
-            key
-        };
+        // Strip ALL trailing `.delta` (not just one) so this matches the
+        // classification path (trim_end_matches at s3.rs:1019/1170). Otherwise a
+        // foreign pair `b.delta` + `b.delta.delta` counts as TWO distinct
+        // candidates here but dedups to ONE served entry, over-counting the
+        // boundary and risking a dropped page tail.
+        let user_key: &str = key.trim_end_matches(".delta");
         if user_key > token {
             candidates.insert(user_key);
         }
@@ -2444,6 +2461,34 @@ mod tests {
             boundary(&["a..delta", "a.delta"], &[], 1, None),
             Some("a.delta".into())
         );
+    }
+
+    #[test]
+    fn boundary_double_delta_dedups_to_one_candidate() {
+        // A foreign pair `b.delta` + `b.delta.delta` must map to the SAME user
+        // key `b` (matching the classification path's trim_end_matches), so it
+        // counts as ONE candidate — not two, which would over-count the boundary.
+        // With max_keys=1 and these two raw keys collapsing to one user key `b`,
+        // there is no (max_keys+1)-th distinct key → the fetch is complete (None).
+        assert_eq!(boundary(&["b.delta", "b.delta.delta"], &[], 1, None), None);
+    }
+
+    #[test]
+    fn encode_copy_source_key_encodes_segments_preserving_slashes() {
+        // Percent-encode special chars per segment; keep '/' separators.
+        assert_eq!(
+            encode_copy_source_key("sale 50% off/.dg/reference.bin"),
+            "sale%2050%25%20off/.dg/reference.bin"
+        );
+        // A plain key round-trips unchanged.
+        assert_eq!(
+            encode_copy_source_key("prefix/reference.bin"),
+            "prefix/reference.bin"
+        );
+        // '+', '?', '#' are all encoded (would break the server-side decode raw).
+        let enc = encode_copy_source_key("a+b?c#d/reference.bin");
+        assert!(!enc.contains('+') && !enc.contains('?') && !enc.contains('#'));
+        assert!(enc.ends_with("/reference.bin"));
     }
 
     // ── resolve_created_at: the replication re-copy fix (RCA 2026-06-30) ──
