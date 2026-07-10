@@ -553,14 +553,23 @@ async fn run_phases(
                     }
                 }
             }
-            // Deletes shrink the listing — restart from the top each sweep.
-            // A sweep that deleted NOTHING will never converge: stop instead
-            // of re-listing the same page (and re-recording the same
-            // failures) up to the page cap.
-            if page.next_continuation_token.is_none() || deleted_this_sweep == 0 {
+            // No more pages → done.
+            if page.next_continuation_token.is_none() {
                 break 'cleanup;
             }
-            cleanup_token = None;
+            // Deletes shrink the listing, so after a sweep that DELETED something
+            // we restart from the top (cleanup_token=None). But a sweep can delete
+            // NOTHING while a next page exists — e.g. a page that is ALL '/'-suffixed
+            // directory markers (filtered out of deletion) OR a page of only
+            // failed deletes. Restarting from the top would re-list the same page
+            // forever and settle 'completed' with source objects left behind (H38).
+            // Instead PAGE FORWARD past the undeletable page to reach real objects;
+            // once something deletes again, resume restart-from-top.
+            if deleted_this_sweep == 0 {
+                cleanup_token = page.next_continuation_token.clone();
+            } else {
+                cleanup_token = None;
+            }
             heartbeat(db, job.id, instance_id).await?;
         }
         remove_routes(
