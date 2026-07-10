@@ -71,6 +71,15 @@ pub struct ConfigDbSync {
     bootstrap_password_hash: String,
     /// Set when an upload exhausted its retries; the periodic poll flushes it.
     needs_upload: AtomicBool,
+    /// Serialises this node's own uploads. Two concurrent same-node uploads
+    /// (e.g. create-user X then create-user Y in quick succession) each
+    /// tokio::spawn `upload_with_reconcile`; without this, they read the DB
+    /// file + expected etag independently, one wins the CAS, the other 412s and
+    /// its reconcile whole-table-replaces the local IAM with the older remote
+    /// blob — silently deleting the just-committed row (X-ray H10). Held across
+    /// the whole read→PUT→reconcile→retry sequence so same-node uploads are
+    /// strictly ordered; cross-node conflicts still use the reconcile path.
+    upload_lock: tokio::sync::Mutex<()>,
 }
 
 impl ConfigDbSync {
@@ -108,6 +117,7 @@ impl ConfigDbSync {
             last_etag: Arc::new(RwLock::new(None)),
             bootstrap_password_hash,
             needs_upload: AtomicBool::new(false),
+            upload_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -734,6 +744,10 @@ pub async fn upload_with_reconcile(
     sessions: Option<&Arc<crate::session::SessionStore>>,
     context: &str,
 ) -> Result<(), UploadError> {
+    // Serialise this node's own uploads: two concurrent same-node uploads that
+    // interleave read-then-PUT let the loser's reconcile whole-table-replace the
+    // local IAM with an older remote blob, deleting a just-committed row (H10).
+    let _guard = sync.upload_lock.lock().await;
     let mut last_err = UploadError::Other("upload never attempted".to_string());
     for attempt in 1..=MAX_UPLOAD_ATTEMPTS {
         match sync.upload().await {

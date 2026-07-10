@@ -24,7 +24,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// Map a Slack Web API JSON response to a delivery result. The API returns HTTP
 /// 200 even on failure; the authoritative status is the `ok` boolean, with the

@@ -582,3 +582,75 @@ async fn ha_replica_with_wrong_password_preserves_local_state() {
         "A's admin API must still work after B's failed-passphrase sync attempt"
     );
 }
+
+/// X-ray H10: concurrent same-node mutations must not self-clobber.
+///
+/// Each admin user-create fires an independent background `upload_with_reconcile`.
+/// Before the per-node upload lock, two of these could interleave read-then-PUT:
+/// one wins the CAS, the other 412s and its reconcile whole-table-replaces the
+/// live IAM with the older remote blob — silently deleting a user for which the
+/// admin already got a 201. No peer node is involved; the node loses its own
+/// committed write. This creates a batch of users as fast as possible on ONE
+/// sync-enabled node and asserts every one survives in that node's own DB.
+#[tokio::test]
+async fn ha_concurrent_same_node_creates_do_not_self_clobber() {
+    skip_unless_minio!();
+
+    let sync_key = unique_config_sync_object_key();
+    let server = TestServer::builder()
+        .auth("HAKEY-SC", "HASECRET-SC-1234567890")
+        .s3_endpoint(&minio_endpoint_url())
+        .bucket(MINIO_BUCKET)
+        .config_sync_bucket(MINIO_BUCKET)
+        .config_sync_object_key(&sync_key)
+        .build()
+        .await;
+    let endpoint = server.endpoint();
+
+    // Fire N creates concurrently so their background uploads overlap.
+    let names: Vec<String> = (0..8)
+        .map(|i| unique_user_name(&format!("h10-{i}")))
+        .collect();
+    let mut handles = Vec::new();
+    for name in &names {
+        let admin = admin_http_client(&endpoint).await;
+        let ep = endpoint.clone();
+        let name = name.clone();
+        handles.push(tokio::spawn(async move {
+            let resp = admin
+                .post(format!("{ep}/_/api/admin/users"))
+                .json(&json!({
+                    "name": name,
+                    "permissions": [{"actions": ["read"], "resources": ["*"]}]
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status().as_u16(), 201, "create {name} must 201");
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    // Let the overlapping background uploads (and any reconcile retries) settle.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Every user the admin got a 201 for must still be present on THIS node.
+    let admin = admin_http_client(&endpoint).await;
+    let users: Vec<serde_json::Value> = admin
+        .get(format!("{endpoint}/_/api/admin/users"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for name in &names {
+        assert!(
+            users.iter().any(|u| u["name"] == *name),
+            "user {name} was 201-created but is missing — self-clobber (H10); got {} users",
+            users.len()
+        );
+    }
+}
