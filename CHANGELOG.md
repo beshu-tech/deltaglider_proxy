@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.14.0 — 2026-07-10
+
 ## v1.13.0 — 2026-07-10
 
 A correctness-and-security hardening release. A deep review of the codebase
