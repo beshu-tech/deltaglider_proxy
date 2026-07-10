@@ -4,7 +4,49 @@
 
 ## v1.13.0 — 2026-07-10
 
-### Fixed
+A correctness-and-security hardening release. A deep review of the codebase
+turned up a set of data-loss, data-corruption, and authorization-bypass bugs
+in edge cases (concurrent config edits, cancelled uploads, slow backends,
+rejected config applies); every one is fixed with a regression test.
+
+### Fixed — data loss & corruption
+
+- **Concurrent admin edits no longer silently lose a user.** Creating two
+  users in quick succession could make one of them vanish everywhere (the
+  config-DB sync path clobbered a just-committed change with an older copy).
+  Same-node syncs are now serialized.
+- **A slow upload to a remote backend no longer loses its data.** A large
+  multipart upload whose final store ran longer than the cleanup timeout could
+  have its temporary parts deleted mid-store, permanently failing the upload on
+  retry. In-flight stores are now protected from the cleanup sweeper.
+- **Background copies no longer race a re-encryption/migration job.** A
+  replication or lifecycle copy in flight when a maintenance job started could
+  be overwritten with stale bytes (or lost after a migration flip). Those
+  copies now register with the maintenance write-gate so the job waits for them.
+- **A dropped connection no longer wedges a bucket's maintenance jobs.** A
+  client disconnecting mid-write used to leak an internal counter, making every
+  later re-encrypt/migrate on that bucket time out until a restart. The counter
+  is now released even on cancellation.
+- **A just-created bucket appears immediately in the next listing** even under
+  a concurrent listing refresh (a race could hide it for a few seconds).
+- **A backend's encryption key survives a config export→edit→apply round-trip**
+  — it was being silently stripped, which could leave historical objects
+  unreadable and new writes unencrypted.
+
+### Fixed — security & authorization
+
+- **A rejected config apply no longer leaks a public prefix.** An apply that
+  failed its IAM validation could still publish a public-read prefix (serving
+  objects anonymously) while reporting "no change." Validation now runs before
+  any change is committed.
+- **Prefix-scoped and IP-scoped Deny rules are enforced on batch deletes and
+  browser (form-POST) uploads** — both paths previously skipped the per-object
+  authorization check, defeating carve-out and source-IP conditions.
+- **A revoked session is dropped from memory immediately**, and a compromised
+  key can no longer be un-revoked by a concurrent config sync.
+- **A quota can no longer be bypassed** by a corrupt object-size reading that
+  overflowed the usage total, and a truncated streaming upload is now rejected
+  instead of stored as a complete (short) object.
 
 - **A run whose process died within its lease TTL no longer shows "running"
   forever.** The boot-time zombie scan spared any `running` row whose leader
@@ -13,6 +55,12 @@
   permanently. Boot now lapses every local lease first: the coordination
   tables are node-local, so a lease found at boot can only belong to a dead
   process of this node. Applies to replication and lifecycle.
+
+### Fixed — config apply
+
+- **Changes to passthrough size limit, codec concurrency, TLS, and the config
+  sync bucket now take effect (or clearly warn a restart is required)** instead
+  of being reported as applied while silently doing nothing.
 
 ## v1.12.4 — 2026-07-09
 
