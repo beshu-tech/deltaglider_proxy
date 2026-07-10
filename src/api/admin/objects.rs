@@ -252,7 +252,10 @@ async fn run_copy_loop(s3: &Arc<AppState>, req: &CopyRequest) -> CopyResponse {
     // makes the worker's drain wait for us; the per-item is_busy check
     // stops us the moment a job arms mid-loop.
     let gate = &s3.maintenance_gate;
-    gate.write_started(&req.dest_bucket);
+    // RAII: releases the drain slot even if this handler future is dropped
+    // (admin closes the browser mid-bulk-copy) — straight-line write_finished
+    // would leak the counter and wedge every later job on the bucket (H12).
+    let _write = gate.begin_write(&req.dest_bucket);
     for (idx, it) in req.items.iter().enumerate() {
         if gate.is_busy(&req.dest_bucket) {
             let remaining = req.items.len() - idx;
@@ -293,7 +296,7 @@ async fn run_copy_loop(s3: &Arc<AppState>, req: &CopyRequest) -> CopyResponse {
             }
         }
     }
-    gate.write_finished(&req.dest_bucket);
+    drop(_write);
     CopyResponse {
         succeeded,
         failed,
@@ -414,7 +417,9 @@ pub async fn move_objects(
     if copy_result.failed == 0 {
         let engine = s3.engine.load();
         let gate = &s3.maintenance_gate;
-        gate.write_started(&req.source_bucket);
+        // RAII drain slot — released on drop even if the handler future is
+        // cancelled mid-loop (H12).
+        let _write = gate.begin_write(&req.source_bucket);
         for it in &req.items {
             if gate.is_busy(&req.source_bucket) {
                 // A maintenance job armed mid-loop: stop deleting sources.
@@ -455,7 +460,7 @@ pub async fn move_objects(
                 }
             }
         }
-        gate.write_finished(&req.source_bucket);
+        drop(_write);
         if skipped_self > 0 {
             warn!(
                 "bulk move: skipped deleting {} source(s) whose destination equals the source \
@@ -514,7 +519,9 @@ pub async fn bulk_delete(
     // Same gate participation as run_copy_loop: visible to the worker's
     // drain, and stops the moment a maintenance job arms mid-loop.
     let gate = &state.s3_state.maintenance_gate;
-    gate.write_started(&req.bucket);
+    // RAII drain slot — released on drop even if the handler future is
+    // cancelled mid-loop (H12).
+    let _write = gate.begin_write(&req.bucket);
     for (idx, key) in req.keys.iter().enumerate() {
         if gate.is_busy(&req.bucket) {
             let remaining = req.keys.len() - idx;
@@ -551,7 +558,7 @@ pub async fn bulk_delete(
         }
     }
 
-    gate.write_finished(&req.bucket);
+    drop(_write);
     info!(
         "bulk delete: bucket={} deleted={} failed={}",
         req.bucket, deleted, failed

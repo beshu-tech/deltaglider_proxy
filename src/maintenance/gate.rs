@@ -123,6 +123,32 @@ impl MaintenanceGate {
             }
         }
     }
+
+    /// RAII in-flight-write registration. Increments the counter now and
+    /// decrements on drop, so a cancelled request future (client disconnect
+    /// mid-body → hyper drops the handler) still releases its slot. Straight-
+    /// line `write_started`/`write_finished` leaks the counter on cancellation,
+    /// permanently marking the bucket busy and failing every later drain (H12).
+    pub fn begin_write(self: &Arc<Self>, bucket: &str) -> WriteGuard {
+        self.write_started(bucket);
+        WriteGuard {
+            gate: Arc::clone(self),
+            bucket: bucket.to_ascii_lowercase(),
+        }
+    }
+}
+
+/// Decrements the gate's in-flight-write counter on drop — cancellation-safe.
+#[must_use = "dropping the guard immediately ends the in-flight-write window"]
+pub struct WriteGuard {
+    gate: Arc<MaintenanceGate>,
+    bucket: String,
+}
+
+impl Drop for WriteGuard {
+    fn drop(&mut self) {
+        self.gate.write_finished(&self.bucket);
+    }
 }
 
 /// First path segment of an S3 request = the bucket (lowercased).
@@ -168,10 +194,10 @@ pub async fn maintenance_gate_middleware(request: Request<Body>, next: Next) -> 
         .into_response();
     }
 
-    gate.write_started(&bucket);
-    let response = next.run(request).await;
-    gate.write_finished(&bucket);
-    response
+    // RAII: the guard decrements even if this future is dropped mid-body on a
+    // client disconnect (straight-line write_finished would leak the counter).
+    let _write = gate.begin_write(&bucket);
+    next.run(request).await
 }
 
 #[cfg(test)]
@@ -203,6 +229,38 @@ mod tests {
         g.write_finished("b");
         assert_eq!(g.inflight_writes("b"), 0);
         assert!(g.inflight_writes.is_empty(), "zeroed entries are removed");
+    }
+
+    #[test]
+    fn write_guard_decrements_on_drop_including_early_drop() {
+        let g = Arc::new(MaintenanceGate::new());
+        assert_eq!(g.inflight_writes("b"), 0);
+        {
+            let _w = g.begin_write("b");
+            assert_eq!(g.inflight_writes("b"), 1);
+            // Guard drops at end of scope even if the surrounding future is
+            // cancelled — this is the cancellation-safety H12 relies on.
+        }
+        assert_eq!(g.inflight_writes("b"), 0, "guard must decrement on drop");
+
+        // Explicit early drop (mimics a request future dropped mid-body).
+        let w = g.begin_write("b");
+        assert_eq!(g.inflight_writes("b"), 1);
+        drop(w);
+        assert_eq!(g.inflight_writes("b"), 0);
+        assert!(g.inflight_writes.is_empty(), "zeroed entries are removed");
+    }
+
+    #[test]
+    fn concurrent_guards_stack_and_unwind_independently() {
+        let g = Arc::new(MaintenanceGate::new());
+        let a = g.begin_write("b");
+        let b = g.begin_write("b");
+        assert_eq!(g.inflight_writes("b"), 2);
+        drop(a);
+        assert_eq!(g.inflight_writes("b"), 1);
+        drop(b);
+        assert_eq!(g.inflight_writes("b"), 0);
     }
 
     #[test]
