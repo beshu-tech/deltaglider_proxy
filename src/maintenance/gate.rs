@@ -43,10 +43,15 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use dashmap::DashMap;
 
-/// Lock-free busy-bucket set + per-bucket in-flight write counters.
+/// Lock-free busy-bucket set (reads) + per-bucket in-flight write counters.
 #[derive(Debug)]
 pub struct MaintenanceGate {
     busy: ArcSwap<HashSet<String>>,
+    /// Serialises the set_busy/clear read-modify-write on `busy`. Without it two
+    /// concurrent writers (worker clear("a") + admin set_busy("b")) both clone
+    /// the same {a} snapshot and the last store wins → a finished bucket A is
+    /// stuck busy forever, 503-ing every client write (H36). Reads stay lock-free.
+    write_lock: parking_lot::Mutex<()>,
     inflight_writes: DashMap<String, i64>,
 }
 
@@ -54,6 +59,7 @@ impl Default for MaintenanceGate {
     fn default() -> Self {
         Self {
             busy: ArcSwap::from_pointee(HashSet::new()),
+            write_lock: parking_lot::Mutex::new(()),
             inflight_writes: DashMap::new(),
         }
     }
@@ -73,6 +79,8 @@ impl MaintenanceGate {
     /// Add a bucket to the busy set (idempotent).
     pub fn set_busy(&self, bucket: &str) {
         let key = bucket.to_ascii_lowercase();
+        // Hold write_lock across the RMW so a concurrent clear() can't clobber it.
+        let _g = self.write_lock.lock();
         let current = self.busy.load();
         if current.contains(&key) {
             return;
@@ -85,6 +93,7 @@ impl MaintenanceGate {
     /// Remove a bucket from the busy set (idempotent).
     pub fn clear(&self, bucket: &str) {
         let key = bucket.to_ascii_lowercase();
+        let _g = self.write_lock.lock();
         let current = self.busy.load();
         if !current.contains(&key) {
             return;
@@ -185,7 +194,16 @@ pub async fn maintenance_gate_middleware(request: Request<Body>, next: Next) -> 
         return next.run(request).await;
     };
 
+    // Acquire the in-flight guard FIRST, then re-check busy (acquire-then-
+    // recheck). A plain is_busy→begin_write has a TOCTOU: a write that passes the
+    // check can be preempted before incrementing the counter, so a maintenance
+    // drain sees zero and starts rewriting while this write is still pending, and
+    // the client's bytes get overwritten with stale (H37). Registering first
+    // makes our write visible to the drain, or the re-check catches the arm and
+    // we 503 with the guard dropped. RAII also releases on a mid-body disconnect.
+    let write = gate.begin_write(&bucket);
     if gate.is_busy(&bucket) {
+        drop(write);
         // The busy set doesn't carry the job kind — name both candidates.
         return crate::api::errors::S3Error::SlowDown(format!(
             "bucket '{bucket}' is temporarily read-only while a background job \
@@ -193,16 +211,33 @@ pub async fn maintenance_gate_middleware(request: Request<Body>, next: Next) -> 
         ))
         .into_response();
     }
-
-    // RAII: the guard decrements even if this future is dropped mid-body on a
-    // client disconnect (straight-line write_finished would leak the counter).
-    let _write = gate.begin_write(&bucket);
+    let _write = write;
     next.run(request).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_set_busy_and_clear_do_not_strand_a_bucket() {
+        // H36: worker clear("a") racing admin set_busy("b") must not leave A
+        // stuck busy (unsynchronized RMW would let the last store clobber the
+        // other's change). Hammer the race; A must always end cleared, B set.
+        use std::sync::Arc;
+        for _ in 0..200 {
+            let g = Arc::new(MaintenanceGate::new());
+            g.set_busy("a"); // A starts busy (a running job)
+            let g1 = Arc::clone(&g);
+            let g2 = Arc::clone(&g);
+            let t1 = std::thread::spawn(move || g1.clear("a")); // job A finishes
+            let t2 = std::thread::spawn(move || g2.set_busy("b")); // job B arms
+            t1.join().unwrap();
+            t2.join().unwrap();
+            assert!(!g.is_busy("a"), "A must be cleared, not stranded busy");
+            assert!(g.is_busy("b"), "B must be busy");
+        }
+    }
 
     #[test]
     fn busy_set_round_trips_case_insensitively() {
