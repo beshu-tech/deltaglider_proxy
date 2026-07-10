@@ -32,9 +32,19 @@ pub(crate) async fn enqueue_object_event(state: &Arc<AppState>, event: NewEvent)
 
 /// Batched variant of [`enqueue_object_event`].
 pub(crate) async fn enqueue_object_events(state: &Arc<AppState>, events: &[NewEvent]) {
-    if events.is_empty() {
+    // Drop events for DG-internal keys (reference.bin, dir markers, staging
+    // routes) at the single enqueue chokepoint. The s3s adapter filters before
+    // calling, but the form-POST path enqueued directly — without this a raw
+    // webhook could fire for a `.dg/reference.bin` write. Idempotent double-filter.
+    let filtered: Vec<NewEvent> = events
+        .iter()
+        .filter(|e| crate::replication::event_consumer::is_user_object_key(&e.key))
+        .cloned()
+        .collect();
+    if filtered.is_empty() {
         return;
     }
+    let events = filtered.as_slice();
     let Some(config_db) = state.config_db.as_ref() else {
         return;
     };

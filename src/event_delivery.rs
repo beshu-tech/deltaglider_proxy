@@ -334,30 +334,44 @@ impl HttpWebhookDeliveryClient {
                 map.insert("icon_emoji".to_string(), Value::String(i.to_string()));
             }
         }
-        for endpoint in endpoints {
-            // SSRF guard, same as the raw-webhook path. Slack's real
-            // hooks.slack.com is public so this never rejects a legitimate
-            // incoming webhook, but it blocks an operator-supplied internal URL.
+        // Validate ALL endpoints (SSRF + URL parse) BEFORE sending anything, so
+        // one bad URL doesn't leave a partial fan-out that the retry then
+        // duplicates. A config-level rejection is not a delivery attempt.
+        let mut urls = Vec::with_capacity(endpoints.len());
+        for endpoint in &endpoints {
             self.check_ssrf(endpoint, "slack webhook URL")?;
-            let url =
-                Url::parse(endpoint).map_err(|e| format!("invalid slack webhook URL: {e}"))?;
-            let response = self
+            urls.push(Url::parse(endpoint).map_err(|e| format!("invalid slack webhook URL: {e}"))?);
+        }
+        // Attempt EVERY endpoint (don't abort on the first failure) so a
+        // transient error on one doesn't skip the rest, then fail if any failed.
+        // ponytail: the outbox row has a single status, so a retry re-POSTs to
+        // endpoints that already succeeded — duplicate Slack messages on partial
+        // failure. Eliminating that needs per-endpoint delivery tracking (a
+        // schema change); until then multi-URL Slack is at-least-once per URL.
+        let mut errors: Vec<String> = Vec::new();
+        for (endpoint, url) in endpoints.iter().zip(urls) {
+            let result = self
                 .client
                 .post(url)
                 .timeout(timeout)
                 .json(&body)
                 .send()
-                .await
-                .map_err(|e| format!("{}: {e}", redact_url_for_error(endpoint)))?;
-            if !response.status().is_success() {
-                return Err(format!(
+                .await;
+            match result {
+                Err(e) => errors.push(format!("{}: {e}", redact_url_for_error(endpoint))),
+                Ok(response) if !response.status().is_success() => errors.push(format!(
                     "{}: slack webhook returned HTTP {}",
                     redact_url_for_error(endpoint),
                     response.status()
-                ));
+                )),
+                Ok(_) => {}
             }
         }
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 }
 
@@ -582,10 +596,17 @@ pub(crate) fn delivered_retention_secs(config: &EventDeliveryConfig) -> i64 {
 fn truncate_error(error: &str) -> String {
     const MAX_ERROR_LEN: usize = 1000;
     if error.len() <= MAX_ERROR_LEN {
-        error.to_string()
-    } else {
-        format!("{}...", &error[..MAX_ERROR_LEN])
+        return error.to_string();
     }
+    // Slice on a CHAR boundary: a naive `&error[..1000]` panics when byte 1000
+    // lands mid-UTF-8-char (e.g. a backend error carrying multi-byte text),
+    // which would kill the delivery dispatcher permanently. Walk back to the
+    // nearest boundary at or below the cap.
+    let mut end = MAX_ERROR_LEN;
+    while end > 0 && !error.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &error[..end])
 }
 
 pub fn known_status(status: &str) -> bool {
@@ -599,6 +620,21 @@ pub fn known_status(status: &str) -> bool {
 mod tests {
     use super::*;
     use crate::config_db::ConfigDb;
+
+    #[test]
+    fn truncate_error_never_panics_on_multibyte_boundary() {
+        // A multi-byte char straddling the 1000-byte cap must not panic.
+        let s = format!("{}é{}", "a".repeat(999), "b".repeat(50));
+        let out = truncate_error(&s);
+        assert!(out.ends_with("..."));
+        assert!(out.len() <= 1003);
+        // A short string is returned verbatim.
+        assert_eq!(truncate_error("short"), "short");
+        // An all-multibyte string longer than the cap still truncates cleanly.
+        let multi = "€".repeat(500); // 1500 bytes
+        let out = truncate_error(&multi);
+        assert!(out.ends_with("..."));
+    }
     use crate::event_outbox::{EventKind, EventSource, NewEvent};
     use axum::{
         http::{HeaderMap, StatusCode},

@@ -704,13 +704,19 @@ pub(super) fn preserve_event_delivery_secrets(
     if new.webhook_url.as_deref() == Some(sentinel) {
         new.webhook_url = old.webhook_url.clone();
     }
-    // webhook_urls are masked element-wise on export; restore each sentinel from
-    // the same index in the old list (the GUI edits the list in place, so index
-    // alignment holds for an untouched round-trip).
-    for (i, url) in new.webhook_urls.iter_mut().enumerate() {
-        if url == sentinel {
-            if let Some(prev) = old.webhook_urls.get(i) {
-                *url = prev.clone();
+    // webhook_urls are masked element-wise on export. A masked entry carries no
+    // identity, so index-based restore is only SOUND when the list wasn't
+    // reordered or resized — otherwise index i in the new list can align to the
+    // WRONG old URL and silently restore a different secret. Restore by index
+    // ONLY when the lengths match (a pure in-place edit); if they differ, leave
+    // the sentinel in place so config validation rejects it (the operator must
+    // supply the real URL for the entry they added/moved) rather than us guessing.
+    if new.webhook_urls.len() == old.webhook_urls.len() {
+        for (i, url) in new.webhook_urls.iter_mut().enumerate() {
+            if url == sentinel {
+                if let Some(prev) = old.webhook_urls.get(i) {
+                    *url = prev.clone();
+                }
             }
         }
     }
@@ -1158,6 +1164,35 @@ mod preserve_tests {
 
         // No change → no warnings.
         assert!(requires_restart_warnings(&base, &base).is_empty());
+    }
+
+    #[test]
+    fn webhook_urls_index_restore_only_when_lengths_match() {
+        // Same length → in-place restore by index (the safe round-trip case).
+        let old = EventDeliveryConfig {
+            webhook_urls: vec!["https://a/secret1".into(), "https://b/secret2".into()],
+            ..EventDeliveryConfig::default()
+        };
+        let mut new = EventDeliveryConfig {
+            webhook_urls: vec![REDACTED_SENTINEL.into(), "https://b/secret2".into()],
+            ..EventDeliveryConfig::default()
+        };
+        preserve_event_delivery_secrets(&mut new, &old);
+        assert_eq!(new.webhook_urls[0], "https://a/secret1");
+
+        // Different length (operator deleted an entry) → NO index restore, or a
+        // masked entry could align to the wrong old URL. The sentinel is left in
+        // place (config validation then rejects it) rather than silently
+        // restoring the wrong secret.
+        let mut shortened = EventDeliveryConfig {
+            webhook_urls: vec![REDACTED_SENTINEL.into()],
+            ..EventDeliveryConfig::default()
+        };
+        preserve_event_delivery_secrets(&mut shortened, &old);
+        assert_eq!(
+            shortened.webhook_urls[0], REDACTED_SENTINEL,
+            "a length change must NOT index-restore (would swap secrets)"
+        );
     }
 
     #[test]

@@ -652,6 +652,35 @@ fn validate(yaml: &DeclarativeIam, db: &CurrentIam) -> Result<(), String> {
         validate_permissions(&perms).map_err(|e| format!("group '{}': {e}", g.name))?;
     }
 
+    // Empty-secret-on-CREATE guard: a redacted export blanks secrets, and for an
+    // EXISTING user/provider the reconciler preserves the DB value
+    // (desired_existing_*). But a user/provider being CREATED (name not in the
+    // DB) with an empty secret has no value to preserve — it would onboard a user
+    // who can never authenticate / an OIDC provider that can't complete the flow.
+    // Reject at validation time so the operator supplies the real secret.
+    let db_user_names: HashSet<&str> = db.users.iter().map(|u| u.name.as_str()).collect();
+    for u in &yaml.users {
+        if !db_user_names.contains(u.name.as_str()) && u.secret_access_key.is_empty() {
+            return Err(format!(
+                "user '{}' is new but has an empty secret_access_key — a redacted export cannot \
+                 onboard a fresh user (they could never authenticate). Supply the real secret.",
+                u.name
+            ));
+        }
+    }
+    let db_provider_names: HashSet<&str> =
+        db.auth_providers.iter().map(|p| p.name.as_str()).collect();
+    for p in &yaml.auth_providers {
+        let secret_missing = p.client_secret.as_deref().unwrap_or("").is_empty();
+        if !db_provider_names.contains(p.name.as_str()) && secret_missing {
+            return Err(format!(
+                "auth_provider '{}' is new but has an empty client_secret — a redacted export \
+                 cannot onboard a fresh OIDC provider. Supply the real client_secret.",
+                p.name
+            ));
+        }
+    }
+
     // Cross-check: YAML user access_key_id must not collide with
     // ANY existing DB user (except the DB user with the same name,
     // which is the update-in-place case). Catches two scenarios:
@@ -1250,6 +1279,41 @@ mod tests {
         assert_eq!(diff.groups_to_create[0].name, "admins");
         assert_eq!(diff.users_to_create.len(), 1);
         assert_eq!(diff.users_to_create[0].name, "alice");
+    }
+
+    #[test]
+    fn diff_rejects_new_user_with_empty_secret() {
+        // A redacted export applied to a FRESH instance: the new user has a
+        // blanked secret. There's no DB row to preserve it from, so onboarding
+        // them would create a user who can never authenticate. Must be rejected.
+        let mut u = yu("alice", "AKIA1");
+        u.secret_access_key = String::new();
+        let yaml = DeclarativeIam {
+            users: vec![u],
+            ..Default::default()
+        };
+        let err = diff_iam(&yaml, &empty_db()).unwrap_err();
+        assert!(
+            err.contains("empty secret_access_key"),
+            "must reject a new user with an empty secret, got: {err}"
+        );
+
+        // But an EXISTING user (name in DB) with a blank secret is fine — the
+        // reconciler preserves the DB secret.
+        let mut u2 = yu("alice", "AKIA1");
+        u2.secret_access_key = String::new();
+        let yaml2 = DeclarativeIam {
+            users: vec![u2],
+            ..Default::default()
+        };
+        let current = CurrentIam {
+            users: vec![db_user(1, "alice", "AKIA1")],
+            ..empty_db()
+        };
+        assert!(
+            diff_iam(&yaml2, &current).is_ok(),
+            "an existing user with a blanked secret must be allowed (preserved)"
+        );
     }
 
     #[test]

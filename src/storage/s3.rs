@@ -431,7 +431,11 @@ impl S3Backend {
             // throttle propagation. Also catches `SlowDown` literal
             // in the SDK error body when the upstream returns it
             // without a 503 status (some implementations).
-            if s == 503 || debug_str.contains("SlowDown") {
+            // 429 Too Many Requests is the throttle signal from Backblaze B2 and
+            // Cloudflare R2 (and some S3-compatibles) where AWS uses 503 SlowDown.
+            // Classify it the same, or it falls into the S3(...) catch-all → 500,
+            // which SDKs treat as permanent and don't back off on.
+            if s == 503 || s == 429 || debug_str.contains("SlowDown") {
                 return StorageError::Throttled(format!("{} throttled (status={}): {}", op, s, e));
             }
         } else if debug_str.contains("SlowDown") {
@@ -2704,6 +2708,24 @@ mod tests {
                 "transient status {status} must NOT be NotFound (would corrupt reference.bin), got {classified:?}"
             );
         }
+    }
+
+    /// 429 Too Many Requests (Backblaze B2 / Cloudflare R2 rate limiting) must
+    /// classify as Throttled, not the S3(...) catch-all → 500. Uses a code that
+    /// is NOT "SlowDown" so this proves the STATUS-based branch, not the string.
+    #[test]
+    fn classify_s3_error_maps_429_to_throttled() {
+        let inner = aws_sdk_s3::operation::get_object::GetObjectError::generic(
+            aws_smithy_types::error::ErrorMetadata::builder()
+                .code("TooManyRequests")
+                .build(),
+        );
+        let err: SdkError<_> = SdkError::service_error(inner, http_response(429, Some("req-429")));
+        let classified = S3Backend::classify_s3_error("bucket", &err, S3Op::GetObject);
+        assert!(
+            matches!(classified, StorageError::Throttled(_)),
+            "429 must map to Throttled (B2/R2 rate limiting), got {classified:?}"
+        );
     }
 
     /// head_bucket routing guard: a transient HEAD-bucket failure must not

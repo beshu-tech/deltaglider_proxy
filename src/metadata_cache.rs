@@ -53,8 +53,13 @@ impl MetadataCache {
     }
 
     /// Build the cache key from bucket and object key.
+    ///
+    /// Strips a leading `/` so `/foo` and `foo` — which `ObjectKey::parse`
+    /// normalizes to the SAME stored object — share ONE cache entry. Without
+    /// this a DELETE via one spelling left stale existence/size cached under the
+    /// other for the 10-min TTL (read-after-delete could 200 a deleted object).
     fn cache_key(bucket: &str, key: &str) -> String {
-        format!("{}/{}", bucket, key)
+        format!("{}/{}", bucket, key.trim_start_matches('/'))
     }
 
     /// Look up cached metadata for an object.
@@ -165,6 +170,26 @@ mod tests {
         assert_eq!(cached.original_name, "file.zip");
         assert_eq!(cached.file_size, 1024);
         assert!(matches!(cached.storage_info, StorageInfo::Passthrough));
+    }
+
+    #[test]
+    fn leading_slash_key_aliases_to_same_entry() {
+        // `/foo` and `foo` normalize to the same stored object, so they must
+        // share one cache entry — else a DELETE via one leaves stale metadata
+        // cached under the other (read-after-delete would 200 a gone object).
+        let cache = MetadataCache::new(10 * 1024 * 1024);
+        cache.insert("b", "prefix/file.zip", sample_metadata("file.zip"));
+        // Look up via the leading-slash spelling → same entry.
+        assert!(
+            cache.get("b", "/prefix/file.zip").is_some(),
+            "leading-slash lookup must hit the un-slashed entry"
+        );
+        // Invalidate via the slashed spelling → clears the un-slashed entry.
+        cache.invalidate("b", "/prefix/file.zip");
+        assert!(
+            cache.get("b", "prefix/file.zip").is_none(),
+            "invalidate via /key must clear the entry stored under key"
+        );
     }
 
     #[test]
