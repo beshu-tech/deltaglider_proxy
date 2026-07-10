@@ -2550,7 +2550,18 @@ impl Config {
     fn to_canonical_yaml_for_persist(&self) -> Result<String, ConfigError> {
         let export = self.with_env_refs_reinserted().redact_for_persist();
         let sectioned = crate::config_sections::SectionedConfig::from_flat(&export);
-        serde_yaml::to_string(&sectioned).map_err(|e| ConfigError::Parse(e.to_string()))
+        // The load path expands the WHOLE file text (`$$`→`$`, `${env:NAME}`→
+        // value). A runtime-entered literal containing `$$` or a `${env:...}`-
+        // shaped substring would therefore round-trip WRONG through persist→load
+        // (`pay $$10` reloads as `pay $10`; a bearer token with `${env:X}` gets
+        // expanded/erased). Escape materialized scalars ($→$$) so load's inverse
+        // recovers the original. A re-inserted `${env:NAME}` ref (produced above)
+        // is LEFT intact — it's meant to expand. Symmetric: load's `$$`→`$`
+        // exactly undoes this, so repeated persist/load is stable.
+        let mut tree =
+            serde_yaml::to_value(&sectioned).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        escape_dollar_for_persist(&mut tree);
+        serde_yaml::to_string(&tree).map_err(|e| ConfigError::Parse(e.to_string()))
     }
 
     /// Persist the current config to a file atomically. Always writes
@@ -2576,6 +2587,38 @@ impl Config {
         }
         let content = self.to_canonical_yaml_for_persist()?;
         atomic_write(std::path::Path::new(path), content.as_bytes())
+    }
+}
+
+/// Is this scalar EXACTLY a re-inserted `${env:NAME}` / `${env:NAME:-default}`
+/// reference (produced by `with_env_refs_reinserted`)? Such scalars must be left
+/// intact so the load-time expander resolves them; every other scalar is a
+/// materialized literal whose `$` must be escaped for persist.
+fn is_whole_env_ref(s: &str) -> bool {
+    s.strip_prefix("${env:")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .map(|inner| !inner.contains('{') && !inner.contains('}'))
+        .unwrap_or(false)
+}
+
+/// Escape `$`→`$$` in every materialized string scalar of the value tree so the
+/// load-time env expander (`$$`→`$`) round-trips it losslessly. Whole `${env:…}`
+/// refs are left intact (they are meant to expand). See
+/// [`Config::to_canonical_yaml_for_persist`].
+fn escape_dollar_for_persist(v: &mut serde_yaml::Value) {
+    match v {
+        serde_yaml::Value::String(s) => {
+            if !is_whole_env_ref(s) && s.contains('$') {
+                *s = s.replace('$', "$$");
+            }
+        }
+        serde_yaml::Value::Sequence(seq) => seq.iter_mut().for_each(escape_dollar_for_persist),
+        serde_yaml::Value::Mapping(map) => {
+            for (_, val) in map.iter_mut() {
+                escape_dollar_for_persist(val);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -3805,6 +3848,51 @@ storage:
             content.contains("listen_addr:"),
             "non-YAML extension must still receive YAML content, got: {content}"
         );
+    }
+
+    #[test]
+    fn dollar_literal_survives_persist_load_roundtrip() {
+        // X-ray M25: a runtime value containing `$$` or a `${env:...}`-shaped
+        // substring must round-trip through persist→load unchanged. The load
+        // path runs the env expander over the whole file, so persist must escape
+        // materialized `$` → `$$` (load's inverse recovers it).
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            listen_addr: "127.0.0.1:9098".parse().unwrap(),
+            // A scalar with both hazards: a literal `$$` and a `${env:...}`-shaped
+            // substring that must NOT be expanded. config_sync_object_key persists
+            // unredacted and isn't an env ref.
+            config_sync_bucket: Some("sync-bucket".into()),
+            config_sync_object_key: Some("pay-$$10-or-${env:SECRET_TOKEN}".into()),
+            ..Config::default()
+        };
+        let path = dir.path().join("dollar.yaml");
+        cfg.persist_to_file(path.to_str().unwrap()).unwrap();
+
+        // Load it back (no such env var set → must NOT try to expand it).
+        let loaded = Config::from_yaml_file(path.to_str().unwrap())
+            .expect("load must not choke on the escaped $ / ${env:...} literal");
+        assert_eq!(
+            loaded.config_sync_object_key.as_deref(),
+            Some("pay-$$10-or-${env:SECRET_TOKEN}"),
+            "the literal $$ and ${{env:...}} substring must survive the round-trip"
+        );
+    }
+
+    #[test]
+    fn escape_dollar_leaves_whole_env_refs_intact() {
+        // A re-inserted whole ${env:NAME} ref must NOT be escaped (it must expand
+        // on load); a materialized literal with `$` must be.
+        assert!(is_whole_env_ref("${env:FOO}"));
+        assert!(is_whole_env_ref("${env:FOO:-default}"));
+        assert!(!is_whole_env_ref("pay $$10"));
+        assert!(!is_whole_env_ref("prefix ${env:FOO} suffix")); // not a WHOLE ref
+        let mut v = serde_yaml::Value::String("${env:FOO}".into());
+        escape_dollar_for_persist(&mut v);
+        assert_eq!(v.as_str(), Some("${env:FOO}"), "whole ref left intact");
+        let mut lit = serde_yaml::Value::String("pay $$10".into());
+        escape_dollar_for_persist(&mut lit);
+        assert_eq!(lit.as_str(), Some("pay $$$$10"), "literal $ escaped to $$");
     }
 
     #[test]
