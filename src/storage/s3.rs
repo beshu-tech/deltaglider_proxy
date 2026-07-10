@@ -81,6 +81,7 @@ fn resolve_created_at(meta_value: Option<String>, fallback: DateTime<Utc>) -> Da
 enum S3Op {
     ListObjects,
     CreateBucket,
+    HeadBucket,
     PutObject,
     GetObject,
     DeleteObject,
@@ -97,6 +98,7 @@ impl std::fmt::Display for S3Op {
         match self {
             S3Op::ListObjects => write!(f, "list_objects"),
             S3Op::CreateBucket => write!(f, "create_bucket"),
+            S3Op::HeadBucket => write!(f, "head_bucket"),
             S3Op::PutObject => write!(f, "put_object"),
             S3Op::GetObject => write!(f, "get_object"),
             S3Op::DeleteObject => write!(f, "delete_object"),
@@ -115,7 +117,10 @@ impl S3Op {
     /// should be treated as BucketNotFound (S3-compatible providers like MinIO
     /// and Ceph return 403 for non-existent buckets).
     fn is_bucket_level(&self) -> bool {
-        matches!(self, S3Op::ListObjects | S3Op::CreateBucket)
+        matches!(
+            self,
+            S3Op::ListObjects | S3Op::CreateBucket | S3Op::HeadBucket
+        )
     }
 }
 
@@ -1299,7 +1304,14 @@ impl StorageBackend for S3Backend {
     async fn head_bucket(&self, bucket: &str) -> Result<bool, StorageError> {
         match self.client.head_bucket().bucket(bucket).send().await {
             Ok(_) => Ok(true),
-            Err(_) => Ok(false),
+            // Only a genuine bucket-404 → absent. A 503 SlowDown / timeout /
+            // 5xx must NOT read as absent — routing uses this to place a bucket
+            // on a backend; a transient error must not silently reroute writes
+            // to the wrong (default) backend. (Same class as has_reference.)
+            Err(e) => match Self::classify_s3_error(bucket, &e, S3Op::HeadBucket) {
+                StorageError::BucketNotFound(_) | StorageError::NotFound(_) => Ok(false),
+                other => Err(other),
+            },
         }
     }
 
@@ -2690,6 +2702,31 @@ mod tests {
             assert!(
                 !matches!(classified, StorageError::NotFound(_)),
                 "transient status {status} must NOT be NotFound (would corrupt reference.bin), got {classified:?}"
+            );
+        }
+    }
+
+    /// head_bucket routing guard: a transient HEAD-bucket failure must not
+    /// classify as BucketNotFound/NotFound — else resolve_existing reads the
+    /// bucket as "absent here" and reroutes the operation to the wrong
+    /// backend. Only a real bucket-404 is absent.
+    #[test]
+    fn transient_head_bucket_errors_are_not_bucket_not_found() {
+        for status in [503u16, 500, 429] {
+            let inner = aws_sdk_s3::operation::head_bucket::HeadBucketError::generic(
+                aws_smithy_types::error::ErrorMetadata::builder()
+                    .code("SlowDown")
+                    .build(),
+            );
+            let err: SdkError<_> =
+                SdkError::service_error(inner, http_response(status, Some("req-hb")));
+            let classified = S3Backend::classify_s3_error("bucket", &err, S3Op::HeadBucket);
+            assert!(
+                !matches!(
+                    classified,
+                    StorageError::BucketNotFound(_) | StorageError::NotFound(_)
+                ),
+                "transient status {status} must NOT be a not-found (would mis-route), got {classified:?}"
             );
         }
     }

@@ -14,6 +14,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
+use tracing::warn;
 
 use crate::types::FileMetadata;
 
@@ -228,9 +229,23 @@ impl RoutingBackend {
             return route;
         }
 
+        // A head_bucket ERROR (503/timeout) is NOT "bucket absent". Treating
+        // it as absent silently reroutes the operation to the WRONG backend —
+        // if the bucket really lives here, writes land elsewhere. So on error
+        // we ROUTE TO THIS backend (the op re-hits it and surfaces the real
+        // error to the client) rather than falling through. Only a clean
+        // Ok(false) means "genuinely not here, keep looking".
         let default = self.default_backend();
-        if default.head_bucket(virtual_bucket).await.unwrap_or(false) {
-            return (default, Cow::Borrowed(virtual_bucket));
+        match default.head_bucket(virtual_bucket).await {
+            Ok(true) => return (default, Cow::Borrowed(virtual_bucket)),
+            Err(e) => {
+                warn!(
+                    "resolve_existing: default backend head_bucket({virtual_bucket}) failed \
+                     transiently ({e}); routing to default rather than mis-routing"
+                );
+                return (default, Cow::Borrowed(virtual_bucket));
+            }
+            Ok(false) => {}
         }
 
         let mut names: Vec<&String> = self.backends.keys().collect();
@@ -240,8 +255,16 @@ impl RoutingBackend {
                 continue;
             }
             let backend = self.backends[name].as_ref().as_ref();
-            if backend.head_bucket(virtual_bucket).await.unwrap_or(false) {
-                return (backend, Cow::Borrowed(virtual_bucket));
+            match backend.head_bucket(virtual_bucket).await {
+                Ok(true) => return (backend, Cow::Borrowed(virtual_bucket)),
+                Err(e) => {
+                    warn!(
+                        "resolve_existing: backend '{name}' head_bucket({virtual_bucket}) failed \
+                         transiently ({e}); routing here rather than mis-routing to default"
+                    );
+                    return (backend, Cow::Borrowed(virtual_bucket));
+                }
+                Ok(false) => {}
             }
         }
 
