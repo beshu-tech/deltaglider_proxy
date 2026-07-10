@@ -743,8 +743,16 @@ pub fn diff_iam(yaml: &DeclarativeIam, db: &CurrentIam) -> Result<IamDiff, Strin
         .collect();
     for yp in &yaml.auth_providers {
         match db.auth_providers.iter().find(|dp| dp.name == yp.name) {
-            Some(dp) if provider_equal(dp, yp) => {}
-            Some(dp) => diff.providers_to_update.push((dp.id, yp.clone())),
+            Some(dp) => {
+                // A redacted export blanks client_secret to None. Preserve the
+                // DB secret so an export→apply round-trip doesn't wipe it
+                // (which would break the OIDC provider). Same class as the
+                // user secret_access_key preservation. (X-ray H9.)
+                let desired = desired_existing_provider(dp, yp);
+                if !provider_equal(dp, &desired) {
+                    diff.providers_to_update.push((dp.id, desired));
+                }
+            }
             None => diff.providers_to_create.push(yp.clone()),
         }
     }
@@ -832,6 +840,28 @@ fn desired_existing_user(db: &IamUser, yaml: &DeclarativeUser) -> DeclarativeUse
     }
     DeclarativeUser {
         secret_access_key: db.secret_access_key.clone(),
+        ..yaml.clone()
+    }
+}
+
+/// When the YAML provider's `client_secret` is absent (a redacted export),
+/// preserve the DB's existing secret — else an export→apply round-trip wipes
+/// it and breaks the OIDC provider. A non-empty incoming secret is a genuine
+/// rotation and passes through. (X-ray H9, mirror of `desired_existing_user`.)
+fn desired_existing_provider(
+    db: &AuthProviderConfig,
+    yaml: &DeclarativeAuthProvider,
+) -> DeclarativeAuthProvider {
+    if yaml
+        .client_secret
+        .as_deref()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+    {
+        return yaml.clone();
+    }
+    DeclarativeAuthProvider {
+        client_secret: db.client_secret.clone(),
         ..yaml.clone()
     }
 }
@@ -1307,6 +1337,52 @@ mod tests {
         assert!(
             diff.users_to_update.is_empty(),
             "redacted exported secret must not rotate existing user credentials: {diff:?}"
+        );
+    }
+
+    /// X-ray H9: a redacted export→apply must NOT wipe an OIDC provider's
+    /// client_secret. The YAML carries client_secret: None (redacted); the DB
+    /// has the real secret — the diff must preserve it (no spurious update).
+    #[test]
+    fn diff_redacted_existing_provider_secret_is_idempotent() {
+        let yaml = DeclarativeIam {
+            auth_providers: vec![DeclarativeAuthProvider {
+                name: "goog".into(),
+                provider_type: "oidc".into(),
+                enabled: true,
+                priority: 0,
+                display_name: None,
+                client_id: Some("client-123".into()),
+                client_secret: None, // redacted
+                issuer_url: Some("https://accounts.google.com".into()),
+                scopes: default_scopes(),
+                extra_config: None,
+            }],
+            ..Default::default()
+        };
+        let current = CurrentIam {
+            auth_providers: vec![AuthProviderConfig {
+                id: 1,
+                name: "goog".into(),
+                provider_type: "oidc".into(),
+                enabled: true,
+                priority: 0,
+                display_name: None,
+                client_id: Some("client-123".into()),
+                client_secret: Some("real-oidc-secret".into()),
+                issuer_url: Some("https://accounts.google.com".into()),
+                scopes: default_scopes(),
+                extra_config: None,
+                created_at: String::new(),
+                updated_at: String::new(),
+            }],
+            ..empty_db()
+        };
+
+        let diff = diff_iam(&yaml, &current).unwrap();
+        assert!(
+            diff.providers_to_update.is_empty(),
+            "redacted provider secret must not trigger an update that wipes it: {diff:?}"
         );
     }
 
