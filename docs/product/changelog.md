@@ -10,6 +10,48 @@ follow [semantic versioning](https://semver.org/); the Docker image
 
 _Last updated: 2026-07-10_
 
+## v1.14.0 — 2026-07-10
+
+The completion of the correctness/security review begun in v1.13.0 — the
+remaining edge-case findings, all fixed with regression tests. Multi-instance
+deployments and shared-host installs get the most benefit.
+
+### Fixed — data & integrity
+
+- **Multipart uploads verify each part's content at completion**, so a part file
+  tampered with on disk (shared-host attack) is rejected instead of stored.
+- **A streamed upload with an unexpected size is rejected** instead of stored
+  short, and a garbled backend error can no longer crash the notification
+  dispatcher.
+- **A deleted object can't be resurrected** by a leftover storage variant, and an
+  object addressed with an extra leading slash shares one cache entry.
+- **A backend returning HTTP 429** (Backblaze B2, Cloudflare R2) is treated as a
+  transient throttle, not a hard error.
+
+### Fixed — multi-instance / jobs
+
+- **Run-now, verify, and delete on a replication rule now see a run in progress
+  on another node** (when cluster coordination is on), preventing double-runs and
+  deleting a rule mid-run.
+- **A stuck replication consumer no longer makes the event log grow forever**, and
+  a fully-throttled small batch now backs off instead of grinding.
+- **A killed replication run no longer mis-marks a successfully-copied object** as
+  failed.
+- **A migration's source cleanup no longer stops early** when it hits a page of
+  folder markers, and a concurrent large upload's parts aren't swept by the
+  periodic cleanup.
+
+### Fixed — config & correctness
+
+- **Values containing `$` round-trip correctly** through save/reload, applying a
+  redacted export can't create a passwordless user or provider, and editing a
+  masked URL list won't restore the wrong secret.
+- **Deleting an OAuth provider on one node removes it everywhere**, and streaming
+  transfers account for their temporary disk so heavy concurrency can't exhaust
+  it.
+- Several smaller hardening fixes (codec watchdog false-kills, backend recovery
+  after a cancelled probe, parity conflict timestamps).
+
 ## v1.13.0 — 2026-07-10
 
 A correctness-and-security hardening release. A deep review of the codebase
