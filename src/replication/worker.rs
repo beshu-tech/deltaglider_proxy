@@ -551,11 +551,15 @@ pub async fn run_rule(
         let mut dest_fatal = false;
         let mut page_copied: i64 = 0;
         let mut page_throttled: i64 = 0;
+        let mut clear_failure_keys: Vec<String> = Vec::new();
         for res in object_results {
             let res = match res {
                 Ok(r) => r,
                 Err(e) => fatal_break!('pages, format!("per-object DB write failed: {e}")),
             };
+            if let Some(k) = res.clear_failure_key {
+                clear_failure_keys.push(k);
+            }
             totals.objects_copied += res.objects_copied;
             totals.objects_skipped += res.objects_skipped;
             totals.bytes_copied += res.bytes_copied;
@@ -672,6 +676,12 @@ pub async fn run_rule(
             // progress, and the page's event flush — do not split (see
             // the throughput note above).
             let db = db.lock().await;
+            // Clear the failure ledger for every durably-copied object in this
+            // page (deferred from copy_one_object so a mid-object kill can't lose
+            // it — H15). Best-effort: a clear failure must not abort the run.
+            for k in &clear_failure_keys {
+                let _ = db.replication_clear_object_failure(&rule.name, k);
+            }
             let persist = db
                 .replication_set_continuation_token(&rule.name, pager.token())
                 .and_then(|_| db.replication_update_run_progress(run_id, totals));
@@ -844,6 +854,12 @@ struct PerObjectResult {
     // Fast-path attribution for the successful copy (zero otherwise).
     delta_passthrough: i64,
     bytes_egress_saved: i64,
+    // On a DURABLE success, the source key whose failure ledger must be cleared.
+    // Deferred to the page's post-copy DB critical section (NOT cleared inside
+    // copy_one_object) so a kill dropping the collect future while an object is
+    // parked on db.lock().await can't lose the clear — which would leave a stale
+    // consecutive-failure count that later poison-skips a healthy object (H15).
+    clear_failure_key: Option<String>,
 }
 
 /// Copy one object: poison-skip check → bounded copy → record/clear the
@@ -953,10 +969,9 @@ async fn copy_one_object(
                     "source_storage_type": outcome.source_storage_label,
                 }),
             ));
-            {
-                let db = db.lock().await;
-                db.replication_clear_object_failure(rule_name, src_key)?;
-            }
+            // Defer the failure-ledger clear to the page's post-copy DB batch
+            // (durable against a mid-object kill — see clear_failure_key).
+            out.clear_failure_key = Some(src_key.to_string());
         }
         Err(e) => {
             out.errors = 1;
