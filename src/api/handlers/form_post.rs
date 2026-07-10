@@ -553,6 +553,7 @@ fn authenticate_form_post(
     iam_state: Option<&SharedIamState>,
     bucket: &str,
     parsed: &ParsedFormPost,
+    client_ip: Option<std::net::IpAddr>,
 ) -> Result<Option<AuthenticatedUser>, S3Error> {
     let Some(iam_state) = iam_state else {
         return Ok(None);
@@ -692,7 +693,17 @@ fn authenticate_form_post(
         parsed.file_data.len() as u64,
     )?;
 
-    if !auth_user.can(S3Action::Write, bucket, &parsed.resolved_key) {
+    // Build a policy context with aws:SourceIp so IP/condition-scoped Deny rules
+    // on the target prefix fire for browser uploads too — the context-free can()
+    // silently ignored them (a SigV4 PUT through the middleware would honor them).
+    let mut context = iam_rs::Context::new();
+    if let Some(ip) = client_ip {
+        context.insert(
+            "aws:SourceIp".to_string(),
+            iam_rs::ContextValue::String(ip.to_string()),
+        );
+    }
+    if !auth_user.can_with_context(S3Action::Write, bucket, &parsed.resolved_key, &context) {
         tracing::warn!(
             "form-POST DENY | reason=iam_no_write | bucket={bucket} key={} user={}",
             parsed.resolved_key,
@@ -716,6 +727,7 @@ pub async fn handle_form_post_upload(
     iam_state: Option<&SharedIamState>,
     headers: &HeaderMap,
     body: Bytes,
+    client_ip: Option<std::net::IpAddr>,
 ) -> Result<Response, S3Error> {
     // Validate the bucket name FIRST. The s3s adapter gets AWS name validation
     // for free; this interceptor bypasses s3s, so an unvalidated segment like
@@ -730,7 +742,7 @@ pub async fn handle_form_post_upload(
     check_client_write_allowed(state, bucket)?;
     ensure_bucket_exists(state, bucket).await?;
     let parsed = parse_form_post_upload(headers, body).await?;
-    let auth_user = match authenticate_form_post(iam_state, bucket, &parsed) {
+    let auth_user = match authenticate_form_post(iam_state, bucket, &parsed, client_ip) {
         Ok(u) => u,
         Err(e) => {
             // Mirror the IAM middleware's PUT-denial audit so operators can see
@@ -820,6 +832,73 @@ pub async fn handle_form_post_upload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// H18-adjacent: the form-POST write check must honor an IP-scoped Deny.
+    /// Mirrors the exact decision the handler now makes (can_with_context with
+    /// aws:SourceIp), proving a context-free can() would wrongly admit the write.
+    #[test]
+    fn form_post_write_check_honors_source_ip_scoped_deny() {
+        use crate::iam::permissions::permission_to_iam_policy;
+        use crate::iam::Permission;
+
+        let bucket = "uploads-bkt";
+        let key = "uploads/quarantine/payload.bin";
+        let allow = Permission {
+            id: 0,
+            effect: "Allow".into(),
+            actions: vec!["write".into()],
+            resources: vec![format!("{bucket}/uploads/*")],
+            conditions: None,
+        };
+        // Deny write to quarantine/* unless the request comes from 10.0.0.0/8.
+        let deny = Permission {
+            id: 0,
+            effect: "Deny".into(),
+            actions: vec!["write".into()],
+            resources: vec![format!("{bucket}/uploads/quarantine/*")],
+            conditions: Some(serde_json::json!({
+                "NotIpAddress": { "aws:SourceIp": ["10.0.0.0/8"] }
+            })),
+        };
+        let user = AuthenticatedUser {
+            name: "u".into(),
+            access_key_id: "AK".into(),
+            permissions: vec![],
+            iam_policies: vec![
+                permission_to_iam_policy(&allow),
+                permission_to_iam_policy(&deny),
+            ],
+        };
+
+        // Context-free (the OLD, buggy path): the conditioned Deny doesn't fire
+        // because aws:SourceIp is absent → the Allow wins. This is the bypass.
+        assert!(
+            user.can(S3Action::Write, bucket, key),
+            "context-free can() admits the write (the bug the fix closes)"
+        );
+
+        // External IP in context (the FIXED path): the Deny fires → blocked.
+        let mut ctx_ext = iam_rs::Context::new();
+        ctx_ext.insert(
+            "aws:SourceIp".to_string(),
+            iam_rs::ContextValue::String("1.2.3.4".to_string()),
+        );
+        assert!(
+            !user.can_with_context(S3Action::Write, bucket, key, &ctx_ext),
+            "an external IP must trip the IP-scoped Deny"
+        );
+
+        // Internal IP: the Deny's NotIpAddress condition is false → write allowed.
+        let mut ctx_int = iam_rs::Context::new();
+        ctx_int.insert(
+            "aws:SourceIp".to_string(),
+            iam_rs::ContextValue::String("10.1.2.3".to_string()),
+        );
+        assert!(
+            user.can_with_context(S3Action::Write, bucket, key, &ctx_int),
+            "an in-CIDR IP must be allowed"
+        );
+    }
 
     /// Pure-function truth table for the canned-ACL compatibility check.
     /// Boto3 default is `acl=private`; many SDK presigned-POST builders

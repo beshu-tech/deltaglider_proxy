@@ -658,6 +658,7 @@ pub fn build_s3_router(
             iam_state.as_ref(),
             &parts.headers,
             body_bytes,
+            peer_ip,
         )
         .await
         {
