@@ -506,6 +506,88 @@ async fn test_deny_overrides_allow() {
     );
 }
 
+/// X-ray H6/H26: batch DeleteObjects must enforce PER-KEY IAM authorization.
+/// The middleware only authorizes the bucket-level POST ?delete, so a prefix
+/// carve-out (`Allow delete bucket-a/*` + `Deny delete bucket-a/protected/*`)
+/// passes the bucket check — without a per-key check the protected key is
+/// silently batch-deleted.
+#[tokio::test]
+async fn test_batch_delete_enforces_prefix_carveout() {
+    let h = IamTestHarness::setup().await;
+    let admin_client = admin_http_client(&h.server.endpoint()).await;
+    let carve_user = create_iam_user(
+        &admin_client,
+        &h.server,
+        "carve_user",
+        vec![
+            json!({"effect": "Allow", "actions": ["*"], "resources": ["bucket-a/*"]}),
+            json!({"effect": "Deny", "actions": ["delete"], "resources": ["bucket-a/protected/*"]}),
+        ],
+    )
+    .await;
+
+    seed_object(&h, "bucket-a", "open/one.txt").await;
+    seed_object(&h, "bucket-a", "protected/secret.txt").await;
+
+    let client = h.client_for(&carve_user).await;
+    let out = client
+        .delete_objects()
+        .bucket("bucket-a")
+        .delete(
+            aws_sdk_s3::types::Delete::builder()
+                .objects(
+                    aws_sdk_s3::types::ObjectIdentifier::builder()
+                        .key("open/one.txt")
+                        .build()
+                        .unwrap(),
+                )
+                .objects(
+                    aws_sdk_s3::types::ObjectIdentifier::builder()
+                        .key("protected/secret.txt")
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .expect("batch delete returns 200 with mixed per-key results");
+
+    // The protected key must be denied; the open key deleted.
+    let errors = out.errors();
+    assert_eq!(
+        errors.len(),
+        1,
+        "exactly the protected key is denied: {errors:?}"
+    );
+    assert_eq!(errors[0].key(), Some("protected/secret.txt"));
+    assert_eq!(errors[0].code(), Some("AccessDenied"));
+
+    // Protected object must STILL EXIST; open object gone.
+    let admin = h.client_for(&h.admin_user).await;
+    assert!(
+        admin
+            .head_object()
+            .bucket("bucket-a")
+            .key("protected/secret.txt")
+            .send()
+            .await
+            .is_ok(),
+        "protected key must survive the batch delete"
+    );
+    assert!(
+        admin
+            .head_object()
+            .bucket("bucket-a")
+            .key("open/one.txt")
+            .send()
+            .await
+            .is_err(),
+        "open key should have been deleted"
+    );
+}
+
 // ============================================================================
 // Disabled user
 // ============================================================================

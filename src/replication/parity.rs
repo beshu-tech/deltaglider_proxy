@@ -1667,8 +1667,14 @@ mod tests {
         d.remove("b");
         let r = diff_parity(&s, &d);
         assert_eq!(r.matched, 1);
-        assert_eq!(r.missing_on_dest, 0, "no false missing from a both-sides drop");
-        assert_eq!(r.orphan_on_dest, 0, "no false orphan from a both-sides drop");
+        assert_eq!(
+            r.missing_on_dest, 0,
+            "no false missing from a both-sides drop"
+        );
+        assert_eq!(
+            r.orphan_on_dest, 0,
+            "no false orphan from a both-sides drop"
+        );
         // Contrast: a ONE-sided drop (the bug) WOULD have fabricated an orphan.
         let mut s_bug = map(&[
             ("a", st(Some("h"), 1, None, None)),

@@ -708,6 +708,12 @@ impl s3s::S3 for DeltaGliderS3Service {
         .map_err(engine_error_to_s3s)?;
         validate_delete_objects_count(input.delete.objects.len())?;
         let quiet = input.delete.quiet.unwrap_or(false);
+        // Per-key IAM authorization. The middleware only authorized the
+        // bucket-level POST ?delete; each key in the batch body must be
+        // checked individually, or a `Deny delete bucket/protected/*`
+        // carve-out (or a prefix-scoped Allow) is silently ignored and
+        // protected objects get batch-deleted. (X-ray H6/H26.)
+        let auth_user = req.extensions.get::<AuthenticatedUser>().cloned();
         let mut deleted = Vec::new();
         let mut errors = Vec::new();
         // Collect ObjectDeleted events for keys that were ACTUALLY deleted
@@ -716,6 +722,26 @@ impl s3s::S3 for DeltaGliderS3Service {
         let mut delete_events: Vec<crate::event_outbox::NewEvent> = Vec::new();
         for obj in input.delete.objects {
             let key = obj.key.trim_start_matches('/').to_string();
+            if let Some(user) = auth_user.as_ref() {
+                if !user.can(S3Action::Delete, &input.bucket, &key) {
+                    crate::audit::audit_log(
+                        "access_denied",
+                        &user.name,
+                        "DeleteObjects",
+                        &axum::http::HeaderMap::new(),
+                        &input.bucket,
+                        &key,
+                    );
+                    let s3_err: crate::api::S3Error = crate::api::S3Error::AccessDenied;
+                    errors.push(s3s::dto::Error {
+                        key: Some(obj.key),
+                        version_id: obj.version_id,
+                        code: Some(s3_err.code().to_string()),
+                        message: Some(s3_err.to_string()),
+                    });
+                    continue;
+                }
+            }
             match self.state.engine.load().delete(&input.bucket, &key).await {
                 Ok(_) => {
                     if crate::replication::event_consumer::is_user_object_key(&key) {
