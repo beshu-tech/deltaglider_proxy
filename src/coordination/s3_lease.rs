@@ -427,7 +427,10 @@ mod tests {
         // real time elapsed on a degraded backend → effective_now=103 > 102.
         let l = lease("me", "nodeA", 7, 102);
         assert!(
-            matches!(plan_renew(Some((&l, "e")), 100, "me"), RenewAction::Renew { .. }),
+            matches!(
+                plan_renew(Some((&l, "e")), 100, "me"),
+                RenewAction::Renew { .. }
+            ),
             "renewable at the stale captured now"
         );
         let effective_now = 100i64.saturating_add(3); // now + elapsed_secs

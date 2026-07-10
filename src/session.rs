@@ -428,7 +428,9 @@ impl SessionStore {
         // a revoked-but-not-yet-TTL-expired session is evicted here rather than
         // lingering in memory until its TTL — defense in depth so no future
         // epoch-handling bug can resurrect a session revoked long ago.
-        self.sessions.write().retain(|_, info| self.entry_live(info));
+        self.sessions
+            .write()
+            .retain(|_, info| self.entry_live(info));
     }
 }
 

@@ -685,7 +685,9 @@ async fn test_config_apply_rejected_iam_gate_does_not_publish_public_prefix() {
         .put_object()
         .bucket(bucket)
         .key("downloads/pub.txt")
-        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"secret-bytes"))
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(
+            b"secret-bytes",
+        ))
         .send()
         .await
         .expect("seed PUT");
@@ -737,10 +739,10 @@ async fn test_config_apply_rejected_iam_gate_does_not_publish_public_prefix() {
     let access = map
         .entry(serde_yaml::Value::String("access".into()))
         .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
-    access
-        .as_mapping_mut()
-        .unwrap()
-        .insert("iam_mode".into(), serde_yaml::Value::String("declarative".into()));
+    access.as_mapping_mut().unwrap().insert(
+        "iam_mode".into(),
+        serde_yaml::Value::String("declarative".into()),
+    );
     let modified = serde_yaml::to_string(&doc).unwrap();
 
     let resp = admin
@@ -757,7 +759,11 @@ async fn test_config_apply_rejected_iam_gate_does_not_publish_public_prefix() {
     // The would-be-public prefix must NOT be live: an anonymous GET is denied.
     let anon = reqwest::Client::new();
     let resp = anon
-        .get(format!("{}/{}/downloads/pub.txt", server.endpoint(), bucket))
+        .get(format!(
+            "{}/{}/downloads/pub.txt",
+            server.endpoint(),
+            bucket
+        ))
         .send()
         .await
         .unwrap();

@@ -535,7 +535,8 @@ async fn declarative_iam_precommit_gate(
         &new_cfg.group_mapping_rules,
     );
 
-    if matches!(old_cfg.iam_mode, crate::config_sections::IamMode::Gui) && yaml_snapshot.is_empty() {
+    if matches!(old_cfg.iam_mode, crate::config_sections::IamMode::Gui) && yaml_snapshot.is_empty()
+    {
         return Err(
             "Refusing to flip to iam_mode: declarative with empty IAM in YAML — \
              this would wipe the existing users/groups in the encrypted config DB. \

@@ -1685,8 +1685,11 @@ mod tests {
 
         let mut backends: HashMap<String, Arc<Box<dyn StorageBackend>>> = HashMap::new();
         backends.insert("primary".into(), Arc::new(Box::new(backend)));
-        let routing =
-            Arc::new(routing_with_fresh(backends, "primary", std::time::Duration::from_secs(30)));
+        let routing = Arc::new(routing_with_fresh(
+            backends,
+            "primary",
+            std::time::Duration::from_secs(30),
+        ));
 
         // Start a listing whose probe blocks mid-LIST (snapshot = {b1}).
         let r1 = routing.clone();

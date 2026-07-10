@@ -283,7 +283,10 @@ mod tests {
 
         // Give the drain time to spin; it must NOT complete while we hold the guard.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        assert!(!drain.is_finished(), "drain must block while a write is in flight");
+        assert!(
+            !drain.is_finished(),
+            "drain must block while a write is in flight"
+        );
 
         drop(guard);
         // Now it drains.
