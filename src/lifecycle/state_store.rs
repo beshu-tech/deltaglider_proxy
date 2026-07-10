@@ -136,6 +136,10 @@ impl ConfigDb {
         max_failures_retained: u32,
     ) -> Result<usize, ConfigDbError> {
         let now = crate::lifecycle::current_unix_seconds();
+        // Boot: every local lease belongs to a dead process of this node —
+        // lapse them all so a run whose holder died INSIDE its lease TTL
+        // can't dodge the zombie scan (same hole as replication's).
+        job_store::lapse_all_leases(&self.conn, "lifecycle_state")?;
         let zombies = job_store::find_zombie_runs(
             &self.conn,
             "lifecycle_run_history",

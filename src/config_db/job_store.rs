@@ -236,6 +236,26 @@ pub(crate) fn find_zombie_runs(
     Ok(rows)
 }
 
+/// Lapse EVERY leader lease on `state_table` — called at BOOT, before the
+/// zombie scan. Rationale: the coordination tables are node-local (excluded
+/// from the config-DB sync set), so any lease found here at boot was written
+/// by a dead process of THIS node. Without this, a process that died within
+/// its lease TTL spares its own zombie `running` rows from the (boot-only)
+/// scan and they read "running" forever — the prod copyHzToBackup case
+/// (2026-07-10). Revisit with a durable_node_id ownership check if these
+/// tables are ever shared across nodes.
+pub(crate) fn lapse_all_leases(conn: &Connection, state_table: &str) -> Result<(), ConfigDbError> {
+    check_idents(&[state_table])?;
+    conn.execute(
+        &format!(
+            "UPDATE {state_table} SET leader_expires_at = 0
+              WHERE leader_expires_at IS NOT NULL"
+        ),
+        [],
+    )?;
+    Ok(())
+}
+
 /// Settle one zombie run-history row: a crashed 'cancelling' run becomes
 /// `cancelled` (the operator's kill is authoritative — same rule as
 /// maintenance_requeue_abandoned); a crashed 'running' run becomes `failed`.
@@ -454,6 +474,30 @@ mod tests {
             .query_row("SELECT status FROM runs WHERE id=?", [r3_id], |r| r.get(0))
             .unwrap();
         assert_eq!(status, "cancelled");
+    }
+
+    #[test]
+    fn boot_lease_lapse_unmasks_zombie_within_ttl() {
+        // The prod copyHzToBackup case (2026-07-10): the process died INSIDE
+        // its lease TTL, so at boot the lease still looked live and the
+        // boot-only zombie scan spared the 'running' row — forever. Boot must
+        // lapse all local leases first (they can only belong to a dead
+        // process of this node), then the scan settles the row.
+        let c = conn();
+        c.execute_batch(
+            "INSERT INTO runs (rule_name, started_at, status) VALUES ('r1', 10, 'running');
+             INSERT INTO run_state (rule_name, leader_instance_id, leader_expires_at)
+             VALUES ('r1', 'dead-prior-self', 9999);",
+        )
+        .unwrap();
+        // Without the lapse, the live-looking lease spares the zombie (now=100 < 9999).
+        assert!(find_zombie_runs(&c, "runs", "run_state", 100)
+            .unwrap()
+            .is_empty());
+        // Boot lapse → the same scan finds it.
+        lapse_all_leases(&c, "run_state").unwrap();
+        let z = find_zombie_runs(&c, "runs", "run_state", 100).unwrap();
+        assert_eq!(z, vec![(1, "r1".to_string(), 10)]);
     }
 
     #[test]
