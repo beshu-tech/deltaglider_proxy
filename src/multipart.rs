@@ -48,12 +48,29 @@ enum PartPayload {
 }
 
 impl PartPayload {
-    fn load_bytes(&self) -> Result<Bytes, S3Error> {
+    /// Load the part bytes. For a RELAYED file, re-hash the content and verify it
+    /// against the MD5 recorded at UploadPart time (`expected_md5`). The relay dir
+    /// lives under a fixed world-known temp path; on a shared host a local attacker
+    /// who pre-creates it owns the parent and could swap a 0600 part file between
+    /// UploadPart and Complete. Re-verifying on read closes that substitution
+    /// (the stored object would otherwise carry attacker bytes under a valid ETag).
+    fn load_bytes(&self, expected_md5: &[u8; 16]) -> Result<Bytes, S3Error> {
         match self {
             Self::InMemory(bytes) => Ok(bytes.clone()),
-            Self::RelayedFile(path) => fs::read(path)
-                .map(Bytes::from)
-                .map_err(|e| S3Error::InternalError(format!("Failed to read relayed part: {}", e))),
+            Self::RelayedFile(path) => {
+                let bytes = fs::read(path).map(Bytes::from).map_err(|e| {
+                    S3Error::InternalError(format!("Failed to read relayed part: {}", e))
+                })?;
+                let actual: [u8; 16] = Md5::digest(&bytes).into();
+                if &actual != expected_md5 {
+                    return Err(S3Error::InternalError(
+                        "relayed multipart part failed integrity check (content changed on disk \
+                         since upload)"
+                            .to_string(),
+                    ));
+                }
+                Ok(bytes)
+            }
         }
     }
 }
@@ -722,7 +739,7 @@ impl MultipartStore {
 
             md5_concat.extend_from_slice(&part.md5_raw);
             if hydrate_part_data {
-                part_data.push(part.payload.load_bytes()?);
+                part_data.push(part.payload.load_bytes(&part.md5_raw)?);
             }
         }
 
@@ -1102,7 +1119,24 @@ fn ordered_relay_part_paths(
             S3Error::InvalidPart(format!("Part {} has not been uploaded", part_number))
         })?;
         match &part.payload {
-            PartPayload::RelayedFile(path) => paths.push(path.clone()),
+            PartPayload::RelayedFile(path) => {
+                // Re-verify content vs the MD5 recorded at UploadPart before the
+                // engine streams these paths (the streamed path never re-hashes
+                // against the per-part digest). Closes the shared-host local-
+                // attacker part-substitution the buffered load_bytes now guards.
+                let bytes = fs::read(path).map_err(|e| {
+                    S3Error::InternalError(format!("Failed to read relayed part: {}", e))
+                })?;
+                let actual: [u8; 16] = Md5::digest(&bytes).into();
+                if actual != part.md5_raw {
+                    return Err(S3Error::InternalError(
+                        "relayed multipart part failed integrity check (content changed on disk \
+                         since upload)"
+                            .to_string(),
+                    ));
+                }
+                paths.push(path.clone());
+            }
             PartPayload::InMemory(_) => {
                 return Err(S3Error::InternalError(
                     "Relay upload contains in-memory part unexpectedly".to_string(),
@@ -1963,6 +1997,29 @@ mod tests {
         );
         assert_eq!(dirs_removed, 0, "a recent dir must be spared by min_age");
         assert!(fresh_orphan.exists(), "the in-flight relay dir must survive");
+    }
+
+    #[test]
+    fn relayed_part_load_bytes_rejects_substituted_content() {
+        // H20: a relay part file swapped on disk (shared-host local attacker)
+        // must be REJECTED at read time — the recorded MD5 no longer matches.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("part-00001.bin");
+        let good = Bytes::from_static(b"the-real-part-bytes");
+        fs::write(&path, &good).unwrap();
+        let expected: [u8; 16] = Md5::digest(&good).into();
+
+        let payload = PartPayload::RelayedFile(path.clone());
+        // Untouched → loads fine.
+        assert_eq!(payload.load_bytes(&expected).unwrap(), good);
+
+        // Attacker swaps the file content → integrity check fails.
+        fs::write(&path, b"attacker-controlled-bytes").unwrap();
+        let err = payload.load_bytes(&expected).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("integrity check"),
+            "substituted part must be rejected, got {err:?}"
+        );
     }
 
     #[test]
