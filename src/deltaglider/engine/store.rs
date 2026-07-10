@@ -442,7 +442,17 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // ONE timed, combined reservation for both spools (ref + delta) — two raw
         // sequential acquire()s self-deadlock when 2×size > budget, the exact
         // class the GET path uses acquire_pair to prevent (mega-review finding).
-        let (ref_spool, delta_spool) = self.spool_acquire_pair(size, size).await?;
+        // The ref spool holds the REFERENCE, which can be larger than this object
+        // — reserve it at the reference's actual size so the byte-budget isn't
+        // under-accounted under concurrency (→ ENOSPC). Falls back to `size` for
+        // a freshly-created baseline (no reference metadata yet).
+        let ref_size = self
+            .storage
+            .get_reference_metadata(bucket, &deltaspace_id)
+            .await
+            .map(|m| m.file_size)
+            .unwrap_or(size);
+        let (ref_spool, delta_spool) = self.spool_acquire_pair(ref_size, size).await?;
         self.storage
             .get_reference_to_file(bucket, &deltaspace_id, ref_spool.path())
             .await?;

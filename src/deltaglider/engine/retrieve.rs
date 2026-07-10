@@ -256,8 +256,20 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // never hold one spool while waiting for the other (x-ray blocker). Timed
         // (shared with the PUT/POST path) so a saturated budget SlowDowns instead
         // of parking the request forever.
+        //
+        // The ref spool holds the REFERENCE baseline, which can be far larger
+        // than this delta object — reserving object_size for it under-accounts
+        // the disk (up to max_object_size per request), defeating the byte-budget
+        // under concurrency → ENOSPC. Reserve the ref spool at the reference's
+        // actual size (out spool stays object-sized: the reconstructed object).
+        let ref_size = self
+            .storage
+            .get_reference_metadata(bucket, deltaspace_id)
+            .await
+            .map(|m| m.file_size)
+            .unwrap_or(metadata.file_size);
         let (ref_spool, out_spool) = self
-            .spool_acquire_pair(metadata.file_size, metadata.file_size)
+            .spool_acquire_pair(ref_size, metadata.file_size)
             .await?;
 
         // Materialise the reference as a seekable file WITHOUT heap-loading it
