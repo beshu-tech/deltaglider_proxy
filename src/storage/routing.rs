@@ -333,9 +333,18 @@ impl RoutingBackend {
                         ));
                     }
                     Some((_, last_err)) => {
-                        // Deadline expired → re-arm now; this request re-probes.
+                        // Deadline expired → this request re-probes. Re-arm for only
+                        // the PROBE WINDOW (list_timeout + margin), not a full
+                        // cooldown: the re-arm just dedups concurrent probers. If
+                        // this prober's future is CANCELLED before the health update
+                        // (client disconnect), a full-cooldown re-arm would pin the
+                        // recovered backend as "in cooldown" with the stale error for
+                        // the whole period; a short re-arm lets another request
+                        // re-probe promptly (H8). A SUCCESSFUL probe clears cooldown
+                        // outright; a real failure re-arms the full cooldown below.
+                        let probe_window = self.list_timeout + std::time::Duration::from_secs(1);
                         h.cooldown
-                            .insert(name.clone(), (now + self.list_cooldown, last_err));
+                            .insert(name.clone(), (now + probe_window, last_err));
                         to_probe.push(name);
                     }
                     None => to_probe.push(name),
