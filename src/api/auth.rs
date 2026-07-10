@@ -147,6 +147,14 @@ pub fn replay_decision(method: &axum::http::Method, is_duplicate: bool) -> Repla
 #[derive(Debug, Clone)]
 pub struct SignedPayloadHash(pub String);
 
+/// The resolved client IP for this request (peer-aware, honoring trusted-proxy
+/// XFF), injected into request extensions so handlers that run a SECOND
+/// authorization the middleware never saw — e.g. CopyObject's source-read
+/// check — can build a policy context with `aws:SourceIp` and honor IP-scoped
+/// conditions. Without it those checks silently ignore IP conditions.
+#[derive(Debug, Clone)]
+pub struct RequestClientIp(pub std::net::IpAddr);
+
 impl SignedPayloadHash {
     /// Returns the inner header value lowercase-trimmed (header
     /// values are sometimes uppercase from older SDKs).
@@ -883,6 +891,13 @@ pub async fn sigv4_auth_middleware(
     if let Some(user) = authenticated_user {
         debug!("SigV4: authenticated user '{}'", user.name);
         request.extensions_mut().insert(user);
+    }
+
+    // Stash the resolved client IP so handlers running a SECONDARY authz the
+    // authorization middleware never sees (CopyObject source-read) can build a
+    // policy context with aws:SourceIp and honor IP-scoped conditions.
+    if let Some(ip) = client_ip {
+        request.extensions_mut().insert(RequestClientIp(ip));
     }
 
     // H1 SigV4 fix: stash the verified `x-amz-content-sha256` so the

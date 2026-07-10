@@ -914,7 +914,11 @@ impl s3s::S3 for DeltaGliderS3Service {
         let auth_user = req.extensions.get::<AuthenticatedUser>().cloned();
         let input = req.input;
         let (source_bucket, source_key) = copy_source_bucket_key(&input.copy_source)?;
-        check_copy_source_access_s3s(auth_user.as_ref(), &source_bucket, &source_key)?;
+        let client_ip = req
+            .extensions
+            .get::<crate::api::auth::RequestClientIp>()
+            .map(|c| c.0);
+        check_copy_source_access_s3s(auth_user.as_ref(), &source_bucket, &source_key, client_ip)?;
         // Gate on the DESTINATION bucket first — copy-into is a client write,
         // refused regardless of backend reachability (403-before-404).
         crate::api::handlers::object_helpers::check_client_write_allowed(
@@ -1327,7 +1331,11 @@ impl s3s::S3 for DeltaGliderS3Service {
         let auth_user = req.extensions.get::<AuthenticatedUser>().cloned();
         let input = req.input;
         let (source_bucket, source_key) = copy_source_bucket_key(&input.copy_source)?;
-        check_copy_source_access_s3s(auth_user.as_ref(), &source_bucket, &source_key)?;
+        let client_ip = req
+            .extensions
+            .get::<crate::api::auth::RequestClientIp>()
+            .map(|c| c.0);
+        check_copy_source_access_s3s(auth_user.as_ref(), &source_bucket, &source_key, client_ip)?;
         // Gate on the DESTINATION bucket — part-copy feeds a client write
         // (403-before-404, no backend I/O for a doomed request).
         crate::api::handlers::object_helpers::check_client_write_allowed(
@@ -1565,11 +1573,22 @@ fn check_copy_source_access_s3s(
     auth_user: Option<&AuthenticatedUser>,
     source_bucket: &str,
     source_key: &str,
+    client_ip: Option<std::net::IpAddr>,
 ) -> s3s::S3Result<()> {
     let Some(user) = auth_user else {
         return Ok(());
     };
-    if user.can(S3Action::Read, source_bucket, source_key) {
+    // Build a policy context with aws:SourceIp so IP-scoped conditions on the
+    // source (e.g. Deny read unless from an office CIDR) actually fire. Using
+    // the context-free can() here silently ignored those conditions (X-ray H17).
+    let mut context = iam_rs::Context::new();
+    if let Some(ip) = client_ip {
+        context.insert(
+            "aws:SourceIp".to_string(),
+            iam_rs::ContextValue::String(ip.to_string()),
+        );
+    }
+    if user.can_with_context(S3Action::Read, source_bucket, source_key, &context) {
         return Ok(());
     }
     crate::audit::audit_log(
@@ -2084,6 +2103,61 @@ fn parse_s3s_etag(etag: &str) -> s3s::S3Result<s3s::dto::ETag> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// X-ray H17: CopyObject source-read auth must honor IP-scoped conditions.
+    /// The context-free can() ignored aws:SourceIp; can_with_context + the
+    /// threaded client IP fixes it.
+    #[test]
+    fn copy_source_access_honors_source_ip_condition() {
+        use crate::iam::permissions::permission_to_iam_policy;
+        use crate::iam::types::Permission;
+        // Allow * ; Deny read when SourceIp ∈ 10.0.0.0/8.
+        let allow = Permission {
+            id: 0,
+            effect: "Allow".into(),
+            actions: vec!["*".into()],
+            resources: vec!["*".into()],
+            conditions: None,
+        };
+        let deny_ip = Permission {
+            id: 1,
+            effect: "Deny".into(),
+            actions: vec!["read".into()],
+            resources: vec!["*".into()],
+            conditions: Some(serde_json::json!({"IpAddress": {"aws:SourceIp": "10.0.0.0/8"}})),
+        };
+        let user = AuthenticatedUser {
+            name: "u".into(),
+            access_key_id: "AKIA".into(),
+            permissions: vec![],
+            iam_policies: [allow, deny_ip]
+                .iter()
+                .map(permission_to_iam_policy)
+                .collect(),
+        };
+        // From a denied IP → AccessDenied (was silently allowed before the fix).
+        assert!(
+            check_copy_source_access_s3s(
+                Some(&user),
+                "src",
+                "k",
+                Some("10.1.2.3".parse().unwrap())
+            )
+            .is_err(),
+            "IP-scoped Deny on the source must be enforced"
+        );
+        // From an allowed IP → Ok.
+        assert!(
+            check_copy_source_access_s3s(
+                Some(&user),
+                "src",
+                "k",
+                Some("192.168.1.1".parse().unwrap())
+            )
+            .is_ok(),
+            "an IP outside the Deny CIDR must be allowed"
+        );
+    }
 
     fn assert_s3_service<T: s3s::S3>() {}
 
