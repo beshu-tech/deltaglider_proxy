@@ -380,7 +380,11 @@ pub fn spawn_dispatcher_with_client(
             let cfg = { config.read().await.event_delivery.clone() };
             tokio::time::sleep(dispatcher_tick(&cfg)).await;
             if !cfg.is_active() {
-                debug!("Event outbox dispatcher skipped: disabled");
+                // Delivery disabled — but STILL prune the outbox below the
+                // active-listener floor, or pending rows consumed by
+                // replication (but never delivered) grow without bound
+                // (X-ray H14). No dispatch, just the floor prune.
+                prune_below_floor(&db, &cfg, current_unix_seconds()).await;
                 continue;
             }
             dispatch_once(
@@ -393,6 +397,21 @@ pub fn spawn_dispatcher_with_client(
             .await;
         }
     })
+}
+
+/// Prune outbox rows at or below the active-listener floor, regardless of
+/// whether delivery is active. Bounds the append-only outbox when delivery is
+/// disabled (pending rows consumed by replication but never delivered).
+pub async fn prune_below_floor(db: &Arc<Mutex<ConfigDb>>, config: &EventDeliveryConfig, now: i64) {
+    let batch = config.prune_batch.max(1);
+    let db = db.lock().await;
+    let min_keep_id = db
+        .event_outbox_min_active_listener_cursor(now, LISTENER_CURSOR_STALE_SECS)
+        .unwrap_or(None)
+        .unwrap_or(i64::MAX);
+    if let Err(err) = db.event_outbox_prune_below_floor(min_keep_id, batch) {
+        warn!("Event outbox floor prune failed: {}", err);
+    }
 }
 
 pub async fn dispatch_once(
@@ -494,6 +513,12 @@ pub async fn dispatch_once(
             min_keep_id,
         ) {
             warn!("Event outbox delivered count-prune failed: {}", err);
+        }
+        // Also prune any-status rows fully below the floor (consumed by every
+        // active listener), so pending rows that were consumed but not
+        // delivered don't accumulate.
+        if let Err(err) = db.event_outbox_prune_below_floor(min_keep_id, config.prune_batch) {
+            warn!("Event outbox floor prune failed: {}", err);
         }
     }
 }

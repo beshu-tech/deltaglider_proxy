@@ -659,6 +659,42 @@ impl ConfigDb {
         Ok(deleted)
     }
 
+    /// Prune every row (any status) AT OR BELOW the active-listener floor: those
+    /// events have been consumed by every live listener (replication, delivery),
+    /// so no one needs them. Unlike the delivered/failed prunes this does NOT
+    /// require delivery to be active — it bounds the append-only outbox even
+    /// when event delivery is DISABLED, where pending rows are consumed by
+    /// replication but never marked delivered (X-ray H14). `min_keep_id` is the
+    /// smallest active-listener cursor; pass 0 (no active listeners → nothing
+    /// consumed yet) to prune nothing.
+    pub fn event_outbox_prune_below_floor(
+        &self,
+        min_keep_id: i64,
+        limit: u32,
+    ) -> Result<usize, ConfigDbError> {
+        // Guard the i64::MAX sentinel: "no active listener cursor" must NOT mean
+        // "prune everything" here. This prune targets rows CONSUMED by a real
+        // listener (an advanced cursor); with no such cursor there's nothing to
+        // safely prune (delivery's own claim/mark-delivered path handles its
+        // rows, and those aren't consumed-pending). The delivered/failed prunes
+        // legitimately treat MAX as "no floor" because they gate on terminal
+        // status; this one gates on nothing, so it must be conservative.
+        if limit == 0 || min_keep_id <= 0 || min_keep_id == i64::MAX {
+            return Ok(0);
+        }
+        let deleted = self.conn.execute(
+            "DELETE FROM event_outbox
+              WHERE id IN (
+                    SELECT id FROM event_outbox
+                     WHERE id <= ?
+                     ORDER BY id ASC
+                     LIMIT ?
+              )",
+            params![min_keep_id, limit as i64],
+        )?;
+        Ok(deleted)
+    }
+
     fn event_outbox_load(&self, id: i64) -> Result<Option<EventOutboxRecord>, ConfigDbError> {
         let row = self
             .conn
@@ -1266,5 +1302,27 @@ mod tests {
         assert_eq!(deleted, 1);
         assert!(db.event_outbox_load(a).unwrap().is_none());
         assert!(db.event_outbox_load(b).unwrap().is_some());
+    }
+
+    /// X-ray H14: with delivery DISABLED, PENDING rows below the active-listener
+    /// floor (consumed by replication but never delivered) must be prunable, or
+    /// the outbox grows without bound. The delivered/failed prunes can't touch
+    /// them (they require status=delivered/failed); prune_below_floor can.
+    #[test]
+    fn prune_below_floor_removes_consumed_pending_rows() {
+        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let a = db.event_outbox_insert(&event_at(10, "a")).unwrap();
+        let b = db.event_outbox_insert(&event_at(20, "b")).unwrap();
+        let c = db.event_outbox_insert(&event_at(30, "c")).unwrap();
+        // All still PENDING (delivery disabled — nothing was delivered).
+        // Replication consumed through `b`.
+        // Floor = b: a and b are at-or-below → pruned; c survives.
+        let deleted = db.event_outbox_prune_below_floor(b, 100).unwrap();
+        assert_eq!(deleted, 2, "pending rows <= floor must be pruned");
+        assert!(db.event_outbox_load(a).unwrap().is_none());
+        assert!(db.event_outbox_load(b).unwrap().is_none());
+        assert!(db.event_outbox_load(c).unwrap().is_some());
+        // Floor 0 (no active listener has consumed anything) prunes nothing.
+        assert_eq!(db.event_outbox_prune_below_floor(0, 100).unwrap(), 0);
     }
 }
