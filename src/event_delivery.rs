@@ -582,10 +582,17 @@ pub(crate) fn delivered_retention_secs(config: &EventDeliveryConfig) -> i64 {
 fn truncate_error(error: &str) -> String {
     const MAX_ERROR_LEN: usize = 1000;
     if error.len() <= MAX_ERROR_LEN {
-        error.to_string()
-    } else {
-        format!("{}...", &error[..MAX_ERROR_LEN])
+        return error.to_string();
     }
+    // Slice on a CHAR boundary: a naive `&error[..1000]` panics when byte 1000
+    // lands mid-UTF-8-char (e.g. a backend error carrying multi-byte text),
+    // which would kill the delivery dispatcher permanently. Walk back to the
+    // nearest boundary at or below the cap.
+    let mut end = MAX_ERROR_LEN;
+    while end > 0 && !error.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &error[..end])
 }
 
 pub fn known_status(status: &str) -> bool {
@@ -599,6 +606,21 @@ pub fn known_status(status: &str) -> bool {
 mod tests {
     use super::*;
     use crate::config_db::ConfigDb;
+
+    #[test]
+    fn truncate_error_never_panics_on_multibyte_boundary() {
+        // A multi-byte char straddling the 1000-byte cap must not panic.
+        let s = format!("{}é{}", "a".repeat(999), "b".repeat(50));
+        let out = truncate_error(&s);
+        assert!(out.ends_with("..."));
+        assert!(out.len() <= 1003);
+        // A short string is returned verbatim.
+        assert_eq!(truncate_error("short"), "short");
+        // An all-multibyte string longer than the cap still truncates cleanly.
+        let multi = "€".repeat(500); // 1500 bytes
+        let out = truncate_error(&multi);
+        assert!(out.ends_with("..."));
+    }
     use crate::event_outbox::{EventKind, EventSource, NewEvent};
     use axum::{
         http::{HeaderMap, StatusCode},
