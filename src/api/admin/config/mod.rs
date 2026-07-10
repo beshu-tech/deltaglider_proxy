@@ -193,6 +193,11 @@ fn engine_affecting_fields_changed(
         || old.cache_size_mb != new.cache_size_mb
         || old.max_delta_ratio != new.max_delta_ratio
         || old.metadata_cache_mb != new.metadata_cache_mb
+        // The engine snapshots these at construction (engine/mod.rs), so a
+        // change is a silent no-op without a rebuild (reported applied:true but
+        // the running engine keeps the old limit / codec parallelism).
+        || old.max_passthrough_object_size != new.max_passthrough_object_size
+        || old.codec_concurrency != new.codec_concurrency
 }
 
 /// Side effects of transitioning the runtime config from `old` to `new`.
@@ -576,6 +581,20 @@ pub(super) fn requires_restart_warnings(
             "cache_size_mb changed to {} — restart required",
             new.cache_size_mb
         ));
+    }
+    // TLS is bound once at startup (tls.rs) and config_sync_bucket launches its
+    // poller once at startup — neither is re-read on hot-apply, so a change here
+    // is applied to config/disk but has NO runtime effect until restart. Without
+    // this warning the operator believes TLS is on / sync is enabled when it is
+    // not (silent no-op reported as success).
+    if old.tls != new.tls {
+        out.push("tls config changed — restart required to (re)bind the listener".to_string());
+    }
+    if old.config_sync_bucket != new.config_sync_bucket {
+        out.push(
+            "config_sync_bucket changed — restart required to (re)start the sync poller"
+                .to_string(),
+        );
     }
     out
 }
@@ -1080,6 +1099,64 @@ mod preserve_tests {
                 .collect(),
             ..EventDeliveryConfig::default()
         }
+    }
+
+    #[test]
+    fn engine_affecting_includes_passthrough_size_and_codec_concurrency() {
+        // These are engine-snapshotted at construction; a change must force a
+        // rebuild or the new value is a silent no-op (X-ray M4).
+        let base = crate::config::Config::default();
+
+        let mut bigger = base.clone();
+        bigger.max_passthrough_object_size = base.max_passthrough_object_size + 1;
+        assert!(
+            engine_affecting_fields_changed(&base, &bigger),
+            "max_passthrough_object_size change must trigger an engine rebuild"
+        );
+
+        let mut codec = base.clone();
+        codec.codec_concurrency = Some(base.codec_concurrency.unwrap_or(4) + 1);
+        assert!(
+            engine_affecting_fields_changed(&base, &codec),
+            "codec_concurrency change must trigger an engine rebuild"
+        );
+
+        // Sanity: an unrelated field (log_level) must NOT trigger a rebuild.
+        let mut logonly = base.clone();
+        logonly.log_level = "debug".to_string();
+        assert!(!engine_affecting_fields_changed(&base, &logonly));
+    }
+
+    #[test]
+    fn restart_warnings_cover_tls_and_config_sync_bucket() {
+        // Both are bound once at startup; a change must WARN restart-required or
+        // the operator believes TLS/sync is on when it is not (X-ray M-adjacent).
+        let base = crate::config::Config::default();
+
+        let mut tls = base.clone();
+        tls.tls = Some(crate::config::TlsConfig {
+            enabled: true,
+            cert_path: None,
+            key_path: None,
+        });
+        assert!(
+            requires_restart_warnings(&base, &tls)
+                .iter()
+                .any(|w| w.contains("tls")),
+            "a TLS change must emit a restart-required warning"
+        );
+
+        let mut sync = base.clone();
+        sync.config_sync_bucket = Some("dgp-sync".to_string());
+        assert!(
+            requires_restart_warnings(&base, &sync)
+                .iter()
+                .any(|w| w.contains("config_sync_bucket")),
+            "a config_sync_bucket change must emit a restart-required warning"
+        );
+
+        // No change → no warnings.
+        assert!(requires_restart_warnings(&base, &base).is_empty());
     }
 
     #[test]
