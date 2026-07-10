@@ -455,6 +455,17 @@ pub async fn run_rule(
 
         totals.objects_skipped += plan.skipped.len() as i64;
 
+        // Register this page's dest writes with the maintenance gate BEFORE the
+        // busy check, so the acquire-then-recheck closes the TOCTOU with a
+        // maintenance job arming concurrently (H22): either our +1 is visible to
+        // its drain_inflight_writes (it waits for this page), or ctrl.check below
+        // sees is_busy and we defer with the guard dropped and no copies done.
+        // The per-page barrier bounds how long a drain can wait on us.
+        let _page_write = ctrl
+            .maintenance_gate
+            .as_ref()
+            .map(|g| g.begin_write(&ctrl.dest_bucket));
+
         // Renew the lease ONCE before the page's concurrent copy batch.
         // The independent heartbeat task keeps it alive during the batch;
         // the post-batch check re-reads it. Events flush post-loop.

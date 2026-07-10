@@ -263,6 +263,37 @@ mod tests {
         assert_eq!(g.inflight_writes("b"), 0);
     }
 
+    #[tokio::test]
+    async fn drain_style_poll_waits_for_a_held_write_guard() {
+        // Models the H22 contract: a background copy (replication/lifecycle) that
+        // holds a begin_write guard keeps inflight_writes>0, so a maintenance
+        // drain_inflight_writes-style poll BLOCKS until the copy's guard drops —
+        // it cannot drain-through and rewrite the same key mid-copy.
+        let g = Arc::new(MaintenanceGate::new());
+        let guard = g.begin_write("b");
+        assert_eq!(g.inflight_writes("b"), 1);
+
+        // A drain poll on another task: completes only once the guard is dropped.
+        let g2 = Arc::clone(&g);
+        let drain = tokio::spawn(async move {
+            while g2.inflight_writes("b") > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        });
+
+        // Give the drain time to spin; it must NOT complete while we hold the guard.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!drain.is_finished(), "drain must block while a write is in flight");
+
+        drop(guard);
+        // Now it drains.
+        tokio::time::timeout(std::time::Duration::from_secs(1), drain)
+            .await
+            .expect("drain must complete once the guard drops")
+            .unwrap();
+        assert_eq!(g.inflight_writes("b"), 0);
+    }
+
     #[test]
     fn bucket_from_path_shapes() {
         assert_eq!(bucket_from_path("/"), None);

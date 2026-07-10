@@ -279,6 +279,14 @@ async fn run_or_preview(
     };
 
     'pages: while let Some(page_idx) = pager.begin_page() {
+        // Acquire the gate write-window BEFORE the busy check (acquire-then-
+        // recheck) so a concurrently-arming maintenance drain either waits for
+        // this page's writes or we defer below with the guards dropped (H22).
+        let _write_windows = if execute {
+            begin_write_windows(rule, maintenance_gate.as_ref())
+        } else {
+            Vec::new()
+        };
         // Mid-run maintenance defer: if a write bucket (source or transition
         // dest) becomes gated mid-run, stop — cursor preserved, resumes when the
         // maintenance job clears. Mirrors the replication RunControl fix (#12);
@@ -636,6 +644,20 @@ async fn run_or_preview_retain_newest(
         return Ok(out);
     }
 
+    // Register the delete window with the gate for the whole act loop so a
+    // reencrypt/migrate drain waits for it instead of racing our deletes (H22).
+    let _write_windows = begin_write_windows(rule, maintenance_gate.as_ref());
+    // Re-check after acquiring: if a job armed between collect and here, defer
+    // the entire act phase rather than delete into a bucket being rewritten.
+    if maintenance_write_bucket_busy(rule, maintenance_gate.as_ref()) {
+        info!(
+            "lifecycle rule '{}' retain-newest deferring act phase — a write bucket is under \
+             maintenance; no objects deleted this run",
+            rule.name
+        );
+        return Ok(out);
+    }
+
     for c in &plan.delete {
         // TOCTOU guard: the ranking used a snapshot taken during collect. If the
         // object was OVERWRITTEN between collect and now (same key, newer
@@ -851,6 +873,25 @@ fn maintenance_write_bucket_busy(
     super::planner::rule_write_buckets(rule)
         .into_iter()
         .any(|b| gate.is_busy(b))
+}
+
+/// Register this rule's write buckets with the maintenance gate for the
+/// duration of a write window, so a reencrypt/migrate job that arms concurrently
+/// has its drain_inflight_writes WAIT for our in-flight writes instead of racing
+/// engine.store/delete on the same key (H22). Acquire BEFORE the is_busy check
+/// so the acquire-then-recheck closes the TOCTOU: either our +1 is visible to
+/// the drain, or the busy check sees the job and we defer with guards dropped.
+fn begin_write_windows(
+    rule: &LifecycleRule,
+    gate: Option<&Arc<crate::maintenance::gate::MaintenanceGate>>,
+) -> Vec<crate::maintenance::gate::WriteGuard> {
+    match gate {
+        None => Vec::new(),
+        Some(gate) => super::planner::rule_write_buckets(rule)
+            .into_iter()
+            .map(|b| gate.begin_write(b))
+            .collect(),
+    }
 }
 
 async fn renew_run_lease(
