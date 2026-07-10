@@ -16,7 +16,7 @@ curl -s -b /tmp/dgp.cookies \
   https://s3.acme.example/_/api/admin/config/declarative-iam-export > iam.yaml
 ```
 
-Secrets are redacted on the way out (`secret_access_key: ""`, `client_secret: null`) — re-inject them before applying (step 4). Entities reference each other **by name**, never by DB id:
+Secrets are redacted on the way out (`secret_access_key: ""`, `client_secret: null`) — re-inject them before applying (step 4). Applying an export with an empty secret for a user or provider that does **not** already exist is rejected (it would onboard an identity that could never authenticate); an empty secret for an *existing* entity is preserved from the DB, so re-applying a redacted export as an idempotent no-op is fine. Entities reference each other **by name**, never by DB id:
 
 ```yaml
 access:

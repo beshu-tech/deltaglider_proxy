@@ -307,7 +307,7 @@ Maximum concurrent xdelta3 subprocesses. Auto-detected as `num_cpus * 4` (min 16
 | **Env var** | `DGP_CODEC_CONCURRENCY` |
 | **YAML** | `advanced.codec_concurrency` |
 | **Default** | `num_cpus * 4` (min 16) |
-| **Hot-reload** | No |
+| **Hot-reload** | Yes (triggers engine rebuild) |
 
 ### `codec_timeout_secs`
 
@@ -619,6 +619,8 @@ advanced:
 
 When `cert_path` and `key_path` are both absent, a self-signed certificate is generated on startup.
 
+TLS is bound once at startup — a `tls.*` change applied at runtime (admin API / `config apply`) is persisted but does **not** take effect until you restart the proxy. The apply response flags this with a `requires_restart` warning.
+
 ---
 
 ## Config sync
@@ -637,6 +639,8 @@ advanced:
 ```
 
 Sync uses the same S3 credentials as the storage backend (`DGP_BE_AWS_*`) and only works when the storage backend is S3 (not filesystem). On every IAM mutation, the DB is uploaded to `s3://<bucket>/.deltaglider/config.db`; readers poll the S3 ETag every 5 minutes and download on change.
+
+The sync poller starts once at boot — enabling or changing `config_sync_bucket` at runtime is persisted but does **not** take effect until restart (the apply response flags this with a `requires_restart` warning).
 
 ---
 
