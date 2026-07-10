@@ -1619,6 +1619,35 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         Ok(self.storage.head_bucket(bucket).await?)
     }
 
+    /// Best-effort delete of the sibling storage variant (the one NOT matched by
+    /// resolve_metadata) so a stale passthrough/delta pair can't resurrect a
+    /// deleted key. NotFound (the normal case — only one variant exists) and
+    /// transient errors are swallowed with a debug log; the primary delete's
+    /// result is authoritative.
+    async fn delete_sibling_variant_best_effort(
+        &self,
+        bucket: &str,
+        deltaspace_id: &str,
+        filename: &str,
+        delete_delta: bool,
+    ) {
+        let res = if delete_delta {
+            self.storage.delete_delta(bucket, deltaspace_id, filename).await
+        } else {
+            self.storage
+                .delete_passthrough(bucket, deltaspace_id, filename)
+                .await
+        };
+        if let Err(e) = res {
+            if !matches!(e, StorageError::NotFound(_)) {
+                debug!(
+                    "sibling-variant cleanup for {}/{}/{} (delta={}) failed: {}",
+                    bucket, deltaspace_id, filename, delete_delta, e
+                );
+            }
+        }
+    }
+
     /// Delete an object
     #[instrument(skip(self))]
     pub async fn delete(&self, bucket: &str, key: &str) -> Result<FileMetadata, EngineError> {
@@ -1639,17 +1668,37 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .await?
             .ok_or_else(|| EngineError::NotFound(obj_key.full_key()))?;
 
-        // Delete based on storage type
+        // Delete based on storage type — but ALSO clean up the OTHER variant.
+        // A key can transiently have BOTH a passthrough and a delta sibling (e.g.
+        // a PUT that stored as delta whose best-effort passthrough cleanup 500'd
+        // and was only warned). resolve_metadata picks the newest, and deleting
+        // only that variant leaves the stale sibling, which a later GET resolves
+        // and serves — a deleted object RESURRECTS (H33). Delete both; the
+        // non-resolved one is best-effort (NotFound is the normal case).
         match &metadata.storage_info {
             StorageInfo::Passthrough => {
                 self.storage
                     .delete_passthrough(bucket, &deltaspace_id, &obj_key.filename)
                     .await?;
+                self.delete_sibling_variant_best_effort(
+                    bucket,
+                    &deltaspace_id,
+                    &obj_key.filename,
+                    /* delete_delta = */ true,
+                )
+                .await;
             }
             StorageInfo::Delta { .. } => {
                 self.storage
                     .delete_delta(bucket, &deltaspace_id, &obj_key.filename)
                     .await?;
+                self.delete_sibling_variant_best_effort(
+                    bucket,
+                    &deltaspace_id,
+                    &obj_key.filename,
+                    /* delete_delta = */ false,
+                )
+                .await;
             }
             StorageInfo::Reference { .. } => {
                 return Err(EngineError::InvalidArgument(
