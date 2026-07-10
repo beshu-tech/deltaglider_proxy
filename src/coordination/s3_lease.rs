@@ -245,12 +245,23 @@ impl CoordinationLease for S3Lease {
         ttl_secs: i64,
     ) -> Result<bool, String> {
         let key = Self::object_key(subsystem, rule);
-        let expires_at = now.saturating_add(ttl_secs.max(1));
         // Bounded retry loop (E5): a transient blip on read or PUT shouldn't drop
         // a lease we still hold. Only a real 412 (stolen) or a lapsed/foreign
         // lease is terminal `Lost`.
+        //
+        // The injected `now` is captured ONCE by the caller, but a degraded
+        // backend can make the retries span more than a TTL of real time. Using
+        // that stale `now` for the freshness check would renew (and re-extend) a
+        // lease that has ACTUALLY lapsed — while a peer may already be stealing
+        // it, so two nodes hold the same lease. Advance the effective time by the
+        // real monotonic elapsed since loop start, so both the plan_renew
+        // freshness check and the new expires_at reflect wall-clock progress.
+        let started = std::time::Instant::now();
         let mut last_err: Option<String> = None;
         for _ in 0..RENEW_MAX_ATTEMPTS {
+            let elapsed_secs = started.elapsed().as_secs() as i64;
+            let effective_now = now.saturating_add(elapsed_secs);
+            let expires_at = effective_now.saturating_add(ttl_secs.max(1));
             let current = match self.read_lease(&key).await {
                 Ok(c) => c,
                 Err(e) => {
@@ -258,7 +269,11 @@ impl CoordinationLease for S3Lease {
                     continue;
                 }
             };
-            match plan_renew(current.as_ref().map(|(l, e)| (l, e.as_str())), now, owner) {
+            match plan_renew(
+                current.as_ref().map(|(l, e)| (l, e.as_str())),
+                effective_now,
+                owner,
+            ) {
                 RenewAction::Lost => return Ok(false),
                 RenewAction::Renew { etag, epoch } => {
                     match self
@@ -400,6 +415,27 @@ mod tests {
         // expires_at < now → lapsed → must NOT renew (never resurrect).
         let l = lease("me", "nodeA", 7, 99);
         assert_eq!(plan_renew(Some((&l, "e")), 100, "me"), RenewAction::Lost);
+    }
+
+    #[test]
+    fn renew_effective_now_advances_a_boundary_lease_to_lapsed() {
+        // The renew loop advances the injected `now` by real monotonic elapsed
+        // (M critic-gap): a lease that is renewable at the captured `now` but
+        // whose expiry falls WITHIN the elapsed retry window must flip to Lost
+        // when evaluated at effective_now = now + elapsed. Model the arithmetic
+        // the loop performs: captured now=100, lease expires_at=102, and 3s of
+        // real time elapsed on a degraded backend → effective_now=103 > 102.
+        let l = lease("me", "nodeA", 7, 102);
+        assert!(
+            matches!(plan_renew(Some((&l, "e")), 100, "me"), RenewAction::Renew { .. }),
+            "renewable at the stale captured now"
+        );
+        let effective_now = 100i64.saturating_add(3); // now + elapsed_secs
+        assert_eq!(
+            plan_renew(Some((&l, "e")), effective_now, "me"),
+            RenewAction::Lost,
+            "a lease that lapsed DURING the retry window must not be renewed"
+        );
     }
 
     #[test]
