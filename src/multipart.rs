@@ -116,11 +116,33 @@ struct MultipartUpload {
     parts: HashMap<u32, PartData>,
     state: MultipartState,
     relay_strategy: RelayStrategy,
+    /// True while the engine store for this upload is actively running. The
+    /// idle-TTL sweeper (`cleanup_expired`) must NOT reclaim a Completing upload
+    /// whose store is in flight — a slow store to a remote backend can exceed
+    /// completing_timeout, and sweeping it deletes the relay part files the
+    /// store is still reading, losing them permanently on retry (H18). The store
+    /// is separately bounded (request timeout + codec watchdog), so this flag
+    /// can never wedge an upload forever.
+    store_in_progress: bool,
 }
 
 enum RelayStrategy {
     InMemory { relay_threshold_bytes: Option<u64> },
     Relayed { relay_dir: PathBuf },
+}
+
+/// RAII: clears an upload's `store_in_progress` flag on drop so a store that
+/// returns (success, failure, OR a dropped future) always re-enables sweeping.
+#[must_use = "the store-in-progress protection ends when the guard is dropped"]
+pub struct StoreInProgressGuard {
+    store: std::sync::Arc<MultipartStore>,
+    upload_id: String,
+}
+
+impl Drop for StoreInProgressGuard {
+    fn drop(&mut self) {
+        self.store.clear_store_in_progress(&self.upload_id);
+    }
 }
 
 /// Result of assembling a completed multipart upload
@@ -319,6 +341,7 @@ impl MultipartStore {
                     relay_threshold_bytes,
                 }
             },
+            store_in_progress: false,
         };
 
         uploads.insert(upload_id.clone(), upload);
@@ -587,6 +610,28 @@ impl MultipartStore {
     pub fn rollback_upload(&self, upload_id: &str) {
         if let Some(u) = self.uploads.write().get_mut(upload_id) {
             u.state = MultipartState::Open;
+        }
+    }
+
+    /// Mark an upload's engine store as in-flight and return an RAII guard that
+    /// clears the flag on drop. While held, `cleanup_expired` will not reclaim
+    /// the (Completing) upload even past completing_timeout, so a slow store to a
+    /// remote backend can't have its relay parts swept out from under it (H18).
+    pub fn store_guard(self: &std::sync::Arc<Self>, upload_id: &str) -> StoreInProgressGuard {
+        if let Some(u) = self.uploads.write().get_mut(upload_id) {
+            u.store_in_progress = true;
+        }
+        StoreInProgressGuard {
+            store: std::sync::Arc::clone(self),
+            upload_id: upload_id.to_string(),
+        }
+    }
+
+    /// Clear the store-in-progress flag (best-effort; no-op if the upload is
+    /// already gone). Called from `StoreInProgressGuard::drop`.
+    fn clear_store_in_progress(&self, upload_id: &str) {
+        if let Some(u) = self.uploads.write().get_mut(upload_id) {
+            u.store_in_progress = false;
         }
     }
 
@@ -942,7 +987,10 @@ impl MultipartStore {
             let mut expired = Vec::new();
             uploads.retain(|_, u| {
                 if u.state == MultipartState::Completing {
-                    if u.last_activity <= completing_cutoff {
+                    // Never reclaim an upload whose engine store is in flight —
+                    // sweeping it deletes the relay parts the store is reading,
+                    // losing them permanently on retry (H18). Bounded elsewhere.
+                    if u.last_activity <= completing_cutoff && !u.store_in_progress {
                         expired.push(take_upload_for_cleanup(u));
                         return false;
                     }
@@ -1090,6 +1138,7 @@ fn take_upload_for_cleanup(upload: &mut MultipartUpload) -> MultipartUpload {
                 relay_dir: relay_dir.clone(),
             },
         },
+        store_in_progress: upload.store_in_progress,
     }
 }
 
@@ -1807,6 +1856,45 @@ mod tests {
         );
         assert_eq!(report.swept_completing_uploads, 1);
         assert_eq!(store.in_flight_bytes(), 0);
+        assert!(store.uploads.read().get(&id).is_none());
+    }
+
+    #[test]
+    fn test_cleanup_expired_spares_completing_upload_with_store_in_flight() {
+        // H18: a Completing upload past completing_timeout must NOT be swept
+        // while its engine store is in flight (store_in_progress), else the relay
+        // parts the store is reading get deleted and are lost on retry.
+        let store = std::sync::Arc::new(MultipartStore::new_for_test(
+            10 * 1024,
+            10 * 1024,
+            Duration::hours(24),
+        ));
+        let id = store.create("b", "k", None, HashMap::new()).unwrap();
+        let etag = store
+            .upload_part(&id, "b", "k", 1, Bytes::from(vec![0u8; 100]))
+            .unwrap();
+        store.complete(&id, "b", "k", &[(1, etag)]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // Store in flight → spared even with a 1ms completing_timeout.
+        let guard = store.store_guard(&id);
+        let report = store.cleanup_expired(
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_millis(1),
+        );
+        assert_eq!(
+            report.swept_completing_uploads, 0,
+            "an in-flight store must protect its Completing upload from the sweeper"
+        );
+        assert!(store.uploads.read().get(&id).is_some());
+
+        // Once the store finishes (guard dropped), the sweeper reclaims it.
+        drop(guard);
+        let report = store.cleanup_expired(
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_millis(1),
+        );
+        assert_eq!(report.swept_completing_uploads, 1);
         assert!(store.uploads.read().get(&id).is_none());
     }
 

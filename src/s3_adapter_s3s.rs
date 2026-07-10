@@ -1200,6 +1200,11 @@ impl s3s::S3 for DeltaGliderS3Service {
                         .await
                 }
                 crate::multipart::PassthroughPayload::RelayedParts(paths) => {
+                    // Protect the relay part files from the idle-TTL sweeper for
+                    // the duration of the store: a slow store to a remote backend
+                    // can exceed completing_timeout, and sweeping mid-store would
+                    // delete the parts being read, losing them forever (H18).
+                    let _store_guard = self.state.multipart.store_guard(&input.upload_id);
                     engine
                         .store_passthrough_relayed_parts_with_multipart_etag(
                             &input.bucket,
