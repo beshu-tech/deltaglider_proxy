@@ -492,6 +492,7 @@ pub async fn run_rule(
         // Arc<Mutex<ConfigDb>>) and returns its totals delta + optional
         // event. The page boundary is the barrier: the cursor does not
         // advance until every in-flight object of this page finishes.
+        let page_attempted = plan.to_copy.len() as i64;
         let copy_page = futures::stream::iter(plan.to_copy.clone())
             .map(|(src_key, dest_key, src_size)| {
                 let db = db.clone();
@@ -589,10 +590,14 @@ pub async fn run_rule(
         }
         // Backend shedding load (503 SlowDown / 429): abort instead of
         // grinding the remaining key list through per-object retries. Gated
-        // on ≥3 throttled objects AND zero successes so one stray 503 on an
-        // otherwise-copying page never aborts. The persisted cursor resumes
-        // this page on the next (backed-off) run; copies are idempotent.
-        if page_throttled >= 3 && page_copied == 0 {
+        // on zero successes this page AND (≥3 throttled OR the WHOLE page
+        // throttled). The whole-page clause matters for small batch_size (≤2):
+        // page_throttled>=3 alone is unsatisfiable there, so a fully-throttling
+        // backend would grind object-by-object with no backoff (the exact prod
+        // incident the gate exists for). The cursor resumes after backoff;
+        // copies are idempotent. Guard page_attempted>0 so an empty page (all
+        // filtered) never trips it.
+        if page_is_throttle_aborted(page_copied, page_throttled, page_attempted) {
             warn!(
                 "replication rule '{}' aborting run: backend throttled ({} objects rejected with SlowDown this page)",
                 rule.name, page_throttled
@@ -1043,6 +1048,15 @@ fn is_backend_throttled(err: &str) -> bool {
         || e.contains("too many requests")
         || e.contains("status=503")
         || e.contains("(503")
+}
+
+/// Pure: should the run abort this page as backend-throttled? True with ZERO
+/// successes AND (≥3 throttled OR the whole page throttled). The whole-page
+/// clause covers small batch_size (≤2) where `>= 3` is unsatisfiable (H16); the
+/// ≥3 clause keeps a couple of stray 503s from aborting a large otherwise-idle
+/// page. `attempted == 0` can't trip it (no throttles without attempts).
+fn page_is_throttle_aborted(copied: i64, throttled: i64, attempted: i64) -> bool {
+    copied == 0 && throttled > 0 && (throttled >= 3 || throttled >= attempted)
 }
 
 /// Resolves to `true` once a kill is requested for `run_id` (polls the DB
@@ -1944,6 +1958,21 @@ fn compute_next_due(rule: &ReplicationRule, finished_at: i64) -> i64 {
 mod tests {
     use super::*;
     use crate::config_sections::{ConflictPolicy, ReplicationEndpoint, ReplicationRule};
+
+    #[test]
+    fn throttle_abort_fires_for_small_batch_full_page() {
+        // H16: small batch_size (≤2) — a fully-throttling page must abort even
+        // though throttled can never reach 3.
+        assert!(page_is_throttle_aborted(0, 2, 2)); // whole 2-object page throttled
+        assert!(page_is_throttle_aborted(0, 1, 1)); // whole 1-object page throttled
+        // A large page needs ≥3 (a stray 503 or two must NOT abort).
+        assert!(!page_is_throttle_aborted(0, 2, 1000));
+        assert!(page_is_throttle_aborted(0, 3, 1000));
+        // Any success this page → never abort (backend is coping).
+        assert!(!page_is_throttle_aborted(5, 100, 1000));
+        // No throttles → never abort.
+        assert!(!page_is_throttle_aborted(0, 0, 1000));
+    }
 
     #[test]
     fn absent_prefix_matches_only_path_descendants() {
