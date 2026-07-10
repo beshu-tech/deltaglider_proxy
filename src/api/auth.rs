@@ -136,14 +136,15 @@ pub fn replay_decision(method: &axum::http::Method, is_duplicate: bool) -> Repla
 /// the claimed hash is signature-bound). Downstream handlers (the PUT path)
 /// compare it against the actual body's SHA-256 to close the H1 integrity gap.
 ///
-/// Sentinel values that disable verification:
+/// Sentinel values that disable the body-hash comparison here:
 /// - `UNSIGNED-PAYLOAD`: client opted out of body-hash signing.
 /// - `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` and the other STREAMING-*
-///   variants: the chunked-payload protocol authenticates each chunk
-///   separately. We don't validate the chunk-signature chain (see
-///   `aws_chunked.rs`), so we don't claim end-to-end integrity for
-///   those — the value is still recorded for observability but
-///   `is_verifiable_hex()` returns false.
+///   variants: the chunked-payload protocol authenticates each chunk with a
+///   signature chain, which s3s verifies UPSTREAM (the sole SigV4 authority)
+///   before the handler runs, handing us the already de-chunked body. There
+///   is no single body-hash to compare, so `is_verifiable_hex()` returns
+///   false and the payload is accepted (integrity already enforced). Rejecting
+///   these here 501'd authenticated streaming PUTs (X-ray H15).
 #[derive(Debug, Clone)]
 pub struct SignedPayloadHash(pub String);
 
@@ -173,35 +174,28 @@ impl SignedPayloadHash {
             })
     }
 
-    /// Signed AWS streaming modes require per-chunk signature validation.
-    /// The proxy can decode AWS chunked framing but does not verify the
-    /// chunk-signature chain, so accepting these modes would advertise
-    /// integrity we do not enforce.
-    pub fn requires_chunk_signature_verification(&self) -> bool {
-        let v = self.0.as_str();
-        v.starts_with("STREAMING-AWS4-HMAC-") || v.starts_with("STREAMING-AWS4-ECDSA-")
-    }
-
     /// H1 SigV4 integrity check: confirm the body's actual SHA-256 matches
     /// the value the client signed in `x-amz-content-sha256`. The signature
     /// covers the canonical request which only sees the header value, not
     /// the body bytes — so a credentialed client could otherwise sign hash
     /// A and ship body B unless the receiver verifies downstream.
     ///
-    /// Sentinels that disable verification:
+    /// Sentinels that disable body-hash comparison here:
     ///   * `UNSIGNED-PAYLOAD` — client opted out (returns Ok).
-    ///   * `STREAMING-*` variants — per-chunk signature scheme; we don't
-    ///     verify the chunk-signature chain, so accepting them here would
-    ///     advertise integrity we do not enforce. Returns `NotImplemented`.
+    ///   * `STREAMING-*` variants — the per-chunk signature chain is verified
+    ///     UPSTREAM by s3s (`aws_chunked_stream::check_signature`, the sole
+    ///     SigV4 authority since the dedup), and s3s hands us the already
+    ///     de-chunked body. There is no single body-hash to compare, exactly
+    ///     like UNSIGNED. Returning NotImplemented here rejected valid
+    ///     authenticated streaming PUTs with 501 (X-ray H15) while the
+    ///     anonymous path — no SignedPayloadHash injected — worked; the
+    ///     asymmetry was the bug.
     ///
     /// Comparison uses `subtle::ConstantTimeEq` to deny timing-side-channel
     /// inference of the signed hash.
     pub fn verify_against_body(&self, body: &[u8]) -> Result<(), super::S3Error> {
-        if self.requires_chunk_signature_verification() {
-            return Err(super::S3Error::NotImplemented(
-                "Signed AWS streaming payloads are not supported; use UNSIGNED-PAYLOAD or non-streaming SHA-256 payloads".to_string(),
-            ));
-        }
+        // STREAMING and UNSIGNED both have no verifiable single hash here; the
+        // streaming chunk signatures are enforced by s3s upstream.
         if !self.is_verifiable_hex() {
             return Ok(());
         }
@@ -1046,17 +1040,25 @@ mod tests {
 
     #[test]
     fn signed_payload_hash_classification() {
+        // Only a 64-char hex is a verifiable single body hash. UNSIGNED and
+        // STREAMING variants are NOT verifiable here — streaming chunk sigs are
+        // enforced by s3s upstream, so they must NOT be rejected (X-ray H15).
         let hex = SignedPayloadHash("a".repeat(64));
         assert!(hex.is_verifiable_hex());
-        assert!(!hex.requires_chunk_signature_verification());
 
         let unsigned = SignedPayloadHash("UNSIGNED-PAYLOAD".into());
         assert!(!unsigned.is_verifiable_hex());
-        assert!(!unsigned.requires_chunk_signature_verification());
+        assert!(unsigned.verify_against_body(b"anything").is_ok());
 
         let signed_stream = SignedPayloadHash("STREAMING-AWS4-HMAC-SHA256-PAYLOAD".into());
         assert!(!signed_stream.is_verifiable_hex());
-        assert!(signed_stream.requires_chunk_signature_verification());
+        // The former bug: this returned NotImplemented (→ 501) under auth.
+        assert!(
+            signed_stream
+                .verify_against_body(b"chunk-decoded-body")
+                .is_ok(),
+            "signed streaming payload must be accepted (verified upstream by s3s)"
+        );
     }
     #[test]
     fn test_has_presigned_query_params() {
